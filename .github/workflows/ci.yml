@@ -6,14 +6,15 @@ on:
   pull_request:
 
 jobs:
-  test:
+  unit-tests:
+    name: Unit tests (no integration features)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Do not pass --all-features unless optional deps are available in CI.
       - run: cargo check --workspace
-      # Unit tests only (`--lib` on default-members). I/O smokes need
-      # `--features integration` (and are not compiled otherwise).
-      - run: cargo test --lib
+      # Every library's default-feature unit tests. Network/filesystem smoke
+      # suites are gated by each crate's opt-in `integration` feature and must
+      # never be enabled in this workflow.
+      - run: cargo test --workspace --lib
       - run: cargo doc --workspace --no-deps

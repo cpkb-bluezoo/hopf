@@ -182,7 +182,7 @@
 <li>STARTTLS, AUTH PLAIN, PIPELINING, 8BITMIME, SMTPUTF8, CHUNKING/BDAT, SIZE, DSN, …</li>
 <li>Staged connection-handler SPI (hello → mail → rcpt → data)</li>
 <li>Stock accept-all (discard) handler; <strong>SimpleRelayService</strong> open MX relay (lab use)</li>
-<li>Local mailbox delivery via custom handler + mailbox API (not stock)</li>
+<li><strong>LocalDeliveryService</strong> — APPEND to local INBOX via <code>hopf-mailbox</code> (mbox / Maildir++)</li>
 </ul>
 <h3 id="mailbox-hopf-mailbox">Mailbox (<code>hopf-mailbox</code>)</h3>
 <ul>

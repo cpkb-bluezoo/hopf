@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "WebSocket framing and HTTP upgrade helpers for Hopf"
@@ -13,7 +14,7 @@ categories = ["network-programming", "web-programming::websocket"]
 
 [features]
 default = []
-# Runtime TCP/QUIC smokes; not compiled in CI by default.
+# Opt-in Runtime TCP/QUIC smokes; excluded from CI unit-test runs.
 integration = ["hopf-http/h3"]
 
 [dependencies]

@@ -1,0 +1,16 @@
+[package]
+name = "smtp-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "smtp-local"
+path = "main.rs"
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-smtp = { workspace = true }
+hopf-mailbox = { workspace = true }

@@ -1,6 +1,9 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Optional server + client smoke tests (feature `integration`).
+//! Opt-in integration tests: real loopback TCP/TLS/DNS and filesystem I/O.
+//!
+//! These are deliberately excluded from CI. Run them manually with:
+//! `cargo test -p hopf-smtp --features integration`.
 
 #![cfg(feature = "integration")]
 
@@ -47,8 +50,7 @@ fn client_send_captured() {
     std::thread::sleep(Duration::from_millis(50));
     let got = capture.lock().unwrap().clone();
     assert!(
-        got.windows(b"hello smtp".len())
-            .any(|w| w == b"hello smtp"),
+        got.windows(b"hello smtp".len()).any(|w| w == b"hello smtp"),
         "capture={got:?}"
     );
 }
@@ -104,11 +106,11 @@ fn client_starttls_send() {
 
 #[test]
 fn simple_relay_mx_to_local_sink() {
-    use std::net::Ipv4Addr;
-    use std::thread;
+    use crate::{SimpleRelayService, SmtpClientBuilder, SmtpConfig};
     use hopf_dns::wire::{DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA};
     use hopf_dns::DnsResolver;
-    use crate::{SimpleRelayService, SmtpClientBuilder, SmtpConfig};
+    use std::net::Ipv4Addr;
+    use std::thread;
 
     // Sink SMTP that captures the forwarded message.
     let capture = Arc::new(Mutex::new(Vec::new()));
@@ -160,12 +162,7 @@ fn simple_relay_mx_to_local_sink() {
 
     let relay_listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let config = SmtpConfig::new(relay_listen, "relay.example.com");
-    let relay = SimpleRelayService::with_resolver(
-        config,
-        Arc::clone(&rt),
-        dns,
-        sink_addr.port(),
-    );
+    let relay = SimpleRelayService::with_resolver(config, Arc::clone(&rt), dns, sink_addr.port());
     let relay_addr = relay.start(Arc::clone(&rt)).unwrap();
 
     let mut c = SmtpClientBuilder::new()
@@ -180,11 +177,71 @@ fn simple_relay_mx_to_local_sink() {
 
     for _ in 0..100 {
         let got = capture.lock().unwrap().clone();
-        if got.windows(b"relayed-body".len()).any(|w| w == b"relayed-body") {
+        if got
+            .windows(b"relayed-body".len())
+            .any(|w| w == b"relayed-body")
+        {
             return;
         }
         thread::sleep(Duration::from_millis(50));
     }
     let got = capture.lock().unwrap().clone();
     panic!("sink did not receive relayed message: {got:?}");
+}
+
+#[test]
+fn local_delivery_appends_to_maildir() {
+    use crate::{LocalDeliveryService, SmtpClientBuilder, SmtpConfig};
+    use hopf_mailbox::MaildirFactory;
+    use std::thread;
+
+    let dir = tempfile::tempdir().unwrap();
+    let factory = Arc::new(MaildirFactory::new(dir.path()));
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(listen, "mail.example.com");
+    let svc = LocalDeliveryService::new(config, Arc::clone(&rt), factory, "example.com");
+    let addr = svc.start(Arc::clone(&rt)).unwrap();
+
+    let mut c = SmtpClientBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .connect(addr)
+        .unwrap();
+    c.ehlo("client.example").unwrap();
+    c.mail("alice@elsewhere.test").unwrap();
+    // Wrong domain → relay denied
+    assert!(c.rcpt("bob@other.example").is_err());
+    c.rcpt("bob@example.com").unwrap();
+    c.rcpt("carol@example.com").unwrap();
+    c.data(b"Subject: local\r\n\r\nlocal-body\r\n").unwrap();
+    c.quit().unwrap();
+
+    // Allow storage pool to finish APPENDs (Maildir++ end_append → cur/).
+    let mut found_bob = false;
+    let mut found_carol = false;
+    for _ in 0..100 {
+        for (user, found) in [("bob", &mut found_bob), ("carol", &mut found_carol)] {
+            let cur = dir.path().join(user).join("cur");
+            if !cur.is_dir() {
+                continue;
+            }
+            for ent in std::fs::read_dir(&cur).unwrap() {
+                let p = ent.unwrap().path();
+                if p.is_file() {
+                    let bytes = std::fs::read(&p).unwrap();
+                    if bytes
+                        .windows(b"local-body".len())
+                        .any(|w| w == b"local-body")
+                    {
+                        *found = true;
+                    }
+                }
+            }
+        }
+        if found_bob && found_carol {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("maildir delivery incomplete: bob={found_bob} carol={found_carol}");
 }

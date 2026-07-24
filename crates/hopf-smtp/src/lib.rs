@@ -3,8 +3,9 @@
 //! SMTP / SMTPS server and blocking client (Gumdrop `org.bluezoo.gumdrop.smtp` port).
 //!
 //! The protocol engine talks to a staged handler SPI ([`SmtpClientConnected`] →
-//! [`HelloHandler`] → [`MailFromHandler`] → …). The stock
-//! [`AcceptAllSmtpHandler`] accepts and discards mail. The blocking
+//! [`HelloHandler`] → [`MailFromHandler`] → …). Stock handlers:
+//! [`AcceptAllSmtpHandler`] (discard), [`SimpleRelayService`] (open MX relay),
+//! and [`LocalDeliveryService`] (APPEND to local mailboxes). The blocking
 //! [`SmtpClient`] speaks cleartext SMTP, explicit `STARTTLS`, and implicit SMTPS.
 
 #![warn(missing_docs)]
@@ -15,6 +16,7 @@ mod control;
 mod data;
 mod delivery;
 mod handler;
+mod mailbox;
 mod metrics;
 mod pipeline;
 mod relay;
@@ -38,6 +40,9 @@ pub use handler::{
 };
 pub use metrics::SmtpServerMetrics;
 pub use pipeline::{DiscardPipeline, NullPipeline, SmtpPipeline};
+pub use mailbox::{
+    LocalDeliveryHandler, LocalDeliveryHandlerFactory, LocalDeliveryService,
+};
 pub use relay::{
     MessageBufferPipeline, SimpleRelayHandler, SimpleRelayHandlerFactory, SimpleRelayService,
 };

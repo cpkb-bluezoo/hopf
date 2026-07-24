@@ -70,7 +70,11 @@
 <p>Env: <code>SMTP_SUBJECT</code>, <code>SMTP_BODY</code>.</p>
 <h2 id="simple-relay">Simple relay</h2>
 <p>There is no example binary yet. Wire <code>SimpleRelayService</code> as in the <a href="../smtp.html">SMTP</a> guide (MX open relay for lab use). Covered by <code>hopf-smtp</code> integration tests.</p>
-<p>Sources: <a href="../../examples/smtp"><code>examples/smtp</code></a>, <a href="../../examples/smtp-send"><code>examples/smtp-send</code></a>.</p>
+<h2 id="local-delivery">Local delivery</h2>
+<div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> smtp-local <span class="at">--</span> 127.0.0.1:2525 localhost example.com ./mail</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> smtp-send <span class="at">--</span> 127.0.0.1:2525 alice@elsewhere.test bob@example.com</span></code></pre></div>
+<p>APPENDs to <code>./mail/bob/</code> (Maildir++). Wrong-domain RCPT is relay-denied.</p>
+<p>Sources: <a href="../../examples/smtp"><code>examples/smtp</code></a>, <a href="../../examples/smtp-local"><code>examples/smtp-local</code></a>, <a href="../../examples/smtp-send"><code>examples/smtp-send</code></a>.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

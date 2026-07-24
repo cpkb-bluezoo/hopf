@@ -299,7 +299,8 @@ MailboxFactory → MailboxStore → Mailbox
 <span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co">#  - mbox rejects COPY</span></span>
 <span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">#  - Maildir body index</span></span></code></pre></div>
 <p>Wire from SMTP:</p>
-<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// In MessageDataHandler::message_complete — submit to StorageExecutor:</span></span>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Prefer LocalDeliveryService for stock local MX; custom handlers can also</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co">// APPEND in MessageDataHandler::message_complete via StorageExecutor:</span></span>
 <span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>storage<span class="op">.</span>submit_on(handle<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
 <span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> factory<span class="op">.</span>create_store()<span class="op">;</span></span>
 <span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    store<span class="op">.</span>open(<span class="st">&quot;alice&quot;</span>)<span class="op">?;</span></span>
@@ -310,8 +311,7 @@ MailboxFactory → MailboxStore → Mailbox
 <span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="op">},</span> <span class="op">|</span>result<span class="op">|</span> <span class="op">{</span> <span class="co">/* reply 250/550 via ConnHandle */</span> <span class="op">}</span>)<span class="op">;</span></span></code></pre></div>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>Not an IMAP server</strong> — storage SPI only.</li>
-<li><strong>SMTP → mailbox not stock-wired</strong> (<a href="smtp.html">SMTP</a>).</li>
+<li><strong>Not an IMAP server</strong> — storage SPI only (use <a href="smtp.html#local-delivery"><code>LocalDeliveryService</code></a> for SMTP → INBOX).</li>
 <li>mbox: no hierarchy / COPY / MOVE.</li>
 <li>Body indexing off by default.</li>
 <li>Must keep search/index off the reactor (use <code>StorageExecutor</code>).</li>
