@@ -65,19 +65,21 @@ tractrix = "0.2"
 rjsonparser = "0.1"
 rmimeparser = "0.3"
 rprotobuf = "0.1"
-hopf-core = { path = "crates/hopf-core" }
-hopf-tls = { path = "crates/hopf-tls" }
-hopf-http = { path = "crates/hopf-http" }
-hopf-quic = { path = "crates/hopf-quic" }
-hopf-dns = { path = "crates/hopf-dns" }
-hopf-auth = { path = "crates/hopf-auth" }
-hopf-otel = { path = "crates/hopf-otel" }
-hopf-webdav = { path = "crates/hopf-webdav" }
-hopf-websocket = { path = "crates/hopf-websocket" }
-hopf-grpc = { path = "crates/hopf-grpc" }
-hopf-ftp = { path = "crates/hopf-ftp" }
-hopf-smtp = { path = "crates/hopf-smtp" }
-hopf-mailbox = { path = "crates/hopf-mailbox" }
+# Internal crates: `version` must match [workspace.package] version (required
+# for publishing; cargo cannot inherit it here). Bump together on release.
+hopf-core = { version = "0.1.0", path = "crates/hopf-core" }
+hopf-tls = { version = "0.1.0", path = "crates/hopf-tls" }
+hopf-http = { version = "0.1.0", path = "crates/hopf-http" }
+hopf-quic = { version = "0.1.0", path = "crates/hopf-quic" }
+hopf-dns = { version = "0.1.0", path = "crates/hopf-dns" }
+hopf-auth = { version = "0.1.0", path = "crates/hopf-auth" }
+hopf-otel = { version = "0.1.0", path = "crates/hopf-otel" }
+hopf-webdav = { version = "0.1.0", path = "crates/hopf-webdav" }
+hopf-websocket = { version = "0.1.0", path = "crates/hopf-websocket" }
+hopf-grpc = { version = "0.1.0", path = "crates/hopf-grpc" }
+hopf-ftp = { version = "0.1.0", path = "crates/hopf-ftp" }
+hopf-smtp = { version = "0.1.0", path = "crates/hopf-smtp" }
+hopf-mailbox = { version = "0.1.0", path = "crates/hopf-mailbox" }
 bytes = "1"
 getrandom = "0.2"
 md-5 = "0.10"
