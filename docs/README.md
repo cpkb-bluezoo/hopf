@@ -9,4 +9,5 @@ Static **HTML** reference for [GitHub Pages](https://docs.github.com/en/pages)
 
 If you regenerate from Markdown drafts, use
 [`scripts/md_docs_to_html.py`](../scripts/md_docs_to_html.py) (requires `pandoc`).
-The published tree is HTML-only.
+The published tree is HTML-only. Use `python3 scripts/md_docs_to_html.py --nav-only`
+to refresh the shared sidebar without converting Markdown.

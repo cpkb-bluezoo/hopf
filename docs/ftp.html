@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FTP — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html" aria-current="page">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>FTP</h1>
+        <p class="lead">Crate `hopf-ftp`: FTP / FTPS **server** and blocking **client** (Gumdrop `org.bluezoo.gumdrop.ftp` port).</p>
+      </header>
+      <p>Crate <code>hopf-ftp</code>: FTP / FTPS <strong>server</strong> and blocking <strong>client</strong> (Gumdrop <code>org.bluezoo.gumdrop.ftp</code> port).</p>
+<h2 id="server">Server</h2>
+<p><code>FtpService</code> + <code>FtpConfig</code>: control connection, PASV data listeners allocated on a shared <code>Arc&lt;Runtime&gt;</code>, stock <code>FilesystemFtpHandler</code> (chrooted root + storage API).</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> policy <span class="op">=</span> <span class="pp">PasswordTrustPolicy::</span><span class="kw">default</span>()<span class="op">.</span>with_user(<span class="st">&quot;ftp&quot;</span><span class="op">,</span> <span class="st">&quot;ftp&quot;</span>)<span class="op">.</span>shared()<span class="op">;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">FtpConfig::</span>new(addr<span class="op">,</span> root<span class="op">,</span> policy)<span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">// optional: .with_tls(acceptor).implicit_ftps().require_data_tls()</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> service <span class="op">=</span> <span class="pp">FtpService::</span>new(config)<span class="op">;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>)<span class="op">;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bound <span class="op">=</span> service<span class="op">.</span>start(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt))<span class="op">?;</span></span></code></pre></div>
+<p>Custom apps implement <code>FtpConnectionHandler</code> (<code>authenticate</code>, <code>file_system</code>, <code>is_authorized</code>) via <code>FtpService::with_handler_factory</code>.</p>
+<p>Config highlights: TrustPolicy, TLS acceptor, <code>implicit_tls</code>, <code>require_tls_for_data</code>, PASV advertised IP / port range, <code>read_only</code>, <code>allow_active_bounce</code>. Explicit FTPS: <code>with_starttls_acceptor</code>; implicit FTPS: <code>with_tls</code> on the listener.</p>
+<p>RFC 2640 <code>OPTS UTF8 ON</code> for pathnames and listings (ASCII substitution when UTF-8 is off).</p>
+<h2 id="client">Client</h2>
+<p><code>FtpClient</code> / <code>FtpClientBuilder</code>: USER/PASS, TYPE, path ops, PASV/EPSV (optional PORT/EPRT), RETR/STOR/LIST, explicit <code>AUTH TLS</code>, implicit FTPS + PROT P. Builder: <code>.tls(ClientConfig, name)</code>, <code>.implicit_tls(true)</code>, <code>.data_mode</code>, <code>.prefer_epsv</code>, timeout.</p>
+<h2 id="examples">Examples</h2>
+<p><a href="cookbook/ftp.html">Cookbook: FTP</a> — <code>examples/ftp</code> (<code>ftp-server</code>) and <code>examples/ftp-get</code>.</p>
+
+      <p class="footer">
+        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
+        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

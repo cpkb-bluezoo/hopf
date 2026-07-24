@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SMTP — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html" aria-current="page">SMTP</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>SMTP</h1>
+        <p class="lead">Crate `hopf-smtp`: SMTP / SMTPS **server** and blocking **client** (Gumdrop `org.bluezoo.gumdrop.smtp` port).</p>
+      </header>
+      <p>Crate <code>hopf-smtp</code>: SMTP / SMTPS <strong>server</strong> and blocking <strong>client</strong> (Gumdrop <code>org.bluezoo.gumdrop.smtp</code> port).</p>
+<h2 id="server">Server</h2>
+<p>Staged connection SPI: <code>SmtpClientConnected</code> → <code>HelloHandler</code> → <code>MailFromHandler</code> → <code>RecipientHandler</code> → <code>MessageDataHandler</code>. DATA (dot-stuffing) and BDAT (CHUNKING). EHLO advertisements include SIZE, PIPELINING, 8BITMIME, SMTPUTF8, CHUNKING, optional STARTTLS and AUTH PLAIN.</p>
+<p>Stock <code>AcceptAllSmtpHandler</code> accepts every stage and <strong>discards</strong> the message (greeting <code>{hostname} ESMTP Hopf</code>). Wire with <code>SmtpService::new(SmtpConfig::new(addr, hostname))</code>.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">SmtpConfig::</span>new(addr<span class="op">,</span> <span class="st">&quot;localhost&quot;</span>)<span class="op">;</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">// .with_tls(a).implicit_tls().auth_required(true).with_policy(policy)</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> service <span class="op">=</span> <span class="pp">SmtpService::</span>new(config)<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bound <span class="op">=</span> service<span class="op">.</span>start(<span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>))<span class="op">?;</span></span></code></pre></div>
+<p>Defaults: max message <strong>35 MiB</strong>, max recipients <strong>100</strong>. STARTTLS via <code>with_starttls_acceptor</code>; SMTPS via <code>with_tls</code> + <code>implicit_tls</code>.</p>
+<p>Local mailbox delivery is <strong>not</strong> built in yet — implement a custom <code>MessageDataHandler</code> that appends via <a href="mailbox.html"><code>hopf-mailbox</code></a> on the storage pool.</p>
+<h2 id="simple-relay">Simple relay</h2>
+<p><code>SimpleRelayService</code> / <code>SimpleRelayHandler</code> — <strong>open MX relay</strong> for any sender/recipient. Buffers the message, groups RCPT by domain, looks up MX with <code>hopf-dns</code>, and delivers with blocking <code>SmtpClient</code> on a worker thread.</p>
+<p><strong>Dev / test / closed networks only</strong> — not for untrusted ingress.</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>)<span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> relay <span class="op">=</span> <span class="pp">SimpleRelayService::</span>new(</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="pp">SmtpConfig::</span>new(addr<span class="op">,</span> hostname)<span class="op">,</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt)<span class="op">,</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>relay<span class="op">.</span>start(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt))<span class="op">?;</span></span></code></pre></div>
+<p>Defaults: DNS timeout 5s, outbound port <strong>25</strong>, SMTP I/O timeout 60s. Tests can inject a resolver with <code>with_resolver</code>. FUTURERELEASE is rejected; REQUIRETLS currently fails delivery (no trust roots for arbitrary MX STARTTLS). There is no <code>examples/smtp-relay</code> binary yet — see <code>hopf-smtp</code> integration tests (<code>simple_relay_mx_to_local_sink</code>).</p>
+<h2 id="client">Client</h2>
+<p><code>SmtpClient</code> / <code>SmtpClientBuilder</code>: EHLO/HELO, MAIL/RCPT, DATA, BDAT, STARTTLS, AUTH PLAIN, QUIT. TLS: <code>.tls(cfg, name).implicit_tls(true)</code> or <code>.starttls()</code>.</p>
+<h2 id="examples">Examples</h2>
+<p><a href="cookbook/smtp.html">Cookbook: SMTP</a> — accept-all server (<code>smtp-server</code>) and send twin (<code>smtp-send</code>).</p>
+
+      <p class="footer">
+        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
+        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>
