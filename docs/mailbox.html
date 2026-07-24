@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mailbox — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="mailbox.html" aria-current="page">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>Mailbox</h1>
+        <p class="lead">Crate `hopf-mailbox`: IMAP-level **storage** SPI (Gumdrop `org.bluezoo.gumdrop.mailbox` port). Not a full IMAP wire server — an IMAP protocol crate (or custom SMTP delivery) would call these traits.</p>
+      </header>
+      <p>Crate <code>hopf-mailbox</code>: IMAP-level <strong>storage</strong> SPI (Gumdrop <code>org.bluezoo.gumdrop.mailbox</code> port). Not a full IMAP wire server — an IMAP protocol crate (or custom SMTP delivery) would call these traits.</p>
+<h2 id="backends">Backends</h2>
+<table>
+<colgroup>
+<col style="width: 38%" />
+<col style="width: 33%" />
+<col style="width: 27%" />
+</colgroup>
+<thead>
+<tr>
+<th>Backend</th>
+<th>Layout</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>mbox</strong></td>
+<td><code>{root}/{user}</code> + <code>.flags</code> sidecar</td>
+<td>INBOX only; no COPY/CREATE hierarchy</td>
+</tr>
+<tr>
+<td><strong>Maildir++</strong></td>
+<td><code>{root}/{user}/</code></td>
+<td>Hierarchical folders, <code>.uidlist</code> / <code>.keywords</code>, COPY + MOVE, subscriptions</td>
+</tr>
+</tbody>
+</table>
+<h2 id="traits">Traits</h2>
+<ul>
+<li><code>MailboxFactory</code> → <code>MailboxStore</code> (<code>open</code> user, <code>create_mailbox</code>, …)</li>
+<li><code>Mailbox</code>: append, flags, fetch, search, copy/move (Maildir), close/expunge</li>
+</ul>
+<p>Search criteria align with <strong>RFC 9051 §6.4.4</strong> (ALL, flags, dates, HEADER/BODY/TEXT, UID/sequence sets, AND/OR/NOT, MODSEQ, …). Flags: IMAP system flags (<code>\Seen</code> … <code>\Recent</code>) plus Maildir letter mapping.</p>
+<h2 id="indexing">Indexing</h2>
+<p><code>.gidx</code> stores headers, flags, sizes, and dates. <strong>Body text is off by default</strong> (<code>IndexConfig::body_indexing</code>). <code>TEXT</code> / <code>BODY</code> use the body index when enabled; otherwise they parse message content.</p>
+<h2 id="storage-pool">Storage pool</h2>
+<p>Indexing and searching are blocking filesystem work. Call <code>Mailbox::search</code> / index rebuild only from <code>StorageExecutor</code> (see <code>hopf_mailbox::pool</code>), never on a reactor thread.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory <span class="op">=</span> <span class="pp">MaildirFactory::</span>new(root)</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_index_config(<span class="pp">IndexConfig::</span>with_body_indexing())<span class="op">;</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> factory<span class="op">.</span>create_store()<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>store<span class="op">.</span>open(<span class="st">&quot;alice&quot;</span>)<span class="op">?;</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> mb <span class="op">=</span> store<span class="op">.</span>open_mailbox(<span class="st">&quot;INBOX&quot;</span><span class="op">,</span> <span class="cn">false</span>)<span class="op">?;</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>mb<span class="op">.</span>append_message(rfc822<span class="op">,</span> <span class="op">&amp;</span>flags<span class="op">,</span> <span class="cn">None</span>)<span class="op">?;</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> hits <span class="op">=</span> mb<span class="op">.</span>search(<span class="op">&amp;</span><span class="pp">SearchCriteria::</span>text(<span class="st">&quot;needle&quot;</span>))<span class="op">?;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>mb<span class="op">.</span>close(<span class="cn">true</span>)<span class="op">?;</span> <span class="co">// expunge \Deleted</span></span></code></pre></div>
+<h2 id="smtp-imap">SMTP / IMAP</h2>
+<p><code>hopf-smtp</code> stock handlers do not deliver into mailboxes yet. Wire a custom <code>MessageDataHandler</code> that <code>append_message</code>s on the storage pool. An IMAP server would sit on top of the same <code>Mailbox</code> / <code>MailboxStore</code> traits.</p>
+<p>Integration coverage: <code>crates/hopf-mailbox/tests/mailbox_integration.rs</code> (no <code>examples/mailbox</code> yet).</p>
+
+      <p class="footer">
+        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
+        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

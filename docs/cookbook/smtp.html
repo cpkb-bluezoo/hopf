@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cookbook: dns-proxy — Hopf</title>
+  <title>Cookbook: SMTP — Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -48,22 +48,28 @@
 <li><a href="../cookbook/echo.html">Echo</a></li>
 <li><a href="../cookbook/tls-echo.html">TLS echo</a></li>
 <li><a href="../cookbook/http-hello-get.html">HTTP hello / get</a></li>
-<li><a href="../cookbook/dns-proxy.html" aria-current="page">DNS proxy</a></li>
+<li><a href="../cookbook/dns-proxy.html">DNS proxy</a></li>
 <li><a href="../cookbook/webdav.html">WebDAV</a></li>
 <li><a href="../cookbook/websocket.html">WebSocket</a></li>
 <li><a href="../cookbook/grpc.html">gRPC</a></li>
 <li><a href="../cookbook/ftp.html">FTP</a></li>
-<li><a href="../cookbook/smtp.html">SMTP</a></li>
+<li><a href="../cookbook/smtp.html" aria-current="page">SMTP</a></li>
 </ul>
 </nav>
     <main class="main">
       <header>
-        <h1>Cookbook: dns-proxy</h1>
-        <p class="lead">```bash</p>
+        <h1>Cookbook: SMTP</h1>
+        
       </header>
-      <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> dns-proxy <span class="at">--</span> …</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># point a stub resolver / dig @… at the bound address</span></span></code></pre></div>
-<p>Source: <a href="../../examples/dns-proxy"><code>examples/dns-proxy</code></a>. Caching forwarder using <code>DnsService</code> + UDP (and optional DoT/DoQ features). See <a href="../dns.html">DNS</a>.</p>
+      <h2 id="accept-all-server">Accept-all server</h2>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> smtp-server <span class="at">--</span> 127.0.0.1:2525</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># optional second arg: hostname (default localhost)</span></span></code></pre></div>
+<h2 id="send">Send</h2>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> smtp-send <span class="at">--</span> 127.0.0.1:2525 from@example.com to@example.com</span></code></pre></div>
+<p>Env: <code>SMTP_SUBJECT</code>, <code>SMTP_BODY</code>.</p>
+<h2 id="simple-relay">Simple relay</h2>
+<p>There is no example binary yet. Wire <code>SimpleRelayService</code> as in the <a href="../smtp.html">SMTP</a> guide (MX open relay for lab use). Covered by <code>hopf-smtp</code> integration tests.</p>
+<p>Sources: <a href="../../examples/smtp"><code>examples/smtp</code></a>, <a href="../../examples/smtp-send"><code>examples/smtp-send</code></a>.</p>
 
       <p class="footer">
         Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·

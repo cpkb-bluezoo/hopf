@@ -32,6 +32,12 @@
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
 <li><a href="auth.html">Auth</a></li>
@@ -43,6 +49,11 @@
 <li><a href="cookbook/tls-echo.html">TLS echo</a></li>
 <li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
 <li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
 </ul>
 </nav>
     <main class="main">
@@ -71,6 +82,7 @@
 <p><code>Service::start</code> should register bindings via Runtime APIs (or Composition). <code>tcp_listeners()</code> defaults to empty and remains only for transitional static sets — <strong>composition owns the script</strong>, not a frozen listener slice.</p>
 <h2 id="http-listen">HTTP listen</h2>
 <p>Wire <code>CleartextHttpEndpoint</code> / <code>AlpnHttpEndpoint</code> / <code>H1Endpoint::server</code> as the <code>ProtocolHandler</code>; implement <code>ServerHandler</code> for application logic. See <a href="http/server.html">HTTP server</a>.</p>
+<p>Higher-level HTTP apps (WebDAV, WebSocket, gRPC) supply a <code>ServerHandlerFactory</code> on that endpoint. FTP and SMTP use <code>FtpService</code> / <code>SmtpService</code> (or <code>SimpleRelayService</code>) with <code>start(Arc&lt;Runtime&gt;)</code> — see the protocol guides.</p>
 
       <p class="footer">
         Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·

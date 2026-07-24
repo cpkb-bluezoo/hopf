@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +30,12 @@ NAV = [
         ("http/client.html", "HTTP client"),
         ("quic-h3.html", "QUIC / H3"),
         ("dns.html", "DNS"),
+        ("webdav.html", "WebDAV"),
+        ("websocket.html", "WebSocket"),
+        ("grpc.html", "gRPC"),
+        ("ftp.html", "FTP"),
+        ("smtp.html", "SMTP"),
+        ("mailbox.html", "Mailbox"),
     ]),
     ("Cross-cutting", [
         ("auth.html", "Auth"),
@@ -40,8 +47,16 @@ NAV = [
         ("cookbook/tls-echo.html", "TLS echo"),
         ("cookbook/http-hello-get.html", "HTTP hello / get"),
         ("cookbook/dns-proxy.html", "DNS proxy"),
+        ("cookbook/webdav.html", "WebDAV"),
+        ("cookbook/websocket.html", "WebSocket"),
+        ("cookbook/grpc.html", "gRPC"),
+        ("cookbook/ftp.html", "FTP"),
+        ("cookbook/smtp.html", "SMTP"),
     ]),
 ]
+
+# Meta readme for maintainers — not a Pages page.
+SKIP_MD = {"README.md"}
 
 
 def depth_prefix(rel: Path) -> str:
@@ -71,6 +86,7 @@ def rewrite_links(html: str) -> str:
         html,
     )
     html = re.sub(r'href="README\.md"', 'href="index.html"', html)
+
     def repl(m):
         path, frag = m.group(1), m.group(2) or ""
         leaf = path.rsplit("/", 1)[-1]
@@ -124,7 +140,7 @@ def pandoc_body(md_path: Path) -> str:
     return rewrite_links(proc.stdout)
 
 
-def page(rel: Path, md_path: Path, out_name: str) -> None:
+def page(rel: Path, md_path: Path, out_name: str) -> Path:
     md = md_path.read_text()
     fallback = out_name.replace(".html", "").replace("-", " ").title()
     title, lead = extract_title(md, fallback)
@@ -180,20 +196,50 @@ def page(rel: Path, md_path: Path, out_name: str) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html)
     print("wrote", out.relative_to(ROOT))
+    return out
+
+
+def html_current_from_path(html_path: Path) -> str:
+    rel = html_path.relative_to(DOCS).as_posix()
+    return rel
+
+
+def refresh_navs() -> None:
+    """Rewrite <nav>…</nav> in every docs HTML page from NAV."""
+    nav_re = re.compile(r"<nav class=\"nav\"[^>]*>.*?</nav>", re.DOTALL)
+    for html_path in sorted(DOCS.rglob("*.html")):
+        text = html_path.read_text()
+        current = html_current_from_path(html_path)
+        prefix = depth_prefix(html_path.relative_to(DOCS))
+        new_nav = nav_html(current, prefix)
+        if not nav_re.search(text):
+            print("skip (no nav):", html_path.relative_to(ROOT), file=sys.stderr)
+            continue
+        updated = nav_re.sub(new_nav, text, count=1)
+        if updated != text:
+            html_path.write_text(updated)
+            print("nav", html_path.relative_to(ROOT))
 
 
 def main() -> None:
-    md_files = sorted(DOCS.rglob("*.md"))
+    md_files = sorted(
+        p for p in DOCS.rglob("*.md") if p.relative_to(DOCS).as_posix() not in SKIP_MD
+    )
     for md in md_files:
         rel = md.relative_to(DOCS)
         page(rel, md, md.stem + ".html")
-    # remove markdown sources (HTML is canonical)
+    # remove markdown sources (HTML is canonical); keep docs/README.md
     for md in md_files:
         md.unlink()
         print("removed", md.relative_to(ROOT))
+    refresh_navs()
     (DOCS / ".nojekyll").write_text("")
     print("done")
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--nav-only":
+        refresh_navs()
+        print("done")
+    else:
+        main()

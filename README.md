@@ -44,13 +44,19 @@ sources of truth.
 
 ```
 crates/
-  hopf-core/   # TPC reactor, Endpoint, ProtocolHandler, Composition, ACL
-  hopf-tls/    # rustls (TCP TLS + STARTTLS; shared identity for QUIC)
-  hopf-http/   # HTTP/1.x + H2 + in-tree H3; Stream app API; Basic auth
-  hopf-quic/   # quinn-proto + mio glue
-  hopf-dns/    # stub resolver + caching forwarder (UDP/TCP/DoT/DoQ/DoH)
-  hopf-auth/   # TrustPolicy / IdentityMaterial / SASL
-  hopf-otel/   # OTLP/HTTP + JSONL telemetry exporters
+  hopf-core/       # TPC reactor, Endpoint, ProtocolHandler, Composition, ACL
+  hopf-tls/        # rustls (TCP TLS + STARTTLS; shared identity for QUIC)
+  hopf-http/       # HTTP/1.x + H2 + in-tree H3; Stream app API; Basic auth
+  hopf-quic/       # quinn-proto + mio glue
+  hopf-dns/        # stub resolver + caching forwarder (UDP/TCP/DoT/DoQ/DoH)
+  hopf-auth/       # TrustPolicy / IdentityMaterial / SASL
+  hopf-otel/       # OTLP/HTTP + JSONL telemetry exporters
+  hopf-webdav/     # RFC 4918 filesystem WebDAV
+  hopf-websocket/  # RFC 6455 (+ H2/H3 Extended CONNECT)
+  hopf-grpc/       # unary gRPC over HTTP Streams
+  hopf-ftp/        # FTP / FTPS server + blocking client
+  hopf-smtp/       # SMTP / SMTPS server + client + simple MX relay
+  hopf-mailbox/    # mbox / Maildir++ storage SPI
 examples/
   echo/              # TCP echo
   tls-echo/          # TLS echo
@@ -58,6 +64,13 @@ examples/
   http-get/          # HTTP client
   http3-hello/       # HTTP/3
   dns-proxy/         # caching DNS forwarder
+  webdav/            # WebDAV file server
+  websocket/         # WebSocket echo
+  grpc/              # unary gRPC echo
+  ftp/               # FTP filesystem server
+  ftp-get/           # FTP client LIST/RETR
+  smtp/              # accept-all SMTP server
+  smtp-send/         # blocking SMTP client
 ```
 
 ## Build
