@@ -59,11 +59,9 @@ rustls-pemfile = "2"
 rcgen = "0.13"
 # QUIC transport state machine (mio/TPC glue in-tree; not the full `quinn` crate)
 quinn-proto = "0.11"
-# Sibling incremental push parsers. tractrix 0.2 is not on crates.io yet —
-# compile against the local checkout until published.
-tractrix = { path = "../tractrix" }
+tractrix = "0.2"
 rjsonparser = "0.1"
-rmimeparser = "0.2"
+rmimeparser = "0.3"
 rprotobuf = "0.1"
 hopf-core = { path = "crates/hopf-core" }
 hopf-tls = { path = "crates/hopf-tls" }

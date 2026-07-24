@@ -159,7 +159,7 @@ Workspace path deps (see root `Cargo.toml`):
 
 | Crate | Role |
 | ----- | ---- |
-| **[tractrix](../tractrix)** | Incremental push **XML** (Gonzalez lineage) — WebDAV wire XML **and** composition scripts ([#8](https://github.com/cpkb-bluezoo/hopf/issues/8)) |
+| **[tractrix](https://crates.io/crates/tractrix)** | Incremental push **XML** (Gonzalez lineage) — WebDAV wire XML **and** composition scripts ([#8](https://github.com/cpkb-bluezoo/hopf/issues/8)) |
 | **[rjsonparser](../rjsonparser)** | Incremental push JSON — protocol payloads / telemetry / wherever JSON appears |
 | **[rmimeparser](../rmimeparser)** | Incremental push MIME / RFC 5322 — mail and related |
 | **[rprotobuf](../rprotobuf)** | Incremental push protobuf — OTLP / telemetry |

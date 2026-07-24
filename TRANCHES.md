@@ -47,7 +47,7 @@ Ingress contract — same shape as sibling parsers
 ([rjsonparser](../rjsonparser) /
 [rmimeparser](../rmimeparser) /
 [rprotobuf](../rprotobuf) /
-[tractrix](../tractrix)):
+[tractrix](https://crates.io/crates/tractrix)):
 
 ```rust
 fn new(handler: &mut H) -> Self;
@@ -272,7 +272,7 @@ Gumdrop-strict rejects where documented.
 **Skipped.** Echo / `http-hello` already prove handler + Endpoint + TLS +
 storage. Filesystem HTTP is **WebDAV**, not a GET/HEAD FileHandler slice.
 
-**Uses [tractrix](../tractrix)** for PROPFIND/PROPPATCH/lock XML (and later
+**Uses [tractrix](https://crates.io/crates/tractrix)** for PROPFIND/PROPPATCH/lock XML (and later
 composition XML). See [Tranche 9+](#tranche-9--further-gumdrop-protocols).
 
 `HttpService` / `HttpListener` sugar can appear when a second listener pattern
