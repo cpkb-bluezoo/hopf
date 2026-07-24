@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,49 +60,466 @@
     <main class="main">
       <header>
         <h1>Runtime options</h1>
-        
+        <p class="lead">Crate <code>hopf-core</code>: process-wide <code>Runtime</code> knobs — worker reactors, blocking storage pool, per-connection TCP listen/dial parameters, and the optional <code>TelemetryHook</code>.</p>
       </header>
-      <h2 id="runtimeconfig">RuntimeConfig</h2>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#runtimeconfig">RuntimeConfig</a></li>
+<li><a href="#storageconfig">StorageConfig</a></li>
+<li><a href="#tcplistenerconfig">TcpListenerConfig</a></li>
+<li><a href="#tcpconnectorconfig">TcpConnectorConfig</a></li>
+<li><a href="#acl-and-accept-rate-limit">ACL and accept rate limit</a></li>
+<li><a href="#idle-timeout">Idle timeout</a></li>
+<li><a href="#telemetry-hook">Telemetry hook</a></li>
+<li><a href="#storageexecutor">StorageExecutor</a></li>
+<li><a href="#worker-handles">Worker handles</a></li>
+<li><a href="#see-also">See also</a></li>
+</ul></div>
+<h2 id="runtimeconfig">RuntimeConfig</h2>
 <table>
 <colgroup>
-<col style="width: 41%" />
-<col style="width: 58%" />
+<col style="width: 22%" />
+<col style="width: 19%" />
+<col style="width: 29%" />
+<col style="width: 29%" />
 </colgroup>
 <thead>
 <tr>
 <th>Field</th>
+<th>Type</th>
+<th>Default</th>
 <th>Meaning</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>worker_threads</code></td>
+<td><code>usize</code></td>
+<td><code>0</code></td>
 <td>Reactor count. <code>0</code> → <code>available_parallelism * 2</code> (min 2)</td>
 </tr>
 <tr>
 <td><code>storage</code></td>
-<td><code>StorageConfig</code> for the blocking pool</td>
+<td><code>StorageConfig</code></td>
+<td><code>StorageConfig::default()</code></td>
+<td>Blocking pool</td>
 </tr>
 </tbody>
 </table>
-<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Runtime::</span>start(RuntimeConfig <span class="op">{</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    worker_threads<span class="op">:</span> <span class="dv">4</span><span class="op">,</span></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">..</span><span class="bu">Default</span><span class="pp">::</span><span class="kw">default</span>()</span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">?;</span></span></code></pre></div>
+<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Runtime<span class="op">,</span> RuntimeConfig<span class="op">};</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Runtime::</span>start(RuntimeConfig <span class="op">{</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    worker_threads<span class="op">:</span> <span class="dv">4</span><span class="op">,</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">..</span><span class="bu">Default</span><span class="pp">::</span><span class="kw">default</span>()</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">?;</span></span></code></pre></div>
 <p>With telemetry: <code>Runtime::start_with_telemetry(config, Some(hook))</code> or <code>Composition::telemetry(hook)</code>.</p>
-<h2 id="per-connection-knobs-tcplistenerconfig-connector">Per-connection knobs (<code>TcpListenerConfig</code> / connector)</h2>
-<p>Typical fields (see crate docs): buffer sizes, max net in/out, idle timers, optional TLS acceptor/connector, STARTTLS acceptor, <strong>ACL</strong>, <strong>rate limit</strong>.</p>
-<h2 id="storage-and-execute">Storage and execute</h2>
-<ul>
-<li><code>rt.storage().submit(…)</code> — blocking work off-loop</li>
-<li>Hop results to the connection via <code>ConnHandle</code> / <code>Endpoint::execute</code> so the reactor stays non-blocking</li>
-</ul>
+<h2 id="storageconfig">StorageConfig</h2>
+<table>
+<colgroup>
+<col style="width: 22%" />
+<col style="width: 19%" />
+<col style="width: 29%" />
+<col style="width: 29%" />
+</colgroup>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>threads</code></td>
+<td><code>usize</code></td>
+<td><code>max(available_parallelism, 4)</code></td>
+<td>Fixed storage worker count</td>
+</tr>
+<tr>
+<td><code>queue_capacity</code></td>
+<td><code>usize</code></td>
+<td><code>4096</code></td>
+<td>Bounded queue; excess submissions <strong>reject</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Fail-fast backpressure: <code>StorageError::Rejected</code> — never blocks a reactor thread waiting for a storage slot.</p>
+<h2 id="tcplistenerconfig">TcpListenerConfig</h2>
+<p>TCP listen birth path — peer of <code>TcpConnectorConfig</code>.</p>
+<table>
+<colgroup>
+<col style="width: 22%" />
+<col style="width: 19%" />
+<col style="width: 29%" />
+<col style="width: 29%" />
+</colgroup>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>addr</code></td>
+<td><code>SocketAddr</code></td>
+<td>(required)</td>
+<td>Bind address; port <code>0</code> = ephemeral</td>
+</tr>
+<tr>
+<td><code>factory</code></td>
+<td><code>HandlerFactory</code></td>
+<td>(required)</td>
+<td><code>Fn() -&gt; Box&lt;dyn ProtocolHandler&gt;</code></td>
+</tr>
+<tr>
+<td><code>max_net_in</code></td>
+<td><code>usize</code></td>
+<td><code>DEFAULT_MAX_NET_IN</code> (<code>1 MiB</code>)</td>
+<td>Close if inbound buffer exceeds</td>
+</tr>
+<tr>
+<td><code>max_net_out</code></td>
+<td><code>usize</code></td>
+<td><code>DEFAULT_MAX_NET_OUT</code> (<code>4 MiB</code>)</td>
+<td>Close if outbound buffer exceeds</td>
+</tr>
+<tr>
+<td><code>idle_timeout</code></td>
+<td><code>Option&lt;Duration&gt;</code></td>
+<td><code>None</code></td>
+<td>Idle (no receive); <strong>partially wired</strong></td>
+</tr>
+<tr>
+<td><code>secure</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>TLS-from-accept when true</td>
+</tr>
+<tr>
+<td><code>tls</code></td>
+<td><code>Option&lt;SharedTlsAcceptor&gt;</code></td>
+<td><code>None</code></td>
+<td>Acceptor for TLS-from-accept / STARTTLS</td>
+</tr>
+<tr>
+<td><code>acl</code></td>
+<td><code>PeerAcl</code></td>
+<td><code>PeerAcl::open()</code></td>
+<td>Peer allow/deny CIDRs</td>
+</tr>
+<tr>
+<td><code>rate_limit</code></td>
+<td><code>Option&lt;AcceptRateLimit&gt;</code></td>
+<td><code>None</code></td>
+<td>Accept token bucket</td>
+</tr>
+</tbody>
+</table>
+<p>Constants: <code>DEFAULT_BUFFER_SIZE = 8 KiB</code> (read chunk / initial buffer).</p>
+<h3 id="builders">Builders</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Method</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TcpListenerConfig::new(addr, factory)</code></td>
+<td>Plaintext defaults</td>
+</tr>
+<tr>
+<td><code>max_net_in(n)</code> / <code>max_net_out(n)</code></td>
+<td>Override buffer caps</td>
+</tr>
+<tr>
+<td><code>idle_timeout(Option&lt;Duration&gt;)</code></td>
+<td>Set idle timer</td>
+</tr>
+<tr>
+<td><code>with_tls(acceptor)</code></td>
+<td>Sets <code>secure = true</code> + acceptor</td>
+</tr>
+<tr>
+<td><code>with_starttls_acceptor(acceptor)</code></td>
+<td>Acceptor without TLS-from-accept</td>
+</tr>
+<tr>
+<td><code>with_acl(PeerAcl)</code></td>
+<td>Replace ACL</td>
+</tr>
+<tr>
+<td><code>with_rate_limit(AcceptRateLimit)</code></td>
+<td>Accept rate limit</td>
+</tr>
+</tbody>
+</table>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>PeerAcl<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_tls::</span>acceptor_from_pem<span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::path::</span><span class="dt">Path</span><span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> acceptor <span class="op">=</span> acceptor_from_pem(<span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;c.pem&quot;</span>)<span class="op">,</span> <span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;k.pem&quot;</span>)<span class="op">,</span> <span class="op">&amp;</span>[<span class="st">b&quot;h2&quot;</span><span class="op">,</span> <span class="st">b&quot;http/1.1&quot;</span>])<span class="op">?;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> cfg <span class="op">=</span> <span class="pp">TcpListenerConfig::</span>new(addr<span class="op">,</span> factory)</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>max_net_in(<span class="dv">2</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>)</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>idle_timeout(<span class="cn">Some</span>(<span class="pp">Duration::</span>from_secs(<span class="dv">60</span>)))</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_tls(acceptor)</span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_acl(<span class="pp">PeerAcl::</span>open())<span class="op">;</span></span></code></pre></div>
+<h2 id="tcpconnectorconfig">TcpConnectorConfig</h2>
+<p>TCP dial birth path — same buffer / idle / TLS knobs as listen.</p>
+<table>
+<colgroup>
+<col style="width: 22%" />
+<col style="width: 19%" />
+<col style="width: 29%" />
+<col style="width: 29%" />
+</colgroup>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>addr</code></td>
+<td><code>SocketAddr</code></td>
+<td>(required)</td>
+<td>Peer (Stage 0: already resolved)</td>
+</tr>
+<tr>
+<td><code>factory</code></td>
+<td><code>HandlerFactory</code></td>
+<td>(required)</td>
+<td>Handler for this dial</td>
+</tr>
+<tr>
+<td><code>max_net_in</code></td>
+<td><code>usize</code></td>
+<td><code>1 MiB</code></td>
+<td>Inbound cap</td>
+</tr>
+<tr>
+<td><code>max_net_out</code></td>
+<td><code>usize</code></td>
+<td><code>4 MiB</code></td>
+<td>Outbound cap</td>
+</tr>
+<tr>
+<td><code>idle_timeout</code></td>
+<td><code>Option&lt;Duration&gt;</code></td>
+<td><code>None</code></td>
+<td>Idle timer (partial)</td>
+</tr>
+<tr>
+<td><code>secure</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>TLS-from-dial when true</td>
+</tr>
+<tr>
+<td><code>tls</code></td>
+<td><code>Option&lt;SharedTlsConnector&gt;</code></td>
+<td><code>None</code></td>
+<td>Client connector</td>
+</tr>
+<tr>
+<td><code>server_name</code></td>
+<td><code>Option&lt;String&gt;</code></td>
+<td><code>None</code></td>
+<td>SNI / cert name (defaults to addr display)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="builders-1">Builders</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TcpConnectorConfig::new(addr, factory)</code></td>
+<td>Plaintext defaults</td>
+</tr>
+<tr>
+<td><code>max_net_in</code> / <code>max_net_out</code> / <code>idle_timeout</code></td>
+<td>Same as listen</td>
+</tr>
+<tr>
+<td><code>with_tls(connector, server_name)</code></td>
+<td>TLS-from-dial + SNI</td>
+</tr>
+<tr>
+<td><code>server_name(name)</code></td>
+<td>Override SNI without changing connector</td>
+</tr>
+</tbody>
+</table>
+<h2 id="acl-and-accept-rate-limit">ACL and accept rate limit</h2>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 29%" />
+<col style="width: 45%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Knobs</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PeerAcl</code></td>
+<td><code>allow: Vec&lt;IpNet&gt;</code>, <code>deny: Vec&lt;IpNet&gt;</code></td>
+<td>Deny wins; empty allow ⇒ allow-all</td>
+</tr>
+<tr>
+<td><code>IpNet::parse("addr/prefix")</code></td>
+<td>IPv4 / IPv6 CIDR</td>
+<td>Used by ACL</td>
+</tr>
+<tr>
+<td><code>AcceptRateLimit::new(per_source, window, global)</code></td>
+<td><code>u32</code>, <code>Duration</code>, <code>u32</code></td>
+<td>Token bucket; <code>0</code> = unlimited on that axis</td>
+</tr>
+</tbody>
+</table>
+<p>Applied on the accept path before the connection is handed to a worker.</p>
+<h2 id="idle-timeout">Idle timeout</h2>
+<p><code>idle_timeout: Option&lt;Duration&gt;</code> exists on both listen and dial configs and is plumbed into <code>TcpConnParams</code>. <strong>Enforcement is only partially wired (Tranche 1)</strong> — do not rely on it as a complete idle-close product feature yet. Prefer application-level timers via <code>Endpoint::schedule_timer</code> where needed.</p>
+<h2 id="telemetry-hook">Telemetry hook</h2>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>TelemetryHook<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::net::</span>SocketAddr<span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> TelemetryHook<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_accept(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> SocketAddr) <span class="op">{</span> <span class="co">/* ... */</span> <span class="op">}</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_dial(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> SocketAddr) <span class="op">{}</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_close(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> SocketAddr) <span class="op">{}</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_error(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;</span>SocketAddr<span class="op">&gt;,</span> msg<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>) <span class="op">{}</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TelemetryHook</code></td>
+<td>Off-hot-path callbacks (enqueue only)</td>
+</tr>
+<tr>
+<td><code>NopTelemetry</code></td>
+<td>Discarding default</td>
+</tr>
+<tr>
+<td><code>Runtime::start_with_telemetry</code></td>
+<td>Install at start</td>
+</tr>
+<tr>
+<td><code>Composition::telemetry</code></td>
+<td>Same via builder</td>
+</tr>
+</tbody>
+</table>
+<p>Production exporters live in <code>hopf-otel</code> (<code>TelemetryPipeline::hook()</code>). See <a href="telemetry.html">telemetry.md</a>.</p>
+<h2 id="storageexecutor">StorageExecutor</h2>
+<table>
+<colgroup>
+<col style="width: 47%" />
+<col style="width: 52%" />
+</colgroup>
+<thead>
+<tr>
+<th>Method</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>submit(&amp;dyn Endpoint, op, callback)</code></td>
+<td>Run <code>op</code> off-loop; hop result via endpoint</td>
+</tr>
+<tr>
+<td><code>submit_on(ConnHandle, op, callback)</code></td>
+<td>Same with a cloned handle</td>
+</tr>
+<tr>
+<td><code>pending_count()</code></td>
+<td>Approximate queued + running jobs</td>
+</tr>
+<tr>
+<td><code>shutdown(self)</code></td>
+<td>Drain / stop pool</td>
+</tr>
+</tbody>
+</table>
+<p>HTTP servers typically obtain <code>ConnHandle</code> from <code>ServerWriter::conn_handle</code> or <code>ServerResponseHandle</code> — see <a href="http/server.html#deferred-responses">http/server.md</a>.</p>
 <h2 id="worker-handles">Worker handles</h2>
-<p><code>rt.worker(i)</code> / <code>rt.pick_worker()</code> — for UDP registration, DNS, and advanced reactor-affine work.</p>
+<table>
+<colgroup>
+<col style="width: 35%" />
+<col style="width: 64%" />
+</colgroup>
+<thead>
+<tr>
+<th>API</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rt.worker(i)</code></td>
+<td>Indexed <code>ReactorHandle</code></td>
+</tr>
+<tr>
+<td><code>rt.pick_worker()</code></td>
+<td>Round-robin worker</td>
+</tr>
+<tr>
+<td><code>rt.worker_count()</code></td>
+<td>Reactor count</td>
+</tr>
+<tr>
+<td><code>rt.schedule_on_worker(idx, delay, FnOnce)</code></td>
+<td>Timer on a chosen worker</td>
+</tr>
+<tr>
+<td><code>rt.storage()</code></td>
+<td><code>&amp;Arc&lt;StorageExecutor&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<p>Use worker handles for UDP registration (DNS), reactor-affine timers, and advanced scheduling — not for blocking filesystem work.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+<li><a href="access-control.html">Access control</a></li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

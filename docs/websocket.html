@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,36 +60,262 @@
     <main class="main">
       <header>
         <h1>WebSocket</h1>
-        <p class="lead">Crate `hopf-websocket`: **RFC 6455** framing with push-incremental parse and app event handlers.</p>
+        <p class="lead">Crate <code>hopf-websocket</code>: RFC 6455 framing and HTTP upgrade helpers on top of <a href="http/overview.html"><code>hopf-http</code></a> upgrade seams. Supports HTTP/1.1 <code>101</code> Upgrade, HTTP/2 Extended CONNECT (<a href="https://www.rfc-editor.org/rfc/rfc8441">RFC 8441</a>), and HTTP/3 Extended CONNECT (<a href="https://www.rfc-editor.org/rfc/rfc9220">RFC 9220</a>).</p>
       </header>
-      <p>Crate <code>hopf-websocket</code>: <strong>RFC 6455</strong> framing with push-incremental parse and app event handlers.</p>
-<h2 id="bootstraps">Bootstraps</h2>
-<p>Handshake rides Hopf HTTP upgrade seams:</p>
+      <p>The crate is <strong>server-centric</strong> (factory as <code>ServerHandlerFactory</code>); handshake helpers also exist for clients. Framing is push-incremental and split-feed safe.</p>
+<div class="toc"><h2 id="contents">Contents</h2>
 <ul>
-<li>HTTP/1.1 Upgrade</li>
-<li>HTTP/2 Extended CONNECT (<a href="https://www.rfc-editor.org/rfc/rfc8441">RFC 8441</a>)</li>
-<li>HTTP/3 Extended CONNECT (<a href="https://www.rfc-editor.org/rfc/rfc9220">RFC 9220</a>)</li>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#handshake">Handshake</a></li>
+<li><a href="#framing">Framing</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#event-handler-spi">Event handler SPI</a></li>
+<li><a href="#session-send-api">Session send API</a></li>
+<li><a href="#echo-helper">Echo helper</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="standards">Standards</h2>
+<table>
+<colgroup>
+<col style="width: 64%" />
+<col style="width: 35%" />
+</colgroup>
+<thead>
+<tr>
+<th>Reference</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc6455">RFC 6455</a></td>
+<td>Framing, opcodes, masking, control-frame rules, Accept GUID</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc8441">RFC 8441</a></td>
+<td>HTTP/2 Extended CONNECT</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc9220">RFC 9220</a></td>
+<td>HTTP/3 Extended CONNECT</td>
+</tr>
+</tbody>
+</table>
+<p>Constants: <code>WEBSOCKET_GUID</code> = <code>258EAFA5-E914-47DA-95CA-C5AB0DC85B11</code>, <code>WEBSOCKET_VERSION</code> = <code>13</code>, <code>MAX_CONTROL_PAYLOAD</code> = 125.</p>
+<h2 id="architecture">Architecture</h2>
+<pre><code>HTTP Stream (H1 / H2 / H3)
+        │  upgrade() / Extended CONNECT
+        ▼
+WsUpgradeHandler  (ProtocolUpgradeHandler)
+        │
+        ├── WsFrameParser (role-aware masking)
+        └── WsEventHandler callbacks
+                │
+                └── WsSession send_* helpers</code></pre>
+<p>Wire as a normal HTTP <code>ServerHandlerFactory</code>:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_websocket::</span><span class="op">{</span>EchoFactory<span class="op">,</span> WebSocketConfig<span class="op">,</span> WebSocketFactory<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> events <span class="op">=</span> EchoFactory<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> ws <span class="op">=</span> <span class="pp">WebSocketFactory::</span>new(events<span class="op">,</span> <span class="pp">WebSocketConfig::</span><span class="kw">default</span>())<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co">// use `ws` as Arc&lt;dyn ServerHandlerFactory&gt; under CleartextHttpEndpoint / AlpnHttpEndpoint</span></span></code></pre></div>
+<h2 id="handshake">Handshake</h2>
+<h3 id="http1.1">HTTP/1.1</h3>
+<p>Helpers: <code>is_h1_websocket_upgrade</code>, <code>validate_h1_upgrade</code> → key, <code>calculate_accept</code>, <code>websocket_accept_headers</code>, <code>generate_key</code> (client).</p>
+<p>Successful upgrade yields <strong>101</strong> with <code>Sec-WebSocket-Accept</code>.</p>
+<h3 id="http2-http3">HTTP/2 / HTTP/3</h3>
+<p><code>is_extended_connect_websocket</code> / <code>websocket_connect_response_headers</code> — successful Extended CONNECT yields <strong>200</strong> and then WebSocket frames on the stream.</p>
+<p>Optional <code>WebSocketConfig.subprotocol</code> is negotiated when set.</p>
+<h2 id="framing">Framing</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>WsFrameParser</code></td>
+<td>Incremental parser; <code>receive(&amp;[u8], &amp;mut dyn WsFrameHandler)</code></td>
+</tr>
+<tr>
+<td><code>WsFrameHandler</code></td>
+<td>Frame callbacks</td>
+</tr>
+<tr>
+<td><code>Opcode</code></td>
+<td>Text / Binary / Close / Ping / Pong / Cont</td>
+</tr>
+<tr>
+<td><code>WsRole</code></td>
+<td><code>Server</code> / <code>Client</code> (masking direction)</td>
+</tr>
+<tr>
+<td><code>write_frame</code></td>
+<td>Encode a frame into a <code>Vec&lt;u8&gt;</code></td>
+</tr>
+<tr>
+<td><code>WsFrameError</code></td>
+<td>Protocol / size / UTF-8 errors</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Role / masking:</strong></p>
+<ul>
+<li>Server: inbound frames <strong>must</strong> be masked; outbound <strong>must not</strong>.</li>
+<li>Client: reverse (outbound masked via <code>getrandom</code>).</li>
 </ul>
-<p>Implement <code>WsEventHandlerFactory::create(path, headers)</code> → <code>Box&lt;dyn WsEventHandler&gt;</code> (<code>on_open</code>, text/binary, ping/pong, close). Send with <code>WsSession::send_text</code> / <code>send_binary</code> / <code>send_ping</code> / <code>send_close</code>.</p>
-<p>Text/binary callbacks currently assume <strong>single-frame</strong> messages (no reassembly yet).</p>
-<h2 id="wiring">Wiring</h2>
-<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">WebSocketFactory::</span>new(</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    EchoFactory<span class="op">,</span> <span class="co">// or your WsEventHandlerFactory</span></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="pp">WebSocketConfig::</span><span class="kw">default</span>()<span class="op">,</span></span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>))<span class="op">;</span></span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>add_tcp_listener(<span class="pp">TcpListenerConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">CleartextHttpEndpoint::</span>new(</span>
-<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory) <span class="kw">as</span> Arc<span class="op">&lt;</span><span class="kw">dyn</span> ServerHandlerFactory<span class="op">&gt;,</span></span>
-<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>        <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
-<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    ))</span>
-<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>))<span class="op">?;</span></span></code></pre></div>
-<p><code>WebSocketConfig</code>: <code>max_payload</code> (default 16 MiB), optional <code>subprotocol</code>.</p>
-<h2 id="example">Example</h2>
-<p>Stock echo: <a href="cookbook/websocket.html">cookbook: WebSocket</a> (<code>examples/websocket</code>, package <code>websocket-echo</code>).</p>
+<p>Enforced: RSV bits zero (no extensions), known opcodes, control-frame constraints (FIN, ≤125 bytes), <code>max_payload</code>, valid UTF-8 for text. Default <strong>auto-pong</strong> on ping.</p>
+<h2 id="configuration">Configuration</h2>
+<h3 id="websocketconfig-default"><code>WebSocketConfig</code> (<code>Default</code>)</h3>
+<table>
+<colgroup>
+<col style="width: 31%" />
+<col style="width: 18%" />
+<col style="width: 28%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>max_payload</code></td>
+<td>size</td>
+<td><strong>16 MiB</strong></td>
+<td>Reject larger data frames</td>
+</tr>
+<tr>
+<td><code>subprotocol</code></td>
+<td><code>Option&lt;String&gt;</code></td>
+<td><code>None</code></td>
+<td>Offered / selected subprotocol</td>
+</tr>
+</tbody>
+</table>
+<h3 id="wsupgradehandler"><code>WsUpgradeHandler</code></h3>
+<table>
+<thead>
+<tr>
+<th>Constructor</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>WsUpgradeHandler::server(event, max_payload)</code></td>
+<td>Server role</td>
+</tr>
+<tr>
+<td><code>WsUpgradeHandler::client(event, max_payload)</code></td>
+<td>Client role</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cargo-features">Cargo features</h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>(default)</td>
+<td>Framing + H1/H2 upgrade</td>
+</tr>
+<tr>
+<td><code>integration</code></td>
+<td>Enables <code>hopf-http/h3</code> for H3 tests</td>
+</tr>
+</tbody>
+</table>
+<h2 id="event-handler-spi">Event handler SPI</h2>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> WsEventHandlerFactory <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> create(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> path<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span> req<span class="op">:</span> <span class="op">&amp;</span>Headers) <span class="op">-&gt;</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> WsEventHandler<span class="op">&gt;;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> WsEventHandler <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> opened(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> session<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> WsSession)<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> text_message(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> session<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> WsSession<span class="op">,</span> text<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> binary_message(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> session<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> WsSession<span class="op">,</span> data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> ping(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> session<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> WsSession<span class="op">,</span> payload<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span> <span class="co">// default auto-pong</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> pong(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> session<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> WsSession<span class="op">,</span> payload<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> closed(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> code<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;</span><span class="dt">u16</span><span class="op">&gt;,</span> reason<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> error(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> err<span class="op">:</span> WsFrameError)<span class="op">;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><code>WebSocketFactory&lt;F&gt;</code> implements <code>ServerHandlerFactory</code> for any <code>F: WsEventHandlerFactory</code>.</p>
+<h2 id="session-send-api">Session send API</h2>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> WsSession <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> send_text(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> text<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> send_binary(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> send_ping(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> payload<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> send_pong(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> payload<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> send_close(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> code<span class="op">:</span> <span class="dt">u16</span><span class="op">,</span> reason<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Free helpers: <code>write_text</code>, <code>write_binary</code>, <code>write_ping</code>, <code>write_pong</code>, <code>write_close</code> (encode into buffers).</p>
+<h2 id="echo-helper">Echo helper</h2>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>EchoFactory</code></td>
+<td><code>WsEventHandlerFactory</code> for demos</td>
+</tr>
+<tr>
+<td><code>EchoWsHandler</code></td>
+<td>Echoes text/binary</td>
+</tr>
+</tbody>
+</table>
+<p>Used by <code>examples/websocket</code>.</p>
+<h2 id="examples">Examples</h2>
+<p>See <a href="cookbook/websocket.html">Cookbook: WebSocket</a>.</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> websocket <span class="at">--</span> 127.0.0.1:8080</span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Package</th>
+<th>Demonstrates</th>
+<th>Knobs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/websocket</code></td>
+<td>Echo server</td>
+<td>arg1 = listen addr</td>
+</tr>
+</tbody>
+</table>
+<p>No environment variables.</p>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li><strong>Single-frame messages only</strong> — fragmented (non-FIN / continuation) messages are <strong>not</strong> reassembled; they are dropped.</li>
+<li>No <code>permessage-deflate</code> or other extensions (RSV must be zero).</li>
+<li>Close handling sends a close and marks the session dead.</li>
+<li>Client handshake helpers exist, but the primary factory path is server-oriented.</li>
+<li>Relies on HTTP trailers / Extended CONNECT behaviour of <code>hopf-http</code> for H2/H3.</li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

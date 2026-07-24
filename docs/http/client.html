@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="../index.html"><img src="../assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="../index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,20 +60,248 @@
     <main class="main">
       <header>
         <h1>HTTP client</h1>
-        <p class="lead">Demo: `examples/http-get`.</p>
+        <p class="lead">Crate <code>hopf-http</code>: client face of an HTTP Stream. Implement <code>ClientHandler</code>, wrap with <code>ClientHandlerFactory</code>, and dial via <code>H1Endpoint::client</code>, <code>H2Endpoint::client</code>, or <code>connect_h3</code>.</p>
       </header>
-      <p>Demo: <code>examples/http-get</code>.</p>
-<p>Patterns:</p>
+      <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
-<li><strong>H1</strong> — <code>H1Endpoint::client</code> + <code>ClientHandler</code> / <code>ClientWriter</code></li>
-<li><strong>H2</strong> — <code>H2Endpoint::client</code> (preface + SETTINGS); <code>http-get --http2</code></li>
-<li><strong>H3</strong> — <code>connect_h3</code> with feature <code>h3</code></li>
+<li><a href="#clienthandler-spi">ClientHandler SPI</a></li>
+<li><a href="#clientwriter-methods">ClientWriter methods</a></li>
+<li><a href="#dial-patterns">Dial patterns</a></li>
+<li><a href="#http-get-flags">http-get flags</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#see-also">See also</a></li>
+</ul></div>
+<h2 id="clienthandler-spi">ClientHandler SPI</h2>
+<table>
+<colgroup>
+<col style="width: 53%" />
+<col style="width: 46%" />
+</colgroup>
+<thead>
+<tr>
+<th>Trait</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ClientHandlerFactory</code></td>
+<td><code>create_handler() -&gt; Box&lt;dyn ClientHandler&gt;</code> per outbound Stream</td>
+</tr>
+<tr>
+<td><code>ClientHandler</code></td>
+<td>Drive one request and receive the response</td>
+</tr>
+<tr>
+<td><code>ClientWriter</code></td>
+<td>Outbound request / in-flight control</td>
+</tr>
+</tbody>
+</table>
+<h3 id="callback-sequence">Callback sequence</h3>
+<ol type="1">
+<li><code>start(&amp;mut dyn ClientWriter)</code> — write request headers ± body</li>
+<li><code>response_headers</code></li>
+<li><code>start_response_body</code> / <code>response_body_content</code>* / <code>end_response_body</code> (optional)</li>
+<li><code>response_trailers</code> (H2/H3; default ignore — used by gRPC)</li>
+<li><code>response_complete</code></li>
+</ol>
+<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>ClientHandler<span class="op">,</span> ClientWriter<span class="op">,</span> Headers<span class="op">};</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> GetOnce <span class="op">{</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    host<span class="op">:</span> <span class="dt">String</span><span class="op">,</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    path<span class="op">:</span> <span class="dt">String</span><span class="op">,</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ClientHandler <span class="cf">for</span> GetOnce <span class="op">{</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> start(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> request<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ClientWriter) <span class="op">{</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> h <span class="op">=</span> <span class="pp">Headers::</span>new()<span class="op">;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>set(<span class="st">&quot;:method&quot;</span><span class="op">,</span> <span class="st">&quot;GET&quot;</span>)<span class="op">;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>set(<span class="st">&quot;:path&quot;</span><span class="op">,</span> <span class="op">&amp;</span><span class="kw">self</span><span class="op">.</span>path)<span class="op">;</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>set(<span class="st">&quot;host&quot;</span><span class="op">,</span> <span class="op">&amp;</span><span class="kw">self</span><span class="op">.</span>host)<span class="op">;</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>set(<span class="st">&quot;connection&quot;</span><span class="op">,</span> <span class="st">&quot;close&quot;</span>)<span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>        request<span class="op">.</span>headers(h)<span class="op">;</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>        request<span class="op">.</span>complete_request()<span class="op">;</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> response_headers(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _request<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ClientWriter<span class="op">,</span> headers<span class="op">:</span> <span class="op">&amp;</span>Headers) <span class="op">{</span></span>
+<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> _status <span class="op">=</span> headers<span class="op">.</span>status_code()<span class="op">;</span></span>
+<span id="cb1-21"><a href="#cb1-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-22"><a href="#cb1-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-23"><a href="#cb1-23" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> response_body_content(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _request<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ClientWriter<span class="op">,</span> data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">{</span></span>
+<span id="cb1-24"><a href="#cb1-24" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> _ <span class="op">=</span> data<span class="op">;</span></span>
+<span id="cb1-25"><a href="#cb1-25" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-26"><a href="#cb1-26" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-27"><a href="#cb1-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> response_complete(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _request<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ClientWriter) <span class="op">{}</span></span>
+<span id="cb1-28"><a href="#cb1-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h2 id="clientwriter-methods">ClientWriter methods</h2>
+<table>
+<colgroup>
+<col style="width: 47%" />
+<col style="width: 52%" />
+</colgroup>
+<thead>
+<tr>
+<th>Method</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>headers(Headers)</code></td>
+<td>Buffer request headers (include <code>:method</code>, <code>:path</code>, …)</td>
+</tr>
+<tr>
+<td><code>start_request_body()</code></td>
+<td>Flush headers and begin the body (or end if empty)</td>
+</tr>
+<tr>
+<td><code>request_body_content(&amp;[u8])</code></td>
+<td>Write request body bytes</td>
+</tr>
+<tr>
+<td><code>end_request_body()</code></td>
+<td>Finish the request body</td>
+</tr>
+<tr>
+<td><code>complete_request()</code></td>
+<td>Finish the request (flushes headers if no body was started)</td>
+</tr>
+</tbody>
+</table>
+<p>For distributed tracing, wrap writers with <code>hopf_otel::with_traceparent</code> / <code>PropagatingClientWriter</code> when using <code>hopf-otel</code>.</p>
+<h2 id="dial-patterns">Dial patterns</h2>
+<p>Listen and dial are peers: the same Stream SPI runs under a <code>TcpConnectorConfig</code> factory or H3 <code>connect_h3</code>.</p>
+<h3 id="http1.1-cleartext">HTTP/1.1 cleartext</h3>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> Runtime<span class="op">,</span> TcpConnectorConfig<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>H1Endpoint<span class="op">,</span> HttpLimits<span class="op">};</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect(<span class="pp">TcpConnectorConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">H1Endpoint::</span>client(</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">,</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>        <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>        <span class="cn">false</span><span class="op">,</span> <span class="co">// not TLS-from-dial at the H1 layer</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    )) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>))<span class="op">?;</span></span></code></pre></div>
+<h3 id="http2-prior-knowledge-h2c">HTTP/2 prior-knowledge (h2c)</h3>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span>H2Endpoint<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect(<span class="pp">TcpConnectorConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">H2Endpoint::</span>client(</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>        <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>        <span class="cn">false</span><span class="op">,</span> <span class="co">// cleartext prior-knowledge</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    )) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>))<span class="op">?;</span></span></code></pre></div>
+<h3 id="tls-alpn">TLS + ALPN</h3>
+<p>Attach <code>hopf_tls::connector_from_pem</code> via <code>TcpConnectorConfig::with_tls</code>, and use <code>H2Endpoint::client</code> / <code>H1Endpoint::client</code> (or an ALPN-aware client stack matching the server). Server name / SNI is set on the connector config.</p>
+<h3 id="http3">HTTP/3</h3>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>connect_h3<span class="op">,</span> HttpLimits<span class="op">};</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_quic::</span><span class="op">{</span>client_config_from_pem<span class="op">,</span> ALPN_H3<span class="op">};</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> client_cfg <span class="op">=</span> client_config_from_pem(ca_path<span class="op">,</span> <span class="op">&amp;</span>[ALPN_H3])<span class="op">?;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> handle <span class="op">=</span> connect_h3(</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    addr<span class="op">,</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    client_cfg<span class="op">,</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;localhost&quot;</span><span class="op">,</span> <span class="co">// SNI / cert name</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    factory<span class="op">,</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div>
+<h3 id="dial-by-name">Dial by name</h3>
+<p><code>hopf_dns::RuntimeDnsExt::connect_by_name</code> resolves then <code>Runtime::connect</code>. Must not run on a reactor thread. See <a href="../clients.html">clients.md</a> and <a href="../dns.html">dns.md</a>.</p>
+<h2 id="http-get-flags">http-get flags</h2>
+<p>Demo binary: <code>examples/http-get</code> (crate <code>http-get</code>).</p>
+<pre class="text"><code>cargo run -p http-get -- [FLAGS] [ADDR] [PATH]</code></pre>
+<table>
+<colgroup>
+<col style="width: 57%" />
+<col style="width: 42%" />
+</colgroup>
+<thead>
+<tr>
+<th>Flag / arg</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--http2</code> / <code>--h2</code></td>
+<td>Dial with <code>H2Endpoint::client</code> (cleartext prior-knowledge)</td>
+</tr>
+<tr>
+<td><code>--http3</code> / <code>--h3</code></td>
+<td>Dial with <code>connect_h3</code> (requires <code>--ca</code>)</td>
+</tr>
+<tr>
+<td><code>--ca &lt;pem&gt;</code></td>
+<td>Trust store / leaf PEM for H3 (<code>client_config_from_pem</code>)</td>
+</tr>
+<tr>
+<td><code>--server-name &lt;name&gt;</code></td>
+<td>TLS server name for H3 (default <code>localhost</code>)</td>
+</tr>
+<tr>
+<td><code>ADDR</code></td>
+<td>Peer <code>SocketAddr</code> (default <code>127.0.0.1:8080</code>, or <code>:4433</code> for H3)</td>
+</tr>
+<tr>
+<td><code>PATH</code></td>
+<td>Request path (default <code>/</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>Typical pairing with servers:</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># H1</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> http-hello <span class="at">--</span> 127.0.0.1:8080</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> http-get <span class="at">--</span> 127.0.0.1:8080 /</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="co"># H2 prior-knowledge</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> http-get <span class="at">--</span> <span class="at">--http2</span> 127.0.0.1:8080 /</span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="co"># H3</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> http3-hello <span class="at">--</span> 127.0.0.1:4433</span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> http-get <span class="at">--</span> <span class="at">--http3</span> <span class="at">--ca</span> <span class="st">&quot;</span><span class="va">$TMPDIR</span><span class="st">/hopf-http3-hello/cert.pem&quot;</span> <span class="dt">\</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    127.0.0.1:4433 /</span></code></pre></div>
+<h2 id="examples">Examples</h2>
+<table>
+<thead>
+<tr>
+<th>Example</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/http-get</code></td>
+<td>H1 / H2 / H3 GET client</td>
+</tr>
+<tr>
+<td><code>examples/http-hello</code></td>
+<td>Twin server for H1/H2</td>
+</tr>
+<tr>
+<td><code>examples/http3-hello</code></td>
+<td>Twin server for H3</td>
+</tr>
+</tbody>
+</table>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>Stage-0 dials expect a pre-resolved <code>SocketAddr</code> unless using <code>connect_by_name</code>.</li>
+<li>H3 client opens one request Stream after handshake in the stock <code>H3ClientConnection</code> path (suitable for the GET demo; not a pool).</li>
+<li>Response trailers are delivered only on H2/H3.</li>
 </ul>
-<p>Implement <code>ClientHandler</code> for response events (headers, body chunks, complete). Dial with <code>Runtime::connect</code> and a TLS connector when using HTTPS.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="overview.html">HTTP overview</a></li>
+<li><a href="server.html">HTTP server</a></li>
+<li><a href="../clients.html">Clients</a></li>
+<li><a href="../quic-h3.html">QUIC / H3</a></li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

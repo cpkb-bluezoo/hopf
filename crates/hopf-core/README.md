@@ -33,5 +33,5 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-See workspace [PLAN.md](../../PLAN.md) and [TRANCHES.md](../../TRANCHES.md).
+See [docs/architecture.html](../../docs/architecture.html).
 Run `cargo run -p echo` for a live echo server.

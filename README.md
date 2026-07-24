@@ -1,5 +1,9 @@
 # Hopf
 
+<p align="center">
+  <img src="docs/assets/hopf.png" alt="Hopf fibration" width="360">
+</p>
+
 Native, asynchronous, non-blocking, event-driven **multi-protocol networking
 framework** in Rust. Successor to
 [Gumdrop](https://github.com/cpkb-bluezoo/gumdrop) without the servlet
@@ -21,24 +25,22 @@ Sibling parsers ([crates.io](https://crates.io); local path override via
 
 ## Status
 
-Greenfield. **Tranche 8** complete (composition, dynamic bindings, auth vocabulary,
-CIDR/rate limits, quota/telemetry seams). **DNS** (`hopf-dns`) and
-**QUIC/H3** (Tranche 7) landed. Design locks:
-[issues #1–#8](https://github.com/cpkb-bluezoo/hopf/issues).
+Greenfield with the core protocol surface landed (HTTP/1–3, QUIC, DNS, WebDAV,
+WebSocket, gRPC, FTP, SMTP, mailbox SPI, composition, auth, ACL, telemetry).
+Design locks: [issues #1–#8](https://github.com/cpkb-bluezoo/hopf/issues).
 
 | Document | Role |
 | -------- | ---- |
-| [docs/index.html](docs/index.html) | User guides and cookbook (GitHub Pages) |
-| [PLAN.md](PLAN.md) | Architecture and product decisions |
-| [TRANCHES.md](TRANCHES.md) | Implementation order and exit criteria |
+| [docs/index.html](docs/index.html) | Product overview and feature manuals (GitHub Pages) |
+| [docs/architecture.html](docs/architecture.html) | Architecture decisions |
 
 ## Documentation
 
-Browse the HTML reference at [docs/index.html](docs/index.html) (enable GitHub
-Pages from the `/docs` folder for the published site). Covers getting started,
-services/clients, composition, HTTP, TLS, DNS, auth, and access control. Crate
-READMEs stay short and link there; PLAN/TRANCHES remain architecture/tranche
-sources of truth.
+Browse the HTML reference at
+[https://cpkb-bluezoo.github.io/hopf/](https://cpkb-bluezoo.github.io/hopf/)
+(or [docs/index.html](docs/index.html) locally). Covers what Hopf can do,
+architecture, services/clients, composition, and every protocol crate. Crate
+READMEs stay short and link there.
 
 ## Workspace
 

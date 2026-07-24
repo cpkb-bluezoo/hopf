@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,61 +60,264 @@
     <main class="main">
       <header>
         <h1>Mailbox</h1>
-        <p class="lead">Crate `hopf-mailbox`: IMAP-level **storage** SPI (Gumdrop `org.bluezoo.gumdrop.mailbox` port). Not a full IMAP wire server — an IMAP protocol crate (or custom SMTP delivery) would call these traits.</p>
+        <p class="lead">Crate <code>hopf-mailbox</code>: <strong>mailbox storage SPI</strong> (Gumdrop <code>org.bluezoo.gumdrop.mailbox</code> port) — Maildir++ and mbox backends with SEARCH, flags, and optional <code>.gidx</code> indexing. This is <strong>not</strong> an IMAP wire server; an IMAP protocol crate would sit on top of these traits.</p>
       </header>
-      <p>Crate <code>hopf-mailbox</code>: IMAP-level <strong>storage</strong> SPI (Gumdrop <code>org.bluezoo.gumdrop.mailbox</code> port). Not a full IMAP wire server — an IMAP protocol crate (or custom SMTP delivery) would call these traits.</p>
-<h2 id="backends">Backends</h2>
+      <p>SMTP local delivery is also not wired stock — see <a href="smtp.html">SMTP</a> limitations and append from a custom <code>MessageDataHandler</code> on <code>StorageExecutor</code>.</p>
+<div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#standards-and-layouts">Standards and layouts</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#backends-compared">Backends compared</a></li>
+<li><a href="#public-types">Public types</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#mailbox-api">Mailbox API</a></li>
+<li><a href="#search">SEARCH</a></li>
+<li><a href="#indexing">Indexing</a></li>
+<li><a href="#storage-pool-helpers">Storage pool helpers</a></li>
+<li><a href="#examples--tests">Examples / tests</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="standards-and-layouts">Standards and layouts</h2>
 <table>
 <colgroup>
-<col style="width: 38%" />
-<col style="width: 33%" />
-<col style="width: 27%" />
+<col style="width: 64%" />
+<col style="width: 35%" />
 </colgroup>
 <thead>
 <tr>
-<th>Backend</th>
-<th>Layout</th>
+<th>Reference</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc9051">RFC 9051</a></td>
+<td>IMAP SEARCH §6.4.4; system flags</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc822">RFC 822</a> / Internet Message Format</td>
+<td>Message bytes</td>
+</tr>
+<tr>
+<td>Maildir++</td>
+<td>Hierarchical folders, <code>:2,</code> flags, COPY/MOVE</td>
+</tr>
+<tr>
+<td>mbox</td>
+<td>Single-file mailbox + <code>.flags</code> sidecar</td>
+</tr>
+<tr>
+<td><code>.gidx</code></td>
+<td>Gumdrop-compatible index: v1 headers, v2 body</td>
+</tr>
+</tbody>
+</table>
+<h2 id="architecture">Architecture</h2>
+<pre><code>App / future IMAP / SMTP delivery
+            │
+            ▼
+MailboxFactory → MailboxStore → Mailbox
+            │
+            ├── mbox:  {root}/{user}  + .flags + .gidx
+            └── Maildir++: {root}/{user}/ cur|new|tmp + .uidlist …
+            │
+            └── ALWAYS run search/index I/O on StorageExecutor</code></pre>
+<p>Never perform heavy mailbox I/O on a reactor thread.</p>
+<h2 id="backends-compared">Backends compared</h2>
+<table>
+<colgroup>
+<col style="width: 41%" />
+<col style="width: 20%" />
+<col style="width: 37%" />
+</colgroup>
+<thead>
+<tr>
+<th>Capability</th>
+<th>mbox</th>
+<th>Maildir++</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Layout</td>
+<td>file + <code>.flags</code> + <code>.gidx</code></td>
+<td><code>cur</code>/<code>new</code>/<code>tmp</code>, <code>.uidlist</code>, <code>.keywords</code>, <code>.gidx</code>, <code>.subscriptions</code></td>
+</tr>
+<tr>
+<td>CREATE / DELETE / RENAME folders</td>
+<td>Unsupported (INBOX only)</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>COPY / MOVE</td>
+<td>Unsupported</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Subscriptions</td>
+<td>no-op-ish</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Keywords</td>
+<td>via <code>.flags</code></td>
+<td>Yes</td>
+</tr>
+</tbody>
+</table>
+<p>Factories:</p>
+<ul>
+<li><code>MboxFactory::new(root).with_index_config(cfg)</code> → path <code>{root}/{user}</code></li>
+<li><code>MaildirFactory::new(root).with_index_config(cfg)</code> → <code>{root}/{user}/</code></li>
+</ul>
+<h2 id="public-types">Public types</h2>
+<table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 60%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Mailbox</code></td>
+<td>Open mailbox operations</td>
+</tr>
+<tr>
+<td><code>MailboxStore</code></td>
+<td>Per-user store</td>
+</tr>
+<tr>
+<td><code>MailboxFactory</code></td>
+<td>Create stores</td>
+</tr>
+<tr>
+<td><code>MessageDescriptor</code></td>
+<td>Message metadata</td>
+</tr>
+<tr>
+<td><code>MailboxInfo</code> / <code>MailboxAttribute</code></td>
+<td>LIST-style metadata</td>
+</tr>
+<tr>
+<td><code>Flag</code></td>
+<td>Seen / Answered / Flagged / Deleted / Draft / Recent</td>
+</tr>
+<tr>
+<td><code>SearchCriteria</code> / <code>MessageContext</code></td>
+<td>SEARCH tree + eval</td>
+</tr>
+<tr>
+<td><code>MessageSet</code> / <code>MessageRange</code></td>
+<td><code>1:5,7,*</code></td>
+</tr>
+<tr>
+<td><code>IndexConfig</code></td>
+<td>Body indexing knobs</td>
+</tr>
+<tr>
+<td><code>MailboxError</code> / <code>MailboxResult</code></td>
+<td>Io / Unsupported / Invalid / Corrupt / NotFound / ReadOnly</td>
+</tr>
+<tr>
+<td><code>MailboxNameCodec</code></td>
+<td><code>=XX</code> filesystem-safe names</td>
+</tr>
+<tr>
+<td><code>index::*</code></td>
+<td><code>.gidx</code> (<code>IndexFile</code>, <code>MessageIndex</code>, …)</td>
+</tr>
+</tbody>
+</table>
+<p>Consts: <code>INDEX_MAGIC</code>, <code>INDEX_VERSION_HEADERS = 1</code>, <code>INDEX_VERSION_BODY = 2</code>.</p>
+<h2 id="configuration">Configuration</h2>
+<h3 id="indexconfig"><code>IndexConfig</code></h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default</th>
 <th>Notes</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><strong>mbox</strong></td>
-<td><code>{root}/{user}</code> + <code>.flags</code> sidecar</td>
-<td>INBOX only; no COPY/CREATE hierarchy</td>
+<td><code>body_indexing</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Index body for TEXT/BODY SEARCH</td>
 </tr>
 <tr>
-<td><strong>Maildir++</strong></td>
-<td><code>{root}/{user}/</code></td>
-<td>Hierarchical folders, <code>.uidlist</code> / <code>.keywords</code>, COPY + MOVE, subscriptions</td>
+<td><code>max_body_bytes</code></td>
+<td><code>usize</code></td>
+<td><code>64 * 1024</code></td>
+<td>Cap indexed body bytes</td>
 </tr>
 </tbody>
 </table>
-<h2 id="traits">Traits</h2>
-<ul>
-<li><code>MailboxFactory</code> → <code>MailboxStore</code> (<code>open</code> user, <code>create_mailbox</code>, …)</li>
-<li><code>Mailbox</code>: append, flags, fetch, search, copy/move (Maildir), close/expunge</li>
-</ul>
-<p>Search criteria align with <strong>RFC 9051 §6.4.4</strong> (ALL, flags, dates, HEADER/BODY/TEXT, UID/sequence sets, AND/OR/NOT, MODSEQ, …). Flags: IMAP system flags (<code>\Seen</code> … <code>\Recent</code>) plus Maildir letter mapping.</p>
+<p><strong>Builders:</strong> <code>IndexConfig::headers_only()</code>, <code>IndexConfig::with_body_indexing()</code>.</p>
+<p>No Cargo features on this crate.</p>
+<h2 id="mailbox-api">Mailbox API</h2>
+<p>Typical flow:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_mailbox::</span><span class="op">{</span>IndexConfig<span class="op">,</span> MaildirFactory<span class="op">,</span> SearchCriteria<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory <span class="op">=</span> <span class="pp">MaildirFactory::</span>new(<span class="st">&quot;/var/mail&quot;</span>)</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_index_config(<span class="pp">IndexConfig::</span>with_body_indexing())<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> factory<span class="op">.</span>create_store()<span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>store<span class="op">.</span>open(<span class="st">&quot;alice&quot;</span>)<span class="op">?;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> mb <span class="op">=</span> store<span class="op">.</span>open_mailbox(<span class="st">&quot;INBOX&quot;</span><span class="op">,</span> <span class="cn">false</span>)<span class="op">?;</span> <span class="co">// read_only flag</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>mb<span class="op">.</span>append_message(rfc822_bytes<span class="op">,</span> <span class="op">&amp;</span>flags<span class="op">,</span> <span class="cn">None</span>)<span class="op">?;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> hits <span class="op">=</span> mb<span class="op">.</span>search(<span class="op">&amp;</span><span class="pp">SearchCriteria::</span>text(<span class="st">&quot;needle&quot;</span>))<span class="op">?;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>mb<span class="op">.</span>close(<span class="cn">true</span>)<span class="op">?;</span> <span class="co">// expunge when true</span></span></code></pre></div>
+<p>Operations (trait surface): <code>close(expunge)</code>, counts/size, <code>messages</code>, <code>read_message</code>, UID / uidvalidity / uidnext, flags / keywords, set/replace flags, append stream, <code>search</code>, <code>copy</code> / <code>move</code> (Maildir).</p>
+<h2 id="search">SEARCH</h2>
+<p>Criteria include: ALL, system flags, NEW/OLD, KEYWORD, LARGER/SMALLER, BEFORE/ON/SINCE, SENT*, HEADER, BODY, TEXT, UID / sequence sets, MODSEQ, AND / OR / NOT.</p>
+<p><strong>BODY / TEXT:</strong> use the <code>.gidx</code> body index when <code>body_indexing</code> is enabled; otherwise parse message content on demand.</p>
 <h2 id="indexing">Indexing</h2>
-<p><code>.gidx</code> stores headers, flags, sizes, and dates. <strong>Body text is off by default</strong> (<code>IndexConfig::body_indexing</code>). <code>TEXT</code> / <code>BODY</code> use the body index when enabled; otherwise they parse message content.</p>
-<h2 id="storage-pool">Storage pool</h2>
-<p>Indexing and searching are blocking filesystem work. Call <code>Mailbox::search</code> / index rebuild only from <code>StorageExecutor</code> (see <code>hopf_mailbox::pool</code>), never on a reactor thread.</p>
-<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory <span class="op">=</span> <span class="pp">MaildirFactory::</span>new(root)</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_index_config(<span class="pp">IndexConfig::</span>with_body_indexing())<span class="op">;</span></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> factory<span class="op">.</span>create_store()<span class="op">;</span></span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>store<span class="op">.</span>open(<span class="st">&quot;alice&quot;</span>)<span class="op">?;</span></span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> mb <span class="op">=</span> store<span class="op">.</span>open_mailbox(<span class="st">&quot;INBOX&quot;</span><span class="op">,</span> <span class="cn">false</span>)<span class="op">?;</span></span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>mb<span class="op">.</span>append_message(rfc822<span class="op">,</span> <span class="op">&amp;</span>flags<span class="op">,</span> <span class="cn">None</span>)<span class="op">?;</span></span>
-<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> hits <span class="op">=</span> mb<span class="op">.</span>search(<span class="op">&amp;</span><span class="pp">SearchCriteria::</span>text(<span class="st">&quot;needle&quot;</span>))<span class="op">?;</span></span>
-<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>mb<span class="op">.</span>close(<span class="cn">true</span>)<span class="op">?;</span> <span class="co">// expunge \Deleted</span></span></code></pre></div>
-<h2 id="smtp-imap">SMTP / IMAP</h2>
-<p><code>hopf-smtp</code> stock handlers do not deliver into mailboxes yet. Wire a custom <code>MessageDataHandler</code> that <code>append_message</code>s on the storage pool. An IMAP server would sit on top of the same <code>Mailbox</code> / <code>MailboxStore</code> traits.</p>
-<p>Integration coverage: <code>crates/hopf-mailbox/tests/mailbox_integration.rs</code> (no <code>examples/mailbox</code> yet).</p>
+<p><code>.gidx</code> is Gumdrop-compatible:</p>
+<ul>
+<li>Version <strong>1</strong> — headers</li>
+<li>Version <strong>2</strong> — body (when enabled)</li>
+</ul>
+<p>Body indexing is <strong>off by default</strong> (disk cost). Enable with <code>IndexConfig::with_body_indexing()</code>.</p>
+<h2 id="storage-pool-helpers">Storage pool helpers</h2>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_mailbox::pool::</span><span class="op">{</span>run_on_storage<span class="op">,</span> search_on_storage<span class="op">};</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Prefer these from protocol servers so SEARCH never blocks a reactor:</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>search_on_storage(<span class="op">&amp;</span>storage<span class="op">,</span> handle<span class="op">,</span> mailbox_arc<span class="op">,</span> criteria<span class="op">,</span> callback)<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>run_on_storage(<span class="op">&amp;</span>storage<span class="op">,</span> handle<span class="op">,</span> op<span class="op">,</span> callback)<span class="op">;</span></span></code></pre></div>
+<h2 id="examples-tests">Examples / tests</h2>
+<p>There is <strong>no</strong> <code>examples/mailbox</code> binary. Coverage lives in:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test <span class="at">-p</span> hopf-mailbox</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co"># notably: tests/mailbox_integration.rs</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="co">#  - mbox append / flags / search</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co">#  - mbox rejects COPY</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">#  - Maildir body index</span></span></code></pre></div>
+<p>Wire from SMTP:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// In MessageDataHandler::message_complete — submit to StorageExecutor:</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a>storage<span class="op">.</span>submit_on(handle<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> store <span class="op">=</span> factory<span class="op">.</span>create_store()<span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    store<span class="op">.</span>open(<span class="st">&quot;alice&quot;</span>)<span class="op">?;</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> <span class="kw">mut</span> mb <span class="op">=</span> store<span class="op">.</span>open_mailbox(<span class="st">&quot;INBOX&quot;</span><span class="op">,</span> <span class="cn">false</span>)<span class="op">?;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">.</span>append_message(<span class="op">&amp;</span>bytes<span class="op">,</span> <span class="op">&amp;</span>flags<span class="op">,</span> <span class="cn">None</span>)<span class="op">?;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    mb<span class="op">.</span>close(<span class="cn">false</span>)<span class="op">?;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="op">},</span> <span class="op">|</span>result<span class="op">|</span> <span class="op">{</span> <span class="co">/* reply 250/550 via ConnHandle */</span> <span class="op">}</span>)<span class="op">;</span></span></code></pre></div>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li><strong>Not an IMAP server</strong> — storage SPI only.</li>
+<li><strong>SMTP → mailbox not stock-wired</strong> (<a href="smtp.html">SMTP</a>).</li>
+<li>mbox: no hierarchy / COPY / MOVE.</li>
+<li>Body indexing off by default.</li>
+<li>Must keep search/index off the reactor (use <code>StorageExecutor</code>).</li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

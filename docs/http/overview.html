@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="../index.html"><img src="../assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="../index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,46 +60,419 @@
     <main class="main">
       <header>
         <h1>HTTP overview</h1>
-        <p class="lead">Applications program **HTTP Streams**, not raw sockets. H1, H2, and H3 adapt a</p>
+        <p class="lead">Crate <code>hopf-http</code>: stream-first HTTP for bind and dial. Applications program <strong>HTTP Streams</strong>, not raw sockets. HTTP/1.1, HTTP/2, and HTTP/3 adapt a transport <code>Endpoint</code> into the same <code>ServerHandler</code> / <code>ClientHandler</code> SPI.</p>
       </header>
-      <p>Applications program <strong>HTTP Streams</strong>, not raw sockets. H1, H2, and H3 adapt a transport <code>Endpoint</code> into the same server/client handler traits.</p>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#version-matrix">Version matrix</a></li>
+<li><a href="#httplimits">HttpLimits</a></li>
+<li><a href="#cleartext-alpn-and-h3-wiring">Cleartext, ALPN, and H3 wiring</a></li>
+<li><a href="#upgrade-seams">Upgrade seams</a></li>
+<li><a href="#shared-types">Shared types</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#see-also">See also</a></li>
+</ul></div>
+<h2 id="standards">Standards</h2>
 <table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 72%" />
+</colgroup>
+<thead>
+<tr>
+<th>Spec</th>
+<th>Role in Hopf</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RFC 9110 / 9112</td>
+<td>HTTP semantics and HTTP/1.1 messaging</td>
+</tr>
+<tr>
+<td>RFC 9113</td>
+<td>HTTP/2 framing, streams, SETTINGS</td>
+</tr>
+<tr>
+<td>RFC 7541</td>
+<td>HPACK header compression</td>
+</tr>
+<tr>
+<td>RFC 9114</td>
+<td>HTTP/3 over QUIC</td>
+</tr>
+<tr>
+<td>RFC 9204</td>
+<td>QPACK</td>
+</tr>
+<tr>
+<td>RFC 7540 §3.2 / prior-knowledge</td>
+<td>Cleartext h2c (Upgrade + preface sniff)</td>
+</tr>
+<tr>
+<td>RFC 8441</td>
+<td>Extended CONNECT (H2) — WebSocket / upgrade</td>
+</tr>
+<tr>
+<td>RFC 9220</td>
+<td>Extended CONNECT (H3)</td>
+</tr>
+<tr>
+<td>RFC 7616 (+ Basic)</td>
+<td>Digest / Basic auth factories</td>
+</tr>
+<tr>
+<td>Bearer</td>
+<td><code>Authorization: Bearer</code> factory</td>
+</tr>
+</tbody>
+</table>
+<p>Chunked transfer encoding and trailers are implemented on the Stream SPI; see <a href="#limitations">Limitations</a> for the HTTP/1.1 trailer gap.</p>
+<h2 id="architecture">Architecture</h2>
+<pre class="text"><code>TcpListenerConfig / TcpConnectorConfig / Quic hooks
+        │
+        ▼
+  ProtocolHandler adapters
+  (H1Endpoint | H2Endpoint | CleartextHttpEndpoint |
+   AlpnHttpEndpoint | H3*Connection via listen_h3/connect_h3)
+        │
+        ▼
+     HttpStream  (one request/response)
+        │
+        ├── ServerHandler  ↔  ServerWriter
+        └── ClientHandler  ↔  ClientWriter</code></pre>
+<p>Push event order on the server (with a body):</p>
+<p><code>headers</code> → <code>start_request_body</code> → <code>request_body_content</code>* → <code>end_request_body</code> → <code>request_complete</code></p>
+<p>Without a body: <code>headers</code> → <code>request_complete</code>.</p>
+<p>Client handlers write in <code>start</code>, then receive <code>response_headers</code> → body* → optional <code>response_trailers</code> → <code>response_complete</code>.</p>
+<p>Body chunks are zero-copy for the duration of each callback. Response bodies auto-chunk when applicable. Informational 1xx responses use <code>ServerWriter::send_informational</code>.</p>
+<h2 id="version-matrix">Version matrix</h2>
+<table>
+<colgroup>
+<col style="width: 16%" />
+<col style="width: 25%" />
+<col style="width: 25%" />
+<col style="width: 31%" />
+</colgroup>
 <thead>
 <tr>
 <th>Version</th>
 <th>Server entry</th>
-<th>Notes</th>
+<th>Client entry</th>
+<th>Transport notes</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>HTTP/1.1</td>
 <td><code>H1Endpoint::server</code></td>
+<td><code>H1Endpoint::client</code></td>
 <td>Grammar-driven lexer tokens</td>
 </tr>
 <tr>
-<td>H2 (TLS)</td>
-<td><code>AlpnHttpEndpoint</code></td>
+<td>HTTP/2 (TLS)</td>
+<td><code>AlpnHttpEndpoint</code> or <code>H2Endpoint::server</code></td>
+<td><code>H2Endpoint::client</code></td>
 <td>ALPN <code>h2</code></td>
 </tr>
 <tr>
 <td>h2c</td>
 <td><code>CleartextHttpEndpoint</code></td>
-<td>Prior-knowledge + Upgrade</td>
+<td><code>H2Endpoint::client(..., secure: false)</code></td>
+<td>Prior-knowledge preface + Upgrade</td>
 </tr>
 <tr>
-<td>H3</td>
-<td><code>listen_h3</code> / feature <code>h3</code></td>
-<td>QUIC underneath</td>
+<td>HTTP/3</td>
+<td><code>listen_h3</code> (feature <code>h3</code>)</td>
+<td><code>connect_h3</code></td>
+<td>QUIC + ALPN <code>h3</code></td>
 </tr>
 </tbody>
 </table>
-<p>Shared types: <code>Headers</code>, <code>HttpLimits</code>, <code>ServerHandler</code>, <code>ClientHandler</code>.</p>
-<p>Next: <a href="server.html">HTTP server</a>, <a href="client.html">HTTP client</a>.</p>
+<p>Cargo features: <code>default = []</code>, <code>h3 = ["dep:hopf-quic"]</code>, <code>integration = ["h3"]</code>.</p>
+<h2 id="httplimits">HttpLimits</h2>
+<p>Shared parser / connection limits (Gumdrop defaults):</p>
+<table>
+<colgroup>
+<col style="width: 22%" />
+<col style="width: 19%" />
+<col style="width: 29%" />
+<col style="width: 29%" />
+</colgroup>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>max_line_length</code></td>
+<td><code>usize</code></td>
+<td><code>8192</code></td>
+<td>Max request-line or header field-line length</td>
+</tr>
+<tr>
+<td><code>max_header_count</code></td>
+<td><code>usize</code></td>
+<td><code>100</code></td>
+<td>Max header fields</td>
+</tr>
+<tr>
+<td><code>max_chunk_size</code></td>
+<td><code>usize</code></td>
+<td><code>10 MiB</code></td>
+<td>Max chunk-size value</td>
+</tr>
+<tr>
+<td><code>max_request_body</code></td>
+<td><code>usize</code></td>
+<td><code>64 MiB</code></td>
+<td>Max aggregate request body</td>
+</tr>
+</tbody>
+</table>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span>HttpLimits<span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> limits <span class="op">=</span> HttpLimits <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    max_request_body<span class="op">:</span> <span class="dv">16</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">..</span><span class="pp">HttpLimits::</span><span class="kw">default</span>()</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
+<p>Additional framing knobs live on the parsers (not <code>HttpLimits</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Knob</th>
+<th>Default</th>
+<th>Where</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>H2 max frame size</td>
+<td><code>16_384</code></td>
+<td><code>H2Parser::with_max_frame_size</code></td>
+</tr>
+<tr>
+<td>HPACK dynamic table</td>
+<td>configurable</td>
+<td><code>hopf_http::h2::hpack</code></td>
+</tr>
+<tr>
+<td>H3 max frame</td>
+<td><code>16 MiB</code></td>
+<td>H3 parser</td>
+</tr>
+</tbody>
+</table>
+<p>Endpoint constructor flags:</p>
+<table>
+<colgroup>
+<col style="width: 52%" />
+<col style="width: 48%" />
+</colgroup>
+<thead>
+<tr>
+<th>Constructor</th>
+<th>Extra args</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>H1Endpoint::server(factory, limits, secure)</code></td>
+<td><code>secure: bool</code></td>
+</tr>
+<tr>
+<td><code>H1Endpoint::client(factory, limits, secure)</code></td>
+<td><code>secure: bool</code></td>
+</tr>
+<tr>
+<td><code>H2Endpoint::server(factory, limits, send_settings_on_connected)</code></td>
+<td>send SETTINGS on connect</td>
+</tr>
+<tr>
+<td><code>H2Endpoint::client(factory, limits, secure)</code></td>
+<td><code>secure: bool</code></td>
+</tr>
+<tr>
+<td><code>CleartextHttpEndpoint::new(factory, limits)</code></td>
+<td>h2c auto-detect</td>
+</tr>
+<tr>
+<td><code>AlpnHttpEndpoint::new(factory, limits)</code></td>
+<td>ALPN → H2 / H1</td>
+</tr>
+</tbody>
+</table>
+<h2 id="cleartext-alpn-and-h3-wiring">Cleartext, ALPN, and H3 wiring</h2>
+<h3 id="cleartext-h1-h2c">Cleartext (H1 + h2c)</h3>
+<p><code>CleartextHttpEndpoint</code> sniffs the HTTP/2 connection preface for prior-knowledge h2c, supports the h2c Upgrade path (101), and otherwise falls back to HTTP/1.1.</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> Runtime<span class="op">,</span> RuntimeConfig<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>CleartextHttpEndpoint<span class="op">,</span> HttpLimits<span class="op">,</span> ServerHandlerFactory<span class="op">};</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> listen_cleartext(rt<span class="op">:</span> <span class="op">&amp;</span>Runtime<span class="op">,</span> factory<span class="op">:</span> Arc<span class="op">&lt;</span><span class="kw">dyn</span> ServerHandlerFactory<span class="op">&gt;</span>) <span class="op">-&gt;</span> <span class="pp">std::io::</span><span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> limits <span class="op">=</span> <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> f <span class="op">=</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    rt<span class="op">.</span>add_tcp_listener(<span class="pp">TcpListenerConfig::</span>new(<span class="st">&quot;127.0.0.1:8080&quot;</span><span class="op">.</span>parse()<span class="op">?,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>        <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">CleartextHttpEndpoint::</span>new(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>f)<span class="op">,</span> limits)) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>))<span class="op">?;</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 id="tls-alpn-h1-h2">TLS + ALPN (H1 / H2)</h3>
+<p>Wire TLS on <code>TcpListenerConfig</code> / <code>TcpConnectorConfig</code> via <code>hopf-tls</code>, and use <code>AlpnHttpEndpoint</code> as the <code>ProtocolHandler</code>. Negotiated ALPN selects H2 or H1. Typical ALPN list: <code>&amp;[b"h2", b"http/1.1"]</code>.</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>AlpnHttpEndpoint<span class="op">,</span> HttpLimits<span class="op">};</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_tls::</span>acceptor_from_pem<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::path::</span><span class="dt">Path</span><span class="op">;</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> acceptor <span class="op">=</span> acceptor_from_pem(</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;cert.pem&quot;</span>)<span class="op">,</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;key.pem&quot;</span>)<span class="op">,</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>[<span class="st">b&quot;h2&quot;</span><span class="op">,</span> <span class="st">b&quot;http/1.1&quot;</span>]<span class="op">,</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory<span class="op">:</span> Arc<span class="op">&lt;</span><span class="kw">dyn</span> <span class="pp">hopf_http::</span>ServerHandlerFactory<span class="op">&gt;</span> <span class="op">=</span> <span class="co">/* ... */</span><span class="op">;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> limits <span class="op">=</span> <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">;</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> f <span class="op">=</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> cfg <span class="op">=</span> <span class="pp">TcpListenerConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">AlpnHttpEndpoint::</span>new(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>f)<span class="op">,</span> limits)) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a><span class="op">.</span>with_tls(acceptor)<span class="op">;</span></span></code></pre></div>
+<h3 id="http3">HTTP/3</h3>
+<p>Enable feature <code>h3</code>. Build a QUIC server/client config with ALPN <code>h3</code> (<code>hopf_quic::ALPN_H3</code>), then call <code>listen_h3</code> / <code>connect_h3</code>. See <a href="../quic-h3.html">quic-h3.md</a>.</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>listen_h3<span class="op">,</span> HttpLimits<span class="op">};</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_quic::</span><span class="op">{</span>server_config_self_signed<span class="op">,</span> ALPN_H3<span class="op">};</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> (server_cfg<span class="op">,</span> _leaf_pem) <span class="op">=</span> server_config_self_signed(<span class="op">&amp;</span>[<span class="st">&quot;localhost&quot;</span>]<span class="op">,</span> <span class="op">&amp;</span>[ALPN_H3])<span class="op">?;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> handle <span class="op">=</span> listen_h3(</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;127.0.0.1:4433&quot;</span><span class="op">.</span>parse()<span class="op">?,</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    server_cfg<span class="op">,</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    factory<span class="op">,</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="co">// QuicDriverHandle owns the UDP driver thread — shut down or drop explicitly.</span></span></code></pre></div>
+<h2 id="upgrade-seams">Upgrade seams</h2>
+<p><code>ServerWriter::upgrade(headers, handler)</code> hands the connection (H1) or stream (H2/H3) to a <code>ProtocolUpgradeHandler</code> after a successful switch:</p>
+<table>
+<colgroup>
+<col style="width: 26%" />
+<col style="width: 38%" />
+<col style="width: 35%" />
+</colgroup>
+<thead>
+<tr>
+<th>Transport</th>
+<th>Success status</th>
+<th>Byte delivery</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTTP/1.1</td>
+<td><strong>101</strong> Switching Protocols</td>
+<td>Raw connection bytes → <code>receive</code></td>
+</tr>
+<tr>
+<td>HTTP/2 / HTTP/3</td>
+<td><strong>200</strong> Extended CONNECT</td>
+<td>Stream DATA payloads → <code>receive</code></td>
+</tr>
+</tbody>
+</table>
+<p>Outbound bytes are drained via <code>ProtocolUpgradeHandler::take_outbound</code>. Used by <code>hopf-websocket</code> (RFC 6455 / 8441 / 9220) and similar upgrades. Returns <code>false</code> if the transport cannot upgrade (already responded, wrong version, etc.).</p>
+<h2 id="shared-types">Shared types</h2>
+<table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 60%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Headers</code> / <code>Header</code></td>
+<td>Ordered, case-insensitive; pseudo-header helpers (<code>:method</code>, <code>:path</code>, <code>:scheme</code>, <code>:authority</code>, <code>:status</code>)</td>
+</tr>
+<tr>
+<td><code>HttpStream</code> / <code>HttpRole</code></td>
+<td>Stream identity</td>
+</tr>
+<tr>
+<td><code>HttpVersion</code></td>
+<td><code>Http10</code> / <code>Http11</code> (H1 messaging)</td>
+</tr>
+<tr>
+<td><code>HttpError</code> / <code>HttpResult</code></td>
+<td>Crate errors</td>
+</tr>
+<tr>
+<td><code>reason_phrase(code)</code></td>
+<td>Status reason text</td>
+</tr>
+<tr>
+<td>Auth factories</td>
+<td><code>BasicAuthFactory</code>, <code>DigestAuthFactory</code>, <code>BearerAuthFactory</code> — see <a href="server.html">server.md</a></td>
+</tr>
+</tbody>
+</table>
+<p>Deprecated aliases (<code>HttpConnection</code>, <code>HttpRequestHandler</code>, …) remain for transitional callers; prefer the Stream SPI names.</p>
+<h2 id="examples">Examples</h2>
+<table>
+<colgroup>
+<col style="width: 42%" />
+<col style="width: 57%" />
+</colgroup>
+<thead>
+<tr>
+<th>Example</th>
+<th>How to run</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/http-hello</code></td>
+<td><code>cargo run -p http-hello -- 127.0.0.1:8080</code> (optional <code>--tls</code>)</td>
+</tr>
+<tr>
+<td><code>examples/http-get</code></td>
+<td><code>cargo run -p http-get -- [--http2\|--h2] [--http3\|--h3] [--ca pem] [--server-name name] ADDR PATH</code></td>
+</tr>
+<tr>
+<td><code>examples/http3-hello</code></td>
+<td><code>cargo run -p http3-hello -- 127.0.0.1:4433</code></td>
+</tr>
+</tbody>
+</table>
+<p>Smoke: <code>cargo test -p hopf-http --features h3 h3_get_hello</code>.</p>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li><strong>No HTTP/2 server push</strong> — <code>PUSH_PROMISE</code> is rejected (client: <code>RST_STREAM</code>; server: <code>GOAWAY</code>).</li>
+<li><strong>H2 PRIORITY frames</strong> are ignored (deprecated by the RFCs).</li>
+<li><strong>HTTP/1.1 trailers</strong> are ignored on the wire (parity gap with Gumdrop). H2/H3 trailers work as a second HEADERS frame (<code>ServerWriter::trailers</code> / <code>ClientHandler::response_trailers</code>).</li>
+<li>UDP / QUIC for H3 lives in <code>hopf-quic</code> and is feature-gated (<code>h3</code>).</li>
+<li>Several declared deps (<code>tractrix</code>, <code>rjsonparser</code>, <code>rmimeparser</code>) support later protocol crates, not the Stream SPI itself.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="server.html">HTTP server</a> — <code>ServerHandler</code>, writers, auth, deferred responses</li>
+<li><a href="client.html">HTTP client</a> — <code>ClientHandler</code>, dial patterns, <code>http-get</code></li>
+<li><a href="../quic-h3.html">QUIC / H3</a> — transport configs and PEM builders</li>
+<li><a href="../websocket.html">WebSocket</a> — upgrade consumer</li>
+<li><a href="../grpc.html">gRPC</a> — unary over Streams (needs trailers on H2/H3)</li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

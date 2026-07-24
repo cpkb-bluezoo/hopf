@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,33 +60,265 @@
     <main class="main">
       <header>
         <h1>Access control</h1>
-        
+        <p class="lead">Peer <strong>ACL</strong>, <strong>accept rate limits</strong>, and <strong>quota</strong> trackers in <code>hopf-core</code>. These sit on <code>TcpListenerConfig</code> (and related accept paths) so unwanted peers never reach <code>ProtocolHandler::connected</code>. Authentication (identity) is separate — see <a href="auth.html">Auth</a>.</p>
       </header>
-      <h2 id="cidr-allow-deny">CIDR allow / deny</h2>
-<p>On <code>TcpListenerConfig</code>:</p>
-<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>IpNet<span class="op">,</span> PeerAcl<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> acl <span class="op">=</span> PeerAcl <span class="op">{</span></span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    allow<span class="op">:</span> <span class="pp">vec!</span>[]<span class="op">,</span> <span class="co">// empty allow = allow all (unless denied)</span></span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    deny<span class="op">:</span> <span class="pp">vec!</span>[<span class="pp">IpNet::</span>parse(<span class="st">&quot;10.0.0.0/8&quot;</span>)<span class="op">.</span>unwrap()]<span class="op">,</span></span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
-<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>config<span class="op">.</span>with_acl(acl)<span class="op">;</span></span></code></pre></div>
-<p>Deny wins. Non-empty <code>allow</code> means the peer must match at least one network. Rejection closes the accepted socket <strong>before</strong> <code>ProtocolHandler::connected</code>.</p>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#cidr-allow--deny-peeracl">CIDR allow / deny (PeerAcl)</a></li>
+<li><a href="#accept-rate-limits">Accept rate limits</a></li>
+<li><a href="#quotas">Quotas</a></li>
+<li><a href="#listener-configuration">Listener configuration</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="architecture">Architecture</h2>
+<pre><code>accept()
+  │
+  ├─ PeerAcl::allows(peer)?     else close + TelemetryHook::on_error
+  ├─ AcceptRateLimit::…?        else close + on_error
+  └─ ProtocolHandler::connected</code></pre>
+<p>Deny wins over allow. Empty allow list means allow-all (subject to deny). IPv4 and IPv6 CIDR supported via <code>IpNet</code>.</p>
+<h2 id="cidr-allow-deny-peeracl">CIDR allow / deny (PeerAcl)</h2>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>IpNet<span class="op">,</span> PeerAcl<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> acl <span class="op">=</span> PeerAcl <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    allow<span class="op">:</span> <span class="pp">vec!</span>[]<span class="op">,</span> <span class="co">// empty allow = allow all (unless denied)</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    deny<span class="op">:</span> <span class="pp">vec!</span>[<span class="pp">IpNet::</span>parse(<span class="st">&quot;10.0.0.0/8&quot;</span>)<span class="op">.</span>unwrap()]<span class="op">,</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">TcpListenerConfig::</span>new(addr<span class="op">,</span> factory)<span class="op">.</span>with_acl(acl)<span class="op">;</span></span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>allow</code></td>
+<td><code>Vec&lt;IpNet&gt;</code></td>
+<td>empty</td>
+<td>If non-empty, peer must match ≥1</td>
+</tr>
+<tr>
+<td><code>deny</code></td>
+<td><code>Vec&lt;IpNet&gt;</code></td>
+<td>empty</td>
+<td>Any match → reject (<strong>deny wins</strong>)</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PeerAcl::open()</code> / <code>Default</code></td>
+<td>Allow all</td>
+</tr>
+<tr>
+<td><code>PeerAcl::allows(peer: SocketAddr) -&gt; bool</code></td>
+<td>Evaluate</td>
+</tr>
+<tr>
+<td><code>IpNet::parse("addr/prefix")</code></td>
+<td>IPv4 / IPv6</td>
+</tr>
+</tbody>
+</table>
+<p>Rejection closes the accepted socket <strong>before</strong> <code>ProtocolHandler::connected</code>.</p>
 <h2 id="accept-rate-limits">Accept rate limits</h2>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
-<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>AcceptRateLimit<span class="op">;</span></span>
-<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>config<span class="op">.</span>with_rate_limit(<span class="pp">AcceptRateLimit::</span>new(</span>
-<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* per_source */</span> <span class="dv">100</span><span class="op">,</span></span>
-<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Duration::</span>from_secs(<span class="dv">1</span>)<span class="op">,</span></span>
-<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="co">/* global */</span> <span class="dv">0</span><span class="op">,</span> <span class="co">// 0 = unlimited</span></span>
-<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>))<span class="op">;</span></span></code></pre></div>
-<h2 id="quotas-skeleton">Quotas (skeleton)</h2>
-<p><code>QuotaTracker</code> / <code>CounterQuota</code> / <code>UnlimitedQuota</code> — protocols may call <code>add_inbound</code> / <code>add_outbound</code> / <code>add_message</code>. Not yet wired into every codec; use as application policy when ready.</p>
+<p>Token-bucket style window counters:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>AcceptRateLimit<span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">TcpListenerConfig::</span>new(addr<span class="op">,</span> factory)<span class="op">.</span>with_rate_limit(</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="pp">AcceptRateLimit::</span>new(</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* per_source */</span> <span class="dv">100</span><span class="op">,</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Duration::</span>from_secs(<span class="dv">1</span>)<span class="op">,</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>        <span class="co">/* global */</span> <span class="dv">0</span><span class="op">,</span> <span class="co">// 0 = unlimited on that axis</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    )<span class="op">,</span></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>)<span class="op">;</span></span></code></pre></div>
+<h3 id="acceptratelimit"><code>AcceptRateLimit</code></h3>
+<table style="width:100%;">
+<colgroup>
+<col style="width: 23%" />
+<col style="width: 14%" />
+<col style="width: 45%" />
+<col style="width: 16%" />
+</colgroup>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default / meaning</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>per_source</code></td>
+<td><code>u32</code></td>
+<td>caller</td>
+<td>Max accepts per window from one source IP</td>
+</tr>
+<tr>
+<td><code>window</code></td>
+<td><code>Duration</code></td>
+<td>caller</td>
+<td>Window length</td>
+</tr>
+<tr>
+<td><code>global</code></td>
+<td><code>u32</code></td>
+<td>caller</td>
+<td>Max accepts per window overall; <strong><code>0</code> = unlimited</strong></td>
+</tr>
+</tbody>
+</table>
+<p><code>AcceptRateLimit::new(per_source, window, global)</code>. Axis value <code>0</code> disables that limit.</p>
+<h2 id="quotas">Quotas</h2>
+<p>Application / protocol policy skeleton — <strong>not</strong> auto-enforced on every codec datapath yet.</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>QuotaTracker</code></td>
+<td>Trait: <code>add_inbound</code> / <code>add_outbound</code> / <code>add_message</code></td>
+</tr>
+<tr>
+<td><code>QuotaVerdict</code></td>
+<td>Allow / deny outcome</td>
+</tr>
+<tr>
+<td><code>CounterQuota</code></td>
+<td>Atomic counters with caps</td>
+</tr>
+<tr>
+<td><code>UnlimitedQuota</code></td>
+<td>Always allow</td>
+</tr>
+</tbody>
+</table>
+<h3 id="counterquota"><code>CounterQuota</code></h3>
+<table>
+<colgroup>
+<col style="width: 65%" />
+<col style="width: 35%" />
+</colgroup>
+<thead>
+<tr>
+<th>Constructor</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CounterQuota::new(max_in, max_out, max_messages) -&gt; Arc&lt;Self&gt;</code></td>
+<td><strong><code>0</code> disables</strong> that axis</td>
+</tr>
+</tbody>
+</table>
+<p>Protocols may call the tracker as policy when ready; do not assume Hopf closes sockets for you on quota alone today.</p>
+<h2 id="listener-configuration">Listener configuration</h2>
+<p>Relevant <code>TcpListenerConfig</code> fields / builders (see also <a href="runtime-options.html">Runtime options</a>):</p>
+<table>
+<colgroup>
+<col style="width: 31%" />
+<col style="width: 18%" />
+<col style="width: 28%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>acl</code></td>
+<td><code>PeerAcl</code></td>
+<td>open (allow all)</td>
+<td><code>.with_acl</code></td>
+</tr>
+<tr>
+<td><code>rate_limit</code></td>
+<td><code>Option&lt;AcceptRateLimit&gt;</code></td>
+<td><code>None</code></td>
+<td><code>.with_rate_limit</code></td>
+</tr>
+<tr>
+<td><code>max_net_in</code></td>
+<td><code>usize</code></td>
+<td><code>1 MiB</code> (<code>DEFAULT_MAX_NET_IN</code>)</td>
+<td>Buffer cap → close</td>
+</tr>
+<tr>
+<td><code>max_net_out</code></td>
+<td><code>usize</code></td>
+<td><code>4 MiB</code> (<code>DEFAULT_MAX_NET_OUT</code>)</td>
+<td>Buffer cap → close</td>
+</tr>
+<tr>
+<td><code>idle_timeout</code></td>
+<td><code>Option&lt;Duration&gt;</code></td>
+<td><code>None</code></td>
+<td>Partially wired (Tranche 1)</td>
+</tr>
+</tbody>
+</table>
+<p>Buffer caps are connection safety limits (not identity ACL), but they are part of the same listener hardening surface.</p>
+<h2 id="examples">Examples</h2>
+<p>Compose ACL + rate limit on any service listener:</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    AcceptRateLimit<span class="op">,</span> IpNet<span class="op">,</span> PeerAcl<span class="op">,</span> Runtime<span class="op">,</span> RuntimeConfig<span class="op">,</span> TcpListenerConfig<span class="op">,</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>)<span class="op">;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> acl <span class="op">=</span> PeerAcl <span class="op">{</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    allow<span class="op">:</span> <span class="pp">vec!</span>[<span class="pp">IpNet::</span>parse(<span class="st">&quot;192.168.0.0/16&quot;</span>)<span class="op">.</span>unwrap()]<span class="op">,</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    deny<span class="op">:</span> <span class="pp">vec!</span>[]<span class="op">,</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> listener <span class="op">=</span> <span class="pp">TcpListenerConfig::</span>new(addr<span class="op">,</span> factory)</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_acl(acl)</span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_rate_limit(<span class="pp">AcceptRateLimit::</span>new(<span class="dv">50</span><span class="op">,</span> <span class="pp">Duration::</span>from_secs(<span class="dv">1</span>)<span class="op">,</span> <span class="dv">500</span>))<span class="op">;</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>add_tcp_listener(listener)<span class="op">?;</span></span></code></pre></div>
+<p>FTP/SMTP services build a <code>TcpListenerConfig</code> internally — prefer their config builders where available, or obtain <code>control_listener</code> and layer ACL before <code>Runtime::add_tcp_listener</code> when the service exposes that path (<a href="ftp.html">FTP</a>, <a href="smtp.html">SMTP</a>).</p>
+<p>Pair with <a href="telemetry.html">Telemetry</a> to observe <code>on_error</code> for denials.</p>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>Quotas are a <strong>skeleton</strong> — not automatically wired into every protocol codec.</li>
+<li><code>idle_timeout</code> is only <strong>partially wired</strong>.</li>
+<li>ACL is IP-based only; user/role RBAC belongs in <a href="auth.html">Auth</a> / protocol <code>is_authorized</code> hooks (e.g. FTP).</li>
+<li>No distributed / cluster ACL store — process-local configuration.</li>
+<li>WebDAV has no in-crate ACL; put <code>PeerAcl</code> on the HTTP listener (<a href="webdav.html">WebDAV</a>).</li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

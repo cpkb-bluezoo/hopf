@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,19 +60,339 @@
     <main class="main">
       <header>
         <h1>DNS</h1>
-        <p class="lead">Crate `hopf-dns`: **stub resolver + caching forwarder** (not authoritative).</p>
+        <p class="lead">Crate <code>hopf-dns</code>: async <strong>stub resolver</strong> and optional <strong>caching forwarder</strong> (Gumdrop parity). The resolver is reactor-affine (UDP on a worker). Optional features add a forwarder service, DoT / DoQ / DoH clients, and DNSSEC validation.</p>
       </header>
-      <p>Crate <code>hopf-dns</code>: <strong>stub resolver + caching forwarder</strong> (not authoritative).</p>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#resolver">Resolver</a></li>
+<li><a href="#caching-forwarder-server-feature">Caching forwarder (server feature)</a></li>
+<li><a href="#transports">Transports</a></li>
+<li><a href="#dnssec">DNSSEC</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#wiring-apis">Wiring APIs</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="standards">Standards</h2>
+<table>
+<colgroup>
+<col style="width: 64%" />
+<col style="width: 35%" />
+</colgroup>
+<thead>
+<tr>
+<th>Reference</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc1035">RFC 1035</a></td>
+<td>Wire format / RRs</td>
+</tr>
+<tr>
+<td>EDNS0</td>
+<td>OPT, DO bit, UDP payload <strong>4096</strong></td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc7873">RFC 7873</a></td>
+<td>DNS Cookies (<code>DnsCookie</code>)</td>
+</tr>
+<tr>
+<td>—</td>
+<td>TCP fallback on truncation; bailiwick filtering</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc7858">RFC 7858</a></td>
+<td>DNS over TLS (DoT)</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc9250">RFC 9250</a></td>
+<td>DNS over QUIC (DoQ)</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc8484">RFC 8484</a></td>
+<td>DNS over HTTPS (DoH POST)</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc4034">RFC 4034</a> / <a href="https://www.rfc-editor.org/rfc/rfc4035">4035</a></td>
+<td>DNSSEC validation</td>
+</tr>
+</tbody>
+</table>
+<p><strong>DNSSEC algorithms:</strong> RSASHA256(8), RSASHA512(10), ECDSAP256SHA256(13), ECDSAP384SHA384(14), Ed25519(15). Ed448(16) recognized but <strong>unverified</strong>. IANA root DS anchors included.</p>
+<h2 id="architecture">Architecture</h2>
+<pre><code>App
+ │  DnsResolver (per Runtime / ReactorHandle)
+ │    ├── hosts file + literal IP short-circuit
+ │    ├── UDP query (+ EDNS, cookies)
+ │    ├── truncation → TCP fallback (helper thread)
+ │    ├── CNAME chase (depth ≤ 8)
+ │    └── optional DnsCache + DnssecValidator
+ │
+ └── (feature server) DnsService caching forwarder
+         ├── listen_dns_udp
+         ├── listen_dns_dot  (+dot)
+         └── listen_dns_doq  (+doq)</code></pre>
+<p><code>RuntimeDnsExt::connect_by_name</code> — blocking resolve then <code>Runtime::connect</code>.</p>
 <h2 id="resolver">Resolver</h2>
-<p>Reactor-affine UDP (and optional TCP / DoT / DoQ / DoH) on worker reactors via core UDP APIs. Shared cache, hosts file, system resolvers, EDNS/cookies/bailiwick. Feature <code>dnssec</code> enables validation with <code>ring</code>.</p>
-<p>Dial helpers: <code>RuntimeDnsExt::connect_by_name</code> when you need name → A/AAAA then TCP connect on the owning reactor.</p>
-<h2 id="server-proxy">Server / proxy</h2>
-<p><code>DnsService</code> + UDP listener; optional DoT/DoQ features. Demo: <code>examples/dns-proxy</code> — see <a href="cookbook/dns-proxy.html">dns-proxy</a>.</p>
-<p>Non-goals (same as Gumdrop): authoritative zones, AXFR, TSIG, UPDATE, DNSSEC signing, DoH server.</p>
+<p><code>DnsResolver</code> — async stub on a reactor.</p>
+<p><strong>Query helpers:</strong> <code>query_a</code>, <code>query_aaaa</code>, <code>query_mx</code>, <code>query_txt</code>, <code>query_ptr</code>, <code>query_srv</code>, generic <code>query(DnsQuestion, …)</code>.</p>
+<p><strong>Happy Eyeballs:</strong> <code>resolve(host, port, ResolveCallback)</code> — parallel A+AAAA, IPv6-first ordering.</p>
+<p><strong>Helpers:</strong> <code>HostsFile</code>, <code>parse_literal_ip</code>, <code>DnsCache</code>, <code>DnsCookie</code>, bailiwick filters (<code>filter_answers_in_bailiwick</code>, <code>is_within_bailiwick</code>, <code>names_equal</code>).</p>
+<p>Wire types: <code>DnsMessage</code>, <code>DnsQuestion</code>, <code>DnsResourceRecord</code>, <code>DnsType</code>, <code>DnsClass</code>, <code>DnsQueryIdGenerator</code>, <code>DnsFormatError</code>, plus <code>FLAG_*</code> / <code>RCODE_*</code> / <code>OPCODE_QUERY</code> / <code>EDNS_FLAG_DO</code> / <code>OPT_UDP_PAYLOAD</code> constants.</p>
+<h2 id="caching-forwarder-server-feature">Caching forwarder (server feature)</h2>
+<p>Enable Cargo feature <code>server</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DnsService</code></td>
+<td>Caching forwarder</td>
+</tr>
+<tr>
+<td><code>DnsServiceHandle</code></td>
+<td>Handle</td>
+</tr>
+<tr>
+<td><code>DnsServerMetrics</code></td>
+<td>Counters</td>
+</tr>
+<tr>
+<td><code>listen_dns_udp</code> / <code>DnsUdpListenConfig</code></td>
+<td>UDP listen</td>
+</tr>
+<tr>
+<td><code>listen_dns_dot</code></td>
+<td>DoT listen (<code>dot</code> feature)</td>
+</tr>
+<tr>
+<td><code>listen_dns_doq</code></td>
+<td>DoQ listen (<code>doq</code> feature)</td>
+</tr>
+<tr>
+<td><code>parse_upstream_list</code></td>
+<td>Parse upstream addrs</td>
+</tr>
+</tbody>
+</table>
+<p><code>DnsService::set_upstream</code>, <code>set_local_resolver</code>, <code>cache</code>, <code>metrics</code>. Strips DNSSEC RRs when the client query lacks DO.</p>
+<p><code>process_query_sync</code> uses a <strong>blocking</strong> upstream path (pragmatic).</p>
+<h2 id="transports">Transports</h2>
+<table>
+<thead>
+<tr>
+<th>Transport</th>
+<th>Feature</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>UdpDnsClientTransport</code></td>
+<td>always</td>
+</tr>
+<tr>
+<td><code>TcpDnsClientTransport</code> / <code>TcpDnsConnectionPool</code></td>
+<td>always</td>
+</tr>
+<tr>
+<td><code>DoqClientTransport</code></td>
+<td><code>doq</code> (+ <code>hopf-quic</code>)</td>
+</tr>
+<tr>
+<td><code>DohClientTransport</code></td>
+<td><code>doh</code> (+ <code>hopf-http</code>, <code>hopf-tls</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>Traits: <code>DnsClientTransport</code>, <code>DnsClientTransportHandler</code>.</p>
+<p>DoT client uses <code>hopf-tls</code> when feature <code>dot</code> is enabled.</p>
+<h2 id="dnssec">DNSSEC</h2>
+<p>Feature <code>dnssec</code> (+ <code>ring</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DnssecValidator</code> / <code>DnssecChainValidator</code></td>
+<td>Validation</td>
+</tr>
+<tr>
+<td><code>DnssecStatus</code> / <code>DnssecAlgorithm</code></td>
+<td>Outcomes / algs</td>
+</tr>
+<tr>
+<td><code>DnssecTrustAnchor</code> / <code>AnchorDs</code></td>
+<td>Trust anchors</td>
+</tr>
+<tr>
+<td><code>verify_rrsig</code> / <code>verify_ds</code> / …</td>
+<td>Low-level</td>
+</tr>
+</tbody>
+</table>
+<p>Validation only — <strong>no signing</strong>. Off by default on the resolver (<code>set_dnssec_enabled</code> / <code>set_dnssec_validator</code>).</p>
+<h2 id="configuration">Configuration</h2>
+<h3 id="defaults">Defaults</h3>
+<table>
+<thead>
+<tr>
+<th>Knob</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DEFAULT_DNS_PORT</code></td>
+<td>53</td>
+</tr>
+<tr>
+<td><code>DEFAULT_TIMEOUT</code></td>
+<td>5 s</td>
+</tr>
+<tr>
+<td><code>MAX_CNAME_DEPTH</code></td>
+<td>8</td>
+</tr>
+<tr>
+<td><code>use_edns</code></td>
+<td><code>true</code></td>
+</tr>
+<tr>
+<td><code>use_cookies</code></td>
+<td><code>true</code></td>
+</tr>
+<tr>
+<td><code>use_bailiwick</code></td>
+<td><code>true</code></td>
+</tr>
+<tr>
+<td><code>tcp_fallback</code></td>
+<td><code>true</code></td>
+</tr>
+<tr>
+<td>DNSSEC</td>
+<td>off</td>
+</tr>
+</tbody>
+</table>
+<h3 id="resolver-setters">Resolver setters</h3>
+<p><code>set_timeout</code>, <code>set_cache</code> / <code>cache</code>, <code>add_server</code> / <code>add_server_str</code>, <code>use_public_resolvers</code>, <code>use_system_resolvers</code>, <code>set_dnssec_enabled</code>, <code>set_dnssec_validator</code>.</p>
+<p><strong>Note:</strong> addresses passed to <code>add_server</code> must be <strong>pre-resolved</strong>.</p>
+<h3 id="cargo-features">Cargo features</h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>(default)</td>
+<td>Stub resolver client</td>
+</tr>
+<tr>
+<td><code>server</code></td>
+<td>Caching forwarder + UDP listen</td>
+</tr>
+<tr>
+<td><code>dot</code></td>
+<td>DoT (+ <code>hopf-tls</code>)</td>
+</tr>
+<tr>
+<td><code>doq</code></td>
+<td>DoQ (+ <code>hopf-quic</code>)</td>
+</tr>
+<tr>
+<td><code>doh</code></td>
+<td>DoH (+ <code>hopf-http</code>, <code>hopf-tls</code>)</td>
+</tr>
+<tr>
+<td><code>dnssec</code></td>
+<td>Validation (+ <code>ring</code>)</td>
+</tr>
+<tr>
+<td><code>integration</code></td>
+<td>Integration tests</td>
+</tr>
+</tbody>
+</table>
+<h2 id="wiring-apis">Wiring APIs</h2>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_dns::</span><span class="op">{</span>DnsResolver<span class="op">,</span> RuntimeDnsExt<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> resolver <span class="op">=</span> <span class="pp">DnsResolver::</span>for_runtime(<span class="op">&amp;</span>rt)<span class="op">?;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co">// or: DnsResolver::for_reactor(reactor_handle)?</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>resolver<span class="op">.</span>query_a(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="op">|</span>result<span class="op">|</span> <span class="op">{</span> <span class="co">/* … */</span> <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>resolver<span class="op">.</span>resolve(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="dv">443</span><span class="op">,</span> <span class="op">|</span>addrs<span class="op">|</span> <span class="op">{</span> <span class="co">/* Happy Eyeballs */</span> <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="co">// Extension on Runtime:</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect_by_name(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="dv">443</span><span class="op">,</span> factory)<span class="op">?;</span></span></code></pre></div>
+<p>Forwarder sketch:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_dns::</span><span class="op">{</span>DnsCache<span class="op">,</span> DnsService<span class="op">,</span> listen_dns_udp<span class="op">,</span> DnsUdpListenConfig<span class="op">};</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> cache <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">DnsCache::</span><span class="kw">default</span>())<span class="op">;</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> svc <span class="op">=</span> <span class="pp">DnsService::</span>new(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>cache))<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>svc<span class="op">.</span>set_upstream(upstream_resolver)<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>listen_dns_udp(DnsUdpListenConfig <span class="op">{</span> <span class="co">/* bind + service handle */</span> <span class="op">}</span>)<span class="op">?;</span></span></code></pre></div>
+<h2 id="examples">Examples</h2>
+<p>See <a href="cookbook/dns-proxy.html">Cookbook: DNS proxy</a>.</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># UDP caching forwarder</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="va">DNS_UPSTREAM</span><span class="op">=</span><span class="st">&quot;8.8.8.8 1.1.1.1&quot;</span> <span class="ex">cargo</span> run <span class="at">-p</span> dns-proxy <span class="at">--</span> 127.0.0.1:5353</span></code></pre></div>
+<table>
+<colgroup>
+<col style="width: 30%" />
+<col style="width: 46%" />
+<col style="width: 23%" />
+</colgroup>
+<thead>
+<tr>
+<th>Package</th>
+<th>Demonstrates</th>
+<th>Knobs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/dns-proxy</code></td>
+<td>UDP caching forwarder</td>
+<td>arg1 = bind; <code>DNS_UPSTREAM</code> (def <code>8.8.8.8 1.1.1.1</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>Smoke: <code>cargo test -p hopf-dns --features integration</code> (<code>tests/resolver_stub.rs</code>).</p>
+<h2 id="limitations">Limitations</h2>
+<p>Explicitly <strong>out of scope</strong> (Gumdrop parity):</p>
+<ul>
+<li>Authoritative zones</li>
+<li>AXFR / IXFR</li>
+<li>TSIG</li>
+<li>Dynamic UPDATE</li>
+<li>DNSSEC <strong>signing</strong></li>
+<li>DoH <strong>server</strong></li>
+</ul>
+<p>Other:</p>
+<ul>
+<li>Ed448 recognized but unverified.</li>
+<li><code>process_query_sync</code> blocks on upstream (forwarder).</li>
+<li>CNAME re-timeout on chase skipped (TODO in code).</li>
+<li>Server addresses must be pre-resolved IPs.</li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

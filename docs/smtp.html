@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,36 +60,532 @@
     <main class="main">
       <header>
         <h1>SMTP</h1>
-        <p class="lead">Crate `hopf-smtp`: SMTP / SMTPS **server** and blocking **client** (Gumdrop `org.bluezoo.gumdrop.smtp` port).</p>
+        <p class="lead">Crate <code>hopf-smtp</code>: SMTP <strong>server</strong> and blocking <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.smtp</code>. The server speaks RFC 5321 with a wide ESMTP extension set on the Hopf reactor. Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code> (AUTH PLAIN). TLS via <a href="tls.html"><code>hopf-tls</code></a>. Optional open-relay demo uses <a href="dns.html"><code>hopf-dns</code></a> MX lookup.</p>
       </header>
-      <p>Crate <code>hopf-smtp</code>: SMTP / SMTPS <strong>server</strong> and blocking <strong>client</strong> (Gumdrop <code>org.bluezoo.gumdrop.smtp</code> port).</p>
-<h2 id="server">Server</h2>
-<p>Staged connection SPI: <code>SmtpClientConnected</code> → <code>HelloHandler</code> → <code>MailFromHandler</code> → <code>RecipientHandler</code> → <code>MessageDataHandler</code>. DATA (dot-stuffing) and BDAT (CHUNKING). EHLO advertisements include SIZE, PIPELINING, 8BITMIME, SMTPUTF8, CHUNKING, optional STARTTLS and AUTH PLAIN.</p>
-<p>Stock <code>AcceptAllSmtpHandler</code> accepts every stage and <strong>discards</strong> the message (greeting <code>{hostname} ESMTP Hopf</code>). Wire with <code>SmtpService::new(SmtpConfig::new(addr, hostname))</code>.</p>
-<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">SmtpConfig::</span>new(addr<span class="op">,</span> <span class="st">&quot;localhost&quot;</span>)<span class="op">;</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co">// .with_tls(a).implicit_tls().auth_required(true).with_policy(policy)</span></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> service <span class="op">=</span> <span class="pp">SmtpService::</span>new(config)<span class="op">;</span></span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bound <span class="op">=</span> service<span class="op">.</span>start(<span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>))<span class="op">?;</span></span></code></pre></div>
-<p>Defaults: max message <strong>35 MiB</strong>, max recipients <strong>100</strong>. STARTTLS via <code>with_starttls_acceptor</code>; SMTPS via <code>with_tls</code> + <code>implicit_tls</code>.</p>
-<p>Local mailbox delivery is <strong>not</strong> built in yet — implement a custom <code>MessageDataHandler</code> that appends via <a href="mailbox.html"><code>hopf-mailbox</code></a> on the storage pool.</p>
-<h2 id="simple-relay">Simple relay</h2>
-<p><code>SimpleRelayService</code> / <code>SimpleRelayHandler</code> — <strong>open MX relay</strong> for any sender/recipient. Buffers the message, groups RCPT by domain, looks up MX with <code>hopf-dns</code>, and delivers with blocking <code>SmtpClient</code> on a worker thread.</p>
-<p><strong>Dev / test / closed networks only</strong> — not for untrusted ingress.</p>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>)<span class="op">;</span></span>
-<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> relay <span class="op">=</span> <span class="pp">SimpleRelayService::</span>new(</span>
-<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="pp">SmtpConfig::</span>new(addr<span class="op">,</span> hostname)<span class="op">,</span></span>
-<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt)<span class="op">,</span></span>
-<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
-<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>relay<span class="op">.</span>start(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt))<span class="op">?;</span></span></code></pre></div>
-<p>Defaults: DNS timeout 5s, outbound port <strong>25</strong>, SMTP I/O timeout 60s. Tests can inject a resolver with <code>with_resolver</code>. FUTURERELEASE is rejected; REQUIRETLS currently fails delivery (no trust roots for arbitrary MX STARTTLS). There is no <code>examples/smtp-relay</code> binary yet — see <code>hopf-smtp</code> integration tests (<code>simple_relay_mx_to_local_sink</code>).</p>
+      <p>Local mailbox delivery is <strong>not</strong> stock — wire a custom <code>MessageDataHandler</code> to <a href="mailbox.html"><code>hopf-mailbox</code></a> on the storage pool.</p>
+<div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#commands">Commands</a></li>
+<li><a href="#ehlo-advertisements">EHLO advertisements</a></li>
+<li><a href="#mail--rcpt-parameters">MAIL / RCPT parameters</a></li>
+<li><a href="#tls">TLS</a></li>
+<li><a href="#authentication">Authentication</a></li>
+<li><a href="#handler-spi">Handler SPI</a></li>
+<li><a href="#pipelines">Pipelines</a></li>
+<li><a href="#relay">Relay</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#client">Client</a></li>
+<li><a href="#metrics">Metrics</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="standards">Standards</h2>
+<table>
+<colgroup>
+<col style="width: 64%" />
+<col style="width: 35%" />
+</colgroup>
+<thead>
+<tr>
+<th>Reference</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc5321">RFC 5321</a></td>
+<td>SMTP base, DATA, replies, multiline</td>
+</tr>
+<tr>
+<td>RFC 5321 §4.5.2</td>
+<td>Dot-stuffing / unstuffing (<code>DotUnstuffer</code>)</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2034">RFC 2034</a></td>
+<td>Enhanced status codes</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc3030">RFC 3030</a></td>
+<td>BDAT / CHUNKING / BINARYMIME</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc6152">RFC 6152</a></td>
+<td>8BITMIME <code>BODY=</code></td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc3461">RFC 3461</a></td>
+<td>DSN RET / ENVID / NOTIFY / ORCPT</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2852">RFC 2852</a></td>
+<td>DELIVERBY (<code>BY=</code>)</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc8689">RFC 8689</a></td>
+<td>REQUIRETLS</td>
+</tr>
+<tr>
+<td>—</td>
+<td>SMTPUTF8, PIPELINING, SIZE, STARTTLS, AUTH PLAIN, FUTURERELEASE, MT-PRIORITY</td>
+</tr>
+</tbody>
+</table>
+<h2 id="architecture">Architecture</h2>
+<pre><code>Client ──TCP──► SmtpControlHandler
+                   │ HELO/EHLO → HelloHandler
+                   │ AUTH PLAIN → TrustPolicy (optional)
+                   │ MAIL/RCPT → staged SPI
+                   │ DATA/BDAT → MessageDataHandler (streamed)
+                   │
+                   └── optional SmtpPipeline per transaction</code></pre>
+<h3 id="protocol-stages">Protocol stages</h3>
+<p>Each connection advances through a staged SPI (Gumdrop-style), not a single monolithic callback:</p>
+<ol type="1">
+<li><code>SmtpClientConnected</code> — accept/reject on connect</li>
+<li><code>HelloHandler</code> — HELO/EHLO, STARTTLS notice, AUTH result</li>
+<li><code>MailFromHandler</code> — MAIL FROM (+ optional <code>SmtpPipeline</code>)</li>
+<li><code>RecipientHandler</code> — RCPT TO, start DATA/BDAT</li>
+<li><code>MessageDataHandler</code> — content chunks + complete/abort</li>
+</ol>
+<h3 id="non-blocking-data">Non-blocking DATA</h3>
+<p>Message content is streamed: <code>DotUnstuffer</code> handles RFC 5321 dot-unstuffing incrementally; <code>BdatAccumulator</code> handles CHUNKING. Handlers receive chunks without requiring the full message in one buffer (subject to <code>max_message_size</code>).</p>
+<h2 id="commands">Commands</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HELO / EHLO</td>
+<td>Greeting; EHLO lists extensions</td>
+</tr>
+<tr>
+<td>MAIL</td>
+<td>Start transaction (+ params)</td>
+</tr>
+<tr>
+<td>RCPT</td>
+<td>Add recipient (+ DSN params)</td>
+</tr>
+<tr>
+<td>DATA</td>
+<td>Dot-stuffed body until <code>CRLF.CRLF</code></td>
+</tr>
+<tr>
+<td>BDAT</td>
+<td>Binary chunks (CHUNKING)</td>
+</tr>
+<tr>
+<td>RSET</td>
+<td>Reset transaction</td>
+</tr>
+<tr>
+<td>QUIT</td>
+<td>Close</td>
+</tr>
+<tr>
+<td>NOOP</td>
+<td>Idle</td>
+</tr>
+<tr>
+<td>HELP</td>
+<td>Help text</td>
+</tr>
+<tr>
+<td>VRFY</td>
+<td>Always <code>252</code> (cannot verify)</td>
+</tr>
+<tr>
+<td>EXPN</td>
+<td><code>502</code> not implemented</td>
+</tr>
+<tr>
+<td>ETRN</td>
+<td><code>458</code> unsuitable</td>
+</tr>
+<tr>
+<td>STARTTLS</td>
+<td>Upgrade when acceptor configured</td>
+</tr>
+<tr>
+<td>AUTH PLAIN</td>
+<td>SASL PLAIN when policy + TLS</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Rejected:</strong> XCLIENT.</p>
+<h2 id="ehlo-advertisements">EHLO advertisements</h2>
+<p>Always (capability-dependent):</p>
+<ul>
+<li>SIZE <em>(value = <code>max_message_size</code>)</em></li>
+<li>PIPELINING</li>
+<li>8BITMIME</li>
+<li>SMTPUTF8</li>
+<li>ENHANCEDSTATUSCODES</li>
+<li>CHUNKING</li>
+<li>BINARYMIME</li>
+<li>DSN</li>
+<li>HELP</li>
+</ul>
+<p>Conditional:</p>
+<ul>
+<li><strong>STARTTLS</strong> — when <code>tls_acceptor</code> is set and the session is not yet TLS</li>
+<li><strong>AUTH PLAIN</strong> — when <code>policy</code> is set <strong>and</strong> the session is TLS-protected</li>
+</ul>
+<h2 id="mail-rcpt-parameters">MAIL / RCPT parameters</h2>
+<p><strong>MAIL FROM</strong> parsed: SIZE, BODY, SMTPUTF8, REQUIRETLS, MT-PRIORITY, RET, ENVID, HOLDFOR, HOLDUNTIL, BY.</p>
+<p><strong>RCPT TO</strong> parsed: NOTIFY, ORCPT.</p>
+<p>Parsed values populate <code>DeliveryRequirements</code>, <code>DsnRecipientParams</code>, etc., for handler code.</p>
+<h2 id="tls">TLS</h2>
+<table>
+<colgroup>
+<col style="width: 54%" />
+<col style="width: 45%" />
+</colgroup>
+<thead>
+<tr>
+<th>Mode</th>
+<th>How</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cleartext</td>
+<td>No acceptor</td>
+</tr>
+<tr>
+<td>STARTTLS</td>
+<td><code>SmtpConfig::with_tls(acceptor)</code> — listener uses starttls acceptor</td>
+</tr>
+<tr>
+<td>Implicit SMTPS</td>
+<td><code>implicit_tls()</code> / <code>implicit_tls = true</code> — TLS-from-accept</td>
+</tr>
+</tbody>
+</table>
+<p>AUTH PLAIN is only advertised after TLS is up (when a policy is configured).</p>
+<h2 id="authentication">Authentication</h2>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span>PasswordTrustPolicy<span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span><span class="op">{</span>SmtpConfig<span class="op">,</span> SmtpService<span class="op">};</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> policy <span class="op">=</span> <span class="pp">PasswordTrustPolicy::</span><span class="kw">default</span>()</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_user(<span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;secret&quot;</span>)</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>shared()<span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">SmtpConfig::</span>new(addr<span class="op">,</span> <span class="st">&quot;mail.example&quot;</span><span class="op">.</span>into())</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_tls(acceptor)</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_policy(policy)</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>auth_required(<span class="cn">true</span>)<span class="op">;</span></span></code></pre></div>
+<ul>
+<li><code>auth_required</code> — reject MAIL until AUTH succeeds.</li>
+<li>Mechanism: <strong>AUTH PLAIN</strong> only on the wire today (store may support more via <a href="auth.html"><code>hopf-auth</code></a>; SMTP advertises PLAIN).</li>
+</ul>
+<h2 id="handler-spi">Handler SPI</h2>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> SmtpHandlerFactory<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> create(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> SmtpClientConnected<span class="op">&gt;;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> SmtpClientConnected<span class="op">:</span> <span class="bu">Send</span> <span class="op">{</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> connected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ConnectedState<span class="op">,</span> meta<span class="op">:</span> <span class="op">&amp;</span>SmtpConnectionMetadata)<span class="op">;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> disconnected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>)<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> HelloHandler<span class="op">:</span> <span class="bu">Send</span> <span class="op">{</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> hello(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> HelloState<span class="op">,</span> extended<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span> hostname<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> tls_established(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>)<span class="op">;</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> authenticated(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> AuthenticateState<span class="op">,</span> user<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> quit(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>)<span class="op">;</span></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> MailFromHandler<span class="op">:</span> <span class="bu">Send</span> <span class="op">{</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> pipeline(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;</span><span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> SmtpPipeline<span class="op">&gt;&gt;</span> <span class="op">{</span> <span class="cn">None</span> <span class="op">}</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> mail_from(</span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a>        state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> MailFromState<span class="op">,</span></span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>        sender<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;&amp;</span>EmailAddress<span class="op">&gt;,</span></span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        smtputf8<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        delivery<span class="op">:</span> <span class="op">&amp;</span>DeliveryRequirements<span class="op">,</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>    )<span class="op">;</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> reset(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ResetState)<span class="op">;</span></span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> quit(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>)<span class="op">;</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-29"><a href="#cb3-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-30"><a href="#cb3-30" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> RecipientHandler<span class="op">:</span> <span class="bu">Send</span> <span class="op">{</span></span>
+<span id="cb3-31"><a href="#cb3-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> rcpt_to(</span>
+<span id="cb3-32"><a href="#cb3-32" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span></span>
+<span id="cb3-33"><a href="#cb3-33" aria-hidden="true" tabindex="-1"></a>        state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> RecipientState<span class="op">,</span></span>
+<span id="cb3-34"><a href="#cb3-34" aria-hidden="true" tabindex="-1"></a>        recipient<span class="op">:</span> <span class="op">&amp;</span>EmailAddress<span class="op">,</span></span>
+<span id="cb3-35"><a href="#cb3-35" aria-hidden="true" tabindex="-1"></a>        dsn<span class="op">:</span> <span class="op">&amp;</span>DsnRecipientParams<span class="op">,</span></span>
+<span id="cb3-36"><a href="#cb3-36" aria-hidden="true" tabindex="-1"></a>    )<span class="op">;</span></span>
+<span id="cb3-37"><a href="#cb3-37" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> start_message(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> MessageStartState)<span class="op">;</span></span>
+<span id="cb3-38"><a href="#cb3-38" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> reset(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ResetState)<span class="op">;</span></span>
+<span id="cb3-39"><a href="#cb3-39" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> quit(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>)<span class="op">;</span></span>
+<span id="cb3-40"><a href="#cb3-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb3-41"><a href="#cb3-41" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-42"><a href="#cb3-42" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> MessageDataHandler<span class="op">:</span> <span class="bu">Send</span> <span class="op">{</span></span>
+<span id="cb3-43"><a href="#cb3-43" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> message_content(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> chunk<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>])<span class="op">;</span></span>
+<span id="cb3-44"><a href="#cb3-44" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> message_complete(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> MessageEndState)<span class="op">;</span></span>
+<span id="cb3-45"><a href="#cb3-45" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> message_aborted(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>)<span class="op">;</span></span>
+<span id="cb3-46"><a href="#cb3-46" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h3 id="stock-handlers">Stock handlers</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AcceptAllSmtpHandler</code> (+Factory)</td>
+<td>Accept and discard (optional capture)</td>
+</tr>
+<tr>
+<td><code>SimpleRelayHandler</code> (+Factory)</td>
+<td>Open MX relay via DNS + <code>SmtpClient</code> (<strong>dev only</strong>)</td>
+</tr>
+</tbody>
+</table>
+<p><code>SmtpConnectionMetadata</code>: <code>peer</code>, <code>local</code>, <code>tls</code>, <code>authenticated_user</code>, <code>smtputf8</code>, <code>control_handle</code>.</p>
+<p>State traits (<code>ConnectedState</code>, <code>HelloState</code>, <code>MailFromState</code>, …) expose accept/reject and deferred-delivery hooks (<code>DeferredDelivery</code>).</p>
+<h2 id="pipelines">Pipelines</h2>
+<p>Optional per-transaction <code>SmtpPipeline</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SmtpPipeline</code></td>
+<td>Trait for transaction hooks</td>
+</tr>
+<tr>
+<td><code>NullPipeline</code></td>
+<td>No-op</td>
+</tr>
+<tr>
+<td><code>DiscardPipeline</code></td>
+<td>Discard-oriented</td>
+</tr>
+<tr>
+<td><code>MessageBufferPipeline</code></td>
+<td>Buffer for relay</td>
+</tr>
+</tbody>
+</table>
+<p>Return a pipeline from <code>MailFromHandler::pipeline()</code>.</p>
+<h2 id="relay">Relay</h2>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span>SimpleRelayService<span class="op">;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> relay <span class="op">=</span> <span class="pp">SimpleRelayService::</span>new(config<span class="op">,</span> <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt))<span class="op">?;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="co">// optional: .with_dns_timeout(Duration::from_secs(5))</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">// optional: .with_resolver(resolver, outbound_port)  // default outbound 25</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bound <span class="op">=</span> relay<span class="op">.</span>start(rt)<span class="op">?;</span></span></code></pre></div>
+<p>Resolves recipient MX with <a href="dns.html"><code>hopf-dns</code></a> and forwards with <code>SmtpClient</code>. Intended for development — open relay, incomplete STARTTLS to arbitrary MX (may bounce).</p>
+<h2 id="configuration">Configuration</h2>
+<h3 id="smtpconfig"><code>SmtpConfig</code></h3>
+<table>
+<colgroup>
+<col style="width: 31%" />
+<col style="width: 18%" />
+<col style="width: 28%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>listen</code></td>
+<td><code>SocketAddr</code></td>
+<td>caller</td>
+<td>Typical <code>:25</code> / demo <code>:2525</code></td>
+</tr>
+<tr>
+<td><code>hostname</code></td>
+<td><code>String</code></td>
+<td>caller</td>
+<td>Used in greetings</td>
+</tr>
+<tr>
+<td><code>max_message_size</code></td>
+<td><code>u64</code></td>
+<td><code>35 * 1024 * 1024</code></td>
+<td>EHLO SIZE; DATA/BDAT cap</td>
+</tr>
+<tr>
+<td><code>max_recipients</code></td>
+<td><code>usize</code></td>
+<td><code>100</code></td>
+<td>Per transaction</td>
+</tr>
+<tr>
+<td><code>auth_required</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>MAIL needs AUTH</td>
+</tr>
+<tr>
+<td><code>tls_acceptor</code></td>
+<td><code>Option&lt;SharedTlsAcceptor&gt;</code></td>
+<td><code>None</code></td>
+<td>STARTTLS / implicit</td>
+</tr>
+<tr>
+<td><code>implicit_tls</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>SMTPS from first byte</td>
+</tr>
+<tr>
+<td><code>policy</code></td>
+<td><code>Option&lt;Arc&lt;dyn TrustPolicy&gt;&gt;</code></td>
+<td><code>None</code></td>
+<td>AUTH PLAIN</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Constants:</strong> <code>DEFAULT_MAX_MESSAGE_SIZE</code> = 35 MiB; <code>DEFAULT_MAX_RECIPIENTS</code> = 100.</p>
+<p><strong>Builders:</strong> <code>SmtpConfig::new(listen, hostname)</code>, <code>.with_tls</code>, <code>.implicit_tls()</code>, <code>.auth_required(bool)</code>, <code>.with_policy</code>.</p>
+<h3 id="smtpservice"><code>SmtpService</code></h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>new(config)</code></td>
+<td>Accept-all factory</td>
+</tr>
+<tr>
+<td><code>with_handler_factory(config, factory)</code></td>
+<td>Custom SPI</td>
+</tr>
+<tr>
+<td><code>control_listener(runtime)</code></td>
+<td><code>TcpListenerConfig</code></td>
+</tr>
+<tr>
+<td><code>start(runtime)</code></td>
+<td>Bind + register</td>
+</tr>
+<tr>
+<td><code>metrics()</code></td>
+<td><code>SmtpServerMetrics</code></td>
+</tr>
+</tbody>
+</table>
 <h2 id="client">Client</h2>
-<p><code>SmtpClient</code> / <code>SmtpClientBuilder</code>: EHLO/HELO, MAIL/RCPT, DATA, BDAT, STARTTLS, AUTH PLAIN, QUIT. TLS: <code>.tls(cfg, name).implicit_tls(true)</code> or <code>.starttls()</code>.</p>
+<p>Blocking <code>SmtpClient</code> / <code>SmtpClientBuilder</code>.</p>
+<h3 id="smtpclientbuilder"><code>SmtpClientBuilder</code></h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>timeout</code></td>
+<td>duration</td>
+<td>30s</td>
+<td></td>
+</tr>
+<tr>
+<td>TLS</td>
+<td>client config</td>
+<td>off</td>
+<td><code>.tls(...)</code></td>
+</tr>
+<tr>
+<td><code>implicit_tls</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span>SmtpClientBuilder<span class="op">;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> c <span class="op">=</span> <span class="pp">SmtpClientBuilder::</span>new()</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>timeout(<span class="pp">std::time::Duration::</span>from_secs(<span class="dv">30</span>))</span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>connect(addr)<span class="op">?;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>ehlo(<span class="st">&quot;client.example&quot;</span>)<span class="op">?;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>mail(<span class="st">&quot;alice@example.com&quot;</span>)<span class="op">?;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>rcpt(<span class="st">&quot;bob@example.com&quot;</span>)<span class="op">?;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>data(<span class="st">b&quot;Subject: hi</span><span class="sc">\r\n\r\n</span><span class="st">Hello</span><span class="sc">\r\n</span><span class="st">&quot;</span>)<span class="op">?;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="co">// or: c.bdat(...) / c.send_message(...)</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>quit()<span class="op">?;</span></span></code></pre></div>
+<p>Methods: <code>ehlo</code>, <code>helo</code>, <code>mail</code>, <code>rcpt</code>, <code>data</code>, <code>bdat</code>, <code>send_message</code>, <code>starttls</code>, <code>auth_plain</code>, <code>quit</code>. Helper: <code>dot_stuff</code>.</p>
+<h2 id="metrics">Metrics</h2>
+<p><code>SmtpServerMetrics</code>: connections, messages, bytes, <code>auth_ok</code> / <code>auth_fail</code>, <code>starttls</code> counts.</p>
 <h2 id="examples">Examples</h2>
-<p><a href="cookbook/smtp.html">Cookbook: SMTP</a> — accept-all server (<code>smtp-server</code>) and send twin (<code>smtp-send</code>).</p>
+<p>See <a href="cookbook/smtp.html">Cookbook: SMTP</a>.</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Accept-all cleartext</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> smtp-server <span class="at">--</span> 127.0.0.1:2525 localhost</span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Send one message</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a><span class="va">SMTP_SUBJECT</span><span class="op">=</span>Hi <span class="va">SMTP_BODY</span><span class="op">=</span>Hello <span class="dt">\</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>  <span class="ex">cargo</span> run <span class="at">-p</span> smtp-send <span class="at">--</span> 127.0.0.1:2525 from@ex to@ex</span></code></pre></div>
+<table>
+<colgroup>
+<col style="width: 30%" />
+<col style="width: 46%" />
+<col style="width: 23%" />
+</colgroup>
+<thead>
+<tr>
+<th>Package</th>
+<th>Demonstrates</th>
+<th>Knobs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/smtp</code> (<code>smtp-server</code>)</td>
+<td>Accept-all</td>
+<td><code>addr</code>, <code>hostname</code></td>
+</tr>
+<tr>
+<td><code>examples/smtp-send</code></td>
+<td>EHLO→MAIL→RCPT→DATA</td>
+<td><code>addr</code>, from, to; <code>SMTP_SUBJECT</code> / <code>SMTP_BODY</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li><strong>Local mailbox delivery is a follow-up</strong> — stock handlers discard; wire <code>MessageDataHandler</code> → <a href="mailbox.html"><code>Mailbox</code></a> append on <code>StorageExecutor</code>.</li>
+<li>Relay is open MX only; STARTTLS to arbitrary MX is incomplete.</li>
+<li>EXPN / ETRN not useful; VRFY always <code>252</code>.</li>
+<li>AUTH PLAIN only (no LOGIN/CRAM/SCRAM on SMTP wire yet).</li>
+<li>No SPF/DKIM/DMARC pipeline (present in Gumdrop SMTP docs; not in Hopf).</li>
+<li>Client is blocking.</li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

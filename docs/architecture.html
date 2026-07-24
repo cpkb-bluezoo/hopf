@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,26 +60,140 @@
     <main class="main">
       <header>
         <h1>Architecture</h1>
-        <p class="lead">Hopf is a **thread-per-core** (TPC) networking framework on</p>
+        <p class="lead">Hopf is a <strong>thread-per-core</strong> multi-protocol networking framework on <a href="https://github.com/tokio-rs/mio">mio</a>. Listen and dial are equal bindings on one <code>Runtime</code>. Protocol code sees plaintext handlers and Streams; TLS/QUIC, buffers, affinity, and backpressure stay below that line. It reimplements Gumdrop’s architectural contracts in Rust — not Java APIs or a Tokio/Hyper stack.</p>
       </header>
-      <p>Hopf is a <strong>thread-per-core</strong> (TPC) networking framework on <a href="https://github.com/tokio-rs/mio">mio</a>. Listen and dial are equal bindings on one <code>Runtime</code>. Codecs are <strong>incremental push parsers</strong> (chunked ingress, handler egress) — not a Tokio/Hyper stack.</p>
-<h2 id="process-shape">Process shape</h2>
-<pre class="text"><code>Composition / script
-       │
-       ├── add_tcp_listener / remove_binding  → Accept loop
-       └── connect / dial                     → worker reactors
-Accept ──affinity──► Reactor 0 … N
-                         │
-                      Endpoint
-                         │
-                  ProtocolHandler
-                         │
-              (HTTP Stream | TLS | DNS | …)</code></pre>
+      <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
-<li><strong>Accept loop</strong> — binds sockets, applies ACL/rate limits, round-robins new connections onto workers.</li>
-<li><strong>Worker reactor</strong> — owns connection affinity for life; timers, TLS I/O, UDP (DNS), execute hops.</li>
-<li><strong>StorageExecutor</strong> — blocking filesystem / mailbox work off the reactor; results hop back via <code>Endpoint::execute</code> / <code>ConnHandle</code>.</li>
+<li><a href="#purpose">Purpose</a></li>
+<li><a href="#thread-per-core">Thread-per-core</a></li>
+<li><a href="#io-substrate-mio">I/O substrate (mio)</a></li>
+<li><a href="#storage-and-dns">Storage and DNS</a></li>
+<li><a href="#layering">Layering</a></li>
+<li><a href="#endpoint-vs-protocolhandler">Endpoint vs ProtocolHandler</a></li>
+<li><a href="#listen-and-dial-are-peers">Listen and dial are peers</a></li>
+<li><a href="#dynamic-bindings-and-composition">Dynamic bindings and composition</a></li>
+<li><a href="#auth-vocabulary">Auth vocabulary</a></li>
+<li><a href="#codec-style">Codec style</a></li>
+<li><a href="#dependencies">Dependencies</a></li>
+<li><a href="#non-goals">Non-goals</a></li>
+<li><a href="#further-reading">Further reading</a></li>
+</ul></div>
+<h2 id="purpose">Purpose</h2>
+<p>The default topology is a <strong>graph of endpoints</strong> on one Runtime: N listeners and M dialers in one process are normal (peer / P2P compositions), not a third stack. Clients routinely host multiple protocols together — at minimum <strong>DNS under dial</strong>.</p>
+<p>Many Internet application protocols share the same transport model: TLS/QUIC where appropriate, transport-level backpressure, worker/storage pools independent of connection count, and <strong>plain buffers</strong> (<code>&amp;[u8]</code> / pooled owned buffers) rather than a proprietary buffer world.</p>
+<p>Hopf is a re-implementation of Gumdrop’s <strong>techniques, protocol work, and architectural contracts</strong>, with Rust ownership and TPC execution — not a line-by-line port of Java types.</p>
+<h2 id="thread-per-core">Thread-per-core</h2>
+<p><strong>Decision: TPC on mio readiness loops.</strong></p>
+<ul>
+<li>Each connection is owned by <strong>one reactor thread for its lifetime</strong> (affinity).</li>
+<li>I/O, TLS, and protocol byte handling stay on that thread.</li>
+<li>Application / blocking / storage work runs on a <strong>separate storage pool</strong>.</li>
+<li>Cross-core coordination is <strong>explicit</strong> (<code>ConnHandle</code>, <code>execute</code>, message passing) — not implicit task migration.</li>
 </ul>
+<pre class="text"><code>                 Runtime
+        ┌──────────┼──────────┐
+        │          │          │
+   AcceptLoop   Workers    StorageExecutor
+        │       0 … N-1         │
+        │          │            │
+   add_tcp_listener / connect   submit(…)
+        │          │
+        └──affinity──► Reactor i owns Conn for life
+                           │
+                        Endpoint
+                           │
+                    ProtocolHandler
+                           │
+                (HTTP Stream | FTP | SMTP | …)</code></pre>
+<table>
+<colgroup>
+<col style="width: 53%" />
+<col style="width: 46%" />
+</colgroup>
+<thead>
+<tr>
+<th>Piece</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Accept loop</strong></td>
+<td>Binds sockets, applies ACL / rate limits, round-robins accepts onto workers</td>
+</tr>
+<tr>
+<td><strong>Worker reactor</strong></td>
+<td>Owns connection affinity; timers, TLS I/O, UDP (DNS), <code>execute</code> hops</td>
+</tr>
+<tr>
+<td><strong>Dial RR</strong></td>
+<td>Separate round-robin for outbound connects</td>
+</tr>
+<tr>
+<td><strong>StorageExecutor</strong></td>
+<td>Bounded blocking pool; results hop back via <code>Endpoint::execute</code> / <code>ConnHandle</code></td>
+</tr>
+<tr>
+<td><strong>QUIC driver</strong></td>
+<td>Dedicated <code>hopf-quic</code> thread; still exposes <code>Endpoint</code> per bi-stream</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Rejected as the primary substrate:</strong> work-stealing async runtimes (e.g. Tokio multithreaded) that migrate connection state; adopting Glommio/Monoio/Compio as the product base (useful ideas, wrong ownership of stack and deps).</p>
+<p><strong>Optional future:</strong> io_uring completion paths for Linux behind the same <code>Endpoint</code> / handler traits — evolution, not a day-one requirement.</p>
+<h2 id="io-substrate-mio">I/O substrate (mio)</h2>
+<p>Build on <a href="https://github.com/tokio-rs/mio">mio</a> (epoll / kqueue readiness) with an in-tree executor, timer, and registration model. Hopf uses <strong>mio only</strong>, not the Tokio runtime.</p>
+<p>This preserves the readiness mental model (interest ops, fill buffer, parse, write queue, backpressure), portable development (including macOS), and a near-zero dependency surface for the reactor.</p>
+<p><strong>Do not</strong> pull Hyper, Axum, Tower, or an async app runtime. Accept loops, per-core reactors, timers, cross-thread queues, buffer pools, and listen/dial APIs are implemented in-tree.</p>
+<h2 id="storage-and-dns">Storage and DNS</h2>
+<p>mio covers <strong>sockets</strong>, not arbitrary filesystem I/O. Mail, FTP, WebDAV, and large body paths use an explicit <strong>storage executor</strong>: blocking or off-loop file work, <strong>never</strong> on the reactor thread.</p>
+<p>Name resolution is <strong>Runtime substrate</strong>, not a bolt-on product:</p>
+<ul>
+<li>Per-reactor <code>DnsResolver</code> (sockets, pending queries, timers on that core).</li>
+<li>Process-shared config + TTL cache where appropriate.</li>
+<li>Dial-by-name resolves on the <strong>target reactor</strong>; callbacks run there, then dial TCP/QUIC.</li>
+<li><strong>No</strong> blocking <code>getaddrinfo</code> on reactor threads.</li>
+</ul>
+<p>See <a href="dns.html">DNS</a>, <a href="runtime-options.html">runtime options</a>.</p>
+<h2 id="layering">Layering</h2>
+<pre class="text"><code>┌─────────────────────────────────────────────────────────┐
+│  hopf-webdav / hopf-websocket / hopf-grpc / hopf-otel   │  Stream consumers
+├─────────────────────────────────────────────────────────┤
+│  hopf-http          ServerHandler / ClientHandler       │  HTTP Streams
+│                     H1 / H2 / H3 adapters               │
+├─────────────────────────────────────────────────────────┤
+│  hopf-ftp / hopf-smtp / hopf-dns / hopf-mailbox         │  Protocol services
+├──────────────────────────┬──────────────────────────────┤
+│  hopf-tls (TCP rustls)   │  hopf-quic (QUIC + TLS 1.3)  │  Crypto transports
+├──────────────────────────┴──────────────────────────────┤
+│  hopf-core   Runtime · Endpoint · ProtocolHandler ·     │
+│              Composition · Storage · ACL · TelemetryHook│
+└─────────────────────────────────────────────────────────┘
+         hopf-auth  (TrustPolicy / SASL — no core dep)</code></pre>
+<h3 id="transport-vs-http-stream">Transport vs HTTP Stream</h3>
+<table>
+<colgroup>
+<col style="width: 41%" />
+<col style="width: 58%" />
+</colgroup>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Concepts</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>A — Transport</strong> (<code>hopf-core</code> / <code>hopf-quic</code>)</td>
+<td><code>Endpoint</code> (byte stream); TCP; UDP datagrams; QUIC stream endpoint; multiplexed QUIC connection</td>
+</tr>
+<tr>
+<td><strong>B — HTTP Stream</strong> (<code>hopf-http</code>)</td>
+<td>One request/response exchange; <code>HttpStream</code> + <code>ServerHandler</code> / <code>ServerWriter</code>, <code>ClientHandler</code> / <code>ClientWriter</code> — <strong>version- and transport-agnostic</strong></td>
+</tr>
+</tbody>
+</table>
+<p>H1 adapts a TCP <code>Endpoint</code> into serialized Streams; H2 multiplexes Streams on one TCP <code>Endpoint</code>; H3 maps each request to a QUIC stream <code>Endpoint</code>. Bind vs dial only affects how the transport was born; server/client role is a separate axis. Terminology: HTTP Stream ≠ H2 stream id ≠ QUIC stream endpoint.</p>
 <h2 id="endpoint-vs-protocolhandler">Endpoint vs ProtocolHandler</h2>
 <table>
 <colgroup>
@@ -94,21 +209,136 @@ Accept ──affinity──► Reactor 0 … N
 <tbody>
 <tr>
 <td><code>Endpoint</code></td>
-<td>Transport face: <code>send</code>, <code>close</code>, <code>start_tls</code>, pause/resume, peer addr</td>
+<td>Transport face: <code>send</code>, <code>close</code>, <code>start_tls</code>, pause/resume read, <code>on_write_ready</code>, <code>execute</code>, <code>schedule_timer</code>, <code>handle</code>, peer addrs, <code>security_info</code></td>
 </tr>
 <tr>
 <td><code>ProtocolHandler</code></td>
-<td>Application/protocol FSM: <code>connected</code>, <code>receive</code>, <code>disconnected</code>, <code>error</code></td>
+<td>Protocol FSM: <code>connected</code>, <code>receive</code>, <code>disconnected</code>, <code>security_established</code>, <code>error</code></td>
 </tr>
 </tbody>
 </table>
-<p>HTTP adapters (<code>H1Endpoint</code>, <code>H2Endpoint</code>, …) are <code>ProtocolHandler</code>s that drive <code>ServerHandler</code> / <code>ClientHandler</code> on an HTTP Stream.</p>
+<p>HTTP adapters (<code>H1Endpoint</code>, <code>H2Endpoint</code>, <code>CleartextHttpEndpoint</code>, <code>AlpnHttpEndpoint</code>, H3 handlers) are <code>ProtocolHandler</code>s that drive Stream handlers. <code>receive</code> uses NIO compact semantics: advance the <code>&amp;mut &amp;[u8]</code> cursor; unconsumed suffix is preserved.</p>
+<h2 id="listen-and-dial-are-peers">Listen and dial are peers</h2>
+<table>
+<thead>
+<tr>
+<th>Listen</th>
+<th>Dial</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TcpListenerConfig</code></td>
+<td><code>TcpConnectorConfig</code></td>
+</tr>
+<tr>
+<td><code>Runtime::add_tcp_listener</code></td>
+<td><code>Runtime::connect</code></td>
+</tr>
+<tr>
+<td><code>Composition::listen_tcp</code></td>
+<td><code>Composition::dial_tcp</code></td>
+</tr>
+<tr>
+<td><code>listen_quic</code> / <code>listen_h3</code></td>
+<td><code>connect_quic</code> / <code>connect_h3</code></td>
+</tr>
+<tr>
+<td><code>ServerHandler</code></td>
+<td><code>ClientHandler</code></td>
+</tr>
+</tbody>
+</table>
+<p>Both reduce to registering a stream on a reactor with lifetime affinity.</p>
+<h2 id="dynamic-bindings-and-composition">Dynamic bindings and composition</h2>
+<p><strong>All bindings are dynamic.</strong> Listen and dial are added/removed through Runtime APIs while the process is alive. Configuration is a <strong>script</strong> over those APIs (Rust <code>main</code> / builder, or XML). <code>Service</code> orchestrates lifecycle; it does <strong>not</strong> own an immutable listener list as source of truth.</p>
+<pre class="text"><code>main → Runtime::start → Composition
+         → TrustPolicy / TLS / DNS
+         → add bindings (listen/dial)
+         → handler factories (closed registry)
+       → wait / shutdown</code></pre>
+<ul>
+<li><strong>Canonical:</strong> Rust <code>Composition</code> builder.</li>
+<li><strong>Declarative:</strong> XML via <strong>tractrix</strong> → same builder; closed registry of handler / trust names — <strong>no</strong> reflective DI.</li>
+<li>TOML/YAML are not primary composition formats.</li>
+</ul>
+<p>Details: <a href="composition.html">composition</a>, <a href="services.html">services</a>, <a href="clients.html">clients</a>.</p>
+<h2 id="auth-vocabulary">Auth vocabulary</h2>
+<p>Prefer <strong>TrustPolicy</strong> + <strong>IdentityMaterial</strong> over Realm-as-root naming. Attach to <strong>both</strong> listen and dial. SASL client/server are <strong>wire roles</strong>, independent of listen/dial. See <a href="auth.html">auth</a>.</p>
+<h2 id="codec-style">Codec style</h2>
+<p><strong>Grammar-driven incremental codecs:</strong> protocol-specific token alphabets on shared <code>ByteStreamLexer</code>; update the parse FSM as each production completes; CRLF is one production, not the only event boundary. Early <strong>parse</strong> state ≠ early <strong>app</strong> callbacks. Sibling incremental parsers (tractrix, rjsonparser, rmimeparser, rprotobuf) follow the same push model for XML/JSON/MIME/protobuf.</p>
+<h2 id="dependencies">Dependencies</h2>
+<h3 id="allowed-hard">Allowed (hard)</h3>
+<table>
+<thead>
+<tr>
+<th>Dependency</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>mio</strong></td>
+<td>Readiness networking (TPC reactors)</td>
+</tr>
+<tr>
+<td><strong>rustls</strong></td>
+<td>TLS for TCP <strong>and</strong> QUIC (single TLS story)</td>
+</tr>
+<tr>
+<td><strong>quinn-proto</strong></td>
+<td>QUIC transport state machine; mio glue in-tree</td>
+</tr>
+</tbody>
+</table>
+<h3 id="sibling-parsers-when-features-need-them">Sibling parsers (when features need them)</h3>
+<table>
+<colgroup>
+<col style="width: 53%" />
+<col style="width: 46%" />
+</colgroup>
+<thead>
+<tr>
+<th>Crate</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://crates.io/crates/tractrix">tractrix</a></td>
+<td>Incremental XML (WebDAV + composition)</td>
+</tr>
+<tr>
+<td><a href="https://crates.io/crates/rjsonparser">rjsonparser</a></td>
+<td>Incremental JSON</td>
+</tr>
+<tr>
+<td><a href="https://crates.io/crates/rmimeparser">rmimeparser</a></td>
+<td>Incremental MIME / RFC 5322</td>
+</tr>
+<tr>
+<td><a href="https://crates.io/crates/rprotobuf">rprotobuf</a></td>
+<td>Incremental protobuf (e.g. OTLP)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="explicit-non-dependencies">Explicit non-dependencies</h3>
+<p>Async app runtimes (Tokio et al.), Hyper, Axum, Tower, serde as architecture, the full <code>quinn</code> crate, separate QUIC crypto beside rustls, servlet/JSP/Java EE APIs, reflective XML DI, TOML/YAML as primary composition formats.</p>
+<h2 id="non-goals">Non-goals</h2>
+<ul>
+<li>Preserving Servlet, JSP, or JavaMail APIs.</li>
+<li>Bit-identical Gumdrop Java package layouts or JNI.</li>
+<li>Work-stealing schedulers as the default concurrency story.</li>
+<li>Supporting every advanced platform feature equally on day one.</li>
+</ul>
 <h2 id="further-reading">Further reading</h2>
-<p><a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> for product decisions; <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> for implementation order.</p>
+<ul>
+<li><a href="services.html">Services</a> · <a href="clients.html">Clients</a> · <a href="runtime-options.html">Runtime options</a></li>
+<li><a href="http/overview.html">HTTP overview</a> · <a href="quic-h3.html">QUIC / H3</a> · <a href="tls.html">TLS</a></li>
+<li><a href="auth.html">Auth</a> · <a href="access-control.html">Access control</a> · <a href="telemetry.html">Telemetry</a></li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

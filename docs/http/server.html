@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="../index.html"><img src="../assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="../index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,41 +60,358 @@
     <main class="main">
       <header>
         <h1>HTTP server</h1>
-        
+        <p class="lead">Crate <code>hopf-http</code>: server face of an HTTP Stream. Implement <code>ServerHandler</code> (and optionally wrap with auth factories); wire a <code>ProtocolHandler</code> adapter (<code>CleartextHttpEndpoint</code>, <code>AlpnHttpEndpoint</code>, <code>H1Endpoint::server</code>, …) on a TCP listener. H3 uses the same handler SPI via <code>listen_h3</code>.</p>
       </header>
-      <h2 id="serverhandler">ServerHandler</h2>
-<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ServerHandler <span class="cf">for</span> Hello <span class="op">{</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> headers(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter<span class="op">,</span> headers<span class="op">:</span> <span class="op">&amp;</span>Headers) <span class="op">{</span></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>        <span class="co">// may write a full response here</span></span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> request_complete(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter) <span class="op">{}</span></span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
-<p>Body sequence when present: <code>headers</code> → <code>start_request_body</code> → <code>request_body_content</code>* → <code>end_request_body</code> → <code>request_complete</code>.</p>
-<h2 id="serverwriter">ServerWriter</h2>
-<p>Buffer status/headers, then <code>start_response_body</code> / <code>response_body_content</code> / <code>end_response_body</code> / <code>complete</code>. Informational 1xx via <code>send_informational</code>.</p>
-<h2 id="limits">Limits</h2>
-<p><code>HttpLimits</code> caps header sizes, body sizes, etc. Pass into endpoint constructors.</p>
-<h2 id="authentication">Authentication</h2>
-<p>Wrap the handler factory with <code>BasicAuthFactory</code>, <code>DigestAuthFactory</code>, or <code>BearerAuthFactory</code>. Digest needs a <code>CredentialStore</code> (e.g. <code>PasswordStore</code>) for HA1. See <a href="../auth.html">Auth</a>.</p>
-<pre><code class="language-rust">use hopf_http::{BasicAuthFactory, BasicAuthConfig, DigestAuthFactory, DigestAuthConfig};
-use hopf_auth::{PasswordTrustPolicy, PasswordStore};
-use std::sync::Arc;
-
-let basic = Arc::new(BasicAuthFactory::new(
-    inner_factory.clone(),
-    PasswordTrustPolicy::new().with_user("alice", "s3cret").shared(),
-    BasicAuthConfig::new("realm"),
-));
-let digest = Arc::new(DigestAuthFactory::new(
-    inner_factory,
-    Arc::new(PasswordStore::new().with_user("alice", "s3cret")),
-    DigestAuthConfig::new("realm"),
-));
-</code></pre>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#serverhandler-spi">ServerHandler SPI</a></li>
+<li><a href="#serverwriter-methods">ServerWriter methods</a></li>
+<li><a href="#deferred-responses">Deferred responses</a></li>
+<li><a href="#authentication-factories">Authentication factories</a></li>
+<li><a href="#protocol-upgrades">Protocol upgrades</a></li>
+<li><a href="#wiring-example">Wiring example</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#see-also">See also</a></li>
+</ul></div>
+<h2 id="serverhandler-spi">ServerHandler SPI</h2>
+<table>
+<colgroup>
+<col style="width: 53%" />
+<col style="width: 46%" />
+</colgroup>
+<thead>
+<tr>
+<th>Trait</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ServerHandlerFactory</code></td>
+<td><code>create_handler() -&gt; Box&lt;dyn ServerHandler&gt;</code> per inbound Stream</td>
+</tr>
+<tr>
+<td><code>ServerHandler</code></td>
+<td>Incremental push events for one request</td>
+</tr>
+<tr>
+<td><code>ServerWriter</code></td>
+<td>Outbound response for the current Stream</td>
+</tr>
+<tr>
+<td><code>ServerResponseHandle</code></td>
+<td>Cloneable offload handle (<code>execute</code>, pause/resume body)</td>
+</tr>
+<tr>
+<td><code>ProtocolUpgradeHandler</code></td>
+<td>Post-upgrade byte protocol</td>
+</tr>
+</tbody>
+</table>
+<h3 id="callback-sequence">Callback sequence</h3>
+<p>With a request body:</p>
+<ol type="1">
+<li><code>headers(&amp;mut dyn ServerWriter, &amp;Headers)</code></li>
+<li><code>start_request_body</code></li>
+<li><code>request_body_content</code> (zero-copy chunks)</li>
+<li><code>end_request_body</code></li>
+<li><code>request_complete</code></li>
+</ol>
+<p>Without a body: <code>headers</code> → <code>request_complete</code>. Body callbacks have empty default implementations.</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>Headers<span class="op">,</span> ServerHandler<span class="op">,</span> ServerWriter<span class="op">};</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Hello<span class="op">;</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ServerHandler <span class="cf">for</span> Hello <span class="op">{</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> headers(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter<span class="op">,</span> req<span class="op">:</span> <span class="op">&amp;</span>Headers) <span class="op">{</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> path <span class="op">=</span> req<span class="op">.</span>get(<span class="st">&quot;:path&quot;</span>)<span class="op">.</span>unwrap_or(<span class="st">&quot;/&quot;</span>)<span class="op">;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> h <span class="op">=</span> <span class="pp">Headers::</span>new()<span class="op">;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>status(<span class="dv">200</span>)<span class="op">;</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>set(<span class="st">&quot;content-type&quot;</span><span class="op">,</span> <span class="st">&quot;text/plain&quot;</span>)<span class="op">;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>        response<span class="op">.</span>headers(h)<span class="op">;</span></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        response<span class="op">.</span>start_response_body()<span class="op">;</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        response<span class="op">.</span>response_body_content(<span class="pp">format!</span>(<span class="st">&quot;hello {path}</span><span class="sc">\n</span><span class="st">&quot;</span>)<span class="op">.</span>as_bytes())<span class="op">;</span></span>
+<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>        response<span class="op">.</span>end_response_body()<span class="op">;</span></span>
+<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>        response<span class="op">.</span>complete()<span class="op">;</span></span>
+<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> request_complete(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter) <span class="op">{}</span></span>
+<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<h2 id="serverwriter-methods">ServerWriter methods</h2>
+<table>
+<colgroup>
+<col style="width: 47%" />
+<col style="width: 52%" />
+</colgroup>
+<thead>
+<tr>
+<th>Method</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>send_informational(code, headers)</code></td>
+<td>Send a 1xx response</td>
+</tr>
+<tr>
+<td><code>headers(Headers)</code></td>
+<td>Buffer response headers (flush on body start or <code>complete</code>)</td>
+</tr>
+<tr>
+<td><code>start_response_body()</code></td>
+<td>Flush headers and begin the body</td>
+</tr>
+<tr>
+<td><code>response_body_content(&amp;[u8])</code></td>
+<td>Write body bytes (auto-chunked when applicable)</td>
+</tr>
+<tr>
+<td><code>end_response_body()</code></td>
+<td>Finish body (final chunk if chunked)</td>
+</tr>
+<tr>
+<td><code>trailers(Headers)</code></td>
+<td>Trailer headers after the body (<strong>H2/H3</strong>; H1 ignores)</td>
+</tr>
+<tr>
+<td><code>complete()</code></td>
+<td>Complete the response (flushes headers if no body was started)</td>
+</tr>
+<tr>
+<td><code>upgrade(headers, handler)</code></td>
+<td>101 (H1) or 200 Extended CONNECT (H2/H3); see <a href="overview.html#upgrade-seams">overview</a></td>
+</tr>
+<tr>
+<td><code>traceparent()</code></td>
+<td>Optional W3C <code>traceparent</code> for outbound continuation</td>
+</tr>
+<tr>
+<td><code>conn_handle()</code></td>
+<td><code>ConnHandle</code> for storage / reactor hops</td>
+</tr>
+<tr>
+<td><code>response_handle()</code></td>
+<td>Cloneable <code>ServerResponseHandle</code> for deferred writes</td>
+</tr>
+<tr>
+<td><code>pause_request_body()</code> / <code>resume_request_body()</code></td>
+<td>Stop / resume inbound body events</td>
+</tr>
+</tbody>
+</table>
+<p>Pseudo-headers on outbound responses use <code>Headers::status(u16)</code> (sets <code>:status</code>). Request inspection uses <code>:method</code>, <code>:path</code>, <code>:scheme</code>, <code>:authority</code>, plus ordinary fields.</p>
+<h2 id="deferred-responses">Deferred responses</h2>
+<p>When request handling needs blocking work (filesystem, mailbox, remote call), do <strong>not</strong> block the reactor. Take a <code>ServerResponseHandle</code>, pause the body if needed, submit to <code>StorageExecutor</code>, then hop back with <code>execute</code>:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>StorageExecutor<span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>Headers<span class="op">,</span> ServerHandler<span class="op">,</span> ServerWriter<span class="op">};</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Offload <span class="op">{</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    storage<span class="op">:</span> Arc<span class="op">&lt;</span>StorageExecutor<span class="op">&gt;,</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ServerHandler <span class="cf">for</span> Offload <span class="op">{</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> headers(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter<span class="op">,</span> _req<span class="op">:</span> <span class="op">&amp;</span>Headers) <span class="op">{</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> handle <span class="op">=</span> response<span class="op">.</span>response_handle()<span class="op">;</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>        handle<span class="op">.</span>pause_request_body()<span class="op">;</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> conn <span class="op">=</span> handle<span class="op">.</span>conn_handle()<span class="op">.</span>clone()<span class="op">;</span></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>        <span class="kw">self</span><span class="op">.</span>storage<span class="op">.</span>submit_on(conn<span class="op">,</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a>            <span class="co">// blocking work off the reactor</span></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>            <span class="cn">Ok</span><span class="pp">::</span><span class="op">&lt;</span>_<span class="op">,</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> <span class="pp">std::error::</span><span class="bu">Error</span> <span class="op">+</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span><span class="op">&gt;&gt;</span>(<span class="st">&quot;ok&quot;</span><span class="op">.</span>to_string())</span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a>        <span class="op">},</span> <span class="kw">move</span> <span class="op">|</span>result<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a>            handle<span class="op">.</span>execute(<span class="kw">move</span> <span class="op">|</span>w<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> body <span class="op">=</span> <span class="cf">match</span> result <span class="op">{</span></span>
+<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a>                    <span class="cn">Ok</span>(s) <span class="op">=&gt;</span> s<span class="op">,</span></span>
+<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a>                    <span class="cn">Err</span>(_) <span class="op">=&gt;</span> <span class="st">&quot;error&quot;</span><span class="op">.</span>into()<span class="op">,</span></span>
+<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a>                <span class="op">};</span></span>
+<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a>                <span class="kw">let</span> <span class="kw">mut</span> h <span class="op">=</span> <span class="pp">Headers::</span>new()<span class="op">;</span></span>
+<span id="cb2-24"><a href="#cb2-24" aria-hidden="true" tabindex="-1"></a>                h<span class="op">.</span>status(<span class="dv">200</span>)<span class="op">;</span></span>
+<span id="cb2-25"><a href="#cb2-25" aria-hidden="true" tabindex="-1"></a>                h<span class="op">.</span>set(<span class="st">&quot;content-type&quot;</span><span class="op">,</span> <span class="st">&quot;text/plain&quot;</span>)<span class="op">;</span></span>
+<span id="cb2-26"><a href="#cb2-26" aria-hidden="true" tabindex="-1"></a>                w<span class="op">.</span>headers(h)<span class="op">;</span></span>
+<span id="cb2-27"><a href="#cb2-27" aria-hidden="true" tabindex="-1"></a>                w<span class="op">.</span>start_response_body()<span class="op">;</span></span>
+<span id="cb2-28"><a href="#cb2-28" aria-hidden="true" tabindex="-1"></a>                w<span class="op">.</span>response_body_content(body<span class="op">.</span>as_bytes())<span class="op">;</span></span>
+<span id="cb2-29"><a href="#cb2-29" aria-hidden="true" tabindex="-1"></a>                w<span class="op">.</span>end_response_body()<span class="op">;</span></span>
+<span id="cb2-30"><a href="#cb2-30" aria-hidden="true" tabindex="-1"></a>                w<span class="op">.</span>complete()<span class="op">;</span></span>
+<span id="cb2-31"><a href="#cb2-31" aria-hidden="true" tabindex="-1"></a>                w<span class="op">.</span>resume_request_body()<span class="op">;</span></span>
+<span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>            <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>        <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-35"><a href="#cb2-35" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> request_complete(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter) <span class="op">{}</span></span>
+<span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Framing stays inside the transport’s <code>ResponseControl</code>; application code only sees <code>ServerWriter</code> / <code>ServerResponseHandle</code>.</p>
+<h2 id="authentication-factories">Authentication factories</h2>
+<p>All three wrap an inner <code>ServerHandlerFactory</code> and challenge before forwarding. They depend on <code>hopf-auth</code> (<code>TrustPolicy</code> / <code>CredentialStore</code>).</p>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 52%" />
+<col style="width: 22%" />
+</colgroup>
+<thead>
+<tr>
+<th>Factory</th>
+<th>Credential surface</th>
+<th>Config</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>BasicAuthFactory</code></td>
+<td><code>TrustPolicy</code> via <code>IdentityMaterial::UsernamePassword</code></td>
+<td><code>BasicAuthConfig { realm }</code></td>
+</tr>
+<tr>
+<td><code>DigestAuthFactory</code></td>
+<td><code>CredentialStore</code> (HA1)</td>
+<td><code>DigestAuthConfig { realm }</code></td>
+</tr>
+<tr>
+<td><code>BearerAuthFactory</code></td>
+<td><code>TrustPolicy</code> via bearer token</td>
+<td>optional <code>with_realm(...)</code></td>
+</tr>
+</tbody>
+</table>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span><span class="op">{</span>PasswordStore<span class="op">,</span> PasswordTrustPolicy<span class="op">};</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    BasicAuthConfig<span class="op">,</span> BasicAuthFactory<span class="op">,</span> BearerAuthFactory<span class="op">,</span> DigestAuthConfig<span class="op">,</span> DigestAuthFactory<span class="op">,</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> inner<span class="op">:</span> Arc<span class="op">&lt;</span><span class="kw">dyn</span> <span class="pp">hopf_http::</span>ServerHandlerFactory<span class="op">&gt;</span> <span class="op">=</span> <span class="co">/* app factory */</span><span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> basic <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">BasicAuthFactory::</span>new(</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>inner)<span class="op">,</span></span>
+<span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="pp">PasswordTrustPolicy::</span>new()<span class="op">.</span>with_user(<span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;s3cret&quot;</span>)<span class="op">.</span>shared()<span class="op">,</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="pp">BasicAuthConfig::</span>new(<span class="st">&quot;realm&quot;</span>)<span class="op">,</span></span>
+<span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>))<span class="op">;</span></span>
+<span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> digest <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">DigestAuthFactory::</span>new(</span>
+<span id="cb3-16"><a href="#cb3-16" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>inner)<span class="op">,</span></span>
+<span id="cb3-17"><a href="#cb3-17" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Arc::</span>new(<span class="pp">PasswordStore::</span>new()<span class="op">.</span>with_user(<span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;s3cret&quot;</span>))<span class="op">,</span></span>
+<span id="cb3-18"><a href="#cb3-18" aria-hidden="true" tabindex="-1"></a>    <span class="pp">DigestAuthConfig::</span>new(<span class="st">&quot;realm&quot;</span>)<span class="op">,</span></span>
+<span id="cb3-19"><a href="#cb3-19" aria-hidden="true" tabindex="-1"></a>))<span class="op">;</span></span>
+<span id="cb3-20"><a href="#cb3-20" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-21"><a href="#cb3-21" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bearer <span class="op">=</span> <span class="pp">Arc::</span>new(</span>
+<span id="cb3-22"><a href="#cb3-22" aria-hidden="true" tabindex="-1"></a>    <span class="pp">BearerAuthFactory::</span>new(</span>
+<span id="cb3-23"><a href="#cb3-23" aria-hidden="true" tabindex="-1"></a>        inner<span class="op">,</span></span>
+<span id="cb3-24"><a href="#cb3-24" aria-hidden="true" tabindex="-1"></a>        <span class="pp">PasswordTrustPolicy::</span>new() <span class="co">/* with_token in PasswordStore / custom policy */</span></span>
+<span id="cb3-25"><a href="#cb3-25" aria-hidden="true" tabindex="-1"></a>            <span class="op">.</span>shared()<span class="op">,</span></span>
+<span id="cb3-26"><a href="#cb3-26" aria-hidden="true" tabindex="-1"></a>    )</span>
+<span id="cb3-27"><a href="#cb3-27" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_realm(<span class="st">&quot;api&quot;</span>)<span class="op">,</span></span>
+<span id="cb3-28"><a href="#cb3-28" aria-hidden="true" tabindex="-1"></a>)<span class="op">;</span></span></code></pre></div>
+<p>Helpers: <code>parse_basic_authorization</code>, <code>build_digest_authorization</code>. Failed auth sends <code>401</code> with <code>WWW-Authenticate</code> and does not forward body events to the inner handler.</p>
+<h2 id="protocol-upgrades">Protocol upgrades</h2>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>Headers<span class="op">,</span> ProtocolUpgradeHandler<span class="op">,</span> ServerHandler<span class="op">,</span> ServerWriter<span class="op">};</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> EchoUpgrade<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ProtocolUpgradeHandler <span class="cf">for</span> EchoUpgrade <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> receive(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> data<span class="op">:</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">{</span> <span class="co">/* inbound app bytes */</span> <span class="kw">let</span> _ <span class="op">=</span> data<span class="op">;</span> <span class="op">}</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> take_outbound(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Vec</span><span class="op">&lt;</span><span class="dt">u8</span><span class="op">&gt;</span> <span class="op">{</span> <span class="dt">Vec</span><span class="pp">::</span>new() <span class="op">}</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ServerHandler <span class="cf">for</span> <span class="co">/* ... */</span> <span class="op">{</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> headers(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter<span class="op">,</span> req<span class="op">:</span> <span class="op">&amp;</span>Headers) <span class="op">{</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> h <span class="op">=</span> <span class="pp">Headers::</span>new()<span class="op">;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>        <span class="co">// fill Upgrade / Sec-WebSocket-* as required by the protocol</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> _ <span class="op">=</span> response<span class="op">.</span>upgrade(h<span class="op">,</span> <span class="dt">Box</span><span class="pp">::</span>new(EchoUpgrade))<span class="op">;</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> request_complete(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter) <span class="op">{}</span></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Prefer stock factories from <code>hopf-websocket</code> / <code>hopf-grpc</code> rather than hand-rolling handshake headers.</p>
+<h2 id="wiring-example">Wiring example</h2>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> Runtime<span class="op">,</span> RuntimeConfig<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    CleartextHttpEndpoint<span class="op">,</span> Headers<span class="op">,</span> HttpLimits<span class="op">,</span> ServerHandler<span class="op">,</span> ServerHandlerFactory<span class="op">,</span> ServerWriter<span class="op">,</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> HelloFactory<span class="op">;</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ServerHandlerFactory <span class="cf">for</span> HelloFactory <span class="op">{</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> create_handler(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ServerHandler<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>        <span class="dt">Box</span><span class="pp">::</span>new(Hello)</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Hello<span class="op">;</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ServerHandler <span class="cf">for</span> Hello <span class="op">{</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> headers(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter<span class="op">,</span> _req<span class="op">:</span> <span class="op">&amp;</span>Headers) <span class="op">{</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>        <span class="kw">let</span> <span class="kw">mut</span> h <span class="op">=</span> <span class="pp">Headers::</span>new()<span class="op">;</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>status(<span class="dv">200</span>)<span class="op">;</span></span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>set(<span class="st">&quot;content-type&quot;</span><span class="op">,</span> <span class="st">&quot;text/plain&quot;</span>)<span class="op">;</span></span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>        h<span class="op">.</span>set(<span class="st">&quot;content-length&quot;</span><span class="op">,</span> <span class="st">&quot;6&quot;</span>)<span class="op">;</span></span>
+<span id="cb5-21"><a href="#cb5-21" aria-hidden="true" tabindex="-1"></a>        response<span class="op">.</span>headers(h)<span class="op">;</span></span>
+<span id="cb5-22"><a href="#cb5-22" aria-hidden="true" tabindex="-1"></a>        response<span class="op">.</span>start_response_body()<span class="op">;</span></span>
+<span id="cb5-23"><a href="#cb5-23" aria-hidden="true" tabindex="-1"></a>        response<span class="op">.</span>response_body_content(<span class="st">b&quot;hello</span><span class="sc">\n</span><span class="st">&quot;</span>)<span class="op">;</span></span>
+<span id="cb5-24"><a href="#cb5-24" aria-hidden="true" tabindex="-1"></a>        response<span class="op">.</span>end_response_body()<span class="op">;</span></span>
+<span id="cb5-25"><a href="#cb5-25" aria-hidden="true" tabindex="-1"></a>        response<span class="op">.</span>complete()<span class="op">;</span></span>
+<span id="cb5-26"><a href="#cb5-26" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb5-27"><a href="#cb5-27" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> request_complete(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter) <span class="op">{}</span></span>
+<span id="cb5-28"><a href="#cb5-28" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb5-29"><a href="#cb5-29" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-30"><a href="#cb5-30" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> main() <span class="op">-&gt;</span> <span class="pp">std::io::</span><span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb5-31"><a href="#cb5-31" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?;</span></span>
+<span id="cb5-32"><a href="#cb5-32" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> factory<span class="op">:</span> Arc<span class="op">&lt;</span><span class="kw">dyn</span> ServerHandlerFactory<span class="op">&gt;</span> <span class="op">=</span> <span class="pp">Arc::</span>new(HelloFactory)<span class="op">;</span></span>
+<span id="cb5-33"><a href="#cb5-33" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> limits <span class="op">=</span> <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">;</span></span>
+<span id="cb5-34"><a href="#cb5-34" aria-hidden="true" tabindex="-1"></a>    rt<span class="op">.</span>add_tcp_listener(<span class="pp">TcpListenerConfig::</span>new(<span class="st">&quot;127.0.0.1:8080&quot;</span><span class="op">.</span>parse()<span class="op">?,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb5-35"><a href="#cb5-35" aria-hidden="true" tabindex="-1"></a>        <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">CleartextHttpEndpoint::</span>new(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">,</span> limits))</span>
+<span id="cb5-36"><a href="#cb5-36" aria-hidden="true" tabindex="-1"></a>            <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
+<span id="cb5-37"><a href="#cb5-37" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>))<span class="op">?;</span></span>
+<span id="cb5-38"><a href="#cb5-38" aria-hidden="true" tabindex="-1"></a>    <span class="co">// hold rt / park main</span></span>
+<span id="cb5-39"><a href="#cb5-39" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb5-40"><a href="#cb5-40" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>For TLS ALPN or H3, swap the adapter — same <code>ServerHandlerFactory</code>. See <a href="overview.html#cleartext-alpn-and-h3-wiring">overview</a>.</p>
+<h2 id="examples">Examples</h2>
+<table>
+<thead>
+<tr>
+<th>Example</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/http-hello</code></td>
+<td>Cleartext + optional <code>--tls</code></td>
+</tr>
+<tr>
+<td><code>examples/http3-hello</code></td>
+<td>Self-signed QUIC + <code>listen_h3</code></td>
+</tr>
+<tr>
+<td><code>examples/webdav</code></td>
+<td><code>ServerHandlerFactory</code> from <code>hopf-webdav</code></td>
+</tr>
+<tr>
+<td><code>examples/websocket</code></td>
+<td>Upgrade via <code>WebSocketFactory</code></td>
+</tr>
+<tr>
+<td><code>examples/grpc</code></td>
+<td>Unary gRPC factory</td>
+</tr>
+</tbody>
+</table>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>Trailers on HTTP/1.1 are ignored (<code>trailers</code> is a no-op for H1).</li>
+<li>Auth factories evaluate against <code>PeerContext::unknown()</code> today (no socket peer material wired into the challenge path).</li>
+<li>Deferred responses require careful pause/resume so body events do not race the offloaded write.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="overview.html">HTTP overview</a></li>
+<li><a href="client.html">HTTP client</a></li>
+<li><a href="../auth.html">Auth</a></li>
+<li><a href="../services.html">Services</a></li>
+<li><a href="../telemetry.html">Telemetry</a> — <code>InstrumentedServerFactory</code></li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

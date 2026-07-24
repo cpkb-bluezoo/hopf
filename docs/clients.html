@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Clients (dial path) — Hopf</title>
+  <title>Clients — Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -58,25 +59,252 @@
 </nav>
     <main class="main">
       <header>
-        <h1>Clients (dial path)</h1>
-        <p class="lead">Dial is a peer of listen: same Runtime, same affinity rules.</p>
+        <h1>Clients</h1>
+        <p class="lead">Crate <code>hopf-core</code> dial path (<code>TcpConnectorConfig</code> / <code>Runtime::connect</code>) is the peer of listen. Protocol crates supply client <code>ProtocolHandler</code>s or HTTP <code>ClientHandler</code>s. DNS name dials use <code>hopf-dns::RuntimeDnsExt</code>.</p>
       </header>
-      <p>Dial is a peer of listen: same Runtime, same affinity rules.</p>
-<h2 id="runtimeconnect">Runtime::connect</h2>
-<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect(<span class="pp">TcpConnectorConfig::</span>new(peer<span class="op">,</span> <span class="op">||</span> <span class="op">{</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(MyClient) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>))<span class="op">?;</span></span></code></pre></div>
-<p>Optional TLS: <code>TcpConnectorConfig::with_tls(connector)</code>.</p>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#dial-path">Dial path</a></li>
+<li><a href="#tcpconnectorconfig">TcpConnectorConfig</a></li>
+<li><a href="#connect_by_name">connect_by_name</a></li>
+<li><a href="#client-handlers-by-protocol">Client handlers by protocol</a></li>
+<li><a href="#http-client">HTTP client</a></li>
+<li><a href="#quic-dial">QUIC dial</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#see-also">See also</a></li>
+</ul></div>
+<h2 id="dial-path">Dial path</h2>
+<pre class="text"><code>Runtime::connect(TcpConnectorConfig)
+        │
+        ▼
+pick worker (dial round-robin) ──affinity──► Reactor
+        │
+        ▼
+TCP connect → optional TLS-from-dial
+        │
+        ▼
+ProtocolHandler::connected / receive / …</code></pre>
+<p>Listen and dial share <code>TcpConnParams</code> (buffer caps, idle, TLS). Affinity is chosen at dial time and held for the connection’s life — same as accept.</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> Runtime<span class="op">,</span> TcpConnectorConfig<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect(<span class="pp">TcpConnectorConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(MyClient) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>))<span class="op">?;</span></span></code></pre></div>
+<p>Optional TLS: <code>TcpConnectorConfig::with_tls(connector, server_name)</code> from <code>hopf-tls</code>.</p>
+<h2 id="tcpconnectorconfig">TcpConnectorConfig</h2>
+<table>
+<colgroup>
+<col style="width: 30%" />
+<col style="width: 39%" />
+<col style="width: 30%" />
+</colgroup>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>addr</code></td>
+<td>required</td>
+<td>Pre-resolved <code>SocketAddr</code> (Stage 0)</td>
+</tr>
+<tr>
+<td><code>factory</code></td>
+<td>required</td>
+<td>Per-dial <code>ProtocolHandler</code></td>
+</tr>
+<tr>
+<td><code>max_net_in</code> / <code>max_net_out</code></td>
+<td>1 MiB / 4 MiB</td>
+<td>Same caps as listen</td>
+</tr>
+<tr>
+<td><code>idle_timeout</code></td>
+<td><code>None</code></td>
+<td>Partially wired — see <a href="runtime-options.html">runtime-options.md</a></td>
+</tr>
+<tr>
+<td><code>secure</code> + <code>tls</code></td>
+<td>off</td>
+<td>TLS-from-dial</td>
+</tr>
+<tr>
+<td><code>server_name</code></td>
+<td>optional</td>
+<td>SNI / cert verification</td>
+</tr>
+</tbody>
+</table>
+<p>Full table: <a href="runtime-options.html#tcpconnectorconfig">runtime-options.md</a>.</p>
+<h2 id="connect_by_name">connect_by_name</h2>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_dns::</span>RuntimeDnsExt<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Must not run on a reactor thread — blocks the caller until DNS completes.</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect_by_name(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="dv">443</span><span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(MyClient) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> <span class="pp">hopf_core::</span>ProtocolHandler<span class="op">&gt;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">?;</span></span></code></pre></div>
+<table>
+<colgroup>
+<col style="width: 57%" />
+<col style="width: 42%" />
+</colgroup>
+<thead>
+<tr>
+<th>Behaviour</th>
+<th>Detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Literal IP</td>
+<td>Skips DNS; dials immediately</td>
+</tr>
+<tr>
+<td>Hostname</td>
+<td><code>DnsResolver::for_runtime</code> → first address → <code>Runtime::connect</code></td>
+</tr>
+<tr>
+<td>Timeout</td>
+<td>Resolve wait ≈ DNS default timeout + 1s</td>
+</tr>
+</tbody>
+</table>
+<p>Prefer resolving on / for the worker that will own the connection when using lower-level <code>DnsResolver</code> APIs. See <a href="dns.html">dns.md</a>.</p>
+<h2 id="client-handlers-by-protocol">Client handlers by protocol</h2>
+<table>
+<thead>
+<tr>
+<th>Protocol</th>
+<th>Client surface</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Raw TCP</td>
+<td><code>ProtocolHandler</code> on <code>TcpConnectorConfig</code></td>
+</tr>
+<tr>
+<td>HTTP/1.1</td>
+<td><code>H1Endpoint::client</code> + <code>ClientHandlerFactory</code></td>
+</tr>
+<tr>
+<td>HTTP/2</td>
+<td><code>H2Endpoint::client</code> + <code>ClientHandlerFactory</code></td>
+</tr>
+<tr>
+<td>HTTP/3</td>
+<td><code>connect_h3</code> + <code>ClientHandlerFactory</code></td>
+</tr>
+<tr>
+<td>FTP</td>
+<td><code>FtpClientBuilder</code> / blocking client in <code>hopf-ftp</code></td>
+</tr>
+<tr>
+<td>SMTP</td>
+<td><code>SmtpClientBuilder</code> in <code>hopf-smtp</code></td>
+</tr>
+<tr>
+<td>gRPC</td>
+<td><code>GrpcClient::unary_call</code> → <code>ClientHandlerFactory</code></td>
+</tr>
+<tr>
+<td>QUIC (non-H3)</td>
+<td><code>connect_quic</code> / <code>RuntimeQuicExt::connect_quic</code></td>
+</tr>
+</tbody>
+</table>
 <h2 id="http-client">HTTP client</h2>
-<p><code>H1Endpoint::client</code> / <code>H2Endpoint::client</code> plus <code>ClientHandler</code> / <code>ClientWriter</code>. Demo: <code>examples/http-get</code>. See <a href="http/client.html">HTTP client</a>.</p>
-<h2 id="dial-by-name-dns">Dial by name (DNS)</h2>
-<p><code>hopf-dns</code> provides reactor-affine resolution and <code>RuntimeDnsExt::connect_by_name</code> (when linked). Prefer resolving on the worker that will own the connection. See <a href="dns.html">DNS</a>.</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> TcpConnectorConfig<span class="op">};</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>H1Endpoint<span class="op">,</span> HttpLimits<span class="op">};</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect(<span class="pp">TcpConnectorConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">H1Endpoint::</span>client(</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">,</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>        <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>        <span class="cn">false</span><span class="op">,</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    )) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>))<span class="op">?;</span></span></code></pre></div>
+<p><code>ClientHandler::start</code> writes the request; response callbacks follow. Demo: <code>examples/http-get</code>. Deep dive: <a href="http/client.html">http/client.md</a>.</p>
+<h3 id="http-get-flags-summary">http-get flags (summary)</h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--http2</code> / <code>--h2</code></td>
+<td>H2 prior-knowledge</td>
+</tr>
+<tr>
+<td><code>--http3</code> / <code>--h3</code></td>
+<td><code>connect_h3</code> (needs <code>--ca</code>)</td>
+</tr>
+<tr>
+<td><code>--ca &lt;pem&gt;</code></td>
+<td>H3 trust PEM</td>
+</tr>
+<tr>
+<td><code>--server-name &lt;name&gt;</code></td>
+<td>H3 SNI (default <code>localhost</code>)</td>
+</tr>
+</tbody>
+</table>
 <h2 id="quic-dial">QUIC dial</h2>
-<p><code>RuntimeQuicExt::connect_quic</code> / H3 helpers — <a href="quic-h3.html">QUIC / H3</a>.</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_quic::</span><span class="op">{</span>connect_quic<span class="op">,</span> QuicConnectConfig<span class="op">};</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="co">// or RuntimeQuicExt::connect_quic</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="co">// H3: hopf_http::connect_h3(...)</span></span></code></pre></div>
+<p>See <a href="quic-h3.html">quic-h3.md</a>.</p>
+<h2 id="examples">Examples</h2>
+<table>
+<thead>
+<tr>
+<th>Example</th>
+<th>Dial style</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/http-get</code></td>
+<td>H1 / H2 / H3 Stream client</td>
+</tr>
+<tr>
+<td><code>examples/ftp-get</code></td>
+<td>FTP client builder</td>
+</tr>
+<tr>
+<td><code>examples/smtp-send</code></td>
+<td>SMTP client builder</td>
+</tr>
+<tr>
+<td><code>examples/tls-echo</code></td>
+<td>TLS dial twin of tls-echo server</td>
+</tr>
+</tbody>
+</table>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>Stage-0 TCP dials need a resolved <code>SocketAddr</code> unless using <code>connect_by_name</code>.</li>
+<li><code>connect_by_name</code> blocks the <strong>calling</strong> thread — never invoke it from <code>ProtocolHandler</code> callbacks.</li>
+<li>QUIC dials likewise require a resolved UDP address today.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="composition.html">Composition</a> — <code>&lt;dial-tcp&gt;</code></li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>QUIC and HTTP/3 — Hopf</title>
+  <title>QUIC / HTTP/3 — Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -58,21 +59,314 @@
 </nav>
     <main class="main">
       <header>
-        <h1>QUIC and HTTP/3</h1>
-        <p class="lead">Crate `hopf-quic` wraps **quinn-proto** with mio/TPC glue (not the full</p>
+        <h1>QUIC / HTTP/3</h1>
+        <p class="lead">Crates <code>hopf-quic</code> and <code>hopf-http</code> (feature <code>h3</code>): QUIC transport via <code>quinn-proto</code> + an in-tree mio UDP driver, and HTTP/3 codecs that reuse the same Stream SPI as H1/H2.</p>
       </header>
-      <p>Crate <code>hopf-quic</code> wraps <strong>quinn-proto</strong> with mio/TPC glue (not the full <code>quinn</code> crate). HTTP/3 lives in <code>hopf-http</code> behind feature <code>h3</code>.</p>
-<h2 id="listen-dial-quic">Listen / dial QUIC</h2>
-<p><code>RuntimeQuicExt::{add_quic_listener, connect_quic}</code> (and hook variants). TLS 1.3 identity comes from <code>hopf-tls</code> helpers shared with TCP TLS.</p>
-<h2 id="h3">H3</h2>
-<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> http3-hello <span class="at">--</span> …</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># curl --http3-only …</span></span></code></pre></div>
-<p>Each H3 request maps to a QUIC-stream <code>Endpoint</code> driving the same <code>ServerHandler</code> app API as H1/H2.</p>
-<p>Deferred: server push, datagrams, WebTransport, full 0-RTT polish.</p>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#quiclisten--quicconnect-configs">QuicListen / QuicConnect configs</a></li>
+<li><a href="#pem-builders">PEM builders</a></li>
+<li><a href="#listen_h3--connect_h3">listen_h3 / connect_h3</a></li>
+<li><a href="#alpn-and-tls-13">ALPN and TLS 1.3</a></li>
+<li><a href="#runtime-extension">Runtime extension</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#see-also">See also</a></li>
+</ul></div>
+<h2 id="architecture">Architecture</h2>
+<pre class="text"><code>UDP socket ── QuicDriverHandle (dedicated hopf-quic thread)
+                 │
+                 ├── plain mode: one ProtocolHandler per bi-stream
+                 │                 (QuicListenConfig / QuicConnectConfig)
+                 │
+                 └── hooks mode: QuicConnection owns control/uni/bi
+                                   (used by listen_h3 / connect_h3)
+                                         │
+                                         ▼
+                              H3ServerConnection / H3ClientConnection
+                                         │
+                                         ▼
+                              ServerHandler / ClientHandler  (hopf-http)</code></pre>
+<p>Each bidirectional QUIC stream is a <code>QuicStreamEndpoint</code> implementing <code>hopf_core::Endpoint</code>. HTTP/3 framing lives in <code>hopf-http</code>, not in <code>hopf-quic</code>.</p>
+<h2 id="standards">Standards</h2>
+<table>
+<colgroup>
+<col style="width: 46%" />
+<col style="width: 53%" />
+</colgroup>
+<thead>
+<tr>
+<th>Spec</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RFC 9000 family</td>
+<td>QUIC via <code>quinn-proto</code></td>
+</tr>
+<tr>
+<td>TLS 1.3 only</td>
+<td>rustls ring; builders pin <code>TLS13</code></td>
+</tr>
+<tr>
+<td>ALPN <code>h3</code></td>
+<td><code>hopf_quic::ALPN_H3 = b"h3"</code></td>
+</tr>
+<tr>
+<td>RFC 9114 / 9204</td>
+<td>HTTP/3 + QPACK in <code>hopf-http</code></td>
+</tr>
+<tr>
+<td>0-RTT / early data</td>
+<td>Server <code>max_early_data_size = u32::MAX</code>; client <code>enable_early_data = true</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="quiclisten-quicconnect-configs">QuicListen / QuicConnect configs</h2>
+<h3 id="plain-bi-stream-mode">Plain bi-stream mode</h3>
+<table>
+<colgroup>
+<col style="width: 26%" />
+<col style="width: 34%" />
+<col style="width: 39%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Fields</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>QuicListenConfig</code></td>
+<td><code>addr</code>, <code>server: Arc&lt;QuicServerConfig&gt;</code>, <code>factory: HandlerFactory</code></td>
+<td>UDP listen; one <code>ProtocolHandler</code> per accepted bi-stream</td>
+</tr>
+<tr>
+<td><code>QuicConnectConfig</code></td>
+<td><code>addr</code>, <code>client: Arc&lt;QuicClientConfig&gt;</code>, <code>server_name</code>, <code>factory</code></td>
+<td>Dial; factory for the first bi-stream</td>
+</tr>
+<tr>
+<td><code>QuicListenHooksConfig</code></td>
+<td><code>addr</code>, <code>server</code>, <code>connection_factory: ConnectionFactory</code></td>
+<td>Connection-level hooks (H3)</td>
+</tr>
+</tbody>
+</table>
+<p>Constructors:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_quic::</span><span class="op">{</span>QuicConnectConfig<span class="op">,</span> QuicListenConfig<span class="op">,</span> QuicListenHooksConfig<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicListenConfig::</span>new(addr<span class="op">,</span> server_cfg<span class="op">,</span> factory)<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicConnectConfig::</span>new(addr<span class="op">,</span> client_cfg<span class="op">,</span> <span class="st">&quot;localhost&quot;</span><span class="op">,</span> factory)<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicListenHooksConfig::</span>new(addr<span class="op">,</span> server_cfg<span class="op">,</span> connection_factory)<span class="op">;</span></span></code></pre></div>
+<p>Port <code>0</code> binds an ephemeral UDP port. Addresses must be pre-resolved (<code>SocketAddr</code>) — Stage 0.</p>
+<h3 id="driver-apis">Driver APIs</h3>
+<table>
+<colgroup>
+<col style="width: 52%" />
+<col style="width: 47%" />
+</colgroup>
+<thead>
+<tr>
+<th>Function</th>
+<th>Returns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>listen_quic(QuicListenConfig)</code></td>
+<td><code>io::Result&lt;QuicDriverHandle&gt;</code></td>
+</tr>
+<tr>
+<td><code>connect_quic(QuicConnectConfig)</code></td>
+<td><code>io::Result&lt;QuicDriverHandle&gt;</code></td>
+</tr>
+<tr>
+<td><code>listen_quic_hooks(QuicListenHooksConfig)</code></td>
+<td><code>io::Result&lt;QuicDriverHandle&gt;</code></td>
+</tr>
+<tr>
+<td><code>connect_quic_hooks(addr, client, server_name, ConnectionFactory)</code></td>
+<td><code>io::Result&lt;QuicDriverHandle&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>QuicDriverHandle</code> exposes <code>local_addr</code> and <code>shutdown(self)</code>. Drop or shut down explicitly — the driver thread is independent of <code>Runtime</code> lifetime.</p>
+<h3 id="hooks-traits">Hooks traits</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>QuicConnection</code></td>
+<td><code>connected</code>, <code>accept_bi</code>, <code>accept_uni</code></td>
+</tr>
+<tr>
+<td><code>QuicConnApi</code></td>
+<td><code>open_uni</code>, <code>open_bi</code>, <code>write</code>, <code>finish</code></td>
+</tr>
+<tr>
+<td><code>ConnectionFactory</code></td>
+<td><code>Arc&lt;dyn Fn() -&gt; Box&lt;dyn QuicConnection&gt; + Send + Sync&gt;</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="pem-builders">PEM builders</h2>
+<p>All builders pin <strong>TLS 1.3 only</strong> (ring provider) and take an ALPN list.</p>
+<table>
+<colgroup>
+<col style="width: 55%" />
+<col style="width: 44%" />
+</colgroup>
+<thead>
+<tr>
+<th>Function</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>server_config_from_pem(cert, key, alpn)</code></td>
+<td><code>Arc&lt;QuicServerConfig&gt;</code></td>
+</tr>
+<tr>
+<td><code>client_config_from_pem(ca, alpn)</code></td>
+<td><code>Arc&lt;QuicClientConfig&gt;</code> trusting PEM roots</td>
+</tr>
+<tr>
+<td><code>server_config_self_signed(&amp;[names], alpn)</code></td>
+<td><code>(Arc&lt;QuicServerConfig&gt;, leaf_pem: String)</code></td>
+</tr>
+<tr>
+<td><code>client_config_for_certified_pem</code> / <code>client_config_for_pem_bytes</code></td>
+<td>Trust a single certified leaf (smoke / demo)</td>
+</tr>
+</tbody>
+</table>
+<p>Type aliases: <code>QuicServerConfig = quinn_proto::ServerConfig</code>, <code>QuicClientConfig = quinn_proto::ClientConfig</code>.</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_quic::</span><span class="op">{</span>server_config_from_pem<span class="op">,</span> client_config_from_pem<span class="op">,</span> ALPN_H3<span class="op">};</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::path::</span><span class="dt">Path</span><span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> server <span class="op">=</span> server_config_from_pem(</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;cert.pem&quot;</span>)<span class="op">,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;key.pem&quot;</span>)<span class="op">,</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>[ALPN_H3]<span class="op">,</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> client <span class="op">=</span> client_config_from_pem(<span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;ca.pem&quot;</span>)<span class="op">,</span> <span class="op">&amp;</span>[ALPN_H3])<span class="op">?;</span></span></code></pre></div>
+<h2 id="listen_h3-connect_h3">listen_h3 / connect_h3</h2>
+<p>Provided by <code>hopf-http</code> under feature <code>h3</code>. Internally install <code>H3ServerConnection</code> / <code>H3ClientConnection</code> via the hooks driver.</p>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>connect_h3<span class="op">,</span> listen_h3<span class="op">,</span> HttpLimits<span class="op">};</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_quic::</span><span class="op">{</span>server_config_self_signed<span class="op">,</span> client_config_from_pem<span class="op">,</span> ALPN_H3<span class="op">};</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">// Server</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> (server_cfg<span class="op">,</span> leaf_pem) <span class="op">=</span> server_config_self_signed(<span class="op">&amp;</span>[<span class="st">&quot;localhost&quot;</span>]<span class="op">,</span> <span class="op">&amp;</span>[ALPN_H3])<span class="op">?;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> listen <span class="op">=</span> listen_h3(</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;127.0.0.1:4433&quot;</span><span class="op">.</span>parse()<span class="op">?,</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    server_cfg<span class="op">,</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    server_factory<span class="op">,</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="co">// Client</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> client_cfg <span class="op">=</span> client_config_from_pem(<span class="pp">std::path::</span><span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;leaf.pem&quot;</span>)<span class="op">,</span> <span class="op">&amp;</span>[ALPN_H3])<span class="op">?;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> dial <span class="op">=</span> connect_h3(</span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;127.0.0.1:4433&quot;</span><span class="op">.</span>parse()<span class="op">?,</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>    client_cfg<span class="op">,</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;localhost&quot;</span><span class="op">,</span></span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a>    client_factory<span class="op">,</span></span>
+<span id="cb4-21"><a href="#cb4-21" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div>
+<p>On connect, the H3 client opens control + QPACK uni streams, then one bi-stream for the application request (<code>ClientHandler::start</code>).</p>
+<p>Each H3 request maps to a QUIC-stream <code>Endpoint</code> driving the same <code>ServerHandler</code> / <code>ClientHandler</code> API as H1/H2.</p>
+<h2 id="alpn-and-tls-1.3">ALPN and TLS 1.3</h2>
+<table>
+<thead>
+<tr>
+<th>Constant / rule</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ALPN_H3</code></td>
+<td><code>b"h3"</code></td>
+</tr>
+<tr>
+<td>Protocol versions</td>
+<td><code>&amp;[rustls::version::TLS13]</code> only</td>
+</tr>
+<tr>
+<td>Early data</td>
+<td>Enabled on both sides in PEM builders</td>
+</tr>
+</tbody>
+</table>
+<p>Do not pass TCP ALPN lists (<code>h2</code>, <code>http/1.1</code>) into QUIC H3 configs.</p>
+<h2 id="runtime-extension">Runtime extension</h2>
+<p><code>RuntimeQuicExt</code> adds convenience methods on <code>Runtime</code>:</p>
+<ul>
+<li><code>add_quic_listener</code></li>
+<li><code>add_quic_listener_hooks</code></li>
+<li><code>connect_quic</code></li>
+</ul>
+<p>QUIC I/O still runs on the dedicated <code>hopf-quic</code> thread; these helpers do not move UDP onto the TCP worker reactors.</p>
+<h2 id="examples">Examples</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Example</th>
+<th>Command</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>http3-hello</code></td>
+<td><code>cargo run -p http3-hello -- 127.0.0.1:4433</code></td>
+</tr>
+<tr>
+<td><code>http-get --http3</code></td>
+<td><code>cargo run -p http-get -- --http3 --ca &lt;pem&gt; 127.0.0.1:4433 /</code></td>
+</tr>
+</tbody>
+</table>
+<p>Smokes: <code>cargo test -p hopf-quic --features integration</code>, <code>cargo test -p hopf-http --features h3 h3_get_hello</code>.</p>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li><code>QuicStreamEndpoint::start_tls</code> returns <code>StartTlsError::Unsupported</code> (QUIC is already TLS 1.3).</li>
+<li>Driver thread is <strong>not</strong> a TCP worker reactor; shut down / drop <code>QuicDriverHandle</code> independently of <code>Runtime</code>.</li>
+<li>Addresses must be pre-resolved (no DNS inside <code>connect_quic</code> / <code>connect_h3</code>).</li>
+<li>Plain (non-hooks) server mode installs <code>NopHandler</code> on accepted unidirectional streams.</li>
+<li>No HTTP/2-style server push; no WebTransport / DATAGRAM product API yet.</li>
+<li>0-RTT is enabled in builders but not polished as an application feature.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="tls.html">TLS</a> — TCP rustls helpers (separate from QUIC PEM builders)</li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>
