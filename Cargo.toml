@@ -26,6 +26,7 @@ members = [
     "examples/ftp",
     "examples/ftp-get",
     "examples/smtp",
+    "examples/smtp-local",
     "examples/smtp-send",
 ]
 default-members = [
@@ -49,6 +50,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
 license = "LGPL-2.1-or-later"
+homepage = "https://cpkb-bluezoo.github.io/hopf/"
 repository = "https://github.com/cpkb-bluezoo/hopf"
 authors = ["Chris Burdess <dog@gnu.org>"]
 

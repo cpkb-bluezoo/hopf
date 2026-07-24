@@ -206,7 +206,7 @@ Worker reactor (affinity for life)</code></pre>
 </tr>
 <tr>
 <td><code>hopf-smtp</code></td>
-<td><code>SmtpService::start</code> (or <code>SimpleRelayService</code>)</td>
+<td><code>SmtpService::start</code> (or <code>SimpleRelayService</code> / <code>LocalDeliveryService</code>)</td>
 <td><code>SmtpHandlerFactory</code></td>
 </tr>
 <tr>
@@ -258,7 +258,7 @@ Worker reactor (affinity for life)</code></pre>
 <span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> service <span class="op">=</span> <span class="pp">SmtpService::</span>new(config)<span class="op">;</span></span>
 <span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="co">// or with_handler_factory / AcceptAllSmtpHandlerFactory</span></span>
 <span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> addr <span class="op">=</span> service<span class="op">.</span>start(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>runtime))<span class="op">?;</span></span></code></pre></div>
-<p>Relay deployments use <code>SimpleRelayService</code> (wraps <code>SmtpService</code>). See <a href="ftp.html">ftp.md</a> and <a href="smtp.html">smtp.md</a> for full knob tables.</p>
+<p>Relay deployments use <code>SimpleRelayService</code>; local MX uses <code>LocalDeliveryService</code> (both wrap <code>SmtpService</code>). See <a href="ftp.html">ftp.md</a> and <a href="smtp.html">smtp.md</a> for full knob tables.</p>
 <h2 id="examples">Examples</h2>
 <table>
 <colgroup>

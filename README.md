@@ -72,6 +72,7 @@ examples/
   ftp/               # FTP filesystem server
   ftp-get/           # FTP client LIST/RETR
   smtp/              # accept-all SMTP server
+  smtp-local/        # LocalDeliveryService → Maildir++
   smtp-send/         # blocking SMTP client
 ```
 
@@ -79,7 +80,10 @@ examples/
 
 ```bash
 cargo check --workspace
-cargo test --workspace
+# Same unit-test command used by CI (does not enable integration features):
+cargo test --workspace --lib
+# Opt-in I/O smoke suites, run locally per crate when needed:
+cargo test -p hopf-smtp --features integration
 cargo run -p echo -- 127.0.0.1:8080
 cargo run -p tls-echo -- 127.0.0.1:8443
 cargo run -p http-hello -- 127.0.0.1:8080
