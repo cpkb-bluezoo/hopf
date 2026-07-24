@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Do not pass --all-features: optional path deps need sibling checkouts.
+      # Do not pass --all-features unless optional deps are available in CI.
       - run: cargo check --workspace
       # Unit tests only (`--lib` on default-members). I/O smokes need
       # `--features integration` (and are not compiled otherwise).
