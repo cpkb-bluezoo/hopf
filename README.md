@@ -23,6 +23,21 @@ Sibling parsers ([crates.io](https://crates.io); local path override via
 [rmimeparser](https://crates.io/crates/rmimeparser) (MIME and RFC5322),
 [rprotobuf](https://crates.io/crates/rprotobuf) (Protobuf).
 
+## Install
+
+The [`hopf`](https://crates.io/crates/hopf) umbrella crate re-exports every
+`hopf-*` crate as a module (`hopf::core`, `hopf::http`, `hopf::smtp`, …):
+
+```toml
+[dependencies]
+hopf = "0.1"   # everything
+# or pick crates individually:
+hopf = { version = "0.1", default-features = false, features = ["http", "tls"] }
+```
+
+Individual crates (`hopf-core`, `hopf-http`, …) can also be depended on
+directly.
+
 ## Documentation
 
 Browse the [HTML reference](https://cpkb-bluezoo.github.io/hopf/).

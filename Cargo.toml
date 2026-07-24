@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/hopf",
     "crates/hopf-core",
     "crates/hopf-tls",
     "crates/hopf-http",
@@ -30,6 +31,7 @@ members = [
     "examples/smtp-send",
 ]
 default-members = [
+    "crates/hopf",
     "crates/hopf-core",
     "crates/hopf-tls",
     "crates/hopf-http",
