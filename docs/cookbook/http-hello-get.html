@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cookbook: http-hello / http-get — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="brand" href="../index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="../index.html">Home</a></li>
+<li><a href="../getting-started.html">Getting started</a></li>
+<li><a href="../architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="../services.html">Services</a></li>
+<li><a href="../clients.html">Clients</a></li>
+<li><a href="../composition.html">Composition</a></li>
+<li><a href="../runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="../tls.html">TLS</a></li>
+<li><a href="../http/overview.html">HTTP overview</a></li>
+<li><a href="../http/server.html">HTTP server</a></li>
+<li><a href="../http/client.html">HTTP client</a></li>
+<li><a href="../quic-h3.html">QUIC / H3</a></li>
+<li><a href="../dns.html">DNS</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="../auth.html">Auth</a></li>
+<li><a href="../access-control.html">Access control</a></li>
+<li><a href="../telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="../cookbook/echo.html">Echo</a></li>
+<li><a href="../cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="../cookbook/http-hello-get.html" aria-current="page">HTTP hello / get</a></li>
+<li><a href="../cookbook/dns-proxy.html">DNS proxy</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>Cookbook: http-hello / http-get</h1>
+        
+      </header>
+      <h2 id="server">Server</h2>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> http-hello <span class="at">--</span> 127.0.0.1:8080</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-v</span> http://127.0.0.1:8080/</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">--http2-prior-knowledge</span> http://127.0.0.1:8080/</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> http-hello <span class="at">--</span> <span class="at">--tls</span> 127.0.0.1:8443</span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-vk</span> https://127.0.0.1:8443/</span></code></pre></div>
+<h2 id="client">Client</h2>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> http-get <span class="at">--</span> http://127.0.0.1:8080/</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co"># see example flags for --http2 / TLS</span></span></code></pre></div>
+<p>Sources: <a href="../../examples/http-hello"><code>examples/http-hello</code></a>, <a href="../../examples/http-get"><code>examples/http-get</code></a>. Guides: <a href="../http/overview.html">HTTP overview</a>.</p>
+
+      <p class="footer">
+        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
+        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Architecture — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html" aria-current="page">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>Architecture</h1>
+        <p class="lead">Hopf is a **thread-per-core** (TPC) networking framework on</p>
+      </header>
+      <p>Hopf is a <strong>thread-per-core</strong> (TPC) networking framework on <a href="https://github.com/tokio-rs/mio">mio</a>. Listen and dial are equal bindings on one <code>Runtime</code>. Codecs are <strong>incremental push parsers</strong> (chunked ingress, handler egress) — not a Tokio/Hyper stack.</p>
+<h2 id="process-shape">Process shape</h2>
+<pre class="text"><code>Composition / script
+       │
+       ├── add_tcp_listener / remove_binding  → Accept loop
+       └── connect / dial                     → worker reactors
+Accept ──affinity──► Reactor 0 … N
+                         │
+                      Endpoint
+                         │
+                  ProtocolHandler
+                         │
+              (HTTP Stream | TLS | DNS | …)</code></pre>
+<ul>
+<li><strong>Accept loop</strong> — binds sockets, applies ACL/rate limits, round-robins new connections onto workers.</li>
+<li><strong>Worker reactor</strong> — owns connection affinity for life; timers, TLS I/O, UDP (DNS), execute hops.</li>
+<li><strong>StorageExecutor</strong> — blocking filesystem / mailbox work off the reactor; results hop back via <code>Endpoint::execute</code> / <code>ConnHandle</code>.</li>
+</ul>
+<h2 id="endpoint-vs-protocolhandler">Endpoint vs ProtocolHandler</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Endpoint</code></td>
+<td>Transport face: <code>send</code>, <code>close</code>, <code>start_tls</code>, pause/resume, peer addr</td>
+</tr>
+<tr>
+<td><code>ProtocolHandler</code></td>
+<td>Application/protocol FSM: <code>connected</code>, <code>receive</code>, <code>disconnected</code>, <code>error</code></td>
+</tr>
+</tbody>
+</table>
+<p>HTTP adapters (<code>H1Endpoint</code>, <code>H2Endpoint</code>, …) are <code>ProtocolHandler</code>s that drive <code>ServerHandler</code> / <code>ClientHandler</code> on an HTTP Stream.</p>
+<h2 id="further-reading">Further reading</h2>
+<p><a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> for product decisions; <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> for implementation order.</p>
+
+      <p class="footer">
+        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
+        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

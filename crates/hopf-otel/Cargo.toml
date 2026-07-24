@@ -1,0 +1,22 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-otel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "OpenTelemetry OTLP/HTTP and JSONL exporters for Hopf (off hot-path)"
+readme = "README.md"
+keywords = ["opentelemetry", "otlp", "telemetry", "observability"]
+categories = ["network-programming"]
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-http = { workspace = true }
+rprotobuf = { workspace = true }
+getrandom = "0.2"
+
+[dev-dependencies]

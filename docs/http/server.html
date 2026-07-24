@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTTP server — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="brand" href="../index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="../index.html">Home</a></li>
+<li><a href="../getting-started.html">Getting started</a></li>
+<li><a href="../architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="../services.html">Services</a></li>
+<li><a href="../clients.html">Clients</a></li>
+<li><a href="../composition.html">Composition</a></li>
+<li><a href="../runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="../tls.html">TLS</a></li>
+<li><a href="../http/overview.html">HTTP overview</a></li>
+<li><a href="../http/server.html" aria-current="page">HTTP server</a></li>
+<li><a href="../http/client.html">HTTP client</a></li>
+<li><a href="../quic-h3.html">QUIC / H3</a></li>
+<li><a href="../dns.html">DNS</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="../auth.html">Auth</a></li>
+<li><a href="../access-control.html">Access control</a></li>
+<li><a href="../telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="../cookbook/echo.html">Echo</a></li>
+<li><a href="../cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="../cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="../cookbook/dns-proxy.html">DNS proxy</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>HTTP server</h1>
+        
+      </header>
+      <h2 id="serverhandler">ServerHandler</h2>
+<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ServerHandler <span class="cf">for</span> Hello <span class="op">{</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> headers(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter<span class="op">,</span> headers<span class="op">:</span> <span class="op">&amp;</span>Headers) <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>        <span class="co">// may write a full response here</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> request_complete(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter) <span class="op">{}</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Body sequence when present: <code>headers</code> → <code>start_request_body</code> → <code>request_body_content</code>* → <code>end_request_body</code> → <code>request_complete</code>.</p>
+<h2 id="serverwriter">ServerWriter</h2>
+<p>Buffer status/headers, then <code>start_response_body</code> / <code>response_body_content</code> / <code>end_response_body</code> / <code>complete</code>. Informational 1xx via <code>send_informational</code>.</p>
+<h2 id="limits">Limits</h2>
+<p><code>HttpLimits</code> caps header sizes, body sizes, etc. Pass into endpoint constructors.</p>
+<h2 id="authentication">Authentication</h2>
+<p>Wrap the handler factory with <code>BasicAuthFactory</code>, <code>DigestAuthFactory</code>, or <code>BearerAuthFactory</code>. Digest needs a <code>CredentialStore</code> (e.g. <code>PasswordStore</code>) for HA1. See <a href="../auth.html">Auth</a>.</p>
+<pre><code class="language-rust">use hopf_http::{BasicAuthFactory, BasicAuthConfig, DigestAuthFactory, DigestAuthConfig};
+use hopf_auth::{PasswordTrustPolicy, PasswordStore};
+use std::sync::Arc;
+
+let basic = Arc::new(BasicAuthFactory::new(
+    inner_factory.clone(),
+    PasswordTrustPolicy::new().with_user("alice", "s3cret").shared(),
+    BasicAuthConfig::new("realm"),
+));
+let digest = Arc::new(DigestAuthFactory::new(
+    inner_factory,
+    Arc::new(PasswordStore::new().with_user("alice", "s3cret")),
+    DigestAuthConfig::new("realm"),
+));
+</code></pre>
+
+      <p class="footer">
+        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
+        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

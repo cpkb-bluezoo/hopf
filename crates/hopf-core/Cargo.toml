@@ -1,0 +1,24 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Thread-per-core reactor, Endpoint, and ProtocolHandler substrate for Hopf"
+readme = "README.md"
+keywords = ["async", "nio", "server", "mio"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = []
+# Runtime/TCP smokes; not compiled in CI (`cargo test --lib` without this feature).
+integration = []
+
+[dependencies]
+mio = { workspace = true }
+tractrix = { workspace = true }
+bytes = "1"

@@ -1,0 +1,17 @@
+[package]
+name = "http-hello"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "http-hello"
+path = "main.rs"
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-http = { workspace = true }
+hopf-tls = { workspace = true }
+rcgen = { workspace = true }

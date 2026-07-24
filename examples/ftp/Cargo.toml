@@ -1,0 +1,16 @@
+[package]
+name = "ftp-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "ftp-server"
+path = "main.rs"
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-auth = { workspace = true }
+hopf-ftp = { workspace = true }

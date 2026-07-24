@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Do not pass --all-features: optional path deps need sibling checkouts.
+      - run: cargo check --workspace
+      # Unit tests only (`--lib` on default-members). I/O smokes need
+      # `--features integration` (and are not compiled otherwise).
+      - run: cargo test --lib
+      - run: cargo doc --workspace --no-deps

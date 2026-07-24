@@ -1,0 +1,30 @@
+[package]
+name = "hopf-webdav"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "WebDAV filesystem handler for Hopf HTTP servers"
+readme = "README.md"
+keywords = ["webdav", "http", "filesystem"]
+categories = ["web-programming::http-server", "filesystem"]
+
+[features]
+default = []
+xattr = ["dep:xattr"]
+# Runtime TCP smokes; not compiled in CI (`cargo test --lib` without this feature).
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-http = { workspace = true }
+tractrix = { workspace = true }
+bytes = "1"
+getrandom = "0.2"
+md-5 = "0.10"
+xattr = { version = "1", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,22 @@
+[package]
+name = "hopf-mailbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "IMAP-level mailbox storage (mbox + Maildir++) for Hopf"
+readme = "README.md"
+keywords = ["mailbox", "maildir", "mbox", "imap", "email"]
+categories = ["email", "filesystem"]
+
+[dependencies]
+hopf-core = { workspace = true }
+rmimeparser = { workspace = true }
+md-5 = { workspace = true }
+libc = "0.2"
+crc32fast = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

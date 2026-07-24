@@ -1,0 +1,31 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-quic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "QUIC transport for Hopf (quinn-proto + mio; no HTTP)"
+readme = "README.md"
+keywords = ["quic", "quinn-proto", "mio"]
+categories = ["network-programming"]
+
+[features]
+default = []
+# QUIC listen/connect smokes; not compiled in CI.
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-tls = { workspace = true }
+quinn-proto = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+mio = { workspace = true }
+bytes = "1"
+rcgen = { workspace = true }
+
+[dev-dependencies]

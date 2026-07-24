@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Composition — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html" aria-current="page">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>Composition</h1>
+        <p class="lead">Canonical Rust script surface (<a href="https://github.com/cpkb-bluezoo/hopf/issues/8">issue #8</a>). XML via tractrix desugars into the same builder.</p>
+      </header>
+<h2 id="builder">Builder</h2>
+<pre><code class="language-rust">use hopf_core::{Composition, RuntimeConfig, TcpListenerConfig, TcpConnectorConfig};
+
+let comp = Composition::new(RuntimeConfig::default())
+    .telemetry(hook)                 // optional Arc&lt;dyn TelemetryHook&gt;
+    .listen_tcp(listen_cfg)
+    .dial_tcp(dial_cfg)              // applied after listens
+    .build()?;
+
+let addr = comp.primary_addr();
+let id = comp.bindings[0];
+comp.remove_binding(id);
+comp.shutdown();
+</code></pre>
+<p><code>build</code> starts the Runtime (with optional telemetry), registers queued listens (recording <code>BindingId</code>s and local addresses), then dials.</p>
+
+<h2 id="xml">XML (tractrix)</h2>
+<p>Declarative files use <strong>elements and attributes only</strong> (no character data). Naming mirrors the builder. Parsing is entirely through <a href="https://github.com/cpkb-bluezoo/tractrix">tractrix</a>.</p>
+<pre><code class="language-xml">&lt;composition worker-threads="4" storage-threads="4"&gt;
+  &lt;listen-tcp addr="127.0.0.1:0" handler="echo"
+              max-net-in="1048576" max-net-out="4194304"
+              idle-timeout-ms="60000"&gt;
+    &lt;allow cidr="10.0.0.0/8"/&gt;
+    &lt;deny cidr="192.0.2.0/24"/&gt;
+    &lt;rate-limit per-source="100" window-ms="1000" global="0"/&gt;
+  &lt;/listen-tcp&gt;
+  &lt;dial-tcp addr="127.0.0.1:8080" handler="echo"/&gt;
+&lt;/composition&gt;
+</code></pre>
+<table>
+<thead><tr><th>XML</th><th>Rust</th></tr></thead>
+<tbody>
+<tr><td><code>&lt;composition&gt;</code></td><td><code>Composition::new(RuntimeConfig)</code></td></tr>
+<tr><td><code>worker-threads</code></td><td><code>RuntimeConfig::worker_threads</code></td></tr>
+<tr><td><code>storage-threads</code></td><td><code>StorageConfig::threads</code></td></tr>
+<tr><td><code>&lt;listen-tcp&gt;</code> / <code>&lt;dial-tcp&gt;</code></td><td><code>listen_tcp</code> / <code>dial_tcp</code></td></tr>
+<tr><td><code>handler</code></td><td>lookup in <code>CompositionRegistry</code></td></tr>
+<tr><td><code>&lt;allow&gt;</code> / <code>&lt;deny&gt;</code> / <code>&lt;rate-limit&gt;</code></td><td>ACL / accept rate limit on that listen</td></tr>
+</tbody>
+</table>
+<p><code>handler="…"</code> is <strong>not</strong> a <code>Service</code> or HTTP Stream handler name. It resolves a closed registry of connection-level <code>HandlerFactory</code> values (<code>Fn() -&gt; Box&lt;dyn ProtocolHandler&gt;</code>). Register pre-wired stacks in Rust before load — no reflective DI.</p>
+<pre><code class="language-rust">use std::sync::Arc;
+use hopf_core::{Composition, CompositionRegistry, ProtocolHandler};
+
+let mut reg = CompositionRegistry::new();
+reg.register("echo", Arc::new(|| Box::new(Echo) as Box&lt;dyn ProtocolHandler&gt;));
+// HTTP: register CleartextHttpEndpoint / AlpnHttpEndpoint under a short name.
+
+let comp = Composition::from_xml_str(xml, &amp;reg)?
+    .telemetry(hook)   // optional; not expressed in XML v1
+    .build()?;
+</code></pre>
+<p>Also: <code>Composition::from_xml</code>, <code>from_xml_path</code>. TLS / <code>secure</code> attributes are rejected in v1 (wire TLS in the registered factory or Rust builder).</p>
+
+<h2 id="binding-lifecycle">Binding lifecycle</h2>
+<ul>
+<li><strong>Add</strong> — <code>Composition::listen_tcp</code> or <code>Runtime::add_tcp_listener</code> → <code>(SocketAddr, BindingId)</code></li>
+<li><strong>Remove</strong> — <code>CompositionRuntime::remove_binding</code> / <code>Runtime::remove_binding</code></li>
+<li>Accept loop deregisters the mio listener; existing connections keep affinity until close</li>
+</ul>
+<p>Trust policies and DNS caches attach at the protocol layer (e.g. HTTP <code>BasicAuthFactory</code>, <code>DnsResolver</code>), not as core Composition fields — core stays free of HTTP/auth types.</p>
+
+      <p class="footer">
+        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
+        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

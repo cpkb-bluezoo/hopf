@@ -1,0 +1,27 @@
+[package]
+name = "hopf-websocket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "WebSocket framing and HTTP upgrade helpers for Hopf"
+readme = "README.md"
+keywords = ["websocket", "http", "networking"]
+categories = ["network-programming", "web-programming::websocket"]
+
+[features]
+default = []
+# Runtime TCP/QUIC smokes; not compiled in CI by default.
+integration = ["hopf-http/h3"]
+
+[dependencies]
+hopf-http = { workspace = true }
+sha1 = "0.10"
+base64 = "0.22"
+getrandom = { workspace = true }
+
+[dev-dependencies]
+hopf-core = { workspace = true }
+tempfile = { workspace = true }
