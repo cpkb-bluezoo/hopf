@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Services (listen path) — Hopf</title>
+  <title>Services — Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -58,35 +59,257 @@
 </nav>
     <main class="main">
       <header>
-        <h1>Services (listen path)</h1>
-        
+        <h1>Services</h1>
+        <p class="lead">Crate <code>hopf-core</code> defines the process seams; protocol crates plug in by implementing <code>ProtocolHandler</code> and/or registering listeners through a <code>Service</code>-shaped helper (<code>FtpService</code>, <code>SmtpService</code>, HTTP endpoint factories).</p>
       </header>
-      <h2 id="protocolhandler">ProtocolHandler</h2>
-<p>Implement <code>ProtocolHandler</code> for a TCP (or TLS-wrapped) session:</p>
-<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ProtocolHandler <span class="cf">for</span> Echo <span class="op">{</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> connected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint) <span class="op">{</span> <span class="co">/* … */</span> <span class="op">}</span></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> receive(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint<span class="op">,</span> data<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">{</span></span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>        endpoint<span class="op">.</span>send(data)<span class="op">;</span></span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>        <span class="op">*</span>data <span class="op">=</span> <span class="op">&amp;</span>[]<span class="op">;</span> <span class="co">// consume</span></span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> disconnected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint) <span class="op">{}</span></span>
-<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> error(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint<span class="op">,</span> _err<span class="op">:</span> <span class="op">&amp;</span><span class="pp">std::io::</span><span class="bu">Error</span>) <span class="op">{}</span></span>
-<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
-<p>Register with a factory on <code>TcpListenerConfig::new(addr, || Box::new(…))</code>.</p>
-<h2 id="runtimeadd_tcp_listener">Runtime::add_tcp_listener</h2>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> (bound<span class="op">,</span> id) <span class="op">=</span> rt<span class="op">.</span>add_tcp_listener(config)<span class="op">?;</span></span>
-<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="co">// later</span></span>
-<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>remove_binding(id)<span class="op">;</span></span></code></pre></div>
-<p>Returns local <code>SocketAddr</code> (useful with port <code>0</code>) and opaque <code>BindingId</code>.</p>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#layering">Layering</a></li>
+<li><a href="#protocolhandler">ProtocolHandler</a></li>
+<li><a href="#service-trait">Service trait</a></li>
+<li><a href="#runtimeadd_tcp_listener">Runtime::add_tcp_listener</a></li>
+<li><a href="#how-protocol-services-plug-in">How protocol services plug in</a></li>
+<li><a href="#http-factories">HTTP factories</a></li>
+<li><a href="#ftp--smtp-factories">FTP / SMTP factories</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#see-also">See also</a></li>
+</ul></div>
+<h2 id="layering">Layering</h2>
+<pre class="text"><code>Application Service / factory
+        │
+        ▼
+HandlerFactory  →  Box&lt;dyn ProtocolHandler&gt;   (per connection / stream)
+        │
+        ▼
+Endpoint  (TCP Connection | QuicStreamEndpoint | …)
+        │
+        ▼
+Worker reactor (affinity for life)</code></pre>
+<p>HTTP inserts an extra Stream layer: the <code>ProtocolHandler</code> is <code>H1Endpoint</code> / <code>CleartextHttpEndpoint</code> / …, which drives <code>ServerHandler</code>. FTP/SMTP implement <code>ProtocolHandler</code> directly on the control connection.</p>
+<h2 id="protocolhandler">ProtocolHandler</h2>
+<p>Invoked on the owning reactor thread — must not block. Panics are caught at the connection boundary (log + close).</p>
+<table>
+<colgroup>
+<col style="width: 57%" />
+<col style="width: 42%" />
+</colgroup>
+<thead>
+<tr>
+<th>Method</th>
+<th>When</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>connected</code></td>
+<td>Socket registered on a worker (not on the accept thread)</td>
+</tr>
+<tr>
+<td><code>receive</code></td>
+<td>Plaintext bytes; advance the cursor (<code>*data = &amp;data[n..]</code>); suffix preserved</td>
+</tr>
+<tr>
+<td><code>disconnected</code></td>
+<td>Peer closed / endpoint finished closing</td>
+</tr>
+<tr>
+<td><code>security_established</code></td>
+<td>TLS/QUIC active (ALPN / cipher in <code>SecurityInfo</code>); default no-op</td>
+</tr>
+<tr>
+<td><code>error</code></td>
+<td>Unrecoverable I/O or protocol error</td>
+</tr>
+</tbody>
+</table>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Endpoint<span class="op">,</span> ProtocolHandler<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::</span>io<span class="op">;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">struct</span> Echo<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> ProtocolHandler <span class="cf">for</span> Echo <span class="op">{</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> connected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint) <span class="op">{}</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> receive(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint<span class="op">,</span> data<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="op">&amp;</span>[<span class="dt">u8</span>]) <span class="op">{</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>        endpoint<span class="op">.</span>send(data)<span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>        <span class="op">*</span>data <span class="op">=</span> <span class="op">&amp;</span>[]<span class="op">;</span> <span class="co">// consume</span></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> disconnected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint) <span class="op">{}</span></span>
+<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> error(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _endpoint<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> Endpoint<span class="op">,</span> _err<span class="op">:</span> <span class="op">&amp;</span><span class="pp">io::</span><span class="bu">Error</span>) <span class="op">{}</span></span>
+<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Register with <code>TcpListenerConfig::new(addr, || Box::new(Echo))</code>. <code>NopHandler</code> is the no-op default for tests / unused uni streams.</p>
 <h2 id="service-trait">Service trait</h2>
-<p><code>Service::start</code> should register bindings via Runtime APIs (or Composition). <code>tcp_listeners()</code> defaults to empty and remains only for transitional static sets — <strong>composition owns the script</strong>, not a frozen listener slice.</p>
-<h2 id="http-listen">HTTP listen</h2>
-<p>Wire <code>CleartextHttpEndpoint</code> / <code>AlpnHttpEndpoint</code> / <code>H1Endpoint::server</code> as the <code>ProtocolHandler</code>; implement <code>ServerHandler</code> for application logic. See <a href="http/server.html">HTTP server</a>.</p>
-<p>Higher-level HTTP apps (WebDAV, WebSocket, gRPC) supply a <code>ServerHandlerFactory</code> on that endpoint. FTP and SMTP use <code>FtpService</code> / <code>SmtpService</code> (or <code>SimpleRelayService</code>) with <code>start(Arc&lt;Runtime&gt;)</code> — see the protocol guides.</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> Service<span class="op">:</span> <span class="bu">Send</span> <span class="op">{</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> start(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> runtime<span class="op">:</span> <span class="op">&amp;</span>Runtime) <span class="op">-&gt;</span> <span class="pp">std::io::</span><span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> stop(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>)<span class="op">;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> tcp_listeners(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="op">&amp;</span>[TcpListenerConfig] <span class="op">{</span> <span class="op">&amp;</span>[] <span class="op">}</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<table>
+<colgroup>
+<col style="width: 57%" />
+<col style="width: 42%" />
+</colgroup>
+<thead>
+<tr>
+<th>Method</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>start</code></td>
+<td>Initialise app resources; register bindings via Runtime APIs (or Composition)</td>
+</tr>
+<tr>
+<td><code>stop</code></td>
+<td>Tear down listeners / resources</td>
+</tr>
+<tr>
+<td><code>tcp_listeners</code></td>
+<td>Optional static set — <strong>transitional</strong>; prefer Runtime registration</td>
+</tr>
+</tbody>
+</table>
+<p><code>Runtime::start_service(&amp;mut service)</code> calls <code>start</code>. Composition owns the listen/dial script for declarative apps — a frozen <code>tcp_listeners</code> slice is not the preferred model.</p>
+<h2 id="runtimeadd_tcp_listener">Runtime::add_tcp_listener</h2>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> (bound<span class="op">,</span> id) <span class="op">=</span> rt<span class="op">.</span>add_tcp_listener(config)<span class="op">?;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// later</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>remove_binding(id)<span class="op">;</span></span></code></pre></div>
+<p>Returns local <code>SocketAddr</code> (useful with port <code>0</code>) and opaque <code>BindingId</code>.</p>
+<h2 id="how-protocol-services-plug-in">How protocol services plug in</h2>
+<table>
+<colgroup>
+<col style="width: 17%" />
+<col style="width: 50%" />
+<col style="width: 32%" />
+</colgroup>
+<thead>
+<tr>
+<th>Crate</th>
+<th>Registration style</th>
+<th>Handler SPI</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hopf-http</code></td>
+<td><code>HandlerFactory</code> → <code>CleartextHttpEndpoint</code> / <code>AlpnHttpEndpoint</code> / <code>H1Endpoint::server</code> / <code>listen_h3</code></td>
+<td><code>ServerHandlerFactory</code></td>
+</tr>
+<tr>
+<td><code>hopf-ftp</code></td>
+<td><code>FtpService::start(Arc&lt;Runtime&gt;)</code> builds <code>TcpListenerConfig</code></td>
+<td><code>FtpConnectionHandlerFactory</code></td>
+</tr>
+<tr>
+<td><code>hopf-smtp</code></td>
+<td><code>SmtpService::start</code> (or <code>SimpleRelayService</code>)</td>
+<td><code>SmtpHandlerFactory</code></td>
+</tr>
+<tr>
+<td><code>hopf-webdav</code> / <code>websocket</code> / <code>grpc</code></td>
+<td>Supply a <code>ServerHandlerFactory</code> to an HTTP endpoint</td>
+<td>Stream-level factories</td>
+</tr>
+<tr>
+<td><code>hopf-dns</code></td>
+<td>Forwarder / resolver on reactor UDP</td>
+<td>datagram / connector helpers</td>
+</tr>
+</tbody>
+</table>
+<p>Common pattern: protocol crate owns config + factory; <code>start</code> closes over <code>Arc&lt;Runtime&gt;</code> when the protocol needs secondary listeners (FTP PASV).</p>
+<h2 id="http-factories">HTTP factories</h2>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> Runtime<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>CleartextHttpEndpoint<span class="op">,</span> HttpLimits<span class="op">,</span> ServerHandlerFactory<span class="op">};</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> listen_http(rt<span class="op">:</span> <span class="op">&amp;</span>Runtime<span class="op">,</span> app<span class="op">:</span> Arc<span class="op">&lt;</span><span class="kw">dyn</span> ServerHandlerFactory<span class="op">&gt;</span>) <span class="op">-&gt;</span> <span class="pp">std::io::</span><span class="dt">Result</span><span class="op">&lt;</span>()<span class="op">&gt;</span> <span class="op">{</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    <span class="kw">let</span> limits <span class="op">=</span> <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    rt<span class="op">.</span>add_tcp_listener(<span class="pp">TcpListenerConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">CleartextHttpEndpoint::</span>new(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>app)<span class="op">,</span> limits))</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>            <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>))<span class="op">?;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Ok</span>(())</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Higher-level HTTP apps (WebDAV, WebSocket, gRPC) implement <code>ServerHandlerFactory</code> and reuse the same listen wiring. Auth wrappers (<code>BasicAuthFactory</code>, …) also implement <code>ServerHandlerFactory</code>. See <a href="http/server.html">http/server.md</a>.</p>
+<h2 id="ftp-smtp-factories">FTP / SMTP factories</h2>
+<h3 id="ftp">FTP</h3>
+<div class="sourceCode" id="cb6"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span>PasswordTrustPolicy<span class="op">;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_ftp::</span><span class="op">{</span>FtpConfig<span class="op">,</span> FtpService<span class="op">};</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>Runtime<span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> policy <span class="op">=</span> <span class="pp">PasswordTrustPolicy::</span>new()<span class="op">.</span>with_user(<span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;s3cret&quot;</span>)<span class="op">.</span>shared()<span class="op">;</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">FtpConfig::</span>new(<span class="st">&quot;127.0.0.1:2121&quot;</span><span class="op">.</span>parse()<span class="op">?,</span> <span class="st">&quot;/tmp/ftp&quot;</span><span class="op">,</span> policy)<span class="op">;</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> service <span class="op">=</span> <span class="pp">FtpService::</span>new(config)<span class="op">;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="co">// or FtpService::with_handler_factory(config, custom_factory);</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> addr <span class="op">=</span> service<span class="op">.</span>start(<span class="pp">Arc::</span>new(<span class="co">/* Runtime */</span>))<span class="op">?;</span></span></code></pre></div>
+<p><code>FtpService::control_listener</code> builds the <code>TcpListenerConfig</code> (TLS via <code>with_tls</code> / <code>implicit_ftps</code> on <code>FtpConfig</code>). PASV data listeners are added later through the held <code>Arc&lt;Runtime&gt;</code>.</p>
+<h3 id="smtp">SMTP</h3>
+<div class="sourceCode" id="cb7"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span><span class="op">{</span>SmtpConfig<span class="op">,</span> SmtpService<span class="op">};</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">SmtpConfig::</span>new(<span class="st">&quot;127.0.0.1:2525&quot;</span><span class="op">.</span>parse()<span class="op">?,</span> <span class="st">&quot;mail.example&quot;</span>)</span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>auth_required(<span class="cn">false</span>)<span class="op">;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> service <span class="op">=</span> <span class="pp">SmtpService::</span>new(config)<span class="op">;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="co">// or with_handler_factory / AcceptAllSmtpHandlerFactory</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> addr <span class="op">=</span> service<span class="op">.</span>start(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>runtime))<span class="op">?;</span></span></code></pre></div>
+<p>Relay deployments use <code>SimpleRelayService</code> (wraps <code>SmtpService</code>). See <a href="ftp.html">ftp.md</a> and <a href="smtp.html">smtp.md</a> for full knob tables.</p>
+<h2 id="examples">Examples</h2>
+<table>
+<colgroup>
+<col style="width: 34%" />
+<col style="width: 65%" />
+</colgroup>
+<thead>
+<tr>
+<th>Example</th>
+<th>Service pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/echo</code></td>
+<td>Raw <code>ProtocolHandler</code></td>
+</tr>
+<tr>
+<td><code>examples/http-hello</code></td>
+<td>HTTP <code>ServerHandlerFactory</code> + cleartext/ALPN endpoint</td>
+</tr>
+<tr>
+<td><code>examples/ftp</code></td>
+<td><code>FtpService::start</code></td>
+</tr>
+<tr>
+<td><code>examples/smtp</code></td>
+<td><code>SmtpService</code> / relay</td>
+</tr>
+<tr>
+<td><code>examples/webdav</code></td>
+<td>HTTP factory from <code>hopf-webdav</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li><code>Service::tcp_listeners</code> is transitional — Composition / Runtime APIs own bindings.</li>
+<li>Protocol <code>start</code> signatures vary (<code>&amp;Runtime</code> vs <code>Arc&lt;Runtime&gt;</code>); FTP needs <code>Arc</code> for PASV.</li>
+<li>QUIC/H3 services are not <code>Service</code> trait objects today — call <code>listen_h3</code> directly.</li>
+</ul>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="ftp.html">FTP</a> · <a href="smtp.html">SMTP</a></li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,28 +60,466 @@
     <main class="main">
       <header>
         <h1>FTP</h1>
-        <p class="lead">Crate `hopf-ftp`: FTP / FTPS **server** and blocking **client** (Gumdrop `org.bluezoo.gumdrop.ftp` port).</p>
+        <p class="lead">Crate <code>hopf-ftp</code>: FTP / FTPS <strong>server</strong> and blocking <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.ftp</code>. The server runs on the Hopf thread-per-core reactor; data connections use dynamic PASV listeners on a shared <code>Arc&lt;Runtime&gt;</code>. TLS is provided by <a href="tls.html"><code>hopf-tls</code></a> (rustls). Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code>.</p>
       </header>
-      <p>Crate <code>hopf-ftp</code>: FTP / FTPS <strong>server</strong> and blocking <strong>client</strong> (Gumdrop <code>org.bluezoo.gumdrop.ftp</code> port).</p>
-<h2 id="server">Server</h2>
-<p><code>FtpService</code> + <code>FtpConfig</code>: control connection, PASV data listeners allocated on a shared <code>Arc&lt;Runtime&gt;</code>, stock <code>FilesystemFtpHandler</code> (chrooted root + storage API).</p>
-<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> policy <span class="op">=</span> <span class="pp">PasswordTrustPolicy::</span><span class="kw">default</span>()<span class="op">.</span>with_user(<span class="st">&quot;ftp&quot;</span><span class="op">,</span> <span class="st">&quot;ftp&quot;</span>)<span class="op">.</span>shared()<span class="op">;</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">FtpConfig::</span>new(addr<span class="op">,</span> root<span class="op">,</span> policy)<span class="op">;</span></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co">// optional: .with_tls(acceptor).implicit_ftps().require_data_tls()</span></span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> service <span class="op">=</span> <span class="pp">FtpService::</span>new(config)<span class="op">;</span></span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>)<span class="op">;</span></span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bound <span class="op">=</span> service<span class="op">.</span>start(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt))<span class="op">?;</span></span></code></pre></div>
-<p>Custom apps implement <code>FtpConnectionHandler</code> (<code>authenticate</code>, <code>file_system</code>, <code>is_authorized</code>) via <code>FtpService::with_handler_factory</code>.</p>
-<p>Config highlights: TrustPolicy, TLS acceptor, <code>implicit_tls</code>, <code>require_tls_for_data</code>, PASV advertised IP / port range, <code>read_only</code>, <code>allow_active_bounce</code>. Explicit FTPS: <code>with_starttls_acceptor</code>; implicit FTPS: <code>with_tls</code> on the listener.</p>
-<p>RFC 2640 <code>OPTS UTF8 ON</code> for pathnames and listings (ASCII substitution when UTF-8 is off).</p>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#supported-commands">Supported commands</a></li>
+<li><a href="#feat-advertisement">FEAT advertisement</a></li>
+<li><a href="#security-ftps">Security (FTPS)</a></li>
+<li><a href="#authentication">Authentication</a></li>
+<li><a href="#file-system-handler">File system handler</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#handler-spi">Handler SPI</a></li>
+<li><a href="#client">Client</a></li>
+<li><a href="#metrics">Metrics</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="standards">Standards</h2>
+<table>
+<colgroup>
+<col style="width: 44%" />
+<col style="width: 56%" />
+</colgroup>
+<thead>
+<tr>
+<th>Reference</th>
+<th>Role in Hopf</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc959">RFC 959</a></td>
+<td>Base FTP: control commands, TYPE/STRU/MODE, NVFS concepts</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2428">RFC 2428</a></td>
+<td>EPRT / EPSV (IPv6-capable active/passive)</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2389">RFC 2389</a></td>
+<td>FEAT / OPTS</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2640">RFC 2640</a></td>
+<td><code>OPTS UTF8 ON/OFF</code> pathname charset</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc3659">RFC 3659</a></td>
+<td>SIZE, MDTM, MLST/MLSD (TVFS facts)</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc4217">RFC 4217</a></td>
+<td>AUTH TLS, PBSZ, PROT; implicit FTPS</td>
+</tr>
+</tbody>
+</table>
+<h2 id="architecture">Architecture</h2>
+<pre><code>Client ──TCP──► FtpControlHandler (reactor)
+                    │ USER/PASS → TrustPolicy
+                    │ RETR/STOR/LIST → FtpFileSystem (via StorageExecutor for FS)
+                    │
+                    ├── PASV/EPSV → Runtime::add_tcp_listener (ephemeral data port)
+                    └── PORT/EPRT → outbound data connect (bounce guard)</code></pre>
+<ul>
+<li><strong>Control connection</strong> — one <code>FtpControlHandler</code> per accept; commands are lexed incrementally (<code>FtpServerLexer</code>).</li>
+<li><strong>Data connection</strong> — active (<code>PORT</code>/<code>EPRT</code>) or passive (<code>PASV</code>/<code>EPSV</code>). Passive binds allocate a short-lived listener on the same <code>Runtime</code>.</li>
+<li><strong>Filesystem</strong> — stock path is chrooted <code>BasicFtpFileSystem</code>; apps can supply any <code>FtpFileSystem</code>. Blocking FS work should stay off the reactor (storage pool).</li>
+<li><strong>TLS</strong> — cleartext, explicit <code>AUTH TLS</code>, or implicit FTPS (<code>secure</code> from first byte). Optional <code>PROT P</code> for data channels.</li>
+</ul>
+<h2 id="supported-commands">Supported commands</h2>
+<h3 id="access-control">Access control</h3>
+<p>USER, PASS, ACCT (always <code>202</code>), CWD / XCWD, CDUP / XCUP, QUIT, REIN</p>
+<h3 id="transfer-parameters">Transfer parameters</h3>
+<p>PORT, PASV, EPRT, EPSV, TYPE (<code>A</code> / <code>I</code>), STRU (<code>F</code> only), MODE (<code>S</code> only)</p>
+<h3 id="service-commands">Service commands</h3>
+<p>RETR, STOR, STOU, APPE, ALLO (<code>202</code>), REST, ABOR, DELE, RMD / XRMD, MKD / XMKD, PWD / XPWD, LIST, NLST, STAT, HELP, NOOP, SYST, RNFR / RNTO</p>
+<h3 id="extensions">Extensions</h3>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FEAT</td>
+<td>Feature negotiation</td>
+</tr>
+<tr>
+<td>SIZE</td>
+<td>File size (RFC 3659 §4)</td>
+</tr>
+<tr>
+<td>MDTM</td>
+<td>Modification time <code>YYYYMMDDhhmmss</code> UTC</td>
+</tr>
+<tr>
+<td>MLST / MLSD</td>
+<td>Machine listings (size, modify, type, perm)</td>
+</tr>
+<tr>
+<td>OPTS UTF8 ON/OFF</td>
+<td>Pathname encoding (RFC 2640)</td>
+</tr>
+<tr>
+<td>AUTH TLS / AUTH SSL</td>
+<td>Upgrade control to TLS</td>
+</tr>
+<tr>
+<td>PBSZ</td>
+<td>Protection buffer size (must be <code>0</code> before PROT)</td>
+</tr>
+<tr>
+<td>PROT C / P</td>
+<td>Clear / protected data</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Rejected / not implemented:</strong> CCC, SITE, SMNT (appropriate error replies).</p>
+<h3 id="data-connection-modes">Data connection modes</h3>
+<ul>
+<li><strong>Active (PORT / EPRT)</strong> — server connects to the client-specified address. Bounce protection rejects PORT targets that are not the control peer unless <code>allow_active_bounce</code> is set.</li>
+<li><strong>Passive (PASV / EPSV)</strong> — client connects to a server-advertised address. Prefer EPSV for IPv6 and NAT. Optional <code>pasv_advertised</code> IP and <code>pasv_port_min</code> / <code>pasv_port_max</code> for firewall/NAT deployments.</li>
+</ul>
+<h2 id="feat-advertisement">FEAT advertisement</h2>
+<p>When FEAT is issued, the server advertises (among others):</p>
+<pre><code>UTF8
+SIZE
+MDTM
+MLST
+MLSD
+REST STREAM
+EPSV
+EPRT
+AUTH TLS
+PBSZ
+PROT</code></pre>
+<h2 id="security-ftps">Security (FTPS)</h2>
+<h3 id="explicit-auth-tls">Explicit AUTH TLS</h3>
+<pre><code>C: AUTH TLS
+S: 234 AUTH TLS successful
+[TLS handshake]
+C: USER alice
+…</code></pre>
+<p>Configure with <code>FtpConfig::with_tls(acceptor)</code> (explicit) — the control listener uses <code>with_starttls_acceptor</code> so the first bytes remain cleartext until AUTH TLS.</p>
+<h3 id="implicit-ftps">Implicit FTPS</h3>
+<p><code>FtpConfig::implicit_ftps()</code> (or <code>implicit_tls = true</code>) expects TLS from connection establishment. Wire the listener with <code>with_tls</code> (TLS-from-accept). Conventionally listen on port 990 when not overridden.</p>
+<h3 id="data-protection">Data protection</h3>
+<pre><code>C: PBSZ 0
+S: 200 PBSZ=0
+C: PROT P
+S: 200 Protection level set to P</code></pre>
+<ul>
+<li><code>PROT P</code> — encrypt data connections with the same TLS acceptor.</li>
+<li><code>PROT C</code> — clear data.</li>
+<li><code>require_tls_for_data</code> / <code>require_data_tls()</code> — reject transfers unless protection level is <code>P</code>.</li>
+</ul>
+<h3 id="same-ip-data-check">Same-IP data check</h3>
+<p>Incoming PASV data connections from a mismatched client IP are rejected. Active PORT/EPRT bounce to a non-peer address is rejected unless <code>allow_active_bounce</code> is enabled.</p>
+<h2 id="authentication">Authentication</h2>
+<p>Stock <code>FilesystemFtpHandler</code> evaluates <code>TrustPolicy</code> with <code>IdentityMaterial::UsernamePassword</code> after USER/PASS.</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span>PasswordTrustPolicy<span class="op">;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_ftp::</span><span class="op">{</span>FtpConfig<span class="op">,</span> FtpService<span class="op">};</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Runtime<span class="op">,</span> RuntimeConfig<span class="op">};</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> policy <span class="op">=</span> <span class="pp">PasswordTrustPolicy::</span><span class="kw">default</span>()</span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_user(<span class="st">&quot;ftp&quot;</span><span class="op">,</span> <span class="st">&quot;ftp&quot;</span>)</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>shared()<span class="op">;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">FtpConfig::</span>new(<span class="st">&quot;127.0.0.1:2121&quot;</span><span class="op">.</span>parse()<span class="op">?,</span> <span class="st">&quot;/tmp/ftp-root&quot;</span><span class="op">.</span>into()<span class="op">,</span> policy)<span class="op">;</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> service <span class="op">=</span> <span class="pp">FtpService::</span>new(config)<span class="op">;</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>)<span class="op">;</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bound <span class="op">=</span> service<span class="op">.</span>start(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>rt))<span class="op">?;</span></span></code></pre></div>
+<p>Custom handlers return <code>FtpAuthResult::{Success, NeedPassword, NeedAccount, Failed, Unavailable}</code>. See <a href="auth.html">Auth</a>.</p>
+<h2 id="file-system-handler">File system handler</h2>
+<table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 60%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>FtpFileSystem</code></td>
+<td>NVFS trait: cwd, list, retrieve, store, mkdir, …</td>
+</tr>
+<tr>
+<td><code>BasicFtpFileSystem</code></td>
+<td>Local chroot under <code>root</code></td>
+</tr>
+<tr>
+<td><code>FilesystemFtpHandler</code></td>
+<td>TrustPolicy + <code>BasicFtpFileSystem</code></td>
+</tr>
+<tr>
+<td><code>FilesystemFtpHandlerFactory</code></td>
+<td>Stock factory for <code>FtpService::new</code></td>
+</tr>
+<tr>
+<td><code>TransferType</code></td>
+<td><code>Ascii</code> / <code>Image</code></td>
+</tr>
+<tr>
+<td><code>FtpFileInfo</code> / <code>FtpFileOpResult</code> / <code>DirectoryChange</code></td>
+<td>Metadata / results</td>
+</tr>
+</tbody>
+</table>
+<p><code>FilesystemFtpHandler::new(root, policy)</code> and <code>::read_only(root, policy)</code>.</p>
+<h2 id="configuration">Configuration</h2>
+<h3 id="ftpconfig"><code>FtpConfig</code></h3>
+<table>
+<colgroup>
+<col style="width: 31%" />
+<col style="width: 18%" />
+<col style="width: 28%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>listen</code></td>
+<td><code>SocketAddr</code></td>
+<td>caller</td>
+<td>Typical cleartext <code>:21</code>, demo <code>127.0.0.1:2121</code></td>
+</tr>
+<tr>
+<td><code>root</code></td>
+<td><code>PathBuf</code></td>
+<td>caller</td>
+<td>Chroot for stock FS handler</td>
+</tr>
+<tr>
+<td><code>policy</code></td>
+<td><code>Arc&lt;dyn TrustPolicy&gt;</code></td>
+<td>caller</td>
+<td>USER/PASS evaluation</td>
+</tr>
+<tr>
+<td><code>tls_acceptor</code></td>
+<td><code>Option&lt;SharedTlsAcceptor&gt;</code></td>
+<td><code>None</code></td>
+<td>From <a href="tls.html"><code>hopf-tls</code></a></td>
+</tr>
+<tr>
+<td><code>implicit_tls</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Implicit FTPS when true</td>
+</tr>
+<tr>
+<td><code>require_tls_for_data</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Mandate <code>PROT P</code></td>
+</tr>
+<tr>
+<td><code>allow_active_bounce</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Allow PORT ≠ control peer</td>
+</tr>
+<tr>
+<td><code>pasv_advertised</code></td>
+<td><code>Option&lt;IpAddr&gt;</code></td>
+<td><code>None</code></td>
+<td>NAT public IP in PASV reply</td>
+</tr>
+<tr>
+<td><code>pasv_port_min</code></td>
+<td><code>Option&lt;u16&gt;</code></td>
+<td><code>None</code></td>
+<td>PASV port range lower</td>
+</tr>
+<tr>
+<td><code>pasv_port_max</code></td>
+<td><code>Option&lt;u16&gt;</code></td>
+<td><code>None</code></td>
+<td>PASV port range upper</td>
+</tr>
+<tr>
+<td><code>read_only</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Stock FS write denied</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Builders:</strong> <code>FtpConfig::new(listen, root, policy)</code>, <code>.with_tls(acceptor)</code>, <code>.implicit_ftps()</code>, <code>.require_data_tls()</code>.</p>
+<h3 id="ftpservice"><code>FtpService</code></h3>
+<table>
+<colgroup>
+<col style="width: 53%" />
+<col style="width: 46%" />
+</colgroup>
+<thead>
+<tr>
+<th>Method</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>FtpService::new(config)</code></td>
+<td>Stock <code>FilesystemFtpHandlerFactory</code></td>
+</tr>
+<tr>
+<td><code>with_handler_factory(config, factory)</code></td>
+<td>Custom SPI</td>
+</tr>
+<tr>
+<td><code>control_listener(runtime)</code></td>
+<td>Build <code>TcpListenerConfig</code> without starting</td>
+</tr>
+<tr>
+<td><code>start(runtime)</code></td>
+<td>Bind + register; returns bound <code>SocketAddr</code></td>
+</tr>
+<tr>
+<td><code>metrics()</code></td>
+<td><code>FtpServerMetrics</code> snapshot</td>
+</tr>
+</tbody>
+</table>
+<h2 id="handler-spi">Handler SPI</h2>
+<div class="sourceCode" id="cb6"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> FtpConnectionHandler<span class="op">:</span> <span class="bu">Send</span> <span class="op">{</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> welcome_message(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> meta<span class="op">:</span> <span class="op">&amp;</span>FtpConnectionMetadata) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;</span><span class="dt">String</span><span class="op">&gt;;</span></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> authenticate(</span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span></span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>        username<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>        password<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;&amp;</span><span class="dt">str</span><span class="op">&gt;,</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>        account<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;&amp;</span><span class="dt">str</span><span class="op">&gt;,</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>        meta<span class="op">:</span> <span class="op">&amp;</span>FtpConnectionMetadata<span class="op">,</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a>    ) <span class="op">-&gt;</span> FtpAuthResult<span class="op">;</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> file_system(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> meta<span class="op">:</span> <span class="op">&amp;</span>FtpConnectionMetadata) <span class="op">-&gt;</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> FtpFileSystem<span class="op">;</span></span>
+<span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> is_authorized(</span>
+<span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        op<span class="op">:</span> FtpOperation<span class="op">,</span> <span class="co">// Read | Write | Delete</span></span>
+<span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>        path<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span></span>
+<span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>        meta<span class="op">:</span> <span class="op">&amp;</span>FtpConnectionMetadata<span class="op">,</span></span>
+<span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    ) <span class="op">-&gt;</span> <span class="dt">bool</span><span class="op">;</span></span>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> FtpConnectionHandlerFactory<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> create(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> FtpConnectionHandler<span class="op">&gt;;</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><code>FtpConnectionMetadata</code>: <code>peer</code>, <code>local</code>, <code>user</code>, <code>tls</code>.</p>
 <h2 id="client">Client</h2>
-<p><code>FtpClient</code> / <code>FtpClientBuilder</code>: USER/PASS, TYPE, path ops, PASV/EPSV (optional PORT/EPRT), RETR/STOR/LIST, explicit <code>AUTH TLS</code>, implicit FTPS + PROT P. Builder: <code>.tls(ClientConfig, name)</code>, <code>.implicit_tls(true)</code>, <code>.data_mode</code>, <code>.prefer_epsv</code>, timeout.</p>
+<p>Blocking <code>FtpClient</code> / <code>FtpClientBuilder</code> for tools and tests (not reactor-bound).</p>
+<h3 id="ftpclientbuilder"><code>FtpClientBuilder</code></h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>timeout</code></td>
+<td>duration</td>
+<td>30s</td>
+<td>Connect/I/O timeout</td>
+</tr>
+<tr>
+<td><code>data_mode</code></td>
+<td><code>FtpDataMode</code></td>
+<td><code>Passive</code></td>
+<td>Active or Passive</td>
+</tr>
+<tr>
+<td><code>prefer_epsv</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td>Prefer EPSV over PASV</td>
+</tr>
+<tr>
+<td>TLS</td>
+<td><code>ClientConfig</code> + server name</td>
+<td>off</td>
+<td>Via <code>.tls(cfg, name)</code></td>
+</tr>
+<tr>
+<td><code>implicit_tls</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Implicit FTPS connect</td>
+</tr>
+</tbody>
+</table>
+<div class="sourceCode" id="cb7"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_ftp::</span>FtpClient<span class="op">;</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> c <span class="op">=</span> <span class="pp">FtpClient::</span>connect(<span class="st">&quot;127.0.0.1:2121&quot;</span>)<span class="op">?;</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>login(<span class="st">&quot;ftp&quot;</span><span class="op">,</span> <span class="st">&quot;ftp&quot;</span>)<span class="op">?;</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>type_image()<span class="op">?;</span></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>cwd(<span class="st">&quot;/&quot;</span>)<span class="op">?;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> listing <span class="op">=</span> c<span class="op">.</span>list(<span class="cn">None</span>)<span class="op">?;</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>retr(<span class="st">&quot;readme.txt&quot;</span><span class="op">,</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="pp">std::io::</span>stdout())<span class="op">?;</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>quit()<span class="op">?;</span></span></code></pre></div>
+<p>Notable methods: <code>login</code>, <code>auth_tls</code>, <code>protect_data</code>, <code>opts_utf8</code>, <code>type_image</code> / <code>type_ascii</code>, <code>cwd</code>, <code>pwd</code>, <code>list</code> / <code>nlst</code> / <code>mlsd</code>, <code>retr</code>, <code>stor</code>, <code>appe</code>, <code>size</code>, <code>mdtm</code>, <code>quit</code>.</p>
+<h2 id="metrics">Metrics</h2>
+<p><code>FtpServerMetrics</code> counters include connections, <code>auth_ok</code> / <code>auth_fail</code>, commands, <code>bytes_in</code> / <code>bytes_out</code>, and <code>pasv_binds</code>.</p>
 <h2 id="examples">Examples</h2>
-<p><a href="cookbook/ftp.html">Cookbook: FTP</a> — <code>examples/ftp</code> (<code>ftp-server</code>) and <code>examples/ftp-get</code>.</p>
+<p>See <a href="cookbook/ftp.html">Cookbook: FTP</a>.</p>
+<div class="sourceCode" id="cb8"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Cleartext stock server (user/pass ftp/ftp)</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> ftp-server <span class="at">--</span> 127.0.0.1:2121 /tmp/ftp-root</span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Blocking client LIST/RETR</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="va">FTP_USER</span><span class="op">=</span>ftp <span class="va">FTP_PASS</span><span class="op">=</span>ftp <span class="ex">cargo</span> run <span class="at">-p</span> ftp-get <span class="at">--</span> 127.0.0.1:2121 remote/path</span></code></pre></div>
+<table>
+<colgroup>
+<col style="width: 30%" />
+<col style="width: 46%" />
+<col style="width: 23%" />
+</colgroup>
+<thead>
+<tr>
+<th>Package</th>
+<th>Demonstrates</th>
+<th>Knobs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/ftp</code> (<code>ftp-server</code>)</td>
+<td>Stock FS server</td>
+<td><code>addr</code> (def <code>127.0.0.1:2121</code>), <code>root</code></td>
+</tr>
+<tr>
+<td><code>examples/ftp-get</code></td>
+<td>Client LIST/RETR</td>
+<td><code>addr</code>, path; <code>FTP_USER</code> / <code>FTP_PASS</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>SITE, CCC, and SMNT are not implemented (rejected).</li>
+<li>Stock examples are cleartext; FTPS is available via API + <a href="tls.html"><code>tls.md</code></a> but not wired in the demo binaries.</li>
+<li>No Gumdrop-style SITE quota / RBAC beyond <code>TrustPolicy</code> + <code>is_authorized</code>.</li>
+<li>Client is blocking; there is no reactor-native FTP client endpoint.</li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

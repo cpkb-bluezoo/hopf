@@ -5,9 +5,10 @@ native successor to [Gumdrop](https://github.com/cpkb-bluezoo/gumdrop) (sibling
 repo `../gumdrop`). It is written so another agent or contributor can continue
 without re-deriving the discussion.
 
-Status: **active greenfield**. Implementation follows [TRANCHES.md](TRANCHES.md).
-Design locks from GitHub issues [#1](https://github.com/cpkb-bluezoo/hopf/issues/1)–[#8](https://github.com/cpkb-bluezoo/hopf/issues/8)
-are summarised below and mirrored in TRANCHES.
+Status: **active greenfield**. Published architecture reference:
+[docs/architecture.html](docs/architecture.html). Design locks from GitHub issues
+[#1](https://github.com/cpkb-bluezoo/hopf/issues/1)–[#8](https://github.com/cpkb-bluezoo/hopf/issues/8)
+are summarised below.
 
 ---
 
@@ -268,15 +269,10 @@ is one production, not the only event boundary. Early **parse** state ≠ early
 
 ## Non-goals
 
-- Becoming a general web-framework competitor for “build a web app in five
-  minutes.”
 - Preserving Servlet, JSP, or JavaMail APIs; reflective XML DI.
 - Bit-identical Gumdrop Java package layouts or JNI.
 - Supporting every platform equally on day one for every advanced feature.
 - Work-stealing schedulers as the default concurrency story.
-- Maximizing crate count or “idiomatic async Rust ecosystem” integration at
-  the expense of the owned stack.
-- A throwaway static-file HTTP PoC (Tranche 5 skipped) — filesystem HTTP is WebDAV.
 
 ---
 
@@ -316,37 +312,3 @@ Use `../gumdrop` as behavioural reference (especially `SelectorLoop`,
 `Endpoint` / handlers, `StorageExecutor`, protocol packages under
 `org.bluezoo.gumdrop.*`).
 
----
-
-## Suggested implementation order (for agents)
-
-Authoritative breakdown: **[TRANCHES.md](TRANCHES.md)**. Summary:
-
-1. Skeleton → core TPC/mio → storage → rustls TLS (done / in flight).
-2. HTTP/1.1 vertical + Stream-first app API (`HttpStream`, server/client);
-   grammar-driven tokens; listen/dial twins (`http-hello` / `http-get`).
-3. **Skip** static-file PoC (T5).
-4. HTTP/2 + HPACK; then QUIC via **quinn-proto** + **in-tree H3**.
-5. Reactor-affine DNS (Stage 1) under dial; TrustPolicy landing; composition builder.
-6. Broader protocols; **WebDAV** + composition XML loader on **tractrix**.
-
-Do not start by wrapping Hyper or an async app runtime “just to get HTTP.”
-
----
-
-## Open points (intentionally undecided here)
-
-Resolved in TRANCHES / issues: workspace layout; HTTP-first; servlet out;
-incremental push parsers; peer-symmetric runtime; dynamic bindings; composition
-XML via tractrix; rustls+quinn-proto; HTTP Stream layering; grammar-driven
-codecs; TrustPolicy vocabulary; reactor-affine DNS staging.
-
-Still open:
-
-- PEM-only vs PKCS#12 import for migration from Gumdrop keystores.
-- Allocator choice (system vs jemalloc/mimalloc) — measure before mandating.
-- Public C ABI (`cdylib`) for embedders — possible later, not required to start.
-- Exact `hopf-auth` crate split vs `core::auth` for first TrustPolicy landing.
-
-When resolving these, prefer decisions that keep TPC + mio + near-zero deps
-intact.

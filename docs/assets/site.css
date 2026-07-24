@@ -1,5 +1,6 @@
 /* Hopf docs — GitHub Pages */
 :root {
+  color-scheme: light dark;
   --bg: #f0f2f5;
   --surface: #ffffff;
   --ink: #12141a;
@@ -8,9 +9,30 @@
   --accent-hover: #085548;
   --border: #d0d5dd;
   --code-bg: #e6e9ef;
+  --pre-bg: #1c212b;
+  --pre-ink: #e8ecf4;
+  --glow-accent: rgba(10, 107, 92, 0.08);
+  --glow-ink: rgba(18, 20, 26, 0.04);
   --nav-w: 15.5rem;
   --font: "Literata", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
   --mono: "IBM Plex Mono", "ui-monospace", "Cascadia Code", Menlo, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151c;
+    --surface: #1a1f2a;
+    --ink: #e8ecf4;
+    --muted: #9aa3b5;
+    --accent: #3dbaa5;
+    --accent-hover: #6dd4c0;
+    --border: #2e3545;
+    --code-bg: #252b38;
+    --pre-bg: #0d1016;
+    --pre-ink: #e8ecf4;
+    --glow-accent: rgba(61, 186, 165, 0.12);
+    --glow-ink: rgba(232, 236, 244, 0.03);
+  }
 }
 
 *,
@@ -31,8 +53,8 @@ body {
   line-height: 1.55;
   color: var(--ink);
   background:
-    radial-gradient(ellipse 80% 50% at 100% 0%, rgba(10, 107, 92, 0.08), transparent 55%),
-    radial-gradient(ellipse 60% 40% at 0% 100%, rgba(18, 20, 26, 0.04), transparent 50%),
+    radial-gradient(ellipse 80% 50% at 100% 0%, var(--glow-accent), transparent 55%),
+    radial-gradient(ellipse 60% 40% at 0% 100%, var(--glow-ink), transparent 50%),
     var(--bg);
 }
 
@@ -64,6 +86,19 @@ a:hover {
   border-right: 1px solid var(--border);
   background: color-mix(in srgb, var(--surface) 88%, transparent);
   backdrop-filter: blur(8px);
+}
+
+.nav .logo {
+  display: block;
+  margin: 0 0 0.85rem;
+  line-height: 0;
+  text-decoration: none;
+}
+
+.nav .logo img {
+  display: block;
+  width: 100%;
+  height: auto;
 }
 
 .nav .brand {
@@ -120,6 +155,10 @@ a:hover {
   color: var(--accent-hover);
 }
 
+.nav a.logo:hover {
+  background: transparent;
+}
+
 .main {
   padding: 2rem 2.25rem 3.5rem;
   max-width: 46rem;
@@ -154,6 +193,41 @@ a:hover {
   font-size: 1.1rem;
 }
 
+.main h4 {
+  margin-top: 1.15rem;
+  font-size: 1rem;
+}
+
+.main .toc {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  padding: 0.85rem 1.1rem;
+  margin: 1rem 0 1.5rem;
+}
+
+.main .toc > p {
+  margin: 0 0 0.4rem;
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+
+.main .toc ul {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.main .toc li {
+  margin: 0.2rem 0;
+  font-size: 0.95rem;
+}
+
+.main .crate {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  color: var(--muted);
+}
+
 .main p,
 .main li {
   color: var(--ink);
@@ -182,8 +256,8 @@ a:hover {
 }
 
 .main pre {
-  background: #1c212b;
-  color: #e8ecf4;
+  background: var(--pre-bg);
+  color: var(--pre-ink);
   padding: 1rem 1.1rem;
   overflow-x: auto;
   font-family: var(--mono);
@@ -235,6 +309,10 @@ a:hover {
     height: auto;
     border-right: none;
     border-bottom: 1px solid var(--border);
+  }
+
+  .nav .logo {
+    max-width: 9.5rem;
   }
 
   .main {

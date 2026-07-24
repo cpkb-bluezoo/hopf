@@ -66,6 +66,11 @@ def depth_prefix(rel: Path) -> str:
 
 def nav_html(current: str, prefix: str) -> str:
     parts = ['<nav class="nav" aria-label="Documentation">']
+    parts.append(
+        f'<a class="logo" href="{prefix}index.html">'
+        f'<img src="{prefix}assets/hopf.png" alt="Hopf" width="220" height="206">'
+        f"</a>"
+    )
     parts.append(f'<a class="brand" href="{prefix}index.html">Hopf</a>')
     parts.append('<p class="tag">Networking framework reference</p>')
     for section, links in NAV:
@@ -104,25 +109,72 @@ def extract_title(md: str, fallback: str) -> tuple[str, str | None]:
     lead = None
     if lines and lines[0].startswith("# "):
         title = lines[0][2:].strip()
-        # first non-empty paragraph after title as lead
-        body = []
+        # Full first paragraph after title (until blank line or heading)
+        parts: list[str] = []
         for line in lines[1:]:
             if line.startswith("#"):
                 break
-            if line.strip():
-                body.append(line.strip())
-                break
-        if body:
-            lead = body[0]
+            if not line.strip():
+                if parts:
+                    break
+                continue
+            parts.append(line.strip())
+        if parts:
+            lead = " ".join(parts)
     return title, lead
 
 
-def pandoc_body(md_path: Path) -> str:
+def inline_md(text: str, prefix: str = "") -> str:
+    """Minimal inline markdown for leads (links, code spans, bold)."""
+    text = (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+    def link_repl(m: re.Match[str]) -> str:
+        label, href = m.group(1), m.group(2)
+        if not href.startswith(("http://", "https://", "#", "/")):
+            if href.endswith(".md"):
+                href = href[:-3] + ".html"
+            elif ".md#" in href:
+                href = href.replace(".md#", ".html#")
+            href = prefix + href
+        return f'<a href="{href}">{label}</a>'
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", link_repl, text)
+    text = re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", text)
+    return text
+
+
+def wrap_toc(html: str) -> str:
+    """Wrap ## Contents heading + following <ul> in <div class="toc">."""
+    return re.sub(
+        r"(<h2[^>]*>Contents</h2>\s*)(<ul>.*?</ul>)",
+        r'<div class="toc">\1\2</div>',
+        html,
+        count=1,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+
+def pandoc_body(md_path: Path, strip_lead: bool = True) -> str:
     # Strip leading H1 (page title comes from template header)
     text = md_path.read_text()
     lines = text.splitlines()
     if lines and lines[0].startswith("# "):
-        text = "\n".join(lines[1:]).lstrip("\n")
+        lines = lines[1:]
+    # Drop blank lines after title
+    while lines and not lines[0].strip():
+        lines = lines[1:]
+    # Drop first paragraph (used as header lead) until blank line or heading
+    if strip_lead and lines and not lines[0].startswith("#"):
+        i = 0
+        while i < len(lines) and lines[i].strip() and not lines[i].startswith("#"):
+            i += 1
+        lines = lines[i:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    text = "\n".join(lines).lstrip("\n")
     proc = subprocess.run(
         [
             "pandoc",
@@ -137,7 +189,7 @@ def pandoc_body(md_path: Path) -> str:
         text=True,
         check=True,
     )
-    return rewrite_links(proc.stdout)
+    return wrap_toc(rewrite_links(proc.stdout))
 
 
 def page(rel: Path, md_path: Path, out_name: str) -> Path:
@@ -146,13 +198,13 @@ def page(rel: Path, md_path: Path, out_name: str) -> Path:
     title, lead = extract_title(md, fallback)
     prefix = depth_prefix(rel)
     current = str(rel).replace("\\", "/")
-    if current.endswith("README.md") or current == "README.md":
+    if current in ("README.md", "index.md") or current.endswith("/README.md"):
         current = "index.html"
-    else:
-        current = current[:-3] + ".html" if current.endswith(".md") else current
+    elif current.endswith(".md"):
+        current = current[:-3] + ".html"
 
     body = pandoc_body(md_path)
-    lead_html = f'<p class="lead">{lead}</p>' if lead else ""
+    lead_html = f'<p class="lead">{inline_md(lead, prefix)}</p>' if lead else ""
     # Escape title minimally
     title_esc = (
         title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -179,8 +231,6 @@ def page(rel: Path, md_path: Path, out_name: str) -> Path:
       </header>
       {body}
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>
@@ -189,7 +239,7 @@ def page(rel: Path, md_path: Path, out_name: str) -> Path:
 </html>
 """
     out = DOCS / rel
-    if out.name == "README.md":
+    if out.name in ("README.md", "index.md"):
         out = out.with_name("index.html")
     else:
         out = out.with_suffix(".html")

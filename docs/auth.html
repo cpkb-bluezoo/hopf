@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,45 +60,309 @@
     <main class="main">
       <header>
         <h1>Auth</h1>
-        <p class="lead">TrustPolicy, credential stores, SASL mechanisms, and HTTP Basic/Digest/Bearer.</p>
+        <p class="lead">Crate <code>hopf-auth</code>: <strong>TrustPolicy</strong>, credential stores, and <strong>SASL</strong> mechanisms (Gumdrop parity, <strong>no GSSAPI</strong>). Independent of <code>hopf-core</code> (own <code>VERSION</code>). HTTP Basic / Digest / Bearer <strong>factories</strong> live in <code>hopf-http</code> and consume these types; FTP and SMTP use <code>TrustPolicy</code> directly.</p>
       </header>
-      <p>Crate <code>hopf-auth</code> keeps trust and SASL out of <code>hopf-core</code>. HTTP consumers live in <code>hopf-http</code>.</p>
-<h2 id="types">Types</h2>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#trustpolicy">TrustPolicy</a></li>
+<li><a href="#credential-stores">Credential stores</a></li>
+<li><a href="#sasl-mechanisms">SASL mechanisms</a></li>
+<li><a href="#http-digest-helpers">HTTP Digest helpers</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#wiring">Wiring</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="standards">Standards</h2>
 <table>
+<colgroup>
+<col style="width: 63%" />
+<col style="width: 36%" />
+</colgroup>
 <thead>
-<tr><th>Type</th><th>Role</th></tr>
+<tr>
+<th>Mechanism / topic</th>
+<th>Reference</th>
+</tr>
 </thead>
 <tbody>
-<tr><td><code>IdentityMaterial</code></td><td>Username/password, bearer, cert DN/SAN, opaque</td></tr>
-<tr><td><code>PeerContext</code></td><td>Optional peer <code>SocketAddr</code></td></tr>
-<tr><td><code>TrustPolicy</code></td><td><code>evaluate</code> → <code>Accept</code> / <code>Reject</code></td></tr>
-<tr><td><code>CredentialStore</code></td><td>Gumdrop <code>Realm</code>-like backend for SASL / Digest HA1 / tokens / certs</td></tr>
-<tr><td><code>PasswordStore</code></td><td>In-memory passwords, tokens, and certificate keys</td></tr>
-<tr><td><code>PasswordTrustPolicy</code></td><td>Simple username/password policy ( demos )</td></tr>
+<tr>
+<td>PLAIN</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc4616">RFC 4616</a></td>
+</tr>
+<tr>
+<td>LOGIN</td>
+<td>Legacy draft</td>
+</tr>
+<tr>
+<td>CRAM-MD5</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2195">RFC 2195</a></td>
+</tr>
+<tr>
+<td>DIGEST-MD5</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2831">RFC 2831</a> (deprecated)</td>
+</tr>
+<tr>
+<td>SCRAM-SHA-256</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc5802">RFC 5802</a> / <a href="https://www.rfc-editor.org/rfc/rfc7677">7677</a> (PBKDF2)</td>
+</tr>
+<tr>
+<td>OAUTHBEARER</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc7628">RFC 7628</a></td>
+</tr>
+<tr>
+<td>EXTERNAL</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc4422">RFC 4422</a> App. A</td>
+</tr>
+<tr>
+<td>HTTP Digest</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc7616">RFC 7616</a> helpers</td>
+</tr>
+<tr>
+<td>Compare</td>
+<td>Constant-time via <code>subtle</code></td>
+</tr>
 </tbody>
 </table>
-<h2 id="sasl">SASL (no GSSAPI)</h2>
-<p>Mechanisms: <strong>PLAIN</strong>, <strong>LOGIN</strong>, <strong>CRAM-MD5</strong>, <strong>DIGEST-MD5</strong>, <strong>SCRAM-SHA-256</strong>, <strong>OAUTHBEARER</strong>, <strong>EXTERNAL</strong>.</p>
-<pre><code class="language-rust">use hopf_auth::{create_client, create_server, PasswordStore, SaslMechanism, SaslServerOptions};
-use std::sync::Arc;
-
-let store = Arc::new(PasswordStore::new().with_user("alice", "s3cret")) as _;
-let mut server = create_server(SaslMechanism::ScramSha256, store, SaslServerOptions::default());
-let mut client = create_client(SaslMechanism::ScramSha256, "alice", "s3cret", "mail.example");
-// drive SaslServer::step / SaslClient::evaluate until Complete
-</code></pre>
-<p>For EXTERNAL, set <code>SaslServerOptions::peer_certificate</code> to the TLS peer fingerprint or DN.</p>
-<h2 id="http">HTTP Basic, Digest, Bearer</h2>
+<h2 id="architecture">Architecture</h2>
+<pre><code>Protocol (FTP / SMTP / HTTP auth factory)
+        │
+        ├── TrustPolicy::evaluate(IdentityMaterial, PeerContext)
+        │         → Accept | Reject
+        │
+        └── SASL: create_server / create_client
+                  ↔ CredentialStore (passwords, HA1, SCRAM, tokens, certs)</code></pre>
+<p><code>PasswordTrustPolicy</code> is a small demo policy; production apps implement <code>TrustPolicy</code> or back SASL with a real <code>CredentialStore</code>.</p>
+<h2 id="trustpolicy">TrustPolicy</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TrustPolicy</code></td>
+<td><code>evaluate</code> → <code>TrustDecision::{Accept,Reject}</code></td>
+</tr>
+<tr>
+<td><code>IdentityMaterial</code></td>
+<td>UsernamePassword / Bearer / CertDn / CertSan / Opaque</td>
+</tr>
+<tr>
+<td><code>PeerContext</code></td>
+<td>Optional peer <code>SocketAddr</code></td>
+</tr>
+<tr>
+<td><code>PasswordTrustPolicy</code></td>
+<td>In-memory username/password map</td>
+</tr>
+</tbody>
+</table>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span><span class="op">{</span>IdentityMaterial<span class="op">,</span> PeerContext<span class="op">,</span> TrustDecision<span class="op">,</span> TrustPolicy<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">fn</span> evaluate(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> id<span class="op">:</span> <span class="op">&amp;</span>IdentityMaterial<span class="op">,</span> peer<span class="op">:</span> <span class="op">&amp;</span>PeerContext) <span class="op">-&gt;</span> TrustDecision <span class="op">{</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// …</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>FTP stock handler and SMTP AUTH PLAIN call this layer. See <a href="ftp.html">FTP</a>, <a href="smtp.html">SMTP</a>.</p>
+<h2 id="credential-stores">Credential stores</h2>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CredentialStore</code></td>
+<td>Trait backend (Gumdrop Realm-like)</td>
+</tr>
+<tr>
+<td><code>PasswordStore</code></td>
+<td>In-memory passwords, tokens, cert keys</td>
+</tr>
+<tr>
+<td><code>ScramCredentials</code></td>
+<td>StoredKey / ServerKey derivation</td>
+</tr>
+<tr>
+<td><code>TokenValidation</code></td>
+<td>Bearer checks</td>
+</tr>
+<tr>
+<td><code>CertificateIdentity</code></td>
+<td>Cert mapping</td>
+</tr>
+</tbody>
+</table>
+<p><code>CredentialStore</code> overridable methods: <code>password_match</code>, <code>plaintext_password</code>, <code>digest_ha1</code>, <code>cram_md5_digest</code>, <code>scram_credentials</code>, <code>validate_bearer</code>, <code>authenticate_certificate</code>, <code>authorize_as</code>, <code>supported_mechanisms</code>.</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span>PasswordStore<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> store <span class="op">=</span> <span class="pp">PasswordStore::</span>new()</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_user(<span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;secret&quot;</span>)</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_token(<span class="st">&quot;tok&quot;</span><span class="op">,</span> <span class="st">&quot;alice&quot;</span>)</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_certificate(<span class="st">&quot;cn=alice&quot;</span><span class="op">,</span> <span class="st">&quot;alice&quot;</span>)</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>shared()<span class="op">;</span></span></code></pre></div>
+<p>SCRAM iterations default <strong>4096</strong> (<code>ScramCredentials::derive(password, salt, iterations)</code>).</p>
+<h2 id="sasl-mechanisms">SASL mechanisms</h2>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">enum</span> SaslMechanism <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    Plain<span class="op">,</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>    Login<span class="op">,</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    CramMd5<span class="op">,</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    DigestMd5<span class="op">,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    ScramSha256<span class="op">,</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    OauthBearer<span class="op">,</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    External<span class="op">,</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Helpers on the enum: <code>name</code>, <code>from_name</code>, <code>is_challenge_response</code>, <code>requires_tls</code>, <code>all</code>.</p>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SaslServer</code> / <code>SaslClient</code></td>
+<td>Step traits</td>
+</tr>
+<tr>
+<td><code>SaslServerStep</code></td>
+<td>Challenge / Complete{username,final_message} / Failure</td>
+</tr>
+<tr>
+<td><code>SaslClientStep</code></td>
+<td>Response / Complete / Failure</td>
+</tr>
+<tr>
+<td><code>SaslServerOptions</code></td>
+<td>hostname, realm, peer_certificate</td>
+</tr>
+<tr>
+<td><code>create_server</code> / <code>create_client</code></td>
+<td>Factories</td>
+</tr>
+</tbody>
+</table>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span><span class="op">{</span>create_server<span class="op">,</span> create_client<span class="op">,</span> SaslMechanism<span class="op">,</span> SaslServerOptions<span class="op">};</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> server <span class="op">=</span> create_server(</span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="pp">SaslMechanism::</span>ScramSha256<span class="op">,</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    store<span class="op">,</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>    SaslServerOptions <span class="op">{</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>        hostname<span class="op">:</span> <span class="st">&quot;localhost&quot;</span><span class="op">.</span>into()<span class="op">,</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>        realm<span class="op">:</span> <span class="st">&quot;hopf&quot;</span><span class="op">.</span>into()<span class="op">,</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>        peer_certificate<span class="op">:</span> <span class="cn">None</span><span class="op">,</span></span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">},</span></span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>)<span class="op">;</span></span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> client <span class="op">=</span> create_client(<span class="pp">SaslMechanism::</span>ScramSha256<span class="op">,</span> <span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;secret&quot;</span><span class="op">,</span> <span class="st">&quot;localhost&quot;</span>)<span class="op">;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a><span class="co">// Alternate challenge/response via server.step / client.evaluate</span></span></code></pre></div>
+<p>Symmetric client + server exchanges for all <strong>seven</strong> mechanisms. <code>requires_tls</code> guides operators (e.g. PLAIN should be under TLS).</p>
+<h2 id="http-digest-helpers">HTTP Digest helpers</h2>
+<p>Module <code>http_digest</code>: <code>challenge_header</code>, <code>new_nonce</code>, <code>verify_authorization</code>, <code>client_authorization</code>.</p>
+<p>HTTP <strong>Basic / Digest / Bearer</strong> request wrappers are in <code>hopf-http</code> (<code>BasicAuthFactory</code>, <code>DigestAuthFactory</code>, <code>BearerAuthFactory</code>) and call into trust / digest helpers — see <a href="http/server.html">HTTP server</a>.</p>
+<h2 id="configuration">Configuration</h2>
+<h3 id="saslserveroptions"><code>SaslServerOptions</code></h3>
+<table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hostname</code></td>
+<td>string</td>
+<td><code>"localhost"</code></td>
+<td>SCRAM / Digest host</td>
+</tr>
+<tr>
+<td><code>realm</code></td>
+<td>string</td>
+<td><code>"hopf"</code></td>
+<td>Digest realm</td>
+</tr>
+<tr>
+<td><code>peer_certificate</code></td>
+<td>optional</td>
+<td><code>None</code></td>
+<td>EXTERNAL</td>
+</tr>
+</tbody>
+</table>
+<h3 id="passwordstore"><code>PasswordStore</code></h3>
+<table>
+<colgroup>
+<col style="width: 27%" />
+<col style="width: 40%" />
+<col style="width: 31%" />
+</colgroup>
+<thead>
+<tr>
+<th>Knob</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SCRAM iterations</td>
+<td><code>4096</code></td>
+<td>PBKDF2</td>
+</tr>
+<tr>
+<td>Builders</td>
+<td>—</td>
+<td><code>with_user</code>, <code>with_token</code>, <code>with_certificate</code>, <code>shared</code></td>
+</tr>
+</tbody>
+</table>
+<p>No Cargo features.</p>
+<h2 id="wiring">Wiring</h2>
+<p><strong>FTP:</strong></p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> policy <span class="op">=</span> <span class="pp">PasswordTrustPolicy::</span><span class="kw">default</span>()<span class="op">.</span>with_user(<span class="st">&quot;ftp&quot;</span><span class="op">,</span> <span class="st">&quot;ftp&quot;</span>)<span class="op">.</span>shared()<span class="op">;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a><span class="pp">FtpConfig::</span>new(addr<span class="op">,</span> root<span class="op">,</span> policy)<span class="op">;</span></span></code></pre></div>
+<p><strong>SMTP:</strong></p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="pp">SmtpConfig::</span>new(addr<span class="op">,</span> hostname)</span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_tls(acceptor)</span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_policy(policy)</span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>auth_required(<span class="cn">true</span>)<span class="op">;</span></span></code></pre></div>
+<p><strong>HTTP</strong> (in <code>hopf-http</code>): wrap a <code>ServerHandlerFactory</code> with <code>BasicAuthFactory</code> / <code>DigestAuthFactory</code> / <code>BearerAuthFactory</code> using a <code>TrustPolicy</code> or realm config (<code>BasicAuthConfig { realm }</code>, <code>DigestAuthConfig { realm }</code>).</p>
+<h2 id="examples">Examples</h2>
+<p>No dedicated <code>examples/auth</code> crate. Consumed by:</p>
 <ul>
-<li><code>BasicAuthFactory</code> — <code>TrustPolicy</code> on <code>Authorization: Basic</code></li>
-<li><code>DigestAuthFactory</code> — RFC 7616 MD5 / qop=auth via <code>CredentialStore::digest_ha1</code></li>
-<li><code>BearerAuthFactory</code> — <code>IdentityMaterial::Bearer</code> through <code>TrustPolicy</code></li>
+<li><a href="cookbook/ftp.html">Cookbook: FTP</a> — <code>FTP_USER</code> / <code>FTP_PASS</code></li>
+<li><a href="cookbook/smtp.html">Cookbook: SMTP</a></li>
+<li>HTTP hello examples with auth factories when configured</li>
 </ul>
-<p>Client Digest credentials: <code>build_digest_authorization</code> / <code>http_digest::client_authorization</code>.</p>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li><strong>No GSSAPI / Kerberos</strong> (deliberate).</li>
+<li>DIGEST-MD5 kept for parity only (deprecated by RFC 6331).</li>
+<li>OAUTHBEARER carries the token in the client “password” slot.</li>
+<li><code>PasswordStore</code> is <strong>in-memory</strong> (demo-grade).</li>
+<li><code>plaintext_password</code> fallback for CRAM-MD5 is discouraged in production.</li>
+<li>SMTP wire currently advertises <strong>AUTH PLAIN</strong> only (<a href="smtp.html">SMTP</a>), even though the auth crate supports more mechanisms.</li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

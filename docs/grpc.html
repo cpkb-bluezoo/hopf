@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,46 +60,314 @@
     <main class="main">
       <header>
         <h1>gRPC</h1>
-        <p class="lead">Crate `hopf-grpc`: **unary** gRPC over Hopf HTTP Streams — Gumdrop `org.bluezoo.gumdrop.grpc` architecture.</p>
+        <p class="lead">Crate <code>hopf-grpc</code>: <strong>unary</strong> gRPC over <a href="http/overview.html"><code>hopf-http</code></a> Streams. Uses a <strong>runtime <code>.proto</code> model</strong> (<code>rprotobuf</code>) — no generated stubs or codegen. Works wherever Hopf Streams run (HTTP/2 preferred; H1/H3 inherit Stream framing, with H1 trailer caveats).</p>
       </header>
-      <p>Crate <code>hopf-grpc</code>: <strong>unary</strong> gRPC over Hopf HTTP Streams — Gumdrop <code>org.bluezoo.gumdrop.grpc</code> architecture.</p>
-<h2 id="model">Model</h2>
+      <p><code>#![forbid(unsafe_code)]</code>.</p>
+<div class="toc"><h2 id="contents">Contents</h2>
 <ul>
-<li>Length-prefixed frames; content-type <code>application/grpc</code></li>
-<li>Runtime <code>.proto</code> via <code>ProtoFileParser</code> / <code>ProtoFile</code> (no generated stubs, no message DOM at the app boundary)</li>
-<li>Schema-aware push decode/encode through <strong>rprotobuf</strong></li>
-<li>Unimplemented methods → gRPC status <strong>12</strong></li>
-<li>Default max message size <strong>4 MiB</strong> (<code>set_max_message_size</code>)</li>
-</ul>
-<h2 id="server-wiring">Server wiring</h2>
-<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> proto <span class="op">=</span> <span class="pp">ProtoFileParser::</span>parse(PROTO)<span class="op">?;</span></span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">GrpcHandlerFactory::</span>new(proto<span class="op">,</span> <span class="pp">Arc::</span>new(EchoService)))<span class="op">;</span></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>add_tcp_listener(<span class="pp">TcpListenerConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
-<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">CleartextHttpEndpoint::</span>new(</span>
-<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory) <span class="kw">as</span> Arc<span class="op">&lt;</span><span class="kw">dyn</span> ServerHandlerFactory<span class="op">&gt;,</span></span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>        <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
-<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>    ))</span>
-<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>))<span class="op">?;</span></span>
-<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="kw">impl</span> GrpcService <span class="cf">for</span> EchoService <span class="op">{</span></span>
-<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> start_unary_call(</span>
-<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span></span>
-<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a>        path<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span></span>
-<span id="cb1-14"><a href="#cb1-14" aria-hidden="true" tabindex="-1"></a>        response<span class="op">:</span> GrpcResponseChannel<span class="op">,</span></span>
-<span id="cb1-15"><a href="#cb1-15" aria-hidden="true" tabindex="-1"></a>    ) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;</span><span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtoMessageHandler<span class="op">&gt;&gt;</span> <span class="op">{</span></span>
-<span id="cb1-16"><a href="#cb1-16" aria-hidden="true" tabindex="-1"></a>        <span class="co">// match &quot;/pkg.Service/Method&quot;, return a ProtoMessageHandler</span></span>
-<span id="cb1-17"><a href="#cb1-17" aria-hidden="true" tabindex="-1"></a>        <span class="co">// that fills the reply via response.open_message / complete</span></span>
-<span id="cb1-18"><a href="#cb1-18" aria-hidden="true" tabindex="-1"></a>        <span class="cn">None</span></span>
-<span id="cb1-19"><a href="#cb1-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
-<span id="cb1-20"><a href="#cb1-20" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#framing">Framing</a></li>
+<li><a href="#proto-model">Proto model</a></li>
+<li><a href="#server-spi">Server SPI</a></li>
+<li><a href="#client">Client</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="standards">Standards</h2>
+<table>
+<colgroup>
+<col style="width: 46%" />
+<col style="width: 53%" />
+</colgroup>
+<thead>
+<tr>
+<th>Topic</th>
+<th>Detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transport</td>
+<td>gRPC over HTTP (<code>application/grpc</code>), typically HTTP/2</td>
+</tr>
+<tr>
+<td>Path</td>
+<td><code>POST /{service}/{method}</code></td>
+</tr>
+<tr>
+<td>Message</td>
+<td>5-byte prefix: 1-byte compression flag + 4-byte big-endian length</td>
+</tr>
+<tr>
+<td>Status</td>
+<td><code>grpc-status</code> / <code>grpc-message</code> in <strong>trailers</strong> (or headers)</td>
+</tr>
+<tr>
+<td>TE</td>
+<td><code>te: trailers</code></td>
+</tr>
+<tr>
+<td>Protobuf</td>
+<td>proto2 / proto3 via <code>rprotobuf</code></td>
+</tr>
+<tr>
+<td>Status codes</td>
+<td>e.g. <code>12</code> UNIMPLEMENTED, <code>13</code> INTERNAL</td>
+</tr>
+</tbody>
+</table>
+<p>Content-type accepted: exact <code>application/grpc</code> or <code>application/grpc…</code> prefix.</p>
+<h2 id="architecture">Architecture</h2>
+<pre><code>HTTP Stream
+    │ POST /pkg.Service/Method  content-type: application/grpc
+    ▼
+GrpcHandlerFactory  (ServerHandlerFactory)
+    │ ProtoFile::get_rpc_by_path
+    ▼
+GrpcService::start_unary_call → ProtoMessageHandler
+    │
+    └── GrpcResponseChannel → framed response + grpc-status trailers</code></pre>
+<p>Client path: <code>GrpcClient::unary_call</code> → <code>GrpcUnaryCall</code> as <code>ClientHandlerFactory</code> for an HTTP client endpoint.</p>
+<h2 id="framing">Framing</h2>
+<table>
+<thead>
+<tr>
+<th>Type / const</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GrpcFrameParser&lt;H&gt;</code></td>
+<td>Incremental length-prefixed parser</td>
+</tr>
+<tr>
+<td><code>GrpcEventHandler</code></td>
+<td>Message callbacks</td>
+</tr>
+<tr>
+<td><code>frame(&amp;[u8]) -&gt; Vec&lt;u8&gt;</code></td>
+<td>Encode one message</td>
+</tr>
+<tr>
+<td><code>framed_size</code></td>
+<td>Size helper</td>
+</tr>
+<tr>
+<td><code>DEFAULT_MAX_MESSAGE_SIZE</code></td>
+<td><strong>4 MiB</strong></td>
+</tr>
+<tr>
+<td><code>GrpcFramingError</code></td>
+<td>Oversized / compressed / partial</td>
+</tr>
+</tbody>
+</table>
+<p>Compressed frames (flag ≠ 0) are <strong>rejected</strong>. Split-feed safe. <code>0</code> max size means unlimited except <code>u32::MAX</code>.</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_grpc::</span><span class="op">{</span>frame<span class="op">,</span> GrpcFrameParser<span class="op">};</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bytes <span class="op">=</span> frame(<span class="st">b&quot;protobuf-payload&quot;</span>)<span class="op">;</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co">// parser.receive(&amp;chunk) pushes complete messages to handler</span></span></code></pre></div>
+<h2 id="proto-model">Proto model</h2>
+<p>Build schemas at runtime — no <code>tonic</code>/<code>prost</code> codegen:</p>
+<table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 60%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ProtoFile</code> / <code>ProtoFileBuilder</code></td>
+<td>Package, syntax, messages, enums, services</td>
+</tr>
+<tr>
+<td><code>ProtoFileParser</code></td>
+<td>Parse <code>.proto</code> text</td>
+</tr>
+<tr>
+<td><code>MessageDescriptor</code> / <code>EnumDescriptor</code> / <code>FieldDescriptor</code> / <code>FieldType</code></td>
+<td>Schema</td>
+</tr>
+<tr>
+<td><code>ServiceDescriptor</code> / <code>RpcDescriptor</code></td>
+<td>RPC map</td>
+</tr>
+<tr>
+<td><code>ProtoMessageHandler</code> / <code>ProtoDefaultHandler</code></td>
+<td>Decode push events</td>
+</tr>
+<tr>
+<td><code>ProtoLocator</code> / <code>ScalarValue</code></td>
+<td>Field access</td>
+</tr>
+<tr>
+<td><code>ProtoModelAdapter</code> / <code>ProtoModelSerializer</code></td>
+<td>Encode helpers</td>
+</tr>
+<tr>
+<td><code>ProtoParseError</code></td>
+<td>Parse failures</td>
+</tr>
+</tbody>
+</table>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_grpc::proto::</span>ProtoFile<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> file <span class="op">=</span> <span class="pp">ProtoFile::</span>builder()</span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>    <span class="co">// .package(...).syntax(...).add_message(...).add_service(...)</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>build()<span class="op">;</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="co">// or: ProtoFileParser::parse(include_str!(&quot;hello.proto&quot;))?</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rpc <span class="op">=</span> file<span class="op">.</span>get_rpc_by_path(<span class="st">&quot;/helloworld.Greeter/SayHello&quot;</span>)<span class="op">;</span></span></code></pre></div>
+<h2 id="server-spi">Server SPI</h2>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> GrpcService<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> start_unary_call(</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>        path<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>        channel<span class="op">:</span> GrpcResponseChannel<span class="op">,</span></span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    ) <span class="op">-&gt;</span> <span class="dt">Option</span><span class="op">&lt;</span><span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtoMessageHandler<span class="op">&gt;&gt;;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="co">// Factory implements ServerHandlerFactory:</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a><span class="pp">GrpcHandlerFactory::</span>new(proto_file<span class="op">,</span> <span class="pp">Arc::</span>new(service))</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>factory<span class="op">.</span>set_max_message_size(<span class="dv">4</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span>)<span class="op">;</span></span></code></pre></div>
+<h3 id="responding">Responding</h3>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="co">// Inside handler after decoding request fields:</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> msg <span class="op">=</span> channel<span class="op">.</span>open_message(<span class="cn">None</span>)<span class="op">?;</span> <span class="co">// content-type optional</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a>msg<span class="op">.</span>field(<span class="st">&quot;message&quot;</span><span class="op">,</span> <span class="pp">ScalarValue::</span><span class="dt">String</span>(<span class="st">&quot;hello&quot;</span><span class="op">.</span>into()))<span class="op">;</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="co">// or msg.writer() / msg.serializer()</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>msg<span class="op">.</span>complete()<span class="op">?;</span></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="co">// Errors:</span></span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>channel<span class="op">.</span>send_error(<span class="dv">12</span><span class="op">,</span> <span class="st">&quot;UNIMPLEMENTED&quot;</span>)<span class="op">;</span></span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>channel<span class="op">.</span>send_error_cause(<span class="op">&amp;</span>err)<span class="op">;</span></span></code></pre></div>
+<p>Server maps protocol problems to HTTP <strong>415</strong> / <strong>404</strong> / <strong>400</strong>, or gRPC status in trailers. One response message per unary call (<code>response already sent</code> if repeated).</p>
 <h2 id="client">Client</h2>
-<p><code>GrpcClient::unary_call(path, unframed_request_bytes, handler)</code> produces a <code>ClientHandlerFactory</code> for Hopf HTTP dial.</p>
-<h2 id="example">Example</h2>
-<p><a href="cookbook/grpc.html">Cookbook: gRPC</a> (<code>examples/grpc</code>, package <code>grpc-echo</code>) — unary <code>demo.Echo/Say</code> over cleartext HTTP/2-capable <code>CleartextHttpEndpoint</code>.</p>
+<div class="sourceCode" id="cb6"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_grpc::</span>GrpcClient<span class="op">;</span></span>
+<span id="cb6-2"><a href="#cb6-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-3"><a href="#cb6-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> client <span class="op">=</span> <span class="pp">GrpcClient::</span>new(proto_file)<span class="op">;</span></span>
+<span id="cb6-4"><a href="#cb6-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> call <span class="op">=</span> client<span class="op">.</span>unary_call(</span>
+<span id="cb6-5"><a href="#cb6-5" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;/helloworld.Greeter/SayHello&quot;</span><span class="op">,</span></span>
+<span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    req_bytes<span class="op">,</span></span>
+<span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(MyResponseHandler)<span class="op">,</span></span>
+<span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>)<span class="op">;</span></span>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="co">// `call` is a ClientHandlerFactory — attach to H2/H1/H3 client endpoint</span></span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GrpcClient</code></td>
+<td>Holds <code>ProtoFile</code></td>
+</tr>
+<tr>
+<td><code>GrpcUnaryCall</code></td>
+<td><code>ClientHandlerFactory</code> for one call</td>
+</tr>
+<tr>
+<td><code>GrpcResponseHandler</code></td>
+<td>App callback for response / status</td>
+</tr>
+</tbody>
+</table>
+<p>Surfaces <code>grpc-status</code> from headers or trailers.</p>
+<h2 id="configuration">Configuration</h2>
+<table>
+<colgroup>
+<col style="width: 21%" />
+<col style="width: 21%" />
+<col style="width: 32%" />
+<col style="width: 25%" />
+</colgroup>
+<thead>
+<tr>
+<th>Knob</th>
+<th>Type</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Max message size</td>
+<td><code>u64</code></td>
+<td><code>4 MiB</code> (<code>DEFAULT_MAX_MESSAGE_SIZE</code>)</td>
+<td><code>GrpcHandlerFactory::set_max_message_size</code>; parser <code>set_max_message_size</code> (<code>0</code> ≈ unlimited)</td>
+</tr>
+<tr>
+<td>Schema</td>
+<td><code>ProtoFile</code></td>
+<td>caller</td>
+<td>Builder or parser</td>
+</tr>
+<tr>
+<td>Service</td>
+<td><code>Arc&lt;dyn GrpcService&gt;</code></td>
+<td>caller</td>
+<td>Path routing</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cargo-features">Cargo features</h3>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>(default)</td>
+<td>Unary gRPC</td>
+</tr>
+<tr>
+<td><code>integration</code></td>
+<td>Integration tests</td>
+</tr>
+</tbody>
+</table>
+<h2 id="examples">Examples</h2>
+<p>See <a href="cookbook/grpc.html">Cookbook: gRPC</a>.</p>
+<div class="sourceCode" id="cb7"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> grpc <span class="at">--</span> 127.0.0.1:8080</span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Package</th>
+<th>Demonstrates</th>
+<th>Knobs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/grpc</code></td>
+<td>Unary server demo</td>
+<td>arg1 = listen addr</td>
+</tr>
+</tbody>
+</table>
+<p>No environment variables.</p>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li><strong>Unary RPC only</strong> — no client / server / bidirectional streaming.</li>
+<li><strong>No message compression</strong> — compressed frames rejected.</li>
+<li><strong>No generated stubs</strong> — runtime <code>.proto</code> model only.</li>
+<li>H1 trailer support is limited (inherited from <code>hopf-http</code>); prefer H2/H3.</li>
+<li>One message per unary response enforced.</li>
+<li>Not a full Google gRPC stack (no interceptors, load balancing, etc.).</li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

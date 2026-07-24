@@ -13,5 +13,5 @@ product centre.
   `http-get --http3 --ca …`. Smoke:
   `cargo test -p hopf-http --features h3 h3_get_hello`
 
-Depends on `hopf-core` (and optionally `hopf-quic`). See workspace
-[PLAN.md](../../PLAN.md).
+Depends on `hopf-core` (and optionally `hopf-quic`). See
+[docs/http/overview.html](../../docs/http/overview.html).

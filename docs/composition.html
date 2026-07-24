@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,73 +60,276 @@
     <main class="main">
       <header>
         <h1>Composition</h1>
-        <p class="lead">Canonical Rust script surface (<a href="https://github.com/cpkb-bluezoo/hopf/issues/8">issue #8</a>). XML via tractrix desugars into the same builder.</p>
+        <p class="lead">Crate <code>hopf-core</code>: <code>Composition</code> is the canonical builder that starts a <code>Runtime</code> and applies listen/dial bindings. Declarative XML (via <a href="https://github.com/cpkb-bluezoo/tractrix">tractrix</a>) desugars into the same builder. Handler names resolve through a closed <code>CompositionRegistry</code> — not reflective DI.</p>
       </header>
-<h2 id="builder">Builder</h2>
-<pre><code class="language-rust">use hopf_core::{Composition, RuntimeConfig, TcpListenerConfig, TcpConnectorConfig};
-
-let comp = Composition::new(RuntimeConfig::default())
-    .telemetry(hook)                 // optional Arc&lt;dyn TelemetryHook&gt;
-    .listen_tcp(listen_cfg)
-    .dial_tcp(dial_cfg)              // applied after listens
-    .build()?;
-
-let addr = comp.primary_addr();
-let id = comp.bindings[0];
-comp.remove_binding(id);
-comp.shutdown();
-</code></pre>
-<p><code>build</code> starts the Runtime (with optional telemetry), registers queued listens (recording <code>BindingId</code>s and local addresses), then dials.</p>
-
-<h2 id="xml">XML (tractrix)</h2>
-<p>Declarative files use <strong>elements and attributes only</strong> (no character data). Naming mirrors the builder. Parsing is entirely through <a href="https://github.com/cpkb-bluezoo/tractrix">tractrix</a>.</p>
-<pre><code class="language-xml">&lt;composition worker-threads="4" storage-threads="4"&gt;
-  &lt;listen-tcp addr="127.0.0.1:0" handler="echo"
-              max-net-in="1048576" max-net-out="4194304"
-              idle-timeout-ms="60000"&gt;
-    &lt;allow cidr="10.0.0.0/8"/&gt;
-    &lt;deny cidr="192.0.2.0/24"/&gt;
-    &lt;rate-limit per-source="100" window-ms="1000" global="0"/&gt;
-  &lt;/listen-tcp&gt;
-  &lt;dial-tcp addr="127.0.0.1:8080" handler="echo"/&gt;
-&lt;/composition&gt;
-</code></pre>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#builder-api">Builder API</a></li>
+<li><a href="#compositionregistry">CompositionRegistry</a></li>
+<li><a href="#xml-from_xml">XML (from_xml)</a></li>
+<li><a href="#xml-attribute-map">XML attribute map</a></li>
+<li><a href="#binding-lifecycle">Binding lifecycle</a></li>
+<li><a href="#telemetry">Telemetry</a></li>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#see-also">See also</a></li>
+</ul></div>
+<h2 id="builder-api">Builder API</h2>
+<div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Composition<span class="op">,</span> RuntimeConfig<span class="op">,</span> TcpConnectorConfig<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> comp <span class="op">=</span> <span class="pp">Composition::</span>new(RuntimeConfig <span class="op">{</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    worker_threads<span class="op">:</span> <span class="dv">4</span><span class="op">,</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">..</span><span class="bu">Default</span><span class="pp">::</span><span class="kw">default</span>()</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)</span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="op">.</span>listen_tcp(<span class="pp">TcpListenerConfig::</span>new(listen_addr<span class="op">,</span> factory))</span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="op">.</span>dial_tcp(<span class="pp">TcpConnectorConfig::</span>new(peer_addr<span class="op">,</span> dial_factory))</span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="co">// .telemetry(hook)  // optional</span></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="op">.</span>build()<span class="op">?;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> primary <span class="op">=</span> comp<span class="op">.</span>primary_addr()<span class="op">;</span></span>
+<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="co">// later: comp.remove_binding(id); comp.shutdown();</span></span></code></pre></div>
 <table>
-<thead><tr><th>XML</th><th>Rust</th></tr></thead>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Method</th>
+<th>Effect</th>
+</tr>
+</thead>
 <tbody>
-<tr><td><code>&lt;composition&gt;</code></td><td><code>Composition::new(RuntimeConfig)</code></td></tr>
-<tr><td><code>worker-threads</code></td><td><code>RuntimeConfig::worker_threads</code></td></tr>
-<tr><td><code>storage-threads</code></td><td><code>StorageConfig::threads</code></td></tr>
-<tr><td><code>&lt;listen-tcp&gt;</code> / <code>&lt;dial-tcp&gt;</code></td><td><code>listen_tcp</code> / <code>dial_tcp</code></td></tr>
-<tr><td><code>handler</code></td><td>lookup in <code>CompositionRegistry</code></td></tr>
-<tr><td><code>&lt;allow&gt;</code> / <code>&lt;deny&gt;</code> / <code>&lt;rate-limit&gt;</code></td><td>ACL / accept rate limit on that listen</td></tr>
+<tr>
+<td><code>Composition::new(RuntimeConfig)</code></td>
+<td>Start of the builder</td>
+</tr>
+<tr>
+<td><code>telemetry(Arc&lt;dyn TelemetryHook&gt;)</code></td>
+<td>Passed to <code>Runtime::start_with_telemetry</code></td>
+</tr>
+<tr>
+<td><code>listen_tcp(TcpListenerConfig)</code></td>
+<td>Queue a listen binding</td>
+</tr>
+<tr>
+<td><code>dial_tcp(TcpConnectorConfig)</code></td>
+<td>Queue a dial</td>
+</tr>
+<tr>
+<td><code>from_xml</code> / <code>from_xml_str</code> / <code>from_xml_path</code></td>
+<td>Parse XML into a builder (needs registry)</td>
+</tr>
+<tr>
+<td><code>build()</code></td>
+<td>Start runtime, apply bindings → <code>CompositionRuntime</code></td>
+</tr>
 </tbody>
 </table>
-<p><code>handler="…"</code> is <strong>not</strong> a <code>Service</code> or HTTP Stream handler name. It resolves a closed registry of connection-level <code>HandlerFactory</code> values (<code>Fn() -&gt; Box&lt;dyn ProtocolHandler&gt;</code>). Register pre-wired stacks in Rust before load — no reflective DI.</p>
-<pre><code class="language-rust">use std::sync::Arc;
-use hopf_core::{Composition, CompositionRegistry, ProtocolHandler};
-
-let mut reg = CompositionRegistry::new();
-reg.register("echo", Arc::new(|| Box::new(Echo) as Box&lt;dyn ProtocolHandler&gt;));
-// HTTP: register CleartextHttpEndpoint / AlpnHttpEndpoint under a short name.
-
-let comp = Composition::from_xml_str(xml, &amp;reg)?
-    .telemetry(hook)   // optional; not expressed in XML v1
-    .build()?;
-</code></pre>
-<p>Also: <code>Composition::from_xml</code>, <code>from_xml_path</code>. TLS / <code>secure</code> attributes are rejected in v1 (wire TLS in the registered factory or Rust builder).</p>
-
+<p><code>CompositionRuntime</code> methods: <code>primary_addr()</code>, <code>remove_binding(BindingId)</code>, <code>shutdown(self)</code>.</p>
+<h2 id="compositionregistry">CompositionRegistry</h2>
+<p><code>handler="…"</code> in XML (and conceptual names in docs) is <strong>not</strong> a <code>Service</code> or HTTP Stream handler name. It resolves a closed map of connection-level <code>HandlerFactory</code> values (<code>Fn() -&gt; Box&lt;dyn ProtocolHandler&gt;</code>).</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Composition<span class="op">,</span> CompositionRegistry<span class="op">,</span> ProtocolHandler<span class="op">};</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> reg <span class="op">=</span> <span class="pp">CompositionRegistry::</span>new()<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>reg<span class="op">.</span>register(<span class="st">&quot;echo&quot;</span><span class="op">,</span> <span class="pp">Arc::</span>new(<span class="op">||</span> <span class="dt">Box</span><span class="pp">::</span>new(Echo) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span>))<span class="op">;</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="co">// HTTP: register CleartextHttpEndpoint / AlpnHttpEndpoint under a short name.</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> xml <span class="op">=</span> <span class="st">r#&quot;&lt;composition worker-threads=&quot;2&quot;&gt;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="st">  &lt;listen-tcp addr=&quot;127.0.0.1:0&quot; handler=&quot;echo&quot;/&gt;</span></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="st">&lt;/composition&gt;&quot;#</span><span class="op">;</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> comp <span class="op">=</span> <span class="pp">Composition::</span>from_xml_str(xml<span class="op">,</span> <span class="op">&amp;</span>reg)<span class="op">?.</span>build()<span class="op">?;</span></span></code></pre></div>
+<p>Register pre-wired stacks in Rust before load. Unknown <code>handler</code> names fail parse/build with <code>CompositionXmlError</code>.</p>
+<h2 id="xml-from_xml">XML (from_xml)</h2>
+<p>Declarative files use <strong>elements and attributes only</strong> (no character data). Naming mirrors the Rust builder. Parsing is entirely through tractrix.</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode xml"><code class="sourceCode xml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>&lt;<span class="kw">composition</span> <span class="ot">worker-threads=</span><span class="st">&quot;4&quot;</span> <span class="ot">storage-threads=</span><span class="st">&quot;4&quot;</span>&gt;</span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">listen-tcp</span> <span class="ot">addr=</span><span class="st">&quot;127.0.0.1:0&quot;</span> <span class="ot">handler=</span><span class="st">&quot;echo&quot;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a>              <span class="ot">max-net-in=</span><span class="st">&quot;1048576&quot;</span> <span class="ot">max-net-out=</span><span class="st">&quot;4194304&quot;</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>              <span class="ot">idle-timeout-ms=</span><span class="st">&quot;60000&quot;</span>&gt;</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">allow</span> <span class="ot">cidr=</span><span class="st">&quot;10.0.0.0/8&quot;</span>/&gt;</span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">deny</span> <span class="ot">cidr=</span><span class="st">&quot;192.0.2.0/24&quot;</span>/&gt;</span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    &lt;<span class="kw">rate-limit</span> <span class="ot">per-source=</span><span class="st">&quot;100&quot;</span> <span class="ot">window-ms=</span><span class="st">&quot;1000&quot;</span> <span class="ot">global=</span><span class="st">&quot;0&quot;</span>/&gt;</span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>  &lt;/<span class="kw">listen-tcp</span>&gt;</span>
+<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>  &lt;<span class="kw">dial-tcp</span> <span class="ot">addr=</span><span class="st">&quot;127.0.0.1:8080&quot;</span> <span class="ot">handler=</span><span class="st">&quot;echo&quot;</span>/&gt;</span>
+<span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a>&lt;/<span class="kw">composition</span>&gt;</span></code></pre></div>
+<table>
+<colgroup>
+<col style="width: 45%" />
+<col style="width: 54%" />
+</colgroup>
+<thead>
+<tr>
+<th>XML</th>
+<th>Rust</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&lt;composition&gt;</code></td>
+<td><code>Composition::new(RuntimeConfig)</code></td>
+</tr>
+<tr>
+<td><code>worker-threads</code></td>
+<td><code>RuntimeConfig::worker_threads</code></td>
+</tr>
+<tr>
+<td><code>storage-threads</code></td>
+<td><code>StorageConfig::threads</code></td>
+</tr>
+<tr>
+<td><code>&lt;listen-tcp&gt;</code> / <code>&lt;dial-tcp&gt;</code></td>
+<td><code>listen_tcp</code> / <code>dial_tcp</code></td>
+</tr>
+<tr>
+<td><code>handler</code></td>
+<td>Lookup in <code>CompositionRegistry</code></td>
+</tr>
+<tr>
+<td><code>&lt;allow&gt;</code> / <code>&lt;deny&gt;</code> / <code>&lt;rate-limit&gt;</code></td>
+<td>ACL / accept rate limit on that listen</td>
+</tr>
+</tbody>
+</table>
+<p>Also: <code>Composition::from_xml(bytes, &amp;registry)</code>, <code>from_xml_path(path, &amp;registry)</code>.</p>
+<h2 id="xml-attribute-map">XML attribute map</h2>
+<h3 id="composition"><code>&lt;composition&gt;</code></h3>
+<table>
+<colgroup>
+<col style="width: 42%" />
+<col style="width: 23%" />
+<col style="width: 34%" />
+</colgroup>
+<thead>
+<tr>
+<th>Attribute</th>
+<th>Type</th>
+<th>Maps to</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>worker-threads</code></td>
+<td><code>usize</code></td>
+<td><code>RuntimeConfig::worker_threads</code> (<code>0</code> → auto)</td>
+</tr>
+<tr>
+<td><code>storage-threads</code></td>
+<td><code>usize</code></td>
+<td><code>StorageConfig::threads</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="listen-tcp-dial-tcp"><code>&lt;listen-tcp&gt;</code> / <code>&lt;dial-tcp&gt;</code></h3>
+<table>
+<thead>
+<tr>
+<th>Attribute</th>
+<th>Type</th>
+<th>Maps to</th>
+<th>Default (Rust)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>addr</code></td>
+<td>socket addr string</td>
+<td>bind / peer</td>
+<td>required</td>
+</tr>
+<tr>
+<td><code>handler</code></td>
+<td>registry name</td>
+<td><code>HandlerFactory</code></td>
+<td>required</td>
+</tr>
+<tr>
+<td><code>max-net-in</code></td>
+<td><code>usize</code></td>
+<td>buffer cap</td>
+<td><code>1 MiB</code></td>
+</tr>
+<tr>
+<td><code>max-net-out</code></td>
+<td><code>usize</code></td>
+<td>buffer cap</td>
+<td><code>4 MiB</code></td>
+</tr>
+<tr>
+<td><code>idle-timeout-ms</code></td>
+<td><code>u64</code> ms</td>
+<td><code>idle_timeout</code></td>
+<td>unset / <code>None</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="children-of-listen-tcp">Children of <code>&lt;listen-tcp&gt;</code></h3>
+<table>
+<colgroup>
+<col style="width: 30%" />
+<col style="width: 40%" />
+<col style="width: 30%" />
+</colgroup>
+<thead>
+<tr>
+<th>Element</th>
+<th>Attributes</th>
+<th>Maps to</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>&lt;allow&gt;</code></td>
+<td><code>cidr</code></td>
+<td><code>PeerAcl.allow</code></td>
+</tr>
+<tr>
+<td><code>&lt;deny&gt;</code></td>
+<td><code>cidr</code></td>
+<td><code>PeerAcl.deny</code> (deny wins)</td>
+</tr>
+<tr>
+<td><code>&lt;rate-limit&gt;</code></td>
+<td><code>per-source</code>, <code>window-ms</code>, <code>global</code></td>
+<td><code>AcceptRateLimit</code> (<code>0</code> = unlimited axis)</td>
+</tr>
+</tbody>
+</table>
+<p>TLS / <code>secure</code> attributes are <strong>rejected in v1</strong>. Wire TLS inside the registered factory or use the Rust builder (<code>TcpListenerConfig::with_tls</code>).</p>
+<p>Telemetry is <strong>not</strong> expressed in XML v1 — call <code>.telemetry(hook)</code> on the builder after <code>from_xml_*</code>.</p>
 <h2 id="binding-lifecycle">Binding lifecycle</h2>
+<ol type="1">
+<li><strong>Add</strong> — <code>Composition::listen_tcp</code> / <code>Runtime::add_tcp_listener</code> → <code>(SocketAddr, BindingId)</code>. Port <code>0</code> yields an ephemeral local address.</li>
+<li><strong>Run</strong> — accept loop registers the mio listener; each accept round-robins onto a worker reactor (affinity for life).</li>
+<li><strong>Remove</strong> — <code>CompositionRuntime::remove_binding</code> / <code>Runtime::remove_binding</code>. The accept loop deregisters the listener; <strong>existing connections keep affinity until close</strong>.</li>
+<li><strong>Shutdown</strong> — <code>CompositionRuntime::shutdown</code> / <code>Runtime::shutdown</code> tears down workers, accept loop, and storage.</li>
+</ol>
+<p>Trust policies and DNS caches attach at the protocol layer (e.g. HTTP <code>BasicAuthFactory</code>, <code>DnsResolver</code>), not as core Composition fields — core stays free of HTTP/auth types.</p>
+<h2 id="telemetry">Telemetry</h2>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>Composition<span class="op">;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// hook: Arc&lt;dyn TelemetryHook&gt; from hopf-otel TelemetryPipeline::hook()</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> comp <span class="op">=</span> <span class="pp">Composition::</span>from_xml_str(xml<span class="op">,</span> <span class="op">&amp;</span>reg)<span class="op">?</span></span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>telemetry(hook)</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>build()<span class="op">?;</span></span></code></pre></div>
+<p>See <a href="runtime-options.html">runtime-options.md</a> and <a href="telemetry.html">telemetry.md</a>.</p>
+<h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>Add</strong> — <code>Composition::listen_tcp</code> or <code>Runtime::add_tcp_listener</code> → <code>(SocketAddr, BindingId)</code></li>
-<li><strong>Remove</strong> — <code>CompositionRuntime::remove_binding</code> / <code>Runtime::remove_binding</code></li>
-<li>Accept loop deregisters the mio listener; existing connections keep affinity until close</li>
+<li>Closed registry only — no dynamic plugin loading.</li>
+<li>XML v1 has no TLS / secure / telemetry attributes.</li>
+<li><code>idle_timeout</code> is only partially wired on the datapath (Tranche 1) — see <a href="runtime-options.html">runtime-options.md</a>.</li>
+<li>QUIC / H3 bindings are not Composition XML elements; use <code>listen_h3</code> / <code>RuntimeQuicExt</code> in Rust.</li>
 </ul>
-<p>Trust policies and DNS caches attach at the protocol layer (e.g. HTTP <code>BasicAuthFactory</code>, <code>DnsResolver</code>), not as core Composition fields — core stays free of HTTP/auth types.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="runtime-options.html">Runtime options</a></li>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+<li><a href="access-control.html">Access control</a></li>
+</ul>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>

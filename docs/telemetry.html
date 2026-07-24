@@ -12,6 +12,7 @@
 <body>
   <div class="layout">
     <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
 <a class="brand" href="index.html">Hopf</a>
 <p class="tag">Networking framework reference</p>
 <h2>Start</h2><ul>
@@ -59,74 +60,306 @@
     <main class="main">
       <header>
         <h1>Telemetry</h1>
-        <p class="lead">Connection hooks enqueue logs; HTTP request traces and metrics attach at the Stream handler — like Gumdrop.</p>
+        <p class="lead">Crate <code>hopf-otel</code>: OpenTelemetry-style <strong>exporters</strong> and HTTP Stream instrumentation. Hot-path methods only <strong>enqueue</strong>; encoding and I/O run on a dedicated export worker (never on accept or reactor threads). Own <code>VERSION</code>. Connection-level hooks implement <code>hopf_core::TelemetryHook</code>; per-request traces/metrics wrap HTTP <code>ServerHandlerFactory</code>.</p>
       </header>
-      <h2 id="telemetryhook">TelemetryHook (connections)</h2>
-<pre><code class="language-rust">pub trait TelemetryHook: Send + Sync {
-    fn on_accept(&amp;self, peer: SocketAddr) {}
-    fn on_dial(&amp;self, peer: SocketAddr) {}
-    fn on_close(&amp;self, peer: SocketAddr) {}
-    fn on_error(&amp;self, peer: Option&lt;SocketAddr&gt;, msg: &amp;str) {}
-}
-</code></pre>
-<p>Attach via <code>Runtime::start_with_telemetry</code> or <code>Composition::telemetry</code>. Accept path reports ACL/rate-limit denials through <code>on_error</code>; connections call <code>on_close</code> / <code>on_error</code> on teardown.</p>
-<p><code>NopTelemetry</code> discards everything. Hook implementations must <strong>not</strong> perform I/O on the accept or reactor threads.</p>
-
-      <h2 id="http-instrumentation">HTTP request traces &amp; metrics</h2>
-<p>Instrument at the <code>ServerHandler</code> layer with <code>InstrumentedServerFactory</code> — not at TCP accept. Config flags <code>traces_enabled</code> / <code>metrics_enabled</code> mirror Gumdrop <code>TelemetryConfig</code>.</p>
-<pre><code class="language-rust">use std::sync::Arc;
-use hopf_otel::{InstrumentedServerFactory, OtelConfig, TelemetryPipeline};
-
-let pipeline = TelemetryPipeline::start(
-    OtelConfig::new("my-service")
-        .with_otlp_endpoint("http://127.0.0.1:4318")
-        .with_traces(true)
-        .with_metrics(true),
-)?;
-
-let app: Arc&lt;dyn ServerHandlerFactory&gt; = Arc::new(HelloFactory);
-let factory = Arc::new(InstrumentedServerFactory::new(app, &amp;pipeline));
-// pass `factory` to CleartextHttpEndpoint / AlpnHttpEndpoint / …
-
-let rt = Runtime::start_with_telemetry(config, Some(pipeline.hook()))?;
-</code></pre>
-<p>Per request the factory:</p>
+      <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
-<li>continues from inbound <code>traceparent</code> (or starts a new SERVER span named <code>HTTP {method}</code>)</li>
-<li>injects response <code>traceparent</code></li>
-<li>records <code>http.server.requests</code>, <code>active_requests</code>, <code>request.duration</code>, sizes</li>
-</ul>
-<p>Handlers read the active context with <code>ServerWriter::traceparent()</code> and pass it to outbound clients:</p>
-<pre><code class="language-rust">fn headers(&amp;mut self, response: &amp;mut dyn ServerWriter, headers: &amp;Headers) {
-    let tp = response.traceparent().map(str::to_owned);
-    // … later, when writing an outbound request:
-    // let mut req = with_traceparent(client_writer, tp.as_deref());
-    // req.headers(outbound_headers);
-}
-</code></pre>
-<p>Helpers: <code>inject_traceparent</code>, <code>with_traceparent</code>, <code>with_trace</code> (Gumdrop <code>HTTPClient.setTrace</code> parity).</p>
-
-      <h2 id="hopf-otel">hopf-otel exporters</h2>
-<p>Crate <code>hopf-otel</code> provides <code>TelemetryPipeline</code>:</p>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#connection-telemetryhook">Connection TelemetryHook</a></li>
+<li><a href="#http-instrumentation">HTTP instrumentation</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#propagation">Propagation</a></li>
+<li><a href="#wiring">Wiring</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="standards">Standards</h2>
+<table>
+<colgroup>
+<col style="width: 46%" />
+<col style="width: 53%" />
+</colgroup>
+<thead>
+<tr>
+<th>Topic</th>
+<th>Detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OTLP/HTTP</td>
+<td>Protobuf to <code>/v1/logs</code>, <code>/v1/traces</code>, <code>/v1/metrics</code></td>
+</tr>
+<tr>
+<td>W3C Trace Context</td>
+<td><code>traceparent</code> = <code>00-&lt;32hex trace&gt;-&lt;16hex span&gt;-&lt;flags&gt;</code></td>
+</tr>
+<tr>
+<td>JSONL</td>
+<td>Optional file sinks</td>
+</tr>
+<tr>
+<td>Semconv</td>
+<td><code>http.method</code>, <code>http.target</code>, <code>http.host</code>, <code>http.scheme</code>, <code>http.status_code</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="architecture">Architecture</h2>
+<pre><code>Accept / dial / close     HTTP ServerHandler
+        │                         │
+        ▼                         ▼
+TelemetryHook enqueue    InstrumentedServerFactory
+        │                  (SERVER span + RED metrics)
+        └──────────► TelemetryPipeline export worker
+                          │
+                          ├── OTLP HTTP endpoints
+                          └── JSONL files</code></pre>
+<h2 id="connection-telemetryhook">Connection TelemetryHook</h2>
+<p>Core trait (implemented / adapted by the pipeline):</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> TelemetryHook<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_accept(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> SocketAddr) <span class="op">{}</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_dial(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> SocketAddr) <span class="op">{}</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_close(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> SocketAddr) <span class="op">{}</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_error(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;</span>SocketAddr<span class="op">&gt;,</span> msg<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>) <span class="op">{}</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p>Attach via <code>Runtime::start_with_telemetry</code> or <code>Composition::telemetry</code>. ACL / rate-limit denials report through <code>on_error</code>. <code>NopTelemetry</code> discards everything.</p>
+<p><strong>Implementations must not perform I/O on accept or reactor threads.</strong></p>
+<p>Events: <code>TelemetryEvent</code> / <code>EventKind::{Accept,Dial,Close,Error}</code>.</p>
+<h2 id="http-instrumentation">HTTP instrumentation</h2>
+<p>Instrument at the <strong>Stream handler</strong> layer — not at TCP accept:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>InstrumentedServerFactory</code></td>
+<td>Wraps <code>ServerHandlerFactory</code></td>
+</tr>
+<tr>
+<td><code>HttpServerMetrics</code></td>
+<td>RED-style counters/gauges</td>
+</tr>
+<tr>
+<td><code>MetricPoint</code></td>
+<td>Counter / UpDown / …</td>
+</tr>
+<tr>
+<td><code>RequestTimer</code></td>
+<td>Latency</td>
+</tr>
+<tr>
+<td><code>Trace</code> / <code>Span</code> / <code>FinishedSpan</code> / <code>SpanContext</code></td>
+<td>Tracing</td>
+</tr>
+<tr>
+<td><code>SpanKind</code> / <code>SpanStatusCode</code></td>
+<td>Span metadata</td>
+</tr>
+<tr>
+<td><code>ExportHandle</code></td>
+<td>Enqueue handle</td>
+</tr>
+</tbody>
+</table>
+<p>Flags <code>traces_enabled</code> / <code>metrics_enabled</code> mirror Gumdrop-style toggles.</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_otel::</span><span class="op">{</span>InstrumentedServerFactory<span class="op">,</span> OtelConfig<span class="op">,</span> TelemetryPipeline<span class="op">};</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> pipeline <span class="op">=</span> <span class="pp">TelemetryPipeline::</span>start(</span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="pp">OtelConfig::</span>new(<span class="st">&quot;echo&quot;</span>)<span class="op">.</span>with_otlp_endpoint(<span class="st">&quot;http://127.0.0.1:4318&quot;</span>)<span class="op">,</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> factory <span class="op">=</span> <span class="pp">InstrumentedServerFactory::</span>new(inner_factory<span class="op">,</span> <span class="op">&amp;</span>pipeline)<span class="op">;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="co">// or: InstrumentedServerFactory::with_parts(inner, export, metrics, traces_enabled)</span></span></code></pre></div>
+<h2 id="configuration">Configuration</h2>
+<h3 id="otelconfig"><code>OtelConfig</code></h3>
+<table>
+<colgroup>
+<col style="width: 31%" />
+<col style="width: 18%" />
+<col style="width: 28%" />
+<col style="width: 21%" />
+</colgroup>
+<thead>
+<tr>
+<th>Property</th>
+<th>Type</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>service_name</code></td>
+<td><code>String</code></td>
+<td><code>"hopf"</code> (<code>new(name)</code> sets it)</td>
+<td>Resource</td>
+</tr>
+<tr>
+<td><code>service_version</code></td>
+<td><code>Option&lt;String&gt;</code></td>
+<td><code>None</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>service_namespace</code></td>
+<td><code>Option&lt;String&gt;</code></td>
+<td><code>None</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>batch_size</code></td>
+<td>usize</td>
+<td><code>64</code></td>
+<td>Export batch</td>
+</tr>
+<tr>
+<td><code>flush_interval</code></td>
+<td>duration</td>
+<td><code>5s</code></td>
+<td>Background flush</td>
+</tr>
+<tr>
+<td><code>queue_capacity</code></td>
+<td>usize</td>
+<td><code>4096</code></td>
+<td>Overflow <strong>drops</strong></td>
+</tr>
+<tr>
+<td><code>traces_enabled</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>metrics_enabled</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>logs_enabled</code></td>
+<td><code>bool</code></td>
+<td><code>true</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>otlp_logs_endpoint</code></td>
+<td><code>Option&lt;…&gt;</code></td>
+<td><code>None</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>otlp_traces_endpoint</code></td>
+<td><code>Option&lt;…&gt;</code></td>
+<td><code>None</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>otlp_metrics_endpoint</code></td>
+<td><code>Option&lt;…&gt;</code></td>
+<td><code>None</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>jsonl_logs_path</code></td>
+<td><code>Option&lt;…&gt;</code></td>
+<td><code>None</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>jsonl_traces_path</code></td>
+<td><code>Option&lt;…&gt;</code></td>
+<td><code>None</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>jsonl_metrics_path</code></td>
+<td><code>Option&lt;…&gt;</code></td>
+<td><code>None</code></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Builders:</strong> <code>with_otlp_endpoint(base)</code> (derives the three <code>/v1/*</code> URLs), <code>with_otlp_logs</code>, <code>with_jsonl_logs</code> / <code>with_jsonl_traces</code> / <code>with_jsonl_metrics</code>, <code>with_traces(bool)</code>, <code>with_metrics(bool)</code>, <code>has_sink()</code>.</p>
+<p><code>TelemetryPipeline::start</code> validates OTLP URLs and <strong>errors</strong> if no sink is configured or a URL is bad.</p>
+<p>No Cargo features.</p>
+<h2 id="propagation">Propagation</h2>
+<table>
+<colgroup>
+<col style="width: 45%" />
+<col style="width: 54%" />
+</colgroup>
+<thead>
+<tr>
+<th>API</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>inject_trace</code> / <code>inject_traceparent</code></td>
+<td>Write into <code>Headers</code></td>
+</tr>
+<tr>
+<td><code>with_trace</code> / <code>with_traceparent</code></td>
+<td>Wrap <code>ClientWriter</code></td>
+</tr>
+<tr>
+<td><code>PropagatingClientWriter</code> / <code>OwnedPropagatingClientWriter</code></td>
+<td>Outbound</td>
+</tr>
+<tr>
+<td><code>Trace::from_traceparent</code></td>
+<td>Continue inbound context</td>
+</tr>
+<tr>
+<td><code>trace.traceparent()</code></td>
+<td>Serialize current</td>
+</tr>
+</tbody>
+</table>
+<p>HTTP writers may also expose <code>traceparent()</code> for response continuation (<a href="http/overview.html">HTTP overview</a>).</p>
+<h2 id="wiring">Wiring</h2>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Runtime<span class="op">,</span> RuntimeConfig<span class="op">};</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_otel::</span><span class="op">{</span>OtelConfig<span class="op">,</span> TelemetryPipeline<span class="op">};</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> pipeline <span class="op">=</span> <span class="pp">TelemetryPipeline::</span>start(</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="pp">OtelConfig::</span>new(<span class="st">&quot;my-service&quot;</span>)</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>        <span class="op">.</span>with_otlp_endpoint(<span class="st">&quot;http://127.0.0.1:4318&quot;</span>)<span class="op">,</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Runtime::</span>start_with_telemetry(</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="pp">RuntimeConfig::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="cn">Some</span>(pipeline<span class="op">.</span>hook())<span class="op">,</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a><span class="co">// HTTP:</span></span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> instrumented <span class="op">=</span> <span class="pp">InstrumentedServerFactory::</span>new(app_factory<span class="op">,</span> <span class="op">&amp;</span>pipeline)<span class="op">;</span></span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="co">// Later:</span></span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>pipeline<span class="op">.</span>flush()<span class="op">;</span></span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>pipeline<span class="op">.</span>shutdown()<span class="op">;</span></span></code></pre></div>
+<p>Accessors: <code>pipeline.hook()</code>, <code>pipeline.http_metrics()</code>, <code>pipeline.export_handle()</code>.</p>
+<h2 id="examples">Examples</h2>
+<p>No standalone example crate. README-style snippet:</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="pp">OtelConfig::</span>new(<span class="st">&quot;echo&quot;</span>)<span class="op">.</span>with_otlp_endpoint(<span class="st">&quot;http://127.0.0.1:4318&quot;</span>)</span></code></pre></div>
+<p>Use with any HTTP cookbook page (<a href="cookbook/http-hello-get.html">HTTP hello / get</a>) by wrapping the server factory.</p>
+<h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>OTLP/HTTP</strong> — batched protobuf POST to <code>/v1/logs</code>, <code>/v1/traces</code>, <code>/v1/metrics</code></li>
-<li><strong>JSONL</strong> — OTLP JSON Lines file appenders per signal</li>
+<li>Traces/metrics attach at the <strong>HTTP Stream</strong> handler — not every TCP accept beyond connection hooks.</li>
+<li>Bounded queue <strong>drops</strong> on overflow.</li>
+<li><code>flush()</code> sleeps ~50 ms to let the worker drain.</li>
+<li>OTLP is <strong>HTTP/protobuf only</strong> (no gRPC OTLP exporter).</li>
+<li>Metrics limited to HTTP server RED + connection up/down events.</li>
+<li>FTP/SMTP do not get automatic request spans from this crate.</li>
 </ul>
-<pre><code class="language-rust">use hopf_otel::{OtelConfig, TelemetryPipeline};
-
-let pipeline = TelemetryPipeline::start(
-    OtelConfig::new("my-service")
-        .with_otlp_endpoint("http://127.0.0.1:4318")
-        .with_jsonl_logs("/var/log/hopf/logs.jsonl")
-        .with_jsonl_traces("/var/log/hopf/traces.jsonl")
-        .with_jsonl_metrics("/var/log/hopf/metrics.jsonl"),
-)?;
-</code></pre>
-<p>Events are queued with a bounded channel (overflow drops). Encoding and network/file I/O happen only on the <code>hopf-otel-export</code> thread.</p>
 
       <p class="footer">
-        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
-        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
       </p>
     </main>
