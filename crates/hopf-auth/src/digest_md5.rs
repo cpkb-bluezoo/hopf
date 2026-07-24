@@ -1,0 +1,234 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+//! SASL DIGEST-MD5 (RFC 2831) — deprecated but retained for Gumdrop parity.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::crypto::{ct_eq_hex, generate_nonce_hex, md5_hex};
+use crate::mechanism::SaslMechanism;
+use crate::session::{SaslClient, SaslClientStep, SaslServer, SaslServerStep};
+use crate::store::CredentialStore;
+
+/// Parse `key=value` DIGEST parameter list.
+pub fn parse_params(response: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    let mut key = String::new();
+    let mut value = String::new();
+    let mut in_quote = false;
+    let mut in_value = false;
+    let chars: Vec<char> = response.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_quote {
+            if c == '"' {
+                in_quote = false;
+            } else if c == '\\' && i + 1 < chars.len() {
+                i += 1;
+                value.push(chars[i]);
+            } else {
+                value.push(c);
+            }
+        } else if c == '"' {
+            in_quote = true;
+        } else if c == '=' {
+            in_value = true;
+        } else if c == ',' {
+            params.insert(key.trim().to_string(), value.clone());
+            key.clear();
+            value.clear();
+            in_value = false;
+        } else if in_value {
+            value.push(c);
+        } else {
+            key.push(c);
+        }
+        i += 1;
+    }
+    if !key.is_empty() {
+        params.insert(key.trim().to_string(), value);
+    }
+    params
+}
+
+/// `MD5(username:realm:password)` hex.
+pub fn compute_ha1(username: &str, realm: &str, password: &str) -> String {
+    md5_hex(format!("{username}:{realm}:{password}").as_bytes())
+}
+
+/// Verify client response; returns `rspauth` hex on success (Gumdrop parity: md5-sess with hex HA1).
+pub fn verify_client_response(
+    ha1_hex: &str,
+    server_nonce: &str,
+    params: &HashMap<String, String>,
+) -> Option<String> {
+    let client_nonce = params.get("nonce")?;
+    let nc = params.get("nc")?;
+    let cnonce = params.get("cnonce")?;
+    let qop = params.get("qop")?;
+    let digest_uri = params.get("digest-uri")?;
+    let client_response = params.get("response")?;
+    if client_nonce != server_nonce {
+        return None;
+    }
+    // Gumdrop: session HA1 = MD5( hex(HA1) + ":" + nonce + ":" + cnonce )
+    let session_ha1 = md5_hex(format!("{ha1_hex}:{server_nonce}:{cnonce}").as_bytes());
+    let ha2 = md5_hex(format!("AUTHENTICATE:{digest_uri}").as_bytes());
+    let expected = md5_hex(
+        format!("{session_ha1}:{server_nonce}:{nc}:{cnonce}:{qop}:{ha2}").as_bytes(),
+    );
+    if !ct_eq_hex(client_response, &expected) {
+        return None;
+    }
+    let rsp_ha2 = md5_hex(format!(":{digest_uri}").as_bytes());
+    Some(md5_hex(
+        format!("{session_ha1}:{server_nonce}:{nc}:{cnonce}:{qop}:{rsp_ha2}").as_bytes(),
+    ))
+}
+
+/// Generate DIGEST-MD5 server challenge (ready for Base64 on the wire).
+pub fn generate_challenge(realm: &str, nonce: &str) -> String {
+    format!("realm=\"{realm}\",nonce=\"{nonce}\",qop=\"auth\",charset=utf-8,algorithm=md5-sess")
+}
+
+pub(crate) struct DigestMd5Server {
+    store: Arc<dyn CredentialStore>,
+    realm: String,
+    nonce: String,
+    sent: bool,
+}
+
+impl DigestMd5Server {
+    pub fn new(store: Arc<dyn CredentialStore>, realm: String) -> Self {
+        Self {
+            store,
+            realm,
+            nonce: generate_nonce_hex(16),
+            sent: false,
+        }
+    }
+}
+
+impl SaslServer for DigestMd5Server {
+    fn mechanism(&self) -> SaslMechanism {
+        SaslMechanism::DigestMd5
+    }
+
+    fn server_first(&self) -> bool {
+        true
+    }
+
+    fn step(&mut self, client_response: Option<&[u8]>) -> SaslServerStep {
+        if !self.sent {
+            self.sent = true;
+            let ch = generate_challenge(&self.realm, &self.nonce);
+            return SaslServerStep::Challenge(ch.into_bytes());
+        }
+        let Some(raw) = client_response else {
+            return SaslServerStep::Failure;
+        };
+        let text = String::from_utf8_lossy(raw);
+        let params = parse_params(&text);
+        let Some(username) = params.get("username").cloned() else {
+            return SaslServerStep::Failure;
+        };
+        let Some(ha1) = self.store.digest_ha1(&username, &self.realm) else {
+            return SaslServerStep::Failure;
+        };
+        match verify_client_response(&ha1, &self.nonce, &params) {
+            Some(rspauth) => SaslServerStep::Complete {
+                username,
+                final_message: Some(format!("rspauth={rspauth}").into_bytes()),
+            },
+            None => SaslServerStep::Failure,
+        }
+    }
+}
+
+pub(crate) struct DigestMd5Client {
+    username: String,
+    password: String,
+    host: String,
+    complete: bool,
+}
+
+impl DigestMd5Client {
+    pub fn new(username: &str, password: &str, host: &str) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+            host: host.into(),
+            complete: false,
+        }
+    }
+}
+
+impl SaslClient for DigestMd5Client {
+    fn mechanism(&self) -> SaslMechanism {
+        SaslMechanism::DigestMd5
+    }
+
+    fn has_initial_response(&self) -> bool {
+        false
+    }
+
+    fn evaluate(&mut self, challenge: Option<&[u8]>) -> SaslClientStep {
+        let Some(ch) = challenge else {
+            return SaslClientStep::Failure;
+        };
+        let text = String::from_utf8_lossy(ch);
+        // Ignore rspauth final
+        if text.starts_with("rspauth=") {
+            self.complete = true;
+            return SaslClientStep::Complete(Vec::new());
+        }
+        let params = parse_params(&text);
+        let realm = params
+            .get("realm")
+            .cloned()
+            .unwrap_or_else(|| "hopf".into());
+        let nonce = match params.get("nonce") {
+            Some(n) => n.clone(),
+            None => return SaslClientStep::Failure,
+        };
+        let cnonce = generate_nonce_hex(8);
+        let nc = "00000001";
+        let qop = "auth";
+        let digest_uri = format!("smtp/{}", self.host);
+        let ha1 = compute_ha1(&self.username, &realm, &self.password);
+        let session_ha1 = md5_hex(format!("{ha1}:{nonce}:{cnonce}").as_bytes());
+        let ha2 = md5_hex(format!("AUTHENTICATE:{digest_uri}").as_bytes());
+        let response = md5_hex(
+            format!("{session_ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}").as_bytes(),
+        );
+        let msg = format!(
+            "username=\"{}\",realm=\"{realm}\",nonce=\"{nonce}\",cnonce=\"{cnonce}\",nc={nc},qop={qop},digest-uri=\"{digest_uri}\",response={response},charset=utf-8",
+            self.username
+        );
+        self.complete = true;
+        SaslClientStep::Complete(msg.into_bytes())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_params_quotes_and_escapes() {
+        let m = parse_params(r#"username="a\"b",realm=r,nonce="n""#);
+        assert_eq!(m.get("username").map(String::as_str), Some(r#"a"b"#));
+        assert_eq!(m.get("realm").map(String::as_str), Some("r"));
+        assert_eq!(m.get("nonce").map(String::as_str), Some("n"));
+        let ha1 = compute_ha1("u", "realm", "p");
+        assert_eq!(ha1.len(), 32);
+        let ch = generate_challenge("realm", "abc");
+        assert!(ch.contains("realm=\"realm\""));
+        assert!(ch.contains("nonce=\"abc\""));
+    }
+}

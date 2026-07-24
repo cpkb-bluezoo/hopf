@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HTTP client — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="brand" href="../index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="../index.html">Home</a></li>
+<li><a href="../getting-started.html">Getting started</a></li>
+<li><a href="../architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="../services.html">Services</a></li>
+<li><a href="../clients.html">Clients</a></li>
+<li><a href="../composition.html">Composition</a></li>
+<li><a href="../runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="../tls.html">TLS</a></li>
+<li><a href="../http/overview.html">HTTP overview</a></li>
+<li><a href="../http/server.html">HTTP server</a></li>
+<li><a href="../http/client.html" aria-current="page">HTTP client</a></li>
+<li><a href="../quic-h3.html">QUIC / H3</a></li>
+<li><a href="../dns.html">DNS</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="../auth.html">Auth</a></li>
+<li><a href="../access-control.html">Access control</a></li>
+<li><a href="../telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="../cookbook/echo.html">Echo</a></li>
+<li><a href="../cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="../cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="../cookbook/dns-proxy.html">DNS proxy</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>HTTP client</h1>
+        <p class="lead">Demo: `examples/http-get`.</p>
+      </header>
+      <p>Demo: <code>examples/http-get</code>.</p>
+<p>Patterns:</p>
+<ul>
+<li><strong>H1</strong> — <code>H1Endpoint::client</code> + <code>ClientHandler</code> / <code>ClientWriter</code></li>
+<li><strong>H2</strong> — <code>H2Endpoint::client</code> (preface + SETTINGS); <code>http-get --http2</code></li>
+<li><strong>H3</strong> — <code>connect_h3</code> with feature <code>h3</code></li>
+</ul>
+<p>Implement <code>ClientHandler</code> for response events (headers, body chunks, complete). Dial with <code>Runtime::connect</code> and a TLS connector when using HTTPS.</p>
+
+      <p class="footer">
+        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
+        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

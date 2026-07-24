@@ -1,0 +1,28 @@
+[package]
+name = "hopf-ftp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "FTP / FTPS server and client for Hopf (Gumdrop ftp port)"
+readme = "README.md"
+keywords = ["ftp", "ftps", "networking"]
+categories = ["network-programming"]
+
+[features]
+default = []
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-auth = { workspace = true }
+hopf-tls = { workspace = true }
+hopf-otel = { workspace = true }
+rustls = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rcgen = { workspace = true }
+rustls-pemfile = { workspace = true }

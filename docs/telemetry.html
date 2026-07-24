@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Telemetry — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html" aria-current="page">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>Telemetry</h1>
+        <p class="lead">Connection hooks enqueue logs; HTTP request traces and metrics attach at the Stream handler — like Gumdrop.</p>
+      </header>
+      <h2 id="telemetryhook">TelemetryHook (connections)</h2>
+<pre><code class="language-rust">pub trait TelemetryHook: Send + Sync {
+    fn on_accept(&amp;self, peer: SocketAddr) {}
+    fn on_dial(&amp;self, peer: SocketAddr) {}
+    fn on_close(&amp;self, peer: SocketAddr) {}
+    fn on_error(&amp;self, peer: Option&lt;SocketAddr&gt;, msg: &amp;str) {}
+}
+</code></pre>
+<p>Attach via <code>Runtime::start_with_telemetry</code> or <code>Composition::telemetry</code>. Accept path reports ACL/rate-limit denials through <code>on_error</code>; connections call <code>on_close</code> / <code>on_error</code> on teardown.</p>
+<p><code>NopTelemetry</code> discards everything. Hook implementations must <strong>not</strong> perform I/O on the accept or reactor threads.</p>
+
+      <h2 id="http-instrumentation">HTTP request traces &amp; metrics</h2>
+<p>Instrument at the <code>ServerHandler</code> layer with <code>InstrumentedServerFactory</code> — not at TCP accept. Config flags <code>traces_enabled</code> / <code>metrics_enabled</code> mirror Gumdrop <code>TelemetryConfig</code>.</p>
+<pre><code class="language-rust">use std::sync::Arc;
+use hopf_otel::{InstrumentedServerFactory, OtelConfig, TelemetryPipeline};
+
+let pipeline = TelemetryPipeline::start(
+    OtelConfig::new("my-service")
+        .with_otlp_endpoint("http://127.0.0.1:4318")
+        .with_traces(true)
+        .with_metrics(true),
+)?;
+
+let app: Arc&lt;dyn ServerHandlerFactory&gt; = Arc::new(HelloFactory);
+let factory = Arc::new(InstrumentedServerFactory::new(app, &amp;pipeline));
+// pass `factory` to CleartextHttpEndpoint / AlpnHttpEndpoint / …
+
+let rt = Runtime::start_with_telemetry(config, Some(pipeline.hook()))?;
+</code></pre>
+<p>Per request the factory:</p>
+<ul>
+<li>continues from inbound <code>traceparent</code> (or starts a new SERVER span named <code>HTTP {method}</code>)</li>
+<li>injects response <code>traceparent</code></li>
+<li>records <code>http.server.requests</code>, <code>active_requests</code>, <code>request.duration</code>, sizes</li>
+</ul>
+<p>Handlers read the active context with <code>ServerWriter::traceparent()</code> and pass it to outbound clients:</p>
+<pre><code class="language-rust">fn headers(&amp;mut self, response: &amp;mut dyn ServerWriter, headers: &amp;Headers) {
+    let tp = response.traceparent().map(str::to_owned);
+    // … later, when writing an outbound request:
+    // let mut req = with_traceparent(client_writer, tp.as_deref());
+    // req.headers(outbound_headers);
+}
+</code></pre>
+<p>Helpers: <code>inject_traceparent</code>, <code>with_traceparent</code>, <code>with_trace</code> (Gumdrop <code>HTTPClient.setTrace</code> parity).</p>
+
+      <h2 id="hopf-otel">hopf-otel exporters</h2>
+<p>Crate <code>hopf-otel</code> provides <code>TelemetryPipeline</code>:</p>
+<ul>
+<li><strong>OTLP/HTTP</strong> — batched protobuf POST to <code>/v1/logs</code>, <code>/v1/traces</code>, <code>/v1/metrics</code></li>
+<li><strong>JSONL</strong> — OTLP JSON Lines file appenders per signal</li>
+</ul>
+<pre><code class="language-rust">use hopf_otel::{OtelConfig, TelemetryPipeline};
+
+let pipeline = TelemetryPipeline::start(
+    OtelConfig::new("my-service")
+        .with_otlp_endpoint("http://127.0.0.1:4318")
+        .with_jsonl_logs("/var/log/hopf/logs.jsonl")
+        .with_jsonl_traces("/var/log/hopf/traces.jsonl")
+        .with_jsonl_metrics("/var/log/hopf/metrics.jsonl"),
+)?;
+</code></pre>
+<p>Events are queued with a bounded channel (overflow drops). Encoding and network/file I/O happen only on the <code>hopf-otel-export</code> thread.</p>
+
+      <p class="footer">
+        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
+        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,23 @@
+[package]
+name = "hopf-grpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "gRPC framing, ProtoFile model, and HTTP Stream binding for Hopf"
+readme = "README.md"
+keywords = ["grpc", "protobuf", "http", "networking"]
+categories = ["network-programming", "web-programming::http-server"]
+
+[features]
+default = []
+integration = []
+
+[dependencies]
+hopf-http = { workspace = true }
+rprotobuf = { workspace = true }
+
+[dev-dependencies]
+hopf-core = { workspace = true }

@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hopf-core",
+    "crates/hopf-tls",
+    "crates/hopf-http",
+    "crates/hopf-quic",
+    "crates/hopf-dns",
+    "crates/hopf-auth",
+    "crates/hopf-otel",
+    "crates/hopf-webdav",
+    "crates/hopf-websocket",
+    "crates/hopf-grpc",
+    "crates/hopf-ftp",
+    "crates/hopf-smtp",
+    "crates/hopf-mailbox",
+    "examples/echo",
+    "examples/tls-echo",
+    "examples/http-hello",
+    "examples/http-get",
+    "examples/http3-hello",
+    "examples/dns-proxy",
+    "examples/webdav",
+    "examples/websocket",
+    "examples/grpc",
+    "examples/ftp",
+    "examples/ftp-get",
+    "examples/smtp",
+    "examples/smtp-send",
+]
+default-members = [
+    "crates/hopf-core",
+    "crates/hopf-tls",
+    "crates/hopf-http",
+    "crates/hopf-quic",
+    "crates/hopf-dns",
+    "crates/hopf-auth",
+    "crates/hopf-otel",
+    "crates/hopf-webdav",
+    "crates/hopf-websocket",
+    "crates/hopf-grpc",
+    "crates/hopf-ftp",
+    "crates/hopf-smtp",
+    "crates/hopf-mailbox",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "LGPL-2.1-or-later"
+repository = "https://github.com/cpkb-bluezoo/hopf"
+authors = ["Chris Burdess <dog@gnu.org>"]
+
+[workspace.dependencies]
+mio = { version = "1", features = ["net", "os-poll", "os-ext"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+# QUIC transport state machine (mio/TPC glue in-tree; not the full `quinn` crate)
+quinn-proto = "0.11"
+# Sibling incremental push parsers. tractrix 0.2 is not on crates.io yet —
+# compile against the local checkout until published.
+tractrix = { path = "../tractrix" }
+rjsonparser = "0.1"
+rmimeparser = "0.2"
+rprotobuf = "0.1"
+hopf-core = { path = "crates/hopf-core" }
+hopf-tls = { path = "crates/hopf-tls" }
+hopf-http = { path = "crates/hopf-http" }
+hopf-quic = { path = "crates/hopf-quic" }
+hopf-dns = { path = "crates/hopf-dns" }
+hopf-auth = { path = "crates/hopf-auth" }
+hopf-otel = { path = "crates/hopf-otel" }
+hopf-webdav = { path = "crates/hopf-webdav" }
+hopf-websocket = { path = "crates/hopf-websocket" }
+hopf-grpc = { path = "crates/hopf-grpc" }
+hopf-ftp = { path = "crates/hopf-ftp" }
+hopf-smtp = { path = "crates/hopf-smtp" }
+hopf-mailbox = { path = "crates/hopf-mailbox" }
+bytes = "1"
+getrandom = "0.2"
+md-5 = "0.10"
+tempfile = "3"

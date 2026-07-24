@@ -1,0 +1,14 @@
+[package]
+name = "ftp-get"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "ftp-get"
+path = "main.rs"
+
+[dependencies]
+hopf-ftp = { workspace = true }

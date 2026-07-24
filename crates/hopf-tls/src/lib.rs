@@ -1,0 +1,553 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+//! rustls TLS for Hopf endpoints (TLS-from-accept and STARTTLS).
+//!
+//! Handlers still see only plaintext via [`hopf_core::Endpoint`]. Ciphertext
+//! stays under the connection's TLS session.
+
+#![warn(missing_docs)]
+
+use std::fs::File;
+use std::io::{self, BufReader, ErrorKind};
+use std::path::Path;
+use std::sync::Arc;
+
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+use hopf_core::{
+    SecurityInfo, SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector, TlsProgress,
+    TlsSession,
+};
+
+/// Load a PEM certificate chain and private key into a rustls [`ServerConfig`].
+///
+/// `alpn` entries are protocol names such as `b"h2"` and `b"http/1.1"`.
+pub fn server_config_from_pem(
+    cert_path: &Path,
+    key_path: &Path,
+    alpn: &[&[u8]],
+) -> io::Result<Arc<ServerConfig>> {
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(Arc::new(config))
+}
+
+/// Build a [`SharedTlsAcceptor`] from an existing [`ServerConfig`].
+pub fn acceptor(config: Arc<ServerConfig>) -> SharedTlsAcceptor {
+    Arc::new(RustlsAcceptor { config })
+}
+
+/// Convenience: PEM paths → shared acceptor.
+pub fn acceptor_from_pem(
+    cert_path: &Path,
+    key_path: &Path,
+    alpn: &[&[u8]],
+) -> io::Result<SharedTlsAcceptor> {
+    Ok(acceptor(server_config_from_pem(cert_path, key_path, alpn)?))
+}
+
+/// Build a [`ClientConfig`] that trusts the given PEM CA / leaf cert file.
+///
+/// `alpn` entries are protocol names such as `b"http/1.1"`.
+pub fn client_config_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<Arc<ClientConfig>> {
+    let certs = load_certs(ca_path)?;
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    }
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(Arc::new(config))
+}
+
+/// Build a [`SharedTlsConnector`] from an existing [`ClientConfig`].
+pub fn connector(config: Arc<ClientConfig>) -> SharedTlsConnector {
+    Arc::new(RustlsConnector { config })
+}
+
+/// Convenience: PEM trust roots → shared connector.
+pub fn connector_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
+    Ok(connector(client_config_from_pem(ca_path, alpn)?))
+}
+
+/// Dangerous: trust a specific leaf certificate (self-signed smoke tests).
+pub fn connector_for_certified_pem(
+    leaf_pem: &Path,
+    alpn: &[&[u8]],
+) -> io::Result<SharedTlsConnector> {
+    connector_from_pem(leaf_pem, alpn)
+}
+
+fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
+    let certs = certs.map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    if certs.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("no certificates in {}", path.display()),
+        ));
+    }
+    Ok(certs)
+}
+
+fn load_private_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
+        .ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("no private key in {}", path.display()),
+            )
+        })
+}
+
+struct RustlsAcceptor {
+    config: Arc<ServerConfig>,
+}
+
+impl TlsAcceptor for RustlsAcceptor {
+    fn accept(&self) -> Box<dyn TlsSession> {
+        let conn = ServerConnection::new(Arc::clone(&self.config))
+            .expect("ServerConnection::new with valid ServerConfig");
+        Box::new(RustlsServerSession {
+            conn,
+            was_handshaking: true,
+        })
+    }
+}
+
+struct RustlsServerSession {
+    conn: ServerConnection,
+    was_handshaking: bool,
+}
+
+impl TlsSession for RustlsServerSession {
+    fn read_tls(&mut self, input: &mut &[u8]) -> io::Result<usize> {
+        match self.conn.read_tls(input) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn process_new_packets(&mut self) -> io::Result<TlsProgress> {
+        self.conn
+            .process_new_packets()
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        let handshaking = self.conn.is_handshaking();
+        let just = self.was_handshaking && !handshaking;
+        self.was_handshaking = handshaking;
+        Ok(TlsProgress {
+            handshake_just_completed: just,
+        })
+    }
+
+    fn read_plaintext(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::io::Read;
+        let mut reader = self.conn.reader();
+        match reader.read(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn write_plaintext(&mut self, buf: &[u8]) -> io::Result<usize> {
+        use std::io::Write;
+        let mut writer = self.conn.writer();
+        writer.write(buf)
+    }
+
+    fn write_tls(&mut self, output: &mut Vec<u8>) -> io::Result<usize> {
+        match self.conn.write_tls(output) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn wants_write(&self) -> bool {
+        self.conn.wants_write()
+    }
+
+    fn is_handshaking(&self) -> bool {
+        self.conn.is_handshaking()
+    }
+
+    fn security_info(&self) -> SecurityInfo {
+        let alpn = self
+            .conn
+            .alpn_protocol()
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_vec());
+        let protocol = self.conn.protocol_version().map(|v| format!("{v:?}"));
+        let cipher_suite = self
+            .conn
+            .negotiated_cipher_suite()
+            .map(|cs| format!("{:?}", cs.suite()));
+        SecurityInfo::secure(alpn, protocol, cipher_suite)
+    }
+
+    fn send_close_notify(&mut self) {
+        self.conn.send_close_notify();
+    }
+}
+
+struct RustlsConnector {
+    config: Arc<ClientConfig>,
+}
+
+impl TlsConnector for RustlsConnector {
+    fn connect(&self, server_name: &str) -> io::Result<Box<dyn TlsSession>> {
+        let name = ServerName::try_from(server_name.to_string())
+            .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
+        let conn = ClientConnection::new(Arc::clone(&self.config), name)
+            .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
+        Ok(Box::new(RustlsClientSession {
+            conn,
+            was_handshaking: true,
+        }))
+    }
+}
+
+struct RustlsClientSession {
+    conn: ClientConnection,
+    was_handshaking: bool,
+}
+
+impl TlsSession for RustlsClientSession {
+    fn read_tls(&mut self, input: &mut &[u8]) -> io::Result<usize> {
+        match self.conn.read_tls(input) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn process_new_packets(&mut self) -> io::Result<TlsProgress> {
+        self.conn
+            .process_new_packets()
+            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        let handshaking = self.conn.is_handshaking();
+        let just = self.was_handshaking && !handshaking;
+        self.was_handshaking = handshaking;
+        Ok(TlsProgress {
+            handshake_just_completed: just,
+        })
+    }
+
+    fn read_plaintext(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        use std::io::Read;
+        let mut reader = self.conn.reader();
+        match reader.read(buf) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn write_plaintext(&mut self, buf: &[u8]) -> io::Result<usize> {
+        use std::io::Write;
+        let mut writer = self.conn.writer();
+        writer.write(buf)
+    }
+
+    fn write_tls(&mut self, output: &mut Vec<u8>) -> io::Result<usize> {
+        match self.conn.write_tls(output) {
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn wants_write(&self) -> bool {
+        self.conn.wants_write()
+    }
+
+    fn is_handshaking(&self) -> bool {
+        self.conn.is_handshaking()
+    }
+
+    fn security_info(&self) -> SecurityInfo {
+        let alpn = self
+            .conn
+            .alpn_protocol()
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_vec());
+        let protocol = self.conn.protocol_version().map(|v| format!("{v:?}"));
+        let cipher_suite = self
+            .conn
+            .negotiated_cipher_suite()
+            .map(|cs| format!("{:?}", cs.suite()));
+        SecurityInfo::secure(alpn, protocol, cipher_suite)
+    }
+
+    fn send_close_notify(&mut self) {
+        self.conn.send_close_notify();
+    }
+}
+
+#[cfg(test)]
+mod unit {
+    use super::*;
+    use rcgen::generate_simple_self_signed;
+
+    fn write_temp_pem() -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-tls-unit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn server_config_from_pem_sets_alpn() {
+        let (cert_path, key_path) = write_temp_pem();
+        let cfg = server_config_from_pem(&cert_path, &key_path, &[b"h2", b"http/1.1"]).unwrap();
+        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn client_config_from_pem_sets_alpn() {
+        let (cert_path, _) = write_temp_pem();
+        let cfg = client_config_from_pem(&cert_path, &[b"http/1.1"]).unwrap();
+        assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn acceptor_and_connector_from_pem() {
+        let (cert_path, key_path) = write_temp_pem();
+        let _ = acceptor_from_pem(&cert_path, &key_path, &[b"h2"]).unwrap();
+        let _ = connector_from_pem(&cert_path, &[b"h2"]).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "integration"))]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpStream as StdTcpStream;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+    use hopf_core::{
+        Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig,
+    };
+
+    fn write_temp_pem() -> (std::path::PathBuf, std::path::PathBuf, CertifiedKey) {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-tls-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        (cert_path, key_path, cert)
+    }
+
+    struct TlsEcho {
+        alpn_seen: Arc<Mutex<Option<Vec<u8>>>>,
+        ready: Arc<Mutex<bool>>,
+    }
+
+    impl ProtocolHandler for TlsEcho {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
+            // Defer traffic until security_established (Gumdrop HTTP/SMTPS pattern).
+        }
+
+        fn security_established(
+            &mut self,
+            _endpoint: &mut dyn Endpoint,
+            info: &SecurityInfo,
+        ) {
+            *self.alpn_seen.lock().unwrap() = info.alpn().map(|a| a.to_vec());
+            *self.ready.lock().unwrap() = true;
+        }
+
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            if !*self.ready.lock().unwrap() {
+                return;
+            }
+            endpoint.send(data);
+            *data = &[];
+        }
+
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+    }
+
+    fn rustls_client(cert: &CertifiedKey, alpn: &[&[u8]]) -> ClientConfig {
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut cfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        cfg
+    }
+
+    #[test]
+    fn tls_echo_exposes_alpn() {
+        let (cert_path, key_path, certified) = write_temp_pem();
+        let acceptor =
+            acceptor_from_pem(&cert_path, &key_path, &[b"h2", b"http/1.1"]).unwrap();
+
+        let alpn_seen = Arc::new(Mutex::new(None));
+        let ready = Arc::new(Mutex::new(false));
+        let alpn_f = Arc::clone(&alpn_seen);
+        let ready_f = Arc::clone(&ready);
+
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+                    Box::new(TlsEcho {
+                        alpn_seen: Arc::clone(&alpn_f),
+                        ready: Arc::clone(&ready_f),
+                    }) as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let client_cfg = Arc::new(rustls_client(&certified, &[b"h2", b"http/1.1"]));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = ClientConnection::new(client_cfg, server_name).unwrap();
+        let sock = StdTcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+
+        tls.write_all(b"hello-tls").unwrap();
+        tls.flush().unwrap();
+        let mut buf = [0u8; 32];
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello-tls");
+
+        for _ in 0..50 {
+            if alpn_seen.lock().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let alpn = alpn_seen.lock().unwrap().clone().expect("ALPN set");
+        assert_eq!(alpn, b"h2");
+
+        rt.shutdown();
+    }
+
+    struct StartTlsProbe {
+        upgraded: Arc<Mutex<bool>>,
+    }
+
+    impl ProtocolHandler for StartTlsProbe {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            endpoint.send(b"PLAIN\n");
+        }
+
+        fn security_established(
+            &mut self,
+            endpoint: &mut dyn Endpoint,
+            _info: &SecurityInfo,
+        ) {
+            *self.upgraded.lock().unwrap() = true;
+            endpoint.send(b"SECURE\n");
+        }
+
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            if let Some(pos) = data.iter().position(|&b| b == b'\n') {
+                let line = &data[..=pos];
+                if line.starts_with(b"STARTTLS") {
+                    *data = &data[pos + 1..];
+                    endpoint.start_tls().expect("start_tls");
+                    return;
+                }
+            }
+            *data = &[];
+        }
+
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+    }
+
+    #[test]
+    fn start_tls_upgrades_connection() {
+        let (cert_path, key_path, certified) = write_temp_pem();
+        let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+        let upgraded = Arc::new(Mutex::new(false));
+        let upgraded_f = Arc::clone(&upgraded);
+
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+                    Box::new(StartTlsProbe {
+                        upgraded: Arc::clone(&upgraded_f),
+                    }) as Box<dyn ProtocolHandler>
+                })
+                .with_starttls_acceptor(acceptor),
+            )
+            .unwrap();
+
+        let mut sock = StdTcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = sock.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"PLAIN\n");
+
+        sock.write_all(b"STARTTLS\n").unwrap();
+
+        let client_cfg = Arc::new(rustls_client(&certified, &[]));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = ClientConnection::new(client_cfg, server_name).unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"SECURE\n");
+        assert!(*upgraded.lock().unwrap());
+
+        rt.shutdown();
+    }
+}

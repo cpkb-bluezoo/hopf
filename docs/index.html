@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hopf documentation — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html" aria-current="page">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>Hopf documentation</h1>
+        <p class="lead">Human guides for building with Hopf. Architecture and tranche status stay in</p>
+      </header>
+      <p>Human guides for building with Hopf. Architecture and tranche status stay in <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> and <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a>. Crate READMEs stay short and link here.</p>
+<h2 id="reading-order">Reading order</h2>
+<ol type="1">
+<li><a href="getting-started.html">Getting started</a> — echo → TLS → HTTP hello</li>
+<li><a href="architecture.html">Architecture</a> — TPC, affinity, Endpoint vs ProtocolHandler</li>
+<li><a href="services.html">Services</a> — listen path, <code>ProtocolHandler</code>, <code>Service</code></li>
+<li><a href="clients.html">Clients</a> — dial path, client handlers, connect-by-name</li>
+<li><a href="composition.html">Composition</a> — builder and binding lifecycle</li>
+<li><a href="runtime-options.html">Runtime options</a> — workers, buffers, storage, execute</li>
+</ol>
+<p>Then protocol and cross-cutting guides as needed:</p>
+<table>
+<thead>
+<tr>
+<th>Guide</th>
+<th>Topic</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="tls.html">TLS</a></td>
+<td>PEM, ALPN, STARTTLS</td>
+</tr>
+<tr>
+<td><a href="http/overview.html">HTTP overview</a></td>
+<td>Stream API; H1/H2/H3</td>
+</tr>
+<tr>
+<td><a href="http/server.html">HTTP server</a></td>
+<td><code>ServerHandler</code> / Writer</td>
+</tr>
+<tr>
+<td><a href="http/client.html">HTTP client</a></td>
+<td>Dial patterns (<code>http-get</code>)</td>
+</tr>
+<tr>
+<td><a href="quic-h3.html">QUIC / H3</a></td>
+<td>QUIC listen/dial; H3</td>
+</tr>
+<tr>
+<td><a href="dns.html">DNS</a></td>
+<td>Resolver, transports, <code>dns-proxy</code></td>
+</tr>
+<tr>
+<td><a href="auth.html">Auth</a></td>
+<td>TrustPolicy, IdentityMaterial, Basic</td>
+</tr>
+<tr>
+<td><a href="access-control.html">Access control</a></td>
+<td>CIDR, rate limits, quotas</td>
+</tr>
+<tr>
+<td><a href="telemetry.html">Telemetry</a></td>
+<td>OTLP/HTTP + JSONL (<code>hopf-otel</code>)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="cookbook">Cookbook</h2>
+<p>Short recipes that mirror <code>examples/</code>:</p>
+<ul>
+<li><a href="cookbook/echo.html">echo</a></li>
+<li><a href="cookbook/tls-echo.html">tls-echo</a></li>
+<li><a href="cookbook/http-hello-get.html">http-hello / http-get</a></li>
+<li><a href="cookbook/dns-proxy.html">dns-proxy</a></li>
+</ul>
+
+      <p class="footer">
+        Architecture: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md">PLAN.md</a> ·
+        Tranches: <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/TRANCHES.md">TRANCHES.md</a> ·
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

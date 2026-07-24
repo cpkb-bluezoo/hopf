@@ -1,0 +1,16 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "dns-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "dns-proxy"
+path = "main.rs"
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-dns = { workspace = true, features = ["server"] }

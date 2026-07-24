@@ -1,0 +1,16 @@
+[package]
+name = "tls-echo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "tls-echo"
+path = "main.rs"
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-tls = { workspace = true }
+rcgen = { workspace = true }
