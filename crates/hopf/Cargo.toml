@@ -1,0 +1,69 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Multi-protocol networking framework — umbrella crate re-exporting the hopf-* crates"
+readme = "README.md"
+keywords = ["networking", "http", "quic", "smtp", "ftp"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = ["full"]
+# Everything (default). Disable default features to pick crates individually;
+# hopf-core is always included.
+full = [
+    "tls",
+    "auth",
+    "http",
+    "quic",
+    "dns",
+    "webdav",
+    "websocket",
+    "grpc",
+    "ftp",
+    "smtp",
+    "mailbox",
+    "otel",
+]
+tls = ["dep:hopf-tls"]
+auth = ["dep:hopf-auth"]
+http = ["dep:hopf-http"]
+quic = ["dep:hopf-quic"]
+dns = ["dep:hopf-dns"]
+webdav = ["dep:hopf-webdav"]
+websocket = ["dep:hopf-websocket"]
+grpc = ["dep:hopf-grpc"]
+ftp = ["dep:hopf-ftp"]
+smtp = ["dep:hopf-smtp"]
+mailbox = ["dep:hopf-mailbox"]
+otel = ["dep:hopf-otel"]
+# Pass-throughs to optional sub-crate features.
+h3 = ["http", "quic", "hopf-http/h3"]
+dns-server = ["dns", "hopf-dns/server"]
+dot = ["dns", "hopf-dns/dot"]
+doq = ["dns", "hopf-dns/doq"]
+doh = ["dns", "hopf-dns/doh"]
+dnssec = ["dns", "hopf-dns/dnssec"]
+webdav-xattr = ["webdav", "hopf-webdav/xattr"]
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-tls = { workspace = true, optional = true }
+hopf-auth = { workspace = true, optional = true }
+hopf-http = { workspace = true, optional = true }
+hopf-quic = { workspace = true, optional = true }
+hopf-dns = { workspace = true, optional = true }
+hopf-webdav = { workspace = true, optional = true }
+hopf-websocket = { workspace = true, optional = true }
+hopf-grpc = { workspace = true, optional = true }
+hopf-ftp = { workspace = true, optional = true }
+hopf-smtp = { workspace = true, optional = true }
+hopf-mailbox = { workspace = true, optional = true }
+hopf-otel = { workspace = true, optional = true }
