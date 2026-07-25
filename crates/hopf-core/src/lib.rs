@@ -48,7 +48,7 @@ pub use byte_stream_lexer::{
 };
 pub use cmd::ReactorHandle;
 pub use composition::{
-    Composition, CompositionRegistry, CompositionRuntime, CompositionXmlError, CompositionXmlResult,
+    Composition, CompositionRegistry, CompositionXmlError, CompositionXmlResult,
 };
 pub use connector::{TcpConnParams, TcpConnectorConfig};
 pub use endpoint::{Endpoint, TimerHandle, WriteReadyCallback};
@@ -496,15 +496,15 @@ mod tests {
     fn composition_add_remove_listener() {
         use crate::Composition;
 
-        let comp = Composition::new(RuntimeConfig {
+        let mut comp = Composition::new(RuntimeConfig {
             worker_threads: 1,
             ..Default::default()
         })
-        .listen_tcp(TcpListenerConfig::new(
+        .unwrap();
+        comp.listen_tcp(TcpListenerConfig::new(
             "127.0.0.1:0".parse().unwrap(),
             || Box::new(EchoHandler) as Box<dyn ProtocolHandler>,
         ))
-        .build()
         .unwrap();
 
         let addr = comp.primary_addr().unwrap();

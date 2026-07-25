@@ -79,17 +79,15 @@
 <h2 id="builder-api">Builder API</h2>
 <div class="sourceCode" id="cb1"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Composition<span class="op">,</span> RuntimeConfig<span class="op">,</span> TcpConnectorConfig<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> comp <span class="op">=</span> <span class="pp">Composition::</span>new(RuntimeConfig <span class="op">{</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> comp <span class="op">=</span> <span class="pp">Composition::</span>new(RuntimeConfig <span class="op">{</span></span>
 <span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>    worker_threads<span class="op">:</span> <span class="dv">4</span><span class="op">,</span></span>
 <span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">..</span><span class="bu">Default</span><span class="pp">::</span><span class="kw">default</span>()</span>
-<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)</span>
-<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a><span class="op">.</span>listen_tcp(<span class="pp">TcpListenerConfig::</span>new(listen_addr<span class="op">,</span> factory))</span>
-<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a><span class="op">.</span>dial_tcp(<span class="pp">TcpConnectorConfig::</span>new(peer_addr<span class="op">,</span> dial_factory))</span>
-<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a><span class="co">// .telemetry(hook)  // optional</span></span>
-<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="op">.</span>build()<span class="op">?;</span></span>
-<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb1-12"><a href="#cb1-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> primary <span class="op">=</span> comp<span class="op">.</span>primary_addr()<span class="op">;</span></span>
-<span id="cb1-13"><a href="#cb1-13" aria-hidden="true" tabindex="-1"></a><span class="co">// later: comp.remove_binding(id); comp.shutdown();</span></span></code></pre></div>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">?;</span>                                              <span class="co">// Runtime starts here</span></span>
+<span id="cb1-7"><a href="#cb1-7" aria-hidden="true" tabindex="-1"></a>comp<span class="op">.</span>listen_tcp(<span class="pp">TcpListenerConfig::</span>new(listen_addr<span class="op">,</span> factory))<span class="op">?;</span></span>
+<span id="cb1-8"><a href="#cb1-8" aria-hidden="true" tabindex="-1"></a>comp<span class="op">.</span>dial_tcp(<span class="pp">TcpConnectorConfig::</span>new(peer_addr<span class="op">,</span> dial_factory))<span class="op">?;</span></span>
+<span id="cb1-9"><a href="#cb1-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb1-10"><a href="#cb1-10" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> primary <span class="op">=</span> comp<span class="op">.</span>primary_addr()<span class="op">;</span></span>
+<span id="cb1-11"><a href="#cb1-11" aria-hidden="true" tabindex="-1"></a><span class="co">// later: comp.remove_binding(id); comp.shutdown();</span></span></code></pre></div>
 <table>
 <colgroup>
 <col style="width: 50%" />
@@ -104,31 +102,35 @@
 <tbody>
 <tr>
 <td><code>Composition::new(RuntimeConfig)</code></td>
-<td>Start of the builder</td>
+<td>Starts the Runtime immediately, no telemetry</td>
 </tr>
 <tr>
-<td><code>telemetry(Arc&lt;dyn TelemetryHook&gt;)</code></td>
-<td>Passed to <code>Runtime::start_with_telemetry</code></td>
+<td><code>Composition::new_with_telemetry(RuntimeConfig, Option&lt;Arc&lt;dyn TelemetryHook&gt;&gt;)</code></td>
+<td>Starts the Runtime immediately, with a telemetry hook</td>
 </tr>
 <tr>
-<td><code>listen_tcp(TcpListenerConfig)</code></td>
-<td>Queue a listen binding</td>
+<td><code>runtime() -&gt; &amp;Arc&lt;Runtime&gt;</code></td>
+<td>Accessor — build <code>Arc&lt;Runtime&gt;</code>-dependent protocol services before adding bindings</td>
 </tr>
 <tr>
-<td><code>dial_tcp(TcpConnectorConfig)</code></td>
-<td>Queue a dial</td>
+<td><code>listen_tcp(TcpListenerConfig) -&gt; io::Result&lt;BindingId&gt;</code></td>
+<td>Apply a listen binding now</td>
 </tr>
 <tr>
-<td><code>from_xml</code> / <code>from_xml_str</code> / <code>from_xml_path</code></td>
-<td>Parse XML into a builder (needs registry)</td>
+<td><code>dial_tcp(TcpConnectorConfig) -&gt; io::Result&lt;()&gt;</code></td>
+<td>Apply a dial now</td>
 </tr>
 <tr>
-<td><code>build()</code></td>
-<td>Start runtime, apply bindings → <code>CompositionRuntime</code></td>
+<td><code>from_xml</code> / <code>from_xml_str</code> / <code>from_xml_path</code> (and <code>_with_telemetry</code> siblings)</td>
+<td>Parse XML and apply it against a fresh Runtime — returns an already-running <code>Composition</code></td>
+</tr>
+<tr>
+<td><code>primary_addr()</code> / <code>remove_binding(BindingId)</code> / <code>shutdown(self)</code></td>
+<td>Inspect / tear down the running composition</td>
 </tr>
 </tbody>
 </table>
-<p><code>CompositionRuntime</code> methods: <code>primary_addr()</code>, <code>remove_binding(BindingId)</code>, <code>shutdown(self)</code>.</p>
+<p>There is no separate <code>build()</code> step — a <code>Composition</code> is running as soon as it's constructed, matching the composition-root ordering in <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md"><code>PLAN.md</code></a> (<code>Runtime::start</code> before the script runs). This is also what lets a registered listener close over <code>Arc&lt;Runtime&gt;</code> — required by any protocol service that offloads work to the storage pool (SMTP local delivery, POP3, IMAP, ...).</p>
 <h2 id="compositionregistry">CompositionRegistry</h2>
 <p><code>handler="…"</code> in XML (and conceptual names in docs) is <strong>not</strong> a <code>Service</code> or HTTP Stream handler name. It resolves a closed map of connection-level <code>HandlerFactory</code> values (<code>Fn() -&gt; Box&lt;dyn ProtocolHandler&gt;</code>).</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
@@ -142,8 +144,8 @@
 <span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="st">  &lt;listen-tcp addr=&quot;127.0.0.1:0&quot; handler=&quot;echo&quot;/&gt;</span></span>
 <span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="st">&lt;/composition&gt;&quot;#</span><span class="op">;</span></span>
 <span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> comp <span class="op">=</span> <span class="pp">Composition::</span>from_xml_str(xml<span class="op">,</span> <span class="op">&amp;</span>reg)<span class="op">?.</span>build()<span class="op">?;</span></span></code></pre></div>
-<p>Register pre-wired stacks in Rust before load. Unknown <code>handler</code> names fail parse/build with <code>CompositionXmlError</code>.</p>
+<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> comp <span class="op">=</span> <span class="pp">Composition::</span>from_xml_str(xml<span class="op">,</span> <span class="op">&amp;</span>reg)<span class="op">?;</span>   <span class="co">// already running</span></span></code></pre></div>
+<p>Register pre-wired stacks in Rust before load. Unknown <code>handler</code> names fail parse with <code>CompositionXmlError</code>. Only <strong>self-contained</strong> handlers can be registered here — the registry is built and resolved before <code>from_xml*</code> starts the Runtime, so a factory that needs <code>Arc&lt;Runtime&gt;</code> (any storage-offloading protocol service — SMTP local delivery, POP3, IMAP, ...) can't go through XML. Wire those with the Rust builder instead, using <a href="#builder-api"><code>Composition::runtime()</code></a> after <code>new()</code>.</p>
 <h2 id="xml-from_xml">XML (from_xml)</h2>
 <p>Declarative files use <strong>elements and attributes only</strong> (no character data). Naming mirrors the Rust builder. Parsing is entirely through tractrix.</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode xml"><code class="sourceCode xml"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a>&lt;<span class="kw">composition</span> <span class="ot">worker-threads=</span><span class="st">&quot;4&quot;</span> <span class="ot">storage-threads=</span><span class="st">&quot;4&quot;</span>&gt;</span>
@@ -194,7 +196,7 @@
 </tr>
 </tbody>
 </table>
-<p>Also: <code>Composition::from_xml(bytes, &amp;registry)</code>, <code>from_xml_path(path, &amp;registry)</code>.</p>
+<p>Also: <code>Composition::from_xml(bytes, &amp;registry)</code>, <code>from_xml_path(path, &amp;registry)</code> — both return an already-running <code>Composition</code>, no separate build step.</p>
 <h2 id="xml-attribute-map">XML attribute map</h2>
 <h3 id="composition"><code>&lt;composition&gt;</code></h3>
 <table>
@@ -305,28 +307,28 @@
 </tbody>
 </table>
 <p>TLS / <code>secure</code> attributes are <strong>rejected in v1</strong>. Wire TLS inside the registered factory or use the Rust builder (<code>TcpListenerConfig::with_tls</code>).</p>
-<p>Telemetry is <strong>not</strong> expressed in XML v1 — call <code>.telemetry(hook)</code> on the builder after <code>from_xml_*</code>.</p>
+<p>Telemetry is <strong>not</strong> expressed in XML v1 — pass it to <code>Composition::from_xml_with_telemetry</code> / <code>from_xml_str_with_telemetry</code> / <code>from_xml_path_with_telemetry</code> instead of the plain <code>from_xml*</code> entry points, since it must be known before the Runtime starts.</p>
 <h2 id="binding-lifecycle">Binding lifecycle</h2>
 <ol type="1">
-<li><strong>Add</strong> — <code>Composition::listen_tcp</code> / <code>Runtime::add_tcp_listener</code> → <code>(SocketAddr, BindingId)</code>. Port <code>0</code> yields an ephemeral local address.</li>
+<li><strong>Start</strong> — <code>Composition::new</code> / <code>new_with_telemetry</code> / <code>from_xml*</code> starts the Runtime immediately (worker reactors, accept loop, storage pool), before any bindings exist.</li>
+<li><strong>Add</strong> — <code>Composition::listen_tcp</code> / <code>Runtime::add_tcp_listener</code> → <code>(SocketAddr, BindingId)</code>, applied immediately against the live Runtime. Port <code>0</code> yields an ephemeral local address.</li>
 <li><strong>Run</strong> — accept loop registers the mio listener; each accept round-robins onto a worker reactor (affinity for life).</li>
-<li><strong>Remove</strong> — <code>CompositionRuntime::remove_binding</code> / <code>Runtime::remove_binding</code>. The accept loop deregisters the listener; <strong>existing connections keep affinity until close</strong>.</li>
-<li><strong>Shutdown</strong> — <code>CompositionRuntime::shutdown</code> / <code>Runtime::shutdown</code> tears down workers, accept loop, and storage.</li>
+<li><strong>Remove</strong> — <code>Composition::remove_binding</code> / <code>Runtime::remove_binding</code>. The accept loop deregisters the listener; <strong>existing connections keep affinity until close</strong>.</li>
+<li><strong>Shutdown</strong> — <code>Composition::shutdown</code> / <code>Runtime::shutdown</code> tears down workers, accept loop, and storage. Best-effort on <code>Composition</code>: if a registered service factory kept its own <code>Arc&lt;Runtime&gt;</code> clone (from <code>runtime()</code>), that clone keeps the Runtime alive past this call — same as the standalone protocol examples, which never call <code>Runtime::shutdown</code> and just drop their <code>Arc&lt;Runtime&gt;</code> at process exit.</li>
 </ol>
 <p>Trust policies and DNS caches attach at the protocol layer (e.g. HTTP <code>BasicAuthFactory</code>, <code>DnsResolver</code>), not as core Composition fields — core stays free of HTTP/auth types.</p>
 <h2 id="telemetry">Telemetry</h2>
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>Composition<span class="op">;</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="co">// hook: Arc&lt;dyn TelemetryHook&gt; from hopf-otel TelemetryPipeline::hook()</span></span>
 <span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> comp <span class="op">=</span> <span class="pp">Composition::</span>from_xml_str(xml<span class="op">,</span> <span class="op">&amp;</span>reg)<span class="op">?</span></span>
-<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>telemetry(hook)</span>
-<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>build()<span class="op">?;</span></span></code></pre></div>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> comp <span class="op">=</span> <span class="pp">Composition::</span>from_xml_str_with_telemetry(xml<span class="op">,</span> <span class="op">&amp;</span>reg<span class="op">,</span> <span class="cn">Some</span>(hook))<span class="op">?;</span></span></code></pre></div>
 <p>See <a href="runtime-options.html">runtime-options.md</a> and <a href="telemetry.html">telemetry.md</a>.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li>Closed registry only — no dynamic plugin loading.</li>
+<li>Registry factories can't depend on <code>Arc&lt;Runtime&gt;</code> — they're resolved before <code>from_xml*</code> starts the Runtime. Storage-offloading protocol services (SMTP local delivery, POP3, IMAP, ...) compose via the Rust builder instead.</li>
 <li>XML v1 has no TLS / secure / telemetry attributes.</li>
-<li><code>idle_timeout</code> is only partially wired on the datapath (Tranche 1) — see <a href="runtime-options.html">runtime-options.md</a>.</li>
+<li><code>idle_timeout</code> is accepted and stored but not yet enforced on the datapath — see <a href="runtime-options.html">runtime-options.md</a>.</li>
 <li>QUIC / H3 bindings are not Composition XML elements; use <code>listen_h3</code> / <code>RuntimeQuicExt</code> in Rust.</li>
 </ul>
 <h2 id="see-also">See also</h2>

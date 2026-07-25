@@ -126,7 +126,7 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_close(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> SocketAddr) <span class="op">{}</span></span>
 <span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> on_error(<span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span> peer<span class="op">:</span> <span class="dt">Option</span><span class="op">&lt;</span>SocketAddr<span class="op">&gt;,</span> msg<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>) <span class="op">{}</span></span>
 <span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
-<p>Attach via <code>Runtime::start_with_telemetry</code> or <code>Composition::telemetry</code>. ACL / rate-limit denials report through <code>on_error</code>. <code>NopTelemetry</code> discards everything.</p>
+<p>Attach via <code>Runtime::start_with_telemetry</code> or <code>Composition::new_with_telemetry</code> / <code>from_xml*_with_telemetry</code>. ACL / rate-limit denials report through <code>on_error</code>. <code>NopTelemetry</code> discards everything.</p>
 <p><strong>Implementations must not perform I/O on accept or reactor threads.</strong></p>
 <p>Events: <code>TelemetryEvent</code> / <code>EventKind::{Accept,Dial,Close,Error}</code>.</p>
 <h2 id="http-instrumentation">HTTP instrumentation</h2>

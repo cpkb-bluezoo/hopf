@@ -1,0 +1,19 @@
+[package]
+name = "mail-composed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "mail-composed"
+path = "main.rs"
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-smtp = { workspace = true }
+hopf-pop3 = { workspace = true }
+hopf-imap = { workspace = true }
+hopf-mailbox = { workspace = true }
+hopf-auth = { workspace = true }

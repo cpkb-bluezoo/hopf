@@ -62,10 +62,33 @@ impl From<ParseError> for CompositionXmlError {
 }
 
 /// Parse bytes into a [`Composition`] using `registry` for `handler` lookup.
+///
+/// Starts the Runtime and applies every parsed binding immediately (the
+/// returned `Composition` is already running); `telemetry` must be supplied
+/// here since it can only be attached at Runtime start.
 pub(super) fn parse_composition(
     bytes: &[u8],
     registry: &CompositionRegistry,
+    telemetry: Option<std::sync::Arc<dyn crate::telemetry::TelemetryHook>>,
 ) -> CompositionXmlResult<Composition> {
+    let doc = parse_document(bytes)?;
+    let resolved = doc.resolve(registry)?;
+
+    let mut comp = Composition::new_with_telemetry(resolved.config, telemetry)
+        .map_err(CompositionXmlError::Io)?;
+    for cfg in resolved.listens {
+        comp.listen_tcp(cfg).map_err(CompositionXmlError::Io)?;
+    }
+    for cfg in resolved.dials {
+        comp.dial_tcp(cfg).map_err(CompositionXmlError::Io)?;
+    }
+    Ok(comp)
+}
+
+/// Parse bytes into a [`CompositionDocument`] (attributes only — no registry
+/// lookup, no Runtime). Split out from [`parse_composition`] so attribute
+/// parsing is testable without registering handlers or starting reactors.
+fn parse_document(bytes: &[u8]) -> CompositionXmlResult<CompositionDocument> {
     let mut handler = CompositionXmlHandler::new();
     let features = FeatureSet::default();
     {
@@ -78,11 +101,10 @@ pub(super) fn parse_composition(
     if let Some(err) = handler.error.take() {
         return Err(err);
     }
-    let doc = handler
+    handler
         .doc
         .take()
-        .ok_or_else(|| CompositionXmlError::Schema("missing root <composition>".into()))?;
-    doc.into_composition(registry)
+        .ok_or_else(|| CompositionXmlError::Schema("missing root <composition>".into()))
 }
 
 #[derive(Default)]
@@ -122,8 +144,18 @@ struct RateDoc {
     global: Option<u32>,
 }
 
+/// Fully-resolved bindings from a parsed `<composition>` document — defaults
+/// applied, `handler` names looked up in the registry — but not yet applied
+/// to a live Runtime. Kept separate from [`Composition`] so attribute
+/// parsing can be tested without starting reactor threads.
+struct ResolvedComposition {
+    config: RuntimeConfig,
+    listens: Vec<TcpListenerConfig>,
+    dials: Vec<TcpConnectorConfig>,
+}
+
 impl CompositionDocument {
-    fn into_composition(self, registry: &CompositionRegistry) -> CompositionXmlResult<Composition> {
+    fn resolve(self, registry: &CompositionRegistry) -> CompositionXmlResult<ResolvedComposition> {
         let mut config = RuntimeConfig::default();
         if let Some(n) = self.worker_threads {
             config.worker_threads = n;
@@ -135,7 +167,8 @@ impl CompositionDocument {
             };
         }
 
-        let mut comp = Composition::new(config);
+        let mut listens = Vec::with_capacity(self.listens.len());
+        let mut dials = Vec::with_capacity(self.dials.len());
 
         for listen in self.listens {
             let addr = parse_addr(
@@ -190,7 +223,7 @@ impl CompositionDocument {
                     global,
                 ));
             }
-            comp = comp.listen_tcp(cfg);
+            listens.push(cfg);
         }
 
         for dial in self.dials {
@@ -220,10 +253,14 @@ impl CompositionDocument {
                 tls: None,
                 server_name: None,
             };
-            comp = comp.dial_tcp(cfg);
+            dials.push(cfg);
         }
 
-        Ok(comp)
+        Ok(ResolvedComposition {
+            config,
+            listens,
+            dials,
+        })
     }
 }
 
@@ -656,22 +693,23 @@ mod tests {
   </listen-tcp>
   <dial-tcp addr="127.0.0.1:9" handler="echo" max-net-in="512" connect-timeout-ms="3000"/>
 </composition>"#;
-        let comp = Composition::from_xml_str(xml, &echo_registry()).expect("parse");
-        assert_eq!(comp.config.worker_threads, 2);
-        assert_eq!(comp.config.storage.threads, 4);
-        assert_eq!(comp.listens.len(), 1);
-        assert_eq!(comp.dials.len(), 1);
-        let listen = &comp.listens[0];
+        let doc = parse_document(xml.as_bytes()).expect("parse");
+        let resolved = doc.resolve(&echo_registry()).expect("resolve");
+        assert_eq!(resolved.config.worker_threads, 2);
+        assert_eq!(resolved.config.storage.threads, 4);
+        assert_eq!(resolved.listens.len(), 1);
+        assert_eq!(resolved.dials.len(), 1);
+        let listen = &resolved.listens[0];
         assert_eq!(listen.max_net_in, 1024);
         assert_eq!(listen.max_net_out, 2048);
         assert_eq!(listen.idle_timeout, Some(Duration::from_millis(1000)));
         assert_eq!(listen.acl.allow.len(), 1);
         assert_eq!(listen.acl.deny.len(), 1);
         assert!(listen.rate_limit.is_some());
-        assert_eq!(comp.dials[0].max_net_in, 512);
-        assert_eq!(comp.dials[0].max_net_out, DEFAULT_MAX_NET_OUT);
+        assert_eq!(resolved.dials[0].max_net_in, 512);
+        assert_eq!(resolved.dials[0].max_net_out, DEFAULT_MAX_NET_OUT);
         assert_eq!(
-            comp.dials[0].connect_timeout,
+            resolved.dials[0].connect_timeout,
             Some(Duration::from_millis(3000))
         );
     }
@@ -724,10 +762,7 @@ mod tests {
         let xml = r#"<composition worker-threads="2">
   <listen-tcp addr="127.0.0.1:0" handler="echo"/>
 </composition>"#;
-        let comp = Composition::from_xml_str(xml, &echo_registry())
-            .expect("parse")
-            .build()
-            .expect("build");
+        let comp = Composition::from_xml_str(xml, &echo_registry()).expect("parse+build");
         let addr = comp.primary_addr().unwrap();
         thread::sleep(Duration::from_millis(50));
         let mut stream = TcpStream::connect(addr).unwrap();
