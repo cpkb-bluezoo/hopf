@@ -64,11 +64,35 @@ pub trait Mailbox: Send {
         false
     }
 
-    /// Accessible message count (includes `\Deleted` until expunge — IMAP model).
+    /// Accessible message count (includes `\Deleted` / session marks until
+    /// expunge — IMAP sequence model).
     fn message_count(&self) -> MailboxResult<u32>;
 
-    /// Total size in octets.
+    /// Total size in octets (all sequence numbers, including deleted).
     fn mailbox_size(&self) -> MailboxResult<u64>;
+
+    /// POP STAT count: messages not marked deleted in this session.
+    fn undeleted_message_count(&self) -> MailboxResult<u32> {
+        let n = self.message_count()?;
+        let mut c = 0u32;
+        for i in 1..=n {
+            if !self.is_deleted(i)? {
+                c += 1;
+            }
+        }
+        Ok(c)
+    }
+
+    /// POP STAT size: octets of messages not session-deleted.
+    fn undeleted_mailbox_size(&self) -> MailboxResult<u64> {
+        let mut total = 0u64;
+        for m in self.messages()? {
+            if !self.is_deleted(m.message_number)? {
+                total += m.size;
+            }
+        }
+        Ok(total)
+    }
 
     /// Enumerate message descriptors in sequence order.
     fn messages(&self) -> MailboxResult<Vec<MessageDescriptor>>;
@@ -112,11 +136,21 @@ pub trait Mailbox: Send {
         flags: &BTreeSet<Flag>,
     ) -> MailboxResult<()>;
 
-    /// Mark deleted (POP DELE / IMAP `\Deleted`).
+    /// Session-local delete mark (POP DELE). In-memory until [`close`](Self::close)
+    /// with `expunge = true`; discarded on `close(false)` or cleared by
+    /// [`undelete_all`](Self::undelete_all). Does **not** rename / persist
+    /// IMAP `\Deleted` — use [`set_flags`](Self::set_flags) for that.
+    fn mark_deleted(&mut self, message_number: u32) -> MailboxResult<()>;
+
+    /// Whether the message has a session delete mark (POP DELE).
+    fn is_deleted(&self, message_number: u32) -> MailboxResult<bool>;
+
+    /// Clear all session delete marks (POP RSET). Does not clear IMAP `\Deleted`.
+    fn undelete_all(&mut self) -> MailboxResult<()>;
+
+    /// Alias for [`mark_deleted`](Self::mark_deleted) (POP DELE).
     fn delete(&mut self, message_number: u32) -> MailboxResult<()> {
-        let mut f = BTreeSet::new();
-        f.insert(Flag::Deleted);
-        self.set_flags(message_number, &f, true)
+        self.mark_deleted(message_number)
     }
 
     /// Begin append (streaming).
@@ -154,15 +188,17 @@ pub trait Mailbox: Send {
         Err(crate::error::MailboxError::Unsupported("COPY"))
     }
 
-    /// MOVE = COPY then mark `\Deleted`.
+    /// MOVE = COPY then IMAP `\Deleted` via [`set_flags`](Self::set_flags).
     fn move_messages(
         &mut self,
         message_numbers: &[u32],
         destination_mailbox: &str,
     ) -> MailboxResult<BTreeMap<u32, u64>> {
         let map = self.copy_messages(message_numbers, destination_mailbox)?;
+        let mut f = BTreeSet::new();
+        f.insert(Flag::Deleted);
         for &n in message_numbers {
-            self.delete(n)?;
+            self.set_flags(n, &f, true)?;
         }
         Ok(map)
     }

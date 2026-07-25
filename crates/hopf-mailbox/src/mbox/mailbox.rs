@@ -29,7 +29,8 @@ struct MboxMsg {
     size: u64,
     unique_id: String,
     uid: u64,
-    deleted: bool,
+    /// POP session delete mark (in-memory until `close(true)`).
+    session_deleted: bool,
 }
 
 /// mbox mailbox with `.flags` sidecar and optional `.gidx`.
@@ -143,7 +144,7 @@ impl MboxMailbox {
                 size,
                 unique_id,
                 uid,
-                deleted: sys.contains(&Flag::Deleted),
+                session_deleted: false,
             });
         }
         index.set_uid_next(uid_next);
@@ -200,7 +201,8 @@ impl MboxMailbox {
         let now = SystemTime::now();
         let snapshot: Vec<MboxMsg> = self.messages.clone();
         for m in &snapshot {
-            if m.deleted {
+            let (sys, _) = self.flags.get(&m.unique_id);
+            if m.session_deleted || sys.contains(&Flag::Deleted) {
                 self.flags.remove(&m.unique_id);
                 self.index.remove(m.uid);
                 continue;
@@ -228,20 +230,24 @@ impl MboxMailbox {
         let segments = scan_mbox(&raw);
         let builder = IndexBuilder::new(self.index_config.clone());
         let mut messages = Vec::new();
-        let mut by_uid: BTreeMap<u64, &MboxMsg> = BTreeMap::new();
-        for m in &snapshot {
-            if !m.deleted {
-                by_uid.insert(m.uid, m);
-            }
-        }
         for (i, (_from, start, end)) in segments.iter().enumerate() {
             let slice = unescape_from(&raw[*start..*end]);
             let unique_id = md5_hex(&slice);
             let (sys, kw) = self.flags.get(&unique_id);
             let uid = snapshot
                 .iter()
-                .find(|m| !m.deleted && m.unique_id == unique_id)
+                .find(|m| {
+                    !m.session_deleted
+                        && !self.flags.get(&m.unique_id).0.contains(&Flag::Deleted)
+                        && m.unique_id == unique_id
+                })
                 .map(|m| m.uid)
+                .or_else(|| {
+                    snapshot
+                        .iter()
+                        .find(|m| m.unique_id == unique_id)
+                        .map(|m| m.uid)
+                })
                 .unwrap_or_else(|| {
                     let u = self.uid_next;
                     self.uid_next += 1;
@@ -265,12 +271,11 @@ impl MboxMailbox {
                 size: slice.len() as u64,
                 unique_id,
                 uid,
-                deleted: false,
+                session_deleted: false,
             });
         }
         self.index.set_uid_next(self.uid_next);
         self.messages = messages;
-        let _ = by_uid;
         Ok(())
     }
 }
@@ -278,18 +283,15 @@ impl MboxMailbox {
 impl Mailbox for MboxMailbox {
     fn close(&mut self, expunge: bool) -> MailboxResult<()> {
         if expunge && !self.read_only {
-            let any = self.messages.iter().any(|m| m.deleted);
+            let any = self.messages.iter().any(|m| {
+                m.session_deleted || self.flags.get(&m.unique_id).0.contains(&Flag::Deleted)
+            });
             if any {
                 self.rewrite_expunge()?;
             }
         } else if !expunge {
             for m in &mut self.messages {
-                if m.deleted {
-                    m.deleted = false;
-                    let (mut f, k) = self.flags.get(&m.unique_id);
-                    f.remove(&Flag::Deleted);
-                    self.flags.set(&m.unique_id, f, k);
-                }
+                m.session_deleted = false;
             }
         }
         self.flags.save()?;
@@ -313,6 +315,23 @@ impl Mailbox for MboxMailbox {
         Ok(self.messages.iter().map(|m| m.size).sum())
     }
 
+    fn undeleted_message_count(&self) -> MailboxResult<u32> {
+        Ok(self
+            .messages
+            .iter()
+            .filter(|m| !m.session_deleted)
+            .count() as u32)
+    }
+
+    fn undeleted_mailbox_size(&self) -> MailboxResult<u64> {
+        Ok(self
+            .messages
+            .iter()
+            .filter(|m| !m.session_deleted)
+            .map(|m| m.size)
+            .sum())
+    }
+
     fn messages(&self) -> MailboxResult<Vec<MessageDescriptor>> {
         let mut out = Vec::new();
         for (i, m) in self.messages.iter().enumerate() {
@@ -328,7 +347,7 @@ impl Mailbox for MboxMailbox {
 
     fn read_message(&self, message_number: u32) -> MailboxResult<Vec<u8>> {
         let msg = self.msg(message_number)?;
-        if msg.deleted {
+        if msg.session_deleted {
             return Err(MailboxError::NotFound(format!("message {message_number}")));
         }
         self.read_raw(msg)
@@ -352,10 +371,7 @@ impl Mailbox for MboxMailbox {
 
     fn flags(&self, message_number: u32) -> MailboxResult<BTreeSet<Flag>> {
         let msg = self.msg(message_number)?;
-        let (mut f, _) = self.flags.get(&msg.unique_id);
-        if msg.deleted {
-            f.insert(Flag::Deleted);
-        }
+        let (f, _) = self.flags.get(&msg.unique_id);
         Ok(f)
     }
 
@@ -384,8 +400,6 @@ impl Mailbox for MboxMailbox {
                 cur.remove(f);
             }
         }
-        let deleted = cur.contains(&Flag::Deleted);
-        self.msg_mut(message_number)?.deleted = deleted;
         self.flags.set(&unique_id, cur.clone(), kw);
         self.index.set_flags(uid, &cur);
         Ok(())
@@ -401,10 +415,25 @@ impl Mailbox for MboxMailbox {
         let unique_id = self.msg(message_number)?.unique_id.clone();
         let (_, kw) = self.flags.get(&unique_id);
         let cur: BTreeSet<Flag> = flags.iter().copied().filter(|f| *f != Flag::Recent).collect();
-        let deleted = cur.contains(&Flag::Deleted);
-        self.msg_mut(message_number)?.deleted = deleted;
         self.flags.set(&unique_id, cur.clone(), kw);
         self.index.set_flags(uid, &cur);
+        Ok(())
+    }
+
+    fn mark_deleted(&mut self, message_number: u32) -> MailboxResult<()> {
+        self.ensure_writable()?;
+        self.msg_mut(message_number)?.session_deleted = true;
+        Ok(())
+    }
+
+    fn is_deleted(&self, message_number: u32) -> MailboxResult<bool> {
+        Ok(self.msg(message_number)?.session_deleted)
+    }
+
+    fn undelete_all(&mut self) -> MailboxResult<()> {
+        for m in &mut self.messages {
+            m.session_deleted = false;
+        }
         Ok(())
     }
 
@@ -493,7 +522,7 @@ impl Mailbox for MboxMailbox {
             size: buf.len() as u64,
             unique_id,
             uid,
-            deleted: flags.contains(&Flag::Deleted),
+            session_deleted: false,
         });
         Ok(uid)
     }

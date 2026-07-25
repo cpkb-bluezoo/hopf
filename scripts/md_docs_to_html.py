@@ -35,6 +35,7 @@ NAV = [
         ("grpc.html", "gRPC"),
         ("ftp.html", "FTP"),
         ("smtp.html", "SMTP"),
+        ("pop3.html", "POP3"),
         ("mailbox.html", "Mailbox"),
     ]),
     ("Cross-cutting", [
@@ -52,6 +53,7 @@ NAV = [
         ("cookbook/grpc.html", "gRPC"),
         ("cookbook/ftp.html", "FTP"),
         ("cookbook/smtp.html", "SMTP"),
+        ("cookbook/pop3.html", "POP3"),
     ]),
 ]
 
