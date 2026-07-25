@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MQTT — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="mqtt.html" aria-current="page">MQTT</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>MQTT</h1>
+        <p class="lead"><code>hopf-mqtt</code> is an MQTT <strong>broker and async client</strong> (Gumdrop <code>mqtt</code> port): MQTT 3.1.1 full semantics plus a useful 5.0 core, with an optional MQTT-over-WebSocket bridge sharing the same broker state as the TCP listener.</p>
+      </header>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#versions">Versions and scope</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#server-quick-start">Server quick start</a></li>
+<li><a href="#connect-handler-spi">Connect handler SPI</a></li>
+<li><a href="#client">Client</a></li>
+<li><a href="#websocket-bridge">WebSocket bridge</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="versions">Versions and scope</h2>
+<table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 60%" />
+</colgroup>
+<thead>
+<tr>
+<th>Area</th>
+<th>Support</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MQTT 3.1.1</td>
+<td>Full semantics — CONNECT/CONNACK, PUBLISH QoS 0/1/2, SUBSCRIBE/SUBACK, UNSUBSCRIBE/UNSUBACK, PINGREQ/PINGRESP, DISCONNECT, retained messages, Will messages, topic wildcards (<code>+</code> / <code>#</code>), session takeover</td>
+</tr>
+<tr>
+<td>MQTT 5.0 (useful core)</td>
+<td>Wire properties, unified reason codes, <strong>Receive Maximum</strong> outbound flow control, subscription options (No Local, Retain As Published, Retain Handling), <strong>Session Expiry Interval</strong> (orphan-and-resume)</td>
+</tr>
+<tr>
+<td>Explicitly out of scope</td>
+<td>Shared subscriptions (<code>$share/...</code>), enhanced AUTH (SASL-style AUTH packets), topic aliases, Will Delay / Message Expiry enforcement, durable offline queues, QoS retry across restarts, file-backed message stores</td>
+</tr>
+</tbody>
+</table>
+<h2 id="architecture">Architecture</h2>
+<pre><code>TCP (1883/8883)  ──┐
+                    ├── MqttFrameParser (push, streaming PUBLISH) ── BrokerState (Arc)
+WebSocket (mqtt) ───┘                                                   │
+                                                                          └── ConnHandle::send (fan-out)</code></pre>
+<p><code>BrokerState</code> is shared behind <code>Arc</code> by every connection regardless of transport or reactor. Delivery to a subscriber never touches that subscriber's <code>Endpoint</code> directly from another thread — it goes through <a href="architecture.html"><code>hopf_core::ConnHandle::send</code></a>, which hops to the owning reactor. PUBLISH payloads are streamed through the codec (<code>MqttFrameHandler::publish_data</code> chunks), never buffered in full.</p>
+<h2 id="server-quick-start">Server quick start</h2>
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> std::sync::Arc;
+<span class="kw">use</span> hopf_core::{Runtime, RuntimeConfig};
+<span class="kw">use</span> hopf_mqtt::broker::BrokerState;
+<span class="kw">use</span> hopf_mqtt::server::{MqttConfig, MqttService};
+
+<span class="kw">let</span> rt = Runtime::start(RuntimeConfig::default())?;
+<span class="kw">let</span> broker = Arc::new(BrokerState::new());
+<span class="kw">let</span> config = MqttConfig::new(<span class="st">&quot;0.0.0.0:1883&quot;</span>.parse()?, broker);
+<span class="kw">let</span> svc = MqttService::new(config);
+<span class="kw">let</span> addr = svc.start(&amp;rt)?;</code></pre></div>
+<p>Example binary: <code>cargo run -p mqtt -- 127.0.0.1:1883</code>.</p>
+<h3 id="mqttconfig">MqttConfig</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>broker</code></td>
+<td>—</td>
+<td>Shared <code>Arc&lt;BrokerState&gt;</code> — reuse the same one across a TCP listener and a WebSocket bridge to share topics/sessions</td>
+</tr>
+<tr>
+<td><code>credentials</code></td>
+<td><code>None</code></td>
+<td><code>Arc&lt;dyn CredentialStore&gt;</code> for CONNECT username/password; <code>None</code> accepts any CONNECT</td>
+</tr>
+<tr>
+<td><code>max_packet_size</code></td>
+<td>library default</td>
+<td>Cap on a packet's Remaining Length (<code>with_max_packet_size</code>)</td>
+</tr>
+<tr>
+<td><code>connect_timeout</code></td>
+<td>10s</td>
+<td>How long to wait for CONNECT before closing an idle new TCP connection</td>
+</tr>
+</tbody>
+</table>
+<h2 id="connect-handler-spi">Connect handler SPI</h2>
+<p>Only CONNECT is staged (Gumdrop shape); PUBLISH and SUBSCRIBE authorization stay inline (accept once connected, reject a malformed filter/topic).</p>
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">pub</span> <span class="kw">trait</span> ConnectHandler: Send {
+    <span class="kw">fn</span> authorize(&amp;mut self, packet: &amp;ConnectPacket) -&gt; ConnectDecision; <span class="co">// Accept | Reject(reason_code)</span>
+}
+
+<span class="kw">pub</span> <span class="kw">trait</span> MqttHandlerFactory: Send + Sync {
+    <span class="kw">fn</span> create(&amp;self) -&gt; Box&lt;dyn ConnectHandler&gt;; <span class="co">// one per accepted connection</span>
+}</code></pre></div>
+<p><code>DefaultConnectHandler</code> / <code>DefaultMqttHandlerFactory</code> accept unconditionally, or require CONNECT username/password to match a <code>CredentialStore</code> when one is configured. Swap in custom policy with <code>MqttService::with_handler_factory</code>.</p>
+<h2 id="client">Client</h2>
+<p>Async, non-blocking client on the <code>hopf-core</code> <code>Runtime</code> / <code>ProtocolHandler</code> SPI, with DNS resolution via <code>hopf-dns</code>. Unlike the staged POP3/IMAP client drivers, MQTT has only one phase once CONNACK arrives, so <code>MqttClientDriver</code> is a flat set of callbacks over <code>MqttClientControl</code> (publish/subscribe/unsubscribe/disconnect) — QoS 1/2 acknowledgment of incoming messages and the PUBREC→PUBREL leg of the client's own QoS 2 publishes are handled automatically by the endpoint.</p>
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> std::sync::Arc;
+<span class="kw">use</span> hopf_core::{Runtime, RuntimeConfig};
+<span class="kw">use</span> hopf_mqtt::client::MqttClient;
+
+<span class="kw">let</span> rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+MqttClient::new(<span class="st">&quot;broker.example.com&quot;</span>, <span class="dv">1883</span>, <span class="st">&quot;my-client-id&quot;</span>)
+    .connect(&amp;rt, Arc::new(driver_factory))?;</code></pre></div>
+<h3 id="client-options">Client builder options</h3>
+<table>
+<thead>
+<tr>
+<th>Builder method</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MqttClient::new(host, port, client_id)</code></td>
+<td>MQTT 5.0</td>
+<td>DNS-resolved</td>
+</tr>
+<tr>
+<td><code>MqttClient::from_addr(addr, client_id)</code></td>
+<td>—</td>
+<td>Pre-resolved, skips DNS</td>
+</tr>
+<tr>
+<td><code>.v3_1_1()</code></td>
+<td>off (5.0)</td>
+<td>CONNECT with MQTT 3.1.1</td>
+</tr>
+<tr>
+<td><code>.clean_start(bool)</code></td>
+<td>true</td>
+<td>Clean Session / Clean Start</td>
+</tr>
+<tr>
+<td><code>.keep_alive(Duration)</code></td>
+<td>60s</td>
+<td><code>Duration::ZERO</code> disables it</td>
+</tr>
+<tr>
+<td><code>.session_expiry(secs)</code></td>
+<td>0</td>
+<td>MQTT 5.0 only</td>
+</tr>
+<tr>
+<td><code>.receive_maximum(n)</code></td>
+<td>unset (unlimited)</td>
+<td>MQTT 5.0 only</td>
+</tr>
+<tr>
+<td><code>.credentials(user, pass)</code></td>
+<td>none</td>
+<td>CONNECT username/password</td>
+</tr>
+<tr>
+<td><code>.will(Will)</code></td>
+<td>none</td>
+<td>Published by the broker on an unclean disconnect</td>
+</tr>
+<tr>
+<td><code>.implicit_tls(connector, name)</code></td>
+<td>off</td>
+<td>MQTTS, typically port 8883</td>
+</tr>
+<tr>
+<td><code>.timeouts(MqttClientTimeouts)</code></td>
+<td>dns=5s, connect=30s, connack=30s, pingresp=10s</td>
+<td>Per-phase deadlines</td>
+</tr>
+</tbody>
+</table>
+<p>Example binary: <code>cargo run -p mqtt-pub -- 127.0.0.1 1883 demo/topic "hello"</code> (also subscribes and prints anything published back to it).</p>
+<h2 id="websocket-bridge">WebSocket bridge</h2>
+<p>Feature <code>websocket</code> (umbrella crate feature <code>mqtt-ws</code>). <code>MqttWsFactory</code> / <code>MqttWsHandler</code> drive the <em>same</em> <code>MqttFrameParser</code> and <code>BrokerState</code> as the TCP listener — a WS-connected client and a TCP-connected client publish and subscribe to each other transparently, sharing one <code>Arc&lt;BrokerState&gt;</code> across both listeners (e.g. via <a href="composition.html"><code>hopf_core::Composition</code></a>).</p>
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> hopf_mqtt::server::DefaultMqttHandlerFactory;
+<span class="kw">use</span> hopf_mqtt::ws::MqttWsFactory;
+<span class="kw">use</span> hopf_websocket::{WebSocketConfig, WebSocketFactory};
+
+<span class="kw">let</span> ws_config = Arc::new(MqttConfig::new(addr, Arc::clone(&amp;broker)));
+<span class="kw">let</span> events = MqttWsFactory::new(ws_config, Arc::new(DefaultMqttHandlerFactory::new(<span class="cn">None</span>)));
+<span class="kw">let</span> ws = WebSocketFactory::new(events, WebSocketConfig::default());
+<span class="co">// wrap `ws` as Arc&lt;dyn ServerHandlerFactory&gt; under CleartextHttpEndpoint / AlpnHttpEndpoint,</span>
+<span class="co">// same as any other hopf-websocket factory — see websocket.html</span></code></pre></div>
+<p>Broker fan-out (<code>BrokerState::publish</code> / <code>deliver_retained</code>) delivers asynchronously, from whichever connection published the message, via <code>ConnHandle::send</code>. A plain <code>ConnHandle</code> writes straight to the raw transport, which would land a bare MQTT packet on the wire unframed and corrupt the WebSocket stream — so the WS bridge registers a <a href="websocket.html"><code>hopf_websocket::framed_ws_conn_handle</code></a>-wrapped handle with the broker instead, which pipes every delivery through WS binary framing first. This is exactly why the WS bridge needed <code>hopf-websocket</code> to expose a per-connection <code>ConnHandle</code> at all — see the <a href="websocket.html#event-handler-spi">WebSocket event handler SPI</a>.</p>
+<p>Because <code>WsEventHandler</code> callbacks have no <code>Endpoint</code> or timer access (only an outbound buffer and a <code>ConnHandle</code>), two things are deliberately <strong>not</strong> shared with the TCP path over WS — see <a href="#limitations">Limitations</a>.</p>
+<h2 id="examples">Examples</h2>
+<div class="sourceCode"><pre class="sourceCode bash"><code class="sourceCode bash"><span class="ex">cargo</span> run -p mqtt -- 127.0.0.1:1883
+<span class="ex">cargo</span> run -p mqtt-pub -- 127.0.0.1 1883 demo/topic <span class="st">&quot;hello from hopf&quot;</span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Package</th>
+<th>Demonstrates</th>
+<th>Knobs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>examples/mqtt</code></td>
+<td>Broker on plain TCP</td>
+<td>arg1 = listen addr</td>
+</tr>
+<tr>
+<td><code>examples/mqtt-pub</code></td>
+<td>Async client: publish once, subscribe and print anything received</td>
+<td>args = host, port, topic, payload</td>
+</tr>
+</tbody>
+</table>
+<p>No environment variables.</p>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li><strong>Session Expiry over WebSocket</strong> — the WS bridge has no timer access, so an unclean WS disconnect always unregisters the session immediately (as if Session Expiry were 0), never orphans. Reconnecting over WS always starts fresh, even if the client requested a nonzero Session Expiry Interval (the CONNACK echoes 0 back rather than promising a resume that will never happen). Session Expiry <strong>is</strong> fully supported over plain TCP.</li>
+<li><strong>No keepalive / CONNACK-timeout enforcement over WebSocket</strong> — MQTT's 1.5×-Keep-Alive rule and the CONNECT wait window are TCP-path-only; a silent or CONNECT-less WS client is only reaped by whatever HTTP/TCP-level idle handling exists underneath.</li>
+<li><strong>Single WS frame per message</strong> — inherited from <code>hopf-websocket</code>: a WebSocket message fragmented across multiple WS frames (non-final frames) is dropped, not reassembled. A single MQTT Control Packet spanning multiple WS <em>frames</em> is unaffected (the frame parser streams across calls same as it does over TCP) — this is specifically about WS-level message fragmentation, which real MQTT-over-WS clients essentially never use.</li>
+<li>No shared subscriptions, enhanced AUTH, topic aliases, Will Delay / Message Expiry enforcement, durable offline queues, QoS retry across restarts, or file-backed message stores (any transport).</li>
+</ul>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

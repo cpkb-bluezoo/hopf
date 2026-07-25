@@ -36,6 +36,7 @@
 //! | [`imap`] | `hopf-imap` | `imap` |
 //! | [`mailbox`] | `hopf-mailbox` | `mailbox` |
 //! | [`otel`] | `hopf-otel` | `otel` |
+//! | [`mqtt`] | `hopf-mqtt` | `mqtt` (`mqtt-ws` for MQTT-over-WebSocket) |
 //!
 //! Documentation: <https://cpkb-bluezoo.github.io/hopf/>
 
@@ -99,3 +100,7 @@ pub use hopf_mailbox as mailbox;
 /// OpenTelemetry OTLP/HTTP and JSONL exporters.
 #[cfg(feature = "otel")]
 pub use hopf_otel as otel;
+
+/// MQTT broker and async client (feature `mqtt-ws` for MQTT-over-WebSocket).
+#[cfg(feature = "mqtt")]
+pub use hopf_mqtt as mqtt;

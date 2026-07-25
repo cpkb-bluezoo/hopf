@@ -1,0 +1,36 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-mqtt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MQTT 3.1.1 / 5 broker and async client for Hopf (Gumdrop mqtt port)"
+readme = "README.md"
+keywords = ["mqtt", "broker", "pubsub", "networking"]
+categories = ["network-programming"]
+
+[features]
+default = []
+# MQTT-over-WebSocket bridge sharing broker state with the TCP listener.
+websocket = ["dep:hopf-websocket", "dep:hopf-http"]
+# Opt-in loopback TCP integration tests. CI runs unit tests without this
+# feature; run manually with `cargo test -p hopf-mqtt --features integration`.
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-auth = { workspace = true }
+hopf-tls = { workspace = true }
+hopf-dns = { workspace = true }
+hopf-websocket = { workspace = true, optional = true }
+hopf-http = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
