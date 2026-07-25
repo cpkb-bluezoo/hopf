@@ -9,7 +9,7 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "POP3 / POP3S server for Hopf (Gumdrop pop3 port)"
+description = "POP3 / POP3S server and async client for Hopf (Gumdrop pop3 port)"
 readme = "README.md"
 keywords = ["pop3", "pop3s", "email", "networking"]
 categories = ["network-programming", "email"]
@@ -26,8 +26,10 @@ hopf-auth = { workspace = true }
 hopf-tls = { workspace = true }
 hopf-otel = { workspace = true }
 hopf-mailbox = { workspace = true }
+hopf-dns = { workspace = true }
 rustls = { workspace = true }
 base64 = "0.22"
+md-5 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

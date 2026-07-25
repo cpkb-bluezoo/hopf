@@ -62,7 +62,7 @@
     <main class="main">
       <header>
         <h1>POP3</h1>
-        <p class="lead"><code>hopf-pop3</code> is a POP3 / POP3S <strong>server</strong> (Gumdrop <code>pop3</code> port). A client is planned as a follow-up.</p>
+        <p class="lead"><code>hopf-pop3</code> is a POP3 / POP3S <strong>server and async client</strong> (Gumdrop <code>pop3</code> port). Use <code>Pop3Fetch</code> for auto-pilot message retrieval or implement <code>Pop3ClientDriver</code> for custom pipelines.</p>
       </header>
       <h2 id="features">Features</h2>
 <table>
@@ -124,6 +124,82 @@ svc.start()?;</code></pre>
 <p>Example binary: <code>cargo run -p pop3 -- 127.0.0.1:1110 localhost ./mail</code>.</p>
 <h2 id="composition">Composition</h2>
 <p>Register a <code>"pop3"</code> handler factory on <code>CompositionRegistry</code> that builds a <code>Pop3ControlHandler</code> (or use <code>Pop3Service::start</code> programmatically).</p>
+<h2 id="client">Client</h2>
+<p>The <code>hopf-pop3</code> crate ships a full async client. The high-level <code>Pop3Fetch</code> auto-pilot handles CAPA negotiation, optional STLS upgrade, USER/PASS or APOP authentication, STAT + RETR for every message, optional DELE, and QUIT.</p>
+<h3 id="pop3fetch-quick-start">Pop3Fetch quick start</h3>
+<pre class="rust,ignore"><code>use std::sync::Arc;
+use hopf_core::{Runtime, RuntimeConfig};
+use hopf_pop3::client::{Pop3Client, Pop3Fetch};
+
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+
+Pop3Client::new(&quot;mail.example.com&quot;, 110)
+    .connect(
+        &amp;rt,
+        Arc::new(
+            Pop3Fetch::new()
+                .credentials(&quot;alice&quot;.into(), &quot;secret&quot;.into())
+                .on_message(Box::new(|id, uid, body| {
+                    println!(&quot;message {id} uid={uid:?} ({} bytes)&quot;, body.len());
+                }))
+                .on_complete(Box::new(|ok| {
+                    println!(&quot;fetch complete: {ok}&quot;);
+                })),
+        ),
+    )?;</code></pre>
+<h3 id="client-options">Client options</h3>
+<table>
+<thead>
+<tr>
+<th>Builder method</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Pop3Client::new(host, port)</code></td>
+<td>—</td>
+<td>Plain TCP; DNS-resolved</td>
+</tr>
+<tr>
+<td><code>.implicit_tls(connector, name)</code></td>
+<td>off</td>
+<td>POP3S (port 995)</td>
+</tr>
+<tr>
+<td><code>.stls(connector, name)</code></td>
+<td>off</td>
+<td>Opportunistic STLS upgrade</td>
+</tr>
+<tr>
+<td><code>.timeouts(Pop3ClientTimeouts)</code></td>
+<td>dns=5s, connect=30s, stage=60s, msg=600s</td>
+<td>Per-phase deadlines</td>
+</tr>
+<tr>
+<td><code>Pop3Fetch::credentials(user, pass)</code></td>
+<td>—</td>
+<td>USER/PASS or APOP</td>
+</tr>
+<tr>
+<td><code>.prefer_apop(true)</code></td>
+<td>false</td>
+<td>Use APOP when server offers timestamp</td>
+</tr>
+<tr>
+<td><code>.delete_after_fetch(true)</code></td>
+<td>false</td>
+<td>DELE each message after RETR</td>
+</tr>
+<tr>
+<td><code>.require_stls(true)</code></td>
+<td>false</td>
+<td>Abort if STLS unavailable</td>
+</tr>
+</tbody>
+</table>
+<p>Example binary: <code>cargo run -p pop3-fetch -- mail.example.com alice secret</code>.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

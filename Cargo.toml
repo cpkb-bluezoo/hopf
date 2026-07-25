@@ -31,6 +31,7 @@ members = [
     "examples/smtp-local",
     "examples/smtp-send",
     "examples/pop3",
+    "examples/pop3-fetch",
 ]
 default-members = [
     "crates/hopf",
