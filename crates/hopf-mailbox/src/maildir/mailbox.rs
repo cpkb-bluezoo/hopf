@@ -190,17 +190,7 @@ impl MaildirMailbox {
 impl Mailbox for MaildirMailbox {
     fn close(&mut self, expunge: bool) -> MailboxResult<()> {
         if expunge && !self.read_only {
-            let mut kept = Vec::new();
-            for m in self.messages.drain(..) {
-                if m.session_deleted || m.filename.flags.contains(&Flag::Deleted) {
-                    let _ = fs::remove_file(&m.path);
-                    self.uidlist.remove_base(&m.filename.base);
-                    self.index.remove(m.uid);
-                } else {
-                    kept.push(m);
-                }
-            }
-            self.messages = kept;
+            let _ = self.expunge()?;
         } else if !expunge {
             for m in &mut self.messages {
                 m.session_deleted = false;
@@ -229,11 +219,7 @@ impl Mailbox for MaildirMailbox {
     }
 
     fn undeleted_message_count(&self) -> MailboxResult<u32> {
-        Ok(self
-            .messages
-            .iter()
-            .filter(|m| !m.session_deleted)
-            .count() as u32)
+        Ok(self.messages.iter().filter(|m| !m.session_deleted).count() as u32)
     }
 
     fn undeleted_mailbox_size(&self) -> MailboxResult<u64> {
@@ -319,11 +305,7 @@ impl Mailbox for MaildirMailbox {
         Ok(())
     }
 
-    fn replace_flags(
-        &mut self,
-        message_number: u32,
-        flags: &BTreeSet<Flag>,
-    ) -> MailboxResult<()> {
+    fn replace_flags(&mut self, message_number: u32, flags: &BTreeSet<Flag>) -> MailboxResult<()> {
         self.ensure_writable()?;
         let idx = self.seq_index(message_number)?;
         self.messages[idx].filename.flags = flags
@@ -335,6 +317,56 @@ impl Mailbox for MaildirMailbox {
         let fl = self.messages[idx].filename.flags.clone();
         self.rename_with_flags(idx)?;
         self.index.set_flags(uid, &fl);
+        Ok(())
+    }
+
+    fn set_keywords(
+        &mut self,
+        message_number: u32,
+        keywords: &BTreeSet<String>,
+        add: bool,
+    ) -> MailboxResult<()> {
+        self.ensure_writable()?;
+        let idx = self.seq_index(message_number)?;
+        if add {
+            for kw in keywords {
+                let letter = self.keywords.letter_for(kw)?;
+                self.messages[idx].filename.keyword_letters.insert(letter);
+            }
+        } else {
+            let current = self.messages[idx].filename.keyword_letters.clone();
+            for c in current {
+                let Some(name) = self.keywords.keyword_for_letter(c) else {
+                    continue;
+                };
+                if keywords.iter().any(|kw| name.eq_ignore_ascii_case(kw)) {
+                    self.messages[idx].filename.keyword_letters.remove(&c);
+                }
+            }
+        }
+        let uid = self.messages[idx].uid;
+        let kw = letters_to_keywords(&self.keywords, &self.messages[idx].filename.keyword_letters);
+        self.rename_with_flags(idx)?;
+        self.index.set_keywords(uid, &kw);
+        Ok(())
+    }
+
+    fn replace_keywords(
+        &mut self,
+        message_number: u32,
+        keywords: &BTreeSet<String>,
+    ) -> MailboxResult<()> {
+        self.ensure_writable()?;
+        let idx = self.seq_index(message_number)?;
+        self.messages[idx].filename.keyword_letters.clear();
+        for kw in keywords {
+            let letter = self.keywords.letter_for(kw)?;
+            self.messages[idx].filename.keyword_letters.insert(letter);
+        }
+        let uid = self.messages[idx].uid;
+        let kw = letters_to_keywords(&self.keywords, &self.messages[idx].filename.keyword_letters);
+        self.rename_with_flags(idx)?;
+        self.index.set_keywords(uid, &kw);
         Ok(())
     }
 
@@ -357,6 +389,27 @@ impl Mailbox for MaildirMailbox {
         Ok(())
     }
 
+    fn expunge(&mut self) -> MailboxResult<Vec<u32>> {
+        self.ensure_writable()?;
+        let mut removed = Vec::new();
+        let mut kept = Vec::new();
+        for (i, m) in self.messages.drain(..).enumerate() {
+            let seq = (i + 1) as u32;
+            if m.session_deleted || m.filename.flags.contains(&Flag::Deleted) {
+                let _ = fs::remove_file(&m.path);
+                self.uidlist.remove_base(&m.filename.base);
+                self.index.remove(m.uid);
+                removed.push(seq);
+            } else {
+                kept.push(m);
+            }
+        }
+        self.messages = kept;
+        self.uidlist.save()?;
+        self.index.save()?;
+        Ok(removed)
+    }
+
     fn start_append(
         &mut self,
         flags: &BTreeSet<Flag>,
@@ -375,7 +428,11 @@ impl Mailbox for MaildirMailbox {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         self.append = Some(AppendState {
-            flags: flags.iter().copied().filter(|f| *f != Flag::Recent).collect(),
+            flags: flags
+                .iter()
+                .copied()
+                .filter(|f| *f != Flag::Recent)
+                .collect(),
             internal_millis,
             buf: Vec::new(),
             tmp_path,
@@ -625,4 +682,103 @@ pub(crate) fn resolve_mailbox_dir(user_root: &Path, name: &str) -> MailboxResult
         .collect::<Vec<_>>()
         .join(".");
     Ok(user_root.join(format!(".{encoded}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::MailboxFactory;
+    use crate::MaildirFactory;
+    use tempfile::tempdir;
+
+    fn sample(subject: &str) -> Vec<u8> {
+        format!(
+            "From: a@b\r\nTo: c@d\r\nSubject: {subject}\r\nMessage-ID: <{subject}@x>\r\n\r\nbody\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn keywords_mutation_renames_and_indexes() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("kwuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        mb.append_message(&sample("k1"), &BTreeSet::new(), None)
+            .unwrap();
+
+        let mut kws = BTreeSet::new();
+        kws.insert("Important".into());
+        kws.insert("Work".into());
+        mb.set_keywords(1, &kws, true).unwrap();
+        let got = mb.keywords(1).unwrap();
+        assert!(got.iter().any(|k| k.eq_ignore_ascii_case("Important")));
+        assert!(got.iter().any(|k| k.eq_ignore_ascii_case("Work")));
+
+        let mut drop = BTreeSet::new();
+        drop.insert("Work".into());
+        mb.set_keywords(1, &drop, false).unwrap();
+        let got = mb.keywords(1).unwrap();
+        assert!(got.iter().any(|k| k.eq_ignore_ascii_case("Important")));
+        assert!(!got.iter().any(|k| k.eq_ignore_ascii_case("Work")));
+
+        let mut repl = BTreeSet::new();
+        repl.insert("Only".into());
+        mb.replace_keywords(1, &repl).unwrap();
+        let got = mb.keywords(1).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(got.iter().any(|k| k.eq_ignore_ascii_case("Only")));
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn expunge_in_place_returns_sequence_numbers() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("exuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        mb.append_message(&sample("a"), &BTreeSet::new(), None)
+            .unwrap();
+        mb.append_message(&sample("b"), &BTreeSet::new(), None)
+            .unwrap();
+        mb.append_message(&sample("c"), &BTreeSet::new(), None)
+            .unwrap();
+
+        let mut del = BTreeSet::new();
+        del.insert(Flag::Deleted);
+        mb.set_flags(2, &del, true).unwrap();
+        let removed = mb.expunge().unwrap();
+        assert_eq!(removed, vec![2]);
+        assert_eq!(mb.message_count().unwrap(), 2);
+        // mailbox remains usable
+        let st = mb.status().unwrap();
+        assert_eq!(st.messages, 2);
+        assert_eq!(st.highest_modseq, 0);
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn status_reports_unseen_and_uid_fields() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("stuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        mb.append_message(&sample("u1"), &BTreeSet::new(), None)
+            .unwrap();
+        let mut seen = BTreeSet::new();
+        seen.insert(Flag::Seen);
+        mb.append_message(&sample("u2"), &seen, None).unwrap();
+
+        let st = mb.status().unwrap();
+        assert_eq!(st.messages, 2);
+        assert_eq!(st.unseen, 1);
+        assert_eq!(st.uid_next, mb.uid_next());
+        assert_eq!(st.uid_validity, mb.uid_validity());
+        assert_eq!(st.recent, 0);
+        assert_eq!(st.highest_modseq, 0);
+        mb.close(false).unwrap();
+    }
 }

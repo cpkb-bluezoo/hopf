@@ -26,7 +26,8 @@ Sibling parsers ([crates.io](https://crates.io); local path override via
 ## Install
 
 The [`hopf`](https://crates.io/crates/hopf) umbrella crate re-exports every
-`hopf-*` crate as a module (`hopf::core`, `hopf::http`, `hopf::smtp`, …):
+`hopf-*` crate as a module (`hopf::core`, `hopf::http`, `hopf::smtp`,
+`hopf::imap`, …):
 
 ```toml
 [dependencies]
@@ -52,6 +53,7 @@ cargo check --workspace
 cargo test --workspace --lib
 # Opt-in I/O smoke suites, run locally per crate when needed:
 cargo test -p hopf-smtp --features integration
+cargo test -p hopf-imap --features integration
 cargo run -p echo -- 127.0.0.1:8080
 cargo run -p tls-echo -- 127.0.0.1:8443
 cargo run -p http-hello -- 127.0.0.1:8080

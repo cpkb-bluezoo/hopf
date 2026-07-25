@@ -28,5 +28,6 @@ pub use message_set::{MessageRange, MessageSet};
 pub use name_codec::MailboxNameCodec;
 pub use search::{MessageContext, SearchCriteria};
 pub use traits::{
-    Mailbox, MailboxAttribute, MailboxFactory, MailboxInfo, MailboxStore, MessageDescriptor,
+    Mailbox, MailboxAttribute, MailboxFactory, MailboxInfo, MailboxStatus, MailboxStore,
+    MessageDescriptor,
 };

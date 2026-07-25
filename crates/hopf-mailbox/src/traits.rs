@@ -48,6 +48,26 @@ pub struct MailboxInfo {
     pub attributes: BTreeSet<MailboxAttribute>,
 }
 
+/// IMAP STATUS snapshot (RFC 9051 §6.3.11).
+///
+/// `unseen` is the 1-based sequence number of the first message without
+/// `\Seen` (0 if none), matching the STATUS UNSEEN item.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MailboxStatus {
+    /// MESSAGES — total accessible messages.
+    pub messages: u32,
+    /// RECENT — count of messages with `\Recent`.
+    pub recent: u32,
+    /// UNSEEN — first unseen sequence number, or 0.
+    pub unseen: u32,
+    /// UIDNEXT.
+    pub uid_next: u64,
+    /// UIDVALIDITY.
+    pub uid_validity: u64,
+    /// HIGHESTMODSEQ (0 when CONDSTORE is unsupported).
+    pub highest_modseq: u64,
+}
+
 /// Single mailbox (folder) — full IMAP surface.
 ///
 /// All methods are blocking. **Indexing and [`search`](Self::search) must run
@@ -55,7 +75,6 @@ pub struct MailboxInfo {
 pub trait Mailbox: Send {
     /// Close; when `expunge` is true, permanently remove `\Deleted` messages.
     fn close(&mut self, expunge: bool) -> MailboxResult<()>;
-
     /// Mailbox name (typically `INBOX`).
     fn name(&self) -> &str;
 
@@ -130,11 +149,28 @@ pub trait Mailbox: Send {
     ) -> MailboxResult<()>;
 
     /// Replace flags entirely (system flags; `Recent` ignored if present).
-    fn replace_flags(
+    fn replace_flags(&mut self, message_number: u32, flags: &BTreeSet<Flag>) -> MailboxResult<()>;
+
+    /// Add or remove user keywords (`add == true` add, else remove).
+    fn set_keywords(
         &mut self,
         message_number: u32,
-        flags: &BTreeSet<Flag>,
-    ) -> MailboxResult<()>;
+        keywords: &BTreeSet<String>,
+        add: bool,
+    ) -> MailboxResult<()> {
+        let _ = (message_number, keywords, add);
+        Err(crate::error::MailboxError::Unsupported("keywords"))
+    }
+
+    /// Replace user keywords entirely.
+    fn replace_keywords(
+        &mut self,
+        message_number: u32,
+        keywords: &BTreeSet<String>,
+    ) -> MailboxResult<()> {
+        let _ = (message_number, keywords);
+        Err(crate::error::MailboxError::Unsupported("keywords"))
+    }
 
     /// Session-local delete mark (POP DELE). In-memory until [`close`](Self::close)
     /// with `expunge = true`; discarded on `close(false)` or cleared by
@@ -151,6 +187,60 @@ pub trait Mailbox: Send {
     /// Alias for [`mark_deleted`](Self::mark_deleted) (POP DELE).
     fn delete(&mut self, message_number: u32) -> MailboxResult<()> {
         self.mark_deleted(message_number)
+    }
+
+    /// Permanently remove session-deleted and `\Deleted` messages, leaving the
+    /// mailbox open. Returns the sequence numbers removed (ascending, pre-renumber).
+    fn expunge(&mut self) -> MailboxResult<Vec<u32>> {
+        Err(crate::error::MailboxError::Unsupported("EXPUNGE"))
+    }
+
+    /// IMAP STATUS snapshot. Default derives counts / UID values from other
+    /// methods; `highest_modseq` comes from [`highest_modseq`](Self::highest_modseq).
+    fn status(&self) -> MailboxResult<MailboxStatus> {
+        let messages = self.message_count()?;
+        let mut recent = 0u32;
+        let mut unseen = 0u32;
+        for i in 1..=messages {
+            let flags = self.flags(i)?;
+            if flags.contains(&Flag::Recent) {
+                recent = recent.saturating_add(1);
+            }
+            if unseen == 0 && !flags.contains(&Flag::Seen) {
+                unseen = i;
+            }
+        }
+        Ok(MailboxStatus {
+            messages,
+            recent,
+            unseen,
+            uid_next: self.uid_next(),
+            uid_validity: self.uid_validity(),
+            highest_modseq: self.highest_modseq(),
+        })
+    }
+
+    /// Highest CONDSTORE mod-sequence (0 = unsupported / unset).
+    fn highest_modseq(&self) -> u64 {
+        0
+    }
+
+    /// Mod-sequence for a message (0 = unsupported / unset).
+    fn modseq(&self, message_number: u32) -> MailboxResult<u64> {
+        let _ = message_number;
+        Ok(0)
+    }
+
+    /// UIDs changed since `modseq` (exclusive). Empty when unsupported.
+    fn changed_since(&self, modseq: u64) -> MailboxResult<Vec<u64>> {
+        let _ = modseq;
+        Ok(Vec::new())
+    }
+
+    /// UIDs expunged since `modseq` (exclusive). Empty when unsupported.
+    fn expunged_since(&self, modseq: u64) -> MailboxResult<Vec<u64>> {
+        let _ = modseq;
+        Ok(Vec::new())
     }
 
     /// Begin append (streaming).
@@ -226,9 +316,16 @@ pub trait MailboxStore: Send {
     /// List mailboxes matching `pattern` (`*` / `%` wildcards).
     fn list(&self, reference: &str, pattern: &str) -> MailboxResult<Vec<MailboxInfo>>;
 
+    /// LSUB — subscribed mailboxes matching `pattern`.
+    ///
+    /// Default returns [`list`](Self::list) when the backend does not track
+    /// subscriptions separately.
+    fn list_subscribed(&self, reference: &str, pattern: &str) -> MailboxResult<Vec<MailboxInfo>> {
+        self.list(reference, pattern)
+    }
+
     /// Create mailbox.
     fn create_mailbox(&mut self, name: &str) -> MailboxResult<()>;
-
     /// Delete mailbox.
     fn delete_mailbox(&mut self, name: &str) -> MailboxResult<()>;
 

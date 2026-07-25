@@ -2,7 +2,7 @@
 
 Umbrella crate for the [Hopf](https://cpkb-bluezoo.github.io/hopf/)
 multi-protocol networking framework. Re-exports every `hopf-*` crate as a
-module (`hopf::core`, `hopf::http`, `hopf::smtp`, …).
+module (`hopf::core`, `hopf::http`, `hopf::smtp`, `hopf::imap`, …).
 
 ```toml
 [dependencies]

@@ -10,9 +10,7 @@ use std::sync::{Arc, Mutex};
 use crate::config::IndexConfig;
 use crate::error::{MailboxError, MailboxResult};
 use crate::name_codec::MailboxNameCodec;
-use crate::traits::{
-    Mailbox, MailboxAttribute, MailboxFactory, MailboxInfo, MailboxStore,
-};
+use crate::traits::{Mailbox, MailboxAttribute, MailboxFactory, MailboxInfo, MailboxStore};
 
 use super::mailbox::{ensure_maildir_layout, resolve_mailbox_dir, MaildirMailbox, MaildirPaths};
 
@@ -136,8 +134,11 @@ impl MailboxStore for MaildirStore {
         for ent in fs::read_dir(root)? {
             let ent = ent?;
             let name = ent.file_name().to_string_lossy().into_owned();
-            if !name.starts_with('.') || name == ".subscriptions" || name == ".uidlist"
-                || name == ".keywords" || name == ".gidx"
+            if !name.starts_with('.')
+                || name == ".subscriptions"
+                || name == ".uidlist"
+                || name == ".keywords"
+                || name == ".gidx"
             {
                 continue;
             }
@@ -155,6 +156,15 @@ impl MailboxStore for MaildirStore {
             }
         }
         Ok(out)
+    }
+
+    fn list_subscribed(&self, reference: &str, pattern: &str) -> MailboxResult<Vec<MailboxInfo>> {
+        let all = self.list(reference, pattern)?;
+        let subs = self.load_subscriptions()?;
+        Ok(all
+            .into_iter()
+            .filter(|info| subs.iter().any(|s| s.eq_ignore_ascii_case(&info.name)))
+            .collect())
     }
 
     fn create_mailbox(&mut self, name: &str) -> MailboxResult<()> {
@@ -269,4 +279,34 @@ fn glob_match(pattern: &str, name: &str) -> bool {
         return name.starts_with(prefix);
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn list_subscribed_filters_by_subscriptions_file() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("subuser").unwrap();
+        store.create_mailbox("Archive").unwrap();
+        store.create_mailbox("Sent").unwrap();
+
+        let listed = store.list("", "*").unwrap();
+        assert!(listed.iter().any(|m| m.name == "INBOX"));
+        assert!(listed.iter().any(|m| m.name == "Archive"));
+        assert!(listed.iter().any(|m| m.name == "Sent"));
+
+        assert!(store.list_subscribed("", "*").unwrap().is_empty());
+
+        store.subscribe("Archive").unwrap();
+        store.subscribe("INBOX").unwrap();
+        let sub = store.list_subscribed("", "*").unwrap();
+        let names: BTreeSet<_> = sub.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, BTreeSet::from(["Archive", "INBOX"]));
+        assert!(!names.contains("Sent"));
+    }
 }
