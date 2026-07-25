@@ -191,6 +191,7 @@
 <li>POP3 / POP3S server (RFC 1939 + CAPA / STLS / UTF8 / SASL AUTH)</li>
 <li>USER/PASS, APOP, TOP, UIDL; staged handler SPI with default mailbox-backed handler</li>
 <li>Opens <code>INBOX</code> via <code>MailboxFactory</code>; session DELE until QUIT expunge</li>
+<li>Async client: <code>Pop3Client</code> + <code>Pop3Fetch</code> auto-pilot; USER/PASS, APOP, AUTH PLAIN, STLS/POP3S</li>
 </ul>
 <h3 id="mailbox-hopf-mailbox">Mailbox (<code>hopf-mailbox</code>)</h3>
 <ul>
@@ -289,8 +290,8 @@
 <td>POP3 / POP3S</td>
 <td><code>hopf-pop3</code></td>
 <td style="text-align: center;">✓</td>
-<td style="text-align: center;">—</td>
-<td>client follow-up</td>
+<td style="text-align: center;">✓</td>
+<td>callback-driven client (<code>Pop3Fetch</code>)</td>
 </tr>
 <tr>
 <td>Mailbox storage</td>
