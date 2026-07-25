@@ -7,7 +7,7 @@ use std::io;
 
 use super::reply::FtpReply;
 
-/// Result alias for the blocking client.
+/// Result alias for the FTP client.
 pub type FtpResult<T> = Result<T, FtpError>;
 
 /// Client-side FTP failure.
@@ -31,6 +31,15 @@ pub enum FtpError {
 impl FtpError {
     pub(crate) fn unexpected(expected: Option<u16>, reply: FtpReply) -> Self {
         Self::Protocol { expected, reply }
+    }
+
+    /// Convert to [`io::Error`], preserving the kind for I/O failures
+    /// (e.g. `TimedOut` from stage timers).
+    pub fn into_io(self) -> io::Error {
+        match self {
+            Self::Io(e) => e,
+            other => io::Error::new(io::ErrorKind::Other, other.to_string()),
+        }
     }
 }
 

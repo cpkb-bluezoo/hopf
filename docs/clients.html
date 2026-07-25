@@ -139,16 +139,23 @@ ProtocolHandler::connected / receive / …</code></pre>
 <td>optional</td>
 <td>SNI / cert verification</td>
 </tr>
+<tr>
+<td><code>connect_timeout</code></td>
+<td><code>None</code></td>
+<td>TCP connect budget (<code>Some(Duration)</code>)</td>
+</tr>
 </tbody>
 </table>
 <p>Full table: <a href="runtime-options.html#tcpconnectorconfig">runtime-options.md</a>.</p>
 <h2 id="connect_by_name">connect_by_name</h2>
-<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_dns::</span>RuntimeDnsExt<span class="op">;</span></span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// Must not run on a reactor thread — blocks the caller until DNS completes.</span></span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect_by_name(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="dv">443</span><span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(MyClient) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> <span class="pp">hopf_core::</span>ProtocolHandler<span class="op">&gt;</span></span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">?;</span></span></code></pre></div>
+<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_dns::</span>RuntimeDnsExt<span class="op">;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="co">// RuntimeDnsExt is implemented for Arc&lt;Runtime&gt;.</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="co">// Returns immediately; DNS + dial run asynchronously.</span></span>
+<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect_by_name(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="dv">443</span><span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(MyClient) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> <span class="pp">hopf_core::</span>ProtocolHandler<span class="op">&gt;</span></span>
+<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">?;</span></span></code></pre></div>
 <table>
 <colgroup>
 <col style="width: 57%" />
@@ -167,15 +174,15 @@ ProtocolHandler::connected / receive / …</code></pre>
 </tr>
 <tr>
 <td>Hostname</td>
-<td><code>DnsResolver::for_runtime</code> → first address → <code>Runtime::connect</code></td>
+<td>Async <code>DnsResolver::resolve</code> → first address → <code>Runtime::connect</code> from the callback</td>
 </tr>
 <tr>
-<td>Timeout</td>
-<td>Resolve wait ≈ DNS default timeout + 1s</td>
+<td>Receiver</td>
+<td><code>Arc&lt;Runtime&gt;</code> (so the DNS callback can dial without parking the caller)</td>
 </tr>
 </tbody>
 </table>
-<p>Prefer resolving on / for the worker that will own the connection when using lower-level <code>DnsResolver</code> APIs. See <a href="dns.html">dns.md</a>.</p>
+<p>See <a href="dns.html">dns.md</a>.</p>
 <h2 id="client-handlers-by-protocol">Client handlers by protocol</h2>
 <table>
 <thead>
@@ -191,11 +198,11 @@ ProtocolHandler::connected / receive / …</code></pre>
 </tr>
 <tr>
 <td>HTTP/1.1</td>
-<td><code>H1Endpoint::client</code> + <code>ClientHandlerFactory</code></td>
+<td><code>connect_http</code> / <code>H1Endpoint::client</code> + <code>ClientHandlerFactory</code></td>
 </tr>
 <tr>
 <td>HTTP/2</td>
-<td><code>H2Endpoint::client</code> + <code>ClientHandlerFactory</code></td>
+<td><code>connect_http</code> (http2) / <code>H2Endpoint::client</code> + <code>ClientHandlerFactory</code></td>
 </tr>
 <tr>
 <td>HTTP/3</td>
@@ -203,11 +210,11 @@ ProtocolHandler::connected / receive / …</code></pre>
 </tr>
 <tr>
 <td>FTP</td>
-<td><code>FtpClientBuilder</code> / blocking client in <code>hopf-ftp</code></td>
+<td><code>FtpClient</code> + <code>FtpPipeline</code> (<code>FtpGet</code> / <code>FtpPut</code>) in <code>hopf-ftp</code></td>
 </tr>
 <tr>
 <td>SMTP</td>
-<td><code>SmtpClientBuilder</code> in <code>hopf-smtp</code></td>
+<td><code>SmtpClient</code> + <code>SmtpSend</code> (or custom <code>SmtpClientHandlerFactory</code>) in <code>hopf-smtp</code></td>
 </tr>
 <tr>
 <td>gRPC</td>
@@ -220,17 +227,20 @@ ProtocolHandler::connected / receive / …</code></pre>
 </tbody>
 </table>
 <h2 id="http-client">HTTP client</h2>
-<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> TcpConnectorConfig<span class="op">};</span></span>
-<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>H1Endpoint<span class="op">,</span> HttpLimits<span class="op">};</span></span>
-<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>ClientHandlerFactory<span class="op">,</span> HttpLimits<span class="op">};</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::client::</span><span class="op">{</span>connect_http<span class="op">,</span> HttpClientTimeouts<span class="op">};</span></span>
 <span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect(<span class="pp">TcpConnectorConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
-<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(<span class="pp">H1Endpoint::</span>client(</span>
-<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>        <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">,</span></span>
-<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>        <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
-<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>        <span class="cn">false</span><span class="op">,</span></span>
-<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    )) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
-<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>))<span class="op">?;</span></span></code></pre></div>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>connect_http(</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>rt<span class="op">,</span>                <span class="co">// &amp;Arc&lt;Runtime&gt;</span></span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;example.com&quot;</span><span class="op">,</span>       <span class="co">// hostname or literal</span></span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>    <span class="dv">80</span><span class="op">,</span></span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">,</span></span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>    <span class="cn">false</span><span class="op">,</span>               <span class="co">// http2 prior-knowledge</span></span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpClientTimeouts::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>    <span class="cn">None</span><span class="op">,</span>                <span class="co">// optional DnsResolver</span></span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div>
 <p><code>ClientHandler::start</code> writes the request; response callbacks follow. Demo: <code>examples/http-get</code>. Deep dive: <a href="http/client.html">http/client.md</a>.</p>
 <h3 id="http-get-flags-summary">http-get flags (summary)</h3>
 <table>
@@ -279,11 +289,11 @@ ProtocolHandler::connected / receive / …</code></pre>
 </tr>
 <tr>
 <td><code>examples/ftp-get</code></td>
-<td>FTP client builder</td>
+<td>Async <code>FtpClient</code> + <code>FtpGet</code></td>
 </tr>
 <tr>
 <td><code>examples/smtp-send</code></td>
-<td>SMTP client builder</td>
+<td>Async <code>SmtpClient</code> + <code>SmtpSend</code></td>
 </tr>
 <tr>
 <td><code>examples/tls-echo</code></td>
@@ -293,9 +303,9 @@ ProtocolHandler::connected / receive / …</code></pre>
 </table>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>Stage-0 TCP dials need a resolved <code>SocketAddr</code> unless using <code>connect_by_name</code>.</li>
-<li><code>connect_by_name</code> blocks the <strong>calling</strong> thread — never invoke it from <code>ProtocolHandler</code> callbacks.</li>
-<li>QUIC dials likewise require a resolved UDP address today.</li>
+<li>Stage-0 TCP dials need a resolved <code>SocketAddr</code> unless using <code>connect_by_name</code> or protocol helpers that resolve (<code>connect_http</code>, <code>SmtpClient</code>, <code>FtpClient</code>).</li>
+<li><code>connect_by_name</code> requires <code>Arc&lt;Runtime&gt;</code>; it schedules DNS asynchronously and returns immediately.</li>
+<li>QUIC dials likewise require a resolved UDP address today (H3-by-name still uses a blocking system resolve in the helper).</li>
 </ul>
 <h2 id="see-also">See also</h2>
 <ul>

@@ -1,16 +1,19 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! SMTP / SMTPS server and blocking client (Gumdrop `org.bluezoo.gumdrop.smtp` port).
+//! SMTP / SMTPS server and async client (Gumdrop `org.bluezoo.gumdrop.smtp` port).
 //!
 //! The protocol engine talks to a staged handler SPI ([`SmtpClientConnected`] →
 //! [`HelloHandler`] → [`MailFromHandler`] → …). Stock handlers:
 //! [`AcceptAllSmtpHandler`] (discard), [`SimpleRelayService`] (open MX relay),
-//! and [`LocalDeliveryService`] (APPEND to local mailboxes). The blocking
-//! [`SmtpClient`] speaks cleartext SMTP, explicit `STARTTLS`, and implicit SMTPS.
+//! and [`LocalDeliveryService`] (APPEND to local mailboxes).
+//!
+//! The async client ([`SmtpClient`] + [`client::SmtpSend`]) uses the
+//! `hopf-core` `Runtime`/`ProtocolHandler` SPI for non-blocking delivery.
 
 #![warn(missing_docs)]
 
-mod client;
+pub mod client;
+
 mod codec;
 mod control;
 mod data;
@@ -24,7 +27,10 @@ mod reply;
 mod service;
 mod session;
 
-pub use client::{dot_stuff, SmtpClient, SmtpClientBuilder, SmtpError, SmtpReply, SmtpResult};
+pub use client::{
+    dot_stuff, SmtpCapabilities, SmtpClient, SmtpClientDriver, SmtpClientEndpoint,
+    SmtpClientHandlerFactory, SmtpClientTimeouts, SmtpError, SmtpReply, SmtpResult, SmtpSend,
+};
 pub use codec::{SmtpCommand, SmtpServerLexer, SmtpToken};
 pub use control::SmtpControlHandler;
 pub use data::{BdatAccumulator, DotUnstuffer};

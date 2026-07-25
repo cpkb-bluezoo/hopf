@@ -1,3 +1,5 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
 [package]
 name = "ftp-get"
 version.workspace = true
@@ -11,4 +13,6 @@ name = "ftp-get"
 path = "main.rs"
 
 [dependencies]
+hopf-core = { workspace = true }
 hopf-ftp = { workspace = true }
+hopf-dns = { workspace = true }

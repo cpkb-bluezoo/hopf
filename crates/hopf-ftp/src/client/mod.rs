@@ -1,619 +1,400 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Blocking FTP / FTPS client.
+//! Async FTP / FTPS client built on the hopf-core [`Runtime`].
+//!
+//! Create an [`FtpClient`] with the desired host / credentials / timeouts,
+//! then call [`FtpClient::connect`] with a [`FtpPipeline`] implementation.
+//! The connection and pipeline run asynchronously; completion is signalled
+//! via callbacks queued through [`FtpSessionWrite`].
+//!
+//! # Quick example
+//!
+//! ```no_run
+//! use std::sync::{Arc, Mutex};
+//! use hopf_core::{Runtime, RuntimeConfig};
+//! use hopf_ftp::{FtpClient, FtpGet};
+//!
+//! let result: Arc<Mutex<Option<std::io::Result<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+//! let result2 = Arc::clone(&result);
+//!
+//! let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+//! FtpClient::new("ftp.example.com")
+//!     .credentials("user", "pass")
+//!     .connect(&rt, Box::new(FtpGet::new("/file.txt", move |r| {
+//!         *result2.lock().unwrap() = Some(r);
+//!     }))).unwrap();
+//! ```
 
-mod error;
-mod reply;
-mod stream;
+mod data;
+mod handler;
+mod pipeline;
+
+pub mod error;
+pub mod reply;
 
 pub use error::{FtpError, FtpResult};
+pub use pipeline::{FtpGet, FtpPut};
 pub use reply::FtpReply;
 
-use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::io;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustls::ClientConfig;
+use hopf_core::{ProtocolHandler, Runtime, TcpConnectorConfig};
+use hopf_dns::{parse_literal_ip, DnsResolver};
 
-use crate::ascii::normalize_ascii_newlines;
-use crate::client::stream::FtpStream;
-use crate::session::TransferType;
+use handler::FtpControlHandler;
 
-use reply::{parse_epsv_port, parse_pasv_addr, read_reply};
+// ---------------------------------------------------------------------------
+// Public callback types
+// ---------------------------------------------------------------------------
 
-/// How the client opens the data connection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FtpDataMode {
-    /// Client dials after `PASV` / `EPSV` (default).
-    #[default]
-    Passive,
-    /// Server dials after `PORT` / `EPRT`.
-    Active,
+/// Callback for RETR / LIST results.
+pub type RetrCallback = Box<dyn FnOnce(io::Result<Vec<u8>>) + Send>;
+/// Callback for STOR results.
+pub type StorCallback = Box<dyn FnOnce(io::Result<()>) + Send>;
+
+// ---------------------------------------------------------------------------
+// Op queue (internal)
+// ---------------------------------------------------------------------------
+
+/// A queued FTP operation.
+pub(crate) enum QueuedOp {
+    /// Raw command: send `verb [arg]\r\n`, expect reply code `expect`.
+    Command {
+        verb: String,
+        arg: Option<String>,
+        expect: u16,
+    },
+    /// Passive RETR.
+    Retr { path: String, callback: RetrCallback },
+    /// Passive STOR (data wrapped in `Arc` to avoid copying in the factory
+    /// closure).
+    Stor {
+        path: String,
+        data: Arc<Vec<u8>>,
+        callback: StorCallback,
+    },
+    /// Passive LIST.
+    List {
+        path: Option<String>,
+        callback: RetrCallback,
+    },
+    /// Send `QUIT` and close.
+    Quit,
 }
 
-/// Builder for [`FtpClient`].
-#[derive(Clone)]
-pub struct FtpClientBuilder {
-    timeout: Duration,
-    data_mode: FtpDataMode,
-    prefer_epsv: bool,
-    tls: Option<Arc<ClientConfig>>,
-    server_name: Option<String>,
-    implicit_tls: bool,
+/// Accumulates [`QueuedOp`]s during [`FtpPipeline::start`].
+pub(crate) struct OpQueue {
+    ops: VecDeque<QueuedOp>,
 }
 
-impl Default for FtpClientBuilder {
+impl OpQueue {
+    pub fn new() -> Self {
+        Self {
+            ops: VecDeque::new(),
+        }
+    }
+
+    pub fn drain(&mut self) -> VecDeque<QueuedOp> {
+        std::mem::take(&mut self.ops)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public session-write trait
+// ---------------------------------------------------------------------------
+
+/// Interface for queuing FTP operations from a [`FtpPipeline`].
+///
+/// Passed to [`FtpPipeline::start`]; enqueues ops that are dispatched
+/// asynchronously after `start` returns.
+pub trait FtpSessionWrite: Send {
+    /// Queue `TYPE I` (binary image transfer mode).
+    fn type_image(&mut self);
+    /// Queue `TYPE A` (ASCII transfer mode).
+    fn type_ascii(&mut self);
+    /// Queue an arbitrary command expecting reply code `expect` (use `0` for
+    /// any `2xx` code).
+    fn command(&mut self, verb: &str, arg: Option<&str>, expect: u16);
+    /// Queue a passive RETR; `callback` receives the file bytes.
+    fn retr(&mut self, path: &str, callback: RetrCallback);
+    /// Queue a passive STOR; `callback` receives `Ok(())` on success.
+    fn stor(&mut self, path: &str, data: Vec<u8>, callback: StorCallback);
+    /// Queue a passive LIST; `callback` receives the directory listing bytes.
+    fn list(&mut self, path: Option<&str>, callback: RetrCallback);
+    /// Queue `QUIT`.
+    fn quit(&mut self);
+}
+
+impl FtpSessionWrite for OpQueue {
+    fn type_image(&mut self) {
+        self.ops.push_back(QueuedOp::Command {
+            verb: "TYPE".into(),
+            arg: Some("I".into()),
+            expect: 200,
+        });
+    }
+
+    fn type_ascii(&mut self) {
+        self.ops.push_back(QueuedOp::Command {
+            verb: "TYPE".into(),
+            arg: Some("A".into()),
+            expect: 200,
+        });
+    }
+
+    fn command(&mut self, verb: &str, arg: Option<&str>, expect: u16) {
+        self.ops.push_back(QueuedOp::Command {
+            verb: verb.to_string(),
+            arg: arg.map(|s| s.to_string()),
+            expect,
+        });
+    }
+
+    fn retr(&mut self, path: &str, callback: RetrCallback) {
+        self.ops.push_back(QueuedOp::Retr {
+            path: path.to_string(),
+            callback,
+        });
+    }
+
+    fn stor(&mut self, path: &str, data: Vec<u8>, callback: StorCallback) {
+        self.ops.push_back(QueuedOp::Stor {
+            path: path.to_string(),
+            data: Arc::new(data),
+            callback,
+        });
+    }
+
+    fn list(&mut self, path: Option<&str>, callback: RetrCallback) {
+        self.ops.push_back(QueuedOp::List {
+            path: path.map(|s| s.to_string()),
+            callback,
+        });
+    }
+
+    fn quit(&mut self) {
+        self.ops.push_back(QueuedOp::Quit);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public pipeline trait
+// ---------------------------------------------------------------------------
+
+/// Drives a complete FTP session from authentication to disconnect.
+///
+/// Implement this to create custom FTP workflows. The built-in
+/// [`FtpGet`] and [`FtpPut`] cover the most common cases.
+pub trait FtpPipeline: Send {
+    /// Session is authenticated; issue operations via `session`.
+    ///
+    /// All ops are queued and dispatched asynchronously after this call
+    /// returns.  Call `session.quit()` to terminate the session cleanly.
+    fn start(&mut self, session: &mut dyn FtpSessionWrite);
+
+    /// All queued operations completed successfully and QUIT was acknowledged.
+    fn done(&mut self);
+
+    /// A fatal error occurred during the session.
+    fn failed(&mut self, err: FtpError);
+}
+
+// ---------------------------------------------------------------------------
+// Timeouts
+// ---------------------------------------------------------------------------
+
+/// Per-phase timeouts for an FTP connection.
+#[derive(Clone, Debug)]
+pub struct FtpClientTimeouts {
+    /// DNS resolution budget (ignored for literal IPs).
+    pub dns: Duration,
+    /// TCP connect handshake budget.
+    pub connect: Duration,
+    /// Control-channel reply budget per command.
+    pub stage: Duration,
+    /// Data-transfer budget (RETR / STOR / LIST).
+    pub data: Duration,
+}
+
+impl Default for FtpClientTimeouts {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(30),
-            data_mode: FtpDataMode::Passive,
-            prefer_epsv: true,
-            tls: None,
-            server_name: None,
-            implicit_tls: false,
+            dns: Duration::from_secs(5),
+            connect: Duration::from_secs(30),
+            stage: Duration::from_secs(60),
+            data: Duration::from_secs(600),
         }
     }
 }
 
-impl FtpClientBuilder {
-    /// Create a builder with defaults (30s timeout, passive, prefer EPSV).
-    pub fn new() -> Self {
-        Self::default()
-    }
+// ---------------------------------------------------------------------------
+// FtpClient
+// ---------------------------------------------------------------------------
 
-    /// I/O timeout applied to control and data sockets.
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// Passive (default) or active data mode.
-    pub fn data_mode(mut self, mode: FtpDataMode) -> Self {
-        self.data_mode = mode;
-        self
-    }
-
-    /// Prefer `EPSV` over `PASV` when the control peer is IPv4/IPv6 (default true).
-    pub fn prefer_epsv(mut self, prefer: bool) -> Self {
-        self.prefer_epsv = prefer;
-        self
-    }
-
-    /// Trust roots / client identity for FTPS (implicit or `AUTH TLS`).
-    pub fn tls(mut self, config: Arc<ClientConfig>, server_name: impl Into<String>) -> Self {
-        self.tls = Some(config);
-        self.server_name = Some(server_name.into());
-        self
-    }
-
-    /// Dial with TLS from the first byte (implicit FTPS, typically port 990).
-    pub fn implicit_tls(mut self, yes: bool) -> Self {
-        self.implicit_tls = yes;
-        self
-    }
-
-    /// Connect and read the welcome `220`.
-    pub fn connect(self, addr: SocketAddr) -> FtpResult<FtpClient> {
-        let mut stream = if self.implicit_tls {
-            let tls = self.tls.as_ref().ok_or_else(|| {
-                FtpError::Config("implicit FTPS requires FtpClientBuilder::tls".into())
-            })?;
-            let name = self.server_name.as_deref().unwrap_or("localhost");
-            FtpStream::connect_tls(addr, Arc::clone(tls), name, self.timeout)?
-        } else {
-            FtpStream::connect_plain(addr, self.timeout)?
-        };
-        let welcome = read_reply(&mut stream)?;
-        if welcome.code != 220 {
-            return Err(FtpError::unexpected(Some(220), welcome));
-        }
-        Ok(FtpClient {
-            stream,
-            peer: addr,
-            timeout: self.timeout,
-            data_mode: self.data_mode,
-            prefer_epsv: self.prefer_epsv,
-            transfer_type: TransferType::Image,
-            protected_data: false,
-            tls: self.tls,
-            server_name: self.server_name,
-            welcome,
-        })
-    }
-}
-
-/// Blocking FTP control session.
+/// Async FTP client configuration and dial factory.
+///
+/// Resolves the host (DNS or literal IP), connects the control channel, and
+/// runs the supplied [`FtpPipeline`] asynchronously on a worker reactor.
 pub struct FtpClient {
-    stream: FtpStream,
-    peer: SocketAddr,
-    timeout: Duration,
-    data_mode: FtpDataMode,
+    host: String,
+    port: u16,
+    timeouts: FtpClientTimeouts,
+    credentials: Option<(String, String)>,
     prefer_epsv: bool,
-    transfer_type: TransferType,
-    protected_data: bool,
-    tls: Option<Arc<ClientConfig>>,
-    server_name: Option<String>,
-    welcome: FtpReply,
+    resolver: Option<Arc<DnsResolver>>,
 }
 
 impl FtpClient {
-    /// Connect with default builder settings (cleartext).
-    pub fn connect(addr: SocketAddr) -> FtpResult<Self> {
-        FtpClientBuilder::new().connect(addr)
+    /// Create a new client targeting `host` (hostname or IP string) on the
+    /// default FTP port (21).
+    pub fn new(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            port: 21,
+            timeouts: FtpClientTimeouts::default(),
+            credentials: None,
+            prefer_epsv: true,
+            resolver: None,
+        }
     }
 
-    /// Welcome reply from the server (`220`).
-    pub fn welcome(&self) -> &FtpReply {
-        &self.welcome
+    /// Override the control port (default: 21).
+    pub fn port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
     }
 
-    /// Control peer address.
-    pub fn peer_addr(&self) -> SocketAddr {
-        self.peer
+    /// Set per-phase timeouts.
+    pub fn timeouts(mut self, t: FtpClientTimeouts) -> Self {
+        self.timeouts = t;
+        self
     }
 
-    /// Send a raw command and read one (possibly multiline) reply.
-    pub fn command(&mut self, verb: &str, arg: Option<&str>) -> FtpResult<FtpReply> {
-        let line = match arg {
-            Some(a) if !a.is_empty() => format!("{verb} {a}\r\n"),
-            _ => format!("{verb}\r\n"),
+    /// Provide USER / PASS credentials.
+    pub fn credentials(mut self, user: impl Into<String>, pass: impl Into<String>) -> Self {
+        self.credentials = Some((user.into(), pass.into()));
+        self
+    }
+
+    /// Prefer `EPSV` over `PASV` for data connections (default: `true`).
+    ///
+    /// When `true`, `EPSV` is sent first; if the server returns `5xx` the
+    /// pipeline will fail.  Set to `false` to always use `PASV`.
+    pub fn prefer_epsv(mut self, yes: bool) -> Self {
+        self.prefer_epsv = yes;
+        self
+    }
+
+    /// Use an existing [`DnsResolver`] instead of creating one per connect.
+    pub fn resolver(mut self, r: Arc<DnsResolver>) -> Self {
+        self.resolver = Some(r);
+        self
+    }
+
+    /// Resolve the host, dial the control connection, and run `pipeline`.
+    ///
+    /// Returns immediately; the connection and pipeline execute asynchronously.
+    pub fn connect(self, rt: &Arc<Runtime>, pipeline: Box<dyn FtpPipeline>) -> io::Result<()> {
+        let host = self.host.clone();
+        let port = self.port;
+        let connect_timeout = Some(self.timeouts.connect);
+
+        // Wrap the pipeline in Arc<Mutex<Option<_>>> so the Fn factory closure
+        // can hand it off exactly once.
+        let pipeline_cell: Arc<Mutex<Option<Box<dyn FtpPipeline>>>> =
+            Arc::new(Mutex::new(Some(pipeline)));
+
+        let creds = self.credentials.clone();
+        let prefer_epsv = self.prefer_epsv;
+        let timeouts = self.timeouts.clone();
+        let rt2 = Arc::clone(rt);
+
+        let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> = {
+            let rt3 = Arc::clone(&rt2);
+            Arc::new(move || {
+                let pl = pipeline_cell
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("FtpClient handler factory called more than once");
+                Box::new(FtpControlHandler::new(
+                    creds.clone(),
+                    prefer_epsv,
+                    timeouts.clone(),
+                    Arc::clone(&rt3),
+                    pl,
+                )) as Box<dyn ProtocolHandler>
+            })
         };
-        self.stream.write_all(line.as_bytes())?;
-        self.stream.flush()?;
-        read_reply(&mut self.stream)
-    }
 
-    /// Expect a reply whose code equals `code`.
-    pub fn expect(&mut self, verb: &str, arg: Option<&str>, code: u16) -> FtpResult<FtpReply> {
-        let r = self.command(verb, arg)?;
-        if r.code != code {
-            return Err(FtpError::unexpected(Some(code), r));
-        }
-        Ok(r)
-    }
-
-    /// `USER` / `PASS` (and optional `ACCT`).
-    pub fn login(&mut self, user: &str, pass: &str) -> FtpResult<()> {
-        self.login_acct(user, pass, None)
-    }
-
-    /// Login with optional account.
-    pub fn login_acct(&mut self, user: &str, pass: &str, acct: Option<&str>) -> FtpResult<()> {
-        let r = self.command("USER", Some(user))?;
-        match r.code {
-            230 => return Ok(()),
-            331 => {}
-            _ => return Err(FtpError::unexpected(Some(331), r)),
-        }
-        let r = self.command("PASS", Some(pass))?;
-        match r.code {
-            230 => Ok(()),
-            332 => {
-                let acct = acct.ok_or_else(|| FtpError::Protocol {
-                    expected: Some(230),
-                    reply: r,
-                })?;
-                self.expect("ACCT", Some(acct), 230)?;
-                Ok(())
+        let dial = {
+            let rt3 = Arc::clone(&rt2);
+            let mh = Arc::clone(&make_handler);
+            move |addr: SocketAddr| -> io::Result<()> {
+                let mh2 = Arc::clone(&mh);
+                rt3.connect(
+                    TcpConnectorConfig::new(addr, move || mh2())
+                        .connect_timeout(connect_timeout),
+                )
             }
-            _ => Err(FtpError::unexpected(Some(230), r)),
-        }
-    }
-
-    /// Explicit FTPS: `AUTH TLS` then rustls handshake, then `PBSZ 0` / `PROT P`.
-    pub fn auth_tls(&mut self) -> FtpResult<()> {
-        let tls = self
-            .tls
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| FtpError::Config("AUTH TLS requires FtpClientBuilder::tls".into()))?;
-        let name = self
-            .server_name
-            .clone()
-            .unwrap_or_else(|| "localhost".into());
-        let r = self.command("AUTH", Some("TLS"))?;
-        if r.code != 234 && r.code != 334 {
-            return Err(FtpError::unexpected(Some(234), r));
-        }
-        self.stream.upgrade_tls(tls, &name)?;
-        self.protect_data()?;
-        Ok(())
-    }
-
-    /// `PBSZ 0` + `PROT P` (data channel TLS). Requires [`FtpClientBuilder::tls`].
-    pub fn protect_data(&mut self) -> FtpResult<()> {
-        if self.tls.is_none() {
-            return Err(FtpError::Config(
-                "PROT P requires FtpClientBuilder::tls".into(),
-            ));
-        }
-        self.expect("PBSZ", Some("0"), 200)?;
-        self.expect("PROT", Some("P"), 200)?;
-        self.protected_data = true;
-        Ok(())
-    }
-
-    /// `OPTS UTF8 ON` / `OFF` (RFC 2640).
-    pub fn opts_utf8(&mut self, on: bool) -> FtpResult<()> {
-        if on {
-            self.expect("OPTS", Some("UTF8 ON"), 200)?;
-        } else {
-            self.expect("OPTS", Some("UTF8 OFF"), 200)?;
-        }
-        Ok(())
-    }
-
-    /// `PROT C` — clear data (after PBSZ if needed).
-    pub fn clear_data_protection(&mut self) -> FtpResult<()> {
-        let _ = self.command("PBSZ", Some("0"))?;
-        self.expect("PROT", Some("C"), 200)?;
-        self.protected_data = false;
-        Ok(())
-    }
-
-    /// `TYPE I`.
-    pub fn type_image(&mut self) -> FtpResult<()> {
-        self.expect("TYPE", Some("I"), 200)?;
-        self.transfer_type = TransferType::Image;
-        Ok(())
-    }
-
-    /// `TYPE A`.
-    pub fn type_ascii(&mut self) -> FtpResult<()> {
-        self.expect("TYPE", Some("A"), 200)?;
-        self.transfer_type = TransferType::Ascii;
-        Ok(())
-    }
-
-    /// `CWD`.
-    pub fn cwd(&mut self, path: &str) -> FtpResult<()> {
-        self.expect("CWD", Some(path), 250)?;
-        Ok(())
-    }
-
-    /// `CDUP`.
-    pub fn cdup(&mut self) -> FtpResult<()> {
-        self.expect("CDUP", None, 250)?;
-        Ok(())
-    }
-
-    /// `PWD` — returns the path text from the 257 reply when parseable.
-    pub fn pwd(&mut self) -> FtpResult<String> {
-        let r = self.expect("PWD", None, 257)?;
-        Ok(parse_pwd_path(&r.text()).unwrap_or_else(|| r.text().to_string()))
-    }
-
-    /// `MKD`.
-    pub fn mkdir(&mut self, path: &str) -> FtpResult<()> {
-        let r = self.command("MKD", Some(path))?;
-        if r.code != 257 && r.code != 250 {
-            return Err(FtpError::unexpected(Some(257), r));
-        }
-        Ok(())
-    }
-
-    /// `RMD`.
-    pub fn rmdir(&mut self, path: &str) -> FtpResult<()> {
-        self.expect("RMD", Some(path), 250)?;
-        Ok(())
-    }
-
-    /// `DELE`.
-    pub fn delete(&mut self, path: &str) -> FtpResult<()> {
-        self.expect("DELE", Some(path), 250)?;
-        Ok(())
-    }
-
-    /// `RNFR` / `RNTO`.
-    pub fn rename(&mut self, from: &str, to: &str) -> FtpResult<()> {
-        self.expect("RNFR", Some(from), 350)?;
-        self.expect("RNTO", Some(to), 250)?;
-        Ok(())
-    }
-
-    /// `SIZE`.
-    pub fn size(&mut self, path: &str) -> FtpResult<u64> {
-        let r = self.expect("SIZE", Some(path), 213)?;
-        r.text()
-            .trim()
-            .parse()
-            .map_err(|_| FtpError::Parse(format!("SIZE: {}", r.text())))
-    }
-
-    /// `MDTM`.
-    pub fn mdtm(&mut self, path: &str) -> FtpResult<String> {
-        let r = self.expect("MDTM", Some(path), 213)?;
-        Ok(r.text().trim().to_string())
-    }
-
-    /// `NOOP`.
-    pub fn noop(&mut self) -> FtpResult<()> {
-        self.expect("NOOP", None, 200)?;
-        Ok(())
-    }
-
-    /// `FEAT` multiline body lines (without the wrapping 211 codes).
-    pub fn feat(&mut self) -> FtpResult<Vec<String>> {
-        let r = self.command("FEAT", None)?;
-        if r.code != 211 {
-            return Err(FtpError::unexpected(Some(211), r));
-        }
-        Ok(r.lines.clone())
-    }
-
-    /// `SYST`.
-    pub fn syst(&mut self) -> FtpResult<String> {
-        let r = self.expect("SYST", None, 215)?;
-        Ok(r.text().to_string())
-    }
-
-    /// `REST` restart marker.
-    pub fn rest(&mut self, offset: u64) -> FtpResult<()> {
-        self.expect("REST", Some(&offset.to_string()), 350)?;
-        Ok(())
-    }
-
-    /// `LIST` → listing bytes.
-    pub fn list(&mut self, path: Option<&str>) -> FtpResult<Vec<u8>> {
-        self.data_retrieve("LIST", path)
-    }
-
-    /// `NLST`.
-    pub fn nlst(&mut self, path: Option<&str>) -> FtpResult<Vec<u8>> {
-        self.data_retrieve("NLST", path)
-    }
-
-    /// `MLSD`.
-    pub fn mlsd(&mut self, path: Option<&str>) -> FtpResult<Vec<u8>> {
-        self.data_retrieve("MLSD", path)
-    }
-
-    /// `RETR` path into a buffer.
-    pub fn retr(&mut self, path: &str) -> FtpResult<Vec<u8>> {
-        let mut buf = self.data_retrieve("RETR", Some(path))?;
-        if self.transfer_type == TransferType::Ascii {
-            buf = normalize_ascii_newlines(&buf);
-        }
-        Ok(buf)
-    }
-
-    /// `RETR` into a writer.
-    pub fn retr_to<W: Write>(&mut self, path: &str, mut out: W) -> FtpResult<u64> {
-        let data = self.retr(path)?;
-        out.write_all(&data)?;
-        Ok(data.len() as u64)
-    }
-
-    /// `STOR` from a buffer.
-    pub fn stor(&mut self, path: &str, body: &[u8]) -> FtpResult<()> {
-        let payload = if self.transfer_type == TransferType::Ascii {
-            normalize_ascii_newlines(body)
-        } else {
-            body.to_vec()
         };
-        self.data_store("STOR", path, &payload)
-    }
 
-    /// `STOR` from a reader (loads into memory for the transfer).
-    pub fn stor_from<R: Read>(&mut self, path: &str, mut reader: R) -> FtpResult<u64> {
-        let mut body = Vec::new();
-        reader.read_to_end(&mut body)?;
-        let n = body.len() as u64;
-        self.stor(path, &body)?;
-        Ok(n)
-    }
+        // Literal IP skips DNS.
+        if let Some(addr) = resolve_literal(&host, port) {
+            return dial(addr);
+        }
 
-    /// `APPE`.
-    pub fn appe(&mut self, path: &str, body: &[u8]) -> FtpResult<()> {
-        let payload = if self.transfer_type == TransferType::Ascii {
-            normalize_ascii_newlines(body)
-        } else {
-            body.to_vec()
+        // Hostname → async DNS.
+        let res = match self.resolver {
+            Some(r) => r,
+            None => Arc::new(DnsResolver::for_runtime(rt)?),
         };
-        self.data_store("APPE", path, &payload)
-    }
 
-    /// Write a local file with `STOR`.
-    pub fn upload_file(&mut self, remote: &str, local: impl AsRef<Path>) -> FtpResult<u64> {
-        let body = std::fs::read(local.as_ref())?;
-        let n = body.len() as u64;
-        self.stor(remote, &body)?;
-        Ok(n)
-    }
-
-    /// Download to a local file with `RETR`.
-    pub fn download_file(&mut self, remote: &str, local: impl AsRef<Path>) -> FtpResult<u64> {
-        let data = self.retr(remote)?;
-        std::fs::write(local.as_ref(), &data)?;
-        Ok(data.len() as u64)
-    }
-
-    /// `ABOR`.
-    pub fn abort(&mut self) -> FtpResult<FtpReply> {
-        self.command("ABOR", None)
-    }
-
-    /// `QUIT` and close the control connection.
-    pub fn quit(mut self) -> FtpResult<()> {
-        let _ = self.command("QUIT", None);
-        self.stream.shutdown();
+        let host_for_err = host.clone();
+        res.resolve(
+            &host,
+            port,
+            Box::new(move |result| {
+                let addrs = match result {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("hopf-ftp: DNS error for {host_for_err}: {e}");
+                        return;
+                    }
+                };
+                if let Some(addr) = addrs.into_iter().next() {
+                    if let Err(e) = dial(addr) {
+                        eprintln!("hopf-ftp: connect error: {e}");
+                    }
+                }
+            }),
+        );
         Ok(())
-    }
-
-    fn data_retrieve(&mut self, verb: &str, arg: Option<&str>) -> FtpResult<Vec<u8>> {
-        let pending = self.setup_data()?;
-        self.write_command(verb, arg)?;
-        // Active: accept before reading 150 so the server's dial can complete.
-        let mut data = pending.complete(self)?;
-        let r = read_reply(&mut self.stream)?;
-        if r.code != 150 && r.code != 125 {
-            return Err(FtpError::unexpected(Some(150), r));
-        }
-        let buf = read_data_to_end(&mut data)?;
-        drop(data);
-        let done = read_reply(&mut self.stream)?;
-        if done.code != 226 && done.code != 250 {
-            return Err(FtpError::unexpected(Some(226), done));
-        }
-        Ok(buf)
-    }
-
-    fn data_store(&mut self, verb: &str, path: &str, body: &[u8]) -> FtpResult<()> {
-        let pending = self.setup_data()?;
-        self.write_command(verb, Some(path))?;
-        let mut data = pending.complete(self)?;
-        let r = read_reply(&mut self.stream)?;
-        if r.code != 150 && r.code != 125 {
-            return Err(FtpError::unexpected(Some(150), r));
-        }
-        data.write_all(body)?;
-        data.flush()?;
-        // Half-close write so the server sees EOF even under TLS.
-        data.shutdown_write();
-        drop(data);
-        let done = read_reply(&mut self.stream)?;
-        if done.code != 226 && done.code != 250 {
-            return Err(FtpError::unexpected(Some(226), done));
-        }
-        Ok(())
-    }
-
-    fn write_command(&mut self, verb: &str, arg: Option<&str>) -> FtpResult<()> {
-        let line = match arg {
-            Some(a) if !a.is_empty() => format!("{verb} {a}\r\n"),
-            _ => format!("{verb}\r\n"),
-        };
-        self.stream.write_all(line.as_bytes())?;
-        self.stream.flush()?;
-        Ok(())
-    }
-
-    fn setup_data(&mut self) -> FtpResult<PendingData> {
-        match self.data_mode {
-            FtpDataMode::Passive => Ok(PendingData::Ready(self.open_passive()?)),
-            FtpDataMode::Active => self.begin_active(),
-        }
-    }
-
-    fn open_passive(&mut self) -> FtpResult<FtpStream> {
-        let addr = if self.prefer_epsv {
-            match self.try_epsv() {
-                Ok(a) => a,
-                Err(_) => self.pasv()?,
-            }
-        } else {
-            self.pasv()?
-        };
-        self.connect_data(addr)
-    }
-
-    fn try_epsv(&mut self) -> FtpResult<SocketAddr> {
-        let r = self.command("EPSV", None)?;
-        if r.code != 229 {
-            return Err(FtpError::unexpected(Some(229), r));
-        }
-        let port = parse_epsv_port(&r.text())?;
-        Ok(SocketAddr::new(self.peer.ip(), port))
-    }
-
-    fn pasv(&mut self) -> FtpResult<SocketAddr> {
-        let r = self.command("PASV", None)?;
-        if r.code != 227 {
-            return Err(FtpError::unexpected(Some(227), r));
-        }
-        parse_pasv_addr(&r.text())
-    }
-
-    fn begin_active(&mut self) -> FtpResult<PendingData> {
-        let bind_ip = match self.stream.local_addr()?.ip() {
-            IpAddr::V4(v) => IpAddr::V4(v),
-            IpAddr::V6(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        };
-        let listener = TcpListener::bind(SocketAddr::new(bind_ip, 0))?;
-        let local = listener.local_addr()?;
-        match local.ip() {
-            IpAddr::V4(v4) => {
-                let o = v4.octets();
-                let p1 = local.port() / 256;
-                let p2 = local.port() % 256;
-                let arg = format!("{},{},{},{},{},{}", o[0], o[1], o[2], o[3], p1, p2);
-                self.expect("PORT", Some(&arg), 200)?;
-            }
-            IpAddr::V6(v6) => {
-                let arg = format!("|2|{}|{}|", v6, local.port());
-                self.expect("EPRT", Some(&arg), 200)?;
-            }
-        }
-        Ok(PendingData::Listening(listener))
-    }
-
-    fn connect_data(&self, addr: SocketAddr) -> FtpResult<FtpStream> {
-        let sock = TcpStream::connect_timeout(&addr, self.timeout)?;
-        sock.set_read_timeout(Some(self.timeout))?;
-        sock.set_write_timeout(Some(self.timeout))?;
-        self.wrap_data(sock)
-    }
-
-    fn wrap_data(&self, sock: TcpStream) -> FtpResult<FtpStream> {
-        if self.protected_data {
-            let tls = self.tls.as_ref().ok_or_else(|| {
-                FtpError::Config("PROT P data requires FtpClientBuilder::tls".into())
-            })?;
-            let name = self.server_name.as_deref().unwrap_or("localhost");
-            FtpStream::handshake_tls(sock, Arc::clone(tls), name)
-        } else {
-            Ok(FtpStream::Plain(sock))
-        }
     }
 }
 
-enum PendingData {
-    Ready(FtpStream),
-    Listening(TcpListener),
-}
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
 
-impl PendingData {
-    fn complete(self, client: &FtpClient) -> FtpResult<FtpStream> {
-        match self {
-            Self::Ready(s) => Ok(s),
-            Self::Listening(listener) => {
-                let (sock, _) = listener.accept()?;
-                sock.set_read_timeout(Some(client.timeout))?;
-                sock.set_write_timeout(Some(client.timeout))?;
-                client.wrap_data(sock)
-            }
-        }
+fn resolve_literal(host: &str, port: u16) -> Option<SocketAddr> {
+    if let Ok(addr) = host.parse::<SocketAddr>() {
+        return Some(addr);
     }
+    parse_literal_ip(host).map(|ip| SocketAddr::new(ip, port))
 }
 
-fn parse_pwd_path(text: &str) -> Option<String> {
-    let start = text.find('"')?;
-    let end = text[start + 1..].find('"')? + start + 1;
-    Some(text[start + 1..end].replace("\"\"", "\""))
-}
-
-/// FTP data peers often close TCP without a TLS `close_notify`.
-fn read_data_to_end(data: &mut FtpStream) -> FtpResult<Vec<u8>> {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 8192];
-    loop {
-        match data.read(&mut tmp) {
-            Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&tmp[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(buf)
-}
+// ---------------------------------------------------------------------------
+// Unit tests (kept from the blocking client)
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use reply::{parse_epsv_port, parse_pasv_addr};
+    use super::reply::{parse_epsv_port, parse_pasv_addr, parse_pwd_path};
 
     #[test]
     fn parse_pasv() {
@@ -623,11 +404,17 @@ mod tests {
 
     #[test]
     fn parse_epsv() {
-        assert_eq!(parse_epsv_port("Entering Extended Passive Mode (|||2121|)").unwrap(), 2121);
+        assert_eq!(
+            parse_epsv_port("Entering Extended Passive Mode (|||2121|)").unwrap(),
+            2121
+        );
     }
 
     #[test]
     fn parse_pwd() {
-        assert_eq!(parse_pwd_path("\"/tmp\" is current directory").as_deref(), Some("/tmp"));
+        assert_eq!(
+            parse_pwd_path("\"/tmp\" is current directory").as_deref(),
+            Some("/tmp")
+        );
     }
 }

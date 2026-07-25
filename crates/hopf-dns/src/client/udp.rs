@@ -15,8 +15,10 @@ impl DnsClientTransport for UdpDnsClientTransport {
         &mut self,
         _server: SocketAddr,
         _message: &[u8],
-        _handler: &mut dyn DnsClientTransportHandler,
+        _handler: Box<dyn DnsClientTransportHandler>,
     ) -> io::Result<()> {
+        // UDP queries go through the reactor-owned socket in DnsResolver.
+        // Returning Err here drops the handler.
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "use DnsResolver UDP path (reactor-owned socket)",

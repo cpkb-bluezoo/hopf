@@ -62,7 +62,7 @@
     <main class="main">
       <header>
         <h1>SMTP</h1>
-        <p class="lead">Crate <code>hopf-smtp</code>: SMTP <strong>server</strong> and blocking <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.smtp</code>. The server speaks RFC 5321 with a wide ESMTP extension set on the Hopf reactor. Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code> (AUTH PLAIN). TLS via <a href="tls.html"><code>hopf-tls</code></a>. Stock services: accept-all, open-relay MX (<a href="dns.html"><code>hopf-dns</code></a>), and local mailbox delivery (<a href="mailbox.html"><code>hopf-mailbox</code></a>).</p>
+        <p class="lead">Crate <code>hopf-smtp</code>: SMTP <strong>server</strong> and callback-driven <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.smtp</code>. The server speaks RFC 5321 with a wide ESMTP extension set on the Hopf reactor. Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code> (AUTH PLAIN). TLS via <a href="tls.html"><code>hopf-tls</code></a>. Stock services: accept-all, open-relay MX (<a href="dns.html"><code>hopf-dns</code></a>), and local mailbox delivery (<a href="mailbox.html"><code>hopf-mailbox</code></a>).</p>
       </header>
       <p>Local delivery lives in <code>hopf_smtp::mailbox</code> as <code>LocalDeliveryService</code> — the Gumdrop-shaped counterpart to <code>SimpleRelayService</code>.</p>
 <div class="toc"><h2 id="contents">Contents</h2>
@@ -550,8 +550,8 @@
 </tbody>
 </table>
 <h2 id="client">Client</h2>
-<p>Blocking <code>SmtpClient</code> / <code>SmtpClientBuilder</code>.</p>
-<h3 id="smtpclientbuilder"><code>SmtpClientBuilder</code></h3>
+<p>Callback-driven <code>SmtpClient</code> on an <code>Arc&lt;Runtime&gt;</code>. DNS (when needed) and the SMTP session run on worker reactors; <code>connect</code> returns immediately. Stock auto-pilot pipeline: <code>SmtpSend</code> (greeting → EHLO → optional STARTTLS/AUTH → MAIL → RCPT → DATA → QUIT).</p>
+<h3 id="smtpclienttimeouts"><code>SmtpClientTimeouts</code></h3>
 <table>
 <thead>
 <tr>
@@ -563,37 +563,92 @@
 </thead>
 <tbody>
 <tr>
-<td><code>timeout</code></td>
+<td><code>dns</code></td>
+<td>duration</td>
+<td>5s</td>
+<td>Hostname resolve budget (ignored for literal IPs / <code>from_addr</code>)</td>
+</tr>
+<tr>
+<td><code>connect</code></td>
 <td>duration</td>
 <td>30s</td>
-<td></td>
+<td>Dial → greeting</td>
 </tr>
 <tr>
-<td>TLS</td>
-<td>client config</td>
-<td>off</td>
-<td><code>.tls(...)</code></td>
+<td><code>stage</code></td>
+<td>duration</td>
+<td>60s</td>
+<td>Per-reply idle after each command</td>
 </tr>
 <tr>
-<td><code>implicit_tls</code></td>
-<td><code>bool</code></td>
-<td><code>false</code></td>
-<td></td>
+<td><code>message</code></td>
+<td>duration</td>
+<td>600s</td>
+<td>Post-DATA-end budget</td>
 </tr>
 </tbody>
 </table>
-<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span>SmtpClientBuilder<span class="op">;</span></span>
-<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> c <span class="op">=</span> <span class="pp">SmtpClientBuilder::</span>new()</span>
-<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>timeout(<span class="pp">std::time::Duration::</span>from_secs(<span class="dv">30</span>))</span>
-<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>connect(addr)<span class="op">?;</span></span>
-<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>ehlo(<span class="st">&quot;client.example&quot;</span>)<span class="op">?;</span></span>
-<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>mail(<span class="st">&quot;alice@example.com&quot;</span>)<span class="op">?;</span></span>
-<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>rcpt(<span class="st">&quot;bob@example.com&quot;</span>)<span class="op">?;</span></span>
-<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>data(<span class="st">b&quot;Subject: hi</span><span class="sc">\r\n\r\n</span><span class="st">Hello</span><span class="sc">\r\n</span><span class="st">&quot;</span>)<span class="op">?;</span></span>
-<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a><span class="co">// or: c.bdat(...) / c.send_message(...)</span></span>
-<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>quit()<span class="op">?;</span></span></code></pre></div>
-<p>Methods: <code>ehlo</code>, <code>helo</code>, <code>mail</code>, <code>rcpt</code>, <code>data</code>, <code>bdat</code>, <code>send_message</code>, <code>starttls</code>, <code>auth_plain</code>, <code>quit</code>. Helper: <code>dot_stuff</code>.</p>
+<h3 id="smtpclient"><code>SmtpClient</code></h3>
+<table>
+<thead>
+<tr>
+<th>Builder</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SmtpClient::new(host, port)</code></td>
+<td>Resolve hostname via <a href="dns.html"><code>hopf-dns</code></a>, then dial</td>
+</tr>
+<tr>
+<td><code>SmtpClient::from_addr(addr)</code></td>
+<td>Skip DNS; dial a resolved <code>SocketAddr</code></td>
+</tr>
+<tr>
+<td><code>.timeouts(SmtpClientTimeouts)</code></td>
+<td>Override defaults</td>
+</tr>
+<tr>
+<td><code>.starttls(connector, server_name)</code></td>
+<td>Explicit STARTTLS after greeting</td>
+</tr>
+<tr>
+<td><code>.implicit_tls(connector, server_name)</code></td>
+<td>SMTPS — TLS from first byte</td>
+</tr>
+<tr>
+<td><code>.resolver(Arc&lt;DnsResolver&gt;)</code></td>
+<td>Reuse a resolver</td>
+</tr>
+<tr>
+<td><code>.connect(&amp;Arc&lt;Runtime&gt;, factory)</code></td>
+<td>Schedule DNS/dial; returns immediately</td>
+</tr>
+</tbody>
+</table>
+<p><code>factory</code> is an <code>Arc&lt;dyn SmtpClientHandlerFactory&gt;</code>. <code>SmtpSend</code> implements that trait for one-shot delivery.</p>
+<div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Runtime<span class="op">,</span> RuntimeConfig<span class="op">};</span></span>
+<span id="cb5-4"><a href="#cb5-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span><span class="op">{</span>SmtpClient<span class="op">,</span> SmtpClientTimeouts<span class="op">,</span> SmtpSend<span class="op">};</span></span>
+<span id="cb5-5"><a href="#cb5-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb5-6"><a href="#cb5-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>)<span class="op">;</span></span>
+<span id="cb5-7"><a href="#cb5-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> send <span class="op">=</span> <span class="pp">SmtpSend::</span>new(<span class="st">&quot;smtp-send.local&quot;</span>)</span>
+<span id="cb5-8"><a href="#cb5-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>mail_from(<span class="st">&quot;alice@example.com&quot;</span>)</span>
+<span id="cb5-9"><a href="#cb5-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>rcpt_to(<span class="st">&quot;bob@example.com&quot;</span>)</span>
+<span id="cb5-10"><a href="#cb5-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>message(<span class="st">b&quot;Subject: hi</span><span class="sc">\r\n\r\n</span><span class="st">Hello</span><span class="sc">\r\n</span><span class="st">&quot;</span><span class="op">.</span>to_vec())</span>
+<span id="cb5-11"><a href="#cb5-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>on_complete(<span class="dt">Box</span><span class="pp">::</span>new(<span class="op">|</span>ok<span class="op">|</span> <span class="pp">eprintln!</span>(<span class="st">&quot;delivery: {ok}&quot;</span>)))</span>
+<span id="cb5-12"><a href="#cb5-12" aria-hidden="true" tabindex="-1"></a><span class="op">;</span></span>
+<span id="cb5-13"><a href="#cb5-13" aria-hidden="true" tabindex="-1"></a><span class="pp">SmtpClient::</span>from_addr(addr)</span>
+<span id="cb5-14"><a href="#cb5-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>timeouts(<span class="pp">SmtpClientTimeouts</span> <span class="op">{</span></span>
+<span id="cb5-15"><a href="#cb5-15" aria-hidden="true" tabindex="-1"></a>        connect<span class="op">:</span> <span class="pp">Duration::</span>from_secs(<span class="dv">10</span>)<span class="op">,</span></span>
+<span id="cb5-16"><a href="#cb5-16" aria-hidden="true" tabindex="-1"></a>        stage<span class="op">:</span> <span class="pp">Duration::</span>from_secs(<span class="dv">10</span>)<span class="op">,</span></span>
+<span id="cb5-17"><a href="#cb5-17" aria-hidden="true" tabindex="-1"></a>        message<span class="op">:</span> <span class="pp">Duration::</span>from_secs(<span class="dv">30</span>)<span class="op">,</span></span>
+<span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">..</span><span class="kw">Default</span><span class="op">::</span><span class="kw">default</span>()</span>
+<span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
+<span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>connect(<span class="op">&amp;</span>rt<span class="op">,</span> <span class="pp">Arc::</span>new(send))<span class="op">?;</span></span></code></pre></div>
+<p><code>SmtpSend</code> builders: <code>mail_from</code>, <code>rcpt_to</code> / <code>recipients</code>, <code>message</code>, <code>require_starttls</code>, <code>auth_plain</code>, <code>on_complete</code>. Custom drivers implement <code>SmtpClientHandlerFactory</code> / <code>SmtpClientDriver</code>. Helper: <code>dot_stuff</code>.</p>
 <h2 id="metrics">Metrics</h2>
 <p><code>SmtpServerMetrics</code>: connections, messages, bytes, <code>auth_ok</code> / <code>auth_fail</code>, <code>starttls</code> counts.</p>
 <h2 id="examples">Examples</h2>
@@ -630,7 +685,7 @@
 </tr>
 <tr>
 <td><code>examples/smtp-send</code></td>
-<td>EHLO→MAIL→RCPT→DATA</td>
+<td>Async <code>SmtpClient</code> + <code>SmtpSend</code></td>
 <td><code>addr</code>, from, to; <code>SMTP_SUBJECT</code> / <code>SMTP_BODY</code></td>
 </tr>
 </tbody>
@@ -642,7 +697,7 @@
 <li>EXPN / ETRN not useful; VRFY always <code>252</code>.</li>
 <li>AUTH PLAIN only (no LOGIN/CRAM/SCRAM on SMTP wire yet).</li>
 <li>No SPF/DKIM/DMARC pipeline (present in Gumdrop SMTP docs; not in Hopf).</li>
-<li>Client is blocking.</li>
+<li>Client completion is callback-driven — callers wait on their own signalling (see <code>examples/smtp-send</code>).</li>
 </ul>
 
       <p class="footer">

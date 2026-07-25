@@ -1,23 +1,26 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Control-channel reply parsing.
+//! FTP control-channel reply type and address-parsing helpers.
 
-use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 
 use super::error::{FtpError, FtpResult};
+
+// ---------------------------------------------------------------------------
+// Reply type
+// ---------------------------------------------------------------------------
 
 /// One FTP reply (possibly multiline).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FtpReply {
     /// Three-digit reply code.
     pub code: u16,
-    /// Lines of text (final line and any continuation bodies without the code prefix).
+    /// Text lines (all continuation bodies plus the terminating line text).
     pub lines: Vec<String>,
 }
 
 impl FtpReply {
-    /// Primary text: first line, or joined lines.
+    /// Primary text: first line, or all lines joined with newlines.
     pub fn text(&self) -> String {
         if self.lines.len() == 1 {
             self.lines[0].clone()
@@ -27,116 +30,69 @@ impl FtpReply {
     }
 }
 
-/// Read one complete reply from `r`.
-pub fn read_reply(r: &mut dyn ReadWrite) -> FtpResult<FtpReply> {
-    let first = read_line(r)?;
-    if first.len() < 3 {
-        return Err(FtpError::Parse(format!("short reply: {first:?}")));
-    }
-    let code: u16 = first[..3]
-        .parse()
-        .map_err(|_| FtpError::Parse(format!("bad code: {first}")))?;
-    let sep = first.as_bytes().get(3).copied().unwrap_or(b' ');
-    let mut lines = Vec::new();
-    if sep == b'-' {
-        let rest = first.get(4..).unwrap_or("").trim_end_matches(['\r', '\n']);
-        if !rest.is_empty() {
-            lines.push(rest.to_string());
-        }
-        loop {
-            let line = read_line(r)?;
-            if line.len() >= 4
-                && line.as_bytes()[3] == b' '
-                && line.as_bytes()[..3]
-                    .iter()
-                    .all(|b| b.is_ascii_digit())
-                && line[..3].parse::<u16>().ok() == Some(code)
-            {
-                let rest = line.get(4..).unwrap_or("").trim_end_matches(['\r', '\n']);
-                lines.push(rest.to_string());
-                break;
-            }
-            lines.push(line.trim_end_matches(['\r', '\n']).to_string());
-        }
-    } else {
-        let rest = first.get(4..).unwrap_or("").trim_end_matches(['\r', '\n']);
-        lines.push(rest.to_string());
-    }
-    Ok(FtpReply { code, lines })
-}
+// ---------------------------------------------------------------------------
+// Address-parsing helpers (kept for async client and external users)
+// ---------------------------------------------------------------------------
 
-/// Object that is both [`Read`] and [`Write`] (control / data streams).
-pub trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
-
-fn read_line(r: &mut dyn Read) -> FtpResult<String> {
-    let mut buf = Vec::with_capacity(128);
-    let mut b = [0u8; 1];
-    loop {
-        r.read_exact(&mut b)?;
-        buf.push(b[0]);
-        if buf.len() >= 2 && buf[buf.len() - 2] == b'\r' && buf[buf.len() - 1] == b'\n' {
-            break;
-        }
-        if buf.len() > 16 * 1024 {
-            return Err(FtpError::Parse("reply line too long".into()));
-        }
-    }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
-/// Parse `227` host/port from reply text.
+/// Parse a `227` PASV reply text into a [`SocketAddr`].
+///
+/// Expects the canonical form `(h1,h2,h3,h4,p1,p2)` anywhere in `text`.
 pub fn parse_pasv_addr(text: &str) -> FtpResult<SocketAddr> {
     let start = text
         .find('(')
-        .ok_or_else(|| FtpError::Parse(format!("PASV: {text}")))?
+        .ok_or_else(|| FtpError::Parse(format!("PASV: no '(' in {text:?}")))?
         + 1;
     let end = text[start..]
         .find(')')
-        .ok_or_else(|| FtpError::Parse(format!("PASV: {text}")))?
+        .ok_or_else(|| FtpError::Parse(format!("PASV: no ')' in {text:?}")))?
         + start;
     let parts: Vec<&str> = text[start..end].split(',').collect();
     if parts.len() != 6 {
-        return Err(FtpError::Parse(format!("PASV fields: {text}")));
+        return Err(FtpError::Parse(format!("PASV: expected 6 fields, got {}", parts.len())));
     }
     let mut nums = [0u16; 6];
     for (i, p) in parts.iter().enumerate() {
         nums[i] = p
             .trim()
             .parse()
-            .map_err(|_| FtpError::Parse(format!("PASV number: {p}")))?;
+            .map_err(|_| FtpError::Parse(format!("PASV: bad number {:?}", p)))?;
     }
-    let ip = Ipv4Addr::new(
-        nums[0] as u8,
-        nums[1] as u8,
-        nums[2] as u8,
-        nums[3] as u8,
-    );
+    let ip = Ipv4Addr::new(nums[0] as u8, nums[1] as u8, nums[2] as u8, nums[3] as u8);
     let port = nums[4] * 256 + nums[5];
     Ok(SocketAddr::from((ip, port)))
 }
 
-/// Parse `229` port from reply text (`|||port|`).
+/// Parse a `229` EPSV reply text into the data port number.
+///
+/// Expects `(|||port|)` or `(|af|addr|port|)` anywhere in `text`.
 pub fn parse_epsv_port(text: &str) -> FtpResult<u16> {
     let start = text
         .find('(')
-        .ok_or_else(|| FtpError::Parse(format!("EPSV: {text}")))?
+        .ok_or_else(|| FtpError::Parse(format!("EPSV: no '(' in {text:?}")))?
         + 1;
     let end = text[start..]
         .find(')')
-        .ok_or_else(|| FtpError::Parse(format!("EPSV: {text}")))?
+        .ok_or_else(|| FtpError::Parse(format!("EPSV: no ')' in {text:?}")))?
         + start;
     let inner = &text[start..end];
-    // |||port| or |2|::1|port|
+    // Format: `|||port|` or `|af|addr|port|`
     let parts: Vec<&str> = inner.split('|').collect();
-    // "", "", "", "port", ""  OR  "", "2", "addr", "port", ""
     let port_str = parts
         .iter()
         .rev()
         .find(|p| !p.is_empty())
         .copied()
-        .ok_or_else(|| FtpError::Parse(format!("EPSV: {text}")))?;
+        .ok_or_else(|| FtpError::Parse(format!("EPSV: no port in {text:?}")))?;
     port_str
         .parse()
-        .map_err(|_| FtpError::Parse(format!("EPSV port: {port_str}")))
+        .map_err(|_| FtpError::Parse(format!("EPSV: bad port {port_str:?}")))
+}
+
+/// Parse a `257` PWD reply and extract the quoted path.
+///
+/// Returns `None` when no double-quoted string is found.
+pub fn parse_pwd_path(text: &str) -> Option<String> {
+    let start = text.find('"')?;
+    let end = text[start + 1..].find('"')? + start + 1;
+    Some(text[start + 1..end].replace("\"\"", "\""))
 }

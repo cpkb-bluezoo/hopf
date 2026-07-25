@@ -112,6 +112,7 @@ struct DialDoc {
     max_net_in: Option<usize>,
     max_net_out: Option<usize>,
     idle_timeout_ms: Option<u64>,
+    connect_timeout_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -214,6 +215,7 @@ impl CompositionDocument {
                 max_net_in: dial.max_net_in.unwrap_or(DEFAULT_MAX_NET_IN),
                 max_net_out: dial.max_net_out.unwrap_or(DEFAULT_MAX_NET_OUT),
                 idle_timeout: dial.idle_timeout_ms.map(Duration::from_millis),
+                connect_timeout: dial.connect_timeout_ms.map(Duration::from_millis),
                 secure: false,
                 tls: None,
                 server_name: None,
@@ -416,6 +418,12 @@ impl CompositionXmlHandler {
                         }
                         "idle-timeout-ms" => {
                             dial.idle_timeout_ms = Some(match parse_u64(&k, &v) {
+                                Ok(n) => n,
+                                Err(e) => return self.fail(e),
+                            });
+                        }
+                        "connect-timeout-ms" => {
+                            dial.connect_timeout_ms = Some(match parse_u64(&k, &v) {
                                 Ok(n) => n,
                                 Err(e) => return self.fail(e),
                             });
@@ -646,7 +654,7 @@ mod tests {
     <deny cidr="192.0.2.0/24"/>
     <rate-limit per-source="10" window-ms="1000" global="100"/>
   </listen-tcp>
-  <dial-tcp addr="127.0.0.1:9" handler="echo" max-net-in="512"/>
+  <dial-tcp addr="127.0.0.1:9" handler="echo" max-net-in="512" connect-timeout-ms="3000"/>
 </composition>"#;
         let comp = Composition::from_xml_str(xml, &echo_registry()).expect("parse");
         assert_eq!(comp.config.worker_threads, 2);
@@ -662,6 +670,10 @@ mod tests {
         assert!(listen.rate_limit.is_some());
         assert_eq!(comp.dials[0].max_net_in, 512);
         assert_eq!(comp.dials[0].max_net_out, DEFAULT_MAX_NET_OUT);
+        assert_eq!(
+            comp.dials[0].connect_timeout,
+            Some(Duration::from_millis(3000))
+        );
     }
 
     #[test]

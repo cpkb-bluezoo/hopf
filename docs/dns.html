@@ -138,7 +138,7 @@
          ├── listen_dns_udp
          ├── listen_dns_dot  (+dot)
          └── listen_dns_doq  (+doq)</code></pre>
-<p><code>RuntimeDnsExt::connect_by_name</code> — blocking resolve then <code>Runtime::connect</code>.</p>
+<p><code>RuntimeDnsExt::connect_by_name</code> — async resolve then <code>Runtime::connect</code> on <code>Arc&lt;Runtime&gt;</code> (returns immediately; dial runs from the DNS callback).</p>
 <h2 id="resolver">Resolver</h2>
 <p><code>DnsResolver</code> — async stub on a reactor.</p>
 <p><strong>Query helpers:</strong> <code>query_a</code>, <code>query_aaaa</code>, <code>query_mx</code>, <code>query_txt</code>, <code>query_ptr</code>, <code>query_srv</code>, generic <code>query(DnsQuestion, …)</code>.</p>
@@ -214,7 +214,8 @@
 </tr>
 </tbody>
 </table>
-<p>Traits: <code>DnsClientTransport</code>, <code>DnsClientTransportHandler</code>.</p>
+<p>Traits: <code>DnsClientTransport</code>, <code>DnsClientTransportHandler</code>. Each <code>send_query</code> schedules I/O and returns immediately; responses arrive via the handler callback — there is no blocking query API.</p>
+<p>DoH (<code>DohClientTransport</code>) and DoQ (<code>DoqClientTransport</code>) are <code>DnsClientTransport</code> implementations: DoH dials HTTP/1.1 POST on a shared <code>Arc&lt;Runtime&gt;</code>; DoQ dials via <code>hopf-quic</code>. Neither waits on the caller thread.</p>
 <p>DoT client uses <code>hopf-tls</code> when feature <code>dot</code> is enabled.</p>
 <h2 id="dnssec">DNSSEC</h2>
 <p>Feature <code>dnssec</code> (+ <code>ring</code>):</p>
@@ -332,16 +333,17 @@
 </tbody>
 </table>
 <h2 id="wiring-apis">Wiring APIs</h2>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_dns::</span><span class="op">{</span>DnsResolver<span class="op">,</span> RuntimeDnsExt<span class="op">};</span></span>
-<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> resolver <span class="op">=</span> <span class="pp">DnsResolver::</span>for_runtime(<span class="op">&amp;</span>rt)<span class="op">?;</span></span>
-<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="co">// or: DnsResolver::for_reactor(reactor_handle)?</span></span>
-<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>resolver<span class="op">.</span>query_a(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="op">|</span>result<span class="op">|</span> <span class="op">{</span> <span class="co">/* … */</span> <span class="op">}</span>)<span class="op">;</span></span>
-<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>resolver<span class="op">.</span>resolve(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="dv">443</span><span class="op">,</span> <span class="op">|</span>addrs<span class="op">|</span> <span class="op">{</span> <span class="co">/* Happy Eyeballs */</span> <span class="op">}</span>)<span class="op">;</span></span>
-<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="co">// Extension on Runtime:</span></span>
-<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect_by_name(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="dv">443</span><span class="op">,</span> factory)<span class="op">?;</span></span></code></pre></div>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_dns::</span><span class="op">{</span>DnsResolver<span class="op">,</span> RuntimeDnsExt<span class="op">};</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> resolver <span class="op">=</span> <span class="pp">DnsResolver::</span>for_runtime(rt<span class="op">.</span>as_ref())<span class="op">?;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co">// or: DnsResolver::for_reactor(reactor_handle)?</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>resolver<span class="op">.</span>query_a(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="op">|</span>result<span class="op">|</span> <span class="op">{</span> <span class="co">/* … */</span> <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>resolver<span class="op">.</span>resolve(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="dv">443</span><span class="op">,</span> <span class="op">|</span>addrs<span class="op">|</span> <span class="op">{</span> <span class="co">/* Happy Eyeballs */</span> <span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co">// Extension on Arc&lt;Runtime&gt; — async DNS, dial from callback:</span></span>
+<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect_by_name(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="dv">443</span><span class="op">,</span> factory)<span class="op">?;</span></span></code></pre></div>
 <p>Forwarder sketch:</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_dns::</span><span class="op">{</span>DnsCache<span class="op">,</span> DnsService<span class="op">,</span> listen_dns_udp<span class="op">,</span> DnsUdpListenConfig<span class="op">};</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>

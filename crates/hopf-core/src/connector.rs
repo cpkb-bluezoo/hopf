@@ -22,6 +22,11 @@ pub struct TcpConnParams {
     pub max_net_out: usize,
     /// Idle timeout (no receive); `None` disables.
     pub idle_timeout: Option<Duration>,
+    /// Wall-clock budget for the nonblocking TCP connect handshake; `None` disables.
+    ///
+    /// Only meaningful when registering a dial (`connecting = true`). Enforced by the
+    /// reactor while [`crate::connection::TcpConnection::is_connecting`] is true.
+    pub connect_timeout: Option<Duration>,
     /// When true, TLS begins from the first byte (TLS-from-accept / TLS-from-dial).
     pub secure: bool,
     /// Server TLS acceptor (listen / STARTTLS).
@@ -41,6 +46,7 @@ impl TcpConnParams {
             max_net_in: DEFAULT_MAX_NET_IN,
             max_net_out: DEFAULT_MAX_NET_OUT,
             idle_timeout: None,
+            connect_timeout: None,
             secure: false,
             tls_acceptor: None,
             tls_connector: None,
@@ -63,6 +69,8 @@ pub struct TcpConnectorConfig {
     pub max_net_out: usize,
     /// Idle timeout (no receive); `None` disables.
     pub idle_timeout: Option<Duration>,
+    /// Wall-clock budget for the TCP connect handshake; `None` disables.
+    pub connect_timeout: Option<Duration>,
     /// When true, TLS handshake begins immediately after TCP connect.
     pub secure: bool,
     /// TLS connector (required when [`secure`](Self::secure) is true).
@@ -83,6 +91,7 @@ impl TcpConnectorConfig {
             max_net_in: DEFAULT_MAX_NET_IN,
             max_net_out: DEFAULT_MAX_NET_OUT,
             idle_timeout: None,
+            connect_timeout: None,
             secure: false,
             tls: None,
             server_name: None,
@@ -107,6 +116,12 @@ impl TcpConnectorConfig {
         self
     }
 
+    /// Set TCP connect handshake timeout (SYN → established).
+    pub fn connect_timeout(mut self, d: Option<Duration>) -> Self {
+        self.connect_timeout = d;
+        self
+    }
+
     /// Enable TLS-from-dial with the given connector and SNI name.
     pub fn with_tls(mut self, connector: SharedTlsConnector, server_name: impl Into<String>) -> Self {
         self.secure = true;
@@ -127,6 +142,7 @@ impl TcpConnectorConfig {
             max_net_in: self.max_net_in,
             max_net_out: self.max_net_out,
             idle_timeout: self.idle_timeout,
+            connect_timeout: self.connect_timeout,
             secure: self.secure,
             tls_acceptor: None,
             tls_connector: self.tls.clone(),

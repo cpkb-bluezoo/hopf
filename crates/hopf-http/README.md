@@ -6,6 +6,9 @@ Stream-first HTTP for Hopf. Applications use [`HttpStream`] plus
 product centre.
 
 - **H1 / H2:** `H1Endpoint`, `H2Endpoint`, `AlpnHttpEndpoint`, `CleartextHttpEndpoint`
+- **Async client dial:** `connect_http(&Arc<Runtime>, host, port, …)` resolves
+  hostnames (or skips DNS for literals), applies `HttpClientTimeouts`
+  (`dns` / `connect` / `stage`), and returns immediately
 - **H2 framing:** push-incremental `H2Parser` + zero-copy frame-handler callbacks;
   HPACK lives under `h2::hpack`
 - **H3** (feature `h3`): QPACK + push `H3Parser`; `listen_h3` / `connect_h3` over

@@ -15,5 +15,6 @@ path = "main.rs"
 [dependencies]
 hopf-core = { workspace = true }
 hopf-http = { workspace = true, features = ["h3"] }
+hopf-dns = { workspace = true }
 hopf-quic = { workspace = true }
 hopf-tls = { workspace = true }

@@ -168,19 +168,19 @@
 <li>Stub resolver + caching forwarder (not authoritative)</li>
 <li>UDP / TCP; optional DoT, DoQ, DoH (features)</li>
 <li>EDNS, cookies, bailiwick; optional DNSSEC validation</li>
-<li><code>connect_by_name</code> for dial-by-hostname on the owning reactor</li>
+<li><code>connect_by_name</code> for async dial-by-hostname on <code>Arc&lt;Runtime&gt;</code></li>
 <li><code>DnsService</code> UDP proxy example (<code>dns-proxy</code>)</li>
 </ul>
 <h3 id="ftp-hopf-ftp">FTP (<code>hopf-ftp</code>)</h3>
 <ul>
-<li>FTP / FTPS server and blocking client (RFC 959 + extensions)</li>
+<li>FTP / FTPS server and callback-driven client (RFC 959 + extensions)</li>
 <li>PASV/EPSV, PORT/EPRT, MLST/MLSD, SIZE, MDTM, OPTS UTF8</li>
 <li>Explicit AUTH TLS and implicit FTPS; PROT P data protection</li>
 <li>TrustPolicy auth; chrooted filesystem handler; PASV via dynamic Runtime listeners</li>
 </ul>
 <h3 id="smtp-hopf-smtp">SMTP (<code>hopf-smtp</code>)</h3>
 <ul>
-<li>SMTP / SMTPS server and blocking client (RFC 5321 + ESMTP)</li>
+<li>SMTP / SMTPS server and callback-driven client (RFC 5321 + ESMTP)</li>
 <li>STARTTLS, AUTH PLAIN, PIPELINING, 8BITMIME, SMTPUTF8, CHUNKING/BDAT, SIZE, DSN, …</li>
 <li>Staged connection-handler SPI (hello → mail → rcpt → data)</li>
 <li>Stock accept-all (discard) handler; <strong>SimpleRelayService</strong> open MX relay (lab use)</li>
@@ -276,14 +276,14 @@
 <td><code>hopf-ftp</code></td>
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
-<td>blocking client</td>
+<td>callback-driven client</td>
 </tr>
 <tr>
 <td>SMTP / SMTPS</td>
 <td><code>hopf-smtp</code></td>
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
-<td>relay demo</td>
+<td>callback-driven client</td>
 </tr>
 <tr>
 <td>POP3 / POP3S</td>

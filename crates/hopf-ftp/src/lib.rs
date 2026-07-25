@@ -1,13 +1,15 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! FTP / FTPS server and blocking client (Gumdrop `org.bluezoo.gumdrop.ftp` port).
+//! FTP / FTPS server and async client (Gumdrop `org.bluezoo.gumdrop.ftp` port).
 //!
 //! The protocol engine talks only to [`FtpConnectionHandler`]. The stock
 //! [`FilesystemFtpHandler`] serves a filesystem root via the Runtime storage
 //! API; deployers override handler callbacks for custom behaviour.
 //!
-//! The blocking [`FtpClient`] speaks cleartext FTP, explicit `AUTH TLS`, and
-//! implicit FTPS, with PASV/EPSV (and optional active PORT/EPRT) data transfers.
+//! The async [`FtpClient`] resolves hostnames via [`hopf_dns`], dials the
+//! control connection on a worker reactor, and drives a [`FtpPipeline`]
+//! through the session lifecycle.  Built-in pipelines: [`FtpGet`] and
+//! [`FtpPut`].
 
 #![warn(missing_docs)]
 
@@ -25,7 +27,11 @@ mod session;
 mod utf8;
 
 pub use ascii::normalize_ascii_newlines;
-pub use client::{FtpClient, FtpClientBuilder, FtpDataMode, FtpError, FtpReply, FtpResult};
+pub use client::{
+    FtpClient, FtpClientTimeouts, FtpError, FtpGet, FtpPipeline, FtpPut, FtpReply, FtpResult,
+    FtpSessionWrite, RetrCallback, StorCallback,
+};
+pub use client::reply::{parse_pasv_addr, parse_epsv_port, parse_pwd_path};
 pub use codec::{FtpCommand, FtpServerLexer, FtpToken};
 pub use control::FtpControlHandler;
 pub use fs::{

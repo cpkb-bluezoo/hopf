@@ -68,6 +68,19 @@ pub trait Endpoint: Send {
     /// Initiate STARTTLS. Stub until Tranche 3 / unsupported on QUIC.
     fn start_tls(&mut self) -> Result<(), StartTlsError>;
 
+    /// Initiate client-side STARTTLS upgrade on a plaintext connection.
+    ///
+    /// Stores the TLS connector; the handshake runs asynchronously and
+    /// [`ProtocolHandler::security_established`] fires once it completes.
+    fn start_client_tls(
+        &mut self,
+        connector: crate::tls::SharedTlsConnector,
+        server_name: &str,
+    ) -> Result<(), StartTlsError> {
+        let _ = (connector, server_name);
+        Err(StartTlsError::Unsupported)
+    }
+
     /// Stop delivering inbound data (`OP_READ` off) — TCP backpressure.
     fn pause_read(&mut self);
 
@@ -91,6 +104,14 @@ pub trait Endpoint: Send {
 
     /// Cloneable handle for hopping work back to this connection from other threads.
     fn handle(&self) -> ConnHandle;
+
+    /// Deliver `err` to the protocol handler and force-close the connection.
+    ///
+    /// Used by stage-timeout timers and other cross-thread failure paths that
+    /// already hold a [`ConnHandle`] but need to surface an error to the app.
+    fn fail(&mut self, err: io::Error) {
+        let _ = err;
+    }
 }
 
 /// Callback type for [`Endpoint::on_write_ready`].

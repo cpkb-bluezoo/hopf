@@ -5,10 +5,13 @@
 //! Applications program against [`HttpStream`] + server / client handlers.
 //! H1 (and later H2/H3) adapt transport [`hopf_core::Endpoint`]s into Streams.
 //! Neither role is privileged — listen and dial are equal birth paths.
+//!
+//! For dialling by hostname with DNS resolution and timeouts, see [`client`].
 
 #![warn(missing_docs)]
 
 pub mod auth;
+pub mod client;
 pub mod h1;
 pub mod h2;
 #[cfg(feature = "h3")]
@@ -16,6 +19,9 @@ pub mod h3;
 pub mod stream;
 
 mod dispatch;
+
+#[cfg(feature = "integration")]
+mod integration;
 
 mod error;
 mod headers;
@@ -28,6 +34,9 @@ pub use auth::{
     build_digest_authorization, parse_basic_authorization, BasicAuthConfig, BasicAuthFactory,
     BearerAuthFactory, DigestAuthConfig, DigestAuthFactory,
 };
+pub use client::{connect_http, HttpClientTimeouts};
+#[cfg(feature = "h3")]
+pub use client::connect_h3_by_name;
 pub use dispatch::AlpnHttpEndpoint;
 pub use error::{HttpError, HttpResult};
 #[allow(deprecated)]

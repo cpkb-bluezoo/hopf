@@ -42,6 +42,8 @@ pub(crate) struct TcpConnection {
     close_requested: bool,
     /// Nonblocking dial in progress — defer `connected` until SO_ERROR / peer_addr.
     connecting: bool,
+    /// Cancel flag for the dial connect-timeout timer (`None` if no timer armed).
+    connect_timeout_cancel: Option<Arc<AtomicBool>>,
     write_ready: Option<WriteReadyCallback>,
     local: SocketAddr,
     remote: SocketAddr,
@@ -121,6 +123,7 @@ impl TcpConnection {
             closing: false,
             close_requested: false,
             connecting,
+            connect_timeout_cancel: None,
             write_ready: None,
             local,
             remote,
@@ -142,12 +145,14 @@ impl TcpConnection {
         }
         match self.stream.take_error() {
             Ok(Some(e)) => {
+                self.cancel_connect_timeout();
                 self.call_error(&e);
                 self.force_close();
                 return false;
             }
             Ok(None) => {}
             Err(e) => {
+                self.cancel_connect_timeout();
                 self.call_error(&e);
                 self.force_close();
                 return false;
@@ -160,6 +165,7 @@ impl TcpConnection {
                     self.local = local;
                 }
                 self.connecting = false;
+                self.cancel_connect_timeout();
                 self.interest_dirty = true;
                 true
             }
@@ -167,6 +173,7 @@ impl TcpConnection {
                 false
             }
             Err(e) => {
+                self.cancel_connect_timeout();
                 self.call_error(&e);
                 self.force_close();
                 false
@@ -177,6 +184,29 @@ impl TcpConnection {
     /// Whether a nonblocking dial is still in progress.
     pub fn is_connecting(&self) -> bool {
         self.connecting
+    }
+
+    /// Arm a connect-timeout cancel flag (reactor schedules the timer itself).
+    pub fn set_connect_timeout_cancel(&mut self, cancel: Arc<AtomicBool>) {
+        self.connect_timeout_cancel = Some(cancel);
+    }
+
+    /// Cancel any armed connect-timeout timer.
+    pub fn cancel_connect_timeout(&mut self) {
+        if let Some(flag) = self.connect_timeout_cancel.take() {
+            flag.store(true, Ordering::Release);
+        }
+    }
+
+    /// Fire connect timeout while still connecting (called from timer → WithConn).
+    pub fn on_connect_timeout(&mut self) {
+        if !self.connecting {
+            return;
+        }
+        self.connect_timeout_cancel = None;
+        let err = io::Error::new(ErrorKind::TimedOut, "TCP connect timed out");
+        self.call_error(&err);
+        self.force_close();
     }
 
     pub fn compute_interest(&self) -> Option<Interest> {
@@ -544,6 +574,7 @@ impl TcpConnection {
     }
 
     pub fn force_close(&mut self) {
+        self.cancel_connect_timeout();
         self.open = false;
         self.closing = true;
         self.close_requested = true;
@@ -678,6 +709,21 @@ impl Endpoint for TcpConnection {
         Ok(())
     }
 
+    fn start_client_tls(
+        &mut self,
+        connector: crate::tls::SharedTlsConnector,
+        server_name: &str,
+    ) -> Result<(), StartTlsError> {
+        if self.tls.is_some() || self.security.is_secure() {
+            return Err(StartTlsError::AlreadySecure);
+        }
+        let session = connector.connect(server_name).map_err(StartTlsError::Io)?;
+        self.tls = Some(session);
+        self.security_notified = false;
+        self.interest_dirty = true;
+        Ok(())
+    }
+
     fn pause_read(&mut self) {
         if self.read_paused {
             return;
@@ -717,5 +763,10 @@ impl Endpoint for TcpConnection {
 
     fn handle(&self) -> ConnHandle {
         ConnHandle::new(self.reactor.clone(), self.token)
+    }
+
+    fn fail(&mut self, err: io::Error) {
+        self.call_error(&err);
+        self.force_close();
     }
 }
