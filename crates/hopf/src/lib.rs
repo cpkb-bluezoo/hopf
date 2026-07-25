@@ -32,6 +32,7 @@
 //! | [`grpc`] | `hopf-grpc` | `grpc` |
 //! | [`ftp`] | `hopf-ftp` | `ftp` |
 //! | [`smtp`] | `hopf-smtp` | `smtp` |
+//! | [`pop3`] | `hopf-pop3` | `pop3` |
 //! | [`mailbox`] | `hopf-mailbox` | `mailbox` |
 //! | [`otel`] | `hopf-otel` | `otel` |
 //!
@@ -81,6 +82,10 @@ pub use hopf_ftp as ftp;
 /// SMTP / SMTPS server, client, relay, and local delivery.
 #[cfg(feature = "smtp")]
 pub use hopf_smtp as smtp;
+
+/// POP3 / POP3S server.
+#[cfg(feature = "pop3")]
+pub use hopf_pop3 as pop3;
 
 /// mbox / Maildir++ mailbox storage SPI.
 #[cfg(feature = "mailbox")]

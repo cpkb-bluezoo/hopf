@@ -15,6 +15,7 @@ members = [
     "crates/hopf-ftp",
     "crates/hopf-smtp",
     "crates/hopf-mailbox",
+    "crates/hopf-pop3",
     "examples/echo",
     "examples/tls-echo",
     "examples/http-hello",
@@ -29,6 +30,7 @@ members = [
     "examples/smtp",
     "examples/smtp-local",
     "examples/smtp-send",
+    "examples/pop3",
 ]
 default-members = [
     "crates/hopf",
@@ -45,6 +47,7 @@ default-members = [
     "crates/hopf-ftp",
     "crates/hopf-smtp",
     "crates/hopf-mailbox",
+    "crates/hopf-pop3",
 ]
 
 [workspace.package]
@@ -82,6 +85,7 @@ hopf-grpc = { version = "0.1.0", path = "crates/hopf-grpc" }
 hopf-ftp = { version = "0.1.0", path = "crates/hopf-ftp" }
 hopf-smtp = { version = "0.1.0", path = "crates/hopf-smtp" }
 hopf-mailbox = { version = "0.1.0", path = "crates/hopf-mailbox" }
+hopf-pop3 = { version = "0.1.0", path = "crates/hopf-pop3" }
 bytes = "1"
 getrandom = "0.2"
 md-5 = "0.10"

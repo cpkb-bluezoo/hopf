@@ -26,7 +26,8 @@ struct MdMsg {
     filename: MaildirFilename,
     size: u64,
     uid: u64,
-    deleted: bool,
+    /// POP session delete mark (in-memory until `close(true)`).
+    session_deleted: bool,
 }
 
 struct AppendState {
@@ -98,16 +99,10 @@ impl MaildirMailbox {
                 filename: parsed,
                 size,
                 uid,
-                deleted: false,
+                session_deleted: false,
             });
         }
         messages.sort_by_key(|m| m.uid);
-        for (i, m) in messages.iter_mut().enumerate() {
-            if m.filename.flags.contains(&Flag::Deleted) {
-                m.deleted = true;
-            }
-            let _ = i;
-        }
 
         let gidx = dir.join(".gidx");
         let mut index = MessageIndex::load(&gidx, index_config.clone())?
@@ -197,7 +192,7 @@ impl Mailbox for MaildirMailbox {
         if expunge && !self.read_only {
             let mut kept = Vec::new();
             for m in self.messages.drain(..) {
-                if m.deleted || m.filename.flags.contains(&Flag::Deleted) {
+                if m.session_deleted || m.filename.flags.contains(&Flag::Deleted) {
                     let _ = fs::remove_file(&m.path);
                     self.uidlist.remove_base(&m.filename.base);
                     self.index.remove(m.uid);
@@ -206,6 +201,10 @@ impl Mailbox for MaildirMailbox {
                 }
             }
             self.messages = kept;
+        } else if !expunge {
+            for m in &mut self.messages {
+                m.session_deleted = false;
+            }
         }
         self.uidlist.save()?;
         self.keywords.save()?;
@@ -227,6 +226,23 @@ impl Mailbox for MaildirMailbox {
 
     fn mailbox_size(&self) -> MailboxResult<u64> {
         Ok(self.messages.iter().map(|m| m.size).sum())
+    }
+
+    fn undeleted_message_count(&self) -> MailboxResult<u32> {
+        Ok(self
+            .messages
+            .iter()
+            .filter(|m| !m.session_deleted)
+            .count() as u32)
+    }
+
+    fn undeleted_mailbox_size(&self) -> MailboxResult<u64> {
+        Ok(self
+            .messages
+            .iter()
+            .filter(|m| !m.session_deleted)
+            .map(|m| m.size)
+            .sum())
     }
 
     fn messages(&self) -> MailboxResult<Vec<MessageDescriptor>> {
@@ -296,10 +312,6 @@ impl Mailbox for MaildirMailbox {
                 self.messages[idx].filename.flags.remove(f);
             }
         }
-        self.messages[idx].deleted = self.messages[idx]
-            .filename
-            .flags
-            .contains(&Flag::Deleted);
         let uid = self.messages[idx].uid;
         let fl = self.messages[idx].filename.flags.clone();
         self.rename_with_flags(idx)?;
@@ -319,14 +331,29 @@ impl Mailbox for MaildirMailbox {
             .copied()
             .filter(|f| *f != Flag::Recent)
             .collect();
-        self.messages[idx].deleted = self.messages[idx]
-            .filename
-            .flags
-            .contains(&Flag::Deleted);
         let uid = self.messages[idx].uid;
         let fl = self.messages[idx].filename.flags.clone();
         self.rename_with_flags(idx)?;
         self.index.set_flags(uid, &fl);
+        Ok(())
+    }
+
+    fn mark_deleted(&mut self, message_number: u32) -> MailboxResult<()> {
+        self.ensure_writable()?;
+        let idx = self.seq_index(message_number)?;
+        self.messages[idx].session_deleted = true;
+        Ok(())
+    }
+
+    fn is_deleted(&self, message_number: u32) -> MailboxResult<bool> {
+        let idx = self.seq_index(message_number)?;
+        Ok(self.messages[idx].session_deleted)
+    }
+
+    fn undelete_all(&mut self) -> MailboxResult<()> {
+        for m in &mut self.messages {
+            m.session_deleted = false;
+        }
         Ok(())
     }
 
@@ -418,7 +445,7 @@ impl Mailbox for MaildirMailbox {
             filename,
             size,
             uid,
-            deleted: flags.contains(&Flag::Deleted),
+            session_deleted: false,
         });
         Ok(uid)
     }

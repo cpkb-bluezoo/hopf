@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cookbook: WebDAV — Hopf</title>
+  <title>Cookbook: POP3 — Hopf</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
@@ -51,24 +51,24 @@
 <li><a href="../cookbook/tls-echo.html">TLS echo</a></li>
 <li><a href="../cookbook/http-hello-get.html">HTTP hello / get</a></li>
 <li><a href="../cookbook/dns-proxy.html">DNS proxy</a></li>
-<li><a href="../cookbook/webdav.html" aria-current="page">WebDAV</a></li>
+<li><a href="../cookbook/webdav.html">WebDAV</a></li>
 <li><a href="../cookbook/websocket.html">WebSocket</a></li>
 <li><a href="../cookbook/grpc.html">gRPC</a></li>
 <li><a href="../cookbook/ftp.html">FTP</a></li>
 <li><a href="../cookbook/smtp.html">SMTP</a></li>
-<li><a href="../cookbook/pop3.html">POP3</a></li>
+<li><a href="../cookbook/pop3.html" aria-current="page">POP3</a></li>
 </ul>
 </nav>
     <main class="main">
       <header>
-        <h1>Cookbook: WebDAV</h1>
-        <p class="lead">```bash</p>
+        <h1>Cookbook: POP3</h1>
+        <p class="lead">Serve POP3 against a Maildir++ root:</p>
       </header>
-      <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="fu">mkdir</span> <span class="at">-p</span> /tmp/webdav-root</span>
-<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> webdav <span class="at">--</span> /tmp/webdav-root</span>
-<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="co"># or: cargo run -p webdav -- 127.0.0.1:8080 /path/to/files</span></span></code></pre></div>
-<p>Env: <code>WEBDAV_ROOT</code>, <code>WEBDAV_WRITE=1|true</code> (default write on). Default listen <code>127.0.0.1:8080</code>.</p>
-<p>Source: <a href="../../examples/webdav"><code>examples/webdav</code></a>. Guide: <a href="../webdav.html">WebDAV</a>.</p>
+      <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> pop3 <span class="at">--</span> 127.0.0.1:1110 localhost ./mail</span></code></pre></div>
+<p>Default demo credentials: <code>alice</code> / <code>secret</code>. Deliver mail first with <code>smtp-local</code> into the same maildir root, then retrieve with any POP3 client:</p>
+<div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="co"># after smtp-local has APPENDed to ./mail/alice/</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="bu">printf</span> <span class="st">&#39;USER alice\r\nPASS secret\r\nSTAT\r\nQUIT\r\n&#39;</span> <span class="kw">|</span> <span class="ex">nc</span> 127.0.0.1 1110</span></code></pre></div>
+<p>See <a href="../pop3.html">POP3</a> for the handler SPI and CAPA surface.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

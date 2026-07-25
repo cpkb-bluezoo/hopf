@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>POP3 — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html" aria-current="page">POP3</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>POP3</h1>
+        <p class="lead"><code>hopf-pop3</code> is a POP3 / POP3S <strong>server</strong> (Gumdrop <code>pop3</code> port). A client is planned as a follow-up.</p>
+      </header>
+      <h2 id="features">Features</h2>
+<table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 60%" />
+</colgroup>
+<thead>
+<tr>
+<th>Area</th>
+<th>Support</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Commands</td>
+<td>USER/PASS, APOP, AUTH (SASL), STAT, LIST, RETR, DELE, RSET, TOP, UIDL, CAPA, NOOP, QUIT, STLS, UTF8</td>
+</tr>
+<tr>
+<td>Auth</td>
+<td><code>CredentialStore</code> — USER/PASS, APOP, PLAIN, LOGIN, CRAM-MD5, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL</td>
+</tr>
+<tr>
+<td>TLS</td>
+<td>STLS and implicit POP3S</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td><code>MailboxFactory</code> → open <code>INBOX</code>; open/read/close on the storage pool</td>
+</tr>
+<tr>
+<td>Deletion</td>
+<td>Session marks until QUIT <code>close(true)</code>; RSET clears; disconnect discards</td>
+</tr>
+</tbody>
+</table>
+<p>Control commands are lexed incrementally with <code>ByteStreamLexer</code> (<code>KEYWORD [SP TEXT] CRLF</code>) — not “buffer until CRLF then re-parse”.</p>
+<h2 id="handler-spi">Handler SPI</h2>
+<p>Gumdrop-style staged traits:</p>
+<ul>
+<li><code>ClientConnected</code> → greeting</li>
+<li><code>AuthorizationHandler</code> → post-credential policy (<code>proceed_open</code> opens INBOX)</li>
+<li><code>TransactionHandler</code> → STAT/LIST/RETR/DELE/RSET/TOP/UIDL/QUIT</li>
+</ul>
+<p>State traits constrain which replies are legal at each stage. The default handler (<code>DefaultPop3Handler</code>) uses the mailbox API and delegates open/RETR/TOP/QUIT I/O to the protocol via <code>proceed_*</code>.</p>
+<h2 id="quick-start">Quick start</h2>
+<pre class="rust,ignore"><code>use std::sync::Arc;
+use hopf_auth::PasswordStore;
+use hopf_core::{Runtime, RuntimeConfig};
+use hopf_mailbox::MaildirFactory;
+use hopf_pop3::{Pop3Config, Pop3Service};
+
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+let factory = Arc::new(MaildirFactory::new(&quot;./mail&quot;));
+let store = Arc::new(PasswordStore::new().with_user(&quot;alice&quot;, &quot;secret&quot;));
+let config = Pop3Config::new(&quot;127.0.0.1:1110&quot;.parse()?, &quot;localhost&quot;, store, factory);
+let svc = Pop3Service::new(config, Arc::clone(&amp;rt));
+svc.start()?;</code></pre>
+<p>Example binary: <code>cargo run -p pop3 -- 127.0.0.1:1110 localhost ./mail</code>.</p>
+<h2 id="composition">Composition</h2>
+<p>Register a <code>"pop3"</code> handler factory on <code>CompositionRegistry</code> that builds a <code>Pop3ControlHandler</code> (or use <code>Pop3Service::start</code> programmatically).</p>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

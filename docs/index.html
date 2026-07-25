@@ -38,6 +38,7 @@
 <li><a href="grpc.html">gRPC</a></li>
 <li><a href="ftp.html">FTP</a></li>
 <li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -55,6 +56,7 @@
 <li><a href="cookbook/grpc.html">gRPC</a></li>
 <li><a href="cookbook/ftp.html">FTP</a></li>
 <li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
 </ul>
 </nav>
     <main class="main">
@@ -184,6 +186,12 @@
 <li>Stock accept-all (discard) handler; <strong>SimpleRelayService</strong> open MX relay (lab use)</li>
 <li><strong>LocalDeliveryService</strong> — APPEND to local INBOX via <code>hopf-mailbox</code> (mbox / Maildir++)</li>
 </ul>
+<h3 id="pop3-hopf-pop3">POP3 (<code>hopf-pop3</code>)</h3>
+<ul>
+<li>POP3 / POP3S server (RFC 1939 + CAPA / STLS / UTF8 / SASL AUTH)</li>
+<li>USER/PASS, APOP, TOP, UIDL; staged handler SPI with default mailbox-backed handler</li>
+<li>Opens <code>INBOX</code> via <code>MailboxFactory</code>; session DELE until QUIT expunge</li>
+</ul>
 <h3 id="mailbox-hopf-mailbox">Mailbox (<code>hopf-mailbox</code>)</h3>
 <ul>
 <li>IMAP-level storage SPI (not a full IMAP wire server yet)</li>
@@ -276,6 +284,13 @@
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
 <td>relay demo</td>
+</tr>
+<tr>
+<td>POP3 / POP3S</td>
+<td><code>hopf-pop3</code></td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">—</td>
+<td>client follow-up</td>
 </tr>
 <tr>
 <td>Mailbox storage</td>

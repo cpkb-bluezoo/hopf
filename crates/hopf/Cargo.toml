@@ -29,6 +29,7 @@ full = [
     "grpc",
     "ftp",
     "smtp",
+    "pop3",
     "mailbox",
     "otel",
 ]
@@ -42,6 +43,7 @@ websocket = ["dep:hopf-websocket"]
 grpc = ["dep:hopf-grpc"]
 ftp = ["dep:hopf-ftp"]
 smtp = ["dep:hopf-smtp"]
+pop3 = ["dep:hopf-pop3"]
 mailbox = ["dep:hopf-mailbox"]
 otel = ["dep:hopf-otel"]
 # Pass-throughs to optional sub-crate features.
@@ -65,5 +67,6 @@ hopf-websocket = { workspace = true, optional = true }
 hopf-grpc = { workspace = true, optional = true }
 hopf-ftp = { workspace = true, optional = true }
 hopf-smtp = { workspace = true, optional = true }
+hopf-pop3 = { workspace = true, optional = true }
 hopf-mailbox = { workspace = true, optional = true }
 hopf-otel = { workspace = true, optional = true }

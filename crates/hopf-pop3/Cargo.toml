@@ -1,0 +1,34 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-pop3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "POP3 / POP3S server for Hopf (Gumdrop pop3 port)"
+readme = "README.md"
+keywords = ["pop3", "pop3s", "email", "networking"]
+categories = ["network-programming", "email"]
+
+[features]
+default = []
+# Opt-in loopback TCP/filesystem smoke tests. CI runs unit tests without this
+# feature; run manually with `cargo test -p hopf-pop3 --features integration`.
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-auth = { workspace = true }
+hopf-tls = { workspace = true }
+hopf-otel = { workspace = true }
+hopf-mailbox = { workspace = true }
+rustls = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rcgen = { workspace = true }
