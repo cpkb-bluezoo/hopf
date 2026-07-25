@@ -62,7 +62,7 @@
     <main class="main">
       <header>
         <h1>FTP</h1>
-        <p class="lead">Crate <code>hopf-ftp</code>: FTP / FTPS <strong>server</strong> and blocking <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.ftp</code>. The server runs on the Hopf thread-per-core reactor; data connections use dynamic PASV listeners on a shared <code>Arc&lt;Runtime&gt;</code>. TLS is provided by <a href="tls.html"><code>hopf-tls</code></a> (rustls). Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code>.</p>
+        <p class="lead">Crate <code>hopf-ftp</code>: FTP / FTPS <strong>server</strong> and callback-driven <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.ftp</code>. The server runs on the Hopf thread-per-core reactor; data connections use dynamic PASV listeners on a shared <code>Arc&lt;Runtime&gt;</code>. TLS is provided by <a href="tls.html"><code>hopf-tls</code></a> (rustls). Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code>.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -424,8 +424,8 @@ S: 200 Protection level set to P</code></pre>
 <span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
 <p><code>FtpConnectionMetadata</code>: <code>peer</code>, <code>local</code>, <code>user</code>, <code>tls</code>.</p>
 <h2 id="client">Client</h2>
-<p>Blocking <code>FtpClient</code> / <code>FtpClientBuilder</code> for tools and tests (not reactor-bound).</p>
-<h3 id="ftpclientbuilder"><code>FtpClientBuilder</code></h3>
+<p>Callback-driven <code>FtpClient</code> on an <code>Arc&lt;Runtime&gt;</code>. DNS (when needed) and the control/data session run on worker reactors; <code>connect</code> returns immediately. Drive the session with an <code>FtpPipeline</code> — stock pipelines <code>FtpGet</code> (RETR) and <code>FtpPut</code> (STOR).</p>
+<h3 id="ftpclienttimeouts"><code>FtpClientTimeouts</code></h3>
 <table>
 <thead>
 <tr>
@@ -437,47 +437,93 @@ S: 200 Protection level set to P</code></pre>
 </thead>
 <tbody>
 <tr>
-<td><code>timeout</code></td>
+<td><code>dns</code></td>
+<td>duration</td>
+<td>5s</td>
+<td>Hostname resolve budget (ignored for literal IPs)</td>
+</tr>
+<tr>
+<td><code>connect</code></td>
 <td>duration</td>
 <td>30s</td>
-<td>Connect/I/O timeout</td>
+<td>TCP connect handshake</td>
 </tr>
 <tr>
-<td><code>data_mode</code></td>
-<td><code>FtpDataMode</code></td>
-<td><code>Passive</code></td>
-<td>Active or Passive</td>
+<td><code>stage</code></td>
+<td>duration</td>
+<td>60s</td>
+<td>Control-channel reply per command</td>
 </tr>
 <tr>
-<td><code>prefer_epsv</code></td>
-<td><code>bool</code></td>
-<td><code>true</code></td>
-<td>Prefer EPSV over PASV</td>
-</tr>
-<tr>
-<td>TLS</td>
-<td><code>ClientConfig</code> + server name</td>
-<td>off</td>
-<td>Via <code>.tls(cfg, name)</code></td>
-</tr>
-<tr>
-<td><code>implicit_tls</code></td>
-<td><code>bool</code></td>
-<td><code>false</code></td>
-<td>Implicit FTPS connect</td>
+<td><code>data</code></td>
+<td>duration</td>
+<td>600s</td>
+<td>Data-transfer budget (RETR / STOR / LIST)</td>
 </tr>
 </tbody>
 </table>
-<div class="sourceCode" id="cb7"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_ftp::</span>FtpClient<span class="op">;</span></span>
-<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> c <span class="op">=</span> <span class="pp">FtpClient::</span>connect(<span class="st">&quot;127.0.0.1:2121&quot;</span>)<span class="op">?;</span></span>
-<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>login(<span class="st">&quot;ftp&quot;</span><span class="op">,</span> <span class="st">&quot;ftp&quot;</span>)<span class="op">?;</span></span>
-<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>type_image()<span class="op">?;</span></span>
-<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>cwd(<span class="st">&quot;/&quot;</span>)<span class="op">?;</span></span>
-<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> listing <span class="op">=</span> c<span class="op">.</span>list(<span class="cn">None</span>)<span class="op">?;</span></span>
-<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>retr(<span class="st">&quot;readme.txt&quot;</span><span class="op">,</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="pp">std::io::</span>stdout())<span class="op">?;</span></span>
-<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>c<span class="op">.</span>quit()<span class="op">?;</span></span></code></pre></div>
-<p>Notable methods: <code>login</code>, <code>auth_tls</code>, <code>protect_data</code>, <code>opts_utf8</code>, <code>type_image</code> / <code>type_ascii</code>, <code>cwd</code>, <code>pwd</code>, <code>list</code> / <code>nlst</code> / <code>mlsd</code>, <code>retr</code>, <code>stor</code>, <code>appe</code>, <code>size</code>, <code>mdtm</code>, <code>quit</code>.</p>
+<h3 id="ftpclient"><code>FtpClient</code></h3>
+<table>
+<thead>
+<tr>
+<th>Builder</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>FtpClient::new(host)</code></td>
+<td>Hostname or IP string; default port 21</td>
+</tr>
+<tr>
+<td><code>.port(u16)</code></td>
+<td>Override control port</td>
+</tr>
+<tr>
+<td><code>.credentials(user, pass)</code></td>
+<td>USER / PASS</td>
+</tr>
+<tr>
+<td><code>.timeouts(FtpClientTimeouts)</code></td>
+<td>Override defaults</td>
+</tr>
+<tr>
+<td><code>.prefer_epsv(bool)</code></td>
+<td>Prefer EPSV over PASV (default <code>true</code>)</td>
+</tr>
+<tr>
+<td><code>.resolver(Arc&lt;DnsResolver&gt;)</code></td>
+<td>Reuse a resolver</td>
+</tr>
+<tr>
+<td><code>.connect(&amp;Arc&lt;Runtime&gt;, pipeline)</code></td>
+<td>Schedule DNS/dial; returns immediately</td>
+</tr>
+</tbody>
+</table>
+<div class="sourceCode" id="cb7"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb7-1"><a href="#cb7-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb7-2"><a href="#cb7-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
+<span id="cb7-3"><a href="#cb7-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Runtime<span class="op">,</span> RuntimeConfig<span class="op">};</span></span>
+<span id="cb7-4"><a href="#cb7-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_ftp::</span><span class="op">{</span>FtpClient<span class="op">,</span> FtpClientTimeouts<span class="op">,</span> FtpGet<span class="op">};</span></span>
+<span id="cb7-5"><a href="#cb7-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb7-6"><a href="#cb7-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> rt <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">Runtime::</span>start(<span class="pp">RuntimeConfig::</span><span class="kw">default</span>())<span class="op">?</span>)<span class="op">;</span></span>
+<span id="cb7-7"><a href="#cb7-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> pipeline <span class="op">=</span> <span class="pp">FtpGet::</span>new(<span class="st">&quot;/readme.txt&quot;</span><span class="op">,</span> <span class="op">|</span>r<span class="op">|</span> <span class="op">{</span></span>
+<span id="cb7-8"><a href="#cb7-8" aria-hidden="true" tabindex="-1"></a>    <span class="kw">match</span> r <span class="op">{</span></span>
+<span id="cb7-9"><a href="#cb7-9" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Ok</span>(bytes) <span class="op">=&gt;</span> <span class="pp">eprintln!</span>(<span class="st">&quot;got {} bytes&quot;</span><span class="op">,</span> bytes<span class="op">.</span>len())<span class="op">,</span></span>
+<span id="cb7-10"><a href="#cb7-10" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Err</span>(e) <span class="op">=&gt;</span> <span class="pp">eprintln!</span>(<span class="st">&quot;RETR failed: {e}&quot;</span>)<span class="op">,</span></span>
+<span id="cb7-11"><a href="#cb7-11" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb7-12"><a href="#cb7-12" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>)<span class="op">;</span></span>
+<span id="cb7-13"><a href="#cb7-13" aria-hidden="true" tabindex="-1"></a><span class="pp">FtpClient::</span>new(<span class="st">&quot;127.0.0.1&quot;</span>)</span>
+<span id="cb7-14"><a href="#cb7-14" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>port(<span class="dv">2121</span>)</span>
+<span id="cb7-15"><a href="#cb7-15" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>credentials(<span class="st">&quot;ftp&quot;</span><span class="op">,</span> <span class="st">&quot;ftp&quot;</span>)</span>
+<span id="cb7-16"><a href="#cb7-16" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>timeouts(<span class="pp">FtpClientTimeouts</span> <span class="op">{</span></span>
+<span id="cb7-17"><a href="#cb7-17" aria-hidden="true" tabindex="-1"></a>        dns<span class="op">:</span> <span class="pp">Duration::</span>from_secs(<span class="dv">5</span>)<span class="op">,</span></span>
+<span id="cb7-18"><a href="#cb7-18" aria-hidden="true" tabindex="-1"></a>        connect<span class="op">:</span> <span class="pp">Duration::</span>from_secs(<span class="dv">10</span>)<span class="op">,</span></span>
+<span id="cb7-19"><a href="#cb7-19" aria-hidden="true" tabindex="-1"></a>        stage<span class="op">:</span> <span class="pp">Duration::</span>from_secs(<span class="dv">30</span>)<span class="op">,</span></span>
+<span id="cb7-20"><a href="#cb7-20" aria-hidden="true" tabindex="-1"></a>        data<span class="op">:</span> <span class="pp">Duration::</span>from_secs(<span class="dv">120</span>)<span class="op">,</span></span>
+<span id="cb7-21"><a href="#cb7-21" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
+<span id="cb7-22"><a href="#cb7-22" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>connect(<span class="op">&amp;</span>rt<span class="op">,</span> <span class="dt">Box</span><span class="pp">::</span>new(pipeline))<span class="op">?;</span></span></code></pre></div>
+<p><code>FtpGet</code> / <code>FtpPut</code> sequence: auth (from credentials) → <code>TYPE I</code> → PASV/EPSV → RETR or STOR → QUIT. Custom workflows implement <code>FtpPipeline</code> (<code>start</code> / <code>done</code> / <code>failed</code>) and issue ops via <code>FtpSessionWrite</code>.</p>
 <h2 id="metrics">Metrics</h2>
 <p><code>FtpServerMetrics</code> counters include connections, <code>auth_ok</code> / <code>auth_fail</code>, commands, <code>bytes_in</code> / <code>bytes_out</code>, and <code>pasv_binds</code>.</p>
 <h2 id="examples">Examples</h2>
@@ -485,8 +531,8 @@ S: 200 Protection level set to P</code></pre>
 <div class="sourceCode" id="cb8"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="co"># Cleartext stock server (user/pass ftp/ftp)</span></span>
 <span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> ftp-server <span class="at">--</span> 127.0.0.1:2121 /tmp/ftp-root</span>
 <span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Blocking client LIST/RETR</span></span>
-<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="va">FTP_USER</span><span class="op">=</span>ftp <span class="va">FTP_PASS</span><span class="op">=</span>ftp <span class="ex">cargo</span> run <span class="at">-p</span> ftp-get <span class="at">--</span> 127.0.0.1:2121 remote/path</span></code></pre></div>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="co"># Async client RETR</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a><span class="va">FTP_USER</span><span class="op">=</span>ftp <span class="va">FTP_PASS</span><span class="op">=</span>ftp <span class="ex">cargo</span> run <span class="at">-p</span> ftp-get <span class="at">--</span> 127.0.0.1:2121 /hello.txt</span></code></pre></div>
 <table>
 <colgroup>
 <col style="width: 30%" />
@@ -508,8 +554,8 @@ S: 200 Protection level set to P</code></pre>
 </tr>
 <tr>
 <td><code>examples/ftp-get</code></td>
-<td>Client LIST/RETR</td>
-<td><code>addr</code>, path; <code>FTP_USER</code> / <code>FTP_PASS</code></td>
+<td>Async <code>FtpClient</code> + <code>FtpGet</code></td>
+<td>host[:port], path; <code>FTP_USER</code> / <code>FTP_PASS</code></td>
 </tr>
 </tbody>
 </table>
@@ -518,7 +564,7 @@ S: 200 Protection level set to P</code></pre>
 <li>SITE, CCC, and SMNT are not implemented (rejected).</li>
 <li>Stock examples are cleartext; FTPS is available via API + <a href="tls.html"><code>tls.md</code></a> but not wired in the demo binaries.</li>
 <li>No Gumdrop-style SITE quota / RBAC beyond <code>TrustPolicy</code> + <code>is_authorized</code>.</li>
-<li>Client is blocking; there is no reactor-native FTP client endpoint.</li>
+<li>Client completion is callback-driven — callers wait on their own signalling (see <code>examples/ftp-get</code>).</li>
 </ul>
 
       <p class="footer">

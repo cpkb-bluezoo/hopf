@@ -52,16 +52,22 @@ pub type QueryCallback = Box<dyn FnOnce(io::Result<DnsMessage>) + Send>;
 /// Pluggable client transport.
 pub trait DnsClientTransport: Send {
     /// Send a query; responses arrive via [`DnsClientTransportHandler`].
+    ///
+    /// `handler` is an owned, `Send` callback. Implementations **must not** block the
+    /// caller — they should schedule the I/O (spawn a thread, fire-and-forget connect,
+    /// etc.) and return `Ok(())` immediately. The handler may be called from any thread.
     fn send_query(
         &mut self,
         server: SocketAddr,
         message: &[u8],
-        handler: &mut dyn DnsClientTransportHandler,
+        handler: Box<dyn DnsClientTransportHandler>,
     ) -> io::Result<()>;
 }
 
 /// Transport → resolver callbacks.
-pub trait DnsClientTransportHandler {
+///
+/// Must be `Send` so that transports can deliver responses from background threads.
+pub trait DnsClientTransportHandler: Send {
     /// Response bytes from `server`.
     fn on_response(&mut self, server: SocketAddr, data: &[u8]);
     /// Transport error.
@@ -610,15 +616,17 @@ fn complete_response(
 
 /// Extension: dial TCP by hostname on the Runtime.
 pub trait RuntimeDnsExt {
-    /// Resolve `host` then [`Runtime::connect`] with the first address.
+    /// Resolve `host` then call [`Runtime::connect`] with the first address.
     ///
-    /// Blocks the **calling** thread until DNS completes (must not run on a reactor).
+    /// Schedules DNS asynchronously and returns `Ok(())` immediately. The TCP
+    /// connect runs from the DNS callback. Prefer [`Arc<Runtime>`] so the
+    /// callback can call `connect` without parking the caller.
     fn connect_by_name<F>(&self, host: &str, port: u16, factory: F) -> io::Result<()>
     where
         F: Fn() -> Box<dyn hopf_core::ProtocolHandler> + Send + Sync + 'static;
 }
 
-impl RuntimeDnsExt for Runtime {
+impl RuntimeDnsExt for Arc<Runtime> {
     fn connect_by_name<F>(&self, host: &str, port: u16, factory: F) -> io::Result<()>
     where
         F: Fn() -> Box<dyn hopf_core::ProtocolHandler> + Send + Sync + 'static,
@@ -627,22 +635,22 @@ impl RuntimeDnsExt for Runtime {
         if let Some(ip) = parse_literal_ip(host) {
             return self.connect(TcpConnectorConfig::new(SocketAddr::new(ip, port), factory));
         }
-        let resolver = DnsResolver::for_runtime(self)?;
-        let (tx, rx) = std::sync::mpsc::channel();
+        let resolver = DnsResolver::for_runtime(self.as_ref())?;
+        let rt = Arc::clone(self);
         resolver.resolve(
             host,
             port,
             Box::new(move |result| {
-                let _ = tx.send(result);
+                let addrs = match result {
+                    Ok(a) => a,
+                    Err(_) => return,
+                };
+                if let Some(addr) = addrs.into_iter().next() {
+                    let cfg = TcpConnectorConfig::new(addr, factory);
+                    let _ = rt.connect(cfg);
+                }
             }),
         );
-        let addrs = rx
-            .recv_timeout(DEFAULT_TIMEOUT + Duration::from_secs(1))
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS resolve timed out"))??;
-        let addr = addrs
-            .into_iter()
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses"))?;
-        self.connect(TcpConnectorConfig::new(addr, factory))
+        Ok(())
     }
 }

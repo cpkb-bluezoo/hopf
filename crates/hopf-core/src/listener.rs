@@ -112,6 +112,7 @@ impl TcpListenerConfig {
             max_net_in: self.max_net_in,
             max_net_out: self.max_net_out,
             idle_timeout: self.idle_timeout,
+            connect_timeout: None,
             secure: self.secure,
             tls_acceptor: self.tls.clone(),
             tls_connector: None,

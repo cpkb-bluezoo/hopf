@@ -307,6 +307,13 @@ CompositionRegistry ───────┘  (handler=&quot;echo&quot; → fact
 <td>unset</td>
 <td><code>idle_timeout</code></td>
 </tr>
+<tr>
+<td><code>connect-timeout-ms</code></td>
+<td><code>u64</code></td>
+<td style="text-align: center;">no</td>
+<td>unset</td>
+<td><code>connect_timeout</code> (<code>&lt;dial-tcp&gt;</code> only)</td>
+</tr>
 </tbody>
 </table>
 <p><code>addr</code> must parse as a <code>SocketAddr</code> (e.g. <code>127.0.0.1:8080</code>, <code>[::1]:8080</code>). Hostnames are <strong>not</strong> resolved here — use numeric addresses (or dial-by-name APIs outside this XML schema).</p>

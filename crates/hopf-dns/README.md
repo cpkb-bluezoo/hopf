@@ -20,11 +20,12 @@ Authoritative zones, AXFR/IXFR, TSIG, dynamic UPDATE, DNSSEC signing, DoH server
 ## Quick start (resolver)
 
 ```rust
-use hopf_core::Runtime;
+use std::sync::Arc;
+use hopf_core::{Runtime, RuntimeConfig};
 use hopf_dns::{DnsResolver, RuntimeDnsExt};
 
-let rt = Runtime::start(Default::default())?;
-let resolver = DnsResolver::for_runtime(&rt)?;
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+let resolver = DnsResolver::for_runtime(rt.as_ref())?;
 resolver.query_a("example.com", Box::new(|result| {
     // ...
 }));
@@ -32,9 +33,20 @@ resolver.query_a("example.com", Box::new(|result| {
 
 ## Dial by name
 
+`RuntimeDnsExt` is implemented for `Arc<Runtime>`. `connect_by_name` schedules
+DNS asynchronously and returns immediately; the TCP dial runs from the
+callback (literal IPs skip DNS).
+
 ```rust
 use hopf_dns::RuntimeDnsExt;
 // rt.connect_by_name("example.com", 80, || Box::new(MyHandler))?;
 ```
+
+## Transports
+
+`DnsClientTransport` / `DnsClientTransportHandler` — callback-driven only (no
+blocking query). DoH (`DohClientTransport`) and DoQ (`DoqClientTransport`)
+implement that trait; each `send_query` schedules I/O and delivers via the
+handler.
 
 See `examples/dns-proxy` for a UDP caching forwarder.

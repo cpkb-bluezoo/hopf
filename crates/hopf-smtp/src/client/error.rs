@@ -7,7 +7,7 @@ use std::io;
 
 use super::reply::SmtpReply;
 
-/// Result alias for the blocking client.
+/// Result alias for the SMTP client.
 pub type SmtpResult<T> = Result<T, SmtpError>;
 
 /// Client-side SMTP failure.
@@ -29,6 +29,7 @@ pub enum SmtpError {
 }
 
 impl SmtpError {
+    #[allow(dead_code)]
     pub(crate) fn unexpected(expected: Option<u16>, reply: SmtpReply) -> Self {
         Self::Protocol { expected, reply }
     }

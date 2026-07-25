@@ -75,7 +75,7 @@ pub use hopf_websocket as websocket;
 #[cfg(feature = "grpc")]
 pub use hopf_grpc as grpc;
 
-/// FTP / FTPS server and blocking client.
+/// FTP / FTPS server and callback-driven client.
 #[cfg(feature = "ftp")]
 pub use hopf_ftp as ftp;
 

@@ -12,3 +12,4 @@ path = "main.rs"
 
 [dependencies]
 hopf-smtp = { workspace = true }
+hopf-core = { workspace = true }

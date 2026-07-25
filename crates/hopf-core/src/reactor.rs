@@ -246,6 +246,7 @@ impl Reactor {
         telemetry: Option<std::sync::Arc<dyn crate::telemetry::TelemetryHook>>,
     ) -> io::Result<()> {
         let token = self.alloc_token();
+        let connect_timeout = params.connect_timeout;
 
         let interest = if connecting {
             Interest::READABLE | Interest::WRITABLE
@@ -270,6 +271,21 @@ impl Reactor {
             conn.call_connected();
         } else {
             let _ = conn.flush_tls_outbound();
+            if let Some(timeout) = connect_timeout {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                conn.set_connect_timeout_cancel(Arc::clone(&cancelled));
+                let handle = self.handle.clone();
+                self.timers.schedule_with_cancel(
+                    timeout,
+                    Box::new(move || {
+                        handle.send(ReactorCmd::WithConn {
+                            token,
+                            task: Box::new(|conn| conn.on_connect_timeout()),
+                        });
+                    }),
+                    cancelled,
+                );
+            }
         }
         if !conn.is_open() {
             let _ = self.poll.registry().deregister(&mut conn.stream);

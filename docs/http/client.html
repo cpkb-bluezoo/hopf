@@ -62,7 +62,7 @@
     <main class="main">
       <header>
         <h1>HTTP client</h1>
-        <p class="lead">Crate <code>hopf-http</code>: client face of an HTTP Stream. Implement <code>ClientHandler</code>, wrap with <code>ClientHandlerFactory</code>, and dial via <code>H1Endpoint::client</code>, <code>H2Endpoint::client</code>, or <code>connect_h3</code>.</p>
+        <p class="lead">Crate <code>hopf-http</code>: client face of an HTTP Stream. Implement <code>ClientHandler</code>, wrap with <code>ClientHandlerFactory</code>, and dial via <code>connect_http</code> (hostname-aware H1/H2), <code>H1Endpoint::client</code> / <code>H2Endpoint::client</code>, or <code>connect_h3</code>.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -174,8 +174,50 @@
 </table>
 <p>For distributed tracing, wrap writers with <code>hopf_otel::with_traceparent</code> / <code>PropagatingClientWriter</code> when using <code>hopf-otel</code>.</p>
 <h2 id="dial-patterns">Dial patterns</h2>
-<p>Listen and dial are peers: the same Stream SPI runs under a <code>TcpConnectorConfig</code> factory or H3 <code>connect_h3</code>.</p>
-<h3 id="http1.1-cleartext">HTTP/1.1 cleartext</h3>
+<p>Listen and dial are peers: the same Stream SPI runs under a <code>TcpConnectorConfig</code> factory or H3 <code>connect_h3</code>. Prefer <code>connect_http</code> when the peer is a hostname (async DNS + connect timeouts).</p>
+<h3 id="connect_http-hostname">connect_http (hostname or literal)</h3>
+<div class="sourceCode" id="cb2a"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2a-1"><a href="#cb2a-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
+<span id="cb2a-2"><a href="#cb2a-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>ClientHandlerFactory<span class="op">,</span> HttpLimits<span class="op">};</span></span>
+<span id="cb2a-3"><a href="#cb2a-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::client::</span><span class="op">{</span>connect_http<span class="op">,</span> HttpClientTimeouts<span class="op">};</span></span>
+<span id="cb2a-4"><a href="#cb2a-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb2a-5"><a href="#cb2a-5" aria-hidden="true" tabindex="-1"></a>connect_http(</span>
+<span id="cb2a-6"><a href="#cb2a-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>rt<span class="op">,</span>                          <span class="co">// &amp;Arc&lt;Runtime&gt;</span></span>
+<span id="cb2a-7"><a href="#cb2a-7" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;example.com&quot;</span><span class="op">,</span>                 <span class="co">// hostname or IP / SocketAddr string</span></span>
+<span id="cb2a-8"><a href="#cb2a-8" aria-hidden="true" tabindex="-1"></a>    <span class="dv">80</span><span class="op">,</span></span>
+<span id="cb2a-9"><a href="#cb2a-9" aria-hidden="true" tabindex="-1"></a>    <span class="pp">Arc::</span>clone(<span class="op">&amp;</span>factory)<span class="op">,</span></span>
+<span id="cb2a-10"><a href="#cb2a-10" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
+<span id="cb2a-11"><a href="#cb2a-11" aria-hidden="true" tabindex="-1"></a>    <span class="cn">false</span><span class="op">,</span>                         <span class="co">// true → H2 prior-knowledge</span></span>
+<span id="cb2a-12"><a href="#cb2a-12" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpClientTimeouts::</span><span class="kw">default</span>()<span class="op">,</span> <span class="co">// dns / connect / stage</span></span>
+<span id="cb2a-13"><a href="#cb2a-13" aria-hidden="true" tabindex="-1"></a>    <span class="cn">None</span><span class="op">,</span>                          <span class="co">// optional DnsResolver</span></span>
+<span id="cb2a-14"><a href="#cb2a-14" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Timeout</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>HttpClientTimeouts::dns</code></td>
+<td>5s</td>
+<td>Ignored for literal IPs</td>
+</tr>
+<tr>
+<td><code>HttpClientTimeouts::connect</code></td>
+<td>30s</td>
+<td>Wired into <code>TcpConnectorConfig::connect_timeout</code></td>
+</tr>
+<tr>
+<td><code>HttpClientTimeouts::stage</code></td>
+<td>60s</td>
+<td>Response-stage budget (headers, etc.)</td>
+</tr>
+</tbody>
+</table>
+<p>Returns immediately; DNS and the TCP/protocol handshake run on a worker. Demo: <code>examples/http-get</code>.</p>
+<h3 id="http1.1-cleartext">HTTP/1.1 cleartext (resolved addr)</h3>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> Runtime<span class="op">,</span> TcpConnectorConfig<span class="op">};</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>H1Endpoint<span class="op">,</span> HttpLimits<span class="op">};</span></span>
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
@@ -212,7 +254,7 @@
 <span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>    <span class="pp">HttpLimits::</span><span class="kw">default</span>()<span class="op">,</span></span>
 <span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div>
 <h3 id="dial-by-name">Dial by name</h3>
-<p><code>hopf_dns::RuntimeDnsExt::connect_by_name</code> resolves then <code>Runtime::connect</code>. Must not run on a reactor thread. See <a href="../clients.html">clients.md</a> and <a href="../dns.html">dns.md</a>.</p>
+<p><code>connect_http</code> resolves hostnames asynchronously (literal IPs skip DNS). Lower-level: <code>hopf_dns::RuntimeDnsExt::connect_by_name</code> on <code>Arc&lt;Runtime&gt;</code>. See <a href="../clients.html">clients.md</a> and <a href="../dns.html">dns.md</a>.</p>
 <h2 id="http-get-flags">http-get flags</h2>
 <p>Demo binary: <code>examples/http-get</code> (crate <code>http-get</code>).</p>
 <pre class="text"><code>cargo run -p http-get -- [FLAGS] [ADDR] [PATH]</code></pre>
@@ -246,7 +288,7 @@
 </tr>
 <tr>
 <td><code>ADDR</code></td>
-<td>Peer <code>SocketAddr</code> (default <code>127.0.0.1:8080</code>, or <code>:4433</code> for H3)</td>
+<td>Hostname or <code>host:port</code> (default <code>127.0.0.1:8080</code>, or <code>:4433</code> for H3)</td>
 </tr>
 <tr>
 <td><code>PATH</code></td>
@@ -291,7 +333,7 @@
 </table>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>Stage-0 dials expect a pre-resolved <code>SocketAddr</code> unless using <code>connect_by_name</code>.</li>
+<li>Stage-0 <code>TcpConnectorConfig</code> dials expect a pre-resolved <code>SocketAddr</code>; prefer <code>connect_http</code> for hostnames.</li>
 <li>H3 client opens one request Stream after handshake in the stock <code>H3ClientConnection</code> path (suitable for the GET demo; not a pool).</li>
 <li>Response trailers are delivered only on H2/H3.</li>
 </ul>

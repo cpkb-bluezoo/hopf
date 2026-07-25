@@ -76,7 +76,7 @@ fn literal_connect_by_name_skips_dns() {
     use hopf_core::{Endpoint, ProtocolHandler, TcpListenerConfig};
     use hopf_dns::RuntimeDnsExt;
 
-    let rt = Runtime::start(Default::default()).unwrap();
+    let rt = Arc::new(Runtime::start(Default::default()).unwrap());
     let (addr, _) = rt
         .add_tcp_listener(TcpListenerConfig::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -129,5 +129,7 @@ fn literal_connect_by_name_skips_dns() {
         thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(got.lock().unwrap().as_slice(), b"hi");
-    rt.shutdown();
+    if let Ok(owned) = Arc::try_unwrap(rt) {
+        owned.shutdown();
+    }
 }

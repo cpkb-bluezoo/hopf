@@ -21,6 +21,7 @@ integration = ["h3"]
 [dependencies]
 hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
+hopf-dns = { workspace = true }
 hopf-quic = { workspace = true, optional = true }
 # Declared for WebDAV / composition XML and protocol payloads (wired in later tranches).
 tractrix = { workspace = true }

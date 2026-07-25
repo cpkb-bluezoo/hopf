@@ -71,7 +71,7 @@
 <h2 id="client">Client</h2>
 <div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> ftp-get <span class="at">--</span> 127.0.0.1:2121 /</span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> ftp-get <span class="at">--</span> 127.0.0.1:2121 /hello.txt</span></code></pre></div>
-<p>Env: <code>FTP_USER</code> / <code>FTP_PASS</code> (default <code>ftp</code>/<code>ftp</code>). Trailing <code>/</code> on the path lists; otherwise RETR.</p>
+<p>Env: <code>FTP_USER</code> / <code>FTP_PASS</code> (default <code>ftp</code>/<code>ftp</code>). Async <code>FtpClient</code> + <code>FtpGet</code> RETR; completion is callback-driven.</p>
 <p>Sources: <a href="../../examples/ftp"><code>examples/ftp</code></a>, <a href="../../examples/ftp-get"><code>examples/ftp-get</code></a>. Guide: <a href="../ftp.html">FTP</a>.</p>
 
       <p class="footer">
