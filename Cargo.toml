@@ -16,6 +16,7 @@ members = [
     "crates/hopf-smtp",
     "crates/hopf-mailbox",
     "crates/hopf-pop3",
+    "crates/hopf-imap",
     "examples/echo",
     "examples/tls-echo",
     "examples/http-hello",
@@ -32,6 +33,8 @@ members = [
     "examples/smtp-send",
     "examples/pop3",
     "examples/pop3-fetch",
+    "examples/imap",
+    "examples/imap-fetch",
 ]
 default-members = [
     "crates/hopf",
@@ -49,6 +52,7 @@ default-members = [
     "crates/hopf-smtp",
     "crates/hopf-mailbox",
     "crates/hopf-pop3",
+    "crates/hopf-imap",
 ]
 
 [workspace.package]
@@ -87,6 +91,7 @@ hopf-ftp = { version = "0.1.0", path = "crates/hopf-ftp" }
 hopf-smtp = { version = "0.1.0", path = "crates/hopf-smtp" }
 hopf-mailbox = { version = "0.1.0", path = "crates/hopf-mailbox" }
 hopf-pop3 = { version = "0.1.0", path = "crates/hopf-pop3" }
+hopf-imap = { version = "0.1.0", path = "crates/hopf-imap" }
 bytes = "1"
 getrandom = "0.2"
 md-5 = "0.10"

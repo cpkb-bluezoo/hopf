@@ -81,9 +81,7 @@ impl TcpConnection {
         connecting: bool,
         telemetry: Option<Arc<dyn TelemetryHook>>,
     ) -> io::Result<Self> {
-        let remote = stream
-            .peer_addr()
-            .unwrap_or(params.remote_hint);
+        let remote = stream.peer_addr().unwrap_or(params.remote_hint);
         let local = stream
             .local_addr()
             .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
@@ -91,10 +89,7 @@ impl TcpConnection {
         let net_out = pool.acquire(DEFAULT_BUFFER_SIZE);
         let tls = if params.secure {
             if let Some(connector) = params.tls_connector.as_ref() {
-                let name = params
-                    .server_name
-                    .as_deref()
-                    .unwrap_or("localhost");
+                let name = params.server_name.as_deref().unwrap_or("localhost");
                 Some(connector.connect(name)?)
             } else if let Some(acceptor) = params.tls_acceptor.as_ref() {
                 Some(acceptor.accept())
@@ -639,10 +634,7 @@ impl TcpConnection {
                     Ok(0) => break,
                     Ok(n) => offset += n,
                     Err(e) => {
-                        eprintln!(
-                            "hopf: TLS write_plaintext failed on {}: {e}",
-                            self.remote
-                        );
+                        eprintln!("hopf: TLS write_plaintext failed on {}: {e}", self.remote);
                         self.force_close();
                         return;
                     }
@@ -768,5 +760,39 @@ impl Endpoint for TcpConnection {
     fn fail(&mut self, err: io::Error) {
         self.call_error(&err);
         self.force_close();
+    }
+
+    fn poke_handler(&mut self) {
+        if !self.open {
+            return;
+        }
+        // Redeliver buffered residual first (bytes the handler left
+        // unconsumed while paused); otherwise call receive with no data so
+        // deferred replies / queued commands can be flushed.
+        if self.tls.is_some() {
+            if !self.app_in.is_empty() {
+                self.deliver_app_in();
+                return;
+            }
+        } else if !self.net_in.is_empty() {
+            self.deliver_plaintext_buffer();
+            return;
+        }
+        let Some(mut handler) = self.handler.take() else {
+            // Re-entrant call from inside `receive` — nothing to do.
+            return;
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut slice: &[u8] = &[];
+            handler.receive(self, &mut slice);
+        }));
+        self.handler = Some(handler);
+        if let Err(payload) = outcome {
+            eprintln!(
+                "hopf: protocol handler panicked in receive on {}: {payload:?}",
+                self.remote
+            );
+            self.force_close();
+        }
     }
 }

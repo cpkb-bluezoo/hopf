@@ -54,7 +54,7 @@ impl KeywordsFile {
         })
     }
 
-    #[allow(dead_code)]
+    /// Allocate or reuse a letter (`a`–`z`) for `keyword`.
     pub fn letter_for(&mut self, keyword: &str) -> MailboxResult<char> {
         for (i, name) in &self.by_index {
             if name.eq_ignore_ascii_case(keyword) {

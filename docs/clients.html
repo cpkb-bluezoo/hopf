@@ -39,6 +39,7 @@
 <li><a href="ftp.html">FTP</a></li>
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -219,6 +220,10 @@ ProtocolHandler::connected / receive / …</code></pre>
 <tr>
 <td>POP3</td>
 <td><code>Pop3Client</code> + <code>Pop3Fetch</code> (or custom <code>Pop3ClientHandlerFactory</code>) in <code>hopf-pop3</code></td>
+</tr>
+<tr>
+<td>IMAP</td>
+<td><code>ImapClient</code> + <code>ImapFetch</code> / <code>ImapIdle</code> (or custom <code>ImapClientHandlerFactory</code>) in <code>hopf-imap</code></td>
 </tr>
 <tr>
 <td>gRPC</td>

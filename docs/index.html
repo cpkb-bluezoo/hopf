@@ -39,6 +39,7 @@
 <li><a href="ftp.html">FTP</a></li>
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -193,9 +194,16 @@
 <li>Opens <code>INBOX</code> via <code>MailboxFactory</code>; session DELE until QUIT expunge</li>
 <li>Async client: <code>Pop3Client</code> + <code>Pop3Fetch</code> auto-pilot; USER/PASS, APOP, AUTH PLAIN, STLS/POP3S</li>
 </ul>
+<h3 id="imap-hopf-imap">IMAP (<code>hopf-imap</code>)</h3>
+<ul>
+<li>IMAP4rev2 / IMAPS server (RFC 9051) over <code>hopf-mailbox</code>; staged handler SPI</li>
+<li>IDLE, UIDPLUS, MOVE, NAMESPACE, ENABLE / CONDSTORE / QRESYNC, UNSELECT, ID, LIST-EXTENDED / LIST-STATUS, QUOTA</li>
+<li>Storage work on the pool; pipelined commands queued and answered in order</li>
+<li>Async client: <code>ImapClient</code> + <code>ImapFetch</code> / <code>ImapIdle</code> auto-pilots; tag-correlated pipelining, STARTTLS/IMAPS, production IDLE</li>
+</ul>
 <h3 id="mailbox-hopf-mailbox">Mailbox (<code>hopf-mailbox</code>)</h3>
 <ul>
-<li>IMAP-level storage SPI (not a full IMAP wire server yet)</li>
+<li>IMAP-level storage SPI (wire server: <a href="imap.html"><code>hopf-imap</code></a>)</li>
 <li>mbox and Maildir++ backends; flags, APPEND, SEARCH (RFC 9051 criteria)</li>
 <li>Optional body indexing (<code>.gidx</code>); storage-pool helpers for search</li>
 </ul>
@@ -292,6 +300,13 @@
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
 <td>callback-driven client (<code>Pop3Fetch</code>)</td>
+</tr>
+<tr>
+<td>IMAP / IMAPS</td>
+<td><code>hopf-imap</code></td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td>pipelined client (<code>ImapFetch</code> / <code>ImapIdle</code>)</td>
 </tr>
 <tr>
 <td>Mailbox storage</td>

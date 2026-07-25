@@ -36,6 +36,7 @@ NAV = [
         ("ftp.html", "FTP"),
         ("smtp.html", "SMTP"),
         ("pop3.html", "POP3"),
+        ("imap.html", "IMAP"),
         ("mailbox.html", "Mailbox"),
     ]),
     ("Cross-cutting", [

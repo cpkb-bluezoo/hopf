@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IMAP — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html" aria-current="page">IMAP</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>IMAP</h1>
+        <p class="lead"><code>hopf-imap</code> is an IMAP4rev2 / IMAPS <strong>server and callback-driven client</strong>. The server stores messages through <a href="mailbox.html"><code>hopf-mailbox</code></a> (Maildir++ / mbox) and advertises only implemented capabilities. The client supports multiple outstanding tagged commands (pipelining), asynchronous DNS, STARTTLS/IMAPS, and a production IDLE state machine. Use <code>ImapFetch</code> / <code>ImapIdle</code> for auto-pilot sessions or implement <code>ImapClientDriver</code> for custom pipelines.</p>
+      </header>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#features">Features</a></li>
+<li><a href="#handler-spi">Handler SPI</a></li>
+<li><a href="#quick-start">Quick start</a></li>
+<li><a href="#client">Client</a></li>
+<li><a href="#pipelining">Pipelining</a></li>
+<li><a href="#timeouts">Timeouts</a></li>
+<li><a href="#testing">Testing</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="features">Features</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Area</th>
+<th>Support</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Base protocol</td>
+<td>IMAP4rev2 (<a href="https://www.rfc-editor.org/rfc/rfc9051">RFC 9051</a>): LOGIN, AUTHENTICATE PLAIN, SELECT/EXAMINE, LIST/LSUB, STATUS, CREATE/DELETE/RENAME, SUBSCRIBE, APPEND, FETCH/UID FETCH, SEARCH/UID SEARCH, STORE, COPY, EXPUNGE, CLOSE, NOOP, LOGOUT</td>
+</tr>
+<tr>
+<td><code>IDLE</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2177">RFC 2177</a> — continuation + <code>DONE</code>; mailbox EXISTS/RECENT polled off-reactor</td>
+</tr>
+<tr>
+<td><code>UIDPLUS</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc4315">RFC 4315</a> — <code>APPENDUID</code>, <code>COPYUID</code>, <code>UID EXPUNGE</code></td>
+</tr>
+<tr>
+<td><code>MOVE</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc6851">RFC 6851</a> — copy + <code>\Deleted</code> + expunge with <code>COPYUID</code></td>
+</tr>
+<tr>
+<td><code>NAMESPACE</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2342">RFC 2342</a> — personal namespace from the mailbox store</td>
+</tr>
+<tr>
+<td><code>ENABLE</code> / <code>CONDSTORE</code> / <code>QRESYNC</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc5161">RFC 5161</a> / <a href="https://www.rfc-editor.org/rfc/rfc7162">RFC 7162</a> — <code>HIGHESTMODSEQ</code>, <code>CHANGEDSINCE</code>, <code>MODSEQ</code> when the backend provides modseqs; QRESYNC degrades safely (no fabricated <code>VANISHED (EARLIER)</code> history)</td>
+</tr>
+<tr>
+<td><code>UNSELECT</code> / <code>ID</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc3691">RFC 3691</a> / <a href="https://www.rfc-editor.org/rfc/rfc2971">RFC 2971</a></td>
+</tr>
+<tr>
+<td><code>LIST-EXTENDED</code> / <code>LIST-STATUS</code> / <code>CHILDREN</code></td>
+<td>Selection/return options; <code>RETURN (STATUS (…))</code></td>
+</tr>
+<tr>
+<td><code>QUOTA</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc9208">RFC 9208</a> — <code>GETQUOTA</code> / <code>GETQUOTAROOT</code> / <code>SETQUOTA</code> via pluggable <code>QuotaManager</code> (default unlimited)</td>
+</tr>
+<tr>
+<td>Auth</td>
+<td><code>CredentialStore</code> — LOGIN and AUTHENTICATE PLAIN (SASL-IR); <code>LOGINDISABLED</code> before STARTTLS</td>
+</tr>
+<tr>
+<td>TLS</td>
+<td>STARTTLS and implicit IMAPS</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td><code>MailboxFactory</code> → store opened after auth; open/read/append/expunge on the storage pool</td>
+</tr>
+</tbody>
+</table>
+<p>Commands are lexed incrementally with the shared push-parser style (tag / verb / arguments / literals) — synchronizing literals emit <code>+</code> continuations, and <code>LITERAL-</code> non-synchronizing literals are accepted.</p>
+<h2 id="handler-spi">Handler SPI</h2>
+<p>Gumdrop-style staged traits:</p>
+<ul>
+<li><code>ClientConnected</code> → greeting</li>
+<li><code>NotAuthenticatedHandler</code> → LOGIN / AUTHENTICATE policy (<code>proceed</code> opens the store)</li>
+<li><code>AuthenticatedHandler</code> → SELECT/LIST/STATUS/APPEND policy</li>
+<li><code>SelectedHandler</code> → FETCH/STORE/SEARCH/COPY/MOVE/EXPUNGE policy</li>
+</ul>
+<p>State traits constrain which replies are legal at each stage. The default handler (<code>DefaultImapHandlerFactory</code>) accepts everything the config allows and delegates storage I/O to the protocol via <code>proceed</code>. Storage work always runs on the Runtime storage pool, never on the reactor; while an operation is in flight the connection queues pipelined commands and answers them in order.</p>
+<h2 id="quick-start">Quick start</h2>
+<pre class="rust,ignore"><code>use std::sync::Arc;
+use hopf_auth::PasswordStore;
+use hopf_core::{Runtime, RuntimeConfig};
+use hopf_imap::{ImapConfig, ImapService};
+use hopf_mailbox::MaildirFactory;
+
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+let factory = Arc::new(MaildirFactory::new(&quot;./mail&quot;));
+let store = Arc::new(PasswordStore::new().with_user(&quot;alice&quot;, &quot;secret&quot;));
+let config = ImapConfig::new(&quot;127.0.0.1:1143&quot;.parse()?, &quot;localhost&quot;, store, factory);
+let svc = ImapService::new(config, Arc::clone(&amp;rt));
+svc.start()?;</code></pre>
+<p><code>ImapConfig</code> knobs: <code>with_tls(acceptor)</code> (+ <code>implicit_tls()</code> for IMAPS), <code>with_greeting</code>, <code>with_quota_manager</code>, <code>with_server_id</code>, and per-extension <code>enable_*</code> flags (<code>idle</code>, <code>namespace</code>, <code>quota</code>, <code>move</code>, <code>condstore</code>, <code>qresync</code>, <code>enable</code>).</p>
+<p>Example binary: <code>cargo run -p imap -- 127.0.0.1:1143 localhost ./mail</code>.</p>
+<h2 id="client">Client</h2>
+<p>The high-level <code>ImapFetch</code> auto-pilot drives greeting → CAPABILITY → (STARTTLS → CAPABILITY) → LOGIN / AUTHENTICATE PLAIN → SELECT → FETCH → LOGOUT. <code>ImapIdle</code> drives the same preamble then IDLE, delivering unsolicited EXISTS/EXPUNGE/FLAGS through a <code>MailboxEventListener</code> until <code>DONE</code>.</p>
+<pre class="rust,ignore"><code>use std::sync::Arc;
+use hopf_core::{Runtime, RuntimeConfig};
+use hopf_imap::{ImapClient, ImapFetch};
+
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+
+ImapClient::new(&quot;mail.example.com&quot;, 143)
+    .connect(
+        &amp;rt,
+        Arc::new(
+            ImapFetch::new()
+                .credentials(&quot;alice&quot;, &quot;secret&quot;)
+                .mailbox(&quot;INBOX&quot;)
+                .on_message(Box::new(|seq, uid, body| {
+                    println!(&quot;message {seq} uid={uid:?} ({} bytes)&quot;, body.len());
+                }))
+                .on_complete(Box::new(|ok| {
+                    println!(&quot;fetch complete: {ok}&quot;);
+                })),
+        ),
+    )?;</code></pre>
+<p>For full control implement <code>ImapClientDriver</code>: every server event surfaces as a callback (<code>on_greeting</code>, <code>on_capability</code>, <code>on_authenticated</code>, <code>on_selected</code>, <code>on_fetch_data</code>, <code>on_status_data</code>, <code>on_list_entry</code>, <code>on_idle_started</code>, …), and each callback receives the staged state reference (<code>ImapClientNotAuthenticated</code> → <code>ImapClientAuthenticated</code> → <code>ImapClientSelected</code> / <code>ImapClientIdle</code>) whose methods issue the commands that are legal in that state.</p>
+<h3 id="client-options">Client options</h3>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Builder method</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ImapClient::new(host, port)</code></td>
+<td>—</td>
+<td>Plain TCP; DNS-resolved off-reactor</td>
+</tr>
+<tr>
+<td><code>ImapClient::from_addr(addr)</code></td>
+<td>—</td>
+<td>Skip DNS</td>
+</tr>
+<tr>
+<td><code>.starttls(connector, name)</code></td>
+<td>off</td>
+<td>Explicit TLS after greeting/CAPABILITY</td>
+</tr>
+<tr>
+<td><code>.implicit_tls(connector, name)</code></td>
+<td>off</td>
+<td>IMAPS (port 993)</td>
+</tr>
+<tr>
+<td><code>.timeouts(ImapClientTimeouts)</code></td>
+<td>dns=5s, connect=30s, stage=60s, msg=600s</td>
+<td>Per-phase deadlines</td>
+</tr>
+<tr>
+<td><code>.max_pipeline(n)</code></td>
+<td>8</td>
+<td>Cap outstanding tagged commands</td>
+</tr>
+<tr>
+<td><code>ImapFetch::credentials(user, pass)</code></td>
+<td>—</td>
+<td>LOGIN or AUTHENTICATE PLAIN</td>
+</tr>
+<tr>
+<td><code>.mailbox(name)</code></td>
+<td><code>INBOX</code></td>
+<td>Mailbox to SELECT</td>
+</tr>
+<tr>
+<td><code>.sequence_set(set)</code> / <code>.fetch_items(items)</code></td>
+<td><code>1:*</code> / <code>(RFC822)</code></td>
+<td>What to FETCH</td>
+</tr>
+<tr>
+<td><code>.require_starttls(true)</code></td>
+<td>false</td>
+<td>Abort if STARTTLS unavailable</td>
+</tr>
+<tr>
+<td><code>ImapIdle::done_on_event(true)</code></td>
+<td>false</td>
+<td>Send <code>DONE</code> after the first mailbox event</td>
+</tr>
+</tbody>
+</table>
+<p>Example binary: <code>cargo run -p imap-fetch -- 127.0.0.1 1143 alice secret</code>.</p>
+<h2 id="pipelining">Pipelining</h2>
+<p>The client keeps a tag-correlated <code>PendingMap</code> of outstanding commands (up to <code>max_pipeline</code>). Untagged replies are classified by prefix (<code>STATUS</code>, <code>LIST</code>, <code>FETCH</code>, <code>SEARCH</code>, …) and routed to the <strong>oldest compatible pending command</strong>, so tagged completions may arrive in any order. <code>pipeline_status_and_list</code> issues STATUS and LIST back-to-back as a demonstration; the Hopf server serializes storage-backed commands per connection and answers in order, but the client also handles out-of-order completion from other servers.</p>
+<h2 id="timeouts">Timeouts</h2>
+<p><code>ImapClientTimeouts</code> phases:</p>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Default</th>
+<th>Covers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>dns</code></td>
+<td>5 s</td>
+<td>Hostname resolution</td>
+</tr>
+<tr>
+<td><code>connect</code></td>
+<td>30 s</td>
+<td>Dial → greeting (and implicit-TLS handshake)</td>
+</tr>
+<tr>
+<td><code>stage</code></td>
+<td>60 s</td>
+<td>Each outstanding tagged command</td>
+</tr>
+<tr>
+<td><code>message</code></td>
+<td>600 s</td>
+<td>FETCH literal (body) transfer</td>
+</tr>
+</tbody>
+</table>
+<p>On expiry the driver’s <code>on_timeout</code> fires and the connection closes.</p>
+<h2 id="testing">Testing</h2>
+<p>Unit tests run with the workspace default (<code>cargo test -p hopf-imap --lib</code>). Loopback TCP / TLS / filesystem integration tests are <strong>opt-in</strong>:</p>
+<div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test <span class="at">-p</span> hopf-imap <span class="at">--features</span> integration</span></code></pre></div>
+<p>They cover raw-socket LOGIN/SELECT/FETCH/APPEND, pipelined STATUS+LIST (in-order against the Hopf server and synthetic out-of-order against a scripted server), STARTTLS and implicit-TLS fetch, hostname dial, and IDLE (server DONE handling plus client EXISTS→DONE).</p>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>AUTHENTICATE mechanisms beyond PLAIN are not implemented (use TLS + PLAIN).</li>
+<li>A mailbox handle is a point-in-time snapshot: IDLE reports appends made through the same session’s store, but changes written by other processes are not observed until reselect.</li>
+<li>QRESYNC does not fabricate <code>VANISHED (EARLIER)</code> history; clients fall back to full resync.</li>
+<li>mbox backend: no hierarchy / COPY / MOVE (see <a href="mailbox.html">Mailbox</a>).</li>
+</ul>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

@@ -33,7 +33,12 @@ pub struct MessageIndex {
 
 impl MessageIndex {
     /// Create an empty index.
-    pub fn new(path: impl Into<PathBuf>, uid_validity: u64, uid_next: u64, config: IndexConfig) -> Self {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        uid_validity: u64,
+        uid_next: u64,
+        config: IndexConfig,
+    ) -> Self {
         Self {
             path: path.into(),
             config,
@@ -154,6 +159,14 @@ impl MessageIndex {
         }
     }
 
+    /// Update keywords on an entry.
+    pub fn set_keywords(&mut self, uid: u64, keywords: &std::collections::BTreeSet<String>) {
+        if let Some(e) = self.entries.get_mut(&uid) {
+            e.set_keywords(keywords);
+            self.dirty = true;
+        }
+    }
+
     /// Search using index; for BODY/TEXT without body index, `body_loader` supplies text.
     pub fn search<F>(
         &self,
@@ -175,10 +188,7 @@ impl MessageIndex {
                 entry: e,
                 body_override,
             };
-            if criteria
-                .matches(&ctx)
-                .map_err(MailboxError::Io)?
-            {
+            if criteria.matches(&ctx).map_err(MailboxError::Io)? {
                 out.push(e.message_number);
             }
         }

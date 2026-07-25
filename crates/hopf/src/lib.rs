@@ -33,6 +33,7 @@
 //! | [`ftp`] | `hopf-ftp` | `ftp` |
 //! | [`smtp`] | `hopf-smtp` | `smtp` |
 //! | [`pop3`] | `hopf-pop3` | `pop3` |
+//! | [`imap`] | `hopf-imap` | `imap` |
 //! | [`mailbox`] | `hopf-mailbox` | `mailbox` |
 //! | [`otel`] | `hopf-otel` | `otel` |
 //!
@@ -86,6 +87,10 @@ pub use hopf_smtp as smtp;
 /// POP3 / POP3S server.
 #[cfg(feature = "pop3")]
 pub use hopf_pop3 as pop3;
+
+/// IMAP4rev2 / IMAPS server and callback-driven client.
+#[cfg(feature = "imap")]
+pub use hopf_imap as imap;
 
 /// mbox / Maildir++ mailbox storage SPI.
 #[cfg(feature = "mailbox")]

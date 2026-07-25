@@ -112,6 +112,16 @@ pub trait Endpoint: Send {
     fn fail(&mut self, err: io::Error) {
         let _ = err;
     }
+
+    /// Re-invoke the protocol handler's `receive` without waiting for new
+    /// inbound data (redelivering any buffered residual first).
+    ///
+    /// Storage-offload completion callbacks (via [`ConnHandle::with_endpoint`])
+    /// use this after `resume_read` so handlers that defer reply emission /
+    /// queued-command dispatch to their `receive` path make progress even when
+    /// the peer is waiting for a reply and sends nothing further. No-op when
+    /// called re-entrantly from inside `receive`. Default is a no-op (mocks).
+    fn poke_handler(&mut self) {}
 }
 
 /// Callback type for [`Endpoint::on_write_ready`].

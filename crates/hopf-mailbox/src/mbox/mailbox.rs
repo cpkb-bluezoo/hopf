@@ -91,7 +91,9 @@ impl MboxMailbox {
         let gidx_path = gidx_path_for(&path);
         let mut index = MessageIndex::load(&gidx_path, index_config.clone())?
             .filter(|idx| idx.uid_validity() == uid_validity)
-            .unwrap_or_else(|| MessageIndex::new(&gidx_path, uid_validity, 1, index_config.clone()));
+            .unwrap_or_else(|| {
+                MessageIndex::new(&gidx_path, uid_validity, 1, index_config.clone())
+            });
 
         let mut messages = Vec::new();
         let mut uid_next = index.uid_next().max(1);
@@ -122,18 +124,12 @@ impl MboxMailbox {
 
             let (sys, kw) = flags.get(&unique_id);
             if index.get(uid).is_none()
-                || index.get(uid).is_some_and(|e| e.prop(0) != loc_key.as_str())
+                || index
+                    .get(uid)
+                    .is_some_and(|e| e.prop(0) != loc_key.as_str())
             {
-                let entry = builder.build(
-                    uid,
-                    (i + 1) as u32,
-                    size,
-                    &location,
-                    &sys,
-                    &kw,
-                    0,
-                    &slice,
-                );
+                let entry =
+                    builder.build(uid, (i + 1) as u32, size, &location, &sys, &kw, 0, &slice);
                 index.put(entry);
                 need_save_index = true;
             }
@@ -283,12 +279,7 @@ impl MboxMailbox {
 impl Mailbox for MboxMailbox {
     fn close(&mut self, expunge: bool) -> MailboxResult<()> {
         if expunge && !self.read_only {
-            let any = self.messages.iter().any(|m| {
-                m.session_deleted || self.flags.get(&m.unique_id).0.contains(&Flag::Deleted)
-            });
-            if any {
-                self.rewrite_expunge()?;
-            }
+            let _ = self.expunge()?;
         } else if !expunge {
             for m in &mut self.messages {
                 m.session_deleted = false;
@@ -316,11 +307,7 @@ impl Mailbox for MboxMailbox {
     }
 
     fn undeleted_message_count(&self) -> MailboxResult<u32> {
-        Ok(self
-            .messages
-            .iter()
-            .filter(|m| !m.session_deleted)
-            .count() as u32)
+        Ok(self.messages.iter().filter(|m| !m.session_deleted).count() as u32)
     }
 
     fn undeleted_mailbox_size(&self) -> MailboxResult<u64> {
@@ -405,18 +392,57 @@ impl Mailbox for MboxMailbox {
         Ok(())
     }
 
-    fn replace_flags(
-        &mut self,
-        message_number: u32,
-        flags: &BTreeSet<Flag>,
-    ) -> MailboxResult<()> {
+    fn replace_flags(&mut self, message_number: u32, flags: &BTreeSet<Flag>) -> MailboxResult<()> {
         self.ensure_writable()?;
         let uid = self.msg(message_number)?.uid;
         let unique_id = self.msg(message_number)?.unique_id.clone();
         let (_, kw) = self.flags.get(&unique_id);
-        let cur: BTreeSet<Flag> = flags.iter().copied().filter(|f| *f != Flag::Recent).collect();
+        let cur: BTreeSet<Flag> = flags
+            .iter()
+            .copied()
+            .filter(|f| *f != Flag::Recent)
+            .collect();
         self.flags.set(&unique_id, cur.clone(), kw);
         self.index.set_flags(uid, &cur);
+        Ok(())
+    }
+
+    fn set_keywords(
+        &mut self,
+        message_number: u32,
+        keywords: &BTreeSet<String>,
+        add: bool,
+    ) -> MailboxResult<()> {
+        self.ensure_writable()?;
+        let uid = self.msg(message_number)?.uid;
+        let unique_id = self.msg(message_number)?.unique_id.clone();
+        let (sys, mut kw) = self.flags.get(&unique_id);
+        if add {
+            for k in keywords {
+                kw.insert(k.to_string());
+            }
+        } else {
+            for k in keywords {
+                kw.retain(|existing| !existing.eq_ignore_ascii_case(k));
+            }
+        }
+        self.flags.set(&unique_id, sys, kw.clone());
+        self.index.set_keywords(uid, &kw);
+        Ok(())
+    }
+
+    fn replace_keywords(
+        &mut self,
+        message_number: u32,
+        keywords: &BTreeSet<String>,
+    ) -> MailboxResult<()> {
+        self.ensure_writable()?;
+        let uid = self.msg(message_number)?.uid;
+        let unique_id = self.msg(message_number)?.unique_id.clone();
+        let (sys, _) = self.flags.get(&unique_id);
+        let kw = keywords.clone();
+        self.flags.set(&unique_id, sys, kw.clone());
+        self.index.set_keywords(uid, &kw);
         Ok(())
     }
 
@@ -437,6 +463,21 @@ impl Mailbox for MboxMailbox {
         Ok(())
     }
 
+    fn expunge(&mut self) -> MailboxResult<Vec<u32>> {
+        self.ensure_writable()?;
+        let mut removed = Vec::new();
+        for (i, m) in self.messages.iter().enumerate() {
+            let (sys, _) = self.flags.get(&m.unique_id);
+            if m.session_deleted || sys.contains(&Flag::Deleted) {
+                removed.push((i + 1) as u32);
+            }
+        }
+        if !removed.is_empty() {
+            self.rewrite_expunge()?;
+        }
+        Ok(removed)
+    }
+
     fn start_append(
         &mut self,
         flags: &BTreeSet<Flag>,
@@ -452,7 +493,11 @@ impl Mailbox for MboxMailbox {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         self.append = Some(AppendState {
-            flags: flags.iter().copied().filter(|f| *f != Flag::Recent).collect(),
+            flags: flags
+                .iter()
+                .copied()
+                .filter(|f| *f != Flag::Recent)
+                .collect(),
             internal_millis,
             buf: Vec::new(),
         });
@@ -490,15 +535,18 @@ impl Mailbox for MboxMailbox {
         let unique_id = md5_hex(&buf);
         let uid = self.uid_next;
         self.uid_next += 1;
-        self.flags
-            .set(&unique_id, flags.clone(), BTreeSet::new());
+        self.flags.set(&unique_id, flags.clone(), BTreeSet::new());
 
         let start = {
             let meta = std::fs::metadata(&self.path)?;
             meta.len().saturating_sub(out.len() as u64)
         };
         // Approximate content start after From_ line
-        let from_line_end = out.iter().position(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
+        let from_line_end = out
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let content_start = start + from_line_end as u64;
         let content_end = start + out.len() as u64;
         let location = format!("{}:{}", content_start, content_end);
@@ -532,9 +580,7 @@ impl Mailbox for MboxMailbox {
         _message_numbers: &[u32],
         _destination_mailbox: &str,
     ) -> MailboxResult<BTreeMap<u32, u64>> {
-        Err(MailboxError::Unsupported(
-            "COPY (mbox is a single mailbox)",
-        ))
+        Err(MailboxError::Unsupported("COPY (mbox is a single mailbox)"))
     }
 
     fn search(&self, criteria: &SearchCriteria) -> MailboxResult<Vec<u32>> {

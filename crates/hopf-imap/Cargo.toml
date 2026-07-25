@@ -1,0 +1,35 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-imap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "IMAP4rev2 / IMAPS server and callback-driven client for Hopf"
+readme = "README.md"
+keywords = ["imap", "imaps", "email", "networking"]
+categories = ["network-programming", "email"]
+
+[features]
+default = []
+# Opt-in loopback/filesystem integration tests; CI runs `--lib` without this.
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-dns = { workspace = true }
+hopf-tls = { workspace = true }
+hopf-auth = { workspace = true }
+hopf-mailbox = { workspace = true }
+hopf-otel = { workspace = true }
+rmimeparser = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
