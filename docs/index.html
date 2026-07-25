@@ -40,6 +40,7 @@
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -201,6 +202,14 @@
 <li>Storage work on the pool; pipelined commands queued and answered in order</li>
 <li>Async client: <code>ImapClient</code> + <code>ImapFetch</code> / <code>ImapIdle</code> auto-pilots; tag-correlated pipelining, STARTTLS/IMAPS, production IDLE</li>
 </ul>
+<h3 id="mqtt-hopf-mqtt">MQTT (<code>hopf-mqtt</code>)</h3>
+<ul>
+<li>MQTT 3.1.1 full semantics plus a useful 5.0 core: wire properties, reason codes, Receive Maximum flow control, subscription options (No Local, Retain As Published, Retain Handling), Session Expiry</li>
+<li>QoS 0/1/2, retained messages, wills, topic wildcards, session takeover / resume</li>
+<li>Multi-reactor fan-out via <code>ConnHandle</code>; staged <code>ConnectHandler</code> SPI backed by <code>CredentialStore</code></li>
+<li>Async client: <code>MqttClient</code> + <code>MqttClientDriver</code> callbacks</li>
+<li>Optional MQTT-over-WebSocket bridge (<code>websocket</code> feature) sharing broker state with the TCP listener</li>
+</ul>
 <h3 id="mailbox-hopf-mailbox">Mailbox (<code>hopf-mailbox</code>)</h3>
 <ul>
 <li>IMAP-level storage SPI (wire server: <a href="imap.html"><code>hopf-imap</code></a>)</li>
@@ -307,6 +316,13 @@
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
 <td>pipelined client (<code>ImapFetch</code> / <code>ImapIdle</code>)</td>
+</tr>
+<tr>
+<td>MQTT</td>
+<td><code>hopf-mqtt</code></td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td>3.1.1 + v5 core; optional WS bridge</td>
 </tr>
 <tr>
 <td>Mailbox storage</td>

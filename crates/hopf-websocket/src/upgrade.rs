@@ -2,6 +2,7 @@
 
 //! Bridge from HTTP [`ProtocolUpgradeHandler`] to WebSocket framing.
 
+use hopf_core::ConnHandle;
 use hopf_http::ProtocolUpgradeHandler;
 
 use crate::frame::{Opcode, WsFrameError, WsFrameHandler, WsFrameParser, WsRole};
@@ -10,7 +11,12 @@ use crate::session::WsSession;
 /// Application callbacks after the WebSocket is open.
 pub trait WsEventHandler: Send {
     /// Connection established (after 101 / Extended CONNECT 200).
-    fn opened(&mut self, session: &mut WsSession<'_>);
+    ///
+    /// `conn` is a cloneable handle to this connection, for hopping work
+    /// back onto its reactor from another thread (e.g. a pub/sub bridge
+    /// delivering a message published on a different connection) — see
+    /// [`hopf_core::ConnHandle`].
+    fn opened(&mut self, session: &mut WsSession<'_>, conn: &ConnHandle);
 
     /// Complete text message (single-frame; fragmented messages not reassembled yet).
     fn text_message(&mut self, session: &mut WsSession<'_>, text: &str) {
@@ -43,30 +49,36 @@ pub struct WsUpgradeHandler {
     event: Box<dyn WsEventHandler>,
     out: Vec<u8>,
     role: WsRole,
+    conn: ConnHandle,
     opened: bool,
     dead: bool,
 }
 
 impl WsUpgradeHandler {
-    /// Server-side upgrade handler.
-    pub fn server(event: Box<dyn WsEventHandler>, max_payload: usize) -> Self {
+    /// Server-side upgrade handler. `conn` is this connection's
+    /// [`ConnHandle`] (from `ServerWriter::conn_handle()`), passed through
+    /// to [`WsEventHandler::opened`].
+    pub fn server(event: Box<dyn WsEventHandler>, max_payload: usize, conn: ConnHandle) -> Self {
         Self {
             parser: WsFrameParser::new(WsRole::Server, max_payload),
             event,
             out: Vec::new(),
             role: WsRole::Server,
+            conn,
             opened: false,
             dead: false,
         }
     }
 
-    /// Client-side upgrade handler.
-    pub fn client(event: Box<dyn WsEventHandler>, max_payload: usize) -> Self {
+    /// Client-side upgrade handler. `conn` is this connection's [`ConnHandle`]
+    /// (from `Endpoint::handle()`), passed through to [`WsEventHandler::opened`].
+    pub fn client(event: Box<dyn WsEventHandler>, max_payload: usize, conn: ConnHandle) -> Self {
         Self {
             parser: WsFrameParser::new(WsRole::Client, max_payload),
             event,
             out: Vec::new(),
             role: WsRole::Client,
+            conn,
             opened: false,
             dead: false,
         }
@@ -78,7 +90,7 @@ impl WsUpgradeHandler {
         }
         self.opened = true;
         let mut session = WsSession::new(&mut self.out, self.role);
-        self.event.opened(&mut session);
+        self.event.opened(&mut session, &self.conn);
     }
 }
 

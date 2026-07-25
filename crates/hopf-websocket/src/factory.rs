@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use hopf_core::ConnHandle;
 use hopf_http::{
     Headers, ServerHandler, ServerHandlerFactory, ServerWriter,
 };
@@ -35,8 +36,10 @@ impl Default for WebSocketConfig {
 
 /// Builds per-connection [`WsEventHandler`] instances.
 pub trait WsEventHandlerFactory: Send + Sync {
-    /// Create a handler for a new WebSocket (path from `:path`).
-    fn create(&self, path: &str, request_headers: &Headers) -> Box<dyn WsEventHandler>;
+    /// Create a handler for a new WebSocket (path from `:path`). `conn` is
+    /// this connection's [`ConnHandle`], for handlers that need to be
+    /// reachable from another reactor thread (e.g. a pub/sub bridge).
+    fn create(&self, path: &str, request_headers: &Headers, conn: ConnHandle) -> Box<dyn WsEventHandler>;
 }
 
 /// HTTP factory that upgrades valid WebSocket requests and rejects others with 400.
@@ -75,13 +78,14 @@ impl<F: WsEventHandlerFactory> ServerHandler for WsHttpHandler<F> {
     fn headers(&mut self, response: &mut dyn ServerWriter, headers: &Headers) {
         self.request = headers.clone();
         let path = headers.get(":path").unwrap_or("/");
-        let event = self.events.create(path, headers);
+        let conn = response.conn_handle();
+        let event = self.events.create(path, headers, conn.clone());
         let max = self.config.max_payload;
         let sub = self.config.subprotocol.as_deref();
 
         if let Ok(key) = validate_h1_upgrade(headers) {
             let resp = websocket_accept_headers(key, sub);
-            let handler = Box::new(WsUpgradeHandler::server(event, max));
+            let handler = Box::new(WsUpgradeHandler::server(event, max, conn));
             if !response.upgrade(resp, handler) {
                 let mut h = Headers::new();
                 h.status(500);
@@ -93,7 +97,7 @@ impl<F: WsEventHandlerFactory> ServerHandler for WsHttpHandler<F> {
 
         if is_extended_connect_websocket(headers) {
             let resp = websocket_connect_response_headers(sub);
-            let handler = Box::new(WsUpgradeHandler::server(event, max));
+            let handler = Box::new(WsUpgradeHandler::server(event, max, conn));
             if !response.upgrade(resp, handler) {
                 let mut h = Headers::new();
                 h.status(500);
@@ -120,7 +124,7 @@ impl<F: WsEventHandlerFactory> ServerHandler for WsHttpHandler<F> {
 pub struct EchoWsHandler;
 
 impl WsEventHandler for EchoWsHandler {
-    fn opened(&mut self, _session: &mut WsSession<'_>) {}
+    fn opened(&mut self, _session: &mut WsSession<'_>, _conn: &ConnHandle) {}
 
     fn text_message(&mut self, session: &mut WsSession<'_>, text: &str) {
         session.send_text(text);
@@ -135,7 +139,7 @@ impl WsEventHandler for EchoWsHandler {
 pub struct EchoFactory;
 
 impl WsEventHandlerFactory for EchoFactory {
-    fn create(&self, _path: &str, _request_headers: &Headers) -> Box<dyn WsEventHandler> {
+    fn create(&self, _path: &str, _request_headers: &Headers, _conn: ConnHandle) -> Box<dyn WsEventHandler> {
         Box::new(EchoWsHandler)
     }
 }

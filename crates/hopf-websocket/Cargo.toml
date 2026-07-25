@@ -18,11 +18,11 @@ default = []
 integration = ["hopf-http/h3"]
 
 [dependencies]
+hopf-core = { workspace = true }
 hopf-http = { workspace = true }
 sha1 = "0.10"
 base64 = "0.22"
 getrandom = { workspace = true }
 
 [dev-dependencies]
-hopf-core = { workspace = true }
 tempfile = { workspace = true }

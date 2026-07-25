@@ -2,6 +2,10 @@
 
 //! Outbound WebSocket frame helpers into a byte buffer.
 
+use std::sync::Arc;
+
+use hopf_core::ConnHandle;
+
 use crate::frame::{write_frame, Opcode, WsRole};
 
 /// Mutable session for sending frames on an established WebSocket.
@@ -83,6 +87,23 @@ pub fn write_close(out: &mut Vec<u8>, role: WsRole, code: u16, reason: &str) {
     payload.extend_from_slice(reason.as_bytes());
     let mask = client_mask(role);
     write_frame(out, true, Opcode::Close, mask, &payload);
+}
+
+/// Wrap `conn` so every [`ConnHandle::send`] first frames the payload as a
+/// WebSocket binary message for `role`, instead of writing it straight to
+/// the raw transport (which would land on the wire unframed and corrupt the
+/// WebSocket stream). Use this — not the raw `conn` handed to
+/// [`crate::WsEventHandlerFactory::create`] / [`crate::WsEventHandler::opened`]
+/// — for any `ConnHandle` given to code that delivers asynchronously from
+/// another connection or thread (e.g. a pub/sub fan-out); synchronous
+/// replies from within a `WsEventHandler` callback should keep using
+/// [`WsSession::send_binary`] instead, which is already correctly framed.
+pub fn framed_ws_conn_handle(conn: &ConnHandle, role: WsRole) -> ConnHandle {
+    conn.framed(Arc::new(move |data: Vec<u8>| {
+        let mut out = Vec::new();
+        write_binary(&mut out, role, &data);
+        out
+    }))
 }
 
 fn client_mask(role: WsRole) -> Option<[u8; 4]> {

@@ -21,7 +21,10 @@ pub use handshake::{
     validate_h1_upgrade, websocket_accept_headers, websocket_connect_response_headers,
     WEBSOCKET_GUID, WEBSOCKET_VERSION,
 };
-pub use session::{write_binary, write_close, write_ping, write_pong, write_text, WsSession};
+pub use session::{
+    framed_ws_conn_handle, write_binary, write_close, write_ping, write_pong, write_text,
+    WsSession,
+};
 pub use upgrade::{WsEventHandler, WsUpgradeHandler};
 
 #[cfg(all(test, feature = "integration"))]
