@@ -65,7 +65,7 @@
         <h1>Mailbox</h1>
         <p class="lead">Crate <code>hopf-mailbox</code>: <strong>mailbox storage SPI</strong> (Gumdrop <code>org.bluezoo.gumdrop.mailbox</code> port) — Maildir++ and mbox backends with SEARCH, flags, and optional <code>.gidx</code> indexing. This is <strong>not</strong> an IMAP wire server; <a href="imap.html"><code>hopf-imap</code></a> sits on top of these traits.</p>
       </header>
-      <p>SMTP local delivery is also not wired stock — see <a href="smtp.html">SMTP</a> limitations and append from a custom <code>MessageDataHandler</code> on <code>StorageExecutor</code>.</p>
+      <p>SMTP local delivery is wired stock via <a href="smtp.html#local-delivery"><code>LocalDeliveryService</code></a>, which APPENDs each accepted message to the recipient's <code>INBOX</code> through this crate's <code>MailboxFactory</code> on the Runtime storage pool. POP3 and IMAP (<code>hopf-pop3</code>, <code>hopf-imap</code>) read from and write to mailboxes the same way, so all three protocols can share one backend in a single composed process — see <a href="composition.html">Composition</a>.</p>
 <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#standards-and-layouts">Standards and layouts</a></li>

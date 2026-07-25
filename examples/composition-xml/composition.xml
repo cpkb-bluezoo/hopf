@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<composition worker-threads="2">
+  <listen-tcp addr="127.0.0.1:8090" handler="echo"
+              max-net-in="65536" max-net-out="65536"
+              idle-timeout-ms="60000">
+    <allow cidr="127.0.0.1/32"/>
+    <rate-limit per-source="50" window-ms="1000" global="0"/>
+  </listen-tcp>
+  <listen-tcp addr="127.0.0.1:8091" handler="shout"/>
+  <dial-tcp addr="127.0.0.1:8090" handler="dial-greet"/>
+</composition>

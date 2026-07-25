@@ -35,6 +35,8 @@ members = [
     "examples/pop3-fetch",
     "examples/imap",
     "examples/imap-fetch",
+    "examples/composition-xml",
+    "examples/mail-composed",
 ]
 default-members = [
     "crates/hopf",
