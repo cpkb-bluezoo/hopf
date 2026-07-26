@@ -81,7 +81,7 @@
 <li><a href="#cross-thread">Cross-thread signaling: ConnHandle and wakeups</a></li>
 <li><a href="#storage">Storage pool: bounded and fail-fast (this one's right)</a></li>
 <li><a href="#acl-quota">ACL, rate limiting, and quotas</a></li>
-<li><a href="#unbounded-growth">Unbounded growth vectors</a></li>
+<li><a href="#unbounded-growth">Accept-rate-limiter memory: bounded by periodic pruning</a></li>
 <li><a href="#summary">Summary table</a></li>
 </ul></div>
 
@@ -125,8 +125,8 @@
 <p><code>PeerAcl::allows</code> (<code>acl.rs:76-85</code>) is a linear scan over the allow/deny <code>Vec&lt;IpNet&gt;</code> lists, evaluated on the single accept thread for every accepted connection (<code>accept.rs:208</code>) — fine for typical ACL sizes (tens of entries), but combined with the single-accept-thread finding above, a very large CIDR list adds directly to that thread's per-accept cost with no way to parallelize it.</p>
 <p><code>CounterQuota</code> (<code>quota.rs:44-95</code>) is lock-free (plain <code>AtomicU64</code> counters, <code>Relaxed</code> ordering — correct here since each axis is an independent monotonic counter with no cross-axis ordering requirement) and scales fine per-connection.</p>
 
-<h2 id="unbounded-growth">Unbounded growth vectors</h2>
-<p><code>AcceptRateLimit</code>'s per-source tracking is a <code>HashMap&lt;IpAddr, (u32, Instant)&gt;</code> (<code>acl.rs:104</code>) that is <strong>only ever inserted into, never pruned</strong>. <code>try_acquire</code> (<code>acl.rs:130-162</code>) reads or inserts an entry for the peer's IP on every accept, but nothing ever removes an entry once its rate-limit window has expired — <code>get_mut</code> either updates the existing entry or, on expiry, the <code>_ =&gt;</code> arm (<code>acl.rs:156-159</code>) overwrites it in place, which is fine for a <em>repeat</em> source, but a source that connects once and never returns leaves its entry in the map forever. For a listener with a configured <code>per_source</code> limit facing traffic from many distinct source IPs over the process lifetime — the exact traffic pattern a rate limiter exists to defend against (many distinct/spoofed/rotating sources) — this map grows without bound for the life of the process. This is the one finding in this audit that's a genuine unbounded-memory issue rather than a contention/throughput characteristic, and it's directly reachable from network input (any listener with <code>per_source &gt; 0</code> configured).</p>
+<h2 id="unbounded-growth">Accept-rate-limiter memory: bounded by periodic pruning</h2>
+<p><code>AcceptRateLimit</code>'s per-source tracking is a <code>HashMap&lt;IpAddr, (u32, Instant)&gt;</code> (<code>acl.rs:104</code>). <code>try_acquire</code> (<code>acl.rs:131-177</code>) sweeps it at most once per rate-limit window — gated by a <code>last_sweep: Option&lt;Instant&gt;</code> timestamp, so the cost of the sweep is amortized across every call within that window rather than paid on every accept — removing every entry whose window has already expired, before reading or inserting the current peer's own entry. A source that connects once and never returns is pruned on the next sweep rather than sitting in the map forever, so memory is bounded by the number of distinct sources active within roughly the trailing window (worst case just under 2× one window's worth, since an entry can linger from just after one sweep until the next), not by every distinct IP seen over the life of the process.</p>
 
 <h2 id="summary">Summary table</h2>
 <table>
@@ -139,10 +139,10 @@
 <tr><td>Cross-reactor fan-out (<code>ConnHandle::send</code>)</td><td>Yes, but 1 syscall/message</td><td>No wake coalescing (<a href="#cross-thread">§Cross-thread signaling</a>)</td></tr>
 <tr><td>Storage / blocking work</td><td>Yes, bounded</td><td>Correctly designed fail-fast pool (<a href="#storage">§Storage pool</a>)</td></tr>
 <tr><td>Reactor command queue depth</td><td>N/A</td><td>Unbounded — no backpressure, unlike storage (<a href="#cross-thread">§Cross-thread signaling</a>)</td></tr>
-<tr><td>Accept-rate-limiter memory</td><td>N/A</td><td>Unbounded growth with distinct source IPs over process lifetime (<a href="#unbounded-growth">§Unbounded growth vectors</a>)</td></tr>
+<tr><td>Accept-rate-limiter memory</td><td>N/A</td><td>Bounded by a periodic sweep — tracks recently-active sources, not every distinct IP ever seen (<a href="#unbounded-growth">§Accept-rate-limiter memory</a>)</td></tr>
 </tbody>
 </table>
-<p>None of these findings are "hopf is broken" — the steady-state per-connection I/O path, which is what TPC is chiefly claimed for, holds up under reading. The accept-rate-limiter map is the one item worth fixing before calling the scalability story complete; the rest are honest tradeoffs worth documenting rather than defects.</p>
+<p>None of these findings are "hopf is broken" — the steady-state per-connection I/O path, which is what TPC is chiefly claimed for, holds up under reading, and every genuine memory/contention issue this audit found has since been fixed. What's left — the single accept thread, no wake coalescing on the reactor command channel, the unbounded reactor command queue — are honest tradeoffs worth documenting rather than defects.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
