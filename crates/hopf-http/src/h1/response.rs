@@ -11,6 +11,7 @@ use crate::status::reason_phrase;
 use crate::stream::{
     ProtocolUpgradeHandler, ResponseControl, ServerResponseHandle, ServerWriter,
 };
+use crate::utils::http_date_now;
 use crate::version::HttpVersion;
 
 /// Framing + outbound buffer shared by the codec driver and deferred
@@ -271,6 +272,9 @@ impl H1SessionWriter {
         let status = headers.status_code();
         if !headers.contains("server") {
             headers.set("Server", "hopf");
+        }
+        if !headers.contains("date") {
+            headers.set("Date", http_date_now());
         }
         let auto_chunk = s.version == HttpVersion::Http11
             && status >= 200

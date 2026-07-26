@@ -2,15 +2,17 @@
 
 //! Token / host / Transfer-Encoding helpers.
 
+/// Whether `b` is an RFC 9110 §5.6.2 `tchar`.
+fn is_tchar(b: u8) -> bool {
+    matches!(b,
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' |
+        b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z'
+    )
+}
+
 /// RFC 9110 token characters for method names.
 pub fn is_token(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes().all(|b| {
-            matches!(b,
-                b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' |
-                b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z'
-            )
-        })
+    !s.is_empty() && s.bytes().all(is_tchar)
 }
 
 /// Basic request-target check (origin-form, absolute-form, authority-form, asterisk).
@@ -53,7 +55,8 @@ pub fn is_invalid_te(value: &str) -> bool {
     !value.trim().is_empty() && !is_chunked_te(value)
 }
 
-/// Header field-name: token, optional leading `:` for pseudo-headers.
+/// Header field-name: token (full RFC 9110 `tchar` set), optional leading
+/// `:` for pseudo-headers.
 pub fn is_valid_header_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() {
@@ -67,9 +70,16 @@ pub fn is_valid_header_name(name: &str) -> bool {
     } else {
         0
     };
-    bytes[start..]
+    bytes[start..].iter().all(|&b| is_tchar(b))
+}
+
+/// Header field-value: reject CTL bytes (RFC 9112 §5.5 `field-content`
+/// grammar) — HTAB is the only permitted control character; SP, VCHAR
+/// (0x21-0x7E), and obs-text (0x80-0xFF) are otherwise allowed.
+pub fn is_valid_header_value(value: &[u8]) -> bool {
+    value
         .iter()
-        .all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        .all(|&b| b == 0x09 || (0x20..=0x7e).contains(&b) || b >= 0x80)
 }
 
 /// Default methods Hopf accepts without a custom factory set.
@@ -104,6 +114,68 @@ pub fn parse_content_length(value: &str) -> Option<u64> {
         return None;
     }
     v.parse().ok()
+}
+
+/// Current time as a `Date` response header value: IMF-fixdate, always GMT
+/// (RFC 9110 §5.6.7, §6.6.1).
+pub fn http_date_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    format_http_date(secs)
+}
+
+fn format_http_date(secs: i64) -> String {
+    const DAYS: &[&str] = &["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: &[&str] = &[
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = secs.div_euclid(86400);
+    let time = secs.rem_euclid(86400);
+    let hour = (time / 3600) as u32;
+    let min = ((time % 3600) / 60) as u32;
+    let sec = (time % 60) as u32;
+    // 1970-01-01 was a Thursday.
+    let wday = (days + 3).rem_euclid(7) as usize;
+    let mut y = 1970i64;
+    let mut day = days;
+    loop {
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let year_days = if leap { 366 } else { 365 };
+        if day >= 0 && day < year_days {
+            break;
+        }
+        if day < 0 {
+            y -= 1;
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            day += if leap { 366 } else { 365 };
+        } else {
+            day -= year_days;
+            y += 1;
+        }
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    let mut m = 0usize;
+    while m < 12 && day >= mdays[m] as i64 {
+        day -= mdays[m] as i64;
+        m += 1;
+    }
+    format!(
+        "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
+        DAYS[wday],
+        day + 1,
+        MONTHS[m],
+        y,
+        hour,
+        min,
+        sec
+    )
 }
 
 /// Methods that never have a request body in practice for H1 framing.
@@ -160,6 +232,36 @@ mod tests {
         assert!(!is_default_method("FOO"));
         assert!(method_implies_no_body("GET"));
         assert!(!method_implies_no_body("POST"));
+    }
+
+    #[test]
+    fn header_name_accepts_full_tchar_set() {
+        // RFC 9110 tchar beyond alphanumeric/-/_: "!#$%&'*+.^`|~"
+        assert!(is_valid_header_name("X-A!B#C$D%E&F'G*H+I.J^K_L`M|N~O"));
+        assert!(!is_valid_header_name("Bad Name"));
+        assert!(!is_valid_header_name("Bad/Name"));
+        assert!(!is_valid_header_name("Bad:Name"));
+    }
+
+    #[test]
+    fn header_value_rejects_ctl_allows_obs_text() {
+        assert!(is_valid_header_value(b"plain value"));
+        assert!(is_valid_header_value(b"tab\tseparated"));
+        assert!(is_valid_header_value(&[0xC3, 0xA9])); // obs-text (UTF-8 'é' bytes)
+        assert!(!is_valid_header_value(b"line\rinjection"));
+        assert!(!is_valid_header_value(b"line\ninjection"));
+        assert!(!is_valid_header_value(b"null\0byte"));
+        assert!(!is_valid_header_value(&[0x7f])); // DEL
+    }
+
+    #[test]
+    fn http_date_format() {
+        // 2024-01-01T00:00:00Z was a Monday.
+        assert_eq!(format_http_date(1704067200), "Mon, 01 Jan 2024 00:00:00 GMT");
+        // Epoch itself was a Thursday.
+        assert_eq!(format_http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        // A leap-day date, exercised for the Feb-29 branch.
+        assert_eq!(format_http_date(1582934400), "Sat, 29 Feb 2020 00:00:00 GMT");
     }
 }
 

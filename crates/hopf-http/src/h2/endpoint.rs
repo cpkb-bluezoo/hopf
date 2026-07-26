@@ -1106,8 +1106,11 @@ impl H2Endpoint {
         let has_trailers = trailers.is_some();
         let headers_this_flush = headers.is_some();
 
-        if let Some(headers) = headers {
+        if let Some(mut headers) = headers {
             if !already_sent {
+                if !headers.contains("date") {
+                    headers.set("Date", crate::utils::http_date_now());
+                }
                 let block = self
                     .encoder
                     .encode(headers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
