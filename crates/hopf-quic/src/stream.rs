@@ -61,6 +61,7 @@ impl QuicStreamEndpoint {
         conn: ConnectionHandle,
         local: SocketAddr,
         remote: SocketAddr,
+        security: SecurityInfo,
         queues: Arc<Mutex<StreamQueues>>,
         cmd_tx: std::sync::mpsc::Sender<DriverCmd>,
         waker: Arc<mio::Waker>,
@@ -71,7 +72,7 @@ impl QuicStreamEndpoint {
             conn,
             local,
             remote,
-            security: SecurityInfo::secure(Some(b"h3".to_vec()), Some("TLSv1.3".into()), None),
+            security,
             open: true,
             closing: false,
             queues,
@@ -94,6 +95,13 @@ impl QuicStreamEndpoint {
     pub(crate) fn mark_closed(&mut self) {
         self.open = false;
         self.closing = false;
+    }
+
+    /// Refresh the cached remote address after a real connection migration
+    /// (RFC 9000 §9) — `remote_addr()` would otherwise keep returning the
+    /// address captured when this stream was opened.
+    pub(crate) fn set_remote(&mut self, remote: SocketAddr) {
+        self.remote = remote;
     }
 
     fn wake(&self) {
