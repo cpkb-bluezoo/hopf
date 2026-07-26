@@ -45,7 +45,6 @@ pub(crate) struct Reactor {
 impl Reactor {
     pub fn spawn(
         id: usize,
-        pool: Arc<BufferPool>,
         active: Arc<AtomicBool>,
     ) -> io::Result<(ReactorHandle, JoinHandle<()>)> {
         let poll = Poll::new()?;
@@ -56,6 +55,11 @@ impl Reactor {
             .name(format!("hopf-reactor-{id}"))
             .spawn(move || {
                 let _id = id;
+                // One pool per reactor thread, never shared across threads —
+                // every buffer acquire/release for a connection happens on
+                // the single reactor thread that owns it for life, so a
+                // global lock here has nothing to protect against.
+                let pool = Arc::new(BufferPool::default());
                 let mut reactor = Reactor {
                     poll,
                     events: Events::with_capacity(256),

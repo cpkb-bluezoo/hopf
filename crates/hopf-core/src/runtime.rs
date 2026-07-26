@@ -10,7 +10,6 @@ use std::thread::JoinHandle;
 
 use crate::accept::{AcceptHandle, AcceptLoop};
 use crate::binding::BindingId;
-use crate::bufpool::BufferPool;
 use crate::cmd::ReactorCmd;
 use crate::connector::TcpConnectorConfig;
 use crate::listener::TcpListenerConfig;
@@ -55,7 +54,6 @@ pub struct Runtime {
     accept: AcceptHandle,
     active: Arc<AtomicBool>,
     joins: Vec<JoinHandle<()>>,
-    pool: Arc<BufferPool>,
     storage: Arc<StorageExecutor>,
     /// Round-robin index for dial affinity (peer of accept-loop RR).
     dial_rr: AtomicUsize,
@@ -75,12 +73,11 @@ impl Runtime {
     ) -> io::Result<Self> {
         let n = config.resolved_workers();
         let active = Arc::new(AtomicBool::new(true));
-        let pool = Arc::new(BufferPool::default());
         let storage = Arc::new(StorageExecutor::new(config.storage));
         let mut workers = Vec::with_capacity(n);
         let mut joins = Vec::with_capacity(n + 1);
         for id in 0..n {
-            let (handle, join) = Reactor::spawn(id, Arc::clone(&pool), Arc::clone(&active))?;
+            let (handle, join) = Reactor::spawn(id, Arc::clone(&active))?;
             workers.push(handle);
             joins.push(join);
         }
@@ -92,7 +89,6 @@ impl Runtime {
             accept,
             active,
             joins,
-            pool,
             storage,
             dial_rr: AtomicUsize::new(0),
             telemetry,
@@ -146,11 +142,6 @@ impl Runtime {
             let _ = self.add_tcp_listener(listener.clone())?;
         }
         Ok(())
-    }
-
-    /// Shared buffer pool (for tests / advanced use).
-    pub fn buffer_pool(&self) -> &Arc<BufferPool> {
-        &self.pool
     }
 
     /// Shared storage executor for blocking filesystem / mailbox work.
