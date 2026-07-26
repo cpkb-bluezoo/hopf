@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Scalability Audit — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Architecture audit</h2><ul>
+<li><a href="conformance.html">Conformance</a></li>
+<li><a href="scalability.html" aria-current="page">Scalability</a></li>
+<li><a href="performance.html">Performance</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>Scalability Audit</h1>
+        <p class="lead">How <code>hopf-core</code>'s thread-per-core (TPC) reactor architecture actually behaves as connection count, core count, and load grow — read directly from <code>crates/hopf-core/src/</code>, not from the marketing description in <a href="architecture.html">Architecture</a>. Companion to <a href="conformance.html">Conformance</a> and <a href="performance.html">Performance</a>.</p>
+      </header>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#method">Method</a></li>
+<li><a href="#model">The scaling model in one picture</a></li>
+<li><a href="#accept">Accept path: single-threaded by design</a></li>
+<li><a href="#bufpool">Buffer pool: one global lock across every core</a></li>
+<li><a href="#reactor-tick">Per-tick connection scans</a></li>
+<li><a href="#cross-thread">Cross-thread signaling: ConnHandle and wakeups</a></li>
+<li><a href="#storage">Storage pool: bounded and fail-fast (this one's right)</a></li>
+<li><a href="#acl-quota">ACL, rate limiting, and quotas</a></li>
+<li><a href="#unbounded-growth">Unbounded growth vectors</a></li>
+<li><a href="#summary">Summary table</a></li>
+</ul></div>
+
+<h2 id="method">Method</h2>
+<p>Everything below is sourced from reading <code>crates/hopf-core/src/{reactor,runtime,accept,bufpool,storage,cmd,connection,timer,acl,quota}.rs</code> directly — file:line citations throughout. This is a <strong>behavioral</strong> audit (what happens as N grows), not a benchmark: no load test was run to produce numbers. Where a claim would need a benchmark to become a number rather than a mechanism, that's said explicitly.</p>
+
+<h2 id="model">The scaling model in one picture</h2>
+<pre><code>1 accept-loop thread  ──RR──▶  N reactor threads (worker_threads, default 2×cores)
+        │                              │
+   ACL + rate-limit               each owns: mio Poll, HashMap&lt;Token,TcpConnection&gt;,
+   (single-threaded)               TimerQueue (BinaryHeap), its own mpsc command queue
+        │                              │
+        └── one Arc&lt;BufferPool&gt; (global Mutex) shared by every reactor ──┘
+
+  M storage threads (StorageConfig::threads, default cores.max(4))
+        │
+   single shared Mutex&lt;Receiver&lt;Job&gt;&gt;, bounded SyncSender (queue_capacity=4096)</code></pre>
+<p>The design intent (per <a href="architecture.html">Architecture</a>) is "each connection stays on one reactor for life... I/O, TLS, and protocol bytes never migrate mid-connection." That part is true and verified below. What the docs don't currently say is that <strong>two structures sit outside that per-core isolation and are shared, lock-guarded, and global</strong>: the buffer pool and (implicitly) the single accept thread's ACL/rate-limit evaluation. Both are discussed below with the actual code.</p>
+
+<h2 id="accept">Accept path: single-threaded by design</h2>
+<p>Every listener in the process — regardless of how many protocols or ports are composed together — is accepted by <strong>one</strong> <code>AcceptLoop</code> thread (<code>crates/hopf-core/src/accept.rs:30-40</code>, spawned once in <code>runtime.rs:87-89</code>). Its run loop (<code>accept.rs:120-142</code>) polls all registered listeners with a single <code>mio::Poll</code>, and for each readable listener drains <code>accept()</code> in a loop (<code>accept.rs:199-251</code>), evaluating the peer ACL (<code>PeerAcl::allows</code>, <code>acl.rs:76-85</code>) and rate limiter (<code>AcceptRateLimit::try_acquire</code>, <code>acl.rs:130-162</code>) inline before handing the stream to a worker via plain round-robin (<code>accept.rs:253-258</code>, <code>next_worker()</code>).</p>
+<p><strong>Consequence:</strong> connection <em>setup</em> rate (accepts/sec) does not scale with core count — it's bounded by one thread's ability to call <code>accept()</code>, evaluate ACL/rate-limit, and dispatch a <code>ReactorCmd::Register</code>. Once a connection is registered on its reactor, all further I/O for that connection <em>does</em> scale across cores (each reactor is fully independent from that point on) — this is only a bottleneck for the accept rate, not steady-state per-connection throughput. For workloads dominated by long-lived connections (IMAP IDLE, MQTT, WebSocket) this essentially never matters; for workloads with very high connection churn (short-lived HTTP/1.0-style requests, connection-per-poll clients) it's the first thing that would show up in a load test.</p>
+<p>Round-robin dispatch (<code>rr.fetch_add(1) % n</code>, <code>accept.rs:256</code>) also means new connections are assigned ignoring each reactor's current load — a reactor doing heavy TLS handshake or protocol-parsing work for its existing connections keeps receiving new ones at the same rate as an idle reactor. There's no least-loaded or work-stealing dispatch.</p>
+<p>On <code>EMFILE</code>/<code>ENFILE</code> (fd exhaustion), the accept loop sleeps 1 second (<code>ACCEPT_BACKOFF</code>, <code>accept.rs:21,239-243</code>) — this pauses accept processing for <em>every</em> listener in the process, not just the one that hit the limit, since it's the same single thread and loop iteration. Reasonable fail-safe against a busy-loop, worth knowing it's process-wide.</p>
+
+<h2 id="bufpool">Buffer pool: one global lock across every core</h2>
+<p><code>Runtime::start_with_telemetry</code> creates exactly one <code>Arc&lt;BufferPool&gt;</code> (<code>runtime.rs:78</code>) and clones the <code>Arc</code> into every reactor (<code>runtime.rs:83</code>, <code>Reactor::spawn(id, Arc::clone(&amp;pool), ...)</code>). <code>BufferPool</code> itself is a single <code>Mutex&lt;Vec&lt;Vec&lt;Vec&lt;u8&gt;&gt;&gt;&gt;</code> (power-of-two size-class buckets, <code>bufpool.rs:12-15</code>) — <strong>one lock, shared by every reactor thread in the process.</strong></p>
+<p>Every socket read that needs to grow <code>net_in</code>, every write that needs to grow <code>net_out</code>, and every connection's initial buffer allocation and final release all call <code>pool.acquire()</code>/<code>pool.release()</code> (<code>connection.rs:88-89,249-253,441-446,590-594,616-621</code>) — i.e. this lock is taken on the hot path of ordinary connection setup/teardown and any buffer growth, across <em>every</em> reactor simultaneously. This directly cuts against the "shared-nothing per core" framing in <a href="architecture.html">Architecture</a>: the TPC model correctly keeps <em>connection state and protocol bytes</em> off any shared structure, but the memory <em>backing</em> those buffers is a single contended resource.</p>
+<p>In practice, the buckets are per-size-class (<code>bucket_index</code>, <code>bufpool.rs:67-70</code>) so contention is spread across ~9 buckets (4 KiB .. 1 MiB, doubling) rather than a single list, and each critical section is short (a <code>Vec::pop()</code> or <code>Vec::push()</code>). Whether this is a measurable bottleneck at N cores is a benchmarking question this audit doesn't answer — but it is a real, load-bearing shared lock in a framework whose headline design claim is per-core isolation, and it's the first place a scalability regression under high core-count contention would show up. A per-reactor buffer pool (or a lock-free MPMC free-list per size class) would remove it entirely; nothing about the current design requires the pool to be global other than that it was simplest to build that way.</p>
+
+<h2 id="reactor-tick">Per-tick connection scans</h2>
+<p>Two housekeeping passes run on <strong>every</strong> reactor loop iteration, each an O(connections-on-this-reactor) scan over the whole <code>HashMap&lt;Token, TcpConnection&gt;</code>, regardless of how many connections actually changed state that tick:</p>
+<ul>
+<li><code>apply_dirty_interests()</code> (<code>reactor.rs:379-392</code>) — iterates all connections filtering on <code>interest_dirty</code>, called once before <code>poll()</code> and once after processing events (<code>reactor.rs:82,122</code>).</li>
+<li><code>reap_closed()</code> (<code>reactor.rs:394-405</code>) — iterates all connections checking <code>!c.is_open()</code>, called once per loop iteration (<code>reactor.rs:123</code>).</li>
+</ul>
+<p>Each item's check is cheap (a bool read), so this is unlikely to matter until a single reactor is carrying a genuinely large connection count (tens of thousands) with a high event rate — but it is a real O(n) cost per wakeup, not O(1) or O(events), and it's paid twice per iteration. It doesn't show up in a functional test; it shows up as reactor-loop latency creeping up as one reactor's connection count grows, independent of how busy those connections actually are. Worth tracking as a candidate optimization (e.g. a dirty-set instead of a full-map filter) if a future load test shows loop latency scaling with idle-connection count.</p>
+
+<h2 id="cross-thread">Cross-thread signaling: ConnHandle and wakeups</h2>
+<p>Every reactor has its own <strong>unbounded</strong> <code>mpsc::channel</code> for <code>ReactorCmd</code> (<code>cmd.rs:142-151</code>) — unlike the storage pool (see below), there is no bound and no backpressure here. <code>ReactorHandle::send</code> (<code>cmd.rs:89-92</code>) pushes onto the channel and calls <code>Waker::wake()</code> — <strong>one OS-level wake syscall per command</strong>, whether that's a <code>ConnHandle::send</code> (used by every cross-connection fan-out — <a href="mqtt.html#architecture">MQTT broker publish</a> being the clearest example), a scheduled timer, or an <code>execute()</code> task. There's no batching: N sends to the same reactor in a tight loop (e.g. an MQTT PUBLISH fanning out to many subscribers that happen to share a reactor) pay for N wake syscalls, not one.</p>
+<p>The lack of a bound on the command channel is the flip side of <code>StorageExecutor</code>'s deliberate bounded/fail-fast design (next section) — if a reactor's command producers (other threads, other reactors) ever outpace that reactor's ability to drain <code>drain_commands()</code> (<code>reactor.rs:136-148</code>, itself an unbounded drain-to-empty loop each tick), the channel grows without limit. This would require a reactor to be pathologically slow or stuck (e.g. a `ConnHandle::execute` closure that blocks, or a panic loop) rather than normal load, but there's no structural guard against it the way there is for storage submissions.</p>
+
+<h2 id="storage">Storage pool: bounded and fail-fast (this one's right)</h2>
+<p><code>StorageExecutor</code> (<code>storage.rs:66-166</code>) is the one place in the runtime that gets backpressure right: a fixed-size thread pool (default <code>cores.max(4)</code>, <code>storage.rs:51-60</code>) draining a <strong>bounded</strong> <code>mpsc::sync_channel</code> (default capacity 4096). Submission uses <code>try_send</code> (<code>storage.rs:136</code>) — on saturation, the caller's callback is invoked immediately on the calling reactor with <code>StorageError::Rejected</code> (<code>storage.rs:140-151</code>) rather than blocking the reactor or queuing unboundedly. This is exactly the "fail-fast backpressure, never block the reactor" contract the docs promise, and it's implemented correctly.</p>
+<p>The one shared point of contention is <code>Receiver&lt;Job&gt;</code> wrapped in a single <code>Mutex</code> (<code>storage.rs:82,168-179</code>) that all <code>threads</code> workers block on via <code>recv()</code> — standard single-queue thread-pool contention (a thundering-herd wakeup when a job arrives with multiple idle workers). For blocking filesystem/mailbox work this is a reasonable, common tradeoff; it would only matter at a submission rate high enough to make queue-lock contention comparable to the blocking work itself, which is a different regime than what this pool is for.</p>
+
+<h2 id="acl-quota">ACL, rate limiting, and quotas</h2>
+<p><code>PeerAcl::allows</code> (<code>acl.rs:76-85</code>) is a linear scan over the allow/deny <code>Vec&lt;IpNet&gt;</code> lists, evaluated on the single accept thread for every accepted connection (<code>accept.rs:208</code>) — fine for typical ACL sizes (tens of entries), but combined with the single-accept-thread finding above, a very large CIDR list adds directly to that thread's per-accept cost with no way to parallelize it.</p>
+<p><code>CounterQuota</code> (<code>quota.rs:44-95</code>) is lock-free (plain <code>AtomicU64</code> counters, <code>Relaxed</code> ordering — correct here since each axis is an independent monotonic counter with no cross-axis ordering requirement) and scales fine per-connection.</p>
+
+<h2 id="unbounded-growth">Unbounded growth vectors</h2>
+<p><code>AcceptRateLimit</code>'s per-source tracking is a <code>HashMap&lt;IpAddr, (u32, Instant)&gt;</code> (<code>acl.rs:104</code>) that is <strong>only ever inserted into, never pruned</strong>. <code>try_acquire</code> (<code>acl.rs:130-162</code>) reads or inserts an entry for the peer's IP on every accept, but nothing ever removes an entry once its rate-limit window has expired — <code>get_mut</code> either updates the existing entry or, on expiry, the <code>_ =&gt;</code> arm (<code>acl.rs:156-159</code>) overwrites it in place, which is fine for a <em>repeat</em> source, but a source that connects once and never returns leaves its entry in the map forever. For a listener with a configured <code>per_source</code> limit facing traffic from many distinct source IPs over the process lifetime — the exact traffic pattern a rate limiter exists to defend against (many distinct/spoofed/rotating sources) — this map grows without bound for the life of the process. This is the one finding in this audit that's a genuine unbounded-memory issue rather than a contention/throughput characteristic, and it's directly reachable from network input (any listener with <code>per_source &gt; 0</code> configured).</p>
+
+<h2 id="summary">Summary table</h2>
+<table>
+<colgroup><col style="width:26%"/><col style="width:20%"/><col style="width:54%"/></colgroup>
+<thead><tr><th>Component</th><th>Scales with cores?</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Steady-state connection I/O</td><td>Yes</td><td>Fully per-reactor, no shared state on the read/write hot path itself</td></tr>
+<tr><td>Connection accept rate</td><td>No</td><td>Single accept thread; ACL + rate-limit + dispatch all serialize there (<a href="#accept">§Accept path</a>)</td></tr>
+<tr><td>Buffer acquire/release</td><td>Partially</td><td>Single global <code>Mutex</code>, split into ~9 size-class buckets (<a href="#bufpool">§Buffer pool</a>)</td></tr>
+<tr><td>Cross-reactor fan-out (<code>ConnHandle::send</code>)</td><td>Yes, but 1 syscall/message</td><td>No wake coalescing (<a href="#cross-thread">§Cross-thread signaling</a>)</td></tr>
+<tr><td>Storage / blocking work</td><td>Yes, bounded</td><td>Correctly designed fail-fast pool (<a href="#storage">§Storage pool</a>)</td></tr>
+<tr><td>Reactor command queue depth</td><td>N/A</td><td>Unbounded — no backpressure, unlike storage (<a href="#cross-thread">§Cross-thread signaling</a>)</td></tr>
+<tr><td>Accept-rate-limiter memory</td><td>N/A</td><td>Unbounded growth with distinct source IPs over process lifetime (<a href="#unbounded-growth">§Unbounded growth vectors</a>)</td></tr>
+</tbody>
+</table>
+<p>None of these findings are "hopf is broken" — the steady-state per-connection I/O path, which is what TPC is chiefly claimed for, holds up under reading. The buffer pool and the accept-rate-limiter map are the two items worth fixing before calling the scalability story complete; the rest are honest tradeoffs worth documenting rather than defects.</p>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

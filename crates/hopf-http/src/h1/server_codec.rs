@@ -2,20 +2,22 @@
 
 //! HTTP/1.x server codec (inbound request / outbound response).
 //!
-//! Grammar-driven tokens from [`super::scan::HttpScanner`] advance the parse
-//! FSM as each production completes (issue #3). Incomplete tokens stay in the
-//! caller's slice — this module does **not** own a line buffer.
+//! Parsing is driven by [`super::parse::H1Scanner`], which emits HTTP's own
+//! token vocabulary (method, request-target, header name/value, chunk-size
+//! line, body bytes) as each production completes. The scanner consumes every
+//! byte it is handed and keeps any partial token in its own bounded state, so
+//! neither this module nor the transport below it ever holds a line buffer.
 
 use std::sync::Arc;
 
-use hopf_core::{ByteStreamHandler, ByteStreamLexer, ConnHandle, HandlerControl};
+use hopf_core::ConnHandle;
 
 use crate::error::{HttpError, HttpResult};
-use crate::stream::{ProtocolUpgradeHandler, ServerHandler, ServerWriter};
-use crate::headers::Headers;
+use crate::h1::parse::{parse_version, FirstLineKind, H1Events, H1Scanner, Next};
 use crate::h1::response::H1ResponseControl;
-use crate::h1::scan::{HttpScanPhase, HttpScanPhaseGate, HttpScanner, HttpToken};
+use crate::headers::Headers;
 use crate::limits::HttpLimits;
+use crate::stream::{ProtocolUpgradeHandler, ServerHandler, ServerWriter};
 use crate::utils::{
     is_chunked_te, is_default_method, is_invalid_te, is_token, is_valid_header_name,
     is_valid_host, is_valid_request_target, method_implies_no_body, parse_content_length,
@@ -28,133 +30,102 @@ enum ParseState {
     Header,
     Body,
     BodyChunkedSize,
-    BodyChunkedData,
     BodyChunkedTrailer,
     BodyUntilClose,
     /// Connection has switched protocols (WebSocket, etc.).
     Upgraded,
 }
 
-/// Where we are inside the request-line grammar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReqLineStep {
-    Method,
-    Target,
-    Version,
-}
-
-/// Where we are inside a header field-line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeaderStep {
-    /// Expect field-name `Word`, obs-fold `Sp`, or empty `Crlf`.
-    Name,
-    /// Saw name; expect `Colon`.
-    Colon,
-    /// Collecting value (`Text` / fold); `Crlf` ends this line of the value.
-    Value,
-}
-
 /// Incremental HTTP/1.x request parser + response framer for one connection.
 pub struct H1ServerCodec<H: ServerHandler> {
-    lexer: ByteStreamLexer<HttpScanner, Driver<H>>,
+    scanner: H1Scanner,
+    driver: Driver<H>,
 }
 
 impl<H: ServerHandler> H1ServerCodec<H> {
     /// Create a parser. `secure` sets `:scheme` to `https` vs `http`.
     pub fn new(handler: H, limits: HttpLimits, secure: bool) -> Self {
         let max_line = limits.max_line_length;
-        let phase = HttpScanPhaseGate::new();
-        let driver = Driver::new(handler, limits, secure, phase.clone());
         Self {
-            lexer: ByteStreamLexer::new(
-                HttpScanner::new(phase),
-                driver,
-                max_line,
-                HttpToken::Crlf,
-                HttpToken::Text,
-            ),
+            scanner: H1Scanner::new(FirstLineKind::Request, max_line),
+            driver: Driver::new(handler, limits, secure),
         }
     }
 
     /// Feed inbound bytes. Advances `data` past consumed input.
+    ///
+    /// Everything is consumed unless the connection has switched protocols,
+    /// in which case the remainder belongs to the upgrade handler.
     pub fn receive(&mut self, data: &mut &[u8]) -> HttpResult<()> {
-        let driver = self.lexer.handler_mut();
-        if driver.fatal.is_some() {
+        if let Some(err) = self.driver.fatal.clone() {
             *data = &[];
-            return Err(driver.fatal.clone().unwrap());
+            return Err(err);
         }
 
-        if driver.state == ParseState::Upgraded {
-            if let Some(up) = driver.upgraded.as_mut() {
-                if !data.is_empty() {
-                    up.receive(data);
-                    *data = &[];
-                }
-            }
+        if self.driver.state == ParseState::Upgraded {
+            self.feed_upgraded(data);
             return Ok(());
         }
 
-        // Activate upgrade installed during the last response write.
-        if let Some(up) = driver.response.take_upgrade() {
-            driver.upgraded = Some(up);
-            driver.state = ParseState::Upgraded;
-            if !data.is_empty() {
-                if let Some(up) = driver.upgraded.as_mut() {
-                    up.receive(data);
-                }
-                *data = &[];
-            }
+        // Activate an upgrade installed while the last response was written.
+        if self.take_upgrade() {
+            self.feed_upgraded(data);
             return Ok(());
         }
 
-        if driver.state == ParseState::BodyUntilClose {
-            if !data.is_empty() {
-                driver.deliver_until_close(data);
-            }
-            return driver.take_error();
-        }
+        let consumed = self.scanner.push(data, &mut self.driver);
+        *data = &data[consumed..];
 
-        self.lexer.feed(data);
-
-        let driver = self.lexer.handler_mut();
-        if let Some(up) = driver.response.take_upgrade() {
-            driver.upgraded = Some(up);
-            driver.state = ParseState::Upgraded;
-            if !data.is_empty() {
-                if let Some(up) = driver.upgraded.as_mut() {
-                    up.receive(data);
-                }
-                *data = &[];
-            }
-            return driver.take_error();
+        if self.take_upgrade() {
+            self.feed_upgraded(data);
+            return self.driver.take_error();
         }
-
-        if driver.state == ParseState::BodyUntilClose && !data.is_empty() {
-            driver.deliver_until_close(data);
+        if self.driver.fatal.is_some() {
+            *data = &[];
         }
-        driver.take_error()
+        self.driver.take_error()
+    }
+
+    /// Install a pending upgrade handler, if the response layer created one.
+    fn take_upgrade(&mut self) -> bool {
+        if let Some(up) = self.driver.response.take_upgrade() {
+            self.driver.upgraded = Some(up);
+            self.driver.state = ParseState::Upgraded;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn feed_upgraded(&mut self, data: &mut &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        if let Some(up) = self.driver.upgraded.as_mut() {
+            up.receive(data);
+        }
+        *data = &[];
     }
 
     /// Connection EOF — completes until-close bodies.
     pub fn close(&mut self) -> HttpResult<()> {
-        let driver = self.lexer.handler_mut();
-        if let Some(up) = driver.upgraded.as_mut() {
+        if let Some(up) = self.driver.upgraded.as_mut() {
             up.closed();
             return Ok(());
         }
-        if driver.state == ParseState::BodyUntilClose {
-            driver.finish_until_close();
-        } else if driver.state != ParseState::RequestLine {
-            driver.fail(HttpError::new(400, "incomplete HTTP message"));
+        if self.driver.state == ParseState::BodyUntilClose {
+            self.driver.finish_until_close();
+        } else if !self.scanner.at_message_start() || self.driver.state != ParseState::RequestLine {
+            self.driver
+                .fail(HttpError::new(400, "incomplete HTTP message"));
         }
-        driver.take_error()
+        self.driver.take_error()
     }
 
     /// Bytes queued for the peer (100-continue, responses, errors, upgrade).
     pub fn take_outbound(&mut self) -> Vec<u8> {
-        let driver = self.lexer.handler_mut();
-        let mut out = driver.response.take_outbound();
-        if let Some(up) = driver.upgraded.as_mut() {
+        let mut out = self.driver.response.take_outbound();
+        if let Some(up) = self.driver.upgraded.as_mut() {
             out.extend(up.take_outbound());
         }
         out
@@ -162,38 +133,37 @@ impl<H: ServerHandler> H1ServerCodec<H> {
 
     /// Whether the peer should be closed after flushing outbound data.
     pub fn wants_close(&self) -> bool {
-        let d = self.lexer.handler();
-        d.response.wants_close() || d.fatal.is_some()
+        self.driver.response.wants_close() || self.driver.fatal.is_some()
     }
 
     /// Bind the transport [`ConnHandle`] (call from `H1Endpoint` on connect/receive).
     pub fn bind_conn_handle(&mut self, conn: ConnHandle) {
-        self.lexer.handler_mut().response.bind_conn(conn);
+        self.driver.response.bind_conn(conn);
     }
 
     /// Whether deferred execute left bytes that still need an endpoint flush.
     pub fn needs_flush(&self) -> bool {
-        self.lexer.handler().response.needs_flush()
+        self.driver.response.needs_flush()
     }
 
     /// Whether request-body delivery is paused for this connection.
     pub fn pause_request_body(&self) -> bool {
-        self.lexer.handler().response.pause_request_body_flag()
+        self.driver.response.pause_request_body_flag()
     }
 
     /// Replace the application handler (e.g. after factory creates a new one).
     pub fn set_handler(&mut self, handler: H) {
-        self.lexer.handler_mut().app = Some(handler);
+        self.driver.app = Some(handler);
     }
 
     /// Method captured so far on the in-progress request-line (tests / debugging).
     pub fn partial_method(&self) -> Option<&str> {
-        self.lexer.handler().partial_method.as_deref()
+        self.driver.partial_method.as_deref()
     }
 
     /// Request-target captured so far on the in-progress request-line.
     pub fn partial_target(&self) -> Option<&str> {
-        self.lexer.handler().partial_target.as_deref()
+        self.driver.partial_target.as_deref()
     }
 }
 
@@ -201,27 +171,19 @@ struct Driver<H: ServerHandler> {
     app: Option<H>,
     limits: HttpLimits,
     secure: bool,
-    phase: HttpScanPhaseGate,
     state: ParseState,
-    req_step: ReqLineStep,
-    header_step: HeaderStep,
     /// Filled as request-line tokens arrive (before app callbacks).
     partial_method: Option<String>,
     partial_target: Option<String>,
-    /// True once the HTTP-version `Word` has been accepted.
-    request_line_version_ready: bool,
     version: HttpVersion,
+    /// True once the HTTP-version token has been accepted.
+    version_ready: bool,
     headers: Headers,
+    /// Field name awaiting its value.
     pending_name: Option<String>,
-    pending_value: String,
     content_length: Option<u64>,
     body_received: u64,
     chunked: bool,
-    chunk_data_left: usize,
-    chunk_crlf_got: usize,
-    chunk_crlf_buf: [u8; 2],
-    /// Accumulates chunk-size `Word` (may include `;ext`).
-    chunk_size_word: String,
     body_started: bool,
     request_count: u32,
     max_requests: u32,
@@ -233,29 +195,21 @@ struct Driver<H: ServerHandler> {
 }
 
 impl<H: ServerHandler> Driver<H> {
-    fn new(handler: H, limits: HttpLimits, secure: bool, phase: HttpScanPhaseGate) -> Self {
+    fn new(handler: H, limits: HttpLimits, secure: bool) -> Self {
         Self {
             app: Some(handler),
             limits,
             secure,
-            phase,
             state: ParseState::RequestLine,
-            req_step: ReqLineStep::Method,
-            header_step: HeaderStep::Name,
             partial_method: None,
             partial_target: None,
-            request_line_version_ready: false,
             version: HttpVersion::Http11,
+            version_ready: false,
             headers: Headers::new(),
             pending_name: None,
-            pending_value: String::new(),
             content_length: None,
             body_received: 0,
             chunked: false,
-            chunk_data_left: 0,
-            chunk_crlf_got: 0,
-            chunk_crlf_buf: [0; 2],
-            chunk_size_word: String::new(),
             body_started: false,
             request_count: 0,
             max_requests: 0,
@@ -282,6 +236,12 @@ impl<H: ServerHandler> Driver<H> {
         self.fatal = Some(err);
     }
 
+    /// Record a fatal error and stop the scanner.
+    fn fail_stop(&mut self, err: HttpError) -> Next {
+        self.fail(err);
+        Next::Stop
+    }
+
     fn with_app_response<R>(&mut self, f: impl FnOnce(&mut H, &mut dyn ServerWriter) -> R) -> R {
         let mut app = self.app.take().expect("handler missing");
         self.response.set_version(self.version);
@@ -293,273 +253,55 @@ impl<H: ServerHandler> Driver<H> {
         r
     }
 
-    fn set_phase(&self, phase: HttpScanPhase) {
-        self.phase.set(phase);
+    fn as_str<'a>(&self, v: &'a [u8]) -> Result<&'a str, HttpError> {
+        std::str::from_utf8(v).map_err(|_| HttpError::new(400, "invalid UTF-8/ASCII"))
     }
 
-    fn window_str<'a>(&self, window: &'a [u8]) -> HttpResult<&'a str> {
-        std::str::from_utf8(window).map_err(|_| HttpError::new(400, "invalid UTF-8/ASCII"))
+    fn finish_request_no_body(&mut self) {
+        self.with_app_response(|app, resp| app.request_complete(resp));
+        self.reset_message_fields();
     }
 
-    fn process_token(&mut self, ty: HttpToken, window: &[u8]) -> HandlerControl {
-        if self.fatal.is_some() {
-            return HandlerControl::Stop;
-        }
-        match self.state {
-            ParseState::RequestLine => self.on_request_line_token(ty, window),
-            ParseState::Header | ParseState::BodyChunkedTrailer => {
-                self.on_header_token(ty, window)
-            }
-            ParseState::BodyChunkedSize => self.on_chunk_size_token(ty, window),
-            ParseState::Body | ParseState::BodyChunkedData | ParseState::BodyUntilClose => {
-                HandlerControl::Continue
-            }
-            ParseState::Upgraded => HandlerControl::Stop,
-        }
-    }
-
-    fn on_request_line_token(&mut self, ty: HttpToken, window: &[u8]) -> HandlerControl {
-        self.line_too_long_status = 414;
-        match (self.req_step, ty) {
-            (ReqLineStep::Method, HttpToken::Word) => {
-                let s = match self.window_str(window) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        self.fail(e);
-                        return HandlerControl::Stop;
-                    }
-                };
-                if s.bytes().any(|b| b < 0x20 && b != b'\t') {
-                    self.fail(HttpError::new(400, "CTL in method"));
-                    return HandlerControl::Stop;
-                }
-                if !is_token(s) {
-                    self.fail(HttpError::new(400, "invalid method"));
-                    return HandlerControl::Stop;
-                }
-                if !is_default_method(s) {
-                    self.fail(HttpError::new(501, "method not implemented"));
-                    return HandlerControl::Stop;
-                }
-                self.partial_method = Some(s.to_string());
-                self.req_step = ReqLineStep::Target;
-                HandlerControl::Continue
-            }
-            (ReqLineStep::Method, HttpToken::Sp) => {
-                self.fail(HttpError::new(400, "empty method"));
-                HandlerControl::Stop
-            }
-            (ReqLineStep::Target, HttpToken::Sp) => HandlerControl::Continue,
-            (ReqLineStep::Target, HttpToken::Word) => {
-                let s = match self.window_str(window) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        self.fail(e);
-                        return HandlerControl::Stop;
-                    }
-                };
-                if !is_valid_request_target(s) {
-                    self.fail(HttpError::new(400, "invalid request-target"));
-                    return HandlerControl::Stop;
-                }
-                self.partial_target = Some(s.to_string());
-                self.req_step = ReqLineStep::Version;
-                HandlerControl::Continue
-            }
-            (ReqLineStep::Version, HttpToken::Sp) => HandlerControl::Continue,
-            (ReqLineStep::Version, HttpToken::Word) => {
-                let s = match self.window_str(window) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        self.fail(e);
-                        return HandlerControl::Stop;
-                    }
-                };
-                let method = self.partial_method.as_deref().unwrap_or("");
-                let target = self.partial_target.as_deref().unwrap_or("");
-                let Some(version) = HttpVersion::parse(s) else {
-                    if s == "HTTP/2.0" && method == "PRI" && target == "*" {
-                        self.fail(HttpError::new(505, "HTTP/2 preface not supported yet"));
-                    } else {
-                        self.fail(HttpError::new(505, "HTTP version not supported"));
-                    }
-                    return HandlerControl::Stop;
-                };
-                self.version = version;
-                if version == HttpVersion::Http10 {
-                    self.response.set_close_connection(true);
-                }
-                self.request_line_version_ready = true;
-                HandlerControl::Continue
-            }
-            (_, HttpToken::Crlf) => {
-                if !self.request_line_version_ready
-                    || self.partial_method.is_none()
-                    || self.partial_target.is_none()
-                {
-                    self.fail(HttpError::new(400, "malformed request-line"));
-                    return HandlerControl::Stop;
-                }
-                let method = self.partial_method.clone().unwrap();
-                let target = self.partial_target.clone().unwrap();
-                self.headers = Headers::new();
-                self.headers.add(":method", method);
-                self.headers.add(":path", target);
-                self.headers
-                    .add(":scheme", if self.secure { "https" } else { "http" });
-                self.state = ParseState::Header;
-                self.header_step = HeaderStep::Name;
-                self.line_too_long_status = 431;
-                self.set_phase(HttpScanPhase::Header);
-                HandlerControl::Continue
-            }
-            _ => {
-                self.fail(HttpError::new(400, "malformed request-line"));
-                HandlerControl::Stop
-            }
-        }
-    }
-
-    fn on_header_token(&mut self, ty: HttpToken, window: &[u8]) -> HandlerControl {
-        self.line_too_long_status = if self.state == ParseState::BodyChunkedSize {
-            400
+    fn finish_request_with_body(&mut self) {
+        if self.body_started {
+            self.with_app_response(|app, resp| {
+                app.end_request_body(resp);
+                app.request_complete(resp);
+            });
         } else {
-            431
-        };
-        if self.headers.len() >= self.limits.max_header_count
-            && matches!(self.header_step, HeaderStep::Name)
-            && ty == HttpToken::Word
-        {
-            self.fail(HttpError::new(431, "too many headers"));
-            return HandlerControl::Stop;
+            self.with_app_response(|app, resp| app.request_complete(resp));
         }
+        self.reset_message_fields();
+    }
 
-        match (self.header_step, ty) {
-            (HeaderStep::Name, HttpToken::Crlf) => {
-                // Empty line — end of header/trailer section.
-                if self.state == ParseState::BodyChunkedTrailer {
-                    self.finish_request_with_body();
-                    self.enter_request_line();
-                    return HandlerControl::Continue;
-                }
-                self.end_headers()
-            }
-            (HeaderStep::Name, HttpToken::Sp) => {
-                // Obs-fold continuation of previous field value.
-                if self.pending_name.is_none() {
-                    self.fail(HttpError::new(400, "obs-fold without field"));
-                    return HandlerControl::Stop;
-                }
-                self.pending_value.push(' ');
-                self.header_step = HeaderStep::Value;
-                HandlerControl::LatchText
-            }
-            (HeaderStep::Name, HttpToken::Word) => {
-                if self.pending_name.is_some() {
-                    self.commit_pending_header();
-                }
-                let name: String = window.iter().map(|&b| b as char).collect();
-                if !is_valid_header_name(&name) {
-                    self.fail(HttpError::new(400, "invalid header name"));
-                    return HandlerControl::Stop;
-                }
-                self.pending_name = Some(name);
-                self.pending_value.clear();
-                self.header_step = HeaderStep::Colon;
-                HandlerControl::Continue
-            }
-            (HeaderStep::Colon, HttpToken::Colon) => {
-                self.header_step = HeaderStep::Value;
-                HandlerControl::LatchText
-            }
-            (HeaderStep::Value, HttpToken::Text) => {
-                let s: String = window.iter().map(|&b| b as char).collect();
-                self.pending_value.push_str(&s);
-                HandlerControl::Continue
-            }
-            (HeaderStep::Value, HttpToken::Crlf) => {
-                self.header_step = HeaderStep::Name;
-                HandlerControl::Continue
-            }
-            // Non-empty trailers: accept then ignore values (Gumdrop H1 gap).
-            (HeaderStep::Name | HeaderStep::Colon | HeaderStep::Value, _)
-                if self.state == ParseState::BodyChunkedTrailer =>
-            {
-                if ty == HttpToken::Colon {
-                    self.header_step = HeaderStep::Value;
-                    return HandlerControl::LatchText;
-                }
-                if ty == HttpToken::Crlf {
-                    self.header_step = HeaderStep::Name;
-                }
-                HandlerControl::Continue
-            }
-            _ => {
-                self.fail(HttpError::new(400, "malformed header"));
-                HandlerControl::Stop
-            }
+    fn reset_message_fields(&mut self) {
+        self.state = ParseState::RequestLine;
+        self.headers = Headers::new();
+        self.pending_name = None;
+        self.content_length = None;
+        self.body_received = 0;
+        self.chunked = false;
+        self.body_started = false;
+        self.response.reset_message_fields();
+        self.partial_method = None;
+        self.partial_target = None;
+        self.version_ready = false;
+        self.line_too_long_status = 414;
+    }
+
+    fn ensure_body_started(&mut self) {
+        if !self.body_started {
+            self.body_started = true;
+            self.with_app_response(|app, resp| app.start_request_body(resp));
         }
     }
 
-    fn on_chunk_size_token(&mut self, ty: HttpToken, window: &[u8]) -> HandlerControl {
-        self.line_too_long_status = 400;
-        match ty {
-            HttpToken::Word => {
-                let s: String = window.iter().map(|&b| b as char).collect();
-                self.chunk_size_word.push_str(&s);
-                HandlerControl::Continue
-            }
-            HttpToken::Crlf => {
-                let line = std::mem::take(&mut self.chunk_size_word);
-                let semi = line.find(';');
-                if semi.is_some_and(|i| line[i..].contains('"')) {
-                    self.fail(HttpError::new(400, "quoted chunk-ext"));
-                    return HandlerControl::Stop;
-                }
-                let size_str = semi.map(|i| &line[..i]).unwrap_or(&line).trim();
-                let Ok(chunk_size) = usize::from_str_radix(size_str, 16) else {
-                    self.fail(HttpError::new(400, "bad chunk size"));
-                    return HandlerControl::Stop;
-                };
-                if chunk_size > self.limits.max_chunk_size {
-                    self.fail(HttpError::new(400, "chunk too large"));
-                    return HandlerControl::Stop;
-                }
-                if self.body_received.saturating_add(chunk_size as u64)
-                    > self.limits.max_request_body as u64
-                {
-                    self.fail(HttpError::new(413, "request body too large"));
-                    return HandlerControl::Stop;
-                }
-                if chunk_size == 0 {
-                    self.state = ParseState::BodyChunkedTrailer;
-                    self.header_step = HeaderStep::Name;
-                    self.set_phase(HttpScanPhase::Header);
-                    return HandlerControl::Continue;
-                }
-                self.chunk_data_left = chunk_size;
-                self.chunk_crlf_got = 0;
-                self.state = ParseState::BodyChunkedData;
-                HandlerControl::EnterRaw((chunk_size + 2) as u64)
-            }
-            _ => {
-                self.fail(HttpError::new(400, "bad chunk size line"));
-                HandlerControl::Stop
-            }
-        }
+    fn finish_until_close(&mut self) {
+        self.finish_request_with_body();
     }
 
-    fn commit_pending_header(&mut self) {
-        if let Some(name) = self.pending_name.take() {
-            let value = self.pending_value.trim().to_string();
-            self.pending_value.clear();
-            self.headers.add(name, value);
-        }
-    }
-
-    fn end_headers(&mut self) -> HandlerControl {
-        self.commit_pending_header();
-
+    /// Validate the completed header block and decide what follows it.
+    fn end_headers(&mut self) -> Next {
         if self.version == HttpVersion::Http11 {
             let host_count = self
                 .headers
@@ -567,8 +309,7 @@ impl<H: ServerHandler> Driver<H> {
                 .filter(|h| h.name.eq_ignore_ascii_case("host") || h.name == ":authority")
                 .count();
             if host_count != 1 {
-                self.fail(HttpError::new(400, "Host required"));
-                return HandlerControl::Stop;
+                return self.fail_stop(HttpError::new(400, "Host required"));
             }
             let host = self
                 .headers
@@ -576,8 +317,7 @@ impl<H: ServerHandler> Driver<H> {
                 .or_else(|| self.headers.get(":authority"))
                 .unwrap_or("");
             if !is_valid_host(host) {
-                self.fail(HttpError::new(400, "invalid Host"));
-                return HandlerControl::Stop;
+                return self.fail_stop(HttpError::new(400, "invalid Host"));
             }
         }
 
@@ -594,8 +334,7 @@ impl<H: ServerHandler> Driver<H> {
         self.content_length = None;
         if let Some(te) = self.headers.get("transfer-encoding") {
             if is_invalid_te(te) {
-                self.fail(HttpError::new(400, "invalid Transfer-Encoding"));
-                return HandlerControl::Stop;
+                return self.fail_stop(HttpError::new(400, "invalid Transfer-Encoding"));
             }
             if is_chunked_te(te) {
                 self.chunked = true;
@@ -604,10 +343,7 @@ impl<H: ServerHandler> Driver<H> {
         } else if let Some(cl) = self.headers.get("content-length") {
             match parse_content_length(cl) {
                 Some(n) => self.content_length = Some(n),
-                None => {
-                    self.fail(HttpError::new(400, "invalid Content-Length"));
-                    return HandlerControl::Stop;
-                }
+                None => return self.fail_stop(HttpError::new(400, "invalid Content-Length")),
             }
         }
 
@@ -628,192 +364,229 @@ impl<H: ServerHandler> Driver<H> {
                 .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
             && (self.chunked || self.content_length.unwrap_or(0) > 0);
         if expect_continue {
-            self.response
-                .extend_out(b"HTTP/1.1 100 Continue\r\n\r\n");
+            self.response.extend_out(b"HTTP/1.1 100 Continue\r\n\r\n");
         }
 
         let hdrs = self.headers.clone();
         self.with_app_response(|app, resp| app.headers(resp, &hdrs));
 
         if self.fatal.is_some() {
-            return HandlerControl::Stop;
+            return Next::Stop;
         }
 
         if self.chunked {
             self.state = ParseState::BodyChunkedSize;
-            self.chunk_size_word.clear();
-            self.set_phase(HttpScanPhase::ChunkSize);
-            return HandlerControl::Continue;
+            self.line_too_long_status = 400;
+            return Next::ChunkSize;
         }
         match self.content_length {
             Some(0) => {
                 self.finish_request_no_body();
-                self.enter_request_line();
-                HandlerControl::Continue
+                Next::FirstLine
             }
             Some(n) => {
                 self.state = ParseState::Body;
                 self.body_received = 0;
-                HandlerControl::EnterRaw(n)
+                Next::Body(n)
             }
             None if self.version == HttpVersion::Http10 => {
                 self.state = ParseState::BodyUntilClose;
-                HandlerControl::Stop
+                Next::UntilClose
             }
-            None => {
-                self.fail(HttpError::new(411, "Length Required"));
-                HandlerControl::Stop
-            }
+            None => self.fail_stop(HttpError::new(411, "Length Required")),
         }
-    }
-
-    fn finish_request_no_body(&mut self) {
-        self.with_app_response(|app, resp| app.request_complete(resp));
-        self.reset_message_fields();
-    }
-
-    fn finish_request_with_body(&mut self) {
-        if self.body_started {
-            self.with_app_response(|app, resp| {
-                app.end_request_body(resp);
-                app.request_complete(resp);
-            });
-        } else {
-            self.with_app_response(|app, resp| app.request_complete(resp));
-        }
-        self.reset_message_fields();
-    }
-
-    fn enter_request_line(&mut self) {
-        self.state = ParseState::RequestLine;
-        self.req_step = ReqLineStep::Method;
-        self.header_step = HeaderStep::Name;
-        self.partial_method = None;
-        self.partial_target = None;
-        self.request_line_version_ready = false;
-        self.set_phase(HttpScanPhase::RequestLine);
-        self.line_too_long_status = 414;
-    }
-
-    fn reset_message_fields(&mut self) {
-        self.headers = Headers::new();
-        self.pending_name = None;
-        self.pending_value.clear();
-        self.content_length = None;
-        self.body_received = 0;
-        self.chunked = false;
-        self.chunk_data_left = 0;
-        self.chunk_crlf_got = 0;
-        self.chunk_size_word.clear();
-        self.body_started = false;
-        self.response.reset_message_fields();
-        self.partial_method = None;
-        self.partial_target = None;
-        self.request_line_version_ready = false;
-        self.req_step = ReqLineStep::Method;
-        self.header_step = HeaderStep::Name;
-    }
-
-    fn deliver_body_cl(&mut self, slice: &[u8]) -> HandlerControl {
-        if self.limits.max_request_body > 0
-            && self.body_received.saturating_add(slice.len() as u64)
-                > self.limits.max_request_body as u64
-        {
-            self.fail(HttpError::new(413, "request body too large"));
-            return HandlerControl::Stop;
-        }
-        self.ensure_body_started();
-        self.with_app_response(|app, resp| app.request_body_content(resp, slice));
-        self.body_received += slice.len() as u64;
-        if self.body_received >= self.content_length.unwrap_or(0) {
-            self.finish_request_with_body();
-            self.enter_request_line();
-        }
-        HandlerControl::Continue
-    }
-
-    fn deliver_chunk_data(&mut self, mut slice: &[u8]) -> HandlerControl {
-        while !slice.is_empty() {
-            if self.chunk_data_left > 0 {
-                let n = slice.len().min(self.chunk_data_left);
-                let (data, rest) = slice.split_at(n);
-                self.ensure_body_started();
-                self.with_app_response(|app, resp| app.request_body_content(resp, data));
-                self.body_received += n as u64;
-                self.chunk_data_left -= n;
-                slice = rest;
-                continue;
-            }
-            let need = 2 - self.chunk_crlf_got;
-            let n = slice.len().min(need);
-            self.chunk_crlf_buf[self.chunk_crlf_got..self.chunk_crlf_got + n]
-                .copy_from_slice(&slice[..n]);
-            self.chunk_crlf_got += n;
-            slice = &slice[n..];
-            if self.chunk_crlf_got == 2 {
-                if self.chunk_crlf_buf != [b'\r', b'\n'] {
-                    self.fail(HttpError::new(400, "bad chunk CRLF"));
-                    return HandlerControl::Stop;
-                }
-                self.state = ParseState::BodyChunkedSize;
-                self.chunk_size_word.clear();
-                self.chunk_crlf_got = 0;
-                self.set_phase(HttpScanPhase::ChunkSize);
-            }
-        }
-        HandlerControl::Continue
-    }
-
-    fn ensure_body_started(&mut self) {
-        if !self.body_started {
-            self.body_started = true;
-            self.with_app_response(|app, resp| app.start_request_body(resp));
-        }
-    }
-
-    fn deliver_until_close(&mut self, data: &mut &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-        self.ensure_body_started();
-        let chunk = *data;
-        self.with_app_response(|app, resp| app.request_body_content(resp, chunk));
-        self.body_received += chunk.len() as u64;
-        *data = &[];
-    }
-
-    fn finish_until_close(&mut self) {
-        self.finish_request_with_body();
-        self.enter_request_line();
     }
 }
 
-impl<H: ServerHandler> ByteStreamHandler for Driver<H> {
-    type Token = HttpToken;
-
-    fn token(&mut self, ty: HttpToken, window: &[u8]) -> HandlerControl {
-        self.process_token(ty, window)
+impl<H: ServerHandler> H1Events for Driver<H> {
+    fn method(&mut self, value: &[u8]) -> Next {
+        self.line_too_long_status = 414;
+        let s = match self.as_str(value) {
+            Ok(s) => s,
+            Err(e) => return self.fail_stop(e),
+        };
+        if s.bytes().any(|b| b < 0x20 && b != b'\t') {
+            return self.fail_stop(HttpError::new(400, "CTL in method"));
+        }
+        if s.is_empty() {
+            return self.fail_stop(HttpError::new(400, "empty method"));
+        }
+        if !is_token(s) {
+            return self.fail_stop(HttpError::new(400, "invalid method"));
+        }
+        if !is_default_method(s) {
+            return self.fail_stop(HttpError::new(501, "method not implemented"));
+        }
+        self.partial_method = Some(s.to_string());
+        Next::Continue
     }
 
-    fn raw_bytes(&mut self, slice: &[u8]) -> HandlerControl {
-        if self.fatal.is_some() {
-            return HandlerControl::Stop;
+    fn request_target(&mut self, value: &[u8]) -> Next {
+        let s = match self.as_str(value) {
+            Ok(s) => s,
+            Err(e) => return self.fail_stop(e),
+        };
+        if !is_valid_request_target(s) {
+            return self.fail_stop(HttpError::new(400, "invalid request-target"));
         }
-        match self.state {
-            ParseState::Body => self.deliver_body_cl(slice),
-            ParseState::BodyChunkedData => self.deliver_chunk_data(slice),
-            _ => HandlerControl::Continue,
-        }
+        self.partial_target = Some(s.to_string());
+        Next::Continue
     }
 
-    fn token_too_long(&mut self) {
+    fn http_version(&mut self, value: &[u8]) -> Next {
+        let s = match self.as_str(value) {
+            Ok(s) => s,
+            Err(e) => return self.fail_stop(e),
+        };
+        let method = self.partial_method.as_deref().unwrap_or("");
+        let target = self.partial_target.as_deref().unwrap_or("");
+        let Some(version) = parse_version(value) else {
+            if s == "HTTP/2.0" && method == "PRI" && target == "*" {
+                return self.fail_stop(HttpError::new(505, "HTTP/2 preface not supported yet"));
+            }
+            return self.fail_stop(HttpError::new(505, "HTTP version not supported"));
+        };
+        self.version = version;
+        if version == HttpVersion::Http10 {
+            self.response.set_close_connection(true);
+        }
+        self.version_ready = true;
+        Next::Continue
+    }
+
+    fn status_code(&mut self, _value: &[u8]) -> Next {
+        self.fail_stop(HttpError::new(400, "status-line on a server"))
+    }
+
+    fn reason_phrase(&mut self, _value: &[u8]) -> Next {
+        self.fail_stop(HttpError::new(400, "status-line on a server"))
+    }
+
+    fn first_line_end(&mut self) -> Next {
+        if !self.version_ready || self.partial_method.is_none() || self.partial_target.is_none() {
+            return self.fail_stop(HttpError::new(400, "malformed request-line"));
+        }
+        let method = self.partial_method.clone().unwrap();
+        let target = self.partial_target.clone().unwrap();
+        self.headers = Headers::new();
+        self.headers.add(":method", method);
+        self.headers.add(":path", target);
+        self.headers
+            .add(":scheme", if self.secure { "https" } else { "http" });
+        self.state = ParseState::Header;
+        self.line_too_long_status = 431;
+        Next::Fields
+    }
+
+    fn header_name(&mut self, value: &[u8]) -> Next {
+        self.line_too_long_status = if self.state == ParseState::BodyChunkedTrailer {
+            400
+        } else {
+            431
+        };
+        if self.state != ParseState::BodyChunkedTrailer
+            && self.headers.len() >= self.limits.max_header_count
+        {
+            return self.fail_stop(HttpError::new(431, "too many headers"));
+        }
+        let name: String = value.iter().map(|&b| b as char).collect();
+        if !is_valid_header_name(&name) {
+            return self.fail_stop(HttpError::new(400, "invalid header name"));
+        }
+        self.pending_name = Some(name);
+        Next::Continue
+    }
+
+    fn header_value(&mut self, value: &[u8]) -> Next {
+        let Some(name) = self.pending_name.take() else {
+            return self.fail_stop(HttpError::new(400, "value without field name"));
+        };
+        // Trailers are accepted but not merged into the header set.
+        if self.state == ParseState::BodyChunkedTrailer {
+            return Next::Continue;
+        }
+        let v: String = value.iter().map(|&b| b as char).collect();
+        self.headers.add(name, v);
+        Next::Continue
+    }
+
+    fn headers_end(&mut self) -> Next {
+        if self.state == ParseState::BodyChunkedTrailer {
+            self.finish_request_with_body();
+            return Next::FirstLine;
+        }
+        self.end_headers()
+    }
+
+    fn chunk_size_line(&mut self, value: &[u8]) -> Next {
+        self.line_too_long_status = 400;
+        let line: String = value.iter().map(|&b| b as char).collect();
+        let semi = line.find(';');
+        if semi.is_some_and(|i| line[i..].contains('"')) {
+            return self.fail_stop(HttpError::new(400, "quoted chunk-ext"));
+        }
+        let size_str = semi.map(|i| &line[..i]).unwrap_or(&line).trim();
+        let Ok(chunk_size) = usize::from_str_radix(size_str, 16) else {
+            return self.fail_stop(HttpError::new(400, "bad chunk size"));
+        };
+        if chunk_size > self.limits.max_chunk_size {
+            return self.fail_stop(HttpError::new(400, "chunk too large"));
+        }
+        if self.body_received.saturating_add(chunk_size as u64)
+            > self.limits.max_request_body as u64
+        {
+            return self.fail_stop(HttpError::new(413, "request body too large"));
+        }
+        if chunk_size == 0 {
+            self.state = ParseState::BodyChunkedTrailer;
+            self.pending_name = None;
+            return Next::Fields;
+        }
+        Next::ChunkBody(chunk_size as u64)
+    }
+
+    fn body_data(&mut self, value: &[u8]) -> Next {
+        if self.limits.max_request_body > 0
+            && self
+                .body_received
+                .saturating_add(value.len() as u64)
+                > self.limits.max_request_body as u64
+        {
+            return self.fail_stop(HttpError::new(413, "request body too large"));
+        }
+        self.ensure_body_started();
+        self.with_app_response(|app, resp| app.request_body_content(resp, value));
+        self.body_received += value.len() as u64;
+        Next::Continue
+    }
+
+    fn body_end(&mut self) -> Next {
+        self.finish_request_with_body();
+        Next::FirstLine
+    }
+
+    fn chunk_end(&mut self) -> Next {
+        self.state = ParseState::BodyChunkedSize;
+        Next::ChunkSize
+    }
+
+    fn too_long(&mut self) -> Next {
         let status = self.line_too_long_status;
         let msg = match status {
             414 => "request-line too long",
             431 => "header line too long",
             _ => "token too long",
         };
-        self.fail(HttpError::new(status, msg));
+        self.fail_stop(HttpError::new(status, msg))
+    }
+
+    fn bad_syntax(&mut self, what: &'static str) -> Next {
+        let status = match self.state {
+            ParseState::RequestLine => 400,
+            _ => 400,
+        };
+        let _ = what;
+        self.fail_stop(HttpError::new(status, "malformed HTTP message"))
     }
 }
 
@@ -863,17 +636,39 @@ mod tests {
         }
     }
 
+    /// Feed chunk by chunk, asserting the codec retains *nothing* — the
+    /// scanner owns any partial token, so the transport buffer always drains
+    /// completely (see `h1::parse` module docs).
     fn feed_all(p: &mut H1ServerCodec<Arc<Mutex<Rec>>>, chunks: &[&[u8]]) {
-        let mut pending = Vec::new();
         for c in chunks {
-            pending.extend_from_slice(c);
-            let mut slice = pending.as_slice();
-            let before = slice.len();
+            let mut slice: &[u8] = c;
             p.receive(&mut slice).unwrap();
-            let consumed = before - slice.len();
-            pending.drain(..consumed);
+            assert!(
+                slice.is_empty(),
+                "codec left {} byte(s) unconsumed from {:?}",
+                slice.len(),
+                String::from_utf8_lossy(c)
+            );
         }
-        assert!(pending.is_empty(), "leftover {pending:?}");
+    }
+
+    /// The design property: a request split at *every* byte boundary parses
+    /// identically and never asks the caller to retain anything.
+    #[test]
+    fn every_split_point_consumes_everything() {
+        let msg: &[u8] = b"POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello";
+        for split in 1..msg.len() {
+            let rec = Arc::new(Mutex::new(Rec::default()));
+            let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
+            for part in [&msg[..split], &msg[split..]] {
+                let mut slice: &[u8] = part;
+                p.receive(&mut slice).unwrap();
+                assert!(slice.is_empty(), "split {split} retained bytes");
+            }
+            let g = rec.lock().unwrap();
+            assert_eq!(g.body, b"hello", "split {split}");
+            assert!(g.events.iter().any(|e| e == "complete"), "split {split}");
+        }
     }
 
     #[test]
