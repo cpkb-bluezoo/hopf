@@ -8,15 +8,17 @@
 
 #![cfg(feature = "integration")]
 
-use std::io;
-use std::net::SocketAddr;
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hopf_core::{Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
 
 use crate::client::{connect_http, HttpClientTimeouts};
-use crate::{ClientHandler, ClientHandlerFactory, ClientWriter, Headers, HttpLimits};
+use crate::h2::frame;
+use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
+use crate::{ClientHandler, ClientHandlerFactory, ClientWriter, H2Endpoint, Headers, HttpLimits};
 
 // ---------------------------------------------------------------------------
 // Minimal in-process HTTP/1.1 server
@@ -126,6 +128,53 @@ fn wait_done(out: &Arc<Mutex<Outcome>>, max: Duration) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Raw H2 server for SETTINGS-ACK-timeout tests
+// ---------------------------------------------------------------------------
+
+struct NoopServerHandler;
+
+impl ServerHandler for NoopServerHandler {
+    fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+    fn request_complete(&mut self, _response: &mut dyn ServerWriter) {}
+}
+
+struct NoopServerFactory;
+
+impl ServerHandlerFactory for NoopServerFactory {
+    fn create_handler(&self) -> Box<dyn ServerHandler> {
+        Box::new(NoopServerHandler)
+    }
+}
+
+/// Cleartext prior-knowledge H2 server whose SETTINGS-ACK wait is shortened
+/// to `ack_timeout`, so tests don't have to wait out the real 10s default.
+fn start_h2_server(rt: &Arc<Runtime>, ack_timeout: Duration) -> SocketAddr {
+    let factory: Arc<dyn ServerHandlerFactory> = Arc::new(NoopServerFactory);
+    let (addr, _) = rt
+        .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+            let mut ep = H2Endpoint::server(Arc::clone(&factory), HttpLimits::default(), true);
+            ep.set_settings_ack_timeout_for_test(ack_timeout);
+            Box::new(ep) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+    addr
+}
+
+/// Read one H2 frame (9-byte header + payload), or `None` on a clean EOF.
+fn read_frame(stream: &mut TcpStream) -> Option<(frame::FrameHeader, Vec<u8>)> {
+    let mut hdr_buf = [0u8; 9];
+    match stream.read_exact(&mut hdr_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return None,
+        Err(e) => panic!("read error: {e}"),
+    }
+    let hdr = frame::parse_frame_header(&hdr_buf);
+    let mut payload = vec![0u8; hdr.length as usize];
+    stream.read_exact(&mut payload).unwrap();
+    Some((hdr, payload))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -191,4 +240,61 @@ fn connect_http_localhost_hostname_roundtrip() {
     let g = out.lock().unwrap();
     assert_eq!(g.status, 200);
     assert_eq!(g.body, b"hello-http-client");
+}
+
+/// A peer that never ACKs the server's SETTINGS frame is closed with
+/// `GOAWAY(SETTINGS_TIMEOUT)` (RFC 9113 §6.5.3).
+#[test]
+fn h2_settings_ack_timeout_closes_with_goaway() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let ack_timeout = Duration::from_millis(150);
+    let addr = start_h2_server(&rt, ack_timeout);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+    let (settings_hdr, _) = read_frame(&mut stream).expect("server SETTINGS frame");
+    assert_eq!(settings_hdr.ty, frame::TYPE_SETTINGS);
+    assert_eq!(settings_hdr.flags & frame::FLAG_ACK, 0);
+
+    // Never ACK it: the timer should fire and close the connection.
+    let (goaway_hdr, payload) = read_frame(&mut stream).expect("GOAWAY frame");
+    assert_eq!(goaway_hdr.ty, frame::TYPE_GOAWAY);
+    let error_code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    assert_eq!(error_code, frame::ERROR_SETTINGS_TIMEOUT);
+
+    let mut buf = [0u8; 1];
+    let n = stream.read(&mut buf).unwrap();
+    assert_eq!(n, 0, "expected connection close (EOF) after GOAWAY");
+}
+
+/// Acknowledging the server's SETTINGS frame in time cancels the timer — no
+/// GOAWAY, no close.
+#[test]
+fn h2_settings_ack_in_time_cancels_timeout() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let ack_timeout = Duration::from_millis(150);
+    let addr = start_h2_server(&rt, ack_timeout);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+    let (settings_hdr, _) = read_frame(&mut stream).expect("server SETTINGS frame");
+    assert_eq!(settings_hdr.ty, frame::TYPE_SETTINGS);
+
+    let mut ack = Vec::new();
+    frame::write_settings_ack(&mut ack);
+    stream.write_all(&ack).unwrap();
+
+    // Wait well past the (shortened) timeout window; the connection must stay open.
+    std::thread::sleep(ack_timeout * 3);
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut buf = [0u8; 1];
+    let err = stream.read(&mut buf).unwrap_err();
+    assert!(
+        matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+        "expected no further data (still-open connection), got: {err:?}"
+    );
 }
