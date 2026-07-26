@@ -122,6 +122,34 @@ pub trait Endpoint: Send {
     /// the peer is waiting for a reply and sends nothing further. No-op when
     /// called re-entrantly from inside `receive`. Default is a no-op (mocks).
     fn poke_handler(&mut self) {}
+
+    /// Abruptly abort this stream with an application-level error code
+    /// (e.g. QUIC RESET_STREAM + STOP_SENDING, RFC 9000 §3.5/§3.6) instead
+    /// of a graceful [`close`](Self::close). Intended for protocol-level
+    /// stream errors (e.g. HTTP/3's `H3_MESSAGE_ERROR`) where the peer
+    /// should be told immediately rather than waiting for a clean FIN.
+    ///
+    /// Default falls back to [`close`](Self::close) for transports with no
+    /// native abrupt-abort primitive, or where "this stream" and "the
+    /// connection" are the same thing (e.g. plain TCP).
+    fn abort(&mut self, error_code: u32) {
+        let _ = error_code;
+        self.close();
+    }
+
+    /// Abruptly close the entire underlying connection — not just this
+    /// stream — with an application-level error code (e.g. a QUIC
+    /// CONNECTION_CLOSE frame, RFC 9000 §10.2). Intended for
+    /// connection-level protocol errors (e.g. HTTP/3's
+    /// `H3_GENERAL_PROTOCOL_ERROR`) that corrupt shared connection state
+    /// (QPACK, the control stream) rather than just one request.
+    ///
+    /// Default falls back to [`abort`](Self::abort) — for single-stream
+    /// transports like TCP, "this stream" and "the connection" are the
+    /// same thing, so there is nothing more to close.
+    fn close_connection(&mut self, error_code: u32) {
+        self.abort(error_code);
+    }
 }
 
 /// Callback type for [`Endpoint::on_write_ready`].
