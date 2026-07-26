@@ -291,9 +291,10 @@ impl ImapServerLexer {
                 self.state = State::Tag;
                 return;
             }
-            // LITERAL- (RFC 7888): synchronizing literals larger than 4 KiB are rejected.
-            if !non_sync && n > LITERAL_MINUS_LIMIT {
-                self.emit_error("Synchronizing literal too large (LITERAL-)");
+            // LITERAL- (RFC 7888): non-synchronizing literals larger than 4 KiB are rejected;
+            // clients must use a synchronizing literal instead for anything bigger.
+            if non_sync && n > LITERAL_MINUS_LIMIT {
+                self.emit_error("Non-synchronizing literal too large (LITERAL-)");
                 self.reset_command();
                 self.state = State::Tag;
                 return;
@@ -684,13 +685,34 @@ mod tests {
     }
 
     #[test]
-    fn oversized_sync_literal_over_literal_minus_limit_rejected() {
+    fn sync_literal_over_literal_minus_limit_accepted() {
+        // Synchronizing literals (`{n}`) have no LITERAL- cap of their own -
+        // they're only bounded by MAX_LITERAL_SIZE - so a size above
+        // LITERAL_MINUS_LIMIT must still be accepted, prompting a
+        // continuation request rather than an error.
         let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
         let n = LITERAL_MINUS_LIMIT + 1;
+        assert!(n < MAX_LITERAL_SIZE);
         let line = format!("a1 LOGIN {{{n}}}\r\n");
         let mut data: &[u8] = line.as_bytes();
         let ev = lex.feed(&mut data);
-        assert!(matches!(&ev[0], LexEvent::Error { tag, .. } if tag == "a1"));
+        assert!(matches!(ev[0], LexEvent::NeedContinuation));
+    }
+
+    #[test]
+    fn oversized_non_sync_literal_over_literal_minus_limit_rejected() {
+        // Non-synchronizing literals (`{n+}`) above LITERAL_MINUS_LIMIT are
+        // exactly what RFC 7888 forbids: the client would send the bytes
+        // without giving the server a chance to reject first.
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let n = LITERAL_MINUS_LIMIT + 1;
+        let line = format!("a1 LOGIN {{{n}+}}\r\n");
+        let mut data: &[u8] = line.as_bytes();
+        let ev = lex.feed(&mut data);
+        assert!(matches!(
+            &ev[0],
+            LexEvent::Error { tag, message } if tag == "a1" && message == "Non-synchronizing literal too large (LITERAL-)"
+        ));
     }
 
     #[test]
