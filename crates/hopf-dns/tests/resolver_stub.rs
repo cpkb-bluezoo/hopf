@@ -71,6 +71,141 @@ fn resolve_a_against_local_stub() {
     rt.shutdown();
 }
 
+/// RFC 5452 §2.2: a forged response with a correctly-guessed id and
+/// question, but from a different source address than the query was sent
+/// to, must be rejected — and must not disrupt the real reply that
+/// follows it.
+#[test]
+fn spoofed_source_address_is_rejected_but_real_reply_still_accepted() {
+    let real_server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    real_server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let real_addr = real_server.local_addr().unwrap();
+    let attacker = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = real_server.recv_from(&mut buf) else {
+            return;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            return;
+        };
+
+        // Forged reply with the right id/question, sent from a different
+        // socket than the one the query was actually sent to.
+        let mut spoof = q.response_template(0);
+        spoof.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            spoof.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 66)));
+        }
+        let _ = attacker.send_to(&spoof.serialize().unwrap(), peer);
+
+        thread::sleep(Duration::from_millis(100));
+
+        // Real server's genuine answer, from the address the query was sent to.
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            resp.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(203, 0, 113, 10)));
+        }
+        let _ = real_server.send_to(&resp.serialize().unwrap(), peer);
+    });
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let resolver = DnsResolver::new(rt.pick_worker().clone());
+    resolver.add_server(real_addr);
+    resolver.open().unwrap();
+
+    let got = Arc::new(Mutex::new(None));
+    let got2 = Arc::clone(&got);
+    resolver.query_a(
+        "spoof-source-test.example",
+        Box::new(move |r| {
+            *got2.lock().unwrap() = Some(r);
+        }),
+    );
+
+    for _ in 0..100 {
+        if got.lock().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let msg = got.lock().unwrap().take().expect("callback").expect("ok");
+    assert_eq!(
+        msg.answers[0].as_a(),
+        Some(Ipv4Addr::new(203, 0, 113, 10)),
+        "must accept only the real server's answer, not the spoofed one from a different address"
+    );
+    rt.shutdown();
+}
+
+/// RFC 5452 §2.2: a response from the right server with the right id but
+/// a question that doesn't match what was actually asked must be
+/// rejected — and must not disrupt the real reply that follows it.
+#[test]
+fn mismatched_question_is_rejected_but_real_reply_still_accepted() {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = server.recv_from(&mut buf) else {
+            return;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            return;
+        };
+
+        // Same id, same source, but a question for a different name than
+        // what was actually queried.
+        let mut wrong_question = q.clone();
+        wrong_question.questions[0].name = "not-what-was-asked.example".into();
+        let mut wrong = wrong_question.response_template(0);
+        wrong.flags |= FLAG_QR | FLAG_RA;
+        wrong.answers.push(DnsResourceRecord::a("not-what-was-asked.example", 60, Ipv4Addr::new(198, 51, 100, 77)));
+        let _ = server.send_to(&wrong.serialize().unwrap(), peer);
+
+        thread::sleep(Duration::from_millis(100));
+
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            resp.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(203, 0, 113, 20)));
+        }
+        let _ = server.send_to(&resp.serialize().unwrap(), peer);
+    });
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let resolver = DnsResolver::new(rt.pick_worker().clone());
+    resolver.add_server(server_addr);
+    resolver.open().unwrap();
+
+    let got = Arc::new(Mutex::new(None));
+    let got2 = Arc::clone(&got);
+    resolver.query_a(
+        "mismatched-question-test.example",
+        Box::new(move |r| {
+            *got2.lock().unwrap() = Some(r);
+        }),
+    );
+
+    for _ in 0..100 {
+        if got.lock().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let msg = got.lock().unwrap().take().expect("callback").expect("ok");
+    assert_eq!(
+        msg.answers[0].as_a(),
+        Some(Ipv4Addr::new(203, 0, 113, 20)),
+        "must accept only the answer matching the actual question asked"
+    );
+    rt.shutdown();
+}
+
 #[test]
 fn literal_connect_by_name_skips_dns() {
     use hopf_core::{Endpoint, ProtocolHandler, TcpListenerConfig};
