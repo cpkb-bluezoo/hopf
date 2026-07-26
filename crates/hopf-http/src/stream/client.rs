@@ -20,6 +20,12 @@ pub trait ClientHandler: Send {
     /// Stream is ready; send the request (headers ± body) via `request`.
     fn start(&mut self, request: &mut dyn ClientWriter);
 
+    /// An interim 1xx response arrived (e.g. `100 Continue`, `103 Early
+    /// Hints`). Never terminal — the real final response still follows on
+    /// the same request via [`response_headers`](Self::response_headers).
+    /// Default: ignore.
+    fn informational_response(&mut self, _request: &mut dyn ClientWriter, _headers: &Headers) {}
+
     /// Response headers are complete (including `:status`).
     fn response_headers(&mut self, request: &mut dyn ClientWriter, headers: &Headers);
 
