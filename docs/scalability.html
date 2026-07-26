@@ -73,7 +73,6 @@
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
-<li><a href="#method">Method</a></li>
 <li><a href="#model">The scaling model in one picture</a></li>
 <li><a href="#accept">Accept path: single-threaded by design</a></li>
 <li><a href="#bufpool">Buffer pool: per-reactor, no cross-thread lock</a></li>
@@ -84,9 +83,6 @@
 <li><a href="#unbounded-growth">Accept-rate-limiter memory: bounded by periodic pruning</a></li>
 <li><a href="#summary">Summary table</a></li>
 </ul></div>
-
-<h2 id="method">Method</h2>
-<p>Everything below is sourced from reading <code>crates/hopf-core/src/{reactor,runtime,accept,bufpool,storage,cmd,connection,timer,acl,quota}.rs</code> directly — file:line citations throughout. This is a <strong>behavioral</strong> audit (what happens as N grows), not a benchmark: no load test was run to produce numbers. Where a claim would need a benchmark to become a number rather than a mechanism, that's said explicitly.</p>
 
 <h2 id="model">The scaling model in one picture</h2>
 <pre><code>1 accept-loop thread  ──RR──▶  N reactor threads (worker_threads, default 2×cores)
