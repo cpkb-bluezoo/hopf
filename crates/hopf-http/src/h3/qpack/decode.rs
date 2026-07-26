@@ -3,6 +3,7 @@
 //! Stateless QPACK field-section decoder for static-table-only peers.
 
 use super::static_table;
+use crate::h2::hpack::huffman;
 
 /// QPACK decoding error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +18,8 @@ pub enum DecodeError {
     Unsupported,
     /// Header bytes are not valid UTF-8.
     InvalidText,
+    /// Malformed Huffman-coded string.
+    InvalidHuffman,
 }
 
 fn integer(input: &[u8], prefix: u8) -> Result<(u64, usize), DecodeError> {
@@ -46,14 +49,19 @@ fn integer(input: &[u8], prefix: u8) -> Result<(u64, usize), DecodeError> {
 }
 
 fn string(input: &[u8]) -> Result<(String, usize), DecodeError> {
-    if input.first().ok_or(DecodeError::Truncated)? & 0x80 != 0 {
-        return Err(DecodeError::Unsupported); // Huffman is deliberately not yet enabled.
-    }
+    let huffman_coded = input.first().ok_or(DecodeError::Truncated)? & 0x80 != 0;
     let (len, used) = integer(input, 7)?;
     let end = used + usize::try_from(len).map_err(|_| DecodeError::Truncated)?;
-    let text = std::str::from_utf8(input.get(used..end).ok_or(DecodeError::Truncated)?)
-        .map_err(|_| DecodeError::InvalidText)?;
-    Ok((text.to_owned(), end))
+    let raw = input.get(used..end).ok_or(DecodeError::Truncated)?;
+    let text = if huffman_coded {
+        let decoded = huffman::decode(raw).map_err(|_| DecodeError::InvalidHuffman)?;
+        String::from_utf8(decoded).map_err(|_| DecodeError::InvalidText)?
+    } else {
+        std::str::from_utf8(raw)
+            .map_err(|_| DecodeError::InvalidText)?
+            .to_owned()
+    };
+    Ok((text, end))
 }
 
 /// Decode a QPACK field section with Required Insert Count zero.

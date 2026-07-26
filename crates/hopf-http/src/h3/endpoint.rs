@@ -35,6 +35,9 @@ pub struct H3ServerConnection {
     /// accepted request without needing the raw QUIC `StreamId` at this
     /// layer.
     accepted_bi_streams: Arc<AtomicU64>,
+    qpack: Arc<qpack::H3Qpack>,
+    qpack_encoder_stream_key: Option<u64>,
+    qpack_decoder_stream_key: Option<u64>,
 }
 
 impl H3ServerConnection {
@@ -46,6 +49,22 @@ impl H3ServerConnection {
             peer_state: Arc::new(Mutex::new(H3PeerState::default())),
             control_stream_key: None,
             accepted_bi_streams: Arc::new(AtomicU64::new(0)),
+            qpack: Arc::new(qpack::H3Qpack::new()),
+            qpack_encoder_stream_key: None,
+            qpack_decoder_stream_key: None,
+        }
+    }
+
+    /// Write any QPACK instruction bytes queued since the last flush onto
+    /// our own encoder/decoder uni streams — the only opportunity to do so
+    /// outside `connected()` (see [`hopf_quic::QuicConnection::drive`]).
+    fn flush_qpack(&self, api: &mut dyn QuicConnApi) {
+        let (enc, dec) = self.qpack.take_pending();
+        if let (Some(key), false) = (self.qpack_encoder_stream_key, enc.is_empty()) {
+            api.write(key, &enc);
+        }
+        if let (Some(key), false) = (self.qpack_decoder_stream_key, dec.is_empty()) {
+            api.write(key, &dec);
         }
     }
 }
@@ -58,17 +77,25 @@ impl QuicConnection for H3ServerConnection {
             api.write(stream, &bytes);
             self.control_stream_key = Some(stream);
         }
-        // RFC 9204 requires both critical QPACK streams even with dynamic QPACK disabled.
-        for ty in [0x02, 0x03] {
-            if let Some(stream) = api.open_uni() {
-                api.write(stream, &[ty]);
-            }
+        if let Some(stream) = api.open_uni() {
+            api.write(stream, &[0x02]); // QPACK encoder stream type
+            self.qpack_encoder_stream_key = Some(stream);
         }
+        if let Some(stream) = api.open_uni() {
+            api.write(stream, &[0x03]); // QPACK decoder stream type
+            self.qpack_decoder_stream_key = Some(stream);
+        }
+        self.flush_qpack(api);
     }
 
     fn accept_bi(&mut self) -> Box<dyn ProtocolHandler> {
-        self.accepted_bi_streams.fetch_add(1, Ordering::SeqCst);
-        Box::new(H3RequestStream::new(Arc::clone(&self.factory), self.limits))
+        let stream_id = self.accepted_bi_streams.fetch_add(1, Ordering::SeqCst) * 4;
+        Box::new(H3RequestStream::new(
+            Arc::clone(&self.factory),
+            self.limits,
+            stream_id,
+            Arc::clone(&self.qpack),
+        ))
     }
 
     /// Send a final GOAWAY on the control stream, announcing the last
@@ -91,7 +118,11 @@ impl QuicConnection for H3ServerConnection {
     }
 
     fn accept_uni(&mut self) -> Box<dyn ProtocolHandler> {
-        Box::new(H3UniStream::new(Arc::clone(&self.peer_state)))
+        Box::new(H3UniStream::new(Arc::clone(&self.peer_state), Arc::clone(&self.qpack)))
+    }
+
+    fn drive(&mut self, api: &mut dyn QuicConnApi) {
+        self.flush_qpack(api);
     }
 }
 
@@ -115,12 +146,16 @@ pub fn listen_h3(
 /// Per-request buffered response.
 struct H3Writer {
     control: Arc<H3ResponseControl>,
+    stream_id: u64,
+    qpack: Arc<qpack::H3Qpack>,
 }
 
 impl H3Writer {
-    fn new() -> Self {
+    fn new(stream_id: u64, qpack: Arc<qpack::H3Qpack>) -> Self {
         Self {
             control: H3ResponseControl::new(),
+            stream_id,
+            qpack,
         }
     }
 
@@ -161,7 +196,9 @@ impl H3Writer {
             if !headers.contains("date") {
                 headers.set("Date", crate::utils::http_date_now());
             }
-            let block = qpack::encode(headers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
+            let block = self
+                .qpack
+                .encode_field_section(self.stream_id, headers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
             frame::write_headers(&mut out, &block);
             self.control.shared.lock().unwrap().headers_sent = true;
         } else if !headers_sent && body.is_empty() && trailers.is_none() {
@@ -171,8 +208,9 @@ impl H3Writer {
             frame::write_data(&mut out, &body);
         }
         if let Some(trailers) = trailers {
-            let block =
-                qpack::encode(trailers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
+            let block = self
+                .qpack
+                .encode_field_section(self.stream_id, trailers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
             frame::write_headers(&mut out, &block);
         }
         if !out.is_empty() {
@@ -245,6 +283,8 @@ struct H3RequestStream {
     factory: Arc<dyn ServerHandlerFactory>,
     #[allow(dead_code)]
     limits: HttpLimits,
+    stream_id: u64,
+    qpack: Arc<qpack::H3Qpack>,
     parser: H3Parser,
     handler: Option<Box<dyn ServerHandler>>,
     writer: H3Writer,
@@ -256,22 +296,29 @@ struct H3RequestStream {
     /// 9114 §4.3.1) — checked in `receive()`'s tail, where an `Endpoint` is
     /// available to abort the stream.
     malformed: bool,
+    /// Set when a HEADERS payload failed to QPACK-decode — checked in
+    /// `receive()`'s tail, where an `Endpoint` is available to close the
+    /// connection (RFC 9204 §4.5.1: `QPACK_DECOMPRESSION_FAILED`).
+    qpack_error: bool,
 }
 
 impl H3RequestStream {
-    fn new(factory: Arc<dyn ServerHandlerFactory>, limits: HttpLimits) -> Self {
+    fn new(factory: Arc<dyn ServerHandlerFactory>, limits: HttpLimits, stream_id: u64, qpack: Arc<qpack::H3Qpack>) -> Self {
         let needs_protocol_flush = Arc::new(Mutex::new(false));
         let stream = Self {
             factory,
             limits,
+            stream_id,
+            qpack: Arc::clone(&qpack),
             parser: H3Parser::new(),
             handler: None,
-            writer: H3Writer::new(),
+            writer: H3Writer::new(stream_id, qpack),
             body_started: false,
             paused_body: Vec::new(),
             needs_protocol_flush: Arc::clone(&needs_protocol_flush),
             upgraded: None,
             malformed: false,
+            qpack_error: false,
         };
         let flag = Arc::clone(&needs_protocol_flush);
         stream.writer.control.set_flush(Some(Arc::new(move || {
@@ -384,7 +431,8 @@ impl H3FrameHandler for H3RequestStream {
     }
 
     fn headers_frame(&mut self, payload: &[u8]) {
-        let Ok(pairs) = qpack::decode(payload) else {
+        let Ok(pairs) = self.qpack.decode_field_section(self.stream_id, payload) else {
+            self.qpack_error = true;
             return;
         };
         if pairs.len() > self.limits.max_header_count {
@@ -438,6 +486,13 @@ impl ProtocolHandler for H3RequestStream {
         parser.push(data, self);
         self.parser = parser;
         *data = &[];
+        if self.qpack_error {
+            // RFC 9204 §4.5.1: a field section this decoder can't process
+            // desynchronizes the whole connection's QPACK state, not just
+            // this stream.
+            endpoint.close_connection(frame::QPACK_DECOMPRESSION_FAILED);
+            return;
+        }
         if self.malformed {
             // RFC 9114 §4.3.1: a malformed request is a stream error, not
             // a connection error — only this one request is affected.
@@ -452,7 +507,12 @@ impl ProtocolHandler for H3RequestStream {
         self.finish_request(endpoint);
     }
 
-    fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
+    fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {
+        // RFC 9204 §4.4.2: this stream won't be acknowledged now — let the
+        // peer's encoder release any dynamic-table references it held open
+        // for it.
+        self.qpack.cancel_stream(self.stream_id);
+    }
 }
 
 /// RFC 9114 §6.2 / RFC 9204 §4.2 unidirectional stream type identifiers.
@@ -489,21 +549,31 @@ enum UniKind {
     /// The (first, valid) control stream — bytes route through the H3
     /// frame parser so SETTINGS/GOAWAY get processed.
     Control(H3Parser),
-    /// Anything else: a QPACK critical stream (dynamic table is disabled,
-    /// so there's nothing to decode from it), a duplicate critical stream,
-    /// or an unknown/reserved type (RFC 9114 §9 requires tolerating these).
+    /// The peer's QPACK encoder stream — bytes are instructions that grow
+    /// our mirror of the peer's dynamic table (RFC 9204 §4.3).
+    QpackEncoderStream,
+    /// The peer's QPACK decoder stream — bytes acknowledge our own
+    /// encoder's insertions (RFC 9204 §4.4).
+    QpackDecoderStream,
+    /// A duplicate critical stream, or an unknown/reserved type (RFC 9114
+    /// §9 requires tolerating these).
     Discard,
 }
 
 /// Reads the RFC 9114 §6.2 type-byte prefix of a peer unidirectional
-/// stream, then either parses it (control stream) or discards it.
+/// stream, then routes it accordingly (control, QPACK critical streams) or
+/// discards it.
 pub(crate) struct H3UniStream {
     peer_state: Arc<Mutex<H3PeerState>>,
+    qpack: Arc<qpack::H3Qpack>,
     kind: UniKind,
     /// Buffered bytes while the type-byte varint is still incomplete —
     /// values above the standard single-byte types (e.g. GREASE, RFC 9114
     /// §7.2.8) legitimately span multiple bytes.
     pending_type: Vec<u8>,
+    /// Buffered bytes for a QPACK critical stream while the latest
+    /// instruction is still incomplete.
+    qpack_buf: Vec<u8>,
     /// Set when a connection-level protocol violation is detected (RFC
     /// 9114 §8.1) — checked in `receive()`'s tail, where an `Endpoint` is
     /// available to actually close the connection.
@@ -511,11 +581,13 @@ pub(crate) struct H3UniStream {
 }
 
 impl H3UniStream {
-    pub(crate) fn new(peer_state: Arc<Mutex<H3PeerState>>) -> Self {
+    pub(crate) fn new(peer_state: Arc<Mutex<H3PeerState>>, qpack: Arc<qpack::H3Qpack>) -> Self {
         Self {
             peer_state,
+            qpack,
             kind: UniKind::Unclassified,
             pending_type: Vec::new(),
+            qpack_buf: Vec::new(),
             connection_error: None,
         }
     }
@@ -534,12 +606,12 @@ impl H3UniStream {
             }
             STREAM_TYPE_QPACK_ENCODER if !state.qpack_encoder_seen => {
                 state.qpack_encoder_seen = true;
-                self.kind = UniKind::Discard;
+                self.kind = UniKind::QpackEncoderStream;
                 false
             }
             STREAM_TYPE_QPACK_DECODER if !state.qpack_decoder_seen => {
                 state.qpack_decoder_seen = true;
-                self.kind = UniKind::Discard;
+                self.kind = UniKind::QpackDecoderStream;
                 false
             }
             STREAM_TYPE_CONTROL | STREAM_TYPE_QPACK_ENCODER | STREAM_TYPE_QPACK_DECODER => {
@@ -612,16 +684,29 @@ impl ProtocolHandler for H3UniStream {
             return;
         }
 
-        if let UniKind::Control(_) = &self.kind {
-            // Detach the parser first — it needs `&mut self` as its
-            // `H3FrameHandler` sink, which would otherwise overlap with
-            // the `&mut self.kind` borrow holding it.
-            let UniKind::Control(mut parser) = std::mem::replace(&mut self.kind, UniKind::Discard)
-            else {
-                unreachable!()
-            };
-            parser.push(data, self);
-            self.kind = UniKind::Control(parser);
+        match &self.kind {
+            UniKind::Control(_) => {
+                // Detach the parser first — it needs `&mut self` as its
+                // `H3FrameHandler` sink, which would otherwise overlap
+                // with the `&mut self.kind` borrow holding it.
+                let UniKind::Control(mut parser) = std::mem::replace(&mut self.kind, UniKind::Discard)
+                else {
+                    unreachable!()
+                };
+                parser.push(data, self);
+                self.kind = UniKind::Control(parser);
+            }
+            UniKind::QpackEncoderStream => {
+                self.qpack_buf.extend_from_slice(data);
+                if self.qpack.feed_encoder_stream(&mut self.qpack_buf).is_err() {
+                    self.connection_error.get_or_insert(frame::QPACK_ENCODER_STREAM_ERROR);
+                }
+            }
+            UniKind::QpackDecoderStream => {
+                self.qpack_buf.extend_from_slice(data);
+                self.qpack.feed_decoder_stream(&mut self.qpack_buf);
+            }
+            _ => {}
         }
         *data = &[];
 
@@ -700,10 +785,15 @@ mod uni_stream_tests {
         Arc::new(Mutex::new(H3PeerState::default()))
     }
 
+    fn shared_qpack() -> Arc<qpack::H3Qpack> {
+        Arc::new(qpack::H3Qpack::new())
+    }
+
     #[test]
     fn control_stream_settings_are_parsed_and_stored() {
         let state = shared_state();
-        let mut uni = H3UniStream::new(Arc::clone(&state));
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
         let mut ep = RecordingEndpoint::default();
 
         let mut bytes = vec![0x00]; // control stream type
@@ -723,7 +813,8 @@ mod uni_stream_tests {
     #[test]
     fn control_stream_type_and_settings_split_across_receives() {
         let state = shared_state();
-        let mut uni = H3UniStream::new(Arc::clone(&state));
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
         let mut ep = RecordingEndpoint::default();
 
         let mut settings_bytes = Vec::new();
@@ -744,15 +835,16 @@ mod uni_stream_tests {
     #[test]
     fn qpack_encoder_and_decoder_streams_are_recognized_and_discarded() {
         let state = shared_state();
+        let qpack = shared_qpack();
 
-        let mut encoder = H3UniStream::new(Arc::clone(&state));
+        let mut encoder = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
         let mut ep1 = RecordingEndpoint::default();
         let mut d1: &[u8] = &[0x02];
         encoder.receive(&mut ep1, &mut d1);
         assert!(!ep1.closed);
         assert!(state.lock().unwrap().qpack_encoder_seen);
 
-        let mut decoder = H3UniStream::new(Arc::clone(&state));
+        let mut decoder = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
         let mut ep2 = RecordingEndpoint::default();
         let mut d2: &[u8] = &[0x03];
         decoder.receive(&mut ep2, &mut d2);
@@ -767,15 +859,16 @@ mod uni_stream_tests {
     #[test]
     fn duplicate_control_stream_closes() {
         let state = shared_state();
+        let qpack = shared_qpack();
         {
-            let mut first = H3UniStream::new(Arc::clone(&state));
+            let mut first = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
             let mut ep = RecordingEndpoint::default();
             let mut d: &[u8] = &[0x00];
             first.receive(&mut ep, &mut d);
             assert!(!ep.closed);
         }
 
-        let mut second = H3UniStream::new(Arc::clone(&state));
+        let mut second = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
         let mut ep = RecordingEndpoint::default();
         let mut d: &[u8] = &[0x00];
         second.receive(&mut ep, &mut d);
@@ -790,14 +883,15 @@ mod uni_stream_tests {
     #[test]
     fn duplicate_qpack_encoder_stream_closes() {
         let state = shared_state();
+        let qpack = shared_qpack();
         {
-            let mut first = H3UniStream::new(Arc::clone(&state));
+            let mut first = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
             let mut ep = RecordingEndpoint::default();
             let mut d: &[u8] = &[0x02];
             first.receive(&mut ep, &mut d);
         }
 
-        let mut second = H3UniStream::new(Arc::clone(&state));
+        let mut second = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
         let mut ep = RecordingEndpoint::default();
         let mut d: &[u8] = &[0x02];
         second.receive(&mut ep, &mut d);
@@ -811,7 +905,8 @@ mod uni_stream_tests {
     #[test]
     fn unknown_multi_byte_stream_type_is_tolerated() {
         let state = shared_state();
-        let mut uni = H3UniStream::new(Arc::clone(&state));
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
         let mut ep = RecordingEndpoint::default();
 
         // A 2-byte QUIC varint encoding of a large "reserved" type value.
@@ -834,7 +929,8 @@ mod uni_stream_tests {
     #[test]
     fn data_frame_on_control_stream_is_a_connection_error() {
         let state = shared_state();
-        let mut uni = H3UniStream::new(Arc::clone(&state));
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x00];
@@ -855,7 +951,8 @@ mod uni_stream_tests {
     #[test]
     fn goaway_on_control_stream_is_recorded() {
         let state = shared_state();
-        let mut uni = H3UniStream::new(Arc::clone(&state));
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x00];
@@ -968,7 +1065,8 @@ mod request_validation_tests {
         let rec = Arc::new(Mutex::new(Recorded::default()));
         let factory: Arc<dyn ServerHandlerFactory> =
             Arc::new(RecordingFactory { rec: Arc::clone(&rec) });
-        (H3RequestStream::new(factory, HttpLimits::default()), rec)
+        let qpack = Arc::new(qpack::H3Qpack::new());
+        (H3RequestStream::new(factory, HttpLimits::default(), 0, qpack), rec)
     }
 
     #[test]

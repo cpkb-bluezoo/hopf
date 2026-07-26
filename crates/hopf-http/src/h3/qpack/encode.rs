@@ -3,6 +3,7 @@
 //! Static-table-only QPACK field-section encoder.
 
 use super::static_table;
+use crate::h2::hpack::huffman;
 
 fn integer(out: &mut Vec<u8>, value: u64, prefix: u8, bits: u8) {
     let max = (1u64 << prefix) - 1;
@@ -19,9 +20,19 @@ fn integer(out: &mut Vec<u8>, value: u64, prefix: u8, bits: u8) {
     out.push(remaining as u8);
 }
 
+/// Write `value` as a Huffman-or-raw string literal (RFC 9204 §4.5.1's `H`
+/// bit), choosing whichever is shorter — same table as HPACK
+/// (RFC 9204 §4.1.2 references RFC 7541 Appendix B).
 fn string(out: &mut Vec<u8>, value: &str) {
-    integer(out, value.len() as u64, 7, 0);
-    out.extend_from_slice(value.as_bytes());
+    let raw = value.as_bytes();
+    let encoded = huffman::encode(raw);
+    if encoded.len() < raw.len() {
+        integer(out, encoded.len() as u64, 7, 0x80);
+        out.extend_from_slice(&encoded);
+    } else {
+        integer(out, raw.len() as u64, 7, 0);
+        out.extend_from_slice(raw);
+    }
 }
 
 /// Encode fields with an empty dynamic table.
