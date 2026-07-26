@@ -361,6 +361,7 @@ impl Driver {
 
             self.handle_timeouts(now);
             self.poll_connections(now);
+            self.drive_apps();
             self.flush_all_transmits();
         }
         Ok(())
@@ -718,6 +719,29 @@ impl Driver {
             };
             let mut recorder = ConnRecorder::default();
             app.disconnecting(&mut recorder);
+            self.apply_recorder(ch, &mut *app, recorder);
+            if let Some(slot) = self.connections.get_mut(&ch) {
+                slot.app = Some(app);
+            }
+        }
+    }
+
+    /// Give every still-live connection's app a chance to write additional
+    /// bytes onto already-open local streams (see
+    /// [`QuicConnection::drive`]), once per loop tick.
+    fn drive_apps(&mut self) {
+        let handles: Vec<ConnectionHandle> = self
+            .connections
+            .iter()
+            .filter(|(_, s)| s.app.is_some())
+            .map(|(ch, _)| *ch)
+            .collect();
+        for ch in handles {
+            let Some(mut app) = self.connections.get_mut(&ch).and_then(|s| s.app.take()) else {
+                continue;
+            };
+            let mut recorder = ConnRecorder::default();
+            app.drive(&mut recorder);
             self.apply_recorder(ch, &mut *app, recorder);
             if let Some(slot) = self.connections.get_mut(&ch) {
                 slot.app = Some(app);
