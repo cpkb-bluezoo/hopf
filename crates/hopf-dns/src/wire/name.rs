@@ -46,15 +46,24 @@ pub fn encode_name(name: &str) -> Result<Vec<u8>, DnsFormatError> {
 
 /// Decode a domain name; advances `cursor` in `data`.
 pub fn decode_name(data: &[u8], cursor: &mut usize) -> Result<String, DnsFormatError> {
-    decode_name_inner(data, cursor, 0)
+    let mut total_len = 0usize;
+    decode_name_inner(data, cursor, 0, &mut total_len)
 }
 
-fn decode_name_inner(data: &[u8], cursor: &mut usize, depth: usize) -> Result<String, DnsFormatError> {
+/// `total_len` accumulates across the *entire* chain of compression-pointer
+/// jumps (RFC 1035 §2.3.4's 255-octet limit applies to the whole decoded
+/// name, not to whatever happens to sit in one pointer's target segment) —
+/// it must be threaded through every recursive call, not reset per call.
+fn decode_name_inner(
+    data: &[u8],
+    cursor: &mut usize,
+    depth: usize,
+    total_len: &mut usize,
+) -> Result<String, DnsFormatError> {
     if depth > MAX_JUMPS {
         return Err(DnsFormatError::new("too many compression pointers"));
     }
     let mut labels = Vec::new();
-    let mut total_len = 0usize;
     loop {
         if *cursor >= data.len() {
             return Err(DnsFormatError::new("truncated name"));
@@ -71,7 +80,7 @@ fn decode_name_inner(data: &[u8], cursor: &mut usize, depth: usize) -> Result<St
             let offset = (((len & 0x3F) as usize) << 8) | (data[*cursor] as usize);
             *cursor += 1;
             let mut ptr = offset;
-            let rest = decode_name_inner(data, &mut ptr, depth + 1)?;
+            let rest = decode_name_inner(data, &mut ptr, depth + 1, total_len)?;
             if !labels.is_empty() {
                 labels.push(b'.');
             }
@@ -82,8 +91,8 @@ fn decode_name_inner(data: &[u8], cursor: &mut usize, depth: usize) -> Result<St
         if *cursor + llen > data.len() {
             return Err(DnsFormatError::new("truncated label"));
         }
-        total_len += 1 + llen;
-        if total_len > MAX_NAME_LENGTH {
+        *total_len += 1 + llen;
+        if *total_len > MAX_NAME_LENGTH {
             return Err(DnsFormatError::new("name too long decode"));
         }
         if !labels.is_empty() {
@@ -156,5 +165,53 @@ mod tests {
         let mut c = 0;
         assert_eq!(decode_name(&buf, &mut c).unwrap(), "example.com");
         assert_eq!(decode_name(&buf, &mut c).unwrap(), "example.com");
+    }
+
+    /// Builds a chain of `segments` pointer-linked labels, each
+    /// `label_len` bytes, innermost first (offset 0). Returns the buffer
+    /// and the offset of the outermost (last-written) segment, which is
+    /// where a decoder would actually start.
+    fn chained_labels(segments: usize, label_len: u8) -> (Vec<u8>, usize) {
+        let mut buf = Vec::new();
+        let mut prev_offset: Option<u16> = None;
+        let mut outer_offset = 0usize;
+        for i in 0..segments {
+            outer_offset = buf.len();
+            buf.push(label_len);
+            buf.extend(std::iter::repeat(b'a' + (i as u8 % 26)).take(label_len as usize));
+            match prev_offset {
+                Some(off) => {
+                    buf.push(0xC0 | ((off >> 8) as u8));
+                    buf.push((off & 0xFF) as u8);
+                }
+                None => buf.push(0),
+            }
+            prev_offset = Some(outer_offset as u16);
+        }
+        (buf, outer_offset)
+    }
+
+    /// RFC 1035 §2.3.4: the 255-octet name limit applies to the whole
+    /// decoded name, not to whichever single pointer-target segment
+    /// happens to be checked — each segment here is only ~64 octets
+    /// (comfortably under 255 on its own), but 4 of them chained together
+    /// total 256, over the limit, well within the MAX_JUMPS=10 budget that
+    /// used to be the only thing bounding this decode.
+    #[test]
+    fn cumulative_length_across_pointer_jumps_is_enforced() {
+        let (buf, start) = chained_labels(4, 63); // 4 * (1 + 63) = 256 octets
+        let mut c = start;
+        let err = decode_name(&buf, &mut c).unwrap_err();
+        assert!(format!("{err}").contains("too long"), "unexpected error: {err}");
+    }
+
+    /// The same chained-pointer shape, but under the 255-octet limit,
+    /// must still decode successfully — the fix must not be overly strict.
+    #[test]
+    fn cumulative_length_under_the_limit_still_decodes() {
+        let (buf, start) = chained_labels(3, 63); // 3 * (1 + 63) = 192 octets
+        let mut c = start;
+        let name = decode_name(&buf, &mut c).unwrap();
+        assert_eq!(name.split('.').count(), 3);
     }
 }

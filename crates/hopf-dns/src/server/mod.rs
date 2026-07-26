@@ -113,6 +113,12 @@ impl DnsService {
             m.cache_hits += 1;
             return query.response_template(crate::wire::RCODE_NXDOMAIN);
         }
+        if self.cache.is_nodata_cached(q) {
+            // RFC 2308 §2 NODATA: NOERROR with an empty answer set, not NXDOMAIN.
+            let mut m = self.metrics.lock().unwrap();
+            m.cache_hits += 1;
+            return query.response_template(0);
+        }
         if let Some(answers) = self.cache.lookup(q) {
             let mut m = self.metrics.lock().unwrap();
             m.cache_hits += 1;
