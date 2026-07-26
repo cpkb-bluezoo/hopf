@@ -39,11 +39,11 @@ use crate::stream::{
 
 use super::flow::FlowControl;
 use super::frame::{
-    self, ERROR_COMPRESSION_ERROR, ERROR_FLOW_CONTROL_ERROR, ERROR_FRAME_SIZE_ERROR,
-    ERROR_PROTOCOL_ERROR, ERROR_REFUSED_STREAM, ERROR_SETTINGS_TIMEOUT, FLAG_END_HEADERS,
-    FLAG_END_STREAM, SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_ENABLE_PUSH,
-    SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS,
-    SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
+    self, ERROR_COMPRESSION_ERROR, ERROR_ENHANCE_YOUR_CALM, ERROR_FLOW_CONTROL_ERROR,
+    ERROR_FRAME_SIZE_ERROR, ERROR_NO_ERROR, ERROR_PROTOCOL_ERROR, ERROR_REFUSED_STREAM,
+    ERROR_SETTINGS_TIMEOUT, FLAG_END_HEADERS, FLAG_END_STREAM, SETTINGS_ENABLE_CONNECT_PROTOCOL,
+    SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE,
+    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
 };
 use super::parser::{H2FrameHandler, H2Parser};
 
@@ -327,6 +327,12 @@ pub struct H2Endpoint {
     /// HPACK can consume fragments incrementally).
     continuation_block: Vec<u8>,
 
+    /// Server role: `true` once [`H2Endpoint::shutdown_gracefully`] has sent
+    /// the initial `GOAWAY(2^31-1)`. New streams are refused while this is
+    /// set; the final GOAWAY (with the true last-stream-id) and connection
+    /// close happen once `server_streams` drains to empty.
+    graceful_shutdown: bool,
+
     deferred_flush: Arc<H2DeferredFlush>,
 }
 
@@ -435,6 +441,7 @@ impl H2Endpoint {
             continuation_stream_id: 0,
             continuation_end_stream: false,
             continuation_block: Vec::new(),
+            graceful_shutdown: false,
             deferred_flush: Arc::new(H2DeferredFlush {
                 streams: Mutex::new(Vec::new()),
             }),
@@ -870,7 +877,7 @@ impl H2Endpoint {
             self.send_goaway(ERROR_PROTOCOL_ERROR);
             return;
         }
-        if self.server_streams.len() >= self.limits.max_concurrent_streams as usize {
+        if self.graceful_shutdown || self.server_streams.len() >= self.limits.max_concurrent_streams as usize {
             frame::write_rst_stream(&mut self.out, stream_id, ERROR_REFUSED_STREAM);
             return;
         }
@@ -884,6 +891,25 @@ impl H2Endpoint {
                 return;
             }
         };
+
+        // RFC 9113 §6.5.2: reject a decoded header list that exceeds what we
+        // advertised via SETTINGS_MAX_HEADER_LIST_SIZE, or HttpLimits' own
+        // field-count cap. This is a stream error, not a connection error —
+        // HPACK state itself is still consistent.
+        if pairs.len() > self.limits.max_header_count
+            || header_list_size(&pairs) > DEFAULT_MAX_HEADER_LIST_SIZE as usize
+        {
+            frame::write_rst_stream(&mut self.out, stream_id, ERROR_ENHANCE_YOUR_CALM);
+            return;
+        }
+
+        // RFC 9113 §8.3.1 (pseudo-header presence/ordering/uniqueness) and
+        // §8.2.2 (connection-specific fields, TE) — both malformed-request
+        // stream errors.
+        if validate_request_header_block(&pairs).is_err() {
+            frame::write_rst_stream(&mut self.out, stream_id, ERROR_PROTOCOL_ERROR);
+            return;
+        }
 
         let mut headers = Headers::new();
         for (name, value) in pairs {
@@ -1104,8 +1130,35 @@ impl H2Endpoint {
         self.flow.close_stream(stream_id);
     }
 
-    fn on_goaway(&mut self) {
+    fn on_goaway(&mut self, payload: &[u8]) {
         self.state = ConnState::GoAway;
+
+        // Client role: fail in-flight requests above the peer's announced
+        // last-stream-id instead of leaving them to hang forever (RFC 9113
+        // §6.8 — those streams were never processed by the peer).
+        if matches!(self.role, H2Role::Client { .. }) && payload.len() >= 8 {
+            let last_stream_id =
+                u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & 0x7fff_ffff;
+            let stale: Vec<u32> = self
+                .client_streams
+                .keys()
+                .copied()
+                .filter(|id| *id > last_stream_id)
+                .collect();
+            let mut w = NullClientWriter;
+            for id in stale {
+                if let Some(mut stream) = self.client_streams.remove(&id) {
+                    self.flow.close_stream(id);
+                    stream.handler.request_failed(
+                        &mut w,
+                        &std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "connection closed via GOAWAY before response completed",
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     fn on_window_update(&mut self, stream_id: u32, payload: &[u8]) {
@@ -1125,6 +1178,37 @@ impl H2Endpoint {
     fn send_goaway(&mut self, error_code: u32) {
         frame::write_goaway(&mut self.out, self.last_stream_id, error_code);
         self.state = ConnState::GoAway;
+    }
+
+    /// Begin RFC 9113 §6.8's recommended two-phase graceful shutdown
+    /// (server role only): send an immediate `GOAWAY(2^31-1, NO_ERROR)` to
+    /// tell the peer to stop opening new streams, while in-flight server
+    /// streams keep draining normally. Once every stream finishes, a final
+    /// `GOAWAY` with the true last-stream-id is sent and the connection is
+    /// closed — see the drain check at the end of
+    /// [`ProtocolHandler::receive`](H2Endpoint::receive).
+    ///
+    /// A no-op if already shutting down, or called for the client role.
+    pub fn shutdown_gracefully(&mut self, endpoint: &mut dyn Endpoint) {
+        if self.graceful_shutdown || !matches!(self.role, H2Role::Server { .. }) {
+            return;
+        }
+        self.graceful_shutdown = true;
+        frame::write_goaway(&mut self.out, u32::MAX >> 1, ERROR_NO_ERROR);
+        endpoint.send(&self.out);
+        self.out.clear();
+        if self.server_streams.is_empty() {
+            self.finish_graceful_shutdown(endpoint);
+        }
+    }
+
+    /// Send the final GOAWAY (true last-stream-id) and close, once a
+    /// graceful shutdown's in-flight streams have all drained.
+    fn finish_graceful_shutdown(&mut self, endpoint: &mut dyn Endpoint) {
+        self.send_goaway(ERROR_NO_ERROR);
+        endpoint.send(&self.out);
+        self.out.clear();
+        endpoint.close();
     }
 
     // -----------------------------------------------------------------------
@@ -1320,6 +1404,87 @@ fn body_empty(shared: &super::response::H2WriterShared) -> bool {
     shared.body.is_empty()
 }
 
+/// Aggregate a decoded header list's size using RFC 7541 §4.1's accounting
+/// model (name length + value length + 32 bytes overhead, per entry) — the
+/// same model `SETTINGS_MAX_HEADER_LIST_SIZE` bounds.
+fn header_list_size(pairs: &[(String, String)]) -> usize {
+    pairs.iter().map(|(name, value)| name.len() + value.len() + 32).sum()
+}
+
+/// Pseudo-headers this server recognizes on inbound requests, including
+/// `:protocol` for RFC 8441 Extended CONNECT.
+const KNOWN_REQUEST_PSEUDO_HEADERS: &[&str] =
+    &[":method", ":scheme", ":authority", ":path", ":protocol"];
+
+/// Header fields whose framing role HTTP/2 carries out-of-band, so the field
+/// itself is forbidden on the wire (RFC 9113 §8.2.2).
+const CONNECTION_SPECIFIC_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Validate a decoded request header list against RFC 9113 §8.3.1
+/// (pseudo-header presence/ordering/uniqueness, including RFC 8441 Extended
+/// CONNECT) and §8.2.2 (connection-specific fields, `TE` value). `Err(())`
+/// means the request is malformed and must be rejected with a stream error.
+fn validate_request_header_block(pairs: &[(String, String)]) -> Result<(), ()> {
+    let mut seen_pseudo: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen_regular = false;
+    let mut method: Option<&str> = None;
+
+    for (name, value) in pairs {
+        if let Some(pseudo) = name.strip_prefix(':') {
+            if seen_regular {
+                return Err(()); // pseudo-header after a regular header
+            }
+            if !KNOWN_REQUEST_PSEUDO_HEADERS.contains(&name.as_str()) {
+                return Err(()); // unknown pseudo-header
+            }
+            if !seen_pseudo.insert(name.as_str()) {
+                return Err(()); // duplicated pseudo-header
+            }
+            if pseudo == "method" {
+                method = Some(value.as_str());
+            }
+        } else {
+            seen_regular = true;
+            if CONNECTION_SPECIFIC_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
+                return Err(());
+            }
+            if name.eq_ignore_ascii_case("te") && !value.eq_ignore_ascii_case("trailers") {
+                return Err(());
+            }
+        }
+    }
+
+    let is_connect = method.is_some_and(|m| m.eq_ignore_ascii_case("CONNECT"));
+    let is_extended_connect = is_connect && seen_pseudo.contains(":protocol");
+
+    if is_connect && !is_extended_connect {
+        // Plain CONNECT (RFC 9113 §8.5): only :method and :authority, no
+        // :scheme/:path.
+        if !seen_pseudo.contains(":method") || !seen_pseudo.contains(":authority") {
+            return Err(());
+        }
+        if seen_pseudo.contains(":scheme") || seen_pseudo.contains(":path") {
+            return Err(());
+        }
+    } else {
+        // Regular requests and Extended CONNECT (RFC 8441 §4) both require
+        // :method, :scheme, :path.
+        for required in [":method", ":scheme", ":path"] {
+            if !seen_pseudo.contains(required) {
+                return Err(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // H2FrameHandler — zero-copy event pipeline into the endpoint
 // ---------------------------------------------------------------------------
@@ -1353,8 +1518,8 @@ impl H2FrameHandler for H2Endpoint {
         self.on_ping(flags, payload);
     }
 
-    fn goaway_frame(&mut self, _payload: &[u8]) {
-        self.on_goaway();
+    fn goaway_frame(&mut self, payload: &[u8]) {
+        self.on_goaway(payload);
     }
 
     fn window_update_frame(&mut self, stream_id: u32, payload: &[u8]) {
@@ -1443,6 +1608,10 @@ impl ProtocolHandler for H2Endpoint {
         self.drain_deferred_flush();
         self.flush_server_streams();
         self.flush_client_streams();
+
+        if self.graceful_shutdown && self.server_streams.is_empty() && self.state != ConnState::GoAway {
+            self.finish_graceful_shutdown(endpoint);
+        }
 
         if !self.out.is_empty() {
             endpoint.send(&self.out);
@@ -1686,5 +1855,434 @@ mod settings_tests {
 
         assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(ep.client_streams.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
+
+    fn encode_headers(pairs: &[(&str, &str)]) -> Vec<u8> {
+        super::super::hpack::Encoder::new(4096).encode(pairs.iter().copied())
+    }
+
+    struct RecordingHandler {
+        opened: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ServerHandler for RecordingHandler {
+        fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {
+            self.opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn request_complete(&mut self, _response: &mut dyn ServerWriter) {}
+    }
+    struct RecordingFactory {
+        opened: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ServerHandlerFactory for RecordingFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            Box::new(RecordingHandler {
+                opened: Arc::clone(&self.opened),
+            })
+        }
+    }
+
+    fn server_endpoint_with_limits(limits: HttpLimits) -> (H2Endpoint, Arc<std::sync::atomic::AtomicUsize>) {
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ep = H2Endpoint::server(
+            Arc::new(RecordingFactory {
+                opened: Arc::clone(&opened),
+            }),
+            limits,
+            false,
+        );
+        (ep, opened)
+    }
+
+    fn rst_stream_error_code(out: &[u8]) -> u32 {
+        assert_eq!(out.len(), 13, "expected exactly one RST_STREAM frame");
+        let header = frame::parse_frame_header(&out[..9]);
+        assert_eq!(header.ty, frame::TYPE_RST_STREAM);
+        u32::from_be_bytes([out[9], out[10], out[11], out[12]])
+    }
+
+    #[test]
+    fn valid_request_headers_open_a_stream() {
+        let (mut ep, opened) = server_endpoint_with_limits(HttpLimits::default());
+        let block = encode_headers(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "example.test"),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+        assert!(ep.out.is_empty(), "no error frame expected");
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(ep.server_streams.contains_key(&1));
+    }
+
+    #[test]
+    fn missing_pseudo_header_is_rejected() {
+        let (mut ep, opened) = server_endpoint_with_limits(HttpLimits::default());
+        // :path is missing.
+        let block = encode_headers(&[(":method", "GET"), (":scheme", "https")]);
+        ep.process_server_headers_block(1, &block, false);
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!ep.server_streams.contains_key(&1));
+        assert_eq!(rst_stream_error_code(&ep.out), ERROR_PROTOCOL_ERROR);
+    }
+
+    #[test]
+    fn duplicate_pseudo_header_is_rejected() {
+        let (mut ep, _) = server_endpoint_with_limits(HttpLimits::default());
+        let block = encode_headers(&[
+            (":method", "GET"),
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":path", "/"),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+        assert_eq!(rst_stream_error_code(&ep.out), ERROR_PROTOCOL_ERROR);
+    }
+
+    #[test]
+    fn pseudo_header_after_regular_header_is_rejected() {
+        let (mut ep, _) = server_endpoint_with_limits(HttpLimits::default());
+        let block = encode_headers(&[
+            (":method", "GET"),
+            ("x-early", "value"),
+            (":scheme", "https"),
+            (":path", "/"),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+        assert_eq!(rst_stream_error_code(&ep.out), ERROR_PROTOCOL_ERROR);
+    }
+
+    #[test]
+    fn connection_specific_header_is_rejected() {
+        let (mut ep, _) = server_endpoint_with_limits(HttpLimits::default());
+        let block = encode_headers(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("connection", "keep-alive"),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+        assert_eq!(rst_stream_error_code(&ep.out), ERROR_PROTOCOL_ERROR);
+    }
+
+    #[test]
+    fn te_trailers_is_accepted_other_te_values_rejected() {
+        let (mut ep, opened) = server_endpoint_with_limits(HttpLimits::default());
+        let block = encode_headers(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("te", "trailers"),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+        assert!(ep.out.is_empty());
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let (mut ep2, _) = server_endpoint_with_limits(HttpLimits::default());
+        let block2 = encode_headers(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("te", "gzip"),
+        ]);
+        ep2.process_server_headers_block(3, &block2, false);
+        assert_eq!(rst_stream_error_code(&ep2.out), ERROR_PROTOCOL_ERROR);
+    }
+
+    #[test]
+    fn extended_connect_with_protocol_is_accepted() {
+        let (mut ep, opened) = server_endpoint_with_limits(HttpLimits::default());
+        let block = encode_headers(&[
+            (":method", "CONNECT"),
+            (":protocol", "websocket"),
+            (":scheme", "https"),
+            (":path", "/chat"),
+            (":authority", "example.test"),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+        assert!(ep.out.is_empty());
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn plain_connect_requires_authority_and_forbids_scheme_path() {
+        let (mut ep, opened) = server_endpoint_with_limits(HttpLimits::default());
+        let block = encode_headers(&[(":method", "CONNECT"), (":authority", "example.test:443")]);
+        ep.process_server_headers_block(1, &block, false);
+        assert!(ep.out.is_empty());
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let (mut ep2, _) = server_endpoint_with_limits(HttpLimits::default());
+        let block2 = encode_headers(&[
+            (":method", "CONNECT"),
+            (":authority", "example.test:443"),
+            (":scheme", "https"),
+        ]);
+        ep2.process_server_headers_block(3, &block2, false);
+        assert_eq!(rst_stream_error_code(&ep2.out), ERROR_PROTOCOL_ERROR);
+    }
+
+    #[test]
+    fn too_many_header_fields_rejected_enhance_your_calm() {
+        let limits = HttpLimits {
+            max_header_count: 3,
+            ..HttpLimits::default()
+        };
+        let (mut ep, opened) = server_endpoint_with_limits(limits);
+        let block = encode_headers(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "example.test"),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(rst_stream_error_code(&ep.out), ERROR_ENHANCE_YOUR_CALM);
+    }
+
+    #[test]
+    fn oversized_header_list_rejected_enhance_your_calm() {
+        let (mut ep, opened) = server_endpoint_with_limits(HttpLimits::default());
+        let big_value = "x".repeat(9_000);
+        let block = encode_headers(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("x-big", &big_value),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(rst_stream_error_code(&ep.out), ERROR_ENHANCE_YOUR_CALM);
+    }
+}
+
+/// Minimal [`Endpoint`] stub recording sent bytes / close calls, for tests
+/// that don't need real I/O, timers, or reactor plumbing.
+#[cfg(test)]
+#[derive(Default)]
+struct RecordingEndpoint {
+    sent: Vec<u8>,
+    closed: bool,
+}
+
+#[cfg(test)]
+impl Endpoint for RecordingEndpoint {
+    fn send(&mut self, data: &[u8]) {
+        self.sent.extend_from_slice(data);
+    }
+    fn is_open(&self) -> bool {
+        !self.closed
+    }
+    fn is_closing(&self) -> bool {
+        self.closed
+    }
+    fn close(&mut self) {
+        self.closed = true;
+    }
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        unimplemented!("not exercised by these unit tests")
+    }
+    fn remote_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        unimplemented!("not exercised by these unit tests")
+    }
+    fn security_info(&self) -> &SecurityInfo {
+        unimplemented!("not exercised by these unit tests")
+    }
+    fn start_tls(&mut self) -> Result<(), hopf_core::StartTlsError> {
+        unimplemented!("not exercised by these unit tests")
+    }
+    fn pause_read(&mut self) {}
+    fn resume_read(&mut self) {}
+    fn on_write_ready(&mut self, _callback: Option<hopf_core::WriteReadyCallback>) {}
+    fn execute(&self, _task: Box<dyn FnOnce() + Send>) {
+        unimplemented!("not exercised by these unit tests")
+    }
+    fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        unimplemented!("not exercised by these unit tests")
+    }
+    fn handle(&self) -> hopf_core::ConnHandle {
+        unimplemented!("not exercised by these unit tests")
+    }
+}
+
+#[cfg(test)]
+mod graceful_shutdown_tests {
+    use super::*;
+    use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
+
+    struct NoopServerFactory;
+    impl ServerHandlerFactory for NoopServerFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+
+    fn server_endpoint() -> H2Endpoint {
+        H2Endpoint::server(Arc::new(NoopServerFactory), HttpLimits::default(), false)
+    }
+
+    /// With no in-flight streams, `shutdown_gracefully` sends both GOAWAY
+    /// phases back-to-back (the "stop opening streams" signal, then
+    /// immediately the final one) and closes.
+    #[test]
+    fn shutdown_with_no_streams_closes_immediately() {
+        let mut ep = server_endpoint();
+        let mut endpoint = RecordingEndpoint::default();
+        ep.shutdown_gracefully(&mut endpoint);
+
+        assert!(endpoint.closed);
+        assert_eq!(endpoint.sent.len(), 34, "expected two back-to-back GOAWAY frames");
+        let first = frame::parse_frame_header(&endpoint.sent[..9]);
+        assert_eq!(first.ty, frame::TYPE_GOAWAY);
+        let first_last_stream_id =
+            u32::from_be_bytes([endpoint.sent[9], endpoint.sent[10], endpoint.sent[11], endpoint.sent[12]]);
+        assert_eq!(first_last_stream_id, u32::MAX >> 1);
+
+        let second = frame::parse_frame_header(&endpoint.sent[17..26]);
+        assert_eq!(second.ty, frame::TYPE_GOAWAY);
+        let second_last_stream_id = u32::from_be_bytes([
+            endpoint.sent[26],
+            endpoint.sent[27],
+            endpoint.sent[28],
+            endpoint.sent[29],
+        ]);
+        assert_eq!(second_last_stream_id, 0, "no streams were ever opened");
+        assert_eq!(ep.state, ConnState::GoAway);
+    }
+
+    /// With a stream still open, the first call sends only the "stop
+    /// opening streams" GOAWAY(2^31-1) and does not close; new streams are
+    /// refused with RST_STREAM(REFUSED_STREAM) in the meantime.
+    #[test]
+    fn shutdown_with_open_stream_defers_close_and_refuses_new_streams() {
+        let mut ep = server_endpoint();
+        ep.server_streams.insert(
+            1,
+            H2ServerStream {
+                id: 1,
+                handler: Box::new(NoopHandler),
+                writer: H2StreamWriter::new(1),
+                half_closed_remote: true,
+                paused_body: Vec::new(),
+                paused_end_stream: false,
+                upgraded: None,
+            },
+        );
+
+        let mut endpoint = RecordingEndpoint::default();
+        ep.shutdown_gracefully(&mut endpoint);
+
+        assert!(!endpoint.closed, "must wait for the open stream to drain");
+        assert_eq!(endpoint.sent.len(), 17, "expected exactly one GOAWAY frame");
+        let last_stream_id =
+            u32::from_be_bytes([endpoint.sent[9], endpoint.sent[10], endpoint.sent[11], endpoint.sent[12]]);
+        assert_eq!(last_stream_id, u32::MAX >> 1);
+        assert_ne!(ep.state, ConnState::GoAway);
+
+        // A racing new stream is refused while draining.
+        ep.process_server_headers_block(3, &[], false);
+        assert!(!ep.server_streams.contains_key(&3));
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_RST_STREAM);
+    }
+
+    struct NoopHandler;
+    impl ServerHandler for NoopHandler {
+        fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+        fn request_complete(&mut self, _response: &mut dyn ServerWriter) {}
+    }
+}
+
+#[cfg(test)]
+mod client_goaway_tests {
+    use super::*;
+    use crate::stream::{ClientHandler, ClientHandlerFactory, ClientWriter};
+
+    struct NoopClientFactory;
+    impl ClientHandlerFactory for NoopClientFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+
+    fn client_endpoint() -> H2Endpoint {
+        H2Endpoint::client(Arc::new(NoopClientFactory), HttpLimits::default(), false)
+    }
+
+    struct FailTrackingHandler {
+        failed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ClientHandler for FailTrackingHandler {
+        fn start(&mut self, _request: &mut dyn ClientWriter) {}
+        fn response_headers(&mut self, _request: &mut dyn ClientWriter, _headers: &Headers) {}
+        fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
+            panic!("response_complete must not fire for a GOAWAY'd stream");
+        }
+        fn request_failed(&mut self, _request: &mut dyn ClientWriter, _err: &std::io::Error) {
+            self.failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn goaway_payload(last_stream_id: u32, error_code: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        frame::write_goaway(&mut out, last_stream_id, error_code);
+        out[9..].to_vec()
+    }
+
+    fn insert_client_stream(ep: &mut H2Endpoint, id: u32, failed: &Arc<std::sync::atomic::AtomicUsize>) {
+        ep.client_streams.insert(
+            id,
+            H2ClientStream {
+                id,
+                handler: Box::new(FailTrackingHandler {
+                    failed: Arc::clone(failed),
+                }),
+                response_headers_received: false,
+                response_body_started: false,
+                pending_body: Vec::new(),
+                pending_end_stream: false,
+            },
+        );
+        ep.flow.open_stream(id, crate::h2::flow::INITIAL_WINDOW_SIZE);
+    }
+
+    /// Streams above the peer's announced last-stream-id are failed with
+    /// `request_failed`, not silently left to hang.
+    #[test]
+    fn goaway_fails_streams_above_last_stream_id() {
+        let mut ep = client_endpoint();
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        insert_client_stream(&mut ep, 1, &failed);
+        insert_client_stream(&mut ep, 3, &failed);
+        insert_client_stream(&mut ep, 5, &failed);
+
+        ep.on_goaway(&goaway_payload(3, ERROR_NO_ERROR));
+
+        assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 1, "only stream 5 is above last_stream_id=3");
+        assert!(ep.client_streams.contains_key(&1));
+        assert!(ep.client_streams.contains_key(&3));
+        assert!(!ep.client_streams.contains_key(&5));
+        assert_eq!(ep.state, ConnState::GoAway);
+    }
+
+    /// `last_stream_id = 0` (e.g. the peer never processed anything) fails
+    /// every in-flight stream.
+    #[test]
+    fn goaway_with_zero_last_stream_id_fails_everything() {
+        let mut ep = client_endpoint();
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        insert_client_stream(&mut ep, 1, &failed);
+        insert_client_stream(&mut ep, 3, &failed);
+
+        ep.on_goaway(&goaway_payload(0, ERROR_PROTOCOL_ERROR));
+
+        assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(ep.client_streams.is_empty());
     }
 }
