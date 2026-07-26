@@ -120,6 +120,9 @@ impl H3Writer {
             if !headers.contains(":status") {
                 headers.status(200);
             }
+            if !headers.contains("date") {
+                headers.set("Date", crate::utils::http_date_now());
+            }
             let block = qpack::encode(headers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
             frame::write_headers(&mut out, &block);
             self.control.shared.lock().unwrap().headers_sent = true;
@@ -446,6 +449,7 @@ mod smoke {
         status: u16,
         body: Vec<u8>,
         done: bool,
+        date: Option<String>,
     }
 
     struct GetOnce {
@@ -462,7 +466,9 @@ mod smoke {
             request.complete_request();
         }
         fn response_headers(&mut self, _: &mut dyn ClientWriter, headers: &Headers) {
-            self.out.lock().unwrap().status = headers.status_code();
+            let mut out = self.out.lock().unwrap();
+            out.status = headers.status_code();
+            out.date = headers.get("date").map(str::to_string);
         }
         fn response_body_content(&mut self, _: &mut dyn ClientWriter, data: &[u8]) {
             self.out.lock().unwrap().body.extend_from_slice(data);
@@ -532,6 +538,11 @@ mod smoke {
         assert!(g.done, "client never completed");
         assert_eq!(g.status, 200);
         assert_eq!(g.body.as_slice(), b"Hello, world\n");
+        assert!(
+            g.date.as_deref().is_some_and(|d| d.ends_with(" GMT")),
+            "response missing Date header: {:?}",
+            g.date
+        );
         server.shutdown();
     }
 }

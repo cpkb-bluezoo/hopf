@@ -144,8 +144,8 @@
 <tbody>
 <tr><td>field-line = field-name ":" OWS field-value OWS</td><td>§5.1</td><td>Compliant</td><td><code>server_codec.rs:423-502,552-558</code></td></tr>
 <tr><td>obs-fold continuation handling</td><td>§5.2</td><td>Compliant</td><td><code>h1/scan.rs:161-167</code>, folded with a single SP (<code>server_codec.rs:447-456</code>)</td></tr>
-<tr><td>Header field-name character validation</td><td>§5.1 / RFC 9110 §5.6.2</td><td>Partial</td><td><code>is_valid_header_name()</code> (<code>utils.rs:57-73</code>) only allows alphanumeric/<code>-</code>/<code>_</code> — narrower than the full RFC <code>tchar</code> set (rejects e.g. <code>!#$%&amp;'*+.^`|~</code> in names)</td></tr>
-<tr><td>Header field-value CTL/obs-text validation</td><td>§5.5</td><td>Not implemented</td><td>Value bytes copied verbatim with no CTL filtering (<code>server_codec.rs:475-479</code>) — only the method token is CTL-checked</td></tr>
+<tr><td>Header field-name character validation</td><td>§5.1 / RFC 9110 §5.6.2</td><td>Compliant</td><td><code>is_valid_header_name()</code> (<code>utils.rs:57-73</code>) accepts the full RFC <code>tchar</code> set, shared with the method-token check (<code>is_token()</code>/<code>is_tchar()</code>, <code>utils.rs:5-17</code>)</td></tr>
+<tr><td>Header field-value CTL/obs-text validation</td><td>§5.5</td><td>Compliant</td><td><code>is_valid_header_value()</code> (<code>utils.rs:79-84</code>) rejects CTL bytes other than HTAB, called from <code>header_value()</code> (<code>server_codec.rs:516-529</code>) before a value is accepted — including trailers</td></tr>
 <tr><td>431 Request Header Fields Too Large</td><td>§5</td><td>Compliant</td><td><code>server_codec.rs:429-435</code> (count), <code>token_too_long()</code> (line length)</td></tr>
 <tr><td>Host header required exactly once (HTTP/1.1)</td><td>§3.2</td><td>Compliant</td><td><code>end_headers()</code>, <code>server_codec.rs:563-582</code>, 400 if count != 1</td></tr>
 <tr><td>Case-insensitive header lookup</td><td>§5.1</td><td>Compliant</td><td><code>Headers::get()</code>, <code>headers.rs:74-79</code></td></tr>
@@ -157,7 +157,7 @@
 <tbody>
 <tr><td>Transfer-Encoding overrides Content-Length</td><td>§6.3</td><td>Compliant</td><td><code>end_headers()</code>, <code>server_codec.rs:593-612</code></td></tr>
 <tr><td>Reject invalid/multi-coding Transfer-Encoding</td><td>§6.3</td><td>Compliant</td><td>Only exact single <code>chunked</code> token accepted (<code>utils.rs:36-54</code>), else 400</td></tr>
-<tr><td><strong>Multiple/conflicting Content-Length header fields → error</strong></td><td>§6.3</td><td><strong>Not implemented</strong></td><td><code>Headers::get()</code> returns only the first occurrence; <code>end_headers()</code> never checks for a second, differing value (<code>server_codec.rs:604-612</code>) — a concrete request-smuggling-adjacent gap, RFC 9112 mandates 400 + close here</td></tr>
+<tr><td>Multiple/conflicting Content-Length header fields → error</td><td>§6.3</td><td>Compliant</td><td><code>end_headers()</code> collects every <code>content-length</code> occurrence and requires them to parse to the same decimal value — a single differing value is 400 (<code>server_codec.rs:344-367</code>); identical duplicates (the RFC-permitted case) still work</td></tr>
 <tr><td>Chunked encoding (chunk-size/data/final chunk)</td><td>§7.1</td><td>Compliant</td><td><code>server_codec.rs:504-550,735-765</code></td></tr>
 <tr><td>Chunk extensions parsed/ignored; quoted chunk-ext rejected</td><td>§7.1.1</td><td>Compliant</td><td><code>server_codec.rs:513-519</code></td></tr>
 <tr><td>Chunk-size / aggregate body limits enforced</td><td>§7.1</td><td>Compliant</td><td><code>HttpLimits::max_chunk_size</code>/<code>max_request_body</code>, <code>server_codec.rs:524-533</code></td></tr>
@@ -180,7 +180,7 @@
 <tr><td>h2c cleartext Upgrade</td><td>RFC 9113 §3.2 legacy</td><td>Compliant</td><td>Handled in <code>CleartextHttpEndpoint</code>, see HTTP/2 table</td></tr>
 <tr><td>1xx informational responses (server send)</td><td>§15.2</td><td>Compliant</td><td><code>h1/response.rs:301-317</code></td></tr>
 <tr><td>Status codes / reason phrases</td><td>§15</td><td>Partial</td><td><code>reason_phrase()</code> covers ~30 codes, falls back to "Unknown" for the rest (<code>status.rs:6-40</code>) — advisory-only text, functionally harmless</td></tr>
-<tr><td><code>Date</code> response header</td><td>§6.6.1</td><td>Not implemented</td><td>No code anywhere in the crate sets one</td></tr>
+<tr><td><code>Date</code> response header</td><td>§6.6.1</td><td>Compliant</td><td><code>http_date_now()</code> (IMF-fixdate, GMT — <code>utils.rs:121-127</code>) is set when absent at every response-flush point: H1 <code>flush_response_headers()</code> (<code>h1/response.rs:277</code>), H2 <code>flush_one_server_stream()</code> (<code>h2/endpoint.rs:1111-1113</code>), H3 <code>H3Writer::flush()</code> (<code>h3/endpoint.rs:123-125</code>)</td></tr>
 <tr><td><code>Server</code> response header</td><td>§10.2.4</td><td>Compliant</td><td>Defaults to <code>hopf</code> (<code>h1/response.rs:272-273</code>)</td></tr>
 <tr><td>Auto-chunk response when length unknown (1.1)</td><td>§8.6</td><td>Compliant</td><td><code>h1/response.rs:275-285</code></td></tr>
 </tbody>
@@ -193,9 +193,9 @@
 <tr><td>Chunked request body encoding</td><td>§7.1</td><td>Compliant</td><td><code>client_codec.rs:558-590</code></td></tr>
 <tr><td>Status-line / header parsing, obs-fold</td><td>§4-5</td><td>Compliant</td><td><code>client_codec.rs:255-340</code></td></tr>
 <tr><td>Content-Length / read-until-close body framing</td><td>§6.3</td><td>Compliant</td><td><code>client_codec.rs:410-413,462-470</code></td></tr>
-<tr><td><strong>Multiple/conflicting Content-Length in response</strong></td><td>§6.3</td><td><strong>Not implemented</strong></td><td>Same first-match limitation as the server side</td></tr>
+<tr><td>Multiple/conflicting Content-Length in response</td><td>§6.3</td><td>Compliant</td><td>Same duplicate-field handling as the server side (<code>client_codec.rs:260-277</code>)</td></tr>
 <tr><td>Chunked response body + trailers</td><td>§7.1-7.1.2</td><td>Partial</td><td>Chunk decode fully implemented; trailers consumed but discarded — no <code>response_trailers</code> callback fires for H1 at all (only H2/H3)</td></tr>
-<tr><td><strong>1xx informational responses handled correctly</strong></td><td>§15.2</td><td><strong>Not implemented (bug)</strong></td><td><code>end_response_headers()</code> (<code>client_codec.rs:382-389</code>) treats any 1xx status exactly like 204/304 — delivers it as the terminal response via <code>finish_response()</code> instead of discarding it and continuing to read the real final status line. A server sending <code>100 Continue</code> or <code>103 Early Hints</code> before the real response will confuse this client.</td></tr>
+<tr><td>1xx informational responses handled correctly</td><td>§15.2</td><td>Compliant</td><td><code>end_response_headers()</code> (<code>client_codec.rs:234-247</code>) discards a 1xx after surfacing it via the new <code>ClientHandler::informational_response</code> callback (<code>stream/client.rs</code>, default no-op) and returns <code>Next::FirstLine</code> to keep reading the same connection for the real final status line; exercised split across separate <code>receive()</code> calls too</td></tr>
 <tr><td>204/304/HEAD → no body</td><td>§15.3.5,§15.4.5,§9.3.2</td><td>Compliant</td><td><code>client_codec.rs:383-389</code></td></tr>
 <tr><td><code>Connection: close</code> handling, persistent by default</td><td>§9.3,§9.6</td><td>Compliant</td><td><code>client_codec.rs:118-121,353-360</code></td></tr>
 <tr><td>Automatic redirect following</td><td>§15.4 (client-optional)</td><td>N/A</td><td>No redirect logic anywhere — deliberate low-level Stream API design, caller decides from <code>:status</code>/Location</td></tr>
