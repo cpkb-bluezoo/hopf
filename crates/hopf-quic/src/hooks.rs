@@ -18,6 +18,16 @@ pub trait QuicConnection: Send {
 
     /// A peer-opened unidirectional stream — return its [`ProtocolHandler`].
     fn accept_uni(&mut self) -> Box<dyn ProtocolHandler>;
+
+    /// Called once for every still-live connection right before a local,
+    /// explicit [`crate::QuicDriverHandle::shutdown`] tears the driver
+    /// down — a last chance to write a final message on an already-open
+    /// stream (e.g. HTTP/3's GOAWAY, RFC 9114 §5.2) via `api`. Not called
+    /// for a connection lost to the peer or the network, since there is
+    /// nothing useful to send at that point. Default: do nothing.
+    fn disconnecting(&mut self, api: &mut dyn QuicConnApi) {
+        let _ = api;
+    }
 }
 
 /// API available during [`QuicConnection::connected`] on the driver thread.

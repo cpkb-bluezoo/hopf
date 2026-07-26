@@ -16,7 +16,7 @@ use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
 use quinn_proto::{
     Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint as QuinnEndpoint, EndpointConfig,
-    Event, StreamEvent, StreamId, Transmit,
+    Event, StreamEvent, StreamId, Transmit, VarInt,
 };
 use hopf_core::{Endpoint, HandlerFactory, ProtocolHandler};
 
@@ -31,6 +31,10 @@ pub(crate) enum DriverCmd {
     StreamWritable { stream_id: StreamId },
     StreamReadable { stream_id: StreamId },
     StreamClose { stream_id: StreamId },
+    /// Abruptly close the whole connection with an application error code
+    /// (RFC 9000 §10.2 CONNECTION_CLOSE), e.g. an HTTP/3 connection-level
+    /// protocol error.
+    ConnectionClose { conn: ConnectionHandle, error_code: u64 },
     ScheduleTimer {
         delay: Duration,
         callback: Box<dyn FnOnce() + Send>,
@@ -402,6 +406,7 @@ impl Driver {
         while let Ok(cmd) = self.cmd_rx.try_recv() {
             match cmd {
                 DriverCmd::Shutdown => {
+                    self.notify_disconnecting();
                     self.active.store(false, Ordering::Release);
                 }
                 DriverCmd::Task(task) => task(),
@@ -421,6 +426,13 @@ impl Driver {
                 | DriverCmd::StreamClose { stream_id } => {
                     let _ = stream_id;
                     // Handled in poll_connections via queue state.
+                }
+                DriverCmd::ConnectionClose { conn, error_code } => {
+                    if let Some(slot) = self.connections.get_mut(&conn) {
+                        if let Ok(code) = VarInt::from_u64(error_code) {
+                            slot.conn.close(Instant::now(), code, Bytes::new());
+                        }
+                    }
                 }
             }
         }
@@ -640,6 +652,7 @@ impl Driver {
                     let queues = Arc::new(Mutex::new(StreamQueues::new()));
                     let mut endpoint = QuicStreamEndpoint::new(
                         id,
+                        ch,
                         local,
                         remote,
                         Arc::clone(&queues),
@@ -687,6 +700,31 @@ impl Driver {
         }
     }
 
+    /// Give every still-live connection's app a last chance to write a
+    /// final message (e.g. GOAWAY) before an explicit driver shutdown.
+    /// Bytes queued here are flushed normally by the same loop iteration's
+    /// subsequent `poll_connections` + `flush_all_transmits` before the
+    /// driver thread actually stops (see [`Self::run`]).
+    fn notify_disconnecting(&mut self) {
+        let handles: Vec<ConnectionHandle> = self
+            .connections
+            .iter()
+            .filter(|(_, s)| s.app.is_some())
+            .map(|(ch, _)| *ch)
+            .collect();
+        for ch in handles {
+            let Some(mut app) = self.connections.get_mut(&ch).and_then(|s| s.app.take()) else {
+                continue;
+            };
+            let mut recorder = ConnRecorder::default();
+            app.disconnecting(&mut recorder);
+            self.apply_recorder(ch, &mut *app, recorder);
+            if let Some(slot) = self.connections.get_mut(&ch) {
+                slot.app = Some(app);
+            }
+        }
+    }
+
     fn on_stream_event(&mut self, ch: ConnectionHandle, ev: StreamEvent) {
         match ev {
             StreamEvent::Opened { dir } => {
@@ -718,6 +756,7 @@ impl Driver {
         let queues = Arc::new(Mutex::new(StreamQueues::new()));
         let mut endpoint = QuicStreamEndpoint::new(
             id,
+            ch,
             local,
             remote,
             Arc::clone(&queues),
@@ -817,6 +856,24 @@ impl Driver {
             .unwrap_or_default();
 
         for id in ids {
+            // Abrupt abort requested (RESET_STREAM + STOP_SENDING) takes
+            // priority over any pending graceful write/finish for this
+            // stream — the peer should see the reset, not more data.
+            let reset_code = self
+                .connections
+                .get(&ch)
+                .and_then(|s| s.streams.get(&id))
+                .and_then(|st| st.queues.lock().unwrap().reset_error_code.take());
+            if let Some(code) = reset_code {
+                if let Ok(vc) = VarInt::from_u64(code) {
+                    if let Some(slot) = self.connections.get_mut(&ch) {
+                        let _ = slot.conn.send_stream(id).reset(vc);
+                        let _ = slot.conn.recv_stream(id).stop(vc);
+                    }
+                }
+                continue;
+            }
+
             // Write pending bytes.
             let pending = self
                 .connections
