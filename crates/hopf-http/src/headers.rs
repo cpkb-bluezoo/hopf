@@ -50,6 +50,22 @@ impl Headers {
         self.fields.push(Header::new(name, value));
     }
 
+    /// Insert a pseudo-header field, keeping all pseudo-headers before any
+    /// regular fields (RFC 9113 §8.3.1 / RFC 9114 §4.3.1 require
+    /// pseudo-header fields to precede regular ones). Use this instead of
+    /// [`add`](Self::add) when appending a pseudo-header (name starting
+    /// with `:`) to a set that may already contain regular fields — e.g.
+    /// auto-filling `:scheme`/`:authority` after the caller already set a
+    /// regular `host` header.
+    pub fn add_pseudo(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        let pos = self
+            .fields
+            .iter()
+            .position(|h| !h.name.starts_with(':'))
+            .unwrap_or(self.fields.len());
+        self.fields.insert(pos, Header::new(name, value));
+    }
+
     /// Set `:status` pseudo-header (response).
     pub fn status(&mut self, code: u16) {
         self.set(":status", code.to_string());
@@ -160,6 +176,28 @@ mod tests {
         assert_eq!(h.authority(), Some("ex.test"));
         assert_eq!(h.status_code(), 201);
         assert!(h.to_string().contains("201"));
+    }
+
+    #[test]
+    fn add_pseudo_stays_before_regular_fields() {
+        let mut h = Headers::new();
+        h.set(":method", "GET");
+        h.set(":path", "/");
+        h.set("host", "example.test"); // a regular field added first
+        h.add_pseudo(":scheme", "https");
+        h.add_pseudo(":authority", "example.test");
+
+        let names: Vec<&str> = h.iter().map(|hd| hd.name.as_str()).collect();
+        assert_eq!(names, [":method", ":path", ":scheme", ":authority", "host"]);
+    }
+
+    #[test]
+    fn add_pseudo_on_all_pseudo_set_appends_at_end() {
+        let mut h = Headers::new();
+        h.set(":method", "GET");
+        h.add_pseudo(":path", "/");
+        let names: Vec<&str> = h.iter().map(|hd| hd.name.as_str()).collect();
+        assert_eq!(names, [":method", ":path"]);
     }
 }
 
