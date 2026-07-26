@@ -73,6 +73,7 @@
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
+<li><a href="#method">Method</a></li>
 <li><a href="#timer-heap">Timer cancellation doesn't reclaim heap space</a></li>
 <li><a href="#storage-alloc">One unnecessary allocation per storage submission</a></li>
 <li><a href="#drain">Buffer compaction cost after partial consumption</a></li>
@@ -80,6 +81,9 @@
 <li><a href="#good">What's actually right</a></li>
 <li><a href="#summary">Summary table</a></li>
 </ul></div>
+
+<h2 id="method">Method</h2>
+<p>Sourced from <code>crates/hopf-core/src/{byte_stream_lexer,timer,storage,connection,reactor,bufpool}.rs</code>, file:line cited throughout. This identifies <em>mechanisms</em> that cost more than they need to, with the actual code path that causes it — it is not a profiling result, and no number here ("O(n²)", "one extra allocation") was measured with a benchmark; each is a direct reading of what the code does per call.</p>
 
 <h2 id="timer-heap">Timer cancellation doesn't reclaim heap space</h2>
 <p><code>TimerQueue</code> (<code>crates/hopf-core/src/timer.rs</code>) is a correct <code>BinaryHeap</code> — O(log n) schedule, and per-reactor with no lock (good, see <a href="scalability.html#cross-thread">Scalability</a>). But cancellation is lazy: <code>schedule_with_cancel</code> pushes an entry with a shared <code>cancelled: Arc&lt;AtomicBool&gt;</code> (<code>timer.rs:70-83</code>), and cancelling just flips that flag — nothing removes the entry from the heap. <code>purge_cancelled</code> (<code>timer.rs:113-121</code>) and the skip-check in <code>fire_due</code> (<code>timer.rs:99-111</code>) only ever look at the <strong>top</strong> of the heap; a cancelled entry buried anywhere else stays allocated — including its captured <code>Box&lt;dyn FnOnce()&gt;</code> closure state — until it naturally bubbles to the top, which happens only when everything scheduled before its original deadline has fired or been popped.</p>
