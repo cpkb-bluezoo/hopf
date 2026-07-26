@@ -429,6 +429,75 @@ mod tests {
         rt.shutdown();
     }
 
+    /// Effective capacity is `threads + queue_capacity`, not `queue_capacity`
+    /// alone — a job a worker has already dequeued no longer occupies a
+    /// buffered slot, so `threads` more can be running concurrently on top
+    /// of the queue. This pins that exact boundary down: with `threads: 1,
+    /// queue_capacity: 3`, exactly 4 submissions are admitted (1 running +
+    /// 3 queued) before the 5th is rejected.
+    #[test]
+    fn storage_capacity_is_threads_plus_queue_capacity() {
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 1,
+            storage: StorageConfig {
+                threads: 1,
+                queue_capacity: 3,
+            },
+        })
+        .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (addr, _) = rt
+            .add_tcp_listener(TcpListenerConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                move || {
+                    Box::new(GiveHandle {
+                        tx: Mutex::new(Some(tx.clone())),
+                    }) as Box<dyn ProtocolHandler>
+                },
+            ))
+            .unwrap();
+
+        let _c = wait_connect(addr);
+        let handle = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Occupy the single worker so nothing dequeues further submissions.
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let gate2 = Arc::clone(&gate);
+        rt.storage().submit_on(
+            handle.clone(),
+            move || {
+                gate2.wait();
+                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+            },
+            |_| {},
+        );
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Three more fit in the queue (threads=1 running + queue_capacity=3
+        // queued == capacity 4 total already admitted).
+        for _ in 0..3 {
+            rt.storage().submit_on(handle.clone(), || Ok(()), |_| {});
+        }
+        assert_eq!(rt.storage().pending_count(), 4);
+
+        // A 5th is over capacity and must be rejected immediately.
+        let rejected = Arc::new(AtomicBool::new(false));
+        let rejected2 = Arc::clone(&rejected);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        rt.storage().submit_on(handle, || Ok(()), move |r| {
+            if matches!(r, Err(StorageError::Rejected)) {
+                rejected2.store(true, Ordering::SeqCst);
+            }
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(rejected.load(Ordering::SeqCst), "expected 5th submission rejected");
+
+        gate.wait();
+        rt.shutdown();
+    }
+
     #[test]
     fn dial_echo_peer_of_listen() {
         use crate::TcpConnectorConfig;

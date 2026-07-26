@@ -4,8 +4,9 @@
 
 use std::error::Error as StdError;
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -64,10 +65,13 @@ type Job = Box<dyn FnOnce() + Send>;
 
 /// Shared, bounded thread pool for blocking work that must not run on a reactor.
 pub struct StorageExecutor {
-    tx: SyncSender<Job>,
+    tx: Sender<Job>,
     joins: Vec<JoinHandle<()>>,
-    /// Approximate queued + running jobs (for diagnostics / tests).
+    /// Approximate queued + running jobs (for diagnostics / tests) — also
+    /// the admission gate `submit_on` reserves a slot against, in place of
+    /// relying on a bounded channel's own capacity.
     pending: Arc<AtomicUsize>,
+    capacity: usize,
 }
 
 impl StorageExecutor {
@@ -78,7 +82,7 @@ impl StorageExecutor {
             config.queue_capacity >= 1,
             "queue_capacity must be at least 1"
         );
-        let (tx, rx) = mpsc::sync_channel::<Job>(config.queue_capacity);
+        let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(std::sync::Mutex::new(rx));
         let pending = Arc::new(AtomicUsize::new(0));
         let mut joins = Vec::with_capacity(config.threads);
@@ -90,7 +94,17 @@ impl StorageExecutor {
                 .expect("spawn storage worker");
             joins.push(join);
         }
-        Self { tx, joins, pending }
+        Self {
+            tx,
+            joins,
+            pending,
+            // `pending` counts queued *and* running jobs together, so the
+            // gate must allow for `threads` running concurrently on top of
+            // `queue_capacity` buffered — matching the old bounded-channel
+            // behavior, where a job already dequeued by a worker no longer
+            // counted against the channel's own buffer capacity.
+            capacity: config.threads + config.queue_capacity,
+        }
     }
 
     /// Run `op` on a storage thread; deliver `callback` on `endpoint`'s reactor.
@@ -114,40 +128,50 @@ impl StorageExecutor {
         Op: FnOnce() -> Result<T, Box<dyn StdError + Send + Sync>> + Send + 'static,
         Cb: FnOnce(Result<T, StorageError>) + Send + 'static,
     {
+        // Reserve a slot against capacity before `callback` is moved
+        // anywhere. Deciding accept/reject up front like this — rather than
+        // building the job first and finding out whether it fit — means
+        // exactly one of "the job runs" or "it's rejected" ever needs
+        // `callback`, so it can move by value into whichever one actually
+        // happens instead of living behind an Arc<Mutex<Option<_>>> shared
+        // between both.
+        let mut cur = self.pending.load(Ordering::Relaxed);
+        loop {
+            if cur >= self.capacity {
+                handle.execute(Box::new(move || callback(Err(StorageError::Rejected))));
+                return;
+            }
+            match self.pending.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+
         let pending = Arc::clone(&self.pending);
-        let callback = Arc::new(std::sync::Mutex::new(Some(callback)));
         let handle_for_job = handle.clone();
-        let callback_for_job = Arc::clone(&callback);
         let job: Job = Box::new(move || {
             let result = match op() {
                 Ok(v) => Ok(v),
                 Err(e) => Err(StorageError::Task(e)),
             };
-            let cb = callback_for_job
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            if let Some(cb) = cb {
-                handle_for_job.execute(Box::new(move || cb(result)));
-            }
+            handle_for_job.execute(Box::new(move || callback(result)));
             pending.fetch_sub(1, Ordering::Relaxed);
         });
 
-        match self.tx.try_send(job) {
-            Ok(()) => {
-                self.pending.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                let cb = callback
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take();
-                if let Some(cb) = cb {
-                    handle.execute(Box::new(move || {
-                        cb(Err(StorageError::Rejected));
-                    }));
-                }
-            }
+        if self.tx.send(job).is_err() {
+            // Every worker thread has exited — unreachable in practice:
+            // `storage_worker` catches job panics, so the only way the
+            // shared receiver ever drops is total pool death, and
+            // `shutdown` takes `self` by value, so no `submit_on` call can
+            // be in flight while it runs. `callback` is trapped inside the
+            // unsent `job` at this point (running it would also run `op`),
+            // so it's simply never invoked; just release the slot.
+            self.pending.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -174,6 +198,10 @@ fn storage_worker(rx: Arc<std::sync::Mutex<Receiver<Job>>>) {
                 Err(RecvError) => break,
             }
         };
-        job();
+        // A panicking `op` or callback must not shrink the pool by one
+        // thread — `submit_on`'s admission gate assumes the pool stays at
+        // its configured size for the assumption that `tx.send` can't fail
+        // while any worker is still alive to hold `rx`.
+        let _ = catch_unwind(AssertUnwindSafe(job));
     }
 }
