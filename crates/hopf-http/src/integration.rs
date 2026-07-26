@@ -15,10 +15,13 @@ use std::time::{Duration, Instant};
 
 use hopf_core::{Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
 
-use crate::client::{connect_http, HttpClientTimeouts};
+use crate::client::{connect_http, connect_http2_upgrade, HttpClientTimeouts};
 use crate::h2::frame;
 use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
-use crate::{ClientHandler, ClientHandlerFactory, ClientWriter, H2Endpoint, Headers, HttpLimits};
+use crate::{
+    CleartextHttpEndpoint, ClientHandler, ClientHandlerFactory, ClientWriter, H2Endpoint, Headers,
+    HttpLimits,
+};
 
 // ---------------------------------------------------------------------------
 // Minimal in-process HTTP/1.1 server
@@ -59,6 +62,41 @@ fn start_server(rt: &Arc<Runtime>) -> SocketAddr {
                 Box::new(FixedHttpServer { buf: Vec::new() }) as Box<dyn ProtocolHandler>
             },
         ))
+        .unwrap();
+    addr
+}
+
+// ---------------------------------------------------------------------------
+// h2c-Upgrade-capable server (real hopf server stack, not the raw responder
+// above) — needed to prove genuine interop for the client-side h2c dial.
+// ---------------------------------------------------------------------------
+
+struct FixedServerHandler;
+impl ServerHandler for FixedServerHandler {
+    fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+    fn request_complete(&mut self, response: &mut dyn ServerWriter) {
+        let mut h = Headers::new();
+        h.set(":status", "200");
+        response.headers(h);
+        response.response_body_content(b"hello-h2c-client");
+        response.end_response_body();
+        response.complete();
+    }
+}
+struct FixedServerFactory;
+impl ServerHandlerFactory for FixedServerFactory {
+    fn create_handler(&self) -> Box<dyn ServerHandler> {
+        Box::new(FixedServerHandler)
+    }
+}
+
+fn start_h2c_capable_server(rt: &Arc<Runtime>) -> SocketAddr {
+    let factory: Arc<dyn ServerHandlerFactory> = Arc::new(FixedServerFactory);
+    let (addr, _) = rt
+        .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+            Box::new(CleartextHttpEndpoint::new(Arc::clone(&factory), HttpLimits::default()))
+                as Box<dyn ProtocolHandler>
+        }))
         .unwrap();
     addr
 }
@@ -297,4 +335,35 @@ fn h2_settings_ack_in_time_cancels_timeout() {
         matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
         "expected no further data (still-open connection), got: {err:?}"
     );
+}
+
+/// End-to-end h2c Upgrade dial (RFC 7540 §3.2) against hopf's own
+/// [`CleartextHttpEndpoint`] server — proves the client-side Upgrade
+/// request, the server's `101` response, and the promoted real H2 exchange
+/// all interoperate over a real socket, not just unit-level plumbing.
+#[test]
+fn h2c_upgrade_round_trip_over_real_socket() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let addr = start_h2c_capable_server(&rt);
+
+    let out = Arc::new(Mutex::new(Outcome::default()));
+    let factory: Arc<dyn ClientHandlerFactory> = Arc::new(GetFactory {
+        out: Arc::clone(&out),
+    });
+
+    connect_http2_upgrade(
+        &rt,
+        &addr.ip().to_string(),
+        addr.port(),
+        factory,
+        HttpLimits::default(),
+        HttpClientTimeouts::default(),
+        None,
+    )
+    .unwrap();
+
+    assert!(wait_done(&out, Duration::from_secs(5)), "request timed out");
+    let g = out.lock().unwrap();
+    assert_eq!(g.status, 200);
+    assert_eq!(g.body, b"hello-h2c-client");
 }

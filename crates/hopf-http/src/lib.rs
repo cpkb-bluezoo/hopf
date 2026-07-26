@@ -34,7 +34,7 @@ pub use auth::{
     build_digest_authorization, parse_basic_authorization, BasicAuthConfig, BasicAuthFactory,
     BearerAuthFactory, DigestAuthConfig, DigestAuthFactory,
 };
-pub use client::{connect_http, HttpClientTimeouts};
+pub use client::{connect_http, connect_http2_upgrade, HttpClientTimeouts};
 #[cfg(feature = "h3")]
 pub use client::connect_h3_by_name;
 pub use dispatch::AlpnHttpEndpoint;
@@ -46,6 +46,7 @@ pub use h1::{
 };
 pub use h2::CleartextHttpEndpoint;
 pub use h2::H2Endpoint;
+pub use h2::H2cUpgradeClientEndpoint;
 #[cfg(feature = "h3")]
 pub use h3::{connect_h3, listen_h3, H3ClientConnection, H3ServerConnection};
 pub use headers::{Header, Headers};

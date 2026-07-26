@@ -26,6 +26,14 @@ pub trait ClientHandler: Send {
     /// Default: ignore.
     fn informational_response(&mut self, _request: &mut dyn ClientWriter, _headers: &Headers) {}
 
+    /// `101 Switching Protocols` arrived (e.g. h2c Upgrade, RFC 7540 §3.2).
+    /// Unlike other 1xx statuses this ends HTTP/1.1 framing on the
+    /// connection — bytes after this point belong to the new protocol, not
+    /// another HTTP response. Neither [`Self::response_headers`] nor
+    /// [`Self::response_complete`] fires afterward for this request.
+    /// Default: ignore.
+    fn switching_protocols(&mut self, _request: &mut dyn ClientWriter, _headers: &Headers) {}
+
     /// Response headers are complete (including `:status`).
     fn response_headers(&mut self, request: &mut dyn ClientWriter, headers: &Headers);
 
@@ -79,6 +87,10 @@ impl ClientHandler for Box<dyn ClientHandler> {
 
     fn informational_response(&mut self, request: &mut dyn ClientWriter, headers: &Headers) {
         (**self).informational_response(request, headers);
+    }
+
+    fn switching_protocols(&mut self, request: &mut dyn ClientWriter, headers: &Headers) {
+        (**self).switching_protocols(request, headers);
     }
 
     fn response_headers(&mut self, request: &mut dyn ClientWriter, headers: &Headers) {
