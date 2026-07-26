@@ -86,6 +86,17 @@ impl<H: ClientHandler> H1ClientCodec<H> {
         std::mem::take(&mut self.driver.out)
     }
 
+    /// Reclaim the handler after a `101 Switching Protocols` response halted
+    /// this codec (see [`crate::stream::ClientHandler::switching_protocols`]).
+    /// The caller now owns the raw transport and any bytes this codec left
+    /// unconsumed in the last [`Self::receive`] call.
+    ///
+    /// Panics if called twice, or before the handler has been installed —
+    /// callers only ever call this once, right after observing the upgrade.
+    pub fn take_handler(&mut self) -> H {
+        self.driver.app.take().expect("handler already taken")
+    }
+
     /// Whether the peer should be closed after flush.
     pub fn wants_close(&self) -> bool {
         self.driver.close_connection || self.driver.fatal.is_some()
@@ -233,6 +244,17 @@ impl<H: ClientHandler> Driver<H> {
         }
 
         let status = self.response_headers.status_code();
+        if status == 101 {
+            // Switching Protocols (RFC 9110 §15.2.2): unlike other 1xx
+            // statuses, this ends HTTP/1.1 framing on the connection —
+            // whatever follows belongs to the new protocol, not another
+            // status line. Surface it and halt; the caller (which owns the
+            // raw transport) takes it from here with whatever bytes this
+            // scanner didn't consume.
+            let hdrs = self.response_headers.clone();
+            self.with_app(|app, req| app.switching_protocols(req, &hdrs));
+            return Next::Stop;
+        }
         if (100..200).contains(&status) {
             // Informational — never terminal. Surface it, discard it, and
             // keep reading on this same connection for the real final
