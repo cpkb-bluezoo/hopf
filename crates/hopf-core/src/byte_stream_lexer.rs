@@ -117,6 +117,14 @@ where
     /// One past last consumed byte within the current `feed` base.
     position: usize,
     raw_remaining: u64,
+    /// Bytes of the in-progress `Mode::Token` token already fed through
+    /// `scanner.consume()` in a previous `feed` call. Callers always retain
+    /// an incomplete token's bytes at the front of the buffer they pass in
+    /// (see the buffer contract above), so on the next call those bytes are
+    /// at `base[0..resume_len]` again — resuming here instead of
+    /// re-scanning from 0 keeps `feed` from re-visiting the same byte once
+    /// per call as a token accumulates across many small reads.
+    resume_len: usize,
 }
 
 impl<S, H> ByteStreamLexer<S, H>
@@ -146,6 +154,7 @@ where
             region_start: 0,
             position: 0,
             raw_remaining: 0,
+            resume_len: 0,
         }
     }
 
@@ -200,6 +209,7 @@ where
         self.region_start = 0;
         self.position = 0;
         self.raw_remaining = 0;
+        self.resume_len = 0;
         self.scanner.reset();
     }
 
@@ -207,6 +217,16 @@ where
     pub fn feed(&mut self, data: &mut &[u8]) {
         let base = *data;
         let mut idx = 0usize;
+        if self.mode == Mode::Token {
+            // Resume an in-progress token at the point we left off, rather
+            // than re-running `consume()` over bytes already scanned in an
+            // earlier `feed` call — see `resume_len`'s doc comment.
+            debug_assert!(self.resume_len <= base.len());
+            idx = self.resume_len.min(base.len());
+            self.region_start = 0;
+            self.position = idx;
+        }
+        self.resume_len = 0;
         let mut cont = true;
         while cont && idx < base.len() {
             match self.mode {
@@ -218,7 +238,6 @@ where
                 Mode::RawFixed => cont = self.continue_raw_fixed(base, &mut idx),
                 Mode::Text => cont = self.continue_text(base, &mut idx),
                 Mode::Token => {
-                    self.region_start = idx;
                     cont = self.scan_tokens(base, &mut idx);
                 }
             }
@@ -264,7 +283,13 @@ where
                 }
             }
         }
-        // Incomplete structured token — rewind.
+        // Not enough data for the next token boundary yet (or we just
+        // finished one exactly at the end of `base`, in which case this is
+        // 0). Remember how far into it we've scanned so the next `feed`
+        // call resumes here instead of re-scanning, then rewind `idx` for
+        // the caller-facing "unconsumed" slice below — that part of the
+        // contract is unchanged.
+        self.resume_len = *idx - self.region_start;
         *idx = self.region_start;
         false
     }
@@ -324,6 +349,9 @@ where
                 let ctrl = self.dispatch_token(base, self.crlf_token, cr_start, *idx);
                 self.region_start = *idx;
                 self.mode = Mode::Token;
+                // Fresh token boundary — any resume position from earlier
+                // in this same `feed` call (before Text mode) is stale now.
+                self.resume_len = 0;
                 // Always continue the outer feed loop after leaving text mode.
                 let _ = self.apply_control(ctrl, self.crlf_token);
                 return true;
@@ -370,6 +398,8 @@ where
         }
         self.mode = Mode::Token;
         self.region_start = *idx;
+        // Fresh token boundary — see the matching comment in `continue_text`.
+        self.resume_len = 0;
         true
     }
 }
@@ -457,6 +487,71 @@ mod tests {
         lex.feed(&mut slice);
         let consumed = before - slice.len();
         pending.drain(..consumed);
+    }
+
+    /// Same grammar as [`LineScan`], but counts `consume()` invocations —
+    /// used to prove `feed` doesn't re-scan bytes across calls.
+    struct CountingScan {
+        last_was_cr: bool,
+        calls: usize,
+    }
+
+    impl ByteStreamScanner for CountingScan {
+        type Token = Tok;
+
+        fn consume(&mut self, b: u8, position: usize, region_start: usize) -> ScanAction<Tok> {
+            self.calls += 1;
+            if b == b'\n' && self.last_was_cr {
+                self.last_was_cr = false;
+                return ScanAction::Emit {
+                    token: Tok::Line,
+                    start: region_start,
+                    end: position,
+                };
+            }
+            self.last_was_cr = b == b'\r';
+            ScanAction::Continue
+        }
+
+        fn reset(&mut self) {
+            self.last_was_cr = false;
+            self.calls = 0;
+        }
+    }
+
+    #[test]
+    fn feeding_one_byte_at_a_time_scans_each_byte_exactly_once() {
+        let mut lex = ByteStreamLexer::new(
+            CountingScan {
+                last_was_cr: false,
+                calls: 0,
+            },
+            Collect {
+                lines: Vec::new(),
+                raw: Vec::new(),
+                too_long: false,
+            },
+            8192,
+            Tok::Line,
+            Tok::Text,
+        );
+        let mut pending = Vec::new();
+        let line: &[u8] = b"a fairly long line that arrives one byte at a time\r\n";
+        for &b in line {
+            pending.extend_from_slice(&[b]);
+            let mut slice = pending.as_slice();
+            lex.feed(&mut slice);
+            let consumed = pending.len() - slice.len();
+            pending.drain(..consumed);
+        }
+        // Regression guard: before the resume-position fix, an incomplete
+        // Token-mode scan restarted from byte 0 on every `feed` call, so
+        // this would take O(n^2) `consume()` calls for a line of length n
+        // (1,431 for this 53-byte line). Fixed, each byte is scanned
+        // exactly once no matter how many separate `feed` calls it
+        // straddles.
+        assert_eq!(lex.scanner_mut().calls, line.len());
+        assert_eq!(lex.handler_mut().lines, vec![line.to_vec()]);
     }
 
     #[test]

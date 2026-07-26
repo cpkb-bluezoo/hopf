@@ -7,13 +7,12 @@
 
 mod client_codec;
 mod endpoint;
+pub mod parse;
 mod response;
-pub mod scan;
 mod server_codec;
 
 pub use client_codec::H1ClientCodec;
 pub use endpoint::H1Endpoint;
 #[allow(deprecated)]
 pub use endpoint::HttpConnection;
-pub use scan::{HttpScanPhase, HttpScanPhaseGate, HttpScanner, HttpToken};
 pub use server_codec::H1ServerCodec;

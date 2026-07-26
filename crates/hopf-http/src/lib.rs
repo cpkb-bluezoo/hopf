@@ -42,8 +42,7 @@ pub use error::{HttpError, HttpResult};
 #[allow(deprecated)]
 pub use h1::HttpConnection;
 pub use h1::{
-    H1ClientCodec, H1Endpoint, H1ServerCodec, HttpScanPhase, HttpScanPhaseGate, HttpScanner,
-    HttpToken,
+    H1ClientCodec, H1Endpoint, H1ServerCodec,
 };
 pub use h2::CleartextHttpEndpoint;
 pub use h2::H2Endpoint;
