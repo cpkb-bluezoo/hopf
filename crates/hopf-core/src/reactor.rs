@@ -83,7 +83,6 @@ impl Reactor {
         while self.active.load(Ordering::Acquire) {
             self.drain_commands()?;
             self.timers.fire_due();
-            self.apply_dirty_interests()?;
 
             let timeout = self.timers.poll_timeout();
             match self.poll.poll(&mut self.events, timeout) {
@@ -122,9 +121,6 @@ impl Reactor {
                     self.handle_writable(token)?;
                 }
             }
-
-            self.apply_dirty_interests()?;
-            self.reap_closed()?;
         }
         let tokens: Vec<_> = self.conns.keys().copied().collect();
         for token in tokens {
@@ -181,6 +177,7 @@ impl Reactor {
                 if let Some(conn) = self.conns.get_mut(&token) {
                     task(conn);
                 }
+                self.sync_or_close(token)?;
             }
             ReactorCmd::ScheduleTimer {
                 delay,
@@ -351,7 +348,7 @@ impl Reactor {
                 }
             }
         }
-        Ok(())
+        self.sync_or_close(token)
     }
 
     fn handle_writable(&mut self, token: Token) -> io::Result<()> {
@@ -377,33 +374,23 @@ impl Reactor {
                 conn.force_close();
             }
         }
-        Ok(())
+        self.sync_or_close(token)
     }
 
-    fn apply_dirty_interests(&mut self) -> io::Result<()> {
-        let tokens: Vec<_> = self
-            .conns
-            .iter()
-            .filter(|(_, c)| c.interest_dirty)
-            .map(|(t, _)| *t)
-            .collect();
-        for token in tokens {
+    /// Reconcile one connection's state after touching it: close it if it's
+    /// no longer open, else apply a dirty interest change. O(1) — looked up
+    /// by the token that was just handled, never a scan over `conns`.
+    fn sync_or_close(&mut self, token: Token) -> io::Result<()> {
+        let (open, dirty) = match self.conns.get(&token) {
+            Some(conn) => (conn.is_open(), conn.interest_dirty),
+            None => return Ok(()),
+        };
+        if !open {
+            self.close_conn(token);
+        } else if dirty {
             if let Some(conn) = self.conns.get_mut(&token) {
                 sync_interest(&self.poll, conn)?;
             }
-        }
-        Ok(())
-    }
-
-    fn reap_closed(&mut self) -> io::Result<()> {
-        let closed: Vec<_> = self
-            .conns
-            .iter()
-            .filter(|(_, c)| !c.is_open())
-            .map(|(t, _)| *t)
-            .collect();
-        for token in closed {
-            self.close_conn(token);
         }
         Ok(())
     }
