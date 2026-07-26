@@ -9,6 +9,8 @@ pub struct SecurityInfo {
     alpn: Option<Vec<u8>>,
     protocol: Option<String>,
     cipher_suite: Option<String>,
+    sni: Option<String>,
+    peer_certificate_fingerprint: Option<String>,
 }
 
 impl SecurityInfo {
@@ -37,6 +39,20 @@ impl SecurityInfo {
         self.cipher_suite.as_deref()
     }
 
+    /// Server Name Indication the peer requested during the handshake
+    /// (server side only — the client already knows the name it dialed).
+    pub fn sni(&self) -> Option<&str> {
+        self.sni.as_deref()
+    }
+
+    /// SHA-256 fingerprint (lowercase hex) of the peer's leaf certificate,
+    /// when client-certificate authentication (mTLS) presented one — server
+    /// side only. Suitable as the `cert_key` passed to
+    /// `CredentialStore::authenticate_certificate` (SASL EXTERNAL).
+    pub fn peer_certificate_fingerprint(&self) -> Option<&str> {
+        self.peer_certificate_fingerprint.as_deref()
+    }
+
     /// Builder used by TLS/QUIC layers (Tranche 3+).
     pub fn secure(alpn: Option<Vec<u8>>, protocol: Option<String>, cipher_suite: Option<String>) -> Self {
         Self {
@@ -44,6 +60,20 @@ impl SecurityInfo {
             alpn,
             protocol,
             cipher_suite,
+            sni: None,
+            peer_certificate_fingerprint: None,
         }
+    }
+
+    /// Attach the SNI hostname the peer requested (server side).
+    pub fn with_sni(mut self, sni: Option<String>) -> Self {
+        self.sni = sni;
+        self
+    }
+
+    /// Attach the peer's client-certificate fingerprint (server side, mTLS).
+    pub fn with_peer_certificate_fingerprint(mut self, fingerprint: Option<String>) -> Self {
+        self.peer_certificate_fingerprint = fingerprint;
+        self
     }
 }
