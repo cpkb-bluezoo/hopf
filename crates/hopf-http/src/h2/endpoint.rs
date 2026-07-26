@@ -24,8 +24,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo};
+use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, TimerHandle};
 
 use super::hpack::{Decoder, Encoder};
 use super::response::{ArcH2ResponseControl, H2ResponseControl, H2SessionWriter};
@@ -39,10 +40,10 @@ use crate::stream::{
 use super::flow::FlowControl;
 use super::frame::{
     self, ERROR_COMPRESSION_ERROR, ERROR_FLOW_CONTROL_ERROR, ERROR_FRAME_SIZE_ERROR,
-    ERROR_PROTOCOL_ERROR, ERROR_REFUSED_STREAM, FLAG_END_HEADERS, FLAG_END_STREAM,
-    SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE,
-    SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE,
-    SETTINGS_MAX_HEADER_LIST_SIZE,
+    ERROR_PROTOCOL_ERROR, ERROR_REFUSED_STREAM, ERROR_SETTINGS_TIMEOUT, FLAG_END_HEADERS,
+    FLAG_END_STREAM, SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_ENABLE_PUSH,
+    SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS,
+    SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
 };
 use super::parser::{H2FrameHandler, H2Parser};
 
@@ -55,8 +56,9 @@ const DEFAULT_MAX_FRAME_SIZE: usize = 16_384;
 /// Default maximum header list size (bytes, advisory).
 const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 8_192;
 
-/// Default maximum concurrent streams we advertise to the client.
-const MAX_CONCURRENT_STREAMS: u32 = 100;
+/// How long to wait for the peer to ACK our initial SETTINGS frame before
+/// closing with SETTINGS_TIMEOUT (RFC 9113 §6.5.3).
+const SETTINGS_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Connection state
@@ -257,6 +259,13 @@ struct H2ClientStream {
     handler: Box<dyn ClientHandler>,
     response_headers_received: bool,
     response_body_started: bool,
+    /// Request-body bytes not yet sent because the flow-control window was
+    /// exhausted; retried on every subsequent `receive()` (e.g. once the
+    /// peer's WINDOW_UPDATE arrives), see `flush_client_streams()`.
+    pending_body: Vec<u8>,
+    /// Whether the final byte of `pending_body` (once fully sent) should
+    /// carry END_STREAM.
+    pending_end_stream: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +278,6 @@ struct H2ClientStream {
 /// constructor for the connection scenario; see the module docs for a table.
 pub struct H2Endpoint {
     role: H2Role,
-    #[allow(dead_code)]
     limits: HttpLimits,
 
     state: ConnState,
@@ -282,6 +290,24 @@ pub struct H2Endpoint {
 
     peer_max_frame_size: usize,
     peer_initial_window_size: i32,
+    /// Peer's `SETTINGS_ENABLE_PUSH` (RFC 9113 §6.5.2 default: enabled).
+    /// hopf never sends PUSH_PROMISE today, so this has no consumer yet —
+    /// tracked so a future push implementation has it available and so an
+    /// out-of-range value (anything but 0 or 1) is rejected as a protocol
+    /// error rather than silently ignored.
+    #[allow(dead_code)]
+    peer_enable_push: bool,
+    /// Peer's `SETTINGS_MAX_CONCURRENT_STREAMS` (RFC 9113 §6.5.2 default:
+    /// unlimited). Guards client-initiated stream creation in
+    /// `start_client_request()`.
+    peer_max_concurrent_streams: Option<u32>,
+    /// Fires if the peer never ACKs our initial SETTINGS frame; cancelled
+    /// in `on_settings()` once the ACK arrives.
+    settings_ack_timer: Option<TimerHandle>,
+    /// How long to wait for that ACK; overridable (see
+    /// `set_settings_ack_timeout_for_test`) so tests don't wait 10 real
+    /// seconds for the timeout path.
+    settings_ack_timeout: Duration,
 
     flow: FlowControl,
 
@@ -398,6 +424,10 @@ impl H2Endpoint {
             encoder: Encoder::new(4096),
             peer_max_frame_size: DEFAULT_MAX_FRAME_SIZE,
             peer_initial_window_size: super::flow::INITIAL_WINDOW_SIZE,
+            peer_enable_push: true,
+            peer_max_concurrent_streams: None,
+            settings_ack_timer: None,
+            settings_ack_timeout: SETTINGS_ACK_TIMEOUT,
             flow: FlowControl::new(),
             server_streams: HashMap::new(),
             client_streams: HashMap::new(),
@@ -498,7 +528,10 @@ impl H2Endpoint {
         frame::write_settings(
             &mut self.out,
             &[
-                (SETTINGS_MAX_CONCURRENT_STREAMS, MAX_CONCURRENT_STREAMS),
+                (
+                    SETTINGS_MAX_CONCURRENT_STREAMS,
+                    self.limits.max_concurrent_streams,
+                ),
                 (SETTINGS_MAX_HEADER_LIST_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE),
                 (
                     SETTINGS_INITIAL_WINDOW_SIZE,
@@ -527,6 +560,38 @@ impl H2Endpoint {
 
         endpoint.send(&self.out);
         self.out.clear();
+        self.arm_settings_ack_timer(endpoint);
+    }
+
+    /// Schedule (replacing any prior timer) a close-with-SETTINGS_TIMEOUT if
+    /// the peer doesn't ACK the SETTINGS frame just sent within
+    /// [`SETTINGS_ACK_TIMEOUT`] (RFC 9113 §6.5.3). Cancelled by
+    /// `on_settings()` once an ACK arrives.
+    fn arm_settings_ack_timer(&mut self, endpoint: &mut dyn Endpoint) {
+        if let Some(timer) = self.settings_ack_timer.take() {
+            timer.cancel();
+        }
+        let handle = endpoint.handle();
+        let timer = endpoint.schedule_timer(
+            self.settings_ack_timeout,
+            Box::new(move || {
+                handle.with_endpoint(|ep| {
+                    let mut goaway = Vec::new();
+                    frame::write_goaway(&mut goaway, 0, ERROR_SETTINGS_TIMEOUT);
+                    ep.send(&goaway);
+                    ep.close();
+                });
+            }),
+        );
+        self.settings_ack_timer = Some(timer);
+    }
+
+    /// Override the SETTINGS-ACK wait ([`SETTINGS_ACK_TIMEOUT`] by default)
+    /// — for tests only, so the timeout path doesn't require waiting out
+    /// the real production duration.
+    #[cfg(test)]
+    pub(crate) fn set_settings_ack_timeout_for_test(&mut self, timeout: Duration) {
+        self.settings_ack_timeout = timeout;
     }
 
     // -----------------------------------------------------------------------
@@ -539,11 +604,24 @@ impl H2Endpoint {
         self.state = ConnState::ExpectSettings;
         endpoint.send(&self.out);
         self.out.clear();
+        self.arm_settings_ack_timer(endpoint);
     }
 
     /// Allocate the next client stream, call `factory.create_handler`,
     /// invoke `handler.start`, and flush the buffered request to `self.out`.
     fn start_client_request(&mut self) {
+        if let Some(limit) = self.peer_max_concurrent_streams {
+            if self.client_streams.len() as u32 >= limit {
+                // The peer's SETTINGS_MAX_CONCURRENT_STREAMS forbids opening
+                // another stream right now. hopf's H2 client is currently
+                // one-request-per-connection, so there's nowhere to queue
+                // this — matches the low-level Stream API design (the
+                // caller controls dial timing); a future multi-stream
+                // client would retry here once a stream closes.
+                return;
+            }
+        }
+
         let (stream_id, scheme) = match &mut self.role {
             H2Role::Client {
                 next_stream_id,
@@ -585,22 +663,12 @@ impl H2Endpoint {
         self.flow
             .open_stream(stream_id, self.peer_initial_window_size);
 
-        if !body.is_empty() {
-            let max_frame = self.peer_max_frame_size;
-            let mut offset = 0;
-            while offset < body.len() {
-                let end = (offset + max_frame).min(body.len());
-                let chunk = &body[offset..end];
-                let is_last = end == body.len();
-                let data_flags = if is_last && end_stream {
-                    FLAG_END_STREAM
-                } else {
-                    0
-                };
-                frame::write_data(&mut self.out, chunk, data_flags, stream_id);
-                offset = end;
-            }
-        }
+        // Send as much of the body as the (fresh, just-opened) flow-control
+        // window allows; whatever's left is retried by
+        // `flush_client_streams()` on every subsequent `receive()` call
+        // (e.g. once the peer's WINDOW_UPDATE arrives).
+        let remaining = self.write_data_flow_controlled(stream_id, &body, end_stream);
+        let pending_end_stream = !remaining.is_empty() && end_stream;
 
         self.last_stream_id = stream_id;
         self.client_streams.insert(
@@ -610,6 +678,8 @@ impl H2Endpoint {
                 handler,
                 response_headers_received: false,
                 response_body_started: false,
+                pending_body: remaining,
+                pending_end_stream,
             },
         );
     }
@@ -659,6 +729,9 @@ impl H2Endpoint {
 
     fn on_settings(&mut self, flags: u8, payload: &[u8]) {
         if flags & frame::FLAG_ACK != 0 {
+            if let Some(timer) = self.settings_ack_timer.take() {
+                timer.cancel();
+            }
             return;
         }
 
@@ -701,6 +774,16 @@ impl H2Endpoint {
                     self.flow
                         .apply_initial_window_size_change(new_initial, old_initial);
                     self.peer_initial_window_size = new_initial;
+                }
+                SETTINGS_ENABLE_PUSH => {
+                    if val > 1 {
+                        self.send_goaway(ERROR_PROTOCOL_ERROR);
+                        return;
+                    }
+                    self.peer_enable_push = val == 1;
+                }
+                SETTINGS_MAX_CONCURRENT_STREAMS => {
+                    self.peer_max_concurrent_streams = Some(val);
                 }
                 _ => { /* unknown setting — ignore per §6.5.2 */ }
             }
@@ -787,7 +870,7 @@ impl H2Endpoint {
             self.send_goaway(ERROR_PROTOCOL_ERROR);
             return;
         }
-        if self.server_streams.len() >= MAX_CONCURRENT_STREAMS as usize {
+        if self.server_streams.len() >= self.limits.max_concurrent_streams as usize {
             frame::write_rst_stream(&mut self.out, stream_id, ERROR_REFUSED_STREAM);
             return;
         }
@@ -1055,6 +1138,69 @@ impl H2Endpoint {
         }
     }
 
+    /// Write as much of `body` as the current flow-control window for
+    /// `stream_id` allows, in `max_frame`-sized (or smaller) DATA frames.
+    /// Returns the unsent remainder — empty once everything was written.
+    /// The final frame carries END_STREAM only when the remainder ends up
+    /// empty and `end_stream` was requested (RFC 9113 §5.2, §6.9).
+    fn write_data_flow_controlled(
+        &mut self,
+        stream_id: u32,
+        body: &[u8],
+        end_stream: bool,
+    ) -> Vec<u8> {
+        if body.is_empty() {
+            return Vec::new();
+        }
+        let max_frame = self.peer_max_frame_size;
+        let mut offset = 0;
+        while offset < body.len() {
+            let avail = self.flow.available_send(stream_id);
+            if avail == 0 {
+                break;
+            }
+            let end = (offset + max_frame.min(avail)).min(body.len());
+            let chunk = &body[offset..end];
+            let is_last = end == body.len();
+            let flags = if is_last && end_stream {
+                FLAG_END_STREAM
+            } else {
+                0
+            };
+            frame::write_data(&mut self.out, chunk, flags, stream_id);
+            self.flow.consume_send(stream_id, chunk.len());
+            offset = end;
+        }
+        if offset >= body.len() {
+            Vec::new()
+        } else {
+            body[offset..].to_vec()
+        }
+    }
+
+    /// Retry any client request body left unsent by a prior flow-control
+    /// stall. Called at the same point as `flush_server_streams()`, so it
+    /// runs on every `receive()` — including one that just processed the
+    /// peer's WINDOW_UPDATE.
+    fn flush_client_streams(&mut self) {
+        let stream_ids: Vec<u32> = self
+            .client_streams
+            .iter()
+            .filter(|(_, s)| !s.pending_body.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stream_ids {
+            let (body, end_stream) = match self.client_streams.get_mut(&id) {
+                Some(s) => (std::mem::take(&mut s.pending_body), s.pending_end_stream),
+                None => continue,
+            };
+            let remaining = self.write_data_flow_controlled(id, &body, end_stream);
+            if let Some(s) = self.client_streams.get_mut(&id) {
+                s.pending_body = remaining;
+            }
+        }
+    }
+
     fn flush_one_server_stream(&mut self, stream_id: u32) {
         // Pull upgrade outbound into the body buffer first.
         if let Some(stream) = self.server_streams.get_mut(&stream_id) {
@@ -1073,7 +1219,7 @@ impl H2Endpoint {
             }
         }
 
-        let (headers, trailers, body, done, already_sent, upgraded) = {
+        let (headers, mut trailers, body, done, already_sent, upgraded) = {
             let stream = match self.server_streams.get_mut(&stream_id) {
                 Some(s) => s,
                 None => return,
@@ -1127,47 +1273,45 @@ impl H2Endpoint {
             return;
         }
 
-        let max_frame = self.peer_max_frame_size;
-        let mut end_stream_sent = headers_this_flush
-            && !already_sent
-            && done
-            && body.is_empty()
-            && !upgraded
-            && !has_trailers;
+        let end_stream_wanted = done && !upgraded && !has_trailers;
+        let mut end_stream_sent =
+            headers_this_flush && !already_sent && body.is_empty() && end_stream_wanted;
 
-        if !body.is_empty() {
-            let mut offset = 0;
-            while offset < body.len() {
-                let end = (offset + max_frame).min(body.len());
-                let chunk = &body[offset..end];
-                let is_last = end == body.len();
-                let data_flags = if is_last && done && !upgraded && !has_trailers {
-                    end_stream_sent = true;
-                    FLAG_END_STREAM
-                } else {
-                    0
-                };
-                let avail = self.flow.available_send(stream_id);
-                let send_len = chunk.len().min(avail.max(chunk.len()));
-                frame::write_data(&mut self.out, &chunk[..send_len], data_flags, stream_id);
-                self.flow.consume_send(stream_id, send_len);
-                offset = end;
+        let remaining_body = self.write_data_flow_controlled(stream_id, &body, end_stream_wanted);
+        let body_fully_sent = remaining_body.is_empty();
+        if body_fully_sent && !body.is_empty() && end_stream_wanted {
+            end_stream_sent = true;
+        }
+
+        if body_fully_sent {
+            if let Some(trailers) = trailers.take() {
+                let block = self
+                    .encoder
+                    .encode(trailers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
+                frame::write_headers(&mut self.out, &block, FLAG_END_STREAM, stream_id);
+            } else if done && !upgraded && !end_stream_sent {
+                // Headers were sent on a prior flush; body empty this flush; no trailers.
+                frame::write_data(&mut self.out, &[], FLAG_END_STREAM, stream_id);
             }
         }
 
-        if let Some(trailers) = trailers {
-            let block = self
-                .encoder
-                .encode(trailers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
-            frame::write_headers(&mut self.out, &block, FLAG_END_STREAM, stream_id);
-        } else if done && !upgraded && !end_stream_sent {
-            // Headers were sent on a prior flush; body empty this flush; no trailers.
-            frame::write_data(&mut self.out, &[], FLAG_END_STREAM, stream_id);
-        }
-
-        if done && !upgraded {
+        if body_fully_sent && done && !upgraded {
             self.flow.close_stream(stream_id);
             self.server_streams.remove(&stream_id);
+        } else if !body_fully_sent {
+            // Flow control exhausted mid-body — requeue whatever's left
+            // unsent (and any trailers, which must follow the body) for the
+            // next flush, triggered by any subsequent incoming frame (e.g.
+            // the peer's WINDOW_UPDATE).
+            if let Some(stream) = self.server_streams.get_mut(&stream_id) {
+                let mut shared = stream.writer.control.shared.lock().unwrap();
+                let mut requeued = remaining_body;
+                requeued.extend_from_slice(&shared.body);
+                shared.body = requeued;
+                if let Some(t) = trailers {
+                    shared.trailers = Some(t);
+                }
+            }
         }
     }
 }
@@ -1298,6 +1442,7 @@ impl ProtocolHandler for H2Endpoint {
 
         self.drain_deferred_flush();
         self.flush_server_streams();
+        self.flush_client_streams();
 
         if !self.out.is_empty() {
             endpoint.send(&self.out);
@@ -1316,5 +1461,230 @@ impl ProtocolHandler for H2Endpoint {
 
     fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
         endpoint.close();
+    }
+}
+
+#[cfg(test)]
+mod flow_control_tests {
+    use super::*;
+    use crate::stream::{ServerHandler, ServerHandlerFactory};
+
+    struct NoopFactory;
+    impl ServerHandlerFactory for NoopFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+
+    fn test_endpoint() -> H2Endpoint {
+        H2Endpoint::server(Arc::new(NoopFactory), HttpLimits::default(), false)
+    }
+
+    /// `ep.out` must contain exactly one DATA frame; return its payload length
+    /// and flags.
+    fn single_data_frame(out: &[u8]) -> (usize, u8) {
+        assert!(out.len() >= 9, "no frame header in output: {out:?}");
+        let header = frame::parse_frame_header(&out[..9]);
+        assert_eq!(header.ty, 0x0, "expected a DATA frame, got type {}", header.ty);
+        assert_eq!(out.len(), 9 + header.length as usize, "unexpected trailing bytes");
+        (header.length as usize, header.flags)
+    }
+
+    /// The bug this guards against: `send_len` must never exceed the peer's
+    /// advertised window, even when the body is bigger than it.
+    #[test]
+    fn flow_control_caps_send_at_available_window() {
+        let mut ep = test_endpoint();
+        ep.flow.open_stream(1, 10); // only 10 bytes of send window
+        let body = vec![b'x'; 25];
+
+        let remaining = ep.write_data_flow_controlled(1, &body, true);
+
+        assert_eq!(remaining.len(), 15, "must not send more than the window allows");
+        assert_eq!(ep.flow.available_send(1), 0);
+        let (len, flags) = single_data_frame(&ep.out);
+        assert_eq!(len, 10);
+        assert_eq!(flags & FLAG_END_STREAM, 0, "more body is still pending, no END_STREAM yet");
+    }
+
+    /// Once the peer's WINDOW_UPDATE reopens the window, the remainder sends
+    /// and the final frame carries END_STREAM.
+    #[test]
+    fn flow_control_sends_remainder_once_window_reopens() {
+        let mut ep = test_endpoint();
+        ep.flow.open_stream(1, 10);
+        let body = vec![b'x'; 25];
+        let remaining = ep.write_data_flow_controlled(1, &body, true);
+        ep.out.clear();
+
+        ep.flow.on_window_update(1, 15);
+        let remaining2 = ep.write_data_flow_controlled(1, &remaining, true);
+
+        assert!(remaining2.is_empty(), "the whole body should now be sent");
+        let (len, flags) = single_data_frame(&ep.out);
+        assert_eq!(len, 15);
+        assert_ne!(flags & FLAG_END_STREAM, 0, "final chunk must carry END_STREAM");
+    }
+
+    /// A body that fits entirely within the window in one call sends as a
+    /// single frame with no remainder, matching the pre-fix common case.
+    #[test]
+    fn flow_control_sends_whole_body_when_window_is_sufficient() {
+        let mut ep = test_endpoint();
+        ep.flow.open_stream(1, 1000);
+        let body = vec![b'y'; 50];
+
+        let remaining = ep.write_data_flow_controlled(1, &body, true);
+
+        assert!(remaining.is_empty());
+        let (len, flags) = single_data_frame(&ep.out);
+        assert_eq!(len, 50);
+        assert_ne!(flags & FLAG_END_STREAM, 0);
+    }
+
+    /// A completely exhausted window (0 bytes available) must send nothing
+    /// at all and return the whole body as the remainder.
+    #[test]
+    fn flow_control_sends_nothing_when_window_is_zero() {
+        let mut ep = test_endpoint();
+        ep.flow.open_stream(1, 0);
+        let body = vec![b'z'; 5];
+
+        let remaining = ep.write_data_flow_controlled(1, &body, true);
+
+        assert_eq!(remaining, body);
+        assert!(ep.out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use crate::stream::{ClientHandler, ClientHandlerFactory, ClientWriter};
+
+    fn settings_payload(entries: &[(u16, u32)]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(entries.len() * 6);
+        for (id, val) in entries {
+            out.extend_from_slice(&id.to_be_bytes());
+            out.extend_from_slice(&val.to_be_bytes());
+        }
+        out
+    }
+
+    struct NoopServerFactory;
+    impl ServerHandlerFactory for NoopServerFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+
+    fn server_endpoint() -> H2Endpoint {
+        H2Endpoint::server(Arc::new(NoopServerFactory), HttpLimits::default(), false)
+    }
+
+    #[test]
+    fn settings_enable_push_stored() {
+        let mut ep = server_endpoint();
+        assert!(ep.peer_enable_push, "RFC 9113 default is enabled");
+        ep.on_settings(0, &settings_payload(&[(SETTINGS_ENABLE_PUSH, 0)]));
+        assert!(!ep.peer_enable_push);
+        ep.on_settings(0, &settings_payload(&[(SETTINGS_ENABLE_PUSH, 1)]));
+        assert!(ep.peer_enable_push);
+    }
+
+    #[test]
+    fn settings_enable_push_out_of_range_is_protocol_error() {
+        let mut ep = server_endpoint();
+        ep.on_settings(0, &settings_payload(&[(SETTINGS_ENABLE_PUSH, 2)]));
+        assert_eq!(ep.state, ConnState::GoAway);
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, 0x7, "expected a GOAWAY frame");
+    }
+
+    #[test]
+    fn settings_max_concurrent_streams_stored() {
+        let mut ep = server_endpoint();
+        assert_eq!(ep.peer_max_concurrent_streams, None, "unlimited until advertised");
+        ep.on_settings(0, &settings_payload(&[(SETTINGS_MAX_CONCURRENT_STREAMS, 5)]));
+        assert_eq!(ep.peer_max_concurrent_streams, Some(5));
+    }
+
+    /// `HttpLimits::max_concurrent_streams` (not a hardcoded constant) governs
+    /// how many client-initiated streams the server role accepts before
+    /// refusing new ones with `RST_STREAM(REFUSED_STREAM)`.
+    #[test]
+    fn own_max_concurrent_streams_limit_is_configurable_and_enforced() {
+        let limits = HttpLimits {
+            max_concurrent_streams: 0,
+            ..HttpLimits::default()
+        };
+        let mut ep = H2Endpoint::server(Arc::new(NoopServerFactory), limits, false);
+        ep.process_server_headers_block(1, &[], false);
+        assert!(ep.server_streams.is_empty(), "stream must not be admitted");
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_RST_STREAM);
+    }
+
+    struct OnceFactory {
+        started: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ClientHandlerFactory for OnceFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            Box::new(OnceHandler {
+                started: Arc::clone(&self.started),
+            })
+        }
+    }
+    struct OnceHandler {
+        started: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ClientHandler for OnceHandler {
+        fn start(&mut self, request: &mut dyn ClientWriter) {
+            self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut h = Headers::new();
+            h.set(":method", "GET");
+            h.set(":path", "/");
+            h.set("host", "example.test");
+            request.headers(h);
+            request.complete_request();
+        }
+        fn response_headers(&mut self, _: &mut dyn ClientWriter, _: &Headers) {}
+        fn response_complete(&mut self, _: &mut dyn ClientWriter) {}
+    }
+
+    #[test]
+    fn start_client_request_refuses_when_peer_allows_zero_streams() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut ep = H2Endpoint::client(
+            Arc::new(OnceFactory {
+                started: Arc::clone(&started),
+            }),
+            HttpLimits::default(),
+            false,
+        );
+        ep.peer_max_concurrent_streams = Some(0);
+
+        ep.start_client_request();
+
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(ep.client_streams.is_empty());
+    }
+
+    #[test]
+    fn start_client_request_proceeds_within_peer_limit() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut ep = H2Endpoint::client(
+            Arc::new(OnceFactory {
+                started: Arc::clone(&started),
+            }),
+            HttpLimits::default(),
+            false,
+        );
+        ep.peer_max_concurrent_streams = Some(1);
+
+        ep.start_client_request();
+
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ep.client_streams.len(), 1);
     }
 }
