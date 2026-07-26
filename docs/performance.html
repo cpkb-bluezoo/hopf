@@ -76,7 +76,6 @@
 <li><a href="#timer-heap">Timer cancellation: bounded by periodic compaction</a></li>
 <li><a href="#storage-alloc">Storage submission: no allocation to satisfy the borrow checker</a></li>
 <li><a href="#drain">Buffer compaction cost after partial consumption</a></li>
-<li><a href="#udp-alloc">UDP datagrams bypass the buffer pool</a></li>
 <li><a href="#good">What's actually right</a></li>
 <li><a href="#summary">Summary table</a></li>
 </ul></div>
@@ -92,9 +91,6 @@
 <h2 id="drain">Buffer compaction cost after partial consumption</h2>
 <p><code>deliver_plaintext_buffer</code> / <code>deliver_app_in</code> (<code>crates/hopf-core/src/connection.rs:366-420</code>) hand the handler the buffered bytes, then compact with <code>buf.drain(..consumed)</code> (<code>connection.rs:379-381</code>, <code>407-409</code>) — an <code>O(remaining bytes)</code> memmove of everything after the consumed prefix. In the common case (the handler consumes everything available each call) <code>remaining</code> is ~0 and this is free. It's only costly when a handler deliberately leaves a large amount buffered across many reads — e.g. streaming a large IMAP literal or MQTT PUBLISH payload one small chunk at a time while the bulk of an already-arrived body sits unconsumed waiting for more of the same message — in which case each read re-shifts that same trailing residue down. Cost is proportional to already-seen-but-unconsumed bytes, and is bounded by whatever a protocol's own streaming design chooses to leave buffered rather than being universal.</p>
 
-<h2 id="udp-alloc">UDP datagrams bypass the buffer pool</h2>
-<p><code>Reactor::handle_udp_readable</code> (<code>crates/hopf-core/src/reactor.rs:221-238</code>) reads into a stack buffer, then does <code>let data = buf[..n].to_vec();</code> (<code>reactor.rs:229</code>) — a fresh heap allocation and copy <em>per datagram</em>, never drawn from or returned to that reactor's own <code>Arc&lt;BufferPool&gt;</code>, the one its TCP connections' <code>net_in</code>/<code>net_out</code> use (<a href="scalability.html#bufpool">Scalability §Buffer pool</a>). For hopf-dns's UDP-heavy workload in particular, this means the one transport that arguably sends/receives the most discrete messages per second in the framework is the one place not benefiting from buffer reuse. Not necessarily wrong — datagrams are typically small (a DNS query/response fits in one MTU) and short-lived — but it's an inconsistency worth noting: the pooling discipline built for TCP doesn't extend to UDP.</p>
-
 <h2 id="good">What's actually right</h2>
 <p>For balance — these are deliberate, correct choices worth keeping, not accidents:</p>
 <ul>
@@ -103,6 +99,7 @@
 <li><strong>Panic isolation at every handler callback</strong>, not just <code>receive()</code> — <code>connected</code>, <code>security_established</code>, <code>disconnected</code>, <code>error</code>, and <code>write_ready</code> callbacks are all wrapped in <code>catch_unwind</code> (<code>connection.rs:511-569, 494-506</code>), confirming the "panic isolation at connection boundary" design claim holds for the whole callback surface, not a subset.</li>
 <li><strong>Lock-free quota counters.</strong> <code>CounterQuota</code> (<code>crates/hopf-core/src/quota.rs:44-95</code>) uses plain <code>AtomicU64</code> with <code>Relaxed</code> ordering — correct here since each axis (in/out/messages) is an independent monotonic counter with no cross-axis ordering requirement, and it avoids a lock on what could otherwise be a very hot per-message path.</li>
 <li><strong>O(log n) timer scheduling, bounded under cancellation.</strong> <code>TimerQueue</code> is a proper binary heap, not a linear scan, per-reactor with no cross-thread lock on the hot scheduling path, and periodic compaction (<a href="#timer-heap">§</a>) keeps cancelled entries from accumulating under the cancel-and-reschedule idiom common to keepalive timers.</li>
+<li><strong>Zero-allocation UDP receive.</strong> <code>handle_udp_readable</code> (<code>crates/hopf-core/src/reactor.rs:222-240</code>) reads into a stack buffer and hands <code>UdpDatagramHandler::on_datagram</code> a borrowed slice straight into it (<code>reactor.rs:233</code>) — no heap allocation at all, not even a pooled one, since the trait only ever takes <code>&amp;[u8]</code> and never needs ownership beyond the call.</li>
 </ul>
 
 <h2 id="summary">Summary table</h2>
@@ -111,7 +108,6 @@
 <thead><tr><th>Finding</th><th>Severity</th><th>Trigger condition</th></tr></thead>
 <tbody>
 <tr><td>Buffer drain on partial consumption (<a href="#drain">§</a>)</td><td>Minor–Moderate</td><td>Protocol deliberately buffers a large amount across many small reads (streaming literal/payload)</td></tr>
-<tr><td>UDP allocates outside the buffer pool (<a href="#udp-alloc">§</a>)</td><td>Minor</td><td>Every inbound UDP datagram — most relevant to hopf-dns's UDP transport</td></tr>
 </tbody>
 </table>
 <p>The buffer-drain finding is the next one worth prioritizing: its cost scales with connection activity rather than being a fixed per-call overhead.</p>

@@ -227,8 +227,10 @@ impl Reactor {
         loop {
             match reg.socket.recv_from(&mut buf) {
                 Ok((n, peer)) => {
-                    let data = buf[..n].to_vec();
-                    reg.handler.on_datagram(peer, &data);
+                    // `on_datagram` only ever borrows `data`, so there's no
+                    // need to copy it off the stack into a fresh heap
+                    // allocation (or even a pooled one) first.
+                    reg.handler.on_datagram(peer, &buf[..n]);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
