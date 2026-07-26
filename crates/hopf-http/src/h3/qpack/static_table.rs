@@ -163,6 +163,13 @@ pub fn find_name(name: &str) -> Option<usize> {
     STATIC_TABLE.iter().position(|entry| entry.name == name)
 }
 
+/// RFC 9204 §3.2.1 dynamic-table entry size: name+value lengths plus 32
+/// bytes of accounting overhead (identical formula to HPACK, RFC 7541
+/// §4.1).
+pub(crate) fn entry_size(name: &str, value: &str) -> usize {
+    name.len() + value.len() + 32
+}
+
 /// Resolve an index.
 pub fn get(index: usize) -> Option<StaticEntry> {
     STATIC_TABLE.get(index).copied()
