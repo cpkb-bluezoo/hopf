@@ -20,7 +20,8 @@ use crate::limits::HttpLimits;
 use crate::stream::{ProtocolUpgradeHandler, ServerHandler, ServerWriter};
 use crate::utils::{
     is_chunked_te, is_default_method, is_invalid_te, is_token, is_valid_header_name,
-    is_valid_host, is_valid_request_target, method_implies_no_body, parse_content_length,
+    is_valid_header_value, is_valid_host, is_valid_request_target, method_implies_no_body,
+    parse_content_length,
 };
 use crate::version::HttpVersion;
 
@@ -340,10 +341,25 @@ impl<H: ServerHandler> Driver<H> {
                 self.chunked = true;
                 self.headers.remove("content-length");
             }
-        } else if let Some(cl) = self.headers.get("content-length") {
-            match parse_content_length(cl) {
-                Some(n) => self.content_length = Some(n),
-                None => return self.fail_stop(HttpError::new(400, "invalid Content-Length")),
+        } else {
+            // RFC 9112 §6.3: multiple Content-Length fields are only valid
+            // if every one carries the same decimal value (equivalent to a
+            // single combined field); any differing value is a framing
+            // error, not just "use the first one".
+            let cl_parsed: Vec<Option<u64>> = self
+                .headers
+                .iter()
+                .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
+                .map(|h| parse_content_length(&h.value))
+                .collect();
+            if let Some(&first) = cl_parsed.first() {
+                let Some(n) = first else {
+                    return self.fail_stop(HttpError::new(400, "invalid Content-Length"));
+                };
+                if cl_parsed.iter().any(|&v| v != Some(n)) {
+                    return self.fail_stop(HttpError::new(400, "conflicting Content-Length"));
+                }
+                self.content_length = Some(n);
             }
         }
 
@@ -501,6 +517,9 @@ impl<H: ServerHandler> H1Events for Driver<H> {
         let Some(name) = self.pending_name.take() else {
             return self.fail_stop(HttpError::new(400, "value without field name"));
         };
+        if !is_valid_header_value(value) {
+            return self.fail_stop(HttpError::new(400, "invalid header value"));
+        }
         // Trailers are accepted but not merged into the header set.
         if self.state == ParseState::BodyChunkedTrailer {
             return Next::Continue;
@@ -759,6 +778,54 @@ mod tests {
         let mut data: &[u8] = b"GET / HTTP/1.1\r\n\r\n";
         let err = p.receive(&mut data).unwrap_err();
         assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn duplicate_identical_content_length_accepted() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
+        feed_all(
+            &mut p,
+            &[b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello"],
+        );
+        assert_eq!(rec.lock().unwrap().body, b"hello");
+    }
+
+    #[test]
+    fn duplicate_conflicting_content_length_rejected() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
+        let mut data: &[u8] =
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello";
+        let err = p.receive(&mut data).unwrap_err();
+        assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn ctl_byte_in_header_value_rejected() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
+        let mut data: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\nX-Bad: a\x01b\r\n\r\n";
+        let err = p.receive(&mut data).unwrap_err();
+        assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn header_name_with_extended_tchar_accepted() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
+        feed_all(&mut p, &[b"GET / HTTP/1.1\r\nHost: x\r\nX-A!B: v\r\n\r\n"]);
+        assert!(rec.lock().unwrap().events.contains(&"headers GET /".into()));
+    }
+
+    #[test]
+    fn response_always_has_date_header() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
+        feed_all(&mut p, &[b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"]);
+        let out = String::from_utf8(p.take_outbound()).unwrap();
+        assert!(out.contains("\r\nDate: "), "response missing Date header: {out:?}");
+        assert!(out.contains(" GMT\r\n"));
     }
 
     /// Handler that schedules the response via [`ServerResponseHandle::execute`].

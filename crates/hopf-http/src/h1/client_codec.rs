@@ -232,6 +232,22 @@ impl<H: ClientHandler> Driver<H> {
             }
         }
 
+        let status = self.response_headers.status_code();
+        if (100..200).contains(&status) {
+            // Informational — never terminal. Surface it, discard it, and
+            // keep reading on this same connection for the real final
+            // status line (RFC 9110 §15.2: a 1xx MUST be followed by a
+            // final response to the same request).
+            let hdrs = self.response_headers.clone();
+            self.with_app(|app, req| app.informational_response(req, &hdrs));
+            if self.fatal.is_some() {
+                return Next::Stop;
+            }
+            self.response_headers = Headers::new();
+            self.state = ParseState::StatusLine;
+            return Next::FirstLine;
+        }
+
         self.chunked = false;
         self.content_length = None;
         if let Some(te) = self.response_headers.get("transfer-encoding") {
@@ -241,15 +257,27 @@ impl<H: ClientHandler> Driver<H> {
             if is_chunked_te(te) {
                 self.chunked = true;
             }
-        } else if let Some(cl) = self.response_headers.get("content-length") {
-            match parse_content_length(cl) {
-                Some(n) => self.content_length = Some(n),
-                None => return self.fail_stop(HttpError::new(0, "invalid Content-Length")),
+        } else {
+            // Same duplicate-Content-Length handling as the server side
+            // (RFC 9112 §6.3): differing values are a framing error.
+            let cl_parsed: Vec<Option<u64>> = self
+                .response_headers
+                .iter()
+                .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
+                .map(|h| parse_content_length(&h.value))
+                .collect();
+            if let Some(&first) = cl_parsed.first() {
+                let Some(n) = first else {
+                    return self.fail_stop(HttpError::new(0, "invalid Content-Length"));
+                };
+                if cl_parsed.iter().any(|&v| v != Some(n)) {
+                    return self.fail_stop(HttpError::new(0, "conflicting Content-Length"));
+                }
+                self.content_length = Some(n);
             }
         }
 
-        let status = self.response_headers.status_code();
-        if (100..200).contains(&status) || status == 204 || status == 304 {
+        if status == 204 || status == 304 {
             self.content_length = Some(0);
             self.chunked = false;
         } else if self.req_method.eq_ignore_ascii_case("HEAD") {
@@ -506,6 +534,7 @@ mod tests {
         status: u16,
         body: Vec<u8>,
         done: bool,
+        informational: Vec<u16>,
     }
 
     struct GetHello {
@@ -521,6 +550,14 @@ mod tests {
             h.set("host", &self.host);
             request.headers(h);
             request.complete_request();
+        }
+
+        fn informational_response(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
+            self.rec
+                .lock()
+                .unwrap()
+                .informational
+                .push(headers.status_code());
         }
 
         fn response_headers(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
@@ -562,6 +599,86 @@ mod tests {
         let g = rec.lock().unwrap();
         assert_eq!(g.status, 200);
         assert_eq!(g.body, b"hello");
+        assert!(g.done);
+    }
+
+    #[test]
+    fn duplicate_conflicting_content_length_in_response_rejected() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut c = H1ClientCodec::new(
+            GetHello {
+                host: "ex.com".into(),
+                rec: Arc::clone(&rec),
+            },
+            HttpLimits::default(),
+            false,
+        );
+        c.on_connected();
+        let _ = c.take_outbound();
+
+        let mut data: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
+        assert!(c.receive(&mut data).is_err());
+    }
+
+    /// A `100 Continue` sent before the real response must not be delivered
+    /// as the terminal response — the client keeps reading on the same
+    /// connection for the actual final status line (RFC 9110 §15.2).
+    #[test]
+    fn informational_1xx_response_is_not_terminal() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut c = H1ClientCodec::new(
+            GetHello {
+                host: "ex.com".into(),
+                rec: Arc::clone(&rec),
+            },
+            HttpLimits::default(),
+            false,
+        );
+        c.on_connected();
+        let _ = c.take_outbound();
+
+        let mut data: &[u8] =
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        c.receive(&mut data).unwrap();
+        assert!(data.is_empty());
+
+        let g = rec.lock().unwrap();
+        assert_eq!(g.informational, vec![100]);
+        assert_eq!(g.status, 200);
+        assert_eq!(g.body, b"hello");
+        assert!(g.done);
+    }
+
+    /// Same, but the 1xx and the real response arrive in separate `receive`
+    /// calls — the discard-and-keep-reading state must survive that split.
+    #[test]
+    fn informational_1xx_split_across_receive_calls() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut c = H1ClientCodec::new(
+            GetHello {
+                host: "ex.com".into(),
+                rec: Arc::clone(&rec),
+            },
+            HttpLimits::default(),
+            false,
+        );
+        c.on_connected();
+        let _ = c.take_outbound();
+
+        let mut first: &[u8] = b"HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n";
+        c.receive(&mut first).unwrap();
+        assert!(first.is_empty());
+        assert_eq!(rec.lock().unwrap().informational, vec![103]);
+        assert_eq!(rec.lock().unwrap().status, 0, "no terminal response yet");
+
+        let mut second: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+        c.receive(&mut second).unwrap();
+        assert!(second.is_empty());
+
+        let g = rec.lock().unwrap();
+        assert_eq!(g.status, 200);
+        assert_eq!(g.body, b"ok");
         assert!(g.done);
     }
 }
