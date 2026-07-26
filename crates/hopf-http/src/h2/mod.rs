@@ -22,6 +22,13 @@
 //! preface and SETTINGS on connect, then starts a single request via
 //! `ClientHandlerFactory`.
 //!
+//! # Client (h2c Upgrade dial)
+//!
+//! Use [`H2cUpgradeClientEndpoint`] to dial a peer that may not support
+//! prior-knowledge H2: the request is sent as HTTP/1.1 with `Upgrade: h2c`,
+//! promoting to H2 on a `101` response and falling back to plain HTTP/1.1
+//! otherwise (server support for h2c Upgrade is optional).
+//!
 //! # Not yet implemented
 //!
 //! - **PUSH_PROMISE / server push** — `H2Endpoint` sends RST_STREAM for any
@@ -38,9 +45,11 @@ pub mod parser;
 
 pub(crate) mod base64url;
 mod cleartext;
+mod client_upgrade;
 mod endpoint;
 mod response;
 
 pub use cleartext::CleartextHttpEndpoint;
+pub use client_upgrade::H2cUpgradeClientEndpoint;
 pub use endpoint::H2Endpoint;
 pub use parser::{H2FrameHandler, H2Parser};

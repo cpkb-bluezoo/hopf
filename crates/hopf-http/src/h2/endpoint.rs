@@ -445,6 +445,45 @@ impl H2Endpoint {
         )
     }
 
+    /// Create an H2 **client** endpoint for a connection just promoted from
+    /// HTTP/1.1 via h2c Upgrade (RFC 7540 §3.2).
+    ///
+    /// `handler` is the [`ClientHandler`] whose `start()` already ran and
+    /// whose request already went out as the HTTP/1.1 Upgrade request — RFC
+    /// 7540 §3.2 assigns that request stream ID 1, so its response now
+    /// arrives via H2 framing on stream 1 instead of more HTTP/1.1 bytes.
+    /// Call [`ProtocolHandler::connected`] on the result immediately (it
+    /// sends the client preface + SETTINGS), then feed it whatever bytes
+    /// were buffered after the `101` response.
+    pub fn client_after_h2c_upgrade(
+        handler: Box<dyn ClientHandler>,
+        factory: Arc<dyn ClientHandlerFactory>,
+        limits: HttpLimits,
+    ) -> Self {
+        let mut ep = Self::make(
+            H2Role::Client {
+                factory,
+                secure: false,
+                next_stream_id: 3,
+            },
+            limits,
+        );
+        ep.last_stream_id = 1;
+        ep.flow.open_stream(1, ep.peer_initial_window_size);
+        ep.client_streams.insert(
+            1,
+            H2ClientStream {
+                id: 1,
+                handler,
+                response_headers_received: false,
+                response_body_started: false,
+                pending_body: Vec::new(),
+                pending_end_stream: false,
+            },
+        );
+        ep
+    }
+
     fn make(role: H2Role, limits: HttpLimits) -> Self {
         Self {
             role,
@@ -995,6 +1034,13 @@ impl H2Endpoint {
 
         let mut w = NullClientWriter;
         if let Some(stream) = self.client_streams.get_mut(&stream_id) {
+            // RFC 9113 §8.1 / RFC 9110 §15.2: a 1xx HEADERS is an interim
+            // response — never terminal, never trailers. The real final
+            // response HEADERS still follows on the same stream.
+            if !stream.response_headers_received && (100..200).contains(&headers.status_code()) {
+                stream.handler.informational_response(&mut w, &headers);
+                return;
+            }
             if stream.response_headers_received {
                 if stream.response_body_started {
                     stream.handler.end_response_body(&mut w);
@@ -2372,9 +2418,7 @@ mod client_goaway_tests {
 #[cfg(test)]
 mod state_machine_tests {
     use super::*;
-    use crate::stream::{
-        ClientHandler, ClientHandlerFactory, ClientWriter, ServerHandler, ServerHandlerFactory,
-    };
+    use crate::stream::{ClientHandler, ClientHandlerFactory, ServerHandler, ServerHandlerFactory};
 
     struct NoopServerFactory;
     impl ServerHandlerFactory for NoopServerFactory {
@@ -2521,4 +2565,126 @@ mod state_machine_tests {
         let error_code = u32::from_be_bytes([ep.out[9], ep.out[10], ep.out[11], ep.out[12]]);
         assert_eq!(error_code, ERROR_STREAM_CLOSED);
     }
+}
+
+#[cfg(test)]
+mod client_informational_response_tests {
+    use super::*;
+    use crate::stream::{ClientHandler, ClientHandlerFactory, ClientWriter};
+
+    fn encode_headers(pairs: &[(&str, &str)]) -> Vec<u8> {
+        super::super::hpack::Encoder::new(4096).encode(pairs.iter().copied())
+    }
+
+    struct NoopClientFactory;
+    impl ClientHandlerFactory for NoopClientFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+    fn client_endpoint() -> H2Endpoint {
+        H2Endpoint::client(Arc::new(NoopClientFactory), HttpLimits::default(), false)
+    }
+
+    #[derive(Default)]
+    struct Recorded {
+        informational_statuses: Vec<u16>,
+        final_status: Option<u16>,
+        trailers_seen: usize,
+        completed: usize,
+    }
+
+    struct RecordingHandler {
+        rec: Arc<std::sync::Mutex<Recorded>>,
+    }
+    impl ClientHandler for RecordingHandler {
+        fn start(&mut self, _request: &mut dyn ClientWriter) {}
+        fn informational_response(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
+            self.rec.lock().unwrap().informational_statuses.push(headers.status_code());
+        }
+        fn response_headers(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
+            self.rec.lock().unwrap().final_status = Some(headers.status_code());
+        }
+        fn response_trailers(&mut self, _request: &mut dyn ClientWriter, _headers: &Headers) {
+            self.rec.lock().unwrap().trailers_seen += 1;
+        }
+        fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
+            self.rec.lock().unwrap().completed += 1;
+        }
+    }
+
+    fn insert_stream(ep: &mut H2Endpoint, id: u32, rec: &Arc<std::sync::Mutex<Recorded>>) {
+        ep.client_streams.insert(
+            id,
+            H2ClientStream {
+                id,
+                handler: Box::new(RecordingHandler { rec: Arc::clone(rec) }),
+                response_headers_received: false,
+                response_body_started: false,
+                pending_body: Vec::new(),
+                pending_end_stream: false,
+            },
+        );
+    }
+
+    /// A `100 Continue` (or `103 Early Hints`) HEADERS frame is surfaced via
+    /// `informational_response` and does not consume the "first HEADERS"
+    /// slot — the real final response still lands on `response_headers`,
+    /// not `response_trailers`.
+    #[test]
+    fn interim_1xx_then_final_response_dispatch_correctly() {
+        let mut ep = client_endpoint();
+        let rec = Arc::new(std::sync::Mutex::new(Recorded::default()));
+        insert_stream(&mut ep, 1, &rec);
+
+        let interim = encode_headers(&[(":status", "100")]);
+        ep.process_client_response_headers(1, &interim, false);
+
+        let final_headers = encode_headers(&[(":status", "200")]);
+        ep.process_client_response_headers(1, &final_headers, true);
+
+        let r = rec.lock().unwrap();
+        assert_eq!(r.informational_statuses, vec![100]);
+        assert_eq!(r.final_status, Some(200));
+        assert_eq!(r.trailers_seen, 0, "the final response must not be mistaken for trailers");
+        assert_eq!(r.completed, 1);
+    }
+
+    /// Multiple interim responses (e.g. 103 Early Hints then 100 Continue)
+    /// are each surfaced individually before the real final response.
+    #[test]
+    fn multiple_interim_responses_all_surfaced() {
+        let mut ep = client_endpoint();
+        let rec = Arc::new(std::sync::Mutex::new(Recorded::default()));
+        insert_stream(&mut ep, 1, &rec);
+
+        ep.process_client_response_headers(1, &encode_headers(&[(":status", "103")]), false);
+        ep.process_client_response_headers(1, &encode_headers(&[(":status", "100")]), false);
+        ep.process_client_response_headers(1, &encode_headers(&[(":status", "200")]), true);
+
+        let r = rec.lock().unwrap();
+        assert_eq!(r.informational_statuses, vec![103, 100]);
+        assert_eq!(r.final_status, Some(200));
+        assert_eq!(r.completed, 1);
+    }
+
+    /// A real (non-1xx) final response is unaffected — no informational
+    /// callback fires, and a genuine second HEADERS frame after it is
+    /// still treated as trailers.
+    #[test]
+    fn no_interim_response_final_headers_then_trailers() {
+        let mut ep = client_endpoint();
+        let rec = Arc::new(std::sync::Mutex::new(Recorded::default()));
+        insert_stream(&mut ep, 1, &rec);
+
+        ep.process_client_response_headers(1, &encode_headers(&[(":status", "200")]), false);
+        ep.process_client_response_headers(1, &encode_headers(&[("grpc-status", "0")]), true);
+
+        let r = rec.lock().unwrap();
+        assert!(r.informational_statuses.is_empty());
+        assert_eq!(r.final_status, Some(200));
+        assert_eq!(r.trailers_seen, 1);
+        assert_eq!(r.completed, 1);
+    }
+
 }

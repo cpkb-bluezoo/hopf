@@ -30,7 +30,7 @@ use std::time::Duration;
 use hopf_core::{ProtocolHandler, Runtime, TcpConnectorConfig};
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
-use crate::{ClientHandlerFactory, H1Endpoint, H2Endpoint, HttpLimits};
+use crate::{ClientHandlerFactory, H1Endpoint, H2Endpoint, H2cUpgradeClientEndpoint, HttpLimits};
 
 #[cfg(feature = "h3")]
 use crate::h3::connect_h3;
@@ -86,9 +86,6 @@ pub fn connect_http(
     timeouts: HttpClientTimeouts,
     resolver: Option<Arc<DnsResolver>>,
 ) -> io::Result<()> {
-    let connect_timeout = Some(timeouts.connect);
-
-    // Build a shared handler factory (Fn, not FnOnce, required by TcpConnectorConfig).
     let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
         Arc::new(move || -> Box<dyn ProtocolHandler> {
             if http2 {
@@ -97,6 +94,46 @@ pub fn connect_http(
                 Box::new(H1Endpoint::client(Arc::clone(&factory), limits, false))
             }
         });
+    dial(rt, host_or_addr, port, &timeouts, resolver, make_handler)
+}
+
+/// Dial an HTTP/2 peer via HTTP/1.1 h2c Upgrade (RFC 7540 §3.2): the request
+/// is sent as HTTP/1.1 with `Upgrade: h2c`, promoting to H2 on a `101`
+/// response — or completing as a plain HTTP/1.1 exchange if the peer
+/// doesn't support the upgrade (support is optional for servers).
+///
+/// Prefer [`connect_http`] with `http2 = true` when the peer is already
+/// known to support prior-knowledge H2 — it skips this extra round-trip.
+///
+/// Returns immediately; the TCP connect and protocol handshake run
+/// asynchronously on a worker reactor.
+pub fn connect_http2_upgrade(
+    rt: &Arc<Runtime>,
+    host_or_addr: &str,
+    port: u16,
+    factory: Arc<dyn ClientHandlerFactory>,
+    limits: HttpLimits,
+    timeouts: HttpClientTimeouts,
+    resolver: Option<Arc<DnsResolver>>,
+) -> io::Result<()> {
+    let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
+        Arc::new(move || -> Box<dyn ProtocolHandler> {
+            Box::new(H2cUpgradeClientEndpoint::new(Arc::clone(&factory), limits))
+        });
+    dial(rt, host_or_addr, port, &timeouts, resolver, make_handler)
+}
+
+/// Shared DNS-resolve-then-connect plumbing for [`connect_http`] and
+/// [`connect_http2_upgrade`].
+fn dial(
+    rt: &Arc<Runtime>,
+    host_or_addr: &str,
+    port: u16,
+    timeouts: &HttpClientTimeouts,
+    resolver: Option<Arc<DnsResolver>>,
+    make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync>,
+) -> io::Result<()> {
+    let connect_timeout = Some(timeouts.connect);
 
     // Literal IP / full SocketAddr → skip DNS.
     if let Some(addr) = resolve_literal(host_or_addr, port) {
