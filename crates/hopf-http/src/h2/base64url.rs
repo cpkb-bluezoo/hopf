@@ -16,6 +16,38 @@ fn char_value(b: u8) -> Option<u8> {
     }
 }
 
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Encode `input` as base64url (RFC 4648 §5, no padding) — used to build the
+/// `HTTP2-Settings` header value for a client-side h2c Upgrade request.
+pub fn encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity((input.len() * 4).div_ceil(3));
+    let mut chunks = input.chunks_exact(3);
+    for c in &mut chunks {
+        let block = ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32;
+        out.push(ALPHABET[(block >> 18 & 0x3f) as usize] as char);
+        out.push(ALPHABET[(block >> 12 & 0x3f) as usize] as char);
+        out.push(ALPHABET[(block >> 6 & 0x3f) as usize] as char);
+        out.push(ALPHABET[(block & 0x3f) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    match rem.len() {
+        1 => {
+            let block = (rem[0] as u32) << 16;
+            out.push(ALPHABET[(block >> 18 & 0x3f) as usize] as char);
+            out.push(ALPHABET[(block >> 12 & 0x3f) as usize] as char);
+        }
+        2 => {
+            let block = ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8);
+            out.push(ALPHABET[(block >> 18 & 0x3f) as usize] as char);
+            out.push(ALPHABET[(block >> 12 & 0x3f) as usize] as char);
+            out.push(ALPHABET[(block >> 6 & 0x3f) as usize] as char);
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Decode a base64url-encoded string without requiring padding characters.
 ///
 /// Returns `None` if the input contains characters outside the base64url
@@ -75,6 +107,32 @@ mod tests {
     #[test]
     fn decode_empty() {
         assert_eq!(decode("").unwrap(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn encode_enable_push_zero_matches_decode_fixture() {
+        assert_eq!(encode(&[0x00, 0x02, 0x00, 0x00, 0x00, 0x00]), "AAIAAAAA");
+    }
+
+    #[test]
+    fn encode_decode_roundtrip_all_remainder_lengths() {
+        for input in [
+            &b""[..],
+            &b"f"[..],
+            &b"fo"[..],
+            &b"foo"[..],
+            &b"foob"[..],
+            &b"fooba"[..],
+            &b"foobar"[..],
+            &[0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05][..],
+        ] {
+            let encoded = encode(input);
+            assert!(
+                encoded.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "output must be padding-free base64url: {encoded:?}"
+            );
+            assert_eq!(decode(&encoded).unwrap(), input, "roundtrip failed for {input:?}");
+        }
     }
 
     #[test]
