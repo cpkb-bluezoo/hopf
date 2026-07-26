@@ -100,11 +100,53 @@ fn alloc_id(g: &ResolverInner) -> u16 {
     }
 }
 
+/// On timeout, retry against the next configured server instead of failing
+/// outright — a single slow/dead upstream shouldn't fail every query when
+/// redundant servers are configured (`add_server`/`add_server_str`).
+/// Exhausting every server fails the query as `TimedOut`, same as when
+/// only one server was ever configured. Also used to (re-)arm the timeout
+/// for a CNAME-chase re-query, which previously had none at all.
+fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
+    let mut g = inner.lock().unwrap();
+    let Some(mut pending) = g.pending.remove(&id) else {
+        return; // already answered, or a stale timer from an earlier retry
+    };
+    let next_idx = pending.server_idx + 1;
+    let Some(&next_server) = g.servers.get(next_idx) else {
+        (pending.callback)(Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "DNS query timed out",
+        )));
+        return;
+    };
+    pending.server_idx = next_idx;
+    pending.server = next_server;
+    let new_id = alloc_id(&g);
+    pending.id = new_id;
+    let timeout = g.timeout;
+    let inner2 = Arc::clone(inner);
+    let cancel = g.reactor.schedule_timer(timeout, Box::new(move || retry_or_fail(&inner2, new_id)));
+    pending.cancel = Some(cancel);
+    let question = pending.question.clone();
+    g.pending.insert(new_id, pending);
+    if let Err(e) = send_udp_query(&mut g, new_id, &question, next_server) {
+        if let Some(p) = g.pending.remove(&new_id) {
+            if let Some(c) = &p.cancel {
+                c.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            (p.callback)(Err(e));
+        }
+    }
+}
+
 /// RFC 5452 §2.2: an accepted response's question section must match the
 /// question actually sent — compared case-insensitively on the name since
 /// DNS names are case-insensitive and some resolvers normalize case.
+/// Compares the *raw* type/class wire values rather than the parsed
+/// `Option<DnsType>`/`Option<DnsClass>`: two different unrecognized types
+/// both parse to `None`, which must not compare equal to each other.
 fn questions_match(a: &DnsQuestion, b: &DnsQuestion) -> bool {
-    a.qtype == b.qtype && a.qclass == b.qclass && a.name.eq_ignore_ascii_case(&b.name)
+    a.raw_qtype == b.raw_qtype && a.raw_qclass == b.raw_qclass && a.name.eq_ignore_ascii_case(&b.name)
 }
 
 struct ResolverInner {
@@ -332,6 +374,14 @@ impl DnsResolver {
             cb(Ok(msg));
             return;
         }
+        if g.cache.is_nodata_cached(&question) {
+            // RFC 2308 §2 NODATA: NOERROR with an empty answer set, not NXDOMAIN.
+            let mut msg = DnsMessage::query(0, question, true);
+            msg.flags |= crate::wire::FLAG_QR | crate::wire::FLAG_RA;
+            drop(g);
+            cb(Ok(msg));
+            return;
+        }
         if let Some(records) = g.cache.lookup(&question) {
             let mut msg = DnsMessage::query(0, question, true);
             msg.flags |= crate::wire::FLAG_QR | crate::wire::FLAG_RA;
@@ -355,15 +405,7 @@ impl DnsResolver {
             timeout,
             Box::new({
                 let inner = Arc::clone(&self.inner);
-                move || {
-                    let mut g = inner.lock().unwrap();
-                    if let Some(p) = g.pending.remove(&id) {
-                        (p.callback)(Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "DNS query timed out",
-                        )));
-                    }
-                }
+                move || retry_or_fail(&inner, id)
             }),
         );
         g.pending.insert(
@@ -477,11 +519,11 @@ fn hosts_answers(question: &DnsQuestion) -> Option<Vec<DnsResourceRecord>> {
     let mut out = Vec::new();
     for ip in addrs {
         match (question.qtype, ip) {
-            (DnsType::A, IpAddr::V4(v4)) => out.push(DnsResourceRecord::a(&question.name, 0, v4)),
-            (DnsType::Aaaa, IpAddr::V6(v6)) => {
+            (Some(DnsType::A), IpAddr::V4(v4)) => out.push(DnsResourceRecord::a(&question.name, 0, v4)),
+            (Some(DnsType::Aaaa), IpAddr::V6(v6)) => {
                 out.push(DnsResourceRecord::aaaa(&question.name, 0, v6))
             }
-            (DnsType::A, IpAddr::V6(_)) | (DnsType::Aaaa, IpAddr::V4(_)) => {}
+            (Some(DnsType::A), IpAddr::V6(_)) | (Some(DnsType::Aaaa), IpAddr::V4(_)) => {}
             _ => {}
         }
     }
@@ -575,7 +617,7 @@ impl UdpDatagramHandler for ResolverUdpHandler {
                     };
                     let mut g = inner.lock().unwrap();
                     match result {
-                        Ok(msg) => complete_response(&mut g, pending, msg, server),
+                        Ok(msg) => complete_response(&inner, &mut g, pending, msg, server),
                         Err(e) => (pending.callback)(Err(e)),
                     }
                 })
@@ -583,11 +625,12 @@ impl UdpDatagramHandler for ResolverUdpHandler {
             return;
         }
 
-        complete_response(&mut g, pending, msg, peer);
+        complete_response(&self.inner, &mut g, pending, msg, peer);
     }
 }
 
 fn complete_response(
+    inner: &Arc<Mutex<ResolverInner>>,
     g: &mut ResolverInner,
     mut pending: PendingQuery,
     mut msg: DnsMessage,
@@ -597,10 +640,9 @@ fn complete_response(
         msg.answers = filter_answers_in_bailiwick(&pending.question.name, &msg.answers);
     }
     // CNAME chase
-    if pending.question.qtype == DnsType::A || pending.question.qtype == DnsType::Aaaa {
+    if let Some(qtype @ (DnsType::A | DnsType::Aaaa)) = pending.question.qtype {
         let has_addr = msg.answers.iter().any(|rr| {
-            (pending.question.qtype == DnsType::A && rr.as_a().is_some())
-                || (pending.question.qtype == DnsType::Aaaa && rr.as_aaaa().is_some())
+            (qtype == DnsType::A && rr.as_a().is_some()) || (qtype == DnsType::Aaaa && rr.as_aaaa().is_some())
         });
         if !has_addr {
             if let Some(cname) = msg
@@ -611,21 +653,14 @@ fn complete_response(
             {
                 if pending.cname_depth < MAX_CNAME_DEPTH {
                     pending.cname_depth += 1;
-                    pending.question = DnsQuestion::in_class(cname, pending.question.qtype);
+                    pending.question = DnsQuestion::in_class(cname, qtype);
                     let id = alloc_id(g);
                     pending.id = id;
                     let server = g.servers.get(pending.server_idx).copied().unwrap_or(server);
                     pending.server = server;
                     let timeout = g.timeout;
-                    let cancel = g.reactor.schedule_timer(
-                        timeout,
-                        Box::new({
-                            let inner_id = id;
-                            // can't easily clone Arc here without restructuring — skip re-timeout
-                            let _ = inner_id;
-                            move || {}
-                        }),
-                    );
+                    let inner2 = Arc::clone(inner);
+                    let cancel = g.reactor.schedule_timer(timeout, Box::new(move || retry_or_fail(&inner2, id)));
                     pending.cancel = Some(cancel);
                     let q = pending.question.clone();
                     g.pending.insert(id, pending);
