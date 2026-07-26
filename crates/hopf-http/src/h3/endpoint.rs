@@ -24,12 +24,17 @@ use super::{frame, qpack, H3FrameHandler, H3Parser};
 pub struct H3ServerConnection {
     factory: Arc<dyn ServerHandlerFactory>,
     limits: HttpLimits,
+    peer_state: Arc<Mutex<H3PeerState>>,
 }
 
 impl H3ServerConnection {
     /// Create an HTTP/3 server connection.
     pub fn new(factory: Arc<dyn ServerHandlerFactory>, limits: HttpLimits) -> Self {
-        Self { factory, limits }
+        Self {
+            factory,
+            limits,
+            peer_state: Arc::new(Mutex::new(H3PeerState::default())),
+        }
     }
 }
 
@@ -53,7 +58,7 @@ impl QuicConnection for H3ServerConnection {
     }
 
     fn accept_uni(&mut self) -> Box<dyn ProtocolHandler> {
-        Box::new(H3UniStream::default())
+        Box::new(H3UniStream::new(Arc::clone(&self.peer_state)))
     }
 }
 
@@ -391,23 +396,348 @@ impl ProtocolHandler for H3RequestStream {
     fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
 }
 
-/// Consumes the type byte and ignores peer control/QPACK unidirectional streams.
+/// RFC 9114 §6.2 / RFC 9204 §4.2 unidirectional stream type identifiers.
+const STREAM_TYPE_CONTROL: u64 = 0x00;
+const STREAM_TYPE_QPACK_ENCODER: u64 = 0x02;
+const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
+
+/// Per-connection unidirectional-stream bookkeeping, shared across every
+/// [`H3UniStream`] accepted on the same connection.
+///
+/// Lets each new uni stream detect a duplicate control or QPACK critical
+/// stream (RFC 9114 §6.2.1, RFC 9204 §4.2), and records the peer's parsed
+/// SETTINGS (RFC 9114 §7.2.4) once their control stream sends one.
 #[derive(Default)]
+pub(crate) struct H3PeerState {
+    control_seen: bool,
+    qpack_encoder_seen: bool,
+    qpack_decoder_seen: bool,
+    /// `true` once the peer's SETTINGS frame advertised
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL=1` (RFC 9220).
+    #[allow(dead_code)] // not yet consulted anywhere — see conformance.html
+    pub(crate) peer_enable_connect_protocol: bool,
+}
+
+/// What an [`H3UniStream`] does with bytes once its type byte is known.
+enum UniKind {
+    /// Type byte not read yet.
+    Unclassified,
+    /// The (first, valid) control stream — bytes route through the H3
+    /// frame parser so SETTINGS/GOAWAY get processed.
+    Control(H3Parser),
+    /// Anything else: a QPACK critical stream (dynamic table is disabled,
+    /// so there's nothing to decode from it), a duplicate critical stream,
+    /// or an unknown/reserved type (RFC 9114 §9 requires tolerating these).
+    Discard,
+}
+
+/// Reads the RFC 9114 §6.2 type-byte prefix of a peer unidirectional
+/// stream, then either parses it (control stream) or discards it.
 pub(crate) struct H3UniStream {
-    type_seen: bool,
+    peer_state: Arc<Mutex<H3PeerState>>,
+    kind: UniKind,
+    /// Buffered bytes while the type-byte varint is still incomplete —
+    /// values above the standard single-byte types (e.g. GREASE, RFC 9114
+    /// §7.2.8) legitimately span multiple bytes.
+    pending_type: Vec<u8>,
+}
+
+impl H3UniStream {
+    pub(crate) fn new(peer_state: Arc<Mutex<H3PeerState>>) -> Self {
+        Self {
+            peer_state,
+            kind: UniKind::Unclassified,
+            pending_type: Vec::new(),
+        }
+    }
+
+    /// Classify by type byte, updating shared connection state. Returns
+    /// `true` if this is a duplicate critical stream that RFC 9114 wants
+    /// treated as a connection error (`H3_STREAM_CREATION_ERROR`).
+    fn classify(&mut self, ty: u64) -> bool {
+        let mut state = self.peer_state.lock().unwrap();
+        match ty {
+            STREAM_TYPE_CONTROL if !state.control_seen => {
+                state.control_seen = true;
+                drop(state);
+                self.kind = UniKind::Control(H3Parser::new());
+                false
+            }
+            STREAM_TYPE_QPACK_ENCODER if !state.qpack_encoder_seen => {
+                state.qpack_encoder_seen = true;
+                self.kind = UniKind::Discard;
+                false
+            }
+            STREAM_TYPE_QPACK_DECODER if !state.qpack_decoder_seen => {
+                state.qpack_decoder_seen = true;
+                self.kind = UniKind::Discard;
+                false
+            }
+            STREAM_TYPE_CONTROL | STREAM_TYPE_QPACK_ENCODER | STREAM_TYPE_QPACK_DECODER => {
+                self.kind = UniKind::Discard;
+                true
+            }
+            _ => {
+                // Unknown/reserved type (includes GREASE) — tolerate per RFC 9114 §9.
+                self.kind = UniKind::Discard;
+                false
+            }
+        }
+    }
+}
+
+impl H3FrameHandler for H3UniStream {
+    fn data_frame(&mut self, _payload: &[u8]) {
+        // RFC 9114 §7.2/§4.1: DATA never appears on the control stream.
+        // No connection-level close primitive exists yet to reject it (see
+        // the malformed-frame-handling conformance gap) — simply not
+        // processed as anything meaningful.
+    }
+    fn headers_frame(&mut self, _payload: &[u8]) {
+        // Same — HEADERS is a request/response-stream-only frame type.
+    }
+    fn settings_frame(&mut self, payload: &[u8]) {
+        let mut enable_connect_protocol = None;
+        for (id, val) in frame::parse_settings(payload) {
+            if id == frame::SETTINGS_ENABLE_CONNECT_PROTOCOL {
+                enable_connect_protocol = Some(val != 0);
+            }
+        }
+        if let Some(v) = enable_connect_protocol {
+            self.peer_state.lock().unwrap().peer_enable_connect_protocol = v;
+        }
+    }
+    fn goaway_frame(&mut self, _payload: &[u8]) {
+        // GOAWAY reception handling is tracked separately.
+    }
+    fn frame_error(&mut self, _message: &str) {}
 }
 
 impl ProtocolHandler for H3UniStream {
     fn connected(&mut self, _: &mut dyn Endpoint) {}
-    fn receive(&mut self, _: &mut dyn Endpoint, data: &mut &[u8]) {
-        if !self.type_seen && !data.is_empty() {
-            // Stream types used by H3 are single-byte QUIC varints.
-            self.type_seen = true;
+
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        if matches!(self.kind, UniKind::Unclassified) {
+            self.pending_type.extend_from_slice(data);
+            *data = &[];
+            let Some((ty, ty_len)) = super::varint::decode(&self.pending_type) else {
+                return; // need more bytes
+            };
+            let remainder = self.pending_type.split_off(ty_len);
+            self.pending_type.clear();
+
+            if self.classify(ty) {
+                // Best available response today: hopf-quic doesn't yet
+                // expose a connection-level or abrupt-stream close (see
+                // the stream-cancellation conformance gap), so stop
+                // reading from this duplicate stream rather than silently
+                // treat it as valid.
+                endpoint.close();
+            }
+
+            if !remainder.is_empty() {
+                let mut rem: &[u8] = &remainder;
+                self.receive(endpoint, &mut rem);
+            }
+            return;
+        }
+
+        if let UniKind::Control(_) = &self.kind {
+            // Detach the parser first — it needs `&mut self` as its
+            // `H3FrameHandler` sink, which would otherwise overlap with
+            // the `&mut self.kind` borrow holding it.
+            let UniKind::Control(mut parser) = std::mem::replace(&mut self.kind, UniKind::Discard)
+            else {
+                unreachable!()
+            };
+            parser.push(data, self);
+            self.kind = UniKind::Control(parser);
         }
         *data = &[];
     }
+
     fn disconnected(&mut self, _: &mut dyn Endpoint) {}
     fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
+}
+
+#[cfg(test)]
+mod uni_stream_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Minimal [`Endpoint`] stub recording only whether `close()` was called
+    /// — all these tests need.
+    #[derive(Default)]
+    struct RecordingEndpoint {
+        closed: bool,
+    }
+    impl Endpoint for RecordingEndpoint {
+        fn send(&mut self, _data: &[u8]) {}
+        fn is_open(&self) -> bool {
+            !self.closed
+        }
+        fn is_closing(&self) -> bool {
+            self.closed
+        }
+        fn close(&mut self) {
+            self.closed = true;
+        }
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn remote_addr(&self) -> std::io::Result<SocketAddr> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn security_info(&self) -> &hopf_core::SecurityInfo {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn start_tls(&mut self) -> Result<(), hopf_core::StartTlsError> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _callback: Option<hopf_core::WriteReadyCallback>) {}
+        fn execute(&self, _task: Box<dyn FnOnce() + Send>) {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn schedule_timer(
+            &self,
+            _delay: Duration,
+            _callback: Box<dyn FnOnce() + Send>,
+        ) -> hopf_core::TimerHandle {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn handle(&self) -> hopf_core::ConnHandle {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+
+    fn shared_state() -> Arc<Mutex<H3PeerState>> {
+        Arc::new(Mutex::new(H3PeerState::default()))
+    }
+
+    #[test]
+    fn control_stream_settings_are_parsed_and_stored() {
+        let state = shared_state();
+        let mut uni = H3UniStream::new(Arc::clone(&state));
+        let mut ep = RecordingEndpoint::default();
+
+        let mut bytes = vec![0x00]; // control stream type
+        frame::write_settings(&mut bytes); // ENABLE_CONNECT_PROTOCOL=1
+        let mut data: &[u8] = &bytes;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(data.is_empty());
+        assert!(!ep.closed);
+        let s = state.lock().unwrap();
+        assert!(s.control_seen);
+        assert!(s.peer_enable_connect_protocol);
+    }
+
+    /// The type byte and the SETTINGS frame bytes arriving in separate
+    /// `receive()` calls must still parse correctly.
+    #[test]
+    fn control_stream_type_and_settings_split_across_receives() {
+        let state = shared_state();
+        let mut uni = H3UniStream::new(Arc::clone(&state));
+        let mut ep = RecordingEndpoint::default();
+
+        let mut settings_bytes = Vec::new();
+        frame::write_settings(&mut settings_bytes);
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+        assert!(state.lock().unwrap().control_seen, "type byte alone must classify the stream");
+
+        for byte in &settings_bytes {
+            let mut one: &[u8] = std::slice::from_ref(byte);
+            uni.receive(&mut ep, &mut one);
+        }
+
+        assert!(state.lock().unwrap().peer_enable_connect_protocol);
+    }
+
+    #[test]
+    fn qpack_encoder_and_decoder_streams_are_recognized_and_discarded() {
+        let state = shared_state();
+
+        let mut encoder = H3UniStream::new(Arc::clone(&state));
+        let mut ep1 = RecordingEndpoint::default();
+        let mut d1: &[u8] = &[0x02];
+        encoder.receive(&mut ep1, &mut d1);
+        assert!(!ep1.closed);
+        assert!(state.lock().unwrap().qpack_encoder_seen);
+
+        let mut decoder = H3UniStream::new(Arc::clone(&state));
+        let mut ep2 = RecordingEndpoint::default();
+        let mut d2: &[u8] = &[0x03];
+        decoder.receive(&mut ep2, &mut d2);
+        assert!(!ep2.closed);
+        assert!(state.lock().unwrap().qpack_decoder_seen);
+    }
+
+    /// A second control stream from the same peer is a protocol violation
+    /// (RFC 9114 §6.2.1) — today's best available response is to stop
+    /// reading it (real connection-level rejection needs QUIC-transport
+    /// work tracked separately).
+    #[test]
+    fn duplicate_control_stream_closes() {
+        let state = shared_state();
+        {
+            let mut first = H3UniStream::new(Arc::clone(&state));
+            let mut ep = RecordingEndpoint::default();
+            let mut d: &[u8] = &[0x00];
+            first.receive(&mut ep, &mut d);
+            assert!(!ep.closed);
+        }
+
+        let mut second = H3UniStream::new(Arc::clone(&state));
+        let mut ep = RecordingEndpoint::default();
+        let mut d: &[u8] = &[0x00];
+        second.receive(&mut ep, &mut d);
+        assert!(ep.closed, "a duplicate control stream must be rejected");
+    }
+
+    #[test]
+    fn duplicate_qpack_encoder_stream_closes() {
+        let state = shared_state();
+        {
+            let mut first = H3UniStream::new(Arc::clone(&state));
+            let mut ep = RecordingEndpoint::default();
+            let mut d: &[u8] = &[0x02];
+            first.receive(&mut ep, &mut d);
+        }
+
+        let mut second = H3UniStream::new(Arc::clone(&state));
+        let mut ep = RecordingEndpoint::default();
+        let mut d: &[u8] = &[0x02];
+        second.receive(&mut ep, &mut d);
+        assert!(ep.closed);
+    }
+
+    /// Unknown/reserved/GREASE stream types (RFC 9114 §9, §7.2.8) must be
+    /// tolerated, not treated as an error, even when the type varint spans
+    /// multiple bytes.
+    #[test]
+    fn unknown_multi_byte_stream_type_is_tolerated() {
+        let state = shared_state();
+        let mut uni = H3UniStream::new(Arc::clone(&state));
+        let mut ep = RecordingEndpoint::default();
+
+        // A 2-byte QUIC varint encoding of a large "reserved" type value.
+        let mut bytes = Vec::new();
+        super::super::varint::encode(&mut bytes, 1000);
+        bytes.extend_from_slice(b"whatever-payload-comes-next");
+        let mut data: &[u8] = &bytes;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(data.is_empty());
+        assert!(!ep.closed);
+        let s = state.lock().unwrap();
+        assert!(!s.control_seen);
+        assert!(!s.qpack_encoder_seen);
+        assert!(!s.qpack_decoder_seen);
+    }
 }
 
 #[cfg(all(test, feature = "integration"))]
