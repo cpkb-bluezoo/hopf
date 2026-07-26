@@ -17,7 +17,6 @@
 pub mod acl;
 pub mod binding;
 pub mod bufpool;
-pub mod byte_stream_lexer;
 pub mod composition;
 pub mod connector;
 pub mod endpoint;
@@ -43,9 +42,6 @@ mod timer;
 pub use acl::{AcceptRateLimit, IpNet, PeerAcl};
 pub use binding::BindingId;
 pub use bufpool::BufferPool;
-pub use byte_stream_lexer::{
-    ByteStreamHandler, ByteStreamLexer, ByteStreamScanner, HandlerControl, ScanAction,
-};
 pub use cmd::ReactorHandle;
 pub use composition::{
     Composition, CompositionRegistry, CompositionXmlError, CompositionXmlResult,

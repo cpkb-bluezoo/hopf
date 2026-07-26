@@ -106,7 +106,7 @@
 </tr>
 </tbody>
 </table>
-<p>Control commands are lexed incrementally with <code>ByteStreamLexer</code> (<code>KEYWORD [SP TEXT] CRLF</code>) — not “buffer until CRLF then re-parse”.</p>
+<p>Control commands are lexed incrementally by <code>Pop3ServerLexer</code> (<code>KEYWORD [SP TEXT] CRLF</code>) — a small self-contained state machine that consumes every byte it's given and owns its own bounded verb/arg scratch buffers, never requiring the caller to retain or re-supply anything. Not “buffer until CRLF then re-parse”.</p>
 <h2 id="handler-spi">Handler SPI</h2>
 <p>Gumdrop-style staged traits:</p>
 <ul>

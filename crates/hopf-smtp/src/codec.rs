@@ -1,23 +1,11 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Incremental SMTP control lexer: `KEYWORD [SP TEXT] CRLF`.
-
-use hopf_core::{
-    ByteStreamHandler, ByteStreamLexer, ByteStreamScanner, HandlerControl, ScanAction,
-};
-
-/// Lexer token kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SmtpToken {
-    /// Command verb.
-    Keyword,
-    /// Single space after the verb.
-    Sp,
-    /// Argument text (may contain spaces); zero-copy chunks.
-    Text,
-    /// End of command line.
-    Crlf,
-}
+//! Incremental SMTP command parser: `KEYWORD [SP TEXT] CRLF`.
+//!
+//! Self-contained streaming parser: [`SmtpServerLexer::feed`] consumes every
+//! byte it is given and keeps a command-in-progress in its own bounded
+//! `verb`/`arg` scratch buffers — never in a buffer the caller has to retain
+//! and re-supply. See `hopf_http::h1::parse` for the design this follows.
 
 /// Parsed control command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,153 +23,131 @@ impl SmtpCommand {
     }
 }
 
-/// Scanner for SMTP control grammar.
-pub struct SmtpScanner {
-    last_was_cr: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Accumulating the verb, up to SP or CR.
+    Verb,
+    /// Accumulating the argument (post-SP), up to CR.
+    Arg,
+    /// Saw CR; a following LF completes the command. Any other byte means
+    /// the CR was literal content, not a terminator.
+    Cr,
+    /// A token exceeded the cap: discard bytes up to the next CRLF (no
+    /// command is produced for the discarded line), then resume normally.
+    Resync,
+    /// Saw CR while resyncing; a following LF ends the discarded line.
+    ResyncCr,
 }
 
-impl Default for SmtpScanner {
-    fn default() -> Self {
-        Self { last_was_cr: false }
-    }
-}
-
-impl ByteStreamScanner for SmtpScanner {
-    type Token = SmtpToken;
-
-    fn consume(&mut self, b: u8, pos: usize, region_start: usize) -> ScanAction<SmtpToken> {
-        if b == b'\n' && self.last_was_cr {
-            let crlf_start = pos.saturating_sub(2);
-            self.last_was_cr = false;
-            if crlf_start > region_start {
-                return ScanAction::Emit {
-                    token: SmtpToken::Keyword,
-                    start: region_start,
-                    end: crlf_start,
-                };
-            }
-            return ScanAction::Emit {
-                token: SmtpToken::Crlf,
-                start: crlf_start,
-                end: pos,
-            };
-        }
-        if b == b'\r' {
-            self.last_was_cr = true;
-            return ScanAction::Continue;
-        }
-        self.last_was_cr = false;
-        if b == b' ' {
-            let sp_start = pos.saturating_sub(1);
-            if sp_start > region_start {
-                return ScanAction::Emit {
-                    token: SmtpToken::Keyword,
-                    start: region_start,
-                    end: sp_start,
-                };
-            }
-            return ScanAction::Emit {
-                token: SmtpToken::Sp,
-                start: sp_start,
-                end: pos,
-            };
-        }
-        ScanAction::Continue
-    }
-
-    fn reset(&mut self) {
-        self.last_was_cr = false;
-    }
-}
-
-/// Accumulates tokens into complete [`SmtpCommand`]s.
-pub struct SmtpCommandBuilder {
-    verb: Option<String>,
-    arg: Vec<u8>,
-    after_sp: bool,
-    /// Completed commands ready for dispatch.
-    pub ready: Vec<SmtpCommand>,
-}
-
-impl Default for SmtpCommandBuilder {
-    fn default() -> Self {
-        Self {
-            verb: None,
-            arg: Vec::new(),
-            after_sp: false,
-            ready: Vec::new(),
-        }
-    }
-}
-
-impl ByteStreamHandler for SmtpCommandBuilder {
-    type Token = SmtpToken;
-
-    fn token(&mut self, ty: SmtpToken, window: &[u8]) -> HandlerControl {
-        match ty {
-            SmtpToken::Keyword => {
-                if self.verb.is_none() {
-                    self.verb = Some(String::from_utf8_lossy(window).to_ascii_uppercase());
-                }
-                HandlerControl::Continue
-            }
-            SmtpToken::Sp => {
-                self.after_sp = true;
-                HandlerControl::LatchText
-            }
-            SmtpToken::Text => {
-                self.arg.extend_from_slice(window);
-                HandlerControl::Continue
-            }
-            SmtpToken::Crlf => {
-                let verb = self.verb.take().unwrap_or_default();
-                let arg_bytes = std::mem::take(&mut self.arg);
-                self.after_sp = false;
-                if !verb.is_empty() {
-                    self.ready.push(SmtpCommand { verb, arg_bytes });
-                }
-                HandlerControl::Continue
-            }
-        }
-    }
-
-    fn token_too_long(&mut self) {
-        self.verb = None;
-        self.arg.clear();
-        self.after_sp = false;
-    }
-}
-
-/// Push lexer wrapping scanner + command builder.
+/// Incremental SMTP command-line parser.
 pub struct SmtpServerLexer {
-    lexer: ByteStreamLexer<SmtpScanner, SmtpCommandBuilder>,
-    pending: Vec<u8>,
+    max_line: usize,
+    state: State,
+    verb: Vec<u8>,
+    arg: Vec<u8>,
+    have_arg: bool,
+    ready: Vec<SmtpCommand>,
 }
 
 impl SmtpServerLexer {
-    /// Create with a max command-line length (bytes).
+    /// Create with a max token length (bytes), applied to the verb and to
+    /// the argument independently.
     pub fn new(max_line: usize) -> Self {
         Self {
-            lexer: ByteStreamLexer::new(
-                SmtpScanner::default(),
-                SmtpCommandBuilder::default(),
-                max_line,
-                SmtpToken::Crlf,
-                SmtpToken::Text,
-            ),
-            pending: Vec::new(),
+            max_line,
+            state: State::Verb,
+            verb: Vec::new(),
+            arg: Vec::new(),
+            have_arg: false,
+            ready: Vec::new(),
         }
     }
 
     /// Feed inbound control bytes; returns newly completed commands.
+    ///
+    /// Consumes everything given — `*data` is always left empty. A line
+    /// whose verb or argument exceeds the cap is silently discarded (no
+    /// command produced), matching the prior lexer's behavior.
     pub fn feed(&mut self, data: &mut &[u8]) -> Vec<SmtpCommand> {
-        self.pending.extend_from_slice(data);
+        for &b in data.iter() {
+            self.push_byte(b);
+        }
         *data = &[];
-        let mut slice = self.pending.as_slice();
-        self.lexer.feed(&mut slice);
-        let consumed = self.pending.len() - slice.len();
-        self.pending.drain(..consumed);
-        std::mem::take(&mut self.lexer.handler_mut().ready)
+        std::mem::take(&mut self.ready)
+    }
+
+    fn push_byte(&mut self, b: u8) {
+        loop {
+            match self.state {
+                State::Resync => {
+                    if b == b'\r' {
+                        self.state = State::ResyncCr;
+                    }
+                    return;
+                }
+                State::ResyncCr => {
+                    if b == b'\n' {
+                        self.state = State::Verb;
+                    } else if b != b'\r' {
+                        self.state = State::Resync;
+                    }
+                    return;
+                }
+                State::Cr => {
+                    if b == b'\n' {
+                        self.finish_command();
+                        self.state = State::Verb;
+                        return;
+                    }
+                    // Literal CR, not a terminator — keep it as content and
+                    // re-dispatch this byte under the token that was active.
+                    self.push_content(b'\r');
+                    self.state = if self.have_arg { State::Arg } else { State::Verb };
+                    continue;
+                }
+                State::Verb => {
+                    if b == b'\r' {
+                        self.state = State::Cr;
+                    } else if b == b' ' {
+                        self.have_arg = true;
+                        self.state = State::Arg;
+                    } else {
+                        self.push_content(b);
+                    }
+                    return;
+                }
+                State::Arg => {
+                    if b == b'\r' {
+                        self.state = State::Cr;
+                    } else {
+                        self.push_content(b);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    fn push_content(&mut self, b: u8) {
+        let buf = if self.have_arg { &mut self.arg } else { &mut self.verb };
+        if buf.len() >= self.max_line {
+            self.verb.clear();
+            self.arg.clear();
+            self.have_arg = false;
+            self.state = State::Resync;
+            return;
+        }
+        buf.push(b);
+    }
+
+    fn finish_command(&mut self) {
+        let verb = String::from_utf8_lossy(&self.verb).to_ascii_uppercase();
+        let arg_bytes = std::mem::take(&mut self.arg);
+        self.verb.clear();
+        self.have_arg = false;
+        if !verb.is_empty() {
+            self.ready.push(SmtpCommand { verb, arg_bytes });
+        }
     }
 }
 
@@ -194,6 +160,7 @@ mod tests {
         let mut lex = SmtpServerLexer::new(4096);
         let mut data: &[u8] = b"MAIL FROM:<a@b.com>\r\n";
         let cmds = lex.feed(&mut data);
+        assert!(data.is_empty());
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].verb, "MAIL");
         assert_eq!(cmds[0].arg_bytes, b"FROM:<a@b.com>");
@@ -213,9 +180,81 @@ mod tests {
         let mut lex = SmtpServerLexer::new(4096);
         let mut a: &[u8] = b"EHL";
         assert!(lex.feed(&mut a).is_empty());
+        assert!(a.is_empty());
         let mut b: &[u8] = b"O client.example\r\n";
         let cmds = lex.feed(&mut b);
+        assert!(b.is_empty());
         assert_eq!(cmds[0].verb, "EHLO");
         assert_eq!(cmds[0].arg_bytes, b"client.example");
+    }
+
+    #[test]
+    fn pipelined_commands() {
+        let mut lex = SmtpServerLexer::new(4096);
+        let mut data: &[u8] = b"MAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\n";
+        let cmds = lex.feed(&mut data);
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[0].verb, "MAIL");
+        assert_eq!(cmds[1].verb, "RCPT");
+        assert_eq!(cmds[2].verb, "DATA");
+    }
+
+    #[test]
+    fn oversized_token_discards_and_resyncs() {
+        let mut lex = SmtpServerLexer::new(4);
+        let mut data: &[u8] = b"TOOLONG arg\r\nNOOP\r\n";
+        let cmds = lex.feed(&mut data);
+        assert_eq!(cmds.iter().map(|c| c.verb.as_str()).collect::<Vec<_>>(), vec!["NOOP"]);
+    }
+
+    #[test]
+    fn literal_cr_not_followed_by_lf_is_content() {
+        let mut lex = SmtpServerLexer::new(4096);
+        let mut data: &[u8] = b"RCPT a\rb\r\n";
+        let cmds = lex.feed(&mut data);
+        assert_eq!(cmds[0].verb, "RCPT");
+        assert_eq!(cmds[0].arg_bytes, b"a\rb");
+    }
+
+    /// One byte per `feed()` call must produce identical commands to a
+    /// single bulk feed, and never leave anything unconsumed.
+    #[test]
+    fn one_byte_at_a_time_matches_bulk_feed() {
+        let msg: &[u8] = b"MAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nQUIT\r\n";
+
+        let mut bulk = SmtpServerLexer::new(4096);
+        let mut bulk_data = msg;
+        let bulk_cmds = bulk.feed(&mut bulk_data);
+
+        let mut drip = SmtpServerLexer::new(4096);
+        let mut drip_cmds = Vec::new();
+        for &b in msg {
+            let mut one: &[u8] = &[b];
+            drip_cmds.extend(drip.feed(&mut one));
+            assert!(one.is_empty());
+        }
+
+        assert_eq!(bulk_cmds, drip_cmds);
+        assert_eq!(bulk_cmds.len(), 3);
+    }
+
+    /// Every split point of a full command stream must be equivalent.
+    #[test]
+    fn all_split_points_are_equivalent() {
+        let msg: &[u8] = b"MAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nDATA\r\nQUIT\r\n";
+        let mut base = SmtpServerLexer::new(4096);
+        let mut base_data = msg;
+        let base_cmds = base.feed(&mut base_data);
+
+        for split in 1..msg.len() {
+            let mut lex = SmtpServerLexer::new(4096);
+            let mut a: &[u8] = &msg[..split];
+            let mut cmds = lex.feed(&mut a);
+            assert!(a.is_empty(), "split {split} retained bytes");
+            let mut b: &[u8] = &msg[split..];
+            cmds.extend(lex.feed(&mut b));
+            assert!(b.is_empty(), "split {split} retained bytes");
+            assert_eq!(cmds, base_cmds, "split {split} diverged");
+        }
     }
 }

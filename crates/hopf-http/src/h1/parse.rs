@@ -22,11 +22,6 @@
 //! Body bytes are never buffered at all — [`H1Events::body_data`] receives
 //! borrowed slices straight out of the caller's buffer, however the chunk
 //! boundaries happen to fall.
-//!
-//! This replaces the generic `hopf_core::ByteStreamLexer`, whose contract
-//! required the *caller* to retain an incomplete token's bytes and re-feed
-//! them on the next call — which pushed a growing line buffer up into the
-//! transport's receive buffer and re-delivered the same bytes repeatedly.
 
 use crate::version::HttpVersion;
 

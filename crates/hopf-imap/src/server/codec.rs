@@ -1,10 +1,21 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Incremental IMAP server command lexer (tag + args + literals).
+//! Incremental IMAP server command parser (tag + args + literals).
+//!
+//! Self-contained streaming parser: [`ImapServerLexer::feed`] consumes every
+//! byte it is given and keeps a command-in-progress in its own bounded
+//! `tag`/`rest` scratch buffers — never in a buffer the caller has to retain
+//! and re-supply. See `hopf_http::h1::parse` for the design this follows.
+//!
+//! IMAP's line grammar is the same `TAG SP REST CRLF` shape as POP3/SMTP/FTP
+//! (`REST` here is simply accumulated verbatim, spaces and all — it gets
+//! split into verb + args only once the line is complete), plus one wrinkle:
+//! a trailing `{n}` / `{n+}` on `REST` announces `n` raw octets that follow
+//! immediately after the line's CRLF, before the command continues. Those
+//! octets are copied in bulk slices as they arrive (never byte-by-byte) and
+//! spliced onto `REST` once complete, so a multi-megabyte literal streams
+//! through in whatever chunk sizes the transport delivers.
 
-use hopf_core::{
-    ByteStreamHandler, ByteStreamLexer, ByteStreamScanner, HandlerControl, ScanAction,
-};
 use hopf_mailbox::{Flag, MessageSet};
 
 use crate::handler::StoreAction;
@@ -17,19 +28,6 @@ pub const MAX_LITERAL_SIZE: u64 = 32 * 1024 * 1024;
 
 /// LITERAL- non-synchronizing literal cap (RFC 7888).
 pub const LITERAL_MINUS_LIMIT: u64 = 4096;
-
-/// Lexer token kinds (outer KEYWORD [SP TEXT] CRLF grammar).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImapToken {
-    /// Tag or post-literal atom fragment.
-    Keyword,
-    /// Single SP after tag / fragment.
-    Sp,
-    /// Free-form argument text chunks.
-    Text,
-    /// End of a physical line.
-    Crlf,
-}
 
 /// A completed IMAP command ready for dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,335 +59,331 @@ pub enum LexEvent {
     },
 }
 
-/// Scanner for IMAP control grammar (identical shape to POP3/SMTP).
-pub struct ImapScanner {
-    last_was_cr: bool,
-}
-
-impl Default for ImapScanner {
-    fn default() -> Self {
-        Self { last_was_cr: false }
-    }
-}
-
-impl ByteStreamScanner for ImapScanner {
-    type Token = ImapToken;
-
-    fn consume(&mut self, b: u8, pos: usize, region_start: usize) -> ScanAction<ImapToken> {
-        if b == b'\n' && self.last_was_cr {
-            let crlf_start = pos.saturating_sub(2);
-            self.last_was_cr = false;
-            if crlf_start > region_start {
-                return ScanAction::Emit {
-                    token: ImapToken::Keyword,
-                    start: region_start,
-                    end: crlf_start,
-                };
-            }
-            return ScanAction::Emit {
-                token: ImapToken::Crlf,
-                start: crlf_start,
-                end: pos,
-            };
-        }
-        if b == b'\r' {
-            self.last_was_cr = true;
-            return ScanAction::Continue;
-        }
-        self.last_was_cr = false;
-        if b == b' ' {
-            let sp_start = pos.saturating_sub(1);
-            if sp_start > region_start {
-                return ScanAction::Emit {
-                    token: ImapToken::Keyword,
-                    start: region_start,
-                    end: sp_start,
-                };
-            }
-            return ScanAction::Emit {
-                token: ImapToken::Sp,
-                start: sp_start,
-                end: pos,
-            };
-        }
-        ScanAction::Continue
-    }
-
-    fn reset(&mut self) {
-        self.last_was_cr = false;
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiteralPhase {
     None,
     /// Waiting for raw bytes of a general-purpose (arg) literal.
-    General {
-        remaining: u64,
-        non_sync: bool,
-    },
+    General { remaining: u64 },
     /// Waiting for APPEND message-body literal.
-    Append {
-        remaining: u64,
-    },
+    Append { remaining: u64 },
 }
 
-/// Accumulates tokens; detects `{n}` / `{n+}` at CRLF and requests raw mode.
-pub struct ImapCommandBuilder {
-    fresh_command: bool,
-    pending_tag: String,
-    pending_has_sp: bool,
-    args: Vec<u8>,
-    segment_bytes: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Accumulating the tag, up to SP or CR.
+    Tag,
+    /// Accumulating the rest of the line (verb + args, literal splices
+    /// included), up to CR.
+    Rest,
+    /// Saw CR; a following LF completes the line. Any other byte means the
+    /// CR was literal content, not a terminator.
+    Cr,
+    /// Streaming a literal's raw octets (`LiteralPhase` says which).
+    Literal,
+    /// A token exceeded the cap: discard bytes up to the next CRLF (no
+    /// command is produced for the discarded line), then resume normally.
+    Resync,
+    /// Saw CR while resyncing; a following LF ends the discarded line.
+    ResyncCr,
+}
+
+/// Incremental IMAP command-line parser with literal support.
+pub struct ImapServerLexer {
     max_line: usize,
-    /// Completed events.
-    pub events: Vec<LexEvent>,
-    /// Pending EnterRaw size after CRLF handling.
-    pending_raw: Option<u64>,
-    literal_phase: LiteralPhase,
-    general_literal_buf: Vec<u8>,
+    state: State,
+    tag: Vec<u8>,
+    /// True while accumulating the tag (before the first SP of a fresh
+    /// command line); false once accumulating `rest`.
+    fresh_command: bool,
+    rest: Vec<u8>,
+    /// Length of the current typed (non-literal) run, for the `max_line` cap.
+    typed_bytes: usize,
+    literal: LiteralPhase,
+    literal_buf: Vec<u8>,
     /// APPEND body bytes (exposed to the control handler).
-    pub append_body: Vec<u8>,
-    /// When set, APPEND literal just finished.
-    pub append_complete: bool,
-    line_too_long: bool,
+    append_body: Vec<u8>,
+    /// When set, an APPEND literal just finished.
+    append_complete: bool,
+    ready: Vec<LexEvent>,
 }
 
-impl ImapCommandBuilder {
-    fn new(max_line: usize) -> Self {
+impl ImapServerLexer {
+    /// Create with a max command-line length.
+    pub fn new(max_line: usize) -> Self {
         Self {
-            fresh_command: true,
-            pending_tag: String::new(),
-            pending_has_sp: false,
-            args: Vec::new(),
-            segment_bytes: 0,
             max_line,
-            events: Vec::new(),
-            pending_raw: None,
-            literal_phase: LiteralPhase::None,
-            general_literal_buf: Vec::new(),
+            state: State::Tag,
+            tag: Vec::new(),
+            fresh_command: true,
+            rest: Vec::new(),
+            typed_bytes: 0,
+            literal: LiteralPhase::None,
+            literal_buf: Vec::new(),
             append_body: Vec::new(),
             append_complete: false,
-            line_too_long: false,
+            ready: Vec::new(),
         }
     }
 
-    fn reset_command(&mut self) {
-        self.fresh_command = true;
-        self.pending_tag.clear();
-        self.pending_has_sp = false;
-        self.args.clear();
-        self.segment_bytes = 0;
-        self.literal_phase = LiteralPhase::None;
-        self.general_literal_buf.clear();
+    /// Feed inbound bytes; returns newly completed lex events (commands,
+    /// continuations, errors). Consumes everything given — `*data` is
+    /// always left empty.
+    pub fn feed(&mut self, data: &mut &[u8]) -> Vec<LexEvent> {
+        while !data.is_empty() {
+            if self.state == State::Literal {
+                self.feed_literal(data);
+            } else {
+                let b = data[0];
+                *data = &data[1..];
+                self.push_byte(b);
+            }
+        }
+        std::mem::take(&mut self.ready)
     }
 
-    fn finish_command(&mut self) {
-        let tag = std::mem::take(&mut self.pending_tag);
-        let arg_bytes = std::mem::take(&mut self.args);
-        self.fresh_command = true;
-        self.pending_has_sp = false;
-        self.segment_bytes = 0;
-        if tag.is_empty() {
-            return;
-        }
-        // Split verb from args.
-        let (verb, rest) = split_verb(&arg_bytes);
-        self.events.push(LexEvent::Command(ImapCommand {
-            tag,
-            verb,
-            args: String::from_utf8_lossy(&rest).into_owned(),
-            arg_bytes: rest,
-        }));
-    }
-
-    /// Detect trailing `{n}` / `{n+}` on the current args; return size + non_sync.
-    fn trailing_literal(args: &[u8]) -> Option<(u64, bool)> {
-        if args.last() != Some(&b'}') {
-            return None;
-        }
-        let open = args.iter().rposition(|&b| b == b'{')?;
-        let inner = &args[open + 1..args.len() - 1];
-        if inner.is_empty() {
-            return None;
-        }
-        let non_sync = inner.last() == Some(&b'+');
-        let digits = if non_sync {
-            &inner[..inner.len() - 1]
+    /// Take APPEND body if a literal just completed.
+    pub fn take_append_body(&mut self) -> Option<Vec<u8>> {
+        if self.append_complete {
+            self.append_complete = false;
+            Some(std::mem::take(&mut self.append_body))
         } else {
-            inner
+            None
+        }
+    }
+
+    /// Whether currently reading a literal.
+    pub fn in_literal(&self) -> bool {
+        !matches!(self.literal, LiteralPhase::None)
+    }
+
+    /// Consume as much of a literal's raw octets from `data` as are
+    /// available, in one bulk slice — never byte-by-byte.
+    fn feed_literal(&mut self, data: &mut &[u8]) {
+        let remaining = match self.literal {
+            LiteralPhase::General { remaining } => remaining,
+            LiteralPhase::Append { remaining } => remaining,
+            LiteralPhase::None => unreachable!("feed_literal only called in State::Literal"),
         };
-        if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        let n: u64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
-        Some((n, non_sync))
-    }
-}
-
-impl ByteStreamHandler for ImapCommandBuilder {
-    type Token = ImapToken;
-
-    fn token(&mut self, ty: ImapToken, window: &[u8]) -> HandlerControl {
-        match ty {
-            ImapToken::Keyword => {
-                self.segment_bytes = window.len();
-                if self.fresh_command {
-                    self.pending_tag = String::from_utf8_lossy(window).into_owned();
-                } else {
-                    self.args.extend_from_slice(window);
-                }
-                HandlerControl::Continue
-            }
-            ImapToken::Sp => {
-                self.segment_bytes += 1;
-                if self.fresh_command {
+        let take = (remaining as usize).min(data.len());
+        let (chunk, rest_data) = data.split_at(take);
+        *data = rest_data;
+        match &mut self.literal {
+            LiteralPhase::General { remaining } => {
+                self.literal_buf.extend_from_slice(chunk);
+                *remaining -= take as u64;
+                if *remaining == 0 {
+                    self.rest.append(&mut self.literal_buf);
+                    self.literal = LiteralPhase::None;
                     self.fresh_command = false;
-                    self.pending_has_sp = true;
-                } else {
-                    self.args.push(b' ');
-                }
-                HandlerControl::LatchText
-            }
-            ImapToken::Text => {
-                if self.segment_bytes + window.len() > self.max_line {
-                    self.line_too_long = true;
-                    let tag = if self.pending_tag.is_empty() {
-                        "*".into()
-                    } else {
-                        self.pending_tag.clone()
-                    };
-                    self.reset_command();
-                    self.events.push(LexEvent::Error {
-                        tag,
-                        message: "Line too long".into(),
-                    });
-                    return HandlerControl::Continue;
-                }
-                self.args.extend_from_slice(window);
-                self.segment_bytes += window.len();
-                HandlerControl::Continue
-            }
-            ImapToken::Crlf => {
-                if self.line_too_long {
-                    self.line_too_long = false;
-                    return HandlerControl::Continue;
-                }
-                // Bare DONE / auth abort without tag: treat keyword-only as command.
-                if self.fresh_command && !self.pending_tag.is_empty() && !self.pending_has_sp {
-                    // Tag-only line (e.g. idle DONE uses lowercase) — promote to verb.
-                    let verb = self.pending_tag.to_ascii_uppercase();
-                    let tag = "*".to_string();
-                    self.events.push(LexEvent::Command(ImapCommand {
-                        tag,
-                        verb,
-                        args: String::new(),
-                        arg_bytes: Vec::new(),
-                    }));
-                    self.reset_command();
-                    return HandlerControl::Continue;
-                }
-
-                if let Some((n, non_sync)) = Self::trailing_literal(&self.args) {
-                    if n > MAX_LITERAL_SIZE {
-                        let tag = self.pending_tag.clone();
-                        self.reset_command();
-                        self.events.push(LexEvent::Error {
-                            tag: if tag.is_empty() { "*".into() } else { tag },
-                            message: "Literal too large".into(),
-                        });
-                        return HandlerControl::Continue;
-                    }
-                    // LITERAL- (RFC 7888): synchronizing literals larger than 4 KiB are rejected.
-                    if !non_sync && n > LITERAL_MINUS_LIMIT {
-                        let tag = self.pending_tag.clone();
-                        self.reset_command();
-                        self.events.push(LexEvent::Error {
-                            tag: if tag.is_empty() { "*".into() } else { tag },
-                            message: "Synchronizing literal too large (LITERAL-)".into(),
-                        });
-                        return HandlerControl::Continue;
-                    }
-                    // Strip `{n[+]}` from args; splice data after raw.
-                    if let Some(open) = self.args.iter().rposition(|&b| b == b'{') {
-                        self.args.truncate(open);
-                    }
-                    // APPEND body literal: verb APPEND and this is the final arg literal.
-                    let is_append = is_append_body_literal(&self.args);
-                    if is_append {
-                        self.append_body.clear();
-                        self.append_complete = false;
-                        self.literal_phase = LiteralPhase::Append { remaining: n };
-                    } else {
-                        self.general_literal_buf.clear();
-                        self.literal_phase = LiteralPhase::General {
-                            remaining: n,
-                            non_sync,
-                        };
-                    }
-                    if !non_sync {
-                        self.events.push(LexEvent::NeedContinuation);
-                    }
-                    self.pending_raw = Some(n);
-                    self.segment_bytes = 0;
-                    return HandlerControl::EnterRaw(n);
-                }
-
-                self.finish_command();
-                HandlerControl::Continue
-            }
-        }
-    }
-
-    fn raw_bytes(&mut self, slice: &[u8]) -> HandlerControl {
-        let phase = self.literal_phase;
-        match phase {
-            LiteralPhase::General {
-                remaining,
-                non_sync,
-            } => {
-                self.general_literal_buf.extend_from_slice(slice);
-                let left = remaining.saturating_sub(slice.len() as u64);
-                if left == 0 {
-                    self.args.append(&mut self.general_literal_buf);
-                    self.literal_phase = LiteralPhase::None;
-                    self.fresh_command = false;
-                } else {
-                    self.literal_phase = LiteralPhase::General {
-                        remaining: left,
-                        non_sync,
-                    };
+                    self.state = State::Rest;
                 }
             }
             LiteralPhase::Append { remaining } => {
-                self.append_body.extend_from_slice(slice);
-                let left = remaining.saturating_sub(slice.len() as u64);
-                if left == 0 {
-                    self.literal_phase = LiteralPhase::None;
+                self.append_body.extend_from_slice(chunk);
+                *remaining -= take as u64;
+                if *remaining == 0 {
+                    self.literal = LiteralPhase::None;
                     self.append_complete = true;
                     self.finish_command();
-                } else {
-                    self.literal_phase = LiteralPhase::Append { remaining: left };
+                    self.state = State::Tag;
                 }
             }
-            LiteralPhase::None => {}
+            LiteralPhase::None => unreachable!(),
         }
-        HandlerControl::Continue
     }
 
-    fn token_too_long(&mut self) {
-        let tag = if self.pending_tag.is_empty() {
-            "*".into()
-        } else {
-            self.pending_tag.clone()
-        };
-        self.reset_command();
-        self.events.push(LexEvent::Error {
-            tag,
-            message: "Line too long".into(),
-        });
-        self.line_too_long = true;
+    fn push_byte(&mut self, b: u8) {
+        loop {
+            match self.state {
+                State::Resync => {
+                    if b == b'\r' {
+                        self.state = State::ResyncCr;
+                    }
+                    return;
+                }
+                State::ResyncCr => {
+                    if b == b'\n' {
+                        self.state = State::Tag;
+                    } else if b != b'\r' {
+                        self.state = State::Resync;
+                    }
+                    return;
+                }
+                State::Cr => {
+                    if b == b'\n' {
+                        self.on_crlf();
+                        return;
+                    }
+                    // Literal CR, not a terminator — keep it as content and
+                    // re-dispatch this byte under the run that was active.
+                    self.push_content(b'\r');
+                    self.state = if self.fresh_command {
+                        State::Tag
+                    } else {
+                        State::Rest
+                    };
+                    continue;
+                }
+                State::Tag => {
+                    if b == b'\r' {
+                        self.state = State::Cr;
+                    } else if b == b' ' {
+                        self.fresh_command = false;
+                        self.typed_bytes = 0;
+                        self.state = State::Rest;
+                    } else {
+                        self.push_content(b);
+                    }
+                    return;
+                }
+                State::Rest => {
+                    if b == b'\r' {
+                        self.state = State::Cr;
+                    } else {
+                        self.push_content(b);
+                    }
+                    return;
+                }
+                State::Literal => unreachable!("feed() never calls push_byte in State::Literal"),
+            }
+        }
     }
+
+    fn push_content(&mut self, b: u8) {
+        if self.typed_bytes >= self.max_line {
+            self.emit_error("Line too long");
+            self.reset_command();
+            self.state = State::Resync;
+            return;
+        }
+        let buf = if self.fresh_command {
+            &mut self.tag
+        } else {
+            &mut self.rest
+        };
+        buf.push(b);
+        self.typed_bytes += 1;
+    }
+
+    /// CRLF confirmed while in `Tag` or `Rest` — decide whether the line is
+    /// a bare tag-only command, opens a literal, or completes a command.
+    fn on_crlf(&mut self) {
+        // Bare tag-only line (e.g. IDLE's "DONE", sent without a tag).
+        if self.fresh_command && !self.tag.is_empty() {
+            let verb = String::from_utf8_lossy(&self.tag).to_ascii_uppercase();
+            self.tag.clear();
+            self.rest.clear();
+            self.typed_bytes = 0;
+            self.ready.push(LexEvent::Command(ImapCommand {
+                tag: "*".to_string(),
+                verb,
+                args: String::new(),
+                arg_bytes: Vec::new(),
+            }));
+            self.state = State::Tag;
+            return;
+        }
+
+        if let Some((n, non_sync)) = trailing_literal(&self.rest) {
+            if n > MAX_LITERAL_SIZE {
+                self.emit_error("Literal too large");
+                self.reset_command();
+                self.state = State::Tag;
+                return;
+            }
+            // LITERAL- (RFC 7888): synchronizing literals larger than 4 KiB are rejected.
+            if !non_sync && n > LITERAL_MINUS_LIMIT {
+                self.emit_error("Synchronizing literal too large (LITERAL-)");
+                self.reset_command();
+                self.state = State::Tag;
+                return;
+            }
+            // Strip `{n[+]}` from rest; the literal's bytes are spliced back
+            // on once complete.
+            if let Some(open) = self.rest.iter().rposition(|&b| b == b'{') {
+                self.rest.truncate(open);
+            }
+            // APPEND body literal: verb APPEND and this is the final arg literal.
+            if is_append_body_literal(&self.rest) {
+                self.append_body.clear();
+                self.append_complete = false;
+                self.literal = LiteralPhase::Append { remaining: n };
+            } else {
+                self.literal_buf.clear();
+                self.literal = LiteralPhase::General { remaining: n };
+            }
+            if !non_sync {
+                self.ready.push(LexEvent::NeedContinuation);
+            }
+            self.typed_bytes = 0;
+            self.state = State::Literal;
+            return;
+        }
+
+        self.finish_command();
+        self.state = State::Tag;
+    }
+
+    fn emit_error(&mut self, message: &str) {
+        let tag = if self.tag.is_empty() {
+            "*".to_string()
+        } else {
+            String::from_utf8_lossy(&self.tag).into_owned()
+        };
+        self.ready.push(LexEvent::Error {
+            tag,
+            message: message.to_string(),
+        });
+    }
+
+    fn reset_command(&mut self) {
+        self.tag.clear();
+        self.rest.clear();
+        self.fresh_command = true;
+        self.typed_bytes = 0;
+        self.literal = LiteralPhase::None;
+        self.literal_buf.clear();
+    }
+
+    fn finish_command(&mut self) {
+        let tag = std::mem::take(&mut self.tag);
+        let rest = std::mem::take(&mut self.rest);
+        self.fresh_command = true;
+        self.typed_bytes = 0;
+        if tag.is_empty() {
+            return;
+        }
+        let (verb, arg_bytes) = split_verb(&rest);
+        self.ready.push(LexEvent::Command(ImapCommand {
+            tag: String::from_utf8_lossy(&tag).into_owned(),
+            verb,
+            args: String::from_utf8_lossy(&arg_bytes).into_owned(),
+            arg_bytes,
+        }));
+    }
+}
+
+/// Detect trailing `{n}` / `{n+}` on the current rest buffer; return size + non_sync.
+fn trailing_literal(rest: &[u8]) -> Option<(u64, bool)> {
+    if rest.last() != Some(&b'}') {
+        return None;
+    }
+    let open = rest.iter().rposition(|&b| b == b'{')?;
+    let inner = &rest[open + 1..rest.len() - 1];
+    if inner.is_empty() {
+        return None;
+    }
+    let non_sync = inner.last() == Some(&b'+');
+    let digits = if non_sync {
+        &inner[..inner.len() - 1]
+    } else {
+        inner
+    };
+    if digits.is_empty() || !digits.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: u64 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    Some((n, non_sync))
 }
 
 fn split_verb(args: &[u8]) -> (String, Vec<u8>) {
@@ -430,55 +424,6 @@ fn is_append_body_literal(args_without_literal: &[u8]) -> bool {
     let s = String::from_utf8_lossy(args_without_literal);
     let t = s.trim_start();
     t.len() >= 6 && t[..6].eq_ignore_ascii_case("APPEND")
-}
-
-/// Push lexer for IMAP commands with literal support.
-pub struct ImapServerLexer {
-    lexer: ByteStreamLexer<ImapScanner, ImapCommandBuilder>,
-    pending: Vec<u8>,
-}
-
-impl ImapServerLexer {
-    /// Create with a max command-line length.
-    pub fn new(max_line: usize) -> Self {
-        Self {
-            lexer: ByteStreamLexer::new(
-                ImapScanner::default(),
-                ImapCommandBuilder::new(max_line),
-                max_line,
-                ImapToken::Crlf,
-                ImapToken::Text,
-            ),
-            pending: Vec::new(),
-        }
-    }
-
-    /// Feed inbound bytes; returns lex events (commands, continuations, errors).
-    pub fn feed(&mut self, data: &mut &[u8]) -> Vec<LexEvent> {
-        self.pending.extend_from_slice(data);
-        *data = &[];
-        let mut slice = self.pending.as_slice();
-        self.lexer.feed(&mut slice);
-        let consumed = self.pending.len() - slice.len();
-        self.pending.drain(..consumed);
-        std::mem::take(&mut self.lexer.handler_mut().events)
-    }
-
-    /// Take APPEND body if a literal just completed.
-    pub fn take_append_body(&mut self) -> Option<Vec<u8>> {
-        let h = self.lexer.handler_mut();
-        if h.append_complete {
-            h.append_complete = false;
-            Some(std::mem::take(&mut h.append_body))
-        } else {
-            None
-        }
-    }
-
-    /// Whether currently reading a literal.
-    pub fn in_literal(&self) -> bool {
-        !matches!(self.lexer.handler().literal_phase, LiteralPhase::None)
-    }
 }
 
 /// Parse an IMAP astring (atom / quoted) from the start of `s`.
@@ -602,6 +547,7 @@ mod tests {
         let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 NOOP\r\n";
         let ev = lex.feed(&mut data);
+        assert!(data.is_empty());
         assert_eq!(ev.len(), 1);
         match &ev[0] {
             LexEvent::Command(c) => {
@@ -631,11 +577,8 @@ mod tests {
     fn non_sync_literal() {
         let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
         let mut data: &[u8] = b"a1 LOGIN {5+}\r\nalice secret\r\n";
-        // First feed: tag LOGIN {5+}\r\n then literal alice, then " secret\r\n"
-        // Actually: `a1 LOGIN {5+}\r\n` + `alice` + ` secret\r\n`
-        // After literal splice args = "LOGIN " + "alice", then more text " secret"
         let ev = lex.feed(&mut data);
-        // May need continuation? No, non-sync.
+        assert!(data.is_empty());
         let cmds: Vec<_> = ev
             .into_iter()
             .filter_map(|e| match e {
@@ -643,8 +586,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // Depending on how trailing text after literal is scanned, we should get LOGIN.
-        assert!(!cmds.is_empty() || true); // exercised without panic
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].verb, "LOGIN");
+        assert_eq!(cmds[0].args, "alice secret");
         let mut data2: &[u8] = b"a2 CAPABILITY\r\n";
         let ev2 = lex.feed(&mut data2);
         assert!(matches!(ev2[0], LexEvent::Command(_)));
@@ -668,6 +612,85 @@ mod tests {
             .collect();
         assert!(!cmds.is_empty());
         assert_eq!(cmds[0].verb, "LOGIN");
+        assert_eq!(cmds[0].args, "alice secret");
+    }
+
+    #[test]
+    fn literal_split_across_many_feeds() {
+        // The literal's bytes arrive one at a time across many feed() calls,
+        // proving bulk-vs-dribbled delivery is equivalent and nothing is
+        // ever retained by the caller.
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let msg: &[u8] = b"a1 LOGIN {5}\r\nalice secret\r\n";
+        let mut events = Vec::new();
+        for &b in msg {
+            let mut one: &[u8] = &[b];
+            events.extend(lex.feed(&mut one));
+            assert!(one.is_empty());
+        }
+        let cmds: Vec<_> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                LexEvent::Command(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].verb, "LOGIN");
+        assert_eq!(cmds[0].args, "alice secret");
+    }
+
+    #[test]
+    fn append_literal_streams_and_finishes_command() {
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut data: &[u8] = b"a1 APPEND INBOX {5}\r\nhello\r\n";
+        let ev = lex.feed(&mut data);
+        assert!(data.is_empty());
+        assert!(matches!(ev[0], LexEvent::NeedContinuation));
+        let cmds: Vec<_> = ev
+            .into_iter()
+            .filter_map(|e| match e {
+                LexEvent::Command(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].verb, "APPEND");
+        let body = lex.take_append_body().expect("append body");
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn in_literal_reports_mid_literal_state() {
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut data: &[u8] = b"a1 LOGIN {5+}\r\nal";
+        let _ = lex.feed(&mut data);
+        assert!(lex.in_literal());
+        let mut rest: &[u8] = b"ice secret\r\n";
+        let _ = lex.feed(&mut rest);
+        assert!(!lex.in_literal());
+    }
+
+    #[test]
+    fn oversized_literal_rejected() {
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let line = format!("a1 LOGIN {{{}}}\r\n", MAX_LITERAL_SIZE + 1);
+        let mut data: &[u8] = line.as_bytes();
+        let ev = lex.feed(&mut data);
+        assert!(matches!(
+            &ev[0],
+            LexEvent::Error { tag, message } if tag == "a1" && message == "Literal too large"
+        ));
+    }
+
+    #[test]
+    fn oversized_sync_literal_over_literal_minus_limit_rejected() {
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let n = LITERAL_MINUS_LIMIT + 1;
+        let line = format!("a1 LOGIN {{{n}}}\r\n");
+        let mut data: &[u8] = line.as_bytes();
+        let ev = lex.feed(&mut data);
+        assert!(matches!(&ev[0], LexEvent::Error { tag, .. } if tag == "a1"));
     }
 
     #[test]
@@ -688,6 +711,128 @@ mod tests {
         match &ev[0] {
             LexEvent::Command(c) => assert_eq!(c.verb, "NOOP"),
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn bare_tag_only_line_is_idle_done() {
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut data: &[u8] = b"DONE\r\n";
+        let ev = lex.feed(&mut data);
+        match &ev[0] {
+            LexEvent::Command(c) => {
+                assert_eq!(c.tag, "*");
+                assert_eq!(c.verb, "DONE");
+                assert!(c.args.is_empty());
+            }
+            _ => panic!("expected command"),
+        }
+    }
+
+    #[test]
+    fn blank_line_produces_no_command() {
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut data: &[u8] = b"\r\na1 NOOP\r\n";
+        let ev = lex.feed(&mut data);
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(&ev[0], LexEvent::Command(c) if c.verb == "NOOP"));
+    }
+
+    #[test]
+    fn oversized_tag_discards_and_resyncs() {
+        let mut lex = ImapServerLexer::new(4);
+        let mut data: &[u8] = b"toolongtag NOOP\r\na2 NOOP\r\n";
+        let ev = lex.feed(&mut data);
+        let cmds: Vec<_> = ev
+            .into_iter()
+            .filter_map(|e| match e {
+                LexEvent::Command(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].tag, "a2");
+    }
+
+    #[test]
+    fn literal_cr_not_followed_by_lf_is_content() {
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut data: &[u8] = b"a1 LOGIN a\rb\r\n";
+        let ev = lex.feed(&mut data);
+        match &ev[0] {
+            LexEvent::Command(c) => {
+                assert_eq!(c.verb, "LOGIN");
+                assert_eq!(c.args, "a\rb");
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// One byte per `feed()` call must produce identical commands to a
+    /// single bulk feed, and never leave anything unconsumed.
+    #[test]
+    fn one_byte_at_a_time_matches_bulk_feed() {
+        let msg: &[u8] = b"a1 LOGIN alice secret\r\na2 CAPABILITY\r\na3 LOGOUT\r\n";
+
+        let mut bulk = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut bulk_data = msg;
+        let bulk_ev = bulk.feed(&mut bulk_data);
+        let bulk_cmds: Vec<_> = bulk_ev
+            .into_iter()
+            .filter_map(|e| match e {
+                LexEvent::Command(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+
+        let mut drip = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut drip_cmds = Vec::new();
+        for &b in msg {
+            let mut one: &[u8] = &[b];
+            let ev = drip.feed(&mut one);
+            assert!(one.is_empty());
+            drip_cmds.extend(ev.into_iter().filter_map(|e| match e {
+                LexEvent::Command(c) => Some(c),
+                _ => None,
+            }));
+        }
+
+        assert_eq!(bulk_cmds, drip_cmds);
+        assert_eq!(bulk_cmds.len(), 3);
+    }
+
+    /// Every split point of a full command stream (including one with a
+    /// literal) must be equivalent.
+    #[test]
+    fn all_split_points_are_equivalent() {
+        let msg: &[u8] = b"a1 LOGIN {5}\r\nalice secret\r\na2 CAPABILITY\r\na3 LOGOUT\r\n";
+        let mut base = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut base_data = msg;
+        let base_ev = base.feed(&mut base_data);
+        let base_cmds: Vec<_> = base_ev
+            .into_iter()
+            .filter_map(|e| match e {
+                LexEvent::Command(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+
+        for split in 1..msg.len() {
+            let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+            let mut a: &[u8] = &msg[..split];
+            let mut ev = lex.feed(&mut a);
+            assert!(a.is_empty(), "split {split} retained bytes");
+            let mut b: &[u8] = &msg[split..];
+            ev.extend(lex.feed(&mut b));
+            assert!(b.is_empty(), "split {split} retained bytes");
+            let cmds: Vec<_> = ev
+                .into_iter()
+                .filter_map(|e| match e {
+                    LexEvent::Command(c) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(cmds, base_cmds, "split {split} diverged");
         }
     }
 

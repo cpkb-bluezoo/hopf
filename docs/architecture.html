@@ -275,7 +275,7 @@
 <h2 id="auth-vocabulary">Auth vocabulary</h2>
 <p>Prefer <strong>TrustPolicy</strong> + <strong>IdentityMaterial</strong> over Realm-as-root naming. Attach to <strong>both</strong> listen and dial. SASL client/server are <strong>wire roles</strong>, independent of listen/dial. See <a href="auth.html">auth</a>.</p>
 <h2 id="codec-style">Codec style</h2>
-<p><strong>Grammar-driven incremental codecs:</strong> protocol-specific token alphabets on shared <code>ByteStreamLexer</code>; update the parse FSM as each production completes; CRLF is one production, not the only event boundary. Early <strong>parse</strong> state ≠ early <strong>app</strong> callbacks. Sibling incremental parsers (tractrix, rjsonparser, rmimeparser, rprotobuf) follow the same push model for XML/JSON/MIME/protobuf.</p>
+<p><strong>Grammar-driven incremental codecs:</strong> each protocol owns a self-contained parser (<code>H1Scanner</code>, <code>Pop3ServerLexer</code>, <code>SmtpServerLexer</code>, <code>FtpServerLexer</code>, <code>ImapServerLexer</code>, …) with its own token alphabet and bounded in-progress-token scratch state; update the parse FSM as each production completes; CRLF is one production, not the only event boundary. A parser consumes every byte it's handed in a single call and never asks the caller to retain or re-supply anything. Early <strong>parse</strong> state ≠ early <strong>app</strong> callbacks. Sibling incremental parsers (tractrix, rjsonparser, rmimeparser, rprotobuf) follow the same push model for XML/JSON/MIME/protobuf.</p>
 <h2 id="dependencies">Dependencies</h2>
 <h3 id="allowed-hard">Allowed (hard)</h3>
 <table>

@@ -27,7 +27,7 @@ pub mod client;
 #[cfg(feature = "integration")]
 mod integration;
 
-pub use codec::{Pop3Command, Pop3ServerLexer, Pop3Token, MAX_COMMAND_LINE};
+pub use codec::{Pop3Command, Pop3ServerLexer, MAX_COMMAND_LINE};
 pub use control::Pop3ControlHandler;
 pub use egress::{dot_stuff_message, truncate_top};
 pub use handler::{
