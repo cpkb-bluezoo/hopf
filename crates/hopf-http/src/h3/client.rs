@@ -4,7 +4,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use hopf_core::{Endpoint, ProtocolHandler};
 use hopf_quic::{
@@ -15,19 +15,24 @@ use crate::{
     ClientHandler, ClientHandlerFactory, ClientWriter, Headers, HttpLimits,
 };
 
-use super::endpoint::H3UniStream;
+use super::endpoint::{H3PeerState, H3UniStream};
 use super::{frame, qpack, H3FrameHandler, H3Parser};
 
 /// HTTP/3 client connection installed in the QUIC hooks driver.
 pub struct H3ClientConnection {
     factory: Arc<dyn ClientHandlerFactory>,
     limits: HttpLimits,
+    peer_state: Arc<Mutex<H3PeerState>>,
 }
 
 impl H3ClientConnection {
     /// Create an HTTP/3 client connection (one request Stream after handshake).
     pub fn new(factory: Arc<dyn ClientHandlerFactory>, limits: HttpLimits) -> Self {
-        Self { factory, limits }
+        Self {
+            factory,
+            limits,
+            peer_state: Arc::new(Mutex::new(H3PeerState::default())),
+        }
     }
 }
 
@@ -52,7 +57,7 @@ impl QuicConnection for H3ClientConnection {
     }
 
     fn accept_uni(&mut self) -> Box<dyn ProtocolHandler> {
-        Box::new(H3UniStream::default())
+        Box::new(H3UniStream::new(Arc::clone(&self.peer_state)))
     }
 }
 
