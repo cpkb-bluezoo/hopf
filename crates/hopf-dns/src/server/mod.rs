@@ -27,9 +27,7 @@ use std::sync::Arc;
 use crate::cache::DnsCache;
 use crate::client::DnsResolver;
 use crate::cookie::DnsCookie;
-use crate::wire::{
-    DnsMessage, DnsQueryIdGenerator, OPCODE_QUERY, RCODE_NOTIMP, RCODE_REFUSED, RCODE_SERVFAIL,
-};
+use crate::wire::{DnsMessage, OPCODE_QUERY, RCODE_NOTIMP, RCODE_REFUSED, RCODE_SERVFAIL};
 
 /// Simple server metrics counters.
 #[derive(Debug, Default, Clone)]
@@ -49,7 +47,6 @@ pub struct DnsService {
     cache: Arc<DnsCache>,
     upstream: Option<DnsResolver>,
     cookies: DnsCookie,
-    ids: DnsQueryIdGenerator,
     metrics: std::sync::Mutex<DnsServerMetrics>,
     /// Optional local resolve hook: return `Some` to answer, `None` to forward.
     local: Option<Box<dyn Fn(&DnsMessage) -> Option<DnsMessage> + Send + Sync>>,
@@ -62,7 +59,6 @@ impl DnsService {
             cache,
             upstream: None,
             cookies: DnsCookie::new(),
-            ids: DnsQueryIdGenerator::new(),
             metrics: std::sync::Mutex::new(DnsServerMetrics::default()),
             local: None,
         }
@@ -132,8 +128,6 @@ impl DnsService {
             m.upstreams += 1;
             drop(m);
             let (tx, rx) = std::sync::mpsc::channel();
-            let id = self.ids.next_id();
-            let _ = id;
             upstream.query(q.clone(), Box::new(move |r| {
                 let _ = tx.send(r);
             }));
