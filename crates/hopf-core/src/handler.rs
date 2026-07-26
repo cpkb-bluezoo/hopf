@@ -34,6 +34,13 @@ pub trait ProtocolHandler: Send {
     /// finishes (with ALPN). Defer protocol greetings that require TLS until here.
     fn security_established(&mut self, _endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {}
 
+    /// The connection migrated to a new network path (RFC 9000 §9), e.g.
+    /// after a client's Wi-Fi-to-cellular handoff or a NAT rebinding.
+    /// `endpoint` already reflects the new address via `remote_addr()`.
+    /// QUIC-only — TCP-based transports never call this. Default: do
+    /// nothing.
+    fn migrated(&mut self, _endpoint: &mut dyn Endpoint) {}
+
     /// Unrecoverable I/O or protocol error on the endpoint.
     fn error(&mut self, endpoint: &mut dyn Endpoint, err: &io::Error);
 }

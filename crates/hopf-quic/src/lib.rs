@@ -15,9 +15,10 @@ mod runtime_ext;
 mod stream;
 
 pub use config::{
-    client_config_for_certified_pem, client_config_for_pem_bytes, client_config_from_pem,
-    server_config_from_pem, server_config_self_signed, QuicClientConfig, QuicConnectConfig,
-    QuicListenConfig, QuicListenHooksConfig, QuicServerConfig,
+    apply_client_transport_options, apply_server_transport_options, client_config_for_certified_pem,
+    client_config_for_pem_bytes, client_config_from_pem, server_config_from_pem,
+    server_config_self_signed, QuicClientConfig, QuicConnectConfig, QuicListenConfig,
+    QuicListenHooksConfig, QuicServerConfig, QuicTransportOptions,
 };
 pub use driver::{connect_quic, connect_quic_hooks, listen_quic, listen_quic_hooks, QuicDriverHandle};
 pub use hooks::{ConnectionFactory, QuicConnApi, QuicConnection};
