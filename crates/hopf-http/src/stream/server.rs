@@ -34,6 +34,11 @@ pub trait ServerHandler: Send {
     /// Request body finished.
     fn end_request_body(&mut self, _response: &mut dyn ServerWriter) {}
 
+    /// Trailer headers after the request body (a second HEADERS frame on
+    /// H2/H3). Default: ignore — most applications (e.g. gRPC) don't send
+    /// or need request trailers.
+    fn request_trailers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+
     /// Request fully received; response may already be in progress.
     fn request_complete(&mut self, response: &mut dyn ServerWriter);
 }
@@ -181,6 +186,10 @@ impl ServerHandler for Box<dyn ServerHandler> {
 
     fn end_request_body(&mut self, response: &mut dyn ServerWriter) {
         (**self).end_request_body(response);
+    }
+
+    fn request_trailers(&mut self, response: &mut dyn ServerWriter, headers: &Headers) {
+        (**self).request_trailers(response, headers);
     }
 
     fn request_complete(&mut self, response: &mut dyn ServerWriter) {
