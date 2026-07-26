@@ -102,6 +102,7 @@ struct RateState {
     global_count: u32,
     global_start: Option<Instant>,
     sources: HashMap<IpAddr, (u32, Instant)>,
+    last_sweep: Option<Instant>,
 }
 
 impl Clone for AcceptRateLimit {
@@ -146,6 +147,20 @@ impl AcceptRateLimit {
             }
         }
         if self.per_source > 0 {
+            // Sweep expired entries at most once per window, amortizing the
+            // cost across every call in that window: without this, `sources`
+            // is only ever inserted into and grows for the life of the
+            // process, one entry per distinct source IP ever seen.
+            let needs_sweep = match g.last_sweep {
+                Some(last) => now.duration_since(last) >= self.window,
+                None => true,
+            };
+            if needs_sweep {
+                let window = self.window;
+                g.sources
+                    .retain(|_, (_, start)| now.duration_since(*start) < window);
+                g.last_sweep = Some(now);
+            }
             match g.sources.get_mut(&ip) {
                 Some((count, start)) if now.duration_since(*start) < self.window => {
                     if *count >= self.per_source {
@@ -227,6 +242,31 @@ mod tests {
         assert!(g.try_acquire(a));
         assert!(g.try_acquire(b));
         assert!(!g.try_acquire(a));
+    }
+
+    /// `sources` must not grow forever for the life of the process — once a
+    /// source's window has elapsed, the next sweep (triggered by any call at
+    /// least one window after the last sweep) prunes it, bounding memory to
+    /// recently-active sources rather than every distinct IP ever seen.
+    #[test]
+    fn rate_limit_prunes_expired_sources_instead_of_growing_forever() {
+        let window = Duration::from_millis(20);
+        let lim = AcceptRateLimit::new(1, window, 0);
+
+        for i in 0..50u8 {
+            assert!(lim.try_acquire(sa4([10, 0, 0, i], 1)));
+        }
+        assert_eq!(lim.inner.lock().unwrap().sources.len(), 50);
+
+        // Let every tracked entry's window expire, then make one more call
+        // (from a source not in the map) far enough past the last sweep to
+        // trigger a new sweep.
+        std::thread::sleep(window * 2);
+        assert!(lim.try_acquire(sa4([10, 0, 1, 0], 1)));
+
+        // Only the source that triggered the sweep should remain — every
+        // stale entry was pruned rather than sitting there indefinitely.
+        assert_eq!(lim.inner.lock().unwrap().sources.len(), 1);
     }
 }
 
