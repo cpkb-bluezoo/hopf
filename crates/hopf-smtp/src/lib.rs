@@ -31,7 +31,7 @@ pub use client::{
     dot_stuff, SmtpCapabilities, SmtpClient, SmtpClientDriver, SmtpClientEndpoint,
     SmtpClientHandlerFactory, SmtpClientTimeouts, SmtpError, SmtpReply, SmtpResult, SmtpSend,
 };
-pub use codec::{SmtpCommand, SmtpServerLexer, SmtpToken};
+pub use codec::{SmtpCommand, SmtpServerLexer};
 pub use control::SmtpControlHandler;
 pub use data::{BdatAccumulator, DotUnstuffer};
 pub use delivery::{

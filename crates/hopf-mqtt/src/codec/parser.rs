@@ -3,11 +3,10 @@
 //! Incremental push parser for MQTT control packets.
 //!
 //! Mirrors this codebase's [`hopf_http::h2` frame parser](../../hopf-http/src/h2/parser.rs)
-//! shape (accumulate into an internal buffer, drain complete units) rather
-//! than `hopf_core::ByteStreamLexer` — MQTT framing is binary
-//! length-prefixed, not CRLF/text-token oriented, so the shared line-lexer
-//! doesn't fit; a small buffer-and-drain parser does, the same way it does
-//! for HTTP/2 frames.
+//! shape (accumulate into an internal buffer, drain complete units) — MQTT
+//! framing is binary length-prefixed, not CRLF/text-token oriented, so a
+//! small buffer-and-drain parser fits, the same way it does for HTTP/2
+//! frames.
 //!
 //! PUBLISH is the one packet type that can carry an unbounded payload, so
 //! it gets different treatment: the fixed header, remaining-length varint,

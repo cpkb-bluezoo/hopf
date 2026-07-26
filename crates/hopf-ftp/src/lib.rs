@@ -32,7 +32,7 @@ pub use client::{
     FtpSessionWrite, RetrCallback, StorCallback,
 };
 pub use client::reply::{parse_pasv_addr, parse_epsv_port, parse_pwd_path};
-pub use codec::{FtpCommand, FtpServerLexer, FtpToken};
+pub use codec::{FtpCommand, FtpServerLexer};
 pub use control::FtpControlHandler;
 pub use fs::{
     BasicFtpFileSystem, DirectoryChange, FtpFileInfo, FtpFileSystem, FtpFileOpResult,

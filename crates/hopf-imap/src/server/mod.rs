@@ -11,7 +11,7 @@ mod views;
 
 pub use codec::{
     parse_astring, parse_flag_list, parse_sequence_set, parse_store_item, BTreeSetFlags,
-    ImapCommand, ImapServerLexer, ImapToken, LexEvent, LITERAL_MINUS_LIMIT, MAX_COMMAND_LINE,
+    ImapCommand, ImapServerLexer, LexEvent, LITERAL_MINUS_LIMIT, MAX_COMMAND_LINE,
     MAX_LITERAL_SIZE,
 };
 pub use control::ImapControlHandler;
