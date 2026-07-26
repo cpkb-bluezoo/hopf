@@ -41,9 +41,10 @@ use super::flow::FlowControl;
 use super::frame::{
     self, ERROR_COMPRESSION_ERROR, ERROR_ENHANCE_YOUR_CALM, ERROR_FLOW_CONTROL_ERROR,
     ERROR_FRAME_SIZE_ERROR, ERROR_NO_ERROR, ERROR_PROTOCOL_ERROR, ERROR_REFUSED_STREAM,
-    ERROR_SETTINGS_TIMEOUT, FLAG_END_HEADERS, FLAG_END_STREAM, SETTINGS_ENABLE_CONNECT_PROTOCOL,
-    SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_INITIAL_WINDOW_SIZE,
-    SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE, SETTINGS_MAX_HEADER_LIST_SIZE,
+    ERROR_SETTINGS_TIMEOUT, ERROR_STREAM_CLOSED, FLAG_END_HEADERS, FLAG_END_STREAM,
+    SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE,
+    SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE,
+    SETTINGS_MAX_HEADER_LIST_SIZE,
 };
 use super::parser::{H2FrameHandler, H2Parser};
 
@@ -74,6 +75,31 @@ enum ConnState {
     Open,
     /// GOAWAY sent; draining existing streams.
     GoAway,
+}
+
+// ---------------------------------------------------------------------------
+// Per-stream lifecycle state (RFC 9113 §5.1, collapsed to what hopf needs
+// to distinguish)
+// ---------------------------------------------------------------------------
+
+/// A stream's lifecycle relative to `server_streams`/`client_streams` and
+/// `last_stream_id`, computed on demand rather than tracked separately —
+/// stream IDs are monotonically increasing and never reused (RFC 9113
+/// §5.1.1), so "used, now finished" (`Closed`) is fully determined by
+/// comparing against `last_stream_id` without needing an ever-growing set
+/// of every ID ever closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamState {
+    /// This ID has never been used by the peer — receiving most frame
+    /// types for it is a connection error (RFC 9113 §5.1).
+    Idle,
+    /// Currently tracked in `server_streams`/`client_streams`.
+    Open,
+    /// This ID was used and has since finished (normal completion or
+    /// RST_STREAM) — late frames get a stream error (RST_STREAM
+    /// STREAM_CLOSED) rather than being silently dropped or misdiagnosed
+    /// as referencing a stream that was never opened.
+    Closed,
 }
 
 // ---------------------------------------------------------------------------
@@ -990,6 +1016,31 @@ impl H2Endpoint {
         }
     }
 
+    /// Classify `stream_id` for the endpoint's own role (RFC 9113 §5.1) —
+    /// see [`StreamState`].
+    fn stream_state(&self, stream_id: u32) -> StreamState {
+        match &self.role {
+            H2Role::Server { .. } => {
+                if self.server_streams.contains_key(&stream_id) {
+                    StreamState::Open
+                } else if stream_id == 0 || stream_id % 2 == 0 || stream_id > self.last_stream_id {
+                    StreamState::Idle
+                } else {
+                    StreamState::Closed
+                }
+            }
+            H2Role::Client { .. } => {
+                if self.client_streams.contains_key(&stream_id) {
+                    StreamState::Open
+                } else if stream_id == 0 || stream_id > self.last_stream_id {
+                    StreamState::Idle
+                } else {
+                    StreamState::Closed
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // DATA frames
     // -----------------------------------------------------------------------
@@ -1002,7 +1053,9 @@ impl H2Endpoint {
     }
 
     fn on_server_data(&mut self, stream_id: u32, flags: u8, payload: &[u8]) {
-        if stream_id == 0 {
+        if stream_id == 0 || self.stream_state(stream_id) == StreamState::Idle {
+            // RFC 9113 §5.1: any frame but HEADERS/PRIORITY on an idle
+            // stream is a connection error.
             self.send_goaway(ERROR_PROTOCOL_ERROR);
             return;
         }
@@ -1010,12 +1063,22 @@ impl H2Endpoint {
         let data = frame::strip_data_payload(payload, flags);
         let len = data.len();
 
+        // Connection-level flow control must still be accounted for even if
+        // the stream itself has since closed — the peer already spent these
+        // bytes against the shared connection window.
         let (conn_upd, stream_upd) = self.flow.on_data_received(stream_id, len);
         if conn_upd > 0 {
             frame::write_window_update(&mut self.out, 0, conn_upd);
         }
         if stream_upd > 0 {
             frame::write_window_update(&mut self.out, stream_id, stream_upd);
+        }
+
+        if self.stream_state(stream_id) == StreamState::Closed {
+            // RFC 9113 §6.1: DATA on a stream that isn't open or
+            // half-closed(local) gets a stream error, not silence.
+            frame::write_rst_stream(&mut self.out, stream_id, ERROR_STREAM_CLOSED);
+            return;
         }
 
         let end_stream = flags & FLAG_END_STREAM != 0;
@@ -1048,7 +1111,9 @@ impl H2Endpoint {
     }
 
     fn on_client_data(&mut self, stream_id: u32, flags: u8, payload: &[u8]) {
-        if stream_id == 0 {
+        if stream_id == 0 || self.stream_state(stream_id) == StreamState::Idle {
+            // RFC 9113 §5.1: any frame but HEADERS/PRIORITY on an idle
+            // stream is a connection error.
             self.send_goaway(ERROR_PROTOCOL_ERROR);
             return;
         }
@@ -1056,12 +1121,22 @@ impl H2Endpoint {
         let data = frame::strip_data_payload(payload, flags);
         let len = data.len();
 
+        // Connection-level flow control must still be accounted for even if
+        // the stream itself has since closed — the peer already spent these
+        // bytes against the shared connection window.
         let (conn_upd, stream_upd) = self.flow.on_data_received(stream_id, len);
         if conn_upd > 0 {
             frame::write_window_update(&mut self.out, 0, conn_upd);
         }
         if stream_upd > 0 {
             frame::write_window_update(&mut self.out, stream_id, stream_upd);
+        }
+
+        if self.stream_state(stream_id) == StreamState::Closed {
+            // RFC 9113 §6.1: DATA on a stream that isn't open or
+            // half-closed(local) gets a stream error, not silence.
+            frame::write_rst_stream(&mut self.out, stream_id, ERROR_STREAM_CLOSED);
+            return;
         }
 
         let end_stream = flags & FLAG_END_STREAM != 0;
@@ -1123,6 +1198,13 @@ impl H2Endpoint {
     fn on_rst_stream(&mut self, stream_id: u32, payload: &[u8]) {
         if payload.len() != 4 {
             self.send_goaway(ERROR_FRAME_SIZE_ERROR);
+            return;
+        }
+        // RFC 9113 §6.4: RST_STREAM MUST NOT be sent for an idle stream;
+        // receiving one is a connection error. A RST_STREAM for an
+        // already-closed stream is explicitly tolerated (no reply needed).
+        if self.stream_state(stream_id) == StreamState::Idle {
+            self.send_goaway(ERROR_PROTOCOL_ERROR);
             return;
         }
         self.server_streams.remove(&stream_id);
@@ -2284,5 +2366,159 @@ mod client_goaway_tests {
 
         assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(ep.client_streams.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::stream::{
+        ClientHandler, ClientHandlerFactory, ClientWriter, ServerHandler, ServerHandlerFactory,
+    };
+
+    struct NoopServerFactory;
+    impl ServerHandlerFactory for NoopServerFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+    fn server_endpoint() -> H2Endpoint {
+        H2Endpoint::server(Arc::new(NoopServerFactory), HttpLimits::default(), false)
+    }
+
+    struct NoopClientFactory;
+    impl ClientHandlerFactory for NoopClientFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+    fn client_endpoint() -> H2Endpoint {
+        H2Endpoint::client(Arc::new(NoopClientFactory), HttpLimits::default(), false)
+    }
+
+    #[test]
+    fn stream_state_idle_for_id_never_seen() {
+        let ep = server_endpoint();
+        assert_eq!(ep.stream_state(1), StreamState::Idle);
+        assert_eq!(ep.stream_state(99), StreamState::Idle);
+    }
+
+    #[test]
+    fn stream_state_open_while_tracked() {
+        let mut ep = server_endpoint();
+        ep.last_stream_id = 1;
+        ep.server_streams.insert(
+            1,
+            H2ServerStream {
+                id: 1,
+                handler: Box::new(NoopServerHandler),
+                writer: H2StreamWriter::new(1),
+                half_closed_remote: true,
+                paused_body: Vec::new(),
+                paused_end_stream: false,
+                upgraded: None,
+            },
+        );
+        assert_eq!(ep.stream_state(1), StreamState::Open);
+    }
+
+    #[test]
+    fn stream_state_closed_once_used_id_is_no_longer_tracked() {
+        let mut ep = server_endpoint();
+        // Simulate stream 3 having been opened and since finished: it
+        // advanced last_stream_id but no longer has a HashMap entry.
+        ep.last_stream_id = 3;
+        assert_eq!(ep.stream_state(1), StreamState::Closed);
+        assert_eq!(ep.stream_state(3), StreamState::Closed);
+        assert_eq!(ep.stream_state(5), StreamState::Idle, "above last_stream_id");
+    }
+
+    struct NoopServerHandler;
+    impl ServerHandler for NoopServerHandler {
+        fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+        fn request_complete(&mut self, _response: &mut dyn ServerWriter) {}
+    }
+
+    #[test]
+    fn data_on_idle_server_stream_is_a_connection_error() {
+        let mut ep = server_endpoint();
+        ep.on_data(3, 0, b"unexpected");
+        assert_eq!(ep.state, ConnState::GoAway);
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_GOAWAY);
+        let error_code = u32::from_be_bytes([ep.out[13], ep.out[14], ep.out[15], ep.out[16]]);
+        assert_eq!(error_code, ERROR_PROTOCOL_ERROR);
+    }
+
+    #[test]
+    fn data_on_closed_server_stream_gets_rst_stream_closed() {
+        let mut ep = server_endpoint();
+        ep.last_stream_id = 3;
+        ep.on_data(3, 0, b"late data");
+        assert_ne!(ep.state, ConnState::GoAway, "connection stays open");
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_RST_STREAM);
+        let error_code = u32::from_be_bytes([ep.out[9], ep.out[10], ep.out[11], ep.out[12]]);
+        assert_eq!(error_code, ERROR_STREAM_CLOSED);
+    }
+
+    #[test]
+    fn data_on_open_server_stream_is_delivered_normally() {
+        let mut ep = server_endpoint();
+        ep.last_stream_id = 1;
+        ep.server_streams.insert(
+            1,
+            H2ServerStream {
+                id: 1,
+                handler: Box::new(NoopServerHandler),
+                writer: H2StreamWriter::new(1),
+                half_closed_remote: false,
+                paused_body: Vec::new(),
+                paused_end_stream: false,
+                upgraded: None,
+            },
+        );
+        ep.on_data(1, 0, b"hello");
+        assert!(ep.out.is_empty(), "no error frame for an open stream");
+        assert!(ep.server_streams.contains_key(&1), "stream must survive");
+    }
+
+    #[test]
+    fn rst_stream_on_idle_server_stream_is_a_connection_error() {
+        let mut ep = server_endpoint();
+        ep.on_rst_stream(3, &[0, 0, 0, 0]);
+        assert_eq!(ep.state, ConnState::GoAway);
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_GOAWAY);
+    }
+
+    #[test]
+    fn rst_stream_on_closed_server_stream_is_tolerated_silently() {
+        let mut ep = server_endpoint();
+        ep.last_stream_id = 3;
+        ep.on_rst_stream(3, &[0, 0, 0, 0]);
+        assert_ne!(ep.state, ConnState::GoAway);
+        assert!(ep.out.is_empty(), "no reply needed for a late RST_STREAM");
+    }
+
+    #[test]
+    fn data_on_idle_client_stream_is_a_connection_error() {
+        let mut ep = client_endpoint();
+        ep.on_data(3, 0, b"unexpected");
+        assert_eq!(ep.state, ConnState::GoAway);
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_GOAWAY);
+    }
+
+    #[test]
+    fn data_on_closed_client_stream_gets_rst_stream_closed() {
+        let mut ep = client_endpoint();
+        ep.last_stream_id = 1;
+        ep.on_data(1, 0, b"late data");
+        assert_ne!(ep.state, ConnState::GoAway);
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_RST_STREAM);
+        let error_code = u32::from_be_bytes([ep.out[9], ep.out[10], ep.out[11], ep.out[12]]);
+        assert_eq!(error_code, ERROR_STREAM_CLOSED);
     }
 }
