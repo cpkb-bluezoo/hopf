@@ -142,6 +142,33 @@ Endpoint  →  ProtocolHandler sees plaintext
 <span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="co">// Dangerous: trust a single leaf (self-signed smoke tests only)</span></span>
 <span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> connector <span class="op">=</span> connector_for_certified_pem(<span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;leaf.pem&quot;</span>)<span class="op">,</span> <span class="op">&amp;</span>[<span class="st">b&quot;http/1.1&quot;</span>])<span class="op">?;</span></span></code></pre></div>
+<h3 id="virtual-hosting-and-mtls">Virtual hosting (SNI) and mutual TLS</h3>
+<pre class="rust,ignore"><code>use hopf_tls::{acceptor_with_sni_certs, acceptor_with_client_auth, client_config_with_identity};
+
+// One listener, one cert per hostname, dispatched by client SNI.
+let acceptor = acceptor_with_sni_certs(
+    &amp;[
+        (&quot;a.example.com&quot;, Path::new(&quot;a-cert.pem&quot;), Path::new(&quot;a-key.pem&quot;)),
+        (&quot;b.example.com&quot;, Path::new(&quot;b-cert.pem&quot;), Path::new(&quot;b-key.pem&quot;)),
+    ],
+    &amp;[b&quot;h2&quot;, b&quot;http/1.1&quot;],
+)?;
+// A hostname with no matching entry (or no SNI at all) fails the handshake —
+// include every hostname you intend to serve.
+
+// Require a client certificate, verified against client_roots.pem.
+let acceptor = acceptor_with_client_auth(
+    Path::new(&quot;cert.pem&quot;), Path::new(&quot;key.pem&quot;),
+    Path::new(&quot;client_roots.pem&quot;), /* required = */ true, &amp;[],
+)?;
+// Pass `required = false` for opportunistic mTLS — check
+// SecurityInfo::peer_certificate_fingerprint() to see whether a client cert
+// was actually presented on a given connection.
+
+// Client side: present an identity certificate for mTLS.
+let client_cfg = client_config_with_identity(
+    Path::new(&quot;ca.pem&quot;), Path::new(&quot;client-cert.pem&quot;), Path::new(&quot;client-key.pem&quot;), &amp;[],
+)?;</code></pre>
 <table>
 <colgroup>
 <col style="width: 38%" />
@@ -180,6 +207,26 @@ Endpoint  →  ProtocolHandler sees plaintext
 <td><code>connector_for_certified_pem</code></td>
 <td><code>SharedTlsConnector</code></td>
 <td><strong>Dangerous</strong> single-leaf trust</td>
+</tr>
+<tr>
+<td><code>server_config_with_resolver</code> / <code>acceptor_with_resolver</code></td>
+<td><code>Arc&lt;ServerConfig&gt;</code> / <code>SharedTlsAcceptor</code></td>
+<td>Any <code>rustls::server::ResolvesServerCert</code> — custom per-connection cert dispatch</td>
+</tr>
+<tr>
+<td><code>server_config_with_sni_certs</code> / <code>acceptor_with_sni_certs</code></td>
+<td><code>Arc&lt;ServerConfig&gt;</code> / <code>SharedTlsAcceptor</code></td>
+<td>PEM triples keyed by hostname, via <code>ResolvesServerCertUsingSni</code>; virtual hosting</td>
+</tr>
+<tr>
+<td><code>server_config_with_client_auth</code> / <code>acceptor_with_client_auth</code></td>
+<td><code>Arc&lt;ServerConfig&gt;</code> / <code>SharedTlsAcceptor</code></td>
+<td>mTLS via <code>WebPkiClientVerifier</code>; <code>required: bool</code> toggles mandatory vs opportunistic</td>
+</tr>
+<tr>
+<td><code>client_config_with_identity</code> / <code>connector_with_identity</code></td>
+<td><code>Arc&lt;ClientConfig&gt;</code> / <code>SharedTlsConnector</code></td>
+<td>Presents a client identity cert for mTLS via <code>with_client_auth_cert</code></td>
 </tr>
 </tbody>
 </table>
@@ -259,7 +306,7 @@ Endpoint  →  ProtocolHandler sees plaintext
 <li>Cookbook: <a href="cookbook/tls-echo.html">TLS echo</a></li>
 </ul>
 <h2 id="securityinfo">SecurityInfo</h2>
-<p>After handshake, <code>Endpoint::security_info()</code> reports (via core <code>SecurityInfo</code>): secure flag, ALPN protocol, TLS protocol version, cipher suite. Handlers may gate AUTH or HTTP/2 on this metadata (<code>ProtocolHandler::security_established</code>).</p>
+<p>After handshake, <code>Endpoint::security_info()</code> reports (via core <code>SecurityInfo</code>): secure flag, ALPN protocol, TLS protocol version, cipher suite, the SNI hostname the peer requested (<code>sni()</code>, server side), and — when mTLS presented a client certificate — its SHA-256 fingerprint as lowercase hex (<code>peer_certificate_fingerprint()</code>, server side). Handlers may gate AUTH or HTTP/2 on this metadata (<code>ProtocolHandler::security_established</code>). The fingerprint is the <code>cert_key</code> expected by <a href="auth.html">SASL EXTERNAL</a>'s <code>CredentialStore::authenticate_certificate</code>.</p>
 <h2 id="examples">Examples</h2>
 <div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> tls-echo <span class="at">--</span> 127.0.0.1:8443 cert.pem key.pem</span></code></pre></div>
 <table>
@@ -279,8 +326,6 @@ Endpoint  →  ProtocolHandler sees plaintext
 <p>See <a href="cookbook/tls-echo.html">Cookbook: TLS echo</a>. No environment variables.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>Server helpers use <strong><code>with_no_client_auth</code></strong> — no mTLS verification in these convenience APIs.</li>
-<li>No client-certificate <strong>presentation</strong> helpers.</li>
 <li><code>connector_for_certified_pem</code> is explicitly dangerous (self-signed demos).</li>
 <li>Cipher / version policy is rustls default — not customizable via Hopf knobs.</li>
 <li>QUIC crypto is configured in <code>hopf-quic</code>, not here.</li>
