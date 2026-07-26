@@ -26,6 +26,7 @@ mod integration;
 mod error;
 mod headers;
 mod limits;
+mod pseudo_headers;
 mod status;
 mod utils;
 mod version;

@@ -95,11 +95,11 @@ impl H3ClientWriter {
 impl ClientWriter for H3ClientWriter {
     fn headers(&mut self, mut headers: Headers) {
         if !headers.contains(":scheme") {
-            headers.add(":scheme", "https");
+            headers.add_pseudo(":scheme", "https");
         }
         if !headers.contains(":authority") {
             if let Some(host) = headers.get("host").map(|s| s.to_string()) {
-                headers.add(":authority", host);
+                headers.add_pseudo(":authority", host);
             }
         }
         self.request_headers = Some(headers);
@@ -130,6 +130,26 @@ impl ClientWriter for NullClientWriter {
     fn complete_request(&mut self) {}
 }
 
+/// Validate a response header list's `:status` pseudo-header (RFC 9114
+/// §4.3.2): present, first, and a well-formed 3-digit numeric value. No
+/// other pseudo-header is legal in a response.
+fn validate_response_status(pairs: &[(String, String)]) -> Result<(), ()> {
+    let mut iter = pairs.iter();
+    let Some((name, value)) = iter.next() else {
+        return Err(());
+    };
+    if name != ":status" {
+        return Err(());
+    }
+    if value.len() != 3 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    if iter.any(|(n, _)| n.starts_with(':')) {
+        return Err(());
+    }
+    Ok(())
+}
+
 /// One outbound H3 request / inbound response on a bidirectional QUIC stream.
 struct H3ClientStream {
     factory: Arc<dyn ClientHandlerFactory>,
@@ -140,6 +160,10 @@ struct H3ClientStream {
     response_headers_received: bool,
     response_body_started: bool,
     started: bool,
+    /// Set when the response HEADERS failed `:status` validation — checked
+    /// in `receive()`'s tail, where an `Endpoint` is available to close
+    /// the stream.
+    malformed: bool,
 }
 
 impl H3ClientStream {
@@ -152,6 +176,7 @@ impl H3ClientStream {
             response_headers_received: false,
             response_body_started: false,
             started: false,
+            malformed: false,
         }
     }
 
@@ -215,11 +240,30 @@ impl H3FrameHandler for H3ClientStream {
         if pairs.len() > self.limits.max_header_count {
             return;
         }
+
+        let mut w = NullClientWriter;
+        if !self.response_headers_received && validate_response_status(&pairs).is_err() {
+            // RFC 9114 §4.3.2: malformed response → stream error. No
+            // abrupt-close primitive exists yet (tracked separately) —
+            // tell the app the request failed and stop this stream in
+            // `receive()`'s tail rather than silently hang it.
+            if let Some(handler) = &mut self.handler {
+                handler.request_failed(
+                    &mut w,
+                    &io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed H3 response: missing or invalid :status",
+                    ),
+                );
+            }
+            self.malformed = true;
+            return;
+        }
+
         let mut headers = Headers::new();
         for (name, value) in pairs {
             headers.add(name, value);
         }
-        let mut w = NullClientWriter;
         if let Some(handler) = &mut self.handler {
             if self.response_headers_received {
                 if self.response_body_started {
@@ -249,7 +293,9 @@ impl ProtocolHandler for H3ClientStream {
         parser.push(data, self);
         self.parser = parser;
         *data = &[];
-        let _ = endpoint;
+        if self.malformed {
+            endpoint.close();
+        }
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -257,4 +303,166 @@ impl ProtocolHandler for H3ClientStream {
     }
 
     fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
+}
+
+#[cfg(test)]
+mod status_validation_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct RecordingEndpoint {
+        closed: bool,
+    }
+    impl Endpoint for RecordingEndpoint {
+        fn send(&mut self, _data: &[u8]) {}
+        fn is_open(&self) -> bool {
+            !self.closed
+        }
+        fn is_closing(&self) -> bool {
+            self.closed
+        }
+        fn close(&mut self) {
+            self.closed = true;
+        }
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn remote_addr(&self) -> std::io::Result<SocketAddr> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn security_info(&self) -> &hopf_core::SecurityInfo {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn start_tls(&mut self) -> Result<(), hopf_core::StartTlsError> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _callback: Option<hopf_core::WriteReadyCallback>) {}
+        fn execute(&self, _task: Box<dyn FnOnce() + Send>) {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn schedule_timer(
+            &self,
+            _delay: Duration,
+            _callback: Box<dyn FnOnce() + Send>,
+        ) -> hopf_core::TimerHandle {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn handle(&self) -> hopf_core::ConnHandle {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorded {
+        status: Option<u16>,
+        failed: usize,
+        trailers: Vec<(String, String)>,
+    }
+
+    struct RecordingHandler {
+        rec: Arc<Mutex<Recorded>>,
+    }
+    impl ClientHandler for RecordingHandler {
+        fn start(&mut self, _request: &mut dyn ClientWriter) {}
+        fn response_headers(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
+            self.rec.lock().unwrap().status = Some(headers.status_code());
+        }
+        fn response_trailers(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
+            let mut r = self.rec.lock().unwrap();
+            for h in headers.iter() {
+                r.trailers.push((h.name.clone(), h.value.clone()));
+            }
+        }
+        fn response_complete(&mut self, _request: &mut dyn ClientWriter) {}
+        fn request_failed(&mut self, _request: &mut dyn ClientWriter, _err: &io::Error) {
+            self.rec.lock().unwrap().failed += 1;
+        }
+    }
+
+    struct RecordingFactory {
+        rec: Arc<Mutex<Recorded>>,
+    }
+    impl ClientHandlerFactory for RecordingFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            Box::new(RecordingHandler { rec: Arc::clone(&self.rec) })
+        }
+    }
+
+    fn encode(pairs: &[(&str, &str)]) -> Vec<u8> {
+        qpack::encode(pairs.iter().copied())
+    }
+
+    /// A stream with a handler already installed (via `start_request`, as
+    /// `connected()` would do), ready to feed response HEADERS into.
+    fn stream_with_recorder() -> (H3ClientStream, Arc<Mutex<Recorded>>) {
+        let rec = Arc::new(Mutex::new(Recorded::default()));
+        let factory: Arc<dyn ClientHandlerFactory> =
+            Arc::new(RecordingFactory { rec: Arc::clone(&rec) });
+        let mut stream = H3ClientStream::new(factory, HttpLimits::default());
+        let mut ep = RecordingEndpoint::default();
+        stream.start_request(&mut ep);
+        (stream, rec)
+    }
+
+    #[test]
+    fn valid_status_dispatches_response_headers() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[(":status", "200"), ("content-type", "text/plain")]);
+        stream.headers_frame(&payload);
+
+        assert!(!stream.malformed);
+        assert_eq!(rec.lock().unwrap().status, Some(200));
+        assert_eq!(rec.lock().unwrap().failed, 0);
+    }
+
+    #[test]
+    fn missing_status_marks_malformed_and_fails_the_request() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[("content-type", "text/plain")]);
+        stream.headers_frame(&payload);
+
+        assert!(stream.malformed);
+        assert_eq!(rec.lock().unwrap().status, None, "must never dispatch a malformed response");
+        assert_eq!(rec.lock().unwrap().failed, 1);
+
+        let mut ep = RecordingEndpoint::default();
+        let mut empty: &[u8] = &[];
+        stream.receive(&mut ep, &mut empty);
+        assert!(ep.closed);
+    }
+
+    #[test]
+    fn non_numeric_status_rejected() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[(":status", "abc")]);
+        stream.headers_frame(&payload);
+        assert!(stream.malformed);
+        assert_eq!(rec.lock().unwrap().failed, 1);
+    }
+
+    #[test]
+    fn extra_pseudo_header_in_response_rejected() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[(":status", "200"), (":path", "/")]);
+        stream.headers_frame(&payload);
+        assert!(stream.malformed);
+        assert_eq!(rec.lock().unwrap().failed, 1);
+    }
+
+    #[test]
+    fn trailers_are_not_run_through_status_validation() {
+        let (mut stream, rec) = stream_with_recorder();
+        let first = encode(&[(":status", "200")]);
+        stream.headers_frame(&first);
+        assert!(!stream.malformed);
+
+        let trailers = encode(&[("grpc-status", "0")]);
+        stream.headers_frame(&trailers);
+
+        assert!(!stream.malformed, "trailers have no :status and must not be validated as one");
+        assert_eq!(rec.lock().unwrap().trailers, vec![("grpc-status".to_string(), "0".to_string())]);
+    }
 }

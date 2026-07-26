@@ -242,11 +242,11 @@ impl H2ClientStreamWriter {
 impl ClientWriter for H2ClientStreamWriter {
     fn headers(&mut self, mut headers: Headers) {
         if !headers.contains(":scheme") {
-            headers.add(":scheme", self.scheme);
+            headers.add_pseudo(":scheme", self.scheme);
         }
         if !headers.contains(":authority") {
             if let Some(host) = headers.get("host").map(|s| s.to_string()) {
-                headers.add(":authority", host);
+                headers.add_pseudo(":authority", host);
             }
         }
         self.request_headers = Some(headers);
@@ -1539,11 +1539,6 @@ fn header_list_size(pairs: &[(String, String)]) -> usize {
     pairs.iter().map(|(name, value)| name.len() + value.len() + 32).sum()
 }
 
-/// Pseudo-headers this server recognizes on inbound requests, including
-/// `:protocol` for RFC 8441 Extended CONNECT.
-const KNOWN_REQUEST_PSEUDO_HEADERS: &[&str] =
-    &[":method", ":scheme", ":authority", ":path", ":protocol"];
-
 /// Header fields whose framing role HTTP/2 carries out-of-band, so the field
 /// itself is forbidden on the wire (RFC 9113 §8.2.2).
 const CONNECTION_SPECIFIC_HEADERS: &[&str] = &[
@@ -1556,57 +1551,21 @@ const CONNECTION_SPECIFIC_HEADERS: &[&str] = &[
 
 /// Validate a decoded request header list against RFC 9113 §8.3.1
 /// (pseudo-header presence/ordering/uniqueness, including RFC 8441 Extended
-/// CONNECT) and §8.2.2 (connection-specific fields, `TE` value). `Err(())`
-/// means the request is malformed and must be rejected with a stream error.
+/// CONNECT — shared with HTTP/3, see [`crate::pseudo_headers`]) and §8.2.2
+/// (connection-specific fields, `TE` value, HTTP/2-only). `Err(())` means
+/// the request is malformed and must be rejected with a stream error.
 fn validate_request_header_block(pairs: &[(String, String)]) -> Result<(), ()> {
-    let mut seen_pseudo: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut seen_regular = false;
-    let mut method: Option<&str> = None;
+    crate::pseudo_headers::validate_request_pseudo_headers(pairs)?;
 
     for (name, value) in pairs {
-        if let Some(pseudo) = name.strip_prefix(':') {
-            if seen_regular {
-                return Err(()); // pseudo-header after a regular header
-            }
-            if !KNOWN_REQUEST_PSEUDO_HEADERS.contains(&name.as_str()) {
-                return Err(()); // unknown pseudo-header
-            }
-            if !seen_pseudo.insert(name.as_str()) {
-                return Err(()); // duplicated pseudo-header
-            }
-            if pseudo == "method" {
-                method = Some(value.as_str());
-            }
-        } else {
-            seen_regular = true;
-            if CONNECTION_SPECIFIC_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
-                return Err(());
-            }
-            if name.eq_ignore_ascii_case("te") && !value.eq_ignore_ascii_case("trailers") {
-                return Err(());
-            }
+        if name.starts_with(':') {
+            continue;
         }
-    }
-
-    let is_connect = method.is_some_and(|m| m.eq_ignore_ascii_case("CONNECT"));
-    let is_extended_connect = is_connect && seen_pseudo.contains(":protocol");
-
-    if is_connect && !is_extended_connect {
-        // Plain CONNECT (RFC 9113 §8.5): only :method and :authority, no
-        // :scheme/:path.
-        if !seen_pseudo.contains(":method") || !seen_pseudo.contains(":authority") {
+        if CONNECTION_SPECIFIC_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
             return Err(());
         }
-        if seen_pseudo.contains(":scheme") || seen_pseudo.contains(":path") {
+        if name.eq_ignore_ascii_case("te") && !value.eq_ignore_ascii_case("trailers") {
             return Err(());
-        }
-    } else {
-        // Regular requests and Extended CONNECT (RFC 8441 §4) both require
-        // :method, :scheme, :path.
-        for required in [":method", ":scheme", ":path"] {
-            if !seen_pseudo.contains(required) {
-                return Err(());
-            }
         }
     }
 
