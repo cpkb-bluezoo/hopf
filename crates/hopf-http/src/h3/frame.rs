@@ -32,6 +32,16 @@ pub const H3_FRAME_ERROR: u32 = 0x0106;
 /// A malformed request or response message.
 pub const H3_MESSAGE_ERROR: u32 = 0x010e;
 
+// ---------------------------------------------------------------------------
+// QPACK-specific application error codes (RFC 9204 §3.1).
+// ---------------------------------------------------------------------------
+
+/// A field section referenced the dynamic table in a way this decoder
+/// can't resolve (unknown index, or would require blocking).
+pub const QPACK_DECOMPRESSION_FAILED: u32 = 0x0200;
+/// The peer's encoder stream sent a malformed or unresolvable instruction.
+pub const QPACK_ENCODER_STREAM_ERROR: u32 = 0x0201;
+
 /// Append an HTTP/3 frame with `payload`.
 pub fn write_frame(out: &mut Vec<u8>, frame_type: u64, payload: &[u8]) {
     varint::encode(out, frame_type);

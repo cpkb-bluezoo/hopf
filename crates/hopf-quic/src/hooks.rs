@@ -28,6 +28,18 @@ pub trait QuicConnection: Send {
     fn disconnecting(&mut self, api: &mut dyn QuicConnApi) {
         let _ = api;
     }
+
+    /// Called once per driver loop tick (at most every ~10ms, see
+    /// [`crate::QuicDriverHandle`]'s internals) for every still-live
+    /// connection, outside the `connected`/`accept_bi`/`accept_uni`
+    /// lifecycle hooks — the only opportunity for an app to write
+    /// additional bytes onto an already-open local stream at an arbitrary
+    /// later time (e.g. flushing queued QPACK instruction traffic
+    /// generated while processing an unrelated stream). Default: do
+    /// nothing.
+    fn drive(&mut self, api: &mut dyn QuicConnApi) {
+        let _ = api;
+    }
 }
 
 /// API available during [`QuicConnection::connected`] on the driver thread.

@@ -23,6 +23,9 @@ pub struct H3ClientConnection {
     factory: Arc<dyn ClientHandlerFactory>,
     limits: HttpLimits,
     peer_state: Arc<Mutex<H3PeerState>>,
+    qpack: Arc<qpack::H3Qpack>,
+    qpack_encoder_stream_key: Option<u64>,
+    qpack_decoder_stream_key: Option<u64>,
 }
 
 impl H3ClientConnection {
@@ -32,6 +35,22 @@ impl H3ClientConnection {
             factory,
             limits,
             peer_state: Arc::new(Mutex::new(H3PeerState::default())),
+            qpack: Arc::new(qpack::H3Qpack::new()),
+            qpack_encoder_stream_key: None,
+            qpack_decoder_stream_key: None,
+        }
+    }
+
+    /// Write any QPACK instruction bytes queued since the last flush onto
+    /// our own encoder/decoder uni streams — the only opportunity to do so
+    /// outside `connected()` (see [`hopf_quic::QuicConnection::drive`]).
+    fn flush_qpack(&self, api: &mut dyn QuicConnApi) {
+        let (enc, dec) = self.qpack.take_pending();
+        if let (Some(key), false) = (self.qpack_encoder_stream_key, enc.is_empty()) {
+            api.write(key, &enc);
+        }
+        if let (Some(key), false) = (self.qpack_decoder_stream_key, dec.is_empty()) {
+            api.write(key, &dec);
         }
     }
 }
@@ -43,21 +62,32 @@ impl QuicConnection for H3ClientConnection {
             frame::write_settings(&mut bytes);
             api.write(stream, &bytes);
         }
-        for ty in [0x02u8, 0x03] {
-            if let Some(stream) = api.open_uni() {
-                api.write(stream, &[ty]);
-            }
+        if let Some(stream) = api.open_uni() {
+            api.write(stream, &[0x02]); // QPACK encoder stream type
+            self.qpack_encoder_stream_key = Some(stream);
         }
+        if let Some(stream) = api.open_uni() {
+            api.write(stream, &[0x03]); // QPACK decoder stream type
+            self.qpack_decoder_stream_key = Some(stream);
+        }
+        self.flush_qpack(api);
         // Request stream — [`H3ClientStream`] starts the app request in `connected`.
         let _ = api.open_bi();
     }
 
     fn accept_bi(&mut self) -> Box<dyn ProtocolHandler> {
-        Box::new(H3ClientStream::new(Arc::clone(&self.factory), self.limits))
+        // hopf's H3 client opens exactly one request stream per connection
+        // today (RFC 9000 §2.1: the first client-initiated bidi stream ID
+        // is always 0).
+        Box::new(H3ClientStream::new(Arc::clone(&self.factory), self.limits, 0, Arc::clone(&self.qpack)))
     }
 
     fn accept_uni(&mut self) -> Box<dyn ProtocolHandler> {
-        Box::new(H3UniStream::new(Arc::clone(&self.peer_state)))
+        Box::new(H3UniStream::new(Arc::clone(&self.peer_state), Arc::clone(&self.qpack)))
+    }
+
+    fn drive(&mut self, api: &mut dyn QuicConnApi) {
+        self.flush_qpack(api);
     }
 }
 
@@ -155,6 +185,8 @@ struct H3ClientStream {
     factory: Arc<dyn ClientHandlerFactory>,
     #[allow(dead_code)]
     limits: HttpLimits,
+    stream_id: u64,
+    qpack: Arc<qpack::H3Qpack>,
     parser: H3Parser,
     handler: Option<Box<dyn ClientHandler>>,
     response_headers_received: bool,
@@ -164,19 +196,26 @@ struct H3ClientStream {
     /// in `receive()`'s tail, where an `Endpoint` is available to abort
     /// the stream.
     malformed: bool,
+    /// Set when a HEADERS payload failed to QPACK-decode — checked in
+    /// `receive()`'s tail, where an `Endpoint` is available to close the
+    /// connection (RFC 9204 §4.5.1: `QPACK_DECOMPRESSION_FAILED`).
+    qpack_error: bool,
 }
 
 impl H3ClientStream {
-    fn new(factory: Arc<dyn ClientHandlerFactory>, limits: HttpLimits) -> Self {
+    fn new(factory: Arc<dyn ClientHandlerFactory>, limits: HttpLimits, stream_id: u64, qpack: Arc<qpack::H3Qpack>) -> Self {
         Self {
             factory,
             limits,
+            stream_id,
+            qpack,
             parser: H3Parser::new(),
             handler: None,
             response_headers_received: false,
             response_body_started: false,
             started: false,
             malformed: false,
+            qpack_error: false,
         }
     }
 
@@ -195,7 +234,9 @@ impl H3ClientStream {
         let done = writer.done;
 
         let mut out = Vec::new();
-        let block = qpack::encode(headers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
+        let block = self
+            .qpack
+            .encode_field_section(self.stream_id, headers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
         frame::write_headers(&mut out, &block);
         if !body.is_empty() {
             frame::write_data(&mut out, &body);
@@ -234,7 +275,8 @@ impl H3FrameHandler for H3ClientStream {
     }
 
     fn headers_frame(&mut self, payload: &[u8]) {
-        let Ok(pairs) = qpack::decode(payload) else {
+        let Ok(pairs) = self.qpack.decode_field_section(self.stream_id, payload) else {
+            self.qpack_error = true;
             return;
         };
         if pairs.len() > self.limits.max_header_count {
@@ -292,6 +334,13 @@ impl ProtocolHandler for H3ClientStream {
         parser.push(data, self);
         self.parser = parser;
         *data = &[];
+        if self.qpack_error {
+            // RFC 9204 §4.5.1: a field section this decoder can't process
+            // desynchronizes the whole connection's QPACK state, not just
+            // this stream.
+            endpoint.close_connection(frame::QPACK_DECOMPRESSION_FAILED);
+            return;
+        }
         if self.malformed {
             // RFC 9114 §4.3.2: a malformed response is a stream error, not
             // a connection error — only this one request is affected.
@@ -303,7 +352,12 @@ impl ProtocolHandler for H3ClientStream {
         self.finish_response();
     }
 
-    fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
+    fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {
+        // RFC 9204 §4.4.2: this stream won't be acknowledged now — let the
+        // peer's encoder release any dynamic-table references it held open
+        // for it.
+        self.qpack.cancel_stream(self.stream_id);
+    }
 }
 
 #[cfg(test)]
@@ -407,7 +461,8 @@ mod status_validation_tests {
         let rec = Arc::new(Mutex::new(Recorded::default()));
         let factory: Arc<dyn ClientHandlerFactory> =
             Arc::new(RecordingFactory { rec: Arc::clone(&rec) });
-        let mut stream = H3ClientStream::new(factory, HttpLimits::default());
+        let qpack = Arc::new(qpack::H3Qpack::new());
+        let mut stream = H3ClientStream::new(factory, HttpLimits::default(), 0, qpack);
         let mut ep = RecordingEndpoint::default();
         stream.start_request(&mut ep);
         (stream, rec)
