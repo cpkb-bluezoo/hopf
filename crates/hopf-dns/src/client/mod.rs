@@ -81,7 +81,30 @@ struct PendingQuery {
     cname_depth: usize,
     /// Original query id for matching.
     id: u16,
+    /// The exact server address this query was sent to (RFC 5452 §2.2) —
+    /// an inbound response is only accepted from this address, not from
+    /// any source that happens to guess the matching id.
+    server: SocketAddr,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// Allocate a query id that isn't already in use by another outstanding
+/// query — a CSPRNG-drawn id (unlike a monotonic counter) can collide with
+/// one still in flight, which would corrupt that query's own tracking.
+fn alloc_id(g: &ResolverInner) -> u16 {
+    loop {
+        let id = g.ids.next_id();
+        if !g.pending.contains_key(&id) {
+            return id;
+        }
+    }
+}
+
+/// RFC 5452 §2.2: an accepted response's question section must match the
+/// question actually sent — compared case-insensitively on the name since
+/// DNS names are case-insensitive and some resolvers normalize case.
+fn questions_match(a: &DnsQuestion, b: &DnsQuestion) -> bool {
+    a.qtype == b.qtype && a.qclass == b.qclass && a.name.eq_ignore_ascii_case(&b.name)
 }
 
 struct ResolverInner {
@@ -325,7 +348,7 @@ impl DnsResolver {
             )));
             return;
         }
-        let id = g.ids.next_id();
+        let id = alloc_id(&g);
         let server = g.servers[0];
         let timeout = g.timeout;
         let cancel = g.reactor.schedule_timer(
@@ -351,6 +374,7 @@ impl DnsResolver {
                 server_idx: 0,
                 cname_depth: 0,
                 id,
+                server,
                 cancel: Some(cancel),
             },
         );
@@ -511,14 +535,29 @@ impl UdpDatagramHandler for ResolverUdpHandler {
             return;
         }
         let mut g = self.inner.lock().unwrap();
-        g.cookies
-            .store_from_message(&peer.to_string(), &msg.additionals);
-        let Some(pending) = g.pending.remove(&msg.id) else {
-            return;
-        };
+
+        // RFC 5452 §2.2: only accept a response from the exact server the
+        // matching query was sent to, with a matching question — checked
+        // *before* removing the pending entry, so a spoofed/mismatched
+        // datagram doesn't discard a query that's still legitimately
+        // outstanding and may yet get its real answer.
+        match g.pending.get(&msg.id) {
+            Some(candidate)
+                if candidate.server == peer
+                    && msg.questions.first().is_some_and(|q| questions_match(q, &candidate.question)) => {}
+            _ => return,
+        }
+        let pending = g.pending.remove(&msg.id).expect("checked above");
         if let Some(c) = &pending.cancel {
             c.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+
+        // Only trust cookie data from a response that just passed the
+        // source/question checks above — otherwise an off-path attacker
+        // could poison our cookie cache for a server's address even
+        // though they can no longer poison an answer.
+        g.cookies
+            .store_from_message(&peer.to_string(), &msg.additionals);
 
         // Truncation → TCP retry
         if msg.is_truncated() && g.tcp_fallback {
@@ -573,9 +612,10 @@ fn complete_response(
                 if pending.cname_depth < MAX_CNAME_DEPTH {
                     pending.cname_depth += 1;
                     pending.question = DnsQuestion::in_class(cname, pending.question.qtype);
-                    let id = g.ids.next_id();
+                    let id = alloc_id(g);
                     pending.id = id;
                     let server = g.servers.get(pending.server_idx).copied().unwrap_or(server);
+                    pending.server = server;
                     let timeout = g.timeout;
                     let cancel = g.reactor.schedule_timer(
                         timeout,
@@ -652,5 +692,66 @@ impl RuntimeDnsExt for Arc<Runtime> {
             }),
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::{DnsClass, DnsType};
+
+    #[test]
+    fn questions_match_is_case_insensitive_on_name() {
+        let a = DnsQuestion::new("Example.COM", DnsType::A, DnsClass::In);
+        let b = DnsQuestion::new("example.com", DnsType::A, DnsClass::In);
+        assert!(questions_match(&a, &b));
+    }
+
+    #[test]
+    fn questions_match_rejects_different_name_type_or_class() {
+        let base = DnsQuestion::new("example.com", DnsType::A, DnsClass::In);
+        assert!(!questions_match(&base, &DnsQuestion::new("other.com", DnsType::A, DnsClass::In)));
+        assert!(!questions_match(&base, &DnsQuestion::new("example.com", DnsType::Aaaa, DnsClass::In)));
+    }
+
+    #[test]
+    fn alloc_id_avoids_colliding_with_a_pending_query() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let mut inner = ResolverInner {
+            reactor: rt.pick_worker().clone(),
+            udp_token: None,
+            servers: Vec::new(),
+            pending: HashMap::new(),
+            ids: DnsQueryIdGenerator::new(),
+            cache: Arc::new(DnsCache::default()),
+            cookies: DnsCookie::new(),
+            timeout: DEFAULT_TIMEOUT,
+            use_edns: true,
+            use_cookies: true,
+            use_bailiwick: true,
+            tcp_fallback: true,
+            tcp_pool: TcpDnsConnectionPool::new(),
+            #[cfg(feature = "dnssec")]
+            dnssec_enabled: false,
+            #[cfg(feature = "dnssec")]
+            dnssec: None,
+        };
+        let taken = alloc_id(&inner);
+        inner.pending.insert(
+            taken,
+            PendingQuery {
+                callback: Box::new(|_| {}),
+                question: DnsQuestion::in_class("example.com", DnsType::A),
+                server_idx: 0,
+                cname_depth: 0,
+                id: taken,
+                server: "127.0.0.1:53".parse().unwrap(),
+                cancel: None,
+            },
+        );
+        for _ in 0..1000 {
+            assert_ne!(alloc_id(&inner), taken, "must never hand out an id already in flight");
+        }
+        rt.shutdown();
     }
 }
