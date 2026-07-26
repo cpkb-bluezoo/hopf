@@ -50,8 +50,6 @@
 </ul>
 <h2>Architecture audit</h2><ul>
 <li><a href="conformance.html" aria-current="page">Conformance</a></li>
-<li><a href="scalability.html">Scalability</a></li>
-<li><a href="performance.html">Performance</a></li>
 </ul>
 <h2>Cookbook</h2><ul>
 <li><a href="cookbook/echo.html">Echo</a></li>
@@ -69,13 +67,12 @@
     <main class="main">
       <header>
         <h1>Conformance Audit</h1>
-        <p class="lead">A requirement-by-requirement matrix of what each protocol crate actually does, checked against its RFC/spec — modeled on <a href="https://github.com/cpkb-bluezoo/gumdrop">Gumdrop</a>'s own <code>RFC-COMPLIANCE.md</code>. Every row below was produced by reading the Rust source directly (file:line cited), not by trusting doc comments or README claims — several rows below <strong>disagree with hopf's own docs pages</strong>, and those are called out explicitly rather than smoothed over. Companion to <a href="scalability.html">Scalability</a> and <a href="performance.html">Performance</a>.</p>
+        <p class="lead">A requirement-by-requirement matrix of what each protocol crate actually does, checked against its RFC/spec — modeled on <a href="https://github.com/cpkb-bluezoo/gumdrop">Gumdrop</a>'s own <code>RFC-COMPLIANCE.md</code>. Every row below was produced by reading the Rust source directly (file:line cited), not by trusting doc comments or README claims — several rows below <strong>disagree with hopf's own docs pages</strong>, and those are called out explicitly rather than smoothed over. Every nonconformant or unimplemented row is tracked as a <a href="https://github.com/cpkb-bluezoo/hopf/issues?q=is%3Aissue+label%3Aconformance">GitHub issue</a> (label <code>conformance</code>).</p>
       </header>
 
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#method">Method and status vocabulary</a></li>
-<li><a href="#headline">Headline findings</a></li>
 <li><a href="#tls">TLS</a></li>
 <li><a href="#http1">HTTP/1.1</a></li>
 <li><a href="#http2">HTTP/2</a></li>
@@ -94,18 +91,6 @@
 <li><a href="#mqtt">MQTT</a></li>
 <li><a href="#deferred">Deferred protocols (not yet started)</a></li>
 </ul></div>
-
-<h2 id="headline">Headline findings</h2>
-<p>With ~15 protocol crates audited, the individual sections below run long. These are the findings worth knowing about first, pulled to the top. All are now tracked as <a href="https://github.com/cpkb-bluezoo/hopf/issues?q=is%3Aissue+label%3Aconformance">GitHub issues</a> (label <code>conformance</code>).</p>
-<ul>
-<li><strong>HTTP/2 server DATA flow control is a no-op bug, not a missing feature</strong> (<a href="https://github.com/cpkb-bluezoo/hopf/issues/1">#1</a>). <code>crates/hopf-http/src/h2/endpoint.rs:1147-1148</code> computes <code>send_len</code> as <code>chunk.len().min(avail.max(chunk.len()))</code> — since <code>avail.max(chunk.len())</code> is always <code>&gt;= chunk.len()</code>, the peer's advertised window is never actually enforced on send. Client-side request-body upload has no flow control accounting at all (<code>h2/endpoint.rs:585-603</code>).</li>
-<li><strong>Duplicate/conflicting <code>Content-Length</code> headers are silently accepted</strong> on both the H1 server and client (<a href="https://github.com/cpkb-bluezoo/hopf/issues/2">#2</a>) — <code>Headers::get()</code> returns only the first match, and nothing checks for a second, differing value, which RFC 9112 §6.3 requires to be treated as a framing error. Request/response-smuggling-adjacent.</li>
-<li><strong>hopf-ftp's PASV data connection accepts any peer</strong> (<a href="https://github.com/cpkb-bluezoo/hopf/issues/3">#3</a>) — hopf's own docs claim source-IP verification on PASV data connections; the code (<code>data.rs:214-229</code>) arms the channel unconditionally. Combined with <strong><code>PROT P</code> only protecting passive-mode data channels</strong> (active-mode/PORT transfers are hardcoded cleartext, contradicting the docs' "same TLS acceptor" claim), and a symlink-escape gap for newly-created files under a jailed root.</li>
-<li><strong>DNS cache-poisoning resilience is weak</strong> (<a href="https://github.com/cpkb-bluezoo/hopf/issues/4">#4</a>) — query IDs are a predictable sequential counter, not random; inbound UDP responses are accepted on ID match alone, with source address and echoed question never verified.</li>
-<li><strong>HTTP/3 has no GOAWAY in either direction</strong> (<a href="https://github.com/cpkb-bluezoo/hopf/issues/5">#5</a>), no way to abruptly cancel a stream (RESET_STREAM/STOP_SENDING is unreachable from the <code>Endpoint</code> API — graceful FIN only, all the way down in hopf-quic's own stream implementation), and malformed/oversized H3 frames never produce a QUIC-level connection close.</li>
-<li><strong>hopf-imap targets IMAP4rev2 but the two mandatory FETCH data items <code>ENVELOPE</code> and <code>BODYSTRUCTURE</code> are not implemented</strong> (<a href="https://github.com/cpkb-bluezoo/hopf/issues/6">#6</a>), and <code>BODY[section]&lt;partial&gt;</code> octet-range fetches aren't parsed.</li>
-</ul>
-<p>Everything else — several hundred more rows across fifteen crates — follows below, organized the same way Gumdrop's own matrix is: by protocol, then by RFC, then by section.</p>
 
 <h2 id="method">Method and status vocabulary</h2>
 <p>Each protocol crate was audited by reading its source against the RFC(s)/spec(s) it targets, cross-checked where a comparable <a href="https://github.com/cpkb-bluezoo/gumdrop">Gumdrop</a> (the Java predecessor this project ports) implementation exists — Gumdrop's own <code>RFC-COMPLIANCE.md</code> served as a candidate requirements checklist, re-verified independently against hopf's Rust code rather than copied. Every <strong>Compliant</strong> row cites the file and, where useful, the line range that implements it. Status vocabulary, matching Gumdrop's:</p>
