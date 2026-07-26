@@ -46,6 +46,12 @@ pub trait ClientHandler: Send {
 
     /// Response fully received.
     fn response_complete(&mut self, request: &mut dyn ClientWriter);
+
+    /// The connection failed or was closed before the response completed
+    /// (e.g. a peer GOAWAY that never reached this stream, or a transport
+    /// error). Mutually exclusive with [`Self::response_complete`] — at
+    /// most one of the two fires per request. Default: ignore.
+    fn request_failed(&mut self, _request: &mut dyn ClientWriter, _err: &std::io::Error) {}
 }
 
 /// Outbound request writer / in-flight control for a client Stream.
@@ -71,6 +77,10 @@ impl ClientHandler for Box<dyn ClientHandler> {
         (**self).start(request);
     }
 
+    fn informational_response(&mut self, request: &mut dyn ClientWriter, headers: &Headers) {
+        (**self).informational_response(request, headers);
+    }
+
     fn response_headers(&mut self, request: &mut dyn ClientWriter, headers: &Headers) {
         (**self).response_headers(request, headers);
     }
@@ -93,5 +103,9 @@ impl ClientHandler for Box<dyn ClientHandler> {
 
     fn response_complete(&mut self, request: &mut dyn ClientWriter) {
         (**self).response_complete(request);
+    }
+
+    fn request_failed(&mut self, request: &mut dyn ClientWriter, err: &std::io::Error) {
+        (**self).request_failed(request, err);
     }
 }
