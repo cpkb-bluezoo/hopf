@@ -27,9 +27,10 @@ impl SmtpReply {
 
 /// Incremental SMTP reply lexer.
 ///
-/// Feed bytes from the wire; complete [`SmtpReply`] values are returned from
-/// [`SmtpReplyLexer::feed`]. Any unconsumed bytes remain at the start of the
-/// next [`feed`] call's `data` slice (NIO compact semantics via `data` advance).
+/// Self-contained streaming parser: [`SmtpReplyLexer::feed`] consumes every
+/// byte it is given — `*data` is always left empty — and keeps a line in
+/// progress in its own `line_buf` scratch buffer, never in a buffer the
+/// caller has to retain and re-supply.
 #[derive(Default)]
 pub struct SmtpReplyLexer {
     /// Current line accumulation buffer.
@@ -45,13 +46,13 @@ impl SmtpReplyLexer {
         Self::default()
     }
 
-    /// Feed bytes from the wire. Returns completed replies and advances `data`
-    /// past the consumed bytes. Returns an error on malformed input.
+    /// Feed bytes from the wire. Returns completed replies. Consumes
+    /// everything given — `*data` is always left empty. Returns an error on
+    /// malformed input.
     pub fn feed(&mut self, data: &mut &[u8]) -> SmtpResult<Vec<SmtpReply>> {
         let mut ready = Vec::new();
-        let mut consumed = 0usize;
 
-        'outer: for (i, &b) in data.iter().enumerate() {
+        'outer: for &b in data.iter() {
             self.line_buf.push(b);
 
             // Line cap to avoid unbounded growth on bad servers.
@@ -66,7 +67,6 @@ impl SmtpReplyLexer {
             }
 
             // We have a complete line: parse it.
-            consumed = i + 1;
             let line = std::mem::take(&mut self.line_buf);
 
             // A line must be at least "XYZ\r\n" (5 bytes).
@@ -136,7 +136,118 @@ impl SmtpReplyLexer {
             }
         }
 
-        *data = &data[consumed..];
+        *data = &[];
         Ok(ready)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_line_reply() {
+        let mut lex = SmtpReplyLexer::new();
+        let mut data: &[u8] = b"250 OK\r\n";
+        let replies = lex.feed(&mut data).unwrap();
+        assert!(data.is_empty());
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].code, 250);
+        assert_eq!(replies[0].lines, vec!["OK".to_string()]);
+    }
+
+    #[test]
+    fn multiline_reply() {
+        let mut lex = SmtpReplyLexer::new();
+        let mut data: &[u8] = b"250-Hello\r\n250-SIZE 1000\r\n250 OK\r\n";
+        let replies = lex.feed(&mut data).unwrap();
+        assert!(data.is_empty());
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].code, 250);
+        assert_eq!(
+            replies[0].lines,
+            vec!["Hello".to_string(), "SIZE 1000".to_string(), "OK".to_string()]
+        );
+    }
+
+    #[test]
+    fn pipelined_replies() {
+        let mut lex = SmtpReplyLexer::new();
+        let mut data: &[u8] = b"220 ready\r\n250 OK\r\n";
+        let replies = lex.feed(&mut data).unwrap();
+        assert!(data.is_empty());
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0].code, 220);
+        assert_eq!(replies[1].code, 250);
+    }
+
+    /// A reply split mid-line across two `feed()` calls (as `connection.rs`
+    /// does: re-presenting whatever wasn't consumed, combined with newly
+    /// read bytes) must not duplicate the already-buffered prefix.
+    #[test]
+    fn feed_across_calls_does_not_duplicate_partial_line() {
+        let mut lex = SmtpReplyLexer::new();
+        let full: &[u8] = b"250-Hello\r\n250 OK\r\n";
+
+        let mut buf: Vec<u8> = full[..7].to_vec(); // "250-Hel", no CRLF yet
+        let mut slice: &[u8] = &buf;
+        let replies = lex.feed(&mut slice).unwrap();
+        assert!(slice.is_empty());
+        assert!(replies.is_empty());
+        buf.clear(); // *data is always fully consumed — nothing to retain
+
+        buf.extend_from_slice(&full[7..]); // rest of the reply arrives
+        let mut slice2: &[u8] = &buf;
+        let replies2 = lex.feed(&mut slice2).unwrap();
+        assert!(slice2.is_empty());
+
+        assert_eq!(replies2.len(), 1);
+        assert_eq!(replies2[0].code, 250);
+        assert_eq!(
+            replies2[0].lines,
+            vec!["Hello".to_string(), "OK".to_string()]
+        );
+    }
+
+    /// One byte per `feed()` call must produce identical replies to a
+    /// single bulk feed, and never leave anything unconsumed.
+    #[test]
+    fn one_byte_at_a_time_matches_bulk_feed() {
+        let msg: &[u8] = b"250-Hello\r\n250-SIZE 1000\r\n250 OK\r\n220 next\r\n";
+
+        let mut bulk = SmtpReplyLexer::new();
+        let mut bulk_data = msg;
+        let bulk_replies = bulk.feed(&mut bulk_data).unwrap();
+
+        let mut drip = SmtpReplyLexer::new();
+        let mut drip_replies = Vec::new();
+        for &b in msg {
+            let mut one: &[u8] = &[b];
+            drip_replies.extend(drip.feed(&mut one).unwrap());
+            assert!(one.is_empty());
+        }
+
+        assert_eq!(bulk_replies, drip_replies);
+        assert_eq!(bulk_replies.len(), 2);
+    }
+
+    /// Every split point of a full reply stream must be equivalent.
+    #[test]
+    fn all_split_points_are_equivalent() {
+        let msg: &[u8] = b"250-Hello\r\n250-SIZE 1000\r\n250 OK\r\n220 next\r\n";
+        let mut base = SmtpReplyLexer::new();
+        let mut base_data = msg;
+        let base_replies = base.feed(&mut base_data).unwrap();
+
+        for split in 1..msg.len() {
+            let mut lex = SmtpReplyLexer::new();
+            let mut a: &[u8] = &msg[..split];
+            let mut replies = lex.feed(&mut a).unwrap();
+            assert!(a.is_empty(), "split {split} retained bytes");
+            let mut b: &[u8] = &msg[split..];
+            replies.extend(lex.feed(&mut b).unwrap());
+            assert!(b.is_empty(), "split {split} retained bytes");
+            assert_eq!(replies, base_replies, "split {split} diverged");
+        }
     }
 }
