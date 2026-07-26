@@ -161,7 +161,7 @@ struct H3ClientStream {
     response_body_started: bool,
     started: bool,
     /// Set when the response HEADERS failed `:status` validation — checked
-    /// in `receive()`'s tail, where an `Endpoint` is available to close
+    /// in `receive()`'s tail, where an `Endpoint` is available to abort
     /// the stream.
     malformed: bool,
 }
@@ -243,9 +243,8 @@ impl H3FrameHandler for H3ClientStream {
 
         let mut w = NullClientWriter;
         if !self.response_headers_received && validate_response_status(&pairs).is_err() {
-            // RFC 9114 §4.3.2: malformed response → stream error. No
-            // abrupt-close primitive exists yet (tracked separately) —
-            // tell the app the request failed and stop this stream in
+            // RFC 9114 §4.3.2: malformed response → stream error. Tell the
+            // app the request failed, then abort the stream in
             // `receive()`'s tail rather than silently hang it.
             if let Some(handler) = &mut self.handler {
                 handler.request_failed(
@@ -294,7 +293,9 @@ impl ProtocolHandler for H3ClientStream {
         self.parser = parser;
         *data = &[];
         if self.malformed {
-            endpoint.close();
+            // RFC 9114 §4.3.2: a malformed response is a stream error, not
+            // a connection error — only this one request is affected.
+            endpoint.abort(frame::H3_MESSAGE_ERROR);
         }
     }
 
@@ -313,6 +314,7 @@ mod status_validation_tests {
     #[derive(Default)]
     struct RecordingEndpoint {
         closed: bool,
+        abort_code: Option<u32>,
     }
     impl Endpoint for RecordingEndpoint {
         fn send(&mut self, _data: &[u8]) {}
@@ -324,6 +326,10 @@ mod status_validation_tests {
         }
         fn close(&mut self) {
             self.closed = true;
+        }
+        fn abort(&mut self, error_code: u32) {
+            self.closed = true;
+            self.abort_code = Some(error_code);
         }
         fn local_addr(&self) -> std::io::Result<SocketAddr> {
             unimplemented!("not exercised by these unit tests")
@@ -432,6 +438,11 @@ mod status_validation_tests {
         let mut empty: &[u8] = &[];
         stream.receive(&mut ep, &mut empty);
         assert!(ep.closed);
+        assert_eq!(
+            ep.abort_code,
+            Some(frame::H3_MESSAGE_ERROR),
+            "must be a stream error (RFC 9114 §4.3.2), not a connection-wide close"
+        );
     }
 
     #[test]

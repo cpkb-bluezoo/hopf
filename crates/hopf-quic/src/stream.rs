@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use quinn_proto::StreamId;
+use quinn_proto::{ConnectionHandle, StreamId};
 use hopf_core::{
     ConnHandle, Endpoint, SecurityInfo, StartTlsError, TimerHandle, WriteReadyCallback,
 };
@@ -20,6 +20,10 @@ pub(crate) struct StreamQueues {
     pub out: Vec<u8>,
     pub closed: bool,
     pub finish_write: bool,
+    /// Set by [`QuicStreamEndpoint::abort`] to request an abrupt
+    /// RESET_STREAM + STOP_SENDING (RFC 9000 §3.5/§3.6) instead of a
+    /// graceful FIN. Consumed (taken) once by the driver's stream loop.
+    pub reset_error_code: Option<u64>,
 }
 
 impl StreamQueues {
@@ -28,6 +32,7 @@ impl StreamQueues {
             out: Vec::new(),
             closed: false,
             finish_write: false,
+            reset_error_code: None,
         }
     }
 }
@@ -35,6 +40,7 @@ impl StreamQueues {
 /// One bidirectional QUIC stream implementing [`Endpoint`].
 pub struct QuicStreamEndpoint {
     stream_id: StreamId,
+    conn: ConnectionHandle,
     local: SocketAddr,
     remote: SocketAddr,
     security: SecurityInfo,
@@ -49,8 +55,10 @@ pub struct QuicStreamEndpoint {
 }
 
 impl QuicStreamEndpoint {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         stream_id: StreamId,
+        conn: ConnectionHandle,
         local: SocketAddr,
         remote: SocketAddr,
         queues: Arc<Mutex<StreamQueues>>,
@@ -60,6 +68,7 @@ impl QuicStreamEndpoint {
     ) -> Self {
         Self {
             stream_id,
+            conn,
             local,
             remote,
             security: SecurityInfo::secure(Some(b"h3".to_vec()), Some("TLSv1.3".into()), None),
@@ -127,6 +136,33 @@ impl Endpoint for QuicStreamEndpoint {
         }
         let _ = self.cmd_tx.send(DriverCmd::StreamClose {
             stream_id: self.stream_id,
+        });
+        self.wake();
+    }
+
+    fn abort(&mut self, error_code: u32) {
+        if self.closing || !self.open {
+            return;
+        }
+        self.closing = true;
+        {
+            let mut q = self.queues.lock().unwrap();
+            q.reset_error_code = Some(error_code as u64);
+            q.closed = true;
+        }
+        // Reuses the same wake-up command as a graceful close — the real
+        // state (the reset request) lives in the shared queue; the driver
+        // checks it on its next stream pass.
+        let _ = self.cmd_tx.send(DriverCmd::StreamClose {
+            stream_id: self.stream_id,
+        });
+        self.wake();
+    }
+
+    fn close_connection(&mut self, error_code: u32) {
+        let _ = self.cmd_tx.send(DriverCmd::ConnectionClose {
+            conn: self.conn,
+            error_code: error_code as u64,
         });
         self.wake();
     }

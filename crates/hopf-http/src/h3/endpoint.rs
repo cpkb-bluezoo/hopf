@@ -4,6 +4,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler};
@@ -25,6 +26,15 @@ pub struct H3ServerConnection {
     factory: Arc<dyn ServerHandlerFactory>,
     limits: HttpLimits,
     peer_state: Arc<Mutex<H3PeerState>>,
+    /// The control stream's `QuicConnApi` key, saved from `connected()` so
+    /// `disconnecting()` can write a final GOAWAY on the same stream.
+    control_stream_key: Option<u64>,
+    /// Count of client-initiated bidirectional streams accepted so far.
+    /// RFC 9000 §2.1: such stream IDs are sequential multiples of 4 (0, 4,
+    /// 8, ...), so `(count - 1) * 4` is the exact ID of the most recently
+    /// accepted request without needing the raw QUIC `StreamId` at this
+    /// layer.
+    accepted_bi_streams: Arc<AtomicU64>,
 }
 
 impl H3ServerConnection {
@@ -34,6 +44,8 @@ impl H3ServerConnection {
             factory,
             limits,
             peer_state: Arc::new(Mutex::new(H3PeerState::default())),
+            control_stream_key: None,
+            accepted_bi_streams: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -44,6 +56,7 @@ impl QuicConnection for H3ServerConnection {
             let mut bytes = vec![0x00]; // control stream type
             frame::write_settings(&mut bytes);
             api.write(stream, &bytes);
+            self.control_stream_key = Some(stream);
         }
         // RFC 9204 requires both critical QPACK streams even with dynamic QPACK disabled.
         for ty in [0x02, 0x03] {
@@ -54,7 +67,27 @@ impl QuicConnection for H3ServerConnection {
     }
 
     fn accept_bi(&mut self) -> Box<dyn ProtocolHandler> {
+        self.accepted_bi_streams.fetch_add(1, Ordering::SeqCst);
         Box::new(H3RequestStream::new(Arc::clone(&self.factory), self.limits))
+    }
+
+    /// Send a final GOAWAY on the control stream, announcing the last
+    /// client-initiated stream this connection will have processed (RFC
+    /// 9114 §5.2), before the driver tears everything down. Not a true
+    /// graceful drain — in-flight streams are still abandoned — but tells
+    /// the peer not to expect responses to anything opened after this.
+    fn disconnecting(&mut self, api: &mut dyn QuicConnApi) {
+        let Some(key) = self.control_stream_key else {
+            return;
+        };
+        let count = self.accepted_bi_streams.load(Ordering::SeqCst);
+        if count == 0 {
+            return; // nothing accepted yet; no meaningful last-stream-id to announce
+        }
+        let last_stream_id = (count - 1) * 4;
+        let mut bytes = Vec::new();
+        frame::write_goaway(&mut bytes, last_stream_id);
+        api.write(key, &bytes);
     }
 
     fn accept_uni(&mut self) -> Box<dyn ProtocolHandler> {
@@ -221,7 +254,7 @@ struct H3RequestStream {
     upgraded: Option<Box<dyn ProtocolUpgradeHandler>>,
     /// Set when the request HEADERS failed pseudo-header validation (RFC
     /// 9114 §4.3.1) — checked in `receive()`'s tail, where an `Endpoint` is
-    /// available to close the stream.
+    /// available to abort the stream.
     malformed: bool,
 }
 
@@ -371,10 +404,8 @@ impl H3FrameHandler for H3RequestStream {
 
         if crate::pseudo_headers::validate_request_pseudo_headers(&pairs).is_err() {
             // RFC 9114 §4.3.1: malformed request → stream error
-            // (H3_MESSAGE_ERROR). No abrupt-close primitive exists yet
-            // (tracked separately) — `malformed` is checked in
-            // `receive()`'s tail, where an `Endpoint` is available to at
-            // least stop this stream rather than silently hang the peer.
+            // (H3_MESSAGE_ERROR). `malformed` is checked in `receive()`'s
+            // tail, where an `Endpoint` is available to abort the stream.
             self.malformed = true;
             return;
         }
@@ -408,7 +439,9 @@ impl ProtocolHandler for H3RequestStream {
         self.parser = parser;
         *data = &[];
         if self.malformed {
-            endpoint.close();
+            // RFC 9114 §4.3.1: a malformed request is a stream error, not
+            // a connection error — only this one request is affected.
+            endpoint.abort(frame::H3_MESSAGE_ERROR);
             return;
         }
         self.maybe_flush_after_deferred(endpoint);
@@ -442,6 +475,11 @@ pub(crate) struct H3PeerState {
     /// `SETTINGS_ENABLE_CONNECT_PROTOCOL=1` (RFC 9220).
     #[allow(dead_code)] // not yet consulted anywhere — see conformance.html
     pub(crate) peer_enable_connect_protocol: bool,
+    /// Set once the peer's GOAWAY frame arrives (RFC 9114 §5.2): the ID it
+    /// carried (the peer's last client-initiated bidirectional stream, if
+    /// sent by a server; a push ID, if sent by a client — moot here since
+    /// hopf never pushes).
+    pub(crate) goaway_received: Option<u64>,
 }
 
 /// What an [`H3UniStream`] does with bytes once its type byte is known.
@@ -466,6 +504,10 @@ pub(crate) struct H3UniStream {
     /// values above the standard single-byte types (e.g. GREASE, RFC 9114
     /// §7.2.8) legitimately span multiple bytes.
     pending_type: Vec<u8>,
+    /// Set when a connection-level protocol violation is detected (RFC
+    /// 9114 §8.1) — checked in `receive()`'s tail, where an `Endpoint` is
+    /// available to actually close the connection.
+    connection_error: Option<u32>,
 }
 
 impl H3UniStream {
@@ -474,6 +516,7 @@ impl H3UniStream {
             peer_state,
             kind: UniKind::Unclassified,
             pending_type: Vec::new(),
+            connection_error: None,
         }
     }
 
@@ -515,12 +558,11 @@ impl H3UniStream {
 impl H3FrameHandler for H3UniStream {
     fn data_frame(&mut self, _payload: &[u8]) {
         // RFC 9114 §7.2/§4.1: DATA never appears on the control stream.
-        // No connection-level close primitive exists yet to reject it (see
-        // the malformed-frame-handling conformance gap) — simply not
-        // processed as anything meaningful.
+        self.connection_error.get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
     fn headers_frame(&mut self, _payload: &[u8]) {
         // Same — HEADERS is a request/response-stream-only frame type.
+        self.connection_error.get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
     fn settings_frame(&mut self, payload: &[u8]) {
         let mut enable_connect_protocol = None;
@@ -533,10 +575,14 @@ impl H3FrameHandler for H3UniStream {
             self.peer_state.lock().unwrap().peer_enable_connect_protocol = v;
         }
     }
-    fn goaway_frame(&mut self, _payload: &[u8]) {
-        // GOAWAY reception handling is tracked separately.
+    fn goaway_frame(&mut self, payload: &[u8]) {
+        if let Some(id) = frame::parse_goaway(payload) {
+            self.peer_state.lock().unwrap().goaway_received = Some(id);
+        }
     }
-    fn frame_error(&mut self, _message: &str) {}
+    fn frame_error(&mut self, _message: &str) {
+        self.connection_error.get_or_insert(frame::H3_FRAME_ERROR);
+    }
 }
 
 impl ProtocolHandler for H3UniStream {
@@ -553,12 +599,10 @@ impl ProtocolHandler for H3UniStream {
             self.pending_type.clear();
 
             if self.classify(ty) {
-                // Best available response today: hopf-quic doesn't yet
-                // expose a connection-level or abrupt-stream close (see
-                // the stream-cancellation conformance gap), so stop
-                // reading from this duplicate stream rather than silently
-                // treat it as valid.
-                endpoint.close();
+                // RFC 9114 §6.2.1 / RFC 9204 §4.2: a duplicate control or
+                // QPACK critical stream is a connection error.
+                endpoint.close_connection(frame::H3_STREAM_CREATION_ERROR);
+                return;
             }
 
             if !remainder.is_empty() {
@@ -580,6 +624,10 @@ impl ProtocolHandler for H3UniStream {
             self.kind = UniKind::Control(parser);
         }
         *data = &[];
+
+        if let Some(code) = self.connection_error.take() {
+            endpoint.close_connection(code);
+        }
     }
 
     fn disconnected(&mut self, _: &mut dyn Endpoint) {}
@@ -591,11 +639,13 @@ mod uni_stream_tests {
     use super::*;
     use std::time::Duration;
 
-    /// Minimal [`Endpoint`] stub recording only whether `close()` was called
-    /// — all these tests need.
+    /// Minimal [`Endpoint`] stub recording `close()`/`abort()`/
+    /// `close_connection()` calls and their error codes.
     #[derive(Default)]
     struct RecordingEndpoint {
         closed: bool,
+        abort_code: Option<u32>,
+        close_connection_code: Option<u32>,
     }
     impl Endpoint for RecordingEndpoint {
         fn send(&mut self, _data: &[u8]) {}
@@ -607,6 +657,14 @@ mod uni_stream_tests {
         }
         fn close(&mut self) {
             self.closed = true;
+        }
+        fn abort(&mut self, error_code: u32) {
+            self.closed = true;
+            self.abort_code = Some(error_code);
+        }
+        fn close_connection(&mut self, error_code: u32) {
+            self.closed = true;
+            self.close_connection_code = Some(error_code);
         }
         fn local_addr(&self) -> std::io::Result<SocketAddr> {
             unimplemented!("not exercised by these unit tests")
@@ -722,6 +780,11 @@ mod uni_stream_tests {
         let mut d: &[u8] = &[0x00];
         second.receive(&mut ep, &mut d);
         assert!(ep.closed, "a duplicate control stream must be rejected");
+        assert_eq!(
+            ep.close_connection_code,
+            Some(frame::H3_STREAM_CREATION_ERROR),
+            "must be a connection error (RFC 9114 §6.2.1), not just a stream close"
+        );
     }
 
     #[test]
@@ -739,6 +802,7 @@ mod uni_stream_tests {
         let mut d: &[u8] = &[0x02];
         second.receive(&mut ep, &mut d);
         assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_STREAM_CREATION_ERROR));
     }
 
     /// Unknown/reserved/GREASE stream types (RFC 9114 §9, §7.2.8) must be
@@ -764,6 +828,47 @@ mod uni_stream_tests {
         assert!(!s.qpack_encoder_seen);
         assert!(!s.qpack_decoder_seen);
     }
+
+    /// A DATA frame on the control stream is a connection error (RFC 9114
+    /// §7.2/§4.1: only SETTINGS/GOAWAY/etc. belong there).
+    #[test]
+    fn data_frame_on_control_stream_is_a_connection_error() {
+        let state = shared_state();
+        let mut uni = H3UniStream::new(Arc::clone(&state));
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+        assert!(!ep.closed);
+
+        let mut bad_frame = Vec::new();
+        frame::write_data(&mut bad_frame, b"not allowed here");
+        let mut data: &[u8] = &bad_frame;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    /// GOAWAY on the control stream is parsed and stored in the shared
+    /// [`H3PeerState`] (RFC 9114 §5.2).
+    #[test]
+    fn goaway_on_control_stream_is_recorded() {
+        let state = shared_state();
+        let mut uni = H3UniStream::new(Arc::clone(&state));
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+
+        let mut goaway_frame = Vec::new();
+        frame::write_goaway(&mut goaway_frame, 8);
+        let mut data: &[u8] = &goaway_frame;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(!ep.closed, "GOAWAY reception alone doesn't close anything");
+        assert_eq!(state.lock().unwrap().goaway_received, Some(8));
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +879,7 @@ mod request_validation_tests {
     #[derive(Default)]
     struct RecordingEndpoint {
         closed: bool,
+        abort_code: Option<u32>,
     }
     impl Endpoint for RecordingEndpoint {
         fn send(&mut self, _data: &[u8]) {}
@@ -785,6 +891,10 @@ mod request_validation_tests {
         }
         fn close(&mut self) {
             self.closed = true;
+        }
+        fn abort(&mut self, error_code: u32) {
+            self.closed = true;
+            self.abort_code = Some(error_code);
         }
         fn local_addr(&self) -> std::io::Result<SocketAddr> {
             unimplemented!("not exercised by these unit tests")
@@ -887,6 +997,11 @@ mod request_validation_tests {
         let mut empty: &[u8] = &[];
         stream.receive(&mut ep, &mut empty);
         assert!(ep.closed, "receive() must close the stream once malformed is set");
+        assert_eq!(
+            ep.abort_code,
+            Some(frame::H3_MESSAGE_ERROR),
+            "must be a stream error (RFC 9114 §4.3.1), not a connection-wide close"
+        );
     }
 
     #[test]
@@ -905,6 +1020,86 @@ mod request_validation_tests {
             vec![("grpc-status".to_string(), "0".to_string()), ("grpc-message".to_string(), "ok".to_string())]
         );
         assert!(!stream.malformed, "trailers must not be run through request pseudo-header validation");
+    }
+}
+
+#[cfg(test)]
+mod connection_lifecycle_tests {
+    use super::*;
+
+    /// Records every `open_uni`/`open_bi`/`write`/`finish` call, mirroring
+    /// what a real `QuicConnApi` implementation would apply — enough to
+    /// verify what [`H3ServerConnection`] writes without a real driver.
+    #[derive(Default)]
+    struct RecordingConnApi {
+        next_key: u64,
+        writes: Vec<(u64, Vec<u8>)>,
+    }
+    impl QuicConnApi for RecordingConnApi {
+        fn open_uni(&mut self) -> Option<u64> {
+            let key = self.next_key;
+            self.next_key += 1;
+            Some(key)
+        }
+        fn open_bi(&mut self) -> Option<u64> {
+            let key = self.next_key;
+            self.next_key += 1;
+            Some(key)
+        }
+        fn write(&mut self, stream_key: u64, data: &[u8]) {
+            self.writes.push((stream_key, data.to_vec()));
+        }
+        fn finish(&mut self, _stream_key: u64) {}
+    }
+
+    struct NoopServerFactory;
+    impl ServerHandlerFactory for NoopServerFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+
+    fn control_stream_writes(api: &RecordingConnApi) -> Vec<&[u8]> {
+        // `connected()` always opens the control stream first (key 0).
+        api.writes.iter().filter(|(k, _)| *k == 0).map(|(_, d)| d.as_slice()).collect()
+    }
+
+    /// `disconnecting()` announces the true last-accepted client stream ID
+    /// (RFC 9000 §2.1: client-initiated bidi IDs are 0, 4, 8, ...) rather
+    /// than a placeholder.
+    #[test]
+    fn disconnecting_sends_goaway_with_last_accepted_stream_id() {
+        let mut conn = H3ServerConnection::new(Arc::new(NoopServerFactory), HttpLimits::default());
+        let mut api = RecordingConnApi::default();
+        conn.connected(&mut api); // control stream (key 0) + 2 QPACK streams
+
+        let _ = conn.accept_bi(); // 1st request -> stream id 0
+        let _ = conn.accept_bi(); // 2nd request -> stream id 4
+        let _ = conn.accept_bi(); // 3rd request -> stream id 8
+
+        conn.disconnecting(&mut api);
+
+        let control_writes = control_stream_writes(&api);
+        let goaway_bytes = control_writes.last().expect("a GOAWAY must have been written");
+        let (ty, ty_len) = super::super::varint::decode(goaway_bytes).unwrap();
+        assert_eq!(ty, frame::GOAWAY);
+        let (len, len_len) = super::super::varint::decode(&goaway_bytes[ty_len..]).unwrap();
+        let payload = &goaway_bytes[ty_len + len_len..ty_len + len_len + len as usize];
+        assert_eq!(frame::parse_goaway(payload), Some(8));
+    }
+
+    /// With no requests ever accepted, there's nothing meaningful to
+    /// announce, so no GOAWAY is sent at all.
+    #[test]
+    fn disconnecting_with_no_accepted_streams_sends_nothing() {
+        let mut conn = H3ServerConnection::new(Arc::new(NoopServerFactory), HttpLimits::default());
+        let mut api = RecordingConnApi::default();
+        conn.connected(&mut api);
+        let writes_before = api.writes.len();
+
+        conn.disconnecting(&mut api);
+
+        assert_eq!(api.writes.len(), writes_before, "no new write should occur");
     }
 }
 
