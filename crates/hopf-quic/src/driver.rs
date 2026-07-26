@@ -18,7 +18,7 @@ use quinn_proto::{
     Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint as QuinnEndpoint, EndpointConfig,
     Event, StreamEvent, StreamId, Transmit, VarInt,
 };
-use hopf_core::{Endpoint, HandlerFactory, ProtocolHandler};
+use hopf_core::{Endpoint, HandlerFactory, ProtocolHandler, SecurityInfo};
 
 use crate::config::{QuicConnectConfig, QuicListenConfig, QuicListenHooksConfig};
 use crate::hooks::{ConnectionFactory, QuicConnApi, QuicConnection};
@@ -26,6 +26,23 @@ use crate::stream::{QuicStreamEndpoint, StreamQueues};
 
 const UDP_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
+
+/// Build a [`SecurityInfo`] from `conn`'s real negotiated handshake data
+/// (RFC 7301 ALPN, SNI) instead of a hardcoded guess. The protocol version
+/// is always `TLSv1.3` by construction — hopf-quic's own TLS configs
+/// (`config.rs`) only ever build TLS 1.3, so a mismatched handshake would
+/// already have failed before any stream exists to report on. Cipher
+/// suite isn't exposed by quinn-proto's crypto session abstraction, so it
+/// stays `None` (honest "unknown", not a fabricated value).
+fn security_info_from_conn(conn: &Connection) -> SecurityInfo {
+    let handshake_data = conn
+        .crypto_session()
+        .handshake_data()
+        .and_then(|d| d.downcast::<quinn_proto::crypto::rustls::HandshakeData>().ok());
+    let alpn = handshake_data.as_ref().and_then(|d| d.protocol.clone());
+    let sni = handshake_data.and_then(|d| d.server_name.clone());
+    SecurityInfo::secure(alpn, Some("TLSv1.3".into()), None).with_sni(sni)
+}
 
 pub(crate) enum DriverCmd {
     StreamWritable { stream_id: StreamId },
@@ -361,6 +378,7 @@ impl Driver {
 
             self.handle_timeouts(now);
             self.poll_connections(now);
+            self.detect_migrations();
             self.drive_apps();
             self.flush_all_transmits();
         }
@@ -650,12 +668,14 @@ impl Driver {
                     };
                     let remote = slot.remote;
                     let local = self.local_addr;
+                    let security = security_info_from_conn(&slot.conn);
                     let queues = Arc::new(Mutex::new(StreamQueues::new()));
                     let mut endpoint = QuicStreamEndpoint::new(
                         id,
                         ch,
                         local,
                         remote,
+                        security,
                         Arc::clone(&queues),
                         self.cmd_tx.clone(),
                         Arc::clone(&self.waker),
@@ -749,6 +769,24 @@ impl Driver {
         }
     }
 
+    /// Refresh `ConnSlot.remote` (and every already-open stream's cached
+    /// remote address) once quinn-proto's active path actually changes
+    /// (RFC 9000 §9) — `remote_address()` is the only way to observe this,
+    /// there's no dedicated migration event to react to instead.
+    fn detect_migrations(&mut self) {
+        for slot in self.connections.values_mut() {
+            let current = slot.conn.remote_address();
+            if current == slot.remote {
+                continue;
+            }
+            slot.remote = current;
+            for stream in slot.streams.values_mut() {
+                stream.endpoint.set_remote(current);
+                stream.handler.migrated(&mut stream.endpoint);
+            }
+        }
+    }
+
     fn on_stream_event(&mut self, ch: ConnectionHandle, ev: StreamEvent) {
         match ev {
             StreamEvent::Opened { dir } => {
@@ -773,8 +811,8 @@ impl Driver {
     }
 
     fn attach_stream_dir(&mut self, ch: ConnectionHandle, id: StreamId, dir: Dir) {
-        let (remote, local) = match self.connections.get(&ch) {
-            Some(s) => (s.remote, self.local_addr),
+        let (remote, local, security) = match self.connections.get(&ch) {
+            Some(s) => (s.remote, self.local_addr, security_info_from_conn(&s.conn)),
             None => return,
         };
         let queues = Arc::new(Mutex::new(StreamQueues::new()));
@@ -783,6 +821,7 @@ impl Driver {
             ch,
             local,
             remote,
+            security,
             Arc::clone(&queues),
             self.cmd_tx.clone(),
             Arc::clone(&self.waker),
@@ -1147,6 +1186,153 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(got.lock().unwrap().as_slice(), b"ping");
+        server.shutdown();
+    }
+
+    struct SecurityRecorder {
+        out: Arc<StdMutex<Option<hopf_core::SecurityInfo>>>,
+    }
+
+    impl ProtocolHandler for SecurityRecorder {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            *self.out.lock().unwrap() = Some(endpoint.security_info().clone());
+            // A stream that never sends anything never actually reaches the
+            // peer (no STREAM frame implies its existence) — write a byte
+            // so the server side sees it and its own connected() fires.
+            endpoint.send(b"x");
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    /// The server offers two ALPNs; the client only offers the second, so
+    /// the real negotiated protocol can't be the old hardcoded `h3` guess
+    /// — proves `SecurityInfo` on both sides reflects the actual handshake
+    /// (RFC 7301 ALPN, plus SNI on the server side), not a constant.
+    #[test]
+    fn security_info_reflects_real_negotiated_alpn_and_sni() {
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"h3", b"custom-proto"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"custom-proto"]).unwrap();
+
+        let server_seen = Arc::new(StdMutex::new(None));
+        let server_seen2 = Arc::clone(&server_seen);
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(move || {
+                Box::new(SecurityRecorder { out: Arc::clone(&server_seen2) }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        let client_seen = Arc::new(StdMutex::new(None));
+        let client_seen2 = Arc::clone(&client_seen);
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(SecurityRecorder { out: Arc::clone(&client_seen2) }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        for _ in 0..200 {
+            if client_seen.lock().unwrap().is_some() && server_seen.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let client_info = client_seen.lock().unwrap().clone().expect("client never connected");
+        let server_info = server_seen.lock().unwrap().clone().expect("server never accepted");
+        assert_eq!(client_info.alpn(), Some(&b"custom-proto"[..]));
+        assert_eq!(server_info.alpn(), Some(&b"custom-proto"[..]));
+        assert_eq!(server_info.protocol(), Some("TLSv1.3"));
+        assert_eq!(server_info.sni(), Some("localhost"));
+
+        server.shutdown();
+    }
+
+    struct DisconnectRecorder {
+        disconnected: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ProtocolHandler for DisconnectRecorder {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            // Force the stream onto the wire so the peer's own connected()
+            // fires too (a stream that never sends anything is never
+            // observed by the peer at all).
+            endpoint.send(b"x");
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
+            self.disconnected.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    /// A real, much-shorter-than-default idle timeout applied via
+    /// [`QuicTransportOptions`] actually tears the connection down on its
+    /// own — proves the config is wired into quinn-proto's real transport
+    /// parameters, not just accepted and ignored.
+    #[test]
+    fn transport_options_shorten_the_idle_timeout() {
+        use crate::config::{apply_client_transport_options, apply_server_transport_options, QuicTransportOptions};
+
+        let (mut server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"idle-test"]).unwrap();
+        let mut client_cfg = client_config_for_pem_bytes(&pem, &[b"idle-test"]).unwrap();
+
+        let opts = QuicTransportOptions::new().max_idle_timeout(Duration::from_millis(200));
+        apply_server_transport_options(&mut server_cfg, &opts).unwrap();
+        apply_client_transport_options(&mut client_cfg, &opts).unwrap();
+
+        let server_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_disconnected2 = Arc::clone(&server_disconnected);
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(move || {
+                Box::new(DisconnectRecorder { disconnected: Arc::clone(&server_disconnected2) })
+                    as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        let client_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client_disconnected2 = Arc::clone(&client_disconnected);
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(DisconnectRecorder { disconnected: Arc::clone(&client_disconnected2) })
+                    as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        // No further traffic after the initial byte — with a 200ms idle
+        // timeout, both sides must tear the connection down well within
+        // this window; the default (30s) never would.
+        for _ in 0..150 {
+            if server_disconnected.load(std::sync::atomic::Ordering::SeqCst)
+                && client_disconnected.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(server_disconnected.load(std::sync::atomic::Ordering::SeqCst), "server never saw the idle timeout");
+        assert!(client_disconnected.load(std::sync::atomic::Ordering::SeqCst), "client never saw the idle timeout");
+
         server.shutdown();
     }
 }

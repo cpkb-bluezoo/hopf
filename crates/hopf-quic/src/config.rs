@@ -7,10 +7,12 @@ use std::io::{self, BufReader, ErrorKind};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig};
 use hopf_core::HandlerFactory;
+use quinn_proto::{TransportConfig, VarInt};
 
 use crate::hooks::ConnectionFactory;
 
@@ -208,6 +210,121 @@ pub fn client_config_for_pem_bytes(
         .try_into()
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     Ok(Arc::new(QuicClientConfig::new(Arc::new(quic_crypto))))
+}
+
+/// Commonly-tuned QUIC transport parameters (RFC 9000 §18.2), applied on
+/// top of a config already built by one of this module's PEM-based
+/// constructors via [`apply_server_transport_options`] /
+/// [`apply_client_transport_options`] — hopf-quic's own builders otherwise
+/// leave everything at quinn-proto's compiled-in defaults (e.g. a 30s idle
+/// timeout). Any field left `None` keeps quinn-proto's default for it.
+#[derive(Debug, Clone, Default)]
+pub struct QuicTransportOptions {
+    max_idle_timeout: Option<Duration>,
+    stream_receive_window: Option<u32>,
+    receive_window: Option<u32>,
+    send_window: Option<u64>,
+    max_concurrent_bidi_streams: Option<u32>,
+    max_concurrent_uni_streams: Option<u32>,
+}
+
+impl QuicTransportOptions {
+    /// Start from quinn-proto's defaults; only fields set via the builder
+    /// methods below are overridden.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Maximum duration of inactivity to accept before timing out the
+    /// connection (quinn-proto default: 30s).
+    pub fn max_idle_timeout(mut self, value: Duration) -> Self {
+        self.max_idle_timeout = Some(value);
+        self
+    }
+
+    /// Maximum bytes the peer may send on any one stream before becoming
+    /// blocked, awaiting a window update.
+    pub fn stream_receive_window(mut self, value: u32) -> Self {
+        self.stream_receive_window = Some(value);
+        self
+    }
+
+    /// Maximum bytes the peer may send across all streams of the
+    /// connection before becoming blocked.
+    pub fn receive_window(mut self, value: u32) -> Self {
+        self.receive_window = Some(value);
+        self
+    }
+
+    /// Maximum bytes to transmit to the peer without acknowledgment.
+    pub fn send_window(mut self, value: u64) -> Self {
+        self.send_window = Some(value);
+        self
+    }
+
+    /// Maximum number of incoming bidirectional streams the peer may have
+    /// open concurrently.
+    pub fn max_concurrent_bidi_streams(mut self, value: u32) -> Self {
+        self.max_concurrent_bidi_streams = Some(value);
+        self
+    }
+
+    /// Maximum number of incoming unidirectional streams the peer may have
+    /// open concurrently.
+    pub fn max_concurrent_uni_streams(mut self, value: u32) -> Self {
+        self.max_concurrent_uni_streams = Some(value);
+        self
+    }
+
+    fn build(&self) -> io::Result<TransportConfig> {
+        let mut transport = TransportConfig::default();
+        if let Some(value) = self.max_idle_timeout {
+            let idle = value
+                .try_into()
+                .map_err(|e| io::Error::new(ErrorKind::InvalidInput, format!("max_idle_timeout: {e}")))?;
+            transport.max_idle_timeout(Some(idle));
+        }
+        if let Some(value) = self.stream_receive_window {
+            transport.stream_receive_window(VarInt::from_u32(value));
+        }
+        if let Some(value) = self.receive_window {
+            transport.receive_window(VarInt::from_u32(value));
+        }
+        if let Some(value) = self.send_window {
+            transport.send_window(value);
+        }
+        if let Some(value) = self.max_concurrent_bidi_streams {
+            transport.max_concurrent_bidi_streams(VarInt::from_u32(value));
+        }
+        if let Some(value) = self.max_concurrent_uni_streams {
+            transport.max_concurrent_uni_streams(VarInt::from_u32(value));
+        }
+        Ok(transport)
+    }
+}
+
+/// Apply `options` to `server`'s transport config (RFC 9000 §18.2),
+/// on top of a config already built by [`server_config_from_pem`] or
+/// [`server_config_self_signed`].
+pub fn apply_server_transport_options(
+    server: &mut Arc<QuicServerConfig>,
+    options: &QuicTransportOptions,
+) -> io::Result<()> {
+    let transport = options.build()?;
+    Arc::make_mut(server).transport_config(Arc::new(transport));
+    Ok(())
+}
+
+/// Apply `options` to `client`'s transport config (RFC 9000 §18.2), on top
+/// of a config already built by [`client_config_from_pem`],
+/// [`client_config_for_pem_bytes`], or [`client_config_for_certified_pem`].
+pub fn apply_client_transport_options(
+    client: &mut Arc<QuicClientConfig>,
+    options: &QuicTransportOptions,
+) -> io::Result<()> {
+    let transport = options.build()?;
+    Arc::make_mut(client).transport_config(Arc::new(transport));
+    Ok(())
 }
 
 fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
