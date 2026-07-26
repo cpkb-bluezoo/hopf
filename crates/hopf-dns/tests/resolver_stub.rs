@@ -3,14 +3,15 @@
 //! Local UDP stub ↔ DnsResolver smoke (no external network).
 
 use std::io;
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use hopf_core::Runtime;
-use hopf_dns::wire::{DnsMessage, DnsResourceRecord, FLAG_QR, FLAG_RA};
-use hopf_dns::DnsResolver;
+use hopf_dns::server::DnsService;
+use hopf_dns::wire::{DnsMessage, DnsResourceRecord, FLAG_QR, FLAG_RA, FLAG_TC};
+use hopf_dns::{DnsCache, DnsResolver};
 
 #[test]
 fn resolve_a_against_local_stub() {
@@ -68,6 +69,249 @@ fn resolve_a_against_local_stub() {
         msg.answers[0].as_a(),
         Some(Ipv4Addr::new(203, 0, 113, 10))
     );
+    rt.shutdown();
+}
+
+/// RFC 2308 §2 NODATA (NOERROR with an empty answer set) must be cached —
+/// a second identical query must be answered from cache instead of
+/// re-querying upstream.
+#[test]
+fn nodata_response_is_negatively_cached_so_a_repeat_query_skips_upstream() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
+    let stub = UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    thread::spawn(move || loop {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            return;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            continue;
+        };
+        hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // NOERROR, no answers: NODATA.
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        let _ = stub.send_to(&resp.serialize().unwrap(), peer);
+    });
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let resolver = DnsResolver::new(rt.pick_worker().clone());
+    resolver.add_server(stub_addr);
+    resolver.open().unwrap();
+
+    for _ in 0..2 {
+        let got = Arc::new(Mutex::new(None));
+        let got2 = Arc::clone(&got);
+        resolver.query_a(
+            "nodata-integration-test.example",
+            Box::new(move |r| {
+                *got2.lock().unwrap() = Some(r);
+            }),
+        );
+        for _ in 0..100 {
+            if got.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let msg = got.lock().unwrap().take().expect("callback").expect("ok");
+        assert!(msg.answers.is_empty());
+    }
+
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "second query must be served from cache, not re-sent upstream");
+    rt.shutdown();
+}
+
+/// The forwarder must truncate (empty answer + TC set) a response too
+/// large for what the client advertised, instead of sending an oversized
+/// UDP datagram — and must send the full answer once the client's
+/// advertised EDNS payload size is big enough to hold it.
+#[test]
+fn forwarder_truncates_oversized_udp_response_for_the_clients_advertised_size() {
+    use hopf_dns::server::{listen_dns_udp, DnsServiceHandle, DnsUdpListenConfig};
+    use hopf_dns::wire::{DnsQuestion, DnsResourceRecord, DnsType};
+
+    let mut service = DnsService::new(Arc::new(DnsCache::default()));
+    service.set_local_resolver(|query| {
+        let mut resp = query.response_template(0);
+        let name = query.questions.first().map(|q| q.name.clone()).unwrap_or_default();
+        // Comfortably over 512 bytes (legacy limit) but well under 4096
+        // (a generous EDNS payload size) once serialized.
+        for i in 0..40u8 {
+            resp.answers.push(DnsResourceRecord::a(&name, 60, Ipv4Addr::new(203, 0, 113, i)));
+        }
+        Some(resp)
+    });
+    let handle = DnsServiceHandle::new(service);
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let (addr, _token) = listen_dns_udp(
+        rt.pick_worker(),
+        DnsUdpListenConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            service: handle,
+        },
+    )
+    .unwrap();
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+    // No EDNS OPT at all → legacy 512-octet limit → must truncate.
+    let plain_query = DnsMessage::query(1, DnsQuestion::in_class("big.example", DnsType::A), true);
+    client.send_to(&plain_query.serialize().unwrap(), addr).unwrap();
+    let mut buf = [0u8; 8192];
+    let n = client.recv(&mut buf).unwrap();
+    let truncated = DnsMessage::parse(&buf[..n]).unwrap();
+    assert!(truncated.is_truncated(), "oversized legacy (no-EDNS) response must set TC");
+    assert!(truncated.answers.is_empty(), "a truncated response carries no partial answer set");
+
+    // EDNS advertising a large payload size → the same answer set fits → no truncation.
+    let mut edns_query = DnsMessage::query(2, DnsQuestion::in_class("big.example", DnsType::A), true);
+    edns_query.additionals.push(DnsResourceRecord::opt(4096, false, &[]));
+    client.send_to(&edns_query.serialize().unwrap(), addr).unwrap();
+    let n = client.recv(&mut buf).unwrap();
+    let full = DnsMessage::parse(&buf[..n]).unwrap();
+    assert!(!full.is_truncated(), "response fits the advertised EDNS payload size, must not be truncated");
+    assert_eq!(full.answers.len(), 40);
+
+    rt.shutdown();
+}
+
+/// The forwarder's own upstream query getting a truncated (TC=1) UDP
+/// answer must trigger a TCP retry that recovers the full answer — proven
+/// through `DnsService::process_query_sync` directly (not just the
+/// underlying resolver), since that's the actual forwarder code path.
+#[test]
+fn forwarder_retries_truncated_upstream_answer_over_tcp() {
+    // Bind UDP first to claim a free ephemeral port, then bind TCP to the
+    // exact same port number (independent namespaces, no conflict) so a
+    // single SocketAddr serves both the UDP query and the TCP retry.
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let upstream_addr = udp.local_addr().unwrap();
+    let tcp = TcpListener::bind(upstream_addr).unwrap();
+
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = udp.recv_from(&mut buf) else {
+            return;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            return;
+        };
+        // Truncated UDP answer: no answers, TC set.
+        let mut truncated = q.response_template(0);
+        truncated.flags |= FLAG_QR | FLAG_RA | FLAG_TC;
+        let _ = udp.send_to(&truncated.serialize().unwrap(), peer);
+    });
+    thread::spawn(move || {
+        let Ok((mut stream, _)) = tcp.accept() else {
+            return;
+        };
+        use std::io::{Read, Write};
+        let mut len_buf = [0u8; 2];
+        if stream.read_exact(&mut len_buf).is_err() {
+            return;
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut req_buf = vec![0u8; len];
+        if stream.read_exact(&mut req_buf).is_err() {
+            return;
+        }
+        let Ok(q) = DnsMessage::parse(&req_buf) else {
+            return;
+        };
+        let mut full = q.response_template(0);
+        full.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            full.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(203, 0, 113, 40)));
+        }
+        let bytes = full.serialize().unwrap();
+        let _ = stream.write_all(&(bytes.len() as u16).to_be_bytes());
+        let _ = stream.write_all(&bytes);
+    });
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let upstream = DnsResolver::new(rt.pick_worker().clone());
+    upstream.add_server(upstream_addr);
+    upstream.open().unwrap();
+
+    let mut service = DnsService::new(Arc::new(DnsCache::default()));
+    service.set_upstream(upstream);
+
+    let query = DnsMessage::query(
+        4242,
+        hopf_dns::wire::DnsQuestion::in_class("tc-fallback-test.example", hopf_dns::wire::DnsType::A),
+        true,
+    );
+    let resp = service.process_query_sync(&query);
+
+    assert!(!resp.is_truncated(), "must return the full TCP-retried answer, not the truncated UDP one");
+    assert_eq!(resp.answers.len(), 1);
+    assert_eq!(resp.answers[0].as_a(), Some(Ipv4Addr::new(203, 0, 113, 40)));
+    rt.shutdown();
+}
+
+/// A dead first server (configured but never answering) must not fail the
+/// query outright — the resolver should retry against the second
+/// configured server and still succeed.
+#[test]
+fn retries_against_second_configured_server_when_first_is_dead() {
+    // Bound but never read from: absorbs the query silently, like a
+    // firewalled/unreachable upstream, so the resolver's own timeout (not
+    // an ICMP port-unreachable) is what triggers the retry.
+    let dead = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead_addr = dead.local_addr().unwrap();
+
+    let live = UdpSocket::bind("127.0.0.1:0").unwrap();
+    live.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let live_addr = live.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = live.recv_from(&mut buf) else {
+            return;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            return;
+        };
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            resp.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(203, 0, 113, 30)));
+        }
+        let _ = live.send_to(&resp.serialize().unwrap(), peer);
+    });
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let resolver = DnsResolver::new(rt.pick_worker().clone());
+    resolver.set_timeout(Duration::from_millis(150));
+    resolver.add_server(dead_addr);
+    resolver.add_server(live_addr);
+    resolver.open().unwrap();
+
+    let got = Arc::new(Mutex::new(None));
+    let got2 = Arc::clone(&got);
+    resolver.query_a(
+        "retry-test.example",
+        Box::new(move |r| {
+            *got2.lock().unwrap() = Some(r);
+        }),
+    );
+
+    // Long enough for one dead-server timeout (150ms) plus the retry's own
+    // round trip; short enough that this fails fast if retry is broken.
+    for _ in 0..150 {
+        if got.lock().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let msg = got.lock().unwrap().take().expect("callback").expect("ok, not a timeout");
+    assert_eq!(msg.answers[0].as_a(), Some(Ipv4Addr::new(203, 0, 113, 30)));
     rt.shutdown();
 }
 

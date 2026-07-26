@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 
-use super::class::DnsClass;
 use super::error::DnsFormatError;
 use super::name::{decode_name, write_name_compressed};
 use super::question::DnsQuestion;
@@ -134,6 +133,19 @@ impl DnsMessage {
         self.additionals.iter().any(|rr| rr.edns_do())
     }
 
+    /// The UDP payload size this message's sender advertises it can
+    /// receive (RFC 6891 §6.2.3, OPT record's CLASS field) — or the RFC
+    /// 1035 §2.3.4 legacy limit of 512 octets if it sent no OPT record at
+    /// all. Used to decide whether *replying* to this message over UDP
+    /// needs truncation (RFC 1035 §4.1.1 / RFC 2181 §9).
+    pub fn requested_udp_payload_size(&self) -> u16 {
+        self.additionals
+            .iter()
+            .find(|rr| rr.rtype == Some(DnsType::Opt))
+            .map(|rr| rr.raw_class)
+            .unwrap_or(512)
+    }
+
     /// Parse wire bytes.
     pub fn parse(data: &[u8]) -> Result<Self, DnsFormatError> {
         if data.len() < HEADER_SIZE {
@@ -215,11 +227,9 @@ fn parse_question(data: &[u8], cursor: &mut usize) -> Result<DnsQuestion, DnsFor
     *cursor += 2;
     let class_v = u16::from_be_bytes([data[*cursor], data[*cursor + 1]]);
     *cursor += 2;
-    let qtype = DnsType::from_value(type_v)
-        .ok_or_else(|| DnsFormatError::new(format!("unknown type {type_v}")))?;
-    let qclass = DnsClass::from_value(class_v)
-        .ok_or_else(|| DnsFormatError::new(format!("unknown class {class_v}")))?;
-    Ok(DnsQuestion::new(name, qtype, qclass))
+    // RFC 3597: an unrecognized QTYPE/QCLASS is preserved raw, the same
+    // way RR type/class already is — not a reason to fail the whole message.
+    Ok(DnsQuestion::opaque(name, type_v, class_v))
 }
 
 fn parse_rr(data: &[u8], cursor: &mut usize) -> Result<DnsResourceRecord, DnsFormatError> {
@@ -254,8 +264,8 @@ fn write_question(
     table: &mut HashMap<String, u16>,
 ) -> Result<(), DnsFormatError> {
     write_name_compressed(out, &q.name, table)?;
-    write_u16(out, q.qtype.value());
-    write_u16(out, q.qclass.value());
+    write_u16(out, q.raw_qtype);
+    write_u16(out, q.raw_qclass);
     Ok(())
 }
 
@@ -290,7 +300,7 @@ mod tests {
         assert_eq!(parsed.id, 0x1234);
         assert!(parsed.is_recursion_desired());
         assert_eq!(parsed.questions[0].name, "example.com");
-        assert_eq!(parsed.questions[0].qtype, DnsType::A);
+        assert_eq!(parsed.questions[0].qtype, Some(DnsType::A));
     }
 
     #[test]
@@ -306,5 +316,24 @@ mod tests {
             parsed.answers[0].as_a(),
             Some(Ipv4Addr::new(93, 184, 216, 34))
         );
+    }
+
+    /// RFC 3597: an unrecognized QTYPE/QCLASS must not fail parsing the
+    /// whole message — the raw value round-trips even though `qtype`/
+    /// `qclass` can't resolve to a known enum variant.
+    #[test]
+    fn unknown_qtype_and_qclass_round_trip_without_failing_the_message() {
+        let q = DnsQuestion::opaque("weird.example", 65280, 65281);
+        assert_eq!(q.qtype, None);
+        assert_eq!(q.qclass, None);
+        let msg = DnsMessage::query(9, q, true);
+        let bytes = msg.serialize().unwrap();
+        let parsed = DnsMessage::parse(&bytes).expect("unknown QTYPE/QCLASS must still parse");
+        assert_eq!(parsed.questions.len(), 1);
+        assert_eq!(parsed.questions[0].name, "weird.example");
+        assert_eq!(parsed.questions[0].qtype, None);
+        assert_eq!(parsed.questions[0].raw_qtype, 65280);
+        assert_eq!(parsed.questions[0].qclass, None);
+        assert_eq!(parsed.questions[0].raw_qclass, 65281);
     }
 }
