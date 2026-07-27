@@ -260,26 +260,178 @@ fn build_canonical_rrset(
     Some(records)
 }
 
-/// Async chain walker stub — currently delegates to in-message validation.
-pub struct DnssecChainValidator {
-    validator: DnssecValidator,
+/// Result of feeding a response into an in-progress [`DnssecChainWalk`].
+/// I/O-agnostic by design (mirrors [`DnssecValidator`]): the caller issues
+/// whatever query each `Need*` step asks for and feeds the response back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainStep {
+    /// Query DNSKEY for this zone and feed the response to
+    /// [`DnssecChainWalk::on_dnskey_response`].
+    NeedDnskey(String),
+    /// Query DS for this zone and feed the response to
+    /// [`DnssecChainWalk::on_ds_response`].
+    NeedDs(String),
+    /// The chain of trust is validated down to `zone`, using `key` — the
+    /// caller can now validate the original target message's own RRSIGs
+    /// against it (e.g. build a [`DnssecTrustAnchor`] anchored at `zone`
+    /// with a DS digest of `key`, and run it through [`DnssecValidator`]).
+    Done {
+        /// The deepest zone this walk actually validated a key for.
+        zone: String,
+        /// That zone's trusted DNSKEY.
+        key: Box<DnsResourceRecord>,
+    },
+    /// The chain could not be validated (RFC 4035 §4.3), or no configured
+    /// trust anchor covers the target name at all.
+    Failed(DnssecStatus),
 }
 
-impl DnssecChainValidator {
-    /// Wrap a validator.
-    pub fn new(validator: DnssecValidator) -> Self {
-        Self { validator }
+/// Drives one DNSSEC chain-of-trust walk (RFC 4035 §5.3.1): starting from
+/// the closest configured trust anchor, resolve and validate DS + DNSKEY
+/// at each zone cut down toward a target name, so validation works for any
+/// signed name under a signed root — not just zones with a directly
+/// pre-configured trust anchor (see [`DnssecValidator`], which only checks
+/// the single message it's given).
+///
+/// A zone-cut candidate with no DS record isn't treated as a hard failure
+/// — it's skipped as "not independently delegated", and the walk keeps
+/// descending under the current key. Authenticating that a missing DS is
+/// itself genuine (rather than stripped by an attacker) needs NSEC/NSEC3
+/// denial-of-existence, which this walker doesn't yet verify.
+pub struct DnssecChainWalk {
+    trust: DnssecTrustAnchor,
+    /// Zone-cut candidates still to investigate, closest-to-root first.
+    remaining: std::collections::VecDeque<String>,
+    /// The zone currently being investigated (whatever `Need*` step is
+    /// outstanding).
+    current_zone: String,
+    /// The deepest zone actually validated so far, and its trusted key.
+    trusted: Option<(String, DnsResourceRecord)>,
+    /// DS records fetched for `current_zone`, awaiting its DNSKEY response.
+    pending_ds: Vec<DnsResourceRecord>,
+}
+
+impl DnssecChainWalk {
+    /// Start a walk toward `qname`. Returns the walk plus its first step —
+    /// `Failed(Indeterminate)` immediately if no configured anchor covers
+    /// `qname` at all (mirrors [`DnssecValidator::validate_message`]).
+    pub fn start(trust: DnssecTrustAnchor, qname: &str) -> (Self, ChainStep) {
+        let chain = zone_chain_from_root(qname);
+        let Some(anchor_idx) = chain.iter().position(|z| !trust.anchors_for(z).is_empty()) else {
+            let walk = Self {
+                trust,
+                remaining: std::collections::VecDeque::new(),
+                current_zone: String::new(),
+                trusted: None,
+                pending_ds: Vec::new(),
+            };
+            return (walk, ChainStep::Failed(DnssecStatus::Indeterminate));
+        };
+        let anchor_zone = chain[anchor_idx].clone();
+        let remaining: std::collections::VecDeque<String> =
+            chain[anchor_idx + 1..].iter().cloned().collect();
+        let step = ChainStep::NeedDnskey(anchor_zone.clone());
+        let walk = Self {
+            trust,
+            remaining,
+            current_zone: anchor_zone,
+            trusted: None,
+            pending_ds: Vec::new(),
+        };
+        (walk, step)
     }
 
-    /// Validate using records present in `msg`.
-    pub fn validate(&self, msg: &DnsMessage) -> DnssecStatus {
-        self.validator.validate_message(msg)
+    /// Feed a DNSKEY response for the zone named in the most recently
+    /// issued `NeedDnskey` step.
+    pub fn on_dnskey_response(&mut self, msg: &DnsMessage) -> ChainStep {
+        let dnskeys: Vec<&DnsResourceRecord> =
+            msg.answers.iter().filter(|rr| rr.rtype == Some(DnsType::Dnskey)).collect();
+
+        let trusted_key = if self.pending_ds.is_empty() {
+            // First (anchor) step: validate directly against the
+            // configured trust anchor for this zone.
+            dnskeys.iter().find(|k| self.trust.is_dnskey_trusted(&self.current_zone, k))
+        } else {
+            // Descent step: validate against the DS fetched for this zone.
+            dnskeys.iter().find(|k| self.pending_ds.iter().any(|ds| verify_ds(k, ds)))
+        };
+        let Some(&key) = trusted_key else {
+            return ChainStep::Failed(DnssecStatus::Bogus);
+        };
+
+        // The DNSKEY RRset must be self-signed by this specific key
+        // (RFC 4035 §5.2) — not just any key present in the response.
+        let rrsigs = find_rrsigs(&msg.answers, DnsType::Dnskey.value());
+        let key_tag = key.dnskey_key_tag();
+        let key_alg = key.dnskey_algorithm();
+        let signed = rrsigs.iter().any(|sig| {
+            is_rrsig_current(sig)
+                && sig.rrsig_key_tag() == key_tag
+                && sig.rrsig_algorithm() == key_alg
+                && verify_rrsig(&dnskeys, sig, key)
+        });
+        if !signed {
+            return ChainStep::Failed(DnssecStatus::Bogus);
+        }
+
+        self.trusted = Some((self.current_zone.clone(), key.clone()));
+        self.pending_ds.clear();
+        self.advance()
     }
 
-    /// Access inner validator.
-    pub fn inner(&self) -> &DnssecValidator {
-        &self.validator
+    /// Feed a DS response for the zone named in the most recently issued
+    /// `NeedDs` step.
+    pub fn on_ds_response(&mut self, msg: &DnsMessage) -> ChainStep {
+        let ds_records: Vec<DnsResourceRecord> =
+            msg.answers.iter().filter(|rr| rr.rtype == Some(DnsType::Ds)).cloned().collect();
+        if ds_records.is_empty() {
+            // No DS at this label: not an independently delegated zone —
+            // skip it and keep descending under the current key.
+            return self.advance();
+        }
+        let Some((_, ref parent_key)) = self.trusted else {
+            return ChainStep::Failed(DnssecStatus::Bogus);
+        };
+        let ds_refs: Vec<&DnsResourceRecord> = ds_records.iter().collect();
+        let rrsigs = find_rrsigs(&msg.answers, DnsType::Ds.value());
+        let signed = rrsigs
+            .iter()
+            .any(|sig| is_rrsig_current(sig) && verify_rrsig(&ds_refs, sig, parent_key));
+        if !signed {
+            return ChainStep::Failed(DnssecStatus::Bogus);
+        }
+        self.pending_ds = ds_records;
+        ChainStep::NeedDnskey(self.current_zone.clone())
     }
+
+    fn advance(&mut self) -> ChainStep {
+        match self.remaining.pop_front() {
+            Some(zone) => {
+                self.current_zone = zone.clone();
+                ChainStep::NeedDs(zone)
+            }
+            None => {
+                let (zone, key) = self.trusted.clone().expect("advance only reached once a key is trusted");
+                ChainStep::Done { zone, key: Box::new(key) }
+            }
+        }
+    }
+}
+
+/// Every ancestor zone name from the root down to and including `name`
+/// itself, e.g. `"www.example.com"` → `[".", "com.", "example.com.",
+/// "www.example.com."]` (RFC 4035 §5.3.1's candidate zone cuts).
+fn zone_chain_from_root(name: &str) -> Vec<String> {
+    let normalized = normalize_name(name);
+    let mut out = vec![".".to_string()];
+    if normalized.is_empty() {
+        return out;
+    }
+    let labels: Vec<&str> = normalized.split('.').collect();
+    for i in (0..labels.len()).rev() {
+        out.push(labels[i..].join("."));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -374,5 +526,133 @@ mod tests {
 
         let trust = DnssecTrustAnchor::with_iana_root();
         assert!(trust.is_dnskey_trusted(".", &dnskey));
+    }
+
+    /// Sign `rrset` (all owned by `name`, of `rtype`) with `pair`, matching
+    /// the RRSIG construction already proven in `ed25519_rrsig_verifies`.
+    fn sign_rrset(
+        rrset: &[&DnsResourceRecord],
+        name: &str,
+        rtype: DnsType,
+        key_tag: u16,
+        pair: &Ed25519KeyPair,
+    ) -> DnsResourceRecord {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+        let labels = if name == "." { 0 } else { name.split('.').filter(|s| !s.is_empty()).count() as u8 };
+        let mut rrsig_rdata = Vec::new();
+        rrsig_rdata.extend_from_slice(&rtype.value().to_be_bytes());
+        rrsig_rdata.push(15); // Ed25519
+        rrsig_rdata.push(labels);
+        rrsig_rdata.extend_from_slice(&3600u32.to_be_bytes());
+        rrsig_rdata.extend_from_slice(&(now + 3600).to_be_bytes());
+        rrsig_rdata.extend_from_slice(&(now - 60).to_be_bytes());
+        rrsig_rdata.extend_from_slice(&key_tag.to_be_bytes());
+        rrsig_rdata.extend_from_slice(&encode_name(name).unwrap());
+        let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rrsig_rdata);
+        let signed = build_signed_data(rrset, &rrsig).unwrap();
+        let sig = pair.sign(&signed);
+        rrsig.rdata.extend_from_slice(sig.as_ref());
+        rrsig
+    }
+
+    fn generate_ed25519() -> (Ed25519KeyPair, Vec<u8>) {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        // Safety-free: PKCS8 doc owns the key material for the pair's lifetime.
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pub_bytes = pair.public_key().as_ref().to_vec();
+        (pair, pub_bytes)
+    }
+
+    /// Real two-level chain walk: root (the trust anchor) delegates to
+    /// "example.com" via a DS record; "com" has no DS at all (must be
+    /// skipped, not treated as a failure) — proves the walker actually
+    /// authenticates each hop rather than just trusting whatever DNSKEY
+    /// shows up.
+    #[test]
+    fn chain_walk_validates_two_level_delegation_and_skips_undelegated_labels() {
+        let (root_pair, root_pub) = generate_ed25519();
+        let (example_pair, example_pub) = generate_ed25519();
+
+        let root_dnskey = DnsResourceRecord::dnskey(".", 3600, 257, 15, &root_pub);
+        let root_key_tag = root_dnskey.dnskey_key_tag().unwrap();
+        let root_dnskey_rrsig = sign_rrset(&[&root_dnskey], ".", DnsType::Dnskey, root_key_tag, &root_pair);
+
+        let example_dnskey = DnsResourceRecord::dnskey("example.com", 3600, 257, 15, &example_pub);
+        let example_key_tag = example_dnskey.dnskey_key_tag().unwrap();
+        let example_dnskey_rrsig =
+            sign_rrset(&[&example_dnskey], "example.com", DnsType::Dnskey, example_key_tag, &example_pair);
+
+        let owner_wire = encode_name("example.com").unwrap();
+        let ds_digest = compute_ds_digest(&owner_wire, &example_dnskey.rdata, 2).unwrap();
+        let example_ds = DnsResourceRecord::ds("example.com", 3600, example_key_tag, 15, 2, &ds_digest);
+        let example_ds_rrsig = sign_rrset(&[&example_ds], "example.com", DnsType::Ds, root_key_tag, &root_pair);
+
+        // Trust anchor for "." matching the root key.
+        let root_digest = compute_ds_digest(&[0u8], &root_dnskey.rdata, 2).unwrap();
+        let mut trust = DnssecTrustAnchor::empty();
+        trust.add_anchor(".", root_key_tag, 15, 2, &root_digest);
+
+        let (mut walk, step) = DnssecChainWalk::start(trust, "example.com");
+        assert_eq!(step, ChainStep::NeedDnskey(".".to_string()));
+
+        let root_dnskey_msg = DnsMessage::new(1, 0, vec![], vec![root_dnskey, root_dnskey_rrsig], vec![], vec![]);
+        let step = walk.on_dnskey_response(&root_dnskey_msg);
+        assert_eq!(step, ChainStep::NeedDs("com".to_string()));
+
+        // No DS at "com." — must be skipped, not fail the whole walk.
+        let empty_msg = DnsMessage::new(2, 0, vec![], vec![], vec![], vec![]);
+        let step = walk.on_ds_response(&empty_msg);
+        assert_eq!(step, ChainStep::NeedDs("example.com".to_string()));
+
+        let ds_msg = DnsMessage::new(3, 0, vec![], vec![example_ds, example_ds_rrsig], vec![], vec![]);
+        let step = walk.on_ds_response(&ds_msg);
+        assert_eq!(step, ChainStep::NeedDnskey("example.com".to_string()));
+
+        let example_dnskey_msg =
+            DnsMessage::new(4, 0, vec![], vec![example_dnskey.clone(), example_dnskey_rrsig], vec![], vec![]);
+        let step = walk.on_dnskey_response(&example_dnskey_msg);
+        match step {
+            ChainStep::Done { zone, key } => {
+                assert_eq!(zone, "example.com");
+                assert_eq!(*key, example_dnskey);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// A DS RRset that claims to be signed but isn't actually verifiable
+    /// against the parent's trusted key must fail the walk (Bogus), not
+    /// silently be accepted.
+    #[test]
+    fn chain_walk_rejects_a_ds_rrset_with_a_bad_signature() {
+        let (root_pair, root_pub) = generate_ed25519();
+        let (_wrong_pair, _wrong_pub) = generate_ed25519();
+        let (forger_pair, _) = generate_ed25519(); // signs with the WRONG key
+
+        let root_dnskey = DnsResourceRecord::dnskey(".", 3600, 257, 15, &root_pub);
+        let root_key_tag = root_dnskey.dnskey_key_tag().unwrap();
+        let root_dnskey_rrsig = sign_rrset(&[&root_dnskey], ".", DnsType::Dnskey, root_key_tag, &root_pair);
+
+        let example_ds = DnsResourceRecord::ds("example.com", 3600, 12345, 15, 2, &[0xaa; 32]);
+        // Signed by an unrelated key, not the trusted root key.
+        let bogus_rrsig = sign_rrset(&[&example_ds], "example.com", DnsType::Ds, root_key_tag, &forger_pair);
+
+        let root_digest = compute_ds_digest(&[0u8], &root_dnskey.rdata, 2).unwrap();
+        let mut trust = DnssecTrustAnchor::empty();
+        trust.add_anchor(".", root_key_tag, 15, 2, &root_digest);
+
+        let (mut walk, _step) = DnssecChainWalk::start(trust, "example.com");
+        let root_dnskey_msg = DnsMessage::new(1, 0, vec![], vec![root_dnskey, root_dnskey_rrsig], vec![], vec![]);
+        walk.on_dnskey_response(&root_dnskey_msg);
+        walk.on_ds_response(&DnsMessage::new(2, 0, vec![], vec![], vec![], vec![])); // skip "com."
+
+        let ds_msg = DnsMessage::new(3, 0, vec![], vec![example_ds, bogus_rrsig], vec![], vec![]);
+        assert_eq!(walk.on_ds_response(&ds_msg), ChainStep::Failed(DnssecStatus::Bogus));
+    }
+
+    #[test]
+    fn chain_walk_is_indeterminate_with_no_covering_trust_anchor() {
+        let (_walk, step) = DnssecChainWalk::start(DnssecTrustAnchor::empty(), "example.com");
+        assert_eq!(step, ChainStep::Failed(DnssecStatus::Indeterminate));
     }
 }

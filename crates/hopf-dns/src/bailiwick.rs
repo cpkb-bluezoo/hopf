@@ -9,17 +9,16 @@ pub fn names_equal(a: &str, b: &str) -> bool {
     normalize_name(a) == normalize_name(b)
 }
 
-/// `record_owner` is `qname` or a subdomain of it.
+/// `record_owner` is `qname` or a subdomain of it. Both normalize to `""`
+/// for the DNS root zone ("."), which must compare equal here — a query
+/// for "." legitimately gets back records owned by the root.
 pub fn is_within_bailiwick(record_owner: &str, qname: &str) -> bool {
     let owner = normalize_name(record_owner);
     let query = normalize_name(qname);
-    if owner.is_empty() || query.is_empty() {
-        return false;
-    }
     if owner == query {
         return true;
     }
-    owner.ends_with(&format!(".{query}"))
+    !query.is_empty() && owner.ends_with(&format!(".{query}"))
 }
 
 /// Filter answers to bailiwick of `qname`.
