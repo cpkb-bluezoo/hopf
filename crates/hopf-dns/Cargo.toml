@@ -36,6 +36,8 @@ integration = []
 hopf-core = { workspace = true }
 mio = { workspace = true }
 getrandom = { workspace = true }
+sha2 = "0.10"
+hmac = "0.12"
 hopf-tls = { workspace = true, optional = true }
 hopf-quic = { workspace = true, optional = true }
 ring = { version = "0.17", optional = true }

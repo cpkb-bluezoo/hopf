@@ -40,6 +40,11 @@ pub struct DnsServerMetrics {
     pub upstreams: u64,
     /// Errors.
     pub errors: u64,
+    /// Queries that presented a DNS Cookie (RFC 7873) option.
+    pub cookies_presented: u64,
+    /// Of those, queries whose presented server cookie was verified
+    /// against a freshly (re)computed one for the client's address.
+    pub cookies_verified: u64,
 }
 
 /// Caching forwarder (Gumdrop `DNSService`).
@@ -87,8 +92,33 @@ impl DnsService {
         self.metrics.lock().unwrap().clone()
     }
 
-    /// Process one query message; returns response (may be async via callback for upstream).
-    pub fn process_query_sync(&self, query: &DnsMessage) -> DnsMessage {
+    /// Process one query message from `peer`; returns response (may be
+    /// async via callback for upstream). Handles the server-side DNS
+    /// Cookie exchange (RFC 7873 §5.2) around whatever
+    /// [`Self::compute_response`] answers: an inbound COOKIE option gets a
+    /// response COOKIE option back, echoing the client's cookie plus a
+    /// freshly (re)issued server cookie, regardless of the query's outcome.
+    pub fn process_query_sync(&self, query: &DnsMessage, peer: SocketAddr) -> DnsMessage {
+        let mut resp = self.compute_response(query);
+        if let Some((client_cookie, server_cookie)) = crate::cookie::parse_client_cookie(&query.additionals) {
+            let mut m = self.metrics.lock().unwrap();
+            m.cookies_presented += 1;
+            let ip_bytes = ip_octets(peer.ip());
+            if let Some(sc) = &server_cookie {
+                if self.cookies.validate_server_cookie(&client_cookie, &ip_bytes, sc) {
+                    m.cookies_verified += 1;
+                }
+            }
+            drop(m);
+            let option = self.cookies.encode_response_edns_option(&client_cookie, &ip_bytes);
+            resp.additionals.push(crate::wire::DnsResourceRecord::opt(crate::wire::OPT_UDP_PAYLOAD, false, &option));
+        }
+        resp
+    }
+
+    /// Core query handling, without the cookie exchange (factored out so
+    /// [`Self::process_query_sync`] can wrap every return path uniformly).
+    fn compute_response(&self, query: &DnsMessage) -> DnsMessage {
         {
             let mut m = self.metrics.lock().unwrap();
             m.queries += 1;
@@ -101,7 +131,6 @@ impl DnsService {
         }
         let q = &query.questions[0];
 
-        // Cookie-only amplification defence: empty question already handled.
         if let Some(ref local) = self.local {
             if let Some(resp) = local(query) {
                 return resp;
@@ -183,14 +212,23 @@ impl DnsServiceHandle {
         }
     }
 
-    /// Process query.
-    pub fn process(&self, query: &DnsMessage) -> DnsMessage {
-        self.inner.process_query_sync(query)
+    /// Process query from `peer`.
+    pub fn process(&self, query: &DnsMessage, peer: SocketAddr) -> DnsMessage {
+        self.inner.process_query_sync(query, peer)
     }
 
     /// Arc access.
     pub fn service(&self) -> &Arc<DnsService> {
         &self.inner
+    }
+}
+
+/// Raw address octets for [`DnsCookie::generate_server_cookie`]'s
+/// client-IP input (4 for IPv4, 16 for IPv6).
+fn ip_octets(ip: std::net::IpAddr) -> Vec<u8> {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+        std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
     }
 }
 
@@ -210,4 +248,100 @@ pub fn parse_upstream_list(s: &str) -> io::Result<Vec<SocketAddr>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::{DnsQuestion, DnsResourceRecord, DnsType};
+    use std::net::Ipv4Addr;
+
+    fn cookie_option(client: &[u8], server: Option<&[u8]>) -> DnsResourceRecord {
+        let mut data = client.to_vec();
+        if let Some(s) = server {
+            data.extend_from_slice(s);
+        }
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&crate::cookie::EDNS_OPTION_COOKIE.to_be_bytes());
+        rdata.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        rdata.extend_from_slice(&data);
+        DnsResourceRecord::opt(1232, false, &rdata)
+    }
+
+    fn service_answering(ip: Ipv4Addr) -> DnsService {
+        let mut service = DnsService::new(Arc::new(DnsCache::default()));
+        service.set_local_resolver(move |q| {
+            let mut resp = q.response_template(0);
+            resp.answers.push(DnsResourceRecord::a(&q.questions[0].name, 60, ip));
+            Some(resp)
+        });
+        service
+    }
+
+    #[test]
+    fn server_echoes_client_cookie_and_issues_a_verifiable_server_cookie() {
+        let service = service_answering(Ipv4Addr::new(203, 0, 113, 9));
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let client_cookie = [1u8, 2, 3, 4, 5, 6, 7, 8];
+
+        let mut query = DnsMessage::query(1, DnsQuestion::in_class("example.com", DnsType::A), true);
+        query.additionals.push(cookie_option(&client_cookie, None));
+        let resp = service.process_query_sync(&query, peer);
+
+        let opt = resp
+            .additionals
+            .iter()
+            .find(|rr| rr.rtype == Some(DnsType::Opt))
+            .expect("response must carry an OPT record with the COOKIE option");
+        let (got_client, got_server) =
+            crate::cookie::parse_client_cookie(std::slice::from_ref(opt)).expect("COOKIE option must round-trip");
+        assert_eq!(got_client, client_cookie);
+        let server_cookie = got_server.expect("server must always issue a server cookie");
+        assert!(service.cookies().validate_server_cookie(&client_cookie, &ip_octets(peer.ip()), &server_cookie));
+
+        assert_eq!(service.metrics().cookies_presented, 1);
+        assert_eq!(service.metrics().cookies_verified, 0, "no prior server cookie was presented, so nothing to verify yet");
+    }
+
+    #[test]
+    fn server_verifies_a_previously_issued_cookie_on_the_next_query() {
+        let service = service_answering(Ipv4Addr::new(203, 0, 113, 9));
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let client_cookie = [9u8; 8];
+        let server_cookie = service.cookies().generate_server_cookie(&client_cookie, &ip_octets(peer.ip()));
+
+        let mut query = DnsMessage::query(2, DnsQuestion::in_class("example.com", DnsType::A), true);
+        query.additionals.push(cookie_option(&client_cookie, Some(&server_cookie)));
+        let _ = service.process_query_sync(&query, peer);
+
+        assert_eq!(service.metrics().cookies_presented, 1);
+        assert_eq!(service.metrics().cookies_verified, 1, "the echoed, still-valid server cookie must verify");
+    }
+
+    #[test]
+    fn server_rejects_a_forged_server_cookie_from_a_different_client() {
+        let service = service_answering(Ipv4Addr::new(203, 0, 113, 9));
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let attacker: SocketAddr = "192.0.2.66:5353".parse().unwrap();
+        let client_cookie = [3u8; 8];
+        // A cookie genuinely issued to a *different* source address.
+        let cookie_for_someone_else = service.cookies().generate_server_cookie(&client_cookie, &ip_octets(attacker.ip()));
+
+        let mut query = DnsMessage::query(3, DnsQuestion::in_class("example.com", DnsType::A), true);
+        query.additionals.push(cookie_option(&client_cookie, Some(&cookie_for_someone_else)));
+        let _ = service.process_query_sync(&query, peer);
+
+        assert_eq!(service.metrics().cookies_presented, 1);
+        assert_eq!(service.metrics().cookies_verified, 0, "a cookie issued for a different address must not verify");
+    }
+
+    #[test]
+    fn no_cookie_option_in_query_means_none_in_response() {
+        let service = service_answering(Ipv4Addr::new(203, 0, 113, 9));
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let query = DnsMessage::query(4, DnsQuestion::in_class("example.com", DnsType::A), true);
+        let resp = service.process_query_sync(&query, peer);
+        assert!(resp.additionals.iter().all(|rr| rr.rtype != Some(DnsType::Opt)));
+        assert_eq!(service.metrics().cookies_presented, 0);
+    }
 }

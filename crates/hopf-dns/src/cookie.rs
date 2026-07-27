@@ -5,7 +5,12 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+
 use crate::wire::DnsResourceRecord;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// EDNS option code for COOKIE.
 pub const EDNS_OPTION_COOKIE: u16 = 10;
@@ -100,17 +105,74 @@ impl DnsCookie {
         }
     }
 
-    /// Server cookie for address verification (simple HMAC-like XOR mix).
+    /// Server cookie for address verification (RFC 7873 §5.2): HMAC-SHA256
+    /// over the client cookie and client IP, keyed by the server secret,
+    /// truncated to 8 octets.
     pub fn generate_server_cookie(&self, client_cookie: &[u8], client_ip: &[u8]) -> [u8; 8] {
+        let mut mac = HmacSha256::new_from_slice(&self.server_secret)
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(client_cookie);
+        mac.update(client_ip);
+        let full = mac.finalize().into_bytes();
         let mut out = [0u8; 8];
-        for i in 0..8 {
-            out[i] = self.server_secret[i]
-                ^ self.server_secret[i + 8]
-                ^ client_cookie.get(i).copied().unwrap_or(0)
-                ^ client_ip.get(i % client_ip.len().max(1)).copied().unwrap_or(0);
-        }
+        out.copy_from_slice(&full[..8]);
         out
     }
+
+    /// Whether `server_cookie` is exactly what we'd issue this
+    /// client/address combination right now.
+    pub fn validate_server_cookie(&self, client_cookie: &[u8], client_ip: &[u8], server_cookie: &[u8]) -> bool {
+        server_cookie.len() == 8 && server_cookie == self.generate_server_cookie(client_cookie, client_ip)
+    }
+
+    /// Server-side response COOKIE option (RFC 7873 §5.2): echoes the
+    /// client's own cookie plus a freshly issued server cookie. The server
+    /// always returns a *valid* server cookie regardless of whether one
+    /// was presented, or whether it validated — that's the mechanism by
+    /// which a client establishes/refreshes its cookie relationship.
+    pub fn encode_response_edns_option(&self, client_cookie: &[u8], client_ip: &[u8]) -> Vec<u8> {
+        let mut data = client_cookie.to_vec();
+        data.extend_from_slice(&self.generate_server_cookie(client_cookie, client_ip));
+        let mut out = Vec::with_capacity(4 + data.len());
+        out.extend_from_slice(&EDNS_OPTION_COOKIE.to_be_bytes());
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+}
+
+/// Parse an inbound query's COOKIE option from its OPT additional record,
+/// if any: the mandatory 8-byte client cookie, and an optional 8-32 byte
+/// server cookie if the client is presenting one it was previously issued
+/// (RFC 7873 §4).
+pub fn parse_client_cookie(additionals: &[DnsResourceRecord]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+    for rr in additionals {
+        if rr.rtype != Some(crate::wire::DnsType::Opt) {
+            continue;
+        }
+        let opt_rdata = &rr.rdata;
+        let mut i = 0;
+        while i + 4 <= opt_rdata.len() {
+            let code = u16::from_be_bytes([opt_rdata[i], opt_rdata[i + 1]]);
+            let len = u16::from_be_bytes([opt_rdata[i + 2], opt_rdata[i + 3]]) as usize;
+            i += 4;
+            if i + len > opt_rdata.len() {
+                break;
+            }
+            if code == EDNS_OPTION_COOKIE && len >= CLIENT_COOKIE_LENGTH {
+                let client = opt_rdata[i..i + CLIENT_COOKIE_LENGTH].to_vec();
+                let server = if len > CLIENT_COOKIE_LENGTH {
+                    let sc = &opt_rdata[i + CLIENT_COOKIE_LENGTH..i + len];
+                    (sc.len() >= 8 && sc.len() <= 32).then(|| sc.to_vec())
+                } else {
+                    None
+                };
+                return Some((client, server));
+            }
+            i += len;
+        }
+    }
+    None
 }
 
 fn fill_random(buf: &mut [u8]) {
@@ -160,6 +222,114 @@ mod tests {
         jar.regenerate_client_cookie();
         let sc = jar.generate_server_cookie(&jar.client_cookie(), &[127, 0, 0, 1]);
         assert_eq!(sc.len(), 8);
+    }
+
+    #[test]
+    fn server_cookie_is_deterministic_and_input_sensitive() {
+        let jar = DnsCookie::new();
+        let cc = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let ip_a = [127, 0, 0, 1];
+        let ip_b = [127, 0, 0, 2];
+
+        let a1 = jar.generate_server_cookie(&cc, &ip_a);
+        let a2 = jar.generate_server_cookie(&cc, &ip_a);
+        assert_eq!(a1, a2, "same inputs must produce the same cookie");
+
+        let b = jar.generate_server_cookie(&cc, &ip_b);
+        assert_ne!(a1, b, "a different client IP must change the cookie");
+
+        let other_cc = [9u8, 9, 9, 9, 9, 9, 9, 9];
+        let c = jar.generate_server_cookie(&other_cc, &ip_a);
+        assert_ne!(a1, c, "a different client cookie must change the cookie");
+
+        // Not a plain concatenation/reorderable mix: swapping bytes between
+        // the two inputs (same combined bytes, different split) must not
+        // produce the same cookie the way a naive XOR mix would.
+        let swapped_cc = [1u8, 2, 3, 4, 5, 6, 7, 127];
+        let swapped_ip = [8u8, 0, 0, 1];
+        let d = jar.generate_server_cookie(&swapped_cc, &swapped_ip);
+        assert_ne!(a1, d);
+    }
+
+    #[test]
+    fn server_cookie_differs_across_independently_keyed_jars() {
+        let cc = [0u8; 8];
+        let ip = [10u8, 0, 0, 1];
+
+        let jar1 = DnsCookie::new();
+        let jar2 = DnsCookie::new();
+        // Two independently random secrets must (overwhelmingly) produce
+        // different server cookies for identical client cookie/IP input.
+        assert_ne!(
+            jar1.generate_server_cookie(&cc, &ip),
+            jar2.generate_server_cookie(&cc, &ip),
+            "distinct server secrets must not collide"
+        );
+    }
+
+    #[test]
+    fn validate_server_cookie_accepts_genuine_and_rejects_tampered() {
+        let jar = DnsCookie::new();
+        let cc = [5u8; 8];
+        let ip = [192, 0, 2, 1];
+        let sc = jar.generate_server_cookie(&cc, &ip);
+        assert!(jar.validate_server_cookie(&cc, &ip, &sc));
+
+        let mut tampered = sc;
+        tampered[0] ^= 0xFF;
+        assert!(!jar.validate_server_cookie(&cc, &ip, &tampered));
+
+        // A cookie valid for one IP must not validate for another.
+        assert!(!jar.validate_server_cookie(&cc, &[192, 0, 2, 2], &sc));
+    }
+
+    #[test]
+    fn parse_client_cookie_extracts_client_and_optional_server_parts() {
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&EDNS_OPTION_COOKIE.to_be_bytes());
+        let client = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let server = [9u8, 10, 11, 12, 13, 14, 15, 16];
+        let mut data = client.to_vec();
+        data.extend_from_slice(&server);
+        rdata.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        rdata.extend_from_slice(&data);
+        let opt = DnsResourceRecord::opt(1232, false, &rdata);
+
+        let (got_client, got_server) = parse_client_cookie(&[opt]).expect("cookie option present");
+        assert_eq!(got_client, client);
+        assert_eq!(got_server, Some(server.to_vec()));
+    }
+
+    #[test]
+    fn parse_client_cookie_handles_client_only_and_absent_option() {
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&EDNS_OPTION_COOKIE.to_be_bytes());
+        let client = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        rdata.extend_from_slice(&(client.len() as u16).to_be_bytes());
+        rdata.extend_from_slice(&client);
+        let opt = DnsResourceRecord::opt(1232, false, &rdata);
+        let (got_client, got_server) = parse_client_cookie(&[opt]).expect("cookie option present");
+        assert_eq!(got_client, client);
+        assert_eq!(got_server, None);
+
+        let no_opt = DnsResourceRecord::opt(1232, false, &[]);
+        assert_eq!(parse_client_cookie(&[no_opt]), None);
+        assert_eq!(parse_client_cookie(&[]), None);
+    }
+
+    #[test]
+    fn server_response_option_round_trips_and_validates() {
+        let jar = DnsCookie::new();
+        let client = [7u8; 8];
+        let ip = [203, 0, 113, 5];
+        let opt_bytes = jar.encode_response_edns_option(&client, &ip);
+
+        assert_eq!(&opt_bytes[0..2], &EDNS_OPTION_COOKIE.to_be_bytes());
+        let len = u16::from_be_bytes([opt_bytes[2], opt_bytes[3]]) as usize;
+        assert_eq!(len, CLIENT_COOKIE_LENGTH + 8);
+        let data = &opt_bytes[4..4 + len];
+        assert_eq!(&data[..8], &client);
+        assert!(jar.validate_server_cookie(&client, &ip, &data[8..]));
     }
 }
 
