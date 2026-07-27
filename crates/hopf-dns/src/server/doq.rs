@@ -56,7 +56,10 @@ impl ProtocolHandler for DoqServerHandler {
             let Ok(query) = DnsMessage::parse(&payload) else {
                 continue;
             };
-            let resp = self.service.process(&query);
+            let peer = endpoint
+                .remote_addr()
+                .unwrap_or_else(|_| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
+            let resp = self.service.process(&query, peer);
             if let Ok(bytes) = resp.serialize() {
                 let mut out = Vec::with_capacity(2 + bytes.len());
                 out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
