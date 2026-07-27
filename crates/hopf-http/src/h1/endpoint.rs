@@ -13,6 +13,7 @@ use crate::stream::{
 
 use super::client_codec::H1ClientCodec;
 use super::server_codec::H1ServerCodec;
+use super::session_client_codec::H1SessionClientCodec;
 
 /// HTTP/1.x engine for one transport Endpoint (listen or dial).
 ///
@@ -22,6 +23,7 @@ pub struct H1Endpoint {
     role: HttpRole,
     server: Option<H1ServerCodec<Box<dyn ServerHandler>>>,
     client: Option<H1ClientCodec<Box<dyn ClientHandler>>>,
+    session: Option<H1SessionClientCodec>,
     #[allow(dead_code)] // keep-alive / next Stream (H2-shaped) later
     server_factory: Option<Arc<dyn ServerHandlerFactory>>,
     #[allow(dead_code)]
@@ -46,6 +48,7 @@ impl H1Endpoint {
             role: HttpRole::Server,
             server: Some(H1ServerCodec::new(handler, limits, secure)),
             client: None,
+            session: None,
             server_factory: Some(factory),
             client_factory: None,
             limits,
@@ -67,6 +70,7 @@ impl H1Endpoint {
             role: HttpRole::Client,
             server: None,
             client: Some(codec),
+            session: None,
             server_factory: None,
             client_factory: Some(factory),
             limits,
@@ -98,8 +102,32 @@ impl H1Endpoint {
         }
     }
 
+    /// Client role using the Gumdrop-shaped [`HttpRequest`](crate::HttpRequest) session API.
+    pub(crate) fn client_session(codec: H1SessionClientCodec, limits: HttpLimits, secure: bool) -> Self {
+        Self {
+            role: HttpRole::Client,
+            server: None,
+            client: None,
+            session: Some(codec),
+            server_factory: None,
+            client_factory: None,
+            limits,
+            secure,
+            next_stream_id: 1,
+        }
+    }
+
     fn flush_client(&mut self, endpoint: &mut dyn Endpoint) {
         if let Some(codec) = self.client.as_mut() {
+            let out = codec.take_outbound();
+            if !out.is_empty() {
+                endpoint.send(&out);
+            }
+            if codec.wants_close() {
+                endpoint.close();
+            }
+        }
+        if let Some(codec) = self.session.as_mut() {
             let out = codec.take_outbound();
             if !out.is_empty() {
                 endpoint.send(&out);
@@ -112,6 +140,13 @@ impl H1Endpoint {
 
     fn kickoff_client(&mut self, endpoint: &mut dyn Endpoint) {
         if let Some(codec) = self.client.as_mut() {
+            codec.on_connected();
+            let out = codec.take_outbound();
+            if !out.is_empty() {
+                endpoint.send(&out);
+            }
+        }
+        if let Some(codec) = self.session.as_mut() {
             codec.on_connected();
             let out = codec.take_outbound();
             if !out.is_empty() {
@@ -155,6 +190,9 @@ impl ProtocolHandler for H1Endpoint {
                 if let Some(codec) = self.client.as_mut() {
                     let _ = codec.receive(data);
                 }
+                if let Some(codec) = self.session.as_mut() {
+                    let _ = codec.receive(data);
+                }
                 self.flush_client(endpoint);
             }
         }
@@ -170,6 +208,9 @@ impl ProtocolHandler for H1Endpoint {
             }
             HttpRole::Client => {
                 if let Some(codec) = self.client.as_mut() {
+                    let _ = codec.close();
+                }
+                if let Some(codec) = self.session.as_mut() {
                     let _ = codec.close();
                 }
                 self.flush_client(endpoint);
