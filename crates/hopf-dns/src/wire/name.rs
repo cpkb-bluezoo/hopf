@@ -19,6 +19,26 @@ pub fn normalize_name(name: &str) -> String {
     n
 }
 
+/// RFC 4034 §6.1 canonical DNS name ordering: labels compared from the
+/// rightmost (most significant, e.g. the TLD) down to the leftmost, as
+/// raw lowercased octets. A name that is a proper suffix-match prefix of
+/// another (fewer labels, otherwise identical from the right) sorts
+/// first — which is exactly how `Vec<Vec<u8>>`'s own lexicographic `Ord`
+/// already behaves once each name is split into labels and reversed.
+pub fn canonical_compare(a: &str, b: &str) -> std::cmp::Ordering {
+    canonical_labels(a).cmp(&canonical_labels(b))
+}
+
+fn canonical_labels(name: &str) -> Vec<Vec<u8>> {
+    let n = normalize_name(name);
+    if n.is_empty() {
+        return Vec::new();
+    }
+    let mut labels: Vec<Vec<u8>> = n.split('.').map(|l| l.as_bytes().to_vec()).collect();
+    labels.reverse();
+    labels
+}
+
 /// Encode a domain name without compression (for RDATA domain names).
 pub fn encode_name(name: &str) -> Result<Vec<u8>, DnsFormatError> {
     if name.is_empty() || name == "." {
@@ -145,6 +165,35 @@ pub fn write_name_compressed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn canonical_ordering_sorts_by_rightmost_label_first() {
+        // RFC 4034 §6.1: compare from the TLD-most label inward; a proper
+        // suffix-prefix (fewer labels, otherwise identical) sorts first.
+        let names = [
+            "example",
+            "a.example",
+            "yljkjljk.a.example",
+            "z.a.example",
+            "z.example",
+            "*.z.example",
+        ];
+        for w in names.windows(2) {
+            assert_eq!(
+                canonical_compare(w[0], w[1]),
+                Ordering::Less,
+                "{:?} should sort before {:?}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_ordering_is_case_insensitive_and_reflexive() {
+        assert_eq!(canonical_compare("WWW.Example.com", "www.example.com"), Ordering::Equal);
+    }
 
     #[test]
     fn roundtrip_simple() {
