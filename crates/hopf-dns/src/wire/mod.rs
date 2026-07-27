@@ -2,6 +2,8 @@
 
 //! DNS wire format (RFC 1035 + EDNS / DNSSEC types).
 
+pub mod base32hex;
+mod bitmap;
 mod class;
 mod error;
 mod message;
@@ -18,7 +20,7 @@ pub use message::{
     RCODE_FORMERR, RCODE_NOERROR, RCODE_NOTIMP, RCODE_NXDOMAIN, RCODE_REFUSED, RCODE_SERVFAIL,
     DnsMessage,
 };
-pub use name::{decode_name, encode_name, normalize_name};
+pub use name::{canonical_compare, decode_name, encode_name, normalize_name};
 pub use query_id::DnsQueryIdGenerator;
 pub use question::DnsQuestion;
 pub use rr::{DnsResourceRecord, EDNS_FLAG_DO, OPT_UDP_PAYLOAD};

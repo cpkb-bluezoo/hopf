@@ -33,8 +33,8 @@ use crate::bailiwick::filter_answers_in_bailiwick;
 use crate::cache::DnsCache;
 use crate::cookie::DnsCookie;
 use crate::wire::{
-    DnsMessage, DnsQueryIdGenerator, DnsQuestion, DnsResourceRecord, DnsType, OPT_UDP_PAYLOAD,
-    RCODE_NXDOMAIN,
+    normalize_name, DnsMessage, DnsQueryIdGenerator, DnsQuestion, DnsResourceRecord, DnsType,
+    OPT_UDP_PAYLOAD, RCODE_NXDOMAIN,
 };
 
 /// Default DNS port.
@@ -85,6 +85,14 @@ struct PendingQuery {
     /// an inbound response is only accepted from this address, not from
     /// any source that happens to guess the matching id.
     server: SocketAddr,
+    /// RFC 4035 §3.2.2 CD: when set, a Bogus DNSSEC validation result
+    /// doesn't fail the query — the caller explicitly asked not to have
+    /// validation enforced (e.g. a forwarder relaying a downstream
+    /// client's own CD=1 query). Only consulted with the `dnssec` feature
+    /// enabled, but always accepted/stored so `query_with_cd`'s signature
+    /// doesn't change shape based on the feature.
+    #[cfg_attr(not(feature = "dnssec"), allow(dead_code))]
+    cd: bool,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -113,6 +121,7 @@ fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
     };
     let next_idx = pending.server_idx + 1;
     let Some(&next_server) = g.servers.get(next_idx) else {
+        drop(g);
         (pending.callback)(Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "DNS query timed out",
@@ -134,9 +143,108 @@ fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
             if let Some(c) = &p.cancel {
                 c.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            drop(g);
             (p.callback)(Err(e));
         }
     }
+}
+
+/// What to do once [`drive_chain_walk`] reaches a trusted zone key: either
+/// [`Self::validate_chain_of_trust`]'s per-message check, or
+/// [`Self::validate_denial_of_existence`]'s NSEC/NSEC3 proof.
+#[cfg(feature = "dnssec")]
+enum ChainWalkFinish {
+    ValidateMessage,
+    ValidateDenial { qname: String, qtype: DnsType },
+}
+
+/// Drives one [`crate::dnssec::DnssecChainWalk`] to completion, issuing
+/// whatever DS/DNSKEY query each step needs through `resolver`'s own
+/// `query()` (so intermediate lookups share the normal cache/retry/id
+/// machinery) and recursing on the response. Terminates via `finish`
+/// against the chain's final trusted key.
+#[cfg(feature = "dnssec")]
+fn drive_chain_walk(
+    resolver: DnsResolver,
+    mut walk: crate::dnssec::DnssecChainWalk,
+    step: crate::dnssec::ChainStep,
+    original_msg: DnsMessage,
+    finish: ChainWalkFinish,
+    cb: Box<dyn FnOnce(DnsMessage, crate::dnssec::DnssecStatus) + Send>,
+) {
+    use crate::dnssec::ChainStep;
+    match step {
+        ChainStep::NeedDnskey(zone) => {
+            let resolver2 = resolver.clone();
+            resolver.query(
+                DnsQuestion::in_class(&zone, DnsType::Dnskey),
+                Box::new(move |r| match r {
+                    Ok(msg) => {
+                        let next = walk.on_dnskey_response(&msg);
+                        drive_chain_walk(resolver2, walk, next, original_msg, finish, cb);
+                    }
+                    Err(_) => cb(original_msg, crate::dnssec::DnssecStatus::Indeterminate),
+                }),
+            );
+        }
+        ChainStep::NeedDs(zone) => {
+            let resolver2 = resolver.clone();
+            resolver.query(
+                DnsQuestion::in_class(&zone, DnsType::Ds),
+                Box::new(move |r| match r {
+                    Ok(msg) => {
+                        let next = walk.on_ds_response(&msg);
+                        drive_chain_walk(resolver2, walk, next, original_msg, finish, cb);
+                    }
+                    Err(_) => cb(original_msg, crate::dnssec::DnssecStatus::Indeterminate),
+                }),
+            );
+        }
+        ChainStep::Done { zone, key } => {
+            let status = match finish {
+                ChainWalkFinish::ValidateMessage => validate_against_key(&zone, &key, &original_msg),
+                ChainWalkFinish::ValidateDenial { qname, qtype } => {
+                    crate::dnssec::verify_denial(&original_msg, &zone, &key, &qname, qtype)
+                }
+            };
+            cb(original_msg, status);
+        }
+        ChainStep::Failed(status) => cb(original_msg, status),
+    }
+}
+
+/// Validate `msg`'s own RRSIGs against a single already-chain-verified
+/// `key` for `zone`, by seeding a throwaway trust anchor with `key`'s own
+/// digest and reusing [`DnssecValidator`]'s existing per-message logic.
+/// [`DnssecValidator::validate_message`] only looks for a matching DNSKEY
+/// *inside* the message it's validating (single-message design) — `msg`
+/// itself never carries one, since the chain walk fetched `key` via
+/// separate DNSKEY/DS round trips, so it's added as glue in a throwaway
+/// clone before delegating (the caller's own `original_msg` is untouched).
+#[cfg(feature = "dnssec")]
+fn validate_against_key(zone: &str, key: &DnsResourceRecord, msg: &DnsMessage) -> crate::dnssec::DnssecStatus {
+    let Some(key_tag) = key.dnskey_key_tag() else {
+        return crate::dnssec::DnssecStatus::Bogus;
+    };
+    let Some(algorithm) = key.dnskey_algorithm() else {
+        return crate::dnssec::DnssecStatus::Bogus;
+    };
+    let owner_wire = if zone == "." {
+        vec![0u8]
+    } else {
+        match crate::wire::encode_name(zone) {
+            Ok(w) => w,
+            Err(_) => return crate::dnssec::DnssecStatus::Bogus,
+        }
+    };
+    let Some(digest) = crate::dnssec::compute_ds_digest(&owner_wire, &key.rdata, 2) else {
+        return crate::dnssec::DnssecStatus::Bogus;
+    };
+    let mut anchor = crate::dnssec::DnssecTrustAnchor::empty();
+    anchor.add_anchor(zone, key_tag, algorithm, 2, &digest);
+    let mut msg = msg.clone();
+    msg.additionals.push(key.clone());
+    crate::dnssec::DnssecValidator::new(anchor).validate_message(&msg)
 }
 
 /// RFC 5452 §2.2: an accepted response's question section must match the
@@ -146,7 +254,14 @@ fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
 /// `Option<DnsType>`/`Option<DnsClass>`: two different unrecognized types
 /// both parse to `None`, which must not compare equal to each other.
 fn questions_match(a: &DnsQuestion, b: &DnsQuestion) -> bool {
-    a.raw_qtype == b.raw_qtype && a.raw_qclass == b.raw_qclass && a.name.eq_ignore_ascii_case(&b.name)
+    // Compare normalized names, not raw strings: the root zone is "." on
+    // the construction side (`DnsQuestion::in_class(".", ...)`, never
+    // itself wire-round-tripped) but decodes to "" once a response's own
+    // question section is parsed back off the wire — both denote the same
+    // name and must compare equal.
+    a.raw_qtype == b.raw_qtype
+        && a.raw_qclass == b.raw_qclass
+        && normalize_name(&a.name) == normalize_name(&b.name)
 }
 
 struct ResolverInner {
@@ -169,7 +284,9 @@ struct ResolverInner {
     dnssec: Option<crate::dnssec::DnssecValidator>,
 }
 
-/// Reactor-affine stub resolver (Gumdrop `DNSResolver`).
+/// Reactor-affine stub resolver (Gumdrop `DNSResolver`). Cheap to clone —
+/// every clone shares the same underlying state.
+#[derive(Clone)]
 pub struct DnsResolver {
     inner: Arc<Mutex<ResolverInner>>,
 }
@@ -285,6 +402,69 @@ impl DnsResolver {
         self.inner.lock().unwrap().dnssec_enabled
     }
 
+    /// Validate `msg` (an answer for `name`) against the full DNSSEC chain
+    /// of trust, walking from the closest configured trust anchor down
+    /// through each zone cut to `name`'s own zone (RFC 4035 §5.3.1) — DS
+    /// and DNSKEY at each hop are actually resolved and cryptographically
+    /// verified, via the same query machinery (and cache) as any other
+    /// lookup. Unlike the per-message check `query()` runs automatically,
+    /// this works for a name under a signed root even when only the root
+    /// itself is a directly configured trust anchor.
+    ///
+    /// Requires a DNSSEC validator to already be configured (see
+    /// [`Self::set_dnssec_enabled`]/[`Self::set_dnssec_validator`]) —
+    /// calls back with `Indeterminate` immediately if none is set.
+    #[cfg(feature = "dnssec")]
+    pub fn validate_chain_of_trust(
+        &self,
+        name: &str,
+        msg: DnsMessage,
+        cb: Box<dyn FnOnce(DnsMessage, crate::dnssec::DnssecStatus) + Send>,
+    ) {
+        let trust = {
+            let g = self.inner.lock().unwrap();
+            g.dnssec.as_ref().map(|v| v.trust_anchors().clone())
+        };
+        let Some(trust) = trust else {
+            cb(msg, crate::dnssec::DnssecStatus::Indeterminate);
+            return;
+        };
+        let (walk, step) = crate::dnssec::DnssecChainWalk::start(trust, name);
+        drive_chain_walk(self.clone(), walk, step, msg, ChainWalkFinish::ValidateMessage, cb);
+    }
+
+    /// Authenticated denial-of-existence (RFC 4035 §5.4): walks the same
+    /// DNSSEC chain of trust as [`Self::validate_chain_of_trust`] toward
+    /// `qname`'s own zone, then checks that `msg`'s authority-section
+    /// NSEC/NSEC3 records are validly signed by that zone's key *and*
+    /// actually prove `qname`/`qtype` doesn't exist (see
+    /// [`crate::dnssec::verify_denial`]) — for validating an NXDOMAIN or
+    /// NODATA response, which [`Self::validate_chain_of_trust`] can't (it
+    /// only validates records that ARE present).
+    #[cfg(feature = "dnssec")]
+    pub fn validate_denial_of_existence(
+        &self,
+        qname: &str,
+        qtype: DnsType,
+        msg: DnsMessage,
+        cb: Box<dyn FnOnce(DnsMessage, crate::dnssec::DnssecStatus) + Send>,
+    ) {
+        let trust = {
+            let g = self.inner.lock().unwrap();
+            g.dnssec.as_ref().map(|v| v.trust_anchors().clone())
+        };
+        let Some(trust) = trust else {
+            cb(msg, crate::dnssec::DnssecStatus::Indeterminate);
+            return;
+        };
+        let (walk, step) = crate::dnssec::DnssecChainWalk::start(trust, qname);
+        let finish = ChainWalkFinish::ValidateDenial {
+            qname: qname.to_string(),
+            qtype,
+        };
+        drive_chain_walk(self.clone(), walk, step, msg, finish, cb);
+    }
+
     /// Bind UDP socket on the reactor.
     pub fn open(&self) -> io::Result<()> {
         let mut g = self.inner.lock().unwrap();
@@ -355,6 +535,14 @@ impl DnsResolver {
 
     /// Generic query.
     pub fn query(&self, question: DnsQuestion, cb: QueryCallback) {
+        self.query_with_cd(question, false, cb);
+    }
+
+    /// Generic query with an explicit RFC 4035 §3.2.2 CD flag: when `cd` is
+    /// `true`, a Bogus DNSSEC validation result doesn't fail the query —
+    /// used by the forwarder to relay a downstream client's own CD=1
+    /// request through to upstream validation.
+    pub fn query_with_cd(&self, question: DnsQuestion, cd: bool, cb: QueryCallback) {
         let _ = self.open();
         let mut g = self.inner.lock().unwrap();
         // Hosts file / literals
@@ -417,6 +605,7 @@ impl DnsResolver {
                 cname_depth: 0,
                 id,
                 server,
+                cd,
                 cancel: Some(cancel),
             },
         );
@@ -425,6 +614,7 @@ impl DnsResolver {
                 if let Some(c) = &p.cancel {
                     c.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+                drop(g);
                 (p.callback)(Err(e));
             }
         }
@@ -615,9 +805,8 @@ impl UdpDatagramHandler for ResolverUdpHandler {
                         let mut g = inner.lock().unwrap();
                         g.tcp_pool.query(server, &question, id)
                     };
-                    let mut g = inner.lock().unwrap();
                     match result {
-                        Ok(msg) => complete_response(&inner, &mut g, pending, msg, server),
+                        Ok(msg) => complete_response(&inner, pending, msg, server),
                         Err(e) => (pending.callback)(Err(e)),
                     }
                 })
@@ -625,17 +814,18 @@ impl UdpDatagramHandler for ResolverUdpHandler {
             return;
         }
 
-        complete_response(&self.inner, &mut g, pending, msg, peer);
+        drop(g);
+        complete_response(&self.inner, pending, msg, peer);
     }
 }
 
 fn complete_response(
     inner: &Arc<Mutex<ResolverInner>>,
-    g: &mut ResolverInner,
     mut pending: PendingQuery,
     mut msg: DnsMessage,
     server: SocketAddr,
 ) {
+    let mut g = inner.lock().unwrap();
     if !pending.question.name.is_empty() && g.use_bailiwick {
         msg.answers = filter_answers_in_bailiwick(&pending.question.name, &msg.answers);
     }
@@ -654,7 +844,7 @@ fn complete_response(
                 if pending.cname_depth < MAX_CNAME_DEPTH {
                     pending.cname_depth += 1;
                     pending.question = DnsQuestion::in_class(cname, qtype);
-                    let id = alloc_id(g);
+                    let id = alloc_id(&g);
                     pending.id = id;
                     let server = g.servers.get(pending.server_idx).copied().unwrap_or(server);
                     pending.server = server;
@@ -664,7 +854,7 @@ fn complete_response(
                     pending.cancel = Some(cancel);
                     let q = pending.question.clone();
                     g.pending.insert(id, pending);
-                    let _ = send_udp_query(g, id, &q, server);
+                    let _ = send_udp_query(&mut g, id, &q, server);
                     return;
                 }
             }
@@ -676,16 +866,26 @@ fn complete_response(
         if g.dnssec_enabled {
             if let Some(ref v) = g.dnssec {
                 let status = v.validate_message(&msg);
-                if status == crate::dnssec::DnssecStatus::Bogus {
+                if status == crate::dnssec::DnssecStatus::Bogus && !pending.cd {
+                    // RFC 4035 §3.2.2: a CD=1 query asked not to have
+                    // validation enforced — only fail the query on Bogus
+                    // when the caller didn't request that.
+                    drop(g);
                     (pending.callback)(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "DNSSEC validation failed (bogus)",
                     )));
                     return;
                 }
+                if status == crate::dnssec::DnssecStatus::Secure {
+                    // RFC 4035 §3.2.3: assert that everything in this
+                    // response was cryptographically validated.
+                    msg.flags |= crate::wire::FLAG_AD;
+                }
             }
         }
     }
+    drop(g);
     (pending.callback)(Ok(msg));
 }
 
@@ -781,12 +981,158 @@ mod tests {
                 cname_depth: 0,
                 id: taken,
                 server: "127.0.0.1:53".parse().unwrap(),
+                cd: false,
                 cancel: None,
             },
         );
         for _ in 0..1000 {
             assert_ne!(alloc_id(&inner), taken, "must never hand out an id already in flight");
         }
+        rt.shutdown();
+    }
+
+    /// Builds a real signed DNSKEY + RRSIG-over-A rrset (same construction
+    /// as `dnssec::validator::tests::ed25519_rrsig_verifies`), plus a trust
+    /// anchor that matches it, so `complete_response` genuinely validates
+    /// the message rather than being told the answer.
+    #[cfg(feature = "dnssec")]
+    fn signed_secure_message(name: &str, id: u16) -> (DnsMessage, crate::dnssec::DnssecValidator) {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pub_bytes = pair.public_key().as_ref().to_vec();
+
+        let dnskey = DnsResourceRecord::dnskey(name, 3600, 257, 15, &pub_bytes);
+        let a = DnsResourceRecord::a(name, 3600, std::net::Ipv4Addr::new(192, 0, 2, 7));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let key_tag = dnskey.dnskey_key_tag().unwrap();
+
+        let mut rrsig_rdata = Vec::new();
+        rrsig_rdata.extend_from_slice(&DnsType::A.value().to_be_bytes());
+        rrsig_rdata.push(15); // Ed25519
+        rrsig_rdata.push(2); // labels
+        rrsig_rdata.extend_from_slice(&3600u32.to_be_bytes());
+        rrsig_rdata.extend_from_slice(&(now + 3600).to_be_bytes());
+        rrsig_rdata.extend_from_slice(&(now - 60).to_be_bytes());
+        rrsig_rdata.extend_from_slice(&key_tag.to_be_bytes());
+        rrsig_rdata.extend_from_slice(&crate::wire::encode_name(name).unwrap());
+
+        let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rrsig_rdata.clone());
+        let signed = {
+            let mut out = rrsig_rdata.clone();
+            // Mirrors build_canonical_rrset's owner+type+class+ttl+rdlen+rdata framing.
+            let owner_wire = crate::wire::encode_name(name).unwrap();
+            out.extend_from_slice(&owner_wire);
+            out.extend_from_slice(&DnsType::A.value().to_be_bytes());
+            out.extend_from_slice(&1u16.to_be_bytes());
+            out.extend_from_slice(&3600u32.to_be_bytes());
+            out.extend_from_slice(&(a.rdata.len() as u16).to_be_bytes());
+            out.extend_from_slice(&a.rdata);
+            out
+        };
+        let sig = pair.sign(&signed);
+        rrsig.rdata.extend_from_slice(sig.as_ref());
+
+        let owner_wire = crate::wire::encode_name(name).unwrap();
+        let digest = crate::dnssec::compute_ds_digest(&owner_wire, &dnskey.rdata, 2).unwrap();
+        let mut anchor = crate::dnssec::DnssecTrustAnchor::empty();
+        anchor.add_anchor(name, key_tag, 15, 2, &digest);
+        let validator = crate::dnssec::DnssecValidator::new(anchor);
+
+        let msg = DnsMessage::new(
+            id,
+            crate::wire::FLAG_QR,
+            vec![DnsQuestion::in_class(name, DnsType::A)],
+            vec![a],
+            vec![],
+            vec![dnskey, rrsig],
+        );
+        (msg, validator)
+    }
+
+    #[cfg(feature = "dnssec")]
+    fn dnssec_test_inner(rt: &hopf_core::Runtime, validator: crate::dnssec::DnssecValidator) -> ResolverInner {
+        ResolverInner {
+            reactor: rt.pick_worker().clone(),
+            udp_token: None,
+            servers: Vec::new(),
+            pending: HashMap::new(),
+            ids: DnsQueryIdGenerator::new(),
+            cache: Arc::new(DnsCache::default()),
+            cookies: DnsCookie::new(),
+            timeout: DEFAULT_TIMEOUT,
+            use_edns: true,
+            use_cookies: true,
+            use_bailiwick: false, // bailiwick would strip an out-of-zone A for this synthetic name
+            tcp_fallback: true,
+            tcp_pool: TcpDnsConnectionPool::new(),
+            dnssec_enabled: true,
+            dnssec: Some(validator),
+        }
+    }
+
+    #[cfg(feature = "dnssec")]
+    fn test_pending(cd: bool, cb: QueryCallback) -> PendingQuery {
+        PendingQuery {
+            callback: cb,
+            question: DnsQuestion::in_class("secure.example", DnsType::A),
+            server_idx: 0,
+            cname_depth: 0,
+            id: 1,
+            server: "127.0.0.1:53".parse().unwrap(),
+            cd,
+            cancel: None,
+        }
+    }
+
+    #[cfg(feature = "dnssec")]
+    #[test]
+    fn complete_response_sets_ad_when_dnssec_validation_is_secure() {
+        let (msg, validator) = signed_secure_message("secure.example", 1);
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let inner = Arc::new(Mutex::new(dnssec_test_inner(&rt, validator)));
+
+        let ad = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ad2 = Arc::clone(&ad);
+        let pending = test_pending(
+            false,
+            Box::new(move |r| {
+                ad2.store(r.expect("secure response must not fail").is_authenticated_data(), std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
+
+        complete_response(&inner, pending, msg, "127.0.0.1:53".parse().unwrap());
+        assert!(ad.load(std::sync::atomic::Ordering::SeqCst), "AD must be set once validation reports Secure");
+        rt.shutdown();
+    }
+
+    #[cfg(feature = "dnssec")]
+    #[test]
+    fn complete_response_honors_cd_and_lets_a_bogus_message_through_without_ad() {
+        let (mut msg, validator) = signed_secure_message("secure.example", 1);
+        // Tamper with the signed answer after signing: now Bogus, not Secure.
+        msg.answers[0] = DnsResourceRecord::a("secure.example", 3600, std::net::Ipv4Addr::new(203, 0, 113, 9));
+
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let inner = Arc::new(Mutex::new(dnssec_test_inner(&rt, validator)));
+
+        let result = Arc::new(Mutex::new(None));
+        let result2 = Arc::clone(&result);
+        let pending = test_pending(
+            true, // CD=1: don't fail on Bogus
+            Box::new(move |r| {
+                *result2.lock().unwrap() = Some(r);
+            }),
+        );
+
+        complete_response(&inner, pending, msg, "127.0.0.1:53".parse().unwrap());
+        let r = result.lock().unwrap().take().expect("callback must fire");
+        let delivered = r.expect("CD=1 must not fail the query even though validation is Bogus");
+        assert!(!delivered.is_authenticated_data(), "a Bogus response must never carry AD");
         rt.shutdown();
     }
 }
