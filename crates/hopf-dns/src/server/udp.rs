@@ -31,7 +31,7 @@ impl UdpDatagramHandler for DnsUdpHandler {
         let Ok(query) = DnsMessage::parse(data) else {
             return;
         };
-        let mut resp = self.service.process(&query);
+        let mut resp = self.service.process(&query, peer);
         let Ok(mut bytes) = resp.serialize() else {
             return;
         };

@@ -248,7 +248,7 @@ fn forwarder_retries_truncated_upstream_answer_over_tcp() {
         hopf_dns::wire::DnsQuestion::in_class("tc-fallback-test.example", hopf_dns::wire::DnsType::A),
         true,
     );
-    let resp = service.process_query_sync(&query);
+    let resp = service.process_query_sync(&query, "127.0.0.1:12345".parse().unwrap());
 
     assert!(!resp.is_truncated(), "must return the full TCP-retried answer, not the truncated UDP one");
     assert_eq!(resp.answers.len(), 1);

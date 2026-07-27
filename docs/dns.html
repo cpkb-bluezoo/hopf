@@ -195,6 +195,7 @@
 </tbody>
 </table>
 <p><code>DnsService::set_upstream</code>, <code>set_local_resolver</code>, <code>cache</code>, <code>metrics</code>. Strips DNSSEC RRs when the client query lacks DO.</p>
+<p><strong>Server-side DNS Cookies</strong> (RFC 7873 §5.2): an inbound query's COOKIE option (if any) is parsed and any presented server cookie validated — via HMAC-SHA256 over the client cookie and source address, keyed by a per-service random secret — against a freshly recomputed one; the response always carries a COOKIE option echoing the client cookie plus a valid server cookie, regardless of the query's own validity (RFC 7873's explicit leniency clause — a mismatched/absent server cookie doesn't change the RCODE, since that would need EDNS extended-RCODE support). <code>DnsServerMetrics::cookies_presented</code>/<code>cookies_verified</code> expose the counts.</p>
 <p><code>process_query_sync</code> uses a <strong>blocking</strong> upstream path (pragmatic).</p>
 <h2 id="transports">Transports</h2>
 <table>
