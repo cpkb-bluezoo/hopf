@@ -470,6 +470,136 @@ impl DnsResourceRecord {
         rdata.extend_from_slice(digest);
         Self::new(name, DnsType::Ds, DnsClass::In, ttl, rdata)
     }
+
+    // -- NSEC (RFC 4034 §4.1) --
+
+    fn require_nsec(&self) -> Option<()> {
+        if self.rtype == Some(DnsType::Nsec) {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Next owner name in canonical zone order.
+    pub fn nsec_next_domain(&self) -> Option<String> {
+        self.require_nsec()?;
+        let mut c = 0;
+        decode_name(&self.rdata, &mut c).ok()
+    }
+
+    /// RR type values present at this owner name.
+    pub fn nsec_types(&self) -> Option<Vec<u16>> {
+        self.require_nsec()?;
+        let mut c = 0;
+        decode_name(&self.rdata, &mut c).ok()?;
+        super::bitmap::decode_type_bitmap(&self.rdata[c..])
+    }
+
+    /// Build an NSEC RR.
+    pub fn nsec(
+        name: impl Into<String>,
+        ttl: u32,
+        next_domain: &str,
+        types: Vec<u16>,
+    ) -> Result<Self, DnsFormatError> {
+        let mut rdata = encode_name(next_domain)?;
+        rdata.extend_from_slice(&super::bitmap::encode_type_bitmap(types));
+        Ok(Self::new(name, DnsType::Nsec, DnsClass::In, ttl, rdata))
+    }
+
+    // -- NSEC3 (RFC 5155 §3) --
+
+    fn require_nsec3(&self) -> Option<()> {
+        if self.rtype == Some(DnsType::Nsec3) {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Hash algorithm (1 = SHA-1, the only one defined to date).
+    pub fn nsec3_hash_algorithm(&self) -> Option<u8> {
+        self.require_nsec3()?;
+        self.rdata.first().copied()
+    }
+
+    /// Flags octet (bit 0 = Opt-Out, RFC 5155 §3.1.2.1).
+    pub fn nsec3_flags(&self) -> Option<u8> {
+        self.require_nsec3()?;
+        self.rdata.get(1).copied()
+    }
+
+    /// Additional hash iterations (RFC 5155 §3.1.3).
+    pub fn nsec3_iterations(&self) -> Option<u16> {
+        self.require_nsec3()?;
+        if self.rdata.len() < 4 {
+            return None;
+        }
+        Some(u16::from_be_bytes([self.rdata[2], self.rdata[3]]))
+    }
+
+    /// Salt bytes.
+    pub fn nsec3_salt(&self) -> Option<&[u8]> {
+        self.require_nsec3()?;
+        let salt_len = *self.rdata.get(4)? as usize;
+        let start = 5;
+        if start + salt_len > self.rdata.len() {
+            return None;
+        }
+        Some(&self.rdata[start..start + salt_len])
+    }
+
+    /// Next hashed owner name (raw hash bytes, not base32hex-encoded).
+    pub fn nsec3_next_hashed_owner(&self) -> Option<&[u8]> {
+        self.require_nsec3()?;
+        let salt_len = *self.rdata.get(4)? as usize;
+        let hash_len_idx = 5 + salt_len;
+        let hash_len = *self.rdata.get(hash_len_idx)? as usize;
+        let start = hash_len_idx + 1;
+        if start + hash_len > self.rdata.len() {
+            return None;
+        }
+        Some(&self.rdata[start..start + hash_len])
+    }
+
+    /// RR type values present at the name this hash covers.
+    pub fn nsec3_types(&self) -> Option<Vec<u16>> {
+        self.require_nsec3()?;
+        let salt_len = *self.rdata.get(4)? as usize;
+        let hash_len_idx = 5 + salt_len;
+        let hash_len = *self.rdata.get(hash_len_idx)? as usize;
+        let start = hash_len_idx + 1 + hash_len;
+        if start > self.rdata.len() {
+            return None;
+        }
+        super::bitmap::decode_type_bitmap(&self.rdata[start..])
+    }
+
+    /// Build an NSEC3 RR. `name` (the base32hex hash label + zone) is the
+    /// caller's responsibility — see [`super::base32hex`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn nsec3(
+        name: impl Into<String>,
+        ttl: u32,
+        hash_algorithm: u8,
+        flags: u8,
+        iterations: u16,
+        salt: &[u8],
+        next_hashed_owner: &[u8],
+        types: Vec<u16>,
+    ) -> Self {
+        let mut rdata = Vec::new();
+        rdata.push(hash_algorithm);
+        rdata.push(flags);
+        rdata.extend_from_slice(&iterations.to_be_bytes());
+        rdata.push(salt.len() as u8);
+        rdata.extend_from_slice(salt);
+        rdata.push(next_hashed_owner.len() as u8);
+        rdata.extend_from_slice(next_hashed_owner);
+        rdata.extend_from_slice(&super::bitmap::encode_type_bitmap(types));
+        Self::new(name, DnsType::Nsec3, DnsClass::In, ttl, rdata)
+    }
 }
 
 #[cfg(test)]
@@ -532,6 +662,36 @@ mod tests {
 
         let short = DnsResourceRecord::opaque("x.", DnsType::A.value(), 1, 0, vec![1]);
         assert!(short.as_a().is_none());
+    }
+
+    #[test]
+    fn nsec_roundtrip() {
+        let types = vec![DnsType::A.value(), DnsType::Rrsig.value(), DnsType::Nsec.value()];
+        let nsec = DnsResourceRecord::nsec("a.ex.test", 3600, "b.ex.test", types.clone()).unwrap();
+        assert_eq!(nsec.nsec_next_domain().as_deref(), Some("b.ex.test"));
+        let mut decoded = nsec.nsec_types().unwrap();
+        decoded.sort_unstable();
+        let mut expected = types;
+        expected.sort_unstable();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn nsec3_roundtrip() {
+        let salt = [0xAB, 0xCD];
+        let next_hash = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+        let types = vec![DnsType::A.value(), DnsType::Rrsig.value()];
+        let nsec3 = DnsResourceRecord::nsec3("q04.ex.test", 3600, 1, 1, 10, &salt, &next_hash, types.clone());
+        assert_eq!(nsec3.nsec3_hash_algorithm(), Some(1));
+        assert_eq!(nsec3.nsec3_flags(), Some(1));
+        assert_eq!(nsec3.nsec3_iterations(), Some(10));
+        assert_eq!(nsec3.nsec3_salt(), Some(&salt[..]));
+        assert_eq!(nsec3.nsec3_next_hashed_owner(), Some(&next_hash[..]));
+        let mut decoded = nsec3.nsec3_types().unwrap();
+        decoded.sort_unstable();
+        let mut expected = types;
+        expected.sort_unstable();
+        assert_eq!(decoded, expected);
     }
 }
 

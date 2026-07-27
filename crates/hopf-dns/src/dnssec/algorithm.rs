@@ -36,9 +36,4 @@ impl DnssecAlgorithm {
             _ => return None,
         })
     }
-
-    /// Whether `ring` can verify this algorithm.
-    pub fn is_verifiable(self) -> bool {
-        !matches!(self, Self::Ed448)
-    }
 }

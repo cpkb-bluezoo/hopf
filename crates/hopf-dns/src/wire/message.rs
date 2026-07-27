@@ -132,6 +132,16 @@ impl DnsMessage {
     pub fn has_do(&self) -> bool {
         self.additionals.iter().any(|rr| rr.edns_do())
     }
+    /// CD bit (RFC 4035 §3.2.2): on a query, the client is requesting that
+    /// DNSSEC validation be skipped/not enforced for this request.
+    pub fn is_checking_disabled(&self) -> bool {
+        self.flags & FLAG_CD != 0
+    }
+    /// AD bit (RFC 4035 §3.2.3): on a response, the responder is asserting
+    /// that all data was DNSSEC-validated as secure.
+    pub fn is_authenticated_data(&self) -> bool {
+        self.flags & FLAG_AD != 0
+    }
 
     /// The UDP payload size this message's sender advertises it can
     /// receive (RFC 6891 §6.2.3, OPT record's CLASS field) — or the RFC

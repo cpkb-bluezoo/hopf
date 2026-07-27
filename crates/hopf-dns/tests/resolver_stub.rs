@@ -512,3 +512,284 @@ fn literal_connect_by_name_skips_dns() {
         owned.shutdown();
     }
 }
+
+/// A real, two-level DNSSEC chain-of-trust walk (root trust anchor →
+/// "example.com" delegation, with "com" correctly skipped as not itself
+/// delegated) driven end-to-end over real UDP round trips through
+/// `DnsResolver::validate_chain_of_trust` — proves the async DS/DNSKEY
+/// query-and-recurse plumbing actually works, not just the underlying
+/// state machine in isolation.
+#[cfg(feature = "dnssec")]
+#[test]
+fn validate_chain_of_trust_walks_a_real_two_level_delegation_over_the_network() {
+    use hopf_dns::dnssec::{compute_ds_digest, DnssecStatus, DnssecTrustAnchor, DnssecValidator};
+    use hopf_dns::wire::{encode_name, DnsClass, DnsQuestion, DnsType};
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn sign_rrset(rrset: &[&DnsResourceRecord], name: &str, rtype: DnsType, key_tag: u16, pair: &Ed25519KeyPair) -> DnsResourceRecord {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+        let labels = if name == "." { 0 } else { name.split('.').filter(|s| !s.is_empty()).count() as u8 };
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&rtype.value().to_be_bytes());
+        rdata.push(15); // Ed25519
+        rdata.push(labels);
+        rdata.extend_from_slice(&3600u32.to_be_bytes());
+        rdata.extend_from_slice(&(now + 3600).to_be_bytes());
+        rdata.extend_from_slice(&(now - 60).to_be_bytes());
+        rdata.extend_from_slice(&key_tag.to_be_bytes());
+        rdata.extend_from_slice(&encode_name(name).unwrap());
+        // RFC 4034 §3.1.8 signed data: RRSIG header (everything above) + canonical rrset.
+        let mut signed = rdata.clone();
+        let owner_wire = encode_name(name).unwrap();
+        for rr in rrset {
+            signed.extend_from_slice(&owner_wire);
+            signed.extend_from_slice(&rtype.value().to_be_bytes());
+            signed.extend_from_slice(&1u16.to_be_bytes()); // IN
+            signed.extend_from_slice(&3600u32.to_be_bytes());
+            signed.extend_from_slice(&(rr.rdata.len() as u16).to_be_bytes());
+            signed.extend_from_slice(&rr.rdata);
+        }
+        let sig = pair.sign(&signed);
+        let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rdata);
+        rrsig.rdata.extend_from_slice(sig.as_ref());
+        rrsig
+    }
+
+    let root_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let root_pair = Ed25519KeyPair::from_pkcs8(root_pkcs8.as_ref()).unwrap();
+    let root_dnskey = DnsResourceRecord::dnskey(".", 3600, 257, 15, root_pair.public_key().as_ref());
+    let root_key_tag = root_dnskey.dnskey_key_tag().unwrap();
+    let root_dnskey_rrsig = sign_rrset(&[&root_dnskey], ".", DnsType::Dnskey, root_key_tag, &root_pair);
+
+    let example_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let example_pair = Ed25519KeyPair::from_pkcs8(example_pkcs8.as_ref()).unwrap();
+    let example_dnskey = DnsResourceRecord::dnskey("example.com", 3600, 257, 15, example_pair.public_key().as_ref());
+    let example_key_tag = example_dnskey.dnskey_key_tag().unwrap();
+    let example_dnskey_rrsig =
+        sign_rrset(&[&example_dnskey], "example.com", DnsType::Dnskey, example_key_tag, &example_pair);
+
+    let owner_wire = encode_name("example.com").unwrap();
+    let ds_digest = compute_ds_digest(&owner_wire, &example_dnskey.rdata, 2).unwrap();
+    let example_ds = DnsResourceRecord::ds("example.com", 3600, example_key_tag, 15, 2, &ds_digest);
+    let example_ds_rrsig = sign_rrset(&[&example_ds], "example.com", DnsType::Ds, root_key_tag, &root_pair);
+
+    let a = DnsResourceRecord::a("example.com", 3600, Ipv4Addr::new(192, 0, 2, 55));
+    let a_rrsig = sign_rrset(&[&a], "example.com", DnsType::A, example_key_tag, &example_pair);
+
+    let root_digest = compute_ds_digest(&[0u8], &root_dnskey.rdata, 2).unwrap();
+
+    let stub = UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    thread::spawn(move || loop {
+        let mut buf = [0u8; 4096];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            return;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            continue;
+        };
+        let Some(question) = q.questions.first() else {
+            continue;
+        };
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        let name = hopf_dns::wire::normalize_name(&question.name);
+        match (name.as_str(), question.qtype) {
+            (".", Some(DnsType::Dnskey)) | ("", Some(DnsType::Dnskey)) => {
+                resp.answers = vec![root_dnskey.clone(), root_dnskey_rrsig.clone()];
+            }
+            ("com", Some(DnsType::Ds)) => {} // no DS: "com" isn't independently delegated here
+            ("example.com", Some(DnsType::Ds)) => {
+                resp.answers = vec![example_ds.clone(), example_ds_rrsig.clone()];
+            }
+            ("example.com", Some(DnsType::Dnskey)) => {
+                resp.answers = vec![example_dnskey.clone(), example_dnskey_rrsig.clone()];
+            }
+            _ => {}
+        }
+        let _ = stub.send_to(&resp.serialize().unwrap(), peer);
+    });
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let resolver = DnsResolver::new(rt.pick_worker().clone());
+    resolver.add_server(stub_addr);
+    resolver.open().unwrap();
+    let mut anchor = DnssecTrustAnchor::empty();
+    anchor.add_anchor(".", root_key_tag, 15, 2, &root_digest);
+    resolver.set_dnssec_validator(DnssecValidator::new(anchor));
+
+    let target_msg = DnsMessage::new(
+        1,
+        FLAG_QR,
+        vec![DnsQuestion::in_class("example.com", DnsType::A)],
+        vec![a, a_rrsig],
+        vec![],
+        vec![],
+    );
+
+    let result = Arc::new(Mutex::new(None));
+    let result2 = Arc::clone(&result);
+    resolver.validate_chain_of_trust(
+        "example.com",
+        target_msg,
+        Box::new(move |_msg, status| {
+            *result2.lock().unwrap() = Some(status);
+        }),
+    );
+
+    for _ in 0..150 {
+        if result.lock().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(result.lock().unwrap().take(), Some(DnssecStatus::Secure), "chain walk over real network round trips must validate as Secure");
+    rt.shutdown();
+}
+
+/// Drives [`DnsResolver::validate_denial_of_existence`] over a real UDP
+/// round trip: a single-hop trust anchor at "." (no delegation involved,
+/// since the chain-walk plumbing itself is already proven end-to-end by
+/// the test above), then an NSEC3 closest-encloser proof — signed by
+/// that same root key — that "missing" doesn't exist. Exercises the
+/// whole path: DNSKEY fetch, NSEC3 hash computation, RRSIG verification,
+/// and the closest-encloser proof, all driven by real network responses.
+#[cfg(feature = "dnssec")]
+#[test]
+fn validate_denial_of_existence_proves_a_real_nxdomain_over_the_network() {
+    use hopf_dns::dnssec::{compute_ds_digest, DnssecStatus, DnssecTrustAnchor, DnssecValidator};
+    use hopf_dns::wire::{encode_name, normalize_name, DnsClass, DnsQuestion, DnsType};
+    use ring::rand::SystemRandom;
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn sign_rrset(rrset: &[&DnsResourceRecord], name: &str, rtype: DnsType, key_tag: u16, pair: &Ed25519KeyPair) -> DnsResourceRecord {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
+        let labels = if name == "." { 0 } else { name.split('.').filter(|s| !s.is_empty()).count() as u8 };
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&rtype.value().to_be_bytes());
+        rdata.push(15); // Ed25519
+        rdata.push(labels);
+        rdata.extend_from_slice(&3600u32.to_be_bytes());
+        rdata.extend_from_slice(&(now + 3600).to_be_bytes());
+        rdata.extend_from_slice(&(now - 60).to_be_bytes());
+        rdata.extend_from_slice(&key_tag.to_be_bytes());
+        rdata.extend_from_slice(&encode_name(name).unwrap());
+        let mut signed = rdata.clone();
+        // Canonical form (RFC 4034 §6.2) lowercases the owner name — the
+        // real verifier recomputes it via `normalize_name`, so this must
+        // match, unlike the raw `name` used for the RRSIG's own owner.
+        let owner_wire = encode_name(&normalize_name(name)).unwrap();
+        for rr in rrset {
+            signed.extend_from_slice(&owner_wire);
+            signed.extend_from_slice(&rtype.value().to_be_bytes());
+            signed.extend_from_slice(&1u16.to_be_bytes()); // IN
+            signed.extend_from_slice(&3600u32.to_be_bytes());
+            signed.extend_from_slice(&(rr.rdata.len() as u16).to_be_bytes());
+            signed.extend_from_slice(&rr.rdata);
+        }
+        let sig = pair.sign(&signed);
+        let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rdata);
+        rrsig.rdata.extend_from_slice(sig.as_ref());
+        rrsig
+    }
+
+    let root_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    let root_pair = Ed25519KeyPair::from_pkcs8(root_pkcs8.as_ref()).unwrap();
+    let root_dnskey = DnsResourceRecord::dnskey(".", 3600, 257, 15, root_pair.public_key().as_ref());
+    let root_key_tag = root_dnskey.dnskey_key_tag().unwrap();
+    let root_dnskey_rrsig = sign_rrset(&[&root_dnskey], ".", DnsType::Dnskey, root_key_tag, &root_pair);
+    let root_digest = compute_ds_digest(&[0u8], &root_dnskey.rdata, 2).unwrap();
+
+    // Closest-encloser NSEC3 proof that "missing" doesn't exist under ".".
+    let salt = [0x7Au8];
+    let iterations = 0u16;
+    let hash_of = |name: &str| {
+        let owner_wire = encode_name(&normalize_name(name)).unwrap();
+        hopf_dns::dnssec::nsec3_hash(&owner_wire, iterations, &salt)
+    };
+    let encloser_hash = hash_of(".");
+    let encloser_owner = hopf_dns::wire::base32hex::encode(&encloser_hash);
+    let next_closer_hash = hash_of("missing");
+    let mut owner_hash = next_closer_hash.clone();
+    owner_hash[0] = owner_hash[0].wrapping_sub(1);
+    let mut next_hash = next_closer_hash.clone();
+    next_hash[0] = next_hash[0].wrapping_add(1);
+    let covering_owner = hopf_dns::wire::base32hex::encode(&owner_hash);
+
+    let encloser_nsec3 = DnsResourceRecord::nsec3(&encloser_owner, 3600, 1, 0, iterations, &salt, &[9u8; 20], vec![DnsType::Ns.value()]);
+    let covering_nsec3 = DnsResourceRecord::nsec3(&covering_owner, 3600, 1, 0, iterations, &salt, &next_hash, vec![DnsType::A.value()]);
+    let encloser_sig = sign_rrset(&[&encloser_nsec3], &encloser_owner, DnsType::Nsec3, root_key_tag, &root_pair);
+    let covering_sig = sign_rrset(&[&covering_nsec3], &covering_owner, DnsType::Nsec3, root_key_tag, &root_pair);
+
+    let stub = UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    thread::spawn(move || loop {
+        let mut buf = [0u8; 4096];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            return;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            continue;
+        };
+        let Some(question) = q.questions.first() else {
+            continue;
+        };
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        let name = hopf_dns::wire::normalize_name(&question.name);
+        match (name.as_str(), question.qtype) {
+            (".", Some(DnsType::Dnskey)) | ("", Some(DnsType::Dnskey)) => {
+                resp.answers = vec![root_dnskey.clone(), root_dnskey_rrsig.clone()];
+            }
+            ("missing", Some(DnsType::Ds)) | ("", Some(DnsType::Ds)) => {} // no delegation anywhere
+            _ => {}
+        }
+        let _ = stub.send_to(&resp.serialize().unwrap(), peer);
+    });
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let resolver = DnsResolver::new(rt.pick_worker().clone());
+    resolver.add_server(stub_addr);
+    resolver.open().unwrap();
+    let mut anchor = DnssecTrustAnchor::empty();
+    anchor.add_anchor(".", root_key_tag, 15, 2, &root_digest);
+    resolver.set_dnssec_validator(DnssecValidator::new(anchor));
+
+    let nxdomain_msg = DnsMessage::new(
+        1,
+        FLAG_QR,
+        vec![DnsQuestion::in_class("missing", DnsType::A)],
+        vec![],
+        vec![encloser_nsec3, encloser_sig, covering_nsec3, covering_sig],
+        vec![],
+    );
+
+    let result = Arc::new(Mutex::new(None));
+    let result2 = Arc::clone(&result);
+    resolver.validate_denial_of_existence(
+        "missing",
+        DnsType::A,
+        nxdomain_msg,
+        Box::new(move |_msg, status| {
+            *result2.lock().unwrap() = Some(status);
+        }),
+    );
+
+    for _ in 0..150 {
+        if result.lock().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        result.lock().unwrap().take(),
+        Some(DnssecStatus::Secure),
+        "NSEC3 denial-of-existence over real network round trips must validate as Secure"
+    );
+    rt.shutdown();
+}

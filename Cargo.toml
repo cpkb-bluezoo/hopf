@@ -99,7 +99,6 @@ hopf-mailbox = { version = "0.1.0", path = "crates/hopf-mailbox" }
 hopf-pop3 = { version = "0.1.0", path = "crates/hopf-pop3" }
 hopf-imap = { version = "0.1.0", path = "crates/hopf-imap" }
 hopf-mqtt = { version = "0.1.0", path = "crates/hopf-mqtt" }
-bytes = "1"
 getrandom = "0.2"
 md-5 = "0.10"
 tempfile = "3"

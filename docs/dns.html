@@ -125,11 +125,15 @@
 </tr>
 <tr>
 <td><a href="https://www.rfc-editor.org/rfc/rfc4034">RFC 4034</a> / <a href="https://www.rfc-editor.org/rfc/rfc4035">4035</a></td>
-<td>DNSSEC validation</td>
+<td>DNSSEC validation, chain-of-trust walking, AD/CD handling</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc5155">RFC 5155</a></td>
+<td>NSEC3 authenticated denial-of-existence</td>
 </tr>
 </tbody>
 </table>
-<p><strong>DNSSEC algorithms:</strong> RSASHA256(8), RSASHA512(10), ECDSAP256SHA256(13), ECDSAP384SHA384(14), Ed25519(15). Ed448(16) recognized but <strong>unverified</strong>. IANA root DS anchors included.</p>
+<p>See <a href="#dnssec">DNSSEC</a> below for algorithm support and trust anchors.</p>
 <h2 id="architecture">Architecture</h2>
 <pre><code>App
  │  DnsResolver (per Runtime / ReactorHandle)
@@ -233,8 +237,16 @@
 </thead>
 <tbody>
 <tr>
-<td><code>DnssecValidator</code> / <code>DnssecChainValidator</code></td>
-<td>Validation</td>
+<td><code>DnssecValidator</code></td>
+<td>Per-message validation (RRSIGs/DNSKEYs present in that one message, against directly configured trust anchors)</td>
+</tr>
+<tr>
+<td><code>DnssecChainWalk</code> / <code>ChainStep</code></td>
+<td>Full chain-of-trust walk from a trust anchor down to a name's own zone (RFC 4035 §5.3.1), driven over the network by <code>DnsResolver::validate_chain_of_trust</code></td>
+</tr>
+<tr>
+<td><code>verify_denial</code></td>
+<td>Authenticated denial-of-existence (NSEC / NSEC3, RFC 4035 §5.4) against a chain-verified zone key, driven over the network by <code>DnsResolver::validate_denial_of_existence</code></td>
 </tr>
 <tr>
 <td><code>DnssecStatus</code> / <code>DnssecAlgorithm</code></td>
@@ -242,15 +254,17 @@
 </tr>
 <tr>
 <td><code>DnssecTrustAnchor</code> / <code>AnchorDs</code></td>
-<td>Trust anchors</td>
+<td>Trust anchors (<code>with_iana_root()</code> ships the current IANA root DS)</td>
 </tr>
 <tr>
-<td><code>verify_rrsig</code> / <code>verify_ds</code> / …</td>
+<td><code>verify_rrsig</code> / <code>verify_ds</code> / <code>nsec3_hash</code> / …</td>
 <td>Low-level</td>
 </tr>
 </tbody>
 </table>
-<p>Validation only — <strong>no signing</strong>. Off by default on the resolver (<code>set_dnssec_enabled</code> / <code>set_dnssec_validator</code>).</p>
+<p>Validation only — <strong>no signing</strong>. Off by default on the resolver (<code>set_dnssec_enabled</code> / <code>set_dnssec_validator</code>). Algorithms: RSASHA256(8), RSASHA512(10), ECDSAP256SHA256(13), ECDSAP384SHA384(14), Ed25519(15), Ed448(16) — Ed448 verification uses the pure-Rust <code>ed448-goldilocks-plus</code> crate (<code>ring</code> has no Ed448 support), which raises the effective MSRV to 1.85+ <strong>only</strong> when the <code>dnssec</code> feature is enabled.</p>
+<p>The <code>DnsResolver</code>'s own per-query validation (run automatically whenever a validator is configured) sets the response's <strong>AD bit</strong> when a message validates as <code>Secure</code>, and honors the query's own <strong>CD bit</strong> (RFC 4035 §3.2.2/§3.2.3) — a CD=1 query gets its answer even if validation comes back <code>Bogus</code>, with AD left unset. The forwarder (<code>DnsService</code>) relays a downstream client's own CD bit upstream via <code>DnsResolver::query_with_cd</code>, so a validating downstream resolver's own re-validation still works through the forwarder. <strong>Known limitation:</strong> the AD bit is not currently preserved across a cache hit (resolver- or forwarder-side) — a cached answer is served without re-asserting AD.</p>
+<p>NSEC3 closest-encloser proofs cover direct NXDOMAIN/NODATA denial only — wildcard non-existence (RFC 5155 §8.3's optional extra step) and Opt-Out (§3/§6) are not implemented.</p>
 <h2 id="configuration">Configuration</h2>
 <h3 id="defaults">Defaults</h3>
 <table>
@@ -395,9 +409,7 @@
 </ul>
 <p>Other:</p>
 <ul>
-<li>Ed448 recognized but unverified.</li>
 <li><code>process_query_sync</code> blocks on upstream (forwarder).</li>
-<li>CNAME re-timeout on chase skipped (TODO in code).</li>
 <li>Server addresses must be pre-resolved IPs.</li>
 </ul>
 

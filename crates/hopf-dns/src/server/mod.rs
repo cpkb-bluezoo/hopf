@@ -134,7 +134,7 @@ impl DnsService {
             m.upstreams += 1;
             drop(m);
             let (tx, rx) = std::sync::mpsc::channel();
-            upstream.query(q.clone(), Box::new(move |r| {
+            upstream.query_with_cd(q.clone(), query.is_checking_disabled(), Box::new(move |r| {
                 let _ = tx.send(r);
             }));
             match rx.recv_timeout(std::time::Duration::from_secs(5)) {
