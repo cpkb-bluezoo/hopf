@@ -120,6 +120,8 @@ enum H2Role {
         secure: bool,
         /// Next odd stream ID to allocate.
         next_stream_id: u32,
+        /// When false, the session layer calls [`Self::kick_client_request`] when a request is ready.
+        auto_kickoff_first_request: bool,
     },
 }
 
@@ -440,6 +442,27 @@ impl H2Endpoint {
                 factory,
                 secure,
                 next_stream_id: 1,
+                auto_kickoff_first_request: true,
+            },
+            limits,
+        )
+    }
+
+    /// Client endpoint for the Gumdrop [`HttpRequest`](crate::HttpRequest) session API.
+    ///
+    /// Does not auto-send the first stream; the session layer calls
+    /// [`Self::kick_client_request`] when the application submits a request.
+    pub(crate) fn client_session(
+        factory: Arc<dyn ClientHandlerFactory>,
+        limits: HttpLimits,
+        secure: bool,
+    ) -> Self {
+        Self::make(
+            H2Role::Client {
+                factory,
+                secure,
+                next_stream_id: 1,
+                auto_kickoff_first_request: false,
             },
             limits,
         )
@@ -465,6 +488,7 @@ impl H2Endpoint {
                 factory,
                 secure: false,
                 next_stream_id: 3,
+                auto_kickoff_first_request: false,
             },
             limits,
         );
@@ -681,6 +705,26 @@ impl H2Endpoint {
 
     /// Allocate the next client stream, call `factory.create_handler`,
     /// invoke `handler.start`, and flush the buffered request to `self.out`.
+    pub(crate) fn kick_client_request(&mut self, endpoint: &mut dyn Endpoint) {
+        if !self.client_connection_ready() {
+            return;
+        }
+        self.start_client_request();
+        self.flush_client_streams();
+        if !self.out.is_empty() {
+            endpoint.send(&self.out);
+            self.out.clear();
+        }
+    }
+
+    pub(crate) fn client_connection_ready(&self) -> bool {
+        matches!(self.state, ConnState::Open)
+    }
+
+    pub(crate) fn take_outbound(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.out)
+    }
+
     fn start_client_request(&mut self) {
         if let Some(limit) = self.peer_max_concurrent_streams {
             if self.client_streams.len() as u32 >= limit {
@@ -879,8 +923,14 @@ impl H2Endpoint {
                 self.deliver_upgrade_stream(hdrs);
             }
 
-            // Client: kick off the first request now that the connection is open.
-            if matches!(self.role, H2Role::Client { .. }) {
+            // Client: kick off the first request when using the legacy factory API.
+            if matches!(
+                self.role,
+                H2Role::Client {
+                    auto_kickoff_first_request: true,
+                    ..
+                }
+            ) {
                 self.start_client_request();
             }
         }

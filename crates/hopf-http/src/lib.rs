@@ -35,7 +35,10 @@ pub use auth::{
     build_digest_authorization, parse_basic_authorization, BasicAuthConfig, BasicAuthFactory,
     BearerAuthFactory, DigestAuthConfig, DigestAuthFactory,
 };
-pub use client::{connect_http, connect_http2_upgrade, HttpClientTimeouts};
+pub use client::{
+    connect_http, connect_http2_upgrade, HttpClient, HttpClientError, HttpClientSessionHandle,
+    HttpClientTimeouts, HttpConnectionHandler, HttpRequest, HttpResponseHandler,
+};
 #[cfg(feature = "h3")]
 pub use client::connect_h3_by_name;
 pub use dispatch::AlpnHttpEndpoint;

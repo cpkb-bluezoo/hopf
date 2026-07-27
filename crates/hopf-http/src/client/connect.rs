@@ -1,26 +1,6 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! HTTP client connect helpers with DNS resolution and per-phase timeouts.
-//!
-//! High-level entry-points that resolve a hostname (or accept a literal IP /
-//! socket-address string) and dial an H1/H2/H3 endpoint with configurable
-//! timeouts.
-//!
-//! # Examples
-//!
-//! ```no_run
-//! use std::sync::Arc;
-//! use hopf_core::{Runtime, RuntimeConfig};
-//! use hopf_http::{ClientHandlerFactory, HttpLimits};
-//! use hopf_http::client::{connect_http, HttpClientTimeouts};
-//!
-//! # fn f(factory: Arc<dyn ClientHandlerFactory>) -> std::io::Result<()> {
-//! let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
-//! connect_http(&rt, "example.com", 80, factory, HttpLimits::default(),
-//!              false, HttpClientTimeouts::default(), None)?;
-//! # Ok(())
-//! # }
-//! ```
+//! Low-level HTTP dial helpers ([`connect_http`], timeouts).
 
 use std::io;
 use std::net::SocketAddr;
@@ -36,10 +16,6 @@ use crate::{ClientHandlerFactory, H1Endpoint, H2Endpoint, H2cUpgradeClientEndpoi
 use crate::h3::connect_h3;
 #[cfg(feature = "h3")]
 use hopf_quic::{QuicClientConfig, QuicDriverHandle};
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
 
 /// Timeouts applied at each phase of an outbound HTTP connection.
 #[derive(Clone, Debug)]
@@ -62,20 +38,7 @@ impl Default for HttpClientTimeouts {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Public functions
-// ---------------------------------------------------------------------------
-
 /// Dial an HTTP/1.1 or HTTP/2 cleartext peer by hostname or socket-address.
-///
-/// * If `host_or_addr` parses as a [`SocketAddr`] or bare IP, DNS is skipped.
-/// * Otherwise a [`DnsResolver`] resolves the name asynchronously (system
-///   resolvers are used when `resolver` is `None`).
-/// * [`HttpClientTimeouts::connect`] is wired into
-///   [`TcpConnectorConfig::connect_timeout`].
-///
-/// Returns immediately; the TCP connect and protocol handshake run
-/// asynchronously on a worker reactor.
 pub fn connect_http(
     rt: &Arc<Runtime>,
     host_or_addr: &str,
@@ -97,16 +60,7 @@ pub fn connect_http(
     dial(rt, host_or_addr, port, &timeouts, resolver, make_handler)
 }
 
-/// Dial an HTTP/2 peer via HTTP/1.1 h2c Upgrade (RFC 7540 §3.2): the request
-/// is sent as HTTP/1.1 with `Upgrade: h2c`, promoting to H2 on a `101`
-/// response — or completing as a plain HTTP/1.1 exchange if the peer
-/// doesn't support the upgrade (support is optional for servers).
-///
-/// Prefer [`connect_http`] with `http2 = true` when the peer is already
-/// known to support prior-knowledge H2 — it skips this extra round-trip.
-///
-/// Returns immediately; the TCP connect and protocol handshake run
-/// asynchronously on a worker reactor.
+/// Dial an HTTP/2 peer via HTTP/1.1 h2c Upgrade (RFC 7540 §3.2).
 pub fn connect_http2_upgrade(
     rt: &Arc<Runtime>,
     host_or_addr: &str,
@@ -123,9 +77,8 @@ pub fn connect_http2_upgrade(
     dial(rt, host_or_addr, port, &timeouts, resolver, make_handler)
 }
 
-/// Shared DNS-resolve-then-connect plumbing for [`connect_http`] and
-/// [`connect_http2_upgrade`].
-fn dial(
+/// Shared DNS-resolve-then-connect plumbing.
+pub(crate) fn dial(
     rt: &Arc<Runtime>,
     host_or_addr: &str,
     port: u16,
@@ -135,7 +88,6 @@ fn dial(
 ) -> io::Result<()> {
     let connect_timeout = Some(timeouts.connect);
 
-    // Literal IP / full SocketAddr → skip DNS.
     if let Some(addr) = resolve_literal(host_or_addr, port) {
         let mh = Arc::clone(&make_handler);
         return rt.connect(
@@ -143,7 +95,6 @@ fn dial(
         );
     }
 
-    // Hostname → async DNS lookup, then connect from callback.
     let res = match resolver {
         Some(r) => r,
         None => Arc::new(DnsResolver::for_runtime(rt)?),
@@ -174,13 +125,6 @@ fn dial(
 }
 
 /// Dial an HTTP/3 peer by hostname or socket-address.
-///
-/// Literal IPs bypass DNS. Hostnames are resolved via one blocking system-DNS
-/// call (a future tranche will use the async [`DnsResolver`] once
-/// `connect_quic_hooks` supports deferred dial).
-///
-/// `server_name` is the TLS SNI / certificate name; defaults to `host_or_addr`
-/// when `None`.
 #[cfg(feature = "h3")]
 pub fn connect_h3_by_name(
     _rt: &Arc<Runtime>,
@@ -200,20 +144,13 @@ pub fn connect_h3_by_name(
     connect_h3(addr, client_config, sni, factory, limits)
 }
 
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
-
 fn resolve_literal(host: &str, port: u16) -> Option<SocketAddr> {
-    // Full "ip:port" or "[::1]:port"
     if let Ok(addr) = host.parse::<SocketAddr>() {
         return Some(addr);
     }
-    // Bare IP address
     parse_literal_ip(host).map(|ip| SocketAddr::new(ip, port))
 }
 
-/// Blocking one-shot system-DNS resolve used only for H3-by-name.
 #[cfg(feature = "h3")]
 fn system_resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
     use std::net::ToSocketAddrs;
