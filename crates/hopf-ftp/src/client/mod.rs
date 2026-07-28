@@ -34,7 +34,6 @@ pub mod reply;
 
 pub use error::{FtpError, FtpResult};
 pub use pipeline::{FtpGet, FtpPut};
-pub use reply::FtpReply;
 
 use std::collections::VecDeque;
 use std::io;
