@@ -19,107 +19,8 @@ use hopf_core::{Endpoint, ProtocolHandler, Runtime, TcpConnectorConfig, TimerHan
 
 use super::data::{FtpDataRetrHandler, FtpDataStorHandler, TransferState};
 use super::error::FtpError;
-use super::reply::{parse_epsv_port, parse_pasv_addr, FtpReply};
+use super::reply::{FtpEvent, FtpReplyLexer, FtpReplyShape};
 use super::{FtpClientTimeouts, FtpPipeline, OpQueue, QueuedOp};
-
-// ---------------------------------------------------------------------------
-// Reply lexer
-// ---------------------------------------------------------------------------
-
-/// Cap on unconsumed buffered reply bytes, so a server that never terminates
-/// a reply block can't grow [`FtpReplyLexer`]'s buffer without bound.
-/// Counterpart to the server-side [`crate::server::MAX_COMMAND_LINE`] (which
-/// bounds a client's command line instead).
-pub(crate) const MAX_REPLY_BUFFER: usize = 256 * 1024;
-
-/// Stateful lexer that turns a byte stream into complete [`FtpReply`] values.
-pub(crate) struct FtpReplyLexer {
-    buf: Vec<u8>,
-}
-
-impl FtpReplyLexer {
-    pub fn new() -> Self {
-        Self { buf: Vec::new() }
-    }
-
-    /// Append bytes and return all complete replies parsed so far.
-    ///
-    /// Errors (and leaves the lexer's buffer cleared) if unconsumed buffered
-    /// bytes exceed [`MAX_REPLY_BUFFER`] — a run-away server never
-    /// terminating a reply line/block.
-    pub fn push(&mut self, data: &[u8]) -> Result<Vec<FtpReply>, FtpError> {
-        self.buf.extend_from_slice(data);
-        if self.buf.len() > MAX_REPLY_BUFFER {
-            self.buf.clear();
-            return Err(FtpError::Parse("FTP reply too long".into()));
-        }
-        let mut out = Vec::new();
-        while let Some(r) = self.try_parse_one() {
-            out.push(r);
-        }
-        Ok(out)
-    }
-
-    /// Try to extract one complete reply from the front of the buffer.
-    ///
-    /// A reply is complete when we encounter a terminating line: one that
-    /// starts with `NNN ` (space, not dash) where `NNN` matches the first
-    /// code seen in this reply block.
-    fn try_parse_one(&mut self) -> Option<FtpReply> {
-        let mut pos = 0;
-        let mut first_code: Option<u16> = None;
-        let mut lines: Vec<String> = Vec::new();
-
-        loop {
-            // Find the next \r\n from `pos`.
-            let nl = self.buf[pos..]
-                .windows(2)
-                .position(|w| w == b"\r\n")?;
-            let line_end = pos + nl;
-            let line = &self.buf[pos..line_end];
-
-            // Parse optional code + separator.
-            let (maybe_code, sep) = if line.len() >= 4 {
-                let c = std::str::from_utf8(&line[..3])
-                    .ok()
-                    .and_then(|s| s.parse::<u16>().ok());
-                (c, line[3])
-            } else if line.len() == 3 {
-                let c = std::str::from_utf8(line)
-                    .ok()
-                    .and_then(|s| s.parse::<u16>().ok());
-                (c, b' ')
-            } else {
-                (None, 0u8)
-            };
-
-            let text: String = if maybe_code.is_some() && (sep == b' ' || sep == b'-') {
-                String::from_utf8_lossy(line.get(4..).unwrap_or(b"")).into_owned()
-            } else {
-                String::from_utf8_lossy(line).into_owned()
-            };
-
-            if let Some(c) = maybe_code {
-                if first_code.is_none() {
-                    first_code = Some(c);
-                }
-                // Terminating line: space separator + code matches first code.
-                if sep == b' ' && first_code == Some(c) {
-                    lines.push(text);
-                    let consumed = line_end + 2;
-                    self.buf.drain(..consumed);
-                    return Some(FtpReply { code: c, lines });
-                }
-            }
-
-            lines.push(text);
-            pos = line_end + 2;
-            if pos >= self.buf.len() {
-                return None;
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Control-connection state machine
@@ -175,13 +76,15 @@ impl FtpControlHandler {
         rt: Arc<Runtime>,
         pipeline: Box<dyn FtpPipeline>,
     ) -> Self {
+        let mut lexer = FtpReplyLexer::new();
+        lexer.expect(FtpReplyShape::Welcome);
         Self {
             credentials,
             prefer_epsv,
             timeouts,
             rt,
             pipeline: Some(pipeline),
-            lexer: FtpReplyLexer::new(),
+            lexer,
             state: ControlState::AwaitWelcome,
             op_queue: VecDeque::new(),
             stage_timer: None,
@@ -236,45 +139,49 @@ impl FtpControlHandler {
     // -----------------------------------------------------------------------
 
     /// Process all complete replies buffered so far.
-    fn process_all_replies(&mut self, endpoint: &mut dyn Endpoint, data: &[u8]) {
-        let replies = match self.lexer.push(data) {
-            Ok(replies) => replies,
+    fn process_all_replies(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        let events = match self.lexer.feed(data) {
+            Ok(events) => events,
             Err(err) => {
                 self.fail(endpoint, err);
                 return;
             }
         };
-        for reply in replies {
+        for event in events {
             self.cancel_timer();
-            self.process_reply(endpoint, reply);
+            self.process_event(endpoint, event);
+            if matches!(self.state, ControlState::Done) {
+                break;
+            }
         }
         self.arm_for_state(endpoint);
     }
 
-    fn process_reply(&mut self, endpoint: &mut dyn Endpoint, reply: FtpReply) {
+    fn process_event(&mut self, endpoint: &mut dyn Endpoint, event: FtpEvent) {
         // Extract the current state (replacing with Done as a sentinel).
         let state = std::mem::replace(&mut self.state, ControlState::Done);
 
         match state {
-            ControlState::AwaitWelcome => {
-                if reply.code == 220 {
-                    match self.credentials.as_ref().map(|(u, _)| u.clone()) {
-                        Some(user) => {
-                            let cmd = format!("USER {user}\r\n");
-                            endpoint.send(cmd.as_bytes());
-                            self.state = ControlState::AwaitUserReply;
-                        }
-                        None => {
-                            self.start_pipeline(endpoint);
-                        }
+            ControlState::AwaitWelcome => match event {
+                FtpEvent::Welcome => match self.credentials.as_ref().map(|(u, _)| u.clone()) {
+                    Some(user) => {
+                        let cmd = format!("USER {user}\r\n");
+                        endpoint.send(cmd.as_bytes());
+                        self.lexer.expect(FtpReplyShape::User);
+                        self.state = ControlState::AwaitUserReply;
                     }
-                } else {
-                    self.fail(endpoint, FtpError::unexpected(Some(220), reply));
+                    None => {
+                        self.start_pipeline(endpoint);
+                    }
+                },
+                FtpEvent::Error { code, message } => {
+                    self.fail(endpoint, FtpError::unexpected(Some(220), code, message));
                 }
-            }
+                _ => {}
+            },
 
-            ControlState::AwaitUserReply => match reply.code {
-                331 => {
+            ControlState::AwaitUserReply => match event {
+                FtpEvent::UserNeedsPassword => {
                     let pass = self
                         .credentials
                         .as_ref()
@@ -282,78 +189,49 @@ impl FtpControlHandler {
                         .unwrap_or_default();
                     let cmd = format!("PASS {pass}\r\n");
                     endpoint.send(cmd.as_bytes());
+                    self.lexer.expect(FtpReplyShape::Pass);
                     self.state = ControlState::AwaitPassReply;
                 }
-                230 => {
+                FtpEvent::UserLoggedIn => {
                     self.start_pipeline(endpoint);
                 }
-                _ => {
-                    self.fail(endpoint, FtpError::unexpected(Some(331), reply));
+                FtpEvent::Error { code, message } => {
+                    self.fail(endpoint, FtpError::unexpected(Some(331), code, message));
                 }
+                _ => {}
             },
 
-            ControlState::AwaitPassReply => {
-                if reply.code == 230 {
+            ControlState::AwaitPassReply => match event {
+                FtpEvent::PassOk => {
                     self.start_pipeline(endpoint);
-                } else {
-                    self.fail(endpoint, FtpError::unexpected(Some(230), reply));
                 }
-            }
+                FtpEvent::Error { code, message } => {
+                    self.fail(endpoint, FtpError::unexpected(Some(230), code, message));
+                }
+                _ => {}
+            },
 
             ControlState::Session => {
                 // Spurious reply while idle — ignore.
                 self.state = ControlState::Session;
             }
 
-            ControlState::AwaitCmdReply { expect } => {
-                // Accept any 2xx if expect is a 2xx wildcard (0), otherwise exact match.
-                let ok = if expect == 0 {
-                    reply.code / 100 == 2
-                } else {
-                    reply.code == expect
-                };
-                if ok {
+            ControlState::AwaitCmdReply { expect } => match event {
+                FtpEvent::CmdOk => {
                     self.enter_session(endpoint);
-                } else {
-                    self.fail(endpoint, FtpError::unexpected(Some(expect), reply));
                 }
-            }
+                FtpEvent::Error { code, message } => {
+                    self.fail(endpoint, FtpError::unexpected(Some(expect), code, message));
+                }
+                _ => {}
+            },
 
             ControlState::AwaitPasvReply { verb, path, data, transfer } => {
-                if reply.code == 227 {
-                    // Standard PASV
-                    let text = reply.text();
-                    let addr = match parse_pasv_addr(&text) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.fail(endpoint, e);
-                            return;
-                        }
-                    };
-                    self.open_data_conn(endpoint, addr, &verb, &path, data, transfer);
-                } else if reply.code == 229 {
-                    // Extended PASV
-                    let text = reply.text();
-                    let port = match parse_epsv_port(&text) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            self.fail(endpoint, e);
-                            return;
-                        }
-                    };
-                    let ctrl_ip = endpoint
-                        .remote_addr()
-                        .map(|a| a.ip())
-                        .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
-                    let addr = SocketAddr::new(ctrl_ip, port);
-                    self.open_data_conn(endpoint, addr, &verb, &path, data, transfer);
-                } else {
-                    self.fail(endpoint, FtpError::unexpected(Some(227), reply));
-                }
+                self.dispatch_pasv_event(endpoint, event, verb, path, data, transfer);
             }
 
-            ControlState::AwaitXferStart { transfer } => {
-                if reply.code == 125 || reply.code == 150 {
+            ControlState::AwaitXferStart { transfer } => match event {
+                FtpEvent::XferStartOk => {
                     // Server is ready — release any STOR upload waiting on
                     // the data connection.
                     {
@@ -369,27 +247,33 @@ impl FtpControlHandler {
                             });
                         }
                     }
+                    self.lexer.expect(FtpReplyShape::XferEnd);
                     self.state = ControlState::AwaitXferEnd { transfer };
-                } else {
-                    self.fail(endpoint, FtpError::unexpected(Some(150), reply));
                 }
-            }
+                FtpEvent::Error { code, message } => {
+                    self.fail(endpoint, FtpError::unexpected(Some(150), code, message));
+                }
+                _ => {}
+            },
 
-            ControlState::AwaitXferEnd { transfer } => {
-                if reply.code == 226 || reply.code == 250 {
+            ControlState::AwaitXferEnd { transfer } => match event {
+                FtpEvent::XferEndOk => {
                     {
                         let mut g = transfer.lock().unwrap();
                         g.ctrl_done = true;
                         g.maybe_complete();
                     }
                     self.enter_session(endpoint);
-                } else {
-                    self.fail(endpoint, FtpError::unexpected(Some(226), reply));
                 }
-            }
+                FtpEvent::Error { code, message } => {
+                    self.fail(endpoint, FtpError::unexpected(Some(226), code, message));
+                }
+                _ => {}
+            },
 
             ControlState::AwaitQuitReply => {
-                // 221 or any reply — session is done.
+                // Any reply (success or failure) — session is done.
+                let _ = event;
                 if let Some(mut pl) = self.pipeline.take() {
                     pl.done();
                 }
@@ -399,6 +283,41 @@ impl FtpControlHandler {
 
             ControlState::Done => {
                 self.state = ControlState::Done;
+            }
+        }
+    }
+
+    /// Handle the reply to `PASV`/`EPSV`, split out of [`Self::process_event`]
+    /// for readability — the match there can't destructure `verb`/`path`/…
+    /// and match on `event` in one arm cleanly.
+    fn dispatch_pasv_event(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        event: FtpEvent,
+        verb: String,
+        path: String,
+        data: Option<Arc<Vec<u8>>>,
+        transfer: Arc<Mutex<TransferState>>,
+    ) {
+        match event {
+            FtpEvent::PasvAddr(addr) => {
+                self.open_data_conn(endpoint, addr, &verb, &path, data, transfer);
+            }
+            FtpEvent::EpsvPort(port) => {
+                let ctrl_ip = endpoint
+                    .remote_addr()
+                    .map(|a| a.ip())
+                    .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+                let addr = SocketAddr::new(ctrl_ip, port);
+                self.open_data_conn(endpoint, addr, &verb, &path, data, transfer);
+            }
+            FtpEvent::Error { code, message } => {
+                self.fail(endpoint, FtpError::unexpected(Some(227), code, message));
+            }
+            _ => {
+                // Restore state — an unrelated event arrived unexpectedly;
+                // stay put and keep waiting for the real reply.
+                self.state = ControlState::AwaitPasvReply { verb, path, data, transfer };
             }
         }
     }
@@ -440,6 +359,7 @@ impl FtpControlHandler {
             format!("{verb}\r\n")
         };
         endpoint.send(cmd.as_bytes());
+        self.lexer.expect(FtpReplyShape::XferStart);
         self.state = ControlState::AwaitXferStart { transfer };
     }
 
@@ -474,6 +394,7 @@ impl FtpControlHandler {
                     None => format!("{verb}\r\n"),
                 };
                 endpoint.send(cmd.as_bytes());
+                self.lexer.expect(FtpReplyShape::Cmd { expect });
                 self.state = ControlState::AwaitCmdReply { expect };
             }
 
@@ -512,17 +433,19 @@ impl FtpControlHandler {
 
             Some(QueuedOp::Quit) => {
                 endpoint.send(b"QUIT\r\n");
+                self.lexer.expect(FtpReplyShape::Quit);
                 self.state = ControlState::AwaitQuitReply;
             }
         }
     }
 
-    fn send_pasv_or_epsv(&self, endpoint: &mut dyn Endpoint) {
+    fn send_pasv_or_epsv(&mut self, endpoint: &mut dyn Endpoint) {
         if self.prefer_epsv {
             endpoint.send(b"EPSV\r\n");
         } else {
             endpoint.send(b"PASV\r\n");
         }
+        self.lexer.expect(FtpReplyShape::PassiveMode);
     }
 
     /// Fail the pipeline with `err`, close the control connection.
@@ -548,9 +471,7 @@ impl ProtocolHandler for FtpControlHandler {
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        let bytes = *data;
-        *data = &[];
-        self.process_all_replies(endpoint, bytes);
+        self.process_all_replies(endpoint, data);
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -570,67 +491,5 @@ impl ProtocolHandler for FtpControlHandler {
             endpoint,
             FtpError::Io(io::Error::new(err.kind(), err.to_string())),
         );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn push_str(lexer: &mut FtpReplyLexer, s: &str) -> Vec<FtpReply> {
-        lexer.push(s.as_bytes()).unwrap()
-    }
-
-    #[test]
-    fn oversized_reply_errors_and_clears_buffer() {
-        let mut lex = FtpReplyLexer::new();
-        // No CRLF, never terminates — must error once it crosses the cap
-        // rather than growing forever or silently discarding.
-        let junk = vec![b'x'; MAX_REPLY_BUFFER + 1];
-        let err = lex.push(&junk).unwrap_err();
-        assert!(matches!(err, FtpError::Parse(_)));
-        assert!(lex.buf.is_empty());
-    }
-
-    #[test]
-    fn single_line_reply() {
-        let mut lex = FtpReplyLexer::new();
-        let replies = push_str(&mut lex, "220 Welcome\r\n");
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].code, 220);
-        assert_eq!(replies[0].lines, vec!["Welcome"]);
-    }
-
-    #[test]
-    fn multi_line_reply() {
-        let mut lex = FtpReplyLexer::new();
-        let replies =
-            push_str(&mut lex, "220-First line\r\nSecond line\r\n220 Last\r\n");
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].code, 220);
-        assert!(replies[0].lines.contains(&"First line".to_string()));
-        assert!(replies[0].lines.contains(&"Last".to_string()));
-    }
-
-    #[test]
-    fn incremental_push() {
-        let mut lex = FtpReplyLexer::new();
-        assert!(push_str(&mut lex, "220 Welco").is_empty());
-        let replies = push_str(&mut lex, "me\r\n");
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].code, 220);
-    }
-
-    #[test]
-    fn two_replies_in_one_push() {
-        let mut lex = FtpReplyLexer::new();
-        let replies = push_str(&mut lex, "220 Hello\r\n331 Password\r\n");
-        assert_eq!(replies.len(), 2);
-        assert_eq!(replies[0].code, 220);
-        assert_eq!(replies[1].code, 331);
     }
 }

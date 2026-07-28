@@ -9,6 +9,12 @@ interfaces into one `XClientDriver` trait per protocol (see each crate's
 gap. Everything below is a genuine capability gap: a Gumdrop interface or
 behaviour with no Hopf equivalent, found by a file-by-file comparison.
 
+The FTP client (`crates/hopf-ftp/src/client/`) is the exception: Gumdrop has
+no FTP client at all (`org.bluezoo.gumdrop.ftp` is server-only), so its
+entries below are gaps against RFC 959 (plus RFC 2428/3659/4217) directly,
+found by comparing the `FtpPipeline`/`FtpSessionWrite` API surface against
+what a general-purpose FTP client needs — not a Gumdrop-shape comparison.
+
 Status values: **Open** (not started), **In Progress**, **Done**.
 
 Format mirrors `.github-issue-smtp-auth-pipeline.md` (kept lighter per-item
@@ -145,3 +151,48 @@ since these are narrower than that one).
 - **Gumdrop reference:** `imap/client/handler/ServerGreeting.java`/`ServerLoginReplyHandler.java` pass `preAuthCapabilities`/post-auth `List<String> capabilities` directly into `handleGreeting`/`handleAuthenticated`
 - **Gap:** `on_greeting`/`on_authenticated` take no capabilities parameter. An untagged `CAPABILITY` line arriving alongside the greeting or LOGIN/AUTHENTICATE response is buffered into `capa_buf` but never promoted to `self.caps`, so `capabilities()` can return stale pre-auth data until a separate CAPABILITY command is explicitly issued.
 - **Suggested fix:** Promote `capa_buf` into `self.caps` at the same point the greeting/auth-complete event fires, and/or pass the parsed capability list into `on_greeting`/`on_authenticated` directly.
+
+---
+
+## FTP client (`crates/hopf-ftp/src/client/`)
+
+No Gumdrop reference exists (see note at top of file) — these are gaps
+against RFC 959 (plus RFC 2428 EPSV, RFC 3659 MLSD/MLST, RFC 4217 FTPS),
+found by comparing `FtpPipeline`/`FtpSessionWrite` (`client/mod.rs`) against
+what a general-purpose FTP client needs.
+
+### FTP-1: Command reply text is never surfaced on success
+
+- **Status:** Open
+- **Gap:** `FtpReplyShape::Cmd`'s success path is always `Field::SkipToEol` (`client/reply.rs`) — text is discarded whenever the code matches `expect`. `FtpSessionWrite::command()` (`client/mod.rs`) has no callback at all, so there's no path back to the caller even if the text were kept. This silently breaks any command whose *value* is its success reply text: `PWD` (257, quoted path — `parse_pwd_path` exists in `client/reply.rs` but is provably unreachable from `command()`), `SIZE`, `MDTM`, `FEAT`, `SYST`.
+- **Suggested fix:** Add a `command_reply(verb, arg, expect, callback: FnOnce(Result<String, FtpError>))` (or thread a callback through the existing `command()`) so success text reaches the caller the same way `retr`/`stor`/`list` results do.
+
+### FTP-2: No APPE / NLST / STOU — any op needing a data connection is hardcoded
+
+- **Status:** Open
+- **Gap:** `retr`/`stor`/`list` (`client/mod.rs`) are the only data-connection operations; each is a bespoke `QueuedOp` variant wired through `ControlState::AwaitPasvReply`/`AwaitXferStart`/`AwaitXferEnd` in `client/handler.rs`. `APPE` (append), `NLST` (name-only listing), and `STOU` (store-unique, whose response text carries the server-assigned filename — same gap as FTP-1) all need the same PASV→verb→transfer dance but can't be expressed via the generic `command()` escape hatch, since that never opens a data connection.
+- **Suggested fix:** Generalize `QueuedOp::{Retr,Stor,List}`/`open_data_conn` to take the verb as a parameter (already almost true — `open_data_conn` takes `verb: &str`) and expose `appe`/`nlst`/`stou` on `FtpSessionWrite` the same shape as `retr`/`stor`/`list`.
+
+### FTP-3: No REST (restart) support
+
+- **Status:** Open
+- **Gap:** RFC 959 §4.1.3 `REST marker` lets a transfer resume from a byte offset (send `REST n` immediately before `RETR`/`STOR`/`APPE`). Neither `FtpSessionWrite` nor `QueuedOp` has any way to set this.
+- **Suggested fix:** Add an optional `offset: u64` parameter to `retr`/`stor` (or a separate `retr_from`/`stor_from`), sending `REST offset\r\n` (expect `350`) before the transfer verb.
+
+### FTP-4: No ABOR support
+
+- **Status:** Open
+- **Gap:** RFC 959 §4.1.1 `ABOR` cancels an in-flight transfer. There's no `FtpSessionWrite::abort()` and no `ControlState` path for sending `ABOR` while `AwaitXferStart`/`AwaitXferEnd` is active.
+- **Suggested fix:** Add `abort()` to `FtpSessionWrite`, sending `ABOR` and handling the `226`/`426` sequence RFC 959 describes.
+
+### FTP-5: No FTPS (AUTH TLS) support at all
+
+- **Status:** Open
+- **Gap:** The client is plaintext-only — no `AUTH TLS`/`PBSZ 0`/`PROT P` sequence (RFC 4217), no `tls_connector` field on `FtpClient` (contrast `hopf-smtp`'s `SmtpClientEndpoint.tls_connector` / `hopf-pop3`'s STLS support). Every credential (`USER`/`PASS`) and every byte of transferred data goes over the wire unencrypted.
+- **Suggested fix:** Mirror SMTP's STARTTLS shape: an explicit `FtpClient::implicit_tls(connector)` (port 990) and/or an `AUTH TLS` step before `USER`, plus `PROT P` before opening data connections so RETR/STOR/LIST are also encrypted.
+
+### FTP-6: `command()` is fire-and-forget — no per-command outcome
+
+- **Status:** Open
+- **Gap:** `FtpSessionWrite::command(verb, arg, expect)` has no callback; a mismatch anywhere fails the *whole pipeline* via `FtpPipeline::failed()` (`client/handler.rs`'s `fail()` closes the connection unconditionally). A pipeline that wants to treat one generic command's failure as non-fatal (e.g. `MKD` failing because the directory already exists) has no way to express that — every `AwaitCmdReply` mismatch is terminal.
+- **Suggested fix:** Same shape as FTP-1's callback — once `command()` carries a per-call callback, a pipeline can decide per-command whether a rejection is fatal instead of the handler deciding unconditionally.

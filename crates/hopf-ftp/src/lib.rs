@@ -17,7 +17,7 @@ mod client;
 mod server;
 
 pub use client::{
-    FtpClient, FtpClientTimeouts, FtpError, FtpGet, FtpPipeline, FtpPut, FtpReply, FtpResult,
+    FtpClient, FtpClientTimeouts, FtpError, FtpGet, FtpPipeline, FtpPut, FtpResult,
     FtpSessionWrite, RetrCallback, StorCallback,
 };
 pub use client::reply::{parse_pasv_addr, parse_epsv_port, parse_pwd_path};
