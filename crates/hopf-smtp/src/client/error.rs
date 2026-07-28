@@ -5,8 +5,6 @@
 use std::fmt;
 use std::io;
 
-use super::reply::SmtpReply;
-
 /// Result alias for the SMTP client.
 pub type SmtpResult<T> = Result<T, SmtpError>;
 
@@ -15,34 +13,16 @@ pub type SmtpResult<T> = Result<T, SmtpError>;
 pub enum SmtpError {
     /// Underlying I/O.
     Io(io::Error),
-    /// Unexpected reply code.
-    Protocol {
-        /// Expected code if known.
-        expected: Option<u16>,
-        /// Reply received.
-        reply: SmtpReply,
-    },
     /// Malformed reply.
     Parse(String),
     /// Missing builder configuration.
     Config(String),
 }
 
-impl SmtpError {
-    #[allow(dead_code)]
-    pub(crate) fn unexpected(expected: Option<u16>, reply: SmtpReply) -> Self {
-        Self::Protocol { expected, reply }
-    }
-}
-
 impl fmt::Display for SmtpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "smtp i/o: {e}"),
-            Self::Protocol { expected, reply } => match expected {
-                Some(c) => write!(f, "smtp expected {c}, got {} {}", reply.code, reply.text()),
-                None => write!(f, "smtp protocol: {} {}", reply.code, reply.text()),
-            },
             Self::Parse(s) => write!(f, "smtp parse: {s}"),
             Self::Config(s) => write!(f, "smtp config: {s}"),
         }

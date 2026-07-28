@@ -58,7 +58,7 @@ pub use pending::{
     UntaggedClass, DEFAULT_MAX_PIPELINE,
 };
 pub use pipeline::{pipeline_status_and_list, ImapFetch, ImapIdle};
-pub use reply::{trailing_literal_size, ImapReplyLexer, ImapStatus, ImapWireEvent};
+pub use reply::{trailing_literal_size, ImapReplyLexer, ImapStatus, ImapWireEvent, MAX_REPLY_LINE};
 pub use state::{
     ImapCapabilities, ImapClientAppend, ImapClientAuthExchange, ImapClientAuthenticated,
     ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls, ImapClientSelected,

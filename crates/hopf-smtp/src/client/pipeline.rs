@@ -161,13 +161,7 @@ impl SmtpSendDriver {
 }
 
 impl SmtpClientDriver for SmtpSendDriver {
-    fn on_greeting(
-        &mut self,
-        hello: &mut dyn SmtpClientHello,
-        _ep: &mut dyn Endpoint,
-        _message: &str,
-        esmtp: bool,
-    ) {
+    fn on_greeting(&mut self, hello: &mut dyn SmtpClientHello, _ep: &mut dyn Endpoint, esmtp: bool) {
         let hostname = self.state.lock().unwrap().hostname.clone();
         if esmtp {
             hello.ehlo(&hostname);
@@ -239,6 +233,11 @@ impl SmtpClientDriver for SmtpSendDriver {
         session.mail_from(sender.as_deref());
     }
 
+    fn on_helo_error(&mut self, ep: &mut dyn Endpoint, _message: &str) {
+        self.complete(false);
+        ep.close();
+    }
+
     fn on_tls_established(
         &mut self,
         post_tls: &mut dyn SmtpClientPostTls,
@@ -258,6 +257,11 @@ impl SmtpClientDriver for SmtpSendDriver {
         session.quit();
     }
 
+    fn on_tls_error(&mut self, ep: &mut dyn Endpoint, _message: &str) {
+        self.complete(false);
+        ep.close();
+    }
+
     fn on_auth_ok(&mut self, session: &mut dyn SmtpClientSession, _ep: &mut dyn Endpoint) {
         let sender = self.state.lock().unwrap().sender.clone();
         session.mail_from(sender.as_deref());
@@ -273,7 +277,12 @@ impl SmtpClientDriver for SmtpSendDriver {
         exchange.abort();
     }
 
-    fn on_auth_failed(&mut self, session: &mut dyn SmtpClientSession, _ep: &mut dyn Endpoint) {
+    fn on_auth_failed(
+        &mut self,
+        session: &mut dyn SmtpClientSession,
+        _ep: &mut dyn Endpoint,
+        _code: u16,
+    ) {
         self.complete(false);
         session.quit();
     }

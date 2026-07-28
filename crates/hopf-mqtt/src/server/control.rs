@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use hopf_core::{Endpoint, ProtocolHandler, TimerHandle};
 
-use crate::broker::{validate_topic_name, BrokerState, SubscriberId, UNLIMITED_RECEIVE_MAXIMUM};
+use crate::server::broker::{validate_topic_name, BrokerState, SubscriberId, UNLIMITED_RECEIVE_MAXIMUM};
 use crate::codec::packet::{reason, ConnectPacket, PublishHeader, QoS, SubscribeFilter, Will};
 use crate::codec::parser::{MqttFrameHandler, MqttFrameParser};
 use crate::codec::properties::property;

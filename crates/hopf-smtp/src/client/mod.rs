@@ -39,7 +39,7 @@ pub use error::{SmtpError, SmtpResult};
 pub use facade::{SmtpClient, SmtpClientTimeouts};
 pub use handlers::{SmtpClientDriver, SmtpClientHandlerFactory};
 pub use pipeline::SmtpSend;
-pub use reply::SmtpReply;
+pub use reply::{SmtpEvent, SmtpReplyLexer, SmtpReplyShape, MAX_REPLY_LINE};
 pub use state::{
     SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope, SmtpClientHello,
     SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
@@ -90,42 +90,5 @@ mod tests {
     fn stuff_adds_trailing_crlf() {
         let out = dot_stuff(b"hello");
         assert!(out.ends_with(b"\r\n"), "should end with CRLF: {out:?}");
-    }
-
-    #[test]
-    fn reply_lexer_single() {
-        let mut lex = reply::SmtpReplyLexer::new();
-        let mut data: &[u8] = b"250 OK\r\n";
-        let replies = lex.feed(&mut data).unwrap();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].code, 250);
-        assert_eq!(replies[0].text(), "OK");
-        assert!(data.is_empty());
-    }
-
-    #[test]
-    fn reply_lexer_multiline() {
-        let mut lex = reply::SmtpReplyLexer::new();
-        let mut data: &[u8] = b"250-smtp.example.com Hello\r\n250-STARTTLS\r\n250 OK\r\n";
-        let replies = lex.feed(&mut data).unwrap();
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].code, 250);
-        assert_eq!(replies[0].lines.len(), 3);
-        assert!(data.is_empty());
-    }
-
-    #[test]
-    fn reply_lexer_split_across_feeds() {
-        let mut lex = reply::SmtpReplyLexer::new();
-        let part1 = b"220 srv.example.com ESMTP\r";
-        let part2 = b"\n";
-        let mut data: &[u8] = part1;
-        let r1 = lex.feed(&mut data).unwrap();
-        assert!(r1.is_empty(), "no complete reply yet");
-        // Remaining: the partial \r should still be in the lexer's buffer
-        let mut data: &[u8] = part2;
-        let r2 = lex.feed(&mut data).unwrap();
-        assert_eq!(r2.len(), 1);
-        assert_eq!(r2[0].code, 220);
     }
 }

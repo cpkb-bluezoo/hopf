@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use hopf_core::{Runtime, RuntimeConfig};
 
-use crate::broker::BrokerState;
+use crate::server::broker::BrokerState;
 use crate::codec::packet::{ConnectPacket, ProtocolVersion};
 use crate::codec::{encode, Properties};
 use crate::server::{MqttConfig, MqttService};
@@ -367,7 +367,7 @@ fn real_client_publishes_and_subscribes_against_real_server() {
 }
 
 /// Proves the point of threading `ConnHandle` through `hopf-websocket`
-/// (see [`crate::ws`]): a subscriber connected over WS and a publisher
+/// (see [`crate::server::ws`]): a subscriber connected over WS and a publisher
 /// connected over plain TCP, sharing one [`BrokerState`], can reach each
 /// other exactly like two TCP connections do.
 #[cfg(feature = "websocket")]
@@ -378,7 +378,7 @@ fn ws_subscriber_and_tcp_publisher_share_broker_state() {
     use hopf_websocket::{write_frame, Opcode, WebSocketConfig, WebSocketFactory};
 
     use crate::server::DefaultMqttHandlerFactory;
-    use crate::ws::MqttWsFactory;
+    use crate::server::ws::MqttWsFactory;
 
     let rt = Runtime::start(RuntimeConfig {
         worker_threads: 2,

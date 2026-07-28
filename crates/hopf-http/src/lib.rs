@@ -14,13 +14,14 @@ pub mod auth;
 pub mod client;
 pub mod h1;
 pub mod h2;
+pub mod server;
 #[cfg(feature = "h3")]
 pub mod h3;
 pub mod stream;
 
 mod dispatch;
 
-#[cfg(feature = "integration")]
+#[cfg(all(test, feature = "integration"))]
 mod integration;
 
 mod error;
@@ -41,6 +42,7 @@ pub use client::{
 };
 #[cfg(feature = "h3")]
 pub use client::connect_h3_by_name;
+pub use server::HttpServer;
 pub use dispatch::AlpnHttpEndpoint;
 pub use error::{HttpError, HttpResult};
 #[allow(deprecated)]

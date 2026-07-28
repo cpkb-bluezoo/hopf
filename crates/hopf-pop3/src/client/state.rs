@@ -8,7 +8,7 @@
 //! callback returns.
 
 /// Capabilities advertised by the server in its CAPA response (RFC 2449).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Pop3Capabilities {
     /// STLS upgrade (RFC 2595).
     pub stls: bool,

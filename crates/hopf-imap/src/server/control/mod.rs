@@ -15,14 +15,14 @@ use hopf_auth::plain::parse_credentials;
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
 use hopf_mailbox::{Mailbox, MailboxStore};
 
-use crate::capability::build_capabilities;
+use crate::server::capability::build_capabilities;
 use crate::enable::EnabledExtensions;
-use crate::fetch_format::parse_fetch_args;
-use crate::handler::{
+use crate::server::fetch_format::parse_fetch_args;
+use crate::server::handler::{
     AuthenticatedHandler, ClientConnected, NotAuthenticatedHandler, SelectedHandler,
 };
-use crate::idle::{is_idle_done, IdleState};
-use crate::search_parse::parse_search;
+use crate::server::idle::{is_idle_done, IdleState};
+use crate::server::search_parse::parse_search;
 use crate::server::codec::{
     parse_astring, parse_flag_list, parse_sequence_set, parse_store_item, ImapCommand,
     ImapServerLexer, LexEvent, MAX_COMMAND_LINE,
@@ -872,7 +872,7 @@ impl ImapControlHandler {
             );
             return;
         }
-        let parsed = match crate::list_ext::parse_list_command(&cmd.args) {
+        let parsed = match crate::server::list_ext::parse_list_command(&cmd.args) {
             Ok(p) => p,
             Err(e) => {
                 self.send(endpoint, tagged_bad(&cmd.tag, &e));
@@ -881,7 +881,7 @@ impl ImapControlHandler {
         };
         let subscribed = parsed
             .select
-            .contains(&crate::list_ext::ListSelectOption::Subscribed)
+            .contains(&crate::server::list_ext::ListSelectOption::Subscribed)
             || parsed.ret.subscribed;
         let extended = !parsed.select.is_empty()
             || parsed.ret.children
@@ -930,9 +930,9 @@ impl ImapControlHandler {
         if self.enabled.condstore
             && !items
                 .iter()
-                .any(|i| matches!(i, crate::fetch_format::FetchItem::ModSeq))
+                .any(|i| matches!(i, crate::server::fetch_format::FetchItem::ModSeq))
         {
-            items.push(crate::fetch_format::FetchItem::ModSeq);
+            items.push(crate::server::fetch_format::FetchItem::ModSeq);
         }
         let Some(mut h) = self.selected.take() else {
             return;

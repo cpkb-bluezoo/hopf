@@ -19,11 +19,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rcgen::generate_simple_self_signed;
-use hopf_core::{ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
-use hopf_http::{
-    AlpnHttpEndpoint, CleartextHttpEndpoint, Headers, HttpLimits, ServerHandler,
-    ServerHandlerFactory, ServerWriter,
-};
+use hopf_core::{Runtime, RuntimeConfig};
+use hopf_http::{Headers, HttpServer, ServerHandler, ServerHandlerFactory, ServerWriter};
 use hopf_tls::acceptor_from_pem;
 
 struct Hello;
@@ -76,10 +73,11 @@ fn main() -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     let factory: Arc<dyn ServerHandlerFactory> = Arc::new(HelloFactory);
-    let limits = HttpLimits::default();
 
     let rt = Runtime::start(RuntimeConfig::default())?;
-    let bound = if tls {
+    let mut server = HttpServer::new();
+    let mut cert_key_paths = None;
+    if tls {
         let dir = std::env::temp_dir().join("hopf-http-hello");
         std::fs::create_dir_all(&dir)?;
         let cert = generate_simple_self_signed(vec!["localhost".into()])
@@ -90,24 +88,13 @@ fn main() -> io::Result<()> {
         std::fs::write(&key_path, cert.key_pair.serialize_pem())?;
         // Prefer h2; fall back to HTTP/1.1 — same ServerHandler either way.
         let acceptor = acceptor_from_pem(&cert_path, &key_path, &[b"h2", b"http/1.1"])?;
-        let factory2 = Arc::clone(&factory);
-        let (bound, _) = rt.add_tcp_listener(
-            TcpListenerConfig::new(addr, move || {
-                Box::new(AlpnHttpEndpoint::new(Arc::clone(&factory2), limits))
-                    as Box<dyn ProtocolHandler>
-            })
-            .with_tls(acceptor),
-        )?;
+        server = server.tls(acceptor);
+        cert_key_paths = Some((cert_path, key_path));
+    }
+    let (bound, _) = server.bind(&rt, addr, factory)?;
+    if let Some((cert_path, key_path)) = cert_key_paths {
         eprintln!("cert {} key {}", cert_path.display(), key_path.display());
-        bound
-    } else {
-        let factory2 = Arc::clone(&factory);
-        let (bound, _) = rt.add_tcp_listener(TcpListenerConfig::new(addr, move || {
-            Box::new(CleartextHttpEndpoint::new(Arc::clone(&factory2), limits))
-                as Box<dyn ProtocolHandler>
-        }))?;
-        bound
-    };
+    }
 
     eprintln!(
         "hopf http-hello listening on {}://{bound} ({} workers){}",

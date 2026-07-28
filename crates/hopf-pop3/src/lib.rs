@@ -12,35 +12,21 @@
 
 #![warn(missing_docs)]
 
-mod auth;
-mod codec;
-mod control;
-mod egress;
-mod handler;
-mod metrics;
-mod reply;
-mod service;
-mod session;
+mod server;
 
 pub mod client;
 
 #[cfg(feature = "integration")]
 mod integration;
 
-pub use codec::{Pop3Command, Pop3ServerLexer, MAX_COMMAND_LINE};
-pub use control::Pop3ControlHandler;
-pub use egress::{dot_stuff_message, truncate_top};
-pub use handler::{
-    AuthorizationHandler, ClientConnected, DefaultPop3Handler, DefaultPop3HandlerFactory,
-    Pop3HandlerFactory, TransactionHandler,
+pub use server::{
+    dot_stuff_message, truncate_top, AuthenticateState, AuthorizationHandler, ClientConnected,
+    ConnectedState, DefaultPop3Handler, DefaultPop3HandlerFactory, ListState, ListWriter,
+    MailboxStatusState, MarkDeletedState, Pop3Command, Pop3Config, Pop3ControlHandler,
+    Pop3HandlerFactory, Pop3ServerLexer, Pop3ServerMetrics, Pop3Service, Pop3SessionState,
+    ResetState, RetrieveState, TopState, TransactionHandler, UidlState, UidlWriter, UpdateState,
+    DEFAULT_TRANSACTION_TIMEOUT, MAX_COMMAND_LINE,
 };
-pub use handler::{
-    AuthenticateState, ConnectedState, ListState, ListWriter, MailboxStatusState, MarkDeletedState,
-    ResetState, RetrieveState, TopState, UidlState, UidlWriter, UpdateState,
-};
-pub use metrics::Pop3ServerMetrics;
-pub use service::{Pop3Config, Pop3Service, DEFAULT_TRANSACTION_TIMEOUT};
-pub use session::Pop3SessionState;
 
 // ── Client re-exports ─────────────────────────────────────────────────────────
 
@@ -48,5 +34,5 @@ pub use client::{
     Pop3Capabilities, Pop3Client, Pop3ClientAuthExchange, Pop3ClientAuthorization,
     Pop3ClientDriver, Pop3ClientEndpoint, Pop3ClientHandlerFactory, Pop3ClientPassword,
     Pop3ClientPostStls, Pop3ClientTimeouts, Pop3ClientTransaction, Pop3DotUnstuffer, Pop3Error,
-    Pop3Fetch, Pop3LexMode, Pop3ReplyLexer, Pop3Result, Pop3WireEvent,
+    ContentId, Pop3Event, Pop3Fetch, Pop3ReplyLexer, Pop3ReplyShape, Pop3Result, MAX_REPLY_LINE,
 };

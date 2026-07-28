@@ -16,7 +16,7 @@ pub trait SmtpClientHello {
 }
 
 /// Capabilities advertised by the server in its EHLO response.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SmtpCapabilities {
     /// Server advertises STARTTLS (RFC 3207).
     pub starttls: bool,

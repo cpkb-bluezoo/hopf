@@ -8,6 +8,14 @@
 
 use super::error::ImapError;
 
+/// Cap on one buffered reply line, so a server that never sends CRLF can't
+/// grow [`ImapReplyLexer`]'s buffer without bound. Counterpart to the
+/// server-side [`crate::server::MAX_COMMAND_LINE`] (which bounds a client's
+/// command line instead) — this lexer allows a larger margin since IMAP
+/// tagged/untagged reply lines (e.g. long FETCH attribute lists) run longer
+/// than commands.
+pub const MAX_REPLY_LINE: usize = 64 * 1024;
+
 /// Tagged / untagged completion status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImapStatus {
@@ -88,7 +96,7 @@ impl ImapReplyLexer {
             mode: LexMode::Line,
             line_buf: Vec::with_capacity(256),
             literal_remaining: 0,
-            max_line: 64 * 1024,
+            max_line: MAX_REPLY_LINE,
         }
     }
 

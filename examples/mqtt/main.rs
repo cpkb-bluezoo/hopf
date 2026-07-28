@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hopf_core::{Runtime, RuntimeConfig};
-use hopf_mqtt::broker::BrokerState;
+use hopf_mqtt::server::broker::BrokerState;
 use hopf_mqtt::server::{MqttConfig, MqttService};
 
 fn main() -> io::Result<()> {

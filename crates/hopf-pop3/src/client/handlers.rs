@@ -10,6 +10,7 @@ use std::io;
 
 use hopf_core::Endpoint;
 
+use super::reply::ContentId;
 use super::state::{
     Pop3Capabilities, Pop3ClientAuthExchange, Pop3ClientAuthorization, Pop3ClientPassword,
     Pop3ClientPostStls, Pop3ClientTransaction,
@@ -33,10 +34,13 @@ pub trait Pop3ClientHandlerFactory: Send + Sync {
 pub trait Pop3ClientDriver: Send {
     // ── Greeting ─────────────────────────────────────────────────────────
 
-    /// Server greeting received (the `+OK` line after TCP connect).
+    /// Server greeting received (the `+OK` line after TCP connect). The
+    /// banner's decorative text is not exposed — greeting text has no
+    /// protocol meaning beyond the optional APOP challenge, which is
+    /// already parsed.
     ///
-    /// `apop_timestamp` is the `<challenge>` token extracted from the greeting
-    /// if the server supports APOP (RFC 1939 §7).
+    /// `apop_challenge` is the `<local@domain>` token from the greeting if
+    /// the server supports APOP (RFC 1939 §7).
     ///
     /// Typical next action: call `auth.capa()` to discover capabilities, or
     /// go straight to `auth.user(…)` / `auth.apop(…)`.
@@ -44,8 +48,7 @@ pub trait Pop3ClientDriver: Send {
         &mut self,
         auth: &mut dyn Pop3ClientAuthorization,
         ep: &mut dyn Endpoint,
-        message: &str,
-        apop_timestamp: Option<&str>,
+        apop_challenge: Option<&ContentId>,
     );
 
     // ── CAPA ─────────────────────────────────────────────────────────────
@@ -91,13 +94,13 @@ pub trait Pop3ClientDriver: Send {
 
     /// AUTH SASL challenge received (`+` continuation).
     ///
-    /// `challenge` is the raw base64 text from the `+ data` line.
-    /// Call `exchange.respond(…)` or `exchange.abort()`.
+    /// `challenge` is the already base64-decoded data from the `+ data`
+    /// line. Call `exchange.respond(…)` or `exchange.abort()`.
     fn on_auth_challenge(
         &mut self,
         exchange: &mut dyn Pop3ClientAuthExchange,
         ep: &mut dyn Endpoint,
-        challenge: &str,
+        challenge: &[u8],
     );
 
     // ── STLS ─────────────────────────────────────────────────────────────

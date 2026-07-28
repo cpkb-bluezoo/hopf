@@ -41,7 +41,7 @@ pub use error::{Pop3Error, Pop3Result};
 pub use facade::Pop3Client;
 pub use handlers::{Pop3ClientDriver, Pop3ClientHandlerFactory};
 pub use pipeline::Pop3Fetch;
-pub use reply::{Pop3LexMode, Pop3ReplyLexer, Pop3WireEvent};
+pub use reply::{ContentId, Pop3Event, Pop3ReplyLexer, Pop3ReplyShape, MAX_REPLY_LINE};
 pub use state::{
     Pop3Capabilities, Pop3ClientAuthExchange, Pop3ClientAuthorization, Pop3ClientPassword,
     Pop3ClientPostStls, Pop3ClientTransaction,

@@ -6,16 +6,16 @@
 //!
 //! - [`codec`] — incremental push frame parser / encoder, varint, MQTT 5
 //!   properties, streaming PUBLISH.
-//! - [`broker`] — topic tree, subscription index, retained store,
-//!   Receive Maximum flow control, Session Expiry, cross-reactor fan-out.
-//! - [`server`] — `MqttConfig` / `MqttService` / `MqttControlHandler`, and
-//!   the staged CONNECT handler SPI (`server::ConnectHandler`).
+//! - [`server`] — `MqttConfig` / `MqttService` / `MqttControlHandler`, the
+//!   staged CONNECT handler SPI (`server::ConnectHandler`),
+//!   [`server::broker`] — topic tree, subscription index, retained store,
+//!   Receive Maximum flow control, Session Expiry, cross-reactor fan-out —
+//!   and `server::ws` (feature `websocket`) — MQTT-over-WebSocket bridge
+//!   sharing broker state with the TCP listener.
 //! - [`client`] — async client facade, endpoint, and the consolidated
 //!   `MqttClientDriver` callback trait.
-//! - [`store`] — reserved for a future durable message store; retained
-//!   messages already live in [`broker::RetainedStore`].
-//! - [`ws`] (feature `websocket`) — MQTT-over-WebSocket bridge sharing
-//!   broker state with the TCP listener.
+//! - `server::store` — reserved for a future durable message store;
+//!   retained messages already live in [`server::broker::RetainedStore`].
 //!
 //! See the MQTT implementation plan for what's deliberately out of scope so
 //! far: shared subscriptions, enhanced AUTH, topic aliases, will delay /
@@ -24,14 +24,9 @@
 
 #![warn(missing_docs)]
 
-pub mod broker;
 pub mod client;
 pub mod codec;
 pub mod server;
-mod store;
-
-#[cfg(feature = "websocket")]
-pub mod ws;
 
 #[cfg(all(test, feature = "integration"))]
 mod integration;

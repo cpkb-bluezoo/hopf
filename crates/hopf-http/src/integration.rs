@@ -6,8 +6,6 @@
 //! These are deliberately excluded from CI. Run them manually with:
 //! `cargo test -p hopf-http --features integration`.
 
-#![cfg(feature = "integration")]
-
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};

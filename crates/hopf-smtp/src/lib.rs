@@ -14,47 +14,27 @@
 
 pub mod client;
 
-mod codec;
-mod control;
-mod data;
-mod delivery;
-mod handler;
-mod mailbox;
-mod metrics;
-mod pipeline;
-mod relay;
-mod reply;
-mod service;
-mod session;
+mod server;
 
 pub use client::{
-    dot_stuff, SmtpCapabilities, SmtpClient, SmtpClientDriver, SmtpClientEndpoint,
-    SmtpClientHandlerFactory, SmtpClientTimeouts, SmtpError, SmtpReply, SmtpResult, SmtpSend,
+    dot_stuff, SmtpCapabilities, SmtpClient, SmtpClientDriver, SmtpClientEndpoint, SmtpEvent,
+    SmtpClientHandlerFactory, SmtpClientTimeouts, SmtpError, SmtpReplyLexer, SmtpReplyShape,
+    SmtpResult, SmtpSend, MAX_REPLY_LINE,
 };
-pub use codec::{SmtpCommand, SmtpServerLexer};
-pub use control::SmtpControlHandler;
-pub use data::{BdatAccumulator, DotUnstuffer};
-pub use delivery::{
-    parse_mail_from_arg, parse_rcpt_to_arg, BodyType, DeliverBy, DeliveryRequirements, DsnNotify,
-    DsnRecipientParams, DsnReturn, MailFromParse, ParamParseError,
+pub use server::{
+    parse_mail_from_arg, parse_rcpt_to_arg, reply, reply_ehlo, reply_enhanced, reply_multiline,
+    AcceptAllSmtpHandler, AcceptAllSmtpHandlerFactory, AuthenticateState, BdatAccumulator,
+    BodyType, ConnectedState, DataDotState, DeferredDelivery, DeliverBy, DeliveryRequirements,
+    DiscardPipeline, DotUnstuffer, DsnNotify, DsnRecipientParams, DsnReturn, HelloHandler,
+    HelloState, LocalDeliveryHandler, LocalDeliveryHandlerFactory, LocalDeliveryService,
+    MailFromHandler, MailFromParse, MailFromState, MessageBufferPipeline, MessageDataHandler,
+    MessageEndState, MessageStartState, NullPipeline, ParamParseError, RecipientHandler,
+    RecipientState, ResetState, SimpleRelayHandler, SimpleRelayHandlerFactory,
+    SimpleRelayService, SmtpClientConnected, SmtpCommand, SmtpConfig, SmtpConnectionMetadata,
+    SmtpControlHandler, SmtpHandlerFactory, SmtpPipeline, SmtpServerLexer, SmtpServerMetrics,
+    SmtpService, SmtpSessionState, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_RECIPIENTS,
+    MAX_COMMAND_LINE,
 };
-pub use handler::{
-    AcceptAllSmtpHandler, AcceptAllSmtpHandlerFactory, AuthenticateState, ConnectedState,
-    DeferredDelivery, HelloHandler, HelloState, MailFromHandler, MailFromState, MessageDataHandler,
-    MessageEndState, MessageStartState, RecipientHandler, RecipientState, ResetState,
-    SmtpClientConnected, SmtpConnectionMetadata, SmtpHandlerFactory,
-};
-pub use metrics::SmtpServerMetrics;
-pub use pipeline::{DiscardPipeline, NullPipeline, SmtpPipeline};
-pub use mailbox::{
-    LocalDeliveryHandler, LocalDeliveryHandlerFactory, LocalDeliveryService,
-};
-pub use relay::{
-    MessageBufferPipeline, SimpleRelayHandler, SimpleRelayHandlerFactory, SimpleRelayService,
-};
-pub use reply::{reply, reply_ehlo, reply_enhanced, reply_multiline};
-pub use service::{SmtpConfig, SmtpService, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_RECIPIENTS};
-pub use session::{DataDotState, SmtpSessionState};
 
 #[cfg(all(test, feature = "integration"))]
 mod integration;

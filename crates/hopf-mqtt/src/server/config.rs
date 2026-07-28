@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hopf_auth::CredentialStore;
 
-use crate::broker::BrokerState;
+use crate::server::broker::BrokerState;
 use crate::codec::DEFAULT_MAX_PACKET_SIZE;
 
 /// Default window to wait for CONNECT after the TCP connection opens

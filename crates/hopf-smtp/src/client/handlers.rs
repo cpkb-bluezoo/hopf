@@ -29,16 +29,11 @@ pub trait SmtpClientHandlerFactory: Send + Sync {
 pub trait SmtpClientDriver: Send {
     // ── Greeting ───────────────────────────────────────────────────────────
 
-    /// 220 greeting received.
+    /// 220 greeting received. The banner text is not exposed — it has no
+    /// protocol meaning beyond the ESMTP flag, which is already extracted.
     ///
     /// Call `hello.ehlo(hostname)` or `hello.helo(hostname)`.
-    fn on_greeting(
-        &mut self,
-        hello: &mut dyn SmtpClientHello,
-        ep: &mut dyn Endpoint,
-        message: &str,
-        esmtp: bool,
-    );
+    fn on_greeting(&mut self, hello: &mut dyn SmtpClientHello, ep: &mut dyn Endpoint, esmtp: bool);
 
     /// 4xx/5xx greeting (service unavailable).
     fn on_service_unavailable(&mut self, ep: &mut dyn Endpoint, message: &str);
@@ -65,6 +60,11 @@ pub trait SmtpClientDriver: Send {
     /// 250 HELO response.
     fn on_helo(&mut self, session: &mut dyn SmtpClientSession, ep: &mut dyn Endpoint);
 
+    /// HELO permanent failure (5xx). Distinct from `on_ehlo_error` — this
+    /// fires only for a rejected HELO, matching Gumdrop's separate
+    /// `ServerHeloReplyHandler`/`ServerEhloReplyHandler` interfaces.
+    fn on_helo_error(&mut self, ep: &mut dyn Endpoint, message: &str);
+
     // ── STARTTLS ───────────────────────────────────────────────────────────
 
     /// TLS handshake completed (RFC 3207 §4.2 / RFC 8314).
@@ -72,8 +72,13 @@ pub trait SmtpClientDriver: Send {
     /// Must re-issue EHLO: call `post_tls.ehlo(hostname)`.
     fn on_tls_established(&mut self, post_tls: &mut dyn SmtpClientPostTls, ep: &mut dyn Endpoint);
 
-    /// STARTTLS rejected (454 / 502).
+    /// STARTTLS temporarily/optionally unavailable (454 / 502) — the
+    /// session continues without TLS.
     fn on_tls_unavailable(&mut self, session: &mut dyn SmtpClientSession, ep: &mut dyn Endpoint);
+
+    /// STARTTLS permanently rejected (5xx other than 502, e.g. 554).
+    /// The connection is closed after this callback returns.
+    fn on_tls_error(&mut self, ep: &mut dyn Endpoint, message: &str);
 
     // ── AUTH ───────────────────────────────────────────────────────────────
 
@@ -91,8 +96,11 @@ pub trait SmtpClientDriver: Send {
         challenge: &[u8],
     );
 
-    /// 535 / 504 / 454 — AUTH failed.
-    fn on_auth_failed(&mut self, session: &mut dyn SmtpClientSession, ep: &mut dyn Endpoint);
+    /// AUTH failed. `code` distinguishes bad credentials (535) from an
+    /// unsupported mechanism (504, retry with a different one) or a
+    /// temporary failure (454, retry later) — matching Gumdrop's
+    /// `handleAuthFailed`/`handleMechanismNotSupported`/`handleTemporaryFailure`.
+    fn on_auth_failed(&mut self, session: &mut dyn SmtpClientSession, ep: &mut dyn Endpoint, code: u16);
 
     // ── MAIL FROM ──────────────────────────────────────────────────────────
 
