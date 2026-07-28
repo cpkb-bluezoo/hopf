@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hopf_auth::{create_server, CredentialStore, SaslServer, SaslServerOptions, SaslServerStep};
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
 use hopf_mailbox::{Mailbox, MailboxFactory, MailboxStore};
+use rmimeparser::charset::base64;
 
 use crate::server::auth::{advertised_mechanisms, apop_timestamp, capa_sasl_line, verify_apop};
 use crate::server::codec::{Pop3Command, Pop3ServerLexer, MAX_COMMAND_LINE};
@@ -169,6 +169,28 @@ impl Pop3ControlHandler {
     }
 
     fn dispatch(&mut self, endpoint: &mut dyn Endpoint, cmd: Pop3Command) {
+        // SASL continuation lines bypass every other check (busy / UPDATE
+        // state / session dispatch) exactly as a raw "+"-prompted line
+        // always did — they aren't really commands.
+        if matches!(
+            cmd,
+            Pop3Command::SaslResponse(_) | Pop3Command::SaslAbort | Pop3Command::SaslResponseInvalid
+        ) {
+            match cmd {
+                Pop3Command::SaslResponse(data) => self.handle_sasl_response(endpoint, data),
+                Pop3Command::SaslAbort => {
+                    self.sasl = None;
+                    self.send(endpoint, reply::err("[AUTH] Authentication cancelled"));
+                }
+                Pop3Command::SaslResponseInvalid => {
+                    self.sasl = None;
+                    self.auth_failed(endpoint, "[AUTH] Invalid base64");
+                }
+                _ => unreachable!(),
+            }
+            return;
+        }
+
         self.last_activity = Instant::now();
         self.take_txn_slot();
         if self.busy.load(Ordering::Relaxed) {
@@ -183,13 +205,12 @@ impl Pop3ControlHandler {
             return;
         }
 
-        let verb = cmd.verb.as_str();
-        match verb {
-            "CAPA" => self.cmd_capa(endpoint),
-            "NOOP" => self.send(endpoint, reply::ok_bare()),
-            "QUIT" => self.cmd_quit(endpoint),
-            "STLS" => self.cmd_stls(endpoint),
-            "UTF8" => self.cmd_utf8(endpoint),
+        match cmd {
+            Pop3Command::Capa => self.cmd_capa(endpoint),
+            Pop3Command::Noop => self.send(endpoint, reply::ok_bare()),
+            Pop3Command::Quit => self.cmd_quit(endpoint),
+            Pop3Command::Stls => self.cmd_stls(endpoint),
+            Pop3Command::Utf8 => self.cmd_utf8(endpoint),
             _ if self.session == Pop3SessionState::Authorization => {
                 self.dispatch_auth(endpoint, cmd);
             }
@@ -201,9 +222,8 @@ impl Pop3ControlHandler {
     }
 
     fn dispatch_auth(&mut self, endpoint: &mut dyn Endpoint, cmd: Pop3Command) {
-        match cmd.verb.as_str() {
-            "USER" => {
-                let name = cmd.arg_lossy();
+        match cmd {
+            Pop3Command::User(name) => {
                 if name.is_empty() {
                     self.send(endpoint, reply::err("Missing username"));
                     return;
@@ -211,9 +231,15 @@ impl Pop3ControlHandler {
                 self.pending_user = Some(name);
                 self.send(endpoint, reply::ok("User accepted"));
             }
-            "PASS" => self.cmd_pass(endpoint, &cmd.arg_lossy()),
-            "APOP" => self.cmd_apop(endpoint, &cmd.arg_lossy()),
-            "AUTH" => self.cmd_auth(endpoint, &cmd.arg_lossy()),
+            Pop3Command::Pass(password) => self.cmd_pass(endpoint, &password),
+            Pop3Command::Apop { name, digest } => self.cmd_apop(endpoint, &name, &digest),
+            Pop3Command::AuthList => self.cmd_auth_list(endpoint),
+            Pop3Command::Auth { mechanism, initial_response } => {
+                self.cmd_auth(endpoint, &mechanism, initial_response)
+            }
+            Pop3Command::Malformed { verb } => {
+                self.send(endpoint, reply::err(&format!("Syntax error in {verb}")));
+            }
             _ => self.send(endpoint, reply::err("Command not valid in AUTHORIZATION state")),
         }
     }
@@ -224,16 +250,21 @@ impl Pop3ControlHandler {
             endpoint.close();
             return;
         }
-        match cmd.verb.as_str() {
-            "STAT" => self.cmd_stat(endpoint),
-            "LIST" => self.cmd_list(endpoint, &cmd.arg_lossy()),
-            "RETR" => self.cmd_retr(endpoint, &cmd.arg_lossy()),
-            "DELE" => self.cmd_dele(endpoint, &cmd.arg_lossy()),
-            "RSET" => self.cmd_rset(endpoint),
-            "TOP" => self.cmd_top(endpoint, &cmd.arg_lossy()),
-            "UIDL" => self.cmd_uidl(endpoint, &cmd.arg_lossy()),
-            "USER" | "PASS" | "APOP" | "AUTH" => {
-                self.send(endpoint, reply::err("Already authenticated"))
+        match cmd {
+            Pop3Command::Stat => self.cmd_stat(endpoint),
+            Pop3Command::List(n) => self.cmd_list(endpoint, n),
+            Pop3Command::Retr(n) => self.cmd_retr(endpoint, n),
+            Pop3Command::Dele(n) => self.cmd_dele(endpoint, n),
+            Pop3Command::Rset => self.cmd_rset(endpoint),
+            Pop3Command::Top(n, lines) => self.cmd_top(endpoint, n, lines),
+            Pop3Command::Uidl(n) => self.cmd_uidl(endpoint, n),
+            Pop3Command::User(_)
+            | Pop3Command::Pass(_)
+            | Pop3Command::Apop { .. }
+            | Pop3Command::AuthList
+            | Pop3Command::Auth { .. } => self.send(endpoint, reply::err("Already authenticated")),
+            Pop3Command::Malformed { verb } => {
+                self.send(endpoint, reply::err(&format!("Syntax error in {verb}")));
             }
             _ => self.send(endpoint, reply::err("Unknown command")),
         }
@@ -343,7 +374,7 @@ impl Pop3ControlHandler {
         self.finish_auth(endpoint, &user);
     }
 
-    fn cmd_apop(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
+    fn cmd_apop(&mut self, endpoint: &mut dyn Endpoint, user: &str, digest: &str) {
         if !self.config.enable_apop {
             self.send(endpoint, reply::err("APOP not available"));
             return;
@@ -352,15 +383,6 @@ impl Pop3ControlHandler {
             self.send(endpoint, reply::err("[AUTH] Login delay active"));
             return;
         }
-        let mut parts = arg.splitn(2, char::is_whitespace);
-        let Some(user) = parts.next().filter(|s| !s.is_empty()) else {
-            self.send(endpoint, reply::err("Syntax: APOP name digest"));
-            return;
-        };
-        let Some(digest) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
-            self.send(endpoint, reply::err("Syntax: APOP name digest"));
-            return;
-        };
         if !verify_apop(
             self.config.store.as_ref(),
             user,
@@ -373,28 +395,25 @@ impl Pop3ControlHandler {
         self.finish_auth(endpoint, user);
     }
 
-    fn cmd_auth(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
+    fn cmd_auth_list(&mut self, endpoint: &mut dyn Endpoint) {
         if self.login_delay_active() {
             self.send(endpoint, reply::err("[AUTH] Login delay active"));
             return;
         }
-        let arg = arg.trim();
-        if arg.is_empty() {
-            // RFC 1734-style listing
-            self.send(
-                endpoint,
-                reply::ok("Supported authentication mechanisms:"),
-            );
-            for m in advertised_mechanisms(&self.config.store, self.tls) {
-                self.send(endpoint, reply::line(m.name()));
-            }
-            self.send(endpoint, reply::multiline_end());
+        // RFC 1734-style listing
+        self.send(endpoint, reply::ok("Supported authentication mechanisms:"));
+        for m in advertised_mechanisms(&self.config.store, self.tls) {
+            self.send(endpoint, reply::line(m.name()));
+        }
+        self.send(endpoint, reply::multiline_end());
+    }
+
+    fn cmd_auth(&mut self, endpoint: &mut dyn Endpoint, mechanism: &str, initial_response: Option<Vec<u8>>) {
+        if self.login_delay_active() {
+            self.send(endpoint, reply::err("[AUTH] Login delay active"));
             return;
         }
-        let mut parts = arg.splitn(2, char::is_whitespace);
-        let mech_name = parts.next().unwrap_or("");
-        let initial = parts.next().map(str::trim).filter(|s| !s.is_empty());
-        let Some(mech) = hopf_auth::SaslMechanism::from_name(mech_name) else {
+        let Some(mech) = hopf_auth::SaslMechanism::from_name(mechanism) else {
             self.send(endpoint, reply::err("[AUTH] Unsupported mechanism"));
             return;
         };
@@ -411,27 +430,13 @@ impl Pop3ControlHandler {
             peer_certificate: None,
         };
         let mut server = create_server(mech, Arc::clone(&self.config.store), opts);
-        let ir = if let Some(ir) = initial {
-            if ir == "=" {
-                Some(Vec::<u8>::new())
-            } else {
-                match B64.decode(ir.as_bytes()) {
-                    Ok(b) => Some(b),
-                    Err(_) => {
-                        self.send(endpoint, reply::err("[AUTH] Invalid base64"));
-                        return;
-                    }
-                }
-            }
-        } else {
-            None
-        };
 
-        if server.server_first() && ir.is_none() {
+        if server.server_first() && initial_response.is_none() {
             match server.step(None) {
                 SaslServerStep::Challenge(c) => {
-                    self.send(endpoint, reply::continuation(&B64.encode(c)));
+                    self.send(endpoint, reply::continuation(&base64::encode(&c)));
                     self.sasl = Some(server);
+                    self.lexer.expect_sasl_response();
                 }
                 SaslServerStep::Failure => {
                     self.auth_failed(endpoint, "[AUTH] Authentication failed");
@@ -443,7 +448,7 @@ impl Pop3ControlHandler {
             return;
         }
 
-        self.sasl_step(endpoint, server, ir.as_deref());
+        self.sasl_step(endpoint, server, initial_response.as_deref());
     }
 
     fn sasl_step(
@@ -454,8 +459,9 @@ impl Pop3ControlHandler {
     ) {
         match server.step(response) {
             SaslServerStep::Challenge(c) => {
-                self.send(endpoint, reply::continuation(&B64.encode(c)));
+                self.send(endpoint, reply::continuation(&base64::encode(&c)));
                 self.sasl = Some(server);
+                self.lexer.expect_sasl_response();
             }
             SaslServerStep::Complete {
                 username,
@@ -463,7 +469,7 @@ impl Pop3ControlHandler {
             } => {
                 if let Some(fm) = final_message {
                     if !fm.is_empty() {
-                        self.send(endpoint, reply::continuation(&B64.encode(fm)));
+                        self.send(endpoint, reply::continuation(&base64::encode(&fm)));
                     }
                 }
                 self.sasl = None;
@@ -476,28 +482,11 @@ impl Pop3ControlHandler {
         }
     }
 
-    fn feed_sasl_line(&mut self, endpoint: &mut dyn Endpoint, line: &[u8]) {
-        if line == b"*" {
-            self.sasl = None;
-            self.send(endpoint, reply::err("[AUTH] Authentication cancelled"));
-            return;
-        }
-        let decoded = if line.is_empty() {
-            Vec::new()
-        } else {
-            match B64.decode(line) {
-                Ok(b) => b,
-                Err(_) => {
-                    self.sasl = None;
-                    self.auth_failed(endpoint, "[AUTH] Invalid base64");
-                    return;
-                }
-            }
-        };
+    fn handle_sasl_response(&mut self, endpoint: &mut dyn Endpoint, response: Vec<u8>) {
         let Some(server) = self.sasl.take() else {
             return;
         };
-        self.sasl_step(endpoint, server, Some(&decoded));
+        self.sasl_step(endpoint, server, Some(&response));
     }
 
     fn finish_auth(&mut self, endpoint: &mut dyn Endpoint, username: &str) {
@@ -585,8 +574,7 @@ impl Pop3ControlHandler {
         }
     }
 
-    fn cmd_list(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        let n = parse_optional_msg(arg);
+    fn cmd_list(&mut self, endpoint: &mut dyn Endpoint, n: Option<u32>) {
         let Some(mut handler) = self.transaction.take() else {
             self.send(endpoint, reply::err("[SYS/PERM] No handler"));
             return;
@@ -613,11 +601,7 @@ impl Pop3ControlHandler {
         }
     }
 
-    fn cmd_retr(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        let Some(n) = parse_msg(arg) else {
-            self.send(endpoint, reply::err("Syntax: RETR msg"));
-            return;
-        };
+    fn cmd_retr(&mut self, endpoint: &mut dyn Endpoint, n: u32) {
         self.pending_msg = n;
         let Some(mut handler) = self.transaction.take() else {
             self.send(endpoint, reply::err("[SYS/PERM] No handler"));
@@ -644,11 +628,7 @@ impl Pop3ControlHandler {
         }
     }
 
-    fn cmd_dele(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        let Some(n) = parse_msg(arg) else {
-            self.send(endpoint, reply::err("Syntax: DELE msg"));
-            return;
-        };
+    fn cmd_dele(&mut self, endpoint: &mut dyn Endpoint, n: u32) {
         let Some(mut handler) = self.transaction.take() else {
             self.send(endpoint, reply::err("[SYS/PERM] No handler"));
             return;
@@ -693,20 +673,7 @@ impl Pop3ControlHandler {
         }
     }
 
-    fn cmd_top(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        let mut parts = arg.split_whitespace();
-        let (Some(n), Some(lines)) = (parts.next(), parts.next()) else {
-            self.send(endpoint, reply::err("Syntax: TOP msg lines"));
-            return;
-        };
-        let Ok(n) = n.parse::<u32>() else {
-            self.send(endpoint, reply::err("Syntax: TOP msg lines"));
-            return;
-        };
-        let Ok(lines) = lines.parse::<u32>() else {
-            self.send(endpoint, reply::err("Syntax: TOP msg lines"));
-            return;
-        };
+    fn cmd_top(&mut self, endpoint: &mut dyn Endpoint, n: u32, lines: u32) {
         self.pending_msg = n;
         self.pending_top_lines = lines;
         let Some(mut handler) = self.transaction.take() else {
@@ -734,8 +701,7 @@ impl Pop3ControlHandler {
         }
     }
 
-    fn cmd_uidl(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
-        let n = parse_optional_msg(arg);
+    fn cmd_uidl(&mut self, endpoint: &mut dyn Endpoint, n: Option<u32>) {
         let Some(mut handler) = self.transaction.take() else {
             self.send(endpoint, reply::err("[SYS/PERM] No handler"));
             return;
@@ -924,22 +890,6 @@ impl Pop3ControlHandler {
     }
 }
 
-fn parse_msg(arg: &str) -> Option<u32> {
-    let s = arg.trim();
-    if s.is_empty() {
-        return None;
-    }
-    s.parse().ok().filter(|&n| n > 0)
-}
-
-fn parse_optional_msg(arg: &str) -> Option<u32> {
-    let s = arg.trim();
-    if s.is_empty() {
-        return None;
-    }
-    s.parse().ok().filter(|&n| n > 0)
-}
-
 impl ProtocolHandler for Pop3ControlHandler {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
         if let Ok(peer) = endpoint.remote_addr() {
@@ -964,18 +914,6 @@ impl ProtocolHandler for Pop3ControlHandler {
         if self.busy.load(Ordering::Relaxed) {
             // Reads are paused during storage offloads; drop any residual.
             *data = &[];
-            return;
-        }
-
-        if self.sasl.is_some() {
-            if let Some(pos) = data.windows(2).position(|w| w == b"\r\n") {
-                let line = data[..pos].to_vec();
-                *data = &data[pos + 2..];
-                self.feed_sasl_line(endpoint, &line);
-                if !data.is_empty() {
-                    self.receive(endpoint, data);
-                }
-            }
             return;
         }
 
