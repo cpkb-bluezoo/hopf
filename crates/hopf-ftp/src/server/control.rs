@@ -150,30 +150,38 @@ impl FtpControlHandler {
 
     fn dispatch(&mut self, endpoint: &mut dyn Endpoint, cmd: FtpCommand) {
         FtpServerMetrics::add(&self.metrics.commands, 1);
-        let verb = cmd.verb.as_str();
-        let arg = match decode_arg(&cmd.arg_bytes, self.utf8) {
-            Ok(s) => s,
-            Err(PathnameCharsetError::NonAscii) => {
-                self.send_reply(
-                    endpoint,
-                    501,
-                    "Non-ASCII characters require OPTS UTF8 ON",
-                );
-                return;
-            }
-            Err(PathnameCharsetError::InvalidUtf8) => {
-                self.send_reply(endpoint, 501, "Invalid UTF-8 in command argument");
-                return;
-            }
+
+        // Commands with a text/path argument need RFC 2640 charset
+        // decoding (depends on the per-connection `self.utf8` toggle, so
+        // it can't happen inside the lexer) before dispatch can use them;
+        // argless commands skip this entirely.
+        let arg = match cmd.arg_bytes() {
+            Some(bytes) => match decode_arg(bytes, self.utf8) {
+                Ok(s) => s,
+                Err(PathnameCharsetError::NonAscii) => {
+                    self.send_reply(
+                        endpoint,
+                        501,
+                        "Non-ASCII characters require OPTS UTF8 ON",
+                    );
+                    return;
+                }
+                Err(PathnameCharsetError::InvalidUtf8) => {
+                    self.send_reply(endpoint, 501, "Invalid UTF-8 in command argument");
+                    return;
+                }
+            },
+            None => String::new(),
         };
         let arg = arg.trim();
-        match verb {
-            "USER" => self.cmd_user(endpoint, arg),
-            "PASS" => self.cmd_pass(endpoint, arg),
-            "ACCT" => self.send_reply(endpoint, 202, "Command not implemented, superfluous"),
-            "CWD" | "XCWD" => self.cmd_cwd(endpoint, arg),
-            "CDUP" | "XCUP" => self.cmd_cwd(endpoint, ".."),
-            "PWD" | "XPWD" => {
+
+        match cmd {
+            FtpCommand::User(_) => self.cmd_user(endpoint, arg),
+            FtpCommand::Pass(_) => self.cmd_pass(endpoint, arg),
+            FtpCommand::Acct => self.send_reply(endpoint, 202, "Command not implemented, superfluous"),
+            FtpCommand::Cwd(_) => self.cmd_cwd(endpoint, arg),
+            FtpCommand::Cdup => self.cmd_cwd(endpoint, ".."),
+            FtpCommand::Pwd => {
                 if self.require_auth(endpoint) {
                     self.send_reply(
                         endpoint,
@@ -182,12 +190,12 @@ impl FtpControlHandler {
                     );
                 }
             }
-            "QUIT" => {
+            FtpCommand::Quit => {
                 self.clear_pasv();
                 self.send_reply(endpoint, 221, "Goodbye");
                 endpoint.close();
             }
-            "REIN" => {
+            FtpCommand::Rein => {
                 self.logged_in = false;
                 self.pending_user = None;
                 self.meta.user = None;
@@ -196,10 +204,10 @@ impl FtpControlHandler {
                 self.clear_pasv();
                 self.send_reply(endpoint, 220, "Service ready for new user");
             }
-            "NOOP" => self.send_reply(endpoint, 200, "OK"),
-            "SYST" => self.send_reply(endpoint, 215, "UNIX Type: L8"),
-            "TYPE" => self.cmd_type(endpoint, arg),
-            "STRU" => {
+            FtpCommand::Noop => self.send_reply(endpoint, 200, "OK"),
+            FtpCommand::Syst => self.send_reply(endpoint, 215, "UNIX Type: L8"),
+            FtpCommand::Type(_) => self.cmd_type(endpoint, arg),
+            FtpCommand::Stru(_) => {
                 if arg.eq_ignore_ascii_case("F") || arg.is_empty() {
                     self.send_reply(endpoint, 200, "Structure set to F");
                 } else {
@@ -210,7 +218,7 @@ impl FtpControlHandler {
                     );
                 }
             }
-            "MODE" => {
+            FtpCommand::Mode(_) => {
                 if arg.eq_ignore_ascii_case("S") || arg.is_empty() {
                     self.send_reply(endpoint, 200, "Mode set to S");
                 } else {
@@ -221,32 +229,32 @@ impl FtpControlHandler {
                     );
                 }
             }
-            "PASV" => self.cmd_pasv(endpoint),
-            "EPSV" => self.cmd_epsv(endpoint, arg),
-            "PORT" => self.cmd_port(endpoint, arg),
-            "EPRT" => self.cmd_eprt(endpoint, arg),
-            "RETR" => self.cmd_retr(endpoint, arg),
-            "STOR" => self.cmd_stor(endpoint, arg, false),
-            "APPE" => self.cmd_stor(endpoint, arg, true),
-            "STOU" => self.cmd_stor(endpoint, &format!("stor-{}", std::process::id()), false),
-            "LIST" => self.cmd_list(endpoint, arg, false),
-            "NLST" => self.cmd_list(endpoint, arg, true),
-            "MLSD" => self.cmd_mlsd(endpoint, arg),
-            "MLST" => self.cmd_mlst(endpoint, arg),
-            "SIZE" => self.cmd_size(endpoint, arg),
-            "MDTM" => self.cmd_mdtm(endpoint, arg),
-            "DELE" => self.cmd_dele(endpoint, arg),
-            "RMD" | "XRMD" => self.cmd_rmd(endpoint, arg),
-            "MKD" | "XMKD" => self.cmd_mkd(endpoint, arg),
-            "RNFR" => self.cmd_rnfr(endpoint, arg),
-            "RNTO" => self.cmd_rnto(endpoint, arg),
-            "REST" => self.cmd_rest(endpoint, arg),
-            "ABOR" => {
+            FtpCommand::Pasv => self.cmd_pasv(endpoint),
+            FtpCommand::Epsv(_) => self.cmd_epsv(endpoint, arg),
+            FtpCommand::Port(_) => self.cmd_port(endpoint, arg),
+            FtpCommand::Eprt(_) => self.cmd_eprt(endpoint, arg),
+            FtpCommand::Retr(_) => self.cmd_retr(endpoint, arg),
+            FtpCommand::Stor(_) => self.cmd_stor(endpoint, arg, false),
+            FtpCommand::Appe(_) => self.cmd_stor(endpoint, arg, true),
+            FtpCommand::Stou => self.cmd_stor(endpoint, &format!("stor-{}", std::process::id()), false),
+            FtpCommand::List(_) => self.cmd_list(endpoint, arg, false),
+            FtpCommand::Nlst(_) => self.cmd_list(endpoint, arg, true),
+            FtpCommand::Mlsd(_) => self.cmd_mlsd(endpoint, arg),
+            FtpCommand::Mlst(_) => self.cmd_mlst(endpoint, arg),
+            FtpCommand::Size(_) => self.cmd_size(endpoint, arg),
+            FtpCommand::Mdtm(_) => self.cmd_mdtm(endpoint, arg),
+            FtpCommand::Dele(_) => self.cmd_dele(endpoint, arg),
+            FtpCommand::Rmd(_) => self.cmd_rmd(endpoint, arg),
+            FtpCommand::Mkd(_) => self.cmd_mkd(endpoint, arg),
+            FtpCommand::Rnfr(_) => self.cmd_rnfr(endpoint, arg),
+            FtpCommand::Rnto(_) => self.cmd_rnto(endpoint, arg),
+            FtpCommand::Rest(_) => self.cmd_rest(endpoint, arg),
+            FtpCommand::Abor => {
                 self.clear_pasv();
                 self.bridge = None;
                 self.send_reply(endpoint, 226, "Abort successful");
             }
-            "STAT" => {
+            FtpCommand::Stat(_) => {
                 if arg.is_empty() {
                     self.send_reply(
                         endpoint,
@@ -257,10 +265,10 @@ impl FtpControlHandler {
                     self.cmd_list(endpoint, arg, false);
                 }
             }
-            "HELP" | "FEAT" => self.cmd_feat(endpoint),
-            "OPTS" => self.cmd_opts(endpoint, arg),
-            "AUTH" => self.cmd_auth(endpoint, arg),
-            "PBSZ" => {
+            FtpCommand::Feat => self.cmd_feat(endpoint),
+            FtpCommand::Opts(_) => self.cmd_opts(endpoint, arg),
+            FtpCommand::Auth(_) => self.cmd_auth(endpoint, arg),
+            FtpCommand::Pbsz(_) => {
                 if arg == "0" {
                     self.pbsz = true;
                     self.send_reply(endpoint, 200, "PBSZ=0");
@@ -269,12 +277,12 @@ impl FtpControlHandler {
                     self.pbsz = true;
                 }
             }
-            "PROT" => self.cmd_prot(endpoint, arg),
-            "CCC" => self.send_reply(endpoint, 533, "CCC not supported"),
-            "ALLO" => self.send_reply(endpoint, 202, "ALLO not required"),
-            "SITE" => self.send_reply(endpoint, 500, "SITE not implemented"),
-            "SMNT" => self.send_reply(endpoint, 502, "Command not implemented"),
-            _ => self.send_reply(endpoint, 502, "Command not implemented"),
+            FtpCommand::Prot(_) => self.cmd_prot(endpoint, arg),
+            FtpCommand::Ccc => self.send_reply(endpoint, 533, "CCC not supported"),
+            FtpCommand::Allo => self.send_reply(endpoint, 202, "ALLO not required"),
+            FtpCommand::Site => self.send_reply(endpoint, 500, "SITE not implemented"),
+            FtpCommand::Smnt => self.send_reply(endpoint, 502, "Command not implemented"),
+            FtpCommand::Unknown { .. } => self.send_reply(endpoint, 502, "Command not implemented"),
         }
     }
 
