@@ -8,10 +8,10 @@ use hopf_core::Endpoint;
 
 use super::reply::ImapStatus;
 use super::state::{
-    ImapCapabilities, ImapClientAppend, ImapClientAuthExchange, ImapClientAuthenticated,
-    ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls, ImapClientSelected,
-    ImapCopyUid, ImapEnabledFeatures, ImapFetchData, ImapListEntry, ImapMailboxInfo,
-    ImapNamespaceData, ImapQuotaData, ImapQuotaRootData, ImapStatusData,
+    ImapAppendUid, ImapCapabilities, ImapClientAppend, ImapClientAuthExchange,
+    ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls,
+    ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData, ImapListEntry,
+    ImapMailboxInfo, ImapNamespaceData, ImapQuotaData, ImapQuotaRootData, ImapStatusData,
 };
 
 /// Creates the connection driver for each new IMAP client connection.
@@ -55,13 +55,19 @@ pub trait ImapClientDriver: Send {
         None
     }
 
-    /// Server greeting (`* OK` / `* PREAUTH` / `* BYE`).
+    /// Server greeting (`* OK` / `* PREAUTH` / `* BYE`). `caps` is the
+    /// pre-auth capability list if the greeting carried one (a `*
+    /// CAPABILITY ...` line, or a `[CAPABILITY ...]` response code on the
+    /// `* OK` itself — RFC 9051 §7.1 allows either), else a default/empty
+    /// set. Matches Gumdrop's `ServerGreeting.handleGreeting`'s
+    /// `preAuthCapabilities`.
     fn on_greeting(
         &mut self,
         auth: &mut dyn ImapClientNotAuthenticated,
         ep: &mut dyn Endpoint,
         text: &str,
         preauth: bool,
+        caps: &ImapCapabilities,
     );
 
     /// CAPABILITY response (pre- or post-auth).
@@ -83,11 +89,16 @@ pub trait ImapClientDriver: Send {
         message: &str,
     );
 
-    /// LOGIN / AUTHENTICATE succeeded.
+    /// LOGIN / AUTHENTICATE succeeded. `caps` is the post-auth capability
+    /// list if this reply carried one, else a default/empty set — matches
+    /// Gumdrop's `ServerLoginReplyHandler.handleAuthenticated`/
+    /// `ServerAuthReplyHandler.handleAuthSuccess`, both of which pass
+    /// `List<String> capabilities`.
     fn on_authenticated(
         &mut self,
         session: &mut dyn ImapClientAuthenticated,
         ep: &mut dyn Endpoint,
+        caps: &ImapCapabilities,
     );
 
     /// LOGIN / AUTHENTICATE failed (NO/BAD).
@@ -345,12 +356,16 @@ pub trait ImapClientDriver: Send {
         text: &str,
     );
 
-    /// APPEND completed.
+    /// APPEND completed. `appenduid` is the parsed `[APPENDUID uidvalidity
+    /// uid]` response code (RFC 4315 UIDPLUS) if the server sent one on
+    /// success — matches Gumdrop's `ServerAppendReplyHandler.handleAppendComplete`,
+    /// which surfaces `uidValidity`/`uid` directly.
     fn on_append_complete(
         &mut self,
         session: &mut dyn ImapClientAuthenticated,
         ep: &mut dyn Endpoint,
         status: ImapStatus,
+        appenduid: Option<&ImapAppendUid>,
         message: &str,
     );
 

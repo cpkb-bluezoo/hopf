@@ -14,11 +14,13 @@ use std::time::Duration;
 use base64::Engine;
 use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
 
+use crate::DsnRecipientParams;
+
 use super::handlers::{SmtpClientDriver, SmtpClientHandlerFactory};
 use super::reply::{SmtpEvent, SmtpReplyLexer, SmtpReplyShape};
 use super::state::{
-    SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope, SmtpClientHello,
-    SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
+    MailFromParams, SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope,
+    SmtpClientHello, SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
 };
 use crate::client::dot_stuff;
 
@@ -50,6 +52,10 @@ enum ProtoState {
     DataEndSent,
     /// RSET sent; waiting for 250.
     RsetSent,
+    /// VRFY sent; waiting for 250/251/252/5xx.
+    VrfySent,
+    /// EXPN sent; waiting for 250 (multiline) / 5xx.
+    ExpnSent,
     /// QUIT sent.
     QuitSent,
     /// Terminal states.
@@ -90,6 +96,11 @@ pub struct SmtpClientEndpoint {
     outbound: Vec<u8>,
     /// Set when TLS STARTTLS handshake is in-flight and we need to arm greeting timer after.
     pending_tls: bool,
+    /// Set by `SmtpClientAuthExchange::abort()`; the next reply in
+    /// `AuthSent` state is the server's response to our `*`, routed to
+    /// `on_auth_aborted` unconditionally instead of the normal
+    /// AuthOk/AuthChallenge/AuthFailed dispatch.
+    auth_aborting: bool,
     /// Connect budget remaining (reserved for future use).
     #[allow(dead_code)]
     connect_budget_remaining: Option<Duration>,
@@ -118,6 +129,7 @@ impl SmtpClientEndpoint {
             accepted_rcpts: 0,
             outbound: Vec::with_capacity(512),
             pending_tls: false,
+            auth_aborting: false,
             connect_budget_remaining: None,
         }
     }
@@ -233,6 +245,8 @@ impl SmtpClientEndpoint {
             }
             ProtoState::DataEndSent => self.dispatch_message_reply(event, ep),
             ProtoState::RsetSent => self.dispatch_rset(event, ep),
+            ProtoState::VrfySent => self.dispatch_vrfy(event, ep),
+            ProtoState::ExpnSent => self.dispatch_expn(event, ep),
             ProtoState::QuitSent | ProtoState::Closed => {
                 self.proto_state = ProtoState::Closed;
                 ep.close();
@@ -367,6 +381,13 @@ impl SmtpClientEndpoint {
             Some(d) => d,
             None => return,
         };
+        if self.auth_aborting {
+            self.auth_aborting = false;
+            self.proto_state = ProtoState::Connected;
+            driver.on_auth_aborted(self, ep);
+            self.driver = Some(driver);
+            return;
+        }
         match event {
             SmtpEvent::AuthOk => {
                 self.proto_state = ProtoState::Connected;
@@ -436,7 +457,7 @@ impl SmtpClientEndpoint {
             }
             SmtpEvent::MessageRejected { code, message } => {
                 self.proto_state = ProtoState::Connected;
-                driver.on_message_rejected(self, ep, code, &message);
+                driver.on_data_rejected(self, ep, code, &message);
             }
             _ => {}
         }
@@ -474,6 +495,44 @@ impl SmtpClientEndpoint {
         self.accepted_rcpts = 0;
         self.proto_state = ProtoState::Connected;
         driver.on_rset_ok(self, ep);
+        self.driver = Some(driver);
+    }
+
+    fn dispatch_vrfy(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
+        match event {
+            SmtpEvent::VrfyOk { code, text } => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_vrfy_ok(self, ep, code, &text);
+            }
+            SmtpEvent::VrfyFailed { code, message } => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_vrfy_failed(self, ep, code, &message);
+            }
+            _ => {}
+        }
+        self.driver = Some(driver);
+    }
+
+    fn dispatch_expn(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
+        match event {
+            SmtpEvent::ExpnOk { members } => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_expn_ok(self, ep, &members);
+            }
+            SmtpEvent::ExpnFailed { code, message } => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_expn_failed(self, ep, code, &message);
+            }
+            _ => {}
+        }
         self.driver = Some(driver);
     }
 }
@@ -569,6 +628,12 @@ impl SmtpClientHello for SmtpClientEndpoint {
         self.lexer.expect(SmtpReplyShape::Helo);
         self.write_line(&format!("HELO {hostname}"));
     }
+
+    fn quit(&mut self) {
+        self.proto_state = ProtoState::QuitSent;
+        self.lexer.expect(SmtpReplyShape::Quit);
+        self.write_line("QUIT");
+    }
 }
 
 // ── SmtpClientPostTls ─────────────────────────────────────────────────────────
@@ -578,11 +643,12 @@ impl SmtpClientPostTls for SmtpClientEndpoint {}
 // ── SmtpClientSession ─────────────────────────────────────────────────────────
 
 impl SmtpClientSession for SmtpClientEndpoint {
-    fn mail_from(&mut self, sender: Option<&str>) {
-        let arg = match sender {
+    fn mail_from(&mut self, sender: Option<&str>, params: &MailFromParams) {
+        let mut arg = match sender {
             Some(s) if !s.is_empty() => format!("MAIL FROM:<{s}>"),
             _ => "MAIL FROM:<>".to_string(),
         };
+        arg.push_str(&params.render());
         self.proto_state = ProtoState::MailFromSent;
         self.lexer.expect(SmtpReplyShape::MailFrom);
         self.write_line(&arg);
@@ -597,6 +663,7 @@ impl SmtpClientSession for SmtpClientEndpoint {
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) {
         self.proto_state = ProtoState::AuthSent;
         self.lexer.expect(SmtpReplyShape::Auth);
+        self.auth_aborting = false;
         let arg = match initial {
             Some(b) => {
                 let enc = base64::engine::general_purpose::STANDARD.encode(b);
@@ -607,10 +674,18 @@ impl SmtpClientSession for SmtpClientEndpoint {
         self.write_line(&arg);
     }
 
-    fn quit(&mut self) {
-        self.proto_state = ProtoState::QuitSent;
-        self.lexer.expect(SmtpReplyShape::Quit);
-        self.write_line("QUIT");
+    // `quit()` is implemented once, in `impl SmtpClientHello`.
+
+    fn vrfy(&mut self, address: &str) {
+        self.proto_state = ProtoState::VrfySent;
+        self.lexer.expect(SmtpReplyShape::Vrfy);
+        self.write_line(&format!("VRFY {address}"));
+    }
+
+    fn expn(&mut self, list: &str) {
+        self.proto_state = ProtoState::ExpnSent;
+        self.lexer.expect(SmtpReplyShape::Expn);
+        self.write_line(&format!("EXPN {list}"));
     }
 
     fn capabilities(&self) -> &SmtpCapabilities {
@@ -624,6 +699,7 @@ impl SmtpClientAuthExchange for SmtpClientEndpoint {
     fn respond(&mut self, response: &[u8]) {
         self.proto_state = ProtoState::AuthSent;
         self.lexer.expect(SmtpReplyShape::Auth);
+        self.auth_aborting = false;
         let enc = base64::engine::general_purpose::STANDARD.encode(response);
         self.write_line(&enc);
     }
@@ -631,6 +707,7 @@ impl SmtpClientAuthExchange for SmtpClientEndpoint {
     fn abort(&mut self) {
         self.proto_state = ProtoState::AuthSent;
         self.lexer.expect(SmtpReplyShape::Auth);
+        self.auth_aborting = true;
         self.write_line("*");
     }
 }
@@ -638,10 +715,12 @@ impl SmtpClientAuthExchange for SmtpClientEndpoint {
 // ── SmtpClientEnvelope ────────────────────────────────────────────────────────
 
 impl SmtpClientEnvelope for SmtpClientEndpoint {
-    fn rcpt_to(&mut self, recipient: &str) {
+    fn rcpt_to(&mut self, recipient: &str, params: &DsnRecipientParams) {
         self.proto_state = ProtoState::RcptToSent(recipient.to_string());
         self.lexer.expect(SmtpReplyShape::RcptTo);
-        self.write_line(&format!("RCPT TO:<{recipient}>"));
+        let mut arg = format!("RCPT TO:<{recipient}>");
+        arg.push_str(&params.render());
+        self.write_line(&arg);
     }
 
     fn rset(&mut self) {

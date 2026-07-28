@@ -41,8 +41,8 @@ pub use handlers::{SmtpClientDriver, SmtpClientHandlerFactory};
 pub use pipeline::SmtpSend;
 pub use reply::{SmtpEvent, SmtpReplyLexer, SmtpReplyShape, MAX_REPLY_LINE};
 pub use state::{
-    SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope, SmtpClientHello,
-    SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
+    MailFromParams, SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope,
+    SmtpClientHello, SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
 };
 
 /// Dot-stuff outbound DATA: lines starting with `.` get an extra `.`.

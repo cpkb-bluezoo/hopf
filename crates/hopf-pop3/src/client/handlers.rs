@@ -61,12 +61,33 @@ pub trait Pop3ClientDriver: Send {
         caps: &Pop3Capabilities,
     );
 
+    /// CAPA failed (-ERR) while in Authorization state. Matches Gumdrop's
+    /// `ServerCapaReplyHandler.handleError` — some older servers don't
+    /// support CAPA at all; the driver can proceed with authentication
+    /// without capability information (e.g. plain `USER`/`PASS`) instead
+    /// of a synthesized default capability set silently standing in for a
+    /// real response.
+    fn on_capa_error(
+        &mut self,
+        auth: &mut dyn Pop3ClientAuthorization,
+        ep: &mut dyn Endpoint,
+        message: &str,
+    );
+
     /// CAPA response received after STLS / TLS handshake (PostStls state).
     fn on_capa_post_stls(
         &mut self,
         post_stls: &mut dyn Pop3ClientPostStls,
         ep: &mut dyn Endpoint,
         caps: &Pop3Capabilities,
+    );
+
+    /// CAPA failed (-ERR) after STLS / TLS handshake (PostStls state).
+    fn on_capa_post_stls_error(
+        &mut self,
+        post_stls: &mut dyn Pop3ClientPostStls,
+        ep: &mut dyn Endpoint,
+        message: &str,
     );
 
     // ── USER / PASS / APOP ────────────────────────────────────────────────
@@ -103,6 +124,16 @@ pub trait Pop3ClientDriver: Send {
         challenge: &[u8],
     );
 
+    /// The server's reply to a client-initiated `exchange.abort()` (`*`).
+    /// Fires unconditionally regardless of whether that reply was itself
+    /// positive or negative — matches Gumdrop's
+    /// `ServerAuthAbortHandler.handleAborted(ClientAuthorizationState)`,
+    /// called unconditionally by `dispatchAuthAbortReply` regardless of the
+    /// server's `+OK`/`-ERR`, a distinct third outcome from
+    /// `on_auth_failed`, not routed through it. Same pattern as SMTP's
+    /// `on_auth_aborted`.
+    fn on_auth_aborted(&mut self, auth: &mut dyn Pop3ClientAuthorization, ep: &mut dyn Endpoint);
+
     // ── STLS ─────────────────────────────────────────────────────────────
 
     /// TLS handshake completed after STLS. Must re-issue CAPA.
@@ -130,6 +161,16 @@ pub trait Pop3ClientDriver: Send {
         octets: u64,
     );
 
+    /// STAT failed (-ERR). Matches Gumdrop's `ServerStatReplyHandler.handleError`
+    /// — a recoverable per-command failure, not a connection error: the
+    /// session stays in Transaction state.
+    fn on_stat_error(
+        &mut self,
+        transaction: &mut dyn Pop3ClientTransaction,
+        ep: &mut dyn Endpoint,
+        message: &str,
+    );
+
     // ── LIST ─────────────────────────────────────────────────────────────
 
     /// One entry from a multi-message LIST response.
@@ -153,6 +194,18 @@ pub trait Pop3ClientDriver: Send {
         size: u64,
     );
 
+    /// Multi-message LIST failed (-ERR), for a reason other than a
+    /// specific missing message (that's [`Self::on_no_such_message`], via
+    /// the `LIST n` single-message form). Matches Gumdrop's
+    /// `ServerListReplyHandler.handleError` — recoverable, session stays
+    /// in Transaction state.
+    fn on_list_error(
+        &mut self,
+        transaction: &mut dyn Pop3ClientTransaction,
+        ep: &mut dyn Endpoint,
+        message: &str,
+    );
+
     // ── UIDL ─────────────────────────────────────────────────────────────
 
     /// One entry from a multi-message UIDL response.
@@ -174,12 +227,25 @@ pub trait Pop3ClientDriver: Send {
         uid: &str,
     );
 
+    /// Multi-message UIDL failed (-ERR), for a reason other than a
+    /// specific missing message. Matches Gumdrop's
+    /// `ServerUidlReplyHandler.handleError` — recoverable, session stays
+    /// in Transaction state.
+    fn on_uidl_error(
+        &mut self,
+        transaction: &mut dyn Pop3ClientTransaction,
+        ep: &mut dyn Endpoint,
+        message: &str,
+    );
+
     // ── RETR / TOP ────────────────────────────────────────────────────────
 
     /// A chunk of the message body arrived (called zero or more times).
     ///
     /// For large messages this may be called multiple times per message.
-    fn on_message_content(&mut self, data: &[u8]);
+    /// `ep` lets the driver call `pause_read`/`resume_read` to apply
+    /// backpressure during a large transfer.
+    fn on_message_content(&mut self, data: &[u8], ep: &mut dyn Endpoint);
 
     /// The complete message body has been received.
     ///
@@ -206,8 +272,32 @@ pub trait Pop3ClientDriver: Send {
 
     // ── Error responses ───────────────────────────────────────────────────
 
-    /// Server returned `-ERR` for a per-message command (RETR/TOP/DELE/LIST n/UIDL n).
+    /// Server returned `-ERR` for a per-message command (RETR/TOP/DELE/LIST n/UIDL n),
+    /// for a reason other than the message being deleted / already deleted
+    /// (those are [`Self::on_message_deleted`] / [`Self::on_already_deleted`]).
     fn on_no_such_message(
+        &mut self,
+        transaction: &mut dyn Pop3ClientTransaction,
+        ep: &mut dyn Endpoint,
+        message: &str,
+    );
+
+    /// RETR/TOP failed (-ERR) because the message is already marked
+    /// deleted (server's error text contains "deleted"). Matches Gumdrop's
+    /// `dispatchRetrReply`/`dispatchTopReply`, which text-sniff the -ERR
+    /// message to pick `handleMessageDeleted` over `handleNoSuchMessage`.
+    fn on_message_deleted(
+        &mut self,
+        transaction: &mut dyn Pop3ClientTransaction,
+        ep: &mut dyn Endpoint,
+        message: &str,
+    );
+
+    /// DELE failed (-ERR) because the message was already deleted (server's
+    /// error text contains "already deleted" or "already marked"). Matches
+    /// Gumdrop's `dispatchDeleReply`, which text-sniffs the -ERR message to
+    /// pick `handleAlreadyDeleted` over `handleNoSuchMessage`.
+    fn on_already_deleted(
         &mut self,
         transaction: &mut dyn Pop3ClientTransaction,
         ep: &mut dyn Endpoint,
@@ -223,5 +313,11 @@ pub trait Pop3ClientDriver: Send {
     fn on_timeout(&mut self, ep: &mut dyn Endpoint);
 
     /// Connection closed by peer or after QUIT.
-    fn on_disconnected(&mut self, ep: &mut dyn Endpoint);
+    ///
+    /// `message` is the most recent `-ERR` text seen before the close, if
+    /// any — matches Gumdrop's `ServerReplyHandler.handleServiceClosing`,
+    /// the base interface every per-command handler extends, so whichever
+    /// handler was active when the server closed unexpectedly gets the
+    /// closing text (or `None`).
+    fn on_disconnected(&mut self, ep: &mut dyn Endpoint, message: Option<&str>);
 }

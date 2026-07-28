@@ -299,6 +299,21 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         }
     }
 
+    fn on_capa_error(
+        &mut self,
+        auth: &mut dyn Pop3ClientAuthorization,
+        _ep: &mut dyn Endpoint,
+        _message: &str,
+    ) {
+        // Some servers don't support CAPA at all — fall back to plain
+        // USER/PASS rather than giving up.
+        let caps = Pop3Capabilities { user: true, ..Default::default() };
+        if !self.authenticate(auth, &caps) {
+            self.complete(false);
+            auth.quit();
+        }
+    }
+
     fn on_capa_post_stls(
         &mut self,
         post_stls: &mut dyn Pop3ClientPostStls,
@@ -307,6 +322,19 @@ impl Pop3ClientDriver for Pop3FetchDriver {
     ) {
         let _ = ep;
         if !self.authenticate_post_stls(post_stls, caps) {
+            self.complete(false);
+            post_stls.quit();
+        }
+    }
+
+    fn on_capa_post_stls_error(
+        &mut self,
+        post_stls: &mut dyn Pop3ClientPostStls,
+        _ep: &mut dyn Endpoint,
+        _message: &str,
+    ) {
+        let caps = Pop3Capabilities { user: true, ..Default::default() };
+        if !self.authenticate_post_stls(post_stls, &caps) {
             self.complete(false);
             post_stls.quit();
         }
@@ -338,6 +366,14 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         _ep: &mut dyn Endpoint,
         _message: &str,
     ) {
+        self.complete(false);
+        auth.quit();
+    }
+
+    fn on_auth_aborted(&mut self, auth: &mut dyn Pop3ClientAuthorization, _ep: &mut dyn Endpoint) {
+        // PLAIN never issues its own abort — this only fires if the server
+        // sent an unexpected challenge, which `on_auth_challenge` answers
+        // with `exchange.abort()`. Treat the same as a failed AUTH.
         self.complete(false);
         auth.quit();
     }
@@ -387,6 +423,16 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         transaction.list(None);
     }
 
+    fn on_stat_error(
+        &mut self,
+        transaction: &mut dyn Pop3ClientTransaction,
+        _ep: &mut dyn Endpoint,
+        _message: &str,
+    ) {
+        // Nothing to fetch without a message count — give up gracefully.
+        self.complete(false);
+        transaction.quit();
+    }
 
     fn on_list_entry(&mut self, message: u32, _size: u64) {
         self.state.lock().unwrap().pending.push_back(message);
@@ -411,6 +457,15 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         self.fetch_next(transaction);
     }
 
+    fn on_list_error(
+        &mut self,
+        transaction: &mut dyn Pop3ClientTransaction,
+        _ep: &mut dyn Endpoint,
+        _message: &str,
+    ) {
+        self.complete(false);
+        transaction.quit();
+    }
 
     fn on_uidl_entry(&mut self, _message: u32, _uid: &str) {}
 
@@ -420,6 +475,16 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         _ep: &mut dyn Endpoint,
     ) {
         self.fetch_next(transaction);
+    }
+
+    fn on_uidl_error(
+        &mut self,
+        transaction: &mut dyn Pop3ClientTransaction,
+        _ep: &mut dyn Endpoint,
+        _message: &str,
+    ) {
+        self.complete(false);
+        transaction.quit();
     }
 
     fn on_uidl_single(
@@ -433,7 +498,7 @@ impl Pop3ClientDriver for Pop3FetchDriver {
 
 
 
-    fn on_message_content(&mut self, data: &[u8]) {
+    fn on_message_content(&mut self, data: &[u8], _ep: &mut dyn Endpoint) {
         self.state.lock().unwrap().body_buf.extend_from_slice(data);
     }
 
@@ -498,6 +563,26 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         self.fetch_next(transaction);
     }
 
+    fn on_message_deleted(
+        &mut self,
+        transaction: &mut dyn Pop3ClientTransaction,
+        _ep: &mut dyn Endpoint,
+        _message: &str,
+    ) {
+        // Already deleted — nothing to fetch, move on.
+        self.fetch_next(transaction);
+    }
+
+    fn on_already_deleted(
+        &mut self,
+        transaction: &mut dyn Pop3ClientTransaction,
+        _ep: &mut dyn Endpoint,
+        _message: &str,
+    ) {
+        // DELE's goal (the message gone) is already achieved either way.
+        self.fetch_next(transaction);
+    }
+
 
     fn on_error(&mut self, ep: &mut dyn Endpoint, _err: &io::Error) {
         self.complete(false);
@@ -509,7 +594,7 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         ep.close();
     }
 
-    fn on_disconnected(&mut self, _ep: &mut dyn Endpoint) {
+    fn on_disconnected(&mut self, _ep: &mut dyn Endpoint, _message: Option<&str>) {
         // If we sent QUIT successfully, success flag was already set to true.
         // Otherwise, fire on_complete(false) if it hasn't been called yet.
         let mut st = self.state.lock().unwrap();

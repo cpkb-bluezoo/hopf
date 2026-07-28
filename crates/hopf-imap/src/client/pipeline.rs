@@ -10,9 +10,9 @@ use hopf_core::Endpoint;
 use super::handlers::{ImapClientDriver, ImapClientHandlerFactory, MailboxEventListener};
 use super::reply::ImapStatus;
 use super::state::{
-    ImapCapabilities, ImapClientAppend, ImapClientAuthExchange, ImapClientAuthenticated,
-    ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls, ImapClientSelected,
-    ImapFetchData, ImapMailboxInfo,
+    ImapAppendUid, ImapCapabilities, ImapClientAppend, ImapClientAuthExchange,
+    ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls,
+    ImapClientSelected, ImapFetchData, ImapMailboxInfo,
 };
 
 struct ImapFetchState {
@@ -178,6 +178,7 @@ impl ImapClientDriver for ImapFetchDriver {
         _ep: &mut dyn Endpoint,
         _text: &str,
         _preauth: bool,
+        _caps: &ImapCapabilities,
     ) {
         auth.capability();
     }
@@ -227,6 +228,7 @@ impl ImapClientDriver for ImapFetchDriver {
         &mut self,
         session: &mut dyn ImapClientAuthenticated,
         _ep: &mut dyn Endpoint,
+        _caps: &ImapCapabilities,
     ) {
         let mailbox = self.state.lock().unwrap().mailbox.clone();
         session.select(&mailbox);
@@ -328,6 +330,7 @@ impl ImapClientDriver for ImapFetchDriver {
         _session: &mut dyn ImapClientAuthenticated,
         _ep: &mut dyn Endpoint,
         _status: ImapStatus,
+        _appenduid: Option<&ImapAppendUid>,
         _message: &str,
     ) {
     }
@@ -511,6 +514,7 @@ impl ImapClientDriver for ImapIdleDriver {
         _ep: &mut dyn Endpoint,
         _text: &str,
         _preauth: bool,
+        _caps: &ImapCapabilities,
     ) {
         auth.capability();
     }
@@ -556,6 +560,7 @@ impl ImapClientDriver for ImapIdleDriver {
         &mut self,
         session: &mut dyn ImapClientAuthenticated,
         _ep: &mut dyn Endpoint,
+        _caps: &ImapCapabilities,
     ) {
         let mailbox = self.state.lock().unwrap().mailbox.clone();
         session.select(&mailbox);
@@ -662,6 +667,7 @@ impl ImapClientDriver for ImapIdleDriver {
         _session: &mut dyn ImapClientAuthenticated,
         _ep: &mut dyn Endpoint,
         _status: ImapStatus,
+        _appenduid: Option<&ImapAppendUid>,
         _message: &str,
     ) {
     }

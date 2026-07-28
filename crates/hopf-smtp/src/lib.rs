@@ -17,9 +17,9 @@ pub mod client;
 mod server;
 
 pub use client::{
-    dot_stuff, SmtpCapabilities, SmtpClient, SmtpClientDriver, SmtpClientEndpoint, SmtpEvent,
-    SmtpClientHandlerFactory, SmtpClientTimeouts, SmtpError, SmtpReplyLexer, SmtpReplyShape,
-    SmtpResult, SmtpSend, MAX_REPLY_LINE,
+    dot_stuff, MailFromParams, SmtpCapabilities, SmtpClient, SmtpClientDriver, SmtpClientEndpoint,
+    SmtpEvent, SmtpClientHandlerFactory, SmtpClientTimeouts, SmtpError, SmtpReplyLexer,
+    SmtpReplyShape, SmtpResult, SmtpSend, MAX_REPLY_LINE,
 };
 pub use server::{
     parse_mail_from_arg, parse_rcpt_to_arg, reply, reply_ehlo, reply_enhanced, reply_multiline,

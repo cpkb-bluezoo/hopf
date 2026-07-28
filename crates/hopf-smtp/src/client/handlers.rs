@@ -102,6 +102,15 @@ pub trait SmtpClientDriver: Send {
     /// `handleAuthFailed`/`handleMechanismNotSupported`/`handleTemporaryFailure`.
     fn on_auth_failed(&mut self, session: &mut dyn SmtpClientSession, ep: &mut dyn Endpoint, code: u16);
 
+    /// The server's reply to a client-initiated `exchange.abort()` (`*`).
+    /// Fires unconditionally regardless of whether that reply was itself
+    /// positive or negative — matching Gumdrop's
+    /// `ServerAuthAbortHandler.handleAborted`, which is a distinct third
+    /// outcome from `handleAuthFailed`/`on_auth_failed`, not routed through
+    /// it. The driver can continue without authentication or try a
+    /// different mechanism.
+    fn on_auth_aborted(&mut self, session: &mut dyn SmtpClientSession, ep: &mut dyn Endpoint);
+
     // ── MAIL FROM ──────────────────────────────────────────────────────────
 
     /// 250 MAIL FROM accepted.
@@ -144,6 +153,23 @@ pub trait SmtpClientDriver: Send {
     /// `data.end_message()`.
     fn on_ready_for_data(&mut self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint);
 
+    /// DATA command itself rejected (4xx/5xx), before any content was
+    /// sent. Per RFC 5321 §3.3, the envelope (MAIL FROM, accepted RCPT
+    /// TOs) is unaffected — `envelope` lets the driver add more
+    /// recipients, retry `start_data()`, or `rset()`. `code` lets the
+    /// driver distinguish a temporary (4xx, matching Gumdrop's
+    /// `ServerDataReplyHandler.handleTemporaryFailure`, which hands back
+    /// `ClientEnvelopeReady`) from a permanent (5xx, `handlePermanentFailure`)
+    /// rejection; hopf hands back the envelope either way since it costs
+    /// nothing and the driver is free to ignore it and `quit()`.
+    fn on_data_rejected(
+        &mut self,
+        envelope: &mut dyn SmtpClientEnvelope,
+        ep: &mut dyn Endpoint,
+        code: u16,
+        message: &str,
+    );
+
     /// 250 — message accepted for delivery.
     ///
     /// `queue_id` is the server's queue identifier if parseable.
@@ -167,6 +193,49 @@ pub trait SmtpClientDriver: Send {
 
     /// 250 RSET accepted.
     fn on_rset_ok(&mut self, session: &mut dyn SmtpClientSession, ep: &mut dyn Endpoint);
+
+    // ── VRFY ───────────────────────────────────────────────────────────────
+
+    /// 250/251/252 — VRFY succeeded. `code` distinguishes a fully verified
+    /// mailbox (250) from one that will be forwarded (251) or merely
+    /// accepted without verification (252); `text` is the resolved-mailbox
+    /// text the server returned.
+    fn on_vrfy_ok(
+        &mut self,
+        session: &mut dyn SmtpClientSession,
+        ep: &mut dyn Endpoint,
+        code: u16,
+        text: &str,
+    );
+
+    /// VRFY failed (5xx, or 502/504 if VRFY itself isn't implemented).
+    fn on_vrfy_failed(
+        &mut self,
+        session: &mut dyn SmtpClientSession,
+        ep: &mut dyn Endpoint,
+        code: u16,
+        message: &str,
+    );
+
+    // ── EXPN ───────────────────────────────────────────────────────────────
+
+    /// 250 — EXPN succeeded; `members` is the expanded mailing-list
+    /// membership, one entry per reply line.
+    fn on_expn_ok(
+        &mut self,
+        session: &mut dyn SmtpClientSession,
+        ep: &mut dyn Endpoint,
+        members: &[String],
+    );
+
+    /// EXPN failed (5xx, or 502/504 if EXPN itself isn't implemented).
+    fn on_expn_failed(
+        &mut self,
+        session: &mut dyn SmtpClientSession,
+        ep: &mut dyn Endpoint,
+        code: u16,
+        message: &str,
+    );
 
     // ── Lifecycle ──────────────────────────────────────────────────────────
 
