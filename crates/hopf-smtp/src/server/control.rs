@@ -5,7 +5,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use base64::Engine;
 use rmimeparser::{EmailAddress, EmailAddressParser};
 use hopf_auth::{IdentityMaterial, PeerContext, TrustDecision};
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler};
@@ -49,7 +48,6 @@ pub struct SmtpControlHandler {
     unstuffer: DotUnstuffer,
     bdat: Option<BdatAccumulator>,
     bdat_started: bool,
-    auth_waiting: bool,
     helo_name: Option<String>,
     extended: bool,
     expect_implicit_tls: bool,
@@ -101,7 +99,6 @@ impl SmtpControlHandler {
             unstuffer: DotUnstuffer::new(),
             bdat: None,
             bdat_started: false,
-            auth_waiting: false,
             helo_name: None,
             extended: false,
             leftover: Vec::new(),
@@ -236,35 +233,25 @@ impl SmtpControlHandler {
     }
 
     fn dispatch(&mut self, endpoint: &mut dyn Endpoint, cmd: SmtpCommand) {
-        if self.auth_waiting {
-            self.cmd_auth_continuation(endpoint, &cmd.arg_lossy());
-            // AUTH continuation is a raw base64 line — verb may be the base64.
-            // Actually the lexer uppercases the verb; base64 may get mangled.
-            // Handle via full line reconstruction:
-            return;
-        }
-        let verb = cmd.verb.as_str();
-        let arg = cmd.arg_lossy();
-        let arg = arg.trim();
-        match verb {
-            "HELO" => self.cmd_helo(endpoint, arg, false),
-            "EHLO" => self.cmd_helo(endpoint, arg, true),
-            "MAIL" => self.cmd_mail(endpoint, arg),
-            "RCPT" => self.cmd_rcpt(endpoint, arg),
-            "DATA" => self.cmd_data(endpoint),
-            "BDAT" => self.cmd_bdat(endpoint, arg),
-            "RSET" => self.cmd_rset(endpoint),
-            "QUIT" => self.cmd_quit(endpoint),
-            "NOOP" => self.send_enhanced(endpoint, 250, "2.0.0", "OK"),
-            "HELP" => self.cmd_help(endpoint, arg),
-            "VRFY" => self.send_enhanced(
+        match cmd {
+            SmtpCommand::Helo(hostname) => self.cmd_helo(endpoint, &hostname, false),
+            SmtpCommand::Ehlo(hostname) => self.cmd_helo(endpoint, &hostname, true),
+            SmtpCommand::Mail(arg) => self.cmd_mail(endpoint, arg.trim()),
+            SmtpCommand::Rcpt(arg) => self.cmd_rcpt(endpoint, arg.trim()),
+            SmtpCommand::Data => self.cmd_data(endpoint),
+            SmtpCommand::Bdat(arg) => self.cmd_bdat(endpoint, &arg),
+            SmtpCommand::Rset => self.cmd_rset(endpoint),
+            SmtpCommand::Quit => self.cmd_quit(endpoint),
+            SmtpCommand::Noop => self.send_enhanced(endpoint, 250, "2.0.0", "OK"),
+            SmtpCommand::Help => self.cmd_help(endpoint),
+            SmtpCommand::Vrfy => self.send_enhanced(
                 endpoint,
                 252,
                 "2.0.0",
                 "Cannot VRFY user, but will accept message and attempt delivery",
             ),
-            "EXPN" => self.send_enhanced(endpoint, 502, "5.5.1", "EXPN not implemented"),
-            "ETRN" => {
+            SmtpCommand::Expn => self.send_enhanced(endpoint, 502, "5.5.1", "EXPN not implemented"),
+            SmtpCommand::Etrn => {
                 if self.extended {
                     self.send_enhanced(
                         endpoint,
@@ -276,10 +263,26 @@ impl SmtpControlHandler {
                     self.send_enhanced(endpoint, 502, "5.5.1", "ETRN requires EHLO");
                 }
             }
-            "STARTTLS" => self.cmd_starttls(endpoint),
-            "AUTH" => self.cmd_auth(endpoint, arg),
-            "XCLIENT" => self.send_enhanced(endpoint, 550, "5.7.0", "XCLIENT not permitted"),
-            _ => self.send_enhanced(endpoint, 500, "5.5.2", "Command unrecognized"),
+            SmtpCommand::Starttls => self.cmd_starttls(endpoint),
+            SmtpCommand::Auth { mechanism, initial_response } => {
+                self.cmd_auth(endpoint, &mechanism, initial_response)
+            }
+            SmtpCommand::SaslResponse(data) => self.finish_auth_plain(endpoint, data),
+            SmtpCommand::SaslAbort => {
+                self.send_enhanced(endpoint, 501, "5.0.0", "Authentication cancelled");
+            }
+            SmtpCommand::SaslResponseInvalid => {
+                SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
+                self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
+            }
+            SmtpCommand::Xclient => self.send_enhanced(endpoint, 550, "5.7.0", "XCLIENT not permitted"),
+            SmtpCommand::Malformed { .. } => {
+                SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
+                self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
+            }
+            SmtpCommand::Unknown { .. } => {
+                self.send_enhanced(endpoint, 500, "5.5.2", "Command unrecognized");
+            }
         }
     }
 
@@ -743,7 +746,7 @@ impl SmtpControlHandler {
         endpoint.close();
     }
 
-    fn cmd_help(&mut self, endpoint: &mut dyn Endpoint, _arg: &str) {
+    fn cmd_help(&mut self, endpoint: &mut dyn Endpoint) {
         self.send(
             endpoint,
             reply_multiline(
@@ -778,7 +781,7 @@ impl SmtpControlHandler {
         // Keep hello handler for post-TLS EHLO.
     }
 
-    fn cmd_auth(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
+    fn cmd_auth(&mut self, endpoint: &mut dyn Endpoint, mechanism: &str, initial_response: Option<Vec<u8>>) {
         if self.config.policy.is_none() {
             self.send_enhanced(endpoint, 502, "5.5.1", "AUTH not available");
             return;
@@ -787,42 +790,23 @@ impl SmtpControlHandler {
             self.send_enhanced(endpoint, 538, "5.7.11", "Encryption required for requested authentication mechanism");
             return;
         }
-        let mut parts = arg.splitn(2, char::is_whitespace);
-        let mech = parts.next().unwrap_or("").to_ascii_uppercase();
-        let initial = parts.next().map(str::trim).filter(|s| !s.is_empty());
-        if mech != "PLAIN" {
+        if !mechanism.eq_ignore_ascii_case("PLAIN") {
             self.send_enhanced(endpoint, 504, "5.5.4", "Unrecognized authentication type");
             return;
         }
-        match initial {
-            Some("=") | None => {
-                self.auth_waiting = true;
+        match initial_response {
+            None => {
                 self.send_reply(endpoint, 334, "");
+                self.lexer.expect_sasl_response();
             }
-            Some(b64) => self.finish_auth_plain(endpoint, b64),
+            // RFC 4954 §4 — a bare "=" is an explicit *empty* initial
+            // response (present, not absent), fed straight into the
+            // mechanism rather than prompting for a continuation line.
+            Some(data) => self.finish_auth_plain(endpoint, data),
         }
     }
 
-    fn cmd_auth_continuation(&mut self, endpoint: &mut dyn Endpoint, line: &str) {
-        // When auth_waiting, receive() should feed raw lines. Here `line` is arg of
-        // a mis-parsed command — use verb+arg reconstruction in receive instead.
-        let _ = (endpoint, line);
-    }
-
-    fn finish_auth_plain(&mut self, endpoint: &mut dyn Endpoint, b64: &str) {
-        self.auth_waiting = false;
-        if b64 == "*" {
-            self.send_enhanced(endpoint, 501, "5.0.0", "Authentication cancelled");
-            return;
-        }
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
-            Ok(d) => d,
-            Err(_) => {
-                SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
-                self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
-                return;
-            }
-        };
+    fn finish_auth_plain(&mut self, endpoint: &mut dyn Endpoint, decoded: Vec<u8>) {
         // AUTH PLAIN: [authzid] \0 authcid \0 passwd
         let parts: Vec<&[u8]> = decoded.split(|&b| b == 0).collect();
         if parts.len() < 3 {
@@ -912,20 +896,9 @@ impl SmtpControlHandler {
                 }
             }
             _ => {
-                if self.auth_waiting {
-                    // Read one line as AUTH response.
-                    if let Some(pos) = data.windows(2).position(|w| w == b"\r\n") {
-                        let line = &data[..pos];
-                        let rest = &data[pos + 2..];
-                        let b64 = String::from_utf8_lossy(line).into_owned();
-                        *data = rest;
-                        self.finish_auth_plain(endpoint, &b64);
-                        if !data.is_empty() {
-                            self.receive_inner(endpoint, data);
-                        }
-                    }
-                    return;
-                }
+                // SASL continuation lines are read by the same lexer, in
+                // raw-line mode — see `SmtpServerLexer::expect_sasl_response`,
+                // armed by `cmd_auth` right after the `334` challenge is sent.
                 let cmds = self.lexer.feed(data);
                 for cmd in cmds {
                     self.dispatch(endpoint, cmd);
