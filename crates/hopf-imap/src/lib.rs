@@ -21,15 +21,15 @@ pub mod server;
 mod integration;
 
 pub use client::{
-    classify_untagged, pipeline_status_and_list, trailing_literal_size, ImapCapabilities,
-    ImapClient, ImapClientAppend, ImapClientAuthExchange, ImapClientAuthenticated,
-    ImapClientDriver, ImapClientEndpoint, ImapClientHandlerFactory, ImapClientIdle,
-    ImapClientNotAuthenticated, ImapClientPostStarttls, ImapClientSelected, ImapClientTimeouts,
-    ImapCopyUid, ImapEnabledFeatures, ImapError, ImapFetch, ImapFetchData, ImapIdle, ImapListEntry,
-    ImapMailboxInfo, ImapNamespace, ImapNamespaceData, ImapQuotaData, ImapQuotaResource,
-    ImapQuotaRootData, ImapReplyLexer, ImapResult, ImapStatus, ImapStatusData, ImapTagGenerator,
-    ImapWireEvent, MailboxEventListener, NopMailboxEventListener, PendingCommand, PendingKind,
-    PendingMap, Tag, UntaggedClass, DEFAULT_MAX_PIPELINE, MAX_REPLY_LINE,
+    pipeline_status_and_list, ImapCapabilities, ImapClient, ImapClientAppend,
+    ImapClientAuthExchange, ImapClientAuthenticated, ImapClientDriver, ImapClientEndpoint,
+    ImapClientHandlerFactory, ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls,
+    ImapClientSelected, ImapClientTimeouts, ImapCopyUid, ImapEnabledFeatures, ImapError, ImapEvent,
+    ImapFetch, ImapFetchData, ImapIdle, ImapListEntry, ImapMailboxInfo, ImapNamespace,
+    ImapNamespaceData, ImapQuotaData, ImapQuotaResource, ImapQuotaRootData, ImapReplyLexer,
+    ImapResult, ImapStatus, ImapStatusData, ImapTagGenerator, MailboxEventListener,
+    NopMailboxEventListener, PendingCommand, PendingKind, PendingMap, Tag, UntaggedClass,
+    DEFAULT_MAX_PIPELINE, MAX_TOKEN,
 };
 pub use enable::{parse_enable_args, EnabledExtensions};
 pub use server::*;

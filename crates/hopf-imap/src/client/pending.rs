@@ -2,10 +2,13 @@
 
 //! Tag generator and pending-command map for pipelined IMAP.
 //!
-//! Untagged data is classified by prefix and routed to the **oldest** pending
-//! command of a compatible [`PendingKind`]. There is no global-exclusive body
-//! consumer, so pipelined `STATUS` + `LIST` (and similar) correlate correctly
-//! even when replies arrive interleaved or out of tag order.
+//! Untagged data arrives from [`super::reply::ImapReplyLexer`] already typed
+//! (an [`super::reply::ImapEvent`] variant, not raw text) and is routed to
+//! the **oldest** pending command of a compatible [`PendingKind`] — see
+//! [`PendingKind::accepts`] and [`UntaggedClass`]. There is no
+//! global-exclusive body consumer, so pipelined `STATUS` + `LIST` (and
+//! similar) correlate correctly even when replies arrive interleaved or out
+//! of tag order.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -158,57 +161,6 @@ pub enum UntaggedClass {
     Other,
 }
 
-/// Classify an untagged payload line (text after `* `).
-pub fn classify_untagged(raw: &str) -> UntaggedClass {
-    let upper = raw.to_ascii_uppercase();
-    if upper.starts_with("CAPABILITY") {
-        return UntaggedClass::Capability;
-    }
-    if upper.starts_with("LIST ") || upper.starts_with("LSUB ") {
-        return UntaggedClass::List;
-    }
-    if upper.starts_with("STATUS ") {
-        return UntaggedClass::Status;
-    }
-    if upper.starts_with("SEARCH") {
-        return UntaggedClass::Search;
-    }
-    if upper.starts_with("ENABLED") {
-        return UntaggedClass::Enabled;
-    }
-    if upper.starts_with("NAMESPACE") {
-        return UntaggedClass::Namespace;
-    }
-    if upper.starts_with("ID ") || upper == "ID" || upper.starts_with("ID(") {
-        return UntaggedClass::Id;
-    }
-    if upper.starts_with("QUOTAROOT ") {
-        return UntaggedClass::QuotaRoot;
-    }
-    if upper.starts_with("QUOTA ") {
-        return UntaggedClass::Quota;
-    }
-    if upper.starts_with("FLAGS ") {
-        return UntaggedClass::FlagsList;
-    }
-    if let Some((_, kind)) = parse_number_atom_local(raw) {
-        return match kind.as_str() {
-            "EXISTS" => UntaggedClass::Exists,
-            "RECENT" => UntaggedClass::Recent,
-            "EXPUNGE" => UntaggedClass::Expunge,
-            "FETCH" => UntaggedClass::Fetch,
-            _ => UntaggedClass::Other,
-        };
-    }
-    UntaggedClass::Other
-}
-
-fn parse_number_atom_local(raw: &str) -> Option<(u32, String)> {
-    let mut parts = raw.split_whitespace();
-    let n: u32 = parts.next()?.parse().ok()?;
-    let kind = parts.next()?.to_ascii_uppercase();
-    Some((n, kind))
-}
 
 /// One in-flight tagged command.
 pub struct PendingCommand {
@@ -540,27 +492,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn classify_prefixes() {
-        assert_eq!(
-            classify_untagged("STATUS INBOX (MESSAGES 1)"),
-            UntaggedClass::Status
-        );
-        assert_eq!(
-            classify_untagged("LIST (\\Noselect) \"/\" INBOX"),
-            UntaggedClass::List
-        );
-        assert_eq!(classify_untagged("SEARCH 1 2 3"), UntaggedClass::Search);
-        assert_eq!(classify_untagged("3 EXISTS"), UntaggedClass::Exists);
-        assert_eq!(
-            classify_untagged("1 FETCH (FLAGS (\\Seen))"),
-            UntaggedClass::Fetch
-        );
-        assert_eq!(
-            classify_untagged("ENABLED CONDSTORE"),
-            UntaggedClass::Enabled
-        );
-    }
 
     #[test]
     fn unknown_tag_returns_none() {

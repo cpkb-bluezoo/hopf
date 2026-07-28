@@ -20,9 +20,9 @@ use hopf_mailbox::{MailboxFactory, MaildirFactory};
 use crate::client::pipeline_status_and_list;
 use crate::{
     ImapCapabilities, ImapClient, ImapClientAppend, ImapClientAuthExchange,
-    ImapClientAuthenticated, ImapClientDriver, ImapClientHandlerFactory,
-    ImapClientNotAuthenticated, ImapClientSelected, ImapClientTimeouts, ImapConfig, ImapFetch,
-    ImapIdle, ImapMailboxInfo, ImapService, ImapStatus, ImapStatusData, MailboxEventListener,
+    ImapClientAuthenticated, ImapClientDriver, ImapClientHandlerFactory, ImapClientNotAuthenticated,
+    ImapClientSelected, ImapClientTimeouts, ImapConfig, ImapFetch, ImapIdle, ImapListEntry,
+    ImapMailboxInfo, ImapService, ImapStatus, ImapStatusData, MailboxEventListener,
 };
 
 const MESSAGE: &[u8] = b"From: a@b\r\nSubject: hi\r\n\r\nhello imap\r\n";
@@ -433,7 +433,7 @@ fn client_implicit_tls_fetch() {
 #[derive(Default)]
 struct PipelineState {
     status: Option<ImapStatusData>,
-    list_lines: Vec<String>,
+    list_names: Vec<String>,
     status_done: bool,
     list_done: bool,
     done: Option<bool>,
@@ -532,7 +532,6 @@ impl ImapClientDriver for PipelineDriver {
     ) {
     }
 
-    fn on_fetch_line(&mut self, _line: &str) {}
     fn on_fetch_literal(&mut self, _data: &[u8]) {}
 
     fn on_fetch_complete(
@@ -548,8 +547,8 @@ impl ImapClientDriver for PipelineDriver {
         self.state.lock().unwrap().status = Some(data.clone());
     }
 
-    fn on_list_line(&mut self, line: &str) {
-        self.state.lock().unwrap().list_lines.push(line.to_string());
+    fn on_list_entry(&mut self, entry: &ImapListEntry) {
+        self.state.lock().unwrap().list_names.push(entry.name.clone());
     }
 
     fn on_status_complete(
@@ -643,9 +642,9 @@ fn client_pipelined_status_list_real_server() {
     assert_eq!(status.mailbox, "INBOX");
     assert_eq!(status.messages, Some(1));
     assert!(
-        st.list_lines.iter().any(|l| l.contains("INBOX")),
-        "list lines: {:?}",
-        st.list_lines
+        st.list_names.iter().any(|n| n.contains("INBOX")),
+        "list names: {:?}",
+        st.list_names
     );
 }
 
@@ -742,7 +741,7 @@ fn client_pipelined_out_of_order_scripted() {
     let status = st.status.as_ref().expect("status data");
     assert_eq!(status.messages, Some(7));
     assert_eq!(status.uid_next, Some(9));
-    assert!(st.list_lines.iter().any(|l| l.contains("INBOX")));
+    assert!(st.list_names.iter().any(|n| n.contains("INBOX")));
     drop(rt);
 }
 

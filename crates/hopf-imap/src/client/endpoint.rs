@@ -3,9 +3,10 @@
 //! `ImapClientEndpoint` — async IMAP client as a [`ProtocolHandler`].
 //!
 //! Correlates pipelined tagged replies via [`PendingMap`], routes untagged
-//! lines by [`classify_untagged`] to the oldest compatible pending command,
-//! and delivers unsolicited EXISTS / EXPUNGE / FLAGS to
-//! [`MailboxEventListener`] (including during active IDLE).
+//! responses (now already-typed [`ImapEvent`] variants, not raw text) to
+//! the oldest compatible pending command, and delivers unsolicited EXISTS /
+//! EXPUNGE / FLAGS to [`MailboxEventListener`] (including during active
+//! IDLE).
 
 use std::io;
 use std::time::Duration;
@@ -14,10 +15,8 @@ use base64::Engine;
 use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
 
 use super::handlers::{ImapClientDriver, ImapClientHandlerFactory};
-use super::pending::{
-    classify_untagged, ImapTagGenerator, PendingCommand, PendingKind, PendingMap, UntaggedClass,
-};
-use super::reply::{ImapReplyLexer, ImapStatus, ImapWireEvent};
+use super::pending::{ImapTagGenerator, PendingCommand, PendingKind, PendingMap, UntaggedClass};
+use super::reply::{ImapEvent, ImapReplyLexer, ImapStatus};
 use super::state::{
     ImapCapabilities, ImapClientAppend, ImapClientAuthExchange, ImapClientAuthenticated,
     ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls, ImapClientSelected,
@@ -61,10 +60,8 @@ pub struct ImapClientEndpoint {
     outbound: Vec<u8>,
     /// SELECT / EXAMINE accumulator.
     select_info: ImapMailboxInfo,
-    /// CAPABILITY tokens accumulated from untagged lines.
-    capa_buf: Vec<String>,
-    /// Simple FETCH body accumulator for the current body owner.
-    fetch_accum: ImapFetchData,
+    /// Untagged `CAPABILITY` seen mid-command, consumed at tagged completion.
+    capa_buf: Option<ImapCapabilities>,
     /// APPEND payload waiting for `+` (when not using LITERAL-).
     append_pending_data: Option<Vec<u8>>,
     /// When true, next APPEND data is flushed immediately after command (LITERAL-).
@@ -73,8 +70,6 @@ pub struct ImapClientEndpoint {
     pending_issue_error: Option<String>,
     /// Last COPYUID seen for MOVE/COPY completion.
     last_copyuid: Option<ImapCopyUid>,
-    /// ENABLE tokens from untagged ENABLED this round.
-    enable_buf: Vec<String>,
     /// Selected before IDLE (restored on DONE completion).
     was_selected: bool,
 }
@@ -110,13 +105,11 @@ impl ImapClientEndpoint {
             message_timer: None,
             outbound: Vec::with_capacity(512),
             select_info: ImapMailboxInfo::default(),
-            capa_buf: Vec::new(),
-            fetch_accum: ImapFetchData::default(),
+            capa_buf: None,
             append_pending_data: None,
             append_literal_minus: false,
             pending_issue_error: None,
             last_copyuid: None,
-            enable_buf: Vec::new(),
             was_selected: false,
         }
     }
@@ -315,418 +308,265 @@ impl ImapClientEndpoint {
 
     // ── Event dispatch ────────────────────────────────────────────────────
 
-    fn dispatch(&mut self, event: ImapWireEvent, ep: &mut dyn Endpoint) {
+    fn dispatch(&mut self, event: ImapEvent, ep: &mut dyn Endpoint) {
         match event {
-            ImapWireEvent::Untagged {
-                status,
-                response_code,
-                text,
-                raw,
-            } => self.on_untagged(status, response_code, text, raw, ep),
-            ImapWireEvent::Continuation { text } => self.on_continuation(text, ep),
-            ImapWireEvent::Tagged {
-                tag,
-                status,
-                response_code,
-                message,
-            } => self.on_tagged(tag, status, response_code, message, ep),
-            ImapWireEvent::LiteralData(data) => self.on_literal_data(data, ep),
-            ImapWireEvent::LiteralComplete => {
-                self.cancel_message_timer();
-                self.on_literal_complete();
+            ImapEvent::Continuation { text } => self.on_continuation(text, ep),
+            ImapEvent::Tagged { tag, status, code, message } => {
+                self.on_tagged(tag, status, code, message, ep)
             }
-            ImapWireEvent::Residual(text) => self.on_residual(text, ep),
+            ImapEvent::UntaggedOk { code, text } => self.on_untagged_ok(code, text, ep),
+            ImapEvent::UntaggedNo { code, text } => {
+                self.apply_status_code_if_present(code.as_deref());
+                let _ = text;
+            }
+            ImapEvent::UntaggedBad { code, text } => {
+                self.apply_status_code_if_present(code.as_deref());
+                let _ = text;
+            }
+            ImapEvent::Bye { text, .. } => self.on_bye(text, ep),
+            ImapEvent::Preauth { .. } => self.on_preauth(ep),
+            ImapEvent::Capability(caps) => self.capa_buf = Some(caps),
+            ImapEvent::ListEntry(entry) => self.on_list_entry(entry, ep),
+            ImapEvent::StatusData(data) => self.on_status_data(data, ep),
+            ImapEvent::SearchNumbers(nums) => self.on_search_numbers(nums, ep),
+            ImapEvent::Exists(n) => self.on_exists(n, ep),
+            ImapEvent::Recent(n) => self.on_recent(n, ep),
+            ImapEvent::Expunge(n) => self.on_expunge(n, ep),
+            ImapEvent::FlagsList(flags) => self.select_info.flags = flags,
+            ImapEvent::Fetch(data) => self.on_fetch(data, ep),
+            ImapEvent::FetchLiteralData(data) => self.on_literal_data(data, ep),
+            ImapEvent::FetchLiteralComplete => self.cancel_message_timer(),
+            ImapEvent::Enabled(tokens) => self.on_enabled(tokens, ep),
+            ImapEvent::Namespace(payload) => self.on_namespace(&payload, ep),
+            ImapEvent::Quota(payload) => self.on_quota(&payload, ep),
+            ImapEvent::QuotaRoot(payload) => self.on_quota_root(&payload, ep),
+            ImapEvent::IdParams(payload) => self.on_id_params(&payload, ep),
+            ImapEvent::Other => {}
         }
     }
 
-    fn on_untagged(
-        &mut self,
-        status: Option<ImapStatus>,
-        response_code: Option<String>,
-        text: String,
-        raw: String,
-        ep: &mut dyn Endpoint,
-    ) {
+    /// Apply a mid-session untagged `NO`/`BAD` response code the same way
+    /// `OK` codes are (e.g. a `[COPYUID …]` can in principle ride any
+    /// status). Greeting handling only ever sees `OK`/`PREAUTH`/`BYE` per
+    /// RFC 9051, so `NO`/`BAD` never occur during `Connecting`.
+    fn apply_status_code_if_present(&mut self, code: Option<&str>) {
+        if let Some(c) = code {
+            self.apply_untagged_status_code(c);
+        }
+    }
+
+    fn apply_untagged_status_code(&mut self, code: &str) {
+        let cu = code.to_ascii_uppercase();
+        if cu.starts_with("COPYUID ") {
+            self.last_copyuid = ImapCopyUid::parse(code);
+        } else if let Some(v) = cu.strip_prefix("UIDVALIDITY ") {
+            self.select_info.uid_validity = v.trim().parse().ok();
+        } else if let Some(v) = cu.strip_prefix("UIDNEXT ") {
+            self.select_info.uid_next = v.trim().parse().ok();
+        } else if let Some(v) = cu.strip_prefix("UNSEEN ") {
+            self.select_info.unseen = v.trim().parse().ok();
+        } else if let Some(v) = cu.strip_prefix("HIGHESTMODSEQ ") {
+            self.select_info.highest_modseq = v.trim().parse().ok();
+        } else if cu.starts_with("PERMANENTFLAGS") {
+            let rest = code.get("PERMANENTFLAGS".len()..).unwrap_or("").trim_start();
+            self.select_info.permanent_flags = parse_flag_list(rest);
+        } else if cu == "READ-WRITE" {
+            self.select_info.read_write = Some(true);
+        } else if cu == "READ-ONLY" {
+            self.select_info.read_write = Some(false);
+        }
+    }
+
+    fn on_untagged_ok(&mut self, code: Option<String>, text: String, ep: &mut dyn Endpoint) {
         if self.session == SessionState::Connecting {
             self.cancel_greeting_timer();
-            let head = raw.to_ascii_uppercase();
-            if head.starts_with("BYE") {
-                self.protocol_error(ep, format!("IMAP greeting BYE: {text}"));
-                return;
-            }
-            let preauth = head.starts_with("PREAUTH");
-            self.session = if preauth {
-                SessionState::Authenticated
-            } else {
-                SessionState::NotAuthenticated
-            };
+            self.session = SessionState::NotAuthenticated;
             let mut driver = match self.driver.take() {
                 Some(d) => d,
                 None => return,
             };
-            if preauth {
-                driver.on_authenticated(self, ep);
-            } else {
-                driver.on_greeting(self, ep, &text, false);
-            }
+            driver.on_greeting(self, ep, &text, false);
             self.driver = Some(driver);
             return;
         }
-
-        let class = classify_untagged(&raw);
-
-        // CAPABILITY always accumulates when present.
-        if class == UntaggedClass::Capability {
-            let rest = raw
-                .get("CAPABILITY".len()..)
-                .unwrap_or("")
-                .trim_start_matches(|c: char| c == ' ' || c == '\t');
-            self.capa_buf.clear();
-            for t in rest.split_whitespace() {
-                self.capa_buf.push(t.to_ascii_uppercase());
-            }
-            return;
-        }
-
-        // Prefer pending-command consumers by class (oldest compatible).
-        match class {
-            UntaggedClass::List => {
-                if self.pending.oldest_compatible(class).is_some() {
-                    if let Some(entry) = ImapListEntry::parse(&raw) {
-                        if let Some(mut driver) = self.driver.take() {
-                            driver.on_list_line(&raw);
-                            driver.on_list_entry(&entry);
-                            self.driver = Some(driver);
-                        }
-                    } else if let Some(mut driver) = self.driver.take() {
-                        driver.on_list_line(&raw);
-                        self.driver = Some(driver);
-                    }
-                    return;
-                }
-            }
-            UntaggedClass::Status => {
-                if self.pending.oldest_compatible(class).is_some() {
-                    if let Some(mut driver) = self.driver.take() {
-                        driver.on_status_line(&raw);
-                        if let Some(data) = ImapStatusData::parse(&raw) {
-                            driver.on_status_data(&data);
-                        }
-                        self.driver = Some(driver);
-                    }
-                    return;
-                }
-            }
-            UntaggedClass::Search => {
-                if self.pending.oldest_compatible(class).is_some() {
-                    let nums = parse_search_numbers(&raw);
-                    if let Some(mut driver) = self.driver.take() {
-                        driver.on_search_numbers(&nums);
-                        self.driver = Some(driver);
-                    }
-                    return;
-                }
-            }
-            UntaggedClass::Fetch => {
-                self.route_fetch_classified(&raw, ep);
-                return;
-            }
-            UntaggedClass::Exists | UntaggedClass::Recent | UntaggedClass::FlagsList => {
-                if self
-                    .pending
-                    .oldest_compatible(class)
-                    .map(|c| matches!(c.kind, PendingKind::Select | PendingKind::Examine))
-                    == Some(true)
-                {
-                    self.collect_select_untagged(&raw, response_code.as_deref(), status);
-                    return;
-                }
-                if self.route_mailbox_event(&raw, ep) {
-                    return;
-                }
-            }
-            UntaggedClass::Expunge => {
-                if self.pending.oldest_of_kind(PendingKind::Expunge).is_some() {
-                    if let Some((n, _)) = parse_number_atom(&raw) {
-                        if let Some(mut driver) = self.driver.take() {
-                            driver.on_expunge_seq(n);
-                            self.driver = Some(driver);
-                        }
-                    }
-                    return;
-                }
-                if self.route_mailbox_event(&raw, ep) {
-                    return;
-                }
-            }
-            UntaggedClass::Enabled => {
-                if self.pending.oldest_of_kind(PendingKind::Enable).is_some() {
-                    let rest = raw
-                        .get("ENABLED".len()..)
-                        .unwrap_or("")
-                        .trim_start_matches(|c: char| c == ' ' || c == '\t');
-                    for t in rest.split_whitespace() {
-                        self.enable_buf.push(t.to_ascii_uppercase());
-                    }
-                    let tokens: Vec<&str> = self.enable_buf.iter().map(|s| s.as_str()).collect();
-                    self.enabled.enable(
-                        &tokens,
-                        self.caps.condstore || self.caps.enable,
-                        self.caps.qresync || self.caps.enable,
-                    );
-                    let enabled = self.enabled.clone();
-                    if let Some(mut driver) = self.driver.take() {
-                        driver.on_enabled(&enabled);
-                        self.driver = Some(driver);
-                    }
-                    return;
-                }
-            }
-            UntaggedClass::Namespace => {
-                if self
-                    .pending
-                    .oldest_of_kind(PendingKind::Namespace)
-                    .is_some()
-                {
-                    if let Some(data) = ImapNamespaceData::parse(&raw) {
-                        if let Some(mut driver) = self.driver.take() {
-                            driver.on_namespace(&data);
-                            self.driver = Some(driver);
-                        }
-                    }
-                    return;
-                }
-            }
-            UntaggedClass::Id => {
-                if self.pending.oldest_of_kind(PendingKind::Id).is_some() {
-                    let params = parse_id_params(&raw);
-                    if let Some(mut driver) = self.driver.take() {
-                        driver.on_id_params(&params);
-                        self.driver = Some(driver);
-                    }
-                    return;
-                }
-            }
-            UntaggedClass::Quota => {
-                if self.pending.oldest_of_kind(PendingKind::Quota).is_some() {
-                    if let Some(data) = ImapQuotaData::parse(&raw) {
-                        if let Some(mut driver) = self.driver.take() {
-                            driver.on_quota(&data);
-                            self.driver = Some(driver);
-                        }
-                    }
-                    return;
-                }
-            }
-            UntaggedClass::QuotaRoot => {
-                if self.pending.oldest_of_kind(PendingKind::Quota).is_some() {
-                    if let Some(data) = ImapQuotaRootData::parse(&raw) {
-                        if let Some(mut driver) = self.driver.take() {
-                            driver.on_quota_root(&data);
-                            self.driver = Some(driver);
-                        }
-                    }
-                    return;
-                }
-            }
-            UntaggedClass::Capability | UntaggedClass::MailboxEvent | UntaggedClass::Other => {}
-        }
-
-        // Unsolicited mailbox events (IDLE, FETCH interleave, NOOP, …).
-        if self.route_mailbox_event(&raw, ep) {
-            return;
-        }
-
-        // Untagged OK/NO response codes (e.g. during SELECT / COPYUID).
-        if status.is_some() {
-            if let Some(ref code) = response_code {
-                if code.to_ascii_uppercase().starts_with("COPYUID ") {
-                    self.last_copyuid = ImapCopyUid::parse(code);
-                }
-            }
-            self.collect_select_untagged(&raw, response_code.as_deref(), status);
-        }
+        self.apply_status_code_if_present(code.as_deref());
     }
 
-    fn route_fetch_classified(&mut self, raw: &str, ep: &mut dyn Endpoint) {
-        let flags_only = is_flags_only_fetch(raw);
-        if flags_only {
-            // Prefer Store consumer, else Fetch, else mailbox event.
-            if self.pending.oldest_of_kind(PendingKind::Store).is_some() {
-                self.route_fetch_line(raw, ep);
-                return;
-            }
-            if self.pending.oldest_of_kind(PendingKind::Fetch).is_some() {
-                // Unsolicited FLAGS interleaved with FETCH → event listener.
-                if self.route_mailbox_event(raw, ep) {
-                    return;
-                }
-            }
-            if self.route_mailbox_event(raw, ep) {
-                return;
-            }
+    fn on_bye(&mut self, text: String, ep: &mut dyn Endpoint) {
+        if self.session == SessionState::Connecting {
+            self.cancel_greeting_timer();
+            self.protocol_error(ep, format!("IMAP greeting BYE: {text}"));
+        }
+        // A mid-session BYE precedes the connection closing; no action
+        // needed here — `disconnected()` will fire shortly and clean up.
+    }
+
+    fn on_preauth(&mut self, ep: &mut dyn Endpoint) {
+        if self.session != SessionState::Connecting {
             return;
         }
-        if let Some(cmd) = self.pending.oldest_of_kind(PendingKind::Fetch) {
-            let tag = cmd.tag.clone();
-            self.pending.set_fetch_literal_owner(tag);
-            self.route_fetch_line(raw, ep);
+        self.cancel_greeting_timer();
+        self.session = SessionState::Authenticated;
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
+        driver.on_authenticated(self, ep);
+        self.driver = Some(driver);
+    }
+
+    fn on_list_entry(&mut self, entry: ImapListEntry, ep: &mut dyn Endpoint) {
+        if self.pending.oldest_compatible(UntaggedClass::List).is_none() {
             return;
-        }
-        // No FETCH pending — treat as unsolicited flags update if possible.
-        let _ = self.route_mailbox_event(raw, ep);
-    }
-
-    fn collect_select_untagged(
-        &mut self,
-        raw: &str,
-        response_code: Option<&str>,
-        _status: Option<ImapStatus>,
-    ) {
-        let upper = raw.to_ascii_uppercase();
-        if upper.starts_with("FLAGS ") {
-            self.select_info.flags = parse_flag_list(&raw[6..]);
-        } else if let Some((n, kind)) = parse_number_atom(raw) {
-            match kind.as_str() {
-                "EXISTS" => self.select_info.exists = n,
-                "RECENT" => self.select_info.recent = n,
-                _ => {}
-            }
-        }
-        if let Some(code) = response_code {
-            let cu = code.to_ascii_uppercase();
-            if let Some(v) = cu.strip_prefix("UIDVALIDITY ") {
-                self.select_info.uid_validity = v.trim().parse().ok();
-            } else if let Some(v) = cu.strip_prefix("UIDNEXT ") {
-                self.select_info.uid_next = v.trim().parse().ok();
-            } else if let Some(v) = cu.strip_prefix("UNSEEN ") {
-                self.select_info.unseen = v.trim().parse().ok();
-            } else if let Some(v) = cu.strip_prefix("HIGHESTMODSEQ ") {
-                self.select_info.highest_modseq = v.trim().parse().ok();
-            } else if cu.starts_with("PERMANENTFLAGS") {
-                let rest = code
-                    .get("PERMANENTFLAGS".len()..)
-                    .unwrap_or("")
-                    .trim_start();
-                self.select_info.permanent_flags = parse_flag_list(rest);
-            } else if cu == "READ-WRITE" {
-                self.select_info.read_write = Some(true);
-            } else if cu == "READ-ONLY" {
-                self.select_info.read_write = Some(false);
-            } else if cu.starts_with("COPYUID ") {
-                self.last_copyuid = ImapCopyUid::parse(code);
-            }
-        }
-    }
-
-    fn route_mailbox_event(&mut self, raw: &str, ep: &mut dyn Endpoint) -> bool {
-        let _ = ep;
-        let mut handled = false;
-        if let Some((n, kind)) = parse_number_atom(raw) {
-            match kind.as_str() {
-                "EXISTS" => {
-                    if let Some(mut driver) = self.driver.take() {
-                        if let Some(listener) = driver.mailbox_events() {
-                            listener.on_exists(n);
-                        }
-                        self.driver = Some(driver);
-                    }
-                    handled = true;
-                }
-                "RECENT" => {
-                    if let Some(mut driver) = self.driver.take() {
-                        if let Some(listener) = driver.mailbox_events() {
-                            listener.on_recent(n);
-                        }
-                        self.driver = Some(driver);
-                    }
-                    handled = true;
-                }
-                "EXPUNGE" => {
-                    if let Some(mut driver) = self.driver.take() {
-                        if let Some(listener) = driver.mailbox_events() {
-                            listener.on_expunge(n);
-                        }
-                        self.driver = Some(driver);
-                    }
-                    handled = true;
-                }
-                _ => {}
-            }
-        }
-        if !handled {
-            if let Some((seq, flags)) = parse_flags_only_fetch(raw) {
-                if let Some(mut driver) = self.driver.take() {
-                    if let Some(listener) = driver.mailbox_events() {
-                        listener.on_flags(seq, &flags);
-                    }
-                    self.driver = Some(driver);
-                }
-                handled = true;
-            }
-        }
-        if handled && self.session == SessionState::IdleActive {
-            if let Some(mut driver) = self.driver.take() {
-                driver.on_idle_mailbox_event(self);
-                self.driver = Some(driver);
-            }
-        }
-        handled
-    }
-
-    fn route_fetch_line(&mut self, raw: &str, ep: &mut dyn Endpoint) {
-        let has_literal = crate::client::reply::trailing_literal_size(raw).is_some();
-        if has_literal {
-            self.arm_message_timer(ep);
-        }
-        if let Some(seq) = parse_fetch_seq(raw) {
-            self.fetch_accum = ImapFetchData {
-                seq,
-                ..ImapFetchData::default()
-            };
-            if let Some(flags) = extract_flags(raw) {
-                self.fetch_accum.flags = flags;
-            }
-            if let Some(uid) = extract_atom_number(raw, "UID") {
-                self.fetch_accum.uid = Some(uid);
-            }
-            if let Some(sz) = extract_atom_number(raw, "RFC822.SIZE") {
-                self.fetch_accum.size = Some(sz as u64);
-            }
-            if let Some(ms) = extract_atom_number(raw, "MODSEQ") {
-                self.fetch_accum.modseq = Some(ms as u64);
-            }
         }
         if let Some(mut driver) = self.driver.take() {
-            driver.on_fetch_line(raw);
-            // When the line announces a trailing literal the body has not
-            // arrived yet; deliver the complete ImapFetchData (body included)
-            // on LiteralComplete instead of firing early with an empty body.
-            if !has_literal {
-                driver.on_fetch_data(&self.fetch_accum);
+            driver.on_list_entry(&entry);
+            self.driver = Some(driver);
+        }
+        let _ = ep;
+    }
+
+    fn on_status_data(&mut self, data: ImapStatusData, ep: &mut dyn Endpoint) {
+        if self.pending.oldest_compatible(UntaggedClass::Status).is_none() {
+            return;
+        }
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_status_data(&data);
+            self.driver = Some(driver);
+        }
+        let _ = ep;
+    }
+
+    fn on_search_numbers(&mut self, nums: Vec<u32>, ep: &mut dyn Endpoint) {
+        if self.pending.oldest_compatible(UntaggedClass::Search).is_none() {
+            return;
+        }
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_search_numbers(&nums);
+            self.driver = Some(driver);
+        }
+        let _ = ep;
+    }
+
+    fn on_exists(&mut self, n: u32, ep: &mut dyn Endpoint) {
+        if self.select_examine_pending() {
+            self.select_info.exists = n;
+            return;
+        }
+        self.route_mailbox_exists(n, ep);
+    }
+
+    fn on_recent(&mut self, n: u32, ep: &mut dyn Endpoint) {
+        if self.select_examine_pending() {
+            self.select_info.recent = n;
+            return;
+        }
+        self.route_mailbox_recent(n, ep);
+    }
+
+    fn on_expunge(&mut self, n: u32, ep: &mut dyn Endpoint) {
+        if self.pending.oldest_of_kind(PendingKind::Expunge).is_some() {
+            if let Some(mut driver) = self.driver.take() {
+                driver.on_expunge_seq(n);
+                self.driver = Some(driver);
             }
+            return;
+        }
+        self.route_mailbox_expunge(n, ep);
+    }
+
+    fn select_examine_pending(&self) -> bool {
+        self.pending
+            .oldest_compatible(UntaggedClass::Exists)
+            .map(|c| matches!(c.kind, PendingKind::Select | PendingKind::Examine))
+            == Some(true)
+    }
+
+    fn route_mailbox_exists(&mut self, n: u32, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if let Some(mut driver) = self.driver.take() {
+            if let Some(listener) = driver.mailbox_events() {
+                listener.on_exists(n);
+            }
+            self.driver = Some(driver);
+        }
+        self.maybe_fire_idle_event(ep);
+    }
+
+    fn route_mailbox_recent(&mut self, n: u32, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if let Some(mut driver) = self.driver.take() {
+            if let Some(listener) = driver.mailbox_events() {
+                listener.on_recent(n);
+            }
+            self.driver = Some(driver);
+        }
+        self.maybe_fire_idle_event(ep);
+    }
+
+    fn route_mailbox_expunge(&mut self, n: u32, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if let Some(mut driver) = self.driver.take() {
+            if let Some(listener) = driver.mailbox_events() {
+                listener.on_expunge(n);
+            }
+            self.driver = Some(driver);
+        }
+        self.maybe_fire_idle_event(ep);
+    }
+
+    fn route_mailbox_flags(&mut self, seq: u32, flags: &[String], ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if let Some(mut driver) = self.driver.take() {
+            if let Some(listener) = driver.mailbox_events() {
+                listener.on_flags(seq, flags);
+            }
+            self.driver = Some(driver);
+        }
+        self.maybe_fire_idle_event(ep);
+    }
+
+    fn maybe_fire_idle_event(&mut self, _ep: &mut dyn Endpoint) {
+        if self.session != SessionState::IdleActive {
+            return;
+        }
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_idle_mailbox_event(self);
             self.driver = Some(driver);
         }
     }
 
-    fn on_residual(&mut self, text: String, ep: &mut dyn Endpoint) {
-        let _ = ep;
-        if self.pending.fetch_literal_owner().is_some()
-            || self.pending.oldest_of_kind(PendingKind::Fetch).is_some()
-        {
-            if let Some(mut driver) = self.driver.take() {
-                driver.on_fetch_line(&text);
-                self.driver = Some(driver);
+    fn on_fetch(&mut self, data: ImapFetchData, ep: &mut dyn Endpoint) {
+        let flags_only =
+            data.uid.is_none() && data.size.is_none() && data.modseq.is_none() && data.body.is_empty()
+                && !data.flags.is_empty();
+        if flags_only {
+            if self.pending.oldest_of_kind(PendingKind::Store).is_some() {
+                self.deliver_fetch_data(data, ep);
+                return;
             }
+            self.route_mailbox_flags(data.seq, &data.flags, ep);
+            return;
+        }
+        if self.pending.oldest_of_kind(PendingKind::Fetch).is_some() {
+            self.deliver_fetch_data(data, ep);
+        }
+        // Non-flags-only FETCH with no pending FETCH command: unsolicited
+        // and not representable via the mailbox-event listener — dropped,
+        // matching the old design's effective behaviour.
+    }
+
+    fn deliver_fetch_data(&mut self, data: ImapFetchData, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_fetch_data(&data);
+            self.driver = Some(driver);
         }
     }
 
     fn on_literal_data(&mut self, data: Vec<u8>, ep: &mut dyn Endpoint) {
-        if self.pending.fetch_literal_owner().is_some()
-            || self.pending.oldest_of_kind(PendingKind::Fetch).is_some()
-        {
+        if self.pending.oldest_of_kind(PendingKind::Fetch).is_some() {
             self.arm_message_timer(ep);
-            self.fetch_accum.body.extend_from_slice(&data);
             if let Some(mut driver) = self.driver.take() {
                 driver.on_fetch_literal(&data);
                 self.driver = Some(driver);
@@ -734,19 +574,72 @@ impl ImapClientEndpoint {
         }
     }
 
-    fn on_literal_complete(&mut self) {
-        // A FETCH body literal finished: deliver the accumulated message
-        // (seq/uid/flags from the announcing line plus the full body) once.
-        if self.pending.fetch_literal_owner().is_some()
-            || self.pending.oldest_of_kind(PendingKind::Fetch).is_some()
-        {
-            if !self.fetch_accum.body.is_empty() {
-                if let Some(mut driver) = self.driver.take() {
-                    driver.on_fetch_data(&self.fetch_accum);
-                    self.driver = Some(driver);
-                }
+    fn on_enabled(&mut self, tokens: Vec<String>, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if self.pending.oldest_of_kind(PendingKind::Enable).is_none() {
+            return;
+        }
+        let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+        self.enabled.enable(
+            &refs,
+            self.caps.condstore || self.caps.enable,
+            self.caps.qresync || self.caps.enable,
+        );
+        let enabled = self.enabled.clone();
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_enabled(&enabled);
+            self.driver = Some(driver);
+        }
+    }
+
+    fn on_namespace(&mut self, payload: &str, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if self.pending.oldest_of_kind(PendingKind::Namespace).is_none() {
+            return;
+        }
+        if let Some(data) = ImapNamespaceData::parse(payload) {
+            if let Some(mut driver) = self.driver.take() {
+                driver.on_namespace(&data);
+                self.driver = Some(driver);
             }
-            self.fetch_accum.body.clear();
+        }
+    }
+
+    fn on_quota(&mut self, payload: &str, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if self.pending.oldest_of_kind(PendingKind::Quota).is_none() {
+            return;
+        }
+        if let Some(data) = ImapQuotaData::parse(payload) {
+            if let Some(mut driver) = self.driver.take() {
+                driver.on_quota(&data);
+                self.driver = Some(driver);
+            }
+        }
+    }
+
+    fn on_quota_root(&mut self, payload: &str, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if self.pending.oldest_of_kind(PendingKind::Quota).is_none() {
+            return;
+        }
+        if let Some(data) = ImapQuotaRootData::parse(payload) {
+            if let Some(mut driver) = self.driver.take() {
+                driver.on_quota_root(&data);
+                self.driver = Some(driver);
+            }
+        }
+    }
+
+    fn on_id_params(&mut self, payload: &str, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if self.pending.oldest_of_kind(PendingKind::Id).is_none() {
+            return;
+        }
+        let params = parse_id_params(payload);
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_id_params(&params);
+            self.driver = Some(driver);
         }
     }
 
@@ -820,8 +713,8 @@ impl ImapClientEndpoint {
 
         match cmd.kind {
             PendingKind::Capability => {
-                let caps = if !self.capa_buf.is_empty() {
-                    ImapCapabilities::parse(&self.capa_buf.join(" "))
+                let caps = if let Some(c) = self.capa_buf.take() {
+                    c
                 } else if let Some(ref code) = response_code {
                     if code.to_ascii_uppercase().starts_with("CAPABILITY ") {
                         ImapCapabilities::parse(&code["CAPABILITY ".len()..])
@@ -831,7 +724,6 @@ impl ImapClientEndpoint {
                 } else {
                     ImapCapabilities::default()
                 };
-                self.capa_buf.clear();
                 self.caps = caps.clone();
                 let mut driver = match self.driver.take() {
                     Some(d) => d,
@@ -994,7 +886,6 @@ impl ImapClientEndpoint {
                 self.driver = Some(driver);
             }
             PendingKind::Enable => {
-                self.enable_buf.clear();
                 let enabled = self.enabled.clone();
                 let mut driver = match self.driver.take() {
                     Some(d) => d,
@@ -1191,7 +1082,6 @@ impl ImapClientAuthenticated for ImapClientEndpoint {
     }
 
     fn enable(&mut self, features: &str) {
-        self.enable_buf.clear();
         let _ = self.issue_no_ep(PendingKind::Enable, &format!("ENABLE {features}"));
     }
 
@@ -1435,35 +1325,6 @@ impl ProtocolHandler for ImapClientEndpoint {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn is_fetch_line(raw: &str) -> bool {
-    let mut parts = raw.splitn(3, ' ');
-    let _n = parts.next();
-    matches!(parts.next(), Some(w) if w.eq_ignore_ascii_case("FETCH"))
-}
-
-fn parse_fetch_seq(raw: &str) -> Option<u32> {
-    let n = raw.split_whitespace().next()?;
-    n.parse().ok()
-}
-
-fn parse_number_atom(raw: &str) -> Option<(u32, String)> {
-    let mut parts = raw.split_whitespace();
-    let n: u32 = parts.next()?.parse().ok()?;
-    let kind = parts.next()?.to_ascii_uppercase();
-    Some((n, kind))
-}
-
-fn parse_search_numbers(raw: &str) -> Vec<u32> {
-    let rest = raw
-        .strip_prefix("SEARCH")
-        .or_else(|| raw.strip_prefix("search"))
-        .unwrap_or(raw)
-        .trim();
-    rest.split_whitespace()
-        .filter_map(|s| s.parse().ok())
-        .collect()
-}
-
 fn parse_flag_list(s: &str) -> Vec<String> {
     let s = s.trim();
     let s = s
@@ -1473,55 +1334,10 @@ fn parse_flag_list(s: &str) -> Vec<String> {
     s.split_whitespace().map(|f| f.to_string()).collect()
 }
 
-fn parse_flags_only_fetch(raw: &str) -> Option<(u32, Vec<String>)> {
-    if !is_flags_only_fetch(raw) {
-        return None;
-    }
-    let seq = parse_fetch_seq(raw)?;
-    let flags = extract_flags(raw)?;
-    Some((seq, flags))
-}
-
-fn is_flags_only_fetch(raw: &str) -> bool {
-    if !is_fetch_line(raw) {
-        return false;
-    }
-    let upper = raw.to_ascii_uppercase();
-    if !upper.contains("FLAGS") {
-        return false;
-    }
-    !(upper.contains("BODY") || upper.contains("RFC822") || upper.contains("ENVELOPE"))
-}
-
-fn extract_flags(raw: &str) -> Option<Vec<String>> {
-    let upper = raw.to_ascii_uppercase();
-    let idx = upper.find("FLAGS")?;
-    let rest = &raw[idx + 5..];
-    let rest = rest.trim_start();
-    if !rest.starts_with('(') {
-        return None;
-    }
-    let end = rest.find(')')?;
-    Some(parse_flag_list(&rest[..=end]))
-}
-
-fn extract_atom_number(raw: &str, atom: &str) -> Option<u32> {
-    let upper = raw.to_ascii_uppercase();
-    let atom_u = atom.to_ascii_uppercase();
-    let idx = upper.find(&atom_u)?;
-    let rest = raw[idx + atom.len()..].trim_start();
-    // Skip optional '(' for MODSEQ (modseq)
-    let rest = rest.strip_prefix('(').unwrap_or(rest);
-    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num.parse().ok()
-}
-
+/// Parse the bounded-captured `ID` payload (already stripped of the `ID `
+/// keyword by the lexer): `(key value key value …)` or `NIL`.
 fn parse_id_params(raw: &str) -> Vec<(String, String)> {
-    let rest = raw
-        .strip_prefix("ID ")
-        .or_else(|| raw.strip_prefix("id "))
-        .unwrap_or(raw)
-        .trim();
+    let rest = raw.trim();
     if rest.eq_ignore_ascii_case("NIL") {
         return Vec::new();
     }
@@ -1782,14 +1598,17 @@ mod tests {
             _m: &str,
         ) {
         }
-        fn on_fetch_line(&mut self, line: &str) {
-            self.events.lock().unwrap().push(format!("fetch:{line}"));
-        }
         fn on_fetch_literal(&mut self, data: &[u8]) {
             self.events
                 .lock()
                 .unwrap()
                 .push(format!("lit:{}", data.len()));
+        }
+        fn on_fetch_data(&mut self, data: &ImapFetchData) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("fetch_data:{}", data.seq));
         }
         fn on_fetch_complete(
             &mut self,
@@ -2000,7 +1819,7 @@ mod tests {
             "EXISTS should hit listener: {events:?}"
         );
         assert!(
-            events.iter().any(|e| e.starts_with("fetch:")),
+            events.iter().any(|e| e == "fetch_data:1"),
             "FETCH should hit body consumer: {events:?}"
         );
         assert!(
