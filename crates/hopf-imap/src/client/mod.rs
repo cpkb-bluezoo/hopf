@@ -54,11 +54,11 @@ pub use handlers::{
     ImapClientDriver, ImapClientHandlerFactory, MailboxEventListener, NopMailboxEventListener,
 };
 pub use pending::{
-    classify_untagged, ImapTagGenerator, PendingCommand, PendingKind, PendingMap, Tag,
-    UntaggedClass, DEFAULT_MAX_PIPELINE,
+    ImapTagGenerator, PendingCommand, PendingKind, PendingMap, Tag, UntaggedClass,
+    DEFAULT_MAX_PIPELINE,
 };
 pub use pipeline::{pipeline_status_and_list, ImapFetch, ImapIdle};
-pub use reply::{trailing_literal_size, ImapReplyLexer, ImapStatus, ImapWireEvent, MAX_REPLY_LINE};
+pub use reply::{ImapEvent, ImapReplyLexer, ImapStatus, MAX_TOKEN};
 pub use state::{
     ImapCapabilities, ImapClientAppend, ImapClientAuthExchange, ImapClientAuthenticated,
     ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls, ImapClientSelected,

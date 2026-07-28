@@ -152,6 +152,34 @@ since these are narrower than that one).
 - **Gap:** `on_greeting`/`on_authenticated` take no capabilities parameter. An untagged `CAPABILITY` line arriving alongside the greeting or LOGIN/AUTHENTICATE response is buffered into `capa_buf` but never promoted to `self.caps`, so `capabilities()` can return stale pre-auth data until a separate CAPABILITY command is explicitly issued.
 - **Suggested fix:** Promote `capa_buf` into `self.caps` at the same point the greeting/auth-complete event fires, and/or pass the parsed capability list into `on_greeting`/`on_authenticated` directly.
 
+### IMAP-3: CREATE/DELETE/RENAME/SUBSCRIBE/UNSUBSCRIBE entirely missing
+
+- **Status:** Open
+- **Gumdrop reference:** `imap/client/handler/ClientAuthenticatedState.java` — `create()`/`delete()`/`rename()`/`subscribe()`/`unsubscribe()`, all routed through `ServerMailboxReplyHandler` (`handleOk`/`handleNo`)
+- **Gap:** `ImapClientAuthenticated` (`client/state.rs`) has no equivalent methods at all — basic RFC 9051 §6.3.3–6.3.7 mailbox management (create, delete, rename, subscribe, unsubscribe) is entirely unreachable from hopf's IMAP client. This isn't a consolidation gap like the others in this file — it's a straightforwardly missing command set.
+- **Suggested fix:** Add the five methods to `ImapClientAuthenticated`, a `PendingKind` variant (or reuse one shape for all five, matching `ServerMailboxReplyHandler`'s single `handleOk`/`handleNo` shape) and a corresponding `on_mailbox_op_complete(session, ep, status, message)` driver callback.
+
+### IMAP-4: APPEND has no INTERNALDATE parameter
+
+- **Status:** Open
+- **Gumdrop reference:** `imap/client/handler/ClientAuthenticatedState.java` — `append(mailbox, flags, date, size, callback)`
+- **Gap:** `ImapClientAuthenticated::append` (`client/state.rs`) takes `mailbox`, `flags`, `size`, `use_literal_minus` — no `date` (RFC 9051 §6.3.11 INTERNALDATE). A caller can never set the appended message's internal date; the server always assigns "now".
+- **Suggested fix:** Add an `Option<&str>` (already-formatted IMAP date-time) parameter to `append`, appended to the command between flags and the literal marker when present.
+
+### IMAP-5: FETCH literal delivery has no section/size context
+
+- **Status:** Open
+- **Gumdrop reference:** `imap/client/handler/ServerFetchReplyHandler.java` — `handleFetchLiteralBegin(messageNumber, section, size)` precedes `handleFetchLiteralContent`, and `handleFetchLiteralEnd(messageNumber)` follows it
+- **Gap:** `ImapClientDriver::on_fetch_literal(&mut self, data: &[u8])` (`client/handlers.rs`) gets raw bytes with no indication of which `BODY[section]` (or `RFC822`/`RFC822.TEXT`/`RFC822.HEADER`) they belong to, or how large the literal is. A FETCH response with *multiple* literals (e.g. both `BODY[HEADER]` and `BODY[TEXT]`) is unattributable — `client/reply.rs`'s lexer already concatenates every literal's bytes into one `ImapFetchData.body` accumulator with no section tags, matching (not improving on) this gap.
+- **Suggested fix:** Track the attribute name (already known at the point `FetchBodyValueStart` is entered) alongside each literal, and thread it through as a new `on_fetch_literal_begin(seq, section: &str, size: u64)` / `on_fetch_literal_end(seq)` pair bracketing the existing `on_fetch_literal` chunks, matching Gumdrop's shape.
+
+### IMAP-6: No backpressure signal for FETCH literal streaming
+
+- **Status:** Open
+- **Gumdrop reference:** `imap/client/handler/ServerFetchReplyHandler.java` — `wantsPause()` (checked after every `handleFetchLiteralContent`) / `setResumeCallback(Runnable)`
+- **Gap:** Same pattern as [POP3-2](#pop3-2-no-backpressure-signal-during-retrtop-streaming) — `on_fetch_literal(&mut self, data: &[u8])` takes no `Endpoint` and returns nothing, so a driver streaming a large message body to disk/network has no way to pause the read side during a large FETCH transfer.
+- **Suggested fix:** Pass `ep: &mut dyn Endpoint` into `on_fetch_literal` (matching most other callbacks) so a driver can call `pause_read`/`resume_read` itself.
+
 ---
 
 ## FTP client (`crates/hopf-ftp/src/client/`)

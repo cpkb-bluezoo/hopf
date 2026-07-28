@@ -9,7 +9,7 @@
 use crate::enable::EnabledExtensions;
 
 /// Server capabilities from an untagged `CAPABILITY` response.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImapCapabilities {
     /// Raw capability tokens (uppercased).
     pub tokens: Vec<String>,
@@ -109,7 +109,7 @@ pub struct ImapMailboxInfo {
 }
 
 /// Basic parsed FETCH attribute bag (core subset).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImapFetchData {
     /// Message sequence number.
     pub seq: u32,
@@ -245,12 +245,10 @@ pub struct ImapNamespaceData {
 }
 
 impl ImapNamespaceData {
-    /// Parse `NAMESPACE personal other shared` (without leading `* `).
+    /// Parse `personal other shared` — the `NAMESPACE` keyword itself is
+    /// already consumed by the lexer's bounded capture ([`ImapEvent::Namespace`](super::reply::ImapEvent::Namespace)).
     pub fn parse(raw: &str) -> Option<Self> {
-        let rest = raw
-            .strip_prefix("NAMESPACE ")
-            .or_else(|| raw.strip_prefix("namespace "))?
-            .trim_start();
+        let rest = raw.trim_start();
         let mut data = Self::default();
         let mut cursor = rest;
         data.personal = parse_namespace_list(&mut cursor)?;
@@ -281,12 +279,10 @@ pub struct ImapQuotaData {
 }
 
 impl ImapQuotaData {
-    /// Parse `QUOTA root (name usage limit …)` (without leading `* `).
+    /// Parse `root (name usage limit …)` — the `QUOTA` keyword itself is
+    /// already consumed by the lexer's bounded capture ([`ImapEvent::Quota`](super::reply::ImapEvent::Quota)).
     pub fn parse(raw: &str) -> Option<Self> {
-        let rest = raw
-            .strip_prefix("QUOTA ")
-            .or_else(|| raw.strip_prefix("quota "))?
-            .trim_start();
+        let rest = raw.trim_start();
         let (root, items) = split_mailbox_and_list(rest)?;
         let mut resources = Vec::new();
         let mut toks = items.split_whitespace();
@@ -313,12 +309,10 @@ pub struct ImapQuotaRootData {
 }
 
 impl ImapQuotaRootData {
-    /// Parse `QUOTAROOT mailbox root…`.
+    /// Parse `mailbox root…` — the `QUOTAROOT` keyword itself is already
+    /// consumed by the lexer's bounded capture ([`ImapEvent::QuotaRoot`](super::reply::ImapEvent::QuotaRoot)).
     pub fn parse(raw: &str) -> Option<Self> {
-        let rest = raw
-            .strip_prefix("QUOTAROOT ")
-            .or_else(|| raw.strip_prefix("quotaroot "))?
-            .trim_start();
+        let rest = raw.trim_start();
         let mut parts = rest.split_whitespace();
         let mailbox = unquote(parts.next()?);
         let roots: Vec<_> = parts.map(unquote).collect();
@@ -646,7 +640,7 @@ mod parse_tests {
 
     #[test]
     fn parse_namespace() {
-        let n = ImapNamespaceData::parse(r#"NAMESPACE (("" "/")) NIL NIL"#).unwrap();
+        let n = ImapNamespaceData::parse(r#"(("" "/")) NIL NIL"#).unwrap();
         assert_eq!(n.personal.len(), 1);
         assert_eq!(n.personal[0].prefix, "");
         assert_eq!(n.personal[0].delimiter.as_deref(), Some("/"));
@@ -655,7 +649,7 @@ mod parse_tests {
 
     #[test]
     fn parse_quota() {
-        let q = ImapQuotaData::parse("QUOTA \"\" (STORAGE 10 512)").unwrap();
+        let q = ImapQuotaData::parse("\"\" (STORAGE 10 512)").unwrap();
         assert_eq!(q.root, "");
         assert_eq!(q.resources[0].name, "STORAGE");
         assert_eq!(q.resources[0].usage, 10);

@@ -123,9 +123,6 @@ pub trait ImapClientDriver: Send {
         message: &str,
     );
 
-    /// One untagged FETCH line / residual (body consumer).
-    fn on_fetch_line(&mut self, line: &str);
-
     /// FETCH literal octets.
     fn on_fetch_literal(&mut self, data: &[u8]);
 
@@ -159,11 +156,6 @@ pub trait ImapClientDriver: Send {
         let _ = (selected, ep, status, message);
     }
 
-    /// One LIST / LSUB line (raw).
-    fn on_list_line(&mut self, line: &str) {
-        let _ = line;
-    }
-
     /// Parsed LIST / LSUB entry.
     fn on_list_entry(&mut self, entry: &ImapListEntry) {
         let _ = entry;
@@ -178,11 +170,6 @@ pub trait ImapClientDriver: Send {
         message: &str,
     ) {
         let _ = (session, ep, status, message);
-    }
-
-    /// STATUS untagged line (raw).
-    fn on_status_line(&mut self, line: &str) {
-        let _ = line;
     }
 
     /// Parsed STATUS data.

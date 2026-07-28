@@ -278,8 +278,6 @@ impl ImapClientDriver for ImapFetchDriver {
         ep.close();
     }
 
-    fn on_fetch_line(&mut self, _line: &str) {}
-
     fn on_fetch_literal(&mut self, data: &[u8]) {
         self.state.lock().unwrap().body_buf.extend_from_slice(data);
     }
@@ -609,8 +607,6 @@ impl ImapClientDriver for ImapIdleDriver {
         self.complete(false);
         ep.close();
     }
-
-    fn on_fetch_line(&mut self, _line: &str) {}
 
     fn on_fetch_literal(&mut self, _data: &[u8]) {}
 
