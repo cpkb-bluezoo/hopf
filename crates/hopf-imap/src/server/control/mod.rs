@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hopf_auth::plain::parse_credentials;
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
 use hopf_mailbox::{Mailbox, MailboxStore};
+
+use rmimeparser::charset::base64;
 
 use crate::server::capability::build_capabilities;
 use crate::enable::EnabledExtensions;
@@ -602,16 +603,19 @@ impl ImapControlHandler {
         }
         if let Some(ir) = parts.next() {
             if ir == "=" {
-                self.pending_auth = Some(PendingAuth::Plain { tag: cmd.tag });
-                self.send(endpoint, continuation(""));
+                // RFC 4959 SASL-IR: a bare "=" is an explicit *empty* initial
+                // response, fed straight to the mechanism — not "no response
+                // yet" (that's the `None` arm below, which prompts for one).
+                self.complete_plain(endpoint, &cmd.tag, &[]);
                 return;
             }
-            match B64.decode(ir.as_bytes()) {
+            match base64::decode(ir) {
                 Ok(raw) => self.complete_plain(endpoint, &cmd.tag, &raw),
                 Err(_) => self.send(endpoint, tagged_no(&cmd.tag, "Invalid base64")),
             }
         } else {
             self.pending_auth = Some(PendingAuth::Plain { tag: cmd.tag });
+            self.lexer.expect_sasl_response();
             self.send(endpoint, continuation(""));
         }
     }
@@ -1328,9 +1332,9 @@ impl ImapControlHandler {
             self.send(endpoint, tagged_bad(&tag, "Authentication cancelled"));
             return;
         }
-        match B64.decode(line) {
-            Ok(raw) => self.complete_plain(endpoint, &tag, &raw),
-            Err(_) => self.send(endpoint, tagged_no(&tag, "Invalid base64")),
+        match std::str::from_utf8(line).ok().and_then(|s| base64::decode(s).ok()) {
+            Some(raw) => self.complete_plain(endpoint, &tag, &raw),
+            None => self.send(endpoint, tagged_no(&tag, "Invalid base64")),
         }
     }
 }
@@ -1364,18 +1368,6 @@ impl ProtocolHandler for ImapControlHandler {
             return;
         }
 
-        if self.pending_auth.is_some() {
-            if let Some(pos) = data.windows(2).position(|w| w == b"\r\n") {
-                let line = data[..pos].to_vec();
-                *data = &data[pos + 2..];
-                self.feed_auth_line(endpoint, &line);
-                if !data.is_empty() {
-                    self.receive(endpoint, data);
-                }
-            }
-            return;
-        }
-
         let events = self.lexer.feed(data);
         if let Some(body) = self.lexer.take_append_body() {
             self.pending_append_body = Some(body);
@@ -1384,6 +1376,9 @@ impl ProtocolHandler for ImapControlHandler {
             match ev {
                 LexEvent::NeedContinuation => {
                     self.send(endpoint, continuation("Ready for literal data"));
+                }
+                LexEvent::SaslLine(line) => {
+                    self.feed_auth_line(endpoint, &line);
                 }
                 LexEvent::Error { tag, message } => {
                     self.send(endpoint, tagged_bad(&tag, &message));

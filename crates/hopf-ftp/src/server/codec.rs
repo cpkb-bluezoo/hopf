@@ -1,32 +1,161 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Incremental FTP command parser: `KEYWORD [SP TEXT] CRLF`.
+//! Incremental, semantic FTP command parser: `KEYWORD [SP TEXT] CRLF`.
 //!
 //! Self-contained streaming parser: [`FtpServerLexer::feed`] consumes every
 //! byte it is given and keeps a command-in-progress in its own bounded
 //! `verb`/`arg` scratch buffers — never in a buffer the caller has to retain
 //! and re-supply. See `hopf_http::h1::parse` for the design this follows.
+//!
+//! Unlike POP3/SMTP's server codecs, [`FtpCommand`]'s path/text arguments
+//! stay as raw bytes rather than being decoded into a `String` here: RFC
+//! 2640 (`OPTS UTF8`) charset decoding depends on a per-connection runtime
+//! toggle (`FtpControlHandler::utf8`) the lexer has no access to, so that
+//! step has to stay at the dispatch layer — see
+//! [`crate::server::utf8::decode_arg`]. What the lexer *does* own is verb
+//! identity: `CWD`/`XCWD`, `CDUP`/`XCUP`, `PWD`/`XPWD`, `RMD`/`XRMD`, and
+//! `MKD`/`XMKD` are consolidated into one variant each here, instead of
+//! dispatch needing an alias-aware `|` pattern per pair.
 
 /// Command-line length limit (octets), applied independently to the verb
 /// and to the argument.
 pub const MAX_COMMAND_LINE: usize = 4096;
 
-/// Parsed control command.
-///
-/// The argument is kept as raw bytes so [`crate::server::utf8::decode_arg`] can apply
-/// RFC 2640 charset rules (`OPTS UTF8`) at dispatch time.
+/// A fully parsed FTP command. Path/text arguments are raw bytes — see the
+/// module docs for why charset decoding stays at the dispatch layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FtpCommand {
-    /// Uppercased verb (ASCII).
-    pub verb: String,
-    /// Raw argument bytes after the first SP (may be empty).
-    pub arg_bytes: Vec<u8>,
+pub enum FtpCommand {
+    /// `USER name`
+    User(Vec<u8>),
+    /// `PASS string`
+    Pass(Vec<u8>),
+    /// `ACCT` (not implemented; argument ignored)
+    Acct,
+    /// `CWD` / `XCWD`
+    Cwd(Vec<u8>),
+    /// `CDUP` / `XCUP`
+    Cdup,
+    /// `PWD` / `XPWD`
+    Pwd,
+    /// `QUIT`
+    Quit,
+    /// `REIN`
+    Rein,
+    /// `NOOP`
+    Noop,
+    /// `SYST`
+    Syst,
+    /// `TYPE`
+    Type(Vec<u8>),
+    /// `STRU`
+    Stru(Vec<u8>),
+    /// `MODE`
+    Mode(Vec<u8>),
+    /// `PASV`
+    Pasv,
+    /// `EPSV`
+    Epsv(Vec<u8>),
+    /// `PORT`
+    Port(Vec<u8>),
+    /// `EPRT`
+    Eprt(Vec<u8>),
+    /// `RETR`
+    Retr(Vec<u8>),
+    /// `STOR`
+    Stor(Vec<u8>),
+    /// `APPE`
+    Appe(Vec<u8>),
+    /// `STOU` (argument ignored — server assigns the unique name)
+    Stou,
+    /// `LIST`
+    List(Vec<u8>),
+    /// `NLST`
+    Nlst(Vec<u8>),
+    /// `MLSD`
+    Mlsd(Vec<u8>),
+    /// `MLST`
+    Mlst(Vec<u8>),
+    /// `SIZE`
+    Size(Vec<u8>),
+    /// `MDTM`
+    Mdtm(Vec<u8>),
+    /// `DELE`
+    Dele(Vec<u8>),
+    /// `RMD` / `XRMD`
+    Rmd(Vec<u8>),
+    /// `MKD` / `XMKD`
+    Mkd(Vec<u8>),
+    /// `RNFR`
+    Rnfr(Vec<u8>),
+    /// `RNTO`
+    Rnto(Vec<u8>),
+    /// `REST`
+    Rest(Vec<u8>),
+    /// `ABOR`
+    Abor,
+    /// `STAT` (argument, if any, is a path to list)
+    Stat(Vec<u8>),
+    /// `HELP` / `FEAT`
+    Feat,
+    /// `OPTS`
+    Opts(Vec<u8>),
+    /// `AUTH` (RFC 2228 — TLS negotiation, not a SASL exchange)
+    Auth(Vec<u8>),
+    /// `PBSZ`
+    Pbsz(Vec<u8>),
+    /// `PROT`
+    Prot(Vec<u8>),
+    /// `CCC` (not supported; argument ignored)
+    Ccc,
+    /// `ALLO` (not required; argument ignored)
+    Allo,
+    /// `SITE` (not implemented; argument ignored)
+    Site,
+    /// `SMNT` (not implemented; argument ignored)
+    Smnt,
+    /// A verb the lexer doesn't recognise at all.
+    Unknown {
+        /// The unrecognised verb.
+        verb: String,
+    },
 }
 
 impl FtpCommand {
-    /// Lossy UTF-8 view of the argument (tests / debugging).
-    pub fn arg_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.arg_bytes).into_owned()
+    /// The raw argument bytes for commands that carry one, `None` for
+    /// argless commands (or commands whose argument is always ignored).
+    pub fn arg_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::User(b)
+            | Self::Pass(b)
+            | Self::Cwd(b)
+            | Self::Type(b)
+            | Self::Stru(b)
+            | Self::Mode(b)
+            | Self::Epsv(b)
+            | Self::Port(b)
+            | Self::Eprt(b)
+            | Self::Retr(b)
+            | Self::Stor(b)
+            | Self::Appe(b)
+            | Self::List(b)
+            | Self::Nlst(b)
+            | Self::Mlsd(b)
+            | Self::Mlst(b)
+            | Self::Size(b)
+            | Self::Mdtm(b)
+            | Self::Dele(b)
+            | Self::Rmd(b)
+            | Self::Mkd(b)
+            | Self::Rnfr(b)
+            | Self::Rnto(b)
+            | Self::Rest(b)
+            | Self::Stat(b)
+            | Self::Opts(b)
+            | Self::Auth(b)
+            | Self::Pbsz(b)
+            | Self::Prot(b) => Some(b),
+            _ => None,
+        }
     }
 }
 
@@ -46,7 +175,7 @@ enum State {
     ResyncCr,
 }
 
-/// Incremental FTP command-line parser.
+/// Incremental, semantic FTP command-line parser. See the module docs.
 pub struct FtpServerLexer {
     max_line: usize,
     state: State,
@@ -152,9 +281,60 @@ impl FtpServerLexer {
         let arg_bytes = std::mem::take(&mut self.arg);
         self.verb.clear();
         self.have_arg = false;
-        if !verb.is_empty() {
-            self.ready.push(FtpCommand { verb, arg_bytes });
+        if verb.is_empty() {
+            return;
         }
+        self.ready.push(build_command(&verb, arg_bytes));
+    }
+}
+
+fn build_command(verb: &str, arg: Vec<u8>) -> FtpCommand {
+    match verb {
+        "USER" => FtpCommand::User(arg),
+        "PASS" => FtpCommand::Pass(arg),
+        "ACCT" => FtpCommand::Acct,
+        "CWD" | "XCWD" => FtpCommand::Cwd(arg),
+        "CDUP" | "XCUP" => FtpCommand::Cdup,
+        "PWD" | "XPWD" => FtpCommand::Pwd,
+        "QUIT" => FtpCommand::Quit,
+        "REIN" => FtpCommand::Rein,
+        "NOOP" => FtpCommand::Noop,
+        "SYST" => FtpCommand::Syst,
+        "TYPE" => FtpCommand::Type(arg),
+        "STRU" => FtpCommand::Stru(arg),
+        "MODE" => FtpCommand::Mode(arg),
+        "PASV" => FtpCommand::Pasv,
+        "EPSV" => FtpCommand::Epsv(arg),
+        "PORT" => FtpCommand::Port(arg),
+        "EPRT" => FtpCommand::Eprt(arg),
+        "RETR" => FtpCommand::Retr(arg),
+        "STOR" => FtpCommand::Stor(arg),
+        "APPE" => FtpCommand::Appe(arg),
+        "STOU" => FtpCommand::Stou,
+        "LIST" => FtpCommand::List(arg),
+        "NLST" => FtpCommand::Nlst(arg),
+        "MLSD" => FtpCommand::Mlsd(arg),
+        "MLST" => FtpCommand::Mlst(arg),
+        "SIZE" => FtpCommand::Size(arg),
+        "MDTM" => FtpCommand::Mdtm(arg),
+        "DELE" => FtpCommand::Dele(arg),
+        "RMD" | "XRMD" => FtpCommand::Rmd(arg),
+        "MKD" | "XMKD" => FtpCommand::Mkd(arg),
+        "RNFR" => FtpCommand::Rnfr(arg),
+        "RNTO" => FtpCommand::Rnto(arg),
+        "REST" => FtpCommand::Rest(arg),
+        "ABOR" => FtpCommand::Abor,
+        "STAT" => FtpCommand::Stat(arg),
+        "HELP" | "FEAT" => FtpCommand::Feat,
+        "OPTS" => FtpCommand::Opts(arg),
+        "AUTH" => FtpCommand::Auth(arg),
+        "PBSZ" => FtpCommand::Pbsz(arg),
+        "PROT" => FtpCommand::Prot(arg),
+        "CCC" => FtpCommand::Ccc,
+        "ALLO" => FtpCommand::Allo,
+        "SITE" => FtpCommand::Site,
+        "SMNT" => FtpCommand::Smnt,
+        _ => FtpCommand::Unknown { verb: verb.to_string() },
     }
 }
 
@@ -168,9 +348,15 @@ mod tests {
         let mut data: &[u8] = b"CWD my dir\r\n";
         let cmds = lex.feed(&mut data);
         assert!(data.is_empty());
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].verb, "CWD");
-        assert_eq!(cmds[0].arg_bytes, b"my dir");
+        assert_eq!(cmds, vec![FtpCommand::Cwd(b"my dir".to_vec())]);
+    }
+
+    #[test]
+    fn cwd_alias_xcwd_same_variant() {
+        let mut lex = FtpServerLexer::new(4096);
+        let mut data: &[u8] = b"XCWD /tmp\r\n";
+        let cmds = lex.feed(&mut data);
+        assert_eq!(cmds, vec![FtpCommand::Cwd(b"/tmp".to_vec())]);
     }
 
     #[test]
@@ -178,9 +364,7 @@ mod tests {
         let mut lex = FtpServerLexer::new(4096);
         let mut data: &[u8] = b"NOOP\r\n";
         let cmds = lex.feed(&mut data);
-        assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].verb, "NOOP");
-        assert!(cmds[0].arg_bytes.is_empty());
+        assert_eq!(cmds, vec![FtpCommand::Noop]);
     }
 
     #[test]
@@ -192,8 +376,7 @@ mod tests {
         let mut b: &[u8] = b"R anonymous\r\n";
         let cmds = lex.feed(&mut b);
         assert!(b.is_empty());
-        assert_eq!(cmds[0].verb, "USER");
-        assert_eq!(cmds[0].arg_bytes, b"anonymous");
+        assert_eq!(cmds, vec![FtpCommand::User(b"anonymous".to_vec())]);
     }
 
     #[test]
@@ -204,7 +387,7 @@ mod tests {
         line.extend_from_slice(b"\r\n");
         let mut data = line.as_slice();
         let cmds = lex.feed(&mut data);
-        assert_eq!(cmds[0].arg_bytes, "café".as_bytes());
+        assert_eq!(cmds, vec![FtpCommand::Cwd("café".as_bytes().to_vec())]);
     }
 
     #[test]
@@ -212,10 +395,51 @@ mod tests {
         let mut lex = FtpServerLexer::new(4096);
         let mut data: &[u8] = b"TYPE I\r\nPASV\r\nNOOP\r\n";
         let cmds = lex.feed(&mut data);
-        assert_eq!(cmds.len(), 3);
-        assert_eq!(cmds[0].verb, "TYPE");
-        assert_eq!(cmds[1].verb, "PASV");
-        assert_eq!(cmds[2].verb, "NOOP");
+        assert_eq!(
+            cmds,
+            vec![FtpCommand::Type(b"I".to_vec()), FtpCommand::Pasv, FtpCommand::Noop]
+        );
+    }
+
+    #[test]
+    fn argless_commands() {
+        let mut lex = FtpServerLexer::new(4096);
+        let mut data: &[u8] =
+            b"CDUP\r\nPWD\r\nQUIT\r\nREIN\r\nSYST\r\nPASV\r\nSTOU\r\nABOR\r\nCCC\r\nALLO\r\nSITE\r\nSMNT\r\n";
+        let cmds = lex.feed(&mut data);
+        assert_eq!(
+            cmds,
+            vec![
+                FtpCommand::Cdup,
+                FtpCommand::Pwd,
+                FtpCommand::Quit,
+                FtpCommand::Rein,
+                FtpCommand::Syst,
+                FtpCommand::Pasv,
+                FtpCommand::Stou,
+                FtpCommand::Abor,
+                FtpCommand::Ccc,
+                FtpCommand::Allo,
+                FtpCommand::Site,
+                FtpCommand::Smnt,
+            ]
+        );
+    }
+
+    #[test]
+    fn help_and_feat_are_the_same_variant() {
+        let mut lex = FtpServerLexer::new(4096);
+        let mut data: &[u8] = b"HELP\r\nFEAT\r\n";
+        let cmds = lex.feed(&mut data);
+        assert_eq!(cmds, vec![FtpCommand::Feat, FtpCommand::Feat]);
+    }
+
+    #[test]
+    fn unknown_verb() {
+        let mut lex = FtpServerLexer::new(4096);
+        let mut data: &[u8] = b"FROBNICATE arg\r\n";
+        let cmds = lex.feed(&mut data);
+        assert_eq!(cmds, vec![FtpCommand::Unknown { verb: "FROBNICATE".into() }]);
     }
 
     #[test]
@@ -223,7 +447,7 @@ mod tests {
         let mut lex = FtpServerLexer::new(4);
         let mut data: &[u8] = b"TOOLONG arg\r\nNOOP\r\n";
         let cmds = lex.feed(&mut data);
-        assert_eq!(cmds.iter().map(|c| c.verb.as_str()).collect::<Vec<_>>(), vec!["NOOP"]);
+        assert_eq!(cmds, vec![FtpCommand::Noop]);
     }
 
     #[test]
@@ -231,8 +455,7 @@ mod tests {
         let mut lex = FtpServerLexer::new(4096);
         let mut data: &[u8] = b"CWD a\rb\r\n";
         let cmds = lex.feed(&mut data);
-        assert_eq!(cmds[0].verb, "CWD");
-        assert_eq!(cmds[0].arg_bytes, b"a\rb");
+        assert_eq!(cmds, vec![FtpCommand::Cwd(b"a\rb".to_vec())]);
     }
 
     /// One byte per `feed()` call must produce identical commands to a

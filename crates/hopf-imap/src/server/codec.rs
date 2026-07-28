@@ -50,6 +50,11 @@ pub enum LexEvent {
     Command(ImapCommand),
     /// Synchronizing literal — send `+` then continue feeding.
     NeedContinuation,
+    /// A raw line received while [`ImapServerLexer::expect_sasl_response`] is
+    /// in effect (a SASL continuation response to `AUTHENTICATE`). Bytes are
+    /// exactly the line's content, minus the CRLF terminator — undecoded,
+    /// since interpretation (base64, `*` abort) is mechanism-specific.
+    SaslLine(Vec<u8>),
     /// Protocol error (line too long, bad literal, …).
     Error {
         /// Tag if known, else `"*"`.
@@ -85,6 +90,11 @@ enum State {
     Resync,
     /// Saw CR while resyncing; a following LF ends the discarded line.
     ResyncCr,
+    /// Accumulating a raw SASL continuation line (see
+    /// [`ImapServerLexer::expect_sasl_response`]), up to CR.
+    RawLine,
+    /// Saw CR while accumulating a raw line; a following LF completes it.
+    RawLineCr,
 }
 
 /// Incremental IMAP command-line parser with literal support.
@@ -104,6 +114,8 @@ pub struct ImapServerLexer {
     append_body: Vec<u8>,
     /// When set, an APPEND literal just finished.
     append_complete: bool,
+    /// Scratch buffer for a SASL continuation line (see `State::RawLine`).
+    raw: Vec<u8>,
     ready: Vec<LexEvent>,
 }
 
@@ -121,8 +133,19 @@ impl ImapServerLexer {
             literal_buf: Vec::new(),
             append_body: Vec::new(),
             append_complete: false,
+            raw: Vec::new(),
             ready: Vec::new(),
         }
+    }
+
+    /// Switch to raw-line mode for one SASL continuation response: the next
+    /// complete line fed in is delivered verbatim as [`LexEvent::SaslLine`]
+    /// instead of being parsed as a tagged command. Resumable across `feed`
+    /// calls like everything else here — the partial line lives in `self.raw`,
+    /// never in a buffer the caller must retain.
+    pub fn expect_sasl_response(&mut self) {
+        self.state = State::RawLine;
+        self.raw.clear();
     }
 
     /// Feed inbound bytes; returns newly completed lex events (commands,
@@ -245,6 +268,32 @@ impl ImapServerLexer {
                     return;
                 }
                 State::Literal => unreachable!("feed() never calls push_byte in State::Literal"),
+                State::RawLine => {
+                    if b == b'\r' {
+                        self.state = State::RawLineCr;
+                    } else if self.raw.len() >= self.max_line {
+                        self.emit_error("Line too long");
+                        self.raw.clear();
+                        self.state = State::Resync;
+                    } else {
+                        self.raw.push(b);
+                    }
+                    return;
+                }
+                State::RawLineCr => {
+                    if b == b'\n' {
+                        let line = std::mem::take(&mut self.raw);
+                        self.ready.push(LexEvent::SaslLine(line));
+                        self.state = State::Tag;
+                    } else if b == b'\r' {
+                        self.raw.push(b'\r');
+                    } else {
+                        self.raw.push(b'\r');
+                        self.raw.push(b);
+                        self.state = State::RawLine;
+                    }
+                    return;
+                }
             }
         }
     }
@@ -608,6 +657,7 @@ mod tests {
             .filter_map(|e| match e {
                 LexEvent::Command(c) => Some(c),
                 LexEvent::NeedContinuation => None,
+                LexEvent::SaslLine(_) => None,
                 LexEvent::Error { .. } => None,
             })
             .collect();
@@ -721,6 +771,77 @@ mod tests {
         let mut data: &[u8] = b"a1 NOOP\r\na2 CAPABILITY\r\n";
         let ev = lex.feed(&mut data);
         assert_eq!(ev.len(), 2);
+    }
+
+    #[test]
+    fn sasl_response_split_across_feeds() {
+        // The line following `expect_sasl_response` must resume correctly
+        // even when its bytes (and CRLF) arrive across separate `feed`
+        // calls — this is the exact class of bug the raw-line scratch
+        // buffer replaces a windows(2)-CRLF-scan with.
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut a: &[u8] = b"a1 AUTHENTICATE PLAIN\r\n";
+        let ev = lex.feed(&mut a);
+        assert_eq!(ev.len(), 1);
+        lex.expect_sasl_response();
+
+        let mut part1: &[u8] = b"AGFsaWNl";
+        assert!(lex.feed(&mut part1).is_empty());
+        let mut part2: &[u8] = b"AHNlY3JldA==\r\n";
+        let ev2 = lex.feed(&mut part2);
+        assert_eq!(ev2.len(), 1);
+        match &ev2[0] {
+            LexEvent::SaslLine(line) => assert_eq!(line, b"AGFsaWNlAHNlY3JldA=="),
+            _ => panic!("expected SaslLine"),
+        }
+    }
+
+    #[test]
+    fn sasl_response_all_split_points_are_equivalent() {
+        let msg: &[u8] = b"AGFsaWNlAHNlY3JldA==\r\n";
+        for split in 1..msg.len() {
+            let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+            lex.expect_sasl_response();
+            let mut a: &[u8] = &msg[..split];
+            let mut ev = lex.feed(&mut a);
+            assert!(a.is_empty(), "split {split} retained bytes");
+            let mut b: &[u8] = &msg[split..];
+            ev.extend(lex.feed(&mut b));
+            assert!(b.is_empty(), "split {split} retained bytes");
+            assert_eq!(ev.len(), 1, "split {split}");
+            match &ev[0] {
+                LexEvent::SaslLine(line) => assert_eq!(line, b"AGFsaWNlAHNlY3JldA=="),
+                _ => panic!("split {split}: expected SaslLine"),
+            }
+        }
+    }
+
+    #[test]
+    fn sasl_response_abort_line_passed_through_raw() {
+        // `*` (RFC 3501 continuation abort) isn't interpreted by the lexer —
+        // that's the caller's job, same as base64 decoding.
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        lex.expect_sasl_response();
+        let mut data: &[u8] = b"*\r\n";
+        let ev = lex.feed(&mut data);
+        match &ev[0] {
+            LexEvent::SaslLine(line) => assert_eq!(line, b"*"),
+            _ => panic!("expected SaslLine"),
+        }
+    }
+
+    #[test]
+    fn sasl_response_resumes_normal_commands_afterward() {
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        lex.expect_sasl_response();
+        let mut data: &[u8] = b"AGFsaWNlAHNlY3JldA==\r\na2 NOOP\r\n";
+        let ev = lex.feed(&mut data);
+        assert_eq!(ev.len(), 2);
+        assert!(matches!(&ev[0], LexEvent::SaslLine(_)));
+        match &ev[1] {
+            LexEvent::Command(c) => assert_eq!(c.verb, "NOOP"),
+            _ => panic!("expected command"),
+        }
     }
 
     #[test]
