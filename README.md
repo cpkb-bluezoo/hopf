@@ -13,8 +13,7 @@ Hopf uses a **thread-per-core** readiness model on
 [mio](https://github.com/tokio-rs/mio), plain buffers, and **rustls** for TCP TLS
 and QUIC ([quinn-proto](https://docs.rs/quinn-proto) + in-tree mio glue).
 **Listen and dial** are equal bindings on one Runtime. Codecs are **incremental
-push parsers** (chunked, resumable ingress; handler-callback egress), including
-grammar-driven tokens on a shared `ByteStreamLexer`.
+push parsers**: chunked, resumable ingress; handler-callback egress.
 
 Sibling parsers ([crates.io](https://crates.io); local path override via
 `[patch.crates-io]` when hacking):
