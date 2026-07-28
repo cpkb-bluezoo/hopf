@@ -78,6 +78,7 @@
 <li><a href="#layering">Layering</a></li>
 <li><a href="#endpoint-vs-protocolhandler">Endpoint vs ProtocolHandler</a></li>
 <li><a href="#listen-and-dial-are-peers">Listen and dial are peers</a></li>
+<li><a href="#module-layout-server-and-client-as-peers">Module layout: server and client as peers</a></li>
 <li><a href="#dynamic-bindings-and-composition">Dynamic bindings and composition</a></li>
 <li><a href="#auth-vocabulary">Auth vocabulary</a></li>
 <li><a href="#codec-style">Codec style</a></li>
@@ -257,6 +258,35 @@
 </tbody>
 </table>
 <p>Both reduce to registering a stream on a reactor with lifetime affinity.</p>
+<h2 id="module-layout-server-and-client-as-peers">Module layout: server and client as peers</h2>
+<p>Gumdrop assumes server functionality by default, with client as a submodule. Hopf deliberately diverges: within a protocol crate, <strong>server (bind) and client (dial) are equal</strong>, not a default role plus an add-on. This is a module-layout axis distinct from the listen/dial API axis above — it governs where code <strong>lives</strong>, not how a socket was born. Three layouts are legitimate, chosen per crate by how tightly client and server share wire state:</p>
+<table>
+<colgroup>
+<col style="width: 30%" />
+<col style="width: 70%" />
+</colgroup>
+<thead>
+<tr>
+<th>Layout</th>
+<th>When to use it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Sibling modules</strong><br><code>client/</code>, <code>server/</code>, shared code at crate root</td>
+<td>Client and server are separate objects with separate state machines. Reference implementations: <code>hopf-dns</code> (<code>client/</code>, <code>server/</code>, shared <code>wire/</code>, <code>dnssec/</code>, <code>cache.rs</code>), <code>hopf-imap</code> (<code>client/</code>, <code>server/</code>, shared <code>capability.rs</code>, <code>idle.rs</code>, …).</td>
+</tr>
+<tr>
+<td><strong>Role-parameterized file</strong><br>one type/file, constructed as either role</td>
+<td>Client and server share one wire FSM and splitting it would fragment that state machine. E.g. <code>hopf-tls</code> (<code>acceptor()</code> / <code>connector()</code>), <code>hopf-quic</code> (<code>listen_quic</code> / <code>connect_quic</code>), <code>hopf-http</code>'s <code>H1Endpoint::server()</code> / <code>::client()</code>, <code>hopf-websocket</code>'s <code>WsUpgradeHandler::server()</code> / <code>::client()</code>, and each <code>hopf-auth</code> SASL mechanism (<code>PlainServer</code> / <code>PlainClient</code> in one file — SASL client/server are wire roles, see <a href="auth.html">auth</a>).</td>
+</tr>
+<tr>
+<td><strong>Single role</strong><br>no split, one role only</td>
+<td>The protocol has no counterpart role in-tree: <code>hopf-webdav</code> (server-only filesystem handler), <code>hopf-otel</code> (client-only exporter; hopf does not run a collector), <code>hopf-mailbox</code> (storage backend, not a network protocol).</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Anti-pattern:</strong> server code flat at crate root with no <code>server/</code> name, plus a <code>client/</code> submodule bolted on — server-as-unmarked-default is exactly the Gumdrop shape this axis exists to avoid. Crates in this shape get a <code>server/</code> module carved out of their root files, mirroring their existing <code>client/</code>.</p>
 <h2 id="dynamic-bindings-and-composition">Dynamic bindings and composition</h2>
 <p><strong>All bindings are dynamic.</strong> Listen and dial are added/removed through Runtime APIs while the process is alive. Configuration is a <strong>script</strong> over those APIs (Rust <code>main</code> / builder, or XML). <code>Service</code> orchestrates lifecycle; it does <strong>not</strong> own an immutable listener list as source of truth.</p>
 <pre class="text"><code>main → Runtime::start → Composition

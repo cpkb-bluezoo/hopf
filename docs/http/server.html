@@ -76,6 +76,7 @@
 <li><a href="#deferred-responses">Deferred responses</a></li>
 <li><a href="#authentication-factories">Authentication factories</a></li>
 <li><a href="#protocol-upgrades">Protocol upgrades</a></li>
+<li><a href="#httpserver-facade">HttpServer facade</a></li>
 <li><a href="#wiring-example">Wiring example</a></li>
 <li><a href="#examples">Examples</a></li>
 <li><a href="#limitations">Limitations</a></li>
@@ -330,6 +331,21 @@
 <span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> request_complete(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter) <span class="op">{}</span></span>
 <span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
 <p>Prefer stock factories from <code>hopf-websocket</code> / <code>hopf-grpc</code> rather than hand-rolling handshake headers.</p>
+<h2 id="httpserver-facade">HttpServer facade</h2>
+<p><code>HttpServer</code> is the app-facing bind facade, symmetric to <a href="client.html"><code>HttpClient</code></a> on the dial side: pick cleartext or TLS with one builder call, then <code>bind</code> once per listen address — no manual <code>CleartextHttpEndpoint</code> / <code>AlpnHttpEndpoint</code> selection.</p>
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> hopf_core::{Runtime, RuntimeConfig};
+<span class="kw">use</span> hopf_http::{HttpServer, ServerHandlerFactory};
+
+<span class="kw">let</span> rt = Runtime::start(RuntimeConfig::default())?;
+<span class="kw">let</span> factory: Arc&lt;<span class="kw">dyn</span> ServerHandlerFactory&gt; = Arc::new(HelloFactory);
+
+<span class="co">// Cleartext (h2c prior-knowledge + Upgrade + HTTP/1.1):</span>
+<span class="kw">let</span> (addr, _binding) = HttpServer::new().bind(&amp;rt, <span class="st">&quot;127.0.0.1:8080&quot;</span>.parse()?, factory.clone())?;
+
+<span class="co">// TLS (ALPN h2 / http/1.1) — acceptor already advertises those protocols:</span>
+<span class="kw">let</span> acceptor = hopf_tls::acceptor_from_pem(&amp;cert_path, &amp;key_path, &amp;[b<span class="st">&quot;h2&quot;</span>, b<span class="st">&quot;http/1.1&quot;</span>])?;
+<span class="kw">let</span> (addr, _binding) = HttpServer::new().tls(acceptor).bind(&amp;rt, <span class="st">&quot;127.0.0.1:8443&quot;</span>.parse()?, factory)?;</code></pre></div>
+<p>Reach for the manual wiring below when a listener needs an adapter <code>HttpServer</code> doesn't cover yet (H3/QUIC, or a non-TCP transport) — same <code>ServerHandler</code> either way.</p>
 <h2 id="wiring-example">Wiring example</h2>
 <div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
 <span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> Runtime<span class="op">,</span> RuntimeConfig<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>

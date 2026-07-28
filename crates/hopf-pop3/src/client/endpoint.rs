@@ -13,7 +13,7 @@ use base64::Engine;
 use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
 
 use super::handlers::{Pop3ClientDriver, Pop3ClientHandlerFactory};
-use super::reply::{Pop3ReplyLexer, Pop3WireEvent};
+use super::reply::{Pop3Event, Pop3ReplyLexer, Pop3ReplyShape};
 use super::state::{
     Pop3Capabilities, Pop3ClientAuthExchange, Pop3ClientAuthorization, Pop3ClientPassword,
     Pop3ClientPostStls, Pop3ClientTransaction,
@@ -98,8 +98,6 @@ pub struct Pop3ClientEndpoint {
     message_timer: Option<TimerHandle>,
     /// Command bytes queued by state-trait methods; flushed after each callback.
     outbound: Vec<u8>,
-    /// Accumulation buffer for multiline listing responses (CAPA / LIST / UIDL).
-    listing_buf: Vec<String>,
 }
 
 impl Pop3ClientEndpoint {
@@ -126,7 +124,6 @@ impl Pop3ClientEndpoint {
             message_timeout,
             message_timer: None,
             outbound: Vec::with_capacity(256),
-            listing_buf: Vec::new(),
         }
     }
 
@@ -212,36 +209,9 @@ impl Pop3ClientEndpoint {
         ep.close();
     }
 
-    // ── CAPA parsing (RFC 2449) ───────────────────────────────────────────
-
-    fn parse_capa(lines: &[String]) -> Pop3Capabilities {
-        let mut caps = Pop3Capabilities::default();
-        for line in lines {
-            let upper = line.to_ascii_uppercase();
-            match upper.as_str() {
-                "USER" => caps.user = true,
-                "TOP" => caps.top = true,
-                "UIDL" => caps.uidl = true,
-                "STLS" => caps.stls = true,
-                "PIPELINING" => caps.pipelining = true,
-                "UTF8" => caps.utf8 = true,
-                _ => {
-                    if upper.starts_with("SASL") {
-                        for mech in line[4..].split_whitespace() {
-                            caps.sasl_mechs.push(mech.to_ascii_uppercase());
-                        }
-                    } else if upper.starts_with("IMPLEMENTATION") && line.len() > 14 {
-                        caps.implementation = Some(line[14..].trim().to_string());
-                    }
-                }
-            }
-        }
-        caps
-    }
-
     // ── Event dispatch ────────────────────────────────────────────────────
 
-    fn dispatch_event(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn dispatch_event(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         self.cancel_stage_timer();
 
         let state = self.proto_state.clone();
@@ -264,7 +234,8 @@ impl Pop3ClientEndpoint {
             ProtoState::DeleSent => self.handle_dele(event, ep),
             ProtoState::RsetSent => self.handle_rset(event, ep),
             ProtoState::NoopSent => self.handle_noop(event, ep),
-            ProtoState::QuitSent | ProtoState::Closed => {
+            ProtoState::QuitSent => self.handle_quit(ep),
+            ProtoState::Closed => {
                 self.proto_state = ProtoState::Closed;
                 ep.close();
             }
@@ -278,105 +249,85 @@ impl Pop3ClientEndpoint {
 
     // ── Per-state handlers ────────────────────────────────────────────────
 
-    fn handle_greeting(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_greeting(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         match event {
-            Pop3WireEvent::Ok { text } => {
-                let ts = extract_apop_timestamp(&text);
-                // Stay in a neutral state; driver will call capa/user/apop/auth.
-                // We set Transaction as a "ready to accept auth commands" marker.
+            Pop3Event::ServerGreeting { apop_challenge } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_greeting(self, ep, &text, ts.as_deref());
+                driver.on_greeting(self, ep, apop_challenge.as_ref());
             }
-            _ => {
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Error;
-                let err = io::Error::new(io::ErrorKind::ConnectionRefused, "POP3 server rejected");
+                let err = io::Error::new(io::ErrorKind::ConnectionRefused, message);
                 driver.on_error(ep, &err);
                 ep.close();
             }
+            _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn handle_capa_auth(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
-        match event {
-            Pop3WireEvent::Ok { .. } | Pop3WireEvent::ListingLine { .. } => {
-                // Accumulation is done in the receive loop.
-            }
-            Pop3WireEvent::ListingEnd => {
-                let lines = std::mem::take(&mut self.listing_buf);
-                let caps = Self::parse_capa(&lines);
-                self.caps = caps.clone();
-                self.proto_state = ProtoState::Transaction;
-                let mut driver = match self.driver.take() {
-                    Some(d) => d,
-                    None => return,
-                };
-                driver.on_capa(self, ep, &caps);
-                self.driver = Some(driver);
-            }
-            Pop3WireEvent::Err { .. } => {
-                // Server doesn't support CAPA — treat as minimal capabilities.
-                let caps = Pop3Capabilities { user: true, ..Default::default() };
-                self.caps = caps.clone();
-                self.proto_state = ProtoState::Transaction;
-                let mut driver = match self.driver.take() {
-                    Some(d) => d,
-                    None => return,
-                };
-                driver.on_capa(self, ep, &caps);
-                self.driver = Some(driver);
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_capa_post_tls(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
-        match event {
-            Pop3WireEvent::Ok { .. } | Pop3WireEvent::ListingLine { .. } => {}
-            Pop3WireEvent::ListingEnd => {
-                let lines = std::mem::take(&mut self.listing_buf);
-                let caps = Self::parse_capa(&lines);
-                self.caps = caps.clone();
-                self.proto_state = ProtoState::Transaction;
-                let mut driver = match self.driver.take() {
-                    Some(d) => d,
-                    None => return,
-                };
-                driver.on_capa_post_stls(self, ep, &caps);
-                self.driver = Some(driver);
-            }
-            Pop3WireEvent::Err { .. } => {
-                let caps = Pop3Capabilities { user: true, ..Default::default() };
-                self.caps = caps.clone();
-                self.proto_state = ProtoState::Transaction;
-                let mut driver = match self.driver.take() {
-                    Some(d) => d,
-                    None => return,
-                };
-                driver.on_capa_post_stls(self, ep, &caps);
-                self.driver = Some(driver);
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_user(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_capa_auth(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         match event {
-            Pop3WireEvent::Ok { .. } => {
+            Pop3Event::Capa(caps) => {
+                self.caps = caps.clone();
+                self.proto_state = ProtoState::Transaction;
+                driver.on_capa(self, ep, &caps);
+            }
+            Pop3Event::Err { .. } => {
+                // Server doesn't support CAPA — treat as minimal capabilities.
+                let caps = Pop3Capabilities { user: true, ..Default::default() };
+                self.caps = caps.clone();
+                self.proto_state = ProtoState::Transaction;
+                driver.on_capa(self, ep, &caps);
+            }
+            _ => {}
+        }
+        self.driver = Some(driver);
+    }
+
+    fn handle_capa_post_tls(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
+        match event {
+            Pop3Event::Capa(caps) => {
+                self.caps = caps.clone();
+                self.proto_state = ProtoState::Transaction;
+                driver.on_capa_post_stls(self, ep, &caps);
+            }
+            Pop3Event::Err { .. } => {
+                let caps = Pop3Capabilities { user: true, ..Default::default() };
+                self.caps = caps.clone();
+                self.proto_state = ProtoState::Transaction;
+                driver.on_capa_post_stls(self, ep, &caps);
+            }
+            _ => {}
+        }
+        self.driver = Some(driver);
+    }
+
+    fn handle_user(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
+        match event {
+            Pop3Event::UserOk => {
                 self.proto_state = ProtoState::Transaction;
                 driver.on_user_ok(self, ep);
             }
-            Pop3WireEvent::Err { text } => {
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_auth_failed(self, ep, &text);
+                driver.on_auth_failed(self, ep, &message);
             }
             _ => {
                 self.proto_state = ProtoState::Error;
@@ -389,19 +340,19 @@ impl Pop3ClientEndpoint {
         self.driver = Some(driver);
     }
 
-    fn handle_pass(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_pass(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         match event {
-            Pop3WireEvent::Ok { .. } => {
+            Pop3Event::Authenticated => {
                 self.proto_state = ProtoState::Transaction;
                 driver.on_authenticated(self, ep);
             }
-            Pop3WireEvent::Err { text } => {
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_auth_failed(self, ep, &text);
+                driver.on_auth_failed(self, ep, &message);
             }
             _ => {
                 self.proto_state = ProtoState::Error;
@@ -414,42 +365,42 @@ impl Pop3ClientEndpoint {
         self.driver = Some(driver);
     }
 
-    fn handle_apop(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_apop(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         match event {
-            Pop3WireEvent::Ok { .. } => {
+            Pop3Event::Authenticated => {
                 self.proto_state = ProtoState::Transaction;
                 driver.on_authenticated(self, ep);
             }
-            Pop3WireEvent::Err { text } => {
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_auth_failed(self, ep, &text);
+                driver.on_auth_failed(self, ep, &message);
             }
             _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn handle_auth(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_auth(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         match event {
-            Pop3WireEvent::Ok { .. } => {
+            Pop3Event::Authenticated => {
                 self.proto_state = ProtoState::Transaction;
                 driver.on_authenticated(self, ep);
             }
-            Pop3WireEvent::Err { text } => {
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_auth_failed(self, ep, &text);
+                driver.on_auth_failed(self, ep, &message);
             }
-            Pop3WireEvent::Continue { text } => {
+            Pop3Event::AuthChallenge { data } => {
                 // Stay in AuthSent; driver may respond or abort.
-                driver.on_auth_challenge(self, ep, &text);
+                driver.on_auth_challenge(self, ep, &data);
             }
             _ => {
                 self.proto_state = ProtoState::Error;
@@ -462,13 +413,13 @@ impl Pop3ClientEndpoint {
         self.driver = Some(driver);
     }
 
-    fn handle_stls(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_stls(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         match event {
-            Pop3WireEvent::Ok { .. } => {
+            Pop3Event::StlsOk => {
                 if let (Some(connector), Some(server_name)) =
                     (self.tls_connector.clone(), self.tls_server_name.clone())
                 {
@@ -484,7 +435,7 @@ impl Pop3ClientEndpoint {
                     ep.close();
                 }
             }
-            Pop3WireEvent::Err { .. } => {
+            Pop3Event::Err { .. } => {
                 self.proto_state = ProtoState::Transaction;
                 driver.on_tls_unavailable(self, ep);
             }
@@ -493,20 +444,19 @@ impl Pop3ClientEndpoint {
         self.driver = Some(driver);
     }
 
-    fn handle_stat(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_stat(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         match event {
-            Pop3WireEvent::Ok { text } => {
-                let (count, octets) = parse_stat(&text);
+            Pop3Event::Stat { count, octets } => {
                 self.proto_state = ProtoState::Transaction;
                 driver.on_stat(self, ep, count, octets);
             }
-            Pop3WireEvent::Err { text } => {
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Error;
-                let err = io::Error::new(io::ErrorKind::Other, format!("STAT failed: {text}"));
+                let err = io::Error::new(io::ErrorKind::Other, format!("STAT failed: {message}"));
                 driver.on_error(ep, &err);
                 ep.close();
             }
@@ -515,197 +465,187 @@ impl Pop3ClientEndpoint {
         self.driver = Some(driver);
     }
 
-    fn handle_list_all(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_list_all(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
         match event {
-            Pop3WireEvent::Ok { .. } | Pop3WireEvent::ListingLine { .. } => {
-                // Listing lines accumulated in receive loop.
+            // ListStart has no driver callback (matches Gumdrop:
+            // dispatchListReply's OK branch transitions to LIST_DATA
+            // silently — entries just start arriving).
+            Pop3Event::ListEntry { message, octets } => {
+                driver.on_list_entry(message, octets);
             }
-            Pop3WireEvent::ListingEnd => {
-                let lines = std::mem::take(&mut self.listing_buf);
-                let mut driver = match self.driver.take() {
-                    Some(d) => d,
-                    None => return,
-                };
+            Pop3Event::ListEnd => {
                 self.proto_state = ProtoState::Transaction;
-                for line in &lines {
-                    if let Some((msg, size)) = parse_list_entry(line) {
-                        driver.on_list_entry(msg, size);
-                    }
-                }
                 driver.on_list_complete(self, ep);
-                self.driver = Some(driver);
             }
-            Pop3WireEvent::Err { text } => {
-                let mut driver = match self.driver.take() {
-                    Some(d) => d,
-                    None => return,
-                };
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Error;
-                let err = io::Error::new(io::ErrorKind::Other, format!("LIST failed: {text}"));
+                let err = io::Error::new(io::ErrorKind::Other, format!("LIST failed: {message}"));
                 driver.on_error(ep, &err);
                 ep.close();
-                self.driver = Some(driver);
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_list_one(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint, _n: u32) {
-        let mut driver = match self.driver.take() {
-            Some(d) => d,
-            None => return,
-        };
-        match event {
-            Pop3WireEvent::Ok { text } => {
-                self.proto_state = ProtoState::Transaction;
-                if let Some((msg, size)) = parse_list_entry(&text) {
-                    driver.on_list_single(self, ep, msg, size);
-                }
-            }
-            Pop3WireEvent::Err { text } => {
-                self.proto_state = ProtoState::Transaction;
-                driver.on_no_such_message(self, ep, &text);
             }
             _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn handle_uidl_all(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_list_one(&mut self, event: Pop3Event, ep: &mut dyn Endpoint, _n: u32) {
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
         match event {
-            Pop3WireEvent::Ok { .. } | Pop3WireEvent::ListingLine { .. } => {}
-            Pop3WireEvent::ListingEnd => {
-                let lines = std::mem::take(&mut self.listing_buf);
-                let mut driver = match self.driver.take() {
-                    Some(d) => d,
-                    None => return,
-                };
+            Pop3Event::ListSingle { message, octets } => {
                 self.proto_state = ProtoState::Transaction;
-                for line in &lines {
-                    if let Some((msg, uid)) = parse_uidl_entry(line) {
-                        driver.on_uidl_entry(msg, uid);
-                    }
-                }
+                driver.on_list_single(self, ep, message, octets);
+            }
+            Pop3Event::Err { message } => {
+                self.proto_state = ProtoState::Transaction;
+                driver.on_no_such_message(self, ep, &message);
+            }
+            _ => {}
+        }
+        self.driver = Some(driver);
+    }
+
+    fn handle_uidl_all(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
+        match event {
+            // UidlStart has no driver callback (matches Gumdrop).
+            Pop3Event::UidlEntry { message, uid } => {
+                driver.on_uidl_entry(message, &uid);
+            }
+            Pop3Event::UidlEnd => {
+                self.proto_state = ProtoState::Transaction;
                 driver.on_uidl_complete(self, ep);
-                self.driver = Some(driver);
             }
-            Pop3WireEvent::Err { text } => {
-                let mut driver = match self.driver.take() {
-                    Some(d) => d,
-                    None => return,
-                };
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Error;
-                let err = io::Error::new(io::ErrorKind::Other, format!("UIDL failed: {text}"));
+                let err = io::Error::new(io::ErrorKind::Other, format!("UIDL failed: {message}"));
                 driver.on_error(ep, &err);
                 ep.close();
-                self.driver = Some(driver);
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_uidl_one(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint, _n: u32) {
-        let mut driver = match self.driver.take() {
-            Some(d) => d,
-            None => return,
-        };
-        match event {
-            Pop3WireEvent::Ok { text } => {
-                self.proto_state = ProtoState::Transaction;
-                if let Some((msg, uid)) = parse_uidl_entry(&text) {
-                    driver.on_uidl_single(self, ep, msg, uid);
-                }
-            }
-            Pop3WireEvent::Err { text } => {
-                self.proto_state = ProtoState::Transaction;
-                driver.on_no_such_message(self, ep, &text);
             }
             _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn handle_retr_sent(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint, n: u32) {
+    fn handle_uidl_one(&mut self, event: Pop3Event, ep: &mut dyn Endpoint, _n: u32) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         match event {
-            Pop3WireEvent::Ok { .. } => {
+            Pop3Event::UidlSingle { message, uid } => {
+                self.proto_state = ProtoState::Transaction;
+                driver.on_uidl_single(self, ep, message, &uid);
+            }
+            Pop3Event::Err { message } => {
+                self.proto_state = ProtoState::Transaction;
+                driver.on_no_such_message(self, ep, &message);
+            }
+            _ => {}
+        }
+        self.driver = Some(driver);
+    }
+
+    fn handle_retr_sent(&mut self, event: Pop3Event, ep: &mut dyn Endpoint, n: u32) {
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
+        match event {
+            Pop3Event::RetrStart => {
+                // No driver callback here (matches Gumdrop: content just
+                // starts arriving via on_message_content).
                 self.unstuffer.reset();
                 self.proto_state = ProtoState::RetrBody(n);
                 self.arm_message_timer(ep);
             }
-            Pop3WireEvent::Err { text } => {
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_no_such_message(self, ep, &text);
+                driver.on_no_such_message(self, ep, &message);
             }
             _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn handle_top_sent(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint, n: u32) {
+    fn handle_top_sent(&mut self, event: Pop3Event, ep: &mut dyn Endpoint, n: u32) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         match event {
-            Pop3WireEvent::Ok { .. } => {
+            Pop3Event::TopStart => {
+                // No driver callback here (matches Gumdrop).
                 self.unstuffer.reset();
                 self.proto_state = ProtoState::TopBody(n);
                 self.arm_message_timer(ep);
             }
-            Pop3WireEvent::Err { text } => {
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_no_such_message(self, ep, &text);
+                driver.on_no_such_message(self, ep, &message);
             }
             _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn handle_dele(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_dele(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         match event {
-            Pop3WireEvent::Ok { .. } => {
+            Pop3Event::DeleOk => {
                 self.proto_state = ProtoState::Transaction;
                 driver.on_dele_ok(self, ep);
             }
-            Pop3WireEvent::Err { text } => {
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_no_such_message(self, ep, &text);
+                driver.on_no_such_message(self, ep, &message);
             }
             _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn handle_rset(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_rset(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        if let Pop3WireEvent::Ok { .. } = event {
+        if let Pop3Event::RsetOk = event {
             self.proto_state = ProtoState::Transaction;
             driver.on_rset_ok(self, ep);
         }
         self.driver = Some(driver);
     }
 
-    fn handle_noop(&mut self, event: Pop3WireEvent, ep: &mut dyn Endpoint) {
+    fn handle_noop(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        if let Pop3WireEvent::Ok { .. } = event {
+        if let Pop3Event::NoopOk = event {
             self.proto_state = ProtoState::Transaction;
             driver.on_noop_ok(self, ep);
         }
         self.driver = Some(driver);
+    }
+
+    fn handle_quit(&mut self, ep: &mut dyn Endpoint) {
+        // No driver callback (matches Gumdrop: dispatchResponse's
+        // QUIT_SENT case closes unconditionally, regardless of reply).
+        self.proto_state = ProtoState::Closed;
+        ep.close();
     }
 
     fn handle_body_complete(&mut self, ep: &mut dyn Endpoint) {
@@ -733,6 +673,7 @@ impl ProtocolHandler for Pop3ClientEndpoint {
             // Implicit TLS: wait for security_established before expecting the greeting.
             return;
         }
+        self.lexer.expect(Pop3ReplyShape::Greeting);
         self.arm_stage_timer(ep);
     }
 
@@ -768,9 +709,10 @@ impl ProtocolHandler for Pop3ClientEndpoint {
                 continue;
             }
 
-            // Status / listing mode: feed to the reply lexer.
-            // The lexer updates *data after each line, so remaining bytes are
-            // available for the next iteration after a body-mode transition.
+            // Status / listing mode: feed to the reply lexer. The lexer
+            // updates *data after each event batch (and immediately on
+            // RetrStart/TopStart), so remaining bytes are available for
+            // the next iteration after a body-mode transition.
             let events = match self.lexer.feed(data) {
                 Ok(e) => e,
                 Err(e) => {
@@ -780,16 +722,12 @@ impl ProtocolHandler for Pop3ClientEndpoint {
             };
 
             if events.is_empty() {
-                break; // no complete line yet; wait for more bytes
+                break; // no complete field yet; wait for more bytes
             }
 
             for event in events {
                 if matches!(self.proto_state, ProtoState::Closed | ProtoState::Error) {
                     break;
-                }
-                // Listing lines are accumulated in the buffer before dispatching.
-                if let Pop3WireEvent::ListingLine { ref text } = event {
-                    self.listing_buf.push(text.clone());
                 }
                 self.dispatch_event(event, ep);
                 self.flush_outbound(ep);
@@ -803,6 +741,7 @@ impl ProtocolHandler for Pop3ClientEndpoint {
         if self.implicit_tls_pending {
             // Implicit TLS handshake done; now wait for POP3 greeting.
             self.implicit_tls_pending = false;
+            self.lexer.expect(Pop3ReplyShape::Greeting);
             self.arm_stage_timer(ep);
             return;
         }
@@ -853,23 +792,25 @@ impl ProtocolHandler for Pop3ClientEndpoint {
 impl Pop3ClientAuthorization for Pop3ClientEndpoint {
     fn capa(&mut self) {
         self.proto_state = ProtoState::CapaAuthSent;
-        self.listing_buf.clear();
-        self.lexer.expect_multiline();
+        self.lexer.expect(Pop3ReplyShape::Capa);
         self.write_line("CAPA");
     }
 
     fn user(&mut self, username: &str) {
         self.proto_state = ProtoState::UserSent;
+        self.lexer.expect(Pop3ReplyShape::User);
         self.write_line(&format!("USER {username}"));
     }
 
     fn apop(&mut self, username: &str, digest: &str) {
         self.proto_state = ProtoState::ApopSent;
+        self.lexer.expect(Pop3ReplyShape::Apop);
         self.write_line(&format!("APOP {username} {digest}"));
     }
 
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) {
         self.proto_state = ProtoState::AuthSent;
+        self.lexer.expect(Pop3ReplyShape::Auth);
         match initial {
             Some(b) => {
                 let enc = base64::engine::general_purpose::STANDARD.encode(b);
@@ -881,11 +822,13 @@ impl Pop3ClientAuthorization for Pop3ClientEndpoint {
 
     fn stls(&mut self) {
         self.proto_state = ProtoState::StlsSent;
+        self.lexer.expect(Pop3ReplyShape::Stls);
         self.write_line("STLS");
     }
 
     fn quit(&mut self) {
         self.proto_state = ProtoState::QuitSent;
+        self.lexer.expect(Pop3ReplyShape::Quit);
         self.write_line("QUIT");
     }
 }
@@ -895,11 +838,13 @@ impl Pop3ClientAuthorization for Pop3ClientEndpoint {
 impl Pop3ClientPassword for Pop3ClientEndpoint {
     fn pass(&mut self, password: &str) {
         self.proto_state = ProtoState::PassSent;
+        self.lexer.expect(Pop3ReplyShape::Pass);
         self.write_line(&format!("PASS {password}"));
     }
 
     fn quit(&mut self) {
         self.proto_state = ProtoState::QuitSent;
+        self.lexer.expect(Pop3ReplyShape::Quit);
         self.write_line("QUIT");
     }
 }
@@ -909,23 +854,25 @@ impl Pop3ClientPassword for Pop3ClientEndpoint {
 impl Pop3ClientPostStls for Pop3ClientEndpoint {
     fn capa(&mut self) {
         self.proto_state = ProtoState::CapaPostTlsSent;
-        self.listing_buf.clear();
-        self.lexer.expect_multiline();
+        self.lexer.expect(Pop3ReplyShape::Capa);
         self.write_line("CAPA");
     }
 
     fn user(&mut self, username: &str) {
         self.proto_state = ProtoState::UserSent;
+        self.lexer.expect(Pop3ReplyShape::User);
         self.write_line(&format!("USER {username}"));
     }
 
     fn apop(&mut self, username: &str, digest: &str) {
         self.proto_state = ProtoState::ApopSent;
+        self.lexer.expect(Pop3ReplyShape::Apop);
         self.write_line(&format!("APOP {username} {digest}"));
     }
 
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) {
         self.proto_state = ProtoState::AuthSent;
+        self.lexer.expect(Pop3ReplyShape::Auth);
         match initial {
             Some(b) => {
                 let enc = base64::engine::general_purpose::STANDARD.encode(b);
@@ -937,6 +884,7 @@ impl Pop3ClientPostStls for Pop3ClientEndpoint {
 
     fn quit(&mut self) {
         self.proto_state = ProtoState::QuitSent;
+        self.lexer.expect(Pop3ReplyShape::Quit);
         self.write_line("QUIT");
     }
 }
@@ -946,12 +894,14 @@ impl Pop3ClientPostStls for Pop3ClientEndpoint {
 impl Pop3ClientAuthExchange for Pop3ClientEndpoint {
     fn respond(&mut self, response: &[u8]) {
         self.proto_state = ProtoState::AuthSent;
+        self.lexer.expect(Pop3ReplyShape::Auth);
         let enc = base64::engine::general_purpose::STANDARD.encode(response);
         self.write_line(&enc);
     }
 
     fn abort(&mut self) {
         self.proto_state = ProtoState::AuthSent;
+        self.lexer.expect(Pop3ReplyShape::Auth);
         self.write_line("*");
     }
 }
@@ -961,6 +911,7 @@ impl Pop3ClientAuthExchange for Pop3ClientEndpoint {
 impl Pop3ClientTransaction for Pop3ClientEndpoint {
     fn stat(&mut self) {
         self.proto_state = ProtoState::StatSent;
+        self.lexer.expect(Pop3ReplyShape::Stat);
         self.write_line("STAT");
     }
 
@@ -968,12 +919,12 @@ impl Pop3ClientTransaction for Pop3ClientEndpoint {
         match message {
             Some(n) => {
                 self.proto_state = ProtoState::ListOneSent(n);
+                self.lexer.expect(Pop3ReplyShape::ListSingle);
                 self.write_line(&format!("LIST {n}"));
             }
             None => {
                 self.proto_state = ProtoState::ListAllSent;
-                self.listing_buf.clear();
-                self.lexer.expect_multiline();
+                self.lexer.expect(Pop3ReplyShape::ListAll);
                 self.write_line("LIST");
             }
         }
@@ -981,23 +932,25 @@ impl Pop3ClientTransaction for Pop3ClientEndpoint {
 
     fn retr(&mut self, message: u32) {
         self.proto_state = ProtoState::RetrSent(message);
-        self.lexer.stop_after_ok = true;
+        self.lexer.expect(Pop3ReplyShape::Retr);
         self.write_line(&format!("RETR {message}"));
     }
 
     fn dele(&mut self, message: u32) {
         self.proto_state = ProtoState::DeleSent;
+        self.lexer.expect(Pop3ReplyShape::Dele);
         self.write_line(&format!("DELE {message}"));
     }
 
     fn rset(&mut self) {
         self.proto_state = ProtoState::RsetSent;
+        self.lexer.expect(Pop3ReplyShape::Rset);
         self.write_line("RSET");
     }
 
     fn top(&mut self, message: u32, lines: u32) {
         self.proto_state = ProtoState::TopSent(message);
-        self.lexer.stop_after_ok = true;
+        self.lexer.expect(Pop3ReplyShape::Top);
         self.write_line(&format!("TOP {message} {lines}"));
     }
 
@@ -1005,12 +958,12 @@ impl Pop3ClientTransaction for Pop3ClientEndpoint {
         match message {
             Some(n) => {
                 self.proto_state = ProtoState::UidlOneSent(n);
+                self.lexer.expect(Pop3ReplyShape::UidlSingle);
                 self.write_line(&format!("UIDL {n}"));
             }
             None => {
                 self.proto_state = ProtoState::UidlAllSent;
-                self.listing_buf.clear();
-                self.lexer.expect_multiline();
+                self.lexer.expect(Pop3ReplyShape::UidlAll);
                 self.write_line("UIDL");
             }
         }
@@ -1018,44 +971,13 @@ impl Pop3ClientTransaction for Pop3ClientEndpoint {
 
     fn noop(&mut self) {
         self.proto_state = ProtoState::NoopSent;
+        self.lexer.expect(Pop3ReplyShape::Noop);
         self.write_line("NOOP");
     }
 
     fn quit(&mut self) {
         self.proto_state = ProtoState::QuitSent;
+        self.lexer.expect(Pop3ReplyShape::Quit);
         self.write_line("QUIT");
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Extract the APOP challenge `<timestamp>` from a POP3 greeting line.
-pub(crate) fn extract_apop_timestamp(greeting: &str) -> Option<String> {
-    let start = greeting.find('<')?;
-    let end = greeting[start..].find('>')? + start + 1;
-    Some(greeting[start..end].to_string())
-}
-
-/// Parse `count octets` from STAT response text.
-fn parse_stat(text: &str) -> (u32, u64) {
-    let mut parts = text.split_whitespace();
-    let count = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let octets = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    (count, octets)
-}
-
-/// Parse `n size` from a LIST listing line or single-response text.
-fn parse_list_entry(line: &str) -> Option<(u32, u64)> {
-    let mut parts = line.split_whitespace();
-    let msg: u32 = parts.next()?.parse().ok()?;
-    let size: u64 = parts.next()?.parse().ok()?;
-    Some((msg, size))
-}
-
-/// Parse `n uid` from a UIDL listing line or single-response text.
-fn parse_uidl_entry(line: &str) -> Option<(u32, &str)> {
-    let space = line.find(' ')?;
-    let msg: u32 = line[..space].parse().ok()?;
-    let uid = &line[space + 1..];
-    Some((msg, uid))
 }

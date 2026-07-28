@@ -1,144 +1,655 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! SMTP reply type and incremental parser.
+//! Incremental, semantic SMTP client reply parser.
+//!
+//! [`SmtpReplyLexer`] never buffers a whole reply line and re-parses it.
+//! The 3-digit code is accumulated one digit at a time; once known, the
+//! text that follows is either scanned-and-discarded (decorative — most
+//! success replies, where the driver call it feeds takes no message text
+//! today) or kept in a bounded scratch buffer (diagnostics on rejection,
+//! and the handful of replies whose text carries real structure: EHLO's
+//! per-line capabilities, AUTH's base64 challenge, the queue-id embedded
+//! in a post-DATA 250). [`SmtpEvent`] is emitted once each reply
+//! completes, already parsed — never a raw code+text pair for the caller
+//! to re-interpret.
+//!
+//! The caller tells the lexer what shape of reply to expect via
+//! [`SmtpReplyLexer::expect`], right after sending the corresponding
+//! command — SMTP's *codes* mean the same thing everywhere (2xx/3xx
+//! success, 4xx/5xx failure), but what the client does with the
+//! accompanying text depends on which command is in flight.
+//!
+//! RFC 5321 §4.2.1's `421 <service closing>` can arrive under any shape
+//! (the server can drop the connection at any point in the exchange) and
+//! is handled uniformly regardless of what was expected.
 
-use super::error::{SmtpError, SmtpResult};
+use base64::Engine;
 
-/// One complete SMTP reply (possibly multiline).
+use super::error::SmtpError;
+use super::state::SmtpCapabilities;
+
+/// Cap on one buffered field (rejection/error diagnostics, an EHLO line,
+/// an AUTH challenge, the text scanned for a queue-id), so a server that
+/// never sends a delimiter can't grow the lexer's scratch buffer without
+/// bound. Decorative success text is never buffered at all — this bound
+/// only applies to fields the parser actually keeps.
+pub const MAX_REPLY_LINE: usize = 16 * 1024;
+
+/// What shape of reply to expect, set via [`SmtpReplyLexer::expect`] right
+/// after sending the corresponding command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmtpReplyShape {
+    /// The initial greeting.
+    Greeting,
+    /// `EHLO`.
+    Ehlo,
+    /// `HELO`.
+    Helo,
+    /// `STARTTLS`.
+    Starttls,
+    /// `AUTH` (initial send, and every subsequent challenge response).
+    Auth,
+    /// `MAIL FROM`.
+    MailFrom,
+    /// `RCPT TO`.
+    RcptTo,
+    /// `DATA` (the command itself, before content).
+    DataCommand,
+    /// End-of-data (`CRLF.CRLF`).
+    DataEnd,
+    /// `RSET`.
+    Rset,
+    /// `QUIT`.
+    Quit,
+}
+
+/// Semantic events. Every variant carries already-parsed, ready-to-use
+/// data — never a raw code+text pair for the caller to re-interpret.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SmtpReply {
-    /// Three-digit reply code.
-    pub code: u16,
-    /// Lines of text without the code prefix.
-    pub lines: Vec<String>,
+pub enum SmtpEvent {
+    /// 220 greeting.
+    Greeting {
+        /// `true` if "ESMTP" appeared in the banner text — the text
+        /// itself is scanned for that and then discarded.
+        esmtp: bool,
+    },
+    /// Non-220, non-421 greeting.
+    ServiceUnavailable {
+        /// The server's diagnostic text.
+        message: String,
+    },
+    /// 250 (multiline) EHLO response, fully parsed (RFC 5321 §4.1.1.1).
+    Ehlo(SmtpCapabilities),
+    /// 502 — EHLO not supported.
+    EhloNotSupported,
+    /// EHLO permanent failure (5xx other than 502).
+    EhloError {
+        /// The server's diagnostic text.
+        message: String,
+    },
+    /// 250 HELO response (no message text — matches the driver call it
+    /// feeds, which takes none).
+    Helo,
+    /// HELO failure.
+    HeloError {
+        /// The server's diagnostic text.
+        message: String,
+    },
+    /// 220 to STARTTLS — the endpoint drives the TLS handshake next.
+    StarttlsAccepted,
+    /// 454/502 to STARTTLS — recoverable, session continues without TLS.
+    TlsUnavailable,
+    /// STARTTLS permanently rejected (5xx other than 502, e.g. 554) —
+    /// connection is closed, matching Gumdrop's `handlePermanentFailure`.
+    TlsError {
+        /// The server's diagnostic text.
+        message: String,
+    },
+    /// 235 — AUTH succeeded.
+    AuthOk,
+    /// 334 — AUTH challenge, already base64-decoded.
+    AuthChallenge {
+        /// Decoded challenge bytes.
+        data: Vec<u8>,
+    },
+    /// 535/504/454 — AUTH failed. `code` lets the driver distinguish bad
+    /// credentials (535) from an unsupported mechanism (504) or a
+    /// temporary failure (454) worth retrying.
+    AuthFailed {
+        /// The server's 3-digit reply code.
+        code: u16,
+    },
+    /// 250 MAIL FROM accepted.
+    MailOk,
+    /// MAIL FROM rejected.
+    MailRejected {
+        /// The server's 3-digit reply code.
+        code: u16,
+        /// The server's diagnostic text.
+        message: String,
+    },
+    /// 250/251/252 RCPT TO accepted.
+    RcptOk,
+    /// RCPT TO rejected.
+    RcptRejected {
+        /// The server's 3-digit reply code.
+        code: u16,
+        /// The server's diagnostic text.
+        message: String,
+    },
+    /// 354 — ready for DATA.
+    ReadyForData,
+    /// DATA command rejected, or the message rejected after end-of-data.
+    MessageRejected {
+        /// The server's 3-digit reply code.
+        code: u16,
+        /// The server's diagnostic text.
+        message: String,
+    },
+    /// 250 after end-of-data. `queue_id` is scanned from the reply text
+    /// ("queued as X" / "message accepted for delivery X") if present.
+    MessageAccepted {
+        /// The server's queue identifier, if present in the reply text.
+        queue_id: Option<String>,
+    },
+    /// RSET accepted (RFC 5321: RSET has no failure path).
+    RsetOk,
+    /// 421 — service closing. Can arrive under any shape.
+    ServiceClosing {
+        /// The server's diagnostic text.
+        message: String,
+    },
 }
 
-impl SmtpReply {
-    /// Primary text — first line of the reply.
-    pub fn text(&self) -> String {
-        self.lines.first().cloned().unwrap_or_default()
-    }
+// ── Internal FSM ─────────────────────────────────────────────────────────────
 
-    /// All lines joined with newlines.
-    pub fn full_text(&self) -> String {
-        self.lines.join("\n")
-    }
+/// What the current line's text field is, decided once the 3-digit code
+/// and separator are known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    /// Decorative text: scan for CRLF, never store.
+    SkipToEol,
+    /// Bounded diagnostic text, kept.
+    KeepText,
+    /// Greeting banner: scanned for "ESMTP" (case-insensitive), discarded.
+    GreetingText,
+    /// One EHLO capability line, bounded, parsed into `caps` on CR.
+    EhloLine,
+    /// AUTH challenge text, bounded, base64-decoded on CR.
+    AuthChallengeText,
+    /// First line of a post-DATA 250, bounded, scanned for a queue-id.
+    QueueIdText,
 }
 
-/// Incremental SMTP reply lexer.
-///
-/// Self-contained streaming parser: [`SmtpReplyLexer::feed`] consumes every
-/// byte it is given — `*data` is always left empty — and keeps a line in
-/// progress in its own `line_buf` scratch buffer, never in a buffer the
-/// caller has to retain and re-supply.
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// Accumulating the 3-digit reply code (0, 1, or 2 digits seen).
+    Code { digits: u8, value: u16 },
+    /// 3 digits seen; next byte is `-` (continuation), SP (final, text
+    /// follows), or CR (final, no text at all — RFC 5321 §4.2 allows a
+    /// bare `code CRLF` final line).
+    Sep { code: u16 },
+    /// Reading a text field.
+    Reading(Field),
+    /// Saw the field's own CR; expect LF next to complete it.
+    FieldCr(Field),
+}
+
+/// Incremental SMTP client-reply parser. See the module docs.
 pub struct SmtpReplyLexer {
-    /// Current line accumulation buffer.
-    line_buf: Vec<u8>,
-    /// Code of the current (possibly multiline) reply in progress.
-    current_code: Option<u16>,
-    /// Accumulated text lines of the current reply.
-    accumulated: Vec<String>,
+    shape: SmtpReplyShape,
+    state: State,
+    /// The 3-digit code of the line most recently completed — read back
+    /// by `finish_reply` once the text field (if any) has also finished,
+    /// since `Sep` (where the code is first known) may have transitioned
+    /// straight into a multi-byte text field read over several `feed()`
+    /// calls before the code is needed again.
+    last_code: u16,
+    /// Code of the multiline reply in progress, if any continuation line
+    /// has been seen (`None` before the first line, or once complete).
+    pending_code: Option<u16>,
+    /// `true` once at least one line of the current reply has completed —
+    /// only the first line gets shape-specific field treatment (kept
+    /// text, ESMTP scan, queue-id scan); continuation lines after it are
+    /// always discarded (matches today's `reply.text()` == first line
+    /// only). EHLO is the one exception: every line matters.
+    seen_first_line: bool,
+    /// Bounded scratch for `KeepText`/`EhloLine`/`AuthChallengeText`/`QueueIdText`.
+    text: String,
+    /// Greeting-only: how many bytes of "ESMTP" have matched so far.
+    esmtp_matched: u8,
+    /// Greeting-only: whether "ESMTP" has been found in the banner.
+    esmtp_found: bool,
+    /// EHLO-only: capabilities accumulated across lines.
+    caps: SmtpCapabilities,
+}
+
+const ESMTP: &[u8] = b"ESMTP";
+
+impl Default for SmtpReplyLexer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SmtpReplyLexer {
+    /// Create a new lexer. Call [`Self::expect`] before feeding the bytes
+    /// of each reply.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            shape: SmtpReplyShape::Greeting,
+            state: State::Code { digits: 0, value: 0 },
+            last_code: 0,
+            pending_code: None,
+            seen_first_line: false,
+            text: String::new(),
+            esmtp_matched: 0,
+            esmtp_found: false,
+            caps: SmtpCapabilities::default(),
+        }
     }
 
-    /// Feed bytes from the wire. Returns completed replies. Consumes
-    /// everything given — `*data` is always left empty. Returns an error on
-    /// malformed input.
-    pub fn feed(&mut self, data: &mut &[u8]) -> SmtpResult<Vec<SmtpReply>> {
-        let mut ready = Vec::new();
+    /// Tell the lexer what shape the next reply takes. Call this right
+    /// after sending the corresponding command.
+    pub fn expect(&mut self, shape: SmtpReplyShape) {
+        self.shape = shape;
+        self.state = State::Code { digits: 0, value: 0 };
+        self.pending_code = None;
+        self.seen_first_line = false;
+        self.caps = SmtpCapabilities::default();
+    }
 
-        'outer: for &b in data.iter() {
-            self.line_buf.push(b);
-
-            // Line cap to avoid unbounded growth on bad servers.
-            if self.line_buf.len() > 16 * 1024 {
-                return Err(SmtpError::Parse("SMTP reply line too long".into()));
+    /// Feed inbound bytes. Returns parsed events; consumes everything
+    /// given (`*data` is always left empty).
+    pub fn feed(&mut self, data: &mut &[u8]) -> Result<Vec<SmtpEvent>, SmtpError> {
+        let mut events = Vec::new();
+        for &b in data.iter() {
+            if let Some(event) = self.push_byte(b)? {
+                events.push(event);
             }
+        }
+        *data = &[];
+        Ok(events)
+    }
 
-            // Wait for CRLF.
-            let n = self.line_buf.len();
-            if n < 2 || self.line_buf[n - 2] != b'\r' || self.line_buf[n - 1] != b'\n' {
-                continue 'outer;
-            }
-
-            // We have a complete line: parse it.
-            let line = std::mem::take(&mut self.line_buf);
-
-            // A line must be at least "XYZ\r\n" (5 bytes).
-            if line.len() < 5 {
-                return Err(SmtpError::Parse(format!(
-                    "SMTP reply line too short: {line:?}"
-                )));
-            }
-
-            // Parse 3-digit code.
-            let code_bytes = &line[..3];
-            if !code_bytes.iter().all(|b| b.is_ascii_digit()) {
-                return Err(SmtpError::Parse(format!(
-                    "SMTP reply: non-digit code in {:?}",
-                    String::from_utf8_lossy(&line)
-                )));
-            }
-            let code: u16 = std::str::from_utf8(code_bytes)
-                .unwrap()
-                .parse()
-                .map_err(|_| SmtpError::Parse("reply code overflow".into()))?;
-
-            // 4th byte: '-' = continuation, ' ' (or anything else) = final.
-            let sep = line[3];
-            let text_bytes = &line[4..line.len() - 2]; // strip code+sep and CRLF
-            let text = String::from_utf8_lossy(text_bytes).into_owned();
-
-            if sep == b'-' {
-                // Continuation line.
-                match self.current_code {
-                    None => {
-                        self.current_code = Some(code);
-                        self.accumulated.push(text);
-                    }
-                    Some(c) if c == code => {
-                        self.accumulated.push(text);
-                    }
-                    Some(c) => {
-                        return Err(SmtpError::Parse(format!(
-                            "SMTP multiline code mismatch: expected {c}, got {code}"
-                        )));
-                    }
-                }
-            } else {
-                // Final line.
-                match self.current_code {
-                    None => {
-                        // Single-line reply.
-                        ready.push(SmtpReply {
-                            code,
-                            lines: vec![text],
-                        });
-                    }
-                    Some(c) if c == code => {
-                        // Last line of a multiline reply.
-                        let mut lines = std::mem::take(&mut self.accumulated);
-                        lines.push(text);
-                        self.current_code = None;
-                        ready.push(SmtpReply { code, lines });
-                    }
-                    Some(c) => {
-                        return Err(SmtpError::Parse(format!(
-                            "SMTP multiline final code mismatch: expected {c}, got {code}"
-                        )));
-                    }
+    fn push_byte(&mut self, b: u8) -> Result<Option<SmtpEvent>, SmtpError> {
+        match self.state {
+            State::Code { digits, value } => self.push_code_byte(digits, value, b),
+            State::Sep { code } => self.push_sep_byte(code, b),
+            State::Reading(field) => self.push_field_byte(field, b),
+            State::FieldCr(field) => {
+                if b == b'\n' {
+                    self.finish_field(field)
+                } else {
+                    Err(SmtpError::Parse("malformed SMTP reply: expected LF after CR".into()))
                 }
             }
         }
-
-        *data = &[];
-        Ok(ready)
     }
+
+    // ── Code + separator ──────────────────────────────────────────────
+
+    fn push_code_byte(
+        &mut self,
+        digits: u8,
+        value: u16,
+        b: u8,
+    ) -> Result<Option<SmtpEvent>, SmtpError> {
+        if !b.is_ascii_digit() {
+            return Err(SmtpError::Parse(format!(
+                "unexpected byte {b:#04x} in SMTP reply code (digit {digits})"
+            )));
+        }
+        let value = value * 10 + u16::from(b - b'0');
+        if digits + 1 == 3 {
+            self.state = State::Sep { code: value };
+        } else {
+            self.state = State::Code { digits: digits + 1, value };
+        }
+        Ok(None)
+    }
+
+    fn push_sep_byte(&mut self, code: u16, b: u8) -> Result<Option<SmtpEvent>, SmtpError> {
+        let is_continuation = match b {
+            b'-' => true,
+            b' ' | b'\r' => false,
+            _ => {
+                return Err(SmtpError::Parse(format!(
+                    "unexpected byte {b:#04x} after SMTP reply code {code}"
+                )))
+            }
+        };
+
+        // Multiline code consistency (RFC 5321 §4.2.1).
+        match self.pending_code {
+            Some(c) if c != code => {
+                return Err(SmtpError::Parse(format!(
+                    "SMTP multiline code mismatch: expected {c}, got {code}"
+                )))
+            }
+            _ => {}
+        }
+        let first_line = !self.seen_first_line;
+        self.pending_code = if is_continuation { Some(code) } else { None };
+        self.last_code = code;
+
+        let field = self.select_field(code, first_line);
+        self.text.clear();
+        if field == Field::GreetingText {
+            self.esmtp_matched = 0;
+        }
+
+        if b == b'\r' {
+            // Bare "code CRLF" — no text at all on this line.
+            self.state = State::FieldCr(field);
+        } else {
+            self.state = State::Reading(field);
+        }
+        Ok(None)
+    }
+
+    /// Decide how to handle this line's text, based on the shape, the
+    /// code just seen, and whether this is the first line of the reply
+    /// (only the first line gets shape-specific treatment for every shape
+    /// except EHLO, where every line carries a capability).
+    fn select_field(&self, code: u16, first_line: bool) -> Field {
+        if code == 421 {
+            return if first_line { Field::KeepText } else { Field::SkipToEol };
+        }
+        if self.shape == SmtpReplyShape::Ehlo && code == 250 {
+            return Field::EhloLine;
+        }
+        if !first_line {
+            return Field::SkipToEol;
+        }
+        match self.shape {
+            SmtpReplyShape::Greeting => {
+                if code == 220 {
+                    Field::GreetingText
+                } else {
+                    Field::KeepText
+                }
+            }
+            SmtpReplyShape::Ehlo => {
+                // Non-250 (EHLO failed): 502 needs no text, other 5xx does.
+                if code == 502 {
+                    Field::SkipToEol
+                } else {
+                    Field::KeepText
+                }
+            }
+            SmtpReplyShape::Helo => {
+                if code == 250 {
+                    Field::SkipToEol
+                } else {
+                    Field::KeepText
+                }
+            }
+            SmtpReplyShape::Starttls => {
+                if code == 220 || code == 454 || code == 502 {
+                    Field::SkipToEol // accepted or recoverably unavailable
+                } else {
+                    Field::KeepText // permanent failure — text goes to TlsError
+                }
+            }
+            SmtpReplyShape::Auth => match code {
+                235 => Field::SkipToEol,
+                334 => Field::AuthChallengeText,
+                _ => Field::SkipToEol, // on_auth_failed takes a code, not text
+            },
+            SmtpReplyShape::MailFrom => {
+                if code == 250 {
+                    Field::SkipToEol
+                } else {
+                    Field::KeepText
+                }
+            }
+            SmtpReplyShape::RcptTo => {
+                if matches!(code, 250 | 251 | 252) {
+                    Field::SkipToEol
+                } else {
+                    Field::KeepText
+                }
+            }
+            SmtpReplyShape::DataCommand => {
+                if code == 354 {
+                    Field::SkipToEol
+                } else {
+                    Field::KeepText
+                }
+            }
+            SmtpReplyShape::DataEnd => {
+                if code == 250 {
+                    Field::QueueIdText
+                } else {
+                    Field::KeepText
+                }
+            }
+            SmtpReplyShape::Rset => Field::SkipToEol, // RSET has no failure path
+            SmtpReplyShape::Quit => Field::SkipToEol, // no reply text is used
+        }
+    }
+
+    // ── Field accumulation ────────────────────────────────────────────
+
+    fn push_field_byte(&mut self, field: Field, b: u8) -> Result<Option<SmtpEvent>, SmtpError> {
+        if b == b'\r' {
+            self.state = State::FieldCr(field);
+            return Ok(None);
+        }
+        match field {
+            Field::SkipToEol => {}
+            Field::GreetingText => self.push_esmtp_byte(b),
+            Field::KeepText | Field::EhloLine | Field::AuthChallengeText | Field::QueueIdText => {
+                if self.text.len() >= MAX_REPLY_LINE {
+                    return Err(SmtpError::Parse("SMTP reply field too long".into()));
+                }
+                self.text.push(b as char);
+            }
+        }
+        Ok(None)
+    }
+
+    /// Case-insensitive streaming match for the fixed pattern "ESMTP". All
+    /// characters in the pattern are distinct, so on a mismatch the only
+    /// possible restart point is "does this byte start a fresh match" —
+    /// no KMP failure-function bookkeeping needed beyond that.
+    fn push_esmtp_byte(&mut self, b: u8) {
+        if self.esmtp_found {
+            return;
+        }
+        let upper = b.to_ascii_uppercase();
+        if upper == ESMTP[self.esmtp_matched as usize] {
+            self.esmtp_matched += 1;
+            if self.esmtp_matched as usize == ESMTP.len() {
+                self.esmtp_found = true;
+            }
+        } else {
+            self.esmtp_matched = u8::from(upper == ESMTP[0]);
+        }
+    }
+
+    fn finish_field(&mut self, field: Field) -> Result<Option<SmtpEvent>, SmtpError> {
+        let was_first_line = !self.seen_first_line;
+        self.seen_first_line = true;
+        let reply_complete = self.pending_code.is_none();
+
+        match field {
+            Field::EhloLine => {
+                if was_first_line {
+                    // First line of EHLO's reply is the greeting-domain
+                    // echo, not a capability — matches today's
+                    // `lines.iter().skip(1)`.
+                } else {
+                    let line = std::mem::take(&mut self.text);
+                    apply_ehlo_line(&mut self.caps, &line);
+                }
+                self.state = State::Code { digits: 0, value: 0 };
+                if reply_complete {
+                    let caps = std::mem::take(&mut self.caps);
+                    Ok(Some(SmtpEvent::Ehlo(caps)))
+                } else {
+                    Ok(None)
+                }
+            }
+            _ if !reply_complete => {
+                // Continuation line of a non-EHLO multiline reply: nothing
+                // to emit yet, keep reading lines.
+                self.state = State::Code { digits: 0, value: 0 };
+                Ok(None)
+            }
+            Field::SkipToEol => {
+                self.state = State::Code { digits: 0, value: 0 };
+                Ok(self.finish_reply(None))
+            }
+            Field::KeepText => {
+                let text = std::mem::take(&mut self.text);
+                self.state = State::Code { digits: 0, value: 0 };
+                Ok(self.finish_reply(Some(text)))
+            }
+            Field::GreetingText => {
+                self.state = State::Code { digits: 0, value: 0 };
+                Ok(self.finish_reply(None))
+            }
+            Field::AuthChallengeText => {
+                let text = std::mem::take(&mut self.text);
+                self.state = State::Code { digits: 0, value: 0 };
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(text.trim().as_bytes())
+                    .unwrap_or_default();
+                Ok(Some(SmtpEvent::AuthChallenge { data }))
+            }
+            Field::QueueIdText => {
+                let text = std::mem::take(&mut self.text);
+                self.state = State::Code { digits: 0, value: 0 };
+                Ok(Some(SmtpEvent::MessageAccepted { queue_id: parse_queue_id(&text) }))
+            }
+        }
+    }
+
+    /// Build the final event for shapes whose outcome only needs the
+    /// code (and, for kept-text fields, the accumulated diagnostic text).
+    fn finish_reply(&mut self, message: Option<String>) -> Option<SmtpEvent> {
+        let code = self.last_code;
+        let esmtp = self.esmtp_found;
+        self.esmtp_matched = 0;
+        self.esmtp_found = false;
+
+        if code == 421 {
+            return Some(SmtpEvent::ServiceClosing { message: message.unwrap_or_default() });
+        }
+
+        Some(match self.shape {
+            SmtpReplyShape::Greeting => {
+                if code == 220 {
+                    SmtpEvent::Greeting { esmtp }
+                } else {
+                    SmtpEvent::ServiceUnavailable { message: message.unwrap_or_default() }
+                }
+            }
+            SmtpReplyShape::Ehlo => {
+                if code == 502 {
+                    SmtpEvent::EhloNotSupported
+                } else {
+                    SmtpEvent::EhloError { message: message.unwrap_or_default() }
+                }
+            }
+            SmtpReplyShape::Helo => {
+                if code == 250 {
+                    SmtpEvent::Helo
+                } else {
+                    SmtpEvent::HeloError { message: message.unwrap_or_default() }
+                }
+            }
+            SmtpReplyShape::Starttls => {
+                if code == 220 {
+                    SmtpEvent::StarttlsAccepted
+                } else if code == 454 || code == 502 {
+                    SmtpEvent::TlsUnavailable
+                } else {
+                    SmtpEvent::TlsError { message: message.unwrap_or_default() }
+                }
+            }
+            SmtpReplyShape::Auth => match code {
+                235 => SmtpEvent::AuthOk,
+                _ => SmtpEvent::AuthFailed { code },
+            },
+            SmtpReplyShape::MailFrom => {
+                if code == 250 {
+                    SmtpEvent::MailOk
+                } else {
+                    SmtpEvent::MailRejected { code, message: message.unwrap_or_default() }
+                }
+            }
+            SmtpReplyShape::RcptTo => {
+                if matches!(code, 250 | 251 | 252) {
+                    SmtpEvent::RcptOk
+                } else {
+                    SmtpEvent::RcptRejected { code, message: message.unwrap_or_default() }
+                }
+            }
+            SmtpReplyShape::DataCommand => {
+                if code == 354 {
+                    SmtpEvent::ReadyForData
+                } else {
+                    SmtpEvent::MessageRejected { code, message: message.unwrap_or_default() }
+                }
+            }
+            SmtpReplyShape::DataEnd => {
+                // 250 goes through Field::QueueIdText, not finish_reply.
+                SmtpEvent::MessageRejected { code, message: message.unwrap_or_default() }
+            }
+            SmtpReplyShape::Rset => SmtpEvent::RsetOk,
+            SmtpReplyShape::Quit => return None, // no driver callback exists for QUIT
+        })
+    }
+}
+
+/// Apply one EHLO continuation line to `caps` (RFC 5321 §4.1.1.1).
+fn apply_ehlo_line(caps: &mut SmtpCapabilities, line: &str) {
+    let upper = line.to_ascii_uppercase();
+    if upper == "STARTTLS" {
+        caps.starttls = true;
+    } else if upper.starts_with("SIZE") {
+        if upper.len() > 5 {
+            if let Ok(n) = line[5..].trim().parse::<u64>() {
+                caps.max_size = n;
+            }
+        }
+    } else if upper.starts_with("AUTH") {
+        for token in line.get(4..).unwrap_or("").split_whitespace() {
+            caps.auth_methods.push(token.to_ascii_uppercase());
+        }
+    } else if upper == "PIPELINING" {
+        caps.pipelining = true;
+    } else if upper == "CHUNKING" {
+        caps.chunking = true;
+    } else if upper == "8BITMIME" {
+        caps.eight_bit_mime = true;
+    } else if upper == "SMTPUTF8" {
+        caps.smtp_utf8 = true;
+    } else if upper == "DSN" {
+        caps.dsn = true;
+    } else if upper == "ENHANCEDSTATUSCODES" {
+        caps.enhanced_status_codes = true;
+    } else if upper == "REQUIRETLS" {
+        caps.require_tls = true;
+    }
+}
+
+/// Extract a queue identifier from a 250 message-accepted text.
+fn parse_queue_id(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    for prefix in &["queued as ", "message accepted for delivery "] {
+        if let Some(idx) = lower.find(prefix) {
+            let rest = message[idx + prefix.len()..].trim();
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            if end > 0 {
+                return Some(rest[..end].to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -146,108 +657,376 @@ mod tests {
     use super::*;
 
     #[test]
-    fn single_line_reply() {
+    fn greeting_esmtp() {
         let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Greeting);
+        let mut data: &[u8] = b"220 mail.example.com ESMTP Postfix\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events, vec![SmtpEvent::Greeting { esmtp: true }]);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn greeting_plain_smtp() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Greeting);
+        let mut data: &[u8] = b"220 mail.example.com Simple Mail Transfer Service Ready\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events, vec![SmtpEvent::Greeting { esmtp: false }]);
+    }
+
+    #[test]
+    fn greeting_esmtp_case_insensitive() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Greeting);
+        let mut data: &[u8] = b"220 host esmtp ready\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events, vec![SmtpEvent::Greeting { esmtp: true }]);
+    }
+
+    #[test]
+    fn greeting_service_unavailable() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Greeting);
+        let mut data: &[u8] = b"554 No SMTP service here\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(
+            events,
+            vec![SmtpEvent::ServiceUnavailable { message: "No SMTP service here".into() }]
+        );
+    }
+
+    #[test]
+    fn service_closing_421_overrides_any_shape() {
+        for shape in [
+            SmtpReplyShape::Greeting,
+            SmtpReplyShape::Ehlo,
+            SmtpReplyShape::MailFrom,
+            SmtpReplyShape::RcptTo,
+            SmtpReplyShape::DataEnd,
+        ] {
+            let mut lex = SmtpReplyLexer::new();
+            lex.expect(shape);
+            let mut data: &[u8] = b"421 mail.example.com Service not available, closing\r\n";
+            let events = lex.feed(&mut data).unwrap();
+            assert_eq!(
+                events,
+                vec![SmtpEvent::ServiceClosing {
+                    message: "mail.example.com Service not available, closing".into()
+                }],
+                "shape {shape:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ehlo_full_capabilities() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Ehlo);
+        let mut data: &[u8] = b"250-mail.example.com Hello\r\n250-SIZE 35882577\r\n250-PIPELINING\r\n250-AUTH PLAIN LOGIN\r\n250-STARTTLS\r\n250 8BITMIME\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SmtpEvent::Ehlo(caps) => {
+                assert_eq!(caps.max_size, 35882577);
+                assert!(caps.pipelining);
+                assert_eq!(caps.auth_methods, vec!["PLAIN", "LOGIN"]);
+                assert!(caps.starttls);
+                assert!(caps.eight_bit_mime);
+            }
+            other => panic!("expected Ehlo, got {other:?}"),
+        }
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn ehlo_split_mid_capability_line() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Ehlo);
+        let mut part1: &[u8] = b"250-mail.example.com\r\n250-STARTT";
+        let e1 = lex.feed(&mut part1).unwrap();
+        assert!(e1.is_empty());
+        let mut part2: &[u8] = b"LS\r\n250 PIPELINING\r\n";
+        let e2 = lex.feed(&mut part2).unwrap();
+        assert_eq!(e2.len(), 1);
+        match &e2[0] {
+            SmtpEvent::Ehlo(caps) => {
+                assert!(caps.starttls);
+                assert!(caps.pipelining);
+            }
+            other => panic!("expected Ehlo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ehlo_not_supported() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Ehlo);
+        let mut data: &[u8] = b"502 Command not implemented\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events, vec![SmtpEvent::EhloNotSupported]);
+    }
+
+    #[test]
+    fn ehlo_error() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Ehlo);
+        let mut data: &[u8] = b"500 Syntax error\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events, vec![SmtpEvent::EhloError { message: "Syntax error".into() }]);
+    }
+
+    #[test]
+    fn helo_ok_and_error() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Helo);
+        let mut data: &[u8] = b"250 mail.example.com\r\n";
+        assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::Helo]);
+
+        lex.expect(SmtpReplyShape::Helo);
+        let mut data2: &[u8] = b"501 Syntax error in parameters\r\n";
+        assert_eq!(
+            lex.feed(&mut data2).unwrap(),
+            vec![SmtpEvent::HeloError { message: "Syntax error in parameters".into() }]
+        );
+    }
+
+    #[test]
+    fn starttls_accepted_and_unavailable() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Starttls);
+        let mut data: &[u8] = b"220 Ready to start TLS\r\n";
+        assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::StarttlsAccepted]);
+
+        lex.expect(SmtpReplyShape::Starttls);
+        let mut data2: &[u8] = b"454 TLS not available due to temporary reason\r\n";
+        assert_eq!(lex.feed(&mut data2).unwrap(), vec![SmtpEvent::TlsUnavailable]);
+
+        lex.expect(SmtpReplyShape::Starttls);
+        let mut data3: &[u8] = b"502 Command not implemented\r\n";
+        assert_eq!(lex.feed(&mut data3).unwrap(), vec![SmtpEvent::TlsUnavailable]);
+    }
+
+    #[test]
+    fn starttls_permanent_failure() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Starttls);
+        let mut data: &[u8] = b"554 TLS not available\r\n";
+        assert_eq!(
+            lex.feed(&mut data).unwrap(),
+            vec![SmtpEvent::TlsError { message: "TLS not available".into() }]
+        );
+    }
+
+    #[test]
+    fn auth_ok_challenge_failed() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Auth);
+        let mut data: &[u8] = b"235 Authentication successful\r\n";
+        assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::AuthOk]);
+
+        lex.expect(SmtpReplyShape::Auth);
+        let mut data2: &[u8] = b"334 VXNlcm5hbWU6\r\n";
+        assert_eq!(
+            lex.feed(&mut data2).unwrap(),
+            vec![SmtpEvent::AuthChallenge { data: b"Username:".to_vec() }]
+        );
+
+        lex.expect(SmtpReplyShape::Auth);
+        let mut data3: &[u8] = b"535 Authentication failed\r\n";
+        assert_eq!(lex.feed(&mut data3).unwrap(), vec![SmtpEvent::AuthFailed { code: 535 }]);
+
+        lex.expect(SmtpReplyShape::Auth);
+        let mut data4: &[u8] = b"504 Mechanism not supported\r\n";
+        assert_eq!(lex.feed(&mut data4).unwrap(), vec![SmtpEvent::AuthFailed { code: 504 }]);
+
+        lex.expect(SmtpReplyShape::Auth);
+        let mut data5: &[u8] = b"454 Temporary auth failure\r\n";
+        assert_eq!(lex.feed(&mut data5).unwrap(), vec![SmtpEvent::AuthFailed { code: 454 }]);
+    }
+
+    #[test]
+    fn mail_from_ok_and_rejected() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::MailFrom);
         let mut data: &[u8] = b"250 OK\r\n";
-        let replies = lex.feed(&mut data).unwrap();
-        assert!(data.is_empty());
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].code, 250);
-        assert_eq!(replies[0].lines, vec!["OK".to_string()]);
-    }
+        assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::MailOk]);
 
-    #[test]
-    fn multiline_reply() {
-        let mut lex = SmtpReplyLexer::new();
-        let mut data: &[u8] = b"250-Hello\r\n250-SIZE 1000\r\n250 OK\r\n";
-        let replies = lex.feed(&mut data).unwrap();
-        assert!(data.is_empty());
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].code, 250);
+        lex.expect(SmtpReplyShape::MailFrom);
+        let mut data2: &[u8] = b"552 Message size exceeds fixed limit\r\n";
         assert_eq!(
-            replies[0].lines,
-            vec!["Hello".to_string(), "SIZE 1000".to_string(), "OK".to_string()]
+            lex.feed(&mut data2).unwrap(),
+            vec![SmtpEvent::MailRejected {
+                code: 552,
+                message: "Message size exceeds fixed limit".into()
+            }]
         );
     }
 
     #[test]
-    fn pipelined_replies() {
+    fn rcpt_to_ok_and_rejected() {
+        for code in [250u16, 251, 252] {
+            let mut lex = SmtpReplyLexer::new();
+            lex.expect(SmtpReplyShape::RcptTo);
+            let mut data: Vec<u8> = format!("{code} OK\r\n").into_bytes();
+            let mut slice: &[u8] = &data;
+            assert_eq!(lex.feed(&mut slice).unwrap(), vec![SmtpEvent::RcptOk]);
+            data.clear();
+        }
+
         let mut lex = SmtpReplyLexer::new();
-        let mut data: &[u8] = b"220 ready\r\n250 OK\r\n";
-        let replies = lex.feed(&mut data).unwrap();
-        assert!(data.is_empty());
-        assert_eq!(replies.len(), 2);
-        assert_eq!(replies[0].code, 220);
-        assert_eq!(replies[1].code, 250);
-    }
-
-    /// A reply split mid-line across two `feed()` calls (as `connection.rs`
-    /// does: re-presenting whatever wasn't consumed, combined with newly
-    /// read bytes) must not duplicate the already-buffered prefix.
-    #[test]
-    fn feed_across_calls_does_not_duplicate_partial_line() {
-        let mut lex = SmtpReplyLexer::new();
-        let full: &[u8] = b"250-Hello\r\n250 OK\r\n";
-
-        let mut buf: Vec<u8> = full[..7].to_vec(); // "250-Hel", no CRLF yet
-        let mut slice: &[u8] = &buf;
-        let replies = lex.feed(&mut slice).unwrap();
-        assert!(slice.is_empty());
-        assert!(replies.is_empty());
-        buf.clear(); // *data is always fully consumed — nothing to retain
-
-        buf.extend_from_slice(&full[7..]); // rest of the reply arrives
-        let mut slice2: &[u8] = &buf;
-        let replies2 = lex.feed(&mut slice2).unwrap();
-        assert!(slice2.is_empty());
-
-        assert_eq!(replies2.len(), 1);
-        assert_eq!(replies2[0].code, 250);
+        lex.expect(SmtpReplyShape::RcptTo);
+        let mut data: &[u8] = b"550 No such user here\r\n";
         assert_eq!(
-            replies2[0].lines,
-            vec!["Hello".to_string(), "OK".to_string()]
+            lex.feed(&mut data).unwrap(),
+            vec![SmtpEvent::RcptRejected { code: 550, message: "No such user here".into() }]
         );
     }
 
-    /// One byte per `feed()` call must produce identical replies to a
-    /// single bulk feed, and never leave anything unconsumed.
     #[test]
-    fn one_byte_at_a_time_matches_bulk_feed() {
-        let msg: &[u8] = b"250-Hello\r\n250-SIZE 1000\r\n250 OK\r\n220 next\r\n";
+    fn data_command_ready_and_rejected() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::DataCommand);
+        let mut data: &[u8] = b"354 Start mail input; end with <CRLF>.<CRLF>\r\n";
+        assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::ReadyForData]);
+
+        lex.expect(SmtpReplyShape::DataCommand);
+        let mut data2: &[u8] = b"503 Bad sequence of commands\r\n";
+        assert_eq!(
+            lex.feed(&mut data2).unwrap(),
+            vec![SmtpEvent::MessageRejected {
+                code: 503,
+                message: "Bad sequence of commands".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn data_end_accepted_with_queue_id() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::DataEnd);
+        let mut data: &[u8] = b"250 2.0.0 OK queued as 4Y2ZzR6q5vzJ\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(
+            events,
+            vec![SmtpEvent::MessageAccepted { queue_id: Some("4Y2ZzR6q5vzJ".into()) }]
+        );
+    }
+
+    #[test]
+    fn data_end_accepted_no_queue_id() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::DataEnd);
+        let mut data: &[u8] = b"250 Message accepted\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events, vec![SmtpEvent::MessageAccepted { queue_id: None }]);
+    }
+
+    #[test]
+    fn data_end_rejected() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::DataEnd);
+        let mut data: &[u8] = b"552 Message exceeds storage allocation\r\n";
+        assert_eq!(
+            lex.feed(&mut data).unwrap(),
+            vec![SmtpEvent::MessageRejected {
+                code: 552,
+                message: "Message exceeds storage allocation".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn rset_always_ok_regardless_of_code() {
+        for line in [&b"250 OK\r\n"[..], &b"500 whatever\r\n"[..]] {
+            let mut lex = SmtpReplyLexer::new();
+            lex.expect(SmtpReplyShape::Rset);
+            let mut data: &[u8] = line;
+            assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::RsetOk]);
+        }
+    }
+
+    #[test]
+    fn quit_produces_no_event() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Quit);
+        let mut data: &[u8] = b"221 Bye\r\n";
+        assert_eq!(lex.feed(&mut data).unwrap(), Vec::<SmtpEvent>::new());
+    }
+
+    #[test]
+    fn bare_code_no_separator_no_text() {
+        // RFC 5321 §4.2 allows a final line with no SP/text at all.
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Rset);
+        let mut data: &[u8] = b"250\r\n";
+        assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::RsetOk]);
+    }
+
+    #[test]
+    fn decorative_text_after_success_is_never_stored() {
+        // A very long success message must not error even though
+        // MAX_REPLY_LINE would reject that many bytes if it were being
+        // buffered — because SkipToEol never buffers it.
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::MailFrom);
+        let mut junk = Vec::new();
+        junk.extend_from_slice(b"250 ");
+        junk.extend(std::iter::repeat(b'x').take(MAX_REPLY_LINE * 4));
+        junk.extend_from_slice(b"\r\n");
+        let mut data: &[u8] = &junk;
+        assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::MailOk]);
+    }
+
+    #[test]
+    fn overlong_error_text_errors_out() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::MailFrom);
+        let mut junk = Vec::new();
+        junk.extend_from_slice(b"550 ");
+        junk.extend(std::iter::repeat(b'x').take(MAX_REPLY_LINE + 1));
+        let mut data: &[u8] = &junk;
+        assert!(lex.feed(&mut data).is_err());
+    }
+
+    #[test]
+    fn split_one_byte_at_a_time_matches_bulk_feed() {
+        let msg: &[u8] = b"250-mail.example.com Hello\r\n250-SIZE 1000\r\n250-STARTTLS\r\n250 PIPELINING\r\n";
 
         let mut bulk = SmtpReplyLexer::new();
+        bulk.expect(SmtpReplyShape::Ehlo);
         let mut bulk_data = msg;
-        let bulk_replies = bulk.feed(&mut bulk_data).unwrap();
+        let bulk_events = bulk.feed(&mut bulk_data).unwrap();
 
         let mut drip = SmtpReplyLexer::new();
-        let mut drip_replies = Vec::new();
+        drip.expect(SmtpReplyShape::Ehlo);
+        let mut drip_events = Vec::new();
         for &b in msg {
-            let mut one: &[u8] = &[b];
-            drip_replies.extend(drip.feed(&mut one).unwrap());
-            assert!(one.is_empty());
+            let mut one: &[u8] = std::slice::from_ref(&b);
+            drip_events.extend(drip.feed(&mut one).unwrap());
         }
-
-        assert_eq!(bulk_replies, drip_replies);
-        assert_eq!(bulk_replies.len(), 2);
+        assert_eq!(bulk_events, drip_events);
+        assert_eq!(bulk_events.len(), 1);
     }
 
-    /// Every split point of a full reply stream must be equivalent.
     #[test]
-    fn all_split_points_are_equivalent() {
-        let msg: &[u8] = b"250-Hello\r\n250-SIZE 1000\r\n250 OK\r\n220 next\r\n";
-        let mut base = SmtpReplyLexer::new();
-        let mut base_data = msg;
-        let base_replies = base.feed(&mut base_data).unwrap();
+    fn multiline_code_mismatch_errors() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Ehlo);
+        let mut data: &[u8] = b"250-Hello\r\n251-oops\r\n";
+        assert!(lex.feed(&mut data).is_err());
+    }
 
-        for split in 1..msg.len() {
-            let mut lex = SmtpReplyLexer::new();
-            let mut a: &[u8] = &msg[..split];
-            let mut replies = lex.feed(&mut a).unwrap();
-            assert!(a.is_empty(), "split {split} retained bytes");
-            let mut b: &[u8] = &msg[split..];
-            replies.extend(lex.feed(&mut b).unwrap());
-            assert!(b.is_empty(), "split {split} retained bytes");
-            assert_eq!(replies, base_replies, "split {split} diverged");
-        }
+    #[test]
+    fn pipelined_replies_in_one_feed() {
+        // Greeting immediately followed by an EHLO reply in one segment —
+        // exercised via two lexers since shape differs per reply in
+        // practice (the endpoint re-`expect()`s between them), but this
+        // confirms multiple *same-shape* replies in one feed still work.
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Rset);
+        let mut data: &[u8] = b"250 OK\r\n250 OK\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events, vec![SmtpEvent::RsetOk, SmtpEvent::RsetOk]);
     }
 }

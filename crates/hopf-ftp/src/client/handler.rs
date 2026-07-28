@@ -26,6 +26,12 @@ use super::{FtpClientTimeouts, FtpPipeline, OpQueue, QueuedOp};
 // Reply lexer
 // ---------------------------------------------------------------------------
 
+/// Cap on unconsumed buffered reply bytes, so a server that never terminates
+/// a reply block can't grow [`FtpReplyLexer`]'s buffer without bound.
+/// Counterpart to the server-side [`crate::server::MAX_COMMAND_LINE`] (which
+/// bounds a client's command line instead).
+pub(crate) const MAX_REPLY_BUFFER: usize = 256 * 1024;
+
 /// Stateful lexer that turns a byte stream into complete [`FtpReply`] values.
 pub(crate) struct FtpReplyLexer {
     buf: Vec<u8>,
@@ -37,18 +43,21 @@ impl FtpReplyLexer {
     }
 
     /// Append bytes and return all complete replies parsed so far.
-    pub fn push(&mut self, data: &[u8]) -> Vec<FtpReply> {
+    ///
+    /// Errors (and leaves the lexer's buffer cleared) if unconsumed buffered
+    /// bytes exceed [`MAX_REPLY_BUFFER`] — a run-away server never
+    /// terminating a reply line/block.
+    pub fn push(&mut self, data: &[u8]) -> Result<Vec<FtpReply>, FtpError> {
         self.buf.extend_from_slice(data);
-        // Guard against run-away servers.
-        if self.buf.len() > 256 * 1024 {
+        if self.buf.len() > MAX_REPLY_BUFFER {
             self.buf.clear();
-            return Vec::new();
+            return Err(FtpError::Parse("FTP reply too long".into()));
         }
         let mut out = Vec::new();
         while let Some(r) = self.try_parse_one() {
             out.push(r);
         }
-        out
+        Ok(out)
     }
 
     /// Try to extract one complete reply from the front of the buffer.
@@ -228,7 +237,13 @@ impl FtpControlHandler {
 
     /// Process all complete replies buffered so far.
     fn process_all_replies(&mut self, endpoint: &mut dyn Endpoint, data: &[u8]) {
-        let replies = self.lexer.push(data);
+        let replies = match self.lexer.push(data) {
+            Ok(replies) => replies,
+            Err(err) => {
+                self.fail(endpoint, err);
+                return;
+            }
+        };
         for reply in replies {
             self.cancel_timer();
             self.process_reply(endpoint, reply);
@@ -567,7 +582,18 @@ mod tests {
     use super::*;
 
     fn push_str(lexer: &mut FtpReplyLexer, s: &str) -> Vec<FtpReply> {
-        lexer.push(s.as_bytes())
+        lexer.push(s.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn oversized_reply_errors_and_clears_buffer() {
+        let mut lex = FtpReplyLexer::new();
+        // No CRLF, never terminates — must error once it crosses the cap
+        // rather than growing forever or silently discarding.
+        let junk = vec![b'x'; MAX_REPLY_BUFFER + 1];
+        let err = lex.push(&junk).unwrap_err();
+        assert!(matches!(err, FtpError::Parse(_)));
+        assert!(lex.buf.is_empty());
     }
 
     #[test]

@@ -15,7 +15,7 @@ use base64::Engine;
 use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
 
 use super::handlers::{SmtpClientDriver, SmtpClientHandlerFactory};
-use super::reply::{SmtpReply, SmtpReplyLexer};
+use super::reply::{SmtpEvent, SmtpReplyLexer, SmtpReplyShape};
 use super::state::{
     SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope, SmtpClientHello,
     SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
@@ -194,18 +194,19 @@ impl SmtpClientEndpoint {
         ep.close();
     }
 
-    // ── Reply dispatch ────────────────────────────────────────────────────
+    // ── Event dispatch ────────────────────────────────────────────────────
 
-    fn dispatch_reply(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint) {
+    fn dispatch_event(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
         self.cancel_timer();
 
-        // RFC 5321 §4.2.1 — 421 service closing: close immediately.
-        if reply.code == 421 {
+        // RFC 5321 §4.2.1 — 421 service closing: close immediately,
+        // regardless of what was expected.
+        if let SmtpEvent::ServiceClosing { message } = event {
             self.proto_state = ProtoState::Closed;
             if let Some(mut driver) = self.driver.take() {
                 let err = io::Error::new(
                     io::ErrorKind::ConnectionAborted,
-                    format!("421 service closing: {}", reply.text()),
+                    format!("421 service closing: {message}"),
                 );
                 driver.on_error(ep, &err);
                 self.driver = Some(driver);
@@ -216,22 +217,22 @@ impl SmtpClientEndpoint {
 
         let state = self.proto_state.clone();
         match state {
-            ProtoState::Connecting => self.dispatch_greeting(reply, ep),
-            ProtoState::EhloSent => self.dispatch_ehlo(reply, ep),
-            ProtoState::HeloSent => self.dispatch_helo(reply, ep),
-            ProtoState::StarttlsSent => self.dispatch_starttls(reply, ep),
-            ProtoState::AuthSent => self.dispatch_auth(reply, ep),
-            ProtoState::MailFromSent => self.dispatch_mail_from(reply, ep),
+            ProtoState::Connecting => self.dispatch_greeting(event, ep),
+            ProtoState::EhloSent => self.dispatch_ehlo(event, ep),
+            ProtoState::HeloSent => self.dispatch_helo(event, ep),
+            ProtoState::StarttlsSent => self.dispatch_starttls(event, ep),
+            ProtoState::AuthSent => self.dispatch_auth(event, ep),
+            ProtoState::MailFromSent => self.dispatch_mail_from(event, ep),
             ProtoState::RcptToSent(ref recipient) => {
                 let r = recipient.clone();
-                self.dispatch_rcpt_to(reply, ep, &r);
+                self.dispatch_rcpt_to(event, ep, &r);
             }
-            ProtoState::DataCommandSent => self.dispatch_data_command(reply, ep),
+            ProtoState::DataCommandSent => self.dispatch_data_command(event, ep),
             ProtoState::DataMode => {
                 // Unexpected reply in DATA mode — ignore (BDAT chunk ack path not implemented).
             }
-            ProtoState::DataEndSent => self.dispatch_message_reply(reply, ep),
-            ProtoState::RsetSent => self.dispatch_rset(reply, ep),
+            ProtoState::DataEndSent => self.dispatch_message_reply(event, ep),
+            ProtoState::RsetSent => self.dispatch_rset(event, ep),
             ProtoState::QuitSent | ProtoState::Closed => {
                 self.proto_state = ProtoState::Closed;
                 ep.close();
@@ -240,88 +241,107 @@ impl SmtpClientEndpoint {
         }
     }
 
-    fn dispatch_greeting(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint) {
+    fn dispatch_greeting(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        if reply.code == 220 {
-            self.proto_state = ProtoState::Connected;
-            let msg = reply.text();
-            let esmtp = msg.to_ascii_uppercase().contains("ESMTP");
-            driver.on_greeting(self, ep, &msg, esmtp);
-        } else {
-            self.proto_state = ProtoState::Error;
-            driver.on_service_unavailable(ep, &reply.text());
-            ep.close();
+        match event {
+            SmtpEvent::Greeting { esmtp } => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_greeting(self, ep, esmtp);
+            }
+            SmtpEvent::ServiceUnavailable { message } => {
+                self.proto_state = ProtoState::Error;
+                driver.on_service_unavailable(ep, &message);
+                ep.close();
+            }
+            _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn dispatch_ehlo(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint) {
+    fn dispatch_ehlo(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        if reply.code == 250 {
-            self.parse_ehlo_caps(&reply.lines);
-            self.proto_state = ProtoState::Connected;
-            let caps = self.caps.clone();
-            driver.on_ehlo(self, ep, &caps);
-        } else if reply.code == 502 {
-            self.proto_state = ProtoState::Connected;
-            driver.on_ehlo_not_supported(self, ep);
-        } else {
-            self.proto_state = ProtoState::Error;
-            let msg = reply.text();
-            driver.on_ehlo_error(ep, &msg);
-            ep.close();
+        match event {
+            SmtpEvent::Ehlo(caps) => {
+                self.caps = caps.clone();
+                self.proto_state = ProtoState::Connected;
+                driver.on_ehlo(self, ep, &caps);
+            }
+            SmtpEvent::EhloNotSupported => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_ehlo_not_supported(self, ep);
+            }
+            SmtpEvent::EhloError { message } => {
+                self.proto_state = ProtoState::Error;
+                driver.on_ehlo_error(ep, &message);
+                ep.close();
+            }
+            _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn dispatch_helo(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint) {
+    fn dispatch_helo(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        if reply.code == 250 {
-            self.caps = SmtpCapabilities::default();
-            self.proto_state = ProtoState::Connected;
-            driver.on_helo(self, ep);
-        } else {
-            self.proto_state = ProtoState::Error;
-            let msg = reply.text();
-            driver.on_ehlo_error(ep, &msg);
-            ep.close();
+        match event {
+            SmtpEvent::Helo => {
+                self.caps = SmtpCapabilities::default();
+                self.proto_state = ProtoState::Connected;
+                driver.on_helo(self, ep);
+            }
+            SmtpEvent::HeloError { message } => {
+                self.proto_state = ProtoState::Error;
+                driver.on_helo_error(ep, &message);
+                ep.close();
+            }
+            _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn dispatch_starttls(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint) {
-        if reply.code == 220 {
-            if let Some(connector) = self.tls_connector.clone() {
-                let name = self.tls_server_name.clone().unwrap_or_else(|| "localhost".into());
-                match ep.start_client_tls(connector, &name) {
-                    Ok(()) => {
-                        self.pending_tls = true;
-                        self.caps = SmtpCapabilities::default();
-                        self.accepted_rcpts = 0;
-                        self.arm_stage_timer(ep);
-                        // security_established callback will fire when handshake completes.
-                    }
-                    Err(e) => {
-                        let err = io::Error::new(io::ErrorKind::Other, format!("start_client_tls: {e}"));
-                        self.proto_state = ProtoState::Error;
-                        if let Some(mut driver) = self.driver.take() {
-                            driver.on_error(ep, &err);
-                            self.driver = Some(driver);
+    fn dispatch_starttls(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
+        match event {
+            SmtpEvent::StarttlsAccepted => {
+                if let Some(connector) = self.tls_connector.clone() {
+                    let name = self.tls_server_name.clone().unwrap_or_else(|| "localhost".into());
+                    match ep.start_client_tls(connector, &name) {
+                        Ok(()) => {
+                            self.pending_tls = true;
+                            self.caps = SmtpCapabilities::default();
+                            self.accepted_rcpts = 0;
+                            self.arm_stage_timer(ep);
+                            // security_established callback will fire when handshake completes.
                         }
-                        ep.close();
+                        Err(e) => {
+                            let err = io::Error::new(io::ErrorKind::Other, format!("start_client_tls: {e}"));
+                            self.proto_state = ProtoState::Error;
+                            if let Some(mut driver) = self.driver.take() {
+                                driver.on_error(ep, &err);
+                                self.driver = Some(driver);
+                            }
+                            ep.close();
+                        }
                     }
+                } else {
+                    // No connector configured — treat as unavailable.
+                    let mut driver = match self.driver.take() {
+                        Some(d) => d,
+                        None => return,
+                    };
+                    self.proto_state = ProtoState::Connected;
+                    driver.on_tls_unavailable(self, ep);
+                    self.driver = Some(driver);
                 }
-            } else {
-                // No connector configured — treat as unavailable.
+            }
+            SmtpEvent::TlsUnavailable => {
                 let mut driver = match self.driver.take() {
                     Some(d) => d,
                     None => return,
@@ -330,160 +350,131 @@ impl SmtpClientEndpoint {
                 driver.on_tls_unavailable(self, ep);
                 self.driver = Some(driver);
             }
-        } else {
-            // 454 or 502 — TLS unavailable.
-            let mut driver = match self.driver.take() {
-                Some(d) => d,
-                None => return,
-            };
-            self.proto_state = ProtoState::Connected;
-            driver.on_tls_unavailable(self, ep);
-            self.driver = Some(driver);
+            SmtpEvent::TlsError { message } => {
+                self.proto_state = ProtoState::Error;
+                if let Some(mut driver) = self.driver.take() {
+                    driver.on_tls_error(ep, &message);
+                    self.driver = Some(driver);
+                }
+                ep.close();
+            }
+            _ => {}
         }
     }
 
-    fn dispatch_auth(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint) {
+    fn dispatch_auth(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        if reply.code == 235 {
-            self.proto_state = ProtoState::Connected;
-            driver.on_auth_ok(self, ep);
-        } else if reply.code == 334 {
-            // SASL challenge — base64 decode.
-            let challenge = base64::engine::general_purpose::STANDARD
-                .decode(reply.text().trim())
-                .unwrap_or_default();
-            driver.on_auth_challenge(self, ep, &challenge);
-        } else {
-            // 535, 504, 454 etc.
-            self.proto_state = ProtoState::Connected;
-            driver.on_auth_failed(self, ep);
+        match event {
+            SmtpEvent::AuthOk => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_auth_ok(self, ep);
+            }
+            SmtpEvent::AuthChallenge { data } => {
+                driver.on_auth_challenge(self, ep, &data);
+            }
+            SmtpEvent::AuthFailed { code } => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_auth_failed(self, ep, code);
+            }
+            _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn dispatch_mail_from(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint) {
+    fn dispatch_mail_from(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        if reply.code == 250 {
-            self.proto_state = ProtoState::Connected; // stays Connected (envelope phase)
-            driver.on_mail_ok(self, ep);
-        } else {
-            let code = reply.code;
-            let msg = reply.text();
-            self.proto_state = ProtoState::Connected;
-            driver.on_mail_rejected(self, ep, code, &msg);
+        match event {
+            SmtpEvent::MailOk => {
+                self.proto_state = ProtoState::Connected; // stays Connected (envelope phase)
+                driver.on_mail_ok(self, ep);
+            }
+            SmtpEvent::MailRejected { code, message } => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_mail_rejected(self, ep, code, &message);
+            }
+            _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn dispatch_rcpt_to(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint, recipient: &str) {
+    fn dispatch_rcpt_to(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint, recipient: &str) {
         let r = recipient.to_string();
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        if reply.code == 250 || reply.code == 251 || reply.code == 252 {
-            self.accepted_rcpts += 1;
-            self.proto_state = ProtoState::Connected;
-            driver.on_rcpt_ok(self, ep, &r);
-        } else {
-            let code = reply.code;
-            let msg = reply.text();
-            self.proto_state = ProtoState::Connected;
-            driver.on_rcpt_rejected(self, ep, &r, code, &msg);
+        match event {
+            SmtpEvent::RcptOk => {
+                self.accepted_rcpts += 1;
+                self.proto_state = ProtoState::Connected;
+                driver.on_rcpt_ok(self, ep, &r);
+            }
+            SmtpEvent::RcptRejected { code, message } => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_rcpt_rejected(self, ep, &r, code, &message);
+            }
+            _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn dispatch_data_command(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint) {
+    fn dispatch_data_command(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        if reply.code == 354 {
-            self.proto_state = ProtoState::DataMode;
-            driver.on_ready_for_data(self, ep);
-        } else {
-            let code = reply.code;
-            let msg = reply.text();
-            self.proto_state = ProtoState::Connected;
-            driver.on_message_rejected(self, ep, code, &msg);
+        match event {
+            SmtpEvent::ReadyForData => {
+                self.proto_state = ProtoState::DataMode;
+                driver.on_ready_for_data(self, ep);
+            }
+            SmtpEvent::MessageRejected { code, message } => {
+                self.proto_state = ProtoState::Connected;
+                driver.on_message_rejected(self, ep, code, &message);
+            }
+            _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn dispatch_message_reply(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint) {
+    fn dispatch_message_reply(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        if reply.code == 250 {
-            let queue_id = parse_queue_id(&reply.text());
-            self.proto_state = ProtoState::Connected;
-            self.accepted_rcpts = 0;
-            driver.on_message_accepted(self, ep, queue_id.as_deref());
-        } else {
-            let code = reply.code;
-            let msg = reply.text();
-            self.proto_state = ProtoState::Connected;
-            self.accepted_rcpts = 0;
-            driver.on_message_rejected(self, ep, code, &msg);
+        match event {
+            SmtpEvent::MessageAccepted { queue_id } => {
+                self.proto_state = ProtoState::Connected;
+                self.accepted_rcpts = 0;
+                driver.on_message_accepted(self, ep, queue_id.as_deref());
+            }
+            SmtpEvent::MessageRejected { code, message } => {
+                self.proto_state = ProtoState::Connected;
+                self.accepted_rcpts = 0;
+                driver.on_message_rejected(self, ep, code, &message);
+            }
+            _ => {}
         }
         self.driver = Some(driver);
     }
 
-    fn dispatch_rset(&mut self, reply: SmtpReply, ep: &mut dyn Endpoint) {
+    fn dispatch_rset(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
         // RFC 5321 — RSET always succeeds with 250.
+        let _ = event;
         self.accepted_rcpts = 0;
         self.proto_state = ProtoState::Connected;
-        let _ = reply;
         driver.on_rset_ok(self, ep);
         self.driver = Some(driver);
-    }
-
-    // ── EHLO capability parsing (RFC 5321 §4.1.1.1) ──────────────────────
-
-    fn parse_ehlo_caps(&mut self, lines: &[String]) {
-        self.caps = SmtpCapabilities::default();
-        for line in lines.iter().skip(1) {
-            let upper = line.to_ascii_uppercase();
-            if upper == "STARTTLS" {
-                self.caps.starttls = true;
-            } else if upper.starts_with("SIZE") {
-                if upper.len() > 5 {
-                    if let Ok(n) = line[5..].trim().parse::<u64>() {
-                        self.caps.max_size = n;
-                    }
-                }
-            } else if upper.starts_with("AUTH") {
-                for token in line[4..].split_whitespace() {
-                    self.caps.auth_methods.push(token.to_ascii_uppercase());
-                }
-            } else if upper == "PIPELINING" {
-                self.caps.pipelining = true;
-            } else if upper == "CHUNKING" {
-                self.caps.chunking = true;
-            } else if upper == "8BITMIME" {
-                self.caps.eight_bit_mime = true;
-            } else if upper == "SMTPUTF8" {
-                self.caps.smtp_utf8 = true;
-            } else if upper == "DSN" {
-                self.caps.dsn = true;
-            } else if upper == "ENHANCEDSTATUSCODES" {
-                self.caps.enhanced_status_codes = true;
-            } else if upper == "REQUIRETLS" {
-                self.caps.require_tls = true;
-            }
-        }
     }
 }
 
@@ -493,23 +484,24 @@ impl ProtocolHandler for SmtpClientEndpoint {
     fn connected(&mut self, ep: &mut dyn Endpoint) {
         // Nothing to send yet — wait for 220 greeting.
         // Arm stage timer for the greeting timeout.
+        self.lexer.expect(SmtpReplyShape::Greeting);
         self.arm_stage_timer(ep);
     }
 
     fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-        let replies = match self.lexer.feed(data) {
-            Ok(r) => r,
+        let events = match self.lexer.feed(data) {
+            Ok(e) => e,
             Err(e) => {
                 let msg = e.to_string();
                 self.protocol_error(ep, msg);
                 return;
             }
         };
-        for reply in replies {
+        for event in events {
             if self.proto_state == ProtoState::Closed || self.proto_state == ProtoState::Error {
                 break;
             }
-            self.dispatch_reply(reply, ep);
+            self.dispatch_event(event, ep);
             // Flush after every dispatched reply.
             if !self.outbound.is_empty() {
                 let out = std::mem::take(&mut self.outbound);
@@ -568,11 +560,13 @@ impl ProtocolHandler for SmtpClientEndpoint {
 impl SmtpClientHello for SmtpClientEndpoint {
     fn ehlo(&mut self, hostname: &str) {
         self.proto_state = ProtoState::EhloSent;
+        self.lexer.expect(SmtpReplyShape::Ehlo);
         self.write_line(&format!("EHLO {hostname}"));
     }
 
     fn helo(&mut self, hostname: &str) {
         self.proto_state = ProtoState::HeloSent;
+        self.lexer.expect(SmtpReplyShape::Helo);
         self.write_line(&format!("HELO {hostname}"));
     }
 }
@@ -590,16 +584,19 @@ impl SmtpClientSession for SmtpClientEndpoint {
             _ => "MAIL FROM:<>".to_string(),
         };
         self.proto_state = ProtoState::MailFromSent;
+        self.lexer.expect(SmtpReplyShape::MailFrom);
         self.write_line(&arg);
     }
 
     fn starttls(&mut self) {
         self.proto_state = ProtoState::StarttlsSent;
+        self.lexer.expect(SmtpReplyShape::Starttls);
         self.write_line("STARTTLS");
     }
 
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) {
         self.proto_state = ProtoState::AuthSent;
+        self.lexer.expect(SmtpReplyShape::Auth);
         let arg = match initial {
             Some(b) => {
                 let enc = base64::engine::general_purpose::STANDARD.encode(b);
@@ -612,6 +609,7 @@ impl SmtpClientSession for SmtpClientEndpoint {
 
     fn quit(&mut self) {
         self.proto_state = ProtoState::QuitSent;
+        self.lexer.expect(SmtpReplyShape::Quit);
         self.write_line("QUIT");
     }
 
@@ -625,12 +623,14 @@ impl SmtpClientSession for SmtpClientEndpoint {
 impl SmtpClientAuthExchange for SmtpClientEndpoint {
     fn respond(&mut self, response: &[u8]) {
         self.proto_state = ProtoState::AuthSent;
+        self.lexer.expect(SmtpReplyShape::Auth);
         let enc = base64::engine::general_purpose::STANDARD.encode(response);
         self.write_line(&enc);
     }
 
     fn abort(&mut self) {
         self.proto_state = ProtoState::AuthSent;
+        self.lexer.expect(SmtpReplyShape::Auth);
         self.write_line("*");
     }
 }
@@ -640,16 +640,19 @@ impl SmtpClientAuthExchange for SmtpClientEndpoint {
 impl SmtpClientEnvelope for SmtpClientEndpoint {
     fn rcpt_to(&mut self, recipient: &str) {
         self.proto_state = ProtoState::RcptToSent(recipient.to_string());
+        self.lexer.expect(SmtpReplyShape::RcptTo);
         self.write_line(&format!("RCPT TO:<{recipient}>"));
     }
 
     fn rset(&mut self) {
         self.proto_state = ProtoState::RsetSent;
+        self.lexer.expect(SmtpReplyShape::Rset);
         self.write_line("RSET");
     }
 
     fn start_data(&mut self) {
         self.proto_state = ProtoState::DataCommandSent;
+        self.lexer.expect(SmtpReplyShape::DataCommand);
         self.write_line("DATA");
     }
 
@@ -674,25 +677,9 @@ impl SmtpClientMessageData for SmtpClientEndpoint {
             return;
         }
         self.proto_state = ProtoState::DataEndSent;
+        self.lexer.expect(SmtpReplyShape::DataEnd);
         // Ensure the buffered data ends with CRLF before the dot.
         // (dot_stuff already handles CRLF normalization for each chunk)
         self.outbound.extend_from_slice(b".\r\n");
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Extract a queue identifier from a 250 message-accepted text.
-fn parse_queue_id(message: &str) -> Option<String> {
-    let lower = message.to_ascii_lowercase();
-    for prefix in &["queued as ", "message accepted for delivery "] {
-        if let Some(idx) = lower.find(prefix) {
-            let rest = message[idx + prefix.len()..].trim();
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            if end > 0 {
-                return Some(rest[..end].to_string());
-            }
-        }
-    }
-    None
 }

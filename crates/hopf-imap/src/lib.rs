@@ -13,24 +13,13 @@
 
 #![warn(missing_docs)]
 
-pub mod capability;
 pub mod client;
 pub mod enable;
-pub mod handler;
-pub mod idle;
-pub mod list_ext;
-pub mod quota;
 pub mod server;
-pub mod status_items;
-pub mod uidplus;
-
-mod fetch_format;
-mod search_parse;
 
 #[cfg(all(test, feature = "integration"))]
 mod integration;
 
-pub use capability::build_capabilities;
 pub use client::{
     classify_untagged, pipeline_status_and_list, trailing_literal_size, ImapCapabilities,
     ImapClient, ImapClientAppend, ImapClientAuthExchange, ImapClientAuthenticated,
@@ -40,22 +29,7 @@ pub use client::{
     ImapMailboxInfo, ImapNamespace, ImapNamespaceData, ImapQuotaData, ImapQuotaResource,
     ImapQuotaRootData, ImapReplyLexer, ImapResult, ImapStatus, ImapStatusData, ImapTagGenerator,
     ImapWireEvent, MailboxEventListener, NopMailboxEventListener, PendingCommand, PendingKind,
-    PendingMap, Tag, UntaggedClass, DEFAULT_MAX_PIPELINE,
+    PendingMap, Tag, UntaggedClass, DEFAULT_MAX_PIPELINE, MAX_REPLY_LINE,
 };
 pub use enable::{parse_enable_args, EnabledExtensions};
-pub use fetch_format::{
-    fetch_needs_bytes, fetch_sets_seen, format_fetch_attrs, format_flags, format_nstring,
-    message_header, message_text, parse_fetch_args, parse_fetch_items, select_header_fields,
-    BodySection, FetchItem, FetchModifiers,
-};
-pub use handler::*;
-pub use idle::{is_idle_done, IdleMailboxSnapshot, IdleShared, IdleState, IDLE_POLL_INTERVAL};
-pub use list_ext::{parse_list_command, ListCommand, ListReturnOptions, ListSelectOption};
-pub use quota::{
-    parse_quota_resource_list, MemoryQuotaManager, Quota, QuotaManager, QuotaResource,
-    UnlimitedQuotaManager,
-};
-pub use search_parse::{parse_search, SearchParseError};
 pub use server::*;
-pub use status_items::{parse_status_command, parse_status_items, StatusItem};
-pub use uidplus::{compress_uid_set, format_appenduid, format_copyuid};

@@ -10,9 +10,9 @@ use hopf_mailbox::{MailboxAttribute, MessageSet};
 
 use super::ImapControlHandler;
 use crate::enable::parse_enable_args;
-use crate::idle::{idle_update_lines, IdleMailboxSnapshot, IDLE_POLL_INTERVAL};
-use crate::list_ext::ListCommand;
-use crate::quota::parse_quota_resource_list;
+use crate::server::idle::{idle_update_lines, IdleMailboxSnapshot, IDLE_POLL_INTERVAL};
+use crate::server::list_ext::ListCommand;
+use crate::server::quota::parse_quota_resource_list;
 use crate::server::codec::{parse_astring, parse_sequence_set, ImapCommand};
 use crate::server::reply::{
     continuation, format_list_attrs, quote_astring, tagged_bad, tagged_no, tagged_ok, untagged,
@@ -21,7 +21,7 @@ use crate::server::session::ImapSessionState;
 use crate::server::views::{
     begin_busy, end_busy, format_status_line, ExpungeView, MoveView, StatusView,
 };
-use crate::status_items::parse_status_command;
+use crate::server::status_items::parse_status_command;
 
 impl ImapControlHandler {
     pub(super) fn cmd_noop(&mut self, endpoint: &mut dyn Endpoint, tag: &str) {
@@ -150,7 +150,7 @@ impl ImapControlHandler {
             endpoint: &mut dyn Endpoint,
             handle: hopf_core::ConnHandle,
             bundle: Arc<std::sync::Mutex<super::MailboxBundle>>,
-            shared: crate::idle::IdleShared,
+            shared: crate::server::idle::IdleShared,
             runtime: Arc<hopf_core::Runtime>,
         ) {
             if !shared.is_active() {

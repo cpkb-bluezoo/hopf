@@ -12,8 +12,8 @@ use hopf_mailbox::{
     Flag, Mailbox, MailboxFactory, MailboxInfo, MailboxStore, MessageSet, SearchCriteria,
 };
 
-use crate::fetch_format::{fetch_needs_bytes, fetch_sets_seen, format_fetch_attrs, FetchItem};
-use crate::handler::{
+use crate::server::fetch_format::{fetch_needs_bytes, fetch_sets_seen, format_fetch_attrs, FetchItem};
+use crate::server::handler::{
     AppendState, AuthenticateState, AuthenticatedHandler, CloseState, ConnectedState, CopyState,
     CreateState, DeleteState, ExpungeState, FetchState, ListState, MoveState,
     NotAuthenticatedHandler, RenameState, SearchState, SelectState, SelectedHandler, StatusState,
@@ -22,8 +22,8 @@ use crate::handler::{
 use crate::server::control::{MailboxBundle, PendingOpen};
 use crate::server::reply::{format_list_attrs, quote_astring, tagged_no, tagged_ok, untagged};
 use crate::server::session::ImapSessionState;
-use crate::status_items::StatusItem;
-use crate::uidplus::{format_appenduid, format_copyuid};
+use crate::server::status_items::StatusItem;
+use crate::server::uidplus::{format_appenduid, format_copyuid};
 
 /// Shared offload helpers.
 pub(crate) fn begin_busy(endpoint: &mut dyn Endpoint, busy: &Arc<AtomicBool>) {

@@ -18,7 +18,7 @@
 
 use hopf_mailbox::{Flag, MessageSet};
 
-use crate::handler::StoreAction;
+use crate::server::handler::StoreAction;
 
 /// Default max command-line length (octets), matching common IMAP practice.
 pub const MAX_COMMAND_LINE: usize = 8192;

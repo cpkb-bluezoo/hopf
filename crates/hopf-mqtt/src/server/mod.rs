@@ -9,10 +9,15 @@
 //! `MqttControlHandler` for now (accept once connected, reject a malformed
 //! filter/topic); staging those too is future work.
 
+pub mod broker;
 mod config;
 mod control;
 mod handler;
 mod service;
+mod store;
+
+#[cfg(feature = "websocket")]
+pub mod ws;
 
 pub use config::{MqttConfig, DEFAULT_CONNECT_TIMEOUT};
 pub use control::MqttControlHandler;

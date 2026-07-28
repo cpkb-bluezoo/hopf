@@ -11,8 +11,8 @@ use hopf_core::tls::SharedTlsAcceptor;
 use hopf_core::{ProtocolHandler, Runtime, TcpListenerConfig};
 use hopf_mailbox::MailboxFactory;
 
-use crate::handler::{DefaultImapHandlerFactory, ImapHandlerFactory};
-use crate::quota::{QuotaManager, UnlimitedQuotaManager};
+use crate::server::handler::{DefaultImapHandlerFactory, ImapHandlerFactory};
+use crate::server::quota::{QuotaManager, UnlimitedQuotaManager};
 use crate::server::control::ImapControlHandler;
 
 /// Default max command line (octets).

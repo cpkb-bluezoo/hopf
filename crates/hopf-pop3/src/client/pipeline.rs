@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use hopf_core::Endpoint;
 
 use super::handlers::{Pop3ClientDriver, Pop3ClientHandlerFactory};
+use super::reply::ContentId;
 use super::state::{
     Pop3Capabilities, Pop3ClientAuthExchange, Pop3ClientAuthorization, Pop3ClientPassword,
     Pop3ClientPostStls, Pop3ClientTransaction,
@@ -263,20 +264,15 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         &mut self,
         auth: &mut dyn Pop3ClientAuthorization,
         _ep: &mut dyn Endpoint,
-        message: &str,
-        apop_timestamp: Option<&str>,
+        apop_challenge: Option<&ContentId>,
     ) {
-        if let Some(ts) = apop_timestamp {
-            self.state.lock().unwrap().apop_timestamp = Some(ts.to_string());
+        if let Some(challenge) = apop_challenge {
+            // APOP's digest is computed over the literal `<local@domain>`
+            // banner text, which `ContentId`'s Display reproduces exactly.
+            self.state.lock().unwrap().apop_timestamp = Some(challenge.to_string());
         }
-        let require_stls = self.state.lock().unwrap().require_stls;
-        if require_stls {
-            // We need to CAPA first to check for STLS.
-            auth.capa();
-        } else {
-            auth.capa();
-        }
-        let _ = message;
+        // CAPA first either way, to discover STLS/SASL support.
+        auth.capa();
     }
 
     fn on_capa(
@@ -350,7 +346,7 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         &mut self,
         exchange: &mut dyn Pop3ClientAuthExchange,
         _ep: &mut dyn Endpoint,
-        _challenge: &str,
+        _challenge: &[u8],
     ) {
         // PLAIN doesn't use server challenges; abort.
         exchange.abort();
@@ -391,6 +387,7 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         transaction.list(None);
     }
 
+
     fn on_list_entry(&mut self, message: u32, _size: u64) {
         self.state.lock().unwrap().pending.push_back(message);
     }
@@ -414,6 +411,7 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         self.fetch_next(transaction);
     }
 
+
     fn on_uidl_entry(&mut self, _message: u32, _uid: &str) {}
 
     fn on_uidl_complete(
@@ -432,6 +430,8 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         _uid: &str,
     ) {
     }
+
+
 
     fn on_message_content(&mut self, data: &[u8]) {
         self.state.lock().unwrap().body_buf.extend_from_slice(data);
@@ -497,6 +497,7 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         // Skip this message and try the next.
         self.fetch_next(transaction);
     }
+
 
     fn on_error(&mut self, ep: &mut dyn Endpoint, _err: &io::Error) {
         self.complete(false);

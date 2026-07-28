@@ -179,19 +179,19 @@ fn simple_relay_mx_to_local_sink() {
             resp.flags |= FLAG_QR | FLAG_RA;
             if let Some(question) = q.questions.first() {
                 match question.qtype {
-                    DnsType::Mx => {
+                    Some(DnsType::Mx) => {
                         resp.answers.push(
                             DnsResourceRecord::mx(&question.name, 60, 10, "127.0.0.1").unwrap(),
                         );
                     }
-                    DnsType::A => {
+                    Some(DnsType::A) => {
                         resp.answers.push(DnsResourceRecord::a(
                             &question.name,
                             60,
                             Ipv4Addr::new(127, 0, 0, 1),
                         ));
                     }
-                    DnsType::Aaaa => {}
+                    Some(DnsType::Aaaa) => {}
                     _ => {}
                 }
             }
