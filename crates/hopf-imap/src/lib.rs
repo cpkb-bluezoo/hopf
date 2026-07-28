@@ -21,7 +21,7 @@ pub mod server;
 mod integration;
 
 pub use client::{
-    pipeline_status_and_list, ImapCapabilities, ImapClient, ImapClientAppend,
+    pipeline_status_and_list, ImapAppendUid, ImapCapabilities, ImapClient, ImapClientAppend,
     ImapClientAuthExchange, ImapClientAuthenticated, ImapClientDriver, ImapClientEndpoint,
     ImapClientHandlerFactory, ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls,
     ImapClientSelected, ImapClientTimeouts, ImapCopyUid, ImapEnabledFeatures, ImapError, ImapEvent,

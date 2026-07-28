@@ -125,6 +125,36 @@ pub struct DsnRecipientParams {
     pub orcpt_address: Option<String>,
 }
 
+impl DsnRecipientParams {
+    /// Render as ` KEY=VALUE` tokens appended after `RCPT TO:<addr>`,
+    /// matching exactly what [`parse_rcpt_to_arg`] parses back.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        let n = &self.notify;
+        if n.never || n.success || n.failure || n.delay {
+            let mut flags = Vec::new();
+            if n.never {
+                flags.push("NEVER");
+            } else {
+                if n.success {
+                    flags.push("SUCCESS");
+                }
+                if n.failure {
+                    flags.push("FAILURE");
+                }
+                if n.delay {
+                    flags.push("DELAY");
+                }
+            }
+            out.push_str(&format!(" NOTIFY={}", flags.join(",")));
+        }
+        if let (Some(ty), Some(addr)) = (&self.orcpt_type, &self.orcpt_address) {
+            out.push_str(&format!(" ORCPT={ty};{addr}"));
+        }
+        out
+    }
+}
+
 /// Parsed MAIL FROM argument (address + extension params).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailFromParse {
@@ -352,5 +382,32 @@ mod tests {
         assert_eq!(addr, "u@d.com");
         assert!(dsn.notify.success && dsn.notify.failure);
         assert_eq!(dsn.orcpt_type.as_deref(), Some("rfc822"));
+    }
+
+    #[test]
+    fn dsn_recipient_params_render_empty() {
+        assert_eq!(DsnRecipientParams::default().render(), "");
+    }
+
+    #[test]
+    fn dsn_recipient_params_render_round_trips_through_parser() {
+        let params = DsnRecipientParams {
+            notify: DsnNotify { never: false, success: true, failure: true, delay: false },
+            orcpt_type: Some("rfc822".into()),
+            orcpt_address: Some("o@d.com".into()),
+        };
+        let rendered = params.render();
+        assert_eq!(rendered, " NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;o@d.com");
+        let (_, reparsed) = parse_rcpt_to_arg(&format!("TO:<u@d.com>{rendered}")).unwrap();
+        assert_eq!(reparsed, params);
+    }
+
+    #[test]
+    fn dsn_recipient_params_render_notify_never() {
+        let params = DsnRecipientParams {
+            notify: DsnNotify { never: true, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(params.render(), " NOTIFY=NEVER");
     }
 }

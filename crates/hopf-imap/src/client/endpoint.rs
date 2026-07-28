@@ -18,10 +18,10 @@ use super::handlers::{ImapClientDriver, ImapClientHandlerFactory};
 use super::pending::{ImapTagGenerator, PendingCommand, PendingKind, PendingMap, UntaggedClass};
 use super::reply::{ImapEvent, ImapReplyLexer, ImapStatus};
 use super::state::{
-    ImapCapabilities, ImapClientAppend, ImapClientAuthExchange, ImapClientAuthenticated,
-    ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls, ImapClientSelected,
-    ImapCopyUid, ImapEnabledFeatures, ImapFetchData, ImapListEntry, ImapMailboxInfo,
-    ImapNamespaceData, ImapQuotaData, ImapQuotaRootData, ImapStatusData,
+    ImapAppendUid, ImapCapabilities, ImapClientAppend, ImapClientAuthExchange,
+    ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls,
+    ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData, ImapListEntry,
+    ImapMailboxInfo, ImapNamespaceData, ImapQuotaData, ImapQuotaRootData, ImapStatusData,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,8 @@ pub struct ImapClientEndpoint {
     pending_issue_error: Option<String>,
     /// Last COPYUID seen for MOVE/COPY completion.
     last_copyuid: Option<ImapCopyUid>,
+    /// Last APPENDUID seen for APPEND completion.
+    last_appenduid: Option<ImapAppendUid>,
     /// Selected before IDLE (restored on DONE completion).
     was_selected: bool,
 }
@@ -110,6 +112,7 @@ impl ImapClientEndpoint {
             append_literal_minus: false,
             pending_issue_error: None,
             last_copyuid: None,
+            last_appenduid: None,
             was_selected: false,
         }
     }
@@ -324,7 +327,7 @@ impl ImapClientEndpoint {
                 let _ = text;
             }
             ImapEvent::Bye { text, .. } => self.on_bye(text, ep),
-            ImapEvent::Preauth { .. } => self.on_preauth(ep),
+            ImapEvent::Preauth { code, .. } => self.on_preauth(code, ep),
             ImapEvent::Capability(caps) => self.capa_buf = Some(caps),
             ImapEvent::ListEntry(entry) => self.on_list_entry(entry, ep),
             ImapEvent::StatusData(data) => self.on_status_data(data, ep),
@@ -355,6 +358,35 @@ impl ImapClientEndpoint {
         }
     }
 
+    /// Resolve the capability list that goes with a greeting/LOGIN/
+    /// AUTHENTICATE completion: prefer a separately-buffered untagged
+    /// `* CAPABILITY ...` line (`capa_buf`) over a `[CAPABILITY ...]`
+    /// response code riding the same line, matching RFC 9051 §7.1's two
+    /// delivery mechanisms. `self.caps` (the `capabilities()` accessor's
+    /// backing store) is only overwritten when genuinely new data was
+    /// found — matches Gumdrop's `IMAPClientProtocolHandler`, where
+    /// `capabilities` is only mutated inside `parseCapabilities()`, itself
+    /// only called when a CAPABILITY line/code was actually seen. The
+    /// *returned* value reflects only what arrived on this reply (empty if
+    /// nothing new), also matching Gumdrop's fresh `ArrayList` per call.
+    fn resolve_and_promote_caps(&mut self, code: Option<&str>) -> ImapCapabilities {
+        let fresh = if let Some(c) = self.capa_buf.take() {
+            Some(c)
+        } else if let Some(code) = code {
+            if code.to_ascii_uppercase().starts_with("CAPABILITY ") {
+                Some(ImapCapabilities::parse(&code["CAPABILITY ".len()..]))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(ref caps) = fresh {
+            self.caps = caps.clone();
+        }
+        fresh.unwrap_or_default()
+    }
+
     fn apply_untagged_status_code(&mut self, code: &str) {
         let cu = code.to_ascii_uppercase();
         if cu.starts_with("COPYUID ") {
@@ -381,11 +413,12 @@ impl ImapClientEndpoint {
         if self.session == SessionState::Connecting {
             self.cancel_greeting_timer();
             self.session = SessionState::NotAuthenticated;
+            let caps = self.resolve_and_promote_caps(code.as_deref());
             let mut driver = match self.driver.take() {
                 Some(d) => d,
                 None => return,
             };
-            driver.on_greeting(self, ep, &text, false);
+            driver.on_greeting(self, ep, &text, false, &caps);
             self.driver = Some(driver);
             return;
         }
@@ -401,17 +434,18 @@ impl ImapClientEndpoint {
         // needed here — `disconnected()` will fire shortly and clean up.
     }
 
-    fn on_preauth(&mut self, ep: &mut dyn Endpoint) {
+    fn on_preauth(&mut self, code: Option<String>, ep: &mut dyn Endpoint) {
         if self.session != SessionState::Connecting {
             return;
         }
         self.cancel_greeting_timer();
         self.session = SessionState::Authenticated;
+        let caps = self.resolve_and_promote_caps(code.as_deref());
         let mut driver = match self.driver.take() {
             Some(d) => d,
             None => return,
         };
-        driver.on_authenticated(self, ep);
+        driver.on_authenticated(self, ep, &caps);
         self.driver = Some(driver);
     }
 
@@ -706,8 +740,11 @@ impl ImapClientEndpoint {
         self.cancel_message_timer();
 
         if let Some(ref code) = response_code {
-            if code.to_ascii_uppercase().starts_with("COPYUID ") {
+            let cu = code.to_ascii_uppercase();
+            if cu.starts_with("COPYUID ") {
                 self.last_copyuid = ImapCopyUid::parse(code);
+            } else if cu.starts_with("APPENDUID ") {
+                self.last_appenduid = ImapAppendUid::parse(code);
             }
         }
 
@@ -760,11 +797,12 @@ impl ImapClientEndpoint {
             PendingKind::Login | PendingKind::Authenticate => match status {
                 ImapStatus::Ok => {
                     self.session = SessionState::Authenticated;
+                    let caps = self.resolve_and_promote_caps(response_code.as_deref());
                     let mut driver = match self.driver.take() {
                         Some(d) => d,
                         None => return,
                     };
-                    driver.on_authenticated(self, ep);
+                    driver.on_authenticated(self, ep, &caps);
                     self.driver = Some(driver);
                 }
                 ImapStatus::No | ImapStatus::Bad => {
@@ -831,11 +869,12 @@ impl ImapClientEndpoint {
                 self.driver = Some(driver);
             }
             PendingKind::Append => {
+                let appenduid = self.last_appenduid.take();
                 let mut driver = match self.driver.take() {
                     Some(d) => d,
                     None => return,
                 };
-                driver.on_append_complete(self, ep, status, &message);
+                driver.on_append_complete(self, ep, status, appenduid.as_ref(), &message);
                 self.driver = Some(driver);
             }
             PendingKind::Store => {
@@ -1541,7 +1580,12 @@ mod tests {
             _e: &mut dyn Endpoint,
             _t: &str,
             _p: bool,
+            caps: &ImapCapabilities,
         ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("greeting:starttls={}", caps.starttls));
         }
         fn on_capability(
             &mut self,
@@ -1567,7 +1611,12 @@ mod tests {
             &mut self,
             _s: &mut dyn ImapClientAuthenticated,
             _e: &mut dyn Endpoint,
+            caps: &ImapCapabilities,
         ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("authenticated:idle={}", caps.idle));
         }
         fn on_auth_failed(
             &mut self,
@@ -1754,9 +1803,17 @@ mod tests {
             &mut self,
             _s: &mut dyn ImapClientAuthenticated,
             _e: &mut dyn Endpoint,
-            _st: ImapStatus,
+            status: ImapStatus,
+            appenduid: Option<&ImapAppendUid>,
             _m: &str,
         ) {
+            let au = appenduid
+                .map(|a| format!("{}:{}", a.uid_validity, a.uid))
+                .unwrap_or_default();
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("append_done:{status:?}:{au}"));
         }
         fn on_error(&mut self, _e: &mut dyn Endpoint, err: &io::Error) {
             self.events.lock().unwrap().push(format!("err:{err}"));
@@ -1963,6 +2020,52 @@ mod tests {
             events
                 .iter()
                 .any(|e| e.contains("move_done") && e.contains("1:99")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn greeting_and_login_surface_capabilities() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut ep = make_ep(&log);
+        let mut fake = FakeEp::new();
+
+        feed(&mut ep, &mut fake, b"* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN] Ready\r\n");
+        let events = log.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e == "greeting:starttls=true"), "{events:?}");
+
+        ImapClientNotAuthenticated::login(&mut ep, "alice", "secret");
+        ep.flush_outbound(&mut fake);
+        feed(
+            &mut ep,
+            &mut fake,
+            b"A000 OK [CAPABILITY IMAP4rev1 IDLE] LOGIN completed\r\n",
+        );
+        let events = log.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e == "authenticated:idle=true"), "{events:?}");
+    }
+
+    #[test]
+    fn append_surfaces_appenduid() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut ep = make_ep(&log);
+        ep.session = SessionState::Authenticated;
+        let mut fake = FakeEp::new();
+
+        ImapClientAuthenticated::append(&mut ep, "INBOX", Some("\\Seen"), 5, true);
+        ep.flush_outbound(&mut fake);
+        let wire_out = fake.sent_str();
+        assert!(wire_out.contains("APPEND"));
+        assert!(wire_out.contains("{5+}"));
+        ImapClientAppend::send_literal(&mut ep, b"hello");
+        ep.flush_outbound(&mut fake);
+
+        feed(&mut ep, &mut fake, b"A000 OK [APPENDUID 38505 3956] APPEND completed\r\n");
+        let events = log.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("append_done") && e.contains("38505:3956")),
             "{events:?}"
         );
     }

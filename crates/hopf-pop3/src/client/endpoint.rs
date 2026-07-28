@@ -98,6 +98,17 @@ pub struct Pop3ClientEndpoint {
     message_timer: Option<TimerHandle>,
     /// Command bytes queued by state-trait methods; flushed after each callback.
     outbound: Vec<u8>,
+    /// Set by `Pop3ClientAuthExchange::abort()`; the next reply in AUTH
+    /// state is the server's response to our `*`, routed to
+    /// `on_auth_aborted` unconditionally instead of the normal
+    /// authenticated/challenge/failed dispatch.
+    auth_aborting: bool,
+    /// The most recent `-ERR` text seen, if any — surfaced to
+    /// `on_disconnected` so an unexpected close carries whatever
+    /// diagnostic the server last sent (matches Gumdrop's
+    /// `ServerReplyHandler.handleServiceClosing`, the base interface every
+    /// per-command handler extends).
+    last_err_message: Option<String>,
 }
 
 impl Pop3ClientEndpoint {
@@ -124,6 +135,8 @@ impl Pop3ClientEndpoint {
             message_timeout,
             message_timer: None,
             outbound: Vec::with_capacity(256),
+            auth_aborting: false,
+            last_err_message: None,
         }
     }
 
@@ -214,6 +227,10 @@ impl Pop3ClientEndpoint {
     fn dispatch_event(&mut self, event: Pop3Event, ep: &mut dyn Endpoint) {
         self.cancel_stage_timer();
 
+        if let Pop3Event::Err { ref message } = event {
+            self.last_err_message = Some(message.clone());
+        }
+
         let state = self.proto_state.clone();
         match state {
             ProtoState::Connecting => self.handle_greeting(event, ep),
@@ -281,12 +298,9 @@ impl Pop3ClientEndpoint {
                 self.proto_state = ProtoState::Transaction;
                 driver.on_capa(self, ep, &caps);
             }
-            Pop3Event::Err { .. } => {
-                // Server doesn't support CAPA — treat as minimal capabilities.
-                let caps = Pop3Capabilities { user: true, ..Default::default() };
-                self.caps = caps.clone();
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_capa(self, ep, &caps);
+                driver.on_capa_error(self, ep, &message);
             }
             _ => {}
         }
@@ -304,11 +318,9 @@ impl Pop3ClientEndpoint {
                 self.proto_state = ProtoState::Transaction;
                 driver.on_capa_post_stls(self, ep, &caps);
             }
-            Pop3Event::Err { .. } => {
-                let caps = Pop3Capabilities { user: true, ..Default::default() };
-                self.caps = caps.clone();
+            Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_capa_post_stls(self, ep, &caps);
+                driver.on_capa_post_stls_error(self, ep, &message);
             }
             _ => {}
         }
@@ -389,6 +401,13 @@ impl Pop3ClientEndpoint {
             Some(d) => d,
             None => return,
         };
+        if self.auth_aborting {
+            self.auth_aborting = false;
+            self.proto_state = ProtoState::Transaction;
+            driver.on_auth_aborted(self, ep);
+            self.driver = Some(driver);
+            return;
+        }
         match event {
             Pop3Event::Authenticated => {
                 self.proto_state = ProtoState::Transaction;
@@ -455,10 +474,8 @@ impl Pop3ClientEndpoint {
                 driver.on_stat(self, ep, count, octets);
             }
             Pop3Event::Err { message } => {
-                self.proto_state = ProtoState::Error;
-                let err = io::Error::new(io::ErrorKind::Other, format!("STAT failed: {message}"));
-                driver.on_error(ep, &err);
-                ep.close();
+                self.proto_state = ProtoState::Transaction;
+                driver.on_stat_error(self, ep, &message);
             }
             _ => {}
         }
@@ -482,10 +499,12 @@ impl Pop3ClientEndpoint {
                 driver.on_list_complete(self, ep);
             }
             Pop3Event::Err { message } => {
-                self.proto_state = ProtoState::Error;
-                let err = io::Error::new(io::ErrorKind::Other, format!("LIST failed: {message}"));
-                driver.on_error(ep, &err);
-                ep.close();
+                self.proto_state = ProtoState::Transaction;
+                if is_no_such_message(&message) {
+                    driver.on_no_such_message(self, ep, &message);
+                } else {
+                    driver.on_list_error(self, ep, &message);
+                }
             }
             _ => {}
         }
@@ -504,7 +523,11 @@ impl Pop3ClientEndpoint {
             }
             Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_no_such_message(self, ep, &message);
+                if is_no_such_message(&message) {
+                    driver.on_no_such_message(self, ep, &message);
+                } else {
+                    driver.on_list_error(self, ep, &message);
+                }
             }
             _ => {}
         }
@@ -526,10 +549,12 @@ impl Pop3ClientEndpoint {
                 driver.on_uidl_complete(self, ep);
             }
             Pop3Event::Err { message } => {
-                self.proto_state = ProtoState::Error;
-                let err = io::Error::new(io::ErrorKind::Other, format!("UIDL failed: {message}"));
-                driver.on_error(ep, &err);
-                ep.close();
+                self.proto_state = ProtoState::Transaction;
+                if is_no_such_message(&message) {
+                    driver.on_no_such_message(self, ep, &message);
+                } else {
+                    driver.on_uidl_error(self, ep, &message);
+                }
             }
             _ => {}
         }
@@ -548,7 +573,11 @@ impl Pop3ClientEndpoint {
             }
             Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_no_such_message(self, ep, &message);
+                if is_no_such_message(&message) {
+                    driver.on_no_such_message(self, ep, &message);
+                } else {
+                    driver.on_uidl_error(self, ep, &message);
+                }
             }
             _ => {}
         }
@@ -570,7 +599,11 @@ impl Pop3ClientEndpoint {
             }
             Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_no_such_message(self, ep, &message);
+                if message.to_ascii_lowercase().contains("deleted") {
+                    driver.on_message_deleted(self, ep, &message);
+                } else {
+                    driver.on_no_such_message(self, ep, &message);
+                }
             }
             _ => {}
         }
@@ -591,7 +624,11 @@ impl Pop3ClientEndpoint {
             }
             Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_no_such_message(self, ep, &message);
+                if message.to_ascii_lowercase().contains("deleted") {
+                    driver.on_message_deleted(self, ep, &message);
+                } else {
+                    driver.on_no_such_message(self, ep, &message);
+                }
             }
             _ => {}
         }
@@ -610,7 +647,12 @@ impl Pop3ClientEndpoint {
             }
             Pop3Event::Err { message } => {
                 self.proto_state = ProtoState::Transaction;
-                driver.on_no_such_message(self, ep, &message);
+                let lower = message.to_ascii_lowercase();
+                if lower.contains("already deleted") || lower.contains("already marked") {
+                    driver.on_already_deleted(self, ep, &message);
+                } else {
+                    driver.on_no_such_message(self, ep, &message);
+                }
             }
             _ => {}
         }
@@ -690,7 +732,7 @@ impl ProtocolHandler for Pop3ClientEndpoint {
                 let (chunks, complete) = self.unstuffer.feed(data);
                 for chunk in &chunks {
                     if let Some(mut driver) = self.driver.take() {
-                        driver.on_message_content(chunk);
+                        driver.on_message_content(chunk, ep);
                         self.driver = Some(driver);
                     }
                 }
@@ -766,8 +808,9 @@ impl ProtocolHandler for Pop3ClientEndpoint {
             return;
         }
         self.proto_state = ProtoState::Closed;
+        let message = self.last_err_message.take();
         if let Some(mut driver) = self.driver.take() {
-            driver.on_disconnected(ep);
+            driver.on_disconnected(ep, message.as_deref());
             self.driver = Some(driver);
         }
     }
@@ -811,6 +854,7 @@ impl Pop3ClientAuthorization for Pop3ClientEndpoint {
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) {
         self.proto_state = ProtoState::AuthSent;
         self.lexer.expect(Pop3ReplyShape::Auth);
+        self.auth_aborting = false;
         match initial {
             Some(b) => {
                 let enc = base64::engine::general_purpose::STANDARD.encode(b);
@@ -873,6 +917,7 @@ impl Pop3ClientPostStls for Pop3ClientEndpoint {
     fn auth(&mut self, mechanism: &str, initial: Option<&[u8]>) {
         self.proto_state = ProtoState::AuthSent;
         self.lexer.expect(Pop3ReplyShape::Auth);
+        self.auth_aborting = false;
         match initial {
             Some(b) => {
                 let enc = base64::engine::general_purpose::STANDARD.encode(b);
@@ -895,6 +940,7 @@ impl Pop3ClientAuthExchange for Pop3ClientEndpoint {
     fn respond(&mut self, response: &[u8]) {
         self.proto_state = ProtoState::AuthSent;
         self.lexer.expect(Pop3ReplyShape::Auth);
+        self.auth_aborting = false;
         let enc = base64::engine::general_purpose::STANDARD.encode(response);
         self.write_line(&enc);
     }
@@ -902,6 +948,7 @@ impl Pop3ClientAuthExchange for Pop3ClientEndpoint {
     fn abort(&mut self) {
         self.proto_state = ProtoState::AuthSent;
         self.lexer.expect(Pop3ReplyShape::Auth);
+        self.auth_aborting = true;
         self.write_line("*");
     }
 }
@@ -980,4 +1027,13 @@ impl Pop3ClientTransaction for Pop3ClientEndpoint {
         self.lexer.expect(Pop3ReplyShape::Quit);
         self.write_line("QUIT");
     }
+}
+
+/// Text-sniff a LIST/UIDL `-ERR` message the same way Gumdrop's
+/// `dispatchListReply`/`dispatchUidlReply` do, for both the all-messages and
+/// single-message (`n`) forms — both funnel through this same
+/// classification in Gumdrop, not just the `n` form.
+fn is_no_such_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("no such message") || lower.contains("not exist")
 }

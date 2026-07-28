@@ -350,6 +350,30 @@ impl ImapCopyUid {
     }
 }
 
+/// Parsed `[APPENDUID uidvalidity uid]` response code payload (RFC 4315
+/// UIDPLUS), surfaced on a successful APPEND.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImapAppendUid {
+    /// Destination mailbox's UIDVALIDITY.
+    pub uid_validity: u32,
+    /// The newly appended message's UID.
+    pub uid: u32,
+}
+
+impl ImapAppendUid {
+    /// Parse the interior of an `APPENDUID` response code (no brackets).
+    pub fn parse(code: &str) -> Option<Self> {
+        let rest = code
+            .strip_prefix("APPENDUID ")
+            .or_else(|| code.strip_prefix("appenduid "))?
+            .trim_start();
+        let mut parts = rest.splitn(2, ' ');
+        let uid_validity = parts.next()?.parse().ok()?;
+        let uid = parts.next()?.trim().parse().ok()?;
+        Some(Self { uid_validity, uid })
+    }
+}
+
 /// Client-side ENABLE tracking (CONDSTORE / QRESYNC).
 pub type ImapEnabledFeatures = EnabledExtensions;
 
@@ -636,6 +660,13 @@ mod parse_tests {
         assert_eq!(c.uid_validity, 38505);
         assert_eq!(c.source_uids, "304,319");
         assert_eq!(c.dest_uids, "3956,3957");
+    }
+
+    #[test]
+    fn parse_appenduid() {
+        let a = ImapAppendUid::parse("APPENDUID 38505 3956").unwrap();
+        assert_eq!(a.uid_validity, 38505);
+        assert_eq!(a.uid, 3956);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use hopf_mailbox::{MailboxFactory, MaildirFactory};
 
 use crate::client::pipeline_status_and_list;
 use crate::{
-    ImapCapabilities, ImapClient, ImapClientAppend, ImapClientAuthExchange,
+    ImapAppendUid, ImapCapabilities, ImapClient, ImapClientAppend, ImapClientAuthExchange,
     ImapClientAuthenticated, ImapClientDriver, ImapClientHandlerFactory, ImapClientNotAuthenticated,
     ImapClientSelected, ImapClientTimeouts, ImapConfig, ImapFetch, ImapIdle, ImapListEntry,
     ImapMailboxInfo, ImapService, ImapStatus, ImapStatusData, MailboxEventListener,
@@ -460,6 +460,7 @@ impl ImapClientDriver for PipelineDriver {
         _ep: &mut dyn Endpoint,
         _text: &str,
         _preauth: bool,
+        _caps: &ImapCapabilities,
     ) {
         auth.capability();
     }
@@ -492,6 +493,7 @@ impl ImapClientDriver for PipelineDriver {
         &mut self,
         session: &mut dyn ImapClientAuthenticated,
         _ep: &mut dyn Endpoint,
+        _caps: &ImapCapabilities,
     ) {
         // Both commands go out before either tagged reply arrives.
         pipeline_status_and_list(session, "INBOX", "MESSAGES UIDNEXT", "", "*");
@@ -596,6 +598,7 @@ impl ImapClientDriver for PipelineDriver {
         _session: &mut dyn ImapClientAuthenticated,
         _ep: &mut dyn Endpoint,
         _status: ImapStatus,
+        _appenduid: Option<&ImapAppendUid>,
         _message: &str,
     ) {
     }

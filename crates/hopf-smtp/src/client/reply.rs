@@ -61,6 +61,10 @@ pub enum SmtpReplyShape {
     Rset,
     /// `QUIT`.
     Quit,
+    /// `VRFY`.
+    Vrfy,
+    /// `EXPN`.
+    Expn,
 }
 
 /// Semantic events. Every variant carries already-parsed, ready-to-use
@@ -154,6 +158,35 @@ pub enum SmtpEvent {
     },
     /// RSET accepted (RFC 5321: RSET has no failure path).
     RsetOk,
+    /// 250/251/252 — VRFY succeeded. `code` distinguishes a fully verified
+    /// mailbox (250) from one that will be forwarded (251) or merely
+    /// accepted without verification (252); `text` is the resolved-mailbox
+    /// text the server returned.
+    VrfyOk {
+        /// The server's 3-digit reply code.
+        code: u16,
+        /// The server's resolved-mailbox text.
+        text: String,
+    },
+    /// VRFY failed (5xx, or 502/504 if VRFY itself isn't implemented).
+    VrfyFailed {
+        /// The server's 3-digit reply code.
+        code: u16,
+        /// The server's diagnostic text.
+        message: String,
+    },
+    /// 250 — EXPN succeeded; one entry per expanded mailing-list member.
+    ExpnOk {
+        /// Each member's text, one per reply line.
+        members: Vec<String>,
+    },
+    /// EXPN failed (5xx, or 502/504 if EXPN itself isn't implemented).
+    ExpnFailed {
+        /// The server's 3-digit reply code.
+        code: u16,
+        /// The server's diagnostic text.
+        message: String,
+    },
     /// 421 — service closing. Can arrive under any shape.
     ServiceClosing {
         /// The server's diagnostic text.
@@ -179,6 +212,8 @@ enum Field {
     AuthChallengeText,
     /// First line of a post-DATA 250, bounded, scanned for a queue-id.
     QueueIdText,
+    /// One EXPN member line, bounded, pushed onto `expn_members` on CR.
+    ExpnLine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +257,8 @@ pub struct SmtpReplyLexer {
     esmtp_found: bool,
     /// EHLO-only: capabilities accumulated across lines.
     caps: SmtpCapabilities,
+    /// EXPN-only: members accumulated across lines.
+    expn_members: Vec<String>,
 }
 
 const ESMTP: &[u8] = b"ESMTP";
@@ -246,6 +283,7 @@ impl SmtpReplyLexer {
             esmtp_matched: 0,
             esmtp_found: false,
             caps: SmtpCapabilities::default(),
+            expn_members: Vec::new(),
         }
     }
 
@@ -257,6 +295,7 @@ impl SmtpReplyLexer {
         self.pending_code = None;
         self.seen_first_line = false;
         self.caps = SmtpCapabilities::default();
+        self.expn_members.clear();
     }
 
     /// Feed inbound bytes. Returns parsed events; consumes everything
@@ -359,6 +398,9 @@ impl SmtpReplyLexer {
         if self.shape == SmtpReplyShape::Ehlo && code == 250 {
             return Field::EhloLine;
         }
+        if self.shape == SmtpReplyShape::Expn && code == 250 {
+            return Field::ExpnLine;
+        }
         if !first_line {
             return Field::SkipToEol;
         }
@@ -427,6 +469,11 @@ impl SmtpReplyLexer {
             }
             SmtpReplyShape::Rset => Field::SkipToEol, // RSET has no failure path
             SmtpReplyShape::Quit => Field::SkipToEol, // no reply text is used
+            // Success/failure text both matter for VRFY (the resolved
+            // mailbox *is* the success text); EXPN's success path never
+            // reaches here (handled by the ExpnLine check above), so this
+            // arm is failure-only for EXPN.
+            SmtpReplyShape::Vrfy | SmtpReplyShape::Expn => Field::KeepText,
         }
     }
 
@@ -440,7 +487,11 @@ impl SmtpReplyLexer {
         match field {
             Field::SkipToEol => {}
             Field::GreetingText => self.push_esmtp_byte(b),
-            Field::KeepText | Field::EhloLine | Field::AuthChallengeText | Field::QueueIdText => {
+            Field::KeepText
+            | Field::EhloLine
+            | Field::AuthChallengeText
+            | Field::QueueIdText
+            | Field::ExpnLine => {
                 if self.text.len() >= MAX_REPLY_LINE {
                     return Err(SmtpError::Parse("SMTP reply field too long".into()));
                 }
@@ -492,9 +543,20 @@ impl SmtpReplyLexer {
                     Ok(None)
                 }
             }
+            Field::ExpnLine => {
+                let line = std::mem::take(&mut self.text);
+                self.expn_members.push(line);
+                self.state = State::Code { digits: 0, value: 0 };
+                if reply_complete {
+                    let members = std::mem::take(&mut self.expn_members);
+                    Ok(Some(SmtpEvent::ExpnOk { members }))
+                } else {
+                    Ok(None)
+                }
+            }
             _ if !reply_complete => {
-                // Continuation line of a non-EHLO multiline reply: nothing
-                // to emit yet, keep reading lines.
+                // Continuation line of a non-EHLO/EXPN multiline reply:
+                // nothing to emit yet, keep reading lines.
                 self.state = State::Code { digits: 0, value: 0 };
                 Ok(None)
             }
@@ -601,6 +663,17 @@ impl SmtpReplyLexer {
             }
             SmtpReplyShape::Rset => SmtpEvent::RsetOk,
             SmtpReplyShape::Quit => return None, // no driver callback exists for QUIT
+            SmtpReplyShape::Vrfy => {
+                if matches!(code, 250 | 251 | 252) {
+                    SmtpEvent::VrfyOk { code, text: message.unwrap_or_default() }
+                } else {
+                    SmtpEvent::VrfyFailed { code, message: message.unwrap_or_default() }
+                }
+            }
+            // 250 goes through Field::ExpnLine, not finish_reply.
+            SmtpReplyShape::Expn => {
+                SmtpEvent::ExpnFailed { code, message: message.unwrap_or_default() }
+            }
         })
     }
 }
@@ -634,6 +707,32 @@ fn apply_ehlo_line(caps: &mut SmtpCapabilities, line: &str) {
         caps.enhanced_status_codes = true;
     } else if upper == "REQUIRETLS" {
         caps.require_tls = true;
+    } else if upper == "BINARYMIME" {
+        caps.binary_mime = true;
+    } else if upper.starts_with("MT-PRIORITY") {
+        caps.mt_priority = true;
+    } else if upper.starts_with("FUTURERELEASE") {
+        caps.future_release = true;
+    } else if upper.starts_with("DELIVERBY") {
+        caps.deliver_by = true;
+    } else if upper.starts_with("LIMITS") {
+        apply_limits_line(caps, line);
+    }
+}
+
+/// RFC 9422 — parse `LIMITS` keyword parameters (`RCPTMAX=`/`MAILMAX=`).
+fn apply_limits_line(caps: &mut SmtpCapabilities, line: &str) {
+    for token in line.split_whitespace().skip(1) {
+        let upper = token.to_ascii_uppercase();
+        if let Some(v) = upper.strip_prefix("RCPTMAX=") {
+            if let Ok(n) = v.parse() {
+                caps.limits_rcpt_max = n;
+            }
+        } else if let Some(v) = upper.strip_prefix("MAILMAX=") {
+            if let Ok(n) = v.parse() {
+                caps.limits_mail_max = n;
+            }
+        }
     }
 }
 
@@ -737,6 +836,26 @@ mod tests {
             other => panic!("expected Ehlo, got {other:?}"),
         }
         assert!(data.is_empty());
+    }
+
+    #[test]
+    fn ehlo_extension_capabilities() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Ehlo);
+        let mut data: &[u8] = b"250-mail.example.com Hello\r\n250-BINARYMIME\r\n250-MT-PRIORITY\r\n250-FUTURERELEASE 1234567 2023-12-31T23:59:59Z\r\n250-DELIVERBY 100\r\n250 LIMITS RCPTMAX=100 MAILMAX=50\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SmtpEvent::Ehlo(caps) => {
+                assert!(caps.binary_mime);
+                assert!(caps.mt_priority);
+                assert!(caps.future_release);
+                assert!(caps.deliver_by);
+                assert_eq!(caps.limits_rcpt_max, 100);
+                assert_eq!(caps.limits_mail_max, 50);
+            }
+            other => panic!("expected Ehlo, got {other:?}"),
+        }
     }
 
     #[test]
@@ -933,6 +1052,76 @@ mod tests {
                 code: 552,
                 message: "Message exceeds storage allocation".into()
             }]
+        );
+    }
+
+    #[test]
+    fn vrfy_ok_variants() {
+        for code in [250u16, 251, 252] {
+            let mut lex = SmtpReplyLexer::new();
+            lex.expect(SmtpReplyShape::Vrfy);
+            let mut data: Vec<u8> =
+                format!("{code} Fred Bloggs <fred@example.com>\r\n").into_bytes();
+            let mut slice: &[u8] = &data;
+            assert_eq!(
+                lex.feed(&mut slice).unwrap(),
+                vec![SmtpEvent::VrfyOk { code, text: "Fred Bloggs <fred@example.com>".into() }]
+            );
+            data.clear();
+        }
+    }
+
+    #[test]
+    fn vrfy_failed() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Vrfy);
+        let mut data: &[u8] = b"550 String does not match anything\r\n";
+        assert_eq!(
+            lex.feed(&mut data).unwrap(),
+            vec![SmtpEvent::VrfyFailed {
+                code: 550,
+                message: "String does not match anything".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn expn_ok_multiline() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Expn);
+        let mut data: &[u8] =
+            b"250-Zaphod Beeblebrox <zb@example.com>\r\n250 Ford Prefect <ford@example.com>\r\n";
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(
+            events,
+            vec![SmtpEvent::ExpnOk {
+                members: vec![
+                    "Zaphod Beeblebrox <zb@example.com>".into(),
+                    "Ford Prefect <ford@example.com>".into(),
+                ]
+            }]
+        );
+    }
+
+    #[test]
+    fn expn_ok_single_line() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Expn);
+        let mut data: &[u8] = b"250 Solo Member <solo@example.com>\r\n";
+        assert_eq!(
+            lex.feed(&mut data).unwrap(),
+            vec![SmtpEvent::ExpnOk { members: vec!["Solo Member <solo@example.com>".into()] }]
+        );
+    }
+
+    #[test]
+    fn expn_failed() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::Expn);
+        let mut data: &[u8] = b"550 Access denied\r\n";
+        assert_eq!(
+            lex.feed(&mut data).unwrap(),
+            vec![SmtpEvent::ExpnFailed { code: 550, message: "Access denied".into() }]
         );
     }
 

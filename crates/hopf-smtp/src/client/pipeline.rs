@@ -13,10 +13,12 @@ use std::sync::{Arc, Mutex};
 
 use hopf_core::Endpoint;
 
+use crate::DsnRecipientParams;
+
 use super::handlers::{SmtpClientDriver, SmtpClientHandlerFactory};
 use super::state::{
-    SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope, SmtpClientHello,
-    SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
+    MailFromParams, SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope,
+    SmtpClientHello, SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
 };
 
 // ── SmtpSendState ─────────────────────────────────────────────────────────────
@@ -211,7 +213,7 @@ impl SmtpClientDriver for SmtpSendDriver {
         // Proceed to envelope.
         let sender = st.sender.clone();
         drop(st);
-        session.mail_from(sender.as_deref());
+        session.mail_from(sender.as_deref(), &MailFromParams::default());
     }
 
     fn on_ehlo_not_supported(
@@ -230,7 +232,7 @@ impl SmtpClientDriver for SmtpSendDriver {
 
     fn on_helo(&mut self, session: &mut dyn SmtpClientSession, _ep: &mut dyn Endpoint) {
         let sender = self.state.lock().unwrap().sender.clone();
-        session.mail_from(sender.as_deref());
+        session.mail_from(sender.as_deref(), &MailFromParams::default());
     }
 
     fn on_helo_error(&mut self, ep: &mut dyn Endpoint, _message: &str) {
@@ -264,7 +266,7 @@ impl SmtpClientDriver for SmtpSendDriver {
 
     fn on_auth_ok(&mut self, session: &mut dyn SmtpClientSession, _ep: &mut dyn Endpoint) {
         let sender = self.state.lock().unwrap().sender.clone();
-        session.mail_from(sender.as_deref());
+        session.mail_from(sender.as_deref(), &MailFromParams::default());
     }
 
     fn on_auth_challenge(
@@ -287,6 +289,14 @@ impl SmtpClientDriver for SmtpSendDriver {
         session.quit();
     }
 
+    fn on_auth_aborted(&mut self, session: &mut dyn SmtpClientSession, _ep: &mut dyn Endpoint) {
+        // PLAIN never issues its own abort — this only fires if the server
+        // sent an unexpected challenge, which `on_auth_challenge` answers
+        // with `exchange.abort()`. Treat the same as a failed AUTH.
+        self.complete(false);
+        session.quit();
+    }
+
     fn on_mail_ok(&mut self, envelope: &mut dyn SmtpClientEnvelope, _ep: &mut dyn Endpoint) {
         // Send first recipient.
         let rcpt = {
@@ -295,7 +305,7 @@ impl SmtpClientDriver for SmtpSendDriver {
         };
         if let Some(r) = rcpt {
             self.state.lock().unwrap().rcpt_idx = 1;
-            envelope.rcpt_to(&r);
+            envelope.rcpt_to(&r, &DsnRecipientParams::default());
         } else {
             // No recipients — abort.
             self.complete(false);
@@ -329,7 +339,7 @@ impl SmtpClientDriver for SmtpSendDriver {
             st.recipients.get(idx).cloned()
         };
         if let Some(r) = next {
-            envelope.rcpt_to(&r);
+            envelope.rcpt_to(&r, &DsnRecipientParams::default());
         } else {
             envelope.start_data();
         }
@@ -351,7 +361,7 @@ impl SmtpClientDriver for SmtpSendDriver {
             st.recipients.get(idx).cloned()
         };
         if let Some(r) = next {
-            envelope.rcpt_to(&r);
+            envelope.rcpt_to(&r, &DsnRecipientParams::default());
         } else if envelope.has_accepted_recipients() {
             envelope.start_data();
         } else {
@@ -365,6 +375,19 @@ impl SmtpClientDriver for SmtpSendDriver {
         let message = self.state.lock().unwrap().message.clone();
         data.write_content(&message);
         data.end_message();
+    }
+
+    fn on_data_rejected(
+        &mut self,
+        envelope: &mut dyn SmtpClientEnvelope,
+        _ep: &mut dyn Endpoint,
+        _code: u16,
+        _message: &str,
+    ) {
+        // The auto-pilot pipeline doesn't retry — give up like every other
+        // rejection path.
+        self.complete(false);
+        envelope.quit();
     }
 
     fn on_message_accepted(
@@ -390,6 +413,44 @@ impl SmtpClientDriver for SmtpSendDriver {
 
     fn on_rset_ok(&mut self, session: &mut dyn SmtpClientSession, _ep: &mut dyn Endpoint) {
         session.quit();
+    }
+
+    // SmtpSend's auto-pilot flow never issues VRFY/EXPN itself, so these
+    // callbacks are unreachable in practice — implemented only to satisfy
+    // the trait.
+    fn on_vrfy_ok(
+        &mut self,
+        _session: &mut dyn SmtpClientSession,
+        _ep: &mut dyn Endpoint,
+        _code: u16,
+        _text: &str,
+    ) {
+    }
+
+    fn on_vrfy_failed(
+        &mut self,
+        _session: &mut dyn SmtpClientSession,
+        _ep: &mut dyn Endpoint,
+        _code: u16,
+        _message: &str,
+    ) {
+    }
+
+    fn on_expn_ok(
+        &mut self,
+        _session: &mut dyn SmtpClientSession,
+        _ep: &mut dyn Endpoint,
+        _members: &[String],
+    ) {
+    }
+
+    fn on_expn_failed(
+        &mut self,
+        _session: &mut dyn SmtpClientSession,
+        _ep: &mut dyn Endpoint,
+        _code: u16,
+        _message: &str,
+    ) {
     }
 
     fn on_error(&mut self, ep: &mut dyn Endpoint, _err: &io::Error) {
