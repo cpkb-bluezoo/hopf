@@ -81,6 +81,7 @@
 <li><a href="#authentication">Authentication</a></li>
 <li><a href="#handler-spi">Handler SPI</a></li>
 <li><a href="#pipelines">Pipelines</a></li>
+<li><a href="#email-authentication">Email authentication (SPF/DKIM/DMARC)</a></li>
 <li><a href="#relay">Relay</a></li>
 <li><a href="#local-delivery">Local delivery</a></li>
 <li><a href="#configuration">Configuration</a></li>
@@ -394,9 +395,47 @@
 <td><code>MessageBufferPipeline</code></td>
 <td>Buffer for relay</td>
 </tr>
+<tr>
+<td><code>AuthPipeline</code></td>
+<td>SPF/DKIM/DMARC — see <a href="#email-authentication">Email authentication</a></td>
+</tr>
 </tbody>
 </table>
 <p>Return a pipeline from <code>MailFromHandler::pipeline()</code>.</p>
+<h2 id="email-authentication">Email authentication (SPF/DKIM/DMARC)</h2>
+<p><code>hopf_smtp::auth</code> is a from-scratch port of Gumdrop's <code>org.bluezoo.gumdrop.smtp.auth</code> package: SPF (RFC 7208), DKIM verify + sign (RFC 6376, Ed25519 per RFC 8463), and DMARC (RFC 7489), plus a Public Suffix List for organizational-domain resolution and DMARC aggregate/forensic report rendering. See the <a href="conformance.html#smtp">conformance audit</a> for the full RFC-by-RFC breakdown, including the couple of deliberately-deferred DMARCbis extras.</p>
+<p><code>AuthPipeline</code> implements <code>SmtpPipeline</code> and can be returned from <code>MailFromHandler::pipeline()</code>. SPF starts at <code>MAIL FROM</code>; DKIM verification and DMARC evaluation start once the message finishes at end-of-DATA. All three depend on DNS, so none of them complete synchronously — observe results via the <code>on_spf</code>/<code>on_dkim</code>/<code>on_dmarc</code> callbacks and/or a cloneable, pollable <code>AuthVerdictHandle</code>:</p>
+<pre><code>use hopf_smtp::{AuthPipeline, MessageEndState};
+
+// MailFromHandler::pipeline():
+fn pipeline(&amp;mut self) -&gt; Option&lt;Box&lt;dyn SmtpPipeline&gt;&gt; {
+    let p = AuthPipeline::builder(dns.clone(), client_ip, helo_domain.clone())
+        .on_dmarc(|outcome| log::info!("dmarc: {:?}", outcome.verdict))
+        .build();
+    self.verdict = Some(p.verdict()); // stash the handle for message_complete
+    Some(Box::new(p))
+}
+
+// MessageDataHandler::message_complete(): AuthPipeline owns all message
+// content when it's the registered pipeline, so this handler's own
+// message_content() is never called.
+fn message_complete(&amp;mut self, state: &amp;mut dyn MessageEndState) {
+    let verdict = self.verdict.take().unwrap();
+    match verdict.poll() {
+        Some(AuthVerdict::Reject) =&gt; state.reject_message_policy("5.7.1 DMARC", Box::new(self.clone())),
+        Some(_) =&gt; state.accept_message_delivery(None, Box::new(self.clone())),
+        None =&gt; {
+            // DNS hasn't resolved yet (the common case) — defer the reply.
+            let deferred = state.defer(Box::new(self.clone()));
+            verdict.on_ready(move |v| match v {
+                AuthVerdict::Reject =&gt; deferred.reject(550, "5.7.1 DMARC"),
+                _ =&gt; deferred.accept(None),
+            });
+        }
+    }
+}</code></pre>
+<p>This deferred-reply path — proven in <code>hopf-smtp</code>'s integration tests against a real loopback DNS stub and the real control-handler state machine — is the normal case, not an edge case: <code>message_complete()</code> always runs synchronously right after <code>end_data()</code> fires off DNS lookups, so the verdict is essentially never ready yet when the app has to decide.</p>
+<p><code>DkimSigner</code> (outbound) and the standalone <code>SpfResult</code>/<code>DkimResult</code>/<code>DmarcResult</code> validators are also usable directly, without the pipeline, for apps that want to check or sign a message themselves. <code>DmarcAggregateReport</code>/<code>DmarcForensicReport</code> render the RFC 7489 Appendix&nbsp;C XML and RFC 5965 ARF documents respectively — sending/scheduling them is left to the app, matching Gumdrop.</p>
 <h2 id="relay">Relay</h2>
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span>SimpleRelayService<span class="op">;</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
@@ -701,7 +740,7 @@
 <li>Relay is open MX only; STARTTLS to arbitrary MX is incomplete.</li>
 <li>EXPN / ETRN not useful; VRFY always <code>252</code>.</li>
 <li>AUTH PLAIN only (no LOGIN/CRAM/SCRAM on SMTP wire yet).</li>
-<li>No SPF/DKIM/DMARC pipeline (present in Gumdrop SMTP docs; not in Hopf).</li>
+<li>SPF's <code>%{p}</code> macro always resolves to <code>"unknown"</code> rather than doing the discouraged PTR-then-forward-confirm lookup; DMARCbis <code>np=</code> is parsed but not enforced, <code>psd=</code> isn't parsed (see <a href="conformance.html#smtp">conformance</a>).</li>
 <li>Client completion is callback-driven — callers wait on their own signalling (see <code>examples/smtp-send</code>).</li>
 </ul>
 
