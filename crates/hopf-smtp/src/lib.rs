@@ -12,10 +12,12 @@
 
 #![warn(missing_docs)]
 
+pub mod auth;
 pub mod client;
 
 mod server;
 
+pub use auth::{AuthPipeline, AuthPipelineBuilder, AuthVerdict, AuthVerdictHandle};
 pub use client::{
     dot_stuff, MailFromParams, SmtpCapabilities, SmtpClient, SmtpClientDriver, SmtpClientEndpoint,
     SmtpEvent, SmtpClientHandlerFactory, SmtpClientTimeouts, SmtpError, SmtpReplyLexer,

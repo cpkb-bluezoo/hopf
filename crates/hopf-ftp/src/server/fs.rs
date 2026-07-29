@@ -95,11 +95,14 @@ pub trait FtpFileSystem: Send {
         meta: &FtpConnectionMetadata,
     ) -> Result<Box<dyn Read + Send>, FtpFileOpResult>;
 
-    /// Open for write (STOR/APPE).
+    /// Open for write (STOR/APPE); `restart` is the REST marker (RFC 959
+    /// §4.1.3) — meaningful only when `append` is false (APPE always seeks
+    /// to EOF regardless of any pending REST).
     fn open_write(
         &self,
         path: &str,
         append: bool,
+        restart: u64,
         meta: &FtpConnectionMetadata,
     ) -> Result<Box<dyn Write + Send>, FtpFileOpResult>;
 }
@@ -316,6 +319,7 @@ impl FtpFileSystem for BasicFtpFileSystem {
         &self,
         path: &str,
         append: bool,
+        restart: u64,
         _meta: &FtpConnectionMetadata,
     ) -> Result<Box<dyn Write + Send>, FtpFileOpResult> {
         if self.read_only {
@@ -326,10 +330,14 @@ impl FtpFileSystem for BasicFtpFileSystem {
         opts.create(true).write(true);
         if append {
             opts.append(true);
-        } else {
+        } else if restart == 0 {
             opts.truncate(true);
         }
-        let f = opts.open(p).map_err(|_| FtpFileOpResult::Failed)?;
+        let mut f = opts.open(p).map_err(|_| FtpFileOpResult::Failed)?;
+        if !append && restart > 0 {
+            f.seek(SeekFrom::Start(restart))
+                .map_err(|_| FtpFileOpResult::Failed)?;
+        }
         Ok(Box::new(f))
     }
 }
@@ -383,5 +391,44 @@ mod tests {
         assert_eq!(fs.mkdir("/a", &meta()), FtpFileOpResult::Ok);
         let list = fs.list_directory("/", &meta()).unwrap();
         assert!(list.iter().any(|e| e.name == "a"));
+    }
+
+    #[test]
+    fn open_write_without_restart_truncates() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = BasicFtpFileSystem::new(dir.path(), false).unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"0123456789").unwrap();
+        let mut w = fs.open_write("/f.txt", false, 0, &meta()).unwrap();
+        w.write_all(b"AB").unwrap();
+        drop(w);
+        assert_eq!(std::fs::read(dir.path().join("f.txt")).unwrap(), b"AB");
+    }
+
+    #[test]
+    fn open_write_with_restart_seeks_instead_of_truncating() {
+        // RFC 959 §4.1.3 — REST before STOR resumes at the given offset
+        // instead of truncating the file back to empty.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = BasicFtpFileSystem::new(dir.path(), false).unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"0123456789").unwrap();
+        let mut w = fs.open_write("/f.txt", false, 5, &meta()).unwrap();
+        w.write_all(b"XYZ").unwrap();
+        drop(w);
+        assert_eq!(std::fs::read(dir.path().join("f.txt")).unwrap(), b"01234XYZ89");
+    }
+
+    #[test]
+    fn open_write_append_ignores_restart() {
+        // APPE always seeks to EOF regardless of any pending REST.
+        let dir = tempfile::tempdir().unwrap();
+        let fs = BasicFtpFileSystem::new(dir.path(), false).unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"0123456789").unwrap();
+        let mut w = fs.open_write("/f.txt", true, 5, &meta()).unwrap();
+        w.write_all(b"XYZ").unwrap();
+        drop(w);
+        assert_eq!(
+            std::fs::read(dir.path().join("f.txt")).unwrap(),
+            b"0123456789XYZ"
+        );
     }
 }

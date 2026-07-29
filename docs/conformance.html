@@ -602,6 +602,23 @@
 <tr><td>MAIL FROM/RCPT TO ESMTP parameters (SIZE/BODY/RET/ENVID/REQUIRETLS/etc.)</td><td>various</td><td>Not implemented</td><td>Client API takes only the bare address — no parameter-passing surface at all, unlike the server which fully parses all of these on the inbound side</td></tr>
 </tbody>
 </table>
+<h3>Email Authentication — SPF / DKIM / DMARC (<code>hopf_smtp::auth</code>)</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>SPF <code>check_host()</code>: all/ip4/ip6/a/mx/include/exists/ptr mechanisms, redirect=/exp= modifiers, macro expansion, 10-lookup + 2-void-lookup limits</td><td>7208 §4-7</td><td>Compliant</td><td><code>auth/spf.rs</code>; null <code>MAIL FROM</code> falls back to the HELO domain per §4.3</td></tr>
+<tr><td>SPF <code>%{p}</code> ("validated domain") macro</td><td>7208 §7.3</td><td>Deferred (documented)</td><td>Always expands to <code>"unknown"</code> rather than performing the PTR-then-forward-confirm lookup — the RFC itself says publishers "SHOULD NOT" use it and resolvers merely "SHOULD" support it; the <code>ptr</code> <em>mechanism</em>, which records use far more often, is fully implemented</td></tr>
+<tr><td>DKIM verify: signature-tag parsing, simple/relaxed header+body canonicalization, <code>{s}._domainkey.{d}</code> key fetch, <code>rsa-sha256</code> and <code>ed25519-sha256</code>, <code>bh=</code>/<code>l=</code>/<code>x=</code>, bottom-up header selection for repeated <code>h=</code> names</td><td>6376, 8463</td><td>Compliant</td><td><code>auth/dkim/{canon,verify}.rs</code>; wired to <code>rmimeparser::DkimMessageParser</code> raw capture for wire-accurate body/header bytes; round-trip tested against real RSA-2048 and Ed25519 keys</td></tr>
+<tr><td>DKIM sign: builder API (<code>DkimSigner</code>), rsa-sha256/ed25519-sha256, header/body canonicalization choice, custom signed-header list, <code>t=</code>/<code>x=</code>/<code>i=</code></td><td>6376 §5, 8463</td><td>Compliant</td><td><code>auth/dkim/sign.rs</code>; not auto-wired into any stock relay/submission path (Gumdrop's <code>SimpleRelay</code> doesn't sign either) — library API only</td></tr>
+<tr><td>DMARC: <code>_dmarc</code> record fetch with organizational-domain fallback, <code>p</code>/<code>sp</code>/<code>adkim</code>/<code>aspf</code>/<code>pct</code>/<code>rua</code>/<code>ruf</code>/<code>fo</code>/<code>rf</code> tags, strict/relaxed SPF+DKIM alignment, <code>pct=</code> sampling with policy downgrade</td><td>7489 §6-7</td><td>Compliant</td><td><code>auth/dmarc/mod.rs</code>; alignment checks every verified DKIM signature, not just the first, per §3.1.2</td></tr>
+<tr><td>DMARCbis <code>np=</code> (non-existent-subdomain policy)</td><td>draft-ietf-dmarc-dmarcbis</td><td>Partial</td><td>Parsed and exposed on <code>DmarcRecord</code>, not enforced — applying it correctly needs an extra domain-existence check this evaluator doesn't perform; <code>psd=</code> is not parsed at all. Both are unfinished-draft features, not RFC 7489</td></tr>
+<tr><td>Public Suffix List (organizational-domain resolution)</td><td>7489 §3.2</td><td>Compliant</td><td><code>auth/psl.rs</code> implements the publicsuffix.org "Formal Algorithm" (exception &gt; wildcard &gt; longest-match) over the bundled ICANN+PRIVATE list (<code>auth/public_suffix_list.dat</code>, MPL-2.0)</td></tr>
+<tr><td>DMARC aggregate ("rua") report XML</td><td>7489 Appx. C</td><td>Compliant</td><td><code>auth/dmarc/aggregate.rs</code> renders the <code>&lt;feedback&gt;</code> document from app-supplied traffic records; sending/scheduling reports is app-driven, same as Gumdrop</td></tr>
+<tr><td>DMARC forensic ("ruf") report</td><td>6591, 5965 (ARF)</td><td>Compliant</td><td><code>auth/dmarc/forensic.rs</code> renders the <code>multipart/report; report-type=feedback-report</code> MIME document; sending is app-driven</td></tr>
+<tr><td><code>AuthPipeline</code> — SPF/DKIM/DMARC wired into the transaction pipeline SPI</td><td>—</td><td>Compliant</td><td><code>auth/pipeline.rs</code>; SPF starts at <code>MAIL FROM</code>, DKIM+DMARC at end-of-DATA; results delivered via <code>on_spf</code>/<code>on_dkim</code>/<code>on_dmarc</code> callbacks and a pollable <code>AuthVerdictHandle</code> that <code>MessageEndState::defer()</code> / <code>DeferredDelivery</code> can wait on when DNS hasn't resolved yet — proven end-to-end in <code>integration.rs::dmarc_pipeline</code> against a real loopback DNS stub and the real control-handler state machine</td></tr>
+<tr><td>ARC, auto-injected <code>Authentication-Results</code> on every inbound message, built-in quarantine mailbox, SMTP-service config toggles for auth</td><td>—</td><td>Not implemented (deliberate)</td><td>Out of scope for v1, matching Gumdrop — apps build the pipeline and act on verdicts themselves rather than the framework enforcing policy implicitly</td></tr>
+</tbody>
+</table>
 
 <h2 id="auth">Auth / SASL — RFC 4422</h2>
 <table>
@@ -811,7 +828,6 @@
 <tr><td>LDAP client</td><td>RFC 4511</td><td>Not started.</td></tr>
 </tbody>
 </table>
-<p>Also present in Gumdrop but not audited here since hopf has no equivalent surface to check: SPF (RFC 7208), DKIM (RFC 6376), and DMARC (RFC 7489) email-authentication support — hopf-smtp has no code addressing any of these.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
