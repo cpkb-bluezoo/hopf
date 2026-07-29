@@ -413,6 +413,75 @@ fn async_client_retr_from_resumes_at_offset() {
     drop(rt);
 }
 
+/// Custom pipeline exercising `stor_from` (RFC 959 §4.1.3 REST + STOR).
+struct StorFromPipeline {
+    path: String,
+    offset: u64,
+    data: Vec<u8>,
+    result: Arc<Mutex<Option<std::io::Result<()>>>>,
+}
+
+impl FtpPipeline for StorFromPipeline {
+    fn start(&mut self, session: &mut dyn FtpSessionWrite, _abort: FtpAbortHandle) {
+        session.type_image();
+        let r = Arc::clone(&self.result);
+        session.stor_from(
+            &self.path,
+            self.offset,
+            self.data.clone(),
+            Box::new(move |res| {
+                *r.lock().unwrap() = Some(res);
+            }),
+        );
+        session.quit();
+    }
+
+    fn done(&mut self) {}
+
+    fn failed(&mut self, err: FtpError) {
+        *self.result.lock().unwrap() = Some(Err(err.into_io()));
+    }
+}
+
+/// Resumed upload writes at the REST offset instead of truncating the
+/// file back to empty — the exact server-side bug found while building
+/// `stor_from`: the server previously ignored the REST marker on STOR.
+#[test]
+fn async_client_stor_from_resumes_at_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("resume.txt"), b"0123456789").unwrap();
+    let (rt, bound) = start_server(dir.path());
+
+    let result: Arc<Mutex<Option<std::io::Result<()>>>> = Arc::new(Mutex::new(None));
+    let pipeline = StorFromPipeline {
+        path: "resume.txt".into(),
+        offset: 5,
+        data: b"XYZ".to_vec(),
+        result: Arc::clone(&result),
+    };
+
+    FtpClient::new(bound.ip().to_string())
+        .port(bound.port())
+        .credentials("u", "p")
+        .prefer_epsv(false)
+        .timeouts(FtpClientTimeouts {
+            dns: Duration::from_secs(1),
+            connect: Duration::from_secs(3),
+            stage: Duration::from_secs(5),
+            data: Duration::from_secs(10),
+        })
+        .connect(&rt, Box::new(pipeline))
+        .unwrap();
+
+    wait_result(result).unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("resume.txt")).unwrap(),
+        b"01234XYZ89"
+    );
+
+    drop(rt);
+}
+
 #[test]
 fn async_client_retr_then_stor() {
     let dir = tempfile::tempdir().unwrap();
