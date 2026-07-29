@@ -280,7 +280,7 @@ impl ImapClientDriver for ImapFetchDriver {
         ep.close();
     }
 
-    fn on_fetch_literal(&mut self, data: &[u8]) {
+    fn on_fetch_literal(&mut self, data: &[u8], _ep: &mut dyn Endpoint) {
         self.state.lock().unwrap().body_buf.extend_from_slice(data);
     }
 
@@ -613,7 +613,7 @@ impl ImapClientDriver for ImapIdleDriver {
         ep.close();
     }
 
-    fn on_fetch_literal(&mut self, _data: &[u8]) {}
+    fn on_fetch_literal(&mut self, _data: &[u8], _ep: &mut dyn Endpoint) {}
 
     fn on_fetch_complete(
         &mut self,

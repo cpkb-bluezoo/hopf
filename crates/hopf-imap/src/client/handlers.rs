@@ -134,8 +134,35 @@ pub trait ImapClientDriver: Send {
         message: &str,
     );
 
-    /// FETCH literal octets.
-    fn on_fetch_literal(&mut self, data: &[u8]);
+    /// A FETCH literal is about to stream — brackets the
+    /// [`Self::on_fetch_literal`] chunks that follow. `section` identifies
+    /// which value this is: a `BODY[...]`'s bracket contents (e.g.
+    /// `"HEADER"`, `"1.TEXT"`, `""` for the whole message), or the bare
+    /// attribute name for `RFC822`/`RFC822.TEXT`/`RFC822.HEADER`. Matches
+    /// Gumdrop's `ServerFetchReplyHandler.handleFetchLiteralBegin`.
+    fn on_fetch_literal_begin(
+        &mut self,
+        ep: &mut dyn Endpoint,
+        seq: u32,
+        section: &str,
+        size: u64,
+    ) {
+        let _ = (ep, seq, section, size);
+    }
+
+    /// FETCH literal octets (called zero or more times between
+    /// [`Self::on_fetch_literal_begin`] and [`Self::on_fetch_literal_end`]).
+    /// `ep` lets the driver call `pause_read`/`resume_read` to apply
+    /// backpressure during a large transfer — matches Gumdrop's
+    /// `wantsPause()`/`setResumeCallback()`, checked after every
+    /// `handleFetchLiteralContent`.
+    fn on_fetch_literal(&mut self, data: &[u8], ep: &mut dyn Endpoint);
+
+    /// The literal started by [`Self::on_fetch_literal_begin`] is complete.
+    /// Matches Gumdrop's `ServerFetchReplyHandler.handleFetchLiteralEnd`.
+    fn on_fetch_literal_end(&mut self, ep: &mut dyn Endpoint, seq: u32) {
+        let _ = (ep, seq);
+    }
 
     /// Parsed FETCH attributes when a simple FETCH line is recognised.
     fn on_fetch_data(&mut self, data: &ImapFetchData) {
@@ -368,6 +395,19 @@ pub trait ImapClientDriver: Send {
         appenduid: Option<&ImapAppendUid>,
         message: &str,
     );
+
+    /// `CREATE`/`DELETE`/`RENAME`/`SUBSCRIBE`/`UNSUBSCRIBE` completed.
+    /// Matches Gumdrop's single `ServerMailboxReplyHandler.handleOk`/
+    /// `handleNo`, shared across all five commands (RFC 9051 §6.3.3–6.3.7).
+    fn on_mailbox_op_complete(
+        &mut self,
+        session: &mut dyn ImapClientAuthenticated,
+        ep: &mut dyn Endpoint,
+        status: ImapStatus,
+        message: &str,
+    ) {
+        let _ = (session, ep, status, message);
+    }
 
     /// Generic tagged completion for commands without a dedicated callback.
     fn on_command_complete(

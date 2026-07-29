@@ -424,7 +424,17 @@ pub trait ImapClientAuthenticated {
     /// Send `STATUS mailbox (items…)`.
     fn status(&mut self, mailbox: &str, items: &str);
     /// Begin `APPEND` (literal framing; wait for `+` unless LITERAL- applies).
-    fn append(&mut self, mailbox: &str, flags: Option<&str>, size: u64, use_literal_minus: bool);
+    /// `date` is an already-formatted RFC 9051 §6.3.12 `date-time` string
+    /// (e.g. `"01-Jan-2024 00:00:00 +0000"`) setting the appended
+    /// message's INTERNALDATE; `None` lets the server assign "now".
+    fn append(
+        &mut self,
+        mailbox: &str,
+        flags: Option<&str>,
+        date: Option<&str>,
+        size: u64,
+        use_literal_minus: bool,
+    );
     /// Send `NAMESPACE` when advertised.
     fn namespace(&mut self);
     /// Send `ENABLE` with space-separated features (e.g. `CONDSTORE QRESYNC`).
@@ -441,6 +451,16 @@ pub trait ImapClientAuthenticated {
     fn idle(&mut self);
     /// Send `NOOP`.
     fn noop(&mut self);
+    /// Send `CREATE mailbox` (RFC 9051 §6.3.3).
+    fn create(&mut self, mailbox: &str);
+    /// Send `DELETE mailbox` (RFC 9051 §6.3.4).
+    fn delete(&mut self, mailbox: &str);
+    /// Send `RENAME from to` (RFC 9051 §6.3.5).
+    fn rename(&mut self, from: &str, to: &str);
+    /// Send `SUBSCRIBE mailbox` (RFC 9051 §6.3.6).
+    fn subscribe(&mut self, mailbox: &str);
+    /// Send `UNSUBSCRIBE mailbox` (RFC 9051 §6.3.7).
+    fn unsubscribe(&mut self, mailbox: &str);
     /// Send `LOGOUT`.
     fn logout(&mut self);
     /// Capabilities from the most recent CAPABILITY response.

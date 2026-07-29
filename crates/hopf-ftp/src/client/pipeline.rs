@@ -46,7 +46,7 @@ impl FtpGet {
 }
 
 impl FtpPipeline for FtpGet {
-    fn start(&mut self, session: &mut dyn FtpSessionWrite) {
+    fn start(&mut self, session: &mut dyn FtpSessionWrite, _abort: super::FtpAbortHandle) {
         session.type_image();
         if let Some(cb) = self.callback.take() {
             session.retr(&self.path, cb);
@@ -99,7 +99,7 @@ impl FtpPut {
 }
 
 impl FtpPipeline for FtpPut {
-    fn start(&mut self, session: &mut dyn FtpSessionWrite) {
+    fn start(&mut self, session: &mut dyn FtpSessionWrite, _abort: super::FtpAbortHandle) {
         session.type_image();
         if let Some(cb) = self.callback.take() {
             session.stor(&self.path, std::mem::take(&mut self.data), cb);
