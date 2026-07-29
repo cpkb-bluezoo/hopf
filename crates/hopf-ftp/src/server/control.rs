@@ -572,10 +572,12 @@ impl FtpControlHandler {
             .app
             .file_system(&self.meta)
             .resolve(arg, &self.cwd);
+        let restart = self.restart;
+        self.restart = 0;
         let writer = match self
             .app
             .file_system(&self.meta)
-            .open_write(&path, append, &self.meta)
+            .open_write(&path, append, restart, &self.meta)
         {
             Ok(w) => w,
             Err(FtpFileOpResult::ReadOnly) => {
