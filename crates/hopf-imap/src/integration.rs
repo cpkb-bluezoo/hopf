@@ -534,7 +534,7 @@ impl ImapClientDriver for PipelineDriver {
     ) {
     }
 
-    fn on_fetch_literal(&mut self, _data: &[u8]) {}
+    fn on_fetch_literal(&mut self, _data: &[u8], _ep: &mut dyn Endpoint) {}
 
     fn on_fetch_complete(
         &mut self,

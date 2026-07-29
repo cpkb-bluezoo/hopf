@@ -72,12 +72,23 @@ pub enum FtpEvent {
     PasvAddr(SocketAddr),
     /// `229` EPSV reply, port already parsed (RFC 2428).
     EpsvPort(u16),
-    /// `125`/`150` — server ready to begin the data transfer.
-    XferStartOk,
+    /// `125`/`150` — server ready to begin the data transfer. `text` is
+    /// the reply line's text — for `STOU`, servers conventionally return
+    /// the assigned filename here (RFC 959 §4.1.3 doesn't standardize the
+    /// exact wording, so callers parse it themselves).
+    XferStartOk {
+        /// The reply's text.
+        text: String,
+    },
     /// `226`/`250` — data transfer complete.
     XferEndOk,
-    /// The expected code for an arbitrary command was received.
-    CmdOk,
+    /// The expected code for an arbitrary command was received. `text` is
+    /// the reply line's text (e.g. `PWD`'s quoted path, `SIZE`'s byte
+    /// count, `SYST`'s system string) — previously discarded.
+    CmdOk {
+        /// The success reply's text.
+        text: String,
+    },
     /// `QUIT` acknowledged (any reply code — RFC 959 §4.1.1).
     QuitDone,
     /// Any shape's failure path: unexpected code, malformed PASV/EPSV
@@ -307,13 +318,12 @@ impl FtpReplyLexer {
             // Always kept: 227/229 need the address text parsed; any
             // other code needs the diagnostic text.
             FtpReplyShape::PassiveMode => Field::KeepText,
-            FtpReplyShape::XferStart => {
-                if matches!(code, 125 | 150) {
-                    Field::SkipToEol
-                } else {
-                    Field::KeepText
-                }
-            }
+            // Kept either way: STOU's assigned filename rides the success
+            // text (RFC 959 §4.1.3); other transfers ignore it, but there's
+            // no way to tell which without knowing the verb, which this
+            // shape doesn't carry — see FtpReplyShape::Cmd for the same
+            // reasoning applied to arbitrary commands.
+            FtpReplyShape::XferStart => Field::KeepText,
             FtpReplyShape::XferEnd => {
                 if matches!(code, 226 | 250) {
                     Field::SkipToEol
@@ -321,14 +331,10 @@ impl FtpReplyLexer {
                     Field::KeepText
                 }
             }
-            FtpReplyShape::Cmd { expect } => {
-                let ok = if expect == 0 { code / 100 == 2 } else { code == expect };
-                if ok {
-                    Field::SkipToEol
-                } else {
-                    Field::KeepText
-                }
-            }
+            // Kept either way: success text carries real values (PWD's
+            // path, SIZE's byte count, SYST's system string, …) just as
+            // much as failure text carries diagnostics.
+            FtpReplyShape::Cmd { .. } => Field::KeepText,
             FtpReplyShape::Quit => Field::SkipToEol, // any code ends the session
         }
     }
@@ -357,7 +363,8 @@ impl FtpReplyLexer {
             return Ok(Some(self.success_event(code)));
         }
 
-        // KeepText: either a PASV/EPSV address to parse, or diagnostics.
+        // KeepText: either a PASV/EPSV address to parse, an arbitrary
+        // command's success/failure text, or diagnostics.
         match self.shape {
             FtpReplyShape::PassiveMode if code == 227 => match parse_pasv_addr(&text) {
                 Ok(addr) => Ok(Some(FtpEvent::PasvAddr(addr))),
@@ -367,6 +374,17 @@ impl FtpReplyLexer {
                 Ok(port) => Ok(Some(FtpEvent::EpsvPort(port))),
                 Err(_) => Ok(Some(FtpEvent::Error { code, message: text })),
             },
+            FtpReplyShape::Cmd { expect } => {
+                let ok = if expect == 0 { code / 100 == 2 } else { code == expect };
+                if ok {
+                    Ok(Some(FtpEvent::CmdOk { text }))
+                } else {
+                    Ok(Some(FtpEvent::Error { code, message: text }))
+                }
+            }
+            FtpReplyShape::XferStart if matches!(code, 125 | 150) => {
+                Ok(Some(FtpEvent::XferStartOk { text }))
+            }
             _ => Ok(Some(FtpEvent::Error { code, message: text })),
         }
     }
@@ -387,9 +405,17 @@ impl FtpReplyLexer {
                 // finish_field never reaches success_event for it.
                 unreachable!("PassiveMode's field is always KeepText")
             }
-            FtpReplyShape::XferStart => FtpEvent::XferStartOk,
+            FtpReplyShape::XferStart => {
+                // select_field always returns KeepText for this shape, so
+                // finish_field never reaches success_event for it.
+                unreachable!("XferStart's field is always KeepText")
+            }
             FtpReplyShape::XferEnd => FtpEvent::XferEndOk,
-            FtpReplyShape::Cmd { .. } => FtpEvent::CmdOk,
+            FtpReplyShape::Cmd { .. } => {
+                // select_field always returns KeepText for this shape, so
+                // finish_field never reaches success_event for it.
+                unreachable!("Cmd's field is always KeepText")
+            }
             FtpReplyShape::Quit => FtpEvent::QuitDone,
         }
     }
@@ -566,10 +592,24 @@ mod tests {
     fn xfer_start_and_end() {
         let mut lex = FtpReplyLexer::new();
         lex.expect(FtpReplyShape::XferStart);
-        assert_eq!(feed_all(&mut lex, "150 Opening data connection\r\n"), vec![FtpEvent::XferStartOk]);
+        assert_eq!(
+            feed_all(&mut lex, "150 Opening data connection\r\n"),
+            vec![FtpEvent::XferStartOk { text: "Opening data connection".into() }]
+        );
 
         lex.expect(FtpReplyShape::XferEnd);
         assert_eq!(feed_all(&mut lex, "226 Transfer complete\r\n"), vec![FtpEvent::XferEndOk]);
+    }
+
+    #[test]
+    fn xfer_start_stou_filename_text_kept() {
+        // STOU's assigned filename rides the 125/150 reply text.
+        let mut lex = FtpReplyLexer::new();
+        lex.expect(FtpReplyShape::XferStart);
+        assert_eq!(
+            feed_all(&mut lex, "150 FILE: unique-name-123.txt\r\n"),
+            vec![FtpEvent::XferStartOk { text: "FILE: unique-name-123.txt".into() }]
+        );
     }
 
     #[test]
@@ -586,10 +626,16 @@ mod tests {
     fn cmd_exact_code_and_any_2xx() {
         let mut lex = FtpReplyLexer::new();
         lex.expect(FtpReplyShape::Cmd { expect: 200 });
-        assert_eq!(feed_all(&mut lex, "200 Command OK\r\n"), vec![FtpEvent::CmdOk]);
+        assert_eq!(
+            feed_all(&mut lex, "200 Command OK\r\n"),
+            vec![FtpEvent::CmdOk { text: "Command OK".into() }]
+        );
 
         lex.expect(FtpReplyShape::Cmd { expect: 0 });
-        assert_eq!(feed_all(&mut lex, "250 OK\r\n"), vec![FtpEvent::CmdOk]);
+        assert_eq!(
+            feed_all(&mut lex, "250 OK\r\n"),
+            vec![FtpEvent::CmdOk { text: "OK".into() }]
+        );
 
         lex.expect(FtpReplyShape::Cmd { expect: 200 });
         assert_eq!(
@@ -614,6 +660,28 @@ mod tests {
         let mut lex = FtpReplyLexer::new();
         lex.expect(FtpReplyShape::XferEnd);
         assert_eq!(feed_all(&mut lex, "226\r\n"), vec![FtpEvent::XferEndOk]);
+    }
+
+    #[test]
+    fn cmd_bare_code_no_text_is_empty_string() {
+        let mut lex = FtpReplyLexer::new();
+        lex.expect(FtpReplyShape::Cmd { expect: 200 });
+        assert_eq!(feed_all(&mut lex, "200\r\n"), vec![FtpEvent::CmdOk { text: String::new() }]);
+    }
+
+    #[test]
+    fn cmd_success_text_reaches_pwd_parser() {
+        // Previously unreachable: PWD's success text was discarded before
+        // parse_pwd_path could ever see it.
+        let mut lex = FtpReplyLexer::new();
+        lex.expect(FtpReplyShape::Cmd { expect: 257 });
+        let events = feed_all(&mut lex, "257 \"/tmp\" is current directory\r\n");
+        match &events[0] {
+            FtpEvent::CmdOk { text } => {
+                assert_eq!(parse_pwd_path(text).as_deref(), Some("/tmp"));
+            }
+            other => panic!("expected CmdOk, got {other:?}"),
+        }
     }
 
     #[test]
@@ -653,7 +721,13 @@ mod tests {
         let mut lex = FtpReplyLexer::new();
         lex.expect(FtpReplyShape::Cmd { expect: 200 });
         let mut data: &[u8] = b"200 First OK\r\n200 Second OK\r\n";
-        assert_eq!(lex.feed(&mut data).unwrap(), vec![FtpEvent::CmdOk, FtpEvent::CmdOk]);
+        assert_eq!(
+            lex.feed(&mut data).unwrap(),
+            vec![
+                FtpEvent::CmdOk { text: "First OK".into() },
+                FtpEvent::CmdOk { text: "Second OK".into() },
+            ]
+        );
     }
 
     #[test]

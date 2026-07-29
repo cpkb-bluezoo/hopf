@@ -337,8 +337,11 @@ impl ImapClientEndpoint {
             ImapEvent::Expunge(n) => self.on_expunge(n, ep),
             ImapEvent::FlagsList(flags) => self.select_info.flags = flags,
             ImapEvent::Fetch(data) => self.on_fetch(data, ep),
+            ImapEvent::FetchLiteralBegin { seq, section, size } => {
+                self.on_literal_begin(seq, section, size, ep)
+            }
             ImapEvent::FetchLiteralData(data) => self.on_literal_data(data, ep),
-            ImapEvent::FetchLiteralComplete => self.cancel_message_timer(),
+            ImapEvent::FetchLiteralEnd { seq } => self.on_literal_end(seq, ep),
             ImapEvent::Enabled(tokens) => self.on_enabled(tokens, ep),
             ImapEvent::Namespace(payload) => self.on_namespace(&payload, ep),
             ImapEvent::Quota(payload) => self.on_quota(&payload, ep),
@@ -598,11 +601,30 @@ impl ImapClientEndpoint {
         }
     }
 
+    fn on_literal_begin(&mut self, seq: u32, section: String, size: u64, ep: &mut dyn Endpoint) {
+        if self.pending.oldest_of_kind(PendingKind::Fetch).is_some() {
+            if let Some(mut driver) = self.driver.take() {
+                driver.on_fetch_literal_begin(ep, seq, &section, size);
+                self.driver = Some(driver);
+            }
+        }
+    }
+
     fn on_literal_data(&mut self, data: Vec<u8>, ep: &mut dyn Endpoint) {
         if self.pending.oldest_of_kind(PendingKind::Fetch).is_some() {
             self.arm_message_timer(ep);
             if let Some(mut driver) = self.driver.take() {
-                driver.on_fetch_literal(&data);
+                driver.on_fetch_literal(&data, ep);
+                self.driver = Some(driver);
+            }
+        }
+    }
+
+    fn on_literal_end(&mut self, seq: u32, ep: &mut dyn Endpoint) {
+        self.cancel_message_timer();
+        if self.pending.oldest_of_kind(PendingKind::Fetch).is_some() {
+            if let Some(mut driver) = self.driver.take() {
+                driver.on_fetch_literal_end(ep, seq);
                 self.driver = Some(driver);
             }
         }
@@ -972,6 +994,14 @@ impl ImapClientEndpoint {
                 self.session = SessionState::Logout;
                 ep.close();
             }
+            PendingKind::MailboxOp => {
+                let mut driver = match self.driver.take() {
+                    Some(d) => d,
+                    None => return,
+                };
+                driver.on_mailbox_op_complete(self, ep, status, &message);
+                self.driver = Some(driver);
+            }
             PendingKind::Other => {
                 let mut driver = match self.driver.take() {
                     Some(d) => d,
@@ -1095,7 +1125,14 @@ impl ImapClientAuthenticated for ImapClientEndpoint {
         let _ = self.issue_no_ep(PendingKind::Status, &cmd);
     }
 
-    fn append(&mut self, mailbox: &str, flags: Option<&str>, size: u64, use_literal_minus: bool) {
+    fn append(
+        &mut self,
+        mailbox: &str,
+        flags: Option<&str>,
+        date: Option<&str>,
+        size: u64,
+        use_literal_minus: bool,
+    ) {
         let mut cmd = format!("APPEND {}", Self::quote_astring(mailbox));
         if let Some(f) = flags {
             cmd.push(' ');
@@ -1106,6 +1143,9 @@ impl ImapClientAuthenticated for ImapClientEndpoint {
                 cmd.push_str(f);
                 cmd.push(')');
             }
+        }
+        if let Some(d) = date {
+            cmd.push_str(&format!(" \"{d}\""));
         }
         self.append_literal_minus = use_literal_minus && size <= 4096;
         if self.append_literal_minus {
@@ -1157,6 +1197,35 @@ impl ImapClientAuthenticated for ImapClientEndpoint {
 
     fn noop(&mut self) {
         let _ = self.issue_no_ep(PendingKind::Other, "NOOP");
+    }
+
+    fn create(&mut self, mailbox: &str) {
+        let cmd = format!("CREATE {}", Self::quote_astring(mailbox));
+        let _ = self.issue_no_ep(PendingKind::MailboxOp, &cmd);
+    }
+
+    fn delete(&mut self, mailbox: &str) {
+        let cmd = format!("DELETE {}", Self::quote_astring(mailbox));
+        let _ = self.issue_no_ep(PendingKind::MailboxOp, &cmd);
+    }
+
+    fn rename(&mut self, from: &str, to: &str) {
+        let cmd = format!(
+            "RENAME {} {}",
+            Self::quote_astring(from),
+            Self::quote_astring(to)
+        );
+        let _ = self.issue_no_ep(PendingKind::MailboxOp, &cmd);
+    }
+
+    fn subscribe(&mut self, mailbox: &str) {
+        let cmd = format!("SUBSCRIBE {}", Self::quote_astring(mailbox));
+        let _ = self.issue_no_ep(PendingKind::MailboxOp, &cmd);
+    }
+
+    fn unsubscribe(&mut self, mailbox: &str) {
+        let cmd = format!("UNSUBSCRIBE {}", Self::quote_astring(mailbox));
+        let _ = self.issue_no_ep(PendingKind::MailboxOp, &cmd);
     }
 
     fn logout(&mut self) {
@@ -1625,6 +1694,18 @@ mod tests {
             _m: &str,
         ) {
         }
+        fn on_mailbox_op_complete(
+            &mut self,
+            _s: &mut dyn ImapClientAuthenticated,
+            _e: &mut dyn Endpoint,
+            status: ImapStatus,
+            _m: &str,
+        ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("mailbox_op_done:{status:?}"));
+        }
         fn on_auth_continue(
             &mut self,
             _x: &mut dyn ImapClientAuthExchange,
@@ -1647,11 +1728,26 @@ mod tests {
             _m: &str,
         ) {
         }
-        fn on_fetch_literal(&mut self, data: &[u8]) {
+        fn on_fetch_literal_begin(
+            &mut self,
+            _e: &mut dyn Endpoint,
+            seq: u32,
+            section: &str,
+            size: u64,
+        ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("lit_begin:{seq}:{section}:{size}"));
+        }
+        fn on_fetch_literal(&mut self, data: &[u8], _e: &mut dyn Endpoint) {
             self.events
                 .lock()
                 .unwrap()
                 .push(format!("lit:{}", data.len()));
+        }
+        fn on_fetch_literal_end(&mut self, _e: &mut dyn Endpoint, seq: u32) {
+            self.events.lock().unwrap().push(format!("lit_end:{seq}"));
         }
         fn on_fetch_data(&mut self, data: &ImapFetchData) {
             self.events
@@ -1883,6 +1979,15 @@ mod tests {
             events.iter().any(|e| e.starts_with("fetch_done")),
             "tagged OK should complete fetch: {events:?}"
         );
+        assert!(
+            events.iter().any(|e| e == "lit_begin:1::3"),
+            "literal begin should carry seq/section/size: {events:?}"
+        );
+        assert!(events.iter().any(|e| e == "lit:3"), "{events:?}");
+        assert!(
+            events.iter().any(|e| e == "lit_end:1"),
+            "literal end should carry seq: {events:?}"
+        );
     }
 
     #[test]
@@ -2052,7 +2157,7 @@ mod tests {
         ep.session = SessionState::Authenticated;
         let mut fake = FakeEp::new();
 
-        ImapClientAuthenticated::append(&mut ep, "INBOX", Some("\\Seen"), 5, true);
+        ImapClientAuthenticated::append(&mut ep, "INBOX", Some("\\Seen"), None, 5, true);
         ep.flush_outbound(&mut fake);
         let wire_out = fake.sent_str();
         assert!(wire_out.contains("APPEND"));
@@ -2068,6 +2173,68 @@ mod tests {
                 .any(|e| e.contains("append_done") && e.contains("38505:3956")),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn append_sends_internaldate_between_flags_and_literal() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut ep = make_ep(&log);
+        ep.session = SessionState::Authenticated;
+        let mut fake = FakeEp::new();
+
+        ImapClientAuthenticated::append(
+            &mut ep,
+            "INBOX",
+            Some("\\Seen"),
+            Some("01-Jan-2024 00:00:00 +0000"),
+            5,
+            false,
+        );
+        ep.flush_outbound(&mut fake);
+        let wire_out = fake.sent_str();
+        assert!(
+            wire_out.contains("(\\Seen) \"01-Jan-2024 00:00:00 +0000\" {5}"),
+            "{wire_out:?}"
+        );
+    }
+
+    #[test]
+    fn mailbox_ops_round_trip() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut ep = make_ep(&log);
+        ep.session = SessionState::Authenticated;
+        let mut fake = FakeEp::new();
+
+        ImapClientAuthenticated::create(&mut ep, "Archive");
+        ep.flush_outbound(&mut fake);
+        assert!(fake.sent_str().contains("CREATE Archive"));
+        feed(&mut ep, &mut fake, b"A000 OK CREATE completed\r\n");
+
+        ImapClientAuthenticated::delete(&mut ep, "Old");
+        ep.flush_outbound(&mut fake);
+        assert!(fake.sent_str().contains("DELETE Old"));
+        feed(&mut ep, &mut fake, b"A001 OK DELETE completed\r\n");
+
+        ImapClientAuthenticated::rename(&mut ep, "Old", "New");
+        ep.flush_outbound(&mut fake);
+        assert!(fake.sent_str().contains("RENAME Old New"));
+        feed(&mut ep, &mut fake, b"A002 OK RENAME completed\r\n");
+
+        ImapClientAuthenticated::subscribe(&mut ep, "Archive");
+        ep.flush_outbound(&mut fake);
+        assert!(fake.sent_str().contains("SUBSCRIBE Archive"));
+        feed(&mut ep, &mut fake, b"A003 OK SUBSCRIBE completed\r\n");
+
+        ImapClientAuthenticated::unsubscribe(&mut ep, "Archive");
+        ep.flush_outbound(&mut fake);
+        assert!(fake.sent_str().contains("UNSUBSCRIBE Archive"));
+        feed(&mut ep, &mut fake, b"A004 NO UNSUBSCRIBE failed\r\n");
+
+        let events = log.lock().unwrap().clone();
+        let ok_count = events.iter().filter(|e| *e == "mailbox_op_done:Ok").count();
+        let no_count = events.iter().filter(|e| *e == "mailbox_op_done:No").count();
+        assert_eq!(ok_count, 4, "{events:?}");
+        assert_eq!(no_count, 1, "{events:?}");
     }
 
     #[test]

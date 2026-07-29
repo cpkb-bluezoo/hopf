@@ -41,19 +41,58 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_core::{ProtocolHandler, Runtime, TcpConnectorConfig};
+use hopf_core::{ConnHandle, ProtocolHandler, Runtime, SharedTlsConnector, TcpConnectorConfig};
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
 use handler::FtpControlHandler;
 
 // ---------------------------------------------------------------------------
+// Abort handle
+// ---------------------------------------------------------------------------
+
+/// Handle for aborting an in-flight transfer (RFC 959 §4.1.1 `ABOR`).
+///
+/// Handed to [`FtpPipeline::start`]; cloneable and safe to call from any
+/// thread (e.g. stash it for a UI cancel button or a watchdog timer) — it
+/// sends `ABOR` on the control connection regardless of which reactor owns
+/// it. The transfer in flight when `ABOR` arrives gets its callback fired
+/// with an `Interrupted` error; the pipeline then continues with any
+/// remaining queued operations rather than failing outright.
+#[derive(Clone)]
+pub struct FtpAbortHandle {
+    control: ConnHandle,
+}
+
+impl FtpAbortHandle {
+    pub(crate) fn new(control: ConnHandle) -> Self {
+        Self { control }
+    }
+
+    /// Send `ABOR` on the control connection.
+    pub fn abort(&self) {
+        self.control.send(b"ABOR\r\n".to_vec());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public callback types
 // ---------------------------------------------------------------------------
 
-/// Callback for RETR / LIST results.
+/// Callback for RETR / LIST / NLST results.
 pub type RetrCallback = Box<dyn FnOnce(io::Result<Vec<u8>>) + Send>;
-/// Callback for STOR results.
+/// Callback for STOR / APPE results.
 pub type StorCallback = Box<dyn FnOnce(io::Result<()>) + Send>;
+/// Callback for STOU results: the server-assigned filename on success (RFC
+/// 959 §4.1.3 — parsed from the `125`/`150` reply text).
+pub type StouCallback = Box<dyn FnOnce(io::Result<String>) + Send>;
+/// Callback for an arbitrary command's outcome: `Ok(text)` with the
+/// success reply's text (e.g. `PWD`'s quoted path), or `Err` on a
+/// mismatched/rejected reply code. Registering a callback via
+/// [`FtpSessionWrite::command_reply`] makes the mismatch non-fatal — the
+/// pipeline decides what to do, instead of the connection failing
+/// unconditionally (which is still what plain [`FtpSessionWrite::command`]
+/// does, for callers that want that).
+pub type CmdCallback = Box<dyn FnOnce(Result<String, FtpError>) + Send>;
 
 // ---------------------------------------------------------------------------
 // Op queue (internal)
@@ -66,14 +105,25 @@ pub(crate) enum QueuedOp {
         verb: String,
         arg: Option<String>,
         expect: u16,
+        /// `None` for [`FtpSessionWrite::command`] (mismatch is fatal);
+        /// `Some` for [`FtpSessionWrite::command_reply`] (mismatch is
+        /// reported to the callback instead).
+        callback: Option<CmdCallback>,
     },
     /// Passive RETR.
-    Retr { path: String, callback: RetrCallback },
+    Retr {
+        path: String,
+        /// RFC 959 §4.1.3 resume offset; sends `REST offset` first.
+        offset: Option<u64>,
+        callback: RetrCallback,
+    },
     /// Passive STOR (data wrapped in `Arc` to avoid copying in the factory
     /// closure).
     Stor {
         path: String,
         data: Arc<Vec<u8>>,
+        /// RFC 959 §4.1.3 resume offset; sends `REST offset` first.
+        offset: Option<u64>,
         callback: StorCallback,
     },
     /// Passive LIST.
@@ -81,6 +131,19 @@ pub(crate) enum QueuedOp {
         path: Option<String>,
         callback: RetrCallback,
     },
+    /// Passive APPE (append to an existing file, or create it).
+    Appe {
+        path: String,
+        data: Arc<Vec<u8>>,
+        callback: StorCallback,
+    },
+    /// Passive NLST (name-only listing).
+    Nlst {
+        path: Option<String>,
+        callback: RetrCallback,
+    },
+    /// Passive STOU (store with a server-assigned unique filename).
+    Stou { data: Arc<Vec<u8>>, callback: StouCallback },
     /// Send `QUIT` and close.
     Quit,
 }
@@ -116,14 +179,39 @@ pub trait FtpSessionWrite: Send {
     /// Queue `TYPE A` (ASCII transfer mode).
     fn type_ascii(&mut self);
     /// Queue an arbitrary command expecting reply code `expect` (use `0` for
-    /// any `2xx` code).
+    /// any `2xx` code). A mismatched/rejected reply fails the whole
+    /// pipeline; use [`Self::command_reply`] if the caller wants to handle
+    /// that itself, or wants the success reply's text.
     fn command(&mut self, verb: &str, arg: Option<&str>, expect: u16);
+    /// Queue an arbitrary command expecting reply code `expect`, with a
+    /// callback receiving `Ok(text)` (the success reply's text — e.g.
+    /// `PWD`'s quoted path, `SIZE`'s byte count, `SYST`'s system string)
+    /// or `Err` on a mismatched/rejected reply. Unlike [`Self::command`],
+    /// a mismatch here does *not* fail the pipeline — the callback decides.
+    fn command_reply(&mut self, verb: &str, arg: Option<&str>, expect: u16, callback: CmdCallback);
     /// Queue a passive RETR; `callback` receives the file bytes.
     fn retr(&mut self, path: &str, callback: RetrCallback);
+    /// Queue a passive RETR resuming from `offset` (RFC 959 §4.1.3 — sends
+    /// `REST offset`, expecting `350`, before `RETR`).
+    fn retr_from(&mut self, path: &str, offset: u64, callback: RetrCallback);
     /// Queue a passive STOR; `callback` receives `Ok(())` on success.
     fn stor(&mut self, path: &str, data: Vec<u8>, callback: StorCallback);
+    /// Queue a passive STOR resuming from `offset` (RFC 959 §4.1.3 — sends
+    /// `REST offset`, expecting `350`, before `STOR`). `data` is the
+    /// remaining bytes to send — i.e. the file's content starting at
+    /// `offset`, not the whole file.
+    fn stor_from(&mut self, path: &str, offset: u64, data: Vec<u8>, callback: StorCallback);
     /// Queue a passive LIST; `callback` receives the directory listing bytes.
     fn list(&mut self, path: Option<&str>, callback: RetrCallback);
+    /// Queue a passive APPE (append to `path`, creating it if it doesn't
+    /// exist); `callback` receives `Ok(())` on success.
+    fn appe(&mut self, path: &str, data: Vec<u8>, callback: StorCallback);
+    /// Queue a passive NLST (name-only listing); `callback` receives the
+    /// listing bytes.
+    fn nlst(&mut self, path: Option<&str>, callback: RetrCallback);
+    /// Queue a passive STOU (store with a server-assigned unique filename);
+    /// `callback` receives the assigned filename on success.
+    fn stou(&mut self, data: Vec<u8>, callback: StouCallback);
     /// Queue `QUIT`.
     fn quit(&mut self);
 }
@@ -134,6 +222,7 @@ impl FtpSessionWrite for OpQueue {
             verb: "TYPE".into(),
             arg: Some("I".into()),
             expect: 200,
+            callback: None,
         });
     }
 
@@ -142,6 +231,7 @@ impl FtpSessionWrite for OpQueue {
             verb: "TYPE".into(),
             arg: Some("A".into()),
             expect: 200,
+            callback: None,
         });
     }
 
@@ -150,12 +240,31 @@ impl FtpSessionWrite for OpQueue {
             verb: verb.to_string(),
             arg: arg.map(|s| s.to_string()),
             expect,
+            callback: None,
+        });
+    }
+
+    fn command_reply(&mut self, verb: &str, arg: Option<&str>, expect: u16, callback: CmdCallback) {
+        self.ops.push_back(QueuedOp::Command {
+            verb: verb.to_string(),
+            arg: arg.map(|s| s.to_string()),
+            expect,
+            callback: Some(callback),
         });
     }
 
     fn retr(&mut self, path: &str, callback: RetrCallback) {
         self.ops.push_back(QueuedOp::Retr {
             path: path.to_string(),
+            offset: None,
+            callback,
+        });
+    }
+
+    fn retr_from(&mut self, path: &str, offset: u64, callback: RetrCallback) {
+        self.ops.push_back(QueuedOp::Retr {
+            path: path.to_string(),
+            offset: Some(offset),
             callback,
         });
     }
@@ -164,6 +273,16 @@ impl FtpSessionWrite for OpQueue {
         self.ops.push_back(QueuedOp::Stor {
             path: path.to_string(),
             data: Arc::new(data),
+            offset: None,
+            callback,
+        });
+    }
+
+    fn stor_from(&mut self, path: &str, offset: u64, data: Vec<u8>, callback: StorCallback) {
+        self.ops.push_back(QueuedOp::Stor {
+            path: path.to_string(),
+            data: Arc::new(data),
+            offset: Some(offset),
             callback,
         });
     }
@@ -173,6 +292,25 @@ impl FtpSessionWrite for OpQueue {
             path: path.map(|s| s.to_string()),
             callback,
         });
+    }
+
+    fn appe(&mut self, path: &str, data: Vec<u8>, callback: StorCallback) {
+        self.ops.push_back(QueuedOp::Appe {
+            path: path.to_string(),
+            data: Arc::new(data),
+            callback,
+        });
+    }
+
+    fn nlst(&mut self, path: Option<&str>, callback: RetrCallback) {
+        self.ops.push_back(QueuedOp::Nlst {
+            path: path.map(|s| s.to_string()),
+            callback,
+        });
+    }
+
+    fn stou(&mut self, data: Vec<u8>, callback: StouCallback) {
+        self.ops.push_back(QueuedOp::Stou { data: Arc::new(data), callback });
     }
 
     fn quit(&mut self) {
@@ -193,7 +331,11 @@ pub trait FtpPipeline: Send {
     ///
     /// All ops are queued and dispatched asynchronously after this call
     /// returns.  Call `session.quit()` to terminate the session cleanly.
-    fn start(&mut self, session: &mut dyn FtpSessionWrite);
+    ///
+    /// `abort` can be stashed (it's `Clone` and thread-safe) to cancel an
+    /// in-flight transfer later — e.g. from a UI cancel button or a
+    /// watchdog timer — via [`FtpAbortHandle::abort`].
+    fn start(&mut self, session: &mut dyn FtpSessionWrite, abort: FtpAbortHandle);
 
     /// All queued operations completed successfully and QUIT was acknowledged.
     fn done(&mut self);
@@ -245,6 +387,9 @@ pub struct FtpClient {
     credentials: Option<(String, String)>,
     prefer_epsv: bool,
     resolver: Option<Arc<DnsResolver>>,
+    tls_connector: Option<SharedTlsConnector>,
+    tls_server_name: Option<String>,
+    implicit_tls: bool,
 }
 
 impl FtpClient {
@@ -258,6 +403,9 @@ impl FtpClient {
             credentials: None,
             prefer_epsv: true,
             resolver: None,
+            tls_connector: None,
+            tls_server_name: None,
+            implicit_tls: false,
         }
     }
 
@@ -294,6 +442,27 @@ impl FtpClient {
         self
     }
 
+    /// Configure explicit FTPS (RFC 4217 `AUTH TLS`): connect in plaintext
+    /// on the usual port, negotiate TLS on the control channel right after
+    /// the welcome banner (before `USER`), then send `PBSZ 0` / `PROT P` so
+    /// data connections (`RETR`/`STOR`/`LIST`/…) are protected too.
+    pub fn auth_tls(mut self, connector: SharedTlsConnector, server_name: impl Into<String>) -> Self {
+        self.tls_connector = Some(connector);
+        self.tls_server_name = Some(server_name.into());
+        self.implicit_tls = false;
+        self
+    }
+
+    /// Configure implicit FTPS: TLS from the first byte (typically port
+    /// 990 — call [`Self::port`] separately). `PBSZ 0` / `PROT P` are still
+    /// sent after the welcome banner to protect data connections.
+    pub fn implicit_tls(mut self, connector: SharedTlsConnector, server_name: impl Into<String>) -> Self {
+        self.tls_connector = Some(connector);
+        self.tls_server_name = Some(server_name.into());
+        self.implicit_tls = true;
+        self
+    }
+
     /// Resolve the host, dial the control connection, and run `pipeline`.
     ///
     /// Returns immediately; the connection and pipeline execute asynchronously.
@@ -311,9 +480,14 @@ impl FtpClient {
         let prefer_epsv = self.prefer_epsv;
         let timeouts = self.timeouts.clone();
         let rt2 = Arc::clone(rt);
+        let tls_connector = self.tls_connector.clone();
+        let tls_server_name = self.tls_server_name.clone();
+        let implicit_tls = self.implicit_tls;
 
         let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> = {
             let rt3 = Arc::clone(&rt2);
+            let tls_connector = tls_connector.clone();
+            let tls_server_name = tls_server_name.clone();
             Arc::new(move || {
                 let pl = pipeline_cell
                     .lock()
@@ -326,6 +500,9 @@ impl FtpClient {
                     timeouts.clone(),
                     Arc::clone(&rt3),
                     pl,
+                    tls_connector.clone(),
+                    tls_server_name.clone(),
+                    implicit_tls,
                 )) as Box<dyn ProtocolHandler>
             })
         };
@@ -333,12 +510,18 @@ impl FtpClient {
         let dial = {
             let rt3 = Arc::clone(&rt2);
             let mh = Arc::clone(&make_handler);
+            let tls_connector = tls_connector.clone();
+            let tls_server_name = tls_server_name.clone();
             move |addr: SocketAddr| -> io::Result<()> {
                 let mh2 = Arc::clone(&mh);
-                rt3.connect(
-                    TcpConnectorConfig::new(addr, move || mh2())
-                        .connect_timeout(connect_timeout),
-                )
+                let mut cfg = TcpConnectorConfig::new(addr, move || mh2())
+                    .connect_timeout(connect_timeout);
+                if implicit_tls {
+                    if let (Some(c), Some(n)) = (tls_connector.clone(), tls_server_name.clone()) {
+                        cfg = cfg.with_tls(c, n);
+                    }
+                }
+                rt3.connect(cfg)
             }
         };
 

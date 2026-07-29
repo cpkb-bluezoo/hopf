@@ -15,7 +15,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_core::{Endpoint, ProtocolHandler, Runtime, TcpConnectorConfig, TimerHandle};
+use hopf_core::{
+    Endpoint, ProtocolHandler, Runtime, SecurityInfo, SharedTlsConnector, TcpConnectorConfig,
+    TimerHandle,
+};
 
 use super::data::{FtpDataRetrHandler, FtpDataStorHandler, TransferState};
 use super::error::FtpError;
@@ -29,6 +32,14 @@ use super::{FtpClientTimeouts, FtpPipeline, OpQueue, QueuedOp};
 enum ControlState {
     /// Waiting for the server's `220` welcome banner.
     AwaitWelcome,
+    /// `AUTH TLS` sent (RFC 4217 explicit FTPS); waiting for `234`.
+    AwaitAuthTlsReply,
+    /// `234` received; TLS handshake in progress on the control channel.
+    PendingTls,
+    /// `PBSZ 0` sent; waiting for `200`.
+    AwaitPbszReply,
+    /// `PROT P` sent; waiting for `200`.
+    AwaitProtReply,
     /// `USER` sent; waiting for `331` or `230`.
     AwaitUserReply,
     /// `PASS` sent; waiting for `230`.
@@ -36,9 +47,24 @@ enum ControlState {
     /// Session active; processing the op queue.
     Session,
     /// A raw command was sent; waiting for a specific reply code.
-    AwaitCmdReply { expect: u16 },
+    AwaitCmdReply {
+        expect: u16,
+        callback: Option<super::CmdCallback>,
+    },
     /// `PASV`/`EPSV` sent; waiting for `227`/`229`.
     AwaitPasvReply {
+        verb: String,
+        path: String,
+        data: Option<Arc<Vec<u8>>>,
+        /// RFC 959 §4.1.3 — resume offset; sends `REST offset` (expect
+        /// `350`) before the transfer verb once the data address is known.
+        offset: Option<u64>,
+        transfer: Arc<Mutex<TransferState>>,
+    },
+    /// `REST offset` sent; waiting for `350` before opening the data
+    /// connection and sending the transfer verb.
+    AwaitRestReply {
+        addr: SocketAddr,
         verb: String,
         path: String,
         data: Option<Arc<Vec<u8>>>,
@@ -66,15 +92,34 @@ pub(crate) struct FtpControlHandler {
     op_queue: VecDeque<QueuedOp>,
     /// Active stage timer (cancelled on every reply that advances state).
     stage_timer: Option<TimerHandle>,
+    /// TLS connector for FTPS (implicit or explicit `AUTH TLS`); `None` for
+    /// plaintext FTP.
+    tls_connector: Option<SharedTlsConnector>,
+    /// SNI / cert server name for FTPS.
+    tls_server_name: Option<String>,
+    /// `true` while waiting for the implicit-TLS handshake to complete
+    /// before the (encrypted) welcome banner is expected.
+    implicit_tls_pending: bool,
+    /// `true` once the control channel is confirmed secure (implicit from
+    /// the start, or explicit `AUTH TLS` handshake completed) — gates
+    /// whether `PBSZ`/`PROT` get sent before `USER`.
+    tls_active: bool,
+    /// `true` once `PROT P` succeeds — every subsequent data connection
+    /// (`RETR`/`STOR`/`LIST`/…) is also TLS-wrapped.
+    prot_active: bool,
 }
 
 impl FtpControlHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         credentials: Option<(String, String)>,
         prefer_epsv: bool,
         timeouts: FtpClientTimeouts,
         rt: Arc<Runtime>,
         pipeline: Box<dyn FtpPipeline>,
+        tls_connector: Option<SharedTlsConnector>,
+        tls_server_name: Option<String>,
+        implicit_tls: bool,
     ) -> Self {
         let mut lexer = FtpReplyLexer::new();
         lexer.expect(FtpReplyShape::Welcome);
@@ -88,6 +133,11 @@ impl FtpControlHandler {
             state: ControlState::AwaitWelcome,
             op_queue: VecDeque::new(),
             stage_timer: None,
+            tls_connector,
+            tls_server_name,
+            implicit_tls_pending: implicit_tls,
+            tls_active: false,
+            prot_active: false,
         }
     }
 
@@ -163,19 +213,74 @@ impl FtpControlHandler {
 
         match state {
             ControlState::AwaitWelcome => match event {
-                FtpEvent::Welcome => match self.credentials.as_ref().map(|(u, _)| u.clone()) {
-                    Some(user) => {
-                        let cmd = format!("USER {user}\r\n");
-                        endpoint.send(cmd.as_bytes());
-                        self.lexer.expect(FtpReplyShape::User);
-                        self.state = ControlState::AwaitUserReply;
-                    }
-                    None => {
-                        self.start_pipeline(endpoint);
-                    }
-                },
+                FtpEvent::Welcome => self.after_welcome(endpoint),
                 FtpEvent::Error { code, message } => {
                     self.fail(endpoint, FtpError::unexpected(Some(220), code, message));
+                }
+                _ => {}
+            },
+
+            ControlState::AwaitAuthTlsReply => match event {
+                FtpEvent::CmdOk { .. } => {
+                    let (Some(connector), Some(name)) =
+                        (self.tls_connector.clone(), self.tls_server_name.clone())
+                    else {
+                        self.fail(
+                            endpoint,
+                            FtpError::Io(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "AUTH TLS accepted but no TLS connector configured",
+                            )),
+                        );
+                        return;
+                    };
+                    match endpoint.start_client_tls(connector, &name) {
+                        Ok(()) => {
+                            self.state = ControlState::PendingTls;
+                            // security_established() fires once the
+                            // handshake completes.
+                        }
+                        Err(e) => {
+                            self.fail(
+                                endpoint,
+                                FtpError::Io(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!("start_client_tls: {e}"),
+                                )),
+                            );
+                        }
+                    }
+                }
+                FtpEvent::Error { code, message } => {
+                    self.fail(endpoint, FtpError::unexpected(Some(234), code, message));
+                }
+                _ => {}
+            },
+
+            ControlState::PendingTls => {
+                // Waiting for security_established(); ignore stray events.
+                self.state = ControlState::PendingTls;
+            }
+
+            ControlState::AwaitPbszReply => match event {
+                FtpEvent::CmdOk { .. } => {
+                    endpoint.send(b"PROT P\r\n");
+                    self.lexer.expect(FtpReplyShape::Cmd { expect: 200 });
+                    self.state = ControlState::AwaitProtReply;
+                }
+                FtpEvent::Error { code, message } => {
+                    self.fail(endpoint, FtpError::unexpected(Some(200), code, message));
+                }
+                _ => {}
+            },
+
+            ControlState::AwaitProtReply => match event {
+                FtpEvent::CmdOk { .. } => {
+                    self.prot_active = true;
+                    self.send_user_or_start(endpoint);
+                }
+                FtpEvent::Error { code, message } => {
+                    self.fail(endpoint, FtpError::unexpected(Some(200), code, message));
                 }
                 _ => {}
             },
@@ -216,27 +321,53 @@ impl FtpControlHandler {
                 self.state = ControlState::Session;
             }
 
-            ControlState::AwaitCmdReply { expect } => match event {
-                FtpEvent::CmdOk => {
+            ControlState::AwaitCmdReply { expect, callback } => match event {
+                FtpEvent::CmdOk { text } => {
+                    if let Some(cb) = callback {
+                        cb(Ok(text));
+                    }
                     self.enter_session(endpoint);
                 }
                 FtpEvent::Error { code, message } => {
-                    self.fail(endpoint, FtpError::unexpected(Some(expect), code, message));
+                    let err = FtpError::unexpected(Some(expect), code, message);
+                    match callback {
+                        // A registered callback makes the mismatch
+                        // non-fatal — the pipeline decides what to do.
+                        Some(cb) => {
+                            cb(Err(err));
+                            self.enter_session(endpoint);
+                        }
+                        None => self.fail(endpoint, err),
+                    }
                 }
                 _ => {}
             },
 
-            ControlState::AwaitPasvReply { verb, path, data, transfer } => {
-                self.dispatch_pasv_event(endpoint, event, verb, path, data, transfer);
+            ControlState::AwaitPasvReply { verb, path, data, offset, transfer } => {
+                self.dispatch_pasv_event(endpoint, event, verb, path, data, offset, transfer);
             }
 
+            ControlState::AwaitRestReply { addr, verb, path, data, transfer } => match event {
+                FtpEvent::CmdOk { .. } => {
+                    self.begin_transfer(endpoint, addr, &verb, &path, data, transfer);
+                }
+                FtpEvent::Error { code, message } => {
+                    self.fail(endpoint, FtpError::unexpected(Some(350), code, message));
+                }
+                _ => {
+                    // Unrelated event — stay put and keep waiting for 350.
+                    self.state = ControlState::AwaitRestReply { addr, verb, path, data, transfer };
+                }
+            },
+
             ControlState::AwaitXferStart { transfer } => match event {
-                FtpEvent::XferStartOk => {
+                FtpEvent::XferStartOk { text } => {
                     // Server is ready — release any STOR upload waiting on
                     // the data connection.
                     {
                         let mut g = transfer.lock().unwrap();
                         g.start_ok = true;
+                        g.assigned_name = text;
                         if let (Some(h), Some(payload)) =
                             (g.data_conn.take(), g.stor_payload.take())
                         {
@@ -250,6 +381,17 @@ impl FtpControlHandler {
                     self.lexer.expect(FtpReplyShape::XferEnd);
                     self.state = ControlState::AwaitXferEnd { transfer };
                 }
+                FtpEvent::Error { code: 426, .. } => {
+                    // RFC 959 §4.1.1 ABOR: the transfer was aborted before
+                    // it even started — non-fatal, report it through the
+                    // transfer's own callback and keep the session going.
+                    {
+                        let mut g = transfer.lock().unwrap();
+                        g.mark_aborted();
+                        g.maybe_complete();
+                    }
+                    self.enter_session(endpoint);
+                }
                 FtpEvent::Error { code, message } => {
                     self.fail(endpoint, FtpError::unexpected(Some(150), code, message));
                 }
@@ -261,6 +403,16 @@ impl FtpControlHandler {
                     {
                         let mut g = transfer.lock().unwrap();
                         g.ctrl_done = true;
+                        g.maybe_complete();
+                    }
+                    self.enter_session(endpoint);
+                }
+                FtpEvent::Error { code: 426, .. } => {
+                    // RFC 959 §4.1.1 ABOR: same treatment as above, but the
+                    // transfer had already started.
+                    {
+                        let mut g = transfer.lock().unwrap();
+                        g.mark_aborted();
                         g.maybe_complete();
                     }
                     self.enter_session(endpoint);
@@ -297,11 +449,12 @@ impl FtpControlHandler {
         verb: String,
         path: String,
         data: Option<Arc<Vec<u8>>>,
+        offset: Option<u64>,
         transfer: Arc<Mutex<TransferState>>,
     ) {
         match event {
             FtpEvent::PasvAddr(addr) => {
-                self.open_data_conn(endpoint, addr, &verb, &path, data, transfer);
+                self.open_data_conn(endpoint, addr, verb, path, data, offset, transfer);
             }
             FtpEvent::EpsvPort(port) => {
                 let ctrl_ip = endpoint
@@ -309,7 +462,7 @@ impl FtpControlHandler {
                     .map(|a| a.ip())
                     .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
                 let addr = SocketAddr::new(ctrl_ip, port);
-                self.open_data_conn(endpoint, addr, &verb, &path, data, transfer);
+                self.open_data_conn(endpoint, addr, verb, path, data, offset, transfer);
             }
             FtpEvent::Error { code, message } => {
                 self.fail(endpoint, FtpError::unexpected(Some(227), code, message));
@@ -317,13 +470,35 @@ impl FtpControlHandler {
             _ => {
                 // Restore state — an unrelated event arrived unexpectedly;
                 // stay put and keep waiting for the real reply.
-                self.state = ControlState::AwaitPasvReply { verb, path, data, transfer };
+                self.state = ControlState::AwaitPasvReply { verb, path, data, offset, transfer };
             }
         }
     }
 
-    /// Open a passive data connection, then send the transfer command.
+    /// Send `REST offset` first if a resume offset was requested, else go
+    /// straight to opening the data connection and sending the transfer verb.
     fn open_data_conn(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        addr: SocketAddr,
+        verb: String,
+        path: String,
+        data: Option<Arc<Vec<u8>>>,
+        offset: Option<u64>,
+        transfer: Arc<Mutex<TransferState>>,
+    ) {
+        match offset {
+            Some(n) => {
+                endpoint.send(format!("REST {n}\r\n").as_bytes());
+                self.lexer.expect(FtpReplyShape::Cmd { expect: 350 });
+                self.state = ControlState::AwaitRestReply { addr, verb, path, data, transfer };
+            }
+            None => self.begin_transfer(endpoint, addr, &verb, &path, data, transfer),
+        }
+    }
+
+    /// Open a passive data connection, then send the transfer command.
+    fn begin_transfer(
         &mut self,
         endpoint: &mut dyn Endpoint,
         addr: SocketAddr,
@@ -332,10 +507,10 @@ impl FtpControlHandler {
         data: Option<Arc<Vec<u8>>>,
         transfer: Arc<Mutex<TransferState>>,
     ) {
-        let is_stor = verb == "STOR";
+        let is_stor = matches!(verb, "STOR" | "APPE" | "STOU");
         let transfer_clone = Arc::clone(&transfer);
         let data_clone = data.clone();
-        let connect_result = self.rt.connect(TcpConnectorConfig::new(addr, move || {
+        let mut cfg = TcpConnectorConfig::new(addr, move || {
             if is_stor {
                 let d = data_clone
                     .clone()
@@ -345,14 +520,23 @@ impl FtpControlHandler {
             } else {
                 Box::new(FtpDataRetrHandler::new(Arc::clone(&transfer_clone)))
             }
-        }));
+        });
+        // RFC 4217 PROT P: data connections are protected the same as the
+        // control connection once negotiated.
+        if self.prot_active {
+            if let (Some(c), Some(n)) = (self.tls_connector.clone(), self.tls_server_name.clone())
+            {
+                cfg = cfg.with_tls(c, n);
+            }
+        }
+        let connect_result = self.rt.connect(cfg);
 
         if let Err(e) = connect_result {
             self.fail(endpoint, FtpError::Io(e));
             return;
         }
 
-        // Send the transfer command (RETR/STOR/LIST).
+        // Send the transfer command (RETR/STOR/LIST/APPE/NLST/STOU).
         let cmd = if !path.is_empty() {
             format!("{verb} {path}\r\n")
         } else {
@@ -363,12 +547,55 @@ impl FtpControlHandler {
         self.state = ControlState::AwaitXferStart { transfer };
     }
 
+    /// After the welcome banner: negotiate FTPS if configured (explicit
+    /// `AUTH TLS` first, or `PBSZ`/`PROT` if already secure — implicit FTPS
+    /// arrives here with `tls_active` already `true`), else proceed
+    /// straight to `USER`/pipeline start.
+    fn after_welcome(&mut self, endpoint: &mut dyn Endpoint) {
+        if self.tls_connector.is_some() && !self.tls_active {
+            // Explicit FTPS: negotiate AUTH TLS now, before USER/PASS.
+            endpoint.send(b"AUTH TLS\r\n");
+            self.lexer.expect(FtpReplyShape::Cmd { expect: 234 });
+            self.state = ControlState::AwaitAuthTlsReply;
+            return;
+        }
+        if self.tls_active && !self.prot_active {
+            self.send_pbsz(endpoint);
+            return;
+        }
+        self.send_user_or_start(endpoint);
+    }
+
+    /// Send `PBSZ 0` (RFC 4217 — required before `PROT`).
+    fn send_pbsz(&mut self, endpoint: &mut dyn Endpoint) {
+        endpoint.send(b"PBSZ 0\r\n");
+        self.lexer.expect(FtpReplyShape::Cmd { expect: 200 });
+        self.state = ControlState::AwaitPbszReply;
+    }
+
+    /// Send `USER` if credentials were configured, else go straight to the
+    /// pipeline (matches the original pre-FTPS `AwaitWelcome` behaviour).
+    fn send_user_or_start(&mut self, endpoint: &mut dyn Endpoint) {
+        match self.credentials.as_ref().map(|(u, _)| u.clone()) {
+            Some(user) => {
+                let cmd = format!("USER {user}\r\n");
+                endpoint.send(cmd.as_bytes());
+                self.lexer.expect(FtpReplyShape::User);
+                self.state = ControlState::AwaitUserReply;
+            }
+            None => {
+                self.start_pipeline(endpoint);
+            }
+        }
+    }
+
     /// Call `pipeline.start()`, drain the resulting op queue, and process
     /// the first op immediately.
     fn start_pipeline(&mut self, endpoint: &mut dyn Endpoint) {
         let mut op_q = OpQueue::new();
+        let abort = super::FtpAbortHandle::new(endpoint.handle());
         if let Some(mut pl) = self.pipeline.take() {
-            pl.start(&mut op_q);
+            pl.start(&mut op_q, abort);
             self.pipeline = Some(pl);
         }
         self.op_queue = op_q.drain();
@@ -388,34 +615,36 @@ impl FtpControlHandler {
                 self.state = ControlState::Session;
             }
 
-            Some(QueuedOp::Command { verb, arg, expect }) => {
+            Some(QueuedOp::Command { verb, arg, expect, callback }) => {
                 let cmd = match arg.as_deref().filter(|a| !a.is_empty()) {
                     Some(a) => format!("{verb} {a}\r\n"),
                     None => format!("{verb}\r\n"),
                 };
                 endpoint.send(cmd.as_bytes());
                 self.lexer.expect(FtpReplyShape::Cmd { expect });
-                self.state = ControlState::AwaitCmdReply { expect };
+                self.state = ControlState::AwaitCmdReply { expect, callback };
             }
 
-            Some(QueuedOp::Retr { path, callback }) => {
+            Some(QueuedOp::Retr { path, offset, callback }) => {
                 let transfer = Arc::new(Mutex::new(TransferState::retr(callback)));
                 self.send_pasv_or_epsv(endpoint);
                 self.state = ControlState::AwaitPasvReply {
                     verb: "RETR".into(),
                     path,
                     data: None,
+                    offset,
                     transfer,
                 };
             }
 
-            Some(QueuedOp::Stor { path, data, callback }) => {
+            Some(QueuedOp::Stor { path, data, offset, callback }) => {
                 let transfer = Arc::new(Mutex::new(TransferState::stor(callback)));
                 self.send_pasv_or_epsv(endpoint);
                 self.state = ControlState::AwaitPasvReply {
                     verb: "STOR".into(),
                     path,
                     data: Some(data),
+                    offset,
                     transfer,
                 };
             }
@@ -427,6 +656,43 @@ impl FtpControlHandler {
                     verb: "LIST".into(),
                     path: path.unwrap_or_default(),
                     data: None,
+                    offset: None,
+                    transfer,
+                };
+            }
+
+            Some(QueuedOp::Appe { path, data, callback }) => {
+                let transfer = Arc::new(Mutex::new(TransferState::stor(callback)));
+                self.send_pasv_or_epsv(endpoint);
+                self.state = ControlState::AwaitPasvReply {
+                    verb: "APPE".into(),
+                    path,
+                    data: Some(data),
+                    offset: None,
+                    transfer,
+                };
+            }
+
+            Some(QueuedOp::Nlst { path, callback }) => {
+                let transfer = Arc::new(Mutex::new(TransferState::retr(callback)));
+                self.send_pasv_or_epsv(endpoint);
+                self.state = ControlState::AwaitPasvReply {
+                    verb: "NLST".into(),
+                    path: path.unwrap_or_default(),
+                    data: None,
+                    offset: None,
+                    transfer,
+                };
+            }
+
+            Some(QueuedOp::Stou { data, callback }) => {
+                let transfer = Arc::new(Mutex::new(TransferState::stou(callback)));
+                self.send_pasv_or_epsv(endpoint);
+                self.state = ControlState::AwaitPasvReply {
+                    verb: "STOU".into(),
+                    path: String::new(),
+                    data: Some(data),
+                    offset: None,
                     transfer,
                 };
             }
@@ -465,6 +731,12 @@ impl FtpControlHandler {
 
 impl ProtocolHandler for FtpControlHandler {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+        if self.implicit_tls_pending {
+            // Implicit FTPS: the TLS handshake happens automatically before
+            // any bytes are decrypted; wait for `security_established`
+            // before expecting the (encrypted) welcome banner.
+            return;
+        }
         // The server sends the `220` banner proactively; wait under the stage
         // budget (the connect budget covered TCP; this covers the greeting).
         self.arm_timer(endpoint, self.timeouts.stage);
@@ -472,6 +744,19 @@ impl ProtocolHandler for FtpControlHandler {
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.process_all_replies(endpoint, data);
+    }
+
+    fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+        self.tls_active = true;
+        if self.implicit_tls_pending {
+            // Implicit FTPS handshake done; now wait for the welcome banner.
+            self.implicit_tls_pending = false;
+            self.lexer.expect(FtpReplyShape::Welcome);
+            self.arm_timer(endpoint, self.timeouts.stage);
+            return;
+        }
+        // Explicit `AUTH TLS` handshake done; proceed to PBSZ/PROT.
+        self.send_pbsz(endpoint);
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {

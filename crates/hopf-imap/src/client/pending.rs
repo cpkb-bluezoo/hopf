@@ -71,6 +71,10 @@ pub enum PendingKind {
     Unselect,
     /// `LOGOUT`
     Logout,
+    /// `CREATE` / `DELETE` / `RENAME` / `SUBSCRIBE` / `UNSUBSCRIBE` — one
+    /// shared kind, matching Gumdrop's single `ServerMailboxReplyHandler`
+    /// (`handleOk`/`handleNo`) used for all five.
+    MailboxOp,
     /// Other / generic tagged command (`NOOP`, …)
     Other,
 }

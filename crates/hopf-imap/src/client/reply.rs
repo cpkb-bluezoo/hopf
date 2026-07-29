@@ -140,12 +140,27 @@ pub enum ImapEvent {
     /// for the caller to decide (e.g. by checking whether only `flags` is
     /// populated) — mirroring how pending-command routing already worked.
     Fetch(ImapFetchData),
+    /// A FETCH literal (`BODY[section]`/`RFC822`/`RFC822.TEXT`/
+    /// `RFC822.HEADER`) is about to stream, bracketing the
+    /// [`ImapEvent::FetchLiteralData`] chunks that follow.
+    FetchLiteralBegin {
+        /// The FETCH response's message sequence number.
+        seq: u32,
+        /// Section identifier: a `BODY[...]`'s bracket contents (e.g.
+        /// `"HEADER"`, `"1.TEXT"`, `""` for the whole message), or the
+        /// bare attribute name for `RFC822`/`RFC822.TEXT`/`RFC822.HEADER`.
+        section: String,
+        /// Total literal size in octets.
+        size: u64,
+    },
     /// FETCH literal octets (a `BODY[...]`/`RFC822`/… value), streamed as
     /// they arrive — never buffered.
     FetchLiteralData(Vec<u8>),
-    /// The literal just streamed via [`ImapEvent::FetchLiteralData`] is
-    /// complete.
-    FetchLiteralComplete,
+    /// The literal started by [`ImapEvent::FetchLiteralBegin`] is complete.
+    FetchLiteralEnd {
+        /// The FETCH response's message sequence number.
+        seq: u32,
+    },
     /// `* ENABLED …`.
     Enabled(Vec<String>),
     /// `* NAMESPACE …` (bounded-captured; caller parses with
@@ -335,8 +350,9 @@ enum State {
     FetchFlagsOpen,
     /// Reading `FLAGS`'s value (depth 1 = inside the list).
     FetchFlagsBody { depth: i32 },
-    /// Skipping a `BODY[section]`-style bracketed section spec.
-    FetchBodySectionSkip,
+    /// Reading a `BODY[section]`-style bracketed section spec into
+    /// `fetch_section` (used to attribute the literal that follows).
+    FetchBodySection,
     /// After the section spec closes: expect `<partial>` or the value.
     FetchAfterSection,
     /// Reading (and discarding) `<origin>` digits.
@@ -400,6 +416,12 @@ pub struct ImapReplyLexer {
     /// response (emits `ImapEvent::FlagsList`) — both reuse the same
     /// states since the grammar is identical.
     flags_is_fetch_attr: bool,
+    /// Bounded scratch for the section identifier of the value about to be
+    /// read: a `BODY[section]`'s bracket contents (e.g. `"HEADER"`,
+    /// `"1.TEXT"`, `""` for the whole message), or the bare attribute name
+    /// for `RFC822`/`RFC822.TEXT`/`RFC822.HEADER`. Read by
+    /// `FetchLiteralBegin` once a literal marker for this value is seen.
+    fetch_section: Vec<u8>,
 }
 
 impl Default for ImapReplyLexer {
@@ -426,6 +448,7 @@ impl ImapReplyLexer {
             tokens: Vec::new(),
             list_close_kind: None,
             flags_is_fetch_attr: false,
+            fetch_section: Vec::with_capacity(16),
         }
     }
 
@@ -453,7 +476,7 @@ impl ImapReplyLexer {
                 }
                 if self.literal_remaining == 0 {
                     self.state = State::FetchAfterValue;
-                    events.push(ImapEvent::FetchLiteralComplete);
+                    events.push(ImapEvent::FetchLiteralEnd { seq: self.fetch_data.seq });
                 }
                 continue;
             }
@@ -547,7 +570,7 @@ impl ImapReplyLexer {
             State::FetchModseqClose => self.on_fetch_modseq_close(b),
             State::FetchFlagsOpen => self.on_fetch_flags_open(b),
             State::FetchFlagsBody { depth } => self.on_fetch_flags_body(depth, b),
-            State::FetchBodySectionSkip => self.on_fetch_body_section_skip(b),
+            State::FetchBodySection => self.on_fetch_body_section(b),
             State::FetchAfterSection => self.on_fetch_after_section(b),
             State::FetchPartialOrigin => self.on_fetch_partial_origin(b),
             State::FetchAfterPartial => self.on_fetch_after_partial(b),
@@ -1364,12 +1387,16 @@ impl ImapReplyLexer {
                 Ok(None)
             }
             (_, b'[') => {
-                // BODY[section]<partial> — skip the bracketed section
-                // spec, then read the literal/quoted/NIL value.
-                self.state = State::FetchBodySectionSkip;
+                // BODY[section]<partial> — capture the bracketed section
+                // spec (attributes the literal that may follow), then read
+                // the literal/quoted/NIL value.
+                self.fetch_section.clear();
+                self.state = State::FetchBodySection;
                 Ok(None)
             }
             ("RFC822" | "RFC822.TEXT" | "RFC822.HEADER", b' ') => {
+                self.fetch_section.clear();
+                self.fetch_section.extend_from_slice(name.as_bytes());
                 self.state = State::FetchBodyValueStart;
                 Ok(None)
             }
@@ -1514,12 +1541,16 @@ impl ImapReplyLexer {
         }
     }
 
-    fn on_fetch_body_section_skip(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+    fn on_fetch_body_section(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
         if b == b']' {
             self.state = State::FetchAfterSection;
             return Ok(None);
         }
-        self.state = State::FetchBodySectionSkip;
+        if self.fetch_section.len() >= MAX_TOKEN {
+            return Err(ImapError::Parse("FETCH section spec too long".into()));
+        }
+        self.fetch_section.push(b);
+        self.state = State::FetchBodySection;
         Ok(None)
     }
 
@@ -1639,12 +1670,19 @@ impl ImapReplyLexer {
 
     fn on_fetch_literal_lf(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
         if b == b'\n' {
-            self.state = if self.literal_remaining == 0 {
-                State::FetchAfterValue
-            } else {
-                State::FetchLiteral
-            };
-            return Ok(None);
+            if self.literal_remaining == 0 {
+                // Nothing will stream — no Begin/End pair for an empty value.
+                self.state = State::FetchAfterValue;
+                return Ok(None);
+            }
+            self.state = State::FetchLiteral;
+            let section = String::from_utf8_lossy(&std::mem::take(&mut self.fetch_section))
+                .into_owned();
+            return Ok(Some(ImapEvent::FetchLiteralBegin {
+                seq: self.fetch_data.seq,
+                section,
+                size: self.literal_remaining,
+            }));
         }
         Err(ImapError::Parse("expected LF after literal size marker's CR".into()))
     }
@@ -2194,9 +2232,14 @@ mod tests {
         let mut data: &[u8] =
             b"* 1 FETCH (UID 5 BODY[] {11}\r\nhello world)\r\nA000 OK done\r\n";
         let ev = lex.feed(&mut data).unwrap();
-        // Events: FetchLiteralData chunk(s), then Fetch, then Tagged.
+        // Events: FetchLiteralBegin, FetchLiteralData chunk(s),
+        // FetchLiteralEnd, then Fetch, then Tagged.
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            ImapEvent::FetchLiteralBegin { seq: 1, section, size: 11 } if section.is_empty()
+        )));
         assert!(ev.iter().any(|e| matches!(e, ImapEvent::FetchLiteralData(d) if d == b"hello world")));
-        assert!(ev.iter().any(|e| *e == ImapEvent::FetchLiteralComplete));
+        assert!(ev.iter().any(|e| *e == ImapEvent::FetchLiteralEnd { seq: 1 }));
         let fetch = ev
             .iter()
             .find_map(|e| match e {
@@ -2217,13 +2260,17 @@ mod tests {
         let mut lex = ImapReplyLexer::new();
         let mut p1: &[u8] = b"* 1 FETCH (BODY[] {5}\r\nhe";
         let e1 = lex.feed(&mut p1).unwrap();
+        assert!(e1.iter().any(|e| matches!(
+            e,
+            ImapEvent::FetchLiteralBegin { seq: 1, section, size: 5 } if section.is_empty()
+        )));
         assert!(e1.iter().any(|e| matches!(e, ImapEvent::FetchLiteralData(d) if d == b"he")));
         assert!(lex.in_literal());
 
         let mut p2: &[u8] = b"llo)\r\n";
         let e2 = lex.feed(&mut p2).unwrap();
         assert!(e2.iter().any(|e| matches!(e, ImapEvent::FetchLiteralData(d) if d == b"llo")));
-        assert!(e2.iter().any(|e| *e == ImapEvent::FetchLiteralComplete));
+        assert!(e2.iter().any(|e| *e == ImapEvent::FetchLiteralEnd { seq: 1 }));
         let fetch = e2
             .iter()
             .find_map(|e| match e {
@@ -2232,6 +2279,39 @@ mod tests {
             })
             .expect("Fetch event");
         assert_eq!(fetch.body, b"hello");
+    }
+
+    #[test]
+    fn fetch_literal_section_attributed_for_body_bracket() {
+        let mut lex = ImapReplyLexer::new();
+        let mut data: &[u8] = b"* 4 FETCH (UID 9 BODY[HEADER] {7}\r\nHeader!)\r\n";
+        let ev = lex.feed(&mut data).unwrap();
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            ImapEvent::FetchLiteralBegin { seq: 4, section, size: 7 } if section == "HEADER"
+        )));
+        assert!(ev.iter().any(|e| *e == ImapEvent::FetchLiteralEnd { seq: 4 }));
+    }
+
+    #[test]
+    fn fetch_literal_section_attributed_for_rfc822_variants() {
+        for (attr, section) in [
+            ("RFC822", "RFC822"),
+            ("RFC822.TEXT", "RFC822.TEXT"),
+            ("RFC822.HEADER", "RFC822.HEADER"),
+        ] {
+            let mut lex = ImapReplyLexer::new();
+            let line = format!("* 2 FETCH ({attr} {{3}}\r\nabc)\r\n");
+            let mut data: &[u8] = line.as_bytes();
+            let ev = lex.feed(&mut data).unwrap();
+            assert!(
+                ev.iter().any(|e| matches!(
+                    e,
+                    ImapEvent::FetchLiteralBegin { seq: 2, section: s, size: 3 } if s == section
+                )),
+                "attr {attr}: {ev:?}"
+            );
+        }
     }
 
     #[test]
