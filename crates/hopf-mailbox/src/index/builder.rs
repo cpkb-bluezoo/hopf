@@ -3,17 +3,19 @@
 //! Build [`IndexEntry`](super::IndexEntry) via rmimeparser.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 
 use rmimeparser::mime::MimeHandler;
 use rmimeparser::rfc5322::{EmailAddress, MessageHandler, MessageParser, OffsetDateTime};
 use rmimeparser::ContentId;
 
 use crate::config::IndexConfig;
+use crate::error::MailboxResult;
 use crate::flag::Flag;
 
 use super::entry::{
-    IndexEntry, DESC_BCC, DESC_BODY, DESC_CC, DESC_FROM, DESC_KEYWORDS, DESC_LOCATION,
-    DESC_MESSAGE_ID, DESC_SUBJECT, DESC_TO, DESCRIPTOR_COUNT_BODY, DESCRIPTOR_COUNT_HEADERS,
+    IndexEntry, DESCRIPTOR_COUNT_BODY, DESCRIPTOR_COUNT_HEADERS, DESC_BCC, DESC_BODY, DESC_CC,
+    DESC_FROM, DESC_KEYWORDS, DESC_LOCATION, DESC_MESSAGE_ID, DESC_SUBJECT, DESC_TO,
 };
 
 /// Collects indexed fields while parsing a message.
@@ -41,7 +43,8 @@ impl MimeHandler for CollectHandler {
     fn body_content(&mut self, content: &[u8]) -> rmimeparser::ParseResult<()> {
         if self.capture_body && self.body.len() < self.max_body {
             let remain = self.max_body - self.body.len();
-            self.body.extend_from_slice(&content[..content.len().min(remain)]);
+            self.body
+                .extend_from_slice(&content[..content.len().min(remain)]);
         }
         Ok(())
     }
@@ -105,7 +108,14 @@ impl IndexBuilder {
         Self { config }
     }
 
-    /// Parse `rfc822` into an [`IndexEntry`].
+    /// Parse `rfc822` (already fully in memory) into an [`IndexEntry`].
+    ///
+    /// Convenience wrapper over [`Self::build_streaming`] for callers that
+    /// already have the whole message as a slice (e.g. mbox, whose on-disk
+    /// format requires a full-file scan to locate message boundaries in the
+    /// first place — a separate, structural constraint this method doesn't
+    /// try to work around). Prefer `build_streaming` for anything read
+    /// incrementally off disk or the wire.
     #[allow(clippy::too_many_arguments)]
     pub fn build(
         &self,
@@ -118,6 +128,36 @@ impl IndexBuilder {
         internal_date_millis: i64,
         rfc822: &[u8],
     ) -> IndexEntry {
+        // `&[u8]` as `Read` never errors, so this can't fail.
+        self.build_streaming(
+            uid,
+            message_number,
+            size,
+            location,
+            flags,
+            keywords,
+            internal_date_millis,
+            rfc822,
+        )
+        .expect("reading from a byte slice cannot fail")
+    }
+
+    /// Build an [`IndexEntry`] by reading `rfc822` from `reader` in bounded
+    /// chunks — the message is never held whole in memory by this method
+    /// (the `MessageParser` push-parses each chunk as it arrives, mirroring
+    /// how the SMTP/IMAP wire parsers are driven).
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_streaming(
+        &self,
+        uid: u64,
+        message_number: u32,
+        size: u64,
+        location: &str,
+        flags: &BTreeSet<Flag>,
+        keywords: &BTreeSet<String>,
+        internal_date_millis: i64,
+        mut reader: impl Read,
+    ) -> MailboxResult<IndexEntry> {
         let mut handler = CollectHandler {
             capture_body: self.config.body_indexing,
             max_body: self.config.max_body_bytes,
@@ -125,18 +165,21 @@ impl IndexBuilder {
         };
         {
             let mut parser = MessageParser::new(&mut handler);
-            let mut data = rfc822;
-            let _ = parser.receive(&mut data);
-            let _ = parser.close();
-        }
-
-        if self.config.body_indexing && handler.body.is_empty() {
-            // Fallback when the MIME push parser does not emit body_content.
-            if let Some(pos) = find_header_body_split(rfc822) {
-                let raw = &rfc822[pos..];
-                let take = raw.len().min(self.config.max_body_bytes);
-                handler.body.extend_from_slice(&raw[..take]);
+            let mut carry: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                carry.extend_from_slice(&buf[..n]);
+                let mut slice = carry.as_slice();
+                // Ignore parse errors — a malformed message still gets a
+                // best-effort index rather than failing indexing outright.
+                let _ = parser.receive(&mut slice);
+                carry = slice.to_vec();
             }
+            let _ = parser.close();
         }
 
         let mut internal = internal_date_millis;
@@ -169,7 +212,7 @@ impl IndexBuilder {
             props[DESC_BODY] = truncate_str(body, self.config.max_body_bytes);
         }
 
-        IndexEntry::new(
+        Ok(IndexEntry::new(
             uid,
             message_number,
             size,
@@ -177,7 +220,7 @@ impl IndexBuilder {
             handler.sent_millis,
             flags,
             props,
-        )
+        ))
     }
 }
 
@@ -241,15 +284,122 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     (era * 146_097 + doe as i64) - 719_468
 }
 
-fn find_header_body_split(rfc822: &[u8]) -> Option<usize> {
-    rfc822
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .or_else(|| {
-            rfc822
-                .windows(2)
-                .position(|w| w == b"\n\n")
-                .map(|i| i + 2)
-        })
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::IndexConfig;
+
+    const MSG: &[u8] = b"From: alice@example.com\r\n\
+Subject: Hello there\r\n\
+\r\n\
+This is the body.\r\nSecond line of the body.\r\n";
+
+    /// A `Read` impl that hands back at most `chunk_size` bytes per call, to
+    /// stress the parser's chunk-boundary/carry-buffer handling regardless
+    /// of where a header or body line happens to split.
+    struct TinyChunks<'a> {
+        data: &'a [u8],
+        chunk_size: usize,
+    }
+
+    impl Read for TinyChunks<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.chunk_size.min(self.data.len()).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn build_whole_slice_indexes_headers() {
+        let builder = IndexBuilder::new(IndexConfig::default());
+        let entry = builder.build(
+            1,
+            1,
+            MSG.len() as u64,
+            "loc",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            0,
+            MSG,
+        );
+        assert_eq!(entry.prop(DESC_FROM), "alice@example.com");
+        assert_eq!(entry.prop(DESC_SUBJECT), "hello there");
+    }
+
+    #[test]
+    fn build_streaming_matches_whole_slice_regardless_of_chunk_size() {
+        let builder = IndexBuilder::new(IndexConfig::with_body_indexing());
+        let whole = builder
+            .build_streaming(
+                1,
+                1,
+                MSG.len() as u64,
+                "loc",
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                0,
+                MSG,
+            )
+            .unwrap();
+
+        for chunk_size in [1usize, 2, 3, 7, 64, 4096] {
+            let entry = builder
+                .build_streaming(
+                    1,
+                    1,
+                    MSG.len() as u64,
+                    "loc",
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    0,
+                    TinyChunks {
+                        data: MSG,
+                        chunk_size,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                entry.prop(DESC_FROM),
+                whole.prop(DESC_FROM),
+                "chunk_size={chunk_size}"
+            );
+            assert_eq!(
+                entry.prop(DESC_SUBJECT),
+                whole.prop(DESC_SUBJECT),
+                "chunk_size={chunk_size}"
+            );
+            assert_eq!(entry.body(), whole.body(), "chunk_size={chunk_size}");
+        }
+    }
+
+    #[test]
+    fn build_streaming_captures_body_when_body_indexing_enabled() {
+        let builder = IndexBuilder::new(IndexConfig::with_body_indexing());
+        let entry = builder
+            .build_streaming(
+                1,
+                1,
+                MSG.len() as u64,
+                "loc",
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                0,
+                TinyChunks {
+                    data: MSG,
+                    chunk_size: 5,
+                },
+            )
+            .unwrap();
+        let body = entry.body().expect("body indexing enabled");
+        assert!(
+            body.contains("this is the body"),
+            "body missing first line: {body:?}"
+        );
+        assert!(
+            body.contains("second line of the body"),
+            "body missing second line: {body:?}"
+        );
+    }
 }

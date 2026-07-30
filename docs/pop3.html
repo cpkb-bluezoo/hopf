@@ -113,6 +113,7 @@
 <li><code>TransactionHandler</code> → STAT/LIST/RETR/DELE/RSET/TOP/UIDL/QUIT</li>
 </ul>
 <p>State traits constrain which replies are legal at each stage. The default handler (<code>DefaultPop3Handler</code>) uses the mailbox API and delegates open/RETR/TOP/QUIT I/O to the protocol via <code>proceed_*</code>.</p>
+<p>RETR and TOP both read the message via the <a href="mailbox.html#mailbox-api">Mailbox streaming read triad</a> rather than pulling the whole message into memory first. TOP additionally stops reading as soon as it has collected the requested number of body lines, instead of reading (and discarding) the rest of a potentially large message.</p>
 <h2 id="quick-start">Quick start</h2>
 <pre class="rust,ignore"><code>use std::sync::Arc;
 use hopf_auth::PasswordStore;
