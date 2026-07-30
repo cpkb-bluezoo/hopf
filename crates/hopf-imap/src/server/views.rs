@@ -12,14 +12,16 @@ use hopf_mailbox::{
     Flag, Mailbox, MailboxFactory, MailboxInfo, MailboxStore, MessageSet, SearchCriteria,
 };
 
-use crate::server::fetch_format::{fetch_needs_bytes, fetch_sets_seen, format_fetch_attrs, FetchItem};
+use crate::server::control::{MailboxBundle, PendingOpen};
+use crate::server::fetch_format::{
+    fetch_needs_bytes, fetch_sets_seen, format_fetch_attrs, FetchItem,
+};
 use crate::server::handler::{
     AppendState, AuthenticateState, AuthenticatedHandler, CloseState, ConnectedState, CopyState,
     CreateState, DeleteState, ExpungeState, FetchState, ListState, MoveState,
     NotAuthenticatedHandler, RenameState, SearchState, SelectState, SelectedHandler, StatusState,
     StoreAction, StoreState, SubscribeState,
 };
-use crate::server::control::{MailboxBundle, PendingOpen};
 use crate::server::reply::{format_list_attrs, quote_astring, tagged_no, tagged_ok, untagged};
 use crate::server::session::ImapSessionState;
 use crate::server::status_items::StatusItem;
@@ -590,7 +592,11 @@ pub(crate) struct AppendView<'a> {
     pub endpoint: &'a mut dyn Endpoint,
     pub tag: &'a str,
     pub mailbox: String,
-    pub body: Vec<u8>,
+    /// Path to the spooled literal (see `control::unique_append_spool_path`);
+    /// streamed into the mailbox's append triad in bounded chunks rather
+    /// than held whole in memory. Always `Some` for a valid APPEND, even a
+    /// zero-length one (an empty spool file).
+    pub body_path: Option<std::path::PathBuf>,
     #[allow(dead_code)]
     pub flags: BTreeSet<Flag>,
     #[allow(dead_code)]
@@ -616,7 +622,7 @@ impl AppendState for AppendView<'_> {
         };
         let bundle = Arc::clone(self.bundle);
         let mailbox = self.mailbox.clone();
-        let body = std::mem::take(&mut self.body);
+        let body_path = self.body_path.take();
         let tag = self.tag.to_string();
         let busy = Arc::clone(self.busy);
         let pending = Arc::clone(self.pending_open);
@@ -633,27 +639,41 @@ impl AppendState for AppendView<'_> {
         self.runtime.storage().submit_on(
             handle.clone(),
             move || {
-                let mut g = bundle.lock().unwrap();
-                // Append into selected mailbox if names match; else open target.
-                let uid = if g.mailbox.as_ref().map(|m| m.name()) == Some(mailbox.as_str()) {
-                    let mb = g.mailbox.as_mut().unwrap();
-                    let uid = mb
-                        .append_message(&body, &flags, internal_date)
+                let result = (|| -> Result<(u64, u64), String> {
+                    let mut g = bundle.lock().unwrap();
+                    // Append into selected mailbox if names match; else open target.
+                    if g.mailbox.as_ref().map(|m| m.name()) == Some(mailbox.as_str()) {
+                        let mb = g.mailbox.as_mut().unwrap();
+                        let uid = append_streaming(
+                            mb.as_mut(),
+                            &flags,
+                            internal_date,
+                            body_path.as_deref(),
+                        )
                         .map_err(|e| e.to_string())?;
-                    let uv = mb.uid_validity();
-                    (uv, uid)
-                } else {
-                    let store = g.store.as_mut().ok_or_else(|| "no store".to_string())?;
-                    let mut mb = store
-                        .open_mailbox(&mailbox, false)
+                        let uv = mb.uid_validity();
+                        Ok((uv, uid))
+                    } else {
+                        let store = g.store.as_mut().ok_or_else(|| "no store".to_string())?;
+                        let mut mb = store
+                            .open_mailbox(&mailbox, false)
+                            .map_err(|e| e.to_string())?;
+                        let uid = append_streaming(
+                            mb.as_mut(),
+                            &flags,
+                            internal_date,
+                            body_path.as_deref(),
+                        )
                         .map_err(|e| e.to_string())?;
-                    let uid = mb
-                        .append_message(&body, &flags, internal_date)
-                        .map_err(|e| e.to_string())?;
-                    let uv = mb.uid_validity();
-                    let _ = mb.close(false);
-                    (uv, uid)
-                };
+                        let uv = mb.uid_validity();
+                        let _ = mb.close(false);
+                        Ok((uv, uid))
+                    }
+                })();
+                if let Some(path) = &body_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                let uid = result?;
                 Ok(format!("[{}] APPEND completed", format_appenduid(uid.0, uid.1)).into_bytes())
             },
             move |result: Result<Vec<u8>, StorageError>| {
@@ -678,9 +698,37 @@ impl AppendState for AppendView<'_> {
     }
 
     fn no(&mut self, message: &str, handler: Box<dyn AuthenticatedHandler>) {
+        if let Some(path) = self.body_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
         *self.authenticated = Some(handler);
         self.endpoint.send(&tagged_no(self.tag, message));
     }
+}
+
+/// Stream `body_path`'s content into the append triad in bounded chunks —
+/// the message is never held whole in memory. `body_path` of `None` means a
+/// zero-length message (append nothing between start/end).
+fn append_streaming(
+    mb: &mut dyn Mailbox,
+    flags: &BTreeSet<Flag>,
+    internal_date: Option<SystemTime>,
+    body_path: Option<&std::path::Path>,
+) -> hopf_mailbox::MailboxResult<u64> {
+    use std::io::Read;
+    mb.start_append(flags, internal_date)?;
+    if let Some(path) = body_path {
+        let mut f = std::fs::File::open(path)?;
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            mb.append_content(&buf[..n])?;
+        }
+    }
+    mb.end_append()
 }
 
 pub(crate) struct FetchView<'a> {

@@ -282,6 +282,7 @@ MailboxFactory → MailboxStore → Mailbox
 <span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> hits <span class="op">=</span> mb<span class="op">.</span>search(<span class="op">&amp;</span><span class="pp">SearchCriteria::</span>text(<span class="st">&quot;needle&quot;</span>))<span class="op">?;</span></span>
 <span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>mb<span class="op">.</span>close(<span class="cn">true</span>)<span class="op">?;</span> <span class="co">// expunge when true</span></span></code></pre></div>
 <p>Operations (trait surface): <code>close(expunge)</code>, counts/size, <code>messages</code>, <code>read_message</code>, UID / uidvalidity / uidnext, flags / keywords, set/replace flags, append stream, <code>search</code>, <code>copy</code> / <code>move</code> (Maildir).</p>
+<p><strong>Streaming reads:</strong> <code>read_message</code> is a default method built on a lower-level <code>start_read</code> / <code>read_chunk</code> / <code>end_read</code> triad — callers that don't want a whole message pulled into memory (POP3 RETR/TOP, IMAP FETCH) can drive the triad directly and process fixed-size chunks as they arrive. <code>append_content</code> is likewise chunk-fed rather than taking one whole buffer, so SMTP delivery and IMAP APPEND can stream message bytes straight through to storage. Maildir implements both ends as true streaming (bounded memory regardless of message size); mbox's <code>start_read</code> materializes the one requested message (not the whole mailbox) because its <code>&gt;From</code>-line unescaping is stateful and unsafe to chunk naively — see <a href="#limitations">Limitations</a>.</p>
 <h2 id="search">SEARCH</h2>
 <p>Criteria include: ALL, system flags, NEW/OLD, KEYWORD, LARGER/SMALLER, BEFORE/ON/SINCE, SENT*, HEADER, BODY, TEXT, UID / sequence sets, MODSEQ, AND / OR / NOT.</p>
 <p><strong>BODY / TEXT:</strong> use the <code>.gidx</code> body index when <code>body_indexing</code> is enabled; otherwise parse message content on demand.</p>
@@ -292,6 +293,7 @@ MailboxFactory → MailboxStore → Mailbox
 <li>Version <strong>2</strong> — body (when enabled)</li>
 </ul>
 <p>Body indexing is <strong>off by default</strong> (disk cost). Enable with <code>IndexConfig::with_body_indexing()</code>.</p>
+<p><code>IndexBuilder::build_streaming</code> feeds any <code>Read</code> to <code>rmimeparser</code>'s incremental <code>MessageParser</code> in fixed-size chunks (carrying a small buffer for lines split across chunk boundaries) rather than reading the whole message into a <code>Vec&lt;u8&gt;</code> first; <code>build</code> (whole-slice) is a thin wrapper over it. Maildir's mailbox-open indexing loop uses <code>build_streaming</code> directly against an open <code>File</code>.</p>
 <h2 id="storage-pool-helpers">Storage pool helpers</h2>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_mailbox::pool::</span><span class="op">{</span>run_on_storage<span class="op">,</span> search_on_storage<span class="op">};</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
@@ -319,7 +321,7 @@ MailboxFactory → MailboxStore → Mailbox
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li><strong>Not an IMAP server</strong> — storage SPI only; <a href="imap.html"><code>hopf-imap</code></a> provides the wire server (use <a href="smtp.html#local-delivery"><code>LocalDeliveryService</code></a> for SMTP → INBOX).</li>
-<li>mbox: no hierarchy / COPY / MOVE.</li>
+<li>mbox: no hierarchy / COPY / MOVE. <code>start_read</code> streams in fixed-size chunks but still materializes the one target message up front (not the whole mailbox) — safe re-chunking of the stateful <code>&gt;From</code>-line unescaping across arbitrary chunk boundaries isn't implemented; <code>open()</code>'s full-mailbox scan and append internals are unchanged.</li>
 <li>Body indexing off by default.</li>
 <li>Must keep search/index off the reactor (use <code>StorageExecutor</code>).</li>
 </ul>

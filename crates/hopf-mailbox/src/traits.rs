@@ -116,8 +116,35 @@ pub trait Mailbox: Send {
     /// Enumerate message descriptors in sequence order.
     fn messages(&self) -> MailboxResult<Vec<MessageDescriptor>>;
 
-    /// Read full RFC 822 bytes for sequence number.
-    fn read_message(&self, message_number: u32) -> MailboxResult<Vec<u8>>;
+    /// Begin a streaming read of RFC 822 bytes for `message_number`. Exactly
+    /// one read may be in progress on a given `Mailbox` handle at a time.
+    fn start_read(&mut self, message_number: u32) -> MailboxResult<()>;
+
+    /// Read the next chunk into `buf`, returning the number of bytes
+    /// written. `0` signals end of message — call [`end_read`](Self::end_read) next.
+    fn read_chunk(&mut self, buf: &mut [u8]) -> MailboxResult<usize>;
+
+    /// Finish a streaming read.
+    fn end_read(&mut self) -> MailboxResult<()>;
+
+    /// Convenience: read a complete message via the streaming triad. Prefer
+    /// [`start_read`](Self::start_read)/[`read_chunk`](Self::read_chunk)/[`end_read`](Self::end_read)
+    /// directly when delivering to a socket or another streaming sink —
+    /// this materializes the whole message in memory.
+    fn read_message(&mut self, message_number: u32) -> MailboxResult<Vec<u8>> {
+        self.start_read(message_number)?;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = self.read_chunk(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        self.end_read()?;
+        Ok(out)
+    }
 
     /// Unique id string for sequence number.
     fn unique_id(&self, message_number: u32) -> MailboxResult<String>;

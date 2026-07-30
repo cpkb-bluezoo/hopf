@@ -393,7 +393,7 @@
 </tr>
 <tr>
 <td><code>MessageBufferPipeline</code></td>
-<td>Buffer for relay</td>
+<td>General-purpose in-memory buffer, for apps that want the whole message at once</td>
 </tr>
 <tr>
 <td><code>AuthPipeline</code></td>
@@ -401,7 +401,7 @@
 </tr>
 </tbody>
 </table>
-<p>Return a pipeline from <code>MailFromHandler::pipeline()</code>.</p>
+<p>Return a pipeline from <code>MailFromHandler::pipeline()</code>. The stock <code>LocalDeliveryHandler</code> and <code>SimpleRelayHandler</code> (below) use an internal streaming pipeline rather than <code>MessageBufferPipeline</code>, so neither one ever holds a whole message in memory.</p>
 <h2 id="email-authentication">Email authentication (SPF/DKIM/DMARC)</h2>
 <p><code>hopf_smtp::auth</code> is a from-scratch port of Gumdrop's <code>org.bluezoo.gumdrop.smtp.auth</code> package: SPF (RFC 7208), DKIM verify + sign (RFC 6376, Ed25519 per RFC 8463), and DMARC (RFC 7489), plus a Public Suffix List for organizational-domain resolution and DMARC aggregate/forensic report rendering. See the <a href="conformance.html#smtp">conformance audit</a> for the full RFC-by-RFC breakdown, including the couple of deliberately-deferred DMARCbis extras.</p>
 <p><code>AuthPipeline</code> implements <code>SmtpPipeline</code> and can be returned from <code>MailFromHandler::pipeline()</code>. SPF starts at <code>MAIL FROM</code>; DKIM verification and DMARC evaluation start once the message finishes at end-of-DATA. All three depend on DNS, so none of them complete synchronously — observe results via the <code>on_spf</code>/<code>on_dkim</code>/<code>on_dmarc</code> callbacks and/or a cloneable, pollable <code>AuthVerdictHandle</code>:</p>
@@ -444,6 +444,7 @@ fn message_complete(&amp;mut self, state: &amp;mut dyn MessageEndState) {
 <span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="co">// optional: .with_resolver(resolver, outbound_port)  // default outbound 25</span></span>
 <span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bound <span class="op">=</span> relay<span class="op">.</span>start(rt)<span class="op">?;</span></span></code></pre></div>
 <p>Resolves recipient MX with <a href="dns.html"><code>hopf-dns</code></a> and forwards with <code>SmtpClient</code>. Intended for development — open relay, incomplete STARTTLS to arbitrary MX (may bounce).</p>
+<p><strong>Streaming, not buffering:</strong> since RCPT TO is always fully known before DATA/BDAT starts, <code>SimpleRelayHandler</code> resolves every recipient domain's MX up front and opens one outbound <code>SmtpClient</code> connection per domain before the inbound message body arrives. Inbound message bytes are written to a small bounded per-transaction temp file as they stream in (never a growing in-memory buffer), and each outbound connection streams its DATA directly from that file via <code>SmtpSend::message_file</code> — the file is deleted once every domain has finished. If <strong>any</strong> destination domain fails, the whole inbound transaction is rejected with a 4xx even if other domains already succeeded: there is no cross-domain retry bookkeeping, so a rejected client retry may cause duplicate delivery to the domains that already succeeded. This trades a small chance of duplicate delivery for not having to build spool/custody infrastructure — a deliberate simplification for this example relay, not something a production MTA would do.</p>
 <h2 id="local-delivery">Local delivery</h2>
 <p>Gumdrop <code>LocalDeliveryService</code> / <code>LocalDeliveryHandler</code>: accept mail only for one local domain; APPEND each message to the recipient's INBOX on the Runtime storage pool.</p>
 <div class="sourceCode" id="cb4b"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4b-1"><a href="#cb4b-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_mailbox::</span>MaildirFactory<span class="op">;</span></span>
@@ -492,6 +493,7 @@ fn message_complete(&amp;mut self, state: &amp;mut dyn MessageEndState) {
 </tbody>
 </table>
 <p>Username is the RCPT <strong>local-part</strong>. Delivery opens <code>INBOX</code>, APPENDs on <code>StorageExecutor</code>, and replies 250 or 450. See <a href="mailbox.html">Mailbox</a> and <code>examples/smtp-local</code>.</p>
+<p>Inbound message bytes are streamed to a small bounded per-transaction temp file as they arrive rather than an in-memory buffer; at <code>message_complete</code> that file is streamed into each recipient's <code>INBOX</code> in fixed-size chunks via the <a href="mailbox.html#mailbox-api">Mailbox streaming append API</a> and then removed — memory use stays flat regardless of message size.</p>
 <h2 id="configuration">Configuration</h2>
 <h3 id="smtpconfig"><code>SmtpConfig</code></h3>
 <table>
@@ -692,7 +694,7 @@ fn message_complete(&amp;mut self, state: &amp;mut dyn MessageEndState) {
 <span id="cb5-18"><a href="#cb5-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">..</span><span class="kw">Default</span><span class="op">::</span><span class="kw">default</span>()</span>
 <span id="cb5-19"><a href="#cb5-19" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span>)</span>
 <span id="cb5-20"><a href="#cb5-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>connect(<span class="op">&amp;</span>rt<span class="op">,</span> <span class="pp">Arc::</span>new(send))<span class="op">?;</span></span></code></pre></div>
-<p><code>SmtpSend</code> builders: <code>mail_from</code>, <code>rcpt_to</code> / <code>recipients</code>, <code>message</code>, <code>require_starttls</code>, <code>auth_plain</code>, <code>on_complete</code>. Custom drivers implement <code>SmtpClientHandlerFactory</code> / <code>SmtpClientDriver</code>. Helper: <code>dot_stuff</code>.</p>
+<p><code>SmtpSend</code> builders: <code>mail_from</code>, <code>rcpt_to</code> / <code>recipients</code>, <code>message</code> (in-memory <code>Vec&lt;u8&gt;</code>) or <code>message_file(path)</code> (stream DATA straight from a file, dot-stuffing on the fly, without ever materializing the whole body in memory), <code>require_starttls</code>, <code>auth_plain</code>, <code>on_complete</code>. Custom drivers implement <code>SmtpClientHandlerFactory</code> / <code>SmtpClientDriver</code>. Helpers: <code>dot_stuff</code> (whole-buffer) and <code>DotStuffer</code> (streaming, chunk-at-a-time — used internally by <code>message_file</code>).</p>
 <h2 id="metrics">Metrics</h2>
 <p><code>SmtpServerMetrics</code>: connections, messages, bytes, <code>auth_ok</code> / <code>auth_fail</code>, <code>starttls</code> counts.</p>
 <h2 id="examples">Examples</h2>

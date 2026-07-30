@@ -45,6 +45,7 @@ pub struct MboxMailbox {
     uid_validity: u64,
     uid_next: u64,
     append: Option<AppendState>,
+    read: Option<ReadState>,
     index_config: IndexConfig,
 }
 
@@ -52,6 +53,11 @@ struct AppendState {
     flags: BTreeSet<Flag>,
     internal_millis: i64,
     buf: Vec<u8>,
+}
+
+struct ReadState {
+    data: Vec<u8>,
+    pos: usize,
 }
 
 impl MboxMailbox {
@@ -159,6 +165,7 @@ impl MboxMailbox {
             uid_validity,
             uid_next,
             append: None,
+            read: None,
             index_config,
         })
     }
@@ -332,12 +339,41 @@ impl Mailbox for MboxMailbox {
         Ok(out)
     }
 
-    fn read_message(&self, message_number: u32) -> MailboxResult<Vec<u8>> {
+    fn start_read(&mut self, message_number: u32) -> MailboxResult<()> {
+        if self.read.is_some() {
+            return Err(MailboxError::Invalid("read already in progress".into()));
+        }
         let msg = self.msg(message_number)?;
         if msg.session_deleted {
             return Err(MailboxError::NotFound(format!("message {message_number}")));
         }
-        self.read_raw(msg)
+        // Unlike Maildir (one file per message), mbox stores every message
+        // concatenated in a single file with "From " escaping applied across
+        // body lines — un-escaping is a stateful, line-based transform. This
+        // reads and unescapes the one requested message in full up front
+        // (bounded by that message's size, not the whole mailbox) and doles
+        // it out to the caller in chunks below, rather than implementing a
+        // chunk-boundary-safe incremental unescaper.
+        let data = self.read_raw(msg)?;
+        self.read = Some(ReadState { data, pos: 0 });
+        Ok(())
+    }
+
+    fn read_chunk(&mut self, buf: &mut [u8]) -> MailboxResult<usize> {
+        let r = self
+            .read
+            .as_mut()
+            .ok_or_else(|| MailboxError::Invalid("no read in progress".into()))?;
+        let remaining = &r.data[r.pos..];
+        let n = remaining.len().min(buf.len());
+        buf[..n].copy_from_slice(&remaining[..n]);
+        r.pos += n;
+        Ok(n)
+    }
+
+    fn end_read(&mut self) -> MailboxResult<()> {
+        self.read = None;
+        Ok(())
     }
 
     fn unique_id(&self, message_number: u32) -> MailboxResult<String> {

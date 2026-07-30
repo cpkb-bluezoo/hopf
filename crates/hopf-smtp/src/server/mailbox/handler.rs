@@ -1,8 +1,12 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! [`LocalDeliveryHandler`] — buffer message, APPEND to each recipient INBOX.
+//! [`LocalDeliveryHandler`] — spool message to a temp file, APPEND to each
+//! recipient INBOX from that spool (streamed, never buffered whole in RAM).
 
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use hopf_core::{ConnHandle, Runtime, StorageError};
@@ -16,7 +20,7 @@ use crate::server::handler::{
     ResetState, SmtpClientConnected, SmtpConnectionMetadata, SmtpHandlerFactory,
 };
 use crate::server::pipeline::SmtpPipeline;
-use crate::server::relay::MessageBufferPipeline;
+use crate::server::spool::{SpoolPipeline, SpoolPipelineHandle};
 
 /// Factory for [`LocalDeliveryHandler`].
 pub struct LocalDeliveryHandlerFactory {
@@ -55,7 +59,7 @@ impl SmtpHandlerFactory for LocalDeliveryHandlerFactory {
             control_handle: None,
             sender: None,
             recipients: Vec::new(),
-            pipeline: None,
+            spool: None,
         })
     }
 }
@@ -71,14 +75,14 @@ pub struct LocalDeliveryHandler {
     sender: Option<EmailAddress>,
     /// Local-parts of accepted recipients (mailbox usernames).
     recipients: Vec<String>,
-    pipeline: Option<Arc<Mutex<MessageBufferPipeline>>>,
+    spool: Option<Arc<Mutex<SpoolPipeline>>>,
 }
 
 impl LocalDeliveryHandler {
     fn reset_transaction(&mut self) {
         self.sender = None;
         self.recipients.clear();
-        self.pipeline = None;
+        self.spool = None;
     }
 }
 
@@ -113,9 +117,9 @@ impl HelloHandler for LocalDeliveryHandler {
 
 impl MailFromHandler for LocalDeliveryHandler {
     fn pipeline(&mut self) -> Option<Box<dyn SmtpPipeline>> {
-        let p = Arc::new(Mutex::new(MessageBufferPipeline::new()));
-        self.pipeline = Some(Arc::clone(&p));
-        Some(Box::new(PipelineHandle(p)))
+        let p = Arc::new(Mutex::new(SpoolPipeline::new()));
+        self.spool = Some(Arc::clone(&p));
+        Some(Box::new(SpoolPipelineHandle(p)))
     }
 
     fn mail_from(
@@ -189,18 +193,32 @@ impl RecipientHandler for LocalDeliveryHandler {
 }
 
 impl MessageDataHandler for LocalDeliveryHandler {
-    fn message_content(&mut self, chunk: &[u8]) {
-        if let Some(p) = &self.pipeline {
-            p.lock().unwrap().message_content(chunk);
-        }
-    }
+    // SpoolPipeline is registered as the transaction pipeline, so all
+    // content goes there, not here (see control.rs `feed_data`).
+    fn message_content(&mut self, _chunk: &[u8]) {}
 
     fn message_complete(&mut self, state: &mut dyn MessageEndState) {
-        let message = self
-            .pipeline
+        let (spool_path, spool_error) = self
+            .spool
             .as_ref()
-            .map(|p| p.lock().unwrap().message_data().to_vec())
-            .unwrap_or_default();
+            .map(|p| {
+                let g = p.lock().unwrap();
+                (g.path().map(|p| p.to_path_buf()), g.error().map(str::to_string))
+            })
+            .unwrap_or((None, None));
+
+        if let Some(err) = spool_error {
+            if let Some(path) = &spool_path {
+                let _ = std::fs::remove_file(path);
+            }
+            state.reject_message_temporary(
+                &format!("could not stage message: {err}"),
+                Box::new(self.clone()),
+            );
+            self.reset_transaction();
+            return;
+        }
+
         let recipients = self.recipients.clone();
         let factory = Arc::clone(&self.mailbox_factory);
         let storage = Arc::clone(self.runtime.storage());
@@ -213,7 +231,7 @@ impl MessageDataHandler for LocalDeliveryHandler {
 
         storage.submit_on(
             handle,
-            move || deliver_buffered(factory.as_ref(), &recipients, &message),
+            move || deliver_spooled(factory.as_ref(), &recipients, spool_path.as_deref()),
             move |result: Result<Option<String>, StorageError>| match result {
                 Ok(None) => deferred.accept(None),
                 Ok(Some(msg)) => deferred.reject_temporary(&msg),
@@ -239,17 +257,23 @@ fn local_recipient_username(
     }
 }
 
-/// Deliver to every recipient; return `None` on full success, or the first
-/// error message (other recipients are still attempted).
-fn deliver_buffered(
+/// Deliver to every recipient by streaming `spool_path`'s content into each
+/// mailbox's append triad, then remove the spool file. Returns `None` on
+/// full success, or the first error message (other recipients are still
+/// attempted).
+fn deliver_spooled(
     factory: &dyn MailboxFactory,
     recipients: &[String],
-    message: &[u8],
+    spool_path: Option<&Path>,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let flags = BTreeSet::<Flag>::new();
-    Ok(deliver_recipients(recipients, |username| {
-        deliver_to_mailbox(factory, username, message, &flags)
-    }))
+    let result = deliver_recipients(recipients, |username| {
+        deliver_to_mailbox_streaming(factory, username, spool_path, &flags)
+    });
+    if let Some(path) = spool_path {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(result)
 }
 
 fn deliver_recipients<E, F>(recipients: &[String], mut deliver: F) -> Option<String>
@@ -271,39 +295,34 @@ where
     first_error
 }
 
-fn deliver_to_mailbox(
+/// Stream `spool_path`'s content into `username`'s INBOX via the append
+/// triad in bounded chunks — the message is never held whole in memory,
+/// neither here nor (per recipient) duplicated as it was before.
+fn deliver_to_mailbox_streaming(
     factory: &dyn MailboxFactory,
     username: &str,
-    message: &[u8],
+    spool_path: Option<&Path>,
     flags: &BTreeSet<Flag>,
 ) -> hopf_mailbox::MailboxResult<()> {
     let mut store = factory.create_store();
     store.open(username)?;
     let mut mb = store.open_mailbox("INBOX", false)?;
-    mb.append_message(message, flags, None)?;
+    mb.start_append(flags, None)?;
+    if let Some(path) = spool_path {
+        let mut f = File::open(path)?;
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            mb.append_content(&buf[..n])?;
+        }
+    }
+    mb.end_append()?;
     mb.close(false)?;
     store.close()?;
     Ok(())
-}
-
-struct PipelineHandle(Arc<Mutex<MessageBufferPipeline>>);
-
-impl SmtpPipeline for PipelineHandle {
-    fn mail_from(&mut self, sender: Option<&EmailAddress>) {
-        self.0.lock().unwrap().mail_from(sender);
-    }
-    fn rcpt_to(&mut self, recipient: &EmailAddress) {
-        self.0.lock().unwrap().rcpt_to(recipient);
-    }
-    fn message_content(&mut self, chunk: &[u8]) {
-        self.0.lock().unwrap().message_content(chunk);
-    }
-    fn end_data(&mut self) {
-        self.0.lock().unwrap().end_data();
-    }
-    fn reset(&mut self) {
-        self.0.lock().unwrap().reset();
-    }
 }
 
 #[cfg(test)]
@@ -359,12 +378,22 @@ mod tests {
     }
 
     #[test]
-    fn message_pipeline_buffers_and_resets_content() {
-        let mut pipeline = MessageBufferPipeline::new();
-        pipeline.message_content(b"one");
-        pipeline.message_content(b"-two");
-        assert_eq!(pipeline.message_data(), b"one-two");
-        pipeline.reset();
-        assert!(pipeline.message_data().is_empty());
+    fn deliver_to_mailbox_streaming_round_trips_spooled_content() {
+        use hopf_mailbox::MaildirFactory;
+        let dir = tempfile::tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool_path = spool_dir.path().join("spooled.tmp");
+        std::fs::write(&spool_path, b"From: a@b\r\n\r\nhello\r\n").unwrap();
+
+        deliver_to_mailbox_streaming(&factory, "alice", Some(&spool_path), &BTreeSet::new())
+            .unwrap();
+
+        let mut store = factory.create_store();
+        store.open("alice").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        assert_eq!(mb.message_count().unwrap(), 1);
+        assert_eq!(mb.read_message(1).unwrap(), b"From: a@b\r\n\r\nhello\r\n");
     }
 }

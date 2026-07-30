@@ -16,19 +16,19 @@ use hopf_mailbox::{Mailbox, MailboxStore};
 
 use rmimeparser::charset::base64;
 
-use crate::server::capability::build_capabilities;
 use crate::enable::EnabledExtensions;
+use crate::server::capability::build_capabilities;
+use crate::server::codec::{
+    parse_astring, parse_flag_list, parse_sequence_set, parse_store_item, ImapCommand,
+    ImapServerLexer, LexEvent, MAX_COMMAND_LINE,
+};
 use crate::server::fetch_format::parse_fetch_args;
 use crate::server::handler::{
     AuthenticatedHandler, ClientConnected, NotAuthenticatedHandler, SelectedHandler,
 };
 use crate::server::idle::{is_idle_done, IdleState};
-use crate::server::search_parse::parse_search;
-use crate::server::codec::{
-    parse_astring, parse_flag_list, parse_sequence_set, parse_store_item, ImapCommand,
-    ImapServerLexer, LexEvent, MAX_COMMAND_LINE,
-};
 use crate::server::reply::{continuation, tagged_bad, tagged_no, tagged_ok, untagged};
+use crate::server::search_parse::parse_search;
 use crate::server::service::ImapConfig;
 use crate::server::session::ImapSessionState;
 use crate::server::views::{
@@ -113,7 +113,14 @@ pub struct ImapControlHandler {
     busy: Arc<AtomicBool>,
     cmd_queue: VecDeque<ImapCommand>,
     pending_auth: Option<PendingAuth>,
-    pending_append_body: Option<Vec<u8>>,
+    /// APPEND literal being spooled to a temp file as chunks arrive — never
+    /// buffered whole in memory (see `AppendChunk`/`finalize_pending_append`).
+    pending_append_file: Option<(std::fs::File, std::path::PathBuf)>,
+    /// First spool write error, if any.
+    pending_append_error: Option<String>,
+    /// Finalized spool path, ready for `cmd_append` to stream from — `None`
+    /// path with no error means a zero-length (`{0}`) literal.
+    pending_append_path: Option<std::path::PathBuf>,
     pending_open: Arc<Mutex<Option<PendingOpen>>>,
     /// Per-session ENABLE set.
     enabled: EnabledExtensions,
@@ -161,7 +168,9 @@ impl ImapControlHandler {
             busy: Arc::new(AtomicBool::new(false)),
             cmd_queue: VecDeque::new(),
             pending_auth: None,
-            pending_append_body: None,
+            pending_append_file: None,
+            pending_append_error: None,
+            pending_append_path: None,
             pending_open: Arc::new(Mutex::new(None)),
             enabled: EnabledExtensions::default(),
             idle: IdleState::default(),
@@ -1057,7 +1066,17 @@ impl ImapControlHandler {
         if !self.require_auth(endpoint, &cmd.tag) {
             return;
         }
-        let Some(body) = self.pending_append_body.take() else {
+        if let Some(err) = self.pending_append_error.take() {
+            if let Some(path) = self.pending_append_path.take() {
+                let _ = std::fs::remove_file(path);
+            }
+            self.send(
+                endpoint,
+                tagged_no(&cmd.tag, &format!("Could not stage message: {err}")),
+            );
+            return;
+        }
+        let Some(body_path) = self.pending_append_path.take() else {
             self.send(
                 endpoint,
                 tagged_bad(&cmd.tag, "APPEND requires a message literal"),
@@ -1093,7 +1112,7 @@ impl ImapControlHandler {
                 endpoint,
                 tag: &cmd.tag,
                 mailbox: name.clone(),
-                body,
+                body_path: Some(body_path),
                 flags: flags.clone(),
                 internal_date,
                 authenticated: &mut self.authenticated,
@@ -1118,7 +1137,7 @@ impl ImapControlHandler {
                 endpoint,
                 tag: &cmd.tag,
                 mailbox: name.clone(),
-                body,
+                body_path: Some(body_path),
                 flags: flags.clone(),
                 internal_date,
                 authenticated: &mut self.authenticated,
@@ -1324,6 +1343,39 @@ impl ImapControlHandler {
         );
     }
 
+    /// Spool one APPEND literal chunk to a temp file, created lazily on the
+    /// first chunk — the literal is never buffered whole in memory.
+    fn handle_append_chunk(&mut self, chunk: &[u8]) {
+        if self.pending_append_error.is_some() {
+            return;
+        }
+        if self.pending_append_file.is_none() {
+            let path = unique_append_spool_path();
+            match std::fs::File::create(&path) {
+                Ok(f) => self.pending_append_file = Some((f, path)),
+                Err(e) => {
+                    self.pending_append_error = Some(e.to_string());
+                    return;
+                }
+            }
+        }
+        if let Some((f, _)) = &mut self.pending_append_file {
+            use std::io::Write;
+            if let Err(e) = f.write_all(chunk) {
+                self.pending_append_error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Move the just-completed APPEND spool (if any) into
+    /// `pending_append_path`, ready for `cmd_append` to stream from.
+    fn finalize_pending_append(&mut self) {
+        if let Some((f, path)) = self.pending_append_file.take() {
+            let _ = f.sync_all();
+            self.pending_append_path = Some(path);
+        }
+    }
+
     fn feed_auth_line(&mut self, endpoint: &mut dyn Endpoint, line: &[u8]) {
         let Some(PendingAuth::Plain { tag }) = self.pending_auth.take() else {
             return;
@@ -1332,7 +1384,10 @@ impl ImapControlHandler {
             self.send(endpoint, tagged_bad(&tag, "Authentication cancelled"));
             return;
         }
-        match std::str::from_utf8(line).ok().and_then(|s| base64::decode(s).ok()) {
+        match std::str::from_utf8(line)
+            .ok()
+            .and_then(|s| base64::decode(s).ok())
+        {
             Some(raw) => self.complete_plain(endpoint, &tag, &raw),
             None => self.send(endpoint, tagged_no(&tag, "Invalid base64")),
         }
@@ -1369,9 +1424,6 @@ impl ProtocolHandler for ImapControlHandler {
         }
 
         let events = self.lexer.feed(data);
-        if let Some(body) = self.lexer.take_append_body() {
-            self.pending_append_body = Some(body);
-        }
         for ev in events {
             match ev {
                 LexEvent::NeedContinuation => {
@@ -1383,7 +1435,15 @@ impl ProtocolHandler for ImapControlHandler {
                 LexEvent::Error { tag, message } => {
                     self.send(endpoint, tagged_bad(&tag, &message));
                 }
+                LexEvent::AppendChunk(chunk) => {
+                    self.handle_append_chunk(&chunk);
+                }
                 LexEvent::Command(cmd) => {
+                    // An APPEND literal (if any) always finishes immediately
+                    // before its Command event — see `codec::feed_literal`'s
+                    // `LiteralPhase::Append` arm — so finalizing here always
+                    // picks up exactly the literal that belongs to `cmd`.
+                    self.finalize_pending_append();
                     // State gating (reject Selected cmds when not selected)
                     // happens inside dispatch. While a storage operation is in
                     // flight, `enqueue_or_dispatch` queues pipelined commands
@@ -1423,6 +1483,22 @@ impl ProtocolHandler for ImapControlHandler {
     fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
         endpoint.close();
     }
+}
+
+fn unique_append_spool_path() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "hopf-imap-append-{}-{}-{}.tmp",
+        std::process::id(),
+        nanos,
+        n
+    ))
 }
 
 #[cfg(test)]

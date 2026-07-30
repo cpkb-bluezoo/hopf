@@ -9,12 +9,12 @@ use std::time::Instant;
 
 use hopf_auth::{create_server, CredentialStore, SaslServer, SaslServerOptions, SaslServerStep};
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
-use hopf_mailbox::{Mailbox, MailboxFactory, MailboxStore};
+use hopf_mailbox::{Mailbox, MailboxFactory, MailboxResult, MailboxStore};
 use rmimeparser::charset::base64;
 
 use crate::server::auth::{advertised_mechanisms, apop_timestamp, capa_sasl_line, verify_apop};
 use crate::server::codec::{Pop3Command, Pop3ServerLexer, MAX_COMMAND_LINE};
-use crate::server::egress::{dot_stuff_message, truncate_top};
+use crate::server::egress::dot_stuff_message;
 use crate::server::handler::{
     AuthenticateState, AuthorizationHandler, ClientConnected, ConnectedState, ListState,
     ListWriter, MailboxStatusState, MarkDeletedState, ResetState, RetrieveState, TopState,
@@ -174,7 +174,9 @@ impl Pop3ControlHandler {
         // always did — they aren't really commands.
         if matches!(
             cmd,
-            Pop3Command::SaslResponse(_) | Pop3Command::SaslAbort | Pop3Command::SaslResponseInvalid
+            Pop3Command::SaslResponse(_)
+                | Pop3Command::SaslAbort
+                | Pop3Command::SaslResponseInvalid
         ) {
             match cmd {
                 Pop3Command::SaslResponse(data) => self.handle_sasl_response(endpoint, data),
@@ -234,13 +236,17 @@ impl Pop3ControlHandler {
             Pop3Command::Pass(password) => self.cmd_pass(endpoint, &password),
             Pop3Command::Apop { name, digest } => self.cmd_apop(endpoint, &name, &digest),
             Pop3Command::AuthList => self.cmd_auth_list(endpoint),
-            Pop3Command::Auth { mechanism, initial_response } => {
-                self.cmd_auth(endpoint, &mechanism, initial_response)
-            }
+            Pop3Command::Auth {
+                mechanism,
+                initial_response,
+            } => self.cmd_auth(endpoint, &mechanism, initial_response),
             Pop3Command::Malformed { verb } => {
                 self.send(endpoint, reply::err(&format!("Syntax error in {verb}")));
             }
-            _ => self.send(endpoint, reply::err("Command not valid in AUTHORIZATION state")),
+            _ => self.send(
+                endpoint,
+                reply::err("Command not valid in AUTHORIZATION state"),
+            ),
         }
     }
 
@@ -313,7 +319,10 @@ impl Pop3ControlHandler {
 
     fn cmd_stls(&mut self, endpoint: &mut dyn Endpoint) {
         if self.session != Pop3SessionState::Authorization {
-            self.send(endpoint, reply::err("STLS only valid in AUTHORIZATION state"));
+            self.send(
+                endpoint,
+                reply::err("STLS only valid in AUTHORIZATION state"),
+            );
             return;
         }
         if self.tls {
@@ -331,7 +340,10 @@ impl Pop3ControlHandler {
 
     fn cmd_utf8(&mut self, endpoint: &mut dyn Endpoint) {
         if self.session != Pop3SessionState::Authorization {
-            self.send(endpoint, reply::err("UTF8 only valid in AUTHORIZATION state"));
+            self.send(
+                endpoint,
+                reply::err("UTF8 only valid in AUTHORIZATION state"),
+            );
             return;
         }
         if !self.config.enable_utf8 {
@@ -408,7 +420,12 @@ impl Pop3ControlHandler {
         self.send(endpoint, reply::multiline_end());
     }
 
-    fn cmd_auth(&mut self, endpoint: &mut dyn Endpoint, mechanism: &str, initial_response: Option<Vec<u8>>) {
+    fn cmd_auth(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        mechanism: &str,
+        initial_response: Option<Vec<u8>>,
+    ) {
         if self.login_delay_active() {
             self.send(endpoint, reply::err("[AUTH] Login delay active"));
             return;
@@ -539,10 +556,7 @@ impl Pop3ControlHandler {
         Some(r)
     }
 
-    fn with_mailbox_ref<R>(
-        &mut self,
-        f: impl FnOnce(&dyn Mailbox, &mut Self) -> R,
-    ) -> Option<R> {
+    fn with_mailbox_ref<R>(&mut self, f: impl FnOnce(&dyn Mailbox, &mut Self) -> R) -> Option<R> {
         let mb = {
             let mut g = self.bundle.lock().unwrap();
             g.mailbox.take()
@@ -772,10 +786,10 @@ impl Pop3ControlHandler {
         self.runtime.storage().submit_on(
             handle.clone(),
             move || {
-                let g = bundle.lock().unwrap();
+                let mut g = bundle.lock().unwrap();
                 let mb = g
                     .mailbox
-                    .as_ref()
+                    .as_mut()
                     .ok_or_else(|| "mailbox closed".to_string())?;
                 let data = mb.read_message(msg).map_err(|e| e.to_string())?;
                 Ok((size, data))
@@ -809,13 +823,12 @@ impl Pop3ControlHandler {
         self.runtime.storage().submit_on(
             handle.clone(),
             move || {
-                let g = bundle.lock().unwrap();
+                let mut g = bundle.lock().unwrap();
                 let mb = g
                     .mailbox
-                    .as_ref()
+                    .as_mut()
                     .ok_or_else(|| "mailbox closed".to_string())?;
-                let data = mb.read_message(msg).map_err(|e| e.to_string())?;
-                Ok(truncate_top(&data, lines))
+                Ok(read_top_streaming(mb.as_mut(), msg, lines).map_err(|e| e.to_string())?)
             },
             move |result: Result<Vec<u8>, StorageError>| {
                 handle.with_endpoint(move |ep| {
@@ -1095,8 +1108,7 @@ struct StatusView<'a> {
 impl MailboxStatusState for StatusView<'_> {
     fn send_status(&mut self, count: u32, size: u64, handler: Box<dyn TransactionHandler>) {
         *self.transaction = Some(handler);
-        self.endpoint
-            .send(&reply::ok(&format!("{count} {size}")));
+        self.endpoint.send(&reply::ok(&format!("{count} {size}")));
     }
 
     fn error(&mut self, message: &str, handler: Box<dyn TransactionHandler>) {
@@ -1114,8 +1126,7 @@ struct ListView<'a> {
 
 impl ListState for ListView<'_> {
     fn begin_listing(&mut self, count: u32) -> Box<dyn ListWriter> {
-        self.endpoint
-            .send(&reply::ok(&format!("{count} messages")));
+        self.endpoint.send(&reply::ok(&format!("{count} messages")));
         Box::new(ListWriterImpl {
             handle: self.handle.clone(),
             lines: Vec::new(),
@@ -1125,8 +1136,7 @@ impl ListState for ListView<'_> {
 
     fn send_listing(&mut self, number: u32, size: u64, handler: Box<dyn TransactionHandler>) {
         *self.transaction = Some(handler);
-        self.endpoint
-            .send(&reply::ok(&format!("{number} {size}")));
+        self.endpoint.send(&reply::ok(&format!("{number} {size}")));
     }
 
     fn no_such_message(&mut self, handler: Box<dyn TransactionHandler>) {
@@ -1280,8 +1290,7 @@ struct UidlView<'a> {
 
 impl UidlState for UidlView<'_> {
     fn begin_listing(&mut self) -> Box<dyn UidlWriter> {
-        self.endpoint
-            .send(&reply::ok("Unique-ID listing follows"));
+        self.endpoint.send(&reply::ok("Unique-ID listing follows"));
         Box::new(UidlWriterImpl {
             handle: self.handle.clone(),
             lines: Vec::new(),
@@ -1291,8 +1300,7 @@ impl UidlState for UidlView<'_> {
 
     fn send_uid(&mut self, number: u32, uid: &str, handler: Box<dyn TransactionHandler>) {
         *self.transaction = Some(handler);
-        self.endpoint
-            .send(&reply::ok(&format!("{number} {uid}")));
+        self.endpoint.send(&reply::ok(&format!("{number} {uid}")));
     }
 
     fn no_such_message(&mut self, handler: Box<dyn TransactionHandler>) {
@@ -1346,5 +1354,137 @@ impl UpdateState for QuitView<'_> {
     fn error(&mut self, message: &str, _handler: Box<dyn TransactionHandler>) {
         self.endpoint.send(&reply::err(message));
         self.endpoint.close();
+    }
+}
+
+/// TOP (RFC 1939 §7): headers plus the first `lines` body lines. Reads via
+/// the streaming triad and stops as soon as enough body lines are collected
+/// — unlike a `read_message` + truncate approach, this never reads (let
+/// alone holds in memory) the rest of a large message just to discard it.
+fn read_top_streaming(
+    mb: &mut dyn Mailbox,
+    message_number: u32,
+    lines: u32,
+) -> MailboxResult<Vec<u8>> {
+    mb.start_read(message_number)?;
+    let mut out = Vec::new();
+    let mut carry: Vec<u8> = Vec::new();
+    let mut in_body = false;
+    let mut body_lines_left = lines;
+    let mut buf = [0u8; 8192];
+
+    'outer: loop {
+        let n = mb.read_chunk(&mut buf)?;
+        if n == 0 {
+            if !carry.is_empty() {
+                emit_top_line(&mut out, &carry, &mut in_body, &mut body_lines_left);
+            }
+            break;
+        }
+        carry.extend_from_slice(&buf[..n]);
+        loop {
+            let Some(nl) = carry.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let raw_line: Vec<u8> = carry.drain(..=nl).collect();
+            if !emit_top_line(&mut out, &raw_line, &mut in_body, &mut body_lines_left) {
+                break 'outer;
+            }
+        }
+    }
+    mb.end_read()?;
+    Ok(out)
+}
+
+/// Append one line to `out`; returns `false` once `body_lines_left` is
+/// exhausted, telling the caller to stop reading further chunks entirely.
+fn emit_top_line(
+    out: &mut Vec<u8>,
+    raw_line: &[u8],
+    in_body: &mut bool,
+    body_lines_left: &mut u32,
+) -> bool {
+    let mut end = raw_line.len();
+    if end > 0 && raw_line[end - 1] == b'\n' {
+        end -= 1;
+    }
+    if end > 0 && raw_line[end - 1] == b'\r' {
+        end -= 1;
+    }
+    let line = &raw_line[..end];
+    if !*in_body {
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+        if line.is_empty() {
+            *in_body = true;
+        }
+        true
+    } else {
+        if *body_lines_left == 0 {
+            return false;
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+        *body_lines_left -= 1;
+        true
+    }
+}
+
+#[cfg(test)]
+mod top_streaming_tests {
+    use std::collections::BTreeSet;
+
+    use hopf_mailbox::{MailboxFactory, MailboxStore};
+    use tempfile::tempdir;
+
+    use super::read_top_streaming;
+
+    fn mailbox_with(msg: &[u8]) -> (tempfile::TempDir, Box<dyn hopf_mailbox::Mailbox>) {
+        let dir = tempdir().unwrap();
+        let factory = hopf_mailbox::MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("topuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        mb.append_message(msg, &BTreeSet::new(), None).unwrap();
+        (dir, mb)
+    }
+
+    #[test]
+    fn matches_reference_truncation() {
+        let msg = b"From: a@b\r\nSubject: x\r\n\r\nbody1\r\nbody2\r\nbody3\r\n";
+        let (_dir, mut mb) = mailbox_with(msg);
+        let top = read_top_streaming(mb.as_mut(), 1, 1).unwrap();
+        assert_eq!(
+            top,
+            crate::server::egress::truncate_top(msg, 1),
+            "streaming TOP must match the reference whole-buffer implementation"
+        );
+    }
+
+    #[test]
+    fn zero_lines_returns_headers_only() {
+        let msg = b"From: a@b\r\nSubject: x\r\n\r\nbody1\r\nbody2\r\n";
+        let (_dir, mut mb) = mailbox_with(msg);
+        let top = read_top_streaming(mb.as_mut(), 1, 0).unwrap();
+        assert_eq!(top, b"From: a@b\r\nSubject: x\r\n\r\n".to_vec());
+    }
+
+    #[test]
+    fn lines_beyond_message_length_returns_whole_body() {
+        let msg = b"Subject: x\r\n\r\nonly-line\r\n";
+        let (_dir, mut mb) = mailbox_with(msg);
+        let top = read_top_streaming(mb.as_mut(), 1, 100).unwrap();
+        assert_eq!(top, msg.to_vec());
+    }
+
+    #[test]
+    fn handles_message_with_no_trailing_newline() {
+        let msg = b"Subject: x\r\n\r\nbody1\r\nbody2-no-trailing-newline";
+        let (_dir, mut mb) = mailbox_with(msg);
+        let top = read_top_streaming(mb.as_mut(), 1, 5).unwrap();
+        assert_eq!(
+            top,
+            b"Subject: x\r\n\r\nbody1\r\nbody2-no-trailing-newline\r\n".to_vec()
+        );
     }
 }
