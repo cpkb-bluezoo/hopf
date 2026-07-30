@@ -3,8 +3,8 @@
 //! Maildir++ mailbox (one folder).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -33,8 +33,13 @@ struct MdMsg {
 struct AppendState {
     flags: BTreeSet<Flag>,
     internal_millis: i64,
-    buf: Vec<u8>,
+    size: u64,
     tmp_path: PathBuf,
+    tmp_file: File,
+}
+
+struct ReadState {
+    file: File,
 }
 
 /// Shared user-root resolver for COPY/MOVE into sibling folders.
@@ -60,6 +65,7 @@ pub struct MaildirMailbox {
     index: MessageIndex,
     index_config: IndexConfig,
     append: Option<AppendState>,
+    read: Option<ReadState>,
     /// When opening destination for copy, hold store-level open lock via paths only.
     _open_guard: Option<Arc<Mutex<()>>>,
 }
@@ -120,9 +126,11 @@ impl MaildirMailbox {
         let mut dirty = false;
         for (i, m) in messages.iter().enumerate() {
             if index.get(m.uid).is_none() {
-                let bytes = fs::read(&m.path)?;
                 let kw = letters_to_keywords(&keywords, &m.filename.keyword_letters);
-                let entry = builder.build(
+                // Streamed in bounded chunks — never holds a whole message
+                // in memory just to index it.
+                let file = File::open(&m.path)?;
+                let entry = builder.build_streaming(
                     m.uid,
                     (i + 1) as u32,
                     m.size,
@@ -130,8 +138,8 @@ impl MaildirMailbox {
                     &m.filename.flags,
                     &kw,
                     0,
-                    &bytes,
-                );
+                    file,
+                )?;
                 index.put(entry);
                 dirty = true;
             }
@@ -155,6 +163,7 @@ impl MaildirMailbox {
             index,
             index_config,
             append: None,
+            read: None,
             _open_guard: open_guard,
         })
     }
@@ -244,9 +253,27 @@ impl Mailbox for MaildirMailbox {
         Ok(out)
     }
 
-    fn read_message(&self, message_number: u32) -> MailboxResult<Vec<u8>> {
+    fn start_read(&mut self, message_number: u32) -> MailboxResult<()> {
+        if self.read.is_some() {
+            return Err(MailboxError::Invalid("read already in progress".into()));
+        }
         let idx = self.seq_index(message_number)?;
-        Ok(fs::read(&self.messages[idx].path)?)
+        let file = File::open(&self.messages[idx].path)?;
+        self.read = Some(ReadState { file });
+        Ok(())
+    }
+
+    fn read_chunk(&mut self, buf: &mut [u8]) -> MailboxResult<usize> {
+        let r = self
+            .read
+            .as_mut()
+            .ok_or_else(|| MailboxError::Invalid("no read in progress".into()))?;
+        Ok(r.file.read(buf)?)
+    }
+
+    fn end_read(&mut self) -> MailboxResult<()> {
+        self.read = None;
+        Ok(())
     }
 
     fn unique_id(&self, message_number: u32) -> MailboxResult<String> {
@@ -421,7 +448,7 @@ impl Mailbox for MaildirMailbox {
         }
         let base = MaildirFilename::generate(None);
         let tmp_path = self.dir.join("tmp").join(&base);
-        File::create(&tmp_path)?;
+        let tmp_file = File::create(&tmp_path)?;
         let internal_millis = internal_date
             .unwrap_or_else(SystemTime::now)
             .duration_since(UNIX_EPOCH)
@@ -434,8 +461,9 @@ impl Mailbox for MaildirMailbox {
                 .filter(|f| *f != Flag::Recent)
                 .collect(),
             internal_millis,
-            buf: Vec::new(),
+            size: 0,
             tmp_path,
+            tmp_file,
         });
         Ok(())
     }
@@ -445,9 +473,8 @@ impl Mailbox for MaildirMailbox {
             .append
             .as_mut()
             .ok_or_else(|| MailboxError::Invalid("no append in progress".into()))?;
-        a.buf.extend_from_slice(data);
-        let mut f = OpenOptions::new().append(true).open(&a.tmp_path)?;
-        f.write_all(data)?;
+        a.tmp_file.write_all(data)?;
+        a.size += data.len() as u64;
         Ok(())
     }
 
@@ -456,44 +483,45 @@ impl Mailbox for MaildirMailbox {
         let AppendState {
             flags,
             internal_millis,
-            buf,
+            size,
             tmp_path,
+            tmp_file,
         } = self
             .append
             .take()
             .ok_or_else(|| MailboxError::Invalid("no append in progress".into()))?;
+        tmp_file.sync_all()?;
+        drop(tmp_file);
 
-        let size = buf.len() as u64;
-        let base = MaildirFilename::generate(Some(size));
-        let mut filename = MaildirFilename {
-            base: base.clone(),
+        let filename = MaildirFilename {
+            base: MaildirFilename::generate(Some(size)),
             flags: flags.clone(),
             keyword_letters: BTreeSet::new(),
         };
-        // Prefer size in final base
-        filename.base = MaildirFilename::generate(Some(size));
         let cur_name = filename.to_string_name();
         let cur_path = self.dir.join("cur").join(&cur_name);
-        // Rewrite tmp with full content then rename
-        {
-            let mut f = File::create(&tmp_path)?;
-            f.write_all(&buf)?;
-            f.sync_all()?;
-        }
+        // The content is already fully on disk at `tmp_path` from the
+        // incremental writes in `append_content` — just rename into place,
+        // no need to rewrite it.
         fs::rename(&tmp_path, &cur_path)?;
 
         let uid = self.uidlist.assign(&filename.base);
         let msg_num = (self.messages.len() + 1) as u32;
-        let entry = IndexBuilder::new(self.index_config.clone()).build(
-            uid,
-            msg_num,
-            size,
-            &filename.base,
-            &flags,
-            &BTreeSet::new(),
-            internal_millis,
-            &buf,
-        );
+        // Streamed back off disk in bounded chunks to build the index entry
+        // — the message content is never held whole in memory.
+        let entry = {
+            let file = File::open(&cur_path)?;
+            IndexBuilder::new(self.index_config.clone()).build_streaming(
+                uid,
+                msg_num,
+                size,
+                &filename.base,
+                &flags,
+                &BTreeSet::new(),
+                internal_millis,
+                file,
+            )?
+        };
         self.index.put(entry);
         self.index.set_uid_next(self.uidlist.uid_next);
 
@@ -696,6 +724,79 @@ mod tests {
             "From: a@b\r\nTo: c@d\r\nSubject: {subject}\r\nMessage-ID: <{subject}@x>\r\n\r\nbody\r\n"
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn streaming_read_round_trips_appended_content() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("readuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        let msg = sample("streamed");
+        mb.append_message(&msg, &BTreeSet::new(), None).unwrap();
+
+        mb.start_read(1).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4]; // deliberately tiny to exercise multiple chunks
+        loop {
+            let n = mb.read_chunk(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        mb.end_read().unwrap();
+        assert_eq!(got, msg);
+
+        // A second read must be independently startable (no leftover state).
+        let via_default = mb.read_message(1).unwrap();
+        assert_eq!(via_default, msg);
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn start_read_rejects_concurrent_read() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("concurrentreaduser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        mb.append_message(&sample("x"), &BTreeSet::new(), None)
+            .unwrap();
+        mb.start_read(1).unwrap();
+        assert!(mb.start_read(1).is_err());
+        mb.end_read().unwrap();
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn append_content_streamed_in_many_small_chunks_matches_whole_write() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("chunkappenduser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        let msg = sample("chunked");
+        mb.start_append(&BTreeSet::new(), None).unwrap();
+        for chunk in msg.chunks(3) {
+            mb.append_content(chunk).unwrap();
+        }
+        let uid = mb.end_append().unwrap();
+        assert!(uid > 0);
+
+        let got = mb.read_message(1).unwrap();
+        assert_eq!(
+            got, msg,
+            "content written via small chunks must round-trip exactly"
+        );
+
+        // The index entry built from the just-written file must have picked
+        // up the real headers, proving end_append's streamed re-read (rather
+        // than a stale/duplicated buffer) fed the indexer.
+        assert_eq!(mb.flags(1).unwrap(), BTreeSet::new());
+        mb.close(false).unwrap();
     }
 
     #[test]

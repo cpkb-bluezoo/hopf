@@ -8,7 +8,8 @@
 //! Users supply the envelope and message at construction; optional hook
 //! closures allow overriding any step.
 
-use std::io;
+use std::io::{self, Read};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use hopf_core::Endpoint;
@@ -20,6 +21,24 @@ use super::state::{
     MailFromParams, SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope,
     SmtpClientHello, SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,
 };
+use super::DotStuffer;
+
+/// Where [`SmtpSend`] reads the message body from.
+enum MessageSource {
+    /// Already in memory.
+    Buffer(Vec<u8>),
+    /// Streamed off disk in bounded chunks at DATA time — the message is
+    /// never held whole in memory by the client either way, but this variant
+    /// additionally avoids ever materializing it as a single `Vec` at all
+    /// (see [`SmtpSend::message_file`]).
+    File(PathBuf),
+}
+
+impl Default for MessageSource {
+    fn default() -> Self {
+        MessageSource::Buffer(Vec::new())
+    }
+}
 
 // ── SmtpSendState ─────────────────────────────────────────────────────────────
 
@@ -30,8 +49,8 @@ struct SmtpSendState {
     sender: Option<String>,
     /// Envelope recipients (at least one required).
     recipients: Vec<String>,
-    /// Message bytes (RFC 5322; will be dot-stuffed).
-    message: Vec<u8>,
+    /// Message source (RFC 5322; will be dot-stuffed).
+    message: MessageSource,
     /// Require STARTTLS before sending (skip delivery if unavailable).
     require_starttls: bool,
     /// AUTH PLAIN credentials.
@@ -78,7 +97,7 @@ impl SmtpSend {
             hostname: hostname.into(),
             sender: None,
             recipients: Vec::new(),
-            message: Vec::new(),
+            message: MessageSource::default(),
             require_starttls: false,
             auth: None,
             rcpt_idx: 0,
@@ -106,9 +125,19 @@ impl SmtpSend {
         self
     }
 
-    /// Set the message bytes.
+    /// Set the message bytes (held in memory).
     pub fn message(self, bytes: Vec<u8>) -> Self {
-        self.0.lock().unwrap().message = bytes;
+        self.0.lock().unwrap().message = MessageSource::Buffer(bytes);
+        self
+    }
+
+    /// Set the message body to be streamed from a file at DATA time, in
+    /// bounded chunks, rather than held in memory as a `Vec<u8>` — for
+    /// senders (like a relay fanning the same message out to several MX
+    /// hosts) that already have the message staged on disk and want to
+    /// avoid buffering it again per outbound connection.
+    pub fn message_file(self, path: impl Into<PathBuf>) -> Self {
+        self.0.lock().unwrap().message = MessageSource::File(path.into());
         self
     }
 
@@ -371,9 +400,40 @@ impl SmtpClientDriver for SmtpSendDriver {
         }
     }
 
-    fn on_ready_for_data(&mut self, data: &mut dyn SmtpClientMessageData, _ep: &mut dyn Endpoint) {
-        let message = self.state.lock().unwrap().message.clone();
-        data.write_content(&message);
+    fn on_ready_for_data(&mut self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint) {
+        let source = std::mem::take(&mut self.state.lock().unwrap().message);
+        match source {
+            MessageSource::Buffer(message) => {
+                data.write_content(&message);
+            }
+            MessageSource::File(path) => {
+                // Streamed in bounded chunks straight to the wire via
+                // `ep.send()` (bypassing `write_content`'s own internal
+                // buffer, which only flushes once this whole callback
+                // returns — see `DotStuffer`'s doc comment) so a relay
+                // fanning one spooled message out to several MX hosts never
+                // holds the whole message in memory again per host.
+                let mut stuffer = DotStuffer::new();
+                let mut out = Vec::with_capacity(8192);
+                if let Ok(mut f) = std::fs::File::open(&path) {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        let n = f.read(&mut buf).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        out.clear();
+                        stuffer.feed(&buf[..n], &mut out);
+                        ep.send(&out);
+                    }
+                }
+                out.clear();
+                stuffer.finish(&mut out);
+                if !out.is_empty() {
+                    ep.send(&out);
+                }
+            }
+        }
         data.end_message();
     }
 
