@@ -11,6 +11,22 @@ use super::r#type::DnsType;
 pub const EDNS_FLAG_DO: u32 = 0x8000;
 /// Default EDNS UDP payload size advertised in OPT CLASS field.
 pub const OPT_UDP_PAYLOAD: u16 = 4096;
+/// EDNS Padding option code (RFC 7830).
+pub const EDNS_OPTION_PADDING: u16 = 12;
+
+/// Build an RFC 7830 Padding option (code + length + `padding_len`
+/// zero-valued octets) ready to append into an OPT record's options — the
+/// caller composes this with whatever other options (e.g. COOKIE) belong
+/// in the same record. Padding matters most on encrypted transports (DoT/
+/// DoQ/DoH), where an attacker can otherwise infer queries from packet
+/// sizes alone even though the payload itself is opaque.
+pub fn encode_edns_padding(padding_len: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + padding_len as usize);
+    out.extend_from_slice(&EDNS_OPTION_PADDING.to_be_bytes());
+    out.extend_from_slice(&padding_len.to_be_bytes());
+    out.resize(out.len() + padding_len as usize, 0u8);
+    out
+}
 
 /// DNS resource record (RFC 1035 §3.2.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +191,61 @@ impl DnsResourceRecord {
     /// EDNS DO bit set?
     pub fn edns_do(&self) -> bool {
         self.rtype == Some(DnsType::Opt) && (self.ttl & EDNS_FLAG_DO) != 0
+    }
+
+    /// Length of the RFC 7830 Padding option, if this OPT record's options
+    /// carry one.
+    pub fn edns_padding_length(&self) -> Option<u16> {
+        if self.rtype != Some(DnsType::Opt) {
+            return None;
+        }
+        let mut i = 0;
+        while i + 4 <= self.rdata.len() {
+            let code = u16::from_be_bytes([self.rdata[i], self.rdata[i + 1]]);
+            let len = u16::from_be_bytes([self.rdata[i + 2], self.rdata[i + 3]]) as usize;
+            i += 4;
+            if i + len > self.rdata.len() {
+                return None;
+            }
+            if code == EDNS_OPTION_PADDING {
+                return Some(len as u16);
+            }
+            i += len;
+        }
+        None
+    }
+
+    /// Extended RCODE octet (RFC 6891 §6.1.3) — the upper 8 bits of the
+    /// 12-bit extended RCODE. Combine with the DNS header's own 4-bit
+    /// RCODE via [`Self::edns_full_rcode`] to get the actual code (e.g.
+    /// BADVERS/BADSIG = 16, which can't be represented in the header's
+    /// RCODE field alone).
+    pub fn edns_extended_rcode(&self) -> Option<u8> {
+        (self.rtype == Some(DnsType::Opt)).then_some((self.ttl >> 24) as u8)
+    }
+
+    /// EDNS VERSION octet (RFC 6891 §6.1.3) — 0 is the only version
+    /// defined to date.
+    pub fn edns_version(&self) -> Option<u8> {
+        (self.rtype == Some(DnsType::Opt)).then_some(((self.ttl >> 16) & 0xFF) as u8)
+    }
+
+    /// Full 12-bit extended RCODE (RFC 6891 §6.1.3): this record's
+    /// extended-RCODE octet as the high 8 bits, combined with the DNS
+    /// header's own 4-bit RCODE (e.g. from [`super::DnsMessage::rcode`])
+    /// as the low 4 bits.
+    pub fn edns_full_rcode(&self, header_rcode: u8) -> Option<u16> {
+        self.edns_extended_rcode()
+            .map(|ext| (u16::from(ext) << 4) | u16::from(header_rcode & 0x0F))
+    }
+
+    /// Set a non-default EDNS extended-RCODE and/or VERSION octet (both 0
+    /// on a plain [`Self::opt`]) — e.g. to signal BADVERS or a full
+    /// extended RCODE above 15 such as BADCOOKIE (23).
+    pub fn with_edns_rcode_version(mut self, extended_rcode: u8, version: u8) -> Self {
+        self.ttl =
+            (self.ttl & 0x0000_FFFF) | (u32::from(extended_rcode) << 24) | (u32::from(version) << 16);
+        self
     }
 
     /// Parse A RDATA.
@@ -641,6 +712,24 @@ mod tests {
     }
 
     #[test]
+    fn edns_padding_round_trips_and_coexists_with_other_options() {
+        let padding = encode_edns_padding(16);
+        assert_eq!(padding.len(), 4 + 16);
+        let opt = DnsResourceRecord::opt(1232, false, &padding);
+        assert_eq!(opt.edns_padding_length(), Some(16));
+
+        // Padding appended after another option (e.g. COOKIE) must still
+        // be found.
+        let mut combined = vec![0u8, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8]; // fake COOKIE option, 8-byte client cookie
+        combined.extend_from_slice(&encode_edns_padding(4));
+        let opt2 = DnsResourceRecord::opt(1232, false, &combined);
+        assert_eq!(opt2.edns_padding_length(), Some(4));
+
+        let no_padding = DnsResourceRecord::opt(1232, false, &[]);
+        assert_eq!(no_padding.edns_padding_length(), None);
+    }
+
+    #[test]
     fn opt_do_bit_and_dnskey_ds() {
         let opt = DnsResourceRecord::opt(1232, true, &[]);
         assert!(opt.edns_do());
@@ -662,6 +751,45 @@ mod tests {
 
         let short = DnsResourceRecord::opaque("x.", DnsType::A.value(), 1, 0, vec![1]);
         assert!(short.as_a().is_none());
+    }
+
+    #[test]
+    fn edns_extended_rcode_and_version_default_to_zero() {
+        let opt = DnsResourceRecord::opt(1232, true, &[]);
+        assert_eq!(opt.edns_extended_rcode(), Some(0));
+        assert_eq!(opt.edns_version(), Some(0));
+        assert_eq!(opt.edns_full_rcode(3 /* NXDOMAIN */), Some(3));
+        // DO bit and the rcode/version octets live in disjoint parts of
+        // TTL and must not disturb each other.
+        assert!(opt.edns_do());
+    }
+
+    #[test]
+    fn edns_extended_rcode_and_version_round_trip() {
+        let opt = DnsResourceRecord::opt(1232, true, &[]).with_edns_rcode_version(1, 0);
+        // BADVERS (16) = extended octet 1 << 4 | header rcode 0.
+        assert_eq!(opt.edns_extended_rcode(), Some(1));
+        assert_eq!(opt.edns_version(), Some(0));
+        assert_eq!(opt.edns_full_rcode(0), Some(crate::wire::RCODE_BADVERS));
+        assert!(opt.edns_do(), "setting rcode/version must not clear DO");
+
+        // A full 12-bit extended code above 15, e.g. BADCOOKIE = 23 = (1 << 4) | 7.
+        let opt2 = DnsResourceRecord::opt(1232, false, &[]).with_edns_rcode_version(1, 0);
+        assert_eq!(opt2.edns_full_rcode(7), Some(23));
+        assert!(!opt2.edns_do());
+
+        // A nonzero EDNS VERSION (e.g. an unsupported future version).
+        let opt3 = DnsResourceRecord::opt(1232, false, &[]).with_edns_rcode_version(0, 9);
+        assert_eq!(opt3.edns_version(), Some(9));
+        assert_eq!(opt3.edns_extended_rcode(), Some(0));
+    }
+
+    #[test]
+    fn edns_accessors_are_none_for_non_opt_records() {
+        let a = DnsResourceRecord::a("ex.test", 60, Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(a.edns_extended_rcode(), None);
+        assert_eq!(a.edns_version(), None);
+        assert_eq!(a.edns_full_rcode(0), None);
     }
 
     #[test]
