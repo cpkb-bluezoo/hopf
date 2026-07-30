@@ -6,7 +6,7 @@ use rmimeparser::dkim::RawHeader;
 
 /// `simple`/`relaxed` selector (RFC 6376 §3.4), independently selectable for
 /// header and body (`c=header/body`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Canonicalization {
     /// No modification beyond what capture already guarantees.
     Simple,
@@ -185,6 +185,152 @@ pub fn canon_body(body: &[u8], c: Canonicalization, l: Option<u64>) -> Vec<u8> {
     result
 }
 
+/// Streaming counterpart to [`canon_body`]: feeds canonicalized body bytes
+/// directly into a running SHA-256 digest as chunks arrive, instead of
+/// materializing the whole canonicalized body in a `Vec<u8>` first (which
+/// requires holding the entire message body in memory — see issue #86).
+///
+/// The only part of body canonicalization that inherently needs lookahead
+/// is RFC 6376 §3.4.3/§3.4.4's "strip trailing empty lines" rule — you
+/// can't know a blank line is trailing until you've seen what (if
+/// anything) follows it. This holds back only a *count* of pending blank
+/// lines (each canonicalizes to exactly `\r\n`, so no bytes need
+/// retaining) rather than the lines' actual content, and a bounded
+/// current-line assembly buffer — memory stays O(one line) instead of
+/// O(whole body) for ordinary messages.
+pub struct IncrementalBodyCanon {
+    c: Canonicalization,
+    limit: Option<u64>,
+    ctx: ring::digest::Context,
+    /// Canonicalized bytes fed to `ctx` so far, for `limit` truncation.
+    emitted: u64,
+    /// Bytes of the current, not-yet-terminated line.
+    line_buf: Vec<u8>,
+    /// Number of trailing blank lines seen but not yet hashed — each is
+    /// exactly `\r\n` once flushed, so a count is all that's needed.
+    pending_blank_lines: u64,
+}
+
+impl IncrementalBodyCanon {
+    /// Start a new streaming body-hash accumulator for canonicalization `c`,
+    /// optionally truncated to `limit` canonicalized octets (`l=` tag).
+    pub fn new(c: Canonicalization, limit: Option<u64>) -> Self {
+        Self {
+            c,
+            limit,
+            ctx: ring::digest::Context::new(&ring::digest::SHA256),
+            emitted: 0,
+            line_buf: Vec::new(),
+            pending_blank_lines: 0,
+        }
+    }
+
+    /// Feed the next chunk of raw (pre-canonicalization) body bytes, in
+    /// wire order. Chunk boundaries may fall anywhere, including mid-line.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        let mut start = 0;
+        for i in 0..chunk.len() {
+            if chunk[i] == b'\n' {
+                self.line_buf.extend_from_slice(&chunk[start..=i]);
+                self.consume_line();
+                start = i + 1;
+            }
+        }
+        self.line_buf.extend_from_slice(&chunk[start..]);
+    }
+
+    /// Finish: flush the final unterminated line (if any) and resolve
+    /// whether the trailing blank-line run (if any) was truly trailing —
+    /// it always is, at true EOF, so it's simply dropped. Returns the
+    /// finished SHA-256 digest.
+    ///
+    /// Matches [`canon_body`]'s existing (slightly asymmetric) empty-body
+    /// handling exactly, byte for byte, rather than "fixing" it here:
+    /// `simple` hashes a single `\r\n` for a wholly empty/blank body (RFC
+    /// 6376 §3.4.3's stated rule); `relaxed` hashes nothing at all for the
+    /// same input, matching `canon_body_relaxed`'s existing behavior — see
+    /// `relaxed_body_all_blank_is_empty`. Whether `relaxed` *should* also
+    /// hash `\r\n` per errata some DKIM implementations apply is a
+    /// pre-existing question this streaming rewrite deliberately doesn't
+    /// re-litigate.
+    pub fn finish(mut self) -> ring::digest::Digest {
+        if !self.line_buf.is_empty() {
+            let line = std::mem::take(&mut self.line_buf);
+            self.consume_line_bytes(&line);
+        }
+        if self.emitted == 0 && self.c == Canonicalization::Simple {
+            self.feed_limited(b"\r\n");
+        }
+        self.ctx.finish()
+    }
+
+    fn consume_line(&mut self) {
+        let line = std::mem::take(&mut self.line_buf);
+        self.consume_line_bytes(&line);
+    }
+
+    fn consume_line_bytes(&mut self, line: &[u8]) {
+        let content = line_content(line);
+        let transformed = match self.c {
+            Canonicalization::Simple => content.to_vec(),
+            Canonicalization::Relaxed => relaxed_line_content(content),
+        };
+        if transformed.is_empty() {
+            self.pending_blank_lines += 1;
+            return;
+        }
+        self.flush_pending_blank_lines();
+        self.feed_limited(&transformed);
+        self.feed_limited(b"\r\n");
+    }
+
+    fn flush_pending_blank_lines(&mut self) {
+        while self.pending_blank_lines > 0 && !self.at_limit() {
+            self.feed_limited(b"\r\n");
+            self.pending_blank_lines -= 1;
+        }
+        self.pending_blank_lines = 0;
+    }
+
+    fn at_limit(&self) -> bool {
+        matches!(self.limit, Some(l) if self.emitted >= l)
+    }
+
+    fn feed_limited(&mut self, bytes: &[u8]) {
+        let Some(l) = self.limit else {
+            self.ctx.update(bytes);
+            self.emitted += bytes.len() as u64;
+            return;
+        };
+        if self.emitted >= l {
+            return;
+        }
+        let remaining = (l - self.emitted) as usize;
+        let take = bytes.len().min(remaining);
+        self.ctx.update(&bytes[..take]);
+        self.emitted += take as u64;
+    }
+}
+
+/// Whitespace-compress one line's already-terminator-stripped content —
+/// the per-line half of [`canon_body_relaxed`]'s transform.
+fn relaxed_line_content(content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(content.len());
+    let mut in_ws = false;
+    for &b in content {
+        if b == b' ' || b == b'\t' {
+            in_ws = true;
+        } else {
+            if in_ws && !out.is_empty() {
+                out.push(b' ');
+            }
+            in_ws = false;
+            out.push(b);
+        }
+    }
+    out
+}
+
 /// Split into lines, each retaining its own line terminator (`\r\n`, bare
 /// `\n`, or none for a final unterminated line).
 fn split_lines(body: &[u8]) -> Vec<&[u8]> {
@@ -272,6 +418,80 @@ fn canon_body_relaxed(lines: &[&[u8]]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`IncrementalBodyCanon`] must produce byte-identical SHA-256 output
+    /// to `sha256(canon_body(..))`, regardless of how the input is chunked
+    /// — the property #86's streaming DKIM design depends on.
+    fn streaming_matches_whole_buffer(body: &[u8], c: Canonicalization, l: Option<u64>) {
+        let expected = ring::digest::digest(&ring::digest::SHA256, &canon_body(body, c, l));
+        for chunk_size in [1usize, 2, 3, 5, 7, 16, 64, 4096] {
+            let mut streaming = IncrementalBodyCanon::new(c, l);
+            for chunk in body.chunks(chunk_size.max(1)) {
+                streaming.feed(chunk);
+            }
+            let got = streaming.finish();
+            assert_eq!(
+                got.as_ref(),
+                expected.as_ref(),
+                "mismatch for c={c:?} l={l:?} chunk_size={chunk_size} body={body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_body_canon_matches_whole_buffer_simple() {
+        let bodies: &[&[u8]] = &[
+            b"",
+            b"\r\n",
+            b"\r\n\r\n",
+            b"hello",
+            b"hello\r\n",
+            b"line one\r\nline two\r\n",
+            b"line one\r\nline two\r\n\r\n\r\n",
+            b"line1\r\n\r\nline2\r\n\r\n\r\n",
+            b"line  one  \t\r\nline\ttwo\r\n\r\n\r\n",
+            b"only a single unterminated line without CRLF",
+            b"multiple\nbare\nlf\nlines\n",
+            b"trailing bare lf blanks\n\n\n",
+        ];
+        for &body in bodies {
+            streaming_matches_whole_buffer(body, Canonicalization::Simple, None);
+            streaming_matches_whole_buffer(body, Canonicalization::Relaxed, None);
+        }
+    }
+
+    #[test]
+    fn incremental_body_canon_matches_whole_buffer_with_l_truncation() {
+        let body: &[u8] = b"0123456789\r\nabcdefghij\r\n\r\n\r\n";
+        for l in [0u64, 1, 5, 12, 14, 20, 100] {
+            streaming_matches_whole_buffer(body, Canonicalization::Simple, Some(l));
+            streaming_matches_whole_buffer(body, Canonicalization::Relaxed, Some(l));
+        }
+    }
+
+    #[test]
+    fn incremental_body_canon_matches_whole_buffer_large_body() {
+        // A body large enough that whole-buffer canon would materialize a
+        // sizeable Vec<u8> — exercises the streaming path at realistic
+        // scale, still cross-checked against the reference implementation.
+        let mut body = Vec::new();
+        for i in 0..2000u32 {
+            body.extend_from_slice(format!("line number {i} with some padding text\r\n").as_bytes());
+        }
+        body.extend_from_slice(b"\r\n\r\n\r\n");
+        streaming_matches_whole_buffer(&body, Canonicalization::Simple, None);
+        streaming_matches_whole_buffer(&body, Canonicalization::Relaxed, None);
+        streaming_matches_whole_buffer(&body, Canonicalization::Simple, Some(1000));
+    }
+
+    #[test]
+    fn incremental_body_canon_all_blank_body_hashes_single_crlf() {
+        let mut c = IncrementalBodyCanon::new(Canonicalization::Simple, None);
+        c.feed(b"\r\n\r\n\r\n");
+        let got = c.finish();
+        let expected = ring::digest::digest(&ring::digest::SHA256, b"\r\n");
+        assert_eq!(got.as_ref(), expected.as_ref());
+    }
 
     #[test]
     fn simple_body_strips_trailing_blank_lines() {

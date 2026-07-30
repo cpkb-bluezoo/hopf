@@ -88,6 +88,12 @@ pub fn verify_first(
 /// Verify every `DKIM-Signature` header present (bounded to
 /// [`MAX_SIGNATURES`]) — used for DMARC alignment, which must consider all
 /// valid signatures, not just the first.
+///
+/// Takes the whole message body in memory. For large messages, prefer
+/// [`verify_all_with_body_hashes`] fed by
+/// [`super::canon::IncrementalBodyCanon`] while the message streams in —
+/// see [`required_body_hash_keys`] for how to determine which
+/// canonicalizations to run.
 pub fn verify_all(
     dns: Arc<dyn DnsLookup>,
     headers: Arc<Vec<RawHeader>>,
@@ -129,6 +135,119 @@ fn step(
     );
 }
 
+/// Body hashes keyed by the `(c=body-side, l=)` pair that produced them —
+/// enough to answer every `DKIM-Signature` header's body-hash need, since
+/// signatures sharing a `(c, l)` pair also share a body hash. Populate via
+/// [`super::canon::IncrementalBodyCanon`], one instance per key returned by
+/// [`required_body_hash_keys`], fed while the message streams in.
+pub type BodyHashMap = HashMap<(Canonicalization, Option<u64>), Vec<u8>>;
+
+/// The distinct `(c=body-side, l=)` pairs across every `DKIM-Signature`
+/// header in `headers` (bounded to [`MAX_SIGNATURES`], matching
+/// [`verify_all`]/[`verify_all_with_body_hashes`]) — i.e. exactly the set
+/// of [`super::canon::IncrementalBodyCanon`] instances a streaming caller
+/// needs to run the message body through before calling
+/// [`verify_all_with_body_hashes`]. Malformed `DKIM-Signature` headers are
+/// silently skipped here (they'll surface as `PermError` during actual
+/// verification instead).
+pub fn required_body_hash_keys(headers: &[RawHeader]) -> Vec<(Canonicalization, Option<u64>)> {
+    let mut keys: Vec<(Canonicalization, Option<u64>)> = Vec::new();
+    for h in headers
+        .iter()
+        .filter(|h| h.name().eq_ignore_ascii_case("DKIM-Signature"))
+        .take(MAX_SIGNATURES)
+    {
+        if let Ok(tags) = parse_signature_tags(&h.as_string_unfolded()) {
+            let key = (tags.c.1, tags.l);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// Streaming counterpart to [`verify_all`]: verifies every `DKIM-Signature`
+/// header using body hashes computed ahead of time (see
+/// [`required_body_hash_keys`] / [`BodyHashMap`]) instead of a
+/// fully-materialized message body — issue #86.
+pub fn verify_all_with_body_hashes(
+    dns: Arc<dyn DnsLookup>,
+    headers: Arc<Vec<RawHeader>>,
+    body_hashes: Arc<BodyHashMap>,
+    cb: DkimAllCallback,
+) {
+    let sigs: Vec<RawHeader> = headers
+        .iter()
+        .filter(|h| h.name().eq_ignore_ascii_case("DKIM-Signature"))
+        .take(MAX_SIGNATURES)
+        .cloned()
+        .collect();
+    step_streaming(dns, headers, body_hashes, sigs, 0, Vec::new(), cb);
+}
+
+fn step_streaming(
+    dns: Arc<dyn DnsLookup>,
+    headers: Arc<Vec<RawHeader>>,
+    body_hashes: Arc<BodyHashMap>,
+    sigs: Vec<RawHeader>,
+    i: usize,
+    mut acc: Vec<DkimSignatureResult>,
+    cb: DkimAllCallback,
+) {
+    if i >= sigs.len() {
+        cb(acc);
+        return;
+    }
+    let sig = sigs[i].clone();
+    verify_one_streaming(
+        Arc::clone(&dns),
+        Arc::clone(&headers),
+        Arc::clone(&body_hashes),
+        sig,
+        Box::new(move |result| {
+            acc.push(result);
+            step_streaming(dns, headers, body_hashes, sigs, i + 1, acc, cb);
+        }),
+    );
+}
+
+fn verify_one_streaming(
+    dns: Arc<dyn DnsLookup>,
+    headers: Arc<Vec<RawHeader>>,
+    body_hashes: Arc<BodyHashMap>,
+    sig_header: RawHeader,
+    cb: DkimCallback,
+) {
+    let tags = match parse_signature_tags(&sig_header.as_string_unfolded()) {
+        Ok(t) => t,
+        Err(()) => {
+            cb(DkimSignatureResult {
+                result: DkimResult::PermError,
+                signing_domain: None,
+                selector: None,
+            });
+            return;
+        }
+    };
+    let computed_bh = match body_hashes.get(&(tags.c.1, tags.l)) {
+        Some(h) => h.clone(),
+        // The caller didn't run a canonicalization this signature needs —
+        // a caller bug (didn't consult required_body_hash_keys first), not
+        // anything about the message itself. Fail closed rather than
+        // silently treating it as a body-hash mismatch.
+        None => {
+            cb(DkimSignatureResult {
+                result: DkimResult::PermError,
+                signing_domain: Some(tags.d.clone()),
+                selector: Some(tags.s.clone()),
+            });
+            return;
+        }
+    };
+    verify_tags_and_hash(dns, headers, tags, computed_bh, sig_header, cb);
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -154,7 +273,25 @@ fn verify_one(
             return;
         }
     };
+    // Body hash check does not require DNS — computed eagerly here (unlike
+    // algo/expiry, which is cheaper still) so a tampered body fails fast
+    // without a network round trip; see verify_tags_and_hash.
+    let computed_bh = sha256(&canon::canon_body(&body, tags.c.1, tags.l));
+    verify_tags_and_hash(dns, headers, tags, computed_bh, sig_header, cb);
+}
 
+/// Shared tail of [`verify_one`] (whole-buffer) and [`verify_one_streaming`]
+/// once each has a `computed_bh` in hand: algo/expiry checks, body-hash
+/// comparison, signature decode, `h=`-selected header canon, and the DNS
+/// key fetch + crypto verify.
+fn verify_tags_and_hash(
+    dns: Arc<dyn DnsLookup>,
+    headers: Arc<Vec<RawHeader>>,
+    tags: SigTags,
+    computed_bh: Vec<u8>,
+    sig_header: RawHeader,
+    cb: DkimCallback,
+) {
     let algo = match tags.a.as_str() {
         "rsa-sha256" => Algorithm::RsaSha256,
         "ed25519-sha256" => Algorithm::Ed25519Sha256,
@@ -180,10 +317,6 @@ fn verify_one(
         }
     }
 
-    // Body hash check does not require DNS — do it before the key fetch so a
-    // tampered body fails fast without a network round trip.
-    let canon_body_bytes = canon::canon_body(&body, tags.c.1, tags.l);
-    let computed_bh = sha256(&canon_body_bytes);
     let given_bh = match base64_decode(&tags.bh) {
         Some(b) => b,
         None => {

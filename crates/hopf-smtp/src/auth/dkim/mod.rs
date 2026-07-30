@@ -7,8 +7,9 @@ mod rsa_der;
 pub mod sign;
 pub mod verify;
 
-pub use canon::Canonicalization;
+pub use canon::{Canonicalization, IncrementalBodyCanon};
 pub use sign::{DkimPrivateKey, DkimSigner};
 pub use verify::{
-    verify_all, verify_first, DkimAllCallback, DkimCallback, DkimResult, DkimSignatureResult,
+    required_body_hash_keys, verify_all, verify_all_with_body_hashes, verify_first, BodyHashMap,
+    DkimAllCallback, DkimCallback, DkimResult, DkimSignatureResult,
 };
