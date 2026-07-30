@@ -249,27 +249,7 @@ impl DnsCache {
     }
 
     fn authorities_soa_minimum(&self, authorities: &[DnsResourceRecord]) -> Option<u32> {
-        for rr in authorities {
-            if rr.rtype == Some(DnsType::Soa) && rr.rdata.len() >= 20 {
-                // SOA: MNAME NNAME SERIAL REFRESH RETRY EXPIRE MINIMUM
-                // Walk two names then 5×u32; MINIMUM is last.
-                let mut c = 0;
-                let _ = crate::wire::decode_name(&rr.rdata, &mut c).ok()?;
-                let _ = crate::wire::decode_name(&rr.rdata, &mut c).ok()?;
-                if c + 20 > rr.rdata.len() {
-                    continue;
-                }
-                c += 16; // serial refresh retry expire
-                let minimum = u32::from_be_bytes([
-                    rr.rdata[c],
-                    rr.rdata[c + 1],
-                    rr.rdata[c + 2],
-                    rr.rdata[c + 3],
-                ]);
-                return Some(minimum.min(rr.ttl));
-            }
-        }
-        None
+        authorities.iter().find_map(|rr| rr.as_soa().map(|soa| soa.minimum.min(rr.ttl)))
     }
 
     /// Entry count (testing).
