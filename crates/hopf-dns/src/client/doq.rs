@@ -19,6 +19,22 @@ use super::{DnsClientTransport, DnsClientTransportHandler};
 /// ALPN for DoQ.
 pub const ALPN_DOQ: &[u8] = b"doq";
 
+/// DoQ-specific QUIC application error codes (RFC 9250 §4.3), for use with
+/// [`hopf_core::Endpoint::abort`]/`close_connection`.
+pub const DOQ_NO_ERROR: u32 = 0x0;
+/// The DoQ implementation encountered a local error and is incapable of
+/// continuing the connection.
+pub const DOQ_INTERNAL_ERROR: u32 = 0x1;
+/// The DoQ implementation encountered a protocol error and is forcibly
+/// aborting the connection (e.g. a malformed DNS message on a stream).
+pub const DOQ_PROTOCOL_ERROR: u32 = 0x2;
+/// A DoQ client uses this to signal that it wants to cancel an
+/// outstanding request.
+pub const DOQ_REQUEST_CANCELLED: u32 = 0x3;
+/// A DoQ implementation uses this to signal when the excessive number of
+/// concurrent streams/requests has caused it to terminate the connection.
+pub const DOQ_EXCESSIVE_LOAD: u32 = 0x4;
+
 /// DoQ client (one QUIC dial per query).
 pub struct DoqClientTransport {
     client: Arc<QuicClientConfig>,
@@ -45,9 +61,17 @@ impl DnsClientTransport for DoqClientTransport {
         message: &[u8],
         handler: Box<dyn DnsClientTransportHandler>,
     ) -> io::Result<()> {
-        let mut framed = Vec::with_capacity(2 + message.len());
-        framed.extend_from_slice(&(message.len() as u16).to_be_bytes());
-        framed.extend_from_slice(message);
+        // RFC 9250 §4.2.1: the DNS message ID MUST be 0 over DoQ — the
+        // QUIC stream itself provides the request/response correlation
+        // the ID field exists for on UDP/TCP.
+        let mut zeroed = message.to_vec();
+        if zeroed.len() >= 2 {
+            zeroed[0] = 0;
+            zeroed[1] = 0;
+        }
+        let mut framed = Vec::with_capacity(2 + zeroed.len());
+        framed.extend_from_slice(&(zeroed.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&zeroed);
 
         let slot: Arc<Mutex<Option<Box<dyn DnsClientTransportHandler>>>> =
             Arc::new(Mutex::new(Some(handler)));
