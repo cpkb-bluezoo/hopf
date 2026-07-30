@@ -28,6 +28,27 @@ pub fn encode_edns_padding(padding_len: u16) -> Vec<u8> {
     out
 }
 
+/// Decoded SOA RDATA (RFC 1035 §3.3.13) — a named struct rather than a
+/// tuple since seven positional fields (several same-typed `u32`s) would
+/// be too easy to transpose by accident at the call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoaData {
+    /// Primary master name server.
+    pub mname: String,
+    /// Mailbox of the responsible person.
+    pub rname: String,
+    /// Zone serial number.
+    pub serial: u32,
+    /// Refresh interval, seconds.
+    pub refresh: u32,
+    /// Retry interval, seconds.
+    pub retry: u32,
+    /// Expire time, seconds.
+    pub expire: u32,
+    /// Negative-caching TTL (RFC 2308 §4).
+    pub minimum: u32,
+}
+
 /// DNS resource record (RFC 1035 §3.2.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsResourceRecord {
@@ -152,6 +173,29 @@ impl DnsResourceRecord {
         rdata.push(bytes.len() as u8);
         rdata.extend_from_slice(bytes);
         Ok(Self::new(name, DnsType::Txt, DnsClass::In, ttl, rdata))
+    }
+
+    /// SOA.
+    #[allow(clippy::too_many_arguments)]
+    pub fn soa(
+        name: impl Into<String>,
+        ttl: u32,
+        mname: &str,
+        rname: &str,
+        serial: u32,
+        refresh: u32,
+        retry: u32,
+        expire: u32,
+        minimum: u32,
+    ) -> Result<Self, DnsFormatError> {
+        let mut rdata = encode_name(mname)?;
+        rdata.extend_from_slice(&encode_name(rname)?);
+        rdata.extend_from_slice(&serial.to_be_bytes());
+        rdata.extend_from_slice(&refresh.to_be_bytes());
+        rdata.extend_from_slice(&retry.to_be_bytes());
+        rdata.extend_from_slice(&expire.to_be_bytes());
+        rdata.extend_from_slice(&minimum.to_be_bytes());
+        Ok(Self::new(name, DnsType::Soa, DnsClass::In, ttl, rdata))
     }
 
     /// SRV.
@@ -286,6 +330,49 @@ impl DnsResourceRecord {
         let mut c = 2;
         let ex = decode_name(&self.rdata, &mut c).ok()?;
         Some((pref, ex))
+    }
+
+    /// Full SOA RDATA (RFC 1035 §3.3.13).
+    pub fn as_soa(&self) -> Option<SoaData> {
+        if self.rtype != Some(DnsType::Soa) {
+            return None;
+        }
+        let mut c = 0;
+        let mname = decode_name(&self.rdata, &mut c).ok()?;
+        let rname = decode_name(&self.rdata, &mut c).ok()?;
+        if c + 20 > self.rdata.len() {
+            return None;
+        }
+        let field = |off: usize| {
+            u32::from_be_bytes([
+                self.rdata[c + off],
+                self.rdata[c + off + 1],
+                self.rdata[c + off + 2],
+                self.rdata[c + off + 3],
+            ])
+        };
+        Some(SoaData {
+            mname,
+            rname,
+            serial: field(0),
+            refresh: field(4),
+            retry: field(8),
+            expire: field(12),
+            minimum: field(16),
+        })
+    }
+
+    /// SRV priority, weight, port, and target (RFC 2782).
+    pub fn as_srv(&self) -> Option<(u16, u16, u16, String)> {
+        if self.rtype != Some(DnsType::Srv) || self.rdata.len() < 7 {
+            return None;
+        }
+        let priority = u16::from_be_bytes([self.rdata[0], self.rdata[1]]);
+        let weight = u16::from_be_bytes([self.rdata[2], self.rdata[3]]);
+        let port = u16::from_be_bytes([self.rdata[4], self.rdata[5]]);
+        let mut c = 6;
+        let target = decode_name(&self.rdata, &mut c).ok()?;
+        Some((priority, weight, port, target))
     }
 
     /// Concatenate TXT character-strings.
@@ -709,6 +796,45 @@ mod tests {
             DnsResourceRecord::srv("_http._tcp.ex.test.", 60, 0, 5, 80, "ex.test.").unwrap();
         assert_eq!(srv.rtype, Some(DnsType::Srv));
         assert!(DnsResourceRecord::txt("x.", 1, &"x".repeat(256)).is_err());
+    }
+
+    #[test]
+    fn soa_round_trips_through_as_soa() {
+        let soa = DnsResourceRecord::soa(
+            "ex.test.", 3600, "ns1.ex.test.", "hostmaster.ex.test.", 2026072701, 3600, 900, 604800, 300,
+        )
+        .unwrap();
+        let decoded = soa.as_soa().unwrap();
+        assert!(decoded.mname.eq_ignore_ascii_case("ns1.ex.test") || decoded.mname.eq_ignore_ascii_case("ns1.ex.test."));
+        assert!(
+            decoded.rname.eq_ignore_ascii_case("hostmaster.ex.test")
+                || decoded.rname.eq_ignore_ascii_case("hostmaster.ex.test.")
+        );
+        assert_eq!(decoded.serial, 2026072701);
+        assert_eq!(decoded.refresh, 3600);
+        assert_eq!(decoded.retry, 900);
+        assert_eq!(decoded.expire, 604800);
+        assert_eq!(decoded.minimum, 300);
+
+        // Non-SOA records must not decode.
+        let a = DnsResourceRecord::a("ex.test.", 60, Ipv4Addr::new(1, 2, 3, 4));
+        assert!(a.as_soa().is_none());
+    }
+
+    #[test]
+    fn srv_round_trips_through_as_srv() {
+        let srv = DnsResourceRecord::srv("_http._tcp.ex.test.", 60, 10, 20, 8080, "target.ex.test.").unwrap();
+        let (priority, weight, port, target) = srv.as_srv().unwrap();
+        assert_eq!(priority, 10);
+        assert_eq!(weight, 20);
+        assert_eq!(port, 8080);
+        assert!(
+            target.eq_ignore_ascii_case("target.ex.test") || target.eq_ignore_ascii_case("target.ex.test."),
+            "got {target:?}"
+        );
+
+        let a = DnsResourceRecord::a("ex.test.", 60, Ipv4Addr::new(1, 2, 3, 4));
+        assert!(a.as_srv().is_none());
     }
 
     #[test]
