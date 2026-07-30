@@ -211,6 +211,72 @@ fn no_signature_header_is_none() {
     assert_eq!(result.result, DkimResult::None);
 }
 
+/// Runs the streaming path exactly the way `AuthPipeline` will: determine
+/// the required `(c, l)` canonicalizations from the (already-buffered,
+/// small) headers, feed the body through one [`super::super::canon::IncrementalBodyCanon`]
+/// per canonicalization in arbitrarily-sized chunks, then verify against
+/// the precomputed hashes instead of a whole-buffer body.
+fn run_all_streaming(
+    dns: FakeDns,
+    headers: Vec<RawHeader>,
+    body: &[u8],
+    chunk_size: usize,
+) -> Vec<DkimSignatureResult> {
+    let keys = required_body_hash_keys(&headers);
+    let mut canons: Vec<_> = keys
+        .iter()
+        .map(|&(c, l)| (c, l, super::super::canon::IncrementalBodyCanon::new(c, l)))
+        .collect();
+    for chunk in body.chunks(chunk_size.max(1)) {
+        for (_, _, canon) in canons.iter_mut() {
+            canon.feed(chunk);
+        }
+    }
+    let mut body_hashes = BodyHashMap::new();
+    for (c, l, canon) in canons {
+        body_hashes.insert((c, l), canon.finish().as_ref().to_vec());
+    }
+
+    let out = Arc::new(Mutex::new(None));
+    let out2 = Arc::clone(&out);
+    verify_all_with_body_hashes(
+        Arc::new(dns),
+        Arc::new(headers),
+        Arc::new(body_hashes),
+        Box::new(move |r| *out2.lock().unwrap() = Some(r)),
+    );
+    let result = out.lock().unwrap().take().unwrap();
+    result
+}
+
+#[test]
+fn streaming_verification_matches_whole_buffer_for_pass_and_fail() {
+    let key = rsa_key();
+    let body = b"Hello, streaming world!\r\nSecond line.\r\n".to_vec();
+    let headers = sign_and_assemble(&key, &body);
+    let dns = || {
+        FakeDns::default().with_txt(
+            "selector1._domainkey.example.com",
+            &format!("v=DKIM1; k=rsa; p={RSA_SPKI_B64}"),
+        )
+    };
+
+    for chunk_size in [1usize, 3, 7, 64, 4096] {
+        let results = run_all_streaming(dns(), headers.clone(), &body, chunk_size);
+        assert_eq!(results.len(), 1, "chunk_size={chunk_size}");
+        assert_eq!(
+            results[0].result,
+            DkimResult::Pass,
+            "chunk_size={chunk_size}"
+        );
+    }
+
+    // A tampered body must still fail streamed, exactly like whole-buffer.
+    let tampered = b"Hello, tampered world!\r\nSecond line.\r\n".to_vec();
+    let results = run_all_streaming(dns(), headers, &tampered, 5);
+    assert_eq!(results[0].result, DkimResult::Fail);
+}
+
 #[test]
 fn algorithm_family_mismatch_is_permerror() {
     let key = rsa_key();

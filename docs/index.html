@@ -170,9 +170,9 @@
 </ul>
 <h3 id="dns-hopf-dns">DNS (<code>hopf-dns</code>)</h3>
 <ul>
-<li>Stub resolver + caching forwarder (not authoritative)</li>
-<li>UDP / TCP; optional DoT, DoQ, DoH (features)</li>
-<li>EDNS, cookies, bailiwick; optional DNSSEC validation</li>
+<li>Resolver: a stub resolver in the RFC 1034 §5.3.1 sense (relies on configured upstreams for recursion — not authoritative, no zone data) but full-featured otherwise: response caching, EDNS0, RFC 7873 cookies, bailiwick filtering, cache-poisoning resilience (RFC 5452), automatic UDP→TCP truncation fallback, and optional DNSSEC chain-of-trust validation</li>
+<li>Forwarder (<code>DnsService</code>, <code>server</code> feature): complete and extensible — UDP/DoT/DoQ listeners share one core, a pluggable local-answer hook can short-circuit any query before it reaches upstream, plus caching, metrics, DNSSEC RR stripping by client DO bit, and RFC 7873 §5.2 server-side cookie validation</li>
+<li>Standalone DoT/DoQ/DoH <code>DnsClientTransport</code> building blocks (<code>dot</code>/<code>doq</code>/<code>doh</code> features) for apps that want to speak one specific encrypted transport directly — not yet wired into the resolver's own automatic query/resolve pipeline, which is UDP + TCP fallback only</li>
 <li><code>connect_by_name</code> for async dial-by-hostname on <code>Arc&lt;Runtime&gt;</code></li>
 <li><code>DnsService</code> UDP proxy example (<code>dns-proxy</code>)</li>
 </ul>
@@ -288,9 +288,9 @@
 <tr>
 <td>DNS</td>
 <td><code>hopf-dns</code></td>
-<td style="text-align: center;">proxy</td>
-<td style="text-align: center;">stub</td>
-<td>DoT/DoQ/DoH optional</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td>UDP/DoT/DoQ forwarder w/ local-answer hook; DNSSEC-validating stub resolver</td>
 </tr>
 <tr>
 <td>FTP / FTPS</td>

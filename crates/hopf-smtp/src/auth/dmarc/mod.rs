@@ -41,6 +41,20 @@ pub enum DmarcResult {
     PermError,
 }
 
+impl DmarcResult {
+    /// `Authentication-Results`-style lowercase token (RFC 7489 §11.2
+    /// registers `dmarc` as an Authentication-Results method).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DmarcResult::Pass => "pass",
+            DmarcResult::Fail => "fail",
+            DmarcResult::None => "none",
+            DmarcResult::TempError => "temperror",
+            DmarcResult::PermError => "permerror",
+        }
+    }
+}
+
 /// `p=`/`sp=`/`np=` policy value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DmarcPolicy {

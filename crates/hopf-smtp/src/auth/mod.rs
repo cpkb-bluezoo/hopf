@@ -19,5 +19,5 @@ pub mod spf;
 
 pub use dmarc::AuthVerdict;
 pub use dns_lookup::{DnsLookup, Lookup};
-pub use pipeline::{AuthPipeline, AuthPipelineBuilder, AuthVerdictHandle};
+pub use pipeline::{AuthPipeline, AuthPipelineBuilder, AuthResultsHandle, AuthVerdictHandle};
 pub use psl::PublicSuffixList;
