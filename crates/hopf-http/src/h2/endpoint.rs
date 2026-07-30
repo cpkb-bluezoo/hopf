@@ -120,7 +120,9 @@ enum H2Role {
         secure: bool,
         /// Next odd stream ID to allocate.
         next_stream_id: u32,
-        /// When false, the session layer calls [`Self::kick_client_request`] when a request is ready.
+        /// When false, the session layer opens streams itself (see
+        /// [`Self::open_client_stream`]) as requests become ready, instead
+        /// of this auto-kickoff.
         auto_kickoff_first_request: bool,
     },
 }
@@ -450,8 +452,9 @@ impl H2Endpoint {
 
     /// Client endpoint for the Gumdrop [`HttpRequest`](crate::HttpRequest) session API.
     ///
-    /// Does not auto-send the first stream; the session layer calls
-    /// [`Self::kick_client_request`] when the application submits a request.
+    /// Does not auto-send the first stream; the session layer opens it via
+    /// [`Self::open_client_stream`] / [`Self::feed_client_stream_body`] as
+    /// the application submits and streams a request.
     pub(crate) fn client_session(
         factory: Arc<dyn ClientHandlerFactory>,
         limits: HttpLimits,
@@ -703,20 +706,6 @@ impl H2Endpoint {
         self.arm_settings_ack_timer(endpoint);
     }
 
-    /// Allocate the next client stream, call `factory.create_handler`,
-    /// invoke `handler.start`, and flush the buffered request to `self.out`.
-    pub(crate) fn kick_client_request(&mut self, endpoint: &mut dyn Endpoint) {
-        if !self.client_connection_ready() {
-            return;
-        }
-        self.start_client_request();
-        self.flush_client_streams();
-        if !self.out.is_empty() {
-            endpoint.send(&self.out);
-            self.out.clear();
-        }
-    }
-
     pub(crate) fn client_connection_ready(&self) -> bool {
         matches!(self.state, ConnState::Open)
     }
@@ -798,6 +787,118 @@ impl H2Endpoint {
                 pending_end_stream,
             },
         );
+    }
+
+    /// Open a new client stream and send its HEADERS frame only — no
+    /// request body touched.
+    ///
+    /// Companion to [`Self::feed_client_stream_body`]: together they let the
+    /// Gumdrop [`crate::HttpRequest`] session API open a stream as soon as
+    /// `start_request_body` is called and emit DATA frames incrementally as
+    /// `request_body_content` is called, instead of
+    /// [`Self::start_client_request`]'s one-shot "hand me the whole body
+    /// now" contract (which the lower-level [`ClientHandler`] SPI still
+    /// uses unchanged). `headers` must already carry all four pseudo-headers.
+    /// Returns `None` if the connection isn't ready to open a stream right
+    /// now (not yet past the preface/SETTINGS exchange, or the peer's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` is currently exhausted) — the
+    /// caller should retry on a later `receive()`/poke.
+    pub(crate) fn open_client_stream(
+        &mut self,
+        headers: Headers,
+        handler: Box<dyn ClientHandler>,
+        bodyless: bool,
+        endpoint: &mut dyn Endpoint,
+    ) -> Option<u32> {
+        if !self.client_connection_ready() {
+            return None;
+        }
+        if let Some(limit) = self.peer_max_concurrent_streams {
+            if self.client_streams.len() as u32 >= limit {
+                return None;
+            }
+        }
+        let stream_id = match &mut self.role {
+            H2Role::Client { next_stream_id, .. } => {
+                let id = *next_stream_id;
+                *next_stream_id += 2;
+                id
+            }
+            _ => return None,
+        };
+
+        let block = self
+            .encoder
+            .encode(headers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
+        let flags = if bodyless { FLAG_END_STREAM } else { 0 };
+        frame::write_headers(&mut self.out, &block, flags, stream_id);
+
+        self.flow
+            .open_stream(stream_id, self.peer_initial_window_size);
+        self.last_stream_id = stream_id;
+        self.client_streams.insert(
+            stream_id,
+            H2ClientStream {
+                id: stream_id,
+                handler,
+                response_headers_received: false,
+                response_body_started: false,
+                pending_body: Vec::new(),
+                pending_end_stream: false,
+            },
+        );
+
+        if !self.out.is_empty() {
+            endpoint.send(&self.out);
+            self.out.clear();
+        }
+        Some(stream_id)
+    }
+
+    /// Queue more DATA for a stream already opened by
+    /// [`Self::open_client_stream`], sending as much as the current
+    /// flow-control window allows and stashing the rest for the automatic
+    /// retry in [`Self::flush_client_streams`]. `end_stream` marks this as
+    /// the final call for the stream — safe to call with `data` empty just
+    /// to flush a previously-signalled end-of-stream.
+    pub(crate) fn feed_client_stream_body(
+        &mut self,
+        stream_id: u32,
+        data: &[u8],
+        end_stream: bool,
+        endpoint: &mut dyn Endpoint,
+    ) {
+        if let Some(stream) = self.client_streams.get_mut(&stream_id) {
+            stream.pending_body.extend_from_slice(data);
+            stream.pending_end_stream |= end_stream;
+        }
+        self.flush_client_streams();
+        if !self.out.is_empty() {
+            endpoint.send(&self.out);
+            self.out.clear();
+        }
+    }
+
+    /// Bytes still queued (not yet sent due to flow control) for a client
+    /// stream opened by [`Self::open_client_stream`]. `0` for an unknown
+    /// stream id (already closed, or never opened).
+    pub(crate) fn client_stream_pending_len(&self, stream_id: u32) -> usize {
+        self.client_streams
+            .get(&stream_id)
+            .map(|s| s.pending_body.len())
+            .unwrap_or(0)
+    }
+
+    /// Notify every in-flight client stream's [`ClientHandler`] that the
+    /// connection failed, via [`ClientHandler::request_failed`], before
+    /// dropping it — otherwise a reset/disconnect mid-request silently
+    /// drops the response handler with no callback at all (the client-role
+    /// counterpart of `flush_server_streams`-adjacent server bookkeeping;
+    /// see issue #88).
+    fn fail_client_streams(&mut self, err: &std::io::Error) {
+        for (_, mut stream) in std::mem::take(&mut self.client_streams) {
+            stream.handler.request_failed(&mut NullClientWriter, err);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1412,6 +1513,16 @@ impl H2Endpoint {
         end_stream: bool,
     ) -> Vec<u8> {
         if body.is_empty() {
+            // A zero-length body with `end_stream` still needs its own
+            // (empty) DATA frame to actually signal end-of-stream — the
+            // Gumdrop session API's incremental body feed can reach this
+            // with nothing new to send but the stream now finished (see
+            // `feed_client_stream_body`). Callers with a known-bodyless
+            // request from the start put END_STREAM on HEADERS instead and
+            // never reach this with `end_stream` set.
+            if end_stream {
+                frame::write_data(&mut self.out, &[], FLAG_END_STREAM, stream_id);
+            }
             return Vec::new();
         }
         let max_frame = self.peer_max_frame_size;
@@ -1445,10 +1556,14 @@ impl H2Endpoint {
     /// runs on every `receive()` — including one that just processed the
     /// peer's WINDOW_UPDATE.
     fn flush_client_streams(&mut self) {
+        // Streams with an empty backlog but a still-pending END_STREAM need
+        // a pass too — that's an explicit "no more body, but still need to
+        // send the empty final DATA frame" state from
+        // `feed_client_stream_body`.
         let stream_ids: Vec<u32> = self
             .client_streams
             .iter()
-            .filter(|(_, s)| !s.pending_body.is_empty())
+            .filter(|(_, s)| !s.pending_body.is_empty() || s.pending_end_stream)
             .map(|(id, _)| *id)
             .collect();
         for id in stream_ids {
@@ -1458,7 +1573,11 @@ impl H2Endpoint {
             };
             let remaining = self.write_data_flow_controlled(id, &body, end_stream);
             if let Some(s) = self.client_streams.get_mut(&id) {
+                let sent_end_stream = remaining.is_empty();
                 s.pending_body = remaining;
+                if sent_end_stream {
+                    s.pending_end_stream = false;
+                }
             }
         }
     }
@@ -1762,10 +1881,14 @@ impl ProtocolHandler for H2Endpoint {
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
         self.server_streams.clear();
-        self.client_streams.clear();
+        self.fail_client_streams(&std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed",
+        ));
     }
 
-    fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
+    fn error(&mut self, endpoint: &mut dyn Endpoint, err: &std::io::Error) {
+        self.fail_client_streams(&std::io::Error::new(err.kind(), err.to_string()));
         endpoint.close();
     }
 }
@@ -2696,4 +2819,144 @@ mod client_informational_response_tests {
         assert_eq!(r.completed, 1);
     }
 
+}
+
+/// [`open_client_stream`](H2Endpoint::open_client_stream) /
+/// [`feed_client_stream_body`](H2Endpoint::feed_client_stream_body) —
+/// the low-level halves behind the Gumdrop session API's incremental H2
+/// body streaming (issue #84: headers open the stream promptly, DATA
+/// frames go out per `request_body_content` call instead of being
+/// buffered until `end_request_body`).
+#[cfg(test)]
+mod gumdrop_client_stream_tests {
+    use super::*;
+
+    struct NoopClientFactory;
+    impl ClientHandlerFactory for NoopClientFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            unimplemented!("open_client_stream takes a handler directly; unused here")
+        }
+    }
+
+    struct NoopClientHandler;
+    impl ClientHandler for NoopClientHandler {
+        fn start(&mut self, _request: &mut dyn ClientWriter) {
+            unimplemented!("constructed pre-started; never goes through start()")
+        }
+        fn response_headers(&mut self, _request: &mut dyn ClientWriter, _headers: &Headers) {}
+        fn response_complete(&mut self, _request: &mut dyn ClientWriter) {}
+    }
+
+    fn open_client() -> H2Endpoint {
+        let mut ep = H2Endpoint::client(Arc::new(NoopClientFactory), HttpLimits::default(), false);
+        ep.state = ConnState::Open;
+        ep
+    }
+
+    fn request_headers() -> Headers {
+        let mut h = Headers::new();
+        h.set(":method", "PUT");
+        h.set(":path", "/upload");
+        h.set(":scheme", "http");
+        h.set(":authority", "ex.com");
+        h
+    }
+
+    /// (payload length, END_STREAM set) for every DATA frame in `bytes`.
+    fn data_frames(bytes: &[u8]) -> Vec<(usize, bool)> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        while offset + 9 <= bytes.len() {
+            let header = frame::parse_frame_header(&bytes[offset..offset + 9]);
+            let payload_end = offset + 9 + header.length as usize;
+            if header.ty == frame::TYPE_DATA {
+                out.push((header.length as usize, header.flags & FLAG_END_STREAM != 0));
+            }
+            offset = payload_end;
+        }
+        out
+    }
+
+    #[test]
+    fn open_client_stream_sends_headers_without_touching_body() {
+        let mut ep = open_client();
+        let mut endpoint = RecordingEndpoint::default();
+
+        let stream_id = ep
+            .open_client_stream(request_headers(), Box::new(NoopClientHandler), false, &mut endpoint)
+            .expect("stream opens");
+
+        assert_eq!(stream_id, 1);
+        assert!(ep.client_streams.contains_key(&1));
+        assert!(
+            data_frames(&endpoint.sent).is_empty(),
+            "no DATA frame before any body is fed"
+        );
+        let header = frame::parse_frame_header(&endpoint.sent[..9]);
+        assert_eq!(header.ty, frame::TYPE_HEADERS);
+        assert_eq!(
+            header.flags & FLAG_END_STREAM,
+            0,
+            "stream must stay open — a body is coming"
+        );
+    }
+
+    #[test]
+    fn feed_client_stream_body_emits_one_data_frame_per_call_before_end() {
+        let mut ep = open_client();
+        let mut endpoint = RecordingEndpoint::default();
+        let stream_id = ep
+            .open_client_stream(request_headers(), Box::new(NoopClientHandler), false, &mut endpoint)
+            .unwrap();
+        endpoint.sent.clear();
+
+        ep.feed_client_stream_body(stream_id, b"chunk one ", false, &mut endpoint);
+        ep.feed_client_stream_body(stream_id, b"chunk two ", false, &mut endpoint);
+        ep.feed_client_stream_body(stream_id, b"chunk three", true, &mut endpoint);
+
+        let frames = data_frames(&endpoint.sent);
+        assert_eq!(
+            frames,
+            vec![
+                (b"chunk one ".len(), false),
+                (b"chunk two ".len(), false),
+                (b"chunk three".len(), true),
+            ],
+            "each feed_client_stream_body call must reach the wire as its own DATA \
+             frame before end_request_body, not get buffered until the end (#84)"
+        );
+    }
+
+    #[test]
+    fn feed_client_stream_body_sends_empty_end_stream_frame_when_body_already_flushed() {
+        let mut ep = open_client();
+        let mut endpoint = RecordingEndpoint::default();
+        let stream_id = ep
+            .open_client_stream(request_headers(), Box::new(NoopClientHandler), false, &mut endpoint)
+            .unwrap();
+
+        ep.feed_client_stream_body(stream_id, b"only chunk", false, &mut endpoint);
+        endpoint.sent.clear();
+        ep.feed_client_stream_body(stream_id, b"", true, &mut endpoint);
+
+        assert_eq!(
+            data_frames(&endpoint.sent),
+            vec![(0, true)],
+            "a final empty-body end_request_body call must still send a DATA frame \
+             carrying END_STREAM, not silently no-op"
+        );
+    }
+
+    #[test]
+    fn open_client_stream_returns_none_when_connection_not_ready() {
+        let mut ep = H2Endpoint::client(Arc::new(NoopClientFactory), HttpLimits::default(), false);
+        // Left at the default pre-handshake state.
+        let mut endpoint = RecordingEndpoint::default();
+
+        let result =
+            ep.open_client_stream(request_headers(), Box::new(NoopClientHandler), false, &mut endpoint);
+
+        assert!(result.is_none());
+        assert!(ep.client_streams.is_empty());
+    }
 }

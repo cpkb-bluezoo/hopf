@@ -107,26 +107,32 @@ impl HttpClient {
         self
     }
 
+    /// Builds the dial config, plus the shared session config so the caller
+    /// can still reach the stashed `handler` for `on_error` if `rt.connect`
+    /// itself fails synchronously (before any `ProtocolHandler` exists to
+    /// report the failure through).
     fn connector_for_addr(
         &self,
         addr: SocketAddr,
         handler: Box<dyn HttpConnectionHandler>,
-    ) -> TcpConnectorConfig {
+    ) -> (TcpConnectorConfig, Arc<HttpClientSessionConfig>) {
         let config = Arc::new(HttpClientSessionConfig {
             host: self.host.clone(),
             port: self.port,
             limits: self.limits,
             secure: self.secure,
             handler: Mutex::new(Some(handler)),
+            stage: self.timeouts.stage,
         });
         let limits = self.limits;
         let secure = self.secure;
         let h2_prior = self.h2_prior_knowledge;
         let connect_timeout = Some(self.timeouts.connect);
+        let config_for_factory = Arc::clone(&config);
 
         let mut cfg = TcpConnectorConfig::new(addr, move || {
             Box::new(HttpClientConnection::new(
-                Arc::clone(&config),
+                Arc::clone(&config_for_factory),
                 limits,
                 secure,
                 h2_prior,
@@ -137,7 +143,7 @@ impl HttpClient {
         if let (Some(tls), Some(name)) = (&self.tls_connector, &self.tls_server_name) {
             cfg = cfg.with_tls(Arc::clone(tls), name.clone());
         }
-        cfg
+        (cfg, config)
     }
 
     /// DNS (if needed) then dial. Returns immediately.
@@ -147,35 +153,61 @@ impl HttpClient {
         handler: Box<dyn HttpConnectionHandler>,
     ) -> io::Result<()> {
         if let Some(addr) = self.addr {
-            return rt.connect(self.connector_for_addr(addr, handler));
+            let (cfg, config) = self.connector_for_addr(addr, handler);
+            return rt.connect(cfg).inspect_err(|e| {
+                if let Some(mut h) = config.handler.lock().unwrap().take() {
+                    h.on_error(e);
+                }
+            });
         }
         if let Some(addr) = resolve_literal(&self.host, self.port) {
-            return rt.connect(self.connector_for_addr(addr, handler));
+            let (cfg, config) = self.connector_for_addr(addr, handler);
+            return rt.connect(cfg).inspect_err(|e| {
+                if let Some(mut h) = config.handler.lock().unwrap().take() {
+                    h.on_error(e);
+                }
+            });
         }
 
         let client = self.clone_for_dial();
         let resolver = match &self.resolver {
             Some(r) => Arc::clone(r),
-            None => Arc::new(DnsResolver::for_runtime(rt)?),
+            None => {
+                let r = Arc::new(DnsResolver::for_runtime(rt)?);
+                // Only apply `timeouts.dns` to a resolver we created
+                // ourselves — a caller-supplied one (`.resolver(...)`) may
+                // be shared elsewhere with its own timeout already set.
+                r.set_timeout(self.timeouts.dns);
+                r
+            }
         };
         let host = self.host.clone();
+        let host_for_error = host.clone();
         let port = self.port;
         let rt2 = Arc::clone(rt);
         resolver.resolve(
             &host,
             port,
             Box::new(move |result| {
+                let mut handler = handler;
                 let addrs = match result {
                     Ok(a) => a,
                     Err(e) => {
-                        eprintln!("hopf-http: DNS error: {e}");
+                        handler.on_error(&e);
                         return;
                     }
                 };
-                if let Some(addr) = addrs.into_iter().next() {
-                    let cfg = client.connector_for_addr(addr, handler);
-                    if let Err(e) = rt2.connect(cfg) {
-                        eprintln!("hopf-http: connect error: {e}");
+                let Some(addr) = addrs.into_iter().next() else {
+                    handler.on_error(&io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("no address for {host_for_error}"),
+                    ));
+                    return;
+                };
+                let (cfg, config) = client.connector_for_addr(addr, handler);
+                if let Err(e) = rt2.connect(cfg) {
+                    if let Some(mut h) = config.handler.lock().unwrap().take() {
+                        h.on_error(&e);
                     }
                 }
             }),

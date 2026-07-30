@@ -132,6 +132,11 @@ impl H1Endpoint {
             if !out.is_empty() {
                 endpoint.send(&out);
             }
+            // Renew on outbound progress (request bytes just went out) and
+            // on inbound progress (this flush follows a `receive()` that
+            // fed the parser) alike — `touch_stage_timer` itself is a no-op
+            // when no request is in flight.
+            codec.touch_stage_timer(endpoint);
             if codec.wants_close() {
                 endpoint.close();
             }
@@ -147,11 +152,12 @@ impl H1Endpoint {
             }
         }
         if let Some(codec) = self.session.as_mut() {
-            codec.on_connected();
+            codec.on_connected(endpoint.handle());
             let out = codec.take_outbound();
             if !out.is_empty() {
                 endpoint.send(&out);
             }
+            codec.touch_stage_timer(endpoint);
         }
     }
 }
@@ -218,7 +224,10 @@ impl ProtocolHandler for H1Endpoint {
         }
     }
 
-    fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
+    fn error(&mut self, endpoint: &mut dyn Endpoint, err: &std::io::Error) {
+        if let Some(codec) = self.session.as_mut() {
+            codec.fail_transport(std::io::Error::new(err.kind(), err.to_string()));
+        }
         endpoint.close();
     }
 }
