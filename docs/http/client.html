@@ -73,6 +73,7 @@
 <ul>
 <li><a href="#clienthandler-spi">ClientHandler SPI</a></li>
 <li><a href="#clientwriter-methods">ClientWriter methods</a></li>
+<li><a href="#httpclient-session-api">HttpClient session API</a></li>
 <li><a href="#dial-patterns">Dial patterns</a></li>
 <li><a href="#http-get-flags">http-get flags</a></li>
 <li><a href="#examples">Examples</a></li>
@@ -178,6 +179,73 @@
 </tbody>
 </table>
 <p>For distributed tracing, wrap writers with <code>hopf_otel::with_traceparent</code> / <code>PropagatingClientWriter</code> when using <code>hopf-otel</code>.</p>
+<h2 id="httpclient-session-api">HttpClient session API</h2>
+<p>A second, higher-level client face (Gumdrop <code>HTTPClient</code>): <code>HttpClient</code> (builder + <code>connect</code>), <code>HttpConnectionHandler</code> (connection lifecycle), <code>HttpClientSessionHandle</code> (request factory: <code>get</code>/<code>post</code>/<code>put</code>/…), and <code>HttpRequest</code> (headers, deferred body). Version (H1/H1.1-negotiated-H2/H2-prior-knowledge) is transparent to application code.</p>
+<pre><code>use std::sync::Arc;
+use hopf_core::{Runtime, RuntimeConfig};
+use hopf_http::{HttpClient, HttpClientSessionHandle, HttpConnectionHandler, HttpResponseHandler};
+
+struct Conn;
+impl HttpConnectionHandler for Conn {
+    fn on_connected(&amp;mut self, session: &amp;mut HttpClientSessionHandle) {
+        session.get("/status").send(Box::new(Resp)).unwrap();
+    }
+    fn on_error(&amp;mut self, err: &amp;std::io::Error) {
+        eprintln!("connect/transport failed: {err}");
+    }
+}
+
+struct Resp;
+impl HttpResponseHandler for Resp {
+    fn ok(&amp;mut self, status: u16) { println!("status {status}"); }
+    fn error(&amp;mut self, status: u16) { println!("status {status}"); }
+    fn header(&amp;mut self, _name: &amp;str, _value: &amp;str) {}
+    fn response_body_content(&amp;mut self, data: &amp;[u8]) { let _ = data; }
+    fn close(&amp;mut self) {}
+    fn failed(&amp;mut self, err: std::io::Error) { eprintln!("request failed: {err}"); }
+}
+
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+HttpClient::new("api.example.com", 443)
+    .tls(connector, "api.example.com")
+    .connect(&amp;rt, Box::new(Conn))?;</code></pre>
+<h3 id="deferred-request-body">Deferred request body</h3>
+<p><code>HttpRequest::start_request_body</code> / <code>request_body_content</code> / <code>end_request_body</code> stream a request body in caller-chosen chunks — on both H1 and H2, bytes reach the wire as each chunk arrives rather than being buffered until the whole body is known:</p>
+<table>
+<colgroup><col style="width: 45%" /><col style="width: 54%" /></colgroup>
+<thead><tr><th>Method</th><th>Behavior</th></tr></thead>
+<tbody>
+<tr><td><code>start_request_body(handler)</code></td><td>H1: flushes request headers and opens chunked encoding. H2: opens the stream and sends HEADERS immediately (no <code>END_STREAM</code>) — it does not wait for <code>end_request_body</code> the way a one-shot <code>ClientWriter::start</code> call does.</td></tr>
+<tr><td><code>request_body_content(data) -&gt; Result&lt;usize, HttpClientError&gt;</code></td><td>Queues <code>data</code> and returns the number of bytes actually accepted — a <em>short write</em> (less than <code>data.len()</code>, possibly <code>0</code>) when the connection's bounded outbound buffer (H1) or the H2 stream's flow-control backlog is currently full, rather than growing unboundedly. Never blocks.</td></tr>
+<tr><td><code>on_body_writable(callback)</code></td><td>One-shot resume signal, fired once more bytes can be accepted after a short write. Register it in response to a short write and retry the remainder from the callback instead of polling.</td></tr>
+<tr><td><code>end_request_body()</code></td><td>Marks the body complete; the final bytes (and <code>END_STREAM</code> on H2) go out once anything still queued has drained.</td></tr>
+</tbody>
+</table>
+<h3 id="cross-connection-streaming">Cross-connection streaming (claim-check / tee pattern)</h3>
+<p>Because <code>request_body_content</code> just queues bytes, it's safe to call from a thread or connection other than this one — the common case being another protocol connection (e.g. SMTP DATA) teeing its incoming bytes straight into an HTTP PUT without holding the whole message in memory on either side. Stash the <code>hopf_core::ConnHandle</code> handed to <code>on_connected</code> via <code>HttpClientSessionHandle::conn_handle()</code>, and call <code>.poke()</code> on it after each out-of-band <code>request_body_content</code> / <code>end_request_body</code> call to ask this connection's own reactor to flush the newly queued bytes without waiting for its own next I/O event:</p>
+<pre><code>// In on_connected: stash session.conn_handle() and the HttpRequest
+// somewhere the other connection's callback can reach (e.g. Arc&lt;Mutex&lt;_&gt;&gt;).
+//
+// From the SMTP connection's message_content callback, once bytes arrive:
+request.request_body_content(&amp;chunk)?;
+conn_handle.poke();   // wakes the HTTP connection's reactor to flush now
+//
+// At end of message:
+request.end_request_body()?;
+conn_handle.poke();</code></pre>
+<p><code>ConnHandle::poke()</code> is the same primitive storage-offload completion callbacks already use to make a paused connection re-check its own state (<code>Endpoint::poke_handler</code>) — it re-invokes this connection's <code>receive</code> path with no new bytes, which is exactly where both the H1 and H2 session codecs already flush anything queued.</p>
+<h3 id="connection-and-request-failure">Connection and request failure</h3>
+<p><code>HttpConnectionHandler::on_error</code> fires for DNS failure, refused/reset connect, or a TLS handshake failure — anything that happens before <code>on_connected</code> could ever run. Once a request is in flight, its own <code>HttpResponseHandler::failed</code> fires instead (mid-connection resets/disconnects route through whichever of the two is still waiting to hear about it — never both, and never neither).</p>
+<h3 id="httpclienttimeouts">HttpClientTimeouts</h3>
+<table>
+<colgroup><col style="width: 20%" /><col style="width: 20%" /><col style="width: 59%" /></colgroup>
+<thead><tr><th>Field</th><th>Default</th><th>Applies to</th></tr></thead>
+<tbody>
+<tr><td><code>dns</code></td><td>5s</td><td>Hostname resolution, via the resolver's own query timeout — only when <code>HttpClient</code> created the resolver itself (not when the caller supplied one via <code>.resolver(...)</code>, which may be shared elsewhere)</td></tr>
+<tr><td><code>connect</code></td><td>30s</td><td>TCP connect handshake</td></tr>
+<tr><td><code>stage</code></td><td>60s</td><td>Budget for one request/response round trip once bytes are on the wire — renewed on outbound and inbound progress alike, so an actively-streaming request or response doesn't spuriously time out; a genuinely stalled peer fails the request via <code>HttpResponseHandler::failed</code> with <code>TimedOut</code>. <code>Duration::ZERO</code> disables it.</td></tr>
+</tbody>
+</table>
 <h2 id="dial-patterns">Dial patterns</h2>
 <p>Listen and dial are peers: the same Stream SPI runs under a <code>TcpConnectorConfig</code> factory or H3 <code>connect_h3</code>. Prefer <code>connect_http</code> when the peer is a hostname (async DNS + connect timeouts).</p>
 <h3 id="connect_http-hostname">connect_http (hostname or literal)</h3>

@@ -122,4 +122,17 @@ impl ConnHandle {
     pub fn close(&self) {
         self.with_endpoint(|ep| ep.close());
     }
+
+    /// Re-invoke the owning connection's protocol handler on its reactor,
+    /// without waiting for new inbound data — see [`Endpoint::poke_handler`].
+    ///
+    /// For a handler whose `receive` unconditionally flushes any
+    /// buffered-but-unsent outbound state (as the H1/H2 HTTP client session
+    /// codecs do), this is how code that mutated that state from *another*
+    /// connection's callback (stashing this handle first) asks the owning
+    /// reactor to actually push the bytes onto the wire, without blocking or
+    /// busy-polling.
+    pub fn poke(&self) {
+        self.with_endpoint(|ep| ep.poke_handler());
+    }
 }

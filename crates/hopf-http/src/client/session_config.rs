@@ -3,6 +3,7 @@
 //! Shared configuration for [`super::connection::HttpClientConnection`] session adapters.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::limits::HttpLimits;
 
@@ -15,4 +16,7 @@ pub(crate) struct HttpClientSessionConfig {
     pub limits: HttpLimits,
     pub secure: bool,
     pub handler: Mutex<Option<Box<dyn HttpConnectionHandler>>>,
+    /// [`crate::HttpClientTimeouts::stage`] — budget for one request/response
+    /// round trip once bytes are on the wire. `Duration::ZERO` disables it.
+    pub stage: Duration,
 }

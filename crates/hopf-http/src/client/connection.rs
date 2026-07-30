@@ -144,6 +144,13 @@ impl ProtocolHandler for HttpClientConnection {
     fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
         if let Some(inner) = self.inner.as_mut() {
             inner.disconnected(endpoint);
+        } else if let Some(mut h) = self.config.handler.lock().unwrap().take() {
+            // Peer closed before negotiation ever got an H1/H2 session
+            // installed — `on_connected` can never fire now.
+            h.on_error(&std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before negotiation completed",
+            ));
         }
     }
 
@@ -151,6 +158,15 @@ impl ProtocolHandler for HttpClientConnection {
         if let Some(inner) = self.inner.as_mut() {
             inner.error(endpoint, err);
         } else {
+            // Failed before an H1/H2 session was even installed (e.g. TLS
+            // handshake failure, or connect-refused/reset delivered before
+            // `connected`/`security_established`) — `on_connected` can
+            // never have fired, so the stashed `HttpConnectionHandler` is
+            // still sitting in `config.handler` and would otherwise just be
+            // dropped with zero notification (issue #88).
+            if let Some(mut h) = self.config.handler.lock().unwrap().take() {
+                h.on_error(err);
+            }
             endpoint.close();
         }
     }

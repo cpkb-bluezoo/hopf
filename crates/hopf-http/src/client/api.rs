@@ -10,6 +10,8 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use hopf_core::ConnHandle;
+
 use crate::headers::Headers;
 use crate::version::HttpVersion;
 
@@ -79,16 +81,42 @@ pub trait HttpResponseHandler: Send {
 pub struct HttpClientSessionHandle {
     pub(crate) ops: Arc<Mutex<dyn SessionRequestOps + Send>>,
     version: HttpVersion,
+    conn_handle: Option<ConnHandle>,
 }
 
 impl HttpClientSessionHandle {
-    pub(crate) fn new(ops: Arc<Mutex<dyn SessionRequestOps + Send>>, version: HttpVersion) -> Self {
-        Self { ops, version }
+    pub(crate) fn new(
+        ops: Arc<Mutex<dyn SessionRequestOps + Send>>,
+        version: HttpVersion,
+        conn_handle: Option<ConnHandle>,
+    ) -> Self {
+        Self {
+            ops,
+            version,
+            conn_handle,
+        }
     }
 
     /// Negotiated protocol version.
     pub fn version(&self) -> HttpVersion {
         self.version
+    }
+
+    /// A cloneable handle to this connection's reactor.
+    ///
+    /// Stash this (e.g. in [`HttpConnectionHandler::on_connected`]) to push
+    /// bytes into a deferred request body — via [`HttpRequest::request_body_content`]
+    /// — from a *different* connection's callback (e.g. bytes arriving on an
+    /// SMTP DATA connection, being teed into an HTTP PUT). After such an
+    /// out-of-band `request_body_content`/[`HttpRequest::end_request_body`]
+    /// call, call [`ConnHandle::poke`] on this handle to ask this HTTP
+    /// connection's own reactor to flush the newly queued bytes onto the
+    /// wire without waiting for its own next I/O event.
+    ///
+    /// `None` only for handles that have no owning TCP connection at all
+    /// (test/mock session construction).
+    pub fn conn_handle(&self) -> Option<ConnHandle> {
+        self.conn_handle.clone()
     }
 
     /// Whether multiple requests may be in flight (HTTP/2+).
@@ -174,6 +202,11 @@ pub(crate) trait SessionRequestOps: Send {
     fn body_content(&mut self, data: &[u8]) -> Result<usize, HttpClientError>;
     fn end_body(&mut self) -> Result<(), HttpClientError>;
     fn cancel_request(&mut self) -> Result<(), HttpClientError>;
+    /// Register a one-shot callback for when `body_content` can accept more
+    /// bytes, after it returned a short write. Default no-op for
+    /// implementations that never short-write. Runs on the connection's own
+    /// reactor thread once registered.
+    fn on_body_writable(&mut self, _cb: Box<dyn FnOnce() + Send>) {}
 }
 
 impl HttpRequest {
@@ -239,11 +272,31 @@ impl HttpRequest {
     }
 
     /// Stream request body bytes (after [`Self::start_request_body`]).
+    ///
+    /// May accept fewer bytes than given (a short write) if the connection's
+    /// outbound buffer or, on HTTP/2, the stream's flow-control window is
+    /// currently full — never silently buffers unbounded bytes. On a short
+    /// write, register [`Self::on_body_writable`] and retry the remainder
+    /// once it fires, rather than looping tightly on this call.
     pub fn request_body_content(&mut self, data: &[u8]) -> Result<usize, HttpClientError> {
         if self.phase != RequestPhase::BodyStreaming {
             return Err(HttpClientError::new("must call start_request_body first"));
         }
         self.session.lock().unwrap().body_content(data)
+    }
+
+    /// Register a one-shot callback for when [`Self::request_body_content`]
+    /// can accept more bytes, after it returned a short write.
+    ///
+    /// Fires on the HTTP connection's own reactor thread — safe to call
+    /// `request_body_content` again from directly inside it. Only one
+    /// callback is held at a time; registering again replaces it.
+    pub fn on_body_writable(&mut self, cb: Box<dyn FnOnce() + Send>) -> Result<(), HttpClientError> {
+        if self.phase != RequestPhase::BodyStreaming {
+            return Err(HttpClientError::new("must call start_request_body first"));
+        }
+        self.session.lock().unwrap().on_body_writable(cb);
+        Ok(())
     }
 
     /// Finish the request body.

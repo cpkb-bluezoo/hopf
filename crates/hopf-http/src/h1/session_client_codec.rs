@@ -4,6 +4,9 @@
 
 use std::io;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use hopf_core::{ConnHandle, Endpoint, TimerHandle};
 
 use crate::client::api::{
     HttpClientError, HttpClientSessionHandle, HttpConnectionHandler, HttpResponseHandler,
@@ -32,6 +35,15 @@ enum ParseState {
 /// Configuration for [`H1SessionClientCodec`].
 pub(crate) use crate::client::session_config::HttpClientSessionConfig as H1SessionConfig;
 
+/// Soft cap on bytes buffered in [`H1SessionInner::out`] between flushes.
+///
+/// `request_body_content` short-writes once this is reached instead of
+/// growing `out` unboundedly while the producer outruns the reactor's
+/// chance to actually flush to the socket (e.g. a cross-connection
+/// producer that never gives this connection an I/O event of its own —
+/// see [`hopf_core::ConnHandle::poke`]).
+const MAX_UNFLUSHED_BODY: usize = 256 * 1024;
+
 pub(crate) struct H1SessionClientCodec {
     scanner: H1Scanner,
     inner: Arc<Mutex<H1SessionInner>>,
@@ -50,7 +62,7 @@ impl H1SessionClientCodec {
         Arc::new(Mutex::new(OpsBridge(Arc::clone(&self.inner))))
     }
 
-    pub fn on_connected(&mut self) {
+    pub fn on_connected(&mut self, conn_handle: ConnHandle) {
         let ops = self.request_ops();
         let handler = {
             let mut inner = self.inner.lock().unwrap();
@@ -63,7 +75,8 @@ impl H1SessionClientCodec {
             h
         };
         if let Some(mut h) = handler {
-            let mut session = HttpClientSessionHandle::new(ops, HttpVersion::Http11);
+            let mut session =
+                HttpClientSessionHandle::new(ops, HttpVersion::Http11, Some(conn_handle));
             h.on_connected(&mut session);
         }
     }
@@ -86,13 +99,42 @@ impl H1SessionClientCodec {
         inner.take_error()
     }
 
+    /// A transport-level failure (connect refused/reset, TLS handshake
+    /// failure, …) reached this connection — see
+    /// [`H1SessionInner::fail_transport`].
+    pub fn fail_transport(&mut self, err: io::Error) {
+        self.inner.lock().unwrap().fail_transport(err);
+    }
+
+    /// (Re)arm the [`crate::HttpClientTimeouts::stage`] timer if a request
+    /// is in flight — see [`H1SessionInner::arm_stage_timer`]. A no-op
+    /// otherwise (nothing to time out).
+    pub fn touch_stage_timer(&mut self, ep: &mut dyn Endpoint) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.in_flight {
+            inner.arm_stage_timer(ep);
+        }
+    }
+
     pub fn close(&mut self) -> HttpResult<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.close()
     }
 
     pub fn take_outbound(&mut self) -> Vec<u8> {
-        self.inner.lock().unwrap().take_outbound()
+        // `out` is always empty afterward, so any registered short-write
+        // backpressure callback can now safely accept more body bytes. Fire
+        // it only after releasing the lock — it commonly calls straight
+        // back into `request_body_content`, which would deadlock on a
+        // still-held `std::sync::Mutex`.
+        let (out, cb) = {
+            let mut inner = self.inner.lock().unwrap();
+            (inner.take_outbound(), inner.take_writable_callback())
+        };
+        if let Some(cb) = cb {
+            cb();
+        }
+        out
     }
 
     pub fn wants_close(&self) -> bool {
@@ -120,6 +162,12 @@ struct H1SessionInner {
     req_chunked: bool,
     body_complete: bool,
     fatal: Option<HttpError>,
+    writable_callback: Option<Box<dyn FnOnce() + Send>>,
+    /// [`crate::HttpClientTimeouts::stage`] budget for the current request —
+    /// armed once its bytes hit the wire, renewed on every byte of response
+    /// progress, cancelled once the response completes. See
+    /// [`Self::arm_stage_timer`].
+    stage_timer: Option<TimerHandle>,
 }
 
 impl H1SessionInner {
@@ -144,6 +192,8 @@ impl H1SessionInner {
             req_chunked: false,
             body_complete: false,
             fatal: None,
+            writable_callback: None,
+            stage_timer: None,
         }
     }
 
@@ -160,8 +210,37 @@ impl H1SessionInner {
         std::mem::take(&mut self.out)
     }
 
+    /// Take any registered short-write resume callback (see
+    /// [`MAX_UNFLUSHED_BODY`]) without invoking it — the caller must run it
+    /// only after releasing the lock on this struct, since the callback
+    /// commonly calls straight back into `request_body_content`.
+    fn take_writable_callback(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.writable_callback.take()
+    }
+
     fn wants_close(&self) -> bool {
         self.close_connection || self.fatal.is_some() || self.state == ParseState::Done
+    }
+
+    /// A transport-level failure (DNS, connect, TLS handshake, or a later
+    /// reset) reached this connection — notify whoever can still hear about
+    /// it and nobody else, matching how [`crate::HttpConnectionHandler`] and
+    /// [`crate::HttpResponseHandler`] are each scoped: the connection
+    /// handler only ever runs once, at `on_connected`, so if that hasn't
+    /// happened yet it's still sitting in `config.handler` and gets
+    /// `on_error`; otherwise, whatever request is currently in flight gets
+    /// `failed()` — there's nothing to notify if neither applies (an idle
+    /// connection between requests has no active listener for this).
+    fn fail_transport(&mut self, err: io::Error) {
+        if !self.connected_notified {
+            if let Some(mut h) = self.config.handler.lock().unwrap().take() {
+                h.on_error(&err);
+            }
+            return;
+        }
+        if let Some(mut h) = self.response_handler.take() {
+            h.failed(err);
+        }
     }
 
     fn take_error(&mut self) -> HttpResult<()> {
@@ -177,9 +256,40 @@ impl H1SessionInner {
         }
         self.close_connection = true;
         self.fatal = Some(err);
+        self.cancel_stage_timer();
         if let Some(mut h) = self.response_handler.take() {
             h.failed(io::Error::new(io::ErrorKind::Other, "HTTP protocol error"));
         }
+    }
+
+    fn cancel_stage_timer(&mut self) {
+        if let Some(t) = self.stage_timer.take() {
+            t.cancel();
+        }
+    }
+
+    /// (Re)arm the stage timer, canceling any previous one. Call whenever
+    /// there's fresh activity for the in-flight request — bytes just sent,
+    /// or a byte of response just parsed — so a still-progressing request
+    /// doesn't spuriously time out; a genuinely stalled peer still does.
+    fn arm_stage_timer(&mut self, ep: &mut dyn Endpoint) {
+        self.cancel_stage_timer();
+        if self.config.stage.is_zero() {
+            return;
+        }
+        let handle = ep.handle();
+        let timer = ep.schedule_timer(
+            self.config.stage,
+            Box::new(move || {
+                handle.with_endpoint(|ep2| {
+                    ep2.fail(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "HTTP client stage timed out",
+                    ));
+                });
+            }),
+        );
+        self.stage_timer = Some(timer);
     }
 
     fn fail_stop(&mut self, err: HttpError) -> Next {
@@ -234,6 +344,11 @@ impl H1SessionInner {
         if self.body_complete {
             return 0;
         }
+        let available = MAX_UNFLUSHED_BODY.saturating_sub(self.out.len());
+        if available == 0 {
+            return 0;
+        }
+        let data = &data[..data.len().min(available)];
         if self.req_chunked {
             let hdr = format!("{:x}\r\n", data.len());
             self.out.extend_from_slice(hdr.as_bytes());
@@ -284,6 +399,7 @@ impl H1SessionInner {
     }
 
     fn finish_response(&mut self) {
+        self.cancel_stage_timer();
         if let Some(mut h) = self.response_handler.take() {
             if self.body_started {
                 h.end_response_body();
@@ -471,6 +587,10 @@ impl SessionRequestOps for OpsBridge {
         inner.state = ParseState::Idle;
         Ok(())
     }
+
+    fn on_body_writable(&mut self, cb: Box<dyn FnOnce() + Send>) {
+        self.0.lock().unwrap().writable_callback = Some(cb);
+    }
 }
 
 impl H1Events for H1SessionInner {
@@ -638,9 +758,10 @@ mod tests {
             handler: Mutex::new(Some(Box::new(Conn {
                 rec: Arc::clone(&rec),
             }))),
+            stage: Duration::ZERO,
         });
         let mut codec = H1SessionClientCodec::new(config);
-        codec.on_connected();
+        codec.on_connected(ConnHandle::from_execute(Arc::new(|task| task())));
         let req = String::from_utf8(codec.take_outbound()).unwrap();
         assert!(req.starts_with("POST / HTTP/1.1\r\n"));
         assert!(req.to_ascii_lowercase().contains("content-type: application/json"));
@@ -653,5 +774,76 @@ mod tests {
         assert_eq!(g.status, 200);
         assert_eq!(g.body, b"hello");
         assert!(g.done);
+    }
+
+    struct NullHandler;
+
+    impl HttpResponseHandler for NullHandler {
+        fn ok(&mut self, _status: u16) {}
+        fn error(&mut self, _status: u16) {}
+        fn header(&mut self, _name: &str, _value: &str) {}
+        fn response_body_content(&mut self, _data: &[u8]) {}
+        fn close(&mut self) {}
+        fn failed(&mut self, _err: io::Error) {}
+    }
+
+    struct BodyConn {
+        req_slot: Arc<Mutex<Option<crate::client::api::HttpRequest>>>,
+    }
+
+    impl HttpConnectionHandler for BodyConn {
+        fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+            let mut req = session.post("/upload");
+            req.start_request_body(Box::new(NullHandler)).unwrap();
+            *self.req_slot.lock().unwrap() = Some(req);
+        }
+    }
+
+    #[test]
+    fn request_body_content_short_writes_past_cap_then_resumes_after_flush() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let req_slot = Arc::new(Mutex::new(None));
+        let config = Arc::new(H1SessionConfig {
+            host: "ex.com".into(),
+            port: 80,
+            limits: HttpLimits::default(),
+            secure: false,
+            handler: Mutex::new(Some(Box::new(BodyConn {
+                req_slot: Arc::clone(&req_slot),
+            }))),
+            stage: Duration::ZERO,
+        });
+        let mut codec = H1SessionClientCodec::new(config);
+        codec.on_connected(ConnHandle::from_execute(Arc::new(|task| task())));
+        // Drop the request-line bytes `start_request_body` already queued.
+        codec.take_outbound();
+
+        let mut req = req_slot.lock().unwrap().take().unwrap();
+        let big = vec![b'x'; MAX_UNFLUSHED_BODY + 1000];
+        let accepted = req.request_body_content(&big).unwrap();
+        assert!(
+            accepted < big.len() && accepted > 0,
+            "expected a short write, got {accepted} of {}",
+            big.len()
+        );
+
+        let resumed = Arc::new(AtomicBool::new(false));
+        let resumed2 = Arc::clone(&resumed);
+        req.on_body_writable(Box::new(move || resumed2.store(true, Ordering::SeqCst)))
+            .unwrap();
+
+        // A flush drains `out` back to empty, so the callback should fire.
+        let flushed = codec.take_outbound();
+        assert!(!flushed.is_empty());
+        assert!(
+            resumed.load(Ordering::SeqCst),
+            "writable callback should fire once buffered bytes are flushed"
+        );
+
+        // The remainder is now accepted in full.
+        let remainder = &big[accepted..];
+        let accepted2 = req.request_body_content(remainder).unwrap();
+        assert_eq!(accepted2, remainder.len());
     }
 }
