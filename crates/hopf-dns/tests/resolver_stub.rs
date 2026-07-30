@@ -793,3 +793,400 @@ fn validate_denial_of_existence_proves_a_real_nxdomain_over_the_network() {
     );
     rt.shutdown();
 }
+
+/// A stub TCP DNS server that keeps each accepted connection open across
+/// multiple length-prefixed queries (RFC 7766 keep-alive), answering every
+/// question with a fixed A record. Returns the bound address and a counter
+/// of how many *connections* (not queries) it has accepted.
+fn spawn_keepalive_tcp_stub() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept_count = Arc::new(AtomicUsize::new(0));
+    let accept_count2 = Arc::clone(&accept_count);
+
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                break;
+            };
+            accept_count2.fetch_add(1, Ordering::SeqCst);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            thread::spawn(move || loop {
+                let mut len_buf = [0u8; 2];
+                if stream.read_exact(&mut len_buf).is_err() {
+                    return;
+                }
+                let len = u16::from_be_bytes(len_buf) as usize;
+                let mut payload = vec![0u8; len];
+                if stream.read_exact(&mut payload).is_err() {
+                    return;
+                }
+                let Ok(q) = DnsMessage::parse(&payload) else {
+                    return;
+                };
+                let mut resp = q.response_template(0);
+                resp.flags |= FLAG_QR;
+                if let Some(question) = q.questions.first() {
+                    resp.answers
+                        .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 9)));
+                }
+                let bytes = resp.serialize().unwrap();
+                let mut out = Vec::with_capacity(2 + bytes.len());
+                out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                out.extend_from_slice(&bytes);
+                if stream.write_all(&out).is_err() {
+                    return;
+                }
+            });
+        }
+    });
+
+    (addr, accept_count)
+}
+
+/// Proves the fix for issue #54: `TcpDnsConnectionPool` must actually reuse
+/// a live connection across queries to the same server, not dial fresh
+/// every time — driven against a real keep-alive TCP stub, counting actual
+/// accepted connections.
+#[test]
+fn tcp_connection_pool_reuses_a_connection_across_queries() {
+    use hopf_dns::client::TcpDnsConnectionPool;
+    use hopf_dns::wire::{DnsQuestion, DnsType};
+
+    let (addr, accept_count) = spawn_keepalive_tcp_stub();
+    let mut pool = TcpDnsConnectionPool::new();
+
+    let q1 = DnsQuestion::in_class("pool-test-1.example", DnsType::A);
+    let r1 = pool.query(addr, &q1, 1).unwrap();
+    assert_eq!(r1.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 9)));
+
+    let q2 = DnsQuestion::in_class("pool-test-2.example", DnsType::A);
+    let r2 = pool.query(addr, &q2, 2).unwrap();
+    assert_eq!(r2.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 9)));
+
+    assert_eq!(
+        accept_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the second query must reuse the pooled connection, not dial a fresh one"
+    );
+}
+
+/// A pooled connection that the *server* has since closed (e.g. an idle
+/// timeout) must be transparently replaced with a fresh one — not
+/// surfaced as a query failure.
+#[test]
+fn tcp_connection_pool_recovers_from_a_stale_pooled_connection() {
+    use hopf_dns::client::TcpDnsConnectionPool;
+    use hopf_dns::wire::{DnsQuestion, DnsType};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        use std::io::{Read, Write};
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                break;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut len_buf = [0u8; 2];
+            if stream.read_exact(&mut len_buf).is_err() {
+                continue;
+            }
+            let len = u16::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            if stream.read_exact(&mut payload).is_err() {
+                continue;
+            }
+            let Ok(q) = DnsMessage::parse(&payload) else {
+                continue;
+            };
+            let mut resp = q.response_template(0);
+            resp.flags |= FLAG_QR;
+            if let Some(question) = q.questions.first() {
+                resp.answers
+                    .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 10)));
+            }
+            let bytes = resp.serialize().unwrap();
+            let mut out = Vec::with_capacity(2 + bytes.len());
+            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            out.extend_from_slice(&bytes);
+            let _ = stream.write_all(&out);
+            // Simulate a server-side idle timeout: close right after
+            // answering, instead of looping for another query.
+        }
+    });
+
+    let mut pool = TcpDnsConnectionPool::new();
+    let q1 = DnsQuestion::in_class("stale-test-1.example", DnsType::A);
+    let r1 = pool.query(addr, &q1, 1).unwrap();
+    assert_eq!(r1.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 10)));
+
+    // The pooled connection is now closed on the server side; this must
+    // still succeed by silently reconnecting, not error out.
+    let q2 = DnsQuestion::in_class("stale-test-2.example", DnsType::A);
+    let r2 = pool.query(addr, &q2, 2).expect("must recover from a stale pooled connection");
+    assert_eq!(r2.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 10)));
+}
+
+/// Same proof as [`tcp_connection_pool_reuses_a_connection_across_queries`]
+/// but for DoT: a real self-signed-TLS stub server, driven through
+/// `TcpDnsConnectionPool::query_dot`, must only complete one TLS handshake
+/// across two queries — the second must reuse the already-established
+/// session, not redial and re-handshake.
+#[cfg(feature = "dot")]
+#[test]
+fn dot_connection_pool_reuses_a_connection_across_queries() {
+    use hopf_core::{Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
+    use hopf_dns::client::TcpDnsConnectionPool;
+    use hopf_dns::wire::{DnsQuestion, DnsType};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "hopf-dns-dot-pool-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+    let acceptor = hopf_tls::acceptor_from_pem(&cert_path, &key_path, &[b"dot"]).unwrap();
+    let connector = hopf_tls::connector_from_pem(&cert_path, &[b"dot"]).unwrap();
+
+    struct DotStub {
+        connect_count: Arc<AtomicUsize>,
+        buf: Vec<u8>,
+    }
+    impl ProtocolHandler for DotStub {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
+            self.connect_count.fetch_add(1, Ordering::SeqCst);
+        }
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            while self.buf.len() >= 2 {
+                let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
+                if self.buf.len() < 2 + len {
+                    break;
+                }
+                let payload = self.buf[2..2 + len].to_vec();
+                self.buf.drain(..2 + len);
+                let Ok(q) = DnsMessage::parse(&payload) else {
+                    continue;
+                };
+                let mut resp = q.response_template(0);
+                resp.flags |= FLAG_QR;
+                if let Some(question) = q.questions.first() {
+                    resp.answers
+                        .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 20)));
+                }
+                let bytes = resp.serialize().unwrap();
+                let mut out = Vec::with_capacity(2 + bytes.len());
+                out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                out.extend_from_slice(&bytes);
+                endpoint.send(&out);
+            }
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let cc = Arc::clone(&connect_count);
+    let rt = Runtime::start(RuntimeConfig {
+        worker_threads: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let (addr, _) = rt
+        .add_tcp_listener(
+            TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+                Box::new(DotStub {
+                    connect_count: Arc::clone(&cc),
+                    buf: Vec::new(),
+                }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(acceptor),
+        )
+        .unwrap();
+
+    let mut pool = TcpDnsConnectionPool::new();
+    let q1 = DnsQuestion::in_class("dot-pool-1.example", DnsType::A);
+    let r1 = pool.query_dot(addr, "localhost", &connector, &q1, 1).unwrap();
+    assert_eq!(r1.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 20)));
+
+    let q2 = DnsQuestion::in_class("dot-pool-2.example", DnsType::A);
+    let r2 = pool.query_dot(addr, "localhost", &connector, &q2, 2).unwrap();
+    assert_eq!(r2.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 20)));
+
+    assert_eq!(
+        connect_count.load(Ordering::SeqCst),
+        1,
+        "the second DoT query must reuse the pooled TLS connection, not redial and re-handshake"
+    );
+    rt.shutdown();
+}
+
+/// Proves the fix for issue #57: `DohClientTransport::with_get(true)` must
+/// send a real RFC 8484 §4.1 GET request — the DNS wire message base64url
+/// -encoded into the `dns` query parameter, no body — and correctly
+/// receive the response back, driven over a real TLS+HTTP stub server that
+/// decodes the parameter itself and checks it byte-for-byte matches what
+/// was sent. Also proves the existing POST path still works against the
+/// same stub, for direct comparison.
+#[cfg(feature = "doh")]
+#[test]
+fn doh_get_and_post_round_trip_over_a_real_tls_http_stub() {
+    use hopf_core::{Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
+    use hopf_dns::client::{DnsClientTransport, DnsClientTransportHandler, DohClientTransport};
+    use hopf_dns::wire::{DnsQuestion, DnsType};
+    use std::sync::mpsc;
+
+    fn base64url_decode(s: &str) -> Vec<u8> {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = Vec::new();
+        let mut bits: u32 = 0;
+        let mut bit_count: u32 = 0;
+        for c in s.bytes() {
+            let Some(val) = ALPHABET.iter().position(|&b| b == c) else {
+                break;
+            };
+            bits = (bits << 6) | val as u32;
+            bit_count += 6;
+            if bit_count >= 8 {
+                bit_count -= 8;
+                out.push(((bits >> bit_count) & 0xFF) as u8);
+            }
+        }
+        out
+    }
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "hopf-dns-doh-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+    let acceptor = hopf_tls::acceptor_from_pem(&cert_path, &key_path, &[b"http/1.1"]).unwrap();
+    let connector = hopf_tls::connector_from_pem(&cert_path, &[b"http/1.1"]).unwrap();
+
+    struct DohStubHandler {
+        buf: Vec<u8>,
+    }
+    impl ProtocolHandler for DohStubHandler {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            let Some(header_end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
+                return;
+            };
+            let head = std::str::from_utf8(&self.buf[..header_end]).unwrap().to_string();
+            let request_line = head.lines().next().unwrap();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap();
+            let target = parts.next().unwrap();
+
+            let body: Vec<u8> = if method == "GET" {
+                let dns_param = target.split("dns=").nth(1).expect("dns= query param");
+                base64url_decode(dns_param)
+            } else {
+                let content_length: usize = head
+                    .lines()
+                    .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                if self.buf.len() < header_end + content_length {
+                    // Body not fully arrived yet — wait for more data.
+                    return;
+                }
+                self.buf[header_end..header_end + content_length].to_vec()
+            };
+
+            let Ok(q) = DnsMessage::parse(&body) else {
+                return;
+            };
+            let mut resp = q.response_template(0);
+            resp.flags |= FLAG_QR;
+            if let Some(question) = q.questions.first() {
+                resp.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 30)));
+            }
+            let resp_bytes = resp.serialize().unwrap();
+            let http_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+                resp_bytes.len()
+            );
+            let mut out = http_resp.into_bytes();
+            out.extend_from_slice(&resp_bytes);
+            endpoint.send(&out);
+            self.buf.clear();
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    let rt = Runtime::start(RuntimeConfig {
+        worker_threads: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let (addr, _) = rt
+        .add_tcp_listener(
+            TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                Box::new(DohStubHandler { buf: Vec::new() }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(acceptor),
+        )
+        .unwrap();
+
+    struct ChannelHandler(mpsc::Sender<io::Result<Vec<u8>>>);
+    impl DnsClientTransportHandler for ChannelHandler {
+        fn on_response(&mut self, _server: std::net::SocketAddr, data: &[u8]) {
+            let _ = self.0.send(Ok(data.to_vec()));
+        }
+        fn on_error(&mut self, _server: std::net::SocketAddr, err: io::Error) {
+            let _ = self.0.send(Err(err));
+        }
+    }
+
+    let rt_arc = Arc::new(rt);
+
+    // GET.
+    let mut get_transport =
+        DohClientTransport::https(Arc::clone(&rt_arc), "localhost", "/dns-query", Arc::clone(&connector)).with_get(true);
+    let q1 = DnsMessage::query(1, DnsQuestion::in_class("doh-get-test.example", DnsType::A), true);
+    let q1_bytes = q1.serialize().unwrap();
+    let (tx1, rx1) = mpsc::channel();
+    get_transport.send_query(addr, &q1_bytes, Box::new(ChannelHandler(tx1))).unwrap();
+    let resp1 = rx1.recv_timeout(Duration::from_secs(5)).unwrap().expect("GET query must succeed");
+    let parsed1 = DnsMessage::parse(&resp1).unwrap();
+    assert_eq!(parsed1.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 30)));
+
+    // POST (existing default path), against the same stub.
+    let mut post_transport = DohClientTransport::https(Arc::clone(&rt_arc), "localhost", "/dns-query", connector);
+    let q2 = DnsMessage::query(2, DnsQuestion::in_class("doh-post-test.example", DnsType::A), true);
+    let q2_bytes = q2.serialize().unwrap();
+    let (tx2, rx2) = mpsc::channel();
+    post_transport.send_query(addr, &q2_bytes, Box::new(ChannelHandler(tx2))).unwrap();
+    let resp2 = rx2.recv_timeout(Duration::from_secs(5)).unwrap().expect("POST query must succeed");
+    let parsed2 = DnsMessage::parse(&resp2).unwrap();
+    assert_eq!(parsed2.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 30)));
+
+    // `rt_arc` is still referenced by in-flight/idle DoH connection state
+    // at this point, so an owning `shutdown()` isn't reachable here — drop
+    // it instead, matching how the standalone DNS examples in this crate
+    // already do (they never call `Runtime::shutdown` either).
+    drop(rt_arc);
+}

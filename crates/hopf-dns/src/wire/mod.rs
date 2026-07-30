@@ -17,8 +17,8 @@ pub use class::DnsClass;
 pub use error::DnsFormatError;
 pub use message::{
     FLAG_AA, FLAG_AD, FLAG_CD, FLAG_QR, FLAG_RA, FLAG_RD, FLAG_TC, HEADER_SIZE, OPCODE_QUERY,
-    RCODE_FORMERR, RCODE_NOERROR, RCODE_NOTIMP, RCODE_NXDOMAIN, RCODE_REFUSED, RCODE_SERVFAIL,
-    DnsMessage,
+    RCODE_BADVERS, RCODE_FORMERR, RCODE_NOERROR, RCODE_NOTIMP, RCODE_NXDOMAIN, RCODE_REFUSED,
+    RCODE_SERVFAIL, DnsMessage,
 };
 pub use name::{canonical_compare, decode_name, encode_name, normalize_name};
 pub use query_id::DnsQueryIdGenerator;

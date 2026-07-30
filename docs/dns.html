@@ -100,12 +100,16 @@
 <td>Wire format / RRs</td>
 </tr>
 <tr>
-<td>EDNS0</td>
-<td>OPT, DO bit, UDP payload <strong>4096</strong></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc6891">RFC 6891</a></td>
+<td>EDNS0: OPT, DO bit, UDP payload <strong>4096</strong>, extended RCODE/VERSION read+write (<code>DnsResourceRecord::edns_extended_rcode</code>/<code>edns_version</code>/<code>edns_full_rcode</code>/<code>with_edns_rcode_version</code>)</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc7830">RFC 7830</a></td>
+<td>EDNS Padding option codec (<code>encode_edns_padding</code>/<code>edns_padding_length</code>) — not automatically applied to any transport, callers compose it into their own OPT options</td>
 </tr>
 <tr>
 <td><a href="https://www.rfc-editor.org/rfc/rfc7873">RFC 7873</a></td>
-<td>DNS Cookies (<code>DnsCookie</code>)</td>
+<td>DNS Cookies, client + server side (<code>DnsCookie</code>)</td>
 </tr>
 <tr>
 <td>—</td>
@@ -116,12 +120,16 @@
 <td>DNS over TLS (DoT)</td>
 </tr>
 <tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc7766">RFC 7766</a> §6.2.1</td>
+<td>TCP/DoT connection pooling — <code>TcpDnsConnectionPool</code> reuses a live connection per destination server across queries, transparently reconnecting if the peer has since closed it</td>
+</tr>
+<tr>
 <td><a href="https://www.rfc-editor.org/rfc/rfc9250">RFC 9250</a></td>
-<td>DNS over QUIC (DoQ)</td>
+<td>DNS over QUIC (DoQ): message ID zeroed both directions (§4.2.1); <code>DOQ_*</code> error-code constants, malformed query aborts the stream with <code>DOQ_PROTOCOL_ERROR</code> (§4.3)</td>
 </tr>
 <tr>
 <td><a href="https://www.rfc-editor.org/rfc/rfc8484">RFC 8484</a></td>
-<td>DNS over HTTPS (DoH POST)</td>
+<td>DNS over HTTPS: both POST and GET (<code>DohClientTransport::with_get</code>, base64url `dns` query parameter)</td>
 </tr>
 <tr>
 <td><a href="https://www.rfc-editor.org/rfc/rfc4034">RFC 4034</a> / <a href="https://www.rfc-editor.org/rfc/rfc4035">4035</a></td>
@@ -153,7 +161,7 @@
 <p><strong>Query helpers:</strong> <code>query_a</code>, <code>query_aaaa</code>, <code>query_mx</code>, <code>query_txt</code>, <code>query_ptr</code>, <code>query_srv</code>, generic <code>query(DnsQuestion, …)</code>.</p>
 <p><strong>Happy Eyeballs:</strong> <code>resolve(host, port, ResolveCallback)</code> — parallel A+AAAA, IPv6-first ordering.</p>
 <p><strong>Helpers:</strong> <code>HostsFile</code>, <code>parse_literal_ip</code>, <code>DnsCache</code>, <code>DnsCookie</code>, bailiwick filters (<code>filter_answers_in_bailiwick</code>, <code>is_within_bailiwick</code>, <code>names_equal</code>).</p>
-<p>Wire types: <code>DnsMessage</code>, <code>DnsQuestion</code>, <code>DnsResourceRecord</code>, <code>DnsType</code>, <code>DnsClass</code>, <code>DnsQueryIdGenerator</code>, <code>DnsFormatError</code>, plus <code>FLAG_*</code> / <code>RCODE_*</code> / <code>OPCODE_QUERY</code> / <code>EDNS_FLAG_DO</code> / <code>OPT_UDP_PAYLOAD</code> constants.</p>
+<p>Wire types: <code>DnsMessage</code>, <code>DnsQuestion</code>, <code>DnsResourceRecord</code>, <code>DnsType</code>, <code>DnsClass</code>, <code>DnsQueryIdGenerator</code>, <code>DnsFormatError</code>, plus <code>FLAG_*</code> / <code>RCODE_*</code> (including <code>RCODE_BADVERS</code>) / <code>OPCODE_QUERY</code> / <code>EDNS_FLAG_DO</code> / <code>OPT_UDP_PAYLOAD</code> / <code>EDNS_OPTION_PADDING</code> constants.</p>
 <h2 id="caching-forwarder-server-feature">Caching forwarder (server feature)</h2>
 <p>Enable Cargo feature <code>server</code>:</p>
 <table>
@@ -225,8 +233,9 @@
 </tbody>
 </table>
 <p>Traits: <code>DnsClientTransport</code>, <code>DnsClientTransportHandler</code>. Each <code>send_query</code> schedules I/O and returns immediately; responses arrive via the handler callback — there is no blocking query API.</p>
-<p>DoH (<code>DohClientTransport</code>) and DoQ (<code>DoqClientTransport</code>) are <code>DnsClientTransport</code> implementations: DoH dials HTTP/1.1 POST on a shared <code>Arc&lt;Runtime&gt;</code>; DoQ dials via <code>hopf-quic</code>. Neither waits on the caller thread.</p>
-<p>DoT client uses <code>hopf-tls</code> when feature <code>dot</code> is enabled.</p>
+<p>DoH (<code>DohClientTransport</code>) and DoQ (<code>DoqClientTransport</code>) are <code>DnsClientTransport</code> implementations: DoH dials HTTP/1.1 (POST by default, or GET via <code>with_get(true)</code>) on a shared <code>Arc&lt;Runtime&gt;</code>; DoQ dials via <code>hopf-quic</code>, zeroing the DNS message ID both directions (RFC 9250 §4.2.1). Neither waits on the caller thread.</p>
+<p>DoT client uses <code>hopf-tls</code> when feature <code>dot</code> is enabled. <code>TcpDnsConnectionPool</code> (shared by plain TCP and DoT) reuses a live connection per destination server across queries instead of dialing fresh every time, transparently reconnecting (and, for DoT, re-handshaking) if a reused connection turns out to be stale.</p>
+<p><strong>DoQ limitations:</strong> every query still dials a brand-new QUIC connection — no session-ticket caching, 0-RTT, or cross-query connection reuse (RFC 9250 §4.5/§5.5.1) — and EDNS Padding (<code>encode_edns_padding</code>, RFC 7830/RFC 9250 §5.4) isn't automatically applied to DoQ/DoT queries, though the codec is available for a caller to compose in.</p>
 <h2 id="dnssec">DNSSEC</h2>
 <p>Feature <code>dnssec</code> (+ <code>ring</code>):</p>
 <table>

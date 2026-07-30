@@ -2,15 +2,23 @@
 
 //! TCP DNS client + connection pool (RFC 7766); DoT via TLS when `dot` feature.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use crate::wire::{DnsMessage, DnsQuestion};
 
-/// Persistent TCP/DoT connection pool.
+/// Persistent TCP/DoT connection pool (RFC 7766 §6.2.1): a live connection
+/// per destination server is kept and reused across queries rather than
+/// dialled fresh every time. A reused connection that turns out to be
+/// stale (e.g. idle-timed-out by the server) is transparently dropped and
+/// replaced with a fresh one — the caller never sees the difference.
 pub struct TcpDnsConnectionPool {
     timeout: Duration,
+    connections: HashMap<SocketAddr, TcpStream>,
+    #[cfg(feature = "dot")]
+    dot_connections: HashMap<SocketAddr, (TcpStream, Box<dyn hopf_core::TlsSession>)>,
 }
 
 impl Default for TcpDnsConnectionPool {
@@ -24,10 +32,14 @@ impl TcpDnsConnectionPool {
     pub fn new() -> Self {
         Self {
             timeout: Duration::from_secs(5),
+            connections: HashMap::new(),
+            #[cfg(feature = "dot")]
+            dot_connections: HashMap::new(),
         }
     }
 
-    /// Length-prefixed TCP query (RFC 1035 §4.2.2).
+    /// Length-prefixed TCP query (RFC 1035 §4.2.2), reusing a pooled
+    /// connection to `server` when one is available.
     pub fn query(
         &mut self,
         server: SocketAddr,
@@ -38,21 +50,38 @@ impl TcpDnsConnectionPool {
         let payload = msg
             .serialize()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        if let Some(mut stream) = self.connections.remove(&server) {
+            if let Ok(buf) = Self::send_receive(&mut stream, &payload) {
+                self.connections.insert(server, stream);
+                return DnsMessage::parse(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+            }
+            // Stale (server-side idle timeout, RFC 7766 §6.2.3) — drop it
+            // and fall through to a fresh connection.
+        }
         let mut stream = TcpStream::connect_timeout(&server, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
+        let buf = Self::send_receive(&mut stream, &payload)?;
+        self.connections.insert(server, stream);
+        DnsMessage::parse(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    fn send_receive(stream: &mut TcpStream, payload: &[u8]) -> io::Result<Vec<u8>> {
         let len = payload.len() as u16;
         stream.write_all(&len.to_be_bytes())?;
-        stream.write_all(&payload)?;
+        stream.write_all(payload)?;
         let mut len_buf = [0u8; 2];
         stream.read_exact(&mut len_buf)?;
         let resp_len = u16::from_be_bytes(len_buf) as usize;
         let mut buf = vec![0u8; resp_len];
         stream.read_exact(&mut buf)?;
-        DnsMessage::parse(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        Ok(buf)
     }
 
-    /// DoT query when `dot` feature is enabled.
+    /// DoT query when `dot` feature is enabled, reusing a pooled
+    /// already-handshaken TLS session/connection to `server` when one is
+    /// available (skipping both the TCP connect and the TLS handshake).
     #[cfg(feature = "dot")]
     pub fn query_dot(
         &mut self,
@@ -66,16 +95,24 @@ impl TcpDnsConnectionPool {
         let payload = msg
             .serialize()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        // Blocking DoT for truncation/fallback path: use rustls via connector session.
+        let mut len_payload = Vec::with_capacity(2 + payload.len());
+        len_payload.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        len_payload.extend_from_slice(&payload);
+
+        if let Some((mut stream, mut session)) = self.dot_connections.remove(&server) {
+            if let Ok(resp) = drive_tls_write_read(&mut stream, &mut *session, &len_payload) {
+                self.dot_connections.insert(server, (stream, session));
+                return Ok(resp);
+            }
+            // Stale — drop and fall through to a fresh connection + handshake.
+        }
         let mut stream = TcpStream::connect_timeout(&server, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
         let mut session = connector.connect(server_name)?;
-        // Drive handshake + write length-prefixed DNS.
-        let mut len_payload = Vec::with_capacity(2 + payload.len());
-        len_payload.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        len_payload.extend_from_slice(&payload);
-        drive_tls_write_read(&mut stream, &mut *session, &len_payload)
+        let resp = drive_tls_write_read(&mut stream, &mut *session, &len_payload)?;
+        self.dot_connections.insert(server, (stream, session));
+        Ok(resp)
     }
 }
 

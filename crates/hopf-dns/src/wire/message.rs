@@ -41,6 +41,10 @@ pub const RCODE_NXDOMAIN: u16 = 3;
 pub const RCODE_NOTIMP: u16 = 4;
 /// Refused.
 pub const RCODE_REFUSED: u16 = 5;
+/// Bad EDNS VERSION (RFC 6891 §7) — requires the EDNS extended-RCODE
+/// octet ([`super::DnsResourceRecord::edns_extended_rcode`]) since it
+/// doesn't fit in the header's own 4-bit RCODE field.
+pub const RCODE_BADVERS: u16 = 16;
 
 const Z_BITS_MASK: u16 = 0x0040;
 
