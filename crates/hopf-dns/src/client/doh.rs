@@ -15,7 +15,7 @@ use hopf_core::{Endpoint, ProtocolHandler, Runtime, SharedTlsConnector, TcpConne
 
 use super::{DnsClientTransport, DnsClientTransportHandler, DEFAULT_TIMEOUT};
 
-/// DoH client via HTTP/1.1 POST `application/dns-message`.
+/// DoH client via HTTP/1.1, `application/dns-message` (RFC 8484 §4.1).
 pub struct DohClientTransport {
     /// Runtime used for dials.
     runtime: Arc<Runtime>,
@@ -27,10 +27,15 @@ pub struct DohClientTransport {
     pub tls: Option<SharedTlsConnector>,
     /// TCP connect timeout for DoH dials.
     pub connect_timeout: Option<Duration>,
+    /// Use GET (base64url `dns` query parameter) instead of POST — both
+    /// are RFC 8484-compliant; GET lets an intermediate cache identical
+    /// queries by URL. `false` (POST) by default.
+    pub use_get: bool,
 }
 
 impl DohClientTransport {
-    /// HTTPS DoH to `host` (SNI) at `path`, dialing on `runtime`.
+    /// HTTPS DoH to `host` (SNI) at `path`, dialing on `runtime`. Uses
+    /// POST by default — see [`Self::use_get`] to switch to GET.
     pub fn https(
         runtime: Arc<Runtime>,
         host: impl Into<String>,
@@ -43,7 +48,14 @@ impl DohClientTransport {
             path: path.into(),
             tls: Some(tls),
             connect_timeout: Some(DEFAULT_TIMEOUT),
+            use_get: false,
         }
+    }
+
+    /// Use GET instead of POST for subsequent queries (RFC 8484 §4.1).
+    pub fn with_get(mut self, use_get: bool) -> Self {
+        self.use_get = use_get;
+        self
     }
 }
 
@@ -57,6 +69,7 @@ impl DnsClientTransport for DohClientTransport {
         let host = self.host.clone();
         let path = self.path.clone();
         let body = message.to_vec();
+        let use_get = self.use_get;
         let slot: Arc<Mutex<Option<Box<dyn DnsClientTransportHandler>>>> =
             Arc::new(Mutex::new(Some(handler)));
         let mut cfg = TcpConnectorConfig::new(server, {
@@ -67,6 +80,7 @@ impl DnsClientTransport for DohClientTransport {
                     host: host.clone(),
                     path: path.clone(),
                     body: body.clone(),
+                    use_get,
                     server,
                     handler: h,
                     started: false,
@@ -89,6 +103,7 @@ struct DohClientHandler {
     host: String,
     path: String,
     body: Vec<u8>,
+    use_get: bool,
     server: SocketAddr,
     handler: Option<Box<dyn DnsClientTransportHandler>>,
     started: bool,
@@ -124,12 +139,25 @@ impl ProtocolHandler for DohClientHandler {
             return;
         }
         self.started = true;
-        let mut req = format!(
-            "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\nAccept: application/dns-message\r\n\r\n",
-            self.path, self.host, self.body.len()
-        )
-        .into_bytes();
-        req.extend_from_slice(&self.body);
+        let req = if self.use_get {
+            // RFC 8484 §4.1: the DNS wire message base64url-encoded
+            // (unpadded) into the `dns` query parameter; no body.
+            let encoded = base64url_encode(&self.body);
+            let sep = if self.path.contains('?') { '&' } else { '?' };
+            format!(
+                "GET {}{}dns={} HTTP/1.1\r\nHost: {}\r\nAccept: application/dns-message\r\nConnection: close\r\n\r\n",
+                self.path, sep, encoded, self.host
+            )
+            .into_bytes()
+        } else {
+            let mut req = format!(
+                "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\nAccept: application/dns-message\r\n\r\n",
+                self.path, self.host, self.body.len()
+            )
+            .into_bytes();
+            req.extend_from_slice(&self.body);
+            req
+        };
         endpoint.send(&req);
     }
 
@@ -187,6 +215,29 @@ fn find_content_length(headers: &[u8]) -> Option<usize> {
     None
 }
 
+const BASE64URL_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// Unpadded base64url (RFC 4648 §5) — the `dns` query parameter's encoding
+/// for a GET request (RFC 8484 §4.1).
+fn base64url_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied();
+        let b2 = chunk.get(2).copied();
+        out.push(BASE64URL_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(BASE64URL_ALPHABET[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
+        if let Some(b1) = b1 {
+            out.push(BASE64URL_ALPHABET[(((b1 & 0x0F) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char);
+        }
+        if let Some(b2) = b2 {
+            out.push(BASE64URL_ALPHABET[(b2 & 0x3F) as usize] as char);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +248,28 @@ mod tests {
         let end = find_header_end(raw).unwrap();
         assert_eq!(find_content_length(&raw[..end]), Some(12));
         assert_eq!(&raw[end..], b"abcdefghijkl");
+    }
+
+    #[test]
+    fn base64url_encode_matches_known_vectors() {
+        // RFC 4648 §10 test vectors, re-expressed unpadded/URL-safe (none
+        // of these particular inputs contain '+'/'/' chars anyway, but the
+        // no-padding behavior is the thing under test).
+        assert_eq!(base64url_encode(b""), "");
+        assert_eq!(base64url_encode(b"f"), "Zg");
+        assert_eq!(base64url_encode(b"fo"), "Zm8");
+        assert_eq!(base64url_encode(b"foo"), "Zm9v");
+        assert_eq!(base64url_encode(b"foob"), "Zm9vYg");
+        assert_eq!(base64url_encode(b"fooba"), "Zm9vYmE");
+        assert_eq!(base64url_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64url_encode_uses_url_safe_alphabet() {
+        // Bytes that would produce '+' (0x3E) and '/' (0x3F) in standard
+        // base64 must instead produce '-' and '_'.
+        let encoded = base64url_encode(&[0xFB, 0xFF]);
+        assert!(!encoded.contains('+') && !encoded.contains('/'));
+        assert!(encoded.contains('-') || encoded.contains('_'));
     }
 }
