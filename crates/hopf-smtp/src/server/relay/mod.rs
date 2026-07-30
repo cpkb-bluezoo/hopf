@@ -8,5 +8,5 @@
 mod handler;
 mod service;
 
-pub use handler::{MessageBufferPipeline, SimpleRelayHandler, SimpleRelayHandlerFactory};
+pub use handler::{SimpleRelayHandler, SimpleRelayHandlerFactory};
 pub use service::SimpleRelayService;

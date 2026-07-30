@@ -55,6 +55,12 @@ pub enum LexEvent {
     /// exactly the line's content, minus the CRLF terminator — undecoded,
     /// since interpretation (base64, `*` abort) is mechanism-specific.
     SaslLine(Vec<u8>),
+    /// One chunk of an in-progress APPEND literal's raw octets, delivered as
+    /// soon as it's readable off the wire — the lexer never buffers an
+    /// APPEND literal whole; the caller decides what to do with each chunk
+    /// (e.g. spool it to a temp file) as it arrives. The literal is complete
+    /// once the following [`LexEvent::Command`] arrives.
+    AppendChunk(Vec<u8>),
     /// Protocol error (line too long, bad literal, …).
     Error {
         /// Tag if known, else `"*"`.
@@ -68,9 +74,13 @@ pub enum LexEvent {
 enum LiteralPhase {
     None,
     /// Waiting for raw bytes of a general-purpose (arg) literal.
-    General { remaining: u64 },
+    General {
+        remaining: u64,
+    },
     /// Waiting for APPEND message-body literal.
-    Append { remaining: u64 },
+    Append {
+        remaining: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,10 +120,6 @@ pub struct ImapServerLexer {
     typed_bytes: usize,
     literal: LiteralPhase,
     literal_buf: Vec<u8>,
-    /// APPEND body bytes (exposed to the control handler).
-    append_body: Vec<u8>,
-    /// When set, an APPEND literal just finished.
-    append_complete: bool,
     /// Scratch buffer for a SASL continuation line (see `State::RawLine`).
     raw: Vec<u8>,
     ready: Vec<LexEvent>,
@@ -131,8 +137,6 @@ impl ImapServerLexer {
             typed_bytes: 0,
             literal: LiteralPhase::None,
             literal_buf: Vec::new(),
-            append_body: Vec::new(),
-            append_complete: false,
             raw: Vec::new(),
             ready: Vec::new(),
         }
@@ -164,16 +168,6 @@ impl ImapServerLexer {
         std::mem::take(&mut self.ready)
     }
 
-    /// Take APPEND body if a literal just completed.
-    pub fn take_append_body(&mut self) -> Option<Vec<u8>> {
-        if self.append_complete {
-            self.append_complete = false;
-            Some(std::mem::take(&mut self.append_body))
-        } else {
-            None
-        }
-    }
-
     /// Whether currently reading a literal.
     pub fn in_literal(&self) -> bool {
         !matches!(self.literal, LiteralPhase::None)
@@ -202,11 +196,18 @@ impl ImapServerLexer {
                 }
             }
             LiteralPhase::Append { remaining } => {
-                self.append_body.extend_from_slice(chunk);
                 *remaining -= take as u64;
-                if *remaining == 0 {
+                let done = *remaining == 0;
+                // Emitted even when empty on completion (a valid `{0}`
+                // literal) — the control layer uses this to tell "a
+                // zero-length literal was provided" apart from "no literal
+                // was provided at all", which it can't distinguish from
+                // silence alone.
+                if !chunk.is_empty() || done {
+                    self.ready.push(LexEvent::AppendChunk(chunk.to_vec()));
+                }
+                if done {
                     self.literal = LiteralPhase::None;
-                    self.append_complete = true;
                     self.finish_command();
                     self.state = State::Tag;
                 }
@@ -355,8 +356,6 @@ impl ImapServerLexer {
             }
             // APPEND body literal: verb APPEND and this is the final arg literal.
             if is_append_body_literal(&self.rest) {
-                self.append_body.clear();
-                self.append_complete = false;
                 self.literal = LiteralPhase::Append { remaining: n };
             } else {
                 self.literal_buf.clear();
@@ -659,6 +658,7 @@ mod tests {
                 LexEvent::NeedContinuation => None,
                 LexEvent::SaslLine(_) => None,
                 LexEvent::Error { .. } => None,
+                LexEvent::AppendChunk(_) => None,
             })
             .collect();
         assert!(!cmds.is_empty());
@@ -698,17 +698,53 @@ mod tests {
         let ev = lex.feed(&mut data);
         assert!(data.is_empty());
         assert!(matches!(ev[0], LexEvent::NeedContinuation));
-        let cmds: Vec<_> = ev
-            .into_iter()
-            .filter_map(|e| match e {
-                LexEvent::Command(c) => Some(c),
-                _ => None,
-            })
-            .collect();
+        let mut body = Vec::new();
+        let mut cmds = Vec::new();
+        for e in ev {
+            match e {
+                LexEvent::AppendChunk(chunk) => body.extend_from_slice(&chunk),
+                LexEvent::Command(c) => cmds.push(c),
+                _ => {}
+            }
+        }
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].verb, "APPEND");
-        let body = lex.take_append_body().expect("append body");
         assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn append_literal_chunk_delivered_as_soon_as_bytes_arrive_even_before_command_completes() {
+        let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
+        let mut data: &[u8] = b"a1 APPEND INBOX {11}\r\nhel";
+        let ev = lex.feed(&mut data);
+        assert!(lex.in_literal());
+        let chunk: Vec<u8> = ev
+            .into_iter()
+            .filter_map(|e| match e {
+                LexEvent::AppendChunk(c) => Some(c),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(chunk, b"hel", "partial literal bytes must be delivered immediately, not buffered until the literal completes");
+
+        let mut rest: &[u8] = b"lo world\r\n";
+        let ev2 = lex.feed(&mut rest);
+        assert!(!lex.in_literal());
+        let mut tail = Vec::new();
+        let mut saw_command = false;
+        for e in ev2 {
+            match e {
+                LexEvent::AppendChunk(c) => tail.extend_from_slice(&c),
+                LexEvent::Command(c) => {
+                    assert_eq!(c.verb, "APPEND");
+                    saw_command = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(tail, b"lo world");
+        assert!(saw_command);
     }
 
     #[test]

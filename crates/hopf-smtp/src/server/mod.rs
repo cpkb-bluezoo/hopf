@@ -15,6 +15,7 @@ mod relay;
 mod reply;
 mod service;
 mod session;
+mod spool;
 
 pub use codec::{SmtpCommand, SmtpServerLexer, MAX_COMMAND_LINE};
 pub use control::SmtpControlHandler;
@@ -30,9 +31,9 @@ pub use handler::{
     SmtpClientConnected, SmtpConnectionMetadata, SmtpHandlerFactory,
 };
 pub use metrics::SmtpServerMetrics;
-pub use pipeline::{DiscardPipeline, NullPipeline, SmtpPipeline};
+pub use pipeline::{DiscardPipeline, MessageBufferPipeline, NullPipeline, SmtpPipeline};
 pub use mailbox::{LocalDeliveryHandler, LocalDeliveryHandlerFactory, LocalDeliveryService};
-pub use relay::{MessageBufferPipeline, SimpleRelayHandler, SimpleRelayHandlerFactory, SimpleRelayService};
+pub use relay::{SimpleRelayHandler, SimpleRelayHandlerFactory, SimpleRelayService};
 pub use reply::{reply, reply_ehlo, reply_enhanced, reply_multiline};
 pub use service::{SmtpConfig, SmtpService, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_RECIPIENTS};
 pub use session::{DataDotState, SmtpSessionState};

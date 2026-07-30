@@ -143,7 +143,7 @@
 </tr>
 </tbody>
 </table>
-<p>Commands are lexed incrementally with the shared push-parser style (tag / verb / arguments / literals) — synchronizing literals emit <code>+</code> continuations, and <code>LITERAL-</code> non-synchronizing literals are accepted.</p>
+<p>Commands are lexed incrementally with the shared push-parser style (tag / verb / arguments / literals) — synchronizing literals emit <code>+</code> continuations, and <code>LITERAL-</code> non-synchronizing literals are accepted. The APPEND message literal is never buffered whole: the codec emits it as a series of chunk events as wire bytes arrive, and the control layer streams each chunk straight to a bounded temp file, which is then streamed into the mailbox on <code>proceed</code> and removed — memory use stays flat regardless of message size.</p>
 <h2 id="handler-spi">Handler SPI</h2>
 <p>Gumdrop-style staged traits:</p>
 <ul>

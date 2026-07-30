@@ -240,6 +240,124 @@ fn simple_relay_mx_to_local_sink() {
     );
 }
 
+/// One recipient domain resolves to a real sink (delivery succeeds), the
+/// other resolves to an address nothing is listening on (delivery fails).
+/// Proves two things the pre-streaming relay got wrong: (1) it now waits
+/// for each domain's *real* `SmtpSend` completion instead of counting a
+/// domain "delivered" the instant the outbound connect call was issued, and
+/// (2) per the confirmed design, any domain failing rejects the whole
+/// inbound transaction even though the other domain's delivery — streamed
+/// from the same spooled file — already went through.
+#[test]
+fn simple_relay_rejects_whole_transaction_if_any_domain_fails() {
+    use crate::{SimpleRelayService, SmtpConfig};
+    use hopf_dns::wire::{DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA};
+    use hopf_dns::DnsResolver;
+    use std::net::Ipv4Addr;
+    use std::thread;
+
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let (rt, sink_addr) = start_accept_all(Arc::clone(&capture));
+
+    // DNS stub: good.example -> 127.0.0.1 (the real sink) resolves
+    // normally; bad.example's MX resolves but its A lookup comes back empty
+    // (NODATA) — a pure DNS-level failure, deterministic and fast,
+    // independent of how this sandbox's network stack happens to handle a
+    // TCP connect to an address nothing is listening on.
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+                break;
+            };
+            let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+                continue;
+            };
+            let mut resp = q.response_template(0);
+            resp.flags |= FLAG_QR | FLAG_RA;
+            if let Some(question) = q.questions.first() {
+                let is_bad = question.name.to_ascii_lowercase().starts_with("bad.");
+                match question.qtype {
+                    Some(DnsType::Mx) => {
+                        resp.answers
+                            .push(DnsResourceRecord::mx(&question.name, 60, 10, &question.name).unwrap());
+                    }
+                    Some(DnsType::A) if !is_bad => {
+                        resp.answers.push(DnsResourceRecord::a(
+                            &question.name,
+                            60,
+                            Ipv4Addr::new(127, 0, 0, 1),
+                        ));
+                    }
+                    // bad.example's A lookup answers NOERROR/NODATA — no
+                    // address, so the relay's resolve() call fails cleanly.
+                    Some(DnsType::A) | Some(DnsType::Aaaa) => {}
+                    _ => {}
+                }
+            }
+            let bytes = resp.serialize().unwrap();
+            let _ = stub.send_to(&bytes, peer);
+        }
+    });
+
+    let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+
+    let relay_listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(relay_listen, "relay.example.com");
+    let relay = SimpleRelayService::with_resolver(config, Arc::clone(&rt), dns, sink_addr.port());
+    let relay_addr = relay.start(Arc::clone(&rt)).unwrap();
+
+    let timeouts = SmtpClientTimeouts {
+        stage: Duration::from_secs(2),
+        message: Duration::from_secs(3),
+        ..Default::default()
+    };
+    let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let done2 = Arc::clone(&done);
+    let send = SmtpSend::new("client.example")
+        .mail_from("alice@elsewhere.test")
+        .rcpt_to("bob@good.example")
+        .rcpt_to("carol@bad.example")
+        .message(b"Subject: partial\r\n\r\npartial-fanout-body\r\n".to_vec())
+        .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
+    SmtpClient::from_addr(relay_addr)
+        .timeouts(timeouts)
+        .connect(&rt, Arc::new(send))
+        .unwrap();
+    assert!(
+        wait_for(|| done.lock().unwrap().is_some(), 5000),
+        "relay submission timed out"
+    );
+
+    // The good domain's delivery — streamed from the spool file — went
+    // through even though the transaction as a whole gets rejected.
+    assert!(
+        wait_for(
+            || {
+                let got = capture.lock().unwrap().clone();
+                got.windows(b"partial-fanout-body".len())
+                    .any(|w| w == b"partial-fanout-body")
+            },
+            5000
+        ),
+        "the succeeding domain should still have received the message"
+    );
+
+    // But the overall inbound transaction must be rejected, not accepted,
+    // because the other domain failed.
+    assert_eq!(
+        *done.lock().unwrap(),
+        Some(false),
+        "any domain failing must reject the whole transaction"
+    );
+}
+
 #[test]
 fn local_delivery_appends_to_maildir() {
     use crate::{LocalDeliveryService, SmtpConfig};
