@@ -18,7 +18,7 @@ use crate::search::SearchCriteria;
 use crate::traits::{Mailbox, MessageDescriptor, MessageReadCallback};
 
 use super::flags::MboxFlagsFile;
-use super::lock::FileLock;
+use super::lock::{DotLock, FileLock};
 
 #[derive(Clone)]
 struct MboxMsg {
@@ -39,6 +39,11 @@ pub struct MboxMailbox {
     name: String,
     read_only: bool,
     _lock: FileLock,
+    // Held alongside `_lock`'s flock so hopf interoperates with
+    // dotlock-only mbox tooling too — see `mbox::lock::DotLock`. Field
+    // order matters here: dropped after `_lock` (Rust drops struct fields
+    // in declaration order), releasing the flock before the dotlock.
+    _dotlock: DotLock,
     messages: Vec<MboxMsg>,
     flags: MboxFlagsFile,
     index: MessageIndex,
@@ -78,6 +83,10 @@ impl MboxMailbox {
             }
             File::create(&path)?;
         }
+        // Dotlock first: it fails fast (or times out cleanly) under
+        // contention rather than blocking indefinitely like flock does,
+        // and is the convention that actually works over NFS.
+        let dotlock = DotLock::acquire(&path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(!read_only)
@@ -161,6 +170,7 @@ impl MboxMailbox {
             name,
             read_only,
             _lock: lock,
+            _dotlock: dotlock,
             messages,
             flags,
             index,
@@ -382,6 +392,24 @@ impl Mailbox for MboxMailbox {
     fn keywords(&self, message_number: u32) -> MailboxResult<BTreeSet<String>> {
         let msg = self.msg(message_number)?;
         Ok(self.flags.get(&msg.unique_id).1)
+    }
+
+    fn highest_modseq(&self) -> u64 {
+        self.flags.highest_modseq
+    }
+
+    fn modseq(&self, message_number: u32) -> MailboxResult<u64> {
+        let msg = self.msg(message_number)?;
+        Ok(self.flags.modseq_for(&msg.unique_id))
+    }
+
+    fn changed_since(&self, modseq: u64) -> MailboxResult<Vec<u64>> {
+        Ok(self
+            .messages
+            .iter()
+            .filter(|m| self.flags.modseq_for(&m.unique_id) > modseq)
+            .map(|m| m.uid)
+            .collect())
     }
 
     fn set_flags(
@@ -653,16 +681,40 @@ impl Mailbox for MboxMailbox {
     }
 
     fn search(&self, criteria: &SearchCriteria) -> MailboxResult<Vec<u32>> {
-        self.index.search(criteria, |uid, needle_lower| {
-            let msg = self
-                .messages
-                .iter()
-                .find(|m| m.uid == uid)
-                .ok_or_else(|| MailboxError::NotFound(format!("uid {uid}")))?;
-            let mut matcher = crate::search::StreamingSubstringMatcher::new(needle_lower);
-            stream_unescaped_range(&self.path, msg.start, msg.end, |chunk| !matcher.feed(chunk))?;
-            Ok(matcher.found())
-        })
+        self.index.search(
+            criteria,
+            |uid, needle_lower| {
+                let msg = self
+                    .messages
+                    .iter()
+                    .find(|m| m.uid == uid)
+                    .ok_or_else(|| MailboxError::NotFound(format!("uid {uid}")))?;
+                let mut matcher = crate::search::StreamingSubstringMatcher::new(needle_lower);
+                stream_unescaped_range(&self.path, msg.start, msg.end, |chunk| {
+                    !matcher.feed(chunk)
+                })?;
+                Ok(matcher.found())
+            },
+            |uid, name| {
+                let msg = self
+                    .messages
+                    .iter()
+                    .find(|m| m.uid == uid)
+                    .ok_or_else(|| MailboxError::NotFound(format!("uid {uid}")))?;
+                let mut extractor = crate::search::HeaderExtractor::new();
+                stream_unescaped_range(&self.path, msg.start, msg.end, |chunk| {
+                    extractor.feed(chunk)
+                })?;
+                Ok(extractor.value(name))
+            },
+            |uid| {
+                self.messages
+                    .iter()
+                    .find(|m| m.uid == uid)
+                    .map(|m| self.flags.modseq_for(&m.unique_id))
+                    .unwrap_or(0)
+            },
+        )
     }
 }
 
@@ -1166,6 +1218,30 @@ mod tests {
     }
 
     #[test]
+    fn open_creates_dotlock_and_drop_removes_it() {
+        let dir = tempdir().unwrap();
+        let factory = MboxFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("dotlockuser").unwrap();
+        let mbox_path = dir.path().join("dotlockuser");
+        let mut lock_os = mbox_path.as_os_str().to_os_string();
+        lock_os.push(".lock");
+        let lock_path = PathBuf::from(lock_os);
+
+        assert!(!lock_path.exists());
+        let mb = store.open_mailbox("INBOX", false).unwrap();
+        assert!(
+            lock_path.exists(),
+            "dotlock file should exist while the mailbox is open"
+        );
+        drop(mb);
+        assert!(
+            !lock_path.exists(),
+            "dotlock file should be removed once the mailbox is dropped"
+        );
+    }
+
+    #[test]
     fn abort_append_discards_the_buffer_and_leaves_no_message() {
         let dir = tempdir().unwrap();
         let factory = MboxFactory::new(dir.path());
@@ -1244,5 +1320,77 @@ mod tests {
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
         assert!(mb.abort_append().is_ok());
         mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn modseq_increases_on_append_and_on_flag_change() {
+        let dir = tempdir().unwrap();
+        let factory = MboxFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("mboxmodsequser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        append_whole(mb.as_mut(), b"From: a@b\r\nSubject: a\r\n\r\nbody a\r\n", &BTreeSet::new(), None).unwrap();
+        append_whole(mb.as_mut(), b"From: a@b\r\nSubject: b\r\n\r\nbody b\r\n", &BTreeSet::new(), None).unwrap();
+        assert_eq!(mb.modseq(1).unwrap(), 1);
+        assert_eq!(mb.modseq(2).unwrap(), 2);
+        assert_eq!(mb.highest_modseq(), 2);
+
+        let mut seen = BTreeSet::new();
+        seen.insert(Flag::Seen);
+        mb.set_flags(1, &seen, true).unwrap();
+        assert_eq!(mb.modseq(1).unwrap(), 3, "flag change must bump modseq");
+        assert_eq!(mb.modseq(2).unwrap(), 2, "unrelated message untouched");
+        assert_eq!(mb.highest_modseq(), 3);
+
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn mbox_changed_since_reports_only_messages_modified_after_the_given_modseq() {
+        let dir = tempdir().unwrap();
+        let factory = MboxFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("mboxchangeduser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        append_whole(mb.as_mut(), b"From: a@b\r\nSubject: a\r\n\r\nbody a\r\n", &BTreeSet::new(), None).unwrap(); // uid 1
+        append_whole(mb.as_mut(), b"From: a@b\r\nSubject: b\r\n\r\nbody b\r\n", &BTreeSet::new(), None).unwrap(); // uid 2
+        let baseline = mb.highest_modseq();
+
+        let mut flagged = BTreeSet::new();
+        flagged.insert(Flag::Flagged);
+        mb.set_flags(2, &flagged, true).unwrap(); // uid 2 -> new modseq
+
+        let changed = mb.changed_since(baseline).unwrap();
+        assert_eq!(changed, vec![2]);
+        assert!(mb.changed_since(mb.highest_modseq()).unwrap().is_empty());
+        assert_eq!(mb.changed_since(0).unwrap().len(), 2);
+
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn mbox_highest_modseq_survives_a_close_and_reopen() {
+        let dir = tempdir().unwrap();
+        let factory = MboxFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("mboxpersistuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        append_whole(mb.as_mut(), b"From: a@b\r\nSubject: a\r\n\r\nbody a\r\n", &BTreeSet::new(), None).unwrap();
+        let mut flagged = BTreeSet::new();
+        flagged.insert(Flag::Flagged);
+        mb.set_flags(1, &flagged, true).unwrap();
+        assert_eq!(mb.highest_modseq(), 2);
+        mb.close(false).unwrap();
+        drop(mb);
+
+        let mb2 = store.open_mailbox("INBOX", false).unwrap();
+        assert_eq!(
+            mb2.highest_modseq(),
+            2,
+            "HIGHESTMODSEQ must be durable across a reopen, not reset to 0"
+        );
+        assert_eq!(mb2.modseq(1).unwrap(), 2);
     }
 }

@@ -301,6 +301,24 @@ impl Mailbox for MaildirMailbox {
         ))
     }
 
+    fn highest_modseq(&self) -> u64 {
+        self.uidlist.highest_modseq
+    }
+
+    fn modseq(&self, message_number: u32) -> MailboxResult<u64> {
+        let idx = self.seq_index(message_number)?;
+        Ok(self.uidlist.modseq_for(&self.messages[idx].filename.base))
+    }
+
+    fn changed_since(&self, modseq: u64) -> MailboxResult<Vec<u64>> {
+        Ok(self
+            .messages
+            .iter()
+            .filter(|m| self.uidlist.modseq_for(&m.filename.base) > modseq)
+            .map(|m| m.uid)
+            .collect())
+    }
+
     fn set_flags(
         &mut self,
         message_number: u32,
@@ -321,6 +339,7 @@ impl Mailbox for MaildirMailbox {
         }
         let uid = self.messages[idx].uid;
         let fl = self.messages[idx].filename.flags.clone();
+        self.uidlist.bump_modseq(&self.messages[idx].filename.base);
         self.rename_with_flags(idx)?;
         self.index.set_flags(uid, &fl);
         Ok(())
@@ -336,6 +355,7 @@ impl Mailbox for MaildirMailbox {
             .collect();
         let uid = self.messages[idx].uid;
         let fl = self.messages[idx].filename.flags.clone();
+        self.uidlist.bump_modseq(&self.messages[idx].filename.base);
         self.rename_with_flags(idx)?;
         self.index.set_flags(uid, &fl);
         Ok(())
@@ -367,6 +387,7 @@ impl Mailbox for MaildirMailbox {
         }
         let uid = self.messages[idx].uid;
         let kw = letters_to_keywords(&self.keywords, &self.messages[idx].filename.keyword_letters);
+        self.uidlist.bump_modseq(&self.messages[idx].filename.base);
         self.rename_with_flags(idx)?;
         self.index.set_keywords(uid, &kw);
         Ok(())
@@ -386,6 +407,7 @@ impl Mailbox for MaildirMailbox {
         }
         let uid = self.messages[idx].uid;
         let kw = letters_to_keywords(&self.keywords, &self.messages[idx].filename.keyword_letters);
+        self.uidlist.bump_modseq(&self.messages[idx].filename.base);
         self.rename_with_flags(idx)?;
         self.index.set_keywords(uid, &kw);
         Ok(())
@@ -611,6 +633,8 @@ impl Mailbox for MaildirMailbox {
             struct Ctx<'a> {
                 e: &'a crate::index::IndexEntry,
                 body_path: Option<&'a Path>,
+                header_path: &'a Path,
+                modseq: u64,
             }
             impl crate::search::MessageContext for Ctx<'_> {
                 fn message_number(&self) -> u32 {
@@ -643,7 +667,11 @@ impl Mailbox for MaildirMailbox {
                     }
                 }
                 fn header(&self, name: &str) -> std::io::Result<String> {
-                    Ok(self.e.header_value(name).unwrap_or("").to_string())
+                    if let Some(v) = self.e.header_value(name) {
+                        return Ok(v.to_string());
+                    }
+                    let file = File::open(self.header_path)?;
+                    Ok(crate::search::header_lookup_streaming(file, name)?.unwrap_or_default())
                 }
                 fn body_contains(&self, needle_lower: &str) -> std::io::Result<bool> {
                     if let Some(path) = self.body_path {
@@ -657,11 +685,16 @@ impl Mailbox for MaildirMailbox {
                         .to_ascii_lowercase()
                         .contains(needle_lower))
                 }
+                fn modseq(&self) -> Option<u64> {
+                    Some(self.modseq)
+                }
             }
             let hit = criteria
                 .matches(&Ctx {
                     e: &entry,
                     body_path,
+                    header_path: &m.path,
+                    modseq: self.uidlist.modseq_for(&m.filename.base),
                 })
                 .map_err(MailboxError::Io)?;
             if hit {
@@ -977,7 +1010,10 @@ mod tests {
         // mailbox remains usable
         let st = mb.status().unwrap();
         assert_eq!(st.messages, 2);
-        assert_eq!(st.highest_modseq, 0);
+        // 3 appends (modseq 1-3) + one flag change on message 2 (modseq 4)
+        // — HIGHESTMODSEQ must not roll back even though the message that
+        // held it was just expunged.
+        assert_eq!(st.highest_modseq, 4);
         mb.close(false).unwrap();
     }
 
@@ -999,7 +1035,79 @@ mod tests {
         assert_eq!(st.uid_next, mb.uid_next());
         assert_eq!(st.uid_validity, mb.uid_validity());
         assert_eq!(st.recent, 0);
-        assert_eq!(st.highest_modseq, 0);
+        assert_eq!(st.highest_modseq, 2);
         mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn modseq_increases_on_append_and_on_flag_change() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("modsequser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        append_whole(mb.as_mut(), &sample("a"), &BTreeSet::new(), None).unwrap();
+        append_whole(mb.as_mut(), &sample("b"), &BTreeSet::new(), None).unwrap();
+        assert_eq!(mb.modseq(1).unwrap(), 1);
+        assert_eq!(mb.modseq(2).unwrap(), 2);
+        assert_eq!(mb.highest_modseq(), 2);
+
+        let mut seen = BTreeSet::new();
+        seen.insert(Flag::Seen);
+        mb.set_flags(1, &seen, true).unwrap();
+        assert_eq!(mb.modseq(1).unwrap(), 3, "flag change must bump modseq");
+        assert_eq!(mb.modseq(2).unwrap(), 2, "unrelated message untouched");
+        assert_eq!(mb.highest_modseq(), 3);
+
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn changed_since_reports_only_messages_modified_after_the_given_modseq() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("changeduser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        append_whole(mb.as_mut(), &sample("a"), &BTreeSet::new(), None).unwrap(); // uid 1, modseq 1
+        append_whole(mb.as_mut(), &sample("b"), &BTreeSet::new(), None).unwrap(); // uid 2, modseq 2
+        let baseline = mb.highest_modseq();
+
+        let mut flagged = BTreeSet::new();
+        flagged.insert(Flag::Flagged);
+        mb.set_flags(2, &flagged, true).unwrap(); // uid 2 -> modseq 3
+
+        let changed = mb.changed_since(baseline).unwrap();
+        assert_eq!(changed, vec![2]);
+        assert!(mb.changed_since(mb.highest_modseq()).unwrap().is_empty());
+        assert_eq!(mb.changed_since(0).unwrap().len(), 2);
+
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn highest_modseq_survives_a_close_and_reopen() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("persistuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        append_whole(mb.as_mut(), &sample("a"), &BTreeSet::new(), None).unwrap();
+        let mut flagged = BTreeSet::new();
+        flagged.insert(Flag::Flagged);
+        mb.set_flags(1, &flagged, true).unwrap();
+        assert_eq!(mb.highest_modseq(), 2);
+        mb.close(false).unwrap();
+        drop(mb);
+
+        let mb2 = store.open_mailbox("INBOX", false).unwrap();
+        assert_eq!(
+            mb2.highest_modseq(),
+            2,
+            "HIGHESTMODSEQ must be durable across a reopen, not reset to 0"
+        );
+        assert_eq!(mb2.modseq(1).unwrap(), 2);
     }
 }
