@@ -2,6 +2,9 @@
 
 //! Connection handle for hopping work back onto an endpoint's reactor.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use mio::Token;
 
 use crate::cmd::{ReactorCmd, ReactorHandle};
@@ -22,6 +25,7 @@ enum ConnHandleInner {
     Tcp {
         reactor: ReactorHandle,
         token: Token,
+        open: Arc<AtomicBool>,
     },
     /// Task queue only (e.g. QUIC stream endpoints on a dedicated driver).
     Tasks {
@@ -42,9 +46,9 @@ enum ConnHandleInner {
 }
 
 impl ConnHandle {
-    pub(crate) fn new(reactor: ReactorHandle, token: Token) -> Self {
+    pub(crate) fn new(reactor: ReactorHandle, token: Token, open: Arc<AtomicBool>) -> Self {
         Self {
-            inner: ConnHandleInner::Tcp { reactor, token },
+            inner: ConnHandleInner::Tcp { reactor, token, open },
         }
     }
 
@@ -87,7 +91,7 @@ impl ConnHandle {
     /// For task-only handles, the task is dropped (no endpoint).
     pub fn with_endpoint(&self, task: impl FnOnce(&mut dyn Endpoint) + Send + 'static) {
         match &self.inner {
-            ConnHandleInner::Tcp { reactor, token } => {
+            ConnHandleInner::Tcp { reactor, token, .. } => {
                 let token = *token;
                 reactor.send(ReactorCmd::WithConn {
                     token,
@@ -121,6 +125,24 @@ impl ConnHandle {
     /// Request a graceful close on the owning reactor.
     pub fn close(&self) {
         self.with_endpoint(|ep| ep.close());
+    }
+
+    /// Cheap, lock-free liveness probe callable from any thread (no reactor
+    /// hop) — advisory only, not a correctness gate. Lets a storage-thread
+    /// chunk-streaming loop (see `StorageExecutor::submit_streamed`) stop
+    /// reading a doomed file early once a peer is unmistakably gone;
+    /// `send`/`with_endpoint` already silently drop work for a closed
+    /// connection regardless of what this returns.
+    ///
+    /// Always `true` for non-TCP handles ([`Self::from_execute`],
+    /// [`Self::framed`]) — there's no cheap liveness signal to read for
+    /// those, so this doesn't pretend to have one.
+    pub fn is_probably_open(&self) -> bool {
+        match &self.inner {
+            ConnHandleInner::Tcp { open, .. } => open.load(Ordering::Acquire),
+            ConnHandleInner::Tasks { .. } => true,
+            ConnHandleInner::Framed { inner, .. } => inner.is_probably_open(),
+        }
     }
 
     /// Re-invoke the owning connection's protocol handler on its reactor,

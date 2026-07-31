@@ -15,6 +15,36 @@ use super::state::{
     ImapClientSelected, ImapFetchData, ImapMailboxInfo,
 };
 
+/// Callback for [`ImapFetch::on_message`] — driven per FETCH response line,
+/// across however many literal chunks it takes to arrive (plus, at most
+/// once, any already-parsed quoted/inline content the wire layer hands
+/// over as a single piece); [`ImapFetch`] never buffers a whole message to
+/// deliver it.
+pub trait MessageReceiveCallback: Send {
+    /// Called once, before any content, when the wire layer starts
+    /// streaming a literal for `seq`. Not called at all for a FETCH line
+    /// with no content items (e.g. `(FLAGS)`) — those still reach
+    /// [`Self::end_message`] directly.
+    fn start_message(&mut self, seq: u32) {
+        let _ = seq;
+    }
+
+    /// Called with each chunk of content, in order — either literal octets
+    /// streamed straight off the wire, or (at most once, if the server
+    /// used quoted syntax instead of a literal for a short value) the
+    /// whole already-parsed value in one call.
+    fn message_content(&mut self, chunk: &[u8]) -> bool;
+
+    /// Called once the FETCH response line for this message is fully
+    /// parsed. `uid` is `Some` when the line included a `UID` attribute
+    /// (not reliably knowable any earlier — item order within a FETCH
+    /// response isn't fixed, so `UID` can appear before or after content
+    /// items).
+    fn end_message(&mut self, uid: Option<u32>) {
+        let _ = uid;
+    }
+}
+
 struct ImapFetchState {
     username: String,
     password: String,
@@ -25,9 +55,11 @@ struct ImapFetchState {
     fetch_items: String,
     require_starttls: bool,
     prefer_auth_plain: bool,
-    body_buf: Vec<u8>,
+    /// Sequence number of the message currently streaming, once
+    /// [`MessageReceiveCallback::start_message`] has fired for it.
+    current_seq: Option<u32>,
     success: bool,
-    on_message: Option<Box<dyn FnMut(u32, Option<u32>, Vec<u8>) + Send>>,
+    on_message: Option<Box<dyn MessageReceiveCallback>>,
     on_complete: Option<Box<dyn FnOnce(bool) + Send>>,
     events: Option<Box<dyn MailboxEventListener>>,
 }
@@ -49,7 +81,7 @@ impl ImapFetch {
             fetch_items: "(RFC822)".into(),
             require_starttls: false,
             prefer_auth_plain: true,
-            body_buf: Vec::new(),
+            current_seq: None,
             success: false,
             on_message: None,
             on_complete: None,
@@ -96,8 +128,8 @@ impl ImapFetch {
         self
     }
 
-    /// Per-message callback: `(seq, uid, bytes)`.
-    pub fn on_message(self, cb: Box<dyn FnMut(u32, Option<u32>, Vec<u8>) + Send>) -> Self {
+    /// Register a per-message callback — see [`MessageReceiveCallback`].
+    pub fn on_message(self, cb: Box<dyn MessageReceiveCallback>) -> Self {
         self.0.lock().unwrap().on_message = Some(cb);
         self
     }
@@ -280,24 +312,54 @@ impl ImapClientDriver for ImapFetchDriver {
         ep.close();
     }
 
+    fn on_fetch_literal_begin(
+        &mut self,
+        _ep: &mut dyn Endpoint,
+        seq: u32,
+        _section: &str,
+        _size: u64,
+    ) {
+        let mut st = self.state.lock().unwrap();
+        if st.current_seq != Some(seq) {
+            st.current_seq = Some(seq);
+            if let Some(cb) = st.on_message.as_mut() {
+                cb.start_message(seq);
+            }
+        }
+    }
+
     fn on_fetch_literal(&mut self, data: &[u8], _ep: &mut dyn Endpoint) {
-        self.state.lock().unwrap().body_buf.extend_from_slice(data);
+        let mut st = self.state.lock().unwrap();
+        if let Some(cb) = st.on_message.as_mut() {
+            cb.message_content(data);
+        }
     }
 
     fn on_fetch_data(&mut self, data: &ImapFetchData) {
         let mut st = self.state.lock().unwrap();
-        if !data.body.is_empty() {
-            st.body_buf = data.body.clone();
-        }
-        let body = std::mem::take(&mut st.body_buf);
         let seq = data.seq;
         let uid = data.uid;
         let has_flags = !data.flags.is_empty();
-        if let Some(ref mut cb) = st.on_message {
-            if !body.is_empty() || uid.is_some() || has_flags {
-                cb(seq, uid, body);
+        if !data.body.is_empty() {
+            // Quoted/inline content the wire layer already assembled
+            // (short values only — never a literal-sized buffer) rather
+            // than streamed via on_fetch_literal.
+            if st.current_seq != Some(seq) {
+                st.current_seq = Some(seq);
+                if let Some(cb) = st.on_message.as_mut() {
+                    cb.start_message(seq);
+                }
+            }
+            if let Some(cb) = st.on_message.as_mut() {
+                cb.message_content(&data.body);
             }
         }
+        if st.current_seq == Some(seq) || !data.body.is_empty() || uid.is_some() || has_flags {
+            if let Some(cb) = st.on_message.as_mut() {
+                cb.end_message(uid);
+            }
+        }
+        st.current_seq = None;
     }
 
     fn on_fetch_complete(

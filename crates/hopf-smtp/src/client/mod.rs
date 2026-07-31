@@ -16,10 +16,11 @@
 //! use hopf_smtp::client::SmtpSend;
 //!
 //! let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+//! let mut body = Some(&b"Subject: hello\r\n\r\nhi there\r\n"[..]);
 //! let send = SmtpSend::new("mail.example.com")
 //!     .mail_from("alice@example.com")
 //!     .rcpt_to("bob@example.com")
-//!     .message(b"Subject: hello\r\n\r\nhi there\r\n".to_vec())
+//!     .message_with(move || body.take().map(|b| b.to_vec()))
 //!     .on_complete(Box::new(|ok| println!("sent: {ok}")));
 //! SmtpClient::new("mx.example.com", 25)
 //!     .connect(&rt, Arc::new(send))

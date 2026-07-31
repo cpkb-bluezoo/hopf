@@ -12,6 +12,7 @@ use std::time::Duration;
 use hopf_core::{Endpoint, ProtocolHandler, TimerHandle};
 
 use crate::server::broker::{validate_topic_name, BrokerState, SubscriberId, UNLIMITED_RECEIVE_MAXIMUM};
+use crate::server::publish_spool::{publish_whole, PendingPublish};
 use crate::codec::packet::{reason, ConnectPacket, PublishHeader, QoS, SubscribeFilter, Will};
 use crate::codec::parser::{MqttFrameHandler, MqttFrameParser};
 use crate::codec::properties::property;
@@ -46,9 +47,8 @@ struct ConnectedSession {
     /// — lets a duplicate (DUP-flagged) resend before PUBREL be re-acked
     /// without re-publishing to subscribers.
     awaiting_pubrel: HashSet<u16>,
-    /// Accumulates one in-progress PUBLISH from the client
-    /// (header set in `start_publish`, bytes appended in `publish_data`).
-    pending_publish: Option<(PublishHeader, Vec<u8>)>,
+    /// One in-progress PUBLISH from the client — see [`PendingPublish`].
+    pending_publish: Option<PendingPublish>,
 }
 
 enum SessionState {
@@ -117,7 +117,8 @@ impl ProtocolHandler for MqttControlHandler {
             }
             if !session.graceful_disconnect {
                 if let Some(will) = &session.will {
-                    self.config.broker.publish(
+                    publish_whole(
+                        &self.config.broker,
                         Some(session.subscriber_id),
                         &will.topic,
                         &will.payload,
@@ -269,6 +270,7 @@ impl MqttFrameHandler for Ctx<'_, '_> {
             receive_maximum,
             packet.clean_session,
             self.endpoint.handle(),
+            false,
         );
         if let Some(evicted) = evicted {
             evicted.close();
@@ -309,6 +311,10 @@ impl MqttFrameHandler for Ctx<'_, '_> {
             self.disconnect_and_close(reason::TOPIC_NAME_INVALID);
             return;
         }
+        if header.payload_len > self.handler.config.max_publish_payload {
+            self.disconnect_and_close(reason::PACKET_TOO_LARGE);
+            return;
+        }
         let SessionState::Connected(session) = &mut self.handler.session else {
             self.disconnect_and_close(reason::PROTOCOL_ERROR);
             return;
@@ -325,48 +331,53 @@ impl MqttFrameHandler for Ctx<'_, '_> {
             self.endpoint.send(&wire);
             return;
         }
-        session.pending_publish = Some((header, Vec::new()));
+
+        // Fan out to QoS-0 recipients now — their PUBLISH headers go out
+        // immediately, payload chunks follow live via `publish_data`.
+        // QoS-1/2 recipients (and retain) are resolved in `end_publish`
+        // once the whole payload is known, from a spooled copy.
+        let subscriber_id = session.subscriber_id;
+        let pending = PendingPublish::begin(self.broker(), subscriber_id, header);
+        let SessionState::Connected(session) = &mut self.handler.session else {
+            return;
+        };
+        session.pending_publish = Some(pending);
     }
 
     fn publish_data(&mut self, data: &[u8]) {
-        if let SessionState::Connected(session) = &mut self.handler.session {
-            if let Some((_, buf)) = &mut session.pending_publish {
-                buf.extend_from_slice(data);
-            }
-        }
+        let SessionState::Connected(session) = &mut self.handler.session else {
+            return;
+        };
+        let Some(pending) = &mut session.pending_publish else {
+            return;
+        };
+        pending.feed(data);
     }
 
     fn end_publish(&mut self) {
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
         };
-        let Some((header, payload)) = session.pending_publish.take() else {
+        let Some(pending) = session.pending_publish.take() else {
             // Duplicate QoS 2 resend — `start_publish` already re-acked it.
             return;
         };
-        let (version, subscriber_id) = (session.version, session.subscriber_id);
-
-        self.broker().publish(
-            Some(subscriber_id),
-            &header.topic,
-            &payload,
-            header.qos,
-            header.retain,
-            &header.properties,
-        );
+        let version = session.version;
+        let (qos, packet_id) = (pending.header.qos, pending.header.packet_id);
+        pending.finish(self.broker());
 
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
         };
-        match header.qos {
+        match qos {
             QoS::AtMostOnce => {}
             QoS::AtLeastOnce => {
-                let wire = encode::encode_puback(header.packet_id, reason::SUCCESS, &Properties::new(), version);
+                let wire = encode::encode_puback(packet_id, reason::SUCCESS, &Properties::new(), version);
                 self.endpoint.send(&wire);
             }
             QoS::ExactlyOnce => {
-                session.awaiting_pubrel.insert(header.packet_id);
-                let wire = encode::encode_pubrec(header.packet_id, reason::SUCCESS, &Properties::new(), version);
+                session.awaiting_pubrel.insert(packet_id);
+                let wire = encode::encode_pubrec(packet_id, reason::SUCCESS, &Properties::new(), version);
                 self.endpoint.send(&wire);
             }
         }

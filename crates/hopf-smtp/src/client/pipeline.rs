@@ -25,18 +25,20 @@ use super::DotStuffer;
 
 /// Where [`SmtpSend`] reads the message body from.
 enum MessageSource {
-    /// Already in memory.
-    Buffer(Vec<u8>),
+    /// No content at all (a genuinely empty message).
+    Empty,
     /// Streamed off disk in bounded chunks at DATA time — the message is
-    /// never held whole in memory by the client either way, but this variant
-    /// additionally avoids ever materializing it as a single `Vec` at all
-    /// (see [`SmtpSend::message_file`]).
+    /// never held whole in memory by the client (see [`SmtpSend::message_file`]).
     File(PathBuf),
+    /// Pulled from a caller-supplied source one chunk at a time —
+    /// `None` signals end of message. Never buffers more than one chunk
+    /// at a time (see [`SmtpSend::message_with`]).
+    Chunks(Box<dyn FnMut() -> Option<Vec<u8>> + Send>),
 }
 
 impl Default for MessageSource {
     fn default() -> Self {
-        MessageSource::Buffer(Vec::new())
+        MessageSource::Empty
     }
 }
 
@@ -79,10 +81,11 @@ struct SmtpSendState {
 /// use hopf_smtp::client::SmtpSend;
 ///
 /// let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+/// let mut body = Some(&b"Subject: test\r\n\r\nhello\r\n"[..]);
 /// let send = SmtpSend::new("smtp-send.local")
 ///     .mail_from("from@example.com")
 ///     .rcpt_to("to@example.com")
-///     .message(b"Subject: test\r\n\r\nhello\r\n".to_vec())
+///     .message_with(move || body.take().map(|b| b.to_vec()))
 ///     .on_complete(Box::new(|ok| eprintln!("delivery: {ok}")));
 /// SmtpClient::new("127.0.0.1", 25)
 ///     .connect(&rt, Arc::new(send))
@@ -125,9 +128,23 @@ impl SmtpSend {
         self
     }
 
-    /// Set the message bytes (held in memory).
-    pub fn message(self, bytes: Vec<u8>) -> Self {
-        self.0.lock().unwrap().message = MessageSource::Buffer(bytes);
+    /// Set the message body to genuinely empty content (no `Vec<u8>`
+    /// buffering needed — there's nothing to buffer).
+    pub fn message_empty(self) -> Self {
+        self.0.lock().unwrap().message = MessageSource::Empty;
+        self
+    }
+
+    /// Set the message body to be pulled from `next_chunk`, called
+    /// repeatedly at DATA time until it returns `None` — never more than
+    /// one chunk held in memory at a time. Use this for an in-memory or
+    /// otherwise caller-controlled source; prefer [`Self::message_file`]
+    /// when the content is already staged on disk.
+    pub fn message_with(
+        self,
+        next_chunk: impl FnMut() -> Option<Vec<u8>> + Send + 'static,
+    ) -> Self {
+        self.0.lock().unwrap().message = MessageSource::Chunks(Box::new(next_chunk));
         self
     }
 
@@ -403,8 +420,20 @@ impl SmtpClientDriver for SmtpSendDriver {
     fn on_ready_for_data(&mut self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint) {
         let source = std::mem::take(&mut self.state.lock().unwrap().message);
         match source {
-            MessageSource::Buffer(message) => {
-                data.write_content(&message);
+            MessageSource::Empty => {}
+            MessageSource::Chunks(mut next_chunk) => {
+                let mut stuffer = DotStuffer::new();
+                let mut out = Vec::with_capacity(8192);
+                while let Some(chunk) = next_chunk() {
+                    out.clear();
+                    stuffer.feed(&chunk, &mut out);
+                    ep.send(&out);
+                }
+                out.clear();
+                stuffer.finish(&mut out);
+                if !out.is_empty() {
+                    ep.send(&out);
+                }
             }
             MessageSource::File(path) => {
                 // Streamed in bounded chunks straight to the wire via

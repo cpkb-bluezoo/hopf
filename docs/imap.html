@@ -98,6 +98,10 @@
 <td>IMAP4rev2 (<a href="https://www.rfc-editor.org/rfc/rfc9051">RFC 9051</a>): LOGIN, AUTHENTICATE PLAIN, SELECT/EXAMINE, LIST/LSUB, STATUS, CREATE/DELETE/RENAME, SUBSCRIBE, APPEND, FETCH/UID FETCH, SEARCH/UID SEARCH, STORE, COPY, EXPUNGE, CLOSE, NOOP, LOGOUT</td>
 </tr>
 <tr>
+<td>FETCH data items</td>
+<td>FLAGS, UID, MODSEQ, RFC822[.SIZE/.HEADER/.TEXT], <code>BODY[section]</code> / <code>BODY.PEEK[section]</code> with <code>&lt;start.count&gt;</code> partial-fetch ranges, ENVELOPE, and BODYSTRUCTURE (recursive MIME structure via <code>rmimeparser</code>'s streaming parser — see <a href="conformance.html">Conformance</a> for the exact scope of what BODYSTRUCTURE's extension data omits)</td>
+</tr>
+<tr>
 <td><code>IDLE</code></td>
 <td><a href="https://www.rfc-editor.org/rfc/rfc2177">RFC 2177</a> — continuation + <code>DONE</code>; mailbox EXISTS/RECENT polled off-reactor</td>
 </tr>
@@ -311,6 +315,8 @@ ImapClient::new(&quot;mail.example.com&quot;, 143)
 <li>A mailbox handle is a point-in-time snapshot: IDLE reports appends made through the same session’s store, but changes written by other processes are not observed until reselect.</li>
 <li>QRESYNC does not fabricate <code>VANISHED (EARLIER)</code> history; clients fall back to full resync.</li>
 <li>mbox backend: no hierarchy / COPY / MOVE (see <a href="mailbox.html">Mailbox</a>).</li>
+<li>BODYSTRUCTURE body size/line counts reflect <code>rmimeparser</code>'s decoded body bytes; for <code>base64</code>/<code>quoted-printable</code>-encoded parts this differs from the RFC-mandated wire-encoded octet count (<code>7bit</code>/<code>8bit</code>/<code>binary</code> parts, including <code>message/rfc822</code>, are unaffected since decoded and wire bytes are identical there).</li>
+<li>BODYSTRUCTURE extension data always reports Content-Language/Content-Location as <code>NIL</code> (not parsed by <code>rmimeparser</code>'s handler trait) and Content-Disposition parameters other than <code>filename</code> are omitted (<code>rmimeparser</code> only supports named parameter lookup, not enumeration).</li>
 </ul>
 
       <p class="footer">

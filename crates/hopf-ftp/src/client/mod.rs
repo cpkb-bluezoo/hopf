@@ -10,19 +10,28 @@
 //! # Quick example
 //!
 //! ```no_run
-//! use std::sync::{Arc, Mutex};
+//! use std::io;
+//! use std::sync::Arc;
 //! use hopf_core::{Runtime, RuntimeConfig};
-//! use hopf_ftp::{FtpClient, FtpGet};
+//! use hopf_ftp::{FtpClient, FtpGet, MessageReceiveCallback};
 //!
-//! let result: Arc<Mutex<Option<std::io::Result<Vec<u8>>>>> = Arc::new(Mutex::new(None));
-//! let result2 = Arc::clone(&result);
+//! #[derive(Default)]
+//! struct PrintSize(usize);
+//! impl MessageReceiveCallback for PrintSize {
+//!     fn message_content(&mut self, chunk: &[u8]) -> bool {
+//!         self.0 += chunk.len();
+//!         true
+//!     }
+//!     fn end_message(&mut self, result: io::Result<()>) {
+//!         println!("{result:?}: {} bytes", self.0);
+//!     }
+//! }
 //!
 //! let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
 //! FtpClient::new("ftp.example.com")
 //!     .credentials("user", "pass")
-//!     .connect(&rt, Box::new(FtpGet::new("/file.txt", move |r| {
-//!         *result2.lock().unwrap() = Some(r);
-//!     }))).unwrap();
+//!     .connect(&rt, Box::new(FtpGet::new("/file.txt", Box::new(PrintSize::default()))))
+//!     .unwrap();
 //! ```
 
 mod data;
@@ -78,13 +87,57 @@ impl FtpAbortHandle {
 // Public callback types
 // ---------------------------------------------------------------------------
 
-/// Callback for RETR / LIST / NLST results.
-pub type RetrCallback = Box<dyn FnOnce(io::Result<Vec<u8>>) + Send>;
-/// Callback for STOR / APPE results.
+/// Receiver for a streamed RETR / LIST / NLST transfer.
+///
+/// Registered once per transfer; driven directly off the data connection as
+/// bytes arrive — the transfer's content is never buffered whole to deliver
+/// it. Mirrors the same start/content/end shape used by the POP3 and IMAP
+/// client `MessageReceiveCallback` traits.
+pub trait MessageReceiveCallback: Send {
+    /// Called once, before any content.
+    fn start_message(&mut self) {}
+
+    /// Called with each chunk of data, in order. Returning `false` closes
+    /// the data connection immediately, ending the transfer early.
+    fn message_content(&mut self, chunk: &[u8]) -> bool;
+
+    /// Called once the transfer finishes: `Ok(())` on a clean `226`, `Err`
+    /// on an I/O error or an `ABOR`.
+    fn end_message(&mut self, result: io::Result<()>);
+}
+
+/// Handle for pushing a STOR / APPE / STOU upload's content once the data
+/// connection is armed (delivered via the `ready` callback passed to
+/// [`FtpSessionWrite::stor`] and friends). Safe to call from any thread.
+#[derive(Clone)]
+pub struct FtpStorHandle {
+    conn: ConnHandle,
+}
+
+impl FtpStorHandle {
+    pub(crate) fn new(conn: ConnHandle) -> Self {
+        Self { conn }
+    }
+
+    /// Push one chunk of upload content.
+    pub fn feed(&self, chunk: &[u8]) {
+        self.conn.send(chunk.to_vec());
+    }
+
+    /// Signal that the upload is complete (half-closes the data connection).
+    pub fn finish(&self) {
+        self.conn.close();
+    }
+}
+
+/// Callback for STOR / APPE completion.
 pub type StorCallback = Box<dyn FnOnce(io::Result<()>) + Send>;
 /// Callback for STOU results: the server-assigned filename on success (RFC
 /// 959 §4.1.3 — parsed from the `125`/`150` reply text).
 pub type StouCallback = Box<dyn FnOnce(io::Result<String>) + Send>;
+/// Callback invoked once the data connection is armed and ready to accept
+/// upload content, for STOR / APPE / STOU.
+pub type StorReady = Box<dyn FnOnce(FtpStorHandle) + Send>;
 /// Callback for an arbitrary command's outcome: `Ok(text)` with the
 /// success reply's text (e.g. `PWD`'s quoted path), or `Err` on a
 /// mismatched/rejected reply code. Registering a callback via
@@ -115,35 +168,34 @@ pub(crate) enum QueuedOp {
         path: String,
         /// RFC 959 §4.1.3 resume offset; sends `REST offset` first.
         offset: Option<u64>,
-        callback: RetrCallback,
+        receiver: Box<dyn MessageReceiveCallback>,
     },
-    /// Passive STOR (data wrapped in `Arc` to avoid copying in the factory
-    /// closure).
+    /// Passive STOR.
     Stor {
         path: String,
-        data: Arc<Vec<u8>>,
         /// RFC 959 §4.1.3 resume offset; sends `REST offset` first.
         offset: Option<u64>,
+        ready: StorReady,
         callback: StorCallback,
     },
     /// Passive LIST.
     List {
         path: Option<String>,
-        callback: RetrCallback,
+        receiver: Box<dyn MessageReceiveCallback>,
     },
     /// Passive APPE (append to an existing file, or create it).
     Appe {
         path: String,
-        data: Arc<Vec<u8>>,
+        ready: StorReady,
         callback: StorCallback,
     },
     /// Passive NLST (name-only listing).
     Nlst {
         path: Option<String>,
-        callback: RetrCallback,
+        receiver: Box<dyn MessageReceiveCallback>,
     },
     /// Passive STOU (store with a server-assigned unique filename).
-    Stou { data: Arc<Vec<u8>>, callback: StouCallback },
+    Stou { ready: StorReady, callback: StouCallback },
     /// Send `QUIT` and close.
     Quit,
 }
@@ -189,29 +241,35 @@ pub trait FtpSessionWrite: Send {
     /// or `Err` on a mismatched/rejected reply. Unlike [`Self::command`],
     /// a mismatch here does *not* fail the pipeline — the callback decides.
     fn command_reply(&mut self, verb: &str, arg: Option<&str>, expect: u16, callback: CmdCallback);
-    /// Queue a passive RETR; `callback` receives the file bytes.
-    fn retr(&mut self, path: &str, callback: RetrCallback);
+    /// Queue a passive RETR; `receiver` is driven with the file content as
+    /// it arrives on the data connection.
+    fn retr(&mut self, path: &str, receiver: Box<dyn MessageReceiveCallback>);
     /// Queue a passive RETR resuming from `offset` (RFC 959 §4.1.3 — sends
     /// `REST offset`, expecting `350`, before `RETR`).
-    fn retr_from(&mut self, path: &str, offset: u64, callback: RetrCallback);
-    /// Queue a passive STOR; `callback` receives `Ok(())` on success.
-    fn stor(&mut self, path: &str, data: Vec<u8>, callback: StorCallback);
+    fn retr_from(&mut self, path: &str, offset: u64, receiver: Box<dyn MessageReceiveCallback>);
+    /// Queue a passive STOR; `ready` is called once the data connection is
+    /// armed with a [`FtpStorHandle`] to push content through, `callback`
+    /// receives `Ok(())` on success.
+    fn stor(&mut self, path: &str, ready: StorReady, callback: StorCallback);
     /// Queue a passive STOR resuming from `offset` (RFC 959 §4.1.3 — sends
-    /// `REST offset`, expecting `350`, before `STOR`). `data` is the
-    /// remaining bytes to send — i.e. the file's content starting at
-    /// `offset`, not the whole file.
-    fn stor_from(&mut self, path: &str, offset: u64, data: Vec<u8>, callback: StorCallback);
-    /// Queue a passive LIST; `callback` receives the directory listing bytes.
-    fn list(&mut self, path: Option<&str>, callback: RetrCallback);
+    /// `REST offset`, expecting `350`, before `STOR`); the content pushed
+    /// through the resulting [`FtpStorHandle`] must start at `offset`, not
+    /// the whole file.
+    fn stor_from(&mut self, path: &str, offset: u64, ready: StorReady, callback: StorCallback);
+    /// Queue a passive LIST; `receiver` is driven with the directory listing
+    /// as it arrives.
+    fn list(&mut self, path: Option<&str>, receiver: Box<dyn MessageReceiveCallback>);
     /// Queue a passive APPE (append to `path`, creating it if it doesn't
-    /// exist); `callback` receives `Ok(())` on success.
-    fn appe(&mut self, path: &str, data: Vec<u8>, callback: StorCallback);
-    /// Queue a passive NLST (name-only listing); `callback` receives the
-    /// listing bytes.
-    fn nlst(&mut self, path: Option<&str>, callback: RetrCallback);
+    /// exist); `ready` is called once the data connection is armed,
+    /// `callback` receives `Ok(())` on success.
+    fn appe(&mut self, path: &str, ready: StorReady, callback: StorCallback);
+    /// Queue a passive NLST (name-only listing); `receiver` is driven with
+    /// the listing as it arrives.
+    fn nlst(&mut self, path: Option<&str>, receiver: Box<dyn MessageReceiveCallback>);
     /// Queue a passive STOU (store with a server-assigned unique filename);
-    /// `callback` receives the assigned filename on success.
-    fn stou(&mut self, data: Vec<u8>, callback: StouCallback);
+    /// `ready` is called once the data connection is armed, `callback`
+    /// receives the assigned filename on success.
+    fn stou(&mut self, ready: StorReady, callback: StouCallback);
     /// Queue `QUIT`.
     fn quit(&mut self);
 }
@@ -253,64 +311,64 @@ impl FtpSessionWrite for OpQueue {
         });
     }
 
-    fn retr(&mut self, path: &str, callback: RetrCallback) {
+    fn retr(&mut self, path: &str, receiver: Box<dyn MessageReceiveCallback>) {
         self.ops.push_back(QueuedOp::Retr {
             path: path.to_string(),
             offset: None,
-            callback,
+            receiver,
         });
     }
 
-    fn retr_from(&mut self, path: &str, offset: u64, callback: RetrCallback) {
+    fn retr_from(&mut self, path: &str, offset: u64, receiver: Box<dyn MessageReceiveCallback>) {
         self.ops.push_back(QueuedOp::Retr {
             path: path.to_string(),
             offset: Some(offset),
-            callback,
+            receiver,
         });
     }
 
-    fn stor(&mut self, path: &str, data: Vec<u8>, callback: StorCallback) {
+    fn stor(&mut self, path: &str, ready: StorReady, callback: StorCallback) {
         self.ops.push_back(QueuedOp::Stor {
             path: path.to_string(),
-            data: Arc::new(data),
             offset: None,
+            ready,
             callback,
         });
     }
 
-    fn stor_from(&mut self, path: &str, offset: u64, data: Vec<u8>, callback: StorCallback) {
+    fn stor_from(&mut self, path: &str, offset: u64, ready: StorReady, callback: StorCallback) {
         self.ops.push_back(QueuedOp::Stor {
             path: path.to_string(),
-            data: Arc::new(data),
             offset: Some(offset),
+            ready,
             callback,
         });
     }
 
-    fn list(&mut self, path: Option<&str>, callback: RetrCallback) {
+    fn list(&mut self, path: Option<&str>, receiver: Box<dyn MessageReceiveCallback>) {
         self.ops.push_back(QueuedOp::List {
             path: path.map(|s| s.to_string()),
-            callback,
+            receiver,
         });
     }
 
-    fn appe(&mut self, path: &str, data: Vec<u8>, callback: StorCallback) {
+    fn appe(&mut self, path: &str, ready: StorReady, callback: StorCallback) {
         self.ops.push_back(QueuedOp::Appe {
             path: path.to_string(),
-            data: Arc::new(data),
+            ready,
             callback,
         });
     }
 
-    fn nlst(&mut self, path: Option<&str>, callback: RetrCallback) {
+    fn nlst(&mut self, path: Option<&str>, receiver: Box<dyn MessageReceiveCallback>) {
         self.ops.push_back(QueuedOp::Nlst {
             path: path.map(|s| s.to_string()),
-            callback,
+            receiver,
         });
     }
 
-    fn stou(&mut self, data: Vec<u8>, callback: StouCallback) {
-        self.ops.push_back(QueuedOp::Stou { data: Arc::new(data), callback });
+    fn stou(&mut self, ready: StorReady, callback: StouCallback) {
+        self.ops.push_back(QueuedOp::Stou { ready, callback });
     }
 
     fn quit(&mut self) {

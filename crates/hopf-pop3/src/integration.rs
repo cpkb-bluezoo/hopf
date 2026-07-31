@@ -12,7 +12,35 @@ use hopf_auth::PasswordStore;
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_mailbox::{MailboxFactory, MaildirFactory};
 
+use crate::client::MessageReceiveCallback;
 use crate::{Pop3Client, Pop3ClientTimeouts, Pop3Config, Pop3Fetch, Pop3Service};
+
+/// Test-only whole-message append, via the real streaming push triad
+/// ([`hopf_mailbox::AppendGuard`]) — never bypasses it.
+fn append_whole(mb: &mut dyn hopf_mailbox::Mailbox, data: &[u8]) {
+    let mut guard = hopf_mailbox::AppendGuard::start(mb, &BTreeSet::new(), None).unwrap();
+    guard.append_content(data).unwrap();
+    guard.commit().unwrap();
+}
+
+/// Test-only [`MessageReceiveCallback`] that collects each message's whole
+/// content into `received` for assertions — the real streaming callback
+/// path is still exercised end-to-end; this just happens to buffer the
+/// result for comparison, per this crate's testing convention.
+struct CollectMessages(Arc<Mutex<Vec<Vec<u8>>>>, Vec<u8>);
+
+impl MessageReceiveCallback for CollectMessages {
+    fn start_message(&mut self, _id: u32, _uid: Option<&str>) {
+        self.1.clear();
+    }
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
+        self.1.extend_from_slice(chunk);
+        true
+    }
+    fn end_message(&mut self) {
+        self.0.lock().unwrap().push(std::mem::take(&mut self.1));
+    }
+}
 
 #[test]
 fn pop3_user_pass_stat_retr_dele_quit() {
@@ -22,12 +50,7 @@ fn pop3_user_pass_stat_retr_dele_quit() {
         let mut store = factory.create_store();
         store.open("alice").unwrap();
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
-        mb.append_message(
-            b"From: a@b\r\nSubject: hi\r\n\r\nhello\r\n",
-            &BTreeSet::new(),
-            None,
-        )
-        .unwrap();
+        append_whole(mb.as_mut(), b"From: a@b\r\nSubject: hi\r\n\r\nhello\r\n");
         mb.close(false).unwrap();
         store.close().unwrap();
     }
@@ -121,12 +144,7 @@ fn start_pop3_server_with_message(
         let mut store = factory.create_store();
         store.open("alice").unwrap();
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
-        mb.append_message(
-            b"From: a@b\r\nSubject: client test\r\n\r\nhello pop3 client\r\n",
-            &BTreeSet::new(),
-            None,
-        )
-        .unwrap();
+        append_whole(mb.as_mut(), b"From: a@b\r\nSubject: client test\r\n\r\nhello pop3 client\r\n");
         mb.close(false).unwrap();
         store.close().unwrap();
     }
@@ -152,9 +170,7 @@ fn client_fetch_round_trip() {
 
     let fetch = Pop3Fetch::new()
         .credentials("alice", "secret")
-        .on_message(Box::new(move |_id, _uid, bytes| {
-            received2.lock().unwrap().push(bytes);
-        }))
+        .on_message(Box::new(CollectMessages(received2, Vec::new())))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
         }));
@@ -281,9 +297,7 @@ fn client_localhost_hostname_dial() {
     let fetch = Pop3Fetch::new()
         .credentials("alice", "secret")
         .prefer_apop(false)
-        .on_message(Box::new(move |_id, _uid, bytes| {
-            received2.lock().unwrap().push(bytes);
-        }))
+        .on_message(Box::new(CollectMessages(received2, Vec::new())))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
         }));
@@ -317,12 +331,7 @@ fn client_stls_fetch() {
         let mut store = factory.create_store();
         store.open("alice").unwrap();
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
-        mb.append_message(
-            b"From: a@b\r\nSubject: stls\r\n\r\nstls-body\r\n",
-            &BTreeSet::new(),
-            None,
-        )
-        .unwrap();
+        append_whole(mb.as_mut(), b"From: a@b\r\nSubject: stls\r\n\r\nstls-body\r\n");
         mb.close(false).unwrap();
         store.close().unwrap();
     }
@@ -359,9 +368,7 @@ fn client_stls_fetch() {
         .credentials("alice", "secret")
         .prefer_apop(false)
         .require_stls(true)
-        .on_message(Box::new(move |_id, _uid, bytes| {
-            received2.lock().unwrap().push(bytes);
-        }))
+        .on_message(Box::new(CollectMessages(received2, Vec::new())))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
         }));

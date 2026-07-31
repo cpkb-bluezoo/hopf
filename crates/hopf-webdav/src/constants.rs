@@ -74,5 +74,10 @@ pub const CONTENT_TYPE_XML: &str = "application/xml; charset=utf-8";
 
 pub const LOCK_TOKEN_SCHEME: &str = "opaquelocktoken:";
 
-/// Maximum WebDAV control-document body size (1 MiB).
+/// Maximum WebDAV control-document body size (1 MiB) — PROPFIND / PROPPATCH
+/// / LOCK request bodies, which stay small XML documents.
 pub const MAX_WEBDAV_REQUEST_BODY: usize = 1 << 20;
+
+/// Maximum PUT upload size (10 GiB) — checked incrementally as chunks
+/// arrive, never after buffering the whole body.
+pub const MAX_WEBDAV_PUT_BODY: u64 = 10 << 30;

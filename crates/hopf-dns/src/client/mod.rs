@@ -74,6 +74,61 @@ pub trait DnsClientTransportHandler: Send {
     fn on_error(&mut self, server: SocketAddr, err: io::Error);
 }
 
+/// Which wire transport to use for one configured upstream server.
+///
+/// Selected per-server (not globally) so a resolver can mix, e.g., a fast
+/// plaintext UDP server with a DoT/DoQ/DoH fallback — [`retry_or_fail`]
+/// walks `servers` in order regardless of which transport each one uses.
+#[derive(Clone)]
+enum ServerTransport {
+    /// UDP with automatic TCP-on-truncation fallback (today's default,
+    /// and the only transport available without the `dot`/`doq`/`doh`
+    /// features).
+    UdpTcp,
+    /// DNS-over-TLS (RFC 7858). `query_dot` is synchronous, so each query
+    /// runs on a dedicated spawned thread (mirroring the existing
+    /// UDP-truncation TCP-fallback pattern) rather than blocking the
+    /// caller.
+    #[cfg(feature = "dot")]
+    Dot {
+        server_name: String,
+        connector: hopf_core::SharedTlsConnector,
+    },
+    /// DNS-over-QUIC (RFC 9250), via [`DoqClientTransport`].
+    #[cfg(feature = "doq")]
+    Doq {
+        server_name: String,
+        client_config: Arc<hopf_quic::QuicClientConfig>,
+    },
+    /// DNS-over-HTTPS (RFC 8484), via [`DohClientTransport`]. Carries its
+    /// own `Arc<Runtime>` (needed to dial) rather than requiring
+    /// `ResolverInner` to hold one — DoT/DoQ/UDP need no `Runtime` at all.
+    #[cfg(feature = "doh")]
+    Doh {
+        runtime: Arc<Runtime>,
+        host: String,
+        path: String,
+        connector: hopf_core::SharedTlsConnector,
+        use_get: bool,
+    },
+}
+
+/// One configured upstream server: address + how to speak to it.
+#[derive(Clone)]
+struct ConfiguredServer {
+    addr: SocketAddr,
+    transport: ServerTransport,
+}
+
+impl ConfiguredServer {
+    fn udp_tcp(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            transport: ServerTransport::UdpTcp,
+        }
+    }
+}
+
 struct PendingQuery {
     callback: QueryCallback,
     question: DnsQuestion,
@@ -94,6 +149,13 @@ struct PendingQuery {
     #[cfg_attr(not(feature = "dnssec"), allow(dead_code))]
     cd: bool,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Keeps a DoQ/DoH transport's live driver/connection alive for as
+    /// long as this query is outstanding (dropping
+    /// [`DoqClientTransport`]/[`DohClientTransport`] mid-flight would tear
+    /// the connection down before a response can arrive — see
+    /// [`send_query_to_server`]). `None` for UDP/TCP/DoT, which need no
+    /// such handle.
+    active_transport: Option<Box<dyn std::any::Any + Send>>,
 }
 
 /// Allocate a query id that isn't already in use by another outstanding
@@ -114,22 +176,41 @@ fn alloc_id(g: &ResolverInner) -> u16 {
 /// Exhausting every server fails the query as `TimedOut`, same as when
 /// only one server was ever configured. Also used to (re-)arm the timeout
 /// for a CNAME-chase re-query, which previously had none at all.
+/// On timeout, retry against the next configured server (see
+/// [`retry_or_fail`]'s own doc comment above); exhausting the list fails
+/// with `TimedOut`.
 fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
+    retry_or_fail_impl(inner, id, || {
+        io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out")
+    });
+}
+
+/// As [`retry_or_fail`], but triggered by a transport-level failure (DoT
+/// connect/handshake error, DoQ/DoH `on_error`) rather than the timeout
+/// timer — a dead/unreachable encrypted upstream should fail over to the
+/// next configured server exactly like a dead UDP one, not just sit until
+/// the timeout eventually fires. `err` becomes the final failure reported
+/// to the caller once every server has been tried.
+fn retry_after_transport_error(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error) {
+    retry_or_fail_impl(inner, id, move || err);
+}
+
+fn retry_or_fail_impl(inner: &Arc<Mutex<ResolverInner>>, id: u16, final_error: impl FnOnce() -> io::Error) {
     let mut g = inner.lock().unwrap();
     let Some(mut pending) = g.pending.remove(&id) else {
-        return; // already answered, or a stale timer from an earlier retry
+        return; // already answered, or a stale timer/callback from an earlier attempt
     };
+    if let Some(c) = &pending.cancel {
+        c.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let next_idx = pending.server_idx + 1;
-    let Some(&next_server) = g.servers.get(next_idx) else {
+    if next_idx >= g.servers.len() {
         drop(g);
-        (pending.callback)(Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "DNS query timed out",
-        )));
+        (pending.callback)(Err(final_error()));
         return;
-    };
+    }
     pending.server_idx = next_idx;
-    pending.server = next_server;
+    pending.server = g.servers[next_idx].addr;
     let new_id = alloc_id(&g);
     pending.id = new_id;
     let timeout = g.timeout;
@@ -137,14 +218,17 @@ fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
     let cancel = g.reactor.schedule_timer(timeout, Box::new(move || retry_or_fail(&inner2, new_id)));
     pending.cancel = Some(cancel);
     let question = pending.question.clone();
-    g.pending.insert(new_id, pending);
-    if let Err(e) = send_udp_query(&mut g, new_id, &question, next_server) {
-        if let Some(p) = g.pending.remove(&new_id) {
-            if let Some(c) = &p.cancel {
+    match send_query_to_server(inner, &mut g, new_id, &question, next_idx) {
+        Ok(keepalive) => {
+            pending.active_transport = keepalive;
+            g.pending.insert(new_id, pending);
+        }
+        Err(e) => {
+            if let Some(c) = &pending.cancel {
                 c.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             drop(g);
-            (p.callback)(Err(e));
+            (pending.callback)(Err(e));
         }
     }
 }
@@ -267,7 +351,7 @@ fn questions_match(a: &DnsQuestion, b: &DnsQuestion) -> bool {
 struct ResolverInner {
     reactor: ReactorHandle,
     udp_token: Option<Token>,
-    servers: Vec<SocketAddr>,
+    servers: Vec<ConfiguredServer>,
     pending: HashMap<u16, PendingQuery>,
     ids: DnsQueryIdGenerator,
     cache: Arc<DnsCache>,
@@ -346,9 +430,12 @@ impl DnsResolver {
         self.inner.lock().unwrap().timeout = timeout;
     }
 
-    /// Add upstream (`addr` already resolved).
+    /// Add upstream (`addr` already resolved). Plain UDP with automatic
+    /// TCP-on-truncation fallback — see [`Self::add_server_dot`]/
+    /// [`Self::add_server_doq`]/[`Self::add_server_doh`] for encrypted
+    /// transports.
     pub fn add_server(&self, addr: SocketAddr) {
-        self.inner.lock().unwrap().servers.push(addr);
+        self.inner.lock().unwrap().servers.push(ConfiguredServer::udp_tcp(addr));
     }
 
     /// Add upstream by IP string + port.
@@ -358,6 +445,75 @@ impl DnsResolver {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         self.add_server(SocketAddr::new(ip, port));
         Ok(())
+    }
+
+    /// Add a DNS-over-TLS (RFC 7858) upstream: every query/retry/CNAME
+    /// chase step sent to `addr` goes out over `connector`'s TLS-wrapped
+    /// TCP (SNI `server_name`) instead of UDP, transparently reusing a
+    /// pooled connection across queries (see
+    /// [`TcpDnsConnectionPool::query_dot`]). Caching, DNSSEC validation,
+    /// bailiwick filtering, and cross-server retry/failover all keep
+    /// working unmodified on top of it.
+    #[cfg(feature = "dot")]
+    pub fn add_server_dot(
+        &self,
+        addr: SocketAddr,
+        server_name: impl Into<String>,
+        connector: hopf_core::SharedTlsConnector,
+    ) {
+        self.inner.lock().unwrap().servers.push(ConfiguredServer {
+            addr,
+            transport: ServerTransport::Dot {
+                server_name: server_name.into(),
+                connector,
+            },
+        });
+    }
+
+    /// Add a DNS-over-QUIC (RFC 9250) upstream: every query/retry/CNAME
+    /// chase step sent to `addr` dials fresh via QUIC (SNI `server_name`,
+    /// `client_config` — its ALPN should advertise `doq`) instead of UDP.
+    #[cfg(feature = "doq")]
+    pub fn add_server_doq(
+        &self,
+        addr: SocketAddr,
+        server_name: impl Into<String>,
+        client_config: Arc<hopf_quic::QuicClientConfig>,
+    ) {
+        self.inner.lock().unwrap().servers.push(ConfiguredServer {
+            addr,
+            transport: ServerTransport::Doq {
+                server_name: server_name.into(),
+                client_config,
+            },
+        });
+    }
+
+    /// Add a DNS-over-HTTPS (RFC 8484) upstream: every query/retry/CNAME
+    /// chase step sent to `addr` dials via HTTPS (`host`/`path`,
+    /// `connector`) on `runtime` instead of UDP. `use_get` selects GET
+    /// (RFC 8484 §4.1, cacheable by URL) over the default POST.
+    #[cfg(feature = "doh")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_server_doh(
+        &self,
+        addr: SocketAddr,
+        runtime: Arc<Runtime>,
+        host: impl Into<String>,
+        path: impl Into<String>,
+        connector: hopf_core::SharedTlsConnector,
+        use_get: bool,
+    ) {
+        self.inner.lock().unwrap().servers.push(ConfiguredServer {
+            addr,
+            transport: ServerTransport::Doh {
+                runtime,
+                host: host.into(),
+                path: path.into(),
+                connector,
+                use_get,
+            },
+        });
     }
 
     /// Use Google + Cloudflare public resolvers.
@@ -371,7 +527,7 @@ impl DnsResolver {
         let servers = crate::system::system_nameservers()?;
         let mut g = self.inner.lock().unwrap();
         for s in servers {
-            g.servers.push(s);
+            g.servers.push(ConfiguredServer::udp_tcp(s));
         }
         Ok(())
     }
@@ -587,7 +743,7 @@ impl DnsResolver {
             return;
         }
         let id = alloc_id(&g);
-        let server = g.servers[0];
+        let server = g.servers[0].addr;
         let timeout = g.timeout;
         let cancel = g.reactor.schedule_timer(
             timeout,
@@ -596,26 +752,27 @@ impl DnsResolver {
                 move || retry_or_fail(&inner, id)
             }),
         );
-        g.pending.insert(
-            id,
-            PendingQuery {
-                callback: cb,
-                question: question.clone(),
-                server_idx: 0,
-                cname_depth: 0,
-                id,
-                server,
-                cd,
-                cancel: Some(cancel),
-            },
-        );
-        if let Err(e) = send_udp_query(&mut g, id, &question, server) {
-            if let Some(p) = g.pending.remove(&id) {
-                if let Some(c) = &p.cancel {
-                    c.store(true, std::sync::atomic::Ordering::SeqCst);
-                }
+        match send_query_to_server(&self.inner, &mut g, id, &question, 0) {
+            Ok(keepalive) => {
+                g.pending.insert(
+                    id,
+                    PendingQuery {
+                        callback: cb,
+                        question: question.clone(),
+                        server_idx: 0,
+                        cname_depth: 0,
+                        id,
+                        server,
+                        cd,
+                        cancel: Some(cancel),
+                        active_transport: keepalive,
+                    },
+                );
+            }
+            Err(e) => {
+                cancel.store(true, std::sync::atomic::Ordering::SeqCst);
                 drop(g);
-                (p.callback)(Err(e));
+                cb(Err(e));
             }
         }
     }
@@ -724,6 +881,34 @@ fn hosts_answers(question: &DnsQuestion) -> Option<Vec<DnsResourceRecord>> {
     }
 }
 
+/// Build the outbound `DnsMessage` for `question`, adding an EDNS OPT RR
+/// (DO bit, and — only for UDP, where RFC 7873 cookies actually defend
+/// against off-path spoofing — an RFC 7873 cookie keyed on `cookie_key`)
+/// when `g.use_edns`. Shared by every transport so cache/DNSSEC/EDNS
+/// behavior stays identical regardless of which one is speaking to the
+/// wire.
+fn build_query_message(
+    g: &ResolverInner,
+    id: u16,
+    question: &DnsQuestion,
+    cookie_key: Option<SocketAddr>,
+) -> DnsMessage {
+    let mut msg = DnsMessage::query(id, question.clone(), true);
+    if g.use_edns {
+        let opt_rdata = match cookie_key {
+            Some(server) if g.use_cookies => g.cookies.encode_edns_option(&server.to_string()),
+            _ => Vec::new(),
+        };
+        #[cfg(feature = "dnssec")]
+        let do_bit = g.dnssec_enabled;
+        #[cfg(not(feature = "dnssec"))]
+        let do_bit = false;
+        msg.additionals
+            .push(DnsResourceRecord::opt(OPT_UDP_PAYLOAD, do_bit, &opt_rdata));
+    }
+    msg
+}
+
 fn send_udp_query(
     g: &mut ResolverInner,
     id: u16,
@@ -733,25 +918,186 @@ fn send_udp_query(
     let token = g
         .udp_token
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "resolver not open"))?;
-    let mut msg = DnsMessage::query(id, question.clone(), true);
-    if g.use_edns {
-        let opt_rdata = if g.use_cookies {
-            g.cookies.encode_edns_option(&server.to_string())
-        } else {
-            Vec::new()
-        };
-        #[cfg(feature = "dnssec")]
-        let do_bit = g.dnssec_enabled;
-        #[cfg(not(feature = "dnssec"))]
-        let do_bit = false;
-        msg.additionals
-            .push(DnsResourceRecord::opt(OPT_UDP_PAYLOAD, do_bit, &opt_rdata));
-    }
+    let msg = build_query_message(g, id, question, Some(server));
     let bytes = msg
         .serialize()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     g.reactor.udp_send(token, server, bytes);
     Ok(())
+}
+
+/// Dispatch one query attempt to whichever transport `server_idx` is
+/// configured for, returning an opaque handle the caller must fold into
+/// the resulting [`PendingQuery::active_transport`] — dropping it early
+/// would tear down an in-flight DoQ/DoH connection before its response can
+/// arrive (see [`PendingQuery::active_transport`]'s doc comment).
+///
+/// UDP and DoT are fire-and-forget from the caller's point of view (UDP
+/// sends synchronously via the reactor; DoT spawns a dedicated thread and
+/// drives the whole exchange itself, matching the existing UDP-truncation
+/// TCP-fallback pattern) — both return `Ok(None)`. DoQ/DoH are also
+/// fire-and-forget (per [`DnsClientTransport::send_query`]'s contract) but
+/// need their transport instance kept alive, so they return `Ok(Some(_))`.
+fn send_query_to_server(
+    inner: &Arc<Mutex<ResolverInner>>,
+    g: &mut ResolverInner,
+    id: u16,
+    question: &DnsQuestion,
+    server_idx: usize,
+) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
+    let server = g.servers[server_idx].clone();
+    match server.transport {
+        ServerTransport::UdpTcp => {
+            send_udp_query(g, id, question, server.addr)?;
+            Ok(None)
+        }
+        #[cfg(feature = "dot")]
+        ServerTransport::Dot { server_name, connector } => {
+            spawn_dot_query(inner, id, question.clone(), server.addr, server_name, connector);
+            Ok(None)
+        }
+        #[cfg(feature = "doq")]
+        ServerTransport::Doq { server_name, client_config } => {
+            let mut transport = doq::DoqClientTransport::new(client_config, server_name);
+            let msg = build_query_message(g, id, question, None);
+            let bytes = msg
+                .serialize()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let handler = Box::new(TransportResponseHandler {
+                inner: Arc::clone(inner),
+                id,
+            });
+            transport.send_query(server.addr, &bytes, handler)?;
+            Ok(Some(Box::new(transport)))
+        }
+        #[cfg(feature = "doh")]
+        ServerTransport::Doh { runtime, host, path, connector, use_get } => {
+            let mut transport = doh::DohClientTransport::https(runtime, host, path, connector).with_get(use_get);
+            let msg = build_query_message(g, id, question, None);
+            let bytes = msg
+                .serialize()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let handler = Box::new(TransportResponseHandler {
+                inner: Arc::clone(inner),
+                id,
+            });
+            transport.send_query(server.addr, &bytes, handler)?;
+            Ok(Some(Box::new(transport)))
+        }
+    }
+}
+
+/// Drive one DoT query on a dedicated thread ([`TcpDnsConnectionPool::query_dot`]
+/// is synchronous) — mirrors the existing UDP-truncation TCP-fallback
+/// thread exactly, down to reusing [`complete_response`]/[`questions_match`]
+/// for the success path and [`retry_or_fail`]'s next-server failover for
+/// the error path (a dead/unreachable DoT server should fail over just
+/// like a dead UDP one, not just time out silently).
+#[cfg(feature = "dot")]
+fn spawn_dot_query(
+    inner: &Arc<Mutex<ResolverInner>>,
+    id: u16,
+    question: DnsQuestion,
+    addr: SocketAddr,
+    server_name: String,
+    connector: hopf_core::SharedTlsConnector,
+) {
+    let inner = Arc::clone(inner);
+    std::thread::Builder::new()
+        .name("hopf-dns-dot".into())
+        .spawn(move || {
+            let result = {
+                let mut g = inner.lock().unwrap();
+                g.tcp_pool.query_dot(addr, &server_name, &connector, &question, id)
+            };
+            match result {
+                Ok(msg) => {
+                    let pending = {
+                        let mut g = inner.lock().unwrap();
+                        let Some(p) = g.pending.remove(&id) else {
+                            return;
+                        };
+                        if let Some(c) = &p.cancel {
+                            c.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        p
+                    };
+                    if !msg.questions.first().is_some_and(|q| questions_match(q, &pending.question)) {
+                        (pending.callback)(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "DNS response question mismatch",
+                        )));
+                        return;
+                    }
+                    complete_response(&inner, pending, msg, addr);
+                }
+                Err(e) => retry_after_transport_error(&inner, id, e),
+            }
+        })
+        .ok();
+}
+
+/// Adapts a [`DnsClientTransport`] (DoQ/DoH)'s callback shape onto the
+/// resolver's own pending-query bookkeeping. Unlike the UDP path, there's
+/// no need to match the response against `g.pending` by wire message id +
+/// source address (RFC 5452 §2.2): `id` here is this specific query's own
+/// resolver-internal id, captured by closure when [`send_query_to_server`]
+/// constructed this handler, so the response is already known to belong to
+/// this query before it's even parsed — DoQ zeroes the wire id per RFC
+/// 9250 §4.2.1 anyway, and DoH has no need for it either (HTTP's own
+/// request/response pairing already disambiguates). The question is still
+/// compared as basic hygiene against a misbehaving server.
+#[cfg(any(feature = "doq", feature = "doh"))]
+struct TransportResponseHandler {
+    inner: Arc<Mutex<ResolverInner>>,
+    id: u16,
+}
+
+#[cfg(any(feature = "doq", feature = "doh"))]
+impl DnsClientTransportHandler for TransportResponseHandler {
+    fn on_response(&mut self, server: SocketAddr, data: &[u8]) {
+        let msg = match DnsMessage::parse(data) {
+            Ok(msg) => msg,
+            Err(_) => {
+                fail_pending(&self.inner, self.id, io::Error::new(io::ErrorKind::InvalidData, "malformed DNS response"));
+                return;
+            }
+        };
+        let pending = {
+            let mut g = self.inner.lock().unwrap();
+            let Some(p) = g.pending.remove(&self.id) else {
+                return;
+            };
+            if let Some(c) = &p.cancel {
+                c.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            p
+        };
+        if !msg.questions.first().is_some_and(|q| questions_match(q, &pending.question)) {
+            (pending.callback)(Err(io::Error::new(io::ErrorKind::InvalidData, "DNS response question mismatch")));
+            return;
+        }
+        complete_response(&self.inner, pending, msg, server);
+    }
+
+    fn on_error(&mut self, _server: SocketAddr, err: io::Error) {
+        retry_after_transport_error(&self.inner, self.id, err);
+    }
+}
+
+/// Remove and fail a pending query outright (no next-server retry) — used
+/// where a malformed response, not a transport-level failure, is the
+/// problem, so retrying the same or another server isn't expected to help.
+fn fail_pending(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error) {
+    let mut g = inner.lock().unwrap();
+    let Some(pending) = g.pending.remove(&id) else {
+        return;
+    };
+    if let Some(c) = &pending.cancel {
+        c.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    drop(g);
+    (pending.callback)(Err(err));
 }
 
 struct ResolverUdpHandler {
@@ -846,15 +1192,20 @@ fn complete_response(
                     pending.question = DnsQuestion::in_class(cname, qtype);
                     let id = alloc_id(&g);
                     pending.id = id;
-                    let server = g.servers.get(pending.server_idx).copied().unwrap_or(server);
-                    pending.server = server;
+                    let server_idx = pending.server_idx;
+                    pending.server = g.servers.get(server_idx).map(|s| s.addr).unwrap_or(server);
                     let timeout = g.timeout;
                     let inner2 = Arc::clone(inner);
                     let cancel = g.reactor.schedule_timer(timeout, Box::new(move || retry_or_fail(&inner2, id)));
                     pending.cancel = Some(cancel);
                     let q = pending.question.clone();
+                    // Best-effort re-query on the same server/transport, ignoring a
+                    // dispatch error the same way the pre-transport-abstraction code
+                    // did: `pending` is still inserted, so the timeout timer (already
+                    // armed above) is what eventually cleans it up either way.
+                    let keepalive = send_query_to_server(inner, &mut g, id, &q, server_idx).ok().flatten();
+                    pending.active_transport = keepalive;
                     g.pending.insert(id, pending);
-                    let _ = send_udp_query(&mut g, id, &q, server);
                     return;
                 }
             }
@@ -983,6 +1334,7 @@ mod tests {
                 server: "127.0.0.1:53".parse().unwrap(),
                 cd: false,
                 cancel: None,
+                active_transport: None,
             },
         );
         for _ in 0..1000 {
@@ -1086,6 +1438,7 @@ mod tests {
             server: "127.0.0.1:53".parse().unwrap(),
             cd,
             cancel: None,
+            active_transport: None,
         }
     }
 

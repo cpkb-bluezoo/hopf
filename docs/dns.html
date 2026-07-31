@@ -146,10 +146,11 @@
 <pre><code>App
  │  DnsResolver (per Runtime / ReactorHandle)
  │    ├── hosts file + literal IP short-circuit
- │    ├── UDP query (+ EDNS, cookies)
- │    ├── truncation → TCP fallback (helper thread)
- │    ├── CNAME chase (depth ≤ 8)
- │    └── optional DnsCache + DnssecValidator
+ │    ├── per-server transport (add_server*): UDP (+EDNS, cookies) + TCP
+ │    │     fallback by default, or DoT / DoQ / DoH per configured server
+ │    ├── retry/failover across configured servers (mixed transports OK)
+ │    ├── CNAME chase (depth ≤ 8, same transport as the server it started on)
+ │    └── optional DnsCache + DnssecValidator (identical for every transport)
  │
  └── (feature server) DnsService caching forwarder
          ├── listen_dns_udp
@@ -157,7 +158,7 @@
          └── listen_dns_doq  (+doq)</code></pre>
 <p><code>RuntimeDnsExt::connect_by_name</code> — async resolve then <code>Runtime::connect</code> on <code>Arc&lt;Runtime&gt;</code> (returns immediately; dial runs from the DNS callback).</p>
 <h2 id="resolver">Resolver</h2>
-<p><code>DnsResolver</code> — async stub on a reactor.</p>
+<p><code>DnsResolver</code> — async stub on a reactor, and (since issue #90) multi-protocol: each configured upstream server carries its own transport (UDP+TCP-fallback by default, or DoT/DoQ/DoH), selected per-server via <code>add_server_dot</code>/<code>add_server_doq</code>/<code>add_server_doh</code> rather than globally — a resolver can mix a fast plaintext server with an encrypted fallback. Every query helper (<code>query_a</code>, <code>resolve</code>, …), retry/failover across configured servers, CNAME chase, response caching, and DNSSEC validation work identically regardless of which transport actually carried the query — they all run in the same transport-agnostic completion path the wire bytes land in once decoded. RFC 7873 cookies stay UDP-only (the anti-spoofing defense they exist for doesn't apply to a TLS/QUIC/HTTPS-authenticated transport).</p>
 <p><strong>Query helpers:</strong> <code>query_a</code>, <code>query_aaaa</code>, <code>query_mx</code>, <code>query_txt</code>, <code>query_ptr</code>, <code>query_srv</code>, generic <code>query(DnsQuestion, …)</code>.</p>
 <p><strong>Happy Eyeballs:</strong> <code>resolve(host, port, ResolveCallback)</code> — parallel A+AAAA, IPv6-first ordering.</p>
 <p><strong>Helpers:</strong> <code>HostsFile</code>, <code>parse_literal_ip</code>, <code>DnsCache</code>, <code>DnsCookie</code>, bailiwick filters (<code>filter_answers_in_bailiwick</code>, <code>is_within_bailiwick</code>, <code>names_equal</code>).</p>
@@ -233,9 +234,9 @@
 </tr>
 </tbody>
 </table>
-<p>Traits: <code>DnsClientTransport</code>, <code>DnsClientTransportHandler</code>. Each <code>send_query</code> schedules I/O and returns immediately; responses arrive via the handler callback — there is no blocking query API.</p>
+<p>Traits: <code>DnsClientTransport</code>, <code>DnsClientTransportHandler</code>. Each <code>send_query</code> schedules I/O and returns immediately; responses arrive via the handler callback — there is no blocking query API. These aren't just standalone building blocks: <code>DnsResolver::add_server_doq</code>/<code>add_server_doh</code> construct and drive them directly as part of the resolver's own query pipeline (see <a href="#resolver">Resolver</a>), keeping the transport instance alive for exactly as long as one query is outstanding.</p>
 <p>DoH (<code>DohClientTransport</code>) and DoQ (<code>DoqClientTransport</code>) are <code>DnsClientTransport</code> implementations: DoH dials HTTP/1.1 (POST by default, or GET via <code>with_get(true)</code>) on a shared <code>Arc&lt;Runtime&gt;</code>; DoQ dials via <code>hopf-quic</code>, zeroing the DNS message ID both directions (RFC 9250 §4.2.1). Neither waits on the caller thread.</p>
-<p>DoT client uses <code>hopf-tls</code> when feature <code>dot</code> is enabled. <code>TcpDnsConnectionPool</code> (shared by plain TCP and DoT) reuses a live connection per destination server across queries instead of dialing fresh every time, transparently reconnecting (and, for DoT, re-handshaking) if a reused connection turns out to be stale.</p>
+<p>DoT client uses <code>hopf-tls</code> when feature <code>dot</code> is enabled. <code>TcpDnsConnectionPool</code> (shared by plain TCP and DoT) reuses a live connection per destination server across queries instead of dialing fresh every time, transparently reconnecting (and, for DoT, re-handshaking) if a reused connection turns out to be stale. Since <code>query_dot</code> is synchronous, <code>DnsResolver::add_server_dot</code> drives each query on a dedicated spawned thread — the same pattern already used for UDP's own truncation → TCP fallback.</p>
 <p><strong>DoQ limitations:</strong> every query still dials a brand-new QUIC connection — no session-ticket caching, 0-RTT, or cross-query connection reuse (RFC 9250 §4.5/§5.5.1) — and EDNS Padding (<code>encode_edns_padding</code>, RFC 7830/RFC 9250 §5.4) isn't automatically applied to DoQ/DoT queries, though the codec is available for a caller to compose in.</p>
 <h2 id="dnssec">DNSSEC</h2>
 <p>Feature <code>dnssec</code> (+ <code>ring</code>):</p>
@@ -321,8 +322,8 @@
 </tbody>
 </table>
 <h3 id="resolver-setters">Resolver setters</h3>
-<p><code>set_timeout</code>, <code>set_cache</code> / <code>cache</code>, <code>add_server</code> / <code>add_server_str</code>, <code>use_public_resolvers</code>, <code>use_system_resolvers</code>, <code>set_dnssec_enabled</code>, <code>set_dnssec_validator</code>.</p>
-<p><strong>Note:</strong> addresses passed to <code>add_server</code> must be <strong>pre-resolved</strong>.</p>
+<p><code>set_timeout</code>, <code>set_cache</code> / <code>cache</code>, <code>add_server</code> / <code>add_server_str</code> (UDP+TCP-fallback), <code>add_server_dot</code> (<code>dot</code> feature), <code>add_server_doq</code> (<code>doq</code> feature), <code>add_server_doh</code> (<code>doh</code> feature), <code>use_public_resolvers</code>, <code>use_system_resolvers</code>, <code>set_dnssec_enabled</code>, <code>set_dnssec_validator</code>.</p>
+<p><strong>Note:</strong> addresses passed to any <code>add_server*</code> method must be <strong>pre-resolved</strong>. <code>add_server_dot</code> takes a TLS SNI name + <code>SharedTlsConnector</code>; <code>add_server_doq</code> takes a TLS SNI name + <code>Arc&lt;QuicClientConfig&gt;</code> (ALPN <code>doq</code>); <code>add_server_doh</code> takes an <code>Arc&lt;Runtime&gt;</code> (needed to dial), host/path, a <code>SharedTlsConnector</code>, and a GET-vs-POST flag.</p>
 <h3 id="cargo-features">Cargo features</h3>
 <table>
 <thead>

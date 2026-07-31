@@ -15,7 +15,7 @@ categories = ["email", "filesystem"]
 [dependencies]
 hopf-core = { workspace = true }
 rmimeparser = { workspace = true }
-md-5 = { workspace = true }
+sha2 = "0.10"
 libc = "0.2"
 crc32fast = "1"
 

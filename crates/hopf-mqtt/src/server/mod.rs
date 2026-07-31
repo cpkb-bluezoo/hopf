@@ -13,6 +13,7 @@ pub mod broker;
 mod config;
 mod control;
 mod handler;
+mod publish_spool;
 mod service;
 mod store;
 

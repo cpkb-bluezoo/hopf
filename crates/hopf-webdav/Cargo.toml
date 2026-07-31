@@ -24,7 +24,7 @@ hopf-http = { workspace = true }
 tractrix = { workspace = true }
 bytes = "1"
 getrandom = "0.2"
-md-5 = "0.10"
+sha2 = "0.10"
 xattr = { version = "1", optional = true }
 
 [dev-dependencies]

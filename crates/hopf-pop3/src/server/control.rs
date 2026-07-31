@@ -14,7 +14,6 @@ use rmimeparser::charset::base64;
 
 use crate::server::auth::{advertised_mechanisms, apop_timestamp, capa_sasl_line, verify_apop};
 use crate::server::codec::{Pop3Command, Pop3ServerLexer, MAX_COMMAND_LINE};
-use crate::server::egress::dot_stuff_message;
 use crate::server::handler::{
     AuthenticateState, AuthorizationHandler, ClientConnected, ConnectedState, ListState,
     ListWriter, MailboxStatusState, MarkDeletedState, ResetState, RetrieveState, TopState,
@@ -783,29 +782,38 @@ impl Pop3ControlHandler {
         let busy = Arc::clone(&self.busy);
         self.set_busy(true);
         endpoint.pause_read();
-        self.runtime.storage().submit_on(
+        // The status line is sent up front — `size` is already known from
+        // mailbox metadata, so this doesn't need the storage round trip.
+        // Only a rare mid-stream I/O error (mailbox closed concurrently, a
+        // disk fault) can still happen after this; that closes the
+        // connection instead of trying to report an error mid-response,
+        // which POP3's framing has no way to do gracefully once `+OK` has
+        // already gone out — see `Pop3DotStuffer`.
+        self.send(endpoint, reply::ok(&format!("{size} octets")));
+        Pop3ServerMetrics::add(&metrics.retr, 1);
+        self.runtime.storage().submit_streamed(
             handle.clone(),
-            move || {
+            move |push| {
                 let mut g = bundle.lock().unwrap();
                 let mb = g
                     .mailbox
                     .as_mut()
                     .ok_or_else(|| "mailbox closed".to_string())?;
-                let data = mb.read_message(msg).map_err(|e| e.to_string())?;
-                Ok((size, data))
+                let conn = push.clone();
+                let mut cb = PushDotStuffer::new(move |bytes: &[u8]| conn.send(bytes.to_vec()));
+                let result = mb.read_message(msg, &mut cb).map_err(|e| e.to_string());
+                cb.finish();
+                result?;
+                Ok(())
             },
-            move |result: Result<(u64, Vec<u8>), StorageError>| {
+            move |result: Result<(), StorageError>| {
+                if let Err(e) = result {
+                    // The status line already went out; nothing left to do
+                    // but log and let the client observe a truncated
+                    // download / closed connection.
+                    eprintln!("hopf-pop3: RETR failed mid-stream: {e}");
+                }
                 handle.with_endpoint(move |ep| {
-                    match result {
-                        Ok((sz, data)) => {
-                            Pop3ServerMetrics::add(&metrics.retr, 1);
-                            ep.send(&reply::ok(&format!("{sz} octets")));
-                            ep.send(&dot_stuff_message(&data));
-                        }
-                        Err(e) => {
-                            ep.send(&reply::err(&format!("[SYS/TEMP] {e}")));
-                        }
-                    }
                     busy.store(false, Ordering::Relaxed);
                     ep.resume_read();
                 });
@@ -820,27 +828,27 @@ impl Pop3ControlHandler {
         let busy = Arc::clone(&self.busy);
         self.set_busy(true);
         endpoint.pause_read();
-        self.runtime.storage().submit_on(
+        self.send(endpoint, reply::ok("Top of message follows"));
+        self.runtime.storage().submit_streamed(
             handle.clone(),
-            move || {
+            move |push| {
                 let mut g = bundle.lock().unwrap();
                 let mb = g
                     .mailbox
                     .as_mut()
                     .ok_or_else(|| "mailbox closed".to_string())?;
-                Ok(read_top_streaming(mb.as_mut(), msg, lines).map_err(|e| e.to_string())?)
+                let conn = push.clone();
+                let mut cb = TopPushCallback::new(move |bytes: &[u8]| conn.send(bytes.to_vec()), lines);
+                let result = mb.read_message(msg, &mut cb).map_err(|e| e.to_string());
+                cb.finish();
+                result?;
+                Ok(())
             },
-            move |result: Result<Vec<u8>, StorageError>| {
+            move |result: Result<(), StorageError>| {
+                if let Err(e) = result {
+                    eprintln!("hopf-pop3: TOP failed mid-stream: {e}");
+                }
                 handle.with_endpoint(move |ep| {
-                    match result {
-                        Ok(data) => {
-                            ep.send(&reply::ok("Top of message follows"));
-                            ep.send(&dot_stuff_message(&data));
-                        }
-                        Err(e) => {
-                            ep.send(&reply::err(&format!("[SYS/TEMP] {e}")));
-                        }
-                    }
                     busy.store(false, Ordering::Relaxed);
                     ep.resume_read();
                 });
@@ -1357,75 +1365,131 @@ impl UpdateState for QuitView<'_> {
     }
 }
 
-/// TOP (RFC 1939 §7): headers plus the first `lines` body lines. Reads via
-/// the streaming triad and stops as soon as enough body lines are collected
-/// — unlike a `read_message` + truncate approach, this never reads (let
-/// alone holds in memory) the rest of a large message just to discard it.
-fn read_top_streaming(
-    mb: &mut dyn Mailbox,
-    message_number: u32,
-    lines: u32,
-) -> MailboxResult<Vec<u8>> {
-    mb.start_read(message_number)?;
-    let mut out = Vec::new();
-    let mut carry: Vec<u8> = Vec::new();
-    let mut in_body = false;
-    let mut body_lines_left = lines;
-    let mut buf = [0u8; 8192];
-
-    'outer: loop {
-        let n = mb.read_chunk(&mut buf)?;
-        if n == 0 {
-            if !carry.is_empty() {
-                emit_top_line(&mut out, &carry, &mut in_body, &mut body_lines_left);
-            }
-            break;
-        }
-        carry.extend_from_slice(&buf[..n]);
-        loop {
-            let Some(nl) = carry.iter().position(|&b| b == b'\n') else {
-                break;
-            };
-            let raw_line: Vec<u8> = carry.drain(..=nl).collect();
-            if !emit_top_line(&mut out, &raw_line, &mut in_body, &mut body_lines_left) {
-                break 'outer;
-            }
-        }
-    }
-    mb.end_read()?;
-    Ok(out)
+/// RETR: pushes each chunk through [`crate::server::egress::Pop3DotStuffer`]
+/// straight to `push` as it arrives — never buffers the message.
+struct PushDotStuffer<F: FnMut(&[u8])> {
+    push: F,
+    stuffer: crate::server::egress::Pop3DotStuffer,
+    out: Vec<u8>,
 }
 
-/// Append one line to `out`; returns `false` once `body_lines_left` is
-/// exhausted, telling the caller to stop reading further chunks entirely.
-fn emit_top_line(
-    out: &mut Vec<u8>,
-    raw_line: &[u8],
-    in_body: &mut bool,
-    body_lines_left: &mut u32,
-) -> bool {
-    let mut end = raw_line.len();
-    if end > 0 && raw_line[end - 1] == b'\n' {
-        end -= 1;
+impl<F: FnMut(&[u8])> PushDotStuffer<F> {
+    fn new(push: F) -> Self {
+        Self {
+            push,
+            stuffer: crate::server::egress::Pop3DotStuffer::new(),
+            out: Vec::new(),
+        }
     }
-    if end > 0 && raw_line[end - 1] == b'\r' {
-        end -= 1;
+
+    /// Flush the terminating `.\r\n` (and any trailing unterminated line).
+    fn finish(&mut self) {
+        self.out.clear();
+        self.stuffer.finish(&mut self.out);
+        if !self.out.is_empty() {
+            (self.push)(&self.out);
+        }
     }
-    let line = &raw_line[..end];
-    if !*in_body {
-        out.extend_from_slice(line);
-        out.extend_from_slice(b"\r\n");
-        if line.is_empty() {
-            *in_body = true;
+}
+
+impl<F: FnMut(&[u8])> hopf_mailbox::MessageReadCallback for PushDotStuffer<F> {
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
+        self.out.clear();
+        self.stuffer.feed(chunk, &mut self.out);
+        if !self.out.is_empty() {
+            (self.push)(&self.out);
         }
         true
-    } else {
-        if *body_lines_left == 0 {
-            return false;
+    }
+}
+
+/// TOP (RFC 1939 §7): headers plus the first `lines` body lines, dot-stuffed
+/// and pushed straight to `push` as they're found — stops reading further
+/// chunks entirely (via [`hopf_mailbox::MessageReadCallback::message_content`]
+/// returning `false`) once the body-line budget is exhausted, so this never
+/// reads — let alone holds in memory — the rest of a large message just to
+/// discard it.
+struct TopPushCallback<F: FnMut(&[u8])> {
+    push: F,
+    carry: Vec<u8>,
+    in_body: bool,
+    body_lines_left: u32,
+    scratch: Vec<u8>,
+}
+
+impl<F: FnMut(&[u8])> TopPushCallback<F> {
+    fn new(push: F, lines: u32) -> Self {
+        Self {
+            push,
+            carry: Vec::new(),
+            in_body: false,
+            body_lines_left: lines,
+            scratch: Vec::new(),
         }
-        out.extend_from_slice(line);
-        out.extend_from_slice(b"\r\n");
-        *body_lines_left -= 1;
+    }
+
+    /// Dot-stuff-and-push one already-terminator-stripped, bare-CR-stripped
+    /// line.
+    fn push_line(&mut self, line: &[u8]) {
+        self.scratch.clear();
+        if line.first() == Some(&b'.') {
+            self.scratch.push(b'.');
+        }
+        self.scratch.extend_from_slice(line);
+        self.scratch.extend_from_slice(b"\r\n");
+        (self.push)(&self.scratch);
+    }
+
+    /// Process one raw (terminator-included) line; `false` once the body
+    /// budget is exhausted.
+    fn emit_line(&mut self, raw_line: &[u8]) -> bool {
+        let mut end = raw_line.len();
+        if end > 0 && raw_line[end - 1] == b'\n' {
+            end -= 1;
+        }
+        if end > 0 && raw_line[end - 1] == b'\r' {
+            end -= 1;
+        }
+        let mut line = raw_line[..end].to_vec();
+        line.retain(|&b| b != b'\r');
+        if !self.in_body {
+            self.push_line(&line);
+            if line.is_empty() {
+                self.in_body = true;
+            }
+            true
+        } else {
+            if self.body_lines_left == 0 {
+                return false;
+            }
+            self.push_line(&line);
+            self.body_lines_left -= 1;
+            true
+        }
+    }
+
+    /// Flush any trailing unterminated line, then the dot-stuff terminator.
+    fn finish(&mut self) {
+        if !self.carry.is_empty() {
+            let carry = std::mem::take(&mut self.carry);
+            self.emit_line(&carry);
+        }
+        (self.push)(b".\r\n");
+    }
+}
+
+impl<F: FnMut(&[u8])> hopf_mailbox::MessageReadCallback for TopPushCallback<F> {
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
+        self.carry.extend_from_slice(chunk);
+        loop {
+            let Some(nl) = self.carry.iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let raw_line: Vec<u8> = self.carry.drain(..=nl).collect();
+            if !self.emit_line(&raw_line) {
+                return false;
+            }
+        }
         true
     }
 }
@@ -1434,10 +1498,10 @@ fn emit_top_line(
 mod top_streaming_tests {
     use std::collections::BTreeSet;
 
-    use hopf_mailbox::{MailboxFactory, MailboxStore};
+    use hopf_mailbox::{AppendGuard, MailboxFactory, MailboxStore, MessageReadCallback};
     use tempfile::tempdir;
 
-    use super::read_top_streaming;
+    use super::TopPushCallback;
 
     fn mailbox_with(msg: &[u8]) -> (tempfile::TempDir, Box<dyn hopf_mailbox::Mailbox>) {
         let dir = tempdir().unwrap();
@@ -1445,46 +1509,87 @@ mod top_streaming_tests {
         let mut store = factory.create_store();
         store.open("topuser").unwrap();
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
-        mb.append_message(msg, &BTreeSet::new(), None).unwrap();
+        let mut guard = AppendGuard::start(mb.as_mut(), &BTreeSet::new(), None).unwrap();
+        guard.append_content(msg).unwrap();
+        guard.commit().unwrap();
         (dir, mb)
     }
 
+    /// Drives the real production `TopPushCallback` (the same one
+    /// `start_top_offload` uses), collecting its pushed chunks into a
+    /// `Vec<u8>` for assertions — including the dot-stuff terminator.
+    fn top_dot_stuffed(mb: &mut dyn hopf_mailbox::Mailbox, message_number: u32, lines: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut cb = TopPushCallback::new(|bytes: &[u8]| out.extend_from_slice(bytes), lines);
+            mb.read_message(message_number, &mut cb).unwrap();
+            cb.finish();
+        }
+        out
+    }
+
     #[test]
-    fn matches_reference_truncation() {
+    fn matches_reference_truncation_plus_dot_stuff() {
         let msg = b"From: a@b\r\nSubject: x\r\n\r\nbody1\r\nbody2\r\nbody3\r\n";
         let (_dir, mut mb) = mailbox_with(msg);
-        let top = read_top_streaming(mb.as_mut(), 1, 1).unwrap();
-        assert_eq!(
-            top,
-            crate::server::egress::truncate_top(msg, 1),
-            "streaming TOP must match the reference whole-buffer implementation"
-        );
+        let top = top_dot_stuffed(mb.as_mut(), 1, 1);
+        assert_eq!(top, b"From: a@b\r\nSubject: x\r\n\r\nbody1\r\n.\r\n".to_vec());
     }
 
     #[test]
     fn zero_lines_returns_headers_only() {
         let msg = b"From: a@b\r\nSubject: x\r\n\r\nbody1\r\nbody2\r\n";
         let (_dir, mut mb) = mailbox_with(msg);
-        let top = read_top_streaming(mb.as_mut(), 1, 0).unwrap();
-        assert_eq!(top, b"From: a@b\r\nSubject: x\r\n\r\n".to_vec());
+        let top = top_dot_stuffed(mb.as_mut(), 1, 0);
+        assert_eq!(top, b"From: a@b\r\nSubject: x\r\n\r\n.\r\n".to_vec());
     }
 
     #[test]
     fn lines_beyond_message_length_returns_whole_body() {
         let msg = b"Subject: x\r\n\r\nonly-line\r\n";
         let (_dir, mut mb) = mailbox_with(msg);
-        let top = read_top_streaming(mb.as_mut(), 1, 100).unwrap();
-        assert_eq!(top, msg.to_vec());
+        let top = top_dot_stuffed(mb.as_mut(), 1, 100);
+        assert_eq!(top, b"Subject: x\r\n\r\nonly-line\r\n.\r\n".to_vec());
     }
 
     #[test]
     fn handles_message_with_no_trailing_newline() {
         let msg = b"Subject: x\r\n\r\nbody1\r\nbody2-no-trailing-newline";
         let (_dir, mut mb) = mailbox_with(msg);
-        let top = read_top_streaming(mb.as_mut(), 1, 5).unwrap();
+        let top = top_dot_stuffed(mb.as_mut(), 1, 5);
         assert_eq!(
             top,
-            b"Subject: x\r\n\r\nbody1\r\nbody2-no-trailing-newline\r\n".to_vec()
+            b"Subject: x\r\n\r\nbody1\r\nbody2-no-trailing-newline\r\n.\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn doubles_a_leading_dot_in_a_body_line() {
+        let msg = b"Subject: x\r\n\r\n.leading dot\r\nplain\r\n";
+        let (_dir, mut mb) = mailbox_with(msg);
+        let top = top_dot_stuffed(mb.as_mut(), 1, 2);
+        assert_eq!(
+            top,
+            b"Subject: x\r\n\r\n..leading dot\r\nplain\r\n.\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn stops_reading_further_chunks_once_line_budget_hit() {
+        // A callback that records how many message_content calls it saw
+        // *after* the budget-exhausted false return would require peeking
+        // at read_message's internals; instead assert indirectly: pushed
+        // output never contains body content past the requested line
+        // count, for a message much larger than the requested budget.
+        let mut msg = b"Subject: x\r\n\r\n".to_vec();
+        for i in 0..1000 {
+            msg.extend_from_slice(format!("line{i}\r\n").as_bytes());
+        }
+        let (_dir, mut mb) = mailbox_with(&msg);
+        let top = top_dot_stuffed(mb.as_mut(), 1, 3);
+        assert_eq!(
+            top,
+            b"Subject: x\r\n\r\nline0\r\nline1\r\nline2\r\n.\r\n".to_vec()
         );
     }
 }

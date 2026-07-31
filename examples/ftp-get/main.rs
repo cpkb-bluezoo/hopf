@@ -20,7 +20,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hopf_core::{Runtime, RuntimeConfig};
-use hopf_ftp::{FtpClient, FtpClientTimeouts, FtpGet};
+use hopf_ftp::{FtpClient, FtpClientTimeouts, FtpGet, MessageReceiveCallback};
+
+/// Writes each chunk straight to stdout as it arrives — the file is never
+/// buffered whole in memory.
+struct StdoutWriter {
+    result: Arc<Mutex<Option<io::Result<()>>>>,
+}
+
+impl MessageReceiveCallback for StdoutWriter {
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
+        io::stdout().write_all(chunk).is_ok()
+    }
+
+    fn end_message(&mut self, result: io::Result<()>) {
+        *self.result.lock().unwrap() = Some(result);
+    }
+}
 
 fn main() -> io::Result<()> {
     // Parse arguments: [host[:port]] [remote_path]
@@ -32,12 +48,10 @@ fn main() -> io::Result<()> {
     let user = env::var("FTP_USER").unwrap_or_else(|_| "ftp".into());
     let pass = env::var("FTP_PASS").unwrap_or_else(|_| "ftp".into());
 
-    let result: Arc<Mutex<Option<io::Result<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+    let result: Arc<Mutex<Option<io::Result<()>>>> = Arc::new(Mutex::new(None));
     let result2 = Arc::clone(&result);
 
-    let pipeline = FtpGet::new(&remote, move |r| {
-        *result2.lock().unwrap() = Some(r);
-    });
+    let pipeline = FtpGet::new(&remote, Box::new(StdoutWriter { result: result2 }));
 
     let rt = Arc::new(Runtime::start(RuntimeConfig {
         worker_threads: 1,
@@ -61,8 +75,7 @@ fn main() -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(r) = result.lock().unwrap().take() {
-            let data = r.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            io::stdout().write_all(&data)?;
+            r.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             break;
         }
         if Instant::now() > deadline {

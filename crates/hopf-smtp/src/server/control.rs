@@ -645,7 +645,23 @@ impl SmtpControlHandler {
                 return;
             }
             if let Some(p) = &mut self.pipeline {
-                p.message_content(&chunk);
+                if !p.message_content(&chunk) {
+                    // Unrecoverable pipeline error (e.g. disk full): stop
+                    // wasting the transfer on a message that's already
+                    // doomed. RFC 5321 gives no way to reply mid-DATA, so
+                    // this mirrors the max-size abort above — reply now,
+                    // reset the transaction, and discard whatever's left
+                    // in this read (the client's own eventual terminator
+                    // gets reinterpreted as a fresh command line, same as
+                    // any other mid-DATA abort here).
+                    if let Some(m) = &mut self.message {
+                        m.message_aborted();
+                    }
+                    self.send_enhanced(endpoint, 452, "4.3.1", "Insufficient system storage");
+                    self.reset_transaction();
+                    *data = &[];
+                    return;
+                }
             } else if let Some(m) = &mut self.message {
                 m.message_content(&chunk);
             }
@@ -681,7 +697,15 @@ impl SmtpControlHandler {
         }
         if !chunk.is_empty() {
             if let Some(p) = &mut self.pipeline {
-                p.message_content(&chunk);
+                if !p.message_content(&chunk) {
+                    if let Some(m) = &mut self.message {
+                        m.message_aborted();
+                    }
+                    self.send_enhanced(endpoint, 452, "4.3.1", "Insufficient system storage");
+                    self.reset_transaction();
+                    *data = &[];
+                    return;
+                }
             } else if let Some(m) = &mut self.message {
                 m.message_content(&chunk);
             }

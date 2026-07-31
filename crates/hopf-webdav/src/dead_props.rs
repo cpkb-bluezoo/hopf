@@ -7,7 +7,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use md5::{Digest, Md5};
+use sha2::{Digest, Sha256};
 
 /// Sidecar file prefix (Gumdrop-compatible).
 pub const SIDECAR_PREFIX: &str = ".webdav_";
@@ -386,7 +386,7 @@ pub fn namespace_hash(ns: &str) -> String {
     if ns.is_empty() {
         return "00000000".to_string();
     }
-    let digest = Md5::digest(ns.as_bytes());
+    let digest = Sha256::digest(ns.as_bytes());
     format!("{:02x}{:02x}{:02x}{:02x}", digest[0], digest[1], digest[2], digest[3])
 }
 

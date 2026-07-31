@@ -117,10 +117,10 @@ impl DnsLookup for FakeDns {
 
 fn sign_and_assemble(key: &DkimPrivateKey, body: &[u8]) -> Vec<RawHeader> {
     let mut headers = sample_headers();
-    let value = DkimSigner::new(key, "example.com", "selector1")
-        .timestamp(1_753_700_000)
-        .sign(&headers, body)
-        .unwrap();
+    let signer = DkimSigner::new(key, "example.com", "selector1").timestamp(1_753_700_000);
+    let mut stream = signer.start(&headers);
+    stream.feed(body);
+    let value = stream.finish().unwrap();
     let mut bytes = b"DKIM-Signature: ".to_vec();
     bytes.extend_from_slice(value.as_bytes());
     bytes.extend_from_slice(b"\r\n");
@@ -128,17 +128,21 @@ fn sign_and_assemble(key: &DkimPrivateKey, body: &[u8]) -> Vec<RawHeader> {
     headers
 }
 
+/// Drives the same streaming verification path `run_all_streaming` does,
+/// but returns only the first signature's result — the behavior these
+/// tests originally exercised via the now-removed whole-buffer
+/// `verify_first` (deleted: zero production callers, `verify_all_with_body_hashes`
+/// is the real path `AuthPipeline` uses). A message with no `DKIM-Signature`
+/// header at all yields an empty result list from the streaming verifier
+/// (nothing to iterate), so that case is synthesized here to match
+/// `verify_first`'s old explicit `DkimResult::None` behavior.
 fn run_first(dns: FakeDns, headers: Vec<RawHeader>, body: &[u8]) -> DkimSignatureResult {
-    let out = Arc::new(Mutex::new(None));
-    let out2 = Arc::clone(&out);
-    verify_first(
-        Arc::new(dns),
-        Arc::new(headers),
-        Arc::new(body.to_vec()),
-        Box::new(move |r| *out2.lock().unwrap() = Some(r)),
-    );
-    let r = out.lock().unwrap().take().unwrap();
-    r
+    let results = run_all_streaming(dns, headers, body, 64);
+    results.into_iter().next().unwrap_or(DkimSignatureResult {
+        result: DkimResult::None,
+        signing_domain: None,
+        selector: None,
+    })
 }
 
 #[test]

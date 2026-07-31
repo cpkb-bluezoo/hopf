@@ -14,7 +14,7 @@ mod session;
 
 pub use codec::{Pop3Command, Pop3ServerLexer, MAX_COMMAND_LINE};
 pub use control::Pop3ControlHandler;
-pub use egress::{dot_stuff_message, truncate_top};
+pub use egress::Pop3DotStuffer;
 pub use handler::{
     AuthorizationHandler, ClientConnected, DefaultPop3Handler, DefaultPop3HandlerFactory,
     Pop3HandlerFactory, TransactionHandler,

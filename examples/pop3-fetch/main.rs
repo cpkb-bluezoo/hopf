@@ -18,7 +18,52 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hopf_core::{Runtime, RuntimeConfig};
+use hopf_pop3::client::MessageReceiveCallback;
 use hopf_pop3::{Pop3Client, Pop3ClientTimeouts, Pop3Fetch};
+
+/// Prints each message's id and a preview of its first 512 bytes, without
+/// ever buffering the whole message — just the bounded preview window.
+struct PreviewPrinter {
+    msg_count: Arc<Mutex<usize>>,
+    id: u32,
+    preview: Vec<u8>,
+    total_len: usize,
+}
+
+impl MessageReceiveCallback for PreviewPrinter {
+    fn start_message(&mut self, id: u32, _uid: Option<&str>) {
+        self.id = id;
+        self.preview.clear();
+        self.total_len = 0;
+    }
+
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
+        self.total_len += chunk.len();
+        if self.preview.len() < 512 {
+            let take = (512 - self.preview.len()).min(chunk.len());
+            self.preview.extend_from_slice(&chunk[..take]);
+        }
+        true
+    }
+
+    fn end_message(&mut self) {
+        let count = {
+            let mut c = self.msg_count.lock().unwrap();
+            *c += 1;
+            *c
+        };
+        let preview = String::from_utf8_lossy(&self.preview);
+        println!(
+            "── message {} [{} bytes, #{count}] ──",
+            self.id, self.total_len
+        );
+        println!("{preview}");
+        if self.total_len > self.preview.len() {
+            println!("... ({} bytes remaining)", self.total_len - self.preview.len());
+        }
+        println!();
+    }
+}
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -45,23 +90,11 @@ fn main() -> io::Result<()> {
     let fetch = Pop3Fetch::new()
         .credentials(user, pass)
         .delete_after_fetch(delete)
-        .on_message(Box::new(move |id, uid, bytes| {
-            let count = {
-                let mut c = msg_count2.lock().unwrap();
-                *c += 1;
-                *c
-            };
-            let preview_len = bytes.len().min(512);
-            let preview = String::from_utf8_lossy(&bytes[..preview_len]);
-            println!(
-                "── message {id} (uid={uid:?}) [{} bytes, #{count}] ──",
-                bytes.len()
-            );
-            println!("{preview}");
-            if bytes.len() > 512 {
-                println!("... ({} bytes remaining)", bytes.len() - 512);
-            }
-            println!();
+        .on_message(Box::new(PreviewPrinter {
+            msg_count: msg_count2,
+            id: 0,
+            preview: Vec::new(),
+            total_len: 0,
         }))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);

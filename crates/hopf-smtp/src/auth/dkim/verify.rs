@@ -64,77 +64,6 @@ pub type DkimAllCallback = Box<dyn FnOnce(Vec<DkimSignatureResult>) + Send>;
 
 const MAX_SIGNATURES: usize = 10;
 
-/// Verify only the first `DKIM-Signature` header (Gumdrop's documented
-/// pipeline behavior — see issue tracking this port).
-pub fn verify_first(
-    dns: Arc<dyn DnsLookup>,
-    headers: Arc<Vec<RawHeader>>,
-    body: Arc<Vec<u8>>,
-    cb: DkimCallback,
-) {
-    let sig = headers
-        .iter()
-        .find(|h| h.name().eq_ignore_ascii_case("DKIM-Signature"));
-    match sig {
-        None => cb(DkimSignatureResult {
-            result: DkimResult::None,
-            signing_domain: None,
-            selector: None,
-        }),
-        Some(sig) => verify_one(dns, headers.clone(), body, sig.clone(), cb),
-    }
-}
-
-/// Verify every `DKIM-Signature` header present (bounded to
-/// [`MAX_SIGNATURES`]) — used for DMARC alignment, which must consider all
-/// valid signatures, not just the first.
-///
-/// Takes the whole message body in memory. For large messages, prefer
-/// [`verify_all_with_body_hashes`] fed by
-/// [`super::canon::IncrementalBodyCanon`] while the message streams in —
-/// see [`required_body_hash_keys`] for how to determine which
-/// canonicalizations to run.
-pub fn verify_all(
-    dns: Arc<dyn DnsLookup>,
-    headers: Arc<Vec<RawHeader>>,
-    body: Arc<Vec<u8>>,
-    cb: DkimAllCallback,
-) {
-    let sigs: Vec<RawHeader> = headers
-        .iter()
-        .filter(|h| h.name().eq_ignore_ascii_case("DKIM-Signature"))
-        .take(MAX_SIGNATURES)
-        .cloned()
-        .collect();
-    step(dns, headers, body, sigs, 0, Vec::new(), cb);
-}
-
-fn step(
-    dns: Arc<dyn DnsLookup>,
-    headers: Arc<Vec<RawHeader>>,
-    body: Arc<Vec<u8>>,
-    sigs: Vec<RawHeader>,
-    i: usize,
-    mut acc: Vec<DkimSignatureResult>,
-    cb: DkimAllCallback,
-) {
-    if i >= sigs.len() {
-        cb(acc);
-        return;
-    }
-    let sig = sigs[i].clone();
-    verify_one(
-        Arc::clone(&dns),
-        Arc::clone(&headers),
-        Arc::clone(&body),
-        sig,
-        Box::new(move |result| {
-            acc.push(result);
-            step(dns, headers, body, sigs, i + 1, acc, cb);
-        }),
-    );
-}
-
 /// Body hashes keyed by the `(c=body-side, l=)` pair that produced them —
 /// enough to answer every `DKIM-Signature` header's body-hash need, since
 /// signatures sharing a `(c, l)` pair also share a body hash. Populate via
@@ -255,35 +184,9 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn verify_one(
-    dns: Arc<dyn DnsLookup>,
-    headers: Arc<Vec<RawHeader>>,
-    body: Arc<Vec<u8>>,
-    sig_header: RawHeader,
-    cb: DkimCallback,
-) {
-    let tags = match parse_signature_tags(&sig_header.as_string_unfolded()) {
-        Ok(t) => t,
-        Err(()) => {
-            cb(DkimSignatureResult {
-                result: DkimResult::PermError,
-                signing_domain: None,
-                selector: None,
-            });
-            return;
-        }
-    };
-    // Body hash check does not require DNS — computed eagerly here (unlike
-    // algo/expiry, which is cheaper still) so a tampered body fails fast
-    // without a network round trip; see verify_tags_and_hash.
-    let computed_bh = sha256(&canon::canon_body(&body, tags.c.1, tags.l));
-    verify_tags_and_hash(dns, headers, tags, computed_bh, sig_header, cb);
-}
-
-/// Shared tail of [`verify_one`] (whole-buffer) and [`verify_one_streaming`]
-/// once each has a `computed_bh` in hand: algo/expiry checks, body-hash
-/// comparison, signature decode, `h=`-selected header canon, and the DNS
-/// key fetch + crypto verify.
+/// Shared tail of [`verify_one_streaming`] once it has a `computed_bh` in
+/// hand: algo/expiry checks, body-hash comparison, signature decode,
+/// `h=`-selected header canon, and the DNS key fetch + crypto verify.
 fn verify_tags_and_hash(
     dns: Arc<dyn DnsLookup>,
     headers: Arc<Vec<RawHeader>>,
@@ -449,12 +352,6 @@ fn evaluate_key(
             }
         }
     }
-}
-
-fn sha256(data: &[u8]) -> Vec<u8> {
-    ring::digest::digest(&ring::digest::SHA256, data)
-        .as_ref()
-        .to_vec()
 }
 
 /// Build the bytes that are actually signed: the selected `h=` headers
