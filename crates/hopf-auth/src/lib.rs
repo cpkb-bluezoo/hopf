@@ -15,6 +15,7 @@ pub mod external;
 pub mod http_digest;
 pub mod login;
 pub mod mechanism;
+pub mod oauth_introspection;
 pub mod oauthbearer;
 pub mod plain;
 pub mod scram;
@@ -22,6 +23,10 @@ pub mod session;
 pub mod store;
 
 pub use mechanism::SaslMechanism;
+pub use oauth_introspection::{
+    IntrospectionCredentialStore, IntrospectionRequest, IntrospectionResponse,
+    IntrospectionTransport,
+};
 pub use session::{
     create_client, create_server, SaslClient, SaslClientStep, SaslServer, SaslServerOptions,
     SaslServerStep,
@@ -186,7 +191,7 @@ mod tests {
             SaslMechanism::External => ("", ""),
             _ => ("alice", "s3cret"),
         };
-        let mut client = create_client(mech, user, pass, "mail.example");
+        let mut client = create_client(mech, user, pass, "mail.example", None);
 
         let mut client_msg: Option<Vec<u8>> = if client.has_initial_response() {
             match client.evaluate(None) {
@@ -236,5 +241,55 @@ mod tests {
         for mech in SaslMechanism::all() {
             roundtrip(*mech, Arc::clone(&store));
         }
+    }
+
+    /// `ScramSha256Plus` is deliberately excluded from
+    /// [`SaslMechanism::all`] (see its doc comment — advertising it by
+    /// default would be a lie for every protocol crate today), but it must
+    /// still be fully constructible and functional through the same
+    /// factory functions for a caller that explicitly wires channel
+    /// binding through.
+    #[test]
+    fn scram_plus_not_in_all_but_still_usable_via_factories() {
+        assert!(!SaslMechanism::all().contains(&SaslMechanism::ScramSha256Plus));
+
+        let store: Arc<dyn CredentialStore> =
+            Arc::new(PasswordStore::new().with_user("alice", "s3cret"));
+        let channel_binding = vec![0x42u8; 32];
+        let opts = SaslServerOptions {
+            channel_binding: Some(channel_binding.clone()),
+            ..Default::default()
+        };
+        let mut server = create_server(SaslMechanism::ScramSha256Plus, store, opts);
+        let mut client = create_client(
+            SaslMechanism::ScramSha256Plus,
+            "alice",
+            "s3cret",
+            "mail.example",
+            Some(&channel_binding),
+        );
+        assert_eq!(server.mechanism(), SaslMechanism::ScramSha256Plus);
+        assert_eq!(client.mechanism(), SaslMechanism::ScramSha256Plus);
+
+        let mut client_msg = match client.evaluate(None) {
+            SaslClientStep::Response(b) => Some(b),
+            other => panic!("unexpected initial step: {other:?}"),
+        };
+        for _ in 0..8 {
+            match server.step(client_msg.as_deref()) {
+                SaslServerStep::Challenge(ch) => match client.evaluate(Some(&ch)) {
+                    SaslClientStep::Response(b) | SaslClientStep::Complete(b) => {
+                        client_msg = if b.is_empty() { None } else { Some(b) };
+                    }
+                    SaslClientStep::Failure => panic!("client failed"),
+                },
+                SaslServerStep::Complete { username, .. } => {
+                    assert_eq!(username, "alice");
+                    return;
+                }
+                SaslServerStep::Failure => panic!("server failed"),
+            }
+        }
+        panic!("did not complete");
     }
 }
