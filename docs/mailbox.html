@@ -170,8 +170,19 @@ MailboxFactory → MailboxStore → Mailbox
 <td>via <code>.flags</code></td>
 <td>Yes</td>
 </tr>
+<tr>
+<td>CONDSTORE (HIGHESTMODSEQ / MODSEQ / CHANGEDSINCE)</td>
+<td>via <code>.flags</code></td>
+<td>via <code>.uidlist</code></td>
+</tr>
+<tr>
+<td>Locking</td>
+<td><code>flock</code> + dotlock (<code>.lock</code>)</td>
+<td>N/A (per-message files, no whole-mailbox lock needed)</td>
+</tr>
 </tbody>
 </table>
+<p>Both backends track a real, persisted, monotonic CONDSTORE mod-sequence per message (bumped on append and on any flag/keyword change, never decreasing even across expunge) — QRESYNC's VANISHED (EARLIER) history is the one CONDSTORE-adjacent piece still out of scope (see Limitations).</p>
 <p>Factories:</p>
 <ul>
 <li><code>MboxFactory::new(root).with_index_config(cfg)</code> → path <code>{root}/{user}</code></li>
@@ -286,6 +297,8 @@ MailboxFactory → MailboxStore → Mailbox
 <h2 id="search">SEARCH</h2>
 <p>Criteria include: ALL, system flags, NEW/OLD, KEYWORD, LARGER/SMALLER, BEFORE/ON/SINCE, SENT*, HEADER, BODY, TEXT, UID / sequence sets, MODSEQ, AND / OR / NOT.</p>
 <p><strong>BODY / TEXT:</strong> use the <code>.gidx</code> body index when <code>body_indexing</code> is enabled; otherwise parse message content on demand.</p>
+<p><strong>HEADER:</strong> six fields (From/Sender/To/Cc/Bcc/Subject/Message-ID) resolve straight from the index; any other header name falls back to a raw per-message header scan (<code>search::HeaderExtractor</code>) rather than reporting empty.</p>
+<p><strong>MODSEQ:</strong> matches against the real, persisted per-message mod-sequence described under Backends compared above.</p>
 <h2 id="indexing">Indexing</h2>
 <p><code>.gidx</code> is Gumdrop-compatible:</p>
 <ul>
@@ -324,6 +337,7 @@ MailboxFactory → MailboxStore → Mailbox
 <li>mbox: no hierarchy / COPY / MOVE. <code>start_read</code> streams in fixed-size chunks but still materializes the one target message up front (not the whole mailbox) — safe re-chunking of the stateful <code>&gt;From</code>-line unescaping across arbitrary chunk boundaries isn't implemented; <code>open()</code>'s full-mailbox scan and append internals are unchanged.</li>
 <li>Body indexing off by default.</li>
 <li>Must keep search/index off the reactor (use <code>StorageExecutor</code>).</li>
+<li><code>Mailbox::expunged_since</code> (QRESYNC VANISHED (EARLIER) history) always returns empty — CONDSTORE's HIGHESTMODSEQ/MODSEQ/CHANGEDSINCE are backed by real per-message tracking, but no backend keeps a tombstone log of past expunges, so a QRESYNC client always falls back to a full resync rather than an incremental one after messages were expunged elsewhere.</li>
 </ul>
 
       <p class="footer">
