@@ -68,6 +68,31 @@ pub struct MailboxStatus {
     pub highest_modseq: u64,
 }
 
+/// Callback for a backend-driven streaming read — see [`Mailbox::read_message`].
+///
+/// The backend owns the read loop and calls these synchronously, in order,
+/// entirely within one [`Mailbox::read_message`] call: `start_message`
+/// once, `message_content` zero or more times, `end_message` once.
+pub trait MessageReadCallback {
+    /// Called once, before any content. `size` is the message's total
+    /// octet count (every current backend already tracks this in its
+    /// message metadata, so it costs nothing to report up front).
+    fn start_message(&mut self, size: u64) {
+        let _ = size;
+    }
+
+    /// Called with each chunk of RFC 822 bytes, in order. Return `false` to
+    /// stop the read early (e.g. a closed destination connection, or a
+    /// body search that already found its match) — `end_message` still
+    /// runs afterward.
+    fn message_content(&mut self, chunk: &[u8]) -> bool;
+
+    /// Called once after the last chunk, whether the read ran to
+    /// completion or was stopped early by `message_content` returning
+    /// `false`.
+    fn end_message(&mut self) {}
+}
+
 /// Single mailbox (folder) — full IMAP surface.
 ///
 /// All methods are blocking. **Indexing and [`search`](Self::search) must run
@@ -116,35 +141,19 @@ pub trait Mailbox: Send {
     /// Enumerate message descriptors in sequence order.
     fn messages(&self) -> MailboxResult<Vec<MessageDescriptor>>;
 
-    /// Begin a streaming read of RFC 822 bytes for `message_number`. Exactly
-    /// one read may be in progress on a given `Mailbox` handle at a time.
-    fn start_read(&mut self, message_number: u32) -> MailboxResult<()>;
-
-    /// Read the next chunk into `buf`, returning the number of bytes
-    /// written. `0` signals end of message — call [`end_read`](Self::end_read) next.
-    fn read_chunk(&mut self, buf: &mut [u8]) -> MailboxResult<usize>;
-
-    /// Finish a streaming read.
-    fn end_read(&mut self) -> MailboxResult<()>;
-
-    /// Convenience: read a complete message via the streaming triad. Prefer
-    /// [`start_read`](Self::start_read)/[`read_chunk`](Self::read_chunk)/[`end_read`](Self::end_read)
-    /// directly when delivering to a socket or another streaming sink —
-    /// this materializes the whole message in memory.
-    fn read_message(&mut self, message_number: u32) -> MailboxResult<Vec<u8>> {
-        self.start_read(message_number)?;
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = self.read_chunk(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n]);
-        }
-        self.end_read()?;
-        Ok(out)
-    }
+    /// Stream RFC 822 bytes for `message_number` to `callback`, which is
+    /// invoked synchronously — `start_message`, then `message_content` one
+    /// or more times, then `end_message` — entirely within this call.
+    ///
+    /// This is the only way to read message content: there is no method
+    /// that returns or accepts a whole message as one buffer. A caller that
+    /// genuinely needs the whole thing (typically only tests) implements a
+    /// [`MessageReadCallback`] that accumulates chunks itself.
+    fn read_message(
+        &mut self,
+        message_number: u32,
+        callback: &mut dyn MessageReadCallback,
+    ) -> MailboxResult<()>;
 
     /// Unique id string for sequence number.
     fn unique_id(&self, message_number: u32) -> MailboxResult<String>;
@@ -283,16 +292,16 @@ pub trait Mailbox: Send {
     /// Finish append; returns new UID.
     fn end_append(&mut self) -> MailboxResult<u64>;
 
-    /// Convenience: append a complete message.
-    fn append_message(
-        &mut self,
-        data: &[u8],
-        flags: &BTreeSet<Flag>,
-        internal_date: Option<SystemTime>,
-    ) -> MailboxResult<u64> {
-        self.start_append(flags, internal_date)?;
-        self.append_content(data)?;
-        self.end_append()
+    /// Abort an in-progress append started via [`Self::start_append`] but
+    /// not finished via [`Self::end_append`] — e.g. because a mid-stream
+    /// [`Self::append_content`] call failed. Cleans up any partial state
+    /// (an orphaned temp file, for backends that write incrementally) so
+    /// the mailbox is left exactly as if `start_append` had never been
+    /// called. Safe to call with no append in progress (a no-op) — the
+    /// default implementation is exactly that, for backends with nothing
+    /// to clean up.
+    fn abort_append(&mut self) -> MailboxResult<()> {
+        Ok(())
     }
 
     /// COPY to another mailbox (Maildir++). Mbox returns unsupported.
@@ -322,6 +331,63 @@ pub trait Mailbox: Send {
 
     /// IMAP SEARCH — **must** be invoked on the storage pool.
     fn search(&self, criteria: &SearchCriteria) -> MailboxResult<Vec<u32>>;
+}
+
+/// RAII wrapper around an in-progress [`Mailbox::start_append`]: stream
+/// content via [`Self::append_content`], then either [`Self::commit`] to
+/// finish it, or just let the guard drop — which calls
+/// [`Mailbox::abort_append`] automatically unless `commit()` was already
+/// reached. This is what makes a mid-stream `?` (e.g. an I/O error reading
+/// the source being appended) roll back cleanly instead of leaving the
+/// mailbox with an orphaned partial append.
+///
+/// ```ignore
+/// let mut guard = AppendGuard::start(mb.as_mut(), &flags, internal_date)?;
+/// for chunk in chunks {
+///     guard.append_content(chunk)?; // early return here => automatic rollback
+/// }
+/// let uid = guard.commit()?;
+/// ```
+pub struct AppendGuard<'a> {
+    mb: &'a mut dyn Mailbox,
+    committed: bool,
+}
+
+impl<'a> AppendGuard<'a> {
+    /// Calls [`Mailbox::start_append`] and returns a guard that will
+    /// [`Mailbox::abort_append`] on drop unless [`Self::commit`] is reached.
+    pub fn start(
+        mb: &'a mut dyn Mailbox,
+        flags: &BTreeSet<Flag>,
+        internal_date: Option<SystemTime>,
+    ) -> MailboxResult<Self> {
+        mb.start_append(flags, internal_date)?;
+        Ok(Self {
+            mb,
+            committed: false,
+        })
+    }
+
+    /// Stream one chunk of content.
+    pub fn append_content(&mut self, data: &[u8]) -> MailboxResult<()> {
+        self.mb.append_content(data)
+    }
+
+    /// Finish the append, returning the new UID and disarming the
+    /// drop-time rollback.
+    pub fn commit(mut self) -> MailboxResult<u64> {
+        let uid = self.mb.end_append()?;
+        self.committed = true;
+        Ok(uid)
+    }
+}
+
+impl Drop for AppendGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.mb.abort_append();
+        }
+    }
 }
 
 /// Multi-mailbox store for one user.

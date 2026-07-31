@@ -70,6 +70,11 @@ fn v5_connect_packet(client_id: &str, clean_start: bool, session_expiry_secs: u3
 /// here) properties block right after the packet id that v3.1.1 lacks;
 /// getting this wrong makes the server misparse the topic filter length.
 fn subscribe_packet(packet_id: u16, topic_filter: &str, version: ProtocolVersion) -> Vec<u8> {
+    subscribe_packet_qos(packet_id, topic_filter, 0, version)
+}
+
+/// As [`subscribe_packet`], but with an explicit requested max QoS byte.
+fn subscribe_packet_qos(packet_id: u16, topic_filter: &str, qos: u8, version: ProtocolVersion) -> Vec<u8> {
     let mut wire = vec![0x82];
     let mut body = packet_id.to_be_bytes().to_vec();
     if version.is_v5() {
@@ -77,7 +82,7 @@ fn subscribe_packet(packet_id: u16, topic_filter: &str, version: ProtocolVersion
     }
     body.extend_from_slice(&(topic_filter.len() as u16).to_be_bytes());
     body.extend_from_slice(topic_filter.as_bytes());
-    body.push(0x00);
+    body.push(qos);
     crate::codec::varint::encode(&mut wire, body.len() as u32);
     wire.extend_from_slice(&body);
     wire
@@ -133,6 +138,115 @@ fn connect_subscribe_publish_fanout_round_trip() {
     let text = String::from_utf8_lossy(received);
     assert!(text.contains("test/topic"));
     assert!(text.contains("hello subscribers"));
+
+    rt.shutdown();
+}
+
+/// A QoS-1 subscriber's PUBLISH is resolved from the broker's spool once
+/// the whole payload has arrived (`BrokerState::deliver_deferred`), rather
+/// than the live QoS-0 fast path — exercised here with a payload spanning
+/// several of the 8KB chunks `stream_file_publish` reads the spool in, to
+/// prove the spool-then-replay round-trips byte for byte regardless of
+/// chunk boundaries.
+#[test]
+fn qos1_subscriber_receives_large_multi_chunk_publish() {
+    let rt = Runtime::start(RuntimeConfig {
+        worker_threads: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let broker = Arc::new(BrokerState::new());
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker);
+    let service = MqttService::new(config);
+    let addr = service.start(&rt).unwrap();
+
+    let mut sub = wait_connect(addr);
+    sub.write_all(&connect_packet("qos1-subscriber")).unwrap();
+    let _ = read_exact_timeout(&mut sub, 4);
+    sub.write_all(&subscribe_packet_qos(0x01, "big/topic", 1, ProtocolVersion::V311))
+        .unwrap();
+    let _ = read_exact_timeout(&mut sub, 5); // SUBACK
+
+    let payload: Vec<u8> = (0..20_000u32).map(|i| (b'a' + (i % 26) as u8)).collect();
+    let mut publisher = wait_connect(addr);
+    publisher.write_all(&connect_packet("qos1-publisher")).unwrap();
+    let _ = read_exact_timeout(&mut publisher, 4);
+    let publish_wire = encode::encode_publish(
+        "big/topic",
+        crate::codec::QoS::AtLeastOnce,
+        false,
+        false,
+        0x55,
+        &payload,
+        &Properties::new(),
+        ProtocolVersion::V311,
+    );
+    publisher.write_all(&publish_wire).unwrap();
+    let puback = read_exact_timeout(&mut publisher, 4);
+    assert_eq!(puback[0], 0x40, "expected PUBACK fixed header byte");
+
+    // Read the forwarded PUBLISH: fixed header, then a varint remaining
+    // length, then topic + packet id + the full payload.
+    let mut first = [0u8; 1];
+    sub.read_exact(&mut first).unwrap();
+    assert_eq!(first[0] & 0xF0, 0x30, "expected a PUBLISH fixed header");
+    let mut remaining_length = 0u32;
+    let mut shift = 0;
+    loop {
+        let mut b = [0u8; 1];
+        sub.read_exact(&mut b).unwrap();
+        remaining_length |= ((b[0] & 0x7F) as u32) << shift;
+        if b[0] & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    let body = read_exact_timeout(&mut sub, remaining_length as usize);
+    let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let topic = &body[2..2 + topic_len];
+    assert_eq!(topic, b"big/topic");
+    // QoS 1: two-byte packet id follows the topic.
+    let payload_start = 2 + topic_len + 2;
+    assert_eq!(&body[payload_start..], payload.as_slice(), "payload should round-trip byte for byte");
+
+    rt.shutdown();
+}
+
+/// PUBLISH payloads over `max_publish_payload` are rejected before any
+/// fan-out/spool work starts, proven here with a tiny cap rather than the
+/// real default.
+#[test]
+fn publish_over_max_payload_is_rejected() {
+    let rt = Runtime::start(RuntimeConfig {
+        worker_threads: 2,
+        ..Default::default()
+    })
+    .unwrap();
+    let broker = Arc::new(BrokerState::new());
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).with_max_publish_payload(8);
+    let service = MqttService::new(config);
+    let addr = service.start(&rt).unwrap();
+
+    let mut publisher = wait_connect(addr);
+    publisher.write_all(&connect_packet("oversized-publisher")).unwrap();
+    let _ = read_exact_timeout(&mut publisher, 4);
+
+    let publish_wire = encode::encode_publish(
+        "t",
+        crate::codec::QoS::AtMostOnce,
+        false,
+        false,
+        0,
+        b"this payload is over eight bytes",
+        &Properties::new(),
+        ProtocolVersion::V311,
+    );
+    publisher.write_all(&publish_wire).unwrap();
+
+    // The server disconnects rather than accepting the oversized PUBLISH.
+    let mut buf = [0u8; 16];
+    let n = publisher.read(&mut buf).unwrap_or(0);
+    assert_eq!(n, 0, "server should have closed the connection, got {n} bytes");
 
     rt.shutdown();
 }

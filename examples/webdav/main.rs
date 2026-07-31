@@ -48,6 +48,7 @@ fn main() -> io::Result<()> {
         webdav_enabled: true,
         welcome_file: "index.html".to_string(),
         dead_property_storage: DeadPropMode::Auto,
+        ..Default::default()
     };
     let factory: Arc<dyn ServerHandlerFactory> =
         Arc::new(WebDavFactory::new(config, Arc::clone(&storage))?);

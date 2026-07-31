@@ -55,6 +55,10 @@ pub(crate) struct TcpConnection {
     pool: Arc<BufferPool>,
     telemetry: Option<Arc<dyn TelemetryHook>>,
     pub interest_dirty: bool,
+    /// Mirrors `open`, but lock-free and cloneable so a [`ConnHandle`] can
+    /// cheaply check liveness from any thread without hopping onto the
+    /// reactor — see [`ConnHandle::is_probably_open`].
+    open_flag: Arc<AtomicBool>,
 }
 
 pub(crate) enum ReadOutcome {
@@ -130,6 +134,7 @@ impl TcpConnection {
             pool,
             telemetry,
             interest_dirty: false,
+            open_flag: Arc::new(AtomicBool::new(true)),
         })
     }
 
@@ -571,6 +576,7 @@ impl TcpConnection {
     pub fn force_close(&mut self) {
         self.cancel_connect_timeout();
         self.open = false;
+        self.open_flag.store(false, Ordering::Release);
         self.closing = true;
         self.close_requested = true;
         self.net_out.clear();
@@ -579,6 +585,7 @@ impl TcpConnection {
 
     pub fn finish_close(&mut self) {
         self.open = false;
+        self.open_flag.store(false, Ordering::Release);
         self.closing = true;
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         self.call_disconnected();
@@ -754,7 +761,7 @@ impl Endpoint for TcpConnection {
     }
 
     fn handle(&self) -> ConnHandle {
-        ConnHandle::new(self.reactor.clone(), self.token)
+        ConnHandle::new(self.reactor.clone(), self.token, Arc::clone(&self.open_flag))
     }
 
     fn fail(&mut self, err: io::Error) {

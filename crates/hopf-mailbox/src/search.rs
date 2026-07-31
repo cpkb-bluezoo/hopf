@@ -3,7 +3,7 @@
 //! IMAP SEARCH criteria and message context.
 
 use std::collections::BTreeSet;
-use std::io;
+use std::io::{self, Read};
 
 use crate::flag::Flag;
 use crate::message_set::MessageSet;
@@ -26,8 +26,11 @@ pub trait MessageContext {
     fn sent_date_millis(&self) -> Option<i64>;
     /// Header field value(s) joined, lowercased for substring match.
     fn header(&self, name: &str) -> io::Result<String>;
-    /// Body text (may be empty if not indexed / not loaded).
-    fn body(&self) -> io::Result<String>;
+    /// Whether the body contains `needle_lower` (already lowercased by the
+    /// caller) as a case-insensitive (ASCII) substring. Implementations
+    /// that don't have the body preloaded (no body indexing) stream it —
+    /// see [`body_contains_streaming`] — rather than materializing it.
+    fn body_contains(&self, needle_lower: &str) -> io::Result<bool>;
     /// CONDSTORE modseq, if known.
     fn modseq(&self) -> Option<u64> {
         None
@@ -221,11 +224,7 @@ impl SearchCriteria {
                 v.to_ascii_lowercase()
                     .contains(&pattern.to_ascii_lowercase())
             }
-            Self::Body(pat) => {
-                let body = ctx.body()?;
-                body.to_ascii_lowercase()
-                    .contains(&pat.to_ascii_lowercase())
-            }
+            Self::Body(pat) => ctx.body_contains(&pat.to_ascii_lowercase())?,
             Self::Text(pat) => {
                 let p = pat.to_ascii_lowercase();
                 let headers = ["from", "to", "cc", "bcc", "subject", "message-id"];
@@ -237,7 +236,7 @@ impl SearchCriteria {
                     }
                 }
                 if !hit {
-                    hit = ctx.body()?.to_ascii_lowercase().contains(&p);
+                    hit = ctx.body_contains(&p)?;
                 }
                 hit
             }
@@ -263,6 +262,73 @@ impl SearchCriteria {
             Self::Not(c) => !c.matches(ctx)?,
         })
     }
+}
+
+/// Case-insensitive (ASCII) substring search fed one chunk at a time —
+/// keeps only a `needle.len() - 1`-byte carry between [`Self::feed`] calls
+/// (bounded regardless of how many chunks, or how large the underlying
+/// message, since a match can span a chunk boundary). Backing piece for
+/// [`body_contains_streaming`]; also usable directly by a caller that
+/// already has its own chunk-producing loop (e.g. one that also needs to
+/// un-escape bytes as they're read, like `hopf_mailbox::mbox`).
+pub struct StreamingSubstringMatcher<'a> {
+    needle: &'a [u8],
+    carry: Vec<u8>,
+    found: bool,
+}
+
+impl<'a> StreamingSubstringMatcher<'a> {
+    /// `needle_lower` must already be lowercased by the caller.
+    pub fn new(needle_lower: &'a str) -> Self {
+        Self {
+            needle: needle_lower.as_bytes(),
+            carry: Vec::new(),
+            found: needle_lower.is_empty(),
+        }
+    }
+
+    /// Feed the next chunk. Returns `true` once (or if already) found —
+    /// once found, further calls are cheap no-ops.
+    pub fn feed(&mut self, chunk: &[u8]) -> bool {
+        if self.found || self.needle.is_empty() {
+            self.found = true;
+            return true;
+        }
+        let mut window = Vec::with_capacity(self.carry.len() + chunk.len());
+        window.extend_from_slice(&self.carry);
+        window.extend(chunk.iter().map(u8::to_ascii_lowercase));
+        if window.windows(self.needle.len()).any(|w| w == self.needle) {
+            self.found = true;
+            return true;
+        }
+        let keep = (self.needle.len() - 1).min(window.len());
+        self.carry = window[window.len() - keep..].to_vec();
+        false
+    }
+
+    /// Whether the needle has been found across all chunks fed so far.
+    pub fn found(&self) -> bool {
+        self.found
+    }
+}
+
+/// Case-insensitive (ASCII) streaming substring search over `reader` — the
+/// [`MessageContext::body_contains`] implementation for backends with no
+/// body index to consult. Reads in 8KB chunks; see
+/// [`StreamingSubstringMatcher`] for the chunk-boundary handling.
+pub fn body_contains_streaming(mut reader: impl Read, needle_lower: &str) -> io::Result<bool> {
+    let mut matcher = StreamingSubstringMatcher::new(needle_lower);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if matcher.feed(&buf[..n]) {
+            break;
+        }
+    }
+    Ok(matcher.found())
 }
 
 fn ymd_from_millis(ms: i64) -> (i32, u32, u32) {

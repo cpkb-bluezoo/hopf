@@ -329,7 +329,7 @@ impl SmtpPipeline for AuthPipeline {
         }
     }
 
-    fn message_content(&mut self, chunk: &[u8]) {
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
         if let Some(canons) = self.body_canons.as_mut() {
             for (_, _, canon) in canons.iter_mut() {
                 canon.feed(chunk);
@@ -357,8 +357,9 @@ impl SmtpPipeline for AuthPipeline {
                 self.header_buf = Vec::new();
             }
         }
-        if let Some(inner) = &mut self.inner {
-            inner.message_content(chunk);
+        match &mut self.inner {
+            Some(inner) => inner.message_content(chunk),
+            None => true,
         }
     }
 
@@ -496,7 +497,7 @@ impl SmtpPipeline for AuthPipeline {
 /// unambiguous without needing full RFC 5322 folding awareness, which is
 /// why this can safely run ahead of (and independently from) the real
 /// [`DkimMessageParser`] parse of the header block itself.
-fn find_header_boundary(buf: &[u8]) -> Option<usize> {
+pub(crate) fn find_header_boundary(buf: &[u8]) -> Option<usize> {
     let mut line_start = 0usize;
     for i in 0..buf.len() {
         if buf[i] != b'\n' {

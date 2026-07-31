@@ -26,8 +26,10 @@ pub use maildir::{MaildirFactory, MaildirMailbox, MaildirStore};
 pub use mbox::{MboxFactory, MboxFlagsFile, MboxMailbox, MboxStore};
 pub use message_set::{MessageRange, MessageSet};
 pub use name_codec::MailboxNameCodec;
-pub use search::{MessageContext, SearchCriteria};
+pub use search::{
+    body_contains_streaming, MessageContext, SearchCriteria, StreamingSubstringMatcher,
+};
 pub use traits::{
-    Mailbox, MailboxAttribute, MailboxFactory, MailboxInfo, MailboxStatus, MailboxStore,
-    MessageDescriptor,
+    AppendGuard, Mailbox, MailboxAttribute, MailboxFactory, MailboxInfo, MailboxStatus,
+    MailboxStore, MessageDescriptor, MessageReadCallback,
 };

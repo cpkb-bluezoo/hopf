@@ -180,6 +180,43 @@ mod tests {
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
     }
 
+    /// On any receive, push a few chunks (with tiny delays, to exercise
+    /// real cross-call ordering rather than one atomic write) via
+    /// `StorageExecutor::submit_streamed`, then close.
+    struct StreamOffload {
+        storage: Arc<StorageExecutor>,
+        callback_fired: Arc<AtomicBool>,
+    }
+
+    impl ProtocolHandler for StreamOffload {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+            let callback_fired = Arc::clone(&self.callback_fired);
+            let handle_for_close = endpoint.handle();
+            self.storage.submit_streamed(
+                endpoint.handle(),
+                move |handle| {
+                    for chunk in [&b"one-"[..], &b"two-"[..], &b"three"[..]] {
+                        handle.send(chunk.to_vec());
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                },
+                move |result| {
+                    assert!(result.is_ok());
+                    callback_fired.store(true, Ordering::SeqCst);
+                    handle_for_close.close();
+                },
+            );
+        }
+
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+    }
+
     fn wait_connect(addr: SocketAddr) -> TcpStream {
         for _ in 0..50 {
             if let Ok(s) = TcpStream::connect(addr) {
@@ -218,6 +255,39 @@ mod tests {
         let n2 = c2.read(&mut b2).unwrap();
         assert_eq!(&b1[..n1], b"hello");
         assert_eq!(&b2[..n2], b"world");
+
+        rt.shutdown();
+    }
+
+    #[test]
+    fn submit_streamed_pushes_chunks_in_order_then_fires_callback() {
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let callback_fired = Arc::new(AtomicBool::new(false));
+        let callback_fired2 = Arc::clone(&callback_fired);
+        let storage: Arc<StorageExecutor> = Arc::clone(rt.storage());
+        let (addr, _) = rt
+            .add_tcp_listener(TcpListenerConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                move || {
+                    Box::new(StreamOffload {
+                        storage: Arc::clone(&storage),
+                        callback_fired: Arc::clone(&callback_fired2),
+                    }) as Box<dyn ProtocolHandler>
+                },
+            ))
+            .unwrap();
+
+        let mut c = wait_connect(addr);
+        c.write_all(b"go").unwrap();
+
+        let mut received = Vec::new();
+        c.read_to_end(&mut received).unwrap();
+        assert_eq!(received, b"one-two-three");
+        assert!(callback_fired.load(Ordering::SeqCst));
 
         rt.shutdown();
     }

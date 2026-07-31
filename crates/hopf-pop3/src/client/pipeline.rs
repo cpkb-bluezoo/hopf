@@ -13,12 +13,25 @@
 //! use hopf_pop3::{Pop3Client, Pop3Fetch};
 //!
 //! let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+//! use hopf_pop3::client::MessageReceiveCallback;
+//!
+//! #[derive(Default)]
+//! struct PrintSizes { total: usize }
+//! impl MessageReceiveCallback for PrintSizes {
+//!     fn message_content(&mut self, chunk: &[u8]) -> bool {
+//!         self.total += chunk.len();
+//!         true
+//!     }
+//!     fn end_message(&mut self) {
+//!         println!("message: {} bytes", self.total);
+//!         self.total = 0;
+//!     }
+//! }
+//!
 //! let fetch = Pop3Fetch::new()
 //!     .credentials("alice", "s3cr3t")
 //!     .delete_after_fetch(true)
-//!     .on_message(Box::new(|id, uid, bytes| {
-//!         println!("message {id} (uid={uid:?}): {} bytes", bytes.len());
-//!     }))
+//!     .on_message(Box::new(PrintSizes::default()))
 //!     .on_complete(Box::new(|ok| println!("done: {ok}")));
 //! Pop3Client::new("pop3.example.com", 110)
 //!     .connect(&rt, Arc::new(fetch))
@@ -40,6 +53,27 @@ use super::state::{
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
+/// Callback for [`Pop3Fetch::on_message`] — driven per message, across
+/// however many wire chunks it takes to arrive; [`Pop3Fetch`] never
+/// buffers a message whole to deliver it.
+pub trait MessageReceiveCallback: Send {
+    /// Called once, before any content. `uid` is always `None` in the
+    /// default RETR-driven flow (UIDL isn't requested as part of it).
+    fn start_message(&mut self, id: u32, uid: Option<&str>) {
+        let _ = (id, uid);
+    }
+
+    /// Called with each already dot-unstuffed chunk of RFC 822 bytes, in
+    /// order. Returning `false` stops further chunks from being delivered
+    /// to this callback for the current message (the connection still has
+    /// to consume them off the wire to stay in sync — POP3 has no way to
+    /// abort a RETR response mid-stream).
+    fn message_content(&mut self, chunk: &[u8]) -> bool;
+
+    /// Called once, after the last chunk (or after an early stop).
+    fn end_message(&mut self) {}
+}
+
 struct Pop3FetchState {
     credentials: Option<(String, String)>,
     prefer_apop: bool,
@@ -51,12 +85,13 @@ struct Pop3FetchState {
     pending: VecDeque<u32>,
     /// Message currently being fetched (for DELE).
     current_id: u32,
-    /// Body accumulation for the current message.
-    body_buf: Vec<u8>,
+    /// Once the current message's callback has signaled "stop", further
+    /// `message_content` chunks are consumed but not forwarded.
+    current_stopped: bool,
     /// Whether the session ended successfully.
     success: bool,
-    /// Per-message callback: `fn(id, uid, bytes)`.
-    on_message: Option<Box<dyn FnMut(u32, Option<String>, Vec<u8>) + Send>>,
+    /// Per-message callback.
+    on_message: Option<Box<dyn MessageReceiveCallback>>,
     /// Session-complete callback.
     on_complete: Option<Box<dyn FnOnce(bool) + Send>>,
 }
@@ -79,7 +114,7 @@ impl Pop3Fetch {
             apop_timestamp: None,
             pending: VecDeque::new(),
             current_id: 0,
-            body_buf: Vec::new(),
+            current_stopped: false,
             success: false,
             on_message: None,
             on_complete: None,
@@ -117,11 +152,8 @@ impl Pop3Fetch {
         self
     }
 
-    /// Register a per-message callback.
-    ///
-    /// `id` is the POP3 message number; `uid` is always `None` (UIDL is
-    /// not requested in the default flow); `bytes` is the complete message.
-    pub fn on_message(self, cb: Box<dyn FnMut(u32, Option<String>, Vec<u8>) + Send>) -> Self {
+    /// Register a per-message callback — see [`MessageReceiveCallback`].
+    pub fn on_message(self, cb: Box<dyn MessageReceiveCallback>) -> Self {
         self.0.lock().unwrap().on_message = Some(cb);
         self
     }
@@ -243,7 +275,10 @@ impl Pop3FetchDriver {
         let mut st = self.state.lock().unwrap();
         if let Some(id) = st.pending.pop_front() {
             st.current_id = id;
-            st.body_buf.clear();
+            st.current_stopped = false;
+            if let Some(cb) = st.on_message.as_mut() {
+                cb.start_message(id, None);
+            }
             drop(st);
             transaction.retr(id);
         } else {
@@ -499,7 +534,15 @@ impl Pop3ClientDriver for Pop3FetchDriver {
 
 
     fn on_message_content(&mut self, data: &[u8], _ep: &mut dyn Endpoint) {
-        self.state.lock().unwrap().body_buf.extend_from_slice(data);
+        let mut st = self.state.lock().unwrap();
+        if st.current_stopped {
+            return;
+        }
+        if let Some(cb) = st.on_message.as_mut() {
+            if !cb.message_content(data) {
+                st.current_stopped = true;
+            }
+        }
     }
 
     fn on_message_complete(
@@ -509,19 +552,13 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         _is_top: bool,
         message: u32,
     ) {
-        let (body, delete_after_fetch) = {
+        let delete_after_fetch = {
             let mut st = self.state.lock().unwrap();
-            let body = std::mem::take(&mut st.body_buf);
-            (body, st.delete_after_fetch)
-        };
-
-        // Deliver message to the caller's callback.
-        {
-            let mut st = self.state.lock().unwrap();
-            if let Some(ref mut cb) = st.on_message {
-                cb(message, None, body);
+            if let Some(cb) = st.on_message.as_mut() {
+                cb.end_message();
             }
-        }
+            st.delete_after_fetch
+        };
 
         if delete_after_fetch {
             transaction.dele(message);

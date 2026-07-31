@@ -18,6 +18,7 @@ use hopf_core::{Endpoint, Runtime, RuntimeConfig};
 use hopf_mailbox::{MailboxFactory, MaildirFactory};
 
 use crate::client::pipeline_status_and_list;
+use crate::client::MessageReceiveCallback;
 use crate::{
     ImapAppendUid, ImapCapabilities, ImapClient, ImapClientAppend, ImapClientAuthExchange,
     ImapClientAuthenticated, ImapClientDriver, ImapClientHandlerFactory, ImapClientNotAuthenticated,
@@ -26,6 +27,49 @@ use crate::{
 };
 
 const MESSAGE: &[u8] = b"From: a@b\r\nSubject: hi\r\n\r\nhello imap\r\n";
+
+/// Test-only [`MessageReceiveCallback`] that collects each message's
+/// `(seq, uid, whole content)` into `received` for assertions — the real
+/// streaming callback path is still exercised end-to-end; this just
+/// happens to buffer the result for comparison.
+struct CollectMessages {
+    received: Arc<Mutex<Vec<(u32, Option<u32>, Vec<u8>)>>>,
+    seq: u32,
+    body: Vec<u8>,
+}
+
+impl MessageReceiveCallback for CollectMessages {
+    fn start_message(&mut self, seq: u32) {
+        self.seq = seq;
+        self.body.clear();
+    }
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
+        self.body.extend_from_slice(chunk);
+        true
+    }
+    fn end_message(&mut self, uid: Option<u32>) {
+        self.received
+            .lock()
+            .unwrap()
+            .push((self.seq, uid, std::mem::take(&mut self.body)));
+    }
+}
+
+/// Like [`CollectMessages`], but keeping only the bodies.
+struct CollectBodies(Arc<Mutex<Vec<Vec<u8>>>>, Vec<u8>);
+
+impl MessageReceiveCallback for CollectBodies {
+    fn start_message(&mut self, _seq: u32) {
+        self.1.clear();
+    }
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
+        self.1.extend_from_slice(chunk);
+        true
+    }
+    fn end_message(&mut self, _uid: Option<u32>) {
+        self.0.lock().unwrap().push(std::mem::take(&mut self.1));
+    }
+}
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -75,7 +119,9 @@ fn seed_mailbox(dir: &tempfile::TempDir) -> Arc<MaildirFactory> {
         let mut store = factory.create_store();
         store.open("alice").unwrap();
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
-        mb.append_message(MESSAGE, &BTreeSet::new(), None).unwrap();
+        let mut guard = hopf_mailbox::AppendGuard::start(mb.as_mut(), &BTreeSet::new(), None).unwrap();
+        guard.append_content(MESSAGE).unwrap();
+        guard.commit().unwrap();
         mb.close(false).unwrap();
         store.close().unwrap();
     }
@@ -181,6 +227,62 @@ fn server_login_select_fetch_append_raw() {
     drop(rt);
 }
 
+/// ENVELOPE, BODYSTRUCTURE, and a `BODY[section]<start.count>` partial
+/// fetch over a real server connection and real maildir-backed mailbox —
+/// the three sub-fixes for issue #6.
+#[test]
+fn server_fetch_envelope_bodystructure_partial_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 8192];
+
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+    write_cmd(&mut stream, b"a1 LOGIN alice secret\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("a1 OK"));
+    write_cmd(&mut stream, b"a2 SELECT INBOX\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("a2 OK"));
+
+    // MESSAGE = "From: a@b\r\nSubject: hi\r\n\r\nhello imap\r\n" — no Date,
+    // single From address, plain-text body.
+    write_cmd(&mut stream, b"a3 FETCH 1 (ENVELOPE)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a3 "));
+    assert!(r.contains("a3 OK"), "envelope fetch: {r}");
+    assert!(r.contains("ENVELOPE ("), "envelope present: {r}");
+    assert!(r.contains("\"hi\""), "subject: {r}");
+    assert!(r.contains("NIL NIL \"a\" \"b\""), "from address: {r}");
+
+    write_cmd(&mut stream, b"a4 FETCH 1 (BODYSTRUCTURE)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a4 "));
+    assert!(r.contains("a4 OK"), "bodystructure fetch: {r}");
+    assert!(
+        r.contains("BODYSTRUCTURE (\"TEXT\" \"PLAIN\""),
+        "bodystructure: {r}"
+    );
+    assert!(r.contains("\"7BIT\""), "encoding: {r}");
+
+    // Partial fetch: `<0.5>` of BODY[TEXT] returns exactly "hello" (the
+    // first 5 bytes of the body), with a matching {5} literal length —
+    // and, combined with FLAGS in the same command, proves the lexer no
+    // longer mis-tokenizes the trailing `<0.5>` as a bogus following item.
+    write_cmd(&mut stream, b"a5 FETCH 1 (BODY[TEXT]<0.5> FLAGS)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a5 "));
+    assert!(r.contains("a5 OK"), "partial fetch: {r}");
+    assert!(
+        r.contains("BODY[TEXT]<0> {5}\r\nhello"),
+        "partial body: {r}"
+    );
+    assert!(r.contains("FLAGS ("), "flags still parsed: {r}");
+
+    write_cmd(&mut stream, b"a6 LOGOUT\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("a6 "));
+    drop(rt);
+}
+
 /// Pipelined STATUS+LIST in one TCP segment: the server queues the second
 /// command while the first is offloaded to storage and answers both in order.
 #[test]
@@ -266,8 +368,10 @@ fn client_fetch_round_trip() {
 
     let fetch = ImapFetch::new()
         .credentials("alice", "secret")
-        .on_message(Box::new(move |seq, uid, bytes| {
-            received2.lock().unwrap().push((seq, uid, bytes));
+        .on_message(Box::new(CollectMessages {
+            received: received2,
+            seq: 0,
+            body: Vec::new(),
         }))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
@@ -307,11 +411,18 @@ fn client_localhost_hostname_dial() {
     let count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     let count2 = Arc::clone(&count);
 
+    struct CountMessages(Arc<Mutex<usize>>);
+    impl MessageReceiveCallback for CountMessages {
+        fn message_content(&mut self, _chunk: &[u8]) -> bool {
+            true
+        }
+        fn end_message(&mut self, _uid: Option<u32>) {
+            *self.0.lock().unwrap() += 1;
+        }
+    }
     let fetch = ImapFetch::new()
         .credentials("alice", "secret")
-        .on_message(Box::new(move |_seq, _uid, _bytes| {
-            *count2.lock().unwrap() += 1;
-        }))
+        .on_message(Box::new(CountMessages(count2)))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
         }));
@@ -356,9 +467,7 @@ fn client_starttls_fetch() {
     let fetch = ImapFetch::new()
         .credentials("alice", "secret")
         .require_starttls(true)
-        .on_message(Box::new(move |_seq, _uid, bytes| {
-            received2.lock().unwrap().push(bytes);
-        }))
+        .on_message(Box::new(CollectBodies(received2, Vec::new())))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
         }));
@@ -403,9 +512,7 @@ fn client_implicit_tls_fetch() {
 
     let fetch = ImapFetch::new()
         .credentials("alice", "secret")
-        .on_message(Box::new(move |_seq, _uid, bytes| {
-            received2.lock().unwrap().push(bytes);
-        }))
+        .on_message(Box::new(CollectBodies(received2, Vec::new())))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
         }));

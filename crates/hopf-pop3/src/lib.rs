@@ -20,10 +20,10 @@ pub mod client;
 mod integration;
 
 pub use server::{
-    dot_stuff_message, truncate_top, AuthenticateState, AuthorizationHandler, ClientConnected,
+    AuthenticateState, AuthorizationHandler, ClientConnected,
     ConnectedState, DefaultPop3Handler, DefaultPop3HandlerFactory, ListState, ListWriter,
     MailboxStatusState, MarkDeletedState, Pop3Command, Pop3Config, Pop3ControlHandler,
-    Pop3HandlerFactory, Pop3ServerLexer, Pop3ServerMetrics, Pop3Service, Pop3SessionState,
+    Pop3DotStuffer, Pop3HandlerFactory, Pop3ServerLexer, Pop3ServerMetrics, Pop3Service, Pop3SessionState,
     ResetState, RetrieveState, TopState, TransactionHandler, UidlState, UidlWriter, UpdateState,
     DEFAULT_TRANSACTION_TIMEOUT, MAX_COMMAND_LINE,
 };
@@ -31,7 +31,7 @@ pub use server::{
 // ── Client re-exports ─────────────────────────────────────────────────────────
 
 pub use client::{
-    Pop3Capabilities, Pop3Client, Pop3ClientAuthExchange, Pop3ClientAuthorization,
+    MessageReceiveCallback, Pop3Capabilities, Pop3Client, Pop3ClientAuthExchange, Pop3ClientAuthorization,
     Pop3ClientDriver, Pop3ClientEndpoint, Pop3ClientHandlerFactory, Pop3ClientPassword,
     Pop3ClientPostStls, Pop3ClientTimeouts, Pop3ClientTransaction, Pop3DotUnstuffer, Pop3Error,
     ContentId, Pop3Event, Pop3Fetch, Pop3ReplyLexer, Pop3ReplyShape, Pop3Result, MAX_REPLY_LINE,

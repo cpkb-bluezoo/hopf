@@ -167,26 +167,22 @@ impl MessageIndex {
         }
     }
 
-    /// Search using index; for BODY/TEXT without body index, `body_loader` supplies text.
-    pub fn search<F>(
-        &self,
-        criteria: &SearchCriteria,
-        mut body_loader: F,
-    ) -> MailboxResult<Vec<u32>>
+    /// Search using index; for BODY/TEXT without body index, `body_loader`
+    /// streams a case-insensitive substring check for a given uid + needle
+    /// (already lowercased) rather than materializing the body — see
+    /// [`crate::search::body_contains_streaming`] for backends implementing
+    /// it as a real stream.
+    pub fn search<F>(&self, criteria: &SearchCriteria, body_loader: F) -> MailboxResult<Vec<u32>>
     where
-        F: FnMut(u64) -> MailboxResult<String>,
+        F: Fn(u64, &str) -> MailboxResult<bool>,
     {
         let need_body = criteria.needs_body() && !self.config.body_indexing;
         let mut out = Vec::new();
         for e in self.entries.values() {
-            let body_override = if need_body {
-                Some(body_loader(e.uid)?)
-            } else {
-                None
-            };
             let ctx = IndexedContext {
                 entry: e,
-                body_override,
+                need_body,
+                body_loader: &body_loader,
             };
             if criteria.matches(&ctx).map_err(MailboxError::Io)? {
                 out.push(e.message_number);
@@ -199,7 +195,8 @@ impl MessageIndex {
 
 struct IndexedContext<'a> {
     entry: &'a IndexEntry,
-    body_override: Option<String>,
+    need_body: bool,
+    body_loader: &'a dyn Fn(u64, &str) -> MailboxResult<bool>,
 }
 
 impl MessageContext for IndexedContext<'_> {
@@ -235,10 +232,16 @@ impl MessageContext for IndexedContext<'_> {
     fn header(&self, name: &str) -> io::Result<String> {
         Ok(self.entry.header_value(name).unwrap_or("").to_string())
     }
-    fn body(&self) -> io::Result<String> {
-        if let Some(ref b) = self.body_override {
-            return Ok(b.clone());
+    fn body_contains(&self, needle_lower: &str) -> io::Result<bool> {
+        if self.need_body {
+            return (self.body_loader)(self.entry.uid, needle_lower)
+                .map_err(|e| io::Error::other(e.to_string()));
         }
-        Ok(self.entry.body().unwrap_or("").to_string())
+        Ok(self
+            .entry
+            .body()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains(needle_lower))
     }
 }

@@ -22,6 +22,9 @@ pub struct WebDavConfig {
     pub webdav_enabled: bool,
     pub welcome_file: String,
     pub dead_property_storage: DeadPropMode,
+    /// Maximum PUT upload size, checked incrementally as chunks arrive.
+    /// Default: [`MAX_WEBDAV_PUT_BODY`](crate::constants::MAX_WEBDAV_PUT_BODY).
+    pub max_put_body: u64,
 }
 
 impl Default for WebDavConfig {
@@ -32,6 +35,7 @@ impl Default for WebDavConfig {
             webdav_enabled: false,
             welcome_file: "index.html".to_string(),
             dead_property_storage: DeadPropMode::Auto,
+            max_put_body: crate::constants::MAX_WEBDAV_PUT_BODY,
         }
     }
 }

@@ -55,7 +55,6 @@ enum ControlState {
     AwaitPasvReply {
         verb: String,
         path: String,
-        data: Option<Arc<Vec<u8>>>,
         /// RFC 959 §4.1.3 — resume offset; sends `REST offset` (expect
         /// `350`) before the transfer verb once the data address is known.
         offset: Option<u64>,
@@ -67,7 +66,6 @@ enum ControlState {
         addr: SocketAddr,
         verb: String,
         path: String,
-        data: Option<Arc<Vec<u8>>>,
         transfer: Arc<Mutex<TransferState>>,
     },
     /// RETR/STOR/LIST sent; waiting for `125`/`150`.
@@ -343,40 +341,35 @@ impl FtpControlHandler {
                 _ => {}
             },
 
-            ControlState::AwaitPasvReply { verb, path, data, offset, transfer } => {
-                self.dispatch_pasv_event(endpoint, event, verb, path, data, offset, transfer);
+            ControlState::AwaitPasvReply { verb, path, offset, transfer } => {
+                self.dispatch_pasv_event(endpoint, event, verb, path, offset, transfer);
             }
 
-            ControlState::AwaitRestReply { addr, verb, path, data, transfer } => match event {
+            ControlState::AwaitRestReply { addr, verb, path, transfer } => match event {
                 FtpEvent::CmdOk { .. } => {
-                    self.begin_transfer(endpoint, addr, &verb, &path, data, transfer);
+                    self.begin_transfer(endpoint, addr, &verb, &path, transfer);
                 }
                 FtpEvent::Error { code, message } => {
                     self.fail(endpoint, FtpError::unexpected(Some(350), code, message));
                 }
                 _ => {
                     // Unrelated event — stay put and keep waiting for 350.
-                    self.state = ControlState::AwaitRestReply { addr, verb, path, data, transfer };
+                    self.state = ControlState::AwaitRestReply { addr, verb, path, transfer };
                 }
             },
 
             ControlState::AwaitXferStart { transfer } => match event {
                 FtpEvent::XferStartOk { text } => {
-                    // Server is ready — release any STOR upload waiting on
-                    // the data connection.
-                    {
+                    // Server is ready — arm any STOR upload waiting on the
+                    // data connection.
+                    let armed = {
                         let mut g = transfer.lock().unwrap();
                         g.start_ok = true;
                         g.assigned_name = text;
-                        if let (Some(h), Some(payload)) =
-                            (g.data_conn.take(), g.stor_payload.take())
-                        {
-                            drop(g);
-                            h.with_endpoint(move |ep| {
-                                ep.send(&payload);
-                                ep.close();
-                            });
-                        }
+                        g.try_arm()
+                    };
+                    if let Some((ready, conn)) = armed {
+                        ready(super::FtpStorHandle::new(conn));
                     }
                     self.lexer.expect(FtpReplyShape::XferEnd);
                     self.state = ControlState::AwaitXferEnd { transfer };
@@ -448,13 +441,12 @@ impl FtpControlHandler {
         event: FtpEvent,
         verb: String,
         path: String,
-        data: Option<Arc<Vec<u8>>>,
         offset: Option<u64>,
         transfer: Arc<Mutex<TransferState>>,
     ) {
         match event {
             FtpEvent::PasvAddr(addr) => {
-                self.open_data_conn(endpoint, addr, verb, path, data, offset, transfer);
+                self.open_data_conn(endpoint, addr, verb, path, offset, transfer);
             }
             FtpEvent::EpsvPort(port) => {
                 let ctrl_ip = endpoint
@@ -462,7 +454,7 @@ impl FtpControlHandler {
                     .map(|a| a.ip())
                     .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
                 let addr = SocketAddr::new(ctrl_ip, port);
-                self.open_data_conn(endpoint, addr, verb, path, data, offset, transfer);
+                self.open_data_conn(endpoint, addr, verb, path, offset, transfer);
             }
             FtpEvent::Error { code, message } => {
                 self.fail(endpoint, FtpError::unexpected(Some(227), code, message));
@@ -470,7 +462,7 @@ impl FtpControlHandler {
             _ => {
                 // Restore state — an unrelated event arrived unexpectedly;
                 // stay put and keep waiting for the real reply.
-                self.state = ControlState::AwaitPasvReply { verb, path, data, offset, transfer };
+                self.state = ControlState::AwaitPasvReply { verb, path, offset, transfer };
             }
         }
     }
@@ -483,7 +475,6 @@ impl FtpControlHandler {
         addr: SocketAddr,
         verb: String,
         path: String,
-        data: Option<Arc<Vec<u8>>>,
         offset: Option<u64>,
         transfer: Arc<Mutex<TransferState>>,
     ) {
@@ -491,9 +482,9 @@ impl FtpControlHandler {
             Some(n) => {
                 endpoint.send(format!("REST {n}\r\n").as_bytes());
                 self.lexer.expect(FtpReplyShape::Cmd { expect: 350 });
-                self.state = ControlState::AwaitRestReply { addr, verb, path, data, transfer };
+                self.state = ControlState::AwaitRestReply { addr, verb, path, transfer };
             }
-            None => self.begin_transfer(endpoint, addr, &verb, &path, data, transfer),
+            None => self.begin_transfer(endpoint, addr, &verb, &path, transfer),
         }
     }
 
@@ -504,18 +495,13 @@ impl FtpControlHandler {
         addr: SocketAddr,
         verb: &str,
         path: &str,
-        data: Option<Arc<Vec<u8>>>,
         transfer: Arc<Mutex<TransferState>>,
     ) {
         let is_stor = matches!(verb, "STOR" | "APPE" | "STOU");
         let transfer_clone = Arc::clone(&transfer);
-        let data_clone = data.clone();
         let mut cfg = TcpConnectorConfig::new(addr, move || {
             if is_stor {
-                let d = data_clone
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(Vec::new()));
-                Box::new(FtpDataStorHandler::new(d, Arc::clone(&transfer_clone)))
+                Box::new(FtpDataStorHandler::new(Arc::clone(&transfer_clone)))
                     as Box<dyn ProtocolHandler>
             } else {
                 Box::new(FtpDataRetrHandler::new(Arc::clone(&transfer_clone)))
@@ -625,73 +611,67 @@ impl FtpControlHandler {
                 self.state = ControlState::AwaitCmdReply { expect, callback };
             }
 
-            Some(QueuedOp::Retr { path, offset, callback }) => {
-                let transfer = Arc::new(Mutex::new(TransferState::retr(callback)));
+            Some(QueuedOp::Retr { path, offset, receiver }) => {
+                let transfer = Arc::new(Mutex::new(TransferState::retr(receiver)));
                 self.send_pasv_or_epsv(endpoint);
                 self.state = ControlState::AwaitPasvReply {
                     verb: "RETR".into(),
                     path,
-                    data: None,
                     offset,
                     transfer,
                 };
             }
 
-            Some(QueuedOp::Stor { path, data, offset, callback }) => {
-                let transfer = Arc::new(Mutex::new(TransferState::stor(callback)));
+            Some(QueuedOp::Stor { path, offset, ready, callback }) => {
+                let transfer = Arc::new(Mutex::new(TransferState::stor(ready, callback)));
                 self.send_pasv_or_epsv(endpoint);
                 self.state = ControlState::AwaitPasvReply {
                     verb: "STOR".into(),
                     path,
-                    data: Some(data),
                     offset,
                     transfer,
                 };
             }
 
-            Some(QueuedOp::List { path, callback }) => {
-                let transfer = Arc::new(Mutex::new(TransferState::retr(callback)));
+            Some(QueuedOp::List { path, receiver }) => {
+                let transfer = Arc::new(Mutex::new(TransferState::retr(receiver)));
                 self.send_pasv_or_epsv(endpoint);
                 self.state = ControlState::AwaitPasvReply {
                     verb: "LIST".into(),
                     path: path.unwrap_or_default(),
-                    data: None,
                     offset: None,
                     transfer,
                 };
             }
 
-            Some(QueuedOp::Appe { path, data, callback }) => {
-                let transfer = Arc::new(Mutex::new(TransferState::stor(callback)));
+            Some(QueuedOp::Appe { path, ready, callback }) => {
+                let transfer = Arc::new(Mutex::new(TransferState::stor(ready, callback)));
                 self.send_pasv_or_epsv(endpoint);
                 self.state = ControlState::AwaitPasvReply {
                     verb: "APPE".into(),
                     path,
-                    data: Some(data),
                     offset: None,
                     transfer,
                 };
             }
 
-            Some(QueuedOp::Nlst { path, callback }) => {
-                let transfer = Arc::new(Mutex::new(TransferState::retr(callback)));
+            Some(QueuedOp::Nlst { path, receiver }) => {
+                let transfer = Arc::new(Mutex::new(TransferState::retr(receiver)));
                 self.send_pasv_or_epsv(endpoint);
                 self.state = ControlState::AwaitPasvReply {
                     verb: "NLST".into(),
                     path: path.unwrap_or_default(),
-                    data: None,
                     offset: None,
                     transfer,
                 };
             }
 
-            Some(QueuedOp::Stou { data, callback }) => {
-                let transfer = Arc::new(Mutex::new(TransferState::stou(callback)));
+            Some(QueuedOp::Stou { ready, callback }) => {
+                let transfer = Arc::new(Mutex::new(TransferState::stou(ready, callback)));
                 self.send_pasv_or_epsv(endpoint);
                 self.state = ControlState::AwaitPasvReply {
                     verb: "STOU".into(),
                     path: String::new(),
-                    data: Some(data),
                     offset: None,
                     transfer,
                 };

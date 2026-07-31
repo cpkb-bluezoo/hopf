@@ -2,9 +2,11 @@
 
 //! IMAP server: transport, codec, session, service, and the staged policy SPI.
 
+mod bodystructure;
 pub mod capability;
 mod codec;
 mod control;
+mod envelope;
 mod fetch_format;
 pub mod handler;
 pub mod idle;
