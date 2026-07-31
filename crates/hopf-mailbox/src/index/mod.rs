@@ -171,10 +171,25 @@ impl MessageIndex {
     /// streams a case-insensitive substring check for a given uid + needle
     /// (already lowercased) rather than materializing the body — see
     /// [`crate::search::body_contains_streaming`] for backends implementing
-    /// it as a real stream.
-    pub fn search<F>(&self, criteria: &SearchCriteria, body_loader: F) -> MailboxResult<Vec<u32>>
+    /// it as a real stream. `header_loader` is the equivalent fallback for
+    /// `HEADER <name> <string>` when `name` isn't one of the entry's
+    /// specifically-indexed fields (see [`IndexEntry::header_value`]) —
+    /// see [`crate::search::header_lookup_streaming`]. `modseq_loader`
+    /// resolves a uid's current CONDSTORE mod-sequence (0 if unknown) —
+    /// `IndexEntry` itself doesn't carry one (the backend's own
+    /// `.uidlist`/`.flags` sidecar is the single source of truth for it,
+    /// same as flags/keywords already work).
+    pub fn search<F, H, M>(
+        &self,
+        criteria: &SearchCriteria,
+        body_loader: F,
+        header_loader: H,
+        modseq_loader: M,
+    ) -> MailboxResult<Vec<u32>>
     where
         F: Fn(u64, &str) -> MailboxResult<bool>,
+        H: Fn(u64, &str) -> MailboxResult<Option<String>>,
+        M: Fn(u64) -> u64,
     {
         let need_body = criteria.needs_body() && !self.config.body_indexing;
         let mut out = Vec::new();
@@ -183,6 +198,8 @@ impl MessageIndex {
                 entry: e,
                 need_body,
                 body_loader: &body_loader,
+                header_loader: &header_loader,
+                modseq_loader: &modseq_loader,
             };
             if criteria.matches(&ctx).map_err(MailboxError::Io)? {
                 out.push(e.message_number);
@@ -197,6 +214,8 @@ struct IndexedContext<'a> {
     entry: &'a IndexEntry,
     need_body: bool,
     body_loader: &'a dyn Fn(u64, &str) -> MailboxResult<bool>,
+    header_loader: &'a dyn Fn(u64, &str) -> MailboxResult<Option<String>>,
+    modseq_loader: &'a dyn Fn(u64) -> u64,
 }
 
 impl MessageContext for IndexedContext<'_> {
@@ -230,7 +249,12 @@ impl MessageContext for IndexedContext<'_> {
         }
     }
     fn header(&self, name: &str) -> io::Result<String> {
-        Ok(self.entry.header_value(name).unwrap_or("").to_string())
+        if let Some(v) = self.entry.header_value(name) {
+            return Ok(v.to_string());
+        }
+        let v = (self.header_loader)(self.entry.uid, name)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(v.unwrap_or_default())
     }
     fn body_contains(&self, needle_lower: &str) -> io::Result<bool> {
         if self.need_body {
@@ -243,5 +267,8 @@ impl MessageContext for IndexedContext<'_> {
             .unwrap_or("")
             .to_ascii_lowercase()
             .contains(needle_lower))
+    }
+    fn modseq(&self) -> Option<u64> {
+        Some((self.modseq_loader)(self.entry.uid))
     }
 }
