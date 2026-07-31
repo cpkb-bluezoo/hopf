@@ -59,9 +59,9 @@ impl SmtpPipeline for SpoolPipeline {
     fn mail_from(&mut self, _sender: Option<&EmailAddress>) {}
     fn rcpt_to(&mut self, _recipient: &EmailAddress) {}
 
-    fn message_content(&mut self, chunk: &[u8]) {
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
         if self.error.is_some() {
-            return;
+            return false;
         }
         if self.file.is_none() {
             let path = unique_spool_path();
@@ -72,15 +72,17 @@ impl SmtpPipeline for SpoolPipeline {
                 }
                 Err(e) => {
                     self.error = Some(e.to_string());
-                    return;
+                    return false;
                 }
             }
         }
         if let Some(f) = &mut self.file {
             if let Err(e) = f.write_all(chunk) {
                 self.error = Some(e.to_string());
+                return false;
             }
         }
+        true
     }
 
     fn end_data(&mut self) {}
@@ -121,8 +123,8 @@ impl SmtpPipeline for SpoolPipelineHandle {
     fn rcpt_to(&mut self, recipient: &EmailAddress) {
         self.0.lock().unwrap().rcpt_to(recipient);
     }
-    fn message_content(&mut self, chunk: &[u8]) {
-        self.0.lock().unwrap().message_content(chunk);
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
+        self.0.lock().unwrap().message_content(chunk)
     }
     fn end_data(&mut self) {
         self.0.lock().unwrap().end_data();
@@ -139,13 +141,27 @@ mod tests {
     #[test]
     fn writes_content_to_a_temp_file_and_cleans_up_on_reset() {
         let mut pipeline = SpoolPipeline::new();
-        pipeline.message_content(b"one");
-        pipeline.message_content(b"-two");
+        assert!(pipeline.message_content(b"one"));
+        assert!(pipeline.message_content(b"-two"));
         let path = pipeline.path().expect("spool file created lazily").to_path_buf();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), b"one-two");
         pipeline.reset();
         assert!(!path.exists(), "reset must remove the spool file");
+    }
+
+    #[test]
+    fn message_content_reports_false_once_a_write_error_is_latched() {
+        let mut pipeline = SpoolPipeline::new();
+        assert!(pipeline.message_content(b"first chunk succeeds"));
+        // Simulate an unrecoverable spool error without needing a real
+        // full disk: latch it directly, exactly as a real write failure
+        // would via `message_content`'s own `Err` branch.
+        pipeline.error = Some("disk full".to_string());
+        assert!(
+            !pipeline.message_content(b"more"),
+            "message_content must report false once the pipeline can no longer accept content"
+        );
     }
 
     #[test]

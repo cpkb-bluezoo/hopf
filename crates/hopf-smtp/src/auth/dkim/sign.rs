@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmimeparser::dkim::RawHeader;
 
-use super::canon::{self, Canonicalization};
+use super::canon::{self, Canonicalization, IncrementalBodyCanon};
 
 /// A private key usable for DKIM signing.
 pub enum DkimPrivateKey {
@@ -135,38 +135,67 @@ impl<'a> DkimSigner<'a> {
         self
     }
 
-    /// Produce the `DKIM-Signature:` header value (without the trailing
-    /// CRLF, without the `DKIM-Signature:` field name) for `headers` +
-    /// `body`. Returns the same string Gumdrop's `DKIMSigner.sign()` returns
-    /// modulo formatting: `"DKIM-Signature: " + this`.
-    pub fn sign(&self, headers: &[RawHeader], body: &[u8]) -> Result<String, ()> {
-        let t = self.timestamp.unwrap_or_else(|| {
+    /// Start a streaming sign: `headers` are known up front (small, already
+    /// fully parsed by the time DATA's header block is done) so their
+    /// canonicalization happens immediately; the body is fed via
+    /// [`DkimSignStream::feed`] as it streams in, and never held whole in
+    /// memory — only a running [`IncrementalBodyCanon`] hash.
+    pub fn start(&self, headers: &[RawHeader]) -> DkimSignStream<'_, 'a> {
+        let selected = select_headers(headers, &self.signed_headers);
+        let mut header_canon_bytes = Vec::new();
+        for h in selected {
+            header_canon_bytes.extend_from_slice(&canon::canon_header(h, self.header_canon));
+        }
+        DkimSignStream {
+            signer: self,
+            header_canon_bytes,
+            body_canon: IncrementalBodyCanon::new(self.body_canon, None),
+        }
+    }
+}
+
+/// In-progress streaming DKIM sign — see [`DkimSigner::start`].
+pub struct DkimSignStream<'s, 'a> {
+    signer: &'s DkimSigner<'a>,
+    /// Canonicalized signed-header bytes, computed once up front (doesn't
+    /// depend on the body).
+    header_canon_bytes: Vec<u8>,
+    body_canon: IncrementalBodyCanon,
+}
+
+impl DkimSignStream<'_, '_> {
+    /// Feed the next chunk of raw (pre-canonicalization) body bytes, in
+    /// wire order. Never buffers the body — only a running hash.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        self.body_canon.feed(chunk);
+    }
+
+    /// Finish: compute the body hash from everything fed so far, then sign.
+    pub fn finish(self) -> Result<String, ()> {
+        let signer = self.signer;
+        let t = signer.timestamp.unwrap_or_else(|| {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0)
         });
 
-        let canon_body_bytes = canon::canon_body(body, self.body_canon, None);
-        let bh = base64_encode(ring::digest::digest(
-            &ring::digest::SHA256,
-            &canon_body_bytes,
-        ));
+        let bh = base64_encode(self.body_canon.finish());
 
-        let h_joined = self.signed_headers.join(":");
+        let h_joined = signer.signed_headers.join(":");
         let mut unsigned_value = format!(
             "v=1; a={}; c={}/{}; d={}; s={}; t={}",
-            self.key.algorithm_tag(),
-            canon_name(self.header_canon),
-            canon_name(self.body_canon),
-            self.domain,
-            self.selector,
+            signer.key.algorithm_tag(),
+            canon_name(signer.header_canon),
+            canon_name(signer.body_canon),
+            signer.domain,
+            signer.selector,
             t,
         );
-        if let Some(x) = self.expiration {
+        if let Some(x) = signer.expiration {
             unsigned_value.push_str(&format!("; x={x}"));
         }
-        if let Some(i) = &self.identity {
+        if let Some(i) = &signer.identity {
             unsigned_value.push_str(&format!("; i={i}"));
         }
         unsigned_value.push_str(&format!("; h={h_joined}; bh={bh}; b="));
@@ -178,18 +207,14 @@ impl<'a> DkimSigner<'a> {
             b
         };
 
-        let selected = select_headers(headers, &self.signed_headers);
-        let mut signed_data = Vec::new();
-        for h in selected {
-            signed_data.extend_from_slice(&canon::canon_header(h, self.header_canon));
-        }
+        let mut signed_data = self.header_canon_bytes;
         signed_data.extend_from_slice(&canon::canon_signature_header(
             "DKIM-Signature",
             &sig_header_bytes,
-            self.header_canon,
+            signer.header_canon,
         ));
 
-        let signature = self.key.sign(&signed_data)?;
+        let signature = signer.key.sign(&signed_data)?;
         let b = base64_encode(&signature);
         Ok(format!("{unsigned_value}{b}"))
     }

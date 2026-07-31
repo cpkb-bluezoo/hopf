@@ -13,13 +13,25 @@
 //! use std::sync::Arc;
 //! use hopf_core::{Runtime, RuntimeConfig};
 //! use hopf_pop3::{Pop3Client, Pop3Fetch};
+//! use hopf_pop3::client::MessageReceiveCallback;
+//!
+//! #[derive(Default)]
+//! struct PrintSizes { total: usize }
+//! impl MessageReceiveCallback for PrintSizes {
+//!     fn message_content(&mut self, chunk: &[u8]) -> bool {
+//!         self.total += chunk.len();
+//!         true
+//!     }
+//!     fn end_message(&mut self) {
+//!         println!("message: {} bytes", self.total);
+//!         self.total = 0;
+//!     }
+//! }
 //!
 //! let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
 //! let fetch = Pop3Fetch::new()
 //!     .credentials("alice", "s3cr3t")
-//!     .on_message(Box::new(|id, uid, body| {
-//!         println!("message {id}: {} bytes", body.len());
-//!     }))
+//!     .on_message(Box::new(PrintSizes::default()))
 //!     .on_complete(Box::new(|ok| println!("fetch complete: {ok}")));
 //! Pop3Client::new("pop3.example.com", 110)
 //!     .connect(&rt, Arc::new(fetch))
@@ -40,7 +52,7 @@ pub use endpoint::Pop3ClientEndpoint;
 pub use error::{Pop3Error, Pop3Result};
 pub use facade::Pop3Client;
 pub use handlers::{Pop3ClientDriver, Pop3ClientHandlerFactory};
-pub use pipeline::Pop3Fetch;
+pub use pipeline::{MessageReceiveCallback, Pop3Fetch};
 pub use reply::{ContentId, Pop3Event, Pop3ReplyLexer, Pop3ReplyShape, MAX_REPLY_LINE};
 pub use state::{
     Pop3Capabilities, Pop3ClientAuthExchange, Pop3ClientAuthorization, Pop3ClientPassword,

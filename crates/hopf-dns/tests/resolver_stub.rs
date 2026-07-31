@@ -1190,3 +1190,304 @@ fn doh_get_and_post_round_trip_over_a_real_tls_http_stub() {
     // already do (they never call `Runtime::shutdown` either).
     drop(rt_arc);
 }
+
+/// Writes a fresh self-signed cert/key pair to a per-test temp dir and
+/// returns `(cert_path, key_path)` — the setup every DoT/DoH stub test in
+/// this file repeats.
+#[cfg(any(feature = "dot", feature = "doh"))]
+fn write_self_signed_pem(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "hopf-dns-{label}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    (cert_path, key_path)
+}
+
+/// Issue #90: `DnsResolver::add_server_dot` must route `query_a` through a
+/// real DoT connection (RFC 7858) to a real `listen_dns_dot` server —
+/// exercised via `query_a` (not the standalone `TcpDnsConnectionPool`
+/// directly, which `dot_connection_pool_reuses_a_connection_across_queries`
+/// already covers) — and the resolver's own cache must still short-circuit
+/// a repeat query without forwarding it again, proving caching isn't
+/// UDP-specific. DNSSEC validation (feature `dnssec`) runs inside
+/// `complete_response`, the exact same function the UDP path uses, so it's
+/// not re-tested transport-by-transport here — see
+/// `complete_response_sets_ad_when_dnssec_validation_is_secure` for that.
+/// RFC 7873 cookies are intentionally UDP-only (see `build_query_message`
+/// in `client/mod.rs`) and so don't apply to this transport.
+#[cfg(all(feature = "dot", feature = "server"))]
+#[test]
+fn resolver_queries_a_real_dot_server_end_to_end() {
+    use hopf_core::RuntimeConfig;
+    use hopf_dns::server::{listen_dns_dot, DnsServiceHandle};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (cert_path, key_path) = write_self_signed_pem("resolver-dot-test");
+    let acceptor = hopf_tls::acceptor_from_pem(&cert_path, &key_path, &[b"dot"]).unwrap();
+    let connector = hopf_tls::connector_from_pem(&cert_path, &[b"dot"]).unwrap();
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
+    let mut service = DnsService::new(Arc::new(DnsCache::default()));
+    service.set_local_resolver(move |q| {
+        hits2.fetch_add(1, Ordering::SeqCst);
+        let question = q.questions.first()?;
+        let mut resp = q.response_template(0);
+        resp.answers
+            .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 40)));
+        Some(resp)
+    });
+    let handle = DnsServiceHandle::new(service);
+
+    let rt = Runtime::start(RuntimeConfig {
+        worker_threads: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let addr = listen_dns_dot(&rt, "127.0.0.1:0".parse().unwrap(), acceptor, handle).unwrap();
+
+    let resolver = DnsResolver::new(rt.pick_worker().clone());
+    resolver.add_server_dot(addr, "localhost", connector);
+    resolver.open().unwrap();
+
+    let wait_for = |resolver: &DnsResolver, name: &'static str| -> io::Result<DnsMessage> {
+        let got = Arc::new(Mutex::new(None));
+        let got2 = Arc::clone(&got);
+        resolver.query_a(
+            name,
+            Box::new(move |r| {
+                *got2.lock().unwrap() = Some(r);
+            }),
+        );
+        for _ in 0..150 {
+            if got.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let result = got.lock().unwrap().take();
+        result.expect("callback fired within the wait window")
+    };
+
+    let msg = wait_for(&resolver, "dot-e2e.example").expect("query over DoT must succeed");
+    assert_eq!(msg.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 40)));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let cached = wait_for(&resolver, "dot-e2e.example").expect("cached repeat query must still succeed");
+    assert_eq!(cached.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 40)));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "second query must be served from the resolver's cache, not re-forwarded over DoT"
+    );
+
+    rt.shutdown();
+}
+
+/// Issue #90: `DnsResolver::add_server_doq` must route `query_a` through a
+/// real DoQ connection (RFC 9250) to a real `listen_dns_doq` server, with
+/// the same caching guarantee as the DoT test above.
+#[cfg(all(feature = "doq", feature = "server"))]
+#[test]
+fn resolver_queries_a_real_doq_server_end_to_end() {
+    use hopf_dns::server::{listen_dns_doq, DnsServiceHandle};
+    use hopf_quic::{client_config_for_certified_pem, server_config_self_signed};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (server_config, leaf_pem) = server_config_self_signed(&["localhost"], &[b"doq"]).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "hopf-dns-resolver-doq-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let leaf_path = dir.join("leaf.pem");
+    std::fs::write(&leaf_path, &leaf_pem).unwrap();
+    let client_config = client_config_for_certified_pem(&leaf_path, &[b"doq"]).unwrap();
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
+    let mut service = DnsService::new(Arc::new(DnsCache::default()));
+    service.set_local_resolver(move |q| {
+        hits2.fetch_add(1, Ordering::SeqCst);
+        let question = q.questions.first()?;
+        let mut resp = q.response_template(0);
+        resp.answers
+            .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 50)));
+        Some(resp)
+    });
+    let handle = DnsServiceHandle::new(service);
+
+    let driver = listen_dns_doq("127.0.0.1:0".parse().unwrap(), server_config, handle).unwrap();
+    let addr = driver.local_addr;
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let resolver = DnsResolver::new(rt.pick_worker().clone());
+    resolver.add_server_doq(addr, "localhost", client_config);
+    resolver.open().unwrap();
+
+    let wait_for = |resolver: &DnsResolver, name: &'static str| -> io::Result<DnsMessage> {
+        let got = Arc::new(Mutex::new(None));
+        let got2 = Arc::clone(&got);
+        resolver.query_a(
+            name,
+            Box::new(move |r| {
+                *got2.lock().unwrap() = Some(r);
+            }),
+        );
+        for _ in 0..150 {
+            if got.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let result = got.lock().unwrap().take();
+        result.expect("callback fired within the wait window")
+    };
+
+    let msg = wait_for(&resolver, "doq-e2e.example").expect("query over DoQ must succeed");
+    assert_eq!(msg.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 50)));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let cached = wait_for(&resolver, "doq-e2e.example").expect("cached repeat query must still succeed");
+    assert_eq!(cached.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 50)));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "second query must be served from the resolver's cache, not re-forwarded over DoQ"
+    );
+
+    rt.shutdown();
+    driver.shutdown();
+}
+
+/// Issue #90: `DnsResolver::add_server_doh` must route `query_a` through a
+/// real DoH connection (RFC 8484) to a real TLS+HTTP stub server, with the
+/// same caching guarantee as the DoT/DoQ tests above. There's no
+/// `listen_dns_doh` server helper in this crate (DoH server support is an
+/// explicit documented limitation), so the stub is hand-rolled the same
+/// way `doh_get_and_post_round_trip_over_a_real_tls_http_stub` already
+/// does — POST only here, since GET vs POST equivalence is that test's job.
+#[cfg(all(feature = "doh", feature = "server"))]
+#[test]
+fn resolver_queries_a_real_doh_server_end_to_end() {
+    use hopf_core::{Endpoint, ProtocolHandler, RuntimeConfig, TcpListenerConfig};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (cert_path, key_path) = write_self_signed_pem("resolver-doh-test");
+    let acceptor = hopf_tls::acceptor_from_pem(&cert_path, &key_path, &[b"http/1.1"]).unwrap();
+    let connector = hopf_tls::connector_from_pem(&cert_path, &[b"http/1.1"]).unwrap();
+
+    struct DohStubHandler {
+        buf: Vec<u8>,
+        hits: Arc<AtomicUsize>,
+    }
+    impl ProtocolHandler for DohStubHandler {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            let Some(header_end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
+                return;
+            };
+            let head = std::str::from_utf8(&self.buf[..header_end]).unwrap().to_string();
+            let content_length: usize = head
+                .lines()
+                .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().to_string()))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            if self.buf.len() < header_end + content_length {
+                return; // body not fully arrived yet
+            }
+            let body = self.buf[header_end..header_end + content_length].to_vec();
+            let Ok(q) = DnsMessage::parse(&body) else {
+                return;
+            };
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            let mut resp = q.response_template(0);
+            resp.flags |= FLAG_QR;
+            if let Some(question) = q.questions.first() {
+                resp.answers
+                    .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 60)));
+            }
+            let resp_bytes = resp.serialize().unwrap();
+            let http_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+                resp_bytes.len()
+            );
+            let mut out = http_resp.into_bytes();
+            out.extend_from_slice(&resp_bytes);
+            endpoint.send(&out);
+            self.buf.clear();
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
+    let rt = Runtime::start(RuntimeConfig {
+        worker_threads: 1,
+        ..Default::default()
+    })
+    .unwrap();
+    let (addr, _) = rt
+        .add_tcp_listener(
+            TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+                Box::new(DohStubHandler {
+                    buf: Vec::new(),
+                    hits: Arc::clone(&hits2),
+                }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(acceptor),
+        )
+        .unwrap();
+
+    let rt_arc = Arc::new(rt);
+    let resolver = DnsResolver::new(rt_arc.pick_worker().clone());
+    resolver.add_server_doh(addr, Arc::clone(&rt_arc), "localhost", "/dns-query", connector, false);
+    resolver.open().unwrap();
+
+    let wait_for = |resolver: &DnsResolver, name: &'static str| -> io::Result<DnsMessage> {
+        let got = Arc::new(Mutex::new(None));
+        let got2 = Arc::clone(&got);
+        resolver.query_a(
+            name,
+            Box::new(move |r| {
+                *got2.lock().unwrap() = Some(r);
+            }),
+        );
+        for _ in 0..150 {
+            if got.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let result = got.lock().unwrap().take();
+        result.expect("callback fired within the wait window")
+    };
+
+    let msg = wait_for(&resolver, "doh-e2e.example").expect("query over DoH must succeed");
+    assert_eq!(msg.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 60)));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let cached = wait_for(&resolver, "doh-e2e.example").expect("cached repeat query must still succeed");
+    assert_eq!(cached.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 60)));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "second query must be served from the resolver's cache, not re-forwarded over DoH"
+    );
+
+    // Same rationale as `doh_get_and_post_round_trip_over_a_real_tls_http_stub`:
+    // `rt_arc` may still be referenced by idle DoH connection state, so drop
+    // rather than an owning `shutdown()`.
+    drop(rt_arc);
+}

@@ -146,11 +146,32 @@ impl BasicFtpFileSystem {
                 _ => return Err(FtpFileOpResult::Invalid),
             }
         }
-        let canon = physical.canonicalize().unwrap_or(physical);
-        if !canon.starts_with(&self.canonical_root) {
-            return Err(FtpFileOpResult::PermissionDenied);
+        match physical.canonicalize() {
+            Ok(canon) => {
+                if !canon.starts_with(&self.canonical_root) {
+                    return Err(FtpFileOpResult::PermissionDenied);
+                }
+                Ok(canon)
+            }
+            Err(_) => {
+                // `physical` itself doesn't exist yet (STOR to a new file,
+                // MKD of a new directory) — falling back to the unresolved
+                // path here would let a symlink planted at an
+                // intermediate component (e.g. root/foo -> /etc, target
+                // root/foo/new.txt) textually pass the jail check while
+                // actually resolving outside root. Canonicalize the parent
+                // (which must exist) instead and re-append the final
+                // component, so the check runs against the real
+                // filesystem location the write will land at.
+                let file_name = physical.file_name().ok_or(FtpFileOpResult::Invalid)?.to_owned();
+                let parent = physical.parent().ok_or(FtpFileOpResult::Invalid)?;
+                let canon_parent = parent.canonicalize().map_err(|_| FtpFileOpResult::NotFound)?;
+                if !canon_parent.starts_with(&self.canonical_root) {
+                    return Err(FtpFileOpResult::PermissionDenied);
+                }
+                Ok(canon_parent.join(file_name))
+            }
         }
-        Ok(canon)
     }
 
     fn to_nvfs(&self, physical: &Path) -> String {
@@ -391,6 +412,64 @@ mod tests {
         assert_eq!(fs.mkdir("/a", &meta()), FtpFileOpResult::Ok);
         let list = fs.list_directory("/", &meta()).unwrap();
         assert!(list.iter().any(|e| e.name == "a"));
+    }
+
+    /// Issue #3 (3): a symlink planted inside the jail that points outside
+    /// it must not let a write to a not-yet-existing path underneath
+    /// escape — the old `canonicalize().unwrap_or(physical)` fallback let
+    /// the unresolved (symlink-unaware) path textually pass the jail
+    /// check even though the real write would follow the symlink.
+    #[cfg(unix)]
+    #[test]
+    fn stor_through_symlinked_directory_is_rejected_for_a_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let fs = BasicFtpFileSystem::new(dir.path(), false).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+
+        // "new.txt" doesn't exist yet under escape/ — exactly the case the
+        // canonicalize-fallback bug mishandled.
+        let result = fs.open_write("/escape/new.txt", false, 0, &meta());
+        assert!(
+            result.is_err(),
+            "must reject a write through a symlink escaping the jail"
+        );
+        assert!(
+            !outside.path().join("new.txt").exists(),
+            "must not have written outside the jail"
+        );
+    }
+
+    /// Same bug class, for MKD instead of STOR.
+    #[cfg(unix)]
+    #[test]
+    fn mkdir_through_symlinked_directory_is_rejected_for_a_new_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let fs = BasicFtpFileSystem::new(dir.path(), false).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+
+        let result = fs.mkdir("/escape/newdir", &meta());
+        assert_ne!(
+            result,
+            FtpFileOpResult::Ok,
+            "must reject mkdir through a symlink escaping the jail"
+        );
+        assert!(!outside.path().join("newdir").exists());
+    }
+
+    /// The fix must not break the ordinary (non-symlinked) case: STOR to a
+    /// new file inside a legitimate, already-existing subdirectory.
+    #[test]
+    fn stor_to_new_file_in_legitimate_subdirectory_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let fs = BasicFtpFileSystem::new(dir.path(), false).unwrap();
+
+        let mut w = fs.open_write("/sub/new.txt", false, 0, &meta()).unwrap();
+        w.write_all(b"hello").unwrap();
+        drop(w);
+        assert_eq!(std::fs::read(dir.path().join("sub/new.txt")).unwrap(), b"hello");
     }
 
     #[test]

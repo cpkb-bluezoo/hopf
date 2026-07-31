@@ -7,6 +7,7 @@
 
 #![cfg(feature = "integration")]
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,12 +17,47 @@ use hopf_core::{Runtime, RuntimeConfig};
 
 use crate::{
     FtpAbortHandle, FtpClient, FtpClientTimeouts, FtpError, FtpGet, FtpPipeline, FtpPut,
-    FtpSessionWrite, FtpConfig, FtpService,
+    FtpSessionWrite, FtpStorHandle, FtpConfig, FtpService, MessageReceiveCallback, StorReady,
 };
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Test-only [`MessageReceiveCallback`] that assembles a whole-buffer result
+/// purely so the test can assert on it — the transfer itself is still
+/// driven entirely through the real streaming callback, chunk by chunk.
+struct CollectReceiver {
+    buf: Vec<u8>,
+    out: Arc<Mutex<Option<io::Result<Vec<u8>>>>>,
+}
+
+impl CollectReceiver {
+    fn new(out: Arc<Mutex<Option<io::Result<Vec<u8>>>>>) -> Self {
+        Self { buf: Vec::new(), out }
+    }
+}
+
+impl MessageReceiveCallback for CollectReceiver {
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
+        self.buf.extend_from_slice(chunk);
+        true
+    }
+
+    fn end_message(&mut self, result: io::Result<()>) {
+        let buf = std::mem::take(&mut self.buf);
+        *self.out.lock().unwrap() = Some(result.map(|_| buf));
+    }
+}
+
+/// Test-only `ready` callback that pushes a whole in-memory buffer through
+/// a [`FtpStorHandle`] once armed.
+fn stor_ready_with(data: Vec<u8>) -> StorReady {
+    Box::new(move |handle: FtpStorHandle| {
+        handle.feed(&data);
+        handle.finish();
+    })
+}
 
 fn start_server(root: &std::path::Path) -> (Arc<Runtime>, SocketAddr) {
     let mut policy = PasswordTrustPolicy::default();
@@ -81,10 +117,7 @@ fn run_get(
     remote: &str,
 ) -> std::io::Result<Vec<u8>> {
     let result: Arc<Mutex<Option<std::io::Result<Vec<u8>>>>> = Arc::new(Mutex::new(None));
-    let result2 = Arc::clone(&result);
-    let pipeline = FtpGet::new(remote, move |r| {
-        *result2.lock().unwrap() = Some(r);
-    });
+    let pipeline = FtpGet::new(remote, Box::new(CollectReceiver::new(Arc::clone(&result))));
     FtpClient::new(addr.ip().to_string())
         .port(addr.port())
         .credentials("u", "p")
@@ -108,7 +141,7 @@ fn run_put(
 ) -> std::io::Result<()> {
     let result: Arc<Mutex<Option<std::io::Result<()>>>> = Arc::new(Mutex::new(None));
     let result2 = Arc::clone(&result);
-    let pipeline = FtpPut::new(remote, data, move |r| {
+    let pipeline = FtpPut::new(remote, Box::new(io::Cursor::new(data)), move |r| {
         *result2.lock().unwrap() = Some(r);
     });
     FtpClient::new(addr.ip().to_string())
@@ -157,10 +190,7 @@ fn async_client_auth_tls_retr() {
     let (rt, bound) = start_server_explicit_ftps(dir.path(), acceptor);
 
     let result: Arc<Mutex<Option<std::io::Result<Vec<u8>>>>> = Arc::new(Mutex::new(None));
-    let result2 = Arc::clone(&result);
-    let pipeline = FtpGet::new("secret.txt", move |r| {
-        *result2.lock().unwrap() = Some(r);
-    });
+    let pipeline = FtpGet::new("secret.txt", Box::new(CollectReceiver::new(Arc::clone(&result))));
     FtpClient::new(bound.ip().to_string())
         .port(bound.port())
         .credentials("u", "p")
@@ -201,10 +231,7 @@ fn async_client_implicit_tls_retr() {
     let bound = service.start(Arc::clone(&rt)).unwrap();
 
     let result: Arc<Mutex<Option<std::io::Result<Vec<u8>>>>> = Arc::new(Mutex::new(None));
-    let result2 = Arc::clone(&result);
-    let pipeline = FtpGet::new("secret.txt", move |r| {
-        *result2.lock().unwrap() = Some(r);
-    });
+    let pipeline = FtpGet::new("secret.txt", Box::new(CollectReceiver::new(Arc::clone(&result))));
     FtpClient::new(bound.ip().to_string())
         .port(bound.port())
         .credentials("u", "p")
@@ -221,6 +248,162 @@ fn async_client_implicit_tls_retr() {
 
     let body = wait_result(result).unwrap();
     assert_eq!(body, b"implicit-tls-data");
+
+    drop(rt);
+}
+
+/// Reads one (single-line) reply from `ctrl`.
+fn read_reply(ctrl: &mut std::net::TcpStream) -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 4096];
+    let n = ctrl.read(&mut buf).unwrap();
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
+/// Sends one command over `ctrl` and returns the (single-line) reply text.
+fn raw_cmd(ctrl: &mut std::net::TcpStream, cmd: &str) -> String {
+    use std::io::Write;
+    ctrl.write_all(cmd.as_bytes()).unwrap();
+    read_reply(ctrl)
+}
+
+/// Connects and logs in over a raw control socket (bypassing
+/// `FtpSessionWrite`, which only supports PASV/EPSV) — needed for the two
+/// tests below, both of which exercise PORT/PROT-P sequences the async
+/// client API can't drive.
+fn raw_login(bound: SocketAddr) -> std::net::TcpStream {
+    use std::io::Read;
+    let mut ctrl = std::net::TcpStream::connect(bound).unwrap();
+    ctrl.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 4096];
+    let _ = ctrl.read(&mut buf).unwrap(); // 220 welcome
+    let r = raw_cmd(&mut ctrl, "USER u\r\n");
+    assert!(r.starts_with("331") || r.starts_with("230"), "USER: {r}");
+    if r.starts_with("331") {
+        let r = raw_cmd(&mut ctrl, "PASS p\r\n");
+        assert!(r.starts_with("230"), "PASS: {r}");
+    }
+    ctrl
+}
+
+/// Issue #3 (2b): `require_tls_for_data` must actually reject a data
+/// transfer attempted without `PROT P`, not silently force TLS on the PASV
+/// listener while leaving a plaintext-only client to just hang/fail
+/// unexpectedly. Exercised with PASV directly over a raw control socket —
+/// a client that never negotiated `PROT P` should be turned away at the
+/// PASV command itself, with a clear reply, before any listener opens.
+#[test]
+fn require_tls_for_data_rejects_pasv_without_prot_p() {
+    let dir = tempfile::tempdir().unwrap();
+    let (acceptor, _connector) = tls_pair(&dir);
+    let (rt, bound) = start_server_explicit_ftps(dir.path(), acceptor);
+
+    let mut ctrl = raw_login(bound);
+    let r = raw_cmd(&mut ctrl, "TYPE I\r\n");
+    assert!(r.starts_with("200"), "TYPE I: {r}");
+
+    // No AUTH TLS, no PBSZ/PROT P — require_tls_for_data must reject this.
+    let r = raw_cmd(&mut ctrl, "PASV\r\n");
+    assert!(r.starts_with("522"), "PASV without PROT P should be rejected, got: {r}");
+
+    drop(rt);
+}
+
+/// Issue #3 (2a): `PROT P` must protect active-mode (PORT) data
+/// connections too, not just PASV — previously hardcoded to cleartext
+/// regardless of `PROT P` (`prepare_data`'s `DataMode::Active` arm). Drives
+/// PORT/PROT P by hand over a raw control socket (the async client only
+/// supports PASV/EPSV) and proves the resulting connection is really
+/// TLS-secured by checking `security_established` actually fires on our
+/// own accepting listener — not just that decodable bytes arrived, which
+/// wouldn't distinguish "really encrypted" from "happened to already be
+/// cleartext".
+#[test]
+fn active_mode_prot_p_actually_encrypts_the_data_connection() {
+    use hopf_core::{Endpoint, ProtocolHandler, TcpListenerConfig};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("secret.txt"), b"active-mode-secret").unwrap();
+
+    // One cert/key pair for the server's own control+PASV acceptor
+    // (unused by this test beyond satisfying `cmd_prot`'s availability
+    // check), a second, independent pair for the direction this test
+    // actually exercises: the server dialing OUT to our fake FTP client's
+    // data listener, which must present as a TLS *server* to accept it.
+    let control_dir = tempfile::tempdir().unwrap();
+    let (control_acceptor, _unused) = tls_pair(&control_dir);
+    let (client_acceptor, server_data_connector) = tls_pair(&dir);
+
+    let mut policy = PasswordTrustPolicy::default();
+    policy = policy.with_user("u", "p");
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = FtpConfig::new(listen, dir.path(), policy.shared())
+        .with_tls(control_acceptor)
+        .with_data_tls_connector(server_data_connector, "localhost");
+    let service = FtpService::new(config);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+
+    struct Capture {
+        buf: Arc<Mutex<Vec<u8>>>,
+        secured: Arc<AtomicBool>,
+    }
+    impl ProtocolHandler for Capture {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn security_established(&mut self, _endpoint: &mut dyn Endpoint, _info: &hopf_core::SecurityInfo) {
+            self.secured.store(true, Ordering::SeqCst);
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            self.buf.lock().unwrap().extend_from_slice(data);
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+    let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let secured = Arc::new(AtomicBool::new(false));
+    let (r2, s2) = (Arc::clone(&received), Arc::clone(&secured));
+    let (data_listen_addr, _) = rt
+        .add_tcp_listener(
+            TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+                Box::new(Capture { buf: Arc::clone(&r2), secured: Arc::clone(&s2) }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(client_acceptor),
+        )
+        .unwrap();
+
+    let mut ctrl = raw_login(bound);
+    let r = raw_cmd(&mut ctrl, "TYPE I\r\n");
+    assert!(r.starts_with("200"), "TYPE I: {r}");
+    let r = raw_cmd(&mut ctrl, "PBSZ 0\r\n");
+    assert!(r.starts_with("200"), "PBSZ 0: {r}");
+    let r = raw_cmd(&mut ctrl, "PROT P\r\n");
+    assert!(r.starts_with("200"), "PROT P: {r}");
+
+    let p1 = (data_listen_addr.port() / 256) as u16;
+    let p2 = data_listen_addr.port() % 256;
+    let r = raw_cmd(&mut ctrl, &format!("PORT 127,0,0,1,{p1},{p2}\r\n"));
+    assert!(r.starts_with("200"), "PORT: {r}");
+
+    let r = raw_cmd(&mut ctrl, "RETR secret.txt\r\n");
+    assert!(r.starts_with("150"), "RETR not accepted: {r}");
+    let r = read_reply(&mut ctrl);
+    assert!(r.starts_with("226"), "transfer did not complete: {r}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if secured.load(Ordering::SeqCst) && !received.lock().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        secured.load(Ordering::SeqCst),
+        "active-mode data connection must be TLS-secured once PROT P is in effect"
+    );
+    assert_eq!(&*received.lock().unwrap(), b"active-mode-secret");
 
     drop(rt);
 }
@@ -266,24 +449,53 @@ struct AppeNlstStouResults {
     failed: Option<FtpError>,
 }
 
+/// Streams NLST content straight into `AppeNlstStouResults::nlst`.
+struct NlstReceiver {
+    buf: Vec<u8>,
+    results: Arc<Mutex<AppeNlstStouResults>>,
+}
+
+impl NlstReceiver {
+    fn new(results: Arc<Mutex<AppeNlstStouResults>>) -> Self {
+        Self { buf: Vec::new(), results }
+    }
+}
+
+impl MessageReceiveCallback for NlstReceiver {
+    fn message_content(&mut self, chunk: &[u8]) -> bool {
+        self.buf.extend_from_slice(chunk);
+        true
+    }
+
+    fn end_message(&mut self, result: io::Result<()>) {
+        let buf = std::mem::take(&mut self.buf);
+        self.results.lock().unwrap().nlst = Some(result.map(|_| buf));
+    }
+}
+
 impl FtpPipeline for AppeNlstStouPipeline {
     fn start(&mut self, session: &mut dyn FtpSessionWrite, _abort: FtpAbortHandle) {
         session.type_image();
 
         let r = Arc::clone(&self.results);
-        session.appe(&self.appe_path, self.appe_data.clone(), Box::new(move |res| {
-            r.lock().unwrap().appe = Some(res);
-        }));
+        session.appe(
+            &self.appe_path,
+            stor_ready_with(self.appe_data.clone()),
+            Box::new(move |res| {
+                r.lock().unwrap().appe = Some(res);
+            }),
+        );
 
         let r = Arc::clone(&self.results);
-        session.nlst(None, Box::new(move |res| {
-            r.lock().unwrap().nlst = Some(res);
-        }));
+        session.nlst(None, Box::new(NlstReceiver::new(r)));
 
         let r = Arc::clone(&self.results);
-        session.stou(b"unique-payload".to_vec(), Box::new(move |res| {
-            r.lock().unwrap().stou = Some(res);
-        }));
+        session.stou(
+            stor_ready_with(b"unique-payload".to_vec()),
+            Box::new(move |res| {
+                r.lock().unwrap().stou = Some(res);
+            }),
+        );
 
         session.quit();
     }
@@ -364,13 +576,7 @@ impl FtpPipeline for RetrFromPipeline {
     fn start(&mut self, session: &mut dyn FtpSessionWrite, _abort: FtpAbortHandle) {
         session.type_image();
         let r = Arc::clone(&self.result);
-        session.retr_from(
-            &self.path,
-            self.offset,
-            Box::new(move |res| {
-                *r.lock().unwrap() = Some(res);
-            }),
-        );
+        session.retr_from(&self.path, self.offset, Box::new(CollectReceiver::new(r)));
         session.quit();
     }
 
@@ -428,7 +634,7 @@ impl FtpPipeline for StorFromPipeline {
         session.stor_from(
             &self.path,
             self.offset,
-            self.data.clone(),
+            stor_ready_with(self.data.clone()),
             Box::new(move |res| {
                 *r.lock().unwrap() = Some(res);
             }),
@@ -525,10 +731,7 @@ fn async_client_greeting_timeout() {
         .unwrap();
 
     let result: Arc<Mutex<Option<std::io::Result<Vec<u8>>>>> = Arc::new(Mutex::new(None));
-    let result2 = Arc::clone(&result);
-    let pipeline = FtpGet::new("x.txt", move |r| {
-        *result2.lock().unwrap() = Some(r);
-    });
+    let pipeline = FtpGet::new("x.txt", Box::new(CollectReceiver::new(Arc::clone(&result))));
     FtpClient::new(addr.ip().to_string())
         .port(addr.port())
         .timeouts(FtpClientTimeouts {

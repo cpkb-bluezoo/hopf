@@ -20,4 +20,5 @@ pub mod spf;
 pub use dmarc::AuthVerdict;
 pub use dns_lookup::{DnsLookup, Lookup};
 pub use pipeline::{AuthPipeline, AuthPipelineBuilder, AuthResultsHandle, AuthVerdictHandle};
+pub(crate) use pipeline::find_header_boundary;
 pub use psl::PublicSuffixList;

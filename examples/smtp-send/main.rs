@@ -30,7 +30,7 @@ fn main() -> io::Result<()> {
         .unwrap_or_else(|| "recipient@example.com".into());
     let subject = env::var("SMTP_SUBJECT").unwrap_or_else(|_| "Hopf test".into());
     let body = env::var("SMTP_BODY").unwrap_or_else(|_| "Hello from smtp-send.\r\n".into());
-    let msg = format!("Subject: {subject}\r\n\r\n{body}");
+    let mut msg = Some(format!("Subject: {subject}\r\n\r\n{body}").into_bytes());
 
     let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
     let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
@@ -39,7 +39,7 @@ fn main() -> io::Result<()> {
     let send = SmtpSend::new("smtp-send.local")
         .mail_from(from.clone())
         .rcpt_to(to.clone())
-        .message(msg.into_bytes())
+        .message_with(move || msg.take())
         .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
 
     SmtpClient::new(&host, port)

@@ -38,10 +38,6 @@ struct AppendState {
     tmp_file: File,
 }
 
-struct ReadState {
-    file: File,
-}
-
 /// Shared user-root resolver for COPY/MOVE into sibling folders.
 pub(crate) struct MaildirPaths {
     pub user_root: PathBuf,
@@ -65,7 +61,6 @@ pub struct MaildirMailbox {
     index: MessageIndex,
     index_config: IndexConfig,
     append: Option<AppendState>,
-    read: Option<ReadState>,
     /// When opening destination for copy, hold store-level open lock via paths only.
     _open_guard: Option<Arc<Mutex<()>>>,
 }
@@ -163,7 +158,6 @@ impl MaildirMailbox {
             index,
             index_config,
             append: None,
-            read: None,
             _open_guard: open_guard,
         })
     }
@@ -253,26 +247,26 @@ impl Mailbox for MaildirMailbox {
         Ok(out)
     }
 
-    fn start_read(&mut self, message_number: u32) -> MailboxResult<()> {
-        if self.read.is_some() {
-            return Err(MailboxError::Invalid("read already in progress".into()));
-        }
+    fn read_message(
+        &mut self,
+        message_number: u32,
+        callback: &mut dyn crate::traits::MessageReadCallback,
+    ) -> MailboxResult<()> {
         let idx = self.seq_index(message_number)?;
-        let file = File::open(&self.messages[idx].path)?;
-        self.read = Some(ReadState { file });
-        Ok(())
-    }
-
-    fn read_chunk(&mut self, buf: &mut [u8]) -> MailboxResult<usize> {
-        let r = self
-            .read
-            .as_mut()
-            .ok_or_else(|| MailboxError::Invalid("no read in progress".into()))?;
-        Ok(r.file.read(buf)?)
-    }
-
-    fn end_read(&mut self) -> MailboxResult<()> {
-        self.read = None;
+        let msg = &self.messages[idx];
+        let mut file = File::open(&msg.path)?;
+        callback.start_message(msg.size);
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            if !callback.message_content(&buf[..n]) {
+                break;
+            }
+        }
+        callback.end_message();
         Ok(())
     }
 
@@ -478,6 +472,18 @@ impl Mailbox for MaildirMailbox {
         Ok(())
     }
 
+    fn abort_append(&mut self) -> MailboxResult<()> {
+        if let Some(a) = self.append.take() {
+            drop(a.tmp_file);
+            // Best-effort: the tmp file was never renamed into `cur/`, so
+            // nothing else references it — but a failure removing it isn't
+            // itself grounds to fail the abort (maildir tolerates stray
+            // `tmp/` files; an external janitor process is the convention).
+            let _ = fs::remove_file(&a.tmp_path);
+        }
+        Ok(())
+    }
+
     fn end_append(&mut self) -> MailboxResult<u64> {
         self.ensure_writable()?;
         let AppendState {
@@ -557,9 +563,27 @@ impl Mailbox for MaildirMailbox {
         let mut map = BTreeMap::new();
         for &n in message_numbers {
             let idx = self.seq_index(n)?;
-            let bytes = fs::read(&self.messages[idx].path)?;
             let flags = self.messages[idx].filename.flags.clone();
-            let uid = dest.append_message(&bytes, &flags, None)?;
+            struct CopyToDest<'a> {
+                guard: crate::traits::AppendGuard<'a>,
+                error: Option<MailboxError>,
+            }
+            impl crate::traits::MessageReadCallback for CopyToDest<'_> {
+                fn message_content(&mut self, chunk: &[u8]) -> bool {
+                    if let Err(e) = self.guard.append_content(chunk) {
+                        self.error = Some(e);
+                        return false;
+                    }
+                    true
+                }
+            }
+            let guard = crate::traits::AppendGuard::start(&mut dest, &flags, None)?;
+            let mut cb = CopyToDest { guard, error: None };
+            self.read_message(n, &mut cb)?;
+            if let Some(e) = cb.error {
+                return Err(e);
+            }
+            let uid = cb.guard.commit()?;
             map.insert(n, uid);
         }
         dest.close(false)?;
@@ -574,12 +598,7 @@ impl Mailbox for MaildirMailbox {
             let Some(e) = self.index.get(m.uid) else {
                 continue;
             };
-            let body_override = if need_body {
-                let raw = fs::read(&m.path)?;
-                Some(String::from_utf8_lossy(&raw).to_ascii_lowercase())
-            } else {
-                None
-            };
+            let body_path: Option<&Path> = if need_body { Some(&m.path) } else { None };
             let entry = crate::index::IndexEntry::new(
                 e.uid,
                 seq,
@@ -591,7 +610,7 @@ impl Mailbox for MaildirMailbox {
             );
             struct Ctx<'a> {
                 e: &'a crate::index::IndexEntry,
-                body: Option<&'a str>,
+                body_path: Option<&'a Path>,
             }
             impl crate::search::MessageContext for Ctx<'_> {
                 fn message_number(&self) -> u32 {
@@ -626,17 +645,23 @@ impl Mailbox for MaildirMailbox {
                 fn header(&self, name: &str) -> std::io::Result<String> {
                     Ok(self.e.header_value(name).unwrap_or("").to_string())
                 }
-                fn body(&self) -> std::io::Result<String> {
-                    if let Some(b) = self.body {
-                        return Ok(b.to_string());
+                fn body_contains(&self, needle_lower: &str) -> std::io::Result<bool> {
+                    if let Some(path) = self.body_path {
+                        let file = File::open(path)?;
+                        return crate::search::body_contains_streaming(file, needle_lower);
                     }
-                    Ok(self.e.body().unwrap_or("").to_string())
+                    Ok(self
+                        .e
+                        .body()
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .contains(needle_lower))
                 }
             }
             let hit = criteria
                 .matches(&Ctx {
                     e: &entry,
-                    body: body_override.as_deref(),
+                    body_path,
                 })
                 .map_err(MailboxError::Io)?;
             if hit {
@@ -726,6 +751,49 @@ mod tests {
         .into_bytes()
     }
 
+    /// Test-only whole-message append, via the real streaming push triad
+    /// ([`AppendGuard`]) — never bypasses it.
+    fn append_whole(
+        mb: &mut dyn Mailbox,
+        data: &[u8],
+        flags: &BTreeSet<Flag>,
+        internal_date: Option<SystemTime>,
+    ) -> MailboxResult<u64> {
+        let mut guard = crate::traits::AppendGuard::start(mb, flags, internal_date)?;
+        guard.append_content(data)?;
+        guard.commit()
+    }
+
+    /// Test-only [`MessageReadCallback`] that records the call sequence and
+    /// collects the whole message, for assertions.
+    #[derive(Default)]
+    struct RecordingReadCallback {
+        events: Vec<String>,
+        data: Vec<u8>,
+    }
+
+    impl crate::traits::MessageReadCallback for RecordingReadCallback {
+        fn start_message(&mut self, size: u64) {
+            self.events.push(format!("start({size})"));
+        }
+        fn message_content(&mut self, chunk: &[u8]) -> bool {
+            self.events.push(format!("content({})", chunk.len()));
+            self.data.extend_from_slice(chunk);
+            true
+        }
+        fn end_message(&mut self) {
+            self.events.push("end".to_string());
+        }
+    }
+
+    /// Test-only whole-message read, via the real streaming
+    /// [`Mailbox::read_message`] callback — never bypasses it.
+    fn read_whole(mb: &mut dyn Mailbox, message_number: u32) -> MailboxResult<Vec<u8>> {
+        let mut cb = RecordingReadCallback::default();
+        mb.read_message(message_number, &mut cb)?;
+        Ok(cb.data)
+    }
+
     #[test]
     fn streaming_read_round_trips_appended_content() {
         let dir = tempdir().unwrap();
@@ -734,39 +802,24 @@ mod tests {
         store.open("readuser").unwrap();
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
         let msg = sample("streamed");
-        mb.append_message(&msg, &BTreeSet::new(), None).unwrap();
+        append_whole(mb.as_mut(), &msg, &BTreeSet::new(), None).unwrap();
 
-        mb.start_read(1).unwrap();
-        let mut got = Vec::new();
-        let mut buf = [0u8; 4]; // deliberately tiny to exercise multiple chunks
-        loop {
-            let n = mb.read_chunk(&mut buf).unwrap();
-            if n == 0 {
-                break;
-            }
-            got.extend_from_slice(&buf[..n]);
-        }
-        mb.end_read().unwrap();
-        assert_eq!(got, msg);
+        let mut cb = RecordingReadCallback::default();
+        mb.read_message(1, &mut cb).unwrap();
+        assert_eq!(cb.data, msg);
+        assert_eq!(cb.events.first(), Some(&format!("start({})", msg.len())));
+        assert_eq!(cb.events.last(), Some(&"end".to_string()));
+        assert!(
+            cb.events.len() > 2,
+            "expected at least one content() call between start and end: {:?}",
+            cb.events
+        );
 
-        // A second read must be independently startable (no leftover state).
-        let via_default = mb.read_message(1).unwrap();
-        assert_eq!(via_default, msg);
-        mb.close(false).unwrap();
-    }
-
-    #[test]
-    fn start_read_rejects_concurrent_read() {
-        let dir = tempdir().unwrap();
-        let factory = MaildirFactory::new(dir.path());
-        let mut store = factory.create_store();
-        store.open("concurrentreaduser").unwrap();
-        let mut mb = store.open_mailbox("INBOX", false).unwrap();
-        mb.append_message(&sample("x"), &BTreeSet::new(), None)
-            .unwrap();
-        mb.start_read(1).unwrap();
-        assert!(mb.start_read(1).is_err());
-        mb.end_read().unwrap();
+        // A second, independent read must produce the same content (no
+        // leftover state from the first — each read_message call is
+        // self-contained).
+        let again = read_whole(mb.as_mut(), 1).unwrap();
+        assert_eq!(again, msg);
         mb.close(false).unwrap();
     }
 
@@ -786,7 +839,7 @@ mod tests {
         let uid = mb.end_append().unwrap();
         assert!(uid > 0);
 
-        let got = mb.read_message(1).unwrap();
+        let got = read_whole(mb.as_mut(), 1).unwrap();
         assert_eq!(
             got, msg,
             "content written via small chunks must round-trip exactly"
@@ -800,14 +853,85 @@ mod tests {
     }
 
     #[test]
+    fn abort_append_removes_the_tmp_file_and_leaves_no_message() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("abortuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        mb.start_append(&BTreeSet::new(), None).unwrap();
+        mb.append_content(b"From: a@b\r\n").unwrap();
+        mb.append_content(b"partial, never finished").unwrap();
+
+        let tmp_dir = dir.path().join("abortuser").join("tmp");
+        let tmp_files_during: Vec<_> = fs::read_dir(&tmp_dir).unwrap().collect();
+        assert_eq!(tmp_files_during.len(), 1, "a tmp file must exist mid-append");
+
+        mb.abort_append().unwrap();
+
+        let tmp_files_after: Vec<_> = fs::read_dir(&tmp_dir).unwrap().collect();
+        assert!(tmp_files_after.is_empty(), "abort_append must remove the orphaned tmp file");
+        assert_eq!(mb.message_count().unwrap(), 0, "aborted append must not deliver a message");
+
+        // The mailbox must be immediately reusable for a fresh append.
+        let uid = append_whole(mb.as_mut(), &sample("after-abort"), &BTreeSet::new(), None)
+            .unwrap();
+        assert!(uid > 0);
+        assert_eq!(mb.message_count().unwrap(), 1);
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn abort_append_with_nothing_in_progress_is_a_safe_no_op() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("noopabortuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        assert!(mb.abort_append().is_ok());
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn append_guard_rolls_back_on_drop_without_commit() {
+        use crate::traits::AppendGuard;
+
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("guarduser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        {
+            let mut guard = AppendGuard::start(mb.as_mut(), &BTreeSet::new(), None).unwrap();
+            guard.append_content(b"From: a@b\r\n").unwrap();
+            guard.append_content(b"partial, never committed").unwrap();
+            // `guard` drops here without `commit()` — must roll back.
+        }
+
+        let tmp_dir = dir.path().join("guarduser").join("tmp");
+        let remaining: Vec<_> = fs::read_dir(&tmp_dir).unwrap().collect();
+        assert!(remaining.is_empty(), "AppendGuard's Drop must remove the orphaned tmp file");
+        assert_eq!(mb.message_count().unwrap(), 0);
+
+        // The mailbox must be immediately reusable through a committed guard.
+        let mut guard = AppendGuard::start(mb.as_mut(), &BTreeSet::new(), None).unwrap();
+        guard.append_content(&sample("via-guard")).unwrap();
+        let uid = guard.commit().unwrap();
+        assert!(uid > 0);
+        assert_eq!(mb.message_count().unwrap(), 1);
+        mb.close(false).unwrap();
+    }
+
+    #[test]
     fn keywords_mutation_renames_and_indexes() {
         let dir = tempdir().unwrap();
         let factory = MaildirFactory::new(dir.path());
         let mut store = factory.create_store();
         store.open("kwuser").unwrap();
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
-        mb.append_message(&sample("k1"), &BTreeSet::new(), None)
-            .unwrap();
+        append_whole(mb.as_mut(), &sample("k1"), &BTreeSet::new(), None).unwrap();
 
         let mut kws = BTreeSet::new();
         kws.insert("Important".into());
@@ -840,12 +964,9 @@ mod tests {
         let mut store = factory.create_store();
         store.open("exuser").unwrap();
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
-        mb.append_message(&sample("a"), &BTreeSet::new(), None)
-            .unwrap();
-        mb.append_message(&sample("b"), &BTreeSet::new(), None)
-            .unwrap();
-        mb.append_message(&sample("c"), &BTreeSet::new(), None)
-            .unwrap();
+        append_whole(mb.as_mut(), &sample("a"), &BTreeSet::new(), None).unwrap();
+        append_whole(mb.as_mut(), &sample("b"), &BTreeSet::new(), None).unwrap();
+        append_whole(mb.as_mut(), &sample("c"), &BTreeSet::new(), None).unwrap();
 
         let mut del = BTreeSet::new();
         del.insert(Flag::Deleted);
@@ -867,11 +988,10 @@ mod tests {
         let mut store = factory.create_store();
         store.open("stuser").unwrap();
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
-        mb.append_message(&sample("u1"), &BTreeSet::new(), None)
-            .unwrap();
+        append_whole(mb.as_mut(), &sample("u1"), &BTreeSet::new(), None).unwrap();
         let mut seen = BTreeSet::new();
         seen.insert(Flag::Seen);
-        mb.append_message(&sample("u2"), &seen, None).unwrap();
+        append_whole(mb.as_mut(), &sample("u2"), &seen, None).unwrap();
 
         let st = mb.status().unwrap();
         assert_eq!(st.messages, 2);

@@ -141,10 +141,24 @@ impl FtpControlHandler {
     }
 
     fn data_tls(&self) -> Option<SharedTlsAcceptor> {
-        if self.prot_p || self.config.require_tls_for_data {
+        if self.prot_p {
             self.config.tls_acceptor.clone()
         } else {
             None
+        }
+    }
+
+    /// `require_tls_for_data` (RFC 4217 §2 / `require_data_tls()`) means
+    /// what it says: a transfer without `PROT P` in effect is refused, not
+    /// silently upgraded — the client must send `PROT P` itself before
+    /// PASV/EPSV/PORT/EPRT. Call before opening/dialing any data
+    /// connection.
+    fn check_data_protection(&self, endpoint: &mut dyn Endpoint) -> bool {
+        if self.config.require_tls_for_data && !self.prot_p {
+            self.send_reply(endpoint, 522, "PROT P required for data connections");
+            false
+        } else {
+            true
         }
     }
 
@@ -371,21 +385,21 @@ impl FtpControlHandler {
         if !self.require_auth(endpoint) {
             return;
         }
-        if self.config.require_tls_for_data && !self.prot_p && self.data_tls().is_none() {
-            self.send_reply(endpoint, 521, "Data connection must be secured");
+        if !self.check_data_protection(endpoint) {
             return;
         }
         self.clear_pasv();
         let bridge = self.ensure_bridge();
         let bridge2 = Arc::clone(&bridge);
         let expect_tls = self.data_tls().is_some();
+        let expected_peer = self.meta.peer.ip();
         let bind_ip = match self.meta.local.ip() {
             IpAddr::V4(v) => IpAddr::V4(v),
             IpAddr::V6(v) => IpAddr::V6(v),
         };
         let port = self.pick_pasv_port();
         let mut cfg = TcpListenerConfig::new(SocketAddr::new(bind_ip, port), move || {
-            Box::new(FtpDataHandler::new(Arc::clone(&bridge2), expect_tls))
+            Box::new(FtpDataHandler::new(Arc::clone(&bridge2), expect_tls, expected_peer))
                 as Box<dyn ProtocolHandler>
         });
         if let Some(tls) = self.data_tls() {
@@ -424,13 +438,17 @@ impl FtpControlHandler {
         if !self.require_auth(endpoint) {
             return;
         }
+        if !self.check_data_protection(endpoint) {
+            return;
+        }
         self.clear_pasv();
         let bridge = self.ensure_bridge();
         let bridge2 = Arc::clone(&bridge);
         let expect_tls = self.data_tls().is_some();
+        let expected_peer = self.meta.peer.ip();
         let bind_ip = self.meta.local.ip();
         let mut cfg = TcpListenerConfig::new(SocketAddr::new(bind_ip, 0), move || {
-            Box::new(FtpDataHandler::new(Arc::clone(&bridge2), expect_tls))
+            Box::new(FtpDataHandler::new(Arc::clone(&bridge2), expect_tls, expected_peer))
                 as Box<dyn ProtocolHandler>
         });
         if let Some(tls) = self.data_tls() {
@@ -486,6 +504,9 @@ impl FtpControlHandler {
     }
 
     fn prepare_data(&mut self, endpoint: &mut dyn Endpoint) -> bool {
+        if !self.check_data_protection(endpoint) {
+            return false;
+        }
         let mode = self.data_mode.clone();
         match mode {
             DataMode::None => {
@@ -495,11 +516,29 @@ impl FtpControlHandler {
             DataMode::Active { addr } => {
                 let bridge = self.ensure_bridge();
                 let bridge2 = Arc::clone(&bridge);
-                // Active + PROT P would need a TLS *connector* (server dials); cleartext only for now.
-                let cfg = TcpConnectorConfig::new(addr, move || {
-                    Box::new(FtpDataHandler::new(Arc::clone(&bridge2), false))
+                let want_tls = self.data_tls().is_some();
+                if want_tls && self.config.data_tls_connector.is_none() {
+                    // PROT P is in effect but this deployment has no client-role
+                    // connector configured (see `with_data_tls_connector`) —
+                    // refuse rather than silently falling back to cleartext.
+                    self.send_reply(endpoint, 425, "Cannot secure active-mode data connection");
+                    return false;
+                }
+                let expected_peer = addr.ip();
+                let mut cfg = TcpConnectorConfig::new(addr, move || {
+                    Box::new(FtpDataHandler::new(Arc::clone(&bridge2), want_tls, expected_peer))
                         as Box<dyn ProtocolHandler>
                 });
+                if want_tls {
+                    if let Some(connector) = &self.config.data_tls_connector {
+                        let server_name = self
+                            .config
+                            .data_tls_server_name
+                            .clone()
+                            .unwrap_or_else(|| "ftp-client".to_string());
+                        cfg = cfg.with_tls(Arc::clone(connector), server_name);
+                    }
+                }
                 if self.runtime.connect(cfg).is_err() {
                     self.send_reply(endpoint, 425, "Cannot open data connection");
                     return false;

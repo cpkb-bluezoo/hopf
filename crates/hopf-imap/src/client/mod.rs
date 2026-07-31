@@ -14,15 +14,29 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use hopf_core::{Runtime, RuntimeConfig};
-//! use hopf_imap::client::{ImapClient, ImapFetch};
+//! use hopf_imap::client::{ImapClient, ImapFetch, MessageReceiveCallback};
+//!
+//! #[derive(Default)]
+//! struct PrintSizes { seq: u32, total: usize }
+//! impl MessageReceiveCallback for PrintSizes {
+//!     fn start_message(&mut self, seq: u32) {
+//!         self.seq = seq;
+//!         self.total = 0;
+//!     }
+//!     fn message_content(&mut self, chunk: &[u8]) -> bool {
+//!         self.total += chunk.len();
+//!         true
+//!     }
+//!     fn end_message(&mut self, uid: Option<u32>) {
+//!         println!("message {} uid={uid:?}: {} bytes", self.seq, self.total);
+//!     }
+//! }
 //!
 //! let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
 //! let fetch = ImapFetch::new()
 //!     .credentials("alice", "s3cr3t")
 //!     .mailbox("INBOX")
-//!     .on_message(Box::new(|seq, uid, body| {
-//!         println!("message {seq} uid={uid:?}: {} bytes", body.len());
-//!     }))
+//!     .on_message(Box::new(PrintSizes::default()))
 //!     .on_complete(Box::new(|ok| println!("fetch complete: {ok}")));
 //! ImapClient::new("imap.example.com", 143)
 //!     .connect(&rt, Arc::new(fetch))
@@ -57,7 +71,7 @@ pub use pending::{
     ImapTagGenerator, PendingCommand, PendingKind, PendingMap, Tag, UntaggedClass,
     DEFAULT_MAX_PIPELINE,
 };
-pub use pipeline::{pipeline_status_and_list, ImapFetch, ImapIdle};
+pub use pipeline::{pipeline_status_and_list, ImapFetch, ImapIdle, MessageReceiveCallback};
 pub use reply::{ImapEvent, ImapReplyLexer, ImapStatus, MAX_TOKEN};
 pub use state::{
     ImapAppendUid, ImapCapabilities, ImapClientAppend, ImapClientAuthExchange,

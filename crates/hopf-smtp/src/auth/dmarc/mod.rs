@@ -138,8 +138,8 @@ pub type DmarcCallback = Box<dyn FnOnce(DmarcOutcome) + Send>;
 /// * `spf_result`/`spf_domain` — the SPF outcome and the domain SPF actually
 ///   authenticated (`MAIL FROM` or `HELO` domain).
 /// * `dkim_results` — every verified `DKIM-Signature` (from
-///   [`crate::auth::dkim::verify_all`]) — DMARC must consider all of them,
-///   not just the first, when checking DKIM alignment.
+///   [`crate::auth::dkim::verify_all_with_body_hashes`]) — DMARC must
+///   consider all of them, not just the first, when checking DKIM alignment.
 pub fn evaluate(
     dns: Arc<dyn DnsLookup>,
     psl: &'static PublicSuffixList,
