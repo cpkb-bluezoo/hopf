@@ -15,6 +15,8 @@ pub enum SaslMechanism {
     DigestMd5,
     /// RFC 5802 / RFC 7677.
     ScramSha256,
+    /// RFC 5802bis / RFC 5929 `tls-server-end-point` channel binding.
+    ScramSha256Plus,
     /// RFC 7628.
     OauthBearer,
     /// RFC 4422 Appendix A — TLS client certificate.
@@ -30,6 +32,7 @@ impl SaslMechanism {
             Self::CramMd5 => "CRAM-MD5",
             Self::DigestMd5 => "DIGEST-MD5",
             Self::ScramSha256 => "SCRAM-SHA-256",
+            Self::ScramSha256Plus => "SCRAM-SHA-256-PLUS",
             Self::OauthBearer => "OAUTHBEARER",
             Self::External => "EXTERNAL",
         }
@@ -43,6 +46,7 @@ impl SaslMechanism {
             "CRAM-MD5" => Some(Self::CramMd5),
             "DIGEST-MD5" => Some(Self::DigestMd5),
             "SCRAM-SHA-256" => Some(Self::ScramSha256),
+            "SCRAM-SHA-256-PLUS" => Some(Self::ScramSha256Plus),
             "OAUTHBEARER" => Some(Self::OauthBearer),
             "EXTERNAL" => Some(Self::External),
             _ => None,
@@ -53,7 +57,7 @@ impl SaslMechanism {
     pub fn is_challenge_response(self) -> bool {
         matches!(
             self,
-            Self::CramMd5 | Self::DigestMd5 | Self::ScramSha256
+            Self::CramMd5 | Self::DigestMd5 | Self::ScramSha256 | Self::ScramSha256Plus
         )
     }
 
@@ -66,6 +70,19 @@ impl SaslMechanism {
     }
 
     /// All mechanisms shipped in this crate (no GSSAPI).
+    ///
+    /// [`Self::ScramSha256Plus`] is deliberately excluded: it's fully
+    /// implemented (see [`crate::scram`]) and available via
+    /// [`crate::session::create_server`]/[`crate::session::create_client`]
+    /// to any caller that explicitly requests it, but a
+    /// [`crate::store::CredentialStore`]'s default
+    /// [`crate::store::CredentialStore::supported_mechanisms`] uses this
+    /// list to decide what to *advertise* — and advertising PLUS support
+    /// here would be a lie for every protocol crate in this workspace
+    /// today, none of which yet wires real `tls-server-end-point` channel-
+    /// binding data through to `create_server`. A store that does that
+    /// wiring should add `ScramSha256Plus` to its own
+    /// `supported_mechanisms()` override explicitly.
     pub fn all() -> &'static [SaslMechanism] {
         &[
             Self::Plain,

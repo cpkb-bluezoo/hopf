@@ -444,6 +444,7 @@ impl Pop3ControlHandler {
             hostname: self.config.hostname.clone(),
             realm: self.config.hostname.clone(),
             peer_certificate: None,
+            channel_binding: None,
         };
         let mut server = create_server(mech, Arc::clone(&self.config.store), opts);
 

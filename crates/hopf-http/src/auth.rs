@@ -2,8 +2,9 @@
 
 //! HTTP Basic, Digest, and Bearer authentication.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use hopf_auth::crypto::decode_base64;
 use hopf_auth::digest_md5::parse_params;
@@ -147,19 +148,34 @@ pub fn parse_basic_authorization(value: Option<&str>) -> Option<IdentityMaterial
     })
 }
 
+/// How long an issued nonce remains acceptable if never used, by default.
+/// RFC 7616 doesn't mandate a value; five minutes matches typical
+/// real-world Digest implementations.
+const DEFAULT_NONCE_TTL: Duration = Duration::from_secs(300);
+
 /// HTTP Digest configuration.
 #[derive(Debug, Clone)]
 pub struct DigestAuthConfig {
     /// Realm name.
     pub realm: String,
+    /// How long an issued nonce remains acceptable if never used —
+    /// see [`DEFAULT_NONCE_TTL`].
+    pub nonce_ttl: Duration,
 }
 
 impl DigestAuthConfig {
-    /// Create with realm.
+    /// Create with realm (default nonce TTL).
     pub fn new(realm: impl Into<String>) -> Self {
         Self {
             realm: realm.into(),
+            nonce_ttl: DEFAULT_NONCE_TTL,
         }
+    }
+
+    /// Override the nonce TTL.
+    pub fn with_nonce_ttl(mut self, ttl: Duration) -> Self {
+        self.nonce_ttl = ttl;
+        self
     }
 }
 
@@ -168,7 +184,7 @@ pub struct DigestAuthFactory {
     inner: Arc<dyn ServerHandlerFactory>,
     store: Arc<dyn CredentialStore>,
     config: DigestAuthConfig,
-    nonces: Arc<Mutex<HashSet<String>>>,
+    nonces: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl DigestAuthFactory {
@@ -182,7 +198,7 @@ impl DigestAuthFactory {
             inner,
             store,
             config,
-            nonces: Arc::new(Mutex::new(HashSet::new())),
+            nonces: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -193,6 +209,7 @@ impl ServerHandlerFactory for DigestAuthFactory {
             inner: self.inner.create_handler(),
             store: Arc::clone(&self.store),
             realm: self.config.realm.clone(),
+            nonce_ttl: self.config.nonce_ttl,
             nonces: Arc::clone(&self.nonces),
             authorized: false,
             challenged: false,
@@ -204,12 +221,31 @@ struct DigestAuthHandler {
     inner: Box<dyn ServerHandler>,
     store: Arc<dyn CredentialStore>,
     realm: String,
-    nonces: Arc<Mutex<HashSet<String>>>,
+    nonce_ttl: Duration,
+    nonces: Arc<Mutex<HashMap<String, Instant>>>,
     authorized: bool,
     challenged: bool,
 }
 
 impl DigestAuthHandler {
+    fn prune_expired_nonces(&self, nonces: &mut HashMap<String, Instant>) {
+        let ttl = self.nonce_ttl;
+        nonces.retain(|_, issued_at| issued_at.elapsed() <= ttl);
+    }
+
+    /// Consume a tracked nonce: `true` only if `nonce` was actually issued
+    /// by [`Self::send_challenge`], hasn't already been used (nonces are
+    /// single-use — removed here on success), and hasn't expired. This is
+    /// the real replay check: an attacker replaying a captured
+    /// `Authorization: Digest` header (even with a byte-identical,
+    /// cryptographically valid `response` value) presents a nonce that's
+    /// already gone from the map on the second attempt.
+    fn consume_nonce(&self, nonce: &str) -> bool {
+        let mut nonces = self.nonces.lock().unwrap();
+        self.prune_expired_nonces(&mut nonces);
+        nonces.remove(nonce).is_some()
+    }
+
     fn check_auth(&mut self, headers: &Headers) -> bool {
         let Some(auth) = headers.get("authorization") else {
             return false;
@@ -225,6 +261,16 @@ impl DigestAuthHandler {
         let Some(username) = params.get("username") else {
             return false;
         };
+        let Some(nonce) = params.get("nonce") else {
+            return false;
+        };
+        // Consult (and consume) the tracked nonce *before* verifying the
+        // credential hash — an untracked/expired/already-used nonce is
+        // rejected outright, regardless of whether `response` is
+        // otherwise cryptographically correct.
+        if !self.consume_nonce(nonce) {
+            return false;
+        }
         let Some(ha1) = self.store.digest_ha1(username, &self.realm) else {
             return false;
         };
@@ -234,12 +280,16 @@ impl DigestAuthHandler {
             .map(|s| s.as_str())
             .or_else(|| headers.path())
             .unwrap_or("/");
-        verify_authorization(creds, &ha1, method, uri, None)
+        verify_authorization(creds, &ha1, method, uri, Some(nonce))
     }
 
     fn send_challenge(&mut self, response: &mut dyn ServerWriter) {
         let nonce = new_nonce();
-        self.nonces.lock().unwrap().insert(nonce.clone());
+        {
+            let mut nonces = self.nonces.lock().unwrap();
+            self.prune_expired_nonces(&mut nonces);
+            nonces.insert(nonce.clone(), Instant::now());
+        }
         let mut h = Headers::new();
         h.status(401);
         h.set(
@@ -567,6 +617,117 @@ mod tests {
         let _ = c.read_to_end(&mut buf);
         let resp = String::from_utf8_lossy(&buf);
         assert!(resp.contains("200"), "{resp}");
+        rt.shutdown();
+    }
+
+    /// Sends `req` over a fresh connection and returns the whole response
+    /// as text.
+    fn send_request(addr: std::net::SocketAddr, req: &str) -> String {
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        c.write_all(req.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        let _ = c.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn digest_req(creds: &str) -> String {
+        format!(
+            "GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Digest {creds}\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    fn challenge_nonce(resp: &str) -> String {
+        resp.split("nonce=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("nonce")
+            .to_string()
+    }
+
+    /// A captured, cryptographically-valid `Authorization: Digest` header
+    /// replayed verbatim on a second request must be rejected — issue
+    /// #122: the nonce is single-use, so its second presentation fails
+    /// even though `response` is byte-identical to the first, successful
+    /// attempt.
+    #[test]
+    fn digest_auth_replayed_credentials_are_rejected() {
+        let store: Arc<dyn CredentialStore> =
+            Arc::new(PasswordStore::new().with_user("alice", "s3cret"));
+        let factory: Arc<dyn ServerHandlerFactory> = Arc::new(DigestAuthFactory::new(
+            Arc::new(OkFactory),
+            store,
+            DigestAuthConfig::new("test"),
+        ));
+        let (rt, addr) = listen(factory);
+
+        let resp = send_request(
+            addr,
+            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let nonce = challenge_nonce(&resp);
+        let creds = build_digest_authorization("alice", "s3cret", "test", &nonce, "GET", "/");
+
+        let first = send_request(addr, &digest_req(&creds));
+        assert!(first.contains("200"), "first use should succeed: {first}");
+
+        // Exact same Authorization header, second request — a replay.
+        let second = send_request(addr, &digest_req(&creds));
+        assert!(
+            second.contains("401"),
+            "replayed credentials must be rejected: {second}"
+        );
+
+        rt.shutdown();
+    }
+
+    /// Credentials built around a nonce the server never issued (forged,
+    /// or from a different server instance) must be rejected outright,
+    /// even with an otherwise-correct `response` hash.
+    #[test]
+    fn digest_auth_unissued_nonce_is_rejected() {
+        let store: Arc<dyn CredentialStore> =
+            Arc::new(PasswordStore::new().with_user("alice", "s3cret"));
+        let factory: Arc<dyn ServerHandlerFactory> = Arc::new(DigestAuthFactory::new(
+            Arc::new(OkFactory),
+            store,
+            DigestAuthConfig::new("test"),
+        ));
+        let (rt, addr) = listen(factory);
+
+        let forged_nonce = "0000deadbeef0000deadbeef00000000";
+        let creds =
+            build_digest_authorization("alice", "s3cret", "test", forged_nonce, "GET", "/");
+        let resp = send_request(addr, &digest_req(&creds));
+        assert!(resp.contains("401"), "{resp}");
+
+        rt.shutdown();
+    }
+
+    /// A nonce older than the configured TTL is rejected even though it
+    /// was genuinely issued and never used.
+    #[test]
+    fn digest_auth_nonce_expires_after_ttl() {
+        let store: Arc<dyn CredentialStore> =
+            Arc::new(PasswordStore::new().with_user("alice", "s3cret"));
+        let factory: Arc<dyn ServerHandlerFactory> = Arc::new(DigestAuthFactory::new(
+            Arc::new(OkFactory),
+            store,
+            DigestAuthConfig::new("test").with_nonce_ttl(Duration::from_millis(50)),
+        ));
+        let (rt, addr) = listen(factory);
+
+        let resp = send_request(
+            addr,
+            "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        );
+        let nonce = challenge_nonce(&resp);
+        let creds = build_digest_authorization("alice", "s3cret", "test", &nonce, "GET", "/");
+
+        std::thread::sleep(Duration::from_millis(150));
+        let resp = send_request(addr, &digest_req(&creds));
+        assert!(resp.contains("401"), "expired nonce must be rejected: {resp}");
+
         rt.shutdown();
     }
 

@@ -67,6 +67,11 @@ pub struct SaslServerOptions {
     pub realm: String,
     /// Optional peer certificate fingerprint/DN for EXTERNAL.
     pub peer_certificate: Option<String>,
+    /// This connection's `tls-server-end-point` channel-binding data
+    /// (RFC 5929 §4), required for SCRAM-SHA-256-PLUS. `None` when
+    /// creating plain SCRAM-SHA-256 (or any other mechanism, where it's
+    /// unused).
+    pub channel_binding: Option<Vec<u8>>,
 }
 
 impl Default for SaslServerOptions {
@@ -75,6 +80,7 @@ impl Default for SaslServerOptions {
             hostname: "localhost".into(),
             realm: "hopf".into(),
             peer_certificate: None,
+            channel_binding: None,
         }
     }
 }
@@ -93,6 +99,13 @@ pub fn create_server(
             Box::new(crate::digest_md5::DigestMd5Server::new(store, opts.realm))
         }
         SaslMechanism::ScramSha256 => Box::new(crate::scram::ScramSha256Server::new(store)),
+        SaslMechanism::ScramSha256Plus => {
+            let mut s = crate::scram::ScramSha256Server::new(store);
+            if let Some(cb) = opts.channel_binding {
+                s = s.with_channel_binding(cb);
+            }
+            Box::new(s)
+        }
         SaslMechanism::OauthBearer => Box::new(crate::oauthbearer::OauthBearerServer::new(store)),
         SaslMechanism::External => {
             let mut s = crate::external::ExternalServer::new(store);
@@ -104,12 +117,17 @@ pub fn create_server(
     }
 }
 
-/// Create a client session. `cert_authzid` is used for EXTERNAL (optional authzid).
+/// Create a client session. `cert_authzid` is used for EXTERNAL (optional
+/// authzid). `channel_binding` is required for
+/// [`SaslMechanism::ScramSha256Plus`] — this connection's
+/// `tls-server-end-point` data (RFC 5929 §4); ignored by every other
+/// mechanism.
 pub fn create_client(
     mechanism: SaslMechanism,
     username: &str,
     password: &str,
     host: &str,
+    channel_binding: Option<&[u8]>,
 ) -> Box<dyn SaslClient> {
     match mechanism {
         SaslMechanism::Plain => Box::new(crate::plain::PlainClient::new(username, password)),
@@ -121,6 +139,11 @@ pub fn create_client(
         SaslMechanism::ScramSha256 => {
             Box::new(crate::scram::ScramSha256Client::new(username, password))
         }
+        SaslMechanism::ScramSha256Plus => Box::new(crate::scram::ScramSha256Client::new_plus(
+            username,
+            password,
+            channel_binding.unwrap_or(&[]).to_vec(),
+        )),
         SaslMechanism::OauthBearer => {
             // password slot carries the bearer token
             Box::new(crate::oauthbearer::OauthBearerClient::new(username, password))
