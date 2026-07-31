@@ -19,6 +19,12 @@ use crate::{
     SmtpSend, SmtpService,
 };
 
+/// Test helper: a one-shot `message_with` source yielding `bytes` once.
+fn once(bytes: Vec<u8>) -> impl FnMut() -> Option<Vec<u8>> + Send {
+    let mut bytes = Some(bytes);
+    move || bytes.take()
+}
+
 /// Helper: spin-wait up to `max` millis for `pred` to return true.
 fn wait_for(pred: impl Fn() -> bool, max_ms: u64) -> bool {
     for _ in 0..(max_ms / 10) {
@@ -55,7 +61,7 @@ fn send_one(
     let send = SmtpSend::new("client.example")
         .mail_from(from)
         .rcpt_to(to)
-        .message(body.to_vec())
+        .message_with(once(body.to_vec()))
         .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
     SmtpClient::from_addr(addr)
         .timeouts(timeouts)
@@ -127,7 +133,7 @@ fn client_starttls_send() {
     let send = SmtpSend::new("client.example")
         .mail_from("a@b.com")
         .rcpt_to("c@d.com")
-        .message(b"Subject: tls\r\n\r\nsecret\r\n".to_vec())
+        .message_with(once(b"Subject: tls\r\n\r\nsecret\r\n".to_vec()))
         .require_starttls(true)
         .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
 
@@ -324,7 +330,7 @@ fn simple_relay_rejects_whole_transaction_if_any_domain_fails() {
         .mail_from("alice@elsewhere.test")
         .rcpt_to("bob@good.example")
         .rcpt_to("carol@bad.example")
-        .message(b"Subject: partial\r\n\r\npartial-fanout-body\r\n".to_vec())
+        .message_with(once(b"Subject: partial\r\n\r\npartial-fanout-body\r\n".to_vec()))
         .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
     SmtpClient::from_addr(relay_addr)
         .timeouts(timeouts)

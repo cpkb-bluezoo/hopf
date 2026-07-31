@@ -27,6 +27,12 @@ pub struct MqttConfig {
     pub credentials: Option<Arc<dyn CredentialStore>>,
     /// Cap on a packet's Remaining Length.
     pub max_packet_size: u32,
+    /// Cap on a PUBLISH payload, checked before any fan-out/spool work
+    /// starts. Independent of `max_packet_size` so raising the general
+    /// packet cap (e.g. for larger CONNECT properties) doesn't silently
+    /// also raise how much a single PUBLISH can make the broker spool to
+    /// disk per recipient. Default: same as `max_packet_size`.
+    pub max_publish_payload: u32,
     /// How long to wait for CONNECT before closing an idle new connection.
     pub connect_timeout: Duration,
 }
@@ -39,6 +45,7 @@ impl MqttConfig {
             broker,
             credentials: None,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
+            max_publish_payload: DEFAULT_MAX_PACKET_SIZE,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
@@ -52,6 +59,12 @@ impl MqttConfig {
     /// Override the Remaining Length cap.
     pub fn with_max_packet_size(mut self, max_packet_size: u32) -> Self {
         self.max_packet_size = max_packet_size;
+        self
+    }
+
+    /// Override the PUBLISH payload cap.
+    pub fn with_max_publish_payload(mut self, max_publish_payload: u32) -> Self {
+        self.max_publish_payload = max_publish_payload;
         self
     }
 

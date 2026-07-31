@@ -14,7 +14,7 @@ use hopf_mailbox::{
 
 use crate::server::control::{MailboxBundle, PendingOpen};
 use crate::server::fetch_format::{
-    fetch_needs_bytes, fetch_sets_seen, format_fetch_attrs, FetchItem,
+    fetch_sets_seen, format_fetch_attrs, push_fetch_attrs, FetchItem,
 };
 use crate::server::handler::{
     AppendState, AuthenticateState, AuthenticatedHandler, CloseState, ConnectedState, CopyState,
@@ -708,7 +708,9 @@ impl AppendState for AppendView<'_> {
 
 /// Stream `body_path`'s content into the append triad in bounded chunks —
 /// the message is never held whole in memory. `body_path` of `None` means a
-/// zero-length message (append nothing between start/end).
+/// zero-length message (append nothing between start/end). A mid-stream
+/// failure rolls back via `AppendGuard` instead of leaving an orphaned
+/// partial append.
 fn append_streaming(
     mb: &mut dyn Mailbox,
     flags: &BTreeSet<Flag>,
@@ -716,7 +718,7 @@ fn append_streaming(
     body_path: Option<&std::path::Path>,
 ) -> hopf_mailbox::MailboxResult<u64> {
     use std::io::Read;
-    mb.start_append(flags, internal_date)?;
+    let mut guard = hopf_mailbox::AppendGuard::start(mb, flags, internal_date)?;
     if let Some(path) = body_path {
         let mut f = std::fs::File::open(path)?;
         let mut buf = [0u8; 8192];
@@ -725,10 +727,10 @@ fn append_streaming(
             if n == 0 {
                 break;
             }
-            mb.append_content(&buf[..n])?;
+            guard.append_content(&buf[..n])?;
         }
     }
-    mb.end_append()
+    guard.commit()
 }
 
 pub(crate) struct FetchView<'a> {
@@ -758,7 +760,6 @@ impl FetchState for FetchView<'_> {
         let tag = self.tag.to_string();
         let busy = Arc::clone(self.busy);
         let pending = Arc::clone(self.pending_open);
-        let need_bytes = fetch_needs_bytes(&items);
         let set_seen = fetch_sets_seen(&items);
         *pending.lock().unwrap() = Some(PendingOpen {
             auth_handler: None,
@@ -770,15 +771,22 @@ impl FetchState for FetchView<'_> {
             },
         });
         begin_busy(self.endpoint, self.busy);
-        self.runtime.storage().submit_on(
+        // Pushed straight to the wire as each message is formatted — see
+        // `push_fetch_attrs` — instead of assembling every matched
+        // message's response into one buffer first. `pending`'s own
+        // `outcome` payload is always empty for FETCH: the untagged lines
+        // have already gone out by the time it resolves, so the existing
+        // `PendingKind::Data` completion path (shared with STORE) just
+        // sends the tagged `OK` with nothing left to append.
+        self.runtime.storage().submit_streamed(
             handle.clone(),
-            move || {
+            move |conn| {
                 let mut g = bundle.lock().unwrap();
                 let read_only = g.read_only;
                 let mb = g.mailbox.as_mut().ok_or_else(|| "no mailbox".to_string())?;
                 let count = mb.message_count().map_err(|e| e.to_string())?;
                 let last = count as u64;
-                let mut out = Vec::new();
+                let mut buf = Vec::with_capacity(8192);
                 for seq in 1..=count {
                     let uid = mb.uid(seq).map_err(|e| e.to_string())?;
                     let matched = if by_uid {
@@ -808,39 +816,42 @@ impl FetchState for FetchView<'_> {
                                 .map(|d| d.size)
                         })
                         .unwrap_or(0);
-                    let msg = if need_bytes {
-                        Some(mb.read_message(seq).map_err(|e| e.to_string())?)
-                    } else {
-                        None
-                    };
                     if set_seen && !read_only {
                         let mut seen = BTreeSet::new();
                         seen.insert(Flag::Seen);
                         let _ = mb.set_flags(seq, &seen, true);
                     }
                     let modseq_opt = if modseq > 0 { Some(modseq) } else { None };
-                    let attrs = format_fetch_attrs(
+
+                    buf.clear();
+                    buf.extend_from_slice(format!("* {seq} FETCH ").as_bytes());
+                    let push_result = push_fetch_attrs(
+                        mb.as_mut(),
                         &items,
                         seq,
                         uid,
                         size,
                         &flags,
                         &keywords,
-                        msg.as_deref(),
                         by_uid,
                         modseq_opt,
+                        &mut |chunk: &[u8]| {
+                            buf.extend_from_slice(chunk);
+                            if buf.len() >= 8192 {
+                                conn.send(std::mem::take(&mut buf));
+                            }
+                        },
                     );
-                    let mut line = format!("* {seq} FETCH ").into_bytes();
-                    line.extend_from_slice(&attrs);
-                    line.extend_from_slice(b"\r\n");
-                    out.extend_from_slice(&line);
+                    buf.extend_from_slice(b"\r\n");
+                    conn.send(std::mem::take(&mut buf));
+                    push_result.map_err(|e| e.to_string())?;
                 }
-                Ok(out)
+                Ok(())
             },
-            move |result: Result<Vec<u8>, StorageError>| {
+            move |result: Result<(), StorageError>| {
                 handle.with_endpoint(move |ep| {
                     if let Some(p) = pending.lock().unwrap().as_mut() {
-                        p.outcome = Some(result.map_err(|e| e.to_string()));
+                        p.outcome = Some(result.map(|_| Vec::new()).map_err(|e| e.to_string()));
                     }
                     end_busy(ep, &busy);
                 });

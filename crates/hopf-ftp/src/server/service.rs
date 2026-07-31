@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use hopf_auth::TrustPolicy;
 use hopf_core::tls::SharedTlsAcceptor;
-use hopf_core::{ProtocolHandler, Runtime, TcpListenerConfig};
+use hopf_core::{ProtocolHandler, Runtime, SharedTlsConnector, TcpListenerConfig};
 
 use crate::server::control::FtpControlHandler;
 use crate::server::handler::{
@@ -25,11 +25,26 @@ pub struct FtpConfig {
     pub root: PathBuf,
     /// Trust policy for USER/PASS.
     pub policy: Arc<dyn TrustPolicy>,
-    /// Optional TLS acceptor (AUTH TLS / implicit / PROT P).
+    /// Optional TLS acceptor (AUTH TLS / implicit / PROT P on PASV/EPSV
+    /// data connections, where the server accepts).
     pub tls_acceptor: Option<SharedTlsAcceptor>,
+    /// Optional TLS connector for PROT P on active-mode (PORT/EPRT) data
+    /// connections — there the server dials out and so needs a client-role
+    /// connector, not an acceptor. `None` means active-mode transfers can
+    /// never be protected, even with PROT P in effect; `PROT P` transfers
+    /// then only work in passive mode.
+    pub data_tls_connector: Option<SharedTlsConnector>,
+    /// TLS verification name (SNI / certificate name) passed to
+    /// `data_tls_connector` for each active-mode dial. There's no real
+    /// hostname for an arbitrary FTP client's data port, so this is a
+    /// fixed, deployer-supplied string (e.g. a pinned name the connector's
+    /// verifier is configured to accept) rather than derived per-peer;
+    /// defaults to `"ftp-client"` when unset.
+    pub data_tls_server_name: Option<String>,
     /// Implicit FTPS (TLS-from-accept on control).
     pub implicit_tls: bool,
-    /// Require PROT P for data.
+    /// Require PROT P for data — a transfer attempted without it is
+    /// rejected outright (RFC 4217 §2), not silently allowed in the clear.
     pub require_tls_for_data: bool,
     /// Allow PORT/EPRT to a different host than the control peer.
     pub allow_active_bounce: bool,
@@ -55,6 +70,8 @@ impl FtpConfig {
             root: root.into(),
             policy,
             tls_acceptor: None,
+            data_tls_connector: None,
+            data_tls_server_name: None,
             implicit_tls: false,
             require_tls_for_data: false,
             allow_active_bounce: false,
@@ -65,9 +82,24 @@ impl FtpConfig {
         }
     }
 
-    /// Attach TLS acceptor for AUTH TLS / PROT P.
+    /// Attach TLS acceptor for AUTH TLS / PROT P (control + passive-mode
+    /// data connections).
     pub fn with_tls(mut self, acceptor: SharedTlsAcceptor) -> Self {
         self.tls_acceptor = Some(acceptor);
+        self
+    }
+
+    /// Attach a TLS connector so PROT P also protects active-mode
+    /// (PORT/EPRT) data connections, where the server dials out.
+    /// `server_name` is the fixed SNI/verification name used for every
+    /// such dial (see [`FtpConfig::data_tls_server_name`]).
+    pub fn with_data_tls_connector(
+        mut self,
+        connector: SharedTlsConnector,
+        server_name: impl Into<String>,
+    ) -> Self {
+        self.data_tls_connector = Some(connector);
+        self.data_tls_server_name = Some(server_name.into());
         self
     }
 

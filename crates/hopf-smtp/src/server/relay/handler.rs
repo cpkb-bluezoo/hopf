@@ -4,6 +4,7 @@
 //! [`SmtpClient`], streamed from the spool to each destination.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -68,6 +69,7 @@ impl SmtpHandlerFactory for SimpleRelayHandlerFactory {
             delivery: DeliveryRequirements::default(),
             recipients: Vec::new(),
             spool: None,
+            extra_header_lines: Vec::new(),
         })
     }
 }
@@ -84,6 +86,11 @@ pub struct SimpleRelayHandler {
     delivery: DeliveryRequirements,
     recipients: Vec<EmailAddress>,
     spool: Option<Arc<Mutex<SpoolPipeline>>>,
+    /// Extra header field values (each without a trailing CRLF) to prepend
+    /// ahead of the spooled content for every outbound destination — see
+    /// [`crate::server::LocalDeliveryHandler::set_extra_header_lines`] for
+    /// the same mechanism on the local-delivery side.
+    extra_header_lines: Vec<String>,
 }
 
 impl SimpleRelayHandler {
@@ -92,6 +99,14 @@ impl SimpleRelayHandler {
         self.delivery = DeliveryRequirements::default();
         self.recipients.clear();
         self.spool = None;
+        self.extra_header_lines.clear();
+    }
+
+    /// Set the header lines (see the field doc) to prepend ahead of the
+    /// next relayed message, to every destination. Cleared automatically
+    /// once the transaction completes.
+    pub fn set_extra_header_lines(&mut self, lines: Vec<String>) {
+        self.extra_header_lines = lines;
     }
 }
 
@@ -233,6 +248,7 @@ impl MessageDataHandler for SimpleRelayHandler {
             domains,
             recipients_by_domain: by_domain,
             spool_path,
+            extra_header_lines: self.extra_header_lines.clone(),
             sender: self.sender.clone(),
             require_tls: self.delivery.is_require_tls(),
             dns: Arc::clone(&self.dns),
@@ -249,6 +265,17 @@ impl MessageDataHandler for SimpleRelayHandler {
     fn message_aborted(&mut self) {
         self.reset_transaction();
     }
+}
+
+/// Each line plus a trailing CRLF, concatenated — small and bounded (a
+/// handful of header field values), unlike the message body this precedes.
+fn render_extra_header_lines(lines: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in lines {
+        out.extend_from_slice(line.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out
 }
 
 fn group_by_domain(recipients: &[EmailAddress]) -> HashMap<String, Vec<EmailAddress>> {
@@ -332,6 +359,7 @@ struct DeliveryContext {
     domains: Vec<String>,
     recipients_by_domain: HashMap<String, Vec<EmailAddress>>,
     spool_path: Option<PathBuf>,
+    extra_header_lines: Vec<String>,
     sender: Option<EmailAddress>,
     require_tls: bool,
     dns: Arc<DnsResolver>,
@@ -427,9 +455,35 @@ impl DeliveryContext {
         send = match &self.spool_path {
             // Streamed straight off the spool file per destination — the
             // message is never cloned into a fresh in-memory buffer per MX,
-            // unlike before.
-            Some(path) => send.message_file(path.clone()),
-            None => send.message(Vec::new()),
+            // unlike before. When there are extra header lines to prepend
+            // (see `extra_header_lines`), yield those first (small, bounded)
+            // then continue streaming the spool file — still never more
+            // than one chunk held in memory at a time.
+            Some(path) if self.extra_header_lines.is_empty() => send.message_file(path.clone()),
+            Some(path) => {
+                let mut prefix = Some(render_extra_header_lines(&self.extra_header_lines));
+                let path = path.clone();
+                let mut file: Option<std::fs::File> = None;
+                let mut buf = [0u8; 8192];
+                send.message_with(move || {
+                    if let Some(p) = prefix.take() {
+                        return Some(p);
+                    }
+                    let f = match file.as_mut() {
+                        Some(f) => f,
+                        None => {
+                            file = std::fs::File::open(&path).ok();
+                            file.as_mut()?
+                        }
+                    };
+                    let n = f.read(&mut buf).ok()?;
+                    if n == 0 {
+                        return None;
+                    }
+                    Some(buf[..n].to_vec())
+                })
+            }
+            None => send.message_empty(),
         };
 
         if let Some(s) = sender {

@@ -3,19 +3,19 @@
 //! Single-file mbox mailbox.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use md5::{Digest, Md5};
+use sha2::{Digest, Sha256};
 
 use crate::config::IndexConfig;
 use crate::error::{MailboxError, MailboxResult};
 use crate::flag::Flag;
 use crate::index::{IndexBuilder, MessageIndex};
 use crate::search::SearchCriteria;
-use crate::traits::{Mailbox, MessageDescriptor};
+use crate::traits::{Mailbox, MessageDescriptor, MessageReadCallback};
 
 use super::flags::MboxFlagsFile;
 use super::lock::FileLock;
@@ -45,19 +45,21 @@ pub struct MboxMailbox {
     uid_validity: u64,
     uid_next: u64,
     append: Option<AppendState>,
-    read: Option<ReadState>,
     index_config: IndexConfig,
 }
 
+/// In-progress append — content is written to a tmp file as it arrives
+/// (bounded memory regardless of message size), matching Maildir's own
+/// `AppendState` pattern. Nothing touches the live mbox file until
+/// `end_append` streams the tmp file's content across (escaped) and
+/// deletes it — so `abort_append` (delete the tmp file) leaves the live
+/// mailbox exactly as it was.
 struct AppendState {
     flags: BTreeSet<Flag>,
     internal_millis: i64,
-    buf: Vec<u8>,
-}
-
-struct ReadState {
-    data: Vec<u8>,
-    pos: usize,
+    size: u64,
+    tmp_path: PathBuf,
+    tmp_file: File,
 }
 
 impl MboxMailbox {
@@ -114,7 +116,7 @@ impl MboxMailbox {
 
         for (i, (_from_off, content_start, content_end)) in segments.iter().enumerate() {
             let slice = unescape_from(&raw[*content_start..*content_end]);
-            let unique_id = md5_hex(&slice);
+            let unique_id = sha256_hex(&slice);
             let size = slice.len() as u64;
             let location = format!("{content_start}:{content_end}");
             let loc_key = location.to_ascii_lowercase();
@@ -165,7 +167,6 @@ impl MboxMailbox {
             uid_validity,
             uid_next,
             append: None,
-            read: None,
             index_config,
         })
     }
@@ -235,7 +236,7 @@ impl MboxMailbox {
         let mut messages = Vec::new();
         for (i, (_from, start, end)) in segments.iter().enumerate() {
             let slice = unescape_from(&raw[*start..*end]);
-            let unique_id = md5_hex(&slice);
+            let unique_id = sha256_hex(&slice);
             let (sys, kw) = self.flags.get(&unique_id);
             let uid = snapshot
                 .iter()
@@ -339,40 +340,20 @@ impl Mailbox for MboxMailbox {
         Ok(out)
     }
 
-    fn start_read(&mut self, message_number: u32) -> MailboxResult<()> {
-        if self.read.is_some() {
-            return Err(MailboxError::Invalid("read already in progress".into()));
-        }
-        let msg = self.msg(message_number)?;
+    fn read_message(
+        &mut self,
+        message_number: u32,
+        callback: &mut dyn MessageReadCallback,
+    ) -> MailboxResult<()> {
+        let msg = self.msg(message_number)?.clone();
         if msg.session_deleted {
             return Err(MailboxError::NotFound(format!("message {message_number}")));
         }
-        // Unlike Maildir (one file per message), mbox stores every message
-        // concatenated in a single file with "From " escaping applied across
-        // body lines — un-escaping is a stateful, line-based transform. This
-        // reads and unescapes the one requested message in full up front
-        // (bounded by that message's size, not the whole mailbox) and doles
-        // it out to the caller in chunks below, rather than implementing a
-        // chunk-boundary-safe incremental unescaper.
-        let data = self.read_raw(msg)?;
-        self.read = Some(ReadState { data, pos: 0 });
-        Ok(())
-    }
-
-    fn read_chunk(&mut self, buf: &mut [u8]) -> MailboxResult<usize> {
-        let r = self
-            .read
-            .as_mut()
-            .ok_or_else(|| MailboxError::Invalid("no read in progress".into()))?;
-        let remaining = &r.data[r.pos..];
-        let n = remaining.len().min(buf.len());
-        buf[..n].copy_from_slice(&remaining[..n]);
-        r.pos += n;
-        Ok(n)
-    }
-
-    fn end_read(&mut self) -> MailboxResult<()> {
-        self.read = None;
+        callback.start_message(msg.size);
+        stream_unescaped_range(&self.path, msg.start, msg.end, |chunk| {
+            callback.message_content(chunk)
+        })?;
+        callback.end_message();
         Ok(())
     }
 
@@ -528,6 +509,8 @@ impl Mailbox for MboxMailbox {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        let tmp_path = append_tmp_path(&self.path);
+        let tmp_file = File::create(&tmp_path)?;
         self.append = Some(AppendState {
             flags: flags
                 .iter()
@@ -535,7 +518,9 @@ impl Mailbox for MboxMailbox {
                 .filter(|f| *f != Flag::Recent)
                 .collect(),
             internal_millis,
-            buf: Vec::new(),
+            size: 0,
+            tmp_path,
+            tmp_file,
         });
         Ok(())
     }
@@ -545,7 +530,19 @@ impl Mailbox for MboxMailbox {
             .append
             .as_mut()
             .ok_or_else(|| MailboxError::Invalid("no append in progress".into()))?;
-        a.buf.extend_from_slice(data);
+        a.tmp_file.write_all(data)?;
+        a.size += data.len() as u64;
+        Ok(())
+    }
+
+    fn abort_append(&mut self) -> MailboxResult<()> {
+        // Nothing on the live mbox file is touched until `end_append` —
+        // dropping the tmp file (which nothing else references yet) is the
+        // whole rollback.
+        if let Some(a) = self.append.take() {
+            drop(a.tmp_file);
+            let _ = fs::remove_file(&a.tmp_path);
+        }
         Ok(())
     }
 
@@ -554,56 +551,92 @@ impl Mailbox for MboxMailbox {
         let AppendState {
             flags,
             internal_millis,
-            buf,
+            size,
+            tmp_path,
+            tmp_file,
         } = self
             .append
             .take()
             .ok_or_else(|| MailboxError::Invalid("no append in progress".into()))?;
+        tmp_file.sync_all()?;
+        drop(tmp_file);
 
-        let mut out = Vec::new();
-        write_mbox_message(&mut out, &buf, SystemTime::now())?;
+        let content_start_of_file = std::fs::metadata(&self.path)?.len();
+        let from_line = format_from_line(SystemTime::now());
+        let content_start = content_start_of_file + from_line.len() as u64;
+
+        let mut live = OpenOptions::new().append(true).open(&self.path)?;
+        live.write_all(from_line.as_bytes())?;
+
+        let mut escaper = MboxFromEscaper::new();
+        let mut hasher = TrimmedSha256::new();
+        let mut escaped_written = 0u64;
+        let mut ends_with_newline = size > 0;
         {
-            let mut f = OpenOptions::new().append(true).open(&self.path)?;
-            f.write_all(&out)?;
-            f.sync_all()?;
+            let mut tmp_read = File::open(&tmp_path)?;
+            let mut raw_buf = [0u8; 8192];
+            let mut out = Vec::with_capacity(8192);
+            loop {
+                let n = tmp_read.read(&mut raw_buf)?;
+                if n == 0 {
+                    break;
+                }
+                let chunk = &raw_buf[..n];
+                hasher.feed(chunk);
+                ends_with_newline = chunk[n - 1] == b'\n';
+                out.clear();
+                escaper.feed(chunk, &mut out);
+                if !out.is_empty() {
+                    live.write_all(&out)?;
+                    escaped_written += out.len() as u64;
+                }
+            }
         }
+        let mut out = Vec::new();
+        escaper.finish(&mut out);
+        if !out.is_empty() {
+            live.write_all(&out)?;
+            escaped_written += out.len() as u64;
+        }
+        if !ends_with_newline {
+            live.write_all(b"\n")?;
+            escaped_written += 1;
+        }
+        live.sync_all()?;
+        drop(live);
 
-        let unique_id = md5_hex(&buf);
+        let unique_id = hasher.finish();
         let uid = self.uid_next;
         self.uid_next += 1;
         self.flags.set(&unique_id, flags.clone(), BTreeSet::new());
 
-        let start = {
-            let meta = std::fs::metadata(&self.path)?;
-            meta.len().saturating_sub(out.len() as u64)
-        };
-        // Approximate content start after From_ line
-        let from_line_end = out
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let content_start = start + from_line_end as u64;
-        let content_end = start + out.len() as u64;
-        let location = format!("{}:{}", content_start, content_end);
+        let content_end = content_start + escaped_written;
+        let location = format!("{content_start}:{content_end}");
         let msg_num = (self.messages.len() + 1) as u32;
-        let entry = IndexBuilder::new(self.index_config.clone()).build(
-            uid,
-            msg_num,
-            buf.len() as u64,
-            &location,
-            &flags,
-            &BTreeSet::new(),
-            internal_millis,
-            &buf,
-        );
+        // Index straight from the raw (unescaped) tmp file — still on
+        // disk, still bounded, no second whole-buffer pass needed. Only
+        // deleted once this (streaming) read is done with it.
+        let entry = {
+            let tmp_read = File::open(&tmp_path)?;
+            IndexBuilder::new(self.index_config.clone()).build_streaming(
+                uid,
+                msg_num,
+                size,
+                &location,
+                &flags,
+                &BTreeSet::new(),
+                internal_millis,
+                tmp_read,
+            )?
+        };
+        let _ = fs::remove_file(&tmp_path);
         self.index.put(entry);
         self.index.set_uid_next(self.uid_next);
 
         self.messages.push(MboxMsg {
             start: content_start,
             end: content_end,
-            size: buf.len() as u64,
+            size,
             unique_id,
             uid,
             session_deleted: false,
@@ -620,16 +653,33 @@ impl Mailbox for MboxMailbox {
     }
 
     fn search(&self, criteria: &SearchCriteria) -> MailboxResult<Vec<u32>> {
-        self.index.search(criteria, |uid| {
+        self.index.search(criteria, |uid, needle_lower| {
             let msg = self
                 .messages
                 .iter()
                 .find(|m| m.uid == uid)
                 .ok_or_else(|| MailboxError::NotFound(format!("uid {uid}")))?;
-            let raw = self.read_raw(msg)?;
-            Ok(String::from_utf8_lossy(&raw).to_ascii_lowercase())
+            let mut matcher = crate::search::StreamingSubstringMatcher::new(needle_lower);
+            stream_unescaped_range(&self.path, msg.start, msg.end, |chunk| !matcher.feed(chunk))?;
+            Ok(matcher.found())
         })
     }
+}
+
+/// A unique tmp-file path alongside `mbox_path` to stream an in-progress
+/// append into (mirrors Maildir's own `tmp/` staging convention, adapted
+/// for mbox's single-file layout).
+fn append_tmp_path(mbox_path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut s = mbox_path.as_os_str().to_os_string();
+    s.push(format!(".append-tmp-{}-{}-{}", std::process::id(), nanos, n));
+    PathBuf::from(s)
 }
 
 fn gidx_path_for(mbox: &Path) -> PathBuf {
@@ -650,8 +700,8 @@ fn file_uid_validity(path: &Path) -> MailboxResult<u64> {
     Ok(secs.max(1))
 }
 
-fn md5_hex(data: &[u8]) -> String {
-    let mut h = Md5::new();
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
     h.update(trim_trailing_newlines(data));
     format!("{:x}", h.finalize())
 }
@@ -662,6 +712,43 @@ fn trim_trailing_newlines(data: &[u8]) -> &[u8] {
         end -= 1;
     }
     &data[..end]
+}
+
+/// Streaming equivalent of `sha256_hex` — bounded `Vec` (at most 2 bytes)
+/// held back so trailing `\n`/`\r` bytes at the very end of the fed data
+/// can be excluded from the digest, matching `sha256_hex`'s
+/// `trim_trailing_newlines`. Differs from it only in the pathological case
+/// of more than 2 consecutive trailing newline/CR bytes (accepted —
+/// `unique_id` is an internal stability key, not a format others parse).
+struct TrimmedSha256 {
+    hasher: Sha256,
+    holdback: Vec<u8>,
+}
+
+impl TrimmedSha256 {
+    fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            holdback: Vec::with_capacity(2),
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        for &b in chunk {
+            self.holdback.push(b);
+            if self.holdback.len() > 2 {
+                self.hasher.update([self.holdback.remove(0)]);
+            }
+        }
+    }
+
+    fn finish(mut self) -> String {
+        while matches!(self.holdback.last(), Some(b'\n') | Some(b'\r')) {
+            self.holdback.pop();
+        }
+        self.hasher.update(&self.holdback);
+        format!("{:x}", self.hasher.finalize())
+    }
 }
 
 /// Returns list of (from_line_start, content_start, content_end).
@@ -781,6 +868,215 @@ fn escape_from(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Header/body-boundary scan shared by [`MboxFromEscaper`] and
+/// [`MboxFromUnescaper`] — a blank line (bare `\n` or `\r\n`, zero content
+/// bytes) ends the header block. Bounded, byte-at-a-time state; chunk
+/// boundaries don't matter.
+#[derive(Clone, Copy)]
+enum HeaderLineState {
+    AtStart,
+    SawCr,
+    HasContent,
+}
+
+struct HeaderBoundaryScanner {
+    state: HeaderLineState,
+    in_body: bool,
+}
+
+impl HeaderBoundaryScanner {
+    fn new() -> Self {
+        Self {
+            state: HeaderLineState::AtStart,
+            in_body: false,
+        }
+    }
+
+    fn feed(&mut self, b: u8) {
+        match self.state {
+            HeaderLineState::AtStart => {
+                if b == b'\n' {
+                    self.in_body = true;
+                } else if b == b'\r' {
+                    self.state = HeaderLineState::SawCr;
+                } else {
+                    self.state = HeaderLineState::HasContent;
+                }
+            }
+            HeaderLineState::SawCr => {
+                if b == b'\n' {
+                    self.in_body = true;
+                } else {
+                    self.state = HeaderLineState::HasContent;
+                }
+            }
+            HeaderLineState::HasContent => {
+                if b == b'\n' {
+                    self.state = HeaderLineState::AtStart;
+                }
+            }
+        }
+    }
+}
+
+/// Feed one body byte through a line-prefix match against `target`,
+/// emitting `replacement` in place of a full match, or the original
+/// bytes otherwise — shared by [`MboxFromEscaper`] (`"From " -> ">From "`)
+/// and [`MboxFromUnescaper`] (`">From " -> "From "`). `pending` holds a
+/// tentative match in progress (at most `target.len()` bytes — bounded
+/// regardless of chunk boundaries).
+fn feed_line_prefix_match(
+    pending: &mut Vec<u8>,
+    at_line_start: &mut bool,
+    target: &[u8],
+    replacement: &[u8],
+    b: u8,
+    out: &mut Vec<u8>,
+) {
+    if *at_line_start || !pending.is_empty() {
+        let idx = pending.len();
+        if idx < target.len() && b == target[idx] {
+            pending.push(b);
+            if pending.len() == target.len() {
+                out.extend_from_slice(replacement);
+                pending.clear();
+                *at_line_start = false;
+            }
+            return;
+        }
+        out.extend_from_slice(pending);
+        pending.clear();
+        out.push(b);
+        *at_line_start = b == b'\n';
+        return;
+    }
+    out.push(b);
+    if b == b'\n' {
+        *at_line_start = true;
+    }
+}
+
+/// Streaming version of `escape_from` (body `"From "` lines -> `">From "`)
+/// — fed one chunk at a time, with bounded state carried across calls (no
+/// whole-message buffering).
+struct MboxFromEscaper {
+    header: HeaderBoundaryScanner,
+    at_line_start: bool,
+    pending: Vec<u8>,
+}
+
+impl MboxFromEscaper {
+    fn new() -> Self {
+        Self {
+            header: HeaderBoundaryScanner::new(),
+            at_line_start: true,
+            pending: Vec::new(),
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+        for &b in chunk {
+            if !self.header.in_body {
+                out.push(b);
+                self.header.feed(b);
+            } else {
+                feed_line_prefix_match(
+                    &mut self.pending,
+                    &mut self.at_line_start,
+                    b"From ",
+                    b">From ",
+                    b,
+                    out,
+                );
+            }
+        }
+    }
+
+    /// Flush any bytes still held back at end-of-message (an incomplete,
+    /// never-matched `"From "` prefix at EOF didn't match — emit verbatim).
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.pending);
+        self.pending.clear();
+    }
+}
+
+/// Streaming version of `unescape_from` (body `">From "` -> `"From "`).
+struct MboxFromUnescaper {
+    header: HeaderBoundaryScanner,
+    at_line_start: bool,
+    pending: Vec<u8>,
+}
+
+impl MboxFromUnescaper {
+    fn new() -> Self {
+        Self {
+            header: HeaderBoundaryScanner::new(),
+            at_line_start: true,
+            pending: Vec::new(),
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+        for &b in chunk {
+            if !self.header.in_body {
+                out.push(b);
+                self.header.feed(b);
+            } else {
+                feed_line_prefix_match(
+                    &mut self.pending,
+                    &mut self.at_line_start,
+                    b">From ",
+                    b"From ",
+                    b,
+                    out,
+                );
+            }
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.pending);
+        self.pending.clear();
+    }
+}
+
+/// Stream the raw byte range `[start, end)` of `path`, un-escaping
+/// `">From "` body lines on the fly, handing each unescaped chunk to
+/// `on_chunk` — never materializes the message whole. `on_chunk` returning
+/// `false` stops the read early (the rest of the range is skipped).
+fn stream_unescaped_range(
+    path: &Path,
+    start: u64,
+    end: u64,
+    mut on_chunk: impl FnMut(&[u8]) -> bool,
+) -> MailboxResult<()> {
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(start))?;
+    let mut remaining = end.saturating_sub(start);
+    let mut unescaper = MboxFromUnescaper::new();
+    let mut raw_buf = [0u8; 8192];
+    let mut out = Vec::with_capacity(8192);
+    while remaining > 0 {
+        let want = (raw_buf.len() as u64).min(remaining) as usize;
+        let n = f.read(&mut raw_buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        remaining -= n as u64;
+        out.clear();
+        unescaper.feed(&raw_buf[..n], &mut out);
+        if !out.is_empty() && !on_chunk(&out) {
+            return Ok(());
+        }
+    }
+    out.clear();
+    unescaper.finish(&mut out);
+    if !out.is_empty() {
+        on_chunk(&out);
+    }
+    Ok(())
+}
+
 fn write_mbox_message(out: &mut Vec<u8>, rfc822: &[u8], when: SystemTime) -> MailboxResult<()> {
     let line = format_from_line(when);
     out.extend_from_slice(line.as_bytes());
@@ -830,4 +1126,123 @@ fn crate_civil(z: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m as u32, d as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::traits::{MailboxFactory, MessageReadCallback};
+    use crate::MboxFactory;
+    use tempfile::tempdir;
+
+    /// Test-only whole-message append, via the real streaming push triad
+    /// ([`crate::traits::AppendGuard`]) — never bypasses it.
+    fn append_whole(
+        mb: &mut dyn Mailbox,
+        data: &[u8],
+        flags: &BTreeSet<Flag>,
+        internal_date: Option<SystemTime>,
+    ) -> MailboxResult<u64> {
+        let mut guard = crate::traits::AppendGuard::start(mb, flags, internal_date)?;
+        guard.append_content(data)?;
+        guard.commit()
+    }
+
+    #[derive(Default)]
+    struct VecReadCallback(Vec<u8>);
+    impl MessageReadCallback for VecReadCallback {
+        fn message_content(&mut self, chunk: &[u8]) -> bool {
+            self.0.extend_from_slice(chunk);
+            true
+        }
+    }
+
+    /// Test-only whole-message read, via the real streaming
+    /// [`Mailbox::read_message`] callback — never bypasses it.
+    fn read_whole(mb: &mut dyn Mailbox, message_number: u32) -> MailboxResult<Vec<u8>> {
+        let mut cb = VecReadCallback::default();
+        mb.read_message(message_number, &mut cb)?;
+        Ok(cb.0)
+    }
+
+    #[test]
+    fn abort_append_discards_the_buffer_and_leaves_no_message() {
+        let dir = tempdir().unwrap();
+        let factory = MboxFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("abortuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        mb.start_append(&BTreeSet::new(), None).unwrap();
+        mb.append_content(b"From: a@b\r\n\r\npartial, never finished").unwrap();
+        mb.abort_append().unwrap();
+
+        assert_eq!(mb.message_count().unwrap(), 0, "aborted append must not deliver a message");
+
+        // Immediately reusable for a fresh append afterward.
+        let msg = b"From: a@b\r\nTo: c@d\r\nSubject: after-abort\r\n\r\nbody\r\n";
+        let uid = append_whole(mb.as_mut(), msg, &BTreeSet::new(), None).unwrap();
+        assert!(uid > 0);
+        assert_eq!(mb.message_count().unwrap(), 1);
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn read_round_trips_a_body_line_that_looks_like_a_from_line() {
+        let dir = tempdir().unwrap();
+        let factory = MboxFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("fromlineuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        let msg = b"From: a@b\r\nSubject: x\r\n\r\nFrom the desk of someone\r\nplain line\r\n";
+        append_whole(mb.as_mut(), msg, &BTreeSet::new(), None).unwrap();
+
+        let got = read_whole(mb.as_mut(), 1).unwrap();
+        assert_eq!(
+            got, &msg[..],
+            "a body line starting with \"From \" must round-trip byte-identical \
+             through escape-on-write / unescape-on-read"
+        );
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn read_round_trips_regardless_of_append_chunk_size() {
+        let dir = tempdir().unwrap();
+        let factory = MboxFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("chunkuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        let msg = b"From: a@b\r\nSubject: chunked\r\n\r\nFrom here to there\r\nsecond line\r\n";
+        for chunk_size in [1usize, 2, 3, 7, 64] {
+            mb.start_append(&BTreeSet::new(), None).unwrap();
+            for chunk in msg.chunks(chunk_size) {
+                mb.append_content(chunk).unwrap();
+            }
+            let uid = mb.end_append().unwrap();
+            let seq = mb
+                .messages()
+                .unwrap()
+                .into_iter()
+                .find(|d| d.uid == Some(uid))
+                .unwrap()
+                .message_number;
+            let got = read_whole(mb.as_mut(), seq).unwrap();
+            assert_eq!(got, &msg[..], "chunk_size={chunk_size}");
+        }
+        mb.close(false).unwrap();
+    }
+
+    #[test]
+    fn abort_append_with_nothing_in_progress_is_a_safe_no_op() {
+        let dir = tempdir().unwrap();
+        let factory = MboxFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("noopabortuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        assert!(mb.abort_append().is_ok());
+        mb.close(false).unwrap();
+    }
 }

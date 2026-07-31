@@ -28,7 +28,7 @@ pub use client::{
     ImapFetch, ImapFetchData, ImapIdle, ImapListEntry, ImapMailboxInfo, ImapNamespace,
     ImapNamespaceData, ImapQuotaData, ImapQuotaResource, ImapQuotaRootData, ImapReplyLexer,
     ImapResult, ImapStatus, ImapStatusData, ImapTagGenerator, MailboxEventListener,
-    NopMailboxEventListener, PendingCommand, PendingKind, PendingMap, Tag, UntaggedClass,
+    MessageReceiveCallback, NopMailboxEventListener, PendingCommand, PendingKind, PendingMap, Tag, UntaggedClass,
     DEFAULT_MAX_PIPELINE, MAX_TOKEN,
 };
 pub use enable::{parse_enable_args, EnabledExtensions};

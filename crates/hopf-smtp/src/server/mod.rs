@@ -10,6 +10,7 @@ mod delivery;
 mod handler;
 mod mailbox;
 mod metrics;
+mod mime_pipeline;
 mod pipeline;
 mod relay;
 mod reply;
@@ -31,7 +32,8 @@ pub use handler::{
     SmtpClientConnected, SmtpConnectionMetadata, SmtpHandlerFactory,
 };
 pub use metrics::SmtpServerMetrics;
-pub use pipeline::{DiscardPipeline, MessageBufferPipeline, NullPipeline, SmtpPipeline};
+pub use mime_pipeline::MimeAnalysisPipeline;
+pub use pipeline::{DiscardPipeline, NullPipeline, SmtpPipeline};
 pub use mailbox::{LocalDeliveryHandler, LocalDeliveryHandlerFactory, LocalDeliveryService};
 pub use relay::{SimpleRelayHandler, SimpleRelayHandlerFactory, SimpleRelayService};
 pub use reply::{reply, reply_ehlo, reply_enhanced, reply_multiline};

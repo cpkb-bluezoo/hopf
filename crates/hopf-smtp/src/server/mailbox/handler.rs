@@ -60,6 +60,7 @@ impl SmtpHandlerFactory for LocalDeliveryHandlerFactory {
             sender: None,
             recipients: Vec::new(),
             spool: None,
+            extra_header_lines: Vec::new(),
         })
     }
 }
@@ -76,6 +77,17 @@ pub struct LocalDeliveryHandler {
     /// Local-parts of accepted recipients (mailbox usernames).
     recipients: Vec<String>,
     spool: Option<Arc<Mutex<SpoolPipeline>>>,
+    /// Extra header field values (each without a trailing CRLF — one is
+    /// added automatically) to prepend to the message ahead of the
+    /// spooled content, e.g. a `Received:` line or an
+    /// `Authentication-Results:` field from `crate::auth::AuthPipeline`.
+    /// Set via [`Self::set_extra_header_lines`] before [`message_complete`]
+    /// runs — a caller composing its own `MessageDataHandler` around this
+    /// one (to also drive its own auth pipeline) is the intended place to
+    /// call it, once whatever it needs to render the line(s) is ready.
+    ///
+    /// [`message_complete`]: MessageDataHandler::message_complete
+    extra_header_lines: Vec<String>,
 }
 
 impl LocalDeliveryHandler {
@@ -83,6 +95,14 @@ impl LocalDeliveryHandler {
         self.sender = None;
         self.recipients.clear();
         self.spool = None;
+        self.extra_header_lines.clear();
+    }
+
+    /// Set the header lines (see the field doc) to prepend ahead of the
+    /// next delivered message. Cleared automatically once the transaction
+    /// completes (successfully or not).
+    pub fn set_extra_header_lines(&mut self, lines: Vec<String>) {
+        self.extra_header_lines = lines;
     }
 }
 
@@ -220,6 +240,7 @@ impl MessageDataHandler for LocalDeliveryHandler {
         }
 
         let recipients = self.recipients.clone();
+        let extra_header_lines = self.extra_header_lines.clone();
         let factory = Arc::clone(&self.mailbox_factory);
         let storage = Arc::clone(self.runtime.storage());
         let handle = self
@@ -231,7 +252,14 @@ impl MessageDataHandler for LocalDeliveryHandler {
 
         storage.submit_on(
             handle,
-            move || deliver_spooled(factory.as_ref(), &recipients, spool_path.as_deref()),
+            move || {
+                deliver_spooled(
+                    factory.as_ref(),
+                    &recipients,
+                    spool_path.as_deref(),
+                    &extra_header_lines,
+                )
+            },
             move |result: Result<Option<String>, StorageError>| match result {
                 Ok(None) => deferred.accept(None),
                 Ok(Some(msg)) => deferred.reject_temporary(&msg),
@@ -265,10 +293,11 @@ fn deliver_spooled(
     factory: &dyn MailboxFactory,
     recipients: &[String],
     spool_path: Option<&Path>,
+    extra_header_lines: &[String],
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let flags = BTreeSet::<Flag>::new();
     let result = deliver_recipients(recipients, |username| {
-        deliver_to_mailbox_streaming(factory, username, spool_path, &flags)
+        deliver_to_mailbox_streaming(factory, username, spool_path, &flags, extra_header_lines)
     });
     if let Some(path) = spool_path {
         let _ = std::fs::remove_file(path);
@@ -297,17 +326,27 @@ where
 
 /// Stream `spool_path`'s content into `username`'s INBOX via the append
 /// triad in bounded chunks — the message is never held whole in memory,
-/// neither here nor (per recipient) duplicated as it was before.
+/// neither here nor (per recipient) duplicated as it was before. A
+/// mid-stream failure (e.g. disk full partway through a large message)
+/// rolls back via `AppendGuard` instead of leaving an orphaned partial
+/// append. `extra_header_lines` (each a complete field value, no trailing
+/// CRLF) is written first, ahead of the spooled content — see
+/// [`LocalDeliveryHandler::set_extra_header_lines`].
 fn deliver_to_mailbox_streaming(
     factory: &dyn MailboxFactory,
     username: &str,
     spool_path: Option<&Path>,
     flags: &BTreeSet<Flag>,
+    extra_header_lines: &[String],
 ) -> hopf_mailbox::MailboxResult<()> {
     let mut store = factory.create_store();
     store.open(username)?;
     let mut mb = store.open_mailbox("INBOX", false)?;
-    mb.start_append(flags, None)?;
+    let mut guard = hopf_mailbox::AppendGuard::start(mb.as_mut(), flags, None)?;
+    for line in extra_header_lines {
+        guard.append_content(line.as_bytes())?;
+        guard.append_content(b"\r\n")?;
+    }
     if let Some(path) = spool_path {
         let mut f = File::open(path)?;
         let mut buf = [0u8; 8192];
@@ -316,10 +355,10 @@ fn deliver_to_mailbox_streaming(
             if n == 0 {
                 break;
             }
-            mb.append_content(&buf[..n])?;
+            guard.append_content(&buf[..n])?;
         }
     }
-    mb.end_append()?;
+    guard.commit()?;
     mb.close(false)?;
     store.close()?;
     Ok(())
@@ -387,13 +426,68 @@ mod tests {
         let spool_path = spool_dir.path().join("spooled.tmp");
         std::fs::write(&spool_path, b"From: a@b\r\n\r\nhello\r\n").unwrap();
 
-        deliver_to_mailbox_streaming(&factory, "alice", Some(&spool_path), &BTreeSet::new())
+        deliver_to_mailbox_streaming(&factory, "alice", Some(&spool_path), &BTreeSet::new(), &[])
             .unwrap();
 
         let mut store = factory.create_store();
         store.open("alice").unwrap();
         let mut mb = store.open_mailbox("INBOX", false).unwrap();
         assert_eq!(mb.message_count().unwrap(), 1);
-        assert_eq!(mb.read_message(1).unwrap(), b"From: a@b\r\n\r\nhello\r\n");
+
+        struct Collect(Vec<u8>);
+        impl hopf_mailbox::MessageReadCallback for Collect {
+            fn message_content(&mut self, chunk: &[u8]) -> bool {
+                self.0.extend_from_slice(chunk);
+                true
+            }
+        }
+        let mut cb = Collect(Vec::new());
+        mb.read_message(1, &mut cb).unwrap();
+        assert_eq!(cb.0, b"From: a@b\r\n\r\nhello\r\n");
+    }
+
+    #[test]
+    fn extra_header_lines_are_prepended_ahead_of_spooled_content() {
+        use hopf_mailbox::MaildirFactory;
+        let dir = tempfile::tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+
+        let spool_dir = tempfile::tempdir().unwrap();
+        let spool_path = spool_dir.path().join("spooled.tmp");
+        std::fs::write(&spool_path, b"From: a@b\r\n\r\nhello\r\n").unwrap();
+
+        let extra = vec![
+            "Received: from mx.example.com".to_string(),
+            "Authentication-Results: mail.example.com; spf=pass".to_string(),
+        ];
+        deliver_to_mailbox_streaming(
+            &factory,
+            "bob",
+            Some(&spool_path),
+            &BTreeSet::new(),
+            &extra,
+        )
+        .unwrap();
+
+        let mut store = factory.create_store();
+        store.open("bob").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+
+        struct Collect(Vec<u8>);
+        impl hopf_mailbox::MessageReadCallback for Collect {
+            fn message_content(&mut self, chunk: &[u8]) -> bool {
+                self.0.extend_from_slice(chunk);
+                true
+            }
+        }
+        let mut cb = Collect(Vec::new());
+        mb.read_message(1, &mut cb).unwrap();
+        assert_eq!(
+            cb.0,
+            b"Received: from mx.example.com\r\n\
+              Authentication-Results: mail.example.com; spf=pass\r\n\
+              From: a@b\r\n\r\nhello\r\n"
+                .to_vec()
+        );
     }
 }

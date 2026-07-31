@@ -50,7 +50,9 @@ fn rsa_signature_has_expected_shape() {
     let signer = DkimSigner::new(&key, "example.com", "sel1")
         .signed_headers(vec!["From".to_string(), "Subject".to_string()])
         .timestamp(1_753_700_000);
-    let value = signer.sign(&headers(), b"body\r\n").unwrap();
+    let mut stream = signer.start(&headers());
+    stream.feed(b"body\r\n");
+    let value = stream.finish().unwrap();
     assert!(value
         .starts_with("v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=sel1; t=1753700000"));
     assert!(value.contains("h=From:Subject;"));
@@ -63,7 +65,9 @@ fn rsa_signature_has_expected_shape() {
 fn ed25519_signature_uses_correct_algorithm_tag() {
     let key = DkimPrivateKey::ed25519_from_pkcs8(&b64_decode(ED25519_PKCS8_B64)).unwrap();
     let signer = DkimSigner::new(&key, "example.com", "sel1").timestamp(1_753_700_000);
-    let value = signer.sign(&headers(), b"body\r\n").unwrap();
+    let mut stream = signer.start(&headers());
+    stream.feed(b"body\r\n");
+    let value = stream.finish().unwrap();
     assert!(value.starts_with("v=1; a=ed25519-sha256;"));
 }
 
@@ -74,7 +78,9 @@ fn expiration_and_identity_tags_included() {
         .timestamp(1_753_700_000)
         .expiration(1_753_800_000)
         .identity("user@sub.example.com");
-    let value = signer.sign(&headers(), b"body\r\n").unwrap();
+    let mut stream = signer.start(&headers());
+    stream.feed(b"body\r\n");
+    let value = stream.finish().unwrap();
     assert!(value.contains("x=1753800000"));
     assert!(value.contains("i=user@sub.example.com"));
 }

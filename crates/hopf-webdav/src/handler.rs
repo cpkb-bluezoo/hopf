@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use md5::{Digest, Md5};
+use sha2::{Digest, Sha256};
 use hopf_core::storage::{StorageError, StorageExecutor};
 use hopf_http::Headers;
 use hopf_http::{ServerHandler, ServerWriter};
@@ -60,9 +60,14 @@ pub struct WebDavHandler {
 
     webdav_body: Vec<u8>,
     webdav_parser: Option<WebDavRequestParser>,
-    put_buffers: Vec<u8>,
-    put_ready: bool,
-    put_path: Option<PathBuf>,
+    /// Open destination file for an in-progress PUT; each inbound chunk is
+    /// written directly to it as it arrives — never buffered whole.
+    put_file: Option<fs::File>,
+    put_bytes_written: u64,
+    /// Set once a PUT has already been answered (size cap exceeded, or a
+    /// write error) — further body chunks are discarded without a second
+    /// response.
+    put_rejected: bool,
 }
 
 impl WebDavHandler {
@@ -100,9 +105,9 @@ impl WebDavHandler {
             host: None,
             webdav_body: Vec::new(),
             webdav_parser: None,
-            put_buffers: Vec::new(),
-            put_ready: false,
-            put_path: None,
+            put_file: None,
+            put_bytes_written: 0,
+            put_rejected: false,
         }
     }
 
@@ -223,10 +228,23 @@ impl ServerHandler for WebDavHandler {
             }
             return;
         }
-        if self.put_path.is_some() {
-            self.put_buffers.extend_from_slice(data);
+        if self.put_rejected || self.put_file.is_none() {
+            return;
         }
-        let _ = response;
+        self.put_bytes_written += data.len() as u64;
+        if self.put_bytes_written > self.config.max_put_body {
+            self.put_rejected = true;
+            self.put_file = None;
+            Self::send_error(response, 413);
+            return;
+        }
+        if let Some(f) = self.put_file.as_mut() {
+            if f.write_all(data).is_err() {
+                self.put_rejected = true;
+                self.put_file = None;
+                Self::send_error(response, 500);
+            }
+        }
     }
 
     fn end_request_body(&mut self, response: &mut dyn ServerWriter) {
@@ -242,37 +260,22 @@ impl ServerHandler for WebDavHandler {
             }
             return;
         }
-        if let Some(lexical) = self.put_path.take() {
-            let data = std::mem::take(&mut self.put_buffers);
-            let root = self.root_path.clone();
-            let canonical = self.canonical_root.clone();
-            self.offload(
-                response,
-                move || {
-                    let resolved = canonicalize_path(&root, &canonical, &lexical)
-                        .ok_or_else(|| io_err("invalid path"))?;
-                    if resolved.is_dir() {
-                        return Err(io_err("is directory"));
-                    }
-                    if let Some(parent) = resolved.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&resolved, &data)?;
-                    Ok(201u16)
-                },
-                |code, writer| Self::send_error(writer, code),
-            );
+        if self.put_rejected {
+            return;
+        }
+        if self.put_file.take().is_some() {
+            Self::send_error(response, 201);
         }
     }
 
     fn request_complete(&mut self, response: &mut dyn ServerWriter) {
         // PUT with no body still needs a response (empty create).
-        if self.put_path.is_some() {
+        if self.put_file.is_some() {
             self.end_request_body(response);
         }
         self.webdav_body.clear();
-        self.put_buffers.clear();
-        self.put_ready = false;
+        self.put_bytes_written = 0;
+        self.put_rejected = false;
     }
 }
 
@@ -312,96 +315,137 @@ impl WebDavHandler {
         let types = self.content_types.clone();
         let root = self.root_path.clone();
         let canonical = self.canonical_root.clone();
-        let method = self.method.clone();
-        let method_for_plan = method.clone();
+        let is_get = self.method == "GET";
 
-        self.offload(w, move || {
-            let mut plan = GetPlan::default();
-            let Some(lexical) = path else {
-                plan.status = 404;
-                return Ok(plan);
-            };
-            let Some(resolved) = canonicalize_path(&root, &canonical, &lexical) else {
-                plan.status = 404;
-                return Ok(plan);
-            };
-            if !resolved.exists() || is_sidecar_file(&resolved) {
-                plan.status = 404;
-                return Ok(plan);
-            }
-            let mut target = resolved.clone();
-            if resolved.is_dir() {
-                if let Some(index) = find_welcome(&resolved, &welcome) {
-                    target = index;
+        let rh = w.response_handle();
+        let conn = rh.conn_handle().clone();
+        let rh_fallback = rh.clone();
+        self.storage.submit_on(
+            conn,
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let Some(lexical) = path else {
+                    rh.execute(|w| Self::send_error(w, 404));
+                    return Ok(());
+                };
+                let Some(resolved) = canonicalize_path(&root, &canonical, &lexical) else {
+                    rh.execute(|w| Self::send_error(w, 404));
+                    return Ok(());
+                };
+                if !resolved.exists() || is_sidecar_file(&resolved) {
+                    rh.execute(|w| Self::send_error(w, 404));
+                    return Ok(());
+                }
+                let mut target = resolved.clone();
+                if resolved.is_dir() {
+                    if let Some(index) = find_welcome(&resolved, &welcome) {
+                        target = index;
+                    } else {
+                        let html = build_listing(&request_path, &resolved)?;
+                        rh.execute(move |w| {
+                            let mut h = Headers::new();
+                            h.status(200);
+                            h.set("Content-Type", "text/html; charset=utf-8");
+                            h.set("Content-Length", html.len().to_string());
+                            w.headers(h);
+                            if is_get {
+                                w.start_response_body();
+                                w.response_body_content(&html);
+                                w.end_response_body();
+                            }
+                            w.complete();
+                        });
+                        return Ok(());
+                    }
+                }
+                let meta = fs::metadata(&target)?;
+                let modified = meta.modified()?;
+                if let Some(since) = if_mod {
+                    if modified <= since {
+                        rh.execute(|w| {
+                            let mut h = Headers::new();
+                            h.status(304);
+                            w.headers(h);
+                            w.complete();
+                        });
+                        return Ok(());
+                    }
+                }
+                let content_type = content_type_for(&target, &types);
+                let size = meta.len();
+                let etag = weak_etag(&target, &meta);
+                let last_modified = http_date(modified);
+                let stream_body = is_get && size > 0;
+
+                // Open (and fail fast on) the file *before* sending headers,
+                // so a "can't open" error still becomes a clean status code
+                // instead of a response that already started.
+                let file = if stream_body {
+                    match fs::File::open(&target) {
+                        Ok(f) => Some(f),
+                        Err(_) => {
+                            rh.execute(|w| Self::send_error(w, 404));
+                            return Ok(());
+                        }
+                    }
                 } else {
-                    plan.listing = Some(build_listing(&request_path, &resolved)?);
-                    plan.is_dir = true;
-                    return Ok(plan);
+                    None
+                };
+
+                rh.execute(move |w| {
+                    let mut h = Headers::new();
+                    h.status(200);
+                    h.set("Last-Modified", last_modified);
+                    h.set("ETag", &etag);
+                    h.set("Content-Type", &content_type);
+                    h.set("Content-Length", size.to_string());
+                    w.headers(h);
+                    if stream_body {
+                        w.start_response_body();
+                    } else {
+                        w.complete();
+                    }
+                });
+
+                if let Some(mut f) = file {
+                    let mut buf = [0u8; 8192];
+                    let mut clean = true;
+                    loop {
+                        match f.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let chunk = buf[..n].to_vec();
+                                rh.execute(move |w| w.response_body_content(&chunk));
+                            }
+                            Err(_) => {
+                                clean = false;
+                                break;
+                            }
+                        }
+                    }
+                    if clean {
+                        rh.execute(|w| {
+                            w.end_response_body();
+                            w.complete();
+                        });
+                    } else {
+                        // Headers (with a Content-Length) already went out —
+                        // finishing normally would send a truncated body
+                        // that still claims the original length. Drop the
+                        // connection instead of corrupting the framing.
+                        rh.conn_handle().close();
+                    }
                 }
-            }
-            let meta = fs::metadata(&target)?;
-            let modified = meta.modified()?;
-            if let Some(since) = if_mod {
-                if modified <= since {
-                    plan.not_modified = true;
-                    return Ok(plan);
+                Ok(())
+            },
+            move |result| {
+                if result.is_err() {
+                    // `op` only reaches here via early `?` before any
+                    // response was sent (metadata/listing failures) — safe
+                    // to answer with a generic error.
+                    rh_fallback.execute(|w| Self::send_error(w, 500));
                 }
-            }
-            plan.last_modified = Some(modified);
-            plan.content_type = content_type_for(&target, &types);
-            plan.size = meta.len();
-            plan.etag = Some(weak_etag(&target, &meta));
-            if method_for_plan == "GET" && plan.size > 0 {
-                plan.file_data = Some(fs::read(&target)?);
-            }
-            Ok(plan)
-        }, move |plan, writer| {
-            let is_get = method == "GET";
-            if plan.status == 404 {
-                Self::send_error(writer, 404);
-                return;
-            }
-            if plan.not_modified {
-                let mut h = Headers::new();
-                h.status(304);
-                writer.headers(h);
-                writer.complete();
-                return;
-            }
-            if let Some(html) = plan.listing {
-                let mut h = Headers::new();
-                h.status(200);
-                h.set("Content-Type", "text/html; charset=utf-8");
-                h.set("Content-Length", html.len().to_string());
-                writer.headers(h);
-                if is_get {
-                    writer.start_response_body();
-                    writer.response_body_content(&html);
-                    writer.end_response_body();
-                }
-                writer.complete();
-                return;
-            }
-            let mut h = Headers::new();
-            h.status(200);
-            if let Some(lm) = plan.last_modified {
-                h.set("Last-Modified", http_date(lm));
-            }
-            if let Some(ref etag) = plan.etag {
-                h.set("ETag", etag);
-            }
-            h.set("Content-Type", &plan.content_type);
-            h.set("Content-Length", plan.size.to_string());
-            writer.headers(h);
-            if is_get {
-                if let Some(data) = plan.file_data {
-                    writer.start_response_body();
-                    writer.response_body_content(&data);
-                    writer.end_response_body();
-                }
-            }
-            writer.complete();
-        });
+            },
+        );
     }
 
     fn handle_put_headers(&mut self, w: &mut dyn ServerWriter) {
@@ -412,11 +456,33 @@ impl WebDavHandler {
             Self::send_error(w, 404);
             return;
         };
-        // Buffer the full request body; write + respond in `end_request_body`.
-        self.put_path = Some(lexical);
-        self.put_ready = true;
-        self.put_buffers.clear();
-        let _ = w;
+        let Some(resolved) = canonicalize_path(&self.root_path, &self.canonical_root, &lexical)
+        else {
+            Self::send_error(w, 403);
+            return;
+        };
+        if resolved.is_dir() {
+            Self::send_error(w, 409);
+            return;
+        }
+        if let Some(parent) = resolved.parent() {
+            if fs::create_dir_all(parent).is_err() {
+                Self::send_error(w, 500);
+                return;
+            }
+        }
+        // Open now and write each inbound chunk directly to it as it
+        // arrives — the request body is never buffered whole. Headers are a
+        // fast metadata operation; the potentially large body writes happen
+        // per chunk in `request_body_content`, not here.
+        match fs::File::create(&resolved) {
+            Ok(f) => {
+                self.put_file = Some(f);
+                self.put_bytes_written = 0;
+                self.put_rejected = false;
+            }
+            Err(_) => Self::send_error(w, 500),
+        }
     }
 
     fn handle_delete(&mut self, w: &mut dyn ServerWriter) {
@@ -739,19 +805,6 @@ enum LockOutcome {
     Created(WebDavLock),
 }
 
-#[derive(Default)]
-struct GetPlan {
-    status: u16,
-    not_modified: bool,
-    listing: Option<Vec<u8>>,
-    is_dir: bool,
-    last_modified: Option<SystemTime>,
-    content_type: String,
-    size: u64,
-    etag: Option<String>,
-    file_data: Option<Vec<u8>>,
-}
-
 fn io_err(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg))
 }
@@ -808,7 +861,7 @@ fn content_type_for(path: &Path, map: &HashMap<String, String>) -> String {
 }
 
 fn weak_etag(path: &Path, meta: &fs::Metadata) -> String {
-    let mut h = Md5::new();
+    let mut h = Sha256::new();
     h.update(path.to_string_lossy().as_bytes());
     h.update(meta.len().to_string().as_bytes());
     if let Ok(t) = meta.modified() {

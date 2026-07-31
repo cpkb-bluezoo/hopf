@@ -175,6 +175,28 @@ impl StorageExecutor {
         }
     }
 
+    /// Like [`submit_on`](Self::submit_on), but `op` also receives a
+    /// [`ConnHandle`] clone it can use to push chunks (`.send(chunk)`) to
+    /// the connection as it goes, instead of assembling a whole result to
+    /// hand back through `callback`. `callback` still fires once at the
+    /// end, with `op`'s own return value (typically `()` or a small
+    /// summary — never the streamed content itself).
+    ///
+    /// `op`'s pushed chunks and the final `callback` all land on the
+    /// connection's reactor thread in the order `op` made the calls (`send`
+    /// is fire-and-forget but FIFO per sending thread, and `callback` is
+    /// queued after `op` returns) — no extra synchronization needed between
+    /// them.
+    pub fn submit_streamed<T, Op, Cb>(&self, handle: ConnHandle, op: Op, callback: Cb)
+    where
+        T: Send + 'static,
+        Op: FnOnce(&ConnHandle) -> Result<T, Box<dyn StdError + Send + Sync>> + Send + 'static,
+        Cb: FnOnce(Result<T, StorageError>) + Send + 'static,
+    {
+        let stream_handle = handle.clone();
+        self.submit_on(handle, move || op(&stream_handle), callback);
+    }
+
     /// Approximate number of queued or running jobs.
     pub fn pending_count(&self) -> usize {
         self.pending.load(Ordering::Relaxed)

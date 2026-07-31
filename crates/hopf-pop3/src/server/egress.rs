@@ -1,91 +1,117 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! RETR / TOP message formatting (dot-stuffing, TOP truncation).
+//! RETR / TOP message formatting: streaming dot-stuffing.
 
-/// Truncate an RFC 822 message to headers + the first `lines` body lines (TOP).
-pub fn truncate_top(message: &[u8], lines: u32) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut body_lines_left = lines;
-    let mut in_body = false;
-    for raw in message.split_inclusive(|&b| b == b'\n') {
-        let line = strip_line_ending(raw);
-        if !in_body {
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
-            if line.is_empty() {
-                in_body = true;
-            }
-            continue;
-        }
-        if body_lines_left == 0 {
-            break;
-        }
-        out.extend_from_slice(line);
-        out.extend_from_slice(b"\r\n");
-        body_lines_left -= 1;
-    }
-    out
+/// Streaming dot-stuffer for RETR/TOP message bodies — fed one chunk at a
+/// time (chunk boundaries may fall anywhere, including mid-line), never
+/// buffers more than the current, not-yet-terminated line.
+///
+/// Per line: strips a trailing CRLF's `\r` (if present) and any other bare
+/// `\r` bytes within the line (prevents response smuggling), normalizes
+/// the terminator to `\r\n`, and doubles a leading `.` (RFC 1939 §3). Call
+/// [`Self::finish`] once the message is exhausted to flush any trailing
+/// unterminated line and append the terminating `.\r\n`.
+pub struct Pop3DotStuffer {
+    line_buf: Vec<u8>,
 }
 
-/// Dot-stuff a message body and append the terminating `.\r\n`.
-///
-/// Strips bare CR from each content line to prevent response smuggling.
-pub fn dot_stuff_message(message: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(message.len() + 16);
-    if message.is_empty() {
-        out.extend_from_slice(b".\r\n");
-        return out;
+impl Pop3DotStuffer {
+    /// New stuffer, positioned at the start of the message.
+    pub fn new() -> Self {
+        Self {
+            line_buf: Vec::new(),
+        }
     }
-    for raw in message.split_inclusive(|&b| b == b'\n') {
-        let line = strip_line_ending(raw);
-        let cleaned = strip_cr(line);
-        if cleaned.first() == Some(&b'.') {
+
+    /// Dot-stuff one chunk, appending the result to `out`.
+    pub fn feed(&mut self, chunk: &[u8], out: &mut Vec<u8>) {
+        for &b in chunk {
+            if b == b'\n' {
+                self.emit_line(out);
+            } else {
+                self.line_buf.push(b);
+            }
+        }
+    }
+
+    fn emit_line(&mut self, out: &mut Vec<u8>) {
+        let mut line = std::mem::take(&mut self.line_buf);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        line.retain(|&b| b != b'\r');
+        if line.first() == Some(&b'.') {
             out.push(b'.');
         }
-        out.extend_from_slice(&cleaned);
+        out.extend_from_slice(&line);
         out.extend_from_slice(b"\r\n");
     }
-    out.extend_from_slice(b".\r\n");
-    out
+
+    /// Flush any trailing unterminated line, then the dot-stuff terminator.
+    pub fn finish(&mut self, out: &mut Vec<u8>) {
+        if !self.line_buf.is_empty() {
+            self.emit_line(out);
+        }
+        out.extend_from_slice(b".\r\n");
+    }
 }
 
-fn strip_line_ending(line: &[u8]) -> &[u8] {
-    let mut end = line.len();
-    if end > 0 && line[end - 1] == b'\n' {
-        end -= 1;
+impl Default for Pop3DotStuffer {
+    fn default() -> Self {
+        Self::new()
     }
-    if end > 0 && line[end - 1] == b'\r' {
-        end -= 1;
-    }
-    &line[..end]
-}
-
-fn strip_cr(line: &[u8]) -> Vec<u8> {
-    line.iter().copied().filter(|&b| b != b'\r').collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn top_zero_body_lines() {
-        let msg = b"From: a@b\r\nSubject: x\r\n\r\nbody1\r\nbody2\r\n";
-        let top = truncate_top(msg, 0);
-        assert_eq!(top, b"From: a@b\r\nSubject: x\r\n\r\n");
-    }
-
-    #[test]
-    fn top_one_body_line() {
-        let msg = b"Subject: x\r\n\r\nbody1\r\nbody2\r\n";
-        let top = truncate_top(msg, 1);
-        assert_eq!(top, b"Subject: x\r\n\r\nbody1\r\n");
+    /// Whole-buffer reference implementation, used only by these tests to
+    /// check the streaming version against varying chunk sizes.
+    fn dot_stuff_whole(message: &[u8]) -> Vec<u8> {
+        let mut stuffer = Pop3DotStuffer::new();
+        let mut out = Vec::new();
+        stuffer.feed(message, &mut out);
+        stuffer.finish(&mut out);
+        out
     }
 
     #[test]
     fn dot_stuff_leading_dot() {
         let msg = b"hello\r\n.hidden\r\n";
-        let out = dot_stuff_message(msg);
+        let out = dot_stuff_whole(msg);
         assert_eq!(out, b"hello\r\n..hidden\r\n.\r\n");
+    }
+
+    #[test]
+    fn dot_stuff_empty_message_is_just_terminator() {
+        assert_eq!(dot_stuff_whole(b""), b".\r\n");
+    }
+
+    #[test]
+    fn dot_stuff_strips_bare_cr_mid_line() {
+        let out = dot_stuff_whole(b"foo\rbar\r\n");
+        assert_eq!(out, b"foobar\r\n.\r\n");
+    }
+
+    #[test]
+    fn dot_stuff_normalizes_bare_lf_terminator() {
+        let out = dot_stuff_whole(b"one\ntwo\n");
+        assert_eq!(out, b"one\r\ntwo\r\n.\r\n");
+    }
+
+    #[test]
+    fn streaming_matches_whole_buffer_regardless_of_chunk_size() {
+        let msg = b"From: a@b\r\nSubject: x\r\n\r\n.leading dot\r\nplain\r\nfoo\rbar\r\nlast-no-nl";
+        let whole = dot_stuff_whole(msg);
+        for chunk_size in [1usize, 2, 3, 7, 64, 4096] {
+            let mut stuffer = Pop3DotStuffer::new();
+            let mut out = Vec::new();
+            for chunk in msg.chunks(chunk_size) {
+                stuffer.feed(chunk, &mut out);
+            }
+            stuffer.finish(&mut out);
+            assert_eq!(out, whole, "chunk_size={chunk_size}");
+        }
     }
 }

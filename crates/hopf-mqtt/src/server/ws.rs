@@ -39,6 +39,7 @@ use hopf_http::Headers;
 use hopf_websocket::{framed_ws_conn_handle, WsEventHandler, WsEventHandlerFactory, WsFrameError, WsRole, WsSession};
 
 use crate::server::broker::{validate_topic_name, BrokerState, SubscriberId, UNLIMITED_RECEIVE_MAXIMUM};
+use crate::server::publish_spool::{publish_whole, PendingPublish};
 use crate::codec::packet::{reason, ConnectPacket, PublishHeader, QoS, SubscribeFilter, Will};
 use crate::codec::parser::{MqttFrameHandler, MqttFrameParser};
 use crate::codec::properties::property;
@@ -52,7 +53,7 @@ struct ConnectedWsSession {
     will: Option<Will>,
     graceful_disconnect: bool,
     awaiting_pubrel: HashSet<u16>,
-    pending_publish: Option<(PublishHeader, Vec<u8>)>,
+    pending_publish: Option<PendingPublish>,
 }
 
 enum SessionState {
@@ -111,7 +112,8 @@ impl MqttWsHandler {
         };
         if !session.graceful_disconnect {
             if let Some(will) = &session.will {
-                self.config.broker.publish(
+                publish_whole(
+                    &self.config.broker,
                     Some(session.subscriber_id),
                     &will.topic,
                     &will.payload,
@@ -228,6 +230,7 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
             receive_maximum,
             packet.clean_session,
             self.handler.conn.clone(),
+            true,
         );
         if let Some(evicted) = evicted {
             evicted.close();
@@ -269,6 +272,10 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
             self.disconnect_and_close(reason::TOPIC_NAME_INVALID);
             return;
         }
+        if header.payload_len > self.handler.config.max_publish_payload {
+            self.disconnect_and_close(reason::PACKET_TOO_LARGE);
+            return;
+        }
         let SessionState::Connected(session) = &mut self.handler.session else {
             self.disconnect_and_close(reason::PROTOCOL_ERROR);
             return;
@@ -280,40 +287,48 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
             self.session.send_binary(&wire);
             return;
         }
-        session.pending_publish = Some((header, Vec::new()));
+
+        let subscriber_id = session.subscriber_id;
+        let pending = PendingPublish::begin(self.broker(), subscriber_id, header);
+        let SessionState::Connected(session) = &mut self.handler.session else {
+            return;
+        };
+        session.pending_publish = Some(pending);
     }
 
     fn publish_data(&mut self, data: &[u8]) {
-        if let SessionState::Connected(session) = &mut self.handler.session {
-            if let Some((_, buf)) = &mut session.pending_publish {
-                buf.extend_from_slice(data);
-            }
-        }
+        let SessionState::Connected(session) = &mut self.handler.session else {
+            return;
+        };
+        let Some(pending) = &mut session.pending_publish else {
+            return;
+        };
+        pending.feed(data);
     }
 
     fn end_publish(&mut self) {
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
         };
-        let Some((header, payload)) = session.pending_publish.take() else {
+        let Some(pending) = session.pending_publish.take() else {
             return;
         };
-        let (version, subscriber_id) = (session.version, session.subscriber_id);
-
-        self.broker().publish(Some(subscriber_id), &header.topic, &payload, header.qos, header.retain, &header.properties);
+        let version = session.version;
+        let (qos, packet_id) = (pending.header.qos, pending.header.packet_id);
+        pending.finish(self.broker());
 
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
         };
-        match header.qos {
+        match qos {
             QoS::AtMostOnce => {}
             QoS::AtLeastOnce => {
-                let wire = encode::encode_puback(header.packet_id, reason::SUCCESS, &Properties::new(), version);
+                let wire = encode::encode_puback(packet_id, reason::SUCCESS, &Properties::new(), version);
                 self.session.send_binary(&wire);
             }
             QoS::ExactlyOnce => {
-                session.awaiting_pubrel.insert(header.packet_id);
-                let wire = encode::encode_pubrec(header.packet_id, reason::SUCCESS, &Properties::new(), version);
+                session.awaiting_pubrel.insert(packet_id);
+                let wire = encode::encode_pubrec(packet_id, reason::SUCCESS, &Properties::new(), version);
                 self.session.send_binary(&wire);
             }
         }

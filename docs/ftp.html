@@ -222,12 +222,12 @@ S: 200 PBSZ=0
 C: PROT P
 S: 200 Protection level set to P</code></pre>
 <ul>
-<li><code>PROT P</code> — encrypt data connections with the same TLS acceptor.</li>
+<li><code>PROT P</code> — encrypt data connections. Passive-mode (PASV/EPSV) connections use the same TLS acceptor as the control channel (<code>FtpConfig::with_tls</code>); active-mode (PORT/EPRT) connections need a separate client-role connector, since there the server dials out — set one with <code>FtpConfig::with_data_tls_connector(connector, server_name)</code>. Without a connector configured, <code>PROT P</code> transfers only work in passive mode; an active-mode transfer attempted under <code>PROT P</code> with no connector configured is refused (<code>425</code>) rather than silently falling back to cleartext.</li>
 <li><code>PROT C</code> — clear data.</li>
-<li><code>require_tls_for_data</code> / <code>require_data_tls()</code> — reject transfers unless protection level is <code>P</code>.</li>
+<li><code>require_tls_for_data</code> / <code>require_data_tls()</code> — reject (<code>522</code>) a PASV/EPSV/PORT/EPRT attempt made without <code>PROT P</code> already in effect, rather than silently upgrading the connection.</li>
 </ul>
 <h3 id="same-ip-data-check">Same-IP data check</h3>
-<p>Incoming PASV data connections from a mismatched client IP are rejected. Active PORT/EPRT bounce to a non-peer address is rejected unless <code>allow_active_bounce</code> is enabled.</p>
+<p>Incoming PASV/EPSV data connections are checked against the control connection's remote address as they connect — a peer other than the control connection's own IP is refused outright, regardless of transfer mode or TLS. Active PORT/EPRT bounce to a non-peer address is rejected at the PORT/EPRT command itself unless <code>allow_active_bounce</code> is enabled.</p>
 <h2 id="authentication">Authentication</h2>
 <p>Stock <code>FilesystemFtpHandler</code> evaluates <code>TrustPolicy</code> with <code>IdentityMaterial::UsernamePassword</code> after USER/PASS.</p>
 <div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
@@ -326,6 +326,18 @@ S: 200 Protection level set to P</code></pre>
 <td>From <a href="tls.html"><code>hopf-tls</code></a></td>
 </tr>
 <tr>
+<td><code>data_tls_connector</code></td>
+<td><code>Option&lt;SharedTlsConnector&gt;</code></td>
+<td><code>None</code></td>
+<td>Protects active-mode (PORT/EPRT) <code>PROT P</code> data connections — the server dials out, so it needs a connector, not an acceptor</td>
+</tr>
+<tr>
+<td><code>data_tls_server_name</code></td>
+<td><code>Option&lt;String&gt;</code></td>
+<td><code>None</code> (falls back to <code>"ftp-client"</code>)</td>
+<td>Fixed SNI/verification name for every active-mode TLS dial</td>
+</tr>
+<tr>
 <td><code>implicit_tls</code></td>
 <td><code>bool</code></td>
 <td><code>false</code></td>
@@ -335,7 +347,7 @@ S: 200 Protection level set to P</code></pre>
 <td><code>require_tls_for_data</code></td>
 <td><code>bool</code></td>
 <td><code>false</code></td>
-<td>Mandate <code>PROT P</code></td>
+<td>Reject (<code>522</code>) a data connection attempted without <code>PROT P</code> already in effect</td>
 </tr>
 <tr>
 <td><code>allow_active_bounce</code></td>
@@ -369,7 +381,7 @@ S: 200 Protection level set to P</code></pre>
 </tr>
 </tbody>
 </table>
-<p><strong>Builders:</strong> <code>FtpConfig::new(listen, root, policy)</code>, <code>.with_tls(acceptor)</code>, <code>.implicit_ftps()</code>, <code>.require_data_tls()</code>.</p>
+<p><strong>Builders:</strong> <code>FtpConfig::new(listen, root, policy)</code>, <code>.with_tls(acceptor)</code>, <code>.with_data_tls_connector(connector, server_name)</code>, <code>.implicit_ftps()</code>, <code>.require_data_tls()</code>.</p>
 <h3 id="ftpservice"><code>FtpService</code></h3>
 <table>
 <colgroup>

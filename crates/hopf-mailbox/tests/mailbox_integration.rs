@@ -3,10 +3,12 @@
 //! Integration tests for mbox + Maildir++.
 
 use std::collections::BTreeSet;
+use std::time::SystemTime;
 
 use tempfile::tempdir;
 use hopf_mailbox::{
-    Flag, IndexConfig, MailboxFactory, MaildirFactory, MboxFactory, SearchCriteria,
+    AppendGuard, Flag, IndexConfig, Mailbox, MailboxFactory, MailboxResult, MaildirFactory,
+    MboxFactory, SearchCriteria,
 };
 
 fn sample_msg(subject: &str, body: &str) -> Vec<u8> {
@@ -22,6 +24,19 @@ fn sample_msg(subject: &str, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Test-only whole-message append, via the real streaming push triad
+/// ([`AppendGuard`]) — never bypasses it.
+fn append_whole(
+    mb: &mut dyn Mailbox,
+    data: &[u8],
+    flags: &BTreeSet<Flag>,
+    internal_date: Option<SystemTime>,
+) -> MailboxResult<u64> {
+    let mut guard = AppendGuard::start(mb, flags, internal_date)?;
+    guard.append_content(data)?;
+    guard.commit()
+}
+
 #[test]
 fn mbox_append_flags_sidecar_and_search() {
     let dir = tempdir().unwrap();
@@ -32,9 +47,7 @@ fn mbox_append_flags_sidecar_and_search() {
 
     let mut flags = BTreeSet::new();
     flags.insert(Flag::Flagged);
-    let uid = mb
-        .append_message(&sample_msg("hello", "plain body"), &flags, None)
-        .unwrap();
+    let uid = append_whole(mb.as_mut(), &sample_msg("hello", "plain body"), &flags, None).unwrap();
     assert_eq!(uid, 1);
     assert_eq!(mb.message_count().unwrap(), 1);
     assert!(mb.flags(1).unwrap().contains(&Flag::Flagged));
@@ -57,8 +70,7 @@ fn mbox_rejects_copy() {
     let mut store = factory.create_store();
     store.open("bob").unwrap();
     let mut mb = store.open_mailbox("INBOX", false).unwrap();
-    mb.append_message(&sample_msg("x", "y"), &BTreeSet::new(), None)
-        .unwrap();
+    append_whole(mb.as_mut(), &sample_msg("x", "y"), &BTreeSet::new(), None).unwrap();
     let err = mb.copy_messages(&[1], "Sent").unwrap_err();
     assert!(err.to_string().contains("COPY"));
     mb.close(false).unwrap();
@@ -74,13 +86,13 @@ fn maildir_copy_move_and_body_index_option() {
     store.create_mailbox("Archive").unwrap();
 
     let mut inbox = store.open_mailbox("INBOX", false).unwrap();
-    inbox
-        .append_message(
-            &sample_msg("secret", "needle in a haystack"),
-            &BTreeSet::new(),
-            None,
-        )
-        .unwrap();
+    append_whole(
+        inbox.as_mut(),
+        &sample_msg("secret", "needle in a haystack"),
+        &BTreeSet::new(),
+        None,
+    )
+    .unwrap();
 
     let hits = inbox.search(&SearchCriteria::text("needle")).unwrap();
     assert_eq!(hits, vec![1]);
