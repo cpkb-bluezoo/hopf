@@ -230,10 +230,11 @@ impl DeadPropertyStore {
         }
         #[cfg(all(unix, feature = "xattr"))]
         {
-            let ok = xattr::SUPPORTED_EXTENSIONS
-                .iter()
-                .any(|_| resource.exists())
-                && std::panic::catch_unwind(|| xattr::list(resource)).is_ok();
+            let ok = xattr::SUPPORTED_PLATFORM
+                && resource.exists()
+                && std::panic::catch_unwind(|| xattr::list(resource))
+                    .map(|r| r.is_ok())
+                    .unwrap_or(false);
             self.xattr_supported = Some(ok);
             return ok;
         }
