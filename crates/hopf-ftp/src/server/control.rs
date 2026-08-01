@@ -250,7 +250,7 @@ impl FtpControlHandler {
             FtpCommand::Retr(_) => self.cmd_retr(endpoint, arg),
             FtpCommand::Stor(_) => self.cmd_stor(endpoint, arg, false),
             FtpCommand::Appe(_) => self.cmd_stor(endpoint, arg, true),
-            FtpCommand::Stou => self.cmd_stor(endpoint, &format!("stor-{}", std::process::id()), false),
+            FtpCommand::Stou => self.cmd_stou(endpoint),
             FtpCommand::List(_) => self.cmd_list(endpoint, arg, false),
             FtpCommand::Nlst(_) => self.cmd_list(endpoint, arg, true),
             FtpCommand::Mlsd(_) => self.cmd_mlsd(endpoint, arg),
@@ -294,7 +294,7 @@ impl FtpControlHandler {
             FtpCommand::Prot(_) => self.cmd_prot(endpoint, arg),
             FtpCommand::Ccc => self.send_reply(endpoint, 533, "CCC not supported"),
             FtpCommand::Allo => self.send_reply(endpoint, 202, "ALLO not required"),
-            FtpCommand::Site => self.send_reply(endpoint, 500, "SITE not implemented"),
+            FtpCommand::Site(_) => self.cmd_site(endpoint, arg),
             FtpCommand::Smnt => self.send_reply(endpoint, 502, "Command not implemented"),
             FtpCommand::Unknown { .. } => self.send_reply(endpoint, 502, "Command not implemented"),
         }
@@ -354,6 +354,13 @@ impl FtpControlHandler {
 
     fn cmd_cwd(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
         if !self.require_auth(endpoint) {
+            return;
+        }
+        if !self
+            .app
+            .is_authorized(FtpOperation::Navigate, arg, &self.meta)
+        {
+            self.send_reply(endpoint, 550, "Permission denied");
             return;
         }
         let r = self
@@ -632,6 +639,36 @@ impl FtpControlHandler {
         self.ensure_bridge().queue_stor(writer);
     }
 
+    fn cmd_stou(&mut self, endpoint: &mut dyn Endpoint) {
+        if !self.require_auth(endpoint) {
+            return;
+        }
+        let unique = self
+            .app
+            .file_system(&self.meta)
+            .generate_unique_name(&self.cwd, None, &self.meta);
+        match unique.result {
+            FtpFileOpResult::Ok => self.cmd_stor(endpoint, &unique.path, false),
+            FtpFileOpResult::ReadOnly => self.send_reply(endpoint, 550, "Read-only file system"),
+            _ => self.send_reply(endpoint, 550, "Failed to generate unique file name"),
+        }
+    }
+
+    fn cmd_site(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
+        if !self.require_auth(endpoint) {
+            return;
+        }
+        match self.app.handle_site_command(arg, &self.meta) {
+            FtpFileOpResult::Ok => self.send_reply(endpoint, 200, "SITE command successful"),
+            FtpFileOpResult::NotSupported => {
+                self.send_reply(endpoint, 502, "SITE command not implemented")
+            }
+            FtpFileOpResult::PermissionDenied => self.send_reply(endpoint, 550, "Permission denied"),
+            FtpFileOpResult::NotFound => self.send_reply(endpoint, 550, "Not found"),
+            _ => self.send_reply(endpoint, 550, "SITE command failed"),
+        }
+    }
+
     fn cmd_list(&mut self, endpoint: &mut dyn Endpoint, arg: &str, names_only: bool) {
         if !self.require_auth(endpoint) {
             return;
@@ -782,6 +819,13 @@ impl FtpControlHandler {
         if !self.require_auth(endpoint) || arg.is_empty() {
             return;
         }
+        if !self
+            .app
+            .is_authorized(FtpOperation::DeleteDir, arg, &self.meta)
+        {
+            self.send_reply(endpoint, 550, "Permission denied");
+            return;
+        }
         let path = self.app.file_system(&self.meta).resolve(arg, &self.cwd);
         match self.app.file_system(&self.meta).rmdir(&path, &self.meta) {
             FtpFileOpResult::Ok => self.send_reply(endpoint, 250, "RMD successful"),
@@ -791,6 +835,13 @@ impl FtpControlHandler {
 
     fn cmd_mkd(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
         if !self.require_auth(endpoint) || arg.is_empty() {
+            return;
+        }
+        if !self
+            .app
+            .is_authorized(FtpOperation::CreateDir, arg, &self.meta)
+        {
+            self.send_reply(endpoint, 550, "Permission denied");
             return;
         }
         let path = self.app.file_system(&self.meta).resolve(arg, &self.cwd);
@@ -804,6 +855,13 @@ impl FtpControlHandler {
 
     fn cmd_rnfr(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
         if !self.require_auth(endpoint) || arg.is_empty() {
+            return;
+        }
+        if !self
+            .app
+            .is_authorized(FtpOperation::Rename, arg, &self.meta)
+        {
+            self.send_reply(endpoint, 550, "Permission denied");
             return;
         }
         let path = self.app.file_system(&self.meta).resolve(arg, &self.cwd);
@@ -953,6 +1011,7 @@ impl ProtocolHandler for FtpControlHandler {
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
         self.clear_pasv();
+        self.app.disconnected(&self.meta);
     }
 
     fn security_established(

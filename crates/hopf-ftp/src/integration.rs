@@ -16,8 +16,10 @@ use hopf_auth::PasswordTrustPolicy;
 use hopf_core::{Runtime, RuntimeConfig};
 
 use crate::{
-    FtpAbortHandle, FtpClient, FtpClientTimeouts, FtpError, FtpGet, FtpPipeline, FtpPut,
-    FtpSessionWrite, FtpStorHandle, FtpConfig, FtpService, MessageReceiveCallback, StorReady,
+    BasicFtpFileSystem, FtpAbortHandle, FtpAuthResult, FtpClient, FtpClientTimeouts,
+    FtpConnectionHandler, FtpConnectionHandlerFactory, FtpConnectionMetadata, FtpError,
+    FtpFileOpResult, FtpFileSystem, FtpGet, FtpOperation, FtpPipeline, FtpPut, FtpSessionWrite,
+    FtpStorHandle, FtpConfig, FtpService, MessageReceiveCallback, StorReady,
 };
 
 // ---------------------------------------------------------------------------
@@ -799,4 +801,180 @@ fn connect_timeout_fires_for_unreachable_peer() {
     }
 
     rt.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// App-handler wiring: is_authorized gates, SITE dispatch, disconnected notify
+// ---------------------------------------------------------------------------
+
+/// Test handler: authenticates "u"/"p" like [`start_server`], but denies
+/// exactly one [`FtpOperation`] (to prove the corresponding command is
+/// actually gated by `is_authorized`), answers `SITE PING` and reports
+/// anything else as not-supported, and records `disconnected`.
+struct AuthzTestHandler {
+    fs: BasicFtpFileSystem,
+    denied: FtpOperation,
+    disconnected: Arc<Mutex<bool>>,
+}
+
+impl FtpConnectionHandler for AuthzTestHandler {
+    fn authenticate(
+        &mut self,
+        username: &str,
+        password: Option<&str>,
+        _account: Option<&str>,
+        _meta: &FtpConnectionMetadata,
+    ) -> FtpAuthResult {
+        match password {
+            None => FtpAuthResult::NeedPassword,
+            Some(p) if username == "u" && p == "p" => FtpAuthResult::Success,
+            Some(_) => FtpAuthResult::Failed,
+        }
+    }
+
+    fn file_system(&mut self, _meta: &FtpConnectionMetadata) -> &mut dyn FtpFileSystem {
+        &mut self.fs
+    }
+
+    fn is_authorized(&self, op: FtpOperation, _path: &str, _meta: &FtpConnectionMetadata) -> bool {
+        op != self.denied
+    }
+
+    fn handle_site_command(
+        &mut self,
+        command: &str,
+        _meta: &FtpConnectionMetadata,
+    ) -> FtpFileOpResult {
+        if command.eq_ignore_ascii_case("PING") {
+            FtpFileOpResult::Ok
+        } else {
+            FtpFileOpResult::NotSupported
+        }
+    }
+
+    fn disconnected(&mut self, _meta: &FtpConnectionMetadata) {
+        *self.disconnected.lock().unwrap() = true;
+    }
+}
+
+struct AuthzTestHandlerFactory {
+    root: std::path::PathBuf,
+    denied: FtpOperation,
+    disconnected: Arc<Mutex<bool>>,
+}
+
+impl FtpConnectionHandlerFactory for AuthzTestHandlerFactory {
+    fn create(&self) -> Box<dyn FtpConnectionHandler> {
+        Box::new(AuthzTestHandler {
+            fs: BasicFtpFileSystem::new(&self.root, false).unwrap(),
+            denied: self.denied,
+            disconnected: Arc::clone(&self.disconnected),
+        })
+    }
+}
+
+fn start_server_with_authz(
+    root: &std::path::Path,
+    denied: FtpOperation,
+    disconnected: Arc<Mutex<bool>>,
+) -> (Arc<Runtime>, SocketAddr) {
+    let policy = PasswordTrustPolicy::default(); // unused: AuthzTestHandler authenticates itself
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = FtpConfig::new(listen, root, policy.shared());
+    let factory = Arc::new(AuthzTestHandlerFactory {
+        root: root.to_path_buf(),
+        denied,
+        disconnected,
+    });
+    let service = FtpService::with_handler_factory(config, factory);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+    (rt, bound)
+}
+
+#[test]
+fn mkd_is_gated_by_is_authorized_create_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_rt, bound) =
+        start_server_with_authz(dir.path(), FtpOperation::CreateDir, Arc::new(Mutex::new(false)));
+    let mut ctrl = raw_login(bound);
+    let r = raw_cmd(&mut ctrl, "MKD /newdir\r\n");
+    assert!(r.starts_with("550"), "MKD should be denied: {r}");
+    assert!(
+        !dir.path().join("newdir").exists(),
+        "a denied MKD must not touch the filesystem"
+    );
+}
+
+#[test]
+fn rmd_is_gated_by_is_authorized_delete_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("d")).unwrap();
+    let (_rt, bound) =
+        start_server_with_authz(dir.path(), FtpOperation::DeleteDir, Arc::new(Mutex::new(false)));
+    let mut ctrl = raw_login(bound);
+    let r = raw_cmd(&mut ctrl, "RMD /d\r\n");
+    assert!(r.starts_with("550"), "RMD should be denied: {r}");
+    assert!(
+        dir.path().join("d").exists(),
+        "a denied RMD must not touch the filesystem"
+    );
+}
+
+#[test]
+fn rnfr_is_gated_by_is_authorized_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), b"hi").unwrap();
+    let (_rt, bound) =
+        start_server_with_authz(dir.path(), FtpOperation::Rename, Arc::new(Mutex::new(false)));
+    let mut ctrl = raw_login(bound);
+    let r = raw_cmd(&mut ctrl, "RNFR /f.txt\r\n");
+    assert!(r.starts_with("550"), "RNFR should be denied: {r}");
+}
+
+#[test]
+fn cwd_is_gated_by_is_authorized_navigate() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("d")).unwrap();
+    let (_rt, bound) =
+        start_server_with_authz(dir.path(), FtpOperation::Navigate, Arc::new(Mutex::new(false)));
+    let mut ctrl = raw_login(bound);
+    let r = raw_cmd(&mut ctrl, "CWD /d\r\n");
+    assert!(r.starts_with("550"), "CWD should be denied: {r}");
+}
+
+#[test]
+fn site_command_dispatches_to_the_application_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    // Nothing this test does is gated by is_authorized, so deny an
+    // unrelated operation.
+    let (_rt, bound) =
+        start_server_with_authz(dir.path(), FtpOperation::Admin, Arc::new(Mutex::new(false)));
+    let mut ctrl = raw_login(bound);
+    let r = raw_cmd(&mut ctrl, "SITE PING\r\n");
+    assert!(r.starts_with("200"), "SITE PING should succeed: {r}");
+    let r = raw_cmd(&mut ctrl, "SITE BOGUS\r\n");
+    assert!(
+        r.starts_with("502"),
+        "an unrecognised SITE subcommand should be 502: {r}"
+    );
+}
+
+#[test]
+fn disconnected_notifies_the_application_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let flag = Arc::new(Mutex::new(false));
+    let (_rt, bound) =
+        start_server_with_authz(dir.path(), FtpOperation::Admin, Arc::clone(&flag));
+    {
+        let mut ctrl = raw_login(bound);
+        let r = raw_cmd(&mut ctrl, "QUIT\r\n");
+        assert!(r.starts_with("221"), "QUIT: {r}");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !*flag.lock().unwrap() {
+        assert!(Instant::now() < deadline, "disconnected() did not fire within 2s");
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

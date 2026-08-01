@@ -26,6 +26,10 @@ pub enum FtpFileOpResult {
     Failed,
     /// Read-only file system.
     ReadOnly,
+    /// Operation not supported by this implementation (Gumdrop
+    /// `FTPFileOperationResult.NOT_SUPPORTED`, 502) — e.g. an unrecognised
+    /// SITE subcommand.
+    NotSupported,
 }
 
 /// Directory entry / file metadata.
@@ -50,6 +54,15 @@ pub struct DirectoryChange {
     pub result: FtpFileOpResult,
     /// New absolute cwd on success.
     pub new_cwd: String,
+}
+
+/// Outcome of unique-name generation for STOU.
+#[derive(Debug, Clone)]
+pub struct UniqueName {
+    /// Operation result.
+    pub result: FtpFileOpResult,
+    /// Generated absolute NVFS path, on success.
+    pub path: String,
 }
 
 /// Network virtual file system (RFC 959 §2.2 / RFC 3659 TVFS).
@@ -105,6 +118,18 @@ pub trait FtpFileSystem: Send {
         restart: u64,
         meta: &FtpConnectionMetadata,
     ) -> Result<Box<dyn Write + Send>, FtpFileOpResult>;
+
+    /// Generate a unique file name under `base` for STOU (RFC 959 §4.1.3).
+    /// `suggested` is a hint from the caller, if any — STOU itself carries
+    /// no client argument, but other callers of the same NVFS operation
+    /// might. Implementations must guarantee the returned path does not
+    /// already exist.
+    fn generate_unique_name(
+        &self,
+        base: &str,
+        suggested: Option<&str>,
+        meta: &FtpConnectionMetadata,
+    ) -> UniqueName;
 }
 
 /// Chrooted local filesystem backend.
@@ -361,6 +386,45 @@ impl FtpFileSystem for BasicFtpFileSystem {
         }
         Ok(Box::new(f))
     }
+
+    fn generate_unique_name(
+        &self,
+        base: &str,
+        _suggested: Option<&str>,
+        _meta: &FtpConnectionMetadata,
+    ) -> UniqueName {
+        if self.read_only {
+            return UniqueName {
+                result: FtpFileOpResult::ReadOnly,
+                path: String::new(),
+            };
+        }
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let base = if base.is_empty() { "/" } else { base };
+        for _ in 0..1000 {
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let name = format!("hopf.{nanos:x}.{n:x}");
+            let candidate = self.resolve(&name, base);
+            match self.join_jail(&candidate) {
+                Ok(p) if !p.exists() => {
+                    return UniqueName {
+                        result: FtpFileOpResult::Ok,
+                        path: candidate,
+                    };
+                }
+                Ok(_) => continue, // Collision (astronomically unlikely) — retry.
+                Err(result) => return UniqueName { result, path: String::new() },
+            }
+        }
+        UniqueName {
+            result: FtpFileOpResult::Failed,
+            path: String::new(),
+        }
+    }
 }
 
 fn normalize_nvfs(path: &str) -> String {
@@ -509,5 +573,39 @@ mod tests {
             std::fs::read(dir.path().join("f.txt")).unwrap(),
             b"0123456789XYZ"
         );
+    }
+
+    /// Issue: STOU's "unique" name used to be `stor-<pid>` — constant for
+    /// the life of the process, so repeated STOU calls collided. Two calls
+    /// in a row (same process, same connection) must produce distinct,
+    /// actually-writable paths.
+    #[test]
+    fn generate_unique_name_produces_distinct_writable_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = BasicFtpFileSystem::new(dir.path(), false).unwrap();
+        let m = meta();
+
+        let a = fs.generate_unique_name("/", None, &m);
+        let b = fs.generate_unique_name("/", None, &m);
+        assert_eq!(a.result, FtpFileOpResult::Ok);
+        assert_eq!(b.result, FtpFileOpResult::Ok);
+        assert_ne!(a.path, b.path, "two calls must not collide");
+
+        let mut w = fs.open_write(&a.path, false, 0, &m).unwrap();
+        w.write_all(b"first").unwrap();
+        drop(w);
+        let mut w = fs.open_write(&b.path, false, 0, &m).unwrap();
+        w.write_all(b"second").unwrap();
+        drop(w);
+
+        assert_eq!(fs.list_directory("/", &m).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn generate_unique_name_rejects_on_read_only_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = BasicFtpFileSystem::new(dir.path(), true).unwrap();
+        let r = fs.generate_unique_name("/", None, &meta());
+        assert_eq!(r.result, FtpFileOpResult::ReadOnly);
     }
 }

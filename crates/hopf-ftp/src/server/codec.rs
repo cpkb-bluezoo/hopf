@@ -109,8 +109,9 @@ pub enum FtpCommand {
     Ccc,
     /// `ALLO` (not required; argument ignored)
     Allo,
-    /// `SITE` (not implemented; argument ignored)
-    Site,
+    /// `SITE` (application-defined subcommand; dispatched to
+    /// [`crate::server::handler::FtpConnectionHandler::handle_site_command`])
+    Site(Vec<u8>),
     /// `SMNT` (not implemented; argument ignored)
     Smnt,
     /// A verb the lexer doesn't recognise at all.
@@ -153,7 +154,8 @@ impl FtpCommand {
             | Self::Opts(b)
             | Self::Auth(b)
             | Self::Pbsz(b)
-            | Self::Prot(b) => Some(b),
+            | Self::Prot(b)
+            | Self::Site(b) => Some(b),
             _ => None,
         }
     }
@@ -332,7 +334,7 @@ fn build_command(verb: &str, arg: Vec<u8>) -> FtpCommand {
         "PROT" => FtpCommand::Prot(arg),
         "CCC" => FtpCommand::Ccc,
         "ALLO" => FtpCommand::Allo,
-        "SITE" => FtpCommand::Site,
+        "SITE" => FtpCommand::Site(arg),
         "SMNT" => FtpCommand::Smnt,
         _ => FtpCommand::Unknown { verb: verb.to_string() },
     }
@@ -420,7 +422,7 @@ mod tests {
                 FtpCommand::Abor,
                 FtpCommand::Ccc,
                 FtpCommand::Allo,
-                FtpCommand::Site,
+                FtpCommand::Site(Vec::new()),
                 FtpCommand::Smnt,
             ]
         );
