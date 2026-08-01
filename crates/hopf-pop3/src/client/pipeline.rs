@@ -42,6 +42,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
 use hopf_core::Endpoint;
 
 use super::handlers::{Pop3ClientDriver, Pop3ClientHandlerFactory};
@@ -81,6 +82,9 @@ struct Pop3FetchState {
     require_stls: bool,
     /// APOP challenge from the greeting, e.g. `<timestamp@host>`.
     apop_timestamp: Option<String>,
+    /// In-progress SASL exchange (mechanism beyond PLAIN's single-shot
+    /// initial response), awaiting the next server challenge.
+    sasl_client: Option<Box<dyn SaslClient>>,
     /// IDs of messages to fetch (populated after LIST).
     pending: VecDeque<u32>,
     /// Message currently being fetched (for DELE).
@@ -112,6 +116,7 @@ impl Pop3Fetch {
             delete_after_fetch: false,
             require_stls: false,
             apop_timestamp: None,
+            sasl_client: None,
             pending: VecDeque::new(),
             current_id: 0,
             current_stopped: false,
@@ -202,42 +207,64 @@ impl Pop3FetchDriver {
         result.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// The strongest mechanism this auto-pilot can drive with a bare
+    /// username/password that the server actually advertises. Excludes
+    /// DIGEST-MD5 (deprecated, needs a hostname this pipeline doesn't
+    /// track), OAUTHBEARER (needs a bearer token, not a password), and
+    /// EXTERNAL (needs a client certificate) — a custom driver can still
+    /// use any of those directly via [`Pop3ClientAuthorization::auth`].
+    fn choose_mechanism(sasl_mechs: &[String]) -> Option<SaslMechanism> {
+        const PREFERENCE: &[SaslMechanism] = &[
+            SaslMechanism::ScramSha256,
+            SaslMechanism::CramMd5,
+            SaslMechanism::Plain,
+            SaslMechanism::Login,
+        ];
+        PREFERENCE
+            .iter()
+            .copied()
+            .find(|m| sasl_mechs.iter().any(|s| s.eq_ignore_ascii_case(m.name())))
+    }
+
     /// Try to authenticate using the best available method.
     fn authenticate(
         &self,
         auth: &mut dyn Pop3ClientAuthorization,
         caps: &Pop3Capabilities,
     ) -> bool {
-        let st = self.state.lock().unwrap();
-        if let Some((ref user, ref pass)) = st.credentials {
-            // Prefer APOP if available and desired.
-            if st.prefer_apop {
-                if let Some(ref ts) = st.apop_timestamp {
-                    let digest = Self::apop_digest(ts, pass);
-                    let user = user.clone();
-                    drop(st);
-                    auth.apop(&user, &digest);
-                    return true;
-                }
-            }
-            // AUTH PLAIN if advertised.
-            if caps.sasl_mechs.iter().any(|m| m == "PLAIN") {
-                let mut buf = Vec::new();
-                buf.push(0u8);
-                buf.extend_from_slice(user.as_bytes());
-                buf.push(0u8);
-                buf.extend_from_slice(pass.as_bytes());
+        let mut st = self.state.lock().unwrap();
+        let Some((user, pass)) = st.credentials.clone() else {
+            return false;
+        };
+        // Prefer APOP if available and desired.
+        if st.prefer_apop {
+            if let Some(ts) = st.apop_timestamp.clone() {
+                let digest = Self::apop_digest(&ts, &pass);
                 drop(st);
-                auth.auth("PLAIN", Some(&buf));
+                auth.apop(&user, &digest);
                 return true;
             }
-            // Fall back to USER/PASS.
-            let user = user.clone();
-            drop(st);
-            auth.user(&user);
-            return true;
         }
-        false
+        if let Some(mech) = Self::choose_mechanism(&caps.sasl_mechs) {
+            let mut client = create_client(mech, &user, &pass, "", None);
+            if client.has_initial_response() {
+                if let SaslClientStep::Response(initial) = client.evaluate(None) {
+                    st.sasl_client = Some(client);
+                    drop(st);
+                    auth.auth(mech.name(), Some(&initial));
+                    return true;
+                }
+            } else {
+                st.sasl_client = Some(client);
+                drop(st);
+                auth.auth(mech.name(), None);
+                return true;
+            }
+        }
+        // Fall back to USER/PASS.
+        drop(st);
+        auth.user(&user);
+        true
     }
 
     /// Authenticate after STLS (no APOP possible here).
@@ -246,24 +273,29 @@ impl Pop3FetchDriver {
         post_stls: &mut dyn Pop3ClientPostStls,
         caps: &Pop3Capabilities,
     ) -> bool {
-        let st = self.state.lock().unwrap();
-        if let Some((ref user, ref pass)) = st.credentials {
-            if caps.sasl_mechs.iter().any(|m| m == "PLAIN") {
-                let mut buf = Vec::new();
-                buf.push(0u8);
-                buf.extend_from_slice(user.as_bytes());
-                buf.push(0u8);
-                buf.extend_from_slice(pass.as_bytes());
+        let mut st = self.state.lock().unwrap();
+        let Some((user, pass)) = st.credentials.clone() else {
+            return false;
+        };
+        if let Some(mech) = Self::choose_mechanism(&caps.sasl_mechs) {
+            let mut client = create_client(mech, &user, &pass, "", None);
+            if client.has_initial_response() {
+                if let SaslClientStep::Response(initial) = client.evaluate(None) {
+                    st.sasl_client = Some(client);
+                    drop(st);
+                    post_stls.auth(mech.name(), Some(&initial));
+                    return true;
+                }
+            } else {
+                st.sasl_client = Some(client);
                 drop(st);
-                post_stls.auth("PLAIN", Some(&buf));
+                post_stls.auth(mech.name(), None);
                 return true;
             }
-            let user = user.clone();
-            drop(st);
-            post_stls.user(&user);
-            return true;
         }
-        false
+        drop(st);
+        post_stls.user(&user);
+        true
     }
 
     /// Fetch the next pending message, or QUIT if all done.
@@ -417,10 +449,40 @@ impl Pop3ClientDriver for Pop3FetchDriver {
         &mut self,
         exchange: &mut dyn Pop3ClientAuthExchange,
         _ep: &mut dyn Endpoint,
-        _challenge: &[u8],
+        challenge: &[u8],
     ) {
-        // PLAIN doesn't use server challenges; abort.
-        exchange.abort();
+        let mut st = self.state.lock().unwrap();
+        let Some(mut client) = st.sasl_client.take() else {
+            // PLAIN/USER-PASS/APOP never reach here; an unexpected
+            // challenge with no in-progress exchange can't be answered.
+            drop(st);
+            exchange.abort();
+            return;
+        };
+        match client.evaluate(Some(challenge)) {
+            SaslClientStep::Response(r) => {
+                st.sasl_client = Some(client);
+                drop(st);
+                exchange.respond(&r);
+            }
+            SaslClientStep::Complete(r) => {
+                // Some mechanisms (e.g. SCRAM-SHA-256) send a trailing
+                // informational challenge (the server's `v=` verifier)
+                // after the exchange is otherwise done; our server sends
+                // it without waiting for a reply. Keep the client so a
+                // further `on_auth_challenge` call can absorb that
+                // instead of falling into the "no exchange" abort path.
+                st.sasl_client = Some(client);
+                drop(st);
+                if !r.is_empty() {
+                    exchange.respond(&r);
+                }
+            }
+            SaslClientStep::Failure => {
+                drop(st);
+                exchange.abort();
+            }
+        }
     }
 
     fn on_tls_established(

@@ -577,7 +577,7 @@
 <tr><td>FUTURERELEASE (HOLDFOR/HOLDUNTIL)</td><td>4865</td><td>Compliant (as rejection)</td><td>Parsed then explicitly rejected with 553 by both stock handlers rather than honored — documented</td></tr>
 <tr><td>LIMITS</td><td>9422</td><td>Not implemented</td><td>Not present at all</td></tr>
 <tr><td>STARTTLS</td><td>3207</td><td>Compliant</td><td>Session/EHLO state correctly reset after upgrade</td></tr>
-<tr><td><strong>AUTH mechanisms</strong></td><td>4954</td><td><strong>Partial — PLAIN only</strong></td><td>Only <code>PLAIN</code> is recognized on the wire (<code>control.rs:793</code>); LOGIN/CRAM-MD5/DIGEST-MD5/SCRAM-SHA-256/OAUTHBEARER/EXTERNAL all exist in <code>hopf-auth</code> but are not wired into <code>hopf-smtp</code> at all — matches hopf's own docs disclosure</td></tr>
+<tr><td>AUTH mechanisms</td><td>4954</td><td>Compliant</td><td>Full <code>hopf-auth</code> mechanism set wired via <code>SaslMechanism::from_name</code> + <code>create_server</code> against a <code>CredentialStore</code> (<code>SmtpConfig::store</code>), matching hopf-pop3/hopf-imap's dispatcher pattern; EHLO's <code>AUTH</code> line lists each mechanism the store supports, filtered by TLS requirement, instead of a hardcoded <code>AUTH PLAIN</code></td></tr>
 <tr><td>AUTH requires TLS, AUTH abort (<code>*</code>)</td><td>4954</td><td>Compliant</td><td><code>control.rs:786-816</code></td></tr>
 <tr><td>Implicit TLS (SMTPS)</td><td>8314</td><td>Compliant</td><td><code>control.rs:983-993</code></td></tr>
 <tr><td>XCLIENT</td><td>Postfix ext.</td><td>Not implemented (rejected)</td><td>Explicitly returns 550 — deliberate</td></tr>
@@ -599,7 +599,7 @@
 <thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
 <tbody>
 <tr><td>Greeting, EHLO + HELO fallback, MAIL/RCPT/DATA + dot-stuffing, RSET/QUIT, STARTTLS, implicit TLS, 421-any-state, multi-line parsing</td><td>various</td><td>Compliant</td><td><code>client/endpoint.rs,pipeline.rs</code></td></tr>
-<tr><td>AUTH — mechanism-agnostic trait exists, but only PLAIN is driven</td><td>4954</td><td>Partial</td><td><code>on_auth_challenge</code> always calls <code>exchange.abort()</code> — no LOGIN/CRAM/SCRAM client wired up even though <code>hopf-auth::create_client</code> supports them</td></tr>
+<tr><td>AUTH — <code>SmtpSend</code> auto-pilot drives the full mechanism menu</td><td>4954</td><td>Compliant</td><td><code>SmtpSendDriver::choose_mechanism</code> picks the strongest mechanism the server advertises (SCRAM-SHA-256 &gt; CRAM-MD5 &gt; PLAIN &gt; LOGIN) via <code>hopf-auth::create_client</code>; <code>on_auth_challenge</code> drives the full client-side exchange, including absorbing SCRAM's trailing <code>v=</code> verifier continuation — same pattern as hopf-pop3's <code>Pop3Fetch</code></td></tr>
 <tr><td><strong>True command pipelining (client sends ahead of replies)</strong></td><td>RFC 2920</td><td><strong>Not implemented</strong></td><td>The client state machine is strictly one-command/one-reply; <code>caps.pipelining</code> is parsed but never consulted to batch outbound commands</td></tr>
 <tr><td>BDAT/CHUNKING (client send)</td><td>3030</td><td>Not implemented</td><td>Capability parsed, never used — client always sends DATA</td></tr>
 <tr><td>MAIL FROM/RCPT TO ESMTP parameters (SIZE/BODY/RET/ENVID/REQUIRETLS/etc.)</td><td>various</td><td>Not implemented</td><td>Client API takes only the bare address — no parameter-passing surface at all, unlike the server which fully parses all of these on the inbound side</td></tr>
@@ -640,7 +640,7 @@
 <tr><td>OAuth 2.0 (RFC 6749/7662 token introspection)</td><td>6749,7662</td><td>Compliant (with a documented scope limit)</td><td><code>hopf-auth::oauth_introspection</code> implements RFC 7662 for real: <code>IntrospectionRequest</code>/<code>IntrospectionResponse</code> build the request and parse the response (a small purpose-built JSON reader, no new crate dependency), and <code>IntrospectionCredentialStore</code> wraps any <code>CredentialStore</code> to back <code>validate_bearer</code> with a real introspection round trip instead of a local map. Scope limit: the actual HTTP POST is supplied by the caller via <code>IntrospectionTransport</code> (<code>hopf-auth</code> has no network I/O of its own — <code>hopf-http</code>, which does, already depends on <code>hopf-auth</code>, so the dependency can't run the other way) — no protocol crate wires one up by default, so <code>PasswordStore::validate_bearer</code> (a local static map) remains what's actually used unless an app supplies its own transport</td></tr>
 </tbody>
 </table>
-<p><strong>Wiring gap across protocols:</strong> hopf-auth implements seven SASL mechanisms; hopf-pop3 and hopf-imap now both wire the full set (PLAIN/LOGIN/CRAM-MD5/DIGEST-MD5/SCRAM-SHA-256/OAUTHBEARER/EXTERNAL, filtered by TLS requirement) onto their wire protocols. hopf-smtp still hard-restricts AUTH to <code>PLAIN</code> on the wire, leaving the rest implemented-but-unreachable there.</p>
+<p>hopf-auth implements seven SASL mechanisms; hopf-pop3, hopf-imap, and hopf-smtp all wire the full set (PLAIN/LOGIN/CRAM-MD5/DIGEST-MD5/SCRAM-SHA-256/OAUTHBEARER/EXTERNAL, filtered by TLS requirement) onto their wire protocols, server and client alike. EXTERNAL's peer-certificate fingerprint is threaded through on all three servers via <code>SecurityInfo::peer_certificate_fingerprint</code>.</p>
 
 <h2 id="pop3">POP3 — RFC 1939</h2>
 <h3>Server</h3>
@@ -666,8 +666,8 @@
 <tr><td>Greeting parsing, APOP timestamp extraction, implicit TLS, STLS upgrade</td><td>Compliant</td><td><code>client/endpoint.rs,facade.rs</code></td></tr>
 <tr><td>USER/PASS, APOP, AUTH (SASL) with initial response + continuation/abort, CAPA discovery</td><td>Compliant</td><td><code>client/endpoint.rs:861-957</code></td></tr>
 <tr><td>STAT/LIST/RETR/DELE/RSET/TOP/UIDL/NOOP/QUIT, streaming RETR/TOP via a cross-buffer-safe dot-unstuffer</td><td>Compliant</td><td><code>client/unstuff.rs</code>, tested for split-across-buffer terminators</td></tr>
-<tr><td><code>Pop3Fetch</code> auto-pilot: CAPA negotiation, optional STLS, APOP-preferred then PLAIN-then-USER/PASS fallback, STAT+RETR-all, optional DELE, QUIT</td><td>Compliant</td><td><code>client/pipeline.rs:261-519</code></td></tr>
-<tr><td>Full SASL exchange in the auto-pilot (beyond PLAIN)</td><td>Partial</td><td><code>on_auth_challenge</code> unconditionally aborts — custom mechanisms require hand-rolling a driver (the underlying protocol is mechanism-agnostic)</td></tr>
+<tr><td><code>Pop3Fetch</code> auto-pilot: CAPA negotiation, optional STLS, APOP-preferred then full-SASL-then-USER/PASS fallback, STAT+RETR-all, optional DELE, QUIT</td><td>Compliant</td><td><code>client/pipeline.rs:261-519</code></td></tr>
+<tr><td>Full SASL exchange in the auto-pilot (beyond PLAIN)</td><td>Compliant</td><td><code>choose_mechanism</code> picks the strongest mechanism the server advertises (SCRAM-SHA-256 &gt; CRAM-MD5 &gt; PLAIN &gt; LOGIN) via <code>hopf-auth::create_client</code>; <code>on_auth_challenge</code> drives the full exchange, including absorbing SCRAM's trailing <code>v=</code> verifier continuation rather than treating it as an abort-worthy unexpected challenge</td></tr>
 </tbody>
 </table>
 

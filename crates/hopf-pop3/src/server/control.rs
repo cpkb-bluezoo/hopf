@@ -40,6 +40,9 @@ pub struct Pop3ControlHandler {
     lexer: Pop3ServerLexer,
     session: Pop3SessionState,
     tls: bool,
+    /// SHA-256 fingerprint of the peer's mTLS client certificate, if any —
+    /// fed into `SaslServerOptions.peer_certificate` for SASL EXTERNAL.
+    peer_certificate: Option<String>,
     expect_implicit_tls: bool,
     greeting_sent: bool,
     stls_used: bool,
@@ -96,6 +99,7 @@ impl Pop3ControlHandler {
             lexer: Pop3ServerLexer::new(MAX_COMMAND_LINE),
             session: Pop3SessionState::Authorization,
             tls: false,
+            peer_certificate: None,
             expect_implicit_tls,
             greeting_sent: false,
             stls_used: false,
@@ -443,7 +447,7 @@ impl Pop3ControlHandler {
         let opts = SaslServerOptions {
             hostname: self.config.hostname.clone(),
             realm: self.config.hostname.clone(),
-            peer_certificate: None,
+            peer_certificate: self.peer_certificate.clone(),
             channel_binding: None,
         };
         let mut server = create_server(mech, Arc::clone(&self.config.store), opts);
@@ -963,10 +967,11 @@ impl ProtocolHandler for Pop3ControlHandler {
     fn security_established(
         &mut self,
         endpoint: &mut dyn Endpoint,
-        _info: &hopf_core::SecurityInfo,
+        info: &hopf_core::SecurityInfo,
     ) {
         let first = !self.tls;
         self.tls = true;
+        self.peer_certificate = info.peer_certificate_fingerprint().map(str::to_string);
         if self.expect_implicit_tls && !self.greeting_sent {
             self.greet(endpoint);
             return;
