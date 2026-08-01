@@ -12,6 +12,7 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
 use hopf_core::Endpoint;
 
 use crate::DsnRecipientParams;
@@ -55,8 +56,11 @@ struct SmtpSendState {
     message: MessageSource,
     /// Require STARTTLS before sending (skip delivery if unavailable).
     require_starttls: bool,
-    /// AUTH PLAIN credentials.
+    /// AUTH credentials (username/password, driven via the strongest
+    /// mechanism the server advertises — see [`SmtpSendDriver::choose_mechanism`]).
     auth: Option<(String, String)>,
+    /// In-progress SASL exchange, between the `334` challenge and our reply.
+    sasl_client: Option<Box<dyn SaslClient>>,
     /// Index of the next recipient to send.
     rcpt_idx: usize,
     /// Count of accepted recipients.
@@ -103,6 +107,7 @@ impl SmtpSend {
             message: MessageSource::default(),
             require_starttls: false,
             auth: None,
+            sasl_client: None,
             rcpt_idx: 0,
             accepted_rcpts: 0,
             on_complete: None,
@@ -197,14 +202,23 @@ impl SmtpSendDriver {
         }
     }
 
-    /// Build AUTH PLAIN initial response bytes.
-    fn auth_plain_initial(user: &str, pass: &str) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push(0u8);
-        buf.extend_from_slice(user.as_bytes());
-        buf.push(0u8);
-        buf.extend_from_slice(pass.as_bytes());
-        buf
+    /// The strongest mechanism this auto-pilot can drive with a bare
+    /// username/password that the server actually advertises. Excludes
+    /// DIGEST-MD5 (deprecated, needs a hostname this pipeline doesn't
+    /// track), OAUTHBEARER (needs a bearer token, not a password), and
+    /// EXTERNAL (needs a client certificate) — a custom driver can still
+    /// use any of those directly via [`SmtpClientSession::auth`].
+    fn choose_mechanism(auth_methods: &[String]) -> Option<SaslMechanism> {
+        const PREFERENCE: &[SaslMechanism] = &[
+            SaslMechanism::ScramSha256,
+            SaslMechanism::CramMd5,
+            SaslMechanism::Plain,
+            SaslMechanism::Login,
+        ];
+        PREFERENCE
+            .iter()
+            .copied()
+            .find(|m| auth_methods.iter().any(|s| s.eq_ignore_ascii_case(m.name())))
     }
 }
 
@@ -229,7 +243,7 @@ impl SmtpClientDriver for SmtpSendDriver {
         ep: &mut dyn Endpoint,
         caps: &SmtpCapabilities,
     ) {
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
 
         // STARTTLS path (skip if the session is already secure — post-TLS EHLO).
         if st.require_starttls && !ep.is_secure() {
@@ -247,12 +261,22 @@ impl SmtpClientDriver for SmtpSendDriver {
         }
 
         // AUTH path.
-        if let Some((ref user, ref pass)) = st.auth {
-            if caps.auth_methods.iter().any(|m| m == "PLAIN") {
-                let initial = Self::auth_plain_initial(user, pass);
-                drop(st);
-                session.auth("PLAIN", Some(&initial));
-                return;
+        if let Some((user, pass)) = st.auth.clone() {
+            if let Some(mech) = Self::choose_mechanism(&caps.auth_methods) {
+                let mut client = create_client(mech, &user, &pass, "", None);
+                if client.has_initial_response() {
+                    if let SaslClientStep::Response(initial) = client.evaluate(None) {
+                        st.sasl_client = Some(client);
+                        drop(st);
+                        session.auth(mech.name(), Some(&initial));
+                        return;
+                    }
+                } else {
+                    st.sasl_client = Some(client);
+                    drop(st);
+                    session.auth(mech.name(), None);
+                    return;
+                }
             }
         }
 
@@ -319,10 +343,41 @@ impl SmtpClientDriver for SmtpSendDriver {
         &mut self,
         exchange: &mut dyn SmtpClientAuthExchange,
         _ep: &mut dyn Endpoint,
-        _challenge: &[u8],
+        challenge: &[u8],
     ) {
-        // PLAIN doesn't use challenges; abort.
-        exchange.abort();
+        let mut st = self.state.lock().unwrap();
+        let Some(mut client) = st.sasl_client.take() else {
+            // No in-progress exchange (e.g. AUTH PLAIN never has a
+            // challenge to answer): an unexpected challenge can't be
+            // driven — abort.
+            drop(st);
+            exchange.abort();
+            return;
+        };
+        match client.evaluate(Some(challenge)) {
+            SaslClientStep::Response(r) => {
+                st.sasl_client = Some(client);
+                drop(st);
+                exchange.respond(&r);
+            }
+            SaslClientStep::Complete(r) => {
+                // Some mechanisms (e.g. SCRAM-SHA-256) send a trailing
+                // informational challenge (the server's `v=` verifier)
+                // after the exchange is otherwise done; our server sends
+                // it without waiting for a reply. Keep the client so a
+                // further `on_auth_challenge` call can absorb that
+                // instead of falling into the "no exchange" abort path.
+                st.sasl_client = Some(client);
+                drop(st);
+                if !r.is_empty() {
+                    exchange.respond(&r);
+                }
+            }
+            SaslClientStep::Failure => {
+                drop(st);
+                exchange.abort();
+            }
+        }
     }
 
     fn on_auth_failed(

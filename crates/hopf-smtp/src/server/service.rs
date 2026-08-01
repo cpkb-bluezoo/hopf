@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use hopf_auth::TrustPolicy;
+use hopf_auth::CredentialStore;
 use hopf_core::tls::SharedTlsAcceptor;
 use hopf_core::{ProtocolHandler, Runtime, TcpListenerConfig};
 
@@ -37,8 +37,10 @@ pub struct SmtpConfig {
     pub tls_acceptor: Option<SharedTlsAcceptor>,
     /// Implicit TLS from accept (SMTPS).
     pub implicit_tls: bool,
-    /// Trust policy for AUTH PLAIN (optional).
-    pub policy: Option<Arc<dyn TrustPolicy>>,
+    /// Credential store for AUTH (optional). When set, the full SASL
+    /// mechanism set the store supports is advertised and driven via
+    /// `hopf_auth::create_server` (same pattern as hopf-pop3/hopf-imap).
+    pub store: Option<Arc<dyn CredentialStore>>,
 }
 
 impl SmtpConfig {
@@ -52,7 +54,7 @@ impl SmtpConfig {
             auth_required: false,
             tls_acceptor: None,
             implicit_tls: false,
-            policy: None,
+            store: None,
         }
     }
 
@@ -74,9 +76,9 @@ impl SmtpConfig {
         self
     }
 
-    /// Trust policy for AUTH PLAIN.
-    pub fn with_policy(mut self, policy: Arc<dyn TrustPolicy>) -> Self {
-        self.policy = Some(policy);
+    /// Credential store for AUTH.
+    pub fn with_store(mut self, store: Arc<dyn CredentialStore>) -> Self {
+        self.store = Some(store);
         self
     }
 }

@@ -104,6 +104,9 @@ pub struct ImapControlHandler {
     lexer: ImapServerLexer,
     session: ImapSessionState,
     tls: bool,
+    /// SHA-256 fingerprint of the peer's mTLS client certificate, if any —
+    /// fed into `SaslServerOptions.peer_certificate` for SASL EXTERNAL.
+    peer_certificate: Option<String>,
     expect_implicit_tls: bool,
     greeting_sent: bool,
     starttls_used: bool,
@@ -155,6 +158,7 @@ impl ImapControlHandler {
             lexer: ImapServerLexer::new(max_line),
             session: ImapSessionState::NotAuthenticated,
             tls: false,
+            peer_certificate: None,
             expect_implicit_tls,
             greeting_sent: false,
             starttls_used: false,
@@ -625,7 +629,7 @@ impl ImapControlHandler {
         let opts = SaslServerOptions {
             hostname: self.config.hostname.clone(),
             realm: self.config.hostname.clone(),
-            peer_certificate: None,
+            peer_certificate: self.peer_certificate.clone(),
             channel_binding: None,
         };
         let mut server = create_server(mech, Arc::clone(&self.config.store), opts);
@@ -1525,9 +1529,10 @@ impl ProtocolHandler for ImapControlHandler {
     fn security_established(
         &mut self,
         endpoint: &mut dyn Endpoint,
-        _info: &hopf_core::SecurityInfo,
+        info: &hopf_core::SecurityInfo,
     ) {
         self.tls = true;
+        self.peer_certificate = info.peer_certificate_fingerprint().map(str::to_string);
         if self.expect_implicit_tls && !self.greeting_sent {
             self.greet(endpoint);
             return;

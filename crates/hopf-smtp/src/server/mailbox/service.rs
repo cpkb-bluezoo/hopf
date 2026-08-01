@@ -28,7 +28,7 @@ use super::handler::LocalDeliveryHandlerFactory;
 /// | `max_message_size` | [`SmtpConfig`] | no | Default ~35 MiB |
 /// | `max_recipients` | [`SmtpConfig`] | no | Default 100 |
 /// | `auth_required` | [`SmtpConfig`] | no | Submission-style AUTH gate |
-/// | `policy` | [`SmtpConfig`] | no | TrustPolicy for AUTH PLAIN |
+/// | `store` | [`SmtpConfig`] | no | CredentialStore for AUTH (full SASL mechanism set) |
 /// | TLS | [`SmtpConfig`] | no | STARTTLS / implicit SMTPS |
 pub struct LocalDeliveryService {
     smtp: SmtpService,
