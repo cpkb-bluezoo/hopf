@@ -38,15 +38,28 @@ pub enum FtpAuthResult {
     Unavailable,
 }
 
-/// High-level operation for authorization hooks.
+/// High-level operation for authorization hooks (Gumdrop `FTPOperation`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FtpOperation {
-    /// Read / list / retrieve.
+    /// Read / list / retrieve (RETR, LIST, NLST, STAT, SIZE, MDTM).
     Read,
-    /// Store / append / mkdir / rename / delete.
+    /// Store / append (STOR, STOU, APPE).
     Write,
-    /// Delete.
+    /// Delete a file (DELE).
     Delete,
+    /// Create a directory (MKD).
+    CreateDir,
+    /// Remove a directory (RMD).
+    DeleteDir,
+    /// Rename/move (RNFR/RNTO).
+    Rename,
+    /// Directory navigation (CWD, CDUP, PWD); typically always allowed for
+    /// authenticated users, but available for path-based restrictions.
+    Navigate,
+    /// SITE subcommand.
+    SiteCommand,
+    /// Server administration.
+    Admin,
 }
 
 /// Per-connection application callbacks (Gumdrop `FTPConnectionHandler`).
@@ -79,6 +92,21 @@ pub trait FtpConnectionHandler: Send {
     ) -> bool {
         true
     }
+
+    /// Application-defined `SITE` subcommand (e.g. `SITE CHMOD`, `SITE
+    /// DISK`). `command` is the text after `SITE `, raw. The default
+    /// reports [`crate::server::fs::FtpFileOpResult::NotSupported`] (502).
+    fn handle_site_command(
+        &mut self,
+        _command: &str,
+        _meta: &FtpConnectionMetadata,
+    ) -> crate::server::fs::FtpFileOpResult {
+        crate::server::fs::FtpFileOpResult::NotSupported
+    }
+
+    /// Notifies that the client connection has closed (QUIT or an abrupt
+    /// disconnect) — final cleanup / stats point.
+    fn disconnected(&mut self, _meta: &FtpConnectionMetadata) {}
 }
 
 /// Factory for per-control-connection handlers.

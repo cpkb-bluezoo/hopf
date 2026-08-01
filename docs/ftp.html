@@ -143,7 +143,7 @@
 <h3 id="transfer-parameters">Transfer parameters</h3>
 <p>PORT, PASV, EPRT, EPSV, TYPE (<code>A</code> / <code>I</code>), STRU (<code>F</code> only), MODE (<code>S</code> only)</p>
 <h3 id="service-commands">Service commands</h3>
-<p>RETR, STOR, STOU, APPE, ALLO (<code>202</code>), REST, ABOR, DELE, RMD / XRMD, MKD / XMKD, PWD / XPWD, LIST, NLST, STAT, HELP, NOOP, SYST, RNFR / RNTO</p>
+<p>RETR, STOR, STOU (server-generated unique name, actually unique per call — see <code>FtpFileSystem::generate_unique_name</code>), APPE, ALLO (<code>202</code>), REST, ABOR, DELE, RMD / XRMD, MKD / XMKD, PWD / XPWD, LIST, NLST, STAT, HELP, NOOP, SYST, RNFR / RNTO, SITE (dispatched to <code>FtpConnectionHandler::handle_site_command</code>; <code>502</code> by default)</p>
 <h3 id="extensions">Extensions</h3>
 <table>
 <thead>
@@ -187,7 +187,7 @@
 </tr>
 </tbody>
 </table>
-<p><strong>Rejected / not implemented:</strong> CCC, SITE, SMNT (appropriate error replies).</p>
+<p><strong>Rejected / not implemented:</strong> CCC, SMNT (appropriate error replies).</p>
 <h3 id="data-connection-modes">Data connection modes</h3>
 <ul>
 <li><strong>Active (PORT / EPRT)</strong> — server connects to the client-specified address. Bounce protection rejects PORT targets that are not the control peer unless <code>allow_active_bounce</code> is set.</li>
@@ -430,16 +430,22 @@ S: 200 Protection level set to P</code></pre>
 <span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> file_system(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> meta<span class="op">:</span> <span class="op">&amp;</span>FtpConnectionMetadata) <span class="op">-&gt;</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> FtpFileSystem<span class="op">;</span></span>
 <span id="cb6-11"><a href="#cb6-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> is_authorized(</span>
 <span id="cb6-12"><a href="#cb6-12" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span><span class="kw">self</span><span class="op">,</span></span>
-<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        op<span class="op">:</span> FtpOperation<span class="op">,</span> <span class="co">// Read | Write | Delete</span></span>
+<span id="cb6-13"><a href="#cb6-13" aria-hidden="true" tabindex="-1"></a>        op<span class="op">:</span> FtpOperation<span class="op">,</span> <span class="co">// Read | Write | Delete | CreateDir | DeleteDir | Rename | Navigate | SiteCommand | Admin</span></span>
 <span id="cb6-14"><a href="#cb6-14" aria-hidden="true" tabindex="-1"></a>        path<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span></span>
 <span id="cb6-15"><a href="#cb6-15" aria-hidden="true" tabindex="-1"></a>        meta<span class="op">:</span> <span class="op">&amp;</span>FtpConnectionMetadata<span class="op">,</span></span>
 <span id="cb6-16"><a href="#cb6-16" aria-hidden="true" tabindex="-1"></a>    ) <span class="op">-&gt;</span> <span class="dt">bool</span><span class="op">;</span></span>
-<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
-<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> FtpConnectionHandlerFactory<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
-<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> create(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> FtpConnectionHandler<span class="op">&gt;;</span></span>
-<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
-<p><code>FtpConnectionMetadata</code>: <code>peer</code>, <code>local</code>, <code>user</code>, <code>tls</code>.</p>
+<span id="cb6-17"><a href="#cb6-17" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> handle_site_command(</span>
+<span id="cb6-18"><a href="#cb6-18" aria-hidden="true" tabindex="-1"></a>        <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span></span>
+<span id="cb6-19"><a href="#cb6-19" aria-hidden="true" tabindex="-1"></a>        command<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span><span class="op">,</span></span>
+<span id="cb6-20"><a href="#cb6-20" aria-hidden="true" tabindex="-1"></a>        meta<span class="op">:</span> <span class="op">&amp;</span>FtpConnectionMetadata<span class="op">,</span></span>
+<span id="cb6-21"><a href="#cb6-21" aria-hidden="true" tabindex="-1"></a>    ) <span class="op">-&gt;</span> FtpFileOpResult<span class="op">;</span> <span class="co">// default: NotSupported (502)</span></span>
+<span id="cb6-22"><a href="#cb6-22" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> disconnected(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> meta<span class="op">:</span> <span class="op">&amp;</span>FtpConnectionMetadata)<span class="op">;</span> <span class="co">// default: no-op</span></span>
+<span id="cb6-23"><a href="#cb6-23" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
+<span id="cb6-24"><a href="#cb6-24" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb6-25"><a href="#cb6-25" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> FtpConnectionHandlerFactory<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
+<span id="cb6-26"><a href="#cb6-26" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> create(<span class="op">&amp;</span><span class="kw">self</span>) <span class="op">-&gt;</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> FtpConnectionHandler<span class="op">&gt;;</span></span>
+<span id="cb6-27"><a href="#cb6-27" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
+<p><code>FtpConnectionMetadata</code>: <code>peer</code>, <code>local</code>, <code>user</code>, <code>tls</code>. <code>is_authorized</code> now gates CWD/CDUP (<code>Navigate</code>), MKD (<code>CreateDir</code>), RMD (<code>DeleteDir</code>), and RNFR (<code>Rename</code>) in addition to RETR/LIST (<code>Read</code>), STOR/APPE/STOU (<code>Write</code>), and DELE (<code>Delete</code>); <code>SiteCommand</code>/<code>Admin</code> are available for handlers to use from within <code>handle_site_command</code> itself (the framework doesn't auto-gate SITE, matching Gumdrop).</p>
 <h2 id="client">Client</h2>
 <p>Callback-driven <code>FtpClient</code> on an <code>Arc&lt;Runtime&gt;</code>. DNS (when needed) and the control/data session run on worker reactors; <code>connect</code> returns immediately. Drive the session with an <code>FtpPipeline</code> — stock pipelines <code>FtpGet</code> (RETR) and <code>FtpPut</code> (STOR).</p>
 <h3 id="ftpclienttimeouts"><code>FtpClientTimeouts</code></h3>
@@ -578,9 +584,9 @@ S: 200 Protection level set to P</code></pre>
 </table>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>SITE, CCC, and SMNT are not implemented (rejected).</li>
+<li>CCC and SMNT are not implemented (rejected); SITE is dispatched to the application (<code>FtpConnectionHandler::handle_site_command</code>, <code>502</code> by default — no subcommands are built in).</li>
 <li>Stock examples are cleartext; FTPS is available via API + <a href="tls.html"><code>tls.md</code></a> but not wired in the demo binaries.</li>
-<li>No Gumdrop-style SITE quota / RBAC beyond <code>TrustPolicy</code> + <code>is_authorized</code>.</li>
+<li>No Gumdrop-style quota subsystem (<code>QuotaManager</code>/<code>canStore</code>/<code>recordBytesAdded</code>) or transfer-progress hooks (<code>transferStarting</code>/<code>transferProgress</code>/<code>transferCompleted</code>) yet — RBAC itself is covered via the 9-variant <code>FtpOperation</code> + <code>is_authorized</code>.</li>
 <li>Client completion is callback-driven — callers wait on their own signalling (see <code>examples/ftp-get</code>).</li>
 </ul>
 
