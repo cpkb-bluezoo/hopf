@@ -14,12 +14,14 @@ use std::time::{Duration, Instant};
 
 use hopf_auth::PasswordTrustPolicy;
 use hopf_core::{Runtime, RuntimeConfig};
+use hopf_quota::QuotaManager as _;
 
 use crate::{
-    BasicFtpFileSystem, FtpAbortHandle, FtpAuthResult, FtpClient, FtpClientTimeouts,
-    FtpConnectionHandler, FtpConnectionHandlerFactory, FtpConnectionMetadata, FtpError,
-    FtpFileOpResult, FtpFileSystem, FtpGet, FtpOperation, FtpPipeline, FtpPut, FtpSessionWrite,
-    FtpStorHandle, FtpConfig, FtpService, MessageReceiveCallback, StorReady,
+    BasicFtpFileSystem, DirectoryChange, FtpAbortHandle, FtpAuthResult, FtpClient,
+    FtpClientTimeouts, FtpConnectionHandler, FtpConnectionHandlerFactory, FtpConnectionMetadata,
+    FtpError, FtpFileInfo, FtpFileOpResult, FtpFileSystem, FtpGet, FtpOperation, FtpPipeline,
+    FtpPut, FtpSessionWrite, FtpStorHandle, FtpConfig, FtpService, MessageReceiveCallback,
+    StorReady, TransferObserver, UniqueName,
 };
 
 // ---------------------------------------------------------------------------
@@ -815,6 +817,8 @@ struct AuthzTestHandler {
     fs: BasicFtpFileSystem,
     denied: FtpOperation,
     disconnected: Arc<Mutex<bool>>,
+    observer: Option<Arc<dyn TransferObserver>>,
+    quota: Option<Arc<dyn hopf_quota::QuotaManager>>,
 }
 
 impl FtpConnectionHandler for AuthzTestHandler {
@@ -855,12 +859,22 @@ impl FtpConnectionHandler for AuthzTestHandler {
     fn disconnected(&mut self, _meta: &FtpConnectionMetadata) {
         *self.disconnected.lock().unwrap() = true;
     }
+
+    fn transfer_observer(&self, _meta: &FtpConnectionMetadata) -> Option<Arc<dyn TransferObserver>> {
+        self.observer.clone()
+    }
+
+    fn quota_manager(&self) -> Option<Arc<dyn hopf_quota::QuotaManager>> {
+        self.quota.clone()
+    }
 }
 
 struct AuthzTestHandlerFactory {
     root: std::path::PathBuf,
     denied: FtpOperation,
     disconnected: Arc<Mutex<bool>>,
+    observer: Option<Arc<dyn TransferObserver>>,
+    quota: Option<Arc<dyn hopf_quota::QuotaManager>>,
 }
 
 impl FtpConnectionHandlerFactory for AuthzTestHandlerFactory {
@@ -869,6 +883,8 @@ impl FtpConnectionHandlerFactory for AuthzTestHandlerFactory {
             fs: BasicFtpFileSystem::new(&self.root, false).unwrap(),
             denied: self.denied,
             disconnected: Arc::clone(&self.disconnected),
+            observer: self.observer.clone(),
+            quota: self.quota.clone(),
         })
     }
 }
@@ -878,6 +894,16 @@ fn start_server_with_authz(
     denied: FtpOperation,
     disconnected: Arc<Mutex<bool>>,
 ) -> (Arc<Runtime>, SocketAddr) {
+    start_server_with_authz_ext(root, denied, disconnected, None, None)
+}
+
+fn start_server_with_authz_ext(
+    root: &std::path::Path,
+    denied: FtpOperation,
+    disconnected: Arc<Mutex<bool>>,
+    observer: Option<Arc<dyn TransferObserver>>,
+    quota: Option<Arc<dyn hopf_quota::QuotaManager>>,
+) -> (Arc<Runtime>, SocketAddr) {
     let policy = PasswordTrustPolicy::default(); // unused: AuthzTestHandler authenticates itself
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let config = FtpConfig::new(listen, root, policy.shared());
@@ -885,6 +911,8 @@ fn start_server_with_authz(
         root: root.to_path_buf(),
         denied,
         disconnected,
+        observer,
+        quota,
     });
     let service = FtpService::with_handler_factory(config, factory);
     let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
@@ -977,4 +1005,266 @@ fn disconnected_notifies_the_application_handler() {
         assert!(Instant::now() < deadline, "disconnected() did not fire within 2s");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Transfer progress hooks + quota enforcement
+// ---------------------------------------------------------------------------
+
+/// Records every [`TransferObserver`] call it sees, for assertions.
+#[derive(Default)]
+struct RecordingObserver {
+    events: Mutex<Vec<String>>,
+}
+
+impl TransferObserver for RecordingObserver {
+    fn transfer_progress(&self, path: &str, upload: bool, data: &[u8], total_transferred: u64) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("progress:{path}:{upload}:{}:{total_transferred}", data.len()));
+    }
+
+    fn transfer_completed(&self, path: &str, upload: bool, total_transferred: u64, success: bool) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("completed:{path}:{upload}:{total_transferred}:{success}"));
+    }
+}
+
+#[test]
+fn transfer_observer_sees_progress_and_completion_for_upload_and_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let observer: Arc<RecordingObserver> = Arc::new(RecordingObserver::default());
+    let (rt, bound) = start_server_with_authz_ext(
+        dir.path(),
+        FtpOperation::Admin,
+        Arc::new(Mutex::new(false)),
+        Some(observer.clone() as Arc<dyn TransferObserver>),
+        None,
+    );
+
+    run_put(&rt, bound, "/up.txt", b"hello world".to_vec()).unwrap();
+    let got = run_get(&rt, bound, "/up.txt").unwrap();
+    assert_eq!(got, b"hello world");
+
+    let events = observer.events.lock().unwrap();
+    assert!(
+        events.iter().any(|e| e.starts_with("progress:/up.txt:true:")),
+        "expected upload progress events, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e == "completed:/up.txt:true:11:true"),
+        "expected a successful upload completion event, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e.starts_with("progress:/up.txt:false:")),
+        "expected download progress events, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e == "completed:/up.txt:false:11:true"),
+        "expected a successful download completion event, got {events:?}"
+    );
+}
+
+#[test]
+fn quota_blocks_upload_once_a_user_is_already_over_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let quota = Arc::new(hopf_quota::MemoryQuotaManager::new());
+    quota.set_user_quota("u", 10, -1);
+    quota.record_bytes_added("u", 10); // already at the limit
+
+    let (rt, bound) = start_server_with_authz_ext(
+        dir.path(),
+        FtpOperation::Admin,
+        Arc::new(Mutex::new(false)),
+        None,
+        Some(quota as Arc<dyn hopf_quota::QuotaManager>),
+    );
+
+    let err = run_put(&rt, bound, "/blocked.txt", b"more data".to_vec()).unwrap_err();
+    let _ = err; // exact FtpError shape isn't the point — it must fail
+    assert!(
+        !dir.path().join("blocked.txt").exists(),
+        "a quota-blocked upload must not create the file"
+    );
+}
+
+#[test]
+fn quota_usage_is_recorded_on_upload_and_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let quota = Arc::new(hopf_quota::MemoryQuotaManager::new());
+    quota.set_user_quota("u", 1_000_000, -1);
+    let quota_dyn: Arc<dyn hopf_quota::QuotaManager> = quota.clone();
+
+    let (rt, bound) = start_server_with_authz_ext(
+        dir.path(),
+        FtpOperation::Admin,
+        Arc::new(Mutex::new(false)),
+        None,
+        Some(quota_dyn),
+    );
+
+    run_put(&rt, bound, "/tracked.txt", b"0123456789".to_vec()).unwrap();
+    assert_eq!(quota.get_quota("u").storage_used(), 10);
+
+    let mut ctrl = raw_login(bound);
+    let r = raw_cmd(&mut ctrl, "DELE /tracked.txt\r\n");
+    assert!(r.starts_with("250"), "DELE: {r}");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while quota.get_quota("u").storage_used() != 0 {
+        assert!(Instant::now() < deadline, "usage was never decremented after DELE");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ALLO -> FtpFileSystem::allocate_space
+// ---------------------------------------------------------------------------
+
+/// Delegates everything to a [`BasicFtpFileSystem`] except `allocate_space`,
+/// which rejects anything over `max` — proof the ALLO hook is real, not
+/// just always-succeeding.
+struct AllocRejectingFs {
+    inner: BasicFtpFileSystem,
+    max: u64,
+}
+
+impl FtpFileSystem for AllocRejectingFs {
+    fn list_directory(&self, path: &str, meta: &FtpConnectionMetadata) -> Option<Vec<FtpFileInfo>> {
+        self.inner.list_directory(path, meta)
+    }
+    fn change_directory(&self, path: &str, cwd: &str, meta: &FtpConnectionMetadata) -> DirectoryChange {
+        self.inner.change_directory(path, cwd, meta)
+    }
+    fn file_info(&self, path: &str, meta: &FtpConnectionMetadata) -> Option<FtpFileInfo> {
+        self.inner.file_info(path, meta)
+    }
+    fn mkdir(&self, path: &str, meta: &FtpConnectionMetadata) -> FtpFileOpResult {
+        self.inner.mkdir(path, meta)
+    }
+    fn rmdir(&self, path: &str, meta: &FtpConnectionMetadata) -> FtpFileOpResult {
+        self.inner.rmdir(path, meta)
+    }
+    fn delete(&self, path: &str, meta: &FtpConnectionMetadata) -> FtpFileOpResult {
+        self.inner.delete(path, meta)
+    }
+    fn rename(&self, from: &str, to: &str, meta: &FtpConnectionMetadata) -> FtpFileOpResult {
+        self.inner.rename(from, to, meta)
+    }
+    fn resolve(&self, path: &str, cwd: &str) -> String {
+        self.inner.resolve(path, cwd)
+    }
+    fn open_read(
+        &self,
+        path: &str,
+        restart: u64,
+        meta: &FtpConnectionMetadata,
+    ) -> Result<Box<dyn io::Read + Send>, FtpFileOpResult> {
+        self.inner.open_read(path, restart, meta)
+    }
+    fn open_write(
+        &self,
+        path: &str,
+        append: bool,
+        restart: u64,
+        meta: &FtpConnectionMetadata,
+    ) -> Result<Box<dyn io::Write + Send>, FtpFileOpResult> {
+        self.inner.open_write(path, append, restart, meta)
+    }
+    fn generate_unique_name(
+        &self,
+        base: &str,
+        suggested: Option<&str>,
+        meta: &FtpConnectionMetadata,
+    ) -> UniqueName {
+        self.inner.generate_unique_name(base, suggested, meta)
+    }
+    fn allocate_space(&self, _path: &str, size: u64, _meta: &FtpConnectionMetadata) -> FtpFileOpResult {
+        if size > self.max {
+            FtpFileOpResult::Failed
+        } else {
+            FtpFileOpResult::Ok
+        }
+    }
+}
+
+struct AllocHandler {
+    fs: AllocRejectingFs,
+}
+
+impl FtpConnectionHandler for AllocHandler {
+    fn authenticate(
+        &mut self,
+        username: &str,
+        password: Option<&str>,
+        _account: Option<&str>,
+        _meta: &FtpConnectionMetadata,
+    ) -> FtpAuthResult {
+        match password {
+            None => FtpAuthResult::NeedPassword,
+            Some(p) if username == "u" && p == "p" => FtpAuthResult::Success,
+            Some(_) => FtpAuthResult::Failed,
+        }
+    }
+
+    fn file_system(&mut self, _meta: &FtpConnectionMetadata) -> &mut dyn FtpFileSystem {
+        &mut self.fs
+    }
+}
+
+struct AllocHandlerFactory {
+    root: std::path::PathBuf,
+    max: u64,
+}
+
+impl FtpConnectionHandlerFactory for AllocHandlerFactory {
+    fn create(&self) -> Box<dyn FtpConnectionHandler> {
+        Box::new(AllocHandler {
+            fs: AllocRejectingFs {
+                inner: BasicFtpFileSystem::new(&self.root, false).unwrap(),
+                max: self.max,
+            },
+        })
+    }
+}
+
+fn start_server_with_alloc_cap(root: &std::path::Path, max: u64) -> (Arc<Runtime>, SocketAddr) {
+    let policy = PasswordTrustPolicy::default(); // unused: AllocHandler authenticates itself
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = FtpConfig::new(listen, root, policy.shared());
+    let factory = Arc::new(AllocHandlerFactory {
+        root: root.to_path_buf(),
+        max,
+    });
+    let service = FtpService::with_handler_factory(config, factory);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+    (rt, bound)
+}
+
+#[test]
+fn allo_defaults_to_a_no_op_success() {
+    // The default FtpFileSystem::allocate_space is a no-op success
+    // (matches Gumdrop's own default), so a stock server accepts any ALLO.
+    let dir = tempfile::tempdir().unwrap();
+    let (_rt, bound) = start_server(dir.path());
+    let mut ctrl = raw_login(bound);
+    let r = raw_cmd(&mut ctrl, "ALLO 999999999\r\n");
+    assert!(r.starts_with("202"), "ALLO: {r}");
+}
+
+#[test]
+fn allo_is_dispatched_to_the_file_system_hook() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_rt, bound) = start_server_with_alloc_cap(dir.path(), 100);
+    let mut ctrl = raw_login(bound);
+
+    let r = raw_cmd(&mut ctrl, "ALLO 50\r\n");
+    assert!(r.starts_with("202"), "ALLO under cap should succeed: {r}");
+
+    let r = raw_cmd(&mut ctrl, "ALLO 500\r\n");
+    assert!(r.starts_with("552"), "ALLO over cap should be rejected: {r}");
 }

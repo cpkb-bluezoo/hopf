@@ -45,6 +45,7 @@
 </ul>
 <h2>Cross-cutting</h2><ul>
 <li><a href="auth.html">Auth</a></li>
+<li><a href="quota.html">Quota</a></li>
 <li><a href="access-control.html">Access control</a></li>
 <li><a href="telemetry.html">Telemetry</a></li>
 </ul>
@@ -131,7 +132,7 @@
 </tr>
 <tr>
 <td><code>QUOTA</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc9208">RFC 9208</a> — <code>GETQUOTA</code> / <code>GETQUOTAROOT</code> / <code>SETQUOTA</code> via pluggable <code>QuotaManager</code> (default unlimited)</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc9208">RFC 9208</a> — <code>GETQUOTA</code> / <code>GETQUOTAROOT</code> / <code>SETQUOTA</code> via pluggable <code>QuotaManager</code> (default unlimited). The stock <code>MemoryQuotaManager</code> is an adapter over a shared <a href="quota.html"><code>hopf_quota::QuotaManager</code></a> — the same backend an <code>hopf-ftp</code> service can enforce against, so a user's mailbox and FTP storage can share one real quota instead of two independent trackers.</td>
 </tr>
 <tr>
 <td>Auth</td>

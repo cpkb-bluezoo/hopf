@@ -24,6 +24,7 @@ hopf-core = { workspace = true }
 hopf-dns = { workspace = true }
 hopf-tls = { workspace = true }
 hopf-auth = { workspace = true }
+hopf-quota = { workspace = true }
 hopf-mailbox = { workspace = true }
 hopf-otel = { workspace = true }
 rmimeparser = { workspace = true }

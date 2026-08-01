@@ -130,6 +130,23 @@ pub trait FtpFileSystem: Send {
         suggested: Option<&str>,
         meta: &FtpConnectionMetadata,
     ) -> UniqueName;
+
+    /// Reserve `size` bytes ahead of an upload (ALLO). `path` is always
+    /// empty — RFC 959's ALLO carries only a byte count, no path; there is
+    /// no association with whatever STOR follows it. Most backends can
+    /// ignore this: the default treats ALLO as a successful no-op, matching
+    /// Gumdrop's own default and every other FTP server's usual behavior.
+    /// Override to reject upfront when `size` obviously can't fit (e.g.
+    /// against a quota or free-space check).
+    fn allocate_space(
+        &self,
+        path: &str,
+        size: u64,
+        meta: &FtpConnectionMetadata,
+    ) -> FtpFileOpResult {
+        let _ = (path, size, meta);
+        FtpFileOpResult::Ok
+    }
 }
 
 /// Chrooted local filesystem backend.

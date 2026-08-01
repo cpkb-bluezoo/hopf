@@ -107,8 +107,9 @@ pub enum FtpCommand {
     Prot(Vec<u8>),
     /// `CCC` (not supported; argument ignored)
     Ccc,
-    /// `ALLO` (not required; argument ignored)
-    Allo,
+    /// `ALLO` (declared byte count; dispatched to
+    /// [`crate::server::fs::FtpFileSystem::allocate_space`])
+    Allo(Vec<u8>),
     /// `SITE` (application-defined subcommand; dispatched to
     /// [`crate::server::handler::FtpConnectionHandler::handle_site_command`])
     Site(Vec<u8>),
@@ -155,7 +156,8 @@ impl FtpCommand {
             | Self::Auth(b)
             | Self::Pbsz(b)
             | Self::Prot(b)
-            | Self::Site(b) => Some(b),
+            | Self::Site(b)
+            | Self::Allo(b) => Some(b),
             _ => None,
         }
     }
@@ -333,7 +335,7 @@ fn build_command(verb: &str, arg: Vec<u8>) -> FtpCommand {
         "PBSZ" => FtpCommand::Pbsz(arg),
         "PROT" => FtpCommand::Prot(arg),
         "CCC" => FtpCommand::Ccc,
-        "ALLO" => FtpCommand::Allo,
+        "ALLO" => FtpCommand::Allo(arg),
         "SITE" => FtpCommand::Site(arg),
         "SMNT" => FtpCommand::Smnt,
         _ => FtpCommand::Unknown { verb: verb.to_string() },
@@ -421,7 +423,7 @@ mod tests {
                 FtpCommand::Stou,
                 FtpCommand::Abor,
                 FtpCommand::Ccc,
-                FtpCommand::Allo,
+                FtpCommand::Allo(Vec::new()),
                 FtpCommand::Site(Vec::new()),
                 FtpCommand::Smnt,
             ]

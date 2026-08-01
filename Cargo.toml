@@ -8,6 +8,7 @@ members = [
     "crates/hopf-quic",
     "crates/hopf-dns",
     "crates/hopf-auth",
+    "crates/hopf-quota",
     "crates/hopf-otel",
     "crates/hopf-webdav",
     "crates/hopf-websocket",
@@ -49,6 +50,7 @@ default-members = [
     "crates/hopf-quic",
     "crates/hopf-dns",
     "crates/hopf-auth",
+    "crates/hopf-quota",
     "crates/hopf-otel",
     "crates/hopf-webdav",
     "crates/hopf-websocket",
@@ -89,6 +91,7 @@ hopf-http = { version = "0.2.0", path = "crates/hopf-http" }
 hopf-quic = { version = "0.2.0", path = "crates/hopf-quic" }
 hopf-dns = { version = "0.2.0", path = "crates/hopf-dns" }
 hopf-auth = { version = "0.2.0", path = "crates/hopf-auth" }
+hopf-quota = { version = "0.2.0", path = "crates/hopf-quota" }
 hopf-otel = { version = "0.2.0", path = "crates/hopf-otel" }
 hopf-webdav = { version = "0.2.0", path = "crates/hopf-webdav" }
 hopf-websocket = { version = "0.2.0", path = "crates/hopf-websocket" }
