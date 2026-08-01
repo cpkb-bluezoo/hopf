@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use hopf_auth::plain::parse_credentials;
+use hopf_auth::{create_server, SaslMechanism, SaslServer, SaslServerOptions, SaslServerStep};
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
 use hopf_mailbox::{Mailbox, MailboxStore};
 
@@ -87,8 +87,10 @@ pub(crate) struct PendingOpen {
     pub kind: PendingKind,
 }
 
-enum PendingAuth {
-    Plain { tag: String },
+/// One AUTHENTICATE exchange awaiting the next base64 continuation line.
+struct PendingAuth {
+    tag: String,
+    server: Box<dyn SaslServer>,
 }
 
 /// Per-connection IMAP protocol state machine.
@@ -602,43 +604,97 @@ impl ImapControlHandler {
             return;
         }
         let mut parts = cmd.args.split_whitespace();
-        let Some(mech) = parts.next() else {
+        let Some(mech_name) = parts.next() else {
             self.send(endpoint, tagged_bad(&cmd.tag, "Missing mechanism"));
             return;
         };
-        if !mech.eq_ignore_ascii_case("PLAIN") {
+        let Some(mech) = SaslMechanism::from_name(mech_name) else {
             self.send(endpoint, tagged_no(&cmd.tag, "Unsupported mechanism"));
             return;
+        };
+        if mech.requires_tls() && !self.tls {
+            self.send(
+                endpoint,
+                tagged_no(
+                    &cmd.tag,
+                    "[PRIVACYREQUIRED] Encryption required for requested authentication mechanism",
+                ),
+            );
+            return;
         }
-        if let Some(ir) = parts.next() {
-            if ir == "=" {
-                // RFC 4959 SASL-IR: a bare "=" is an explicit *empty* initial
-                // response, fed straight to the mechanism — not "no response
-                // yet" (that's the `None` arm below, which prompts for one).
-                self.complete_plain(endpoint, &cmd.tag, &[]);
-                return;
+        let opts = SaslServerOptions {
+            hostname: self.config.hostname.clone(),
+            realm: self.config.hostname.clone(),
+            peer_certificate: None,
+            channel_binding: None,
+        };
+        let mut server = create_server(mech, Arc::clone(&self.config.store), opts);
+
+        let initial_response = match parts.next() {
+            // RFC 4959 SASL-IR: a bare "=" is an explicit *empty* initial
+            // response, fed straight to the mechanism — not "no response
+            // yet" (the `None` arm below, which prompts for one).
+            Some("=") => Some(Vec::new()),
+            Some(ir) => match base64::decode(ir) {
+                Ok(raw) => Some(raw),
+                Err(_) => {
+                    self.send(endpoint, tagged_no(&cmd.tag, "Invalid base64"));
+                    return;
+                }
+            },
+            None => None,
+        };
+
+        if server.server_first() && initial_response.is_none() {
+            // A server-first mechanism (e.g. CRAM-MD5) must send its
+            // challenge before any client response exists to step on —
+            // "complete" on this very first step would mean the mechanism
+            // authenticated nobody, so treat it as failure, not success.
+            match server.step(None) {
+                SaslServerStep::Challenge(c) => {
+                    self.send(endpoint, continuation(&base64::encode(&c)));
+                    self.pending_auth = Some(PendingAuth { tag: cmd.tag, server });
+                    self.lexer.expect_sasl_response();
+                }
+                SaslServerStep::Complete { .. } | SaslServerStep::Failure => {
+                    self.auth_failed(endpoint, &cmd.tag);
+                }
             }
-            match base64::decode(ir) {
-                Ok(raw) => self.complete_plain(endpoint, &cmd.tag, &raw),
-                Err(_) => self.send(endpoint, tagged_no(&cmd.tag, "Invalid base64")),
+            return;
+        }
+        self.sasl_step(endpoint, cmd.tag, server, initial_response.as_deref());
+    }
+
+    fn sasl_step(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        tag: String,
+        mut server: Box<dyn SaslServer>,
+        response: Option<&[u8]>,
+    ) {
+        match server.step(response) {
+            SaslServerStep::Challenge(c) => {
+                self.send(endpoint, continuation(&base64::encode(&c)));
+                self.pending_auth = Some(PendingAuth { tag, server });
+                self.lexer.expect_sasl_response();
             }
-        } else {
-            self.pending_auth = Some(PendingAuth::Plain { tag: cmd.tag });
-            self.lexer.expect_sasl_response();
-            self.send(endpoint, continuation(""));
+            SaslServerStep::Complete { username, final_message } => {
+                if let Some(fm) = final_message {
+                    if !fm.is_empty() {
+                        self.send(endpoint, continuation(&base64::encode(&fm)));
+                    }
+                }
+                self.finish_auth(endpoint, &tag, username);
+            }
+            SaslServerStep::Failure => {
+                self.auth_failed(endpoint, &tag);
+            }
         }
     }
 
-    fn complete_plain(&mut self, endpoint: &mut dyn Endpoint, tag: &str, raw: &[u8]) {
-        let Some((_, authcid, password)) = parse_credentials(raw) else {
-            self.send(endpoint, tagged_no(tag, "Invalid PLAIN credentials"));
-            return;
-        };
-        if !self.config.store.password_match(&authcid, &password) {
-            self.send(endpoint, tagged_no(tag, "Invalid credentials"));
-            return;
-        }
-        self.finish_auth(endpoint, tag, authcid);
+    fn auth_failed(&mut self, endpoint: &mut dyn Endpoint, tag: &str) {
+        self.pending_auth = None;
+        self.send(endpoint, tagged_no(tag, "Authentication failed"));
     }
 
     fn finish_auth(&mut self, endpoint: &mut dyn Endpoint, tag: &str, username: String) {
@@ -1377,7 +1433,7 @@ impl ImapControlHandler {
     }
 
     fn feed_auth_line(&mut self, endpoint: &mut dyn Endpoint, line: &[u8]) {
-        let Some(PendingAuth::Plain { tag }) = self.pending_auth.take() else {
+        let Some(PendingAuth { tag, server }) = self.pending_auth.take() else {
             return;
         };
         if line == b"*" {
@@ -1388,7 +1444,7 @@ impl ImapControlHandler {
             .ok()
             .and_then(|s| base64::decode(s).ok())
         {
-            Some(raw) => self.complete_plain(endpoint, &tag, &raw),
+            Some(raw) => self.sasl_step(endpoint, tag, server, Some(&raw)),
             None => self.send(endpoint, tagged_no(&tag, "Invalid base64")),
         }
     }

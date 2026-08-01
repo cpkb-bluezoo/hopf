@@ -136,7 +136,7 @@
 </tr>
 <tr>
 <td>Auth</td>
-<td><code>CredentialStore</code> — LOGIN and AUTHENTICATE PLAIN (SASL-IR); <code>LOGINDISABLED</code> before STARTTLS</td>
+<td><code>CredentialStore</code> — LOGIN and AUTHENTICATE (all 7 <a href="auth.html">hopf-auth</a> SASL mechanisms: PLAIN, LOGIN, CRAM-MD5, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL — SASL-IR, capability advertisement via <code>store.supported_mechanisms()</code> filtered by TLS requirement); <code>LOGINDISABLED</code> before STARTTLS</td>
 </tr>
 <tr>
 <td>TLS</td>
@@ -312,7 +312,7 @@ ImapClient::new(&quot;mail.example.com&quot;, 143)
 <p>They cover raw-socket LOGIN/SELECT/FETCH/APPEND, pipelined STATUS+LIST (in-order against the Hopf server and synthetic out-of-order against a scripted server), STARTTLS and implicit-TLS fetch, hostname dial, and IDLE (server DONE handling plus client EXISTS→DONE).</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>AUTHENTICATE mechanisms beyond PLAIN are not implemented (use TLS + PLAIN).</li>
+<li>The <code>ImapFetch</code>/<code>ImapIdle</code> auto-pilots only drive AUTHENTICATE PLAIN themselves (same scope limit as hopf-pop3's auto-pilot) — a custom driver is needed to exercise LOGIN/CRAM-MD5/DIGEST-MD5/SCRAM-SHA-256/OAUTHBEARER/EXTERNAL from the client side, though the underlying <code>authenticate(mechanism, initial)</code> + <code>ImapClientAuthExchange</code> API is mechanism-agnostic. EXTERNAL isn't reachable end-to-end yet on either side: the TLS layer doesn't plumb a peer certificate through to <code>SaslServerOptions</code>.</li>
 <li>A mailbox handle is a point-in-time snapshot: IDLE reports appends made through the same session’s store, but changes written by other processes are not observed until reselect.</li>
 <li>QRESYNC does not fabricate <code>VANISHED (EARLIER)</code> history; clients fall back to full resync.</li>
 <li>mbox backend: no hierarchy / COPY / MOVE (see <a href="mailbox.html">Mailbox</a>).</li>
