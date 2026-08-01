@@ -34,6 +34,10 @@ pub struct SmtpConnectionMetadata {
     pub smtputf8: bool,
     /// Control-connection handle (for deferred delivery / off-reactor work).
     pub control_handle: Option<hopf_core::ConnHandle>,
+    /// Negotiated TLS parameters (cipher suite, protocol version, peer
+    /// certificate chain for mTLS). [`hopf_core::SecurityInfo::plaintext`]
+    /// until TLS is established.
+    pub security_info: hopf_core::SecurityInfo,
 }
 
 /// Factory for the initial [`SmtpClientConnected`] stage.
@@ -55,7 +59,7 @@ pub trait HelloHandler: Send {
     /// Client greeting.
     fn hello(&mut self, state: &mut dyn HelloState, extended: bool, hostname: &str);
     /// TLS established after STARTTLS (or implicit).
-    fn tls_established(&mut self);
+    fn tls_established(&mut self, info: &hopf_core::SecurityInfo);
     /// SASL completed; decide accept/reject.
     fn authenticated(&mut self, state: &mut dyn AuthenticateState, user: &str);
     /// QUIT.

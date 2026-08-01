@@ -87,6 +87,7 @@ impl SmtpControlHandler {
                 authenticated_user: None,
                 smtputf8: false,
                 control_handle: None,
+                security_info: hopf_core::SecurityInfo::plaintext(),
             },
             config,
             metrics,
@@ -942,6 +943,7 @@ impl ProtocolHandler for SmtpControlHandler {
         }
         if endpoint.is_secure() {
             self.meta.tls = true;
+            self.meta.security_info = endpoint.security_info().clone();
         }
         let handle = endpoint.handle();
         self.control_handle = Some(handle.clone());
@@ -980,10 +982,11 @@ impl ProtocolHandler for SmtpControlHandler {
     fn security_established(
         &mut self,
         endpoint: &mut dyn Endpoint,
-        _info: &hopf_core::SecurityInfo,
+        info: &hopf_core::SecurityInfo,
     ) {
         let first = !self.meta.tls;
         self.meta.tls = true;
+        self.meta.security_info = info.clone();
         if self.expect_implicit_tls && !self.greeting_sent {
             self.maybe_greet(endpoint);
             return;
@@ -994,7 +997,7 @@ impl ProtocolHandler for SmtpControlHandler {
         // STARTTLS completed
         SmtpServerMetrics::add(&self.metrics.starttls, 1);
         if let Some(h) = &mut self.hello {
-            h.tls_established();
+            h.tls_established(info);
         }
         self.session = SmtpSessionState::Initial;
         self.extended = false;
