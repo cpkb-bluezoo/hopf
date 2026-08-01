@@ -24,9 +24,8 @@ hopf-quota = { workspace = true }
 hopf-dns = { workspace = true }
 hopf-tls = { workspace = true }
 hopf-otel = { workspace = true }
-rustls = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 rcgen = { workspace = true }
-rustls-pemfile = { workspace = true }
+rustls = { workspace = true }

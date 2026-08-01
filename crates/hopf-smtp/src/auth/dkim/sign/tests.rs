@@ -33,8 +33,7 @@ const RSA_PKCS8_B64: &str = concat!(
 const ED25519_PKCS8_B64: &str = "MC4CAQAwBQYDK2VwBCIEIJOr3cUYESkwGr3t08+NHi5fO++QEUtI7YDNn9ruV59R";
 
 fn b64_decode(s: &str) -> Vec<u8> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    rmimeparser::charset::base64::decode(s).unwrap()
 }
 
 fn headers() -> Vec<RawHeader> {

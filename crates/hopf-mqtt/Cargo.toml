@@ -32,5 +32,3 @@ hopf-http = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-rcgen = { workspace = true }
-rustls = { workspace = true }

@@ -23,7 +23,7 @@
 //! (the server can drop the connection at any point in the exchange) and
 //! is handled uniformly regardless of what was expected.
 
-use base64::Engine;
+use rmimeparser::charset::base64;
 
 use super::error::SmtpError;
 use super::state::SmtpCapabilities;
@@ -576,9 +576,7 @@ impl SmtpReplyLexer {
             Field::AuthChallengeText => {
                 let text = std::mem::take(&mut self.text);
                 self.state = State::Code { digits: 0, value: 0 };
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(text.trim().as_bytes())
-                    .unwrap_or_default();
+                let data = base64::decode(text.trim()).unwrap_or_default();
                 Ok(Some(SmtpEvent::AuthChallenge { data }))
             }
             Field::QueueIdText => {
