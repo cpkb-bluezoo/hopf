@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quota — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="quota.html" aria-current="page">Quota</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Architecture audit</h2><ul>
+<li><a href="conformance.html">Conformance</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>Quota</h1>
+        <p class="lead">Crate <code>hopf-quota</code>: per-user storage quota tracking (Gumdrop <code>org.bluezoo.gumdrop.quota</code> parity). Tracks how much storage — and, optionally, how many messages — a <em>user</em> has accumulated, independent of which protocol or connection touched their data. The same <code>QuotaManager</code> can back an FTP file store (<a href="ftp.html"><code>hopf-ftp</code></a>) and an IMAP mailbox (<a href="imap.html"><code>hopf-imap</code></a>) at once.</p>
+      </header>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#why-a-separate-crate">Why a separate crate</a></li>
+<li><a href="#core-types">Core types</a></li>
+<li><a href="#resolution-order">Resolution order</a></li>
+<li><a href="#stock-managers">Stock managers</a></li>
+<li><a href="#ftp-integration">FTP integration</a></li>
+<li><a href="#imap-integration">IMAP integration</a></li>
+<li><a href="#sharing-one-quota-across-protocols">Sharing one quota across protocols</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="why-a-separate-crate">Why a separate crate</h2>
+<p>This is easy to confuse with <code>hopf_core::quota</code> (<code>QuotaTracker</code>/<code>CounterQuota</code>) — that's a <em>connection-level</em> traffic/rate limiter (bytes in/out, message count, per connection — closer to DoS protection). <code>hopf-quota</code> is about <em>per-user</em> storage accounting: how many bytes has <code>alice</code> stored across however many connections, over however long, regardless of protocol.</p>
+<h2 id="core-types">Core types</h2>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Quota</code></td>
+<td>Limits + current usage (storage bytes, message count); either limit may be <code>UNLIMITED</code> (<code>-1</code>)</td>
+</tr>
+<tr>
+<td><code>QuotaSource</code></td>
+<td><code>User</code> / <code>Role</code> / <code>Default</code> / <code>None</code> — where a <code>Quota</code>'s limits came from</td>
+</tr>
+<tr>
+<td><code>QuotaManager</code></td>
+<td>Resolve/check/update by username</td>
+</tr>
+<tr>
+<td><code>QuotaPolicy</code></td>
+<td>Named limits (a role, or the system default), with <code>parse_size</code> for human-readable sizes (<code>"100MB"</code>, <code>"10GB"</code>, <code>"1TB"</code>, <code>"unlimited"</code>)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="resolution-order">Resolution order</h2>
+<p><code>QuotaManager::get_quota</code> resolves a user's effective quota with the same priority as Gumdrop's <code>QuotaManager</code>: <strong>user-specific</strong> (<code>set_user_quota</code>) → <strong>role-based</strong> → <strong>system default</strong> → <strong>unlimited</strong>. When a user matches more than one role policy, the most generous storage limit wins.</p>
+<h2 id="stock-managers">Stock managers</h2>
+<table>
+<thead>
+<tr>
+<th>Manager</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>UnlimitedQuotaManager</code></td>
+<td>No limits, ever; usage tracking is a no-op</td>
+</tr>
+<tr>
+<td><code>MemoryQuotaManager</code></td>
+<td>In-process usage tracking; optional role policies + role lookup, optional default policy, per-user overrides</td>
+</tr>
+</tbody>
+</table>
+<p>Usage isn't persisted across restarts by either stock manager. <code>QuotaManager::save_usage_data</code>/<code>load_usage_data</code> are no-op-by-default hooks for an implementation that needs to flush/restore usage explicitly.</p>
+<h2 id="ftp-integration">FTP integration</h2>
+<p><code>FtpConnectionHandler</code> (<a href="ftp.html"><code>hopf-ftp</code></a>) has <code>quota_manager()</code>/<code>can_store</code>/<code>quota</code>/<code>record_bytes_added</code>/<code>record_bytes_removed</code> default methods delegating to whatever <code>quota_manager()</code> returns — matching Gumdrop's <code>FTPConnectionHandler</code>. The stock <code>FilesystemFtpHandler</code>/<code>FilesystemFtpHandlerFactory</code> take an optional manager via <code>with_quota(Arc&lt;dyn QuotaManager&gt;)</code>.</p>
+<p>STOR/APPE/STOU are gated on <code>Quota::is_storage_exceeded</code> before the data connection opens — FTP has no declared-size-ahead-of-time (no <code>ALLO</code> tracking), so this can only reject a user who's <em>already</em> over quota, not pre-empt a specific upload that would push them over. Usage is recorded via the same <code>TransferObserver</code>-carried manager handle once the upload actually completes (see <a href="ftp.html#handler-spi">FTP: Handler SPI</a>), and on <code>DELE</code>.</p>
+<h2 id="imap-integration">IMAP integration</h2>
+<p><code>hopf_imap::server::quota::MemoryQuotaManager</code> is an adapter over a shared <code>hopf_quota::QuotaManager</code>, translating to/from RFC 9208's <code>STORAGE</code> (KiB)/<code>MESSAGE</code> resource view for GETQUOTA/SETQUOTA. It replaces what used to be IMAP's own independent in-memory tracker — see <a href="imap.html">IMAP</a>.</p>
+<h2 id="sharing-one-quota-across-protocols">Sharing one quota across protocols</h2>
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust">let backend: Arc&lt;dyn hopf_quota::QuotaManager&gt; =
+    Arc::new(hopf_quota::MemoryQuotaManager::new()
+        .with_default(hopf_quota::QuotaPolicy::with_storage("default", hopf_quota::QuotaPolicy::parse_size("1GB")?)));
+
+// FTP enforces against the same backend...
+let ftp_handler = FilesystemFtpHandlerFactory::new(root, policy).with_quota(backend.clone());
+
+// ...and so does IMAP's GETQUOTA/SETQUOTA.
+let imap_quota = hopf_imap::server::quota::MemoryQuotaManager::new(backend);
+</code></pre></div>
+<p>An upload through FTP and an APPEND through IMAP for the same user now draw down the same limit.</p>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>No persistence backend is shipped — <code>MemoryQuotaManager</code> is in-process only; wrap or replace <code>QuotaManager</code> for a database/file-backed one.</li>
+<li>No role-membership source is shipped either — <code>MemoryQuotaManager::with_roles</code> takes a plain <code>Fn(&amp;str) -&gt; Vec&lt;String&gt;</code> lookup, since Hopf has no built-in role/group concept (<a href="auth.html"><code>hopf-auth</code></a>'s <code>TrustPolicy</code> is accept/reject only, no roles).</li>
+<li>FTP's quota gate can't check a specific upload's size ahead of time (no <code>ALLO</code> tracking) — see <a href="#ftp-integration">FTP integration</a> above.</li>
+</ul>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

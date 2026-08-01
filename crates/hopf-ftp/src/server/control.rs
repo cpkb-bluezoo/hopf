@@ -13,7 +13,7 @@ use hopf_core::{
 use hopf_core::tls::SharedTlsAcceptor;
 
 use crate::server::codec::{FtpCommand, FtpServerLexer, MAX_COMMAND_LINE};
-use crate::server::data::{DataBridge, FtpDataHandler, OutboundTransfer};
+use crate::server::data::{DataBridge, FtpDataHandler, OutboundTransfer, StorTransfer};
 use crate::server::fs::FtpFileOpResult;
 use crate::server::handler::{
     FtpAuthResult, FtpConnectionHandler, FtpConnectionMetadata, FtpOperation,
@@ -293,7 +293,7 @@ impl FtpControlHandler {
             }
             FtpCommand::Prot(_) => self.cmd_prot(endpoint, arg),
             FtpCommand::Ccc => self.send_reply(endpoint, 533, "CCC not supported"),
-            FtpCommand::Allo => self.send_reply(endpoint, 202, "ALLO not required"),
+            FtpCommand::Allo(_) => self.cmd_allo(endpoint, arg),
             FtpCommand::Site(_) => self.cmd_site(endpoint, arg),
             FtpCommand::Smnt => self.send_reply(endpoint, 502, "Command not implemented"),
             FtpCommand::Unknown { .. } => self.send_reply(endpoint, 502, "Command not implemented"),
@@ -591,9 +591,11 @@ impl FtpControlHandler {
                 return;
             }
         };
+        self.app.transfer_starting(&path, false, None, &self.meta);
+        let observer = self.app.transfer_observer(&self.meta);
         self.send_reply(endpoint, 150, "Opening data connection");
         let bridge = self.ensure_bridge();
-        bridge.queue_outbound(OutboundTransfer::Retr { ascii, reader });
+        bridge.queue_outbound(OutboundTransfer::Retr { ascii, reader, path, observer });
         // Passive binding can go after accept; leave until transfer done / ABOR.
     }
 
@@ -610,6 +612,21 @@ impl FtpControlHandler {
         {
             self.send_reply(endpoint, 550, "Permission denied");
             return;
+        }
+        // Quota gate: FTP has no declared-size-ahead-of-time (no ALLO
+        // tracking), so this can only check "is the user already over
+        // quota", not "would this specific upload push them over" — real
+        // enforcement of the latter would need incremental checks as bytes
+        // stream in, which isn't implemented.
+        if let Some(user) = self.meta.user.clone() {
+            if self
+                .app
+                .quota(&user, &self.meta)
+                .is_some_and(|q| q.is_storage_exceeded())
+            {
+                self.send_reply(endpoint, 552, "Storage quota exceeded");
+                return;
+            }
         }
         if !self.prepare_data(endpoint) {
             return;
@@ -635,8 +652,20 @@ impl FtpControlHandler {
                 return;
             }
         };
+        self.app.transfer_starting(&path, true, None, &self.meta);
+        let observer = self.app.transfer_observer(&self.meta);
+        let quota = self
+            .meta
+            .user
+            .clone()
+            .and_then(|user| self.app.quota_manager().map(|qm| (qm, user)));
         self.send_reply(endpoint, 150, "Opening data connection");
-        self.ensure_bridge().queue_stor(writer);
+        self.ensure_bridge().queue_stor(StorTransfer {
+            path,
+            writer,
+            observer,
+            quota,
+        });
     }
 
     fn cmd_stou(&mut self, endpoint: &mut dyn Endpoint) {
@@ -666,6 +695,25 @@ impl FtpControlHandler {
             FtpFileOpResult::PermissionDenied => self.send_reply(endpoint, 550, "Permission denied"),
             FtpFileOpResult::NotFound => self.send_reply(endpoint, 550, "Not found"),
             _ => self.send_reply(endpoint, 550, "SITE command failed"),
+        }
+    }
+
+    fn cmd_allo(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
+        if !self.require_auth(endpoint) {
+            return;
+        }
+        // RFC 959 §4.1.3: ALLO <SP> <decimal-integer> [<SP> R <SP> <decimal-integer>].
+        // Lenient like the rest of this command's history: a missing or
+        // unparseable count still reaches the hook, just as size 0, rather
+        // than a hard syntax error.
+        let size: u64 = arg
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        match self.app.file_system(&self.meta).allocate_space("", size, &self.meta) {
+            FtpFileOpResult::Ok => self.send_reply(endpoint, 202, "ALLO not required"),
+            _ => self.send_reply(endpoint, 552, "Insufficient storage space"),
         }
     }
 
@@ -809,8 +857,18 @@ impl FtpControlHandler {
             return;
         }
         let path = self.app.file_system(&self.meta).resolve(arg, &self.cwd);
+        let size = self
+            .app
+            .file_system(&self.meta)
+            .file_info(&path, &self.meta)
+            .map(|i| i.size);
         match self.app.file_system(&self.meta).delete(&path, &self.meta) {
-            FtpFileOpResult::Ok => self.send_reply(endpoint, 250, "DELE successful"),
+            FtpFileOpResult::Ok => {
+                if let (Some(size), Some(user)) = (size, self.meta.user.clone()) {
+                    self.app.record_bytes_removed(&user, size, &self.meta);
+                }
+                self.send_reply(endpoint, 250, "DELE successful");
+            }
             _ => self.send_reply(endpoint, 550, "DELE failed"),
         }
     }

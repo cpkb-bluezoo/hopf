@@ -17,10 +17,13 @@ mod utf8;
 pub use ascii::normalize_ascii_newlines;
 pub use codec::{FtpCommand, FtpServerLexer, MAX_COMMAND_LINE};
 pub use control::FtpControlHandler;
-pub use fs::{BasicFtpFileSystem, DirectoryChange, FtpFileInfo, FtpFileOpResult, FtpFileSystem};
+pub use data::StorTransfer;
+pub use fs::{
+    BasicFtpFileSystem, DirectoryChange, FtpFileInfo, FtpFileOpResult, FtpFileSystem, UniqueName,
+};
 pub use handler::{
     FilesystemFtpHandler, FilesystemFtpHandlerFactory, FtpAuthResult, FtpConnectionHandler,
-    FtpConnectionHandlerFactory, FtpConnectionMetadata, FtpOperation,
+    FtpConnectionHandlerFactory, FtpConnectionMetadata, FtpOperation, TransferObserver,
 };
 pub use metrics::FtpServerMetrics;
 pub use reply::{

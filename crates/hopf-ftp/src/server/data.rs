@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, StorageExecutor};
 
 use crate::server::ascii::AsciiNewlineNormalizer;
+use crate::server::handler::TransferObserver;
 use crate::server::metrics::FtpServerMetrics;
 use crate::server::reply::reply;
 
@@ -23,12 +24,29 @@ pub enum OutboundTransfer {
         ascii: bool,
         /// Reader.
         reader: Box<dyn Read + Send>,
+        /// NVFS path (for the transfer observer).
+        path: String,
+        /// Progress/completion observer, if the app wants one.
+        observer: Option<Arc<dyn TransferObserver>>,
     },
     /// Preformatted listing.
     Listing {
         /// Bytes.
         body: Vec<u8>,
     },
+}
+
+/// Everything the data connection needs to drive one STOR/APPE/STOU upload.
+pub struct StorTransfer {
+    /// NVFS path (for the transfer observer / quota accounting).
+    pub path: String,
+    /// Writer to stream bytes into.
+    pub writer: Box<dyn Write + Send>,
+    /// Progress/completion observer, if the app wants one.
+    pub observer: Option<Arc<dyn TransferObserver>>,
+    /// Quota manager + username to record usage against, once the upload
+    /// completes successfully.
+    pub quota: Option<(Arc<dyn hopf_quota::QuotaManager>, String)>,
 }
 
 /// Shared state between control and one data connection.
@@ -40,7 +58,7 @@ struct DataBridgeState {
     data_handle: Option<ConnHandle>,
     control_handle: Option<ConnHandle>,
     outbound: Option<OutboundTransfer>,
-    stor_writer: Option<Box<dyn Write + Send>>,
+    stor: Option<StorTransfer>,
     metrics: Arc<FtpServerMetrics>,
     storage: Arc<StorageExecutor>,
 }
@@ -53,7 +71,7 @@ impl DataBridge {
                 data_handle: None,
                 control_handle: None,
                 outbound: None,
-                stor_writer: None,
+                stor: None,
                 metrics,
                 storage,
                 },
@@ -75,9 +93,9 @@ impl DataBridge {
         self.try_start_outbound();
     }
 
-    /// Queue STOR / APPE writer for the data handler.
-    pub fn queue_stor(&self, writer: Box<dyn Write + Send>) {
-        self.inner.lock().unwrap().stor_writer = Some(writer);
+    /// Queue a STOR / APPE / STOU upload for the data handler.
+    pub fn queue_stor(&self, transfer: StorTransfer) {
+        self.inner.lock().unwrap().stor = Some(transfer);
     }
 
     /// Data peer connected.
@@ -86,9 +104,9 @@ impl DataBridge {
         self.try_start_outbound();
     }
 
-    /// Take STOR writer (data handler).
-    pub fn take_stor_writer(&self) -> Option<Box<dyn Write + Send>> {
-        self.inner.lock().unwrap().stor_writer.take()
+    /// Take the queued STOR transfer (data handler, at arm time).
+    pub fn take_stor_transfer(&self) -> Option<StorTransfer> {
+        self.inner.lock().unwrap().stor.take()
     }
 
     /// Data peer closed.
@@ -137,7 +155,11 @@ impl DataBridge {
         };
 
         match transfer {
-            OutboundTransfer::Retr { ascii, mut reader } => {
+            OutboundTransfer::Retr { ascii, mut reader, path, observer } => {
+                let progress_observer = observer.clone();
+                let progress_path = path.clone();
+                let complete_observer = observer;
+                let complete_path = path;
                 storage.submit_streamed(
                     data.clone(),
                     move |conn: &ConnHandle| {
@@ -157,10 +179,16 @@ impl DataBridge {
                                 norm.feed(&buf[..n], &mut out);
                                 total += out.len() as u64;
                                 if !out.is_empty() {
+                                    if let Some(obs) = &progress_observer {
+                                        obs.transfer_progress(&progress_path, false, &out, total);
+                                    }
                                     conn.send(out);
                                 }
                             } else {
                                 total += n as u64;
+                                if let Some(obs) = &progress_observer {
+                                    obs.transfer_progress(&progress_path, false, &buf[..n], total);
+                                }
                                 conn.send(buf[..n].to_vec());
                             }
                         }
@@ -169,6 +197,9 @@ impl DataBridge {
                             norm.finish(&mut tail);
                             if !tail.is_empty() {
                                 total += tail.len() as u64;
+                                if let Some(obs) = &progress_observer {
+                                    obs.transfer_progress(&progress_path, false, &tail, total);
+                                }
                                 conn.send(tail);
                             }
                         }
@@ -177,12 +208,18 @@ impl DataBridge {
                     move |result| match result {
                         Ok(n) => {
                             FtpServerMetrics::add(&metrics.bytes_out, n);
+                            if let Some(obs) = &complete_observer {
+                                obs.transfer_completed(&complete_path, false, n, true);
+                            }
                             data.close();
                             if let Some(c) = control {
                                 c.send(reply(226, "Transfer complete"));
                             }
                         }
                         Err(_) => {
+                            if let Some(obs) = &complete_observer {
+                                obs.transfer_completed(&complete_path, false, 0, false);
+                            }
                             data.close();
                             if let Some(c) = control {
                                 c.send(reply(426, "Transfer aborted"));
@@ -219,6 +256,9 @@ pub struct FtpDataHandler {
     expected_peer: IpAddr,
     armed: bool,
     stor_writer: Option<Box<dyn Write + Send>>,
+    stor_path: String,
+    stor_observer: Option<Arc<dyn TransferObserver>>,
+    stor_quota: Option<(Arc<dyn hopf_quota::QuotaManager>, String)>,
     stor_bytes: u64,
 }
 
@@ -231,7 +271,26 @@ impl FtpDataHandler {
             expected_peer,
             armed: false,
             stor_writer: None,
+            stor_path: String::new(),
+            stor_observer: None,
+            stor_quota: None,
             stor_bytes: 0,
+        }
+    }
+
+    /// Pull in a queued [`StorTransfer`], if one is waiting and we haven't
+    /// already got one — the data connection can arm (or start receiving,
+    /// for active mode) before the control connection has actually queued
+    /// the transfer, so both [`Self::arm`] and
+    /// [`ProtocolHandler::receive`](ProtocolHandler) retry this.
+    fn take_stor(&mut self) {
+        if self.stor_writer.is_none() {
+            if let Some(t) = self.bridge.take_stor_transfer() {
+                self.stor_path = t.path;
+                self.stor_observer = t.observer;
+                self.stor_quota = t.quota;
+                self.stor_writer = Some(t.writer);
+            }
         }
     }
 
@@ -251,7 +310,7 @@ impl FtpDataHandler {
         self.armed = true;
         let handle = endpoint.handle();
         self.bridge.on_data_connected(handle);
-        self.stor_writer = self.bridge.take_stor_writer();
+        self.take_stor();
     }
 }
 
@@ -273,12 +332,13 @@ impl ProtocolHandler for FtpDataHandler {
     }
 
     fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        if self.stor_writer.is_none() {
-            self.stor_writer = self.bridge.take_stor_writer();
-        }
+        self.take_stor();
         if let Some(w) = self.stor_writer.as_mut() {
             let _ = w.write_all(*data);
             self.stor_bytes += data.len() as u64;
+            if let Some(obs) = &self.stor_observer {
+                obs.transfer_progress(&self.stor_path, true, data, self.stor_bytes);
+            }
         }
         *data = &[];
     }
@@ -286,6 +346,12 @@ impl ProtocolHandler for FtpDataHandler {
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
         if let Some(mut w) = self.stor_writer.take() {
             let _ = w.flush();
+            if let Some(obs) = &self.stor_observer {
+                obs.transfer_completed(&self.stor_path, true, self.stor_bytes, true);
+            }
+            if let Some((qm, user)) = &self.stor_quota {
+                qm.record_bytes_added(user, self.stor_bytes);
+            }
             self.bridge.stor_complete(self.stor_bytes);
         }
         self.bridge.on_data_closed();
@@ -293,6 +359,9 @@ impl ProtocolHandler for FtpDataHandler {
 
     fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
         if self.stor_writer.take().is_some() {
+            if let Some(obs) = &self.stor_observer {
+                obs.transfer_completed(&self.stor_path, true, self.stor_bytes, false);
+            }
             self.bridge.stor_failed();
         }
         endpoint.close();
