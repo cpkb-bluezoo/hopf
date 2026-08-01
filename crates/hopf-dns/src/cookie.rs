@@ -141,11 +141,30 @@ impl DnsCookie {
     }
 }
 
+/// Result of looking for an inbound query's COOKIE option (RFC 7873 §4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientCookieOption {
+    /// No COOKIE option in the query.
+    Absent,
+    /// A COOKIE option was present but shorter than the mandatory 8-byte
+    /// client cookie — RFC 7873 §5.2.2 requires FORMERR for this, with no
+    /// cookie exchange attempted.
+    Malformed,
+    /// Well-formed client cookie, with the previously-issued server cookie
+    /// if the client is presenting one it holds from an earlier response.
+    Present {
+        /// The mandatory 8-byte client cookie.
+        client: Vec<u8>,
+        /// The 8-32 byte server cookie, if presented.
+        server: Option<Vec<u8>>,
+    },
+}
+
 /// Parse an inbound query's COOKIE option from its OPT additional record,
 /// if any: the mandatory 8-byte client cookie, and an optional 8-32 byte
 /// server cookie if the client is presenting one it was previously issued
 /// (RFC 7873 §4).
-pub fn parse_client_cookie(additionals: &[DnsResourceRecord]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+pub fn parse_client_cookie(additionals: &[DnsResourceRecord]) -> ClientCookieOption {
     for rr in additionals {
         if rr.rtype != Some(crate::wire::DnsType::Opt) {
             continue;
@@ -159,7 +178,10 @@ pub fn parse_client_cookie(additionals: &[DnsResourceRecord]) -> Option<(Vec<u8>
             if i + len > opt_rdata.len() {
                 break;
             }
-            if code == EDNS_OPTION_COOKIE && len >= CLIENT_COOKIE_LENGTH {
+            if code == EDNS_OPTION_COOKIE {
+                if len < CLIENT_COOKIE_LENGTH {
+                    return ClientCookieOption::Malformed;
+                }
                 let client = opt_rdata[i..i + CLIENT_COOKIE_LENGTH].to_vec();
                 let server = if len > CLIENT_COOKIE_LENGTH {
                     let sc = &opt_rdata[i + CLIENT_COOKIE_LENGTH..i + len];
@@ -167,12 +189,12 @@ pub fn parse_client_cookie(additionals: &[DnsResourceRecord]) -> Option<(Vec<u8>
                 } else {
                     None
                 };
-                return Some((client, server));
+                return ClientCookieOption::Present { client, server };
             }
             i += len;
         }
     }
-    None
+    ClientCookieOption::Absent
 }
 
 fn fill_random(buf: &mut [u8]) {
@@ -295,9 +317,13 @@ mod tests {
         rdata.extend_from_slice(&data);
         let opt = DnsResourceRecord::opt(1232, false, &rdata);
 
-        let (got_client, got_server) = parse_client_cookie(&[opt]).expect("cookie option present");
-        assert_eq!(got_client, client);
-        assert_eq!(got_server, Some(server.to_vec()));
+        match parse_client_cookie(&[opt]) {
+            ClientCookieOption::Present { client: got_client, server: got_server } => {
+                assert_eq!(got_client, client);
+                assert_eq!(got_server, Some(server.to_vec()));
+            }
+            other => panic!("expected Present, got {other:?}"),
+        }
     }
 
     #[test]
@@ -308,13 +334,28 @@ mod tests {
         rdata.extend_from_slice(&(client.len() as u16).to_be_bytes());
         rdata.extend_from_slice(&client);
         let opt = DnsResourceRecord::opt(1232, false, &rdata);
-        let (got_client, got_server) = parse_client_cookie(&[opt]).expect("cookie option present");
-        assert_eq!(got_client, client);
-        assert_eq!(got_server, None);
+        match parse_client_cookie(&[opt]) {
+            ClientCookieOption::Present { client: got_client, server: got_server } => {
+                assert_eq!(got_client, client);
+                assert_eq!(got_server, None);
+            }
+            other => panic!("expected Present, got {other:?}"),
+        }
 
         let no_opt = DnsResourceRecord::opt(1232, false, &[]);
-        assert_eq!(parse_client_cookie(&[no_opt]), None);
-        assert_eq!(parse_client_cookie(&[]), None);
+        assert_eq!(parse_client_cookie(&[no_opt]), ClientCookieOption::Absent);
+        assert_eq!(parse_client_cookie(&[]), ClientCookieOption::Absent);
+    }
+
+    #[test]
+    fn parse_client_cookie_rejects_too_short_option_as_malformed() {
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&EDNS_OPTION_COOKIE.to_be_bytes());
+        let short = [1u8, 2, 3, 4, 5]; // < CLIENT_COOKIE_LENGTH
+        rdata.extend_from_slice(&(short.len() as u16).to_be_bytes());
+        rdata.extend_from_slice(&short);
+        let opt = DnsResourceRecord::opt(1232, false, &rdata);
+        assert_eq!(parse_client_cookie(&[opt]), ClientCookieOption::Malformed);
     }
 
     #[test]
