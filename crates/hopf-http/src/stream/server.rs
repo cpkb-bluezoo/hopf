@@ -4,13 +4,72 @@
 //!
 //! Peer of [`super::client`] — not a privileged product centre.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use hopf_core::ConnHandle;
+use hopf_core::{ConnHandle, SecurityInfo};
 
 use crate::headers::Headers;
 
+/// Transport metadata for the current connection (Gumdrop
+/// `HTTPResponseState.getRemoteAddress`/`getLocalAddress`/`getSecurityInfo`).
+///
+/// Captured once when the transport binds and constant for the connection's
+/// lifetime — cheap to read on every [`ServerWriter`] call.
+#[derive(Clone, Debug, Default)]
+pub struct ConnectionInfo {
+    pub(crate) remote_addr: Option<SocketAddr>,
+    pub(crate) local_addr: Option<SocketAddr>,
+    pub(crate) security_info: SecurityInfo,
+}
+
+impl ConnectionInfo {
+    pub(crate) fn new(
+        remote_addr: Option<SocketAddr>,
+        local_addr: Option<SocketAddr>,
+        security_info: SecurityInfo,
+    ) -> Self {
+        Self {
+            remote_addr,
+            local_addr,
+            security_info,
+        }
+    }
+
+    /// Peer address, when the transport is a socket (`None` for in-process tests).
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
+        self.remote_addr
+    }
+
+    /// Local bound address, when the transport is a socket.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addr
+    }
+
+    /// Whether a TLS layer is active on this connection.
+    pub fn is_secure(&self) -> bool {
+        self.security_info.is_secure()
+    }
+
+    /// Negotiated TLS parameters (ALPN, protocol, cipher, SNI, mTLS
+    /// fingerprint). Plaintext connections get [`SecurityInfo::plaintext`].
+    pub fn security_info(&self) -> &SecurityInfo {
+        &self.security_info
+    }
+}
+
 /// Factory that creates a server handler per HTTP Stream.
+///
+/// Unlike Gumdrop's `HTTPRequestHandlerFactory.createHandler(state, headers)`,
+/// this factory does not see the request — it cannot route by path or
+/// short-circuit with an early 401/404 before a handler exists. Routing and
+/// auth-gating are instead composed by *decoration*: wrap an inner
+/// `ServerHandlerFactory`/`ServerHandler` in one that inspects headers in
+/// [`ServerHandler::headers`] and either forwards to the inner handler or
+/// answers directly (see [`crate::auth::BasicAuthFactory`] for the pattern).
+/// This is a deliberate departure from Gumdrop, not a gap: composition over
+/// a request-aware factory keeps handler construction side-effect-free and
+/// lets multiple concerns (auth, routing, logging) stack independently.
 pub trait ServerHandlerFactory: Send + Sync {
     /// Create a handler for the next inbound request Stream.
     fn create_handler(&self) -> Box<dyn ServerHandler>;
@@ -160,6 +219,14 @@ pub trait ServerWriter {
 
     /// Connection handle for storage / reactor hops (never transport-typed).
     fn conn_handle(&self) -> ConnHandle;
+
+    /// Remote/local addresses and TLS metadata for the current connection
+    /// (Gumdrop `getRemoteAddress`/`getLocalAddress`/`isSecure`/`getSecurityInfo`).
+    /// Default: unknown/plaintext — transports that don't track this yet fall
+    /// back rather than panic.
+    fn connection_info(&self) -> ConnectionInfo {
+        ConnectionInfo::default()
+    }
 
     /// Cloneable handle to finish this Stream's response after offload.
     fn response_handle(&self) -> ServerResponseHandle;

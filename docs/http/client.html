@@ -187,6 +187,9 @@ use hopf_http::{HttpClient, HttpClientSessionHandle, HttpConnectionHandler, Http
 
 struct Conn;
 impl HttpConnectionHandler for Conn {
+    fn on_security_established(&amp;mut self, info: &amp;hopf_core::SecurityInfo) {
+        println!("TLS: {:?} via {:?}", info.protocol(), info.alpn());
+    }
     fn on_connected(&amp;mut self, session: &amp;mut HttpClientSessionHandle) {
         session.get("/status").send(Box::new(Resp)).unwrap();
     }
@@ -236,6 +239,7 @@ conn_handle.poke();</code></pre>
 <p><code>ConnHandle::poke()</code> is the same primitive storage-offload completion callbacks already use to make a paused connection re-check its own state (<code>Endpoint::poke_handler</code>) — it re-invokes this connection's <code>receive</code> path with no new bytes, which is exactly where both the H1 and H2 session codecs already flush anything queued.</p>
 <h3 id="connection-and-request-failure">Connection and request failure</h3>
 <p><code>HttpConnectionHandler::on_error</code> fires for DNS failure, refused/reset connect, or a TLS handshake failure — anything that happens before <code>on_connected</code> could ever run. Once a request is in flight, its own <code>HttpResponseHandler::failed</code> fires instead (mid-connection resets/disconnects route through whichever of the two is still waiting to hear about it — never both, and never neither).</p>
+<p><code>HttpConnectionHandler::on_security_established</code> (Gumdrop <code>onSecurityEstablished</code>) fires once, right before <code>on_connected</code>, on TLS dials only — a plaintext <code>HttpClient</code> never calls it. Use it to inspect the negotiated <code>hopf_core::SecurityInfo</code> (ALPN, protocol version, cipher suite) before the first request goes out; the default implementation is a no-op.</p>
 <h3 id="httpclienttimeouts">HttpClientTimeouts</h3>
 <table>
 <colgroup><col style="width: 20%" /><col style="width: 20%" /><col style="width: 59%" /></colgroup>

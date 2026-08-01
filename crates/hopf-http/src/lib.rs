@@ -45,8 +45,6 @@ pub use client::connect_h3_by_name;
 pub use server::HttpServer;
 pub use dispatch::AlpnHttpEndpoint;
 pub use error::{HttpError, HttpResult};
-#[allow(deprecated)]
-pub use h1::HttpConnection;
 pub use h1::{
     H1ClientCodec, H1Endpoint, H1ServerCodec,
 };
@@ -59,7 +57,7 @@ pub use headers::{Header, Headers};
 pub use limits::HttpLimits;
 pub use status::reason_phrase;
 pub use stream::{
-    ClientHandler, ClientHandlerFactory, ClientWriter, HttpRole, HttpStream,
+    ClientHandler, ClientHandlerFactory, ClientWriter, ConnectionInfo, HttpRole, HttpStream,
     ProtocolUpgradeHandler, ServerHandler, ServerHandlerFactory, ServerResponseHandle,
     ServerWriter,
 };
@@ -69,45 +67,3 @@ pub use utils::{
 };
 pub use version::HttpVersion;
 pub use hopf_core::VERSION;
-
-// --- Deprecated aliases (older names) ---
-
-/// Deprecated — use [`H1ServerCodec`].
-#[deprecated(note = "renamed to H1ServerCodec")]
-pub use h1::H1ServerCodec as Http1Parser;
-
-/// Deprecated — use [`ServerHandler`].
-#[deprecated(note = "renamed to ServerHandler")]
-pub use stream::ServerHandler as HttpRequestHandler;
-
-/// Deprecated — use [`ServerHandlerFactory`].
-#[deprecated(note = "renamed to ServerHandlerFactory")]
-pub use stream::ServerHandlerFactory as HttpRequestHandlerFactory;
-
-/// Deprecated — use [`ServerWriter`].
-#[deprecated(note = "renamed to ServerWriter")]
-pub use stream::ServerWriter as HttpResponseState;
-
-/// Deprecated — use [`ServerHandler`].
-#[deprecated(note = "renamed to ServerHandler")]
-pub use stream::ServerHandler as OriginHandler;
-
-/// Deprecated — use [`ServerHandlerFactory`].
-#[deprecated(note = "renamed to ServerHandlerFactory")]
-pub use stream::ServerHandlerFactory as OriginHandlerFactory;
-
-/// Deprecated — use [`ServerWriter`].
-#[deprecated(note = "renamed to ServerWriter")]
-pub use stream::ServerWriter as OriginWriter;
-
-/// Deprecated — use [`ClientHandler`].
-#[deprecated(note = "renamed to ClientHandler")]
-pub use stream::ClientHandler as UserAgentHandler;
-
-/// Deprecated — use [`ClientHandlerFactory`].
-#[deprecated(note = "renamed to ClientHandlerFactory")]
-pub use stream::ClientHandlerFactory as UserAgentHandlerFactory;
-
-/// Deprecated — use [`ClientWriter`].
-#[deprecated(note = "renamed to ClientWriter")]
-pub use stream::ClientWriter as UserAgentWriter;

@@ -117,6 +117,7 @@
 </tr>
 </tbody>
 </table>
+<p>Coming from Gumdrop: <code>HTTPRequestHandlerFactory.createHandler(state, headers)</code> sees the request and can route by path or reject early (401/404) before a handler exists. <code>ServerHandlerFactory::create_handler()</code> deliberately does not — it takes no arguments. Routing and auth-gating are composed by <em>decoration</em> instead: wrap an inner factory/handler in one that inspects headers inside <code>ServerHandler::headers</code> and either forwards or answers directly. <code>BasicAuthFactory</code>/<code>DigestAuthFactory</code>/<code>BearerAuthFactory</code> below are the reference examples; a path router is the same shape, dispatching to a different inner handler per route instead of challenging.</p>
 <h3 id="callback-sequence">Callback sequence</h3>
 <p>With a request body:</p>
 <ol type="1">
@@ -200,6 +201,10 @@
 <td><code>ConnHandle</code> for storage / reactor hops</td>
 </tr>
 <tr>
+<td><code>connection_info()</code></td>
+<td><code>ConnectionInfo</code> — remote/local address, TLS metadata</td>
+</tr>
+<tr>
 <td><code>response_handle()</code></td>
 <td>Cloneable <code>ServerResponseHandle</code> for deferred writes</td>
 </tr>
@@ -210,6 +215,7 @@
 </tbody>
 </table>
 <p>Pseudo-headers on outbound responses use <code>Headers::status(u16)</code> (sets <code>:status</code>). Request inspection uses <code>:method</code>, <code>:path</code>, <code>:scheme</code>, <code>:authority</code>, plus ordinary fields.</p>
+<p><code>connection_info()</code> (Gumdrop <code>getRemoteAddress</code>/<code>getLocalAddress</code>/<code>isSecure</code>/<code>getSecurityInfo</code>) returns a <code>ConnectionInfo</code> snapshot — <code>remote_addr()</code>, <code>local_addr()</code>, <code>is_secure()</code>, and <code>security_info()</code> (ALPN, TLS protocol/cipher, SNI, and — for mTLS — the peer certificate fingerprint). Captured once per connection, so it's cheap to read from every callback; useful for access logging, per-client rate limiting, or gating on the mTLS fingerprint. Wired for H1 and H2 today; H3 (QUIC) returns the default (unknown/plaintext) until <code>hopf_quic::QuicConnApi</code> grows the equivalent accessors.</p>
 <h2 id="deferred-responses">Deferred responses</h2>
 <p>When request handling needs blocking work (filesystem, mailbox, remote call), do <strong>not</strong> block the reactor. Take a <code>ServerResponseHandle</code>, pause the body if needed, submit to <code>StorageExecutor</code>, then hop back with <code>execute</code>:</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>StorageExecutor<span class="op">;</span></span>

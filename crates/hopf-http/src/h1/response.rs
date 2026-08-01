@@ -9,7 +9,7 @@ use hopf_core::{ConnHandle, Endpoint};
 use crate::headers::Headers;
 use crate::status::reason_phrase;
 use crate::stream::{
-    ProtocolUpgradeHandler, ResponseControl, ServerResponseHandle, ServerWriter,
+    ConnectionInfo, ProtocolUpgradeHandler, ResponseControl, ServerResponseHandle, ServerWriter,
 };
 use crate::utils::http_date_now;
 use crate::version::HttpVersion;
@@ -65,6 +65,7 @@ impl H1ResponseShared {
 /// H1 session: ConnHandle + shared framing + optional flush callback.
 pub(crate) struct H1ResponseControl {
     conn: Mutex<ConnHandle>,
+    connection_info: Mutex<ConnectionInfo>,
     /// Invoked after deferred writes when `with_endpoint` is unavailable.
     flush: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     shared: Arc<Mutex<H1ResponseShared>>,
@@ -76,6 +77,7 @@ impl H1ResponseControl {
         let conn = ConnHandle::from_execute(Arc::new(|task| task()));
         Arc::new(Self {
             conn: Mutex::new(conn),
+            connection_info: Mutex::new(ConnectionInfo::default()),
             flush: Mutex::new(None),
             shared: Arc::new(Mutex::new(H1ResponseShared::new())),
         })
@@ -83,6 +85,20 @@ impl H1ResponseControl {
 
     pub(crate) fn bind_conn(&self, conn: ConnHandle) {
         *self.conn.lock().unwrap() = conn;
+    }
+
+    /// Snapshot remote/local address and TLS metadata (call from the
+    /// endpoint once transport binding is known — cheap, cached reads).
+    pub(crate) fn bind_connection_info(&self, endpoint: &dyn Endpoint) {
+        *self.connection_info.lock().unwrap() = ConnectionInfo::new(
+            endpoint.remote_addr().ok(),
+            endpoint.local_addr().ok(),
+            endpoint.security_info().clone(),
+        );
+    }
+
+    pub(crate) fn connection_info(&self) -> ConnectionInfo {
+        self.connection_info.lock().unwrap().clone()
     }
 
     /// Optional flush hook for `from_execute`-only handles (no `with_endpoint`).
@@ -400,6 +416,10 @@ impl ServerWriter for H1SessionWriter {
         self.control.conn_handle()
     }
 
+    fn connection_info(&self) -> ConnectionInfo {
+        self.control.connection_info()
+    }
+
     fn response_handle(&self) -> ServerResponseHandle {
         ServerResponseHandle::new(ArcH1ResponseControl::new(Arc::clone(&self.control)))
     }
@@ -410,5 +430,34 @@ impl ServerWriter for H1SessionWriter {
 
     fn resume_request_body(&mut self) {
         self.control.shared.lock().unwrap().pause_request_body = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_info_round_trips_through_writer() {
+        let control = H1ResponseControl::new();
+        let remote: std::net::SocketAddr = "203.0.113.5:9000".parse().unwrap();
+        let local: std::net::SocketAddr = "198.51.100.7:443".parse().unwrap();
+        let info = ConnectionInfo::new(
+            Some(remote),
+            Some(local),
+            hopf_core::SecurityInfo::secure(
+                Some(b"http/1.1".to_vec()),
+                Some("TLSv1.3".into()),
+                None,
+            ),
+        );
+        *control.connection_info.lock().unwrap() = info;
+
+        let w = control.writer();
+        let got = ServerWriter::connection_info(&w);
+        assert_eq!(got.remote_addr(), Some(remote));
+        assert_eq!(got.local_addr(), Some(local));
+        assert!(got.is_secure());
+        assert_eq!(got.security_info().alpn(), Some(&b"http/1.1"[..]));
     }
 }

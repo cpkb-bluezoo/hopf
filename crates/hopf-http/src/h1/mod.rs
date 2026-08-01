@@ -15,7 +15,5 @@ mod session_client_codec;
 
 pub use client_codec::H1ClientCodec;
 pub use endpoint::H1Endpoint;
-#[allow(deprecated)]
-pub use endpoint::HttpConnection;
 pub use server_codec::H1ServerCodec;
 pub(crate) use session_client_codec::H1SessionClientCodec;

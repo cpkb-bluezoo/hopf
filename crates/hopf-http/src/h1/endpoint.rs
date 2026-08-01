@@ -82,6 +82,7 @@ impl H1Endpoint {
     fn bind_server_handle(&mut self, endpoint: &dyn Endpoint) {
         if let Some(codec) = self.server.as_mut() {
             codec.bind_conn_handle(endpoint.handle());
+            codec.bind_connection_info(endpoint);
         }
     }
 
@@ -175,10 +176,13 @@ impl ProtocolHandler for H1Endpoint {
     fn security_established(
         &mut self,
         endpoint: &mut dyn Endpoint,
-        _info: &hopf_core::SecurityInfo,
+        info: &hopf_core::SecurityInfo,
     ) {
         self.bind_server_handle(endpoint);
         if self.role == HttpRole::Client && self.secure {
+            if let Some(codec) = self.session.as_mut() {
+                codec.notify_security_established(info);
+            }
             self.kickoff_client(endpoint);
         }
     }
@@ -229,41 +233,5 @@ impl ProtocolHandler for H1Endpoint {
             codec.fail_transport(std::io::Error::new(err.kind(), err.to_string()));
         }
         endpoint.close();
-    }
-}
-
-/// Deprecated alias — use [`H1Endpoint::server`].
-#[deprecated(note = "renamed to H1Endpoint::server")]
-pub type HttpConnection = H1Endpoint;
-
-impl H1Endpoint {
-    /// Deprecated constructor — use [`H1Endpoint::server`].
-    #[deprecated(note = "use H1Endpoint::server")]
-    pub fn new(
-        factory: Arc<dyn ServerHandlerFactory>,
-        limits: HttpLimits,
-        secure: bool,
-    ) -> Self {
-        Self::server(factory, limits, secure)
-    }
-
-    /// Deprecated — use [`H1Endpoint::server`].
-    #[deprecated(note = "renamed to H1Endpoint::server")]
-    pub fn origin(
-        factory: Arc<dyn ServerHandlerFactory>,
-        limits: HttpLimits,
-        secure: bool,
-    ) -> Self {
-        Self::server(factory, limits, secure)
-    }
-
-    /// Deprecated — use [`H1Endpoint::client`].
-    #[deprecated(note = "renamed to H1Endpoint::client")]
-    pub fn user_agent(
-        factory: Arc<dyn ClientHandlerFactory>,
-        limits: HttpLimits,
-        secure: bool,
-    ) -> Self {
-        Self::client(factory, limits, secure)
     }
 }

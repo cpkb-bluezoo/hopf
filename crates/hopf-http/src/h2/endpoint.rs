@@ -33,8 +33,8 @@ use super::response::{ArcH2ResponseControl, H2ResponseControl, H2SessionWriter};
 use crate::headers::Headers;
 use crate::limits::HttpLimits;
 use crate::stream::{
-    ClientHandler, ClientHandlerFactory, ClientWriter, ProtocolUpgradeHandler, ServerHandler,
-    ServerHandlerFactory, ServerResponseHandle, ServerWriter,
+    ClientHandler, ClientHandlerFactory, ClientWriter, ConnectionInfo, ProtocolUpgradeHandler,
+    ServerHandler, ServerHandlerFactory, ServerResponseHandle, ServerWriter,
 };
 
 use super::flow::FlowControl;
@@ -188,6 +188,10 @@ impl ServerWriter for H2StreamWriter {
 
     fn conn_handle(&self) -> hopf_core::ConnHandle {
         self.control.conn_handle()
+    }
+
+    fn connection_info(&self) -> ConnectionInfo {
+        self.control.connection_info()
     }
 
     fn response_handle(&self) -> crate::stream::ServerResponseHandle {
@@ -364,6 +368,10 @@ pub struct H2Endpoint {
     graceful_shutdown: bool,
 
     deferred_flush: Arc<H2DeferredFlush>,
+
+    /// Remote/local address and TLS metadata, captured once and handed to
+    /// each server stream's [`H2ResponseControl`] as it's (re)bound.
+    connection_info: ConnectionInfo,
 }
 
 impl H2Endpoint {
@@ -537,6 +545,7 @@ impl H2Endpoint {
             deferred_flush: Arc::new(H2DeferredFlush {
                 streams: Mutex::new(Vec::new()),
             }),
+            connection_info: ConnectionInfo::default(),
         }
     }
 
@@ -545,9 +554,18 @@ impl H2Endpoint {
             return;
         };
         let conn = endpoint.handle();
+        self.connection_info = ConnectionInfo::new(
+            endpoint.remote_addr().ok(),
+            endpoint.local_addr().ok(),
+            endpoint.security_info().clone(),
+        );
         let df = Arc::clone(&self.deferred_flush);
         for stream in self.server_streams.values_mut() {
             stream.writer.control.bind_conn(conn.clone());
+            stream
+                .writer
+                .control
+                .bind_connection_info(self.connection_info.clone());
             let df = Arc::clone(&df);
             let sid = stream.id;
             stream.writer.control.set_flush(Some(Arc::new(move || {

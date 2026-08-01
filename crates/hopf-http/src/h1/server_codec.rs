@@ -142,6 +142,11 @@ impl<H: ServerHandler> H1ServerCodec<H> {
         self.driver.response.bind_conn(conn);
     }
 
+    /// Snapshot remote/local address and TLS metadata from the transport.
+    pub fn bind_connection_info(&mut self, endpoint: &dyn hopf_core::Endpoint) {
+        self.driver.response.bind_connection_info(endpoint);
+    }
+
     /// Whether deferred execute left bytes that still need an endpoint flush.
     pub fn needs_flush(&self) -> bool {
         self.driver.response.needs_flush()
