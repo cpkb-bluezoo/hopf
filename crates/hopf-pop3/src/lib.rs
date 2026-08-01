@@ -16,7 +16,7 @@ mod server;
 
 pub mod client;
 
-#[cfg(feature = "integration")]
+#[cfg(all(test, feature = "integration"))]
 mod integration;
 
 pub use server::{

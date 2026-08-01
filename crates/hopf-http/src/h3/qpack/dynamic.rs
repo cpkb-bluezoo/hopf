@@ -67,6 +67,7 @@ impl DynamicTable {
 
     /// Absolute index of the oldest still-live entry (entries below this
     /// have been evicted).
+    #[allow(dead_code)] // exercised by unit tests; reserved for encoder relative-index math
     pub(crate) fn base_index(&self) -> u64 {
         self.base_index
     }

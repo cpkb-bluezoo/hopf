@@ -706,7 +706,7 @@ impl H2Endpoint {
     /// Override the SETTINGS-ACK wait ([`SETTINGS_ACK_TIMEOUT`] by default)
     /// — for tests only, so the timeout path doesn't require waiting out
     /// the real production duration.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "integration"))]
     pub(crate) fn set_settings_ack_timeout_for_test(&mut self, timeout: Duration) {
         self.settings_ack_timeout = timeout;
     }

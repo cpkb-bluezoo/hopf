@@ -167,7 +167,7 @@ fn qos1_subscriber_receives_large_multi_chunk_publish() {
         .unwrap();
     let _ = read_exact_timeout(&mut sub, 5); // SUBACK
 
-    let payload: Vec<u8> = (0..20_000u32).map(|i| (b'a' + (i % 26) as u8)).collect();
+    let payload: Vec<u8> = (0..20_000u32).map(|i| b'a' + (i % 26) as u8).collect();
     let mut publisher = wait_connect(addr);
     publisher.write_all(&connect_packet("qos1-publisher")).unwrap();
     let _ = read_exact_timeout(&mut publisher, 4);

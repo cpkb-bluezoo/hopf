@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use hopf_auth::{create_server, CredentialStore, SaslServer, SaslServerOptions, SaslServerStep};
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
-use hopf_mailbox::{Mailbox, MailboxFactory, MailboxResult, MailboxStore};
+use hopf_mailbox::{Mailbox, MailboxFactory, MailboxStore};
 use rmimeparser::charset::base64;
 
 use crate::server::auth::{advertised_mechanisms, apop_timestamp, capa_sasl_line, verify_apop};
@@ -1504,7 +1504,7 @@ impl<F: FnMut(&[u8])> hopf_mailbox::MessageReadCallback for TopPushCallback<F> {
 mod top_streaming_tests {
     use std::collections::BTreeSet;
 
-    use hopf_mailbox::{AppendGuard, MailboxFactory, MailboxStore, MessageReadCallback};
+    use hopf_mailbox::{AppendGuard, MailboxFactory};
     use tempfile::tempdir;
 
     use super::TopPushCallback;

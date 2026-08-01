@@ -191,6 +191,7 @@ fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
 /// next configured server exactly like a dead UDP one, not just sit until
 /// the timeout eventually fires. `err` becomes the final failure reported
 /// to the caller once every server has been tried.
+#[cfg(any(feature = "dot", feature = "doq", feature = "doh"))]
 fn retry_after_transport_error(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error) {
     retry_or_fail_impl(inner, id, move || err);
 }
@@ -938,6 +939,10 @@ fn send_udp_query(
 /// TCP-fallback pattern) — both return `Ok(None)`. DoQ/DoH are also
 /// fire-and-forget (per [`DnsClientTransport::send_query`]'s contract) but
 /// need their transport instance kept alive, so they return `Ok(Some(_))`.
+#[cfg_attr(
+    not(any(feature = "dot", feature = "doq", feature = "doh")),
+    allow(unused_variables)
+)]
 fn send_query_to_server(
     inner: &Arc<Mutex<ResolverInner>>,
     g: &mut ResolverInner,
@@ -1088,6 +1093,7 @@ impl DnsClientTransportHandler for TransportResponseHandler {
 /// Remove and fail a pending query outright (no next-server retry) — used
 /// where a malformed response, not a transport-level failure, is the
 /// problem, so retrying the same or another server isn't expected to help.
+#[cfg(any(feature = "doq", feature = "doh"))]
 fn fail_pending(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error) {
     let mut g = inner.lock().unwrap();
     let Some(pending) = g.pending.remove(&id) else {

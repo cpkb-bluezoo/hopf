@@ -4,19 +4,16 @@
 
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use hopf_core::{ConnHandle, Endpoint, TimerHandle};
 
 use crate::client::api::{
-    HttpClientError, HttpClientSessionHandle, HttpConnectionHandler, HttpResponseHandler,
-    SessionRequestOps,
+    HttpClientError, HttpClientSessionHandle, HttpResponseHandler, SessionRequestOps,
 };
 use crate::error::{HttpError, HttpResult};
 use crate::h1::encode_request::write_request_headers;
 use crate::h1::parse::{parse_version, FirstLineKind, H1Events, H1Scanner, Next};
 use crate::headers::Headers;
-use crate::limits::HttpLimits;
 use crate::utils::{is_chunked_te, is_invalid_te, parse_content_length};
 use crate::version::HttpVersion;
 
@@ -712,6 +709,10 @@ impl H1Events for H1SessionInner {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use crate::client::api::HttpConnectionHandler;
+    use crate::limits::HttpLimits;
 
     #[derive(Default)]
     struct Rec {

@@ -61,6 +61,7 @@ pub(crate) fn write_insert_with_literal_name(out: &mut Vec<u8>, name: &[u8], val
     strings::write(out, value, 7, 0x00);
 }
 
+#[allow(dead_code)] // encoder does not emit Duplicate yet; covered by round-trip tests
 pub(crate) fn write_duplicate(out: &mut Vec<u8>, relative_index: u64) {
     prefix_int::encode(out, relative_index, 5, 0x00);
 }
