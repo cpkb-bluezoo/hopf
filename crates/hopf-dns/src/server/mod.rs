@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use crate::cache::DnsCache;
 use crate::client::DnsResolver;
-use crate::cookie::DnsCookie;
-use crate::wire::{DnsMessage, OPCODE_QUERY, RCODE_NOTIMP, RCODE_REFUSED, RCODE_SERVFAIL};
+use crate::cookie::{ClientCookieOption, DnsCookie};
+use crate::wire::{DnsMessage, OPCODE_QUERY, RCODE_FORMERR, RCODE_NOTIMP, RCODE_SERVFAIL};
 
 /// Simple server metrics counters.
 #[derive(Debug, Default, Clone)]
@@ -94,26 +94,44 @@ impl DnsService {
 
     /// Process one query message from `peer`; returns response (may be
     /// async via callback for upstream). Handles the server-side DNS
-    /// Cookie exchange (RFC 7873 §5.2) around whatever
-    /// [`Self::compute_response`] answers: an inbound COOKIE option gets a
-    /// response COOKIE option back, echoing the client's cookie plus a
-    /// freshly (re)issued server cookie, regardless of the query's outcome.
+    /// Cookie exchange (RFC 7873 §5.2) around [`Self::compute_response`]:
+    /// an inbound COOKIE option gets a response COOKIE option back, echoing
+    /// the client's cookie plus a freshly (re)issued server cookie.
+    ///
+    /// A malformed COOKIE option (shorter than the 8-byte client cookie) is
+    /// FORMERR with no cookie exchange (RFC 7873 §5.2.2). A client cookie
+    /// presented without a server cookie we can verify gets a minimal
+    /// cookie-only response instead of full resolution — RFC 7873 §5.2.3's
+    /// anti-amplification guard: don't do real resolution work (including
+    /// upstream forwarding) for a source that hasn't yet proven it can see
+    /// our responses, since that work could otherwise be triggered at scale
+    /// against a spoofed victim address.
     pub fn process_query_sync(&self, query: &DnsMessage, peer: SocketAddr) -> DnsMessage {
-        let mut resp = self.compute_response(query);
-        if let Some((client_cookie, server_cookie)) = crate::cookie::parse_client_cookie(&query.additionals) {
-            let mut m = self.metrics.lock().unwrap();
-            m.cookies_presented += 1;
-            let ip_bytes = ip_octets(peer.ip());
-            if let Some(sc) = &server_cookie {
-                if self.cookies.validate_server_cookie(&client_cookie, &ip_bytes, sc) {
+        match crate::cookie::parse_client_cookie(&query.additionals) {
+            ClientCookieOption::Absent => self.compute_response(query),
+            ClientCookieOption::Malformed => query.response_template(RCODE_FORMERR),
+            ClientCookieOption::Present { client, server } => {
+                let ip_bytes = ip_octets(peer.ip());
+                let mut m = self.metrics.lock().unwrap();
+                m.cookies_presented += 1;
+                let verified = server
+                    .as_deref()
+                    .is_some_and(|sc| self.cookies.validate_server_cookie(&client, &ip_bytes, sc));
+                if verified {
                     m.cookies_verified += 1;
                 }
+                drop(m);
+                let option = self.cookies.encode_response_edns_option(&client, &ip_bytes);
+                let mut resp = if verified {
+                    self.compute_response(query)
+                } else {
+                    query.response_template(0)
+                };
+                resp.additionals
+                    .push(crate::wire::DnsResourceRecord::opt(crate::wire::OPT_UDP_PAYLOAD, false, &option));
+                resp
             }
-            drop(m);
-            let option = self.cookies.encode_response_edns_option(&client_cookie, &ip_bytes);
-            resp.additionals.push(crate::wire::DnsResourceRecord::opt(crate::wire::OPT_UDP_PAYLOAD, false, &option));
         }
-        resp
     }
 
     /// Core query handling, without the cookie exchange (factored out so
@@ -123,11 +141,14 @@ impl DnsService {
             let mut m = self.metrics.lock().unwrap();
             m.queries += 1;
         }
-        if query.opcode() != OPCODE_QUERY {
+        // RFC 1035 §4.1.1: only actual queries (QR clear) with the standard
+        // QUERY opcode are supported.
+        if !query.is_query() || query.opcode() != OPCODE_QUERY {
             return query.response_template(RCODE_NOTIMP);
         }
+        // RFC 1035 §4.1.2: the question section must not be empty.
         if query.questions.is_empty() {
-            return query.response_template(RCODE_REFUSED);
+            return query.response_template(RCODE_FORMERR);
         }
         let q = &query.questions[0];
 
@@ -293,8 +314,10 @@ mod tests {
             .iter()
             .find(|rr| rr.rtype == Some(DnsType::Opt))
             .expect("response must carry an OPT record with the COOKIE option");
-        let (got_client, got_server) =
-            crate::cookie::parse_client_cookie(std::slice::from_ref(opt)).expect("COOKIE option must round-trip");
+        let (got_client, got_server) = match crate::cookie::parse_client_cookie(std::slice::from_ref(opt)) {
+            ClientCookieOption::Present { client, server } => (client, server),
+            other => panic!("COOKIE option must round-trip, got {other:?}"),
+        };
         assert_eq!(got_client, client_cookie);
         let server_cookie = got_server.expect("server must always issue a server cookie");
         assert!(service.cookies().validate_server_cookie(&client_cookie, &ip_octets(peer.ip()), &server_cookie));
@@ -343,5 +366,78 @@ mod tests {
         let resp = service.process_query_sync(&query, peer);
         assert!(resp.additionals.iter().all(|rr| rr.rtype != Some(DnsType::Opt)));
         assert_eq!(service.metrics().cookies_presented, 0);
+    }
+
+    #[test]
+    fn empty_question_section_is_formerr() {
+        // RFC 1035 §4.1.2: the question section must not be empty.
+        let service = service_answering(Ipv4Addr::new(203, 0, 113, 9));
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let query = DnsMessage::new(5, 0, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let resp = service.process_query_sync(&query, peer);
+        assert_eq!(resp.rcode(), RCODE_FORMERR);
+    }
+
+    #[test]
+    fn response_message_sent_as_a_query_is_notimp() {
+        // RFC 1035 §4.1.1: a message with QR already set is a response, not
+        // a query — reject it rather than trying to resolve it.
+        let service = service_answering(Ipv4Addr::new(203, 0, 113, 9));
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let mut query = DnsMessage::query(6, DnsQuestion::in_class("example.com", DnsType::A), true);
+        query.flags |= crate::wire::FLAG_QR;
+        let resp = service.process_query_sync(&query, peer);
+        assert_eq!(resp.rcode(), RCODE_NOTIMP);
+    }
+
+    #[test]
+    fn malformed_cookie_option_is_formerr_with_no_cookie_exchange() {
+        // RFC 7873 §5.2.2: a COOKIE option shorter than the mandatory
+        // 8-byte client cookie is malformed.
+        let service = service_answering(Ipv4Addr::new(203, 0, 113, 9));
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let mut query = DnsMessage::query(7, DnsQuestion::in_class("example.com", DnsType::A), true);
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&crate::cookie::EDNS_OPTION_COOKIE.to_be_bytes());
+        let short = [1u8, 2, 3];
+        rdata.extend_from_slice(&(short.len() as u16).to_be_bytes());
+        rdata.extend_from_slice(&short);
+        query.additionals.push(DnsResourceRecord::opt(1232, false, &rdata));
+
+        let resp = service.process_query_sync(&query, peer);
+        assert_eq!(resp.rcode(), RCODE_FORMERR);
+        assert!(resp.additionals.iter().all(|rr| rr.rtype != Some(DnsType::Opt)));
+        assert_eq!(service.metrics().cookies_presented, 0, "a malformed option was never actually parsed as a cookie");
+    }
+
+    #[test]
+    fn cookie_without_a_verifiable_server_cookie_skips_resolution() {
+        // RFC 7873 §5.2.3 anti-amplification: don't do real resolution work
+        // (including upstream forwarding) for a client that hasn't yet
+        // proven it can see our responses.
+        let service = service_answering(Ipv4Addr::new(203, 0, 113, 9));
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let client_cookie = [4u8; 8];
+
+        // No server cookie presented at all.
+        let mut query = DnsMessage::query(8, DnsQuestion::in_class("example.com", DnsType::A), true);
+        query.additionals.push(cookie_option(&client_cookie, None));
+        let resp = service.process_query_sync(&query, peer);
+        assert!(resp.answers.is_empty(), "must not resolve without a verified server cookie");
+        assert_eq!(resp.rcode(), 0);
+
+        // A server cookie is presented, but it's invalid (forged/stale).
+        let mut query2 = DnsMessage::query(9, DnsQuestion::in_class("example.com", DnsType::A), true);
+        query2.additionals.push(cookie_option(&client_cookie, Some(&[0u8; 8])));
+        let resp2 = service.process_query_sync(&query2, peer);
+        assert!(resp2.answers.is_empty(), "must not resolve with an invalid server cookie");
+
+        // Once the client echoes back the valid, freshly-issued server
+        // cookie, resolution proceeds normally.
+        let server_cookie = service.cookies().generate_server_cookie(&client_cookie, &ip_octets(peer.ip()));
+        let mut query3 = DnsMessage::query(10, DnsQuestion::in_class("example.com", DnsType::A), true);
+        query3.additionals.push(cookie_option(&client_cookie, Some(&server_cookie)));
+        let resp3 = service.process_query_sync(&query3, peer);
+        assert!(!resp3.answers.is_empty(), "a verified server cookie must proceed to full resolution");
     }
 }
