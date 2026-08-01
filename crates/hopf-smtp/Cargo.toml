@@ -26,11 +26,10 @@ hopf-otel = { workspace = true }
 hopf-dns = { workspace = true }
 hopf-mailbox = { workspace = true }
 rmimeparser = { workspace = true }
-rustls = { workspace = true }
-base64 = "0.22"
 ring = "0.17"
 getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 rcgen = { workspace = true }
+rustls = { workspace = true }

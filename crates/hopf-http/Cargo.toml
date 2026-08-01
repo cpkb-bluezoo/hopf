@@ -23,12 +23,6 @@ hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
 hopf-dns = { workspace = true }
 hopf-quic = { workspace = true, optional = true }
-# Declared for WebDAV / composition XML and protocol payloads (wired in later tranches).
-tractrix = { workspace = true }
-rjsonparser = { workspace = true }
-rmimeparser = { workspace = true }
-rprotobuf = { workspace = true }
 
 [dev-dependencies]
 hopf-tls = { workspace = true }
-rcgen = { workspace = true }

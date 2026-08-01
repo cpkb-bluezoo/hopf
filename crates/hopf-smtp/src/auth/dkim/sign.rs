@@ -249,8 +249,7 @@ fn canon_name(c: Canonicalization) -> &'static str {
 }
 
 fn base64_encode(data: impl AsRef<[u8]>) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(data.as_ref())
+    rmimeparser::charset::base64::encode(data.as_ref())
 }
 
 #[cfg(test)]

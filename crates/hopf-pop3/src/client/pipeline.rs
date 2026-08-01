@@ -199,12 +199,10 @@ impl Pop3FetchDriver {
 
     /// Compute APOP digest: MD5(timestamp || password) as lowercase hex.
     fn apop_digest(timestamp: &str, password: &str) -> String {
-        use md5::{Digest, Md5};
-        let mut h = Md5::new();
-        h.update(timestamp.as_bytes());
-        h.update(password.as_bytes());
-        let result = h.finalize();
-        result.iter().map(|b| format!("{b:02x}")).collect()
+        let mut data = Vec::with_capacity(timestamp.len() + password.len());
+        data.extend_from_slice(timestamp.as_bytes());
+        data.extend_from_slice(password.as_bytes());
+        hopf_auth::crypto::md5_hex(&data)
     }
 
     /// The strongest mechanism this auto-pilot can drive with a bare

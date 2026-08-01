@@ -27,11 +27,9 @@ hopf-tls = { workspace = true }
 hopf-otel = { workspace = true }
 hopf-mailbox = { workspace = true }
 hopf-dns = { workspace = true }
-rustls = { workspace = true }
 rmimeparser = { workspace = true }
-base64 = "0.22"
-md-5 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 rcgen = { workspace = true }
+rustls = { workspace = true }

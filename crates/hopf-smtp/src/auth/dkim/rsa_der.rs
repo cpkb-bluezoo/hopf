@@ -84,8 +84,7 @@ mod tests {
     }
 
     fn base64_decode(s: &str) -> Vec<u8> {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+        rmimeparser::charset::base64::decode(s).unwrap()
     }
 
     // 2048-bit RSA public key, DER SPKI, base64 — freshly generated for this

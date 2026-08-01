@@ -50,8 +50,7 @@ const ED25519_PKCS8_B64: &str = "MC4CAQAwBQYDK2VwBCIEIJOr3cUYESkwGr3t08+NHi5fO++
 const ED25519_RAW_PUB_B64: &str = "7qcUfZUf3KQSvsFseKVzOm5hlukTWGugsb87LtL2Wuo=";
 
 fn b64_decode(s: &str) -> Vec<u8> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+    rmimeparser::charset::base64::decode(s).unwrap()
 }
 
 fn rsa_key() -> DkimPrivateKey {

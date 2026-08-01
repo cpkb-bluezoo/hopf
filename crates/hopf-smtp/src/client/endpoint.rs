@@ -11,8 +11,8 @@
 use std::io;
 use std::time::Duration;
 
-use base64::Engine;
 use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
+use rmimeparser::charset::base64;
 
 use crate::DsnRecipientParams;
 
@@ -666,7 +666,7 @@ impl SmtpClientSession for SmtpClientEndpoint {
         self.auth_aborting = false;
         let arg = match initial {
             Some(b) => {
-                let enc = base64::engine::general_purpose::STANDARD.encode(b);
+                let enc = base64::encode(b);
                 format!("AUTH {mechanism} {enc}")
             }
             None => format!("AUTH {mechanism}"),
@@ -700,7 +700,7 @@ impl SmtpClientAuthExchange for SmtpClientEndpoint {
         self.proto_state = ProtoState::AuthSent;
         self.lexer.expect(SmtpReplyShape::Auth);
         self.auth_aborting = false;
-        let enc = base64::engine::general_purpose::STANDARD.encode(response);
+        let enc = base64::encode(response);
         self.write_line(&enc);
     }
 

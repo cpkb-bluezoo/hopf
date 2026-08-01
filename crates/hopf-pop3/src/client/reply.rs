@@ -18,8 +18,7 @@
 //! command — POP3's grammar is command-dependent: the same `+OK` line
 //! means a different field layout after `STAT` than after `USER`.
 
-use base64::Engine;
-
+use rmimeparser::charset::base64;
 use rmimeparser::ContentIdParser;
 
 use super::error::Pop3Error;
@@ -671,9 +670,9 @@ impl Pop3ReplyLexer {
             }
             Field::ContinuationText => {
                 let text = std::mem::take(&mut self.text);
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(text.as_bytes())
-                    .map_err(|e| Pop3Error::Parse(format!("bad base64 in SASL continuation: {e}")))?;
+                let data = base64::decode(&text).map_err(|()| {
+                    Pop3Error::Parse("bad base64 in SASL continuation".into())
+                })?;
                 self.state = State::Prefix(Prefix::Start);
                 Ok(Some(Pop3Event::AuthChallenge { data }))
             }

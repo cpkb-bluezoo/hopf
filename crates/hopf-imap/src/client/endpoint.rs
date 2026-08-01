@@ -11,8 +11,8 @@
 use std::io;
 use std::time::Duration;
 
-use base64::Engine;
 use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
+use rmimeparser::charset::base64;
 
 use super::handlers::{ImapClientDriver, ImapClientHandlerFactory};
 use super::pending::{ImapTagGenerator, PendingCommand, PendingKind, PendingMap, UntaggedClass};
@@ -1033,7 +1033,7 @@ impl ImapClientNotAuthenticated for ImapClientEndpoint {
     fn authenticate(&mut self, mechanism: &str, initial: Option<&[u8]>) {
         let mech = mechanism.to_ascii_uppercase();
         if let Some(raw) = initial {
-            let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+            let b64 = base64::encode(raw);
             let _ = self.issue_no_ep(
                 PendingKind::Authenticate,
                 &format!("AUTHENTICATE {mech} {b64}"),
@@ -1064,7 +1064,7 @@ impl ImapClientPostStarttls for ImapClientEndpoint {}
 
 impl ImapClientAuthExchange for ImapClientEndpoint {
     fn respond(&mut self, response: &[u8]) {
-        let b64 = base64::engine::general_purpose::STANDARD.encode(response);
+        let b64 = base64::encode(response);
         self.write_line(&b64);
     }
 

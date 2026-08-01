@@ -9,8 +9,8 @@
 use std::io;
 use std::time::Duration;
 
-use base64::Engine;
 use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
+use rmimeparser::charset::base64;
 
 use super::handlers::{Pop3ClientDriver, Pop3ClientHandlerFactory};
 use super::reply::{Pop3Event, Pop3ReplyLexer, Pop3ReplyShape};
@@ -857,7 +857,7 @@ impl Pop3ClientAuthorization for Pop3ClientEndpoint {
         self.auth_aborting = false;
         match initial {
             Some(b) => {
-                let enc = base64::engine::general_purpose::STANDARD.encode(b);
+                let enc = base64::encode(b);
                 self.write_line(&format!("AUTH {mechanism} {enc}"));
             }
             None => self.write_line(&format!("AUTH {mechanism}")),
@@ -920,7 +920,7 @@ impl Pop3ClientPostStls for Pop3ClientEndpoint {
         self.auth_aborting = false;
         match initial {
             Some(b) => {
-                let enc = base64::engine::general_purpose::STANDARD.encode(b);
+                let enc = base64::encode(b);
                 self.write_line(&format!("AUTH {mechanism} {enc}"));
             }
             None => self.write_line(&format!("AUTH {mechanism}")),
@@ -941,7 +941,7 @@ impl Pop3ClientAuthExchange for Pop3ClientEndpoint {
         self.proto_state = ProtoState::AuthSent;
         self.lexer.expect(Pop3ReplyShape::Auth);
         self.auth_aborting = false;
-        let enc = base64::engine::general_purpose::STANDARD.encode(response);
+        let enc = base64::encode(response);
         self.write_line(&enc);
     }
 

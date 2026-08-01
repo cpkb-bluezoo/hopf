@@ -103,5 +103,4 @@ hopf-pop3 = { version = "0.2.0", path = "crates/hopf-pop3" }
 hopf-imap = { version = "0.2.0", path = "crates/hopf-imap" }
 hopf-mqtt = { version = "0.2.0", path = "crates/hopf-mqtt" }
 getrandom = "0.2"
-md-5 = "0.10"
 tempfile = "3"

@@ -393,11 +393,8 @@ fn select_headers<'a>(all: &'a [RawHeader], h_list: &[String]) -> Vec<&'a RawHea
 }
 
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    use base64::Engine;
     let stripped: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(stripped)
-        .ok()
+    rmimeparser::charset::base64::decode(&stripped).ok()
 }
 
 fn domain_eq_or_subdomain(sub: &str, base: &str) -> bool {
