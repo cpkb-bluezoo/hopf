@@ -6,7 +6,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rmimeparser::{EmailAddress, EmailAddressParser};
-use hopf_auth::{IdentityMaterial, PeerContext, TrustDecision};
+use hopf_auth::{
+    create_server, CredentialStore, SaslMechanism, SaslServer, SaslServerOptions, SaslServerStep,
+};
+use rmimeparser::charset::base64;
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler};
 
 use crate::server::codec::{SmtpCommand, SmtpServerLexer, MAX_COMMAND_LINE};
@@ -57,6 +60,9 @@ pub struct SmtpControlHandler {
     /// Shared slot for [`MessageEndState::defer`].
     deferred: Arc<std::sync::Mutex<Option<DeferredSlot>>>,
     control_handle: Option<ConnHandle>,
+    /// In-progress SASL exchange, between the `334` challenge and the
+    /// client's continuation line.
+    sasl: Option<Box<dyn SaslServer>>,
 }
 
 impl SmtpControlHandler {
@@ -105,6 +111,7 @@ impl SmtpControlHandler {
             leftover: Vec::new(),
             deferred: Arc::new(std::sync::Mutex::new(None)),
             control_handle: None,
+            sasl: None,
         }
     }
 
@@ -193,11 +200,18 @@ impl SmtpControlHandler {
         if self.config.tls_acceptor.is_some() && !self.meta.tls && !self.config.implicit_tls {
             caps.push("STARTTLS".into());
         }
-        if self.config.policy.is_some() && (self.meta.tls || self.config.tls_acceptor.is_some()) {
-            // Advertise AUTH PLAIN when TLS is up, or STARTTLS is available (clients
-            // must upgrade first — we still list it when starttls is offered).
-            if self.meta.tls {
-                caps.push("AUTH PLAIN".into());
+        if let Some(store) = &self.config.store {
+            // RFC 4954 §4: advertise each mechanism the store can drive,
+            // except ones that require TLS on a connection that doesn't
+            // have it yet (matches hopf-pop3/hopf-imap).
+            let mechs: Vec<&str> = store
+                .supported_mechanisms()
+                .iter()
+                .filter(|m| self.meta.tls || !m.requires_tls())
+                .map(|m| m.name())
+                .collect();
+            if !mechs.is_empty() {
+                caps.push(format!("AUTH {}", mechs.join(" ")));
             }
         }
         caps
@@ -268,16 +282,19 @@ impl SmtpControlHandler {
             SmtpCommand::Auth { mechanism, initial_response } => {
                 self.cmd_auth(endpoint, &mechanism, initial_response)
             }
-            SmtpCommand::SaslResponse(data) => self.finish_auth_plain(endpoint, data),
+            SmtpCommand::SaslResponse(data) => self.handle_sasl_response(endpoint, data),
             SmtpCommand::SaslAbort => {
+                self.sasl = None;
                 self.send_enhanced(endpoint, 501, "5.0.0", "Authentication cancelled");
             }
             SmtpCommand::SaslResponseInvalid => {
+                self.sasl = None;
                 SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
                 self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
             }
             SmtpCommand::Xclient => self.send_enhanced(endpoint, 550, "5.7.0", "XCLIENT not permitted"),
             SmtpCommand::Malformed { .. } => {
+                self.sasl = None;
                 SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
                 self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
             }
@@ -807,88 +824,124 @@ impl SmtpControlHandler {
     }
 
     fn cmd_auth(&mut self, endpoint: &mut dyn Endpoint, mechanism: &str, initial_response: Option<Vec<u8>>) {
-        if self.config.policy.is_none() {
-            self.send_enhanced(endpoint, 502, "5.5.1", "AUTH not available");
-            return;
-        }
-        if !self.meta.tls {
-            self.send_enhanced(endpoint, 538, "5.7.11", "Encryption required for requested authentication mechanism");
-            return;
-        }
-        if !mechanism.eq_ignore_ascii_case("PLAIN") {
-            self.send_enhanced(endpoint, 504, "5.5.4", "Unrecognized authentication type");
-            return;
-        }
-        match initial_response {
+        let store = match &self.config.store {
+            Some(s) => Arc::clone(s),
             None => {
-                self.send_reply(endpoint, 334, "");
-                self.lexer.expect_sasl_response();
-            }
-            // RFC 4954 §4 — a bare "=" is an explicit *empty* initial
-            // response (present, not absent), fed straight into the
-            // mechanism rather than prompting for a continuation line.
-            Some(data) => self.finish_auth_plain(endpoint, data),
-        }
-    }
-
-    fn finish_auth_plain(&mut self, endpoint: &mut dyn Endpoint, decoded: Vec<u8>) {
-        // AUTH PLAIN: [authzid] \0 authcid \0 passwd
-        let parts: Vec<&[u8]> = decoded.split(|&b| b == 0).collect();
-        if parts.len() < 3 {
-            SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
-            self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
-            return;
-        }
-        let user = String::from_utf8_lossy(parts[1]).into_owned();
-        let pass = String::from_utf8_lossy(parts[2]).into_owned();
-        let policy = match &self.config.policy {
-            Some(p) => p,
-            None => {
-                self.send_enhanced(endpoint, 454, "4.7.0", "Temporary authentication failure");
+                self.send_enhanced(endpoint, 502, "5.5.1", "AUTH not available");
                 return;
             }
         };
-        let identity = IdentityMaterial::UsernamePassword {
-            username: user.clone(),
-            password: pass,
+        let Some(mech) = SaslMechanism::from_name(mechanism) else {
+            self.send_enhanced(endpoint, 504, "5.5.4", "Unrecognized authentication type");
+            return;
         };
-        let peer = PeerContext::from_addr(self.meta.peer);
-        match policy.evaluate(&identity, &peer) {
-            TrustDecision::Reject => {
-                SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
-                self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
+        if mech.requires_tls() && !self.meta.tls {
+            self.send_enhanced(
+                endpoint,
+                538,
+                "5.7.11",
+                "Encryption required for requested authentication mechanism",
+            );
+            return;
+        }
+        let opts = SaslServerOptions {
+            hostname: self.config.hostname.clone(),
+            realm: self.config.hostname.clone(),
+            peer_certificate: self.meta.security_info.peer_certificate_fingerprint().map(str::to_string),
+            channel_binding: None,
+        };
+        let server = create_server(mech, store, opts);
+
+        if server.server_first() && initial_response.is_none() {
+            self.sasl_step(endpoint, server, None);
+            return;
+        }
+
+        // RFC 4954 §4 — a bare "=" is an explicit *empty* initial response
+        // (present, not absent), fed straight into the mechanism rather
+        // than prompting for a continuation line.
+        match initial_response {
+            None => {
+                self.send_reply(endpoint, 334, "");
+                self.sasl = Some(server);
+                self.lexer.expect_sasl_response();
             }
-            TrustDecision::Accept => {
-                let mut hello = match self.hello.take() {
-                    Some(h) => h,
-                    None => {
-                        // After EHLO, hello may have been cleared — use mail_from stage.
-                        SmtpServerMetrics::add(&self.metrics.auth_ok, 1);
-                        self.meta.authenticated_user = Some(user);
-                        self.send_enhanced(endpoint, 235, "2.7.0", "Authentication successful");
-                        return;
+            Some(data) => self.sasl_step(endpoint, server, Some(&data)),
+        }
+    }
+
+    fn sasl_step(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        mut server: Box<dyn SaslServer>,
+        response: Option<&[u8]>,
+    ) {
+        match server.step(response) {
+            SaslServerStep::Challenge(c) => {
+                self.send_reply(endpoint, 334, &base64::encode(&c));
+                self.sasl = Some(server);
+                self.lexer.expect_sasl_response();
+            }
+            SaslServerStep::Complete {
+                username,
+                final_message,
+            } => {
+                if let Some(fm) = final_message {
+                    if !fm.is_empty() {
+                        self.send_reply(endpoint, 334, &base64::encode(&fm));
                     }
-                };
-                {
-                    let mut ctx = AuthCtx {
-                        endpoint,
-                        mail_from: &mut self.mail_from,
-                        hello: &mut self.hello,
-                        session: &mut self.session,
-                        meta: &mut self.meta,
-                        metrics: &self.metrics,
-                        user: user.clone(),
-                    };
-                    hello.authenticated(&mut ctx, &user);
                 }
-                if self.hello.is_none() && self.mail_from.is_none() {
-                    // closed
-                } else if self.mail_from.is_some() {
-                    // accepted via state
-                } else {
-                    self.hello = Some(hello);
-                }
+                self.sasl = None;
+                self.finish_auth(endpoint, username);
             }
+            SaslServerStep::Failure => {
+                self.sasl = None;
+                self.auth_failed(endpoint);
+            }
+        }
+    }
+
+    fn handle_sasl_response(&mut self, endpoint: &mut dyn Endpoint, response: Vec<u8>) {
+        let Some(server) = self.sasl.take() else {
+            return;
+        };
+        self.sasl_step(endpoint, server, Some(&response));
+    }
+
+    fn auth_failed(&mut self, endpoint: &mut dyn Endpoint) {
+        SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
+        self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
+    }
+
+    fn finish_auth(&mut self, endpoint: &mut dyn Endpoint, user: String) {
+        let mut hello = match self.hello.take() {
+            Some(h) => h,
+            None => {
+                // After EHLO, hello may have been cleared — use mail_from stage.
+                SmtpServerMetrics::add(&self.metrics.auth_ok, 1);
+                self.meta.authenticated_user = Some(user);
+                self.send_enhanced(endpoint, 235, "2.7.0", "Authentication successful");
+                return;
+            }
+        };
+        {
+            let mut ctx = AuthCtx {
+                endpoint,
+                mail_from: &mut self.mail_from,
+                hello: &mut self.hello,
+                session: &mut self.session,
+                meta: &mut self.meta,
+                metrics: &self.metrics,
+                user: user.clone(),
+            };
+            hello.authenticated(&mut ctx, &user);
+        }
+        if self.hello.is_none() && self.mail_from.is_none() {
+            // closed
+        } else if self.mail_from.is_some() {
+            // accepted via state
+        } else {
+            self.hello = Some(hello);
         }
     }
 

@@ -68,7 +68,7 @@
     <main class="main">
       <header>
         <h1>SMTP</h1>
-        <p class="lead">Crate <code>hopf-smtp</code>: SMTP <strong>server</strong> and callback-driven <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.smtp</code>. The server speaks RFC 5321 with a wide ESMTP extension set on the Hopf reactor. Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code> (AUTH PLAIN). TLS via <a href="tls.html"><code>hopf-tls</code></a>. Stock services: accept-all, open-relay MX (<a href="dns.html"><code>hopf-dns</code></a>), and local mailbox delivery (<a href="mailbox.html"><code>hopf-mailbox</code></a>).</p>
+        <p class="lead">Crate <code>hopf-smtp</code>: SMTP <strong>server</strong> and callback-driven <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.smtp</code>. The server speaks RFC 5321 with a wide ESMTP extension set on the Hopf reactor. Authentication uses the full <a href="auth.html"><code>hopf-auth</code></a> SASL mechanism set (PLAIN/LOGIN/CRAM-MD5/DIGEST-MD5/SCRAM-SHA-256/OAUTHBEARER/EXTERNAL) via a <code>CredentialStore</code>, same pattern as <a href="pop3.html">POP3</a>/<a href="imap.html">IMAP</a>. TLS via <a href="tls.html"><code>hopf-tls</code></a>. Stock services: accept-all, open-relay MX (<a href="dns.html"><code>hopf-dns</code></a>), and local mailbox delivery (<a href="mailbox.html"><code>hopf-mailbox</code></a>).</p>
       </header>
       <p>Local delivery lives in <code>hopf_smtp::mailbox</code> as <code>LocalDeliveryService</code> — the Gumdrop-shaped counterpart to <code>SimpleRelayService</code>.</p>
 <div class="toc"><h2 id="contents">Contents</h2>
@@ -138,14 +138,14 @@
 </tr>
 <tr>
 <td>—</td>
-<td>SMTPUTF8, PIPELINING, SIZE, STARTTLS, AUTH PLAIN, FUTURERELEASE, MT-PRIORITY</td>
+<td>SMTPUTF8, PIPELINING, SIZE, STARTTLS, AUTH (full SASL mechanism set), FUTURERELEASE, MT-PRIORITY</td>
 </tr>
 </tbody>
 </table>
 <h2 id="architecture">Architecture</h2>
 <pre><code>Client ──TCP──► SmtpControlHandler
                    │ HELO/EHLO → HelloHandler
-                   │ AUTH PLAIN → TrustPolicy (optional)
+                   │ AUTH → CredentialStore, full SASL set (optional)
                    │ MAIL/RCPT → staged SPI
                    │ DATA/BDAT → MessageDataHandler (streamed)
                    │
@@ -223,8 +223,8 @@
 <td>Upgrade when acceptor configured</td>
 </tr>
 <tr>
-<td>AUTH PLAIN</td>
-<td>SASL PLAIN when policy + TLS</td>
+<td>AUTH</td>
+<td>Full SASL mechanism set when a <code>store</code> is configured, filtered by TLS requirement</td>
 </tr>
 </tbody>
 </table>
@@ -245,7 +245,7 @@
 <p>Conditional:</p>
 <ul>
 <li><strong>STARTTLS</strong> — when <code>tls_acceptor</code> is set and the session is not yet TLS</li>
-<li><strong>AUTH PLAIN</strong> — when <code>policy</code> is set <strong>and</strong> the session is TLS-protected</li>
+<li><strong>AUTH &lt;mechanisms&gt;</strong> — when <code>store</code> is set; lists each mechanism <code>store.supported_mechanisms()</code> returns, filtered to drop TLS-only mechanisms (PLAIN, LOGIN, OAUTHBEARER, EXTERNAL) until the session is TLS-protected</li>
 </ul>
 <h2 id="mail-rcpt-parameters">MAIL / RCPT parameters</h2>
 <p><strong>MAIL FROM</strong> parsed: SIZE, BODY, SMTPUTF8, REQUIRETLS, MT-PRIORITY, RET, ENVID, HOLDFOR, HOLDUNTIL, BY.</p>
@@ -278,21 +278,19 @@
 </tr>
 </tbody>
 </table>
-<p>AUTH PLAIN is only advertised after TLS is up (when a policy is configured).</p>
+<p>AUTH is only advertised once TLS is up for mechanisms that require it (PLAIN, LOGIN, OAUTHBEARER, EXTERNAL); TLS-independent mechanisms (CRAM-MD5, DIGEST-MD5, SCRAM-SHA-256) are advertised as soon as a store is configured, even pre-TLS.</p>
 <h2 id="authentication">Authentication</h2>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span>PasswordTrustPolicy<span class="op">;</span></span>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_auth::</span>PasswordStore<span class="op">;</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span><span class="op">{</span>SmtpConfig<span class="op">,</span> SmtpService<span class="op">};</span></span>
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> policy <span class="op">=</span> <span class="pp">PasswordTrustPolicy::</span><span class="kw">default</span>()</span>
-<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_user(<span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;secret&quot;</span>)</span>
-<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>shared()<span class="op">;</span></span>
-<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">SmtpConfig::</span>new(addr<span class="op">,</span> <span class="st">&quot;mail.example&quot;</span><span class="op">.</span>into())</span>
-<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_tls(acceptor)</span>
-<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_policy(policy)</span>
-<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>auth_required(<span class="cn">true</span>)<span class="op">;</span></span></code></pre></div>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> store <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">PasswordStore::</span>new()<span class="op">.</span>with_user(<span class="st">&quot;alice&quot;</span><span class="op">,</span> <span class="st">&quot;secret&quot;</span>))<span class="op">;</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> config <span class="op">=</span> <span class="pp">SmtpConfig::</span>new(addr<span class="op">,</span> <span class="st">&quot;mail.example&quot;</span><span class="op">.</span>into())</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_tls(acceptor)</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_store(store)</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>auth_required(<span class="cn">true</span>)<span class="op">;</span></span></code></pre></div>
 <ul>
 <li><code>auth_required</code> — reject MAIL until AUTH succeeds.</li>
-<li>Mechanism: <strong>AUTH PLAIN</strong> only on the wire today (store may support more via <a href="auth.html"><code>hopf-auth</code></a>; SMTP advertises PLAIN).</li>
+<li>Mechanisms: the full <a href="auth.html"><code>hopf-auth</code></a> SASL set the store supports — <code>PasswordStore</code> drives all seven (PLAIN, LOGIN, CRAM-MD5, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL) — same pattern as <a href="pop3.html">POP3</a>/<a href="imap.html">IMAP</a>.</li>
 </ul>
 <h2 id="handler-spi">Handler SPI</h2>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> SmtpHandlerFactory<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>
@@ -565,15 +563,15 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 <td>SMTPS from first byte</td>
 </tr>
 <tr>
-<td><code>policy</code></td>
-<td><code>Option&lt;Arc&lt;dyn TrustPolicy&gt;&gt;</code></td>
+<td><code>store</code></td>
+<td><code>Option&lt;Arc&lt;dyn CredentialStore&gt;&gt;</code></td>
 <td><code>None</code></td>
-<td>AUTH PLAIN</td>
+<td>AUTH — full SASL mechanism set</td>
 </tr>
 </tbody>
 </table>
 <p><strong>Constants:</strong> <code>DEFAULT_MAX_MESSAGE_SIZE</code> = 35 MiB; <code>DEFAULT_MAX_RECIPIENTS</code> = 100.</p>
-<p><strong>Builders:</strong> <code>SmtpConfig::new(listen, hostname)</code>, <code>.with_tls</code>, <code>.implicit_tls()</code>, <code>.auth_required(bool)</code>, <code>.with_policy</code>.</p>
+<p><strong>Builders:</strong> <code>SmtpConfig::new(listen, hostname)</code>, <code>.with_tls</code>, <code>.implicit_tls()</code>, <code>.auth_required(bool)</code>, <code>.with_store</code>.</p>
 <h3 id="smtpservice"><code>SmtpService</code></h3>
 <table>
 <thead>
@@ -751,7 +749,6 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 <li>Local delivery is final APPEND only (no outbound queue/retry); wrong-domain RCPT is relay-denied.</li>
 <li>Relay is open MX only; STARTTLS to arbitrary MX is incomplete.</li>
 <li>EXPN / ETRN not useful; VRFY always <code>252</code>.</li>
-<li>AUTH PLAIN only (no LOGIN/CRAM/SCRAM on SMTP wire yet).</li>
 <li>SPF's <code>%{p}</code> macro always resolves to <code>"unknown"</code> rather than doing the discouraged PTR-then-forward-confirm lookup; DMARCbis <code>np=</code> is parsed but not enforced, <code>psd=</code> isn't parsed (see <a href="conformance.html#smtp">conformance</a>).</li>
 <li>Client completion is callback-driven — callers wait on their own signalling (see <code>examples/smtp-send</code>).</li>
 </ul>

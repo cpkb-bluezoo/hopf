@@ -7,10 +7,12 @@
 
 #![cfg(feature = "integration")]
 
-use std::net::SocketAddr;
+use std::io::{self, Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hopf_auth::PasswordStore;
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_tls::{acceptor_from_pem, connector};
 
@@ -156,6 +158,196 @@ fn client_starttls_send() {
     let got = capture.lock().unwrap().clone();
     assert!(
         got.windows(b"secret".len()).any(|w| w == b"secret"),
+        "capture={got:?}"
+    );
+}
+
+fn start_smtp_server_with_store(store: Arc<PasswordStore>) -> (Arc<Runtime>, SocketAddr) {
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(listen, "test.example.com").with_store(store);
+    let handler = AcceptAllSmtpHandler::new("test.example.com");
+    let factory = Arc::new(AcceptAllSmtpHandlerFactory::new(handler));
+    let service = SmtpService::with_handler_factory(config, factory);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+    (rt, bound)
+}
+
+fn write_cmd(stream: &mut TcpStream, cmd: &[u8]) {
+    stream.write_all(cmd).unwrap();
+    stream.flush().unwrap();
+}
+
+/// Read until `pred` matches the accumulated text (bounded by read timeout).
+fn read_until(stream: &mut TcpStream, buf: &mut [u8], pred: impl Fn(&str) -> bool) -> String {
+    let mut acc = String::new();
+    for _ in 0..100 {
+        match stream.read(buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                acc.push_str(std::str::from_utf8(&buf[..n]).unwrap_or(""));
+                if pred(&acc) {
+                    return acc;
+                }
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+    acc
+}
+
+/// SMTP AUTH must drive the full mechanism menu, not just PLAIN — matching
+/// the pattern already established for hopf-pop3/hopf-imap (#111).
+#[test]
+fn smtp_auth_cram_md5_raw() {
+    let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
+    let (rt, addr) = start_smtp_server_with_store(store);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = vec![0u8; 8192];
+    read_until(&mut stream, &mut buf, |s| s.contains("220 "));
+
+    write_cmd(&mut stream, b"EHLO client.example\r\n");
+    let ehlo = read_until(&mut stream, &mut buf, |s| s.contains("250 "));
+    assert!(ehlo.contains("CRAM-MD5"), "expected CRAM-MD5 in {ehlo}");
+
+    write_cmd(&mut stream, b"AUTH CRAM-MD5\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("334 "));
+    let b64 = r.trim().strip_prefix("334 ").expect("continuation prefix");
+    let challenge = String::from_utf8(rmimeparser::charset::base64::decode(b64).unwrap())
+        .expect("challenge is ASCII");
+    let digest = hopf_auth::cram_md5::compute_response("secret", &challenge);
+    let response = format!("alice {digest}");
+    write_cmd(
+        &mut stream,
+        format!(
+            "{}\r\n",
+            rmimeparser::charset::base64::encode(response.as_bytes())
+        )
+        .as_bytes(),
+    );
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("235 ") || s.starts_with("535 "));
+    assert!(r.starts_with("235 "), "authenticate cram-md5: {r}");
+
+    write_cmd(&mut stream, b"MAIL FROM:<a@b.com>\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("250 ") || s.starts_with("5"));
+    assert!(r.starts_with("250 "), "mail from after CRAM-MD5 auth: {r}");
+    drop(rt);
+}
+
+/// LOGIN requires TLS — over a plain connection it must be refused up
+/// front, never even reaching the username challenge.
+#[test]
+fn smtp_auth_login_mechanism_requires_tls() {
+    let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
+    let (rt, addr) = start_smtp_server_with_store(store);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = vec![0u8; 8192];
+    read_until(&mut stream, &mut buf, |s| s.contains("220 "));
+    write_cmd(&mut stream, b"EHLO client.example\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("250 "));
+
+    write_cmd(&mut stream, b"AUTH LOGIN\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("538 ") || s.starts_with("334 "));
+    assert!(
+        r.starts_with("538 "),
+        "LOGIN mechanism must be refused without TLS: {r}"
+    );
+    drop(rt);
+}
+
+#[test]
+fn smtp_auth_unsupported_mechanism_is_rejected() {
+    let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
+    let (rt, addr) = start_smtp_server_with_store(store);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = vec![0u8; 8192];
+    read_until(&mut stream, &mut buf, |s| s.contains("220 "));
+    write_cmd(&mut stream, b"EHLO client.example\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("250 "));
+
+    write_cmd(&mut stream, b"AUTH GSSAPI\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("504 "));
+    assert!(r.starts_with("504 "), "GSSAPI is not implemented: {r}");
+    drop(rt);
+}
+
+/// EHLO's AUTH line must list every mechanism the store can drive,
+/// filtered by TLS requirement — not just a hardcoded `AUTH PLAIN`.
+#[test]
+fn smtp_ehlo_lists_mechanisms_filtered_by_tls() {
+    let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
+    let (rt, addr) = start_smtp_server_with_store(store);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = vec![0u8; 8192];
+    read_until(&mut stream, &mut buf, |s| s.contains("220 "));
+    write_cmd(&mut stream, b"EHLO client.example\r\n");
+    let ehlo = read_until(&mut stream, &mut buf, |s| s.contains("250 "));
+
+    for present in ["CRAM-MD5", "DIGEST-MD5", "SCRAM-SHA-256"] {
+        assert!(ehlo.contains(present), "expected {present} in {ehlo}");
+    }
+    for absent in ["PLAIN", "LOGIN", "OAUTHBEARER", "EXTERNAL"] {
+        assert!(
+            !ehlo.contains(absent),
+            "{absent} requires TLS, must not be advertised on a plain connection: {ehlo}"
+        );
+    }
+    drop(rt);
+}
+
+/// `SmtpSend`'s auto-pilot must drive the full client-side SASL exchange
+/// (#114), not just PLAIN — including absorbing SCRAM-SHA-256's trailing
+/// `v=` verifier continuation rather than treating it as an abort-worthy
+/// unexpected challenge.
+#[test]
+fn client_auth_scram_send() {
+    let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(listen, "test.example.com").with_store(store);
+    let handler = AcceptAllSmtpHandler::new("test.example.com").with_capture(Arc::clone(&capture));
+    let factory = Arc::new(AcceptAllSmtpHandlerFactory::new(handler));
+    let service = SmtpService::with_handler_factory(config, factory);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+
+    let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let done2 = Arc::clone(&done);
+    let send = SmtpSend::new("client.example")
+        .mail_from("a@b.com")
+        .rcpt_to("c@d.com")
+        .message_with(once(b"Subject: scram\r\n\r\nauthenticated hello\r\n".to_vec()))
+        .auth_plain("alice", "secret")
+        .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
+
+    SmtpClient::from_addr(bound)
+        .timeouts(SmtpClientTimeouts {
+            stage: Duration::from_secs(3),
+            ..Default::default()
+        })
+        .connect(&rt, Arc::new(send))
+        .unwrap();
+
+    assert!(wait_for(|| done.lock().unwrap().is_some(), 3000), "delivery timed out");
+    assert_eq!(*done.lock().unwrap(), Some(true), "SCRAM-authenticated delivery should succeed");
+
+    std::thread::sleep(Duration::from_millis(50));
+    let got = capture.lock().unwrap().clone();
+    assert!(
+        got.windows(b"authenticated hello".len()).any(|w| w == b"authenticated hello"),
         "capture={got:?}"
     );
 }
