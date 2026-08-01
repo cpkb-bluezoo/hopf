@@ -11,6 +11,7 @@ pub struct SecurityInfo {
     cipher_suite: Option<String>,
     sni: Option<String>,
     peer_certificate_fingerprint: Option<String>,
+    peer_certificate_chain: Option<Vec<Vec<u8>>>,
 }
 
 impl SecurityInfo {
@@ -53,6 +54,14 @@ impl SecurityInfo {
         self.peer_certificate_fingerprint.as_deref()
     }
 
+    /// The peer's full certificate chain (DER-encoded, leaf certificate
+    /// first), when one was presented during the handshake. Server side
+    /// this is the client certificate chain (mTLS); client side it is the
+    /// server's certificate chain.
+    pub fn peer_certificate_chain(&self) -> Option<&[Vec<u8>]> {
+        self.peer_certificate_chain.as_deref()
+    }
+
     /// Builder used by TLS/QUIC layers (Tranche 3+).
     pub fn secure(alpn: Option<Vec<u8>>, protocol: Option<String>, cipher_suite: Option<String>) -> Self {
         Self {
@@ -62,6 +71,7 @@ impl SecurityInfo {
             cipher_suite,
             sni: None,
             peer_certificate_fingerprint: None,
+            peer_certificate_chain: None,
         }
     }
 
@@ -74,6 +84,12 @@ impl SecurityInfo {
     /// Attach the peer's client-certificate fingerprint (server side, mTLS).
     pub fn with_peer_certificate_fingerprint(mut self, fingerprint: Option<String>) -> Self {
         self.peer_certificate_fingerprint = fingerprint;
+        self
+    }
+
+    /// Attach the peer's full certificate chain (DER, leaf first).
+    pub fn with_peer_certificate_chain(mut self, chain: Option<Vec<Vec<u8>>>) -> Self {
+        self.peer_certificate_chain = chain;
         self
     }
 }

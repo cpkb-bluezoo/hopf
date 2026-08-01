@@ -305,7 +305,7 @@
 <span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb3-10"><a href="#cb3-10" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> HelloHandler<span class="op">:</span> <span class="bu">Send</span> <span class="op">{</span></span>
 <span id="cb3-11"><a href="#cb3-11" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> hello(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> HelloState<span class="op">,</span> extended<span class="op">:</span> <span class="dt">bool</span><span class="op">,</span> hostname<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
-<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> tls_established(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>)<span class="op">;</span></span>
+<span id="cb3-12"><a href="#cb3-12" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> tls_established(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> info<span class="op">:</span> <span class="op">&amp;</span>hopf_core<span class="op">::</span>SecurityInfo)<span class="op">;</span></span>
 <span id="cb3-13"><a href="#cb3-13" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> authenticated(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> state<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> AuthenticateState<span class="op">,</span> user<span class="op">:</span> <span class="op">&amp;</span><span class="dt">str</span>)<span class="op">;</span></span>
 <span id="cb3-14"><a href="#cb3-14" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> quit(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span>)<span class="op">;</span></span>
 <span id="cb3-15"><a href="#cb3-15" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span>
@@ -367,7 +367,7 @@
 </tr>
 </tbody>
 </table>
-<p><code>SmtpConnectionMetadata</code>: <code>peer</code>, <code>local</code>, <code>tls</code>, <code>authenticated_user</code>, <code>smtputf8</code>, <code>control_handle</code>.</p>
+<p><code>SmtpConnectionMetadata</code>: <code>peer</code>, <code>local</code>, <code>tls</code>, <code>authenticated_user</code>, <code>smtputf8</code>, <code>control_handle</code>, <code>security_info</code>. The last is a <a href="architecture.html"><code>hopf_core::SecurityInfo</code></a> snapshot (cipher suite, protocol version, and the peer&#8217;s certificate chain when mTLS is in use) taken at connect time and refreshed after STARTTLS &#8212; also passed directly to <code>HelloHandler::tls_established</code>.</p>
 <p>State traits (<code>ConnectedState</code>, <code>HelloState</code>, <code>MailFromState</code>, …) expose accept/reject and deferred-delivery hooks (<code>DeferredDelivery</code>).</p>
 <h2 id="pipelines">Pipelines</h2>
 <p>Optional per-transaction <code>SmtpPipeline</code>:</p>

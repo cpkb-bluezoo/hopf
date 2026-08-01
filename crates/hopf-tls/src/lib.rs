@@ -358,14 +358,16 @@ impl TlsSession for RustlsServerSession {
             .negotiated_cipher_suite()
             .map(|cs| format!("{:?}", cs.suite()));
         let sni = self.conn.server_name().map(|s| s.to_string());
-        let peer_certificate_fingerprint = self
-            .conn
-            .peer_certificates()
+        let peer_certificates = self.conn.peer_certificates();
+        let peer_certificate_fingerprint = peer_certificates
             .and_then(|certs| certs.first())
             .map(|leaf| sha256_hex(leaf));
+        let peer_certificate_chain = peer_certificates
+            .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect());
         SecurityInfo::secure(alpn, protocol, cipher_suite)
             .with_sni(sni)
             .with_peer_certificate_fingerprint(peer_certificate_fingerprint)
+            .with_peer_certificate_chain(peer_certificate_chain)
     }
 
     fn send_close_notify(&mut self) {
@@ -471,7 +473,15 @@ impl TlsSession for RustlsClientSession {
             .conn
             .negotiated_cipher_suite()
             .map(|cs| format!("{:?}", cs.suite()));
+        let peer_certificates = self.conn.peer_certificates();
+        let peer_certificate_fingerprint = peer_certificates
+            .and_then(|certs| certs.first())
+            .map(|leaf| sha256_hex(leaf));
+        let peer_certificate_chain = peer_certificates
+            .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect());
         SecurityInfo::secure(alpn, protocol, cipher_suite)
+            .with_peer_certificate_fingerprint(peer_certificate_fingerprint)
+            .with_peer_certificate_chain(peer_certificate_chain)
     }
 
     fn send_close_notify(&mut self) {
@@ -986,12 +996,16 @@ mod tests {
         echo_roundtrip(&mut tls, b"hi");
 
         wait_for(&infos, 1);
-        let fingerprint = infos.lock().unwrap()[0]
+        let info = infos.lock().unwrap()[0].clone();
+        let fingerprint = info
             .peer_certificate_fingerprint()
             .expect("fingerprint set")
             .to_string();
         let expected = sha256_hex(&client_certified.cert.der().clone());
         assert_eq!(fingerprint, expected);
+        let chain = info.peer_certificate_chain().expect("chain set");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0], client_certified.cert.der().to_vec());
 
         rt.shutdown();
     }

@@ -474,7 +474,7 @@ mod dmarc_pipeline {
         fn hello(&mut self, state: &mut dyn HelloState, _extended: bool, _hostname: &str) {
             state.accept_hello(Box::new(self.clone()));
         }
-        fn tls_established(&mut self) {}
+        fn tls_established(&mut self, _info: &hopf_core::SecurityInfo) {}
         fn authenticated(&mut self, state: &mut dyn AuthenticateState, _user: &str) {
             state.accept(Box::new(self.clone()));
         }
