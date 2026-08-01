@@ -10,7 +10,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use hopf_core::ConnHandle;
+use hopf_core::{ConnHandle, SecurityInfo};
 
 use crate::headers::Headers;
 use crate::version::HttpVersion;
@@ -37,6 +37,11 @@ impl std::error::Error for HttpClientError {}
 
 /// Connection lifecycle for an outbound HTTP client (Gumdrop `HTTPClientHandler`).
 pub trait HttpConnectionHandler: Send + Sync {
+    /// TLS handshake completed (Gumdrop `onSecurityEstablished`). Fires
+    /// before [`Self::on_connected`] on secure connections only — plaintext
+    /// dials never call this. Default: ignore.
+    fn on_security_established(&mut self, _info: &SecurityInfo) {}
+
     /// Transport is ready; create and send requests via `session`.
     fn on_connected(&mut self, session: &mut HttpClientSessionHandle);
 

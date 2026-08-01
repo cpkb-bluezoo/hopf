@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use hopf_core::ConnHandle;
 
 use crate::headers::Headers;
-use crate::stream::{ProtocolUpgradeHandler, ResponseControl, ServerResponseHandle, ServerWriter};
+use crate::stream::{
+    ConnectionInfo, ProtocolUpgradeHandler, ResponseControl, ServerResponseHandle, ServerWriter,
+};
 
 /// Outbound response fields for one server stream (shared with deferred execute).
 pub(crate) struct H2WriterShared {
@@ -48,6 +50,7 @@ pub(crate) struct H2ResponseControl {
     #[allow(dead_code)]
     pub stream_id: u32,
     conn: Mutex<ConnHandle>,
+    connection_info: Mutex<ConnectionInfo>,
     flush: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub shared: Arc<Mutex<H2WriterShared>>,
 }
@@ -57,6 +60,7 @@ impl H2ResponseControl {
         Arc::new(Self {
             stream_id,
             conn: Mutex::new(ConnHandle::from_execute(Arc::new(|task| task()))),
+            connection_info: Mutex::new(ConnectionInfo::default()),
             flush: Mutex::new(None),
             shared: Arc::new(Mutex::new(H2WriterShared::new())),
         })
@@ -64,6 +68,14 @@ impl H2ResponseControl {
 
     pub(crate) fn bind_conn(&self, conn: ConnHandle) {
         *self.conn.lock().unwrap() = conn;
+    }
+
+    pub(crate) fn bind_connection_info(&self, info: ConnectionInfo) {
+        *self.connection_info.lock().unwrap() = info;
+    }
+
+    pub(crate) fn connection_info(&self) -> ConnectionInfo {
+        self.connection_info.lock().unwrap().clone()
     }
 
     pub(crate) fn set_flush(&self, flush: Option<Arc<dyn Fn() + Send + Sync>>) {
@@ -209,6 +221,10 @@ impl ServerWriter for H2SessionWriter {
         self.control.conn_handle()
     }
 
+    fn connection_info(&self) -> ConnectionInfo {
+        self.control.connection_info()
+    }
+
     fn response_handle(&self) -> ServerResponseHandle {
         ServerResponseHandle::new(ArcH2ResponseControl::new(Arc::clone(&self.control)))
     }
@@ -245,5 +261,29 @@ mod tests {
             Some("0")
         );
         assert_eq!(shared.body, b"abc");
+    }
+
+    #[test]
+    fn connection_info_round_trips_through_writer() {
+        let control = H2ResponseControl::new(1);
+        let remote: std::net::SocketAddr = "203.0.113.5:9000".parse().unwrap();
+        let local: std::net::SocketAddr = "198.51.100.7:443".parse().unwrap();
+        let info = ConnectionInfo::new(
+            Some(remote),
+            Some(local),
+            hopf_core::SecurityInfo::secure(
+                Some(b"h2".to_vec()),
+                Some("TLSv1.3".into()),
+                Some("TLS_AES_128_GCM_SHA256".into()),
+            ),
+        );
+        control.bind_connection_info(info);
+
+        let w = control.writer();
+        let got = ServerWriter::connection_info(&w);
+        assert_eq!(got.remote_addr(), Some(remote));
+        assert_eq!(got.local_addr(), Some(local));
+        assert!(got.is_secure());
+        assert_eq!(got.security_info().alpn(), Some(&b"h2"[..]));
     }
 }

@@ -550,6 +550,15 @@ impl ProtocolHandler for H2HttpClientSession {
     }
 
     fn security_established(&mut self, endpoint: &mut dyn Endpoint, info: &hopf_core::SecurityInfo) {
+        // Forward to the stashed HttpConnectionHandler without consuming it —
+        // `maybe_notify_connected` below still needs to `take()` it.
+        {
+            let g = self.shared.lock().unwrap();
+            let mut handler = g.config.handler.lock().unwrap();
+            if let Some(h) = handler.as_mut() {
+                h.on_security_established(info);
+            }
+        }
         self.inner.security_established(endpoint, info);
         self.forward_outbound(endpoint);
         self.maybe_notify_connected(endpoint);

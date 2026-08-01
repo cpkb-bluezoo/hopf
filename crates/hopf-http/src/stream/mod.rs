@@ -11,8 +11,8 @@ mod server;
 
 pub use client::{ClientHandler, ClientHandlerFactory, ClientWriter};
 pub use server::{
-    ProtocolUpgradeHandler, ServerHandler, ServerHandlerFactory, ServerResponseHandle,
-    ServerWriter,
+    ConnectionInfo, ProtocolUpgradeHandler, ServerHandler, ServerHandlerFactory,
+    ServerResponseHandle, ServerWriter,
 };
 pub(crate) use server::ResponseControl;
 

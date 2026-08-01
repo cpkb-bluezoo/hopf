@@ -62,6 +62,17 @@ impl H1SessionClientCodec {
         Arc::new(Mutex::new(OpsBridge(Arc::clone(&self.inner))))
     }
 
+    /// Forward a completed TLS handshake to the stashed
+    /// [`HttpConnectionHandler`], without consuming it — [`Self::on_connected`]
+    /// still needs to `take()` it afterward.
+    pub fn notify_security_established(&mut self, info: &hopf_core::SecurityInfo) {
+        let inner = self.inner.lock().unwrap();
+        let mut handler = inner.config.handler.lock().unwrap();
+        if let Some(h) = handler.as_mut() {
+            h.on_security_established(info);
+        }
+    }
+
     pub fn on_connected(&mut self, conn_handle: ConnHandle) {
         let ops = self.request_ops();
         let handler = {
@@ -774,6 +785,60 @@ mod tests {
         assert_eq!(g.status, 200);
         assert_eq!(g.body, b"hello");
         assert!(g.done);
+    }
+
+    struct SecurityRec {
+        established_alpn: Option<Vec<u8>>,
+        connected: bool,
+        order_ok: bool,
+    }
+
+    struct SecurityConn {
+        rec: Arc<Mutex<SecurityRec>>,
+    }
+
+    impl HttpConnectionHandler for SecurityConn {
+        fn on_security_established(&mut self, info: &hopf_core::SecurityInfo) {
+            let mut g = self.rec.lock().unwrap();
+            g.established_alpn = info.alpn().map(|a| a.to_vec());
+            g.order_ok = !g.connected;
+        }
+
+        fn on_connected(&mut self, _session: &mut HttpClientSessionHandle) {
+            self.rec.lock().unwrap().connected = true;
+        }
+    }
+
+    #[test]
+    fn security_established_fires_before_connected_on_tls_dial() {
+        let rec = Arc::new(Mutex::new(SecurityRec {
+            established_alpn: None,
+            connected: false,
+            order_ok: false,
+        }));
+        let config = Arc::new(H1SessionConfig {
+            host: "ex.com".into(),
+            port: 443,
+            limits: HttpLimits::default(),
+            secure: true,
+            handler: Mutex::new(Some(Box::new(SecurityConn {
+                rec: Arc::clone(&rec),
+            }))),
+            stage: Duration::ZERO,
+        });
+        let mut codec = H1SessionClientCodec::new(config);
+        let info = hopf_core::SecurityInfo::secure(
+            Some(b"http/1.1".to_vec()),
+            Some("TLSv1.3".into()),
+            None,
+        );
+        codec.notify_security_established(&info);
+        codec.on_connected(ConnHandle::from_execute(Arc::new(|task| task())));
+
+        let g = rec.lock().unwrap();
+        assert_eq!(g.established_alpn.as_deref(), Some(&b"http/1.1"[..]));
+        assert!(g.connected);
+        assert!(g.order_ok, "on_security_established must fire before on_connected");
     }
 
     struct NullHandler;
