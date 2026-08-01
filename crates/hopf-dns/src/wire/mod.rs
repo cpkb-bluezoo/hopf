@@ -23,5 +23,7 @@ pub use message::{
 pub use name::{canonical_compare, decode_name, encode_name, normalize_name};
 pub use query_id::DnsQueryIdGenerator;
 pub use question::DnsQuestion;
-pub use rr::{DnsResourceRecord, EDNS_FLAG_DO, OPT_UDP_PAYLOAD};
+pub use rr::{
+    encode_edns_padding, DnsResourceRecord, EDNS_FLAG_DO, EDNS_OPTION_PADDING, OPT_UDP_PAYLOAD,
+};
 pub use r#type::DnsType;
