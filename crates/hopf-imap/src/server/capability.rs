@@ -2,6 +2,8 @@
 
 //! IMAP CAPABILITY string construction.
 
+use hopf_auth::CredentialStore;
+
 use crate::ImapConfig;
 
 /// Build the space-separated capability list advertised to clients.
@@ -16,7 +18,13 @@ pub fn build_capabilities(config: &ImapConfig, authenticated: bool, tls: bool) -
     }
 
     if !authenticated {
-        caps.push("AUTH=PLAIN".to_string());
+        // RFC 9051 §6.2.2: advertise each mechanism the store can drive,
+        // except ones that require TLS on a connection that doesn't have it.
+        for mech in config.store.supported_mechanisms() {
+            if tls || !mech.requires_tls() {
+                caps.push(format!("AUTH={}", mech.name()));
+            }
+        }
         if !tls && config.tls_acceptor.is_some() && !config.implicit_tls {
             caps.push("LOGINDISABLED".to_string());
         }

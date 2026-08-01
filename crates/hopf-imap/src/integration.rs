@@ -962,3 +962,117 @@ fn client_idle_exists_done_scripted() {
     assert!(seen.contains(&2), "EXISTS events: {seen:?}");
     drop(rt);
 }
+
+// ── AUTHENTICATE: SASL mechanisms beyond PLAIN (issue #128) ────────────────────
+
+/// CRAM-MD5 doesn't require TLS, so this exercises the full non-PLAIN
+/// dispatch — mechanism lookup, server-first challenge, `create_server`,
+/// and completion — over a plain connection.
+#[test]
+fn server_authenticate_cram_md5_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 8192];
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+
+    write_cmd(&mut stream, b"a1 AUTHENTICATE CRAM-MD5\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("+ ") && s.ends_with("\r\n"));
+    assert!(r.contains("+ "), "cram-md5 challenge: {r}");
+    let b64 = r.trim().strip_prefix("+ ").expect("continuation prefix");
+    let challenge = String::from_utf8(rmimeparser::charset::base64::decode(b64).unwrap())
+        .expect("challenge is ASCII");
+    let digest = hopf_auth::cram_md5::compute_response("secret", &challenge);
+    let response = format!("alice {digest}");
+    write_cmd(
+        &mut stream,
+        format!(
+            "{}\r\n",
+            rmimeparser::charset::base64::encode(response.as_bytes())
+        )
+        .as_bytes(),
+    );
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
+    assert!(r.contains("a1 OK"), "authenticate cram-md5: {r}");
+
+    write_cmd(&mut stream, b"a2 SELECT INBOX\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
+    assert!(r.contains("a2 OK"), "select after CRAM-MD5 auth: {r}");
+    drop(rt);
+}
+
+/// LOGIN (the SASL mechanism, not the LOGIN command) requires TLS, matching
+/// Gumdrop — over a plain connection it must be refused up front, never
+/// even reaching the username challenge.
+#[test]
+fn server_authenticate_login_mechanism_requires_tls() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 8192];
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+
+    write_cmd(&mut stream, b"a1 AUTHENTICATE LOGIN\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
+    assert!(
+        r.contains("a1 NO"),
+        "LOGIN mechanism must be refused without TLS: {r}"
+    );
+    assert!(
+        !r.contains("+ "),
+        "must not even prompt for a username before the TLS check: {r}"
+    );
+    drop(rt);
+}
+
+#[test]
+fn server_authenticate_unsupported_mechanism_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 8192];
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+
+    write_cmd(&mut stream, b"a1 AUTHENTICATE GSSAPI\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
+    assert!(r.contains("a1 NO"), "GSSAPI is not implemented: {r}");
+    drop(rt);
+}
+
+/// The greeting's inline CAPABILITY must list every mechanism the store can
+/// drive, filtered by TLS requirement — not just a hardcoded `AUTH=PLAIN`.
+#[test]
+fn server_capability_lists_mechanisms_filtered_by_tls() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 8192];
+    let greet = read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+
+    for present in ["AUTH=CRAM-MD5", "AUTH=DIGEST-MD5", "AUTH=SCRAM-SHA-256"] {
+        assert!(greet.contains(present), "expected {present} in {greet}");
+    }
+    for absent in ["AUTH=PLAIN", "AUTH=LOGIN", "AUTH=OAUTHBEARER", "AUTH=EXTERNAL"] {
+        assert!(
+            !greet.contains(absent),
+            "{absent} requires TLS, must not be advertised on a plain connection: {greet}"
+        );
+    }
+    drop(rt);
+}
