@@ -393,7 +393,7 @@
 <tr><td>Subprotocol negotiation</td><td>§4.2.2</td><td>Compliant</td><td><code>negotiate_subprotocol</code>: echoes configured protocol only when present in the client's offer list</td></tr>
 <tr><td>permessage-deflate / extensions</td><td>§9.1</td><td>Not implemented</td><td>Matches docs Limitations (RSV must be zero)</td></tr>
 <tr><td>Client: key generation</td><td>§4.1</td><td>Compliant</td><td><code>handshake.rs</code></td></tr>
-<tr><td>Client: 101 response validation</td><td>§4.1 step 5</td><td>Not implemented</td><td>Nothing reads/validates an inbound 101's headers or recomputes/compares Accept — matches docs ("primary factory path is server-oriented")</td></tr>
+<tr><td>Client: 101 response validation</td><td>§4.1 step 5</td><td>Compliant</td><td><code>validate_upgrade_response</code> / <code>WebSocketOpening</code> — status 101, Upgrade/Connection tokens, Accept recomputed vs sent key, subprotocol echo rules; call before entering <code>WsUpgradeHandler::client</code></td></tr>
 <tr><td>FIN/RSV/opcode handling, 7/16/64-bit length</td><td>§5.2</td><td>Compliant</td><td><code>frame.rs</code></td></tr>
 <tr><td>Masking direction (server rejects unmasked in, never masks out; client reverse)</td><td>§5.1/§5.3</td><td>Compliant</td><td><code>frame.rs</code>, <code>session.rs</code></td></tr>
 <tr><td>Protocol-error handling forces a real close</td><td>§7.1.7</td><td>Compliant</td><td>Writes Close (1002/1007/1009), sets <code>dead</code>, and <code>wants_close()</code> ends the H1 connection or H2/H3 stream</td></tr>

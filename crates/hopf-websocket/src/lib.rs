@@ -17,9 +17,10 @@ pub use frame::{
     write_frame, Opcode, WsFrameError, WsFrameHandler, WsFrameParser, WsRole, MAX_CONTROL_PAYLOAD,
 };
 pub use handshake::{
-    calculate_accept, generate_key, is_extended_connect_websocket, is_h1_websocket_upgrade,
-    negotiate_subprotocol, validate_h1_upgrade, websocket_accept_headers,
-    websocket_connect_response_headers, WEBSOCKET_GUID, WEBSOCKET_VERSION,
+    calculate_accept, create_upgrade_request, generate_key, is_extended_connect_websocket,
+    is_h1_websocket_upgrade, negotiate_subprotocol, validate_h1_upgrade,
+    validate_upgrade_response, websocket_accept_headers, websocket_connect_response_headers,
+    WebSocketOpening, WEBSOCKET_GUID, WEBSOCKET_VERSION,
 };
 pub use session::{
     framed_ws_conn_handle, write_binary, write_close, write_close_empty, write_ping, write_pong,
