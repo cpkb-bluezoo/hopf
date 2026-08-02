@@ -62,8 +62,9 @@ pub use stream::{
     ServerWriter,
 };
 pub use utils::{
-    is_chunked_te, is_default_method, is_invalid_te, is_token, is_valid_header_name, is_valid_host,
-    is_valid_request_target, method_implies_no_body, parse_content_length,
+    format_http_date, http_date_now, is_chunked_te, is_default_method, is_invalid_te, is_token,
+    is_valid_header_name, is_valid_host, is_valid_request_target, method_implies_no_body,
+    parse_content_length, parse_http_date,
 };
 pub use version::HttpVersion;
 pub use hopf_core::VERSION;

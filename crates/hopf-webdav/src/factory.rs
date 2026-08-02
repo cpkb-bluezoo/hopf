@@ -25,6 +25,9 @@ pub struct WebDavConfig {
     /// Maximum PUT upload size, checked incrementally as chunks arrive.
     /// Default: [`MAX_WEBDAV_PUT_BODY`](crate::constants::MAX_WEBDAV_PUT_BODY).
     pub max_put_body: u64,
+    /// Optional default `DAV:getcontentlanguage` live property value
+    /// (RFC 4918 §15.4). When `None`, the property is omitted from PROPFIND.
+    pub content_language: Option<String>,
 }
 
 impl Default for WebDavConfig {
@@ -36,6 +39,7 @@ impl Default for WebDavConfig {
             welcome_file: "index.html".to_string(),
             dead_property_storage: DeadPropMode::Auto,
             max_put_body: crate::constants::MAX_WEBDAV_PUT_BODY,
+            content_language: None,
         }
     }
 }
