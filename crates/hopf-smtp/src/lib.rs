@@ -36,7 +36,8 @@ pub use server::{
     SimpleRelayService, SmtpClientConnected, SmtpCommand, SmtpConfig, SmtpConnectionMetadata,
     SmtpControlHandler, SmtpHandlerFactory, SmtpPipeline, SmtpServerLexer, SmtpServerMetrics,
     SmtpService, SmtpSessionState, DEFAULT_MAX_MAIL_TRANSACTIONS, DEFAULT_MAX_MESSAGE_SIZE,
-    DEFAULT_MAX_RECIPIENTS, MAX_COMMAND_LINE,
+    DEFAULT_MAX_RECIPIENTS, MAX_COMMAND_LINE, XclientOverrides, XclientParseError, decode_xtext,
+    parse_xclient_args,
 };
 
 #[cfg(all(test, feature = "integration"))]

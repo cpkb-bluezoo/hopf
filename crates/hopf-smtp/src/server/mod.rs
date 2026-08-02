@@ -18,6 +18,7 @@ mod reply;
 mod service;
 mod session;
 mod spool;
+mod xclient;
 
 pub use codec::{SmtpCommand, SmtpServerLexer, MAX_COMMAND_LINE};
 pub use control::SmtpControlHandler;
@@ -44,3 +45,4 @@ pub use service::{
     DEFAULT_MAX_RECIPIENTS,
 };
 pub use session::{DataDotState, SmtpSessionState};
+pub use xclient::{decode_xtext, parse_xclient_args, XclientOverrides, XclientParseError};
