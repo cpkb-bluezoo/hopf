@@ -128,7 +128,7 @@
 </tr>
 </tbody>
 </table>
-<p>Content-type accepted: exact <code>application/grpc</code> or <code>application/grpc…</code> prefix.</p>
+<p>Content-types accepted: <code>application/grpc</code>, <code>application/grpc+proto</code>, and <code>application/grpc+json</code> (optional <code>;</code> parameters). Other subtypes (<code>+thrift</code>, <code>grpc-web*</code>, …) return HTTP 415. JSON payloads use the proto3 JSON mapping via <code>rjsonparser</code>; framing stays 5-byte length-prefixed.</p>
 <h2 id="architecture">Architecture</h2>
 <pre><code>HTTP Stream
     │ POST /pkg.Service/Method  content-type: application/grpc
@@ -220,7 +220,11 @@ GrpcService::start_unary_call → ProtoMessageHandler
 </tr>
 <tr>
 <td><code>ProtoModelAdapter</code> / <code>ProtoModelSerializer</code></td>
-<td>Encode helpers</td>
+<td>Protobuf wire encode/decode</td>
+</tr>
+<tr>
+<td><code>JsonModelAdapter</code> / <code>JsonModelSerializer</code></td>
+<td>Proto3 JSON encode/decode (<code>application/grpc+json</code>)</td>
 </tr>
 <tr>
 <td><code>ProtoParseError</code></td>
@@ -267,7 +271,8 @@ GrpcService::start_unary_call → ProtoMessageHandler
 <span id="cb6-6"><a href="#cb6-6" aria-hidden="true" tabindex="-1"></a>    req_bytes<span class="op">,</span></span>
 <span id="cb6-7"><a href="#cb6-7" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(MyResponseHandler)<span class="op">,</span></span>
 <span id="cb6-8"><a href="#cb6-8" aria-hidden="true" tabindex="-1"></a>)<span class="op">;</span></span>
-<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="co">// `call` is a ClientHandlerFactory — attach to H2/H1/H3 client endpoint</span></span></code></pre></div>
+<span id="cb6-9"><a href="#cb6-9" aria-hidden="true" tabindex="-1"></a><span class="co">// or client.unary_call_json(...) for application/grpc+json</span></span>
+<span id="cb6-10"><a href="#cb6-10" aria-hidden="true" tabindex="-1"></a><span class="co">// `call` is a ClientHandlerFactory — attach to H2/H1/H3 client endpoint</span></span></code></pre></div>
 <table>
 <thead>
 <tr>

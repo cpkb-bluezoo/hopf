@@ -2,9 +2,13 @@
 
 //! ProtoFile IDL model, `.proto` parser, and rprotobuf bridges.
 
+mod base64;
 mod enum_descriptor;
 mod field_descriptor;
 mod field_type;
+mod json_model_adapter;
+mod json_model_serializer;
+mod json_names;
 mod message_descriptor;
 mod proto_file;
 mod proto_file_parser;
@@ -18,6 +22,9 @@ mod service_descriptor;
 pub use enum_descriptor::{EnumDescriptor, EnumDescriptorBuilder};
 pub use field_descriptor::{FieldDescriptor, FieldDescriptorBuilder};
 pub use field_type::FieldType;
+pub use json_model_adapter::JsonModelAdapter;
+pub use json_model_serializer::JsonModelSerializer;
+pub use json_names::proto_json_name;
 pub use message_descriptor::{MessageDescriptor, MessageDescriptorBuilder};
 pub use proto_file::{ProtoFile, ProtoFileBuilder};
 pub use proto_file_parser::ProtoFileParser;
