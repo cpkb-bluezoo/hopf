@@ -286,8 +286,7 @@ impl MessageDataHandler for SimpleRelayHandler {
         }
 
         let deferred = state.defer(Box::new(self.clone()));
-        let addrs: Vec<EmailAddress> = self.recipients.iter().map(|(a, _)| a.clone()).collect();
-        let by_domain = group_by_domain(&addrs);
+        let by_domain = group_by_domain(&self.recipients);
         let domains: Vec<String> = by_domain.keys().cloned().collect();
         let tracker = Arc::new(Mutex::new(DeliveryTracker {
             deferred: Some(deferred),
@@ -353,11 +352,15 @@ fn render_extra_header_lines(lines: &[String]) -> Vec<u8> {
     out
 }
 
-fn group_by_domain(recipients: &[EmailAddress]) -> HashMap<String, Vec<EmailAddress>> {
+fn group_by_domain(
+    recipients: &[(EmailAddress, DsnRecipientParams)],
+) -> HashMap<String, Vec<(EmailAddress, DsnRecipientParams)>> {
     let mut map = HashMap::new();
-    for r in recipients {
+    for (r, params) in recipients {
         let domain = r.domain().to_ascii_lowercase();
-        map.entry(domain).or_insert_with(Vec::new).push(r.clone());
+        map.entry(domain)
+            .or_insert_with(Vec::new)
+            .push((r.clone(), params.clone()));
     }
     map
 }
@@ -502,7 +505,7 @@ impl DeliveryTracker {
 struct DeliveryContext {
     tracker: Arc<Mutex<DeliveryTracker>>,
     domains: Vec<String>,
-    recipients_by_domain: HashMap<String, Vec<EmailAddress>>,
+    recipients_by_domain: HashMap<String, Vec<(EmailAddress, DsnRecipientParams)>>,
     spool_path: Option<PathBuf>,
     extra_header_lines: Vec<String>,
     sender: Option<EmailAddress>,
@@ -557,7 +560,12 @@ impl DeliveryContext {
         self.deliver_next();
     }
 
-    fn deliver_to_host(self, domain: String, host: String, recipients: Vec<EmailAddress>) {
+    fn deliver_to_host(
+        self,
+        domain: String,
+        host: String,
+        recipients: Vec<(EmailAddress, DsnRecipientParams)>,
+    ) {
         let port = self.outbound_port;
         let dns = Arc::clone(&self.dns);
 
@@ -588,12 +596,11 @@ impl DeliveryContext {
         domain: String,
         host: String,
         addr: std::net::SocketAddr,
-        recipients: Vec<EmailAddress>,
+        recipients: Vec<(EmailAddress, DsnRecipientParams)>,
         tls_connector: Option<SharedTlsConnector>,
     ) {
         let hostname = self.hostname.clone();
         let sender = self.sender.as_ref().map(|s| s.address());
-        let recipient_addrs: Vec<String> = recipients.iter().map(|r| r.address()).collect();
         let tracker = Arc::clone(&self.tracker);
         let domain_for_cb = domain.clone();
 
@@ -641,8 +648,8 @@ impl DeliveryContext {
         if let Some(s) = sender {
             send = send.mail_from(s);
         }
-        for r in recipient_addrs {
-            send = send.rcpt_to(r);
+        for (addr, params) in &recipients {
+            send = send.rcpt_to_with(addr.address(), params.clone());
         }
 
         let mut client = SmtpClient::from_addr(addr);
@@ -799,9 +806,18 @@ mod tests {
     #[test]
     fn group_by_domain_buckets_case_insensitively() {
         let recipients = vec![
-            EmailAddress::new(None, "a", "Example.com", true),
-            EmailAddress::new(None, "b", "example.COM", true),
-            EmailAddress::new(None, "c", "other.example", true),
+            (
+                EmailAddress::new(None, "a", "Example.com", true),
+                DsnRecipientParams::default(),
+            ),
+            (
+                EmailAddress::new(None, "b", "example.COM", true),
+                DsnRecipientParams::default(),
+            ),
+            (
+                EmailAddress::new(None, "c", "other.example", true),
+                DsnRecipientParams::default(),
+            ),
         ];
         let groups = group_by_domain(&recipients);
         assert_eq!(groups.len(), 2);

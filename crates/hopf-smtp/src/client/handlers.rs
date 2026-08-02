@@ -149,9 +149,19 @@ pub trait SmtpClientDriver: Send {
 
     /// 354 — ready for DATA.
     ///
+    /// Also fired (without a preceding 354) when [`SmtpClientEnvelope::start_data`]
+    /// enters BDAT mode because the server advertised CHUNKING — check
+    /// [`SmtpClientMessageData::is_bdat_mode`] and use
+    /// [`SmtpClientMessageData::write_bdat_chunk`] instead of
+    /// `write_content` / `end_message`.
+    ///
     /// Write message content via `data.write_content(…)` then call
-    /// `data.end_message()`.
+    /// `data.end_message()`, or send BDAT chunks as described above.
     fn on_ready_for_data(&mut self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint);
+
+    /// 250 after a non-LAST `BDAT` chunk — send the next chunk via
+    /// [`SmtpClientMessageData::write_bdat_chunk`].
+    fn on_bdat_chunk_ok(&mut self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint);
 
     /// DATA command itself rejected (4xx/5xx), before any content was
     /// sent. Per RFC 5321 §3.3, the envelope (MAIL FROM, accepted RCPT

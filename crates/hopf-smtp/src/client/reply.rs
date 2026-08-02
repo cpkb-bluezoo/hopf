@@ -55,8 +55,10 @@ pub enum SmtpReplyShape {
     RcptTo,
     /// `DATA` (the command itself, before content).
     DataCommand,
-    /// End-of-data (`CRLF.CRLF`).
+    /// End-of-data (`CRLF.CRLF`), or a final `BDAT … LAST` chunk.
     DataEnd,
+    /// Intermediate `BDAT` chunk (non-LAST); expects 250 before the next chunk.
+    BdatChunk,
     /// `RSET`.
     Rset,
     /// `QUIT`.
@@ -143,6 +145,8 @@ pub enum SmtpEvent {
     },
     /// 354 — ready for DATA.
     ReadyForData,
+    /// 250 after a non-LAST `BDAT` chunk — ready for the next chunk.
+    BdatChunkOk,
     /// DATA command rejected, or the message rejected after end-of-data.
     MessageRejected {
         /// The server's 3-digit reply code.
@@ -467,6 +471,13 @@ impl SmtpReplyLexer {
                     Field::KeepText
                 }
             }
+            SmtpReplyShape::BdatChunk => {
+                if code == 250 {
+                    Field::SkipToEol
+                } else {
+                    Field::KeepText
+                }
+            }
             SmtpReplyShape::Rset => Field::SkipToEol, // RSET has no failure path
             SmtpReplyShape::Quit => Field::SkipToEol, // no reply text is used
             // Success/failure text both matter for VRFY (the resolved
@@ -658,6 +669,13 @@ impl SmtpReplyLexer {
             SmtpReplyShape::DataEnd => {
                 // 250 goes through Field::QueueIdText, not finish_reply.
                 SmtpEvent::MessageRejected { code, message: message.unwrap_or_default() }
+            }
+            SmtpReplyShape::BdatChunk => {
+                if code == 250 {
+                    SmtpEvent::BdatChunkOk
+                } else {
+                    SmtpEvent::MessageRejected { code, message: message.unwrap_or_default() }
+                }
             }
             SmtpReplyShape::Rset => SmtpEvent::RsetOk,
             SmtpReplyShape::Quit => return None, // no driver callback exists for QUIT
@@ -1014,6 +1032,24 @@ mod tests {
             vec![SmtpEvent::MessageRejected {
                 code: 503,
                 message: "Bad sequence of commands".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn bdat_chunk_ok_and_rejected() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::BdatChunk);
+        let mut data: &[u8] = b"250 OK\r\n";
+        assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::BdatChunkOk]);
+
+        lex.expect(SmtpReplyShape::BdatChunk);
+        let mut data2: &[u8] = b"554 Transaction failed\r\n";
+        assert_eq!(
+            lex.feed(&mut data2).unwrap(),
+            vec![SmtpEvent::MessageRejected {
+                code: 554,
+                message: "Transaction failed".into()
             }]
         );
     }

@@ -46,9 +46,11 @@ enum ProtoState {
     RcptToSent(String),
     /// DATA sent; waiting for 354.
     DataCommandSent,
-    /// Writing message data (dot-stuffed).
+    /// Writing message data (dot-stuffed DATA, or BDAT between chunks).
     DataMode,
-    /// End-of-data sent (CRLF.CRLF); waiting for 250/4xx/5xx.
+    /// Waiting for 250 after a non-LAST BDAT chunk.
+    BdatChunkSent,
+    /// End-of-data sent (CRLF.CRLF or BDAT … LAST); waiting for 250/4xx/5xx.
     DataEndSent,
     /// RSET sent; waiting for 250.
     RsetSent,
@@ -101,6 +103,12 @@ pub struct SmtpClientEndpoint {
     /// `on_auth_aborted` unconditionally instead of the normal
     /// AuthOk/AuthChallenge/AuthFailed dispatch.
     auth_aborting: bool,
+    /// Set by [`SmtpClientEnvelope::start_data`] when CHUNKING is available:
+    /// after the current driver callback returns, enter BDAT mode and fire
+    /// `on_ready_for_data` (no DATA command / 354 exchange).
+    pending_bdat: bool,
+    /// True while transferring via BDAT rather than DATA.
+    bdat_mode: bool,
     /// Connect budget remaining (reserved for future use).
     #[allow(dead_code)]
     connect_budget_remaining: Option<Duration>,
@@ -130,6 +138,8 @@ impl SmtpClientEndpoint {
             outbound: Vec::with_capacity(512),
             pending_tls: false,
             auth_aborting: false,
+            pending_bdat: false,
+            bdat_mode: false,
             connect_budget_remaining: None,
         }
     }
@@ -241,8 +251,9 @@ impl SmtpClientEndpoint {
             }
             ProtoState::DataCommandSent => self.dispatch_data_command(event, ep),
             ProtoState::DataMode => {
-                // Unexpected reply in DATA mode — ignore (BDAT chunk ack path not implemented).
+                // Replies are not expected mid-DATA; BDAT waits in BdatChunkSent.
             }
+            ProtoState::BdatChunkSent => self.dispatch_bdat_chunk(event, ep),
             ProtoState::DataEndSent => self.dispatch_message_reply(event, ep),
             ProtoState::RsetSent => self.dispatch_rset(event, ep),
             ProtoState::VrfySent => self.dispatch_vrfy(event, ep),
@@ -453,11 +464,33 @@ impl SmtpClientEndpoint {
         match event {
             SmtpEvent::ReadyForData => {
                 self.proto_state = ProtoState::DataMode;
+                self.bdat_mode = false;
                 driver.on_ready_for_data(self, ep);
             }
             SmtpEvent::MessageRejected { code, message } => {
                 self.proto_state = ProtoState::Connected;
                 driver.on_data_rejected(self, ep, code, &message);
+            }
+            _ => {}
+        }
+        self.driver = Some(driver);
+    }
+
+    fn dispatch_bdat_chunk(&mut self, event: SmtpEvent, ep: &mut dyn Endpoint) {
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
+        match event {
+            SmtpEvent::BdatChunkOk => {
+                self.proto_state = ProtoState::DataMode;
+                driver.on_bdat_chunk_ok(self, ep);
+            }
+            SmtpEvent::MessageRejected { code, message } => {
+                self.proto_state = ProtoState::Connected;
+                self.bdat_mode = false;
+                self.accepted_rcpts = 0;
+                driver.on_message_rejected(self, ep, code, &message);
             }
             _ => {}
         }
@@ -473,15 +506,29 @@ impl SmtpClientEndpoint {
             SmtpEvent::MessageAccepted { queue_id } => {
                 self.proto_state = ProtoState::Connected;
                 self.accepted_rcpts = 0;
+                self.bdat_mode = false;
                 driver.on_message_accepted(self, ep, queue_id.as_deref());
             }
             SmtpEvent::MessageRejected { code, message } => {
                 self.proto_state = ProtoState::Connected;
                 self.accepted_rcpts = 0;
+                self.bdat_mode = false;
                 driver.on_message_rejected(self, ep, code, &message);
             }
             _ => {}
         }
+        self.driver = Some(driver);
+    }
+
+    /// Enter BDAT mode and ask the driver for the first chunk.
+    fn begin_bdat(&mut self, ep: &mut dyn Endpoint) {
+        self.proto_state = ProtoState::DataMode;
+        self.bdat_mode = true;
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
+        driver.on_ready_for_data(self, ep);
         self.driver = Some(driver);
     }
 
@@ -561,6 +608,10 @@ impl ProtocolHandler for SmtpClientEndpoint {
                 break;
             }
             self.dispatch_event(event, ep);
+            if self.pending_bdat {
+                self.pending_bdat = false;
+                self.begin_bdat(ep);
+            }
             // Flush after every dispatched reply.
             if !self.outbound.is_empty() {
                 let out = std::mem::take(&mut self.outbound);
@@ -730,7 +781,13 @@ impl SmtpClientEnvelope for SmtpClientEndpoint {
     }
 
     fn start_data(&mut self) {
+        if self.caps.chunking {
+            // RFC 3030: no DATA / 354 — driver sends BDAT chunks directly.
+            self.pending_bdat = true;
+            return;
+        }
         self.proto_state = ProtoState::DataCommandSent;
+        self.bdat_mode = false;
         self.lexer.expect(SmtpReplyShape::DataCommand);
         self.write_line("DATA");
     }
@@ -744,7 +801,7 @@ impl SmtpClientEnvelope for SmtpClientEndpoint {
 
 impl SmtpClientMessageData for SmtpClientEndpoint {
     fn write_content(&mut self, content: &[u8]) {
-        if self.proto_state != ProtoState::DataMode {
+        if self.proto_state != ProtoState::DataMode || self.bdat_mode {
             return;
         }
         let stuffed = dot_stuff(content);
@@ -752,7 +809,7 @@ impl SmtpClientMessageData for SmtpClientEndpoint {
     }
 
     fn end_message(&mut self) {
-        if self.proto_state != ProtoState::DataMode {
+        if self.proto_state != ProtoState::DataMode || self.bdat_mode {
             return;
         }
         self.proto_state = ProtoState::DataEndSent;
@@ -760,5 +817,26 @@ impl SmtpClientMessageData for SmtpClientEndpoint {
         // Ensure the buffered data ends with CRLF before the dot.
         // (dot_stuff already handles CRLF normalization for each chunk)
         self.outbound.extend_from_slice(b".\r\n");
+    }
+
+    fn is_bdat_mode(&self) -> bool {
+        self.bdat_mode
+    }
+
+    fn write_bdat_chunk(&mut self, content: &[u8], last: bool) {
+        if self.proto_state != ProtoState::DataMode || !self.bdat_mode {
+            return;
+        }
+        if last {
+            self.write_line(&format!("BDAT {} LAST", content.len()));
+            self.write_cmd(content);
+            self.proto_state = ProtoState::DataEndSent;
+            self.lexer.expect(SmtpReplyShape::DataEnd);
+        } else {
+            self.write_line(&format!("BDAT {}", content.len()));
+            self.write_cmd(content);
+            self.proto_state = ProtoState::BdatChunkSent;
+            self.lexer.expect(SmtpReplyShape::BdatChunk);
+        }
     }
 }
