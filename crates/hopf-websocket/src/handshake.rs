@@ -77,6 +77,31 @@ pub fn is_extended_connect_websocket(headers: &Headers) -> bool {
         .unwrap_or(false)
 }
 
+/// Select a subprotocol from the client's `Sec-WebSocket-Protocol` offer.
+///
+/// Returns `Some(configured)` only when the client offered that token
+/// (comma-separated list, case-sensitive token match per RFC 6455 §4.2.2 /
+/// RFC 2616 token rules as used by browsers). Returns `None` when the
+/// server has no preferred protocol, or the client did not offer it —
+/// never echo a protocol the client did not request.
+pub fn negotiate_subprotocol<'a>(
+    headers: &Headers,
+    configured: Option<&'a str>,
+) -> Option<&'a str> {
+    let configured = configured?;
+    let offer = headers.get("sec-websocket-protocol").unwrap_or("");
+    if offer
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .any(|t| t == configured)
+    {
+        Some(configured)
+    } else {
+        None
+    }
+}
+
 /// Response headers for a successful H1 101 upgrade.
 pub fn websocket_accept_headers(client_key: &str, subprotocol: Option<&str>) -> Headers {
     let mut h = Headers::new();
@@ -129,5 +154,20 @@ mod tests {
         h.set(":protocol", "websocket");
         h.set(":path", "/");
         assert!(is_extended_connect_websocket(&h));
+    }
+
+    #[test]
+    fn negotiates_subprotocol_from_offer() {
+        let mut h = Headers::new();
+        h.set("sec-websocket-protocol", "chat, superchat");
+        assert_eq!(negotiate_subprotocol(&h, Some("superchat")), Some("superchat"));
+        assert_eq!(negotiate_subprotocol(&h, Some("other")), None);
+        assert_eq!(negotiate_subprotocol(&h, None), None);
+    }
+
+    #[test]
+    fn no_echo_when_client_omits_protocol() {
+        let h = Headers::new();
+        assert_eq!(negotiate_subprotocol(&h, Some("chat")), None);
     }
 }

@@ -1305,17 +1305,18 @@ impl H2Endpoint {
                 if end_stream {
                     up.closed();
                 }
+                let wants_close = up.wants_close();
                 // Queue any immediate outbound frames into the response body buffer.
                 let out = up.take_outbound();
-                if !out.is_empty() {
-                    stream
-                        .writer
-                        .control
-                        .shared
-                        .lock()
-                        .unwrap()
-                        .body
-                        .extend_from_slice(&out);
+                {
+                    let mut shared = stream.writer.control.shared.lock().unwrap();
+                    if !out.is_empty() {
+                        shared.body.extend_from_slice(&out);
+                    }
+                    // Extended CONNECT: end the stream after a WS Close / protocol error.
+                    if wants_close {
+                        shared.done = true;
+                    }
                 }
                 return;
             }
@@ -1604,16 +1605,14 @@ impl H2Endpoint {
         // Pull upgrade outbound into the body buffer first.
         if let Some(stream) = self.server_streams.get_mut(&stream_id) {
             if let Some(up) = stream.upgraded.as_mut() {
+                let wants_close = up.wants_close();
                 let out = up.take_outbound();
+                let mut shared = stream.writer.control.shared.lock().unwrap();
                 if !out.is_empty() {
-                    stream
-                        .writer
-                        .control
-                        .shared
-                        .lock()
-                        .unwrap()
-                        .body
-                        .extend_from_slice(&out);
+                    shared.body.extend_from_slice(&out);
+                }
+                if wants_close {
+                    shared.done = true;
                 }
             }
         }
@@ -1626,6 +1625,13 @@ impl H2Endpoint {
             let mut shared = stream.writer.control.shared.lock().unwrap();
             shared.needs_flush = false;
             let upgraded = shared.upgraded || stream.upgraded.is_some();
+            let upgrade_closing = upgraded
+                && stream
+                    .upgraded
+                    .as_ref()
+                    .map(|u| u.wants_close())
+                    .unwrap_or(false)
+                && shared.done;
             if shared.response_headers.is_none()
                 && !shared.headers_sent
                 && body_empty(&shared)
@@ -1640,7 +1646,9 @@ impl H2Endpoint {
                 None
             };
             let body = std::mem::take(&mut shared.body);
-            let done = shared.done && !upgraded;
+            // Normal responses: END_STREAM when done. Upgraded streams stay open
+            // unless the upgrade handler requested close (WS Close / protocol error).
+            let done = (shared.done && !upgraded) || upgrade_closing;
             let already_sent = shared.headers_sent;
             if headers.is_some() {
                 shared.headers_sent = true;
