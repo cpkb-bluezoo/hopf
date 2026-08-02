@@ -32,6 +32,7 @@ fn listen_webdav_with(root: std::path::PathBuf, max_put_body: u64) -> (Runtime, 
                 welcome_file: "index.html".into(),
                 dead_property_storage: DeadPropMode::Sidecar,
                 max_put_body,
+                content_language: None,
             },
             storage,
         )

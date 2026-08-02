@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use hopf_core::storage::{StorageError, StorageExecutor};
 use hopf_http::Headers;
-use hopf_http::{ServerHandler, ServerWriter};
+use hopf_http::{parse_http_date, ServerHandler, ServerWriter};
 
 use crate::constants::{
     self, CONTENT_TYPE_XML, DEPTH_0, DEPTH_1, DEPTH_INFINITY, HEADER_DAV, HEADER_DEPTH,
@@ -68,6 +68,10 @@ pub struct WebDavHandler {
     /// write error) — further body chunks are discarded without a second
     /// response.
     put_rejected: bool,
+    /// MKCOL deferred until the request body ends so a non-empty body can
+    /// be rejected with 415 (RFC 4918 §9.3).
+    mkcol_pending: bool,
+    mkcol_had_body: bool,
 }
 
 impl WebDavHandler {
@@ -108,6 +112,8 @@ impl WebDavHandler {
             put_file: None,
             put_bytes_written: 0,
             put_rejected: false,
+            mkcol_pending: false,
+            mkcol_had_body: false,
         }
     }
 
@@ -205,7 +211,8 @@ impl ServerHandler for WebDavHandler {
                 self.start_webdav_body(response)
             }
             "MKCOL" if self.config.webdav_enabled && self.config.allow_write => {
-                self.handle_mkcol(response)
+                self.mkcol_pending = true;
+                self.mkcol_had_body = false;
             }
             "COPY" if self.config.webdav_enabled && self.config.allow_write => {
                 self.handle_copy(response)
@@ -221,6 +228,12 @@ impl ServerHandler for WebDavHandler {
     }
 
     fn request_body_content(&mut self, response: &mut dyn ServerWriter, data: &[u8]) {
+        if self.mkcol_pending {
+            if !data.is_empty() {
+                self.mkcol_had_body = true;
+            }
+            return;
+        }
         if self.webdav_parser.is_some() {
             self.webdav_body.extend_from_slice(data);
             if let Some(ref mut p) = self.webdav_parser {
@@ -248,6 +261,10 @@ impl ServerHandler for WebDavHandler {
     }
 
     fn end_request_body(&mut self, response: &mut dyn ServerWriter) {
+        if self.mkcol_pending {
+            self.finish_mkcol(response);
+            return;
+        }
         if self.webdav_parser.take().is_some() {
             if self.webdav_body.len() > MAX_WEBDAV_REQUEST_BODY {
                 Self::send_error(response, 413);
@@ -269,8 +286,10 @@ impl ServerHandler for WebDavHandler {
     }
 
     fn request_complete(&mut self, response: &mut dyn ServerWriter) {
-        // PUT with no body still needs a response (empty create).
-        if self.put_file.is_some() {
+        // MKCOL / PUT with no body still need a response.
+        if self.mkcol_pending {
+            self.finish_mkcol(response);
+        } else if self.put_file.is_some() {
             self.end_request_body(response);
         }
         self.webdav_body.clear();
@@ -492,34 +511,54 @@ impl WebDavHandler {
         let path = self.path.clone();
         let root = self.root_path.clone();
         let canonical = self.canonical_root.clone();
+        let href = self.href();
         let mut store = self.dead_store.clone();
         self.offload(w, move || {
             let Some(lexical) = path else {
-                return Ok(404u16);
+                return Ok(DeleteOutcome::Status(404));
             };
             let Some(resolved) = canonicalize_path(&root, &canonical, &lexical) else {
-                return Ok(404);
+                return Ok(DeleteOutcome::Status(404));
             };
             if !resolved.exists() || is_sidecar_file(&resolved) {
-                return Ok(404);
+                return Ok(DeleteOutcome::Status(404));
             }
-            if resolved.is_dir() {
-                fs::remove_dir_all(&resolved)?;
+            let mut errors: Vec<(String, u16)> = Vec::new();
+            delete_recursive(&resolved, &href, &mut store, &mut errors);
+            if errors.is_empty() {
+                Ok(DeleteOutcome::Status(204))
             } else {
-                fs::remove_file(&resolved)?;
+                let mut ms = MultistatusWriter::new();
+                for (h, code) in &errors {
+                    ms.response(h, |r| {
+                        r.status(&format!("HTTP/1.1 {code} {}", hopf_http::reason_phrase(*code)))
+                    })
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                }
+                Ok(DeleteOutcome::MultiStatus(ms.finish()))
             }
-            store.delete_properties(&resolved)?;
-            Ok(204)
-        }, |code, writer| {
-            if code == 404 {
-                Self::send_error(writer, 404);
-            } else {
-                Self::send_error(writer, code);
+        }, |out, writer| match out {
+            DeleteOutcome::Status(code) => {
+                if code == 204 {
+                    Self::send_error(writer, 204);
+                } else {
+                    Self::send_error(writer, code);
+                }
+            }
+            DeleteOutcome::MultiStatus(body) => {
+                Self::send_bytes(writer, 207, CONTENT_TYPE_XML, &body)
             }
         });
     }
 
-    fn handle_mkcol(&mut self, w: &mut dyn ServerWriter) {
+    fn finish_mkcol(&mut self, w: &mut dyn ServerWriter) {
+        self.mkcol_pending = false;
+        if self.mkcol_had_body {
+            self.mkcol_had_body = false;
+            Self::send_error(w, 415);
+            return;
+        }
+        self.mkcol_had_body = false;
         if !self.check_mutating_preconditions(w) {
             return;
         }
@@ -536,7 +575,14 @@ impl WebDavHandler {
             if resolved.exists() {
                 return Ok(405);
             }
-            fs::create_dir_all(&resolved)?;
+            // RFC 4918 §9.3: intermediate collections must already exist.
+            let Some(parent) = resolved.parent() else {
+                return Ok(403);
+            };
+            if !parent.exists() {
+                return Ok(409);
+            }
+            fs::create_dir(&resolved)?;
             Ok(201)
         }, |code, writer| Self::send_error(writer, code));
     }
@@ -561,6 +607,7 @@ impl WebDavHandler {
         let root = self.root_path.clone();
         let canonical = self.canonical_root.clone();
         let overwrite = self.overwrite;
+        let depth = self.depth;
         let mut store = self.dead_store.clone();
         self.offload(w, move || {
             let Some(src_lex) = src else {
@@ -572,6 +619,10 @@ impl WebDavHandler {
             let dest_path = resolve_destination(&root, &canonical, &dest_hdr)?;
             if !src_path.exists() {
                 return Ok(404);
+            }
+            // MOVE requires Depth: infinity when Depth is present (RFC 4918 §9.9).
+            if is_move && depth == DEPTH_0 {
+                return Ok(403);
             }
             if dest_path.exists() {
                 if !overwrite {
@@ -586,18 +637,21 @@ impl WebDavHandler {
             if is_move {
                 fs::rename(&src_path, &dest_path)?;
                 store.delete_properties(&src_path)?;
-            } else {
-                if src_path.is_dir() {
-                    copy_dir_all(&src_path, &dest_path)?;
+            } else if src_path.is_dir() {
+                if depth == DEPTH_0 {
+                    // Copy the collection only — no members (RFC 4918 §9.8.3).
+                    fs::create_dir(&dest_path)?;
                 } else {
-                    if let Some(p) = dest_path.parent() {
-                        fs::create_dir_all(p)?;
-                    }
-                    fs::copy(&src_path, &dest_path)?;
+                    copy_dir_all(&src_path, &dest_path)?;
                 }
+            } else {
+                if let Some(p) = dest_path.parent() {
+                    fs::create_dir_all(p)?;
+                }
+                fs::copy(&src_path, &dest_path)?;
             }
             store.copy_properties(&src_path, &dest_path)?;
-            Ok(if is_move { 201 } else { 201 })
+            Ok(201)
         }, |code, writer| Self::send_error(writer, code));
     }
 
@@ -700,7 +754,7 @@ impl WebDavHandler {
             if !resolved.exists() {
                 return Ok(ProppatchOutcome::Status(404));
             }
-            for upd in patch.updates {
+            for upd in &patch.updates {
                 match upd.operation {
                     ProppatchOp::Set => store.set_property(
                         &resolved,
@@ -715,8 +769,15 @@ impl WebDavHandler {
                 }
             }
             let mut ms = MultistatusWriter::new();
-            ms.response(&href, |r| r.propstat("HTTP/1.1 200 OK", |_| Ok(())))
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            ms.response(&href, |r| {
+                r.propstat("HTTP/1.1 200 OK", |w| {
+                    for upd in &patch.updates {
+                        write_live_property(w, &upd.namespace_uri, &upd.local_name, "")?;
+                    }
+                    Ok(())
+                })
+            })
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
             Ok(ProppatchOutcome::Body(ms.finish()))
         }, |out, writer| match out {
             ProppatchOutcome::Status(c) => Self::send_error(writer, c),
@@ -734,6 +795,7 @@ impl WebDavHandler {
         let mut store = self.dead_store.clone();
         let lock_mgr = Arc::clone(&self.lock_manager);
         let types = self.content_types.clone();
+        let content_language = self.config.content_language.clone();
 
         self.offload(w, move || {
             let Some(lex) = path else {
@@ -751,7 +813,16 @@ impl WebDavHandler {
             for (rpath, rhref) in resources {
                 ms.response(&rhref, |r| {
                     r.propstat("HTTP/1.1 200 OK", |w| {
-                        append_propfind_props(w, &pf, &rpath, &rhref, &types, &lock_mgr, &mut store)
+                        append_propfind_props(
+                            w,
+                            &pf,
+                            &rpath,
+                            &rhref,
+                            &types,
+                            &lock_mgr,
+                            &mut store,
+                            content_language.as_deref(),
+                        )
                             .map_err(|c| {
                                 io::Error::new(io::ErrorKind::Other, format!("propfind {c}"))
                             })
@@ -788,6 +859,11 @@ impl WebDavHandler {
         }
         true
     }
+}
+
+enum DeleteOutcome {
+    Status(u16),
+    MultiStatus(Vec<u8>),
 }
 
 enum ProppatchOutcome {
@@ -931,12 +1007,6 @@ fn format_http_date(secs: i64) -> String {
     )
 }
 
-fn parse_http_date(s: &str) -> Option<SystemTime> {
-    // Minimal: try RFC3339-like or ignore
-    let _ = s;
-    None
-}
-
 fn resolve_destination(
     root: &Path,
     canonical: &Path,
@@ -966,6 +1036,52 @@ fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Recursively delete `path`, recording per-member failures for a 207
+/// Multi-Status (RFC 4918 §9.6.1) instead of aborting on the first error.
+fn delete_recursive(
+    path: &Path,
+    href: &str,
+    store: &mut DeadPropertyStore,
+    errors: &mut Vec<(String, u16)>,
+) {
+    if path.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if is_sidecar_name(&name) {
+                    continue;
+                }
+                let child_path = entry.path();
+                let child_href = if href.ends_with('/') {
+                    format!("{href}{name}")
+                } else {
+                    format!("{href}/{name}")
+                };
+                let child_href =
+                    ensure_trailing_slash_for_collection(&child_href, child_path.is_dir());
+                delete_recursive(&child_path, &child_href, store, errors);
+            }
+        }
+        match fs::remove_dir(path) {
+            Ok(()) => {
+                let _ = store.delete_properties(path);
+            }
+            Err(_) => {
+                // Children that failed leave the directory non-empty → 424.
+                let code = if errors.is_empty() { 403 } else { 424 };
+                errors.push((href.to_string(), code));
+            }
+        }
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                let _ = store.delete_properties(path);
+            }
+            Err(_) => errors.push((href.to_string(), 403)),
+        }
+    }
 }
 
 fn collect_propfind_resources(
@@ -1022,6 +1138,7 @@ fn append_propfind_props(
     types: &HashMap<String, String>,
     lock_mgr: &WebDavLockManager,
     store: &mut DeadPropertyStore,
+    content_language: Option<&str>,
 ) -> Result<(), u16> {
     let meta = fs::metadata(path).map_err(|_| 500u16)?;
     let is_dir = meta.is_dir();
@@ -1030,11 +1147,25 @@ fn append_propfind_props(
     match pf.kind {
         PropfindType::Propname => {
             for name in live_prop_names() {
+                // Only advertise getcontentlanguage when configured.
+                if *name == constants::PROP_GETCONTENTLANGUAGE && content_language.is_none() {
+                    continue;
+                }
                 write_live_property(w, NAMESPACE, name, "").map_err(|_| 500u16)?;
             }
         }
         PropfindType::Allprop | PropfindType::Prop => {
-            append_live_props(w, path, href, &meta, is_dir, types, lock_mgr, store)?;
+            append_live_props(
+                w,
+                path,
+                href,
+                &meta,
+                is_dir,
+                types,
+                lock_mgr,
+                store,
+                content_language,
+            )?;
             if pf.kind == PropfindType::Prop {
                 for req in &pf.properties {
                     if !is_live_prop(&req.local_name) {
@@ -1053,12 +1184,15 @@ fn append_propfind_props(
 
 fn live_prop_names() -> &'static [&'static str] {
     &[
+        constants::PROP_CREATIONDATE,
         constants::PROP_DISPLAYNAME,
+        constants::PROP_GETCONTENTLANGUAGE,
         constants::PROP_GETCONTENTLENGTH,
         constants::PROP_GETCONTENTTYPE,
         constants::PROP_GETETAG,
         constants::PROP_GETLASTMODIFIED,
         constants::PROP_RESOURCETYPE,
+        constants::PROP_SOURCE,
         constants::PROP_SUPPORTEDLOCK,
         constants::PROP_LOCKDISCOVERY,
     ]
@@ -1077,12 +1211,27 @@ fn append_live_props(
     types: &HashMap<String, String>,
     lock_mgr: &WebDavLockManager,
     store: &mut DeadPropertyStore,
+    content_language: Option<&str>,
 ) -> Result<(), u16> {
+    let created = meta.created().or_else(|_| meta.modified()).ok();
+    if let Some(t) = created {
+        write_live_property(
+            w,
+            NAMESPACE,
+            constants::PROP_CREATIONDATE,
+            &iso8601_date(t),
+        )
+        .map_err(|_| 500u16)?;
+    }
     let display = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
     write_live_property(w, NAMESPACE, constants::PROP_DISPLAYNAME, display).map_err(|_| 500u16)?;
+    if let Some(lang) = content_language {
+        write_live_property(w, NAMESPACE, constants::PROP_GETCONTENTLANGUAGE, lang)
+            .map_err(|_| 500u16)?;
+    }
     if !is_dir {
         write_live_property(
             w,
@@ -1115,6 +1264,8 @@ fn append_live_props(
     } else {
         write_empty_resourcetype(w).map_err(|_| 500u16)?;
     }
+    // RFC 4918 §15.10 — typically empty; still advertised as a live property.
+    write_live_property(w, NAMESPACE, constants::PROP_SOURCE, "").map_err(|_| 500u16)?;
     write_supported_lock(w).map_err(|_| 500u16)?;
     let locks = lock_mgr.get_covering_locks(path);
     write_lock_discovery(w, &locks, href).map_err(|_| 500u16)?;
@@ -1123,6 +1274,37 @@ fn append_live_props(
         write_dead_property(w, dp).map_err(|_| 500u16)?;
     }
     Ok(())
+}
+
+fn iso8601_date(t: SystemTime) -> String {
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64;
+    // Reuse civil breakdown from IMF-fixdate formatting.
+    let imf = format_http_date(secs);
+    // "Mon, 01 Jan 2024 00:00:00 GMT" → "2024-01-01T00:00:00Z"
+    let rest = imf.split_once(", ").map(|(_, r)| r).unwrap_or(&imf);
+    let mut parts = rest.split_whitespace();
+    let day = parts.next().unwrap_or("01");
+    let month = match parts.next().unwrap_or("Jan") {
+        "Jan" => "01",
+        "Feb" => "02",
+        "Mar" => "03",
+        "Apr" => "04",
+        "May" => "05",
+        "Jun" => "06",
+        "Jul" => "07",
+        "Aug" => "08",
+        "Sep" => "09",
+        "Oct" => "10",
+        "Nov" => "11",
+        "Dec" => "12",
+        _ => "01",
+    };
+    let year = parts.next().unwrap_or("1970");
+    let time = parts.next().unwrap_or("00:00:00");
+    format!("{year}-{month}-{day}T{time}Z")
 }
 
 fn parse_timeout_header(raw: Option<&str>) -> i64 {
@@ -1151,4 +1333,43 @@ fn parse_timeout_header(raw: Option<&str>) -> i64 {
         }
     }
     constants::DEFAULT_LOCK_TIMEOUT_SECONDS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dead_props::DeadPropMode;
+    use std::time::Duration;
+
+    #[test]
+    fn iso8601_matches_known_instant() {
+        let t = UNIX_EPOCH + Duration::from_secs(1704067200);
+        assert_eq!(iso8601_date(t), "2024-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn delete_recursive_removes_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("col");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        let nested = root.join("sub");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("b.txt"), b"b").unwrap();
+
+        let mut store = DeadPropertyStore::new(DeadPropMode::None);
+        let mut errors = Vec::new();
+        delete_recursive(&root, "/col/", &mut store, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn parse_http_date_from_hopf_http_enables_304_path() {
+        let t = parse_http_date("Mon, 01 Jan 2024 00:00:00 GMT").unwrap();
+        assert_eq!(
+            t.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1704067200
+        );
+    }
 }

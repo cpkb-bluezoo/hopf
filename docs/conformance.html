@@ -350,8 +350,8 @@
 <tbody>
 <tr><td>GET/HEAD/OPTIONS/PUT</td><td>RFC 9110</td><td>Compliant</td><td><code>handler.rs:245-290,307-420</code></td></tr>
 <tr><td>DELETE (files)</td><td>RFC 9110 §9.3.5</td><td>Compliant</td><td><code>handler.rs:422-454</code></td></tr>
-<tr><td>DELETE (collections)</td><td>RFC 4918 §9.6.1</td><td>Partial</td><td><code>fs::remove_dir_all</code> — all-or-nothing, no per-member 207 Multi-Status on partial failure</td></tr>
-<tr><td><strong>If-Modified-Since / 304</strong></td><td>RFC 9110 §13.1.3</td><td><strong>Not implemented (docs claim Compliant)</strong></td><td><code>parse_http_date</code> is a stub that always returns <code>None</code> (<code>handler.rs:881-885</code>) — 304 responses are dead code</td></tr>
+<tr><td>DELETE (collections)</td><td>RFC 4918 §9.6.1</td><td>Compliant</td><td>Recursive member deletion continues after failures and returns 207 Multi-Status naming failed hrefs (424/403); full success remains 204</td></tr>
+<tr><td>If-Modified-Since / 304</td><td>RFC 9110 §13.1.3</td><td>Compliant</td><td><code>hopf_http::parse_http_date</code> accepts IMF-fixdate plus obsolete RFC 850 / asctime forms; GET/HEAD return 304 when <code>Last-Modified ≤ If-Modified-Since</code></td></tr>
 <tr><td>ETag generation, Content-Type detection</td><td>RFC 9110 §8.8.3,§8.3</td><td>Compliant</td><td>Weak MD5-based ETag (<code>handler.rs:810-825</code>)</td></tr>
 </tbody>
 </table>
@@ -360,9 +360,9 @@
 <thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
 <tbody>
 <tr><td>PROPFIND (allprop/propname/prop)</td><td>§9.1</td><td>Compliant</td><td><code>handler.rs:661-701</code></td></tr>
-<tr><td>PROPPATCH</td><td>§9.2</td><td>Partial</td><td>Storage side works, but the 207 response body's <code>&lt;prop&gt;</code> is always empty (<code>handler.rs:651-654</code>) — never names which properties were actually set/removed</td></tr>
-<tr><td>MKCOL</td><td>§9.3</td><td>Partial</td><td>Uses <code>create_dir_all</code>, which silently creates missing ancestors instead of 409 Conflict; no 415 for a request body</td></tr>
-<tr><td>COPY</td><td>§9.8</td><td>Partial</td><td>Depth header parsed but never consulted — COPY is always fully recursive regardless of <code>Depth: 0</code></td></tr>
+<tr><td>PROPPATCH</td><td>§9.2</td><td>Compliant</td><td>207 propstat lists each set/removed property by name</td></tr>
+<tr><td>MKCOL</td><td>§9.3</td><td>Compliant</td><td><code>create_dir</code> only (409 when a parent is missing); non-empty request body → 415</td></tr>
+<tr><td>COPY</td><td>§9.8</td><td>Compliant</td><td><code>Depth: 0</code> copies a collection without members; infinity (default) remains recursive</td></tr>
 <tr><td>MOVE</td><td>§9.9</td><td>Compliant</td><td><code>fs::rename</code> is inherently whole-subtree, matching required Depth-infinity semantics</td></tr>
 <tr><td>LOCK (new + refresh), UNLOCK</td><td>§9.10-9.11</td><td>Compliant</td><td><code>handler.rs:538-596</code>, <code>lock.rs:183-227</code></td></tr>
 <tr><td>Lock-null resources</td><td>§7.3</td><td>Not implemented</td><td>LOCK on a nonexistent path registers a lock but creates no empty file</td></tr>
@@ -373,9 +373,9 @@
 <table>
 <thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
 <tbody>
-<tr><td>DAV/Depth/Destination/If/Lock-Token/Overwrite/Timeout headers</td><td>§10</td><td>Compliant</td><td>Full grammar including weak-ETag comparison (<code>if_header.rs:30-272</code>) — see COPY row above for a specific enforcement gap</td></tr>
+<tr><td>DAV/Depth/Destination/If/Lock-Token/Overwrite/Timeout headers</td><td>§10</td><td>Compliant</td><td>Full grammar including weak-ETag comparison (<code>if_header.rs</code>); COPY honors Depth 0/infinity</td></tr>
 <tr><td>Exclusive/shared write lock, conflict detection, Depth-infinity coverage, expiry cleanup</td><td>§6</td><td>Compliant</td><td><code>lock.rs</code>, in-process only (matches docs)</td></tr>
-<tr><td>creationdate / getcontentlanguage / source live properties</td><td>§15.1,§15.4,§15.10</td><td>Not implemented (docs list them)</td><td>Constants defined but never referenced in <code>append_live_props</code></td></tr>
+<tr><td>creationdate / getcontentlanguage / source live properties</td><td>§15.1,§15.4,§15.10</td><td>Compliant</td><td><code>creationdate</code> from birth time (mtime fallback) as ISO-8601; <code>getcontentlanguage</code> from optional <code>WebDavConfig::content_language</code>; empty <code>source</code></td></tr>
 <tr><td>displayname/getcontentlength/getcontenttype/getetag/getlastmodified/lockdiscovery/resourcetype/supportedlock</td><td>§15.2-15.11</td><td>Compliant</td><td><code>handler.rs:1018-1073</code></td></tr>
 <tr><td>Dead properties (xattr/sidecar/none)</td><td>§4</td><td>Compliant</td><td><code>dead_props.rs:71-333</code></td></tr>
 <tr><td>Class 3 ordered collections, Auth/ACL</td><td>—</td><td>Deferred / N/A</td><td>Explicit scope: Class 1+2 only, compose with HTTP auth</td></tr>
