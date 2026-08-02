@@ -14,7 +14,7 @@ mod service;
 mod session;
 mod utf8;
 
-pub use ascii::normalize_ascii_newlines;
+pub use ascii::{format_ftp_mtime, normalize_ascii_newlines};
 pub use codec::{FtpCommand, FtpServerLexer, MAX_COMMAND_LINE};
 pub use control::FtpControlHandler;
 pub use data::StorTransfer;

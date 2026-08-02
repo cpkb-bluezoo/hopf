@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, StorageExecutor};
 
-use crate::server::ascii::AsciiNewlineNormalizer;
+use crate::server::ascii::{AsciiNewlineDenormalizer, AsciiNewlineNormalizer};
 use crate::server::handler::TransferObserver;
 use crate::server::metrics::FtpServerMetrics;
 use crate::server::reply::reply;
@@ -38,6 +38,8 @@ pub enum OutboundTransfer {
 
 /// Everything the data connection needs to drive one STOR/APPE/STOU upload.
 pub struct StorTransfer {
+    /// TYPE A — denormalize network CRLF to local LF while writing.
+    pub ascii: bool,
     /// NVFS path (for the transfer observer / quota accounting).
     pub path: String,
     /// Writer to stream bytes into.
@@ -59,6 +61,8 @@ struct DataBridgeState {
     control_handle: Option<ConnHandle>,
     outbound: Option<OutboundTransfer>,
     stor: Option<StorTransfer>,
+    /// Set by [`DataBridge::abort`]; completion paths skip control replies.
+    aborted: bool,
     metrics: Arc<FtpServerMetrics>,
     storage: Arc<StorageExecutor>,
 }
@@ -72,6 +76,7 @@ impl DataBridge {
                 control_handle: None,
                 outbound: None,
                 stor: None,
+                aborted: false,
                 metrics,
                 storage,
                 },
@@ -85,9 +90,10 @@ impl DataBridge {
     }
 
     /// Queue RETR / LIST; starts when the data peer is connected.
-    pub fn queue_outbound(&self, transfer: OutboundTransfer) {
+    pub fn queue_outbound(self: &Arc<Self>, transfer: OutboundTransfer) {
         {
             let mut g = self.inner.lock().unwrap();
+            g.aborted = false;
             g.outbound = Some(transfer);
         }
         self.try_start_outbound();
@@ -95,11 +101,38 @@ impl DataBridge {
 
     /// Queue a STOR / APPE / STOU upload for the data handler.
     pub fn queue_stor(&self, transfer: StorTransfer) {
-        self.inner.lock().unwrap().stor = Some(transfer);
+        let mut g = self.inner.lock().unwrap();
+        g.aborted = false;
+        g.stor = Some(transfer);
+    }
+
+    /// Whether [`Self::abort`] has been called for the current transfer.
+    pub fn was_aborted(&self) -> bool {
+        self.inner.lock().unwrap().aborted
+    }
+
+    /// Cancel any queued/in-flight transfer and close the data connection.
+    ///
+    /// Returns `true` if a transfer was in progress (RFC 959: reply 426 then
+    /// 226). Completion callbacks skip their own control replies after this.
+    pub fn abort(&self) -> bool {
+        let (in_progress, handle) = {
+            let mut g = self.inner.lock().unwrap();
+            let in_progress =
+                g.outbound.is_some() || g.stor.is_some() || g.data_handle.is_some();
+            g.aborted = true;
+            g.outbound = None;
+            g.stor = None;
+            (in_progress, g.data_handle.take())
+        };
+        if let Some(h) = handle {
+            h.close();
+        }
+        in_progress
     }
 
     /// Data peer connected.
-    pub fn on_data_connected(&self, handle: ConnHandle) {
+    pub fn on_data_connected(self: &Arc<Self>, handle: ConnHandle) {
         self.inner.lock().unwrap().data_handle = Some(handle);
         self.try_start_outbound();
     }
@@ -117,6 +150,9 @@ impl DataBridge {
     /// Finish STOR successfully.
     pub fn stor_complete(&self, bytes: u64) {
         let g = self.inner.lock().unwrap();
+        if g.aborted {
+            return;
+        }
         FtpServerMetrics::add(&g.metrics.bytes_in, bytes);
         if let Some(c) = &g.control_handle {
             c.send(reply(226, "Transfer complete"));
@@ -126,12 +162,28 @@ impl DataBridge {
     /// Finish STOR with error.
     pub fn stor_failed(&self) {
         let g = self.inner.lock().unwrap();
+        if g.aborted {
+            return;
+        }
         if let Some(c) = &g.control_handle {
             c.send(reply(426, "Transfer aborted"));
         }
     }
 
-    fn try_start_outbound(&self) {
+    fn send_transfer_reply(control: &Option<ConnHandle>, aborted: bool, ok: bool) {
+        if aborted {
+            return;
+        }
+        if let Some(c) = control {
+            if ok {
+                c.send(reply(226, "Transfer complete"));
+            } else {
+                c.send(reply(426, "Transfer aborted"));
+            }
+        }
+    }
+
+    fn try_start_outbound(self: &Arc<Self>) {
         let (transfer, data, control, storage, metrics) = {
             let mut g = self.inner.lock().unwrap();
             let transfer = match g.outbound.take() {
@@ -153,6 +205,8 @@ impl DataBridge {
                 Arc::clone(&g.metrics),
             )
         };
+        let bridge = Arc::clone(self);
+        let bridge_done = Arc::clone(self);
 
         match transfer {
             OutboundTransfer::Retr { ascii, mut reader, path, observer } => {
@@ -168,6 +222,13 @@ impl DataBridge {
                         let mut total = 0u64;
                         loop {
                             if !conn.is_probably_open() {
+                                // Distinguishing ABOR from clean EOF: treat a
+                                // mid-stream close as failure so we don't claim
+                                // success after abort (completion still checks
+                                // `was_aborted` before any control reply).
+                                if bridge.was_aborted() {
+                                    return Err("transfer aborted".into());
+                                }
                                 break;
                             }
                             let n = reader.read(&mut buf)?;
@@ -203,6 +264,9 @@ impl DataBridge {
                                 conn.send(tail);
                             }
                         }
+                        if bridge.was_aborted() {
+                            return Err("transfer aborted".into());
+                        }
                         Ok::<u64, Box<dyn std::error::Error + Send + Sync>>(total)
                     },
                     move |result| match result {
@@ -212,30 +276,28 @@ impl DataBridge {
                                 obs.transfer_completed(&complete_path, false, n, true);
                             }
                             data.close();
-                            if let Some(c) = control {
-                                c.send(reply(226, "Transfer complete"));
-                            }
+                            Self::send_transfer_reply(&control, bridge_done.was_aborted(), true);
                         }
                         Err(_) => {
                             if let Some(obs) = &complete_observer {
                                 obs.transfer_completed(&complete_path, false, 0, false);
                             }
                             data.close();
-                            if let Some(c) = control {
-                                c.send(reply(426, "Transfer aborted"));
-                            }
+                            Self::send_transfer_reply(&control, bridge_done.was_aborted(), false);
                         }
                     },
                 );
             }
             OutboundTransfer::Listing { body } => {
+                if bridge.was_aborted() {
+                    data.close();
+                    return;
+                }
                 let n = body.len() as u64;
                 FtpServerMetrics::add(&metrics.bytes_out, n);
                 data.send(body);
                 data.close();
-                if let Some(c) = control {
-                    c.send(reply(226, "Transfer complete"));
-                }
+                Self::send_transfer_reply(&control, bridge.was_aborted(), true);
             }
         }
     }
@@ -260,6 +322,8 @@ pub struct FtpDataHandler {
     stor_observer: Option<Arc<dyn TransferObserver>>,
     stor_quota: Option<(Arc<dyn hopf_core::QuotaManager>, String)>,
     stor_bytes: u64,
+    stor_ascii: bool,
+    stor_denorm: AsciiNewlineDenormalizer,
 }
 
 impl FtpDataHandler {
@@ -275,6 +339,8 @@ impl FtpDataHandler {
             stor_observer: None,
             stor_quota: None,
             stor_bytes: 0,
+            stor_ascii: false,
+            stor_denorm: AsciiNewlineDenormalizer::new(),
         }
     }
 
@@ -289,6 +355,8 @@ impl FtpDataHandler {
                 self.stor_path = t.path;
                 self.stor_observer = t.observer;
                 self.stor_quota = t.quota;
+                self.stor_ascii = t.ascii;
+                self.stor_denorm = AsciiNewlineDenormalizer::new();
                 self.stor_writer = Some(t.writer);
             }
         }
@@ -334,10 +402,22 @@ impl ProtocolHandler for FtpDataHandler {
     fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.take_stor();
         if let Some(w) = self.stor_writer.as_mut() {
-            let _ = w.write_all(*data);
-            self.stor_bytes += data.len() as u64;
-            if let Some(obs) = &self.stor_observer {
-                obs.transfer_progress(&self.stor_path, true, data, self.stor_bytes);
+            if self.stor_ascii {
+                let mut out = Vec::with_capacity(data.len());
+                self.stor_denorm.feed(data, &mut out);
+                if !out.is_empty() {
+                    let _ = w.write_all(&out);
+                    self.stor_bytes += out.len() as u64;
+                    if let Some(obs) = &self.stor_observer {
+                        obs.transfer_progress(&self.stor_path, true, &out, self.stor_bytes);
+                    }
+                }
+            } else {
+                let _ = w.write_all(*data);
+                self.stor_bytes += data.len() as u64;
+                if let Some(obs) = &self.stor_observer {
+                    obs.transfer_progress(&self.stor_path, true, data, self.stor_bytes);
+                }
             }
         }
         *data = &[];
@@ -345,14 +425,31 @@ impl ProtocolHandler for FtpDataHandler {
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
         if let Some(mut w) = self.stor_writer.take() {
+            if self.stor_ascii {
+                let mut tail = Vec::new();
+                self.stor_denorm.finish(&mut tail);
+                if !tail.is_empty() {
+                    let _ = w.write_all(&tail);
+                    self.stor_bytes += tail.len() as u64;
+                    if let Some(obs) = &self.stor_observer {
+                        obs.transfer_progress(&self.stor_path, true, &tail, self.stor_bytes);
+                    }
+                }
+            }
             let _ = w.flush();
-            if let Some(obs) = &self.stor_observer {
-                obs.transfer_completed(&self.stor_path, true, self.stor_bytes, true);
+            if self.bridge.was_aborted() {
+                if let Some(obs) = &self.stor_observer {
+                    obs.transfer_completed(&self.stor_path, true, self.stor_bytes, false);
+                }
+            } else {
+                if let Some(obs) = &self.stor_observer {
+                    obs.transfer_completed(&self.stor_path, true, self.stor_bytes, true);
+                }
+                if let Some((qm, user)) = &self.stor_quota {
+                    qm.record_bytes_added(user, self.stor_bytes);
+                }
+                self.bridge.stor_complete(self.stor_bytes);
             }
-            if let Some((qm, user)) = &self.stor_quota {
-                qm.record_bytes_added(user, self.stor_bytes);
-            }
-            self.bridge.stor_complete(self.stor_bytes);
         }
         self.bridge.on_data_closed();
     }

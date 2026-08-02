@@ -4,7 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 use hopf_core::{
     BindingId, Endpoint, ProtocolHandler, Runtime, StorageExecutor, TcpConnectorConfig,
@@ -12,6 +12,7 @@ use hopf_core::{
 };
 use hopf_core::tls::SharedTlsAcceptor;
 
+use crate::server::ascii::format_ftp_mtime;
 use crate::server::codec::{FtpCommand, FtpServerLexer, MAX_COMMAND_LINE};
 use crate::server::data::{DataBridge, FtpDataHandler, OutboundTransfer, StorTransfer};
 use crate::server::fs::FtpFileOpResult;
@@ -42,6 +43,8 @@ pub struct FtpControlHandler {
     restart: u64,
     rename_from: Option<String>,
     data_mode: DataMode,
+    /// RFC 2428 §4: after `EPSV ALL`, reject PORT/PASV/EPRT for the session.
+    epsv_all: bool,
     bridge: Option<Arc<DataBridge>>,
     utf8: bool,
     prot_p: bool,
@@ -80,6 +83,7 @@ impl FtpControlHandler {
             restart: 0,
             rename_from: None,
             data_mode: DataMode::None,
+            epsv_all: false,
             bridge: None,
             utf8: false,
             prot_p: false,
@@ -215,6 +219,7 @@ impl FtpControlHandler {
                 self.meta.user = None;
                 self.cwd = "/".into();
                 self.utf8 = false;
+                self.epsv_all = false;
                 self.clear_pasv();
                 self.send_reply(endpoint, 220, "Service ready for new user");
             }
@@ -248,8 +253,8 @@ impl FtpControlHandler {
             FtpCommand::Port(_) => self.cmd_port(endpoint, arg),
             FtpCommand::Eprt(_) => self.cmd_eprt(endpoint, arg),
             FtpCommand::Retr(_) => self.cmd_retr(endpoint, arg),
-            FtpCommand::Stor(_) => self.cmd_stor(endpoint, arg, false),
-            FtpCommand::Appe(_) => self.cmd_stor(endpoint, arg, true),
+            FtpCommand::Stor(_) => self.cmd_stor(endpoint, arg, false, None),
+            FtpCommand::Appe(_) => self.cmd_stor(endpoint, arg, true, None),
             FtpCommand::Stou => self.cmd_stou(endpoint),
             FtpCommand::List(_) => self.cmd_list(endpoint, arg, false),
             FtpCommand::Nlst(_) => self.cmd_list(endpoint, arg, true),
@@ -264,8 +269,16 @@ impl FtpControlHandler {
             FtpCommand::Rnto(_) => self.cmd_rnto(endpoint, arg),
             FtpCommand::Rest(_) => self.cmd_rest(endpoint, arg),
             FtpCommand::Abor => {
+                let in_progress = self
+                    .bridge
+                    .as_ref()
+                    .map(|b| b.abort())
+                    .unwrap_or(false);
                 self.clear_pasv();
                 self.bridge = None;
+                if in_progress {
+                    self.send_reply(endpoint, 426, "Connection closed; transfer aborted.");
+                }
                 self.send_reply(endpoint, 226, "Abort successful");
             }
             FtpCommand::Stat(_) => {
@@ -276,7 +289,7 @@ impl FtpControlHandler {
                         "FTP server status: Hopf FTP ready",
                     );
                 } else if self.require_auth(endpoint) {
-                    self.cmd_list(endpoint, arg, false);
+                    self.cmd_stat_path(endpoint, arg);
                 }
             }
             FtpCommand::Feat => self.cmd_feat(endpoint),
@@ -392,6 +405,10 @@ impl FtpControlHandler {
         if !self.require_auth(endpoint) {
             return;
         }
+        if self.epsv_all {
+            self.send_reply(endpoint, 501, "EPSV ALL in effect; use EPSV");
+            return;
+        }
         if !self.check_data_protection(endpoint) {
             return;
         }
@@ -441,9 +458,39 @@ impl FtpControlHandler {
         }
     }
 
-    fn cmd_epsv(&mut self, endpoint: &mut dyn Endpoint, _arg: &str) {
+    fn cmd_epsv(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
         if !self.require_auth(endpoint) {
             return;
+        }
+        let arg = arg.trim();
+        if arg.eq_ignore_ascii_case("ALL") {
+            self.epsv_all = true;
+            self.send_reply(endpoint, 200, "EPSV ALL ok");
+            return;
+        }
+        if !arg.is_empty() {
+            let want_v6 = match arg {
+                "1" => false,
+                "2" => true,
+                _ => {
+                    self.send_reply(
+                        endpoint,
+                        522,
+                        "Network protocol not supported, use (1,2)",
+                    );
+                    return;
+                }
+            };
+            let local_v6 = self.meta.local.is_ipv6();
+            if want_v6 != local_v6 {
+                let supported = if local_v6 { "(2)" } else { "(1)" };
+                self.send_reply(
+                    endpoint,
+                    522,
+                    &format!("Network protocol not supported, use {supported}"),
+                );
+                return;
+            }
         }
         if !self.check_data_protection(endpoint) {
             return;
@@ -478,6 +525,10 @@ impl FtpControlHandler {
         if !self.require_auth(endpoint) {
             return;
         }
+        if self.epsv_all {
+            self.send_reply(endpoint, 501, "EPSV ALL in effect; use EPSV");
+            return;
+        }
         self.clear_pasv();
         let Some(addr) = parse_port(arg) else {
             self.send_reply(endpoint, 501, "Syntax error in parameters");
@@ -496,18 +547,32 @@ impl FtpControlHandler {
         if !self.require_auth(endpoint) {
             return;
         }
-        self.clear_pasv();
-        let Some(addr) = parse_eprt(arg) else {
-            self.send_reply(endpoint, 501, "Syntax error in parameters");
-            return;
-        };
-        if !self.config.allow_active_bounce && addr.ip() != self.meta.peer.ip() {
-            self.send_reply(endpoint, 504, "EPRT to foreign address rejected");
+        if self.epsv_all {
+            self.send_reply(endpoint, 501, "EPSV ALL in effect; use EPSV");
             return;
         }
-        self.data_mode = DataMode::Active { addr };
-        let _ = self.ensure_bridge();
-        self.send_reply(endpoint, 200, "EPRT command successful");
+        self.clear_pasv();
+        match parse_eprt(arg) {
+            Ok(addr) => {
+                if !self.config.allow_active_bounce && addr.ip() != self.meta.peer.ip() {
+                    self.send_reply(endpoint, 504, "EPRT to foreign address rejected");
+                    return;
+                }
+                self.data_mode = DataMode::Active { addr };
+                let _ = self.ensure_bridge();
+                self.send_reply(endpoint, 200, "EPRT command successful");
+            }
+            Err(EprtError::ProtocolNotSupported { supported }) => {
+                self.send_reply(
+                    endpoint,
+                    522,
+                    &format!("Network protocol not supported, use ({supported})"),
+                );
+            }
+            Err(EprtError::Syntax) => {
+                self.send_reply(endpoint, 501, "Syntax error in parameters");
+            }
+        }
     }
 
     fn prepare_data(&mut self, endpoint: &mut dyn Endpoint) -> bool {
@@ -599,7 +664,13 @@ impl FtpControlHandler {
         // Passive binding can go after accept; leave until transfer done / ABOR.
     }
 
-    fn cmd_stor(&mut self, endpoint: &mut dyn Endpoint, arg: &str, append: bool) {
+    fn cmd_stor(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        arg: &str,
+        append: bool,
+        opening: Option<&str>,
+    ) {
         if !self.require_auth(endpoint) || arg.is_empty() {
             if arg.is_empty() {
                 self.send_reply(endpoint, 501, "Syntax error");
@@ -659,8 +730,11 @@ impl FtpControlHandler {
             .user
             .clone()
             .and_then(|user| self.app.quota_manager().map(|qm| (qm, user)));
-        self.send_reply(endpoint, 150, "Opening data connection");
+        let ascii = self.transfer_type == TransferType::Ascii;
+        let msg = opening.unwrap_or("Opening data connection");
+        self.send_reply(endpoint, 150, msg);
         self.ensure_bridge().queue_stor(StorTransfer {
+            ascii,
             path,
             writer,
             observer,
@@ -677,7 +751,10 @@ impl FtpControlHandler {
             .file_system(&self.meta)
             .generate_unique_name(&self.cwd, None, &self.meta);
         match unique.result {
-            FtpFileOpResult::Ok => self.cmd_stor(endpoint, &unique.path, false),
+            FtpFileOpResult::Ok => {
+                let msg = format!("FILE: {}", unique.path);
+                self.cmd_stor(endpoint, &unique.path, false, Some(&msg));
+            }
             FtpFileOpResult::ReadOnly => self.send_reply(endpoint, 550, "Read-only file system"),
             _ => self.send_reply(endpoint, 550, "Failed to generate unique file name"),
         }
@@ -737,25 +814,81 @@ impl FtpControlHandler {
             self.send_reply(endpoint, 550, "Failed to list directory");
             return;
         };
-        let mut body = String::new();
-        for e in entries {
-            let name = encode_name(&e.name, self.utf8);
-            if names_only {
-                body.push_str(&name);
-                body.push_str("\r\n");
-            } else {
-                let t = if e.is_dir { 'd' } else { '-' };
-                body.push_str(&format!(
-                    "{t}rw-r--r-- 1 ftp ftp {:>10} Jan  1 00:00 {}\r\n",
-                    e.size, name
-                ));
-            }
-        }
+        let body = self.format_list_body(&entries, names_only);
         self.send_reply(endpoint, 150, "Opening data connection");
         self.ensure_bridge()
             .queue_outbound(OutboundTransfer::Listing {
                 body: encode_text(&body, self.utf8),
             });
+    }
+
+    /// STAT `<path>` — listing over the control connection (RFC 959 §4.1.3).
+    fn cmd_stat_path(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
+        if !self
+            .app
+            .is_authorized(FtpOperation::Read, arg, &self.meta)
+        {
+            self.send_reply(endpoint, 550, "Permission denied");
+            return;
+        }
+        let path = self.app.file_system(&self.meta).resolve(arg, &self.cwd);
+        if let Some(entries) = self
+            .app
+            .file_system(&self.meta)
+            .list_directory(&path, &self.meta)
+        {
+            let body = self.format_list_body(&entries, false);
+            let header = format!("status of {path}");
+            let owned: Vec<String> = std::iter::once(header)
+                .chain(body.lines().map(|l| l.to_string()))
+                .chain(std::iter::once("End of status".into()))
+                .collect();
+            let parts: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+            self.send_multiline(endpoint, 213, &parts);
+            return;
+        }
+        match self
+            .app
+            .file_system(&self.meta)
+            .file_info(&path, &self.meta)
+        {
+            Some(e) => {
+                let line = self.format_list_entry(&e);
+                let header = format!("status of {path}");
+                self.send_multiline(endpoint, 213, &[&header, &line, "End of status"]);
+            }
+            None => self.send_reply(endpoint, 550, "Failed to list path"),
+        }
+    }
+
+    fn format_list_body(&self, entries: &[crate::server::fs::FtpFileInfo], names_only: bool) -> String {
+        let mut body = String::new();
+        for e in entries {
+            if names_only {
+                body.push_str(&encode_name(&e.name, self.utf8));
+                body.push_str("\r\n");
+            } else {
+                body.push_str(&self.format_list_entry(e));
+                body.push_str("\r\n");
+            }
+        }
+        body
+    }
+
+    fn format_list_entry(&self, e: &crate::server::fs::FtpFileInfo) -> String {
+        let name = encode_name(&e.name, self.utf8);
+        let t = if e.is_dir { 'd' } else { '-' };
+        format!("{t}rw-r--r-- 1 ftp ftp {:>10} Jan  1 00:00 {name}", e.size)
+    }
+
+    fn mls_facts(&self, e: &crate::server::fs::FtpFileInfo) -> String {
+        let typ = if e.is_dir { "dir" } else { "file" };
+        let modify = e
+            .modified
+            .map(format_ftp_mtime)
+            .unwrap_or_else(|| "19700101000000".into());
+        let perm = mls_perm(e.is_dir, self.config.read_only);
+        format!("Type={typ};Size={};Modify={modify};Perm={perm};", e.size)
     }
 
     fn cmd_mlsd(&mut self, endpoint: &mut dyn Endpoint, arg: &str) {
@@ -780,9 +913,11 @@ impl FtpControlHandler {
         };
         let mut body = String::new();
         for e in entries {
-            let typ = if e.is_dir { "dir" } else { "file" };
             let name = encode_name(&e.name, self.utf8);
-            body.push_str(&format!("Type={typ};Size={}; {}\r\n", e.size, name));
+            body.push_str(&self.mls_facts(&e));
+            body.push(' ');
+            body.push_str(&name);
+            body.push_str("\r\n");
         }
         self.send_reply(endpoint, 150, "Opening data connection");
         self.ensure_bridge()
@@ -802,10 +937,9 @@ impl FtpControlHandler {
         };
         match self.app.file_system(&self.meta).file_info(&path, &self.meta) {
             Some(e) => {
-                let typ = if e.is_dir { "dir" } else { "file" };
                 let shown = encode_name(&e.path, self.utf8);
-                let line = format!("Type={typ};Size={}; {}", e.size, shown);
-                self.send_multiline(endpoint, 250, &["Start of list", &line, "End"]);
+                let line = format!("{} {}", self.mls_facts(&e), shown);
+                self.send_multiline(endpoint, 250, &["Listing", &line, "End"]);
             }
             None => self.send_reply(endpoint, 550, "File not found"),
         }
@@ -833,11 +967,7 @@ impl FtpControlHandler {
             Some(e) => {
                 let s = e
                     .modified
-                    .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| {
-                        // YYYYMMDDhhmmss rough UTC via secs — enough for smoke tests
-                        format!("{}", d.as_secs())
-                    })
+                    .map(format_ftp_mtime)
                     .unwrap_or_else(|| "19700101000000".into());
                 self.send_reply(endpoint, 213, &s);
             }
@@ -944,6 +1074,14 @@ impl FtpControlHandler {
             self.send_reply(endpoint, 503, "RNFR required first");
             return;
         };
+        if !self
+            .app
+            .is_authorized(FtpOperation::Rename, arg, &self.meta)
+        {
+            self.rename_from = Some(from);
+            self.send_reply(endpoint, 550, "Permission denied");
+            return;
+        }
         let to = self.app.file_system(&self.meta).resolve(arg, &self.cwd);
         match self
             .app
@@ -971,7 +1109,7 @@ impl FtpControlHandler {
             " UTF8",
             " SIZE",
             " MDTM",
-            " MLST Type*;Size*;",
+            " MLST Type*;Size*;Modify*;Perm*;",
             " MLSD",
             " REST STREAM",
             " EPSV",
@@ -1103,16 +1241,70 @@ fn parse_port(arg: &str) -> Option<SocketAddr> {
     ))
 }
 
-fn parse_eprt(arg: &str) -> Option<SocketAddr> {
+enum EprtError {
+    Syntax,
+    ProtocolNotSupported { supported: &'static str },
+}
+
+fn parse_eprt(arg: &str) -> Result<SocketAddr, EprtError> {
     // |1|127.0.0.1|65000| or |2|::1|65000|
     let parts: Vec<_> = arg.trim_matches('|').split('|').collect();
     if parts.len() < 3 {
-        return None;
+        return Err(EprtError::Syntax);
     }
-    let host: IpAddr = parts[1].parse().ok()?;
-    let port: u16 = parts[2].parse().ok()?;
-    Some(SocketAddr::new(host, port))
+    let host: IpAddr = parts[1].parse().map_err(|_| EprtError::Syntax)?;
+    let port: u16 = parts[2].parse().map_err(|_| EprtError::Syntax)?;
+    match (parts[0], host) {
+        ("1", IpAddr::V4(_)) => Ok(SocketAddr::new(host, port)),
+        ("2", IpAddr::V6(_)) => Ok(SocketAddr::new(host, port)),
+        ("1", IpAddr::V6(_)) | ("2", IpAddr::V4(_)) => Err(EprtError::ProtocolNotSupported {
+            supported: if host.is_ipv4() { "1" } else { "2" },
+        }),
+        _ => Err(EprtError::ProtocolNotSupported {
+            supported: "1,2",
+        }),
+    }
+}
+
+/// RFC 3659 `Perm=` fact letters for the logged-in user's abilities.
+fn mls_perm(is_dir: bool, read_only: bool) -> &'static str {
+    if is_dir {
+        if read_only {
+            "el"
+        } else {
+            "cdeflmp"
+        }
+    } else if read_only {
+        "r"
+    } else {
+        "adfrw"
+    }
 }
 
 #[allow(dead_code)]
 fn _binding_ty(_: BindingId) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    fn parse_eprt_validates_net_prt_against_address() {
+        assert!(parse_eprt("|1|127.0.0.1|65000|").is_ok());
+        assert!(parse_eprt("|2|::1|65000|").is_ok());
+        assert!(matches!(
+            parse_eprt("|1|::1|65000|"),
+            Err(EprtError::ProtocolNotSupported { .. })
+        ));
+        assert!(matches!(
+            parse_eprt("|2|127.0.0.1|65000|"),
+            Err(EprtError::ProtocolNotSupported { .. })
+        ));
+        assert!(matches!(
+            parse_eprt("|3|127.0.0.1|65000|"),
+            Err(EprtError::ProtocolNotSupported { .. })
+        ));
+        let _ = Ipv6Addr::LOCALHOST;
+    }
+}
