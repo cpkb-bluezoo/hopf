@@ -984,6 +984,61 @@ fn start_server_with_authz_ext(
     (rt, bound)
 }
 
+/// Like [`AuthzTestHandler`], but denies `Rename` only when the path contains
+/// `dest` — so RNFR can succeed while RNTO of `/dest.txt` is gated.
+struct RntoDenyHandler {
+    fs: BasicFtpFileSystem,
+}
+
+impl FtpConnectionHandler for RntoDenyHandler {
+    fn authenticate(
+        &mut self,
+        username: &str,
+        password: Option<&str>,
+        _account: Option<&str>,
+        _meta: &FtpConnectionMetadata,
+    ) -> FtpAuthResult {
+        match password {
+            None => FtpAuthResult::NeedPassword,
+            Some(p) if username == "u" && p == "p" => FtpAuthResult::Success,
+            Some(_) => FtpAuthResult::Failed,
+        }
+    }
+
+    fn file_system(&mut self, _meta: &FtpConnectionMetadata) -> &mut dyn FtpFileSystem {
+        &mut self.fs
+    }
+
+    fn is_authorized(&self, op: FtpOperation, path: &str, _meta: &FtpConnectionMetadata) -> bool {
+        !(op == FtpOperation::Rename && path.contains("dest"))
+    }
+}
+
+struct RntoDenyFactory {
+    root: std::path::PathBuf,
+}
+
+impl FtpConnectionHandlerFactory for RntoDenyFactory {
+    fn create(&self) -> Box<dyn FtpConnectionHandler> {
+        Box::new(RntoDenyHandler {
+            fs: BasicFtpFileSystem::new(&self.root, false).unwrap(),
+        })
+    }
+}
+
+fn start_server_with_rnto_authz(root: &std::path::Path) -> (Arc<Runtime>, SocketAddr) {
+    let policy = PasswordTrustPolicy::default();
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = FtpConfig::new(listen, root, policy.shared());
+    let factory = Arc::new(RntoDenyFactory {
+        root: root.to_path_buf(),
+    });
+    let service = FtpService::with_handler_factory(config, factory);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+    (rt, bound)
+}
+
 #[test]
 fn mkd_is_gated_by_is_authorized_create_dir() {
     let dir = tempfile::tempdir().unwrap();
@@ -1022,6 +1077,22 @@ fn rnfr_is_gated_by_is_authorized_rename() {
     let mut ctrl = raw_login(bound);
     let r = raw_cmd(&mut ctrl, "RNFR /f.txt\r\n");
     assert!(r.starts_with("550"), "RNFR should be denied: {r}");
+}
+
+#[test]
+fn rnto_is_gated_by_is_authorized_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.txt"), b"hi").unwrap();
+    let (_rt, bound) = start_server_with_rnto_authz(dir.path());
+    let mut ctrl = raw_login(bound);
+    let r = raw_cmd(&mut ctrl, "RNFR /f.txt\r\n");
+    assert!(r.starts_with("350"), "RNFR should succeed: {r}");
+    let r = raw_cmd(&mut ctrl, "RNTO /dest.txt\r\n");
+    assert!(r.starts_with("550"), "RNTO should be denied: {r}");
+    assert!(
+        dir.path().join("f.txt").exists(),
+        "denied RNTO must not rename"
+    );
 }
 
 #[test]

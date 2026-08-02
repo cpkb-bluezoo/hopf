@@ -26,7 +26,7 @@ pub use client::reply::{
 };
 pub use server::{
     decode_arg, encode_name, encode_text, format_epsv_reply, format_pasv_reply,
-    normalize_ascii_newlines, reply, reply_charset, reply_multiline, reply_multiline_charset,
+    normalize_ascii_newlines, format_ftp_mtime, reply, reply_charset, reply_multiline, reply_multiline_charset,
     BasicFtpFileSystem, DataMode, DirectoryChange, FilesystemFtpHandler,
     FilesystemFtpHandlerFactory, FtpAuthResult, FtpCommand, FtpConfig, FtpConnectionHandler,
     FtpConnectionHandlerFactory, FtpConnectionMetadata, FtpFileInfo, FtpFileOpResult,
