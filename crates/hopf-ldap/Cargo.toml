@@ -1,0 +1,22 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-ldap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "LDAPv3 client and CredentialStore (Gumdrop ldap.asn1 + LDAPRealm port)"
+readme = "README.md"
+keywords = ["ldap", "ber", "asn1", "auth", "sasl"]
+categories = ["network-programming", "authentication"]
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-tls = { workspace = true }
+hopf-auth = { workspace = true }
+
+[dev-dependencies]

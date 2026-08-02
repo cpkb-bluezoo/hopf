@@ -24,6 +24,7 @@
 //! | [`core`] | `hopf-core` | always |
 //! | [`tls`] | `hopf-tls` | `tls` |
 //! | [`auth`] | `hopf-auth` | `auth` |
+//! | [`ldap`] | `hopf-ldap` | `ldap` |
 //! | [`http`] | `hopf-http` | `http` (`h3` for HTTP/3) |
 //! | [`quic`] | `hopf-quic` | `quic` |
 //! | [`dns`] | `hopf-dns` | `dns` (`dns-server`, `dot`, `doq`, `doh`, `dnssec`) |
@@ -53,6 +54,10 @@ pub use hopf_tls as tls;
 /// TrustPolicy / IdentityMaterial / SASL.
 #[cfg(feature = "auth")]
 pub use hopf_auth as auth;
+
+/// LDAPv3 client and [`CredentialStore`](hopf_auth::CredentialStore) backend.
+#[cfg(feature = "ldap")]
+pub use hopf_ldap as ldap;
 
 /// HTTP/1.x, HTTP/2, and (feature `h3`) HTTP/3 Streams.
 #[cfg(feature = "http")]

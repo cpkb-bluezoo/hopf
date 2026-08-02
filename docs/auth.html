@@ -33,6 +33,7 @@
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="ldap.html">LDAP</a></li>
 <li><a href="webdav.html">WebDAV</a></li>
 <li><a href="websocket.html">WebSocket</a></li>
 <li><a href="grpc.html">gRPC</a></li>
@@ -200,7 +201,11 @@
 </tr>
 <tr>
 <td><code>PasswordStore</code></td>
-<td>In-memory passwords, tokens, cert keys</td>
+<td>In-memory passwords, tokens, cert keys (demo)</td>
+</tr>
+<tr>
+<td><code>LdapCredentialStore</code> (<a href="ldap.html"><code>hopf-ldap</code></a>)</td>
+<td>Production LDAP search-then-bind (PLAIN/LOGIN); keeps LDAP out of <code>hopf-auth</code></td>
 </tr>
 <tr>
 <td><code>ScramCredentials</code></td>
@@ -380,6 +385,7 @@
 <ul>
 <li><a href="cookbook/ftp.html">Cookbook: FTP</a> — <code>FTP_USER</code> / <code>FTP_PASS</code></li>
 <li><a href="cookbook/smtp.html">Cookbook: SMTP</a></li>
+<li><code>examples/smtp-ldap</code> — <a href="ldap.html"><code>LdapCredentialStore</code></a> + <code>SmtpConfig::with_store</code></li>
 <li>HTTP hello examples with auth factories when configured</li>
 </ul>
 <h2 id="limitations">Limitations</h2>
@@ -387,7 +393,7 @@
 <li><strong>No GSSAPI / Kerberos</strong> (deliberate).</li>
 <li>DIGEST-MD5 kept for parity only (deprecated by RFC 6331).</li>
 <li>OAUTHBEARER carries the token in the client “password” slot.</li>
-<li><code>PasswordStore</code> is <strong>in-memory</strong> (demo-grade).</li>
+<li><code>PasswordStore</code> is <strong>in-memory</strong> (demo-grade). For production password AUTH, use <a href="ldap.html"><code>LdapCredentialStore</code></a> (or another <code>CredentialStore</code> impl such as a future PAM backend).</li>
 <li><code>plaintext_password</code> fallback for CRAM-MD5 is discouraged in production.</li>
 <li>SMTP wire currently advertises <strong>AUTH PLAIN</strong> only (<a href="smtp.html">SMTP</a>), even though the auth crate supports more mechanisms.</li>
 <li>SCRAM-SHA-256-PLUS has no cross-mechanism downgrade detection — see the <a href="#scram-channel-binding">channel binding</a> section.</li>
