@@ -525,6 +525,101 @@ impl ImapServerMetrics {
     }
 }
 
+/// MQTT server metrics instruments (OTLP export).
+pub struct MqttServerMetrics {
+    export: ExportHandle,
+    active_connections: AtomicI64,
+}
+
+impl MqttServerMetrics {
+    /// Create with export handle.
+    pub fn new(export: ExportHandle) -> Arc<Self> {
+        Arc::new(Self {
+            export,
+            active_connections: AtomicI64::new(0),
+        })
+    }
+
+    /// Control connection accepted.
+    pub fn connection_opened(&self) {
+        let v = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "mqtt.server.connections",
+            attributes: Vec::new(),
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "mqtt.server.active_connections",
+            attributes: Vec::new(),
+            value: v,
+        });
+    }
+
+    /// Control connection closed.
+    pub fn connection_closed(&self) {
+        let v = self.active_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "mqtt.server.active_connections",
+            attributes: Vec::new(),
+            value: v.max(0),
+        });
+    }
+
+    /// CONNECT authorization finished.
+    pub fn auth(&self, ok: bool) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "mqtt.server.auth",
+            attributes: vec![(
+                "result".into(),
+                if ok { "ok" } else { "fail" }.into(),
+            )],
+            value: 1,
+        });
+    }
+
+    /// SUBSCRIBE processed (one packet, may contain multiple filters).
+    pub fn subscribe(&self) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "mqtt.server.subscribes",
+            attributes: Vec::new(),
+            value: 1,
+        });
+    }
+
+    /// Client PUBLISH finished (after payload streamed).
+    ///
+    /// `qos` is `"0"`, `"1"`, or `"2"`. `outcome` is `"ok"` or `"fail"`.
+    pub fn publish_completed(
+        &self,
+        qos: &str,
+        outcome: &str,
+        duration: std::time::Duration,
+        bytes: u64,
+    ) {
+        let qos_a = ("mqtt.publish.qos".into(), qos.into());
+        let out_a = ("outcome".into(), outcome.into());
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "mqtt.server.publishes",
+            attributes: vec![qos_a.clone(), out_a.clone()],
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::Histogram {
+            name: "mqtt.server.publish.duration",
+            unit: "ms",
+            attributes: vec![qos_a.clone(), out_a],
+            value: duration.as_secs_f64() * 1000.0,
+        });
+        if outcome == "ok" && bytes > 0 {
+            self.export.try_send_metric(MetricPoint::Histogram {
+                name: "mqtt.server.publish.size",
+                unit: "By",
+                attributes: vec![qos_a],
+                value: bytes as f64,
+            });
+        }
+    }
+}
+
 /// Timing helper for one request / transaction.
 #[derive(Debug)]
 pub struct RequestTimer {
@@ -665,6 +760,36 @@ mod tests {
         let body = std::fs::read_to_string(&dir).unwrap_or_default();
         assert!(
             body.contains("imap.server.command.duration"),
+            "missing duration metric: {body}"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn mqtt_publish_emits_duration_to_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-otel-mqtt-pub-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let cfg = OtelConfig::new("mqtt-pub-test").with_jsonl_metrics(&dir);
+        let (handle, join, _running) = spawn_worker(cfg);
+        let metrics = MqttServerMetrics::new(handle.clone());
+        metrics.connection_opened();
+        metrics.publish_completed(
+            "0",
+            "ok",
+            std::time::Duration::from_millis(4),
+            32,
+        );
+        metrics.connection_closed();
+        handle.flush();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        handle.shutdown();
+        let _ = join.join();
+        let body = std::fs::read_to_string(&dir).unwrap_or_default();
+        assert!(
+            body.contains("mqtt.server.publish.duration"),
             "missing duration metric: {body}"
         );
         let _ = std::fs::remove_file(&dir);

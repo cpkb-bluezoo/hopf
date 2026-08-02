@@ -8,11 +8,32 @@
 //! malformed filter/topic). Staging those too, with the same `proceed` /
 //! `reject` shape POP3/IMAP use for their per-command SPI, is future work.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hopf_auth::CredentialStore;
 
 use crate::codec::packet::{reason, ConnectPacket};
+
+/// Per-connection metadata visible to handlers.
+#[derive(Debug, Clone)]
+pub struct MqttConnectionMetadata {
+    /// Client address.
+    pub peer: SocketAddr,
+    /// Local listen address.
+    pub local: SocketAddr,
+    /// Transport has TLS.
+    pub tls: bool,
+    /// Assigned / accepted client id after CONNECT (filled after auth).
+    pub client_id: Option<String>,
+    /// W3C `traceparent` for the active span when OTel traces are enabled.
+    ///
+    /// Pass to outbound HTTP clients (for example
+    /// `hopf_otel::with_traceparent`) so microservice calls continue the
+    /// distributed trace. Timing/duration stay in telemetry — this field is
+    /// propagation identity only.
+    pub traceparent: Option<String>,
+}
 
 /// A CONNECT authorization decision.
 pub enum ConnectDecision {
@@ -29,7 +50,11 @@ pub enum ConnectDecision {
 /// per-connection state if needed (most won't).
 pub trait ConnectHandler: Send {
     /// Decide whether to accept `packet`.
-    fn authorize(&mut self, packet: &ConnectPacket) -> ConnectDecision;
+    fn authorize(
+        &mut self,
+        packet: &ConnectPacket,
+        meta: &MqttConnectionMetadata,
+    ) -> ConnectDecision;
 }
 
 /// Factory for [`ConnectHandler`] — one call per accepted TCP connection.
@@ -45,7 +70,11 @@ pub struct DefaultConnectHandler {
 }
 
 impl ConnectHandler for DefaultConnectHandler {
-    fn authorize(&mut self, packet: &ConnectPacket) -> ConnectDecision {
+    fn authorize(
+        &mut self,
+        packet: &ConnectPacket,
+        _meta: &MqttConnectionMetadata,
+    ) -> ConnectDecision {
         let Some(store) = &self.credentials else {
             return ConnectDecision::Accept;
         };
