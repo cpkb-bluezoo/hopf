@@ -368,7 +368,7 @@
 <tr><td>COPY</td><td>§9.8</td><td>Compliant</td><td><code>Depth: 0</code> copies a collection without members; infinity (default) remains recursive</td></tr>
 <tr><td>MOVE</td><td>§9.9</td><td>Compliant</td><td><code>fs::rename</code> is inherently whole-subtree, matching required Depth-infinity semantics</td></tr>
 <tr><td>LOCK (new + refresh), UNLOCK</td><td>§9.10-9.11</td><td>Compliant</td><td><code>handler.rs:538-596</code>, <code>lock.rs:183-227</code></td></tr>
-<tr><td>Lock-null resources</td><td>§7.3</td><td>Not implemented</td><td>LOCK on a nonexistent path registers a lock but creates no empty file</td></tr>
+<tr><td>Locked empty resources (LOCK unmapped URL)</td><td>RFC 4918 §7.3</td><td>Compliant</td><td>LOCK on an unmapped URL creates a normal empty non-collection file and returns <code>201 Created</code> with <code>Lock-Token</code>; LOCK on an already-mapped URL stays <code>200 OK</code>. The empty resource appears in PROPFIND, accepts PUT (with the lock token), and <code>MUST NOT</code> convert via MKCOL. UNLOCK releases the lock but leaves the file (recommended model). Deprecated RFC 2518 lock-null removal-on-UNLOCK is not implemented. Proven in <code>integration.rs</code> (<code>lock_unmapped_url_creates_locked_empty_resource</code>, <code>lock_then_put_fills_empty_resource_and_relock_is_200</code>, <code>mkcol_on_locked_empty_resource_fails</code>)</td></tr>
 <tr><td>207 Multi-Status framework</td><td>§13</td><td>Compliant</td><td>Streaming writer/parser, split-feed tested</td></tr>
 </tbody>
 </table>
