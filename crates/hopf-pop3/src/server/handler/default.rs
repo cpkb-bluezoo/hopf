@@ -2,15 +2,14 @@
 
 //! Default POP3 handler using the Mailbox API.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hopf_mailbox::{Mailbox, MailboxFactory};
 
 use super::{
     AuthenticateState, AuthorizationHandler, ClientConnected, ConnectedState, ListState,
-    MailboxStatusState, MarkDeletedState, Pop3HandlerFactory, ResetState, RetrieveState,
-    TopState, TransactionHandler, UidlState, UpdateState,
+    MailboxStatusState, MarkDeletedState, Pop3ConnectionMetadata, Pop3HandlerFactory, ResetState,
+    RetrieveState, TopState, TransactionHandler, UidlState, UpdateState,
 };
 
 /// Factory for [`DefaultPop3Handler`].
@@ -45,13 +44,7 @@ pub struct DefaultPop3Handler {
 }
 
 impl ClientConnected for DefaultPop3Handler {
-    fn connected(
-        &mut self,
-        state: &mut dyn ConnectedState,
-        _peer: SocketAddr,
-        _local: SocketAddr,
-        _tls: bool,
-    ) {
+    fn connected(&mut self, state: &mut dyn ConnectedState, _meta: &Pop3ConnectionMetadata) {
         state.accept_connection(&self.greeting, Box::new(self.clone()));
     }
 

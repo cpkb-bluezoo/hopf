@@ -11,6 +11,7 @@ mod fetch_format;
 pub mod handler;
 pub mod idle;
 pub mod list_ext;
+mod metrics;
 pub mod quota;
 mod reply;
 mod search_parse;
@@ -38,6 +39,7 @@ pub use idle::{
     IDLE_POLL_INTERVAL,
 };
 pub use list_ext::{parse_list_command, ListCommand, ListReturnOptions, ListSelectOption};
+pub use metrics::ImapServerMetrics;
 pub use quota::{
     parse_quota_resource_list, MemoryQuotaManager, Quota, QuotaManager, QuotaResource,
     UnlimitedQuotaManager,

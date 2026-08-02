@@ -7,6 +7,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, StorageExecutor};
+use hopf_otel::{RequestTimer, Span, FtpServerMetrics as OtelFtpMetrics};
 
 use crate::server::ascii::{AsciiNewlineDenormalizer, AsciiNewlineNormalizer};
 use crate::server::handler::TransferObserver;
@@ -15,6 +16,48 @@ use crate::server::reply::reply;
 
 /// Bounded read chunk size for streamed RETR transfers.
 const RETR_CHUNK_SIZE: usize = 8192;
+
+/// OTel timing/span for one data transfer; finished from the data plane.
+pub struct TransferTelemetry {
+    timer: RequestTimer,
+    span: Option<Span>,
+    otel: Option<Arc<OtelFtpMetrics>>,
+    direction: &'static str,
+}
+
+impl TransferTelemetry {
+    /// Build for a transfer that has just been queued on the control connection.
+    pub fn start(
+        direction: &'static str,
+        otel: Option<Arc<OtelFtpMetrics>>,
+        span: Option<Span>,
+    ) -> Self {
+        Self {
+            timer: RequestTimer::start(),
+            span,
+            otel,
+            direction,
+        }
+    }
+
+    /// Record duration / size and end the span.
+    pub fn finish(self, ok: bool, bytes: u64) {
+        let outcome = if ok { "ok" } else { "fail" };
+        if let Some(span) = self.span {
+            span.set_attribute("ftp.transfer.direction", self.direction);
+            span.set_attribute("outcome", outcome);
+            if ok {
+                span.set_status_ok();
+            } else {
+                span.set_status_error(outcome);
+            }
+            span.end();
+        }
+        if let Some(m) = &self.otel {
+            m.transfer_completed(self.direction, outcome, self.timer.elapsed(), bytes);
+        }
+    }
+}
 
 /// Outbound (server→client) transfer.
 pub enum OutboundTransfer {
@@ -28,11 +71,15 @@ pub enum OutboundTransfer {
         path: String,
         /// Progress/completion observer, if the app wants one.
         observer: Option<Arc<dyn TransferObserver>>,
+        /// Optional OTel transfer instrumentation.
+        telemetry: Option<TransferTelemetry>,
     },
     /// Preformatted listing.
     Listing {
         /// Bytes.
         body: Vec<u8>,
+        /// Optional OTel transfer instrumentation.
+        telemetry: Option<TransferTelemetry>,
     },
 }
 
@@ -49,6 +96,8 @@ pub struct StorTransfer {
     /// Quota manager + username to record usage against, once the upload
     /// completes successfully.
     pub quota: Option<(Arc<dyn hopf_core::QuotaManager>, String)>,
+    /// Optional OTel transfer instrumentation.
+    pub telemetry: Option<TransferTelemetry>,
 }
 
 /// Shared state between control and one data connection.
@@ -209,7 +258,13 @@ impl DataBridge {
         let bridge_done = Arc::clone(self);
 
         match transfer {
-            OutboundTransfer::Retr { ascii, mut reader, path, observer } => {
+            OutboundTransfer::Retr {
+                ascii,
+                mut reader,
+                path,
+                observer,
+                telemetry,
+            } => {
                 let progress_observer = observer.clone();
                 let progress_path = path.clone();
                 let complete_observer = observer;
@@ -269,27 +324,38 @@ impl DataBridge {
                         }
                         Ok::<u64, Box<dyn std::error::Error + Send + Sync>>(total)
                     },
-                    move |result| match result {
-                        Ok(n) => {
-                            FtpServerMetrics::add(&metrics.bytes_out, n);
-                            if let Some(obs) = &complete_observer {
-                                obs.transfer_completed(&complete_path, false, n, true);
+                    move |result| {
+                        let aborted = bridge_done.was_aborted();
+                        let (ok, n) = match result {
+                            Ok(n) => {
+                                FtpServerMetrics::add(&metrics.bytes_out, n);
+                                if let Some(obs) = &complete_observer {
+                                    obs.transfer_completed(&complete_path, false, n, true);
+                                }
+                                data.close();
+                                Self::send_transfer_reply(&control, aborted, true);
+                                (!aborted, n)
                             }
-                            data.close();
-                            Self::send_transfer_reply(&control, bridge_done.was_aborted(), true);
-                        }
-                        Err(_) => {
-                            if let Some(obs) = &complete_observer {
-                                obs.transfer_completed(&complete_path, false, 0, false);
+                            Err(_) => {
+                                if let Some(obs) = &complete_observer {
+                                    obs.transfer_completed(&complete_path, false, 0, false);
+                                }
+                                data.close();
+                                Self::send_transfer_reply(&control, aborted, false);
+                                (false, 0)
                             }
-                            data.close();
-                            Self::send_transfer_reply(&control, bridge_done.was_aborted(), false);
+                        };
+                        if let Some(t) = telemetry {
+                            t.finish(ok, n);
                         }
                     },
                 );
             }
-            OutboundTransfer::Listing { body } => {
+            OutboundTransfer::Listing { body, telemetry } => {
                 if bridge.was_aborted() {
+                    if let Some(t) = telemetry {
+                        t.finish(false, 0);
+                    }
                     data.close();
                     return;
                 }
@@ -297,6 +363,10 @@ impl DataBridge {
                 FtpServerMetrics::add(&metrics.bytes_out, n);
                 data.send(body);
                 data.close();
+                let ok = !bridge.was_aborted();
+                if let Some(t) = telemetry {
+                    t.finish(ok, n);
+                }
                 Self::send_transfer_reply(&control, bridge.was_aborted(), true);
             }
         }
@@ -324,6 +394,7 @@ pub struct FtpDataHandler {
     stor_bytes: u64,
     stor_ascii: bool,
     stor_denorm: AsciiNewlineDenormalizer,
+    stor_telemetry: Option<TransferTelemetry>,
 }
 
 impl FtpDataHandler {
@@ -341,6 +412,7 @@ impl FtpDataHandler {
             stor_bytes: 0,
             stor_ascii: false,
             stor_denorm: AsciiNewlineDenormalizer::new(),
+            stor_telemetry: None,
         }
     }
 
@@ -357,6 +429,7 @@ impl FtpDataHandler {
                 self.stor_quota = t.quota;
                 self.stor_ascii = t.ascii;
                 self.stor_denorm = AsciiNewlineDenormalizer::new();
+                self.stor_telemetry = t.telemetry;
                 self.stor_writer = Some(t.writer);
             }
         }
@@ -437,7 +510,8 @@ impl ProtocolHandler for FtpDataHandler {
                 }
             }
             let _ = w.flush();
-            if self.bridge.was_aborted() {
+            let aborted = self.bridge.was_aborted();
+            if aborted {
                 if let Some(obs) = &self.stor_observer {
                     obs.transfer_completed(&self.stor_path, true, self.stor_bytes, false);
                 }
@@ -450,6 +524,9 @@ impl ProtocolHandler for FtpDataHandler {
                 }
                 self.bridge.stor_complete(self.stor_bytes);
             }
+            if let Some(t) = self.stor_telemetry.take() {
+                t.finish(!aborted, self.stor_bytes);
+            }
         }
         self.bridge.on_data_closed();
     }
@@ -458,6 +535,9 @@ impl ProtocolHandler for FtpDataHandler {
         if self.stor_writer.take().is_some() {
             if let Some(obs) = &self.stor_observer {
                 obs.transfer_completed(&self.stor_path, true, self.stor_bytes, false);
+            }
+            if let Some(t) = self.stor_telemetry.take() {
+                t.finish(false, self.stor_bytes);
             }
             self.bridge.stor_failed();
         }

@@ -99,6 +99,9 @@ pub struct Pop3Service {
     metrics: Arc<Pop3ServerMetrics>,
     handler_factory: Arc<dyn Pop3HandlerFactory>,
     runtime: Arc<Runtime>,
+    otel_metrics: Option<Arc<hopf_otel::Pop3ServerMetrics>>,
+    export: Option<hopf_otel::ExportHandle>,
+    traces_enabled: bool,
 }
 
 impl Pop3Service {
@@ -115,6 +118,9 @@ impl Pop3Service {
             metrics: Pop3ServerMetrics::shared(),
             handler_factory: factory,
             runtime,
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
         }
     }
 
@@ -129,7 +135,29 @@ impl Pop3Service {
             metrics: Pop3ServerMetrics::shared(),
             handler_factory: factory,
             runtime,
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
         }
+    }
+
+    /// Wire OTLP/JSONL POP3 metrics and connection/retrieve traces from a pipeline.
+    ///
+    /// When traces are enabled, handlers see a W3C `traceparent` on
+    /// [`Pop3ConnectionMetadata`](crate::Pop3ConnectionMetadata) for outbound
+    /// HTTP via `hopf_otel::with_traceparent`.
+    pub fn with_telemetry(mut self, pipeline: &hopf_otel::TelemetryPipeline) -> Self {
+        let cfg = pipeline.config();
+        if cfg.metrics_enabled {
+            self.otel_metrics = Some(pipeline.pop3_metrics());
+        }
+        if cfg.traces_enabled {
+            self.export = Some(pipeline.export_handle());
+            self.traces_enabled = true;
+        } else if cfg.metrics_enabled {
+            self.export = Some(pipeline.export_handle());
+        }
+        self
     }
 
     /// Shared metrics.
@@ -143,13 +171,19 @@ impl Pop3Service {
         let metrics = Arc::clone(&self.metrics);
         let config = self.config.clone();
         let runtime = Arc::clone(&self.runtime);
+        let otel_metrics = self.otel_metrics.clone();
+        let export = self.export.clone();
+        let traces_enabled = self.traces_enabled;
         let mut cfg = TcpListenerConfig::new(self.config.listen, move || {
-            Box::new(Pop3ControlHandler::new(
-                factory.create(),
-                Arc::clone(&metrics),
-                config.clone(),
-                Arc::clone(&runtime),
-            )) as Box<dyn ProtocolHandler>
+            Box::new(
+                Pop3ControlHandler::new(
+                    factory.create(),
+                    Arc::clone(&metrics),
+                    config.clone(),
+                    Arc::clone(&runtime),
+                )
+                .with_telemetry(otel_metrics.clone(), export.clone(), traces_enabled),
+            ) as Box<dyn ProtocolHandler>
         });
         if let Some(tls) = &self.config.tls_acceptor {
             if self.config.implicit_tls {

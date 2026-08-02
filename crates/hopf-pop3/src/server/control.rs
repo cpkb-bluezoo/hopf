@@ -10,19 +10,66 @@ use std::time::Instant;
 use hopf_auth::{create_server, CredentialStore, SaslServer, SaslServerOptions, SaslServerStep};
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
 use hopf_mailbox::{Mailbox, MailboxFactory, MailboxStore, MessageReadCallback};
+use hopf_otel::{
+    ExportHandle, RequestTimer, Span, SpanKind, Trace, Pop3ServerMetrics as OtelPop3Metrics,
+};
 use rmimeparser::charset::base64;
 
 use crate::server::auth::{advertised_mechanisms, apop_timestamp, capa_sasl_line, verify_apop};
 use crate::server::codec::{Pop3Command, Pop3ServerLexer, MAX_COMMAND_LINE};
 use crate::server::handler::{
-    AuthenticateState, AuthorizationHandler, ClientConnected, ConnectedState, ListState,
-    ListWriter, MailboxStatusState, MarkDeletedState, ResetState, RetrieveState, TopState,
-    TransactionHandler, UidlState, UidlWriter, UpdateState,
+    AuthenticateState, AuthorizationHandler, ClientConnected, ConnectedState,
+    DefaultPop3HandlerFactory, ListState, ListWriter, MailboxStatusState, MarkDeletedState,
+    Pop3ConnectionMetadata, ResetState, RetrieveState, TopState, TransactionHandler, UidlState,
+    UidlWriter, UpdateState,
 };
 use crate::server::metrics::Pop3ServerMetrics;
 use crate::server::reply;
 use crate::server::service::Pop3Config;
 use crate::server::session::Pop3SessionState;
+
+/// OTel timing/span for one RETR/TOP retrieve; finished from the storage callback.
+struct RetrieveTelemetry {
+    timer: RequestTimer,
+    span: Option<Span>,
+    otel: Option<Arc<OtelPop3Metrics>>,
+    kind: &'static str,
+    bytes: u64,
+}
+
+impl RetrieveTelemetry {
+    fn start(
+        kind: &'static str,
+        bytes: u64,
+        otel: Option<Arc<OtelPop3Metrics>>,
+        span: Option<Span>,
+    ) -> Self {
+        Self {
+            timer: RequestTimer::start(),
+            span,
+            otel,
+            kind,
+            bytes,
+        }
+    }
+
+    fn finish(self, ok: bool) {
+        let outcome = if ok { "ok" } else { "fail" };
+        if let Some(span) = self.span {
+            span.set_attribute("pop3.retrieve.kind", self.kind);
+            span.set_attribute("outcome", outcome);
+            if ok {
+                span.set_status_ok();
+            } else {
+                span.set_status_error(outcome);
+            }
+            span.end();
+        }
+        if let Some(m) = &self.otel {
+            m.retrieve_completed(self.kind, outcome, self.timer.elapsed(), self.bytes);
+        }
+    }
+}
 
 struct MailboxBundle {
     store: Option<Box<dyn MailboxStore>>,
@@ -62,11 +109,17 @@ pub struct Pop3ControlHandler {
     last_activity: Instant,
     peer: SocketAddr,
     local: SocketAddr,
+    /// Handler-visible connection metadata (includes `traceparent`).
+    meta: Pop3ConnectionMetadata,
     busy: Arc<AtomicBool>,
     /// Slot for ListWriter/UidlWriter to restore the transaction handler.
     txn_slot: Arc<Mutex<Option<Box<dyn TransactionHandler>>>>,
     /// In-flight mailbox open: handler + outcome filled by the storage callback.
     pending_open: Arc<Mutex<Option<PendingOpen>>>,
+    otel_metrics: Option<Arc<OtelPop3Metrics>>,
+    export: Option<ExportHandle>,
+    traces_enabled: bool,
+    conn_trace: Option<Trace>,
 }
 
 struct PendingOpen {
@@ -120,9 +173,106 @@ impl Pop3ControlHandler {
             last_activity: Instant::now(),
             peer: SocketAddr::from(([0, 0, 0, 0], 0)),
             local: SocketAddr::from(([0, 0, 0, 0], 0)),
+            meta: Pop3ConnectionMetadata {
+                peer: SocketAddr::from(([0, 0, 0, 0], 0)),
+                local: SocketAddr::from(([0, 0, 0, 0], 0)),
+                tls: false,
+                traceparent: None,
+            },
             busy: Arc::new(AtomicBool::new(false)),
             txn_slot: Arc::new(Mutex::new(None)),
             pending_open: Arc::new(Mutex::new(None)),
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
+            conn_trace: None,
+        }
+    }
+
+    /// Attach OTel metrics / traces from a telemetry pipeline.
+    pub fn with_telemetry(
+        mut self,
+        otel_metrics: Option<Arc<OtelPop3Metrics>>,
+        export: Option<ExportHandle>,
+        traces_enabled: bool,
+    ) -> Self {
+        self.otel_metrics = otel_metrics;
+        self.export = export;
+        self.traces_enabled = traces_enabled;
+        self
+    }
+
+    fn sync_meta_addrs(&mut self) {
+        self.meta.peer = self.peer;
+        self.meta.local = self.local;
+        self.meta.tls = self.tls;
+    }
+
+    fn begin_connection_telemetry(&mut self) {
+        if let Some(m) = &self.otel_metrics {
+            m.connection_opened();
+        }
+        if self.traces_enabled {
+            if let Some(export) = self.export.clone() {
+                let t = Trace::new("POP3 connection", SpanKind::Server);
+                t.set_exporter(export);
+                self.meta.traceparent = Some(t.traceparent());
+                self.conn_trace = Some(t);
+            }
+        }
+    }
+
+    fn end_connection_telemetry(&mut self) {
+        if let Some(trace) = self.conn_trace.take() {
+            let root = trace.root_span();
+            root.set_status_ok();
+            root.end();
+            trace.end();
+        }
+        self.meta.traceparent = None;
+        if let Some(m) = &self.otel_metrics {
+            m.connection_closed();
+        }
+    }
+
+    fn begin_retrieve_telemetry(
+        &mut self,
+        kind: &'static str,
+        bytes: u64,
+    ) -> Option<RetrieveTelemetry> {
+        if self.otel_metrics.is_none() && self.conn_trace.is_none() {
+            return None;
+        }
+        let span = if let Some(trace) = &self.conn_trace {
+            let s = trace.start_span("POP3 retrieve", SpanKind::Server);
+            self.meta.traceparent = Some(trace.traceparent());
+            Some(s)
+        } else {
+            None
+        };
+        Some(RetrieveTelemetry::start(
+            kind,
+            bytes,
+            self.otel_metrics.clone(),
+            span,
+        ))
+    }
+
+    fn record_auth(&self, ok: bool) {
+        if ok {
+            Pop3ServerMetrics::add(&self.metrics.auth_ok, 1);
+        } else {
+            Pop3ServerMetrics::add(&self.metrics.auth_fail, 1);
+        }
+        if let Some(m) = &self.otel_metrics {
+            m.auth(ok);
+        }
+    }
+
+    fn record_stls(&self) {
+        Pop3ServerMetrics::add(&self.metrics.stls, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.stls();
         }
     }
 
@@ -159,6 +309,7 @@ impl Pop3ControlHandler {
         }
         self.greeting_sent = true;
         Pop3ServerMetrics::add(&self.metrics.connections, 1);
+        self.sync_meta_addrs();
         let mut view = ConnectedView {
             endpoint,
             authorization: &mut self.authorization,
@@ -166,7 +317,7 @@ impl Pop3ControlHandler {
             enable_apop: self.config.enable_apop,
         };
         if let Some(mut c) = self.client_connected.take() {
-            c.connected(&mut view, self.peer, self.local, self.tls);
+            c.connected(&mut view, &self.meta);
             self.client_connected = Some(c);
         }
     }
@@ -374,7 +525,7 @@ impl Pop3ControlHandler {
     }
 
     fn auth_failed(&mut self, endpoint: &mut dyn Endpoint, msg: &str) {
-        Pop3ServerMetrics::add(&self.metrics.auth_fail, 1);
+        self.record_auth(false);
         self.last_auth_fail = Some(Instant::now());
         self.pending_user = None;
         self.send(endpoint, reply::err(msg));
@@ -518,7 +669,7 @@ impl Pop3ControlHandler {
     }
 
     fn finish_auth(&mut self, endpoint: &mut dyn Endpoint, username: &str) {
-        Pop3ServerMetrics::add(&self.metrics.auth_ok, 1);
+        self.record_auth(true);
         self.pending_user = None;
         let factory = Arc::clone(&self.config.mailbox_factory);
         let Some(mut h) = self.authorization.take() else {
@@ -687,6 +838,7 @@ impl Pop3ControlHandler {
                 endpoint,
                 transaction: &mut this.transaction,
                 metrics: &this.metrics,
+                otel: &this.otel_metrics,
             };
             handler.mark_deleted(&mut view, mb, n);
             done = true;
@@ -822,6 +974,7 @@ impl Pop3ControlHandler {
         let handle = endpoint.handle();
         let metrics = Arc::clone(&self.metrics);
         let busy = Arc::clone(&self.busy);
+        let telemetry = self.begin_retrieve_telemetry("retr", size);
         self.set_busy(true);
         endpoint.pause_read();
         // The status line is sent up front — `size` is already known from
@@ -849,11 +1002,15 @@ impl Pop3ControlHandler {
                 Ok(())
             },
             move |result: Result<(), StorageError>| {
+                let ok = result.is_ok();
                 if let Err(e) = result {
                     // The status line already went out; nothing left to do
                     // but log and let the client observe a truncated
                     // download / closed connection.
                     eprintln!("hopf-pop3: RETR failed mid-stream: {e}");
+                }
+                if let Some(tel) = telemetry {
+                    tel.finish(ok);
                 }
                 handle.with_endpoint(move |ep| {
                     busy.store(false, Ordering::Relaxed);
@@ -868,6 +1025,7 @@ impl Pop3ControlHandler {
         let bundle = Arc::clone(&self.bundle);
         let handle = endpoint.handle();
         let busy = Arc::clone(&self.busy);
+        let telemetry = self.begin_retrieve_telemetry("top", 0);
         self.set_busy(true);
         endpoint.pause_read();
         self.send(endpoint, reply::ok("Top of message follows"));
@@ -887,8 +1045,12 @@ impl Pop3ControlHandler {
                 Ok(())
             },
             move |result: Result<(), StorageError>| {
+                let ok = result.is_ok();
                 if let Err(e) = result {
                     eprintln!("hopf-pop3: TOP failed mid-stream: {e}");
+                }
+                if let Some(tel) = telemetry {
+                    tel.finish(ok);
                 }
                 handle.with_endpoint(move |ep| {
                     busy.store(false, Ordering::Relaxed);
@@ -964,6 +1126,8 @@ impl ProtocolHandler for Pop3ControlHandler {
         if endpoint.is_secure() {
             self.tls = true;
         }
+        self.sync_meta_addrs();
+        self.begin_connection_telemetry();
         self.control_handle = Some(endpoint.handle());
         if !self.expect_implicit_tls || self.tls {
             self.greet(endpoint);
@@ -999,6 +1163,7 @@ impl ProtocolHandler for Pop3ControlHandler {
         if self.session != Pop3SessionState::Update {
             self.offload_close_no_expunge();
         }
+        self.end_connection_telemetry();
     }
 
     fn security_established(
@@ -1008,13 +1173,14 @@ impl ProtocolHandler for Pop3ControlHandler {
     ) {
         let first = !self.tls;
         self.tls = true;
+        self.meta.tls = true;
         self.peer_certificate = info.peer_certificate_fingerprint().map(str::to_string);
         if self.expect_implicit_tls && !self.greeting_sent {
             self.greet(endpoint);
             return;
         }
         if self.stls_used {
-            Pop3ServerMetrics::add(&self.metrics.stls, 1);
+            self.record_stls();
             self.stls_used = false;
             return;
         }
@@ -1260,12 +1426,16 @@ struct DeleView<'a> {
     endpoint: &'a mut dyn Endpoint,
     transaction: &'a mut Option<Box<dyn TransactionHandler>>,
     metrics: &'a Arc<Pop3ServerMetrics>,
+    otel: &'a Option<Arc<OtelPop3Metrics>>,
 }
 
 impl MarkDeletedState for DeleView<'_> {
     fn marked_deleted(&mut self, handler: Box<dyn TransactionHandler>) {
         *self.transaction = Some(handler);
         Pop3ServerMetrics::add(&self.metrics.dele, 1);
+        if let Some(m) = self.otel {
+            m.dele();
+        }
         self.endpoint
             .send(&reply::ok("Message marked for deletion"));
     }
@@ -1689,5 +1859,64 @@ mod utf8_scan_tests {
     fn non_ascii_header_requires_utf8() {
         let (_dir, mut mb) = mailbox_with("Subject: café\r\n\r\nbody\r\n".as_bytes());
         assert!(message_has_non_ascii(mb.as_mut(), 1));
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use hopf_auth::PasswordStore;
+    use hopf_core::{Runtime, RuntimeConfig};
+    use hopf_mailbox::MaildirFactory;
+    use hopf_otel::{OtelConfig, SpanContext, TelemetryPipeline};
+    use crate::server::handler::Pop3HandlerFactory;
+
+    #[test]
+    fn with_telemetry_sets_parseable_traceparent_on_connect() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-pop3-tp-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = OtelConfig::new("pop3-tp-test")
+            .with_jsonl_traces(&dir)
+            .with_jsonl_metrics(&dir);
+        let pipeline = TelemetryPipeline::start(cfg).unwrap();
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let store = Arc::new(PasswordStore::new().with_user("u", "p"));
+        let factory = Arc::new(MaildirFactory::new(root.path()));
+        let listen: SocketAddr = "127.0.0.1:1110".parse().unwrap();
+        let config = Pop3Config::new(listen, "localhost", store, factory);
+        let app = DefaultPop3HandlerFactory::new("ready").create();
+        let mut h = Pop3ControlHandler::new(
+            app,
+            Pop3ServerMetrics::shared(),
+            config,
+            rt,
+        )
+        .with_telemetry(
+            Some(pipeline.pop3_metrics()),
+            Some(pipeline.export_handle()),
+            true,
+        );
+        h.begin_connection_telemetry();
+        let tp = h.meta.traceparent.clone().expect("traceparent set");
+        let ctx = SpanContext::from_traceparent(&tp).expect("valid traceparent");
+        assert!(!ctx.trace_id.iter().all(|&b| b == 0));
+
+        let xfer = h
+            .begin_retrieve_telemetry("retr", 10)
+            .expect("retrieve telemetry");
+        let xfer_tp = h.meta.traceparent.clone().expect("xfer traceparent");
+        let xfer_ctx = SpanContext::from_traceparent(&xfer_tp).unwrap();
+        assert_eq!(xfer_ctx.trace_id, ctx.trace_id);
+        assert_ne!(xfer_ctx.span_id, ctx.span_id);
+        xfer.finish(true);
+
+        h.end_connection_telemetry();
+        assert!(h.meta.traceparent.is_none());
+        pipeline.shutdown();
+        let _ = std::fs::remove_file(&dir);
     }
 }
