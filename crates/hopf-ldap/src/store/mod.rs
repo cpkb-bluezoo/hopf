@@ -64,7 +64,7 @@ pub struct LdapStoreConfig {
     pub user_filter: String,
     /// Overall timeout for each connect/search/bind phase.
     pub timeout: Duration,
-    /// Follow LDAP referrals / SearchResultReference URLs (default `true`).
+    /// Follow LDAP referrals / SearchResultReference URLs (default `false`).
     pub chase_referrals: bool,
     /// Maximum referral hops (default [`DEFAULT_MAX_REFERRAL_HOPS`]).
     pub max_referral_hops: u32,
@@ -74,7 +74,7 @@ pub struct LdapStoreConfig {
 
 impl LdapStoreConfig {
     /// Build a config with defaults (`port` 389, filter `(uid={0})`, 30s timeout,
-    /// referral chase on).
+    /// referral chase **off**).
     pub fn new(host: impl Into<String>, base_dn: impl Into<String>, runtime: Arc<Runtime>) -> Self {
         Self {
             host: host.into(),
@@ -86,7 +86,7 @@ impl LdapStoreConfig {
             bind_password: None,
             user_filter: "(uid={0})".into(),
             timeout: Duration::from_secs(30),
-            chase_referrals: true,
+            chase_referrals: false,
             max_referral_hops: DEFAULT_MAX_REFERRAL_HOPS,
             runtime,
         }
@@ -139,7 +139,8 @@ impl LdapStoreConfig {
         self
     }
 
-    /// Enable or disable referral chase.
+    /// Enable or disable referral chase (off by default — SSRF / credential
+    /// reuse risk when following attacker-influenced URLs).
     pub fn with_chase_referrals(mut self, chase: bool) -> Self {
         self.chase_referrals = chase;
         self

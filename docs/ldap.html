@@ -138,7 +138,7 @@ LdapClient<span class="op">::</span>connect(<span class="op">&amp;</span>rt<span
 <p><strong>STARTTLS</strong> (RFC 4511 §4.14): dial plaintext, then <code>LdapSession::start_tls</code> (or configure <code>LdapStoreConfig::with_starttls</code> so the store does it before bind). Uses <code>Endpoint::start_client_tls</code> after a successful ExtendedResponse for OID <code>1.3.6.1.4.1.1466.20037</code>. LDAPS and STARTTLS are mutually exclusive on one dial.</p>
 
 <h2 id="referrals">Referral chase</h2>
-<p><code>LdapCredentialStore</code> chases search and bind referrals by default (cap <code>max_referral_hops</code>, default 5). URLs are parsed per RFC 4516 (<code>ldap://</code> / <code>ldaps://</code>); empty DN in the URL keeps the referring operation’s base DN (RFC 4511 §4.1.10). Disable with <code>with_chase_referrals(false)</code>. <code>ldaps://</code> referrals need a TLS connector already configured on the store.</p>
+<p><code>LdapCredentialStore</code> does <strong>not</strong> chase search/bind referrals by default (enable with <code>with_chase_referrals(true)</code>; hop cap <code>max_referral_hops</code>, default 5). URLs are parsed per RFC 4516 (<code>ldap://</code> / <code>ldaps://</code>); empty DN in the URL keeps the referring operation’s base DN (RFC 4511 §4.1.10). <code>ldaps://</code> referrals need a TLS connector already configured on the store.</p>
 
 <h2 id="store">LdapCredentialStore</h2>
 <p>Search-then-bind (Gumdrop <code>LDAPRealm.passwordMatch</code>):</p>
