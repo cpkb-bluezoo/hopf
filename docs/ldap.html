@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LDAP — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="ldap.html" aria-current="page">LDAP</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
+<li><a href="amqp.html">AMQP</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="quota.html">Quota</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Architecture audit</h2><ul>
+<li><a href="conformance.html">Conformance</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>LDAP</h1>
+        <p class="lead">Crate <code>hopf-ldap</code>: async <strong>LDAPv3 client</strong> (RFC&nbsp;4511) and <code>LdapCredentialStore</code> — Gumdrop <code>ldap</code> / <code>LDAPRealm</code> port. BER wire codec lives in <code>hopf_ldap::asn1</code>; the store implements <a href="auth.html"><code>CredentialStore</code></a> without putting LDAP types into <code>hopf-auth</code>.</p>
+      </header>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#ber">BER codec</a></li>
+<li><a href="#client">Client</a></li>
+<li><a href="#ldaps">LDAPS / STARTTLS</a></li>
+<li><a href="#referrals">Referral chase</a></li>
+<li><a href="#store">LdapCredentialStore</a></li>
+<li><a href="#wiring">Wiring mail services</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+
+<h2 id="standards">Standards</h2>
+<table>
+<thead>
+<tr><th>Topic</th><th>Reference</th></tr>
+</thead>
+<tbody>
+<tr><td>LDAPv3</td><td>RFC 4511</td></tr>
+<tr><td>Authentication methods / LDAPS</td><td>RFC 4513</td></tr>
+<tr><td>String representation of filters</td><td>RFC 4515</td></tr>
+<tr><td>BER (definite length)</td><td>ITU-T X.690 (LDAP subset)</td></tr>
+</tbody>
+</table>
+
+<h2 id="architecture">Architecture</h2>
+<pre><code>Mail / HTTP / FTP
+        │
+        ▼
+hopf-auth::CredentialStore  ←── PasswordStore (demo)
+        │                   ←── hopf-ldap::LdapCredentialStore
+        │                   ←── future PamCredentialStore
+        ▼
+hopf-ldap::LdapClient  →  ProtocolHandler on Runtime
+        │
+        ▼
+hopf-ldap::asn1 (BER)
+</code></pre>
+<p><code>CredentialStore</code> stays protocol-agnostic (same as Gumdrop <code>Realm</code>). LDAP lives only in <code>hopf-ldap</code>.</p>
+
+<h2 id="ber">BER codec</h2>
+<p>Module <code>hopf_ldap::asn1</code> ports Gumdrop’s definite-length BER stack: <code>BerEncoder</code>, <code>BerDecoder</code> (streaming <code>receive</code> / <code>next</code>), <code>Asn1Element</code>, tag helpers. Indefinite length is rejected. This is LDAP-oriented BER, not full DER/CER.</p>
+
+<h2 id="client">Client</h2>
+<p><code>LdapClient</code> dials via <code>Runtime::connect</code> / <code>TcpConnectorConfig</code>. On ready it delivers an <code>LdapSession</code>:</p>
+<ul>
+<li><code>bind</code> / <code>bind_anonymous</code> (simple auth)</li>
+<li><code>search</code> (subtree and other scopes; RFC 4515 filter string → BER)</li>
+<li><code>unbind</code> (APPLICATION 2)</li>
+</ul>
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> hopf_ldap<span class="op">::{</span>LdapClient<span class="op">,</span> LdapClientConfig<span class="op">};</span>
+
+<span class="kw">let</span> cfg <span class="op">=</span> LdapClientConfig<span class="op">::</span>new(<span class="st">&quot;ldap.example.com&quot;</span><span class="op">,</span> <span class="dv">389</span>);
+LdapClient<span class="op">::</span>connect(<span class="op">&amp;</span>rt<span class="op">,</span> cfg<span class="op">,</span> <span class="op">|</span>ready<span class="op">|</span> <span class="op">{</span>
+    <span class="kw">if</span> <span class="kw">let</span> <span class="cn">Ok</span>(session) <span class="op">=</span> ready <span class="op">{</span>
+        session<span class="op">.</span>bind_anonymous(<span class="op">|</span>r<span class="op">|</span> <span class="op">{</span> <span class="kw">let</span> _ <span class="op">=</span> r<span class="op">;</span> <span class="op">}</span>);
+    <span class="op">}</span>
+<span class="op">})</span><span class="op">?</span>;
+</code></pre></div>
+
+<h2 id="ldaps">LDAPS / STARTTLS</h2>
+<p><strong>LDAPS</strong> (implicit TLS from dial, port 636 typical): <code>LdapClientConfig::with_tls</code> / <code>LdapStoreConfig::with_ldaps</code>. The handler waits for <code>security_established</code> before delivering the session.</p>
+<p><strong>STARTTLS</strong> (RFC 4511 §4.14): dial plaintext, then <code>LdapSession::start_tls</code> (or configure <code>LdapStoreConfig::with_starttls</code> so the store does it before bind). Uses <code>Endpoint::start_client_tls</code> after a successful ExtendedResponse for OID <code>1.3.6.1.4.1.1466.20037</code>. LDAPS and STARTTLS are mutually exclusive on one dial.</p>
+
+<h2 id="referrals">Referral chase</h2>
+<p><code>LdapCredentialStore</code> chases search and bind referrals by default (cap <code>max_referral_hops</code>, default 5). URLs are parsed per RFC 4516 (<code>ldap://</code> / <code>ldaps://</code>); empty DN in the URL keeps the referring operation’s base DN (RFC 4511 §4.1.10). Disable with <code>with_chase_referrals(false)</code>. <code>ldaps://</code> referrals need a TLS connector already configured on the store.</p>
+
+<h2 id="store">LdapCredentialStore</h2>
+<p>Search-then-bind (Gumdrop <code>LDAPRealm.passwordMatch</code>):</p>
+<ol>
+<li>Service bind (<code>bind_dn</code> / <code>bind_password</code>) or anonymous</li>
+<li>Search <code>base_dn</code> with <code>user_filter</code> (<code>{0}</code> = RFC 4515–escaped username)</li>
+<li>Bind as discovered user DN + candidate password</li>
+</ol>
+<table>
+<thead>
+<tr><th><code>CredentialStore</code> method</th><th>LDAP store</th></tr>
+</thead>
+<tbody>
+<tr><td><code>supported_mechanisms</code></td><td>PLAIN, LOGIN</td></tr>
+<tr><td><code>password_match</code></td><td>search-then-bind</td></tr>
+<tr><td>digest / SCRAM / CRAM / plaintext / bearer</td><td>unsupported</td></tr>
+</tbody>
+</table>
+<p><strong>Reactor rule:</strong> <code>password_match</code> blocks on a Condvar + timeout completed from LDAP callbacks. Call it only from a storage/worker pool — never on a reactor thread.</p>
+
+<h2 id="wiring">Wiring mail services</h2>
+<p>Same <code>with_store</code> surface as <code>PasswordStore</code>:</p>
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> hopf_ldap<span class="op">::{</span>LdapCredentialStore<span class="op">,</span> LdapStoreConfig<span class="op">};</span>
+<span class="kw">use</span> hopf_smtp<span class="op">::{</span>SmtpConfig<span class="op">,</span> SmtpService<span class="op">};</span>
+
+<span class="kw">let</span> ldap <span class="op">=</span> Arc<span class="op">::</span>new(LdapCredentialStore<span class="op">::</span>new(
+    LdapStoreConfig<span class="op">::</span>new(<span class="st">&quot;ldap.example.com&quot;</span><span class="op">,</span> <span class="st">&quot;dc=example,dc=com&quot;</span><span class="op">,</span> Arc<span class="op">::</span>clone(<span class="op">&amp;</span>rt))
+        <span class="op">.</span>with_bind(<span class="st">&quot;cn=admin,dc=example,dc=com&quot;</span><span class="op">,</span> <span class="st">&quot;secret&quot;</span>)
+        <span class="op">.</span>with_user_filter(<span class="st">&quot;(uid={0})&quot;</span>),
+));
+<span class="kw">let</span> config <span class="op">=</span> SmtpConfig<span class="op">::</span>new(listen<span class="op">,</span> <span class="st">&quot;mail.example.com&quot;</span>)
+    <span class="op">.</span>with_store(ldap);
+</code></pre></div>
+<p>Example binary: <code>examples/smtp-ldap</code> (<code>cargo run -p smtp-ldap -- …</code>). POP3/IMAP use the same <code>Arc&lt;dyn CredentialStore&gt;</code>.</p>
+
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>No modify/add/delete/compare admin API (deferred)</li>
+<li>No SASL bind to the directory server (store uses simple bind only)</li>
+<li>Roles / <code>memberOf</code> not on <code>CredentialStore</code> yet</li>
+<li>Hostname dial uses blocking <code>ToSocketAddrs</code>; prefer a resolved <code>SocketAddr</code> when possible</li>
+<li>Referral chase does not rewrite service credentials per URL; same bind DN/password is reused</li>
+</ul>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

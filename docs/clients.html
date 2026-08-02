@@ -33,6 +33,7 @@
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="ldap.html">LDAP</a></li>
 <li><a href="webdav.html">WebDAV</a></li>
 <li><a href="websocket.html">WebSocket</a></li>
 <li><a href="grpc.html">gRPC</a></li>
@@ -230,6 +231,10 @@ ProtocolHandler::connected / receive / …</code></pre>
 <tr>
 <td>IMAP</td>
 <td><code>ImapClient</code> + <code>ImapFetch</code> / <code>ImapIdle</code> (or custom <code>ImapClientHandlerFactory</code>) in <code>hopf-imap</code></td>
+</tr>
+<tr>
+<td>LDAP</td>
+<td><code>LdapClient</code> / <code>LdapSession</code> (bind, search, unbind) in <a href="ldap.html"><code>hopf-ldap</code></a>; <code>LdapCredentialStore</code> for AUTH</td>
 </tr>
 <tr>
 <td>MQTT</td>

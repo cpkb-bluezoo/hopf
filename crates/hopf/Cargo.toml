@@ -21,6 +21,7 @@ default = ["full"]
 full = [
     "tls",
     "auth",
+    "ldap",
     "http",
     "quic",
     "dns",
@@ -38,6 +39,7 @@ full = [
 ]
 tls = ["dep:hopf-tls"]
 auth = ["dep:hopf-auth"]
+ldap = ["dep:hopf-ldap", "auth", "tls"]
 http = ["dep:hopf-http"]
 quic = ["dep:hopf-quic"]
 dns = ["dep:hopf-dns"]
@@ -66,6 +68,7 @@ mqtt-ws = ["mqtt", "hopf-mqtt/websocket"]
 hopf-core = { workspace = true }
 hopf-tls = { workspace = true, optional = true }
 hopf-auth = { workspace = true, optional = true }
+hopf-ldap = { workspace = true, optional = true }
 hopf-http = { workspace = true, optional = true }
 hopf-quic = { workspace = true, optional = true }
 hopf-dns = { workspace = true, optional = true }

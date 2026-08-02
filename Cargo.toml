@@ -8,6 +8,7 @@ members = [
     "crates/hopf-quic",
     "crates/hopf-dns",
     "crates/hopf-auth",
+    "crates/hopf-ldap",
     "crates/hopf-otel",
     "crates/hopf-webdav",
     "crates/hopf-websocket",
@@ -31,6 +32,7 @@ members = [
     "examples/ftp",
     "examples/ftp-get",
     "examples/smtp",
+    "examples/smtp-ldap",
     "examples/smtp-local",
     "examples/smtp-send",
     "examples/pop3",
@@ -52,6 +54,7 @@ default-members = [
     "crates/hopf-quic",
     "crates/hopf-dns",
     "crates/hopf-auth",
+    "crates/hopf-ldap",
     "crates/hopf-otel",
     "crates/hopf-webdav",
     "crates/hopf-websocket",
@@ -93,6 +96,7 @@ hopf-http = { version = "0.2.0", path = "crates/hopf-http" }
 hopf-quic = { version = "0.2.0", path = "crates/hopf-quic" }
 hopf-dns = { version = "0.2.0", path = "crates/hopf-dns" }
 hopf-auth = { version = "0.2.0", path = "crates/hopf-auth" }
+hopf-ldap = { version = "0.2.0", path = "crates/hopf-ldap" }
 hopf-otel = { version = "0.2.0", path = "crates/hopf-otel" }
 hopf-webdav = { version = "0.2.0", path = "crates/hopf-webdav" }
 hopf-websocket = { version = "0.2.0", path = "crates/hopf-websocket" }

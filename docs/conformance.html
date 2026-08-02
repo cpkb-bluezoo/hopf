@@ -33,6 +33,7 @@
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="ldap.html">LDAP</a></li>
 <li><a href="webdav.html">WebDAV</a></li>
 <li><a href="websocket.html">WebSocket</a></li>
 <li><a href="grpc.html">gRPC</a></li>
@@ -636,7 +637,7 @@
 <tr><td>Proxy authorization (authzid)</td><td>4422 §4.2</td><td>Compliant</td><td>Used by PLAIN and EXTERNAL</td></tr>
 <tr><td>GSSAPI</td><td>4752</td><td>Not implemented (deliberate)</td><td>"Gumdrop parity, no GSSAPI" per hopf's own docs</td></tr>
 <tr><td>Base64, HMAC-MD5/SHA-256, MD5, SHA-256, PBKDF2-HMAC-SHA256, constant-time comparison, CSPRNG nonces</td><td>various</td><td>Compliant</td><td><code>crypto.rs</code>; constant-time compares used consistently across CRAM-MD5/SCRAM/DIGEST-MD5/HTTP Digest</td></tr>
-<tr><td><code>PasswordStore</code> demo-grade / in-memory</td><td>—</td><td>Deferred (documented, not a bug)</td><td>Explicitly scoped as a demo/wiring store — meant to be replaced against a real backend for production, matching Gumdrop's <code>Realm</code> pattern</td></tr>
+<tr><td><code>PasswordStore</code> demo-grade / in-memory</td><td>—</td><td>Documented (demo); LDAP backend available</td><td><code>PasswordStore</code> remains the in-memory wiring/demo store. Production password AUTH: <code>hopf-ldap::LdapCredentialStore</code> (search-then-bind, PLAIN/LOGIN) implements <code>CredentialStore</code> without putting LDAP types into <code>hopf-auth</code> — closes the LDAP path for <a href="https://github.com/cpkb-bluezoo/hopf/issues/124">#124</a>. PAM / other OS backends remain future plugins.</td></tr>
 <tr><td>HTTP Digest (RFC 7616) challenge/verification, Basic, Bearer factories</td><td>7616,7617,6750</td><td>Compliant</td><td><code>http_digest.rs</code>, <code>hopf-http/src/auth.rs</code></td></tr>
 <tr><td>HTTP Digest server-side nonce replay protection</td><td>7616</td><td>Compliant</td><td><code>hopf-http</code>'s <code>DigestAuthHandler::check_auth</code> now consults (and consumes) the tracked-nonce map before verifying the credential hash — an untracked, already-used, or expired nonce is rejected outright, regardless of whether <code>response</code> is otherwise cryptographically correct. Nonces are single-use and expire after <code>DigestAuthConfig::nonce_ttl</code> (default 5 minutes, configurable via <code>with_nonce_ttl</code>) if never redeemed</td></tr>
 <tr><td>OAuth 2.0 (RFC 6749/7662 token introspection)</td><td>6749,7662</td><td>Compliant (with a documented scope limit)</td><td><code>hopf-auth::oauth_introspection</code> implements RFC 7662 for real: <code>IntrospectionRequest</code>/<code>IntrospectionResponse</code> build the request and parse the response (a small purpose-built JSON reader, no new crate dependency), and <code>IntrospectionCredentialStore</code> wraps any <code>CredentialStore</code> to back <code>validate_bearer</code> with a real introspection round trip instead of a local map. Scope limit: the actual HTTP POST is supplied by the caller via <code>IntrospectionTransport</code> (<code>hopf-auth</code> has no network I/O of its own — <code>hopf-http</code>, which does, already depends on <code>hopf-auth</code>, so the dependency can't run the other way) — no protocol crate wires one up by default, so <code>PasswordStore::validate_bearer</code> (a local static map) remains what's actually used unless an app supplies its own transport</td></tr>
@@ -846,7 +847,7 @@
 <tbody>
 <tr><td>SOCKS proxy</td><td>SOCKS5 (RFC 1928) incl. CONNECT/BIND/UDP ASSOCIATE, username/password auth (RFC 1929), GSSAPI (RFC 1961), plus SOCKS4/4a — a large, detailed implementation</td><td>Not started. Planned port from Gumdrop.</td></tr>
 <tr><td>Redis client</td><td>RESP protocol client</td><td>Not started.</td></tr>
-<tr><td>LDAP client</td><td>RFC 4511</td><td>Not started.</td></tr>
+<tr><td>LDAP client + BER + CredentialStore</td><td>RFC 4511 / 4513 / 4515 / 4516</td><td>Started (v1)</td><td>Crate <code>hopf-ldap</code>: definite-length BER (<code>asn1</code>), async bind/search/unbind on the Runtime, LDAPS and STARTTLS via <code>hopf-tls</code>, <code>LdapCredentialStore</code> search-then-bind with referral chase (RFC 4516 URLs). Non-goals: directory admin API, SASL bind to the directory, PAM.</td></tr>
 </tbody>
 </table>
 
