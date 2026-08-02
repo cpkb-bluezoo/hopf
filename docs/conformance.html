@@ -580,7 +580,7 @@
 <tr><td>AUTH mechanisms</td><td>4954</td><td>Compliant</td><td>Full <code>hopf-auth</code> mechanism set wired via <code>SaslMechanism::from_name</code> + <code>create_server</code> against a <code>CredentialStore</code> (<code>SmtpConfig::store</code>), matching hopf-pop3/hopf-imap's dispatcher pattern; EHLO's <code>AUTH</code> line lists each mechanism the store supports, filtered by TLS requirement, instead of a hardcoded <code>AUTH PLAIN</code></td></tr>
 <tr><td>AUTH requires TLS, AUTH abort (<code>*</code>)</td><td>4954</td><td>Compliant</td><td><code>control.rs:786-816</code></td></tr>
 <tr><td>Implicit TLS (SMTPS)</td><td>8314</td><td>Compliant</td><td><code>control.rs:983-993</code></td></tr>
-<tr><td>XCLIENT</td><td>Postfix ext.</td><td>Not implemented (rejected)</td><td>Explicitly returns 550 — deliberate</td></tr>
+<tr><td>XCLIENT</td><td>Postfix ext.</td><td>Compliant</td><td>ACL-gated via <code>SmtpConfig::with_xclient_allow</code> (empty = disabled); EHLO advertises supported attrs; overrides peer/local/HELO/NAME/LOGIN; mid-transaction rejected with 503; LOGIN is informational only (not SASL AUTH)</td></tr>
 </tbody>
 </table>
 <h3>Server — Handler SPI and Stock Services</h3>

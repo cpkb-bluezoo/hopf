@@ -226,9 +226,12 @@
 <td>AUTH</td>
 <td>Full SASL mechanism set when a <code>store</code> is configured, filtered by TLS requirement</td>
 </tr>
+<tr>
+<td>XCLIENT</td>
+<td>Postfix extension; enabled only for CIDRs in <code>SmtpConfig::xclient_allow</code> (default empty = off). Overrides effective peer/local/HELO; <code>LOGIN</code> is informational only</td>
+</tr>
 </tbody>
 </table>
-<p><strong>Rejected:</strong> XCLIENT.</p>
 <h2 id="ehlo-advertisements">EHLO advertisements</h2>
 <p>Always (capability-dependent):</p>
 <ul>
