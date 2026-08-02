@@ -786,7 +786,9 @@ fn parse_capa(lines: &[String]) -> Pop3Capabilities {
             "PIPELINING" => caps.pipelining = true,
             "UTF8" => caps.utf8 = true,
             _ => {
-                if upper.starts_with("SASL") {
+                if upper.starts_with("UTF8 ") {
+                    caps.utf8 = true;
+                } else if upper.starts_with("SASL") {
                     for mech in line.get(4..).unwrap_or("").split_whitespace() {
                         caps.sasl_mechs.push(mech.to_ascii_uppercase());
                     }
