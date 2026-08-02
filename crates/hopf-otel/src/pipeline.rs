@@ -13,7 +13,8 @@ use crate::batch::{spawn_worker, ExportHandle};
 use crate::config::OtelConfig;
 use crate::event::{EventKind, TelemetryEvent};
 use crate::metrics::{
-    FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, Pop3ServerMetrics, SmtpServerMetrics,
+    FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MqttServerMetrics, Pop3ServerMetrics,
+    SmtpServerMetrics,
 };
 
 /// Pipeline: hot-path hook + background OTLP/JSONL exporters.
@@ -25,6 +26,7 @@ pub struct TelemetryPipeline {
     ftp_metrics: Arc<FtpServerMetrics>,
     pop3_metrics: Arc<Pop3ServerMetrics>,
     imap_metrics: Arc<ImapServerMetrics>,
+    mqtt_metrics: Arc<MqttServerMetrics>,
     join: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
 }
@@ -54,6 +56,7 @@ impl TelemetryPipeline {
         let ftp_metrics = FtpServerMetrics::new(sender.clone());
         let pop3_metrics = Pop3ServerMetrics::new(sender.clone());
         let imap_metrics = ImapServerMetrics::new(sender.clone());
+        let mqtt_metrics = MqttServerMetrics::new(sender.clone());
         Ok(Self {
             config,
             sender,
@@ -62,6 +65,7 @@ impl TelemetryPipeline {
             ftp_metrics,
             pop3_metrics,
             imap_metrics,
+            mqtt_metrics,
             join: Some(join),
             running,
         })
@@ -100,6 +104,11 @@ impl TelemetryPipeline {
     /// Shared IMAP server metrics instruments.
     pub fn imap_metrics(&self) -> Arc<ImapServerMetrics> {
         Arc::clone(&self.imap_metrics)
+    }
+
+    /// Shared MQTT server metrics instruments.
+    pub fn mqtt_metrics(&self) -> Arc<MqttServerMetrics> {
+        Arc::clone(&self.mqtt_metrics)
     }
 
     /// Snapshot of exporter configuration.

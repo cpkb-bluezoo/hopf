@@ -13,6 +13,7 @@ pub mod broker;
 mod config;
 mod control;
 mod handler;
+mod metrics;
 mod publish_spool;
 mod service;
 mod store;
@@ -22,5 +23,9 @@ pub mod ws;
 
 pub use config::{MqttConfig, DEFAULT_CONNECT_TIMEOUT};
 pub use control::MqttControlHandler;
-pub use handler::{ConnectDecision, ConnectHandler, DefaultConnectHandler, DefaultMqttHandlerFactory, MqttHandlerFactory};
+pub use handler::{
+    ConnectDecision, ConnectHandler, DefaultConnectHandler, DefaultMqttHandlerFactory,
+    MqttConnectionMetadata, MqttHandlerFactory,
+};
+pub use metrics::MqttServerMetrics;
 pub use service::MqttService;

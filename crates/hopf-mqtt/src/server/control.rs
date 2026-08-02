@@ -5,11 +5,15 @@
 
 use std::collections::HashSet;
 use std::mem;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use hopf_core::{Endpoint, ProtocolHandler, TimerHandle};
+use hopf_otel::{
+    ExportHandle, RequestTimer, Span, SpanKind, Trace, MqttServerMetrics as OtelMqttMetrics,
+};
 
 use crate::server::broker::{validate_topic_name, BrokerState, SubscriberId, UNLIMITED_RECEIVE_MAXIMUM};
 use crate::server::publish_spool::{publish_whole, PendingPublish};
@@ -19,7 +23,56 @@ use crate::codec::properties::property;
 use crate::codec::{encode, MqttError, Properties, ProtocolVersion};
 
 use super::config::MqttConfig;
-use super::handler::{ConnectDecision, ConnectHandler};
+use super::handler::{ConnectDecision, ConnectHandler, MqttConnectionMetadata};
+use super::metrics::MqttServerMetrics;
+
+/// OTel timing/span for one client PUBLISH.
+pub(crate) struct PublishTelemetry {
+    timer: RequestTimer,
+    span: Option<Span>,
+    otel: Option<Arc<OtelMqttMetrics>>,
+    qos: &'static str,
+    bytes: u64,
+}
+
+impl PublishTelemetry {
+    pub(crate) fn start(
+        qos: QoS,
+        bytes: u64,
+        otel: Option<Arc<OtelMqttMetrics>>,
+        span: Option<Span>,
+    ) -> Self {
+        let qos = match qos {
+            QoS::AtMostOnce => "0",
+            QoS::AtLeastOnce => "1",
+            QoS::ExactlyOnce => "2",
+        };
+        Self {
+            timer: RequestTimer::start(),
+            span,
+            otel,
+            qos,
+            bytes,
+        }
+    }
+
+    pub(crate) fn finish(self, ok: bool) {
+        let outcome = if ok { "ok" } else { "fail" };
+        if let Some(span) = self.span {
+            span.set_attribute("mqtt.publish.qos", self.qos);
+            span.set_attribute("outcome", outcome);
+            if ok {
+                span.set_status_ok();
+            } else {
+                span.set_status_error(outcome);
+            }
+            span.end();
+        }
+        if let Some(m) = &self.otel {
+            m.publish_completed(self.qos, outcome, self.timer.elapsed(), self.bytes);
+        }
+    }
+}
 
 static NEXT_ASSIGNED_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -63,13 +116,24 @@ pub struct MqttControlHandler {
     session: SessionState,
     connect_timeout_timer: Option<TimerHandle>,
     connect_handler: Box<dyn ConnectHandler>,
+    metrics: Arc<MqttServerMetrics>,
+    meta: MqttConnectionMetadata,
+    otel_metrics: Option<Arc<OtelMqttMetrics>>,
+    export: Option<ExportHandle>,
+    traces_enabled: bool,
+    conn_trace: Option<Trace>,
+    publish_tel: Option<PublishTelemetry>,
 }
 
 impl MqttControlHandler {
     /// New handler bound to `config` (shared across every connection this
     /// listener accepts) and a freshly-created [`ConnectHandler`] (one per
     /// connection, from [`super::handler::MqttHandlerFactory::create`]).
-    pub fn new(config: Arc<MqttConfig>, connect_handler: Box<dyn ConnectHandler>) -> Self {
+    pub fn new(
+        config: Arc<MqttConfig>,
+        connect_handler: Box<dyn ConnectHandler>,
+        metrics: Arc<MqttServerMetrics>,
+    ) -> Self {
         let mut parser = MqttFrameParser::new(ProtocolVersion::V311);
         parser.set_max_packet_size(config.max_packet_size);
         Self {
@@ -78,12 +142,128 @@ impl MqttControlHandler {
             session: SessionState::AwaitingConnect,
             connect_timeout_timer: None,
             connect_handler,
+            metrics,
+            meta: MqttConnectionMetadata {
+                peer: SocketAddr::from(([0, 0, 0, 0], 0)),
+                local: SocketAddr::from(([0, 0, 0, 0], 0)),
+                tls: false,
+                client_id: None,
+                traceparent: None,
+            },
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
+            conn_trace: None,
+            publish_tel: None,
+        }
+    }
+
+    /// Attach OTel metrics / traces from a telemetry pipeline.
+    pub fn with_telemetry(
+        mut self,
+        otel_metrics: Option<Arc<OtelMqttMetrics>>,
+        export: Option<ExportHandle>,
+        traces_enabled: bool,
+    ) -> Self {
+        self.otel_metrics = otel_metrics;
+        self.export = export;
+        self.traces_enabled = traces_enabled;
+        self
+    }
+
+    fn begin_connection_telemetry(&mut self) {
+        MqttServerMetrics::add(&self.metrics.connections, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.connection_opened();
+        }
+        if self.traces_enabled {
+            if let Some(export) = self.export.clone() {
+                let t = Trace::new("MQTT connection", SpanKind::Server);
+                t.set_exporter(export);
+                self.meta.traceparent = Some(t.traceparent());
+                self.conn_trace = Some(t);
+            }
+        }
+    }
+
+    fn end_connection_telemetry(&mut self) {
+        if let Some(tel) = self.publish_tel.take() {
+            tel.finish(false);
+        }
+        if let Some(trace) = self.conn_trace.take() {
+            let root = trace.root_span();
+            root.set_status_ok();
+            root.end();
+            trace.end();
+        }
+        self.meta.traceparent = None;
+        if let Some(m) = &self.otel_metrics {
+            m.connection_closed();
+        }
+    }
+
+    fn begin_publish_telemetry(&mut self, qos: QoS, bytes: u64) {
+        if self.otel_metrics.is_none() && self.conn_trace.is_none() {
+            return;
+        }
+        let span = if let Some(trace) = &self.conn_trace {
+            let s = trace.start_span("MQTT publish", SpanKind::Server);
+            self.meta.traceparent = Some(trace.traceparent());
+            Some(s)
+        } else {
+            None
+        };
+        self.publish_tel = Some(PublishTelemetry::start(
+            qos,
+            bytes,
+            self.otel_metrics.clone(),
+            span,
+        ));
+    }
+
+    fn finish_publish_telemetry(&mut self, ok: bool) {
+        if let Some(tel) = self.publish_tel.take() {
+            tel.finish(ok);
+        }
+        if let Some(trace) = &self.conn_trace {
+            self.meta.traceparent = Some(trace.traceparent());
+        }
+        if ok {
+            MqttServerMetrics::add(&self.metrics.publishes, 1);
+        }
+    }
+
+    fn record_auth(&self, ok: bool) {
+        if ok {
+            MqttServerMetrics::add(&self.metrics.auth_ok, 1);
+        } else {
+            MqttServerMetrics::add(&self.metrics.auth_fail, 1);
+        }
+        if let Some(m) = &self.otel_metrics {
+            m.auth(ok);
+        }
+    }
+
+    fn record_subscribe(&self) {
+        MqttServerMetrics::add(&self.metrics.subscribes, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.subscribe();
         }
     }
 }
 
 impl ProtocolHandler for MqttControlHandler {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+        if let Ok(peer) = endpoint.remote_addr() {
+            self.meta.peer = peer;
+        }
+        if let Ok(local) = endpoint.local_addr() {
+            self.meta.local = local;
+        }
+        if endpoint.is_secure() {
+            self.meta.tls = true;
+        }
+        self.begin_connection_telemetry();
         let handle = endpoint.handle();
         self.connect_timeout_timer = Some(endpoint.schedule_timer(
             self.config.connect_timeout,
@@ -144,6 +324,15 @@ impl ProtocolHandler for MqttControlHandler {
                 );
             }
         }
+        self.end_connection_telemetry();
+    }
+
+    fn security_established(
+        &mut self,
+        _endpoint: &mut dyn Endpoint,
+        _info: &hopf_core::SecurityInfo,
+    ) {
+        self.meta.tls = true;
     }
 
     fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
@@ -237,10 +426,15 @@ impl MqttFrameHandler for Ctx<'_, '_> {
             packet.client_id.clone()
         };
 
-        if let ConnectDecision::Reject(reason_code) = self.handler.connect_handler.authorize(&packet) {
+        if let ConnectDecision::Reject(reason_code) =
+            self.handler.connect_handler.authorize(&packet, &self.handler.meta)
+        {
+            self.handler.record_auth(false);
             self.connack_and_close(version, reason_code);
             return;
         }
+        self.handler.record_auth(true);
+        self.handler.meta.client_id = Some(client_id.clone());
 
         let keep_alive = if packet.keep_alive == 0 {
             Duration::ZERO
@@ -337,11 +531,14 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         // QoS-1/2 recipients (and retain) are resolved in `end_publish`
         // once the whole payload is known, from a spooled copy.
         let subscriber_id = session.subscriber_id;
+        let qos = header.qos;
+        let bytes = header.payload_len as u64;
         let pending = PendingPublish::begin(self.broker(), subscriber_id, header);
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
         };
         session.pending_publish = Some(pending);
+        self.handler.begin_publish_telemetry(qos, bytes);
     }
 
     fn publish_data(&mut self, data: &[u8]) {
@@ -365,6 +562,7 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         let version = session.version;
         let (qos, packet_id) = (pending.header.qos, pending.header.packet_id);
         pending.finish(self.broker());
+        self.handler.finish_publish_telemetry(true);
 
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
@@ -442,6 +640,7 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         }
         let wire = encode::encode_suback(packet_id, &reason_codes, &Properties::new(), version);
         self.endpoint.send(&wire);
+        self.handler.record_subscribe();
     }
 
     fn suback(&mut self, _packet_id: u16, _properties: Properties, _reason_codes: Vec<u8>) {
@@ -493,5 +692,56 @@ impl MqttFrameHandler for Ctx<'_, '_> {
 
     fn parse_error(&mut self, _err: MqttError) {
         self.disconnect_and_close(reason::MALFORMED_PACKET);
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use crate::server::handler::DefaultMqttHandlerFactory;
+    use crate::server::handler::MqttHandlerFactory;
+    use hopf_otel::{OtelConfig, SpanContext, TelemetryPipeline};
+
+    #[test]
+    fn with_telemetry_sets_parseable_traceparent_on_connect() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-mqtt-tp-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let cfg = OtelConfig::new("mqtt-tp-test")
+            .with_jsonl_traces(&dir)
+            .with_jsonl_metrics(&dir);
+        let pipeline = TelemetryPipeline::start(cfg).unwrap();
+        let config = Arc::new(MqttConfig::new(
+            "127.0.0.1:1883".parse().unwrap(),
+            Arc::new(BrokerState::new()),
+        ));
+        let mut h = MqttControlHandler::new(
+            config,
+            DefaultMqttHandlerFactory::new(None).create(),
+            MqttServerMetrics::shared(),
+        )
+        .with_telemetry(
+            Some(pipeline.mqtt_metrics()),
+            Some(pipeline.export_handle()),
+            true,
+        );
+        h.begin_connection_telemetry();
+        let tp = h.meta.traceparent.clone().expect("traceparent set");
+        let ctx = SpanContext::from_traceparent(&tp).expect("valid traceparent");
+        assert!(!ctx.trace_id.iter().all(|&b| b == 0));
+
+        h.begin_publish_telemetry(QoS::AtMostOnce, 8);
+        let pub_tp = h.meta.traceparent.clone().expect("publish traceparent");
+        let pub_ctx = SpanContext::from_traceparent(&pub_tp).unwrap();
+        assert_eq!(pub_ctx.trace_id, ctx.trace_id);
+        assert_ne!(pub_ctx.span_id, ctx.span_id);
+        h.finish_publish_telemetry(true);
+
+        h.end_connection_telemetry();
+        assert!(h.meta.traceparent.is_none());
+        pipeline.shutdown();
+        let _ = std::fs::remove_file(&dir);
     }
 }
