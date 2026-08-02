@@ -331,8 +331,11 @@ fn local_recipient_username(
 
 /// Deliver to every recipient by streaming `spool_path`'s content into each
 /// mailbox's append triad, then remove the spool file. Emits a DSN to the
-/// reverse-path when NOTIFY requests it. Returns `None` on full success, or
-/// the first error message (other recipients are still attempted).
+/// reverse-path when NOTIFY requests it.
+///
+/// Returns `None` when at least one recipient succeeded (SMTP 250 — partial
+/// failures are reported via DSN so clients do not retry and duplicate).
+/// Returns `Some(error)` only when every recipient failed.
 fn deliver_spooled(
     factory: &dyn MailboxFactory,
     recipients: &[(String, EmailAddress, DsnRecipientParams)],
@@ -346,10 +349,11 @@ fn deliver_spooled(
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let flags = BTreeSet::<Flag>::new();
     let mut first_error: Option<String> = None;
+    let mut any_success = false;
     let mut outcomes: Vec<(DsnRecipientParams, DsnRecipientReport)> = Vec::new();
 
     for (username, addr, params) in recipients {
-        let outcome = match deliver_to_mailbox_streaming(
+        match deliver_to_mailbox_streaming(
             factory,
             username,
             spool_path,
@@ -357,6 +361,7 @@ fn deliver_spooled(
             extra_header_lines,
         ) {
             Ok(()) => {
+                any_success = true;
                 outcomes.push((
                     params.clone(),
                     DsnRecipientReport {
@@ -366,7 +371,6 @@ fn deliver_spooled(
                         diagnostic: None,
                     },
                 ));
-                Ok(())
             }
             Err(e) => {
                 let msg = e.to_string();
@@ -382,10 +386,8 @@ fn deliver_spooled(
                         diagnostic: Some(msg),
                     },
                 ));
-                Err(())
             }
-        };
-        let _ = outcome;
+        }
     }
 
     let reports = DeliveryStatusNotification::filter_reports(outcomes);
@@ -418,7 +420,11 @@ fn deliver_spooled(
     if let Some(path) = spool_path {
         let _ = std::fs::remove_file(path);
     }
-    Ok(first_error)
+    if any_success {
+        Ok(None)
+    } else {
+        Ok(first_error.or_else(|| Some("No recipients could be delivered".into())))
+    }
 }
 
 /// Deliver a rendered DSN: local reverse-path → APPEND; otherwise MX relay.
@@ -539,9 +545,10 @@ where
     F: FnMut(&str) -> Result<(), E>,
 {
     let mut first_error: Option<String> = None;
+    let mut any_success = false;
     for username in recipients {
         match deliver(username) {
-            Ok(()) => {}
+            Ok(()) => any_success = true,
             Err(e) => {
                 if first_error.is_none() {
                     first_error = Some(e.to_string());
@@ -549,7 +556,11 @@ where
             }
         }
     }
-    first_error
+    if any_success {
+        None
+    } else {
+        first_error
+    }
 }
 
 /// Stream `spool_path`'s content into `username`'s INBOX via the append
@@ -624,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_reports_first_failure_but_attempts_later_recipients() {
+    fn delivery_accepts_on_partial_success_but_attempts_every_recipient() {
         let recipients = vec![
             "bad-one".to_string(),
             "good".to_string(),
@@ -632,6 +643,7 @@ mod tests {
         ];
         let mut visited = Vec::new();
 
+        // Any success → accept (None); failures are reported via DSN, not 4xx.
         let error = deliver_recipients(&recipients, |username| {
             visited.push(username.to_string());
             match username {
@@ -639,6 +651,22 @@ mod tests {
                 "bad-two" => Err("second failure"),
                 _ => Ok(()),
             }
+        });
+        assert_eq!(error, None);
+        assert_eq!(visited, recipients);
+    }
+
+    #[test]
+    fn delivery_rejects_only_when_every_recipient_fails() {
+        let recipients = vec!["bad-one".to_string(), "bad-two".to_string()];
+        let mut visited = Vec::new();
+
+        let error = deliver_recipients(&recipients, |username| {
+            visited.push(username.to_string());
+            Err::<(), _>(match username {
+                "bad-one" => "first failure",
+                _ => "second failure",
+            })
         });
         assert_eq!(error.as_deref(), Some("first failure"));
         assert_eq!(visited, recipients);

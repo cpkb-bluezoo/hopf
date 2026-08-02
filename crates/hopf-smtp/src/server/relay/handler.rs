@@ -292,7 +292,6 @@ impl MessageDataHandler for SimpleRelayHandler {
             deferred: Some(deferred),
             remaining: domains.len(),
             any_success: false,
-            any_fail: false,
             spool_path: spool_path.clone(),
             hostname: self.hostname.clone(),
             sender: self.sender.clone(),
@@ -375,7 +374,6 @@ struct DeliveryTracker {
     deferred: Option<DeferredDelivery>,
     remaining: usize,
     any_success: bool,
-    any_fail: bool,
     spool_path: Option<PathBuf>,
     hostname: String,
     sender: Option<EmailAddress>,
@@ -393,19 +391,14 @@ struct DeliveryTracker {
 
 impl DeliveryTracker {
     /// Record one domain's outcome. Once every domain has reported, issues
-    /// the final reply: reject if *any* domain failed — even if others
-    /// already succeeded — rather than tracking per-recipient state to
-    /// retry only the failed ones. A client that retries after a 4xx may
-    /// therefore re-deliver to domains that already got the message; that
-    /// tradeoff (accepted over adding a durable, cross-attempt spool) mirrors
-    /// the one `LocalDeliveryHandler` already makes for its own multi-recipient
-    /// case.
+    /// the final SMTP reply. Partial success accepts the transaction (250)
+    /// and relies on failure DSNs for undelivered recipients — rejecting
+    /// after some domains already got the message would invite client
+    /// retry and duplicate delivery.
     fn record(&mut self, domain: &str, ok: bool) {
         self.domain_results.insert(domain.to_string(), ok);
         if ok {
             self.any_success = true;
-        } else {
-            self.any_fail = true;
         }
         self.remaining = self.remaining.saturating_sub(1);
         if self.remaining == 0 {
@@ -427,12 +420,11 @@ impl DeliveryTracker {
         let Some(deferred) = self.deferred.take() else {
             return;
         };
-        if self.any_fail {
-            deferred.reject_temporary("Delivery failed to one or more recipient domains");
-        } else if self.any_success {
+        if self.any_success {
+            // Accept even when some domains failed — DSNs cover the rest.
             deferred.accept(None);
         } else {
-            deferred.reject_temporary("No recipient domains could be resolved");
+            deferred.reject_temporary("No recipient domains could be delivered");
         }
     }
 
