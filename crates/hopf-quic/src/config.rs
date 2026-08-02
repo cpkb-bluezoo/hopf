@@ -217,10 +217,12 @@ pub fn client_config_for_pem_bytes(
 /// constructors via [`apply_server_transport_options`] /
 /// [`apply_client_transport_options`] — hopf-quic's own builders otherwise
 /// leave everything at quinn-proto's compiled-in defaults (e.g. a 30s idle
-/// timeout). Any field left `None` keeps quinn-proto's default for it.
+/// timeout and no keepalive). Any field left `None` keeps quinn-proto's
+/// default for it.
 #[derive(Debug, Clone, Default)]
 pub struct QuicTransportOptions {
     max_idle_timeout: Option<Duration>,
+    keep_alive_interval: Option<Duration>,
     stream_receive_window: Option<u32>,
     receive_window: Option<u32>,
     send_window: Option<u64>,
@@ -239,6 +241,16 @@ impl QuicTransportOptions {
     /// connection (quinn-proto default: 30s).
     pub fn max_idle_timeout(mut self, value: Duration) -> Self {
         self.max_idle_timeout = Some(value);
+        self
+    }
+
+    /// Interval at which to send QUIC keep-alive probes when the connection
+    /// is otherwise idle (RFC 9000 §10.1.2).
+    ///
+    /// Quinn default is disabled (`None`). Must be shorter than both peers'
+    /// idle timeouts to be effective; only one side needs it enabled.
+    pub fn keep_alive_interval(mut self, value: Duration) -> Self {
+        self.keep_alive_interval = Some(value);
         self
     }
 
@@ -283,6 +295,9 @@ impl QuicTransportOptions {
                 .try_into()
                 .map_err(|e| io::Error::new(ErrorKind::InvalidInput, format!("max_idle_timeout: {e}")))?;
             transport.max_idle_timeout(Some(idle));
+        }
+        if let Some(value) = self.keep_alive_interval {
+            transport.keep_alive_interval(Some(value));
         }
         if let Some(value) = self.stream_receive_window {
             transport.stream_receive_window(VarInt::from_u32(value));
