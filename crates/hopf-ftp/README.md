@@ -14,6 +14,7 @@ Control and data connections, PASV via dynamic `Runtime` listeners, stock
 - `FtpClientTimeouts` — `dns` / `connect` / `stage` / `data`
 - `FtpGet` / `FtpPut` — stock `FtpPipeline`s (TYPE I → data setup → RETR/STOR → QUIT)
 - Data channel: passive `PASV`/`EPSV` (default) or active `PORT`/`EPRT` via `FtpClient::active_mode`
+- FTPS: `FtpClient::auth_tls` (explicit `AUTH TLS` + `PBSZ`/`PROT P`) or `FtpClient::implicit_tls` (TLS from dial); active-mode PROT P also needs `data_tls_acceptor`
 - Custom workflows implement `FtpPipeline` and issue ops via `FtpSessionWrite`
 
 ```rust

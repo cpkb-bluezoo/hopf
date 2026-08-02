@@ -550,7 +550,7 @@
 <tbody>
 <tr><td>Control state machine, multiline reply parsing, RETR/STOR/LIST, arbitrary command + expected-code wait, PASV/EPSV, PORT/EPRT, QUIT, per-phase timeouts</td><td>Compliant</td><td>Full coverage, <code>client/handler.rs</code>, <code>client/pipeline.rs</code>, <code>client/data.rs</code>; <code>FtpClient::active_mode</code> selects PORT/EPRT (with optional <code>data_tls_acceptor</code> for PROT P)</td></tr>
 <tr><td>Active mode (PORT/EPRT) as a client</td><td>Compliant</td><td><code>FtpClient::active_mode(true)</code> binds a one-shot listener, advertises it via EPRT (default) or PORT, peer-ACL'd to the control remote; PROT P active data uses <code>data_tls_acceptor</code></td></tr>
-<tr><td><strong>FTPS (AUTH TLS/PBSZ/PROT/implicit) as a client</strong></td><td><strong>Not implemented</strong></td><td>Exhaustive grep of the client crate finds zero references to TLS/AUTH/PROT/PBSZ or any <code>start_tls()</code> call — the client has no FTPS capability whatsoever, explicit or implicit</td></tr>
+<tr><td>FTPS (AUTH TLS/PBSZ/PROT/implicit) as a client</td><td>Compliant</td><td><code>FtpClient::auth_tls</code> (explicit RFC 4217: welcome → <code>AUTH TLS</code> → <code>start_client_tls</code> → <code>PBSZ 0</code>/<code>PROT P</code>) and <code>FtpClient::implicit_tls</code> (TLS-from-dial, then PBSZ/PROT); data connections reuse the connector under PROT P; active-mode PROT P uses <code>data_tls_acceptor</code>. Covered by <code>async_client_auth_tls_retr</code> / <code>async_client_implicit_tls_retr</code></td></tr>
 </tbody>
 </table>
 
