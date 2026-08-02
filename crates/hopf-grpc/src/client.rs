@@ -4,13 +4,15 @@
 
 use std::sync::{Arc, Mutex};
 
-use rprotobuf::Parser;
 use hopf_http::{ClientHandler, ClientHandlerFactory, ClientWriter, Headers};
+use rjsonparser::Parser as JsonParser;
+use rprotobuf::Parser as ProtoParser;
 
+use crate::codec::{parse_grpc_content_type, GrpcCodec};
 use crate::framing::{frame, GrpcEventHandler, GrpcFrameParser};
-use crate::proto::{ProtoFile, ProtoMessageHandler, ProtoModelAdapter};
-
-const CONTENT_TYPE_GRPC: &str = "application/grpc";
+use crate::proto::{
+    JsonModelAdapter, ProtoFile, ProtoMessageHandler, ProtoModelAdapter,
+};
 
 /// Callback for a unary response message.
 pub trait GrpcResponseHandler: Send {
@@ -28,11 +30,15 @@ pub struct GrpcUnaryCall {
     request_message: Vec<u8>,
     proto_file: Arc<ProtoFile>,
     response_type_name: Option<String>,
+    codec: GrpcCodec,
     handler: Arc<Mutex<Box<dyn GrpcResponseHandler>>>,
 }
 
 impl GrpcUnaryCall {
-    /// Create a unary call with a pre-serialized protobuf request body (unframed).
+    /// Create a unary call with a pre-serialized request body (unframed).
+    ///
+    /// The body encoding must match [`GrpcCodec::Proto`] (protobuf wire) unless
+    /// [`Self::with_codec`] selects JSON.
     pub fn new(
         proto_file: Arc<ProtoFile>,
         path: impl Into<String>,
@@ -48,8 +54,15 @@ impl GrpcUnaryCall {
             request_message,
             proto_file,
             response_type_name,
+            codec: GrpcCodec::Proto,
             handler: Arc::new(Mutex::new(handler)),
         }
+    }
+
+    /// Select request/response payload codec (`Proto` default, or `Json`).
+    pub fn with_codec(mut self, codec: GrpcCodec) -> Self {
+        self.codec = codec;
+        self
     }
 
     /// Frame the request for HTTP body use.
@@ -65,9 +78,10 @@ impl ClientHandlerFactory for GrpcUnaryCall {
             framed: frame(&self.request_message),
             proto_file: Arc::clone(&self.proto_file),
             response_type_name: self.response_type_name.clone(),
+            codec: self.codec,
             handler: Arc::clone(&self.handler),
             frame_parser: None,
-            adapter: None,
+            decoder: None,
             message_done: false,
             failed: false,
             grpc_status: None,
@@ -98,14 +112,20 @@ impl GrpcEventHandler for FrameAccum {
     }
 }
 
+enum ResponseDecoder {
+    Proto(ProtoModelAdapter<Box<dyn ProtoMessageHandler>>),
+    Json(JsonModelAdapter<Box<dyn ProtoMessageHandler>>),
+}
+
 struct GrpcClientHandler {
     path: String,
     framed: Vec<u8>,
     proto_file: Arc<ProtoFile>,
     response_type_name: Option<String>,
+    codec: GrpcCodec,
     handler: Arc<Mutex<Box<dyn GrpcResponseHandler>>>,
     frame_parser: Option<GrpcFrameParser<FrameAccum>>,
-    adapter: Option<ProtoModelAdapter<Box<dyn ProtoMessageHandler>>>,
+    decoder: Option<ResponseDecoder>,
     message_done: bool,
     failed: bool,
     grpc_status: Option<(i32, String)>,
@@ -129,25 +149,46 @@ impl GrpcClientHandler {
             self.fail(&err);
             return;
         }
-        let Some(adapter) = self.adapter.as_mut() else {
+        let Some(decoder) = self.decoder.as_mut() else {
             self.fail("no adapter");
             return;
         };
         let mut slice = accum.buf.as_slice();
-        {
-            let mut pb = Parser::new(adapter);
-            if let Err(e) = pb.receive(&mut slice) {
-                self.fail(&e.to_string());
-                return;
+        match decoder {
+            ResponseDecoder::Proto(adapter) => {
+                {
+                    let mut pb = ProtoParser::new(adapter);
+                    if let Err(e) = pb.receive(&mut slice) {
+                        self.fail(&e.to_string());
+                        return;
+                    }
+                    if let Err(e) = pb.close() {
+                        self.fail(&e.to_string());
+                        return;
+                    }
+                }
+                if let Err(e) = adapter.end_root_message() {
+                    self.fail(&e.to_string());
+                    return;
+                }
             }
-            if let Err(e) = pb.close() {
-                self.fail(&e.to_string());
-                return;
+            ResponseDecoder::Json(adapter) => {
+                {
+                    let mut jp = JsonParser::new(adapter);
+                    if let Err(e) = jp.receive(&mut slice) {
+                        self.fail(&e.to_string());
+                        return;
+                    }
+                    if let Err(e) = jp.close() {
+                        self.fail(&e.to_string());
+                        return;
+                    }
+                }
+                if let Err(e) = adapter.end_root_message() {
+                    self.fail(&e.to_string());
+                    return;
+                }
             }
-        }
-        if let Err(e) = adapter.end_root_message() {
-            self.fail(&e.to_string());
-            return;
         }
         self.message_done = true;
     }
@@ -159,7 +200,7 @@ impl ClientHandler for GrpcClientHandler {
         h.set(":method", "POST");
         h.set(":path", &self.path);
         h.set(":scheme", "https");
-        h.set("content-type", CONTENT_TYPE_GRPC);
+        h.set("content-type", self.codec.content_type());
         h.set("te", "trailers");
         request.headers(h);
         request.start_request_body();
@@ -175,6 +216,11 @@ impl ClientHandler for GrpcClientHandler {
             self.grpc_status = Some((code, msg.clone()));
             self.handler.lock().unwrap().on_grpc_status(code, &msg);
         }
+        // Prefer response Content-Type when present; otherwise use the request codec.
+        let codec = headers
+            .get("content-type")
+            .and_then(parse_grpc_content_type)
+            .unwrap_or(self.codec);
         let type_name = self.response_type_name.clone();
         let msg_handler = {
             let mut h = self.handler.lock().unwrap();
@@ -184,14 +230,31 @@ impl ClientHandler for GrpcClientHandler {
             self.fail("no response handler");
             return;
         };
-        let mut adapter = ProtoModelAdapter::new((*self.proto_file).clone(), msg_handler);
-        if let Some(ref ty) = type_name {
-            if let Err(e) = adapter.start_root_message(ty) {
-                self.fail(&e.to_string());
-                return;
+        let decoder = match codec {
+            GrpcCodec::Proto => {
+                let mut adapter =
+                    ProtoModelAdapter::new((*self.proto_file).clone(), msg_handler);
+                if let Some(ref ty) = type_name {
+                    if let Err(e) = adapter.start_root_message(ty) {
+                        self.fail(&e.to_string());
+                        return;
+                    }
+                }
+                ResponseDecoder::Proto(adapter)
             }
-        }
-        self.adapter = Some(adapter);
+            GrpcCodec::Json => {
+                let mut adapter =
+                    JsonModelAdapter::new((*self.proto_file).clone(), msg_handler);
+                if let Some(ref ty) = type_name {
+                    if let Err(e) = adapter.start_root_message(ty) {
+                        self.fail(&e.to_string());
+                        return;
+                    }
+                }
+                ResponseDecoder::Json(adapter)
+            }
+        };
+        self.decoder = Some(decoder);
         self.frame_parser = Some(GrpcFrameParser::new(FrameAccum {
             buf: Vec::new(),
             error: None,
@@ -262,7 +325,7 @@ impl GrpcClient {
         &self.proto_file
     }
 
-    /// Build a [`ClientHandlerFactory`] for one unary RPC.
+    /// Build a [`ClientHandlerFactory`] for one unary RPC (protobuf by default).
     pub fn unary_call(
         &self,
         path: impl Into<String>,
@@ -270,5 +333,16 @@ impl GrpcClient {
         handler: Box<dyn GrpcResponseHandler>,
     ) -> GrpcUnaryCall {
         GrpcUnaryCall::new(Arc::clone(&self.proto_file), path, request_message, handler)
+    }
+
+    /// Build a unary RPC that sends/accepts `application/grpc+json`.
+    pub fn unary_call_json(
+        &self,
+        path: impl Into<String>,
+        request_message: Vec<u8>,
+        handler: Box<dyn GrpcResponseHandler>,
+    ) -> GrpcUnaryCall {
+        self.unary_call(path, request_message, handler)
+            .with_codec(GrpcCodec::Json)
     }
 }
