@@ -11,7 +11,9 @@ use hopf_mailbox::{MailboxAttribute, MessageSet};
 use super::ImapControlHandler;
 use crate::enable::parse_enable_args;
 use crate::server::codec::{parse_astring, parse_sequence_set, ImapCommand};
-use crate::server::idle::{idle_update_lines, IdleMailboxSnapshot, IDLE_POLL_INTERVAL};
+use crate::server::idle::{
+    idle_diff_lines, IdleMailboxSnapshot, IdleMsgSnap, IDLE_POLL_INTERVAL,
+};
 use crate::server::list_ext::ListCommand;
 use crate::server::quota::parse_quota_resource_list;
 use crate::server::reply::{
@@ -24,24 +26,44 @@ use crate::server::views::{
 };
 
 impl ImapControlHandler {
+    fn mailbox_idle_snapshot(
+        mb: &mut dyn hopf_mailbox::Mailbox,
+    ) -> Result<IdleMailboxSnapshot, String> {
+        let _ = mb.refresh().map_err(|e| e.to_string())?;
+        let exists = mb.message_count().map_err(|e| e.to_string())?;
+        let mut messages = Vec::with_capacity(exists as usize);
+        for seq in 1..=exists {
+            let uid = mb.uid(seq).map_err(|e| e.to_string())?;
+            let flags = mb.flags(seq).map_err(|e| e.to_string())?;
+            let keywords = mb.keywords(seq).unwrap_or_default();
+            messages.push(IdleMsgSnap {
+                uid,
+                flags,
+                keywords,
+            });
+        }
+        Ok(IdleMailboxSnapshot { exists, messages })
+    }
+
     pub(super) fn cmd_noop(&mut self, endpoint: &mut dyn Endpoint, tag: &str) {
         if self.session == ImapSessionState::Selected {
-            let snap = self.bundle.lock().ok().and_then(|g| {
-                g.mailbox.as_ref().and_then(|mb| {
-                    let status = mb.status().ok()?;
-                    Some(IdleMailboxSnapshot {
-                        exists: status.messages,
-                        recent: status.recent,
-                    })
-                })
+            let snap = self.bundle.lock().ok().and_then(|mut g| {
+                g.mailbox
+                    .as_mut()
+                    .and_then(|mb| Self::mailbox_idle_snapshot(mb.as_mut()).ok())
             });
             if let Some(snap) = snap {
-                for line in idle_update_lines(&self.idle, &snap) {
+                for line in idle_diff_lines(
+                    &self.idle.last_messages,
+                    self.idle.last_exists,
+                    &snap,
+                ) {
                     self.send(endpoint, untagged(&line));
                 }
                 self.idle.last_exists = snap.exists;
-                self.idle.last_recent = snap.recent;
-                *self.idle.shared.counts.lock().unwrap() = (snap.exists, snap.recent);
+                self.idle.last_messages = snap.messages.clone();
+                *self.idle.shared.exists.lock().unwrap() = snap.exists;
+                *self.idle.shared.messages.lock().unwrap() = snap.messages;
             }
         }
         self.send(endpoint, tagged_ok(tag, "NOOP completed"));
@@ -102,9 +124,11 @@ impl ImapControlHandler {
             })
             .unwrap_or_else(|| (String::new(), '/'));
         let personal_ns = format!("((\"{personal}\" \"{delim}\"))");
+        let other = format_namespace_list(&self.config.other_users_namespaces);
+        let shared = format_namespace_list(&self.config.shared_namespaces);
         self.send(
             endpoint,
-            untagged(&format!("NAMESPACE {personal_ns} NIL NIL")),
+            untagged(&format!("NAMESPACE {personal_ns} {other} {shared}")),
         );
         self.send(endpoint, tagged_ok(tag, "NAMESPACE completed"));
     }
@@ -117,18 +141,18 @@ impl ImapControlHandler {
             self.send(endpoint, tagged_bad(tag, "IDLE not available"));
             return;
         }
-        let (exists, recent) = self
+        let snap = self
             .bundle
             .lock()
             .ok()
-            .and_then(|g| {
-                g.mailbox.as_ref().and_then(|mb| {
-                    let st = mb.status().ok()?;
-                    Some((st.messages, st.recent))
-                })
+            .and_then(|mut g| {
+                g.mailbox
+                    .as_mut()
+                    .and_then(|mb| Self::mailbox_idle_snapshot(mb.as_mut()).ok())
             })
-            .unwrap_or((0, 0));
-        self.idle.begin(tag.to_string(), exists, recent);
+            .unwrap_or_default();
+        self.idle
+            .begin(tag.to_string(), snap.exists, snap.messages);
         self.send(endpoint, continuation("idling"));
         self.arm_idle_timer(endpoint);
     }
@@ -145,6 +169,7 @@ impl ImapControlHandler {
         let bundle = Arc::clone(&self.bundle);
         let shared = self.idle.shared.clone();
         let runtime = Arc::clone(&self.runtime);
+        let max_idle = self.config.idle_max_duration;
 
         fn schedule(
             endpoint: &mut dyn Endpoint,
@@ -152,6 +177,7 @@ impl ImapControlHandler {
             bundle: Arc<std::sync::Mutex<super::MailboxBundle>>,
             shared: crate::server::idle::IdleShared,
             runtime: Arc<hopf_core::Runtime>,
+            max_idle: std::time::Duration,
         ) {
             if !shared.is_active() {
                 return;
@@ -173,29 +199,48 @@ impl ImapControlHandler {
                     runtime_cb.storage().submit_on(
                         handle_cb.clone(),
                         move || {
-                            let g = bundle_cb.lock().map_err(|e| e.to_string())?;
-                            let mb = g.mailbox.as_ref().ok_or_else(|| "no mailbox".to_string())?;
-                            let st = mb.status().map_err(|e| e.to_string())?;
-                            Ok((st.messages, st.recent))
+                            let mut g = bundle_cb.lock().map_err(|e| e.to_string())?;
+                            let mb = g
+                                .mailbox
+                                .as_mut()
+                                .ok_or_else(|| "no mailbox".to_string())?;
+                            let _ = mb.refresh().map_err(|e| e.to_string())?;
+                            let exists = mb.message_count().map_err(|e| e.to_string())?;
+                            let mut messages = Vec::with_capacity(exists as usize);
+                            for seq in 1..=exists {
+                                let uid = mb.uid(seq).map_err(|e| e.to_string())?;
+                                let flags = mb.flags(seq).map_err(|e| e.to_string())?;
+                                let keywords = mb.keywords(seq).unwrap_or_default();
+                                messages.push(IdleMsgSnap {
+                                    uid,
+                                    flags,
+                                    keywords,
+                                });
+                            }
+                            Ok(IdleMailboxSnapshot { exists, messages })
                         },
-                        move |result: Result<(u32, u32), StorageError>| {
+                        move |result: Result<IdleMailboxSnapshot, StorageError>| {
                             let handle3 = handle2.clone();
                             handle2.with_endpoint(move |ep| {
                                 if !shared2.is_active() {
                                     return;
                                 }
-                                if let Ok((exists, recent)) = result {
-                                    let mut counts = shared2.counts.lock().unwrap();
-                                    if exists != counts.0 {
-                                        ep.send(&untagged(&format!("{exists} EXISTS")));
-                                        counts.0 = exists;
+                                if shared2.timed_out(max_idle) {
+                                    if let Some(tag) = shared2.end() {
+                                        ep.send(&tagged_ok(&tag, "IDLE timed out"));
                                     }
-                                    if recent != counts.1 {
-                                        ep.send(&untagged(&format!("{recent} RECENT")));
-                                        counts.1 = recent;
-                                    }
+                                    return;
                                 }
-                                schedule(ep, handle3, bundle2, shared2, runtime2);
+                                if let Ok(snap) = result {
+                                    let prev_exists = *shared2.exists.lock().unwrap();
+                                    let prev_msgs = shared2.messages.lock().unwrap().clone();
+                                    for line in idle_diff_lines(&prev_msgs, prev_exists, &snap) {
+                                        ep.send(&untagged(&line));
+                                    }
+                                    *shared2.exists.lock().unwrap() = snap.exists;
+                                    *shared2.messages.lock().unwrap() = snap.messages;
+                                }
+                                schedule(ep, handle3, bundle2, shared2, runtime2, max_idle);
                             });
                         },
                     );
@@ -204,7 +249,7 @@ impl ImapControlHandler {
             *shared.timer.lock().unwrap() = Some(timer);
         }
 
-        schedule(endpoint, handle, bundle, shared, runtime);
+        schedule(endpoint, handle, bundle, shared, runtime, max_idle);
     }
 
     pub(super) fn cmd_status(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
@@ -514,4 +559,15 @@ impl ImapControlHandler {
         }
         let _ = Ordering::Relaxed;
     }
+}
+
+fn format_namespace_list(ns: &[crate::server::service::NamespaceDesc]) -> String {
+    if ns.is_empty() {
+        return "NIL".into();
+    }
+    let parts: Vec<String> = ns
+        .iter()
+        .map(|n| format!("(\"{}\" \"{}\")", n.prefix, n.delimiter))
+        .collect();
+    format!("({})", parts.join(""))
 }

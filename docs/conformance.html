@@ -672,21 +672,21 @@
 </table>
 
 <h2 id="imap">IMAP — RFC 9051 (IMAP4rev2)</h2>
-<p>hopf correctly targets RFC 9051 rather than the older RFC 3501 — <code>IMAP4rev2</code> is unconditionally advertised. One genuine rev1-vs-rev2 gap survives: RFC 9051 removed the mandatory unsolicited RECENT response, and hopf still sends it (see Server Responses below).</p>
+<p>hopf correctly targets RFC 9051 rather than the older RFC 3501 — <code>IMAP4rev2</code> is unconditionally advertised.</p>
 <h3>Server — Connection, Commands</h3>
 <table>
 <thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
 <tbody>
 <tr><td>Greeting + inline CAPABILITY, state machine, command pipelining (queued, answered in order)</td><td>§3,§7.1</td><td>Compliant</td><td><code>server/control/mod.rs:432-560</code></td></tr>
-<tr><td>PREAUTH greeting</td><td>§7.1</td><td>Not implemented</td><td>Server only ever sends OK/BYE; client can <em>parse</em> a PREAUTH greeting, server never produces one</td></tr>
+<tr><td>PREAUTH greeting</td><td>§7.1</td><td>Compliant</td><td><code>ImapConfig::preauth_username</code> / <code>with_preauth</code> — opens the user's store then greets with <code>* PREAUTH [CAPABILITY …]</code></td></tr>
 <tr><td>CAPABILITY/NOOP/LOGOUT</td><td>§6.1</td><td>Compliant</td><td></td></tr>
 <tr><td>STARTTLS</td><td>§6.2.1</td><td>Compliant</td><td></td></tr>
 <tr><td>AUTHENTICATE (SASL mechanisms beyond PLAIN)</td><td>§6.2.2</td><td>Compliant</td><td>All 7 <code>hopf-auth</code> mechanisms wired via <code>SaslMechanism::from_name</code> + <code>create_server</code> (<code>server/control/mod.rs</code>'s <code>cmd_authenticate</code>/<code>sasl_step</code>), matching hopf-pop3's dispatcher pattern; capability advertisement lists each mechanism the store supports (<code>store.supported_mechanisms()</code>), filtered by TLS requirement, instead of a hardcoded <code>AUTH=PLAIN</code>. EXTERNAL still requires a peer certificate the TLS layer doesn't plumb through yet (see hopf-pop3's own note above)</td></tr>
 <tr><td>SASL-IR (inline initial response)</td><td>RFC 4959</td><td>Compliant</td><td></td></tr>
 <tr><td>LOGIN, LOGINDISABLED/PRIVACYREQUIRED on cleartext</td><td>§6.2.3</td><td>Compliant</td><td></td></tr>
-<tr><td>SELECT/EXAMINE (FLAGS/PERMANENTFLAGS/EXISTS/RECENT/UIDVALIDITY/UIDNEXT), CREATE/DELETE/RENAME, SUBSCRIBE/UNSUBSCRIBE, LIST/LIST-EXTENDED, LSUB, STATUS, APPEND (+ literal streaming)</td><td>§6.3</td><td>Compliant</td><td></td></tr>
-<tr><td>NAMESPACE</td><td>RFC 2342</td><td>Partial</td><td>Personal namespace only — shared/other-users always <code>NIL</code></td></tr>
-<tr><td>IDLE</td><td>RFC 2177</td><td>Partial</td><td>Continuation/DONE loop correct; 1s poll pushes untagged EXISTS/RECENT only on count change — <strong>no untagged EXPUNGE or FETCH FLAGS during IDLE</strong>, and no maximum-duration server timeout (no auto-DONE)</td></tr>
+<tr><td>SELECT/EXAMINE (FLAGS/PERMANENTFLAGS/EXISTS/UIDVALIDITY/UIDNEXT), CREATE/DELETE/RENAME, SUBSCRIBE/UNSUBSCRIBE, LIST/LIST-EXTENDED, LSUB, STATUS, APPEND (+ literal streaming)</td><td>§6.3</td><td>Compliant</td><td>Unsolicited RECENT omitted (IMAP4rev2); STATUS RECENT still answered when requested</td></tr>
+<tr><td>NAMESPACE</td><td>RFC 2342</td><td>Compliant</td><td>Personal namespace from the mailbox store; other-users / shared configurable via <code>ImapConfig::other_users_namespaces</code> / <code>shared_namespaces</code> (default <code>NIL</code>)</td></tr>
+<tr><td>IDLE</td><td>RFC 2177</td><td>Compliant</td><td>Continuation/DONE loop; 1s poll refreshes Maildir and emits untagged EXISTS / EXPUNGE / FETCH FLAGS; auto-completes after <code>idle_max_duration</code> (default 29 minutes)</td></tr>
 <tr><td>GETQUOTA/GETQUOTAROOT/SETQUOTA</td><td>RFC 9208 §3</td><td>Compliant</td><td></td></tr>
 </tbody>
 </table>
@@ -707,7 +707,7 @@
 <thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
 <tbody>
 <tr><td>Untagged/tagged/continuation responses, response codes (CAPABILITY/TRYCREATE/APPENDUID/COPYUID/PRIVACYREQUIRED/READ-ONLY/READ-WRITE)</td><td>§7</td><td>Compliant</td><td></td></tr>
-<tr><td><strong>RECENT response removed in IMAP4rev2</strong></td><td>§7.4.1</td><td><strong>Not conformant</strong></td><td>Server still sends untagged <code>n RECENT</code> on every SELECT/EXAMINE and during IDLE polling, despite unconditionally advertising IMAP4rev2 — harmless to rev2-aware clients that ignore it, but not strictly conformant</td></tr>
+<tr><td>Unsolicited RECENT (IMAP4rev2)</td><td>§7.4.1</td><td>Compliant</td><td>Not emitted on SELECT/EXAMINE or IDLE/NOOP; solicited <code>STATUS … (RECENT)</code> remains available</td></tr>
 <tr><td>UIDPLUS (APPENDUID/COPYUID/UID EXPUNGE)</td><td>RFC 4315</td><td>Compliant</td><td></td></tr>
 <tr><td>ENABLE, UNSELECT, ID, LIST-EXTENDED/LIST-STATUS</td><td>5161,3691,2971,5258/5819</td><td>Compliant</td><td></td></tr>
 <tr><td>CONDSTORE / QRESYNC</td><td>RFC 7162</td><td>Compliant (with a documented scope limit)</td><td>HIGHESTMODSEQ/MODSEQ/CHANGEDSINCE are now backed by real per-message mod-sequence tracking in both shipped backends — Maildir++'s <code>.uidlist</code> and mbox's <code>.flags</code> sidecar each gained a persisted, monotonic counter (<code>maildir/uidlist.rs</code>, <code>mbox/flags.rs</code>); <code>Mailbox::modseq()</code>/<code>highest_modseq()</code>/<code>changed_since()</code> return genuine values that survive a mailbox reopen. <code>expunged_since()</code> (VANISHED (EARLIER) history) is unchanged — still returns empty rather than fabricating history, a deliberate scope boundary, not an oversight.</td></tr>

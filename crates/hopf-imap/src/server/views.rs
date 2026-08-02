@@ -45,8 +45,16 @@ pub(crate) fn end_busy(endpoint: &mut dyn Endpoint, busy: &Arc<AtomicBool>) {
 pub(crate) struct ConnectedView<'a> {
     pub endpoint: &'a mut dyn Endpoint,
     pub not_authenticated: &'a mut Option<Box<dyn NotAuthenticatedHandler>>,
+    pub authenticated: &'a mut Option<Box<dyn AuthenticatedHandler>>,
     pub caps: &'a str,
     pub session: &'a mut ImapSessionState,
+    pub username: &'a mut Option<String>,
+    pub bundle: &'a Arc<Mutex<MailboxBundle>>,
+    pub runtime: &'a Arc<Runtime>,
+    pub busy: &'a Arc<AtomicBool>,
+    pub control_handle: &'a Option<ConnHandle>,
+    pub pending_open: &'a Arc<Mutex<Option<PendingOpen>>>,
+    pub factory: Arc<dyn MailboxFactory>,
 }
 
 impl ConnectedState for ConnectedView<'_> {
@@ -57,6 +65,58 @@ impl ConnectedState for ConnectedView<'_> {
             "OK [CAPABILITY {}] {greeting}",
             self.caps
         )));
+    }
+
+    fn accept_preauth(
+        &mut self,
+        greeting: &str,
+        username: &str,
+        handler: Box<dyn AuthenticatedHandler>,
+    ) {
+        let Some(handle) = self.control_handle.clone() else {
+            self.endpoint
+                .send(&untagged("BYE Internal error: no handle"));
+            self.endpoint.close();
+            return;
+        };
+        *self.username = Some(username.to_string());
+        let bundle = Arc::clone(self.bundle);
+        let factory = Arc::clone(&self.factory);
+        let user = username.to_string();
+        let caps = self.caps.to_string();
+        let greet = greeting.to_string();
+        let busy = Arc::clone(self.busy);
+        let pending = Arc::clone(self.pending_open);
+        *pending.lock().unwrap() = Some(PendingOpen {
+            auth_handler: Some(handler),
+            selected_handler: None,
+            outcome: None,
+            kind: crate::server::control::PendingKind::Preauth {
+                caps,
+                greeting: greet,
+            },
+        });
+        begin_busy(self.endpoint, self.busy);
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || {
+                let mut store = factory.create_store();
+                store.open(&user).map_err(|e| e.to_string())?;
+                bundle.lock().unwrap().store = Some(store);
+                Ok(())
+            },
+            move |result: Result<(), StorageError>| {
+                handle.with_endpoint(move |ep| {
+                    if let Some(p) = pending.lock().unwrap().as_mut() {
+                        p.outcome = Some(match result {
+                            Ok(()) => Ok(Vec::new()),
+                            Err(e) => Err(e.to_string()),
+                        });
+                    }
+                    end_busy(ep, &busy);
+                });
+            },
+        );
     }
 
     fn reject_connection(&mut self, message: &str) {

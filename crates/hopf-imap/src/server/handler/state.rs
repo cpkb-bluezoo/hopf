@@ -26,6 +26,14 @@ pub enum StoreAction {
 pub trait ConnectedState {
     /// Accept with greeting text; transition to not-authenticated.
     fn accept_connection(&mut self, greeting: &str, handler: Box<dyn NotAuthenticatedHandler>);
+    /// Accept with a PREAUTH greeting; open `username`'s store and transition
+    /// to authenticated (RFC 9051 §7.1).
+    fn accept_preauth(
+        &mut self,
+        greeting: &str,
+        username: &str,
+        handler: Box<dyn AuthenticatedHandler>,
+    );
     /// Reject and close.
     fn reject_connection(&mut self, message: &str);
 }
