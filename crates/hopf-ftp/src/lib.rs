@@ -17,11 +17,13 @@ mod client;
 mod server;
 
 pub use client::{
-    CmdCallback, FtpAbortHandle, FtpClient, FtpClientTimeouts, FtpError, FtpGet,
+    CmdCallback, FtpAbortHandle, FtpClient, FtpClientDataMode, FtpClientTimeouts, FtpError, FtpGet,
     FtpPipeline, FtpPut, FtpResult, FtpSessionWrite, FtpStorHandle, MessageReceiveCallback,
     StorCallback, StorReady, StouCallback,
 };
-pub use client::reply::{parse_pasv_addr, parse_epsv_port, parse_pwd_path};
+pub use client::reply::{
+    format_eprt_arg, format_port_arg, parse_epsv_port, parse_pasv_addr, parse_pwd_path,
+};
 pub use server::{
     decode_arg, encode_name, encode_text, format_epsv_reply, format_pasv_reply,
     normalize_ascii_newlines, reply, reply_charset, reply_multiline, reply_multiline_charset,

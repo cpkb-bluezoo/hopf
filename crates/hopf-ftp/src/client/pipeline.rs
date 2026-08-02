@@ -10,8 +10,11 @@
 //!
 //! | Type | Sequence |
 //! |------|----------|
-//! | [`FtpGet`] | `TYPE I` → `PASV` → `RETR` → `QUIT` |
-//! | [`FtpPut`] | `TYPE I` → `PASV` → `STOR` → `QUIT` |
+//! | [`FtpGet`] | `TYPE I` → data setup → `RETR` → `QUIT` |
+//! | [`FtpPut`] | `TYPE I` → data setup → `STOR` → `QUIT` |
+//!
+//! Data-channel setup is configured on [`super::FtpClient`] (`PASV`/`EPSV`
+//! by default, or `PORT`/`EPRT` via [`super::FtpClient::active_mode`]).
 
 use std::io::{self, Read};
 
@@ -22,11 +25,12 @@ use super::{FtpPipeline, FtpSessionWrite, FtpStorHandle, MessageReceiveCallback,
 // FtpGet
 // ---------------------------------------------------------------------------
 
-/// Pipeline that downloads one file: `USER/PASS` → `TYPE I` → `PASV` →
+/// Pipeline that downloads one file: `USER/PASS` → `TYPE I` → data setup →
 /// `RETR path` → `QUIT`.
 ///
 /// The file content is streamed directly to `receiver` as it arrives — see
-/// [`MessageReceiveCallback`].
+/// [`MessageReceiveCallback`]. Data-channel mode (passive/active) follows
+/// the [`super::FtpClient`] configuration.
 pub struct FtpGet {
     path: String,
     receiver: Option<Box<dyn MessageReceiveCallback>>,
@@ -67,12 +71,13 @@ impl FtpPipeline for FtpGet {
 // FtpPut
 // ---------------------------------------------------------------------------
 
-/// Pipeline that uploads one file: `USER/PASS` → `TYPE I` → `PASV` →
+/// Pipeline that uploads one file: `USER/PASS` → `TYPE I` → data setup →
 /// `STOR path` → `QUIT`.
 ///
 /// Content is read from `reader` in bounded chunks and pushed through the
 /// data connection as it becomes available — the whole file is never held
 /// in memory at once. The result (or I/O error) is delivered to `callback`.
+/// Data-channel mode follows the [`super::FtpClient`] configuration.
 pub struct FtpPut {
     path: String,
     reader: Option<Box<dyn Read + Send>>,

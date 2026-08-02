@@ -271,10 +271,9 @@ fn raw_cmd(ctrl: &mut std::net::TcpStream, cmd: &str) -> String {
     read_reply(ctrl)
 }
 
-/// Connects and logs in over a raw control socket (bypassing
-/// `FtpSessionWrite`, which only supports PASV/EPSV) — needed for the two
-/// tests below, both of which exercise PORT/PROT-P sequences the async
-/// client API can't drive.
+/// Connects and logs in over a raw control socket (bypassing `FtpSessionWrite`)
+/// — needed for the two tests below that assert server-side PROT-P /
+/// require-TLS behaviour with hand-rolled PORT sequences.
 fn raw_login(bound: SocketAddr) -> std::net::TcpStream {
     use std::io::Read;
     let mut ctrl = std::net::TcpStream::connect(bound).unwrap();
@@ -316,12 +315,12 @@ fn require_tls_for_data_rejects_pasv_without_prot_p() {
 /// Issue #3 (2a): `PROT P` must protect active-mode (PORT) data
 /// connections too, not just PASV — previously hardcoded to cleartext
 /// regardless of `PROT P` (`prepare_data`'s `DataMode::Active` arm). Drives
-/// PORT/PROT P by hand over a raw control socket (the async client only
-/// supports PASV/EPSV) and proves the resulting connection is really
-/// TLS-secured by checking `security_established` actually fires on our
-/// own accepting listener — not just that decodable bytes arrived, which
-/// wouldn't distinguish "really encrypted" from "happened to already be
-/// cleartext".
+/// PORT/PROT P by hand over a raw control socket (independent of the async
+/// client's own active-mode path) and proves the resulting connection is
+/// really TLS-secured by checking `security_established` actually fires on
+/// our own accepting listener — not just that decodable bytes arrived,
+/// which wouldn't distinguish "really encrypted" from "happened to already
+/// be cleartext".
 #[test]
 fn active_mode_prot_p_actually_encrypts_the_data_connection() {
     use hopf_core::{Endpoint, ProtocolHandler, TcpListenerConfig};
@@ -433,6 +432,71 @@ fn async_client_stor() {
     assert_eq!(
         std::fs::read(dir.path().join("out.txt")).unwrap(),
         b"uploaded-async"
+    );
+
+    drop(rt);
+}
+
+/// Active-mode RETR via `FtpClient::active_mode` (PORT — IPv4 loopback).
+#[test]
+fn async_client_active_mode_retr() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("active.txt"), b"via-port").unwrap();
+    let (rt, bound) = start_server(dir.path());
+
+    let result: Arc<Mutex<Option<std::io::Result<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+    let pipeline = FtpGet::new("active.txt", Box::new(CollectReceiver::new(Arc::clone(&result))));
+    FtpClient::new(bound.ip().to_string())
+        .port(bound.port())
+        .credentials("u", "p")
+        .active_mode(true)
+        .prefer_eprt(false) // exercise classic PORT
+        .timeouts(FtpClientTimeouts {
+            dns: Duration::from_secs(1),
+            connect: Duration::from_secs(3),
+            stage: Duration::from_secs(5),
+            data: Duration::from_secs(10),
+        })
+        .connect(&rt, Box::new(pipeline))
+        .unwrap();
+    let body = wait_result(result).unwrap();
+    assert_eq!(body, b"via-port");
+
+    drop(rt);
+}
+
+/// Active-mode STOR via EPRT.
+#[test]
+fn async_client_active_mode_stor_eprt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, bound) = start_server(dir.path());
+
+    let result: Arc<Mutex<Option<std::io::Result<()>>>> = Arc::new(Mutex::new(None));
+    let result2 = Arc::clone(&result);
+    let pipeline = FtpPut::new(
+        "eprt-out.txt",
+        Box::new(io::Cursor::new(b"via-eprt".to_vec())),
+        move |r| {
+            *result2.lock().unwrap() = Some(r);
+        },
+    );
+    FtpClient::new(bound.ip().to_string())
+        .port(bound.port())
+        .credentials("u", "p")
+        .active_mode(true)
+        .prefer_eprt(true)
+        .timeouts(FtpClientTimeouts {
+            dns: Duration::from_secs(1),
+            connect: Duration::from_secs(3),
+            stage: Duration::from_secs(5),
+            data: Duration::from_secs(10),
+        })
+        .connect(&rt, Box::new(pipeline))
+        .unwrap();
+    wait_result(result).unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("eprt-out.txt")).unwrap(),
+        b"via-eprt"
     );
 
     drop(rt);
