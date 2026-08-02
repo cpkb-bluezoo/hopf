@@ -22,13 +22,13 @@ use crate::server::pipeline::SmtpPipeline;
 /// Per-connection metadata visible to handlers.
 #[derive(Clone)]
 pub struct SmtpConnectionMetadata {
-    /// Client address.
+    /// Effective client address (may be overridden by XCLIENT ADDR/PORT).
     pub peer: SocketAddr,
-    /// Local address.
+    /// Effective local address (may be overridden by XCLIENT DESTADDR/DESTPORT).
     pub local: SocketAddr,
     /// TLS is active.
     pub tls: bool,
-    /// Authenticated username, if any.
+    /// Authenticated username, if any (local SASL only — never from XCLIENT LOGIN).
     pub authenticated_user: Option<String>,
     /// SMTPUTF8 negotiated for the current transaction.
     pub smtputf8: bool,
@@ -38,6 +38,10 @@ pub struct SmtpConnectionMetadata {
     /// certificate chain for mTLS). [`hopf_core::SecurityInfo::plaintext`]
     /// until TLS is established.
     pub security_info: hopf_core::SecurityInfo,
+    /// Client reverse hostname from XCLIENT `NAME`, if asserted.
+    pub reverse_name: Option<String>,
+    /// Informational proxied login from XCLIENT `LOGIN` (not SASL AUTH).
+    pub xclient_login: Option<String>,
 }
 
 /// Factory for the initial [`SmtpClientConnected`] stage.

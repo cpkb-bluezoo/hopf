@@ -91,8 +91,8 @@ pub enum SmtpCommand {
     SaslResponseInvalid,
     /// A bare `*` SASL continuation line — client cancels the exchange.
     SaslAbort,
-    /// `XCLIENT` (never permitted; argument ignored).
-    Xclient,
+    /// `XCLIENT attr=value …` (Postfix extension; ACL-gated).
+    Xclient(String),
     /// A recognised verb whose argument didn't match its expected shape
     /// (currently only `AUTH` with unparseable base64).
     Malformed {
@@ -310,7 +310,7 @@ fn build_command(verb: &str, arg: &[u8]) -> SmtpCommand {
         "EXPN" => SmtpCommand::Expn,
         "ETRN" => SmtpCommand::Etrn,
         "STARTTLS" => SmtpCommand::Starttls,
-        "XCLIENT" => SmtpCommand::Xclient,
+        "XCLIENT" => SmtpCommand::Xclient(trimmed.to_string()),
         "AUTH" => {
             let mut parts = trimmed.splitn(2, char::is_whitespace);
             let mechanism = parts.next().unwrap_or("").to_string();
@@ -394,8 +394,19 @@ mod tests {
                 SmtpCommand::Expn,
                 SmtpCommand::Etrn,
                 SmtpCommand::Starttls,
-                SmtpCommand::Xclient,
+                SmtpCommand::Xclient(String::new()),
             ]
+        );
+    }
+
+    #[test]
+    fn parse_xclient_keeps_args() {
+        let mut lex = SmtpServerLexer::new(4096);
+        let mut data: &[u8] = b"XCLIENT NAME=a.example ADDR=1.2.3.4\r\n";
+        let cmds = lex.feed(&mut data);
+        assert_eq!(
+            cmds,
+            vec![SmtpCommand::Xclient("NAME=a.example ADDR=1.2.3.4".into())]
         );
     }
 
