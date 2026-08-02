@@ -10,7 +10,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use hopf_core::{ConnHandle, Endpoint, ProtocolHandler};
+use hopf_core::{BindingId, ConnHandle, Endpoint, ProtocolHandler, Runtime, SecurityInfo};
 
 use super::{FtpStorHandle, MessageReceiveCallback, StorCallback, StorReady, StouCallback};
 
@@ -209,27 +209,62 @@ impl ProtocolHandler for FtpDataRetrHandler {
 // STOR data handler
 // ---------------------------------------------------------------------------
 
-/// Arms a passive data connection for upload and, once both it and the
-/// server's `125`/`150` are ready, hands the caller a [`FtpStorHandle`] to
-/// push content through.
+/// Arms a data connection for upload and, once both it and the server's
+/// `125`/`150` are ready, hands the caller a [`FtpStorHandle`] to push
+/// content through.
 pub(crate) struct FtpDataStorHandler {
     transfer: Arc<Mutex<TransferState>>,
+    /// When true (active-mode TLS-from-accept), wait for
+    /// [`ProtocolHandler::security_established`] before arming so content
+    /// is not pushed before the handshake completes.
+    expect_tls: bool,
+    armed: bool,
 }
 
 impl FtpDataStorHandler {
+    /// Plaintext or outbound-TLS dial — arm as soon as TCP is up.
     pub fn new(transfer: Arc<Mutex<TransferState>>) -> Self {
-        Self { transfer }
+        Self {
+            transfer,
+            expect_tls: false,
+            armed: false,
+        }
     }
-}
 
-impl ProtocolHandler for FtpDataStorHandler {
-    fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+    /// TLS-from-accept (active mode + `PROT P`) — arm after handshake.
+    pub fn new_expect_tls(transfer: Arc<Mutex<TransferState>>) -> Self {
+        Self {
+            transfer,
+            expect_tls: true,
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self, endpoint: &mut dyn Endpoint) {
+        if self.armed {
+            return;
+        }
+        self.armed = true;
         let mut g = self.transfer.lock().unwrap();
         g.data_conn = Some(endpoint.handle());
         let armed = g.try_arm();
         drop(g);
         if let Some((ready, conn)) = armed {
             ready(FtpStorHandle::new(conn));
+        }
+    }
+}
+
+impl ProtocolHandler for FtpDataStorHandler {
+    fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+        if !self.expect_tls {
+            self.arm(endpoint);
+        }
+    }
+
+    fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+        if self.expect_tls {
+            self.arm(endpoint);
         }
     }
 
@@ -248,6 +283,58 @@ impl ProtocolHandler for FtpDataStorHandler {
         g.data_error = Some(io::Error::new(err.kind(), err.to_string()));
         g.data_done = true;
         g.maybe_complete();
+    }
+}
+
+/// Wraps a data handler so the one-shot active-mode listen binding is
+/// removed as soon as the server connects (or the socket errors out).
+pub(crate) struct ActiveAcceptGuard {
+    rt: Arc<Runtime>,
+    binding: BindingId,
+    removed: bool,
+    inner: Box<dyn ProtocolHandler>,
+}
+
+impl ActiveAcceptGuard {
+    pub fn new(rt: Arc<Runtime>, binding: BindingId, inner: Box<dyn ProtocolHandler>) -> Self {
+        Self {
+            rt,
+            binding,
+            removed: false,
+            inner,
+        }
+    }
+
+    fn drop_binding(&mut self) {
+        if !self.removed {
+            self.rt.remove_binding(self.binding);
+            self.removed = true;
+        }
+    }
+}
+
+impl ProtocolHandler for ActiveAcceptGuard {
+    fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+        self.drop_binding();
+        self.inner.connected(endpoint);
+    }
+
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        self.inner.receive(endpoint, data);
+    }
+
+    fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
+        self.drop_binding();
+        self.inner.disconnected(endpoint);
+    }
+
+    fn security_established(&mut self, endpoint: &mut dyn Endpoint, info: &SecurityInfo) {
+        self.inner.security_established(endpoint, info);
+    }
+
+    fn error(&mut self, endpoint: &mut dyn Endpoint, err: &io::Error) {
+        self.drop_binding();
+        self.inner.error(endpoint, err);
     }
 }
 

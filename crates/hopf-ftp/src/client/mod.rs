@@ -50,7 +50,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_core::{ConnHandle, ProtocolHandler, Runtime, SharedTlsConnector, TcpConnectorConfig};
+use hopf_core::{
+    ConnHandle, ProtocolHandler, Runtime, SharedTlsAcceptor, SharedTlsConnector, TcpConnectorConfig,
+};
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
 use handler::FtpControlHandler;
@@ -241,32 +243,32 @@ pub trait FtpSessionWrite: Send {
     /// or `Err` on a mismatched/rejected reply. Unlike [`Self::command`],
     /// a mismatch here does *not* fail the pipeline — the callback decides.
     fn command_reply(&mut self, verb: &str, arg: Option<&str>, expect: u16, callback: CmdCallback);
-    /// Queue a passive RETR; `receiver` is driven with the file content as
-    /// it arrives on the data connection.
+    /// Queue a RETR; `receiver` is driven with the file content as it arrives
+    /// on the data connection (passive or active per [`FtpClient`]).
     fn retr(&mut self, path: &str, receiver: Box<dyn MessageReceiveCallback>);
-    /// Queue a passive RETR resuming from `offset` (RFC 959 §4.1.3 — sends
+    /// Queue a RETR resuming from `offset` (RFC 959 §4.1.3 — sends
     /// `REST offset`, expecting `350`, before `RETR`).
     fn retr_from(&mut self, path: &str, offset: u64, receiver: Box<dyn MessageReceiveCallback>);
-    /// Queue a passive STOR; `ready` is called once the data connection is
+    /// Queue a STOR; `ready` is called once the data connection is
     /// armed with a [`FtpStorHandle`] to push content through, `callback`
     /// receives `Ok(())` on success.
     fn stor(&mut self, path: &str, ready: StorReady, callback: StorCallback);
-    /// Queue a passive STOR resuming from `offset` (RFC 959 §4.1.3 — sends
+    /// Queue a STOR resuming from `offset` (RFC 959 §4.1.3 — sends
     /// `REST offset`, expecting `350`, before `STOR`); the content pushed
     /// through the resulting [`FtpStorHandle`] must start at `offset`, not
     /// the whole file.
     fn stor_from(&mut self, path: &str, offset: u64, ready: StorReady, callback: StorCallback);
-    /// Queue a passive LIST; `receiver` is driven with the directory listing
+    /// Queue a LIST; `receiver` is driven with the directory listing
     /// as it arrives.
     fn list(&mut self, path: Option<&str>, receiver: Box<dyn MessageReceiveCallback>);
-    /// Queue a passive APPE (append to `path`, creating it if it doesn't
+    /// Queue an APPE (append to `path`, creating it if it doesn't
     /// exist); `ready` is called once the data connection is armed,
     /// `callback` receives `Ok(())` on success.
     fn appe(&mut self, path: &str, ready: StorReady, callback: StorCallback);
-    /// Queue a passive NLST (name-only listing); `receiver` is driven with
+    /// Queue an NLST (name-only listing); `receiver` is driven with
     /// the listing as it arrives.
     fn nlst(&mut self, path: Option<&str>, receiver: Box<dyn MessageReceiveCallback>);
-    /// Queue a passive STOU (store with a server-assigned unique filename);
+    /// Queue a STOU (store with a server-assigned unique filename);
     /// `ready` is called once the data connection is armed, `callback`
     /// receives the assigned filename on success.
     fn stou(&mut self, ready: StorReady, callback: StouCallback);
@@ -402,6 +404,16 @@ pub trait FtpPipeline: Send {
     fn failed(&mut self, err: FtpError);
 }
 
+/// How the client opens the FTP data channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FtpClientDataMode {
+    /// Client dials the server (`PASV` / `EPSV`). Default.
+    #[default]
+    Passive,
+    /// Client listens; server dials (`PORT` / `EPRT`).
+    Active,
+}
+
 // ---------------------------------------------------------------------------
 // Timeouts
 // ---------------------------------------------------------------------------
@@ -443,10 +455,15 @@ pub struct FtpClient {
     port: u16,
     timeouts: FtpClientTimeouts,
     credentials: Option<(String, String)>,
+    data_mode: FtpClientDataMode,
     prefer_epsv: bool,
+    prefer_eprt: bool,
     resolver: Option<Arc<DnsResolver>>,
     tls_connector: Option<SharedTlsConnector>,
     tls_server_name: Option<String>,
+    /// TLS acceptor for active-mode data connections under `PROT P` (the
+    /// client is the TLS server when the peer dials in).
+    data_tls_acceptor: Option<SharedTlsAcceptor>,
     implicit_tls: bool,
 }
 
@@ -459,10 +476,13 @@ impl FtpClient {
             port: 21,
             timeouts: FtpClientTimeouts::default(),
             credentials: None,
+            data_mode: FtpClientDataMode::Passive,
             prefer_epsv: true,
+            prefer_eprt: true,
             resolver: None,
             tls_connector: None,
             tls_server_name: None,
+            data_tls_acceptor: None,
             implicit_tls: false,
         }
     }
@@ -485,12 +505,34 @@ impl FtpClient {
         self
     }
 
-    /// Prefer `EPSV` over `PASV` for data connections (default: `true`).
+    /// Use active mode (`PORT`/`EPRT`) instead of passive (`PASV`/`EPSV`).
     ///
-    /// When `true`, `EPSV` is sent first; if the server returns `5xx` the
-    /// pipeline will fail.  Set to `false` to always use `PASV`.
+    /// Default is passive. Active mode binds an ephemeral local listener and
+    /// tells the server to dial it; pair with [`Self::prefer_eprt`] and, for
+    /// FTPS `PROT P`, [`Self::data_tls_acceptor`].
+    pub fn active_mode(mut self, yes: bool) -> Self {
+        self.data_mode = if yes {
+            FtpClientDataMode::Active
+        } else {
+            FtpClientDataMode::Passive
+        };
+        self
+    }
+
+    /// Prefer `EPSV` over `PASV` for passive data connections (default: `true`).
+    ///
+    /// Ignored when [`Self::active_mode`] is enabled.
     pub fn prefer_epsv(mut self, yes: bool) -> Self {
         self.prefer_epsv = yes;
+        self
+    }
+
+    /// Prefer `EPRT` over `PORT` for active data connections (default: `true`).
+    ///
+    /// `PORT` is IPv4-only; set `false` only when talking to servers that lack
+    /// `EPRT`. Ignored in passive mode.
+    pub fn prefer_eprt(mut self, yes: bool) -> Self {
+        self.prefer_eprt = yes;
         self
     }
 
@@ -521,6 +563,16 @@ impl FtpClient {
         self
     }
 
+    /// TLS acceptor for active-mode data channels when `PROT P` is in effect
+    /// (the client presents as the TLS server to the dialing peer).
+    ///
+    /// Required for active-mode FTPS transfers; unused in passive mode
+    /// (passive `PROT P` uses the control-channel [`SharedTlsConnector`]).
+    pub fn data_tls_acceptor(mut self, acceptor: SharedTlsAcceptor) -> Self {
+        self.data_tls_acceptor = Some(acceptor);
+        self
+    }
+
     /// Resolve the host, dial the control connection, and run `pipeline`.
     ///
     /// Returns immediately; the connection and pipeline execute asynchronously.
@@ -535,17 +587,21 @@ impl FtpClient {
             Arc::new(Mutex::new(Some(pipeline)));
 
         let creds = self.credentials.clone();
+        let data_mode = self.data_mode;
         let prefer_epsv = self.prefer_epsv;
+        let prefer_eprt = self.prefer_eprt;
         let timeouts = self.timeouts.clone();
         let rt2 = Arc::clone(rt);
         let tls_connector = self.tls_connector.clone();
         let tls_server_name = self.tls_server_name.clone();
+        let data_tls_acceptor = self.data_tls_acceptor.clone();
         let implicit_tls = self.implicit_tls;
 
         let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> = {
             let rt3 = Arc::clone(&rt2);
             let tls_connector = tls_connector.clone();
             let tls_server_name = tls_server_name.clone();
+            let data_tls_acceptor = data_tls_acceptor.clone();
             Arc::new(move || {
                 let pl = pipeline_cell
                     .lock()
@@ -554,12 +610,15 @@ impl FtpClient {
                     .expect("FtpClient handler factory called more than once");
                 Box::new(FtpControlHandler::new(
                     creds.clone(),
+                    data_mode,
                     prefer_epsv,
+                    prefer_eprt,
                     timeouts.clone(),
                     Arc::clone(&rt3),
                     pl,
                     tls_connector.clone(),
                     tls_server_name.clone(),
+                    data_tls_acceptor.clone(),
                     implicit_tls,
                 )) as Box<dyn ProtocolHandler>
             })
@@ -634,7 +693,7 @@ fn resolve_literal(host: &str, port: u16) -> Option<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::reply::{parse_epsv_port, parse_pasv_addr, parse_pwd_path};
+    use super::reply::{format_eprt_arg, format_port_arg, parse_epsv_port, parse_pasv_addr, parse_pwd_path};
 
     #[test]
     fn parse_pasv() {
@@ -655,6 +714,26 @@ mod tests {
         assert_eq!(
             parse_pwd_path("\"/tmp\" is current directory").as_deref(),
             Some("/tmp")
+        );
+    }
+
+    #[test]
+    fn format_port_round_trips_through_pasv_parser_shape() {
+        let addr = "192.168.1.2:1029".parse().unwrap();
+        let arg = format_port_arg(addr).unwrap();
+        assert_eq!(arg, "192,168,1,2,4,5");
+        assert!(format_port_arg("[::1]:2121".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn format_eprt_v4_and_v6() {
+        assert_eq!(
+            format_eprt_arg("127.0.0.1:65000".parse().unwrap()),
+            "|1|127.0.0.1|65000|"
+        );
+        assert_eq!(
+            format_eprt_arg("[::1]:2121".parse().unwrap()),
+            "|2|::1|2121|"
         );
     }
 }
