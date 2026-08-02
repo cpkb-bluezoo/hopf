@@ -1335,4 +1335,70 @@ mod tests {
 
         server.shutdown();
     }
+
+    /// Keep-alive probes applied via [`QuicTransportOptions`] keep a
+    /// connection alive past what the idle timeout alone would allow —
+    /// proves `keep_alive_interval` is wired into quinn-proto, not just
+    /// accepted and ignored.
+    #[test]
+    fn transport_options_keepalive_prevents_idle_timeout() {
+        use crate::config::{apply_client_transport_options, apply_server_transport_options, QuicTransportOptions};
+
+        let (mut server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"ka-test"]).unwrap();
+        let mut client_cfg = client_config_for_pem_bytes(&pem, &[b"ka-test"]).unwrap();
+
+        // Same short idle as the teardown test, but with keep-alive well
+        // under it on the client (one side is enough).
+        let opts = QuicTransportOptions::new()
+            .max_idle_timeout(Duration::from_millis(200))
+            .keep_alive_interval(Duration::from_millis(50));
+        apply_server_transport_options(
+            &mut server_cfg,
+            &QuicTransportOptions::new().max_idle_timeout(Duration::from_millis(200)),
+        )
+        .unwrap();
+        apply_client_transport_options(&mut client_cfg, &opts).unwrap();
+
+        let server_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_disconnected2 = Arc::clone(&server_disconnected);
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(move || {
+                Box::new(DisconnectRecorder {
+                    disconnected: Arc::clone(&server_disconnected2),
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        let client_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client_disconnected2 = Arc::clone(&client_disconnected);
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(DisconnectRecorder {
+                    disconnected: Arc::clone(&client_disconnected2),
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        // Without keepalive, both sides disconnect by ~200ms. Wait several
+        // idle periods; keep-alive must keep the connection up.
+        thread::sleep(Duration::from_millis(800));
+        assert!(
+            !server_disconnected.load(std::sync::atomic::Ordering::SeqCst),
+            "server disconnected despite client keep-alive"
+        );
+        assert!(
+            !client_disconnected.load(std::sync::atomic::Ordering::SeqCst),
+            "client disconnected despite its own keep-alive"
+        );
+
+        server.shutdown();
+    }
 }
