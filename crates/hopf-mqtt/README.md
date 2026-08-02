@@ -17,18 +17,18 @@ core, v5 core, async client, MQTT-over-WebSocket bridge, examples). See
 - Multi-reactor fan-out: publishes cross reactors via
   [`hopf_core::ConnHandle`](../hopf-core/src/handle.rs), never touching a
   peer `Endpoint` from another thread directly.
-- Staged `Connect` / `Publish` / `Subscribe` handler SPI (Gumdrop shape),
-  backed by [`hopf_auth::CredentialStore`](../hopf-auth/src/store.rs) for
-  CONNECT username/password.
+- Staged Connect / Publish / Subscribe handler SPI (Gumdrop shape).
+  CONNECT username/password and enhanced AUTH use
+  [`hopf_auth::CredentialStore`](../hopf-auth/src/store.rs).
 - Async, non-blocking client on the `hopf-core` `Runtime` / `ProtocolHandler`
   SPI, with DNS resolution via `hopf-dns`.
 - Optional MQTT-over-WebSocket bridge (`websocket` feature) sharing broker
-  state with the TCP listener.
+  state with the TCP listener (timers via `ConnHandle::schedule_timer`).
+- Offline QoS ≥ 1 queues (`MqttMessageStore`, default in-memory; optional
+  file-backed) and in-process QoS retransmission while connected.
 
-Explicitly deferred (see the plan's "Future project work"): shared
-subscriptions (`$share/...`), enhanced AUTH, topic aliases, will delay /
-message expiry enforcement, durable offline sessions, QoS retry across
-restarts, file-backed message stores.
+Still limited: QoS retry / inflight state does not survive broker process
+restarts (even with a file-backed offline store).
 
 See [docs/mqtt.html](https://cpkb-bluezoo.github.io/hopf/mqtt.html).
 

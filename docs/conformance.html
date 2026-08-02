@@ -746,12 +746,12 @@
 </table>
 
 <h2 id="mqtt">MQTT — OASIS MQTT Version 3.1.1 / Version 5.0 (useful core)</h2>
-<p>No Gumdrop precedent (Gumdrop doesn't implement MQTT) — this section is based on this session's own implementation work on <code>hopf-mqtt</code>, audited the same way as the rest: against the OASIS specification text, with file:line citations.</p>
+<p>Gumdrop implements MQTT (broker + client) under <code>org.bluezoo.gumdrop.mqtt</code> (<code>MQTTService</code>, <code>MQTTProtocolHandler</code>, WebSocket bridge, staged Connect/Publish/Subscribe handlers). This section audits <code>hopf-mqtt</code> against the OASIS specification text the same way as the other protocols, using Gumdrop as a parity reference rather than as the requirements source. Gumdrop's own HTML docs overstate some v5 features relative to its code — hopf rows below reflect what each codebase actually enforces.</p>
 <table>
 <thead><tr><th>Spec</th><th>Status</th></tr></thead>
 <tbody>
 <tr><td>OASIS MQTT Version 3.1.1</td><td>Core — full semantics</td></tr>
-<tr><td>OASIS MQTT Version 5.0</td><td>Useful subset — see per-feature rows; shared subscriptions, enhanced AUTH, topic aliases, and several Will/Message-Expiry mechanics are explicitly deferred, not silently missing</td></tr>
+<tr><td>OASIS MQTT Version 5.0</td><td>Useful subset — see per-feature rows; QoS retry across broker restarts remains limited (in-flight is process-local)</td></tr>
 </tbody>
 </table>
 <h3>Connect / Session / Disconnect</h3>
@@ -761,9 +761,9 @@
 <tr><td>CONNECT parsing (flags, keep alive, client id, will, credentials), CONNACK (session-present, version-appropriate reason code)</td><td>v3.1.1 §3.1-3.2, v5 §3.1-3.2</td><td>Compliant</td><td><code>codec/decode.rs</code>, <code>server/control.rs</code>; v3.1.1 uses the narrower <code>reason::connack_v311</code> table, v5 the unified reason-code table — kept genuinely separate, not unified incorrectly</td></tr>
 <tr><td>Zero-length Client Identifier: assigned when Clean Session set, rejected otherwise</td><td>v3.1.1 §3.1.3.7</td><td>Compliant</td><td><code>assign_client_id()</code> (TCP) / <code>uuid_ish()</code> (WS)</td></tr>
 <tr><td>Session takeover (evicts a live prior connection)</td><td>v3.1.1 §3.1.2.4</td><td>Compliant</td><td><code>BrokerState::register</code> evicted-connection path, unit-tested (<code>session_takeover_evicts_old_connection</code>)</td></tr>
-<tr><td>Session resume (orphaned, non-clean-start, Session Expiry)</td><td>v5 §3.1.2.11.2</td><td>Compliant (TCP)</td><td>Epoch-guarded orphan/resume so a stale expiry timer can't reap a session that was already resumed and re-orphaned; unit- and integration-tested</td></tr>
-<tr><td>Keep Alive ×1.5 enforcement</td><td>v3.1.1 §3.1.2.10</td><td>Compliant (TCP only)</td><td><code>rearm_keepalive</code>; see WebSocket bridge row below for the documented gap</td></tr>
-<tr><td>CONNECT-timeout if no CONNECT arrives</td><td>v3.1.1 §3.1 (implied)</td><td>Compliant (TCP only)</td><td><code>connect_timeout_timer</code>; not enforceable over WS (no timer access from <code>WsEventHandler</code> callbacks)</td></tr>
+<tr><td>Session resume (orphaned, non-clean-start, Session Expiry)</td><td>v5 §3.1.2.11.2</td><td>Compliant</td><td>Epoch-guarded orphan/resume on TCP and WS; offline QoS ≥ 1 drained via <code>BrokerState::drain_offline</code></td></tr>
+<tr><td>Keep Alive ×1.5 enforcement</td><td>v3.1.1 §3.1.2.10</td><td>Compliant</td><td>TCP via <code>Endpoint::schedule_timer</code>; WS via <code>ConnHandle::schedule_timer</code></td></tr>
+<tr><td>CONNECT-timeout if no CONNECT arrives</td><td>v3.1.1 §3.1 (implied)</td><td>Compliant</td><td>TCP and WS (<code>connect_timeout_timer</code>)</td></tr>
 <tr><td>DISCONNECT — client-initiated (graceful, no Will), server-initiated (v5 reason code, correctly absent for v3.1.1 which has no such packet)</td><td>v3.1.1 §3.14, v5 §3.14</td><td>Compliant</td><td></td></tr>
 </tbody>
 </table>
@@ -773,11 +773,11 @@
 <tbody>
 <tr><td>QoS 0/1/2 full handshakes (PUBACK; PUBREC/PUBREL/PUBCOMP)</td><td>v3.1.1 §3.3-3.7</td><td>Compliant</td><td>Server-inbound QoS 2 dedup via <code>awaiting_pubrel</code>, re-acks a duplicate PUBLISH without re-delivering to subscribers</td></tr>
 <tr><td>Streaming PUBLISH payload (never buffered in full)</td><td>—</td><td>Compliant</td><td><code>MqttFrameParser</code> streams payload chunks directly to <code>publish_data</code>, mirroring <code>hopf-http</code>'s H2Parser buffer-and-drain shape</td></tr>
-<tr><td>Retransmission / redelivery timer for outbound QoS 1/2</td><td>v3.1.1 §4.4</td><td>Not implemented (deferred)</td><td>Explicitly out of scope per the implementation plan's "QoS retry across restarts / while connected" non-goal — Gumdrop also lacks this</td></tr>
+<tr><td>Retransmission / redelivery timer for outbound QoS 1/2</td><td>v3.1.1 §4.4</td><td>Compliant (in-process)</td><td><code>MqttMessageStore::track_inflight</code> / <code>due_retransmits</code>; 5s retry timer on TCP/WS. Does not survive broker restarts</td></tr>
 <tr><td>Topic Name validation on PUBLISH (no wildcards)</td><td>v3.1.1 §4.7</td><td>Compliant</td><td><code>validate_topic_name</code></td></tr>
 <tr><td>Retained messages: store, clear, deliver on new SUBSCRIBE respecting Retain Handling</td><td>v3.1.1 §3.3.1.3, v5 §3.8.3.1</td><td>Compliant</td><td><code>RetainedStore</code>, <code>deliver_retained</code></td></tr>
 <tr><td>Will Message published on unclean disconnect</td><td>v3.1.1 §3.1.2.5</td><td>Compliant</td><td></td></tr>
-<tr><td>Will Delay Interval, Message Expiry Interval enforcement</td><td>v5 §3.1.3.2, §3.3.2.3.3</td><td>Not implemented (deferred)</td><td>Per the plan's explicit non-goals</td></tr>
+<tr><td>Will Delay Interval, Message Expiry Interval enforcement</td><td>v5 §3.1.3.2, §3.3.2.3.3</td><td>Compliant</td><td><code>server/expiry.rs</code>; Will Delay capped by Session Expiry; Message Expiry rewritten on offline dequeue / retained delivery</td></tr>
 </tbody>
 </table>
 <h3>Subscribe / Wildcards / v5 Options</h3>
@@ -787,8 +787,9 @@
 <tr><td>SUBSCRIBE/SUBACK, UNSUBSCRIBE/UNSUBACK</td><td>v3.1.1 §3.8,§3.10</td><td>Compliant</td><td></td></tr>
 <tr><td>Wildcards (<code>+</code>, <code>#</code>), <code>$</code>-prefix exclusion from wildcard matching</td><td>v3.1.1 §4.7</td><td>Compliant</td><td><code>TopicTree</code></td></tr>
 <tr><td>Subscription Options: No Local, Retain As Published, Retain Handling (0/1/2)</td><td>v5 §3.8.3.1</td><td>Compliant</td><td><code>MatchOptions::from_filter</code>; No Local checked in <code>BrokerState::publish</code>; unit-tested</td></tr>
-<tr><td>Shared Subscriptions (<code>$share/group/filter</code>)</td><td>v5 §4.8.2</td><td>Not implemented (deferred)</td><td>Explicit plan non-goal</td></tr>
-<tr><td>Topic Alias</td><td>v5 §3.3.2.3.4</td><td>Not implemented (deferred)</td><td></td></tr>
+<tr><td>Shared Subscriptions (<code>$share/group/filter</code>)</td><td>v5 §4.8.2</td><td>Compliant</td><td><code>TopicTree</code> round-robin; CONNACK advertises <code>SHARED_SUBSCRIPTION_AVAILABLE = 1</code></td></tr>
+<tr><td>Topic Alias</td><td>v5 §3.3.2.3.4</td><td>Compliant</td><td>Inbound alias map on TCP/WS; CONNACK <code>TOPIC_ALIAS_MAXIMUM</code></td></tr>
+<tr><td>Offline QoS ≥ 1 queue (Session Expiry orphan window)</td><td>v5 §4.1</td><td>Compliant</td><td><code>MqttMessageStore</code> on <code>BrokerState</code>; default in-memory, optional file-backed</td></tr>
 </tbody>
 </table>
 <h3>v5 Flow Control and Reason Codes</h3>
@@ -797,7 +798,7 @@
 <tbody>
 <tr><td>Receive Maximum (server caps unacked outbound QoS 1/2 per subscriber)</td><td>v5 §3.3.4</td><td>Compliant</td><td>Lock-free <code>AtomicU16</code> in-flight counter + <code>try_reserve_delivery</code>, unit-tested including the credit-release-on-ack path</td></tr>
 <tr><td>Unified v5 reason-code table (CONNACK/PUBACK/PUBREC/SUBACK/etc.)</td><td>v5 §2.4</td><td>Compliant</td><td><code>codec/packet.rs</code> <code>reason</code> module</td></tr>
-<tr><td>Enhanced AUTH (AUTH packet exchange, re-authentication)</td><td>v5 §3.15,§4.12</td><td>Not implemented (deferred, documented in-code)</td><td><code>auth()</code> handler is a literal no-op with a comment: "Enhanced AUTH… is future work"</td></tr>
+<tr><td>Enhanced AUTH (AUTH packet exchange, re-authentication)</td><td>v5 §3.15,§4.12</td><td>Compliant (TCP server + client callback)</td><td>Server: <code>server/auth.rs</code> via <code>hopf-auth</code> SASL; client: <code>MqttClientDriver::on_auth</code> / <code>MqttClientControl::auth</code></td></tr>
 </tbody>
 </table>
 <h3>Async Client</h3>
@@ -814,11 +815,11 @@
 <tbody>
 <tr><td>Same codec + <code>BrokerState</code> shared with the TCP listener</td><td>Compliant</td><td><code>MqttWsFactory</code>/<code>MqttWsHandler</code> drive the identical <code>MqttFrameParser</code></td></tr>
 <tr><td>Cross-transport, cross-connection pub/sub fan-out (WS subscriber receives a TCP publisher's PUBLISH)</td><td>Compliant — required a real fix this session</td><td>Originally broken: a plain <code>ConnHandle::send</code> writes straight to the raw transport, bypassing WS framing entirely and corrupting the stream. Fixed by adding <code>ConnHandle::framed()</code> to <code>hopf-core</code> and <code>framed_ws_conn_handle()</code> to <code>hopf-websocket</code>; proven by a real cross-transport integration test</td></tr>
-<tr><td>Session Expiry over WS</td><td>Not implemented (documented)</td><td>No timer access from <code>WsEventHandler</code> callbacks — an unclean WS disconnect always unregisters immediately rather than orphaning</td></tr>
-<tr><td>Keepalive / CONNECT-timeout enforcement over WS</td><td>Not implemented (documented)</td><td>Same root cause</td></tr>
+<tr><td>Session Expiry over WS</td><td>Compliant</td><td>Orphan + expire via <code>ConnHandle::schedule_timer</code></td></tr>
+<tr><td>Keepalive / CONNECT-timeout enforcement over WS</td><td>Compliant</td><td>Same timer path as TCP</td></tr>
 </tbody>
 </table>
-<p><strong>Explicitly deferred</strong> (per the crate's own implementation plan, not silent gaps): shared subscriptions, enhanced AUTH, topic aliases, Will Delay / Message Expiry enforcement, durable offline queues, QoS retry across restarts, file-backed message store.</p>
+<p><strong>Remaining gap</strong>: QoS retransmission bookkeeping does not survive broker process restarts (in-flight entries stay in memory even when offline queues use <code>FileBackedMessageStore</code>). Staged Connect / Publish / Subscribe SPI matches Gumdrop.</p>
 
 <h2 id="deferred">Deferred protocols (not yet started)</h2>
 <p>Three protocols Gumdrop implements have no hopf equivalent yet — deliberately deferred, not gaps in what exists:</p>
