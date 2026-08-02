@@ -65,6 +65,8 @@ pub struct SmtpControlHandler {
     sasl: Option<Box<dyn SaslServer>>,
     /// MAIL FROM commands seen this session (RFC 9422 MAILMAX counter).
     mail_transactions: u32,
+    /// Real TCP peer for XCLIENT authorization (never overridden by ADDR).
+    tcp_peer: SocketAddr,
 }
 
 impl SmtpControlHandler {
@@ -96,6 +98,8 @@ impl SmtpControlHandler {
                 smtputf8: false,
                 control_handle: None,
                 security_info: hopf_core::SecurityInfo::plaintext(),
+                reverse_name: None,
+                xclient_login: None,
             },
             config,
             metrics,
@@ -115,6 +119,7 @@ impl SmtpControlHandler {
             control_handle: None,
             sasl: None,
             mail_transactions: 0,
+            tcp_peer: peer,
         }
     }
 
@@ -224,6 +229,9 @@ impl SmtpControlHandler {
                 caps.push(format!("AUTH {}", mechs.join(" ")));
             }
         }
+        if self.config.xclient_authorized(self.tcp_peer) {
+            caps.push("XCLIENT NAME ADDR PORT PROTO HELO LOGIN DESTADDR DESTPORT".into());
+        }
         caps
     }
 
@@ -302,7 +310,7 @@ impl SmtpControlHandler {
                 SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
                 self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
             }
-            SmtpCommand::Xclient => self.send_enhanced(endpoint, 550, "5.7.0", "XCLIENT not permitted"),
+            SmtpCommand::Xclient(args) => self.cmd_xclient(endpoint, &args),
             SmtpCommand::Malformed { .. } => {
                 self.sasl = None;
                 SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
@@ -833,15 +841,81 @@ impl SmtpControlHandler {
     }
 
     fn cmd_help(&mut self, endpoint: &mut dyn Endpoint) {
+        let mut line1 =
+            "HELO EHLO MAIL RCPT DATA BDAT RSET NOOP QUIT HELP AUTH STARTTLS".to_string();
+        if self.config.xclient_authorized(self.tcp_peer) {
+            line1.push_str(" XCLIENT");
+        }
         self.send(
             endpoint,
-            reply_multiline(
-                214,
-                &[
-                    "HELO EHLO MAIL RCPT DATA BDAT RSET NOOP QUIT HELP AUTH STARTTLS",
-                    "End of HELP",
-                ],
-            ),
+            reply_multiline(214, &[line1.as_str(), "End of HELP"]),
+        );
+    }
+
+    fn cmd_xclient(&mut self, endpoint: &mut dyn Endpoint, args: &str) {
+        use crate::server::xclient::{apply_addr_overrides, parse_xclient_args};
+
+        if !self.config.xclient_authorized(self.tcp_peer) {
+            self.send_enhanced(endpoint, 550, "5.7.0", "XCLIENT not permitted");
+            return;
+        }
+        if matches!(
+            self.session,
+            SmtpSessionState::Mail
+                | SmtpSessionState::Rcpt
+                | SmtpSessionState::Data
+                | SmtpSessionState::Bdat
+                | SmtpSessionState::Delivering
+        ) {
+            self.send_enhanced(endpoint, 503, "5.5.1", "Mail transaction in progress");
+            return;
+        }
+
+        let overrides = match parse_xclient_args(args) {
+            Ok(o) => o,
+            Err(e) => {
+                self.send_enhanced(endpoint, 501, "5.5.4", &e.0);
+                return;
+            }
+        };
+
+        let (peer, local) = apply_addr_overrides(self.meta.peer, self.meta.local, &overrides);
+        self.meta.peer = peer;
+        self.meta.local = local;
+
+        if let Some(name) = overrides.name {
+            self.meta.reverse_name = name;
+        }
+        if let Some(login) = overrides.login {
+            // Informational only — never treat as SASL AUTH.
+            self.meta.xclient_login = login;
+        }
+        if let Some(helo) = overrides.helo.clone() {
+            self.helo_name = helo;
+        }
+        if let Some(Some(proto)) = &overrides.proto {
+            if proto.eq_ignore_ascii_case("ESMTP") {
+                self.extended = true;
+            }
+        }
+
+        // Jump back to greeting stage (Postfix XCLIENT semantics).
+        self.reset_transaction();
+        self.session = SmtpSessionState::Initial;
+        self.mail_from = None;
+        self.recipient = None;
+        self.message = None;
+        // Keep `hello` so the next EHLO can re-enter MAIL FROM; HELO name
+        // already reflects XCLIENT HELO when asserted.
+        if overrides.helo.is_none() {
+            self.helo_name = None;
+            self.extended = false;
+        }
+
+        self.send_reply(
+            endpoint,
+            220,
+            &format!("{} ESMTP Service ready", self.config.hostname),
         );
     }
 
@@ -1033,6 +1107,7 @@ impl SmtpControlHandler {
 impl ProtocolHandler for SmtpControlHandler {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
         if let Ok(peer) = endpoint.remote_addr() {
+            self.tcp_peer = peer;
             self.meta.peer = peer;
         }
         if let Ok(local) = endpoint.local_addr() {

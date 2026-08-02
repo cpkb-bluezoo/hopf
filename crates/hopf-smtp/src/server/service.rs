@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use hopf_auth::CredentialStore;
 use hopf_core::tls::SharedTlsAcceptor;
-use hopf_core::{ProtocolHandler, Runtime, TcpListenerConfig};
+use hopf_core::{IpNet, ProtocolHandler, Runtime, TcpListenerConfig};
 
 use crate::server::control::SmtpControlHandler;
 use crate::server::handler::{
@@ -46,6 +46,10 @@ pub struct SmtpConfig {
     /// mechanism set the store supports is advertised and driven via
     /// `hopf_auth::create_server` (same pattern as hopf-pop3/hopf-imap).
     pub store: Option<Arc<dyn CredentialStore>>,
+    /// TCP peers allowed to issue XCLIENT (real socket IP, never the
+    /// overridden ADDR). Empty = XCLIENT disabled (default; matches
+    /// Gumdrop's deny-by-default `isXclientAuthorized`).
+    pub xclient_allow: Vec<IpNet>,
 }
 
 impl SmtpConfig {
@@ -61,6 +65,7 @@ impl SmtpConfig {
             tls_acceptor: None,
             implicit_tls: false,
             store: None,
+            xclient_allow: Vec::new(),
         }
     }
 
@@ -92,6 +97,22 @@ impl SmtpConfig {
     pub fn with_max_mail_transactions(mut self, n: u32) -> Self {
         self.max_mail_transactions = n.max(1);
         self
+    }
+
+    /// Authorize XCLIENT from these CIDRs (real TCP peer only). Empty
+    /// clears the allowlist and disables XCLIENT again.
+    pub fn with_xclient_allow(mut self, nets: Vec<IpNet>) -> Self {
+        self.xclient_allow = nets;
+        self
+    }
+
+    /// Whether the real TCP peer may issue XCLIENT.
+    pub fn xclient_authorized(&self, peer: SocketAddr) -> bool {
+        if self.xclient_allow.is_empty() {
+            return false;
+        }
+        let ip = peer.ip();
+        self.xclient_allow.iter().any(|n| n.contains(ip))
     }
 }
 
