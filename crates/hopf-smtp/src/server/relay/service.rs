@@ -18,6 +18,12 @@ use super::handler::SimpleRelayHandlerFactory;
 /// Creates [`super::SimpleRelayHandler`] instances that accept mail for any
 /// domain, look up MX records via [`DnsResolver`], and forward with
 /// [`crate::SmtpClient`].
+///
+/// **Security:** this is an open relay by design. Prefer a non-empty
+/// [`SmtpConfig::acl`] allow list and keep [`SmtpConfig::auth_required`]
+/// enabled unless you intentionally turn it off. [`Self::start`] warns via
+/// telemetry when no CIDR allow list is configured, but does not refuse to
+/// start.
 pub struct SimpleRelayService {
     smtp: SmtpService,
     dns: Arc<DnsResolver>,
@@ -87,7 +93,86 @@ impl SimpleRelayService {
     }
 
     /// Register the SMTP listener; returns bound address.
+    ///
+    /// When [`SmtpConfig::acl`] has an empty allow list (open to every peer),
+    /// emits a telemetry warning — open relays without a CIDR allowlist are
+    /// a common abuse vector. Startup is not blocked.
     pub fn start(&self, runtime: Arc<Runtime>) -> std::io::Result<SocketAddr> {
+        if self.smtp.config().acl.allow.is_empty() {
+            let msg = "SimpleRelayService started with no PeerAcl allow CIDRs \
+                       (open to all peers); configure SmtpConfig::with_acl if \
+                       this is not intentional";
+            if let Some(t) = runtime.telemetry() {
+                t.on_warn(msg);
+            } else {
+                // No telemetry hook — still surface on stderr so operators notice.
+                eprintln!("hopf-smtp: WARN: {msg}");
+            }
+        }
         self.smtp.start(runtime)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hopf_core::{IpNet, PeerAcl, RuntimeConfig, TelemetryHook};
+    use std::sync::Mutex;
+
+    struct WarnCapture {
+        msgs: Mutex<Vec<String>>,
+    }
+
+    impl TelemetryHook for WarnCapture {
+        fn on_warn(&self, msg: &str) {
+            self.msgs.lock().unwrap().push(msg.to_string());
+        }
+    }
+
+    #[test]
+    fn start_without_allow_cidrs_emits_telemetry_warning() {
+        let capture = Arc::new(WarnCapture {
+            msgs: Mutex::new(Vec::new()),
+        });
+        let hook: Arc<dyn TelemetryHook> = capture.clone();
+        let rt = Arc::new(Runtime::start_with_telemetry(RuntimeConfig::default(), Some(hook)).unwrap());
+        let config = SmtpConfig::new("127.0.0.1:0".parse().unwrap(), "relay.test").auth_required(false);
+        let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
+        let relay = SimpleRelayService::with_resolver(config, Arc::clone(&rt), dns, 25);
+        let _addr = relay.start(Arc::clone(&rt)).unwrap();
+        let msgs = capture.msgs.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("no PeerAcl allow CIDRs")),
+            "expected open-relay CIDR warning, got {msgs:?}"
+        );
+        drop(relay);
+        drop(msgs);
+        // Allow the Arc to drop uniquely so Runtime::shutdown can run.
+        drop(rt);
+    }
+
+    #[test]
+    fn start_with_allow_cidrs_is_silent() {
+        let capture = Arc::new(WarnCapture {
+            msgs: Mutex::new(Vec::new()),
+        });
+        let hook: Arc<dyn TelemetryHook> = capture.clone();
+        let rt = Arc::new(Runtime::start_with_telemetry(RuntimeConfig::default(), Some(hook)).unwrap());
+        let acl = PeerAcl {
+            allow: vec![IpNet::parse("127.0.0.0/8").unwrap()],
+            deny: Vec::new(),
+        };
+        let config = SmtpConfig::new("127.0.0.1:0".parse().unwrap(), "relay.test")
+            .auth_required(false)
+            .with_acl(acl);
+        let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
+        let relay = SimpleRelayService::with_resolver(config, Arc::clone(&rt), dns, 25);
+        let _addr = relay.start(Arc::clone(&rt)).unwrap();
+        assert!(
+            capture.msgs.lock().unwrap().is_empty(),
+            "must not warn when allow CIDRs are configured"
+        );
+        drop(relay);
+        drop(rt);
     }
 }

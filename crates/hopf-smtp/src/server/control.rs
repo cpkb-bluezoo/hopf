@@ -1694,7 +1694,7 @@ mod telemetry_tests {
         let mut h = SmtpControlHandler::new(
             Box::new(AcceptAllSmtpHandler::new("localhost")),
             SmtpServerMetrics::shared(),
-            SmtpConfig::new(local, "localhost"),
+            SmtpConfig::new(local, "localhost").auth_required(false),
             peer,
             local,
         )

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use hopf_auth::CredentialStore;
 use hopf_core::tls::SharedTlsAcceptor;
-use hopf_core::{IpNet, ProtocolHandler, Runtime, TcpListenerConfig};
+use hopf_core::{AcceptRateLimit, IpNet, PeerAcl, ProtocolHandler, Runtime, TcpListenerConfig};
 
 use crate::server::control::SmtpControlHandler;
 use crate::server::handler::{
@@ -36,7 +36,9 @@ pub struct SmtpConfig {
     /// Max MAIL FROM commands per session (LIMITS MAILMAX). Counted
     /// regardless of success or failure (RFC 9422 §4.1).
     pub max_mail_transactions: u32,
-    /// Require AUTH before MAIL FROM.
+    /// Require AUTH before MAIL FROM. Defaults to **`true`**; set
+    /// [`Self::auth_required`]`(false)` only when the listener is otherwise
+    /// restricted (e.g. CIDR ACL on an intentional open relay).
     pub auth_required: bool,
     /// Optional TLS acceptor (STARTTLS / implicit).
     pub tls_acceptor: Option<SharedTlsAcceptor>,
@@ -50,10 +52,16 @@ pub struct SmtpConfig {
     /// overridden ADDR). Empty = XCLIENT disabled (default; matches
     /// Gumdrop's deny-by-default `isXclientAuthorized`).
     pub xclient_allow: Vec<IpNet>,
+    /// Peer CIDR allow/deny applied at accept
+    /// ([`TcpListenerConfig::with_acl`]). Empty allow = open to all peers
+    /// (deny still applies). Open relays should set a non-empty allow list.
+    pub acl: PeerAcl,
+    /// Optional accept-rate limit ([`TcpListenerConfig::with_rate_limit`]).
+    pub rate_limit: Option<AcceptRateLimit>,
 }
 
 impl SmtpConfig {
-    /// Plain SMTP with hostname.
+    /// Plain SMTP with hostname. Authentication is required by default.
     pub fn new(listen: SocketAddr, hostname: impl Into<String>) -> Self {
         Self {
             listen,
@@ -61,11 +69,13 @@ impl SmtpConfig {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_recipients: DEFAULT_MAX_RECIPIENTS,
             max_mail_transactions: DEFAULT_MAX_MAIL_TRANSACTIONS,
-            auth_required: false,
+            auth_required: true,
             tls_acceptor: None,
             implicit_tls: false,
             store: None,
             xclient_allow: Vec::new(),
+            acl: PeerAcl::open(),
+            rate_limit: None,
         }
     }
 
@@ -81,7 +91,7 @@ impl SmtpConfig {
         self
     }
 
-    /// Require authentication before MAIL.
+    /// Require (or not) authentication before MAIL.
     pub fn auth_required(mut self, yes: bool) -> Self {
         self.auth_required = yes;
         self
@@ -103,6 +113,18 @@ impl SmtpConfig {
     /// clears the allowlist and disables XCLIENT again.
     pub fn with_xclient_allow(mut self, nets: Vec<IpNet>) -> Self {
         self.xclient_allow = nets;
+        self
+    }
+
+    /// Restrict which TCP peers may connect (CIDR allow/deny).
+    pub fn with_acl(mut self, acl: PeerAcl) -> Self {
+        self.acl = acl;
+        self
+    }
+
+    /// Cap accepts per source / globally (see [`AcceptRateLimit`]).
+    pub fn with_rate_limit(mut self, limit: AcceptRateLimit) -> Self {
+        self.rate_limit = Some(limit);
         self
     }
 
@@ -182,6 +204,11 @@ impl SmtpService {
         &self.metrics
     }
 
+    /// Current SMTP configuration (ACL, auth, listen address, …).
+    pub fn config(&self) -> &SmtpConfig {
+        &self.config
+    }
+
     /// Build a [`TcpListenerConfig`] for the SMTP port.
     pub fn control_listener(&self, _runtime: Arc<Runtime>) -> TcpListenerConfig {
         let factory = Arc::clone(&self.handler_factory);
@@ -203,7 +230,11 @@ impl SmtpService {
                 )
                 .with_telemetry(otel_metrics.clone(), export.clone(), traces_enabled),
             ) as Box<dyn ProtocolHandler>
-        });
+        })
+        .with_acl(self.config.acl.clone());
+        if let Some(lim) = self.config.rate_limit.clone() {
+            cfg = cfg.with_rate_limit(lim);
+        }
         if let Some(tls) = &self.config.tls_acceptor {
             if self.config.implicit_tls {
                 cfg = cfg.with_tls(Arc::clone(tls));

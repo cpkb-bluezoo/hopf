@@ -18,6 +18,9 @@ pub trait TelemetryHook: Send + Sync {
     fn on_close(&self, _peer: SocketAddr) {}
     /// I/O or protocol error.
     fn on_error(&self, _peer: Option<SocketAddr>, _msg: &str) {}
+    /// Non-fatal configuration / operational warning (e.g. open relay with
+    /// no CIDR allowlist). Default: no-op.
+    fn on_warn(&self, _msg: &str) {}
 }
 
 /// Discarding hook.

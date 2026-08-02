@@ -165,6 +165,12 @@ impl Runtime {
         &self.workers[idx]
     }
 
+    /// Process-wide telemetry hook, if one was supplied at
+    /// [`Self::start_with_telemetry`].
+    pub fn telemetry(&self) -> Option<&Arc<dyn TelemetryHook>> {
+        self.telemetry.as_ref()
+    }
+
     /// Schedule a timer on a specific worker (no TCP endpoint required).
     pub fn schedule_on_worker(
         &self,

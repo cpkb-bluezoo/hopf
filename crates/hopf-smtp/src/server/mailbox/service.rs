@@ -27,7 +27,7 @@ use super::handler::LocalDeliveryHandlerFactory;
 /// | `mailbox_factory` | constructor | yes | mbox or Maildir++ factory |
 /// | `max_message_size` | [`SmtpConfig`] | no | Default ~35 MiB |
 /// | `max_recipients` | [`SmtpConfig`] | no | Default 100 |
-/// | `auth_required` | [`SmtpConfig`] | no | Submission-style AUTH gate |
+/// | `auth_required` | [`SmtpConfig`] | **yes** (default) | Submission-style AUTH gate; `.auth_required(false)` to disable |
 /// | `store` | [`SmtpConfig`] | no | CredentialStore for AUTH (full SASL mechanism set) |
 /// | TLS | [`SmtpConfig`] | no | STARTTLS / implicit SMTPS |
 pub struct LocalDeliveryService {

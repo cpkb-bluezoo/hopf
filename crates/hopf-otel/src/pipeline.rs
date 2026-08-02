@@ -178,6 +178,14 @@ impl TelemetryHook for Hook {
             msg.to_string(),
         ));
     }
+
+    fn on_warn(&self, msg: &str) {
+        self.0.try_send_log(TelemetryEvent::new(
+            EventKind::Warn,
+            None,
+            msg.to_string(),
+        ));
+    }
 }
 
 #[cfg(test)]
