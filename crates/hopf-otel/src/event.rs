@@ -16,6 +16,8 @@ pub enum EventKind {
     Close,
     /// Error (ACL, rate limit, I/O, …).
     Error,
+    /// Non-fatal warning (misconfiguration, open relay without CIDRs, …).
+    Warn,
 }
 
 /// One telemetry event (log-oriented).
@@ -46,6 +48,7 @@ impl TelemetryEvent {
     pub fn severity_number(&self) -> i32 {
         match self.kind {
             EventKind::Error => 17,
+            EventKind::Warn => 13,
             EventKind::Close => 9,
             EventKind::Accept | EventKind::Dial => 9,
         }
@@ -55,6 +58,7 @@ impl TelemetryEvent {
     pub fn severity_text(&self) -> &'static str {
         match self.kind {
             EventKind::Error => "ERROR",
+            EventKind::Warn => "WARN",
             _ => "INFO",
         }
     }
@@ -66,6 +70,7 @@ impl TelemetryEvent {
             EventKind::Dial => "connection.dial",
             EventKind::Close => "connection.close",
             EventKind::Error => "connection.error",
+            EventKind::Warn => "runtime.warn",
         }
     }
 }

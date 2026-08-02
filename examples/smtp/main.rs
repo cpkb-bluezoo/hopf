@@ -24,7 +24,7 @@ fn main() -> io::Result<()> {
         .nth(2)
         .unwrap_or_else(|| "localhost".into());
 
-    let config = SmtpConfig::new(addr, hostname.clone());
+    let config = SmtpConfig::new(addr, hostname.clone()).auth_required(false);
     let service = SmtpService::new(config);
 
     let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);

@@ -40,7 +40,7 @@ fn wait_for(pred: impl Fn() -> bool, max_ms: u64) -> bool {
 
 fn start_accept_all(capture: Arc<Mutex<Vec<u8>>>) -> (Arc<Runtime>, SocketAddr) {
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let config = SmtpConfig::new(listen, "test.example.com");
+    let config = SmtpConfig::new(listen, "test.example.com").auth_required(false);
     let handler = AcceptAllSmtpHandler::new("test.example.com").with_capture(capture);
     let factory = Arc::new(AcceptAllSmtpHandlerFactory::new(handler));
     let service = SmtpService::with_handler_factory(config, factory);
@@ -114,7 +114,9 @@ fn client_starttls_send() {
 
     let capture = Arc::new(Mutex::new(Vec::new()));
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let config = SmtpConfig::new(listen, "test.example.com").with_tls(acceptor);
+    let config = SmtpConfig::new(listen, "test.example.com")
+        .auth_required(false)
+        .with_tls(acceptor);
     let handler = AcceptAllSmtpHandler::new("test.example.com").with_capture(Arc::clone(&capture));
     let factory = Arc::new(AcceptAllSmtpHandlerFactory::new(handler));
     let service = SmtpService::with_handler_factory(config, factory);
@@ -404,7 +406,7 @@ fn simple_relay_mx_to_local_sink() {
     dns.open().unwrap();
 
     let relay_listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let config = SmtpConfig::new(relay_listen, "relay.example.com");
+    let config = SmtpConfig::new(relay_listen, "relay.example.com").auth_required(false);
     let relay =
         SimpleRelayService::with_resolver(config, Arc::clone(&rt), dns, sink_addr.port());
     let relay_addr = relay.start(Arc::clone(&rt)).unwrap();
@@ -506,7 +508,7 @@ fn simple_relay_accepts_transaction_on_partial_domain_success() {
     dns.open().unwrap();
 
     let relay_listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let config = SmtpConfig::new(relay_listen, "relay.example.com");
+    let config = SmtpConfig::new(relay_listen, "relay.example.com").auth_required(false);
     let relay = SimpleRelayService::with_resolver(config, Arc::clone(&rt), dns, sink_addr.port());
     let relay_addr = relay.start(Arc::clone(&rt)).unwrap();
 
@@ -563,7 +565,7 @@ fn local_delivery_appends_to_maildir() {
     let factory = Arc::new(MaildirFactory::new(dir.path()));
     let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let config = SmtpConfig::new(listen, "mail.example.com");
+    let config = SmtpConfig::new(listen, "mail.example.com").auth_required(false);
     let svc = LocalDeliveryService::new(config, Arc::clone(&rt), factory, "example.com");
     let addr = svc.start(Arc::clone(&rt)).unwrap();
 
@@ -793,7 +795,7 @@ mod dmarc_pipeline {
         dns.open().unwrap();
 
         let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let config = SmtpConfig::new(listen, "test.example.com");
+        let config = SmtpConfig::new(listen, "test.example.com").auth_required(false);
         let factory = Arc::new(DmarcTestHandlerFactory {
             hostname: "test.example.com".to_string(),
             dns,

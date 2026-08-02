@@ -51,7 +51,9 @@ fn main() -> io::Result<()> {
     let credentials = Arc::new(PasswordStore::new().with_user("alice", "secret"));
 
     let smtp = LocalDeliveryService::new(
-        SmtpConfig::new(smtp_addr, hostname.clone()),
+        SmtpConfig::new(smtp_addr, hostname.clone())
+            .with_store(credentials.clone())
+            .auth_required(true),
         Arc::clone(&rt),
         mailbox_factory.clone(),
         local_domain.clone(),

@@ -30,7 +30,7 @@ fn main() -> io::Result<()> {
 
     let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
     let factory = Arc::new(MaildirFactory::new(&mail_root));
-    let config = SmtpConfig::new(addr, hostname.clone());
+    let config = SmtpConfig::new(addr, hostname.clone()).auth_required(false);
     let svc = LocalDeliveryService::new(config, Arc::clone(&rt), factory, local_domain.clone());
     let bound = svc.start(Arc::clone(&rt))?;
 
