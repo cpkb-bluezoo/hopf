@@ -351,17 +351,19 @@ TelemetryHook enqueue    InstrumentedServerFactory
 <span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a><span class="co">// Later:</span></span>
 <span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>pipeline<span class="op">.</span>flush()<span class="op">;</span></span>
 <span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>pipeline<span class="op">.</span>shutdown()<span class="op">;</span></span></code></pre></div>
-<p>Accessors: <code>pipeline.hook()</code>, <code>pipeline.http_metrics()</code>, <code>pipeline.smtp_metrics()</code>, <code>pipeline.ftp_metrics()</code>, <code>pipeline.export_handle()</code>.</p>
+<p>Accessors: <code>pipeline.hook()</code>, <code>pipeline.http_metrics()</code>, <code>pipeline.smtp_metrics()</code>, <code>pipeline.ftp_metrics()</code>, <code>pipeline.pop3_metrics()</code>, <code>pipeline.imap_metrics()</code>, <code>pipeline.export_handle()</code>.</p>
 <h2 id="examples">Examples</h2>
 <p>No standalone example crate. README-style snippet:</p>
 <div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="pp">OtelConfig::</span>new(<span class="st">&quot;echo&quot;</span>)<span class="op">.</span>with_otlp_endpoint(<span class="st">&quot;http://127.0.0.1:4318&quot;</span>)</span></code></pre></div>
-<p>Use with any HTTP cookbook page (<a href="cookbook/http-hello-get.html">HTTP hello / get</a>) by wrapping the server factory. For SMTP or FTP, call <code>SmtpService::with_telemetry(&amp;pipeline)</code> / <code>FtpService::with_telemetry(&amp;pipeline)</code> so handlers see <code>traceparent</code> on connection metadata and OTLP metrics are emitted.</p>
+<p>Use with any HTTP cookbook page (<a href="cookbook/http-hello-get.html">HTTP hello / get</a>) by wrapping the server factory. For SMTP, FTP, POP3, or IMAP, call <code>*Service::with_telemetry(&amp;pipeline)</code> so handlers see <code>traceparent</code> on connection metadata and OTLP metrics are emitted.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li>Connection Accept/Dial/Close logs apply to every protocol via <code>TelemetryHook</code>.</li>
 <li>HTTP Stream RED metrics and SERVER spans: <code>InstrumentedServerFactory</code>.</li>
 <li>SMTP transaction duration histograms and handler <code>traceparent</code>: <code>SmtpService::with_telemetry</code> (see <a href="smtp.html#metrics">SMTP metrics</a>).</li>
-<li>FTP transfer duration histograms and handler <code>traceparent</code>: <code>FtpService::with_telemetry</code> (see <a href="ftp.html#metrics">FTP metrics</a>). POP3/IMAP/MQTT protocol-level duration metrics are not yet wired (#138 follow-ups).</li>
+<li>FTP transfer duration histograms and handler <code>traceparent</code>: <code>FtpService::with_telemetry</code> (see <a href="ftp.html#metrics">FTP metrics</a>).</li>
+<li>POP3 retrieve duration histograms and handler <code>traceparent</code>: <code>Pop3Service::with_telemetry</code> (see <a href="pop3.html#metrics">POP3 metrics</a>).</li>
+<li>IMAP command duration histograms and handler <code>traceparent</code>: <code>ImapService::with_telemetry</code> (see <a href="imap.html#metrics">IMAP metrics</a>). MQTT protocol-level duration metrics are not yet wired (#138 follow-ups).</li>
 <li>Bounded queue <strong>drops</strong> on overflow.</li>
 <li><code>flush()</code> sleeps ~50 ms to let the worker drain.</li>
 <li>OTLP is <strong>HTTP/protobuf only</strong> (no gRPC OTLP exporter).</li>

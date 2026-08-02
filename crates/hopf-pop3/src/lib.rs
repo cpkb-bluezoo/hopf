@@ -20,10 +20,10 @@ pub mod client;
 mod integration;
 
 pub use server::{
-    AuthenticateState, AuthorizationHandler, ClientConnected,
-    ConnectedState, DefaultPop3Handler, DefaultPop3HandlerFactory, ListState, ListWriter,
-    MailboxStatusState, MarkDeletedState, Pop3Command, Pop3Config, Pop3ControlHandler,
-    Pop3DotStuffer, Pop3HandlerFactory, Pop3ServerLexer, Pop3ServerMetrics, Pop3Service, Pop3SessionState,
+    AuthenticateState, AuthorizationHandler, ClientConnected, ConnectedState, DefaultPop3Handler,
+    DefaultPop3HandlerFactory, ListState, ListWriter, MailboxStatusState, MarkDeletedState,
+    Pop3Command, Pop3Config, Pop3ConnectionMetadata, Pop3ControlHandler, Pop3DotStuffer,
+    Pop3HandlerFactory, Pop3ServerLexer, Pop3ServerMetrics, Pop3Service, Pop3SessionState,
     ResetState, RetrieveState, TopState, TransactionHandler, UidlState, UidlWriter, UpdateState,
     DEFAULT_TRANSACTION_TIMEOUT, MAX_COMMAND_LINE,
 };

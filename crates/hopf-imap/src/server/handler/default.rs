@@ -3,7 +3,6 @@
 //! Default IMAP handler that authorises every request via `proceed`.
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -12,9 +11,9 @@ use hopf_mailbox::{Flag, Mailbox, MailboxFactory, MailboxStore, MessageSet, Sear
 use super::{
     AppendState, AuthenticateState, AuthenticatedHandler, ClientConnected, CloseState,
     ConnectedState, CopyState, CreateState, DeleteState, ExpungeState, FetchState,
-    ImapHandlerFactory, ListState, MoveState, NotAuthenticatedHandler, QuotaState, RenameState,
-    SearchState, SelectState, SelectedHandler, StatusState, StoreAction, StoreState,
-    SubscribeState,
+    ImapConnectionMetadata, ImapHandlerFactory, ListState, MoveState, NotAuthenticatedHandler,
+    QuotaState, RenameState, SearchState, SelectState, SelectedHandler, StatusState, StoreAction,
+    StoreState, SubscribeState,
 };
 use crate::server::fetch_format::FetchItem;
 use crate::server::quota::QuotaManager;
@@ -59,13 +58,7 @@ pub struct DefaultImapHandler {
 }
 
 impl ClientConnected for DefaultImapHandler {
-    fn connected(
-        &mut self,
-        state: &mut dyn ConnectedState,
-        _peer: SocketAddr,
-        _local: SocketAddr,
-        _tls: bool,
-    ) {
+    fn connected(&mut self, state: &mut dyn ConnectedState, _meta: &ImapConnectionMetadata) {
         if let Some(user) = self.preauth_username.as_deref() {
             state.accept_preauth(&self.greeting, user, Box::new(self.clone()));
         } else {

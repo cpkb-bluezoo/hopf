@@ -13,6 +13,24 @@ pub use state::{
 
 use hopf_mailbox::{Mailbox, MailboxFactory};
 
+/// Per-connection metadata visible to handlers.
+#[derive(Debug, Clone)]
+pub struct Pop3ConnectionMetadata {
+    /// Client address.
+    pub peer: std::net::SocketAddr,
+    /// Local control address.
+    pub local: std::net::SocketAddr,
+    /// Control channel has TLS.
+    pub tls: bool,
+    /// W3C `traceparent` for the active span when OTel traces are enabled.
+    ///
+    /// Pass to outbound HTTP clients (for example
+    /// `hopf_otel::with_traceparent`) so microservice calls continue the
+    /// distributed trace. Timing/duration stay in telemetry — this field is
+    /// propagation identity only.
+    pub traceparent: Option<String>,
+}
+
 /// Factory for the initial [`ClientConnected`] stage.
 pub trait Pop3HandlerFactory: Send + Sync {
     /// Create a handler for a new connection.
@@ -22,13 +40,7 @@ pub trait Pop3HandlerFactory: Send + Sync {
 /// Entry point after TCP (and optional implicit TLS) accept.
 pub trait ClientConnected: Send {
     /// New connection; call accept/reject on `state`.
-    fn connected(
-        &mut self,
-        state: &mut dyn ConnectedState,
-        peer: std::net::SocketAddr,
-        local: std::net::SocketAddr,
-        tls: bool,
-    );
+    fn connected(&mut self, state: &mut dyn ConnectedState, meta: &Pop3ConnectionMetadata);
     /// Connection closed.
     fn disconnected(&mut self);
 }

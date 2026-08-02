@@ -335,6 +335,196 @@ impl FtpServerMetrics {
     }
 }
 
+/// POP3 server metrics instruments (OTLP export).
+pub struct Pop3ServerMetrics {
+    export: ExportHandle,
+    active_connections: AtomicI64,
+}
+
+impl Pop3ServerMetrics {
+    /// Create with export handle.
+    pub fn new(export: ExportHandle) -> Arc<Self> {
+        Arc::new(Self {
+            export,
+            active_connections: AtomicI64::new(0),
+        })
+    }
+
+    /// Control connection accepted.
+    pub fn connection_opened(&self) {
+        let v = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "pop3.server.connections",
+            attributes: Vec::new(),
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "pop3.server.active_connections",
+            attributes: Vec::new(),
+            value: v,
+        });
+    }
+
+    /// Control connection closed.
+    pub fn connection_closed(&self) {
+        let v = self.active_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "pop3.server.active_connections",
+            attributes: Vec::new(),
+            value: v.max(0),
+        });
+    }
+
+    /// USER/PASS / APOP / AUTH attempt finished.
+    pub fn auth(&self, ok: bool) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "pop3.server.auth",
+            attributes: vec![(
+                "result".into(),
+                if ok { "ok" } else { "fail" }.into(),
+            )],
+            value: 1,
+        });
+    }
+
+    /// STLS upgrade completed.
+    pub fn stls(&self) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "pop3.server.stls",
+            attributes: Vec::new(),
+            value: 1,
+        });
+    }
+
+    /// DELE mark applied.
+    pub fn dele(&self) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "pop3.server.dele",
+            attributes: Vec::new(),
+            value: 1,
+        });
+    }
+
+    /// RETR or TOP retrieve finished.
+    ///
+    /// `kind` is typically `"retr"` or `"top"`. `outcome` is `"ok"` or `"fail"`.
+    pub fn retrieve_completed(
+        &self,
+        kind: &str,
+        outcome: &str,
+        duration: std::time::Duration,
+        bytes: u64,
+    ) {
+        let kind_a = ("pop3.retrieve.kind".into(), kind.into());
+        let out_a = ("outcome".into(), outcome.into());
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "pop3.server.retrieves",
+            attributes: vec![kind_a.clone(), out_a.clone()],
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::Histogram {
+            name: "pop3.server.retrieve.duration",
+            unit: "ms",
+            attributes: vec![kind_a.clone(), out_a],
+            value: duration.as_secs_f64() * 1000.0,
+        });
+        if outcome == "ok" && bytes > 0 {
+            self.export.try_send_metric(MetricPoint::Histogram {
+                name: "pop3.server.retrieve.size",
+                unit: "By",
+                attributes: vec![kind_a],
+                value: bytes as f64,
+            });
+        }
+    }
+}
+
+/// IMAP server metrics instruments (OTLP export).
+pub struct ImapServerMetrics {
+    export: ExportHandle,
+    active_connections: AtomicI64,
+}
+
+impl ImapServerMetrics {
+    /// Create with export handle.
+    pub fn new(export: ExportHandle) -> Arc<Self> {
+        Arc::new(Self {
+            export,
+            active_connections: AtomicI64::new(0),
+        })
+    }
+
+    /// Control connection accepted.
+    pub fn connection_opened(&self) {
+        let v = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "imap.server.connections",
+            attributes: Vec::new(),
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "imap.server.active_connections",
+            attributes: Vec::new(),
+            value: v,
+        });
+    }
+
+    /// Control connection closed.
+    pub fn connection_closed(&self) {
+        let v = self.active_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "imap.server.active_connections",
+            attributes: Vec::new(),
+            value: v.max(0),
+        });
+    }
+
+    /// LOGIN / AUTHENTICATE attempt finished.
+    pub fn auth(&self, ok: bool) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "imap.server.auth",
+            attributes: vec![(
+                "result".into(),
+                if ok { "ok" } else { "fail" }.into(),
+            )],
+            value: 1,
+        });
+    }
+
+    /// STARTTLS completed.
+    pub fn starttls(&self) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "imap.server.starttls",
+            attributes: Vec::new(),
+            value: 1,
+        });
+    }
+
+    /// One tagged command finished.
+    ///
+    /// `verb` is the IMAP command name (e.g. `"FETCH"`). `outcome` is `"ok"` or `"fail"`.
+    pub fn command_completed(
+        &self,
+        verb: &str,
+        outcome: &str,
+        duration: std::time::Duration,
+    ) {
+        let verb_a = ("imap.command.verb".into(), verb.into());
+        let out_a = ("outcome".into(), outcome.into());
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "imap.server.commands",
+            attributes: vec![verb_a.clone(), out_a.clone()],
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::Histogram {
+            name: "imap.server.command.duration",
+            unit: "ms",
+            attributes: vec![verb_a, out_a],
+            value: duration.as_secs_f64() * 1000.0,
+        });
+    }
+}
+
 /// Timing helper for one request / transaction.
 #[derive(Debug)]
 pub struct RequestTimer {
@@ -416,6 +606,65 @@ mod tests {
         let body = std::fs::read_to_string(&dir).unwrap_or_default();
         assert!(
             body.contains("ftp.server.transfer.duration"),
+            "missing duration metric: {body}"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn pop3_retrieve_emits_duration_to_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-otel-pop3-tx-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let cfg = OtelConfig::new("pop3-tx-test").with_jsonl_metrics(&dir);
+        let (handle, join, _running) = spawn_worker(cfg);
+        let metrics = Pop3ServerMetrics::new(handle.clone());
+        metrics.connection_opened();
+        metrics.retrieve_completed(
+            "retr",
+            "ok",
+            std::time::Duration::from_millis(7),
+            100,
+        );
+        metrics.connection_closed();
+        handle.flush();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        handle.shutdown();
+        let _ = join.join();
+        let body = std::fs::read_to_string(&dir).unwrap_or_default();
+        assert!(
+            body.contains("pop3.server.retrieve.duration"),
+            "missing duration metric: {body}"
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn imap_command_emits_duration_to_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-otel-imap-cmd-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let cfg = OtelConfig::new("imap-cmd-test").with_jsonl_metrics(&dir);
+        let (handle, join, _running) = spawn_worker(cfg);
+        let metrics = ImapServerMetrics::new(handle.clone());
+        metrics.connection_opened();
+        metrics.command_completed(
+            "FETCH",
+            "ok",
+            std::time::Duration::from_millis(9),
+        );
+        metrics.connection_closed();
+        handle.flush();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        handle.shutdown();
+        let _ = join.join();
+        let body = std::fs::read_to_string(&dir).unwrap_or_default();
+        assert!(
+            body.contains("imap.server.command.duration"),
             "missing duration metric: {body}"
         );
         let _ = std::fs::remove_file(&dir);
