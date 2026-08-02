@@ -81,6 +81,7 @@
 <li><a href="#configuration">Configuration</a></li>
 <li><a href="#wiring-apis">Wiring APIs</a></li>
 <li><a href="#examples">Examples</a></li>
+<li><a href="#telemetry">Telemetry</a></li>
 <li><a href="#limitations">Limitations</a></li>
 </ul></div>
 <h2 id="standards">Standards</h2>
@@ -410,6 +411,15 @@
 </tbody>
 </table>
 <p>Smoke: <code>cargo test -p hopf-dns --features integration</code> (<code>tests/resolver_stub.rs</code>).</p>
+<h2 id="telemetry">Telemetry</h2>
+<p>DNS is <strong>not</strong> wired for W3C Trace Context propagation the way HTTP (and Hopf’s mail/MQTT services) are. There is no IETF standard for carrying <code>traceparent</code> on DNS queries; experimental EDNS options (e.g. PowerDNS TRACEPARENT) are out of scope.</p>
+<p>What is typical in practice — and what Hopf supports today:</p>
+<ul>
+<li><strong>Connection logs</strong> — Accept/Dial/Close for DNS listeners and client dials still flow through <code>TelemetryHook</code> when the runtime is started with a <a href="telemetry.html">telemetry pipeline</a>.</li>
+<li><strong>Local server counters</strong> — <code>DnsService::metrics()</code> exposes process-local query/cookie stats (not OTLP instruments).</li>
+<li><strong>Optional client spans</strong> — applications may time a DNS lookup as a child span under an HTTP or protocol request; that is local timing only and does not continue a distributed trace across the DNS hop.</li>
+</ul>
+<p>See <a href="telemetry.html#dns">Telemetry: DNS</a> for the same guidance from the OTel side.</p>
 <h2 id="limitations">Limitations</h2>
 <p>Explicitly <strong>out of scope</strong> (Gumdrop parity):</p>
 <ul>
@@ -424,6 +434,7 @@
 <ul>
 <li><code>process_query_sync</code> blocks on upstream (forwarder).</li>
 <li>Server addresses must be pre-resolved IPs.</li>
+<li>No W3C Trace Context on the DNS wire (see <a href="#telemetry">Telemetry</a>).</li>
 </ul>
 
       <p class="footer">
