@@ -72,6 +72,8 @@ struct SmtpSendState {
     rcpt_idx: usize,
     /// Count of accepted recipients.
     accepted_rcpts: usize,
+    /// PIPELINING group failed (e.g. MAIL rejected); drain replies then quit.
+    pipeline_abort: bool,
     /// Completion callback.
     on_complete: Option<Box<dyn FnOnce(bool) + Send>>,
 }
@@ -119,6 +121,7 @@ impl SmtpSend {
             sasl_client: None,
             rcpt_idx: 0,
             accepted_rcpts: 0,
+            pipeline_abort: false,
             on_complete: None,
         })))
     }
@@ -333,6 +336,23 @@ impl SmtpSendDriver {
             }
         }
     }
+
+    /// Start MAIL FROM, optionally pipelining RCPT(+DATA) when advertised.
+    fn begin_mail(&self, session: &mut dyn SmtpClientSession) {
+        let mut st = self.state.lock().unwrap();
+        let sender = st.sender.clone();
+        let params = st.mail_params.clone();
+        let recipients = st.recipients.clone();
+        let pipelining = session.capabilities().pipelining;
+        let chunking = session.capabilities().chunking;
+        if pipelining {
+            st.rcpt_idx = recipients.len();
+        }
+        drop(st);
+        // With CHUNKING, defer DATA/BDAT until all RCPT replies arrive.
+        let defer_data = chunking;
+        session.start_mail(sender.as_deref(), &params, &recipients, defer_data);
+    }
 }
 
 impl SmtpClientDriver for SmtpSendDriver {
@@ -394,7 +414,6 @@ impl SmtpClientDriver for SmtpSendDriver {
         }
 
         // Proceed to envelope.
-        let sender = st.sender.clone();
         let params = st.mail_params.clone();
         if params.require_tls && !caps.require_tls {
             drop(st);
@@ -421,7 +440,7 @@ impl SmtpClientDriver for SmtpSendDriver {
             }
         }
         drop(st);
-        session.mail_from(sender.as_deref(), &params);
+        self.begin_mail(session);
     }
 
     fn on_ehlo_not_supported(
@@ -439,11 +458,7 @@ impl SmtpClientDriver for SmtpSendDriver {
     }
 
     fn on_helo(&mut self, session: &mut dyn SmtpClientSession, _ep: &mut dyn Endpoint) {
-        let st = self.state.lock().unwrap();
-        let sender = st.sender.clone();
-        let params = st.mail_params.clone();
-        drop(st);
-        session.mail_from(sender.as_deref(), &params);
+        self.begin_mail(session);
     }
 
     fn on_helo_error(&mut self, ep: &mut dyn Endpoint, _message: &str) {
@@ -476,11 +491,7 @@ impl SmtpClientDriver for SmtpSendDriver {
     }
 
     fn on_auth_ok(&mut self, session: &mut dyn SmtpClientSession, _ep: &mut dyn Endpoint) {
-        let st = self.state.lock().unwrap();
-        let sender = st.sender.clone();
-        let params = st.mail_params.clone();
-        drop(st);
-        session.mail_from(sender.as_deref(), &params);
+        self.begin_mail(session);
     }
 
     fn on_auth_challenge(
@@ -543,6 +554,10 @@ impl SmtpClientDriver for SmtpSendDriver {
     }
 
     fn on_mail_ok(&mut self, envelope: &mut dyn SmtpClientEnvelope, _ep: &mut dyn Endpoint) {
+        if envelope.awaiting_more_replies() {
+            // PIPELINING: RCPT(+DATA) already queued.
+            return;
+        }
         // Send first recipient.
         let rcpt = {
             let st = self.state.lock().unwrap();
@@ -565,6 +580,10 @@ impl SmtpClientDriver for SmtpSendDriver {
         _code: u16,
         _message: &str,
     ) {
+        if session.awaiting_more_replies() {
+            self.state.lock().unwrap().pipeline_abort = true;
+            return;
+        }
         self.complete(false);
         session.quit();
     }
@@ -575,10 +594,18 @@ impl SmtpClientDriver for SmtpSendDriver {
         _ep: &mut dyn Endpoint,
         _recipient: &str,
     ) {
+        self.state.lock().unwrap().accepted_rcpts += 1;
+        if envelope.awaiting_more_replies() {
+            return;
+        }
+        if self.state.lock().unwrap().pipeline_abort {
+            self.complete(false);
+            envelope.quit();
+            return;
+        }
         // Try next recipient or start DATA/BDAT.
         let next = {
             let mut st = self.state.lock().unwrap();
-            st.accepted_rcpts += 1;
             let idx = st.rcpt_idx;
             st.rcpt_idx += 1;
             st.recipients.get(idx).cloned()
@@ -598,6 +625,14 @@ impl SmtpClientDriver for SmtpSendDriver {
         _code: u16,
         _message: &str,
     ) {
+        if envelope.awaiting_more_replies() {
+            return;
+        }
+        if self.state.lock().unwrap().pipeline_abort {
+            self.complete(false);
+            envelope.quit();
+            return;
+        }
         // Try next recipient even if this one was rejected.
         let next = {
             let mut st = self.state.lock().unwrap();
@@ -617,6 +652,13 @@ impl SmtpClientDriver for SmtpSendDriver {
     }
 
     fn on_ready_for_data(&mut self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint) {
+        if self.state.lock().unwrap().pipeline_abort {
+            // MAIL failed earlier in a pipelined group — close DATA without a body.
+            if !data.is_bdat_mode() {
+                data.end_message();
+            }
+            return;
+        }
         if data.is_bdat_mode() {
             self.send_next_bdat_chunk(data);
             return;

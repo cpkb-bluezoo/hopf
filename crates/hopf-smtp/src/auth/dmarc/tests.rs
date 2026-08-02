@@ -7,6 +7,8 @@ use super::*;
 #[derive(Default)]
 struct FakeDns {
     txt: HashMap<String, Vec<String>>,
+    /// Domains that exist for A lookups (anything else → NXDOMAIN).
+    a_exists: std::collections::HashSet<String>,
 }
 
 impl FakeDns {
@@ -15,6 +17,11 @@ impl FakeDns {
             .entry(name.to_ascii_lowercase())
             .or_default()
             .push(record.to_string());
+        self
+    }
+
+    fn with_a(mut self, name: &str) -> Self {
+        self.a_exists.insert(name.to_ascii_lowercase());
         self
     }
 }
@@ -26,8 +33,12 @@ impl DnsLookup for FakeDns {
             Some(v) => cb(Lookup::Answers(v.clone())),
         }
     }
-    fn query_a(&self, _name: &str, cb: Box<dyn FnOnce(Lookup<Ipv4Addr>) + Send>) {
-        cb(Lookup::NxDomain);
+    fn query_a(&self, name: &str, cb: Box<dyn FnOnce(Lookup<Ipv4Addr>) + Send>) {
+        if self.a_exists.contains(&name.to_ascii_lowercase()) {
+            cb(Lookup::Answers(vec![Ipv4Addr::new(127, 0, 0, 1)]));
+        } else {
+            cb(Lookup::NxDomain);
+        }
     }
     fn query_aaaa(&self, _name: &str, cb: Box<dyn FnOnce(Lookup<Ipv6Addr>) + Send>) {
         cb(Lookup::NxDomain);
@@ -153,10 +164,50 @@ fn neither_aligned_p_none_is_monitor_only() {
 
 #[test]
 fn subdomain_falls_back_to_org_domain_sp() {
-    let dns = FakeDns::default().with_txt("_dmarc.example.com", "v=DMARC1; p=none; sp=reject");
+    let dns = FakeDns::default()
+        .with_txt("_dmarc.example.com", "v=DMARC1; p=none; sp=reject")
+        .with_a("mail.example.com");
     let out = run(dns, "mail.example.com", SpfResult::Fail, None, vec![]);
     assert_eq!(out.policy, DmarcPolicy::Reject);
     assert_eq!(out.verdict, AuthVerdict::Reject);
+}
+
+#[test]
+fn np_applied_when_from_domain_nxdomain() {
+    let dns = FakeDns::default().with_txt(
+        "_dmarc.example.com",
+        "v=DMARC1; p=none; sp=quarantine; np=reject",
+    );
+    // No A record for nonexistent.example.com → NXDOMAIN → np=reject.
+    let out = run(
+        dns,
+        "nonexistent.example.com",
+        SpfResult::Fail,
+        None,
+        vec![],
+    );
+    assert_eq!(out.policy, DmarcPolicy::Reject);
+    assert_eq!(out.verdict, AuthVerdict::Reject);
+}
+
+#[test]
+fn np_ignored_when_from_domain_exists() {
+    let dns = FakeDns::default()
+        .with_txt(
+            "_dmarc.example.com",
+            "v=DMARC1; p=none; sp=quarantine; np=reject",
+        )
+        .with_a("mail.example.com");
+    let out = run(dns, "mail.example.com", SpfResult::Fail, None, vec![]);
+    assert_eq!(out.policy, DmarcPolicy::Quarantine);
+    assert_eq!(out.verdict, AuthVerdict::Quarantine);
+}
+
+#[test]
+fn psd_tag_parsed() {
+    let dns = FakeDns::default().with_txt("_dmarc.example.com", "v=DMARC1; p=none; psd=y");
+    let out = run(dns, "example.com", SpfResult::Pass, Some("example.com"), vec![]);
+    assert!(out.record.as_ref().unwrap().psd);
 }
 
 #[test]

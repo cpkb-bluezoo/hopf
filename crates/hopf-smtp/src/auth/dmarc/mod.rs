@@ -1,13 +1,11 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
 //! DMARC — Domain-based Message Authentication, Reporting, and Conformance
-//! (RFC 7489), plus `np=` from the in-progress DMARCbis revision.
+//! (RFC 7489), plus `np=` / `psd=` from the in-progress DMARCbis revision.
 //!
-//! Known, deliberate limitation: `np=` (policy for non-existent subdomains)
-//! is parsed and exposed on [`DmarcRecord`] but not applied, since applying
-//! it correctly requires an extra existence check (NXDOMAIN on the exact
-//! `From:` domain) this evaluator doesn't perform; `psd=` is not parsed at
-//! all — both are unfinished-draft DMARCbis features, not RFC 7489.
+//! `np=` (non-existent subdomain policy) is applied when the organizational
+//! domain's record is used and an A lookup for the exact `From:` domain
+//! returns NXDOMAIN. `psd=` is parsed and exposed on [`DmarcRecord`].
 
 pub mod aggregate;
 pub mod forensic;
@@ -89,15 +87,17 @@ pub enum Alignment {
     Relaxed,
 }
 
-/// Parsed `_dmarc` TXT record (RFC 7489 §6.4).
+/// Parsed `_dmarc` TXT record (RFC 7489 §6.4 / DMARCbis).
 #[derive(Debug, Clone)]
 pub struct DmarcRecord {
     /// `p=` — policy for the domain itself.
     pub p: DmarcPolicy,
     /// `sp=` — policy for subdomains (defaults to `p` when absent).
     pub sp: Option<DmarcPolicy>,
-    /// `np=` — policy for non-existent subdomains (DMARCbis; parsed, not enforced).
+    /// `np=` — policy for non-existent subdomains (DMARCbis).
     pub np: Option<DmarcPolicy>,
+    /// `psd=` — record is published for a Public Suffix Domain (DMARCbis).
+    pub psd: bool,
     /// `adkim=` — DKIM alignment mode (default relaxed).
     pub adkim: Alignment,
     /// `aspf=` — SPF alignment mode (default relaxed).
@@ -160,6 +160,7 @@ pub fn evaluate(
             Lookup::Answers(txts) => match select_record(&txts) {
                 Ok(text) => match parse_record(&text) {
                     Ok(record) => finish_with_record(
+                        Arc::clone(&dns_inner),
                         from_domain_cb,
                         false,
                         record,
@@ -176,6 +177,7 @@ pub fn evaluate(
             Lookup::NxDomain | Lookup::NoData => match psl.organizational_domain(&from_domain_cb) {
                 Some(org) if org != from_domain_cb => {
                     let org_query = format!("_dmarc.{org}");
+                    let dns2 = Arc::clone(&dns_inner);
                     dns_inner.query_txt(
                         &org_query,
                         Box::new(move |lookup2| match lookup2 {
@@ -185,6 +187,7 @@ pub fn evaluate(
                             Lookup::Answers(txts) => match select_record(&txts) {
                                 Ok(text) => match parse_record(&text) {
                                     Ok(record) => finish_with_record(
+                                        dns2,
                                         from_domain_cb,
                                         true,
                                         record,
@@ -222,6 +225,7 @@ fn empty_outcome(result: DmarcResult, from_domain: String) -> DmarcOutcome {
 
 #[allow(clippy::too_many_arguments)]
 fn finish_with_record(
+    dns: Arc<dyn DnsLookup>,
     from_domain: String,
     used_org_fallback: bool,
     record: DmarcRecord,
@@ -249,8 +253,46 @@ fn finish_with_record(
         DmarcResult::Fail
     };
 
+    // DMARCbis `np=`: when using the organizational domain's record, check
+    // whether the exact From: domain exists. NXDOMAIN → apply `np` (else `sp`).
+    if used_org_fallback && record.np.is_some() {
+        let from_check = from_domain.clone();
+        dns.query_a(
+            &from_check,
+            Box::new(move |lookup| {
+                match lookup {
+                    Lookup::TempError => {
+                        cb(empty_outcome(DmarcResult::TempError, from_domain));
+                    }
+                    Lookup::NxDomain => {
+                        emit_outcome(from_domain, result, record, true, true, cb);
+                    }
+                    Lookup::Answers(_) | Lookup::NoData => {
+                        emit_outcome(from_domain, result, record, true, false, cb);
+                    }
+                }
+            }),
+        );
+        return;
+    }
+
+    emit_outcome(from_domain, result, record, used_org_fallback, false, cb);
+}
+
+fn emit_outcome(
+    from_domain: String,
+    result: DmarcResult,
+    record: DmarcRecord,
+    used_org_fallback: bool,
+    from_domain_nxdomain: bool,
+    cb: DmarcCallback,
+) {
     let base_policy = if used_org_fallback {
-        record.sp.unwrap_or(record.p)
+        if from_domain_nxdomain {
+            record.np.unwrap_or_else(|| record.sp.unwrap_or(record.p))
+        } else {
+            record.sp.unwrap_or(record.p)
+        }
     } else {
         record.p
     };
@@ -380,6 +422,11 @@ fn parse_record(txt: &str) -> Result<DmarcRecord, ()> {
         Some(s) => Some(parse_policy(s)?),
         None => None,
     };
+    let psd = match tags.get("psd").map(|s| s.as_str()) {
+        Some("y") | Some("yes") => true,
+        Some("n") | Some("no") | None => false,
+        Some(_) => return Err(()),
+    };
     let adkim = match tags.get("adkim").map(|s| s.as_str()) {
         Some("s") => Alignment::Strict,
         Some("r") | None => Alignment::Relaxed,
@@ -420,6 +467,7 @@ fn parse_record(txt: &str) -> Result<DmarcRecord, ()> {
         p,
         sp,
         np,
+        psd,
         adkim,
         aspf,
         pct,
