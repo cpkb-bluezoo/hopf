@@ -419,4 +419,19 @@ mod tests {
         assert_eq!(child.span_context().trace_id, parsed.trace_id);
         assert_ne!(child.span_context().span_id, parsed.span_id);
     }
+
+    #[test]
+    fn child_span_shares_trace_id_and_updates_traceparent() {
+        let t = Trace::new("SMTP connection", SpanKind::Server);
+        let parent_tp = t.traceparent();
+        let parent_ctx = SpanContext::from_traceparent(&parent_tp).unwrap();
+        let child = t.start_span("SMTP transaction", SpanKind::Server);
+        let child_tp = t.traceparent();
+        let child_ctx = SpanContext::from_traceparent(&child_tp).unwrap();
+        assert_eq!(child_ctx.trace_id, parent_ctx.trace_id);
+        assert_ne!(child_ctx.span_id, parent_ctx.span_id);
+        child.end();
+        let after = SpanContext::from_traceparent(&t.traceparent()).unwrap();
+        assert_eq!(after.span_id, parent_ctx.span_id);
+    }
 }
