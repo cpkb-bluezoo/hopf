@@ -8,6 +8,7 @@
 //! caller's `receive` / `connected` / `security_established` method flushes
 //! the queue to the [`Endpoint`].
 
+use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
@@ -65,6 +66,15 @@ enum ProtoState {
     Error,
 }
 
+/// Outstanding command whose reply is still expected (RFC 2920 pipelining).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingCmd {
+    MailFrom,
+    RcptTo(String),
+    DataCommand,
+    Rset,
+}
+
 // ── SmtpClientEndpoint ────────────────────────────────────────────────────────
 
 /// Async SMTP client [`ProtocolHandler`].
@@ -96,6 +106,8 @@ pub struct SmtpClientEndpoint {
     accepted_rcpts: usize,
     /// Outbound command queue — flushed to the Endpoint after every callback.
     outbound: Vec<u8>,
+    /// FIFO of pipelined commands awaiting replies (MAIL/RCPT/DATA/RSET).
+    pending: VecDeque<PendingCmd>,
     /// Set when TLS STARTTLS handshake is in-flight and we need to arm greeting timer after.
     pending_tls: bool,
     /// Set by `SmtpClientAuthExchange::abort()`; the next reply in
@@ -136,6 +148,7 @@ impl SmtpClientEndpoint {
             message_timeout,
             accepted_rcpts: 0,
             outbound: Vec::with_capacity(512),
+            pending: VecDeque::new(),
             pending_tls: false,
             auth_aborting: false,
             pending_bdat: false,
@@ -155,6 +168,45 @@ impl SmtpClientEndpoint {
     fn write_line(&mut self, line: &str) {
         self.write_cmd(line.as_bytes());
         self.write_cmd(b"\r\n");
+    }
+
+    /// Queue a pipelinable command and arm the lexer if this is the head.
+    fn issue_pending(&mut self, cmd: PendingCmd, line: &str) {
+        let first = self.pending.is_empty();
+        self.pending.push_back(cmd);
+        self.write_line(line);
+        if first {
+            self.arm_pending_head();
+        }
+    }
+
+    /// Set `proto_state` / lexer expectation from the head of `pending`.
+    fn arm_pending_head(&mut self) {
+        match self.pending.front() {
+            Some(PendingCmd::MailFrom) => {
+                self.proto_state = ProtoState::MailFromSent;
+                self.lexer.expect(SmtpReplyShape::MailFrom);
+            }
+            Some(PendingCmd::RcptTo(r)) => {
+                self.proto_state = ProtoState::RcptToSent(r.clone());
+                self.lexer.expect(SmtpReplyShape::RcptTo);
+            }
+            Some(PendingCmd::DataCommand) => {
+                self.proto_state = ProtoState::DataCommandSent;
+                self.lexer.expect(SmtpReplyShape::DataCommand);
+            }
+            Some(PendingCmd::Rset) => {
+                self.proto_state = ProtoState::RsetSent;
+                self.lexer.expect(SmtpReplyShape::Rset);
+            }
+            None => {}
+        }
+    }
+
+    /// Pop the completed head command and arm the next pending reply, if any.
+    fn advance_pending(&mut self) {
+        self.pending.pop_front();
+        self.arm_pending_head();
     }
 
     /// Flush `outbound` to the endpoint and arm the stage timer.
@@ -423,11 +475,15 @@ impl SmtpClientEndpoint {
         };
         match event {
             SmtpEvent::MailOk => {
-                self.proto_state = ProtoState::Connected; // stays Connected (envelope phase)
+                self.proto_state = ProtoState::Connected;
+                self.advance_pending();
                 driver.on_mail_ok(self, ep);
             }
             SmtpEvent::MailRejected { code, message } => {
                 self.proto_state = ProtoState::Connected;
+                // Keep remaining pending replies queued — RFC 2920 requires
+                // draining every reply in a pipelined group.
+                self.advance_pending();
                 driver.on_mail_rejected(self, ep, code, &message);
             }
             _ => {}
@@ -445,10 +501,12 @@ impl SmtpClientEndpoint {
             SmtpEvent::RcptOk => {
                 self.accepted_rcpts += 1;
                 self.proto_state = ProtoState::Connected;
+                self.advance_pending();
                 driver.on_rcpt_ok(self, ep, &r);
             }
             SmtpEvent::RcptRejected { code, message } => {
                 self.proto_state = ProtoState::Connected;
+                self.advance_pending();
                 driver.on_rcpt_rejected(self, ep, &r, code, &message);
             }
             _ => {}
@@ -463,11 +521,13 @@ impl SmtpClientEndpoint {
         };
         match event {
             SmtpEvent::ReadyForData => {
+                let _ = self.pending.pop_front(); // DataCommand
                 self.proto_state = ProtoState::DataMode;
                 self.bdat_mode = false;
                 driver.on_ready_for_data(self, ep);
             }
             SmtpEvent::MessageRejected { code, message } => {
+                self.pending.clear();
                 self.proto_state = ProtoState::Connected;
                 driver.on_data_rejected(self, ep, code, &message);
             }
@@ -541,6 +601,7 @@ impl SmtpClientEndpoint {
         let _ = event;
         self.accepted_rcpts = 0;
         self.proto_state = ProtoState::Connected;
+        self.advance_pending();
         driver.on_rset_ok(self, ep);
         self.driver = Some(driver);
     }
@@ -700,9 +761,26 @@ impl SmtpClientSession for SmtpClientEndpoint {
             _ => "MAIL FROM:<>".to_string(),
         };
         arg.push_str(&params.render());
-        self.proto_state = ProtoState::MailFromSent;
-        self.lexer.expect(SmtpReplyShape::MailFrom);
-        self.write_line(&arg);
+        self.issue_pending(PendingCmd::MailFrom, &arg);
+    }
+
+    fn start_mail(
+        &mut self,
+        sender: Option<&str>,
+        params: &MailFromParams,
+        recipients: &[(String, DsnRecipientParams)],
+        defer_data: bool,
+    ) {
+        self.mail_from(sender, params);
+        if !self.caps.pipelining {
+            return;
+        }
+        for (r, p) in recipients {
+            SmtpClientEnvelope::rcpt_to(self, r, p);
+        }
+        if !defer_data && !self.caps.chunking {
+            SmtpClientEnvelope::start_data(self);
+        }
     }
 
     fn starttls(&mut self) {
@@ -742,6 +820,10 @@ impl SmtpClientSession for SmtpClientEndpoint {
     fn capabilities(&self) -> &SmtpCapabilities {
         &self.caps
     }
+
+    fn awaiting_more_replies(&self) -> bool {
+        !self.pending.is_empty()
+    }
 }
 
 // ── SmtpClientAuthExchange ────────────────────────────────────────────────────
@@ -767,17 +849,14 @@ impl SmtpClientAuthExchange for SmtpClientEndpoint {
 
 impl SmtpClientEnvelope for SmtpClientEndpoint {
     fn rcpt_to(&mut self, recipient: &str, params: &DsnRecipientParams) {
-        self.proto_state = ProtoState::RcptToSent(recipient.to_string());
-        self.lexer.expect(SmtpReplyShape::RcptTo);
         let mut arg = format!("RCPT TO:<{recipient}>");
         arg.push_str(&params.render());
-        self.write_line(&arg);
+        self.issue_pending(PendingCmd::RcptTo(recipient.to_string()), &arg);
     }
 
     fn rset(&mut self) {
-        self.proto_state = ProtoState::RsetSent;
-        self.lexer.expect(SmtpReplyShape::Rset);
-        self.write_line("RSET");
+        self.pending.clear();
+        self.issue_pending(PendingCmd::Rset, "RSET");
     }
 
     fn start_data(&mut self) {
@@ -786,10 +865,8 @@ impl SmtpClientEnvelope for SmtpClientEndpoint {
             self.pending_bdat = true;
             return;
         }
-        self.proto_state = ProtoState::DataCommandSent;
         self.bdat_mode = false;
-        self.lexer.expect(SmtpReplyShape::DataCommand);
-        self.write_line("DATA");
+        self.issue_pending(PendingCmd::DataCommand, "DATA");
     }
 
     fn has_accepted_recipients(&self) -> bool {

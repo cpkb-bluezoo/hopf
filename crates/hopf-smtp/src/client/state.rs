@@ -143,6 +143,20 @@ pub trait SmtpClientSession: SmtpClientHello {
     /// REQUIRETLS, MT-PRIORITY, FUTURERELEASE, DELIVERBY).
     fn mail_from(&mut self, sender: Option<&str>, params: &MailFromParams);
 
+    /// When PIPELINING is advertised, also queue all `RCPT TO` commands and
+    /// (unless `defer_data`) `DATA` in the same write. Otherwise only sends
+    /// `MAIL FROM` (lockstep — subsequent RCPT/DATA from reply callbacks).
+    fn start_mail(
+        &mut self,
+        sender: Option<&str>,
+        params: &MailFromParams,
+        recipients: &[(String, DsnRecipientParams)],
+        defer_data: bool,
+    ) {
+        let _ = (recipients, defer_data);
+        self.mail_from(sender, params);
+    }
+
     /// Send `STARTTLS`.
     fn starttls(&mut self);
 
@@ -161,6 +175,11 @@ pub trait SmtpClientSession: SmtpClientHello {
 
     /// Capabilities from the server's EHLO response.
     fn capabilities(&self) -> &SmtpCapabilities;
+
+    /// True when more pipelined replies are still outstanding (RFC 2920).
+    fn awaiting_more_replies(&self) -> bool {
+        false
+    }
 }
 
 /// Post-STARTTLS stage: must re-EHLO.
