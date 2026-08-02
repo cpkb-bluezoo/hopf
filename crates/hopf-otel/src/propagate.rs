@@ -64,6 +64,10 @@ impl ClientWriter for PropagatingClientWriter<'_> {
         self.inner.end_request_body();
     }
 
+    fn trailers(&mut self, headers: Headers) {
+        self.inner.trailers(headers);
+    }
+
     fn complete_request(&mut self) {
         self.inner.complete_request();
     }
@@ -109,6 +113,10 @@ impl ClientWriter for OwnedPropagatingClientWriter<'_> {
 
     fn end_request_body(&mut self) {
         self.inner.end_request_body();
+    }
+
+    fn trailers(&mut self, headers: Headers) {
+        self.inner.trailers(headers);
     }
 
     fn complete_request(&mut self) {
