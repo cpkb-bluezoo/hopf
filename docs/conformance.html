@@ -415,8 +415,8 @@
 <tr><td>5-byte length-prefixed framing, split-feed parsing</td><td>Compliant</td><td><code>framing.rs:104-282</code>, tested at arbitrary split points</td></tr>
 <tr><td>Compressed frames (flag ≠ 0) rejected</td><td>Compliant (matches declared scope)</td><td><code>framing.rs:225-231</code></td></tr>
 <tr><td>Max message size enforcement (4 MiB default, configurable)</td><td>Compliant</td><td><code>framing.rs:13,244-251</code>, <code>server.rs:175-177</code></td></tr>
-<tr><td><code>application/grpc</code> content-type, exact or prefix match</td><td>Compliant</td><td><code>server.rs:323-324</code></td></tr>
-<tr><td><code>+proto</code>/other subtype dispatch</td><td>Partial</td><td>Accepted by the prefix check but always decoded as protobuf regardless of declared subtype — a hypothetical <code>+json</code> request would be accepted then fail to decode</td></tr>
+<tr><td><code>application/grpc</code> / <code>application/grpc+proto</code> content-type</td><td>Compliant</td><td><code>is_supported_grpc_content_type</code> — exact media type (optional <code>;</code> params); case-insensitive</td></tr>
+<tr><td>Unsupported subtypes (e.g. <code>+json</code>) rejected</td><td>Compliant</td><td>HTTP 415 — only protobuf is decoded; no longer accepted via a loose <code>application/grpc</code> prefix</td></tr>
 <tr><td><code>POST /{service}/{method}</code> routing</td><td>Compliant</td><td><code>server.rs:330-333</code>, <code>proto_file.rs:42-54</code></td></tr>
 <tr><td><code>grpc-status</code>/<code>grpc-message</code> trailers (success) and Trailers-Only (error)</td><td>Compliant</td><td><code>server.rs:250-271</code></td></tr>
 <tr><td>Full gRPC status-code space representable</td><td>Compliant</td><td>Any caller-supplied code accepted; only <code>UNIMPLEMENTED</code>/<code>INTERNAL</code> auto-generated, no named enum for the other 15</td></tr>
