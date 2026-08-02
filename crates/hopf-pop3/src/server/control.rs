@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use hopf_auth::{create_server, CredentialStore, SaslServer, SaslServerOptions, SaslServerStep};
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
-use hopf_mailbox::{Mailbox, MailboxFactory, MailboxStore};
+use hopf_mailbox::{Mailbox, MailboxFactory, MailboxStore, MessageReadCallback};
 use rmimeparser::charset::base64;
 
 use crate::server::auth::{advertised_mechanisms, apop_timestamp, capa_sasl_line, verify_apop};
@@ -290,7 +290,9 @@ impl Pop3ControlHandler {
             "IMPLEMENTATION hopf".to_string(),
         ];
         if self.config.enable_utf8 {
-            lines.push("UTF8".to_string());
+            // RFC 6856 §2.2: USER argument means UTF-8 usernames/passwords
+            // are accepted (including before the UTF8 command).
+            lines.push("UTF8 USER".to_string());
         }
         if self.config.enable_pipelining {
             lines.push("PIPELINING".to_string());
@@ -326,6 +328,11 @@ impl Pop3ControlHandler {
                 endpoint,
                 reply::err("STLS only valid in AUTHORIZATION state"),
             );
+            return;
+        }
+        // RFC 6856 §2.1: clients MUST NOT issue STLS after UTF8; servers MAY reject.
+        if self.utf8 {
+            self.send(endpoint, reply::err("STLS not allowed after UTF8"));
             return;
         }
         if self.tls {
@@ -570,6 +577,13 @@ impl Pop3ControlHandler {
         Some(r)
     }
 
+    /// RFC 6856 §2.1 / §5: without UTF8 mode, refuse messages that contain
+    /// octets outside the ASCII repertoire (rather than inventing a surrogate).
+    fn message_requires_utf8(&mut self, message_number: u32) -> bool {
+        self.with_mailbox_mut(|mb, _| message_has_non_ascii(mb, message_number))
+            .unwrap_or(false)
+    }
+
     fn cmd_stat(&mut self, endpoint: &mut dyn Endpoint) {
         let Some(mut handler) = self.transaction.take() else {
             self.send(endpoint, reply::err("[SYS/PERM] No handler"));
@@ -593,6 +607,15 @@ impl Pop3ControlHandler {
     }
 
     fn cmd_list(&mut self, endpoint: &mut dyn Endpoint, n: Option<u32>) {
+        if let Some(msg) = n {
+            if !self.utf8 && self.message_requires_utf8(msg) {
+                self.send(
+                    endpoint,
+                    reply::err("[UTF8] UTF8 mode required to access this message"),
+                );
+                return;
+            }
+        }
         let Some(mut handler) = self.transaction.take() else {
             self.send(endpoint, reply::err("[SYS/PERM] No handler"));
             return;
@@ -642,6 +665,13 @@ impl Pop3ControlHandler {
             self.transaction = Some(handler);
         }
         if let Some(size) = self.pending_retr_offload.take() {
+            if !self.utf8 && self.message_requires_utf8(self.pending_msg) {
+                self.send(
+                    endpoint,
+                    reply::err("[UTF8] UTF8 mode required to retrieve this message"),
+                );
+                return;
+            }
             self.start_retr_offload(endpoint, size);
         }
     }
@@ -715,6 +745,13 @@ impl Pop3ControlHandler {
             self.transaction = Some(handler);
         }
         if let Some(lines) = self.pending_top_offload.take() {
+            if !self.utf8 && self.message_requires_utf8(self.pending_msg) {
+                self.send(
+                    endpoint,
+                    reply::err("[UTF8] UTF8 mode required to retrieve this message"),
+                );
+                return;
+            }
             self.start_top_offload(endpoint, lines);
         }
     }
@@ -1500,6 +1537,27 @@ impl<F: FnMut(&[u8])> hopf_mailbox::MessageReadCallback for TopPushCallback<F> {
     }
 }
 
+/// Scan a message for any non-ASCII octet (RFC 6856 "UTF-8 string" content).
+fn message_has_non_ascii(mb: &mut dyn Mailbox, message_number: u32) -> bool {
+    struct Scan {
+        found: bool,
+    }
+    impl MessageReadCallback for Scan {
+        fn message_content(&mut self, chunk: &[u8]) -> bool {
+            if chunk.iter().any(|b| !b.is_ascii()) {
+                self.found = true;
+                return false;
+            }
+            true
+        }
+    }
+    let mut scan = Scan { found: false };
+    match mb.read_message(message_number, &mut scan) {
+        Ok(()) => scan.found,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod top_streaming_tests {
     use std::collections::BTreeSet;
@@ -1597,5 +1655,39 @@ mod top_streaming_tests {
             top,
             b"Subject: x\r\n\r\nline0\r\nline1\r\nline2\r\n.\r\n".to_vec()
         );
+    }
+}
+
+#[cfg(test)]
+mod utf8_scan_tests {
+    use std::collections::BTreeSet;
+
+    use hopf_mailbox::{AppendGuard, MailboxFactory};
+    use tempfile::tempdir;
+
+    use super::message_has_non_ascii;
+
+    fn mailbox_with(msg: &[u8]) -> (tempfile::TempDir, Box<dyn hopf_mailbox::Mailbox>) {
+        let dir = tempdir().unwrap();
+        let factory = hopf_mailbox::MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("utf8user").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        let mut guard = AppendGuard::start(mb.as_mut(), &BTreeSet::new(), None).unwrap();
+        guard.append_content(msg).unwrap();
+        guard.commit().unwrap();
+        (dir, mb)
+    }
+
+    #[test]
+    fn ascii_only_does_not_require_utf8() {
+        let (_dir, mut mb) = mailbox_with(b"Subject: hello\r\n\r\nbody\r\n");
+        assert!(!message_has_non_ascii(mb.as_mut(), 1));
+    }
+
+    #[test]
+    fn non_ascii_header_requires_utf8() {
+        let (_dir, mut mb) = mailbox_with("Subject: café\r\n\r\nbody\r\n".as_bytes());
+        assert!(message_has_non_ascii(mb.as_mut(), 1));
     }
 }
