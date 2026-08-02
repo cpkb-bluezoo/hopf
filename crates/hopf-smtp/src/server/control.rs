@@ -63,6 +63,8 @@ pub struct SmtpControlHandler {
     /// In-progress SASL exchange, between the `334` challenge and the
     /// client's continuation line.
     sasl: Option<Box<dyn SaslServer>>,
+    /// MAIL FROM commands seen this session (RFC 9422 MAILMAX counter).
+    mail_transactions: u32,
 }
 
 impl SmtpControlHandler {
@@ -112,6 +114,7 @@ impl SmtpControlHandler {
             deferred: Arc::new(std::sync::Mutex::new(None)),
             control_handle: None,
             sasl: None,
+            mail_transactions: 0,
         }
     }
 
@@ -195,6 +198,13 @@ impl SmtpControlHandler {
             "CHUNKING".into(),
             "BINARYMIME".into(),
             "DSN".into(),
+            "DELIVERBY".into(),
+            "MT-PRIORITY".into(),
+            "REQUIRETLS".into(),
+            format!(
+                "LIMITS RCPTMAX={} MAILMAX={}",
+                self.config.max_recipients, self.config.max_mail_transactions
+            ),
             "HELP".into(),
         ];
         if self.config.tls_acceptor.is_some() && !self.meta.tls && !self.config.implicit_tls {
@@ -360,6 +370,18 @@ impl SmtpControlHandler {
             self.send_enhanced(endpoint, 530, "5.7.0", "Authentication required");
             return;
         }
+        // RFC 9422 §4.1: MAILMAX counts every MAIL FROM, success or failure.
+        if self.mail_transactions >= self.config.max_mail_transactions {
+            self.send_enhanced(
+                endpoint,
+                452,
+                "4.5.3",
+                "Too many MAIL transactions in this session",
+            );
+            return;
+        }
+        self.mail_transactions = self.mail_transactions.saturating_add(1);
+
         let parsed = match parse_mail_from_arg(&format!("FROM:{}", strip_mail_prefix(arg))) {
             Ok(p) => p,
             Err(e) => {
@@ -382,6 +404,28 @@ impl SmtpControlHandler {
         if parsed.smtputf8 && !self.extended {
             self.send_enhanced(endpoint, 503, "5.5.1", "SMTPUTF8 requires EHLO");
             return;
+        }
+        // RFC 8689 §2: REQUIRETLS may only be used on a TLS-protected session.
+        if parsed.delivery.require_tls && !self.meta.tls {
+            self.send_enhanced(
+                endpoint,
+                530,
+                "5.7.10",
+                "REQUIRETLS requires a TLS-protected session",
+            );
+            return;
+        }
+        // RFC 2852: refuse a DELIVERBY deadline that has already passed.
+        if let Some(by) = &parsed.delivery.deliver_by {
+            if by.deadline <= std::time::SystemTime::now() {
+                self.send_enhanced(
+                    endpoint,
+                    501,
+                    "5.5.4",
+                    "DELIVERBY deadline has already passed",
+                );
+                return;
+            }
         }
         self.meta.smtputf8 = parsed.smtputf8;
         self.delivery = parsed.delivery.clone();

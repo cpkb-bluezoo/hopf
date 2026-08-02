@@ -571,11 +571,11 @@
 <tbody>
 <tr><td>SIZE (advertised + enforced), 8BITMIME, SMTPUTF8, PIPELINING, ENHANCEDSTATUSCODES</td><td>1870,6152,6531,2920,2034</td><td>Compliant</td><td>All wired end-to-end</td></tr>
 <tr><td>CHUNKING/BDAT, BINARYMIME</td><td>3030</td><td>Compliant</td><td><code>control.rs:511-591,660-691</code>, <code>data.rs:193-222</code></td></tr>
-<tr><td>DSN RET/ENVID (MAIL FROM), NOTIFY/ORCPT (RCPT TO)</td><td>3461 §4</td><td>Partial</td><td>Fully parsed into <code>DeliveryRequirements</code>/<code>DsnRecipientParams</code>, but neither stock handler (<code>LocalDeliveryHandler</code>, <code>SimpleRelayHandler</code>) ever acts on them — available to custom handlers via the SPI only, no DSN message is ever generated</td></tr>
-<tr><td>DELIVERBY, MT-PRIORITY</td><td>2852,6710</td><td>Partial</td><td>Parsed, not enforced by any stock handler</td></tr>
-<tr><td>REQUIRETLS</td><td>8689</td><td>Partial</td><td>Enforced only in <code>SimpleRelayHandler</code>, and only as an outright bounce rather than verified-TLS relay; not checked against the inbound session's own TLS state; <code>LocalDeliveryHandler</code> ignores it</td></tr>
+<tr><td>DSN RET/ENVID (MAIL FROM), NOTIFY/ORCPT (RCPT TO)</td><td>3461 §4</td><td>Compliant</td><td>Parsed into <code>DeliveryRequirements</code>/<code>DsnRecipientParams</code>; stock handlers generate RFC 3461 <code>multipart/report</code> DSNs honoring NOTIFY/RET/ENVID/ORCPT (null reverse-path → no DSN)</td></tr>
+<tr><td>DELIVERBY, MT-PRIORITY</td><td>2852,6710</td><td>Compliant</td><td>Advertised in EHLO; MT-PRIORITY −9..=9 validated at parse; past DELIVERBY deadline rejected at MAIL FROM and again at delivery in stock handlers</td></tr>
+<tr><td>REQUIRETLS</td><td>8689</td><td>Compliant</td><td>Advertised; inbound MAIL FROM rejected without TLS (530 5.7.10); stock handlers refuse REQUIRETLS off-TLS; relay attempts verified STARTTLS + REQUIRETLS to next hop when a TLS connector is configured</td></tr>
 <tr><td>FUTURERELEASE (HOLDFOR/HOLDUNTIL)</td><td>4865</td><td>Compliant (as rejection)</td><td>Parsed then explicitly rejected with 553 by both stock handlers rather than honored — documented</td></tr>
-<tr><td>LIMITS</td><td>9422</td><td>Not implemented</td><td>Not present at all</td></tr>
+<tr><td>LIMITS</td><td>9422</td><td>Compliant</td><td>EHLO advertises <code>LIMITS RCPTMAX=… MAILMAX=…</code>; session counters enforce both (<code>SmtpConfig::max_recipients</code> / <code>max_mail_transactions</code>)</td></tr>
 <tr><td>STARTTLS</td><td>3207</td><td>Compliant</td><td>Session/EHLO state correctly reset after upgrade</td></tr>
 <tr><td>AUTH mechanisms</td><td>4954</td><td>Compliant</td><td>Full <code>hopf-auth</code> mechanism set wired via <code>SaslMechanism::from_name</code> + <code>create_server</code> against a <code>CredentialStore</code> (<code>SmtpConfig::store</code>), matching hopf-pop3/hopf-imap's dispatcher pattern; EHLO's <code>AUTH</code> line lists each mechanism the store supports, filtered by TLS requirement, instead of a hardcoded <code>AUTH PLAIN</code></td></tr>
 <tr><td>AUTH requires TLS, AUTH abort (<code>*</code>)</td><td>4954</td><td>Compliant</td><td><code>control.rs:786-816</code></td></tr>
@@ -589,7 +589,7 @@
 <tbody>
 <tr><td>Staged handler SPI (connect→hello→mail→rcpt→data)</td><td>Compliant</td><td><code>handler/mod.rs:40-111</code></td></tr>
 <tr><td><code>SimpleRelayService</code> — open MX relay</td><td>Deferred (documented risk)</td><td>Accepts every recipient with no domain check at all (<code>relay/handler.rs:200-209</code>) — a genuine open relay, explicitly scoped to dev/test/closed-networks by the crate's own doc comment; must not be exposed to the public Internet</td></tr>
-<tr><td><code>SimpleRelayHandler</code> multi-domain reply semantics</td><td>Partial</td><td>A single 250/450 covers the whole transaction — if one recipient-domain succeeds, the transaction gets 250 even if other domains fully failed, with no DSN or per-recipient bounce</td></tr>
+<tr><td><code>SimpleRelayHandler</code> multi-domain reply semantics</td><td>Partial</td><td>A single 250/450 still covers the whole transaction at the SMTP reply layer, but per-recipient DSNs are generated for domains that failed (or succeeded when NOTIFY=SUCCESS)</td></tr>
 <tr><td><code>LocalDeliveryService</code> — APPEND to local INBOX via <code>hopf-mailbox</code></td><td>Compliant</td><td><code>mailbox/service.rs,handler.rs</code>, case-insensitive domain check at RCPT TO</td></tr>
 <tr><td>Local delivery multi-recipient failure semantics</td><td>Partial</td><td>Every recipient is attempted (doesn't abort on first failure), but the SMTP-level reply is a single 250/450 for the whole transaction — a failure to one recipient's mailbox after others already succeeded risks duplicate delivery on client retry</td></tr>
 </tbody>
@@ -602,7 +602,7 @@
 <tr><td>AUTH — <code>SmtpSend</code> auto-pilot drives the full mechanism menu</td><td>4954</td><td>Compliant</td><td><code>SmtpSendDriver::choose_mechanism</code> picks the strongest mechanism the server advertises (SCRAM-SHA-256 &gt; CRAM-MD5 &gt; PLAIN &gt; LOGIN) via <code>hopf-auth::create_client</code>; <code>on_auth_challenge</code> drives the full client-side exchange, including absorbing SCRAM's trailing <code>v=</code> verifier continuation — same pattern as hopf-pop3's <code>Pop3Fetch</code></td></tr>
 <tr><td><strong>True command pipelining (client sends ahead of replies)</strong></td><td>RFC 2920</td><td><strong>Not implemented</strong></td><td>The client state machine is strictly one-command/one-reply; <code>caps.pipelining</code> is parsed but never consulted to batch outbound commands</td></tr>
 <tr><td>BDAT/CHUNKING (client send)</td><td>3030</td><td>Not implemented</td><td>Capability parsed, never used — client always sends DATA</td></tr>
-<tr><td>MAIL FROM/RCPT TO ESMTP parameters (SIZE/BODY/RET/ENVID/REQUIRETLS/etc.)</td><td>various</td><td>Not implemented</td><td>Client API takes only the bare address — no parameter-passing surface at all, unlike the server which fully parses all of these on the inbound side</td></tr>
+<tr><td>MAIL FROM/RCPT TO ESMTP parameters (SIZE/BODY/RET/ENVID/REQUIRETLS/etc.)</td><td>various</td><td>Partial</td><td><code>SmtpSend::mail_from_params</code> / <code>MailFromParams</code> cover MAIL FROM extensions (including REQUIRETLS auto-STARTTLS); RCPT TO DSN params (NOTIFY/ORCPT) are not yet exposed on the client send API</td></tr>
 </tbody>
 </table>
 <h3>Email Authentication — SPF / DKIM / DMARC (<code>hopf_smtp::auth</code>)</h3>

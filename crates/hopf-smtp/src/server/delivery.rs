@@ -114,6 +114,38 @@ pub struct DsnNotify {
     pub delay: bool,
 }
 
+impl DsnNotify {
+    /// Whether any NOTIFY token was explicitly supplied (vs. the RFC default).
+    pub fn is_explicit(&self) -> bool {
+        self.never || self.success || self.failure || self.delay
+    }
+
+    /// RFC 3461 §4.1: unspecified NOTIFY ≡ `FAILURE,DELAY`.
+    fn effective_failure(self) -> bool {
+        if self.never {
+            return false;
+        }
+        if !self.is_explicit() {
+            return true;
+        }
+        self.failure
+    }
+
+    fn effective_success(self) -> bool {
+        !self.never && self.success
+    }
+
+    /// Sender wants a success DSN for this recipient.
+    pub fn wants_success(self) -> bool {
+        self.effective_success()
+    }
+
+    /// Sender wants a failure DSN for this recipient.
+    pub fn wants_failure(self) -> bool {
+        self.effective_failure()
+    }
+}
+
 /// Per-recipient DSN parameters from RCPT TO.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DsnRecipientParams {
@@ -229,6 +261,11 @@ pub fn parse_mail_from_arg(arg: &str) -> Result<MailFromParse, ParamParseError> 
                 let p: i8 = v
                     .parse()
                     .map_err(|_| ParamParseError::new("Invalid MT-PRIORITY"))?;
+                if !(-9..=9).contains(&p) {
+                    return Err(ParamParseError::new(
+                        "MT-PRIORITY must be between -9 and 9",
+                    ));
+                }
                 out.delivery.priority = Some(p);
             } else if let Some(v) = upper.strip_prefix("RET=") {
                 out.delivery.dsn_ret = Some(

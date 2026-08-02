@@ -9,12 +9,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_core::Runtime;
+use hopf_core::{Runtime, SharedTlsConnector};
 use hopf_dns::DnsResolver;
 use rmimeparser::EmailAddress;
 
-use crate::client::{SmtpClient, SmtpClientTimeouts, SmtpSend};
+use crate::client::{MailFromParams, SmtpClient, SmtpClientTimeouts, SmtpSend};
 use crate::server::delivery::{DeliveryRequirements, DsnRecipientParams};
+use crate::server::dsn::{orcpt_field, DeliveryStatusNotification, DsnAction, DsnRecipientReport};
 use crate::server::handler::{
     AuthenticateState, ConnectedState, DeferredDelivery, HelloHandler, HelloState, MailFromHandler,
     MailFromState, MessageDataHandler, MessageEndState, MessageStartState, RecipientHandler,
@@ -30,6 +31,8 @@ pub struct SimpleRelayHandlerFactory {
     hostname: String,
     smtp_timeout: Duration,
     outbound_port: u16,
+    /// Optional TLS connector for REQUIRETLS outbound (STARTTLS to MX).
+    tls_connector: Option<SharedTlsConnector>,
 }
 
 impl SimpleRelayHandlerFactory {
@@ -41,6 +44,7 @@ impl SimpleRelayHandlerFactory {
             hostname: hostname.into(),
             smtp_timeout: Duration::from_secs(60),
             outbound_port: 25,
+            tls_connector: None,
         }
     }
 
@@ -55,6 +59,13 @@ impl SimpleRelayHandlerFactory {
         self.outbound_port = port;
         self
     }
+
+    /// TLS connector used when relaying REQUIRETLS messages (STARTTLS +
+    /// verified trust roots supplied by the caller).
+    pub fn with_tls_connector(mut self, connector: SharedTlsConnector) -> Self {
+        self.tls_connector = Some(connector);
+        self
+    }
 }
 
 impl SmtpHandlerFactory for SimpleRelayHandlerFactory {
@@ -65,6 +76,8 @@ impl SmtpHandlerFactory for SimpleRelayHandlerFactory {
             hostname: self.hostname.clone(),
             smtp_timeout: self.smtp_timeout,
             outbound_port: self.outbound_port,
+            tls_connector: self.tls_connector.clone(),
+            inbound_tls: false,
             sender: None,
             delivery: DeliveryRequirements::default(),
             recipients: Vec::new(),
@@ -82,9 +95,11 @@ pub struct SimpleRelayHandler {
     hostname: String,
     smtp_timeout: Duration,
     outbound_port: u16,
+    tls_connector: Option<SharedTlsConnector>,
+    inbound_tls: bool,
     sender: Option<EmailAddress>,
     delivery: DeliveryRequirements,
-    recipients: Vec<EmailAddress>,
+    recipients: Vec<(EmailAddress, DsnRecipientParams)>,
     spool: Option<Arc<Mutex<SpoolPipeline>>>,
     /// Extra header field values (each without a trailing CRLF) to prepend
     /// ahead of the spooled content for every outbound destination — see
@@ -111,7 +126,8 @@ impl SimpleRelayHandler {
 }
 
 impl SmtpClientConnected for SimpleRelayHandler {
-    fn connected(&mut self, state: &mut dyn ConnectedState, _meta: &SmtpConnectionMetadata) {
+    fn connected(&mut self, state: &mut dyn ConnectedState, meta: &SmtpConnectionMetadata) {
+        self.inbound_tls = meta.tls;
         let greeting = format!("{} ESMTP SimpleRelay", self.hostname);
         state.accept_connection(&greeting, Box::new(self.clone()));
     }
@@ -126,7 +142,9 @@ impl HelloHandler for SimpleRelayHandler {
         state.accept_hello(Box::new(self.clone()));
     }
 
-    fn tls_established(&mut self, _info: &hopf_core::SecurityInfo) {}
+    fn tls_established(&mut self, _info: &hopf_core::SecurityInfo) {
+        self.inbound_tls = true;
+    }
 
     fn authenticated(&mut self, state: &mut dyn AuthenticateState, _user: &str) {
         state.accept(Box::new(self.clone()));
@@ -162,6 +180,15 @@ impl MailFromHandler for SimpleRelayHandler {
             );
             return;
         }
+        // Belt-and-suspenders with the control-plane check: REQUIRETLS needs
+        // an inbound TLS session (RFC 8689 §2).
+        if delivery.is_require_tls() && !self.inbound_tls {
+            state.reject_sender_policy(
+                "REQUIRETLS requires a TLS-protected session",
+                Box::new(self.clone()),
+            );
+            return;
+        }
 
         state.accept_sender(Box::new(self.clone()));
     }
@@ -181,9 +208,9 @@ impl RecipientHandler for SimpleRelayHandler {
         &mut self,
         state: &mut dyn RecipientState,
         recipient: &EmailAddress,
-        _dsn: &DsnRecipientParams,
+        dsn: &DsnRecipientParams,
     ) {
-        self.recipients.push(recipient.clone());
+        self.recipients.push((recipient.clone(), dsn.clone()));
         state.accept_recipient(Box::new(self.clone()));
     }
 
@@ -228,8 +255,39 @@ impl MessageDataHandler for SimpleRelayHandler {
             return;
         }
 
+        // RFC 2852: if the DELIVERBY deadline has passed by the time we
+        // finish receiving, refuse delivery (return-mode → permanent feel
+        // via temporary reject that still triggers a failure DSN).
+        if let Some(by) = &self.delivery.deliver_by {
+            if by.deadline <= std::time::SystemTime::now() {
+                maybe_send_failure_dsn(
+                    &self.hostname,
+                    self.sender.as_ref(),
+                    &self.delivery,
+                    &self.recipients,
+                    spool_path.as_deref(),
+                    "DELIVERBY deadline exceeded before relay",
+                    &self.dns,
+                    &self.runtime,
+                    self.smtp_timeout,
+                    self.outbound_port,
+                    self.tls_connector.clone(),
+                );
+                if let Some(path) = &spool_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                state.reject_message_temporary(
+                    "DELIVERBY deadline exceeded",
+                    Box::new(self.clone()),
+                );
+                self.reset_transaction();
+                return;
+            }
+        }
+
         let deferred = state.defer(Box::new(self.clone()));
-        let by_domain = group_by_domain(&self.recipients);
+        let addrs: Vec<EmailAddress> = self.recipients.iter().map(|(a, _)| a.clone()).collect();
+        let by_domain = group_by_domain(&addrs);
         let domains: Vec<String> = by_domain.keys().cloned().collect();
         let tracker = Arc::new(Mutex::new(DeliveryTracker {
             deferred: Some(deferred),
@@ -237,10 +295,19 @@ impl MessageDataHandler for SimpleRelayHandler {
             any_success: false,
             any_fail: false,
             spool_path: spool_path.clone(),
+            hostname: self.hostname.clone(),
+            sender: self.sender.clone(),
+            delivery: self.delivery.clone(),
+            recipients: self.recipients.clone(),
+            domain_results: HashMap::new(),
+            dns: Arc::clone(&self.dns),
+            runtime: Arc::clone(&self.runtime),
+            smtp_timeout: self.smtp_timeout,
+            outbound_port: self.outbound_port,
+            tls_connector: self.tls_connector.clone(),
+            dsn_sent: false,
         }));
         if domains.is_empty() {
-            // No recipients survived grouping (shouldn't happen — RCPT TO
-            // already required at least one — but stay safe).
             tracker.lock().unwrap().finish_if_needed_with_zero_domains();
         }
         let ctx = DeliveryContext {
@@ -251,11 +318,19 @@ impl MessageDataHandler for SimpleRelayHandler {
             extra_header_lines: self.extra_header_lines.clone(),
             sender: self.sender.clone(),
             require_tls: self.delivery.is_require_tls(),
+            mail_params: MailFromParams {
+                require_tls: self.delivery.is_require_tls(),
+                dsn_ret: self.delivery.dsn_ret,
+                dsn_envid: self.delivery.dsn_envid.clone(),
+                priority: self.delivery.priority,
+                ..Default::default()
+            },
             dns: Arc::clone(&self.dns),
             runtime: Arc::clone(&self.runtime),
             hostname: self.hostname.clone(),
             smtp_timeout: self.smtp_timeout,
             outbound_port: self.outbound_port,
+            tls_connector: self.tls_connector.clone(),
             current: 0,
         };
         self.reset_transaction();
@@ -299,6 +374,18 @@ struct DeliveryTracker {
     any_success: bool,
     any_fail: bool,
     spool_path: Option<PathBuf>,
+    hostname: String,
+    sender: Option<EmailAddress>,
+    delivery: DeliveryRequirements,
+    recipients: Vec<(EmailAddress, DsnRecipientParams)>,
+    /// Domain → ok for DSN generation once every domain has reported.
+    domain_results: HashMap<String, bool>,
+    dns: Arc<DnsResolver>,
+    runtime: Arc<Runtime>,
+    smtp_timeout: Duration,
+    outbound_port: u16,
+    tls_connector: Option<SharedTlsConnector>,
+    dsn_sent: bool,
 }
 
 impl DeliveryTracker {
@@ -310,7 +397,8 @@ impl DeliveryTracker {
     /// tradeoff (accepted over adding a durable, cross-attempt spool) mirrors
     /// the one `LocalDeliveryHandler` already makes for its own multi-recipient
     /// case.
-    fn record(&mut self, ok: bool) {
+    fn record(&mut self, domain: &str, ok: bool) {
+        self.domain_results.insert(domain.to_string(), ok);
         if ok {
             self.any_success = true;
         } else {
@@ -329,6 +417,7 @@ impl DeliveryTracker {
     }
 
     fn finish(&mut self) {
+        self.emit_dsn_if_needed();
         if let Some(path) = self.spool_path.take() {
             let _ = std::fs::remove_file(path);
         }
@@ -343,17 +432,73 @@ impl DeliveryTracker {
             deferred.reject_temporary("No recipient domains could be resolved");
         }
     }
+
+    fn emit_dsn_if_needed(&mut self) {
+        if self.dsn_sent {
+            return;
+        }
+        self.dsn_sent = true;
+        let Some(sender) = self.sender.clone() else {
+            return;
+        };
+        let mut reports = Vec::new();
+        for (addr, params) in &self.recipients {
+            let domain = addr.domain().to_ascii_lowercase();
+            let ok = self.domain_results.get(&domain).copied().unwrap_or(false);
+            let action = if ok {
+                DsnAction::Delivered
+            } else {
+                DsnAction::Failed
+            };
+            let want = match action {
+                DsnAction::Delivered => params.notify.wants_success(),
+                DsnAction::Failed => params.notify.wants_failure(),
+            };
+            if !want {
+                continue;
+            }
+            reports.push(DsnRecipientReport {
+                final_recipient: addr.address(),
+                original_recipient: orcpt_field(params),
+                action,
+                diagnostic: if ok {
+                    None
+                } else {
+                    Some("relay to recipient domain failed".into())
+                },
+            });
+        }
+        if reports.is_empty() {
+            return;
+        }
+        let original = self
+            .spool_path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .unwrap_or_default();
+        let dsn = DeliveryStatusNotification {
+            reporting_mta: self.hostname.clone(),
+            reverse_path: Some(sender),
+            delivery: self.delivery.clone(),
+            recipients: reports,
+            original_message: original,
+        };
+        if let Some(bytes) = dsn.render() {
+            send_dsn_message(
+                &bytes,
+                dsn.reverse_path.as_ref().unwrap(),
+                &self.hostname,
+                &self.dns,
+                &self.runtime,
+                self.smtp_timeout,
+                self.outbound_port,
+                self.tls_connector.clone(),
+                self.delivery.is_require_tls(),
+            );
+        }
+    }
 }
 
-// ── Async delivery context ────────────────────────────────────────────────────
-
-/// Iterates destination domains (MX lookup → connect → hand off to
-/// [`SmtpSend`]); `self` is consumed and rebuilt across each async DNS/connect
-/// step exactly like the pre-streaming version, but domain *outcomes* now
-/// flow independently to the shared [`DeliveryTracker`] instead of being
-/// folded into this struct — so `deliver_next()` can move on to resolving
-/// the next domain without waiting for the current one's SMTP delivery to
-/// actually finish, while still reporting the real result once it does.
 struct DeliveryContext {
     tracker: Arc<Mutex<DeliveryTracker>>,
     domains: Vec<String>,
@@ -362,11 +507,13 @@ struct DeliveryContext {
     extra_header_lines: Vec<String>,
     sender: Option<EmailAddress>,
     require_tls: bool,
+    mail_params: MailFromParams,
     dns: Arc<DnsResolver>,
     runtime: Arc<Runtime>,
     hostname: String,
     smtp_timeout: Duration,
     outbound_port: u16,
+    tls_connector: Option<SharedTlsConnector>,
     current: usize,
 }
 
@@ -382,9 +529,10 @@ impl DeliveryContext {
             .cloned()
             .unwrap_or_default();
         let dns = Arc::clone(&self.dns);
+        let domain_query = domain.clone();
         let domain_fallback = domain.clone();
         dns.query_mx(
-            &domain,
+            &domain_query,
             Box::new(move |result| match result {
                 Ok(msg) => {
                     let mut mx: Vec<(u16, String)> =
@@ -394,54 +542,60 @@ impl DeliveryContext {
                         .first()
                         .map(|(_, ex)| ex.trim_end_matches('.').to_string())
                         .unwrap_or(domain_fallback);
-                    self.deliver_to_host(host, recipients);
+                    self.deliver_to_host(domain, host, recipients);
                 }
                 Err(_) => {
-                    let recipients_len = recipients.len();
-                    self.fail_current(recipients_len);
+                    self.fail_current(&domain);
                 }
             }),
         );
     }
 
-    fn fail_current(mut self, _recipients_len: usize) {
-        self.tracker.lock().unwrap().record(false);
+    fn fail_current(mut self, domain: &str) {
+        self.tracker.lock().unwrap().record(domain, false);
         self.current += 1;
         self.deliver_next();
     }
 
-    fn deliver_to_host(self, host: String, recipients: Vec<EmailAddress>) {
-        let require_tls = self.require_tls;
+    fn deliver_to_host(self, domain: String, host: String, recipients: Vec<EmailAddress>) {
         let port = self.outbound_port;
         let dns = Arc::clone(&self.dns);
 
-        if require_tls {
-            // Full STARTTLS to arbitrary MX needs trust roots; bounce for now.
-            self.fail_current(recipients.len());
+        if self.require_tls && self.tls_connector.is_none() {
+            self.fail_current(&domain);
             return;
         }
 
+        let tls_connector = self.tls_connector.clone();
+        let host_query = host.clone();
         dns.resolve(
-            &host,
+            &host_query,
             port,
             Box::new(move |result| match result {
                 Ok(addrs) if !addrs.is_empty() => {
                     let addr = addrs[0];
-                    self.deliver_smtp(addr, recipients);
+                    self.deliver_smtp(domain, host, addr, recipients, tls_connector);
                 }
                 _ => {
-                    let recipients_len = recipients.len();
-                    self.fail_current(recipients_len);
+                    self.fail_current(&domain);
                 }
             }),
         );
     }
 
-    fn deliver_smtp(mut self, addr: std::net::SocketAddr, recipients: Vec<EmailAddress>) {
+    fn deliver_smtp(
+        mut self,
+        domain: String,
+        host: String,
+        addr: std::net::SocketAddr,
+        recipients: Vec<EmailAddress>,
+        tls_connector: Option<SharedTlsConnector>,
+    ) {
         let hostname = self.hostname.clone();
         let sender = self.sender.as_ref().map(|s| s.address());
         let recipient_addrs: Vec<String> = recipients.iter().map(|r| r.address()).collect();
         let tracker = Arc::clone(&self.tracker);
+        let domain_for_cb = domain.clone();
 
         let timeouts = SmtpClientTimeouts {
             stage: self.smtp_timeout,
@@ -450,15 +604,13 @@ impl DeliveryContext {
         };
 
         let mut send = SmtpSend::new(hostname).on_complete(Box::new(move |ok| {
-            tracker.lock().unwrap().record(ok);
+            tracker.lock().unwrap().record(&domain_for_cb, ok);
         }));
+        send = send.mail_from_params(self.mail_params.clone());
+        if self.require_tls {
+            send = send.require_starttls(true);
+        }
         send = match &self.spool_path {
-            // Streamed straight off the spool file per destination — the
-            // message is never cloned into a fresh in-memory buffer per MX,
-            // unlike before. When there are extra header lines to prepend
-            // (see `extra_header_lines`), yield those first (small, bounded)
-            // then continue streaming the spool file — still never more
-            // than one chunk held in memory at a time.
             Some(path) if self.extra_header_lines.is_empty() => send.message_file(path.clone()),
             Some(path) => {
                 let mut prefix = Some(render_extra_header_lines(&self.extra_header_lines));
@@ -493,23 +645,151 @@ impl DeliveryContext {
             send = send.rcpt_to(r);
         }
 
-        let result = SmtpClient::from_addr(addr)
+        let mut client = SmtpClient::from_addr(addr);
+        if self.require_tls {
+            if let Some(connector) = tls_connector {
+                client = client.starttls(connector, host);
+            }
+        }
+
+        let result = client
             .timeouts(timeouts)
             .connect(&self.runtime, Arc::new(send));
 
         if result.is_err() {
-            self.fail_current(recipients.len());
+            self.fail_current(&domain);
             return;
         }
 
-        // Connection accepted for delivery; that domain's real outcome now
-        // arrives asynchronously via the `on_complete` callback above, which
-        // reports straight to the shared tracker. Move on to the next
-        // domain immediately — deliveries to different domains proceed
-        // concurrently.
         self.current += 1;
         self.deliver_next();
     }
+}
+
+fn maybe_send_failure_dsn(
+    hostname: &str,
+    sender: Option<&EmailAddress>,
+    delivery: &DeliveryRequirements,
+    recipients: &[(EmailAddress, DsnRecipientParams)],
+    spool_path: Option<&std::path::Path>,
+    diagnostic: &str,
+    dns: &Arc<DnsResolver>,
+    runtime: &Arc<Runtime>,
+    smtp_timeout: Duration,
+    outbound_port: u16,
+    tls_connector: Option<SharedTlsConnector>,
+) {
+    let Some(sender) = sender else {
+        return;
+    };
+    let reports: Vec<_> = recipients
+        .iter()
+        .filter(|(_, p)| p.notify.wants_failure())
+        .map(|(addr, params)| DsnRecipientReport {
+            final_recipient: addr.address(),
+            original_recipient: orcpt_field(params),
+            action: DsnAction::Failed,
+            diagnostic: Some(diagnostic.into()),
+        })
+        .collect();
+    if reports.is_empty() {
+        return;
+    }
+    let original = spool_path.and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
+    let dsn = DeliveryStatusNotification {
+        reporting_mta: hostname.into(),
+        reverse_path: Some(sender.clone()),
+        delivery: delivery.clone(),
+        recipients: reports,
+        original_message: original,
+    };
+    if let Some(bytes) = dsn.render() {
+        send_dsn_message(
+            &bytes,
+            sender,
+            hostname,
+            dns,
+            runtime,
+            smtp_timeout,
+            outbound_port,
+            tls_connector,
+            delivery.is_require_tls(),
+        );
+    }
+}
+
+fn send_dsn_message(
+    message: &[u8],
+    reverse_path: &EmailAddress,
+    hostname: &str,
+    dns: &Arc<DnsResolver>,
+    runtime: &Arc<Runtime>,
+    smtp_timeout: Duration,
+    outbound_port: u16,
+    tls_connector: Option<SharedTlsConnector>,
+    require_tls: bool,
+) {
+    let domain = reverse_path.domain().to_ascii_lowercase();
+    let to = reverse_path.address();
+    let hostname = hostname.to_string();
+    let message = message.to_vec();
+    let runtime = Arc::clone(runtime);
+    let dns2 = Arc::clone(dns);
+    let domain_for_cb = domain.clone();
+    dns.query_mx(
+        &domain,
+        Box::new(move |result| {
+            let host = match result {
+                Ok(msg) => {
+                    let mut mx: Vec<(u16, String)> =
+                        msg.answers.iter().filter_map(|rr| rr.as_mx()).collect();
+                    mx.sort_by_key(|(pref, _)| *pref);
+                    mx.first()
+                        .map(|(_, ex)| ex.trim_end_matches('.').to_string())
+                        .unwrap_or(domain_for_cb)
+                }
+                Err(_) => return,
+            };
+            let host_for_tls = host.clone();
+            dns2.resolve(
+                &host,
+                outbound_port,
+                Box::new(move |result| {
+                    let Ok(addrs) = result else {
+                        return;
+                    };
+                    let Some(&addr) = addrs.first() else {
+                        return;
+                    };
+                    let timeouts = SmtpClientTimeouts {
+                        stage: smtp_timeout,
+                        message: smtp_timeout * 10,
+                        ..Default::default()
+                    };
+                    let mut body = Some(message);
+                    let mut send = SmtpSend::new(hostname)
+                        .mail_from("")
+                        .rcpt_to(to)
+                        .message_with(move || body.take());
+                    if require_tls {
+                        send = send
+                            .require_starttls(true)
+                            .mail_from_params(MailFromParams {
+                                require_tls: true,
+                                ..Default::default()
+                            });
+                    }
+                    let mut client = SmtpClient::from_addr(addr);
+                    if require_tls {
+                        if let Some(connector) = tls_connector {
+                            client = client.starttls(connector, host_for_tls);
+                        }
+                    }
+                    let _ = client.timeouts(timeouts).connect(&runtime, Arc::new(send));
+                }),
+            );
+        }),
+    );
 }
 
 #[cfg(test)]
@@ -528,5 +808,4 @@ mod tests {
         assert_eq!(groups.get("example.com").map(Vec::len), Some(2));
         assert_eq!(groups.get("other.example").map(Vec::len), Some(1));
     }
-
 }

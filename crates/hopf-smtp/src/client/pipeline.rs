@@ -50,6 +50,8 @@ struct SmtpSendState {
     hostname: String,
     /// Envelope sender (None = null sender `<>`).
     sender: Option<String>,
+    /// MAIL FROM extension parameters (DSN / REQUIRETLS / …).
+    mail_params: MailFromParams,
     /// Envelope recipients (at least one required).
     recipients: Vec<String>,
     /// Message source (RFC 5322; will be dot-stuffed).
@@ -103,6 +105,7 @@ impl SmtpSend {
         SmtpSend(Arc::new(Mutex::new(SmtpSendState {
             hostname: hostname.into(),
             sender: None,
+            mail_params: MailFromParams::default(),
             recipients: Vec::new(),
             message: MessageSource::default(),
             require_starttls: false,
@@ -118,6 +121,18 @@ impl SmtpSend {
     pub fn mail_from(self, sender: impl Into<String>) -> Self {
         let s = sender.into();
         self.0.lock().unwrap().sender = if s.is_empty() { None } else { Some(s) };
+        self
+    }
+
+    /// Set MAIL FROM extension parameters (REQUIRETLS, RET, ENVID, …).
+    pub fn mail_from_params(self, params: MailFromParams) -> Self {
+        let require_tls = params.require_tls;
+        let mut st = self.0.lock().unwrap();
+        st.mail_params = params;
+        if require_tls {
+            st.require_starttls = true;
+        }
+        drop(st);
         self
     }
 
@@ -282,8 +297,16 @@ impl SmtpClientDriver for SmtpSendDriver {
 
         // Proceed to envelope.
         let sender = st.sender.clone();
+        let params = st.mail_params.clone();
+        if params.require_tls && !caps.require_tls {
+            drop(st);
+            // RFC 8689 §4.2.1: next hop must advertise REQUIRETLS after TLS.
+            self.complete(false);
+            session.quit();
+            return;
+        }
         drop(st);
-        session.mail_from(sender.as_deref(), &MailFromParams::default());
+        session.mail_from(sender.as_deref(), &params);
     }
 
     fn on_ehlo_not_supported(
@@ -301,8 +324,11 @@ impl SmtpClientDriver for SmtpSendDriver {
     }
 
     fn on_helo(&mut self, session: &mut dyn SmtpClientSession, _ep: &mut dyn Endpoint) {
-        let sender = self.state.lock().unwrap().sender.clone();
-        session.mail_from(sender.as_deref(), &MailFromParams::default());
+        let st = self.state.lock().unwrap();
+        let sender = st.sender.clone();
+        let params = st.mail_params.clone();
+        drop(st);
+        session.mail_from(sender.as_deref(), &params);
     }
 
     fn on_helo_error(&mut self, ep: &mut dyn Endpoint, _message: &str) {
@@ -335,8 +361,11 @@ impl SmtpClientDriver for SmtpSendDriver {
     }
 
     fn on_auth_ok(&mut self, session: &mut dyn SmtpClientSession, _ep: &mut dyn Endpoint) {
-        let sender = self.state.lock().unwrap().sender.clone();
-        session.mail_from(sender.as_deref(), &MailFromParams::default());
+        let st = self.state.lock().unwrap();
+        let sender = st.sender.clone();
+        let params = st.mail_params.clone();
+        drop(st);
+        session.mail_from(sender.as_deref(), &params);
     }
 
     fn on_auth_challenge(
