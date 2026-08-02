@@ -79,6 +79,7 @@
 <li><a href="#client">Client</a></li>
 <li><a href="#websocket-bridge">WebSocket bridge</a></li>
 <li><a href="#examples">Examples</a></li>
+<li><a href="#metrics">Metrics</a></li>
 <li><a href="#limitations">Limitations</a></li>
 </ul></div>
 <h2 id="versions">Versions and scope</h2>
@@ -161,13 +162,13 @@ WebSocket (mqtt) ───┘                                                   
 <h2 id="connect-handler-spi">Connect handler SPI</h2>
 <p>Only CONNECT is staged (Gumdrop shape); PUBLISH and SUBSCRIBE authorization stay inline (accept once connected, reject a malformed filter/topic).</p>
 <div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">pub</span> <span class="kw">trait</span> ConnectHandler: Send {
-    <span class="kw">fn</span> authorize(&amp;mut self, packet: &amp;ConnectPacket) -&gt; ConnectDecision; <span class="co">// Accept | Reject(reason_code)</span>
+    <span class="kw">fn</span> authorize(&amp;mut self, packet: &amp;ConnectPacket, meta: &amp;MqttConnectionMetadata) -&gt; ConnectDecision;
 }
 
 <span class="kw">pub</span> <span class="kw">trait</span> MqttHandlerFactory: Send + Sync {
     <span class="kw">fn</span> create(&amp;self) -&gt; Box&lt;dyn ConnectHandler&gt;; <span class="co">// one per accepted connection</span>
 }</code></pre></div>
-<p><code>DefaultConnectHandler</code> / <code>DefaultMqttHandlerFactory</code> accept unconditionally, or require CONNECT username/password to match a <code>CredentialStore</code> when one is configured. Swap in custom policy with <code>MqttService::with_handler_factory</code>.</p>
+<p><code>MqttConnectionMetadata</code> carries peer/local/tls, optional <code>client_id</code>, and (when OTel traces are enabled) a W3C <code>traceparent</code>. <code>DefaultConnectHandler</code> / <code>DefaultMqttHandlerFactory</code> accept unconditionally, or require CONNECT username/password to match a <code>CredentialStore</code> when one is configured. Swap in custom policy with <code>MqttService::with_handler_factory</code>.</p>
 <h2 id="client">Client</h2>
 <p>Async, non-blocking client on the <code>hopf-core</code> <code>Runtime</code> / <code>ProtocolHandler</code> SPI, with DNS resolution via <code>hopf-dns</code>. Unlike the staged POP3/IMAP client drivers, MQTT has only one phase once CONNACK arrives, so <code>MqttClientDriver</code> is a flat set of callbacks over <code>MqttClientControl</code> (publish/subscribe/unsubscribe/disconnect) — QoS 1/2 acknowledgment of incoming messages and the PUBREC→PUBREL leg of the client's own QoS 2 publishes are handled automatically by the endpoint.</p>
 <div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> std::sync::Arc;
@@ -283,6 +284,10 @@ MqttClient::new(<span class="st">&quot;broker.example.com&quot;</span>, <span cl
 </tbody>
 </table>
 <p>No environment variables.</p>
+<h2 id="metrics">Metrics</h2>
+<p>Process-local <code>MqttServerMetrics</code> (in <code>hopf-mqtt</code>): connections, <code>auth_ok</code> / <code>auth_fail</code>, <code>publishes</code>, and <code>subscribes</code> via <code>MqttService::metrics()</code>.</p>
+<p>OTLP/JSONL export (when <code>MqttService::with_telemetry(&amp;pipeline)</code> is used — also <code>MqttWsFactory::with_telemetry</code> for the WebSocket bridge): <code>hopf_otel::MqttServerMetrics</code> emits <code>mqtt.server.connections</code>, <code>mqtt.server.active_connections</code>, <code>mqtt.server.auth</code>, <code>mqtt.server.subscribes</code>, <code>mqtt.server.publishes</code> (qos/outcome), <code>mqtt.server.publish.duration</code> (ms), and <code>mqtt.server.publish.size</code>.</p>
+<p>With traces enabled on the pipeline, <code>MqttConnectionMetadata::traceparent</code> carries the active W3C <code>traceparent</code> for the connection or current client PUBLISH. Handler SPI implementers can pass it to outbound HTTP with <code>hopf_otel::with_traceparent</code>.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li><strong>Session Expiry over WebSocket</strong> — the WS bridge has no timer access, so an unclean WS disconnect always unregisters the session immediately (as if Session Expiry were 0), never orphans. Reconnecting over WS always starts fresh, even if the client requested a nonzero Session Expiry Interval (the CONNACK echoes 0 back rather than promising a resume that will never happen). Session Expiry <strong>is</strong> fully supported over plain TCP.</li>
