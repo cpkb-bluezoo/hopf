@@ -793,6 +793,16 @@ mod tests {
     }
 
     #[test]
+    fn trace_rejected_as_not_implemented() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
+        let mut data: &[u8] = b"TRACE / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let err = p.receive(&mut data).unwrap_err();
+        assert_eq!(err.status, 501);
+        assert!(rec.lock().unwrap().events.is_empty());
+    }
+
+    #[test]
     fn duplicate_identical_content_length_accepted() {
         let rec = Arc::new(Mutex::new(Rec::default()));
         let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);

@@ -64,11 +64,44 @@ pub fn capa_sasl_line(mechs: &[SaslMechanism]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hopf_auth::PasswordStore;
+    use hopf_auth::{
+        CertificateIdentity, CredentialStore, PasswordStore, ScramCredentials, TokenValidation,
+    };
+
+    /// APOP needs a recoverable secret; `PasswordStore` deliberately does not
+    /// retain plaintext. This stub is only for the APOP unit test.
+    struct PlaintextStub {
+        user: String,
+        pass: String,
+    }
+
+    impl CredentialStore for PlaintextStub {
+        fn password_match(&self, username: &str, password: &str) -> bool {
+            username == self.user && password == self.pass
+        }
+        fn plaintext_password(&self, username: &str) -> Option<String> {
+            (username == self.user).then(|| self.pass.clone())
+        }
+        fn digest_ha1(&self, _: &str, _: &str) -> Option<String> {
+            None
+        }
+        fn scram_credentials(&self, _: &str) -> Option<ScramCredentials> {
+            None
+        }
+        fn validate_bearer(&self, _: &str) -> Option<TokenValidation> {
+            None
+        }
+        fn authenticate_certificate(&self, _: &str) -> Option<CertificateIdentity> {
+            None
+        }
+    }
 
     #[test]
     fn apop_roundtrip() {
-        let store = PasswordStore::new().with_user("alice", "secret");
+        let store = PlaintextStub {
+            user: "alice".into(),
+            pass: "secret".into(),
+        };
         let ts = "<1.2@localhost>";
         let mut data = Vec::new();
         data.extend_from_slice(ts.as_bytes());
@@ -76,5 +109,11 @@ mod tests {
         let digest = md5_hex(&data);
         assert!(verify_apop(&store, "alice", ts, &digest));
         assert!(!verify_apop(&store, "alice", ts, "deadbeef"));
+    }
+
+    #[test]
+    fn password_store_does_not_support_apop() {
+        let store = PasswordStore::new().with_user("alice", "secret");
+        assert!(!verify_apop(&store, "alice", "<1.2@localhost>", "anything"));
     }
 }

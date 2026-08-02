@@ -25,8 +25,13 @@ pub struct WebDavConfig {
     pub welcome_file: String,
     pub dead_property_storage: DeadPropMode,
     /// Maximum PUT upload size, checked incrementally as chunks arrive.
-    /// Default: [`MAX_WEBDAV_PUT_BODY`](crate::constants::MAX_WEBDAV_PUT_BODY).
+    /// Default: [`MAX_WEBDAV_PUT_BODY`](crate::constants::MAX_WEBDAV_PUT_BODY)
+    /// (16 MiB — align with [`hopf_http::HttpLimits::max_request_body`]).
     pub max_put_body: u64,
+    /// Max resources visited on Depth: infinity PROPFIND / recursive COPY.
+    /// Default: [`DEFAULT_MAX_TREE_ENTRIES`](crate::constants::DEFAULT_MAX_TREE_ENTRIES).
+    /// Depth 0 / 1 are unaffected. Exceeding the cap yields HTTP 507.
+    pub max_tree_entries: usize,
     /// Optional default `DAV:getcontentlanguage` live property value
     /// (RFC 4918 §15.4). When `None`, the property is omitted from PROPFIND.
     pub content_language: Option<String>,
@@ -49,6 +54,7 @@ impl Default for WebDavConfig {
             welcome_file: "index.html".to_string(),
             dead_property_storage: DeadPropMode::Auto,
             max_put_body: crate::constants::MAX_WEBDAV_PUT_BODY,
+            max_tree_entries: crate::constants::DEFAULT_MAX_TREE_ENTRIES,
             content_language: None,
             allow_unauthenticated_access: false,
         }
@@ -65,6 +71,12 @@ impl WebDavConfig {
     /// Enable WebDAV method set (PROPFIND, LOCK, …).
     pub fn with_webdav(mut self, yes: bool) -> Self {
         self.webdav_enabled = yes;
+        self
+    }
+
+    /// Cap Depth: infinity PROPFIND / recursive COPY resource visits.
+    pub fn with_max_tree_entries(mut self, max: usize) -> Self {
+        self.max_tree_entries = max.max(1);
         self
     }
 

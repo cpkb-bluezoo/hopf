@@ -18,9 +18,9 @@ pub use frame::{
 };
 pub use handshake::{
     calculate_accept, create_upgrade_request, generate_key, is_extended_connect_websocket,
-    is_h1_websocket_upgrade, negotiate_subprotocol, validate_h1_upgrade,
+    is_h1_websocket_upgrade, negotiate_subprotocol, origin_allowed, validate_h1_upgrade,
     validate_upgrade_response, websocket_accept_headers, websocket_connect_response_headers,
-    WebSocketOpening, WEBSOCKET_GUID, WEBSOCKET_VERSION,
+    OriginPolicy, WebSocketOpening, WEBSOCKET_GUID, WEBSOCKET_VERSION,
 };
 pub use session::{
     framed_ws_conn_handle, write_binary, write_close, write_close_empty, write_ping, write_pong,

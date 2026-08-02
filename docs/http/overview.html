@@ -242,7 +242,7 @@
 <tr>
 <td><code>max_request_body</code></td>
 <td><code>usize</code></td>
-<td><code>64 MiB</code></td>
+<td><code>16 MiB</code></td>
 <td>Max aggregate request body</td>
 </tr>
 </tbody>
@@ -250,7 +250,7 @@
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span>HttpLimits<span class="op">;</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> limits <span class="op">=</span> HttpLimits <span class="op">{</span></span>
-<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    max_request_body<span class="op">:</span> <span class="dv">16</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    max_request_body<span class="op">:</span> <span class="dv">64</span> <span class="op">*</span> <span class="dv">1024</span> <span class="op">*</span> <span class="dv">1024</span><span class="op">,</span> <span class="co">// raise for large uploads</span></span>
 <span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">..</span><span class="pp">HttpLimits::</span><span class="kw">default</span>()</span>
 <span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span></code></pre></div>
 <p>Additional framing knobs live on the parsers (not <code>HttpLimits</code>):</p>

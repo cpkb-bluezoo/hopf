@@ -99,11 +99,11 @@ pub trait TrustPolicy: Send + Sync {
     fn evaluate(&self, identity: &IdentityMaterial, peer: &PeerContext) -> TrustDecision;
 }
 
-/// In-memory username → password map (demos). Prefer [`PasswordStore`] when
-/// also using SASL / Digest.
+/// In-memory username → SCRAM-hashed password map (demos). Prefer
+/// [`PasswordStore`] when also using SASL / Digest.
 #[derive(Debug, Default, Clone)]
 pub struct PasswordTrustPolicy {
-    users: HashMap<String, String>,
+    users: HashMap<String, ScramCredentials>,
 }
 
 impl PasswordTrustPolicy {
@@ -112,9 +112,12 @@ impl PasswordTrustPolicy {
         Self::default()
     }
 
-    /// Insert or replace a user.
+    /// Insert or replace a user (password enrolled then discarded).
     pub fn insert(&mut self, username: impl Into<String>, password: impl Into<String>) {
-        self.users.insert(username.into(), password.into());
+        let salt = crate::crypto::from_hex(&crate::crypto::generate_nonce_hex(16))
+            .unwrap_or_else(|| vec![0u8; 16]);
+        let creds = ScramCredentials::derive(&password.into(), &salt, 4096);
+        self.users.insert(username.into(), creds);
     }
 
     /// Builder-style insert.
@@ -126,8 +129,8 @@ impl PasswordTrustPolicy {
     /// Convert into a full [`PasswordStore`].
     pub fn into_store(self) -> PasswordStore {
         let mut s = PasswordStore::new();
-        for (u, p) in self.users {
-            s.insert(u, p);
+        for (u, scram) in self.users {
+            s.insert_scram(u, scram, None);
         }
         s
     }
@@ -142,7 +145,12 @@ impl TrustPolicy for PasswordTrustPolicy {
     fn evaluate(&self, identity: &IdentityMaterial, _peer: &PeerContext) -> TrustDecision {
         match identity {
             IdentityMaterial::UsernamePassword { username, password } => {
-                if self.users.get(username).map(|p| p == password).unwrap_or(false) {
+                if self
+                    .users
+                    .get(username)
+                    .map(|c| c.verify_password(password))
+                    .unwrap_or(false)
+                {
                     TrustDecision::Accept
                 } else {
                     TrustDecision::Reject
@@ -240,12 +248,13 @@ mod tests {
     fn all_sasl_mechanisms_roundtrip() {
         let store: Arc<dyn CredentialStore> = Arc::new(
             PasswordStore::new()
+                .with_digest_realm("example")
                 .with_user("alice", "s3cret")
                 .with_token("tok-alice", "alice")
                 .with_certificate("fp-alice", "alice"),
         );
-        for mech in SaslMechanism::all() {
-            roundtrip(*mech, Arc::clone(&store));
+        for mech in store.supported_mechanisms() {
+            roundtrip(mech, Arc::clone(&store));
         }
     }
 

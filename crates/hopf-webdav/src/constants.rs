@@ -78,6 +78,11 @@ pub const LOCK_TOKEN_SCHEME: &str = "opaquelocktoken:";
 /// / LOCK request bodies, which stay small XML documents.
 pub const MAX_WEBDAV_REQUEST_BODY: usize = 1 << 20;
 
-/// Maximum PUT upload size (10 GiB) — checked incrementally as chunks
-/// arrive, never after buffering the whole body.
-pub const MAX_WEBDAV_PUT_BODY: u64 = 10 << 30;
+/// Maximum PUT upload size (16 MiB) — matches the default
+/// [`hopf_http::HttpLimits::max_request_body`]. Checked incrementally as
+/// chunks arrive; raise both knobs together for larger uploads.
+pub const MAX_WEBDAV_PUT_BODY: u64 = 16 << 20;
+
+/// Default cap on resources visited during Depth: infinity PROPFIND or
+/// recursive COPY.
+pub const DEFAULT_MAX_TREE_ENTRIES: usize = 10_000;

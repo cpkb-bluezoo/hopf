@@ -15,30 +15,32 @@ use hopf_core::{
 };
 use hopf_http::{CleartextHttpEndpoint, HttpLimits, ServerHandlerFactory};
 
-use crate::{DeadPropMode, WebDavConfig, WebDavFactory};
+use crate::{WebDavConfig, WebDavFactory};
 
 fn listen_webdav(root: std::path::PathBuf) -> (Runtime, std::net::SocketAddr) {
-    listen_webdav_with(root, WebDavConfig::default().max_put_body)
+    listen_webdav_cfg(WebDavConfig {
+        root_path: root,
+        allow_write: true,
+        webdav_enabled: true,
+        allow_unauthenticated_access: true,
+        ..Default::default()
+    })
 }
 
 fn listen_webdav_with(root: std::path::PathBuf, max_put_body: u64) -> (Runtime, std::net::SocketAddr) {
+    listen_webdav_cfg(WebDavConfig {
+        root_path: root,
+        allow_write: true,
+        webdav_enabled: true,
+        allow_unauthenticated_access: true,
+        max_put_body,
+        ..Default::default()
+    })
+}
+
+fn listen_webdav_cfg(config: WebDavConfig) -> (Runtime, std::net::SocketAddr) {
     let storage = Arc::new(StorageExecutor::new(StorageConfig::default()));
-    let factory = Arc::new(
-        WebDavFactory::new(
-            WebDavConfig {
-                root_path: root,
-                allow_write: true,
-                webdav_enabled: true,
-                welcome_file: "index.html".into(),
-                dead_property_storage: DeadPropMode::Sidecar,
-                max_put_body,
-                content_language: None,
-                allow_unauthenticated_access: true,
-            },
-            storage,
-        )
-        .unwrap(),
-    );
+    let factory = Arc::new(WebDavFactory::new(config, storage).unwrap());
     let rt = Runtime::start(RuntimeConfig::default()).unwrap();
     let factory2 = Arc::clone(&factory);
     let (addr, _) = rt
@@ -144,7 +146,7 @@ fn put_get_roundtrip_spans_many_chunks() {
 
 /// A PUT whose body exceeds the configured cap is rejected with `413`
 /// before the whole body has to arrive — proven here by using a tiny cap
-/// (well under the request body) rather than the real 10 GiB default.
+/// (well under the request body) rather than the real default.
 #[test]
 fn put_over_size_cap_is_rejected() {
     let dir = tempdir().unwrap();
@@ -187,6 +189,35 @@ fn propfind_depth_zero() {
     assert!(
         resp.to_ascii_lowercase().contains("multistatus"),
         "PROPFIND body: {resp:?}"
+    );
+    rt.shutdown();
+}
+
+/// Depth: infinity PROPFIND stops at `max_tree_entries` with 507.
+#[test]
+fn propfind_depth_infinity_respects_tree_entry_cap() {
+    let dir = tempdir().unwrap();
+    for i in 0..5 {
+        std::fs::write(dir.path().join(format!("f{i}.txt")), b"x").unwrap();
+    }
+    let (rt, addr) = listen_webdav_cfg(WebDavConfig {
+        root_path: dir.path().to_path_buf(),
+        allow_write: true,
+        webdav_enabled: true,
+        allow_unauthenticated_access: true,
+        max_tree_entries: 3, // root + 2 children before overflow
+        ..Default::default()
+    });
+    thread::sleep(Duration::from_millis(50));
+    let body = "<?xml version=\"1.0\"?><D:propfind xmlns:D=\"DAV:\"><D:propname/></D:propfind>";
+    let req = format!(
+        "PROPFIND / HTTP/1.1\r\nHost: localhost\r\nDepth: infinity\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let resp = http_exchange(addr, &req);
+    assert!(
+        resp.contains("507"),
+        "expected 507 when tree walk exceeds cap, got: {resp:?}"
     );
     rt.shutdown();
 }

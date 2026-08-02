@@ -10,8 +10,8 @@ use hopf_http::{
 };
 
 use crate::handshake::{
-    is_extended_connect_websocket, negotiate_subprotocol, validate_h1_upgrade,
-    websocket_accept_headers, websocket_connect_response_headers,
+    is_extended_connect_websocket, negotiate_subprotocol, origin_allowed, validate_h1_upgrade,
+    websocket_accept_headers, websocket_connect_response_headers, OriginPolicy,
 };
 use crate::session::WsSession;
 use crate::upgrade::{WsEventHandler, WsUpgradeHandler};
@@ -24,6 +24,8 @@ pub struct WebSocketConfig {
     /// Optional subprotocol to select when the client offers it
     /// (see [`crate::negotiate_subprotocol`]).
     pub subprotocol: Option<String>,
+    /// `Origin` check for the opening handshake.
+    pub origin: OriginPolicy,
 }
 
 impl Default for WebSocketConfig {
@@ -31,7 +33,25 @@ impl Default for WebSocketConfig {
         Self {
             max_payload: 16 * 1024 * 1024,
             subprotocol: None,
+            origin: OriginPolicy::default(),
         }
+    }
+}
+
+impl WebSocketConfig {
+    /// Restrict browser `Origin` values to this allowlist.
+    pub fn with_allowed_origins(
+        mut self,
+        origins: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.origin = OriginPolicy::AllowList(origins.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Disable Origin checking (demos / trusted networks).
+    pub fn allow_any_origin(mut self) -> Self {
+        self.origin = OriginPolicy::AllowAny;
+        self
     }
 }
 
@@ -83,6 +103,18 @@ impl<F: WsEventHandlerFactory> ServerHandler for WsHttpHandler<F> {
         let event = self.events.create(path, headers, conn.clone());
         let max = self.config.max_payload;
         let sub = negotiate_subprotocol(headers, self.config.subprotocol.as_deref());
+
+        if !origin_allowed(headers, &self.config.origin) {
+            let mut h = Headers::new();
+            h.status(403);
+            h.set("Content-Type", "text/plain");
+            response.headers(h);
+            response.start_response_body();
+            response.response_body_content(b"Origin not allowed");
+            response.end_response_body();
+            response.complete();
+            return;
+        }
 
         if let Ok(key) = validate_h1_upgrade(headers) {
             let resp = websocket_accept_headers(key, sub);

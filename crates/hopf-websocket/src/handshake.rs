@@ -80,6 +80,41 @@ pub fn is_extended_connect_websocket(headers: &Headers) -> bool {
         .unwrap_or(false)
 }
 
+/// How the server treats the WebSocket `Origin` header (RFC 6455 §10.2).
+///
+/// Browser clients always send `Origin`. Non-browser clients often omit it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OriginPolicy {
+    /// When `Origin` is present it must match an entry (exact string match,
+    /// trimmed). Missing `Origin` is allowed (native / non-browser clients).
+    ///
+    /// Default is an empty list: any browser `Origin` is rejected.
+    AllowList(Vec<String>),
+    /// Accept any `Origin` or a missing one. Explicit opt-out for demos and
+    /// trusted networks (see SECURITY.md).
+    AllowAny,
+}
+
+impl Default for OriginPolicy {
+    fn default() -> Self {
+        Self::AllowList(Vec::new())
+    }
+}
+
+/// Whether the request's `Origin` is acceptable under `policy` (RFC 6455 §10.2).
+///
+/// Missing `Origin` is allowed under [`OriginPolicy::AllowList`] so
+/// non-browser clients keep working; browsers always send the header.
+pub fn origin_allowed(headers: &Headers, policy: &OriginPolicy) -> bool {
+    match policy {
+        OriginPolicy::AllowAny => true,
+        OriginPolicy::AllowList(allowed) => match headers.get("origin").map(str::trim) {
+            None | Some("") => true,
+            Some(origin) => allowed.iter().any(|a| a == origin),
+        },
+    }
+}
+
 /// Select a subprotocol from the client's `Sec-WebSocket-Protocol` offer.
 ///
 /// Returns `Some(configured)` only when the client offered that token
@@ -425,6 +460,25 @@ mod tests {
             validate_upgrade_response(&key, &bare, Some("chat")),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn origin_policy_default_rejects_browser_origin() {
+        let mut h = Headers::new();
+        h.set("origin", "https://evil.example");
+        assert!(!origin_allowed(&h, &OriginPolicy::default()));
+        assert!(!origin_allowed(
+            &h,
+            &OriginPolicy::AllowList(vec!["https://app.example".into()])
+        ));
+        assert!(origin_allowed(
+            &h,
+            &OriginPolicy::AllowList(vec!["https://evil.example".into()])
+        ));
+        assert!(origin_allowed(&h, &OriginPolicy::AllowAny));
+
+        let bare = Headers::new();
+        assert!(origin_allowed(&bare, &OriginPolicy::default()));
     }
 
     #[test]
