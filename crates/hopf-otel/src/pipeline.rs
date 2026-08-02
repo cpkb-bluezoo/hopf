@@ -12,13 +12,14 @@ use hopf_core::TelemetryHook;
 use crate::batch::{spawn_worker, ExportHandle};
 use crate::config::OtelConfig;
 use crate::event::{EventKind, TelemetryEvent};
-use crate::metrics::HttpServerMetrics;
+use crate::metrics::{HttpServerMetrics, SmtpServerMetrics};
 
 /// Pipeline: hot-path hook + background OTLP/JSONL exporters.
 pub struct TelemetryPipeline {
     config: OtelConfig,
     sender: ExportHandle,
     metrics: Arc<HttpServerMetrics>,
+    smtp_metrics: Arc<SmtpServerMetrics>,
     join: Option<JoinHandle<()>>,
     running: Arc<AtomicBool>,
 }
@@ -44,10 +45,12 @@ impl TelemetryPipeline {
         }
         let (sender, join, running) = spawn_worker(config.clone());
         let metrics = HttpServerMetrics::new(sender.clone());
+        let smtp_metrics = SmtpServerMetrics::new(sender.clone());
         Ok(Self {
             config,
             sender,
             metrics,
+            smtp_metrics,
             join: Some(join),
             running,
         })
@@ -66,6 +69,11 @@ impl TelemetryPipeline {
     /// Shared HTTP server metrics instruments.
     pub fn http_metrics(&self) -> Arc<HttpServerMetrics> {
         Arc::clone(&self.metrics)
+    }
+
+    /// Shared SMTP server metrics instruments.
+    pub fn smtp_metrics(&self) -> Arc<SmtpServerMetrics> {
+        Arc::clone(&self.smtp_metrics)
     }
 
     /// Snapshot of exporter configuration.

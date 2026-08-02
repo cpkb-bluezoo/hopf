@@ -239,7 +239,7 @@ pub fn encode_metrics_json(config: &OtelConfig, points: &[crate::metrics::Metric
     }
     format!(
         "{{\"resourceMetrics\":[{{\"resource\":{{\"attributes\":[{}]}},\
-         \"scopeMetrics\":[{{\"scope\":{{\"name\":\"org.bluezoo.hopf.http\"}},\"metrics\":[{metrics}]}}]}}]}}",
+         \"scopeMetrics\":[{{\"scope\":{{\"name\":\"org.bluezoo.hopf\"}},\"metrics\":[{metrics}]}}]}}]}}",
         resource_attrs_json(config),
     )
 }

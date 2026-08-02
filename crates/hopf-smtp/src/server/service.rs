@@ -121,6 +121,9 @@ pub struct SmtpService {
     config: SmtpConfig,
     metrics: Arc<SmtpServerMetrics>,
     handler_factory: Arc<dyn SmtpHandlerFactory>,
+    otel_metrics: Option<Arc<hopf_otel::SmtpServerMetrics>>,
+    export: Option<hopf_otel::ExportHandle>,
+    traces_enabled: bool,
 }
 
 impl SmtpService {
@@ -133,6 +136,9 @@ impl SmtpService {
             config,
             metrics: SmtpServerMetrics::shared(),
             handler_factory: factory,
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
         }
     }
 
@@ -145,10 +151,33 @@ impl SmtpService {
             config,
             metrics: SmtpServerMetrics::shared(),
             handler_factory: factory,
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
         }
     }
 
-    /// Shared metrics.
+    /// Wire OTLP/JSONL SMTP metrics and connection/transaction traces from a pipeline.
+    ///
+    /// When `traces_enabled` is true (from the pipeline config), handlers see a
+    /// W3C `traceparent` on [`SmtpConnectionMetadata`](crate::SmtpConnectionMetadata)
+    /// for outbound HTTP propagation via `hopf_otel::with_traceparent`.
+    pub fn with_telemetry(mut self, pipeline: &hopf_otel::TelemetryPipeline) -> Self {
+        let cfg = pipeline.config();
+        if cfg.metrics_enabled {
+            self.otel_metrics = Some(pipeline.smtp_metrics());
+        }
+        if cfg.traces_enabled {
+            self.export = Some(pipeline.export_handle());
+            self.traces_enabled = true;
+        } else if cfg.metrics_enabled {
+            // Metrics alone still need the shared export handle (already inside metrics).
+            self.export = Some(pipeline.export_handle());
+        }
+        self
+    }
+
+    /// Shared process-local metrics.
     pub fn metrics(&self) -> &Arc<SmtpServerMetrics> {
         &self.metrics
     }
@@ -158,16 +187,22 @@ impl SmtpService {
         let factory = Arc::clone(&self.handler_factory);
         let metrics = Arc::clone(&self.metrics);
         let config = self.config.clone();
+        let otel_metrics = self.otel_metrics.clone();
+        let export = self.export.clone();
+        let traces_enabled = self.traces_enabled;
         let mut cfg = TcpListenerConfig::new(self.config.listen, move || {
             let peer = SocketAddr::from(([0, 0, 0, 0], 0));
             let local = config.listen;
-            Box::new(SmtpControlHandler::new(
-                factory.create(),
-                Arc::clone(&metrics),
-                config.clone(),
-                peer,
-                local,
-            )) as Box<dyn ProtocolHandler>
+            Box::new(
+                SmtpControlHandler::new(
+                    factory.create(),
+                    Arc::clone(&metrics),
+                    config.clone(),
+                    peer,
+                    local,
+                )
+                .with_telemetry(otel_metrics.clone(), export.clone(), traces_enabled),
+            ) as Box<dyn ProtocolHandler>
         });
         if let Some(tls) = &self.config.tls_acceptor {
             if self.config.implicit_tls {
