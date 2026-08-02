@@ -76,6 +76,16 @@ pub trait ClientWriter {
     /// Finish the request body.
     fn end_request_body(&mut self);
 
+    /// Buffer trailer headers sent after the request body (H3; H2 when wired).
+    ///
+    /// On HTTP/3 this becomes a second HEADERS frame before stream FIN
+    /// (RFC 9114 §4.1). HTTP/1.1 ignores outbound trailers (same gap as
+    /// inbound H1 trailers). Call after body bytes (if any) and before or
+    /// with [`complete_request`](Self::complete_request).
+    ///
+    /// Default: ignore.
+    fn trailers(&mut self, _headers: Headers) {}
+
     /// Finish the request (flushes headers if body was never started).
     fn complete_request(&mut self);
 }
