@@ -47,6 +47,8 @@ use hopf_dns::RuntimeDnsExt;
 `DnsClientTransport` / `DnsClientTransportHandler` — callback-driven only (no
 blocking query). DoH (`DohClientTransport`) and DoQ (`DoqClientTransport`)
 implement that trait; each `send_query` schedules I/O and delivers via the
-handler.
+handler. DoQ reuses a live QUIC connection per destination across queries
+(`DoqConnectionPool`, RFC 9250 §5.5.1), opening one bidirectional stream per
+query.
 
 See `examples/dns-proxy` for a UDP caching forwarder.
