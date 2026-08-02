@@ -180,18 +180,30 @@ pub trait SmtpClientEnvelope: SmtpClientSession {
     fn rcpt_to(&mut self, recipient: &str, params: &DsnRecipientParams);
     /// Send `RSET`.
     fn rset(&mut self);
-    /// Send `DATA` (or enter BDAT mode if CHUNKING is available).
+    /// Send `DATA`, or enter BDAT mode when the server advertised CHUNKING
+    /// (RFC 3030). In the BDAT case no command is sent yet —
+    /// [`SmtpClientDriver::on_ready_for_data`](super::handlers::SmtpClientDriver::on_ready_for_data)
+    /// is invoked so the driver can call
+    /// [`SmtpClientMessageData::write_bdat_chunk`].
     fn start_data(&mut self);
     /// Whether at least one RCPT TO has been accepted.
     fn has_accepted_recipients(&self) -> bool;
 }
 
-/// DATA-ready stage: write content then end.
+/// DATA-ready stage: write content then end. Also used for RFC 3030 BDAT
+/// once [`SmtpClientEnvelope::start_data`] has entered chunking mode.
 pub trait SmtpClientMessageData {
-    /// Append dot-stuffed content to the DATA stream.
+    /// Append dot-stuffed content to the DATA stream (DATA mode only).
     fn write_content(&mut self, content: &[u8]);
-    /// End the message (`CRLF.CRLF`).
+    /// End the message (`CRLF.CRLF`) in DATA mode.
     fn end_message(&mut self);
+    /// Whether [`SmtpClientEnvelope::start_data`] selected BDAT (CHUNKING).
+    fn is_bdat_mode(&self) -> bool;
+    /// Send one `BDAT` chunk (RFC 3030). Content is sent as raw octets —
+    /// no dot-stuffing. After a non-LAST chunk wait for
+    /// [`SmtpClientDriver::on_bdat_chunk_ok`](super::handlers::SmtpClientDriver::on_bdat_chunk_ok);
+    /// after LAST wait for `on_message_accepted` / `on_message_rejected`.
+    fn write_bdat_chunk(&mut self, content: &[u8], last: bool);
 }
 
 #[cfg(test)]
