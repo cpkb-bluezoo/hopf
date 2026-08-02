@@ -3,10 +3,11 @@
 //! Credential store (Gumdrop `Realm` surface used by SASL / HTTP Digest).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::crypto::{
-    encode_base64, generate_nonce_hex, hmac_sha256, md5_hex, pbkdf2_sha256, sha256, from_hex,
+    ct_eq, decode_base64, encode_base64, generate_nonce_hex, hmac_sha256, md5_hex, pbkdf2_sha256,
+    sha256, from_hex,
 };
 use crate::mechanism::SaslMechanism;
 use crate::{IdentityMaterial, PeerContext, TrustDecision, TrustPolicy};
@@ -25,7 +26,8 @@ pub struct ScramCredentials {
 }
 
 impl ScramCredentials {
-    /// Derive from plaintext password (SCRAM-SHA-256).
+    /// Derive from plaintext password (SCRAM-SHA-256). Enrollment only —
+    /// do not persist the password afterward.
     pub fn derive(password: &str, salt: &[u8], iterations: u32) -> Self {
         let salted = pbkdf2_sha256(password.as_bytes(), salt, iterations);
         let client_key = hmac_sha256(&salted, b"Client Key");
@@ -37,6 +39,17 @@ impl ScramCredentials {
             stored_key,
             server_key,
         }
+    }
+
+    /// Verify a candidate password against these stored credentials
+    /// (constant-time `StoredKey` compare).
+    pub fn verify_password(&self, password: &str) -> bool {
+        let Some(salt) = decode_base64(&self.salt_b64) else {
+            return false;
+        };
+        let derived = Self::derive(password, &salt, self.iterations);
+        ct_eq(&derived.stored_key, &self.stored_key)
+            && ct_eq(&derived.server_key, &self.server_key)
     }
 }
 
@@ -63,11 +76,17 @@ pub trait CredentialStore: Send + Sync {
         SaslMechanism::all().to_vec()
     }
 
-    /// PLAIN / LOGIN / Basic.
+    /// PLAIN / LOGIN / Basic — verify the password presented on the wire.
+    ///
+    /// Implementations should compare against a salted hash (or delegate to
+    /// LDAP/PAM), never store recoverable passwords for this check alone.
     fn password_match(&self, username: &str, password: &str) -> bool;
 
-    /// Look up plaintext password when needed for CRAM-MD5 (demo stores only).
-    /// Production stores should override [`cram_md5_digest`] instead.
+    /// Look up a recoverable plaintext password.
+    ///
+    /// **Only** for legacy mechanisms that require it (CRAM-MD5 default
+    /// path, POP3 APOP). Production stores should leave this as `None` and
+    /// override [`cram_md5_digest`] / supply a custom APOP verifier instead.
     fn plaintext_password(&self, username: &str) -> Option<String> {
         let _ = username;
         None
@@ -103,22 +122,37 @@ pub trait CredentialStore: Send + Sync {
     }
 }
 
-/// In-memory password / token / cert map (Gumdrop `BasicRealm` lite).
+#[derive(Debug, Clone)]
+struct StoredUser {
+    scram: ScramCredentials,
+    /// `MD5(user:digest_realm:password)` when a digest realm was configured
+    /// at enrollment.
+    ha1: Option<String>,
+}
+
+/// In-memory credential map for demos and tests (Gumdrop `BasicRealm` lite).
+///
+/// Enrollment accepts a password **once**, then keeps only SCRAM-SHA-256
+/// material (and optional Digest HA1). Plaintext is not retained.
+///
+/// Does **not** support CRAM-MD5 or POP3 APOP (those need a recoverable
+/// secret or a custom [`CredentialStore`]). DIGEST-MD5 / HTTP Digest work
+/// when [`Self::with_digest_realm`] matches the challenge realm.
 #[derive(Debug, Default)]
 pub struct PasswordStore {
-    passwords: HashMap<String, String>,
+    users: HashMap<String, StoredUser>,
     /// Bearer token → username.
     tokens: HashMap<String, String>,
     /// Cert fingerprint/DN → username.
     certs: HashMap<String, String>,
-    /// Cached SCRAM creds.
-    scram: Mutex<HashMap<String, ScramCredentials>>,
     /// Default SCRAM iterations.
     scram_iterations: u32,
+    /// Realm used to precompute HA1 at [`Self::insert`] / [`Self::with_user`].
+    digest_realm: String,
 }
 
 impl PasswordStore {
-    /// Empty store.
+    /// Empty store (no Digest HA1 until [`Self::with_digest_realm`]).
     pub fn new() -> Self {
         Self {
             scram_iterations: 4096,
@@ -126,16 +160,67 @@ impl PasswordStore {
         }
     }
 
-    /// Insert username/password.
-    pub fn insert(&mut self, username: impl Into<String>, password: impl Into<String>) {
-        let u = username.into();
-        self.passwords.insert(u.clone(), password.into());
-        self.scram.lock().unwrap().remove(&u);
+    /// Realm for DIGEST-MD5 / HTTP Digest HA1 precomputation.
+    ///
+    /// Call **before** enrolling users. HA1 is stored only for this realm;
+    /// [`CredentialStore::digest_ha1`] returns `None` for any other realm.
+    pub fn with_digest_realm(mut self, realm: impl Into<String>) -> Self {
+        self.digest_realm = realm.into();
+        self
     }
 
-    /// Builder insert.
+    /// PBKDF2 iteration count for SCRAM enrollment (default 4096).
+    pub fn with_scram_iterations(mut self, iterations: u32) -> Self {
+        self.scram_iterations = iterations.max(1);
+        self
+    }
+
+    /// Enroll `username` from a password: derive SCRAM (+ HA1 if a digest
+    /// realm is set), then discard the password.
+    pub fn insert(&mut self, username: impl Into<String>, password: impl Into<String>) {
+        let u = username.into();
+        let password = password.into();
+        let salt = from_hex(&generate_nonce_hex(16)).unwrap_or_else(|| vec![0u8; 16]);
+        let scram = ScramCredentials::derive(&password, &salt, self.scram_iterations);
+        let ha1 = if self.digest_realm.is_empty() {
+            None
+        } else {
+            Some(md5_hex(
+                format!("{u}:{}:{password}", self.digest_realm).as_bytes(),
+            ))
+        };
+        self.users.insert(u, StoredUser { scram, ha1 });
+    }
+
+    /// Enroll from already-hashed SCRAM material (no password involved).
+    ///
+    /// `ha1` is optional Digests HA1 for the store's configured realm.
+    pub fn insert_scram(
+        &mut self,
+        username: impl Into<String>,
+        scram: ScramCredentials,
+        ha1: Option<String>,
+    ) {
+        self.users.insert(
+            username.into(),
+            StoredUser { scram, ha1 },
+        );
+    }
+
+    /// Builder insert (password enrollment).
     pub fn with_user(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.insert(username, password);
+        self
+    }
+
+    /// Builder insert of precomputed SCRAM credentials.
+    pub fn with_scram(
+        mut self,
+        username: impl Into<String>,
+        scram: ScramCredentials,
+        ha1: Option<String>,
+    ) -> Self {
+        self.insert_scram(username, scram, ha1);
         self
     }
 
@@ -162,33 +247,40 @@ impl PasswordStore {
 }
 
 impl CredentialStore for PasswordStore {
+    fn supported_mechanisms(&self) -> Vec<SaslMechanism> {
+        let mut mechs = vec![
+            SaslMechanism::Plain,
+            SaslMechanism::Login,
+            SaslMechanism::ScramSha256,
+            SaslMechanism::OauthBearer,
+            SaslMechanism::External,
+        ];
+        if !self.digest_realm.is_empty() {
+            mechs.insert(3, SaslMechanism::DigestMd5);
+        }
+        mechs
+    }
+
     fn password_match(&self, username: &str, password: &str) -> bool {
-        self.passwords
+        self.users
             .get(username)
-            .map(|p| p == password)
+            .map(|u| u.scram.verify_password(password))
             .unwrap_or(false)
     }
 
-    fn plaintext_password(&self, username: &str) -> Option<String> {
-        self.passwords.get(username).cloned()
+    fn plaintext_password(&self, _username: &str) -> Option<String> {
+        None
     }
 
     fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
-        let password = self.passwords.get(username)?;
-        let a1 = format!("{username}:{realm}:{password}");
-        Some(md5_hex(a1.as_bytes()))
+        if realm != self.digest_realm || self.digest_realm.is_empty() {
+            return None;
+        }
+        self.users.get(username)?.ha1.clone()
     }
 
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
-        let password = self.passwords.get(username)?;
-        let mut cache = self.scram.lock().unwrap();
-        if let Some(c) = cache.get(username) {
-            return Some(c.clone());
-        }
-        let salt = from_hex(&generate_nonce_hex(16)).unwrap_or_else(|| vec![0u8; 16]);
-        let creds = ScramCredentials::derive(password, &salt, self.scram_iterations);
-        cache.insert(username.to_string(), creds.clone());
-        Some(creds)
+        self.users.get(username).map(|u| u.scram.clone())
     }
 
     fn validate_bearer(&self, token: &str) -> Option<TokenValidation> {
@@ -271,5 +363,33 @@ impl CredentialStore for Arc<dyn CredentialStore> {
     }
     fn authorize_as(&self, authcid: &str, authzid: &str) -> bool {
         (**self).authorize_as(authcid, authzid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enrollment_discards_plaintext() {
+        let store = PasswordStore::new().with_user("alice", "s3cret");
+        assert!(store.plaintext_password("alice").is_none());
+        assert!(store.password_match("alice", "s3cret"));
+        assert!(!store.password_match("alice", "wrong"));
+        assert!(!store.password_match("bob", "s3cret"));
+        assert!(store.scram_credentials("alice").is_some());
+        assert!(!store.supported_mechanisms().contains(&SaslMechanism::CramMd5));
+    }
+
+    #[test]
+    fn digest_ha1_requires_matching_realm() {
+        let store = PasswordStore::new()
+            .with_digest_realm("example")
+            .with_user("alice", "s3cret");
+        assert!(store.digest_ha1("alice", "example").is_some());
+        assert!(store.digest_ha1("alice", "other").is_none());
+        assert!(store
+            .supported_mechanisms()
+            .contains(&SaslMechanism::DigestMd5));
     }
 }

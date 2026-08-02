@@ -85,6 +85,8 @@ pub fn is_valid_header_value(value: &[u8]) -> bool {
 /// Default methods Hopf accepts without a custom factory set.
 ///
 /// Includes RFC 4918 WebDAV methods so H1 does not 501 them.
+/// `TRACE` is intentionally omitted (XST / cross-site tracing); H1 answers
+/// `501` like any other unimplemented method.
 pub fn is_default_method(method: &str) -> bool {
     matches!(
         method,
@@ -94,7 +96,6 @@ pub fn is_default_method(method: &str) -> bool {
             | "PUT"
             | "DELETE"
             | "OPTIONS"
-            | "TRACE"
             | "CONNECT"
             | "PATCH"
             | "PROPFIND"
@@ -346,7 +347,9 @@ mod tests {
         assert!(is_default_method("PROPFIND"));
         assert!(is_default_method("LOCK"));
         assert!(!is_default_method("FOO"));
+        assert!(!is_default_method("TRACE"));
         assert!(method_implies_no_body("GET"));
+        assert!(method_implies_no_body("TRACE"));
         assert!(!method_implies_no_body("POST"));
     }
 

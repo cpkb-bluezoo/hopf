@@ -207,9 +207,10 @@ WebDavFactory → WebDavHandler (ServerHandler)
 </tr>
 </tbody>
 </table>
-<p>Constant: <code>MAX_WEBDAV_REQUEST_BODY</code> = <strong>1 MiB</strong> (PROPFIND/PROPPATCH/LOCK bodies).</p>
+<p>Constants: <code>MAX_WEBDAV_REQUEST_BODY</code> = <strong>1 MiB</strong> (PROPFIND/PROPPATCH/LOCK bodies); <code>MAX_WEBDAV_PUT_BODY</code> = <strong>16 MiB</strong> (matches default <code>HttpLimits::max_request_body</code> — raise both for larger PUTs); <code>DEFAULT_MAX_TREE_ENTRIES</code> = <strong>10 000</strong>.</p>
 <h2 id="depth-headers-and-locks">Depth, headers, and locks</h2>
 <p>Supported request headers (as applicable): Depth (<code>0</code> / <code>1</code> / <code>infinity</code>), Destination, Overwrite, If, Lock-Token, Timeout.</p>
+<p><code>Depth: infinity</code> (the PROPFIND default when Depth is omitted) is allowed, but PROPFIND and recursive COPY stop with <strong>507</strong> once <code>WebDavConfig::max_tree_entries</code> resources have been visited. Depth 0/1 are unchanged. MOVE still uses atomic <code>rename</code> (no tree walk).</p>
 <p><strong>Locks</strong> (<code>WebDavLockManager</code>):</p>
 <table>
 <thead>
@@ -308,6 +309,24 @@ WebDavFactory → WebDavHandler (ServerHandler)
 <td><code>DeadPropMode</code></td>
 <td><code>Auto</code></td>
 <td>See above</td>
+</tr>
+<tr>
+<td><code>max_put_body</code></td>
+<td><code>u64</code></td>
+<td><strong>16 MiB</strong></td>
+<td>PUT size cap (align with HTTP <code>max_request_body</code>)</td>
+</tr>
+<tr>
+<td><code>max_tree_entries</code></td>
+<td><code>usize</code></td>
+<td><strong>10 000</strong></td>
+<td>Depth: infinity PROPFIND / recursive COPY; 507 when exceeded</td>
+</tr>
+<tr>
+<td><code>allow_unauthenticated_access</code></td>
+<td><code>bool</code></td>
+<td><code>false</code></td>
+<td>Required when write/WebDAV enabled without acknowledging no built-in auth</td>
 </tr>
 </tbody>
 </table>

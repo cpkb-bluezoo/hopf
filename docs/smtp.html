@@ -295,7 +295,7 @@
 <span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>auth_required(<span class="cn">true</span>)<span class="op">;</span></span></code></pre></div>
 <ul>
 <li><code>auth_required</code> — reject MAIL until AUTH succeeds.</li>
-<li>Mechanisms: the full <a href="auth.html"><code>hopf-auth</code></a> SASL set the store supports — <code>PasswordStore</code> drives all seven (PLAIN, LOGIN, CRAM-MD5, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL) — same pattern as <a href="pop3.html">POP3</a>/<a href="imap.html">IMAP</a>.</li>
+<li>Mechanisms: whatever the store advertises via <code>supported_mechanisms()</code> — <code>PasswordStore</code> offers PLAIN, LOGIN, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL, plus DIGEST-MD5 when enrolled with <code>with_digest_realm</code> (not CRAM-MD5). Same pattern as <a href="pop3.html">POP3</a>/<a href="imap.html">IMAP</a>.</li>
 </ul>
 <h2 id="handler-spi">Handler SPI</h2>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">pub</span> <span class="kw">trait</span> SmtpHandlerFactory<span class="op">:</span> <span class="bu">Send</span> <span class="op">+</span> <span class="bu">Sync</span> <span class="op">{</span></span>

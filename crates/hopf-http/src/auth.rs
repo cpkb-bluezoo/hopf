@@ -583,7 +583,11 @@ mod tests {
     #[test]
     fn digest_auth_challenge_and_success() {
         let store: Arc<dyn CredentialStore> =
-            Arc::new(PasswordStore::new().with_user("alice", "s3cret"));
+            Arc::new(
+                PasswordStore::new()
+                    .with_digest_realm("test")
+                    .with_user("alice", "s3cret"),
+            );
         let factory: Arc<dyn ServerHandlerFactory> = Arc::new(DigestAuthFactory::new(
             Arc::new(OkFactory),
             store,
@@ -652,8 +656,11 @@ mod tests {
     /// attempt.
     #[test]
     fn digest_auth_replayed_credentials_are_rejected() {
-        let store: Arc<dyn CredentialStore> =
-            Arc::new(PasswordStore::new().with_user("alice", "s3cret"));
+        let store: Arc<dyn CredentialStore> = Arc::new(
+            PasswordStore::new()
+                .with_digest_realm("test")
+                .with_user("alice", "s3cret"),
+        );
         let factory: Arc<dyn ServerHandlerFactory> = Arc::new(DigestAuthFactory::new(
             Arc::new(OkFactory),
             store,
@@ -686,8 +693,11 @@ mod tests {
     /// even with an otherwise-correct `response` hash.
     #[test]
     fn digest_auth_unissued_nonce_is_rejected() {
-        let store: Arc<dyn CredentialStore> =
-            Arc::new(PasswordStore::new().with_user("alice", "s3cret"));
+        let store: Arc<dyn CredentialStore> = Arc::new(
+            PasswordStore::new()
+                .with_digest_realm("test")
+                .with_user("alice", "s3cret"),
+        );
         let factory: Arc<dyn ServerHandlerFactory> = Arc::new(DigestAuthFactory::new(
             Arc::new(OkFactory),
             store,
@@ -708,8 +718,11 @@ mod tests {
     /// was genuinely issued and never used.
     #[test]
     fn digest_auth_nonce_expires_after_ttl() {
-        let store: Arc<dyn CredentialStore> =
-            Arc::new(PasswordStore::new().with_user("alice", "s3cret"));
+        let store: Arc<dyn CredentialStore> = Arc::new(
+            PasswordStore::new()
+                .with_digest_realm("test")
+                .with_user("alice", "s3cret"),
+        );
         let factory: Arc<dyn ServerHandlerFactory> = Arc::new(DigestAuthFactory::new(
             Arc::new(OkFactory),
             store,

@@ -137,6 +137,7 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 <h3 id="http2-http3">HTTP/2 / HTTP/3</h3>
 <p><code>is_extended_connect_websocket</code> / <code>websocket_connect_response_headers</code> — successful Extended CONNECT yields <strong>200</strong> and then WebSocket frames on the stream.</p>
 <p>Optional <code>WebSocketConfig.subprotocol</code> is echoed only when that token appears in the client's <code>Sec-WebSocket-Protocol</code> offer; otherwise it is omitted.</p>
+<p><code>Origin</code> (RFC 6455 §10.2): default <code>OriginPolicy::AllowList([])</code> rejects any present <code>Origin</code> with <code>403</code> (browsers always send it). Missing <code>Origin</code> is allowed for native clients. Configure with <code>WebSocketConfig::with_allowed_origins([...])</code> or <code>allow_any_origin()</code> for demos.</p>
 <h2 id="framing">Framing</h2>
 <table>
 <colgroup>
@@ -211,6 +212,12 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 <td><code>Option&lt;String&gt;</code></td>
 <td><code>None</code></td>
 <td>Offered / selected subprotocol</td>
+</tr>
+<tr>
+<td><code>origin</code></td>
+<td><code>OriginPolicy</code></td>
+<td>Empty <code>AllowList</code></td>
+<td>Browser <code>Origin</code> must match the list (else <code>403</code>); missing <code>Origin</code> allowed. Use <code>with_allowed_origins</code> or <code>allow_any_origin</code></td>
 </tr>
 </tbody>
 </table>

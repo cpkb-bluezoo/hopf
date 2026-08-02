@@ -151,8 +151,13 @@ WebSocket (mqtt) ───┘                                                   
 </tr>
 <tr>
 <td><code>max_packet_size</code></td>
-<td>library default</td>
+<td><strong>1 MiB</strong></td>
 <td>Cap on a packet's Remaining Length (<code>with_max_packet_size</code>)</td>
+</tr>
+<tr>
+<td><code>max_publish_payload</code></td>
+<td><strong>1 MiB</strong></td>
+<td>PUBLISH payload cap before fan-out/spool (<code>with_max_publish_payload</code>); intentional internet default</td>
 </tr>
 <tr>
 <td><code>connect_timeout</code></td>

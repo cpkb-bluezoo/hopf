@@ -609,6 +609,7 @@ impl WebDavHandler {
         let overwrite = self.overwrite;
         let depth = self.depth;
         let mut store = self.dead_store.clone();
+        let max_tree_entries = self.config.max_tree_entries;
         self.offload(w, move || {
             let Some(src_lex) = src else {
                 return Ok(404u16);
@@ -641,8 +642,10 @@ impl WebDavHandler {
                 if depth == DEPTH_0 {
                     // Copy the collection only — no members (RFC 4918 §9.8.3).
                     fs::create_dir(&dest_path)?;
-                } else {
-                    copy_dir_all(&src_path, &dest_path)?;
+                } else if let Err(code) =
+                    copy_dir_all(&src_path, &dest_path, max_tree_entries, &mut 0)
+                {
+                    return Ok(code);
                 }
             } else {
                 if let Some(p) = dest_path.parent() {
@@ -827,6 +830,7 @@ impl WebDavHandler {
         let lock_mgr = Arc::clone(&self.lock_manager);
         let types = self.content_types.clone();
         let content_language = self.config.content_language.clone();
+        let max_tree_entries = self.config.max_tree_entries;
 
         self.offload(w, move || {
             let Some(lex) = path else {
@@ -838,8 +842,12 @@ impl WebDavHandler {
             if !resolved.exists() || is_sidecar_file(&resolved) {
                 return Ok(PropfindOutcome::Status(404));
             }
-            let resources = collect_propfind_resources(&resolved, &request_path, depth)
-                .map_err(|c| io_err(&format!("{c}")))?;
+            let resources =
+                match collect_propfind_resources(&resolved, &request_path, depth, max_tree_entries)
+                {
+                    Ok(r) => r,
+                    Err(code) => return Ok(PropfindOutcome::Status(code)),
+                };
             let mut ms = MultistatusWriter::new();
             for (rpath, rhref) in resources {
                 ms.response(&rhref, |r| {
@@ -1056,16 +1064,29 @@ fn resolve_destination(
     canonicalize_path(root, canonical, &lexical).ok_or_else(|| io_err("bad destination"))
 }
 
-fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
+fn copy_dir_all(
+    src: &Path,
+    dst: &Path,
+    max_entries: usize,
+    count: &mut usize,
+) -> Result<(), u16> {
+    *count = count.saturating_add(1);
+    if *count > max_entries {
+        return Err(507);
+    }
+    fs::create_dir_all(dst).map_err(|_| 500u16)?;
+    for entry in fs::read_dir(src).map_err(|_| 500u16)? {
+        let entry = entry.map_err(|_| 500u16)?;
+        let ty = entry.file_type().map_err(|_| 500u16)?;
         let target = dst.join(entry.file_name());
         if ty.is_dir() {
-            copy_dir_all(&entry.path(), &target)?;
+            copy_dir_all(&entry.path(), &target, max_entries, count)?;
         } else {
-            fs::copy(entry.path(), target)?;
+            *count = count.saturating_add(1);
+            if *count > max_entries {
+                return Err(507);
+            }
+            fs::copy(entry.path(), target).map_err(|_| 500u16)?;
         }
     }
     Ok(())
@@ -1121,6 +1142,7 @@ fn collect_propfind_resources(
     root: &Path,
     request_path: &str,
     depth: i32,
+    max_entries: usize,
 ) -> Result<Vec<(PathBuf, String)>, u16> {
     let mut out = Vec::new();
     let base_href = href_for_path(request_path);
@@ -1129,7 +1151,13 @@ fn collect_propfind_resources(
         return Ok(out);
     }
     if root.is_dir() {
-        collect_propfind_children(&mut out, root, &base_href, depth == DEPTH_INFINITY)?;
+        collect_propfind_children(
+            &mut out,
+            root,
+            &base_href,
+            depth == DEPTH_INFINITY,
+            max_entries,
+        )?;
     }
     Ok(out)
 }
@@ -1140,12 +1168,16 @@ fn collect_propfind_children(
     dir: &Path,
     base_href: &str,
     recursive: bool,
+    max_entries: usize,
 ) -> Result<(), u16> {
     for entry in fs::read_dir(dir).map_err(|_| 500u16)? {
         let entry = entry.map_err(|_| 500u16)?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if is_sidecar_name(&name) {
             continue;
+        }
+        if out.len() >= max_entries {
+            return Err(507);
         }
         let child_href = if base_href.ends_with('/') {
             format!("{base_href}{name}")
@@ -1157,7 +1189,7 @@ fn collect_propfind_children(
         let href = ensure_trailing_slash_for_collection(&child_href, is_dir);
         out.push((path.clone(), href.clone()));
         if recursive && is_dir {
-            collect_propfind_children(out, &path, &href, true)?;
+            collect_propfind_children(out, &path, &href, true, max_entries)?;
         }
     }
     Ok(())

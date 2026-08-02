@@ -11,7 +11,7 @@ pub struct HttpLimits {
     pub max_header_count: usize,
     /// Max chunk-size value (default 10 MiB).
     pub max_chunk_size: usize,
-    /// Max aggregate request body (default 64 MiB).
+    /// Max aggregate request body (default 16 MiB).
     pub max_request_body: usize,
     /// Max concurrently open HTTP/2 streams a peer may have open on this
     /// connection (default 100). Advertised to the peer via
@@ -27,7 +27,7 @@ impl Default for HttpLimits {
             max_line_length: 8192,
             max_header_count: 100,
             max_chunk_size: 10 * 1024 * 1024,
-            max_request_body: 64 * 1024 * 1024,
+            max_request_body: 16 * 1024 * 1024,
             max_concurrent_streams: 100,
         }
     }
