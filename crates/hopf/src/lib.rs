@@ -37,6 +37,7 @@
 //! | [`mailbox`] | `hopf-mailbox` | `mailbox` |
 //! | [`otel`] | `hopf-otel` | `otel` |
 //! | [`mqtt`] | `hopf-mqtt` | `mqtt` (`mqtt-ws` for MQTT-over-WebSocket) |
+//! | [`amqp`] | `hopf-amqp` | `amqp` |
 //!
 //! Documentation: <https://cpkb-bluezoo.github.io/hopf/>
 
@@ -104,3 +105,7 @@ pub use hopf_otel as otel;
 /// MQTT broker and async client (feature `mqtt-ws` for MQTT-over-WebSocket).
 #[cfg(feature = "mqtt")]
 pub use hopf_mqtt as mqtt;
+
+/// AMQP 0-9-1 async client (RabbitMQ).
+#[cfg(feature = "amqp")]
+pub use hopf_amqp as amqp;

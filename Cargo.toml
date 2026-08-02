@@ -18,6 +18,7 @@ members = [
     "crates/hopf-pop3",
     "crates/hopf-imap",
     "crates/hopf-mqtt",
+    "crates/hopf-amqp",
     "examples/echo",
     "examples/tls-echo",
     "examples/http-hello",
@@ -40,6 +41,8 @@ members = [
     "examples/mail-composed",
     "examples/mqtt",
     "examples/mqtt-pub",
+    "examples/amqp-pub",
+    "examples/amqp-consume",
 ]
 default-members = [
     "crates/hopf",
@@ -59,6 +62,7 @@ default-members = [
     "crates/hopf-pop3",
     "crates/hopf-imap",
     "crates/hopf-mqtt",
+    "crates/hopf-amqp",
 ]
 
 [workspace.package]
@@ -99,5 +103,6 @@ hopf-mailbox = { version = "0.2.0", path = "crates/hopf-mailbox" }
 hopf-pop3 = { version = "0.2.0", path = "crates/hopf-pop3" }
 hopf-imap = { version = "0.2.0", path = "crates/hopf-imap" }
 hopf-mqtt = { version = "0.2.0", path = "crates/hopf-mqtt" }
+hopf-amqp = { version = "0.2.0", path = "crates/hopf-amqp" }
 getrandom = "0.2"
 tempfile = "3"

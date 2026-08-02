@@ -41,6 +41,7 @@
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
+<li><a href="amqp.html">AMQP</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -90,6 +91,7 @@
 <li><a href="#imap">IMAP</a></li>
 <li><a href="#mailbox">Mailbox storage</a></li>
 <li><a href="#mqtt">MQTT</a></li>
+<li><a href="#amqp">AMQP</a></li>
 <li><a href="#deferred">Deferred protocols (not yet started)</a></li>
 </ul></div>
 
@@ -820,6 +822,22 @@
 </tbody>
 </table>
 <p><strong>Remaining gap</strong>: QoS retransmission bookkeeping does not survive broker process restarts (in-flight entries stay in memory even when offline queues use <code>FileBackedMessageStore</code>). Staged Connect / Publish / Subscribe SPI matches Gumdrop.</p>
+
+<h2 id="amqp">AMQP 0-9-1 — client only (RabbitMQ)</h2>
+<p><code>hopf-amqp</code> is a new client-only crate (not a Gumdrop port). It dials an AMQP 0-9-1 broker, publishes opaque message bodies with basic properties, and consumes via push <code>basic.consume</code> deliveries. See <a href="amqp.html">amqp.html</a>.</p>
+<table>
+<thead><tr><th>Capability</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Connection handshake + PLAIN / AMQPLAIN</td><td>Compliant</td><td></td></tr>
+<tr><td>Tune / heartbeat / multi-channel</td><td>Compliant</td><td></td></tr>
+<tr><td>Exchange / queue topology methods</td><td>Compliant</td><td>declare / bind / unbind / purge / delete</td></tr>
+<tr><td><code>basic.publish</code> + content streaming / <code>frame_max</code></td><td>Compliant</td><td></td></tr>
+<tr><td>Publisher confirms + <code>basic.return</code></td><td>Compliant</td><td></td></tr>
+<tr><td><code>basic.consume</code> push deliveries + ack / nack / reject / qos</td><td>Compliant</td><td><code>basic.get</code> deferred</td></tr>
+<tr><td>AMQPS (implicit TLS)</td><td>Compliant</td><td></td></tr>
+<tr><td>Broker / AMQP 1.0 / transactions</td><td>Out of scope</td><td>Client-only by design</td></tr>
+</tbody>
+</table>
 
 <h2 id="deferred">Deferred protocols (not yet started)</h2>
 <p>Three protocols Gumdrop implements have no hopf equivalent yet — deliberately deferred, not gaps in what exists:</p>

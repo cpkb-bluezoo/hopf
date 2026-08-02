@@ -34,6 +34,7 @@ full = [
     "mailbox",
     "otel",
     "mqtt",
+    "amqp",
 ]
 tls = ["dep:hopf-tls"]
 auth = ["dep:hopf-auth"]
@@ -50,6 +51,7 @@ imap = ["dep:hopf-imap"]
 mailbox = ["dep:hopf-mailbox"]
 otel = ["dep:hopf-otel"]
 mqtt = ["dep:hopf-mqtt"]
+amqp = ["dep:hopf-amqp"]
 # Pass-throughs to optional sub-crate features.
 h3 = ["http", "quic", "hopf-http/h3"]
 dns-server = ["dns", "hopf-dns/server"]
@@ -77,3 +79,4 @@ hopf-imap = { workspace = true, optional = true }
 hopf-mailbox = { workspace = true, optional = true }
 hopf-otel = { workspace = true, optional = true }
 hopf-mqtt = { workspace = true, optional = true }
+hopf-amqp = { workspace = true, optional = true }
