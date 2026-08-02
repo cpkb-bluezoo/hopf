@@ -418,7 +418,7 @@
 <tbody>
 <tr><td>5-byte length-prefixed framing, split-feed parsing</td><td>Compliant</td><td><code>framing.rs:104-282</code>, tested at arbitrary split points</td></tr>
 <tr><td>Compressed frames (flag ≠ 0) rejected</td><td>Compliant (matches declared scope)</td><td><code>framing.rs:225-231</code></td></tr>
-<tr><td>Max message size enforcement (4 MiB default, configurable)</td><td>Compliant</td><td><code>framing.rs:13,244-251</code>, <code>server.rs:175-177</code></td></tr>
+<tr><td>Max message size enforcement (4 MiB default, configurable)</td><td>Compliant</td><td><code>DEFAULT_MAX_MESSAGE_SIZE</code>; <code>set_max_message_size(0)</code> clamps to the default (not unlimited); pass <code>u64::MAX</code> only for an explicit no-cap</td></tr>
 <tr><td><code>application/grpc</code> / <code>application/grpc+proto</code> / <code>application/grpc+json</code> content-type</td><td>Compliant</td><td><code>parse_grpc_content_type</code> — exact media type (optional <code>;</code> params); case-insensitive; JSON via <code>rjsonparser</code> + proto3 JSON mapping</td></tr>
 <tr><td>Unsupported subtypes (e.g. <code>+thrift</code>, <code>grpc-web*</code>) rejected</td><td>Compliant</td><td>HTTP 415 — only <code>+proto</code> (default) and <code>+json</code> are decoded</td></tr>
 <tr><td><code>POST /{service}/{method}</code> routing</td><td>Compliant</td><td><code>server.rs:330-333</code>, <code>proto_file.rs:42-54</code></td></tr>

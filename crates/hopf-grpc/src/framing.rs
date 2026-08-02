@@ -12,6 +12,16 @@ use std::fmt;
 /// Default maximum gRPC message payload size: 4 MiB (common gRPC default).
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 4 * 1024 * 1024;
 
+/// Resolve a configured max. **`0` means the secure default**, not unlimited
+/// (pass [`u64::MAX`] only when an explicit no-cap is intentional).
+pub fn effective_max_message_size(max: u64) -> u64 {
+    if max == 0 {
+        DEFAULT_MAX_MESSAGE_SIZE
+    } else {
+        max
+    }
+}
+
 const HEADER_SIZE: usize = 5;
 const UNCOMPRESSED: u8 = 0;
 
@@ -65,7 +75,8 @@ impl GrpcFraming {
 
     /// Parses the gRPC frame header.
     ///
-    /// `max_message_length` of `0` or `u64::MAX` means no limit except `u32::MAX`.
+    /// `max_message_length` of `0` uses [`DEFAULT_MAX_MESSAGE_SIZE`]. Pass
+    /// [`u64::MAX`] for no application limit (still capped at `u32::MAX`).
     /// Returns `Ok(None)` if the header is incomplete.
     pub fn read_header_limited(
         data: &[u8],
@@ -87,9 +98,10 @@ impl GrpcFraming {
             )));
         }
         let message_length = length as u32;
-        if max_message_length > 0 && message_length as u64 > max_message_length {
+        let limit = effective_max_message_size(max_message_length);
+        if message_length as u64 > limit {
             return Err(GrpcFramingError::new(format!(
-                "gRPC message length {message_length} exceeds maximum {max_message_length}"
+                "gRPC message length {message_length} exceeds maximum {limit}"
             )));
         }
         Ok(Some(message_length))
@@ -170,9 +182,12 @@ impl<H: GrpcEventHandler> GrpcFrameParser<H> {
         self.max_message_size
     }
 
-    /// Sets the maximum permitted frame payload size (`0` = unlimited).
+    /// Sets the maximum permitted frame payload size.
+    ///
+    /// `0` is treated as [`DEFAULT_MAX_MESSAGE_SIZE`] (not unlimited). Use a
+    /// large explicit value only when you intentionally accept big messages.
     pub fn set_max_message_size(&mut self, max_message_size: u64) {
-        self.max_message_size = max_message_size;
+        self.max_message_size = effective_max_message_size(max_message_size);
     }
 
     /// Returns true if at least one complete message frame was delivered.
@@ -241,7 +256,7 @@ impl<H: GrpcEventHandler> GrpcFrameParser<H> {
             return false;
         }
         let payload_length = length as u32;
-        if self.max_message_size > 0 && payload_length as u64 > self.max_message_size {
+        if payload_length as u64 > self.max_message_size {
             self.reset();
             self.handler.parse_error(&format!(
                 "gRPC frame length {payload_length} exceeds maximum {}",
@@ -345,5 +360,51 @@ mod tests {
     #[test]
     fn read_header_incomplete() {
         assert_eq!(GrpcFraming::read_header(&[0, 0, 0]).unwrap(), None);
+    }
+
+    #[test]
+    fn zero_max_message_size_means_default_not_unlimited() {
+        assert_eq!(
+            effective_max_message_size(0),
+            DEFAULT_MAX_MESSAGE_SIZE
+        );
+        let mut p = GrpcFrameParser::new(Collect {
+            starts: vec![],
+            chunks: vec![],
+            ends: 0,
+            errors: vec![],
+        });
+        p.set_max_message_size(0);
+        assert_eq!(p.max_message_size(), DEFAULT_MAX_MESSAGE_SIZE);
+
+        // Frame larger than the default must be rejected even after set(0).
+        let oversized = DEFAULT_MAX_MESSAGE_SIZE as usize + 1;
+        let mut framed = vec![0u8; 5 + oversized.min(64)];
+        framed[0] = 0;
+        let len = oversized as u32;
+        framed[1] = (len >> 24) as u8;
+        framed[2] = (len >> 16) as u8;
+        framed[3] = (len >> 8) as u8;
+        framed[4] = len as u8;
+        // Only need the header for the size check.
+        p.receive(&framed[..5]);
+        let h = p.into_handler();
+        assert!(
+            h.errors.iter().any(|e| e.contains("exceeds maximum")),
+            "errors: {:?}",
+            h.errors
+        );
+    }
+
+    #[test]
+    fn read_header_limited_zero_uses_default() {
+        let mut hdr = [0u8; 5];
+        let len = (DEFAULT_MAX_MESSAGE_SIZE + 1) as u32;
+        hdr[1] = (len >> 24) as u8;
+        hdr[2] = (len >> 16) as u8;
+        hdr[3] = (len >> 8) as u8;
+        hdr[4] = len as u8;
+        assert!(GrpcFraming::read_header_limited(&hdr, 0).is_err());
+        assert!(GrpcFraming::read_header_limited(&hdr, u64::MAX).unwrap().is_some());
     }
 }
