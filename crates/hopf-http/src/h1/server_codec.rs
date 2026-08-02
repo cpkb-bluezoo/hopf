@@ -134,7 +134,14 @@ impl<H: ServerHandler> H1ServerCodec<H> {
 
     /// Whether the peer should be closed after flushing outbound data.
     pub fn wants_close(&self) -> bool {
-        self.driver.response.wants_close() || self.driver.fatal.is_some()
+        if self.driver.response.wants_close() || self.driver.fatal.is_some() {
+            return true;
+        }
+        self.driver
+            .upgraded
+            .as_ref()
+            .map(|u| u.wants_close())
+            .unwrap_or(false)
     }
 
     /// Bind the transport [`ConnHandle`] (call from `H1Endpoint` on connect/receive).
