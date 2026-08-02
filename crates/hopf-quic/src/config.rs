@@ -100,6 +100,7 @@ fn tls13_server(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     alpn: &[&[u8]],
+    tls: &QuicTlsOptions,
 ) -> io::Result<RustlsServerConfig> {
     let provider = rustls::crypto::ring::default_provider();
     let mut cfg = RustlsServerConfig::builder_with_provider(provider.into())
@@ -108,12 +109,22 @@ fn tls13_server(
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    cfg.max_early_data_size = u32::MAX;
+    // 0 = reject early data (secure default). Non-zero advertises 0-RTT
+    // acceptance — replayable; only enable via [`QuicTlsOptions::with_early_data`].
+    cfg.max_early_data_size = if tls.enable_early_data {
+        tls.max_early_data_size
+    } else {
+        0
+    };
     cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(cfg)
 }
 
-fn tls13_client(roots: RootCertStore, alpn: &[&[u8]]) -> io::Result<RustlsClientConfig> {
+fn tls13_client(
+    roots: RootCertStore,
+    alpn: &[&[u8]],
+    tls: &QuicTlsOptions,
+) -> io::Result<RustlsClientConfig> {
     let provider = rustls::crypto::ring::default_provider();
     let mut cfg = RustlsClientConfig::builder_with_provider(provider.into())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -121,19 +132,79 @@ fn tls13_client(roots: RootCertStore, alpn: &[&[u8]]) -> io::Result<RustlsClient
         .with_root_certificates(roots)
         .with_no_client_auth();
     cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    cfg.enable_early_data = true;
+    // Off by default: 0-RTT application data is replayable (RFC 9001 §5.6).
+    cfg.enable_early_data = tls.enable_early_data;
     Ok(cfg)
 }
 
+/// TLS options for hopf-quic PEM builders (separate from
+/// [`QuicTransportOptions`], which covers RFC 9000 transport parameters).
+#[derive(Debug, Clone, Copy)]
+pub struct QuicTlsOptions {
+    /// Offer / accept TLS 1.3 early data (0-RTT). **Default: `false`** —
+    /// early data is replayable; enable only for idempotent workloads that
+    /// accept that risk (see SECURITY.md).
+    pub enable_early_data: bool,
+    /// Server `max_early_data_size` when early data is enabled (ignored when
+    /// disabled). Default when enabling via [`Self::with_early_data`]:
+    /// `u32::MAX`.
+    pub max_early_data_size: u32,
+}
+
+impl Default for QuicTlsOptions {
+    fn default() -> Self {
+        Self {
+            enable_early_data: false,
+            max_early_data_size: 0,
+        }
+    }
+}
+
+impl QuicTlsOptions {
+    /// Secure defaults: early data off.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Opt in to 0-RTT / early data (server advertises `u32::MAX` bytes;
+    /// client sets `enable_early_data`).
+    pub fn with_early_data(mut self) -> Self {
+        self.enable_early_data = true;
+        self.max_early_data_size = u32::MAX;
+        self
+    }
+
+    /// Opt in to early data with an explicit server byte cap.
+    pub fn with_early_data_size(mut self, max_early_data_size: u32) -> Self {
+        self.enable_early_data = true;
+        self.max_early_data_size = max_early_data_size;
+        self
+    }
+}
+
 /// Build a QUIC [`QuicServerConfig`] from PEM cert/key with the given ALPN list.
+///
+/// Early data (0-RTT) is **disabled**. Use
+/// [`server_config_from_pem_with`] with [`QuicTlsOptions::with_early_data`]
+/// to opt in.
 pub fn server_config_from_pem(
     cert_path: &Path,
     key_path: &Path,
     alpn: &[&[u8]],
 ) -> io::Result<Arc<QuicServerConfig>> {
+    server_config_from_pem_with(cert_path, key_path, alpn, QuicTlsOptions::default())
+}
+
+/// [`server_config_from_pem`] with explicit [`QuicTlsOptions`] (e.g. early data).
+pub fn server_config_from_pem_with(
+    cert_path: &Path,
+    key_path: &Path,
+    alpn: &[&[u8]],
+    tls: QuicTlsOptions,
+) -> io::Result<Arc<QuicServerConfig>> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
-    let rustls_cfg = tls13_server(certs, key, alpn)?;
+    let rustls_cfg = tls13_server(certs, key, alpn, &tls)?;
     let quic_crypto: quinn_proto::crypto::rustls::QuicServerConfig = Arc::new(rustls_cfg)
         .try_into()
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
@@ -141,9 +212,20 @@ pub fn server_config_from_pem(
 }
 
 /// Build a QUIC [`QuicClientConfig`] that trusts `ca_path` PEM with the given ALPN.
+///
+/// Early data is **disabled**. Use [`client_config_from_pem_with`] to opt in.
 pub fn client_config_from_pem(
     ca_path: &Path,
     alpn: &[&[u8]],
+) -> io::Result<Arc<QuicClientConfig>> {
+    client_config_from_pem_with(ca_path, alpn, QuicTlsOptions::default())
+}
+
+/// [`client_config_from_pem`] with explicit [`QuicTlsOptions`].
+pub fn client_config_from_pem_with(
+    ca_path: &Path,
+    alpn: &[&[u8]],
+    tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicClientConfig>> {
     let certs = load_certs(ca_path)?;
     let mut roots = RootCertStore::empty();
@@ -152,7 +234,7 @@ pub fn client_config_from_pem(
             .add(cert)
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     }
-    let rustls_cfg = tls13_client(roots, alpn)?;
+    let rustls_cfg = tls13_client(roots, alpn, &tls)?;
     let quic_crypto: quinn_proto::crypto::rustls::QuicClientConfig = Arc::new(rustls_cfg)
         .try_into()
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
@@ -161,10 +243,20 @@ pub fn client_config_from_pem(
 
 /// Build an in-memory self-signed server config (tests / demos).
 ///
-/// Returns `(server_config, leaf_cert_pem)`.
+/// Returns `(server_config, leaf_cert_pem)`. Early data is disabled; see
+/// [`server_config_self_signed_with`].
 pub fn server_config_self_signed(
     names: &[&str],
     alpn: &[&[u8]],
+) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
+    server_config_self_signed_with(names, alpn, QuicTlsOptions::default())
+}
+
+/// [`server_config_self_signed`] with explicit [`QuicTlsOptions`].
+pub fn server_config_self_signed_with(
+    names: &[&str],
+    alpn: &[&[u8]],
+    tls: QuicTlsOptions,
 ) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
     let cert = rcgen::generate_simple_self_signed(
         names.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
@@ -173,7 +265,7 @@ pub fn server_config_self_signed(
     let cert_der = cert.cert.der().clone();
     let key_der = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
     let pem = cert.cert.pem();
-    let rustls_cfg = tls13_server(vec![cert_der], key_der, alpn)?;
+    let rustls_cfg = tls13_server(vec![cert_der], key_der, alpn, &tls)?;
     let quic_crypto: quinn_proto::crypto::rustls::QuicServerConfig = Arc::new(rustls_cfg)
         .try_into()
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
@@ -191,10 +283,28 @@ pub fn client_config_for_certified_pem(
     client_config_from_pem(leaf_pem, alpn)
 }
 
+/// [`client_config_for_certified_pem`] with explicit [`QuicTlsOptions`].
+pub fn client_config_for_certified_pem_with(
+    leaf_pem: &Path,
+    alpn: &[&[u8]],
+    tls: QuicTlsOptions,
+) -> io::Result<Arc<QuicClientConfig>> {
+    client_config_from_pem_with(leaf_pem, alpn, tls)
+}
+
 /// Client config that trusts an in-memory PEM cert.
 pub fn client_config_for_pem_bytes(
     leaf_pem: &[u8],
     alpn: &[&[u8]],
+) -> io::Result<Arc<QuicClientConfig>> {
+    client_config_for_pem_bytes_with(leaf_pem, alpn, QuicTlsOptions::default())
+}
+
+/// [`client_config_for_pem_bytes`] with explicit [`QuicTlsOptions`].
+pub fn client_config_for_pem_bytes_with(
+    leaf_pem: &[u8],
+    alpn: &[&[u8]],
+    tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicClientConfig>> {
     let mut reader = BufReader::new(leaf_pem);
     let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
@@ -205,7 +315,7 @@ pub fn client_config_for_pem_bytes(
             .add(cert)
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     }
-    let rustls_cfg = tls13_client(roots, alpn)?;
+    let rustls_cfg = tls13_client(roots, alpn, &tls)?;
     let quic_crypto: quinn_proto::crypto::rustls::QuicClientConfig = Arc::new(rustls_cfg)
         .try_into()
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
@@ -397,5 +507,49 @@ mod tests {
             }),
         );
         assert_eq!(cfg.addr, addr);
+    }
+
+    #[test]
+    fn early_data_off_by_default() {
+        let opts = QuicTlsOptions::default();
+        assert!(!opts.enable_early_data);
+        assert_eq!(opts.max_early_data_size, 0);
+        let on = QuicTlsOptions::new().with_early_data();
+        assert!(on.enable_early_data);
+        assert_eq!(on.max_early_data_size, u32::MAX);
+    }
+
+    #[test]
+    fn tls13_helpers_honor_early_data_flag() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.cert.der().clone();
+        let key_bytes = cert.key_pair.serialize_der();
+
+        let off = tls13_server(
+            vec![cert_der.clone()],
+            PrivateKeyDer::Pkcs8(key_bytes.clone().into()),
+            &[ALPN_H3],
+            &QuicTlsOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(off.max_early_data_size, 0);
+
+        let on = tls13_server(
+            vec![cert_der],
+            PrivateKeyDer::Pkcs8(key_bytes.into()),
+            &[ALPN_H3],
+            &QuicTlsOptions::new().with_early_data(),
+        )
+        .unwrap();
+        assert_eq!(on.max_early_data_size, u32::MAX);
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let client_off =
+            tls13_client(roots.clone(), &[ALPN_H3], &QuicTlsOptions::default()).unwrap();
+        assert!(!client_off.enable_early_data);
+        let client_on =
+            tls13_client(roots, &[ALPN_H3], &QuicTlsOptions::new().with_early_data()).unwrap();
+        assert!(client_on.enable_early_data);
     }
 }
