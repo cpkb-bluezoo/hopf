@@ -14,7 +14,24 @@ use crate::proto::{
 };
 
 const CONTENT_TYPE_GRPC: &str = "application/grpc";
+const CONTENT_TYPE_GRPC_PROTO: &str = "application/grpc+proto";
 const GRPC_STATUS_UNIMPLEMENTED: i32 = 12;
+
+/// Accept only protobuf gRPC media types (`application/grpc` /
+/// `application/grpc+proto`), optionally with parameters after `;`.
+///
+/// Other subtypes (e.g. `application/grpc+json`) and near-misses such as
+/// `application/grpc-web` are rejected — hopf only decodes protobuf wire
+/// format.
+fn is_supported_grpc_content_type(ct: &str) -> bool {
+    let media = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    media == CONTENT_TYPE_GRPC || media == CONTENT_TYPE_GRPC_PROTO
+}
 
 /// Application SPI for unary RPC handling.
 pub trait GrpcService: Send + Sync {
@@ -321,9 +338,7 @@ impl ServerHandler for GrpcHandler {
         let method = headers.get(":method").unwrap_or("");
         let path = headers.get(":path").unwrap_or("").to_string();
         let ct = headers.get("content-type").unwrap_or("");
-        let ct_ok = ct == CONTENT_TYPE_GRPC || ct.starts_with("application/grpc");
-
-        if method != "POST" || !ct_ok {
+        if method != "POST" || !is_supported_grpc_content_type(ct) {
             self.reject_http(response, 415, "gRPC requires POST application/grpc");
             return;
         }
@@ -448,5 +463,33 @@ impl ServerHandler for GrpcHandler {
 
     fn request_complete(&mut self, response: &mut dyn ServerWriter) {
         self.flush_pending(response);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_bare_grpc_and_grpc_proto() {
+        assert!(is_supported_grpc_content_type("application/grpc"));
+        assert!(is_supported_grpc_content_type("application/grpc+proto"));
+        assert!(is_supported_grpc_content_type("Application/gRPC+Proto"));
+        assert!(is_supported_grpc_content_type("application/grpc; charset=utf-8"));
+        assert!(is_supported_grpc_content_type(
+            "application/grpc+proto; charset=utf-8"
+        ));
+        assert!(is_supported_grpc_content_type("  application/grpc  "));
+    }
+
+    #[test]
+    fn rejects_unsupported_subtypes_and_near_misses() {
+        assert!(!is_supported_grpc_content_type("application/grpc+json"));
+        assert!(!is_supported_grpc_content_type("application/grpc+thrift"));
+        assert!(!is_supported_grpc_content_type("application/grpc-web"));
+        assert!(!is_supported_grpc_content_type("application/grpc-web+proto"));
+        assert!(!is_supported_grpc_content_type("application/json"));
+        assert!(!is_supported_grpc_content_type(""));
+        assert!(!is_supported_grpc_content_type("text/plain"));
     }
 }
