@@ -87,7 +87,13 @@ impl MqttService {
         let traces_enabled = self.traces_enabled;
         TcpListenerConfig::new(self.config.listen, move || {
             Box::new(
-                MqttControlHandler::new(Arc::clone(&config), handler_factory.create(), Arc::clone(&metrics))
+                MqttControlHandler::new(
+                    Arc::clone(&config),
+                    handler_factory.create(),
+                    handler_factory.create_publish(),
+                    handler_factory.create_subscribe(),
+                    Arc::clone(&metrics),
+                )
                     .with_telemetry(otel_metrics.clone(), export.clone(), traces_enabled),
             ) as Box<dyn ProtocolHandler>
         })

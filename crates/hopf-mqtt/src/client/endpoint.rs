@@ -86,6 +86,9 @@ pub struct MqttClientEndpoint {
     keepalive_timer: Option<TimerHandle>,
     next_packet_id: u16,
     pending_publish_header: Option<PublishHeader>,
+    /// AUTH challenge received while the driver was taken (re-delivered on
+    /// the next opportunity).
+    pending_auth: Option<(u8, Properties)>,
     closed: bool,
 }
 
@@ -112,6 +115,7 @@ impl MqttClientEndpoint {
             keepalive_timer: None,
             next_packet_id: 1,
             pending_publish_header: None,
+            pending_auth: None,
             closed: false,
         }
     }
@@ -292,6 +296,11 @@ impl MqttClientControl for ClientCtx<'_, '_> {
         packet_id
     }
 
+    fn auth(&mut self, reason_code: u8, properties: &Properties) {
+        let wire = encode::encode_auth(reason_code, properties);
+        self.endpoint.send(&wire);
+    }
+
     fn disconnect(&mut self, reason_code: u8) {
         if self.handler.version.is_v5() {
             let wire = encode::encode_disconnect(reason_code, &Properties::new(), self.handler.version);
@@ -428,8 +437,19 @@ impl MqttFrameHandler for ClientCtx<'_, '_> {
         self.endpoint.close();
     }
 
-    fn auth(&mut self, _reason_code: u8, _properties: Properties) {
-        // Enhanced AUTH (MQTT 5.0 §4.12) is future work — see the MQTT plan.
+    fn auth(&mut self, reason_code: u8, properties: Properties) {
+        if let Some(mut driver) = self.handler.driver.take() {
+            driver.on_auth(self, reason_code, &properties);
+            self.handler.driver = Some(driver);
+            if let Some((code, props)) = self.handler.pending_auth.take() {
+                if let Some(mut driver) = self.handler.driver.take() {
+                    driver.on_auth(self, code, &props);
+                    self.handler.driver = Some(driver);
+                }
+            }
+        } else {
+            self.handler.pending_auth = Some((reason_code, properties));
+        }
     }
 
     fn parse_error(&mut self, err: MqttError) {

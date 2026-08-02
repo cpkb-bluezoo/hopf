@@ -13,16 +13,12 @@
 //! `with_endpoint` round-trip, since `Endpoint` doesn't expose the
 //! connection's `ProtocolHandler` state to reach into.
 //!
-//! **Session persistence** is limited to what fits in memory for the
-//! Session Expiry window: a session with `session_expiry > 0` that
-//! disconnects without Clean Start keeps its [`SubscriberId`], topic
-//! subscriptions, and packet-id counter alive as an "orphan" (see
-//! [`BrokerState::orphan`]) until either a matching CONNECT resumes it
-//! ([`BrokerState::register`] with `clean_start = false`) or its expiry
-//! timer reaps it ([`BrokerState::expire_orphan`]). Messages published
-//! while orphaned are **not** queued — that's the "durable offline queue"
-//! future work the plan explicitly defers; only the subscription state
-//! survives, not in-flight application data.
+//! **Session persistence** for the Session Expiry window keeps
+//! [`SubscriberId`], topic subscriptions, and the packet-id counter as an
+//! "orphan" (see [`BrokerState::orphan`]) until resume or
+//! [`BrokerState::expire_orphan`]. QoS ≥ 1 publishes matching an orphaned
+//! subscriber are queued in [`crate::server::store::MqttMessageStore`] and
+//! drained on resume via [`BrokerState::drain_offline`].
 
 mod retained;
 mod topic;
@@ -34,11 +30,15 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 
 use hopf_core::ConnHandle;
 
+use crate::codec::packet::Will;
 use crate::codec::{Properties, ProtocolVersion, QoS, SubscribeFilter};
+use crate::server::expiry::{expiry_deadline, is_expired};
+use crate::server::store::{queued_message, InMemoryMessageStore, MqttMessageStore, QueuedMessage};
 
 /// Effectively-unlimited Receive Maximum (MQTT 5.0 default when the CONNECT
 /// property is absent, and the value used for v3.1.1 connections, which
@@ -78,10 +78,16 @@ struct Subscriber {
     expiry_epoch: AtomicU64,
 }
 
+/// Pending Will Delay publish, keyed by client id.
+struct DelayedWill {
+    will: Will,
+    /// Cancels a stale timer after reconnect / clean-start replacement.
+    epoch: u64,
+}
+
 /// Shared broker state: topic subscriptions, retained messages, and the
 /// registry used for cross-reactor publish fan-out, session takeover, and
 /// session resume.
-#[derive(Default)]
 pub struct BrokerState {
     next_subscriber_id: AtomicU64,
     topics: RwLock<TopicTree>,
@@ -89,12 +95,40 @@ pub struct BrokerState {
     subscribers: RwLock<HashMap<SubscriberId, Subscriber>>,
     /// Client id -> current subscriber, for session-takeover / resume lookup.
     sessions: RwLock<HashMap<String, SubscriberId>>,
+    /// Unclean-disconnect Wills waiting on Will Delay Interval.
+    delayed_wills: Mutex<HashMap<String, DelayedWill>>,
+    next_will_epoch: AtomicU64,
+    /// Offline QoS ≥ 1 queues and in-flight retransmission bookkeeping.
+    pub store: Arc<dyn MqttMessageStore>,
+}
+
+impl Default for BrokerState {
+    fn default() -> Self {
+        Self {
+            next_subscriber_id: AtomicU64::new(0),
+            topics: RwLock::new(TopicTree::default()),
+            retained: RwLock::new(RetainedStore::default()),
+            subscribers: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            delayed_wills: Mutex::new(HashMap::new()),
+            next_will_epoch: AtomicU64::new(0),
+            store: Arc::new(InMemoryMessageStore::new()),
+        }
+    }
 }
 
 impl BrokerState {
-    /// Shared, empty broker state.
+    /// Shared, empty broker state with an in-memory message store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Shared broker state using a custom [`MqttMessageStore`].
+    pub fn with_store(store: Arc<dyn MqttMessageStore>) -> Self {
+        Self {
+            store,
+            ..Self::default()
+        }
     }
 
     /// Register a newly-CONNECTed session for `client_id`.
@@ -119,6 +153,9 @@ impl BrokerState {
         conn: ConnHandle,
         atomic_send: bool,
     ) -> (SubscriberId, Option<ConnHandle>, bool) {
+        // Reconnect / takeover cancels any pending Will Delay for this client.
+        self.cancel_delayed_will(client_id);
+
         if !clean_start {
             let existing_id = self.sessions.read().unwrap().get(client_id).copied();
             if let Some(existing_id) = existing_id {
@@ -142,6 +179,7 @@ impl BrokerState {
         let old_id = self.sessions.write().unwrap().insert(client_id.to_string(), id);
         let evicted_conn = if let Some(old_id) = old_id {
             self.topics.write().unwrap().unsubscribe_all(old_id);
+            self.store.clear_offline(old_id);
             self.subscribers
                 .write()
                 .unwrap()
@@ -174,6 +212,7 @@ impl BrokerState {
     /// Session/Start, `session_expiry == 0`, or v3.1.1).
     pub fn unregister(&self, id: SubscriberId) {
         self.topics.write().unwrap().unsubscribe_all(id);
+        self.store.clear_offline(id);
         if let Some(sub) = self.subscribers.write().unwrap().remove(&id) {
             let mut sessions = self.sessions.write().unwrap();
             if sessions.get(&sub.client_id) == Some(&id) {
@@ -185,14 +224,30 @@ impl BrokerState {
     /// Mark a session orphaned (disconnected, but its Session Expiry
     /// interval hasn't elapsed) instead of tearing it down: subscriptions
     /// and packet-id state stay live for a possible [`Self::register`]
-    /// resume. Returns the epoch to pass to [`Self::expire_orphan`]'s timer.
+    /// resume. Unacked outbound QoS 1/2 messages are moved into the offline
+    /// queue for delivery on resume. Returns the epoch to pass to
+    /// [`Self::expire_orphan`]'s timer.
     pub fn orphan(&self, id: SubscriberId) -> u64 {
         let subs = self.subscribers.read().unwrap();
         let Some(sub) = subs.get(&id) else {
             return 0;
         };
         sub.state.lock().unwrap().conn = None;
-        sub.expiry_epoch.fetch_add(1, Ordering::Relaxed) + 1
+        let epoch = sub.expiry_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        drop(subs);
+
+        // Unacked outbound becomes offline — the live connection is gone.
+        let pending: Vec<_> = self
+            .store
+            .due_retransmits(std::time::Duration::ZERO)
+            .into_iter()
+            .filter(|(sid, _, _)| *sid == id)
+            .collect();
+        for (_, packet_id, msg) in pending {
+            self.store.ack_inflight(id, packet_id);
+            self.store.enqueue_offline(id, msg);
+        }
+        epoch
     }
 
     /// Reap an orphaned session if it's still orphaned under the same
@@ -213,10 +268,74 @@ impl BrokerState {
         };
         self.subscribers.write().unwrap().remove(&id);
         self.topics.write().unwrap().unsubscribe_all(id);
+        self.store.clear_offline(id);
         let mut sessions = self.sessions.write().unwrap();
         if sessions.get(&client_id) == Some(&id) {
             sessions.remove(&client_id);
         }
+        // Session lifetime ended — publish any Will still waiting on delay
+        // (MQTT: Will Delay capped by Session Expiry means the Will fires
+        // when the session expires if it hasn't already).
+        self.fire_delayed_will(&client_id, u64::MAX);
+    }
+
+    /// Park `will` for `client_id` until [`Self::fire_delayed_will`]. Returns
+    /// the epoch the caller must pass to the timer callback.
+    pub fn park_delayed_will(&self, client_id: &str, will: Will) -> u64 {
+        let epoch = self.next_will_epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        self.delayed_wills.lock().unwrap().insert(
+            client_id.to_string(),
+            DelayedWill { will, epoch },
+        );
+        epoch
+    }
+
+    /// Drop a parked Will Delay (reconnect / clean disconnect / takeover).
+    pub fn cancel_delayed_will(&self, client_id: &str) {
+        self.delayed_wills.lock().unwrap().remove(client_id);
+    }
+
+    /// Publish a parked Will if it is still pending under `epoch`.
+    /// Pass `u64::MAX` to fire regardless of epoch (session expiry path).
+    pub fn fire_delayed_will(&self, client_id: &str, epoch: u64) {
+        let will = {
+            let mut map = self.delayed_wills.lock().unwrap();
+            match map.get(client_id) {
+                Some(dw) if epoch == u64::MAX || dw.epoch == epoch => {
+                    map.remove(client_id).map(|dw| dw.will)
+                }
+                _ => None,
+            }
+        };
+        if let Some(will) = will {
+            crate::server::publish_spool::publish_whole(
+                self,
+                None,
+                &will.topic,
+                &will.payload,
+                will.qos,
+                will.retain,
+                &will.properties,
+            );
+        }
+    }
+
+    /// Look up the client id for a live or orphaned subscriber.
+    pub fn client_id(&self, id: SubscriberId) -> Option<String> {
+        self.subscribers
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|s| s.client_id.clone())
+    }
+
+    /// Whether `id` currently has a live connection (not orphaned).
+    pub fn is_connected(&self, id: SubscriberId) -> bool {
+        self.subscribers
+            .read()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|sub| sub.state.lock().unwrap().conn.is_some())
     }
 
     /// Subscribe `id` to `filter`. Errors on a malformed filter. Returns
@@ -261,8 +380,9 @@ impl BrokerState {
     /// (spooled to disk — see the module docs' note on why QoS-1/2/retain
     /// re-reads the spool once per recipient instead of buffering the
     /// payload in memory for the whole delivery). A subscriber already at
-    /// Receive Maximum, or currently orphaned (Session Expiry pending), is
-    /// silently skipped (no retry / offline queue — see the module docs).
+    /// Receive Maximum is silently skipped. An orphaned subscriber with
+    /// effective QoS ≥ 1 is deferred so [`Self::deliver_deferred`] can
+    /// enqueue into the message store; QoS 0 to an orphan is dropped.
     /// `publisher` is `None` for messages with no originating subscriber
     /// (e.g. Will messages).
     pub fn begin_publish(
@@ -274,7 +394,16 @@ impl BrokerState {
         retain: bool,
         properties: &Properties,
     ) -> PublishFanout {
-        let matches = self.topics.read().unwrap().matching_subscribers(topic);
+        let now = Instant::now();
+        // Message Expiry Interval of 0 (or already elapsed) → drop before fan-out.
+        if is_expired(properties, now, now) {
+            return PublishFanout {
+                live: Vec::new(),
+                deferred: Vec::new(),
+            };
+        }
+
+        let matches = self.topics.write().unwrap().matching_subscribers(topic);
         let mut live = Vec::new();
         let mut deferred = Vec::new();
         if !matches.is_empty() {
@@ -314,6 +443,9 @@ impl BrokerState {
     /// allocated packet id. `spool` is `Some((path, len))` re-read once per
     /// recipient (never held whole in memory for the group), or `None` for
     /// a zero-length payload.
+    ///
+    /// Orphaned recipients with effective QoS ≥ 1 are enqueued into
+    /// [`Self::store`] instead of being delivered.
     pub fn deliver_deferred(
         &self,
         fanout: &PublishFanout,
@@ -322,6 +454,28 @@ impl BrokerState {
         spool: Option<(&Path, u64)>,
     ) {
         for &(sub_id, effective_qos, effective_retain) in &fanout.deferred {
+            let orphaned = {
+                let subscribers = self.subscribers.read().unwrap();
+                match subscribers.get(&sub_id) {
+                    Some(sub) => sub.state.lock().unwrap().conn.is_none(),
+                    None => continue,
+                }
+            };
+            if orphaned {
+                if effective_qos == QoS::AtMostOnce {
+                    continue;
+                }
+                let payload = match spool {
+                    Some((path, _)) => read_spool_payload(path).unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                self.store.enqueue_offline(
+                    sub_id,
+                    queued_message(topic, &payload, effective_qos, effective_retain, properties),
+                );
+                continue;
+            }
+
             let (conn, version, packet_id, atomic_send) = {
                 let subscribers = self.subscribers.read().unwrap();
                 let Some(sub) = subscribers.get(&sub_id) else {
@@ -344,30 +498,126 @@ impl BrokerState {
                     conn.send(header);
                 }
             }
+            if effective_qos != QoS::AtMostOnce {
+                let payload = match spool {
+                    Some((path, _)) => read_spool_payload(path).unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                self.store.track_inflight(
+                    sub_id,
+                    packet_id,
+                    queued_message(topic, &payload, effective_qos, effective_retain, properties),
+                );
+            }
         }
+    }
+
+    /// Deliver every offline message queued for `id` (session resume).
+    /// Messages that cannot be reserved (Receive Maximum exhausted) are
+    /// re-enqueued.
+    pub fn drain_offline(&self, id: SubscriberId) {
+        let msgs = self.store.take_offline(id);
+        for msg in msgs {
+            if !self.deliver_queued(id, &msg, false) {
+                self.store.enqueue_offline(id, msg);
+            }
+        }
+    }
+
+    /// Re-send outbound QoS 1/2 publishes whose in-flight timer has elapsed
+    /// for `id`. Returns how many were retransmitted.
+    pub fn retransmit_due(&self, id: SubscriberId, older_than: std::time::Duration) -> usize {
+        let due = self.store.due_retransmits(older_than);
+        let mut n = 0;
+        for (sub_id, packet_id, msg) in due {
+            if sub_id != id {
+                continue;
+            }
+            if self.deliver_queued_inner(id, &msg, true, Some(packet_id)) {
+                // Refresh the sent timestamp for the next retry window.
+                self.store.track_inflight(id, packet_id, msg);
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Deliver one queued message to a single subscriber (`dup` = retransmission).
+    fn deliver_queued(&self, id: SubscriberId, msg: &QueuedMessage, dup: bool) -> bool {
+        self.deliver_queued_inner(id, msg, dup, None)
+    }
+
+    /// When `forced_packet_id` is `Some`, reuse that id (retransmission — do
+    /// not bump in-flight; credit was taken on the first send).
+    fn deliver_queued_inner(
+        &self,
+        id: SubscriberId,
+        msg: &QueuedMessage,
+        dup: bool,
+        forced_packet_id: Option<u16>,
+    ) -> bool {
+        let subscribers = self.subscribers.read().unwrap();
+        let Some(sub) = subscribers.get(&id) else {
+            return false;
+        };
+        let (conn, version, packet_id) = if let Some(pid) = forced_packet_id {
+            let state = sub.state.lock().unwrap();
+            let Some(conn) = state.conn.clone() else {
+                return false;
+            };
+            (conn, state.version, pid)
+        } else {
+            match try_reserve_delivery(sub, msg.qos) {
+                Some((conn, version, packet_id, _)) => (conn, version, packet_id),
+                None => return false,
+            }
+        };
+        drop(subscribers);
+        let wire = crate::codec::encode::encode_publish(
+            &msg.topic,
+            msg.qos,
+            dup,
+            msg.retain,
+            packet_id,
+            &msg.payload,
+            &msg.properties,
+            version,
+        );
+        conn.send(wire);
+        if msg.qos != QoS::AtMostOnce && forced_packet_id.is_none() {
+            self.store.track_inflight(id, packet_id, msg.clone());
+        }
+        true
     }
 
     /// Set or clear the retained message for `topic`, handing off ownership
     /// of `spool`'s file (if any) to the retained-message store — see
     /// [`RetainedStore::publish`].
     pub fn retain(&self, topic: &str, qos: QoS, spool: Option<(std::path::PathBuf, u64)>, properties: Properties) {
+        let now = Instant::now();
+        let expires_at = expiry_deadline(&properties, now);
+        if expires_at.is_some_and(|d| now >= d) {
+            // Expired at retain time — clear any prior retained message.
+            self.retained
+                .write()
+                .unwrap()
+                .publish(topic, qos, None, 0, properties, None);
+            return;
+        }
         let (path, len) = match spool {
             Some((p, l)) => (Some(p), l),
             None => (None, 0),
         };
-        self.retained.write().unwrap().publish(topic, qos, path, len, properties);
+        self.retained
+            .write()
+            .unwrap()
+            .publish(topic, qos, path, len, properties, expires_at);
     }
 
     /// Retained messages matching a freshly-subscribed `filter`, to deliver
-    /// immediately (MQTT 3.1.1 §3.8.4).
+    /// immediately (MQTT 3.1.1 §3.8.4). Expired retained messages are purged.
     pub fn retained_matching(&self, filter: &str) -> Vec<(String, RetainedSnapshot)> {
-        self.retained
-            .read()
-            .unwrap()
-            .matching(filter)
-            .into_iter()
-            .map(|(topic, msg)| (topic.to_string(), msg))
-            .collect()
+        self.retained.write().unwrap().matching(filter)
     }
 
     /// Deliver one retained message to a single newly-subscribed connection
@@ -375,6 +625,23 @@ impl BrokerState {
     /// independent of Retain As Published — that option only affects live
     /// fan-out via [`Self::begin_publish`]).
     pub fn deliver_retained(&self, id: SubscriberId, topic: &str, msg: &RetainedSnapshot, max_qos: QoS) {
+        if msg.expires_at.is_some_and(|d| Instant::now() >= d) {
+            return;
+        }
+        let mut props = msg.properties.clone();
+        if let Some(expires_at) = msg.expires_at {
+            // Reconstruct received_at ≈ expires_at - original interval is unknown;
+            // rewrite remaining from absolute deadline.
+            let now = Instant::now();
+            if now >= expires_at {
+                return;
+            }
+            let remaining = expires_at.saturating_duration_since(now).as_secs();
+            props.set_u32(
+                crate::codec::properties::property::MESSAGE_EXPIRY_INTERVAL,
+                u32::try_from(remaining).unwrap_or(u32::MAX),
+            );
+        }
         let subscribers = self.subscribers.read().unwrap();
         let Some(sub) = subscribers.get(&id) else {
             return;
@@ -386,12 +653,12 @@ impl BrokerState {
         drop(subscribers);
         match &msg.path {
             Some(path) => stream_file_publish(
-                &conn, topic, effective_qos, true, packet_id, path, msg.payload_len, &msg.properties, version,
+                &conn, topic, effective_qos, true, packet_id, path, msg.payload_len, &props, version,
                 atomic_send,
             ),
             None => {
                 let header = crate::codec::encode::encode_publish_header(
-                    topic, effective_qos, false, true, packet_id, 0, &msg.properties, version,
+                    topic, effective_qos, false, true, packet_id, 0, &props, version,
                 );
                 conn.send(header);
             }
@@ -420,6 +687,14 @@ impl PublishFanout {
     pub fn has_deferred(&self) -> bool {
         !self.deferred.is_empty()
     }
+}
+
+/// Read a spool file into memory (offline enqueue / inflight tracking).
+fn read_spool_payload(path: &Path) -> Option<Vec<u8>> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(buf)
 }
 
 /// Send a PUBLISH header for `payload_size` bytes, then stream `path`'s
@@ -550,7 +825,7 @@ mod tests {
         assert_ne!(id1, id2);
 
         // Old subscriptions are gone after a clean-start takeover.
-        assert!(broker.topics.read().unwrap().matching_subscribers("a/b").is_empty());
+        assert!(broker.topics.write().unwrap().matching_subscribers("a/b").is_empty());
     }
 
     #[test]
@@ -560,7 +835,7 @@ mod tests {
             broker.register("c1", ProtocolVersion::V311, UNLIMITED_RECEIVE_MAXIMUM, true, noop_handle(), false);
         broker.subscribe(id, &filter("x/y", QoS::AtLeastOnce)).unwrap();
         broker.unregister(id);
-        assert!(broker.topics.read().unwrap().matching_subscribers("x/y").is_empty());
+        assert!(broker.topics.write().unwrap().matching_subscribers("x/y").is_empty());
     }
 
     #[test]
@@ -574,14 +849,14 @@ mod tests {
         assert!(epoch > 0);
         // Orphaned: publish shouldn't be delivered anywhere, but the
         // subscription itself is still registered.
-        assert_eq!(broker.topics.read().unwrap().matching_subscribers("x/y").len(), 1);
+        assert_eq!(broker.topics.write().unwrap().matching_subscribers("x/y").len(), 1);
 
         let (resumed_id, evicted, present) =
             broker.register("c1", ProtocolVersion::V311, UNLIMITED_RECEIVE_MAXIMUM, false, noop_handle(), false);
         assert_eq!(resumed_id, id);
         assert!(evicted.is_none());
         assert!(present);
-        assert_eq!(broker.topics.read().unwrap().matching_subscribers("x/y").len(), 1);
+        assert_eq!(broker.topics.write().unwrap().matching_subscribers("x/y").len(), 1);
     }
 
     #[test]
@@ -595,12 +870,12 @@ mod tests {
         // A resume bumps things back to live; the stale timer must not reap it.
         broker.register("c1", ProtocolVersion::V311, UNLIMITED_RECEIVE_MAXIMUM, false, noop_handle(), false);
         broker.expire_orphan(id, epoch);
-        assert_eq!(broker.topics.read().unwrap().matching_subscribers("x/y").len(), 1);
+        assert_eq!(broker.topics.write().unwrap().matching_subscribers("x/y").len(), 1);
 
         // Orphan again (new epoch) and reap for real.
         let epoch2 = broker.orphan(id);
         broker.expire_orphan(id, epoch2);
-        assert!(broker.topics.read().unwrap().matching_subscribers("x/y").is_empty());
+        assert!(broker.topics.write().unwrap().matching_subscribers("x/y").is_empty());
     }
 
     #[test]
@@ -615,7 +890,7 @@ mod tests {
             broker.register("c1", ProtocolVersion::V311, UNLIMITED_RECEIVE_MAXIMUM, true, noop_handle(), false);
         assert_ne!(id, id2);
         assert!(!present);
-        assert!(broker.topics.read().unwrap().matching_subscribers("x/y").is_empty());
+        assert!(broker.topics.write().unwrap().matching_subscribers("x/y").is_empty());
     }
 
     #[test]
@@ -657,10 +932,36 @@ mod tests {
         // No assertion on delivery here (no_local is exercised end-to-end in
         // the integration tests); this just checks registration succeeds
         // with no_local set and the match options carry it through.
-        let matches = broker.topics.read().unwrap().matching_subscribers("t");
+        let matches = broker.topics.write().unwrap().matching_subscribers("t");
         assert!(matches[0].1.no_local);
         let fanout = broker.begin_publish(Some(id), "t", 1, QoS::AtMostOnce, false, &Properties::new());
         fanout.feed(b"x");
+    }
+
+    #[test]
+    fn orphaned_qos1_is_queued_and_drained_on_resume() {
+        let broker = BrokerState::new();
+        let (id, _, _) =
+            broker.register("c1", ProtocolVersion::V5, UNLIMITED_RECEIVE_MAXIMUM, false, noop_handle(), false);
+        broker.subscribe(id, &filter("t", QoS::AtLeastOnce)).unwrap();
+        broker.orphan(id);
+
+        crate::server::publish_spool::publish_whole(
+            &broker,
+            None,
+            "t",
+            b"offline",
+            QoS::AtLeastOnce,
+            false,
+            &Properties::new(),
+        );
+
+        let (resumed, _, present) =
+            broker.register("c1", ProtocolVersion::V5, UNLIMITED_RECEIVE_MAXIMUM, false, noop_handle(), false);
+        assert!(present);
+        assert_eq!(resumed, id);
+        broker.drain_offline(id);
+        assert!(broker.store.take_offline(id).is_empty());
     }
 
     #[test]

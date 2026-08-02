@@ -4,11 +4,12 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use mio::Token;
 
 use crate::cmd::{ReactorCmd, ReactorHandle};
-use crate::endpoint::Endpoint;
+use crate::endpoint::{Endpoint, TimerHandle};
 
 /// Cloneable handle to a connection pinned to one reactor.
 ///
@@ -156,5 +157,37 @@ impl ConnHandle {
     /// busy-polling.
     pub fn poke(&self) {
         self.with_endpoint(|ep| ep.poke_handler());
+    }
+
+    /// Schedule `callback` after `delay` on this connection's reactor (TCP /
+    /// framed handles). Task-only handles run the timer on a detached thread
+    /// and invoke `execute` when it fires.
+    ///
+    /// Used by layered protocols (e.g. MQTT-over-WebSocket) that hold a
+    /// [`ConnHandle`] but not a live [`Endpoint`] borrow.
+    pub fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        match &self.inner {
+            ConnHandleInner::Tcp { reactor, .. } => {
+                let cancelled = reactor.schedule_timer(delay, callback);
+                TimerHandle::new(move || {
+                    cancelled.store(true, Ordering::Release);
+                })
+            }
+            ConnHandleInner::Framed { inner, .. } => inner.schedule_timer(delay, callback),
+            ConnHandleInner::Tasks { execute } => {
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let flag = Arc::clone(&cancelled);
+                let exec = Arc::clone(execute);
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    if !flag.load(Ordering::Acquire) {
+                        exec(callback);
+                    }
+                });
+                TimerHandle::new(move || {
+                    cancelled.store(true, Ordering::Release);
+                })
+            }
+        }
     }
 }

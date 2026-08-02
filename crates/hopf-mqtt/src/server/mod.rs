@@ -2,21 +2,21 @@
 
 //! MQTT server: config, listener factory, `ProtocolHandler`.
 //!
-//! CONNECT authorization is staged (see [`handler`]), matching
-//! `hopf-pop3` / `hopf-imap`'s handler-factory shape — the default checks
-//! `MqttConfig::credentials`, and `MqttService::with_handler_factory` swaps
-//! in custom policy. PUBLISH and SUBSCRIBE decisions stay inline in
-//! `MqttControlHandler` for now (accept once connected, reject a malformed
-//! filter/topic); staging those too is future work.
+//! CONNECT / PUBLISH / SUBSCRIBE authorization is staged (see [`handler`]),
+//! matching Gumdrop and `hopf-pop3` / `hopf-imap`'s handler-factory shape —
+//! the default checks `MqttConfig::credentials` on CONNECT and accepts all
+//! PUBLISH/SUBSCRIBE; `MqttService::with_handler_factory` swaps in custom policy.
 
+pub mod auth;
 pub mod broker;
 mod config;
 mod control;
+mod expiry;
 mod handler;
 mod metrics;
 mod publish_spool;
 mod service;
-mod store;
+pub mod store;
 
 #[cfg(feature = "websocket")]
 pub mod ws;
@@ -24,8 +24,12 @@ pub mod ws;
 pub use config::{MqttConfig, DEFAULT_CONNECT_TIMEOUT};
 pub use control::MqttControlHandler;
 pub use handler::{
-    ConnectDecision, ConnectHandler, DefaultConnectHandler, DefaultMqttHandlerFactory,
-    MqttConnectionMetadata, MqttHandlerFactory,
+    AcceptAllPublishHandler, AcceptAllSubscribeHandler, ConnectDecision, ConnectHandler,
+    DefaultConnectHandler, DefaultMqttHandlerFactory, MqttConnectionMetadata, MqttHandlerFactory,
+    PublishDecision, PublishHandler, SubscribeDecision, SubscribeHandler,
 };
 pub use metrics::MqttServerMetrics;
 pub use service::MqttService;
+pub use store::{
+    queued_message, FileBackedMessageStore, InMemoryMessageStore, MqttMessageStore, QueuedMessage,
+};
