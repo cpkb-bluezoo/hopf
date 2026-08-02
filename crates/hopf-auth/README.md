@@ -16,4 +16,7 @@ TrustPolicy, IdentityMaterial, credential stores, and **SASL mechanisms**
 HTTP Digest helpers live in [`http_digest`](src/http_digest.rs); HTTP Basic /
 Digest / Bearer consumers are in `hopf-http`.
 
+Optional feature **`pam`** (Unix): [`PamCredentialStore`](src/pam.rs) verifies
+passwords via system PAM (`libpam` / OpenPAM), advertising PLAIN and LOGIN only.
+
 See [docs/auth.html](../../docs/auth.html).

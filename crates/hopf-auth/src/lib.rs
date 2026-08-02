@@ -22,6 +22,9 @@ pub mod scram;
 pub mod session;
 pub mod store;
 
+#[cfg(all(feature = "pam", unix))]
+pub mod pam;
+
 pub use mechanism::SaslMechanism;
 pub use oauth_introspection::{
     IntrospectionCredentialStore, IntrospectionRequest, IntrospectionResponse,
@@ -34,6 +37,9 @@ pub use session::{
 pub use store::{
     CertificateIdentity, CredentialStore, PasswordStore, ScramCredentials, TokenValidation,
 };
+
+#[cfg(all(feature = "pam", unix))]
+pub use pam::{PamCredentialStore, PamStoreConfig, DEFAULT_PAM_SERVICE};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

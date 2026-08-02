@@ -14,6 +14,12 @@ readme = "README.md"
 keywords = ["auth", "sasl", "trust", "digest", "scram"]
 categories = ["network-programming", "authentication", "cryptography"]
 
+[features]
+default = []
+# System PAM backend ([`PamCredentialStore`]). Unix only; links `libpam` / OpenPAM
+# via in-tree FFI (no bindgen).
+pam = ["dep:libc"]
+
 [dependencies]
 md-5 = "0.10"
 sha2 = "0.10"
@@ -21,5 +27,6 @@ hmac = "0.12"
 pbkdf2 = "0.12"
 subtle = "2"
 getrandom = "0.2"
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]

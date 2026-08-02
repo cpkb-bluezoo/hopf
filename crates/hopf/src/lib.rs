@@ -23,7 +23,7 @@
 //! |--------|-------|---------|
 //! | [`core`] | `hopf-core` | always |
 //! | [`tls`] | `hopf-tls` | `tls` |
-//! | [`auth`] | `hopf-auth` | `auth` |
+//! | [`auth`] | `hopf-auth` | `auth` (`pam` for PAM store) |
 //! | [`ldap`] | `hopf-ldap` | `ldap` |
 //! | [`http`] | `hopf-http` | `http` (`h3` for HTTP/3) |
 //! | [`quic`] | `hopf-quic` | `quic` |
