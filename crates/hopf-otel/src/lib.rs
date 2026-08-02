@@ -28,7 +28,8 @@ pub use config::OtelConfig;
 pub use event::{EventKind, TelemetryEvent};
 pub use instrument::InstrumentedServerFactory;
 pub use metrics::{
-    FtpServerMetrics, HttpServerMetrics, MetricPoint, RequestTimer, SmtpServerMetrics,
+    FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MetricPoint, Pop3ServerMetrics,
+    RequestTimer, SmtpServerMetrics,
 };
 pub use pipeline::TelemetryPipeline;
 pub use propagate::{

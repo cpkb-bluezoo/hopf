@@ -22,6 +22,26 @@ use crate::server::fetch_format::FetchItem;
 use crate::server::quota::QuotaManager;
 use crate::server::status_items::StatusItem;
 
+/// Per-connection metadata visible to handlers.
+#[derive(Debug, Clone)]
+pub struct ImapConnectionMetadata {
+    /// Client address.
+    pub peer: SocketAddr,
+    /// Local control address.
+    pub local: SocketAddr,
+    /// Control channel has TLS.
+    pub tls: bool,
+    /// Authenticated username, if any.
+    pub user: Option<String>,
+    /// W3C `traceparent` for the active span when OTel traces are enabled.
+    ///
+    /// Pass to outbound HTTP clients (for example
+    /// `hopf_otel::with_traceparent`) so microservice calls continue the
+    /// distributed trace. Timing/duration stay in telemetry — this field is
+    /// propagation identity only.
+    pub traceparent: Option<String>,
+}
+
 /// Factory for the initial [`ClientConnected`] stage.
 pub trait ImapHandlerFactory: Send + Sync {
     /// Create a handler for a new connection.
@@ -31,13 +51,7 @@ pub trait ImapHandlerFactory: Send + Sync {
 /// Entry point after TCP (and optional implicit TLS) accept.
 pub trait ClientConnected: Send {
     /// New connection; call accept/reject on `state`.
-    fn connected(
-        &mut self,
-        state: &mut dyn ConnectedState,
-        peer: SocketAddr,
-        local: SocketAddr,
-        tls: bool,
-    );
+    fn connected(&mut self, state: &mut dyn ConnectedState, meta: &ImapConnectionMetadata);
     /// Connection closed.
     fn disconnected(&mut self);
 }

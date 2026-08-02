@@ -109,7 +109,7 @@
 <h2 id="handler-spi">Handler SPI</h2>
 <p>Gumdrop-style staged traits:</p>
 <ul>
-<li><code>ClientConnected</code> → greeting</li>
+<li><code>ClientConnected</code> → greeting (<code>Pop3ConnectionMetadata</code>, including optional <code>traceparent</code>)</li>
 <li><code>AuthorizationHandler</code> → post-credential policy (<code>proceed_open</code> opens INBOX)</li>
 <li><code>TransactionHandler</code> → STAT/LIST/RETR/DELE/RSET/TOP/UIDL/QUIT</li>
 </ul>
@@ -207,6 +207,10 @@ Pop3Client::new(&quot;mail.example.com&quot;, 110)
 </tbody>
 </table>
 <p>Example binary: <code>cargo run -p pop3-fetch -- mail.example.com alice secret</code>.</p>
+<h2 id="metrics">Metrics</h2>
+<p>Process-local <code>Pop3ServerMetrics</code> (in <code>hopf-pop3</code>): connections, <code>auth_ok</code> / <code>auth_fail</code>, <code>retr</code>, <code>dele</code>, and <code>stls</code> via <code>Pop3Service::metrics()</code>.</p>
+<p>OTLP/JSONL export (when <code>Pop3Service::with_telemetry(&amp;pipeline)</code> is used): <code>hopf_otel::Pop3ServerMetrics</code> emits <code>pop3.server.connections</code>, <code>pop3.server.active_connections</code>, <code>pop3.server.auth</code>, <code>pop3.server.stls</code>, <code>pop3.server.dele</code>, <code>pop3.server.retrieves</code> (kind/outcome), <code>pop3.server.retrieve.duration</code> (ms), and <code>pop3.server.retrieve.size</code>.</p>
+<p>With traces enabled on the pipeline, <code>Pop3ConnectionMetadata::traceparent</code> carries the active W3C <code>traceparent</code> for the connection or current RETR/TOP retrieve. Handler SPI implementers can pass it to outbound HTTP with <code>hopf_otel::with_traceparent</code>.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
