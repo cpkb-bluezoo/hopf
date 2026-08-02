@@ -964,9 +964,18 @@ fn build_listing(request_path: &str, dir: &Path) -> Result<Vec<u8>, Box<dyn std:
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('"', "&quot;")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn content_type_for(path: &Path, map: &HashMap<String, String>) -> String {
@@ -1436,5 +1445,17 @@ mod tests {
             t.duration_since(UNIX_EPOCH).unwrap().as_secs(),
             1704067200
         );
+    }
+
+    #[test]
+    fn html_escape_covers_full_text_and_attribute_context() {
+        assert_eq!(
+            html_escape(r#"a&b<c>d"e'f"#),
+            "a&amp;b&lt;c&gt;d&quot;e&#39;f"
+        );
+        let listing = build_listing("/dir", Path::new(".")).unwrap();
+        let s = String::from_utf8(listing).unwrap();
+        assert!(s.contains("Index of /dir"));
+        assert!(!s.contains("Index of /dir<script"));
     }
 }
