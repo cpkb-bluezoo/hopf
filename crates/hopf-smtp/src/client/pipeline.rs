@@ -3,11 +3,12 @@
 //! `SmtpSend` — auto-pilot delivery pipeline.
 //!
 //! Drives: greeting → EHLO → (STARTTLS) → (AUTH) → MAIL FROM → RCPT TO(s) →
-//! DATA → message body → QUIT.
+//! DATA or BDAT → message body → QUIT.
 //!
 //! Users supply the envelope and message at construction; optional hook
 //! closures allow overriding any step.
 
+use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -15,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
 use hopf_core::Endpoint;
 
-use crate::DsnRecipientParams;
+use crate::{BodyType, DsnRecipientParams};
 
 use super::handlers::{SmtpClientDriver, SmtpClientHandlerFactory};
 use super::state::{
@@ -28,9 +29,11 @@ use super::DotStuffer;
 enum MessageSource {
     /// No content at all (a genuinely empty message).
     Empty,
-    /// Streamed off disk in bounded chunks at DATA time — the message is
+    /// Streamed off disk in bounded chunks at DATA/BDAT time — the message is
     /// never held whole in memory by the client (see [`SmtpSend::message_file`]).
     File(PathBuf),
+    /// Open file handle while streaming BDAT / DATA chunks.
+    Reading(File),
     /// Pulled from a caller-supplied source one chunk at a time —
     /// `None` signals end of message. Never buffers more than one chunk
     /// at a time (see [`SmtpSend::message_with`]).
@@ -52,10 +55,12 @@ struct SmtpSendState {
     sender: Option<String>,
     /// MAIL FROM extension parameters (DSN / REQUIRETLS / …).
     mail_params: MailFromParams,
-    /// Envelope recipients (at least one required).
-    recipients: Vec<String>,
-    /// Message source (RFC 5322; will be dot-stuffed).
+    /// Envelope recipients with optional per-RCPT DSN params.
+    recipients: Vec<(String, DsnRecipientParams)>,
+    /// Message source (RFC 5322; will be dot-stuffed for DATA, raw for BDAT).
     message: MessageSource,
+    /// Lookahead chunk for BDAT LAST detection.
+    bdat_lookahead: Option<Vec<u8>>,
     /// Require STARTTLS before sending (skip delivery if unavailable).
     require_starttls: bool,
     /// AUTH credentials (username/password, driven via the strongest
@@ -108,6 +113,7 @@ impl SmtpSend {
             mail_params: MailFromParams::default(),
             recipients: Vec::new(),
             message: MessageSource::default(),
+            bdat_lookahead: None,
             require_starttls: false,
             auth: None,
             sasl_client: None,
@@ -124,7 +130,7 @@ impl SmtpSend {
         self
     }
 
-    /// Set MAIL FROM extension parameters (REQUIRETLS, RET, ENVID, …).
+    /// Set MAIL FROM extension parameters (SIZE, BODY, REQUIRETLS, RET, ENVID, …).
     pub fn mail_from_params(self, params: MailFromParams) -> Self {
         let require_tls = params.require_tls;
         let mut st = self.0.lock().unwrap();
@@ -136,14 +142,41 @@ impl SmtpSend {
         self
     }
 
-    /// Add an envelope recipient (`RCPT TO`).
+    /// Add an envelope recipient (`RCPT TO`) with default DSN parameters.
     pub fn rcpt_to(self, recipient: impl Into<String>) -> Self {
-        self.0.lock().unwrap().recipients.push(recipient.into());
+        self.0
+            .lock()
+            .unwrap()
+            .recipients
+            .push((recipient.into(), DsnRecipientParams::default()));
         self
     }
 
-    /// Set envelope recipients, replacing any previously added.
+    /// Add an envelope recipient with DSN NOTIFY/ORCPT parameters (RFC 3461).
+    pub fn rcpt_to_with(
+        self,
+        recipient: impl Into<String>,
+        params: DsnRecipientParams,
+    ) -> Self {
+        self.0
+            .lock()
+            .unwrap()
+            .recipients
+            .push((recipient.into(), params));
+        self
+    }
+
+    /// Set envelope recipients, replacing any previously added (default DSN params).
     pub fn recipients(self, recipients: Vec<String>) -> Self {
+        self.0.lock().unwrap().recipients = recipients
+            .into_iter()
+            .map(|r| (r, DsnRecipientParams::default()))
+            .collect();
+        self
+    }
+
+    /// Set envelope recipients with per-recipient DSN parameters.
+    pub fn recipients_with(self, recipients: Vec<(String, DsnRecipientParams)>) -> Self {
         self.0.lock().unwrap().recipients = recipients;
         self
     }
@@ -235,6 +268,71 @@ impl SmtpSendDriver {
             .copied()
             .find(|m| auth_methods.iter().any(|s| s.eq_ignore_ascii_case(m.name())))
     }
+
+    /// Pull the next body chunk for BDAT, with one-chunk lookahead so the
+    /// LAST flag can be set correctly.
+    fn send_next_bdat_chunk(&self, data: &mut dyn SmtpClientMessageData) {
+        let mut st = self.state.lock().unwrap();
+        let current = st
+            .bdat_lookahead
+            .take()
+            .or_else(|| Self::read_one_chunk(&mut st.message));
+        let Some(cur) = current else {
+            // Empty message → BDAT 0 LAST.
+            drop(st);
+            data.write_bdat_chunk(&[], true);
+            return;
+        };
+        let following = Self::read_one_chunk(&mut st.message);
+        match following {
+            None => {
+                drop(st);
+                data.write_bdat_chunk(&cur, true);
+            }
+            Some(next) => {
+                st.bdat_lookahead = Some(next);
+                drop(st);
+                data.write_bdat_chunk(&cur, false);
+            }
+        }
+    }
+
+    fn read_one_chunk(message: &mut MessageSource) -> Option<Vec<u8>> {
+        match message {
+            MessageSource::Empty => None,
+            MessageSource::Chunks(next) => next(),
+            MessageSource::File(_) => {
+                let path = match std::mem::replace(message, MessageSource::Empty) {
+                    MessageSource::File(p) => p,
+                    other => {
+                        *message = other;
+                        return None;
+                    }
+                };
+                match File::open(&path) {
+                    Ok(f) => {
+                        *message = MessageSource::Reading(f);
+                        Self::read_one_chunk(message)
+                    }
+                    Err(_) => None,
+                }
+            }
+            MessageSource::Reading(f) => {
+                let mut buf = [0u8; 8192];
+                match f.read(&mut buf) {
+                    Ok(0) => {
+                        *message = MessageSource::Empty;
+                        None
+                    }
+                    Ok(n) => Some(buf[..n].to_vec()),
+                    Err(_) => {
+                        *message = MessageSource::Empty;
+                        None
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl SmtpClientDriver for SmtpSendDriver {
@@ -304,6 +402,23 @@ impl SmtpClientDriver for SmtpSendDriver {
             self.complete(false);
             session.quit();
             return;
+        }
+        if params.body == Some(BodyType::BinaryMime)
+            && (!caps.binary_mime || !caps.chunking)
+        {
+            drop(st);
+            // RFC 3030: BINARYMIME requires CHUNKING.
+            self.complete(false);
+            session.quit();
+            return;
+        }
+        if let (Some(size), max) = (params.size, caps.max_size) {
+            if max > 0 && size > max {
+                drop(st);
+                self.complete(false);
+                session.quit();
+                return;
+            }
         }
         drop(st);
         session.mail_from(sender.as_deref(), &params);
@@ -433,9 +548,9 @@ impl SmtpClientDriver for SmtpSendDriver {
             let st = self.state.lock().unwrap();
             st.recipients.first().cloned()
         };
-        if let Some(r) = rcpt {
+        if let Some((r, params)) = rcpt {
             self.state.lock().unwrap().rcpt_idx = 1;
-            envelope.rcpt_to(&r, &DsnRecipientParams::default());
+            envelope.rcpt_to(&r, &params);
         } else {
             // No recipients — abort.
             self.complete(false);
@@ -460,7 +575,7 @@ impl SmtpClientDriver for SmtpSendDriver {
         _ep: &mut dyn Endpoint,
         _recipient: &str,
     ) {
-        // Try next recipient or start DATA.
+        // Try next recipient or start DATA/BDAT.
         let next = {
             let mut st = self.state.lock().unwrap();
             st.accepted_rcpts += 1;
@@ -468,8 +583,8 @@ impl SmtpClientDriver for SmtpSendDriver {
             st.rcpt_idx += 1;
             st.recipients.get(idx).cloned()
         };
-        if let Some(r) = next {
-            envelope.rcpt_to(&r, &DsnRecipientParams::default());
+        if let Some((r, params)) = next {
+            envelope.rcpt_to(&r, &params);
         } else {
             envelope.start_data();
         }
@@ -490,8 +605,8 @@ impl SmtpClientDriver for SmtpSendDriver {
             st.rcpt_idx += 1;
             st.recipients.get(idx).cloned()
         };
-        if let Some(r) = next {
-            envelope.rcpt_to(&r, &DsnRecipientParams::default());
+        if let Some((r, params)) = next {
+            envelope.rcpt_to(&r, &params);
         } else if envelope.has_accepted_recipients() {
             envelope.start_data();
         } else {
@@ -502,9 +617,13 @@ impl SmtpClientDriver for SmtpSendDriver {
     }
 
     fn on_ready_for_data(&mut self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint) {
+        if data.is_bdat_mode() {
+            self.send_next_bdat_chunk(data);
+            return;
+        }
         let source = std::mem::take(&mut self.state.lock().unwrap().message);
         match source {
-            MessageSource::Empty => {}
+            MessageSource::Empty | MessageSource::Reading(_) => {}
             MessageSource::Chunks(mut next_chunk) => {
                 let mut stuffer = DotStuffer::new();
                 let mut out = Vec::with_capacity(8192);
@@ -528,7 +647,7 @@ impl SmtpClientDriver for SmtpSendDriver {
                 // holds the whole message in memory again per host.
                 let mut stuffer = DotStuffer::new();
                 let mut out = Vec::with_capacity(8192);
-                if let Ok(mut f) = std::fs::File::open(&path) {
+                if let Ok(mut f) = File::open(&path) {
                     let mut buf = [0u8; 8192];
                     loop {
                         let n = f.read(&mut buf).unwrap_or(0);
@@ -548,6 +667,10 @@ impl SmtpClientDriver for SmtpSendDriver {
             }
         }
         data.end_message();
+    }
+
+    fn on_bdat_chunk_ok(&mut self, data: &mut dyn SmtpClientMessageData, _ep: &mut dyn Endpoint) {
+        self.send_next_bdat_chunk(data);
     }
 
     fn on_data_rejected(
