@@ -13,6 +13,9 @@ use std::time::SystemTime;
 use hopf_auth::{create_server, SaslMechanism, SaslServer, SaslServerOptions, SaslServerStep};
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
 use hopf_mailbox::{Mailbox, MailboxStore};
+use hopf_otel::{
+    ExportHandle, RequestTimer, Span, SpanKind, Trace, ImapServerMetrics as OtelImapMetrics,
+};
 
 use rmimeparser::charset::base64;
 
@@ -24,9 +27,11 @@ use crate::server::codec::{
 };
 use crate::server::fetch_format::parse_fetch_args;
 use crate::server::handler::{
-    AuthenticatedHandler, ClientConnected, NotAuthenticatedHandler, SelectedHandler,
+    AuthenticatedHandler, ClientConnected, ImapConnectionMetadata, NotAuthenticatedHandler,
+    SelectedHandler,
 };
 use crate::server::idle::{is_idle_done, IdleState};
+use crate::server::metrics::ImapServerMetrics;
 use crate::server::reply::{continuation, tagged_bad, tagged_no, tagged_ok, untagged};
 use crate::server::search_parse::parse_search;
 use crate::server::service::ImapConfig;
@@ -35,6 +40,13 @@ use crate::server::views::{
     AppendView, AuthView, CloseView, ConnectedView, CopyView, FetchView, MgmtOp, MgmtView,
     SearchView, SelectView, StoreView,
 };
+
+/// In-flight command telemetry finished when the tagged reply is sent.
+struct CommandTelemetry {
+    timer: RequestTimer,
+    span: Option<Span>,
+    verb: String,
+}
 
 pub(crate) struct MailboxBundle {
     pub store: Option<Box<dyn MailboxStore>>,
@@ -106,6 +118,7 @@ pub struct ImapControlHandler {
     selected: Option<Box<dyn SelectedHandler>>,
     config: ImapConfig,
     runtime: Arc<Runtime>,
+    metrics: Arc<ImapServerMetrics>,
     lexer: ImapServerLexer,
     session: ImapSessionState,
     tls: bool,
@@ -120,6 +133,7 @@ pub struct ImapControlHandler {
     bundle: Arc<Mutex<MailboxBundle>>,
     peer: SocketAddr,
     local: SocketAddr,
+    meta: ImapConnectionMetadata,
     busy: Arc<AtomicBool>,
     cmd_queue: VecDeque<ImapCommand>,
     pending_auth: Option<PendingAuth>,
@@ -138,6 +152,11 @@ pub struct ImapControlHandler {
     idle: IdleState,
     /// QRESYNC parameters from the last SELECT (uidvalidity, modseq).
     pending_qresync: Option<(u64, u64)>,
+    otel_metrics: Option<Arc<OtelImapMetrics>>,
+    export: Option<ExportHandle>,
+    traces_enabled: bool,
+    conn_trace: Option<Trace>,
+    pending_cmd_tel: Option<CommandTelemetry>,
 }
 
 impl ImapControlHandler {
@@ -146,6 +165,7 @@ impl ImapControlHandler {
         client: Box<dyn ClientConnected>,
         config: ImapConfig,
         runtime: Arc<Runtime>,
+        metrics: Arc<ImapServerMetrics>,
     ) -> Self {
         let expect_implicit_tls = config.implicit_tls && config.tls_acceptor.is_some();
         let max_line = if config.max_line == 0 {
@@ -160,6 +180,7 @@ impl ImapControlHandler {
             selected: None,
             config,
             runtime,
+            metrics,
             lexer: ImapServerLexer::new(max_line),
             session: ImapSessionState::NotAuthenticated,
             tls: false,
@@ -176,6 +197,13 @@ impl ImapControlHandler {
             })),
             peer: SocketAddr::from(([0, 0, 0, 0], 0)),
             local: SocketAddr::from(([0, 0, 0, 0], 0)),
+            meta: ImapConnectionMetadata {
+                peer: SocketAddr::from(([0, 0, 0, 0], 0)),
+                local: SocketAddr::from(([0, 0, 0, 0], 0)),
+                tls: false,
+                user: None,
+                traceparent: None,
+            },
             busy: Arc::new(AtomicBool::new(false)),
             cmd_queue: VecDeque::new(),
             pending_auth: None,
@@ -186,6 +214,117 @@ impl ImapControlHandler {
             enabled: EnabledExtensions::default(),
             idle: IdleState::default(),
             pending_qresync: None,
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
+            conn_trace: None,
+            pending_cmd_tel: None,
+        }
+    }
+
+    /// Attach OTel metrics / traces from a telemetry pipeline.
+    pub fn with_telemetry(
+        mut self,
+        otel_metrics: Option<Arc<OtelImapMetrics>>,
+        export: Option<ExportHandle>,
+        traces_enabled: bool,
+    ) -> Self {
+        self.otel_metrics = otel_metrics;
+        self.export = export;
+        self.traces_enabled = traces_enabled;
+        self
+    }
+
+    fn sync_meta_addrs(&mut self) {
+        self.meta.peer = self.peer;
+        self.meta.local = self.local;
+        self.meta.tls = self.tls;
+        self.meta.user = self.username.clone();
+    }
+
+    fn begin_connection_telemetry(&mut self) {
+        if let Some(m) = &self.otel_metrics {
+            m.connection_opened();
+        }
+        if self.traces_enabled {
+            if let Some(export) = self.export.clone() {
+                let t = Trace::new("IMAP connection", SpanKind::Server);
+                t.set_exporter(export);
+                self.meta.traceparent = Some(t.traceparent());
+                self.conn_trace = Some(t);
+            }
+        }
+    }
+
+    fn end_connection_telemetry(&mut self) {
+        if let Some(tel) = self.pending_cmd_tel.take() {
+            self.finish_command_telemetry(tel, "aborted");
+        }
+        if let Some(trace) = self.conn_trace.take() {
+            let root = trace.root_span();
+            root.set_status_ok();
+            root.end();
+            trace.end();
+        }
+        self.meta.traceparent = None;
+        if let Some(m) = &self.otel_metrics {
+            m.connection_closed();
+        }
+    }
+
+    fn begin_command_telemetry(&mut self, verb: &str) -> Option<CommandTelemetry> {
+        if self.otel_metrics.is_none() && self.conn_trace.is_none() {
+            return None;
+        }
+        let span = if let Some(trace) = &self.conn_trace {
+            let s = trace.start_span("IMAP command", SpanKind::Server);
+            s.set_attribute("imap.command.verb", verb);
+            self.meta.traceparent = Some(trace.traceparent());
+            Some(s)
+        } else {
+            None
+        };
+        Some(CommandTelemetry {
+            timer: RequestTimer::start(),
+            span,
+            verb: verb.to_string(),
+        })
+    }
+
+    fn finish_command_telemetry(&mut self, tel: CommandTelemetry, outcome: &str) {
+        ImapServerMetrics::add(&self.metrics.commands, 1);
+        if let Some(span) = tel.span {
+            span.set_attribute("outcome", outcome);
+            if outcome == "ok" {
+                span.set_status_ok();
+            } else {
+                span.set_status_error(outcome);
+            }
+            span.end();
+        }
+        if let Some(trace) = &self.conn_trace {
+            self.meta.traceparent = Some(trace.traceparent());
+        }
+        if let Some(m) = &self.otel_metrics {
+            m.command_completed(&tel.verb, outcome, tel.timer.elapsed());
+        }
+    }
+
+    fn record_auth(&self, ok: bool) {
+        if ok {
+            ImapServerMetrics::add(&self.metrics.auth_ok, 1);
+        } else {
+            ImapServerMetrics::add(&self.metrics.auth_fail, 1);
+        }
+        if let Some(m) = &self.otel_metrics {
+            m.auth(ok);
+        }
+    }
+
+    fn record_starttls(&self) {
+        ImapServerMetrics::add(&self.metrics.starttls, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.starttls();
         }
     }
 
@@ -206,6 +345,8 @@ impl ImapControlHandler {
             return;
         }
         self.greeting_sent = true;
+        ImapServerMetrics::add(&self.metrics.connections, 1);
+        self.sync_meta_addrs();
         let caps = self.capabilities();
         let mut view = ConnectedView {
             endpoint,
@@ -222,7 +363,7 @@ impl ImapControlHandler {
             factory: Arc::clone(&self.config.mailbox_factory),
         };
         if let Some(mut c) = self.client_connected.take() {
-            c.connected(&mut view, self.peer, self.local, self.tls);
+            c.connected(&mut view, &self.meta);
             self.client_connected = Some(c);
         }
     }
@@ -248,6 +389,7 @@ impl ImapControlHandler {
         let Some(outcome) = outcome else {
             return;
         };
+        let cmd_ok = outcome.is_ok();
 
         match kind {
             PendingKind::Auth { tag, caps } => match outcome {
@@ -474,6 +616,9 @@ impl ImapControlHandler {
                 }
             },
         }
+        if let Some(tel) = self.pending_cmd_tel.take() {
+            self.finish_command_telemetry(tel, if cmd_ok { "ok" } else { "fail" });
+        }
     }
 
     fn drain_queue(&mut self, endpoint: &mut dyn Endpoint) {
@@ -512,7 +657,9 @@ impl ImapControlHandler {
             }
             return;
         }
-        let verb = cmd.verb.as_str();
+        let verb = cmd.verb.clone();
+        let tel = self.begin_command_telemetry(&verb);
+        let verb = verb.as_str();
         match verb {
             "CAPABILITY" => {
                 let caps = self.capabilities();
@@ -563,6 +710,12 @@ impl ImapControlHandler {
                 endpoint,
                 tagged_bad(&cmd.tag, &format!("Unknown command {}", cmd.verb)),
             ),
+        }
+        // Hold telemetry across storage offloads and multi-step AUTHENTICATE.
+        if self.busy.load(Ordering::Relaxed) || self.pending_auth.is_some() {
+            self.pending_cmd_tel = tel;
+        } else if let Some(tel) = tel {
+            self.finish_command_telemetry(tel, "ok");
         }
     }
 
@@ -627,6 +780,7 @@ impl ImapControlHandler {
             return;
         };
         if !self.config.store.password_match(&user, &pass) {
+            self.record_auth(false);
             self.send(endpoint, tagged_no(&cmd.tag, "Invalid credentials"));
             return;
         }
@@ -729,11 +883,17 @@ impl ImapControlHandler {
 
     fn auth_failed(&mut self, endpoint: &mut dyn Endpoint, tag: &str) {
         self.pending_auth = None;
+        self.record_auth(false);
         self.send(endpoint, tagged_no(tag, "Authentication failed"));
+        if let Some(tel) = self.pending_cmd_tel.take() {
+            self.finish_command_telemetry(tel, "fail");
+        }
     }
 
     fn finish_auth(&mut self, endpoint: &mut dyn Endpoint, tag: &str, username: String) {
+        self.record_auth(true);
         self.username = Some(username.clone());
+        self.meta.user = Some(username.clone());
         let factory = Arc::clone(&self.config.mailbox_factory);
         let Some(mut h) = self.not_authenticated.take() else {
             self.send(endpoint, tagged_no(tag, "No authentication handler"));
@@ -1496,6 +1656,8 @@ impl ProtocolHandler for ImapControlHandler {
         if endpoint.is_secure() {
             self.tls = true;
         }
+        self.sync_meta_addrs();
+        self.begin_connection_telemetry();
         self.control_handle = Some(endpoint.handle());
         if !self.expect_implicit_tls || self.tls {
             self.greet(endpoint);
@@ -1555,6 +1717,7 @@ impl ProtocolHandler for ImapControlHandler {
         if self.session != ImapSessionState::Logout {
             self.offload_close(false);
         }
+        self.end_connection_telemetry();
     }
 
     fn security_established(
@@ -1563,12 +1726,17 @@ impl ProtocolHandler for ImapControlHandler {
         info: &hopf_core::SecurityInfo,
     ) {
         self.tls = true;
+        self.meta.tls = true;
         self.peer_certificate = info.peer_certificate_fingerprint().map(str::to_string);
         if self.expect_implicit_tls && !self.greeting_sent {
             self.greet(endpoint);
             return;
         }
-        let _ = self.starttls_used;
+        if self.starttls_used {
+            self.record_starttls();
+            self.starttls_used = false;
+            return;
+        }
         self.starttls_used = false;
     }
 
@@ -1620,5 +1788,64 @@ mod tests {
         // Document expected verbs that require Selected.
         let selected_only = ["FETCH", "STORE", "SEARCH", "COPY", "CLOSE", "UID"];
         assert!(selected_only.contains(&"FETCH"));
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use hopf_auth::PasswordStore;
+    use hopf_core::{Runtime, RuntimeConfig};
+    use hopf_mailbox::MaildirFactory;
+    use hopf_otel::{OtelConfig, SpanContext, TelemetryPipeline};
+    use crate::server::handler::ImapHandlerFactory;
+
+    #[test]
+    fn with_telemetry_sets_parseable_traceparent_on_connect() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-imap-tp-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = OtelConfig::new("imap-tp-test")
+            .with_jsonl_traces(&dir)
+            .with_jsonl_metrics(&dir);
+        let pipeline = TelemetryPipeline::start(cfg).unwrap();
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let store = Arc::new(PasswordStore::new().with_user("u", "p"));
+        let factory = Arc::new(MaildirFactory::new(root.path()));
+        let listen: SocketAddr = "127.0.0.1:1143".parse().unwrap();
+        let config = ImapConfig::new(listen, "localhost", store, factory);
+        let app = crate::server::handler::DefaultImapHandlerFactory::new("ready").create();
+        let mut h = ImapControlHandler::new(
+            app,
+            config,
+            rt,
+            ImapServerMetrics::shared(),
+        )
+        .with_telemetry(
+            Some(pipeline.imap_metrics()),
+            Some(pipeline.export_handle()),
+            true,
+        );
+        h.begin_connection_telemetry();
+        let tp = h.meta.traceparent.clone().expect("traceparent set");
+        let ctx = SpanContext::from_traceparent(&tp).expect("valid traceparent");
+        assert!(!ctx.trace_id.iter().all(|&b| b == 0));
+
+        let cmd = h
+            .begin_command_telemetry("FETCH")
+            .expect("command telemetry");
+        let cmd_tp = h.meta.traceparent.clone().expect("cmd traceparent");
+        let cmd_ctx = SpanContext::from_traceparent(&cmd_tp).unwrap();
+        assert_eq!(cmd_ctx.trace_id, ctx.trace_id);
+        assert_ne!(cmd_ctx.span_id, ctx.span_id);
+        h.finish_command_telemetry(cmd, "ok");
+
+        h.end_connection_telemetry();
+        assert!(h.meta.traceparent.is_none());
+        pipeline.shutdown();
+        let _ = std::fs::remove_file(&dir);
     }
 }

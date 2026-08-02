@@ -79,6 +79,7 @@
 <li><a href="#pipelining">Pipelining</a></li>
 <li><a href="#timeouts">Timeouts</a></li>
 <li><a href="#testing">Testing</a></li>
+<li><a href="#metrics">Metrics</a></li>
 <li><a href="#limitations">Limitations</a></li>
 </ul></div>
 <h2 id="features">Features</h2>
@@ -152,7 +153,7 @@
 <h2 id="handler-spi">Handler SPI</h2>
 <p>Gumdrop-style staged traits:</p>
 <ul>
-<li><code>ClientConnected</code> → greeting</li>
+<li><code>ClientConnected</code> → greeting (<code>ImapConnectionMetadata</code>, including optional <code>traceparent</code>)</li>
 <li><code>NotAuthenticatedHandler</code> → LOGIN / AUTHENTICATE policy (<code>proceed</code> opens the store)</li>
 <li><code>AuthenticatedHandler</code> → SELECT/LIST/STATUS/APPEND policy</li>
 <li><code>SelectedHandler</code> → FETCH/STORE/SEARCH/COPY/MOVE/EXPUNGE policy</li>
@@ -310,6 +311,10 @@ ImapClient::new(&quot;mail.example.com&quot;, 143)
 <p>Unit tests run with the workspace default (<code>cargo test -p hopf-imap --lib</code>). Loopback TCP / TLS / filesystem integration tests are <strong>opt-in</strong>:</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> test <span class="at">-p</span> hopf-imap <span class="at">--features</span> integration</span></code></pre></div>
 <p>They cover raw-socket LOGIN/SELECT/FETCH/APPEND, pipelined STATUS+LIST (in-order against the Hopf server and synthetic out-of-order against a scripted server), STARTTLS and implicit-TLS fetch, hostname dial, and IDLE (server DONE handling plus client EXISTS→DONE).</p>
+<h2 id="metrics">Metrics</h2>
+<p>Process-local <code>ImapServerMetrics</code> (in <code>hopf-imap</code>): connections, <code>auth_ok</code> / <code>auth_fail</code>, commands, and <code>starttls</code> via <code>ImapService::metrics()</code>.</p>
+<p>OTLP/JSONL export (when <code>ImapService::with_telemetry(&amp;pipeline)</code> is used): <code>hopf_otel::ImapServerMetrics</code> emits <code>imap.server.connections</code>, <code>imap.server.active_connections</code>, <code>imap.server.auth</code>, <code>imap.server.starttls</code>, <code>imap.server.commands</code> (verb/outcome), and <code>imap.server.command.duration</code> (ms).</p>
+<p>With traces enabled on the pipeline, <code>ImapConnectionMetadata::traceparent</code> carries the active W3C <code>traceparent</code> for the connection or current tagged command. Handler SPI implementers can pass it to outbound HTTP with <code>hopf_otel::with_traceparent</code>.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li>The <code>ImapFetch</code>/<code>ImapIdle</code> auto-pilots only drive AUTHENTICATE PLAIN themselves (same scope limit as hopf-pop3's auto-pilot) — a custom driver is needed to exercise LOGIN/CRAM-MD5/DIGEST-MD5/SCRAM-SHA-256/OAUTHBEARER/EXTERNAL from the client side, though the underlying <code>authenticate(mechanism, initial)</code> + <code>ImapClientAuthExchange</code> API is mechanism-agnostic. EXTERNAL isn't reachable end-to-end yet on either side: the TLS layer doesn't plumb a peer certificate through to <code>SaslServerOptions</code>.</li>

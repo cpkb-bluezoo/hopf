@@ -17,7 +17,7 @@ mod utf8;
 pub use ascii::{format_ftp_mtime, normalize_ascii_newlines};
 pub use codec::{FtpCommand, FtpServerLexer, MAX_COMMAND_LINE};
 pub use control::FtpControlHandler;
-pub use data::StorTransfer;
+pub use data::{StorTransfer, TransferTelemetry};
 pub use fs::{
     BasicFtpFileSystem, DirectoryChange, FtpFileInfo, FtpFileOpResult, FtpFileSystem, UniqueName,
 };

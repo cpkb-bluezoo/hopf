@@ -17,7 +17,7 @@ pub use control::Pop3ControlHandler;
 pub use egress::Pop3DotStuffer;
 pub use handler::{
     AuthorizationHandler, ClientConnected, DefaultPop3Handler, DefaultPop3HandlerFactory,
-    Pop3HandlerFactory, TransactionHandler,
+    Pop3ConnectionMetadata, Pop3HandlerFactory, TransactionHandler,
 };
 pub use handler::{
     AuthenticateState, ConnectedState, ListState, ListWriter, MailboxStatusState, MarkDeletedState,
