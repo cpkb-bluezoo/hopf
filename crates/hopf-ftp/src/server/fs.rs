@@ -474,6 +474,7 @@ mod tests {
             local: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21),
             user: None,
             tls: false,
+            traceparent: None,
         }
     }
 

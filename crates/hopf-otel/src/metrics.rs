@@ -230,6 +230,111 @@ impl SmtpServerMetrics {
     }
 }
 
+/// FTP server metrics instruments (OTLP export).
+pub struct FtpServerMetrics {
+    export: ExportHandle,
+    active_connections: AtomicI64,
+}
+
+impl FtpServerMetrics {
+    /// Create with export handle.
+    pub fn new(export: ExportHandle) -> Arc<Self> {
+        Arc::new(Self {
+            export,
+            active_connections: AtomicI64::new(0),
+        })
+    }
+
+    /// Control connection accepted.
+    pub fn connection_opened(&self) {
+        let v = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "ftp.server.connections",
+            attributes: Vec::new(),
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "ftp.server.active_connections",
+            attributes: Vec::new(),
+            value: v,
+        });
+    }
+
+    /// Control connection closed.
+    pub fn connection_closed(&self) {
+        let v = self.active_connections.fetch_sub(1, Ordering::Relaxed) - 1;
+        self.export.try_send_metric(MetricPoint::UpDown {
+            name: "ftp.server.active_connections",
+            attributes: Vec::new(),
+            value: v.max(0),
+        });
+    }
+
+    /// USER/PASS authentication attempt finished.
+    pub fn auth(&self, ok: bool) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "ftp.server.auth",
+            attributes: vec![(
+                "result".into(),
+                if ok { "ok" } else { "fail" }.into(),
+            )],
+            value: 1,
+        });
+    }
+
+    /// One control command processed.
+    pub fn command(&self) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "ftp.server.commands",
+            attributes: Vec::new(),
+            value: 1,
+        });
+    }
+
+    /// PASV/EPSV listener bound.
+    pub fn pasv_bind(&self) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "ftp.server.pasv_binds",
+            attributes: Vec::new(),
+            value: 1,
+        });
+    }
+
+    /// Data transfer finished (RETR/STOR/LIST/…).
+    ///
+    /// `direction` is typically `"download"`, `"upload"`, or `"listing"`.
+    /// `outcome` is `"ok"` or `"fail"`.
+    pub fn transfer_completed(
+        &self,
+        direction: &str,
+        outcome: &str,
+        duration: std::time::Duration,
+        bytes: u64,
+    ) {
+        let dir_a = ("ftp.transfer.direction".into(), direction.into());
+        let out_a = ("outcome".into(), outcome.into());
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "ftp.server.transfers",
+            attributes: vec![dir_a.clone(), out_a.clone()],
+            value: 1,
+        });
+        self.export.try_send_metric(MetricPoint::Histogram {
+            name: "ftp.server.transfer.duration",
+            unit: "ms",
+            attributes: vec![dir_a.clone(), out_a],
+            value: duration.as_secs_f64() * 1000.0,
+        });
+        if outcome == "ok" && bytes > 0 {
+            self.export.try_send_metric(MetricPoint::Histogram {
+                name: "ftp.server.transfer.size",
+                unit: "By",
+                attributes: vec![dir_a],
+                value: bytes as f64,
+            });
+        }
+    }
+}
+
 /// Timing helper for one request / transaction.
 #[derive(Debug)]
 pub struct RequestTimer {
@@ -283,6 +388,36 @@ mod tests {
             "missing duration metric: {body}"
         );
         assert!(body.contains("smtp.server.messages"), "{body}");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn ftp_transfer_emits_duration_to_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-otel-ftp-tx-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let cfg = OtelConfig::new("ftp-tx-test").with_jsonl_metrics(&dir);
+        let (handle, join, _running) = spawn_worker(cfg);
+        let metrics = FtpServerMetrics::new(handle.clone());
+        metrics.connection_opened();
+        metrics.transfer_completed(
+            "download",
+            "ok",
+            std::time::Duration::from_millis(5),
+            42,
+        );
+        metrics.connection_closed();
+        handle.flush();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        handle.shutdown();
+        let _ = join.join();
+        let body = std::fs::read_to_string(&dir).unwrap_or_default();
+        assert!(
+            body.contains("ftp.server.transfer.duration"),
+            "missing duration metric: {body}"
+        );
         let _ = std::fs::remove_file(&dir);
     }
 }

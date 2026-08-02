@@ -27,7 +27,9 @@ pub use batch::ExportHandle;
 pub use config::OtelConfig;
 pub use event::{EventKind, TelemetryEvent};
 pub use instrument::InstrumentedServerFactory;
-pub use metrics::{HttpServerMetrics, MetricPoint, RequestTimer, SmtpServerMetrics};
+pub use metrics::{
+    FtpServerMetrics, HttpServerMetrics, MetricPoint, RequestTimer, SmtpServerMetrics,
+};
 pub use pipeline::TelemetryPipeline;
 pub use propagate::{
     inject_trace, inject_traceparent, with_trace, with_traceparent, OwnedPropagatingClientWriter,
