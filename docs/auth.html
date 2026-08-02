@@ -78,6 +78,8 @@
 <li><a href="#architecture">Architecture</a></li>
 <li><a href="#trustpolicy">TrustPolicy</a></li>
 <li><a href="#credential-stores">Credential stores</a></li>
+<li><a href="#passwordstore"><code>PasswordStore</code></a></li>
+<li><a href="#pamcredentialstore"><code>PamCredentialStore</code></a></li>
 <li><a href="#sasl-mechanisms">SASL mechanisms</a></li>
 <li><a href="#http-digest-helpers">HTTP Digest helpers</a></li>
 <li><a href="#configuration">Configuration</a></li>
@@ -206,6 +208,10 @@
 <tr>
 <td><code>LdapCredentialStore</code> (<a href="ldap.html"><code>hopf-ldap</code></a>)</td>
 <td>Production LDAP search-then-bind (PLAIN/LOGIN); keeps LDAP out of <code>hopf-auth</code></td>
+</tr>
+<tr>
+<td><code>PamCredentialStore</code> (feature <code>pam</code>)</td>
+<td>System PAM password check (PLAIN/LOGIN); Unix; blocking — off-reactor only</td>
 </tr>
 <tr>
 <td><code>ScramCredentials</code></td>
@@ -369,7 +375,21 @@
 </tr>
 </tbody>
 </table>
-<p>No Cargo features.</p>
+<p>No Cargo features for the demo store.</p>
+<h3 id="pamcredentialstore"><code>PamCredentialStore</code></h3>
+<p>Optional feature <code>pam</code> on <code>hopf-auth</code> (and umbrella <code>hopf</code> feature <code>pam</code>). Unix only; links <code>libpam</code> / OpenPAM via in-tree FFI.</p>
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="co">// Cargo.toml: hopf-auth = { version = &quot;…&quot;, features = [&quot;pam&quot;] }</span>
+<span class="kw">use</span> hopf_auth<span class="op">::{</span>PamCredentialStore<span class="op">,</span> PamStoreConfig<span class="op">};</span>
+
+<span class="kw">let</span> store <span class="op">=</span> PamCredentialStore<span class="op">::</span>new(PamStoreConfig<span class="op">::</span>new(<span class="st">&quot;login&quot;</span>))
+    <span class="op">.</span>shared()<span class="op">;</span>
+<span class="co">// SmtpConfig::new(…).with_store(store)</span>
+</code></pre></div>
+<ul>
+<li>Mechanisms: PLAIN, LOGIN only (no digest/SCRAM/bearer).</li>
+<li><code>password_match</code> is blocking — call from a storage/worker pool, never a reactor thread.</li>
+<li>Default service name: <code>login</code> (<code>DEFAULT_PAM_SERVICE</code>). Point at a custom PAM stack (e.g. <code>/etc/pam.d/hopf</code>) when deploying.</li>
+</ul>
 <h2 id="wiring">Wiring</h2>
 <p><strong>FTP:</strong></p>
 <div class="sourceCode" id="cb6"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> policy <span class="op">=</span> <span class="pp">PasswordTrustPolicy::</span><span class="kw">default</span>()<span class="op">.</span>with_user(<span class="st">&quot;ftp&quot;</span><span class="op">,</span> <span class="st">&quot;ftp&quot;</span>)<span class="op">.</span>shared()<span class="op">;</span></span>
@@ -393,7 +413,7 @@
 <li><strong>No GSSAPI / Kerberos</strong> (deliberate).</li>
 <li>DIGEST-MD5 kept for parity only (deprecated by RFC 6331).</li>
 <li>OAUTHBEARER carries the token in the client “password” slot.</li>
-<li><code>PasswordStore</code> is <strong>in-memory</strong> (demo-grade). For production password AUTH, use <a href="ldap.html"><code>LdapCredentialStore</code></a> (or another <code>CredentialStore</code> impl such as a future PAM backend).</li>
+<li><code>PasswordStore</code> is <strong>in-memory</strong> (demo-grade). For production password AUTH, use <a href="ldap.html"><code>LdapCredentialStore</code></a> or feature <code>pam</code>’s <code>PamCredentialStore</code>.</li>
 <li><code>plaintext_password</code> fallback for CRAM-MD5 is discouraged in production.</li>
 <li>SMTP wire currently advertises <strong>AUTH PLAIN</strong> only (<a href="smtp.html">SMTP</a>), even though the auth crate supports more mechanisms.</li>
 <li>SCRAM-SHA-256-PLUS has no cross-mechanism downgrade detection — see the <a href="#scram-channel-binding">channel binding</a> section.</li>

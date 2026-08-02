@@ -10,6 +10,7 @@ LDAPv3 client and [`CredentialStore`](../hopf-auth) backend for Hopf
 | `store` | `LdapCredentialStore` — search-then-bind Realm |
 
 `CredentialStore` stays LDAP-free in `hopf-auth`; this crate plugs in as a
-production backend (see issue #124). PAM and other stores remain separate.
+production backend (see issue #124). System PAM is optional feature `pam` on
+`hopf-auth` (`PamCredentialStore`).
 
 See [docs/ldap.html](../../docs/ldap.html) and [docs/auth.html](../../docs/auth.html).

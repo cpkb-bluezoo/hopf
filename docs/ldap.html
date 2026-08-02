@@ -104,14 +104,14 @@
         ▼
 hopf-auth::CredentialStore  ←── PasswordStore (demo)
         │                   ←── hopf-ldap::LdapCredentialStore
-        │                   ←── future PamCredentialStore
+        │                   ←── hopf-auth::PamCredentialStore (feature pam)
         ▼
 hopf-ldap::LdapClient  →  ProtocolHandler on Runtime
         │
         ▼
 hopf-ldap::asn1 (BER)
 </code></pre>
-<p><code>CredentialStore</code> stays protocol-agnostic (same as Gumdrop <code>Realm</code>). LDAP lives only in <code>hopf-ldap</code>.</p>
+<p><code>CredentialStore</code> stays protocol-agnostic (same as Gumdrop <code>Realm</code>). LDAP lives only in <code>hopf-ldap</code>; system PAM is optional feature <code>pam</code> on <code>hopf-auth</code>.</p>
 
 <h2 id="ber">BER codec</h2>
 <p>Module <code>hopf_ldap::asn1</code> ports Gumdrop’s definite-length BER stack: <code>BerEncoder</code>, <code>BerDecoder</code> (streaming <code>receive</code> / <code>next</code>), <code>Asn1Element</code>, tag helpers. Indefinite length is rejected. This is LDAP-oriented BER, not full DER/CER.</p>
@@ -178,7 +178,7 @@ LdapClient<span class="op">::</span>connect(<span class="op">&amp;</span>rt<span
 <ul>
 <li>No modify/add/delete/compare admin API (deferred)</li>
 <li>No SASL bind to the directory server (store uses simple bind only)</li>
-<li>Roles / <code>memberOf</code> not on <code>CredentialStore</code> yet</li>
+<li>No role / <code>memberOf</code> API — Gumdrop used that for servlet + FTP/mail admin; Hopf has no consumers yet (quota uses a separate lookup callback if needed)</li>
 <li>Hostname dial uses blocking <code>ToSocketAddrs</code>; prefer a resolved <code>SocketAddr</code> when possible</li>
 <li>Referral chase does not rewrite service credentials per URL; same bind DN/password is reused</li>
 </ul>

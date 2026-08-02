@@ -55,6 +55,8 @@ otel = ["dep:hopf-otel"]
 mqtt = ["dep:hopf-mqtt"]
 amqp = ["dep:hopf-amqp"]
 # Pass-throughs to optional sub-crate features.
+# `pam` is opt-in (links libpam); not included in `full`.
+pam = ["auth", "hopf-auth/pam"]
 h3 = ["http", "quic", "hopf-http/h3"]
 dns-server = ["dns", "hopf-dns/server"]
 dot = ["dns", "hopf-dns/dot"]
