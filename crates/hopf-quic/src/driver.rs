@@ -52,6 +52,13 @@ pub(crate) enum DriverCmd {
     /// (RFC 9000 §10.2 CONNECTION_CLOSE), e.g. an HTTP/3 connection-level
     /// protocol error.
     ConnectionClose { conn: ConnectionHandle, error_code: u64 },
+    /// Client mode: open another bidirectional stream on the live connection
+    /// and attach a handler from `factory`. `reply` reports whether the
+    /// open was accepted (queued until Connected, or opened immediately).
+    OpenBi {
+        factory: HandlerFactory,
+        reply: std::sync::mpsc::SyncSender<io::Result<()>>,
+    },
     ScheduleTimer {
         delay: Duration,
         callback: Box<dyn FnOnce() + Send>,
@@ -80,6 +87,46 @@ impl QuicDriverHandle {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+    }
+
+    /// Whether the driver thread is still running (not shut down). A live
+    /// driver may still have lost its QUIC connection — use [`Self::open_bi`]
+    /// to probe that.
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Open another client-initiated bidirectional stream on the live
+    /// client connection, attaching a handler from `factory`.
+    ///
+    /// Intended for connection reuse (e.g. DNS-over-QUIC: one QUIC
+    /// connection, one stream per query). Returns `Err` if the driver is
+    /// gone or there is no usable client connection — callers should dial
+    /// fresh in that case. If the handshake is still in progress the open
+    /// is queued and applied once [`Event::Connected`] fires.
+    pub fn open_bi(&self, factory: HandlerFactory) -> io::Result<()> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "QUIC driver shut down",
+            ));
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.cmd_tx
+            .send(DriverCmd::OpenBi {
+                factory,
+                reply: tx,
+            })
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::NotConnected, "QUIC driver shut down")
+            })?;
+        let _ = self.waker.wake();
+        rx.recv().unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "QUIC driver shut down before open_bi",
+            ))
+        })
     }
 }
 
@@ -224,6 +271,9 @@ struct ConnSlot {
     streams: HashMap<StreamId, StreamSlot>,
     /// Client: open first bi stream after Connected.
     client_pending_open: bool,
+    /// Client: additional [`DriverCmd::OpenBi`] requests that arrived
+    /// before the handshake completed — drained in [`Driver::on_connected`].
+    pending_open_bi: std::collections::VecDeque<HandlerFactory>,
     /// Hooks-mode application connection (H3).
     app: Option<Box<dyn QuicConnection>>,
     /// Keys from ConnRecorder → StreamId for locally opened streams.
@@ -346,6 +396,7 @@ impl Driver {
                             remote: peer,
                             streams: HashMap::new(),
                             client_pending_open: pending_open,
+                            pending_open_bi: std::collections::VecDeque::new(),
                             app: None,
                             local_keys: HashMap::new(),
                         },
@@ -453,8 +504,51 @@ impl Driver {
                         }
                     }
                 }
+                DriverCmd::OpenBi { factory, reply } => {
+                    let result = self.open_bi_stream(factory);
+                    let _ = reply.send(result);
+                }
             }
         }
+    }
+
+    /// Open (or queue) a client-initiated bi stream with an explicit factory.
+    fn open_bi_stream(&mut self, factory: HandlerFactory) -> io::Result<()> {
+        if !matches!(self.mode, DriverMode::Client { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "open_bi is only supported on client (non-hooks) drivers",
+            ));
+        }
+        let Some(ch) = self.connections.keys().next().copied() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no QUIC connection to open a stream on",
+            ));
+        };
+        let pending = self
+            .connections
+            .get(&ch)
+            .map(|s| s.client_pending_open)
+            .unwrap_or(true);
+        if pending {
+            if let Some(slot) = self.connections.get_mut(&ch) {
+                slot.pending_open_bi.push_back(factory);
+            }
+            return Ok(());
+        }
+        let Some(id) = self
+            .connections
+            .get_mut(&ch)
+            .and_then(|s| s.conn.streams().open(Dir::Bi))
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "cannot open another bidirectional QUIC stream",
+            ));
+        };
+        self.attach_stream_with_factory(ch, id, factory);
+        Ok(())
     }
 
     fn on_udp_readable(&mut self, now: Instant) -> io::Result<()> {
@@ -481,6 +575,7 @@ impl Driver {
                                         remote,
                                         streams: HashMap::new(),
                                         client_pending_open: false,
+                                        pending_open_bi: std::collections::VecDeque::new(),
                                         app: None,
                                         local_keys: HashMap::new(),
                                     },
@@ -638,6 +733,22 @@ impl Driver {
                 if let Some(id) = slot.conn.streams().open(Dir::Bi) {
                     self.attach_stream_dir(ch, id, Dir::Bi);
                 }
+            }
+            // Drain any open_bi requests that arrived during the handshake.
+            let pending: Vec<HandlerFactory> = self
+                .connections
+                .get_mut(&ch)
+                .map(|s| s.pending_open_bi.drain(..).collect())
+                .unwrap_or_default();
+            for factory in pending {
+                let Some(id) = self
+                    .connections
+                    .get_mut(&ch)
+                    .and_then(|s| s.conn.streams().open(Dir::Bi))
+                else {
+                    break;
+                };
+                self.attach_stream_with_factory(ch, id, factory);
             }
         }
         if matches!(self.mode, DriverMode::Server { .. }) {
@@ -857,6 +968,47 @@ impl Driver {
         let sec = endpoint.security_info().clone();
         handler.security_established(&mut endpoint, &sec);
 
+        if let Some(slot) = self.connections.get_mut(&ch) {
+            slot.streams.insert(
+                id,
+                StreamSlot {
+                    queues,
+                    endpoint,
+                    handler,
+                    send_only: matches!(dir, Dir::Uni),
+                },
+            );
+        }
+    }
+
+    /// Like [`Self::attach_stream_dir`] for a client-opened bi stream whose
+    /// handler comes from an explicit factory (connection-reuse path).
+    fn attach_stream_with_factory(
+        &mut self,
+        ch: ConnectionHandle,
+        id: StreamId,
+        factory: HandlerFactory,
+    ) {
+        let (remote, local, security) = match self.connections.get(&ch) {
+            Some(s) => (s.remote, self.local_addr, security_info_from_conn(&s.conn)),
+            None => return,
+        };
+        let queues = Arc::new(Mutex::new(StreamQueues::new()));
+        let mut endpoint = QuicStreamEndpoint::new(
+            id,
+            ch,
+            local,
+            remote,
+            security,
+            Arc::clone(&queues),
+            self.cmd_tx.clone(),
+            Arc::clone(&self.waker),
+            Arc::clone(&self.execute),
+        );
+        let mut handler = factory();
+        handler.connected(&mut endpoint);
+        let sec = endpoint.security_info().clone();
+        handler.security_established(&mut endpoint, &sec);
         if let Some(slot) = self.connections.get_mut(&ch) {
             slot.streams.insert(
                 id,
