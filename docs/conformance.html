@@ -652,7 +652,7 @@
 <tr><td>AUTH (SASL, RFC 5034) — initial response, cancel with <code>*</code></td><td>5034 §4</td><td>Compliant</td><td><code>control.rs:376-484</code></td></tr>
 <tr><td>All 7 SASL mechanisms wired (PLAIN/LOGIN/CRAM-MD5/DIGEST-MD5/SCRAM-SHA-256/OAUTHBEARER/EXTERNAL, no GSSAPI)</td><td>various</td><td>Compliant</td><td><code>control.rs:397-413</code> — the one protocol crate that connects the full <code>hopf-auth</code> mechanism set</td></tr>
 <tr><td>STLS (pre-auth only)</td><td>RFC 2595 §4</td><td>Compliant</td><td><code>control.rs:283-299</code></td></tr>
-<tr><td>UTF8</td><td>RFC 6856 §3</td><td>Partial</td><td>Toggle accepted and stored, but the flag is never read anywhere else — no observable behavioral change</td></tr>
+<tr><td>UTF8</td><td>RFC 6856 §3</td><td>Compliant</td><td>CAPA advertises <code>UTF8 USER</code>; after <code>UTF8</code>, LIST/TOP/RETR may return non-ASCII content; without UTF8 mode those commands fail with <code>[UTF8]</code> for non-ASCII messages; STLS after UTF8 is rejected</td></tr>
 <tr><td>STAT/LIST/RETR/DELE/RSET/TOP/UIDL/NOOP</td><td>§5,§7</td><td>Compliant</td><td>All route through the <code>Mailbox</code> trait, never touch a path/File directly (verified for RETR/TOP)</td></tr>
 <tr><td>DELE session-only marks, RSET clears, QUIT commits (expunge), abrupt disconnect discards without deleting</td><td>§6</td><td>Compliant</td><td>Exact match to spec, verified against <code>hopf-mailbox</code>'s <code>close(expunge: bool)</code> contract in both Maildir and mbox backends</td></tr>
 <tr><td>CAPA + all advertised extensions (SASL/STLS/UTF8/PIPELINING/IMPLEMENTATION/RESP-CODES/EXPIRE/LOGIN-DELAY)</td><td>2449</td><td>Compliant</td><td><code>control.rs:242-281</code></td></tr>
