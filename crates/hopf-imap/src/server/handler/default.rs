@@ -23,14 +23,22 @@ use crate::server::status_items::StatusItem;
 /// Factory for [`DefaultImapHandler`].
 pub struct DefaultImapHandlerFactory {
     greeting: Arc<str>,
+    preauth_username: Option<Arc<str>>,
 }
 
 impl DefaultImapHandlerFactory {
-    /// Create with greeting banner text (without untagged OK prefix).
+    /// Create with greeting banner text (without untagged OK / PREAUTH prefix).
     pub fn new(greeting: impl Into<String>) -> Self {
         Self {
             greeting: greeting.into().into(),
+            preauth_username: None,
         }
+    }
+
+    /// When set, connections are greeted with PREAUTH for this user.
+    pub fn with_preauth(mut self, username: Option<String>) -> Self {
+        self.preauth_username = username.map(|u| Arc::<str>::from(u));
+        self
     }
 }
 
@@ -38,6 +46,7 @@ impl ImapHandlerFactory for DefaultImapHandlerFactory {
     fn create(&self) -> Box<dyn ClientConnected> {
         Box::new(DefaultImapHandler {
             greeting: Arc::clone(&self.greeting),
+            preauth_username: self.preauth_username.clone(),
         })
     }
 }
@@ -46,6 +55,7 @@ impl ImapHandlerFactory for DefaultImapHandlerFactory {
 #[derive(Clone)]
 pub struct DefaultImapHandler {
     greeting: Arc<str>,
+    preauth_username: Option<Arc<str>>,
 }
 
 impl ClientConnected for DefaultImapHandler {
@@ -56,7 +66,11 @@ impl ClientConnected for DefaultImapHandler {
         _local: SocketAddr,
         _tls: bool,
     ) {
-        state.accept_connection(&self.greeting, Box::new(self.clone()));
+        if let Some(user) = self.preauth_username.as_deref() {
+            state.accept_preauth(&self.greeting, user, Box::new(self.clone()));
+        } else {
+            state.accept_connection(&self.greeting, Box::new(self.clone()));
+        }
     }
 
     fn disconnected(&mut self) {}

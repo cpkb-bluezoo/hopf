@@ -104,7 +104,7 @@
 </tr>
 <tr>
 <td><code>IDLE</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc2177">RFC 2177</a> — continuation + <code>DONE</code>; mailbox EXISTS/RECENT polled off-reactor</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2177">RFC 2177</a> — continuation + <code>DONE</code>; mailbox polled off-reactor for EXISTS / EXPUNGE / FETCH FLAGS (Maildir <code>refresh</code>); auto-completes after <code>idle_max_duration</code> (default 29 minutes)</td>
 </tr>
 <tr>
 <td><code>UIDPLUS</code></td>
@@ -116,7 +116,7 @@
 </tr>
 <tr>
 <td><code>NAMESPACE</code></td>
-<td><a href="https://www.rfc-editor.org/rfc/rfc2342">RFC 2342</a> — personal namespace from the mailbox store</td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2342">RFC 2342</a> — personal namespace from the mailbox store; optional other-users / shared namespaces via <code>ImapConfig</code></td>
 </tr>
 <tr>
 <td><code>ENABLE</code> / <code>CONDSTORE</code> / <code>QRESYNC</code></td>
@@ -313,9 +313,8 @@ ImapClient::new(&quot;mail.example.com&quot;, 143)
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li>The <code>ImapFetch</code>/<code>ImapIdle</code> auto-pilots only drive AUTHENTICATE PLAIN themselves (same scope limit as hopf-pop3's auto-pilot) — a custom driver is needed to exercise LOGIN/CRAM-MD5/DIGEST-MD5/SCRAM-SHA-256/OAUTHBEARER/EXTERNAL from the client side, though the underlying <code>authenticate(mechanism, initial)</code> + <code>ImapClientAuthExchange</code> API is mechanism-agnostic. EXTERNAL isn't reachable end-to-end yet on either side: the TLS layer doesn't plumb a peer certificate through to <code>SaslServerOptions</code>.</li>
-<li>A mailbox handle is a point-in-time snapshot: IDLE reports appends made through the same session’s store, but changes written by other processes are not observed until reselect.</li>
 <li>QRESYNC does not fabricate <code>VANISHED (EARLIER)</code> history; clients fall back to full resync.</li>
-<li>mbox backend: no hierarchy / COPY / MOVE (see <a href="mailbox.html">Mailbox</a>).</li>
+<li>mbox backend: no hierarchy / COPY / MOVE (see <a href="mailbox.html">Mailbox</a>); IDLE <code>refresh</code> is a no-op for mbox (Maildir rescans <code>new/</code>/<code>cur/</code> each poll).</li>
 <li>BODYSTRUCTURE body size/line counts reflect <code>rmimeparser</code>'s decoded body bytes; for <code>base64</code>/<code>quoted-printable</code>-encoded parts this differs from the RFC-mandated wire-encoded octet count (<code>7bit</code>/<code>8bit</code>/<code>binary</code> parts, including <code>message/rfc822</code>, are unaffected since decoded and wire bytes are identical there).</li>
 <li>BODYSTRUCTURE extension data always reports Content-Language/Content-Location as <code>NIL</code> (not parsed by <code>rmimeparser</code>'s handler trait) and Content-Disposition parameters other than <code>filename</code> are omitted (<code>rmimeparser</code> only supports named parameter lookup, not enumeration).</li>
 </ul>
