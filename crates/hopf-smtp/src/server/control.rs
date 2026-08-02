@@ -1096,6 +1096,9 @@ impl SmtpControlHandler {
                 // raw-line mode — see `SmtpServerLexer::expect_sasl_response`,
                 // armed by `cmd_auth` right after the `334` challenge is sent.
                 let cmds = self.lexer.feed(data);
+                if self.lexer.took_line_too_long() {
+                    self.send_enhanced(endpoint, 500, "5.5.2", "Line too long");
+                }
                 for cmd in cmds {
                     self.dispatch(endpoint, cmd);
                 }

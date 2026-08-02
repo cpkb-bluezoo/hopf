@@ -135,6 +135,8 @@ pub struct SmtpServerLexer {
     have_arg: bool,
     raw: Vec<u8>,
     ready: Vec<SmtpCommand>,
+    /// Set when a verb, argument, or SASL line exceeded [`Self::max_line`].
+    line_too_long: bool,
 }
 
 impl SmtpServerLexer {
@@ -149,6 +151,7 @@ impl SmtpServerLexer {
             have_arg: false,
             raw: Vec::new(),
             ready: Vec::new(),
+            line_too_long: false,
         }
     }
 
@@ -161,11 +164,19 @@ impl SmtpServerLexer {
         self.raw.clear();
     }
 
+    /// Whether a line exceeded the length cap since the last call (clears the flag).
+    ///
+    /// RFC 5321 §4.5.3 — the server should reply `500` rather than silently
+    /// discarding the over-long command.
+    pub fn took_line_too_long(&mut self) -> bool {
+        std::mem::take(&mut self.line_too_long)
+    }
+
     /// Feed inbound control bytes; returns newly completed commands.
     ///
     /// Consumes everything given — `*data` is always left empty. A line
-    /// whose verb or argument exceeds the cap is silently discarded (no
-    /// command produced), matching the prior lexer's behavior.
+    /// whose verb or argument exceeds the cap is discarded (no command
+    /// produced) and flagged via [`took_line_too_long`](Self::took_line_too_long).
     pub fn feed(&mut self, data: &mut &[u8]) -> Vec<SmtpCommand> {
         for &b in data.iter() {
             self.push_byte(b);
@@ -227,6 +238,7 @@ impl SmtpServerLexer {
                         self.state = State::RawLineCr;
                     } else if self.raw.len() >= self.max_line {
                         self.raw.clear();
+                        self.line_too_long = true;
                         self.state = State::Resync;
                     } else {
                         self.raw.push(b);
@@ -242,6 +254,7 @@ impl SmtpServerLexer {
                     // Literal CR mid-line — keep it as content.
                     if self.raw.len() >= self.max_line {
                         self.raw.clear();
+                        self.line_too_long = true;
                         self.state = State::Resync;
                         return;
                     }
@@ -259,6 +272,7 @@ impl SmtpServerLexer {
             self.verb.clear();
             self.arg.clear();
             self.have_arg = false;
+            self.line_too_long = true;
             self.state = State::Resync;
             return;
         }
@@ -554,7 +568,9 @@ mod tests {
         let mut lex = SmtpServerLexer::new(4);
         let mut data: &[u8] = b"TOOLONG arg\r\nNOOP\r\n";
         let cmds = lex.feed(&mut data);
+        assert!(lex.took_line_too_long());
         assert_eq!(cmds, vec![SmtpCommand::Noop]);
+        assert!(!lex.took_line_too_long());
     }
 
     #[test]
