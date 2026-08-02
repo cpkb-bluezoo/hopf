@@ -12,7 +12,8 @@ Control and data connections, PASV via dynamic `Runtime` listeners, stock
 
 - `FtpClient` — builder + `connect(&Arc<Runtime>, pipeline)`; returns immediately
 - `FtpClientTimeouts` — `dns` / `connect` / `stage` / `data`
-- `FtpGet` / `FtpPut` — stock `FtpPipeline`s (TYPE I → PASV/EPSV → RETR/STOR → QUIT)
+- `FtpGet` / `FtpPut` — stock `FtpPipeline`s (TYPE I → data setup → RETR/STOR → QUIT)
+- Data channel: passive `PASV`/`EPSV` (default) or active `PORT`/`EPRT` via `FtpClient::active_mode`
 - Custom workflows implement `FtpPipeline` and issue ops via `FtpSessionWrite`
 
 ```rust

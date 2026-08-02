@@ -3,31 +3,45 @@
 //! Async FTP control-connection [`ProtocolHandler`].
 //!
 //! Drives the FTP state machine: welcome banner → auth → pipeline operations
-//! (TYPE / PASV / RETR / STOR / LIST / arbitrary commands / QUIT).
+//! (TYPE / PASV|PORT / RETR / STOR / LIST / arbitrary commands / QUIT).
 //!
-//! Data connections are opened via the [`Runtime`] from the PASV/EPSV reply;
-//! control and data handlers share a [`TransferState`] to synchronise the
-//! `226` control reply with the data-channel close.
+//! Data connections are opened via the [`Runtime`]: dialing from a PASV/EPSV
+//! reply in passive mode, or binding a one-shot listener and advertising it
+//! with PORT/EPRT in active mode. Control and data handlers share a
+//! [`TransferState`] to synchronise the `226` control reply with the
+//! data-channel close.
 
 use std::collections::VecDeque;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hopf_core::{
-    Endpoint, ProtocolHandler, Runtime, SecurityInfo, SharedTlsConnector, TcpConnectorConfig,
-    TimerHandle,
+    BindingId, Endpoint, IpNet, PeerAcl, ProtocolHandler, Runtime, SecurityInfo,
+    SharedTlsAcceptor, SharedTlsConnector, TcpConnectorConfig, TcpListenerConfig, TimerHandle,
 };
 
-use super::data::{FtpDataRetrHandler, FtpDataStorHandler, TransferState};
+use super::data::{
+    ActiveAcceptGuard, FtpDataRetrHandler, FtpDataStorHandler, TransferState,
+};
 use super::error::FtpError;
-use super::reply::{FtpEvent, FtpReplyLexer, FtpReplyShape};
-use super::{FtpClientTimeouts, FtpPipeline, OpQueue, QueuedOp};
+use super::reply::{
+    format_eprt_arg, format_port_arg, FtpEvent, FtpReplyLexer, FtpReplyShape,
+};
+use super::{FtpClientDataMode, FtpClientTimeouts, FtpPipeline, OpQueue, QueuedOp};
 
 // ---------------------------------------------------------------------------
 // Control-connection state machine
 // ---------------------------------------------------------------------------
+
+/// How the data channel for the current transfer will be established.
+enum DataChannel {
+    /// Dial this address (after `PASV`/`EPSV`).
+    Passive(SocketAddr),
+    /// Already listening (binding tracked on the control handler).
+    Active,
+}
 
 enum ControlState {
     /// Waiting for the server's `220` welcome banner.
@@ -60,10 +74,17 @@ enum ControlState {
         offset: Option<u64>,
         transfer: Arc<Mutex<TransferState>>,
     },
+    /// `PORT`/`EPRT` sent; waiting for `200`.
+    AwaitPortReply {
+        verb: String,
+        path: String,
+        offset: Option<u64>,
+        transfer: Arc<Mutex<TransferState>>,
+    },
     /// `REST offset` sent; waiting for `350` before opening the data
-    /// connection and sending the transfer verb.
+    /// connection (passive) or sending the transfer verb (active).
     AwaitRestReply {
-        addr: SocketAddr,
+        channel: DataChannel,
         verb: String,
         path: String,
         transfer: Arc<Mutex<TransferState>>,
@@ -81,7 +102,9 @@ enum ControlState {
 /// Async FTP control-connection handler.
 pub(crate) struct FtpControlHandler {
     credentials: Option<(String, String)>,
+    data_mode: FtpClientDataMode,
     prefer_epsv: bool,
+    prefer_eprt: bool,
     timeouts: FtpClientTimeouts,
     rt: Arc<Runtime>,
     pipeline: Option<Box<dyn FtpPipeline>>,
@@ -95,6 +118,8 @@ pub(crate) struct FtpControlHandler {
     tls_connector: Option<SharedTlsConnector>,
     /// SNI / cert server name for FTPS.
     tls_server_name: Option<String>,
+    /// Acceptor for active-mode data under `PROT P`.
+    data_tls_acceptor: Option<SharedTlsAcceptor>,
     /// `true` while waiting for the implicit-TLS handshake to complete
     /// before the (encrypted) welcome banner is expected.
     implicit_tls_pending: bool,
@@ -105,25 +130,32 @@ pub(crate) struct FtpControlHandler {
     /// `true` once `PROT P` succeeds — every subsequent data connection
     /// (`RETR`/`STOR`/`LIST`/…) is also TLS-wrapped.
     prot_active: bool,
+    /// One-shot active-mode listen binding still open (cleaned up on fail).
+    active_binding: Option<BindingId>,
 }
 
 impl FtpControlHandler {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         credentials: Option<(String, String)>,
+        data_mode: FtpClientDataMode,
         prefer_epsv: bool,
+        prefer_eprt: bool,
         timeouts: FtpClientTimeouts,
         rt: Arc<Runtime>,
         pipeline: Box<dyn FtpPipeline>,
         tls_connector: Option<SharedTlsConnector>,
         tls_server_name: Option<String>,
+        data_tls_acceptor: Option<SharedTlsAcceptor>,
         implicit_tls: bool,
     ) -> Self {
         let mut lexer = FtpReplyLexer::new();
         lexer.expect(FtpReplyShape::Welcome);
         Self {
             credentials,
+            data_mode,
             prefer_epsv,
+            prefer_eprt,
             timeouts,
             rt,
             pipeline: Some(pipeline),
@@ -133,9 +165,11 @@ impl FtpControlHandler {
             stage_timer: None,
             tls_connector,
             tls_server_name,
+            data_tls_acceptor,
             implicit_tls_pending: implicit_tls,
             tls_active: false,
             prot_active: false,
+            active_binding: None,
         }
     }
 
@@ -345,16 +379,56 @@ impl FtpControlHandler {
                 self.dispatch_pasv_event(endpoint, event, verb, path, offset, transfer);
             }
 
-            ControlState::AwaitRestReply { addr, verb, path, transfer } => match event {
+            ControlState::AwaitPortReply {
+                verb,
+                path,
+                offset,
+                transfer,
+            } => match event {
                 FtpEvent::CmdOk { .. } => {
-                    self.begin_transfer(endpoint, addr, &verb, &path, transfer);
+                    self.after_data_setup(
+                        endpoint,
+                        DataChannel::Active,
+                        verb,
+                        path,
+                        offset,
+                        transfer,
+                    );
                 }
                 FtpEvent::Error { code, message } => {
+                    self.clear_active_binding();
+                    self.fail(endpoint, FtpError::unexpected(Some(200), code, message));
+                }
+                _ => {
+                    self.state = ControlState::AwaitPortReply {
+                        verb,
+                        path,
+                        offset,
+                        transfer,
+                    };
+                }
+            },
+
+            ControlState::AwaitRestReply {
+                channel,
+                verb,
+                path,
+                transfer,
+            } => match event {
+                FtpEvent::CmdOk { .. } => {
+                    self.begin_transfer(endpoint, channel, &verb, &path, transfer);
+                }
+                FtpEvent::Error { code, message } => {
+                    self.clear_active_binding();
                     self.fail(endpoint, FtpError::unexpected(Some(350), code, message));
                 }
                 _ => {
-                    // Unrelated event — stay put and keep waiting for 350.
-                    self.state = ControlState::AwaitRestReply { addr, verb, path, transfer };
+                    self.state = ControlState::AwaitRestReply {
+                        channel,
+                        verb,
+                        path,
+                        transfer,
+                    };
                 }
             },
 
@@ -446,7 +520,14 @@ impl FtpControlHandler {
     ) {
         match event {
             FtpEvent::PasvAddr(addr) => {
-                self.open_data_conn(endpoint, addr, verb, path, offset, transfer);
+                self.after_data_setup(
+                    endpoint,
+                    DataChannel::Passive(addr),
+                    verb,
+                    path,
+                    offset,
+                    transfer,
+                );
             }
             FtpEvent::EpsvPort(port) => {
                 let ctrl_ip = endpoint
@@ -454,7 +535,14 @@ impl FtpControlHandler {
                     .map(|a| a.ip())
                     .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
                 let addr = SocketAddr::new(ctrl_ip, port);
-                self.open_data_conn(endpoint, addr, verb, path, offset, transfer);
+                self.after_data_setup(
+                    endpoint,
+                    DataChannel::Passive(addr),
+                    verb,
+                    path,
+                    offset,
+                    transfer,
+                );
             }
             FtpEvent::Error { code, message } => {
                 self.fail(endpoint, FtpError::unexpected(Some(227), code, message));
@@ -462,17 +550,22 @@ impl FtpControlHandler {
             _ => {
                 // Restore state — an unrelated event arrived unexpectedly;
                 // stay put and keep waiting for the real reply.
-                self.state = ControlState::AwaitPasvReply { verb, path, offset, transfer };
+                self.state = ControlState::AwaitPasvReply {
+                    verb,
+                    path,
+                    offset,
+                    transfer,
+                };
             }
         }
     }
 
-    /// Send `REST offset` first if a resume offset was requested, else go
-    /// straight to opening the data connection and sending the transfer verb.
-    fn open_data_conn(
+    /// After `PASV`/`EPSV`/`PORT`/`EPRT` succeeded: optional `REST`, then
+    /// open the data channel (passive) and/or send the transfer verb.
+    fn after_data_setup(
         &mut self,
         endpoint: &mut dyn Endpoint,
-        addr: SocketAddr,
+        channel: DataChannel,
         verb: String,
         path: String,
         offset: Option<u64>,
@@ -482,21 +575,57 @@ impl FtpControlHandler {
             Some(n) => {
                 endpoint.send(format!("REST {n}\r\n").as_bytes());
                 self.lexer.expect(FtpReplyShape::Cmd { expect: 350 });
-                self.state = ControlState::AwaitRestReply { addr, verb, path, transfer };
+                self.state = ControlState::AwaitRestReply {
+                    channel,
+                    verb,
+                    path,
+                    transfer,
+                };
             }
-            None => self.begin_transfer(endpoint, addr, &verb, &path, transfer),
+            None => self.begin_transfer(endpoint, channel, &verb, &path, transfer),
         }
     }
 
-    /// Open a passive data connection, then send the transfer command.
+    /// Open a passive data connection if needed, then send the transfer command.
     fn begin_transfer(
         &mut self,
         endpoint: &mut dyn Endpoint,
-        addr: SocketAddr,
+        channel: DataChannel,
         verb: &str,
         path: &str,
         transfer: Arc<Mutex<TransferState>>,
     ) {
+        match channel {
+            DataChannel::Passive(addr) => {
+                if let Err(e) = self.dial_passive(addr, verb, Arc::clone(&transfer)) {
+                    self.fail(endpoint, FtpError::Io(e));
+                    return;
+                }
+            }
+            DataChannel::Active => {
+                // Listener already armed; `active_binding` stays set until
+                // accept (guard removes it) or `clear_active_binding` on
+                // fail / session continue.
+            }
+        }
+
+        // Send the transfer command (RETR/STOR/LIST/APPE/NLST/STOU).
+        let cmd = if !path.is_empty() {
+            format!("{verb} {path}\r\n")
+        } else {
+            format!("{verb}\r\n")
+        };
+        endpoint.send(cmd.as_bytes());
+        self.lexer.expect(FtpReplyShape::XferStart);
+        self.state = ControlState::AwaitXferStart { transfer };
+    }
+
+    fn dial_passive(
+        &self,
+        addr: SocketAddr,
+        verb: &str,
+        transfer: Arc<Mutex<TransferState>>,
+    ) -> io::Result<()> {
         let is_stor = matches!(verb, "STOR" | "APPE" | "STOU");
         let transfer_clone = Arc::clone(&transfer);
         let mut cfg = TcpConnectorConfig::new(addr, move || {
@@ -515,22 +644,163 @@ impl FtpControlHandler {
                 cfg = cfg.with_tls(c, n);
             }
         }
-        let connect_result = self.rt.connect(cfg);
+        self.rt.connect(cfg)
+    }
 
-        if let Err(e) = connect_result {
-            self.fail(endpoint, FtpError::Io(e));
+    /// Bind a one-shot listener and send `PORT` or `EPRT`.
+    fn start_active_data(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        verb: String,
+        path: String,
+        offset: Option<u64>,
+        transfer: Arc<Mutex<TransferState>>,
+    ) {
+        let local_ip = match endpoint.local_addr() {
+            Ok(a) => a.ip(),
+            Err(e) => {
+                self.fail(endpoint, FtpError::Io(e));
+                return;
+            }
+        };
+        let peer_ip = match endpoint.remote_addr() {
+            Ok(a) => a.ip(),
+            Err(e) => {
+                self.fail(endpoint, FtpError::Io(e));
+                return;
+            }
+        };
+
+        if self.prot_active && self.data_tls_acceptor.is_none() {
+            self.fail(
+                endpoint,
+                FtpError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active-mode PROT P requires FtpClient::data_tls_acceptor",
+                )),
+            );
             return;
         }
 
-        // Send the transfer command (RETR/STOR/LIST/APPE/NLST/STOU).
-        let cmd = if !path.is_empty() {
-            format!("{verb} {path}\r\n")
+        let bind_ip: IpAddr = match local_ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let bind_addr = SocketAddr::new(bind_ip, 0);
+
+        let is_stor = matches!(verb.as_str(), "STOR" | "APPE" | "STOU");
+        let expect_tls = self.prot_active;
+        let transfer_for_factory = Arc::clone(&transfer);
+        let rt_for_factory = Arc::clone(&self.rt);
+        // Binding id is filled after add_tcp_listener; the factory closes over
+        // a cell updated before any accept can run.
+        let binding_cell: Arc<Mutex<Option<BindingId>>> = Arc::new(Mutex::new(None));
+        let binding_cell2 = Arc::clone(&binding_cell);
+
+        let mut cfg = TcpListenerConfig::new(bind_addr, move || {
+            let binding = binding_cell2
+                .lock()
+                .unwrap()
+                .expect("active data accept before binding id was stored");
+            let inner: Box<dyn ProtocolHandler> = if is_stor {
+                if expect_tls {
+                    Box::new(FtpDataStorHandler::new_expect_tls(Arc::clone(
+                        &transfer_for_factory,
+                    )))
+                } else {
+                    Box::new(FtpDataStorHandler::new(Arc::clone(&transfer_for_factory)))
+                }
+            } else {
+                Box::new(FtpDataRetrHandler::new(Arc::clone(&transfer_for_factory)))
+            };
+            Box::new(ActiveAcceptGuard::new(
+                Arc::clone(&rt_for_factory),
+                binding,
+                inner,
+            ))
+        });
+
+        // Only accept from the control peer (bounce protection).
+        let prefix = match peer_ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        cfg = cfg.with_acl(PeerAcl {
+            allow: vec![IpNet {
+                addr: peer_ip,
+                prefix,
+            }],
+            deny: Vec::new(),
+        });
+
+        if expect_tls {
+            if let Some(acceptor) = self.data_tls_acceptor.clone() {
+                cfg = cfg.with_tls(acceptor);
+            }
+        }
+
+        let (bound, binding) = match self.rt.add_tcp_listener(cfg) {
+            Ok(v) => v,
+            Err(e) => {
+                self.fail(endpoint, FtpError::Io(e));
+                return;
+            }
+        };
+        *binding_cell.lock().unwrap() = Some(binding);
+        self.active_binding = Some(binding);
+
+        let advertise = SocketAddr::new(local_ip, bound.port());
+        let cmd = if self.prefer_eprt {
+            format!("EPRT {}\r\n", format_eprt_arg(advertise))
         } else {
-            format!("{verb}\r\n")
+            match format_port_arg(advertise) {
+                Some(arg) => format!("PORT {arg}\r\n"),
+                None => {
+                    self.clear_active_binding();
+                    self.fail(
+                        endpoint,
+                        FtpError::Io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "PORT requires an IPv4 local address; enable prefer_eprt",
+                        )),
+                    );
+                    return;
+                }
+            }
         };
         endpoint.send(cmd.as_bytes());
-        self.lexer.expect(FtpReplyShape::XferStart);
-        self.state = ControlState::AwaitXferStart { transfer };
+        self.lexer.expect(FtpReplyShape::Cmd { expect: 200 });
+        self.state = ControlState::AwaitPortReply {
+            verb,
+            path,
+            offset,
+            transfer,
+        };
+    }
+
+    /// Begin a data transfer in the configured mode (passive or active).
+    fn start_data_transfer(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        verb: String,
+        path: String,
+        offset: Option<u64>,
+        transfer: Arc<Mutex<TransferState>>,
+    ) {
+        match self.data_mode {
+            FtpClientDataMode::Passive => {
+                self.send_pasv_or_epsv(endpoint);
+                self.state = ControlState::AwaitPasvReply {
+                    verb,
+                    path,
+                    offset,
+                    transfer,
+                };
+            }
+            FtpClientDataMode::Active => {
+                self.start_active_data(endpoint, verb, path, offset, transfer);
+            }
+        }
     }
 
     /// After the welcome banner: negotiate FTPS if configured (explicit
@@ -591,6 +861,7 @@ impl FtpControlHandler {
     /// Transition into the idle Session state and immediately dispatch the
     /// next queued operation (if any).
     fn enter_session(&mut self, endpoint: &mut dyn Endpoint) {
+        self.clear_active_binding();
         self.process_next_op(endpoint);
     }
 
@@ -613,68 +884,44 @@ impl FtpControlHandler {
 
             Some(QueuedOp::Retr { path, offset, receiver }) => {
                 let transfer = Arc::new(Mutex::new(TransferState::retr(receiver)));
-                self.send_pasv_or_epsv(endpoint);
-                self.state = ControlState::AwaitPasvReply {
-                    verb: "RETR".into(),
-                    path,
-                    offset,
-                    transfer,
-                };
+                self.start_data_transfer(endpoint, "RETR".into(), path, offset, transfer);
             }
 
             Some(QueuedOp::Stor { path, offset, ready, callback }) => {
                 let transfer = Arc::new(Mutex::new(TransferState::stor(ready, callback)));
-                self.send_pasv_or_epsv(endpoint);
-                self.state = ControlState::AwaitPasvReply {
-                    verb: "STOR".into(),
-                    path,
-                    offset,
-                    transfer,
-                };
+                self.start_data_transfer(endpoint, "STOR".into(), path, offset, transfer);
             }
 
             Some(QueuedOp::List { path, receiver }) => {
                 let transfer = Arc::new(Mutex::new(TransferState::retr(receiver)));
-                self.send_pasv_or_epsv(endpoint);
-                self.state = ControlState::AwaitPasvReply {
-                    verb: "LIST".into(),
-                    path: path.unwrap_or_default(),
-                    offset: None,
+                self.start_data_transfer(
+                    endpoint,
+                    "LIST".into(),
+                    path.unwrap_or_default(),
+                    None,
                     transfer,
-                };
+                );
             }
 
             Some(QueuedOp::Appe { path, ready, callback }) => {
                 let transfer = Arc::new(Mutex::new(TransferState::stor(ready, callback)));
-                self.send_pasv_or_epsv(endpoint);
-                self.state = ControlState::AwaitPasvReply {
-                    verb: "APPE".into(),
-                    path,
-                    offset: None,
-                    transfer,
-                };
+                self.start_data_transfer(endpoint, "APPE".into(), path, None, transfer);
             }
 
             Some(QueuedOp::Nlst { path, receiver }) => {
                 let transfer = Arc::new(Mutex::new(TransferState::retr(receiver)));
-                self.send_pasv_or_epsv(endpoint);
-                self.state = ControlState::AwaitPasvReply {
-                    verb: "NLST".into(),
-                    path: path.unwrap_or_default(),
-                    offset: None,
+                self.start_data_transfer(
+                    endpoint,
+                    "NLST".into(),
+                    path.unwrap_or_default(),
+                    None,
                     transfer,
-                };
+                );
             }
 
             Some(QueuedOp::Stou { ready, callback }) => {
                 let transfer = Arc::new(Mutex::new(TransferState::stou(ready, callback)));
-                self.send_pasv_or_epsv(endpoint);
-                self.state = ControlState::AwaitPasvReply {
-                    verb: "STOU".into(),
-                    path: String::new(),
-                    offset: None,
-                    transfer,
-                };
+                self.start_data_transfer(endpoint, "STOU".into(), String::new(), None, transfer);
             }
 
             Some(QueuedOp::Quit) => {
@@ -694,9 +941,16 @@ impl FtpControlHandler {
         self.lexer.expect(FtpReplyShape::PassiveMode);
     }
 
+    fn clear_active_binding(&mut self) {
+        if let Some(id) = self.active_binding.take() {
+            self.rt.remove_binding(id);
+        }
+    }
+
     /// Fail the pipeline with `err`, close the control connection.
     fn fail(&mut self, endpoint: &mut dyn Endpoint, err: FtpError) {
         self.cancel_timer();
+        self.clear_active_binding();
         if let Some(mut pl) = self.pipeline.take() {
             pl.failed(err);
         }

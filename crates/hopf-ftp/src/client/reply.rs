@@ -19,7 +19,7 @@
 //! [`FtpReplyLexer::expect`], right after sending the corresponding
 //! command — mirroring `SmtpReplyLexer`/`Pop3ReplyLexer`.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use super::error::FtpError;
 
@@ -486,6 +486,35 @@ pub fn parse_pwd_path(text: &str) -> Option<String> {
     let start = text.find('"')?;
     let end = text[start + 1..].find('"')? + start + 1;
     Some(text[start + 1..end].replace("\"\"", "\""))
+}
+
+/// Format a `PORT` command argument for an IPv4 `addr` (`h1,h2,h3,h4,p1,p2`).
+///
+/// Returns `None` for IPv6 — use [`format_eprt_arg`] instead (RFC 2428).
+pub fn format_port_arg(addr: SocketAddr) -> Option<String> {
+    let IpAddr::V4(ip) = addr.ip() else {
+        return None;
+    };
+    let o = ip.octets();
+    let p = addr.port();
+    Some(format!(
+        "{},{},{},{},{},{}",
+        o[0],
+        o[1],
+        o[2],
+        o[3],
+        p / 256,
+        p % 256
+    ))
+}
+
+/// Format an `EPRT` command argument (`|af|addr|port|`, RFC 2428 §2).
+pub fn format_eprt_arg(addr: SocketAddr) -> String {
+    let af = match addr.ip() {
+        IpAddr::V4(_) => 1,
+        IpAddr::V6(_) => 2,
+    };
+    format!("|{af}|{}|{}|", addr.ip(), addr.port())
 }
 
 #[cfg(test)]
