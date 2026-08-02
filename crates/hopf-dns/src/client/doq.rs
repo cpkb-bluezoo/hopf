@@ -12,10 +12,10 @@
 //! [`QuicDriverHandle`] shuts down the driver).
 //!
 //! **0-RTT / session resumption:** reusing a live connection avoids a full
-//! handshake on subsequent queries. hopf-quic enables TLS early-data at the
-//! config layer, but a fresh dial after the pooled connection is gone does
-//! not yet perform ticket-based 0-RTT resume (no session-ticket cache is
-//! wired through); that remains a config-only capability, same as H3.
+//! handshake on subsequent queries. hopf-quic PEM builders leave TLS early
+//! data **off** by default (opt in via `QuicTlsOptions::with_early_data`); a
+//! fresh dial after the pooled connection is gone does not yet perform
+//! ticket-based 0-RTT resume (no session-ticket cache is wired through).
 
 use std::collections::HashMap;
 use std::io;

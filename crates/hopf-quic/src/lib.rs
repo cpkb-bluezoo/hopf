@@ -16,9 +16,11 @@ mod stream;
 
 pub use config::{
     apply_client_transport_options, apply_server_transport_options, client_config_for_certified_pem,
-    client_config_for_pem_bytes, client_config_from_pem, server_config_from_pem,
-    server_config_self_signed, QuicClientConfig, QuicConnectConfig, QuicListenConfig,
-    QuicListenHooksConfig, QuicServerConfig, QuicTransportOptions,
+    client_config_for_certified_pem_with, client_config_for_pem_bytes,
+    client_config_for_pem_bytes_with, client_config_from_pem, client_config_from_pem_with,
+    server_config_from_pem, server_config_from_pem_with, server_config_self_signed,
+    server_config_self_signed_with, QuicClientConfig, QuicConnectConfig, QuicListenConfig,
+    QuicListenHooksConfig, QuicServerConfig, QuicTlsOptions, QuicTransportOptions,
 };
 pub use driver::{connect_quic, connect_quic_hooks, listen_quic, listen_quic_hooks, QuicDriverHandle};
 pub use hooks::{ConnectionFactory, QuicConnApi, QuicConnection};

@@ -131,7 +131,7 @@
 </tr>
 <tr>
 <td>0-RTT / early data</td>
-<td>Server <code>max_early_data_size = u32::MAX</code>; client <code>enable_early_data = true</code></td>
+<td>Off by default; opt in with <code>QuicTlsOptions::with_early_data</code> on <code>*_with</code> PEM builders</td>
 </tr>
 </tbody>
 </table>
@@ -365,7 +365,7 @@
 <li>Addresses must be pre-resolved (no DNS inside <code>connect_quic</code> / <code>connect_h3</code>).</li>
 <li>Plain (non-hooks) server mode installs <code>NopHandler</code> on accepted unidirectional streams.</li>
 <li>No HTTP/2-style server push; no WebTransport / DATAGRAM product API yet.</li>
-<li>0-RTT is enabled in builders but not polished as an application feature.</li>
+<li>0-RTT is off by default; enable via <code>QuicTlsOptions::with_early_data</code> (replay risk — see SECURITY.md). Not polished as an application feature.</li>
 </ul>
 <h2 id="see-also">See also</h2>
 <ul>
