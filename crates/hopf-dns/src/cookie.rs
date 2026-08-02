@@ -7,6 +7,7 @@ use std::sync::Mutex;
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 
 use crate::wire::DnsResourceRecord;
 
@@ -120,9 +121,13 @@ impl DnsCookie {
     }
 
     /// Whether `server_cookie` is exactly what we'd issue this
-    /// client/address combination right now.
+    /// client/address combination right now (constant-time compare).
     pub fn validate_server_cookie(&self, client_cookie: &[u8], client_ip: &[u8], server_cookie: &[u8]) -> bool {
-        server_cookie.len() == 8 && server_cookie == self.generate_server_cookie(client_cookie, client_ip)
+        if server_cookie.len() != 8 {
+            return false;
+        }
+        let expected = self.generate_server_cookie(client_cookie, client_ip);
+        bool::from(expected.ct_eq(server_cookie))
     }
 
     /// Server-side response COOKIE option (RFC 7873 §5.2): echoes the
@@ -198,23 +203,9 @@ pub fn parse_client_cookie(additionals: &[DnsResourceRecord]) -> ClientCookieOpt
 }
 
 fn fill_random(buf: &mut [u8]) {
-    // Prefer getrandom via std if available; fall back to time-based mix.
-    #[cfg(unix)]
-    {
-        use std::fs::File;
-        use std::io::Read;
-        if let Ok(mut f) = File::open("/dev/urandom") {
-            let _ = f.read_exact(buf);
-            return;
-        }
-    }
-    let t = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = ((t >> ((i % 8) * 8)) as u8).wrapping_add(i as u8);
-    }
+    // Same fail-closed CSPRNG path as [`crate::wire::query_id`] — never a
+    // time-based mix (predictable secrets defeat cookie anti-amplification).
+    getrandom::getrandom(buf).expect("OS RNG");
 }
 
 #[cfg(test)]
