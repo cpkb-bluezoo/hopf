@@ -1025,11 +1025,14 @@ mod telemetry_tests {
             .with_jsonl_traces(&dir)
             .with_jsonl_metrics(&dir);
         let pipeline = TelemetryPipeline::start(cfg).unwrap();
-        let config = Arc::new(MqttConfig::new(
-            "127.0.0.1:1883".parse().unwrap(),
-            Arc::new(BrokerState::new()),
-        ));
-        let factory = DefaultMqttHandlerFactory::new(None);
+        let config = Arc::new(
+            MqttConfig::new(
+                "127.0.0.1:1883".parse().unwrap(),
+                Arc::new(BrokerState::new()),
+            )
+            .allow_anonymous(),
+        );
+        let factory = DefaultMqttHandlerFactory::new(None, true);
         let mut h = MqttControlHandler::new(
             config,
             factory.create(),

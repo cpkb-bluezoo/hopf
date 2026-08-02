@@ -22,9 +22,19 @@ pub struct MqttConfig {
     pub listen: SocketAddr,
     /// Shared broker state (topics, retained messages, session registry).
     pub broker: Arc<BrokerState>,
-    /// Credential store for CONNECT username/password. `None` accepts any
-    /// CONNECT regardless of the username/password fields present.
+    /// Credential store for CONNECT username/password.
+    ///
+    /// When [`Self::allow_anonymous`] is `false` (the default):
+    /// - `Some(store)` — CONNECT must present matching username/password
+    /// - `None` — every CONNECT is rejected (fail closed until credentials
+    ///   or anonymous access are configured)
+    ///
+    /// When `allow_anonymous` is `true`, `None` accepts any CONNECT.
     pub credentials: Option<Arc<dyn CredentialStore>>,
+    /// When `true`, CONNECT is accepted without username/password even if
+    /// [`Self::credentials`] is `None`. Defaults to **`false`** — call
+    /// [`Self::allow_anonymous`] explicitly for demo / trusted-network brokers.
+    pub allow_anonymous: bool,
     /// Cap on a packet's Remaining Length.
     pub max_packet_size: u32,
     /// Cap on a PUBLISH payload, checked before any fan-out/spool work
@@ -38,12 +48,14 @@ pub struct MqttConfig {
 }
 
 impl MqttConfig {
-    /// Plain (no auth) config sharing `broker` with every listener that uses it.
+    /// Secure-by-default config: anonymous CONNECT is **denied** until
+    /// [`Self::with_credentials`] or [`Self::allow_anonymous`] is used.
     pub fn new(listen: SocketAddr, broker: Arc<BrokerState>) -> Self {
         Self {
             listen,
             broker,
             credentials: None,
+            allow_anonymous: false,
             max_packet_size: DEFAULT_MAX_PACKET_SIZE,
             max_publish_payload: DEFAULT_MAX_PACKET_SIZE,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -53,6 +65,12 @@ impl MqttConfig {
     /// Require CONNECT username/password to match `store`.
     pub fn with_credentials(mut self, store: Arc<dyn CredentialStore>) -> Self {
         self.credentials = Some(store);
+        self
+    }
+
+    /// Allow CONNECT without credentials (explicit open-broker opt-in).
+    pub fn allow_anonymous(mut self) -> Self {
+        self.allow_anonymous = true;
         self
     }
 

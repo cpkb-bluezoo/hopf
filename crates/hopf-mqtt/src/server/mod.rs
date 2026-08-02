@@ -4,8 +4,9 @@
 //!
 //! CONNECT / PUBLISH / SUBSCRIBE authorization is staged (see [`handler`]),
 //! matching Gumdrop and `hopf-pop3` / `hopf-imap`'s handler-factory shape —
-//! the default checks `MqttConfig::credentials` on CONNECT and accepts all
-//! PUBLISH/SUBSCRIBE; `MqttService::with_handler_factory` swaps in custom policy.
+//! the default requires [`MqttConfig::with_credentials`] or
+//! [`MqttConfig::allow_anonymous`]; PUBLISH/SUBSCRIBE still default to
+//! accept-all. `MqttService::with_handler_factory` swaps in custom policy.
 
 pub mod auth;
 pub mod broker;

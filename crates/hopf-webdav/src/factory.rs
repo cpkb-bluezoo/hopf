@@ -18,7 +18,9 @@ use crate::lock::WebDavLockManager;
 #[derive(Clone, Debug)]
 pub struct WebDavConfig {
     pub root_path: PathBuf,
+    /// Allow mutating methods (PUT/DELETE/MKCOL/…). Default: `false`.
     pub allow_write: bool,
+    /// Advertise and handle WebDAV methods. Default: `false`.
     pub webdav_enabled: bool,
     pub welcome_file: String,
     pub dead_property_storage: DeadPropMode,
@@ -28,6 +30,14 @@ pub struct WebDavConfig {
     /// Optional default `DAV:getcontentlanguage` live property value
     /// (RFC 4918 §15.4). When `None`, the property is omitted from PROPFIND.
     pub content_language: Option<String>,
+    /// Explicit opt-in to expose this factory without HTTP auth wrapping.
+    ///
+    /// [`WebDavFactory`] has no built-in authentication. When `webdav_enabled`
+    /// or `allow_write` is true and this flag is false, [`WebDavFactory::new`]
+    /// returns an error — wrap the factory in `hopf_http` Basic/Digest/Bearer
+    /// (or mTLS) and set this to acknowledge that auth lives outside the
+    /// WebDAV crate, or set it for intentional cleartext demos.
+    pub allow_unauthenticated_access: bool,
 }
 
 impl Default for WebDavConfig {
@@ -40,7 +50,29 @@ impl Default for WebDavConfig {
             dead_property_storage: DeadPropMode::Auto,
             max_put_body: crate::constants::MAX_WEBDAV_PUT_BODY,
             content_language: None,
+            allow_unauthenticated_access: false,
         }
+    }
+}
+
+impl WebDavConfig {
+    /// Enable mutating methods.
+    pub fn with_write(mut self, yes: bool) -> Self {
+        self.allow_write = yes;
+        self
+    }
+
+    /// Enable WebDAV method set (PROPFIND, LOCK, …).
+    pub fn with_webdav(mut self, yes: bool) -> Self {
+        self.webdav_enabled = yes;
+        self
+    }
+
+    /// Acknowledge that this factory will be served without (or before)
+    /// HTTP-layer authentication — required when write or WebDAV is enabled.
+    pub fn allow_unauthenticated_access(mut self) -> Self {
+        self.allow_unauthenticated_access = true;
+        self
     }
 }
 
@@ -58,7 +90,22 @@ pub struct WebDavFactory {
 
 impl WebDavFactory {
     /// Build a factory; resolves the document root on the local filesystem.
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] when WebDAV or write is enabled
+    /// without [`WebDavConfig::allow_unauthenticated_access`] — this crate has
+    /// no built-in auth, so exposure must be acknowledged (or the factory
+    /// wrapped in HTTP auth *and* the flag set, since wrapping happens after
+    /// construction).
     pub fn new(config: WebDavConfig, storage: Arc<StorageExecutor>) -> io::Result<Self> {
+        if (config.webdav_enabled || config.allow_write) && !config.allow_unauthenticated_access {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WebDavConfig enables WebDAV/write without allow_unauthenticated_access(); \
+                 wrap with hopf_http BasicAuthFactory / DigestAuthFactory / BearerAuthFactory \
+                 (or mTLS) and call WebDavConfig::allow_unauthenticated_access(), or use that \
+                 method alone for intentional cleartext demos",
+            ));
+        }
         let root_path = config.root_path.clone();
         std::fs::create_dir_all(&root_path)?;
         let canonical_root = root_path.canonicalize().unwrap_or_else(|_| {
@@ -189,5 +236,50 @@ impl PathAbsolute for PathBuf {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hopf_core::storage::{StorageConfig, StorageExecutor};
+    use tempfile::tempdir;
+
+    #[test]
+    fn write_without_unauth_opt_in_is_rejected() {
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(StorageExecutor::new(StorageConfig::default()));
+        let result = WebDavFactory::new(
+            WebDavConfig {
+                root_path: dir.path().to_path_buf(),
+                allow_write: true,
+                webdav_enabled: true,
+                ..Default::default()
+            },
+            storage,
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected InvalidInput when unauth opt-in is missing"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("allow_unauthenticated_access"));
+    }
+
+    #[test]
+    fn unauth_opt_in_allows_factory() {
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(StorageExecutor::new(StorageConfig::default()));
+        WebDavFactory::new(
+            WebDavConfig {
+                root_path: dir.path().to_path_buf(),
+                allow_write: true,
+                webdav_enabled: true,
+                allow_unauthenticated_access: true,
+                ..Default::default()
+            },
+            storage,
+        )
+        .unwrap();
     }
 }

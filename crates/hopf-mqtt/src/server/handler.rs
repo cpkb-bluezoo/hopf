@@ -113,10 +113,11 @@ pub trait MqttHandlerFactory: Send + Sync {
     }
 }
 
-/// Default: accept unconditionally, or require CONNECT username/password to
-/// match a [`CredentialStore`] when one is configured.
+/// Default: require CONNECT credentials when a store is configured; reject
+/// anonymous CONNECT unless [`MqttConfig::allow_anonymous`] was set.
 pub struct DefaultConnectHandler {
     credentials: Option<Arc<dyn CredentialStore>>,
+    allow_anonymous: bool,
 }
 
 impl ConnectHandler for DefaultConnectHandler {
@@ -125,19 +126,37 @@ impl ConnectHandler for DefaultConnectHandler {
         packet: &ConnectPacket,
         _meta: &MqttConnectionMetadata,
     ) -> ConnectDecision {
-        let Some(store) = &self.credentials else {
-            return ConnectDecision::Accept;
+        let reject = || {
+            if packet.version.is_v5() {
+                ConnectDecision::Reject(reason::NOT_AUTHORIZED)
+            } else {
+                ConnectDecision::Reject(reason::connack_v311::NOT_AUTHORIZED)
+            }
         };
-        let authorized = match (&packet.username, &packet.password) {
-            (Some(user), Some(pass)) => store.password_match(user, &String::from_utf8_lossy(pass)),
-            _ => false,
+        let reject_bad_pass = || {
+            if packet.version.is_v5() {
+                ConnectDecision::Reject(reason::BAD_USER_NAME_OR_PASSWORD)
+            } else {
+                ConnectDecision::Reject(reason::connack_v311::BAD_USER_NAME_OR_PASSWORD)
+            }
         };
-        if authorized {
-            ConnectDecision::Accept
-        } else if packet.version.is_v5() {
-            ConnectDecision::Reject(reason::BAD_USER_NAME_OR_PASSWORD)
-        } else {
-            ConnectDecision::Reject(reason::connack_v311::BAD_USER_NAME_OR_PASSWORD)
+
+        match &self.credentials {
+            Some(store) => {
+                let authorized = match (&packet.username, &packet.password) {
+                    (Some(user), Some(pass)) => {
+                        store.password_match(user, &String::from_utf8_lossy(pass))
+                    }
+                    _ => false,
+                };
+                if authorized {
+                    ConnectDecision::Accept
+                } else {
+                    reject_bad_pass()
+                }
+            }
+            None if self.allow_anonymous => ConnectDecision::Accept,
+            None => reject(),
         }
     }
 }
@@ -175,12 +194,16 @@ impl SubscribeHandler for AcceptAllSubscribeHandler {
 /// Factory for [`DefaultConnectHandler`] (+ accept-all publish/subscribe).
 pub struct DefaultMqttHandlerFactory {
     credentials: Option<Arc<dyn CredentialStore>>,
+    allow_anonymous: bool,
 }
 
 impl DefaultMqttHandlerFactory {
-    /// Build from an optional credential store (`None` accepts every CONNECT).
-    pub fn new(credentials: Option<Arc<dyn CredentialStore>>) -> Self {
-        Self { credentials }
+    /// Build from config fields (`credentials` + `allow_anonymous`).
+    pub fn new(credentials: Option<Arc<dyn CredentialStore>>, allow_anonymous: bool) -> Self {
+        Self {
+            credentials,
+            allow_anonymous,
+        }
     }
 }
 
@@ -188,6 +211,62 @@ impl MqttHandlerFactory for DefaultMqttHandlerFactory {
     fn create(&self) -> Box<dyn ConnectHandler> {
         Box::new(DefaultConnectHandler {
             credentials: self.credentials.clone(),
+            allow_anonymous: self.allow_anonymous,
         })
+    }
+}
+
+#[cfg(test)]
+mod default_connect_tests {
+    use super::*;
+    use crate::codec::packet::{ConnectPacket, ProtocolVersion};
+    use crate::codec::properties::Properties;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn meta() -> MqttConnectionMetadata {
+        MqttConnectionMetadata {
+            peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1883),
+            tls: false,
+            client_id: None,
+            traceparent: None,
+        }
+    }
+
+    fn pkt() -> ConnectPacket {
+        ConnectPacket {
+            version: ProtocolVersion::V5,
+            clean_session: true,
+            keep_alive: 60,
+            properties: Properties::new(),
+            client_id: "c".into(),
+            will: None,
+            username: None,
+            password: None,
+        }
+    }
+
+    #[test]
+    fn rejects_when_neither_credentials_nor_anonymous() {
+        let mut h = DefaultConnectHandler {
+            credentials: None,
+            allow_anonymous: false,
+        };
+        assert!(matches!(
+            h.authorize(&pkt(), &meta()),
+            ConnectDecision::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn accepts_anonymous_when_opted_in() {
+        let mut h = DefaultConnectHandler {
+            credentials: None,
+            allow_anonymous: true,
+        };
+        assert!(matches!(
+            h.authorize(&pkt(), &meta()),
+            ConnectDecision::Accept
+        ));
     }
 }

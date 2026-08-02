@@ -24,10 +24,13 @@ pub struct MqttService {
 }
 
 impl MqttService {
-    /// Wrap `config`, authorizing CONNECT via `config.credentials` (or
-    /// unconditionally, if `None`).
+    /// Wrap `config`, authorizing CONNECT via `config.credentials`, or
+    /// anonymously only when [`MqttConfig::allow_anonymous`] is set.
     pub fn new(config: MqttConfig) -> Self {
-        let handler_factory = Arc::new(DefaultMqttHandlerFactory::new(config.credentials.clone()));
+        let handler_factory = Arc::new(DefaultMqttHandlerFactory::new(
+            config.credentials.clone(),
+            config.allow_anonymous,
+        ));
         Self {
             config: Arc::new(config),
             handler_factory,

@@ -33,6 +33,7 @@ fn listen_webdav_with(root: std::path::PathBuf, max_put_body: u64) -> (Runtime, 
                 dead_property_storage: DeadPropMode::Sidecar,
                 max_put_body,
                 content_language: None,
+                allow_unauthenticated_access: true,
             },
             storage,
         )

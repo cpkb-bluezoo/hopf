@@ -18,7 +18,8 @@ core, v5 core, async client, MQTT-over-WebSocket bridge, examples). See
   [`hopf_core::ConnHandle`](../hopf-core/src/handle.rs), never touching a
   peer `Endpoint` from another thread directly.
 - Staged Connect / Publish / Subscribe handler SPI (Gumdrop shape).
-  CONNECT username/password and enhanced AUTH use
+  CONNECT defaults to **deny** until `MqttConfig::with_credentials` or
+  `allow_anonymous()`; enhanced AUTH uses
   [`hopf_auth::CredentialStore`](../hopf-auth/src/store.rs).
 - Async, non-blocking client on the `hopf-core` `Runtime` / `ProtocolHandler`
   SPI, with DNS resolution via `hopf-dns`.
