@@ -109,6 +109,7 @@ pub fn connect_h3(
 struct H3ClientWriter {
     request_headers: Option<Headers>,
     body: Vec<u8>,
+    trailers: Option<Headers>,
     done: bool,
 }
 
@@ -117,6 +118,7 @@ impl H3ClientWriter {
         Self {
             request_headers: None,
             body: Vec::new(),
+            trailers: None,
             done: false,
         }
     }
@@ -142,6 +144,11 @@ impl ClientWriter for H3ClientWriter {
     }
 
     fn end_request_body(&mut self) {
+        self.done = true;
+    }
+
+    fn trailers(&mut self, headers: Headers) {
+        self.trailers = Some(headers);
         self.done = true;
     }
 
@@ -231,6 +238,7 @@ impl H3ClientStream {
 
         let headers = writer.request_headers.take().unwrap_or_default();
         let body = writer.body;
+        let trailers = writer.trailers;
         let done = writer.done;
 
         let mut out = Vec::new();
@@ -241,7 +249,16 @@ impl H3ClientStream {
         if !body.is_empty() {
             frame::write_data(&mut out, &body);
         }
-        endpoint.send(&out);
+        if let Some(trailers) = trailers {
+            let block = self.qpack.encode_field_section(
+                self.stream_id,
+                trailers.iter().map(|h| (h.name.as_str(), h.value.as_str())),
+            );
+            frame::write_headers(&mut out, &block);
+        }
+        if !out.is_empty() {
+            endpoint.send(&out);
+        }
         if done {
             endpoint.close();
         }
@@ -369,9 +386,12 @@ mod status_validation_tests {
     struct RecordingEndpoint {
         closed: bool,
         abort_code: Option<u32>,
+        sent: Vec<u8>,
     }
     impl Endpoint for RecordingEndpoint {
-        fn send(&mut self, _data: &[u8]) {}
+        fn send(&mut self, data: &[u8]) {
+            self.sent.extend_from_slice(data);
+        }
         fn is_open(&self) -> bool {
             !self.closed
         }
@@ -530,5 +550,85 @@ mod status_validation_tests {
 
         assert!(!stream.malformed, "trailers have no :status and must not be validated as one");
         assert_eq!(rec.lock().unwrap().trailers, vec![("grpc-status".to_string(), "0".to_string())]);
+    }
+
+    /// Collects frame types and HEADERS payloads from a client-encoded request.
+    #[derive(Default)]
+    struct FrameLog {
+        types: Vec<u64>,
+        headers_payloads: Vec<Vec<u8>>,
+        data: Vec<u8>,
+    }
+    impl H3FrameHandler for FrameLog {
+        fn data_frame(&mut self, payload: &[u8]) {
+            self.types.push(frame::DATA);
+            self.data.extend_from_slice(payload);
+        }
+        fn headers_frame(&mut self, payload: &[u8]) {
+            self.types.push(frame::HEADERS);
+            self.headers_payloads.push(payload.to_vec());
+        }
+        fn settings_frame(&mut self, _: &[u8]) {}
+        fn goaway_frame(&mut self, _: &[u8]) {}
+        fn frame_error(&mut self, msg: &str) {
+            panic!("frame error: {msg}");
+        }
+    }
+
+    struct TrailerSender;
+    impl ClientHandler for TrailerSender {
+        fn start(&mut self, request: &mut dyn ClientWriter) {
+            let mut h = Headers::new();
+            h.set(":method", "POST");
+            h.set(":path", "/rpc");
+            h.set("host", "example.com");
+            request.headers(h);
+            request.start_request_body();
+            request.request_body_content(b"ping");
+            request.end_request_body();
+            let mut t = Headers::new();
+            t.set("grpc-status", "0");
+            t.set("grpc-message", "ok");
+            request.trailers(t);
+        }
+        fn response_headers(&mut self, _: &mut dyn ClientWriter, _: &Headers) {}
+        fn response_complete(&mut self, _: &mut dyn ClientWriter) {}
+    }
+
+    struct TrailerFactory;
+    impl ClientHandlerFactory for TrailerFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            Box::new(TrailerSender)
+        }
+    }
+
+    #[test]
+    fn client_sends_request_trailers_as_second_headers_before_fin() {
+        let factory: Arc<dyn ClientHandlerFactory> = Arc::new(TrailerFactory);
+        let qpack = Arc::new(qpack::H3Qpack::new());
+        let mut stream = H3ClientStream::new(factory, HttpLimits::default(), 0, Arc::clone(&qpack));
+        let mut ep = RecordingEndpoint::default();
+        stream.start_request(&mut ep);
+
+        assert!(ep.closed, "trailers complete the request → stream FIN");
+        assert!(!ep.sent.is_empty());
+
+        let mut log = FrameLog::default();
+        let mut parser = H3Parser::new();
+        parser.push(&ep.sent, &mut log);
+
+        assert_eq!(
+            log.types,
+            vec![frame::HEADERS, frame::DATA, frame::HEADERS],
+            "HEADERS + DATA + trailer HEADERS"
+        );
+        assert_eq!(log.data, b"ping");
+        assert_eq!(log.headers_payloads.len(), 2);
+
+        let trailers = qpack
+            .decode_field_section(0, &log.headers_payloads[1])
+            .expect("trailer QPACK block");
+        assert!(trailers.iter().any(|(n, v)| n == "grpc-status" && v == "0"));
+        assert!(trailers.iter().any(|(n, v)| n == "grpc-message" && v == "ok"));
     }
 }

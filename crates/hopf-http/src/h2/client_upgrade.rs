@@ -60,6 +60,9 @@ impl ClientWriter for InjectingWriter<'_> {
     fn end_request_body(&mut self) {
         self.inner.end_request_body();
     }
+    fn trailers(&mut self, headers: Headers) {
+        self.inner.trailers(headers);
+    }
     fn complete_request(&mut self) {
         self.inner.complete_request();
     }

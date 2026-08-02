@@ -176,6 +176,10 @@
 <td>Finish the request body</td>
 </tr>
 <tr>
+<td><code>trailers(Headers)</code></td>
+<td>Buffer request trailers after the body (H3: second HEADERS before FIN; H1 ignores; H2 not wired yet)</td>
+</tr>
+<tr>
 <td><code>complete_request()</code></td>
 <td>Finish the request (flushes headers if no body was started)</td>
 </tr>

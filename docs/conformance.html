@@ -299,7 +299,7 @@
 <tr><td>HEADERS+DATA request framing, FIN to complete</td><td>§4.1</td><td>Compliant</td><td><code>h3/client.rs:167-176</code></td></tr>
 <tr><td><code>:status</code> extraction from response</td><td>§4.3.2</td><td>Compliant</td><td><code>validate_response_status()</code> (<code>h3/client.rs</code>) requires <code>:status</code> to be present, first, a well-formed 3-digit numeric value, and the only pseudo-header in the response; a malformed response calls the new <code>ClientHandler::request_failed</code> and stops the stream instead of dispatching <code>response_headers</code></td></tr>
 <tr><td>Response DATA/trailers/FIN → completion</td><td>§4.1</td><td>Compliant</td><td><code>h3/client.rs:193-252</code></td></tr>
-<tr><td>Request trailers (client-sent)</td><td>§4.1</td><td>Not implemented</td><td><code>ClientWriter</code> trait has no trailers method at all</td></tr>
+<tr><td>Request trailers (client-sent)</td><td>§4.1</td><td>Compliant</td><td><code>ClientWriter::trailers</code> (default no-op for H1/H2); H3 client encodes a second HEADERS frame before stream FIN (<code>h3/client.rs</code>)</td></tr>
 <tr><td>GOAWAY reception</td><td>§5.2</td><td>Compliant</td><td>Same <code>H3UniStream::goaway_frame()</code> path as the server, shared between roles</td></tr>
 <tr><td>Extended CONNECT (client-initiated)</td><td>RFC 9220</td><td>Needs verification</td><td>Server-side path is integration-tested; no H3-client-initiated Extended-CONNECT test exists</td></tr>
 <tr><td>End-to-end GET verified live</td><td>—</td><td>Compliant</td><td><code>h3/endpoint.rs:487-536</code> integration test, real client GET through <code>connect_h3</code>/<code>listen_h3</code></td></tr>
