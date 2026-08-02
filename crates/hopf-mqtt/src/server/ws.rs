@@ -45,7 +45,15 @@ use crate::codec::parser::{MqttFrameHandler, MqttFrameParser};
 use crate::codec::properties::property;
 use crate::codec::{encode, MqttError, Properties, ProtocolVersion};
 
-use crate::server::{ConnectDecision, ConnectHandler, MqttConfig, MqttHandlerFactory};
+use crate::server::control::PublishTelemetry;
+use crate::server::{
+    ConnectDecision, ConnectHandler, MqttConfig, MqttConnectionMetadata, MqttHandlerFactory,
+};
+use crate::server::metrics::MqttServerMetrics;
+use hopf_otel::{
+    ExportHandle, SpanKind, Trace, MqttServerMetrics as OtelMqttMetrics,
+};
+use std::net::SocketAddr;
 
 struct ConnectedWsSession {
     subscriber_id: SubscriberId,
@@ -66,6 +74,10 @@ enum SessionState {
 pub struct MqttWsFactory {
     config: Arc<MqttConfig>,
     handler_factory: Arc<dyn MqttHandlerFactory>,
+    metrics: Arc<MqttServerMetrics>,
+    otel_metrics: Option<Arc<OtelMqttMetrics>>,
+    export: Option<ExportHandle>,
+    traces_enabled: bool,
 }
 
 impl MqttWsFactory {
@@ -73,7 +85,29 @@ impl MqttWsFactory {
     /// CONNECT via `handler_factory` (same SPI as the TCP listener —
     /// `server::DefaultMqttHandlerFactory` if you don't need custom policy).
     pub fn new(config: Arc<MqttConfig>, handler_factory: Arc<dyn MqttHandlerFactory>) -> Self {
-        Self { config, handler_factory }
+        Self {
+            config,
+            handler_factory,
+            metrics: MqttServerMetrics::shared(),
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
+        }
+    }
+
+    /// Wire OTLP/JSONL MQTT metrics and traces (same as [`crate::server::MqttService::with_telemetry`]).
+    pub fn with_telemetry(mut self, pipeline: &hopf_otel::TelemetryPipeline) -> Self {
+        let cfg = pipeline.config();
+        if cfg.metrics_enabled {
+            self.otel_metrics = Some(pipeline.mqtt_metrics());
+        }
+        if cfg.traces_enabled {
+            self.export = Some(pipeline.export_handle());
+            self.traces_enabled = true;
+        } else if cfg.metrics_enabled {
+            self.export = Some(pipeline.export_handle());
+        }
+        self
     }
 }
 
@@ -92,6 +126,20 @@ impl WsEventHandlerFactory for MqttWsFactory {
             // transport — wrap it so those deliveries come out as proper WS
             // binary frames instead of raw MQTT bytes on the wire.
             conn: framed_ws_conn_handle(&conn, WsRole::Server),
+            metrics: Arc::clone(&self.metrics),
+            meta: MqttConnectionMetadata {
+                peer: SocketAddr::from(([0, 0, 0, 0], 0)),
+                local: SocketAddr::from(([0, 0, 0, 0], 0)),
+                tls: false,
+                client_id: None,
+                traceparent: None,
+            },
+            otel_metrics: self.otel_metrics.clone(),
+            export: self.export.clone(),
+            traces_enabled: self.traces_enabled,
+            conn_trace: None,
+            publish_tel: None,
+            telemetry_started: false,
         })
     }
 }
@@ -103,11 +151,107 @@ pub struct MqttWsHandler {
     session: SessionState,
     connect_handler: Box<dyn ConnectHandler>,
     conn: ConnHandle,
+    metrics: Arc<MqttServerMetrics>,
+    meta: MqttConnectionMetadata,
+    otel_metrics: Option<Arc<OtelMqttMetrics>>,
+    export: Option<ExportHandle>,
+    traces_enabled: bool,
+    conn_trace: Option<Trace>,
+    publish_tel: Option<PublishTelemetry>,
+    telemetry_started: bool,
 }
 
 impl MqttWsHandler {
+    fn ensure_connection_telemetry(&mut self) {
+        if self.telemetry_started {
+            return;
+        }
+        self.telemetry_started = true;
+        MqttServerMetrics::add(&self.metrics.connections, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.connection_opened();
+        }
+        if self.traces_enabled {
+            if let Some(export) = self.export.clone() {
+                let t = Trace::new("MQTT connection", SpanKind::Server);
+                t.set_exporter(export);
+                self.meta.traceparent = Some(t.traceparent());
+                self.conn_trace = Some(t);
+            }
+        }
+    }
+
+    fn end_connection_telemetry(&mut self) {
+        if !self.telemetry_started {
+            return;
+        }
+        if let Some(tel) = self.publish_tel.take() {
+            tel.finish(false);
+        }
+        if let Some(trace) = self.conn_trace.take() {
+            let root = trace.root_span();
+            root.set_status_ok();
+            root.end();
+            trace.end();
+        }
+        self.meta.traceparent = None;
+        if let Some(m) = &self.otel_metrics {
+            m.connection_closed();
+        }
+    }
+
+    fn begin_publish_telemetry(&mut self, qos: QoS, bytes: u64) {
+        if self.otel_metrics.is_none() && self.conn_trace.is_none() {
+            return;
+        }
+        let span = if let Some(trace) = &self.conn_trace {
+            let s = trace.start_span("MQTT publish", SpanKind::Server);
+            self.meta.traceparent = Some(trace.traceparent());
+            Some(s)
+        } else {
+            None
+        };
+        self.publish_tel = Some(PublishTelemetry::start(
+            qos,
+            bytes,
+            self.otel_metrics.clone(),
+            span,
+        ));
+    }
+
+    fn finish_publish_telemetry(&mut self, ok: bool) {
+        if let Some(tel) = self.publish_tel.take() {
+            tel.finish(ok);
+        }
+        if let Some(trace) = &self.conn_trace {
+            self.meta.traceparent = Some(trace.traceparent());
+        }
+        if ok {
+            MqttServerMetrics::add(&self.metrics.publishes, 1);
+        }
+    }
+
+    fn record_auth(&self, ok: bool) {
+        if ok {
+            MqttServerMetrics::add(&self.metrics.auth_ok, 1);
+        } else {
+            MqttServerMetrics::add(&self.metrics.auth_fail, 1);
+        }
+        if let Some(m) = &self.otel_metrics {
+            m.auth(ok);
+        }
+    }
+
+    fn record_subscribe(&self) {
+        MqttServerMetrics::add(&self.metrics.subscribes, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.subscribe();
+        }
+    }
+
     fn teardown(&mut self) {
         let SessionState::Connected(session) = &self.session else {
+            self.end_connection_telemetry();
             return;
         };
         if !session.graceful_disconnect {
@@ -127,12 +271,14 @@ impl MqttWsHandler {
         // full, immediate teardown; see the module docs.
         self.config.broker.unregister(session.subscriber_id);
         self.session = SessionState::AwaitingConnect;
+        self.end_connection_telemetry();
     }
 }
 
 impl WsEventHandler for MqttWsHandler {
     fn opened(&mut self, _session: &mut WsSession<'_>, _conn: &ConnHandle) {
         // `conn` was already captured at construction (`MqttWsFactory::create`).
+        self.ensure_connection_telemetry();
     }
 
     fn binary_message(&mut self, session: &mut WsSession<'_>, data: &[u8]) {
@@ -208,10 +354,15 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
             packet.client_id.clone()
         };
 
-        if let ConnectDecision::Reject(reason_code) = self.handler.connect_handler.authorize(&packet) {
+        if let ConnectDecision::Reject(reason_code) =
+            self.handler.connect_handler.authorize(&packet, &self.handler.meta)
+        {
+            self.handler.record_auth(false);
             self.connack_and_close(version, reason_code);
             return;
         }
+        self.handler.record_auth(true);
+        self.handler.meta.client_id = Some(client_id.clone());
 
         let receive_maximum = if version.is_v5() {
             packet.properties.get_u16(property::RECEIVE_MAXIMUM).unwrap_or(UNLIMITED_RECEIVE_MAXIMUM).max(1)
@@ -289,11 +440,14 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         }
 
         let subscriber_id = session.subscriber_id;
+        let qos = header.qos;
+        let bytes = header.payload_len as u64;
         let pending = PendingPublish::begin(self.broker(), subscriber_id, header);
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
         };
         session.pending_publish = Some(pending);
+        self.handler.begin_publish_telemetry(qos, bytes);
     }
 
     fn publish_data(&mut self, data: &[u8]) {
@@ -316,6 +470,7 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         let version = session.version;
         let (qos, packet_id) = (pending.header.qos, pending.header.packet_id);
         pending.finish(self.broker());
+        self.handler.finish_publish_telemetry(true);
 
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
@@ -385,6 +540,7 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         }
         let wire = encode::encode_suback(packet_id, &reason_codes, &Properties::new(), version);
         self.session.send_binary(&wire);
+        self.handler.record_subscribe();
     }
 
     fn suback(&mut self, _packet_id: u16, _properties: Properties, _reason_codes: Vec<u8>) {
