@@ -19,6 +19,8 @@ use crate::server::metrics::SmtpServerMetrics;
 pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 35 * 1024 * 1024;
 /// Default max recipients per transaction.
 pub const DEFAULT_MAX_RECIPIENTS: usize = 100;
+/// Default max MAIL FROM transactions per SMTP session (RFC 9422 MAILMAX).
+pub const DEFAULT_MAX_MAIL_TRANSACTIONS: u32 = 100;
 
 /// SMTP server configuration.
 #[derive(Clone)]
@@ -29,8 +31,11 @@ pub struct SmtpConfig {
     pub hostname: String,
     /// Max message size in bytes.
     pub max_message_size: u64,
-    /// Max RCPT TO per transaction.
+    /// Max RCPT TO per transaction (also advertised as LIMITS RCPTMAX).
     pub max_recipients: usize,
+    /// Max MAIL FROM commands per session (LIMITS MAILMAX). Counted
+    /// regardless of success or failure (RFC 9422 §4.1).
+    pub max_mail_transactions: u32,
     /// Require AUTH before MAIL FROM.
     pub auth_required: bool,
     /// Optional TLS acceptor (STARTTLS / implicit).
@@ -51,6 +56,7 @@ impl SmtpConfig {
             hostname: hostname.into(),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_recipients: DEFAULT_MAX_RECIPIENTS,
+            max_mail_transactions: DEFAULT_MAX_MAIL_TRANSACTIONS,
             auth_required: false,
             tls_acceptor: None,
             implicit_tls: false,
@@ -79,6 +85,12 @@ impl SmtpConfig {
     /// Credential store for AUTH.
     pub fn with_store(mut self, store: Arc<dyn CredentialStore>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Override LIMITS MAILMAX (and the matching session counter).
+    pub fn with_max_mail_transactions(mut self, n: u32) -> Self {
+        self.max_mail_transactions = n.max(1);
         self
     }
 }

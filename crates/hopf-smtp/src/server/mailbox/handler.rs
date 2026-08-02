@@ -10,10 +10,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use hopf_core::{ConnHandle, Runtime, StorageError};
+use hopf_dns::DnsResolver;
 use hopf_mailbox::{Flag, MailboxFactory};
 use rmimeparser::EmailAddress;
 
+use crate::client::{MailFromParams, SmtpClient, SmtpClientTimeouts, SmtpSend};
 use crate::server::delivery::{DeliveryRequirements, DsnRecipientParams};
+use crate::server::dsn::{orcpt_field, DeliveryStatusNotification, DsnAction, DsnRecipientReport};
 use crate::server::handler::{
     AuthenticateState, ConnectedState, HelloHandler, HelloState, MailFromHandler, MailFromState,
     MessageDataHandler, MessageEndState, MessageStartState, RecipientHandler, RecipientState,
@@ -57,7 +60,9 @@ impl SmtpHandlerFactory for LocalDeliveryHandlerFactory {
             local_domain: self.local_domain.clone(),
             hostname: self.hostname.clone(),
             control_handle: None,
+            inbound_tls: false,
             sender: None,
+            delivery: DeliveryRequirements::default(),
             recipients: Vec::new(),
             spool: None,
             extra_header_lines: Vec::new(),
@@ -73,9 +78,11 @@ pub struct LocalDeliveryHandler {
     local_domain: String,
     hostname: String,
     control_handle: Option<ConnHandle>,
+    inbound_tls: bool,
     sender: Option<EmailAddress>,
-    /// Local-parts of accepted recipients (mailbox usernames).
-    recipients: Vec<String>,
+    delivery: DeliveryRequirements,
+    /// Accepted recipients: (mailbox username, address, DSN params).
+    recipients: Vec<(String, EmailAddress, DsnRecipientParams)>,
     spool: Option<Arc<Mutex<SpoolPipeline>>>,
     /// Extra header field values (each without a trailing CRLF — one is
     /// added automatically) to prepend to the message ahead of the
@@ -93,6 +100,7 @@ pub struct LocalDeliveryHandler {
 impl LocalDeliveryHandler {
     fn reset_transaction(&mut self) {
         self.sender = None;
+        self.delivery = DeliveryRequirements::default();
         self.recipients.clear();
         self.spool = None;
         self.extra_header_lines.clear();
@@ -109,6 +117,7 @@ impl LocalDeliveryHandler {
 impl SmtpClientConnected for LocalDeliveryHandler {
     fn connected(&mut self, state: &mut dyn ConnectedState, meta: &SmtpConnectionMetadata) {
         self.control_handle = meta.control_handle.clone();
+        self.inbound_tls = meta.tls;
         let greeting = format!("{} ESMTP Service ready", self.hostname);
         state.accept_connection(&greeting, Box::new(self.clone()));
     }
@@ -124,7 +133,9 @@ impl HelloHandler for LocalDeliveryHandler {
         state.accept_hello(Box::new(self.clone()));
     }
 
-    fn tls_established(&mut self, _info: &hopf_core::SecurityInfo) {}
+    fn tls_established(&mut self, _info: &hopf_core::SecurityInfo) {
+        self.inbound_tls = true;
+    }
 
     fn authenticated(&mut self, state: &mut dyn AuthenticateState, _user: &str) {
         state.accept(Box::new(self.clone()));
@@ -150,11 +161,19 @@ impl MailFromHandler for LocalDeliveryHandler {
         delivery: &DeliveryRequirements,
     ) {
         self.sender = sender.cloned();
+        self.delivery = delivery.clone();
         self.recipients.clear();
 
         if delivery.is_future_release() {
             state.reject_sender_policy(
                 "FUTURERELEASE not supported by local delivery",
+                Box::new(self.clone()),
+            );
+            return;
+        }
+        if delivery.is_require_tls() && !self.inbound_tls {
+            state.reject_sender_policy(
+                "REQUIRETLS requires a TLS-protected session",
                 Box::new(self.clone()),
             );
             return;
@@ -178,7 +197,7 @@ impl RecipientHandler for LocalDeliveryHandler {
         &mut self,
         state: &mut dyn RecipientState,
         recipient: &EmailAddress,
-        _dsn: &DsnRecipientParams,
+        dsn: &DsnRecipientParams,
     ) {
         let Some(username) = local_recipient_username(
             recipient.local_part(),
@@ -188,7 +207,8 @@ impl RecipientHandler for LocalDeliveryHandler {
             state.reject_recipient_relay_denied(Box::new(self.clone()));
             return;
         };
-        self.recipients.push(username);
+        self.recipients
+            .push((username, recipient.clone(), dsn.clone()));
         state.accept_recipient(Box::new(self.clone()));
     }
 
@@ -239,6 +259,20 @@ impl MessageDataHandler for LocalDeliveryHandler {
             return;
         }
 
+        if let Some(by) = &self.delivery.deliver_by {
+            if by.deadline <= std::time::SystemTime::now() {
+                if let Some(path) = &spool_path {
+                    let _ = std::fs::remove_file(path);
+                }
+                state.reject_message_temporary(
+                    "DELIVERBY deadline exceeded",
+                    Box::new(self.clone()),
+                );
+                self.reset_transaction();
+                return;
+            }
+        }
+
         let recipients = self.recipients.clone();
         let extra_header_lines = self.extra_header_lines.clone();
         let factory = Arc::clone(&self.mailbox_factory);
@@ -248,6 +282,11 @@ impl MessageDataHandler for LocalDeliveryHandler {
             .clone()
             .expect("control handle set in connected()");
         let deferred = state.defer(Box::new(self.clone()));
+        let sender = self.sender.clone();
+        let delivery = self.delivery.clone();
+        let hostname = self.hostname.clone();
+        let local_domain = self.local_domain.clone();
+        let runtime = Arc::clone(&self.runtime);
         self.reset_transaction();
 
         storage.submit_on(
@@ -258,6 +297,11 @@ impl MessageDataHandler for LocalDeliveryHandler {
                     &recipients,
                     spool_path.as_deref(),
                     &extra_header_lines,
+                    sender.as_ref(),
+                    &delivery,
+                    &hostname,
+                    &local_domain,
+                    &runtime,
                 )
             },
             move |result: Result<Option<String>, StorageError>| match result {
@@ -286,25 +330,209 @@ fn local_recipient_username(
 }
 
 /// Deliver to every recipient by streaming `spool_path`'s content into each
-/// mailbox's append triad, then remove the spool file. Returns `None` on
-/// full success, or the first error message (other recipients are still
-/// attempted).
+/// mailbox's append triad, then remove the spool file. Emits a DSN to the
+/// reverse-path when NOTIFY requests it. Returns `None` on full success, or
+/// the first error message (other recipients are still attempted).
 fn deliver_spooled(
     factory: &dyn MailboxFactory,
-    recipients: &[String],
+    recipients: &[(String, EmailAddress, DsnRecipientParams)],
     spool_path: Option<&Path>,
     extra_header_lines: &[String],
+    sender: Option<&EmailAddress>,
+    delivery: &DeliveryRequirements,
+    hostname: &str,
+    local_domain: &str,
+    runtime: &Arc<Runtime>,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let flags = BTreeSet::<Flag>::new();
-    let result = deliver_recipients(recipients, |username| {
-        deliver_to_mailbox_streaming(factory, username, spool_path, &flags, extra_header_lines)
-    });
+    let mut first_error: Option<String> = None;
+    let mut outcomes: Vec<(DsnRecipientParams, DsnRecipientReport)> = Vec::new();
+
+    for (username, addr, params) in recipients {
+        let outcome = match deliver_to_mailbox_streaming(
+            factory,
+            username,
+            spool_path,
+            &flags,
+            extra_header_lines,
+        ) {
+            Ok(()) => {
+                outcomes.push((
+                    params.clone(),
+                    DsnRecipientReport {
+                        final_recipient: addr.address(),
+                        original_recipient: orcpt_field(params),
+                        action: DsnAction::Delivered,
+                        diagnostic: None,
+                    },
+                ));
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if first_error.is_none() {
+                    first_error = Some(msg.clone());
+                }
+                outcomes.push((
+                    params.clone(),
+                    DsnRecipientReport {
+                        final_recipient: addr.address(),
+                        original_recipient: orcpt_field(params),
+                        action: DsnAction::Failed,
+                        diagnostic: Some(msg),
+                    },
+                ));
+                Err(())
+            }
+        };
+        let _ = outcome;
+    }
+
+    let reports = DeliveryStatusNotification::filter_reports(outcomes);
+    if !reports.is_empty() {
+        if let Some(sender) = sender {
+            let original = spool_path
+                .and_then(|p| std::fs::read(p).ok())
+                .unwrap_or_default();
+            let dsn = DeliveryStatusNotification {
+                reporting_mta: hostname.into(),
+                reverse_path: Some(sender.clone()),
+                delivery: delivery.clone(),
+                recipients: reports,
+                original_message: original,
+            };
+            if let Some(bytes) = dsn.render() {
+                deliver_dsn_to_reverse_path(
+                    factory,
+                    sender,
+                    &bytes,
+                    local_domain,
+                    hostname,
+                    runtime,
+                    delivery.is_require_tls(),
+                );
+            }
+        }
+    }
+
     if let Some(path) = spool_path {
         let _ = std::fs::remove_file(path);
     }
-    Ok(result)
+    Ok(first_error)
 }
 
+/// Deliver a rendered DSN: local reverse-path → APPEND; otherwise MX relay.
+fn deliver_dsn_to_reverse_path(
+    factory: &dyn MailboxFactory,
+    reverse_path: &EmailAddress,
+    message: &[u8],
+    local_domain: &str,
+    hostname: &str,
+    runtime: &Arc<Runtime>,
+    require_tls: bool,
+) {
+    if let Some(username) = local_recipient_username(
+        reverse_path.local_part(),
+        reverse_path.domain(),
+        local_domain,
+    ) {
+        let _ = append_bytes_to_mailbox(factory, &username, message);
+        return;
+    }
+
+    let Ok(dns) = DnsResolver::for_runtime(runtime.as_ref()) else {
+        return;
+    };
+    send_local_dsn_via_mx(
+        message,
+        reverse_path,
+        hostname,
+        &Arc::new(dns),
+        runtime,
+        require_tls,
+    );
+}
+
+fn append_bytes_to_mailbox(
+    factory: &dyn MailboxFactory,
+    username: &str,
+    message: &[u8],
+) -> hopf_mailbox::MailboxResult<()> {
+    let flags = BTreeSet::<Flag>::new();
+    let mut store = factory.create_store();
+    store.open(username)?;
+    let mut mb = store.open_mailbox("INBOX", false)?;
+    let mut guard = hopf_mailbox::AppendGuard::start(mb.as_mut(), &flags, None)?;
+    guard.append_content(message)?;
+    guard.commit()?;
+    mb.close(false)?;
+    store.close()?;
+    Ok(())
+}
+
+fn send_local_dsn_via_mx(
+    message: &[u8],
+    reverse_path: &EmailAddress,
+    hostname: &str,
+    dns: &Arc<DnsResolver>,
+    runtime: &Arc<Runtime>,
+    require_tls: bool,
+) {
+    let domain = reverse_path.domain().to_ascii_lowercase();
+    let to = reverse_path.address();
+    let hostname = hostname.to_string();
+    let message = message.to_vec();
+    let runtime = Arc::clone(runtime);
+    let dns2 = Arc::clone(dns);
+    let domain_for_cb = domain.clone();
+    dns.query_mx(
+        &domain,
+        Box::new(move |result| {
+            let host = match result {
+                Ok(msg) => {
+                    let mut mx: Vec<(u16, String)> =
+                        msg.answers.iter().filter_map(|rr| rr.as_mx()).collect();
+                    mx.sort_by_key(|(pref, _)| *pref);
+                    mx.first()
+                        .map(|(_, ex)| ex.trim_end_matches('.').to_string())
+                        .unwrap_or(domain_for_cb)
+                }
+                Err(_) => return,
+            };
+            dns2.resolve(
+                &host,
+                25,
+                Box::new(move |result| {
+                    let Ok(addrs) = result else {
+                        return;
+                    };
+                    let Some(&addr) = addrs.first() else {
+                        return;
+                    };
+                    let timeouts = SmtpClientTimeouts::default();
+                    let mut body = Some(message);
+                    let mut send = SmtpSend::new(hostname)
+                        .mail_from("")
+                        .rcpt_to(to)
+                        .message_with(move || body.take());
+                    if require_tls {
+                        send = send
+                            .require_starttls(true)
+                            .mail_from_params(MailFromParams {
+                                require_tls: true,
+                                ..Default::default()
+                            });
+                    }
+                    let _ = SmtpClient::from_addr(addr)
+                        .timeouts(timeouts)
+                        .connect(&runtime, Arc::new(send));
+                }),
+            );
+        }),
+    );
+}
+
+#[cfg(test)]
 fn deliver_recipients<E, F>(recipients: &[String], mut deliver: F) -> Option<String>
 where
     E: std::fmt::Display,

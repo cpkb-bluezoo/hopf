@@ -7,6 +7,7 @@ mod codec;
 mod control;
 mod data;
 mod delivery;
+mod dsn;
 mod handler;
 mod mailbox;
 mod metrics;
@@ -25,6 +26,7 @@ pub use delivery::{
     parse_mail_from_arg, parse_rcpt_to_arg, BodyType, DeliverBy, DeliveryRequirements, DsnNotify,
     DsnRecipientParams, DsnReturn, MailFromParse, ParamParseError,
 };
+pub use dsn::{DeliveryStatusNotification, DsnAction, DsnRecipientReport};
 pub use handler::{
     AcceptAllSmtpHandler, AcceptAllSmtpHandlerFactory, AuthenticateState, ConnectedState,
     DeferredDelivery, HelloHandler, HelloState, MailFromHandler, MailFromState, MessageDataHandler,
@@ -37,5 +39,8 @@ pub use pipeline::{DiscardPipeline, NullPipeline, SmtpPipeline};
 pub use mailbox::{LocalDeliveryHandler, LocalDeliveryHandlerFactory, LocalDeliveryService};
 pub use relay::{SimpleRelayHandler, SimpleRelayHandlerFactory, SimpleRelayService};
 pub use reply::{reply, reply_ehlo, reply_enhanced, reply_multiline};
-pub use service::{SmtpConfig, SmtpService, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_RECIPIENTS};
+pub use service::{
+    SmtpConfig, SmtpService, DEFAULT_MAX_MAIL_TRANSACTIONS, DEFAULT_MAX_MESSAGE_SIZE,
+    DEFAULT_MAX_RECIPIENTS,
+};
 pub use session::{DataDotState, SmtpSessionState};

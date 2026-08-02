@@ -27,15 +27,16 @@ pub use server::{
     parse_mail_from_arg, parse_rcpt_to_arg, reply, reply_ehlo, reply_enhanced, reply_multiline,
     AcceptAllSmtpHandler, AcceptAllSmtpHandlerFactory, AuthenticateState, BdatAccumulator,
     BodyType, ConnectedState, DataDotState, DeferredDelivery, DeliverBy, DeliveryRequirements,
-    DiscardPipeline, DotUnstuffer, DsnNotify, DsnRecipientParams, DsnReturn, HelloHandler,
+    DeliveryStatusNotification, DiscardPipeline, DotUnstuffer, DsnAction, DsnNotify,
+    DsnRecipientParams, DsnRecipientReport, DsnReturn, HelloHandler,
     HelloState, LocalDeliveryHandler, LocalDeliveryHandlerFactory, LocalDeliveryService,
     MailFromHandler, MailFromParse, MailFromState, MessageDataHandler,
     MessageEndState, MessageStartState, MimeAnalysisPipeline, NullPipeline, ParamParseError, RecipientHandler,
     RecipientState, ResetState, SimpleRelayHandler, SimpleRelayHandlerFactory,
     SimpleRelayService, SmtpClientConnected, SmtpCommand, SmtpConfig, SmtpConnectionMetadata,
     SmtpControlHandler, SmtpHandlerFactory, SmtpPipeline, SmtpServerLexer, SmtpServerMetrics,
-    SmtpService, SmtpSessionState, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_RECIPIENTS,
-    MAX_COMMAND_LINE,
+    SmtpService, SmtpSessionState, DEFAULT_MAX_MAIL_TRANSACTIONS, DEFAULT_MAX_MESSAGE_SIZE,
+    DEFAULT_MAX_RECIPIENTS, MAX_COMMAND_LINE,
 };
 
 #[cfg(all(test, feature = "integration"))]
