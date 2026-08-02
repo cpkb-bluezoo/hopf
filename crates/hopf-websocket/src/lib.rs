@@ -18,14 +18,14 @@ pub use frame::{
 };
 pub use handshake::{
     calculate_accept, generate_key, is_extended_connect_websocket, is_h1_websocket_upgrade,
-    validate_h1_upgrade, websocket_accept_headers, websocket_connect_response_headers,
-    WEBSOCKET_GUID, WEBSOCKET_VERSION,
+    negotiate_subprotocol, validate_h1_upgrade, websocket_accept_headers,
+    websocket_connect_response_headers, WEBSOCKET_GUID, WEBSOCKET_VERSION,
 };
 pub use session::{
-    framed_ws_conn_handle, write_binary, write_close, write_ping, write_pong, write_text,
-    WsSession,
+    framed_ws_conn_handle, write_binary, write_close, write_close_empty, write_ping, write_pong,
+    write_text, WsSession,
 };
-pub use upgrade::{WsEventHandler, WsUpgradeHandler};
+pub use upgrade::{is_valid_close_code, WsEventHandler, WsUpgradeHandler};
 
 #[cfg(all(test, feature = "integration"))]
 mod integration;

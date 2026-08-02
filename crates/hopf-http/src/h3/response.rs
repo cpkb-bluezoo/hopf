@@ -20,6 +20,9 @@ pub(crate) struct H3WriterShared {
     pub upgrade_handler: Option<Box<dyn ProtocolUpgradeHandler>>,
     pub upgraded: bool,
     pub headers_sent: bool,
+    /// When true with [`Self::complete`], an upgraded stream should FIN
+    /// (WebSocket Close / protocol error). Normal upgraded streams stay open.
+    pub upgrade_fin: bool,
 }
 
 impl H3WriterShared {
@@ -34,6 +37,7 @@ impl H3WriterShared {
             upgrade_handler: None,
             upgraded: false,
             headers_sent: false,
+            upgrade_fin: false,
         }
     }
 }

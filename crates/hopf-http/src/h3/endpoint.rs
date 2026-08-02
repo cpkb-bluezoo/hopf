@@ -184,7 +184,7 @@ impl H3Writer {
         };
         let complete = {
             let shared = self.control.shared.lock().unwrap();
-            shared.complete && !upgraded
+            shared.complete && (!upgraded || shared.upgrade_fin)
         };
         let headers_sent = self.control.shared.lock().unwrap().headers_sent;
 
@@ -340,15 +340,15 @@ impl H3RequestStream {
     fn maybe_flush_after_deferred(&mut self, endpoint: &mut dyn Endpoint) {
         self.deliver_paused_body();
         if let Some(up) = self.upgraded.as_mut() {
+            let wants_close = up.wants_close();
             let out = up.take_outbound();
+            let mut shared = self.writer.control.shared.lock().unwrap();
             if !out.is_empty() {
-                self.writer
-                    .control
-                    .shared
-                    .lock()
-                    .unwrap()
-                    .body
-                    .extend_from_slice(&out);
+                shared.body.extend_from_slice(&out);
+            }
+            if wants_close {
+                shared.complete = true;
+                shared.upgrade_fin = true;
             }
         }
         self.writer.flush_if_ready(endpoint);
@@ -359,15 +359,15 @@ impl H3RequestStream {
             if !payload.is_empty() {
                 up.receive(payload);
             }
+            let wants_close = up.wants_close();
             let out = up.take_outbound();
+            let mut shared = self.writer.control.shared.lock().unwrap();
             if !out.is_empty() {
-                self.writer
-                    .control
-                    .shared
-                    .lock()
-                    .unwrap()
-                    .body
-                    .extend_from_slice(&out);
+                shared.body.extend_from_slice(&out);
+            }
+            if wants_close {
+                shared.complete = true;
+                shared.upgrade_fin = true;
             }
             return;
         }
