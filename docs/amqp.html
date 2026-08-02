@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AMQP — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
+<li><a href="amqp.html" aria-current="page">AMQP</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="quota.html">Quota</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Architecture audit</h2><ul>
+<li><a href="conformance.html">Conformance</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>AMQP</h1>
+        <p class="lead"><code>hopf-amqp</code> is an <strong>AMQP 0-9-1 async client</strong> (RabbitMQ wire protocol). Client-only: publish opaque bodies and consume via push <code>basic.consume</code> deliveries on the Hopf TPC runtime. There is no broker in this crate.</p>
+      </header>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#scope">Scope</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#client">Client</a></li>
+<li><a href="#messages">Messages</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+
+      <h2 id="scope">Scope</h2>
+<table>
+<thead><tr><th>Area</th><th>Support</th></tr></thead>
+<tbody>
+<tr><td>Protocol</td><td>AMQP 0-9-1 only (not 1.0)</td></tr>
+<tr><td>Role</td><td>Client only</td></tr>
+<tr><td>Auth</td><td><code>PLAIN</code> (via <code>hopf-auth</code>) or <code>AMQPLAIN</code></td></tr>
+<tr><td>Channels</td><td>Multi-channel; control methods take <code>channel_id</code></td></tr>
+<tr><td>Publish</td><td><code>basic.publish</code> + content frames, publisher confirms, <code>basic.return</code></td></tr>
+<tr><td>Consume</td><td><code>basic.consume</code> push deliveries (not <code>basic.get</code>)</td></tr>
+<tr><td>TLS</td><td>AMQPS via implicit TLS on dial</td></tr>
+</tbody>
+</table>
+
+      <h2 id="architecture">Architecture</h2>
+<pre><code>AmqpClient::connect
+    → Runtime::connect(TcpConnectorConfig)
+    → AmqpClientEndpoint (ProtocolHandler)
+         protocol header → connection.start/start-ok
+         → tune/tune-ok → open/open-ok
+         → AmqpClientDriver::on_connection_open
+         → channel / topology / basic.* via AmqpClientControl
+         ← basic.deliver + content → on_delivery_start/data/complete</code></pre>
+<p>Inbound is reactor-driven: socket readable → <code>receive</code> → <code>AmqpFrameParser</code> → driver callbacks. There is no application poll loop.</p>
+
+      <h2 id="client">Client</h2>
+<p>SPI mirrors MQTT: <code>AmqpClient</code> facade, <code>AmqpClientHandlerFactory</code>, flat <code>AmqpClientDriver</code> / <code>AmqpClientControl</code>.</p>
+<pre class="text"><code>AmqpClient::new("127.0.0.1", 5672)
+    .credentials("guest", "guest")
+    .connect(&amp;rt, Arc::new(Factory))?;</code></pre>
+<p>On <code>on_connection_open</code>, open a channel (≥ 1), then declare topology, <code>confirm_select</code>, <code>basic_publish</code>, and/or <code>basic_consume</code>.</p>
+
+      <h2 id="messages">Messages</h2>
+<p>Bodies are opaque octets. Basic properties (<code>content-type</code>, <code>content-encoding</code>, headers, delivery-mode, correlation-id, …) travel in the content header; MIME values are conventional, not enforced by the protocol.</p>
+
+      <h2 id="examples">Examples</h2>
+<pre><code>cargo run -p amqp-pub -- 127.0.0.1 5672 demo.queue "hello from hopf"
+cargo run -p amqp-consume -- 127.0.0.1 5672 demo.queue</code></pre>
+<p>Opt-in broker test: <code>cargo test -p hopf-amqp --features integration</code>.</p>
+
+      <h2 id="limitations">Limitations</h2>
+<ul>
+<li>No broker / server module</li>
+<li>No <code>basic.get</code>, transactions (<code>tx.*</code>), or AMQP 1.0</li>
+<li>No Composition/XML registration in v1</li>
+</ul>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>
