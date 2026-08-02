@@ -46,7 +46,7 @@ pub struct StorTransfer {
     pub observer: Option<Arc<dyn TransferObserver>>,
     /// Quota manager + username to record usage against, once the upload
     /// completes successfully.
-    pub quota: Option<(Arc<dyn hopf_quota::QuotaManager>, String)>,
+    pub quota: Option<(Arc<dyn hopf_core::QuotaManager>, String)>,
 }
 
 /// Shared state between control and one data connection.
@@ -258,7 +258,7 @@ pub struct FtpDataHandler {
     stor_writer: Option<Box<dyn Write + Send>>,
     stor_path: String,
     stor_observer: Option<Arc<dyn TransferObserver>>,
-    stor_quota: Option<(Arc<dyn hopf_quota::QuotaManager>, String)>,
+    stor_quota: Option<(Arc<dyn hopf_core::QuotaManager>, String)>,
     stor_bytes: u64,
 }
 

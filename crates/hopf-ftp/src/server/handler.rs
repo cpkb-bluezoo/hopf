@@ -150,7 +150,7 @@ pub trait FtpConnectionHandler: Send {
     /// it can be carried into the async completion path for STOR/APPE/STOU
     /// — those run off the control connection's own thread, so usage can't
     /// be recorded through `self` there.
-    fn quota_manager(&self) -> Option<Arc<dyn hopf_quota::QuotaManager>> {
+    fn quota_manager(&self) -> Option<Arc<dyn hopf_core::QuotaManager>> {
         None
     }
 
@@ -167,7 +167,7 @@ pub trait FtpConnectionHandler: Send {
     /// The current quota status for `username` (used by `SITE QUOTA`-style
     /// commands), if quotas are enabled. Default delegates to
     /// [`Self::quota_manager`].
-    fn quota(&self, username: &str, _meta: &FtpConnectionMetadata) -> Option<hopf_quota::Quota> {
+    fn quota(&self, username: &str, _meta: &FtpConnectionMetadata) -> Option<hopf_core::Quota> {
         self.quota_manager().map(|qm| qm.get_quota(username))
     }
 
@@ -198,7 +198,7 @@ pub trait FtpConnectionHandlerFactory: Send + Sync {
 pub struct FilesystemFtpHandler {
     policy: Arc<dyn TrustPolicy>,
     fs: BasicFtpFileSystem,
-    quota: Option<Arc<dyn hopf_quota::QuotaManager>>,
+    quota: Option<Arc<dyn hopf_core::QuotaManager>>,
 }
 
 impl FilesystemFtpHandler {
@@ -222,7 +222,7 @@ impl FilesystemFtpHandler {
 
     /// Enforce per-user storage quotas via `quota` (shared across
     /// connections so usage accounting stays consistent).
-    pub fn with_quota(mut self, quota: Arc<dyn hopf_quota::QuotaManager>) -> Self {
+    pub fn with_quota(mut self, quota: Arc<dyn hopf_core::QuotaManager>) -> Self {
         self.quota = Some(quota);
         self
     }
@@ -254,7 +254,7 @@ impl FtpConnectionHandler for FilesystemFtpHandler {
         &mut self.fs
     }
 
-    fn quota_manager(&self) -> Option<Arc<dyn hopf_quota::QuotaManager>> {
+    fn quota_manager(&self) -> Option<Arc<dyn hopf_core::QuotaManager>> {
         self.quota.clone()
     }
 }
@@ -264,7 +264,7 @@ pub struct FilesystemFtpHandlerFactory {
     root: PathBuf,
     policy: Arc<dyn TrustPolicy>,
     read_only: bool,
-    quota: Option<Arc<dyn hopf_quota::QuotaManager>>,
+    quota: Option<Arc<dyn hopf_core::QuotaManager>>,
 }
 
 impl FilesystemFtpHandlerFactory {
@@ -290,7 +290,7 @@ impl FilesystemFtpHandlerFactory {
 
     /// Enforce per-user storage quotas via `quota`, shared across every
     /// connection this factory creates.
-    pub fn with_quota(mut self, quota: Arc<dyn hopf_quota::QuotaManager>) -> Self {
+    pub fn with_quota(mut self, quota: Arc<dyn hopf_core::QuotaManager>) -> Self {
         self.quota = Some(quota);
         self
     }

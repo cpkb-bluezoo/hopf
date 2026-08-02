@@ -55,7 +55,10 @@ pub use listener::{
     HandlerFactory, Listener, TcpListenerConfig, DEFAULT_BUFFER_SIZE, DEFAULT_MAX_NET_IN,
     DEFAULT_MAX_NET_OUT,
 };
-pub use quota::{CounterQuota, QuotaTracker, QuotaVerdict, UnlimitedQuota};
+pub use quota::{
+    CounterQuota, MemoryQuotaManager, Quota, QuotaManager, QuotaPolicy, QuotaSource, QuotaTracker,
+    QuotaVerdict, UnlimitedQuota, UnlimitedQuotaManager, UNLIMITED,
+};
 pub use runtime::{Runtime, RuntimeConfig};
 pub use security::SecurityInfo;
 pub use service::Service;

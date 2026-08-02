@@ -68,11 +68,11 @@
     <main class="main">
       <header>
         <h1>Quota</h1>
-        <p class="lead">Crate <code>hopf-quota</code>: per-user storage quota tracking (Gumdrop <code>org.bluezoo.gumdrop.quota</code> parity). Tracks how much storage — and, optionally, how many messages — a <em>user</em> has accumulated, independent of which protocol or connection touched their data. The same <code>QuotaManager</code> can back an FTP file store (<a href="ftp.html"><code>hopf-ftp</code></a>) and an IMAP mailbox (<a href="imap.html"><code>hopf-imap</code></a>) at once.</p>
+        <p class="lead">Per-user storage quota tracking in <code>hopf_core::quota</code> (Gumdrop <code>org.bluezoo.gumdrop.quota</code> parity). Tracks how much storage — and, optionally, how many messages — a <em>user</em> has accumulated, independent of which protocol or connection touched their data. The same <code>QuotaManager</code> can back an FTP file store (<a href="ftp.html"><code>hopf-ftp</code></a>) and an IMAP mailbox (<a href="imap.html"><code>hopf-imap</code></a>) at once.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
-<li><a href="#why-a-separate-crate">Why a separate crate</a></li>
+<li><a href="#two-kinds-of-quota">Two kinds of quota</a></li>
 <li><a href="#core-types">Core types</a></li>
 <li><a href="#resolution-order">Resolution order</a></li>
 <li><a href="#stock-managers">Stock managers</a></li>
@@ -81,8 +81,8 @@
 <li><a href="#sharing-one-quota-across-protocols">Sharing one quota across protocols</a></li>
 <li><a href="#limitations">Limitations</a></li>
 </ul></div>
-<h2 id="why-a-separate-crate">Why a separate crate</h2>
-<p>This is easy to confuse with <code>hopf_core::quota</code> (<code>QuotaTracker</code>/<code>CounterQuota</code>) — that's a <em>connection-level</em> traffic/rate limiter (bytes in/out, message count, per connection — closer to DoS protection). <code>hopf-quota</code> is about <em>per-user</em> storage accounting: how many bytes has <code>alice</code> stored across however many connections, over however long, regardless of protocol.</p>
+<h2 id="two-kinds-of-quota">Two kinds of quota</h2>
+<p><code>hopf_core::quota</code> covers both. <code>QuotaTracker</code>/<code>CounterQuota</code> are a <em>connection-level</em> traffic/rate limiter (bytes in/out, message count, per connection — closer to DoS protection). <code>QuotaManager</code>/<code>Quota</code> are <em>per-user</em> storage accounting: how many bytes has <code>alice</code> stored across however many connections, over however long, regardless of protocol.</p>
 <h2 id="core-types">Core types</h2>
 <table>
 <thead>
@@ -136,11 +136,11 @@
 <p><code>FtpConnectionHandler</code> (<a href="ftp.html"><code>hopf-ftp</code></a>) has <code>quota_manager()</code>/<code>can_store</code>/<code>quota</code>/<code>record_bytes_added</code>/<code>record_bytes_removed</code> default methods delegating to whatever <code>quota_manager()</code> returns — matching Gumdrop's <code>FTPConnectionHandler</code>. The stock <code>FilesystemFtpHandler</code>/<code>FilesystemFtpHandlerFactory</code> take an optional manager via <code>with_quota(Arc&lt;dyn QuotaManager&gt;)</code>.</p>
 <p>STOR/APPE/STOU are gated on <code>Quota::is_storage_exceeded</code> before the data connection opens — FTP has no declared-size-ahead-of-time (no <code>ALLO</code> tracking), so this can only reject a user who's <em>already</em> over quota, not pre-empt a specific upload that would push them over. Usage is recorded via the same <code>TransferObserver</code>-carried manager handle once the upload actually completes (see <a href="ftp.html#handler-spi">FTP: Handler SPI</a>), and on <code>DELE</code>.</p>
 <h2 id="imap-integration">IMAP integration</h2>
-<p><code>hopf_imap::server::quota::MemoryQuotaManager</code> is an adapter over a shared <code>hopf_quota::QuotaManager</code>, translating to/from RFC 9208's <code>STORAGE</code> (KiB)/<code>MESSAGE</code> resource view for GETQUOTA/SETQUOTA. It replaces what used to be IMAP's own independent in-memory tracker — see <a href="imap.html">IMAP</a>.</p>
+<p><code>hopf_imap::server::quota::MemoryQuotaManager</code> is an adapter over a shared <code>hopf_core::QuotaManager</code>, translating to/from RFC 9208's <code>STORAGE</code> (KiB)/<code>MESSAGE</code> resource view for GETQUOTA/SETQUOTA. It replaces what used to be IMAP's own independent in-memory tracker — see <a href="imap.html">IMAP</a>.</p>
 <h2 id="sharing-one-quota-across-protocols">Sharing one quota across protocols</h2>
-<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust">let backend: Arc&lt;dyn hopf_quota::QuotaManager&gt; =
-    Arc::new(hopf_quota::MemoryQuotaManager::new()
-        .with_default(hopf_quota::QuotaPolicy::with_storage("default", hopf_quota::QuotaPolicy::parse_size("1GB")?)));
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust">let backend: Arc&lt;dyn hopf_core::QuotaManager&gt; =
+    Arc::new(hopf_core::MemoryQuotaManager::new()
+        .with_default(hopf_core::QuotaPolicy::with_storage("default", hopf_core::QuotaPolicy::parse_size("1GB")?)));
 
 // FTP enforces against the same backend...
 let ftp_handler = FilesystemFtpHandlerFactory::new(root, policy).with_quota(backend.clone());

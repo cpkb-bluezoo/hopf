@@ -20,7 +20,6 @@ integration = []
 [dependencies]
 hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
-hopf-quota = { workspace = true }
 hopf-dns = { workspace = true }
 hopf-tls = { workspace = true }
 hopf-otel = { workspace = true }
