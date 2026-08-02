@@ -589,9 +589,9 @@
 <tbody>
 <tr><td>Staged handler SPI (connect→hello→mail→rcpt→data)</td><td>Compliant</td><td><code>handler/mod.rs:40-111</code></td></tr>
 <tr><td><code>SimpleRelayService</code> — open MX relay</td><td>Deferred (documented risk)</td><td>Accepts every recipient with no domain check at all (<code>relay/handler.rs:200-209</code>) — a genuine open relay, explicitly scoped to dev/test/closed-networks by the crate's own doc comment; must not be exposed to the public Internet</td></tr>
-<tr><td><code>SimpleRelayHandler</code> multi-domain reply semantics</td><td>Partial</td><td>A single 250/450 still covers the whole transaction at the SMTP reply layer, but per-recipient DSNs are generated for domains that failed (or succeeded when NOTIFY=SUCCESS)</td></tr>
+<tr><td><code>SimpleRelayHandler</code> multi-domain reply semantics</td><td>Compliant</td><td>Post-DATA reply is still a single 250/450 (SMTP has no per-RCPT DATA reply); partial success returns 250 and failure DSNs cover undelivered domains so clients do not retry and duplicate</td></tr>
 <tr><td><code>LocalDeliveryService</code> — APPEND to local INBOX via <code>hopf-mailbox</code></td><td>Compliant</td><td><code>mailbox/service.rs,handler.rs</code>, case-insensitive domain check at RCPT TO</td></tr>
-<tr><td>Local delivery multi-recipient failure semantics</td><td>Partial</td><td>Every recipient is attempted (doesn't abort on first failure), but the SMTP-level reply is a single 250/450 for the whole transaction — a failure to one recipient's mailbox after others already succeeded risks duplicate delivery on client retry</td></tr>
+<tr><td>Local delivery multi-recipient failure semantics</td><td>Compliant</td><td>Every recipient is attempted; partial success returns 250 with failure DSNs for the rest (avoids duplicate delivery on client retry)</td></tr>
 </tbody>
 </table>
 <h3>Client</h3>
