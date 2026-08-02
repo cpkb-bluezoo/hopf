@@ -1033,6 +1033,156 @@ fn dot_connection_pool_reuses_a_connection_across_queries() {
     rt.shutdown();
 }
 
+/// Same proof as [`tcp_connection_pool_reuses_a_connection_across_queries`]
+/// / [`dot_connection_pool_reuses_a_connection_across_queries`] but for DoQ
+/// (issue #163): two queries through [`DoqConnectionPool`] against a real
+/// DoQ stub must complete exactly one QUIC handshake — the second opens a
+/// new stream on the pooled connection (RFC 9250 §4.2 / §5.5.1).
+#[cfg(all(feature = "doq", feature = "server"))]
+#[test]
+fn doq_connection_pool_reuses_a_connection_across_queries() {
+    use hopf_core::{Endpoint, NopHandler, ProtocolHandler};
+    use hopf_dns::client::{DnsClientTransportHandler, DoqConnectionPool};
+    use hopf_dns::wire::{DnsQuestion, DnsType};
+    use hopf_quic::{
+        client_config_for_certified_pem, listen_quic_hooks, server_config_self_signed,
+        QuicConnApi, QuicConnection, QuicListenHooksConfig,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+
+    let (server_config, leaf_pem) = server_config_self_signed(&["localhost"], &[b"doq"]).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "hopf-dns-doq-pool-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let leaf_path = dir.join("leaf.pem");
+    std::fs::write(&leaf_path, &leaf_pem).unwrap();
+    let client_config = client_config_for_certified_pem(&leaf_path, &[b"doq"]).unwrap();
+
+    struct DoqStubStream {
+        buf: Vec<u8>,
+    }
+    impl ProtocolHandler for DoqStubStream {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            self.buf.extend_from_slice(data);
+            *data = &[];
+            while self.buf.len() >= 2 {
+                let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
+                if self.buf.len() < 2 + len {
+                    break;
+                }
+                let payload = self.buf[2..2 + len].to_vec();
+                self.buf.drain(..2 + len);
+                let Ok(q) = DnsMessage::parse(&payload) else {
+                    continue;
+                };
+                let mut resp = q.response_template(0);
+                resp.id = 0;
+                resp.flags |= FLAG_QR;
+                if let Some(question) = q.questions.first() {
+                    resp.answers.push(DnsResourceRecord::a(
+                        &question.name,
+                        60,
+                        Ipv4Addr::new(198, 51, 100, 30),
+                    ));
+                }
+                let bytes = resp.serialize().unwrap();
+                let mut out = Vec::with_capacity(2 + bytes.len());
+                out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                out.extend_from_slice(&bytes);
+                endpoint.send(&out);
+            }
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    struct CountingDoqConn {
+        connect_count: Arc<AtomicUsize>,
+    }
+    impl QuicConnection for CountingDoqConn {
+        fn connected(&mut self, _api: &mut dyn QuicConnApi) {
+            self.connect_count.fetch_add(1, Ordering::SeqCst);
+        }
+        fn accept_bi(&mut self) -> Box<dyn ProtocolHandler> {
+            Box::new(DoqStubStream { buf: Vec::new() })
+        }
+        fn accept_uni(&mut self) -> Box<dyn ProtocolHandler> {
+            Box::new(NopHandler)
+        }
+    }
+
+    let connect_count = Arc::new(AtomicUsize::new(0));
+    let cc = Arc::clone(&connect_count);
+    let driver = listen_quic_hooks(QuicListenHooksConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        server_config,
+        Arc::new(move || {
+            Box::new(CountingDoqConn {
+                connect_count: Arc::clone(&cc),
+            }) as Box<dyn QuicConnection>
+        }),
+    ))
+    .unwrap();
+    let addr = driver.local_addr;
+
+    struct ChannelHandler {
+        tx: mpsc::Sender<io::Result<Vec<u8>>>,
+    }
+    impl DnsClientTransportHandler for ChannelHandler {
+        fn on_response(&mut self, _server: std::net::SocketAddr, data: &[u8]) {
+            let _ = self.tx.send(Ok(data.to_vec()));
+        }
+        fn on_error(&mut self, _server: std::net::SocketAddr, err: io::Error) {
+            let _ = self.tx.send(Err(err));
+        }
+    }
+
+    let mut pool = DoqConnectionPool::new();
+    let wait = |pool: &mut DoqConnectionPool, name: &str| -> DnsMessage {
+        let (tx, rx) = mpsc::channel();
+        let q = DnsMessage::query(1, DnsQuestion::in_class(name, DnsType::A), true);
+        let bytes = q.serialize().unwrap();
+        pool.send_query(
+            addr,
+            &client_config,
+            "localhost",
+            &bytes,
+            Box::new(ChannelHandler { tx }),
+        )
+        .unwrap();
+        let raw = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("DoQ response within timeout")
+            .expect("DoQ query succeeded");
+        DnsMessage::parse(&raw).unwrap()
+    };
+
+    let r1 = wait(&mut pool, "doq-pool-1.example");
+    assert_eq!(r1.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 30)));
+    let r2 = wait(&mut pool, "doq-pool-2.example");
+    assert_eq!(r2.answers[0].as_a(), Some(Ipv4Addr::new(198, 51, 100, 30)));
+
+    assert_eq!(
+        pool.pooled_connections(),
+        1,
+        "client pool must retain a single driver across both queries"
+    );
+    assert_eq!(
+        connect_count.load(Ordering::SeqCst),
+        1,
+        "the second DoQ query must reuse the pooled QUIC connection, not redial"
+    );
+    driver.shutdown();
+}
+
 /// Proves the fix for issue #57: `DohClientTransport::with_get(true)` must
 /// send a real RFC 8484 §4.1 GET request — the DNS wire message base64url
 /// -encoded into the `dns` query parameter, no body — and correctly
