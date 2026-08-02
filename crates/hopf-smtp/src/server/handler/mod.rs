@@ -42,6 +42,13 @@ pub struct SmtpConnectionMetadata {
     pub reverse_name: Option<String>,
     /// Informational proxied login from XCLIENT `LOGIN` (not SASL AUTH).
     pub xclient_login: Option<String>,
+    /// W3C `traceparent` for the active span when OTel traces are enabled.
+    ///
+    /// Pass to outbound HTTP clients (for example
+    /// `hopf_otel::with_traceparent`) so microservice calls continue the
+    /// distributed trace. Timing/duration stay in telemetry — this field is
+    /// propagation identity only.
+    pub traceparent: Option<String>,
 }
 
 /// Factory for the initial [`SmtpClientConnected`] stage.
