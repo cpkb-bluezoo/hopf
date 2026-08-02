@@ -440,14 +440,13 @@ fn simple_relay_mx_to_local_sink() {
 
 /// One recipient domain resolves to a real sink (delivery succeeds), the
 /// other resolves to an address nothing is listening on (delivery fails).
-/// Proves two things the pre-streaming relay got wrong: (1) it now waits
-/// for each domain's *real* `SmtpSend` completion instead of counting a
-/// domain "delivered" the instant the outbound connect call was issued, and
-/// (2) per the confirmed design, any domain failing rejects the whole
-/// inbound transaction even though the other domain's delivery — streamed
-/// from the same spooled file — already went through.
+/// Proves two things: (1) the relay waits for each domain's *real*
+/// `SmtpSend` completion instead of counting a domain "delivered" the
+/// instant the outbound connect call was issued, and (2) partial success
+/// accepts the inbound transaction (250) so clients do not retry and
+/// duplicate the already-delivered copy — failure DSNs cover the rest.
 #[test]
-fn simple_relay_rejects_whole_transaction_if_any_domain_fails() {
+fn simple_relay_accepts_transaction_on_partial_domain_success() {
     use crate::{SimpleRelayService, SmtpConfig};
     use hopf_dns::wire::{DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA};
     use hopf_dns::DnsResolver;
@@ -533,8 +532,7 @@ fn simple_relay_rejects_whole_transaction_if_any_domain_fails() {
         "relay submission timed out"
     );
 
-    // The good domain's delivery — streamed from the spool file — went
-    // through even though the transaction as a whole gets rejected.
+    // The good domain's delivery — streamed from the spool file — went through.
     assert!(
         wait_for(
             || {
@@ -547,12 +545,12 @@ fn simple_relay_rejects_whole_transaction_if_any_domain_fails() {
         "the succeeding domain should still have received the message"
     );
 
-    // But the overall inbound transaction must be rejected, not accepted,
-    // because the other domain failed.
+    // Partial success must accept the inbound transaction so a client
+    // retry does not duplicate the already-delivered copy.
     assert_eq!(
         *done.lock().unwrap(),
-        Some(false),
-        "any domain failing must reject the whole transaction"
+        Some(true),
+        "any domain succeeding must accept the transaction"
     );
 }
 
