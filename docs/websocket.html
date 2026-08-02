@@ -132,8 +132,8 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 <span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="co">// use `ws` as Arc&lt;dyn ServerHandlerFactory&gt; under CleartextHttpEndpoint / AlpnHttpEndpoint</span></span></code></pre></div>
 <h2 id="handshake">Handshake</h2>
 <h3 id="http1.1">HTTP/1.1</h3>
-<p>Helpers: <code>is_h1_websocket_upgrade</code>, <code>validate_h1_upgrade</code> → key, <code>calculate_accept</code>, <code>websocket_accept_headers</code>, <code>generate_key</code> (client).</p>
-<p>Successful upgrade yields <strong>101</strong> with <code>Sec-WebSocket-Accept</code>.</p>
+<p>Helpers: <code>is_h1_websocket_upgrade</code>, <code>validate_h1_upgrade</code> → key, <code>calculate_accept</code>, <code>websocket_accept_headers</code>, <code>generate_key</code> / <code>create_upgrade_request</code> / <code>validate_upgrade_response</code> / <code>WebSocketOpening</code> (client).</p>
+<p>Successful upgrade yields <strong>101</strong> with <code>Sec-WebSocket-Accept</code>. Clients must run <code>validate_upgrade_response</code> (or <code>WebSocketOpening::validate_response</code>) on that 101 <strong>before</strong> installing <code>WsUpgradeHandler::client</code>.</p>
 <h3 id="http2-http3">HTTP/2 / HTTP/3</h3>
 <p><code>is_extended_connect_websocket</code> / <code>websocket_connect_response_headers</code> — successful Extended CONNECT yields <strong>200</strong> and then WebSocket frames on the stream.</p>
 <p>Optional <code>WebSocketConfig.subprotocol</code> is echoed only when that token appears in the client's <code>Sec-WebSocket-Protocol</code> offer; otherwise it is omitted.</p>
@@ -324,7 +324,7 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 <ul>
 <li>No <code>permessage-deflate</code> or other extensions (RSV must be zero).</li>
 <li>Close handling sends a close and marks the session dead; protocol errors emit Close 1002/1007/1009 then tear down the transport/stream.</li>
-<li>Client handshake helpers exist, but the primary factory path is server-oriented.</li>
+<li>Client opening helpers (<code>WebSocketOpening</code>, <code>validate_upgrade_response</code>) cover RFC 6455 §4.1 step 5; the stock factory path remains server-oriented.</li>
 <li>Relies on HTTP trailers / Extended CONNECT behaviour of <code>hopf-http</code> for H2/H3.</li>
 </ul>
 
