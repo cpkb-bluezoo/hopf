@@ -166,6 +166,13 @@ pub trait ProtocolUpgradeHandler: Send {
 
     /// Peer closed the transport / stream.
     fn closed(&mut self) {}
+
+    /// When `true`, the HTTP transport should tear down after flushing any
+    /// remaining [`take_outbound`](Self::take_outbound) bytes (H1: close the
+    /// connection; H2/H3: end the stream). Default: keep the transport open.
+    fn wants_close(&self) -> bool {
+        false
+    }
 }
 
 /// Outbound response writer for the current server Stream.

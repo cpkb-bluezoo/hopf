@@ -134,7 +134,7 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 <p>Successful upgrade yields <strong>101</strong> with <code>Sec-WebSocket-Accept</code>.</p>
 <h3 id="http2-http3">HTTP/2 / HTTP/3</h3>
 <p><code>is_extended_connect_websocket</code> / <code>websocket_connect_response_headers</code> — successful Extended CONNECT yields <strong>200</strong> and then WebSocket frames on the stream.</p>
-<p>Optional <code>WebSocketConfig.subprotocol</code> is negotiated when set.</p>
+<p>Optional <code>WebSocketConfig.subprotocol</code> is echoed only when that token appears in the client's <code>Sec-WebSocket-Protocol</code> offer; otherwise it is omitted.</p>
 <h2 id="framing">Framing</h2>
 <table>
 <colgroup>
@@ -320,9 +320,8 @@ WsUpgradeHandler  (ProtocolUpgradeHandler)
 <p>No environment variables.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>Single-frame messages only</strong> — fragmented (non-FIN / continuation) messages are <strong>not</strong> reassembled; they are dropped.</li>
 <li>No <code>permessage-deflate</code> or other extensions (RSV must be zero).</li>
-<li>Close handling sends a close and marks the session dead.</li>
+<li>Close handling sends a close and marks the session dead; protocol errors emit Close 1002/1007/1009 then tear down the transport/stream.</li>
 <li>Client handshake helpers exist, but the primary factory path is server-oriented.</li>
 <li>Relies on HTTP trailers / Extended CONNECT behaviour of <code>hopf-http</code> for H2/H3.</li>
 </ul>

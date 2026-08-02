@@ -10,8 +10,8 @@ use hopf_http::{
 };
 
 use crate::handshake::{
-    is_extended_connect_websocket, validate_h1_upgrade, websocket_accept_headers,
-    websocket_connect_response_headers,
+    is_extended_connect_websocket, negotiate_subprotocol, validate_h1_upgrade,
+    websocket_accept_headers, websocket_connect_response_headers,
 };
 use crate::session::WsSession;
 use crate::upgrade::{WsEventHandler, WsUpgradeHandler};
@@ -21,7 +21,8 @@ use crate::upgrade::{WsEventHandler, WsUpgradeHandler};
 pub struct WebSocketConfig {
     /// Maximum data-frame payload bytes.
     pub max_payload: usize,
-    /// Optional subprotocol to select when the client offers it.
+    /// Optional subprotocol to select when the client offers it
+    /// (see [`crate::negotiate_subprotocol`]).
     pub subprotocol: Option<String>,
 }
 
@@ -81,7 +82,7 @@ impl<F: WsEventHandlerFactory> ServerHandler for WsHttpHandler<F> {
         let conn = response.conn_handle();
         let event = self.events.create(path, headers, conn.clone());
         let max = self.config.max_payload;
-        let sub = self.config.subprotocol.as_deref();
+        let sub = negotiate_subprotocol(headers, self.config.subprotocol.as_deref());
 
         if let Ok(key) = validate_h1_upgrade(headers) {
             let resp = websocket_accept_headers(key, sub);

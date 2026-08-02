@@ -45,6 +45,14 @@ impl<'a> WsSession<'a> {
         write_close(self.out, self.role, code, reason);
     }
 
+    /// Send a Close with empty payload (no status code on the wire).
+    ///
+    /// Used when echoing a peer Close that itself had no code (RFC 6455 §5.5.1).
+    /// Do not put 1005 in a Close frame — that code is reserved for local use.
+    pub fn send_close_empty(&mut self) {
+        write_close_empty(self.out, self.role);
+    }
+
     /// Role of this endpoint.
     pub fn role(&self) -> WsRole {
         self.role
@@ -87,6 +95,12 @@ pub fn write_close(out: &mut Vec<u8>, role: WsRole, code: u16, reason: &str) {
     payload.extend_from_slice(reason.as_bytes());
     let mask = client_mask(role);
     write_frame(out, true, Opcode::Close, mask, &payload);
+}
+
+/// Write a Close frame with an empty payload (no status code).
+pub fn write_close_empty(out: &mut Vec<u8>, role: WsRole) {
+    let mask = client_mask(role);
+    write_frame(out, true, Opcode::Close, mask, &[]);
 }
 
 /// Wrap `conn` so every [`ConnHandle::send`] first frames the payload as a
