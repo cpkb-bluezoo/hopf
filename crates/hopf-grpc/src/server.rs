@@ -258,7 +258,7 @@ impl GrpcHandlerFactory {
     }
 
     pub fn set_max_message_size(&mut self, max_message_size: u64) {
-        self.max_message_size = max_message_size;
+        self.max_message_size = crate::framing::effective_max_message_size(max_message_size);
     }
 }
 

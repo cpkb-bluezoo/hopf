@@ -16,7 +16,8 @@ pub mod server;
 pub use client::{GrpcClient, GrpcResponseHandler, GrpcUnaryCall};
 pub use codec::{parse_grpc_content_type, GrpcCodec};
 pub use framing::{
-    frame, framed_size, GrpcEventHandler, GrpcFrameParser, DEFAULT_MAX_MESSAGE_SIZE,
+    effective_max_message_size, frame, framed_size, GrpcEventHandler, GrpcFrameParser,
+    DEFAULT_MAX_MESSAGE_SIZE,
 };
 pub use proto::*;
 pub use server::{

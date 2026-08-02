@@ -175,7 +175,7 @@ GrpcService::start_unary_call → ProtoMessageHandler
 </tr>
 </tbody>
 </table>
-<p>Compressed frames (flag ≠ 0) are <strong>rejected</strong>. Split-feed safe. <code>0</code> max size means unlimited except <code>u32::MAX</code>.</p>
+<p>Compressed frames (flag ≠ 0) are <strong>rejected</strong>. Split-feed safe. <code>0</code> max size uses the default 4 MiB (not unlimited); pass <code>u64::MAX</code> only for an explicit no-cap.</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_grpc::</span><span class="op">{</span>frame<span class="op">,</span> GrpcFrameParser<span class="op">};</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> bytes <span class="op">=</span> frame(<span class="st">b&quot;protobuf-payload&quot;</span>)<span class="op">;</span></span>
@@ -317,7 +317,7 @@ GrpcService::start_unary_call → ProtoMessageHandler
 <td>Max message size</td>
 <td><code>u64</code></td>
 <td><code>4 MiB</code> (<code>DEFAULT_MAX_MESSAGE_SIZE</code>)</td>
-<td><code>GrpcHandlerFactory::set_max_message_size</code>; parser <code>set_max_message_size</code> (<code>0</code> ≈ unlimited)</td>
+<td><code>GrpcHandlerFactory::set_max_message_size</code>; parser <code>set_max_message_size</code> (<code>0</code> → default 4 MiB, not unlimited)</td>
 </tr>
 <tr>
 <td>Schema</td>
