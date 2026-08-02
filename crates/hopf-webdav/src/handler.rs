@@ -701,23 +701,54 @@ impl WebDavHandler {
             let Some(resolved) = canonicalize_path(&root, &canonical, &lex) else {
                 return Ok(LockOutcome::Status(404));
             };
+            // RFC 4918 §7.3: LOCK on an unmapped URL creates a locked empty
+            // non-collection resource (recommended model). Parent collections
+            // must already exist — we do not mkdir -p here.
+            let created = if !resolved.exists() {
+                let Some(parent) = resolved.parent() else {
+                    return Ok(LockOutcome::Status(403));
+                };
+                if !parent.exists() {
+                    return Ok(LockOutcome::Status(409));
+                }
+                if parent.is_file() {
+                    return Ok(LockOutcome::Status(409));
+                }
+                fs::File::create(&resolved)?;
+                true
+            } else if resolved.is_dir() {
+                // Collection locks are fine; no empty-file creation.
+                false
+            } else {
+                false
+            };
             let owner = lock_req.owner.unwrap_or_default();
-            let lock = lock_mgr
-                .lock(
-                    resolved,
-                    lock_req.scope,
-                    lock_req.ty,
-                    depth,
-                    owner,
-                    timeout,
-                )
-                .ok_or_else(|| io_err("conflict"))?;
-            Ok(LockOutcome::Created(lock))
+            let lock = match lock_mgr.lock(
+                resolved.clone(),
+                lock_req.scope,
+                lock_req.ty,
+                depth,
+                owner,
+                timeout,
+            ) {
+                Some(lock) => lock,
+                None => {
+                    // Conflict after we created the empty placeholder — remove
+                    // it so a failed LOCK does not leave an orphan file.
+                    if created {
+                        let _ = fs::remove_file(&resolved);
+                    }
+                    return Ok(LockOutcome::Status(423));
+                }
+            };
+            Ok(LockOutcome::Locked { lock, created })
         }, move |out, writer| match out {
             LockOutcome::Status(c) => Self::send_error(writer, c),
-            LockOutcome::Created(lock) => {
+            LockOutcome::Locked { lock, created } => {
                 let mut h = Headers::new();
-                h.status(200);
+                // §7.3: 201 Created when the LOCK mapped a new resource;
+                // 200 OK when locking an already-mapped URL.
+                h.status(if created { 201 } else { 200 });
                 h.set("Content-Type", CONTENT_TYPE_XML);
                 h.set("Lock-Token", format!("<{}>", lock.token()));
                 let body = write_active_lock(&lock, &href);
@@ -878,7 +909,9 @@ enum PropfindOutcome {
 
 enum LockOutcome {
     Status(u16),
-    Created(WebDavLock),
+    /// Successful LOCK; `created` is true when this LOCK mapped a new empty
+    /// resource (RFC 4918 §7.3).
+    Locked { lock: WebDavLock, created: bool },
 }
 
 fn io_err(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {

@@ -189,3 +189,196 @@ fn propfind_depth_zero() {
     );
     rt.shutdown();
 }
+
+fn lock_body_exclusive() -> &'static str {
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+     <D:lockinfo xmlns:D=\"DAV:\">\
+       <D:lockscope><D:exclusive/></D:lockscope>\
+       <D:locktype><D:write/></D:locktype>\
+       <D:owner><D:href>hopf-test</D:href></D:owner>\
+     </D:lockinfo>"
+}
+
+fn extract_lock_token(resp: &str) -> String {
+    for line in resp.lines() {
+        if line.to_ascii_lowercase().starts_with("lock-token:") {
+            let raw = line.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+            return raw.trim().trim_matches(|c| c == '<' || c == '>').to_string();
+        }
+    }
+    panic!("no Lock-Token header in response: {resp}");
+}
+
+/// RFC 4918 §7.3: LOCK on an unmapped URL creates a locked empty resource
+/// (201), visible to PROPFIND; UNLOCK releases the lock but leaves the
+/// empty file (recommended model — not deprecated lock-null removal).
+#[test]
+fn lock_unmapped_url_creates_locked_empty_resource() {
+    let dir = tempdir().unwrap();
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let body = lock_body_exclusive();
+    let lock_req = format!(
+        "LOCK /reserved.txt HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\n\
+         Content-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let lock = http_exchange(addr, &lock_req);
+    assert!(lock.contains("201"), "expected 201 Created, got: {lock}");
+    assert!(
+        lock.to_ascii_lowercase().contains("lock-token:"),
+        "missing Lock-Token: {lock}"
+    );
+    let path = dir.path().join("reserved.txt");
+    assert!(path.is_file(), "locked empty resource must exist on disk");
+    assert_eq!(std::fs::read(&path).unwrap(), b"", "resource must be empty");
+
+    let propfind_body =
+        "<?xml version=\"1.0\"?><D:propfind xmlns:D=\"DAV:\"><D:propname/></D:propfind>";
+    let propfind = http_exchange(
+        addr,
+        &format!(
+            "PROPFIND / HTTP/1.1\r\nHost: localhost\r\nDepth: 1\r\n\
+             Content-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{propfind_body}",
+            propfind_body.len()
+        ),
+    );
+    assert!(propfind.contains("207") || propfind.contains("200"), "{propfind}");
+    assert!(
+        propfind.contains("reserved.txt"),
+        "empty locked resource must appear in parent PROPFIND: {propfind}"
+    );
+
+    let token = extract_lock_token(&lock);
+    let unlock = http_exchange(
+        addr,
+        &format!(
+            "UNLOCK /reserved.txt HTTP/1.1\r\nHost: localhost\r\n\
+             Lock-Token: <{token}>\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(unlock.contains("204"), "UNLOCK status: {unlock}");
+    assert!(
+        path.is_file(),
+        "§7.3: unlocked empty resource MUST remain (not lock-null removal)"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"");
+
+    rt.shutdown();
+}
+
+/// After LOCK creates an empty resource, PUT with the lock token supplies
+/// content; after UNLOCK, a fresh LOCK on the mapped URL returns 200.
+#[test]
+fn lock_then_put_fills_empty_resource_and_relock_is_200() {
+    let dir = tempdir().unwrap();
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let body = lock_body_exclusive();
+    let lock = http_exchange(
+        addr,
+        &format!(
+            "LOCK /draft.txt HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\n\
+             Content-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(lock.contains("201"), "{lock}");
+    let token = extract_lock_token(&lock);
+
+    let put = http_exchange(
+        addr,
+        &format!(
+            "PUT /draft.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\
+             If: (<{token}>)\r\nConnection: close\r\n\r\nhello"
+        ),
+    );
+    assert!(
+        put.contains("201") || put.contains("200") || put.contains("204"),
+        "PUT with lock token failed: {put}"
+    );
+    assert_eq!(std::fs::read(dir.path().join("draft.txt")).unwrap(), b"hello");
+
+    let unlock = http_exchange(
+        addr,
+        &format!(
+            "UNLOCK /draft.txt HTTP/1.1\r\nHost: localhost\r\n\
+             Lock-Token: <{token}>\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(unlock.contains("204"), "{unlock}");
+
+    let lock2 = http_exchange(
+        addr,
+        &format!(
+            "LOCK /draft.txt HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\n\
+             Content-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(
+        lock2.contains("200"),
+        "LOCK on already-mapped URL must be 200, got: {lock2}"
+    );
+
+    rt.shutdown();
+}
+
+/// §7.3: locked empty resource MUST NOT become a collection — MKCOL fails.
+#[test]
+fn mkcol_on_locked_empty_resource_fails() {
+    let dir = tempdir().unwrap();
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let body = lock_body_exclusive();
+    let lock = http_exchange(
+        addr,
+        &format!(
+            "LOCK /not-a-col HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\n\
+             Content-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(lock.contains("201"), "{lock}");
+    let token = extract_lock_token(&lock);
+
+    let mkcol = http_exchange(
+        addr,
+        &format!(
+            "MKCOL /not-a-col HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\
+             If: (<{token}>)\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(
+        mkcol.contains("405") || mkcol.contains("403") || mkcol.contains("409"),
+        "MKCOL on locked empty file must fail: {mkcol}"
+    );
+    assert!(dir.path().join("not-a-col").is_file());
+
+    rt.shutdown();
+}
+
+/// LOCK under a missing parent collection is a conflict, not mkdir -p.
+#[test]
+fn lock_unmapped_with_missing_parent_is_409() {
+    let dir = tempdir().unwrap();
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let body = lock_body_exclusive();
+    let lock = http_exchange(
+        addr,
+        &format!(
+            "LOCK /missing/child.txt HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\n\
+             Content-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    );
+    assert!(lock.contains("409"), "expected 409, got: {lock}");
+    assert!(!dir.path().join("missing").exists());
+
+    rt.shutdown();
+}
