@@ -33,7 +33,10 @@ pub use fetch_format::{
     BodySection, FetchItem, FetchModifiers,
 };
 pub use handler::*;
-pub use idle::{is_idle_done, IdleMailboxSnapshot, IdleShared, IdleState, IDLE_POLL_INTERVAL};
+pub use idle::{
+    is_idle_done, IdleMailboxSnapshot, IdleMsgSnap, IdleShared, IdleState, IDLE_MAX_DURATION,
+    IDLE_POLL_INTERVAL,
+};
 pub use list_ext::{parse_list_command, ListCommand, ListReturnOptions, ListSelectOption};
 pub use quota::{
     parse_quota_resource_list, MemoryQuotaManager, Quota, QuotaManager, QuotaResource,
@@ -41,7 +44,7 @@ pub use quota::{
 };
 pub use reply::{continuation, quote_astring, tagged_bad, tagged_no, tagged_ok, untagged};
 pub use search_parse::{parse_search, SearchParseError};
-pub use service::{ImapConfig, ImapService, DEFAULT_MAX_LINE};
+pub use service::{ImapConfig, ImapService, NamespaceDesc, DEFAULT_MAX_LINE};
 pub use session::ImapSessionState;
 pub use status_items::{parse_status_command, parse_status_items, StatusItem};
 pub use uidplus::{compress_uid_set, format_appenduid, format_copyuid};

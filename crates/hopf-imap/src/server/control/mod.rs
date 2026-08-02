@@ -48,6 +48,11 @@ pub(crate) enum PendingKind {
         tag: String,
         caps: String,
     },
+    /// PREAUTH greeting deferred until the store is open.
+    Preauth {
+        caps: String,
+        greeting: String,
+    },
     Select {
         tag: String,
         examine: bool,
@@ -205,8 +210,16 @@ impl ImapControlHandler {
         let mut view = ConnectedView {
             endpoint,
             not_authenticated: &mut self.not_authenticated,
+            authenticated: &mut self.authenticated,
             caps: &caps,
             session: &mut self.session,
+            username: &mut self.username,
+            bundle: &self.bundle,
+            runtime: &self.runtime,
+            busy: &self.busy,
+            control_handle: &self.control_handle,
+            pending_open: &self.pending_open,
+            factory: Arc::clone(&self.config.mailbox_factory),
         };
         if let Some(mut c) = self.client_connected.take() {
             c.connected(&mut view, self.peer, self.local, self.tls);
@@ -257,6 +270,26 @@ impl ImapControlHandler {
                     // Keep not-authenticated if we still have one.
                 }
             },
+            PendingKind::Preauth { caps, greeting } => match outcome {
+                Ok(_) => {
+                    if let Some(h) = auth_handler {
+                        self.authenticated = Some(h);
+                    }
+                    self.not_authenticated = None;
+                    self.session = ImapSessionState::Authenticated;
+                    self.send(
+                        endpoint,
+                        untagged(&format!("PREAUTH [CAPABILITY {caps}] {greeting}")),
+                    );
+                }
+                Err(e) => {
+                    self.send(
+                        endpoint,
+                        untagged(&format!("BYE PREAUTH mailbox unavailable: {e}")),
+                    );
+                    endpoint.close();
+                }
+            },
             PendingKind::Select {
                 tag,
                 examine,
@@ -265,8 +298,10 @@ impl ImapControlHandler {
                 Ok(payload) => {
                     let s = String::from_utf8_lossy(&payload);
                     // exists|recent|uidvalidity|uidnext|highestmodseq[|VANISHED uids]
+                    // `recent` stays in the payload for backends; unsolicited RECENT is
+                    // not emitted (IMAP4rev2 / RFC 9051).
                     let parts: Vec<&str> = s.split('|').collect();
-                    let (exists, recent, uidvalidity, uidnext, highest) = if parts.len() >= 5 {
+                    let (exists, _recent, uidvalidity, uidnext, highest) = if parts.len() >= 5 {
                         (parts[0], parts[1], parts[2], parts[3], parts[4])
                     } else if parts.len() == 4 {
                         (parts[0], parts[1], parts[2], parts[3], "0")
@@ -284,7 +319,6 @@ impl ImapControlHandler {
                         ),
                     );
                     self.send(endpoint, untagged(&format!("{exists} EXISTS")));
-                    self.send(endpoint, untagged(&format!("{recent} RECENT")));
                     self.send(
                         endpoint,
                         untagged(&format!("OK [UIDVALIDITY {uidvalidity}] UIDs valid")),
@@ -312,9 +346,6 @@ impl ImapControlHandler {
                     }
                     if let Ok(n) = exists.parse::<u32>() {
                         self.idle.last_exists = n;
-                    }
-                    if let Ok(n) = recent.parse::<u32>() {
-                        self.idle.last_recent = n;
                     }
                     if let Some(h) = selected_handler {
                         self.selected = Some(h);

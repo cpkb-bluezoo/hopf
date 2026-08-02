@@ -112,6 +112,15 @@ pub trait Mailbox: Send {
     /// expunge — IMAP sequence model).
     fn message_count(&self) -> MailboxResult<u32>;
 
+    /// Reconcile this open handle with on-disk state (e.g. Maildir `new/`→`cur/`
+    /// and flag renames from other writers). Default is a no-op.
+    ///
+    /// IMAP IDLE calls this before diffing EXISTS / EXPUNGE / FLAGS so
+    /// concurrent updates become visible without a reselect.
+    fn refresh(&mut self) -> MailboxResult<()> {
+        Ok(())
+    }
+
     /// Total size in octets (all sequence numbers, including deleted).
     fn mailbox_size(&self) -> MailboxResult<u64>;
 

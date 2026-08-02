@@ -11,10 +11,10 @@ implemented support only.
 
 | Capability | Notes |
 |---|---|
-| `IDLE` | Continuation + `DONE`; mailbox EXISTS/RECENT polled off-reactor |
+| `IDLE` | Continuation + `DONE`; EXISTS/EXPUNGE/FLAGS polled off-reactor; max-duration auto-OK |
 | `UIDPLUS` | `APPENDUID`, `COPYUID`, `UID EXPUNGE` |
 | `MOVE` | Copy + `\Deleted` + expunge with `COPYUID` |
-| `NAMESPACE` | Personal namespace from the mailbox store |
+| `NAMESPACE` | Personal + optional other-users/shared from config |
 | `ENABLE` | `CONDSTORE` / `QRESYNC` per session |
 | `CONDSTORE` | `HIGHESTMODSEQ` on SELECT when enabled; `CHANGEDSINCE` FETCH; `MODSEQ` when backend provides modseqs |
 | `QRESYNC` | Degrades safely — no fabricated `VANISHED (EARLIER)` history |

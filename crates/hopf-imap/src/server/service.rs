@@ -35,12 +35,22 @@ pub struct ImapConfig {
     pub implicit_tls: bool,
     /// Greeting text (without untagged OK / capability prefix). Empty → built-in.
     pub greeting: String,
+    /// When set, send a `PREAUTH` greeting and open this user's store
+    /// (external authentication — RFC 9051 §7.1). Empty / `None` → normal `OK`.
+    pub preauth_username: Option<String>,
     /// Max command-line length.
     pub max_line: usize,
     /// Advertise and accept IDLE (RFC 2177).
     pub enable_idle: bool,
+    /// Maximum IDLE duration before the server ends the command with a tagged OK.
+    /// Default: 29 minutes (RFC 2177 client guidance).
+    pub idle_max_duration: std::time::Duration,
     /// Advertise and accept NAMESPACE (RFC 2342).
     pub enable_namespace: bool,
+    /// Other-users namespace descriptors for NAMESPACE (empty → `NIL`).
+    pub other_users_namespaces: Vec<NamespaceDesc>,
+    /// Shared namespace descriptors for NAMESPACE (empty → `NIL`).
+    pub shared_namespaces: Vec<NamespaceDesc>,
     /// Advertise and accept QUOTA (RFC 9208).
     pub enable_quota: bool,
     /// Advertise and accept MOVE (RFC 6851).
@@ -55,6 +65,25 @@ pub struct ImapConfig {
     pub quota_manager: Arc<dyn QuotaManager>,
     /// Server ID fields for the ID command (RFC 2971). Empty → built-in defaults.
     pub server_id: BTreeMap<String, String>,
+}
+
+/// One NAMESPACE triple: prefix + hierarchy delimiter (RFC 2342).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamespaceDesc {
+    /// Namespace prefix (e.g. `"#shared/"`).
+    pub prefix: String,
+    /// Hierarchy delimiter character.
+    pub delimiter: char,
+}
+
+impl NamespaceDesc {
+    /// Construct a namespace descriptor.
+    pub fn new(prefix: impl Into<String>, delimiter: char) -> Self {
+        Self {
+            prefix: prefix.into(),
+            delimiter,
+        }
+    }
 }
 
 impl ImapConfig {
@@ -73,9 +102,13 @@ impl ImapConfig {
             tls_acceptor: None,
             implicit_tls: false,
             greeting: String::new(),
+            preauth_username: None,
             max_line: DEFAULT_MAX_LINE,
             enable_idle: true,
+            idle_max_duration: crate::server::idle::IDLE_MAX_DURATION,
             enable_namespace: true,
+            other_users_namespaces: Vec::new(),
+            shared_namespaces: Vec::new(),
             enable_quota: true,
             enable_move: true,
             enable_condstore: true,
@@ -101,6 +134,30 @@ impl ImapConfig {
     /// Custom greeting banner text.
     pub fn with_greeting(mut self, greeting: impl Into<String>) -> Self {
         self.greeting = greeting.into();
+        self
+    }
+
+    /// Emit a PREAUTH greeting and open `username`'s store (external auth).
+    pub fn with_preauth(mut self, username: impl Into<String>) -> Self {
+        self.preauth_username = Some(username.into());
+        self
+    }
+
+    /// Other-users NAMESPACE entries (RFC 2342).
+    pub fn with_other_users_namespaces(mut self, ns: Vec<NamespaceDesc>) -> Self {
+        self.other_users_namespaces = ns;
+        self
+    }
+
+    /// Shared NAMESPACE entries (RFC 2342).
+    pub fn with_shared_namespaces(mut self, ns: Vec<NamespaceDesc>) -> Self {
+        self.shared_namespaces = ns;
+        self
+    }
+
+    /// Maximum IDLE duration before auto-completing the command.
+    pub fn with_idle_max_duration(mut self, d: std::time::Duration) -> Self {
+        self.idle_max_duration = d;
         self
     }
 
@@ -132,7 +189,9 @@ impl ImapService {
         } else {
             config.greeting.clone()
         };
-        let factory = Arc::new(DefaultImapHandlerFactory::new(greeting));
+        let factory = Arc::new(DefaultImapHandlerFactory::new(greeting).with_preauth(
+            config.preauth_username.clone(),
+        ));
         Self {
             config,
             handler_factory: factory,
