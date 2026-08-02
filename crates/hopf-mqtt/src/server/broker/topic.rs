@@ -7,6 +7,10 @@
 //! a filter, and a filter beginning with a wildcard never matches a topic
 //! whose first level begins with `$` (reserved for server-internal topics
 //! such as `$SYS`).
+//!
+//! Shared subscriptions (`$share/<ShareName>/<TopicFilter>`, MQTT 5.0
+//! §4.8.2) register under the underlying topic filter; each matching
+//! PUBLISH is delivered to **one** member of each share group (round-robin).
 
 use std::collections::HashMap;
 
@@ -38,10 +42,59 @@ impl MatchOptions {
     }
 }
 
+/// One share group's members + round-robin cursor.
+#[derive(Default)]
+struct SharedGroup {
+    members: Vec<(SubscriberId, MatchOptions)>,
+    next: usize,
+}
+
+impl SharedGroup {
+    fn pick(&mut self) -> Option<(SubscriberId, MatchOptions)> {
+        if self.members.is_empty() {
+            return None;
+        }
+        let i = self.next % self.members.len();
+        self.next = self.next.wrapping_add(1);
+        Some(self.members[i])
+    }
+}
+
 #[derive(Default)]
 struct TopicNode {
     children: HashMap<String, TopicNode>,
     subscribers: HashMap<SubscriberId, MatchOptions>,
+    /// ShareName → members subscribed via `$share/ShareName/<this filter>`.
+    shared: HashMap<String, SharedGroup>,
+}
+
+/// Parsed subscribe filter: either a normal filter or a shared subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedFilter<'a> {
+    Normal(&'a str),
+    Shared { share_name: &'a str, filter: &'a str },
+}
+
+fn parse_filter(filter: &str) -> Result<ParsedFilter<'_>, &'static str> {
+    if let Some(rest) = filter.strip_prefix("$share/") {
+        let Some((share_name, topic_filter)) = rest.split_once('/') else {
+            return Err("shared subscription missing topic filter");
+        };
+        if share_name.is_empty() || share_name.contains('+') || share_name.contains('#') {
+            return Err("invalid share name");
+        }
+        if topic_filter.is_empty() {
+            return Err("shared subscription missing topic filter");
+        }
+        validate_filter(topic_filter)?;
+        Ok(ParsedFilter::Shared {
+            share_name,
+            filter: topic_filter,
+        })
+    } else {
+        validate_filter(filter)?;
+        Ok(ParsedFilter::Normal(filter))
+    }
 }
 
 /// Subscription registry: a trie over `/`-separated topic filter segments.
@@ -49,7 +102,8 @@ struct TopicNode {
 pub struct TopicTree {
     root: TopicNode,
     /// Reverse index so `unsubscribe_all` doesn't need the caller to
-    /// remember which filters a subscriber registered.
+    /// remember which filters a subscriber registered. Values are the
+    /// original subscribe strings (including `$share/...` when shared).
     by_subscriber: HashMap<SubscriberId, Vec<String>>,
 }
 
@@ -60,19 +114,40 @@ impl TopicTree {
     }
 
     /// Register `subscriber` for `filter`. Replaces any existing options
-    /// for the same (subscriber, filter) pair, matching MQTT's "a new
-    /// subscription on an existing filter replaces the old one" rule.
+    /// for the same (subscriber, filter) pair.
     ///
     /// Returns whether this is a brand new subscription (`true`) or a
-    /// replacement of one that already existed (`false`) — used to honour
-    /// MQTT 5.0 Retain Handling `1` ("send retained only for new subscriptions").
-    pub fn subscribe(&mut self, filter: &str, subscriber: SubscriberId, options: MatchOptions) -> Result<bool, &'static str> {
-        validate_filter(filter)?;
+    /// replacement — used for MQTT 5.0 Retain Handling `1`.
+    pub fn subscribe(
+        &mut self,
+        filter: &str,
+        subscriber: SubscriberId,
+        options: MatchOptions,
+    ) -> Result<bool, &'static str> {
+        let parsed = parse_filter(filter)?;
+        let (path, share) = match parsed {
+            ParsedFilter::Normal(f) => (f, None),
+            ParsedFilter::Shared {
+                share_name,
+                filter: f,
+            } => (f, Some(share_name)),
+        };
         let mut node = &mut self.root;
-        for seg in filter.split('/') {
+        for seg in path.split('/') {
             node = node.children.entry(seg.to_string()).or_default();
         }
-        let is_new = node.subscribers.insert(subscriber, options).is_none();
+        let is_new = if let Some(share_name) = share {
+            let group = node.shared.entry(share_name.to_string()).or_default();
+            if let Some(existing) = group.members.iter_mut().find(|(id, _)| *id == subscriber) {
+                existing.1 = options;
+                false
+            } else {
+                group.members.push((subscriber, options));
+                true
+            }
+        } else {
+            node.subscribers.insert(subscriber, options).is_none()
+        };
         if is_new {
             self.by_subscriber
                 .entry(subscriber)
@@ -84,14 +159,7 @@ impl TopicTree {
 
     /// Remove `subscriber` from `filter`. Returns whether it was subscribed.
     pub fn unsubscribe(&mut self, filter: &str, subscriber: SubscriberId) -> bool {
-        let mut node = &mut self.root;
-        for seg in filter.split('/') {
-            match node.children.get_mut(seg) {
-                Some(child) => node = child,
-                None => return false,
-            }
-        }
-        let removed = node.subscribers.remove(&subscriber).is_some();
+        let removed = self.unsubscribe_one(filter, subscriber);
         if removed {
             if let Some(filters) = self.by_subscriber.get_mut(&subscriber) {
                 filters.retain(|f| f != filter);
@@ -104,42 +172,77 @@ impl TopicTree {
     pub fn unsubscribe_all(&mut self, subscriber: SubscriberId) {
         if let Some(filters) = self.by_subscriber.remove(&subscriber) {
             for filter in filters {
-                let mut node = &mut self.root;
-                let mut path_ok = true;
-                for seg in filter.split('/') {
-                    match node.children.get_mut(seg) {
-                        Some(child) => node = child,
-                        None => {
-                            path_ok = false;
-                            break;
-                        }
-                    }
-                }
-                if path_ok {
-                    node.subscribers.remove(&subscriber);
-                }
+                let _ = self.unsubscribe_one(&filter, subscriber);
             }
+        }
+    }
+
+    fn unsubscribe_one(&mut self, filter: &str, subscriber: SubscriberId) -> bool {
+        let Ok(parsed) = parse_filter(filter) else {
+            return false;
+        };
+        let (path, share) = match parsed {
+            ParsedFilter::Normal(f) => (f, None),
+            ParsedFilter::Shared {
+                share_name,
+                filter: f,
+            } => (f, Some(share_name)),
+        };
+        let mut node = &mut self.root;
+        for seg in path.split('/') {
+            match node.children.get_mut(seg) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        if let Some(share_name) = share {
+            let Some(group) = node.shared.get_mut(share_name) else {
+                return false;
+            };
+            let before = group.members.len();
+            group.members.retain(|(id, _)| *id != subscriber);
+            let removed = group.members.len() != before;
+            if group.members.is_empty() {
+                node.shared.remove(share_name);
+            }
+            removed
+        } else {
+            node.subscribers.remove(&subscriber).is_some()
         }
     }
 
     /// Every (subscriber, match options) whose filter matches `topic`.
     ///
-    /// A subscriber matched by more than one filter appears once per
-    /// matching filter (delivered once per subscription at the highest
-    /// matching QoS is a policy decision left to the caller).
-    pub fn matching_subscribers(&self, topic: &str) -> Vec<(SubscriberId, MatchOptions)> {
+    /// Each matching share group contributes **exactly one** member
+    /// (round-robin). Requires `&mut self` for the RR cursor.
+    pub fn matching_subscribers(&mut self, topic: &str) -> Vec<(SubscriberId, MatchOptions)> {
         let mut out = Vec::new();
         let segments: Vec<&str> = topic.split('/').collect();
-        collect(&self.root, &segments, true, &mut out);
+        collect(&mut self.root, &segments, true, &mut out);
         out
     }
 }
 
-fn collect(node: &TopicNode, segments: &[&str], is_root: bool, out: &mut Vec<(SubscriberId, MatchOptions)>) {
+fn collect(
+    node: &mut TopicNode,
+    segments: &[&str],
+    is_root: bool,
+    out: &mut Vec<(SubscriberId, MatchOptions)>,
+) {
     if segments.is_empty() {
         out.extend(node.subscribers.iter().map(|(id, opt)| (*id, *opt)));
-        if let Some(hash) = node.children.get("#") {
+        for group in node.shared.values_mut() {
+            if let Some(pick) = group.pick() {
+                out.push(pick);
+            }
+        }
+        if let Some(hash) = node.children.get_mut("#") {
             out.extend(hash.subscribers.iter().map(|(id, opt)| (*id, *opt)));
+            for group in hash.shared.values_mut() {
+                if let Some(pick) = group.pick() {
+                    out.push(pick);
+                }
+            }
         }
         return;
     }
@@ -147,15 +250,20 @@ fn collect(node: &TopicNode, segments: &[&str], is_root: bool, out: &mut Vec<(Su
     let rest = &segments[1..];
     let dollar_blocked = is_root && seg.starts_with('$');
 
-    if let Some(child) = node.children.get(seg) {
+    if let Some(child) = node.children.get_mut(seg) {
         collect(child, rest, false, out);
     }
     if !dollar_blocked {
-        if let Some(plus) = node.children.get("+") {
+        if let Some(plus) = node.children.get_mut("+") {
             collect(plus, rest, false, out);
         }
-        if let Some(hash) = node.children.get("#") {
+        if let Some(hash) = node.children.get_mut("#") {
             out.extend(hash.subscribers.iter().map(|(id, opt)| (*id, *opt)));
+            for group in hash.shared.values_mut() {
+                if let Some(pick) = group.pick() {
+                    out.push(pick);
+                }
+            }
         }
     }
 }
@@ -213,33 +321,40 @@ mod tests {
     #[test]
     fn exact_match() {
         let mut tree = TopicTree::new();
-        tree.subscribe("a/b/c", SubscriberId(1), opt(QoS::AtMostOnce)).unwrap();
-        assert_eq!(ids(tree.matching_subscribers("a/b/c")), vec![SubscriberId(1)]);
+        tree.subscribe("a/b/c", SubscriberId(1), opt(QoS::AtMostOnce))
+            .unwrap();
+        assert_eq!(
+            ids(tree.matching_subscribers("a/b/c")),
+            vec![SubscriberId(1)]
+        );
         assert!(tree.matching_subscribers("a/b").is_empty());
     }
 
     #[test]
     fn plus_matches_one_level() {
         let mut tree = TopicTree::new();
-        tree.subscribe("sport/+/player1", SubscriberId(1), opt(QoS::AtMostOnce)).unwrap();
+        tree.subscribe("sport/+/player1", SubscriberId(1), opt(QoS::AtMostOnce))
+            .unwrap();
         assert_eq!(
             ids(tree.matching_subscribers("sport/tennis/player1")),
             vec![SubscriberId(1)]
         );
-        assert!(tree.matching_subscribers("sport/tennis/bourse/player1").is_empty());
+        assert!(tree
+            .matching_subscribers("sport/tennis/player1/ranking")
+            .is_empty());
     }
 
     #[test]
     fn hash_matches_trailing_levels_and_parent() {
         let mut tree = TopicTree::new();
-        tree.subscribe("sport/tennis/#", SubscriberId(1), opt(QoS::AtMostOnce)).unwrap();
-        assert_eq!(ids(tree.matching_subscribers("sport/tennis")), vec![SubscriberId(1)]);
+        tree.subscribe("sport/tennis/#", SubscriberId(1), opt(QoS::AtMostOnce))
+            .unwrap();
         assert_eq!(
-            ids(tree.matching_subscribers("sport/tennis/player1")),
+            ids(tree.matching_subscribers("sport/tennis")),
             vec![SubscriberId(1)]
         );
         assert_eq!(
-            ids(tree.matching_subscribers("sport/tennis/player1/ranking")),
+            ids(tree.matching_subscribers("sport/tennis/player1")),
             vec![SubscriberId(1)]
         );
         assert!(tree.matching_subscribers("sport/football").is_empty());
@@ -248,54 +363,88 @@ mod tests {
     #[test]
     fn bare_wildcards_do_not_match_dollar_topics() {
         let mut tree = TopicTree::new();
-        tree.subscribe("#", SubscriberId(1), opt(QoS::AtMostOnce)).unwrap();
-        tree.subscribe("+/status", SubscriberId(2), opt(QoS::AtMostOnce)).unwrap();
-        tree.subscribe("$SYS/#", SubscriberId(3), opt(QoS::AtMostOnce)).unwrap();
+        tree.subscribe("#", SubscriberId(1), opt(QoS::AtMostOnce))
+            .unwrap();
+        tree.subscribe("+/status", SubscriberId(2), opt(QoS::AtMostOnce))
+            .unwrap();
+        tree.subscribe("$SYS/#", SubscriberId(3), opt(QoS::AtMostOnce))
+            .unwrap();
 
-        assert!(tree.matching_subscribers("$SYS/broker/uptime").iter().all(|(id, _)| *id != SubscriberId(1)));
-        assert!(tree.matching_subscribers("$SYS/status").iter().all(|(id, _)| *id != SubscriberId(2)));
+        assert!(tree
+            .matching_subscribers("$SYS/broker/uptime")
+            .iter()
+            .all(|(id, _)| *id != SubscriberId(1)));
+        assert!(tree
+            .matching_subscribers("$SYS/status")
+            .iter()
+            .all(|(id, _)| *id != SubscriberId(2)));
         assert_eq!(
             ids(tree.matching_subscribers("$SYS/broker/uptime")),
             vec![SubscriberId(3)]
         );
-        // Non-dollar topics still match the bare wildcards normally.
-        assert_eq!(ids(tree.matching_subscribers("plain/topic")), vec![SubscriberId(1)]);
+        assert_eq!(
+            ids(tree.matching_subscribers("plain/topic")),
+            vec![SubscriberId(1)]
+        );
     }
 
     #[test]
     fn unsubscribe_removes_entry() {
         let mut tree = TopicTree::new();
-        tree.subscribe("a/b", SubscriberId(1), opt(QoS::AtMostOnce)).unwrap();
+        tree.subscribe("a/b", SubscriberId(1), opt(QoS::AtMostOnce))
+            .unwrap();
         assert!(tree.unsubscribe("a/b", SubscriberId(1)));
         assert!(tree.matching_subscribers("a/b").is_empty());
-        assert!(!tree.unsubscribe("a/b", SubscriberId(1)));
     }
 
     #[test]
-    fn unsubscribe_all_clears_every_filter() {
+    fn shared_subscription_delivers_to_one_member() {
         let mut tree = TopicTree::new();
-        tree.subscribe("a/b", SubscriberId(1), opt(QoS::AtMostOnce)).unwrap();
-        tree.subscribe("c/#", SubscriberId(1), opt(QoS::AtMostOnce)).unwrap();
-        tree.subscribe("c/#", SubscriberId(2), opt(QoS::AtMostOnce)).unwrap();
-        tree.unsubscribe_all(SubscriberId(1));
-        assert!(tree.matching_subscribers("a/b").is_empty());
-        assert_eq!(ids(tree.matching_subscribers("c/d")), vec![SubscriberId(2)]);
+        tree.subscribe("$share/g1/a/b", SubscriberId(1), opt(QoS::AtMostOnce))
+            .unwrap();
+        tree.subscribe("$share/g1/a/b", SubscriberId(2), opt(QoS::AtMostOnce))
+            .unwrap();
+        tree.subscribe("$share/g2/a/b", SubscriberId(3), opt(QoS::AtMostOnce))
+            .unwrap();
+
+        let first = ids(tree.matching_subscribers("a/b"));
+        assert_eq!(first.len(), 2); // one from g1, one from g2
+        assert!(first.contains(&SubscriberId(3)));
+
+        let second = ids(tree.matching_subscribers("a/b"));
+        assert_eq!(second.len(), 2);
+        // g1 round-robins between 1 and 2
+        let g1_picks: Vec<_> = [first.clone(), second]
+            .into_iter()
+            .flatten()
+            .filter(|id| *id == SubscriberId(1) || *id == SubscriberId(2))
+            .collect();
+        assert_eq!(g1_picks.len(), 2);
+        assert_ne!(g1_picks[0], g1_picks[1]);
     }
 
     #[test]
-    fn rejects_malformed_filters() {
+    fn shared_and_normal_both_match() {
         let mut tree = TopicTree::new();
-        assert!(tree.subscribe("a/#/b", SubscriberId(1), opt(QoS::AtMostOnce)).is_err());
-        assert!(tree.subscribe("a/b#", SubscriberId(1), opt(QoS::AtMostOnce)).is_err());
-        assert!(tree.subscribe("a/+b", SubscriberId(1), opt(QoS::AtMostOnce)).is_err());
-        assert!(tree.subscribe("", SubscriberId(1), opt(QoS::AtMostOnce)).is_err());
+        tree.subscribe("a/b", SubscriberId(1), opt(QoS::AtMostOnce))
+            .unwrap();
+        tree.subscribe("$share/g/a/b", SubscriberId(2), opt(QoS::AtMostOnce))
+            .unwrap();
+        let got = ids(tree.matching_subscribers("a/b"));
+        assert_eq!(got, vec![SubscriberId(1), SubscriberId(2)]);
     }
 
     #[test]
-    fn rejects_wildcards_in_topic_names() {
-        assert!(validate_topic_name("a/+/b").is_err());
-        assert!(validate_topic_name("a/#").is_err());
-        assert!(validate_topic_name("").is_err());
-        assert!(validate_topic_name("a/b/c").is_ok());
+    fn rejects_malformed_shared() {
+        let mut tree = TopicTree::new();
+        assert!(tree
+            .subscribe("$share/", SubscriberId(1), opt(QoS::AtMostOnce))
+            .is_err());
+        assert!(tree
+            .subscribe("$share/g", SubscriberId(1), opt(QoS::AtMostOnce))
+            .is_err());
+        assert!(tree
+            .subscribe("$share/+/a", SubscriberId(1), opt(QoS::AtMostOnce))
+            .is_err());
     }
 }

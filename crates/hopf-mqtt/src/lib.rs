@@ -7,20 +7,19 @@
 //! - [`codec`] — incremental push frame parser / encoder, varint, MQTT 5
 //!   properties, streaming PUBLISH.
 //! - [`server`] — `MqttConfig` / `MqttService` / `MqttControlHandler`, the
-//!   staged CONNECT handler SPI (`server::ConnectHandler`),
-//!   [`server::broker`] — topic tree, subscription index, retained store,
-//!   Receive Maximum flow control, Session Expiry, cross-reactor fan-out —
-//!   and `server::ws` (feature `websocket`) — MQTT-over-WebSocket bridge
-//!   sharing broker state with the TCP listener.
+//!   staged CONNECT / PUBLISH / SUBSCRIBE handler SPI (`server::ConnectHandler`
+//!   et al.), [`server::broker`] — topic tree (including `$share/...`),
+//!   subscription index, retained store, Receive Maximum flow control,
+//!   Session Expiry, offline QoS queues / QoS retransmission via
+//!   [`server::store`], cross-reactor fan-out — and `server::ws` (feature
+//!   `websocket`) — MQTT-over-WebSocket bridge sharing broker state with
+//!   the TCP listener.
 //! - [`client`] — async client facade, endpoint, and the consolidated
-//!   `MqttClientDriver` callback trait.
-//! - `server::store` — reserved for a future durable message store;
-//!   retained messages already live in [`server::broker::RetainedStore`].
+//!   `MqttClientDriver` callback trait (including enhanced AUTH).
 //!
-//! See the MQTT implementation plan for what's deliberately out of scope so
-//! far: shared subscriptions, enhanced AUTH, topic aliases, will delay /
-//! message expiry enforcement, durable offline queues, QoS retry across
-//! reconnects, and file-backed message storage.
+//! Deliberately still limited: QoS retry does not survive broker process
+//! restarts (in-flight state is process-local even with
+//! [`server::FileBackedMessageStore`]).
 
 #![warn(missing_docs)]
 

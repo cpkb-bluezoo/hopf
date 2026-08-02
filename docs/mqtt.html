@@ -101,11 +101,11 @@
 </tr>
 <tr>
 <td>MQTT 5.0 (useful core)</td>
-<td>Wire properties, unified reason codes, <strong>Receive Maximum</strong> outbound flow control, subscription options (No Local, Retain As Published, Retain Handling), <strong>Session Expiry Interval</strong> (orphan-and-resume)</td>
+<td>Wire properties, unified reason codes, <strong>Receive Maximum</strong> outbound flow control, subscription options (No Local, Retain As Published, Retain Handling), <strong>Session Expiry Interval</strong> (orphan-and-resume), shared subscriptions (<code>$share/...</code>), topic aliases, Will Delay / Message Expiry enforcement, enhanced AUTH, offline QoS ≥ 1 queues, in-process QoS retransmission</td>
 </tr>
 <tr>
-<td>Explicitly out of scope</td>
-<td>Shared subscriptions (<code>$share/...</code>), enhanced AUTH (SASL-style AUTH packets), topic aliases, Will Delay / Message Expiry enforcement, durable offline queues, QoS retry across restarts, file-backed message stores</td>
+<td>Still limited</td>
+<td>QoS retry / inflight state does not survive broker process restarts (file-backed store covers offline queues only)</td>
 </tr>
 </tbody>
 </table>
@@ -159,16 +159,20 @@ WebSocket (mqtt) ───┘                                                   
 </tr>
 </tbody>
 </table>
-<h2 id="connect-handler-spi">Connect handler SPI</h2>
-<p>Only CONNECT is staged (Gumdrop shape); PUBLISH and SUBSCRIBE authorization stay inline (accept once connected, reject a malformed filter/topic).</p>
+<h2 id="connect-handler-spi">Handler SPI</h2>
+<p>CONNECT, PUBLISH, and SUBSCRIBE are staged (Gumdrop parity). Default handlers accept all traffic, or require CONNECT username/password to match a <code>CredentialStore</code> when one is configured. Enhanced AUTH (MQTT 5.0) is driven when CONNECT carries Authentication Method and credentials are configured.</p>
 <div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">pub</span> <span class="kw">trait</span> ConnectHandler: Send {
     <span class="kw">fn</span> authorize(&amp;mut self, packet: &amp;ConnectPacket, meta: &amp;MqttConnectionMetadata) -&gt; ConnectDecision;
 }
+<span class="kw">pub</span> <span class="kw">trait</span> PublishHandler: Send { <span class="co">/* authorize(client_id, topic, qos, retain, meta) */</span> }
+<span class="kw">pub</span> <span class="kw">trait</span> SubscribeHandler: Send { <span class="co">/* authorize(client_id, filter, meta) */</span> }
 
 <span class="kw">pub</span> <span class="kw">trait</span> MqttHandlerFactory: Send + Sync {
-    <span class="kw">fn</span> create(&amp;self) -&gt; Box&lt;dyn ConnectHandler&gt;; <span class="co">// one per accepted connection</span>
+    <span class="kw">fn</span> create(&amp;self) -&gt; Box&lt;dyn ConnectHandler&gt;;
+    <span class="kw">fn</span> create_publish(&amp;self) -&gt; Box&lt;dyn PublishHandler&gt;;
+    <span class="kw">fn</span> create_subscribe(&amp;self) -&gt; Box&lt;dyn SubscribeHandler&gt;;
 }</code></pre></div>
-<p><code>MqttConnectionMetadata</code> carries peer/local/tls, optional <code>client_id</code>, and (when OTel traces are enabled) a W3C <code>traceparent</code>. <code>DefaultConnectHandler</code> / <code>DefaultMqttHandlerFactory</code> accept unconditionally, or require CONNECT username/password to match a <code>CredentialStore</code> when one is configured. Swap in custom policy with <code>MqttService::with_handler_factory</code>.</p>
+<p><code>MqttConnectionMetadata</code> carries peer/local/tls, optional <code>client_id</code>, and (when OTel traces are enabled) a W3C <code>traceparent</code>. Swap in custom policy with <code>MqttService::with_handler_factory</code>. Offline / inflight message storage is pluggable via <code>BrokerState::with_store</code> (<code>InMemoryMessageStore</code> default, <code>FileBackedMessageStore</code> optional).</p>
 <h2 id="client">Client</h2>
 <p>Async, non-blocking client on the <code>hopf-core</code> <code>Runtime</code> / <code>ProtocolHandler</code> SPI, with DNS resolution via <code>hopf-dns</code>. Unlike the staged POP3/IMAP client drivers, MQTT has only one phase once CONNACK arrives, so <code>MqttClientDriver</code> is a flat set of callbacks over <code>MqttClientControl</code> (publish/subscribe/unsubscribe/disconnect) — QoS 1/2 acknowledgment of incoming messages and the PUBREC→PUBREL leg of the client's own QoS 2 publishes are handled automatically by the endpoint.</p>
 <div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> std::sync::Arc;
@@ -258,7 +262,7 @@ MqttClient::new(<span class="st">&quot;broker.example.com&quot;</span>, <span cl
 <span class="co">// wrap `ws` as Arc&lt;dyn ServerHandlerFactory&gt; under CleartextHttpEndpoint / AlpnHttpEndpoint,</span>
 <span class="co">// same as any other hopf-websocket factory — see websocket.html</span></code></pre></div>
 <p>Broker fan-out (<code>BrokerState::publish</code> / <code>deliver_retained</code>) delivers asynchronously, from whichever connection published the message, via <code>ConnHandle::send</code>. A plain <code>ConnHandle</code> writes straight to the raw transport, which would land a bare MQTT packet on the wire unframed and corrupt the WebSocket stream — so the WS bridge registers a <a href="websocket.html"><code>hopf_websocket::framed_ws_conn_handle</code></a>-wrapped handle with the broker instead, which pipes every delivery through WS binary framing first. This is exactly why the WS bridge needed <code>hopf-websocket</code> to expose a per-connection <code>ConnHandle</code> at all — see the <a href="websocket.html#event-handler-spi">WebSocket event handler SPI</a>.</p>
-<p>Because <code>WsEventHandler</code> callbacks have no <code>Endpoint</code> or timer access (only an outbound buffer and a <code>ConnHandle</code>), two things are deliberately <strong>not</strong> shared with the TCP path over WS — see <a href="#limitations">Limitations</a>.</p>
+<p>Timers (CONNECT timeout, keepalive, Session Expiry, Will Delay, QoS retransmission) use <code>ConnHandle::schedule_timer</code> on the framed handle — the same semantics as the TCP path.</p>
 <h2 id="examples">Examples</h2>
 <div class="sourceCode"><pre class="sourceCode bash"><code class="sourceCode bash"><span class="ex">cargo</span> run -p mqtt -- 127.0.0.1:1883
 <span class="ex">cargo</span> run -p mqtt-pub -- 127.0.0.1 1883 demo/topic <span class="st">&quot;hello from hopf&quot;</span></code></pre></div>
@@ -290,9 +294,7 @@ MqttClient::new(<span class="st">&quot;broker.example.com&quot;</span>, <span cl
 <p>With traces enabled on the pipeline, <code>MqttConnectionMetadata::traceparent</code> carries the active W3C <code>traceparent</code> for the connection or current client PUBLISH. Handler SPI implementers can pass it to outbound HTTP with <code>hopf_otel::with_traceparent</code>.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>Session Expiry over WebSocket</strong> — the WS bridge has no timer access, so an unclean WS disconnect always unregisters the session immediately (as if Session Expiry were 0), never orphans. Reconnecting over WS always starts fresh, even if the client requested a nonzero Session Expiry Interval (the CONNACK echoes 0 back rather than promising a resume that will never happen). Session Expiry <strong>is</strong> fully supported over plain TCP.</li>
-<li><strong>No keepalive / CONNACK-timeout enforcement over WebSocket</strong> — MQTT's 1.5×-Keep-Alive rule and the CONNECT wait window are TCP-path-only; a silent or CONNECT-less WS client is only reaped by whatever HTTP/TCP-level idle handling exists underneath.</li>
-<li>No shared subscriptions, enhanced AUTH, topic aliases, Will Delay / Message Expiry enforcement, durable offline queues, QoS retry across restarts, or file-backed message stores (any transport).</li>
+<li>QoS retransmission / in-flight state is process-local — it does not survive broker restarts (file-backed <code>MqttMessageStore</code> persists offline queues only).</li>
 </ul>
 
       <p class="footer">

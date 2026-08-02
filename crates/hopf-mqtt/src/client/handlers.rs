@@ -36,6 +36,9 @@ pub trait MqttClientControl {
     /// [`MqttClientDriver::on_unsuback`]).
     fn unsubscribe(&mut self, topic_filters: &[String]) -> u16;
 
+    /// Send an AUTH packet (MQTT 5.0 enhanced authentication).
+    fn auth(&mut self, reason_code: u8, properties: &Properties);
+
     /// Send DISCONNECT and close gracefully (no Will Message published).
     fn disconnect(&mut self, reason_code: u8);
 }
@@ -83,6 +86,11 @@ pub trait MqttClientDriver: Send {
 
     /// The broker sent a server-initiated DISCONNECT (MQTT 5.0).
     fn on_server_disconnect(&mut self, reason_code: u8, properties: &Properties);
+
+    /// Enhanced AUTH challenge / continuation (MQTT 5.0 §4.12). Default is
+    /// a no-op — override to continue the exchange via
+    /// [`MqttClientControl::auth`].
+    fn on_auth(&mut self, _client: &mut dyn MqttClientControl, _reason_code: u8, _properties: &Properties) {}
 
     /// Unrecoverable I/O or protocol error (including CONNACK / PINGRESP
     /// timeouts, surfaced with [`std::io::ErrorKind::TimedOut`]).
