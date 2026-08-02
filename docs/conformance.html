@@ -502,19 +502,19 @@
 <table>
 <thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
 <tbody>
-<tr><td>TYPE A/I (E and L not implemented, by design)</td><td>§3.1.1</td><td>Compliant</td><td><code>control.rs:349-360</code></td></tr>
-<tr><td>STRU F only (R/P not implemented)</td><td>§3.1.2</td><td>Compliant (declared scope)</td><td><code>control.rs:202-212</code> — RFC says R SHOULD be accepted for text types, hopf doesn't</td></tr>
-<tr><td>ASCII CRLF normalization — download (RETR)</td><td>§3.1.1.1</td><td>Compliant</td><td><code>ascii.rs:6-31</code>, wired at <code>data.rs:142-146</code></td></tr>
-<tr><td><strong>ASCII CRLF normalization — upload (STOR/APPE)</strong></td><td>§3.1.1.1</td><td><strong>Not implemented</strong></td><td><code>cmd_stor</code>/<code>FtpDataHandler::receive</code> never inspect <code>transfer_type</code> — upload never normalizes line endings for TYPE A</td></tr>
-<tr><td>USER/PASS/ACCT/CWD/CDUP/SMNT/REIN/QUIT</td><td>§4.1.1</td><td>Compliant</td><td><code>control.rs:173-347</code></td></tr>
-<tr><td>PORT/PASV, active-mode bounce protection</td><td>§4.1.2</td><td>Compliant</td><td><code>control.rs:453,471,922-938</code></td></tr>
-<tr><td>Passive-mode same-IP verification</td><td>RFC 4217 §10 (security practice)</td><td>Compliant</td><td><code>FtpDataHandler</code> carries an <code>expected_peer: IpAddr</code> (the control connection's remote IP for PASV/EPSV, the PORT/EPRT dial target for active mode) and <code>arm()</code> (<code>data.rs:238-249</code>) closes and refuses to arm any data connection whose <code>remote_addr()</code> doesn't match, independent of the pre-existing PORT/EPRT bounce-protection check</td></tr>
-<tr><td>RETR/STOR/APPE</td><td>§4.1.3</td><td>Compliant</td><td><code>control.rs:505-584</code></td></tr>
-<tr><td>STOU</td><td>§4.1.3</td><td>Partial</td><td>Synthesized name (<code>stor-{pid}</code>) collides on a second call within the same process — not filesystem-derived</td></tr>
-<tr><td>REST (STREAM)</td><td>§4.1.3</td><td>Partial</td><td>Only consumed by RETR; STOR/APPE never honor a restart offset</td></tr>
-<tr><td>RNFR/RNTO, DELE, RMD/MKD, PWD, LIST/NLST</td><td>§4.1.3</td><td>Compliant</td><td><code>control.rs:586-791</code></td></tr>
-<tr><td>ABOR</td><td>§4.1.3</td><td>Partial</td><td>Always replies 226 only — RFC requires 426 first if a transfer was actually in progress; no in-flight storage task is actually cancelled, only the bridge reference dropped</td></tr>
-<tr><td><strong>STAT with a pathname argument</strong></td><td>§4.1.3</td><td><strong>Not implemented / bug</strong></td><td>Dispatches to the same code as LIST, which requires an established <em>data</em> connection — RFC 959 requires STAT's listing over the control connection with no data connection involved; as implemented, <code>STAT &lt;path&gt;</code> without a prior PASV/PORT simply fails 425</td></tr>
+<tr><td>TYPE A/I (E and L not implemented, by design)</td><td>§3.1.1</td><td>Compliant</td><td><code>control.rs</code> TYPE dispatch</td></tr>
+<tr><td>STRU F only (R/P not implemented)</td><td>§3.1.2</td><td>Compliant (declared scope)</td><td>RFC says R SHOULD be accepted for text types, hopf doesn't</td></tr>
+<tr><td>ASCII CRLF normalization — download (RETR)</td><td>§3.1.1.1</td><td>Compliant</td><td><code>ascii.rs</code> + RETR path in <code>data.rs</code></td></tr>
+<tr><td>ASCII CRLF normalization — upload (STOR/APPE)</td><td>§3.1.1.1</td><td>Compliant</td><td><code>AsciiNewlineDenormalizer</code> on TYPE A STOR/APPE via <code>StorTransfer::ascii</code></td></tr>
+<tr><td>USER/PASS/ACCT/CWD/CDUP/SMNT/REIN/QUIT</td><td>§4.1.1</td><td>Compliant</td><td></td></tr>
+<tr><td>PORT/PASV, active-mode bounce protection</td><td>§4.1.2</td><td>Compliant</td><td></td></tr>
+<tr><td>Passive-mode same-IP verification</td><td>RFC 4217 §10 (security practice)</td><td>Compliant</td><td><code>FtpDataHandler</code> carries an <code>expected_peer: IpAddr</code> (the control connection's remote IP for PASV/EPSV, the PORT/EPRT dial target for active mode) and <code>arm()</code> closes and refuses to arm any data connection whose <code>remote_addr()</code> doesn't match, independent of the pre-existing PORT/EPRT bounce-protection check</td></tr>
+<tr><td>RETR/STOR/APPE</td><td>§4.1.3</td><td>Compliant</td><td></td></tr>
+<tr><td>STOU</td><td>§4.1.3</td><td>Compliant</td><td><code>generate_unique_name</code> uses a per-process counter + nanos; 150 reply includes <code>FILE: {path}</code></td></tr>
+<tr><td>REST (STREAM)</td><td>§4.1.3</td><td>Compliant</td><td>Honored by RETR and STOR; APPE ignores restart (append semantics)</td></tr>
+<tr><td>RNFR/RNTO, DELE, RMD/MKD, PWD, LIST/NLST</td><td>§4.1.3</td><td>Compliant</td><td></td></tr>
+<tr><td>ABOR</td><td>§4.1.3</td><td>Compliant</td><td>Closes the data connection; replies 426 then 226 when a transfer was in progress, else 226 only</td></tr>
+<tr><td>STAT with a pathname argument</td><td>§4.1.3</td><td>Compliant</td><td>Listing sent over the control connection as multiline 213 (no data connection)</td></tr>
 </tbody>
 </table>
 <h3>Server — TLS (RFC 4217), IPv6/NAT (RFC 2428), Extensions</h3>
@@ -525,12 +525,12 @@
 <tr><td><strong>PROT P — passive-mode data channel</strong></td><td>§9</td><td><strong>Compliant</strong></td><td><code>control.rs:383-385,428-430</code>; <code>FtpDataHandler</code> waits for <code>security_established</code></td></tr>
 <tr><td>PROT P — active-mode data channel</td><td>§9</td><td>Compliant</td><td><code>FtpConfig.data_tls_connector</code>/<code>data_tls_server_name</code> (<code>service.rs:36-43</code>), set via <code>with_data_tls_connector(connector, server_name)</code>; <code>prepare_data</code>'s active-mode arm (<code>control.rs:516-547</code>) dials out through the connector when PROT P is in effect, refusing with 425 rather than falling back to cleartext if no connector is configured</td></tr>
 <tr><td><code>require_tls_for_data</code> rejects non-protected transfers as documented</td><td>—</td><td>Compliant</td><td><code>check_data_protection</code> (<code>control.rs:156-163</code>) explicitly rejects with 522 "PROT P required for data connections" — called at the top of <code>cmd_pasv</code>, <code>cmd_epsv</code>, and <code>prepare_data</code> (covering both passive and active mode) whenever the config demands protection and PROT P isn't yet in effect</td></tr>
-<tr><td>EPRT/EPSV command format and reply</td><td>RFC 2428 §2-3</td><td>Partial</td><td>net-prt (address family) field parsed but never validated against the actual address type; no 522 mismatch reply path exists</td></tr>
-<tr><td>EPSV ALL</td><td>RFC 2428 §4</td><td>Not implemented</td><td>Argument to EPSV is discarded entirely</td></tr>
-<tr><td>FEAT / OPTS UTF8, only-advertise-what's-implemented</td><td>RFC 2389</td><td>Compliant</td><td><code>control.rs:803-834</code></td></tr>
-<tr><td>SIZE</td><td>RFC 3659 §4</td><td>Compliant</td><td><code>control.rs:680-691</code></td></tr>
-<tr><td><strong>MDTM (RFC 3659 timestamp format)</strong></td><td>RFC 3659 §2.3,§3</td><td><strong>Partial — wrong format</strong></td><td>Formats as raw Unix-epoch seconds (<code>control.rs:704-706</code>), not the mandated <code>YYYYMMDDHHMMSS</code> — code comment admits it's "rough… enough for smoke tests"</td></tr>
-<tr><td><strong>MLST/MLSD fact set</strong></td><td>RFC 3659 §7.5</td><td><strong>Partial — narrower than hopf's own docs claim</strong></td><td>Only <code>Type=</code>/<code>Size=</code> ever emitted; hopf's own docs describe "size, modify, type, perm" — no <code>Modify=</code>/<code>Perm=</code> anywhere. FEAT is self-consistent (only advertises what's sent), the docs page over-claims.</td></tr>
+<tr><td>EPRT/EPSV command format and reply</td><td>RFC 2428 §2-3</td><td>Compliant</td><td>net-prt validated against address family; mismatch → 522</td></tr>
+<tr><td>EPSV ALL</td><td>RFC 2428 §4</td><td>Compliant</td><td>Session flag rejects subsequent PORT/PASV/EPRT with 501; cleared on REIN</td></tr>
+<tr><td>FEAT / OPTS UTF8, only-advertise-what's-implemented</td><td>RFC 2389</td><td>Compliant</td><td></td></tr>
+<tr><td>SIZE</td><td>RFC 3659 §4</td><td>Compliant</td><td></td></tr>
+<tr><td>MDTM (RFC 3659 timestamp format)</td><td>RFC 3659 §2.3,§3</td><td>Compliant</td><td><code>YYYYMMDDHHMMSS</code> UTC via <code>format_ftp_mtime</code></td></tr>
+<tr><td>MLST/MLSD fact set</td><td>RFC 3659 §7.5</td><td>Compliant</td><td>Emits <code>Type=</code>/<code>Size=</code>/<code>Modify=</code>/<code>Perm=</code>; FEAT advertises the same</td></tr>
 <tr><td>OPTS UTF8, non-ASCII rejection without it, charset substitution</td><td>RFC 2640 §4</td><td>Compliant</td><td><code>utf8.rs</code></td></tr>
 </tbody>
 </table>
@@ -540,7 +540,7 @@
 <tbody>
 <tr><td><code>..</code>/symlink escape prevention for existing paths</td><td>Compliant</td><td><code>fs.rs:131-151</code>: component-wise walk + a second post-canonicalize re-check, which also defeats symlink escapes for anything already on disk</td></tr>
 <tr><td>Symlink escape prevention for newly-created paths (STOR to a new file, MKD of a new dir)</td><td>Compliant</td><td>When the target doesn't yet exist, <code>join_jail</code> (<code>fs.rs:134-163</code>) canonicalizes the <em>parent</em> directory instead of falling back to the unresolved full path, then re-appends the final path component — an intermediate symlink pointing outside root is caught by the parent's canonicalized containment check, the same as for existing paths</td></tr>
-<tr><td><code>is_authorized</code> hook enforced for all mutating operations</td><td>Partial</td><td>Called for RETR/STOR/APPE/DELE; <strong>MKD/RMD/RNFR/RNTO bypass it entirely</strong>, relying only on the filesystem's own read-only flag</td></tr>
+<tr><td><code>is_authorized</code> hook enforced for all mutating operations</td><td>Compliant</td><td>Called for RETR/LIST/STAT (<code>Read</code>), STOR/APPE/STOU (<code>Write</code>), DELE (<code>Delete</code>), MKD (<code>CreateDir</code>), RMD (<code>DeleteDir</code>), RNFR/RNTO (<code>Rename</code>), CWD/CDUP (<code>Navigate</code>)</td></tr>
 <tr><td>TrustPolicy-based USER/PASS auth, correct reply-code mapping</td><td>Compliant</td><td><code>handler.rs:114-134</code>, matches hopf's own docs example exactly</td></tr>
 </tbody>
 </table>
