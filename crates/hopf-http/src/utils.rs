@@ -126,7 +126,8 @@ pub fn http_date_now() -> String {
     format_http_date(secs)
 }
 
-fn format_http_date(secs: i64) -> String {
+/// Format a Unix timestamp as IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`).
+pub fn format_http_date(secs: i64) -> String {
     const DAYS: &[&str] = &["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     const MONTHS: &[&str] = &[
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -176,6 +177,121 @@ fn format_http_date(secs: i64) -> String {
         min,
         sec
     )
+}
+
+/// Parse an HTTP-date (RFC 9110 §5.6.7) into a [`std::time::SystemTime`].
+///
+/// Accepts IMF-fixdate and the two obsolete forms recipients must still
+/// understand: RFC 850 and ANSI C's `asctime()`.
+pub fn parse_http_date(s: &str) -> Option<std::time::SystemTime> {
+    let s = s.trim();
+    let secs = parse_imf_fixdate(s)
+        .or_else(|| parse_rfc850_date(s))
+        .or_else(|| parse_asctime_date(s))?;
+    if secs < 0 {
+        return None;
+    }
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+}
+
+fn parse_imf_fixdate(s: &str) -> Option<i64> {
+    // Sun, 06 Nov 1994 08:49:37 GMT
+    let rest = s.split_once(", ")?.1;
+    let mut parts = rest.split_whitespace();
+    let day: u32 = parts.next()?.parse().ok()?;
+    let month = month_num(parts.next()?)?;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let (hour, min, sec) = parse_hms(parts.next()?)?;
+    let _gmt = parts.next()?; // GMT
+    civil_to_unix(year, month, day, hour, min, sec)
+}
+
+fn parse_rfc850_date(s: &str) -> Option<i64> {
+    // Sunday, 06-Nov-94 08:49:37 GMT
+    let rest = s.split_once(", ")?.1;
+    let mut parts = rest.split_whitespace();
+    let date = parts.next()?;
+    let mut dmy = date.split('-');
+    let day: u32 = dmy.next()?.parse().ok()?;
+    let month = month_num(dmy.next()?)?;
+    let yy: i64 = dmy.next()?.parse().ok()?;
+    // RFC 850 two-digit year: 0–69 → 2000–2069, 70–99 → 1970–1999 (common convention).
+    let year = if yy < 70 { 2000 + yy } else { 1900 + yy };
+    let (hour, min, sec) = parse_hms(parts.next()?)?;
+    let _gmt = parts.next()?;
+    civil_to_unix(year, month, day, hour, min, sec)
+}
+
+fn parse_asctime_date(s: &str) -> Option<i64> {
+    // Sun Nov  6 08:49:37 1994
+    let mut parts = s.split_whitespace();
+    let _wday = parts.next()?;
+    let month = month_num(parts.next()?)?;
+    let day: u32 = parts.next()?.parse().ok()?;
+    let (hour, min, sec) = parse_hms(parts.next()?)?;
+    let year: i64 = parts.next()?.parse().ok()?;
+    civil_to_unix(year, month, day, hour, min, sec)
+}
+
+fn parse_hms(s: &str) -> Option<(u32, u32, u32)> {
+    let mut p = s.split(':');
+    let hour: u32 = p.next()?.parse().ok()?;
+    let min: u32 = p.next()?.parse().ok()?;
+    let sec: u32 = p.next()?.parse().ok()?;
+    if hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    Some((hour, min, sec))
+}
+
+fn month_num(m: &str) -> Option<u32> {
+    Some(match m {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    })
+}
+
+fn civil_to_unix(year: i64, month: u32, day: u32, hour: u32, min: u32, sec: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || day == 0 || day > 31 {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let mdays = [
+        31,
+        if leap { 29 } else { 28 },
+        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+    ];
+    if day > mdays[(month - 1) as usize] {
+        return None;
+    }
+    let mut days: i64 = 0;
+    if year >= 1970 {
+        for y in 1970..year {
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            days += if leap { 366 } else { 365 };
+        }
+    } else {
+        for y in (year..1970).rev() {
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            days -= if leap { 366 } else { 365 };
+        }
+    }
+    for m in 1..month {
+        days += mdays[(m - 1) as usize] as i64;
+    }
+    days += (day - 1) as i64;
+    Some(days * 86400 + (hour as i64) * 3600 + (min as i64) * 60 + sec as i64)
 }
 
 /// Methods that never have a request body in practice for H1 framing.
@@ -262,6 +378,31 @@ mod tests {
         assert_eq!(format_http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
         // A leap-day date, exercised for the Feb-29 branch.
         assert_eq!(format_http_date(1582934400), "Sat, 29 Feb 2020 00:00:00 GMT");
+    }
+
+    #[test]
+    fn http_date_parse_round_trips_imf() {
+        let s = "Mon, 01 Jan 2024 00:00:00 GMT";
+        let t = parse_http_date(s).unwrap();
+        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        assert_eq!(secs, 1704067200);
+        assert_eq!(format_http_date(secs), s);
+    }
+
+    #[test]
+    fn http_date_parse_obsolete_forms() {
+        // RFC 850 (two-digit year 94 → 1994).
+        let t = parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT").unwrap();
+        assert_eq!(
+            t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            784111777
+        );
+        // asctime — note the double space before single-digit day.
+        let t = parse_http_date("Sun Nov  6 08:49:37 1994").unwrap();
+        assert_eq!(
+            t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            784111777
+        );
     }
 }
 
