@@ -11,10 +11,15 @@ use hopf_core::{
     TcpListenerConfig,
 };
 use hopf_core::tls::SharedTlsAcceptor;
+use hopf_otel::{
+    ExportHandle, SpanKind, Trace, FtpServerMetrics as OtelFtpMetrics,
+};
 
 use crate::server::ascii::format_ftp_mtime;
 use crate::server::codec::{FtpCommand, FtpServerLexer, MAX_COMMAND_LINE};
-use crate::server::data::{DataBridge, FtpDataHandler, OutboundTransfer, StorTransfer};
+use crate::server::data::{
+    DataBridge, FtpDataHandler, OutboundTransfer, StorTransfer, TransferTelemetry,
+};
 use crate::server::fs::FtpFileOpResult;
 use crate::server::handler::{
     FtpAuthResult, FtpConnectionHandler, FtpConnectionMetadata, FtpOperation,
@@ -50,6 +55,10 @@ pub struct FtpControlHandler {
     prot_p: bool,
     pbsz: bool,
     control_handle: Option<hopf_core::ConnHandle>,
+    otel_metrics: Option<Arc<OtelFtpMetrics>>,
+    export: Option<ExportHandle>,
+    traces_enabled: bool,
+    conn_trace: Option<Trace>,
 }
 
 impl FtpControlHandler {
@@ -75,6 +84,7 @@ impl FtpControlHandler {
                 local,
                 user: None,
                 tls: false,
+                traceparent: None,
             },
             cwd: "/".into(),
             logged_in: false,
@@ -89,6 +99,94 @@ impl FtpControlHandler {
             prot_p: false,
             pbsz: false,
             control_handle: None,
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
+            conn_trace: None,
+        }
+    }
+
+    /// Attach OTel metrics / traces from a telemetry pipeline.
+    pub fn with_telemetry(
+        mut self,
+        otel_metrics: Option<Arc<OtelFtpMetrics>>,
+        export: Option<ExportHandle>,
+        traces_enabled: bool,
+    ) -> Self {
+        self.otel_metrics = otel_metrics;
+        self.export = export;
+        self.traces_enabled = traces_enabled;
+        self
+    }
+
+    fn begin_connection_telemetry(&mut self) {
+        if let Some(m) = &self.otel_metrics {
+            m.connection_opened();
+        }
+        if self.traces_enabled {
+            if let Some(export) = self.export.clone() {
+                let t = Trace::new("FTP connection", SpanKind::Server);
+                t.set_exporter(export);
+                self.meta.traceparent = Some(t.traceparent());
+                self.conn_trace = Some(t);
+            }
+        }
+    }
+
+    fn end_connection_telemetry(&mut self) {
+        if let Some(trace) = self.conn_trace.take() {
+            let root = trace.root_span();
+            root.set_status_ok();
+            root.end();
+            trace.end();
+        }
+        self.meta.traceparent = None;
+        if let Some(m) = &self.otel_metrics {
+            m.connection_closed();
+        }
+    }
+
+    /// Start transfer instrumentation; updates `meta.traceparent` for handlers.
+    fn begin_transfer_telemetry(&mut self, direction: &'static str) -> Option<TransferTelemetry> {
+        if self.otel_metrics.is_none() && self.conn_trace.is_none() {
+            return None;
+        }
+        let span = if let Some(trace) = &self.conn_trace {
+            let s = trace.start_span("FTP transfer", SpanKind::Server);
+            self.meta.traceparent = Some(trace.traceparent());
+            Some(s)
+        } else {
+            None
+        };
+        Some(TransferTelemetry::start(
+            direction,
+            self.otel_metrics.clone(),
+            span,
+        ))
+    }
+
+    fn record_auth(&self, ok: bool) {
+        if ok {
+            FtpServerMetrics::add(&self.metrics.auth_ok, 1);
+        } else {
+            FtpServerMetrics::add(&self.metrics.auth_fail, 1);
+        }
+        if let Some(m) = &self.otel_metrics {
+            m.auth(ok);
+        }
+    }
+
+    fn record_command(&self) {
+        FtpServerMetrics::add(&self.metrics.commands, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.command();
+        }
+    }
+
+    fn record_pasv_bind(&self) {
+        FtpServerMetrics::add(&self.metrics.pasv_binds, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.pasv_bind();
         }
     }
 
@@ -167,7 +265,7 @@ impl FtpControlHandler {
     }
 
     fn dispatch(&mut self, endpoint: &mut dyn Endpoint, cmd: FtpCommand) {
-        FtpServerMetrics::add(&self.metrics.commands, 1);
+        self.record_command();
 
         // Commands with a text/path argument need RFC 2640 charset
         // decoding (depends on the per-connection `self.utf8` toggle, so
@@ -327,14 +425,14 @@ impl FtpControlHandler {
             FtpAuthResult::Success => {
                 self.logged_in = true;
                 self.meta.user = Some(arg.to_string());
-                FtpServerMetrics::add(&self.metrics.auth_ok, 1);
+                self.record_auth(true);
                 self.send_reply(endpoint, 230, "User logged in");
             }
             FtpAuthResult::NeedPassword => {
                 self.send_reply(endpoint, 331, "User name okay, need password");
             }
             _ => {
-                FtpServerMetrics::add(&self.metrics.auth_fail, 1);
+                self.record_auth(false);
                 self.send_reply(endpoint, 530, "Login incorrect");
             }
         }
@@ -352,14 +450,14 @@ impl FtpControlHandler {
             FtpAuthResult::Success => {
                 self.logged_in = true;
                 self.meta.user = Some(user);
-                FtpServerMetrics::add(&self.metrics.auth_ok, 1);
+                self.record_auth(true);
                 self.send_reply(endpoint, 230, "User logged in");
             }
             FtpAuthResult::NeedAccount => {
                 self.send_reply(endpoint, 332, "Need account for login");
             }
             _ => {
-                FtpServerMetrics::add(&self.metrics.auth_fail, 1);
+                self.record_auth(false);
                 self.send_reply(endpoint, 530, "Login incorrect");
             }
         }
@@ -431,7 +529,7 @@ impl FtpControlHandler {
         }
         match self.runtime.add_tcp_listener(cfg) {
             Ok((local, id)) => {
-                FtpServerMetrics::add(&self.metrics.pasv_binds, 1);
+                self.record_pasv_bind();
                 let adv = self.advertised_addr(local);
                 self.data_mode = DataMode::Passive {
                     binding: id,
@@ -510,7 +608,7 @@ impl FtpControlHandler {
         }
         match self.runtime.add_tcp_listener(cfg) {
             Ok((local, id)) => {
-                FtpServerMetrics::add(&self.metrics.pasv_binds, 1);
+                self.record_pasv_bind();
                 self.data_mode = DataMode::Passive {
                     binding: id,
                     local,
@@ -658,9 +756,16 @@ impl FtpControlHandler {
         };
         self.app.transfer_starting(&path, false, None, &self.meta);
         let observer = self.app.transfer_observer(&self.meta);
+        let telemetry = self.begin_transfer_telemetry("download");
         self.send_reply(endpoint, 150, "Opening data connection");
         let bridge = self.ensure_bridge();
-        bridge.queue_outbound(OutboundTransfer::Retr { ascii, reader, path, observer });
+        bridge.queue_outbound(OutboundTransfer::Retr {
+            ascii,
+            reader,
+            path,
+            observer,
+            telemetry,
+        });
         // Passive binding can go after accept; leave until transfer done / ABOR.
     }
 
@@ -731,6 +836,7 @@ impl FtpControlHandler {
             .clone()
             .and_then(|user| self.app.quota_manager().map(|qm| (qm, user)));
         let ascii = self.transfer_type == TransferType::Ascii;
+        let telemetry = self.begin_transfer_telemetry("upload");
         let msg = opening.unwrap_or("Opening data connection");
         self.send_reply(endpoint, 150, msg);
         self.ensure_bridge().queue_stor(StorTransfer {
@@ -739,6 +845,7 @@ impl FtpControlHandler {
             writer,
             observer,
             quota,
+            telemetry,
         });
     }
 
@@ -815,10 +922,12 @@ impl FtpControlHandler {
             return;
         };
         let body = self.format_list_body(&entries, names_only);
+        let telemetry = self.begin_transfer_telemetry("listing");
         self.send_reply(endpoint, 150, "Opening data connection");
         self.ensure_bridge()
             .queue_outbound(OutboundTransfer::Listing {
                 body: encode_text(&body, self.utf8),
+                telemetry,
             });
     }
 
@@ -919,10 +1028,12 @@ impl FtpControlHandler {
             body.push_str(&name);
             body.push_str("\r\n");
         }
+        let telemetry = self.begin_transfer_telemetry("listing");
         self.send_reply(endpoint, 150, "Opening data connection");
         self.ensure_bridge()
             .queue_outbound(OutboundTransfer::Listing {
                 body: encode_text(&body, self.utf8),
+                telemetry,
             });
     }
 
@@ -1181,6 +1292,7 @@ impl FtpControlHandler {
 impl ProtocolHandler for FtpControlHandler {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
         FtpServerMetrics::add(&self.metrics.connections, 1);
+        self.begin_connection_telemetry();
         self.control_handle = Some(endpoint.handle());
         if let Ok(peer) = endpoint.remote_addr() {
             self.meta.peer = peer;
@@ -1207,6 +1319,7 @@ impl ProtocolHandler for FtpControlHandler {
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
         self.clear_pasv();
+        self.end_connection_telemetry();
         self.app.disconnected(&self.meta);
     }
 
@@ -1306,5 +1419,64 @@ mod tests {
             Err(EprtError::ProtocolNotSupported { .. })
         ));
         let _ = Ipv6Addr::LOCALHOST;
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use crate::server::handler::FilesystemFtpHandler;
+    use hopf_auth::PasswordTrustPolicy;
+    use hopf_core::{Runtime, RuntimeConfig};
+    use hopf_otel::{OtelConfig, SpanContext, TelemetryPipeline};
+
+    #[test]
+    fn with_telemetry_sets_parseable_traceparent_on_connect() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-ftp-tp-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let root = tempfile::tempdir().unwrap();
+        let cfg = OtelConfig::new("ftp-tp-test")
+            .with_jsonl_traces(&dir)
+            .with_jsonl_metrics(&dir);
+        let pipeline = TelemetryPipeline::start(cfg).unwrap();
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let peer: SocketAddr = "127.0.0.1:2121".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2121".parse().unwrap();
+        let policy = PasswordTrustPolicy::default().with_user("u", "p").shared();
+        let app = Box::new(FilesystemFtpHandler::new(root.path(), policy.clone()).unwrap());
+        let mut h = FtpControlHandler::new(
+            app,
+            rt,
+            FtpServerMetrics::shared(),
+            FtpConfig::new(local, root.path(), policy),
+            peer,
+            local,
+        )
+        .with_telemetry(
+            Some(pipeline.ftp_metrics()),
+            Some(pipeline.export_handle()),
+            true,
+        );
+        h.begin_connection_telemetry();
+        let tp = h.meta.traceparent.clone().expect("traceparent set");
+        let ctx = SpanContext::from_traceparent(&tp).expect("valid traceparent");
+        assert!(!ctx.trace_id.iter().all(|&b| b == 0));
+
+        let xfer = h
+            .begin_transfer_telemetry("download")
+            .expect("transfer telemetry");
+        let xfer_tp = h.meta.traceparent.clone().expect("xfer traceparent");
+        let xfer_ctx = SpanContext::from_traceparent(&xfer_tp).unwrap();
+        assert_eq!(xfer_ctx.trace_id, ctx.trace_id);
+        assert_ne!(xfer_ctx.span_id, ctx.span_id);
+        xfer.finish(true, 0);
+
+        h.end_connection_telemetry();
+        assert!(h.meta.traceparent.is_none());
+        pipeline.shutdown();
+        let _ = std::fs::remove_file(&dir);
     }
 }

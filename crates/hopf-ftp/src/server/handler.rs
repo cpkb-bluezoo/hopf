@@ -21,6 +21,13 @@ pub struct FtpConnectionMetadata {
     pub user: Option<String>,
     /// Control channel has TLS.
     pub tls: bool,
+    /// W3C `traceparent` for the active span when OTel traces are enabled.
+    ///
+    /// Pass to outbound HTTP clients (for example
+    /// `hopf_otel::with_traceparent`) so microservice calls continue the
+    /// distributed trace. Timing/duration stay in telemetry — this field is
+    /// propagation identity only.
+    pub traceparent: Option<String>,
 }
 
 /// Authentication outcome.
