@@ -16,7 +16,7 @@ pub use tcp::{TcpDnsClientTransport, TcpDnsConnectionPool};
 pub use udp::UdpDnsClientTransport;
 
 #[cfg(feature = "doq")]
-pub use doq::DoqClientTransport;
+pub use doq::{DoqClientTransport, DoqConnectionPool};
 #[cfg(feature = "doh")]
 pub use doh::DohClientTransport;
 
@@ -149,12 +149,12 @@ struct PendingQuery {
     #[cfg_attr(not(feature = "dnssec"), allow(dead_code))]
     cd: bool,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Keeps a DoQ/DoH transport's live driver/connection alive for as
+    /// Keeps a DoH transport's live driver/connection alive for as
     /// long as this query is outstanding (dropping
-    /// [`DoqClientTransport`]/[`DohClientTransport`] mid-flight would tear
-    /// the connection down before a response can arrive — see
-    /// [`send_query_to_server`]). `None` for UDP/TCP/DoT, which need no
-    /// such handle.
+    /// [`DohClientTransport`] mid-flight would tear the connection down
+    /// before a response can arrive — see [`send_query_to_server`]).
+    /// `None` for UDP/TCP/DoT/DoQ — DoQ's connection lives in
+    /// [`ResolverInner`]'s pool for the lifetime of the resolver.
     active_transport: Option<Box<dyn std::any::Any + Send>>,
 }
 
@@ -363,6 +363,9 @@ struct ResolverInner {
     use_bailiwick: bool,
     tcp_fallback: bool,
     tcp_pool: TcpDnsConnectionPool,
+    /// Live DoQ QUIC connections reused across queries (RFC 9250 §5.5.1).
+    #[cfg(feature = "doq")]
+    doq_pool: doq::DoqConnectionPool,
     #[cfg(feature = "dnssec")]
     dnssec_enabled: bool,
     #[cfg(feature = "dnssec")]
@@ -394,6 +397,8 @@ impl DnsResolver {
                 use_bailiwick: true,
                 tcp_fallback: true,
                 tcp_pool: TcpDnsConnectionPool::new(),
+                #[cfg(feature = "doq")]
+                doq_pool: doq::DoqConnectionPool::new(),
                 #[cfg(feature = "dnssec")]
                 dnssec_enabled: false,
                 #[cfg(feature = "dnssec")]
@@ -474,6 +479,8 @@ impl DnsResolver {
     /// Add a DNS-over-QUIC (RFC 9250) upstream: every query/retry/CNAME
     /// chase step sent to `addr` dials fresh via QUIC (SNI `server_name`,
     /// `client_config` — its ALPN should advertise `doq`) instead of UDP.
+    /// Connections are pooled and reused across queries (RFC 9250 §5.5.1),
+    /// with one bidirectional stream per query.
     #[cfg(feature = "doq")]
     pub fn add_server_doq(
         &self,
@@ -930,15 +937,16 @@ fn send_udp_query(
 /// Dispatch one query attempt to whichever transport `server_idx` is
 /// configured for, returning an opaque handle the caller must fold into
 /// the resulting [`PendingQuery::active_transport`] — dropping it early
-/// would tear down an in-flight DoQ/DoH connection before its response can
+/// would tear down an in-flight DoH connection before its response can
 /// arrive (see [`PendingQuery::active_transport`]'s doc comment).
 ///
 /// UDP and DoT are fire-and-forget from the caller's point of view (UDP
 /// sends synchronously via the reactor; DoT spawns a dedicated thread and
 /// drives the whole exchange itself, matching the existing UDP-truncation
-/// TCP-fallback pattern) — both return `Ok(None)`. DoQ/DoH are also
-/// fire-and-forget (per [`DnsClientTransport::send_query`]'s contract) but
-/// need their transport instance kept alive, so they return `Ok(Some(_))`.
+/// TCP-fallback pattern) — both return `Ok(None)`. DoQ reuses a pooled
+/// connection owned by [`ResolverInner::doq_pool`], so it also returns
+/// `Ok(None)`. DoH still needs its transport instance kept alive for the
+/// duration of the query, so it returns `Ok(Some(_))`.
 #[cfg_attr(
     not(any(feature = "dot", feature = "doq", feature = "doh")),
     allow(unused_variables)
@@ -963,7 +971,6 @@ fn send_query_to_server(
         }
         #[cfg(feature = "doq")]
         ServerTransport::Doq { server_name, client_config } => {
-            let mut transport = doq::DoqClientTransport::new(client_config, server_name);
             let msg = build_query_message(g, id, question, None);
             let bytes = msg
                 .serialize()
@@ -972,8 +979,9 @@ fn send_query_to_server(
                 inner: Arc::clone(inner),
                 id,
             });
-            transport.send_query(server.addr, &bytes, handler)?;
-            Ok(Some(Box::new(transport)))
+            g.doq_pool
+                .send_query(server.addr, &client_config, &server_name, &bytes, handler)?;
+            Ok(None)
         }
         #[cfg(feature = "doh")]
         ServerTransport::Doh { runtime, host, path, connector, use_get } => {
@@ -1323,6 +1331,8 @@ mod tests {
             use_bailiwick: true,
             tcp_fallback: true,
             tcp_pool: TcpDnsConnectionPool::new(),
+            #[cfg(feature = "doq")]
+            doq_pool: doq::DoqConnectionPool::new(),
             #[cfg(feature = "dnssec")]
             dnssec_enabled: false,
             #[cfg(feature = "dnssec")]
@@ -1428,6 +1438,8 @@ mod tests {
             use_bailiwick: false, // bailiwick would strip an out-of-zone A for this synthetic name
             tcp_fallback: true,
             tcp_pool: TcpDnsConnectionPool::new(),
+            #[cfg(feature = "doq")]
+            doq_pool: doq::DoqConnectionPool::new(),
             dnssec_enabled: true,
             dnssec: Some(validator),
         }
