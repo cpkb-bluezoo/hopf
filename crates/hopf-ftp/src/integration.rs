@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use hopf_auth::PasswordTrustPolicy;
 use hopf_core::{Runtime, RuntimeConfig};
-use hopf_quota::QuotaManager as _;
+use hopf_core::QuotaManager as _;
 
 use crate::{
     BasicFtpFileSystem, DirectoryChange, FtpAbortHandle, FtpAuthResult, FtpClient,
@@ -818,7 +818,7 @@ struct AuthzTestHandler {
     denied: FtpOperation,
     disconnected: Arc<Mutex<bool>>,
     observer: Option<Arc<dyn TransferObserver>>,
-    quota: Option<Arc<dyn hopf_quota::QuotaManager>>,
+    quota: Option<Arc<dyn hopf_core::QuotaManager>>,
 }
 
 impl FtpConnectionHandler for AuthzTestHandler {
@@ -864,7 +864,7 @@ impl FtpConnectionHandler for AuthzTestHandler {
         self.observer.clone()
     }
 
-    fn quota_manager(&self) -> Option<Arc<dyn hopf_quota::QuotaManager>> {
+    fn quota_manager(&self) -> Option<Arc<dyn hopf_core::QuotaManager>> {
         self.quota.clone()
     }
 }
@@ -874,7 +874,7 @@ struct AuthzTestHandlerFactory {
     denied: FtpOperation,
     disconnected: Arc<Mutex<bool>>,
     observer: Option<Arc<dyn TransferObserver>>,
-    quota: Option<Arc<dyn hopf_quota::QuotaManager>>,
+    quota: Option<Arc<dyn hopf_core::QuotaManager>>,
 }
 
 impl FtpConnectionHandlerFactory for AuthzTestHandlerFactory {
@@ -902,7 +902,7 @@ fn start_server_with_authz_ext(
     denied: FtpOperation,
     disconnected: Arc<Mutex<bool>>,
     observer: Option<Arc<dyn TransferObserver>>,
-    quota: Option<Arc<dyn hopf_quota::QuotaManager>>,
+    quota: Option<Arc<dyn hopf_core::QuotaManager>>,
 ) -> (Arc<Runtime>, SocketAddr) {
     let policy = PasswordTrustPolicy::default(); // unused: AuthzTestHandler authenticates itself
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -1071,7 +1071,7 @@ fn transfer_observer_sees_progress_and_completion_for_upload_and_download() {
 #[test]
 fn quota_blocks_upload_once_a_user_is_already_over_limit() {
     let dir = tempfile::tempdir().unwrap();
-    let quota = Arc::new(hopf_quota::MemoryQuotaManager::new());
+    let quota = Arc::new(hopf_core::MemoryQuotaManager::new());
     quota.set_user_quota("u", 10, -1);
     quota.record_bytes_added("u", 10); // already at the limit
 
@@ -1080,7 +1080,7 @@ fn quota_blocks_upload_once_a_user_is_already_over_limit() {
         FtpOperation::Admin,
         Arc::new(Mutex::new(false)),
         None,
-        Some(quota as Arc<dyn hopf_quota::QuotaManager>),
+        Some(quota as Arc<dyn hopf_core::QuotaManager>),
     );
 
     let err = run_put(&rt, bound, "/blocked.txt", b"more data".to_vec()).unwrap_err();
@@ -1094,9 +1094,9 @@ fn quota_blocks_upload_once_a_user_is_already_over_limit() {
 #[test]
 fn quota_usage_is_recorded_on_upload_and_delete() {
     let dir = tempfile::tempdir().unwrap();
-    let quota = Arc::new(hopf_quota::MemoryQuotaManager::new());
+    let quota = Arc::new(hopf_core::MemoryQuotaManager::new());
     quota.set_user_quota("u", 1_000_000, -1);
-    let quota_dyn: Arc<dyn hopf_quota::QuotaManager> = quota.clone();
+    let quota_dyn: Arc<dyn hopf_core::QuotaManager> = quota.clone();
 
     let (rt, bound) = start_server_with_authz_ext(
         dir.path(),

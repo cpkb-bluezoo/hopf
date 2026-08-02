@@ -90,7 +90,7 @@ impl QuotaManager for UnlimitedQuotaManager {
     }
 }
 
-/// Adapts a shared [`hopf_quota::QuotaManager`] — bytes + message count,
+/// Adapts a shared [`hopf_core::QuotaManager`] — bytes + message count,
 /// not RFC 9208-shaped — to IMAP's `STORAGE`/`MESSAGE` resource view.
 /// Share the same backend with an `hopf-ftp` service
 /// (`FilesystemFtpHandler::with_quota`/`FilesystemFtpHandlerFactory::with_quota`)
@@ -100,12 +100,12 @@ impl QuotaManager for UnlimitedQuotaManager {
 /// `STORAGE` is in KiB on the wire (RFC 9208 §3), converted to/from the
 /// backend's bytes; `MESSAGE` is a plain count on both sides.
 pub struct MemoryQuotaManager {
-    inner: Arc<dyn hopf_quota::QuotaManager>,
+    inner: Arc<dyn hopf_core::QuotaManager>,
 }
 
 impl MemoryQuotaManager {
     /// Wrap a shared quota backend.
-    pub fn new(inner: Arc<dyn hopf_quota::QuotaManager>) -> Self {
+    pub fn new(inner: Arc<dyn hopf_core::QuotaManager>) -> Self {
         Self { inner }
     }
 }
@@ -118,7 +118,7 @@ impl QuotaManager for MemoryQuotaManager {
     fn set_quota(&self, username: &str, resources: BTreeMap<String, i64>) -> Result<Quota, String> {
         let current = self.inner.get_quota(username);
         let storage_limit_bytes = match resources.get("STORAGE") {
-            Some(&kib) if kib < 0 => hopf_quota::UNLIMITED,
+            Some(&kib) if kib < 0 => hopf_core::UNLIMITED,
             Some(&kib) => kib * 1024,
             None => current.storage_limit(),
         };
@@ -131,7 +131,7 @@ impl QuotaManager for MemoryQuotaManager {
     }
 }
 
-fn quota_from_shared(q: &hopf_quota::Quota) -> Quota {
+fn quota_from_shared(q: &hopf_core::Quota) -> Quota {
     let mut resources = BTreeMap::new();
     resources.insert(
         "STORAGE".to_string(),
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn memory_set_get() {
-        let mgr = MemoryQuotaManager::new(Arc::new(hopf_quota::MemoryQuotaManager::new()));
+        let mgr = MemoryQuotaManager::new(Arc::new(hopf_core::MemoryQuotaManager::new()));
         let mut limits = BTreeMap::new();
         limits.insert("STORAGE".into(), 100); // KiB
         mgr.set_quota("alice", limits).unwrap();
@@ -206,11 +206,11 @@ mod tests {
     #[test]
     fn memory_manager_shares_usage_with_the_underlying_backend() {
         // The point of the adapter: something else writing bytes through the
-        // shared `hopf_quota::QuotaManager` directly (e.g. an FTP upload for
+        // shared `hopf_core::QuotaManager` directly (e.g. an FTP upload for
         // the same user) is visible from the IMAP side without any IMAP
         // command having run.
-        let shared = Arc::new(hopf_quota::MemoryQuotaManager::new());
-        use hopf_quota::QuotaManager as _;
+        let shared = Arc::new(hopf_core::MemoryQuotaManager::new());
+        use hopf_core::QuotaManager as _;
         shared.set_user_quota("bob", 10 * 1024, -1); // 10 KiB
         shared.record_bytes_added("bob", 2048); // 2 KiB used, from "elsewhere"
 
