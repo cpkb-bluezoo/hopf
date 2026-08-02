@@ -8,11 +8,13 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+pub mod codec;
 pub mod framing;
 pub mod proto;
 pub mod server;
 
 pub use client::{GrpcClient, GrpcResponseHandler, GrpcUnaryCall};
+pub use codec::{parse_grpc_content_type, GrpcCodec};
 pub use framing::{
     frame, framed_size, GrpcEventHandler, GrpcFrameParser, DEFAULT_MAX_MESSAGE_SIZE,
 };

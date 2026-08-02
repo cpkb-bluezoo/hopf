@@ -4,34 +4,18 @@
 
 use std::sync::{Arc, Mutex};
 
-use rprotobuf::{Buffer, Parser, Writer};
 use hopf_http::{Headers, ServerHandler, ServerHandlerFactory, ServerWriter};
+use rjsonparser::Parser as JsonParser;
+use rprotobuf::{Buffer, Parser as ProtoParser, Writer as ProtoWriter};
 
+use crate::codec::{parse_grpc_content_type, GrpcCodec};
 use crate::framing::{frame, GrpcEventHandler, GrpcFrameParser, DEFAULT_MAX_MESSAGE_SIZE};
 use crate::proto::{
-    ProtoFile, ProtoMessageHandler, ProtoModelAdapter, ProtoModelSerializer, ProtoParseError,
-    ScalarValue,
+    JsonModelAdapter, JsonModelSerializer, ProtoFile, ProtoMessageHandler, ProtoModelAdapter,
+    ProtoModelSerializer, ProtoParseError, ScalarValue,
 };
 
-const CONTENT_TYPE_GRPC: &str = "application/grpc";
-const CONTENT_TYPE_GRPC_PROTO: &str = "application/grpc+proto";
 const GRPC_STATUS_UNIMPLEMENTED: i32 = 12;
-
-/// Accept only protobuf gRPC media types (`application/grpc` /
-/// `application/grpc+proto`), optionally with parameters after `;`.
-///
-/// Other subtypes (e.g. `application/grpc+json`) and near-misses such as
-/// `application/grpc-web` are rejected — hopf only decodes protobuf wire
-/// format.
-fn is_supported_grpc_content_type(ct: &str) -> bool {
-    let media = ct
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    media == CONTENT_TYPE_GRPC || media == CONTENT_TYPE_GRPC_PROTO
-}
 
 /// Application SPI for unary RPC handling.
 pub trait GrpcService: Send + Sync {
@@ -52,6 +36,7 @@ pub struct GrpcResponseChannel {
 struct ChannelInner {
     proto_file: Arc<ProtoFile>,
     response_type_name: Option<String>,
+    codec: GrpcCodec,
     pending: Option<PendingResponse>,
     sent: bool,
 }
@@ -62,11 +47,16 @@ enum PendingResponse {
 }
 
 impl GrpcResponseChannel {
-    fn new(proto_file: Arc<ProtoFile>, response_type_name: Option<String>) -> Self {
+    fn new(
+        proto_file: Arc<ProtoFile>,
+        response_type_name: Option<String>,
+        codec: GrpcCodec,
+    ) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ChannelInner {
                 proto_file,
                 response_type_name,
+                codec,
                 pending: None,
                 sent: false,
             })),
@@ -75,6 +65,11 @@ impl GrpcResponseChannel {
 
     fn take_pending(&self) -> Option<PendingResponse> {
         self.inner.lock().unwrap().pending.take()
+    }
+
+    /// Negotiated response codec (`Proto` or `Json`).
+    pub fn codec(&self) -> GrpcCodec {
+        self.inner.lock().unwrap().codec
     }
 }
 
@@ -93,12 +88,21 @@ impl GrpcResponseChannel {
             .or_else(|| g.response_type_name.clone())
             .ok_or_else(|| "unknown response message type".to_string())?;
         let proto_file = Arc::clone(&g.proto_file);
+        let codec = g.codec;
         let inner = Arc::clone(&self.inner);
         drop(g);
         Ok(GrpcResponseMessage {
             type_name,
-            serializer: ProtoModelSerializer::new((*proto_file).clone()),
-            writer: Writer::buffer(4096),
+            body: match codec {
+                GrpcCodec::Proto => ResponseBody::Proto {
+                    serializer: ProtoModelSerializer::new((*proto_file).clone()),
+                    writer: ProtoWriter::buffer(4096),
+                },
+                GrpcCodec::Json => ResponseBody::Json {
+                    serializer: JsonModelSerializer::new((*proto_file).clone()),
+                    writer: rjsonparser::Writer::buffer(4096),
+                },
+            },
             started: false,
             inner,
         })
@@ -123,36 +127,87 @@ impl GrpcResponseChannel {
     }
 }
 
+enum ResponseBody {
+    Proto {
+        serializer: ProtoModelSerializer,
+        writer: ProtoWriter<Buffer>,
+    },
+    Json {
+        serializer: JsonModelSerializer,
+        writer: rjsonparser::Writer<Vec<u8>>,
+    },
+}
+
 /// Encoder handle for one unary response message.
 pub struct GrpcResponseMessage {
     type_name: String,
-    serializer: ProtoModelSerializer,
-    writer: Writer<Buffer>,
+    body: ResponseBody,
     started: bool,
     inner: Arc<Mutex<ChannelInner>>,
 }
 
 impl GrpcResponseMessage {
-    pub fn serializer(&mut self) -> &mut ProtoModelSerializer {
-        &mut self.serializer
+    /// Protobuf wire serializer (only when the negotiated codec is [`GrpcCodec::Proto`]).
+    pub fn serializer(&mut self) -> Result<&mut ProtoModelSerializer, String> {
+        match &mut self.body {
+            ResponseBody::Proto { serializer, .. } => Ok(serializer),
+            ResponseBody::Json { .. } => {
+                Err("protobuf serializer unavailable for application/grpc+json".into())
+            }
+        }
     }
 
-    pub fn writer(&mut self) -> Result<&mut Writer<Buffer>, String> {
+    /// Protobuf wire writer (only when the negotiated codec is [`GrpcCodec::Proto`]).
+    pub fn writer(&mut self) -> Result<&mut ProtoWriter<Buffer>, String> {
         self.ensure_started()?;
-        Ok(&mut self.writer)
+        match &mut self.body {
+            ResponseBody::Proto { writer, .. } => Ok(writer),
+            ResponseBody::Json { .. } => {
+                Err("protobuf writer unavailable for application/grpc+json".into())
+            }
+        }
     }
 
     pub fn field(&mut self, name: &str, value: ScalarValue) -> Result<(), String> {
         self.ensure_started()?;
-        self.serializer
-            .field(&mut self.writer, name, value)
-            .map_err(|e| e.to_string())
+        match &mut self.body {
+            ResponseBody::Proto {
+                serializer,
+                writer,
+            } => serializer
+                .field(writer, name, value)
+                .map_err(|e| e.to_string()),
+            ResponseBody::Json {
+                serializer,
+                writer,
+            } => serializer
+                .field(writer, name, value)
+                .map_err(|e| e.to_string()),
+        }
     }
 
     pub fn complete(mut self) -> Result<(), String> {
         self.ensure_started()?;
-        self.serializer.end_message();
-        let bytes = std::mem::replace(&mut self.writer, Writer::buffer(0)).finish();
+        let bytes = match &mut self.body {
+            ResponseBody::Proto {
+                serializer,
+                writer,
+            } => {
+                serializer.end_message();
+                std::mem::replace(writer, ProtoWriter::buffer(0)).finish()
+            }
+            ResponseBody::Json {
+                serializer,
+                writer,
+            } => {
+                serializer
+                    .end_message(writer)
+                    .map_err(|e| e.to_string())?;
+                std::mem::replace(writer, rjsonparser::Writer::buffer(0))
+                    .finish()
+                    .map_err(|e| e.to_string())?
+            }
+        };
         let mut g = self.inner.lock().unwrap();
         if g.sent {
             return Err("response already sent".into());
@@ -163,17 +218,30 @@ impl GrpcResponseMessage {
     }
 
     fn ensure_started(&mut self) -> Result<(), String> {
-        if !self.started {
-            self.serializer
-                .start_message(&self.type_name)
-                .map_err(|e| e.to_string())?;
-            self.started = true;
+        if self.started {
+            return Ok(());
         }
+        match &mut self.body {
+            ResponseBody::Proto { serializer, .. } => {
+                serializer
+                    .start_message(&self.type_name)
+                    .map_err(|e| e.to_string())?;
+            }
+            ResponseBody::Json {
+                serializer,
+                writer,
+            } => {
+                serializer
+                    .start_message(writer, &self.type_name)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        self.started = true;
         Ok(())
     }
 }
 
-/// Factory that routes `POST` + `application/grpc` to [`GrpcHandler`].
+/// Factory that routes `POST` + supported gRPC Content-Types to [`GrpcHandler`].
 pub struct GrpcHandlerFactory {
     proto_file: Arc<ProtoFile>,
     service: Arc<dyn GrpcService>,
@@ -203,6 +271,7 @@ impl ServerHandlerFactory for GrpcHandlerFactory {
             path: String::new(),
             request_type_name: None,
             response_type_name: None,
+            codec: GrpcCodec::Proto,
             content_ok: false,
             body_started: false,
             body_rejected: false,
@@ -212,8 +281,13 @@ impl ServerHandlerFactory for GrpcHandlerFactory {
     }
 }
 
+enum MessageDecoder {
+    Proto(ProtoModelAdapter<Box<dyn ProtoMessageHandler>>),
+    Json(JsonModelAdapter<Box<dyn ProtoMessageHandler>>),
+}
+
 struct DecodeState {
-    adapter: ProtoModelAdapter<Box<dyn ProtoMessageHandler>>,
+    decoder: MessageDecoder,
     frame_parser: Option<GrpcFrameParser<FrameAccum>>,
     message_done: bool,
 }
@@ -248,6 +322,7 @@ struct GrpcHandler {
     path: String,
     request_type_name: Option<String>,
     response_type_name: Option<String>,
+    codec: GrpcCodec,
     content_ok: bool,
     body_started: bool,
     body_rejected: bool,
@@ -263,11 +338,12 @@ impl GrpcHandler {
         let Some(pending) = channel.take_pending() else {
             return;
         };
+        let ct = self.codec.content_type();
         match pending {
             PendingResponse::Error { status, message } => {
                 let mut h = Headers::new();
                 h.status(200);
-                h.set("content-type", CONTENT_TYPE_GRPC);
+                h.set("content-type", ct);
                 h.set("grpc-status", status.to_string());
                 h.set("grpc-message", message);
                 response.headers(h);
@@ -276,7 +352,7 @@ impl GrpcHandler {
             PendingResponse::Framed(body) => {
                 let mut h = Headers::new();
                 h.status(200);
-                h.set("content-type", CONTENT_TYPE_GRPC);
+                h.set("content-type", ct);
                 response.headers(h);
                 response.start_response_body();
                 response.response_body_content(&body);
@@ -312,15 +388,28 @@ impl GrpcHandler {
             return Err(err);
         }
         let mut slice = accum.buf.as_slice();
-        {
-            let mut pb = Parser::new(&mut decode.adapter);
-            pb.receive(&mut slice).map_err(|e| e.to_string())?;
-            pb.close().map_err(|e| e.to_string())?;
+        match &mut decode.decoder {
+            MessageDecoder::Proto(adapter) => {
+                {
+                    let mut pb = ProtoParser::new(adapter);
+                    pb.receive(&mut slice).map_err(|e| e.to_string())?;
+                    pb.close().map_err(|e| e.to_string())?;
+                }
+                adapter
+                    .end_root_message()
+                    .map_err(|e: ProtoParseError| e.to_string())?;
+            }
+            MessageDecoder::Json(adapter) => {
+                {
+                    let mut jp = JsonParser::new(adapter);
+                    jp.receive(&mut slice).map_err(|e| e.to_string())?;
+                    jp.close().map_err(|e| e.to_string())?;
+                }
+                adapter
+                    .end_root_message()
+                    .map_err(|e: ProtoParseError| e.to_string())?;
+            }
         }
-        decode
-            .adapter
-            .end_root_message()
-            .map_err(|e: ProtoParseError| e.to_string())?;
         decode.message_done = true;
         let mut frame_parser = GrpcFrameParser::new(FrameAccum {
             buf: Vec::new(),
@@ -338,7 +427,11 @@ impl ServerHandler for GrpcHandler {
         let method = headers.get(":method").unwrap_or("");
         let path = headers.get(":path").unwrap_or("").to_string();
         let ct = headers.get("content-type").unwrap_or("");
-        if method != "POST" || !is_supported_grpc_content_type(ct) {
+        let Some(codec) = parse_grpc_content_type(ct) else {
+            self.reject_http(response, 415, "gRPC requires POST application/grpc");
+            return;
+        };
+        if method != "POST" {
             self.reject_http(response, 415, "gRPC requires POST application/grpc");
             return;
         }
@@ -348,6 +441,7 @@ impl ServerHandler for GrpcHandler {
         }
 
         self.path = path.clone();
+        self.codec = codec;
         self.content_ok = true;
         if let Some(rpc) = self.proto_file.get_rpc_by_path(&path) {
             self.request_type_name = Some(rpc.input_type_name.clone());
@@ -369,10 +463,9 @@ impl ServerHandler for GrpcHandler {
         let channel = GrpcResponseChannel::new(
             Arc::clone(&self.proto_file),
             self.response_type_name.clone(),
+            self.codec,
         );
-        let handler = self
-            .service
-            .start_unary_call(&self.path, channel.clone());
+        let handler = self.service.start_unary_call(&self.path, channel.clone());
         self.channel = Some(channel);
         if handler.is_none() {
             self.channel
@@ -385,11 +478,26 @@ impl ServerHandler for GrpcHandler {
         }
         let handler = handler.unwrap();
         let request_type = self.request_type_name.clone().unwrap();
-        let mut adapter = ProtoModelAdapter::new((*self.proto_file).clone(), handler);
-        if let Err(e) = adapter.start_root_message(&request_type) {
-            self.reject_http(response, 400, &format!("Invalid request type: {e}"));
-            return;
-        }
+        let decoder = match self.codec {
+            GrpcCodec::Proto => {
+                let mut adapter =
+                    ProtoModelAdapter::new((*self.proto_file).clone(), handler);
+                if let Err(e) = adapter.start_root_message(&request_type) {
+                    self.reject_http(response, 400, &format!("Invalid request type: {e}"));
+                    return;
+                }
+                MessageDecoder::Proto(adapter)
+            }
+            GrpcCodec::Json => {
+                let mut adapter =
+                    JsonModelAdapter::new((*self.proto_file).clone(), handler);
+                if let Err(e) = adapter.start_root_message(&request_type) {
+                    self.reject_http(response, 400, &format!("Invalid request type: {e}"));
+                    return;
+                }
+                MessageDecoder::Json(adapter)
+            }
+        };
         let mut frame_parser = GrpcFrameParser::new(FrameAccum {
             buf: Vec::new(),
             error: None,
@@ -397,7 +505,7 @@ impl ServerHandler for GrpcHandler {
         });
         frame_parser.set_max_message_size(self.max_message_size);
         self.decode = Some(DecodeState {
-            adapter,
+            decoder,
             frame_parser: Some(frame_parser),
             message_done: false,
         });
@@ -469,27 +577,33 @@ impl ServerHandler for GrpcHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::parse_grpc_content_type;
 
     #[test]
-    fn accepts_bare_grpc_and_grpc_proto() {
-        assert!(is_supported_grpc_content_type("application/grpc"));
-        assert!(is_supported_grpc_content_type("application/grpc+proto"));
-        assert!(is_supported_grpc_content_type("Application/gRPC+Proto"));
-        assert!(is_supported_grpc_content_type("application/grpc; charset=utf-8"));
-        assert!(is_supported_grpc_content_type(
-            "application/grpc+proto; charset=utf-8"
-        ));
-        assert!(is_supported_grpc_content_type("  application/grpc  "));
+    fn accepts_proto_and_json_content_types() {
+        assert!(parse_grpc_content_type("application/grpc").is_some());
+        assert!(parse_grpc_content_type("application/grpc+proto").is_some());
+        assert!(parse_grpc_content_type("Application/gRPC+Proto").is_some());
+        assert!(parse_grpc_content_type("application/grpc; charset=utf-8").is_some());
+        assert!(parse_grpc_content_type("application/grpc+proto; charset=utf-8").is_some());
+        assert!(parse_grpc_content_type("  application/grpc  ").is_some());
+        assert_eq!(
+            parse_grpc_content_type("application/grpc+json"),
+            Some(GrpcCodec::Json)
+        );
+        assert_eq!(
+            parse_grpc_content_type("APPLICATION/GRPC+JSON; charset=utf-8"),
+            Some(GrpcCodec::Json)
+        );
     }
 
     #[test]
-    fn rejects_unsupported_subtypes_and_near_misses() {
-        assert!(!is_supported_grpc_content_type("application/grpc+json"));
-        assert!(!is_supported_grpc_content_type("application/grpc+thrift"));
-        assert!(!is_supported_grpc_content_type("application/grpc-web"));
-        assert!(!is_supported_grpc_content_type("application/grpc-web+proto"));
-        assert!(!is_supported_grpc_content_type("application/json"));
-        assert!(!is_supported_grpc_content_type(""));
-        assert!(!is_supported_grpc_content_type("text/plain"));
+    fn rejects_unsupported_content_types() {
+        assert!(parse_grpc_content_type("application/grpc+thrift").is_none());
+        assert!(parse_grpc_content_type("application/grpc-web").is_none());
+        assert!(parse_grpc_content_type("application/grpc-web+proto").is_none());
+        assert!(parse_grpc_content_type("application/json").is_none());
+        assert!(parse_grpc_content_type("").is_none());
+        assert!(parse_grpc_content_type("text/plain").is_none());
     }
 }

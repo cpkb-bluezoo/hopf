@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use super::json_names::proto_json_name;
 use super::{EnumDescriptor, FieldDescriptor};
 
 /// Descriptor for a protobuf message type.
@@ -20,6 +21,18 @@ impl MessageDescriptor {
         self.fields_by_number
             .get(&number)
             .map(|&i| &self.fields[i])
+    }
+
+    /// Lookup by proto field name.
+    pub fn field_by_name(&self, name: &str) -> Option<&FieldDescriptor> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+
+    /// Lookup by proto3 JSON key: original name or default lowerCamelCase `json_name`.
+    pub fn field_by_json_key(&self, key: &str) -> Option<&FieldDescriptor> {
+        self.fields.iter().find(|f| {
+            f.name == key || proto_json_name(&f.name) == key
+        })
     }
 
     pub fn builder() -> MessageDescriptorBuilder {
