@@ -6,9 +6,9 @@
 //! cargo run -p mqtt -- 127.0.0.1:1883
 //! ```
 //!
-//! No CONNECT authorization by default — pass `MqttConfig::with_credentials`
-//! (see `hopf-pop3`'s example for the `PasswordStore` pattern) or a custom
-//! `MqttHandlerFactory` to require auth.
+//! This demo calls [`MqttConfig::allow_anonymous`] so CONNECT works without
+//! a credential store. Production brokers should use
+//! [`MqttConfig::with_credentials`] instead (and omit `allow_anonymous`).
 
 use std::env;
 use std::io;
@@ -28,11 +28,11 @@ fn main() -> io::Result<()> {
 
     let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
     let broker = Arc::new(BrokerState::new());
-    let config = MqttConfig::new(addr, broker);
+    let config = MqttConfig::new(addr, broker).allow_anonymous();
     let svc = MqttService::new(config);
     let bound = svc.start(&rt)?;
 
-    eprintln!("mqtt broker on mqtt://{bound}/  (no auth — CONNECT accepted from anyone)");
+    eprintln!("mqtt broker on mqtt://{bound}/  (anonymous CONNECT — demo only)");
     eprintln!("press Enter to stop");
     let mut line = String::new();
     let _ = io::stdin().read_line(&mut line);

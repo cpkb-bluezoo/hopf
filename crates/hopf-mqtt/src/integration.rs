@@ -96,7 +96,7 @@ fn connect_subscribe_publish_fanout_round_trip() {
     })
     .unwrap();
     let broker = Arc::new(BrokerState::new());
-    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker);
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).allow_anonymous();
     let service = MqttService::new(config);
     let addr = service.start(&rt).unwrap();
 
@@ -156,7 +156,7 @@ fn qos1_subscriber_receives_large_multi_chunk_publish() {
     })
     .unwrap();
     let broker = Arc::new(BrokerState::new());
-    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker);
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).allow_anonymous();
     let service = MqttService::new(config);
     let addr = service.start(&rt).unwrap();
 
@@ -223,7 +223,9 @@ fn publish_over_max_payload_is_rejected() {
     })
     .unwrap();
     let broker = Arc::new(BrokerState::new());
-    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).with_max_publish_payload(8);
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker)
+        .allow_anonymous()
+        .with_max_publish_payload(8);
     let service = MqttService::new(config);
     let addr = service.start(&rt).unwrap();
 
@@ -259,7 +261,7 @@ fn retained_message_delivered_on_new_subscribe() {
     })
     .unwrap();
     let broker = Arc::new(BrokerState::new());
-    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker);
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).allow_anonymous();
     let service = MqttService::new(config);
     let addr = service.start(&rt).unwrap();
 
@@ -303,7 +305,7 @@ fn v5_session_resume_after_unclean_disconnect_preserves_subscription() {
     })
     .unwrap();
     let broker = Arc::new(BrokerState::new());
-    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker);
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).allow_anonymous();
     let service = MqttService::new(config);
     let addr = service.start(&rt).unwrap();
 
@@ -375,7 +377,7 @@ fn real_client_publishes_and_subscribes_against_real_server() {
         .unwrap(),
     );
     let broker = Arc::new(BrokerState::new());
-    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker);
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).allow_anonymous();
     let service = MqttService::new(config);
     let addr = service.start(&rt).unwrap();
 
@@ -502,14 +504,17 @@ fn ws_subscriber_and_tcp_publisher_share_broker_state() {
     let broker = Arc::new(BrokerState::new());
 
     // TCP listener: the publisher connects here.
-    let tcp_config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&broker));
+    let tcp_config =
+        MqttConfig::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&broker)).allow_anonymous();
     let tcp_service = MqttService::new(tcp_config);
     let tcp_addr = tcp_service.start(&rt).unwrap();
 
     // WS listener: the subscriber connects here, sharing the same broker.
-    let ws_config = Arc::new(MqttConfig::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&broker)));
+    let ws_config = Arc::new(
+        MqttConfig::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&broker)).allow_anonymous(),
+    );
     let ws_factory = Arc::new(WebSocketFactory::new(
-        MqttWsFactory::new(ws_config, Arc::new(DefaultMqttHandlerFactory::new(None))),
+        MqttWsFactory::new(ws_config, Arc::new(DefaultMqttHandlerFactory::new(None, true))),
         WebSocketConfig::default(),
     ));
     let (ws_addr, _) = rt

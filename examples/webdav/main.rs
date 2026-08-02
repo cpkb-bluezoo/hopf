@@ -5,7 +5,14 @@
 //! ```text
 //! cargo run -p webdav -- /tmp/webdav-root
 //! cargo run -p webdav -- 127.0.0.1:8080 /path/to/files
+//! WEBDAV_WRITE=1 cargo run -p webdav -- /tmp/webdav-root
 //! ```
+//!
+//! Write is **off** by default. This demo uses
+//! [`WebDavConfig::allow_unauthenticated_access`] for a cleartext loopback
+//! server; production deployments should wrap the factory in
+//! `hopf_http::BasicAuthFactory` / Digest / Bearer (or mTLS) instead of
+//! relying on that flag alone.
 
 use std::env;
 use std::io;
@@ -39,7 +46,7 @@ fn main() -> io::Result<()> {
     let addr = addr.unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap());
     let allow_write = env::var("WEBDAV_WRITE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let storage = Arc::new(StorageExecutor::new(StorageConfig::default()));
     let config = WebDavConfig {
@@ -48,6 +55,7 @@ fn main() -> io::Result<()> {
         webdav_enabled: true,
         welcome_file: "index.html".to_string(),
         dead_property_storage: DeadPropMode::Auto,
+        allow_unauthenticated_access: true,
         ..Default::default()
     };
     let factory: Arc<dyn ServerHandlerFactory> =
@@ -62,7 +70,7 @@ fn main() -> io::Result<()> {
     }))?;
 
     eprintln!(
-        "webdav serving {} on http://{bound} (write={allow_write})",
+        "webdav serving {} on http://{bound} (write={allow_write}, unauthenticated demo)",
         root.display()
     );
     eprintln!("press Enter to stop");
