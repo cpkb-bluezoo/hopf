@@ -217,6 +217,49 @@ impl Mailbox for MaildirMailbox {
         Ok(self.messages.len() as u32)
     }
 
+    fn refresh(&mut self) -> MailboxResult<()> {
+        let session_deleted: BTreeMap<String, bool> = self
+            .messages
+            .iter()
+            .map(|m| (m.filename.base.clone(), m.session_deleted))
+            .collect();
+
+        move_new_to_cur(&self.dir)?;
+        // Pick up flag/keyword changes and UIDASSIGN updates from other writers.
+        let default_uv = self.uidlist.uid_validity;
+        self.uidlist = UidList::load_or_new(&self.dir, default_uv)?;
+        self.keywords = KeywordsFile::load_or_empty(&self.dir)?;
+
+        let mut messages = Vec::new();
+        let cur = self.dir.join("cur");
+        for ent in fs::read_dir(&cur)? {
+            let ent = ent?;
+            let ft = ent.file_type()?;
+            if !ft.is_file() {
+                continue;
+            }
+            let fname = ent.file_name().to_string_lossy().into_owned();
+            let parsed = MaildirFilename::parse(&fname);
+            let meta = ent.metadata()?;
+            let size = meta.len();
+            let uid = self.uidlist.assign(&parsed.base);
+            let session_deleted = session_deleted
+                .get(&parsed.base)
+                .copied()
+                .unwrap_or(false);
+            messages.push(MdMsg {
+                path: ent.path(),
+                filename: parsed,
+                size,
+                uid,
+                session_deleted,
+            });
+        }
+        messages.sort_by_key(|m| m.uid);
+        self.messages = messages;
+        Ok(())
+    }
+
     fn mailbox_size(&self) -> MailboxResult<u64> {
         Ok(self.messages.iter().map(|m| m.size).sum())
     }
