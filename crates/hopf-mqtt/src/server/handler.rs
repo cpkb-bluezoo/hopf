@@ -1,19 +1,19 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Staged CONNECT handler SPI (Gumdrop shape, matching `hopf-pop3` /
-//! `hopf-imap`'s `HandlerFactory` pattern).
+//! Staged CONNECT / PUBLISH / SUBSCRIBE handler SPI (Gumdrop shape, matching
+//! `hopf-pop3` / `hopf-imap`'s `HandlerFactory` pattern).
 //!
-//! Only CONNECT is staged for now — PUBLISH and SUBSCRIBE authorization
-//! stay inline in `MqttControlHandler` (accept once connected, reject a
-//! malformed filter/topic). Staging those too, with the same `proceed` /
-//! `reject` shape POP3/IMAP use for their per-command SPI, is future work.
+//! Default implementations accept all traffic (subject to CONNECT
+//! username/password when a [`CredentialStore`] is configured). Custom
+//! factories override [`MqttHandlerFactory`] to install policy per stage.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hopf_auth::CredentialStore;
 
-use crate::codec::packet::{reason, ConnectPacket};
+use crate::codec::packet::{reason, ConnectPacket, QoS};
+use crate::codec::SubscribeFilter;
 
 /// Per-connection metadata visible to handlers.
 #[derive(Debug, Clone)]
@@ -45,6 +45,22 @@ pub enum ConnectDecision {
     Reject(u8),
 }
 
+/// A PUBLISH authorization decision.
+pub enum PublishDecision {
+    /// Allow the publish to proceed.
+    Accept,
+    /// Reject with a PUBACK/PUBREC reason code (MQTT 5) or disconnect (v3).
+    Reject(u8),
+}
+
+/// A single SUBSCRIBE filter authorization decision.
+pub enum SubscribeDecision {
+    /// Grant the subscription at the requested (or reduced) QoS.
+    Accept(QoS),
+    /// Reject this filter with a SUBACK reason code.
+    Reject(u8),
+}
+
 /// Authorizes each CONNECT. One instance per connection (built by
 /// [`MqttHandlerFactory::create`]), so implementations can hold
 /// per-connection state if needed (most won't).
@@ -57,10 +73,44 @@ pub trait ConnectHandler: Send {
     ) -> ConnectDecision;
 }
 
-/// Factory for [`ConnectHandler`] — one call per accepted TCP connection.
+/// Authorizes each PUBLISH (Gumdrop `PublishHandler` parity).
+pub trait PublishHandler: Send {
+    /// Decide whether to accept a publish to `topic`.
+    fn authorize(
+        &mut self,
+        client_id: &str,
+        topic: &str,
+        qos: QoS,
+        retain: bool,
+        meta: &MqttConnectionMetadata,
+    ) -> PublishDecision;
+}
+
+/// Authorizes each SUBSCRIBE filter (Gumdrop `SubscribeHandler` parity).
+pub trait SubscribeHandler: Send {
+    /// Decide whether to accept `filter` for `client_id`.
+    fn authorize(
+        &mut self,
+        client_id: &str,
+        filter: &SubscribeFilter,
+        meta: &MqttConnectionMetadata,
+    ) -> SubscribeDecision;
+}
+
+/// Factory for per-connection staged handlers.
 pub trait MqttHandlerFactory: Send + Sync {
-    /// Create the handler for a new connection.
+    /// Create the CONNECT handler for a new connection.
     fn create(&self) -> Box<dyn ConnectHandler>;
+
+    /// Create the PUBLISH handler for a new connection.
+    fn create_publish(&self) -> Box<dyn PublishHandler> {
+        Box::new(AcceptAllPublishHandler)
+    }
+
+    /// Create the SUBSCRIBE handler for a new connection.
+    fn create_subscribe(&self) -> Box<dyn SubscribeHandler> {
+        Box::new(AcceptAllSubscribeHandler)
+    }
 }
 
 /// Default: accept unconditionally, or require CONNECT username/password to
@@ -92,7 +142,37 @@ impl ConnectHandler for DefaultConnectHandler {
     }
 }
 
-/// Factory for [`DefaultConnectHandler`].
+/// Default PUBLISH policy: accept everything.
+pub struct AcceptAllPublishHandler;
+
+impl PublishHandler for AcceptAllPublishHandler {
+    fn authorize(
+        &mut self,
+        _client_id: &str,
+        _topic: &str,
+        _qos: QoS,
+        _retain: bool,
+        _meta: &MqttConnectionMetadata,
+    ) -> PublishDecision {
+        PublishDecision::Accept
+    }
+}
+
+/// Default SUBSCRIBE policy: accept everything at the requested QoS.
+pub struct AcceptAllSubscribeHandler;
+
+impl SubscribeHandler for AcceptAllSubscribeHandler {
+    fn authorize(
+        &mut self,
+        _client_id: &str,
+        filter: &SubscribeFilter,
+        _meta: &MqttConnectionMetadata,
+    ) -> SubscribeDecision {
+        SubscribeDecision::Accept(filter.max_qos)
+    }
+}
+
+/// Factory for [`DefaultConnectHandler`] (+ accept-all publish/subscribe).
 pub struct DefaultMqttHandlerFactory {
     credentials: Option<Arc<dyn CredentialStore>>,
 }

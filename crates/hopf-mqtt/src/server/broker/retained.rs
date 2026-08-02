@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::codec::{Properties, QoS};
 
@@ -28,6 +29,8 @@ pub struct RetainedMessage {
     pub payload_len: u64,
     /// MQTT 5.0 properties at the time it was retained.
     pub properties: Properties,
+    /// Absolute expiry deadline (Message Expiry Interval), if any.
+    pub expires_at: Option<Instant>,
 }
 
 impl Drop for RetainedMessage {
@@ -51,6 +54,8 @@ pub struct RetainedSnapshot {
     pub payload_len: u64,
     /// MQTT 5.0 properties at the time it was retained.
     pub properties: Properties,
+    /// Absolute expiry deadline (Message Expiry Interval), if any.
+    pub expires_at: Option<Instant>,
 }
 
 impl From<&RetainedMessage> for RetainedSnapshot {
@@ -60,6 +65,7 @@ impl From<&RetainedMessage> for RetainedSnapshot {
             path: msg.path.clone(),
             payload_len: msg.payload_len,
             properties: msg.properties.clone(),
+            expires_at: msg.expires_at,
         }
     }
 }
@@ -91,12 +97,26 @@ impl RetainedStore {
         path: Option<PathBuf>,
         payload_len: u64,
         properties: Properties,
+        expires_at: Option<Instant>,
     ) {
         match path {
             None => {
                 self.by_topic.remove(topic);
             }
             Some(path) => {
+                // Don't store an already-expired retained message.
+                if expires_at.is_some_and(|d| Instant::now() >= d) {
+                    self.by_topic.remove(topic);
+                    // Drop would delete `path`; take ownership into a temp so Drop runs.
+                    let _ = RetainedMessage {
+                        qos,
+                        path: Some(path),
+                        payload_len,
+                        properties,
+                        expires_at,
+                    };
+                    return;
+                }
                 self.by_topic.insert(
                     topic.to_string(),
                     RetainedMessage {
@@ -104,6 +124,7 @@ impl RetainedStore {
                         path: Some(path),
                         payload_len,
                         properties,
+                        expires_at,
                     },
                 );
             }
@@ -111,13 +132,19 @@ impl RetainedStore {
     }
 
     /// Every retained message whose topic matches `filter` (used when a
-    /// new SUBSCRIBE arrives — MQTT 3.1.1 §3.8.4).
-    pub fn matching(&self, filter: &str) -> Vec<(&str, RetainedSnapshot)> {
+    /// new SUBSCRIBE arrives — MQTT 3.1.1 §3.8.4). Expired entries are
+    /// purged as a side effect of matching.
+    pub fn matching(&mut self, filter: &str) -> Vec<(String, RetainedSnapshot)> {
+        let now = Instant::now();
+        self.by_topic.retain(|_, msg| match msg.expires_at {
+            Some(deadline) => now < deadline,
+            None => true,
+        });
         let filter_segments: Vec<&str> = filter.split('/').collect();
         self.by_topic
             .iter()
             .filter(|(topic, _)| topic_matches_filter(topic, &filter_segments))
-            .map(|(topic, msg)| (topic.as_str(), RetainedSnapshot::from(msg)))
+            .map(|(topic, msg)| (topic.clone(), RetainedSnapshot::from(msg)))
             .collect()
     }
 }
@@ -168,11 +195,11 @@ mod tests {
     fn set_then_clear_with_empty_payload() {
         let mut store = RetainedStore::new();
         let path = spool(b"hi");
-        store.publish("a/b", QoS::AtMostOnce, Some(path.clone()), 2, Properties::new());
+        store.publish("a/b", QoS::AtMostOnce, Some(path.clone()), 2, Properties::new(), None);
         assert_eq!(store.matching("a/b").len(), 1);
         assert!(path.exists());
 
-        store.publish("a/b", QoS::AtMostOnce, None, 0, Properties::new());
+        store.publish("a/b", QoS::AtMostOnce, None, 0, Properties::new(), None);
         assert!(store.matching("a/b").is_empty());
         // Clearing drops the old entry, deleting its spooled file.
         assert!(!path.exists());
@@ -182,9 +209,9 @@ mod tests {
     fn replacing_an_entry_deletes_the_old_spool_file() {
         let mut store = RetainedStore::new();
         let old_path = spool(b"old");
-        store.publish("a/b", QoS::AtMostOnce, Some(old_path.clone()), 3, Properties::new());
+        store.publish("a/b", QoS::AtMostOnce, Some(old_path.clone()), 3, Properties::new(), None);
         let new_path = spool(b"new");
-        store.publish("a/b", QoS::AtMostOnce, Some(new_path.clone()), 3, Properties::new());
+        store.publish("a/b", QoS::AtMostOnce, Some(new_path.clone()), 3, Properties::new(), None);
 
         assert!(!old_path.exists(), "old spool file should have been deleted");
         assert!(new_path.exists());
@@ -195,8 +222,8 @@ mod tests {
     #[test]
     fn matching_respects_wildcards_and_dollar_rule() {
         let mut store = RetainedStore::new();
-        store.publish("sport/tennis/player1", QoS::AtMostOnce, Some(spool(b"x")), 1, Properties::new());
-        store.publish("$SYS/uptime", QoS::AtMostOnce, Some(spool(b"y")), 1, Properties::new());
+        store.publish("sport/tennis/player1", QoS::AtMostOnce, Some(spool(b"x")), 1, Properties::new(), None);
+        store.publish("$SYS/uptime", QoS::AtMostOnce, Some(spool(b"y")), 1, Properties::new(), None);
 
         assert_eq!(store.matching("sport/tennis/+").len(), 1);
         assert_eq!(store.matching("sport/#").len(), 1);

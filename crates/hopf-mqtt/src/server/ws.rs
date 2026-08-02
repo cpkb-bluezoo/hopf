@@ -8,17 +8,10 @@
 //! subscribe to each other freely, since both register a real
 //! `hopf_core::ConnHandle` with the broker for cross-reactor fan-out.
 //!
-//! Two things are deliberately **not** shared with the TCP path, because
-//! `hopf_websocket::WsEventHandler` has no `Endpoint` / timer access (only
-//! an outbound byte buffer and, as of this crate, a `ConnHandle`):
-//!
-//! - **No keepalive / CONNACK-timeout enforcement.** A WS-connected client
-//!   that never sends CONNECT, or goes silent, is only ever reaped by
-//!   whatever HTTP/TCP-level idle handling exists underneath — MQTT's own
-//!   1.5x-Keep-Alive rule isn't enforced here.
-//! - **No Session Expiry.** An unclean WS disconnect always unregisters
-//!   immediately (as if Session Expiry were 0), never orphans — there's no
-//!   timer to schedule the reap with. Reconnecting always starts fresh.
+//! Timers (CONNECT timeout, keepalive, Session Expiry orphan reap, Will
+//! Delay, QoS retransmission) are scheduled via
+//! [`hopf_core::ConnHandle::schedule_timer`] — the WS event handler holds a
+//! framed `ConnHandle` but not a live `Endpoint` borrow.
 //!
 //! There's also a wire-level caveat inherited from `hopf-websocket`
 //! directly: it delivers a `binary_message` only for a single WebSocket
@@ -30,24 +23,29 @@
 //! reads) — this caveat is specifically about WS-level message
 //! fragmentation, which real MQTT-over-WS clients essentially never use.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::sync::Arc;
+use std::time::Duration;
 
-use hopf_core::ConnHandle;
+use hopf_core::{ConnHandle, TimerHandle};
 use hopf_http::Headers;
 use hopf_websocket::{framed_ws_conn_handle, WsEventHandler, WsEventHandlerFactory, WsFrameError, WsRole, WsSession};
 
 use crate::server::broker::{validate_topic_name, BrokerState, SubscriberId, UNLIMITED_RECEIVE_MAXIMUM};
+use crate::server::control::{
+    connack_properties, DEFAULT_QOS_RETRY_INTERVAL, PublishTelemetry, SERVER_TOPIC_ALIAS_MAXIMUM,
+};
+use crate::server::expiry::effective_will_delay;
 use crate::server::publish_spool::{publish_whole, PendingPublish};
 use crate::codec::packet::{reason, ConnectPacket, PublishHeader, QoS, SubscribeFilter, Will};
 use crate::codec::parser::{MqttFrameHandler, MqttFrameParser};
 use crate::codec::properties::property;
 use crate::codec::{encode, MqttError, Properties, ProtocolVersion};
 
-use crate::server::control::PublishTelemetry;
 use crate::server::{
     ConnectDecision, ConnectHandler, MqttConfig, MqttConnectionMetadata, MqttHandlerFactory,
+    PublishDecision, PublishHandler, SubscribeDecision, SubscribeHandler,
 };
 use crate::server::metrics::MqttServerMetrics;
 use hopf_otel::{
@@ -57,11 +55,20 @@ use std::net::SocketAddr;
 
 struct ConnectedWsSession {
     subscriber_id: SubscriberId,
+    client_id: String,
     version: ProtocolVersion,
     will: Option<Will>,
+    keep_alive: Duration,
+    keepalive_timer: Option<TimerHandle>,
+    session_expiry: Duration,
     graceful_disconnect: bool,
     awaiting_pubrel: HashSet<u16>,
     pending_publish: Option<PendingPublish>,
+    inbound_aliases: HashMap<u16, String>,
+    server_topic_alias_max: u16,
+    client_topic_alias_max: u16,
+    qos_retry_interval: Duration,
+    retransmit_timer: Option<TimerHandle>,
 }
 
 enum SessionState {
@@ -120,12 +127,13 @@ impl WsEventHandlerFactory for MqttWsFactory {
             parser,
             session: SessionState::AwaitingConnect,
             connect_handler: self.handler_factory.create(),
-            // Broker fan-out (`BrokerState::publish`/`deliver_retained`)
-            // delivers asynchronously from another connection's reactor via
-            // plain `ConnHandle::send`, which writes straight to the raw
-            // transport — wrap it so those deliveries come out as proper WS
-            // binary frames instead of raw MQTT bytes on the wire.
+            publish_handler: self.handler_factory.create_publish(),
+            subscribe_handler: self.handler_factory.create_subscribe(),
+            // Broker fan-out delivers asynchronously from another connection's
+            // reactor via plain `ConnHandle::send` — wrap so those deliveries
+            // come out as proper WS binary frames.
             conn: framed_ws_conn_handle(&conn, WsRole::Server),
+            connect_timeout_timer: None,
             metrics: Arc::clone(&self.metrics),
             meta: MqttConnectionMetadata {
                 peer: SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -150,7 +158,10 @@ pub struct MqttWsHandler {
     parser: MqttFrameParser,
     session: SessionState,
     connect_handler: Box<dyn ConnectHandler>,
+    publish_handler: Box<dyn PublishHandler>,
+    subscribe_handler: Box<dyn SubscribeHandler>,
     conn: ConnHandle,
+    connect_timeout_timer: Option<TimerHandle>,
     metrics: Arc<MqttServerMetrics>,
     meta: MqttConnectionMetadata,
     otel_metrics: Option<Arc<OtelMqttMetrics>>,
@@ -249,53 +260,142 @@ impl MqttWsHandler {
         }
     }
 
+    fn rearm_keepalive(&mut self) {
+        let SessionState::Connected(session) = &mut self.session else {
+            return;
+        };
+        if session.keep_alive.is_zero() {
+            return;
+        }
+        if let Some(old) = session.keepalive_timer.take() {
+            old.cancel();
+        }
+        let handle = self.conn.clone();
+        session.keepalive_timer = Some(self.conn.schedule_timer(
+            session.keep_alive,
+            Box::new(move || handle.close()),
+        ));
+    }
+
+    fn arm_retransmit_timer(&mut self) {
+        let SessionState::Connected(session) = &mut self.session else {
+            return;
+        };
+        if let Some(old) = session.retransmit_timer.take() {
+            old.cancel();
+        }
+        let interval = session.qos_retry_interval;
+        if interval.is_zero() {
+            return;
+        }
+        let broker = Arc::clone(&self.config.broker);
+        let id = session.subscriber_id;
+        let conn = self.conn.clone();
+        session.retransmit_timer = Some(schedule_qos_retry(conn, broker, id, interval));
+    }
+
     fn teardown(&mut self) {
         let SessionState::Connected(session) = &self.session else {
             self.end_connection_telemetry();
             return;
         };
-        if !session.graceful_disconnect {
-            if let Some(will) = &session.will {
-                publish_whole(
-                    &self.config.broker,
-                    Some(session.subscriber_id),
-                    &will.topic,
-                    &will.payload,
-                    will.qos,
-                    will.retain,
-                    &will.properties,
-                );
-            }
+        if let Some(timer) = &session.keepalive_timer {
+            timer.cancel();
         }
-        // No Session Expiry support over WS (no timer access) — always a
-        // full, immediate teardown; see the module docs.
-        self.config.broker.unregister(session.subscriber_id);
+        if let Some(timer) = &session.retransmit_timer {
+            timer.cancel();
+        }
+        if !session.graceful_disconnect {
+            if let Some(will) = session.will.clone() {
+                let delay = effective_will_delay(&will.properties, session.session_expiry);
+                if delay.is_zero() {
+                    publish_whole(
+                        &self.config.broker,
+                        Some(session.subscriber_id),
+                        &will.topic,
+                        &will.payload,
+                        will.qos,
+                        will.retain,
+                        &will.properties,
+                    );
+                } else {
+                    let epoch = self.config.broker.park_delayed_will(&session.client_id, will);
+                    let broker = Arc::clone(&self.config.broker);
+                    let client_id = session.client_id.clone();
+                    self.conn.schedule_timer(
+                        delay,
+                        Box::new(move || broker.fire_delayed_will(&client_id, epoch)),
+                    );
+                }
+            }
+        } else {
+            self.config.broker.cancel_delayed_will(&session.client_id);
+        }
+        if session.session_expiry.is_zero() {
+            self.config.broker.unregister(session.subscriber_id);
+        } else {
+            let epoch = self.config.broker.orphan(session.subscriber_id);
+            let broker = Arc::clone(&self.config.broker);
+            let id = session.subscriber_id;
+            self.conn.schedule_timer(
+                session.session_expiry,
+                Box::new(move || broker.expire_orphan(id, epoch)),
+            );
+        }
         self.session = SessionState::AwaitingConnect;
         self.end_connection_telemetry();
     }
 }
 
+fn schedule_qos_retry(
+    conn: ConnHandle,
+    broker: Arc<BrokerState>,
+    id: SubscriberId,
+    interval: Duration,
+) -> TimerHandle {
+    let conn2 = conn.clone();
+    let broker2 = Arc::clone(&broker);
+    conn.schedule_timer(
+        interval,
+        Box::new(move || {
+            if !broker2.is_connected(id) {
+                return;
+            }
+            broker2.retransmit_due(id, interval);
+            let _ = schedule_qos_retry(conn2, broker2, id, interval);
+        }),
+    )
+}
+
 impl WsEventHandler for MqttWsHandler {
     fn opened(&mut self, _session: &mut WsSession<'_>, _conn: &ConnHandle) {
-        // `conn` was already captured at construction (`MqttWsFactory::create`).
         self.ensure_connection_telemetry();
+        let handle = self.conn.clone();
+        self.connect_timeout_timer = Some(self.conn.schedule_timer(
+            self.config.connect_timeout,
+            Box::new(move || handle.close()),
+        ));
     }
 
     fn binary_message(&mut self, session: &mut WsSession<'_>, data: &[u8]) {
-        // `WsCtx` borrows `self` for the callbacks, so the parser driving
-        // them can't live inside `self` while it's being called — same
-        // `mem::replace` pattern as the TCP control handler.
         let mut parser = mem::replace(&mut self.parser, MqttFrameParser::new(ProtocolVersion::V311));
         let mut ctx = WsCtx { handler: self, session };
         parser.push(data, &mut ctx);
         self.parser = parser;
+        self.rearm_keepalive();
     }
 
     fn closed(&mut self, _session: &mut WsSession<'_>, _code: u16, _reason: &str) {
+        if let Some(t) = self.connect_timeout_timer.take() {
+            t.cancel();
+        }
         self.teardown();
     }
 
     fn error(&mut self, _err: WsFrameError) {
+        if let Some(t) = self.connect_timeout_timer.take() {
+            t.cancel();
+        }
         self.teardown();
     }
 }
@@ -333,6 +433,9 @@ impl WsCtx<'_, '_, '_> {
 
 impl MqttFrameHandler for WsCtx<'_, '_, '_> {
     fn connect(&mut self, packet: ConnectPacket) {
+        if let Some(timer) = self.handler.connect_timeout_timer.take() {
+            timer.cancel();
+        }
         if matches!(self.handler.session, SessionState::Connected(_)) {
             self.disconnect_and_close(reason::PROTOCOL_ERROR);
             return;
@@ -364,6 +467,12 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         self.handler.record_auth(true);
         self.handler.meta.client_id = Some(client_id.clone());
 
+        let keep_alive = if packet.keep_alive == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(packet.keep_alive as u64 * 1500)
+        };
+
         let receive_maximum = if version.is_v5() {
             packet.properties.get_u16(property::RECEIVE_MAXIMUM).unwrap_or(UNLIMITED_RECEIVE_MAXIMUM).max(1)
         } else {
@@ -371,6 +480,18 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         };
         let session_expiry_secs = if version.is_v5() {
             packet.properties.get_u32(property::SESSION_EXPIRY_INTERVAL).unwrap_or(0)
+        } else {
+            0
+        };
+        let session_expiry = Duration::from_secs(session_expiry_secs as u64);
+
+        let client_topic_alias_max = if version.is_v5() {
+            packet.properties.get_u16(property::TOPIC_ALIAS_MAXIMUM).unwrap_or(0)
+        } else {
+            0
+        };
+        let server_topic_alias_max = if version.is_v5() {
+            SERVER_TOPIC_ALIAS_MAXIMUM
         } else {
             0
         };
@@ -389,27 +510,34 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
 
         self.handler.session = SessionState::Connected(Box::new(ConnectedWsSession {
             subscriber_id,
+            client_id,
             version,
             will: packet.will,
+            keep_alive,
+            keepalive_timer: None,
+            session_expiry,
             graceful_disconnect: false,
             awaiting_pubrel: HashSet::new(),
             pending_publish: None,
+            inbound_aliases: HashMap::new(),
+            server_topic_alias_max,
+            client_topic_alias_max,
+            qos_retry_interval: DEFAULT_QOS_RETRY_INTERVAL,
+            retransmit_timer: None,
         }));
         self.handler.parser.set_version(version);
 
-        let mut connack_props = Properties::new();
-        if version.is_v5() {
-            if receive_maximum != UNLIMITED_RECEIVE_MAXIMUM {
-                connack_props.set_u16(property::RECEIVE_MAXIMUM, receive_maximum);
-            }
-            if session_expiry_secs != 0 {
-                // We accept the property but never actually honour Session
-                // Expiry over WS (see module docs) — echo 0 back so a
-                // well-behaved v5 client doesn't rely on a resume that will
-                // never happen.
-                connack_props.set_u32(property::SESSION_EXPIRY_INTERVAL, 0);
-            }
+        if session_present {
+            self.broker().drain_offline(subscriber_id);
         }
+        self.handler.arm_retransmit_timer();
+
+        let connack_props = connack_properties(
+            version,
+            receive_maximum,
+            session_expiry_secs,
+            server_topic_alias_max,
+        );
         let wire = encode::encode_connack(session_present, 0, &connack_props, version);
         self.session.send_binary(&wire);
     }
@@ -418,7 +546,31 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         self.disconnect_and_close(reason::PROTOCOL_ERROR);
     }
 
-    fn start_publish(&mut self, header: PublishHeader) {
+    fn start_publish(&mut self, mut header: PublishHeader) {
+        let SessionState::Connected(session) = &mut self.handler.session else {
+            self.disconnect_and_close(reason::PROTOCOL_ERROR);
+            return;
+        };
+        if session.version.is_v5() {
+            if let Some(alias) = header.properties.get_u16(property::TOPIC_ALIAS) {
+                if alias == 0 || alias > session.server_topic_alias_max {
+                    self.disconnect_and_close(reason::TOPIC_ALIAS_INVALID);
+                    return;
+                }
+                if header.topic.is_empty() {
+                    let Some(mapped) = session.inbound_aliases.get(&alias).cloned() else {
+                        self.disconnect_and_close(reason::PROTOCOL_ERROR);
+                        return;
+                    };
+                    header.topic = mapped;
+                } else {
+                    session.inbound_aliases.insert(alias, header.topic.clone());
+                }
+            } else if header.topic.is_empty() {
+                self.disconnect_and_close(reason::TOPIC_NAME_INVALID);
+                return;
+            }
+        }
         if validate_topic_name(&header.topic).is_err() {
             self.disconnect_and_close(reason::TOPIC_NAME_INVALID);
             return;
@@ -439,6 +591,45 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
             return;
         }
 
+        let client_id = session.client_id.clone();
+        let qos = header.qos;
+        let retain = header.retain;
+        let topic = header.topic.clone();
+        match self.handler.publish_handler.authorize(
+            &client_id,
+            &topic,
+            qos,
+            retain,
+            &self.handler.meta,
+        ) {
+            PublishDecision::Accept => {}
+            PublishDecision::Reject(code) => {
+                if session.version.is_v5() {
+                    match qos {
+                        QoS::AtMostOnce => self.disconnect_and_close(code),
+                        QoS::AtLeastOnce => {
+                            let wire = encode::encode_puback(
+                                header.packet_id, code, &Properties::new(), session.version,
+                            );
+                            self.session.send_binary(&wire);
+                        }
+                        QoS::ExactlyOnce => {
+                            let wire = encode::encode_pubrec(
+                                header.packet_id, code, &Properties::new(), session.version,
+                            );
+                            self.session.send_binary(&wire);
+                        }
+                    }
+                } else {
+                    self.disconnect_and_close(reason::PROTOCOL_ERROR);
+                }
+                return;
+            }
+        }
+
+        let SessionState::Connected(session) = &mut self.handler.session else {
+            return;
+        };
         let subscriber_id = session.subscriber_id;
         let qos = header.qos;
         let bytes = header.payload_len as u64;
@@ -489,9 +680,10 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         }
     }
 
-    fn puback(&mut self, _packet_id: u16, _reason_code: u8, _properties: Properties) {
+    fn puback(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
         if let SessionState::Connected(session) = &self.handler.session {
             self.broker().ack_delivered(session.subscriber_id);
+            self.broker().store.ack_inflight(session.subscriber_id, packet_id);
         }
     }
 
@@ -506,9 +698,10 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         self.session.send_binary(&wire);
     }
 
-    fn pubcomp(&mut self, _packet_id: u16, _reason_code: u8, _properties: Properties) {
+    fn pubcomp(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
         if let SessionState::Connected(session) = &self.handler.session {
             self.broker().ack_delivered(session.subscriber_id);
+            self.broker().store.ack_inflight(session.subscriber_id, packet_id);
         }
     }
 
@@ -517,25 +710,45 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
             self.disconnect_and_close(reason::PROTOCOL_ERROR);
             return;
         };
-        let (subscriber_id, version) = (session.subscriber_id, session.version);
+        let (subscriber_id, version, client_id) = (
+            session.subscriber_id,
+            session.version,
+            session.client_id.clone(),
+        );
 
         let mut reason_codes = Vec::with_capacity(filters.len());
         for filter in &filters {
-            match self.broker().subscribe(subscriber_id, filter) {
-                Ok(is_new) => {
-                    reason_codes.push(filter.max_qos.value());
-                    let send_retained = match filter.retain_handling {
-                        0 => true,
-                        1 => is_new,
-                        _ => false,
-                    };
-                    if send_retained {
-                        for (topic, msg) in self.broker().retained_matching(&filter.topic_filter) {
-                            self.broker().deliver_retained(subscriber_id, &topic, &msg, filter.max_qos);
+            match self.handler.subscribe_handler.authorize(
+                &client_id,
+                filter,
+                &self.handler.meta,
+            ) {
+                SubscribeDecision::Reject(code) => {
+                    reason_codes.push(code);
+                    continue;
+                }
+                SubscribeDecision::Accept(granted_qos) => {
+                    let mut filter = filter.clone();
+                    filter.max_qos = granted_qos;
+                    match self.broker().subscribe(subscriber_id, &filter) {
+                        Ok(is_new) => {
+                            reason_codes.push(granted_qos.value());
+                            let send_retained = match filter.retain_handling {
+                                0 => true,
+                                1 => is_new,
+                                _ => false,
+                            };
+                            if send_retained {
+                                for (topic, msg) in self.broker().retained_matching(&filter.topic_filter) {
+                                    self.broker().deliver_retained(
+                                        subscriber_id, &topic, &msg, granted_qos,
+                                    );
+                                }
+                            }
                         }
+                        Err(_) => reason_codes.push(reason::TOPIC_FILTER_INVALID),
                     }
                 }
-                Err(_) => reason_codes.push(reason::UNSPECIFIED_ERROR),
             }
         }
         let wire = encode::encode_suback(packet_id, &reason_codes, &Properties::new(), version);
@@ -583,7 +796,9 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
     }
 
     fn auth(&mut self, _reason_code: u8, _properties: Properties) {
-        // Enhanced AUTH (MQTT 5.0 §4.12) is future work — see the MQTT plan.
+        // Enhanced AUTH over WS uses the same server::auth path as TCP once
+        // Endpoint access is available; WS currently rejects mid-session AUTH.
+        self.disconnect_and_close(reason::PROTOCOL_ERROR);
     }
 
     fn parse_error(&mut self, _err: MqttError) {
