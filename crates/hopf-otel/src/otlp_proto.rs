@@ -191,7 +191,7 @@ pub fn encode_metrics_request(config: &OtelConfig, points: &[MetricPoint]) -> Ve
         rm.write_message_field(RESOURCE_METRICS_RESOURCE, |res| write_resource(res, config))?;
         rm.write_message_field(RESOURCE_METRICS_SCOPE_METRICS, |sm| {
             sm.write_message_field(SCOPE_METRICS_SCOPE, |scope| {
-                scope.write_string_field(SCOPE_NAME, "org.bluezoo.hopf.http")?;
+                scope.write_string_field(SCOPE_NAME, "org.bluezoo.hopf")?;
                 Ok(())
             })?;
             for p in points {

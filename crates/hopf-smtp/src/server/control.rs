@@ -11,6 +11,9 @@ use hopf_auth::{
 };
 use rmimeparser::charset::base64;
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler};
+use hopf_otel::{
+    ExportHandle, RequestTimer, Span, SpanKind, Trace, SmtpServerMetrics as OtelSmtpMetrics,
+};
 
 use crate::server::codec::{SmtpCommand, SmtpServerLexer, MAX_COMMAND_LINE};
 use crate::server::data::{BdatAccumulator, DotUnstuffer};
@@ -67,6 +70,18 @@ pub struct SmtpControlHandler {
     mail_transactions: u32,
     /// Real TCP peer for XCLIENT authorization (never overridden by ADDR).
     tcp_peer: SocketAddr,
+    /// Optional OTLP SMTP metrics (from a telemetry pipeline).
+    otel_metrics: Option<Arc<OtelSmtpMetrics>>,
+    /// Export handle for finishing traces.
+    export: Option<ExportHandle>,
+    /// Whether to create SERVER spans for this connection.
+    traces_enabled: bool,
+    /// Connection-level distributed trace (when tracing is enabled).
+    conn_trace: Option<Trace>,
+    /// Open child span for the current mail transaction.
+    tx_span: Option<Span>,
+    /// Timer for the current mail transaction (MAIL → end).
+    tx_timer: Option<RequestTimer>,
 }
 
 impl SmtpControlHandler {
@@ -100,6 +115,7 @@ impl SmtpControlHandler {
                 security_info: hopf_core::SecurityInfo::plaintext(),
                 reverse_name: None,
                 xclient_login: None,
+                traceparent: None,
             },
             config,
             metrics,
@@ -120,6 +136,106 @@ impl SmtpControlHandler {
             sasl: None,
             mail_transactions: 0,
             tcp_peer: peer,
+            otel_metrics: None,
+            export: None,
+            traces_enabled: false,
+            conn_trace: None,
+            tx_span: None,
+            tx_timer: None,
+        }
+    }
+
+    /// Attach OTel metrics / traces from a [`hopf_otel::TelemetryPipeline`].
+    pub fn with_telemetry(
+        mut self,
+        otel_metrics: Option<Arc<OtelSmtpMetrics>>,
+        export: Option<ExportHandle>,
+        traces_enabled: bool,
+    ) -> Self {
+        self.otel_metrics = otel_metrics;
+        self.export = export;
+        self.traces_enabled = traces_enabled;
+        self
+    }
+
+    fn begin_connection_telemetry(&mut self) {
+        if let Some(m) = &self.otel_metrics {
+            m.connection_opened();
+        }
+        if self.traces_enabled {
+            if let Some(export) = self.export.clone() {
+                let t = Trace::new("SMTP connection", SpanKind::Server);
+                t.set_exporter(export);
+                self.meta.traceparent = Some(t.traceparent());
+                self.conn_trace = Some(t);
+            }
+        }
+    }
+
+    fn begin_transaction_telemetry(&mut self) {
+        self.tx_timer = Some(RequestTimer::start());
+        if let Some(trace) = &self.conn_trace {
+            let span = trace.start_span("SMTP transaction", SpanKind::Server);
+            self.meta.traceparent = Some(trace.traceparent());
+            self.tx_span = Some(span);
+        }
+    }
+
+    fn end_transaction_telemetry(&mut self, outcome: &str) {
+        let duration = self
+            .tx_timer
+            .take()
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        let size = self.message_bytes;
+        if let Some(span) = self.tx_span.take() {
+            if outcome == "accepted" {
+                span.set_status_ok();
+            } else {
+                span.set_status_error(outcome);
+            }
+            span.set_attribute("smtp.transaction.outcome", outcome);
+            span.end();
+        }
+        if let Some(trace) = &self.conn_trace {
+            self.meta.traceparent = Some(trace.traceparent());
+        }
+        if let Some(m) = &self.otel_metrics {
+            m.transaction_completed(outcome, duration, size);
+        }
+    }
+
+    fn end_connection_telemetry(&mut self) {
+        if self.tx_timer.is_some() || self.tx_span.is_some() {
+            self.end_transaction_telemetry("aborted");
+        }
+        if let Some(trace) = self.conn_trace.take() {
+            let root = trace.root_span();
+            root.set_status_ok();
+            root.end();
+            trace.end();
+        }
+        self.meta.traceparent = None;
+        if let Some(m) = &self.otel_metrics {
+            m.connection_closed();
+        }
+    }
+
+    fn record_auth(&self, ok: bool) {
+        if ok {
+            SmtpServerMetrics::add(&self.metrics.auth_ok, 1);
+        } else {
+            SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
+        }
+        if let Some(m) = &self.otel_metrics {
+            m.auth(ok);
+        }
+    }
+
+    fn record_starttls(&self) {
+        SmtpServerMetrics::add(&self.metrics.starttls, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.starttls();
         }
     }
 
@@ -180,6 +296,7 @@ impl SmtpControlHandler {
             None => return,
         };
         SmtpServerMetrics::add(&self.metrics.connections, 1);
+        self.begin_connection_telemetry();
         {
             let mut ctx = ConnectedCtx {
                 endpoint,
@@ -307,13 +424,13 @@ impl SmtpControlHandler {
             }
             SmtpCommand::SaslResponseInvalid => {
                 self.sasl = None;
-                SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
+                self.record_auth(false);
                 self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
             }
             SmtpCommand::Xclient(args) => self.cmd_xclient(endpoint, &args),
             SmtpCommand::Malformed { .. } => {
                 self.sasl = None;
-                SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
+                self.record_auth(false);
                 self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
             }
             SmtpCommand::Unknown { .. } => {
@@ -475,6 +592,7 @@ impl SmtpControlHandler {
             }
             if accepted {
                 self.sender = sender;
+                self.begin_transaction_telemetry();
             }
         }
         if self.mail_from.is_none() {
@@ -669,6 +787,7 @@ impl SmtpControlHandler {
         }
         SmtpServerMetrics::add(&self.metrics.messages, 1);
         SmtpServerMetrics::add(&self.metrics.bytes, self.message_bytes);
+        self.end_transaction_telemetry("accepted");
         let mut msg = match self.message.take() {
             Some(m) => m,
             None => {
@@ -788,6 +907,9 @@ impl SmtpControlHandler {
     }
 
     fn cmd_rset(&mut self, endpoint: &mut dyn Endpoint) {
+        if self.tx_timer.is_some() || self.tx_span.is_some() {
+            self.end_transaction_telemetry("aborted");
+        }
         if let Some(m) = &mut self.message {
             m.message_aborted();
         }
@@ -1027,7 +1149,7 @@ impl SmtpControlHandler {
     }
 
     fn auth_failed(&mut self, endpoint: &mut dyn Endpoint) {
-        SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
+        self.record_auth(false);
         self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
     }
 
@@ -1036,7 +1158,7 @@ impl SmtpControlHandler {
             Some(h) => h,
             None => {
                 // After EHLO, hello may have been cleared — use mail_from stage.
-                SmtpServerMetrics::add(&self.metrics.auth_ok, 1);
+                self.record_auth(true);
                 self.meta.authenticated_user = Some(user);
                 self.send_enhanced(endpoint, 235, "2.7.0", "Authentication successful");
                 return;
@@ -1050,6 +1172,7 @@ impl SmtpControlHandler {
                 session: &mut self.session,
                 meta: &mut self.meta,
                 metrics: &self.metrics,
+                otel_metrics: self.otel_metrics.as_ref(),
                 user: user.clone(),
             };
             hello.authenticated(&mut ctx, &user);
@@ -1149,6 +1272,7 @@ impl ProtocolHandler for SmtpControlHandler {
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
+        self.end_connection_telemetry();
         if let Some(mut c) = self.client_connected.take() {
             c.disconnected();
         }
@@ -1170,7 +1294,7 @@ impl ProtocolHandler for SmtpControlHandler {
             return;
         }
         // STARTTLS completed
-        SmtpServerMetrics::add(&self.metrics.starttls, 1);
+        self.record_starttls();
         if let Some(h) = &mut self.hello {
             h.tls_established(info);
         }
@@ -1290,12 +1414,16 @@ struct AuthCtx<'a> {
     session: &'a mut SmtpSessionState,
     meta: &'a mut SmtpConnectionMetadata,
     metrics: &'a SmtpServerMetrics,
+    otel_metrics: Option<&'a Arc<OtelSmtpMetrics>>,
     user: String,
 }
 
 impl AuthenticateState for AuthCtx<'_> {
     fn accept(&mut self, handler: Box<dyn MailFromHandler>) {
         SmtpServerMetrics::add(&self.metrics.auth_ok, 1);
+        if let Some(m) = self.otel_metrics {
+            m.auth(true);
+        }
         self.meta.authenticated_user = Some(self.user.clone());
         self.endpoint
             .send(&reply_enhanced(235, "2.7.0", "Authentication successful"));
@@ -1306,6 +1434,9 @@ impl AuthenticateState for AuthCtx<'_> {
 
     fn reject(&mut self, handler: Box<dyn HelloHandler>) {
         SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
+        if let Some(m) = self.otel_metrics {
+            m.auth(false);
+        }
         self.endpoint
             .send(&reply_enhanced(535, "5.7.8", "Authentication credentials invalid"));
         *self.hello = Some(handler);
@@ -1313,6 +1444,9 @@ impl AuthenticateState for AuthCtx<'_> {
 
     fn reject_and_close(&mut self) {
         SmtpServerMetrics::add(&self.metrics.auth_fail, 1);
+        if let Some(m) = self.otel_metrics {
+            m.auth(false);
+        }
         self.endpoint
             .send(&reply_enhanced(535, "5.7.8", "Authentication credentials invalid"));
         self.endpoint.close();
@@ -1535,5 +1669,58 @@ impl ResetState for ResetCtx<'_> {
         self.endpoint
             .send(&reply_enhanced(421, "4.3.2", "Service not available"));
         self.endpoint.close();
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use crate::server::handler::AcceptAllSmtpHandler;
+    use hopf_otel::{OtelConfig, SpanContext, TelemetryPipeline};
+
+    #[test]
+    fn with_telemetry_sets_parseable_traceparent_on_connect() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-smtp-tp-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let cfg = OtelConfig::new("smtp-tp-test")
+            .with_jsonl_traces(&dir)
+            .with_jsonl_metrics(&dir);
+        let pipeline = TelemetryPipeline::start(cfg).unwrap();
+        let peer: SocketAddr = "127.0.0.1:25".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let mut h = SmtpControlHandler::new(
+            Box::new(AcceptAllSmtpHandler::new("localhost")),
+            SmtpServerMetrics::shared(),
+            SmtpConfig::new(local, "localhost"),
+            peer,
+            local,
+        )
+        .with_telemetry(
+            Some(pipeline.smtp_metrics()),
+            Some(pipeline.export_handle()),
+            true,
+        );
+        h.begin_connection_telemetry();
+        let tp = h.meta.traceparent.clone().expect("traceparent set");
+        let ctx = SpanContext::from_traceparent(&tp).expect("valid traceparent");
+        assert!(!ctx.trace_id.iter().all(|&b| b == 0));
+
+        h.begin_transaction_telemetry();
+        let tx_tp = h.meta.traceparent.clone().expect("tx traceparent");
+        let tx_ctx = SpanContext::from_traceparent(&tx_tp).unwrap();
+        assert_eq!(tx_ctx.trace_id, ctx.trace_id);
+        assert_ne!(tx_ctx.span_id, ctx.span_id);
+
+        h.end_transaction_telemetry("accepted");
+        let after = SpanContext::from_traceparent(h.meta.traceparent.as_deref().unwrap()).unwrap();
+        assert_eq!(after.span_id, ctx.span_id);
+
+        h.end_connection_telemetry();
+        assert!(h.meta.traceparent.is_none());
+        pipeline.shutdown();
+        let _ = std::fs::remove_file(&dir);
     }
 }

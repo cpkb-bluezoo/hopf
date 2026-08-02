@@ -1,11 +1,12 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! OpenTelemetry exporters and HTTP Stream instrumentation for Hopf.
+//! OpenTelemetry exporters and protocol instrumentation for Hopf.
 //!
 //! Connection logs use [`TelemetryHook`] via [`TelemetryPipeline::hook`].
-//! Request traces and metrics use [`InstrumentedServerFactory`] at the
-//! HTTP handler level (not TCP accept). Encoding and I/O run on a dedicated
-//! export worker — never on accept or reactor threads.
+//! HTTP request traces/metrics use [`InstrumentedServerFactory`]. SMTP
+//! metrics are available via [`TelemetryPipeline::smtp_metrics`]; protocol
+//! crates wire them at control-handler call sites. Encoding and I/O run on
+//! a dedicated export worker — never on accept or reactor threads.
 
 #![warn(missing_docs)]
 
@@ -26,7 +27,7 @@ pub use batch::ExportHandle;
 pub use config::OtelConfig;
 pub use event::{EventKind, TelemetryEvent};
 pub use instrument::InstrumentedServerFactory;
-pub use metrics::{HttpServerMetrics, MetricPoint, RequestTimer};
+pub use metrics::{HttpServerMetrics, MetricPoint, RequestTimer, SmtpServerMetrics};
 pub use pipeline::TelemetryPipeline;
 pub use propagate::{
     inject_trace, inject_traceparent, with_trace, with_traceparent, OwnedPropagatingClientWriter,
