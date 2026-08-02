@@ -41,6 +41,7 @@
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
+<li><a href="amqp.html">AMQP</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -229,6 +230,14 @@ ProtocolHandler::connected / receive / …</code></pre>
 <tr>
 <td>IMAP</td>
 <td><code>ImapClient</code> + <code>ImapFetch</code> / <code>ImapIdle</code> (or custom <code>ImapClientHandlerFactory</code>) in <code>hopf-imap</code></td>
+</tr>
+<tr>
+<td>MQTT</td>
+<td><code>MqttClient</code> + <code>MqttClientDriver</code> / <code>MqttClientControl</code> in <code>hopf-mqtt</code></td>
+</tr>
+<tr>
+<td>AMQP 0-9-1</td>
+<td><code>AmqpClient</code> + <code>AmqpClientDriver</code> / <code>AmqpClientControl</code> in <code>hopf-amqp</code> (client-only)</td>
 </tr>
 <tr>
 <td>gRPC</td>
