@@ -65,7 +65,11 @@ struct ConnectedWsSession {
     awaiting_pubrel: HashSet<u16>,
     pending_publish: Option<PendingPublish>,
     inbound_aliases: HashMap<u16, String>,
+    /// Max alias we accept from the client (advertised in CONNACK).
     server_topic_alias_max: u16,
+    /// Max alias the client will accept from us (from CONNECT). Reserved for
+    /// outbound Topic Alias assignment.
+    #[allow(dead_code)]
     client_topic_alias_max: u16,
     qos_retry_interval: Duration,
     retransmit_timer: Option<TimerHandle>,

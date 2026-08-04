@@ -18,11 +18,12 @@ use rmimeparser::charset::base64;
 use crate::server::auth::{advertised_mechanisms, apop_timestamp, capa_sasl_line, verify_apop};
 use crate::server::codec::{Pop3Command, Pop3ServerLexer, MAX_COMMAND_LINE};
 use crate::server::handler::{
-    AuthenticateState, AuthorizationHandler, ClientConnected, ConnectedState,
-    DefaultPop3HandlerFactory, ListState, ListWriter, MailboxStatusState, MarkDeletedState,
-    Pop3ConnectionMetadata, ResetState, RetrieveState, TopState, TransactionHandler, UidlState,
-    UidlWriter, UpdateState,
+    AuthenticateState, AuthorizationHandler, ClientConnected, ConnectedState, ListState,
+    ListWriter, MailboxStatusState, MarkDeletedState, Pop3ConnectionMetadata, ResetState,
+    RetrieveState, TopState, TransactionHandler, UidlState, UidlWriter, UpdateState,
 };
+#[cfg(test)]
+use crate::server::handler::DefaultPop3HandlerFactory;
 use crate::server::metrics::Pop3ServerMetrics;
 use crate::server::reply;
 use crate::server::service::Pop3Config;
