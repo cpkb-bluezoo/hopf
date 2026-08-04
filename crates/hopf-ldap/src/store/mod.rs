@@ -19,9 +19,8 @@ use hopf_auth::{
 use hopf_core::{Runtime, SharedTlsConnector};
 
 use crate::client::{
-    BindResult, LdapClient, LdapClientConfig, LdapError, LdapResultCode, LdapSession, LdapUrl,
-    SearchDone, SearchEntry, SearchRequest, SearchScope, DEFAULT_LDAP_PORT,
-    DEFAULT_MAX_REFERRAL_HOPS,
+    LdapClient, LdapClientConfig, LdapError, LdapResultCode, LdapSession, LdapUrl, SearchDone,
+    SearchEntry, SearchRequest, SearchScope, DEFAULT_LDAP_PORT, DEFAULT_MAX_REFERRAL_HOPS,
 };
 
 /// Escape RFC 4515 filter value specials (`\ * ( )` NUL), matching Gumdrop

@@ -45,7 +45,6 @@ pub(crate) fn end_busy(endpoint: &mut dyn Endpoint, busy: &Arc<AtomicBool>) {
 pub(crate) struct ConnectedView<'a> {
     pub endpoint: &'a mut dyn Endpoint,
     pub not_authenticated: &'a mut Option<Box<dyn NotAuthenticatedHandler>>,
-    pub authenticated: &'a mut Option<Box<dyn AuthenticatedHandler>>,
     pub caps: &'a str,
     pub session: &'a mut ImapSessionState,
     pub username: &'a mut Option<String>,

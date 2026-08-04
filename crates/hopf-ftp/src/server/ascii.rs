@@ -90,7 +90,10 @@ impl AsciiNewlineNormalizer {
 }
 
 /// Convert network CRLF (and lone CR) to local LF for ASCII-mode uploads.
-pub fn denormalize_ascii_newlines(input: &[u8]) -> Vec<u8> {
+/// Superseded in production by [`AsciiNewlineDenormalizer`]; kept as the
+/// whole-buffer oracle the streaming tests below check against.
+#[cfg(test)]
+fn denormalize_ascii_newlines(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
     let mut i = 0;
     while i < input.len() {

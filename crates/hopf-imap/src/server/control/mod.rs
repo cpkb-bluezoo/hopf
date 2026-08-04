@@ -351,7 +351,6 @@ impl ImapControlHandler {
         let mut view = ConnectedView {
             endpoint,
             not_authenticated: &mut self.not_authenticated,
-            authenticated: &mut self.authenticated,
             caps: &caps,
             session: &mut self.session,
             username: &mut self.username,
