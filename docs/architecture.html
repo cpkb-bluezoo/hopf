@@ -94,28 +94,83 @@
 <p>Many Internet application protocols share the same transport model: TLS/QUIC where appropriate, transport-level backpressure, worker/storage pools independent of connection count, and <strong>plain buffers</strong> (<code>&amp;[u8]</code> / pooled owned buffers) rather than a proprietary buffer world.</p>
 <p>Hopf is a re-implementation of Gumdrop’s <strong>techniques, protocol work, and architectural contracts</strong>, with Rust ownership and TPC execution — not a line-by-line port of Java types.</p>
 <h2 id="thread-per-core">Thread-per-core</h2>
-<p><strong>Decision: TPC on mio readiness loops.</strong></p>
 <ul>
 <li>Each connection is owned by <strong>one reactor thread for its lifetime</strong> (affinity).</li>
 <li>I/O, TLS, and protocol byte handling stay on that thread.</li>
 <li>Application / blocking / storage work runs on a <strong>separate storage pool</strong>.</li>
 <li>Cross-core coordination is <strong>explicit</strong> (<code>ConnHandle</code>, <code>execute</code>, message passing) — not implicit task migration.</li>
 </ul>
-<pre class="text"><code>                 Runtime
-        ┌──────────┼──────────┐
-        │          │          │
-   AcceptLoop   Workers    StorageExecutor
-        │       0 … N-1         │
-        │          │            │
-   add_tcp_listener / connect   submit(…)
-        │          │
-        └──affinity──► Reactor i owns Conn for life
-                           │
-                        Endpoint
-                           │
-                    ProtocolHandler
-                           │
-                (HTTP Stream | FTP | SMTP | …)</code></pre>
+<figure class="diagram" role="group" aria-labelledby="diagram-tpc-caption">
+<svg viewBox="0 0 640 420" width="640" height="420" role="img" aria-labelledby="diagram-tpc-title diagram-tpc-desc">
+  <title id="diagram-tpc-title">Thread-per-core Runtime</title>
+  <desc id="diagram-tpc-desc">Runtime fans out to AcceptLoop, Workers, and StorageExecutor. Accept and dial land on a reactor that owns the connection for life, then Endpoint and ProtocolHandler.</desc>
+  <defs>
+    <marker id="tpc-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 L9 5 L1 9 Z" fill="var(--accent)"/>
+    </marker>
+    <linearGradient id="tpc-runtime" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="var(--accent)" stop-opacity="0.08"/>
+    </linearGradient>
+  </defs>
+  <!-- Runtime banner -->
+  <rect x="160" y="12" width="320" height="44" rx="10" fill="url(#tpc-runtime)" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="320" y="40" text-anchor="middle" font-family="var(--font)" font-size="18" font-weight="700" fill="var(--ink)">Runtime</text>
+
+  <!-- Fan-out lines -->
+  <path d="M320 56 V78 M160 78 H480 M160 78 V96 M320 78 V96 M480 78 V96" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.55"/>
+
+  <!-- Three pillars -->
+  <rect x="28" y="96" width="176" height="92" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="116" y="124" text-anchor="middle" font-family="var(--font)" font-size="14" font-weight="700" fill="var(--ink)">AcceptLoop</text>
+  <text x="116" y="148" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">add_tcp_listener</text>
+  <text x="116" y="166" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">ACL · rate limit · RR</text>
+
+  <rect x="232" y="96" width="176" height="92" rx="10" fill="var(--surface)" stroke="var(--accent)" stroke-width="1.75"/>
+  <text x="320" y="124" text-anchor="middle" font-family="var(--font)" font-size="14" font-weight="700" fill="var(--ink)">Workers</text>
+  <text x="320" y="148" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">reactors 0 … N−1</text>
+  <text x="320" y="166" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">timers · TLS · UDP</text>
+
+  <rect x="436" y="96" width="176" height="92" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="524" y="124" text-anchor="middle" font-family="var(--font)" font-size="14" font-weight="700" fill="var(--ink)">StorageExecutor</text>
+  <text x="524" y="148" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">submit(…)</text>
+  <text x="524" y="166" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">bounded blocking pool</text>
+
+  <!-- Affinity bridge -->
+  <path d="M116 188 V210 H320" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.7" marker-end="url(#tpc-arrow)"/>
+  <path d="M320 188 V210" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.7"/>
+  <path d="M524 188 V210 H320" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-dasharray="4 3" opacity="0.55"/>
+  <rect x="214" y="210" width="212" height="36" rx="8" fill="color-mix(in srgb, var(--accent) 14%, var(--surface))" stroke="var(--accent)" stroke-width="1.25"/>
+  <text x="320" y="233" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">affinity → Reactor i owns Conn</text>
+
+  <!-- Stack under reactor -->
+  <path d="M320 246 V268" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.55" marker-end="url(#tpc-arrow)"/>
+  <rect x="200" y="268" width="240" height="40" rx="8" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="320" y="293" text-anchor="middle" font-family="var(--mono)" font-size="13" font-weight="500" fill="var(--ink)">Endpoint</text>
+
+  <path d="M320 308 V328" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.55" marker-end="url(#tpc-arrow)"/>
+  <rect x="200" y="328" width="240" height="40" rx="8" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="320" y="353" text-anchor="middle" font-family="var(--mono)" font-size="13" font-weight="500" fill="var(--ink)">ProtocolHandler</text>
+
+  <!-- Protocol chips -->
+  <path d="M320 368 V382" fill="none" stroke="var(--border)" stroke-width="1.25"/>
+  <g font-family="var(--mono)" font-size="11" fill="var(--muted)">
+    <rect x="88" y="382" width="88" height="26" rx="13" fill="color-mix(in srgb, var(--accent) 10%, var(--surface))" stroke="var(--border)"/>
+    <text x="132" y="399" text-anchor="middle">HTTP Stream</text>
+    <rect x="188" y="382" width="56" height="26" rx="13" fill="color-mix(in srgb, var(--accent) 10%, var(--surface))" stroke="var(--border)"/>
+    <text x="216" y="399" text-anchor="middle">FTP</text>
+    <rect x="256" y="382" width="64" height="26" rx="13" fill="color-mix(in srgb, var(--accent) 10%, var(--surface))" stroke="var(--border)"/>
+    <text x="288" y="399" text-anchor="middle">SMTP</text>
+    <rect x="332" y="382" width="56" height="26" rx="13" fill="color-mix(in srgb, var(--accent) 10%, var(--surface))" stroke="var(--border)"/>
+    <text x="360" y="399" text-anchor="middle">DNS</text>
+    <rect x="400" y="382" width="64" height="26" rx="13" fill="color-mix(in srgb, var(--accent) 10%, var(--surface))" stroke="var(--border)"/>
+    <text x="432" y="399" text-anchor="middle">IMAP</text>
+    <rect x="468" y="382" width="92" height="26" rx="13" fill="color-mix(in srgb, var(--accent) 10%, var(--surface))" stroke="var(--border)"/>
+    <text x="514" y="399" text-anchor="middle">and more</text>
+  </g>
+</svg>
+<figcaption id="diagram-tpc-caption">One Runtime: accept, dial, and storage meet reactors that keep connection affinity for life.</figcaption>
+</figure>
 <table>
 <colgroup>
 <col style="width: 53%" />
@@ -167,20 +222,62 @@
 </ul>
 <p>See <a href="dns.html">DNS</a>, <a href="runtime-options.html">runtime options</a>.</p>
 <h2 id="layering">Layering</h2>
-<pre class="text"><code>┌─────────────────────────────────────────────────────────┐
-│  hopf-webdav / hopf-websocket / hopf-grpc / hopf-otel   │  Stream consumers
-├─────────────────────────────────────────────────────────┤
-│  hopf-http          ServerHandler / ClientHandler       │  HTTP Streams
-│                     H1 / H2 / H3 adapters               │
-├─────────────────────────────────────────────────────────┤
-│  hopf-ftp / hopf-smtp / hopf-dns / hopf-mailbox         │  Protocol services
-├──────────────────────────┬──────────────────────────────┤
-│  hopf-tls (TCP rustls)   │  hopf-quic (QUIC + TLS 1.3)  │  Crypto transports
-├──────────────────────────┴──────────────────────────────┤
-│  hopf-core   Runtime · Endpoint · ProtocolHandler ·     │
-│              Composition · Storage · ACL · TelemetryHook│
-└─────────────────────────────────────────────────────────┘
-         hopf-auth  (TrustPolicy / SASL — no core dep)</code></pre>
+<figure class="diagram" role="group" aria-labelledby="diagram-layers-caption">
+<svg viewBox="0 0 640 360" width="640" height="360" role="img" aria-labelledby="diagram-layers-title diagram-layers-desc">
+  <title id="diagram-layers-title">Crate layering</title>
+  <desc id="diagram-layers-desc">Stack from hopf-core up through crypto transports, protocol services, HTTP Streams, and Stream consumers. hopf-auth sits beside core with no core dependency.</desc>
+  <defs>
+    <linearGradient id="layer-top" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="var(--accent)" stop-opacity="0.06"/>
+    </linearGradient>
+    <linearGradient id="layer-core" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="var(--accent)" stop-opacity="0.12"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Layer 5: Stream consumers -->
+  <rect x="36" y="16" width="460" height="52" rx="10" fill="url(#layer-top)" stroke="var(--accent)" stroke-width="1.35"/>
+  <text x="52" y="38" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-webdav · hopf-websocket · hopf-grpc · hopf-otel</text>
+  <text x="52" y="56" font-family="var(--font)" font-size="12" fill="var(--muted)">Stream consumers</text>
+  <text x="520" y="48" font-family="var(--mono)" font-size="11" fill="var(--accent)">apps</text>
+
+  <!-- Layer 4: HTTP -->
+  <rect x="48" y="78" width="436" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="64" y="100" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-http — ServerHandler / ClientHandler</text>
+  <text x="64" y="118" font-family="var(--font)" font-size="12" fill="var(--muted)">HTTP Streams · H1 / H2 / H3 adapters</text>
+  <text x="508" y="110" font-family="var(--mono)" font-size="11" fill="var(--muted)">streams</text>
+
+  <!-- Layer 3: Protocol services -->
+  <rect x="60" y="140" width="412" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="76" y="162" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-ftp · hopf-smtp · hopf-dns · hopf-mailbox · …</text>
+  <text x="76" y="180" font-family="var(--font)" font-size="12" fill="var(--muted)">Protocol services</text>
+  <text x="500" y="172" font-family="var(--mono)" font-size="11" fill="var(--muted)">wire</text>
+
+  <!-- Layer 2: Crypto transports (split) -->
+  <rect x="72" y="202" width="194" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="169" y="224" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-tls</text>
+  <text x="169" y="242" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">TCP · rustls</text>
+
+  <rect x="278" y="202" width="194" height="52" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="375" y="224" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-quic</text>
+  <text x="375" y="242" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">QUIC · TLS 1.3</text>
+  <text x="500" y="234" font-family="var(--mono)" font-size="11" fill="var(--muted)">crypto</text>
+
+  <!-- Layer 1: core -->
+  <rect x="84" y="264" width="388" height="56" rx="10" fill="url(#layer-core)" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="100" y="288" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">hopf-core</text>
+  <text x="100" y="306" font-family="var(--font)" font-size="11" fill="var(--muted)">Runtime · Endpoint · ProtocolHandler · Composition · Storage · ACL</text>
+  <text x="500" y="298" font-family="var(--mono)" font-size="11" fill="var(--accent)">core</text>
+
+  <!-- hopf-auth aside -->
+  <path d="M278 320 V334" fill="none" stroke="var(--border)" stroke-width="1.25" stroke-dasharray="3 3"/>
+  <rect x="148" y="334" width="260" height="22" rx="11" fill="var(--surface)" stroke="var(--border)" stroke-dasharray="4 3"/>
+  <text x="278" y="349" text-anchor="middle" font-family="var(--mono)" font-size="10.5" fill="var(--muted)">hopf-auth · TrustPolicy / SASL · no core dep</text>
+</svg>
+<figcaption id="diagram-layers-caption">Protocol crates sit on crypto transports and <code>hopf-core</code>; Stream consumers ride HTTP Streams.</figcaption>
+</figure>
 <h3 id="transport-vs-http-stream">Transport vs HTTP Stream</h3>
 <table>
 <colgroup>
@@ -292,11 +389,49 @@
 <p><strong>Anti-pattern:</strong> server code flat at crate root with no <code>server/</code> name, plus a <code>client/</code> submodule bolted on — server-as-unmarked-default is exactly the Gumdrop shape this axis exists to avoid. Crates in this shape get a <code>server/</code> module carved out of their root files, mirroring their existing <code>client/</code>.</p>
 <h2 id="dynamic-bindings-and-composition">Dynamic bindings and composition</h2>
 <p><strong>All bindings are dynamic.</strong> Listen and dial are added/removed through Runtime APIs while the process is alive. Configuration is a <strong>script</strong> over those APIs (Rust <code>main</code> / builder, or XML). <code>Service</code> orchestrates lifecycle; it does <strong>not</strong> own an immutable listener list as source of truth.</p>
-<pre class="text"><code>main → Runtime::start → Composition
-         → TrustPolicy / TLS / DNS
-         → add bindings (listen/dial)
-         → handler factories (closed registry)
-       → wait / shutdown</code></pre>
+<figure class="diagram" role="group" aria-labelledby="diagram-compose-caption">
+<svg viewBox="0 0 640 220" width="640" height="220" role="img" aria-labelledby="diagram-compose-title diagram-compose-desc">
+  <title id="diagram-compose-title">Composition startup flow</title>
+  <desc id="diagram-compose-desc">main starts the Runtime, builds a Composition with TrustPolicy TLS and DNS, adds listen and dial bindings plus handler factories, then waits or shuts down.</desc>
+  <defs>
+    <marker id="compose-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M1 1 L9 5 L1 9 Z" fill="var(--accent)"/>
+    </marker>
+  </defs>
+
+  <!-- Step 1 -->
+  <rect x="20" y="36" width="100" height="56" rx="10" fill="color-mix(in srgb, var(--accent) 16%, var(--surface))" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="70" y="60" text-anchor="middle" font-family="var(--mono)" font-size="13" font-weight="500" fill="var(--ink)">main</text>
+  <text x="70" y="78" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">entry</text>
+
+  <path d="M120 64 H148" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.7" marker-end="url(#compose-arrow)"/>
+
+  <!-- Step 2 -->
+  <rect x="152" y="36" width="140" height="56" rx="10" fill="var(--surface)" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="222" y="60" text-anchor="middle" font-family="var(--mono)" font-size="12" font-weight="500" fill="var(--ink)">Runtime::start</text>
+  <text x="222" y="78" text-anchor="middle" font-family="var(--font)" font-size="11" fill="var(--muted)">reactors up</text>
+
+  <path d="M292 64 H320" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity="0.7" marker-end="url(#compose-arrow)"/>
+
+  <!-- Step 3 hub -->
+  <rect x="324" y="20" width="296" height="168" rx="12" fill="color-mix(in srgb, var(--accent) 7%, var(--surface))" stroke="var(--accent)" stroke-width="1.5"/>
+  <text x="472" y="44" text-anchor="middle" font-family="var(--font)" font-size="15" font-weight="700" fill="var(--ink)">Composition</text>
+
+  <rect x="344" y="58" width="256" height="32" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+  <text x="472" y="78" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--ink)">TrustPolicy · TLS · DNS</text>
+
+  <rect x="344" y="100" width="256" height="32" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+  <text x="472" y="120" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--ink)">add bindings (listen / dial)</text>
+
+  <rect x="344" y="142" width="256" height="32" rx="8" fill="var(--surface)" stroke="var(--border)"/>
+  <text x="472" y="162" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--ink)">handler factories (closed registry)</text>
+
+  <!-- Wait / shutdown -->
+  <path d="M472 188 V200" fill="none" stroke="var(--border)" stroke-width="1.25"/>
+  <text x="472" y="214" text-anchor="middle" font-family="var(--mono)" font-size="11" fill="var(--muted)">wait / shutdown</text>
+</svg>
+<figcaption id="diagram-compose-caption">Configuration is a script over Runtime APIs — Rust builder or XML via tractrix, same destination.</figcaption>
+</figure>
 <ul>
 <li><strong>Canonical:</strong> Rust <code>Composition</code> builder.</li>
 <li><strong>Declarative:</strong> XML via <strong>tractrix</strong> → same builder; closed registry of handler / trust names — <strong>no</strong> reflective DI.</li>
@@ -364,13 +499,6 @@
 </table>
 <h3 id="explicit-non-dependencies">Explicit non-dependencies</h3>
 <p>Async app runtimes (Tokio et al.), Hyper, Axum, Tower, serde as architecture, the full <code>quinn</code> crate, separate QUIC crypto beside rustls, servlet/JSP/Java EE APIs, reflective XML DI, TOML/YAML as primary composition formats.</p>
-<h2 id="non-goals">Non-goals</h2>
-<ul>
-<li>Preserving Servlet, JSP, or JavaMail APIs.</li>
-<li>Bit-identical Gumdrop Java package layouts or JNI.</li>
-<li>Work-stealing schedulers as the default concurrency story.</li>
-<li>Supporting every advanced platform feature equally on day one.</li>
-</ul>
 <h2 id="further-reading">Further reading</h2>
 <ul>
 <li><a href="services.html">Services</a> · <a href="clients.html">Clients</a> · <a href="runtime-options.html">Runtime options</a></li>

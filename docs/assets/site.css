@@ -291,6 +291,32 @@ a:hover {
   color: var(--muted);
 }
 
+.diagram {
+  margin: 1.25rem 0 1.75rem;
+  padding: 1.1rem 0.85rem 0.85rem;
+  background:
+    linear-gradient(165deg, color-mix(in srgb, var(--accent) 6%, var(--surface)) 0%, var(--surface) 45%),
+    var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  overflow-x: auto;
+}
+
+.diagram svg {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+  height: auto;
+}
+
+.diagram figcaption {
+  margin: 0.85rem 0 0;
+  text-align: center;
+  font-size: 0.88rem;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
 .footer {
   margin-top: 3rem;
   padding-top: 1rem;
