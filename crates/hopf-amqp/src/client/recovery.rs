@@ -475,6 +475,25 @@ impl AmqpClientControl for TrackingControl<'_> {
             .basic_publish(channel, exchange, routing_key, mandatory, immediate, properties, body);
     }
 
+    fn basic_publish_start(
+        &mut self,
+        channel: u16,
+        exchange: &str,
+        routing_key: &str,
+        mandatory: bool,
+        immediate: bool,
+        properties: &BasicProperties,
+        body_len: u64,
+    ) {
+        self.inner.basic_publish_start(
+            channel, exchange, routing_key, mandatory, immediate, properties, body_len,
+        );
+    }
+
+    fn basic_publish_body(&mut self, channel: u16, chunk: &[u8]) {
+        self.inner.basic_publish_body(channel, chunk);
+    }
+
     fn basic_qos(&mut self, channel: u16, prefetch_size: u32, prefetch_count: u16, global: bool) {
         self.inner.basic_qos(channel, prefetch_size, prefetch_count, global);
     }
@@ -1084,6 +1103,8 @@ mod tests {
             fn queue_delete(&mut self, _: u16, _: &str, _: bool, _: bool) {}
             fn confirm_select(&mut self, _: u16) {}
             fn basic_publish(&mut self, _: u16, _: &str, _: &str, _: bool, _: bool, _: &BasicProperties, _: &[u8]) {}
+            fn basic_publish_start(&mut self, _: u16, _: &str, _: &str, _: bool, _: bool, _: &BasicProperties, _: u64) {}
+            fn basic_publish_body(&mut self, _: u16, _: &[u8]) {}
             fn basic_qos(&mut self, _: u16, _: u32, _: u16, _: bool) {}
             fn basic_consume(&mut self, _: u16, queue: &str, consumer_tag: &str, _: bool, _: bool, _: bool, _: &FieldTable) {
                 self.0.push(format!("basic_consume({queue},{consumer_tag})"));
@@ -1188,6 +1209,8 @@ mod tests {
         fn queue_delete(&mut self, _: u16, _: &str, _: bool, _: bool) {}
         fn confirm_select(&mut self, _: u16) {}
         fn basic_publish(&mut self, _: u16, _: &str, _: &str, _: bool, _: bool, _: &BasicProperties, _: &[u8]) {}
+        fn basic_publish_start(&mut self, _: u16, _: &str, _: &str, _: bool, _: bool, _: &BasicProperties, _: u64) {}
+        fn basic_publish_body(&mut self, _: u16, _: &[u8]) {}
         fn basic_qos(&mut self, _: u16, _: u32, _: u16, _: bool) {}
         fn basic_consume(&mut self, _: u16, queue: &str, consumer_tag: &str, _: bool, _: bool, _: bool, _: &FieldTable) {
             self.log.lock().unwrap().push(format!("basic_consume({queue},{consumer_tag})"));
