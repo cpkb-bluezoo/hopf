@@ -263,6 +263,12 @@ struct StreamSlot {
     handler: Box<dyn ProtocolHandler>,
     /// Locally-opened unidirectional stream (send-only; never recv_stream).
     send_only: bool,
+    /// Bytes read from the stream but left unconsumed by the handler's
+    /// last `receive()` call (NIO compact-buffer semantics — mirrors
+    /// `TcpConnection`'s `net_in`/`app_in`). Without this, a handler
+    /// waiting on a token split across two QUIC STREAM frames loses the
+    /// first half the moment `read_stream` returns.
+    pending_in: Vec<u8>,
 }
 
 struct ConnSlot {
@@ -343,6 +349,103 @@ struct PendingTimer {
     when: Instant,
     callback: Box<dyn FnOnce() + Send>,
     cancelled: Arc<AtomicBool>,
+}
+
+/// NIO compact-buffer delivery (mirrors `hopf_core::TcpConnection`'s
+/// `net_in`/`app_in` handling): append `new_data` to whatever was left
+/// unconsumed by the last call, hand `deliver` a cursor into the combined
+/// buffer, then retain only the unconsumed suffix in `pending` for next
+/// time — so a handler waiting on a token split across two separately
+/// delivered chunks (e.g. two QUIC STREAM frames) never loses the first
+/// half just because this call returned.
+fn deliver_with_residual(pending: &mut Vec<u8>, new_data: &[u8], deliver: impl FnOnce(&mut &[u8])) {
+    pending.extend_from_slice(new_data);
+    let mut buf = std::mem::take(pending);
+    let mut slice = buf.as_slice();
+    deliver(&mut slice);
+    let remaining = slice.len();
+    let consumed = buf.len() - remaining;
+    if consumed > 0 {
+        buf.drain(..consumed);
+    }
+    *pending = buf;
+}
+
+#[cfg(test)]
+mod residual_tests {
+    use super::deliver_with_residual;
+
+    /// Regression test for a bug where `read_stream` dropped whatever
+    /// bytes the handler left unconsumed instead of preserving them for
+    /// the next call. A handler that refuses to consume anything until it
+    /// has seen a full 9-byte token, fed 3 bytes then 6 bytes across two
+    /// separate calls, must still see the complete, correctly-reassembled
+    /// token on the second call.
+    #[test]
+    fn preserves_unconsumed_bytes_across_calls() {
+        let mut pending = Vec::new();
+        let mut seen: Option<Vec<u8>> = None;
+
+        deliver_with_residual(&mut pending, b"PIN", |data| {
+            if data.len() < 9 {
+                return; // not enough yet — consume nothing
+            }
+            seen = Some(data.to_vec());
+            *data = &[];
+        });
+        assert_eq!(pending, b"PIN", "unconsumed bytes must be preserved, not dropped");
+        assert!(seen.is_none());
+
+        deliver_with_residual(&mut pending, b"G-1234", |data| {
+            if data.len() < 9 {
+                return;
+            }
+            seen = Some(data.to_vec());
+            *data = &[];
+        });
+        assert_eq!(seen.as_deref(), Some(&b"PING-1234"[..]));
+        assert!(pending.is_empty(), "fully-consumed bytes must not linger");
+    }
+
+    #[test]
+    fn partial_consumption_retains_only_the_unconsumed_suffix() {
+        let mut pending = Vec::new();
+        let mut got = Vec::new();
+
+        // Handler consumes one 3-byte record at a time, leaving any
+        // trailing partial record for next call.
+        deliver_with_residual(&mut pending, b"ABCDEFG", |data| {
+            while data.len() >= 3 {
+                got.push(data[..3].to_vec());
+                *data = &data[3..];
+            }
+        });
+        assert_eq!(got, vec![b"ABC".to_vec(), b"DEF".to_vec()]);
+        assert_eq!(pending, b"G");
+
+        deliver_with_residual(&mut pending, b"HI", |data| {
+            while data.len() >= 3 {
+                got.push(data[..3].to_vec());
+                *data = &data[3..];
+            }
+        });
+        assert_eq!(got, vec![b"ABC".to_vec(), b"DEF".to_vec(), b"GHI".to_vec()]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn fully_consumed_each_call_never_accumulates() {
+        let mut pending = Vec::new();
+        let mut total = Vec::new();
+        for chunk in [&b"foo"[..], b"bar", b"baz"] {
+            deliver_with_residual(&mut pending, chunk, |data| {
+                total.extend_from_slice(data);
+                *data = &[];
+            });
+        }
+        assert_eq!(total, b"foobarbaz");
+        assert!(pending.is_empty());
+    }
 }
 
 struct Driver {
@@ -806,6 +909,7 @@ impl Driver {
                             endpoint,
                             handler,
                             send_only: matches!(dir, Dir::Uni),
+                            pending_in: Vec::new(),
                         },
                     );
                     slot.local_keys.insert(key, id);
@@ -976,6 +1080,7 @@ impl Driver {
                     endpoint,
                     handler,
                     send_only: matches!(dir, Dir::Uni),
+                    pending_in: Vec::new(),
                 },
             );
         }
@@ -1017,6 +1122,7 @@ impl Driver {
                     endpoint,
                     handler,
                     send_only: false,
+                    pending_in: Vec::new(),
                 },
             );
         }
@@ -1040,26 +1146,27 @@ impl Driver {
             Ok(c) => c,
             Err(_) => return,
         };
-        let mut data = Vec::new();
+        let mut new_data = Vec::new();
         loop {
             match chunks.next(usize::MAX) {
                 Ok(Some(chunk)) => {
-                    data.extend_from_slice(&chunk.bytes);
+                    new_data.extend_from_slice(&chunk.bytes);
                 }
                 Ok(None) => break,
                 Err(_) => break,
             }
         }
         let _ = chunks.finalize();
-        if data.is_empty() {
+        if new_data.is_empty() {
             return;
         }
 
         if let Some(stream) = slot.streams.get_mut(&id) {
-            let mut slice = data.as_slice();
-            stream
-                .handler
-                .receive(&mut stream.endpoint, &mut slice);
+            let handler = &mut stream.handler;
+            let endpoint = &mut stream.endpoint;
+            deliver_with_residual(&mut stream.pending_in, &new_data, |slice| {
+                handler.receive(endpoint, slice);
+            });
         }
     }
 
