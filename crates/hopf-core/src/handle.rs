@@ -89,7 +89,15 @@ impl ConnHandle {
     /// Run `task` on the owning reactor with `&mut dyn Endpoint`.
     ///
     /// If the connection is already gone, the task is dropped.
-    /// For task-only handles, the task is dropped (no endpoint).
+    ///
+    /// **Task-only handles** (built via [`Self::from_execute`] — e.g. a QUIC
+    /// stream's [`Endpoint::handle`](crate::Endpoint::handle), which has no
+    /// TCP-style reactor token to hop back through) have no endpoint to run
+    /// `task` against: the task is dropped, and this prints a warning so the
+    /// drop is at least observable rather than silent. [`Self::send`],
+    /// [`Self::close`], and [`Self::poke`] are all implemented via this
+    /// method, so the same applies to them — use [`Self::execute`] instead
+    /// for a task-only handle (it doesn't need an endpoint).
     pub fn with_endpoint(&self, task: impl FnOnce(&mut dyn Endpoint) + Send + 'static) {
         match &self.inner {
             ConnHandleInner::Tcp { reactor, token, .. } => {
@@ -100,6 +108,11 @@ impl ConnHandle {
                 });
             }
             ConnHandleInner::Tasks { .. } => {
+                eprintln!(
+                    "hopf-core: ConnHandle::with_endpoint (or send/close/poke, which are \
+                     built on it) called on a task-only handle — dropped, no endpoint to \
+                     run it against. Use ConnHandle::execute instead for this handle."
+                );
                 let _ = task;
             }
             ConnHandleInner::Framed { inner, .. } => inner.with_endpoint(task),
@@ -112,6 +125,8 @@ impl ConnHandle {
     /// asynchronous, cross-connection delivery (like a broker fan-out)
     /// still reaches the peer correctly framed instead of landing on the
     /// wire raw.
+    ///
+    /// Silently dropped for a task-only handle — see [`Self::with_endpoint`].
     pub fn send(&self, data: Vec<u8>) {
         if let ConnHandleInner::Framed { inner, frame } = &self.inner {
             return inner.send(frame(data));
@@ -124,6 +139,8 @@ impl ConnHandle {
     }
 
     /// Request a graceful close on the owning reactor.
+    ///
+    /// Silently dropped for a task-only handle — see [`Self::with_endpoint`].
     pub fn close(&self) {
         self.with_endpoint(|ep| ep.close());
     }
@@ -155,6 +172,8 @@ impl ConnHandle {
     /// connection's callback (stashing this handle first) asks the owning
     /// reactor to actually push the bytes onto the wire, without blocking or
     /// busy-polling.
+    ///
+    /// Silently dropped for a task-only handle — see [`Self::with_endpoint`].
     pub fn poke(&self) {
         self.with_endpoint(|ep| ep.poke_handler());
     }
@@ -189,5 +208,56 @@ impl ConnHandle {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// `with_endpoint` (and `send`/`close`/`poke`, built on it) must not
+    /// panic for a task-only handle — the task is dropped, not run, but
+    /// that drop must stay silent-safe (no crash), just observable (see the
+    /// `eprintln!` in `with_endpoint`, not asserted here since this crate
+    /// has no stderr-capturing test infra).
+    #[test]
+    fn with_endpoint_on_task_only_handle_drops_without_panicking() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+        let handle = ConnHandle::from_execute(Arc::new(|task| task()));
+
+        handle.with_endpoint(move |_ep| {
+            ran2.store(true, Ordering::SeqCst);
+        });
+
+        assert!(!ran.load(Ordering::SeqCst), "task-only handle must not run an with_endpoint task");
+    }
+
+    #[test]
+    fn send_close_poke_on_task_only_handle_do_not_panic() {
+        let handle = ConnHandle::from_execute(Arc::new(|task| task()));
+        // None of these have an endpoint to act on for a task-only handle;
+        // the contract is just "don't panic," which this exercises for all
+        // three (each is implemented via with_endpoint).
+        handle.send(b"hello".to_vec());
+        handle.close();
+        handle.poke();
+    }
+
+    /// `execute` is the one primitive that *does* work for a task-only
+    /// handle — the documented escape hatch `with_endpoint`'s doc comment
+    /// points callers at.
+    #[test]
+    fn execute_on_task_only_handle_actually_runs_the_task() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let count2 = Arc::clone(&count);
+        let handle = ConnHandle::from_execute(Arc::new(|task| task()));
+
+        handle.execute(Box::new(move || {
+            count2.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }
