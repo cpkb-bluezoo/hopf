@@ -244,7 +244,7 @@ impl Pop3FetchDriver {
             }
         }
         if let Some(mech) = Self::choose_mechanism(&caps.sasl_mechs) {
-            let mut client = create_client(mech, &user, &pass, "", None);
+            let mut client = create_client(mech, &user, &pass, "", "pop", None);
             if client.has_initial_response() {
                 if let SaslClientStep::Response(initial) = client.evaluate(None) {
                     st.sasl_client = Some(client);
@@ -276,7 +276,7 @@ impl Pop3FetchDriver {
             return false;
         };
         if let Some(mech) = Self::choose_mechanism(&caps.sasl_mechs) {
-            let mut client = create_client(mech, &user, &pass, "", None);
+            let mut client = create_client(mech, &user, &pass, "", "pop", None);
             if client.has_initial_response() {
                 if let SaslClientStep::Response(initial) = client.evaluate(None) {
                     st.sasl_client = Some(client);
