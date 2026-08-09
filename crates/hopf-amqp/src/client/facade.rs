@@ -17,6 +17,7 @@ use super::timeout::AmqpClientTimeouts;
 ///
 /// Build with [`AmqpClient::new`] or [`AmqpClient::from_addr`], configure
 /// credentials / vhost / TLS, then [`AmqpClient::connect`] with a handler factory.
+#[derive(Clone)]
 pub struct AmqpClient {
     host: Option<String>,
     port: u16,
