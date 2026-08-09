@@ -396,7 +396,7 @@ impl SmtpClientDriver for SmtpSendDriver {
         // AUTH path.
         if let Some((user, pass)) = st.auth.clone() {
             if let Some(mech) = Self::choose_mechanism(&caps.auth_methods) {
-                let mut client = create_client(mech, &user, &pass, "", None);
+                let mut client = create_client(mech, &user, &pass, "", "smtp", None);
                 if client.has_initial_response() {
                     if let SaslClientStep::Response(initial) = client.evaluate(None) {
                         st.sasl_client = Some(client);

@@ -275,7 +275,7 @@ impl AmqpClientEndpoint {
             if mech == SaslMechanism::External && !endpoint.is_secure() {
                 return Err(AmqpError::Malformed("EXTERNAL requires a TLS connection"));
             }
-            let mut client = create_client(mech, &self.username, &self.password, "", None);
+            let mut client = create_client(mech, &self.username, &self.password, "", "amqp", None);
             let response = if client.has_initial_response() {
                 match client.evaluate(None) {
                     SaslClientStep::Response(r) | SaslClientStep::Complete(r) => r,

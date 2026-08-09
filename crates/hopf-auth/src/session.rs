@@ -117,25 +117,28 @@ pub fn create_server(
     }
 }
 
-/// Create a client session. `cert_authzid` is used for EXTERNAL (optional
-/// authzid). `channel_binding` is required for
-/// [`SaslMechanism::ScramSha256Plus`] — this connection's
-/// `tls-server-end-point` data (RFC 5929 §4); ignored by every other
-/// mechanism.
+/// Create a client session. `host` and `service` (RFC 2831 §2.1.2
+/// `serv-type`, e.g. `"imap"`, `"pop"`, `"smtp"`, `"amqp"`) together form
+/// [`SaslMechanism::DigestMd5`]'s `digest-uri`; ignored by every other
+/// mechanism. `cert_authzid` is used for EXTERNAL (optional authzid).
+/// `channel_binding` is required for [`SaslMechanism::ScramSha256Plus`] —
+/// this connection's `tls-server-end-point` data (RFC 5929 §4); ignored by
+/// every other mechanism.
 pub fn create_client(
     mechanism: SaslMechanism,
     username: &str,
     password: &str,
     host: &str,
+    service: &str,
     channel_binding: Option<&[u8]>,
 ) -> Box<dyn SaslClient> {
     match mechanism {
         SaslMechanism::Plain => Box::new(crate::plain::PlainClient::new(username, password)),
         SaslMechanism::Login => Box::new(crate::login::LoginClient::new(username, password)),
         SaslMechanism::CramMd5 => Box::new(crate::cram_md5::CramMd5Client::new(username, password)),
-        SaslMechanism::DigestMd5 => {
-            Box::new(crate::digest_md5::DigestMd5Client::new(username, password, host))
-        }
+        SaslMechanism::DigestMd5 => Box::new(crate::digest_md5::DigestMd5Client::new(
+            username, password, host, service,
+        )),
         SaslMechanism::ScramSha256 => {
             Box::new(crate::scram::ScramSha256Client::new(username, password))
         }
