@@ -40,6 +40,8 @@ pub mod class {
     pub const BASIC: u16 = 60;
     /// Confirm class (RabbitMQ extension).
     pub const CONFIRM: u16 = 85;
+    /// Tx (transactions) class.
+    pub const TX: u16 = 90;
 }
 
 /// Connection method ids.
@@ -54,6 +56,11 @@ pub mod connection {
     pub const OPEN_OK: u16 = 41;
     pub const CLOSE: u16 = 50;
     pub const CLOSE_OK: u16 = 51;
+    /// RabbitMQ extension: broker warns it will start blocking publishers
+    /// (e.g. low on memory/disk); carries a `reason` shortstr.
+    pub const BLOCKED: u16 = 60;
+    /// RabbitMQ extension: the earlier `blocked` condition has cleared.
+    pub const UNBLOCKED: u16 = 61;
 }
 
 /// Channel method ids.
@@ -99,8 +106,13 @@ pub mod basic {
     pub const PUBLISH: u16 = 40;
     pub const RETURN: u16 = 50;
     pub const DELIVER: u16 = 60;
+    pub const GET: u16 = 70;
+    pub const GET_OK: u16 = 71;
+    pub const GET_EMPTY: u16 = 72;
     pub const ACK: u16 = 80;
     pub const REJECT: u16 = 90;
+    pub const RECOVER: u16 = 110;
+    pub const RECOVER_OK: u16 = 111;
     pub const NACK: u16 = 120;
 }
 
@@ -108,6 +120,16 @@ pub mod basic {
 pub mod confirm {
     pub const SELECT: u16 = 10;
     pub const SELECT_OK: u16 = 11;
+}
+
+/// Tx (transactions) method ids.
+pub mod tx {
+    pub const SELECT: u16 = 10;
+    pub const SELECT_OK: u16 = 11;
+    pub const COMMIT: u16 = 20;
+    pub const COMMIT_OK: u16 = 21;
+    pub const ROLLBACK: u16 = 30;
+    pub const ROLLBACK_OK: u16 = 31;
 }
 
 /// Soft / hard error reply codes used in close methods (subset).

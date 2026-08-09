@@ -559,6 +559,88 @@ pub fn encode_confirm_select(no_wait: bool) -> Vec<u8> {
     vec![if no_wait { 1 } else { 0 }]
 }
 
+/// Encode tx.select / tx.commit / tx.rollback (all empty argument lists).
+pub fn encode_tx_method() -> Vec<u8> {
+    Vec::new()
+}
+
+/// Encode basic.get.
+pub fn encode_basic_get(queue: &str, no_ack: bool) -> Result<Vec<u8>, AmqpError> {
+    let mut args = Vec::new();
+    args.extend_from_slice(&0u16.to_be_bytes());
+    encode_shortstr(&mut args, queue)?;
+    args.push(if no_ack { 1 } else { 0 });
+    Ok(args)
+}
+
+/// `basic.get-ok` arguments (before content).
+#[derive(Debug, Clone)]
+pub struct BasicGetOk {
+    /// Delivery tag.
+    pub delivery_tag: u64,
+    /// Redelivered flag.
+    pub redelivered: bool,
+    /// Exchange.
+    pub exchange: String,
+    /// Routing key.
+    pub routing_key: String,
+    /// Remaining messages in the queue (not counting this one).
+    pub message_count: u32,
+}
+
+impl BasicGetOk {
+    /// Decode.
+    pub fn decode(mut data: &[u8]) -> Result<Self, AmqpError> {
+        let delivery_tag = read_u64(&mut data)?;
+        let redelivered = read_bits(&mut data)? & 1 != 0;
+        let exchange = decode_shortstr(&mut data)?.to_owned();
+        let routing_key = decode_shortstr(&mut data)?.to_owned();
+        let message_count = read_u32(&mut data)?;
+        Ok(Self {
+            delivery_tag,
+            redelivered,
+            exchange,
+            routing_key,
+            message_count,
+        })
+    }
+}
+
+/// Encode basic.recover.
+pub fn encode_basic_recover(requeue: bool) -> Vec<u8> {
+    vec![if requeue { 1 } else { 0 }]
+}
+
+/// Encode channel.flow.
+pub fn encode_channel_flow(active: bool) -> Vec<u8> {
+    vec![if active { 1 } else { 0 }]
+}
+
+/// Decode channel.flow / channel.flow-ok `active` bit.
+pub fn decode_flow_active(data: &[u8]) -> bool {
+    data.first().copied().unwrap_or(1) & 1 != 0
+}
+
+/// Encode basic.cancel-ok (reply to a broker-initiated consumer-cancel-notify).
+pub fn encode_basic_cancel_ok(consumer_tag: &str) -> Result<Vec<u8>, AmqpError> {
+    let mut args = Vec::new();
+    encode_shortstr(&mut args, consumer_tag)?;
+    Ok(args)
+}
+
+/// Decode a broker-initiated basic.cancel (consumer-cancel-notify):
+/// `(consumer_tag, no_wait)`.
+pub fn decode_basic_cancel(mut data: &[u8]) -> Result<(String, bool), AmqpError> {
+    let consumer_tag = decode_shortstr(&mut data)?.to_owned();
+    let no_wait = read_bits(&mut data)? & 1 != 0;
+    Ok((consumer_tag, no_wait))
+}
+
+/// Decode `connection.blocked` `reason` shortstr.
+pub fn decode_connection_blocked(mut data: &[u8]) -> Result<String, AmqpError> {
+    Ok(decode_shortstr(&mut data)?.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,5 +666,66 @@ mod tests {
         let args = encode_basic_publish("amq.direct", "rk", true, false).unwrap();
         let frame = encode_method(1, class::BASIC, basic::PUBLISH, &args);
         assert!(frame.len() > 8);
+    }
+
+    #[test]
+    fn basic_get_args() {
+        let args = encode_basic_get("my-queue", true).unwrap();
+        let frame = encode_method(1, class::BASIC, basic::GET, &args);
+        assert!(frame.len() > 8);
+    }
+
+    #[test]
+    fn basic_get_ok_round_trip() {
+        let mut args = Vec::new();
+        args.extend_from_slice(&42u64.to_be_bytes());
+        args.push(1); // redelivered
+        encode_shortstr(&mut args, "amq.direct").unwrap();
+        encode_shortstr(&mut args, "rk").unwrap();
+        args.extend_from_slice(&7u32.to_be_bytes());
+        let ok = BasicGetOk::decode(&args).unwrap();
+        assert_eq!(ok.delivery_tag, 42);
+        assert!(ok.redelivered);
+        assert_eq!(ok.exchange, "amq.direct");
+        assert_eq!(ok.routing_key, "rk");
+        assert_eq!(ok.message_count, 7);
+    }
+
+    #[test]
+    fn basic_recover_args() {
+        assert_eq!(encode_basic_recover(true), vec![1]);
+        assert_eq!(encode_basic_recover(false), vec![0]);
+    }
+
+    #[test]
+    fn channel_flow_round_trip() {
+        assert!(decode_flow_active(&encode_channel_flow(true)));
+        assert!(!decode_flow_active(&encode_channel_flow(false)));
+    }
+
+    #[test]
+    fn basic_cancel_ok_args() {
+        let args = encode_basic_cancel_ok("ctag-1").unwrap();
+        assert_eq!(decode_consumer_tag(&args).unwrap(), "ctag-1");
+    }
+
+    #[test]
+    fn basic_cancel_notify_round_trip() {
+        let args = encode_basic_cancel("ctag-1", true).unwrap();
+        let (tag, no_wait) = decode_basic_cancel(&args).unwrap();
+        assert_eq!(tag, "ctag-1");
+        assert!(no_wait);
+    }
+
+    #[test]
+    fn connection_blocked_reason() {
+        let mut args = Vec::new();
+        encode_shortstr(&mut args, "low on memory").unwrap();
+        assert_eq!(decode_connection_blocked(&args).unwrap(), "low on memory");
+    }
+
+    #[test]
+    fn tx_method_args_are_empty() {
+        assert!(encode_tx_method().is_empty());
     }
 }

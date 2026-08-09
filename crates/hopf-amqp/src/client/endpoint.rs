@@ -13,18 +13,21 @@ use crate::codec::encode::{
     encode_content, encode_heartbeat, encode_method, encode_protocol_header,
 };
 use crate::codec::methods::{
-    decode_ack, decode_consumer_tag, decode_nack, encode_basic_ack, encode_basic_cancel,
-    encode_basic_consume, encode_basic_nack, encode_basic_publish, encode_basic_qos,
-    encode_basic_reject, encode_channel_open, encode_confirm_select, encode_connection_open,
-    encode_connection_start_ok, encode_exchange_declare, encode_exchange_delete, encode_queue_bind,
-    encode_queue_declare, encode_queue_delete, encode_queue_purge, encode_queue_unbind, BasicDeliver,
-    BasicReturn, CloseArgs, ConnectionStart, ConnectionTune, MethodFrame, QueueDeclareOk,
+    decode_ack, decode_basic_cancel, decode_connection_blocked, decode_consumer_tag,
+    decode_flow_active, decode_nack, encode_basic_ack, encode_basic_cancel,
+    encode_basic_cancel_ok, encode_basic_consume, encode_basic_get, encode_basic_nack,
+    encode_basic_publish, encode_basic_qos, encode_basic_recover, encode_basic_reject,
+    encode_channel_flow, encode_channel_open, encode_confirm_select, encode_connection_open,
+    encode_connection_start_ok, encode_exchange_declare, encode_exchange_delete,
+    encode_queue_bind, encode_queue_declare, encode_queue_delete, encode_queue_purge,
+    encode_queue_unbind, encode_tx_method, BasicDeliver, BasicGetOk, BasicReturn, CloseArgs,
+    ConnectionStart, ConnectionTune, MethodFrame, QueueDeclareOk,
 };
 use crate::codec::parser::{AmqpFrameHandler, AmqpFrameParser};
 use crate::codec::table::{encode_amqplain, FieldTable, FieldValue};
 use crate::codec::types::{
     basic, channel as channel_ids, class, confirm, connection, exchange as exchange_ids,
-    queue as queue_ids, reply, DEFAULT_CHANNEL_MAX, DEFAULT_FRAME_MAX,
+    queue as queue_ids, reply, tx, DEFAULT_CHANNEL_MAX, DEFAULT_FRAME_MAX,
 };
 use crate::codec::{AmqpError, BasicProperties};
 
@@ -33,10 +36,11 @@ use super::handlers::{AmqpClientControl, AmqpClientDriver, AmqpClientHandlerFact
 /// Marker on TimedOut errors meaning "send a heartbeat".
 const HEARTBEAT_DUE: &str = "hopf-amqp-heartbeat-due";
 
-/// Pending content after a content-bearing method (deliver / return).
+/// Pending content after a content-bearing method (deliver / return / get-ok).
 enum PendingContent {
     Deliver(BasicDeliver),
     Return(BasicReturn),
+    Get(BasicGetOk),
 }
 
 /// Builder input bundled by [`super::facade::AmqpClient`].
@@ -335,6 +339,19 @@ impl AmqpClientEndpoint {
                     // No challenge-response beyond PLAIN/AMQPLAIN for v1.
                     self.send_method(endpoint, 0, class::CONNECTION, connection::SECURE_OK, &[]);
                 }
+                connection::BLOCKED => match decode_connection_blocked(&args) {
+                    Ok(reason) => {
+                        if let Some(ref mut d) = self.driver {
+                            d.on_connection_blocked(&reason);
+                        }
+                    }
+                    Err(e) => self.fail_io(endpoint, &e.to_string()),
+                },
+                connection::UNBLOCKED => {
+                    if let Some(ref mut d) = self.driver {
+                        d.on_connection_unblocked();
+                    }
+                }
                 _ => {}
             }
             return;
@@ -364,9 +381,22 @@ impl AmqpClientEndpoint {
                     });
                 }
                 channel_ids::FLOW => {
-                    // Echo flow-ok with same active bit.
-                    let active = args.first().copied().unwrap_or(1);
-                    self.send_method(endpoint, channel, class::CHANNEL, channel_ids::FLOW_OK, &[active]);
+                    // The protocol requires an immediate echo of flow-ok
+                    // with the same active bit, regardless of what the
+                    // driver decides to do about it.
+                    let active = decode_flow_active(&args);
+                    self.send_method(
+                        endpoint,
+                        channel,
+                        class::CHANNEL,
+                        channel_ids::FLOW_OK,
+                        &encode_channel_flow(active),
+                    );
+                    self.with_driver_control(endpoint, |d, c| d.on_flow(c, channel, active));
+                }
+                channel_ids::FLOW_OK => {
+                    let active = decode_flow_active(&args);
+                    self.with_driver_control(endpoint, |d, c| d.on_flow_ok(c, channel, active));
                 }
                 _ => {}
             }
@@ -438,6 +468,22 @@ impl AmqpClientEndpoint {
             return;
         }
 
+        if class_id == class::TX {
+            match method_id {
+                tx::SELECT_OK => {
+                    self.with_driver_control(endpoint, |d, c| d.on_tx_select_ok(c, channel));
+                }
+                tx::COMMIT_OK => {
+                    self.with_driver_control(endpoint, |d, c| d.on_tx_commit_ok(c, channel));
+                }
+                tx::ROLLBACK_OK => {
+                    self.with_driver_control(endpoint, |d, c| d.on_tx_rollback_ok(c, channel));
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if class_id == class::BASIC {
             match method_id {
                 basic::QOS_OK => {
@@ -455,6 +501,31 @@ impl AmqpClientEndpoint {
                     }
                     Err(e) => self.fail_io(endpoint, &e.to_string()),
                 },
+                basic::CANCEL => match decode_basic_cancel(&args) {
+                    // Broker-initiated consumer-cancel-notify (RabbitMQ
+                    // extension), not a reply to our own basic_cancel.
+                    Ok((tag, no_wait)) => {
+                        if !no_wait {
+                            match encode_basic_cancel_ok(&tag) {
+                                Ok(a) => self.send_method(
+                                    endpoint,
+                                    channel,
+                                    class::BASIC,
+                                    basic::CANCEL_OK,
+                                    &a,
+                                ),
+                                Err(e) => {
+                                    self.fail_io(endpoint, &e.to_string());
+                                    return;
+                                }
+                            }
+                        }
+                        self.with_driver_control(endpoint, |d, c| {
+                            d.on_consumer_cancelled(c, channel, &tag);
+                        });
+                    }
+                    Err(e) => self.fail_io(endpoint, &e.to_string()),
+                },
                 basic::DELIVER => match BasicDeliver::decode(&args) {
                     Ok(d) => {
                         self.pending_content = Some(PendingContent::Deliver(d));
@@ -469,6 +540,19 @@ impl AmqpClientEndpoint {
                     }
                     Err(e) => self.fail_io(endpoint, &e.to_string()),
                 },
+                basic::GET_OK => match BasicGetOk::decode(&args) {
+                    Ok(ok) => {
+                        self.pending_content = Some(PendingContent::Get(ok));
+                        self.content_is_return = false;
+                    }
+                    Err(e) => self.fail_io(endpoint, &e.to_string()),
+                },
+                basic::GET_EMPTY => {
+                    self.with_driver_control(endpoint, |d, c| d.on_get_empty(c, channel));
+                }
+                basic::RECOVER_OK => {
+                    self.with_driver_control(endpoint, |d, c| d.on_recover_ok(c, channel));
+                }
                 basic::ACK => match decode_ack(&args) {
                     Ok((tag, multiple)) => {
                         self.with_driver_control(endpoint, |d, c| d.on_ack(c, channel, tag, multiple));
@@ -533,6 +617,25 @@ impl AmqpClientEndpoint {
                         body_size,
                     );
                 }
+                if body_size == 0 {
+                    self.finish_content(endpoint, channel);
+                }
+            }
+            Some(PendingContent::Get(ok)) => {
+                self.pending_content = Some(PendingContent::Get(ok.clone()));
+                self.with_driver_control(endpoint, |d, c| {
+                    d.on_get_ok(
+                        c,
+                        channel,
+                        ok.delivery_tag,
+                        ok.redelivered,
+                        &ok.exchange,
+                        &ok.routing_key,
+                        ok.message_count,
+                        &props,
+                        body_size,
+                    );
+                });
                 if body_size == 0 {
                     self.finish_content(endpoint, channel);
                 }
@@ -879,6 +982,53 @@ impl AmqpClientControl for ControlAdapter<'_> {
         let args = encode_basic_reject(delivery_tag, requeue);
         self.inner
             .send_method(self.endpoint, channel, class::BASIC, basic::REJECT, &args);
+    }
+
+    fn basic_get(&mut self, channel: u16, queue: &str, no_ack: bool) {
+        match encode_basic_get(queue, no_ack) {
+            Ok(args) => {
+                self.inner
+                    .send_method(self.endpoint, channel, class::BASIC, basic::GET, &args);
+            }
+            Err(e) => self.inner.fail_io(self.endpoint, &e.to_string()),
+        }
+    }
+
+    fn basic_recover(&mut self, channel: u16, requeue: bool) {
+        let args = encode_basic_recover(requeue);
+        self.inner
+            .send_method(self.endpoint, channel, class::BASIC, basic::RECOVER, &args);
+    }
+
+    fn flow(&mut self, channel: u16, active: bool) {
+        let args = encode_channel_flow(active);
+        self.inner.send_method(
+            self.endpoint,
+            channel,
+            class::CHANNEL,
+            channel_ids::FLOW,
+            &args,
+        );
+    }
+
+    fn tx_select(&mut self, channel: u16) {
+        self.inner
+            .send_method(self.endpoint, channel, class::TX, tx::SELECT, &encode_tx_method());
+    }
+
+    fn tx_commit(&mut self, channel: u16) {
+        self.inner
+            .send_method(self.endpoint, channel, class::TX, tx::COMMIT, &encode_tx_method());
+    }
+
+    fn tx_rollback(&mut self, channel: u16) {
+        self.inner.send_method(
+            self.endpoint,
+            channel,
+            class::TX,
+            tx::ROLLBACK,
+            &encode_tx_method(),
+        );
     }
 
     fn connection_close(&mut self, reply_code: u16, reply_text: &str) {
