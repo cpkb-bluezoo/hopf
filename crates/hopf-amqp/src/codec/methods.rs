@@ -111,6 +111,18 @@ pub fn encode_connection_start_ok(
     Ok(args)
 }
 
+/// Decode `connection.secure`'s single `challenge` longstr.
+pub fn decode_connection_secure(mut data: &[u8]) -> Result<Vec<u8>, AmqpError> {
+    Ok(decode_longstr(&mut data)?.to_vec())
+}
+
+/// Encode `connection.secure-ok`'s single `response` longstr.
+pub fn encode_connection_secure_ok(response: &[u8]) -> Vec<u8> {
+    let mut args = Vec::new();
+    encode_longstr(&mut args, response);
+    args
+}
+
 /// `connection.tune` arguments.
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectionTune {
@@ -727,5 +739,21 @@ mod tests {
     #[test]
     fn tx_method_args_are_empty() {
         assert!(encode_tx_method().is_empty());
+    }
+
+    #[test]
+    fn connection_secure_round_trip() {
+        let mut args = Vec::new();
+        encode_longstr(&mut args, b"digest challenge bytes");
+        assert_eq!(
+            decode_connection_secure(&args).unwrap(),
+            b"digest challenge bytes"
+        );
+    }
+
+    #[test]
+    fn connection_secure_ok_round_trip() {
+        let args = encode_connection_secure_ok(b"response bytes");
+        assert_eq!(decode_connection_secure(&args).unwrap(), b"response bytes");
     }
 }

@@ -6,22 +6,22 @@ use std::collections::HashMap;
 use std::io;
 use std::time::Duration;
 
-use hopf_auth::plain::encode_credentials;
+use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
 use hopf_core::{Endpoint, ProtocolHandler, SharedTlsConnector, TimerHandle};
 
 use crate::codec::encode::{
     encode_content, encode_heartbeat, encode_method, encode_protocol_header,
 };
 use crate::codec::methods::{
-    decode_ack, decode_basic_cancel, decode_connection_blocked, decode_consumer_tag,
-    decode_flow_active, decode_nack, encode_basic_ack, encode_basic_cancel,
+    decode_ack, decode_basic_cancel, decode_connection_blocked, decode_connection_secure,
+    decode_consumer_tag, decode_flow_active, decode_nack, encode_basic_ack, encode_basic_cancel,
     encode_basic_cancel_ok, encode_basic_consume, encode_basic_get, encode_basic_nack,
     encode_basic_publish, encode_basic_qos, encode_basic_recover, encode_basic_reject,
     encode_channel_flow, encode_channel_open, encode_confirm_select, encode_connection_open,
-    encode_connection_start_ok, encode_exchange_declare, encode_exchange_delete,
-    encode_queue_bind, encode_queue_declare, encode_queue_delete, encode_queue_purge,
-    encode_queue_unbind, encode_tx_method, BasicDeliver, BasicGetOk, BasicReturn, CloseArgs,
-    ConnectionStart, ConnectionTune, MethodFrame, QueueDeclareOk,
+    encode_connection_secure_ok, encode_connection_start_ok, encode_exchange_declare,
+    encode_exchange_delete, encode_queue_bind, encode_queue_declare, encode_queue_delete,
+    encode_queue_purge, encode_queue_unbind, encode_tx_method, BasicDeliver, BasicGetOk,
+    BasicReturn, CloseArgs, ConnectionStart, ConnectionTune, MethodFrame, QueueDeclareOk,
 };
 use crate::codec::parser::{AmqpFrameHandler, AmqpFrameParser};
 use crate::codec::table::{encode_amqplain, FieldTable, FieldValue};
@@ -52,6 +52,9 @@ pub struct AmqpClientParams {
     pub username: String,
     /// Password (default `guest`).
     pub password: String,
+    /// Forced SASL mechanism wire name (e.g. `"EXTERNAL"`); `None` means
+    /// auto-negotiate PLAIN, then AMQPLAIN.
+    pub mechanism: Option<String>,
     /// Client-preferred heartbeat seconds (0 = none); negotiated with broker.
     pub heartbeat: u16,
     /// Client frame_max cap (0 = accept broker).
@@ -77,6 +80,11 @@ pub struct AmqpClientEndpoint {
     virtual_host: String,
     username: String,
     password: String,
+    mechanism: Option<String>,
+    /// SASL exchange in progress between `connection.start-ok` and the
+    /// final `connection.tune` (`Some` only while a multi-step mechanism
+    /// is mid-handshake).
+    sasl_client: Option<Box<dyn SaslClient>>,
     preferred_heartbeat: u16,
     preferred_frame_max: u32,
     preferred_channel_max: u16,
@@ -108,6 +116,8 @@ impl AmqpClientEndpoint {
             virtual_host: params.virtual_host,
             username: params.username,
             password: params.password,
+            mechanism: params.mechanism,
+            sasl_client: None,
             preferred_heartbeat: params.heartbeat,
             preferred_frame_max: params.frame_max,
             preferred_channel_max: params.channel_max,
@@ -248,28 +258,53 @@ impl AmqpClientEndpoint {
         );
         client_props.insert("platform".into(), FieldValue::longstr("Rust"));
 
-        let (mechanism, response) = if mechs.iter().any(|m| *m == "PLAIN") {
-            let resp = encode_credentials("", &self.username, &self.password);
-            ("PLAIN", resp)
-        } else if mechs.iter().any(|m| *m == "AMQPLAIN") {
-            let resp = encode_amqplain(&self.username, &self.password)?;
-            ("AMQPLAIN", resp)
+        let chosen = choose_mechanism(self.mechanism.as_deref(), &mechs)?;
+
+        let response = if chosen.eq_ignore_ascii_case("AMQPLAIN") {
+            encode_amqplain(&self.username, &self.password)?
         } else {
-            return Err(AmqpError::Malformed("no supported SASL mechanism"));
+            // AMQPLAIN aside, only PLAIN and EXTERNAL are wired through
+            // hopf_auth today — anything else (a forced but unimplemented
+            // mechanism, e.g. GSSAPI or DIGEST-MD5) fails clearly here
+            // rather than being silently attempted.
+            let mech = match chosen.to_ascii_uppercase().as_str() {
+                "PLAIN" => SaslMechanism::Plain,
+                "EXTERNAL" => SaslMechanism::External,
+                _ => return Err(AmqpError::Malformed("unsupported SASL mechanism")),
+            };
+            if mech == SaslMechanism::External && !endpoint.is_secure() {
+                return Err(AmqpError::Malformed("EXTERNAL requires a TLS connection"));
+            }
+            let mut client = create_client(mech, &self.username, &self.password, "", None);
+            let response = if client.has_initial_response() {
+                match client.evaluate(None) {
+                    SaslClientStep::Response(r) | SaslClientStep::Complete(r) => r,
+                    SaslClientStep::Failure => {
+                        return Err(AmqpError::Malformed("SASL mechanism setup failed"));
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            self.sasl_client = Some(client);
+            response
         };
 
-        let args = encode_connection_start_ok(&client_props, mechanism, &response, "en_US")?;
+        let start_ok_args = encode_connection_start_ok(&client_props, &chosen, &response, "en_US")?;
         self.send_method(
             endpoint,
             0,
             class::CONNECTION,
             connection::START_OK,
-            &args,
+            &start_ok_args,
         );
         Ok(())
     }
 
     fn handle_connection_tune(&mut self, endpoint: &mut dyn Endpoint, args: &[u8]) -> Result<(), AmqpError> {
+        // The SASL exchange is over once we reach tune (regardless of how
+        // many connection.secure round-trips it took).
+        self.sasl_client = None;
         let tune = ConnectionTune::decode(args)?;
         let channel_max = negotiate_max_u16(tune.channel_max, self.preferred_channel_max, DEFAULT_CHANNEL_MAX);
         let frame_max = negotiate_max_u32(tune.frame_max, self.preferred_frame_max, DEFAULT_FRAME_MAX);
@@ -336,8 +371,36 @@ impl AmqpClientEndpoint {
                     endpoint.close();
                 }
                 connection::SECURE => {
-                    // No challenge-response beyond PLAIN/AMQPLAIN for v1.
-                    self.send_method(endpoint, 0, class::CONNECTION, connection::SECURE_OK, &[]);
+                    let challenge = match decode_connection_secure(&args) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            self.fail_io(endpoint, &e.to_string());
+                            return;
+                        }
+                    };
+                    let Some(mut client) = self.sasl_client.take() else {
+                        self.fail_io(
+                            endpoint,
+                            "unexpected connection.secure (no SASL exchange in progress)",
+                        );
+                        return;
+                    };
+                    match client.evaluate(Some(&challenge)) {
+                        SaslClientStep::Response(r) | SaslClientStep::Complete(r) => {
+                            let ok_args = encode_connection_secure_ok(&r);
+                            self.sasl_client = Some(client);
+                            self.send_method(
+                                endpoint,
+                                0,
+                                class::CONNECTION,
+                                connection::SECURE_OK,
+                                &ok_args,
+                            );
+                        }
+                        SaslClientStep::Failure => {
+                            self.fail_io(endpoint, "SASL mechanism rejected broker challenge");
+                        }
+                    }
                 }
                 connection::BLOCKED => match decode_connection_blocked(&args) {
                     Ok(reason) => {
@@ -693,6 +756,69 @@ fn negotiate_heartbeat(broker: u16, client: u16) -> u16 {
         (0, c) => c,
         (b, 0) => b,
         (b, c) => b.min(c),
+    }
+}
+
+/// Pick the SASL mechanism wire name to send in `connection.start-ok`.
+///
+/// If `forced` is set, it must appear (case-insensitively) in `advertised`
+/// or this fails clearly rather than silently substituting a different
+/// mechanism. Otherwise, the original unconditional default: the first of
+/// PLAIN, then AMQPLAIN, that the broker advertises.
+fn choose_mechanism(forced: Option<&str>, advertised: &[&str]) -> Result<String, AmqpError> {
+    if let Some(name) = forced {
+        if advertised.iter().any(|m| m.eq_ignore_ascii_case(name)) {
+            Ok(name.to_owned())
+        } else {
+            Err(AmqpError::Malformed(
+                "broker does not advertise the requested SASL mechanism",
+            ))
+        }
+    } else {
+        ["PLAIN", "AMQPLAIN"]
+            .into_iter()
+            .find(|want| advertised.iter().any(|m| m.eq_ignore_ascii_case(want)))
+            .map(str::to_owned)
+            .ok_or(AmqpError::Malformed("no supported SASL mechanism"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_prefers_plain_over_amqplain() {
+        assert_eq!(
+            choose_mechanism(None, &["AMQPLAIN", "PLAIN"]).unwrap(),
+            "PLAIN"
+        );
+    }
+
+    #[test]
+    fn default_falls_back_to_amqplain() {
+        assert_eq!(
+            choose_mechanism(None, &["AMQPLAIN", "EXTERNAL"]).unwrap(),
+            "AMQPLAIN"
+        );
+    }
+
+    #[test]
+    fn default_errors_when_neither_advertised() {
+        assert!(choose_mechanism(None, &["EXTERNAL", "GSSAPI"]).is_err());
+    }
+
+    #[test]
+    fn forced_mechanism_used_case_insensitively_when_advertised() {
+        assert_eq!(
+            choose_mechanism(Some("external"), &["PLAIN", "EXTERNAL"]).unwrap(),
+            "external"
+        );
+    }
+
+    #[test]
+    fn forced_mechanism_errors_when_not_advertised() {
+        assert!(choose_mechanism(Some("EXTERNAL"), &["PLAIN", "AMQPLAIN"]).is_err());
     }
 }
 
