@@ -119,6 +119,27 @@ pub trait AmqpClientControl {
     /// Reject a delivery.
     fn basic_reject(&mut self, channel: u16, delivery_tag: u64, requeue: bool);
 
+    /// Poll-fetch a single message (`basic.get`), as an alternative to a
+    /// push `basic.consume` subscription.
+    fn basic_get(&mut self, channel: u16, queue: &str, no_ack: bool);
+
+    /// Ask the broker to redeliver all unacknowledged messages on this
+    /// channel (`basic.recover`).
+    fn basic_recover(&mut self, channel: u16, requeue: bool);
+
+    /// Pause (`active = false`) or resume (`active = true`) delivery on a
+    /// channel (`channel.flow`, client-initiated).
+    fn flow(&mut self, channel: u16, active: bool);
+
+    /// Select transaction mode for a channel (`tx.select`).
+    fn tx_select(&mut self, channel: u16);
+
+    /// Commit the current transaction (`tx.commit`).
+    fn tx_commit(&mut self, channel: u16);
+
+    /// Roll back the current transaction (`tx.rollback`).
+    fn tx_rollback(&mut self, channel: u16);
+
     /// Close the connection gracefully.
     fn connection_close(&mut self, reply_code: u16, reply_text: &str);
 }
@@ -270,6 +291,95 @@ pub trait AmqpClientDriver: Send {
     ) {
         let _ = (client, channel, delivery_tag, multiple, requeue);
     }
+
+    /// `basic.get` found a message (`basic.get-ok`). Content follows via the
+    /// same [`Self::on_delivery_data`] / [`Self::on_delivery_complete`]
+    /// callbacks used for a pushed `basic.deliver`.
+    #[allow(clippy::too_many_arguments)]
+    fn on_get_ok(
+        &mut self,
+        client: &mut dyn AmqpClientControl,
+        channel: u16,
+        delivery_tag: u64,
+        redelivered: bool,
+        exchange: &str,
+        routing_key: &str,
+        message_count: u32,
+        properties: &BasicProperties,
+        body_len: u64,
+    ) {
+        let _ = (
+            client,
+            channel,
+            delivery_tag,
+            redelivered,
+            exchange,
+            routing_key,
+            message_count,
+            properties,
+            body_len,
+        );
+    }
+
+    /// `basic.get` found the queue empty (`basic.get-empty`).
+    fn on_get_empty(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
+        let _ = (client, channel);
+    }
+
+    /// `basic.recover-ok` — the broker will redeliver unacked messages.
+    fn on_recover_ok(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
+        let _ = (client, channel);
+    }
+
+    /// Reply to a client-initiated [`AmqpClientControl::flow`] request.
+    fn on_flow_ok(&mut self, client: &mut dyn AmqpClientControl, channel: u16, active: bool) {
+        let _ = (client, channel, active);
+    }
+
+    /// Broker-initiated `channel.flow` — the endpoint always auto-replies
+    /// with `flow-ok` (required by the protocol); this callback lets the
+    /// driver observe and react (e.g. pause publishing) to the requested
+    /// state.
+    fn on_flow(&mut self, client: &mut dyn AmqpClientControl, channel: u16, active: bool) {
+        let _ = (client, channel, active);
+    }
+
+    /// Broker-initiated consumer-cancel-notify (RabbitMQ extension, e.g.
+    /// the consumer's queue was deleted). The endpoint auto-replies with
+    /// `cancel-ok` unless the broker set `no_wait`.
+    fn on_consumer_cancelled(
+        &mut self,
+        client: &mut dyn AmqpClientControl,
+        channel: u16,
+        consumer_tag: &str,
+    ) {
+        let _ = (client, channel, consumer_tag);
+    }
+
+    /// `tx.select-ok` — the channel is now in transactional mode.
+    fn on_tx_select_ok(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
+        let _ = (client, channel);
+    }
+
+    /// `tx.commit-ok`.
+    fn on_tx_commit_ok(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
+        let _ = (client, channel);
+    }
+
+    /// `tx.rollback-ok`.
+    fn on_tx_rollback_ok(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
+        let _ = (client, channel);
+    }
+
+    /// RabbitMQ extension: the broker will block/has blocked publishers
+    /// (e.g. low on resources). `reason` is broker-supplied free text.
+    fn on_connection_blocked(&mut self, reason: &str) {
+        let _ = reason;
+    }
+
+    /// RabbitMQ extension: a previous [`Self::on_connection_blocked`]
+    /// condition has cleared.
+    fn on_connection_unblocked(&mut self) {}
 
     /// Connection closed by peer or after `connection_close`.
     fn on_connection_close(&mut self, reply_code: u16, reply_text: &str) {
