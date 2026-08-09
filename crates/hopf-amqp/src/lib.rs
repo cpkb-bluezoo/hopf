@@ -3,11 +3,14 @@
 //! AMQP 0-9-1 async client for Hopf (RabbitMQ).
 //!
 //! Client-only: dial a broker, publish opaque message bodies with basic
-//! properties, and consume via push `basic.consume` deliveries or pull
-//! `basic.get`. Also supports classic AMQP transactions (`tx.*`), channel
-//! flow control, `basic.recover`, PLAIN / AMQPLAIN / EXTERNAL SASL
-//! (auto-negotiated, or forced via [`client::AmqpClient::mechanism`]), and
-//! automatic reconnection with topology/consumer replay via
+//! properties — either whole via `basic.publish`, or streamed in pieces
+//! via `basic.publish-start`/`basic.publish-body` for large bodies the
+//! caller doesn't want to materialize as one contiguous buffer — and
+//! consume via push `basic.consume` deliveries or pull `basic.get`. Also
+//! supports classic AMQP transactions (`tx.*`), channel flow control,
+//! `basic.recover`, PLAIN / AMQPLAIN / EXTERNAL SASL (auto-negotiated, or
+//! forced via [`client::AmqpClient::mechanism`]), and automatic
+//! reconnection with topology/consumer replay via
 //! [`client::AmqpRecoveringClient`]. There is no broker implementation in
 //! this crate.
 //!

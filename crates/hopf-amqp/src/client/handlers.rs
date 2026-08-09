@@ -91,6 +91,32 @@ pub trait AmqpClientControl {
         body: &[u8],
     );
 
+    /// Start a streaming publish: sends `basic.publish` plus the content
+    /// header declaring `body_len` bytes to follow. Feed the body via one
+    /// or more [`Self::basic_publish_body`] calls whose chunk lengths sum
+    /// to exactly `body_len` (a mismatch produces a malformed message the
+    /// broker will reject) — this is the streaming counterpart to
+    /// [`Self::basic_publish`] for large bodies the caller doesn't want to
+    /// materialize as one contiguous buffer (e.g. reading a large file in
+    /// fixed-size chunks).
+    #[allow(clippy::too_many_arguments)]
+    fn basic_publish_start(
+        &mut self,
+        channel: u16,
+        exchange: &str,
+        routing_key: &str,
+        mandatory: bool,
+        immediate: bool,
+        properties: &BasicProperties,
+        body_len: u64,
+    );
+
+    /// Feed the next chunk of a streaming publish started with
+    /// [`Self::basic_publish_start`]. `chunk` is split into wire frames at
+    /// the negotiated frame size automatically — it doesn't need to align
+    /// with any particular boundary. An empty `chunk` is a harmless no-op.
+    fn basic_publish_body(&mut self, channel: u16, chunk: &[u8]);
+
     /// Set QoS / prefetch.
     fn basic_qos(&mut self, channel: u16, prefetch_size: u32, prefetch_count: u16, global: bool);
 
