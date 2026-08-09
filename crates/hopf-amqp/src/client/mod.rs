@@ -48,10 +48,12 @@ mod endpoint;
 mod error;
 mod facade;
 mod handlers;
+mod recovery;
 mod timeout;
 
 pub use endpoint::{AmqpClientEndpoint, AmqpClientParams};
 pub use error::{AmqpClientError, AmqpClientResult};
 pub use facade::AmqpClient;
 pub use handlers::{AmqpClientControl, AmqpClientDriver, AmqpClientHandlerFactory};
+pub use recovery::{AmqpRecoveringClient, AmqpRecoveringHandle, RecoveryListener, RecoveryPolicy};
 pub use timeout::AmqpClientTimeouts;

@@ -5,9 +5,11 @@
 //! Client-only: dial a broker, publish opaque message bodies with basic
 //! properties, and consume via push `basic.consume` deliveries or pull
 //! `basic.get`. Also supports classic AMQP transactions (`tx.*`), channel
-//! flow control, `basic.recover`, and PLAIN / AMQPLAIN / EXTERNAL SASL
-//! (auto-negotiated, or forced via [`client::AmqpClient::mechanism`]).
-//! There is no broker implementation in this crate.
+//! flow control, `basic.recover`, PLAIN / AMQPLAIN / EXTERNAL SASL
+//! (auto-negotiated, or forced via [`client::AmqpClient::mechanism`]), and
+//! automatic reconnection with topology/consumer replay via
+//! [`client::AmqpRecoveringClient`]. There is no broker implementation in
+//! this crate.
 //!
 //! # Layout
 //!
