@@ -150,15 +150,19 @@ pub(crate) struct DigestMd5Client {
     username: String,
     password: String,
     host: String,
+    /// `serv-type` half of the `digest-uri` (RFC 2831 §2.1.2), e.g. `"imap"`,
+    /// `"pop"`, `"smtp"` — the protocol the caller is authenticating for.
+    service: String,
     complete: bool,
 }
 
 impl DigestMd5Client {
-    pub fn new(username: &str, password: &str, host: &str) -> Self {
+    pub fn new(username: &str, password: &str, host: &str, service: &str) -> Self {
         Self {
             username: username.into(),
             password: password.into(),
             host: host.into(),
+            service: service.into(),
             complete: false,
         }
     }
@@ -195,7 +199,7 @@ impl SaslClient for DigestMd5Client {
         let cnonce = generate_nonce_hex(8);
         let nc = "00000001";
         let qop = "auth";
-        let digest_uri = format!("smtp/{}", self.host);
+        let digest_uri = format!("{}/{}", self.service, self.host);
         let ha1 = compute_ha1(&self.username, &realm, &self.password);
         let session_ha1 = md5_hex(format!("{ha1}:{nonce}:{cnonce}").as_bytes());
         let ha2 = md5_hex(format!("AUTHENTICATE:{digest_uri}").as_bytes());
@@ -230,5 +234,30 @@ mod tests {
         let ch = generate_challenge("realm", "abc");
         assert!(ch.contains("realm=\"realm\""));
         assert!(ch.contains("nonce=\"abc\""));
+    }
+
+    /// Two callers authenticating the same user against the same server for
+    /// two different protocols (e.g. IMAP vs POP) must produce different
+    /// `digest-uri`s (RFC 2831 §2.1.2: `serv-type/host`) — a server that
+    /// validates it (real DIGEST-MD5 servers do) would otherwise accept a
+    /// response computed for the wrong protocol.
+    #[test]
+    fn digest_uri_reflects_caller_supplied_service() {
+        let challenge = generate_challenge("realm", "abc");
+        let mut imap_client = DigestMd5Client::new("u", "p", "host.example", "imap");
+        let SaslClientStep::Complete(imap_msg) = imap_client.evaluate(Some(challenge.as_bytes()))
+        else {
+            panic!("expected Complete");
+        };
+        let imap_text = String::from_utf8(imap_msg).unwrap();
+        assert!(imap_text.contains("digest-uri=\"imap/host.example\""));
+
+        let mut pop_client = DigestMd5Client::new("u", "p", "host.example", "pop");
+        let SaslClientStep::Complete(pop_msg) = pop_client.evaluate(Some(challenge.as_bytes()))
+        else {
+            panic!("expected Complete");
+        };
+        let pop_text = String::from_utf8(pop_msg).unwrap();
+        assert!(pop_text.contains("digest-uri=\"pop/host.example\""));
     }
 }
