@@ -205,7 +205,7 @@ mod tests {
             SaslMechanism::External => ("", ""),
             _ => ("alice", "s3cret"),
         };
-        let mut client = create_client(mech, user, pass, "mail.example", None);
+        let mut client = create_client(mech, user, pass, "mail.example", "smtp", None);
 
         let mut client_msg: Option<Vec<u8>> = if client.has_initial_response() {
             match client.evaluate(None) {
@@ -281,6 +281,7 @@ mod tests {
             "alice",
             "s3cret",
             "mail.example",
+            "smtp",
             Some(&channel_binding),
         );
         assert_eq!(server.mechanism(), SaslMechanism::ScramSha256Plus);
