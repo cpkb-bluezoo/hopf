@@ -72,6 +72,24 @@ pub fn max_body_per_frame(frame_max: u32) -> usize {
     fm.saturating_sub(8) as usize
 }
 
+/// Encode one or more content body frames for `chunk`, splitting it at
+/// `frame_max` boundaries as needed. For streaming publish, where the
+/// caller feeds arbitrary-sized chunks (e.g. disk-read buffers) that may
+/// be larger or smaller than the negotiated frame size — unlike
+/// [`encode_content_body`], which assumes the caller already split to fit.
+/// An empty `chunk` encodes to nothing (a no-op write).
+pub fn encode_content_body_chunk(channel: u16, chunk: &[u8], frame_max: u32) -> Vec<u8> {
+    let max = max_body_per_frame(frame_max).max(1);
+    let mut out = Vec::with_capacity(chunk.len() + 8 * chunk.len().div_ceil(max.max(1)));
+    let mut offset = 0;
+    while offset < chunk.len() {
+        let end = (offset + max).min(chunk.len());
+        out.extend_from_slice(&encode_content_body(channel, &chunk[offset..end]));
+        offset = end;
+    }
+    out
+}
+
 /// Encode a full Basic content (header + body frames), splitting by `frame_max`.
 pub fn encode_content(
     channel: u16,
@@ -118,5 +136,62 @@ mod tests {
     fn heartbeat_empty() {
         let h = encode_heartbeat();
         assert_eq!(h, vec![FRAME_HEARTBEAT, 0, 0, 0, 0, 0, 0, FRAME_END]);
+    }
+
+    #[test]
+    fn body_chunk_oversized_splits_into_multiple_frames() {
+        let chunk = vec![7u8; 100];
+        let frames = encode_content_body_chunk(1, &chunk, 32);
+        let body_frames = frames.iter().filter(|&&b| b == FRAME_BODY).count();
+        assert!(body_frames > 1);
+    }
+
+    #[test]
+    fn body_chunk_undersized_is_one_frame() {
+        let chunk = vec![7u8; 10];
+        let frames = encode_content_body_chunk(1, &chunk, 4096);
+        let body_frames = frames.iter().filter(|&&b| b == FRAME_BODY).count();
+        assert_eq!(body_frames, 1);
+    }
+
+    #[test]
+    fn body_chunk_empty_encodes_to_nothing() {
+        let frames = encode_content_body_chunk(1, &[], 4096);
+        assert!(frames.is_empty());
+    }
+
+    /// Concatenate every `FRAME_BODY` frame's payload, in order — frame
+    /// *boundaries* needn't match between whole-body and chunked encoding
+    /// (chunk sizes differ), only the reassembled bytes.
+    fn extract_body_bytes(mut frames: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        while !frames.is_empty() {
+            let frame_type = frames[0];
+            let size = u32::from_be_bytes([frames[3], frames[4], frames[5], frames[6]]) as usize;
+            let payload = &frames[7..7 + size];
+            if frame_type == FRAME_BODY {
+                out.extend_from_slice(payload);
+            }
+            frames = &frames[7 + size + 1..]; // + frame-end octet
+        }
+        out
+    }
+
+    #[test]
+    fn body_chunk_reassembles_to_the_same_bytes_as_whole_body_encoding() {
+        // Streaming a body in two arbitrarily-sized pieces must reassemble
+        // to the same bytes as encoding it whole via encode_content, given
+        // the same frame_max — even though individual frame boundaries
+        // differ between the two encodings.
+        let props = BasicProperties::new();
+        let body: Vec<u8> = (0..100u16).map(|i| i as u8).collect();
+        let whole = encode_content(1, &props, &body, 32).unwrap();
+
+        let mut streamed = encode_content_header(1, body.len() as u64, &props).unwrap();
+        streamed.extend_from_slice(&encode_content_body_chunk(1, &body[..40], 32));
+        streamed.extend_from_slice(&encode_content_body_chunk(1, &body[40..], 32));
+
+        assert_eq!(extract_body_bytes(&whole), body);
+        assert_eq!(extract_body_bytes(&streamed), body);
     }
 }

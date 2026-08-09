@@ -10,7 +10,8 @@ use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
 use hopf_core::{Endpoint, ProtocolHandler, SharedTlsConnector, TimerHandle};
 
 use crate::codec::encode::{
-    encode_content, encode_heartbeat, encode_method, encode_protocol_header,
+    encode_content, encode_content_body_chunk, encode_content_header, encode_heartbeat,
+    encode_method, encode_protocol_header,
 };
 use crate::codec::methods::{
     decode_ack, decode_basic_cancel, decode_connection_blocked, decode_connection_secure,
@@ -1041,6 +1042,38 @@ impl AmqpClientControl for ControlAdapter<'_> {
             }
             Err(e) => self.inner.fail_io(self.endpoint, &e.to_string()),
         }
+    }
+
+    fn basic_publish_start(
+        &mut self,
+        channel: u16,
+        exchange: &str,
+        routing_key: &str,
+        mandatory: bool,
+        immediate: bool,
+        properties: &BasicProperties,
+        body_len: u64,
+    ) {
+        match encode_basic_publish(exchange, routing_key, mandatory, immediate) {
+            Ok(args) => {
+                self.inner.send_method(self.endpoint, channel, class::BASIC, basic::PUBLISH, &args);
+                match encode_content_header(channel, body_len, properties) {
+                    Ok(header) => {
+                        self.endpoint.send(&header);
+                        if let Some(tag) = self.inner.next_publish_tag.get_mut(&channel) {
+                            *tag = tag.saturating_add(1);
+                        }
+                    }
+                    Err(e) => self.inner.fail_io(self.endpoint, &e.to_string()),
+                }
+            }
+            Err(e) => self.inner.fail_io(self.endpoint, &e.to_string()),
+        }
+    }
+
+    fn basic_publish_body(&mut self, channel: u16, chunk: &[u8]) {
+        let frames = encode_content_body_chunk(channel, chunk, self.inner.negotiated_frame_max);
+        self.endpoint.send(&frames);
     }
 
     fn basic_qos(&mut self, channel: u16, prefetch_size: u32, prefetch_count: u16, global: bool) {

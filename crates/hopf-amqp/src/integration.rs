@@ -921,3 +921,136 @@ fn recovering_client_replays_topology_after_induced_disconnect() {
     assert!(s.recovered, "RecoveryListener::on_recovered must fire");
     assert!(s.redelivered_after_recovery);
 }
+
+#[derive(Default, Clone)]
+struct StreamingPublishState {
+    body_matches: Option<bool>,
+    error: Option<String>,
+}
+
+/// Deterministic, non-repeating byte pattern — repeating a single byte
+/// wouldn't catch a chunk-boundary bug that just duplicates or drops a
+/// chunk's worth of *identical* bytes.
+fn test_body(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+struct StreamingPublishDriver {
+    queue: String,
+    state: Arc<Mutex<StreamingPublishState>>,
+    expected_body: Vec<u8>,
+    received: Vec<u8>,
+}
+
+impl AmqpClientDriver for StreamingPublishDriver {
+    fn on_connection_open(&mut self, client: &mut dyn AmqpClientControl) {
+        client.channel_open(1);
+    }
+
+    fn on_channel_open(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
+        client.queue_declare(channel, &self.queue, false, false, true, true, &FieldTable::new());
+    }
+
+    fn on_channel_close(&mut self, _: &mut dyn AmqpClientControl, _: u16, _: u16, _: &str) {}
+    fn on_exchange_declare_ok(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
+
+    fn on_queue_declare_ok(
+        &mut self,
+        client: &mut dyn AmqpClientControl,
+        channel: u16,
+        queue: &str,
+        _: u32,
+        _: u32,
+    ) {
+        client.basic_consume(channel, queue, "", false, true, false, &FieldTable::new());
+    }
+
+    fn on_consume_ok(&mut self, client: &mut dyn AmqpClientControl, channel: u16, _: &str) {
+        let mut props = BasicProperties::new();
+        props.content_type = Some("application/octet-stream".into());
+        client.basic_publish_start(
+            channel, "", &self.queue, false, false, &props, self.expected_body.len() as u64,
+        );
+        // Chunk size deliberately doesn't divide the body length evenly,
+        // and is unrelated to the broker's negotiated frame_max — the
+        // point of streaming is that neither has to line up with the
+        // other; basic_publish_body re-splits internally as needed.
+        for chunk in self.expected_body.clone().chunks(4096) {
+            client.basic_publish_body(channel, chunk);
+        }
+    }
+
+    fn on_delivery_start(
+        &mut self,
+        _: u16,
+        _: &str,
+        _: u64,
+        _: bool,
+        _: &str,
+        _: &str,
+        _: &BasicProperties,
+        body_len: u64,
+    ) {
+        self.received = Vec::with_capacity(body_len as usize);
+    }
+
+    fn on_delivery_data(&mut self, data: &[u8]) {
+        self.received.extend_from_slice(data);
+    }
+
+    fn on_delivery_complete(&mut self, client: &mut dyn AmqpClientControl, _channel: u16) {
+        self.state.lock().unwrap().body_matches = Some(self.received == self.expected_body);
+        client.connection_close(200, "streaming publish integration done");
+    }
+
+    fn on_error(&mut self, err: &io::Error) {
+        self.state.lock().unwrap().error = Some(err.to_string());
+    }
+
+    fn on_disconnected(&mut self) {}
+}
+
+struct StreamingPublishFactory {
+    queue: String,
+    state: Arc<Mutex<StreamingPublishState>>,
+}
+
+impl AmqpClientHandlerFactory for StreamingPublishFactory {
+    fn create(&self) -> Box<dyn AmqpClientDriver> {
+        Box::new(StreamingPublishDriver {
+            queue: self.queue.clone(),
+            state: Arc::clone(&self.state),
+            // Deliberately larger than any reasonable frame_max, so
+            // basic_publish_body's internal splitting is actually
+            // exercised over multiple wire frames per chunk too.
+            expected_body: test_body(200_000),
+            received: Vec::new(),
+        })
+    }
+}
+
+/// Publishes a 200KB body via `basic_publish_start`/`basic_publish_body`
+/// in 4096-byte pieces (neither aligned with the broker's frame_max nor
+/// evenly dividing the body length) and verifies the consumer reassembles
+/// exactly the original bytes.
+#[test]
+fn streaming_publish_reassembles_to_original_bytes() {
+    let (host, port, user, pass) = broker_creds();
+    let queue = format!("hopf.amqp.integ.stream.{}", std::process::id());
+
+    let state = Arc::new(Mutex::new(StreamingPublishState::default()));
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).expect("runtime"));
+    AmqpClient::new(host, port)
+        .credentials(user, pass)
+        .connect(&rt, Arc::new(StreamingPublishFactory { queue, state: Arc::clone(&state) }))
+        .expect("connect");
+
+    let s = wait_for(
+        &state,
+        20,
+        |s| &s.error,
+        |s| s.body_matches.is_some(),
+        "streaming publish round-trip",
+    );
+    assert_eq!(s.body_matches, Some(true));
+}
