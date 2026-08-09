@@ -210,6 +210,38 @@ fn publish_consume_roundtrip() {
     assert!(s.opened && s.declared && s.consumed && s.published);
 }
 
+/// Same round-trip, but with the SASL mechanism forced via
+/// [`AmqpClient::mechanism`] instead of auto-negotiated — exercises the
+/// hopf_auth-backed PLAIN path explicitly rather than incidentally.
+#[test]
+fn publish_consume_roundtrip_with_forced_plain_mechanism() {
+    let (host, port, user, pass) = broker_creds();
+    let queue = format!("hopf.amqp.integ.plain.{}", std::process::id());
+
+    let state = Arc::new(Mutex::new(State::default()));
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).expect("runtime"));
+    AmqpClient::new(host, port)
+        .credentials(user, pass)
+        .mechanism("PLAIN")
+        .connect(
+            &rt,
+            Arc::new(IntegFactory {
+                queue,
+                state: Arc::clone(&state),
+            }),
+        )
+        .expect("connect");
+
+    let s = wait_for(
+        &state,
+        15,
+        |s| &s.error,
+        |s| s.delivered && s.acked_pub,
+        "forced-PLAIN publish/consume round-trip",
+    );
+    assert!(s.opened && s.declared && s.consumed && s.published);
+}
+
 #[derive(Default, Clone)]
 struct TxState {
     committed: bool,

@@ -24,6 +24,7 @@ pub struct AmqpClient {
     virtual_host: String,
     username: String,
     password: String,
+    mechanism: Option<String>,
     heartbeat: u16,
     frame_max: u32,
     channel_max: u16,
@@ -45,6 +46,7 @@ impl AmqpClient {
             virtual_host: "/".into(),
             username: "guest".into(),
             password: "guest".into(),
+            mechanism: None,
             heartbeat: 60,
             frame_max: 0,
             channel_max: 0,
@@ -65,6 +67,7 @@ impl AmqpClient {
             virtual_host: "/".into(),
             username: "guest".into(),
             password: "guest".into(),
+            mechanism: None,
             heartbeat: 60,
             frame_max: 0,
             channel_max: 0,
@@ -86,6 +89,21 @@ impl AmqpClient {
     pub fn credentials(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.username = username.into();
         self.password = password.into();
+        self
+    }
+
+    /// Force a specific SASL mechanism by wire name (e.g. `"PLAIN"`,
+    /// `"AMQPLAIN"`, `"EXTERNAL"`). If the broker doesn't advertise it,
+    /// the connection fails clearly instead of silently falling back.
+    ///
+    /// `EXTERNAL` (TLS client-certificate auth) only makes sense with
+    /// [`AmqpClient::implicit_tls`] and a client certificate configured on
+    /// the connector.
+    ///
+    /// If unset, the client auto-negotiates PLAIN, then AMQPLAIN — the
+    /// same default as before this method existed.
+    pub fn mechanism(mut self, name: impl Into<String>) -> Self {
+        self.mechanism = Some(name.into());
         self
     }
 
@@ -136,6 +154,7 @@ impl AmqpClient {
             virtual_host: self.virtual_host.clone(),
             username: self.username.clone(),
             password: self.password.clone(),
+            mechanism: self.mechanism.clone(),
             heartbeat: self.heartbeat,
             frame_max: self.frame_max,
             channel_max: self.channel_max,
