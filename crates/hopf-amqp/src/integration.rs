@@ -16,6 +16,7 @@ use hopf_core::{Runtime, RuntimeConfig};
 
 use crate::client::{
     AmqpClient, AmqpClientControl, AmqpClientDriver, AmqpClientHandlerFactory,
+    AmqpRecoveringClient, RecoveryListener,
 };
 use crate::codec::{BasicProperties, FieldTable};
 
@@ -781,4 +782,142 @@ fn client_initiated_flow_roundtrip() {
     );
     assert_eq!(s.paused_ack, Some(false));
     assert_eq!(s.resumed_ack, Some(true));
+}
+
+#[derive(Default, Clone)]
+struct RecoveryState {
+    first_consume_ok: bool,
+    recovered: bool,
+    redelivered_after_recovery: bool,
+    error: Option<String>,
+}
+
+struct RecoveryDriver {
+    queue: String,
+    state: Arc<Mutex<RecoveryState>>,
+    consume_ok_count: u32,
+}
+
+impl AmqpClientDriver for RecoveryDriver {
+    fn on_connection_open(&mut self, client: &mut dyn AmqpClientControl) {
+        client.channel_open(1);
+    }
+
+    fn on_channel_open(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
+        client.queue_declare(channel, &self.queue, false, false, true, true, &FieldTable::new());
+    }
+
+    fn on_channel_close(&mut self, _: &mut dyn AmqpClientControl, _: u16, _: u16, _: &str) {}
+    fn on_exchange_declare_ok(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
+
+    fn on_queue_declare_ok(
+        &mut self,
+        client: &mut dyn AmqpClientControl,
+        channel: u16,
+        queue: &str,
+        _: u32,
+        _: u32,
+    ) {
+        client.basic_consume(channel, queue, "", false, true, false, &FieldTable::new());
+    }
+
+    fn on_consume_ok(&mut self, client: &mut dyn AmqpClientControl, channel: u16, _: &str) {
+        self.consume_ok_count += 1;
+        if self.consume_ok_count == 1 {
+            // First consume succeeded — mark it, then simulate an
+            // unexpected drop. AmqpRecoveringClient can't tell this apart
+            // from a real broker restart / network blip: on_disconnected
+            // fires either way and (since we never called
+            // AmqpRecoveringHandle::close()) triggers reconnect + replay.
+            self.state.lock().unwrap().first_consume_ok = true;
+            client.connection_close(200, "integration test induced disconnect");
+        } else {
+            // Reconnect replayed queue_declare + basic_consume, producing
+            // this second consume-ok — the queue/consumer are live again
+            // with no code on our side re-running that choreography.
+            let mut props = BasicProperties::new();
+            props.content_type = Some("text/plain".into());
+            client.basic_publish(channel, "", &self.queue, false, false, &props, b"post-recovery");
+        }
+    }
+
+    fn on_delivery_start(
+        &mut self,
+        _: u16,
+        _: &str,
+        _: u64,
+        _: bool,
+        _: &str,
+        _: &str,
+        _: &BasicProperties,
+        _: u64,
+    ) {
+    }
+    fn on_delivery_data(&mut self, _: &[u8]) {}
+
+    fn on_delivery_complete(&mut self, client: &mut dyn AmqpClientControl, _channel: u16) {
+        self.state.lock().unwrap().redelivered_after_recovery = true;
+        client.connection_close(200, "recovery integration done");
+    }
+
+    fn on_error(&mut self, err: &io::Error) {
+        self.state.lock().unwrap().error = Some(err.to_string());
+    }
+
+    fn on_disconnected(&mut self) {}
+}
+
+struct RecoveryFactory {
+    queue: String,
+    state: Arc<Mutex<RecoveryState>>,
+}
+
+impl AmqpClientHandlerFactory for RecoveryFactory {
+    fn create(&self) -> Box<dyn AmqpClientDriver> {
+        Box::new(RecoveryDriver {
+            queue: self.queue.clone(),
+            state: Arc::clone(&self.state),
+            consume_ok_count: 0,
+        })
+    }
+}
+
+struct RecoveryListenerCapture {
+    state: Arc<Mutex<RecoveryState>>,
+}
+
+impl RecoveryListener for RecoveryListenerCapture {
+    fn on_recovered(&self) {
+        self.state.lock().unwrap().recovered = true;
+    }
+}
+
+/// Simulates an unexpected drop (a driver-initiated `connection_close` —
+/// indistinguishable to the recovery layer from a real broker restart)
+/// and verifies `AmqpRecoveringClient` reconnects, replays the
+/// queue/consumer with no application code re-running that setup, and
+/// `RecoveryListener::on_recovered` fires before the redelivered message
+/// arrives.
+#[test]
+fn recovering_client_replays_topology_after_induced_disconnect() {
+    let (host, port, user, pass) = broker_creds();
+    let queue = format!("hopf.amqp.integ.recovery.{}", std::process::id());
+
+    let state = Arc::new(Mutex::new(RecoveryState::default()));
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).expect("runtime"));
+    AmqpRecoveringClient::new(AmqpClient::new(host, port).credentials(user, pass), Arc::clone(&rt))
+        .recovery_listener(Arc::new(RecoveryListenerCapture { state: Arc::clone(&state) }))
+        .connect(Arc::new(RecoveryFactory { queue, state: Arc::clone(&state) }))
+        .expect("connect");
+
+    let s = wait_for(
+        &state,
+        20,
+        |s| &s.error,
+        |s| s.redelivered_after_recovery,
+        "reconnect + topology replay + post-recovery delivery",
+    );
+    assert!(s.first_consume_ok);
+    assert!(s.recovered, "RecoveryListener::on_recovered must fire");
+    assert!(s.redelivered_after_recovery);
 }
