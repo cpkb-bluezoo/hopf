@@ -10,10 +10,66 @@ use std::time::Duration;
 
 use quinn_proto::{ConnectionHandle, StreamId};
 use hopf_core::{
-    ConnHandle, Endpoint, SecurityInfo, StartTlsError, TimerHandle, WriteReadyCallback,
+    ConnHandle, ConnHandleBackend, Endpoint, SecurityInfo, StartTlsError, TimerHandle,
+    WriteReadyCallback,
 };
 
 use crate::driver::DriverCmd;
+
+/// [`ConnHandleBackend`] for a QUIC stream — routes `with_endpoint` through
+/// the driver thread's command channel (`DriverCmd::WithStream`), the same
+/// way `hopf_core::Reactor` routes a TCP `ConnHandle`'s `with_endpoint`
+/// through `ReactorCmd::WithConn`. Constructed fresh per [`ConnHandle`]
+/// (see [`QuicStreamEndpoint::handle`]) from the same fields the endpoint
+/// itself already holds.
+struct QuicStreamBackend {
+    conn: ConnectionHandle,
+    stream_id: StreamId,
+    cmd_tx: std::sync::mpsc::Sender<DriverCmd>,
+    waker: Arc<mio::Waker>,
+    execute: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
+}
+
+impl ConnHandleBackend for QuicStreamBackend {
+    fn with_endpoint(&self, task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>) {
+        let _ = self.cmd_tx.send(DriverCmd::WithStream {
+            conn: self.conn,
+            stream_id: self.stream_id,
+            task,
+        });
+        let _ = self.waker.wake();
+    }
+
+    fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+        (self.execute)(task);
+    }
+
+    fn is_probably_open(&self) -> bool {
+        // Same answer the old from_execute-based handle gave — no cheap
+        // liveness flag threaded through yet (the driver thread owns that
+        // state); a real one is future work, not a regression here.
+        true
+    }
+
+    fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        // Route through the driver's own timer queue (DriverCmd::
+        // ScheduleTimer, already handled in drain_cmds) — the same
+        // mechanism QuicStreamEndpoint::schedule_timer already uses, now
+        // reachable from other threads too since this backend has a real
+        // cmd_tx, unlike a bare from_execute closure.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let _ = self.cmd_tx.send(DriverCmd::ScheduleTimer {
+            delay,
+            callback,
+            cancelled: flag,
+        });
+        let _ = self.waker.wake();
+        TimerHandle::from_cancel(move || {
+            cancelled.store(true, Ordering::Release);
+        })
+    }
+}
 
 /// Shared outbound/inbound queues between the stream endpoint and the driver.
 pub(crate) struct StreamQueues {
@@ -226,6 +282,12 @@ impl Endpoint for QuicStreamEndpoint {
     }
 
     fn handle(&self) -> ConnHandle {
-        ConnHandle::from_execute(Arc::clone(&self.execute))
+        ConnHandle::from_backend(Arc::new(QuicStreamBackend {
+            conn: self.conn,
+            stream_id: self.stream_id,
+            cmd_tx: self.cmd_tx.clone(),
+            waker: Arc::clone(&self.waker),
+            execute: Arc::clone(&self.execute),
+        }))
     }
 }

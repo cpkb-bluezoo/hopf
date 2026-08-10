@@ -11,6 +11,24 @@ use mio::Token;
 use crate::cmd::{ReactorCmd, ReactorHandle};
 use crate::endpoint::{Endpoint, TimerHandle};
 
+/// Backend for a [`ConnHandle`] that can genuinely service
+/// [`ConnHandle::with_endpoint`] without being a `hopf-core` TCP connection —
+/// e.g. a QUIC stream on its own driver thread (see
+/// `hopf_quic`'s `QuicStreamBackend`). Implement this (and construct via
+/// [`ConnHandle::from_backend`]) instead of [`ConnHandle::from_execute`]
+/// when the handle has a real, reachable endpoint to run tasks against, not
+/// just a bare executor.
+pub trait ConnHandleBackend: Send + Sync {
+    /// See [`ConnHandle::with_endpoint`].
+    fn with_endpoint(&self, task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>);
+    /// See [`ConnHandle::execute`].
+    fn execute(&self, task: Box<dyn FnOnce() + Send>);
+    /// See [`ConnHandle::is_probably_open`].
+    fn is_probably_open(&self) -> bool;
+    /// See [`ConnHandle::schedule_timer`].
+    fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle;
+}
+
 /// Cloneable handle to a connection pinned to one reactor.
 ///
 /// Use this from storage workers (or any non-reactor thread) to `send` /
@@ -28,10 +46,17 @@ enum ConnHandleInner {
         token: Token,
         open: Arc<AtomicBool>,
     },
-    /// Task queue only (e.g. QUIC stream endpoints on a dedicated driver).
+    /// Task queue only, no endpoint reachable at all — `with_endpoint`
+    /// (and `send`/`close`/`poke`, built on it) drop the call. Use
+    /// [`ConnHandleInner::Custom`] instead when there's a real endpoint
+    /// to reach, just not through a `hopf-core` reactor token.
     Tasks {
         execute: std::sync::Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
     },
+    /// A non-TCP transport that can genuinely service every `ConnHandle`
+    /// operation via its own dispatch mechanism (e.g. a QUIC driver
+    /// thread's command channel) — see [`ConnHandleBackend`].
+    Custom(Arc<dyn ConnHandleBackend>),
     /// `inner` with outbound bytes piped through `frame` before `send`.
     ///
     /// `send` writes straight to the raw transport `Endpoint` (see
@@ -64,6 +89,16 @@ impl ConnHandle {
         }
     }
 
+    /// Handle backed by a [`ConnHandleBackend`] that can service every
+    /// operation (`with_endpoint`/`send`/`close`/`poke`/`execute`/
+    /// `schedule_timer`) for real, not just `execute` — see
+    /// [`ConnHandleBackend`].
+    pub fn from_backend(backend: Arc<dyn ConnHandleBackend>) -> Self {
+        Self {
+            inner: ConnHandleInner::Custom(backend),
+        }
+    }
+
     /// Wrap `self` so every [`send`](Self::send) pipes its payload through
     /// `frame` first — e.g. WebSocket framing — before it reaches the raw
     /// transport. `execute`/`with_endpoint`/`close` delegate straight
@@ -82,6 +117,7 @@ impl ConnHandle {
         match &self.inner {
             ConnHandleInner::Tcp { reactor, .. } => reactor.execute(task),
             ConnHandleInner::Tasks { execute } => execute(task),
+            ConnHandleInner::Custom(backend) => backend.execute(task),
             ConnHandleInner::Framed { inner, .. } => inner.execute(task),
         }
     }
@@ -90,14 +126,18 @@ impl ConnHandle {
     ///
     /// If the connection is already gone, the task is dropped.
     ///
-    /// **Task-only handles** (built via [`Self::from_execute`] — e.g. a QUIC
-    /// stream's [`Endpoint::handle`](crate::Endpoint::handle), which has no
-    /// TCP-style reactor token to hop back through) have no endpoint to run
-    /// `task` against: the task is dropped, and this prints a warning so the
-    /// drop is at least observable rather than silent. [`Self::send`],
-    /// [`Self::close`], and [`Self::poke`] are all implemented via this
-    /// method, so the same applies to them — use [`Self::execute`] instead
-    /// for a task-only handle (it doesn't need an endpoint).
+    /// **Task-only handles** (built via [`Self::from_execute`] — a bare
+    /// executor with no way to reach any specific endpoint at all) have no
+    /// endpoint to run `task` against: the task is dropped, and this prints
+    /// a warning so the drop is at least observable rather than silent.
+    /// [`Self::send`], [`Self::close`], and [`Self::poke`] are all
+    /// implemented via this method, so the same applies to them — use
+    /// [`Self::execute`] instead for a task-only handle (it doesn't need an
+    /// endpoint). A non-TCP transport that *can* reach a specific endpoint
+    /// through its own dispatch mechanism (e.g. a QUIC stream, via its
+    /// driver thread's command channel) should implement
+    /// [`ConnHandleBackend`] and construct via [`Self::from_backend`]
+    /// instead — that handle variant services `with_endpoint` for real.
     pub fn with_endpoint(&self, task: impl FnOnce(&mut dyn Endpoint) + Send + 'static) {
         match &self.inner {
             ConnHandleInner::Tcp { reactor, token, .. } => {
@@ -115,6 +155,7 @@ impl ConnHandle {
                 );
                 let _ = task;
             }
+            ConnHandleInner::Custom(backend) => backend.with_endpoint(Box::new(task)),
             ConnHandleInner::Framed { inner, .. } => inner.with_endpoint(task),
         }
     }
@@ -126,7 +167,9 @@ impl ConnHandle {
     /// still reaches the peer correctly framed instead of landing on the
     /// wire raw.
     ///
-    /// Silently dropped for a task-only handle — see [`Self::with_endpoint`].
+    /// Silently dropped for a task-only handle (built via
+    /// [`Self::from_execute`]) — works correctly for a [`Self::from_backend`]
+    /// handle. See [`Self::with_endpoint`].
     pub fn send(&self, data: Vec<u8>) {
         if let ConnHandleInner::Framed { inner, frame } = &self.inner {
             return inner.send(frame(data));
@@ -140,7 +183,9 @@ impl ConnHandle {
 
     /// Request a graceful close on the owning reactor.
     ///
-    /// Silently dropped for a task-only handle — see [`Self::with_endpoint`].
+    /// Silently dropped for a task-only handle (built via
+    /// [`Self::from_execute`]) — works correctly for a [`Self::from_backend`]
+    /// handle. See [`Self::with_endpoint`].
     pub fn close(&self) {
         self.with_endpoint(|ep| ep.close());
     }
@@ -152,13 +197,15 @@ impl ConnHandle {
     /// `send`/`with_endpoint` already silently drop work for a closed
     /// connection regardless of what this returns.
     ///
-    /// Always `true` for non-TCP handles ([`Self::from_execute`],
-    /// [`Self::framed`]) — there's no cheap liveness signal to read for
-    /// those, so this doesn't pretend to have one.
+    /// Always `true` for a task-only handle ([`Self::from_execute`]) — no
+    /// cheap liveness signal exists for those, so this doesn't pretend to
+    /// have one. A [`Self::from_backend`] handle reports whatever its
+    /// [`ConnHandleBackend::is_probably_open`] implementation knows.
     pub fn is_probably_open(&self) -> bool {
         match &self.inner {
             ConnHandleInner::Tcp { open, .. } => open.load(Ordering::Acquire),
             ConnHandleInner::Tasks { .. } => true,
+            ConnHandleInner::Custom(backend) => backend.is_probably_open(),
             ConnHandleInner::Framed { inner, .. } => inner.is_probably_open(),
         }
     }
@@ -173,7 +220,9 @@ impl ConnHandle {
     /// reactor to actually push the bytes onto the wire, without blocking or
     /// busy-polling.
     ///
-    /// Silently dropped for a task-only handle — see [`Self::with_endpoint`].
+    /// Silently dropped for a task-only handle (built via
+    /// [`Self::from_execute`]) — works correctly for a [`Self::from_backend`]
+    /// handle. See [`Self::with_endpoint`].
     pub fn poke(&self) {
         self.with_endpoint(|ep| ep.poke_handler());
     }
@@ -193,6 +242,7 @@ impl ConnHandle {
                 })
             }
             ConnHandleInner::Framed { inner, .. } => inner.schedule_timer(delay, callback),
+            ConnHandleInner::Custom(backend) => backend.schedule_timer(delay, callback),
             ConnHandleInner::Tasks { execute } => {
                 let cancelled = Arc::new(AtomicBool::new(false));
                 let flag = Arc::clone(&cancelled);
@@ -259,5 +309,115 @@ mod tests {
         }));
 
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    // -- ConnHandleBackend / from_backend -----------------------------
+
+    struct FakeEndpoint;
+
+    impl crate::endpoint::Endpoint for FakeEndpoint {
+        fn send(&mut self, _data: &[u8]) {}
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn is_closing(&self) -> bool {
+            false
+        }
+        fn close(&mut self) {}
+        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+        fn remote_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+        fn security_info(&self) -> &crate::security::SecurityInfo {
+            static PLAINTEXT: std::sync::OnceLock<crate::security::SecurityInfo> =
+                std::sync::OnceLock::new();
+            PLAINTEXT.get_or_init(crate::security::SecurityInfo::plaintext)
+        }
+        fn start_tls(&mut self) -> Result<(), crate::error::StartTlsError> {
+            Err(crate::error::StartTlsError::Unsupported)
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _callback: Option<crate::endpoint::WriteReadyCallback>) {}
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            task();
+        }
+        fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+            TimerHandle::new(|| {})
+        }
+        fn handle(&self) -> ConnHandle {
+            ConnHandle::from_execute(Arc::new(|task| task()))
+        }
+    }
+
+    struct FakeBackend {
+        with_endpoint_calls: Arc<AtomicUsize>,
+        execute_calls: Arc<AtomicUsize>,
+    }
+
+    impl ConnHandleBackend for FakeBackend {
+        fn with_endpoint(&self, task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>) {
+            self.with_endpoint_calls.fetch_add(1, Ordering::SeqCst);
+            let mut ep = FakeEndpoint;
+            task(&mut ep);
+        }
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            task();
+        }
+        fn is_probably_open(&self) -> bool {
+            true
+        }
+        fn schedule_timer(&self, _delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+            callback();
+            TimerHandle::new(|| {})
+        }
+    }
+
+    /// A [`Self::from_backend`] handle must genuinely dispatch every
+    /// operation to the backend — unlike a task-only handle, `with_endpoint`
+    /// (and `send`/`close`/`poke`, built on it) must actually run the task
+    /// against a real endpoint, not drop it.
+    #[test]
+    fn from_backend_dispatches_every_operation_to_the_backend() {
+        let with_endpoint_calls = Arc::new(AtomicUsize::new(0));
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(FakeBackend {
+            with_endpoint_calls: Arc::clone(&with_endpoint_calls),
+            execute_calls: Arc::clone(&execute_calls),
+        });
+        let handle = ConnHandle::from_backend(backend);
+
+        let saw_open = Arc::new(AtomicBool::new(false));
+        let saw_open2 = Arc::clone(&saw_open);
+        handle.with_endpoint(move |ep| {
+            saw_open2.store(ep.is_open(), Ordering::SeqCst);
+        });
+        assert_eq!(with_endpoint_calls.load(Ordering::SeqCst), 1);
+        assert!(saw_open.load(Ordering::SeqCst), "task must run against a real endpoint, not be dropped");
+
+        handle.execute(Box::new(|| {}));
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+
+        assert!(handle.is_probably_open());
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran2 = Arc::clone(&ran);
+        let _timer = handle.schedule_timer(
+            Duration::from_secs(0),
+            Box::new(move || {
+                ran2.store(true, Ordering::SeqCst);
+            }),
+        );
+        assert!(ran.load(Ordering::SeqCst));
+
+        // send/close/poke are all implemented via with_endpoint — confirm
+        // each one actually reaches the backend (3 more calls).
+        handle.send(b"hi".to_vec());
+        handle.close();
+        handle.poke();
+        assert_eq!(with_endpoint_calls.load(Ordering::SeqCst), 1 + 3);
     }
 }

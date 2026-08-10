@@ -65,6 +65,17 @@ pub(crate) enum DriverCmd {
         cancelled: Arc<AtomicBool>,
     },
     Task(Box<dyn FnOnce() + Send>),
+    /// Run `task` against a specific stream's endpoint — the QUIC side of
+    /// [`hopf_core::ConnHandle::with_endpoint`] (see `stream.rs`'s
+    /// `QuicStreamBackend`), mirroring how `hopf_core::Reactor` handles
+    /// `ReactorCmd::WithConn` for TCP. Dropped silently if the connection
+    /// or stream is already gone, matching `with_endpoint`'s documented
+    /// "already gone → dropped" contract.
+    WithStream {
+        conn: ConnectionHandle,
+        stream_id: StreamId,
+        task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>,
+    },
     Shutdown,
 }
 
@@ -610,6 +621,13 @@ impl Driver {
                 DriverCmd::OpenBi { factory, reply } => {
                     let result = self.open_bi_stream(factory);
                     let _ = reply.send(result);
+                }
+                DriverCmd::WithStream { conn, stream_id, task } => {
+                    if let Some(slot) = self.connections.get_mut(&conn) {
+                        if let Some(stream) = slot.streams.get_mut(&stream_id) {
+                            task(&mut stream.endpoint);
+                        }
+                    }
                 }
             }
         }
@@ -1445,6 +1463,108 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(got.lock().unwrap().as_slice(), b"ping");
+        server.shutdown();
+    }
+
+    /// A handler that only consumes once it has the full expected message,
+    /// otherwise leaves everything unconsumed — exercises the NIO
+    /// compact-buffer fix from #179 (a token split across two chunks must
+    /// reassemble) *and* proves `Endpoint::handle().with_endpoint(...)` now
+    /// genuinely dispatches for a QUIC stream, which is what let this test
+    /// actually be written for real instead of via a pure unit test of the
+    /// extracted buffer logic.
+    struct SplitTokenProbe {
+        expected: &'static [u8],
+        done: Arc<StdMutex<Option<Vec<u8>>>>,
+    }
+
+    impl ProtocolHandler for SplitTokenProbe {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            if data.len() < self.expected.len() {
+                return; // not enough yet — consume nothing, wait for more
+            }
+            *self.done.lock().unwrap() = Some(data.to_vec());
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    /// Sends `first` on `connected()`, then `second` ~40ms later via a real
+    /// timer + `ConnHandle::with_endpoint` — the exact path that was a
+    /// silent no-op before `QuicStreamEndpoint::handle()` returned a
+    /// `ConnHandleBackend`-based handle instead of a bare `from_execute`
+    /// one.
+    struct FirstThenSecondSender {
+        first: &'static [u8],
+        second: &'static [u8],
+    }
+
+    impl ProtocolHandler for FirstThenSecondSender {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            endpoint.send(self.first);
+            let second = self.second;
+            let handle = endpoint.handle();
+            endpoint.schedule_timer(
+                Duration::from_millis(40),
+                Box::new(move || {
+                    handle.with_endpoint(move |ep| ep.send(second));
+                }),
+            );
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    #[test]
+    fn conn_handle_with_endpoint_delivers_a_second_chunk_from_a_timer() {
+        const FIRST: &[u8] = b"PIN";
+        const SECOND: &[u8] = b"G-1234";
+        const WHOLE: &[u8] = b"PING-1234";
+
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+
+        let done = Arc::new(StdMutex::new(None));
+        let done2 = Arc::clone(&done);
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(move || {
+                Box::new(SplitTokenProbe { expected: WHOLE, done: Arc::clone(&done2) })
+                    as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(FirstThenSecondSender { first: FIRST, second: SECOND })
+                    as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        for _ in 0..200 {
+            if done.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            done.lock().unwrap().as_deref(),
+            Some(WHOLE),
+            "ConnHandle::with_endpoint never delivered the second chunk for a QUIC stream"
+        );
+
         server.shutdown();
     }
 

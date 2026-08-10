@@ -49,7 +49,7 @@ pub use composition::{
 pub use connector::{TcpConnParams, TcpConnectorConfig};
 pub use endpoint::{Endpoint, TimerHandle, WriteReadyCallback};
 pub use error::StartTlsError;
-pub use handle::ConnHandle;
+pub use handle::{ConnHandle, ConnHandleBackend};
 pub use handler::{NopHandler, ProtocolHandler};
 pub use listener::{
     HandlerFactory, Listener, TcpListenerConfig, DEFAULT_BUFFER_SIZE, DEFAULT_MAX_NET_IN,
