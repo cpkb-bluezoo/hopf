@@ -16,13 +16,23 @@ use super::Error;
 /// same connection.
 pub struct Decoder {
     table: DynamicTable,
+    /// The maximum dynamic table size this decoder will ever honor, fixed
+    /// at construction time — matching the value we (implicitly, by never
+    /// sending our own SETTINGS_HEADER_TABLE_SIZE) declare to the peer.
+    /// Neither an in-band Dynamic Table Size Update (RFC 7541 §6.3) nor
+    /// anything else can push the table past this ceiling, regardless of
+    /// what the peer's encoder claims — a peer's SETTINGS_HEADER_TABLE_SIZE
+    /// constrains what *our encoder* may build, not this decoder.
+    local_max: usize,
 }
 
 impl Decoder {
-    /// Create a decoder with the given initial dynamic table capacity (bytes).
+    /// Create a decoder with the given initial dynamic table capacity (bytes),
+    /// which also becomes this decoder's fixed upper bound (`local_max`).
     pub fn new(max_table_size: usize) -> Self {
         Self {
             table: DynamicTable::new(max_table_size),
+            local_max: max_table_size,
         }
     }
 
@@ -64,10 +74,12 @@ impl Decoder {
                 pos += n;
                 headers.push((name, value));
             } else if first & 0xe0 == 0x20 {
-                // Dynamic table size update (RFC 7541 §6.3)
+                // Dynamic table size update (RFC 7541 §6.3). Clamped to
+                // local_max regardless of what the peer requests — see
+                // Decoder::local_max.
                 let (new_max, n) = decode_int(block, pos, 5)?;
                 pos += n;
-                self.table.set_max_size(new_max);
+                self.table.set_max_size(new_max.min(self.local_max));
             } else {
                 return Err(Error::InvalidData);
             }
@@ -77,8 +89,13 @@ impl Decoder {
     }
 
     /// Applies a dynamic table size update without decoding a header block.
+    ///
+    /// Not for reacting to a peer's `SETTINGS_HEADER_TABLE_SIZE` — that
+    /// setting describes the peer's own decoder and should only inform our
+    /// *encoder* (see `Encoder::set_max_size`). This is for locally
+    /// re-tuning this decoder's own ceiling; still clamped to `local_max`.
     pub fn set_max_table_size(&mut self, size: usize) {
-        self.table.set_max_size(size);
+        self.table.set_max_size(size.min(self.local_max));
     }
 
     // -----------------------------------------------------------------------
@@ -211,5 +228,24 @@ mod tests {
         let pairs = dec.decode(block).unwrap();
         assert_eq!(pairs[0].0, ":method");
         assert_eq!(pairs[0].1, "GET");
+    }
+
+    #[test]
+    fn dynamic_table_size_update_is_clamped_to_local_max() {
+        // Dynamic Table Size Update (0x20 prefix, 5-bit) requesting 5000,
+        // far beyond this decoder's local_max of 100. A hostile peer could
+        // otherwise grow the table unboundedly (issue #178) — must clamp,
+        // not adopt the requested size.
+        let block = &[0x3F, 0xE9, 0x26];
+        let mut dec = Decoder::new(100);
+        dec.decode(block).unwrap();
+        assert_eq!(dec.table.max_size(), 100);
+    }
+
+    #[test]
+    fn set_max_table_size_is_also_clamped_to_local_max() {
+        let mut dec = Decoder::new(100);
+        dec.set_max_table_size(999_999);
+        assert_eq!(dec.table.max_size(), 100);
     }
 }
