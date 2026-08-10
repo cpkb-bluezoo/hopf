@@ -990,7 +990,10 @@ impl H2Endpoint {
 
             match id {
                 SETTINGS_HEADER_TABLE_SIZE => {
-                    self.decoder.set_max_table_size(val as usize);
+                    // This describes the peer's own decoder table, i.e.
+                    // what our encoder may reference — never our decoder's
+                    // ceiling (see hpack::Decoder::local_max).
+                    self.encoder.set_max_size(val as usize);
                 }
                 SETTINGS_MAX_FRAME_SIZE => {
                     if val < 16_384 || val > 16_777_215 {
