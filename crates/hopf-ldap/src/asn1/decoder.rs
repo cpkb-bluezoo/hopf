@@ -18,6 +18,10 @@ const STATE_VALUE: u8 = 4;
 
 const DEFAULT_CAPACITY: usize = 8192;
 const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024;
+/// Matches `BerEncoder`'s `MAX_DEPTH` — the write side already enforces
+/// this; a message with deeper nesting than the encoder could ever produce
+/// is necessarily hostile.
+const MAX_DEPTH: usize = 32;
 
 /// Streaming BER decoder (definite-length only).
 #[derive(Debug)]
@@ -33,6 +37,10 @@ pub struct BerDecoder {
     value_buffer: Option<Vec<u8>>,
     value_offset: usize,
     completed: VecDeque<Asn1Element>,
+    /// Nesting depth of this decoder: 0 for a top-level decoder, N+1 for a
+    /// child decoder created by `parse_children` to decode a constructed
+    /// element's contents at depth N.
+    depth: usize,
 }
 
 impl Default for BerDecoder {
@@ -49,6 +57,10 @@ impl BerDecoder {
 
     /// Creates a new BER decoder with the specified initial buffer capacity.
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_depth(capacity, 0)
+    }
+
+    fn with_capacity_and_depth(capacity: usize, depth: usize) -> Self {
         let mut decoder = Self {
             buffer: Vec::with_capacity(capacity),
             pos: 0,
@@ -59,6 +71,7 @@ impl BerDecoder {
             value_buffer: None,
             value_offset: 0,
             completed: VecDeque::new(),
+            depth,
         };
         decoder.reset();
         decoder
@@ -267,7 +280,7 @@ impl BerDecoder {
         // LDAP tags fit in one byte; multi-byte tags are rare.
         let tag_byte = (self.tag & 0xFF) as u8;
         let element = if Asn1Type::is_constructed(tag_byte) {
-            let children = parse_children(&value)?;
+            let children = parse_children(&value, self.depth)?;
             Asn1Element::constructed(tag_byte, children)
         } else {
             Asn1Element::primitive(tag_byte, value)
@@ -284,8 +297,14 @@ impl BerDecoder {
     }
 }
 
-fn parse_children(data: &[u8]) -> Result<Vec<Asn1Element>, Asn1Error> {
-    let mut child_decoder = BerDecoder::with_capacity(data.len().max(1));
+fn parse_children(data: &[u8], depth: usize) -> Result<Vec<Asn1Element>, Asn1Error> {
+    if depth >= MAX_DEPTH {
+        return Err(Asn1Error::new(format!(
+            "Nesting depth exceeds maximum of {}",
+            MAX_DEPTH
+        )));
+    }
+    let mut child_decoder = BerDecoder::with_capacity_and_depth(data.len().max(1), depth + 1);
     child_decoder.receive(data)?;
 
     let mut children = Vec::new();
@@ -513,6 +532,72 @@ mod tests {
 
         decoder.receive(&[0x02, 0x01, 0x2A]).unwrap();
         assert_eq!(decoder.next().unwrap().as_i32().unwrap(), 42);
+    }
+
+    #[test]
+    fn deeply_nested_sequences_within_limit_decode_successfully() {
+        // 32 nested SEQUENCEs (matching BerEncoder's own MAX_DEPTH) via the
+        // encoder, so the fix doesn't reject anything the encoder can
+        // legitimately produce.
+        let mut encoder = BerEncoder::new();
+        for _ in 0..32 {
+            encoder.begin_sequence();
+        }
+        encoder.write_integer_i32(7);
+        for _ in 0..32 {
+            encoder.end_sequence();
+        }
+        let encoded = encoder.to_bytes();
+
+        let mut decoder = BerDecoder::new();
+        decoder.receive(&encoded).unwrap();
+        let mut current = decoder.next().unwrap();
+        for _ in 0..31 {
+            assert_eq!(current.child_count(), 1);
+            current = current.child(0).clone();
+        }
+        assert_eq!(current.child(0).as_i32().unwrap(), 7);
+    }
+
+    #[test]
+    fn excessively_nested_sequences_are_rejected_not_stack_overflowed() {
+        // One nesting level beyond what the encoder itself will produce —
+        // must be rejected with an error, not recursed into.
+        let depth = 10_000;
+        let mut data = Vec::new();
+        for _ in 0..depth {
+            data.push(0x30); // SEQUENCE, constructed
+        }
+        // Build lengths from the innermost element outward so every
+        // declared length is correct definite-length BER (long-form once
+        // nesting pushes the content past 127 bytes).
+        fn ber_length(len: usize) -> Vec<u8> {
+            if len < 0x80 {
+                vec![len as u8]
+            } else {
+                let bytes = len.to_be_bytes();
+                let significant: Vec<u8> = bytes
+                    .iter()
+                    .copied()
+                    .skip_while(|&b| b == 0)
+                    .collect();
+                let mut out = vec![0x80 | significant.len() as u8];
+                out.extend_from_slice(&significant);
+                out
+            }
+        }
+
+        let mut body: Vec<u8> = vec![0x02, 0x01, 0x00]; // INTEGER 0
+        for _ in 0..depth {
+            let mut wrapped = vec![0x30];
+            wrapped.extend_from_slice(&ber_length(body.len()));
+            wrapped.extend_from_slice(&body);
+            body = wrapped;
+        }
+
+        let mut decoder = BerDecoder::new();
+        let err = decoder.receive(&body).unwrap_err();
+        assert!(err.message().contains("depth"), "{}", err.message());
     }
 
     #[test]
