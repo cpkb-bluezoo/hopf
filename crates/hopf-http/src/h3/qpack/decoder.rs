@@ -34,10 +34,19 @@ pub(crate) enum DecodeError {
     /// The Required Insert Count depends on entries we haven't received
     /// yet — would require blocking, which this decoder never permits.
     Blocked,
+    /// A `Set Dynamic Table Capacity` instruction exceeded the capacity
+    /// this decoder declared via `SETTINGS_QPACK_MAX_TABLE_CAPACITY`
+    /// (RFC 9204 §3.2.3 — a hard connection error, not a clamp).
+    CapacityExceeded,
 }
 
 pub(crate) struct Decoder {
     table: DynamicTable,
+    /// The capacity ceiling this decoder declared via
+    /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY`, fixed at construction. RFC 9204
+    /// §3.2.3 requires a peer exceeding this to be treated as a connection
+    /// error — never silently honored.
+    max_capacity: usize,
 }
 
 fn integer(input: &[u8], prefix: u8) -> Result<(u64, usize), DecodeError> {
@@ -53,7 +62,10 @@ fn read_string(input: &[u8], prefix_bits: u8) -> Result<(String, usize), DecodeE
 
 impl Decoder {
     pub(crate) fn new(capacity: usize) -> Self {
-        Self { table: DynamicTable::new(capacity) }
+        Self {
+            table: DynamicTable::new(capacity),
+            max_capacity: capacity,
+        }
     }
 
     /// Apply an encoder-stream instruction already parsed by
@@ -65,6 +77,9 @@ impl Decoder {
         match instr {
             EncoderInstruction::SetDynamicTableCapacity(capacity) => {
                 let capacity = usize::try_from(capacity).map_err(|_| DecodeError::InvalidIndex)?;
+                if capacity > self.max_capacity {
+                    return Err(DecodeError::CapacityExceeded);
+                }
                 self.table.set_capacity(capacity);
                 Ok(Vec::new())
             }
@@ -250,6 +265,28 @@ mod tests {
         dec.apply_encoder_instruction(EncoderInstruction::Duplicate(0)).unwrap(); // duplicate the only (most recent) entry
         assert_eq!(dec.table.get(0), Some(("a", "1")));
         assert_eq!(dec.table.get(1), Some(("a", "1")));
+    }
+
+    #[test]
+    fn set_dynamic_table_capacity_within_limit_is_honored() {
+        let mut dec = Decoder::new(4096);
+        dec.apply_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(2048))
+            .unwrap();
+        assert_eq!(dec.table.capacity(), 2048);
+    }
+
+    #[test]
+    fn set_dynamic_table_capacity_exceeding_local_max_is_a_connection_error() {
+        // RFC 9204 §3.2.3: exceeding the declared
+        // SETTINGS_QPACK_MAX_TABLE_CAPACITY is a hard connection error, not
+        // something to silently honor (issue #178).
+        let mut dec = Decoder::new(4096);
+        let err = dec
+            .apply_encoder_instruction(EncoderInstruction::SetDynamicTableCapacity(1_000_000))
+            .unwrap_err();
+        assert_eq!(err, DecodeError::CapacityExceeded);
+        // The rejected instruction must not have taken effect.
+        assert_eq!(dec.table.capacity(), 4096);
     }
 
     #[test]

@@ -15,6 +15,10 @@ use super::static_table;
 /// Maintains a dynamic table in sync with the peer's decoder.
 pub struct Encoder {
     table: DynamicTable,
+    /// This encoder's own upper bound, fixed at construction — a peer's
+    /// `SETTINGS_HEADER_TABLE_SIZE` (see `set_max_size`) can only shrink
+    /// the working table below this, never grow it past it.
+    local_max: usize,
 }
 
 impl Encoder {
@@ -22,7 +26,18 @@ impl Encoder {
     pub fn new(max_table_size: usize) -> Self {
         Self {
             table: DynamicTable::new(max_table_size),
+            local_max: max_table_size,
         }
+    }
+
+    /// React to the peer's `SETTINGS_HEADER_TABLE_SIZE` — the size of the
+    /// dynamic table *their decoder* is willing to hold, which is what
+    /// bounds what this encoder may reference (RFC 7541 §6.3). Never
+    /// exceeds this encoder's own `local_max` regardless of what the peer
+    /// permits, so an oversized peer-advertised value can't make this
+    /// encoder hold more table memory than it would use on its own.
+    pub fn set_max_size(&mut self, peer_max: usize) {
+        self.table.set_max_size(peer_max.min(self.local_max));
     }
 
     /// Encode an iterable of `(name, value)` pairs into an HPACK header block.
@@ -131,6 +146,20 @@ mod tests {
         let block2 = enc.encode([("custom-x", "hello")]);
         let out2 = dec.decode(&block2).unwrap();
         assert_eq!(out2, vec![("custom-x".into(), "hello".into())]);
+    }
+
+    #[test]
+    fn set_max_size_clamps_to_local_max() {
+        // A peer advertising an enormous SETTINGS_HEADER_TABLE_SIZE must
+        // not be able to make our own encoder hold more table memory than
+        // it was constructed to use (issue #178).
+        let mut enc = Encoder::new(4096);
+        enc.set_max_size(0xFFFF_FFFF);
+        assert_eq!(enc.table.max_size(), 4096);
+
+        // A smaller peer-advertised value is honored (shrinks below local_max).
+        enc.set_max_size(100);
+        assert_eq!(enc.table.max_size(), 100);
     }
 
     #[test]
