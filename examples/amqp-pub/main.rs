@@ -107,7 +107,7 @@ impl AmqpClientDriver for PubDriver {
     ) {
     }
 
-    fn on_delivery_data(&mut self, _: &[u8]) {}
+    fn on_delivery_data(&mut self, _: u16, _: &[u8]) {}
 
     fn on_delivery_complete(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
 
