@@ -7,8 +7,9 @@
 //! calling methods on the state trait references it receives.
 
 use std::io;
+use std::sync::Arc;
 
-use hopf_core::Endpoint;
+use hopf_core::{Endpoint, Runtime};
 
 use super::state::{
     SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope, SmtpClientHello,
@@ -17,8 +18,11 @@ use super::state::{
 
 /// Creates the connection driver for each new SMTP client connection.
 pub trait SmtpClientHandlerFactory: Send + Sync {
-    /// Produce a fresh driver for one connection.
-    fn create(&self) -> Box<dyn SmtpClientDriver>;
+    /// Produce a fresh driver for one connection. `runtime` lets the driver
+    /// offload blocking work (e.g. reading a spooled message body off disk,
+    /// issue #184) to [`hopf_core::StorageExecutor`] instead of the reactor
+    /// thread.
+    fn create(&self, runtime: &Arc<Runtime>) -> Box<dyn SmtpClientDriver>;
 }
 
 /// Receives all SMTP protocol callbacks for a single client connection.
@@ -257,4 +261,22 @@ pub trait SmtpClientDriver: Send {
 
     /// Connection closed by peer or endpoint.
     fn on_disconnected(&mut self, ep: &mut dyn Endpoint);
+
+    // ── Offloaded DATA/BDAT chunk resumption (issue #184) ─────────────────
+
+    /// Called at the top of every `receive()` so a driver that offloaded a
+    /// DATA/BDAT chunk read to [`hopf_core::StorageExecutor`] (rather than
+    /// reading it inline during [`Self::on_ready_for_data`] /
+    /// [`Self::on_bdat_chunk_ok`]) can finish it now that it has `data`
+    /// again — e.g. call `data.end_message()` or
+    /// `data.write_bdat_chunk(…)`. The storage callback that finishes the
+    /// read only has a bare `ConnHandle`, not `&mut dyn
+    /// SmtpClientMessageData`, so it stashes the outcome and pokes the
+    /// endpoint instead of calling back in directly (mirrors
+    /// `sync_pending_finish` / `sync_pending_auth_check` in
+    /// `hopf_smtp::server::control`, issues #184/#181). Default: no-op —
+    /// a driver that never offloads has nothing to resume.
+    fn resume_pending_data(&mut self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint) {
+        let _ = (data, ep);
+    }
 }

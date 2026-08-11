@@ -102,6 +102,16 @@ pub struct SmtpControlHandler {
     /// than processed against stale pre-auth state.
     busy: Arc<AtomicBool>,
     pending_auth_check: Arc<Mutex<Option<AuthCheckOutcome>>>,
+    /// True while `finish_message` is waiting on `self.pipeline`'s queued
+    /// (offloaded) writes to finish landing (issue #184) — `end_data()`
+    /// returning doesn't mean every chunk is actually on disk yet, so
+    /// `message_complete` (which reads pipeline-observable state like the
+    /// spool path/error) must not run until `is_pending()` clears. Gates
+    /// pipelined commands the same way `busy` does, since `finish_message`
+    /// deferring leaves `self.session` unchanged (still `Data`/`Bdat`),
+    /// which alone isn't enough to stop a *separate* later `receive()`
+    /// call from being misinterpreted as more DATA content.
+    pending_finish: bool,
 }
 
 impl SmtpControlHandler {
@@ -166,6 +176,7 @@ impl SmtpControlHandler {
             runtime,
             busy: Arc::new(AtomicBool::new(false)),
             pending_auth_check: Arc::new(Mutex::new(None)),
+            pending_finish: false,
         }
     }
 
@@ -808,6 +819,17 @@ impl SmtpControlHandler {
     fn finish_message(&mut self, endpoint: &mut dyn Endpoint) {
         if let Some(p) = &mut self.pipeline {
             p.end_data();
+            if p.is_pending() {
+                // Chunks are still draining to disk (issue #184) —
+                // `message_complete` reads pipeline-observable state
+                // (spool path/error) that isn't trustworthy until every
+                // queued write has actually landed. Defer the rest of
+                // this function; `sync_pending_finish` re-invokes it once
+                // `is_pending()` clears, triggered by the last write's
+                // `poke_handler` call (see `spool.rs::drain_next`).
+                self.pending_finish = true;
+                return;
+            }
         }
         SmtpServerMetrics::add(&self.metrics.messages, 1);
         SmtpServerMetrics::add(&self.metrics.bytes, self.message_bytes);
@@ -1233,6 +1255,25 @@ impl SmtpControlHandler {
         self.send_enhanced(endpoint, 535, "5.7.8", "Authentication credentials invalid");
     }
 
+    /// Re-invoke `finish_message` once its deferred pipeline writes have
+    /// landed (issue #184) — see the comment in `finish_message` where
+    /// `pending_finish` is set.
+    fn sync_pending_finish(&mut self, endpoint: &mut dyn Endpoint) {
+        if !self.pending_finish {
+            return;
+        }
+        let still_pending = self
+            .pipeline
+            .as_ref()
+            .map(|p| p.is_pending())
+            .unwrap_or(false);
+        if still_pending {
+            return;
+        }
+        self.pending_finish = false;
+        self.finish_message(endpoint);
+    }
+
     fn finish_auth(&mut self, endpoint: &mut dyn Endpoint, user: String) {
         let mut hello = match self.hello.take() {
             Some(h) => h,
@@ -1352,6 +1393,27 @@ impl ProtocolHandler for SmtpControlHandler {
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_deferred();
         self.sync_pending_auth_check(endpoint);
+        self.sync_pending_finish(endpoint);
+        if self.pending_finish {
+            // Spool writes from the just-finished message are still
+            // draining (issue #184) — soft reject pipelined commands, same
+            // precedent as the `Delivering`/`busy` checks below. Must come
+            // before the `session` dispatch in `receive_inner`: `session`
+            // is still `Data`/`Bdat` at this point (deferring
+            // `finish_message` leaves it untouched), so without this check
+            // a later `receive()` call could have its bytes misinterpreted
+            // as more DATA content instead of a new command.
+            if !data.is_empty() {
+                self.send_enhanced(
+                    endpoint,
+                    451,
+                    "4.3.2",
+                    "Message processing in progress, try again later",
+                );
+                *data = &[];
+            }
+            return;
+        }
         if self.session == SmtpSessionState::Delivering {
             // Still waiting for outbound relay to finish — soft reject pipelined cmds.
             if !data.is_empty() {
@@ -1835,5 +1897,250 @@ mod telemetry_tests {
         assert!(h.meta.traceparent.is_none());
         pipeline.shutdown();
         let _ = std::fs::remove_file(&dir);
+    }
+}
+
+/// Issue #184: `finish_message` must not read pipeline-observable state
+/// (and must not reply) until every offloaded write has landed, and must
+/// soft-reject any pipelined command that arrives while it's waiting. This
+/// drives `SmtpControlHandler` directly (no TCP) with a hand-controlled
+/// [`SmtpPipeline`] standing in for `SpoolPipeline`'s real async drain —
+/// deterministic instead of timing against real disk I/O.
+#[cfg(test)]
+mod pending_finish_tests {
+    use super::*;
+    use hopf_core::{RuntimeConfig, StartTlsError, TimerHandle, WriteReadyCallback};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    #[derive(Clone, Default)]
+    struct ControllablePipeline {
+        pending: Arc<AtomicBool>,
+    }
+
+    impl SmtpPipeline for ControllablePipeline {
+        fn mail_from(&mut self, _sender: Option<&EmailAddress>) {}
+        fn rcpt_to(&mut self, _recipient: &EmailAddress) {}
+        fn message_content(&mut self, _chunk: &[u8]) -> bool {
+            true
+        }
+        fn end_data(&mut self) {}
+        fn reset(&mut self) {}
+        fn is_pending(&self) -> bool {
+            self.pending.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Mirrors [`crate::server::handler::AcceptAllSmtpHandler`] but installs
+    /// a [`ControllablePipeline`] instead of `None`.
+    #[derive(Clone)]
+    struct PendingTestHandler {
+        pipeline: ControllablePipeline,
+    }
+
+    impl SmtpClientConnected for PendingTestHandler {
+        fn connected(&mut self, state: &mut dyn ConnectedState, _meta: &SmtpConnectionMetadata) {
+            state.accept_connection("test.example.com ESMTP Hopf", Box::new(self.clone()));
+        }
+        fn disconnected(&mut self) {}
+    }
+    impl HelloHandler for PendingTestHandler {
+        fn hello(&mut self, state: &mut dyn HelloState, _extended: bool, _hostname: &str) {
+            state.accept_hello(Box::new(self.clone()));
+        }
+        fn tls_established(&mut self, _info: &hopf_core::SecurityInfo) {}
+        fn authenticated(&mut self, state: &mut dyn AuthenticateState, _user: &str) {
+            state.accept(Box::new(self.clone()));
+        }
+        fn quit(&mut self) {}
+    }
+    impl MailFromHandler for PendingTestHandler {
+        fn pipeline(&mut self) -> Option<Box<dyn SmtpPipeline>> {
+            Some(Box::new(self.pipeline.clone()))
+        }
+        fn mail_from(
+            &mut self,
+            state: &mut dyn MailFromState,
+            _sender: Option<&EmailAddress>,
+            _smtputf8: bool,
+            _delivery: &DeliveryRequirements,
+        ) {
+            state.accept_sender(Box::new(self.clone()));
+        }
+        fn reset(&mut self, state: &mut dyn ResetState) {
+            state.accept_reset(Box::new(self.clone()));
+        }
+        fn quit(&mut self) {}
+    }
+    impl RecipientHandler for PendingTestHandler {
+        fn rcpt_to(
+            &mut self,
+            state: &mut dyn RecipientState,
+            _recipient: &EmailAddress,
+            _dsn: &DsnRecipientParams,
+        ) {
+            state.accept_recipient(Box::new(self.clone()));
+        }
+        fn start_message(&mut self, state: &mut dyn MessageStartState) {
+            state.accept_message(Box::new(self.clone()));
+        }
+        fn reset(&mut self, state: &mut dyn ResetState) {
+            state.accept_reset(Box::new(self.clone()));
+        }
+        fn quit(&mut self) {}
+    }
+    impl MessageDataHandler for PendingTestHandler {
+        fn message_content(&mut self, _chunk: &[u8]) {}
+        fn message_complete(&mut self, state: &mut dyn MessageEndState) {
+            state.accept_message_delivery(None, Box::new(self.clone()));
+        }
+        fn message_aborted(&mut self) {}
+    }
+
+    /// Minimal `Endpoint`: captures sent bytes, no real I/O or reactor.
+    struct MockEndpoint {
+        sent: Vec<u8>,
+        open: bool,
+    }
+    impl MockEndpoint {
+        fn new() -> Self {
+            Self {
+                sent: Vec::new(),
+                open: true,
+            }
+        }
+    }
+    impl hopf_core::Endpoint for MockEndpoint {
+        fn send(&mut self, data: &[u8]) {
+            self.sent.extend_from_slice(data);
+        }
+        fn is_open(&self) -> bool {
+            self.open
+        }
+        fn is_closing(&self) -> bool {
+            false
+        }
+        fn close(&mut self) {
+            self.open = false;
+        }
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok("127.0.0.1:25".parse().unwrap())
+        }
+        fn remote_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok("127.0.0.1:9999".parse().unwrap())
+        }
+        fn security_info(&self) -> &hopf_core::SecurityInfo {
+            static PLAINTEXT: OnceLock<hopf_core::SecurityInfo> = OnceLock::new();
+            PLAINTEXT.get_or_init(hopf_core::SecurityInfo::plaintext)
+        }
+        fn start_tls(&mut self) -> Result<(), StartTlsError> {
+            Err(StartTlsError::Unsupported)
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _callback: Option<WriteReadyCallback>) {}
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            task();
+        }
+        fn schedule_timer(
+            &self,
+            _delay: Duration,
+            _callback: Box<dyn FnOnce() + Send>,
+        ) -> TimerHandle {
+            TimerHandle::from_cancel(|| {})
+        }
+        fn handle(&self) -> ConnHandle {
+            ConnHandle::from_execute(Arc::new(|task| task()))
+        }
+    }
+
+    fn new_handler(pipeline: ControllablePipeline) -> SmtpControlHandler {
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let peer: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:25".parse().unwrap();
+        let config = SmtpConfig::new(local, "test.example.com").auth_required(false);
+        let client = Box::new(PendingTestHandler { pipeline });
+        SmtpControlHandler::new(client, SmtpServerMetrics::shared(), config, peer, local, rt)
+    }
+
+    fn feed(h: &mut SmtpControlHandler, ep: &mut MockEndpoint, line: &[u8]) {
+        let mut data = line;
+        h.receive(ep, &mut data);
+    }
+
+    /// Numeric code of the last CRLF-terminated reply line seen so far.
+    fn last_reply_code(sent: &[u8]) -> Option<u32> {
+        let text = String::from_utf8_lossy(sent);
+        text.lines()
+            .rev()
+            .find(|l| !l.is_empty())
+            .and_then(|l| l.get(0..3))
+            .and_then(|c| c.parse().ok())
+    }
+
+    #[test]
+    fn finish_message_defers_until_pipeline_drains_and_soft_rejects_pipelined_commands() {
+        let pipeline = ControllablePipeline::default();
+        // Simulate a write still in flight when the DATA terminator arrives
+        // (the exact race `is_pending()`/`pending_finish` close).
+        pipeline.pending.store(true, Ordering::SeqCst);
+        let mut handler = new_handler(pipeline.clone());
+        let mut ep = MockEndpoint::new();
+
+        handler.connected(&mut ep);
+        feed(&mut handler, &mut ep, b"EHLO client.example\r\n");
+        feed(&mut handler, &mut ep, b"MAIL FROM:<a@b.example>\r\n");
+        feed(&mut handler, &mut ep, b"RCPT TO:<c@d.example>\r\n");
+        feed(&mut handler, &mut ep, b"DATA\r\n");
+        ep.sent.clear();
+
+        feed(&mut handler, &mut ep, b"hello world\r\n.\r\n");
+        assert!(
+            ep.sent.is_empty(),
+            "must not reply while the spool write is still pending: {:?}",
+            String::from_utf8_lossy(&ep.sent)
+        );
+        assert!(handler.pending_finish, "finish_message must have deferred");
+
+        // A pipelined command arriving while the write drains must be
+        // soft-rejected, not dispatched against stale session state.
+        feed(&mut handler, &mut ep, b"QUIT\r\n");
+        assert_eq!(last_reply_code(&ep.sent), Some(451));
+        ep.sent.clear();
+
+        // The write "lands" (mirrors `spool.rs::drain_next`'s callback);
+        // a subsequent `receive()` call (standing in for the production
+        // `poke_handler` re-entry) must now complete the deferred finish.
+        pipeline.pending.store(false, Ordering::SeqCst);
+        feed(&mut handler, &mut ep, b"");
+        assert!(
+            !handler.pending_finish,
+            "must clear once the pipeline drains"
+        );
+        assert_eq!(
+            last_reply_code(&ep.sent),
+            Some(250),
+            "deferred finish must complete once no longer pending: {:?}",
+            String::from_utf8_lossy(&ep.sent)
+        );
+    }
+
+    #[test]
+    fn finish_message_completes_immediately_when_pipeline_never_pending() {
+        let pipeline = ControllablePipeline::default();
+        let mut handler = new_handler(pipeline);
+        let mut ep = MockEndpoint::new();
+
+        handler.connected(&mut ep);
+        feed(&mut handler, &mut ep, b"EHLO client.example\r\n");
+        feed(&mut handler, &mut ep, b"MAIL FROM:<a@b.example>\r\n");
+        feed(&mut handler, &mut ep, b"RCPT TO:<c@d.example>\r\n");
+        feed(&mut handler, &mut ep, b"DATA\r\n");
+        ep.sent.clear();
+
+        feed(&mut handler, &mut ep, b"hello world\r\n.\r\n");
+        assert!(!handler.pending_finish);
+        assert_eq!(last_reply_code(&ep.sent), Some(250));
     }
 }

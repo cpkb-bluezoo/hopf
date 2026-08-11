@@ -148,7 +148,11 @@ impl HelloHandler for LocalDeliveryHandler {
 
 impl MailFromHandler for LocalDeliveryHandler {
     fn pipeline(&mut self) -> Option<Box<dyn SmtpPipeline>> {
-        let p = Arc::new(Mutex::new(SpoolPipeline::new()));
+        let handle = self
+            .control_handle
+            .clone()
+            .expect("control handle set in connected()");
+        let p = Arc::new(Mutex::new(SpoolPipeline::new(Arc::clone(&self.runtime), handle)));
         self.spool = Some(Arc::clone(&p));
         Some(Box::new(SpoolPipelineHandle(p)))
     }
@@ -243,7 +247,7 @@ impl MessageDataHandler for LocalDeliveryHandler {
             .as_ref()
             .map(|p| {
                 let g = p.lock().unwrap();
-                (g.path().map(|p| p.to_path_buf()), g.error().map(str::to_string))
+                (g.path(), g.error())
             })
             .unwrap_or((None, None));
 
