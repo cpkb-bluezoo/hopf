@@ -747,8 +747,8 @@ impl AmqpClientDriver for RecoveringDriver {
         });
     }
 
-    fn on_delivery_data(&mut self, data: &[u8]) {
-        self.shared.with_user_driver(|d| d.on_delivery_data(data));
+    fn on_delivery_data(&mut self, channel: u16, data: &[u8]) {
+        self.shared.with_user_driver(|d| d.on_delivery_data(channel, data));
     }
 
     fn on_delivery_complete(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
@@ -771,8 +771,8 @@ impl AmqpClientDriver for RecoveringDriver {
         });
     }
 
-    fn on_return_data(&mut self, data: &[u8]) {
-        self.shared.with_user_driver(|d| d.on_return_data(data));
+    fn on_return_data(&mut self, channel: u16, data: &[u8]) {
+        self.shared.with_user_driver(|d| d.on_return_data(channel, data));
     }
 
     fn on_return_complete(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
@@ -1248,7 +1248,7 @@ mod tests {
         fn on_queue_declare_ok(&mut self, _: &mut dyn AmqpClientControl, _: u16, _: &str, _: u32, _: u32) {}
         fn on_consume_ok(&mut self, _: &mut dyn AmqpClientControl, _: u16, _: &str) {}
         fn on_delivery_start(&mut self, _: u16, _: &str, _: u64, _: bool, _: &str, _: &str, _: &BasicProperties, _: u64) {}
-        fn on_delivery_data(&mut self, _: &[u8]) {}
+        fn on_delivery_data(&mut self, _: u16, _: &[u8]) {}
         fn on_delivery_complete(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
         fn on_error(&mut self, _: &io::Error) {}
         fn on_disconnected(&mut self) {}
