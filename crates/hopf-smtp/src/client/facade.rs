@@ -128,6 +128,7 @@ impl SmtpClient {
         &self,
         factory: Arc<dyn SmtpClientHandlerFactory>,
         addr: SocketAddr,
+        rt: &Arc<Runtime>,
     ) -> TcpConnectorConfig {
         let tls_connector = self.tls_connector.clone();
         let tls_server_name = self.tls_server_name.clone();
@@ -136,10 +137,12 @@ impl SmtpClient {
         let implicit = self.implicit_tls;
         let tls_for_dial = self.tls_connector.clone();
         let sn_for_dial = self.tls_server_name.clone();
+        let rt = Arc::clone(rt);
 
         let mut cfg = TcpConnectorConfig::new(addr, move || {
             Box::new(SmtpClientEndpoint::new(
                 factory.as_ref(),
+                &rt,
                 stage,
                 message,
                 tls_connector.clone(),
@@ -166,7 +169,7 @@ impl SmtpClient {
         factory: Arc<dyn SmtpClientHandlerFactory>,
     ) -> io::Result<()> {
         if let Some(addr) = self.addr {
-            return rt.connect(self.connector(factory, addr));
+            return rt.connect(self.connector(factory, addr, rt));
         }
 
         let host = self
@@ -176,7 +179,7 @@ impl SmtpClient {
 
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             let addr = SocketAddr::new(ip, self.port);
-            return rt.connect(self.connector(factory, addr));
+            return rt.connect(self.connector(factory, addr, rt));
         }
 
         let resolver = match &self.resolver {
@@ -211,9 +214,11 @@ impl SmtpClient {
                 let tls_for_dial = tls_connector.clone();
                 let sn_for_dial = tls_server_name.clone();
                 let factory2 = Arc::clone(&factory);
+                let rt3 = Arc::clone(&rt2);
                 let mut cfg = TcpConnectorConfig::new(addr, move || {
                     Box::new(SmtpClientEndpoint::new(
                         factory2.as_ref(),
+                        &rt3,
                         timeouts.stage,
                         timeouts.message,
                         tls_connector.clone(),
