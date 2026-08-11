@@ -267,8 +267,13 @@ pub trait AmqpClientDriver: Send {
         body_len: u64,
     );
 
-    /// Chunk of the current delivery body (valid for this call only).
-    fn on_delivery_data(&mut self, data: &[u8]);
+    /// Chunk of the current delivery body on `channel` (valid for this call
+    /// only). `channel` disambiguates interleaved deliveries: AMQP 0-9-1
+    /// permits the broker to interleave content frames from *different*
+    /// channels on one connection, so a driver tracking multiple
+    /// concurrent deliveries must not assume chunks arrive contiguously
+    /// for a single delivery.
+    fn on_delivery_data(&mut self, channel: u16, data: &[u8]);
 
     /// Current delivery complete.
     fn on_delivery_complete(&mut self, client: &mut dyn AmqpClientControl, channel: u16);
@@ -295,8 +300,9 @@ pub trait AmqpClientDriver: Send {
         );
     }
 
-    /// Chunk of a returned message body.
-    fn on_return_data(&mut self, _data: &[u8]) {}
+    /// Chunk of a returned message body on `channel` (see [`Self::on_delivery_data`]
+    /// on why `channel` matters for interleaved content).
+    fn on_return_data(&mut self, _channel: u16, _data: &[u8]) {}
 
     /// Returned message complete.
     fn on_return_complete(&mut self, _client: &mut dyn AmqpClientControl, _channel: u16) {}

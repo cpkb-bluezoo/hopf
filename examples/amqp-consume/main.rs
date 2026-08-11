@@ -102,7 +102,7 @@ impl AmqpClientDriver for ConsumeDriver {
         self.pending_tag = Some((channel, delivery_tag));
     }
 
-    fn on_delivery_data(&mut self, data: &[u8]) {
+    fn on_delivery_data(&mut self, _channel: u16, data: &[u8]) {
         print!("{}", String::from_utf8_lossy(data));
         let _ = io::stdout().flush();
     }
