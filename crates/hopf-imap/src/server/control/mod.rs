@@ -163,12 +163,23 @@ pub struct ImapControlHandler {
     pending_auth_check: Arc<Mutex<Option<AuthCheckOutcome>>>,
     /// APPEND literal being spooled to a temp file as chunks arrive — never
     /// buffered whole in memory (see `AppendChunk`/`finalize_pending_append`).
-    pending_append_file: Option<(std::fs::File, std::path::PathBuf)>,
+    /// Writes are offloaded to `hopf_core::StorageExecutor` (issue #185)
+    /// rather than done inline on the reactor thread; shared (not a plain
+    /// field) so the storage-pool write callback, which only ever gets a
+    /// cloned `Arc`, can safely reach it.
+    append_spool: Arc<Mutex<AppendSpoolState>>,
     /// First spool write error, if any.
     pending_append_error: Option<String>,
     /// Finalized spool path, ready for `cmd_append` to stream from — `None`
     /// path with no error means a zero-length (`{0}`) literal.
     pending_append_path: Option<std::path::PathBuf>,
+    /// The APPEND's own trailing `Command` event, stashed when it arrives
+    /// before `append_spool`'s queued writes have finished draining (issue
+    /// #185) — `sync_pending_append` finalizes and dispatches it once
+    /// ready, triggered by the last write's `poke_handler` call. Also
+    /// blocks `enqueue_or_dispatch`/`drain_queue` the same way `busy`
+    /// does, so a further pipelined command can't run ahead of it.
+    pending_append_cmd: Option<ImapCommand>,
     pending_open: Arc<Mutex<Option<PendingOpen>>>,
     /// Per-session ENABLE set.
     enabled: EnabledExtensions,
@@ -232,9 +243,10 @@ impl ImapControlHandler {
             cmd_queue: VecDeque::new(),
             pending_auth: None,
             pending_auth_check: Arc::new(Mutex::new(None)),
-            pending_append_file: None,
+            append_spool: Arc::new(Mutex::new(AppendSpoolState::default())),
             pending_append_error: None,
             pending_append_path: None,
+            pending_append_cmd: None,
             pending_open: Arc::new(Mutex::new(None)),
             enabled: EnabledExtensions::default(),
             idle: IdleState::default(),
@@ -646,7 +658,7 @@ impl ImapControlHandler {
     }
 
     fn drain_queue(&mut self, endpoint: &mut dyn Endpoint) {
-        while !self.busy.load(Ordering::Relaxed) {
+        while !self.busy.load(Ordering::Relaxed) && self.pending_append_cmd.is_none() {
             let Some(cmd) = self.cmd_queue.pop_front() else {
                 break;
             };
@@ -655,7 +667,10 @@ impl ImapControlHandler {
     }
 
     fn enqueue_or_dispatch(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if self.busy.load(Ordering::Relaxed) {
+        // `pending_append_cmd` gates the same way `busy` does (issue
+        // #185) — a further pipelined command must not run ahead of an
+        // APPEND whose spool writes are still draining.
+        if self.busy.load(Ordering::Relaxed) || self.pending_append_cmd.is_some() {
             self.cmd_queue.push_back(cmd);
         } else {
             self.dispatch(endpoint, cmd);
@@ -1691,37 +1706,75 @@ impl ImapControlHandler {
         );
     }
 
-    /// Spool one APPEND literal chunk to a temp file, created lazily on the
-    /// first chunk — the literal is never buffered whole in memory.
+    /// Queue one APPEND literal chunk for spooling to a temp file, created
+    /// lazily on the first chunk — the literal is never buffered whole in
+    /// memory. The write itself is offloaded to `hopf_core::StorageExecutor`
+    /// (issue #185) rather than done inline here; chunks land on disk in
+    /// order because `drain_next_append_chunk` only submits the next
+    /// write once the previous one's callback confirms completion (writes
+    /// to the same file must be ordered, and `StorageExecutor::submit_on`
+    /// doesn't guarantee that across separate calls).
     fn handle_append_chunk(&mut self, chunk: &[u8]) {
-        if self.pending_append_error.is_some() {
+        let mut g = self.append_spool.lock().unwrap();
+        if g.error.is_some() {
             return;
         }
-        if self.pending_append_file.is_none() {
-            let path = unique_append_spool_path();
-            match std::fs::File::create(&path) {
-                Ok(f) => self.pending_append_file = Some((f, path)),
-                Err(e) => {
-                    self.pending_append_error = Some(e.to_string());
-                    return;
-                }
-            }
+        if self.pending_append_cmd.is_some() {
+            // A previous APPEND's spool hasn't finalized yet (issue #185)
+            // — only reachable via extremely aggressive LITERAL+
+            // pipelining that outruns our own finalize (a second literal
+            // starting before the first APPEND's tagged reply). Refuse
+            // rather than silently appending into the wrong message.
+            g.error = Some("internal: previous APPEND still finalizing".into());
+            return;
         }
-        if let Some((f, _)) = &mut self.pending_append_file {
-            use std::io::Write;
-            if let Err(e) = f.write_all(chunk) {
-                self.pending_append_error = Some(e.to_string());
-            }
+        g.queue.push_back(chunk.to_vec());
+        let should_start = !g.draining;
+        if should_start {
+            g.draining = true;
+        }
+        drop(g);
+        if should_start {
+            let Some(handle) = self.control_handle.clone() else {
+                self.append_spool.lock().unwrap().error = Some("no control handle".into());
+                return;
+            };
+            drain_next_append_chunk(Arc::clone(&self.append_spool), Arc::clone(&self.runtime), handle);
         }
     }
 
     /// Move the just-completed APPEND spool (if any) into
     /// `pending_append_path`, ready for `cmd_append` to stream from.
-    fn finalize_pending_append(&mut self) {
-        if let Some((f, path)) = self.pending_append_file.take() {
-            let _ = f.sync_all();
-            self.pending_append_path = Some(path);
+    /// Returns `false` (and does nothing else) while writes are still
+    /// draining (issue #185) — the caller must defer via
+    /// `pending_append_cmd`/`sync_pending_append` instead of finalizing
+    /// before every chunk has actually landed.
+    fn finalize_pending_append(&mut self) -> bool {
+        let mut g = self.append_spool.lock().unwrap();
+        if g.draining || !g.queue.is_empty() {
+            return false;
         }
+        if let Some(f) = g.file.take() {
+            let _ = f.sync_all();
+        }
+        self.pending_append_path = g.path.take();
+        self.pending_append_error = g.error.take();
+        true
+    }
+
+    /// Re-invoke the deferred APPEND `Command` event once `append_spool`'s
+    /// queued writes have finished draining (issue #185) — mirrors
+    /// `sync_pending_auth_check`, triggered by the last write's
+    /// `poke_handler` call (see `drain_next_append_chunk`).
+    fn sync_pending_append(&mut self, endpoint: &mut dyn Endpoint) {
+        let Some(cmd) = self.pending_append_cmd.take() else {
+            return;
+        };
+        if !self.finalize_pending_append() {
+            self.pending_append_cmd = Some(cmd);
+            return;
+        }
+        self.enqueue_or_dispatch(endpoint, cmd);
     }
 
     fn feed_auth_line(&mut self, endpoint: &mut dyn Endpoint, line: &[u8]) {
@@ -1764,6 +1817,7 @@ impl ProtocolHandler for ImapControlHandler {
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_pending(endpoint);
         self.sync_pending_auth_check(endpoint);
+        self.sync_pending_append(endpoint);
         self.drain_queue(endpoint);
 
         if self.busy.load(Ordering::Relaxed) && !self.lexer.in_literal() {
@@ -1794,18 +1848,32 @@ impl ProtocolHandler for ImapControlHandler {
                     // before its Command event — see `codec::feed_literal`'s
                     // `LiteralPhase::Append` arm — so finalizing here always
                     // picks up exactly the literal that belongs to `cmd`.
-                    self.finalize_pending_append();
-                    // State gating (reject Selected cmds when not selected)
-                    // happens inside dispatch. While a storage operation is in
-                    // flight, `enqueue_or_dispatch` queues pipelined commands
-                    // instead of dispatching, so keep consuming every event
-                    // lexed from this buffer — breaking here would drop them.
-                    self.enqueue_or_dispatch(endpoint, cmd);
+                    if self.finalize_pending_append() {
+                        // State gating (reject Selected cmds when not
+                        // selected) happens inside dispatch. While a
+                        // storage operation is in flight,
+                        // `enqueue_or_dispatch` queues pipelined commands
+                        // instead of dispatching, so keep consuming every
+                        // event lexed from this buffer — breaking here
+                        // would drop them.
+                        self.enqueue_or_dispatch(endpoint, cmd);
+                    } else {
+                        // Spool writes from this literal are still
+                        // draining (issue #185) — `cmd` reads
+                        // `pending_append_path`, which isn't set yet.
+                        // Defer both finalize and dispatch;
+                        // `sync_pending_append` re-invokes this once
+                        // `finalize_pending_append` succeeds, triggered by
+                        // the last write's `poke_handler` call (see
+                        // `drain_next_append_chunk`).
+                        self.pending_append_cmd = Some(cmd);
+                    }
                 }
             }
         }
         self.sync_pending(endpoint);
         self.sync_pending_auth_check(endpoint);
+        self.sync_pending_append(endpoint);
         self.drain_queue(endpoint);
     }
 
@@ -1842,6 +1910,79 @@ impl ProtocolHandler for ImapControlHandler {
     fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
         endpoint.close();
     }
+}
+
+/// Shared, mutex-guarded APPEND literal spool state (issue #185) — see
+/// `ImapControlHandler::append_spool`.
+#[derive(Default)]
+struct AppendSpoolState {
+    file: Option<std::fs::File>,
+    path: Option<std::path::PathBuf>,
+    error: Option<String>,
+    queue: VecDeque<Vec<u8>>,
+    /// One write in flight at a time — set while a chunk is submitted to
+    /// the storage pool, cleared once its callback lands and the queue is
+    /// empty.
+    draining: bool,
+}
+
+/// Drain the next queued APPEND chunk (if any) by submitting its write to
+/// the storage pool; on completion, either drains the next one or clears
+/// `draining` once the queue is empty. Free function (not a method) since
+/// it needs to re-invoke itself from inside a `'static` storage callback,
+/// which only has cloned `Arc`s/`ConnHandle`, not `&mut Self`. Mirrors
+/// `hopf_smtp::server::spool::drain_next` (issue #184).
+fn drain_next_append_chunk(state: Arc<Mutex<AppendSpoolState>>, runtime: Arc<Runtime>, handle: ConnHandle) {
+    let chunk = {
+        let mut g = state.lock().unwrap();
+        match g.queue.pop_front() {
+            Some(c) => c,
+            None => {
+                g.draining = false;
+                return;
+            }
+        }
+    };
+    let op_state = Arc::clone(&state);
+    let cb_state = Arc::clone(&state);
+    let cb_runtime = Arc::clone(&runtime);
+    let cb_handle = handle.clone();
+    runtime.storage().submit_on(
+        handle,
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let mut g = op_state.lock().unwrap();
+            if g.file.is_none() {
+                let path = unique_append_spool_path();
+                let f = std::fs::File::create(&path)?;
+                g.file = Some(f);
+                g.path = Some(path);
+            }
+            use std::io::Write;
+            g.file.as_mut().unwrap().write_all(&chunk)?;
+            Ok(())
+        },
+        move |result: Result<(), StorageError>| {
+            let ok = result.is_ok();
+            {
+                let mut g = cb_state.lock().unwrap();
+                if let Err(e) = &result {
+                    g.error = Some(e.to_string());
+                    g.queue.clear();
+                    g.draining = false;
+                }
+            }
+            cb_handle.with_endpoint(|ep| {
+                // Lets `ImapControlHandler::sync_pending_append` (issue
+                // #185) re-check readiness promptly once this was the
+                // last outstanding write, instead of waiting for the
+                // client's next input to trigger another `receive()`.
+                ep.poke_handler();
+            });
+            if ok {
+                drain_next_append_chunk(cb_state, cb_runtime, cb_handle);
+            }
+        },
+    );
 }
 
 fn unique_append_spool_path() -> std::path::PathBuf {
@@ -1887,6 +2028,183 @@ mod tests {
         // Document expected verbs that require Selected.
         let selected_only = ["FETCH", "STORE", "SEARCH", "COPY", "CLOSE", "UID"];
         assert!(selected_only.contains(&"FETCH"));
+    }
+}
+
+/// Issue #185: APPEND literal chunk writes are offloaded to
+/// `hopf_core::StorageExecutor` rather than done inline on the reactor
+/// thread, and `finalize_pending_append`/the `Command` event that follows
+/// must not read `pending_append_path` until every queued chunk has
+/// actually landed, in order.
+#[cfg(test)]
+mod append_offload_tests {
+    use super::*;
+    use crate::server::handler::ImapHandlerFactory;
+    use hopf_core::{RuntimeConfig, SecurityInfo, StartTlsError, TimerHandle, WriteReadyCallback};
+    use std::io;
+
+    /// Endpoint stub: no real I/O, just enough to satisfy the trait so
+    /// `handle_append_chunk`'s offloaded writes (via `self.control_handle`)
+    /// and `sync_pending_append`/`enqueue_or_dispatch` can run.
+    struct NoopEndpoint;
+    impl Endpoint for NoopEndpoint {
+        fn send(&mut self, _data: &[u8]) {}
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn is_closing(&self) -> bool {
+            false
+        }
+        fn close(&mut self) {}
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:143".parse().unwrap())
+        }
+        fn remote_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:9999".parse().unwrap())
+        }
+        fn security_info(&self) -> &SecurityInfo {
+            static PLAINTEXT: std::sync::OnceLock<SecurityInfo> = std::sync::OnceLock::new();
+            PLAINTEXT.get_or_init(SecurityInfo::plaintext)
+        }
+        fn start_tls(&mut self) -> Result<(), StartTlsError> {
+            Err(StartTlsError::Unsupported)
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _callback: Option<WriteReadyCallback>) {}
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            task();
+        }
+        fn schedule_timer(
+            &self,
+            _delay: std::time::Duration,
+            _callback: Box<dyn FnOnce() + Send>,
+        ) -> TimerHandle {
+            TimerHandle::from_cancel(|| {})
+        }
+        fn handle(&self) -> ConnHandle {
+            ConnHandle::from_execute(Arc::new(|task| task()))
+        }
+    }
+
+    fn test_handler() -> ImapControlHandler {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(hopf_auth::PasswordStore::new().with_user("u", "p"));
+        let factory = Arc::new(hopf_mailbox::MaildirFactory::new(root.path()));
+        // The handler only needs the factory's type, not the directory's
+        // continued existence — nothing in these tests reaches `cmd_append`
+        // itself (they drive `handle_append_chunk`/`finalize_pending_append`
+        // directly), so leaking the tempdir here is fine.
+        std::mem::forget(root);
+        let listen: SocketAddr = "127.0.0.1:1143".parse().unwrap();
+        let config = ImapConfig::new(listen, "localhost", store, factory);
+        let client = crate::server::handler::DefaultImapHandlerFactory::new("ready").create();
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let mut h = ImapControlHandler::new(client, config, rt, ImapServerMetrics::shared());
+        h.control_handle = Some(ConnHandle::from_execute(Arc::new(|task| task())));
+        h
+    }
+
+    fn wait_for(mut pred: impl FnMut() -> bool, max_ms: u64) -> bool {
+        for _ in 0..(max_ms / 5).max(1) {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        pred()
+    }
+
+    #[test]
+    fn append_chunks_land_in_order_across_many_offloaded_writes() {
+        let mut h = test_handler();
+
+        let mut expected = Vec::new();
+        for i in 0..20 {
+            let chunk = format!("chunk{i:02}-");
+            expected.extend_from_slice(chunk.as_bytes());
+            h.handle_append_chunk(chunk.as_bytes());
+        }
+
+        assert!(
+            wait_for(|| h.finalize_pending_append(), 3000),
+            "finalize must eventually succeed once every offloaded write lands"
+        );
+        let path = h
+            .pending_append_path
+            .clone()
+            .expect("spool file created");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected,
+            "chunks must land on disk in submission order despite being offloaded"
+        );
+        assert!(h.pending_append_error.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_literal_never_creates_a_spool_file() {
+        let mut h = test_handler();
+        assert!(h.finalize_pending_append());
+        assert!(h.pending_append_path.is_none());
+        assert!(h.pending_append_error.is_none());
+    }
+
+    #[test]
+    fn command_after_draining_literal_is_deferred_then_dispatched_in_order() {
+        let mut h = test_handler();
+        let mut ep = NoopEndpoint;
+
+        h.handle_append_chunk(b"hello world");
+        let append_cmd = ImapCommand {
+            tag: "a1".into(),
+            verb: "APPEND".into(),
+            args: "INBOX".into(),
+            arg_bytes: b"INBOX".to_vec(),
+        };
+        // Mirrors `receive()`'s `LexEvent::Command` arm.
+        if h.finalize_pending_append() {
+            h.enqueue_or_dispatch(&mut ep, append_cmd);
+        } else {
+            h.pending_append_cmd = Some(append_cmd);
+        }
+
+        // A further pipelined command must queue behind the still-
+        // finalizing APPEND, not run ahead of it.
+        let noop_cmd = ImapCommand {
+            tag: "a2".into(),
+            verb: "NOOP".into(),
+            args: String::new(),
+            arg_bytes: Vec::new(),
+        };
+        h.enqueue_or_dispatch(&mut ep, noop_cmd);
+        if h.pending_append_cmd.is_some() {
+            assert_eq!(
+                h.cmd_queue.len(),
+                1,
+                "a2 must queue behind the still-finalizing APPEND, not dispatch early"
+            );
+        }
+
+        assert!(
+            wait_for(
+                || {
+                    h.sync_pending_append(&mut ep);
+                    h.pending_append_cmd.is_none()
+                },
+                2000
+            ),
+            "the deferred APPEND command must eventually finalize and dispatch"
+        );
+        h.drain_queue(&mut ep);
+        assert!(
+            h.cmd_queue.is_empty(),
+            "a2 must have drained once the APPEND finished"
+        );
+        if let Some(path) = h.pending_append_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
