@@ -37,8 +37,8 @@ use crate::server::search_parse::parse_search;
 use crate::server::service::ImapConfig;
 use crate::server::session::ImapSessionState;
 use crate::server::views::{
-    AppendView, AuthView, CloseView, ConnectedView, CopyView, FetchView, MgmtOp, MgmtView,
-    SearchView, SelectView, StoreView,
+    begin_busy, end_busy, AppendView, AuthView, CloseView, ConnectedView, CopyView, FetchView,
+    MgmtOp, MgmtView, SearchView, SelectView, StoreView,
 };
 
 /// In-flight command telemetry finished when the tagged reply is sent.
@@ -110,6 +110,29 @@ struct PendingAuth {
     server: Box<dyn SaslServer>,
 }
 
+/// Result of a credential check offloaded to the storage pool (issue #181)
+/// — `CredentialStore::password_match`/`SaslServer::step` can block for
+/// LDAP/PAM-backed stores, so both run off the reactor thread; the outcome
+/// lands here for `sync_pending_auth_check` to apply once back on the
+/// reactor (the storage callback only has `&mut dyn Endpoint`, never
+/// `&mut Self`).
+enum AuthCheckOutcome {
+    /// LOGIN.
+    Login {
+        tag: String,
+        user: String,
+        result: Result<bool, String>,
+    },
+    /// AUTHENTICATE (initial or continuation step). `first_step` marks the
+    /// server-first initial call (no client data yet) — a `Complete` there
+    /// means the mechanism authenticated nobody, so it's still a failure.
+    Step {
+        tag: String,
+        first_step: bool,
+        result: Result<(Box<dyn SaslServer>, SaslServerStep), String>,
+    },
+}
+
 /// Per-connection IMAP protocol state machine.
 pub struct ImapControlHandler {
     client_connected: Option<Box<dyn ClientConnected>>,
@@ -137,6 +160,7 @@ pub struct ImapControlHandler {
     busy: Arc<AtomicBool>,
     cmd_queue: VecDeque<ImapCommand>,
     pending_auth: Option<PendingAuth>,
+    pending_auth_check: Arc<Mutex<Option<AuthCheckOutcome>>>,
     /// APPEND literal being spooled to a temp file as chunks arrive — never
     /// buffered whole in memory (see `AppendChunk`/`finalize_pending_append`).
     pending_append_file: Option<(std::fs::File, std::path::PathBuf)>,
@@ -207,6 +231,7 @@ impl ImapControlHandler {
             busy: Arc::new(AtomicBool::new(false)),
             cmd_queue: VecDeque::new(),
             pending_auth: None,
+            pending_auth_check: Arc::new(Mutex::new(None)),
             pending_append_file: None,
             pending_append_error: None,
             pending_append_path: None,
@@ -778,12 +803,25 @@ impl ImapControlHandler {
             self.send(endpoint, tagged_bad(&cmd.tag, "Invalid LOGIN arguments"));
             return;
         };
-        if !self.config.store.password_match(&user, &pass) {
-            self.record_auth(false);
-            self.send(endpoint, tagged_no(&cmd.tag, "Invalid credentials"));
+        let Some(handle) = self.control_handle.clone() else {
+            self.send(endpoint, tagged_no(&cmd.tag, "Internal error: no handle"));
             return;
-        }
-        self.finish_auth(endpoint, &cmd.tag, user);
+        };
+        let store = Arc::clone(&self.config.store);
+        let tag = cmd.tag.clone();
+        let user_for_check = user.clone();
+        let pending = Arc::clone(&self.pending_auth_check);
+        let busy = Arc::clone(&self.busy);
+        begin_busy(endpoint, &self.busy);
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || Ok(store.password_match(&user_for_check, &pass)),
+            move |result: Result<bool, StorageError>| {
+                let result = result.map_err(|e| e.to_string());
+                *pending.lock().unwrap() = Some(AuthCheckOutcome::Login { tag, user, result });
+                handle.with_endpoint(move |ep| end_busy(ep, &busy));
+            },
+        );
     }
 
     fn cmd_authenticate(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
@@ -816,7 +854,7 @@ impl ImapControlHandler {
             peer_certificate: self.peer_certificate.clone(),
             channel_binding: None,
         };
-        let mut server = create_server(mech, Arc::clone(&self.config.store), opts);
+        let server = create_server(mech, Arc::clone(&self.config.store), opts);
 
         let initial_response = match parts.next() {
             // RFC 4959 SASL-IR: a bare "=" is an explicit *empty* initial
@@ -837,46 +875,106 @@ impl ImapControlHandler {
             // A server-first mechanism (e.g. CRAM-MD5) must send its
             // challenge before any client response exists to step on —
             // "complete" on this very first step would mean the mechanism
-            // authenticated nobody, so treat it as failure, not success.
-            match server.step(None) {
-                SaslServerStep::Challenge(c) => {
-                    self.send(endpoint, continuation(&base64::encode(&c)));
-                    self.pending_auth = Some(PendingAuth { tag: cmd.tag, server });
-                    self.lexer.expect_sasl_response();
-                }
-                SaslServerStep::Complete { .. } | SaslServerStep::Failure => {
-                    self.auth_failed(endpoint, &cmd.tag);
-                }
-            }
+            // authenticated nobody, so treat it as failure, not success
+            // (see `AuthCheckOutcome::Step::first_step`).
+            self.sasl_step(endpoint, cmd.tag, server, None, true);
             return;
         }
-        self.sasl_step(endpoint, cmd.tag, server, initial_response.as_deref());
+        self.sasl_step(endpoint, cmd.tag, server, initial_response.as_deref(), false);
     }
 
+    /// Run one SASL step off the reactor thread (issue #181 —
+    /// `SaslServer::step` can block for LDAP/PAM-backed stores). The result
+    /// is applied later by `sync_pending_auth_check`, once back on the
+    /// reactor; `busy` gates pipelined commands until then.
     fn sasl_step(
         &mut self,
         endpoint: &mut dyn Endpoint,
         tag: String,
         mut server: Box<dyn SaslServer>,
         response: Option<&[u8]>,
+        first_step: bool,
     ) {
-        match server.step(response) {
-            SaslServerStep::Challenge(c) => {
-                self.send(endpoint, continuation(&base64::encode(&c)));
-                self.pending_auth = Some(PendingAuth { tag, server });
-                self.lexer.expect_sasl_response();
-            }
-            SaslServerStep::Complete { username, final_message } => {
-                if let Some(fm) = final_message {
-                    if !fm.is_empty() {
-                        self.send(endpoint, continuation(&base64::encode(&fm)));
-                    }
+        let Some(handle) = self.control_handle.clone() else {
+            self.send(endpoint, tagged_no(&tag, "Internal error: no handle"));
+            return;
+        };
+        let response = response.map(<[u8]>::to_vec);
+        let pending = Arc::clone(&self.pending_auth_check);
+        let busy = Arc::clone(&self.busy);
+        begin_busy(endpoint, &self.busy);
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || {
+                let step = server.step(response.as_deref());
+                Ok((server, step))
+            },
+            move |result: Result<(Box<dyn SaslServer>, SaslServerStep), StorageError>| {
+                let result = result.map_err(|e| e.to_string());
+                *pending.lock().unwrap() = Some(AuthCheckOutcome::Step {
+                    tag,
+                    first_step,
+                    result,
+                });
+                handle.with_endpoint(move |ep| end_busy(ep, &busy));
+            },
+        );
+    }
+
+    /// Apply the outcome of an offloaded credential check (LOGIN or a SASL
+    /// step), once `sasl_step`/`cmd_login`'s `submit_on` callback has
+    /// stashed one — see `AuthCheckOutcome`.
+    fn sync_pending_auth_check(&mut self, endpoint: &mut dyn Endpoint) {
+        let Some(outcome) = self.pending_auth_check.lock().unwrap().take() else {
+            return;
+        };
+        match outcome {
+            AuthCheckOutcome::Login { tag, user, result } => match result {
+                Ok(true) => self.finish_auth(endpoint, &tag, user),
+                Ok(false) => {
+                    self.record_auth(false);
+                    self.send(endpoint, tagged_no(&tag, "Invalid credentials"));
                 }
-                self.finish_auth(endpoint, &tag, username);
-            }
-            SaslServerStep::Failure => {
-                self.auth_failed(endpoint, &tag);
-            }
+                Err(e) => {
+                    self.send(
+                        endpoint,
+                        tagged_no(&tag, &format!("[UNAVAILABLE] Authentication temporarily unavailable: {e}")),
+                    );
+                }
+            },
+            AuthCheckOutcome::Step {
+                tag,
+                first_step,
+                result,
+            } => match result {
+                Ok((server, step)) => match step {
+                    SaslServerStep::Challenge(c) => {
+                        self.send(endpoint, continuation(&base64::encode(&c)));
+                        self.pending_auth = Some(PendingAuth { tag, server });
+                        self.lexer.expect_sasl_response();
+                    }
+                    SaslServerStep::Complete {
+                        username,
+                        final_message,
+                    } if !first_step => {
+                        if let Some(fm) = final_message {
+                            if !fm.is_empty() {
+                                self.send(endpoint, continuation(&base64::encode(&fm)));
+                            }
+                        }
+                        self.finish_auth(endpoint, &tag, username);
+                    }
+                    SaslServerStep::Complete { .. } | SaslServerStep::Failure => {
+                        self.auth_failed(endpoint, &tag);
+                    }
+                },
+                Err(e) => {
+                    self.send(
+                        endpoint,
+                        tagged_no(&tag, &format!("[UNAVAILABLE] Authentication temporarily unavailable: {e}")),
+                    );
+                }
+            },
         }
     }
 
@@ -1638,7 +1736,7 @@ impl ImapControlHandler {
             .ok()
             .and_then(|s| base64::decode(s).ok())
         {
-            Some(raw) => self.sasl_step(endpoint, tag, server, Some(&raw)),
+            Some(raw) => self.sasl_step(endpoint, tag, server, Some(&raw), false),
             None => self.send(endpoint, tagged_no(&tag, "Invalid base64")),
         }
     }
@@ -1665,6 +1763,7 @@ impl ProtocolHandler for ImapControlHandler {
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_pending(endpoint);
+        self.sync_pending_auth_check(endpoint);
         self.drain_queue(endpoint);
 
         if self.busy.load(Ordering::Relaxed) && !self.lexer.in_literal() {
@@ -1706,6 +1805,7 @@ impl ProtocolHandler for ImapControlHandler {
             }
         }
         self.sync_pending(endpoint);
+        self.sync_pending_auth_check(endpoint);
         self.drain_queue(endpoint);
     }
 

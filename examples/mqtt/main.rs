@@ -30,7 +30,7 @@ fn main() -> io::Result<()> {
     let broker = Arc::new(BrokerState::new());
     let config = MqttConfig::new(addr, broker).allow_anonymous();
     let svc = MqttService::new(config);
-    let bound = svc.start(&rt)?;
+    let bound = svc.start(Arc::clone(&rt))?;
 
     eprintln!("mqtt broker on mqtt://{bound}/  (anonymous CONNECT — demo only)");
     eprintln!("press Enter to stop");

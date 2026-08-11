@@ -3,14 +3,15 @@
 //! SMTP connection protocol engine (`ProtocolHandler`).
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rmimeparser::{EmailAddress, EmailAddressParser};
 use hopf_auth::{
     create_server, CredentialStore, SaslMechanism, SaslServer, SaslServerOptions, SaslServerStep,
 };
 use rmimeparser::charset::base64;
-use hopf_core::{ConnHandle, Endpoint, ProtocolHandler};
+use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, StorageError};
 use hopf_otel::{
     ExportHandle, RequestTimer, Span, SpanKind, Trace, SmtpServerMetrics as OtelSmtpMetrics,
 };
@@ -31,6 +32,18 @@ use crate::server::pipeline::SmtpPipeline;
 use crate::server::reply::{reply, reply_enhanced, reply_ehlo, reply_multiline};
 use crate::server::service::SmtpConfig;
 use crate::server::session::SmtpSessionState;
+
+/// Result of a SASL step offloaded to the storage pool (issue #181) —
+/// `SaslServer::step` can block for LDAP/PAM-backed stores, so it runs off
+/// the reactor thread; the outcome lands here for `sync_pending_auth_check`
+/// to apply once back on the reactor (the storage callback only has
+/// `&mut dyn Endpoint`, never `&mut Self`). `first_step` marks the
+/// server-first initial call (no client data yet) — a `Complete` there
+/// means the mechanism authenticated nobody, so it's still a failure.
+struct AuthCheckOutcome {
+    first_step: bool,
+    result: Result<(Box<dyn SaslServer>, SaslServerStep), String>,
+}
 
 /// Control-channel SMTP protocol handler.
 pub struct SmtpControlHandler {
@@ -82,6 +95,13 @@ pub struct SmtpControlHandler {
     tx_span: Option<Span>,
     /// Timer for the current mail transaction (MAIL → end).
     tx_timer: Option<RequestTimer>,
+    runtime: Arc<Runtime>,
+    /// True while a SASL step is offloaded to the storage pool (issue
+    /// #181) — pipelined commands are soft-rejected with a temporary
+    /// error (matching the existing `Delivering`-state precedent) rather
+    /// than processed against stale pre-auth state.
+    busy: Arc<AtomicBool>,
+    pending_auth_check: Arc<Mutex<Option<AuthCheckOutcome>>>,
 }
 
 impl SmtpControlHandler {
@@ -92,6 +112,7 @@ impl SmtpControlHandler {
         config: SmtpConfig,
         peer: SocketAddr,
         local: SocketAddr,
+        runtime: Arc<Runtime>,
     ) -> Self {
         let expect_implicit_tls = config.implicit_tls && config.tls_acceptor.is_some();
         Self {
@@ -142,6 +163,9 @@ impl SmtpControlHandler {
             conn_trace: None,
             tx_span: None,
             tx_timer: None,
+            runtime,
+            busy: Arc::new(AtomicBool::new(false)),
+            pending_auth_check: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1093,7 +1117,11 @@ impl SmtpControlHandler {
         let server = create_server(mech, store, opts);
 
         if server.server_first() && initial_response.is_none() {
-            self.sasl_step(endpoint, server, None);
+            // A server-first mechanism must send its challenge before any
+            // client response exists to step on — "complete" here would
+            // mean the mechanism authenticated nobody, so it's still a
+            // failure (see `AuthCheckOutcome::first_step`).
+            self.sasl_step(endpoint, server, None, true);
             return;
         }
 
@@ -1106,46 +1134,98 @@ impl SmtpControlHandler {
                 self.sasl = Some(server);
                 self.lexer.expect_sasl_response();
             }
-            Some(data) => self.sasl_step(endpoint, server, Some(&data)),
+            Some(data) => self.sasl_step(endpoint, server, Some(&data), false),
         }
     }
 
+    /// Run one SASL step off the reactor thread (issue #181 —
+    /// `SaslServer::step` can block for LDAP/PAM-backed stores). The result
+    /// is applied later by `sync_pending_auth_check`, once back on the
+    /// reactor; `busy` soft-rejects pipelined commands until then (same
+    /// precedent as the `Delivering` state check in `receive`).
     fn sasl_step(
         &mut self,
         endpoint: &mut dyn Endpoint,
         mut server: Box<dyn SaslServer>,
         response: Option<&[u8]>,
+        first_step: bool,
     ) {
-        match server.step(response) {
-            SaslServerStep::Challenge(c) => {
-                self.send_reply(endpoint, 334, &base64::encode(&c));
-                self.sasl = Some(server);
-                self.lexer.expect_sasl_response();
-            }
-            SaslServerStep::Complete {
-                username,
-                final_message,
-            } => {
-                if let Some(fm) = final_message {
-                    if !fm.is_empty() {
-                        self.send_reply(endpoint, 334, &base64::encode(&fm));
-                    }
-                }
-                self.sasl = None;
-                self.finish_auth(endpoint, username);
-            }
-            SaslServerStep::Failure => {
-                self.sasl = None;
-                self.auth_failed(endpoint);
-            }
-        }
+        let Some(handle) = self.control_handle.clone() else {
+            self.send_enhanced(endpoint, 454, "4.7.0", "Temporary authentication failure");
+            return;
+        };
+        let response = response.map(<[u8]>::to_vec);
+        let pending = Arc::clone(&self.pending_auth_check);
+        let busy = Arc::clone(&self.busy);
+        self.busy.store(true, Ordering::Relaxed);
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || {
+                let step = server.step(response.as_deref());
+                Ok((server, step))
+            },
+            move |result: Result<(Box<dyn SaslServer>, SaslServerStep), StorageError>| {
+                let result = result.map_err(|e| e.to_string());
+                *pending.lock().unwrap() = Some(AuthCheckOutcome { first_step, result });
+                handle.with_endpoint(move |ep| {
+                    busy.store(false, Ordering::Relaxed);
+                    // Nothing has been sent to the client yet at this
+                    // point — the reply depends entirely on
+                    // `sync_pending_auth_check`, which needs `&mut Self`
+                    // and so can't run from here. The client is waiting on
+                    // us, not about to send more input, so nothing else
+                    // would trigger another `receive()` call; `poke_handler`
+                    // forces one.
+                    ep.poke_handler();
+                });
+            },
+        );
     }
 
     fn handle_sasl_response(&mut self, endpoint: &mut dyn Endpoint, response: Vec<u8>) {
         let Some(server) = self.sasl.take() else {
             return;
         };
-        self.sasl_step(endpoint, server, Some(&response));
+        self.sasl_step(endpoint, server, Some(&response), false);
+    }
+
+    /// Apply the outcome of an offloaded SASL step, once `sasl_step`'s
+    /// `submit_on` callback has stashed one — see `AuthCheckOutcome`.
+    fn sync_pending_auth_check(&mut self, endpoint: &mut dyn Endpoint) {
+        let Some(AuthCheckOutcome { first_step, result }) = self.pending_auth_check.lock().unwrap().take() else {
+            return;
+        };
+        match result {
+            Ok((server, step)) => match step {
+                SaslServerStep::Challenge(c) => {
+                    self.send_reply(endpoint, 334, &base64::encode(&c));
+                    self.sasl = Some(server);
+                    self.lexer.expect_sasl_response();
+                }
+                SaslServerStep::Complete {
+                    username,
+                    final_message,
+                } if !first_step => {
+                    if let Some(fm) = final_message {
+                        if !fm.is_empty() {
+                            self.send_reply(endpoint, 334, &base64::encode(&fm));
+                        }
+                    }
+                    self.finish_auth(endpoint, username);
+                }
+                SaslServerStep::Complete { .. } | SaslServerStep::Failure => {
+                    self.auth_failed(endpoint);
+                }
+            },
+            Err(e) => {
+                self.send_enhanced(
+                    endpoint,
+                    454,
+                    "4.7.0",
+                    &format!("Temporary authentication failure: {e}"),
+                );
+            }
+        }
     }
 
     fn auth_failed(&mut self, endpoint: &mut dyn Endpoint) {
@@ -1223,6 +1303,22 @@ impl SmtpControlHandler {
                     self.send_enhanced(endpoint, 500, "5.5.2", "Line too long");
                 }
                 for cmd in cmds {
+                    // A SASL continuation line can itself flip `busy` (its
+                    // step offloads to the storage pool) partway through
+                    // this loop — any command already lexed out of this
+                    // same buffer right behind it must not be dispatched
+                    // against that now-stale state (issue #181); soft
+                    // reject it the same way `receive` does for a command
+                    // arriving in a later, separate read while busy.
+                    if self.busy.load(Ordering::Relaxed) {
+                        self.send_enhanced(
+                            endpoint,
+                            451,
+                            "4.7.0",
+                            "Authentication in progress, try again later",
+                        );
+                        continue;
+                    }
                     self.dispatch(endpoint, cmd);
                 }
             }
@@ -1255,6 +1351,7 @@ impl ProtocolHandler for SmtpControlHandler {
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_deferred();
+        self.sync_pending_auth_check(endpoint);
         if self.session == SmtpSessionState::Delivering {
             // Still waiting for outbound relay to finish — soft reject pipelined cmds.
             if !data.is_empty() {
@@ -1263,6 +1360,20 @@ impl ProtocolHandler for SmtpControlHandler {
                     451,
                     "4.3.2",
                     "Delivery in progress, try again later",
+                );
+                *data = &[];
+            }
+            return;
+        }
+        if self.busy.load(Ordering::Relaxed) {
+            // A SASL step is offloaded — soft reject pipelined commands
+            // (issue #181), same precedent as the `Delivering` check above.
+            if !data.is_empty() {
+                self.send_enhanced(
+                    endpoint,
+                    451,
+                    "4.7.0",
+                    "Authentication in progress, try again later",
                 );
                 *data = &[];
             }
@@ -1691,12 +1802,14 @@ mod telemetry_tests {
         let pipeline = TelemetryPipeline::start(cfg).unwrap();
         let peer: SocketAddr = "127.0.0.1:25".parse().unwrap();
         let local: SocketAddr = "127.0.0.1:2525".parse().unwrap();
+        let rt = Arc::new(Runtime::start(hopf_core::RuntimeConfig::default()).unwrap());
         let mut h = SmtpControlHandler::new(
             Box::new(AcceptAllSmtpHandler::new("localhost")),
             SmtpServerMetrics::shared(),
             SmtpConfig::new(local, "localhost").auth_required(false),
             peer,
             local,
+            rt,
         )
         .with_telemetry(
             Some(pipeline.smtp_metrics()),

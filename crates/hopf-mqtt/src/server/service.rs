@@ -81,7 +81,7 @@ impl MqttService {
     /// Build a [`TcpListenerConfig`] for the MQTT port (for composing with
     /// other listeners via `hopf_core::Composition`, mirroring
     /// `SmtpService::control_listener` / `Pop3Service::control_listener`).
-    pub fn control_listener(&self) -> TcpListenerConfig {
+    pub fn control_listener(&self, runtime: Arc<Runtime>) -> TcpListenerConfig {
         let config = Arc::clone(&self.config);
         let handler_factory = Arc::clone(&self.handler_factory);
         let metrics = Arc::clone(&self.metrics);
@@ -96,6 +96,7 @@ impl MqttService {
                     handler_factory.create_publish(),
                     handler_factory.create_subscribe(),
                     Arc::clone(&metrics),
+                    Arc::clone(&runtime),
                 )
                     .with_telemetry(otel_metrics.clone(), export.clone(), traces_enabled),
             ) as Box<dyn ProtocolHandler>
@@ -103,8 +104,8 @@ impl MqttService {
     }
 
     /// Register the listener directly on `runtime`; returns the bound address.
-    pub fn start(&self, runtime: &Runtime) -> io::Result<SocketAddr> {
-        let (addr, _) = runtime.add_tcp_listener(self.control_listener())?;
+    pub fn start(&self, runtime: Arc<Runtime>) -> io::Result<SocketAddr> {
+        let (addr, _) = runtime.add_tcp_listener(self.control_listener(Arc::clone(&runtime)))?;
         Ok(addr)
     }
 }
