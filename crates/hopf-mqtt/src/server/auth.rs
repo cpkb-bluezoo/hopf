@@ -7,17 +7,18 @@
 //! established is also supported when credentials are configured. AUTH without
 //! a configured method / exchange is rejected clearly (not a silent no-op).
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use hopf_auth::{
     create_server, SaslMechanism, SaslServer, SaslServerOptions, SaslServerStep,
 };
-use hopf_core::Endpoint;
+use hopf_core::{Endpoint, StorageError};
 
 use crate::codec::packet::reason;
 use crate::codec::properties::property;
 use crate::codec::{encode, Properties, ProtocolVersion};
-use crate::server::control::MqttControlHandler;
+use crate::server::control::{AuthStepOutcome, MqttControlHandler};
 
 /// In-progress enhanced AUTH exchange (between CONNECT and CONNACK, or re-AUTH).
 pub(crate) struct PendingAuth {
@@ -40,39 +41,149 @@ pub(crate) struct PendingConnectAuth {
     pub(crate) client_topic_alias_max: u16,
 }
 
-enum AuthOutcome {
-    Continue,
-    Complete,
-    Failure,
+/// Run one SASL step off the reactor thread (issue #181 — `SaslServer::step`
+/// can block for LDAP/PAM-backed stores). The result is applied later by
+/// [`sync_pending_auth_check`], once back on the reactor — this call site
+/// used to do the step and send the resulting reply/challenge inline
+/// (`step_and_reply`); now the two are split across the async boundary, so
+/// every bit of context needed to resume (which of the CONNECT-initial /
+/// continuation / re-AUTH branches, and the pending CONNECT fields for the
+/// first of those) travels in [`AuthStepOutcome`] instead of living on the
+/// call stack.
+fn offload_step(
+    handler: &mut MqttControlHandler,
+    endpoint: &mut dyn Endpoint,
+    mut server: Box<dyn SaslServer>,
+    client_data: Option<&[u8]>,
+    method: String,
+    version: ProtocolVersion,
+    for_connect: bool,
+    pending_connect: Option<PendingConnectAuth>,
+) {
+    let Some(handle) = handler.control_handle.clone() else {
+        endpoint.send(&encode::encode_disconnect(reason::UNSPECIFIED_ERROR, &Properties::new(), version));
+        endpoint.close();
+        return;
+    };
+    let client_data = client_data.map(<[u8]>::to_vec);
+    let pending = Arc::clone(&handler.pending_auth_check);
+    let busy = Arc::clone(&handler.busy);
+    handler.busy.store(true, Ordering::Relaxed);
+    handler.runtime.storage().submit_on(
+        handle.clone(),
+        move || {
+            let step = server.step(client_data.as_deref());
+            Ok((server, step))
+        },
+        move |result: Result<(Box<dyn SaslServer>, SaslServerStep), StorageError>| {
+            let result = result.map_err(|e| e.to_string());
+            *pending.lock().unwrap() = Some(AuthStepOutcome {
+                result,
+                method,
+                version,
+                for_connect,
+                pending_connect,
+            });
+            handle.with_endpoint(move |ep| {
+                busy.store(false, Ordering::Relaxed);
+                // Nothing has been sent to the client yet at this point —
+                // the reply depends entirely on `sync_pending_auth_check`,
+                // which needs `&mut MqttControlHandler` and so can't run
+                // from here. The client is waiting on us, not about to
+                // send more input, so nothing else would trigger another
+                // `receive()` call; `poke_handler` forces one.
+                ep.poke_handler();
+            });
+        },
+    );
 }
 
-fn step_and_reply(
-    endpoint: &mut dyn Endpoint,
-    server: &mut dyn SaslServer,
-    method: &str,
-    client_data: Option<&[u8]>,
-) -> AuthOutcome {
-    let result = server.step(client_data);
-    match result {
+/// Apply the outcome of an offloaded SASL step, once `offload_step`'s
+/// `submit_on` callback has stashed one — see [`AuthStepOutcome`]. Called
+/// from `MqttControlHandler::receive` before every packet parse, mirroring
+/// the synchronous reply/state logic `step_and_reply` plus each of its call
+/// sites used to do inline.
+pub(crate) fn sync_pending_auth_check(handler: &mut MqttControlHandler, endpoint: &mut dyn Endpoint) {
+    let Some(AuthStepOutcome {
+        result,
+        method,
+        version,
+        for_connect,
+        pending_connect,
+    }) = handler.pending_auth_check.lock().unwrap().take()
+    else {
+        return;
+    };
+    let (server, step) = match result {
+        Ok(ok) => ok,
+        Err(_e) => {
+            handler.record_auth(false);
+            if for_connect {
+                endpoint.send(&encode::encode_connack(
+                    false,
+                    reason::SERVER_UNAVAILABLE,
+                    &Properties::new(),
+                    version,
+                ));
+            } else {
+                endpoint.send(&encode::encode_disconnect(
+                    reason::SERVER_UNAVAILABLE,
+                    &Properties::new(),
+                    version,
+                ));
+            }
+            endpoint.close();
+            return;
+        }
+    };
+    match step {
         SaslServerStep::Challenge(data) => {
             let mut props = Properties::new();
-            props.set_utf8(property::AUTHENTICATION_METHOD, method);
+            props.set_utf8(property::AUTHENTICATION_METHOD, &method);
             if !data.is_empty() {
                 props.set_binary(property::AUTHENTICATION_DATA, data);
             }
             endpoint.send(&encode::encode_auth(reason::CONTINUE_AUTHENTICATION, &props));
-            AuthOutcome::Continue
+            handler.pending_auth = Some(PendingAuth {
+                server,
+                method,
+                for_connect,
+                version,
+                pending_connect,
+            });
         }
         SaslServerStep::Complete { final_message, .. } => {
             if let Some(data) = final_message.filter(|d| !d.is_empty()) {
                 let mut props = Properties::new();
-                props.set_utf8(property::AUTHENTICATION_METHOD, method);
+                props.set_utf8(property::AUTHENTICATION_METHOD, &method);
                 props.set_binary(property::AUTHENTICATION_DATA, data);
                 endpoint.send(&encode::encode_auth(reason::SUCCESS, &props));
             }
-            AuthOutcome::Complete
+            handler.record_auth(true);
+            if for_connect {
+                if let Some(pc) = pending_connect {
+                    crate::server::control::finish_connect_after_auth(handler, endpoint, pc);
+                }
+            }
         }
-        SaslServerStep::Failure => AuthOutcome::Failure,
+        SaslServerStep::Failure => {
+            handler.record_auth(false);
+            if for_connect {
+                endpoint.send(&encode::encode_connack(
+                    false,
+                    reason::NOT_AUTHORIZED,
+                    &Properties::new(),
+                    version,
+                ));
+            } else {
+                endpoint.send(&encode::encode_disconnect(
+                    reason::NOT_AUTHORIZED,
+                    &Properties::new(),
+                    version,
+                ));
+            }
+            endpoint.close();
+        }
     }
 }
 
@@ -122,43 +233,39 @@ pub(crate) fn maybe_start_connect_auth(
         return Err(reason::BAD_AUTHENTICATION_METHOD);
     };
 
-    let mut server = make_server(&method, store).ok_or(reason::BAD_AUTHENTICATION_METHOD)?;
+    let server = make_server(&method, store).ok_or(reason::BAD_AUTHENTICATION_METHOD)?;
+
+    let pending_connect = PendingConnectAuth {
+        client_id: client_id.to_string(),
+        clean_session: packet.clean_session,
+        keep_alive_raw: packet.keep_alive,
+        will: packet.will.clone(),
+        receive_maximum,
+        session_expiry_secs,
+        client_topic_alias_max,
+    };
 
     // Server-first mechanisms need an initial empty step.
     if server.server_first() {
-        match step_and_reply(endpoint, &mut *server, &method, None) {
-            AuthOutcome::Continue => {}
-            AuthOutcome::Complete => return Ok(false),
-            AuthOutcome::Failure => return Err(reason::NOT_AUTHORIZED),
-        }
+        offload_step(handler, endpoint, server, None, method, packet.version, true, Some(pending_connect));
     } else if let Some(data) = packet.properties.get_binary(property::AUTHENTICATION_DATA) {
-        match step_and_reply(endpoint, &mut *server, &method, Some(data)) {
-            AuthOutcome::Continue => {}
-            AuthOutcome::Complete => return Ok(false),
-            AuthOutcome::Failure => return Err(reason::NOT_AUTHORIZED),
-        }
+        let data = data.to_vec();
+        offload_step(handler, endpoint, server, Some(&data), method, packet.version, true, Some(pending_connect));
     } else {
-        // Client must send AUTH with data next (e.g. PLAIN without initial data).
+        // Client must send AUTH with data next (e.g. PLAIN without initial
+        // data) — nothing to step yet, so no offload needed here; just
+        // prompt and stash the server for the continuation to offload.
         let mut props = Properties::new();
         props.set_utf8(property::AUTHENTICATION_METHOD, &method);
         endpoint.send(&encode::encode_auth(reason::CONTINUE_AUTHENTICATION, &props));
+        handler.pending_auth = Some(PendingAuth {
+            server,
+            method,
+            for_connect: true,
+            version: packet.version,
+            pending_connect: Some(pending_connect),
+        });
     }
-
-    handler.pending_auth = Some(PendingAuth {
-        server,
-        method,
-        for_connect: true,
-        version: packet.version,
-        pending_connect: Some(PendingConnectAuth {
-            client_id: client_id.to_string(),
-            clean_session: packet.clean_session,
-            keep_alive_raw: packet.keep_alive,
-            will: packet.will.clone(),
-            receive_maximum,
-            session_expiry_secs,
-            client_topic_alias_max,
-        }),
-    });
     Ok(true)
 }
 
@@ -168,7 +275,7 @@ pub(crate) fn handle_auth_packet(
     endpoint: &mut dyn Endpoint,
     properties: Properties,
 ) {
-    if let Some(mut pending) = handler.pending_auth.take() {
+    if let Some(pending) = handler.pending_auth.take() {
         if let Some(method) = properties.get_utf8(property::AUTHENTICATION_METHOD) {
             if method != pending.method {
                 endpoint.send(&encode::encode_disconnect(
@@ -181,37 +288,16 @@ pub(crate) fn handle_auth_packet(
             }
         }
         let data = properties.get_binary(property::AUTHENTICATION_DATA);
-        match step_and_reply(endpoint, &mut *pending.server, &pending.method, data) {
-            AuthOutcome::Continue => {
-                handler.pending_auth = Some(pending);
-            }
-            AuthOutcome::Complete => {
-                handler.record_auth(true);
-                if pending.for_connect {
-                    if let Some(pc) = pending.pending_connect {
-                        crate::server::control::finish_connect_after_auth(handler, endpoint, pc);
-                    }
-                }
-            }
-            AuthOutcome::Failure => {
-                handler.record_auth(false);
-                if pending.for_connect {
-                    endpoint.send(&encode::encode_connack(
-                        false,
-                        reason::NOT_AUTHORIZED,
-                        &Properties::new(),
-                        pending.version,
-                    ));
-                } else {
-                    endpoint.send(&encode::encode_disconnect(
-                        reason::NOT_AUTHORIZED,
-                        &Properties::new(),
-                        pending.version,
-                    ));
-                }
-                endpoint.close();
-            }
-        }
+        offload_step(
+            handler,
+            endpoint,
+            pending.server,
+            data,
+            pending.method,
+            pending.version,
+            pending.for_connect,
+            pending.pending_connect,
+        );
         return;
     }
 
@@ -240,7 +326,7 @@ pub(crate) fn handle_auth_packet(
         return;
     };
 
-    let Some(mut server) = make_server(&method, store) else {
+    let Some(server) = make_server(&method, store) else {
         endpoint.send(&encode::encode_disconnect(
             reason::BAD_AUTHENTICATION_METHOD,
             &Properties::new(),
@@ -251,25 +337,5 @@ pub(crate) fn handle_auth_packet(
     };
 
     let data = properties.get_binary(property::AUTHENTICATION_DATA);
-    match step_and_reply(endpoint, &mut *server, &method, data) {
-        AuthOutcome::Continue => {
-            handler.pending_auth = Some(PendingAuth {
-                server,
-                method,
-                for_connect: false,
-                version,
-                pending_connect: None,
-            });
-        }
-        AuthOutcome::Complete => handler.record_auth(true),
-        AuthOutcome::Failure => {
-            handler.record_auth(false);
-            endpoint.send(&encode::encode_disconnect(
-                reason::NOT_AUTHORIZED,
-                &Properties::new(),
-                version,
-            ));
-            endpoint.close();
-        }
-    }
+    offload_step(handler, endpoint, server, data, method, version, false, None);
 }

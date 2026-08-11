@@ -210,7 +210,7 @@ impl SmtpService {
     }
 
     /// Build a [`TcpListenerConfig`] for the SMTP port.
-    pub fn control_listener(&self, _runtime: Arc<Runtime>) -> TcpListenerConfig {
+    pub fn control_listener(&self, runtime: Arc<Runtime>) -> TcpListenerConfig {
         let factory = Arc::clone(&self.handler_factory);
         let metrics = Arc::clone(&self.metrics);
         let config = self.config.clone();
@@ -227,6 +227,7 @@ impl SmtpService {
                     config.clone(),
                     peer,
                     local,
+                    Arc::clone(&runtime),
                 )
                 .with_telemetry(otel_metrics.clone(), export.clone(), traces_enabled),
             ) as Box<dyn ProtocolHandler>

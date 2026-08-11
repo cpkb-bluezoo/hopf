@@ -6,11 +6,12 @@
 use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_core::{Endpoint, ProtocolHandler, TimerHandle};
+use hopf_auth::{SaslServer, SaslServerStep};
+use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, TimerHandle};
 use hopf_otel::{
     ExportHandle, RequestTimer, Span, SpanKind, Trace, MqttServerMetrics as OtelMqttMetrics,
 };
@@ -132,6 +133,22 @@ enum SessionState {
     Connected(Box<ConnectedSession>),
 }
 
+/// Result of a SASL step offloaded to the storage pool (issue #181) —
+/// `SaslServer::step` can block for LDAP/PAM-backed stores, so it runs off
+/// the reactor thread; the outcome lands here for `sync_pending_auth_check`
+/// to apply once back on the reactor (the storage callback only has
+/// `&mut dyn Endpoint`, never `&mut Self`). Carries everything the
+/// synchronous `step_and_reply` call site used to close over, since which
+/// of the (CONNECT-initial / continuation / re-AUTH) branches to resume
+/// can no longer be inferred from the call stack once the step is async.
+pub(crate) struct AuthStepOutcome {
+    pub(crate) result: Result<(Box<dyn SaslServer>, SaslServerStep), String>,
+    pub(crate) method: String,
+    pub(crate) version: ProtocolVersion,
+    pub(crate) for_connect: bool,
+    pub(crate) pending_connect: Option<crate::server::auth::PendingConnectAuth>,
+}
+
 /// Server-side `ProtocolHandler` for one MQTT TCP connection.
 pub struct MqttControlHandler {
     pub(crate) config: Arc<MqttConfig>,
@@ -149,6 +166,16 @@ pub struct MqttControlHandler {
     traces_enabled: bool,
     conn_trace: Option<Trace>,
     publish_tel: Option<PublishTelemetry>,
+    pub(crate) runtime: Arc<Runtime>,
+    pub(crate) control_handle: Option<ConnHandle>,
+    /// True while a SASL step (enhanced AUTH) is offloaded to the storage
+    /// pool (issue #181) — `connect()`'s existing second-CONNECT guard also
+    /// rejects while this is set, since a pipelined second CONNECT would
+    /// otherwise race the in-flight check (session state alone doesn't
+    /// protect against that: it only transitions to `Connected` once the
+    /// check resolves).
+    pub(crate) busy: Arc<AtomicBool>,
+    pub(crate) pending_auth_check: Arc<Mutex<Option<AuthStepOutcome>>>,
 }
 
 impl MqttControlHandler {
@@ -161,6 +188,7 @@ impl MqttControlHandler {
         publish_handler: Box<dyn PublishHandler>,
         subscribe_handler: Box<dyn SubscribeHandler>,
         metrics: Arc<MqttServerMetrics>,
+        runtime: Arc<Runtime>,
     ) -> Self {
         let mut parser = MqttFrameParser::new(ProtocolVersion::V311);
         parser.set_max_packet_size(config.max_packet_size);
@@ -186,6 +214,10 @@ impl MqttControlHandler {
             traces_enabled: false,
             conn_trace: None,
             publish_tel: None,
+            runtime,
+            control_handle: None,
+            busy: Arc::new(AtomicBool::new(false)),
+            pending_auth_check: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -305,6 +337,7 @@ impl ProtocolHandler for MqttControlHandler {
         }
         self.begin_connection_telemetry();
         let handle = endpoint.handle();
+        self.control_handle = Some(handle.clone());
         self.connect_timeout_timer = Some(endpoint.schedule_timer(
             self.config.connect_timeout,
             Box::new(move || handle.close()),
@@ -312,6 +345,7 @@ impl ProtocolHandler for MqttControlHandler {
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        crate::server::auth::sync_pending_auth_check(self, endpoint);
         // `Ctx` borrows `self` for the duration of the callbacks, so the
         // parser driving those callbacks can't live inside `self` while
         // it's being called — swap it out for the duration of `push`.
@@ -521,9 +555,15 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         if let Some(timer) = self.handler.connect_timeout_timer.take() {
             timer.cancel();
         }
-        if matches!(self.handler.session, SessionState::Connected(_)) {
+        if matches!(self.handler.session, SessionState::Connected(_))
+            || self.handler.busy.load(Ordering::Relaxed)
+        {
             // A second CONNECT on an established session is a protocol
-            // violation (MQTT 3.1.1 §3.1).
+            // violation (MQTT 3.1.1 §3.1) — also rejected while a SASL
+            // step from a first, still-in-flight CONNECT's enhanced AUTH
+            // is offloaded (issue #181): `session` alone doesn't protect
+            // against this race, since it only becomes `Connected` once
+            // that check resolves.
             self.disconnect_and_close(reason::PROTOCOL_ERROR);
             return;
         }
@@ -1033,12 +1073,14 @@ mod telemetry_tests {
             .allow_anonymous(),
         );
         let factory = DefaultMqttHandlerFactory::new(None, true);
+        let rt = Arc::new(Runtime::start(hopf_core::RuntimeConfig::default()).unwrap());
         let mut h = MqttControlHandler::new(
             config,
             factory.create(),
             factory.create_publish(),
             factory.create_subscribe(),
             MqttServerMetrics::shared(),
+            rt,
         )
         .with_telemetry(
             Some(pipeline.mqtt_metrics()),
