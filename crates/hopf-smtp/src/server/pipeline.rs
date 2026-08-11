@@ -23,6 +23,15 @@ pub trait SmtpPipeline: Send {
     fn end_data(&mut self);
     /// RSET or transaction end — clear per-message state.
     fn reset(&mut self);
+    /// True while async work `message_content` queued (e.g. disk writes
+    /// offloaded to `hopf_core::StorageExecutor`, issue #184) is still in
+    /// flight. Callers must not trust `end_data()` as a completion signal,
+    /// or read any pipeline-observable state that depends on every chunk
+    /// having actually landed, until this returns `false`. Default: this
+    /// pipeline never defers anything, so there's nothing to wait for.
+    fn is_pending(&self) -> bool {
+        false
+    }
 }
 
 /// No-op pipeline.

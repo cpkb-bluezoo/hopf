@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
-use hopf_core::Endpoint;
+use hopf_core::{ConnHandle, Endpoint, Runtime, StorageError};
 
 use crate::{BodyType, DsnRecipientParams};
 
@@ -44,6 +44,17 @@ impl Default for MessageSource {
     fn default() -> Self {
         MessageSource::Empty
     }
+}
+
+/// Result of an offloaded DATA/BDAT chunk read (issue #184), stashed by
+/// the storage callback for [`SmtpSendDriver::resume_pending_data`] to
+/// apply once back on the reactor thread (see
+/// [`super::handlers::SmtpClientDriver::resume_pending_data`]).
+enum PendingDataOutcome {
+    /// Plain-DATA file source exhausted — call `end_message()`.
+    EndMessage,
+    /// Next BDAT chunk (or the empty-message `BDAT 0 LAST` case).
+    BdatChunk { content: Vec<u8>, last: bool },
 }
 
 // ── SmtpSendState ─────────────────────────────────────────────────────────────
@@ -76,6 +87,9 @@ struct SmtpSendState {
     pipeline_abort: bool,
     /// Completion callback.
     on_complete: Option<Box<dyn FnOnce(bool) + Send>>,
+    /// Set by an offloaded DATA/BDAT chunk read's storage callback (issue
+    /// #184); applied by `SmtpSendDriver::resume_pending_data`.
+    pending_data: Option<PendingDataOutcome>,
 }
 
 // ── SmtpSend ─────────────────────────────────────────────────────────────────
@@ -123,6 +137,7 @@ impl SmtpSend {
             accepted_rcpts: 0,
             pipeline_abort: false,
             on_complete: None,
+            pending_data: None,
         })))
     }
 
@@ -234,8 +249,11 @@ impl SmtpSend {
 }
 
 impl SmtpClientHandlerFactory for SmtpSend {
-    fn create(&self) -> Box<dyn SmtpClientDriver> {
-        Box::new(SmtpSendDriver { state: Arc::clone(&self.0) })
+    fn create(&self, runtime: &Arc<Runtime>) -> Box<dyn SmtpClientDriver> {
+        Box::new(SmtpSendDriver {
+            state: Arc::clone(&self.0),
+            runtime: Arc::clone(runtime),
+        })
     }
 }
 
@@ -243,6 +261,7 @@ impl SmtpClientHandlerFactory for SmtpSend {
 
 struct SmtpSendDriver {
     state: Arc<Mutex<SmtpSendState>>,
+    runtime: Arc<Runtime>,
 }
 
 impl SmtpSendDriver {
@@ -273,9 +292,18 @@ impl SmtpSendDriver {
     }
 
     /// Pull the next body chunk for BDAT, with one-chunk lookahead so the
-    /// LAST flag can be set correctly.
-    fn send_next_bdat_chunk(&self, data: &mut dyn SmtpClientMessageData) {
+    /// LAST flag can be set correctly. A file-backed source (issue #184)
+    /// offloads its read(s) to the storage pool and resumes asynchronously
+    /// via [`Self::resume_pending_data`]; an in-memory source
+    /// (`Chunks`/`Empty`) resolves inline as before.
+    fn send_next_bdat_chunk(&self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint) {
         let mut st = self.state.lock().unwrap();
+        if matches!(st.message, MessageSource::File(_) | MessageSource::Reading(_)) {
+            let known_current = st.bdat_lookahead.take();
+            drop(st);
+            self.offload_bdat_read(ep, known_current);
+            return;
+        }
         let current = st
             .bdat_lookahead
             .take()
@@ -298,6 +326,54 @@ impl SmtpSendDriver {
                 data.write_bdat_chunk(&cur, false);
             }
         }
+    }
+
+    /// Off-reactor counterpart of the tail of [`Self::send_next_bdat_chunk`]
+    /// for a file-backed `message` — reads `known_current` (if not already
+    /// known from a previous lookahead) plus the one-chunk lookahead, all
+    /// on the storage pool, then stashes a [`PendingDataOutcome::BdatChunk`]
+    /// and pokes the endpoint so `resume_pending_data` can apply it.
+    fn offload_bdat_read(&self, ep: &mut dyn Endpoint, known_current: Option<Vec<u8>>) {
+        let handle = ep.handle();
+        let handle_for_cb = handle.clone();
+        let state = Arc::clone(&self.state);
+        let message = std::mem::replace(&mut state.lock().unwrap().message, MessageSource::Empty);
+        // (new `message` state, current chunk, following/lookahead chunk).
+        type BdatReadResult = (MessageSource, Option<Vec<u8>>, Option<Vec<u8>>);
+        self.runtime.storage().submit_on(
+            handle,
+            move || -> Result<BdatReadResult, Box<dyn std::error::Error + Send + Sync>> {
+                let mut message = message;
+                let current = match known_current {
+                    Some(c) => Some(c),
+                    None => Self::read_one_chunk(&mut message),
+                };
+                let Some(cur) = current else {
+                    return Ok((message, None, None));
+                };
+                let following = Self::read_one_chunk(&mut message);
+                Ok((message, Some(cur), following))
+            },
+            move |result: Result<BdatReadResult, StorageError>| {
+                let (message, current, following) = result.unwrap_or((MessageSource::Empty, None, None));
+                let mut st = state.lock().unwrap();
+                st.message = message;
+                st.bdat_lookahead = following.clone();
+                st.pending_data = Some(match current {
+                    Some(content) => PendingDataOutcome::BdatChunk {
+                        content,
+                        last: following.is_none(),
+                    },
+                    // Empty message → BDAT 0 LAST.
+                    None => PendingDataOutcome::BdatChunk {
+                        content: Vec::new(),
+                        last: true,
+                    },
+                });
+                drop(st);
+                handle_for_cb.with_endpoint(|ep| ep.poke_handler());
+            },
+        );
     }
 
     fn read_one_chunk(message: &mut MessageSource) -> Option<Vec<u8>> {
@@ -660,7 +736,7 @@ impl SmtpClientDriver for SmtpSendDriver {
             return;
         }
         if data.is_bdat_mode() {
-            self.send_next_bdat_chunk(data);
+            self.send_next_bdat_chunk(data, ep);
             return;
         }
         let source = std::mem::take(&mut self.state.lock().unwrap().message);
@@ -681,38 +757,55 @@ impl SmtpClientDriver for SmtpSendDriver {
                 }
             }
             MessageSource::File(path) => {
-                // Streamed in bounded chunks straight to the wire via
-                // `ep.send()` (bypassing `write_content`'s own internal
-                // buffer, which only flushes once this whole callback
-                // returns — see `DotStuffer`'s doc comment) so a relay
-                // fanning one spooled message out to several MX hosts never
-                // holds the whole message in memory again per host.
-                let mut stuffer = DotStuffer::new();
-                let mut out = Vec::with_capacity(8192);
-                if let Ok(mut f) = File::open(&path) {
-                    let mut buf = [0u8; 8192];
-                    loop {
-                        let n = f.read(&mut buf).unwrap_or(0);
-                        if n == 0 {
-                            break;
+                // Read + dot-stuff the file off the reactor thread (issue
+                // #184) via `submit_streamed`, sending each stuffed chunk
+                // straight to the wire (`h.send()`, bypassing
+                // `write_content`'s own internal buffer — see `DotStuffer`'s
+                // doc comment) so a relay fanning one spooled message out
+                // to several MX hosts never holds the whole message in
+                // memory again per host. `end_message()` needs `data`
+                // (only reachable via `resume_pending_data`, since the
+                // storage callback only has a bare `ConnHandle`), so it
+                // runs there instead of inline below.
+                let handle = ep.handle();
+                let handle_for_cb = handle.clone();
+                let state = Arc::clone(&self.state);
+                self.runtime.storage().submit_streamed(
+                    handle,
+                    move |h: &ConnHandle| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                        let mut stuffer = DotStuffer::new();
+                        if let Ok(mut f) = File::open(&path) {
+                            let mut buf = [0u8; 8192];
+                            loop {
+                                let n = f.read(&mut buf).unwrap_or(0);
+                                if n == 0 {
+                                    break;
+                                }
+                                let mut out = Vec::with_capacity(n + 16);
+                                stuffer.feed(&buf[..n], &mut out);
+                                h.send(out);
+                            }
                         }
-                        out.clear();
-                        stuffer.feed(&buf[..n], &mut out);
-                        ep.send(&out);
-                    }
-                }
-                out.clear();
-                stuffer.finish(&mut out);
-                if !out.is_empty() {
-                    ep.send(&out);
-                }
+                        let mut out = Vec::new();
+                        stuffer.finish(&mut out);
+                        if !out.is_empty() {
+                            h.send(out);
+                        }
+                        Ok(())
+                    },
+                    move |_result: Result<(), StorageError>| {
+                        state.lock().unwrap().pending_data = Some(PendingDataOutcome::EndMessage);
+                        handle_for_cb.with_endpoint(|ep| ep.poke_handler());
+                    },
+                );
+                return;
             }
         }
         data.end_message();
     }
 
-    fn on_bdat_chunk_ok(&mut self, data: &mut dyn SmtpClientMessageData, _ep: &mut dyn Endpoint) {
-        self.send_next_bdat_chunk(data);
+    fn on_bdat_chunk_ok(&mut self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint) {
+        self.send_next_bdat_chunk(data, ep);
     }
 
     fn on_data_rejected(
@@ -804,5 +897,279 @@ impl SmtpClientDriver for SmtpSendDriver {
     fn on_disconnected(&mut self, _ep: &mut dyn Endpoint) {
         // Completion already called on QUIT path; this is a no-op fallback.
         let _ = self.state.lock().unwrap().on_complete.take();
+    }
+
+    fn resume_pending_data(&mut self, data: &mut dyn SmtpClientMessageData, _ep: &mut dyn Endpoint) {
+        let outcome = self.state.lock().unwrap().pending_data.take();
+        match outcome {
+            None => {}
+            Some(PendingDataOutcome::EndMessage) => data.end_message(),
+            Some(PendingDataOutcome::BdatChunk { content, last }) => {
+                data.write_bdat_chunk(&content, last)
+            }
+        }
+    }
+}
+
+/// Issue #184: plain-DATA and BDAT file-source reads are offloaded to
+/// [`hopf_core::StorageExecutor`] rather than read inline on the reactor
+/// thread. Drives [`SmtpClientEndpoint`] directly (no real TCP) against a
+/// mock [`Endpoint`] whose `handle()` is backed by
+/// [`hopf_core::ConnHandleBackend`] — unlike a task-only `ConnHandle`
+/// (`from_execute`), this makes the storage callback's `with_endpoint`
+/// (and the offloaded op's own `ConnHandle::send`) actually reach the mock,
+/// which is what these tests need to observe.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::endpoint::SmtpClientEndpoint;
+    use hopf_core::{ConnHandleBackend, ProtocolHandler, RuntimeConfig, SecurityInfo, StartTlsError, TimerHandle, WriteReadyCallback};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct SharedMockEp {
+        sent: Vec<u8>,
+        open: bool,
+    }
+
+    struct MockEndpoint {
+        shared: Arc<Mutex<SharedMockEp>>,
+    }
+
+    struct TestBackend {
+        shared: Arc<Mutex<SharedMockEp>>,
+    }
+
+    impl ConnHandleBackend for TestBackend {
+        fn with_endpoint(&self, task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>) {
+            let mut ep = MockEndpoint {
+                shared: Arc::clone(&self.shared),
+            };
+            task(&mut ep);
+        }
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            task();
+        }
+        fn is_probably_open(&self) -> bool {
+            self.shared.lock().unwrap().open
+        }
+        fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+            TimerHandle::from_cancel(|| {})
+        }
+    }
+
+    impl Endpoint for MockEndpoint {
+        fn send(&mut self, data: &[u8]) {
+            self.shared.lock().unwrap().sent.extend_from_slice(data);
+        }
+        fn is_open(&self) -> bool {
+            self.shared.lock().unwrap().open
+        }
+        fn is_closing(&self) -> bool {
+            false
+        }
+        fn close(&mut self) {
+            self.shared.lock().unwrap().open = false;
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:25".parse().unwrap())
+        }
+        fn remote_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:9999".parse().unwrap())
+        }
+        fn security_info(&self) -> &SecurityInfo {
+            static PLAINTEXT: std::sync::OnceLock<SecurityInfo> = std::sync::OnceLock::new();
+            PLAINTEXT.get_or_init(SecurityInfo::plaintext)
+        }
+        fn start_tls(&mut self) -> Result<(), StartTlsError> {
+            Err(StartTlsError::Unsupported)
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _callback: Option<WriteReadyCallback>) {}
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            task();
+        }
+        fn schedule_timer(
+            &self,
+            _delay: std::time::Duration,
+            _callback: Box<dyn FnOnce() + Send>,
+        ) -> TimerHandle {
+            TimerHandle::from_cancel(|| {})
+        }
+        fn handle(&self) -> ConnHandle {
+            ConnHandle::from_backend(Arc::new(TestBackend {
+                shared: Arc::clone(&self.shared),
+            }))
+        }
+    }
+
+    impl MockEndpoint {
+        fn new() -> Self {
+            Self {
+                shared: Arc::new(Mutex::new(SharedMockEp {
+                    sent: Vec::new(),
+                    open: true,
+                })),
+            }
+        }
+        fn sent(&self) -> Vec<u8> {
+            self.shared.lock().unwrap().sent.clone()
+        }
+    }
+
+    fn feed(client: &mut SmtpClientEndpoint, ep: &mut MockEndpoint, line: &[u8]) {
+        let mut data = line;
+        client.receive(ep, &mut data);
+    }
+
+    /// Feed `line`, retrying (to let a poked-but-not-really-poked async
+    /// offload — `poke_handler`'s default is a no-op on this mock — apply
+    /// once ready) until `sent()` satisfies `ready`.
+    fn feed_and_wait_until(
+        client: &mut SmtpClientEndpoint,
+        ep: &mut MockEndpoint,
+        line: &[u8],
+        ready: impl Fn(&[u8]) -> bool,
+        max_ms: u64,
+    ) {
+        let mut data = line;
+        client.receive(ep, &mut data);
+        for _ in 0..(max_ms / 5).max(1) {
+            if ready(&ep.sent()) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut empty: &[u8] = &[];
+            client.receive(ep, &mut empty);
+        }
+        assert!(ready(&ep.sent()), "condition never satisfied: {:?}", String::from_utf8_lossy(&ep.sent()));
+    }
+
+    #[test]
+    fn plain_data_file_source_is_offloaded_and_dot_stuffed() {
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("msg.eml");
+        std::fs::write(&path, b"Subject: hi\r\n\r\n.leading dot\r\nbody\r\n").unwrap();
+
+        let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let done2 = Arc::clone(&done);
+        let send = SmtpSend::new("client.example")
+            .mail_from("a@example.com")
+            .rcpt_to("b@example.com")
+            .message_file(&path)
+            .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
+
+        let mut client = SmtpClientEndpoint::new(
+            &send,
+            &rt,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            None,
+            None,
+        );
+        let mut ep = MockEndpoint::new();
+
+        client.connected(&mut ep);
+        feed(&mut client, &mut ep, b"220 test.example ESMTP\r\n");
+        feed(&mut client, &mut ep, b"250-test.example\r\n250 OK\r\n"); // EHLO — no PIPELINING/CHUNKING
+        feed(&mut client, &mut ep, b"250 OK\r\n"); // MAIL FROM
+        feed(&mut client, &mut ep, b"250 OK\r\n"); // RCPT TO
+        ep.shared.lock().unwrap().sent.clear();
+
+        // Triggers `on_ready_for_data`, which offloads the file read.
+        feed_and_wait_until(
+            &mut client,
+            &mut ep,
+            b"354 Start mail input\r\n",
+            |sent| sent.ends_with(b".\r\n"),
+            2000,
+        );
+        let sent = ep.sent();
+        // Dot-stuffing must still apply even though the read moved off the
+        // reactor thread: the leading dot on its own line is doubled.
+        assert!(
+            sent.windows(6).any(|w| w == b"..lead"),
+            "leading dot must be stuffed: {:?}",
+            String::from_utf8_lossy(&sent)
+        );
+        assert!(sent.ends_with(b".\r\n"), "must end with the DATA terminator");
+
+        feed(&mut client, &mut ep, b"250 2.0.0 Message accepted\r\n");
+        assert_eq!(*done.lock().unwrap(), Some(true));
+    }
+
+    #[test]
+    fn bdat_file_source_is_offloaded_across_multiple_chunks() {
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("msg.eml");
+        // Larger than the 8192-byte read buffer, so the lookahead logic
+        // must offload (at least) two reads across two BDAT chunks.
+        let body = vec![b'x'; 9000];
+        std::fs::write(&path, &body).unwrap();
+
+        let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let done2 = Arc::clone(&done);
+        let send = SmtpSend::new("client.example")
+            .mail_from("a@example.com")
+            .rcpt_to("b@example.com")
+            .message_file(&path)
+            .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
+
+        let mut client = SmtpClientEndpoint::new(
+            &send,
+            &rt,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            None,
+            None,
+        );
+        let mut ep = MockEndpoint::new();
+
+        client.connected(&mut ep);
+        feed(&mut client, &mut ep, b"220 test.example ESMTP\r\n");
+        feed(&mut client, &mut ep, b"250-test.example\r\n250 CHUNKING\r\n"); // EHLO — advertise CHUNKING
+        feed(&mut client, &mut ep, b"250 OK\r\n"); // MAIL FROM
+        ep.shared.lock().unwrap().sent.clear();
+
+        // RCPT TO accepted → `start_data()` enters BDAT mode immediately
+        // (no DATA/354 exchange) → `on_ready_for_data` → offloaded read.
+        feed_and_wait_until(
+            &mut client,
+            &mut ep,
+            b"250 OK\r\n",
+            |sent| sent.starts_with(b"BDAT 8192\r\n") && sent.len() >= b"BDAT 8192\r\n".len() + 8192,
+            2000,
+        );
+        let first = ep.sent();
+        assert!(
+            first.starts_with(b"BDAT 8192\r\n"),
+            "first chunk must be the full 8192-byte read, not LAST: {:?}",
+            &first[..first.len().min(40)]
+        );
+        ep.shared.lock().unwrap().sent.clear();
+
+        // Ack the first chunk → the driver already knows the next 808
+        // bytes (from round 1's lookahead read); it offloads one more read
+        // to discover EOF and mark this chunk LAST.
+        feed_and_wait_until(
+            &mut client,
+            &mut ep,
+            b"250 OK\r\n",
+            |sent| sent.starts_with(b"BDAT 808 LAST\r\n"),
+            2000,
+        );
+        let second = ep.sent();
+        assert!(
+            second.starts_with(b"BDAT 808 LAST\r\n"),
+            "second chunk must be the remaining 808 bytes, marked LAST: {:?}",
+            &second[..second.len().min(40)]
+        );
+
+        feed(&mut client, &mut ep, b"250 2.0.0 Message accepted\r\n");
+        assert_eq!(*done.lock().unwrap(), Some(true));
     }
 }
