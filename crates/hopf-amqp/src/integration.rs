@@ -104,7 +104,7 @@ impl AmqpClientDriver for IntegDriver {
         self.pending_tag = Some((channel, delivery_tag));
     }
 
-    fn on_delivery_data(&mut self, _: &[u8]) {}
+    fn on_delivery_data(&mut self, _: u16, _: &[u8]) {}
 
     fn on_delivery_complete(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
         self.state.lock().unwrap().delivered = true;
@@ -325,7 +325,7 @@ impl AmqpClientDriver for TxDriver {
     ) {
     }
 
-    fn on_delivery_data(&mut self, _: &[u8]) {}
+    fn on_delivery_data(&mut self, _: u16, _: &[u8]) {}
 
     fn on_delivery_complete(&mut self, client: &mut dyn AmqpClientControl, _channel: u16) {
         let mut s = self.state.lock().unwrap();
@@ -478,7 +478,7 @@ impl AmqpClientDriver for GetDriver {
         client.basic_get(channel, &self.queue, false);
     }
 
-    fn on_delivery_data(&mut self, _: &[u8]) {}
+    fn on_delivery_data(&mut self, _: u16, _: &[u8]) {}
 
     fn on_delivery_complete(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
 
@@ -614,7 +614,7 @@ impl AmqpClientDriver for RecoverDriver {
         }
     }
 
-    fn on_delivery_data(&mut self, _: &[u8]) {}
+    fn on_delivery_data(&mut self, _: u16, _: &[u8]) {}
 
     fn on_delivery_complete(&mut self, client: &mut dyn AmqpClientControl, channel: u16) {
         // Deliberately never ack: the first delivery is left outstanding so
@@ -724,7 +724,7 @@ impl AmqpClientDriver for FlowDriver {
     ) {
     }
 
-    fn on_delivery_data(&mut self, _: &[u8]) {}
+    fn on_delivery_data(&mut self, _: u16, _: &[u8]) {}
 
     fn on_delivery_complete(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
 
@@ -853,7 +853,7 @@ impl AmqpClientDriver for RecoveryDriver {
         _: u64,
     ) {
     }
-    fn on_delivery_data(&mut self, _: &[u8]) {}
+    fn on_delivery_data(&mut self, _: u16, _: &[u8]) {}
 
     fn on_delivery_complete(&mut self, client: &mut dyn AmqpClientControl, _channel: u16) {
         self.state.lock().unwrap().redelivered_after_recovery = true;
@@ -994,7 +994,7 @@ impl AmqpClientDriver for StreamingPublishDriver {
         self.received = Vec::with_capacity(body_len as usize);
     }
 
-    fn on_delivery_data(&mut self, data: &[u8]) {
+    fn on_delivery_data(&mut self, _channel: u16, data: &[u8]) {
         self.received.extend_from_slice(data);
     }
 
