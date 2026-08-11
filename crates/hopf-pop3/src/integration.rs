@@ -8,7 +8,10 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_auth::PasswordStore;
+use hopf_auth::{
+    CertificateIdentity, CredentialStore, PasswordStore, ScramCredentials, SaslMechanism,
+    TokenValidation,
+};
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_mailbox::{MailboxFactory, MaildirFactory};
 
@@ -154,6 +157,75 @@ fn start_pop3_server_with_message(
     let svc = Pop3Service::new(config, Arc::clone(&rt));
     let addr = svc.start().unwrap();
     (rt, addr)
+}
+
+/// Like [`start_pop3_server_with_message`], but with a caller-supplied
+/// [`CredentialStore`] — used with [`SlowStore`] to widen the async
+/// credential-check offload's window for pipelining regression tests
+/// (issue #181).
+fn start_pop3_server_with_store(
+    dir: &tempfile::TempDir,
+    store: Arc<dyn CredentialStore>,
+) -> (Arc<Runtime>, std::net::SocketAddr) {
+    let factory = Arc::new(MaildirFactory::new(dir.path()));
+    {
+        let mut s = factory.create_store();
+        s.open("alice").unwrap();
+        let mut mb = s.open_mailbox("INBOX", false).unwrap();
+        append_whole(mb.as_mut(), b"From: a@b\r\nSubject: client test\r\n\r\nhello pop3 client\r\n");
+        mb.close(false).unwrap();
+        s.close().unwrap();
+    }
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let config = Pop3Config::new("127.0.0.1:0".parse().unwrap(), "localhost", store, factory);
+    let svc = Pop3Service::new(config, Arc::clone(&rt));
+    let addr = svc.start().unwrap();
+    (rt, addr)
+}
+
+/// Wraps a [`PasswordStore`] and sleeps inside `password_match`/
+/// `plaintext_password` — deterministically widens the window a credential
+/// check spends offloaded to the storage pool (issue #181), so a
+/// pipelining regression test can reliably observe whether a command sent
+/// right behind PASS/AUTH gets processed before or after the check
+/// resolves, rather than depending on the storage thread happening to be
+/// slow by chance.
+struct SlowStore {
+    inner: PasswordStore,
+    delay: Duration,
+}
+
+impl CredentialStore for SlowStore {
+    fn supported_mechanisms(&self) -> Vec<SaslMechanism> {
+        self.inner.supported_mechanisms()
+    }
+    fn password_match(&self, username: &str, password: &str) -> bool {
+        std::thread::sleep(self.delay);
+        self.inner.password_match(username, password)
+    }
+    fn plaintext_password(&self, username: &str) -> Option<String> {
+        // `PasswordStore` deliberately discards plaintext after enrollment
+        // and so can't drive CRAM-MD5, which needs a recoverable secret —
+        // override it here so `SlowStore` can, since CRAM-MD5's
+        // server-first, multi-round-trip shape is what the AUTH pipelining
+        // test below needs to exercise the `first_step`/continuation
+        // offload path. CRAM-MD5 verification goes through this method
+        // (not `password_match`), so it needs the same delay.
+        std::thread::sleep(self.delay);
+        (username == "alice").then(|| "secret".to_string())
+    }
+    fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
+        self.inner.digest_ha1(username, realm)
+    }
+    fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
+        self.inner.scram_credentials(username)
+    }
+    fn validate_bearer(&self, token: &str) -> Option<TokenValidation> {
+        self.inner.validate_bearer(token)
+    }
+    fn authenticate_certificate(&self, cert_key: &str) -> Option<CertificateIdentity> {
+        self.inner.authenticate_certificate(cert_key)
+    }
 }
 
 // ── Client integration tests ──────────────────────────────────────────────────
@@ -393,4 +465,92 @@ fn client_stls_fetch() {
         "body={:?}",
         String::from_utf8_lossy(&msgs[0])
     );
+}
+
+/// PASS's credential check runs off the reactor thread (issue #181); a
+/// STAT pipelined right behind it in the same TCP write must not be
+/// processed until the check resolves and the session actually becomes
+/// TRANSACTION — otherwise it would race ahead and see stale
+/// (AUTHORIZATION-state) state. `SlowStore` widens the offload's window so
+/// this is reliably observable rather than a timing coincidence.
+#[test]
+fn server_pass_pipelined_with_stat_waits_for_async_credential_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn CredentialStore> = Arc::new(SlowStore {
+        inner: PasswordStore::new().with_user("alice", "secret"),
+        delay: Duration::from_millis(150),
+    });
+    let (rt, addr) = start_pop3_server_with_store(&dir, store);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 4096];
+    let greet = read_until(&mut stream, &mut buf, |s| s.starts_with("+OK"));
+    assert!(greet.starts_with("+OK"), "{greet}");
+
+    write_cmd(&mut stream, b"USER alice\r\n");
+    assert!(read_until(&mut stream, &mut buf, |s| s.starts_with("+OK")).starts_with("+OK"));
+
+    // One write, both commands — proves this isn't just "two separate
+    // reads happened to land in order." Both replies are awaited from a
+    // single accumulating read (not two separate `read_until` calls): the
+    // two replies can legitimately land in the same TCP segment once the
+    // credential check and mailbox open both resolve quickly, and a second
+    // fresh `read_until` call has no way to see bytes a prior call already
+    // drained out of the socket.
+    write_cmd(&mut stream, b"PASS secret\r\nSTAT\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| {
+        s.contains("Mailbox opened") && s.contains("+OK 1 ")
+    });
+    assert!(r.contains("Mailbox opened"), "pass: {r}");
+    assert!(
+        r.contains("+OK 1 "),
+        "pipelined STAT must be processed only after PASS's async \
+         credential check completes, against authenticated state: {r}"
+    );
+    drop(rt);
+}
+
+/// Same race, but for the SASL path (issue #181), using CRAM-MD5 — a
+/// server-first, multi-round-trip mechanism whose *first* step offload is
+/// the new `first_step` code path added for this issue. Challenge
+/// round-trip, then the client's response and a pipelined STAT sent in the
+/// same write right behind it.
+#[test]
+fn server_auth_pipelined_with_stat_waits_for_async_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn CredentialStore> = Arc::new(SlowStore {
+        inner: PasswordStore::new().with_user("alice", "secret"),
+        delay: Duration::from_millis(150),
+    });
+    let (rt, addr) = start_pop3_server_with_store(&dir, store);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 4096];
+    read_until(&mut stream, &mut buf, |s| s.starts_with("+OK"));
+
+    write_cmd(&mut stream, b"AUTH CRAM-MD5\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("+ ") && s.ends_with("\r\n"));
+    let b64 = r.trim().strip_prefix("+ ").expect("continuation prefix");
+    let challenge = String::from_utf8(rmimeparser::charset::base64::decode(b64).unwrap())
+        .expect("challenge is ASCII");
+    let digest = hopf_auth::cram_md5::compute_response("secret", &challenge);
+    let response = rmimeparser::charset::base64::encode(format!("alice {digest}").as_bytes());
+    write_cmd(&mut stream, format!("{response}\r\nSTAT\r\n").as_bytes());
+
+    let r = read_until(&mut stream, &mut buf, |s| {
+        s.contains("Mailbox opened") && s.contains("+OK 1 ")
+    });
+    assert!(r.contains("Mailbox opened"), "auth: {r}");
+    assert!(
+        r.contains("+OK 1 "),
+        "pipelined STAT must be processed only after the offloaded SASL \
+         step completes, against authenticated state: {r}"
+    );
+    drop(rt);
 }

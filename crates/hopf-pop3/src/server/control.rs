@@ -2,6 +2,7 @@
 
 //! POP3 control-connection protocol handler.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -117,6 +118,15 @@ pub struct Pop3ControlHandler {
     txn_slot: Arc<Mutex<Option<Box<dyn TransactionHandler>>>>,
     /// In-flight mailbox open: handler + outcome filled by the storage callback.
     pending_open: Arc<Mutex<Option<PendingOpen>>>,
+    /// In-flight credential check: outcome filled by the storage callback
+    /// (issue #181).
+    pending_auth_check: Arc<Mutex<Option<AuthCheckOutcome>>>,
+    /// Commands lexed while `busy` was set (e.g. a pipelined command right
+    /// behind PASS/APOP/AUTH/RETR/TOP/QUIT), dispatched once it clears —
+    /// without this, a command already parsed out of the same read as a
+    /// busy-triggering one would otherwise be silently dropped rather than
+    /// processed against stale state or queued correctly.
+    cmd_queue: VecDeque<Pop3Command>,
     otel_metrics: Option<Arc<OtelPop3Metrics>>,
     export: Option<ExportHandle>,
     traces_enabled: bool,
@@ -127,6 +137,27 @@ struct PendingOpen {
     handler: Box<dyn TransactionHandler>,
     /// `None` while open is in flight; `Some(Ok(()))` / `Some(Err(()))` when done.
     outcome: Option<Result<(), ()>>,
+}
+
+/// Result of a credential check offloaded to the storage pool (issue #181)
+/// — `CredentialStore::password_match`/`verify_apop`/`SaslServer::step` can
+/// block for LDAP/PAM-backed stores, so all three run off the reactor
+/// thread; the outcome lands here for `sync_pending_auth_check` to apply
+/// once back on the reactor (the storage callback only has
+/// `&mut dyn Endpoint`, never `&mut Self`).
+enum AuthCheckOutcome {
+    /// PASS or APOP.
+    Password {
+        user: String,
+        result: Result<bool, String>,
+    },
+    /// AUTH (initial or continuation step). `first_step` marks the
+    /// server-first initial call (no client data yet) — a `Complete` there
+    /// means the mechanism authenticated nobody, so it's still a failure.
+    Step {
+        first_step: bool,
+        result: Result<(Box<dyn SaslServer>, SaslServerStep), String>,
+    },
 }
 
 impl Pop3ControlHandler {
@@ -183,6 +214,8 @@ impl Pop3ControlHandler {
             busy: Arc::new(AtomicBool::new(false)),
             txn_slot: Arc::new(Mutex::new(None)),
             pending_open: Arc::new(Mutex::new(None)),
+            pending_auth_check: Arc::new(Mutex::new(None)),
+            cmd_queue: VecDeque::new(),
             otel_metrics: None,
             export: None,
             traces_enabled: false,
@@ -541,11 +574,37 @@ impl Pop3ControlHandler {
             self.send(endpoint, reply::err("USER required first"));
             return;
         };
-        if !self.config.store.password_match(&user, password) {
-            self.auth_failed(endpoint, "[AUTH] Authentication failed");
+        let Some(handle) = self.control_handle.clone() else {
+            self.send(endpoint, reply::err("[SYS/TEMP] No connection handle"));
             return;
-        }
-        self.finish_auth(endpoint, &user);
+        };
+        let store = Arc::clone(&self.config.store);
+        let password = password.to_owned();
+        let user_for_check = user.clone();
+        let pending = Arc::clone(&self.pending_auth_check);
+        let busy = Arc::clone(&self.busy);
+        self.set_busy(true);
+        endpoint.pause_read();
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || Ok(store.password_match(&user_for_check, &password)),
+            move |result: Result<bool, StorageError>| {
+                let result = result.map_err(|e| e.to_string());
+                *pending.lock().unwrap() = Some(AuthCheckOutcome::Password { user, result });
+                handle.with_endpoint(move |ep| {
+                    busy.store(false, Ordering::Relaxed);
+                    ep.resume_read();
+                    // Unlike RETR/TOP/mailbox-open, nothing has been sent to
+                    // the client yet at this point — the reply depends
+                    // entirely on `sync_pending_auth_check`, which needs
+                    // `&mut Self` and so can't run from here. The client is
+                    // waiting on us, not about to send more input, so
+                    // `resume_read` alone would never trigger another
+                    // `receive()` call; `poke_handler` forces one.
+                    ep.poke_handler();
+                });
+            },
+        );
     }
 
     fn cmd_apop(&mut self, endpoint: &mut dyn Endpoint, user: &str, digest: &str) {
@@ -557,16 +616,32 @@ impl Pop3ControlHandler {
             self.send(endpoint, reply::err("[AUTH] Login delay active"));
             return;
         }
-        if !verify_apop(
-            self.config.store.as_ref(),
-            user,
-            &self.apop_timestamp,
-            digest,
-        ) {
-            self.auth_failed(endpoint, "[AUTH] Authentication failed");
+        let Some(handle) = self.control_handle.clone() else {
+            self.send(endpoint, reply::err("[SYS/TEMP] No connection handle"));
             return;
-        }
-        self.finish_auth(endpoint, user);
+        };
+        let store = Arc::clone(&self.config.store);
+        let user = user.to_owned();
+        let user_for_check = user.clone();
+        let timestamp = self.apop_timestamp.clone();
+        let digest = digest.to_owned();
+        let pending = Arc::clone(&self.pending_auth_check);
+        let busy = Arc::clone(&self.busy);
+        self.set_busy(true);
+        endpoint.pause_read();
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || Ok(verify_apop(store.as_ref(), &user_for_check, &timestamp, &digest)),
+            move |result: Result<bool, StorageError>| {
+                let result = result.map_err(|e| e.to_string());
+                *pending.lock().unwrap() = Some(AuthCheckOutcome::Password { user, result });
+                handle.with_endpoint(move |ep| {
+                    busy.store(false, Ordering::Relaxed);
+                    ep.resume_read();
+                    ep.poke_handler();
+                });
+            },
+        );
     }
 
     fn cmd_auth_list(&mut self, endpoint: &mut dyn Endpoint) {
@@ -609,64 +684,109 @@ impl Pop3ControlHandler {
             peer_certificate: self.peer_certificate.clone(),
             channel_binding: None,
         };
-        let mut server = create_server(mech, Arc::clone(&self.config.store), opts);
+        let server = create_server(mech, Arc::clone(&self.config.store), opts);
 
         if server.server_first() && initial_response.is_none() {
-            match server.step(None) {
-                SaslServerStep::Challenge(c) => {
-                    self.send(endpoint, reply::continuation(&base64::encode(&c)));
-                    self.sasl = Some(server);
-                    self.lexer.expect_sasl_response();
-                }
-                SaslServerStep::Failure => {
-                    self.auth_failed(endpoint, "[AUTH] Authentication failed");
-                }
-                SaslServerStep::Complete { .. } => {
-                    self.auth_failed(endpoint, "[AUTH] Authentication failed");
-                }
-            }
+            // A server-first mechanism must send its challenge before any
+            // client response exists to step on — "complete" here would
+            // mean the mechanism authenticated nobody, so it's still a
+            // failure (see `AuthCheckOutcome::Step::first_step`).
+            self.sasl_step(endpoint, server, None, true);
             return;
         }
 
-        self.sasl_step(endpoint, server, initial_response.as_deref());
+        self.sasl_step(endpoint, server, initial_response.as_deref(), false);
     }
 
+    /// Run one SASL step off the reactor thread (issue #181 —
+    /// `SaslServer::step` can block for LDAP/PAM-backed stores). The result
+    /// is applied later by `sync_pending_auth_check`, once back on the
+    /// reactor; `busy` gates pipelined commands until then.
     fn sasl_step(
         &mut self,
         endpoint: &mut dyn Endpoint,
         mut server: Box<dyn SaslServer>,
         response: Option<&[u8]>,
+        first_step: bool,
     ) {
-        match server.step(response) {
-            SaslServerStep::Challenge(c) => {
-                self.send(endpoint, reply::continuation(&base64::encode(&c)));
-                self.sasl = Some(server);
-                self.lexer.expect_sasl_response();
-            }
-            SaslServerStep::Complete {
-                username,
-                final_message,
-            } => {
-                if let Some(fm) = final_message {
-                    if !fm.is_empty() {
-                        self.send(endpoint, reply::continuation(&base64::encode(&fm)));
-                    }
-                }
-                self.sasl = None;
-                self.finish_auth(endpoint, &username);
-            }
-            SaslServerStep::Failure => {
-                self.sasl = None;
-                self.auth_failed(endpoint, "[AUTH] Authentication failed");
-            }
-        }
+        let Some(handle) = self.control_handle.clone() else {
+            self.send(endpoint, reply::err("[SYS/TEMP] No connection handle"));
+            return;
+        };
+        let response = response.map(<[u8]>::to_vec);
+        let pending = Arc::clone(&self.pending_auth_check);
+        let busy = Arc::clone(&self.busy);
+        self.set_busy(true);
+        endpoint.pause_read();
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || {
+                let step = server.step(response.as_deref());
+                Ok((server, step))
+            },
+            move |result: Result<(Box<dyn SaslServer>, SaslServerStep), StorageError>| {
+                let result = result.map_err(|e| e.to_string());
+                *pending.lock().unwrap() = Some(AuthCheckOutcome::Step { first_step, result });
+                handle.with_endpoint(move |ep| {
+                    busy.store(false, Ordering::Relaxed);
+                    ep.resume_read();
+                    ep.poke_handler();
+                });
+            },
+        );
     }
 
     fn handle_sasl_response(&mut self, endpoint: &mut dyn Endpoint, response: Vec<u8>) {
         let Some(server) = self.sasl.take() else {
             return;
         };
-        self.sasl_step(endpoint, server, Some(&response));
+        self.sasl_step(endpoint, server, Some(&response), false);
+    }
+
+    /// Apply the outcome of an offloaded credential check (PASS/APOP or a
+    /// SASL step), once `submit_on`'s callback has stashed one — see
+    /// `AuthCheckOutcome`.
+    fn sync_pending_auth_check(&mut self, endpoint: &mut dyn Endpoint) {
+        let Some(outcome) = self.pending_auth_check.lock().unwrap().take() else {
+            return;
+        };
+        match outcome {
+            AuthCheckOutcome::Password { user, result } => match result {
+                Ok(true) => self.finish_auth(endpoint, &user),
+                Ok(false) => self.auth_failed(endpoint, "[AUTH] Authentication failed"),
+                Err(e) => self.send(
+                    endpoint,
+                    reply::err(&format!("[SYS/TEMP] Authentication temporarily unavailable: {e}")),
+                ),
+            },
+            AuthCheckOutcome::Step { first_step, result } => match result {
+                Ok((server, step)) => match step {
+                    SaslServerStep::Challenge(c) => {
+                        self.send(endpoint, reply::continuation(&base64::encode(&c)));
+                        self.sasl = Some(server);
+                        self.lexer.expect_sasl_response();
+                    }
+                    SaslServerStep::Complete {
+                        username,
+                        final_message,
+                    } if !first_step => {
+                        if let Some(fm) = final_message {
+                            if !fm.is_empty() {
+                                self.send(endpoint, reply::continuation(&base64::encode(&fm)));
+                            }
+                        }
+                        self.finish_auth(endpoint, &username);
+                    }
+                    SaslServerStep::Complete { .. } | SaslServerStep::Failure => {
+                        self.auth_failed(endpoint, "[AUTH] Authentication failed");
+                    }
+                },
+                Err(e) => self.send(
+                    endpoint,
+                    reply::err(&format!("[SYS/TEMP] Authentication temporarily unavailable: {e}")),
+                ),
+            },
+        }
     }
 
     fn finish_auth(&mut self, endpoint: &mut dyn Endpoint, username: &str) {
@@ -704,6 +824,25 @@ impl Pop3ControlHandler {
 
     fn set_busy(&self, v: bool) {
         self.busy.store(v, Ordering::Relaxed);
+    }
+
+    /// Dispatch a queued command once `busy` clears — mirrors `hopf-imap`'s
+    /// identically-named helper.
+    fn drain_queue(&mut self, endpoint: &mut dyn Endpoint) {
+        while !self.busy.load(Ordering::Relaxed) {
+            let Some(cmd) = self.cmd_queue.pop_front() else {
+                break;
+            };
+            self.dispatch(endpoint, cmd);
+        }
+    }
+
+    fn enqueue_or_dispatch(&mut self, endpoint: &mut dyn Endpoint, cmd: Pop3Command) {
+        if self.busy.load(Ordering::Relaxed) {
+            self.cmd_queue.push_back(cmd);
+        } else {
+            self.dispatch(endpoint, cmd);
+        }
     }
 
     fn with_mailbox_mut<R>(
@@ -1016,6 +1155,10 @@ impl Pop3ControlHandler {
                 handle.with_endpoint(move |ep| {
                     busy.store(false, Ordering::Relaxed);
                     ep.resume_read();
+                    // See the identical comment in `AuthView::proceed_open`
+                    // — a command pipelined right behind RETR can be
+                    // sitting in `cmd_queue` at this point (issue #181).
+                    ep.poke_handler();
                 });
             },
         );
@@ -1056,6 +1199,10 @@ impl Pop3ControlHandler {
                 handle.with_endpoint(move |ep| {
                     busy.store(false, Ordering::Relaxed);
                     ep.resume_read();
+                    // See the identical comment in `AuthView::proceed_open`
+                    // — a command pipelined right behind TOP can be
+                    // sitting in `cmd_queue` at this point (issue #181).
+                    ep.poke_handler();
                 });
             },
         );
@@ -1137,7 +1284,9 @@ impl ProtocolHandler for Pop3ControlHandler {
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_pending_open();
+        self.sync_pending_auth_check(endpoint);
         self.take_txn_slot();
+        self.drain_queue(endpoint);
 
         if self.busy.load(Ordering::Relaxed) {
             // Reads are paused during storage offloads; drop any residual.
@@ -1150,11 +1299,15 @@ impl ProtocolHandler for Pop3ControlHandler {
             self.send(endpoint, reply::err("Line too long"));
         }
         for cmd in cmds {
-            self.dispatch(endpoint, cmd);
-            if self.busy.load(Ordering::Relaxed) {
-                break;
-            }
+            // While busy, queue instead of dropping — a command already
+            // lexed out of this same buffer (e.g. pipelined right behind
+            // PASS/APOP/AUTH) must not be lost just because a prior command
+            // in this same batch started a storage offload.
+            self.enqueue_or_dispatch(endpoint, cmd);
         }
+        self.sync_pending_open();
+        self.sync_pending_auth_check(endpoint);
+        self.drain_queue(endpoint);
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -1284,6 +1437,12 @@ impl AuthenticateState for AuthView<'_> {
                     }
                     busy.store(false, Ordering::Relaxed);
                     ep.resume_read();
+                    // A command pipelined right behind PASS/APOP/AUTH (e.g.
+                    // STAT) can be sitting in `cmd_queue` at this point —
+                    // the client already sent it and is waiting on a reply,
+                    // so nothing else will trigger another `receive()` to
+                    // drain it without this (issue #181).
+                    ep.poke_handler();
                 });
             },
         );
