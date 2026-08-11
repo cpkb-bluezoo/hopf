@@ -10,9 +10,10 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
 use std::time::Duration;
 
-use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
+use hopf_core::{Endpoint, ProtocolHandler, Runtime, SecurityInfo, SharedTlsConnector, TimerHandle};
 use rmimeparser::charset::base64;
 
 use crate::DsnRecipientParams;
@@ -129,15 +130,18 @@ pub struct SmtpClientEndpoint {
 impl SmtpClientEndpoint {
     /// Create a new endpoint from a factory. `stage_timeout` is the per-reply
     /// idle budget; `message_timeout` is the budget after DATA end.
+    /// `runtime` is passed to [`SmtpClientHandlerFactory::create`] so the
+    /// driver can offload blocking work (issue #184).
     pub fn new(
         factory: &dyn SmtpClientHandlerFactory,
+        runtime: &Arc<Runtime>,
         stage_timeout: Duration,
         message_timeout: Duration,
         tls_connector: Option<SharedTlsConnector>,
         tls_server_name: Option<String>,
     ) -> Self {
         Self {
-            driver: Some(factory.create()),
+            driver: Some(factory.create(runtime)),
             proto_state: ProtoState::Connecting,
             caps: SmtpCapabilities::default(),
             lexer: SmtpReplyLexer::new(),
@@ -255,6 +259,25 @@ impl SmtpClientEndpoint {
             self.driver = Some(driver);
         }
         ep.close();
+    }
+
+    /// Issue #184: give the driver a chance to resume an offloaded
+    /// DATA/BDAT chunk read before anything else in this `receive()` call
+    /// runs — see [`SmtpClientDriver::resume_pending_data`]. Called
+    /// unconditionally (cheap no-op for a driver that never offloads);
+    /// this is also what a poked `receive()` call (empty `data`, no lexer
+    /// events) actually accomplishes.
+    fn sync_pending_data(&mut self, ep: &mut dyn Endpoint) {
+        let mut driver = match self.driver.take() {
+            Some(d) => d,
+            None => return,
+        };
+        driver.resume_pending_data(self, ep);
+        self.driver = Some(driver);
+        if !self.outbound.is_empty() {
+            let out = std::mem::take(&mut self.outbound);
+            ep.send(&out);
+        }
     }
 
     /// Handle a protocol parse error.
@@ -656,6 +679,7 @@ impl ProtocolHandler for SmtpClientEndpoint {
     }
 
     fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+        self.sync_pending_data(ep);
         let events = match self.lexer.feed(data) {
             Ok(e) => e,
             Err(e) => {
