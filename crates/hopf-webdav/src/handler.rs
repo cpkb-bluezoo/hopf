@@ -2,17 +2,17 @@
 
 //! WebDAV HTTP request handler (RFC 4918 + RFC 9110 file serving).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use hopf_core::storage::{StorageError, StorageExecutor};
 use hopf_http::Headers;
-use hopf_http::{parse_http_date, ServerHandler, ServerWriter};
+use hopf_http::{parse_http_date, ServerHandler, ServerResponseHandle, ServerWriter};
 
 use crate::constants::{
     self, CONTENT_TYPE_XML, DEPTH_0, DEPTH_1, DEPTH_INFINITY, HEADER_DAV, HEADER_DEPTH,
@@ -60,9 +60,13 @@ pub struct WebDavHandler {
 
     webdav_body: Vec<u8>,
     webdav_parser: Option<WebDavRequestParser>,
-    /// Open destination file for an in-progress PUT; each inbound chunk is
-    /// written directly to it as it arrives — never buffered whole.
-    put_file: Option<fs::File>,
+    /// Shared state for an in-progress PUT — open (canonicalize + create)
+    /// and each inbound chunk's write are offloaded to
+    /// `hopf_core::StorageExecutor` (issue #186) rather than done inline
+    /// on the reactor thread; shared (not a plain field) so the
+    /// storage-pool callback, which only ever gets a cloned `Arc`, can
+    /// safely reach it.
+    put_state: Option<Arc<Mutex<PutState>>>,
     put_bytes_written: u64,
     /// Set once a PUT has already been answered (size cap exceeded, or a
     /// write error) — further body chunks are discarded without a second
@@ -109,7 +113,7 @@ impl WebDavHandler {
             host: None,
             webdav_body: Vec::new(),
             webdav_parser: None,
-            put_file: None,
+            put_state: None,
             put_bytes_written: 0,
             put_rejected: false,
             mkcol_pending: false,
@@ -241,22 +245,43 @@ impl ServerHandler for WebDavHandler {
             }
             return;
         }
-        if self.put_rejected || self.put_file.is_none() {
+        if self.put_rejected || self.put_state.is_none() {
             return;
         }
         self.put_bytes_written += data.len() as u64;
         if self.put_bytes_written > self.config.max_put_body {
             self.put_rejected = true;
-            self.put_file = None;
-            Self::send_error(response, 413);
+            // Claim the response under the lock so an in-flight offloaded
+            // open/write (issue #186) that completes after this point sees
+            // `done` already set and doesn't also try to respond.
+            let already_responded = self.put_state.take().is_some_and(|state| {
+                let mut g = state.lock().unwrap();
+                if g.done {
+                    true
+                } else {
+                    g.done = true;
+                    g.queue.clear();
+                    false
+                }
+            });
+            if !already_responded {
+                Self::send_error(response, 413);
+            }
             return;
         }
-        if let Some(f) = self.put_file.as_mut() {
-            if f.write_all(data).is_err() {
-                self.put_rejected = true;
-                self.put_file = None;
-                Self::send_error(response, 500);
-            }
+        let state = self.put_state.clone().unwrap();
+        let mut g = state.lock().unwrap();
+        if g.done {
+            return;
+        }
+        g.queue.push_back(data.to_vec());
+        let should_start = g.open_done && !g.draining;
+        if should_start {
+            g.draining = true;
+        }
+        drop(g);
+        if should_start {
+            drain_put_writes(state, Arc::clone(&self.storage), response.response_handle());
         }
     }
 
@@ -280,7 +305,22 @@ impl ServerHandler for WebDavHandler {
         if self.put_rejected {
             return;
         }
-        if self.put_file.take().is_some() {
+        let Some(state) = self.put_state.take() else {
+            return;
+        };
+        let mut g = state.lock().unwrap();
+        if g.done {
+            return;
+        }
+        g.finished = true;
+        // Offloaded writes may still be draining (issue #186) — only
+        // respond now if every queued chunk has actually landed;
+        // `drain_put_writes`'s callback responds once it has, once the
+        // queue truly empties.
+        let ready = g.open_done && !g.draining && g.queue.is_empty();
+        if ready {
+            g.done = true;
+            drop(g);
             Self::send_error(response, 201);
         }
     }
@@ -289,7 +329,7 @@ impl ServerHandler for WebDavHandler {
         // MKCOL / PUT with no body still need a response.
         if self.mkcol_pending {
             self.finish_mkcol(response);
-        } else if self.put_file.is_some() {
+        } else if self.put_state.is_some() {
             self.end_request_body(response);
         }
         self.webdav_body.clear();
@@ -475,33 +515,86 @@ impl WebDavHandler {
             Self::send_error(w, 404);
             return;
         };
-        let Some(resolved) = canonicalize_path(&self.root_path, &self.canonical_root, &lexical)
-        else {
-            Self::send_error(w, 403);
-            return;
-        };
-        if resolved.is_dir() {
-            Self::send_error(w, 409);
-            return;
-        }
-        if let Some(parent) = resolved.parent() {
-            if fs::create_dir_all(parent).is_err() {
-                Self::send_error(w, 500);
-                return;
-            }
-        }
-        // Open now and write each inbound chunk directly to it as it
-        // arrives — the request body is never buffered whole. Headers are a
-        // fast metadata operation; the potentially large body writes happen
-        // per chunk in `request_body_content`, not here.
-        match fs::File::create(&resolved) {
-            Ok(f) => {
-                self.put_file = Some(f);
-                self.put_bytes_written = 0;
-                self.put_rejected = false;
-            }
-            Err(_) => Self::send_error(w, 500),
-        }
+
+        // Validate (canonicalize/is_dir), create the parent directory, and
+        // open the destination file off the reactor thread (issue #186) —
+        // headers() runs on the connection's reactor thread, and all three
+        // are blocking syscalls. Inbound chunks are never buffered whole:
+        // `request_body_content` queues them and `drain_put_writes` writes
+        // each one, in order, once this open completes (which may be
+        // after chunks have already started arriving).
+        let state = Arc::new(Mutex::new(PutState::default()));
+        self.put_state = Some(Arc::clone(&state));
+        self.put_bytes_written = 0;
+        self.put_rejected = false;
+
+        let rh = w.response_handle();
+        let conn = rh.conn_handle().clone();
+        let root = self.root_path.clone();
+        let canonical = self.canonical_root.clone();
+        let storage = Arc::clone(&self.storage);
+
+        let op_state = Arc::clone(&state);
+        let cb_state = Arc::clone(&state);
+        let cb_storage = Arc::clone(&storage);
+        let cb_rh = rh.clone();
+        storage.submit_on(
+            conn,
+            move || -> Result<Option<u16>, Box<dyn std::error::Error + Send + Sync>> {
+                let Some(resolved) = canonicalize_path(&root, &canonical, &lexical) else {
+                    return Ok(Some(403));
+                };
+                if resolved.is_dir() {
+                    return Ok(Some(409));
+                }
+                if let Some(parent) = resolved.parent() {
+                    if fs::create_dir_all(parent).is_err() {
+                        return Ok(Some(500));
+                    }
+                }
+                match fs::File::create(&resolved) {
+                    Ok(f) => {
+                        op_state.lock().unwrap().file = Some(f);
+                        Ok(None)
+                    }
+                    Err(_) => Ok(Some(500)),
+                }
+            },
+            move |result: Result<Option<u16>, StorageError>| {
+                let status = match result {
+                    Ok(Some(status)) => Some(status),
+                    Ok(None) => None,
+                    Err(_) => Some(500),
+                };
+                let mut g = cb_state.lock().unwrap();
+                if g.done {
+                    // The size cap (or something else) already claimed the
+                    // response while this was in flight.
+                    return;
+                }
+                if let Some(status) = status {
+                    g.done = true;
+                    g.queue.clear();
+                    drop(g);
+                    cb_rh.execute(move |w| Self::send_error(w, status));
+                    return;
+                }
+                g.open_done = true;
+                let has_queued = !g.queue.is_empty();
+                if !has_queued && g.finished {
+                    // Zero-byte body: nothing to write, but the (empty)
+                    // file still needed to be created.
+                    g.done = true;
+                    drop(g);
+                    cb_rh.execute(|w| Self::send_error(w, 201));
+                } else {
+                    drop(g);
+                    if has_queued {
+                        drain_put_writes(cb_state, cb_storage, cb_rh);
+                    }
+                }
+            },
+        );
     }
 
     fn handle_delete(&mut self, w: &mut dyn ServerWriter) {
@@ -924,6 +1017,88 @@ enum LockOutcome {
 
 fn io_err(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg))
+}
+
+/// Shared, mutex-guarded PUT state (issue #186) — see
+/// [`WebDavHandler::put_state`].
+#[derive(Default)]
+struct PutState {
+    file: Option<fs::File>,
+    /// True once `handle_put_headers`'s offloaded open (canonicalize +
+    /// create-dir + `File::create`) has succeeded.
+    open_done: bool,
+    queue: VecDeque<Vec<u8>>,
+    /// One write in flight at a time — set while a chunk is submitted to
+    /// the storage pool, cleared once its callback lands and the queue is
+    /// empty.
+    draining: bool,
+    /// `end_request_body` has fired — no more chunks are coming.
+    finished: bool,
+    /// A final response (success or error) has been claimed — every site
+    /// that's about to respond checks-and-sets this under the lock first,
+    /// so exactly one response is ever sent even though the size cap (on
+    /// the reactor thread) and open/write failures (on the storage thread)
+    /// can both discover a reason to respond.
+    done: bool,
+}
+
+/// Drain the next queued PUT chunk (if any) by submitting its write to the
+/// storage pool; on completion, either drains the next one or — once the
+/// queue is empty and `end_request_body` has already fired — sends the
+/// `201` response. Free function (not a `WebDavHandler` method) since it
+/// needs to re-invoke itself from inside a `'static` storage callback,
+/// which only has cloned `Arc`s/a `ServerResponseHandle`, not `&mut
+/// WebDavHandler`. Mirrors `hopf_smtp::server::spool::drain_next` (#184) /
+/// `hopf_imap`'s `drain_next_append_chunk` (#185).
+fn drain_put_writes(
+    state: Arc<Mutex<PutState>>,
+    storage: Arc<StorageExecutor>,
+    rh: ServerResponseHandle,
+) {
+    let chunk = {
+        let mut g = state.lock().unwrap();
+        match g.queue.pop_front() {
+            Some(c) => c,
+            None => {
+                g.draining = false;
+                if g.finished && !g.done {
+                    g.done = true;
+                    drop(g);
+                    rh.execute(|w| WebDavHandler::send_error(w, 201));
+                }
+                return;
+            }
+        }
+    };
+    let op_state = Arc::clone(&state);
+    let cb_state = Arc::clone(&state);
+    let cb_storage = Arc::clone(&storage);
+    let cb_rh = rh.clone();
+    storage.submit_on(
+        rh.conn_handle().clone(),
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let mut g = op_state.lock().unwrap();
+            let f = g
+                .file
+                .as_mut()
+                .expect("PUT file is open before any chunk is queued for writing");
+            f.write_all(&chunk)?;
+            Ok(())
+        },
+        move |result: Result<(), StorageError>| {
+            if result.is_err() {
+                let mut g = cb_state.lock().unwrap();
+                if !g.done {
+                    g.done = true;
+                    g.queue.clear();
+                    drop(g);
+                    cb_rh.execute(|w| WebDavHandler::send_error(w, 500));
+                }
+                return;
+            }
+            drain_put_writes(cb_state, cb_storage, cb_rh);
+        },
+    );
 }
 
 fn find_welcome(dir: &Path, names: &[String]) -> Option<PathBuf> {
