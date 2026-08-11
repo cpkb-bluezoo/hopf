@@ -107,6 +107,28 @@ fn put_get_roundtrip() {
     rt.shutdown();
 }
 
+/// Issue #186: a zero-length PUT never queues a chunk for
+/// `drain_put_writes` to write, so the offloaded open's own completion
+/// callback is what has to notice `end_request_body` already fired and
+/// send `201` — the one path a chunk-triggered drain never exercises.
+#[test]
+fn put_empty_body_creates_a_zero_length_file() {
+    let dir = tempdir().unwrap();
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+    let put = http_exchange(
+        addr,
+        "PUT /empty.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        put.contains("201") || put.contains("200") || put.contains("204"),
+        "PUT failed: {put:?}"
+    );
+    let on_disk = std::fs::read(dir.path().join("empty.txt")).expect("file created");
+    assert!(on_disk.is_empty());
+    rt.shutdown();
+}
+
 /// A payload spanning many 8KB read/write chunks round-trips byte for byte
 /// through the streaming PUT/GET path (no `fs::read`/`fs::write` of a whole
 /// buffer anywhere in the handler).
