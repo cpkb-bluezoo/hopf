@@ -5,7 +5,7 @@
 //!
 //! `cargo test -p hopf-mqtt --features integration`
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
@@ -90,15 +90,15 @@ fn subscribe_packet_qos(packet_id: u16, topic_filter: &str, qos: u8, version: Pr
 
 #[test]
 fn connect_subscribe_publish_fanout_round_trip() {
-    let rt = Runtime::start(RuntimeConfig {
+    let rt = Arc::new(Runtime::start(RuntimeConfig {
         worker_threads: 2,
         ..Default::default()
     })
-    .unwrap();
+    .unwrap());
     let broker = Arc::new(BrokerState::new());
     let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).allow_anonymous();
     let service = MqttService::new(config);
-    let addr = service.start(&rt).unwrap();
+    let addr = service.start(Arc::clone(&rt)).unwrap();
 
     // Subscriber: CONNECT, then SUBSCRIBE to "test/topic".
     let mut sub = wait_connect(addr);
@@ -139,7 +139,7 @@ fn connect_subscribe_publish_fanout_round_trip() {
     assert!(text.contains("test/topic"));
     assert!(text.contains("hello subscribers"));
 
-    rt.shutdown();
+    drop(rt);
 }
 
 /// A QoS-1 subscriber's PUBLISH is resolved from the broker's spool once
@@ -150,15 +150,15 @@ fn connect_subscribe_publish_fanout_round_trip() {
 /// chunk boundaries.
 #[test]
 fn qos1_subscriber_receives_large_multi_chunk_publish() {
-    let rt = Runtime::start(RuntimeConfig {
+    let rt = Arc::new(Runtime::start(RuntimeConfig {
         worker_threads: 2,
         ..Default::default()
     })
-    .unwrap();
+    .unwrap());
     let broker = Arc::new(BrokerState::new());
     let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).allow_anonymous();
     let service = MqttService::new(config);
-    let addr = service.start(&rt).unwrap();
+    let addr = service.start(Arc::clone(&rt)).unwrap();
 
     let mut sub = wait_connect(addr);
     sub.write_all(&connect_packet("qos1-subscriber")).unwrap();
@@ -209,7 +209,7 @@ fn qos1_subscriber_receives_large_multi_chunk_publish() {
     let payload_start = 2 + topic_len + 2;
     assert_eq!(&body[payload_start..], payload.as_slice(), "payload should round-trip byte for byte");
 
-    rt.shutdown();
+    drop(rt);
 }
 
 /// PUBLISH payloads over `max_publish_payload` are rejected before any
@@ -217,17 +217,17 @@ fn qos1_subscriber_receives_large_multi_chunk_publish() {
 /// real default.
 #[test]
 fn publish_over_max_payload_is_rejected() {
-    let rt = Runtime::start(RuntimeConfig {
+    let rt = Arc::new(Runtime::start(RuntimeConfig {
         worker_threads: 2,
         ..Default::default()
     })
-    .unwrap();
+    .unwrap());
     let broker = Arc::new(BrokerState::new());
     let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker)
         .allow_anonymous()
         .with_max_publish_payload(8);
     let service = MqttService::new(config);
-    let addr = service.start(&rt).unwrap();
+    let addr = service.start(Arc::clone(&rt)).unwrap();
 
     let mut publisher = wait_connect(addr);
     publisher.write_all(&connect_packet("oversized-publisher")).unwrap();
@@ -250,20 +250,20 @@ fn publish_over_max_payload_is_rejected() {
     let n = publisher.read(&mut buf).unwrap_or(0);
     assert_eq!(n, 0, "server should have closed the connection, got {n} bytes");
 
-    rt.shutdown();
+    drop(rt);
 }
 
 #[test]
 fn retained_message_delivered_on_new_subscribe() {
-    let rt = Runtime::start(RuntimeConfig {
+    let rt = Arc::new(Runtime::start(RuntimeConfig {
         worker_threads: 1,
         ..Default::default()
     })
-    .unwrap();
+    .unwrap());
     let broker = Arc::new(BrokerState::new());
     let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).allow_anonymous();
     let service = MqttService::new(config);
-    let addr = service.start(&rt).unwrap();
+    let addr = service.start(Arc::clone(&rt)).unwrap();
 
     let mut publisher = wait_connect(addr);
     publisher.write_all(&connect_packet("retainer")).unwrap();
@@ -294,20 +294,20 @@ fn retained_message_delivered_on_new_subscribe() {
     assert_eq!(received[0] & 0xF1, 0x31, "expected a retained PUBLISH (RETAIN bit set)");
     assert!(String::from_utf8_lossy(received).contains("status/online"));
 
-    rt.shutdown();
+    drop(rt);
 }
 
 #[test]
 fn v5_session_resume_after_unclean_disconnect_preserves_subscription() {
-    let rt = Runtime::start(RuntimeConfig {
+    let rt = Arc::new(Runtime::start(RuntimeConfig {
         worker_threads: 2,
         ..Default::default()
     })
-    .unwrap();
+    .unwrap());
     let broker = Arc::new(BrokerState::new());
     let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).allow_anonymous();
     let service = MqttService::new(config);
-    let addr = service.start(&rt).unwrap();
+    let addr = service.start(Arc::clone(&rt)).unwrap();
 
     // First connection: non-clean-start with a 60s Session Expiry, subscribe,
     // then drop the socket without sending DISCONNECT (unclean). CONNACK
@@ -360,7 +360,7 @@ fn v5_session_resume_after_unclean_disconnect_preserves_subscription() {
     let n = second.read(&mut buf).unwrap();
     assert!(String::from_utf8_lossy(&buf[..n]).contains("still subscribed"));
 
-    rt.shutdown();
+    drop(rt);
 }
 
 #[test]
@@ -379,7 +379,7 @@ fn real_client_publishes_and_subscribes_against_real_server() {
     let broker = Arc::new(BrokerState::new());
     let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).allow_anonymous();
     let service = MqttService::new(config);
-    let addr = service.start(&rt).unwrap();
+    let addr = service.start(Arc::clone(&rt)).unwrap();
 
     // Subscriber driver: on CONNACK, subscribe; report the first received
     // message body (topic, payload) back to the test thread.
@@ -482,6 +482,150 @@ fn real_client_publishes_and_subscribes_against_real_server() {
     drop(rt);
 }
 
+/// Wraps a [`hopf_auth::PasswordStore`] and sleeps inside `password_match`
+/// — deterministically widens the window a credential check spends
+/// offloaded to the storage pool (issue #181), so a pipelining regression
+/// test can reliably observe whether a second CONNECT sent right behind
+/// the first gets rejected before or after the check resolves, rather than
+/// depending on the storage thread happening to be slow by chance.
+struct SlowStore {
+    inner: hopf_auth::PasswordStore,
+    delay: Duration,
+}
+
+impl hopf_auth::CredentialStore for SlowStore {
+    fn supported_mechanisms(&self) -> Vec<hopf_auth::SaslMechanism> {
+        self.inner.supported_mechanisms()
+    }
+    fn password_match(&self, username: &str, password: &str) -> bool {
+        std::thread::sleep(self.delay);
+        self.inner.password_match(username, password)
+    }
+    fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
+        self.inner.digest_ha1(username, realm)
+    }
+    fn scram_credentials(&self, username: &str) -> Option<hopf_auth::ScramCredentials> {
+        self.inner.scram_credentials(username)
+    }
+}
+
+/// A v5 CONNECT carrying MQTT 5 enhanced-AUTH `Authentication Method` +
+/// `Authentication Data` (PLAIN's initial response), so the server takes
+/// `maybe_start_connect_auth`'s "has initial response" branch and offloads
+/// the SASL step (issue #181).
+fn v5_connect_packet_with_plain_auth(client_id: &str, user: &str, pass: &str) -> Vec<u8> {
+    let mut properties = Properties::new();
+    properties.set_utf8(crate::codec::properties::property::AUTHENTICATION_METHOD, "PLAIN");
+    let initial = format!("\0{user}\0{pass}");
+    properties.set_binary(crate::codec::properties::property::AUTHENTICATION_DATA, initial.as_bytes());
+    encode::encode_connect(&ConnectPacket {
+        version: ProtocolVersion::V5,
+        clean_session: true,
+        keep_alive: 30,
+        properties,
+        client_id: client_id.to_string(),
+        will: None,
+        username: None,
+        password: None,
+    })
+}
+
+/// Enhanced AUTH (MQTT 5 §4.12, PLAIN mechanism) completes correctly end to
+/// end now that its SASL step runs off the reactor thread (issue #181) —
+/// regression guard proving the offload didn't break the
+/// synchronous-looking-from-the-wire behavior.
+#[test]
+fn connect_with_enhanced_auth_plain_succeeds() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let broker = Arc::new(BrokerState::new());
+    let store: Arc<dyn hopf_auth::CredentialStore> =
+        Arc::new(hopf_auth::PasswordStore::new().with_user("alice", "secret"));
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).with_credentials(store);
+    let service = MqttService::new(config);
+    let addr = service.start(Arc::clone(&rt)).unwrap();
+
+    let mut stream = wait_connect(addr);
+    stream
+        .write_all(&v5_connect_packet_with_plain_auth("client-a", "alice", "secret"))
+        .unwrap();
+
+    let connack = read_exact_timeout(&mut stream, 4);
+    assert_eq!(connack[0], 0x20, "expected CONNACK fixed header byte: {connack:?}");
+    assert_eq!(connack[3], 0x00, "expected acceptance: {connack:?}");
+    drop(rt);
+}
+
+/// Enhanced AUTH's SASL step runs off the reactor thread (issue #181). A
+/// second CONNECT pipelined right behind the first, in the same write,
+/// must be rejected (MQTT 3.1.1 §3.1 already requires rejecting a second
+/// CONNECT on an established session — the same guard now also covers the
+/// window before that, while the first CONNECT's step is still offloaded,
+/// since `session` alone doesn't protect against this: it only becomes
+/// `Connected` once the check resolves) rather than racing the in-flight
+/// check and being processed as a legitimate new session. `SlowStore`
+/// widens the offload's window so this is reliably observable rather than
+/// a timing coincidence.
+///
+/// The connection closes immediately on detecting the violation (matching
+/// `disconnect_and_close`'s existing behavior for every other protocol
+/// error) rather than waiting for the first CONNECT's own — by this point
+/// moot — reply to go out first, so this test only asserts on the one
+/// thing issue #181 actually cares about here: the second CONNECT is never
+/// accepted as a new session. It does not assert the first CONNECT's
+/// CONNACK arrives (`connect_with_enhanced_auth_plain_succeeds` already
+/// covers that, unpipelined) — asserting that here would depend on winning
+/// a race against the same close this test is verifying happens.
+#[test]
+fn second_connect_pipelined_behind_enhanced_auth_is_rejected() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let broker = Arc::new(BrokerState::new());
+    let store: Arc<dyn hopf_auth::CredentialStore> = Arc::new(SlowStore {
+        inner: hopf_auth::PasswordStore::new().with_user("alice", "secret"),
+        delay: Duration::from_millis(150),
+    });
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).with_credentials(store);
+    let service = MqttService::new(config);
+    let addr = service.start(Arc::clone(&rt)).unwrap();
+
+    let mut stream = wait_connect(addr);
+    let connect1 = v5_connect_packet_with_plain_auth("client-a", "alice", "secret");
+    let connect2 = v5_connect_packet_with_plain_auth("client-b", "alice", "secret");
+
+    // One write, both CONNECT packets — proves the second was actually
+    // sitting on the wire during the offloaded step, not just sent
+    // afterward by coincidence.
+    let mut both = connect1;
+    both.extend_from_slice(&connect2);
+    stream.write_all(&both).unwrap();
+
+    // Whatever comes back — nothing, the first CONNACK, or an error — the
+    // connection must end up closed, and a second CONNACK (which would
+    // mean the broker double-registered a session for one connection)
+    // must never appear anywhere in the byte stream.
+    let mut received = Vec::new();
+    loop {
+        let mut buf = [0u8; 64];
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                panic!(
+                    "connection neither closed nor produced a full reply within the read \
+                     timeout — expected a close after the rejected pipelined CONNECT: {received:?}"
+                );
+            }
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+    }
+    let connack_count = received.iter().zip(received.iter().skip(1)).filter(|&(&a, &b)| a == 0x20 && b == 0x03).count();
+    assert!(
+        connack_count <= 1,
+        "the pipelined second CONNECT must never be accepted as a new session \
+         (at most one CONNACK expected): {received:?}"
+    );
+    drop(rt);
+}
+
 /// Proves the point of threading `ConnHandle` through `hopf-websocket`
 /// (see [`crate::server::ws`]): a subscriber connected over WS and a publisher
 /// connected over plain TCP, sharing one [`BrokerState`], can reach each
@@ -496,18 +640,18 @@ fn ws_subscriber_and_tcp_publisher_share_broker_state() {
     use crate::server::DefaultMqttHandlerFactory;
     use crate::server::ws::MqttWsFactory;
 
-    let rt = Runtime::start(RuntimeConfig {
+    let rt = Arc::new(Runtime::start(RuntimeConfig {
         worker_threads: 2,
         ..Default::default()
     })
-    .unwrap();
+    .unwrap());
     let broker = Arc::new(BrokerState::new());
 
     // TCP listener: the publisher connects here.
     let tcp_config =
         MqttConfig::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&broker)).allow_anonymous();
     let tcp_service = MqttService::new(tcp_config);
-    let tcp_addr = tcp_service.start(&rt).unwrap();
+    let tcp_addr = tcp_service.start(Arc::clone(&rt)).unwrap();
 
     // WS listener: the subscriber connects here, sharing the same broker.
     let ws_config = Arc::new(
@@ -583,7 +727,7 @@ fn ws_subscriber_and_tcp_publisher_share_broker_state() {
     assert!(text.contains("ws/topic"));
     assert!(text.contains("hello over ws"));
 
-    rt.shutdown();
+    drop(rt);
 }
 
 /// Read one unfragmented WebSocket frame's payload. Server-to-client frames

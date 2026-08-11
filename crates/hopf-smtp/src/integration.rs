@@ -12,7 +12,10 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_auth::PasswordStore;
+use hopf_auth::{
+    CertificateIdentity, CredentialStore, PasswordStore, ScramCredentials, SaslMechanism,
+    TokenValidation,
+};
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_tls::{acceptor_from_pem, connector};
 
@@ -173,6 +176,65 @@ fn start_smtp_server_with_store(store: Arc<PasswordStore>) -> (Arc<Runtime>, Soc
     let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
     let bound = service.start(Arc::clone(&rt)).unwrap();
     (rt, bound)
+}
+
+/// Like [`start_smtp_server_with_store`], but with a caller-supplied
+/// [`CredentialStore`] — used with [`SlowStore`] to widen the async SASL
+/// step offload's window for pipelining regression tests (issue #181).
+fn start_smtp_server_with_credential_store(store: Arc<dyn CredentialStore>) -> (Arc<Runtime>, SocketAddr) {
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(listen, "test.example.com").with_store(store);
+    let handler = AcceptAllSmtpHandler::new("test.example.com");
+    let factory = Arc::new(AcceptAllSmtpHandlerFactory::new(handler));
+    let service = SmtpService::with_handler_factory(config, factory);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+    (rt, bound)
+}
+
+/// Wraps a [`PasswordStore`] and sleeps inside `password_match`/
+/// `plaintext_password` — deterministically widens the window a credential
+/// check spends offloaded to the storage pool (issue #181), so a
+/// pipelining regression test can reliably observe whether a command sent
+/// right behind AUTH gets processed (or in SMTP's case, soft-rejected)
+/// before or after the check resolves, rather than depending on the
+/// storage thread happening to be slow by chance.
+struct SlowStore {
+    inner: PasswordStore,
+    delay: Duration,
+}
+
+impl CredentialStore for SlowStore {
+    fn supported_mechanisms(&self) -> Vec<SaslMechanism> {
+        self.inner.supported_mechanisms()
+    }
+    fn password_match(&self, username: &str, password: &str) -> bool {
+        std::thread::sleep(self.delay);
+        self.inner.password_match(username, password)
+    }
+    fn plaintext_password(&self, username: &str) -> Option<String> {
+        // `PasswordStore` deliberately discards plaintext after enrollment
+        // and so can't drive CRAM-MD5, which needs a recoverable secret —
+        // override it here so `SlowStore` can, since CRAM-MD5's
+        // server-first, multi-round-trip shape is what the AUTH pipelining
+        // test below needs to exercise the `first_step`/continuation
+        // offload path. CRAM-MD5 verification goes through this method
+        // (not `password_match`), so it needs the same delay.
+        std::thread::sleep(self.delay);
+        (username == "alice").then(|| "secret".to_string())
+    }
+    fn digest_ha1(&self, username: &str, realm: &str) -> Option<String> {
+        self.inner.digest_ha1(username, realm)
+    }
+    fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
+        self.inner.scram_credentials(username)
+    }
+    fn validate_bearer(&self, token: &str) -> Option<TokenValidation> {
+        self.inner.validate_bearer(token)
+    }
+    fn authenticate_certificate(&self, cert_key: &str) -> Option<CertificateIdentity> {
+        self.inner.authenticate_certificate(cert_key)
+    }
 }
 
 fn write_cmd(stream: &mut TcpStream, cmd: &[u8]) {
@@ -604,6 +666,62 @@ fn local_delivery_appends_to_maildir() {
         5000,
     );
     assert!(found, "maildir delivery incomplete");
+}
+
+/// AUTH's SASL step runs off the reactor thread (issue #181), using
+/// CRAM-MD5 — a server-first, multi-round-trip mechanism whose *first*
+/// step offload is the new `first_step` code path added for this issue.
+/// A command pipelined right behind the continuation response, in the same
+/// write, must be soft-rejected (matching the existing `Delivering`-state
+/// precedent) rather than processed against stale pre-auth state — and the
+/// AUTH exchange itself must still complete correctly once the offloaded
+/// step resolves. `SlowStore` widens the offload's window so this is
+/// reliably observable rather than a timing coincidence.
+#[test]
+fn smtp_auth_pipelined_with_mail_from_is_soft_rejected_until_async_step_resolves() {
+    let store: Arc<dyn CredentialStore> = Arc::new(SlowStore {
+        inner: PasswordStore::new().with_user("alice", "secret"),
+        delay: Duration::from_millis(150),
+    });
+    let (rt, addr) = start_smtp_server_with_credential_store(store);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = vec![0u8; 8192];
+    read_until(&mut stream, &mut buf, |s| s.contains("220 "));
+
+    write_cmd(&mut stream, b"EHLO client.example\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("250 "));
+
+    write_cmd(&mut stream, b"AUTH CRAM-MD5\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.starts_with("334 "));
+    let b64 = r.trim().strip_prefix("334 ").expect("continuation prefix");
+    let challenge = String::from_utf8(rmimeparser::charset::base64::decode(b64).unwrap())
+        .expect("challenge is ASCII");
+    let digest = hopf_auth::cram_md5::compute_response("secret", &challenge);
+    let response = rmimeparser::charset::base64::encode(format!("alice {digest}").as_bytes());
+
+    // One write, both commands — proves the pipelined MAIL FROM was
+    // actually sitting on the wire during the offloaded step, not just
+    // sent afterward by coincidence.
+    write_cmd(&mut stream, format!("{response}\r\nMAIL FROM:<a@b.com>\r\n").as_bytes());
+
+    let r = read_until(&mut stream, &mut buf, |s| {
+        s.contains("235 ") && (s.contains("451 ") || s.contains("250 "))
+    });
+    assert!(r.contains("235 "), "authenticate cram-md5: {r}");
+    assert!(
+        r.contains("451 "),
+        "MAIL FROM pipelined behind the AUTH continuation must be soft-\
+         rejected while the SASL step is still offloaded, not processed \
+         early: {r}"
+    );
+
+    // Now that AUTH has resolved, the same command must go through cleanly.
+    write_cmd(&mut stream, b"MAIL FROM:<a@b.com>\r\n");
+    let r2 = read_until(&mut stream, &mut buf, |s| s.starts_with("250 ") || s.starts_with("5"));
+    assert!(r2.starts_with("250 "), "mail from after CRAM-MD5 auth: {r2}");
+    drop(rt);
 }
 
 /// End-to-end proof that [`crate::AuthPipeline`] can be returned from
