@@ -80,8 +80,16 @@ impl std::error::Error for WsFrameError {}
 
 /// Callbacks for recognized frames (zero-copy payload for the call).
 pub trait WsFrameHandler {
-    /// Data or continuation frame.
-    fn data_frame(&mut self, fin: bool, opcode: Opcode, payload: &[u8]);
+    /// Data or continuation frame payload chunk.
+    ///
+    /// Called one or more times per frame as payload bytes arrive off the
+    /// wire — large payloads are never buffered in full before this fires.
+    /// `chunk_end` is true on the call that delivers the last bytes of
+    /// *this frame's* payload (an empty-payload frame still fires exactly
+    /// once, with `chunk` empty and `chunk_end` true). `fin` is the frame's
+    /// own FIN bit — a fragmented message (RFC 6455 §5.4) spans multiple
+    /// frames, each ending with its own `chunk_end`.
+    fn data_frame(&mut self, fin: bool, opcode: Opcode, chunk: &[u8], chunk_end: bool);
     /// Ping.
     fn ping_frame(&mut self, payload: &[u8]);
     /// Pong.
@@ -111,8 +119,17 @@ pub struct WsFrameParser {
     masked: bool,
     payload_len: u64,
     mask: [u8; 4],
+    /// Buffered payload for control frames only (bounded to
+    /// `MAX_CONTROL_PAYLOAD`) — data-frame payload is streamed straight to
+    /// the handler and never buffered here.
     payload: Vec<u8>,
     need: usize,
+    /// Bytes of the current frame's payload not yet consumed.
+    payload_remaining: u64,
+    /// Rolling offset into `mask` for the next payload byte, carried across
+    /// `receive()` calls so a chunk boundary never has to land on a 4-byte
+    /// mask-key boundary.
+    mask_offset: usize,
 }
 
 impl WsFrameParser {
@@ -130,12 +147,20 @@ impl WsFrameParser {
             mask: [0; 4],
             payload: Vec::new(),
             need: 2,
+            payload_remaining: 0,
+            mask_offset: 0,
         }
     }
 
     /// Feed bytes; invokes handler callbacks as frames complete.
     pub fn receive(&mut self, mut data: &[u8], handler: &mut dyn WsFrameHandler) {
         while !data.is_empty() {
+            if self.step == Step::Payload {
+                if !self.consume_payload(&mut data, handler) {
+                    return;
+                }
+                continue;
+            }
             let take = data.len().min(self.need.saturating_sub(self.buf.len()));
             if take == 0 && self.need == 0 {
                 break;
@@ -163,13 +188,46 @@ impl WsFrameParser {
                         return;
                     }
                 }
-                Step::Payload => {
-                    self.payload.extend_from_slice(&self.buf);
-                    self.buf.clear();
-                    self.finish_frame(handler);
-                }
+                Step::Payload => unreachable!("handled above"),
             }
         }
+    }
+
+    /// Consume as much of the current frame's payload as `data` has
+    /// available (at most `payload_remaining`), dispatching it to the
+    /// handler. Returns false if a fatal error was reported.
+    fn consume_payload(&mut self, data: &mut &[u8], handler: &mut dyn WsFrameHandler) -> bool {
+        let take = data.len().min(self.payload_remaining as usize);
+        let chunk = &data[..take];
+        *data = &data[take..];
+        self.payload_remaining -= take as u64;
+        let chunk_end = self.payload_remaining == 0;
+
+        if self.opcode.is_control() {
+            self.payload.extend_from_slice(chunk);
+            if chunk_end {
+                self.finish_control_frame(handler);
+            }
+            return true;
+        }
+
+        if self.masked {
+            let mut masked: Vec<u8> = chunk.to_vec();
+            for (i, b) in masked.iter_mut().enumerate() {
+                *b ^= self.mask[(self.mask_offset + i) % 4];
+            }
+            handler.data_frame(self.fin, self.opcode, &masked, chunk_end);
+        } else {
+            handler.data_frame(self.fin, self.opcode, chunk, chunk_end);
+        }
+        self.mask_offset = (self.mask_offset + take) % 4;
+
+        if chunk_end {
+            self.step = Step::Header;
+            self.need = 2;
+            self.buf.clear();
+        }
+        true
     }
 
     fn parse_header(&mut self, handler: &mut dyn WsFrameHandler) -> bool {
@@ -255,19 +313,27 @@ impl WsFrameParser {
     /// Returns false if a fatal error was reported.
     fn begin_payload(&mut self, handler: &mut dyn WsFrameHandler) -> bool {
         self.payload.clear();
-        let n = self.payload_len as usize;
-        if n == 0 {
-            self.finish_frame(handler);
-            true
+        self.mask_offset = 0;
+        self.payload_remaining = self.payload_len;
+        if self.payload_len == 0 {
+            if self.opcode.is_control() {
+                self.finish_control_frame(handler);
+            } else {
+                handler.data_frame(self.fin, self.opcode, &[], true);
+                self.step = Step::Header;
+                self.need = 2;
+                self.buf.clear();
+            }
         } else {
             self.step = Step::Payload;
-            self.need = n;
-            self.payload.reserve(n);
-            true
         }
+        true
     }
 
-    fn finish_frame(&mut self, handler: &mut dyn WsFrameHandler) {
+    /// Dispatch a complete, buffered control frame (ping/pong/close — always
+    /// small, bounded by `MAX_CONTROL_PAYLOAD`, so buffering it whole costs
+    /// nothing worth streaming).
+    fn finish_control_frame(&mut self, handler: &mut dyn WsFrameHandler) {
         if self.masked {
             for (i, b) in self.payload.iter_mut().enumerate() {
                 *b ^= self.mask[i % 4];
@@ -278,7 +344,7 @@ impl WsFrameParser {
             Opcode::Ping => handler.ping_frame(&self.payload),
             Opcode::Pong => handler.pong_frame(&self.payload),
             Opcode::Close => handler.close_frame(&self.payload),
-            op => handler.data_frame(self.fin, op, &self.payload),
+            _ => unreachable!("finish_control_frame called for a data opcode"),
         }
 
         self.step = Step::Header;
@@ -335,16 +401,40 @@ pub fn write_frame(
 mod tests {
     use super::*;
 
+    /// Accumulates chunks into `scratch`, pushing one `events` line (and one
+    /// `completed` entry, exact bytes) per complete frame — so existing
+    /// once-per-frame assertions still work regardless of how many
+    /// `data_frame` chunk calls it took to get there, while `chunk_calls`
+    /// and `completed` let new tests inspect the streaming behavior itself.
     struct Rec {
         events: Vec<String>,
+        chunk_calls: usize,
+        scratch: Vec<u8>,
+        completed: Vec<Vec<u8>>,
+    }
+
+    impl Rec {
+        fn new() -> Self {
+            Self {
+                events: vec![],
+                chunk_calls: 0,
+                scratch: vec![],
+                completed: vec![],
+            }
+        }
     }
 
     impl WsFrameHandler for Rec {
-        fn data_frame(&mut self, fin: bool, opcode: Opcode, payload: &[u8]) {
-            self.events.push(format!(
-                "data fin={fin} op={opcode:?} {}",
-                String::from_utf8_lossy(payload)
-            ));
+        fn data_frame(&mut self, fin: bool, opcode: Opcode, chunk: &[u8], chunk_end: bool) {
+            self.chunk_calls += 1;
+            self.scratch.extend_from_slice(chunk);
+            if chunk_end {
+                self.events.push(format!(
+                    "data fin={fin} op={opcode:?} {}",
+                    String::from_utf8_lossy(&self.scratch)
+                ));
+                self.completed.push(std::mem::take(&mut self.scratch));
+            }
         }
         fn ping_frame(&mut self, payload: &[u8]) {
             self.events
@@ -368,7 +458,7 @@ mod tests {
         write_frame(&mut out, true, Opcode::Text, Some(mask), b"hi");
 
         let mut p = WsFrameParser::new(WsRole::Server, 1024);
-        let mut h = Rec { events: vec![] };
+        let mut h = Rec::new();
         p.receive(&out, &mut h);
         assert_eq!(h.events, vec!["data fin=true op=Text hi".to_string()]);
     }
@@ -378,7 +468,7 @@ mod tests {
         let mut out = Vec::new();
         write_frame(&mut out, true, Opcode::Text, Some([9, 8, 7, 6]), b"abc");
         let mut p = WsFrameParser::new(WsRole::Server, 1024);
-        let mut h = Rec { events: vec![] };
+        let mut h = Rec::new();
         p.receive(&out[..1], &mut h);
         assert!(h.events.is_empty());
         p.receive(&out[1..], &mut h);
@@ -390,8 +480,80 @@ mod tests {
         let mut out = Vec::new();
         write_frame(&mut out, true, Opcode::Text, None, b"x");
         let mut p = WsFrameParser::new(WsRole::Server, 1024);
-        let mut h = Rec { events: vec![] };
+        let mut h = Rec::new();
         p.receive(&out, &mut h);
         assert!(h.events[0].starts_with("err:"));
+    }
+
+    /// Issue #192: the payload must be delivered to `data_frame` as it
+    /// arrives, not buffered whole and delivered in one call once the
+    /// frame completes.
+    #[test]
+    fn data_frame_streams_across_multiple_receive_calls() {
+        let mut out = Vec::new();
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        let payload = b"the quick brown fox jumps over the lazy dog!";
+        write_frame(&mut out, true, Opcode::Binary, Some(mask), payload);
+        let header_len = out.len() - payload.len();
+
+        let mut p = WsFrameParser::new(WsRole::Server, 1024);
+        let mut h = Rec::new();
+        p.receive(&out[..header_len], &mut h);
+        assert!(h.events.is_empty());
+
+        let body = &out[header_len..];
+        // Non-4-byte-aligned splits, so the rolling mask offset is
+        // genuinely exercised across chunk boundaries.
+        let mut pos = 0;
+        for n in [1, 3, 3, 10, body.len()] {
+            let end = (pos + n).min(body.len());
+            if pos < end {
+                p.receive(&body[pos..end], &mut h);
+            }
+            pos = end;
+        }
+        assert!(
+            h.chunk_calls > 1,
+            "expected multiple data_frame calls, got {}",
+            h.chunk_calls
+        );
+        assert_eq!(h.completed, vec![payload.to_vec()]);
+    }
+
+    /// Every possible split point of a masked payload reconstructs the
+    /// exact original bytes — proves the rolling mask offset is correct
+    /// regardless of where a chunk boundary happens to fall.
+    #[test]
+    fn payload_reconstructed_at_every_split_point() {
+        let mut out = Vec::new();
+        let mask = [7, 3, 9, 1];
+        let payload: Vec<u8> = (0..37u8).collect();
+        write_frame(&mut out, true, Opcode::Binary, Some(mask), &payload);
+        let header_len = out.len() - payload.len();
+        let body = &out[header_len..];
+
+        for split in 0..=payload.len() {
+            let mut p = WsFrameParser::new(WsRole::Server, 1024);
+            let mut h = Rec::new();
+            let mut first = Vec::new();
+            first.extend_from_slice(&out[..header_len]);
+            first.extend_from_slice(&body[..split]);
+            p.receive(&first, &mut h);
+            p.receive(&body[split..], &mut h);
+            assert_eq!(h.completed, vec![payload.clone()], "wrong reconstruction at split {split}");
+        }
+    }
+
+    /// A zero-length data frame still fires exactly one `data_frame` call
+    /// with `chunk_end` true, not zero calls.
+    #[test]
+    fn empty_payload_data_frame_still_fires() {
+        let mut out = Vec::new();
+        write_frame(&mut out, true, Opcode::Text, Some([1, 2, 3, 4]), b"");
+        let mut p = WsFrameParser::new(WsRole::Server, 1024);
+        let mut h = Rec::new();
+        p.receive(&out, &mut h);
+        assert_eq!(h.chunk_calls, 1);
+        assert_eq!(h.completed, vec![Vec::<u8>::new()]);
     }
 }
