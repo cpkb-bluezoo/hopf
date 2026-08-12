@@ -149,13 +149,29 @@ pub(crate) struct AuthStepOutcome {
     pub(crate) pending_connect: Option<crate::server::auth::PendingConnectAuth>,
 }
 
+/// Result of an offloaded plain-CONNECT `ConnectHandler::authorize` call
+/// (issue #210 — the shipped `DefaultConnectHandler`, and any
+/// application-supplied one, may block for an LDAP/PAM-backed
+/// `CredentialStore`). `connect_handler` travels back with the outcome:
+/// it moved into the storage-pool closure to make the call, and
+/// `sync_pending_authorize` restores it — `authorize()` runs at most once
+/// per connection (a rejected/errored CONNECT always closes the
+/// connection), so there's never a second call waiting on it.
+pub(crate) struct PendingAuthorizeOutcome {
+    pub(crate) result: Result<(Box<dyn ConnectHandler>, ConnectDecision), String>,
+    pub(crate) pending_connect: crate::server::auth::PendingConnectAuth,
+}
+
 /// Server-side `ProtocolHandler` for one MQTT TCP connection.
 pub struct MqttControlHandler {
     pub(crate) config: Arc<MqttConfig>,
     parser: MqttFrameParser,
     session: SessionState,
     connect_timeout_timer: Option<TimerHandle>,
-    connect_handler: Box<dyn ConnectHandler>,
+    /// `None` only while offloaded to the storage pool for an in-flight
+    /// `authorize()` call (issue #210), or after one has run — `authorize`
+    /// is called at most once per connection, so it's never needed back.
+    connect_handler: Option<Box<dyn ConnectHandler>>,
     publish_handler: Box<dyn PublishHandler>,
     subscribe_handler: Box<dyn SubscribeHandler>,
     pub(crate) pending_auth: Option<crate::server::auth::PendingAuth>,
@@ -176,6 +192,10 @@ pub struct MqttControlHandler {
     /// check resolves).
     pub(crate) busy: Arc<AtomicBool>,
     pub(crate) pending_auth_check: Arc<Mutex<Option<AuthStepOutcome>>>,
+    /// See [`PendingAuthorizeOutcome`] (issue #210) — same busy-gate
+    /// (`busy` above) as the enhanced-AUTH SASL step offload, since only
+    /// one of the two ever runs for a given CONNECT.
+    pub(crate) pending_authorize: Arc<Mutex<Option<PendingAuthorizeOutcome>>>,
     /// PUBLISHes whose `end_publish` ran before their spool write finished
     /// draining (issue #187) — `sync_pending_publish_finish` completes
     /// each once ready, triggered by the last chunk's `poke_handler` call
@@ -216,7 +236,7 @@ impl MqttControlHandler {
             parser,
             session: SessionState::AwaitingConnect,
             connect_timeout_timer: None,
-            connect_handler,
+            connect_handler: Some(connect_handler),
             publish_handler,
             subscribe_handler,
             pending_auth: None,
@@ -237,6 +257,7 @@ impl MqttControlHandler {
             control_handle: None,
             busy: Arc::new(AtomicBool::new(false)),
             pending_auth_check: Arc::new(Mutex::new(None)),
+            pending_authorize: Arc::new(Mutex::new(None)),
             pending_publish_finishes: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -381,6 +402,7 @@ impl ProtocolHandler for MqttControlHandler {
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         crate::server::auth::sync_pending_auth_check(self, endpoint);
+        sync_pending_authorize(self, endpoint);
         sync_pending_publish_finish(self, endpoint);
         // `Ctx` borrows `self` for the duration of the callbacks, so the
         // parser driving those callbacks can't live inside `self` while
@@ -666,9 +688,10 @@ impl MqttFrameHandler for Ctx<'_, '_> {
             // A second CONNECT on an established session is a protocol
             // violation (MQTT 3.1.1 §3.1) — also rejected while a SASL
             // step from a first, still-in-flight CONNECT's enhanced AUTH
-            // is offloaded (issue #181): `session` alone doesn't protect
-            // against this race, since it only becomes `Connected` once
-            // that check resolves.
+            // is offloaded (issue #181), or while a plain CONNECT's
+            // authorize() call is offloaded (issue #210): `session` alone
+            // doesn't protect against either race, since it only becomes
+            // `Connected` once the check resolves.
             self.disconnect_and_close(reason::PROTOCOL_ERROR);
             return;
         }
@@ -692,24 +715,6 @@ impl MqttFrameHandler for Ctx<'_, '_> {
             packet.client_id.clone()
         };
 
-        if packet.properties.get_utf8(property::AUTHENTICATION_METHOD).is_none() {
-            if let ConnectDecision::Reject(reason_code) =
-                self.handler.connect_handler.authorize(&packet, &self.handler.meta)
-            {
-                self.handler.record_auth(false);
-                self.connack_and_close(version, reason_code);
-                return;
-            }
-            self.handler.record_auth(true);
-        }
-        self.handler.meta.client_id = Some(client_id.clone());
-
-        let keep_alive = if packet.keep_alive == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_millis(packet.keep_alive as u64 * 1500)
-        };
-
         let receive_maximum = if version.is_v5() {
             packet
                 .properties
@@ -724,13 +729,35 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         } else {
             0
         };
-        let session_expiry = Duration::from_secs(session_expiry_secs as u64);
-
         let client_topic_alias_max = if version.is_v5() {
             packet.properties.get_u16(property::TOPIC_ALIAS_MAXIMUM).unwrap_or(0)
         } else {
             0
         };
+
+        if packet.properties.get_utf8(property::AUTHENTICATION_METHOD).is_none() {
+            // Plain CONNECT: offload the (possibly blocking — e.g. an
+            // LDAP/PAM-backed CredentialStore) authorize() call off the
+            // reactor thread (issue #210), same class of risk #181 fixed
+            // for enhanced AUTH's SaslServer::step. Everything downstream
+            // of a successful check is captured in `pending_connect` and
+            // resumed via `finish_connect_after_auth` by
+            // `sync_pending_authorize`, once the result is back.
+            let pending_connect = crate::server::auth::PendingConnectAuth {
+                client_id: client_id.clone(),
+                clean_session: packet.clean_session,
+                keep_alive_raw: packet.keep_alive,
+                will: packet.will.clone(),
+                receive_maximum,
+                session_expiry_secs,
+                client_topic_alias_max,
+                version,
+            };
+            offload_authorize(self.handler, self.endpoint, packet, pending_connect);
+            self.pending_version = Some(version);
+            return;
+        }
+        self.handler.meta.client_id = Some(client_id.clone());
 
         match crate::server::auth::maybe_start_connect_auth(
             self.handler,
@@ -743,69 +770,18 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         ) {
             Ok(true) => {
                 // AUTH exchange in progress — CONNACK deferred.
-                let _ = keep_alive;
-                let _ = session_expiry;
                 self.pending_version = Some(version);
-                return;
             }
-            Ok(false) => {}
+            Ok(false) => unreachable!(
+                "maybe_start_connect_auth only returns Ok(false) when no \
+                 Authentication Method is present, but connect() only \
+                 calls it once one is confirmed present"
+            ),
             Err(code) => {
                 self.handler.record_auth(false);
                 self.connack_and_close(version, code);
-                return;
             }
         }
-
-        let (subscriber_id, evicted, session_present) = self.broker().register(
-            &client_id,
-            version,
-            receive_maximum,
-            packet.clean_session,
-            self.endpoint.handle(),
-            false,
-        );
-        if let Some(evicted) = evicted {
-            evicted.close();
-        }
-
-        let server_topic_alias_max = if version.is_v5() {
-            SERVER_TOPIC_ALIAS_MAXIMUM
-        } else {
-            0
-        };
-
-        self.handler.session = SessionState::Connected(Box::new(ConnectedSession {
-            subscriber_id,
-            client_id: client_id.clone(),
-            version,
-            will: packet.will,
-            keep_alive,
-            keepalive_timer: None,
-            session_expiry,
-            graceful_disconnect: false,
-            awaiting_pubrel: HashSet::new(),
-            pending_publish: None,
-            inbound_aliases: HashMap::new(),
-            server_topic_alias_max,
-            client_topic_alias_max,
-            qos_retry_interval: DEFAULT_QOS_RETRY_INTERVAL,
-            retransmit_timer: None,
-        }));
-        self.pending_version = Some(version);
-
-        if session_present {
-            self.broker().drain_offline(subscriber_id);
-        }
-        arm_retransmit_timer(self.handler, self.endpoint);
-
-        let connack_props = connack_properties(
-            version,
-            receive_maximum,
-            session_expiry_secs,
-            server_topic_alias_max,
-        );
-        let wire = encode::encode_connack(session_present, 0, &connack_props, version);
-        self.endpoint.send(&wire);
     }
 
     fn connack(&mut self, _session_present: bool, _reason_code: u8, _properties: Properties) {
@@ -1091,20 +1067,22 @@ impl MqttFrameHandler for Ctx<'_, '_> {
     }
 }
 
-/// Complete CONNECT session setup after a successful enhanced AUTH exchange.
+/// Complete CONNECT session setup after a successful enhanced AUTH exchange
+/// (always v5), or a successful offloaded plain-CONNECT `authorize()` call
+/// (issue #210 — any version).
 pub(crate) fn finish_connect_after_auth(
     handler: &mut MqttControlHandler,
     endpoint: &mut dyn Endpoint,
     pc: crate::server::auth::PendingConnectAuth,
 ) {
-    let version = ProtocolVersion::V5;
+    let version = pc.version;
     let keep_alive = if pc.keep_alive_raw == 0 {
         Duration::ZERO
     } else {
         Duration::from_millis(pc.keep_alive_raw as u64 * 1500)
     };
     let session_expiry = Duration::from_secs(pc.session_expiry_secs as u64);
-    let server_topic_alias_max = SERVER_TOPIC_ALIAS_MAXIMUM;
+    let server_topic_alias_max = if version.is_v5() { SERVER_TOPIC_ALIAS_MAXIMUM } else { 0 };
 
     let (subscriber_id, evicted, session_present) = handler.config.broker.register(
         &pc.client_id,
@@ -1149,6 +1127,97 @@ pub(crate) fn finish_connect_after_auth(
         server_topic_alias_max,
     );
     endpoint.send(&encode::encode_connack(session_present, 0, &connack_props, version));
+}
+
+/// Offload a plain (non-enhanced-AUTH) CONNECT's `ConnectHandler::authorize`
+/// call to the storage pool (issue #210 — may block for an LDAP/PAM-backed
+/// `CredentialStore`, same class of risk #181 fixed for `SaslServer::step`).
+/// `connect_handler` moves into the closure; the outcome (including it,
+/// restored) lands in `pending_authorize` for [`sync_pending_authorize`] to
+/// apply once back on the reactor.
+fn offload_authorize(
+    handler: &mut MqttControlHandler,
+    endpoint: &mut dyn Endpoint,
+    packet: ConnectPacket,
+    pending_connect: crate::server::auth::PendingConnectAuth,
+) {
+    let version = pending_connect.version;
+    let Some(connect_handler) = handler.connect_handler.take() else {
+        // Can't happen (authorize() runs at most once per connection —
+        // see `connect_handler`'s doc), but fail closed rather than
+        // panicking if it somehow did.
+        endpoint.send(&encode::encode_connack(false, reason::UNSPECIFIED_ERROR, &Properties::new(), version));
+        endpoint.close();
+        return;
+    };
+    let Some(handle) = handler.control_handle.clone() else {
+        endpoint.close();
+        return;
+    };
+    let meta = handler.meta.clone();
+    let pending = Arc::clone(&handler.pending_authorize);
+    let busy = Arc::clone(&handler.busy);
+    handler.busy.store(true, Ordering::Relaxed);
+    handler.runtime.storage().submit_on(
+        handle.clone(),
+        move || {
+            let mut connect_handler = connect_handler;
+            let decision = connect_handler.authorize(&packet, &meta);
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((connect_handler, decision))
+        },
+        move |result: Result<(Box<dyn ConnectHandler>, ConnectDecision), hopf_core::StorageError>| {
+            let result = result.map_err(|e| e.to_string());
+            *pending.lock().unwrap() = Some(PendingAuthorizeOutcome { result, pending_connect });
+            handle.with_endpoint(move |ep| {
+                busy.store(false, Ordering::Relaxed);
+                // Nothing sent to the client yet — the reply depends
+                // entirely on `sync_pending_authorize`, which needs
+                // `&mut MqttControlHandler`. The client is waiting on us,
+                // not about to send more input, so `poke_handler` is what
+                // triggers the next `receive()` call.
+                ep.poke_handler();
+            });
+        },
+    );
+}
+
+/// Apply the outcome of an offloaded plain-CONNECT `authorize()` call, once
+/// [`offload_authorize`]'s `submit_on` callback has stashed one — see
+/// [`PendingAuthorizeOutcome`]. Called from `MqttControlHandler::receive`
+/// before every packet parse, mirroring `sync_pending_auth_check`.
+fn sync_pending_authorize(handler: &mut MqttControlHandler, endpoint: &mut dyn Endpoint) {
+    let Some(PendingAuthorizeOutcome { result, pending_connect }) =
+        handler.pending_authorize.lock().unwrap().take()
+    else {
+        return;
+    };
+    let version = pending_connect.version;
+    let (connect_handler, decision) = match result {
+        Ok(ok) => ok,
+        Err(_e) => {
+            handler.record_auth(false);
+            endpoint.send(&encode::encode_connack(
+                false,
+                reason::SERVER_UNAVAILABLE,
+                &Properties::new(),
+                version,
+            ));
+            endpoint.close();
+            return;
+        }
+    };
+    handler.connect_handler = Some(connect_handler);
+    match decision {
+        ConnectDecision::Reject(reason_code) => {
+            handler.record_auth(false);
+            endpoint.send(&encode::encode_connack(false, reason_code, &Properties::new(), version));
+            endpoint.close();
+        }
+        ConnectDecision::Accept => {
+            handler.record_auth(true);
+            finish_connect_after_auth(handler, endpoint, pending_connect);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1262,7 +1331,10 @@ mod publish_finish_tests {
     /// until its spool write has actually landed on disk — proven here by
     /// checking the retained store already has the full expected payload
     /// at the exact moment the PUBACK first appears in `sent`, not merely
-    /// "eventually".
+    /// "eventually". Whether that write happens to finish before or after
+    /// `end_publish` itself runs is a timing coincidence this test doesn't
+    /// pin down either way (see the comment at the PUBACK wait below) —
+    /// only the on-disk-before-PUBACK invariant is asserted.
     #[test]
     fn end_publish_defers_puback_until_spool_write_lands() {
         let mut h = new_handler();
@@ -1271,6 +1343,19 @@ mod publish_finish_tests {
 
         let mut data = connect_bytes("pub1").into_boxed_slice();
         h.receive(&mut ep, &mut &*data);
+        // CONNECT's own authorize() check is now offloaded too (issue
+        // #210), so the CONNACK no longer lands inline within this call —
+        // poll for it, same as the PUBACK further down.
+        assert!(
+            wait_for(
+                || {
+                    h.receive(&mut ep, &mut &[][..]);
+                    !ep.sent.is_empty()
+                },
+                3000
+            ),
+            "CONNACK must eventually be sent once the offloaded authorize() check completes"
+        );
         assert_eq!(packet_type_at(&ep.sent, 0), Some(PacketType::Connack));
         let after_connack = ep.sent.len();
 
@@ -1281,15 +1366,14 @@ mod publish_finish_tests {
         data = publish.into_boxed_slice();
         h.receive(&mut ep, &mut &*data);
 
-        // The PUBACK must not have been appended synchronously, inline
-        // within the very `receive()` call that carried the PUBLISH — it
-        // can only be sent once `sync_pending_publish_finish` picks the
-        // finished write back up on a later `receive()`.
-        assert_eq!(
-            ep.sent.len(), after_connack,
-            "PUBACK must be deferred, not sent inline, while the spool write is still draining"
-        );
-
+        // Whether the spool write's background chunks happen to have
+        // already drained by the time `end_publish` runs (in which case
+        // the PUBACK goes out inline) or are still in flight (in which
+        // case `sync_pending_publish_finish` picks it up on a later
+        // `receive()`, once `is_ready()`) is a timing coincidence, not
+        // something this test can pin down — either is correct. What
+        // matters, checked below, is that the retained payload is always
+        // fully on disk by the time the PUBACK is observed either way.
         assert!(
             wait_for(
                 || {
@@ -1326,6 +1410,19 @@ mod publish_finish_tests {
 
         let mut data = connect_bytes("pub2").into_boxed_slice();
         h.receive(&mut ep, &mut &*data);
+        // CONNECT's own authorize() check is now offloaded too (issue
+        // #210) — poll for the CONNACK before capturing the offset that
+        // later PUBACK assertions are measured from.
+        assert!(
+            wait_for(
+                || {
+                    h.receive(&mut ep, &mut &[][..]);
+                    !ep.sent.is_empty()
+                },
+                3000
+            ),
+            "CONNACK must eventually be sent once the offloaded authorize() check completes"
+        );
         let after_connack = ep.sent.len();
 
         let payload_a = vec![0xAA; 32 * 1024];

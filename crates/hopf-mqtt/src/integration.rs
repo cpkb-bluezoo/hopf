@@ -626,6 +626,104 @@ fn second_connect_pipelined_behind_enhanced_auth_is_rejected() {
     drop(rt);
 }
 
+/// A plain (non-enhanced-AUTH) v3.1.1 CONNECT carrying `username`/
+/// `password` fields — takes `connect()`'s offloaded `ConnectHandler::
+/// authorize` path (issue #210), not `maybe_start_connect_auth`'s SASL
+/// exchange.
+fn v311_connect_packet_with_plain_auth(client_id: &str, user: &str, pass: &str) -> Vec<u8> {
+    encode::encode_connect(&ConnectPacket {
+        version: ProtocolVersion::V311,
+        clean_session: true,
+        keep_alive: 30,
+        properties: Properties::new(),
+        client_id: client_id.to_string(),
+        will: None,
+        username: Some(user.to_string()),
+        password: Some(pass.as_bytes().to_vec()),
+    })
+}
+
+/// A plain CONNECT's `ConnectHandler::authorize` call completes correctly
+/// end to end now that it runs off the reactor thread (issue #210) —
+/// regression guard proving the offload didn't break the
+/// synchronous-looking-from-the-wire behavior, for both a successful and a
+/// rejected check.
+#[test]
+fn plain_connect_authorize_offload_round_trips_accept_and_reject() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let broker = Arc::new(BrokerState::new());
+    let store: Arc<dyn hopf_auth::CredentialStore> =
+        Arc::new(hopf_auth::PasswordStore::new().with_user("alice", "secret"));
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).with_credentials(store);
+    let service = MqttService::new(config);
+    let addr = service.start(Arc::clone(&rt)).unwrap();
+
+    let mut good = wait_connect(addr);
+    good.write_all(&v311_connect_packet_with_plain_auth("client-good", "alice", "secret")).unwrap();
+    let connack = read_exact_timeout(&mut good, 4);
+    assert_eq!(connack[0], 0x20, "expected CONNACK fixed header byte: {connack:?}");
+    assert_eq!(connack[3], 0x00, "expected acceptance: {connack:?}");
+
+    let mut bad = wait_connect(addr);
+    bad.write_all(&v311_connect_packet_with_plain_auth("client-bad", "alice", "wrong")).unwrap();
+    let connack = read_exact_timeout(&mut bad, 4);
+    assert_eq!(connack[0], 0x20, "expected CONNACK fixed header byte: {connack:?}");
+    assert_ne!(connack[3], 0x00, "expected rejection: {connack:?}");
+    drop(rt);
+}
+
+/// A plain CONNECT's `authorize()` call runs off the reactor thread (issue
+/// #210). A second CONNECT pipelined right behind the first, in the same
+/// write, must be rejected — same busy-gate guard #181 established for
+/// enhanced AUTH's offloaded SASL step (see
+/// `second_connect_pipelined_behind_enhanced_auth_is_rejected`), now also
+/// covering this separate offload call site. `SlowStore` widens the
+/// offload's window so this is reliably observable rather than a timing
+/// coincidence.
+#[test]
+fn second_connect_pipelined_behind_plain_authorize_is_rejected() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let broker = Arc::new(BrokerState::new());
+    let store: Arc<dyn hopf_auth::CredentialStore> = Arc::new(SlowStore {
+        inner: hopf_auth::PasswordStore::new().with_user("alice", "secret"),
+        delay: Duration::from_millis(150),
+    });
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).with_credentials(store);
+    let service = MqttService::new(config);
+    let addr = service.start(Arc::clone(&rt)).unwrap();
+
+    let mut stream = wait_connect(addr);
+    let connect1 = v311_connect_packet_with_plain_auth("client-a", "alice", "secret");
+    let connect2 = v311_connect_packet_with_plain_auth("client-b", "alice", "secret");
+
+    let mut both = connect1;
+    both.extend_from_slice(&connect2);
+    stream.write_all(&both).unwrap();
+
+    let mut received = Vec::new();
+    loop {
+        let mut buf = [0u8; 64];
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                panic!(
+                    "connection neither closed nor produced a full reply within the read \
+                     timeout — expected a close after the rejected pipelined CONNECT: {received:?}"
+                );
+            }
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+    }
+    let connack_count = received.iter().zip(received.iter().skip(1)).filter(|&(&a, &b)| a == 0x20 && b == 0x03).count();
+    assert!(
+        connack_count <= 1,
+        "the pipelined second CONNECT must never be accepted as a new session \
+         (at most one CONNACK expected): {received:?}"
+    );
+    drop(rt);
+}
+
 /// Proves the point of threading `ConnHandle` through `hopf-websocket`
 /// (see [`crate::server::ws`]): a subscriber connected over WS and a publisher
 /// connected over plain TCP, sharing one [`BrokerState`], can reach each
