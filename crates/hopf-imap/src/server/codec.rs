@@ -507,18 +507,24 @@ fn parse_quoted(s: &str) -> Result<(String, &str), String> {
     if bytes.first() != Some(&b'"') {
         return Err("expected quoted".into());
     }
-    let mut out = String::new();
+    // Accumulate raw bytes and decode once at the end (matching the
+    // client-side reply parser) — pushing `bytes[i] as char` byte-by-byte
+    // corrupts any non-ASCII content, since a multi-byte UTF-8 sequence's
+    // bytes each get reinterpreted as an independent Latin-1 codepoint.
+    let mut out = Vec::new();
     let mut i = 1;
     while i < bytes.len() {
         if bytes[i] == b'"' {
-            return Ok((out, s[i + 1..].trim_start()));
+            let text =
+                String::from_utf8(out).map_err(|_| "invalid utf-8 in quoted string".to_string())?;
+            return Ok((text, s[i + 1..].trim_start()));
         }
         if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            out.push(bytes[i + 1] as char);
+            out.push(bytes[i + 1]);
             i += 2;
             continue;
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
     Err("unterminated quoted string".into())
@@ -1036,5 +1042,28 @@ mod tests {
         let (v, r) = split_verb(b"SELECT INBOX");
         assert_eq!(v, "SELECT");
         assert_eq!(String::from_utf8_lossy(&r), "INBOX");
+    }
+
+    /// Issue #195: a quoted string containing non-ASCII UTF-8 content must
+    /// decode intact, not get mangled by treating each byte of a
+    /// multi-byte sequence as an independent Latin-1 codepoint.
+    #[test]
+    fn parse_quoted_preserves_non_ascii_utf8() {
+        let (s, rest) = parse_astring("\"café\" REST").unwrap();
+        assert_eq!(s, "café");
+        assert_eq!(rest, "REST");
+    }
+
+    #[test]
+    fn parse_quoted_preserves_multibyte_and_emoji() {
+        let (s, rest) = parse_astring("\"日本語 🎉\" REST").unwrap();
+        assert_eq!(s, "日本語 🎉");
+        assert_eq!(rest, "REST");
+    }
+
+    #[test]
+    fn parse_quoted_still_handles_escapes_with_non_ascii() {
+        let (s, _) = parse_astring("\"caf\\\"é\\\\\"").unwrap();
+        assert_eq!(s, "caf\"é\\");
     }
 }
