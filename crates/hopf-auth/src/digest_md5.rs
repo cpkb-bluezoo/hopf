@@ -119,30 +119,30 @@ impl SaslServer for DigestMd5Server {
         true
     }
 
-    fn step(&mut self, client_response: Option<&[u8]>) -> SaslServerStep {
+    fn step(&mut self, client_response: Option<&[u8]>, cb: crate::session::Cb<SaslServerStep>) {
         if !self.sent {
             self.sent = true;
             let ch = generate_challenge(&self.realm, &self.nonce);
-            return SaslServerStep::Challenge(ch.into_bytes());
+            return cb(SaslServerStep::Challenge(ch.into_bytes()));
         }
         let Some(raw) = client_response else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
         let text = String::from_utf8_lossy(raw);
         let params = parse_params(&text);
         let Some(username) = params.get("username").cloned() else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
         let Some(ha1) = self.store.digest_ha1(&username, &self.realm) else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
-        match verify_client_response(&ha1, &self.nonce, &params) {
+        cb(match verify_client_response(&ha1, &self.nonce, &params) {
             Some(rspauth) => SaslServerStep::Complete {
                 username,
                 final_message: Some(format!("rspauth={rspauth}").into_bytes()),
             },
             None => SaslServerStep::Failure,
-        }
+        });
     }
 }
 

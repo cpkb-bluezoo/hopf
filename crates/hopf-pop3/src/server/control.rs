@@ -721,7 +721,19 @@ impl Pop3ControlHandler {
         self.runtime.storage().submit_on(
             handle.clone(),
             move || {
-                let step = server.step(response.as_deref());
+                // `step()` is callback-based (may complete inline, or hand
+                // off to e.g. an OAUTHBEARER introspection transport);
+                // bridge back to `submit_on`'s synchronous-`op` contract.
+                // This closure already runs on a storage-pool thread, never
+                // the reactor, so blocking here is exactly what
+                // `StorageExecutor` is for (issue #182).
+                let (tx, rx) = std::sync::mpsc::channel();
+                server.step(response.as_deref(), Box::new(move |step| {
+                    let _ = tx.send(step);
+                }));
+                let step = rx.recv().map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                    "SaslServer::step callback dropped without completing".into()
+                })?;
                 Ok((server, step))
             },
             move |result: Result<(Box<dyn SaslServer>, SaslServerStep), StorageError>| {

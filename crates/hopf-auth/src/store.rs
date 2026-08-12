@@ -69,6 +69,9 @@ pub struct CertificateIdentity {
     pub username: String,
 }
 
+/// One-shot completion callback — see [`CredentialStore::validate_bearer`].
+pub type Cb<T> = Box<dyn FnOnce(T) + Send>;
+
 /// Backend for SASL mechanisms and HTTP Digest (Gumdrop `Realm`).
 pub trait CredentialStore: Send + Sync {
     /// Mechanisms this store can drive.
@@ -104,10 +107,17 @@ pub trait CredentialStore: Send + Sync {
     /// SCRAM-SHA-256 credentials.
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials>;
 
-    /// OAUTHBEARER / HTTP Bearer.
-    fn validate_bearer(&self, token: &str) -> Option<TokenValidation> {
+    /// OAUTHBEARER / HTTP Bearer. Callback-based (unlike every other method
+    /// here) because a real implementation typically validates the token
+    /// against a remote introspection endpoint (RFC 7662) — see
+    /// [`crate::oauth_introspection::IntrospectionCredentialStore`] — and
+    /// must not block the caller's thread while that network round trip is
+    /// in flight. `cb` may be invoked either synchronously (before this
+    /// call returns, as the default and [`PasswordStore`]'s override do)
+    /// or later from another thread.
+    fn validate_bearer(&self, token: &str, cb: Cb<Option<TokenValidation>>) {
         let _ = token;
-        None
+        cb(None);
     }
 
     /// SASL EXTERNAL — `cert_key` is typically SHA-256 fingerprint hex or subject DN.
@@ -283,11 +293,11 @@ impl CredentialStore for PasswordStore {
         self.users.get(username).map(|u| u.scram.clone())
     }
 
-    fn validate_bearer(&self, token: &str) -> Option<TokenValidation> {
-        self.tokens.get(token).map(|u| TokenValidation {
+    fn validate_bearer(&self, token: &str, cb: Cb<Option<TokenValidation>>) {
+        cb(self.tokens.get(token).map(|u| TokenValidation {
             username: u.clone(),
             scopes: Vec::new(),
-        })
+        }));
     }
 
     fn authenticate_certificate(&self, cert_key: &str) -> Option<CertificateIdentity> {
@@ -295,6 +305,27 @@ impl CredentialStore for PasswordStore {
             username: u.clone(),
         })
     }
+}
+
+/// Bridges [`PasswordStore::validate_bearer`]'s callback back to a plain
+/// return value for [`TrustPolicy::evaluate`], which — unlike the SASL
+/// chain — has no offload machinery of its own to defer through. Safe
+/// **only** because `PasswordStore::validate_bearer` is a pure in-memory
+/// lookup that always invokes its callback before returning; this is not a
+/// general async-to-sync bridge and must not be reused for a
+/// `CredentialStore` whose `validate_bearer` can complete asynchronously
+/// (e.g. [`crate::oauth_introspection::IntrospectionCredentialStore`]).
+fn validate_bearer_sync(store: &PasswordStore, token: &str) -> Option<TokenValidation> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    store.validate_bearer(token, Box::new(move |r| {
+        let _ = tx.send(r);
+    }));
+    rx.try_recv().unwrap_or_else(|_| {
+        panic!(
+            "PasswordStore::validate_bearer completed asynchronously; \
+             TrustPolicy::evaluate's sync bridge assumption was violated"
+        )
+    })
 }
 
 impl TrustPolicy for PasswordStore {
@@ -308,7 +339,7 @@ impl TrustPolicy for PasswordStore {
                 }
             }
             IdentityMaterial::Bearer(token) => {
-                if self.validate_bearer(token).is_some() {
+                if validate_bearer_sync(self, token).is_some() {
                     TrustDecision::Accept
                 } else {
                     TrustDecision::Reject
@@ -355,8 +386,8 @@ impl CredentialStore for Arc<dyn CredentialStore> {
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
         (**self).scram_credentials(username)
     }
-    fn validate_bearer(&self, token: &str) -> Option<TokenValidation> {
-        (**self).validate_bearer(token)
+    fn validate_bearer(&self, token: &str, cb: Cb<Option<TokenValidation>>) {
+        (**self).validate_bearer(token, cb)
     }
     fn authenticate_certificate(&self, cert_key: &str) -> Option<CertificateIdentity> {
         (**self).authenticate_certificate(cert_key)

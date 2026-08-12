@@ -40,28 +40,28 @@ impl SaslServer for ExternalServer {
         SaslMechanism::External
     }
 
-    fn step(&mut self, client_response: Option<&[u8]>) -> SaslServerStep {
+    fn step(&mut self, client_response: Option<&[u8]>, cb: crate::session::Cb<SaslServerStep>) {
         let Some(cert_key) = self.cert_key.clone() else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
         let Some(id) = self.store.authenticate_certificate(&cert_key) else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
         let authzid = client_response
             .map(|b| String::from_utf8_lossy(b).into_owned())
             .unwrap_or_default();
         if !self.store.authorize_as(&id.username, &authzid) {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         }
         let username = if authzid.is_empty() {
             id.username
         } else {
             authzid
         };
-        SaslServerStep::Complete {
+        cb(SaslServerStep::Complete {
             username,
             final_message: None,
-        }
+        });
     }
 }
 

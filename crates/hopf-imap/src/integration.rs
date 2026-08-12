@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hopf_auth::{
-    CertificateIdentity, CredentialStore, PasswordStore, ScramCredentials, SaslMechanism,
+    CertificateIdentity, Cb, CredentialStore, PasswordStore, ScramCredentials, SaslMechanism,
     TokenValidation,
 };
 use hopf_core::{Endpoint, Runtime, RuntimeConfig};
@@ -189,8 +189,8 @@ impl CredentialStore for SlowStore {
     fn scram_credentials(&self, username: &str) -> Option<ScramCredentials> {
         self.inner.scram_credentials(username)
     }
-    fn validate_bearer(&self, token: &str) -> Option<TokenValidation> {
-        self.inner.validate_bearer(token)
+    fn validate_bearer(&self, token: &str, cb: Cb<Option<TokenValidation>>) {
+        self.inner.validate_bearer(token, cb)
     }
     fn authenticate_certificate(&self, cert_key: &str) -> Option<CertificateIdentity> {
         self.inner.authenticate_certificate(cert_key)
