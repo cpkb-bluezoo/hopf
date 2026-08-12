@@ -242,6 +242,12 @@ fn client_fetch_round_trip() {
 
     let fetch = Pop3Fetch::new()
         .credentials("alice", "secret")
+        // `PasswordStore` never retains a recoverable plaintext password
+        // (see its doc comment), so it can't verify APOP; `prefer_apop`
+        // defaults to true and the server always advertises a timestamp
+        // (issue #218), so without this the auto-pilot tries APOP first
+        // and fails before ever attempting USER/PASS.
+        .prefer_apop(false)
         .on_message(Box::new(CollectMessages(received2, Vec::new())))
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
@@ -276,6 +282,8 @@ fn client_fetch_delete_after_fetch() {
 
     let fetch = Pop3Fetch::new()
         .credentials("alice", "secret")
+        // See the comment on the same call in `client_fetch_round_trip`.
+        .prefer_apop(false)
         .delete_after_fetch(true)
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
@@ -342,6 +350,8 @@ fn client_empty_maildrop() {
 
     let fetch = Pop3Fetch::new()
         .credentials("bob", "pw")
+        // See the comment on the same call in `client_fetch_round_trip`.
+        .prefer_apop(false)
         .on_complete(Box::new(move |ok| {
             *done2.lock().unwrap() = Some(ok);
         }));
