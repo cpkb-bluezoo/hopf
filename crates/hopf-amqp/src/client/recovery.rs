@@ -26,6 +26,10 @@
 //!   an already-live connection — `AmqpClientControl` doesn't expose the
 //!   raw endpoint handle needed for that. Close a live connection from
 //!   within your own driver via [`AmqpClientControl::connection_close`].
+//!   Dropping the handle calls `close()` automatically (issue #208) — the
+//!   reconnect loop does not outlive it. Keep the handle alive (in your
+//!   own long-lived state, not just a temporary) for as long as you want
+//!   reconnection to keep happening.
 
 use std::collections::HashMap;
 use std::io;
@@ -1045,6 +1049,12 @@ impl AmqpRecoveringClient {
 }
 
 /// Handle returned by [`AmqpRecoveringClient::connect`].
+///
+/// Dropping this handle stops the reconnect loop (calls [`Self::close`]) —
+/// keep it alive in your own long-lived state for as long as you want
+/// reconnection to keep happening (issue #208: previously the reconnect
+/// loop outlived a dropped handle indefinitely, since the loop's own timer
+/// closure holds its own clone of the shared cancellation state).
 pub struct AmqpRecoveringHandle {
     closing: Arc<AtomicBool>,
     backoff_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
@@ -1055,11 +1065,21 @@ impl AmqpRecoveringHandle {
     /// wait, if one is in progress. Does **not** forcibly close an
     /// already-live connection (see the module docs) — close that from
     /// your own driver via [`AmqpClientControl::connection_close`].
+    ///
+    /// Also runs automatically when the handle is dropped — this method
+    /// remains useful for stopping reconnection early while still holding
+    /// the handle.
     pub fn close(&self) {
         self.closing.store(true, Ordering::Release);
         if let Some(cancel) = self.backoff_cancel.lock().unwrap().take() {
             cancel.store(true, Ordering::Release);
         }
+    }
+}
+
+impl Drop for AmqpRecoveringHandle {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 

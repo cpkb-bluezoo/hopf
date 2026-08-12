@@ -905,10 +905,15 @@ fn recovering_client_replays_topology_after_induced_disconnect() {
 
     let state = Arc::new(Mutex::new(RecoveryState::default()));
     let rt = Arc::new(Runtime::start(RuntimeConfig::default()).expect("runtime"));
-    AmqpRecoveringClient::new(AmqpClient::new(host, port).credentials(user, pass), Arc::clone(&rt))
-        .recovery_listener(Arc::new(RecoveryListenerCapture { state: Arc::clone(&state) }))
-        .connect(Arc::new(RecoveryFactory { queue, state: Arc::clone(&state) }))
-        .expect("connect");
+    // Bound to a variable and kept alive for the whole test (issue #208):
+    // AmqpRecoveringHandle now stops the reconnect loop on Drop, so an
+    // unbound temporary here would stop reconnection almost immediately —
+    // before the induced disconnect below even has a chance to trigger it.
+    let handle =
+        AmqpRecoveringClient::new(AmqpClient::new(host, port).credentials(user, pass), Arc::clone(&rt))
+            .recovery_listener(Arc::new(RecoveryListenerCapture { state: Arc::clone(&state) }))
+            .connect(Arc::new(RecoveryFactory { queue, state: Arc::clone(&state) }))
+            .expect("connect");
 
     let s = wait_for(
         &state,
@@ -920,6 +925,7 @@ fn recovering_client_replays_topology_after_induced_disconnect() {
     assert!(s.first_consume_ok);
     assert!(s.recovered, "RecoveryListener::on_recovered must fire");
     assert!(s.redelivered_after_recovery);
+    handle.close();
 }
 
 #[derive(Default, Clone)]
