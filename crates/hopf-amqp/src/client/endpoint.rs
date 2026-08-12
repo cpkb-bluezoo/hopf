@@ -266,6 +266,17 @@ impl AmqpClientEndpoint {
             FieldValue::longstr(env!("CARGO_PKG_VERSION")),
         );
         client_props.insert("platform".into(), FieldValue::longstr("Rust"));
+        // RabbitMQ only sends these broker-initiated notifications if the
+        // client declares support for them here — `on_consumer_cancelled`/
+        // `on_connection_blocked`/`on_connection_unblocked` are fully wired
+        // on the decode side (see `basic::CANCEL` / `connection.blocked`
+        // handling below) but were dead code without this: RabbitMQ was
+        // silently falling back to pre-extension behavior (no notification
+        // at all) instead of ever calling them.
+        let mut capabilities = FieldTable::new();
+        capabilities.insert("consumer_cancel_notify".into(), FieldValue::Bool(true));
+        capabilities.insert("connection.blocked".into(), FieldValue::Bool(true));
+        client_props.insert("capabilities".into(), FieldValue::Table(capabilities));
 
         let chosen = choose_mechanism(self.mechanism.as_deref(), &mechs)?;
 
