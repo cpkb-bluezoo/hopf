@@ -85,6 +85,7 @@ rcgen = "0.13"
 # QUIC transport state machine (mio/TPC glue in-tree; not the full `quinn` crate)
 quinn-proto = "0.11"
 tractrix = "0.2"
+self_cell = "1"
 rjsonparser = "0.1"
 rmimeparser = "0.4"
 rprotobuf = "0.1"

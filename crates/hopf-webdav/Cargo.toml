@@ -22,6 +22,7 @@ integration = []
 hopf-core = { workspace = true }
 hopf-http = { workspace = true }
 tractrix = { workspace = true }
+self_cell = { workspace = true }
 bytes = "1"
 getrandom = "0.2"
 sha2 = "0.10"
