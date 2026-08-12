@@ -4,7 +4,6 @@
 //! [`SmtpClient`], streamed from the spool to each destination.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -673,29 +672,17 @@ impl DeliveryContext {
         }
         send = match &self.spool_path {
             Some(path) if self.extra_header_lines.is_empty() => send.message_file(path.clone()),
-            Some(path) => {
-                let mut prefix = Some(render_extra_header_lines(&self.extra_header_lines));
-                let path = path.clone();
-                let mut file: Option<std::fs::File> = None;
-                let mut buf = [0u8; 8192];
-                send.message_with(move || {
-                    if let Some(p) = prefix.take() {
-                        return Some(p);
-                    }
-                    let f = match file.as_mut() {
-                        Some(f) => f,
-                        None => {
-                            file = std::fs::File::open(&path).ok();
-                            file.as_mut()?
-                        }
-                    };
-                    let n = f.read(&mut buf).ok()?;
-                    if n == 0 {
-                        return None;
-                    }
-                    Some(buf[..n].to_vec())
-                })
-            }
+            // Issue #212: previously routed through `message_with`, whose
+            // closure opened and read the spool file inline on the reactor
+            // thread — same class of blocking-I/O risk #184 fixed for the
+            // no-extra-headers case just above. `message_file_with_prefix`
+            // reuses that same offloaded file-read path, with the rendered
+            // extra header lines sent immediately ahead of the file's
+            // content.
+            Some(path) => send.message_file_with_prefix(
+                path.clone(),
+                render_extra_header_lines(&self.extra_header_lines),
+            ),
             None => send.message_empty(),
         };
 

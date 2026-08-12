@@ -70,6 +70,13 @@ struct SmtpSendState {
     recipients: Vec<(String, DsnRecipientParams)>,
     /// Message source (RFC 5322; will be dot-stuffed for DATA, raw for BDAT).
     message: MessageSource,
+    /// Small, already-in-memory bytes to send immediately ahead of `message`
+    /// when it's a [`MessageSource::File`] (issue #212 — e.g. a relay
+    /// prepending extra header lines ahead of a spooled body). Set via
+    /// [`SmtpSend::message_file_with_prefix`]; consumed by the same
+    /// offloaded read/send as the file itself, so it costs nothing extra
+    /// to include. Meaningless (never consulted) for any other source.
+    message_prefix: Option<Vec<u8>>,
     /// Lookahead chunk for BDAT LAST detection.
     bdat_lookahead: Option<Vec<u8>>,
     /// Require STARTTLS before sending (skip delivery if unavailable).
@@ -129,6 +136,7 @@ impl SmtpSend {
             mail_params: MailFromParams::default(),
             recipients: Vec::new(),
             message: MessageSource::default(),
+            message_prefix: None,
             bdat_lookahead: None,
             require_starttls: false,
             auth: None,
@@ -229,6 +237,22 @@ impl SmtpSend {
         self
     }
 
+    /// Like [`Self::message_file`], but with `prefix` — small,
+    /// already-in-memory bytes (e.g. a relay's extra header lines,
+    /// issue #212) — sent immediately ahead of the file's content. The
+    /// file itself is still streamed off the reactor thread exactly as
+    /// [`Self::message_file`] does (issue #184); `prefix` rides along in
+    /// that same offloaded unit of work rather than being read/sent
+    /// synchronously on the reactor thread the way a
+    /// [`Self::message_with`] closure would be.
+    pub fn message_file_with_prefix(self, path: impl Into<PathBuf>, prefix: Vec<u8>) -> Self {
+        let mut st = self.0.lock().unwrap();
+        st.message = MessageSource::File(path.into());
+        st.message_prefix = Some(prefix);
+        drop(st);
+        self
+    }
+
     /// Require STARTTLS; abort delivery if the server does not support it.
     pub fn require_starttls(self, require: bool) -> Self {
         self.0.lock().unwrap().require_starttls = require;
@@ -299,7 +323,11 @@ impl SmtpSendDriver {
     fn send_next_bdat_chunk(&self, data: &mut dyn SmtpClientMessageData, ep: &mut dyn Endpoint) {
         let mut st = self.state.lock().unwrap();
         if matches!(st.message, MessageSource::File(_) | MessageSource::Reading(_)) {
-            let known_current = st.bdat_lookahead.take();
+            // `message_prefix` (issue #212), if still set, is treated as an
+            // already-known first chunk exactly like a real BDAT lookahead
+            // would be — `offload_bdat_read` sends it as-is (BDAT chunks
+            // aren't dot-stuffed) ahead of reading the file.
+            let known_current = st.bdat_lookahead.take().or_else(|| st.message_prefix.take());
             drop(st);
             self.offload_bdat_read(ep, known_current);
             return;
@@ -767,6 +795,15 @@ impl SmtpClientDriver for SmtpSendDriver {
                 // (only reachable via `resume_pending_data`, since the
                 // storage callback only has a bare `ConnHandle`), so it
                 // runs there instead of inline below.
+                //
+                // `message_prefix` (issue #212), if set, is fed through the
+                // same `stuffer` first — its own dot-stuffing state must be
+                // continuous across the prefix→file boundary, and since the
+                // whole read is already offloaded here, folding the (small,
+                // already-in-memory) prefix into this same closure costs
+                // nothing extra rather than dot-stuffing it separately on
+                // the reactor thread.
+                let prefix = self.state.lock().unwrap().message_prefix.take();
                 let handle = ep.handle();
                 let handle_for_cb = handle.clone();
                 let state = Arc::clone(&self.state);
@@ -774,6 +811,11 @@ impl SmtpClientDriver for SmtpSendDriver {
                     handle,
                     move |h: &ConnHandle| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let mut stuffer = DotStuffer::new();
+                        if let Some(prefix) = prefix {
+                            let mut out = Vec::with_capacity(prefix.len() + 16);
+                            stuffer.feed(&prefix, &mut out);
+                            h.send(out);
+                        }
                         if let Ok(mut f) = File::open(&path) {
                             let mut buf = [0u8; 8192];
                             loop {
@@ -1167,6 +1209,135 @@ mod tests {
             second.starts_with(b"BDAT 808 LAST\r\n"),
             "second chunk must be the remaining 808 bytes, marked LAST: {:?}",
             &second[..second.len().min(40)]
+        );
+
+        feed(&mut client, &mut ep, b"250 2.0.0 Message accepted\r\n");
+        assert_eq!(*done.lock().unwrap(), Some(true));
+    }
+
+    /// Issue #212: a relay's extra header lines, prepended via
+    /// `message_file_with_prefix`, must appear before the (offloaded, dot-
+    /// stuffed) file content — and dot-stuffing state must carry
+    /// continuously across the prefix→file boundary, proven here by a file
+    /// that itself starts with a leading dot.
+    #[test]
+    fn message_file_with_prefix_prepends_prefix_ahead_of_dot_stuffed_file_content() {
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("msg.eml");
+        std::fs::write(&path, b".leading dot\r\nbody\r\n").unwrap();
+        let prefix = b"X-Relay-Added: yes\r\n".to_vec();
+
+        let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let done2 = Arc::clone(&done);
+        let send = SmtpSend::new("client.example")
+            .mail_from("a@example.com")
+            .rcpt_to("b@example.com")
+            .message_file_with_prefix(&path, prefix.clone())
+            .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
+
+        let mut client = SmtpClientEndpoint::new(
+            &send,
+            &rt,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            None,
+            None,
+        );
+        let mut ep = MockEndpoint::new();
+
+        client.connected(&mut ep);
+        feed(&mut client, &mut ep, b"220 test.example ESMTP\r\n");
+        feed(&mut client, &mut ep, b"250-test.example\r\n250 OK\r\n"); // EHLO — no PIPELINING/CHUNKING
+        feed(&mut client, &mut ep, b"250 OK\r\n"); // MAIL FROM
+        feed(&mut client, &mut ep, b"250 OK\r\n"); // RCPT TO
+        ep.shared.lock().unwrap().sent.clear();
+
+        feed_and_wait_until(
+            &mut client,
+            &mut ep,
+            b"354 Start mail input\r\n",
+            |sent| sent.ends_with(b".\r\n"),
+            2000,
+        );
+        let sent = ep.sent();
+        assert!(
+            sent.starts_with(&prefix),
+            "prefix must be sent first, ahead of the file content: {:?}",
+            String::from_utf8_lossy(&sent[..sent.len().min(64)])
+        );
+        assert!(
+            sent.windows(14).any(|w| w == b"\r\n..leading do"),
+            "leading dot in the file content (after the prefix) must still be stuffed: {:?}",
+            String::from_utf8_lossy(&sent)
+        );
+
+        feed(&mut client, &mut ep, b"250 2.0.0 Message accepted\r\n");
+        assert_eq!(*done.lock().unwrap(), Some(true));
+    }
+
+    /// Issue #212: for BDAT (no dot-stuffing), the prefix must arrive as
+    /// its own first chunk, verbatim, ahead of the file's content chunk(s).
+    #[test]
+    fn message_file_with_prefix_sent_as_first_bdat_chunk() {
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("msg.eml");
+        std::fs::write(&path, b"body content\r\n").unwrap();
+        let prefix = b"X-Relay-Added: yes\r\n".to_vec();
+
+        let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let done2 = Arc::clone(&done);
+        let send = SmtpSend::new("client.example")
+            .mail_from("a@example.com")
+            .rcpt_to("b@example.com")
+            .message_file_with_prefix(&path, prefix.clone())
+            .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
+
+        let mut client = SmtpClientEndpoint::new(
+            &send,
+            &rt,
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            None,
+            None,
+        );
+        let mut ep = MockEndpoint::new();
+
+        client.connected(&mut ep);
+        feed(&mut client, &mut ep, b"220 test.example ESMTP\r\n");
+        feed(&mut client, &mut ep, b"250-test.example\r\n250 CHUNKING\r\n"); // EHLO — advertise CHUNKING
+        feed(&mut client, &mut ep, b"250 OK\r\n"); // MAIL FROM
+        ep.shared.lock().unwrap().sent.clear();
+
+        let expected_first = format!("BDAT {}\r\n", prefix.len());
+        feed_and_wait_until(
+            &mut client,
+            &mut ep,
+            b"250 OK\r\n",
+            |sent| sent.starts_with(expected_first.as_bytes()),
+            2000,
+        );
+        let first = ep.sent();
+        assert!(
+            first.ends_with(&prefix),
+            "first BDAT chunk must be exactly the prefix, unstuffed: {:?}",
+            String::from_utf8_lossy(&first)
+        );
+        ep.shared.lock().unwrap().sent.clear();
+
+        feed_and_wait_until(
+            &mut client,
+            &mut ep,
+            b"250 OK\r\n",
+            |sent| sent.starts_with(b"BDAT 14 LAST\r\n"),
+            2000,
+        );
+        let second = ep.sent();
+        assert!(
+            second.ends_with(b"body content\r\n"),
+            "second BDAT chunk must be the file content, marked LAST: {:?}",
+            String::from_utf8_lossy(&second)
         );
 
         feed(&mut client, &mut ep, b"250 2.0.0 Message accepted\r\n");
