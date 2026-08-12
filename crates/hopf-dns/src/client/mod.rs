@@ -382,6 +382,14 @@ pub struct DnsResolver {
 impl DnsResolver {
     /// Create an unopened resolver bound to a reactor handle.
     pub fn new(reactor: ReactorHandle) -> Self {
+        // Populate the process-wide hosts-file cache now, on whatever
+        // thread constructs this resolver (by convention always a setup
+        // thread, never the reactor — every call site in this workspace
+        // constructs resolvers right after `Runtime::start`/
+        // `pick_worker`). Without this, the first `HostsFile::lookup()`
+        // miss would block synchronously on `/etc/hosts` later, from
+        // inside `query_with_cd` (issue #183).
+        HostsFile::warm();
         Self {
             inner: Arc::new(Mutex::new(ResolverInner {
                 reactor,
@@ -708,16 +716,19 @@ impl DnsResolver {
     /// request through to upstream validation.
     pub fn query_with_cd(&self, question: DnsQuestion, cd: bool, cb: QueryCallback) {
         let _ = self.open();
-        let mut g = self.inner.lock().unwrap();
-        // Hosts file / literals
+        // Hosts file / literals — checked before acquiring `self.inner`'s
+        // lock (issue #183): a cache-miss here falls through to
+        // `HostsFile::load_hosts`'s blocking `/etc/hosts` read, which must
+        // not happen while holding the mutex that serializes every other
+        // in-flight query against this resolver.
         if let Some(addrs) = hosts_answers(&question) {
             let mut msg = DnsMessage::query(0, question.clone(), true);
             msg.flags |= crate::wire::FLAG_QR | crate::wire::FLAG_RA;
             msg.answers = addrs;
-            drop(g);
             cb(Ok(msg));
             return;
         }
+        let mut g = self.inner.lock().unwrap();
         if g.cache.is_negatively_cached(&question.name) {
             let mut msg = DnsMessage::query(0, question, true);
             msg.flags |= crate::wire::FLAG_QR;
