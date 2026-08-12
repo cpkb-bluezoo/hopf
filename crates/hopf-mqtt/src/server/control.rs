@@ -196,6 +196,11 @@ pub struct MqttControlHandler {
     /// (`busy` above) as the enhanced-AUTH SASL step offload, since only
     /// one of the two ever runs for a given CONNECT.
     pub(crate) pending_authorize: Arc<Mutex<Option<PendingAuthorizeOutcome>>>,
+    /// See [`PendingConnackOutcome`] (issue #216) — no busy-gate needed:
+    /// by the time this is set, `session` is already `Connected`, which
+    /// `connect()`'s existing guard rejects a second CONNECT against
+    /// regardless.
+    pub(crate) pending_connack: Arc<Mutex<Option<PendingConnackOutcome>>>,
     /// PUBLISHes whose `end_publish` ran before their spool write finished
     /// draining (issue #187) — `sync_pending_publish_finish` completes
     /// each once ready, triggered by the last chunk's `poke_handler` call
@@ -258,6 +263,7 @@ impl MqttControlHandler {
             busy: Arc::new(AtomicBool::new(false)),
             pending_auth_check: Arc::new(Mutex::new(None)),
             pending_authorize: Arc::new(Mutex::new(None)),
+            pending_connack: Arc::new(Mutex::new(None)),
             pending_publish_finishes: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -403,6 +409,7 @@ impl ProtocolHandler for MqttControlHandler {
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         crate::server::auth::sync_pending_auth_check(self, endpoint);
         sync_pending_authorize(self, endpoint);
+        sync_pending_connack(self, endpoint);
         sync_pending_publish_finish(self, endpoint);
         // `Ctx` borrows `self` for the duration of the callbacks, so the
         // parser driving those callbacks can't live inside `self` while
@@ -1116,7 +1123,49 @@ pub(crate) fn finish_connect_after_auth(
     }));
 
     if session_present {
-        handler.config.broker.drain_offline(subscriber_id);
+        // Issue #216: the offline-queue read can block for a file-backed
+        // store, so it's offloaded — CONNACK (and arming the retransmit
+        // timer) waits for it via `pending_connack`/`sync_pending_connack`,
+        // same deferred-reply shape as #185/#187/#210. A second CONNECT
+        // can't race this window: `handler.session` is already `Connected`
+        // by this point, which `connect()`'s existing guard already rejects
+        // regardless of any busy flag.
+        let outcome = PendingConnackOutcome {
+            session_present,
+            receive_maximum: pc.receive_maximum,
+            session_expiry_secs: pc.session_expiry_secs,
+            server_topic_alias_max,
+            version,
+        };
+        match handler.control_handle.clone() {
+            Some(conn_handle) => {
+                let pending = Arc::clone(&handler.pending_connack);
+                let poke_handle = conn_handle.clone();
+                handler.config.broker.drain_offline_async(
+                    subscriber_id,
+                    conn_handle,
+                    Box::new(move || {
+                        *pending.lock().unwrap() = Some(outcome);
+                        poke_handle.with_endpoint(|ep| ep.poke_handler());
+                    }),
+                );
+                return;
+            }
+            None => {
+                // No handle to route the offloaded read's completion
+                // through (shouldn't happen — set in `connected()` before
+                // any CONNECT can be processed) — fail closed rather than
+                // silently skipping the offline drain.
+                endpoint.send(&encode::encode_connack(
+                    false,
+                    reason::UNSPECIFIED_ERROR,
+                    &Properties::new(),
+                    version,
+                ));
+                endpoint.close();
+                return;
+            }
+        }
     }
     arm_retransmit_timer(handler, endpoint);
 
@@ -1126,6 +1175,41 @@ pub(crate) fn finish_connect_after_auth(
         pc.session_expiry_secs,
         server_topic_alias_max,
     );
+    endpoint.send(&encode::encode_connack(session_present, 0, &connack_props, version));
+}
+
+/// Result of an offloaded offline-queue drain (issue #216), stashed by
+/// [`crate::server::broker::BrokerState::drain_offline_async`]'s completion
+/// closure for [`sync_pending_connack`] to apply once back on the reactor
+/// — everything `finish_connect_after_auth`'s tail (arm the retransmit
+/// timer, send CONNACK) used to do inline once `drain_offline` returned.
+pub(crate) struct PendingConnackOutcome {
+    session_present: bool,
+    receive_maximum: u16,
+    session_expiry_secs: u32,
+    server_topic_alias_max: u16,
+    version: ProtocolVersion,
+}
+
+/// Apply the outcome of an offloaded offline-queue drain, once
+/// `drain_offline_async`'s completion closure has stashed one — see
+/// [`PendingConnackOutcome`]. Called from `MqttControlHandler::receive`
+/// before every packet parse, mirroring `sync_pending_auth_check`/
+/// `sync_pending_authorize`.
+fn sync_pending_connack(handler: &mut MqttControlHandler, endpoint: &mut dyn Endpoint) {
+    let Some(PendingConnackOutcome {
+        session_present,
+        receive_maximum,
+        session_expiry_secs,
+        server_topic_alias_max,
+        version,
+    }) = handler.pending_connack.lock().unwrap().take()
+    else {
+        return;
+    };
+    arm_retransmit_timer(handler, endpoint);
+    let connack_props =
+        connack_properties(version, receive_maximum, session_expiry_secs, server_topic_alias_max);
     endpoint.send(&encode::encode_connack(session_present, 0, &connack_props, version));
 }
 
