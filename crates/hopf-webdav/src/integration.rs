@@ -244,6 +244,45 @@ fn propfind_depth_infinity_respects_tree_entry_cap() {
     rt.shutdown();
 }
 
+/// Issue #193: a multistatus response with several resources streams out
+/// via chunked transfer-encoding (one `response_body_content` call per
+/// `<D:response>`) instead of being buffered whole behind a
+/// `Content-Length` — proven both by the framing (chunked, no
+/// Content-Length) and by every resource still round-tripping correctly.
+#[test]
+fn propfind_streams_multiple_chunks_for_many_resources() {
+    let dir = tempdir().unwrap();
+    for i in 0..8 {
+        std::fs::write(dir.path().join(format!("f{i}.txt")), b"x").unwrap();
+    }
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+    let body = "<?xml version=\"1.0\"?><D:propfind xmlns:D=\"DAV:\"><D:propname/></D:propfind>";
+    let req = format!(
+        "PROPFIND / HTTP/1.1\r\nHost: localhost\r\nDepth: 1\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let resp = http_exchange(addr, &req);
+    assert!(resp.contains("207"), "PROPFIND status: {resp:?}");
+    assert!(
+        resp.to_ascii_lowercase().contains("transfer-encoding: chunked"),
+        "large multistatus responses must stream via chunked transfer-encoding, \
+         not a single Content-Length body: {resp:?}"
+    );
+    assert!(
+        !resp.to_ascii_lowercase().contains("content-length:"),
+        "a chunked response must not also carry Content-Length: {resp:?}"
+    );
+    // root collection + 8 files = 9 <D:response> elements, each delivered
+    // as its own chunk.
+    assert_eq!(
+        resp.matches("<D:response>").count(),
+        9,
+        "expected one <D:response> per resource: {resp:?}"
+    );
+    rt.shutdown();
+}
+
 fn lock_body_exclusive() -> &'static str {
     "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
      <D:lockinfo xmlns:D=\"DAV:\">\

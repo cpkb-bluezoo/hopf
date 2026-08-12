@@ -904,6 +904,17 @@ impl WebDavHandler {
         });
     }
 
+    /// Streams the multistatus document out as each resource's `<response>`
+    /// is generated (issue #193), rather than buffering the whole thing
+    /// into one `Vec<u8>` before sending anything — the response is
+    /// chunked (no upfront `Content-Length`, since the total size isn't
+    /// known ahead of time), one `response_body_content` call per resource.
+    /// Runs entirely off the reactor thread, same as every other handler
+    /// here (`self.storage.submit_on`), but delivers incrementally via
+    /// repeated `ServerResponseHandle::execute` calls rather than
+    /// `offload`'s single result-then-done shape — `execute` calls made in
+    /// order from the same (storage) thread land on the reactor in that
+    /// same order, which is what keeps the chunks correctly sequenced.
     fn handle_propfind(&mut self, w: &mut dyn ServerWriter, parsed: WebDavParsed) {
         let pf = parsed.propfind.unwrap_or_default();
         let path = self.path.clone();
@@ -917,48 +928,92 @@ impl WebDavHandler {
         let content_language = self.config.content_language.clone();
         let max_tree_entries = self.config.max_tree_entries;
 
-        self.offload(w, move || {
-            let Some(lex) = path else {
-                return Ok(PropfindOutcome::Status(404));
-            };
-            let Some(resolved) = canonicalize_path(&root, &canonical, &lex) else {
-                return Ok(PropfindOutcome::Status(404));
-            };
-            if !resolved.exists() || is_sidecar_file(&resolved) {
-                return Ok(PropfindOutcome::Status(404));
-            }
-            let resources =
-                match collect_propfind_resources(&resolved, &request_path, depth, max_tree_entries)
-                {
-                    Ok(r) => r,
-                    Err(code) => return Ok(PropfindOutcome::Status(code)),
+        let rh = w.response_handle();
+        let rh_for_reject = rh.clone();
+        let conn = rh.conn_handle().clone();
+        self.storage.submit_on(
+            conn,
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let Some(lex) = path else {
+                    rh.execute(|writer| Self::send_error(writer, 404));
+                    return Ok(());
                 };
-            let mut ms = MultistatusWriter::new();
-            for (rpath, rhref) in resources {
-                ms.response(&rhref, |r| {
-                    r.propstat("HTTP/1.1 200 OK", |w| {
-                        append_propfind_props(
-                            w,
-                            &pf,
-                            &rpath,
-                            &rhref,
-                            &types,
-                            &lock_mgr,
-                            &mut store,
-                            content_language.as_deref(),
-                        )
-                            .map_err(|c| {
-                                io::Error::new(io::ErrorKind::Other, format!("propfind {c}"))
-                            })
+                let Some(resolved) = canonicalize_path(&root, &canonical, &lex) else {
+                    rh.execute(|writer| Self::send_error(writer, 404));
+                    return Ok(());
+                };
+                if !resolved.exists() || is_sidecar_file(&resolved) {
+                    rh.execute(|writer| Self::send_error(writer, 404));
+                    return Ok(());
+                }
+                let resources =
+                    match collect_propfind_resources(&resolved, &request_path, depth, max_tree_entries)
+                    {
+                        Ok(r) => r,
+                        Err(code) => {
+                            rh.execute(move |writer| Self::send_error(writer, code));
+                            return Ok(());
+                        }
+                    };
+
+                rh.execute(|writer| {
+                    let mut h = Headers::new();
+                    h.status(207);
+                    h.set("Content-Type", CONTENT_TYPE_XML);
+                    writer.headers(h);
+                    writer.start_response_body();
+                });
+
+                let mut ms = MultistatusWriter::new();
+                for (rpath, rhref) in resources {
+                    ms.response(&rhref, |r| {
+                        r.propstat("HTTP/1.1 200 OK", |w| {
+                            append_propfind_props(
+                                w,
+                                &pf,
+                                &rpath,
+                                &rhref,
+                                &types,
+                                &lock_mgr,
+                                &mut store,
+                                content_language.as_deref(),
+                            )
+                                .map_err(|c| {
+                                    io::Error::new(io::ErrorKind::Other, format!("propfind {c}"))
+                                })
+                        })
                     })
-                })
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            }
-            Ok(PropfindOutcome::Body(ms.finish()))
-        }, |out, writer| match out {
-            PropfindOutcome::Status(c) => Self::send_error(writer, c),
-            PropfindOutcome::Body(body) => Self::send_bytes(writer, 207, CONTENT_TYPE_XML, &body),
-        });
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    let chunk = ms.take_written();
+                    if !chunk.is_empty() {
+                        rh.execute(move |writer| writer.response_body_content(&chunk));
+                    }
+                }
+                let tail = ms.finish();
+                rh.execute(move |writer| {
+                    if !tail.is_empty() {
+                        writer.response_body_content(&tail);
+                    }
+                    writer.end_response_body();
+                    writer.complete();
+                });
+                Ok(())
+            },
+            move |result: Result<(), StorageError>| {
+                // Every success/error response was already delivered via
+                // `rh.execute` above, during `op`'s own execution — except
+                // `Rejected` (storage queue full), which fires *before*
+                // `op` ever runs, so nothing has been sent yet and it's
+                // still safe to reply here. A `Task` error (the closure
+                // itself panicked) could happen after streaming has
+                // already started, with no safe way to downgrade an
+                // in-progress chunked response to an error status — same
+                // as any other framework streaming a body in pieces.
+                if let Err(StorageError::Rejected) = result {
+                    rh_for_reject.execute(|writer| Self::send_error(writer, 503));
+                }
+            },
+        );
     }
 
     fn check_mutating_preconditions(&self, w: &mut dyn ServerWriter) -> bool {
@@ -991,11 +1046,6 @@ enum DeleteOutcome {
 }
 
 enum ProppatchOutcome {
-    Status(u16),
-    Body(Vec<u8>),
-}
-
-enum PropfindOutcome {
     Status(u16),
     Body(Vec<u8>),
 }
