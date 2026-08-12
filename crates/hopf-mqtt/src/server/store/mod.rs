@@ -45,6 +45,26 @@ pub trait MqttMessageStore: Send + Sync {
     /// Drain every queued message for `subscriber` (session resumed).
     fn take_offline(&self, subscriber: SubscriberId) -> Vec<QueuedMessage>;
 
+    /// Async, offload-capable alternative to [`Self::take_offline`] for a
+    /// store whose read can block (issue #216 — e.g. a file-backed store).
+    /// `handle` is the resuming connection's own `ConnHandle`; an
+    /// implementation that actually offloads uses it to route `done` back
+    /// to that connection's reactor thread rather than an unrelated one.
+    ///
+    /// Default implementation just calls the synchronous
+    /// [`Self::take_offline`] and invokes `done` immediately — correct
+    /// as-is for a store (like [`InMemoryMessageStore`]) with no blocking
+    /// I/O to speak of, so implementing this is opt-in.
+    fn take_offline_async(
+        &self,
+        subscriber: SubscriberId,
+        handle: ConnHandle,
+        done: Box<dyn FnOnce(Vec<QueuedMessage>) + Send>,
+    ) {
+        let _ = handle;
+        done(self.take_offline(subscriber));
+    }
+
     /// Drop offline state when a session is fully torn down.
     fn clear_offline(&self, subscriber: SubscriberId);
 
@@ -142,6 +162,27 @@ impl MqttMessageStore for InMemoryMessageStore {
 enum StoreJob {
     Append(QueuedMessage),
     ClearFile,
+    /// Issue #216: routed through the same per-subscriber ordering as
+    /// `Append`/`ClearFile` rather than read out-of-band, so it's
+    /// guaranteed to run after every job already queued for this
+    /// subscriber at the time it's submitted — closing the residual race
+    /// the old synchronous `take_offline` could only narrow (a job
+    /// already mid-flight when it ran could still land after it).
+    TakeOffline {
+        subscriber: SubscriberId,
+        inner: Arc<InMemoryMessageStore>,
+        handle: ConnHandle,
+        done: Box<dyn FnOnce(Vec<QueuedMessage>) + Send>,
+    },
+}
+
+/// What a [`StoreJob`] handed back once its storage-pool `op` completes —
+/// `Append`/`ClearFile` have nothing to report; `TakeOffline` carries its
+/// result forward to [`drain_next_store_job`]'s completion closure, which
+/// runs `done` before draining the next job.
+enum StoreJobOutcome {
+    None,
+    TakeOffline(Vec<QueuedMessage>, Box<dyn FnOnce(Vec<QueuedMessage>) + Send>),
 }
 
 /// Per-subscriber ordered queue of pending [`StoreJob`]s — separate from
@@ -170,23 +211,26 @@ struct SubQueue {
 /// `drain_next_publish_chunk`, just keyed by subscriber instead of having
 /// one queue per connection.
 ///
-/// `take_offline`'s disk read stays synchronous — its
-/// `-> Vec<QueuedMessage>` return value is needed immediately by
-/// `BrokerState::drain_offline`, which can't be made fire-and-forget the
-/// way the write side can without changing this trait's signature (a
-/// separable, larger piece of work — see the issue #187 follow-up). Taking
-/// `queues`' not-yet-started jobs for that subscriber narrows, but doesn't
-/// fully close, the resulting race against a job already in flight at the
-/// exact moment of a resume (see [`Self::take_offline`]).
+/// [`Self::take_offline`] (the `MqttMessageStore` trait's required
+/// synchronous method) still reads the disk inline — kept for API
+/// compatibility and any caller without a `ConnHandle` to offload against.
+/// [`MqttMessageStore::take_offline_async`] (issue #216) is the offload-
+/// capable path `BrokerState::drain_offline` actually uses: it queues a
+/// `StoreJob::TakeOffline` job on the *same* per-subscriber ordering as
+/// `Append`/`ClearFile`, so it's guaranteed to run after every job already
+/// queued for that subscriber — closing the race the synchronous version's
+/// "clear not-yet-started jobs" workaround could only narrow.
 pub struct FileBackedMessageStore {
     root: PathBuf,
-    inner: InMemoryMessageStore,
+    inner: Arc<InMemoryMessageStore>,
     queues: Mutex<HashMap<SubscriberId, Arc<Mutex<SubQueue>>>>,
     runtime: Arc<Runtime>,
-    /// Routing target for offloaded jobs' `submit_on` callbacks — no live
-    /// connection is ever relevant to this store's own bookkeeping, so a
-    /// task-only handle (`submit_on`'s callback dispatch only ever calls
-    /// `ConnHandle::execute` on it, never `with_endpoint`) is enough.
+    /// Routing target for `Append`/`ClearFile` jobs' `submit_on` callbacks
+    /// — no live connection is relevant to those, so a task-only handle
+    /// (`submit_on`'s callback dispatch only ever calls `ConnHandle::execute`
+    /// on it, never `with_endpoint`) is enough. A `TakeOffline` job instead
+    /// carries its own caller-supplied handle (see [`StoreJob::TakeOffline`])
+    /// so its completion reaches the resuming connection's own reactor.
     detached: ConnHandle,
 }
 
@@ -198,7 +242,7 @@ impl FileBackedMessageStore {
         fs::create_dir_all(&root)?;
         Ok(Self {
             root,
-            inner: InMemoryMessageStore::new(),
+            inner: Arc::new(InMemoryMessageStore::new()),
             queues: Mutex::new(HashMap::new()),
             runtime,
             detached: ConnHandle::from_execute(Arc::new(|task| task())),
@@ -327,7 +371,12 @@ impl FileBackedMessageStore {
 /// failed append) doesn't stop later queued jobs — each is an independent
 /// unit (a distinct message, or a clear), unlike an ordered spool write
 /// where one chunk's failure invalidates the rest of the same file.
-fn drain_next_store_job(path: PathBuf, state: Arc<Mutex<SubQueue>>, runtime: Arc<Runtime>, handle: ConnHandle) {
+///
+/// `detached` is the store's generic, connection-agnostic handle, used to
+/// dispatch `Append`/`ClearFile` jobs (issue #216: a `TakeOffline` job
+/// carries its own caller-supplied handle instead, so its completion
+/// reaches the *resuming* connection's reactor, not an arbitrary one).
+fn drain_next_store_job(path: PathBuf, state: Arc<Mutex<SubQueue>>, runtime: Arc<Runtime>, detached: ConnHandle) {
     let job = {
         let mut g = state.lock().unwrap();
         match g.queue.pop_front() {
@@ -340,21 +389,47 @@ fn drain_next_store_job(path: PathBuf, state: Arc<Mutex<SubQueue>>, runtime: Arc
     };
     let cb_state = Arc::clone(&state);
     let cb_runtime = Arc::clone(&runtime);
-    let cb_handle = handle.clone();
+    let cb_detached = detached.clone();
     let op_path = path.clone();
+    let dispatch_handle = match &job {
+        StoreJob::TakeOffline { handle, .. } => handle.clone(),
+        _ => detached.clone(),
+    };
     runtime.storage().submit_on(
-        handle,
-        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        dispatch_handle,
+        move || -> Result<StoreJobOutcome, Box<dyn std::error::Error + Send + Sync>> {
             match job {
-                StoreJob::Append(msg) => FileBackedMessageStore::append_file(&op_path, &msg)?,
+                StoreJob::Append(msg) => {
+                    FileBackedMessageStore::append_file(&op_path, &msg)?;
+                    Ok(StoreJobOutcome::None)
+                }
                 StoreJob::ClearFile => {
                     let _ = fs::remove_file(&op_path);
+                    Ok(StoreJobOutcome::None)
+                }
+                StoreJob::TakeOffline { subscriber, inner, handle: _, done } => {
+                    let from_disk = FileBackedMessageStore::read_all(&op_path).unwrap_or_default();
+                    let _ = fs::remove_file(&op_path);
+                    // Ordering guarantees this job runs only after every
+                    // `Append` queued ahead of it for this subscriber has
+                    // already landed on disk — so `from_disk` is already a
+                    // superset of whatever this session put in `inner`
+                    // (the old synchronous `take_offline` needed to merge
+                    // both because its "clear not-yet-started jobs" trick
+                    // could leave memory ahead of disk; ordering removes
+                    // that gap entirely). `inner`'s copy is still drained
+                    // here — discarding the result, not merging it — so it
+                    // doesn't linger and get double-delivered next time.
+                    let _ = inner.take_offline(subscriber);
+                    Ok(StoreJobOutcome::TakeOffline(from_disk, done))
                 }
             }
-            Ok(())
         },
-        move |_result: Result<(), StorageError>| {
-            drain_next_store_job(path, cb_state, cb_runtime, cb_handle);
+        move |result: Result<StoreJobOutcome, StorageError>| {
+            if let Ok(StoreJobOutcome::TakeOffline(msgs, done)) = result {
+                done(msgs);
+            }
+            drain_next_store_job(path, cb_state, cb_runtime, cb_detached);
         },
     );
 }
@@ -395,14 +470,15 @@ impl MqttMessageStore for FileBackedMessageStore {
         self.inner.enqueue_offline(subscriber, msg);
     }
 
-    /// Disk read stays synchronous here — see the type-level doc comment
-    /// for why, and for the residual race this narrows but doesn't fully
-    /// close. Discarding this subscriber's not-yet-started queued jobs
-    /// keeps any of them from resurrecting the file (with an already-
-    /// in-memory-covered message) after it's removed here; a job already
-    /// mid-flight on a storage thread at this exact moment can still race
-    /// it — closing that needs `take_offline` itself to go through the
-    /// same queue, which is the deferred follow-up work.
+    /// Synchronous fallback, kept for API compatibility with callers that
+    /// have no `ConnHandle` to offload against — `BrokerState::drain_offline`
+    /// uses [`Self::take_offline_async`] instead (issue #216). Discarding
+    /// this subscriber's not-yet-started queued jobs keeps any of them from
+    /// resurrecting the file (with an already-in-memory-covered message)
+    /// after it's removed here; a job already mid-flight on a storage
+    /// thread at this exact moment can still race it — the async path
+    /// doesn't have this gap, since it's ordered *through* the same queue
+    /// rather than racing it.
     fn take_offline(&self, subscriber: SubscriberId) -> Vec<QueuedMessage> {
         if let Some(state) = self.queues.lock().unwrap().get(&subscriber) {
             state.lock().unwrap().queue.clear();
@@ -417,6 +493,27 @@ impl MqttMessageStore for FileBackedMessageStore {
             from_mem.extend(from_disk);
             from_mem
         }
+    }
+
+    /// Issue #216: reads the disk off the reactor thread, ordered against
+    /// this subscriber's pending `Append`/`ClearFile` jobs by running on
+    /// the same [`SubQueue`] rather than racing it — see the type-level
+    /// doc comment.
+    fn take_offline_async(
+        &self,
+        subscriber: SubscriberId,
+        handle: ConnHandle,
+        done: Box<dyn FnOnce(Vec<QueuedMessage>) + Send>,
+    ) {
+        self.submit_job(
+            subscriber,
+            StoreJob::TakeOffline {
+                subscriber,
+                inner: Arc::clone(&self.inner),
+                handle,
+                done,
+            },
+        );
     }
 
     fn clear_offline(&self, subscriber: SubscriberId) {
@@ -551,6 +648,101 @@ mod file_backed_tests {
             "append + clear jobs must eventually drain"
         );
         assert!(!store.path_for(id).exists(), "clear must run after the appends it was queued behind");
+    }
+
+    /// Issue #216: `take_offline_async` reads the disk off the reactor
+    /// thread and still recovers messages already drained there in an
+    /// earlier process (`InMemoryMessageStore`'s copy alone wouldn't
+    /// have them — only the disk read does).
+    #[test]
+    fn take_offline_async_reads_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Arc::new(Runtime::start(hopf_core::RuntimeConfig::default()).unwrap());
+        let store = FileBackedMessageStore::new(dir.path(), Arc::clone(&rt)).unwrap();
+        let id = SubscriberId(11);
+
+        for i in 0..5 {
+            store.enqueue_offline(
+                id,
+                queued_message(&format!("t/{i}"), b"x", QoS::AtLeastOnce, false, &Properties::new()),
+            );
+        }
+        assert!(
+            wait_for(
+                || {
+                    let state = store.queue_for(id);
+                    let g = state.lock().unwrap();
+                    !g.draining && g.queue.is_empty()
+                },
+                3000
+            ),
+            "appends must land on disk before the take_offline_async below"
+        );
+        assert!(store.path_for(id).exists(), "sanity: appends also landed on disk");
+        for i in 5..10 {
+            store.enqueue_offline(
+                id,
+                queued_message(&format!("t/{i}"), b"x", QoS::AtLeastOnce, false, &Properties::new()),
+            );
+        }
+        assert!(
+            wait_for(
+                || {
+                    let state = store.queue_for(id);
+                    let g = state.lock().unwrap();
+                    !g.draining && g.queue.is_empty()
+                },
+                3000
+            ),
+            "second batch of appends must also land"
+        );
+
+        let handle = ConnHandle::from_execute(Arc::new(|task| task()));
+        let result: Arc<Mutex<Option<Vec<QueuedMessage>>>> = Arc::new(Mutex::new(None));
+        let result2 = Arc::clone(&result);
+        store.take_offline_async(id, handle, Box::new(move |msgs| *result2.lock().unwrap() = Some(msgs)));
+
+        assert!(
+            wait_for(|| result.lock().unwrap().is_some(), 3000),
+            "take_offline_async must eventually call done"
+        );
+        let msgs = result.lock().unwrap().take().unwrap();
+        let topics: std::collections::HashSet<String> = msgs.iter().map(|m| m.topic.clone()).collect();
+        let expected: std::collections::HashSet<String> = (0..10).map(|i| format!("t/{i}")).collect();
+        assert_eq!(topics, expected, "must recover every enqueued message from disk+memory");
+        assert!(!store.path_for(id).exists(), "offline file must be removed once drained");
+    }
+
+    /// Issue #216: a `take_offline_async` call queued immediately behind
+    /// still-pending appends for the same subscriber must still see all
+    /// of them — it's ordered *through* the same `SubQueue`, not racing
+    /// it, so there's no window where a not-yet-landed append gets lost
+    /// (the gap the old synchronous `take_offline` could only narrow).
+    #[test]
+    fn take_offline_async_ordered_behind_pending_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Arc::new(Runtime::start(hopf_core::RuntimeConfig::default()).unwrap());
+        let store = FileBackedMessageStore::new(dir.path(), Arc::clone(&rt)).unwrap();
+        let id = SubscriberId(23);
+
+        // Enqueue, then immediately call take_offline_async — before any
+        // of these appends could plausibly have drained to disk yet, so
+        // the ordering guarantee (not a timing coincidence) is what makes
+        // this pass reliably.
+        for i in 0..20 {
+            store.enqueue_offline(
+                id,
+                queued_message(&format!("t/{i:02}"), b"x", QoS::AtLeastOnce, false, &Properties::new()),
+            );
+        }
+        let handle = ConnHandle::from_execute(Arc::new(|task| task()));
+        let result: Arc<Mutex<Option<Vec<QueuedMessage>>>> = Arc::new(Mutex::new(None));
+        let result2 = Arc::clone(&result);
+        store.take_offline_async(id, handle, Box::new(move |msgs| *result2.lock().unwrap() = Some(msgs)));
+
+        assert!(wait_for(|| result.lock().unwrap().is_some(), 3000), "take_offline_async must eventually call done");
+        let msgs = result.lock().unwrap().take().unwrap();
+        assert_eq!(msgs.len(), 20, "every append queued ahead of the read must be reflected in it");
     }
 }
 
