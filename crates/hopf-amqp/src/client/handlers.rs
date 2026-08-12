@@ -155,6 +155,14 @@ pub trait AmqpClientControl {
 
     /// Pause (`active = false`) or resume (`active = true`) delivery on a
     /// channel (`channel.flow`, client-initiated).
+    ///
+    /// Mainstream RabbitMQ does not implement the client-initiated
+    /// `active = false` direction: it rejects the request with a hard
+    /// connection-level exception (reply-code 540, `NOT_IMPLEMENTED`) and
+    /// closes the connection rather than replying `flow-ok` — surfaced
+    /// promptly via [`AmqpClientDriver::on_connection_close`]. Don't wait
+    /// on a `flow-ok` after calling this against a real broker; check for
+    /// `on_connection_close`/`on_error` too.
     fn flow(&mut self, channel: u16, active: bool);
 
     /// Select transaction mode for a channel (`tx.select`).

@@ -684,14 +684,13 @@ fn basic_recover_redelivers_unacked_message() {
 
 #[derive(Default, Clone)]
 struct FlowState {
-    paused_ack: Option<bool>,
-    resumed_ack: Option<bool>,
+    close_code: Option<u16>,
+    close_text: Option<String>,
     error: Option<String>,
 }
 
 struct FlowDriver {
     state: Arc<Mutex<FlowState>>,
-    step: u8,
 }
 
 impl AmqpClientDriver for FlowDriver {
@@ -728,18 +727,12 @@ impl AmqpClientDriver for FlowDriver {
 
     fn on_delivery_complete(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
 
-    fn on_flow_ok(&mut self, client: &mut dyn AmqpClientControl, channel: u16, active: bool) {
+    fn on_flow_ok(&mut self, _: &mut dyn AmqpClientControl, _: u16, _: bool) {}
+
+    fn on_connection_close(&mut self, reply_code: u16, reply_text: &str) {
         let mut s = self.state.lock().unwrap();
-        if self.step == 0 {
-            s.paused_ack = Some(active);
-            self.step = 1;
-            drop(s);
-            client.flow(channel, true);
-        } else {
-            s.resumed_ack = Some(active);
-            drop(s);
-            client.connection_close(200, "flow integration done");
-        }
+        s.close_code = Some(reply_code);
+        s.close_text = Some(reply_text.to_string());
     }
 
     fn on_error(&mut self, err: &io::Error) {
@@ -755,15 +748,18 @@ struct FlowFactory {
 
 impl AmqpClientHandlerFactory for FlowFactory {
     fn create(&self) -> Box<dyn AmqpClientDriver> {
-        Box::new(FlowDriver {
-            state: Arc::clone(&self.state),
-            step: 0,
-        })
+        Box::new(FlowDriver { state: Arc::clone(&self.state) })
     }
 }
 
+/// Issue #207: real RabbitMQ doesn't implement client-initiated pause
+/// (`channel.flow` with `active=false`) — it rejects the request with a
+/// hard connection-level exception (reply-code 540, `NOT_IMPLEMENTED`)
+/// instead of replying `flow-ok`. This proves the client decodes and
+/// surfaces that promptly via `on_connection_close`, rather than a caller
+/// hanging indefinitely waiting for a `flow-ok` that will never arrive.
 #[test]
-fn client_initiated_flow_roundtrip() {
+fn client_initiated_flow_is_rejected_by_the_broker_with_a_prompt_connection_close() {
     let (host, port, user, pass) = broker_creds();
 
     let state = Arc::new(Mutex::new(FlowState::default()));
@@ -775,13 +771,17 @@ fn client_initiated_flow_roundtrip() {
 
     let s = wait_for(
         &state,
-        15,
+        5,
         |s| &s.error,
-        |s| s.resumed_ack.is_some(),
-        "channel.flow pause/resume",
+        |s| s.close_code.is_some(),
+        "connection.close after client-initiated channel.flow",
     );
-    assert_eq!(s.paused_ack, Some(false));
-    assert_eq!(s.resumed_ack, Some(true));
+    assert_eq!(s.close_code, Some(540));
+    assert!(
+        s.close_text.as_deref().unwrap_or("").contains("NOT_IMPLEMENTED"),
+        "unexpected close text: {:?}",
+        s.close_text
+    );
 }
 
 #[derive(Default, Clone)]
