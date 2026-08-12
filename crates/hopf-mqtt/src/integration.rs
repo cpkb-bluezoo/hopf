@@ -724,6 +724,172 @@ fn second_connect_pipelined_behind_plain_authorize_is_rejected() {
     drop(rt);
 }
 
+/// Bind a WS-hosted MQTT listener on `broker`, authorizing CONNECT the same
+/// way [`MqttService::new`] would (via `config.credentials`/`allow_anonymous`)
+/// but reachable over WebSocket instead of plain TCP.
+#[cfg(feature = "websocket")]
+fn start_ws_mqtt_listener(
+    rt: &Arc<Runtime>,
+    config: MqttConfig,
+) -> SocketAddr {
+    use hopf_core::{ProtocolHandler, TcpListenerConfig};
+    use hopf_http::{CleartextHttpEndpoint, HttpLimits, ServerHandlerFactory};
+    use hopf_websocket::{WebSocketConfig, WebSocketFactory};
+
+    use crate::server::DefaultMqttHandlerFactory;
+    use crate::server::ws::MqttWsFactory;
+
+    let handler_factory = Arc::new(DefaultMqttHandlerFactory::new(
+        config.credentials.clone(),
+        config.allow_anonymous,
+    ));
+    let ws_config = Arc::new(config);
+    let ws_factory = Arc::new(WebSocketFactory::new(
+        MqttWsFactory::new(ws_config, handler_factory, Arc::clone(rt)),
+        WebSocketConfig::default(),
+    ));
+    let (ws_addr, _) = rt
+        .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+            Box::new(CleartextHttpEndpoint::new(
+                Arc::clone(&ws_factory) as Arc<dyn ServerHandlerFactory>,
+                HttpLimits::default(),
+            )) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+    ws_addr
+}
+
+/// Perform the WS opening handshake (plain HTTP/1.1 Upgrade) against
+/// `addr` and return the connected stream, ready for masked binary MQTT
+/// frames.
+#[cfg(feature = "websocket")]
+fn ws_upgrade(addr: SocketAddr) -> TcpStream {
+    let mut stream = wait_connect(addr);
+    let key = "dGhlIHNhbXBsZSBub25jZQ==";
+    let req = format!(
+        "GET /mqtt HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("101"), "{resp}");
+    stream
+}
+
+/// A plain CONNECT's `ConnectHandler::authorize` call completes correctly
+/// end to end over WebSocket now that it runs off the reactor thread (issue
+/// #232, WS counterpart of #210) — regression guard proving the new
+/// `WsEventHandler::poke` re-entry hook (and `hopf-http`'s upgraded-handler
+/// poke fix it depends on) actually delivers the deferred CONNACK, for both
+/// a successful and a rejected check.
+#[cfg(feature = "websocket")]
+#[test]
+fn plain_connect_authorize_offload_over_ws_round_trips_accept_and_reject() {
+    use hopf_websocket::{write_frame, Opcode};
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let broker = Arc::new(BrokerState::new());
+    let store: Arc<dyn hopf_auth::CredentialStore> =
+        Arc::new(hopf_auth::PasswordStore::new().with_user("alice", "secret"));
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).with_credentials(store);
+    let addr = start_ws_mqtt_listener(&rt, config);
+
+    let mut good = ws_upgrade(addr);
+    let mut good_frame = Vec::new();
+    write_frame(
+        &mut good_frame,
+        true,
+        Opcode::Binary,
+        Some([1, 2, 3, 4]),
+        &v311_connect_packet_with_plain_auth("ws-client-good", "alice", "secret"),
+    );
+    good.write_all(&good_frame).unwrap();
+    let connack = read_ws_frame(&mut good);
+    assert_eq!(connack[0], 0x20, "expected CONNACK fixed header byte: {connack:?}");
+    assert_eq!(connack[3], 0x00, "expected acceptance: {connack:?}");
+
+    let mut bad = ws_upgrade(addr);
+    let mut bad_frame = Vec::new();
+    write_frame(
+        &mut bad_frame,
+        true,
+        Opcode::Binary,
+        Some([1, 2, 3, 4]),
+        &v311_connect_packet_with_plain_auth("ws-client-bad", "alice", "wrong"),
+    );
+    bad.write_all(&bad_frame).unwrap();
+    let connack = read_ws_frame(&mut bad);
+    assert_eq!(connack[0], 0x20, "expected CONNACK fixed header byte: {connack:?}");
+    assert_ne!(connack[3], 0x00, "expected rejection: {connack:?}");
+    drop(rt);
+}
+
+/// A plain CONNECT's `authorize()` call runs off the reactor thread over
+/// WebSocket (issue #232). A second CONNECT pipelined right behind the
+/// first, in the same WS frame, must be rejected — same busy-gate guard
+/// #210 established for the TCP transport (see
+/// `second_connect_pipelined_behind_plain_authorize_is_rejected`), now also
+/// covering the WS one. `SlowStore` widens the offload's window so this is
+/// reliably observable rather than a timing coincidence.
+#[cfg(feature = "websocket")]
+#[test]
+fn second_connect_pipelined_behind_plain_authorize_over_ws_is_rejected() {
+    use hopf_websocket::{write_frame, Opcode};
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let broker = Arc::new(BrokerState::new());
+    let store: Arc<dyn hopf_auth::CredentialStore> = Arc::new(SlowStore {
+        inner: hopf_auth::PasswordStore::new().with_user("alice", "secret"),
+        delay: Duration::from_millis(150),
+    });
+    let config = MqttConfig::new("127.0.0.1:0".parse().unwrap(), broker).with_credentials(store);
+    let addr = start_ws_mqtt_listener(&rt, config);
+
+    let mut stream = ws_upgrade(addr);
+    let mut both = Vec::new();
+    write_frame(
+        &mut both,
+        true,
+        Opcode::Binary,
+        Some([1, 2, 3, 4]),
+        &v311_connect_packet_with_plain_auth("ws-client-a", "alice", "secret"),
+    );
+    write_frame(
+        &mut both,
+        true,
+        Opcode::Binary,
+        Some([5, 6, 7, 8]),
+        &v311_connect_packet_with_plain_auth("ws-client-b", "alice", "secret"),
+    );
+    // One write, both WS frames — proves the second CONNECT was actually
+    // sitting on the wire during the offloaded authorize() call, not just
+    // sent afterward by coincidence.
+    stream.write_all(&both).unwrap();
+
+    // Whatever comes back — nothing, the first CONNACK, or a close — a
+    // second CONNACK (which would mean the broker double-registered a
+    // session for one connection) must never appear anywhere in the byte
+    // stream.
+    let mut received = Vec::new();
+    loop {
+        let mut buf = [0u8; 64];
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => received.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
+            Err(e) => panic!("unexpected read error: {e}"),
+        }
+    }
+    let connack_count = received.windows(4).filter(|w| w[0] == 0x20 && w[1] == 0x02 && w[3] == 0x00).count();
+    assert!(
+        connack_count <= 1,
+        "the pipelined second CONNECT must never be accepted as a new session \
+         (at most one accepting CONNACK expected): {received:?}"
+    );
+    drop(rt);
+}
+
 /// Proves the point of threading `ConnHandle` through `hopf-websocket`
 /// (see [`crate::server::ws`]): a subscriber connected over WS and a publisher
 /// connected over plain TCP, sharing one [`BrokerState`], can reach each
