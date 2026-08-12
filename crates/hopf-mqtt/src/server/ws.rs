@@ -25,10 +25,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_core::{ConnHandle, TimerHandle};
+use hopf_core::{ConnHandle, Runtime, TimerHandle};
 use hopf_http::Headers;
 use hopf_websocket::{framed_ws_conn_handle, WsEventHandler, WsEventHandlerFactory, WsFrameError, WsRole, WsSession};
 
@@ -62,7 +62,13 @@ struct ConnectedWsSession {
     keepalive_timer: Option<TimerHandle>,
     session_expiry: Duration,
     graceful_disconnect: bool,
-    awaiting_pubrel: HashSet<u16>,
+    /// Shared (not a plain field) so a deferred `end_publish` completion
+    /// (issue #187 — WS has no `poke_handler`-equivalent reactor re-entry
+    /// hook the way TCP's `MqttControlHandler` does, so a still-draining
+    /// publish's finish runs entirely from the storage callback that
+    /// clears its spool write queue, without `&mut MqttWsHandler`) can
+    /// record a QoS 2 packet id without needing one.
+    awaiting_pubrel: Arc<Mutex<HashSet<u16>>>,
     pending_publish: Option<PendingPublish>,
     inbound_aliases: HashMap<u16, String>,
     /// Max alias we accept from the client (advertised in CONNACK).
@@ -89,13 +95,16 @@ pub struct MqttWsFactory {
     otel_metrics: Option<Arc<OtelMqttMetrics>>,
     export: Option<ExportHandle>,
     traces_enabled: bool,
+    runtime: Arc<Runtime>,
 }
 
 impl MqttWsFactory {
     /// Bridge `config` (and its `broker`) onto WebSocket, authorizing
     /// CONNECT via `handler_factory` (same SPI as the TCP listener —
     /// `server::DefaultMqttHandlerFactory` if you don't need custom policy).
-    pub fn new(config: Arc<MqttConfig>, handler_factory: Arc<dyn MqttHandlerFactory>) -> Self {
+    /// `runtime` lets each connection offload blocking spool I/O (issue
+    /// #187) to `hopf_core::StorageExecutor`.
+    pub fn new(config: Arc<MqttConfig>, handler_factory: Arc<dyn MqttHandlerFactory>, runtime: Arc<Runtime>) -> Self {
         Self {
             config,
             handler_factory,
@@ -103,6 +112,7 @@ impl MqttWsFactory {
             otel_metrics: None,
             export: None,
             traces_enabled: false,
+            runtime,
         }
     }
 
@@ -138,6 +148,7 @@ impl WsEventHandlerFactory for MqttWsFactory {
             // come out as proper WS binary frames.
             conn: framed_ws_conn_handle(&conn, WsRole::Server),
             connect_timeout_timer: None,
+            runtime: Arc::clone(&self.runtime),
             metrics: Arc::clone(&self.metrics),
             meta: MqttConnectionMetadata {
                 peer: SocketAddr::from(([0, 0, 0, 0], 0)),
@@ -166,6 +177,7 @@ pub struct MqttWsHandler {
     subscribe_handler: Box<dyn SubscribeHandler>,
     conn: ConnHandle,
     connect_timeout_timer: Option<TimerHandle>,
+    runtime: Arc<Runtime>,
     metrics: Arc<MqttServerMetrics>,
     meta: MqttConnectionMetadata,
     otel_metrics: Option<Arc<OtelMqttMetrics>>,
@@ -232,18 +244,6 @@ impl MqttWsHandler {
             self.otel_metrics.clone(),
             span,
         ));
-    }
-
-    fn finish_publish_telemetry(&mut self, ok: bool) {
-        if let Some(tel) = self.publish_tel.take() {
-            tel.finish(ok);
-        }
-        if let Some(trace) = &self.conn_trace {
-            self.meta.traceparent = Some(trace.traceparent());
-        }
-        if ok {
-            MqttServerMetrics::add(&self.metrics.publishes, 1);
-        }
     }
 
     fn record_auth(&self, ok: bool) {
@@ -321,14 +321,18 @@ impl MqttWsHandler {
                         will.qos,
                         will.retain,
                         &will.properties,
+                        Arc::clone(&self.runtime),
+                        self.conn.clone(),
                     );
                 } else {
                     let epoch = self.config.broker.park_delayed_will(&session.client_id, will);
                     let broker = Arc::clone(&self.config.broker);
                     let client_id = session.client_id.clone();
+                    let runtime = Arc::clone(&self.runtime);
+                    let handle = self.conn.clone();
                     self.conn.schedule_timer(
                         delay,
-                        Box::new(move || broker.fire_delayed_will(&client_id, epoch)),
+                        Box::new(move || broker.fire_delayed_will(&broker, &client_id, epoch, runtime, handle)),
                     );
                 }
             }
@@ -341,9 +345,11 @@ impl MqttWsHandler {
             let epoch = self.config.broker.orphan(session.subscriber_id);
             let broker = Arc::clone(&self.config.broker);
             let id = session.subscriber_id;
+            let runtime = Arc::clone(&self.runtime);
+            let handle = self.conn.clone();
             self.conn.schedule_timer(
                 session.session_expiry,
-                Box::new(move || broker.expire_orphan(id, epoch)),
+                Box::new(move || broker.expire_orphan(&broker, id, epoch, runtime, handle)),
             );
         }
         self.session = SessionState::AwaitingConnect;
@@ -521,7 +527,7 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
             keepalive_timer: None,
             session_expiry,
             graceful_disconnect: false,
-            awaiting_pubrel: HashSet::new(),
+            awaiting_pubrel: Arc::new(Mutex::new(HashSet::new())),
             pending_publish: None,
             inbound_aliases: HashMap::new(),
             server_topic_alias_max,
@@ -587,7 +593,7 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
             self.disconnect_and_close(reason::PROTOCOL_ERROR);
             return;
         };
-        if header.qos == QoS::ExactlyOnce && session.awaiting_pubrel.contains(&header.packet_id) {
+        if header.qos == QoS::ExactlyOnce && session.awaiting_pubrel.lock().unwrap().contains(&header.packet_id) {
             session.pending_publish = None;
             let version = session.version;
             let wire = encode::encode_pubrec(header.packet_id, reason::SUCCESS, &Properties::new(), version);
@@ -637,7 +643,9 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         let subscriber_id = session.subscriber_id;
         let qos = header.qos;
         let bytes = header.payload_len as u64;
-        let pending = PendingPublish::begin(self.broker(), subscriber_id, header);
+        let runtime = Arc::clone(&self.handler.runtime);
+        let handle = self.handler.conn.clone();
+        let pending = PendingPublish::begin(self.broker(), subscriber_id, header, runtime, handle);
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
         };
@@ -655,6 +663,19 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         pending.feed(data);
     }
 
+    /// Unlike TCP's `MqttControlHandler::end_publish`, this can't defer via
+    /// a `pending_publish_finishes` queue drained from a `poke_handler`-
+    /// triggered re-entry — `WsEventHandler` has no such hook (issue
+    /// #187). Instead, `PendingPublish::finish_when_ready` runs the finish
+    /// (and this closure) directly from the storage thread that drains the
+    /// last queued write, if it isn't already done by the time this is
+    /// called — so everything the closure touches must be safe to run from
+    /// any thread without `&mut MqttWsHandler`: `self.handler.conn.send`
+    /// (thread-safe already), `Arc`-shared `awaiting_pubrel`/`metrics`, and
+    /// `PublishTelemetry::finish` (self-contained, needs no external
+    /// state). The one thing this intentionally skips versus the TCP path
+    /// is refreshing `self.meta.traceparent` afterward — purely a display/
+    /// logging nicety for the *next* span, not a correctness concern.
     fn end_publish(&mut self) {
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
@@ -664,24 +685,30 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         };
         let version = session.version;
         let (qos, packet_id) = (pending.header.qos, pending.header.packet_id);
-        pending.finish(self.broker());
-        self.handler.finish_publish_telemetry(true);
+        let awaiting_pubrel = Arc::clone(&session.awaiting_pubrel);
+        let conn = self.handler.conn.clone();
+        let metrics = Arc::clone(&self.handler.metrics);
+        let telemetry = self.handler.publish_tel.take();
+        let broker = Arc::clone(self.broker());
 
-        let SessionState::Connected(session) = &mut self.handler.session else {
-            return;
-        };
-        match qos {
-            QoS::AtMostOnce => {}
-            QoS::AtLeastOnce => {
-                let wire = encode::encode_puback(packet_id, reason::SUCCESS, &Properties::new(), version);
-                self.session.send_binary(&wire);
+        pending.finish_when_ready(broker, move || {
+            if let Some(tel) = telemetry {
+                tel.finish(true);
             }
-            QoS::ExactlyOnce => {
-                session.awaiting_pubrel.insert(packet_id);
-                let wire = encode::encode_pubrec(packet_id, reason::SUCCESS, &Properties::new(), version);
-                self.session.send_binary(&wire);
+            MqttServerMetrics::add(&metrics.publishes, 1);
+            match qos {
+                QoS::AtMostOnce => {}
+                QoS::AtLeastOnce => {
+                    let wire = encode::encode_puback(packet_id, reason::SUCCESS, &Properties::new(), version);
+                    conn.send(wire);
+                }
+                QoS::ExactlyOnce => {
+                    awaiting_pubrel.lock().unwrap().insert(packet_id);
+                    let wire = encode::encode_pubrec(packet_id, reason::SUCCESS, &Properties::new(), version);
+                    conn.send(wire);
+                }
             }
-        }
+        });
     }
 
     fn puback(&mut self, packet_id: u16, _reason_code: u8, _properties: Properties) {
@@ -697,7 +724,7 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
         };
-        session.awaiting_pubrel.remove(&packet_id);
+        session.awaiting_pubrel.lock().unwrap().remove(&packet_id);
         let wire = encode::encode_pubcomp(packet_id, reason::SUCCESS, &Properties::new(), session.version);
         self.session.send_binary(&wire);
     }
@@ -745,7 +772,7 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
                             if send_retained {
                                 for (topic, msg) in self.broker().retained_matching(&filter.topic_filter) {
                                     self.broker().deliver_retained(
-                                        subscriber_id, &topic, &msg, granted_qos,
+                                        subscriber_id, &topic, &msg, granted_qos, &self.handler.runtime,
                                     );
                                 }
                             }

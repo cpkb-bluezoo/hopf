@@ -658,7 +658,7 @@ fn ws_subscriber_and_tcp_publisher_share_broker_state() {
         MqttConfig::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&broker)).allow_anonymous(),
     );
     let ws_factory = Arc::new(WebSocketFactory::new(
-        MqttWsFactory::new(ws_config, Arc::new(DefaultMqttHandlerFactory::new(None, true))),
+        MqttWsFactory::new(ws_config, Arc::new(DefaultMqttHandlerFactory::new(None, true)), Arc::clone(&rt)),
         WebSocketConfig::default(),
     ));
     let (ws_addr, _) = rt
