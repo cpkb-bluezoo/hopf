@@ -582,6 +582,34 @@ impl BrokerState {
         }
     }
 
+    /// Async counterpart of [`Self::drain_offline`] (issue #216) — reads
+    /// the offline queue off the reactor thread via
+    /// [`MqttMessageStore::take_offline_async`], delivering the drained
+    /// messages and calling `done` once finished. `handle` is the resuming
+    /// connection's own `ConnHandle`, threaded through so a store that
+    /// offloads (e.g. `FileBackedMessageStore`) routes completion back to
+    /// that connection's reactor rather than an unrelated one.
+    pub fn drain_offline_async(
+        self: &Arc<Self>,
+        id: SubscriberId,
+        handle: ConnHandle,
+        done: Box<dyn FnOnce() + Send>,
+    ) {
+        let broker = Arc::clone(self);
+        self.store.take_offline_async(
+            id,
+            handle,
+            Box::new(move |msgs| {
+                for msg in msgs {
+                    if !broker.deliver_queued(id, &msg, false) {
+                        broker.store.enqueue_offline(id, msg);
+                    }
+                }
+                done();
+            }),
+        );
+    }
+
     /// Re-send outbound QoS 1/2 publishes whose in-flight timer has elapsed
     /// for `id`. Returns how many were retransmitted.
     pub fn retransmit_due(&self, id: SubscriberId, older_than: std::time::Duration) -> usize {
