@@ -99,9 +99,14 @@ impl<H: ServerHandler> H1ServerCodec<H> {
     }
 
     fn feed_upgraded(&mut self, data: &mut &[u8]) {
-        if data.is_empty() {
-            return;
-        }
+        // Deliberately *not* gated on `data.is_empty()` — an empty call is
+        // exactly what `Endpoint::poke_handler` (and so `ConnHandle::poke`)
+        // sends to re-enter a handler without new inbound bytes, and the
+        // upgrade handler is who needs that re-entry point: see
+        // `hopf_websocket::WsUpgradeHandler`'s `poke`, which lets a
+        // protocol layered on WebSocket (e.g. hopf-mqtt's WS transport)
+        // resume state mutated from an offloaded storage-pool callback the
+        // same way a plain `ProtocolHandler` already can (issue #232).
         if let Some(up) = self.driver.upgraded.as_mut() {
             up.receive(data);
         }
