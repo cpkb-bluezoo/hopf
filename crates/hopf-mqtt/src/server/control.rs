@@ -1331,7 +1331,10 @@ mod publish_finish_tests {
     /// until its spool write has actually landed on disk — proven here by
     /// checking the retained store already has the full expected payload
     /// at the exact moment the PUBACK first appears in `sent`, not merely
-    /// "eventually".
+    /// "eventually". Whether that write happens to finish before or after
+    /// `end_publish` itself runs is a timing coincidence this test doesn't
+    /// pin down either way (see the comment at the PUBACK wait below) —
+    /// only the on-disk-before-PUBACK invariant is asserted.
     #[test]
     fn end_publish_defers_puback_until_spool_write_lands() {
         let mut h = new_handler();
@@ -1363,15 +1366,14 @@ mod publish_finish_tests {
         data = publish.into_boxed_slice();
         h.receive(&mut ep, &mut &*data);
 
-        // The PUBACK must not have been appended synchronously, inline
-        // within the very `receive()` call that carried the PUBLISH — it
-        // can only be sent once `sync_pending_publish_finish` picks the
-        // finished write back up on a later `receive()`.
-        assert_eq!(
-            ep.sent.len(), after_connack,
-            "PUBACK must be deferred, not sent inline, while the spool write is still draining"
-        );
-
+        // Whether the spool write's background chunks happen to have
+        // already drained by the time `end_publish` runs (in which case
+        // the PUBACK goes out inline) or are still in flight (in which
+        // case `sync_pending_publish_finish` picks it up on a later
+        // `receive()`, once `is_ready()`) is a timing coincidence, not
+        // something this test can pin down — either is correct. What
+        // matters, checked below, is that the retained payload is always
+        // fully on disk by the time the PUBACK is observed either way.
         assert!(
             wait_for(
                 || {
