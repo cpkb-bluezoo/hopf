@@ -24,7 +24,7 @@ use crate::factory::WebDavConfig;
 use crate::if_header::{evaluate_if_header, parse_if_header};
 use crate::lock::{WebDavLock, WebDavLockManager};
 use crate::parser::{
-    parse_webdav_body, PropfindType, ProppatchOp, WebDavParsed, WebDavRequestParser,
+    ParseWebDavError, PropfindType, ProppatchOp, WebDavParsed, WebDavRequestParser,
 };
 use crate::path::{canonicalize_path, resolve_path_lexical};
 use crate::multistatus::MultistatusWriter;
@@ -58,7 +58,6 @@ pub struct WebDavHandler {
     timeout_header: Option<String>,
     host: Option<String>,
 
-    webdav_body: Vec<u8>,
     webdav_parser: Option<WebDavRequestParser>,
     /// Shared state for an in-progress PUT — open (canonicalize + create)
     /// and each inbound chunk's write are offloaded to
@@ -111,7 +110,6 @@ impl WebDavHandler {
             if_header: None,
             timeout_header: None,
             host: None,
-            webdav_body: Vec::new(),
             webdav_parser: None,
             put_state: None,
             put_bytes_written: 0,
@@ -238,11 +236,11 @@ impl ServerHandler for WebDavHandler {
             }
             return;
         }
-        if self.webdav_parser.is_some() {
-            self.webdav_body.extend_from_slice(data);
-            if let Some(ref mut p) = self.webdav_parser {
-                let _ = p.feed(data);
-            }
+        if let Some(p) = self.webdav_parser.as_mut() {
+            // Errors surface once, from `finish()` in `end_request_body` —
+            // `feed()`'s own `Result` here would just be the same error
+            // discovered one chunk earlier.
+            let _ = p.feed(data);
             return;
         }
         if self.put_rejected || self.put_state.is_none() {
@@ -290,15 +288,11 @@ impl ServerHandler for WebDavHandler {
             self.finish_mkcol(response);
             return;
         }
-        if self.webdav_parser.take().is_some() {
-            if self.webdav_body.len() > MAX_WEBDAV_REQUEST_BODY {
-                Self::send_error(response, 413);
-                return;
-            }
-            let body = std::mem::take(&mut self.webdav_body);
-            match parse_webdav_body(&body) {
+        if let Some(parser) = self.webdav_parser.take() {
+            match parser.finish() {
                 Ok(parsed) => self.finish_webdav(response, parsed),
-                Err(_) => Self::send_error(response, 400),
+                Err(ParseWebDavError::TooLarge) => Self::send_error(response, 413),
+                Err(ParseWebDavError::Parse(_)) => Self::send_error(response, 400),
             }
             return;
         }
@@ -332,7 +326,6 @@ impl ServerHandler for WebDavHandler {
         } else if self.put_state.is_some() {
             self.end_request_body(response);
         }
-        self.webdav_body.clear();
         self.put_bytes_written = 0;
         self.put_rejected = false;
     }
@@ -353,7 +346,6 @@ impl WebDavHandler {
 
     fn start_webdav_body(&mut self, w: &mut dyn ServerWriter) {
         self.webdav_parser = Some(WebDavRequestParser::new(MAX_WEBDAV_REQUEST_BODY));
-        self.webdav_body.clear();
         let _ = w;
     }
 
