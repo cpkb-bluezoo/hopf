@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::mechanism::SaslMechanism;
 use crate::store::{
-    CertificateIdentity, CredentialStore, ScramCredentials, TokenValidation,
+    CertificateIdentity, Cb, CredentialStore, ScramCredentials, TokenValidation,
 };
 
 /// Default PAM service name when none is configured.
@@ -252,8 +252,8 @@ impl CredentialStore for PamCredentialStore {
         None
     }
 
-    fn validate_bearer(&self, _token: &str) -> Option<TokenValidation> {
-        None
+    fn validate_bearer(&self, _token: &str, cb: Cb<Option<TokenValidation>>) {
+        cb(None);
     }
 
     fn authenticate_certificate(&self, _cert_key: &str) -> Option<CertificateIdentity> {
@@ -275,7 +275,9 @@ mod tests {
         assert!(store.digest_ha1("u", "r").is_none());
         assert!(store.scram_credentials("u").is_none());
         assert!(store.plaintext_password("u").is_none());
-        assert!(store.validate_bearer("t").is_none());
+        let (tx, rx) = std::sync::mpsc::channel();
+        store.validate_bearer("t", Box::new(move |r| { let _ = tx.send(r); }));
+        assert!(rx.recv().unwrap().is_none());
         assert_eq!(store.service(), "login");
     }
 

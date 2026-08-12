@@ -68,27 +68,26 @@ impl SaslServer for OauthBearerServer {
         SaslMechanism::OauthBearer
     }
 
-    fn step(&mut self, client_response: Option<&[u8]>) -> SaslServerStep {
+    fn step(&mut self, client_response: Option<&[u8]>, cb: crate::session::Cb<SaslServerStep>) {
         let Some(raw) = client_response.filter(|d| !d.is_empty()) else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
         let text = String::from_utf8_lossy(raw);
         let parsed = parse_credentials(&text);
-        let Some(token) = parsed.get("token") else {
-            return SaslServerStep::Failure;
+        let Some(token) = parsed.get("token").cloned() else {
+            return cb(SaslServerStep::Failure);
         };
-        let Some(v) = self.store.validate_bearer(token) else {
-            return SaslServerStep::Failure;
-        };
-        let username = parsed
-            .get("user")
-            .cloned()
-            .filter(|u| !u.is_empty())
-            .unwrap_or(v.username);
-        SaslServerStep::Complete {
-            username,
-            final_message: None,
-        }
+        let requested_user = parsed.get("user").cloned().filter(|u| !u.is_empty());
+        self.store.validate_bearer(&token, Box::new(move |result| {
+            let Some(v) = result else {
+                return cb(SaslServerStep::Failure);
+            };
+            let username = requested_user.unwrap_or(v.username);
+            cb(SaslServerStep::Complete {
+                username,
+                final_message: None,
+            });
+        }));
     }
 }
 

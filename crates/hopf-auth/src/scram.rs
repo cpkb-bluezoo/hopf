@@ -147,11 +147,11 @@ impl SaslServer for ScramSha256Server {
         }
     }
 
-    fn step(&mut self, client_response: Option<&[u8]>) -> SaslServerStep {
+    fn step(&mut self, client_response: Option<&[u8]>, cb: crate::session::Cb<SaslServerStep>) {
         match &self.state {
             ScramServerState::Start => {
                 let Some(raw) = client_response else {
-                    return SaslServerStep::Failure;
+                    return cb(SaslServerStep::Failure);
                 };
                 let text = String::from_utf8_lossy(raw);
                 // n,,n=user,r=clientnonce  or  p=tls-server-end-point,,n=user,r=…
@@ -159,7 +159,7 @@ impl SaslServer for ScramSha256Server {
                 // either form this crate produces, so splitting there is
                 // safe and avoids a full GS2 grammar parser.
                 let Some(bare_idx) = text.find("n=") else {
-                    return SaslServerStep::Failure;
+                    return cb(SaslServerStep::Failure);
                 };
                 let gs2_header = text[..bare_idx].to_string();
                 let expected_gs2 = if self.is_plus() {
@@ -168,20 +168,20 @@ impl SaslServer for ScramSha256Server {
                     GS2_HEADER_PLAIN
                 };
                 if gs2_header != expected_gs2 {
-                    return SaslServerStep::Failure;
+                    return cb(SaslServerStep::Failure);
                 }
                 let bare = text[bare_idx..].to_string();
                 let attrs = attr_map(&bare);
                 let Some(username) = attrs.get("n").cloned() else {
-                    return SaslServerStep::Failure;
+                    return cb(SaslServerStep::Failure);
                 };
                 // SASLprep omitted; decode =2C etc. minimally
                 let username = username.replace("=2C", ",").replace("=3D", "=");
                 let Some(client_nonce) = attrs.get("r").cloned() else {
-                    return SaslServerStep::Failure;
+                    return cb(SaslServerStep::Failure);
                 };
                 let Some(creds) = self.store.scram_credentials(&username) else {
-                    return SaslServerStep::Failure;
+                    return cb(SaslServerStep::Failure);
                 };
                 let server_nonce = generate_nonce_hex(12);
                 let combined = format!("{client_nonce}{server_nonce}");
@@ -198,7 +198,7 @@ impl SaslServer for ScramSha256Server {
                     creds,
                     gs2_header,
                 };
-                SaslServerStep::Challenge(challenge)
+                cb(SaslServerStep::Challenge(challenge));
             }
             ScramServerState::First {
                 username,
@@ -209,7 +209,7 @@ impl SaslServer for ScramSha256Server {
                 gs2_header,
             } => {
                 let Some(raw) = client_response else {
-                    return SaslServerStep::Failure;
+                    return cb(SaslServerStep::Failure);
                 };
                 let client_final = String::from_utf8_lossy(raw);
                 let auth_prefix = format!("{client_first_bare},{server_first}");
@@ -229,18 +229,18 @@ impl SaslServer for ScramSha256Server {
                         let v = encode_base64(&sig);
                         let user = username.clone();
                         self.state = ScramServerState::Done;
-                        SaslServerStep::Complete {
+                        cb(SaslServerStep::Complete {
                             username: user,
                             final_message: Some(format!("v={v}").into_bytes()),
-                        }
+                        });
                     }
                     None => {
                         self.state = ScramServerState::Done;
-                        SaslServerStep::Failure
+                        cb(SaslServerStep::Failure);
                     }
                 }
             }
-            ScramServerState::Done => SaslServerStep::Failure,
+            ScramServerState::Done => cb(SaslServerStep::Failure),
         }
     }
 }
@@ -405,7 +405,9 @@ mod tests {
             SaslClientStep::Failure => return Err(()),
         };
         for _ in 0..8 {
-            match server.step(client_msg.as_deref()) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            server.step(client_msg.as_deref(), Box::new(move |s| { let _ = tx.send(s); }));
+            match rx.recv().expect("step completes synchronously in tests") {
                 SaslServerStep::Challenge(ch) => match client.evaluate(Some(&ch)) {
                     SaslClientStep::Response(b) | SaslClientStep::Complete(b) => {
                         client_msg = if b.is_empty() { None } else { Some(b) };

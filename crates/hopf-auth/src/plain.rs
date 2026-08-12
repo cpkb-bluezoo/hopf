@@ -54,28 +54,28 @@ impl SaslServer for PlainServer {
         SaslMechanism::Plain
     }
 
-    fn step(&mut self, client_response: Option<&[u8]>) -> SaslServerStep {
+    fn step(&mut self, client_response: Option<&[u8]>, cb: crate::session::Cb<SaslServerStep>) {
         let Some(data) = client_response.filter(|d| !d.is_empty()) else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
         let Some((authzid, authcid, password)) = parse_credentials(data) else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
         if !self.store.password_match(&authcid, &password) {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         }
         if !self.store.authorize_as(&authcid, &authzid) {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         }
         let username = if authzid.is_empty() {
             authcid
         } else {
             authzid
         };
-        SaslServerStep::Complete {
+        cb(SaslServerStep::Complete {
             username,
             final_message: None,
-        }
+        });
     }
 }
 
