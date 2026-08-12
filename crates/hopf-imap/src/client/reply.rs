@@ -363,8 +363,9 @@ enum State {
     FetchBodyValueStart,
     /// Matching literal `NIL` for a body value (chars matched so far).
     FetchBodyNilTail { matched: u8 },
-    /// Skipping a quoted body value (rare, but grammar allows it).
-    FetchBodyQuotedSkip { escape: bool },
+    /// Reading a quoted body value (rare, but grammar allows it) into
+    /// `text`, to be delivered once as `fetch_data.body` when it closes.
+    FetchBodyQuoted { escape: bool },
     /// Reading a literal size marker's digits (`{n` or `{n+`).
     FetchLiteralMarker,
     /// Consumed `}`; expect the CR of the marker's terminating CRLF.
@@ -471,7 +472,13 @@ impl ImapReplyLexer {
                 rest = &rest[take..];
                 self.literal_remaining -= take as u64;
                 if !chunk.is_empty() {
-                    self.fetch_data.body.extend_from_slice(&chunk);
+                    // Literal octets are delivered only via
+                    // `FetchLiteralData` events (streamed, chunk by chunk)
+                    // — never also accumulated into `fetch_data.body`,
+                    // which is reserved for the quoted-string case (see
+                    // `on_fetch_body_quoted`). Double-populating both here
+                    // used to deliver the same content twice to callers of
+                    // `MessageReceiveCallback::message_content` (issue #190).
                     events.push(ImapEvent::FetchLiteralData(chunk));
                 }
                 if self.literal_remaining == 0 {
@@ -513,6 +520,13 @@ impl ImapReplyLexer {
 
     fn take_text(&mut self) -> String {
         String::from_utf8_lossy(&std::mem::take(&mut self.text)).into_owned()
+    }
+
+    /// Like [`Self::take_text`], but without the lossy UTF-8 conversion —
+    /// for fields (e.g. a FETCH `BODY[]` quoted-string value) that carry
+    /// arbitrary message-body bytes rather than IMAP protocol text.
+    fn take_text_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.text)
     }
 
     // ── top-level dispatch ──────────────────────────────────────────────
@@ -576,7 +590,7 @@ impl ImapReplyLexer {
             State::FetchAfterPartial => self.on_fetch_after_partial(b),
             State::FetchBodyValueStart => self.on_fetch_body_value_start(b),
             State::FetchBodyNilTail { matched } => self.on_fetch_body_nil_tail(matched, b),
-            State::FetchBodyQuotedSkip { escape } => self.on_fetch_body_quoted_skip(escape, b),
+            State::FetchBodyQuoted { escape } => self.on_fetch_body_quoted(escape, b),
             State::FetchLiteralMarker => self.on_fetch_literal_marker(b),
             State::FetchLiteralCr => self.on_fetch_literal_cr(b),
             State::FetchLiteralLf => self.on_fetch_literal_lf(b),
@@ -1597,7 +1611,7 @@ impl ImapReplyLexer {
                 Ok(None)
             }
             b'"' => {
-                self.state = State::FetchBodyQuotedSkip { escape: false };
+                self.state = State::FetchBodyQuoted { escape: false };
                 Ok(None)
             }
             _ => Err(ImapError::Parse("expected literal, NIL, or quoted FETCH body value".into())),
@@ -1618,22 +1632,29 @@ impl ImapReplyLexer {
         Ok(None)
     }
 
-    fn on_fetch_body_quoted_skip(&mut self, escape: bool, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+    fn on_fetch_body_quoted(&mut self, escape: bool, b: u8) -> Result<Option<ImapEvent>, ImapError> {
         if escape {
-            self.state = State::FetchBodyQuotedSkip { escape: false };
+            self.push_text(b)?;
+            self.state = State::FetchBodyQuoted { escape: false };
             return Ok(None);
         }
         match b {
             b'\\' => {
-                self.state = State::FetchBodyQuotedSkip { escape: true };
+                self.state = State::FetchBodyQuoted { escape: true };
                 Ok(None)
             }
             b'"' => {
+                // Delivered once via `data.body` in the `Fetch` event
+                // (`MessageReceiveCallback::message_content`'s "at most
+                // once, if the server used quoted syntax" case) — never
+                // streamed like a literal's octets are.
+                self.fetch_data.body = self.take_text_bytes();
                 self.state = State::FetchAfterValue;
                 Ok(None)
             }
             _ => {
-                self.state = State::FetchBodyQuotedSkip { escape: false };
+                self.push_text(b)?;
+                self.state = State::FetchBodyQuoted { escape: false };
                 Ok(None)
             }
         }
@@ -2248,11 +2269,48 @@ mod tests {
             })
             .expect("Fetch event");
         assert_eq!(fetch.uid, Some(5));
-        assert_eq!(fetch.body, b"hello world");
+        // Issue #190: a literal's octets are delivered exactly once, via
+        // the streamed `FetchLiteralData` chunks above — `data.body` must
+        // stay empty, not duplicate them.
+        assert!(fetch.body.is_empty());
         assert!(ev.iter().any(|e| matches!(
             e,
             ImapEvent::Tagged { status: ImapStatus::Ok, .. }
         )));
+    }
+
+    #[test]
+    fn fetch_quoted_body_delivered_once_via_data_body_not_streamed() {
+        // The (rare, but grammar-legal) quoted-string form of a BODY[]/
+        // RFC822 value — as opposed to a literal — must be delivered
+        // exactly once via `Fetch(data).body`, and never as
+        // `FetchLiteralData` (issue #190).
+        let mut lex = ImapReplyLexer::new();
+        let ev = feed_all(&mut lex, "* 1 FETCH (UID 5 BODY[] \"hi\")\r\n");
+        assert!(!ev.iter().any(|e| matches!(e, ImapEvent::FetchLiteralData(_))));
+        let fetch = ev
+            .iter()
+            .find_map(|e| match e {
+                ImapEvent::Fetch(d) => Some(d),
+                _ => None,
+            })
+            .expect("Fetch event");
+        assert_eq!(fetch.uid, Some(5));
+        assert_eq!(fetch.body, b"hi");
+    }
+
+    #[test]
+    fn fetch_quoted_body_handles_escapes() {
+        let mut lex = ImapReplyLexer::new();
+        let ev = feed_all(&mut lex, "* 1 FETCH (BODY[] \"a\\\"b\\\\c\")\r\n");
+        let fetch = ev
+            .iter()
+            .find_map(|e| match e {
+                ImapEvent::Fetch(d) => Some(d),
+                _ => None,
+            })
+            .expect("Fetch event");
+        assert_eq!(fetch.body, b"a\"b\\c");
     }
 
     #[test]
@@ -2278,7 +2336,7 @@ mod tests {
                 _ => None,
             })
             .expect("Fetch event");
-        assert_eq!(fetch.body, b"hello");
+        assert!(fetch.body.is_empty());
     }
 
     #[test]
