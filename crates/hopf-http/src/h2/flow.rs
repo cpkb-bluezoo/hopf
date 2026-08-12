@@ -83,13 +83,31 @@ impl FlowControl {
 
     /// Record a WINDOW_UPDATE received from the peer for `stream_id`.
     ///
-    /// Pass `stream_id = 0` for a connection-level update.
-    pub fn on_window_update(&mut self, stream_id: u32, increment: u32) {
+    /// Pass `stream_id = 0` for a connection-level update. Returns `false`
+    /// (window left unchanged) if applying it would push the window past
+    /// 2³¹−1 — RFC 9113 §6.9.1 requires treating that as a
+    /// `FLOW_CONTROL_ERROR`, not silently clamping it.
+    #[must_use]
+    pub fn on_window_update(&mut self, stream_id: u32, increment: u32) -> bool {
         let inc = increment as i32;
         if stream_id == 0 {
-            self.conn_send = self.conn_send.saturating_add(inc);
+            match self.conn_send.checked_add(inc) {
+                Some(v) => {
+                    self.conn_send = v;
+                    true
+                }
+                None => false,
+            }
         } else if let Some(w) = self.stream_send.get_mut(&stream_id) {
-            *w = w.saturating_add(inc);
+            match w.checked_add(inc) {
+                Some(v) => {
+                    *w = v;
+                    true
+                }
+                None => false,
+            }
+        } else {
+            true
         }
     }
 
@@ -144,9 +162,9 @@ mod tests {
         fc.consume_send(1, 40);
         assert_eq!(fc.available_send(1), 60);
         assert_eq!(fc.conn_send_window(), INITIAL_WINDOW_SIZE - 40);
-        fc.on_window_update(1, 10);
+        assert!(fc.on_window_update(1, 10));
         assert_eq!(fc.available_send(1), 70);
-        fc.on_window_update(0, 1000);
+        assert!(fc.on_window_update(0, 1000));
         assert_eq!(fc.conn_send_window(), INITIAL_WINDOW_SIZE - 40 + 1000);
         fc.close_stream(1);
         assert_eq!(fc.available_send(1), 0);
@@ -165,6 +183,40 @@ mod tests {
         let (c2, s2) = fc.on_data_received(3, 1);
         assert_eq!(c2, 0);
         assert_eq!(s2, 0);
+    }
+
+    #[test]
+    fn stream_window_update_overflowing_2_31_minus_1_is_rejected_not_clamped() {
+        let mut fc = FlowControl::new();
+        fc.open_stream(1, i32::MAX - 5);
+        // Raise the connection window out of the way so `available_send`
+        // reflects the stream window alone.
+        assert!(fc.on_window_update(0, (i32::MAX - INITIAL_WINDOW_SIZE) as u32));
+        assert_eq!(fc.available_send(1), (i32::MAX - 5) as usize);
+
+        // Stream window is already within 5 of the RFC 9113 §6.9.1 ceiling
+        // (2^31-1) -- an increment of 10 must be rejected, and the window
+        // must be left exactly as it was, not clamped to the max.
+        assert!(!fc.on_window_update(1, 10));
+        assert_eq!(
+            fc.available_send(1),
+            (i32::MAX - 5) as usize,
+            "must not silently clamp past the ceiling"
+        );
+    }
+
+    #[test]
+    fn connection_window_update_overflowing_2_31_minus_1_is_rejected_not_clamped() {
+        let mut fc = FlowControl::new();
+        assert!(fc.on_window_update(0, (i32::MAX - INITIAL_WINDOW_SIZE) as u32));
+        assert_eq!(fc.conn_send_window(), i32::MAX);
+
+        assert!(!fc.on_window_update(0, 1));
+        assert_eq!(
+            fc.conn_send_window(),
+            i32::MAX,
+            "must not silently clamp past the ceiling"
+        );
     }
 
     #[test]

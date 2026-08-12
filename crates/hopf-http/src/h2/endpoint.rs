@@ -1473,7 +1473,26 @@ impl H2Endpoint {
             self.send_goaway(ERROR_PROTOCOL_ERROR);
             return;
         }
-        self.flow.on_window_update(stream_id, increment);
+        if !self.flow.on_window_update(stream_id, increment) {
+            // RFC 9113 §6.9.1: a WINDOW_UPDATE that would push a
+            // flow-control window past 2³¹−1 is a FLOW_CONTROL_ERROR. A
+            // connection-level overflow has no smaller blast radius than
+            // GOAWAY; a stream-level overflow only needs that one stream
+            // reset.
+            if stream_id == 0 {
+                self.send_goaway(ERROR_FLOW_CONTROL_ERROR);
+                return;
+            }
+            frame::write_rst_stream(&mut self.out, stream_id, ERROR_FLOW_CONTROL_ERROR);
+            self.server_streams.remove(&stream_id);
+            if let Some(mut stream) = self.client_streams.remove(&stream_id) {
+                stream.handler.request_failed(
+                    &mut NullClientWriter,
+                    &std::io::Error::other("stream flow-control window overflow"),
+                );
+            }
+            self.flow.close_stream(stream_id);
+        }
     }
 
     fn send_goaway(&mut self, error_code: u32) {
@@ -1975,7 +1994,7 @@ mod flow_control_tests {
         let remaining = ep.write_data_flow_controlled(1, &body, true);
         ep.out.clear();
 
-        ep.flow.on_window_update(1, 15);
+        assert!(ep.flow.on_window_update(1, 15));
         let remaining2 = ep.write_data_flow_controlled(1, &remaining, true);
 
         assert!(remaining2.is_empty(), "the whole body should now be sent");
@@ -2573,6 +2592,99 @@ mod client_goaway_tests {
 
         assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(ep.client_streams.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod flow_control_error_tests {
+    use super::*;
+    use crate::stream::{ClientHandler, ClientHandlerFactory, ClientWriter};
+
+    struct NoopClientFactory;
+    impl ClientHandlerFactory for NoopClientFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+    fn client_endpoint() -> H2Endpoint {
+        H2Endpoint::client(Arc::new(NoopClientFactory), HttpLimits::default(), false)
+    }
+
+    struct FailTrackingHandler {
+        failed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl ClientHandler for FailTrackingHandler {
+        fn start(&mut self, _request: &mut dyn ClientWriter) {}
+        fn response_headers(&mut self, _request: &mut dyn ClientWriter, _headers: &Headers) {}
+        fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
+            panic!("response_complete must not fire for a reset stream");
+        }
+        fn request_failed(&mut self, _request: &mut dyn ClientWriter, _err: &std::io::Error) {
+            self.failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn insert_client_stream(ep: &mut H2Endpoint, id: u32, failed: &Arc<std::sync::atomic::AtomicUsize>) {
+        ep.client_streams.insert(
+            id,
+            H2ClientStream {
+                id,
+                handler: Box::new(FailTrackingHandler {
+                    failed: Arc::clone(failed),
+                }),
+                response_headers_received: false,
+                response_body_started: false,
+                pending_body: Vec::new(),
+                pending_end_stream: false,
+            },
+        );
+        ep.flow.open_stream(id, i32::MAX - 5);
+    }
+
+    fn window_update_payload(increment: u32) -> Vec<u8> {
+        increment.to_be_bytes().to_vec()
+    }
+
+    /// RFC 9113 §6.9.1: a stream-level WINDOW_UPDATE that would push the
+    /// window past 2^31-1 resets just that stream with FLOW_CONTROL_ERROR
+    /// (not the whole connection), and the waiting client handler is told
+    /// via `request_failed` rather than left to hang.
+    #[test]
+    fn stream_window_overflow_resets_only_that_stream() {
+        let mut ep = client_endpoint();
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        insert_client_stream(&mut ep, 1, &failed);
+        insert_client_stream(&mut ep, 3, &failed);
+
+        ep.on_window_update(1, &window_update_payload(10));
+
+        assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 1, "only stream 1 must fail");
+        assert!(!ep.client_streams.contains_key(&1));
+        assert!(ep.client_streams.contains_key(&3), "stream 3 is untouched");
+        assert_ne!(ep.state, ConnState::GoAway, "must not tear down the whole connection");
+
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_RST_STREAM);
+        let error_code = u32::from_be_bytes([ep.out[9], ep.out[10], ep.out[11], ep.out[12]]);
+        assert_eq!(error_code, ERROR_FLOW_CONTROL_ERROR);
+    }
+
+    /// A connection-level overflow has no smaller blast radius than the
+    /// whole connection: GOAWAY(FLOW_CONTROL_ERROR).
+    #[test]
+    fn connection_window_overflow_sends_goaway() {
+        let mut ep = client_endpoint();
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        insert_client_stream(&mut ep, 1, &failed);
+        // Bring the connection window near the ceiling first.
+        ep.on_window_update(0, &window_update_payload((i32::MAX - crate::h2::flow::INITIAL_WINDOW_SIZE) as u32));
+        ep.out.clear();
+
+        ep.on_window_update(0, &window_update_payload(1));
+
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_GOAWAY);
+        assert_eq!(ep.state, ConnState::GoAway);
     }
 }
 
