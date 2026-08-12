@@ -315,19 +315,33 @@ impl Topology {
 
     /// Re-issue every recorded entry against `client` (the *raw* control,
     /// not a [`TrackingControl`], so replay doesn't re-record itself) in
-    /// channel-open → exchanges → queues → bindings → consumers order —
+    /// channel-open → exchanges → queues → bindings → consumers *phases*,
+    /// each phase covering every channel before the next phase starts —
     /// safe to pipeline without waiting for individual `-ok`s, since AMQP
     /// method delivery is strictly ordered per channel and replay never
     /// depends on a broker-assigned name (it resends the original request
     /// verbatim, including an empty/auto-generated `consumer_tag`).
+    ///
+    /// Phases run across *all* channels rather than per-channel-in-order
+    /// (issue #196): exchanges and queues are broker-global, so a binding
+    /// or consumer can legitimately reference one declared on a different,
+    /// numerically-later channel. Replaying exchange-declares (all
+    /// channels) before queue-declares (all channels) before bindings (all
+    /// channels) before consumers (all channels) guarantees every
+    /// dependency is sent — and, since these are pipelined over one
+    /// ordered TCP stream, processed by the broker — before anything that
+    /// needs it, regardless of which channel originally declared it.
     fn replay(&self, client: &mut dyn AmqpClientControl) {
         let mut channels: Vec<_> = self.channels.keys().copied().collect();
         channels.sort_unstable();
-        for channel in channels {
+
+        for &channel in &channels {
+            client.channel_open(channel);
+        }
+        for &channel in &channels {
             let Some(ch) = self.channels.get(&channel) else {
                 continue;
             };
-            client.channel_open(channel);
             for e in &ch.exchanges {
                 client.exchange_declare(
                     channel,
@@ -340,15 +354,30 @@ impl Topology {
                     &e.arguments,
                 );
             }
+        }
+        for &channel in &channels {
+            let Some(ch) = self.channels.get(&channel) else {
+                continue;
+            };
             for q in &ch.queues {
                 client.queue_declare(
                     channel, &q.queue, q.passive, q.durable, q.exclusive, q.auto_delete,
                     &q.arguments,
                 );
             }
+        }
+        for &channel in &channels {
+            let Some(ch) = self.channels.get(&channel) else {
+                continue;
+            };
             for b in &ch.bindings {
                 client.queue_bind(channel, &b.queue, &b.exchange, &b.routing_key, &b.arguments);
             }
+        }
+        for &channel in &channels {
+            let Some(ch) = self.channels.get(&channel) else {
+                continue;
+            };
             for c in &ch.consumers {
                 client.basic_consume(
                     channel, &c.queue, &c.consumer_tag, c.no_local, c.no_ack, c.exclusive,
@@ -1134,6 +1163,63 @@ mod tests {
                 "basic_consume(q,ctag)".to_string(),
             ]
         );
+    }
+
+    /// Issue #196: an exchange declared on a higher-numbered channel than
+    /// the one that binds to it must still be replayed before the bind —
+    /// replay is phase-based across all channels, not per-channel in
+    /// numeric order.
+    #[test]
+    fn replay_declares_exchange_before_binding_even_across_channels() {
+        let mut t = Topology::default();
+        t.open_channel(2);
+        t.open_channel(5);
+        // App declared the exchange on the higher-numbered channel, then
+        // bound to it from the lower-numbered one.
+        t.declare_exchange(5, "ex", "topic", false, false, false, false, &ft());
+        t.declare_queue(2, "q", false, false, false, false, &ft());
+        t.bind_queue(2, "q", "ex", "rk", &ft());
+
+        let mut control = FakeControl::default();
+        t.replay(&mut control);
+
+        let log = control.log.lock().unwrap().clone();
+        let declare_pos = log
+            .iter()
+            .position(|e| e == "exchange_declare(ex)")
+            .expect("exchange_declare must be replayed");
+        let bind_pos = log
+            .iter()
+            .position(|e| e == "queue_bind(q,ex)")
+            .expect("queue_bind must be replayed");
+        assert!(
+            declare_pos < bind_pos,
+            "exchange_declare must precede queue_bind even when the exchange lives on a higher channel number: {log:?}"
+        );
+    }
+
+    #[test]
+    fn replay_phases_span_all_channels_before_advancing() {
+        let mut t = Topology::default();
+        t.open_channel(1);
+        t.open_channel(2);
+        t.declare_exchange(1, "ex1", "topic", false, false, false, false, &ft());
+        t.declare_exchange(2, "ex2", "topic", false, false, false, false, &ft());
+        t.bind_queue(1, "q1", "ex1", "rk", &ft());
+        t.bind_queue(2, "q2", "ex2", "rk", &ft());
+
+        let mut control = FakeControl::default();
+        t.replay(&mut control);
+        let log = control.log.lock().unwrap().clone();
+
+        // Every exchange_declare (across both channels) must precede every
+        // queue_bind (across both channels).
+        let last_declare = log
+            .iter()
+            .rposition(|e| e.starts_with("exchange_declare"))
+            .unwrap();
+        let first_bind = log.iter().position(|e| e.starts_with("queue_bind")).unwrap();
+        assert!(last_declare < first_bind, "{log:?}");
     }
 
     #[test]
