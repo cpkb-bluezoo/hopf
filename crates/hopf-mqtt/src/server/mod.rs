@@ -17,6 +17,7 @@ mod handler;
 mod metrics;
 mod publish_spool;
 mod service;
+mod spool_file;
 pub mod store;
 
 #[cfg(feature = "websocket")]
