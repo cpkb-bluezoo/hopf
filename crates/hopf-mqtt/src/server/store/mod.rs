@@ -10,8 +10,10 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use hopf_core::{ConnHandle, Runtime, StorageError};
 
 use crate::codec::properties::property;
 use crate::codec::{Properties, QoS};
@@ -135,26 +137,107 @@ impl MqttMessageStore for InMemoryMessageStore {
     }
 }
 
+/// One queued disk operation for a subscriber's offline-queue file (issue
+/// #187) — see [`FileBackedMessageStore::queues`].
+enum StoreJob {
+    Append(QueuedMessage),
+    ClearFile,
+}
+
+/// Per-subscriber ordered queue of pending [`StoreJob`]s — separate from
+/// [`FileBackedMessageStore`] so the storage-pool callback (which only
+/// ever gets a cloned `Arc`, never `&FileBackedMessageStore`) can safely
+/// reach it.
+#[derive(Default)]
+struct SubQueue {
+    queue: VecDeque<StoreJob>,
+    /// One job in flight at a time — set while a job is submitted to the
+    /// storage pool, cleared once its callback lands and the queue is
+    /// empty.
+    draining: bool,
+}
+
 /// File-backed offline queue: one JSONL-ish binary record file per subscriber
 /// under `root`. In-flight state stays in memory (process-local).
+///
+/// `append_file`/`clear_offline`'s file write/remove are offloaded to
+/// `hopf_core::StorageExecutor` (issue #187) rather than done inline on the
+/// reactor thread, one queue per subscriber so two publishes queued for the
+/// *same* offline subscriber still land on disk in the order they were
+/// enqueued (`StorageExecutor::submit_on` doesn't guarantee ordering across
+/// separate calls) — mirrors `hopf_smtp::server::spool`'s
+/// `drain_next`/`hopf_mqtt::server::publish_spool`'s
+/// `drain_next_publish_chunk`, just keyed by subscriber instead of having
+/// one queue per connection.
+///
+/// `take_offline`'s disk read stays synchronous — its
+/// `-> Vec<QueuedMessage>` return value is needed immediately by
+/// `BrokerState::drain_offline`, which can't be made fire-and-forget the
+/// way the write side can without changing this trait's signature (a
+/// separable, larger piece of work — see the issue #187 follow-up). Taking
+/// `queues`' not-yet-started jobs for that subscriber narrows, but doesn't
+/// fully close, the resulting race against a job already in flight at the
+/// exact moment of a resume (see [`Self::take_offline`]).
 pub struct FileBackedMessageStore {
     root: PathBuf,
     inner: InMemoryMessageStore,
+    queues: Mutex<HashMap<SubscriberId, Arc<Mutex<SubQueue>>>>,
+    runtime: Arc<Runtime>,
+    /// Routing target for offloaded jobs' `submit_on` callbacks — no live
+    /// connection is ever relevant to this store's own bookkeeping, so a
+    /// task-only handle (`submit_on`'s callback dispatch only ever calls
+    /// `ConnHandle::execute` on it, never `with_endpoint`) is enough.
+    detached: ConnHandle,
 }
 
 impl FileBackedMessageStore {
-    /// Store offline payloads under `root` (created if missing).
-    pub fn new(root: impl Into<PathBuf>) -> std::io::Result<Self> {
+    /// Store offline payloads under `root` (created if missing). `runtime`
+    /// lets writes offload to `hopf_core::StorageExecutor` (issue #187).
+    pub fn new(root: impl Into<PathBuf>, runtime: Arc<Runtime>) -> std::io::Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         Ok(Self {
             root,
             inner: InMemoryMessageStore::new(),
+            queues: Mutex::new(HashMap::new()),
+            runtime,
+            detached: ConnHandle::from_execute(Arc::new(|task| task())),
         })
     }
 
     fn path_for(&self, subscriber: SubscriberId) -> PathBuf {
         self.root.join(format!("offline-{}.bin", subscriber.0))
+    }
+
+    fn queue_for(&self, subscriber: SubscriberId) -> Arc<Mutex<SubQueue>> {
+        Arc::clone(
+            self.queues
+                .lock()
+                .unwrap()
+                .entry(subscriber)
+                .or_insert_with(|| Arc::new(Mutex::new(SubQueue::default()))),
+        )
+    }
+
+    /// Queue `job` for `subscriber`, kicking off the drain if nothing else
+    /// is already in flight for it.
+    fn submit_job(&self, subscriber: SubscriberId, job: StoreJob) {
+        let state = self.queue_for(subscriber);
+        let mut g = state.lock().unwrap();
+        g.queue.push_back(job);
+        let should_start = !g.draining;
+        if should_start {
+            g.draining = true;
+        }
+        drop(g);
+        if should_start {
+            drain_next_store_job(
+                self.path_for(subscriber),
+                state,
+                Arc::clone(&self.runtime),
+                self.detached.clone(),
+            );
+        }
     }
 
     fn append_file(path: &Path, msg: &QueuedMessage) -> std::io::Result<()> {
@@ -235,6 +318,47 @@ impl FileBackedMessageStore {
     }
 }
 
+/// Drain the next queued job (if any) for one subscriber's offline-queue
+/// file by submitting it to the storage pool; on completion, either drains
+/// the next one or clears `draining` once the queue is empty. Free
+/// function (not a method) since it needs to re-invoke itself from inside
+/// a `'static` storage callback, which only has cloned `Arc`s/a
+/// `ConnHandle`, not `&FileBackedMessageStore`. A job's own error (e.g. a
+/// failed append) doesn't stop later queued jobs — each is an independent
+/// unit (a distinct message, or a clear), unlike an ordered spool write
+/// where one chunk's failure invalidates the rest of the same file.
+fn drain_next_store_job(path: PathBuf, state: Arc<Mutex<SubQueue>>, runtime: Arc<Runtime>, handle: ConnHandle) {
+    let job = {
+        let mut g = state.lock().unwrap();
+        match g.queue.pop_front() {
+            Some(j) => j,
+            None => {
+                g.draining = false;
+                return;
+            }
+        }
+    };
+    let cb_state = Arc::clone(&state);
+    let cb_runtime = Arc::clone(&runtime);
+    let cb_handle = handle.clone();
+    let op_path = path.clone();
+    runtime.storage().submit_on(
+        handle,
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            match job {
+                StoreJob::Append(msg) => FileBackedMessageStore::append_file(&op_path, &msg)?,
+                StoreJob::ClearFile => {
+                    let _ = fs::remove_file(&op_path);
+                }
+            }
+            Ok(())
+        },
+        move |_result: Result<(), StorageError>| {
+            drain_next_store_job(path, cb_state, cb_runtime, cb_handle);
+        },
+    );
+}
+
 fn encode_props_simple(props: &Properties) -> Vec<u8> {
     // Persist Message Expiry Interval only (enough for offline dequeue).
     let mut out = Vec::new();
@@ -267,12 +391,22 @@ impl MqttMessageStore for FileBackedMessageStore {
         if msg.qos == QoS::AtMostOnce {
             return;
         }
-        let path = self.path_for(subscriber);
-        let _ = Self::append_file(&path, &msg);
+        self.submit_job(subscriber, StoreJob::Append(msg.clone()));
         self.inner.enqueue_offline(subscriber, msg);
     }
 
+    /// Disk read stays synchronous here — see the type-level doc comment
+    /// for why, and for the residual race this narrows but doesn't fully
+    /// close. Discarding this subscriber's not-yet-started queued jobs
+    /// keeps any of them from resurrecting the file (with an already-
+    /// in-memory-covered message) after it's removed here; a job already
+    /// mid-flight on a storage thread at this exact moment can still race
+    /// it — closing that needs `take_offline` itself to go through the
+    /// same queue, which is the deferred follow-up work.
     fn take_offline(&self, subscriber: SubscriberId) -> Vec<QueuedMessage> {
+        if let Some(state) = self.queues.lock().unwrap().get(&subscriber) {
+            state.lock().unwrap().queue.clear();
+        }
         let path = self.path_for(subscriber);
         let from_disk = Self::read_all(&path).unwrap_or_default();
         let _ = fs::remove_file(&path);
@@ -286,7 +420,7 @@ impl MqttMessageStore for FileBackedMessageStore {
     }
 
     fn clear_offline(&self, subscriber: SubscriberId) {
-        let _ = fs::remove_file(self.path_for(subscriber));
+        self.submit_job(subscriber, StoreJob::ClearFile);
         self.inner.clear_offline(subscriber);
     }
 
@@ -320,6 +454,103 @@ pub fn queued_message(
         retain,
         properties: properties.clone(),
         received_at,
+    }
+}
+
+#[cfg(test)]
+mod file_backed_tests {
+    use super::*;
+
+    fn wait_for(mut pred: impl FnMut() -> bool, max_ms: u64) -> bool {
+        for _ in 0..(max_ms / 5).max(1) {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pred()
+    }
+
+    /// Issue #187: back-to-back `enqueue_offline` calls for the *same*
+    /// subscriber must still land on disk in submission order, even though
+    /// each call's write is independently offloaded (`submit_on` gives no
+    /// cross-call ordering guarantee on its own — `SubQueue`'s per-
+    /// subscriber drain is what restores it).
+    #[test]
+    fn per_subscriber_appends_land_in_order_despite_offloading() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Arc::new(Runtime::start(hopf_core::RuntimeConfig::default()).unwrap());
+        let store = FileBackedMessageStore::new(dir.path(), Arc::clone(&rt)).unwrap();
+        let id = SubscriberId(42);
+
+        let mut expected_topics = Vec::new();
+        for i in 0..20 {
+            let topic = format!("t/{i:02}");
+            expected_topics.push(topic.clone());
+            store.enqueue_offline(
+                id,
+                queued_message(
+                    &topic,
+                    format!("payload{i:02}").as_bytes(),
+                    QoS::AtLeastOnce,
+                    false,
+                    &Properties::new(),
+                ),
+            );
+        }
+
+        assert!(
+            wait_for(
+                || {
+                    let state = store.queue_for(id);
+                    let g = state.lock().unwrap();
+                    !g.draining && g.queue.is_empty()
+                },
+                3000
+            ),
+            "all offloaded appends must eventually drain"
+        );
+
+        let path = store.path_for(id);
+        let on_disk = FileBackedMessageStore::read_all(&path).unwrap();
+        let topics: Vec<String> = on_disk.iter().map(|m| m.topic.clone()).collect();
+        assert_eq!(
+            topics, expected_topics,
+            "messages for one subscriber must land on disk in enqueue order despite offloaded writes"
+        );
+    }
+
+    /// A subscriber-scoped `clear_offline` queued behind pending appends
+    /// must still run after them (folded into the same per-subscriber
+    /// queue), leaving no on-disk file — not racing ahead and being
+    /// resurrected by a later append landing after it.
+    #[test]
+    fn clear_offline_queued_behind_appends_runs_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = Arc::new(Runtime::start(hopf_core::RuntimeConfig::default()).unwrap());
+        let store = FileBackedMessageStore::new(dir.path(), Arc::clone(&rt)).unwrap();
+        let id = SubscriberId(7);
+
+        for i in 0..5 {
+            store.enqueue_offline(
+                id,
+                queued_message(&format!("t/{i}"), b"x", QoS::AtLeastOnce, false, &Properties::new()),
+            );
+        }
+        store.clear_offline(id);
+
+        assert!(
+            wait_for(
+                || {
+                    let state = store.queue_for(id);
+                    let g = state.lock().unwrap();
+                    !g.draining && g.queue.is_empty()
+                },
+                3000
+            ),
+            "append + clear jobs must eventually drain"
+        );
+        assert!(!store.path_for(id).exists(), "clear must run after the appends it was queued behind");
     }
 }
 

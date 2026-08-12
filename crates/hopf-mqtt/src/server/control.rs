@@ -3,7 +3,7 @@
 //! `MqttControlHandler` — the per-connection `ProtocolHandler` driving the
 //! MQTT wire protocol against shared [`BrokerState`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -176,6 +176,25 @@ pub struct MqttControlHandler {
     /// check resolves).
     pub(crate) busy: Arc<AtomicBool>,
     pub(crate) pending_auth_check: Arc<Mutex<Option<AuthStepOutcome>>>,
+    /// PUBLISHes whose `end_publish` ran before their spool write finished
+    /// draining (issue #187) — `sync_pending_publish_finish` completes
+    /// each once ready, triggered by the last chunk's `poke_handler` call
+    /// (see `publish_spool::drain_next_publish_chunk`). A queue, not a
+    /// single slot: MQTT lets a client pipeline multiple in-flight QoS-1/2
+    /// PUBLISHes without waiting for each PUBACK, so more than one publish
+    /// can legitimately be mid-drain at once.
+    pending_publish_finishes: Arc<Mutex<VecDeque<PendingPublishFinish>>>,
+}
+
+/// A [`PendingPublish`] whose `end_publish` ran while its spool write was
+/// still draining — see `MqttControlHandler::pending_publish_finishes`.
+/// Owns `telemetry` itself (rather than leaving it in a single
+/// `MqttControlHandler::publish_tel` slot) so two overlapping publishes'
+/// telemetry can't clobber each other.
+struct PendingPublishFinish {
+    pending: PendingPublish,
+    version: ProtocolVersion,
+    telemetry: Option<PublishTelemetry>,
 }
 
 impl MqttControlHandler {
@@ -218,6 +237,7 @@ impl MqttControlHandler {
             control_handle: None,
             busy: Arc::new(AtomicBool::new(false)),
             pending_auth_check: Arc::new(Mutex::new(None)),
+            pending_publish_finishes: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -262,6 +282,15 @@ impl MqttControlHandler {
         if let Some(tel) = self.publish_tel.take() {
             tel.finish(false);
         }
+        // Any publish still deferred, waiting on `pending_publish_finishes`
+        // (issue #187), never gets a chance for `sync_pending_publish_finish`
+        // to finish its telemetry — the connection's gone. Finish each as
+        // failed here instead of silently dropping it.
+        for pending in self.pending_publish_finishes.lock().unwrap().drain(..) {
+            if let Some(tel) = pending.telemetry {
+                tel.finish(false);
+            }
+        }
         if let Some(trace) = self.conn_trace.take() {
             let root = trace.root_span();
             root.set_status_ok();
@@ -293,8 +322,14 @@ impl MqttControlHandler {
         ));
     }
 
-    fn finish_publish_telemetry(&mut self, ok: bool) {
-        if let Some(tel) = self.publish_tel.take() {
+    /// Finish and record `tel` (typically `self.publish_tel.take()` for a
+    /// publish that resolved inline, or a [`PendingPublishFinish`]'s own
+    /// owned telemetry for one that was deferred — issue #187's deferred-
+    /// finish path takes ownership of the telemetry at `end_publish` time
+    /// instead of leaving it in the single `publish_tel` slot, so two
+    /// overlapping publishes' telemetry can't clobber each other).
+    fn finish_publish_telemetry_for(&mut self, tel: Option<PublishTelemetry>, ok: bool) {
+        if let Some(tel) = tel {
             tel.finish(ok);
         }
         if let Some(trace) = &self.conn_trace {
@@ -346,6 +381,7 @@ impl ProtocolHandler for MqttControlHandler {
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         crate::server::auth::sync_pending_auth_check(self, endpoint);
+        sync_pending_publish_finish(self, endpoint);
         // `Ctx` borrows `self` for the duration of the callbacks, so the
         // parser driving those callbacks can't live inside `self` while
         // it's being called — swap it out for the duration of `push`.
@@ -384,14 +420,18 @@ impl ProtocolHandler for MqttControlHandler {
                             will.qos,
                             will.retain,
                             &will.properties,
+                            Arc::clone(&self.runtime),
+                            endpoint.handle(),
                         );
                     } else {
                         let epoch = self.config.broker.park_delayed_will(&session.client_id, will);
                         let broker = Arc::clone(&self.config.broker);
                         let client_id = session.client_id.clone();
+                        let runtime = Arc::clone(&self.runtime);
+                        let handle = endpoint.handle();
                         endpoint.schedule_timer(
                             delay,
-                            Box::new(move || broker.fire_delayed_will(&client_id, epoch)),
+                            Box::new(move || broker.fire_delayed_will(&broker, &client_id, epoch, runtime, handle)),
                         );
                     }
                 }
@@ -408,9 +448,11 @@ impl ProtocolHandler for MqttControlHandler {
                 let epoch = self.config.broker.orphan(session.subscriber_id);
                 let broker = Arc::clone(&self.config.broker);
                 let id = session.subscriber_id;
+                let runtime = Arc::clone(&self.runtime);
+                let handle = endpoint.handle();
                 endpoint.schedule_timer(
                     session.session_expiry,
-                    Box::new(move || broker.expire_orphan(id, epoch)),
+                    Box::new(move || broker.expire_orphan(&broker, id, epoch, runtime, handle)),
                 );
             }
         }
@@ -547,6 +589,69 @@ impl Ctx<'_, '_> {
             }
         }
         self.endpoint.close();
+    }
+
+    /// Run a [`PendingPublish`]'s `finish` (already known ready) and send
+    /// the resulting PUBACK/PUBREC. Shared by `end_publish`'s fast path and
+    /// `sync_pending_publish_finish`'s deferred one (issue #187).
+    fn finish_ready_publish(
+        &mut self,
+        pending: PendingPublish,
+        version: ProtocolVersion,
+        telemetry: Option<PublishTelemetry>,
+    ) {
+        let (qos, packet_id) = (pending.header.qos, pending.header.packet_id);
+        pending.finish(self.broker());
+        self.handler.finish_publish_telemetry_for(telemetry, true);
+
+        let SessionState::Connected(session) = &mut self.handler.session else {
+            return;
+        };
+        match qos {
+            QoS::AtMostOnce => {}
+            QoS::AtLeastOnce => {
+                let wire = encode::encode_puback(packet_id, reason::SUCCESS, &Properties::new(), version);
+                self.endpoint.send(&wire);
+            }
+            QoS::ExactlyOnce => {
+                session.awaiting_pubrel.insert(packet_id);
+                let wire = encode::encode_pubrec(packet_id, reason::SUCCESS, &Properties::new(), version);
+                self.endpoint.send(&wire);
+            }
+        }
+    }
+}
+
+/// Re-invoke every deferred [`PendingPublishFinish`] whose spool write has
+/// finished draining (issue #187) — mirrors `sync_pending_auth_check`
+/// (#181). Called from the top of `receive()`, since the storage callback
+/// that finishes the last chunk only has a bare `ConnHandle`, not `&mut
+/// MqttControlHandler`, so it stashes the outcome and pokes instead of
+/// calling back in directly.
+fn sync_pending_publish_finish(handler: &mut MqttControlHandler, endpoint: &mut dyn Endpoint) {
+    let ready: Vec<PendingPublishFinish> = {
+        let mut queue = handler.pending_publish_finishes.lock().unwrap();
+        if queue.is_empty() {
+            return;
+        }
+        let mut ready = Vec::new();
+        let mut remaining = VecDeque::new();
+        for item in queue.drain(..) {
+            if item.pending.is_ready() {
+                ready.push(item);
+            } else {
+                remaining.push_back(item);
+            }
+        }
+        *queue = remaining;
+        ready
+    };
+    if ready.is_empty() {
+        return;
+    }
+    let mut ctx = Ctx { handler, endpoint, pending_version: None };
+    for PendingPublishFinish { pending, version, telemetry } in ready {
+        ctx.finish_ready_publish(pending, version, telemetry);
     }
 }
 
@@ -806,7 +911,9 @@ impl MqttFrameHandler for Ctx<'_, '_> {
         let subscriber_id = session.subscriber_id;
         let qos = header.qos;
         let bytes = header.payload_len as u64;
-        let pending = PendingPublish::begin(self.broker(), subscriber_id, header);
+        let runtime = Arc::clone(&self.handler.runtime);
+        let handle = self.endpoint.handle();
+        let pending = PendingPublish::begin(self.broker(), subscriber_id, header, runtime, handle);
         let SessionState::Connected(session) = &mut self.handler.session else {
             return;
         };
@@ -833,24 +940,21 @@ impl MqttFrameHandler for Ctx<'_, '_> {
             return;
         };
         let version = session.version;
-        let (qos, packet_id) = (pending.header.qos, pending.header.packet_id);
-        pending.finish(self.broker());
-        self.handler.finish_publish_telemetry(true);
-
-        let SessionState::Connected(session) = &mut self.handler.session else {
-            return;
-        };
-        match qos {
-            QoS::AtMostOnce => {}
-            QoS::AtLeastOnce => {
-                let wire = encode::encode_puback(packet_id, reason::SUCCESS, &Properties::new(), version);
-                self.endpoint.send(&wire);
-            }
-            QoS::ExactlyOnce => {
-                session.awaiting_pubrel.insert(packet_id);
-                let wire = encode::encode_pubrec(packet_id, reason::SUCCESS, &Properties::new(), version);
-                self.endpoint.send(&wire);
-            }
+        let telemetry = self.handler.publish_tel.take();
+        if pending.is_ready() {
+            self.finish_ready_publish(pending, version, telemetry);
+        } else {
+            // Spool writes from this publish are still draining (issue
+            // #187) — defer both `finish` and the PUBACK/PUBREC;
+            // `sync_pending_publish_finish` picks this back up once
+            // `is_ready()` is true, triggered by the last write's
+            // `poke_handler` call (see
+            // `publish_spool::drain_next_publish_chunk`).
+            self.handler
+                .pending_publish_finishes
+                .lock()
+                .unwrap()
+                .push_back(PendingPublishFinish { pending, version, telemetry });
         }
     }
 
@@ -919,7 +1023,7 @@ impl MqttFrameHandler for Ctx<'_, '_> {
                             if send_retained {
                                 for (topic, msg) in self.broker().retained_matching(&filter.topic_filter) {
                                     self.broker().deliver_retained(
-                                        subscriber_id, &topic, &msg, granted_qos,
+                                        subscriber_id, &topic, &msg, granted_qos, &self.handler.runtime,
                                     );
                                 }
                             }
@@ -1048,6 +1152,229 @@ pub(crate) fn finish_connect_after_auth(
 }
 
 #[cfg(test)]
+mod publish_finish_tests {
+    use super::*;
+    use crate::codec::encode;
+    use crate::codec::packet::{ConnectPacket, PacketType};
+    use crate::server::handler::DefaultMqttHandlerFactory;
+    use crate::server::handler::MqttHandlerFactory;
+    use hopf_core::{RuntimeConfig, SecurityInfo, StartTlsError, WriteReadyCallback};
+    use std::io;
+    use std::sync::OnceLock;
+
+    /// Minimal `Endpoint`: captures sent bytes, no real I/O or reactor —
+    /// same shape as `hopf-smtp`/`hopf-imap`'s own test-only endpoint stubs.
+    struct MockEndpoint {
+        sent: Vec<u8>,
+        open: bool,
+    }
+    impl MockEndpoint {
+        fn new() -> Self {
+            Self { sent: Vec::new(), open: true }
+        }
+    }
+    impl Endpoint for MockEndpoint {
+        fn send(&mut self, data: &[u8]) {
+            self.sent.extend_from_slice(data);
+        }
+        fn is_open(&self) -> bool {
+            self.open
+        }
+        fn is_closing(&self) -> bool {
+            false
+        }
+        fn close(&mut self) {
+            self.open = false;
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:1883".parse().unwrap())
+        }
+        fn remote_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:9999".parse().unwrap())
+        }
+        fn security_info(&self) -> &SecurityInfo {
+            static PLAINTEXT: OnceLock<SecurityInfo> = OnceLock::new();
+            PLAINTEXT.get_or_init(SecurityInfo::plaintext)
+        }
+        fn start_tls(&mut self) -> Result<(), StartTlsError> {
+            Err(StartTlsError::Unsupported)
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _callback: Option<WriteReadyCallback>) {}
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            task();
+        }
+        fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+            TimerHandle::from_cancel(|| {})
+        }
+        fn handle(&self) -> ConnHandle {
+            ConnHandle::from_execute(Arc::new(|task| task()))
+        }
+    }
+
+    fn new_handler() -> MqttControlHandler {
+        let config = Arc::new(
+            MqttConfig::new("127.0.0.1:1883".parse().unwrap(), Arc::new(BrokerState::new()))
+                .allow_anonymous(),
+        );
+        let factory = DefaultMqttHandlerFactory::new(None, true);
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        MqttControlHandler::new(
+            config,
+            factory.create(),
+            factory.create_publish(),
+            factory.create_subscribe(),
+            MqttServerMetrics::shared(),
+            rt,
+        )
+    }
+
+    fn connect_bytes(client_id: &str) -> Vec<u8> {
+        encode::encode_connect(&ConnectPacket {
+            version: ProtocolVersion::V311,
+            clean_session: true,
+            keep_alive: 0,
+            properties: Properties::new(),
+            client_id: client_id.to_string(),
+            will: None,
+            username: None,
+            password: None,
+        })
+    }
+
+    fn wait_for(mut pred: impl FnMut() -> bool, max_ms: u64) -> bool {
+        for _ in 0..(max_ms / 5).max(1) {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pred()
+    }
+
+    /// The next packet type in `sent` starting at `offset`, if any.
+    fn packet_type_at(sent: &[u8], offset: usize) -> Option<PacketType> {
+        sent.get(offset).and_then(|b| PacketType::from_value(b >> 4))
+    }
+
+    /// Issue #187: PUBACK for a retained, QoS-1 PUBLISH must not be sent
+    /// until its spool write has actually landed on disk — proven here by
+    /// checking the retained store already has the full expected payload
+    /// at the exact moment the PUBACK first appears in `sent`, not merely
+    /// "eventually".
+    #[test]
+    fn end_publish_defers_puback_until_spool_write_lands() {
+        let mut h = new_handler();
+        let mut ep = MockEndpoint::new();
+        h.connected(&mut ep);
+
+        let mut data = connect_bytes("pub1").into_boxed_slice();
+        h.receive(&mut ep, &mut &*data);
+        assert_eq!(packet_type_at(&ep.sent, 0), Some(PacketType::Connack));
+        let after_connack = ep.sent.len();
+
+        let payload = vec![0x5A; 64 * 1024];
+        let publish = encode::encode_publish(
+            "t/deferred", QoS::AtLeastOnce, false, true, 42, &payload, &Properties::new(), ProtocolVersion::V311,
+        );
+        data = publish.into_boxed_slice();
+        h.receive(&mut ep, &mut &*data);
+
+        // The PUBACK must not have been appended synchronously, inline
+        // within the very `receive()` call that carried the PUBLISH — it
+        // can only be sent once `sync_pending_publish_finish` picks the
+        // finished write back up on a later `receive()`.
+        assert_eq!(
+            ep.sent.len(), after_connack,
+            "PUBACK must be deferred, not sent inline, while the spool write is still draining"
+        );
+
+        assert!(
+            wait_for(
+                || {
+                    h.receive(&mut ep, &mut &[][..]);
+                    ep.sent.len() > after_connack
+                },
+                3000
+            ),
+            "PUBACK must eventually be sent once the spool write drains"
+        );
+        assert_eq!(packet_type_at(&ep.sent, after_connack), Some(PacketType::Puback));
+        assert_eq!(&ep.sent[after_connack + 2..after_connack + 4], &42u16.to_be_bytes());
+
+        let snap = h.config.broker.retained_matching("t/deferred");
+        assert_eq!(snap.len(), 1);
+        let path = snap[0].1.path.as_ref().expect("spooled").path().to_path_buf();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            payload,
+            "retained payload must already be fully on disk by the time PUBACK is observed"
+        );
+    }
+
+    /// Two pipelined QoS-1 PUBLISHes, both deferred, must each get their
+    /// own correct PUBACK (right packet id) and telemetry/publish-count
+    /// bookkeeping without clobbering each other (issue #187 — the
+    /// `PendingPublishFinish` queue, not a single slot, is what prevents
+    /// this).
+    #[test]
+    fn overlapping_pipelined_publishes_each_finish_independently() {
+        let mut h = new_handler();
+        let mut ep = MockEndpoint::new();
+        h.connected(&mut ep);
+
+        let mut data = connect_bytes("pub2").into_boxed_slice();
+        h.receive(&mut ep, &mut &*data);
+        let after_connack = ep.sent.len();
+
+        let payload_a = vec![0xAA; 32 * 1024];
+        let payload_b = vec![0xBB; 48 * 1024];
+        let publish_a = encode::encode_publish(
+            "t/a", QoS::AtLeastOnce, false, true, 1, &payload_a, &Properties::new(), ProtocolVersion::V311,
+        );
+        let publish_b = encode::encode_publish(
+            "t/b", QoS::AtLeastOnce, false, true, 2, &payload_b, &Properties::new(), ProtocolVersion::V311,
+        );
+        data = publish_a.into_boxed_slice();
+        h.receive(&mut ep, &mut &*data);
+        data = publish_b.into_boxed_slice();
+        h.receive(&mut ep, &mut &*data);
+
+        assert!(
+            wait_for(
+                || {
+                    h.receive(&mut ep, &mut &[][..]);
+                    h.pending_publish_finishes.lock().unwrap().is_empty()
+                },
+                3000
+            ),
+            "both pipelined publishes must eventually finish"
+        );
+
+        let mut packet_ids = Vec::new();
+        let mut offset = after_connack;
+        while offset < ep.sent.len() {
+            assert_eq!(packet_type_at(&ep.sent, offset), Some(PacketType::Puback));
+            packet_ids.push(u16::from_be_bytes([ep.sent[offset + 2], ep.sent[offset + 3]]));
+            offset += 4;
+        }
+        packet_ids.sort_unstable();
+        assert_eq!(packet_ids, vec![1, 2], "each publish must get exactly one correctly-numbered PUBACK");
+
+        assert_eq!(
+            std::fs::read(h.config.broker.retained_matching("t/a")[0].1.path.as_ref().unwrap().path()).unwrap(),
+            payload_a
+        );
+        assert_eq!(
+            std::fs::read(h.config.broker.retained_matching("t/b")[0].1.path.as_ref().unwrap().path()).unwrap(),
+            payload_b
+        );
+        assert_eq!(h.metrics.publishes.load(Ordering::Relaxed), 2);
+    }
+}
+
+#[cfg(test)]
 mod telemetry_tests {
     use super::*;
     use crate::server::handler::DefaultMqttHandlerFactory;
@@ -1097,7 +1424,8 @@ mod telemetry_tests {
         let pub_ctx = SpanContext::from_traceparent(&pub_tp).unwrap();
         assert_eq!(pub_ctx.trace_id, ctx.trace_id);
         assert_ne!(pub_ctx.span_id, ctx.span_id);
-        h.finish_publish_telemetry(true);
+        let tel = h.publish_tel.take();
+        h.finish_publish_telemetry_for(tel, true);
 
         h.end_connection_telemetry();
         assert!(h.meta.traceparent.is_none());
