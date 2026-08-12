@@ -15,7 +15,10 @@ static ENTRIES: RwLock<Option<HashMap<String, Vec<IpAddr>>>> = RwLock::new(None)
 pub struct HostsFile;
 
 impl HostsFile {
-    /// Warm the cache (call at process start).
+    /// Warm the process-wide cache. Called automatically by
+    /// `DnsResolver::new` (issue #183) — exposed publicly too, for callers
+    /// who want the first real lookup to be fast without constructing a
+    /// resolver first, or who want to eagerly re-warm after `reload()`.
     pub fn warm() {
         let _ = Self::lookup("localhost");
     }
@@ -92,6 +95,18 @@ fn load_hosts() -> std::io::Result<HashMap<String, Vec<IpAddr>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #183: `DnsResolver::new` calls this so the first real
+    /// `lookup()` (possibly made while holding the resolver's
+    /// query-serializing mutex) never has to block on `/etc/hosts` itself
+    /// — confirm it actually populates the cache, robust to whether
+    /// `/etc/hosts` exists in the test environment (`load_hosts` falls
+    /// back to an empty map on any read error).
+    #[test]
+    fn warm_populates_the_cache() {
+        HostsFile::warm();
+        assert!(ENTRIES.read().unwrap().is_some());
+    }
 
     #[test]
     fn parse_literals() {
