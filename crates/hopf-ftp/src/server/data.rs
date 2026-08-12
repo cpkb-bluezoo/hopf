@@ -2,11 +2,12 @@
 
 //! Data-connection bridge and handler (PASV accept / active dial).
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
-use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, StorageExecutor};
+use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, StorageError, StorageExecutor};
 use hopf_otel::{RequestTimer, Span, FtpServerMetrics as OtelFtpMetrics};
 
 use crate::server::ascii::{AsciiNewlineDenormalizer, AsciiNewlineNormalizer};
@@ -136,6 +137,12 @@ impl DataBridge {
     /// Bind the control ConnHandle (for 226 replies after transfer).
     pub fn set_control(&self, handle: ConnHandle) {
         self.inner.lock().unwrap().control_handle = Some(handle);
+    }
+
+    /// Storage pool this bridge's transfers offload to — also used by
+    /// [`FtpDataHandler`] to offload STOR upload writes (issue #224).
+    pub fn storage(&self) -> Arc<StorageExecutor> {
+        Arc::clone(&self.inner.lock().unwrap().storage)
     }
 
     /// Queue RETR / LIST; starts when the data peer is connected.
@@ -373,6 +380,144 @@ impl DataBridge {
     }
 }
 
+/// Ordered, offloaded write queue for one STOR/APPE/STOU upload (issue
+/// #224) — `FtpDataHandler::receive` only ever enqueues; the actual
+/// `Write::write_all` calls run on the storage pool, one chunk at a time,
+/// in submission order (writes to the same writer must land in order;
+/// `StorageExecutor::submit_on` gives no cross-call ordering guarantee on
+/// its own) — mirrors `hopf_mqtt::server::publish_spool`'s
+/// `SpoolWriteState`/`drain_next_publish_chunk`.
+struct StorWriteState {
+    writer: Option<Box<dyn Write + Send>>,
+    /// NVFS path / observer, duplicated from `FtpDataHandler` so the
+    /// storage-pool completion callback (which only ever gets a cloned
+    /// `Arc`, never `&FtpDataHandler`) can report per-chunk progress once
+    /// each chunk's write has actually landed, not just been received.
+    path: String,
+    observer: Option<Arc<dyn TransferObserver>>,
+    queue: VecDeque<Vec<u8>>,
+    /// One write in flight at a time — set while a chunk is submitted to
+    /// the storage pool, cleared once its callback lands and the queue is
+    /// empty.
+    draining: bool,
+    /// Set once a write fails — remaining queued chunks are dropped
+    /// rather than written after a gap.
+    error: bool,
+    bytes_written: u64,
+    /// Set by [`finish_stor_when_drained`] when the queue isn't already
+    /// empty at that point — run once, right here on the storage thread,
+    /// the moment the queue actually empties. Carries `(bytes_written,
+    /// had_error)` for the caller to decide success/failure.
+    on_drained: Option<Box<dyn FnOnce(u64, bool) + Send>>,
+}
+
+/// Queue `chunk` for `state`, kicking off the drain if nothing else is
+/// already in flight. A no-op once `state` has latched an error, or for
+/// an empty chunk (nothing to write).
+fn enqueue_stor_chunk(state: &Arc<Mutex<StorWriteState>>, storage: &Arc<StorageExecutor>, handle: &ConnHandle, chunk: Vec<u8>) {
+    if chunk.is_empty() {
+        return;
+    }
+    let mut g = state.lock().unwrap();
+    if g.error {
+        return;
+    }
+    g.queue.push_back(chunk);
+    let should_start = !g.draining;
+    if should_start {
+        g.draining = true;
+    }
+    drop(g);
+    if should_start {
+        drain_next_stor_chunk(Arc::clone(state), Arc::clone(storage), handle.clone());
+    }
+}
+
+/// Drain the next queued chunk (if any) by submitting its write to the
+/// storage pool; on completion, either drains the next one, or — once the
+/// queue is empty — runs `on_drained` if [`finish_stor_when_drained`] set
+/// one while writes were still in flight. Free function (not a method)
+/// since it needs to re-invoke itself from inside a `'static` storage
+/// callback, which only has cloned `Arc`s/a `ConnHandle`.
+fn drain_next_stor_chunk(state: Arc<Mutex<StorWriteState>>, storage: Arc<StorageExecutor>, handle: ConnHandle) {
+    let chunk = {
+        let mut g = state.lock().unwrap();
+        if g.error {
+            g.queue.clear();
+            g.draining = false;
+            if let Some(cb) = g.on_drained.take() {
+                let bytes = g.bytes_written;
+                drop(g);
+                cb(bytes, true);
+            }
+            return;
+        }
+        match g.queue.pop_front() {
+            Some(c) => c,
+            None => {
+                g.draining = false;
+                if let Some(cb) = g.on_drained.take() {
+                    let bytes = g.bytes_written;
+                    drop(g);
+                    cb(bytes, false);
+                }
+                return;
+            }
+        }
+    };
+    let op_state = Arc::clone(&state);
+    let cb_state = Arc::clone(&state);
+    let cb_storage = Arc::clone(&storage);
+    let cb_handle = handle.clone();
+    storage.submit_on(
+        handle,
+        move || -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+            let mut g = op_state.lock().unwrap();
+            let w = g.writer.as_mut().ok_or("writer already closed")?;
+            w.write_all(&chunk)?;
+            // Flushed after every chunk (not just the last) — simpler than
+            // a separate final flush job, and correct for any writer
+            // (buffered or not): `std::fs::File::flush` is a no-op, so
+            // this costs nothing for the common case.
+            w.flush()?;
+            Ok(chunk)
+        },
+        move |result: Result<Vec<u8>, StorageError>| {
+            match result {
+                Ok(chunk) => {
+                    let mut g = cb_state.lock().unwrap();
+                    g.bytes_written += chunk.len() as u64;
+                    if let Some(obs) = &g.observer {
+                        obs.transfer_progress(&g.path, true, &chunk, g.bytes_written);
+                    }
+                }
+                Err(_) => {
+                    let mut g = cb_state.lock().unwrap();
+                    g.error = true;
+                    g.writer = None;
+                }
+            }
+            drain_next_stor_chunk(cb_state, cb_storage, cb_handle);
+        },
+    );
+}
+
+/// Run `on_finished(bytes_written, had_error)` once every queued write for
+/// `state` has landed — immediately, inline, if nothing is currently
+/// draining; otherwise deferred until the last chunk's completion callback
+/// picks it up. Mirrors `hopf_mqtt::server::publish_spool::PendingPublish::finish_when_ready`.
+fn finish_stor_when_drained(state: Arc<Mutex<StorWriteState>>, on_finished: Box<dyn FnOnce(u64, bool) + Send>) {
+    let mut g = state.lock().unwrap();
+    if !g.draining && g.queue.is_empty() {
+        let bytes = g.bytes_written;
+        let had_error = g.error;
+        drop(g);
+        on_finished(bytes, had_error);
+        return;
+    }
+    g.on_drained = Some(on_finished);
+}
+
 /// Protocol handler for one data connection.
 pub struct FtpDataHandler {
     bridge: Arc<DataBridge>,
@@ -387,11 +532,17 @@ pub struct FtpDataHandler {
     /// observed the ephemeral port.
     expected_peer: IpAddr,
     armed: bool,
-    stor_writer: Option<Box<dyn Write + Send>>,
+    /// This connection's own `ConnHandle`, captured at [`Self::arm`] time —
+    /// used (issue #224) to dispatch offloaded STOR chunk writes to the
+    /// storage pool. Always `Some` once `receive`/`disconnected` can run
+    /// (the reactor only calls them after `connected`/`security_established`,
+    /// which always call `arm`).
+    data_handle: Option<ConnHandle>,
+    storage: Arc<StorageExecutor>,
+    stor_state: Option<Arc<Mutex<StorWriteState>>>,
     stor_path: String,
     stor_observer: Option<Arc<dyn TransferObserver>>,
     stor_quota: Option<(Arc<dyn hopf_core::QuotaManager>, String)>,
-    stor_bytes: u64,
     stor_ascii: bool,
     stor_denorm: AsciiNewlineDenormalizer,
     stor_telemetry: Option<TransferTelemetry>,
@@ -400,16 +551,18 @@ pub struct FtpDataHandler {
 impl FtpDataHandler {
     /// Create for an accepted/dialed data socket.
     pub fn new(bridge: Arc<DataBridge>, expect_tls: bool, expected_peer: IpAddr) -> Self {
+        let storage = bridge.storage();
         Self {
             bridge,
             expect_tls,
             expected_peer,
             armed: false,
-            stor_writer: None,
+            data_handle: None,
+            storage,
+            stor_state: None,
             stor_path: String::new(),
             stor_observer: None,
             stor_quota: None,
-            stor_bytes: 0,
             stor_ascii: false,
             stor_denorm: AsciiNewlineDenormalizer::new(),
             stor_telemetry: None,
@@ -422,15 +575,24 @@ impl FtpDataHandler {
     /// the transfer, so both [`Self::arm`] and
     /// [`ProtocolHandler::receive`](ProtocolHandler) retry this.
     fn take_stor(&mut self) {
-        if self.stor_writer.is_none() {
+        if self.stor_state.is_none() {
             if let Some(t) = self.bridge.take_stor_transfer() {
-                self.stor_path = t.path;
-                self.stor_observer = t.observer;
+                self.stor_path = t.path.clone();
+                self.stor_observer = t.observer.clone();
                 self.stor_quota = t.quota;
                 self.stor_ascii = t.ascii;
                 self.stor_denorm = AsciiNewlineDenormalizer::new();
                 self.stor_telemetry = t.telemetry;
-                self.stor_writer = Some(t.writer);
+                self.stor_state = Some(Arc::new(Mutex::new(StorWriteState {
+                    writer: Some(t.writer),
+                    path: t.path,
+                    observer: t.observer,
+                    queue: VecDeque::new(),
+                    draining: false,
+                    error: false,
+                    bytes_written: 0,
+                    on_drained: None,
+                })));
             }
         }
     }
@@ -450,6 +612,7 @@ impl FtpDataHandler {
         }
         self.armed = true;
         let handle = endpoint.handle();
+        self.data_handle = Some(handle.clone());
         self.bridge.on_data_connected(handle);
         self.take_stor();
     }
@@ -474,70 +637,73 @@ impl ProtocolHandler for FtpDataHandler {
 
     fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.take_stor();
-        if let Some(w) = self.stor_writer.as_mut() {
+        if let Some(state) = &self.stor_state {
+            let handle = self.data_handle.clone().expect("receive() only runs after arm()");
             if self.stor_ascii {
                 let mut out = Vec::with_capacity(data.len());
                 self.stor_denorm.feed(data, &mut out);
-                if !out.is_empty() {
-                    let _ = w.write_all(&out);
-                    self.stor_bytes += out.len() as u64;
-                    if let Some(obs) = &self.stor_observer {
-                        obs.transfer_progress(&self.stor_path, true, &out, self.stor_bytes);
-                    }
-                }
+                enqueue_stor_chunk(state, &self.storage, &handle, out);
             } else {
-                let _ = w.write_all(*data);
-                self.stor_bytes += data.len() as u64;
-                if let Some(obs) = &self.stor_observer {
-                    obs.transfer_progress(&self.stor_path, true, data, self.stor_bytes);
-                }
+                enqueue_stor_chunk(state, &self.storage, &handle, data.to_vec());
             }
         }
         *data = &[];
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
-        if let Some(mut w) = self.stor_writer.take() {
-            if self.stor_ascii {
-                let mut tail = Vec::new();
-                self.stor_denorm.finish(&mut tail);
-                if !tail.is_empty() {
-                    let _ = w.write_all(&tail);
-                    self.stor_bytes += tail.len() as u64;
-                    if let Some(obs) = &self.stor_observer {
-                        obs.transfer_progress(&self.stor_path, true, &tail, self.stor_bytes);
-                    }
-                }
-            }
-            let _ = w.flush();
-            let aborted = self.bridge.was_aborted();
-            if aborted {
-                if let Some(obs) = &self.stor_observer {
-                    obs.transfer_completed(&self.stor_path, true, self.stor_bytes, false);
-                }
-            } else {
-                if let Some(obs) = &self.stor_observer {
-                    obs.transfer_completed(&self.stor_path, true, self.stor_bytes, true);
-                }
-                if let Some((qm, user)) = &self.stor_quota {
-                    qm.record_bytes_added(user, self.stor_bytes);
-                }
-                self.bridge.stor_complete(self.stor_bytes);
-            }
-            if let Some(t) = self.stor_telemetry.take() {
-                t.finish(!aborted, self.stor_bytes);
+        let Some(state) = self.stor_state.take() else {
+            self.bridge.on_data_closed();
+            return;
+        };
+        if self.stor_ascii {
+            let mut tail = Vec::new();
+            self.stor_denorm.finish(&mut tail);
+            if !tail.is_empty() {
+                let handle = self.data_handle.clone().expect("disconnected() only runs after arm()");
+                enqueue_stor_chunk(&state, &self.storage, &handle, tail);
             }
         }
-        self.bridge.on_data_closed();
+        let bridge = Arc::clone(&self.bridge);
+        let observer = self.stor_observer.clone();
+        let path = self.stor_path.clone();
+        let quota = self.stor_quota.clone();
+        let telemetry = self.stor_telemetry.take();
+        finish_stor_when_drained(
+            state,
+            Box::new(move |bytes_written, had_error| {
+                let aborted = bridge.was_aborted();
+                let ok = !had_error && !aborted;
+                if let Some(obs) = &observer {
+                    obs.transfer_completed(&path, true, bytes_written, ok);
+                }
+                if ok {
+                    if let Some((qm, user)) = &quota {
+                        qm.record_bytes_added(user, bytes_written);
+                    }
+                    bridge.stor_complete(bytes_written);
+                } else if had_error {
+                    bridge.stor_failed();
+                }
+                if let Some(t) = telemetry {
+                    t.finish(ok, bytes_written);
+                }
+                bridge.on_data_closed();
+            }),
+        );
     }
 
     fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
-        if self.stor_writer.take().is_some() {
+        if let Some(state) = self.stor_state.take() {
+            let bytes_written = {
+                let mut g = state.lock().unwrap();
+                g.error = true;
+                g.bytes_written
+            };
             if let Some(obs) = &self.stor_observer {
-                obs.transfer_completed(&self.stor_path, true, self.stor_bytes, false);
+                obs.transfer_completed(&self.stor_path, true, bytes_written, false);
             }
             if let Some(t) = self.stor_telemetry.take() {
-                t.finish(false, self.stor_bytes);
+                t.finish(false, bytes_written);
             }
             self.bridge.stor_failed();
         }
@@ -667,5 +833,143 @@ mod tests {
         handler.security_established(&mut ep, &SecurityInfo::plaintext());
         assert!(!handler.armed, "must not arm for a mismatched peer");
         assert!(ep.closed);
+    }
+
+    fn wait_for(mut pred: impl FnMut() -> bool, max_ms: u64) -> bool {
+        for _ in 0..(max_ms / 5).max(1) {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pred()
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        progress: Mutex<Vec<Vec<u8>>>,
+        completed: Mutex<Option<(u64, bool)>>,
+    }
+
+    impl TransferObserver for RecordingObserver {
+        fn transfer_progress(&self, _path: &str, _upload: bool, data: &[u8], _total: u64) {
+            self.progress.lock().unwrap().push(data.to_vec());
+        }
+        fn transfer_completed(&self, _path: &str, _upload: bool, total: u64, success: bool) {
+            *self.completed.lock().unwrap() = Some((total, success));
+        }
+    }
+
+    /// A `Write` whose `write` call fails starting from its `fail_at_call`th
+    /// invocation — lets a test force a write failure partway through an
+    /// upload without needing a real full disk.
+    struct FailingWriter {
+        calls: usize,
+        fail_at_call: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls >= self.fail_at_call {
+                return Err(std::io::Error::other("disk full"));
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Issue #224: STOR chunk writes must land off the reactor thread, in
+    /// submission order, across many `receive()` calls — proven by feeding
+    /// 20 distinct chunks and checking the resulting file byte-for-byte,
+    /// not just "eventually all bytes arrived" (which alone wouldn't catch
+    /// a reordering bug).
+    #[test]
+    fn stor_writes_land_off_thread_in_order_across_many_chunks() {
+        let bridge = test_bridge();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload.bin");
+        let observer = Arc::new(RecordingObserver::default());
+        bridge.queue_stor(StorTransfer {
+            ascii: false,
+            path: "upload.bin".to_string(),
+            writer: Box::new(std::fs::File::create(&path).unwrap()),
+            observer: Some(Arc::clone(&observer) as Arc<dyn TransferObserver>),
+            quota: None,
+            telemetry: None,
+        });
+
+        let expected: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut handler = FtpDataHandler::new(Arc::clone(&bridge), false, expected);
+        let mut ep = FakeEndpoint::new("10.0.0.1:4000".parse().unwrap());
+        handler.connected(&mut ep);
+        assert!(handler.armed);
+
+        let mut expected_bytes = Vec::new();
+        for i in 0..20u8 {
+            let chunk = vec![i; 500];
+            expected_bytes.extend_from_slice(&chunk);
+            let mut data: &[u8] = &chunk;
+            handler.receive(&mut ep, &mut data);
+        }
+        handler.disconnected(&mut ep);
+
+        assert!(
+            wait_for(
+                || std::fs::read(&path).map(|b| b.len()).unwrap_or(0) == expected_bytes.len(),
+                3000
+            ),
+            "all chunks must eventually land on disk"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected_bytes,
+            "bytes must land in submission order despite being offloaded per chunk"
+        );
+        assert!(
+            wait_for(|| observer.completed.lock().unwrap().is_some(), 3000),
+            "transfer_completed must eventually fire"
+        );
+        assert_eq!(*observer.completed.lock().unwrap(), Some((expected_bytes.len() as u64, true)));
+    }
+
+    /// Issue #224 (found while fixing it): a genuine write failure partway
+    /// through an upload must be reported as a failure — the old
+    /// synchronous code (`let _ = w.write_all(...)`) silently ignored
+    /// write errors and would have reported success regardless.
+    #[test]
+    fn stor_write_failure_is_reported_as_failure_not_silently_dropped() {
+        let bridge = test_bridge();
+        let observer = Arc::new(RecordingObserver::default());
+        bridge.queue_stor(StorTransfer {
+            ascii: false,
+            path: "upload.bin".to_string(),
+            writer: Box::new(FailingWriter { calls: 0, fail_at_call: 2 }),
+            observer: Some(Arc::clone(&observer) as Arc<dyn TransferObserver>),
+            quota: None,
+            telemetry: None,
+        });
+
+        let expected: IpAddr = "10.0.0.1".parse().unwrap();
+        let mut handler = FtpDataHandler::new(Arc::clone(&bridge), false, expected);
+        let mut ep = FakeEndpoint::new("10.0.0.1:4000".parse().unwrap());
+        handler.connected(&mut ep);
+
+        // First chunk succeeds (call 1), second chunk fails (call 2).
+        let mut first: &[u8] = b"first chunk ok";
+        handler.receive(&mut ep, &mut first);
+        let mut second: &[u8] = b"second chunk fails";
+        handler.receive(&mut ep, &mut second);
+        handler.disconnected(&mut ep);
+
+        assert!(
+            wait_for(|| observer.completed.lock().unwrap().is_some(), 3000),
+            "transfer_completed must eventually fire even on a write failure"
+        );
+        let (total, success) = observer.completed.lock().unwrap().unwrap();
+        assert!(!success, "a real write failure must be reported as failure, not silently as success");
+        assert_eq!(total, "first chunk ok".len() as u64, "reported total must reflect only what actually landed");
     }
 }
