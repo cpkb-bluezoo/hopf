@@ -63,6 +63,17 @@ impl MultistatusWriter {
         let _ = self.w.flush();
         self.w.into_inner()
     }
+
+    /// Drain whatever's been written so far, leaving the document open to
+    /// keep writing `<response>` elements — unlike [`Self::finish`], does
+    /// *not* close `<multistatus>` (issue #193: lets a caller stream the
+    /// document out in pieces as each `<response>` is generated, instead of
+    /// buffering the whole thing before sending anything). Call
+    /// [`Self::finish`] once at the end for the closing tag.
+    pub fn take_written(&mut self) -> Vec<u8> {
+        let _ = self.w.flush();
+        std::mem::take(self.w.get_mut())
+    }
 }
 
 impl Default for MultistatusWriter {
