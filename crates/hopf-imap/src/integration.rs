@@ -152,6 +152,19 @@ fn start_imap_server_with_store(
     (rt, addr)
 }
 
+/// A store enrolling "alice"/"secret" that can drive CRAM-MD5 and
+/// DIGEST-MD5, not just SCRAM-SHA-256 — [`start_imap_server`]'s bare
+/// `PasswordStore` deliberately can't (see [`SlowStore`]'s doc comment),
+/// and has no digest realm set, so it can't either.
+fn cram_and_digest_capable_store() -> Arc<dyn CredentialStore> {
+    Arc::new(SlowStore {
+        inner: PasswordStore::new()
+            .with_digest_realm("localhost")
+            .with_user("alice", "secret"),
+        delay: Duration::ZERO,
+    })
+}
+
 /// Wraps a [`PasswordStore`] and sleeps for `delay` inside `password_match`
 /// — deterministically widens the window a credential check spends offloaded
 /// to the storage pool (issue #181), so a pipelining regression test can
@@ -165,7 +178,12 @@ struct SlowStore {
 
 impl CredentialStore for SlowStore {
     fn supported_mechanisms(&self) -> Vec<SaslMechanism> {
-        self.inner.supported_mechanisms()
+        // `plaintext_password` below always resolves for enrolled users, so
+        // unlike `PasswordStore` this store really can drive CRAM-MD5 —
+        // advertise it (issue #218).
+        let mut mechs = self.inner.supported_mechanisms();
+        mechs.push(SaslMechanism::CramMd5);
+        mechs
     }
     fn password_match(&self, username: &str, password: &str) -> bool {
         std::thread::sleep(self.delay);
@@ -1029,7 +1047,7 @@ fn client_idle_exists_done_scripted() {
 #[test]
 fn server_authenticate_cram_md5_raw() {
     let dir = tempfile::tempdir().unwrap();
-    let (rt, addr) = start_imap_server(&dir);
+    let (rt, addr) = start_imap_server_with_store(&dir, cram_and_digest_capable_store());
 
     let mut stream = TcpStream::connect(addr).unwrap();
     stream
@@ -1114,7 +1132,7 @@ fn server_authenticate_unsupported_mechanism_is_rejected() {
 #[test]
 fn server_capability_lists_mechanisms_filtered_by_tls() {
     let dir = tempfile::tempdir().unwrap();
-    let (rt, addr) = start_imap_server(&dir);
+    let (rt, addr) = start_imap_server_with_store(&dir, cram_and_digest_capable_store());
 
     let mut stream = TcpStream::connect(addr).unwrap();
     stream

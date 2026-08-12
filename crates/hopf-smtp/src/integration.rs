@@ -105,6 +105,44 @@ fn client_send_captured() {
     );
 }
 
+/// The server advertises CHUNKING (BDAT), and a real BDAT client sends
+/// `BDAT size LAST\r\n` immediately followed by that many raw bytes in one
+/// write, with no round trip in between (RFC 3030) — exactly what
+/// `SmtpClient`'s own auto-pilot does whenever CHUNKING is advertised. Both
+/// pieces routinely land in the same `receive()` call; previously the
+/// server's line lexer kept scanning past the `BDAT` line and misparsed the
+/// message body (which itself contains CRLFs) as further bogus commands,
+/// rejecting every such delivery (issue #218).
+#[test]
+fn bdat_command_and_payload_in_one_write_is_not_misparsed() {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let (rt, addr) = start_accept_all(Arc::clone(&capture));
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = vec![0u8; 8192];
+    read_until(&mut stream, &mut buf, |s| s.contains("\r\n"));
+
+    write_cmd(&mut stream, b"EHLO client.example\r\n");
+    let ehlo = read_until(&mut stream, &mut buf, |s| s.contains("250 "));
+    assert!(ehlo.contains("CHUNKING"), "{ehlo}");
+
+    write_cmd(&mut stream, b"MAIL FROM:<from@example.com>\r\n");
+    assert!(read_until(&mut stream, &mut buf, |s| s.starts_with('2') || s.starts_with('5')).starts_with("250"));
+
+    write_cmd(&mut stream, b"RCPT TO:<to@example.com>\r\n");
+    assert!(read_until(&mut stream, &mut buf, |s| s.starts_with('2') || s.starts_with('5')).starts_with("250"));
+
+    let body: &[u8] = b"Subject: hi\r\n\r\nhello smtp\r\n";
+    let mut single_write = format!("BDAT {} LAST\r\n", body.len()).into_bytes();
+    single_write.extend_from_slice(body);
+    write_cmd(&mut stream, &single_write);
+
+    let reply = read_until(&mut stream, &mut buf, |s| s.starts_with('2') || s.starts_with('5'));
+    assert!(reply.starts_with("250"), "BDAT delivery must succeed, not be misparsed: {reply}");
+    drop(rt);
+}
+
 #[test]
 fn client_starttls_send() {
     let dir = tempfile::tempdir().unwrap();
@@ -192,6 +230,19 @@ fn start_smtp_server_with_credential_store(store: Arc<dyn CredentialStore>) -> (
     (rt, bound)
 }
 
+/// A store enrolling "alice"/"secret" that can drive CRAM-MD5 and
+/// DIGEST-MD5, not just SCRAM-SHA-256 — [`start_smtp_server_with_store`]'s
+/// bare `PasswordStore` deliberately can't (see [`SlowStore`]'s doc
+/// comment), and has no digest realm set, so it can't either.
+fn cram_and_digest_capable_store() -> Arc<dyn CredentialStore> {
+    Arc::new(SlowStore {
+        inner: PasswordStore::new()
+            .with_digest_realm("test.example.com")
+            .with_user("alice", "secret"),
+        delay: Duration::ZERO,
+    })
+}
+
 /// Wraps a [`PasswordStore`] and sleeps inside `password_match`/
 /// `plaintext_password` — deterministically widens the window a credential
 /// check spends offloaded to the storage pool (issue #181), so a
@@ -206,7 +257,12 @@ struct SlowStore {
 
 impl CredentialStore for SlowStore {
     fn supported_mechanisms(&self) -> Vec<SaslMechanism> {
-        self.inner.supported_mechanisms()
+        // `plaintext_password` below always resolves for enrolled users, so
+        // unlike `PasswordStore` this store really can drive CRAM-MD5 —
+        // advertise it (issue #218).
+        let mut mechs = self.inner.supported_mechanisms();
+        mechs.push(SaslMechanism::CramMd5);
+        mechs
     }
     fn password_match(&self, username: &str, password: &str) -> bool {
         std::thread::sleep(self.delay);
@@ -269,8 +325,7 @@ fn read_until(stream: &mut TcpStream, buf: &mut [u8], pred: impl Fn(&str) -> boo
 /// the pattern already established for hopf-pop3/hopf-imap (#111).
 #[test]
 fn smtp_auth_cram_md5_raw() {
-    let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
-    let (rt, addr) = start_smtp_server_with_store(store);
+    let (rt, addr) = start_smtp_server_with_credential_store(cram_and_digest_capable_store());
 
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -350,8 +405,7 @@ fn smtp_auth_unsupported_mechanism_is_rejected() {
 /// filtered by TLS requirement — not just a hardcoded `AUTH PLAIN`.
 #[test]
 fn smtp_ehlo_lists_mechanisms_filtered_by_tls() {
-    let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
-    let (rt, addr) = start_smtp_server_with_store(store);
+    let (rt, addr) = start_smtp_server_with_credential_store(cram_and_digest_capable_store());
 
     let mut stream = TcpStream::connect(addr).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();

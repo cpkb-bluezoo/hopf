@@ -680,27 +680,45 @@ impl ProtocolHandler for SmtpClientEndpoint {
 
     fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_pending_data(ep);
-        let events = match self.lexer.feed(data) {
-            Ok(e) => e,
-            Err(e) => {
-                let msg = e.to_string();
-                self.protocol_error(ep, msg);
-                return;
-            }
-        };
-        for event in events {
-            if self.proto_state == ProtoState::Closed || self.proto_state == ProtoState::Error {
+        // `lexer.feed` stops after each completed reply so `dispatch_event`
+        // can call `expect()` for the *next* reply's shape before any more
+        // bytes are parsed — a pipelining server sends replies to several
+        // queued commands back to back, with no round trip in between, so
+        // more than one routinely lands in the same `receive()` call (issue
+        // #218). Keep re-feeding whatever `feed` left unconsumed until
+        // there's nothing left or nothing more parses out of it.
+        loop {
+            let events = match self.lexer.feed(data) {
+                Ok(e) => e,
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.protocol_error(ep, msg);
+                    return;
+                }
+            };
+            if events.is_empty() {
                 break;
             }
-            self.dispatch_event(event, ep);
-            if self.pending_bdat {
-                self.pending_bdat = false;
-                self.begin_bdat(ep);
+            for event in events {
+                if self.proto_state == ProtoState::Closed || self.proto_state == ProtoState::Error {
+                    break;
+                }
+                self.dispatch_event(event, ep);
+                if self.pending_bdat {
+                    self.pending_bdat = false;
+                    self.begin_bdat(ep);
+                }
+                // Flush after every dispatched reply.
+                if !self.outbound.is_empty() {
+                    let out = std::mem::take(&mut self.outbound);
+                    ep.send(&out);
+                }
             }
-            // Flush after every dispatched reply.
-            if !self.outbound.is_empty() {
-                let out = std::mem::take(&mut self.outbound);
-                ep.send(&out);
+            if data.is_empty()
+                || self.proto_state == ProtoState::Closed
+                || self.proto_state == ProtoState::Error
+            {
+                break;
             }
         }
     }

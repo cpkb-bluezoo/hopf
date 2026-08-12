@@ -1374,6 +1374,17 @@ impl SmtpControlHandler {
                     }
                     self.dispatch(endpoint, cmd);
                 }
+                // `lexer.feed` stops right after a `BDAT` line so its raw
+                // payload never gets misparsed as more command lines (issue
+                // #218) — a pipelining client sends that payload in the
+                // same write, with no round trip, so it's routinely still
+                // sitting unconsumed in `data` right here. Re-enter so the
+                // now-updated `self.session` routes it to `feed_bdat`
+                // (or, for a malformed/rejected BDAT that never flipped
+                // `session`, back through the lexer as further commands).
+                if !data.is_empty() {
+                    self.receive_inner(endpoint, data);
+                }
             }
         }
     }
