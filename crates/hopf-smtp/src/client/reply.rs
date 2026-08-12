@@ -302,13 +302,24 @@ impl SmtpReplyLexer {
         self.expn_members.clear();
     }
 
-    /// Feed inbound bytes. Returns parsed events; consumes everything
-    /// given (`*data` is always left empty).
+    /// Feed inbound bytes. Returns parsed events, but stops and returns
+    /// immediately once a reply completes — `expect()` (called by the
+    /// caller's dispatch right after each reply, to say what shape the
+    /// *next* one takes, e.g. `MailFrom` then `RcptTo` for a pipelined
+    /// MAIL+RCPT) must run before any further bytes are parsed, since a
+    /// pipelining server sends both replies back to back with no round
+    /// trip in between and they routinely land in the same `feed()` call.
+    /// Without this, every reply after the first in one call would be
+    /// parsed against the *first* reply's shape instead of its own. `*data`
+    /// is left holding whatever wasn't consumed; call `feed()` again with
+    /// it after dispatching.
     pub fn feed(&mut self, data: &mut &[u8]) -> Result<Vec<SmtpEvent>, SmtpError> {
         let mut events = Vec::new();
-        for &b in data.iter() {
-            if let Some(event) = self.push_byte(b)? {
+        for i in 0..data.len() {
+            if let Some(event) = self.push_byte(data[i])? {
                 events.push(event);
+                *data = &data[i + 1..];
+                return Ok(events);
             }
         }
         *data = &[];
@@ -1242,14 +1253,42 @@ mod tests {
 
     #[test]
     fn pipelined_replies_in_one_feed() {
-        // Greeting immediately followed by an EHLO reply in one segment —
-        // exercised via two lexers since shape differs per reply in
-        // practice (the endpoint re-`expect()`s between them), but this
-        // confirms multiple *same-shape* replies in one feed still work.
+        // A pipelining server sends replies to several queued commands back
+        // to back with no round trip in between, so more than one reply
+        // routinely lands in the same buffer — but `feed` stops right after
+        // the first completes, since the *caller* (the endpoint's
+        // `dispatch_event`) is what re-`expect()`s the shape for the next
+        // one in practice, and that can only happen between `feed` calls.
         let mut lex = SmtpReplyLexer::new();
         lex.expect(SmtpReplyShape::Rset);
         let mut data: &[u8] = b"250 OK\r\n250 OK\r\n";
         let events = lex.feed(&mut data).unwrap();
-        assert_eq!(events, vec![SmtpEvent::RsetOk, SmtpEvent::RsetOk]);
+        assert_eq!(events, vec![SmtpEvent::RsetOk]);
+        assert_eq!(data, b"250 OK\r\n", "second reply must be left for the next feed() call");
+
+        lex.expect(SmtpReplyShape::Rset);
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events, vec![SmtpEvent::RsetOk]);
+        assert!(data.is_empty());
+    }
+
+    /// A pipelined MAIL+RCPT group's two replies carry *different* enhanced
+    /// codes (2.1.0 vs 2.1.5) and must be parsed against their own shape —
+    /// `MailFrom` then `RcptTo` — not both against whatever shape was set
+    /// before the first `feed()` call (issue #218).
+    #[test]
+    fn pipelined_replies_with_different_shapes_are_each_parsed_correctly() {
+        let mut lex = SmtpReplyLexer::new();
+        lex.expect(SmtpReplyShape::MailFrom);
+        let mut data: &[u8] = b"250 2.1.0 Sender OK\r\n250 2.1.5 Recipient OK\r\n";
+
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events, vec![SmtpEvent::MailOk]);
+        assert!(!data.is_empty(), "second reply must not be consumed yet");
+
+        lex.expect(SmtpReplyShape::RcptTo);
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(events, vec![SmtpEvent::RcptOk], "must parse against RcptTo, not the stale MailFrom shape");
+        assert!(data.is_empty());
     }
 }

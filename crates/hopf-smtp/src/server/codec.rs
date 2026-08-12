@@ -174,12 +174,26 @@ impl SmtpServerLexer {
 
     /// Feed inbound control bytes; returns newly completed commands.
     ///
-    /// Consumes everything given — `*data` is always left empty. A line
-    /// whose verb or argument exceeds the cap is discarded (no command
-    /// produced) and flagged via [`took_line_too_long`](Self::took_line_too_long).
+    /// Consumes everything given, *except* that it stops right after a
+    /// `BDAT` command line completes — BDAT's payload is raw octets, not
+    /// more command lines, and a pipelining client sends `BDAT size
+    /// [LAST]\r\n` immediately followed by exactly that many raw bytes with
+    /// no round trip in between (RFC 3030), so those bytes can easily land
+    /// in the same `feed()` call as the command line itself. Without this,
+    /// the lexer would keep scanning past the `BDAT` line and misparse the
+    /// message body as more command lines. The caller is expected to check
+    /// for a trailing `SmtpCommand::Bdat` and switch to raw-byte
+    /// consumption for whatever remains in `*data`. Otherwise (no `BDAT`
+    /// seen), `*data` is always left empty. A line whose verb or argument
+    /// exceeds the cap is discarded (no command produced) and flagged via
+    /// [`took_line_too_long`](Self::took_line_too_long).
     pub fn feed(&mut self, data: &mut &[u8]) -> Vec<SmtpCommand> {
-        for &b in data.iter() {
-            self.push_byte(b);
+        for i in 0..data.len() {
+            self.push_byte(data[i]);
+            if matches!(self.ready.last(), Some(SmtpCommand::Bdat(_))) {
+                *data = &data[i + 1..];
+                return std::mem::take(&mut self.ready);
+            }
         }
         *data = &[];
         std::mem::take(&mut self.ready)
@@ -426,10 +440,55 @@ mod tests {
 
     #[test]
     fn bdat_size_and_last() {
+        // `feed` stops right after each `BDAT` line (its payload isn't a
+        // command line — see `feed_stops_after_bdat_leaving_raw_payload_unconsumed`),
+        // so a non-final `BDAT 100` (a real payload would follow it, not
+        // another line-terminated command) is fed and consumed separately
+        // from the next `BDAT 0 LAST`.
         let mut lex = SmtpServerLexer::new(4096);
-        let mut data: &[u8] = b"BDAT 100\r\nBDAT 0 LAST\r\n";
+        let mut data: &[u8] = b"BDAT 100\r\n";
+        assert_eq!(lex.feed(&mut data), vec![SmtpCommand::Bdat("100".into())]);
+        assert!(data.is_empty());
+
+        let mut data: &[u8] = b"BDAT 0 LAST\r\n";
+        assert_eq!(lex.feed(&mut data), vec![SmtpCommand::Bdat("0 LAST".into())]);
+        assert!(data.is_empty());
+    }
+
+    /// A pipelining client sends `BDAT size [LAST]\r\n` immediately
+    /// followed by exactly that many raw octets, no round trip in between
+    /// (RFC 3030) — those bytes routinely land in the same `feed()` call as
+    /// the command line itself. The lexer has no way to know the payload
+    /// length, so it must stop right after the `BDAT` line instead of
+    /// scanning on and misparsing the raw payload as further command lines
+    /// (issue #218).
+    #[test]
+    fn feed_stops_after_bdat_leaving_raw_payload_unconsumed() {
+        let mut lex = SmtpServerLexer::new(4096);
+        // The payload itself contains CRLFs, so a lexer that kept scanning
+        // would misparse it as two more (bogus) command lines.
+        let mut data: &[u8] = b"BDAT 15 LAST\r\nSubject: hi\r\n\r\n";
         let cmds = lex.feed(&mut data);
-        assert_eq!(cmds, vec![SmtpCommand::Bdat("100".into()), SmtpCommand::Bdat("0 LAST".into())]);
+        assert_eq!(cmds, vec![SmtpCommand::Bdat("15 LAST".into())]);
+        assert_eq!(data, b"Subject: hi\r\n\r\n", "raw payload must be left untouched for the caller");
+    }
+
+    /// Commands pipelined ahead of a `BDAT` line are still all returned
+    /// together — only the bytes *after* `BDAT` are held back.
+    #[test]
+    fn feed_returns_everything_up_to_and_including_bdat() {
+        let mut lex = SmtpServerLexer::new(4096);
+        let mut data: &[u8] = b"MAIL FROM:<a@b>\r\nRCPT TO:<c@d>\r\nBDAT 5 LAST\r\nhello";
+        let cmds = lex.feed(&mut data);
+        assert_eq!(
+            cmds,
+            vec![
+                SmtpCommand::Mail("FROM:<a@b>".into()),
+                SmtpCommand::Rcpt("TO:<c@d>".into()),
+                SmtpCommand::Bdat("5 LAST".into()),
+            ]
+        );
+        assert_eq!(data, b"hello");
     }
 
     #[test]
