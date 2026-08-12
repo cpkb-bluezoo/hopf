@@ -23,6 +23,9 @@ pub enum SaslServerStep {
     Failure,
 }
 
+/// One-shot completion callback — see [`SaslServer::step`].
+pub type Cb<T> = Box<dyn FnOnce(T) + Send>;
+
 /// Server SASL exchange (one authentication attempt).
 pub trait SaslServer: Send {
     /// Mechanism name.
@@ -31,8 +34,12 @@ pub trait SaslServer: Send {
     fn server_first(&self) -> bool {
         false
     }
-    /// Process client response (`None` = empty / initial).
-    fn step(&mut self, client_response: Option<&[u8]>) -> SaslServerStep;
+    /// Process client response (`None` = empty / initial). Callback-based
+    /// because a mechanism's backing [`CredentialStore`] method may itself
+    /// be async (currently only [`CredentialStore::validate_bearer`] —
+    /// OAUTHBEARER) — every other mechanism invokes `cb` synchronously,
+    /// before this call returns.
+    fn step(&mut self, client_response: Option<&[u8]>, cb: Cb<SaslServerStep>);
 }
 
 /// Client-side step result.

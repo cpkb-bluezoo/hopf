@@ -65,7 +65,7 @@ pub fn capa_sasl_line(mechs: &[SaslMechanism]) -> Option<String> {
 mod tests {
     use super::*;
     use hopf_auth::{
-        CertificateIdentity, CredentialStore, PasswordStore, ScramCredentials, TokenValidation,
+        CertificateIdentity, Cb, CredentialStore, PasswordStore, ScramCredentials, TokenValidation,
     };
 
     /// APOP needs a recoverable secret; `PasswordStore` deliberately does not
@@ -88,8 +88,8 @@ mod tests {
         fn scram_credentials(&self, _: &str) -> Option<ScramCredentials> {
             None
         }
-        fn validate_bearer(&self, _: &str) -> Option<TokenValidation> {
-            None
+        fn validate_bearer(&self, _: &str, cb: Cb<Option<TokenValidation>>) {
+            cb(None);
         }
         fn authenticate_certificate(&self, _: &str) -> Option<CertificateIdentity> {
             None

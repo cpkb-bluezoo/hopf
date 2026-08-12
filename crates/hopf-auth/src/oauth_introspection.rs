@@ -108,15 +108,24 @@ impl IntrospectionResponse {
     }
 }
 
+/// One-shot completion callback — see [`IntrospectionTransport::introspect`].
+pub type Cb<T> = Box<dyn FnOnce(T) + Send>;
+
 /// Supplies the actual HTTP POST to the introspection endpoint.
 /// hopf-auth only builds the request body and parses the response; see
 /// the module docs for why it can't make the call itself.
 pub trait IntrospectionTransport: Send + Sync {
     /// POST `form_body` (already `application/x-www-form-urlencoded`) to
-    /// the introspection endpoint and return the raw JSON response body,
-    /// or `None` on any transport-level failure (network error, non-2xx
-    /// status, timeout, ...).
-    fn introspect(&self, form_body: &str) -> Option<String>;
+    /// the introspection endpoint and invoke `cb` with the raw JSON
+    /// response body, or `None` on any transport-level failure (network
+    /// error, non-2xx status, timeout, ...). Callback-based so a real HTTP
+    /// client can dispatch this without blocking the calling thread; `cb`
+    /// may fire either synchronously or later from another thread. An
+    /// implementation must complete without re-entering the same
+    /// `hopf_core::storage::StorageExecutor` its caller may itself be
+    /// running on — a nested submission with no free worker thread could
+    /// self-deadlock.
+    fn introspect(&self, form_body: &str, cb: Cb<Option<String>>);
 }
 
 /// A [`CredentialStore`] whose [`CredentialStore::validate_bearer`] calls
@@ -157,30 +166,35 @@ impl CredentialStore for IntrospectionCredentialStore {
         self.inner.scram_credentials(username)
     }
 
-    fn validate_bearer(&self, token: &str) -> Option<TokenValidation> {
+    fn validate_bearer(&self, token: &str, cb: Cb<Option<TokenValidation>>) {
         let req = IntrospectionRequest::new(token);
-        let body = self.transport.introspect(&req.to_form_body())?;
-        let resp = IntrospectionResponse::parse(&body)?;
-        if !resp.active {
-            return None;
-        }
-        // RFC 7662 doesn't require this — an AS returning `active: true`
-        // has already made that determination — but a local expiry check
-        // is cheap defense in depth against a stale cached/replayed
-        // response outliving its `exp`.
-        if let Some(exp) = resp.exp {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if exp <= now {
-                return None;
-            }
-        }
-        Some(TokenValidation {
-            username: resp.username.unwrap_or_default(),
-            scopes: resp.scope,
-        })
+        self.transport.introspect(&req.to_form_body(), Box::new(move |body| {
+            cb((|| {
+                let body = body?;
+                let resp = IntrospectionResponse::parse(&body)?;
+                if !resp.active {
+                    return None;
+                }
+                // RFC 7662 doesn't require this — an AS returning
+                // `active: true` has already made that determination —
+                // but a local expiry check is cheap defense in depth
+                // against a stale cached/replayed response outliving its
+                // `exp`.
+                if let Some(exp) = resp.exp {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if exp <= now {
+                        return None;
+                    }
+                }
+                Some(TokenValidation {
+                    username: resp.username.unwrap_or_default(),
+                    scopes: resp.scope,
+                })
+            })());
+        }));
     }
 
     fn authenticate_certificate(&self, cert_key: &str) -> Option<CertificateIdentity> {
@@ -442,10 +456,24 @@ mod tests {
     }
 
     impl IntrospectionTransport for FakeTransport {
-        fn introspect(&self, form_body: &str) -> Option<String> {
+        fn introspect(&self, form_body: &str, cb: Cb<Option<String>>) {
             *self.last_request.lock().unwrap() = Some(form_body.to_string());
-            self.response.lock().unwrap().clone()
+            cb(self.response.lock().unwrap().clone());
         }
+    }
+
+    /// Bridges a callback-based `validate_bearer` call back to a plain
+    /// return value for tests — safe here because `FakeTransport` always
+    /// completes `cb` synchronously/inline.
+    fn validate_bearer_sync(
+        store: &IntrospectionCredentialStore,
+        token: &str,
+    ) -> Option<TokenValidation> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        store.validate_bearer(token, Box::new(move |r| {
+            let _ = tx.send(r);
+        }));
+        rx.try_recv().expect("FakeTransport completes synchronously")
     }
 
     #[test]
@@ -459,7 +487,7 @@ mod tests {
         let inner: Arc<dyn CredentialStore> = Arc::new(PasswordStore::new());
         let store = IntrospectionCredentialStore::new(inner, Arc::clone(&transport) as Arc<dyn IntrospectionTransport>);
 
-        let result = store.validate_bearer("tok-123").unwrap();
+        let result = validate_bearer_sync(&store, "tok-123").unwrap();
         assert_eq!(result.username, "alice");
         assert_eq!(result.scopes, vec!["read".to_string(), "write".to_string()]);
 
@@ -475,7 +503,7 @@ mod tests {
         });
         let inner: Arc<dyn CredentialStore> = Arc::new(PasswordStore::new());
         let store = IntrospectionCredentialStore::new(inner, transport);
-        assert!(store.validate_bearer("revoked-token").is_none());
+        assert!(validate_bearer_sync(&store, "revoked-token").is_none());
     }
 
     #[test]
@@ -486,7 +514,7 @@ mod tests {
         });
         let inner: Arc<dyn CredentialStore> = Arc::new(PasswordStore::new());
         let store = IntrospectionCredentialStore::new(inner, transport);
-        assert!(store.validate_bearer("any-token").is_none());
+        assert!(validate_bearer_sync(&store, "any-token").is_none());
     }
 
     #[test]
@@ -499,7 +527,7 @@ mod tests {
         });
         let inner: Arc<dyn CredentialStore> = Arc::new(PasswordStore::new());
         let store = IntrospectionCredentialStore::new(inner, transport);
-        assert!(store.validate_bearer("stale-token").is_none());
+        assert!(validate_bearer_sync(&store, "stale-token").is_none());
     }
 
     #[test]
