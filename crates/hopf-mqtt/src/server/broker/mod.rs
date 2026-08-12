@@ -33,11 +33,12 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
-use hopf_core::ConnHandle;
+use hopf_core::{ConnHandle, Runtime, StorageError};
 
 use crate::codec::packet::Will;
 use crate::codec::{Properties, ProtocolVersion, QoS, SubscribeFilter};
 use crate::server::expiry::{expiry_deadline, is_expired};
+use crate::server::spool_file::SpoolHandle;
 use crate::server::store::{queued_message, InMemoryMessageStore, MqttMessageStore, QueuedMessage};
 
 /// Effectively-unlimited Receive Maximum (MQTT 5.0 default when the CONNECT
@@ -252,8 +253,18 @@ impl BrokerState {
 
     /// Reap an orphaned session if it's still orphaned under the same
     /// epoch [`Self::orphan`] returned (i.e. it wasn't resumed, or was
-    /// resumed and orphaned again before this timer fired).
-    pub fn expire_orphan(&self, id: SubscriberId, epoch: u64) {
+    /// resumed and orphaned again before this timer fired). `self_arc` is
+    /// `self` as an `Arc` — needed to offload a delayed Will's spool write
+    /// (issue #187), which must move an owned `Arc<BrokerState>` into a
+    /// `'static` storage closure; a plain `&self` can't provide that.
+    pub fn expire_orphan(
+        &self,
+        self_arc: &Arc<BrokerState>,
+        id: SubscriberId,
+        epoch: u64,
+        runtime: Arc<Runtime>,
+        handle: ConnHandle,
+    ) {
         let client_id = {
             let subs = self.subscribers.read().unwrap();
             let Some(sub) = subs.get(&id) else {
@@ -276,7 +287,7 @@ impl BrokerState {
         // Session lifetime ended — publish any Will still waiting on delay
         // (MQTT: Will Delay capped by Session Expiry means the Will fires
         // when the session expires if it hasn't already).
-        self.fire_delayed_will(&client_id, u64::MAX);
+        self.fire_delayed_will(self_arc, &client_id, u64::MAX, runtime, handle);
     }
 
     /// Park `will` for `client_id` until [`Self::fire_delayed_will`]. Returns
@@ -297,7 +308,15 @@ impl BrokerState {
 
     /// Publish a parked Will if it is still pending under `epoch`.
     /// Pass `u64::MAX` to fire regardless of epoch (session expiry path).
-    pub fn fire_delayed_will(&self, client_id: &str, epoch: u64) {
+    /// `self_arc` — see [`Self::expire_orphan`]'s doc comment.
+    pub fn fire_delayed_will(
+        &self,
+        self_arc: &Arc<BrokerState>,
+        client_id: &str,
+        epoch: u64,
+        runtime: Arc<Runtime>,
+        handle: ConnHandle,
+    ) {
         let will = {
             let mut map = self.delayed_wills.lock().unwrap();
             match map.get(client_id) {
@@ -309,13 +328,15 @@ impl BrokerState {
         };
         if let Some(will) = will {
             crate::server::publish_spool::publish_whole(
-                self,
+                self_arc,
                 None,
                 &will.topic,
                 &will.payload,
                 will.qos,
                 will.retain,
                 &will.properties,
+                runtime,
+                handle,
             );
         }
     }
@@ -440,9 +461,15 @@ impl BrokerState {
 
     /// Deliver the now-complete payload to every QoS-1/2 recipient
     /// [`Self::begin_publish`] deferred, each with its own freshly
-    /// allocated packet id. `spool` is `Some((path, len))` re-read once per
-    /// recipient (never held whole in memory for the group), or `None` for
-    /// a zero-length payload.
+    /// allocated packet id. `spool` is `Some((handle, len))`, re-read once
+    /// per recipient (never held whole in memory for the group), or `None`
+    /// for a zero-length payload. Every recipient's read+delivery (and
+    /// orphaned recipients' offline-queue write) is offloaded to
+    /// `hopf_core::StorageExecutor` (issue #187) — `conn.send()` and every
+    /// [`crate::server::store::MqttMessageStore`] method are thread-safe,
+    /// so each can run entirely on the storage thread with a no-op or
+    /// bookkeeping-only completion callback; nothing here needs to hop
+    /// back to a reactor thread.
     ///
     /// Orphaned recipients with effective QoS ≥ 1 are enqueued into
     /// [`Self::store`] instead of being delivered.
@@ -451,7 +478,8 @@ impl BrokerState {
         fanout: &PublishFanout,
         topic: &str,
         properties: &Properties,
-        spool: Option<(&Path, u64)>,
+        spool: Option<(SpoolHandle, u64)>,
+        runtime: &Arc<Runtime>,
     ) {
         for &(sub_id, effective_qos, effective_retain) in &fanout.deferred {
             let orphaned = {
@@ -465,13 +493,24 @@ impl BrokerState {
                 if effective_qos == QoS::AtMostOnce {
                     continue;
                 }
-                let payload = match spool {
-                    Some((path, _)) => read_spool_payload(path).unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                self.store.enqueue_offline(
-                    sub_id,
-                    queued_message(topic, &payload, effective_qos, effective_retain, properties),
+                let store = Arc::clone(&self.store);
+                let topic_owned = topic.to_string();
+                let properties_owned = properties.clone();
+                let spool_op = spool.clone();
+                runtime.storage().submit_on(
+                    detached_handle(),
+                    move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                        let payload = match &spool_op {
+                            Some((sh, _)) => read_spool_payload(sh.path()).unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                        store.enqueue_offline(
+                            sub_id,
+                            queued_message(&topic_owned, &payload, effective_qos, effective_retain, &properties_owned),
+                        );
+                        Ok(())
+                    },
+                    |_: Result<(), StorageError>| {},
                 );
                 continue;
             }
@@ -486,29 +525,48 @@ impl BrokerState {
                 };
                 reserved
             };
-            match spool {
-                Some((path, len)) => stream_file_publish(
-                    &conn, topic, effective_qos, effective_retain, packet_id, path, len, properties, version,
-                    atomic_send,
-                ),
-                None => {
-                    let header = crate::codec::encode::encode_publish_header(
-                        topic, effective_qos, false, effective_retain, packet_id, 0, properties, version,
+            let topic_op = topic.to_string();
+            let properties_op = properties.clone();
+            let spool_op = spool.clone();
+            let store = Arc::clone(&self.store);
+            let topic_cb = topic.to_string();
+            let properties_cb = properties.clone();
+            runtime.storage().submit_streamed(
+                conn,
+                move |c: &ConnHandle| -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+                    match &spool_op {
+                        Some((sh, len)) => {
+                            stream_file_publish(
+                                c, &topic_op, effective_qos, effective_retain, packet_id, sh.path(), *len,
+                                &properties_op, version, atomic_send,
+                            );
+                            if effective_qos != QoS::AtMostOnce {
+                                Ok(read_spool_payload(sh.path()))
+                            } else {
+                                Ok(None)
+                            }
+                        }
+                        None => {
+                            let header = crate::codec::encode::encode_publish_header(
+                                &topic_op, effective_qos, false, effective_retain, packet_id, 0, &properties_op, version,
+                            );
+                            c.send(header);
+                            Ok(None)
+                        }
+                    }
+                },
+                move |result: Result<Option<Vec<u8>>, StorageError>| {
+                    if effective_qos == QoS::AtMostOnce {
+                        return;
+                    }
+                    let payload = result.ok().flatten().unwrap_or_default();
+                    store.track_inflight(
+                        sub_id,
+                        packet_id,
+                        queued_message(&topic_cb, &payload, effective_qos, effective_retain, &properties_cb),
                     );
-                    conn.send(header);
-                }
-            }
-            if effective_qos != QoS::AtMostOnce {
-                let payload = match spool {
-                    Some((path, _)) => read_spool_payload(path).unwrap_or_default(),
-                    None => Vec::new(),
-                };
-                self.store.track_inflight(
-                    sub_id,
-                    packet_id,
-                    queued_message(topic, &payload, effective_qos, effective_retain, properties),
-                );
-            }
+                },
+            );
         }
     }
 
@@ -591,9 +649,12 @@ impl BrokerState {
     }
 
     /// Set or clear the retained message for `topic`, handing off ownership
-    /// of `spool`'s file (if any) to the retained-message store — see
-    /// [`RetainedStore::publish`].
-    pub fn retain(&self, topic: &str, qos: QoS, spool: Option<(std::path::PathBuf, u64)>, properties: Properties) {
+    /// of `spool`'s handle (if any) to the retained-message store — see
+    /// [`RetainedStore::publish`]. No blocking I/O here: replacing or
+    /// clearing an entry just drops an [`SpoolHandle`], which self-offloads
+    /// its own file deletion (issue #187) once nothing else — including any
+    /// in-flight [`Self::deliver_retained`] read — still holds a clone.
+    pub fn retain(&self, topic: &str, qos: QoS, spool: Option<(SpoolHandle, u64)>, properties: Properties) {
         let now = Instant::now();
         let expires_at = expiry_deadline(&properties, now);
         if expires_at.is_some_and(|d| now >= d) {
@@ -604,14 +665,14 @@ impl BrokerState {
                 .publish(topic, qos, None, 0, properties, None);
             return;
         }
-        let (path, len) = match spool {
-            Some((p, l)) => (Some(p), l),
+        let (handle, len) = match spool {
+            Some((h, l)) => (Some(h), l),
             None => (None, 0),
         };
         self.retained
             .write()
             .unwrap()
-            .publish(topic, qos, path, len, properties, expires_at);
+            .publish(topic, qos, handle, len, properties, expires_at);
     }
 
     /// Retained messages matching a freshly-subscribed `filter`, to deliver
@@ -623,8 +684,18 @@ impl BrokerState {
     /// Deliver one retained message to a single newly-subscribed connection
     /// at `max_qos` (the RETAIN flag is always set on this delivery path,
     /// independent of Retain As Published — that option only affects live
-    /// fan-out via [`Self::begin_publish`]).
-    pub fn deliver_retained(&self, id: SubscriberId, topic: &str, msg: &RetainedSnapshot, max_qos: QoS) {
+    /// fan-out via [`Self::begin_publish`]). The spool read is offloaded
+    /// (issue #187); `msg`'s own `SpoolHandle` clone, captured into the
+    /// storage job, keeps the file alive for the read even if the retained
+    /// entry is replaced or cleared before the job runs.
+    pub fn deliver_retained(
+        &self,
+        id: SubscriberId,
+        topic: &str,
+        msg: &RetainedSnapshot,
+        max_qos: QoS,
+        runtime: &Arc<Runtime>,
+    ) {
         if msg.expires_at.is_some_and(|d| Instant::now() >= d) {
             return;
         }
@@ -651,18 +722,28 @@ impl BrokerState {
             return;
         };
         drop(subscribers);
-        match &msg.path {
-            Some(path) => stream_file_publish(
-                &conn, topic, effective_qos, true, packet_id, path, msg.payload_len, &props, version,
-                atomic_send,
-            ),
-            None => {
-                let header = crate::codec::encode::encode_publish_header(
-                    topic, effective_qos, false, true, packet_id, 0, &props, version,
-                );
-                conn.send(header);
-            }
-        }
+        let topic_owned = topic.to_string();
+        let payload_len = msg.payload_len;
+        let path = msg.path.clone();
+        runtime.storage().submit_streamed(
+            conn,
+            move |c: &ConnHandle| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                match &path {
+                    Some(sh) => stream_file_publish(
+                        c, &topic_owned, effective_qos, true, packet_id, sh.path(), payload_len, &props, version,
+                        atomic_send,
+                    ),
+                    None => {
+                        let header = crate::codec::encode::encode_publish_header(
+                            &topic_owned, effective_qos, false, true, packet_id, 0, &props, version,
+                        );
+                        c.send(header);
+                    }
+                }
+                Ok(())
+            },
+            |_: Result<(), StorageError>| {},
+        );
     }
 }
 
@@ -687,6 +768,17 @@ impl PublishFanout {
     pub fn has_deferred(&self) -> bool {
         !self.deferred.is_empty()
     }
+}
+
+/// A `ConnHandle` whose only valid use is as a `submit_on`/`submit_streamed`
+/// routing target for a job whose callback does nothing publisher/
+/// subscriber-connection-specific (issue #187) — e.g. an orphaned
+/// subscriber's offline-queue write, which isn't tied to any live
+/// connection. `submit_on`'s callback dispatch only ever calls
+/// `ConnHandle::execute` on the handle it's given, never `with_endpoint`,
+/// so a task-only handle works correctly here.
+fn detached_handle() -> ConnHandle {
+    ConnHandle::from_execute(Arc::new(|task| task()))
 }
 
 /// Read a spool file into memory (offline enqueue / inflight tracking).
@@ -799,6 +891,29 @@ mod tests {
         ConnHandle::from_execute(std::sync::Arc::new(|task| task()))
     }
 
+    fn test_runtime() -> Arc<Runtime> {
+        Arc::new(Runtime::start(hopf_core::RuntimeConfig::default()).unwrap())
+    }
+
+    /// Issue #187: `publish_whole`'s spool write (and the `deliver_deferred`
+    /// it triggers) is now offloaded, so an orphaned subscriber's message
+    /// doesn't land in the offline queue synchronously. `take_offline` is
+    /// destructive (no peek API), so poll by taking-and-re-enqueueing until
+    /// something shows up, rather than a fixed sleep.
+    fn wait_for_offline_message(broker: &BrokerState, id: SubscriberId, max_ms: u64) -> bool {
+        for _ in 0..(max_ms / 5).max(1) {
+            let msgs = broker.store.take_offline(id);
+            if !msgs.is_empty() {
+                for m in msgs {
+                    broker.store.enqueue_offline(id, m);
+                }
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
     fn filter(topic_filter: &str, max_qos: QoS) -> SubscribeFilter {
         SubscribeFilter {
             topic_filter: topic_filter.to_string(),
@@ -861,7 +976,7 @@ mod tests {
 
     #[test]
     fn expire_orphan_reaps_only_matching_epoch() {
-        let broker = BrokerState::new();
+        let broker = Arc::new(BrokerState::new());
         let (id, _, _) =
             broker.register("c1", ProtocolVersion::V311, UNLIMITED_RECEIVE_MAXIMUM, false, noop_handle(), false);
         broker.subscribe(id, &filter("x/y", QoS::AtMostOnce)).unwrap();
@@ -869,12 +984,12 @@ mod tests {
 
         // A resume bumps things back to live; the stale timer must not reap it.
         broker.register("c1", ProtocolVersion::V311, UNLIMITED_RECEIVE_MAXIMUM, false, noop_handle(), false);
-        broker.expire_orphan(id, epoch);
+        broker.expire_orphan(&broker, id, epoch, test_runtime(), noop_handle());
         assert_eq!(broker.topics.write().unwrap().matching_subscribers("x/y").len(), 1);
 
         // Orphan again (new epoch) and reap for real.
         let epoch2 = broker.orphan(id);
-        broker.expire_orphan(id, epoch2);
+        broker.expire_orphan(&broker, id, epoch2, test_runtime(), noop_handle());
         assert!(broker.topics.write().unwrap().matching_subscribers("x/y").is_empty());
     }
 
@@ -940,7 +1055,7 @@ mod tests {
 
     #[test]
     fn orphaned_qos1_is_queued_and_drained_on_resume() {
-        let broker = BrokerState::new();
+        let broker = Arc::new(BrokerState::new());
         let (id, _, _) =
             broker.register("c1", ProtocolVersion::V5, UNLIMITED_RECEIVE_MAXIMUM, false, noop_handle(), false);
         broker.subscribe(id, &filter("t", QoS::AtLeastOnce)).unwrap();
@@ -954,6 +1069,12 @@ mod tests {
             QoS::AtLeastOnce,
             false,
             &Properties::new(),
+            test_runtime(),
+            noop_handle(),
+        );
+        assert!(
+            wait_for_offline_message(&broker, id, 2000),
+            "offloaded publish_whole must still enqueue the offline message"
         );
 
         let (resumed, _, present) =
