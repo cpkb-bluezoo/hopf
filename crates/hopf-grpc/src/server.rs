@@ -515,6 +515,16 @@ impl ServerHandler for GrpcHandler {
         if self.body_rejected || !self.body_started || data.is_empty() {
             return;
         }
+        // A unary RPC carries exactly one gRPC message frame — this
+        // handler has no streaming variant (`GrpcService` only offers
+        // `start_unary_call`), so any bytes arriving after the first
+        // frame already completed are a genuine protocol violation, not
+        // a second legitimate message to silently drop (issue #197).
+        let already_done = self.decode.as_ref().map(|d| d.message_done).unwrap_or(false);
+        if already_done {
+            self.reject_http(response, 400, "unary request carried more than one gRPC message frame");
+            return;
+        }
         {
             let Some(decode) = self.decode.as_mut() else {
                 return;
@@ -528,10 +538,7 @@ impl ServerHandler for GrpcHandler {
                 self.reject_http(response, 400, &err);
                 return;
             }
-            let ended = parser.handler_mut().ended;
-            if ended && !decode.message_done {
-                // fall through after drop borrow
-            } else {
+            if !parser.handler_mut().ended {
                 self.flush_pending(response);
                 return;
             }
@@ -578,6 +585,9 @@ impl ServerHandler for GrpcHandler {
 mod tests {
     use super::*;
     use crate::codec::parse_grpc_content_type;
+    use crate::proto::ProtoFileParser;
+    use hopf_core::ConnHandle;
+    use hopf_http::ServerResponseHandle;
 
     #[test]
     fn accepts_proto_and_json_content_types() {
@@ -605,5 +615,145 @@ mod tests {
         assert!(parse_grpc_content_type("application/json").is_none());
         assert!(parse_grpc_content_type("").is_none());
         assert!(parse_grpc_content_type("text/plain").is_none());
+    }
+
+    const TEST_PROTO: &str = r#"
+        syntax = "proto3";
+        package test;
+        message Msg { string text = 1; }
+        service TestSvc {
+          rpc Call (Msg) returns (Msg);
+        }
+    "#;
+
+    /// Wire-encoded `Msg { text: "x" }` — a real (non-empty) payload, so
+    /// the frame's header doesn't exactly fill a single `receive()` call
+    /// (`GrpcFrameParser::receive` only fires `end_message` once it sees
+    /// at least one more byte after a frame's header — an empty-payload
+    /// frame needs a following byte to complete within the same call).
+    fn test_message_payload() -> Vec<u8> {
+        vec![0x0A, 0x01, b'x'] // field 1 (tag 0x0A = 1<<3|2), len 1, "x"
+    }
+
+    struct NoopHandler;
+    impl ProtoMessageHandler for NoopHandler {
+        fn start_message(&mut self, _type_name: &str) -> Result<(), ProtoParseError> {
+            Ok(())
+        }
+        fn end_message(&mut self) -> Result<(), ProtoParseError> {
+            Ok(())
+        }
+        fn field(&mut self, _name: &str, _value: ScalarValue) -> Result<(), ProtoParseError> {
+            Ok(())
+        }
+        fn start_field(&mut self, _name: &str, _type_name: &str) -> Result<(), ProtoParseError> {
+            Ok(())
+        }
+        fn end_field(&mut self) -> Result<(), ProtoParseError> {
+            Ok(())
+        }
+    }
+
+    struct NoopService;
+    impl GrpcService for NoopService {
+        fn start_unary_call(
+            &self,
+            _path: &str,
+            _response: GrpcResponseChannel,
+        ) -> Option<Box<dyn ProtoMessageHandler>> {
+            Some(Box::new(NoopHandler))
+        }
+    }
+
+    #[derive(Default)]
+    struct MockWriter {
+        status: Option<u16>,
+        body: Vec<u8>,
+    }
+
+    impl ServerWriter for MockWriter {
+        fn headers(&mut self, headers: Headers) {
+            self.status = Some(headers.status_code());
+        }
+        fn start_response_body(&mut self) {}
+        fn response_body_content(&mut self, data: &[u8]) {
+            self.body.extend_from_slice(data);
+        }
+        fn end_response_body(&mut self) {}
+        fn complete(&mut self) {}
+        fn conn_handle(&self) -> ConnHandle {
+            ConnHandle::from_execute(Arc::new(|task| task()))
+        }
+        fn response_handle(&self) -> ServerResponseHandle {
+            unimplemented!("not exercised by this test — GrpcHandler's request_body_content never calls it")
+        }
+        fn pause_request_body(&mut self) {}
+        fn resume_request_body(&mut self) {}
+    }
+
+    /// One length-prefixed, uncompressed gRPC frame wrapping `payload`.
+    fn grpc_frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8];
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn unary_handler() -> Box<dyn ServerHandler> {
+        let proto = ProtoFileParser::parse(TEST_PROTO).unwrap();
+        let factory = GrpcHandlerFactory::new(proto, Arc::new(NoopService));
+        factory.create_handler()
+    }
+
+    /// Issue #197: a unary request carrying a *second* complete gRPC
+    /// message frame must be rejected (400), not silently discarded —
+    /// `GrpcService` has no streaming variant, so any bytes after the
+    /// first frame completes are a genuine protocol violation.
+    #[test]
+    fn second_frame_in_a_unary_request_is_rejected() {
+        let mut handler = unary_handler();
+        let mut w = MockWriter::default();
+
+        let mut h = Headers::new();
+        h.set(":method", "POST");
+        h.set(":path", "/test.TestSvc/Call");
+        h.set("content-type", "application/grpc");
+        handler.headers(&mut w, &h);
+        handler.start_request_body(&mut w);
+        assert_eq!(w.status, None, "no response expected yet");
+
+        let msg = grpc_frame(&test_message_payload());
+        handler.request_body_content(&mut w, &msg);
+        assert_eq!(w.status, None, "first frame alone must not reject the request");
+
+        // A second complete frame — the actual bug: this used to be
+        // silently discarded instead of rejected.
+        handler.request_body_content(&mut w, &msg);
+        assert_eq!(w.status, Some(400), "a second frame in a unary request must be rejected: {:?}", w.status);
+        assert!(
+            !w.body.is_empty(),
+            "a rejection should carry an explanatory body"
+        );
+    }
+
+    /// A single-frame unary request must still work normally — the fix
+    /// must not reject the first (only) frame.
+    #[test]
+    fn single_frame_unary_request_is_not_rejected() {
+        let mut handler = unary_handler();
+        let mut w = MockWriter::default();
+
+        let mut h = Headers::new();
+        h.set(":method", "POST");
+        h.set(":path", "/test.TestSvc/Call");
+        h.set("content-type", "application/grpc");
+        handler.headers(&mut w, &h);
+        handler.start_request_body(&mut w);
+
+        let msg = grpc_frame(&test_message_payload());
+        handler.request_body_content(&mut w, &msg);
+        handler.end_request_body(&mut w);
+
+        assert_ne!(w.status, Some(400), "a single well-formed frame must not be rejected: {:?} body={:?}", w.status, String::from_utf8_lossy(&w.body));
     }
 }
