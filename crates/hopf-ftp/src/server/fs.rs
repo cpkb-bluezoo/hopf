@@ -150,6 +150,7 @@ pub trait FtpFileSystem: Send {
 }
 
 /// Chrooted local filesystem backend.
+#[derive(Clone)]
 pub struct BasicFtpFileSystem {
     root: PathBuf,
     canonical_root: PathBuf,

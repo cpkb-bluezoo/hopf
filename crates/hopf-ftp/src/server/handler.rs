@@ -106,6 +106,18 @@ pub trait FtpConnectionHandler: Send {
     /// File system for this connection (may depend on user).
     fn file_system(&mut self, meta: &FtpConnectionMetadata) -> &mut dyn FtpFileSystem;
 
+    /// Owned, `Send + Sync` handle to this connection's file system, used
+    /// only to offload `open_read`/`open_write` — including the jail
+    /// canonicalization walk they do — off the reactor thread (issue
+    /// #188). Every other [`FtpFileSystem`] operation still goes through
+    /// [`Self::file_system`]. Defaults to `None`: `RETR`/`STOR` then fall
+    /// back to opening synchronously via `file_system()`, exactly as
+    /// before this method existed. Override to opt into the off-thread
+    /// path (the stock `FilesystemFtpHandler` does).
+    fn file_system_handle(&mut self, _meta: &FtpConnectionMetadata) -> Option<Arc<dyn FtpFileSystem + Sync>> {
+        None
+    }
+
     /// Authorization gate before an operation.
     fn is_authorized(
         &self,
@@ -205,24 +217,38 @@ pub trait FtpConnectionHandlerFactory: Send + Sync {
 pub struct FilesystemFtpHandler {
     policy: Arc<dyn TrustPolicy>,
     fs: BasicFtpFileSystem,
+    /// Separate, independent copy of `fs`'s (cheap, immutable) state —
+    /// shared out via [`FtpConnectionHandler::file_system_handle`] so
+    /// `open_read`/`open_write` can run off the reactor thread (issue
+    /// #188). Kept genuinely separate rather than `Arc<BasicFtpFileSystem>`
+    /// shared with `fs`: `file_system()`'s signature returns `&mut dyn
+    /// FtpFileSystem`, which `Arc::get_mut` can't honor once
+    /// `file_system_handle()`'s clones may be alive concurrently (e.g. a
+    /// LIST command using `fs` normally while a RETR's open is in flight
+    /// on another thread).
+    fs_shared: Arc<BasicFtpFileSystem>,
     quota: Option<Arc<dyn hopf_core::QuotaManager>>,
 }
 
 impl FilesystemFtpHandler {
     /// Serve `root` with the given trust policy.
     pub fn new(root: impl AsRef<Path>, policy: Arc<dyn TrustPolicy>) -> std::io::Result<Self> {
+        let fs = BasicFtpFileSystem::new(root, false)?;
         Ok(Self {
             policy,
-            fs: BasicFtpFileSystem::new(root, false)?,
+            fs_shared: Arc::new(fs.clone()),
+            fs,
             quota: None,
         })
     }
 
     /// Read-only root.
     pub fn read_only(root: impl AsRef<Path>, policy: Arc<dyn TrustPolicy>) -> std::io::Result<Self> {
+        let fs = BasicFtpFileSystem::new(root, true)?;
         Ok(Self {
             policy,
-            fs: BasicFtpFileSystem::new(root, true)?,
+            fs_shared: Arc::new(fs.clone()),
+            fs,
             quota: None,
         })
     }
@@ -259,6 +285,10 @@ impl FtpConnectionHandler for FilesystemFtpHandler {
 
     fn file_system(&mut self, _meta: &FtpConnectionMetadata) -> &mut dyn FtpFileSystem {
         &mut self.fs
+    }
+
+    fn file_system_handle(&mut self, _meta: &FtpConnectionMetadata) -> Option<Arc<dyn FtpFileSystem + Sync>> {
+        Some(Arc::clone(&self.fs_shared) as Arc<dyn FtpFileSystem + Sync>)
     }
 
     fn quota_manager(&self) -> Option<Arc<dyn hopf_core::QuotaManager>> {
