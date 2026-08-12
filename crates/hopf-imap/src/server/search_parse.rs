@@ -267,20 +267,24 @@ impl<'a> Parser<'a> {
             return Err(self.err("expected quoted string"));
         }
         self.pos += 1;
-        let mut out = String::new();
+        // Accumulate raw bytes and decode once at the end — pushing
+        // `c as char` byte-by-byte corrupts any non-ASCII content, since a
+        // multi-byte UTF-8 sequence's bytes each get reinterpreted as an
+        // independent Latin-1 codepoint.
+        let mut out = Vec::new();
         while self.pos < self.len {
             let c = self.input.as_bytes()[self.pos];
             if c == b'"' {
                 self.pos += 1;
-                return Ok(out);
+                return String::from_utf8(out).map_err(|_| self.err("invalid utf-8 in quoted string"));
             }
             if c == b'\\' && self.pos + 1 < self.len {
                 self.pos += 1;
-                out.push(self.input.as_bytes()[self.pos] as char);
+                out.push(self.input.as_bytes()[self.pos]);
                 self.pos += 1;
                 continue;
             }
-            out.push(c as char);
+            out.push(c);
             self.pos += 1;
         }
         Err(self.err("unterminated quoted string"))
@@ -442,5 +446,29 @@ mod tests {
     #[test]
     fn unknown_key_errors() {
         assert!(parse_search("XYZ").is_err());
+    }
+
+    /// Issue #195: a quoted SEARCH string argument containing non-ASCII
+    /// UTF-8 content must decode intact, not get mangled by treating each
+    /// byte of a multi-byte sequence as an independent Latin-1 codepoint.
+    #[test]
+    fn quoted_string_preserves_non_ascii_utf8() {
+        let c = parse_search("FROM \"café\"").unwrap();
+        match c {
+            SearchCriteria::Header { name, pattern } => {
+                assert_eq!(name, "From");
+                assert_eq!(pattern, "café");
+            }
+            _ => panic!("expected Header"),
+        }
+    }
+
+    #[test]
+    fn quoted_string_preserves_multibyte_and_emoji() {
+        let c = parse_search("SUBJECT \"日本語 🎉\"").unwrap();
+        match c {
+            SearchCriteria::Header { pattern, .. } => assert_eq!(pattern, "日本語 🎉"),
+            _ => panic!("expected Header"),
+        }
     }
 }
