@@ -18,6 +18,17 @@ pub trait WsEventHandler: Send {
     /// [`hopf_core::ConnHandle`].
     fn opened(&mut self, session: &mut WsSession<'_>, conn: &ConnHandle);
 
+    /// Re-entry point for work stashed by another thread (e.g. a storage
+    /// pool completion callback) that needs `&mut self` access to finish —
+    /// the WebSocket-layer counterpart of [`hopf_core::Endpoint::poke_handler`]/
+    /// [`hopf_core::ConnHandle::poke`], which only reach the raw transport's
+    /// `ProtocolHandler`, not a handler layered on top via WebSocket framing
+    /// (issue #232). Called with no frame data, purely to give a handler a
+    /// chance to apply a pending outcome and reply via `session` (e.g. a
+    /// deferred CONNACK once an offloaded credential check resolves) —
+    /// default no-op for handlers that never offload work this way.
+    fn poke(&mut self, _session: &mut WsSession<'_>) {}
+
     /// Whether this handler wants incremental delivery via [`Self::text_chunk`]/
     /// [`Self::binary_chunk`] instead of whole-message buffering.
     ///
@@ -167,6 +178,15 @@ impl ProtocolUpgradeHandler for WsUpgradeHandler {
             return;
         }
         self.ensure_opened();
+        {
+            // See `WsEventHandler::poke` — this runs unconditionally (not
+            // just for an empty `data` "pure poke" call) so a poke that
+            // happens to race with real inbound bytes in the same
+            // `receive()` call still gets serviced, same as `receive`
+            // itself always would.
+            let mut session = WsSession::new(&mut self.out, self.role);
+            self.event.poke(&mut session);
+        }
         let streaming = self.event.wants_streaming();
         let mut bridge = FrameBridge {
             event: &mut *self.event,

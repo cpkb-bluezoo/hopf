@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -140,7 +141,7 @@ impl WsEventHandlerFactory for MqttWsFactory {
             config: Arc::clone(&self.config),
             parser,
             session: SessionState::AwaitingConnect,
-            connect_handler: self.handler_factory.create(),
+            connect_handler: Some(self.handler_factory.create()),
             publish_handler: self.handler_factory.create_publish(),
             subscribe_handler: self.handler_factory.create_subscribe(),
             // Broker fan-out delivers asynchronously from another connection's
@@ -163,6 +164,8 @@ impl WsEventHandlerFactory for MqttWsFactory {
             conn_trace: None,
             publish_tel: None,
             telemetry_started: false,
+            busy: Arc::new(AtomicBool::new(false)),
+            pending_authorize: Arc::new(Mutex::new(None)),
         })
     }
 }
@@ -172,7 +175,10 @@ pub struct MqttWsHandler {
     config: Arc<MqttConfig>,
     parser: MqttFrameParser,
     session: SessionState,
-    connect_handler: Box<dyn ConnectHandler>,
+    /// `None` only while offloaded to the storage pool for an in-flight
+    /// `authorize()` call (issue #232), or after one has run — `authorize`
+    /// is called at most once per connection, so it's never needed back.
+    connect_handler: Option<Box<dyn ConnectHandler>>,
     publish_handler: Box<dyn PublishHandler>,
     subscribe_handler: Box<dyn SubscribeHandler>,
     conn: ConnHandle,
@@ -186,6 +192,29 @@ pub struct MqttWsHandler {
     conn_trace: Option<Trace>,
     publish_tel: Option<PublishTelemetry>,
     telemetry_started: bool,
+    /// True while a plain-CONNECT's `authorize()` call is offloaded to the
+    /// storage pool (issue #232, WS counterpart of #210's TCP fix) — a
+    /// pipelined second CONNECT arriving before the check resolves is
+    /// rejected while this is set, since `session` alone doesn't protect
+    /// against that race (it only becomes `Connected` once the check
+    /// resolves).
+    busy: Arc<AtomicBool>,
+    /// See [`PendingWsAuthorizeOutcome`].
+    pending_authorize: Arc<Mutex<Option<PendingWsAuthorizeOutcome>>>,
+}
+
+/// Result of an offloaded plain-CONNECT `ConnectHandler::authorize` call
+/// over WebSocket (issue #232 — same class of risk #210 fixed for the TCP
+/// transport: the shipped `DefaultConnectHandler`, and any
+/// application-supplied one, may block for an LDAP/PAM-backed
+/// `CredentialStore`). `connect_handler` travels back with the outcome: it
+/// moved into the storage-pool closure to make the call, and
+/// `sync_pending_ws_authorize` restores it — `authorize()` runs at most
+/// once per connection (a rejected/errored CONNECT always closes the
+/// connection), so there's never a second call waiting on it.
+struct PendingWsAuthorizeOutcome {
+    result: Result<(Box<dyn ConnectHandler>, ConnectDecision), String>,
+    pending_connect: crate::server::auth::PendingConnectAuth,
 }
 
 impl MqttWsHandler {
@@ -395,6 +424,16 @@ impl WsEventHandler for MqttWsHandler {
         self.rearm_keepalive();
     }
 
+    /// Re-entry point for `offload_ws_authorize`'s completion (issue #232):
+    /// `hopf_websocket::WsUpgradeHandler` calls this unconditionally on
+    /// every `poke` (an `Endpoint::poke_handler`/`ConnHandle::poke` that
+    /// reached this WS-layered handler, not just the raw HTTP connection)
+    /// as well as before parsing any newly-arrived frame data, so a pending
+    /// outcome is always applied before anything else touches `self`.
+    fn poke(&mut self, session: &mut WsSession<'_>) {
+        sync_pending_ws_authorize(self, session);
+    }
+
     fn closed(&mut self, _session: &mut WsSession<'_>, _code: u16, _reason: &str) {
         if let Some(t) = self.connect_timeout_timer.take() {
             t.cancel();
@@ -446,7 +485,15 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         if let Some(timer) = self.handler.connect_timeout_timer.take() {
             timer.cancel();
         }
-        if matches!(self.handler.session, SessionState::Connected(_)) {
+        if matches!(self.handler.session, SessionState::Connected(_))
+            || self.handler.busy.load(Ordering::Relaxed)
+        {
+            // A second CONNECT on an established session is a protocol
+            // violation (MQTT 3.1.1 §3.1) — also rejected while a first,
+            // still-in-flight CONNECT's `authorize()` call is offloaded
+            // (issue #232): `session` alone doesn't protect against that
+            // race, since it only becomes `Connected` once the check
+            // resolves.
             self.disconnect_and_close(reason::PROTOCOL_ERROR);
             return;
         }
@@ -467,22 +514,6 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
             packet.client_id.clone()
         };
 
-        if let ConnectDecision::Reject(reason_code) =
-            self.handler.connect_handler.authorize(&packet, &self.handler.meta)
-        {
-            self.handler.record_auth(false);
-            self.connack_and_close(version, reason_code);
-            return;
-        }
-        self.handler.record_auth(true);
-        self.handler.meta.client_id = Some(client_id.clone());
-
-        let keep_alive = if packet.keep_alive == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_millis(packet.keep_alive as u64 * 1500)
-        };
-
         let receive_maximum = if version.is_v5() {
             packet.properties.get_u16(property::RECEIVE_MAXIMUM).unwrap_or(UNLIMITED_RECEIVE_MAXIMUM).max(1)
         } else {
@@ -493,63 +524,29 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
         } else {
             0
         };
-        let session_expiry = Duration::from_secs(session_expiry_secs as u64);
-
         let client_topic_alias_max = if version.is_v5() {
             packet.properties.get_u16(property::TOPIC_ALIAS_MAXIMUM).unwrap_or(0)
         } else {
             0
         };
-        let server_topic_alias_max = if version.is_v5() {
-            SERVER_TOPIC_ALIAS_MAXIMUM
-        } else {
-            0
-        };
 
-        let (subscriber_id, evicted, session_present) = self.broker().register(
-            &client_id,
-            version,
-            receive_maximum,
-            packet.clean_session,
-            self.handler.conn.clone(),
-            true,
-        );
-        if let Some(evicted) = evicted {
-            evicted.close();
-        }
-
-        self.handler.session = SessionState::Connected(Box::new(ConnectedWsSession {
-            subscriber_id,
+        // Offload the (possibly blocking — e.g. an LDAP/PAM-backed
+        // CredentialStore) authorize() call off the reactor thread (issue
+        // #232, WS counterpart of #210's TCP fix). Everything downstream of
+        // a successful check is captured in `pending_connect` and resumed
+        // via `finish_ws_connect_after_auth` by `sync_pending_ws_authorize`,
+        // once the result is back.
+        let pending_connect = crate::server::auth::PendingConnectAuth {
             client_id,
-            version,
-            will: packet.will,
-            keep_alive,
-            keepalive_timer: None,
-            session_expiry,
-            graceful_disconnect: false,
-            awaiting_pubrel: Arc::new(Mutex::new(HashSet::new())),
-            pending_publish: None,
-            inbound_aliases: HashMap::new(),
-            server_topic_alias_max,
-            client_topic_alias_max,
-            qos_retry_interval: DEFAULT_QOS_RETRY_INTERVAL,
-            retransmit_timer: None,
-        }));
-        self.handler.parser.set_version(version);
-
-        if session_present {
-            self.broker().drain_offline(subscriber_id);
-        }
-        self.handler.arm_retransmit_timer();
-
-        let connack_props = connack_properties(
-            version,
+            clean_session: packet.clean_session,
+            keep_alive_raw: packet.keep_alive,
+            will: packet.will.clone(),
             receive_maximum,
             session_expiry_secs,
-            server_topic_alias_max,
-        );
-        let wire = encode::encode_connack(session_present, 0, &connack_props, version);
-        self.session.send_binary(&wire);
+            client_topic_alias_max,
+            version,
+        };
+        offload_ws_authorize(self.handler, packet, pending_connect);
     }
 
     fn connack(&mut self, _session_present: bool, _reason_code: u8, _properties: Properties) {
@@ -835,6 +832,160 @@ impl MqttFrameHandler for WsCtx<'_, '_, '_> {
     fn parse_error(&mut self, _err: MqttError) {
         self.disconnect_and_close(reason::MALFORMED_PACKET);
     }
+}
+
+/// Offload a plain (non-enhanced-AUTH) CONNECT's `ConnectHandler::authorize`
+/// call to the storage pool over WebSocket (issue #232 — may block for an
+/// LDAP/PAM-backed `CredentialStore`, same class of risk #210 fixed for the
+/// TCP transport). `connect_handler` moves into the closure; the outcome
+/// (including it, restored) lands in `pending_authorize` for
+/// [`sync_pending_ws_authorize`] to apply once back on the reactor, via
+/// [`WsEventHandler::poke`] (issue #232's whole point — the WS-layered
+/// counterpart of `ConnHandle::poke`/`Endpoint::poke_handler`).
+fn offload_ws_authorize(
+    handler: &mut MqttWsHandler,
+    packet: ConnectPacket,
+    pending_connect: crate::server::auth::PendingConnectAuth,
+) {
+    let version = pending_connect.version;
+    let Some(connect_handler) = handler.connect_handler.take() else {
+        // Can't happen (authorize() runs at most once per connection —
+        // see `connect_handler`'s doc), but fail closed rather than
+        // panicking if it somehow did.
+        let wire = encode::encode_connack(false, reason::UNSPECIFIED_ERROR, &Properties::new(), version);
+        handler.conn.send(wire);
+        handler.conn.close();
+        return;
+    };
+    let meta = handler.meta.clone();
+    let pending = Arc::clone(&handler.pending_authorize);
+    let busy = Arc::clone(&handler.busy);
+    handler.busy.store(true, Ordering::Relaxed);
+    let handle = handler.conn.clone();
+    handler.runtime.storage().submit_on(
+        handle.clone(),
+        move || {
+            let mut connect_handler = connect_handler;
+            let decision = connect_handler.authorize(&packet, &meta);
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((connect_handler, decision))
+        },
+        move |result: Result<(Box<dyn ConnectHandler>, ConnectDecision), hopf_core::StorageError>| {
+            let result = result.map_err(|e| e.to_string());
+            *pending.lock().unwrap() = Some(PendingWsAuthorizeOutcome { result, pending_connect });
+            handle.with_endpoint(move |ep| {
+                busy.store(false, Ordering::Relaxed);
+                // Nothing sent to the client yet — the reply depends
+                // entirely on `sync_pending_ws_authorize`, which needs
+                // `&mut MqttWsHandler`. The client is waiting on us, not
+                // about to send more input, so this poke is what triggers
+                // the next re-entry.
+                ep.poke_handler();
+            });
+        },
+    );
+}
+
+/// Apply the outcome of an offloaded plain-CONNECT `authorize()` call over
+/// WebSocket, once [`offload_ws_authorize`]'s `submit_on` callback has
+/// stashed one — see [`PendingWsAuthorizeOutcome`]. Called from
+/// [`MqttWsHandler::poke`].
+fn sync_pending_ws_authorize(handler: &mut MqttWsHandler, session: &mut WsSession<'_>) {
+    let Some(PendingWsAuthorizeOutcome { result, pending_connect }) =
+        handler.pending_authorize.lock().unwrap().take()
+    else {
+        return;
+    };
+    let version = pending_connect.version;
+    let (connect_handler, decision) = match result {
+        Ok(ok) => ok,
+        Err(_e) => {
+            handler.record_auth(false);
+            let wire = encode::encode_connack(false, reason::SERVER_UNAVAILABLE, &Properties::new(), version);
+            session.send_binary(&wire);
+            session.send_close(1002, "mqtt CONNECT refused");
+            return;
+        }
+    };
+    handler.connect_handler = Some(connect_handler);
+    match decision {
+        ConnectDecision::Reject(reason_code) => {
+            handler.record_auth(false);
+            let wire = encode::encode_connack(false, reason_code, &Properties::new(), version);
+            session.send_binary(&wire);
+            session.send_close(1002, "mqtt CONNECT refused");
+        }
+        ConnectDecision::Accept => {
+            handler.record_auth(true);
+            finish_ws_connect_after_auth(handler, session, pending_connect);
+        }
+    }
+}
+
+/// Resume CONNECT processing after a successful offloaded `authorize()`
+/// call over WebSocket — WS counterpart of `control::finish_connect_after_auth`
+/// (issue #232). Unlike the TCP path, this doesn't (yet) offload the
+/// offline-queue drain for a resumed session (issue #216 wasn't ported to
+/// WS) — `self.broker().drain_offline` here is the same synchronous call
+/// the pre-#232 code always made inline.
+fn finish_ws_connect_after_auth(
+    handler: &mut MqttWsHandler,
+    session: &mut WsSession<'_>,
+    pc: crate::server::auth::PendingConnectAuth,
+) {
+    let version = pc.version;
+    let keep_alive = if pc.keep_alive_raw == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(pc.keep_alive_raw as u64 * 1500)
+    };
+    let session_expiry = Duration::from_secs(pc.session_expiry_secs as u64);
+    let server_topic_alias_max = if version.is_v5() { SERVER_TOPIC_ALIAS_MAXIMUM } else { 0 };
+
+    let (subscriber_id, evicted, session_present) = handler.config.broker.register(
+        &pc.client_id,
+        version,
+        pc.receive_maximum,
+        pc.clean_session,
+        handler.conn.clone(),
+        true,
+    );
+    if let Some(evicted) = evicted {
+        evicted.close();
+    }
+
+    handler.meta.client_id = Some(pc.client_id.clone());
+    handler.session = SessionState::Connected(Box::new(ConnectedWsSession {
+        subscriber_id,
+        client_id: pc.client_id,
+        version,
+        will: pc.will,
+        keep_alive,
+        keepalive_timer: None,
+        session_expiry,
+        graceful_disconnect: false,
+        awaiting_pubrel: Arc::new(Mutex::new(HashSet::new())),
+        pending_publish: None,
+        inbound_aliases: HashMap::new(),
+        server_topic_alias_max,
+        client_topic_alias_max: pc.client_topic_alias_max,
+        qos_retry_interval: DEFAULT_QOS_RETRY_INTERVAL,
+        retransmit_timer: None,
+    }));
+    handler.parser.set_version(version);
+
+    if session_present {
+        handler.config.broker.drain_offline(subscriber_id);
+    }
+    handler.arm_retransmit_timer();
+
+    let connack_props = connack_properties(
+        version,
+        pc.receive_maximum,
+        pc.session_expiry_secs,
+        server_topic_alias_max,
+    );
+    let wire = encode::encode_connack(session_present, 0, &connack_props, version);
+    session.send_binary(&wire);
 }
 
 /// Cheap process-unique suffix for an assigned client id — avoids pulling
