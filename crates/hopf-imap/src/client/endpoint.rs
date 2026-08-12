@@ -74,6 +74,14 @@ pub struct ImapClientEndpoint {
     last_appenduid: Option<ImapAppendUid>,
     /// Selected before IDLE (restored on DONE completion).
     was_selected: bool,
+    /// Set while a `FETCH` response in progress has streamed at least one
+    /// literal chunk (`on_literal_begin`..`on_literal_end`) — since issue
+    /// #190, literal content is delivered only via `on_fetch_literal*` and
+    /// never duplicated into `ImapFetchData::body`, so `on_fetch`'s
+    /// flags-only heuristic can no longer use `data.body.is_empty()` alone
+    /// to tell a real content-bearing FETCH response apart from an
+    /// unsolicited flags-only one. Consumed (reset) by `on_fetch`.
+    fetch_streamed_literal: bool,
 }
 
 impl ImapClientEndpoint {
@@ -114,6 +122,7 @@ impl ImapClientEndpoint {
             last_copyuid: None,
             last_appenduid: None,
             was_selected: false,
+            fetch_streamed_literal: false,
         }
     }
 
@@ -574,9 +583,10 @@ impl ImapClientEndpoint {
     }
 
     fn on_fetch(&mut self, data: ImapFetchData, ep: &mut dyn Endpoint) {
+        let streamed_literal = std::mem::take(&mut self.fetch_streamed_literal);
         let flags_only =
             data.uid.is_none() && data.size.is_none() && data.modseq.is_none() && data.body.is_empty()
-                && !data.flags.is_empty();
+                && !streamed_literal && !data.flags.is_empty();
         if flags_only {
             if self.pending.oldest_of_kind(PendingKind::Store).is_some() {
                 self.deliver_fetch_data(data, ep);
@@ -602,6 +612,7 @@ impl ImapClientEndpoint {
     }
 
     fn on_literal_begin(&mut self, seq: u32, section: String, size: u64, ep: &mut dyn Endpoint) {
+        self.fetch_streamed_literal = true;
         if self.pending.oldest_of_kind(PendingKind::Fetch).is_some() {
             if let Some(mut driver) = self.driver.take() {
                 driver.on_fetch_literal_begin(ep, seq, &section, size);
