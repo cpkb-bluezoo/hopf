@@ -93,7 +93,12 @@ impl TcpConnection {
         let net_out = pool.acquire(DEFAULT_BUFFER_SIZE);
         let tls = if params.secure {
             if let Some(connector) = params.tls_connector.as_ref() {
-                let name = params.server_name.as_deref().unwrap_or("localhost");
+                let name = params.server_name.as_deref().ok_or_else(|| {
+                    io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "TLS client connector requires server_name (SNI) to be set",
+                    )
+                })?;
                 Some(connector.connect(name)?)
             } else if let Some(acceptor) = params.tls_acceptor.as_ref() {
                 Some(acceptor.accept())
@@ -800,6 +805,63 @@ impl Endpoint for TcpConnection {
                 self.remote
             );
             self.force_close();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::NopHandler;
+    use crate::reactor::Reactor;
+    use crate::tls::TlsSession;
+    use std::net::TcpListener as StdTcpListener;
+    use std::sync::atomic::AtomicBool;
+
+    /// Never actually dials out — the missing-`server_name` check must
+    /// reject the connection before this is ever invoked.
+    struct UnreachableConnector;
+
+    impl crate::tls::TlsConnector for UnreachableConnector {
+        fn connect(&self, _server_name: &str) -> io::Result<Box<dyn TlsSession>> {
+            unreachable!("connector.connect must not be called without a server_name (issue #198)")
+        }
+    }
+
+    fn connected_stream_pair() -> mio::net::TcpStream {
+        let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let std_stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        std_stream.set_nonblocking(true).unwrap();
+        let _ = listener.accept().unwrap();
+        mio::net::TcpStream::from_std(std_stream)
+    }
+
+    #[test]
+    fn tls_dial_without_server_name_is_rejected_not_defaulted_to_localhost() {
+        let active = Arc::new(AtomicBool::new(true));
+        let (reactor_handle, _thread) = Reactor::spawn(0, active).unwrap();
+        let pool = Arc::new(BufferPool::default());
+        let stream = connected_stream_pair();
+        let addr = stream.peer_addr().unwrap();
+
+        let mut params = TcpConnParams::plaintext(addr);
+        params.secure = true;
+        params.tls_connector = Some(Arc::new(UnreachableConnector));
+        // server_name left unset — this must not silently become "localhost".
+
+        let result = TcpConnection::new(
+            Token(1),
+            stream,
+            Box::new(NopHandler),
+            params,
+            reactor_handle,
+            pool,
+            false,
+            None,
+        );
+        match result {
+            Ok(_) => panic!("TLS dial with no server_name must fail, not default to \"localhost\""),
+            Err(e) => assert_eq!(e.kind(), ErrorKind::InvalidInput),
         }
     }
 }
