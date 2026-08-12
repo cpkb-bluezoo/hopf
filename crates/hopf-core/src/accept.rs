@@ -6,7 +6,7 @@ use std::io::{self, ErrorKind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mio::net::TcpListener as MioTcpListener;
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -19,6 +19,8 @@ use crate::telemetry::TelemetryHook;
 const WAKER_TOKEN: Token = Token(0);
 const FIRST_LISTENER_TOKEN: usize = 1;
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(1000);
+/// Upper bound on `poll()`'s wait when nothing else needs attention.
+const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 
 struct BoundListener {
     id: BindingId,
@@ -37,6 +39,15 @@ pub(crate) struct AcceptLoop {
     active: Arc<AtomicBool>,
     cmd_rx: std::sync::mpsc::Receiver<AcceptCmd>,
     telemetry: Option<Arc<dyn TelemetryHook>>,
+    /// Set on EMFILE/ENFILE (issue #189): while in the future, `run()`
+    /// skips attempting `accept()` on any listener — fd exhaustion is a
+    /// process-wide condition, so retrying immediately on another listener
+    /// would just fail the same way — but keeps polling/`drain_cmds`ing
+    /// normally instead of blocking the thread with `thread::sleep`, so
+    /// listeners that were *already* readable in the same batch this
+    /// backoff started in still get serviced, and `AddListener`/
+    /// `RemoveListener` commands never stall behind it.
+    backoff_until: Option<Instant>,
 }
 
 pub(crate) enum AcceptCmd {
@@ -109,6 +120,7 @@ impl AcceptLoop {
                     active,
                     cmd_rx,
                     telemetry,
+                    backoff_until: None,
                 };
                 if let Err(e) = accept.run() {
                     eprintln!("hopf: accept loop exited with error: {e}");
@@ -120,10 +132,14 @@ impl AcceptLoop {
     fn run(&mut self) -> io::Result<()> {
         while self.active.load(Ordering::Acquire) {
             self.drain_cmds()?;
-            match self.poll.poll(&mut self.events, Some(Duration::from_millis(500))) {
+            let timeout = self.poll_timeout();
+            match self.poll.poll(&mut self.events, Some(timeout)) {
                 Ok(()) => {}
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
+            }
+            if self.backoff_until.is_some_and(|until| Instant::now() >= until) {
+                self.backoff_until = None;
             }
             let mut readable_tokens = Vec::new();
             for event in self.events.iter() {
@@ -134,11 +150,33 @@ impl AcceptLoop {
                     readable_tokens.push(event.token());
                 }
             }
-            for token in readable_tokens {
-                self.accept_on(token)?;
+            // Still backing off (issue #189): fd exhaustion is process-wide,
+            // so a fresh `accept()` attempt right now would just fail the
+            // same way on any listener — skip trying until the backoff
+            // clears, rather than spinning on repeated failures. Listeners
+            // already readable in whichever batch *started* the backoff
+            // were serviced before `accept_on` set it, so nothing already
+            // in flight this iteration is held up by this check.
+            if self.backoff_until.is_none() {
+                for token in readable_tokens {
+                    self.accept_on(token)?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// How long `poll()` should wait: the usual default, or less if a
+    /// backoff is due to expire sooner — so `run()` wakes up promptly to
+    /// retry (and keeps `drain_cmds()` responsive throughout) instead of
+    /// blocking the thread for the whole backoff window (issue #189).
+    fn poll_timeout(&self) -> Duration {
+        match self.backoff_until {
+            Some(until) => until
+                .saturating_duration_since(Instant::now())
+                .min(DEFAULT_POLL_TIMEOUT),
+            None => DEFAULT_POLL_TIMEOUT,
+        }
     }
 
     fn drain_cmds(&mut self) -> io::Result<()> {
@@ -238,7 +276,7 @@ impl AcceptLoop {
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if is_fd_exhaustion(&e) => {
                     eprintln!("hopf: accept EMFILE/ENFILE, backing off");
-                    thread::sleep(ACCEPT_BACKOFF);
+                    self.backoff_until = Some(Instant::now() + ACCEPT_BACKOFF);
                     break;
                 }
                 Err(e) => {
@@ -260,4 +298,60 @@ impl AcceptLoop {
 
 fn is_fd_exhaustion(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(24) | Some(23))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real (but socket-free) `AcceptLoop`, enough to exercise
+    /// `poll_timeout` directly without needing a spawned thread or actual
+    /// listeners.
+    fn test_loop() -> AcceptLoop {
+        let poll = Poll::new().unwrap();
+        let (_tx, cmd_rx) = std::sync::mpsc::channel();
+        AcceptLoop {
+            poll,
+            events: Events::with_capacity(1),
+            listeners: Vec::new(),
+            next_token: FIRST_LISTENER_TOKEN,
+            workers: Vec::new(),
+            rr: AtomicUsize::new(0),
+            active: Arc::new(AtomicBool::new(true)),
+            cmd_rx,
+            telemetry: None,
+            backoff_until: None,
+        }
+    }
+
+    /// Issue #189: `poll_timeout` — not a blocking `thread::sleep` — is
+    /// what now enforces the EMFILE/ENFILE backoff, so `run()`'s loop
+    /// (and thus `drain_cmds`/other listeners) stays responsive throughout
+    /// the backoff window instead of the whole accept-loop thread being
+    /// blocked for it.
+    #[test]
+    fn poll_timeout_is_default_with_no_backoff() {
+        let l = test_loop();
+        assert_eq!(l.poll_timeout(), DEFAULT_POLL_TIMEOUT);
+    }
+
+    #[test]
+    fn poll_timeout_is_bounded_by_a_fresh_backoff() {
+        let mut l = test_loop();
+        l.backoff_until = Some(Instant::now() + ACCEPT_BACKOFF);
+        let t = l.poll_timeout();
+        // Never waits longer than the default even though the backoff
+        // itself (1s) is longer — `run()` must keep waking up to service
+        // `drain_cmds`/already-readable listeners, not block for the full
+        // window in one `poll()` call.
+        assert!(t <= DEFAULT_POLL_TIMEOUT, "{t:?} exceeds the default poll timeout");
+        assert!(t > Duration::from_millis(400), "{t:?} should be close to the default, backoff just started");
+    }
+
+    #[test]
+    fn poll_timeout_is_zero_once_backoff_has_elapsed() {
+        let mut l = test_loop();
+        l.backoff_until = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(l.poll_timeout(), Duration::ZERO);
+    }
 }
