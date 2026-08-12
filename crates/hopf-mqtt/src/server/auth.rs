@@ -30,7 +30,8 @@ pub(crate) struct PendingAuth {
     pub(crate) pending_connect: Option<PendingConnectAuth>,
 }
 
-/// CONNECT fields held until enhanced AUTH completes.
+/// CONNECT fields held until enhanced AUTH (or, issue #210, an offloaded
+/// plain-CONNECT `authorize()` call) completes.
 pub(crate) struct PendingConnectAuth {
     pub(crate) client_id: String,
     pub(crate) clean_session: bool,
@@ -39,6 +40,11 @@ pub(crate) struct PendingConnectAuth {
     pub(crate) receive_maximum: u16,
     pub(crate) session_expiry_secs: u32,
     pub(crate) client_topic_alias_max: u16,
+    /// Enhanced AUTH is MQTT5-only, so `finish_connect_after_auth` used to
+    /// hardcode `ProtocolVersion::V5` — issue #210's plain-CONNECT offload
+    /// reuses the same continuation for v3.1.1 connections too, so the
+    /// version now travels with the rest of the pending state instead.
+    pub(crate) version: ProtocolVersion,
 }
 
 /// Run one SASL step off the reactor thread (issue #181 — `SaslServer::step`
@@ -255,6 +261,7 @@ pub(crate) fn maybe_start_connect_auth(
         receive_maximum,
         session_expiry_secs,
         client_topic_alias_max,
+        version: packet.version,
     };
 
     // Server-first mechanisms need an initial empty step.
