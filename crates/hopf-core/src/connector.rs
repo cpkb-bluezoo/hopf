@@ -75,7 +75,9 @@ pub struct TcpConnectorConfig {
     pub secure: bool,
     /// TLS connector (required when [`secure`](Self::secure) is true).
     pub tls: Option<SharedTlsConnector>,
-    /// Server name for SNI / cert verification (defaults to addr display).
+    /// Server name for SNI / cert verification. Required when `secure` is
+    /// true and `tls` is set — a dial with TLS enabled but no name fails
+    /// at connect time rather than silently using a placeholder identity.
     pub server_name: Option<String>,
 }
 
