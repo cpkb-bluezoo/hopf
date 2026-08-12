@@ -350,8 +350,16 @@ impl<H: ServerHandler> Driver<H> {
                 return self.fail_stop(HttpError::new(400, "invalid Transfer-Encoding"));
             }
             if is_chunked_te(te) {
+                // RFC 9112 §6.1: a message with both Transfer-Encoding and
+                // Content-Length is a request smuggling vector — reject it
+                // outright rather than silently letting TE win.
+                if self.headers.get("content-length").is_some() {
+                    return self.fail_stop(HttpError::new(
+                        400,
+                        "Content-Length not allowed with Transfer-Encoding",
+                    ));
+                }
                 self.chunked = true;
-                self.headers.remove("content-length");
             }
         } else {
             // RFC 9112 §6.3: multiple Content-Length fields are only valid
@@ -781,6 +789,17 @@ mod tests {
         feed_all(&mut p, &[b"5\r\nhello\r\n0\r\n\r\n"]);
         let g = rec.lock().unwrap();
         assert_eq!(g.body, b"hello");
+    }
+
+    #[test]
+    fn transfer_encoding_and_content_length_together_is_rejected() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut p = H1ServerCodec::new(Arc::clone(&rec), HttpLimits::default(), false);
+        let mut data: &[u8] =
+            b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\nhello";
+        let err = p.receive(&mut data).unwrap_err();
+        assert_eq!(err.status, 400);
+        assert!(rec.lock().unwrap().events.is_empty(), "must not reach the app handler");
     }
 
     #[test]
