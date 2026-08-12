@@ -5,17 +5,26 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hopf_auth::crypto::{ct_eq_hex, md5_hex};
+use hopf_auth::crypto::{ct_eq_hex, generate_nonce_hex, md5_hex};
 use hopf_auth::{CredentialStore, SaslMechanism};
 
-/// Build an APOP timestamp `<pid.millis@hostname>`.
+/// Build an APOP timestamp `<pid.millis.nonce@hostname>`.
+///
+/// RFC 1939's entire APOP security property rests on this challenge being
+/// unpredictable and never repeated — `pid` is constant for the server's
+/// whole lifetime (and visible in the banner itself) and millisecond
+/// wall-clock alone can collide across connections accepted in the same
+/// millisecond, so the 128-bit `nonce` (from the OS CSPRNG, same helper
+/// SASL nonces use) is what actually carries the security property; `pid`/
+/// `millis` are kept only for human-readable uniqueness/debugging.
 pub fn apop_timestamp(hostname: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     let pid = std::process::id();
-    format!("<{pid}.{millis}@{hostname}>")
+    let nonce = generate_nonce_hex(16);
+    format!("<{pid}.{millis}.{nonce}@{hostname}>")
 }
 
 /// Verify an APOP digest: `MD5(timestamp || password)` as lowercase hex.
@@ -115,5 +124,29 @@ mod tests {
     fn password_store_does_not_support_apop() {
         let store = PasswordStore::new().with_user("alice", "secret");
         assert!(!verify_apop(&store, "alice", "<1.2@localhost>", "anything"));
+    }
+
+    /// Issue #194: the challenge must carry real entropy, not just
+    /// pid+coarse-timestamp — two challenges built back-to-back (the
+    /// same-millisecond-collision scenario the issue describes) must
+    /// still differ, and differ by more than just their timestamp field.
+    #[test]
+    fn apop_timestamp_is_unique_across_rapid_calls() {
+        let challenges: Vec<String> = (0..100).map(|_| apop_timestamp("localhost")).collect();
+        let unique: std::collections::HashSet<&String> = challenges.iter().collect();
+        assert_eq!(unique.len(), challenges.len(), "every challenge must be distinct");
+    }
+
+    #[test]
+    fn apop_timestamp_has_the_expected_shape() {
+        let ts = apop_timestamp("mail.example.com");
+        assert!(ts.starts_with('<') && ts.ends_with('>'));
+        assert!(ts.ends_with("@mail.example.com>"));
+        let inner = &ts[1..ts.len() - 1];
+        let parts: Vec<&str> = inner.splitn(2, '@').next().unwrap().split('.').collect();
+        assert_eq!(parts.len(), 3, "expected pid.millis.nonce, got {inner:?}");
+        let nonce = parts[2];
+        assert_eq!(nonce.len(), 32, "128-bit nonce as hex");
+        assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
