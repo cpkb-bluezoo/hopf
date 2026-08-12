@@ -49,28 +49,28 @@ impl SaslServer for CramMd5Server {
         true
     }
 
-    fn step(&mut self, client_response: Option<&[u8]>) -> SaslServerStep {
+    fn step(&mut self, client_response: Option<&[u8]>, cb: crate::session::Cb<SaslServerStep>) {
         if !self.sent {
             self.sent = true;
-            return SaslServerStep::Challenge(self.challenge.as_bytes().to_vec());
+            return cb(SaslServerStep::Challenge(self.challenge.as_bytes().to_vec()));
         }
         let Some(raw) = client_response else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
         let text = String::from_utf8_lossy(raw);
         let Some((user, digest)) = text.rsplit_once(' ') else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
         let Some(expected) = self.store.cram_md5_digest(user, &self.challenge) else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
         if ct_eq_hex(digest, &expected) {
-            SaslServerStep::Complete {
+            cb(SaslServerStep::Complete {
                 username: user.to_string(),
                 final_message: None,
-            }
+            });
         } else {
-            SaslServerStep::Failure
+            cb(SaslServerStep::Failure);
         }
     }
 }

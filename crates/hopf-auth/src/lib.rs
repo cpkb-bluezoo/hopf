@@ -35,7 +35,7 @@ pub use session::{
     SaslServerStep,
 };
 pub use store::{
-    CertificateIdentity, CredentialStore, PasswordStore, ScramCredentials, TokenValidation,
+    CertificateIdentity, Cb, CredentialStore, PasswordStore, ScramCredentials, TokenValidation,
 };
 
 #[cfg(all(feature = "pam", unix))]
@@ -220,7 +220,9 @@ mod tests {
             if server.server_first() && client_msg.is_none() {
                 // server sends first
             }
-            let step = server.step(client_msg.as_deref());
+            let (tx, rx) = std::sync::mpsc::channel();
+            server.step(client_msg.as_deref(), Box::new(move |s| { let _ = tx.send(s); }));
+            let step = rx.recv().expect("step completes synchronously in tests");
             match step {
                 SaslServerStep::Challenge(ch) => match client.evaluate(Some(&ch)) {
                     SaslClientStep::Response(b) | SaslClientStep::Complete(b) => {
@@ -292,7 +294,9 @@ mod tests {
             other => panic!("unexpected initial step: {other:?}"),
         };
         for _ in 0..8 {
-            match server.step(client_msg.as_deref()) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            server.step(client_msg.as_deref(), Box::new(move |s| { let _ = tx.send(s); }));
+            match rx.recv().expect("step completes synchronously in tests") {
                 SaslServerStep::Challenge(ch) => match client.evaluate(Some(&ch)) {
                     SaslClientStep::Response(b) | SaslClientStep::Complete(b) => {
                         client_msg = if b.is_empty() { None } else { Some(b) };

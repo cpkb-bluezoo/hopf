@@ -45,18 +45,18 @@ impl SaslServer for LoginServer {
         true
     }
 
-    fn step(&mut self, client_response: Option<&[u8]>) -> SaslServerStep {
+    fn step(&mut self, client_response: Option<&[u8]>, cb: crate::session::Cb<SaslServerStep>) {
         if self.phase == Phase::Done {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         }
         if !self.prompted {
             self.prompted = true;
-            return SaslServerStep::Challenge(b"Username:".to_vec());
+            return cb(SaslServerStep::Challenge(b"Username:".to_vec()));
         }
         let Some(raw) = client_response else {
-            return SaslServerStep::Failure;
+            return cb(SaslServerStep::Failure);
         };
-        match self.phase {
+        cb(match self.phase {
             Phase::ExpectUsername => {
                 self.username = decode_utf8_or_b64(raw);
                 self.phase = Phase::ExpectPassword;
@@ -75,7 +75,7 @@ impl SaslServer for LoginServer {
                 }
             }
             Phase::Done => SaslServerStep::Failure,
-        }
+        });
     }
 }
 
