@@ -2,13 +2,15 @@
 
 //! FTP control connection (`ProtocolHandler`).
 
+use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
 use hopf_core::{
-    BindingId, Endpoint, ProtocolHandler, Runtime, StorageExecutor, TcpConnectorConfig,
-    TcpListenerConfig,
+    BindingId, Endpoint, ProtocolHandler, Runtime, StorageError, StorageExecutor,
+    TcpConnectorConfig, TcpListenerConfig,
 };
 use hopf_core::tls::SharedTlsAcceptor;
 use hopf_otel::{
@@ -59,6 +61,99 @@ pub struct FtpControlHandler {
     export: Option<ExportHandle>,
     traces_enabled: bool,
     conn_trace: Option<Trace>,
+    /// Set while a RETR/STOR/STOU/APPE file-open is offloaded (issue
+    /// #188) — gates only those commands; `ABOR` and everything else stay
+    /// free to run (needed so `ABOR` can interrupt an in-flight open, see
+    /// [`PendingOpenOutcome`]).
+    busy: Arc<AtomicBool>,
+    pending_open: Arc<Mutex<Option<PendingOpenOutcome>>>,
+}
+
+/// A RETR/STOR file-open offloaded via `file_system_handle` (issue #188),
+/// applied once back on the reactor by [`sync_pending_open`].
+///
+/// `bridge` is captured (via `ensure_bridge()`) *before* offloading, not
+/// re-fetched from `FtpControlHandler::bridge` once the open completes —
+/// so that an `ABOR` racing ahead of the open (`dispatch`'s `Abor` arm
+/// clears `self.bridge` and calls `bridge.abort()` on the instance that
+/// was current at that time) is still correctly observed here via
+/// `bridge.was_aborted()`, regardless of what `self.bridge` has since
+/// become.
+struct PendingOpenOutcome {
+    bridge: Arc<DataBridge>,
+    kind: PendingOpenKind,
+}
+
+enum PendingOpenKind {
+    Retr {
+        result: Result<Box<dyn Read + Send>, FtpFileOpResult>,
+        ascii: bool,
+        path: String,
+    },
+    Stor {
+        result: Result<Box<dyn Write + Send>, FtpFileOpResult>,
+        ascii: bool,
+        path: String,
+        opening_msg: String,
+    },
+}
+
+/// Apply an offloaded RETR/STOR open, once `cmd_retr`/`cmd_stor`'s
+/// `submit_on` callback has stashed one — see [`PendingOpenOutcome`].
+/// Mirrors every other crate's `sync_pending_*` (issues #181/#185/#186/
+/// #187): the storage callback only has a bare `ConnHandle`, not `&mut
+/// FtpControlHandler`, so it stashes the outcome and pokes instead of
+/// calling back in directly.
+fn sync_pending_open(handler: &mut FtpControlHandler, endpoint: &mut dyn Endpoint) {
+    let Some(PendingOpenOutcome { bridge, kind }) = handler.pending_open.lock().unwrap().take()
+    else {
+        return;
+    };
+    if bridge.was_aborted() {
+        // `ABOR` already sent its own 426/226 replies — nothing more to do.
+        return;
+    }
+    match kind {
+        PendingOpenKind::Retr { result, ascii, path } => match result {
+            Ok(reader) => {
+                handler.app.transfer_starting(&path, false, None, &handler.meta);
+                let observer = handler.app.transfer_observer(&handler.meta);
+                let telemetry = handler.begin_transfer_telemetry("download");
+                handler.send_reply(endpoint, 150, "Opening data connection");
+                bridge.queue_outbound(OutboundTransfer::Retr {
+                    ascii,
+                    reader,
+                    path,
+                    observer,
+                    telemetry,
+                });
+            }
+            Err(_) => handler.send_reply(endpoint, 550, "Failed to open file"),
+        },
+        PendingOpenKind::Stor { result, ascii, path, opening_msg } => match result {
+            Ok(writer) => {
+                handler.app.transfer_starting(&path, true, None, &handler.meta);
+                let observer = handler.app.transfer_observer(&handler.meta);
+                let quota = handler
+                    .meta
+                    .user
+                    .clone()
+                    .and_then(|user| handler.app.quota_manager().map(|qm| (qm, user)));
+                let telemetry = handler.begin_transfer_telemetry("upload");
+                handler.send_reply(endpoint, 150, &opening_msg);
+                bridge.queue_stor(StorTransfer {
+                    ascii,
+                    path,
+                    writer,
+                    observer,
+                    quota,
+                    telemetry,
+                });
+            }
+            Err(FtpFileOpResult::ReadOnly) => handler.send_reply(endpoint, 550, "Read-only file system"),
+            Err(_) => handler.send_reply(endpoint, 550, "Failed to open file"),
+        },
+    }
 }
 
 impl FtpControlHandler {
@@ -103,6 +198,8 @@ impl FtpControlHandler {
             export: None,
             traces_enabled: false,
             conn_trace: None,
+            busy: Arc::new(AtomicBool::new(false)),
+            pending_open: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -733,6 +830,10 @@ impl FtpControlHandler {
             self.send_reply(endpoint, 550, "Permission denied");
             return;
         }
+        if self.busy.load(Ordering::Relaxed) {
+            self.send_reply(endpoint, 450, "Requested file action not taken; server busy");
+            return;
+        }
         if !self.prepare_data(endpoint) {
             return;
         }
@@ -743,29 +844,65 @@ impl FtpControlHandler {
         let restart = self.restart;
         self.restart = 0;
         let ascii = self.transfer_type == TransferType::Ascii;
-        let reader = match self
-            .app
-            .file_system(&self.meta)
-            .open_read(&path, restart, &self.meta)
-        {
-            Ok(r) => r,
-            Err(_) => {
-                self.send_reply(endpoint, 550, "Failed to open file");
-                return;
-            }
+
+        let Some(fs) = self.app.file_system_handle(&self.meta) else {
+            // App hasn't opted into off-thread opens — unchanged synchronous path.
+            let reader = match self
+                .app
+                .file_system(&self.meta)
+                .open_read(&path, restart, &self.meta)
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    self.send_reply(endpoint, 550, "Failed to open file");
+                    return;
+                }
+            };
+            self.app.transfer_starting(&path, false, None, &self.meta);
+            let observer = self.app.transfer_observer(&self.meta);
+            let telemetry = self.begin_transfer_telemetry("download");
+            self.send_reply(endpoint, 150, "Opening data connection");
+            let bridge = self.ensure_bridge();
+            bridge.queue_outbound(OutboundTransfer::Retr {
+                ascii,
+                reader,
+                path,
+                observer,
+                telemetry,
+            });
+            return;
         };
-        self.app.transfer_starting(&path, false, None, &self.meta);
-        let observer = self.app.transfer_observer(&self.meta);
-        let telemetry = self.begin_transfer_telemetry("download");
-        self.send_reply(endpoint, 150, "Opening data connection");
+
+        // Issue #188: `open_read` (including the jail canonicalization walk
+        // it does) runs on a storage-pool thread, not the reactor —
+        // `sync_pending_open` applies the result once back on the reactor.
+        let Some(handle) = self.control_handle.clone() else {
+            self.send_reply(endpoint, 550, "Internal error");
+            return;
+        };
         let bridge = self.ensure_bridge();
-        bridge.queue_outbound(OutboundTransfer::Retr {
-            ascii,
-            reader,
-            path,
-            observer,
-            telemetry,
-        });
+        let meta = self.meta.clone();
+        let pending = Arc::clone(&self.pending_open);
+        let busy = Arc::clone(&self.busy);
+        self.busy.store(true, Ordering::Relaxed);
+        let path_for_op = path.clone();
+        self.storage.submit_on(
+            handle.clone(),
+            move || -> Result<Result<Box<dyn Read + Send>, FtpFileOpResult>, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(fs.open_read(&path_for_op, restart, &meta))
+            },
+            move |result: Result<Result<Box<dyn Read + Send>, FtpFileOpResult>, StorageError>| {
+                let result = result.unwrap_or(Err(FtpFileOpResult::Failed));
+                *pending.lock().unwrap() = Some(PendingOpenOutcome {
+                    bridge,
+                    kind: PendingOpenKind::Retr { result, ascii, path },
+                });
+                handle.with_endpoint(move |ep| {
+                    busy.store(false, Ordering::Relaxed);
+                    ep.poke_handler();
+                });
+            },
+        );
         // Passive binding can go after accept; leave until transfer done / ABOR.
     }
 
@@ -804,6 +941,10 @@ impl FtpControlHandler {
                 return;
             }
         }
+        if self.busy.load(Ordering::Relaxed) {
+            self.send_reply(endpoint, 450, "Requested file action not taken; server busy");
+            return;
+        }
         if !self.prepare_data(endpoint) {
             return;
         }
@@ -813,40 +954,76 @@ impl FtpControlHandler {
             .resolve(arg, &self.cwd);
         let restart = self.restart;
         self.restart = 0;
-        let writer = match self
-            .app
-            .file_system(&self.meta)
-            .open_write(&path, append, restart, &self.meta)
-        {
-            Ok(w) => w,
-            Err(FtpFileOpResult::ReadOnly) => {
-                self.send_reply(endpoint, 550, "Read-only file system");
-                return;
-            }
-            Err(_) => {
-                self.send_reply(endpoint, 550, "Failed to open file");
-                return;
-            }
-        };
-        self.app.transfer_starting(&path, true, None, &self.meta);
-        let observer = self.app.transfer_observer(&self.meta);
-        let quota = self
-            .meta
-            .user
-            .clone()
-            .and_then(|user| self.app.quota_manager().map(|qm| (qm, user)));
         let ascii = self.transfer_type == TransferType::Ascii;
-        let telemetry = self.begin_transfer_telemetry("upload");
-        let msg = opening.unwrap_or("Opening data connection");
-        self.send_reply(endpoint, 150, msg);
-        self.ensure_bridge().queue_stor(StorTransfer {
-            ascii,
-            path,
-            writer,
-            observer,
-            quota,
-            telemetry,
-        });
+        let opening_msg = opening.unwrap_or("Opening data connection").to_string();
+
+        let Some(fs) = self.app.file_system_handle(&self.meta) else {
+            // App hasn't opted into off-thread opens — unchanged synchronous path.
+            let writer = match self
+                .app
+                .file_system(&self.meta)
+                .open_write(&path, append, restart, &self.meta)
+            {
+                Ok(w) => w,
+                Err(FtpFileOpResult::ReadOnly) => {
+                    self.send_reply(endpoint, 550, "Read-only file system");
+                    return;
+                }
+                Err(_) => {
+                    self.send_reply(endpoint, 550, "Failed to open file");
+                    return;
+                }
+            };
+            self.app.transfer_starting(&path, true, None, &self.meta);
+            let observer = self.app.transfer_observer(&self.meta);
+            let quota = self
+                .meta
+                .user
+                .clone()
+                .and_then(|user| self.app.quota_manager().map(|qm| (qm, user)));
+            let telemetry = self.begin_transfer_telemetry("upload");
+            self.send_reply(endpoint, 150, &opening_msg);
+            self.ensure_bridge().queue_stor(StorTransfer {
+                ascii,
+                path,
+                writer,
+                observer,
+                quota,
+                telemetry,
+            });
+            return;
+        };
+
+        // Issue #188: `open_write` (including the jail canonicalization
+        // walk it does) runs on a storage-pool thread, not the reactor —
+        // `sync_pending_open` applies the result once back on the reactor.
+        let Some(handle) = self.control_handle.clone() else {
+            self.send_reply(endpoint, 550, "Internal error");
+            return;
+        };
+        let bridge = self.ensure_bridge();
+        let meta = self.meta.clone();
+        let pending = Arc::clone(&self.pending_open);
+        let busy = Arc::clone(&self.busy);
+        self.busy.store(true, Ordering::Relaxed);
+        let path_for_op = path.clone();
+        self.storage.submit_on(
+            handle.clone(),
+            move || -> Result<Result<Box<dyn Write + Send>, FtpFileOpResult>, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(fs.open_write(&path_for_op, append, restart, &meta))
+            },
+            move |result: Result<Result<Box<dyn Write + Send>, FtpFileOpResult>, StorageError>| {
+                let result = result.unwrap_or(Err(FtpFileOpResult::Failed));
+                *pending.lock().unwrap() = Some(PendingOpenOutcome {
+                    bridge,
+                    kind: PendingOpenKind::Stor { result, ascii, path, opening_msg },
+                });
+                handle.with_endpoint(move |ep| {
+                    busy.store(false, Ordering::Relaxed);
+                    ep.poke_handler();
+                });
+            },
+        );
     }
 
     fn cmd_stou(&mut self, endpoint: &mut dyn Endpoint) {
@@ -1311,6 +1488,7 @@ impl ProtocolHandler for FtpControlHandler {
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        sync_pending_open(self, endpoint);
         let cmds = self.lexer.feed(data);
         for cmd in cmds {
             self.dispatch(endpoint, cmd);
@@ -1419,6 +1597,254 @@ mod tests {
             Err(EprtError::ProtocolNotSupported { .. })
         ));
         let _ = Ipv6Addr::LOCALHOST;
+    }
+}
+
+#[cfg(test)]
+mod open_offload_tests {
+    use super::*;
+    use crate::server::fs::BasicFtpFileSystem;
+    use crate::server::handler::FilesystemFtpHandler;
+    use hopf_auth::PasswordTrustPolicy;
+    use hopf_core::{RuntimeConfig, SecurityInfo, StartTlsError, TimerHandle, WriteReadyCallback};
+    use std::io;
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    /// Minimal `Endpoint`: captures sent bytes, no real I/O or reactor —
+    /// same shape as this session's other crates' own test-only stubs.
+    struct MockEndpoint {
+        sent: Vec<u8>,
+        open: bool,
+        peer: SocketAddr,
+        local: SocketAddr,
+    }
+    impl MockEndpoint {
+        fn new(peer: SocketAddr, local: SocketAddr) -> Self {
+            Self { sent: Vec::new(), open: true, peer, local }
+        }
+    }
+    impl Endpoint for MockEndpoint {
+        fn send(&mut self, data: &[u8]) {
+            self.sent.extend_from_slice(data);
+        }
+        fn is_open(&self) -> bool {
+            self.open
+        }
+        fn is_closing(&self) -> bool {
+            false
+        }
+        fn close(&mut self) {
+            self.open = false;
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.local)
+        }
+        fn remote_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.peer)
+        }
+        fn security_info(&self) -> &SecurityInfo {
+            static PLAINTEXT: OnceLock<SecurityInfo> = OnceLock::new();
+            PLAINTEXT.get_or_init(SecurityInfo::plaintext)
+        }
+        fn start_tls(&mut self) -> Result<(), StartTlsError> {
+            Err(StartTlsError::Unsupported)
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _callback: Option<WriteReadyCallback>) {}
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            task();
+        }
+        fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+            TimerHandle::from_cancel(|| {})
+        }
+        fn handle(&self) -> hopf_core::ConnHandle {
+            hopf_core::ConnHandle::from_execute(Arc::new(|task| task()))
+        }
+    }
+
+    /// A `FtpConnectionHandler` that never overrides `file_system_handle`
+    /// (the trait default returns `None`) — used to prove RETR/STOR's
+    /// synchronous fallback path (issue #188's `None` branch) still works
+    /// unchanged.
+    struct SyncOnlyHandler(BasicFtpFileSystem);
+    impl FtpConnectionHandler for SyncOnlyHandler {
+        fn authenticate(
+            &mut self,
+            _username: &str,
+            password: Option<&str>,
+            _account: Option<&str>,
+            _meta: &FtpConnectionMetadata,
+        ) -> FtpAuthResult {
+            if password.is_some() {
+                FtpAuthResult::Success
+            } else {
+                FtpAuthResult::NeedPassword
+            }
+        }
+        fn file_system(&mut self, _meta: &FtpConnectionMetadata) -> &mut dyn crate::server::fs::FtpFileSystem {
+            &mut self.0
+        }
+    }
+
+    fn new_handler(root: &std::path::Path, app: Box<dyn FtpConnectionHandler>) -> FtpControlHandler {
+        let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+        let peer: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:2121".parse().unwrap();
+        let policy = PasswordTrustPolicy::default().with_user("u", "p").shared();
+        FtpControlHandler::new(
+            app,
+            rt,
+            FtpServerMetrics::shared(),
+            FtpConfig::new(local, root, policy),
+            peer,
+            local,
+        )
+    }
+
+    fn feed(h: &mut FtpControlHandler, ep: &mut MockEndpoint, line: &[u8]) {
+        let mut data = line;
+        h.receive(ep, &mut data);
+    }
+
+    fn wait_for(mut pred: impl FnMut() -> bool, max_ms: u64) -> bool {
+        for _ in 0..(max_ms / 5).max(1) {
+            if pred() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pred()
+    }
+
+    fn login_and_pasv(h: &mut FtpControlHandler, ep: &mut MockEndpoint) {
+        h.connected(ep);
+        ep.sent.clear();
+        feed(h, ep, b"USER u\r\n");
+        feed(h, ep, b"PASS p\r\n");
+        ep.sent.clear();
+        feed(h, ep, b"PASV\r\n");
+        assert!(
+            ep.sent.starts_with(b"227 "),
+            "expected PASV to succeed: {:?}",
+            String::from_utf8_lossy(&ep.sent)
+        );
+        ep.sent.clear();
+    }
+
+    #[test]
+    fn retr_defers_150_until_the_offloaded_open_completes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("hello.txt"), b"hello world").unwrap();
+        let app = Box::new(FilesystemFtpHandler::new(
+            root.path(),
+            PasswordTrustPolicy::default().with_user("u", "p").shared(),
+        ).unwrap());
+        let mut h = new_handler(root.path(), app);
+        let mut ep = MockEndpoint::new("127.0.0.1:9999".parse().unwrap(), "127.0.0.1:2121".parse().unwrap());
+        login_and_pasv(&mut h, &mut ep);
+
+        feed(&mut h, &mut ep, b"RETR hello.txt\r\n");
+        assert!(
+            ep.sent.is_empty(),
+            "150 must be deferred, not sent inline within the same receive() call: {:?}",
+            String::from_utf8_lossy(&ep.sent)
+        );
+
+        assert!(
+            wait_for(
+                || {
+                    feed(&mut h, &mut ep, b"");
+                    !ep.sent.is_empty()
+                },
+                2000
+            ),
+            "150 must eventually be sent once the offloaded open completes"
+        );
+        assert!(ep.sent.starts_with(b"150 "), "{:?}", String::from_utf8_lossy(&ep.sent));
+    }
+
+    #[test]
+    fn stor_defers_150_until_the_offloaded_open_completes() {
+        let root = tempfile::tempdir().unwrap();
+        let app = Box::new(FilesystemFtpHandler::new(
+            root.path(),
+            PasswordTrustPolicy::default().with_user("u", "p").shared(),
+        ).unwrap());
+        let mut h = new_handler(root.path(), app);
+        let mut ep = MockEndpoint::new("127.0.0.1:9999".parse().unwrap(), "127.0.0.1:2121".parse().unwrap());
+        login_and_pasv(&mut h, &mut ep);
+
+        feed(&mut h, &mut ep, b"STOR new.txt\r\n");
+        assert!(
+            ep.sent.is_empty(),
+            "150 must be deferred: {:?}",
+            String::from_utf8_lossy(&ep.sent)
+        );
+
+        assert!(wait_for(
+            || {
+                feed(&mut h, &mut ep, b"");
+                !ep.sent.is_empty()
+            },
+            2000
+        ));
+        assert!(ep.sent.starts_with(b"150 "), "{:?}", String::from_utf8_lossy(&ep.sent));
+    }
+
+    /// Issue #188: an `ABOR` racing ahead of a still-in-flight offloaded
+    /// open (sent in the same synchronous burst, before the storage-pool
+    /// callback has had a chance to run) must suppress the transfer once
+    /// the open does complete — no stray 150, no double reply.
+    #[test]
+    fn abor_racing_ahead_of_a_pending_open_suppresses_the_transfer() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("hello.txt"), b"hello world").unwrap();
+        let app = Box::new(FilesystemFtpHandler::new(
+            root.path(),
+            PasswordTrustPolicy::default().with_user("u", "p").shared(),
+        ).unwrap());
+        let mut h = new_handler(root.path(), app);
+        let mut ep = MockEndpoint::new("127.0.0.1:9999".parse().unwrap(), "127.0.0.1:2121".parse().unwrap());
+        login_and_pasv(&mut h, &mut ep);
+
+        feed(&mut h, &mut ep, b"RETR hello.txt\r\n");
+        feed(&mut h, &mut ep, b"ABOR\r\n");
+        let after_abor = ep.sent.clone();
+        assert!(!after_abor.is_empty(), "ABOR must reply promptly");
+        assert!(
+            !after_abor.windows(4).any(|w| w == b"150 "),
+            "no 150 for a RETR that raced against ABOR: {:?}",
+            String::from_utf8_lossy(&after_abor)
+        );
+
+        // Give the offloaded open time to resolve, then confirm
+        // `sync_pending_open` didn't queue (or reply for) it.
+        std::thread::sleep(Duration::from_millis(200));
+        feed(&mut h, &mut ep, b"");
+        assert_eq!(
+            ep.sent, after_abor,
+            "no further replies once the aborted open resolves"
+        );
+    }
+
+    #[test]
+    fn fallback_handler_without_file_system_handle_still_works_synchronously() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("hello.txt"), b"hello world").unwrap();
+        let fs = BasicFtpFileSystem::new(root.path(), false).unwrap();
+        let app = Box::new(SyncOnlyHandler(fs));
+        let mut h = new_handler(root.path(), app);
+        let mut ep = MockEndpoint::new("127.0.0.1:9999".parse().unwrap(), "127.0.0.1:2121".parse().unwrap());
+        login_and_pasv(&mut h, &mut ep);
+
+        feed(&mut h, &mut ep, b"RETR hello.txt\r\n");
+        assert!(
+            ep.sent.starts_with(b"150 "),
+            "the None fallback must open and reply inline, within the same receive() call: {:?}",
+            String::from_utf8_lossy(&ep.sent)
+        );
     }
 }
 
