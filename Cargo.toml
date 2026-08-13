@@ -69,7 +69,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.70"
 license = "LGPL-2.1-or-later"
@@ -91,23 +91,23 @@ rmimeparser = "0.4"
 rprotobuf = "0.1"
 # Internal crates: `version` must match [workspace.package] version (required
 # for publishing; cargo cannot inherit it here). Bump together on release.
-hopf-core = { version = "0.2.0", path = "crates/hopf-core" }
-hopf-tls = { version = "0.2.0", path = "crates/hopf-tls" }
-hopf-http = { version = "0.2.0", path = "crates/hopf-http" }
-hopf-quic = { version = "0.2.0", path = "crates/hopf-quic" }
-hopf-dns = { version = "0.2.0", path = "crates/hopf-dns" }
-hopf-auth = { version = "0.2.0", path = "crates/hopf-auth" }
-hopf-ldap = { version = "0.2.0", path = "crates/hopf-ldap" }
-hopf-otel = { version = "0.2.0", path = "crates/hopf-otel" }
-hopf-webdav = { version = "0.2.0", path = "crates/hopf-webdav" }
-hopf-websocket = { version = "0.2.0", path = "crates/hopf-websocket" }
-hopf-grpc = { version = "0.2.0", path = "crates/hopf-grpc" }
-hopf-ftp = { version = "0.2.0", path = "crates/hopf-ftp" }
-hopf-smtp = { version = "0.2.0", path = "crates/hopf-smtp" }
-hopf-mailbox = { version = "0.2.0", path = "crates/hopf-mailbox" }
-hopf-pop3 = { version = "0.2.0", path = "crates/hopf-pop3" }
-hopf-imap = { version = "0.2.0", path = "crates/hopf-imap" }
-hopf-mqtt = { version = "0.2.0", path = "crates/hopf-mqtt" }
-hopf-amqp = { version = "0.2.0", path = "crates/hopf-amqp" }
+hopf-core = { version = "0.2.1", path = "crates/hopf-core" }
+hopf-tls = { version = "0.2.1", path = "crates/hopf-tls" }
+hopf-http = { version = "0.2.1", path = "crates/hopf-http" }
+hopf-quic = { version = "0.2.1", path = "crates/hopf-quic" }
+hopf-dns = { version = "0.2.1", path = "crates/hopf-dns" }
+hopf-auth = { version = "0.2.1", path = "crates/hopf-auth" }
+hopf-ldap = { version = "0.2.1", path = "crates/hopf-ldap" }
+hopf-otel = { version = "0.2.1", path = "crates/hopf-otel" }
+hopf-webdav = { version = "0.2.1", path = "crates/hopf-webdav" }
+hopf-websocket = { version = "0.2.1", path = "crates/hopf-websocket" }
+hopf-grpc = { version = "0.2.1", path = "crates/hopf-grpc" }
+hopf-ftp = { version = "0.2.1", path = "crates/hopf-ftp" }
+hopf-smtp = { version = "0.2.1", path = "crates/hopf-smtp" }
+hopf-mailbox = { version = "0.2.1", path = "crates/hopf-mailbox" }
+hopf-pop3 = { version = "0.2.1", path = "crates/hopf-pop3" }
+hopf-imap = { version = "0.2.1", path = "crates/hopf-imap" }
+hopf-mqtt = { version = "0.2.1", path = "crates/hopf-mqtt" }
+hopf-amqp = { version = "0.2.1", path = "crates/hopf-amqp" }
 getrandom = "0.2"
 tempfile = "3"
