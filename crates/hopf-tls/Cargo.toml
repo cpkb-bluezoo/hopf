@@ -25,3 +25,4 @@ ring = "0.17"
 
 [dev-dependencies]
 rcgen = { workspace = true }
+tempfile = { workspace = true }
