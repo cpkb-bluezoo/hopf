@@ -494,41 +494,42 @@ mod unit {
     use super::*;
     use rcgen::generate_simple_self_signed;
 
-    fn write_temp_pem() -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "hopf-tls-unit-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    // Returns the TempDir guard too — the caller must keep it alive for as
+    // long as it uses the paths, since dropping it deletes the directory.
+    // A per-call unique directory (rather than a pid/timestamp-derived name)
+    // is what actually matters here: parallel test threads each get their
+    // own directory, so one test's cert/key pair can never be interleaved
+    // with another's.
+    fn write_temp_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix("hopf-tls-unit-")
+            .tempdir()
+            .unwrap();
         let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert_path = dir.join("cert.pem");
-        let key_path = dir.join("key.pem");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, cert.cert.pem()).unwrap();
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-        (cert_path, key_path)
+        (dir, cert_path, key_path)
     }
 
     #[test]
     fn server_config_from_pem_sets_alpn() {
-        let (cert_path, key_path) = write_temp_pem();
+        let (_dir, cert_path, key_path) = write_temp_pem();
         let cfg = server_config_from_pem(&cert_path, &key_path, &[b"h2", b"http/1.1"]).unwrap();
         assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     #[test]
     fn client_config_from_pem_sets_alpn() {
-        let (cert_path, _) = write_temp_pem();
+        let (_dir, cert_path, _key_path) = write_temp_pem();
         let cfg = client_config_from_pem(&cert_path, &[b"http/1.1"]).unwrap();
         assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 
     #[test]
     fn acceptor_and_connector_from_pem() {
-        let (cert_path, key_path) = write_temp_pem();
+        let (_dir, cert_path, key_path) = write_temp_pem();
         let _ = acceptor_from_pem(&cert_path, &key_path, &[b"h2"]).unwrap();
         let _ = connector_from_pem(&cert_path, &[b"h2"]).unwrap();
     }
