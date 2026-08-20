@@ -8,6 +8,10 @@ pub(crate) mod connect;
 pub(crate) mod connection;
 pub(crate) mod facade;
 pub(crate) mod h2_session;
+#[cfg(feature = "h3")]
+pub(crate) mod h3_session;
+#[cfg(feature = "h3")]
+pub(crate) mod negotiate;
 pub(crate) mod session_config;
 
 pub use alt_svc::{parse_alt_svc_h3, AltSvcCache, AltSvcEntry, AltSvcH3Entry};

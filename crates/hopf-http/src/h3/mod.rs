@@ -2,7 +2,7 @@
 
 //! HTTP/3 over Hopf QUIC (server and client).
 
-mod client;
+pub(crate) mod client;
 mod endpoint;
 mod response;
 mod frame;

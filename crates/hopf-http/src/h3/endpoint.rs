@@ -4,7 +4,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler};
@@ -29,12 +29,15 @@ pub struct H3ServerConnection {
     /// The control stream's `QuicConnApi` key, saved from `connected()` so
     /// `disconnecting()` can write a final GOAWAY on the same stream.
     control_stream_key: Option<u64>,
-    /// Count of client-initiated bidirectional streams accepted so far.
-    /// RFC 9000 §2.1: such stream IDs are sequential multiples of 4 (0, 4,
-    /// 8, ...), so `(count - 1) * 4` is the exact ID of the most recently
-    /// accepted request without needing the raw QUIC `StreamId` at this
-    /// layer.
-    accepted_bi_streams: Arc<AtomicU64>,
+    /// The real QUIC stream id of the most recently accepted
+    /// client-initiated bidirectional stream — `accept_bi`'s `stream_id`
+    /// parameter, saved for `disconnecting`'s GOAWAY.
+    last_accepted_bi_stream: Arc<AtomicU64>,
+    /// Whether any client-initiated bidirectional stream has been accepted
+    /// yet — `last_accepted_bi_stream` reads 0 both before the first
+    /// accept and after accepting the (legitimate) first stream id 0, so
+    /// this disambiguates "nothing accepted" from "accepted stream 0".
+    has_accepted_bi_stream: Arc<AtomicBool>,
     qpack: Arc<qpack::H3Qpack>,
     qpack_encoder_stream_key: Option<u64>,
     qpack_decoder_stream_key: Option<u64>,
@@ -48,7 +51,8 @@ impl H3ServerConnection {
             limits,
             peer_state: Arc::new(Mutex::new(H3PeerState::default())),
             control_stream_key: None,
-            accepted_bi_streams: Arc::new(AtomicU64::new(0)),
+            last_accepted_bi_stream: Arc::new(AtomicU64::new(0)),
+            has_accepted_bi_stream: Arc::new(AtomicBool::new(false)),
             qpack: Arc::new(qpack::H3Qpack::new()),
             qpack_encoder_stream_key: None,
             qpack_decoder_stream_key: None,
@@ -88,8 +92,9 @@ impl QuicConnection for H3ServerConnection {
         self.flush_qpack(api);
     }
 
-    fn accept_bi(&mut self) -> Box<dyn ProtocolHandler> {
-        let stream_id = self.accepted_bi_streams.fetch_add(1, Ordering::SeqCst) * 4;
+    fn accept_bi(&mut self, stream_id: u64) -> Box<dyn ProtocolHandler> {
+        self.last_accepted_bi_stream.store(stream_id, Ordering::SeqCst);
+        self.has_accepted_bi_stream.store(true, Ordering::SeqCst);
         Box::new(H3RequestStream::new(
             Arc::clone(&self.factory),
             self.limits,
@@ -107,17 +112,16 @@ impl QuicConnection for H3ServerConnection {
         let Some(key) = self.control_stream_key else {
             return;
         };
-        let count = self.accepted_bi_streams.load(Ordering::SeqCst);
-        if count == 0 {
+        if !self.has_accepted_bi_stream.load(Ordering::SeqCst) {
             return; // nothing accepted yet; no meaningful last-stream-id to announce
         }
-        let last_stream_id = (count - 1) * 4;
+        let last_stream_id = self.last_accepted_bi_stream.load(Ordering::SeqCst);
         let mut bytes = Vec::new();
         frame::write_goaway(&mut bytes, last_stream_id);
         api.write(key, &bytes);
     }
 
-    fn accept_uni(&mut self) -> Box<dyn ProtocolHandler> {
+    fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
         Box::new(H3UniStream::new(Arc::clone(&self.peer_state), Arc::clone(&self.qpack)))
     }
 
@@ -1171,9 +1175,9 @@ mod connection_lifecycle_tests {
         let mut api = RecordingConnApi::default();
         conn.connected(&mut api); // control stream (key 0) + 2 QPACK streams
 
-        let _ = conn.accept_bi(); // 1st request -> stream id 0
-        let _ = conn.accept_bi(); // 2nd request -> stream id 4
-        let _ = conn.accept_bi(); // 3rd request -> stream id 8
+        let _ = conn.accept_bi(0); // 1st request -> stream id 0
+        let _ = conn.accept_bi(4); // 2nd request -> stream id 4
+        let _ = conn.accept_bi(8); // 3rd request -> stream id 8
 
         conn.disconnecting(&mut api);
 

@@ -787,6 +787,120 @@ fn connect_h3_by_name_uses_the_injected_dns_resolver_not_the_os_resolver() {
 }
 
 // ---------------------------------------------------------------------------
+// H3HttpClientSession: multiple sequential requests over one H3 connection
+// ---------------------------------------------------------------------------
+
+/// Two requests issued sequentially (the second from inside the first
+/// response's `close()`) over one [`crate::client::h3_session::connect_h3_session`]
+/// connection — proves Part A/B's stream-id fix and pending-opens queue:
+/// before that work, `H3ClientConnection::accept_bi` always used the
+/// hardcoded stream id `0` for QPACK, which would corrupt the second
+/// request's field-section decoding if it collided with the first's.
+#[test]
+fn h3_session_supports_two_sequential_requests_over_one_connection() {
+    use crate::client::h3_session::connect_h3_session;
+    use hopf_quic::{client_config_for_pem_bytes, server_config_self_signed, ALPN_H3};
+
+    let (server_cfg, pem) = server_config_self_signed(&["localhost"], &[ALPN_H3]).unwrap();
+    let client_cfg = client_config_for_pem_bytes(&pem, &[ALPN_H3]).unwrap();
+
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits2 = Arc::clone(&hits);
+    struct CountingFactory(Arc<std::sync::atomic::AtomicUsize>);
+    impl ServerHandlerFactory for CountingFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::new(H3Hello)
+        }
+    }
+    let server = crate::h3::listen_h3(
+        "127.0.0.1:0".parse().unwrap(),
+        server_cfg,
+        Arc::new(CountingFactory(hits2)),
+        HttpLimits::default(),
+    )
+    .unwrap();
+
+    let out1 = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let out2 = Arc::new(Mutex::new(GumdropOutcome::default()));
+
+    struct TwoRequestsHandler {
+        out1: Arc<Mutex<GumdropOutcome>>,
+        out2: Arc<Mutex<GumdropOutcome>>,
+    }
+    impl HttpConnectionHandler for TwoRequestsHandler {
+        fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+            let ops = Arc::clone(&session.ops);
+            let out2 = Arc::clone(&self.out2);
+            struct ChainedHandler {
+                out1: Arc<Mutex<GumdropOutcome>>,
+                ops: Arc<Mutex<dyn crate::client::api::SessionRequestOps + Send>>,
+                out2: Arc<Mutex<GumdropOutcome>>,
+            }
+            impl HttpResponseHandler for ChainedHandler {
+                fn ok(&mut self, status: u16) {
+                    self.out1.lock().unwrap().status = status;
+                }
+                fn error(&mut self, status: u16) {
+                    self.out1.lock().unwrap().status = status;
+                }
+                fn header(&mut self, _name: &str, _value: &str) {}
+                fn response_body_content(&mut self, data: &[u8]) {
+                    self.out1.lock().unwrap().body.extend_from_slice(data);
+                }
+                fn close(&mut self) {
+                    self.out1.lock().unwrap().done = true;
+                    let mut second = crate::HttpRequest::new(Arc::clone(&self.ops), "GET".to_string(), "/".to_string());
+                    second
+                        .send(Box::new(RecordingResponseHandler { out: Arc::clone(&self.out2) }))
+                        .unwrap();
+                }
+                fn failed(&mut self, err: io::Error) {
+                    let mut g = self.out1.lock().unwrap();
+                    g.failed = Some(err.kind());
+                    g.done = true;
+                }
+            }
+            session
+                .get("/")
+                .send(Box::new(ChainedHandler {
+                    out1: Arc::clone(&self.out1),
+                    ops,
+                    out2,
+                }))
+                .unwrap();
+        }
+    }
+
+    connect_h3_session(
+        server.local_addr,
+        client_cfg,
+        "localhost",
+        "localhost",
+        server.local_addr.port(),
+        HttpLimits::default(),
+        Box::new(TwoRequestsHandler {
+            out1: Arc::clone(&out1),
+            out2: Arc::clone(&out2),
+        }),
+    )
+    .unwrap();
+
+    assert!(wait_gumdrop_done(&out1, Duration::from_secs(5)), "first request never completed");
+    assert!(wait_gumdrop_done(&out2, Duration::from_secs(5)), "second request never completed");
+    assert_eq!(out1.lock().unwrap().status, 200);
+    assert_eq!(out1.lock().unwrap().body, b"hello-h3-via-connect-auto");
+    assert_eq!(out2.lock().unwrap().status, 200);
+    assert_eq!(out2.lock().unwrap().body, b"hello-h3-via-connect-auto");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "server should have handled two separate request streams"
+    );
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // connect_auto: DNS HTTPS-record tier and Alt-Svc tier
 // ---------------------------------------------------------------------------
 
@@ -1062,5 +1176,454 @@ fn connect_auto_upgrades_to_h3_via_alt_svc_cache_on_the_next_connection() {
     );
     assert_eq!(out2.lock().unwrap().status, 200);
     assert_eq!(out2.lock().unwrap().body, b"hello-h3-via-connect-auto");
+    h3_server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// HttpClient: transparent h3/h2/h1 negotiation
+// ---------------------------------------------------------------------------
+
+/// A DNS HTTPS record advertising `alpn=h3` lets the Gumdrop-style
+/// `HttpClient` reach h3 transparently — no `h3_prior_knowledge`, no manual
+/// H3-specific API, just `.quic_client_config(...)` and `connect()`. No TCP
+/// listener exists anywhere in this test, so a wrong tier-3 fallback would
+/// hang rather than pass.
+#[test]
+fn http_client_uses_dns_https_record_to_reach_h3_transparently() {
+    use hopf_dns::wire::{
+        encode_svcb_alpn, DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA,
+        SVCB_PARAM_ALPN, SVCB_PARAM_PORT,
+    };
+    use hopf_dns::DnsResolver;
+    use hopf_quic::{client_config_for_pem_bytes, server_config_self_signed, ALPN_H3};
+    use std::net::Ipv4Addr;
+
+    const HOST: &str = "httpclient-h3-https-record-test.invalid";
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+
+    let (server_cfg, pem) = server_config_self_signed(&[HOST], &[ALPN_H3]).unwrap();
+    let client_cfg = client_config_for_pem_bytes(&pem, &[ALPN_H3]).unwrap();
+    let h3_server = crate::h3::listen_h3(
+        "127.0.0.1:0".parse().unwrap(),
+        server_cfg,
+        Arc::new(H3HelloFactory),
+        HttpLimits::default(),
+    )
+    .unwrap();
+    let h3_port = h3_server.local_addr.port();
+
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            break;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            continue;
+        };
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            match question.qtype {
+                Some(DnsType::A) => resp.answers.push(DnsResourceRecord::a(
+                    &question.name,
+                    60,
+                    Ipv4Addr::new(127, 0, 0, 1),
+                )),
+                Some(DnsType::Https) => {
+                    let params = vec![
+                        (SVCB_PARAM_ALPN, encode_svcb_alpn(&["h3"])),
+                        (SVCB_PARAM_PORT, h3_port.to_be_bytes().to_vec()),
+                    ];
+                    resp.answers.push(
+                        DnsResourceRecord::https(&question.name, 60, 1, ".", &params).unwrap(),
+                    );
+                }
+                _ => {} // AAAA: NODATA
+            }
+        }
+        let bytes = resp.serialize().unwrap();
+        let _ = stub.send_to(&bytes, peer);
+    });
+
+    let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+
+    struct ConnectedHandler {
+        out: Arc<Mutex<GumdropOutcome>>,
+    }
+    impl HttpConnectionHandler for ConnectedHandler {
+        fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+            session
+                .get("/")
+                .send(Box::new(RecordingResponseHandler { out: Arc::clone(&self.out) }))
+                .unwrap();
+        }
+    }
+
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    HttpClient::new(HOST, 80)
+        .resolver(dns)
+        .quic_client_config(client_cfg)
+        .connect(&rt, Box::new(ConnectedHandler { out: Arc::clone(&out) }))
+        .unwrap();
+
+    assert!(
+        wait_gumdrop_done(&out, Duration::from_secs(5)),
+        "HttpClient never completed a request via the DNS HTTPS-record tier"
+    );
+    assert_eq!(out.lock().unwrap().status, 200);
+    assert_eq!(out.lock().unwrap().body, b"hello-h3-via-connect-auto");
+    h3_server.shutdown();
+}
+
+/// No DNS HTTPS record exists, so `HttpClient::connect()` falls to tier 3
+/// (plain TCP), observes an `Alt-Svc: h3=...` response header, and caches
+/// it. Per the "wait until idle, not immediately" design, the same
+/// connection then automatically upgrades to h3 once its one in-flight
+/// request finishes — `on_connected` fires a second time, this time on a
+/// live h3 session, with no further TCP listener able to serve it (a wrong
+/// fallback would hang rather than fail cleanly).
+#[test]
+fn http_client_alt_svc_upgrades_the_same_session_to_h3_once_idle() {
+    use hopf_dns::wire::{DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA};
+    use hopf_dns::DnsResolver;
+    use hopf_quic::{client_config_for_pem_bytes, server_config_self_signed, ALPN_H3};
+    use std::net::Ipv4Addr;
+
+    const HOST: &str = "httpclient-alt-svc-test.invalid";
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+
+    let (server_cfg, pem) = server_config_self_signed(&[HOST], &[ALPN_H3]).unwrap();
+    let client_cfg = client_config_for_pem_bytes(&pem, &[ALPN_H3]).unwrap();
+    let h3_server = crate::h3::listen_h3(
+        "127.0.0.1:0".parse().unwrap(),
+        server_cfg,
+        Arc::new(H3HelloFactory),
+        HttpLimits::default(),
+    )
+    .unwrap();
+    let h3_port = h3_server.local_addr.port();
+
+    let (tcp_addr, _tcp_listener) = rt
+        .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+            Box::new(AltSvcAnnouncingServer { buf: Vec::new(), h3_port }) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            break;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            continue;
+        };
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            if question.qtype == Some(DnsType::A) {
+                resp.answers.push(DnsResourceRecord::a(
+                    &question.name,
+                    60,
+                    Ipv4Addr::new(127, 0, 0, 1),
+                ));
+            }
+        }
+        let bytes = resp.serialize().unwrap();
+        let _ = stub.send_to(&bytes, peer);
+    });
+
+    let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+
+    let alt_svc_cache = Arc::new(AltSvcCache::new());
+
+    // `on_connected` fires twice on the *same* handler instance for this
+    // one `connect()` call: once for tier 3 (plain TCP), and again — per
+    // the "wait until idle, then upgrade" design — once the first
+    // request's Alt-Svc header has been observed and the connection has
+    // gone idle, this time on the auto-upgraded h3 session. `out1`/`out2`
+    // record each generation's response separately.
+    struct ConnectedHandler {
+        first: Arc<Mutex<GumdropOutcome>>,
+        second: Arc<Mutex<GumdropOutcome>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl HttpConnectionHandler for ConnectedHandler {
+        fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let out = if call == 0 { Arc::clone(&self.first) } else { Arc::clone(&self.second) };
+            session
+                .get("/")
+                .send(Box::new(RecordingResponseHandler { out }))
+                .unwrap();
+        }
+    }
+
+    let out1 = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let out2 = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    HttpClient::new(HOST, tcp_addr.port())
+        .resolver(dns)
+        .quic_client_config(client_cfg)
+        .alt_svc_cache(Arc::clone(&alt_svc_cache))
+        .connect(
+            &rt,
+            Box::new(ConnectedHandler {
+                first: Arc::clone(&out1),
+                second: Arc::clone(&out2),
+                calls: Arc::clone(&calls),
+            }),
+        )
+        .unwrap();
+
+    assert!(
+        wait_gumdrop_done(&out1, Duration::from_secs(5)),
+        "first generation (tier 3, plain TCP) never completed"
+    );
+    assert_eq!(out1.lock().unwrap().status, 200);
+    assert_eq!(out1.lock().unwrap().body, b"hello-tcp-before-alt-svc-upgrade");
+
+    assert!(
+        wait_gumdrop_done(&out2, Duration::from_secs(5)),
+        "second generation (auto-upgraded h3 session) never completed"
+    );
+    assert_eq!(out2.lock().unwrap().status, 200);
+    assert_eq!(out2.lock().unwrap().body, b"hello-h3-via-connect-auto");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "on_connected should fire exactly twice: tier 3, then the h3 upgrade"
+    );
+    assert!(
+        alt_svc_cache.get(HOST, tcp_addr.port()).is_some(),
+        "Alt-Svc header from the first response should have been cached"
+    );
+    h3_server.shutdown();
+}
+
+/// `disable_h3` skips discovery/upgrade entirely, even with a QUIC config
+/// set — the connection stays on tier 3 (plain TCP) despite a DNS HTTPS
+/// record advertising h3, proven by pointing the h3 listener at a port
+/// nothing will ever try to reach.
+#[test]
+fn http_client_disable_h3_skips_negotiation_even_with_an_https_record() {
+    use hopf_dns::wire::{
+        encode_svcb_alpn, DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA,
+        SVCB_PARAM_ALPN, SVCB_PARAM_PORT,
+    };
+    use hopf_dns::DnsResolver;
+    use hopf_quic::{client_config_for_pem_bytes, server_config_self_signed, ALPN_H3};
+    use std::net::Ipv4Addr;
+
+    const HOST: &str = "httpclient-disable-h3-test.invalid";
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+
+    let (server_cfg, pem) = server_config_self_signed(&[HOST], &[ALPN_H3]).unwrap();
+    let client_cfg = client_config_for_pem_bytes(&pem, &[ALPN_H3]).unwrap();
+    // A real h3 listener exists, so if `disable_h3` didn't work this would
+    // succeed via h3 -- proving the negative requires it to actually be
+    // reachable, not just absent.
+    let h3_server = crate::h3::listen_h3(
+        "127.0.0.1:0".parse().unwrap(),
+        server_cfg,
+        Arc::new(H3HelloFactory),
+        HttpLimits::default(),
+    )
+    .unwrap();
+    let h3_port = h3_server.local_addr.port();
+
+    let tcp_server_addr = start_h2c_capable_server(&rt);
+
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            break;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            continue;
+        };
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            match question.qtype {
+                Some(DnsType::A) => resp.answers.push(DnsResourceRecord::a(
+                    &question.name,
+                    60,
+                    Ipv4Addr::new(127, 0, 0, 1),
+                )),
+                Some(DnsType::Https) => {
+                    let params = vec![
+                        (SVCB_PARAM_ALPN, encode_svcb_alpn(&["h3"])),
+                        (SVCB_PARAM_PORT, h3_port.to_be_bytes().to_vec()),
+                    ];
+                    resp.answers.push(
+                        DnsResourceRecord::https(&question.name, 60, 1, ".", &params).unwrap(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        let bytes = resp.serialize().unwrap();
+        let _ = stub.send_to(&bytes, peer);
+    });
+
+    let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+
+    let out = Arc::new(Mutex::new(Outcome::default()));
+    let handler = StashConnForH2 { out: Arc::clone(&out) };
+
+    HttpClient::new(HOST, tcp_server_addr.port())
+        .resolver(dns)
+        .quic_client_config(client_cfg)
+        .disable_h3(true)
+        .h2_prior_knowledge(true)
+        .connect(&rt, Box::new(handler))
+        .unwrap();
+
+    assert!(wait_done(&out, Duration::from_secs(5)), "disable_h3 connection never completed");
+    assert_eq!(out.lock().unwrap().status, 200);
+    h3_server.shutdown();
+}
+
+struct StashConnForH2 {
+    out: Arc<Mutex<Outcome>>,
+}
+impl HttpConnectionHandler for StashConnForH2 {
+    fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+        session
+            .get("/")
+            .send(Box::new(GumdropToOutcomeAdapter { out: Arc::clone(&self.out) }))
+            .unwrap();
+    }
+}
+
+/// Bridges the Gumdrop [`HttpResponseHandler`] callbacks onto the
+/// low-level-style [`Outcome`] used by this file's `ClientHandler`-based
+/// tests, so `disable_h3`/`h3_prior_knowledge` tests can reuse `wait_done`.
+struct GumdropToOutcomeAdapter {
+    out: Arc<Mutex<Outcome>>,
+}
+impl HttpResponseHandler for GumdropToOutcomeAdapter {
+    fn ok(&mut self, status: u16) {
+        self.out.lock().unwrap().status = status;
+    }
+    fn error(&mut self, status: u16) {
+        self.out.lock().unwrap().status = status;
+    }
+    fn header(&mut self, _name: &str, _value: &str) {}
+    fn response_body_content(&mut self, data: &[u8]) {
+        self.out.lock().unwrap().body.extend_from_slice(data);
+    }
+    fn close(&mut self) {
+        self.out.lock().unwrap().done = true;
+    }
+    fn failed(&mut self, _err: io::Error) {
+        self.out.lock().unwrap().done = true;
+    }
+}
+
+/// `h3_prior_knowledge` dials h3 directly with no discovery round trip at
+/// all — proven with *no* DNS HTTPS record configured (the stub only
+/// answers A queries); tier-1 discovery would find nothing, but prior
+/// knowledge doesn't look.
+#[test]
+fn http_client_h3_prior_knowledge_skips_discovery() {
+    use hopf_dns::wire::{DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA};
+    use hopf_dns::DnsResolver;
+    use hopf_quic::{client_config_for_pem_bytes, server_config_self_signed, ALPN_H3};
+    use std::net::Ipv4Addr;
+
+    const HOST: &str = "httpclient-h3-prior-knowledge-test.invalid";
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+
+    let (server_cfg, pem) = server_config_self_signed(&[HOST], &[ALPN_H3]).unwrap();
+    let client_cfg = client_config_for_pem_bytes(&pem, &[ALPN_H3]).unwrap();
+    let h3_server = crate::h3::listen_h3(
+        "127.0.0.1:0".parse().unwrap(),
+        server_cfg,
+        Arc::new(H3HelloFactory),
+        HttpLimits::default(),
+    )
+    .unwrap();
+    let h3_port = h3_server.local_addr.port();
+
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            break;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            continue;
+        };
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            if question.qtype == Some(DnsType::A) {
+                resp.answers.push(DnsResourceRecord::a(
+                    &question.name,
+                    60,
+                    Ipv4Addr::new(127, 0, 0, 1),
+                ));
+            }
+        }
+        let bytes = resp.serialize().unwrap();
+        let _ = stub.send_to(&bytes, peer);
+    });
+
+    let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+
+    struct ConnectedHandler {
+        out: Arc<Mutex<GumdropOutcome>>,
+    }
+    impl HttpConnectionHandler for ConnectedHandler {
+        fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+            session
+                .get("/")
+                .send(Box::new(RecordingResponseHandler { out: Arc::clone(&self.out) }))
+                .unwrap();
+        }
+    }
+
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    HttpClient::new(HOST, h3_port)
+        .resolver(dns)
+        .quic_client_config(client_cfg)
+        .h3_prior_knowledge(true)
+        .connect(&rt, Box::new(ConnectedHandler { out: Arc::clone(&out) }))
+        .unwrap();
+
+    assert!(
+        wait_gumdrop_done(&out, Duration::from_secs(5)),
+        "h3_prior_knowledge connection never completed"
+    );
+    assert_eq!(out.lock().unwrap().status, 200);
+    assert_eq!(out.lock().unwrap().body, b"hello-h3-via-connect-auto");
     h3_server.shutdown();
 }

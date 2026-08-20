@@ -401,7 +401,7 @@ pub fn connect_auto(
 /// the plain A/AAAA answers from the same batch when the HTTPS record
 /// carries no hints of its own.
 #[cfg(feature = "h3")]
-fn pick_h3_target(records: &[DnsResourceRecord], origin_port: u16) -> Option<SocketAddr> {
+pub(crate) fn pick_h3_target(records: &[DnsResourceRecord], origin_port: u16) -> Option<SocketAddr> {
     let https = records.iter().find(|rr| {
         rr.rtype == Some(DnsType::Https)
             && !rr.is_svcb_alias_form()
@@ -428,7 +428,7 @@ fn pick_h3_target(records: &[DnsResourceRecord], origin_port: u16) -> Option<Soc
     None
 }
 
-fn resolve_literal(host: &str, port: u16) -> Option<SocketAddr> {
+pub(crate) fn resolve_literal(host: &str, port: u16) -> Option<SocketAddr> {
     if let Ok(addr) = host.parse::<SocketAddr>() {
         return Some(addr);
     }
