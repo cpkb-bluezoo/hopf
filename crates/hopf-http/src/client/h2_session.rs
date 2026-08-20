@@ -172,15 +172,20 @@ impl ClientHandler for H2StreamHandler {
     }
 
     fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
-        self.with_response(|h| h.close());
+        // Clear `in_flight` *before* calling out to the app's `close()` --
+        // a caller chaining a follow-up request from inside `close()` (an
+        // ordinary pattern for sequential session use) must see the
+        // session as already idle by then, not still "in flight" against
+        // the very request that just finished.
         self.shared.lock().unwrap().in_flight = false;
+        self.with_response(|h| h.close());
     }
 
     fn request_failed(&mut self, _request: &mut dyn ClientWriter, err: &io::Error) {
+        self.shared.lock().unwrap().in_flight = false;
         if let Some(mut h) = self.response.take() {
             h.failed(io::Error::new(err.kind(), err.to_string()));
         }
-        self.shared.lock().unwrap().in_flight = false;
     }
 }
 

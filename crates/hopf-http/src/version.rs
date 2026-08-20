@@ -11,6 +11,8 @@ pub enum HttpVersion {
     Http11,
     /// HTTP/2 (RFC 9113).
     Http2,
+    /// HTTP/3 (RFC 9114).
+    Http3,
 }
 
 impl HttpVersion {
@@ -29,11 +31,12 @@ impl HttpVersion {
             Self::Http10 => "HTTP/1.0",
             Self::Http11 => "HTTP/1.1",
             Self::Http2 => "HTTP/2",
+            Self::Http3 => "HTTP/3",
         }
     }
 
     /// True when multiple concurrent request streams are supported (HTTP/2+).
     pub fn supports_multiplexing(self) -> bool {
-        matches!(self, Self::Http2)
+        matches!(self, Self::Http2 | Self::Http3)
     }
 }

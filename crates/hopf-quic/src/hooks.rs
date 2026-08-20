@@ -13,11 +13,19 @@ pub trait QuicConnection: Send {
     /// Called after the QUIC handshake completes. Open control streams here.
     fn connected(&mut self, api: &mut dyn QuicConnApi);
 
-    /// A peer-opened bidirectional stream — return its [`ProtocolHandler`].
-    fn accept_bi(&mut self) -> Box<dyn ProtocolHandler>;
+    /// A new bidirectional stream — peer-opened, or locally opened via
+    /// [`QuicConnApi::open_bi`] (either during [`Self::connected`]/[`Self::drive`]
+    /// or queued from outside the driver thread and applied on a later
+    /// `drive` tick) — return its [`ProtocolHandler`]. `stream_id` is the
+    /// real QUIC stream id (RFC 9000 §2.1), stable for this stream's
+    /// lifetime; apps that key per-stream state (e.g. HTTP/3 QPACK field
+    /// section instructions, RFC 9204 §4.5) by stream id need this to
+    /// avoid every stream colliding on the same key.
+    fn accept_bi(&mut self, stream_id: u64) -> Box<dyn ProtocolHandler>;
 
-    /// A peer-opened unidirectional stream — return its [`ProtocolHandler`].
-    fn accept_uni(&mut self) -> Box<dyn ProtocolHandler>;
+    /// A new unidirectional stream — see [`Self::accept_bi`] for
+    /// `stream_id`.
+    fn accept_uni(&mut self, stream_id: u64) -> Box<dyn ProtocolHandler>;
 
     /// Called once for every still-live connection right before a local,
     /// explicit [`crate::QuicDriverHandle::shutdown`] tears the driver

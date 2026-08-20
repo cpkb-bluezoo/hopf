@@ -85,19 +85,45 @@ pub struct QuicDriverHandle {
     waker: Arc<Waker>,
     active: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    /// The driver thread's own id, captured at spawn — lets `shutdown`/
+    /// `Drop` detect the (real, reachable) case of being dropped *from*
+    /// the driver thread itself (e.g. a `QuicConnection` impl's own state
+    /// ends up holding the last strong reference to this handle, dropped
+    /// while running on the very thread it represents — see
+    /// `hopf-http`'s H3 session code for a concrete case). `JoinHandle::join`
+    /// panics (not just errors) when a thread tries to join itself
+    /// (`EDEADLK`), so that case must skip the join entirely, not attempt
+    /// and recover from it.
+    driver_thread_id: std::thread::ThreadId,
     /// Local UDP address after bind.
     pub local_addr: SocketAddr,
 }
 
 impl QuicDriverHandle {
-    /// Request shutdown and join the driver thread.
+    fn join_driver_thread(&mut self) {
+        if std::thread::current().id() == self.driver_thread_id {
+            // Joining ourselves would panic (EDEADLK) rather than error --
+            // and is unnecessary anyway: we're already running on the
+            // driver thread, past the point of executing this code, so it
+            // needs no one to wait for it. The Shutdown command already
+            // sent will make it stop on its own once this call stack
+            // unwinds back to the driver's own loop.
+            self.join = None;
+            return;
+        }
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+
+    /// Request shutdown and join the driver thread — unless called from
+    /// the driver thread itself, in which case the join is skipped (see
+    /// [`Self::join_driver_thread`]).
     pub fn shutdown(mut self) {
         self.active.store(false, Ordering::Release);
         let _ = self.cmd_tx.send(DriverCmd::Shutdown);
         let _ = self.waker.wake();
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+        self.join_driver_thread();
     }
 
     /// Whether the driver thread is still running (not shut down). A live
@@ -139,6 +165,37 @@ impl QuicDriverHandle {
             ))
         })
     }
+
+    /// Wake a hooks-mode (H3) connection's [`crate::QuicConnection::drive`]
+    /// on demand, from any thread.
+    ///
+    /// The driver loop already calls `drive_apps()` (which calls every
+    /// live hooks connection's `drive`) unconditionally on every
+    /// iteration, and `RecorderAction::Open` — the mechanism that turns a
+    /// `drive`-time [`crate::QuicConnApi::open_bi`] call into a real,
+    /// handler-attached stream — already works identically whether it's
+    /// recorded during `connected` or a later `drive` tick. The only piece
+    /// missing for "open another client-initiated stream on a live H3
+    /// connection whenever the app has new work" is prompting the loop to
+    /// run again *promptly* instead of waiting for the next incoming
+    /// packet or timer — this does that, reusing the same `DriverCmd`
+    /// channel and [`mio::Waker`] every other cross-thread operation here
+    /// already goes through (see [`Self::open_bi`]). Unlike `open_bi`,
+    /// this carries no payload: the app-level queue of pending work (e.g.
+    /// hopf-http's `H3ClientConnection`'s own pending-opens queue) lives
+    /// entirely on the `QuicConnection` implementor's side, checked by its
+    /// own `drive`.
+    pub fn poke_hooks(&self) -> io::Result<()> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "QUIC driver shut down",
+            ));
+        }
+        let _ = self.cmd_tx.send(DriverCmd::Task(Box::new(|| {})));
+        let _ = self.waker.wake();
+        Ok(())
+    }
 }
 
 impl Drop for QuicDriverHandle {
@@ -146,9 +203,7 @@ impl Drop for QuicDriverHandle {
         self.active.store(false, Ordering::Release);
         let _ = self.cmd_tx.send(DriverCmd::Shutdown);
         let _ = self.waker.wake();
-        if let Some(j) = self.join.take() {
-            let _ = j.join();
-        }
+        self.join_driver_thread();
     }
 }
 
@@ -351,6 +406,7 @@ fn spawn_driver(
         cmd_tx,
         waker,
         active,
+        driver_thread_id: join.thread().id(),
         join: Some(join),
         local_addr,
     })
@@ -914,7 +970,7 @@ impl Driver {
                         Arc::clone(&self.execute),
                     );
                     let mut handler = match dir {
-                        Dir::Bi => app.accept_bi(),
+                        Dir::Bi => app.accept_bi(u64::from(id)),
                         Dir::Uni => Box::new(hopf_core::NopHandler),
                     };
                     handler.connected(&mut endpoint);
@@ -1069,8 +1125,8 @@ impl Driver {
                     .and_then(|s| s.app.take())
                     .unwrap();
                 let h = match dir {
-                    Dir::Bi => app.accept_bi(),
-                    Dir::Uni => app.accept_uni(),
+                    Dir::Bi => app.accept_bi(u64::from(id)),
+                    Dir::Uni => app.accept_uni(u64::from(id)),
                 };
                 if let Some(slot) = self.connections.get_mut(&ch) {
                     slot.app = Some(app);

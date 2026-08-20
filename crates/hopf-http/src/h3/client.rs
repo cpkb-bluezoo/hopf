@@ -18,26 +18,61 @@ use crate::{
 use super::endpoint::{H3PeerState, H3UniStream};
 use super::{frame, qpack, H3FrameHandler, H3Parser};
 
+/// Client-initiated stream factories queued to be opened on a live H3
+/// connection — FIFO: each [`QuicConnApi::open_bi`] call recorded by
+/// [`H3ClientConnection::drain_pending_opens`] is matched, in order, to the
+/// next `accept_bi` call the driver makes for it (see
+/// [`crate::client::h3_session`] for the multi-request session that
+/// populates this from outside the driver thread).
+pub(crate) type PendingOpens = Arc<Mutex<std::collections::VecDeque<Arc<dyn ClientHandlerFactory>>>>;
+/// One-shot "the QUIC handshake completed" signal — see
+/// [`H3ClientConnection::connected`].
+pub(crate) type OnReady = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 /// HTTP/3 client connection installed in the QUIC hooks driver.
 pub struct H3ClientConnection {
-    factory: Arc<dyn ClientHandlerFactory>,
     limits: HttpLimits,
     peer_state: Arc<Mutex<H3PeerState>>,
     qpack: Arc<qpack::H3Qpack>,
     qpack_encoder_stream_key: Option<u64>,
     qpack_decoder_stream_key: Option<u64>,
+    pending_opens: PendingOpens,
+    on_ready: OnReady,
 }
 
 impl H3ClientConnection {
-    /// Create an HTTP/3 client connection (one request Stream after handshake).
+    /// Create an HTTP/3 client connection that eagerly opens exactly one
+    /// request stream once connected, driving it from `factory` — the
+    /// shape every existing caller ([`connect_h3`]) still wants. For a
+    /// connection whose requests are decided over time (a session issuing
+    /// many sequential requests), see [`connect_h3_session`].
     pub fn new(factory: Arc<dyn ClientHandlerFactory>, limits: HttpLimits) -> Self {
+        let pending_opens: PendingOpens = Arc::new(Mutex::new(std::collections::VecDeque::from([factory])));
+        Self::with_shared_state(pending_opens, Arc::new(Mutex::new(None)), limits)
+    }
+
+    pub(crate) fn with_shared_state(pending_opens: PendingOpens, on_ready: OnReady, limits: HttpLimits) -> Self {
         Self {
-            factory,
             limits,
             peer_state: Arc::new(Mutex::new(H3PeerState::default())),
             qpack: Arc::new(qpack::H3Qpack::new()),
             qpack_encoder_stream_key: None,
             qpack_decoder_stream_key: None,
+            pending_opens,
+            on_ready,
+        }
+    }
+
+    /// Record one `open_bi` per factory currently queued (whatever's
+    /// queued *now* — anything pushed after this call waits for the next
+    /// `drive` tick, prompted via [`hopf_quic::QuicDriverHandle::poke_hooks`]).
+    /// `hopf-quic`'s driver attaches each recorded open to the next
+    /// [`Self::accept_bi`] call it makes for this connection, in the same
+    /// order, so factories are handed out FIFO.
+    fn drain_pending_opens(&mut self, api: &mut dyn QuicConnApi) {
+        let count = self.pending_opens.lock().unwrap().len();
+        for _ in 0..count {
+            let _ = api.open_bi();
         }
     }
 
@@ -71,27 +106,37 @@ impl QuicConnection for H3ClientConnection {
             self.qpack_decoder_stream_key = Some(stream);
         }
         self.flush_qpack(api);
-        // Request stream — [`H3ClientStream`] starts the app request in `connected`.
-        let _ = api.open_bi();
+        // Request stream(s) — whatever's queued so far (the single seed
+        // factory for [`Self::new`]'s callers, or nothing yet for a
+        // session that hasn't issued its first request).
+        self.drain_pending_opens(api);
+        if let Some(cb) = self.on_ready.lock().unwrap().take() {
+            cb();
+        }
     }
 
-    fn accept_bi(&mut self) -> Box<dyn ProtocolHandler> {
-        // hopf's H3 client opens exactly one request stream per connection
-        // today (RFC 9000 §2.1: the first client-initiated bidi stream ID
-        // is always 0).
-        Box::new(H3ClientStream::new(Arc::clone(&self.factory), self.limits, 0, Arc::clone(&self.qpack)))
+    fn accept_bi(&mut self, stream_id: u64) -> Box<dyn ProtocolHandler> {
+        let factory = self
+            .pending_opens
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("accept_bi called without a matching queued factory — drain_pending_opens/open_bi calls must stay 1:1 with queued factories");
+        Box::new(H3ClientStream::new(factory, self.limits, stream_id, Arc::clone(&self.qpack)))
     }
 
-    fn accept_uni(&mut self) -> Box<dyn ProtocolHandler> {
+    fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
         Box::new(H3UniStream::new(Arc::clone(&self.peer_state), Arc::clone(&self.qpack)))
     }
 
     fn drive(&mut self, api: &mut dyn QuicConnApi) {
         self.flush_qpack(api);
+        self.drain_pending_opens(api);
     }
 }
 
-/// Dial an HTTP/3 peer (ALPN `h3`).
+/// Dial an HTTP/3 peer (ALPN `h3`), eagerly opening exactly one request
+/// stream driven by `factory` once connected.
 pub fn connect_h3(
     addr: SocketAddr,
     client_config: Arc<QuicClientConfig>,
@@ -103,6 +148,43 @@ pub fn connect_h3(
         Box::new(H3ClientConnection::new(Arc::clone(&factory), limits)) as Box<dyn QuicConnection>
     });
     connect_quic_hooks(addr, client_config, server_name, connection_factory)
+}
+
+/// Dial an HTTP/3 peer for session-based use, where the caller decides
+/// requests over time rather than eagerly at connect time (see
+/// [`crate::client::h3_session::H3HttpClientSession`]).
+///
+/// No stream is opened here — the caller pushes factories onto the
+/// returned queue and calls [`QuicDriverHandle::poke_hooks`] each time
+/// (the connection may not even be established yet; queued factories are
+/// opened once it is, same as [`connect_h3`]'s single eager stream).
+/// `on_ready` fires exactly once, from the driver thread, the moment the
+/// QUIC/TLS handshake completes — the caller's cue that issuing requests
+/// is now meaningful (nothing stops it earlier either, they'd just wait in
+/// the queue).
+pub(crate) fn connect_h3_session(
+    addr: SocketAddr,
+    client_config: Arc<QuicClientConfig>,
+    server_name: impl Into<String>,
+    limits: HttpLimits,
+    on_ready: Box<dyn FnOnce() + Send>,
+) -> io::Result<(QuicDriverHandle, PendingOpens)> {
+    let pending_opens: PendingOpens = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let pending_opens2 = Arc::clone(&pending_opens);
+    let on_ready_slot: OnReady = Arc::new(Mutex::new(Some(on_ready)));
+    let handle = connect_quic_hooks(
+        addr,
+        client_config,
+        server_name,
+        Arc::new(move || {
+            Box::new(H3ClientConnection::with_shared_state(
+                Arc::clone(&pending_opens2),
+                Arc::clone(&on_ready_slot),
+                limits,
+            )) as Box<dyn QuicConnection>
+        }),
+    )?;
+    Ok((handle, pending_opens))
 }
 
 /// Buffered outbound request during [`ClientHandler::start`].
