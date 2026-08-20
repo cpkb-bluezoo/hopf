@@ -32,6 +32,8 @@ use hopf_core::{ReactorHandle, Runtime, UdpDatagramHandler};
 use crate::bailiwick::filter_answers_in_bailiwick;
 use crate::cache::DnsCache;
 use crate::cookie::DnsCookie;
+use crate::multi_qtype::{encode_mqtype_query_option, find_mqtype_option, EDNS_OPTION_MQTYPE_RESPONSE};
+use crate::multi_qtype_cache::MultiQTypeCache;
 use crate::wire::{
     normalize_name, DnsMessage, DnsQueryIdGenerator, DnsQuestion, DnsResourceRecord, DnsType,
     OPT_UDP_PAYLOAD, RCODE_NXDOMAIN,
@@ -48,6 +50,10 @@ pub type ResolveCallback = Box<dyn FnOnce(io::Result<Vec<SocketAddr>>) + Send>;
 
 /// Single-question callback.
 pub type QueryCallback = Box<dyn FnOnce(io::Result<DnsMessage>) + Send>;
+
+/// Per-type result callback for [`DnsResolver::query_batch`] — called
+/// exactly once for each requested [`DnsType`].
+pub type BatchResultCallback = Box<dyn FnMut(DnsType, io::Result<Vec<DnsResourceRecord>>) + Send>;
 
 /// Pluggable client transport.
 pub trait DnsClientTransport: Send {
@@ -149,6 +155,12 @@ struct PendingQuery {
     #[cfg_attr(not(feature = "dnssec"), allow(dead_code))]
     cd: bool,
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// RFC 10029 `MQTYPE-Query` option bytes (if any) attached to this
+    /// query's OPT record — preserved across retry-to-next-server and
+    /// CNAME-chase re-sends so the option stays attached for the life of
+    /// this logical query, not just its first wire attempt. Empty for
+    /// every query that isn't part of a [`DnsResolver::query_batch`] call.
+    extra_edns_options: Vec<u8>,
     /// Keeps a DoH transport's live driver/connection alive for as
     /// long as this query is outstanding (dropping
     /// [`DohClientTransport`] mid-flight would tear the connection down
@@ -219,7 +231,7 @@ fn retry_or_fail_impl(inner: &Arc<Mutex<ResolverInner>>, id: u16, final_error: i
     let cancel = g.reactor.schedule_timer(timeout, Box::new(move || retry_or_fail(&inner2, new_id)));
     pending.cancel = Some(cancel);
     let question = pending.question.clone();
-    match send_query_to_server(inner, &mut g, new_id, &question, next_idx) {
+    match send_query_to_server(inner, &mut g, new_id, &question, next_idx, &pending.extra_edns_options) {
         Ok(keepalive) => {
             pending.active_transport = keepalive;
             g.pending.insert(new_id, pending);
@@ -349,6 +361,80 @@ fn questions_match(a: &DnsQuestion, b: &DnsQuestion) -> bool {
         && normalize_name(&a.name) == normalize_name(&b.name)
 }
 
+/// Joins per-type results from [`DnsResolver::query_batch`] into that
+/// batch's `on_complete` signal, once every requested type has reported a
+/// result (`Err` included — a per-type failure still counts as delivered).
+struct BatchCollector {
+    on_result: Mutex<BatchResultCallback>,
+    on_complete: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    outstanding: Mutex<std::collections::HashSet<DnsType>>,
+}
+
+impl BatchCollector {
+    fn deliver(&self, qtype: DnsType, result: io::Result<Vec<DnsResourceRecord>>) {
+        (self.on_result.lock().unwrap())(qtype, result);
+        let done = {
+            let mut outstanding = self.outstanding.lock().unwrap();
+            outstanding.remove(&qtype);
+            outstanding.is_empty()
+        };
+        if done {
+            if let Some(cb) = self.on_complete.lock().unwrap().take() {
+                cb();
+            }
+        }
+    }
+}
+
+fn records_of_type(msg: &DnsMessage, qtype: DnsType) -> Vec<DnsResourceRecord> {
+    msg.answers
+        .iter()
+        .filter(|rr| rr.rtype == Some(qtype))
+        .cloned()
+        .collect()
+}
+
+/// RFC 10029: returns the additional types `server` reported having merged
+/// into `response` via `MQTYPE-Response`, marking `server` as not
+/// supporting the mechanism (so future [`DnsResolver::query_batch`] calls
+/// skip attaching the option) when that option is absent from the
+/// response's OPT record — or there's no OPT record at all.
+fn mqtype_response_coverage(
+    response: &DnsMessage,
+    server: Option<SocketAddr>,
+    inner: &Arc<Mutex<ResolverInner>>,
+) -> Vec<DnsType> {
+    let covered = response
+        .additionals
+        .iter()
+        .find(|rr| rr.rtype == Some(DnsType::Opt))
+        .and_then(|opt| find_mqtype_option(&opt.rdata, EDNS_OPTION_MQTYPE_RESPONSE));
+    match covered {
+        Some(types) => types,
+        None => {
+            if let Some(server) = server {
+                inner.lock().unwrap().multi_qtype_cache.mark_unsupported(server);
+            }
+            Vec::new()
+        }
+    }
+}
+
+fn query_standalone_for_batch(
+    resolver: &DnsResolver,
+    name: &str,
+    qtype: DnsType,
+    collector: Arc<BatchCollector>,
+) {
+    resolver.query(
+        DnsQuestion::in_class(name, qtype),
+        Box::new(move |result| {
+            let records = result.map(|msg| records_of_type(&msg, qtype));
+            collector.deliver(qtype, records);
+        }),
+    );
+}
+
 struct ResolverInner {
     reactor: ReactorHandle,
     udp_token: Option<Token>,
@@ -357,6 +443,7 @@ struct ResolverInner {
     ids: DnsQueryIdGenerator,
     cache: Arc<DnsCache>,
     cookies: DnsCookie,
+    multi_qtype_cache: Arc<MultiQTypeCache>,
     timeout: Duration,
     use_edns: bool,
     use_cookies: bool,
@@ -399,6 +486,7 @@ impl DnsResolver {
                 ids: DnsQueryIdGenerator::new(),
                 cache: Arc::new(DnsCache::default()),
                 cookies: DnsCookie::new(),
+                multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
                 timeout: DEFAULT_TIMEOUT,
                 use_edns: true,
                 use_cookies: true,
@@ -715,6 +803,22 @@ impl DnsResolver {
     /// used by the forwarder to relay a downstream client's own CD=1
     /// request through to upstream validation.
     pub fn query_with_cd(&self, question: DnsQuestion, cd: bool, cb: QueryCallback) {
+        self.query_with_cd_and_options(question, cd, Vec::new(), cb);
+    }
+
+    /// As [`Self::query_with_cd`], additionally attaching `extra_edns_options`
+    /// (raw, already-encoded EDNS0 options, e.g. an RFC 10029
+    /// `MQTYPE-Query`) to this query's OPT record. Only
+    /// [`Self::query_batch`] needs this directly; every other caller goes
+    /// through [`Self::query`]/[`Self::query_with_cd`] with no extra
+    /// options.
+    fn query_with_cd_and_options(
+        &self,
+        question: DnsQuestion,
+        cd: bool,
+        extra_edns_options: Vec<u8>,
+        cb: QueryCallback,
+    ) {
         let _ = self.open();
         // Hosts file / literals — checked before acquiring `self.inner`'s
         // lock (issue #183): a cache-miss here falls through to
@@ -771,7 +875,7 @@ impl DnsResolver {
                 move || retry_or_fail(&inner, id)
             }),
         );
-        match send_query_to_server(&self.inner, &mut g, id, &question, 0) {
+        match send_query_to_server(&self.inner, &mut g, id, &question, 0, &extra_edns_options) {
             Ok(keepalive) => {
                 g.pending.insert(
                     id,
@@ -784,6 +888,7 @@ impl DnsResolver {
                         server,
                         cd,
                         cancel: Some(cancel),
+                        extra_edns_options,
                         active_transport: keepalive,
                     },
                 );
@@ -794,6 +899,100 @@ impl DnsResolver {
                 cb(Err(e));
             }
         }
+    }
+
+    /// Resolves several RRTYPEs for one name in as few wire exchanges as
+    /// possible (RFC 10029 DNS Multiple QTYPEs).
+    ///
+    /// The first type in `types` is sent as the primary QTYPE; the rest are
+    /// requested via an `MQTYPE-Query` EDNS0 option attached to that same
+    /// query, unless the target server is already known not to support it
+    /// ([`crate::multi_qtype_cache::MultiQTypeCache`]). A supporting server
+    /// merges whatever extra answers it can into the single response and
+    /// echoes back which types it covered via `MQTYPE-Response`; anything
+    /// not covered — including every additional type, if the server
+    /// doesn't support the mechanism at all — is resolved with an ordinary
+    /// standalone [`Self::query`]. This is purely a transport-level
+    /// optimization: every type in `types` is guaranteed exactly one call
+    /// to `on_result`, followed by exactly one call to `on_complete`,
+    /// regardless of how many packets it actually took.
+    ///
+    /// Duplicate types in `types` are collapsed to their first occurrence.
+    ///
+    /// # Panics
+    /// If `types` is empty.
+    pub fn query_batch(
+        &self,
+        name: &str,
+        types: &[DnsType],
+        on_result: BatchResultCallback,
+        on_complete: Box<dyn FnOnce() + Send>,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        let requested: Vec<DnsType> = types.iter().copied().filter(|t| seen.insert(*t)).collect();
+        assert!(!requested.is_empty(), "query_batch: types must not be empty");
+
+        let collector = Arc::new(BatchCollector {
+            on_result: Mutex::new(on_result),
+            on_complete: Mutex::new(Some(on_complete)),
+            outstanding: Mutex::new(requested.iter().copied().collect()),
+        });
+
+        let primary_type = requested[0];
+        let additional_types: Vec<DnsType> = requested[1..].to_vec();
+
+        let (target_server, attempt_option) = {
+            let g = self.inner.lock().unwrap();
+            let target_server = g.servers.first().map(|s| s.addr);
+            let attempt_option = !additional_types.is_empty()
+                && target_server.is_some_and(|s| !g.multi_qtype_cache.is_known_unsupported(s));
+            (target_server, attempt_option)
+        };
+
+        let extra_edns_options = if attempt_option {
+            encode_mqtype_query_option(&additional_types)
+        } else {
+            Vec::new()
+        };
+
+        let resolver = self.clone();
+        let name_owned = name.to_string();
+        self.query_with_cd_and_options(
+            DnsQuestion::in_class(name, primary_type),
+            false,
+            extra_edns_options,
+            Box::new(move |result| {
+                match result {
+                    Ok(msg) => {
+                        collector.deliver(primary_type, Ok(records_of_type(&msg, primary_type)));
+                        if additional_types.is_empty() {
+                            return;
+                        }
+                        let covered = if attempt_option {
+                            mqtype_response_coverage(&msg, target_server, &resolver.inner)
+                        } else {
+                            Vec::new()
+                        };
+                        for t in &additional_types {
+                            if covered.contains(t) {
+                                collector.deliver(*t, Ok(records_of_type(&msg, *t)));
+                            } else {
+                                query_standalone_for_batch(&resolver, &name_owned, *t, Arc::clone(&collector));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // The whole exchange failed (timeout/network error,
+                        // not a per-type DNS-level outcome) -- every
+                        // requested type fails together.
+                        collector.deliver(primary_type, Err(io::Error::new(e.kind(), e.to_string())));
+                        for t in &additional_types {
+                            collector.deliver(*t, Err(io::Error::new(e.kind(), e.to_string())));
+                        }
+                    }
+                }
+            }),
+        );
     }
 
     /// Parallel A+AAAA; IPv6 preferred in result order. Port applied to each.
@@ -911,13 +1110,15 @@ fn build_query_message(
     id: u16,
     question: &DnsQuestion,
     cookie_key: Option<SocketAddr>,
+    extra_edns_options: &[u8],
 ) -> DnsMessage {
     let mut msg = DnsMessage::query(id, question.clone(), true);
     if g.use_edns {
-        let opt_rdata = match cookie_key {
+        let mut opt_rdata = match cookie_key {
             Some(server) if g.use_cookies => g.cookies.encode_edns_option(&server.to_string()),
             _ => Vec::new(),
         };
+        opt_rdata.extend_from_slice(extra_edns_options);
         #[cfg(feature = "dnssec")]
         let do_bit = g.dnssec_enabled;
         #[cfg(not(feature = "dnssec"))]
@@ -933,11 +1134,12 @@ fn send_udp_query(
     id: u16,
     question: &DnsQuestion,
     server: SocketAddr,
+    extra_edns_options: &[u8],
 ) -> io::Result<()> {
     let token = g
         .udp_token
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "resolver not open"))?;
-    let msg = build_query_message(g, id, question, Some(server));
+    let msg = build_query_message(g, id, question, Some(server), extra_edns_options);
     let bytes = msg
         .serialize()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -968,21 +1170,30 @@ fn send_query_to_server(
     id: u16,
     question: &DnsQuestion,
     server_idx: usize,
+    extra_edns_options: &[u8],
 ) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
     let server = g.servers[server_idx].clone();
     match server.transport {
         ServerTransport::UdpTcp => {
-            send_udp_query(g, id, question, server.addr)?;
+            send_udp_query(g, id, question, server.addr, extra_edns_options)?;
             Ok(None)
         }
         #[cfg(feature = "dot")]
         ServerTransport::Dot { server_name, connector } => {
+            // DoT dispatches through `TcpDnsConnectionPool::query_dot`
+            // rather than `build_query_message`, so a batched query's
+            // `MQTYPE-Query` option isn't attached here — the server simply
+            // never sees it, answers normally, and `query_batch`'s
+            // coverage-check falls back to standalone per-type queries
+            // exactly as it would for any other RFC-10029-unsupporting
+            // server. No correctness impact, just no optimization on DoT
+            // upstreams yet.
             spawn_dot_query(inner, id, question.clone(), server.addr, server_name, connector);
             Ok(None)
         }
         #[cfg(feature = "doq")]
         ServerTransport::Doq { server_name, client_config } => {
-            let msg = build_query_message(g, id, question, None);
+            let msg = build_query_message(g, id, question, None, extra_edns_options);
             let bytes = msg
                 .serialize()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -997,7 +1208,7 @@ fn send_query_to_server(
         #[cfg(feature = "doh")]
         ServerTransport::Doh { runtime, host, path, connector, use_get } => {
             let mut transport = doh::DohClientTransport::https(runtime, host, path, connector).with_get(use_get);
-            let msg = build_query_message(g, id, question, None);
+            let msg = build_query_message(g, id, question, None, extra_edns_options);
             let bytes = msg
                 .serialize()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -1228,7 +1439,9 @@ fn complete_response(
                     // dispatch error the same way the pre-transport-abstraction code
                     // did: `pending` is still inserted, so the timeout timer (already
                     // armed above) is what eventually cleans it up either way.
-                    let keepalive = send_query_to_server(inner, &mut g, id, &q, server_idx).ok().flatten();
+                    let keepalive = send_query_to_server(inner, &mut g, id, &q, server_idx, &pending.extra_edns_options)
+                        .ok()
+                        .flatten();
                     pending.active_transport = keepalive;
                     g.pending.insert(id, pending);
                     return;
@@ -1336,6 +1549,7 @@ mod tests {
             ids: DnsQueryIdGenerator::new(),
             cache: Arc::new(DnsCache::default()),
             cookies: DnsCookie::new(),
+            multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
             timeout: DEFAULT_TIMEOUT,
             use_edns: true,
             use_cookies: true,
@@ -1361,6 +1575,7 @@ mod tests {
                 server: "127.0.0.1:53".parse().unwrap(),
                 cd: false,
                 cancel: None,
+                extra_edns_options: Vec::new(),
                 active_transport: None,
             },
         );
@@ -1443,6 +1658,7 @@ mod tests {
             ids: DnsQueryIdGenerator::new(),
             cache: Arc::new(DnsCache::default()),
             cookies: DnsCookie::new(),
+            multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
             timeout: DEFAULT_TIMEOUT,
             use_edns: true,
             use_cookies: true,
@@ -1467,6 +1683,7 @@ mod tests {
             server: "127.0.0.1:53".parse().unwrap(),
             cd,
             cancel: None,
+            extra_edns_options: Vec::new(),
             active_transport: None,
         }
     }

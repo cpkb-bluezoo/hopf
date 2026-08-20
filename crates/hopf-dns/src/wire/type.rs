@@ -22,6 +22,10 @@ pub enum DnsType {
     Aaaa = 28,
     /// Service locator.
     Srv = 33,
+    /// Service binding. RFC 9460 §2.
+    Svcb = 64,
+    /// HTTPS binding. RFC 9460 §2.
+    Https = 65,
     /// EDNS OPT pseudo-RR.
     Opt = 41,
     /// Delegation signer.
@@ -58,6 +62,8 @@ impl DnsType {
             16 => Self::Txt,
             28 => Self::Aaaa,
             33 => Self::Srv,
+            64 => Self::Svcb,
+            65 => Self::Https,
             41 => Self::Opt,
             43 => Self::Ds,
             46 => Self::Rrsig,

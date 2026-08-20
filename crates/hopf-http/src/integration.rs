@@ -13,13 +13,13 @@ use std::time::{Duration, Instant};
 
 use hopf_core::{Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
 
-use crate::client::{connect_http, connect_http2_upgrade, HttpClientTimeouts};
+use crate::client::{connect_auto, connect_http, connect_http2_upgrade, HttpClientTimeouts};
 use crate::h2::frame;
 use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
 use crate::{
-    CleartextHttpEndpoint, ClientHandler, ClientHandlerFactory, ClientWriter, H2Endpoint, Headers,
-    HttpClient, HttpClientSessionHandle, HttpConnectionHandler, HttpLimits, HttpRequest,
-    HttpResponseHandler,
+    AltSvcCache, CleartextHttpEndpoint, ClientHandler, ClientHandlerFactory, ClientWriter,
+    H2Endpoint, Headers, HttpClient, HttpClientSessionHandle, HttpConnectionHandler, HttpLimits,
+    HttpRequest, HttpResponseHandler,
 };
 
 // ---------------------------------------------------------------------------
@@ -712,4 +712,355 @@ fn gumdrop_client_dns_failure_invokes_on_error() {
         !out.lock().unwrap().on_connected_called,
         "on_connected must not fire when DNS resolution never succeeded"
     );
+}
+
+/// `connect_h3_by_name` must resolve hostnames through an injected
+/// [`hopf_dns::DnsResolver`], the same as every other dial path in this
+/// crate (`connect_http`/`connect_http2_upgrade`) — not silently fall back
+/// to the OS resolver. Proven with a hostname that only resolves via a
+/// local stub DNS server the injected resolver points at: the OS has no
+/// idea about it, so this only succeeds if the injected resolver was
+/// actually consulted.
+#[test]
+fn connect_h3_by_name_uses_the_injected_dns_resolver_not_the_os_resolver() {
+    use hopf_dns::wire::{DnsMessage, DnsResourceRecord, FLAG_QR, FLAG_RA};
+    use hopf_dns::DnsResolver;
+    use std::net::Ipv4Addr;
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+
+    // Answers A queries with a TEST-NET-3 (RFC 5737) address: reserved,
+    // never routable, and certainly not what any real DNS server would
+    // return for this made-up hostname.
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+                break;
+            };
+            let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+                continue;
+            };
+            let mut resp = q.response_template(0);
+            resp.flags |= FLAG_QR | FLAG_RA;
+            if let Some(question) = q.questions.first() {
+                resp.answers.push(DnsResourceRecord::a(
+                    &question.name,
+                    60,
+                    Ipv4Addr::new(203, 0, 113, 55),
+                ));
+            }
+            let bytes = resp.serialize().unwrap();
+            let _ = stub.send_to(&bytes, peer);
+        }
+    });
+
+    let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+
+    let (_server_cfg, pem) = hopf_quic::server_config_self_signed(&["localhost"], &[b"h3"]).unwrap();
+    let client_config = hopf_quic::client_config_for_pem_bytes(&pem, &[b"h3"]).unwrap();
+
+    let out = Arc::new(Mutex::new(Outcome::default()));
+    let factory: Arc<dyn ClientHandlerFactory> = Arc::new(GetFactory { out: Arc::clone(&out) });
+
+    let result = crate::client::connect_h3_by_name(
+        &rt,
+        "made-up-host.hopf-h3-resolver-test.invalid",
+        4433,
+        client_config,
+        None,
+        factory,
+        HttpLimits::default(),
+        Some(dns),
+    );
+
+    assert!(
+        result.is_ok(),
+        "connect_h3_by_name should have resolved via the injected DnsResolver, got: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// connect_auto: DNS HTTPS-record tier and Alt-Svc tier
+// ---------------------------------------------------------------------------
+
+struct H3Hello;
+impl ServerHandler for H3Hello {
+    fn headers(&mut self, response: &mut dyn ServerWriter, _: &Headers) {
+        let body = b"hello-h3-via-connect-auto";
+        let mut h = Headers::new();
+        h.status(200);
+        h.set("content-type", "text/plain");
+        h.set("content-length", body.len().to_string());
+        response.headers(h);
+        response.start_response_body();
+        response.response_body_content(body);
+        response.end_response_body();
+        response.complete();
+    }
+    fn request_complete(&mut self, _: &mut dyn ServerWriter) {}
+}
+struct H3HelloFactory;
+impl ServerHandlerFactory for H3HelloFactory {
+    fn create_handler(&self) -> Box<dyn ServerHandler> {
+        Box::new(H3Hello)
+    }
+}
+
+/// A DNS HTTPS record (RFC 9460) advertising `alpn=h3` lets `connect_auto`
+/// reach the origin over QUIC directly — no TCP listener exists anywhere
+/// in this test, so a fall-through to the TCP tier would simply hang
+/// rather than silently "still working".
+#[test]
+fn connect_auto_uses_dns_https_record_to_reach_h3_with_no_tcp_fallback() {
+    use hopf_dns::wire::{
+        encode_svcb_alpn, DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA,
+        SVCB_PARAM_ALPN, SVCB_PARAM_PORT,
+    };
+    use hopf_dns::DnsResolver;
+    use hopf_quic::{client_config_for_pem_bytes, server_config_self_signed, ALPN_H3};
+    use std::net::Ipv4Addr;
+
+    const HOST: &str = "h3-https-record-test.invalid";
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+
+    let (server_cfg, pem) = server_config_self_signed(&[HOST], &[ALPN_H3]).unwrap();
+    let client_cfg = client_config_for_pem_bytes(&pem, &[ALPN_H3]).unwrap();
+    let h3_server = crate::h3::listen_h3(
+        "127.0.0.1:0".parse().unwrap(),
+        server_cfg,
+        Arc::new(H3HelloFactory),
+        HttpLimits::default(),
+    )
+    .unwrap();
+    let h3_port = h3_server.local_addr.port();
+
+    // DNS: A -> 127.0.0.1; HTTPS -> alpn=h3, port=<the real h3 listener>;
+    // AAAA -> NODATA. No MQTYPE-Response is ever attached, so
+    // `query_batch` falls back to standalone per-type queries exactly as
+    // it does against a plain RFC-10029-unaware resolver.
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            break;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            continue;
+        };
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            match question.qtype {
+                Some(DnsType::A) => resp.answers.push(DnsResourceRecord::a(
+                    &question.name,
+                    60,
+                    Ipv4Addr::new(127, 0, 0, 1),
+                )),
+                Some(DnsType::Https) => {
+                    let params = vec![
+                        (SVCB_PARAM_ALPN, encode_svcb_alpn(&["h3"])),
+                        (SVCB_PARAM_PORT, h3_port.to_be_bytes().to_vec()),
+                    ];
+                    resp.answers.push(
+                        DnsResourceRecord::https(&question.name, 60, 1, ".", &params).unwrap(),
+                    );
+                }
+                _ => {} // AAAA: NODATA
+            }
+        }
+        let bytes = resp.serialize().unwrap();
+        let _ = stub.send_to(&bytes, peer);
+    });
+
+    let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+
+    let out = Arc::new(Mutex::new(Outcome::default()));
+    let factory: Arc<dyn ClientHandlerFactory> = Arc::new(GetFactory { out: Arc::clone(&out) });
+
+    connect_auto(
+        &rt,
+        HOST,
+        80, // origin port -- deliberately not the real h3 port; svcb_port must override it
+        factory,
+        HttpLimits::default(),
+        false,
+        HttpClientTimeouts::default(),
+        Some(dns),
+        Some(client_cfg),
+        Arc::new(AltSvcCache::new()),
+    )
+    .unwrap();
+
+    assert!(
+        wait_done(&out, Duration::from_secs(5)),
+        "connect_auto never completed a request via the DNS HTTPS-record tier"
+    );
+    assert_eq!(out.lock().unwrap().status, 200);
+    assert_eq!(out.lock().unwrap().body, b"hello-h3-via-connect-auto");
+    h3_server.shutdown();
+}
+
+/// Replies `200 OK` to every request, announcing h3 support via an
+/// `Alt-Svc` response header on the *first* request only — later requests
+/// (there shouldn't be any once the cache kicks in) would just repeat it.
+struct AltSvcAnnouncingServer {
+    buf: Vec<u8>,
+    h3_port: u16,
+}
+impl ProtocolHandler for AltSvcAnnouncingServer {
+    fn connected(&mut self, _: &mut dyn Endpoint) {}
+    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+        self.buf.extend_from_slice(data);
+        *data = &[];
+        if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let body = b"hello-tcp-before-alt-svc-upgrade";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nAlt-Svc: h3=\":{}\"\r\nConnection: close\r\n\r\n",
+                body.len(),
+                self.h3_port
+            );
+            ep.send(resp.as_bytes());
+            ep.send(body);
+            ep.close();
+        }
+    }
+    fn disconnected(&mut self, _: &mut dyn Endpoint) {}
+    fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
+}
+
+/// First connection to an origin with no DNS HTTPS record falls through to
+/// plain TCP (tier 3) and observes an `Alt-Svc: h3=...` response header,
+/// caching it. A *second* `connect_auto` call to the same origin, sharing
+/// that cache, then reaches h3 directly via the tier-2 Alt-Svc lookup —
+/// again with no TCP listener able to serve it, so a mistaken tier-3
+/// fallback would simply hang.
+#[test]
+fn connect_auto_upgrades_to_h3_via_alt_svc_cache_on_the_next_connection() {
+    use hopf_dns::wire::{DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA};
+    use hopf_dns::DnsResolver;
+    use hopf_quic::{client_config_for_pem_bytes, server_config_self_signed, ALPN_H3};
+    use std::net::Ipv4Addr;
+
+    const HOST: &str = "h3-alt-svc-test.invalid";
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+
+    let (server_cfg, pem) = server_config_self_signed(&[HOST], &[ALPN_H3]).unwrap();
+    let client_cfg = client_config_for_pem_bytes(&pem, &[ALPN_H3]).unwrap();
+    let h3_server = crate::h3::listen_h3(
+        "127.0.0.1:0".parse().unwrap(),
+        server_cfg,
+        Arc::new(H3HelloFactory),
+        HttpLimits::default(),
+    )
+    .unwrap();
+    let h3_port = h3_server.local_addr.port();
+
+    let (tcp_addr, _tcp_listener) = rt
+        .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+            Box::new(AltSvcAnnouncingServer { buf: Vec::new(), h3_port }) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+
+    // DNS: A -> 127.0.0.1 only. No HTTPS record at all -- tier 1 must miss
+    // on every call, so the h3 upgrade can only come from the Alt-Svc tier.
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    std::thread::spawn(move || loop {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            break;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            continue;
+        };
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            if question.qtype == Some(DnsType::A) {
+                resp.answers.push(DnsResourceRecord::a(
+                    &question.name,
+                    60,
+                    Ipv4Addr::new(127, 0, 0, 1),
+                ));
+            }
+        }
+        let bytes = resp.serialize().unwrap();
+        let _ = stub.send_to(&bytes, peer);
+    });
+
+    let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+
+    let alt_svc_cache = Arc::new(AltSvcCache::new());
+
+    // First connection: no HTTPS record, no cached Alt-Svc entry yet ->
+    // tier 3, plain TCP, observing the Alt-Svc header on the response.
+    let out1 = Arc::new(Mutex::new(Outcome::default()));
+    let factory1: Arc<dyn ClientHandlerFactory> = Arc::new(GetFactory { out: Arc::clone(&out1) });
+    connect_auto(
+        &rt,
+        HOST,
+        tcp_addr.port(),
+        factory1,
+        HttpLimits::default(),
+        false,
+        HttpClientTimeouts::default(),
+        Some(Arc::clone(&dns)),
+        Some(Arc::clone(&client_cfg)),
+        Arc::clone(&alt_svc_cache),
+    )
+    .unwrap();
+    assert!(
+        wait_done(&out1, Duration::from_secs(5)),
+        "first connect_auto call (tier 3, plain TCP) never completed"
+    );
+    assert_eq!(out1.lock().unwrap().status, 200);
+    assert_eq!(out1.lock().unwrap().body, b"hello-tcp-before-alt-svc-upgrade");
+    assert!(
+        alt_svc_cache.get(HOST, tcp_addr.port()).is_some(),
+        "Alt-Svc header from the first response should have been cached"
+    );
+
+    // Second connection, same origin, same cache: must reach h3 via the
+    // Alt-Svc tier -- no TCP server exists on any port the h3 listener
+    // uses, so a wrong tier-3 fallback here would hang rather than pass.
+    let out2 = Arc::new(Mutex::new(Outcome::default()));
+    let factory2: Arc<dyn ClientHandlerFactory> = Arc::new(GetFactory { out: Arc::clone(&out2) });
+    connect_auto(
+        &rt,
+        HOST,
+        tcp_addr.port(),
+        factory2,
+        HttpLimits::default(),
+        false,
+        HttpClientTimeouts::default(),
+        Some(dns),
+        Some(client_cfg),
+        alt_svc_cache,
+    )
+    .unwrap();
+    assert!(
+        wait_done(&out2, Duration::from_secs(5)),
+        "second connect_auto call never completed via the Alt-Svc tier"
+    );
+    assert_eq!(out2.lock().unwrap().status, 200);
+    assert_eq!(out2.lock().unwrap().body, b"hello-h3-via-connect-auto");
+    h3_server.shutdown();
 }
