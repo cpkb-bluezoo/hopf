@@ -1,5 +1,6 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use super::class::DnsClass;
@@ -13,6 +14,54 @@ pub const EDNS_FLAG_DO: u32 = 0x8000;
 pub const OPT_UDP_PAYLOAD: u16 = 4096;
 /// EDNS Padding option code (RFC 7830).
 pub const EDNS_OPTION_PADDING: u16 = 12;
+
+/// SVCB/HTTPS "alpn" SvcParamKey (RFC 9460 §7.1.1).
+pub const SVCB_PARAM_ALPN: u16 = 1;
+/// SVCB/HTTPS "port" SvcParamKey (RFC 9460 §7.1.2).
+pub const SVCB_PARAM_PORT: u16 = 3;
+/// SVCB/HTTPS "ipv4hint" SvcParamKey (RFC 9460 §7.1.3).
+pub const SVCB_PARAM_IPV4HINT: u16 = 4;
+/// SVCB/HTTPS "ech" SvcParamKey (draft-ietf-tls-svcb-ech).
+pub const SVCB_PARAM_ECH: u16 = 5;
+/// SVCB/HTTPS "ipv6hint" SvcParamKey (RFC 9460 §7.1.3).
+pub const SVCB_PARAM_IPV6HINT: u16 = 6;
+
+/// Encode an "alpn" SvcParam value: a concatenation of length-prefixed
+/// ALPN protocol IDs (RFC 9460 §7.1.1), ready to pass as one entry in
+/// [`DnsResourceRecord::svcb`]/[`DnsResourceRecord::https`]'s `params`.
+pub fn encode_svcb_alpn(protocols: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in protocols {
+        let bytes = p.as_bytes();
+        out.push(bytes.len() as u8);
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+fn encode_svcb_rdata(
+    priority: u16,
+    target: &str,
+    params: &[(u16, Vec<u8>)],
+) -> Result<Vec<u8>, DnsFormatError> {
+    let mut rdata = Vec::new();
+    rdata.extend_from_slice(&priority.to_be_bytes());
+    // RFC 9460 §2.2: TargetName is always in uncompressed wire format.
+    // `encode_name` never emits compression pointers (it has no name
+    // table to point into), so this is automatically satisfied.
+    rdata.extend_from_slice(&encode_name(target)?);
+    let mut sorted: Vec<&(u16, Vec<u8>)> = params.iter().collect();
+    sorted.sort_by_key(|(k, _)| *k);
+    for (key, value) in sorted {
+        if value.len() > u16::MAX as usize {
+            return Err(DnsFormatError::new("SvcParam value too long"));
+        }
+        rdata.extend_from_slice(&key.to_be_bytes());
+        rdata.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        rdata.extend_from_slice(value);
+    }
+    Ok(rdata)
+}
 
 /// Build an RFC 7830 Padding option (code + length + `padding_len`
 /// zero-valued octets) ready to append into an OPT record's options — the
@@ -213,6 +262,167 @@ impl DnsResourceRecord {
         rdata.extend_from_slice(&port.to_be_bytes());
         rdata.extend_from_slice(&encode_name(target)?);
         Ok(Self::new(name, DnsType::Srv, DnsClass::In, ttl, rdata))
+    }
+
+    /// SVCB (RFC 9460 §2).
+    pub fn svcb(
+        name: impl Into<String>,
+        ttl: u32,
+        priority: u16,
+        target: &str,
+        params: &[(u16, Vec<u8>)],
+    ) -> Result<Self, DnsFormatError> {
+        let rdata = encode_svcb_rdata(priority, target, params)?;
+        Ok(Self::new(name, DnsType::Svcb, DnsClass::In, ttl, rdata))
+    }
+
+    /// HTTPS (RFC 9460 §2) — same RDATA shape as SVCB, distinct TYPE.
+    pub fn https(
+        name: impl Into<String>,
+        ttl: u32,
+        priority: u16,
+        target: &str,
+        params: &[(u16, Vec<u8>)],
+    ) -> Result<Self, DnsFormatError> {
+        let rdata = encode_svcb_rdata(priority, target, params)?;
+        Ok(Self::new(name, DnsType::Https, DnsClass::In, ttl, rdata))
+    }
+
+    fn require_svcb(&self) -> Option<()> {
+        match self.rtype {
+            Some(DnsType::Svcb) | Some(DnsType::Https) => Some(()),
+            _ => None,
+        }
+    }
+
+    /// SvcPriority (RFC 9460 §2.2). 0 means alias form
+    /// ([`Self::is_svcb_alias_form`]).
+    pub fn svcb_priority(&self) -> Option<u16> {
+        self.require_svcb()?;
+        if self.rdata.len() < 2 {
+            return None;
+        }
+        Some(u16::from_be_bytes([self.rdata[0], self.rdata[1]]))
+    }
+
+    /// True if this is an AliasForm record (SvcPriority 0, RFC 9460 §2.2) —
+    /// TargetName is an alias to resolve instead of a service endpoint, and
+    /// carries no SvcParams.
+    pub fn is_svcb_alias_form(&self) -> bool {
+        self.svcb_priority() == Some(0)
+    }
+
+    /// TargetName (RFC 9460 §2.2): the alias (AliasForm) or service
+    /// hostname (ServiceForm, "." for the owner name itself).
+    pub fn svcb_target_name(&self) -> Option<String> {
+        self.require_svcb()?;
+        let mut c = 2;
+        decode_name(&self.rdata, &mut c).ok()
+    }
+
+    fn svcb_params_offset(&self) -> Option<usize> {
+        self.require_svcb()?;
+        if self.rdata.len() < 2 {
+            return None;
+        }
+        let mut c = 2;
+        decode_name(&self.rdata, &mut c).ok()?;
+        Some(c)
+    }
+
+    /// Raw SvcParamKey → SvcParamValue map (RFC 9460 §2.2). `None` if the
+    /// record isn't SVCB/HTTPS, or the SvcParams are truncated/malformed.
+    pub fn svcb_params(&self) -> Option<HashMap<u16, Vec<u8>>> {
+        let start = self.svcb_params_offset()?;
+        let mut params = HashMap::new();
+        let mut i = start;
+        while i + 4 <= self.rdata.len() {
+            let key = u16::from_be_bytes([self.rdata[i], self.rdata[i + 1]]);
+            let len = u16::from_be_bytes([self.rdata[i + 2], self.rdata[i + 3]]) as usize;
+            i += 4;
+            if i + len > self.rdata.len() {
+                return None;
+            }
+            params.insert(key, self.rdata[i..i + len].to_vec());
+            i += len;
+        }
+        Some(params)
+    }
+
+    /// ALPN protocol IDs advertised by the "alpn" SvcParam (RFC 9460
+    /// §7.1.1, e.g. `"h3"`). Empty if absent or malformed.
+    pub fn svcb_alpn_protocols(&self) -> Vec<String> {
+        let raw = match self.svcb_params() {
+            Some(p) => p.get(&SVCB_PARAM_ALPN).cloned(),
+            None => None,
+        };
+        let raw = match raw {
+            Some(r) => r,
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < raw.len() {
+            let len = raw[i] as usize;
+            i += 1;
+            if i + len > raw.len() {
+                break;
+            }
+            out.push(String::from_utf8_lossy(&raw[i..i + len]).into_owned());
+            i += len;
+        }
+        out
+    }
+
+    /// "port" SvcParam (RFC 9460 §7.1.2) — an alternate port for the
+    /// service, overriding the origin port.
+    pub fn svcb_port(&self) -> Option<u16> {
+        let raw = self.svcb_params()?.remove(&SVCB_PARAM_PORT)?;
+        if raw.len() != 2 {
+            return None;
+        }
+        Some(u16::from_be_bytes([raw[0], raw[1]]))
+    }
+
+    /// "ipv4hint" SvcParam (RFC 9460 §7.1.3) — IP address hints letting a
+    /// client skip a separate A query. Empty if absent or malformed.
+    pub fn svcb_ipv4hint(&self) -> Vec<Ipv4Addr> {
+        let raw = match self.svcb_params() {
+            Some(p) => p.get(&SVCB_PARAM_IPV4HINT).cloned(),
+            None => None,
+        };
+        match raw {
+            Some(raw) => raw
+                .chunks_exact(4)
+                .map(|c| Ipv4Addr::new(c[0], c[1], c[2], c[3]))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// "ipv6hint" SvcParam (RFC 9460 §7.1.3) — IP address hints letting a
+    /// client skip a separate AAAA query. Empty if absent or malformed.
+    pub fn svcb_ipv6hint(&self) -> Vec<Ipv6Addr> {
+        let raw = match self.svcb_params() {
+            Some(p) => p.get(&SVCB_PARAM_IPV6HINT).cloned(),
+            None => None,
+        };
+        match raw {
+            Some(raw) => raw
+                .chunks_exact(16)
+                .map(|c| {
+                    let mut o = [0u8; 16];
+                    o.copy_from_slice(c);
+                    Ipv6Addr::from(o)
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Raw "ech" SvcParam value (ECHConfigList bytes), unparsed.
+    pub fn svcb_ech(&self) -> Option<Vec<u8>> {
+        self.svcb_params()?.remove(&SVCB_PARAM_ECH)
     }
 
     /// OPT / EDNS0 pseudo-RR (name empty, CLASS = UDP size, TTL = flags).
@@ -928,6 +1138,66 @@ mod tests {
         let mut expected = types;
         expected.sort_unstable();
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn https_record_round_trips_alpn_port_and_hints() {
+        let alpn = encode_svcb_alpn(&["h3", "h2"]);
+        let params = vec![
+            (SVCB_PARAM_ALPN, alpn),
+            (SVCB_PARAM_PORT, 8443u16.to_be_bytes().to_vec()),
+            (
+                SVCB_PARAM_IPV4HINT,
+                Ipv4Addr::new(203, 0, 113, 1).octets().to_vec(),
+            ),
+            (
+                SVCB_PARAM_IPV6HINT,
+                Ipv6Addr::LOCALHOST.octets().to_vec(),
+            ),
+            (SVCB_PARAM_ECH, vec![0xAA, 0xBB, 0xCC]),
+        ];
+        let rr = DnsResourceRecord::https("ex.test.", 300, 1, "ex.test.", &params).unwrap();
+
+        assert_eq!(rr.svcb_priority(), Some(1));
+        assert!(!rr.is_svcb_alias_form());
+        let target = rr.svcb_target_name().unwrap();
+        assert!(target.eq_ignore_ascii_case("ex.test") || target.eq_ignore_ascii_case("ex.test."));
+        assert_eq!(rr.svcb_alpn_protocols(), vec!["h3".to_string(), "h2".to_string()]);
+        assert_eq!(rr.svcb_port(), Some(8443));
+        assert_eq!(rr.svcb_ipv4hint(), vec![Ipv4Addr::new(203, 0, 113, 1)]);
+        assert_eq!(rr.svcb_ipv6hint(), vec![Ipv6Addr::LOCALHOST]);
+        assert_eq!(rr.svcb_ech(), Some(vec![0xAA, 0xBB, 0xCC]));
+
+        // Non-SVCB/HTTPS records must not decode as one.
+        let a = DnsResourceRecord::a("ex.test.", 60, Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(a.svcb_priority(), None);
+        assert!(a.svcb_alpn_protocols().is_empty());
+    }
+
+    #[test]
+    fn svcb_alias_form_has_no_params() {
+        let rr = DnsResourceRecord::svcb("ex.test.", 300, 0, "canonical.ex.test.", &[]).unwrap();
+        assert!(rr.is_svcb_alias_form());
+        assert_eq!(rr.svcb_priority(), Some(0));
+        assert!(rr.svcb_alpn_protocols().is_empty());
+        assert_eq!(rr.svcb_port(), None);
+    }
+
+    #[test]
+    fn svcb_params_truncated_returns_none_not_panic() {
+        // Priority + a valid target name, then a key/len header claiming
+        // more value bytes than actually follow.
+        let mut rdata = 1u16.to_be_bytes().to_vec();
+        rdata.extend_from_slice(&encode_name("ex.test.").unwrap());
+        rdata.extend_from_slice(&SVCB_PARAM_ALPN.to_be_bytes());
+        rdata.extend_from_slice(&100u16.to_be_bytes()); // claims 100 bytes of value
+        rdata.extend_from_slice(&[1, 2, 3]); // far short of 100
+
+        let rr = DnsResourceRecord::new("ex.test.", DnsType::Https, DnsClass::In, 60, rdata);
+        assert_eq!(rr.svcb_params(), None);
+        assert!(rr.svcb_alpn_protocols().is_empty());
+        assert!(rr.svcb_ipv4hint().is_empty());
+        assert_eq!(rr.svcb_port(), None);
     }
 
     #[test]

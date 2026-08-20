@@ -125,6 +125,202 @@ fn nodata_response_is_negatively_cached_so_a_repeat_query_skips_upstream() {
     rt.shutdown();
 }
 
+/// A server that echoes `MQTYPE-Response` covering every additional type
+/// lets `query_batch` resolve everything from a single wire exchange.
+#[test]
+fn query_batch_merges_additional_types_in_one_exchange_when_server_supports_it() {
+    use hopf_dns::wire::DnsType;
+    use hopf_dns::{encode_mqtype_response_option, find_mqtype_option, EDNS_OPTION_MQTYPE_QUERY};
+    use std::net::Ipv6Addr;
+
+    let request_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let request_count2 = Arc::clone(&request_count);
+    let stub = UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            return;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            return;
+        };
+        request_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let additional = q
+            .additionals
+            .iter()
+            .find(|rr| rr.rtype == Some(DnsType::Opt))
+            .and_then(|rr| find_mqtype_option(&rr.rdata, EDNS_OPTION_MQTYPE_QUERY))
+            .unwrap_or_default();
+
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            resp.answers.push(DnsResourceRecord::a(
+                &question.name,
+                60,
+                Ipv4Addr::new(203, 0, 113, 10),
+            ));
+            if additional.contains(&DnsType::Aaaa) {
+                resp.answers
+                    .push(DnsResourceRecord::aaaa(&question.name, 60, Ipv6Addr::LOCALHOST));
+            }
+        }
+        let response_opt_data = encode_mqtype_response_option(&additional);
+        resp.additionals
+            .push(DnsResourceRecord::opt(4096, false, &response_opt_data));
+        let bytes = resp.serialize().unwrap();
+        let _ = stub.send_to(&bytes, peer);
+    });
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let resolver = DnsResolver::new(rt.pick_worker().clone());
+    resolver.add_server(stub_addr);
+    resolver.open().unwrap();
+
+    let results: Arc<Mutex<Vec<(DnsType, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+    let results2 = Arc::clone(&results);
+    let done = Arc::new(Mutex::new(false));
+    let done2 = Arc::clone(&done);
+    resolver.query_batch(
+        "batch.example",
+        &[DnsType::A, DnsType::Aaaa],
+        Box::new(move |t, r| {
+            results2
+                .lock()
+                .unwrap()
+                .push((t, r.map(|v| !v.is_empty()).unwrap_or(false)));
+        }),
+        Box::new(move || {
+            *done2.lock().unwrap() = true;
+        }),
+    );
+
+    for _ in 0..100 {
+        if *done.lock().unwrap() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(*done.lock().unwrap(), "on_complete never fired");
+    assert_eq!(
+        request_count.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "expected a single wire exchange"
+    );
+    let results = results.lock().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|(_, ok)| *ok), "got {results:?}");
+    rt.shutdown();
+}
+
+/// A server that ignores the `MQTYPE-Query` option entirely (answering
+/// only the primary question, as an RFC-10029-unaware server would) must
+/// still get every requested type resolved, via standalone follow-up
+/// queries — and a second `query_batch` call to the same server must skip
+/// attaching the option at all, since the capability cache now remembers
+/// the miss.
+#[test]
+fn query_batch_falls_back_to_standalone_queries_and_caches_the_server_as_unsupported() {
+    use hopf_dns::wire::DnsType;
+    use hopf_dns::{find_mqtype_option, EDNS_OPTION_MQTYPE_QUERY};
+    use std::net::Ipv6Addr;
+
+    let saw_option = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let saw_option2 = Arc::clone(&saw_option);
+    let stub = UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    thread::spawn(move || loop {
+        let mut buf = [0u8; 512];
+        let Ok((n, peer)) = stub.recv_from(&mut buf) else {
+            return;
+        };
+        let Ok(q) = DnsMessage::parse(&buf[..n]) else {
+            continue;
+        };
+        let saw = q
+            .additionals
+            .iter()
+            .find(|rr| rr.rtype == Some(DnsType::Opt))
+            .and_then(|rr| find_mqtype_option(&rr.rdata, EDNS_OPTION_MQTYPE_QUERY))
+            .is_some();
+        if saw {
+            saw_option2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        // No MQTYPE-Response, ever -- answer only the primary question, as
+        // an RFC-10029-unaware server would.
+        let mut resp = q.response_template(0);
+        resp.flags |= FLAG_QR | FLAG_RA;
+        if let Some(question) = q.questions.first() {
+            match question.qtype {
+                Some(DnsType::A) => resp.answers.push(DnsResourceRecord::a(
+                    &question.name,
+                    60,
+                    Ipv4Addr::new(203, 0, 113, 20),
+                )),
+                Some(DnsType::Aaaa) => resp
+                    .answers
+                    .push(DnsResourceRecord::aaaa(&question.name, 60, Ipv6Addr::LOCALHOST)),
+                _ => {}
+            }
+        }
+        let bytes = resp.serialize().unwrap();
+        let _ = stub.send_to(&bytes, peer);
+    });
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let resolver = DnsResolver::new(rt.pick_worker().clone());
+    resolver.add_server(stub_addr);
+    resolver.open().unwrap();
+
+    run_batch_and_wait(&resolver, "unsupported.example");
+    let seen_after_first = saw_option.load(std::sync::atomic::Ordering::SeqCst);
+    run_batch_and_wait(&resolver, "unsupported2.example");
+
+    assert_eq!(seen_after_first, 1, "first batch should have attached the option once");
+    assert_eq!(
+        saw_option.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "second batch must not re-attach a known-unsupported option"
+    );
+    rt.shutdown();
+}
+
+fn run_batch_and_wait(resolver: &DnsResolver, name: &str) {
+    use hopf_dns::wire::DnsType;
+
+    let results: Arc<Mutex<Vec<DnsType>>> = Arc::new(Mutex::new(Vec::new()));
+    let results2 = Arc::clone(&results);
+    let done = Arc::new(Mutex::new(false));
+    let done2 = Arc::clone(&done);
+    resolver.query_batch(
+        name,
+        &[DnsType::A, DnsType::Aaaa],
+        Box::new(move |t, r| {
+            if r.map(|v| !v.is_empty()).unwrap_or(false) {
+                results2.lock().unwrap().push(t);
+            }
+        }),
+        Box::new(move || {
+            *done2.lock().unwrap() = true;
+        }),
+    );
+    for _ in 0..100 {
+        if *done.lock().unwrap() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(*done.lock().unwrap(), "on_complete never fired for {name}");
+    assert_eq!(
+        results.lock().unwrap().len(),
+        2,
+        "expected both types resolved for {name} via fallback"
+    );
+}
+
 /// The forwarder must truncate (empty answer + TC set) a response too
 /// large for what the client advertised, instead of sending an oversized
 /// UDP datagram — and must send the full answer once the client's

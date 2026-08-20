@@ -18,6 +18,8 @@ pub mod bailiwick;
 pub mod cache;
 pub mod client;
 pub mod cookie;
+pub mod multi_qtype;
+pub mod multi_qtype_cache;
 pub mod system;
 pub mod wire;
 
@@ -32,10 +34,15 @@ pub use bailiwick::{
 };
 pub use cache::DnsCache;
 pub use client::{
-    parse_literal_ip, DnsResolver, HostsFile, QueryCallback, ResolveCallback, RuntimeDnsExt,
-    DEFAULT_DNS_PORT, DEFAULT_TIMEOUT,
+    parse_literal_ip, BatchResultCallback, DnsResolver, HostsFile, QueryCallback, ResolveCallback,
+    RuntimeDnsExt, DEFAULT_DNS_PORT, DEFAULT_TIMEOUT,
 };
 pub use cookie::DnsCookie;
+pub use multi_qtype::{
+    encode_mqtype_query_option, encode_mqtype_response_option, find_mqtype_option,
+    EDNS_OPTION_MQTYPE_QUERY, EDNS_OPTION_MQTYPE_RESPONSE,
+};
+pub use multi_qtype_cache::MultiQTypeCache;
 pub use wire::{
     DnsClass, DnsFormatError, DnsMessage, DnsQueryIdGenerator, DnsQuestion, DnsResourceRecord,
     DnsType,
