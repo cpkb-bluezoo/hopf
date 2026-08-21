@@ -13,6 +13,13 @@ pub const SETTINGS: u64 = 0x04;
 /// GOAWAY frame type.
 pub const GOAWAY: u64 = 0x07;
 
+/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (RFC 9204 §5) — decoder's advertised
+/// dynamic-table capacity ceiling for the peer encoder. Default if absent: 0.
+pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
+/// `SETTINGS_QPACK_BLOCKED_STREAMS` (RFC 9204 §5) — how many streams the
+/// decoder is willing to block. Default if absent: 0. hopf always sends 0
+/// (non-blocking encoder policy).
+pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;
 /// `SETTINGS_ENABLE_CONNECT_PROTOCOL` identifier (RFC 9220).
 pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
 
@@ -72,9 +79,22 @@ pub fn parse_goaway(payload: &[u8]) -> Option<u64> {
     varint::decode(payload).map(|(id, _)| id)
 }
 
-/// Append a SETTINGS frame advertising Extended CONNECT (RFC 9220).
-pub fn write_settings(out: &mut Vec<u8>) {
+/// Append a SETTINGS frame advertising QPACK parameters (RFC 9204 §5) and
+/// Extended CONNECT (RFC 9220).
+///
+/// `qpack_max_table_capacity` is this endpoint's decoder ceiling (what the
+/// peer encoder may grow to); `qpack_blocked_streams` is how many streams
+/// we are willing to block — hopf always passes `0`.
+pub fn write_settings(
+    out: &mut Vec<u8>,
+    qpack_max_table_capacity: u64,
+    qpack_blocked_streams: u64,
+) {
     let mut payload = Vec::new();
+    varint::encode(&mut payload, SETTINGS_QPACK_MAX_TABLE_CAPACITY);
+    varint::encode(&mut payload, qpack_max_table_capacity);
+    varint::encode(&mut payload, SETTINGS_QPACK_BLOCKED_STREAMS);
+    varint::encode(&mut payload, qpack_blocked_streams);
     varint::encode(&mut payload, SETTINGS_ENABLE_CONNECT_PROTOCOL);
     varint::encode(&mut payload, 1);
     write_frame(out, SETTINGS, &payload);
@@ -105,7 +125,7 @@ mod tests {
     #[test]
     fn write_settings_round_trips_through_parse_settings() {
         let mut out = Vec::new();
-        write_settings(&mut out);
+        write_settings(&mut out, 4096, 0);
         // Strip the frame type+length prefix to get just the payload, as a
         // real receiver would after `H3Parser` hands it a SETTINGS frame.
         let (ty, ty_len) = varint::decode(&out).unwrap();
@@ -114,7 +134,14 @@ mod tests {
         let payload = &out[ty_len + len_len..ty_len + len_len + len as usize];
 
         let parsed = parse_settings(payload);
-        assert_eq!(parsed, vec![(SETTINGS_ENABLE_CONNECT_PROTOCOL, 1)]);
+        assert_eq!(
+            parsed,
+            vec![
+                (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 4096),
+                (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+                (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
+            ]
+        );
     }
 
     #[test]

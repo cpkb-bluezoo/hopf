@@ -6,10 +6,9 @@
 //! and post-base references — since a real peer encoder isn't obligated to
 //! follow hopf's own non-blocking encoding policy. The one thing this
 //! decoder does not do is *buffer and wait* for a blocked stream: since we
-//! never advertise `SETTINGS_QPACK_BLOCKED_STREAMS` (default 0, RFC 9204
-//! §5), a compliant peer never sends a Required Insert Count we can't
-//! already satisfy, so [`DecodeError::Blocked`] should never occur against
-//! a compliant encoder.
+//! advertise `SETTINGS_QPACK_BLOCKED_STREAMS = 0` (RFC 9204 §5), a compliant
+//! peer never sends a Required Insert Count we can't already satisfy, so
+//! [`DecodeError::Blocked`] should never occur against a compliant encoder.
 
 use super::dynamic::DynamicTable;
 use super::encoder_stream::EncoderInstruction;

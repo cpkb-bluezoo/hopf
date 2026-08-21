@@ -21,14 +21,12 @@ mod strings;
 pub use decode::{decode, DecodeError};
 pub use encode::encode;
 
-/// Dynamic-table capacity hopf uses for both its own encoder's table and
-/// its mirror of the peer's, advertised via
-/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY`. RFC 9204 permits a peer to
-/// advertise a smaller value and expect the encoder to respect it; hopf
-/// doesn't currently react to that (a real interop edge case against a
-/// constrained third-party peer, not exercised by hopf-to-hopf traffic
-/// since both ends use this same constant).
-const MAX_TABLE_CAPACITY: usize = 4096;
+/// Dynamic-table capacity hopf uses for its own decoder (advertised via
+/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY`) and as the upper bound for its
+/// encoder once the peer advertises a non-zero capacity. Until peer
+/// SETTINGS arrive, RFC 9204 §5 defaults the peer's max to 0 — the encoder
+/// must not grow the dynamic table.
+pub(crate) const MAX_TABLE_CAPACITY: usize = 4096;
 
 /// Per-connection QPACK state: our own encoder (for outgoing field
 /// sections, growing our dynamic table) and our mirror of the peer's
@@ -45,16 +43,34 @@ pub(crate) struct H3Qpack {
 
 impl H3Qpack {
     pub(crate) fn new() -> Self {
-        let mut enc = encoder::Encoder::new(0);
-        // RFC 9204 §4.3.1: an encoder must announce its capacity before
-        // any insertion. Queue it now; the caller flushes it (along with
-        // everything else) once the encoder stream is actually open.
-        let initial = enc.set_capacity(MAX_TABLE_CAPACITY);
+        // Encoder starts at capacity 0: RFC 9204 §5 defaults the peer's
+        // SETTINGS_QPACK_MAX_TABLE_CAPACITY to 0 until SETTINGS arrives.
+        // Decoder uses our advertised ceiling immediately.
         Self {
-            encoder: Mutex::new(enc),
+            encoder: Mutex::new(encoder::Encoder::new(0)),
             decoder: Mutex::new(decoder::Decoder::new(MAX_TABLE_CAPACITY)),
-            pending_encoder_stream: Mutex::new(initial),
+            pending_encoder_stream: Mutex::new(Vec::new()),
             pending_decoder_stream: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Apply the peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY` as our encoder's
+    /// ceiling (clamped to [`MAX_TABLE_CAPACITY`]). Queues a Set Dynamic
+    /// Table Capacity instruction when the value actually changes.
+    pub(crate) fn apply_peer_max_table_capacity(&self, peer_max: u64) {
+        let cap = usize::try_from(peer_max)
+            .unwrap_or(usize::MAX)
+            .min(MAX_TABLE_CAPACITY);
+        let mut enc = self.encoder.lock().unwrap();
+        if enc.capacity() == cap {
+            return;
+        }
+        let instructions = enc.set_capacity(cap);
+        if !instructions.is_empty() {
+            self.pending_encoder_stream
+                .lock()
+                .unwrap()
+                .extend_from_slice(&instructions);
         }
     }
 
@@ -148,6 +164,11 @@ impl H3Qpack {
             std::mem::take(&mut *self.pending_decoder_stream.lock().unwrap()),
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn encoder_capacity_for_test(&self) -> usize {
+        self.encoder.lock().unwrap().capacity()
+    }
 }
 
 #[cfg(test)]
@@ -165,8 +186,16 @@ mod h3qpack_tests {
         let client = H3Qpack::new();
         let server = H3Qpack::new();
 
-        // Each side's initial "Set Dynamic Table Capacity" announcement.
+        // Simulate SETTINGS exchange: each side learns the peer's
+        // SETTINGS_QPACK_MAX_TABLE_CAPACITY and may then grow its encoder.
+        assert_eq!(client.encoder_capacity_for_test(), 0);
+        client.apply_peer_max_table_capacity(MAX_TABLE_CAPACITY as u64);
+        server.apply_peer_max_table_capacity(MAX_TABLE_CAPACITY as u64);
+        assert_eq!(client.encoder_capacity_for_test(), MAX_TABLE_CAPACITY);
+
+        // Each side's "Set Dynamic Table Capacity" announcement.
         let (mut client_enc_out, _) = client.take_pending();
+        assert!(!client_enc_out.is_empty(), "expected set-capacity after peer SETTINGS");
         server.feed_encoder_stream(&mut client_enc_out).unwrap();
         let (mut server_enc_out, _) = server.take_pending();
         client.feed_encoder_stream(&mut server_enc_out).unwrap();
@@ -196,6 +225,27 @@ mod h3qpack_tests {
 
         let fields2 = server.decode_field_section(1, &section2).unwrap();
         assert_eq!(fields2, vec![("x-custom".into(), "widget".into())]);
+    }
+
+    #[test]
+    fn encoder_stays_at_zero_until_peer_advertises_capacity() {
+        let q = H3Qpack::new();
+        assert_eq!(q.encoder_capacity_for_test(), 0);
+        // Peer SETTINGS omitted the setting → default 0; still no growth.
+        q.apply_peer_max_table_capacity(0);
+        assert_eq!(q.encoder_capacity_for_test(), 0);
+        let (pending, _) = q.take_pending();
+        assert!(pending.is_empty(), "capacity 0→0 must not emit a set-capacity");
+
+        // Peer advertises less than our ceiling — honor their value.
+        q.apply_peer_max_table_capacity(1024);
+        assert_eq!(q.encoder_capacity_for_test(), 1024);
+        let (pending, _) = q.take_pending();
+        assert!(!pending.is_empty());
+
+        // Peer advertises more than our ceiling — clamp.
+        q.apply_peer_max_table_capacity(u64::from(u32::MAX));
+        assert_eq!(q.encoder_capacity_for_test(), MAX_TABLE_CAPACITY);
     }
 }
 
