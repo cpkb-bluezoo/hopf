@@ -140,8 +140,10 @@ impl QuicDriverHandle {
     /// Intended for connection reuse (e.g. DNS-over-QUIC: one QUIC
     /// connection, one stream per query). Returns `Err` if the driver is
     /// gone or there is no usable client connection — callers should dial
-    /// fresh in that case. If the handshake is still in progress the open
-    /// is queued and applied once [`Event::Connected`] fires.
+    /// fresh in that case. If the handshake is still in progress and
+    /// 0-RTT is not available the open is queued and applied once
+    /// [`Event::Connected`] fires; when [`Connection::has_0rtt`] is true
+    /// the stream is opened immediately so data can ride as early data.
     pub fn open_bi(&self, factory: HandlerFactory) -> io::Result<()> {
         if !self.active.load(Ordering::Acquire) {
             return Err(io::Error::new(
@@ -342,10 +344,14 @@ struct ConnSlot {
     conn: Connection,
     remote: SocketAddr,
     streams: HashMap<StreamId, StreamSlot>,
-    /// Client: open first bi stream after Connected.
+    /// Client: still waiting to open the first bi stream (and drain any
+    /// queued [`DriverCmd::OpenBi`]s). Cleared once those opens run —
+    /// either immediately after `connect()` when [`Connection::has_0rtt`]
+    /// is true, or later in [`Driver::on_connected`].
     client_pending_open: bool,
     /// Client: additional [`DriverCmd::OpenBi`] requests that arrived
-    /// before the handshake completed — drained in [`Driver::on_connected`].
+    /// before the first-stream open ran — drained by
+    /// [`Driver::open_pending_client_streams`].
     pending_open_bi: std::collections::VecDeque<HandlerFactory>,
     /// Hooks-mode application connection (H3).
     app: Option<Box<dyn QuicConnection>>,
@@ -560,6 +566,7 @@ impl Driver {
                 &server_name,
             ) {
                 Ok((ch, conn)) => {
+                    let early = pending_open && conn.has_0rtt();
                     self.connections.insert(
                         ch,
                         ConnSlot {
@@ -572,6 +579,17 @@ impl Driver {
                             local_keys: HashMap::new(),
                         },
                     );
+                    // 0-RTT: open the first bi stream (and any queued
+                    // open_bi) right away so application writes can leave
+                    // with the ClientHello. Drive the new stream before the
+                    // main loop's first flush so early data is not left
+                    // sitting only in handler out-queues.
+                    if early {
+                        #[cfg(all(test, feature = "integration"))]
+                        early_open_probe::note();
+                        self.open_pending_client_streams(ch);
+                        self.drive_streams(ch, now);
+                    }
                 }
                 Err(e) => {
                     eprintln!("hopf-quic connect: {e}");
@@ -704,16 +722,24 @@ impl Driver {
                 "no QUIC connection to open a stream on",
             ));
         };
-        let pending = self
+        let (pending, has_0rtt) = self
             .connections
             .get(&ch)
-            .map(|s| s.client_pending_open)
-            .unwrap_or(true);
-        if pending {
+            .map(|s| (s.client_pending_open, s.conn.has_0rtt()))
+            .unwrap_or((true, false));
+        // Without 0-RTT, wait for Event::Connected. With 0-RTT available,
+        // open immediately (and clear the first-stream pending latch if it
+        // is still set — e.g. a raced open_bi before run() finished the
+        // early-open path).
+        if pending && !has_0rtt {
             if let Some(slot) = self.connections.get_mut(&ch) {
                 slot.pending_open_bi.push_back(factory);
             }
             return Ok(());
+        }
+        if pending {
+            // Promote the dial's factory stream first, then this open_bi.
+            self.open_pending_client_streams(ch);
         }
         let Some(id) = self
             .connections
@@ -898,37 +924,9 @@ impl Driver {
             return;
         }
 
-        let open_client = matches!(
-            (
-                &self.mode,
-                self.connections.get(&ch).map(|s| s.client_pending_open)
-            ),
-            (DriverMode::Client { .. }, Some(true))
-        );
-        if open_client {
-            if let Some(slot) = self.connections.get_mut(&ch) {
-                slot.client_pending_open = false;
-                if let Some(id) = slot.conn.streams().open(Dir::Bi) {
-                    self.attach_stream_dir(ch, id, Dir::Bi);
-                }
-            }
-            // Drain any open_bi requests that arrived during the handshake.
-            let pending: Vec<HandlerFactory> = self
-                .connections
-                .get_mut(&ch)
-                .map(|s| s.pending_open_bi.drain(..).collect())
-                .unwrap_or_default();
-            for factory in pending {
-                let Some(id) = self
-                    .connections
-                    .get_mut(&ch)
-                    .and_then(|s| s.conn.streams().open(Dir::Bi))
-                else {
-                    break;
-                };
-                self.attach_stream_with_factory(ch, id, factory);
-            }
-        }
+        // Plain client: open the first bi stream once Connected (unless
+        // 0-RTT already did so right after connect()).
+        self.open_pending_client_streams(ch);
         if matches!(self.mode, DriverMode::Server { .. }) {
             while let Some(id) = self
                 .connections
@@ -937,6 +935,46 @@ impl Driver {
             {
                 self.attach_stream_dir(ch, id, Dir::Bi);
             }
+        }
+    }
+
+    /// Open the dial's first bi stream and drain any queued `open_bi`
+    /// factories. No-op unless this is a plain client still marked
+    /// `client_pending_open`. Called from the 0-RTT path right after
+    /// `connect()`, from [`Self::on_connected`] for the 1-RTT path, and
+    /// from [`Self::open_bi_stream`] when a late `open_bi` races with an
+    /// available 0-RTT window.
+    fn open_pending_client_streams(&mut self, ch: ConnectionHandle) {
+        let open_client = matches!(
+            (
+                &self.mode,
+                self.connections.get(&ch).map(|s| s.client_pending_open)
+            ),
+            (DriverMode::Client { .. }, Some(true))
+        );
+        if !open_client {
+            return;
+        }
+        if let Some(slot) = self.connections.get_mut(&ch) {
+            slot.client_pending_open = false;
+            if let Some(id) = slot.conn.streams().open(Dir::Bi) {
+                self.attach_stream_dir(ch, id, Dir::Bi);
+            }
+        }
+        let pending: Vec<HandlerFactory> = self
+            .connections
+            .get_mut(&ch)
+            .map(|s| s.pending_open_bi.drain(..).collect())
+            .unwrap_or_default();
+        for factory in pending {
+            let Some(id) = self
+                .connections
+                .get_mut(&ch)
+                .and_then(|s| s.conn.streams().open(Dir::Bi))
+            else {
+                break;
+            };
+            self.attach_stream_with_factory(ch, id, factory);
         }
     }
 
@@ -1421,6 +1459,28 @@ impl Driver {
     }
 }
 
+
+/// Integration-test seam: set when the client driver opens its first bi
+/// stream immediately after `connect()` because [`Connection::has_0rtt`]
+/// was true (see `early_data_second_dial_opens_stream_before_connected`).
+#[cfg(all(test, feature = "integration"))]
+mod early_open_probe {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static DID_EARLY_OPEN: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn reset() {
+        DID_EARLY_OPEN.store(false, Ordering::SeqCst);
+    }
+
+    pub(super) fn note() {
+        DID_EARLY_OPEN.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn took() -> bool {
+        DID_EARLY_OPEN.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Default)]
 struct ConnRecorder {
@@ -1992,6 +2052,79 @@ mod tests {
         let close = crate::connection_close_error(err).expect("QuicConnectionCloseError");
         assert!(close.application_error);
         assert_eq!(close.error_code, APP_CODE);
+
+        server.shutdown();
+    }
+
+    /// With early data opted in on both peers and a shared client config
+    /// (so rustls can cache the session ticket), the second dial must open
+    /// its first bi stream immediately after `connect()` — before
+    /// `Event::Connected` — so application writes can ride as 0-RTT.
+    #[test]
+    fn early_data_second_dial_opens_stream_before_connected() {
+        use crate::config::{
+            client_config_for_pem_bytes_with, server_config_self_signed_with, QuicTlsOptions,
+        };
+
+        let tls = QuicTlsOptions::new().with_early_data();
+        let (server_cfg, pem) =
+            server_config_self_signed_with(&["localhost"], &[b"hq-interop"], tls).unwrap();
+        let client_cfg =
+            client_config_for_pem_bytes_with(&pem, &[b"hq-interop"], tls).unwrap();
+
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        let echo_once = |client_cfg: Arc<crate::QuicClientConfig>| {
+            let got = Arc::new(StdMutex::new(Vec::new()));
+            let got2 = Arc::clone(&got);
+            let client = connect_quic(QuicConnectConfig::new(
+                server.local_addr,
+                client_cfg,
+                "localhost",
+                Arc::new(move || {
+                    Box::new(ClientProbe {
+                        sent: false,
+                        got: Arc::clone(&got2),
+                    }) as Box<dyn ProtocolHandler>
+                }),
+            ))
+            .unwrap();
+            for _ in 0..200 {
+                if got.lock().unwrap().as_slice() == b"ping" {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(got.lock().unwrap().as_slice(), b"ping");
+            client.shutdown();
+        };
+
+        // First dial: full handshake, fills the rustls session-ticket cache.
+        early_open_probe::reset();
+        echo_once(Arc::clone(&client_cfg));
+        assert!(
+            !early_open_probe::took(),
+            "cold dial must not 0-RTT-open (no ticket yet)"
+        );
+
+        // Second dial: same ClientConfig Arc → ticket available → has_0rtt.
+        early_open_probe::reset();
+        echo_once(Arc::clone(&client_cfg));
+        for _ in 0..50 {
+            if early_open_probe::took() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            early_open_probe::took(),
+            "resumed dial with early data enabled must open the first stream before Connected"
+        );
 
         server.shutdown();
     }
