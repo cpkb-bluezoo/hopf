@@ -464,6 +464,10 @@ impl FtpControlHandler {
             FtpCommand::Rnto(_) => self.cmd_rnto(endpoint, arg),
             FtpCommand::Rest(_) => self.cmd_rest(endpoint, arg),
             FtpCommand::Abor => {
+                // Drop any stashed offloaded-open outcome so a later
+                // `sync_pending_open` cannot revive it if the captured
+                // bridge Arc somehow diverged from `self.bridge`.
+                let _ = self.pending_open.lock().unwrap().take();
                 let in_progress = self
                     .bridge
                     .as_ref()
@@ -1488,11 +1492,17 @@ impl ProtocolHandler for FtpControlHandler {
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        sync_pending_open(self, endpoint);
+        // Dispatch first so an `ABOR` in this burst can mark the bridge
+        // aborted before [`sync_pending_open`] applies a RETR/STOR that
+        // finished on the storage pool between commands (otherwise a
+        // completed open stashed in `pending_open` would send 150, then
+        // ABOR would reply 426/226 — the flake seen on CI for
+        // `abor_racing_ahead_of_a_pending_open_suppresses_the_transfer`).
         let cmds = self.lexer.feed(data);
         for cmd in cmds {
             self.dispatch(endpoint, cmd);
         }
+        sync_pending_open(self, endpoint);
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -1797,6 +1807,10 @@ mod open_offload_tests {
     /// open (sent in the same synchronous burst, before the storage-pool
     /// callback has had a chance to run) must suppress the transfer once
     /// the open does complete — no stray 150, no double reply.
+    ///
+    /// Also covers the inverse timing: open already completed and stashed
+    /// in `pending_open` before `ABOR` is dispatched — `receive` must
+    /// process `ABOR` before `sync_pending_open`, otherwise a 150 leaks.
     #[test]
     fn abor_racing_ahead_of_a_pending_open_suppresses_the_transfer() {
         let root = tempfile::tempdir().unwrap();
@@ -1810,6 +1824,14 @@ mod open_offload_tests {
         login_and_pasv(&mut h, &mut ep);
 
         feed(&mut h, &mut ep, b"RETR hello.txt\r\n");
+        // Wait until the offloaded open has stashed its outcome. (The mock
+        // ConnHandle is execute-only, so the completion callback's
+        // `with_endpoint` poke is a no-op — `busy` stays set — but
+        // `pending_open` is still filled before that call.)
+        assert!(
+            wait_for(|| h.pending_open.lock().unwrap().is_some(), 2000),
+            "offloaded open must stash a pending outcome"
+        );
         feed(&mut h, &mut ep, b"ABOR\r\n");
         let after_abor = ep.sent.clone();
         assert!(!after_abor.is_empty(), "ABOR must reply promptly");
@@ -1819,9 +1841,9 @@ mod open_offload_tests {
             String::from_utf8_lossy(&after_abor)
         );
 
-        // Give the offloaded open time to resolve, then confirm
-        // `sync_pending_open` didn't queue (or reply for) it.
-        std::thread::sleep(Duration::from_millis(200));
+        // Give any late poke a chance, then confirm sync_pending_open
+        // did not queue (or reply for) the aborted open.
+        std::thread::sleep(Duration::from_millis(50));
         feed(&mut h, &mut ep, b"");
         assert_eq!(
             ep.sent, after_abor,
