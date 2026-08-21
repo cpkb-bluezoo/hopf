@@ -2,6 +2,7 @@
 
 //! HTTP/3 server connection and request-stream adapters.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,6 +14,7 @@ use hopf_quic::{
     QuicListenHooksConfig, QuicServerConfig,
 };
 
+use crate::priority::PriorityParams;
 use crate::stream::{
     ProtocolUpgradeHandler, ServerHandler, ServerHandlerFactory, ServerResponseHandle, ServerWriter,
 };
@@ -195,6 +197,8 @@ struct H3Writer {
     stream_id: u64,
     qpack: Arc<qpack::H3Qpack>,
     peer_state: Arc<Mutex<H3PeerState>>,
+    /// RFC 9218 priority for this request stream.
+    priority: PriorityParams,
 }
 
 impl H3Writer {
@@ -204,6 +208,7 @@ impl H3Writer {
             stream_id,
             qpack,
             peer_state,
+            priority: PriorityParams::default(),
         }
     }
 
@@ -248,6 +253,14 @@ impl H3Writer {
         };
         let headers_sent = self.control.shared.lock().unwrap().headers_sent;
 
+        // Prefer the latest PRIORITY_UPDATE over the header snapshot.
+        {
+            let state = self.peer_state.lock().unwrap();
+            if let Some(p) = state.stream_priority.get(&self.stream_id) {
+                self.priority = *p;
+            }
+        }
+
         if let Some(ref headers) = headers {
             if self.exceeds_peer_field_section_limit(headers) {
                 // RFC 9114 §4.2.2: SHOULD NOT send a field section over the
@@ -276,11 +289,24 @@ impl H3Writer {
                 .encode_field_section(self.stream_id, headers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
             frame::write_headers(&mut out, &block);
             self.control.shared.lock().unwrap().headers_sent = true;
+            // Apply RFC 9218 urgency to the QUIC stream send scheduler.
+            endpoint.set_stream_priority(self.priority.quinn_priority());
         } else if !headers_sent && body.is_empty() && trailers.is_none() {
             return;
         }
+
+        let body = body;
         if !body.is_empty() {
-            frame::write_data(&mut out, &body);
+            let allowed = {
+                let mut state = self.peer_state.lock().unwrap();
+                claim_non_inc_slot(&mut state, self.stream_id, self.priority)
+            };
+            if allowed {
+                frame::write_data(&mut out, &body);
+            } else {
+                // Hold body until the active non-incremental peer finishes.
+                self.control.shared.lock().unwrap().body = body;
+            }
         }
         if let Some(trailers) = trailers {
             let block = self
@@ -292,6 +318,11 @@ impl H3Writer {
             endpoint.send(&out);
         }
         if complete {
+            {
+                let mut state = self.peer_state.lock().unwrap();
+                release_non_inc_slot(&mut state, self.stream_id, self.priority);
+                state.stream_priority.remove(&self.stream_id);
+            }
             endpoint.close();
         }
     }
@@ -581,6 +612,15 @@ impl H3FrameHandler for H3RequestStream {
             headers.add(name, value);
         }
         self.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);
+        {
+            let mut state = self.writer.peer_state.lock().unwrap();
+            let params = state
+                .stream_priority
+                .remove(&self.stream_id)
+                .unwrap_or_else(|| PriorityParams::from_headers(&headers));
+            state.stream_priority.insert(self.stream_id, params);
+            self.writer.priority = params;
+        }
         let mut handler = self.factory.create_handler();
         handler.headers(&mut self.writer, &headers);
         if let Some(up) = self.writer.control.take_upgrade() {
@@ -603,6 +643,14 @@ impl H3FrameHandler for H3RequestStream {
     }
     fn max_push_id_frame(&mut self, _: &[u8]) {
         // MAX_PUSH_ID is control-stream only (RFC 9114 §7.2.7).
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
+    fn priority_update_request_frame(&mut self, _: &[u8]) {
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
+    fn priority_update_push_frame(&mut self, _: &[u8]) {
         self.connection_error
             .get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
@@ -719,6 +767,33 @@ pub(crate) struct H3PeerState {
     /// error. On the client, any value here also blocks further
     /// [`crate::h3::client::H3ClientConnection`] `open_bi` calls.
     pub(crate) goaway_received: Option<u64>,
+    /// PRIORITY_UPDATE / Priority header — latest signal per request stream.
+    pub(crate) stream_priority: HashMap<u64, PriorityParams>,
+    /// Per-urgency active non-incremental stream (RFC 9218 §4.2 / §10).
+    pub(crate) non_inc_active: [Option<u64>; 8],
+}
+
+fn claim_non_inc_slot(state: &mut H3PeerState, stream_id: u64, p: PriorityParams) -> bool {
+    if p.incremental {
+        return true;
+    }
+    let slot = &mut state.non_inc_active[p.urgency as usize];
+    match *slot {
+        None => {
+            *slot = Some(stream_id);
+            true
+        }
+        Some(id) => id == stream_id,
+    }
+}
+
+fn release_non_inc_slot(state: &mut H3PeerState, stream_id: u64, p: PriorityParams) {
+    if p.incremental {
+        return;
+    }
+    if state.non_inc_active[p.urgency as usize] == Some(stream_id) {
+        state.non_inc_active[p.urgency as usize] = None;
+    }
 }
 
 /// What an [`H3UniStream`] does with bytes once its type byte is known.
@@ -952,6 +1027,49 @@ impl H3FrameHandler for H3UniStream {
         }
         state.goaway_received = Some(id);
     }
+
+    fn priority_update_request_frame(&mut self, payload: &[u8]) {
+        if !self.settings_received {
+            self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
+            return;
+        }
+        // Servers MUST NOT send PRIORITY_UPDATE (RFC 9218 §7.2).
+        if self.is_client {
+            self.connection_error
+                .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+            return;
+        }
+        let Some((stream_id, value)) = frame::parse_priority_update_request(payload) else {
+            self.connection_error
+                .get_or_insert(frame::H3_GENERAL_PROTOCOL_ERROR);
+            return;
+        };
+        if stream_id % 4 != 0 {
+            self.connection_error.get_or_insert(frame::H3_ID_ERROR);
+            return;
+        }
+        let params = PriorityParams::parse(value);
+        self.peer_state
+            .lock()
+            .unwrap()
+            .stream_priority
+            .insert(stream_id, params);
+    }
+
+    fn priority_update_push_frame(&mut self, _payload: &[u8]) {
+        if !self.settings_received {
+            self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
+            return;
+        }
+        if self.is_client {
+            self.connection_error
+                .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+            return;
+        }
+        // hopf never pushes — any push PRIORITY_UPDATE is an ID error.
+        self.connection_error.get_or_insert(frame::H3_ID_ERROR);
+    }
+
     fn cancel_push_frame(&mut self, _payload: &[u8]) {
         if !self.settings_received {
             self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);

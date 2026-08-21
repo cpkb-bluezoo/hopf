@@ -467,7 +467,7 @@
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li><strong>No HTTP/2 server push</strong> — <code>PUSH_PROMISE</code> is rejected (client: <code>RST_STREAM</code>; server: <code>GOAWAY</code>).</li>
-<li><strong>H2 PRIORITY frames</strong> are ignored (deprecated by the RFCs).</li>
+<li><strong>H2 PRIORITY frames</strong> (RFC 7540) are ignored; hopf uses RFC 9218 Extensible Prioritization (<code>Priority</code> header + <code>PRIORITY_UPDATE</code>) with urgency/incremental scheduling.</li>
 <li><strong>HTTP/1.1 trailers</strong> are ignored on the wire (parity gap with Gumdrop). H2/H3 trailers work as a second HEADERS frame (<code>ServerWriter::trailers</code> / <code>ClientHandler::response_trailers</code>).</li>
 <li>UDP / QUIC for H3 lives in <code>hopf-quic</code> and is feature-gated (<code>h3</code>).</li>
 <li>Several declared deps (<code>tractrix</code>, <code>rjsonparser</code>, <code>rmimeparser</code>) support later protocol crates, not the Stream SPI itself.</li>

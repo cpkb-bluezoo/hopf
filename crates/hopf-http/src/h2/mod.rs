@@ -35,8 +35,10 @@
 //!   server-push streams received as a client; server side rejects
 //!   PUSH_PROMISE with GOAWAY per RFC 9113 §8.4.
 //!   TODO: server push.
-//! - **PRIORITY frames** are deprecated in RFC 9113 and silently ignored.
-//!   TODO: priority (deprecated).
+//! - PRIORITY frames (RFC 7540) are deprecated in RFC 9113 and ignored.
+//! - Capsule Protocol (RFC 9297) on upgraded streams with `Capsule-Protocol: ?1`.
+//! - Extensible Prioritization (RFC 9218) is **implemented** (`Priority` /
+//!   `PRIORITY_UPDATE` + urgency scheduling).
 
 pub mod flow;
 pub mod frame;

@@ -240,6 +240,15 @@ impl Endpoint for QuicStreamEndpoint {
         Ok(())
     }
 
+    fn set_stream_priority(&mut self, priority: i32) {
+        let _ = self.cmd_tx.send(DriverCmd::SetStreamPriority {
+            conn: self.conn,
+            stream_id: self.stream_id,
+            priority,
+        });
+        self.wake();
+    }
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local)
     }

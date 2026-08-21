@@ -163,6 +163,10 @@ pub trait Endpoint: Send {
             "datagrams not supported on this endpoint",
         ))
     }
+
+    /// Set this stream's send priority on the underlying QUIC connection
+    /// (higher = sooner). Used for RFC 9218 urgency. Default: ignore.
+    fn set_stream_priority(&mut self, _priority: i32) {}
 }
 
 /// Callback type for [`Endpoint::on_write_ready`].

@@ -82,6 +82,12 @@ pub(crate) enum DriverCmd {
         conn: ConnectionHandle,
         payload: Vec<u8>,
     },
+    /// Set send priority for a stream (RFC 9218 via quinn-proto).
+    SetStreamPriority {
+        conn: ConnectionHandle,
+        stream_id: StreamId,
+        priority: i32,
+    },
     Shutdown,
 }
 
@@ -759,6 +765,15 @@ impl Driver {
                         let _ = slot.conn.datagrams().send(Bytes::from(payload), true);
                     }
                 }
+                DriverCmd::SetStreamPriority {
+                    conn,
+                    stream_id,
+                    priority,
+                } => {
+                    if let Some(slot) = self.connections.get_mut(&conn) {
+                        let _ = slot.conn.send_stream(stream_id).set_priority(priority);
+                    }
+                }
             }
         }
     }
@@ -1120,6 +1135,17 @@ impl Driver {
                 RecorderAction::SendDatagram { data } => {
                     if let Some(slot) = self.connections.get_mut(&ch) {
                         let _ = slot.conn.datagrams().send(Bytes::from(data), true);
+                    }
+                }
+                RecorderAction::SetStreamPriority {
+                    stream_id,
+                    priority,
+                } => {
+                    if let Some(slot) = self.connections.get_mut(&ch) {
+                        if let Ok(vid) = VarInt::from_u64(stream_id) {
+                            let sid = StreamId::from(vid);
+                            let _ = slot.conn.send_stream(sid).set_priority(priority);
+                        }
                     }
                 }
             }
@@ -1654,6 +1680,7 @@ enum RecorderAction {
     Write { key: u64, data: Vec<u8> },
     Finish { key: u64 },
     SendDatagram { data: Vec<u8> },
+    SetStreamPriority { stream_id: u64, priority: i32 },
 }
 
 impl QuicConnApi for ConnRecorder {
@@ -1693,6 +1720,13 @@ impl QuicConnApi for ConnRecorder {
             data: payload.to_vec(),
         });
         Ok(())
+    }
+
+    fn set_stream_priority(&mut self, stream_id: u64, priority: i32) {
+        self.actions.push(RecorderAction::SetStreamPriority {
+            stream_id,
+            priority,
+        });
     }
 }
 

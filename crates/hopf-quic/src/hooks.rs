@@ -107,4 +107,9 @@ pub trait QuicConnApi {
             "datagrams not supported by this QuicConnApi",
         ))
     }
+
+    /// Set quinn-proto send priority for a stream (higher = sooner). Used by
+    /// HTTP/3 to apply RFC 9218 urgency. `stream_id` is the real QUIC id.
+    /// Default: ignore.
+    fn set_stream_priority(&mut self, _stream_id: u64, _priority: i32) {}
 }

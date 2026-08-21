@@ -15,6 +15,7 @@ pub mod capsule;
 pub mod client;
 pub mod h1;
 pub mod h2;
+pub mod priority;
 pub mod server;
 #[cfg(feature = "h3")]
 pub mod h3;
@@ -70,6 +71,9 @@ pub use h3::{
 };
 pub use headers::{Header, Headers};
 pub use limits::HttpLimits;
+pub use priority::{
+    PriorityParams, DEFAULT_URGENCY, PRIORITY_HEADER, URGENCY_HIGHEST, URGENCY_LOWEST,
+};
 pub use status::reason_phrase;
 pub use stream::{
     ClientHandler, ClientHandlerFactory, ClientWriter, ConnectionInfo, HttpRole, HttpStream,
