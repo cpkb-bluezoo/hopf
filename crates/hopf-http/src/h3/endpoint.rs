@@ -81,6 +81,7 @@ impl QuicConnection for H3ServerConnection {
                 &mut bytes,
                 qpack::MAX_TABLE_CAPACITY as u64,
                 0, // SETTINGS_QPACK_BLOCKED_STREAMS — non-blocking encoder
+                frame::DEFAULT_MAX_FIELD_SECTION_SIZE,
             );
             api.write(stream, &bytes);
             self.control_stream_key = Some(stream);
@@ -104,6 +105,7 @@ impl QuicConnection for H3ServerConnection {
             self.limits,
             stream_id,
             Arc::clone(&self.qpack),
+            Arc::clone(&self.peer_state),
         ))
     }
 
@@ -160,19 +162,33 @@ struct H3Writer {
     control: Arc<H3ResponseControl>,
     stream_id: u64,
     qpack: Arc<qpack::H3Qpack>,
+    peer_state: Arc<Mutex<H3PeerState>>,
 }
 
 impl H3Writer {
-    fn new(stream_id: u64, qpack: Arc<qpack::H3Qpack>) -> Self {
+    fn new(stream_id: u64, qpack: Arc<qpack::H3Qpack>, peer_state: Arc<Mutex<H3PeerState>>) -> Self {
         Self {
             control: H3ResponseControl::new(),
             stream_id,
             qpack,
+            peer_state,
         }
     }
 
     fn session_writer(&mut self) -> H3SessionWriter {
         self.control.writer()
+    }
+
+    fn exceeds_peer_field_section_limit(&self, headers: &Headers) -> bool {
+        let Some(max) = self.peer_state.lock().unwrap().peer_max_field_section_size else {
+            return false; // unlimited
+        };
+        let size = frame::field_section_size(
+            headers
+                .iter()
+                .map(|h| (h.name.as_str(), h.value.as_str())),
+        );
+        size as u64 > max
     }
 
     fn flush(&mut self, endpoint: &mut dyn Endpoint) {
@@ -199,6 +215,21 @@ impl H3Writer {
             shared.complete && (!upgraded || shared.upgrade_fin)
         };
         let headers_sent = self.control.shared.lock().unwrap().headers_sent;
+
+        if let Some(ref headers) = headers {
+            if self.exceeds_peer_field_section_limit(headers) {
+                // RFC 9114 §4.2.2: SHOULD NOT send a field section over the
+                // peer's advertised ceiling.
+                endpoint.abort(frame::H3_EXCESSIVE_LOAD);
+                return;
+            }
+        }
+        if let Some(ref trailers) = trailers {
+            if self.exceeds_peer_field_section_limit(trailers) {
+                endpoint.abort(frame::H3_EXCESSIVE_LOAD);
+                return;
+            }
+        }
 
         let mut out = Vec::new();
         if let Some(mut headers) = headers {
@@ -293,7 +324,6 @@ impl ServerWriter for H3Writer {
 /// A peer-initiated HTTP/3 request stream.
 struct H3RequestStream {
     factory: Arc<dyn ServerHandlerFactory>,
-    #[allow(dead_code)]
     limits: HttpLimits,
     stream_id: u64,
     qpack: Arc<qpack::H3Qpack>,
@@ -312,13 +342,22 @@ struct H3RequestStream {
     /// `receive()`'s tail, where an `Endpoint` is available to close the
     /// connection (RFC 9204 §4.5.1: `QPACK_DECOMPRESSION_FAILED`).
     qpack_error: bool,
+    /// Oversized field section (count or `SETTINGS_MAX_FIELD_SECTION_SIZE`)
+    /// — stream error `H3_EXCESSIVE_LOAD` in `receive()`'s tail.
+    excessive_load: bool,
     /// Set for connection-level frame violations (push frames, etc.) —
     /// checked in `receive()`'s tail via `close_connection`.
     connection_error: Option<u32>,
 }
 
 impl H3RequestStream {
-    fn new(factory: Arc<dyn ServerHandlerFactory>, limits: HttpLimits, stream_id: u64, qpack: Arc<qpack::H3Qpack>) -> Self {
+    fn new(
+        factory: Arc<dyn ServerHandlerFactory>,
+        limits: HttpLimits,
+        stream_id: u64,
+        qpack: Arc<qpack::H3Qpack>,
+        peer_state: Arc<Mutex<H3PeerState>>,
+    ) -> Self {
         let needs_protocol_flush = Arc::new(Mutex::new(false));
         let stream = Self {
             factory,
@@ -327,13 +366,14 @@ impl H3RequestStream {
             qpack: Arc::clone(&qpack),
             parser: H3Parser::new(),
             handler: None,
-            writer: H3Writer::new(stream_id, qpack),
+            writer: H3Writer::new(stream_id, qpack, peer_state),
             body_started: false,
             paused_body: Vec::new(),
             needs_protocol_flush: Arc::clone(&needs_protocol_flush),
             upgraded: None,
             malformed: false,
             qpack_error: false,
+            excessive_load: false,
             connection_error: None,
         };
         let flag = Arc::clone(&needs_protocol_flush);
@@ -451,7 +491,13 @@ impl H3FrameHandler for H3RequestStream {
             self.qpack_error = true;
             return;
         };
-        if pairs.len() > self.limits.max_header_count {
+        if pairs.len() > self.limits.max_header_count
+            || frame::field_section_size_owned(&pairs)
+                > frame::DEFAULT_MAX_FIELD_SECTION_SIZE as usize
+        {
+            // RFC 9114 §4.2.2 / §10.5.1 — refuse oversized field sections
+            // with a stream error rather than hanging the peer.
+            self.excessive_load = true;
             return;
         }
 
@@ -528,6 +574,10 @@ impl ProtocolHandler for H3RequestStream {
             endpoint.close_connection(code);
             return;
         }
+        if self.excessive_load {
+            endpoint.abort(frame::H3_EXCESSIVE_LOAD);
+            return;
+        }
         if self.malformed {
             // RFC 9114 §4.3.1: a malformed request is a stream error, not
             // a connection error — only this one request is affected.
@@ -581,6 +631,9 @@ pub(crate) struct H3PeerState {
     /// (encoder must not use the dynamic table). Applied to our encoder via
     /// [`qpack::H3Qpack::apply_peer_max_table_capacity`].
     pub(crate) peer_qpack_max_table_capacity: Option<u64>,
+    /// Peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §4.2.2). `None`
+    /// until SETTINGS arrives or when the peer omits it (unlimited).
+    pub(crate) peer_max_field_section_size: Option<u64>,
     /// Set once the peer's GOAWAY frame arrives (RFC 9114 §5.2): the ID it
     /// carried (the peer's last client-initiated bidirectional stream, if
     /// sent by a server; a push ID, if sent by a client — moot here since
@@ -744,12 +797,16 @@ impl H3FrameHandler for H3UniStream {
         // peer sends SETTINGS without a QPACK capacity entry.
         let mut qpack_max_table_capacity = 0u64;
         let mut saw_qpack_max = false;
+        // RFC 9114 §4.2.2: absent → unlimited.
+        let mut max_field_section_size: Option<u64> = None;
         for (id, val) in frame::parse_settings(payload) {
             if id == frame::SETTINGS_ENABLE_CONNECT_PROTOCOL {
                 enable_connect_protocol = Some(val != 0);
             } else if id == frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY {
                 qpack_max_table_capacity = val;
                 saw_qpack_max = true;
+            } else if id == frame::SETTINGS_MAX_FIELD_SECTION_SIZE {
+                max_field_section_size = Some(val);
             }
         }
         {
@@ -764,6 +821,7 @@ impl H3FrameHandler for H3UniStream {
             } else {
                 0
             });
+            state.peer_max_field_section_size = max_field_section_size;
         }
         self.qpack
             .apply_peer_max_table_capacity(if saw_qpack_max {
@@ -997,7 +1055,7 @@ mod uni_stream_tests {
         let mut type_byte: &[u8] = &[0x00];
         uni.receive(ep, &mut type_byte);
         let mut settings = Vec::new();
-        frame::write_settings(&mut settings, qpack::MAX_TABLE_CAPACITY as u64, 0);
+        frame::write_settings(&mut settings, qpack::MAX_TABLE_CAPACITY as u64, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
         let mut data: &[u8] = &settings;
         uni.receive(ep, &mut data);
         assert!(!ep.closed, "SETTINGS alone must not close the connection");
@@ -1011,7 +1069,7 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut bytes = vec![0x00]; // control stream type
-        frame::write_settings(&mut bytes, qpack::MAX_TABLE_CAPACITY as u64, 0);
+        frame::write_settings(&mut bytes, qpack::MAX_TABLE_CAPACITY as u64, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
         let mut data: &[u8] = &bytes;
         uni.receive(&mut ep, &mut data);
 
@@ -1034,7 +1092,7 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut settings_bytes = Vec::new();
-        frame::write_settings(&mut settings_bytes, qpack::MAX_TABLE_CAPACITY as u64, 0);
+        frame::write_settings(&mut settings_bytes, qpack::MAX_TABLE_CAPACITY as u64, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
 
         let mut type_byte: &[u8] = &[0x00];
         uni.receive(&mut ep, &mut type_byte);
@@ -1189,7 +1247,7 @@ mod uni_stream_tests {
         open_control_with_settings(&mut uni, &mut ep);
 
         let mut second = Vec::new();
-        frame::write_settings(&mut second, 0, 0);
+        frame::write_settings(&mut second, 0, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
         let mut data: &[u8] = &second;
         uni.receive(&mut ep, &mut data);
 
@@ -1585,7 +1643,11 @@ mod request_validation_tests {
         let factory: Arc<dyn ServerHandlerFactory> =
             Arc::new(RecordingFactory { rec: Arc::clone(&rec) });
         let qpack = Arc::new(qpack::H3Qpack::new());
-        (H3RequestStream::new(factory, HttpLimits::default(), 0, qpack), rec)
+        let peer_state = Arc::new(Mutex::new(H3PeerState::default()));
+        (
+            H3RequestStream::new(factory, HttpLimits::default(), 0, qpack, peer_state),
+            rec,
+        )
     }
 
     #[test]
@@ -1619,6 +1681,32 @@ mod request_validation_tests {
             Some(frame::H3_MESSAGE_ERROR),
             "must be a stream error (RFC 9114 §4.3.1), not a connection-wide close"
         );
+    }
+
+    /// An oversized decoded field section is a stream error of type
+    /// `H3_EXCESSIVE_LOAD` (RFC 9114 §4.2.2 / §10.5.1), not a silent hang.
+    #[test]
+    fn oversized_field_section_aborts_with_excessive_load() {
+        let (mut stream, rec) = stream_with_recorder();
+        // One field whose name+value+32 exceeds DEFAULT_MAX_FIELD_SECTION_SIZE.
+        let big = "x".repeat(frame::DEFAULT_MAX_FIELD_SECTION_SIZE as usize);
+        let payload = encode(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+            ("x-big", &big),
+        ]);
+        stream.headers_frame(&payload);
+
+        assert!(stream.excessive_load);
+        assert!(stream.handler.is_none());
+        assert_eq!(rec.lock().unwrap().opened, 0);
+
+        let mut ep = RecordingEndpoint::default();
+        let mut empty: &[u8] = &[];
+        stream.receive(&mut ep, &mut empty);
+        assert_eq!(ep.abort_code, Some(frame::H3_EXCESSIVE_LOAD));
     }
 
     #[test]

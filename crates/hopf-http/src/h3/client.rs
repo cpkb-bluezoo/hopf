@@ -102,6 +102,7 @@ impl QuicConnection for H3ClientConnection {
                 &mut bytes,
                 qpack::MAX_TABLE_CAPACITY as u64,
                 0, // SETTINGS_QPACK_BLOCKED_STREAMS — non-blocking encoder
+                frame::DEFAULT_MAX_FIELD_SECTION_SIZE,
             );
             api.write(stream, &bytes);
         }
@@ -130,7 +131,13 @@ impl QuicConnection for H3ClientConnection {
             .unwrap()
             .pop_front()
             .expect("accept_bi called without a matching queued factory — drain_pending_opens/open_bi calls must stay 1:1 with queued factories");
-        Box::new(H3ClientStream::new(factory, self.limits, stream_id, Arc::clone(&self.qpack)))
+        Box::new(H3ClientStream::new(
+            factory,
+            self.limits,
+            stream_id,
+            Arc::clone(&self.qpack),
+            Arc::clone(&self.peer_state),
+        ))
     }
 
     fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
@@ -280,10 +287,10 @@ fn validate_response_status(pairs: &[(String, String)]) -> Result<(), ()> {
 /// One outbound H3 request / inbound response on a bidirectional QUIC stream.
 struct H3ClientStream {
     factory: Arc<dyn ClientHandlerFactory>,
-    #[allow(dead_code)]
     limits: HttpLimits,
     stream_id: u64,
     qpack: Arc<qpack::H3Qpack>,
+    peer_state: Arc<Mutex<H3PeerState>>,
     parser: H3Parser,
     handler: Option<Box<dyn ClientHandler>>,
     response_headers_received: bool,
@@ -297,17 +304,26 @@ struct H3ClientStream {
     /// `receive()`'s tail, where an `Endpoint` is available to close the
     /// connection (RFC 9204 §4.5.1: `QPACK_DECOMPRESSION_FAILED`).
     qpack_error: bool,
+    /// Oversized response field section — stream error `H3_EXCESSIVE_LOAD`.
+    excessive_load: bool,
     /// Connection-level frame violations (e.g. unsolicited PUSH_PROMISE).
     connection_error: Option<u32>,
 }
 
 impl H3ClientStream {
-    fn new(factory: Arc<dyn ClientHandlerFactory>, limits: HttpLimits, stream_id: u64, qpack: Arc<qpack::H3Qpack>) -> Self {
+    fn new(
+        factory: Arc<dyn ClientHandlerFactory>,
+        limits: HttpLimits,
+        stream_id: u64,
+        qpack: Arc<qpack::H3Qpack>,
+        peer_state: Arc<Mutex<H3PeerState>>,
+    ) -> Self {
         Self {
             factory,
             limits,
             stream_id,
             qpack,
+            peer_state,
             parser: H3Parser::new(),
             handler: None,
             response_headers_received: false,
@@ -315,6 +331,7 @@ impl H3ClientStream {
             started: false,
             malformed: false,
             qpack_error: false,
+            excessive_load: false,
             connection_error: None,
         }
     }
@@ -333,6 +350,27 @@ impl H3ClientStream {
         let body = writer.body;
         let trailers = writer.trailers;
         let done = writer.done;
+
+        let req_size = frame::field_section_size(
+            headers
+                .iter()
+                .map(|h| (h.name.as_str(), h.value.as_str())),
+        );
+        if let Some(max) = self.peer_state.lock().unwrap().peer_max_field_section_size {
+            if req_size as u64 > max {
+                // RFC 9114 §4.2.2: SHOULD NOT send over the peer's ceiling.
+                handler.request_failed(
+                    &mut NullClientWriter,
+                    &io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "request field section exceeds peer SETTINGS_MAX_FIELD_SECTION_SIZE",
+                    ),
+                );
+                self.handler = Some(handler);
+                endpoint.abort(frame::H3_EXCESSIVE_LOAD);
+                return;
+            }
+        }
 
         let mut out = Vec::new();
         let block = self
@@ -389,7 +427,11 @@ impl H3FrameHandler for H3ClientStream {
             self.qpack_error = true;
             return;
         };
-        if pairs.len() > self.limits.max_header_count {
+        if pairs.len() > self.limits.max_header_count
+            || frame::field_section_size_owned(&pairs)
+                > frame::DEFAULT_MAX_FIELD_SECTION_SIZE as usize
+        {
+            self.excessive_load = true;
             return;
         }
 
@@ -466,6 +508,20 @@ impl ProtocolHandler for H3ClientStream {
         }
         if let Some(code) = self.connection_error.take() {
             endpoint.close_connection(code);
+            return;
+        }
+        if self.excessive_load {
+            let mut w = NullClientWriter;
+            if let Some(handler) = &mut self.handler {
+                handler.request_failed(
+                    &mut w,
+                    &io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "response field section exceeds SETTINGS_MAX_FIELD_SECTION_SIZE",
+                    ),
+                );
+            }
+            endpoint.abort(frame::H3_EXCESSIVE_LOAD);
             return;
         }
         if self.malformed {
@@ -601,7 +657,13 @@ mod status_validation_tests {
         let factory: Arc<dyn ClientHandlerFactory> =
             Arc::new(RecordingFactory { rec: Arc::clone(&rec) });
         let qpack = Arc::new(qpack::H3Qpack::new());
-        let mut stream = H3ClientStream::new(factory, HttpLimits::default(), 0, qpack);
+        let mut stream = H3ClientStream::new(
+            factory,
+            HttpLimits::default(),
+            0,
+            qpack,
+            Arc::new(Mutex::new(H3PeerState::default())),
+        );
         let mut ep = RecordingEndpoint::default();
         stream.start_request(&mut ep);
         (stream, rec)
@@ -744,7 +806,13 @@ mod status_validation_tests {
     fn client_sends_request_trailers_as_second_headers_before_fin() {
         let factory: Arc<dyn ClientHandlerFactory> = Arc::new(TrailerFactory);
         let qpack = Arc::new(qpack::H3Qpack::new());
-        let mut stream = H3ClientStream::new(factory, HttpLimits::default(), 0, Arc::clone(&qpack));
+        let mut stream = H3ClientStream::new(
+            factory,
+            HttpLimits::default(),
+            0,
+            Arc::clone(&qpack),
+            Arc::new(Mutex::new(H3PeerState::default())),
+        );
         let mut ep = RecordingEndpoint::default();
         stream.start_request(&mut ep);
 
