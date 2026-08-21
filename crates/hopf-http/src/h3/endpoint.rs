@@ -689,6 +689,21 @@ impl H3UniStream {
             }
         }
     }
+
+    /// RFC 9114 §6.2.1 / RFC 9204 §4.2: control and QPACK critical streams
+    /// must stay open for the life of the connection.
+    fn is_critical(&self) -> bool {
+        matches!(
+            self.kind,
+            UniKind::Control(_) | UniKind::QpackEncoderStream | UniKind::QpackDecoderStream
+        )
+    }
+
+    fn close_if_critical_stream_closed(&self, endpoint: &mut dyn Endpoint) {
+        if self.is_critical() {
+            endpoint.close_connection(frame::H3_CLOSED_CRITICAL_STREAM);
+        }
+    }
 }
 
 impl H3FrameHandler for H3UniStream {
@@ -822,8 +837,20 @@ impl ProtocolHandler for H3UniStream {
         }
     }
 
-    fn disconnected(&mut self, _: &mut dyn Endpoint) {}
-    fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
+    fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
+        // RFC 9114 §6.2.1 / RFC 9204 §4.2: the peer MUST NOT close the
+        // control or QPACK critical streams. A clean FIN is still a
+        // connection error.
+        self.close_if_critical_stream_closed(endpoint);
+    }
+
+    fn error(&mut self, endpoint: &mut dyn Endpoint, _: &io::Error) {
+        // Same for RESET_STREAM / STOP_SENDING / other abrupt stream
+        // teardown. Connection-level closes also reach here after the
+        // driver has already dropped the connection, so a follow-up
+        // `close_connection` is a no-op.
+        self.close_if_critical_stream_closed(endpoint);
+    }
 }
 
 #[cfg(test)]
@@ -1151,6 +1178,106 @@ mod uni_stream_tests {
         frame::write_frame(&mut grease, 0x21, b"pad");
         let mut data: &[u8] = &grease;
         uni.receive(&mut ep, &mut data);
+
+        assert!(!ep.closed);
+        assert_eq!(ep.close_connection_code, None);
+    }
+
+    /// Premature FIN of the peer control stream is H3_CLOSED_CRITICAL_STREAM
+    /// (RFC 9114 §6.2.1).
+    #[test]
+    fn control_stream_fin_is_closed_critical_stream() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+        assert!(!ep.closed);
+
+        uni.disconnected(&mut ep);
+        assert!(ep.closed);
+        assert_eq!(
+            ep.close_connection_code,
+            Some(frame::H3_CLOSED_CRITICAL_STREAM)
+        );
+    }
+
+    /// Premature FIN of the peer QPACK encoder stream is
+    /// H3_CLOSED_CRITICAL_STREAM (RFC 9204 §4.2).
+    #[test]
+    fn qpack_encoder_stream_fin_is_closed_critical_stream() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x02];
+        uni.receive(&mut ep, &mut type_byte);
+        uni.disconnected(&mut ep);
+
+        assert_eq!(
+            ep.close_connection_code,
+            Some(frame::H3_CLOSED_CRITICAL_STREAM)
+        );
+    }
+
+    /// Premature FIN of the peer QPACK decoder stream is
+    /// H3_CLOSED_CRITICAL_STREAM (RFC 9204 §4.2).
+    #[test]
+    fn qpack_decoder_stream_fin_is_closed_critical_stream() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x03];
+        uni.receive(&mut ep, &mut type_byte);
+        uni.disconnected(&mut ep);
+
+        assert_eq!(
+            ep.close_connection_code,
+            Some(frame::H3_CLOSED_CRITICAL_STREAM)
+        );
+    }
+
+    /// Abrupt teardown of a critical stream (RESET / STOP_SENDING path)
+    /// is also H3_CLOSED_CRITICAL_STREAM.
+    #[test]
+    fn control_stream_error_is_closed_critical_stream() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+        uni.error(
+            &mut ep,
+            &io::Error::new(io::ErrorKind::ConnectionReset, "reset"),
+        );
+
+        assert_eq!(
+            ep.close_connection_code,
+            Some(frame::H3_CLOSED_CRITICAL_STREAM)
+        );
+    }
+
+    /// Unknown / GREASE uni streams may close without a connection error.
+    #[test]
+    fn discard_uni_stream_fin_is_tolerated() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+
+        // Reserved stream type 0x21 (GREASE form).
+        let mut type_bytes = Vec::new();
+        super::super::varint::encode(&mut type_bytes, 0x21);
+        let mut data: &[u8] = &type_bytes;
+        uni.receive(&mut ep, &mut data);
+        uni.disconnected(&mut ep);
 
         assert!(!ep.closed);
         assert_eq!(ep.close_connection_code, None);
