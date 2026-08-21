@@ -458,6 +458,13 @@ impl H3FrameHandler for H3ClientStream {
             headers.add(name, value);
         }
         if let Some(handler) = &mut self.handler {
+            // RFC 9114 §4.1 / RFC 9110 §15.2: a 1xx HEADERS is an interim
+            // response — never terminal, never trailers. The real final
+            // response HEADERS still follows on the same stream.
+            if !self.response_headers_received && (100..200).contains(&headers.status_code()) {
+                handler.informational_response(&mut w, &headers);
+                return;
+            }
             if self.response_headers_received {
                 if self.response_body_started {
                     handler.end_response_body(&mut w);
@@ -615,6 +622,7 @@ mod status_validation_tests {
         status: Option<u16>,
         failed: usize,
         trailers: Vec<(String, String)>,
+        informational_statuses: Vec<u16>,
     }
 
     struct RecordingHandler {
@@ -622,6 +630,13 @@ mod status_validation_tests {
     }
     impl ClientHandler for RecordingHandler {
         fn start(&mut self, _request: &mut dyn ClientWriter) {}
+        fn informational_response(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
+            self.rec
+                .lock()
+                .unwrap()
+                .informational_statuses
+                .push(headers.status_code());
+        }
         fn response_headers(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
             self.rec.lock().unwrap().status = Some(headers.status_code());
         }
@@ -731,6 +746,54 @@ mod status_validation_tests {
 
         assert!(!stream.malformed, "trailers have no :status and must not be validated as one");
         assert_eq!(rec.lock().unwrap().trailers, vec![("grpc-status".to_string(), "0".to_string())]);
+    }
+
+    /// A `100 Continue` / `103 Early Hints` HEADERS frame is surfaced via
+    /// `informational_response` and does not consume the "first HEADERS"
+    /// slot — the real final response still lands on `response_headers`,
+    /// not `response_trailers` (RFC 9114 §4.1).
+    #[test]
+    fn interim_1xx_then_final_response_dispatch_correctly() {
+        let (mut stream, rec) = stream_with_recorder();
+
+        stream.headers_frame(&encode(&[(":status", "100")]));
+        stream.headers_frame(&encode(&[(":status", "200"), ("content-type", "text/plain")]));
+
+        let r = rec.lock().unwrap();
+        assert_eq!(r.informational_statuses, vec![100]);
+        assert_eq!(r.status, Some(200));
+        assert!(r.trailers.is_empty(), "final response must not be mistaken for trailers");
+        assert!(stream.response_headers_received);
+    }
+
+    /// Multiple interim responses (e.g. 103 then 100) are all surfaced
+    /// before the final response.
+    #[test]
+    fn multiple_interim_responses_all_surfaced() {
+        let (mut stream, rec) = stream_with_recorder();
+
+        stream.headers_frame(&encode(&[(":status", "103"), ("link", "</style.css>; rel=preload")]));
+        stream.headers_frame(&encode(&[(":status", "100")]));
+        stream.headers_frame(&encode(&[(":status", "200")]));
+
+        let r = rec.lock().unwrap();
+        assert_eq!(r.informational_statuses, vec![103, 100]);
+        assert_eq!(r.status, Some(200));
+        assert!(r.trailers.is_empty());
+    }
+
+    /// A final response with no preceding 1xx is unaffected.
+    #[test]
+    fn no_interim_response_final_headers_then_trailers() {
+        let (mut stream, rec) = stream_with_recorder();
+
+        stream.headers_frame(&encode(&[(":status", "200")]));
+        stream.headers_frame(&encode(&[("grpc-status", "0")]));
+
+        let r = rec.lock().unwrap();
+        assert!(r.informational_statuses.is_empty());
+        assert_eq!(r.status, Some(200));
+        assert_eq!(r.trailers, vec![("grpc-status".to_string(), "0".to_string())]);
     }
 
     /// hopf never sends MAX_PUSH_ID, so PUSH_PROMISE on a request stream is
