@@ -38,6 +38,10 @@ impl Encoder {
         }
     }
 
+    pub(crate) fn capacity(&self) -> usize {
+        self.table.capacity()
+    }
+
     /// Change the dynamic table's capacity, returning the encoder-stream
     /// instruction bytes to send (RFC 9204 §4.3.1).
     pub(crate) fn set_capacity(&mut self, capacity: usize) -> Vec<u8> {
