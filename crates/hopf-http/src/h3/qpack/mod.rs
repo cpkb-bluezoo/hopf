@@ -237,7 +237,7 @@ mod h3qpack_tests {
         let (pending, _) = q.take_pending();
         assert!(pending.is_empty(), "capacity 0→0 must not emit a set-capacity");
 
-        // Peer advertises less than our ceiling — honor their value.
+        // Peer advertises less than our ceiling — honour their value.
         q.apply_peer_max_table_capacity(1024);
         assert_eq!(q.encoder_capacity_for_test(), 1024);
         let (pending, _) = q.take_pending();
