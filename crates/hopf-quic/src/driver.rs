@@ -144,6 +144,10 @@ impl QuicDriverHandle {
     /// 0-RTT is not available the open is queued and applied once
     /// [`Event::Connected`] fires; when [`Connection::has_0rtt`] is true
     /// the stream is opened immediately so data can ride as early data.
+    /// If the peer's stream-concurrency limit is exhausted (`MAX_STREAMS`,
+    /// RFC 9000 §4.6), the open is queued and applied when
+    /// [`StreamEvent::Available`] reports new credit — callers do not
+    /// need to retry.
     pub fn open_bi(&self, factory: HandlerFactory) -> io::Result<()> {
         if !self.active.load(Ordering::Acquire) {
             return Err(io::Error::new(
@@ -349,9 +353,10 @@ struct ConnSlot {
     /// either immediately after `connect()` when [`Connection::has_0rtt`]
     /// is true, or later in [`Driver::on_connected`].
     client_pending_open: bool,
-    /// Client: additional [`DriverCmd::OpenBi`] requests that arrived
-    /// before the first-stream open ran — drained by
-    /// [`Driver::open_pending_client_streams`].
+    /// Client: additional [`DriverCmd::OpenBi`] requests waiting for either
+    /// handshake completion / 0-RTT, or for peer `MAX_STREAMS` credit
+    /// ([`StreamEvent::Available`]). Drained by
+    /// [`Driver::drain_pending_open_bi`].
     pending_open_bi: std::collections::VecDeque<HandlerFactory>,
     /// Hooks-mode application connection (H3).
     app: Option<Box<dyn QuicConnection>>,
@@ -746,10 +751,12 @@ impl Driver {
             .get_mut(&ch)
             .and_then(|s| s.conn.streams().open(Dir::Bi))
         else {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "cannot open another bidirectional QUIC stream",
-            ));
+            // Peer concurrency limit (RFC 9000 §4.6) — queue until
+            // StreamEvent::Available grants more credit.
+            if let Some(slot) = self.connections.get_mut(&ch) {
+                slot.pending_open_bi.push_back(factory);
+            }
+            return Ok(());
         };
         self.attach_stream_with_factory(ch, id, factory);
         Ok(())
@@ -961,18 +968,31 @@ impl Driver {
                 self.attach_stream_dir(ch, id, Dir::Bi);
             }
         }
-        let pending: Vec<HandlerFactory> = self
-            .connections
-            .get_mut(&ch)
-            .map(|s| s.pending_open_bi.drain(..).collect())
-            .unwrap_or_default();
-        for factory in pending {
+        self.drain_pending_open_bi(ch);
+    }
+
+    /// Apply as many queued [`DriverCmd::OpenBi`] factories as the peer's
+    /// current bi-stream credit allows. Stops (leaving the rest queued)
+    /// when `streams().open(Dir::Bi)` returns `None`;
+    /// [`StreamEvent::Available`] will call this again.
+    fn drain_pending_open_bi(&mut self, ch: ConnectionHandle) {
+        loop {
+            let Some(factory) = self
+                .connections
+                .get_mut(&ch)
+                .and_then(|s| s.pending_open_bi.pop_front())
+            else {
+                return;
+            };
             let Some(id) = self
                 .connections
                 .get_mut(&ch)
                 .and_then(|s| s.conn.streams().open(Dir::Bi))
             else {
-                break;
+                if let Some(slot) = self.connections.get_mut(&ch) {
+                    slot.pending_open_bi.push_front(factory);
+                }
+                return;
             };
             self.attach_stream_with_factory(ch, id, factory);
         }
@@ -1130,7 +1150,9 @@ impl Driver {
                 self.read_stream(ch, id);
             }
             StreamEvent::Finished { id } => {
-                // Drain any remaining data before tearing down the stream.
+                // Our send half is fully acknowledged. Drain any final peer
+                // data/FIN first (which may already have torn the stream
+                // down via read_stream), then drop the handler if still live.
                 self.read_stream(ch, id);
                 self.finish_stream(ch, id, None);
             }
@@ -1140,6 +1162,11 @@ impl Driver {
                 // disconnected() path used for a clean FIN.
                 self.read_stream(ch, id);
                 self.finish_stream(ch, id, Some(stream_stopped_io_error(error_code)));
+            }
+            StreamEvent::Available { dir: Dir::Bi } => {
+                // Peer raised MAX_STREAMS (or freed credit after a finished
+                // stream) — retry any open_bi that hit the concurrency cap.
+                self.drain_pending_open_bi(ch);
             }
             _ => {}
         }
@@ -1267,26 +1294,40 @@ impl Driver {
             Err(_) => return,
         };
         let mut new_data = Vec::new();
+        let mut peer_finished = false;
         loop {
             match chunks.next(usize::MAX) {
                 Ok(Some(chunk)) => {
                     new_data.extend_from_slice(&chunk.bytes);
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    // Peer FIN (or reset path already freed recv) — both
+                    // directions must close before MAX_STREAMS credit returns.
+                    peer_finished = true;
+                    break;
+                }
                 Err(_) => break,
             }
         }
         let _ = chunks.finalize();
-        if new_data.is_empty() {
-            return;
+
+        if !new_data.is_empty() {
+            if let Some(stream) = slot.streams.get_mut(&id) {
+                let handler = &mut stream.handler;
+                let endpoint = &mut stream.endpoint;
+                deliver_with_residual(&mut stream.pending_in, &new_data, |slice| {
+                    handler.receive(endpoint, slice);
+                });
+            }
         }
 
-        if let Some(stream) = slot.streams.get_mut(&id) {
-            let handler = &mut stream.handler;
-            let endpoint = &mut stream.endpoint;
-            deliver_with_residual(&mut stream.pending_in, &new_data, |slice| {
-                handler.receive(endpoint, slice);
-            });
+        if peer_finished {
+            // Finish our send half so a bidi stream becomes fully closed and
+            // the peer can raise MAX_STREAMS (RFC 9000 §4.6).
+            if let Some(slot) = self.connections.get_mut(&ch) {
+                let _ = slot.conn.send_stream(id).finish();
+            }
+            self.finish_stream(ch, id, None);
         }
     }
 
@@ -2127,5 +2168,151 @@ mod tests {
         );
 
         server.shutdown();
+    }
+
+    /// Holds the dial's first bi stream open until `release` is set, polling
+    /// via the QUIC timer path so we can open a second stream against a
+    /// peer that only grants one concurrent bidi at a time.
+    struct HoldUntilRelease {
+        release: Arc<std::sync::atomic::AtomicBool>,
+        signaled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl HoldUntilRelease {
+        fn arm_poll(endpoint: &mut dyn Endpoint, release: Arc<std::sync::atomic::AtomicBool>) {
+            let handle = endpoint.handle();
+            endpoint.schedule_timer(
+                Duration::from_millis(10),
+                Box::new(move || {
+                    handle.with_endpoint(move |ep| {
+                        if release.load(std::sync::atomic::Ordering::SeqCst) {
+                            ep.close();
+                        } else {
+                            Self::arm_poll(ep, release);
+                        }
+                    });
+                }),
+            );
+        }
+    }
+
+    impl ProtocolHandler for HoldUntilRelease {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            endpoint.send(b"hold");
+            self.signaled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Self::arm_poll(endpoint, Arc::clone(&self.release));
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    /// When the peer advertises only one concurrent bidi stream, a second
+    /// `open_bi` must queue (not fail) and complete once
+    /// `StreamEvent::Available` reports new `MAX_STREAMS` credit.
+    #[test]
+    fn open_bi_queues_until_stream_credit_available() {
+        use crate::config::{apply_server_transport_options, QuicTransportOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        apply_server_transport_options(
+            &mut server_cfg,
+            &QuicTransportOptions::new().max_concurrent_bidi_streams(1),
+        )
+        .unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        let release = Arc::new(AtomicBool::new(false));
+        let first_up = Arc::new(AtomicBool::new(false));
+        let client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            {
+                let release = Arc::clone(&release);
+                let first_up = Arc::clone(&first_up);
+                Arc::new(move || {
+                    Box::new(HoldUntilRelease {
+                        release: Arc::clone(&release),
+                        signaled: Arc::clone(&first_up),
+                    }) as Box<dyn ProtocolHandler>
+                })
+            },
+        ))
+        .unwrap();
+
+        for _ in 0..200 {
+            if first_up.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            first_up.load(Ordering::SeqCst),
+            "first (sole) stream never opened"
+        );
+
+        let second_up = Arc::new(AtomicBool::new(false));
+        let second_up2 = Arc::clone(&second_up);
+        client
+            .open_bi(Arc::new(move || {
+                Box::new(MarkConnected {
+                    flag: Arc::clone(&second_up2),
+                }) as Box<dyn ProtocolHandler>
+            }))
+            .expect("open_bi should queue under MAX_STREAMS, not fail");
+
+        // While the first stream still occupies the only credit slot, the
+        // queued open must not have attached yet.
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            !second_up.load(Ordering::SeqCst),
+            "second stream opened before MAX_STREAMS credit was freed"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        for _ in 0..200 {
+            if second_up.load(Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            second_up.load(Ordering::SeqCst),
+            "queued open_bi never drained after StreamEvent::Available"
+        );
+
+        client.shutdown();
+        server.shutdown();
+    }
+
+    struct MarkConnected {
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ProtocolHandler for MarkConnected {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            self.flag
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            endpoint.send(b"second");
+            endpoint.close();
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
 }
