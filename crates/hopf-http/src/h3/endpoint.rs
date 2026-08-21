@@ -77,7 +77,11 @@ impl QuicConnection for H3ServerConnection {
     fn connected(&mut self, api: &mut dyn QuicConnApi) {
         if let Some(stream) = api.open_uni() {
             let mut bytes = vec![0x00]; // control stream type
-            frame::write_settings(&mut bytes);
+            frame::write_settings(
+                &mut bytes,
+                qpack::MAX_TABLE_CAPACITY as u64,
+                0, // SETTINGS_QPACK_BLOCKED_STREAMS — non-blocking encoder
+            );
             api.write(stream, &bytes);
             self.control_stream_key = Some(stream);
         }
@@ -544,6 +548,11 @@ pub(crate) struct H3PeerState {
     /// `SETTINGS_ENABLE_CONNECT_PROTOCOL=1` (RFC 9220).
     #[allow(dead_code)] // not yet consulted anywhere — see conformance.html
     pub(crate) peer_enable_connect_protocol: bool,
+    /// Peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (RFC 9204 §5). `None`
+    /// until SETTINGS arrives; absent from SETTINGS means the default of 0
+    /// (encoder must not use the dynamic table). Applied to our encoder via
+    /// [`qpack::H3Qpack::apply_peer_max_table_capacity`].
+    pub(crate) peer_qpack_max_table_capacity: Option<u64>,
     /// Set once the peer's GOAWAY frame arrives (RFC 9114 §5.2): the ID it
     /// carried (the peer's last client-initiated bidirectional stream, if
     /// sent by a server; a push ID, if sent by a client — moot here since
@@ -647,14 +656,38 @@ impl H3FrameHandler for H3UniStream {
     }
     fn settings_frame(&mut self, payload: &[u8]) {
         let mut enable_connect_protocol = None;
+        // RFC 9204 §5: absent → default 0. Track whether the setting was
+        // present so we still apply 0 (and keep the encoder gated) when a
+        // peer sends SETTINGS without a QPACK capacity entry.
+        let mut qpack_max_table_capacity = 0u64;
+        let mut saw_qpack_max = false;
         for (id, val) in frame::parse_settings(payload) {
             if id == frame::SETTINGS_ENABLE_CONNECT_PROTOCOL {
                 enable_connect_protocol = Some(val != 0);
+            } else if id == frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY {
+                qpack_max_table_capacity = val;
+                saw_qpack_max = true;
             }
         }
-        if let Some(v) = enable_connect_protocol {
-            self.peer_state.lock().unwrap().peer_enable_connect_protocol = v;
+        {
+            let mut state = self.peer_state.lock().unwrap();
+            if let Some(v) = enable_connect_protocol {
+                state.peer_enable_connect_protocol = v;
+            }
+            // Always record a capacity once SETTINGS has been seen — either
+            // the advertised value or the RFC default of 0.
+            state.peer_qpack_max_table_capacity = Some(if saw_qpack_max {
+                qpack_max_table_capacity
+            } else {
+                0
+            });
         }
+        self.qpack
+            .apply_peer_max_table_capacity(if saw_qpack_max {
+                qpack_max_table_capacity
+            } else {
+                0
+            });
     }
     fn goaway_frame(&mut self, payload: &[u8]) {
         if let Some(id) = frame::parse_goaway(payload) {
@@ -806,7 +839,7 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut bytes = vec![0x00]; // control stream type
-        frame::write_settings(&mut bytes); // ENABLE_CONNECT_PROTOCOL=1
+        frame::write_settings(&mut bytes, qpack::MAX_TABLE_CAPACITY as u64, 0);
         let mut data: &[u8] = &bytes;
         uni.receive(&mut ep, &mut data);
 
@@ -815,6 +848,8 @@ mod uni_stream_tests {
         let s = state.lock().unwrap();
         assert!(s.control_seen);
         assert!(s.peer_enable_connect_protocol);
+        assert_eq!(s.peer_qpack_max_table_capacity, Some(qpack::MAX_TABLE_CAPACITY as u64));
+        assert_eq!(qpack.encoder_capacity_for_test(), qpack::MAX_TABLE_CAPACITY);
     }
 
     /// The type byte and the SETTINGS frame bytes arriving in separate
@@ -827,7 +862,7 @@ mod uni_stream_tests {
         let mut ep = RecordingEndpoint::default();
 
         let mut settings_bytes = Vec::new();
-        frame::write_settings(&mut settings_bytes);
+        frame::write_settings(&mut settings_bytes, qpack::MAX_TABLE_CAPACITY as u64, 0);
 
         let mut type_byte: &[u8] = &[0x00];
         uni.receive(&mut ep, &mut type_byte);

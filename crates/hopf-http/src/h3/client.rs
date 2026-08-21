@@ -94,7 +94,11 @@ impl QuicConnection for H3ClientConnection {
     fn connected(&mut self, api: &mut dyn QuicConnApi) {
         if let Some(stream) = api.open_uni() {
             let mut bytes = vec![0x00];
-            frame::write_settings(&mut bytes);
+            frame::write_settings(
+                &mut bytes,
+                qpack::MAX_TABLE_CAPACITY as u64,
+                0, // SETTINGS_QPACK_BLOCKED_STREAMS — non-blocking encoder
+            );
             api.write(stream, &bytes);
         }
         if let Some(stream) = api.open_uni() {
