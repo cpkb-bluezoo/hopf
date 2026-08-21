@@ -629,6 +629,9 @@ pub(crate) struct H3UniStream {
     /// 9114 §8.1) — checked in `receive()`'s tail, where an `Endpoint` is
     /// available to actually close the connection.
     connection_error: Option<u32>,
+    /// `true` once the peer's control stream has delivered its SETTINGS
+    /// frame (RFC 9114 §7.2.4) — gates SETTINGS-first / SETTINGS-once.
+    settings_received: bool,
 }
 
 impl H3UniStream {
@@ -645,6 +648,7 @@ impl H3UniStream {
             pending_type: Vec::new(),
             qpack_buf: Vec::new(),
             connection_error: None,
+            settings_received: false,
         }
     }
 
@@ -710,14 +714,30 @@ impl H3UniStream {
 
 impl H3FrameHandler for H3UniStream {
     fn data_frame(&mut self, _payload: &[u8]) {
+        if !self.settings_received {
+            // RFC 9114 §6.2.1: first control-stream frame must be SETTINGS.
+            self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
+            return;
+        }
         // RFC 9114 §7.2/§4.1: DATA never appears on the control stream.
         self.connection_error.get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
     fn headers_frame(&mut self, _payload: &[u8]) {
-        // Same — HEADERS is a request/response-stream-only frame type.
+        if !self.settings_received {
+            self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
+            return;
+        }
         self.connection_error.get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
     fn settings_frame(&mut self, payload: &[u8]) {
+        // RFC 9114 §7.2.4: SETTINGS must be first and must not be repeated.
+        if self.settings_received {
+            self.connection_error
+                .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+            return;
+        }
+        self.settings_received = true;
+
         let mut enable_connect_protocol = None;
         // RFC 9204 §5: absent → default 0. Track whether the setting was
         // present so we still apply 0 (and keep the encoder gated) when a
@@ -753,6 +773,10 @@ impl H3FrameHandler for H3UniStream {
             });
     }
     fn goaway_frame(&mut self, payload: &[u8]) {
+        if !self.settings_received {
+            self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
+            return;
+        }
         let Some(id) = frame::parse_goaway(payload) else {
             self.connection_error.get_or_insert(frame::H3_FRAME_ERROR);
             return;
@@ -778,17 +802,29 @@ impl H3FrameHandler for H3UniStream {
         state.goaway_received = Some(id);
     }
     fn cancel_push_frame(&mut self, _payload: &[u8]) {
+        if !self.settings_received {
+            self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
+            return;
+        }
         // hopf never permits push (no MAX_PUSH_ID sent), so any referenced
         // push ID is greater than currently allowed → H3_ID_ERROR
         // (RFC 9114 §7.2.3).
         self.connection_error.get_or_insert(frame::H3_ID_ERROR);
     }
     fn push_promise_frame(&mut self, _payload: &[u8]) {
+        if !self.settings_received {
+            self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
+            return;
+        }
         // PUSH_PROMISE on the control stream is forbidden (RFC 9114 §7.2.5).
         self.connection_error
             .get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
     fn max_push_id_frame(&mut self, _payload: &[u8]) {
+        if !self.settings_received {
+            self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
+            return;
+        }
         if self.is_client {
             // Servers MUST NOT send MAX_PUSH_ID (RFC 9114 §7.2.7).
             self.connection_error
@@ -796,6 +832,13 @@ impl H3FrameHandler for H3UniStream {
         }
         // Server role: client is raising our push budget. hopf never pushes,
         // so ignore (still a legal frame on the control stream).
+    }
+    fn unknown_frame(&mut self, _frame_type: u64) {
+        // RFC 9114 §6.2.1 / §9: GREASE before SETTINGS does not satisfy the
+        // SETTINGS-first requirement.
+        if !self.settings_received {
+            self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
+        }
     }
     fn frame_error(&mut self, _message: &str) {
         self.connection_error.get_or_insert(frame::H3_FRAME_ERROR);
@@ -945,6 +988,21 @@ mod uni_stream_tests {
         Arc::new(qpack::H3Qpack::new())
     }
 
+    /// Classify as control and deliver a peer SETTINGS frame (required first
+    /// on the control stream per RFC 9114 §7.2.4).
+    fn open_control_with_settings(
+        uni: &mut H3UniStream,
+        ep: &mut RecordingEndpoint,
+    ) {
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(ep, &mut type_byte);
+        let mut settings = Vec::new();
+        frame::write_settings(&mut settings, qpack::MAX_TABLE_CAPACITY as u64, 0);
+        let mut data: &[u8] = &settings;
+        uni.receive(ep, &mut data);
+        assert!(!ep.closed, "SETTINGS alone must not close the connection");
+    }
+
     #[test]
     fn control_stream_settings_are_parsed_and_stored() {
         let state = shared_state();
@@ -1090,14 +1148,49 @@ mod uni_stream_tests {
         let qpack = shared_qpack();
         let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
-
-        let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
-        assert!(!ep.closed);
+        open_control_with_settings(&mut uni, &mut ep);
 
         let mut bad_frame = Vec::new();
         frame::write_data(&mut bad_frame, b"not allowed here");
         let mut data: &[u8] = &bad_frame;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    /// GOAWAY before SETTINGS is H3_MISSING_SETTINGS (RFC 9114 §6.2.1).
+    #[test]
+    fn goaway_before_settings_is_missing_settings() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+
+        let mut goaway_frame = Vec::new();
+        frame::write_goaway(&mut goaway_frame, 8);
+        let mut data: &[u8] = &goaway_frame;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_MISSING_SETTINGS));
+    }
+
+    /// A second SETTINGS frame is H3_FRAME_UNEXPECTED (RFC 9114 §7.2.4).
+    #[test]
+    fn second_settings_frame_is_frame_unexpected() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+        open_control_with_settings(&mut uni, &mut ep);
+
+        let mut second = Vec::new();
+        frame::write_settings(&mut second, 0, 0);
+        let mut data: &[u8] = &second;
         uni.receive(&mut ep, &mut data);
 
         assert!(ep.closed);
@@ -1112,9 +1205,7 @@ mod uni_stream_tests {
         let qpack = shared_qpack();
         let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
-
-        let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        open_control_with_settings(&mut uni, &mut ep);
 
         let mut goaway_frame = Vec::new();
         frame::write_goaway(&mut goaway_frame, 8);
@@ -1133,9 +1224,7 @@ mod uni_stream_tests {
         let qpack = shared_qpack();
         let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
         let mut ep = RecordingEndpoint::default();
-
-        let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        open_control_with_settings(&mut uni, &mut ep);
 
         let mut first = Vec::new();
         frame::write_goaway(&mut first, 4);
@@ -1165,9 +1254,7 @@ mod uni_stream_tests {
         let qpack = shared_qpack();
         let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
         let mut ep = RecordingEndpoint::default();
-
-        let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        open_control_with_settings(&mut uni, &mut ep);
 
         let mut first = Vec::new();
         frame::write_goaway(&mut first, 8);
@@ -1191,9 +1278,7 @@ mod uni_stream_tests {
         let qpack = shared_qpack();
         let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
         let mut ep = RecordingEndpoint::default();
-
-        let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        open_control_with_settings(&mut uni, &mut ep);
 
         // Stream ID 1 is client-initiated unidirectional, not bi.
         let mut bad = Vec::new();
@@ -1214,9 +1299,7 @@ mod uni_stream_tests {
         let qpack = shared_qpack();
         let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
         let mut ep = RecordingEndpoint::default();
-
-        let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        open_control_with_settings(&mut uni, &mut ep);
 
         let mut frame_bytes = Vec::new();
         frame::write_cancel_push(&mut frame_bytes, 0);
@@ -1235,9 +1318,7 @@ mod uni_stream_tests {
         let qpack = shared_qpack();
         let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
         let mut ep = RecordingEndpoint::default();
-
-        let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        open_control_with_settings(&mut uni, &mut ep);
 
         let mut frame_bytes = Vec::new();
         frame::write_push_promise(&mut frame_bytes, 0, b"");
@@ -1264,7 +1345,7 @@ mod uni_stream_tests {
         assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
     }
 
-    /// GREASE / unknown frame types on the control stream are ignored
+    /// GREASE / unknown frame types after SETTINGS are ignored
     /// (RFC 9114 §9), not treated as errors.
     #[test]
     fn grease_frame_on_control_stream_is_ignored() {
@@ -1272,9 +1353,7 @@ mod uni_stream_tests {
         let qpack = shared_qpack();
         let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
-
-        let mut type_byte: &[u8] = &[0x00];
-        uni.receive(&mut ep, &mut type_byte);
+        open_control_with_settings(&mut uni, &mut ep);
 
         // Reserved frame type 0x21 (N=0 grease form 0x1f*N+0x21).
         let mut grease = Vec::new();
@@ -1284,6 +1363,27 @@ mod uni_stream_tests {
 
         assert!(!ep.closed);
         assert_eq!(ep.close_connection_code, None);
+    }
+
+    /// GREASE before SETTINGS is H3_MISSING_SETTINGS — unknown frames do
+    /// not satisfy the SETTINGS-first requirement (RFC 9114 §6.2.1 / §9).
+    #[test]
+    fn grease_before_settings_is_missing_settings() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+
+        let mut grease = Vec::new();
+        frame::write_frame(&mut grease, 0x21, b"pad");
+        let mut data: &[u8] = &grease;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_MISSING_SETTINGS));
     }
 
     /// Premature FIN of the peer control stream is H3_CLOSED_CRITICAL_STREAM
