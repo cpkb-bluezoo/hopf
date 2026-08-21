@@ -26,8 +26,33 @@ pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
 /// decoder is willing to block. Default if absent: 0. hopf always sends 0
 /// (non-blocking encoder policy).
 pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;
+/// `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1 / §4.2.2) — advisory
+/// ceiling on a decompressed field section, in bytes under the
+/// name+value+32 accounting model. Default if absent: unlimited.
+pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
 /// `SETTINGS_ENABLE_CONNECT_PROTOCOL` identifier (RFC 9220).
 pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
+
+/// Default / advertised `SETTINGS_MAX_FIELD_SECTION_SIZE` — matches the
+/// HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE` hopf advertises (8192).
+pub const DEFAULT_MAX_FIELD_SECTION_SIZE: u64 = 8_192;
+
+/// Decompressed field-section size under RFC 7541 §4.1 / RFC 9114 §4.2.2
+/// accounting (name length + value length + 32 octets per field line).
+pub fn field_section_size<'a, I>(pairs: I) -> usize
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    pairs
+        .into_iter()
+        .map(|(name, value)| name.len() + value.len() + 32)
+        .sum()
+}
+
+/// Same as [`field_section_size`] for owned decoded pairs.
+pub fn field_section_size_owned(pairs: &[(String, String)]) -> usize {
+    field_section_size(pairs.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+}
 
 // ---------------------------------------------------------------------------
 // HTTP/3 application error codes (RFC 9114 §8.1), for QUIC-level
@@ -140,22 +165,28 @@ pub fn parse_goaway(payload: &[u8]) -> Option<u64> {
     varint::decode(payload).map(|(id, _)| id)
 }
 
-/// Append a SETTINGS frame advertising QPACK parameters (RFC 9204 §5) and
-/// Extended CONNECT (RFC 9220).
+/// Append a SETTINGS frame advertising QPACK parameters (RFC 9204 §5),
+/// `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1), and Extended
+/// CONNECT (RFC 9220).
 ///
 /// `qpack_max_table_capacity` is this endpoint's decoder ceiling (what the
 /// peer encoder may grow to); `qpack_blocked_streams` is how many streams
 /// we are willing to block — hopf always passes `0`.
+/// `max_field_section_size` is the decompressed field-section byte ceiling
+/// we will enforce on inbound HEADERS (see [`DEFAULT_MAX_FIELD_SECTION_SIZE`]).
 pub fn write_settings(
     out: &mut Vec<u8>,
     qpack_max_table_capacity: u64,
     qpack_blocked_streams: u64,
+    max_field_section_size: u64,
 ) {
     let mut payload = Vec::new();
     varint::encode(&mut payload, SETTINGS_QPACK_MAX_TABLE_CAPACITY);
     varint::encode(&mut payload, qpack_max_table_capacity);
     varint::encode(&mut payload, SETTINGS_QPACK_BLOCKED_STREAMS);
     varint::encode(&mut payload, qpack_blocked_streams);
+    varint::encode(&mut payload, SETTINGS_MAX_FIELD_SECTION_SIZE);
+    varint::encode(&mut payload, max_field_section_size);
     varint::encode(&mut payload, SETTINGS_ENABLE_CONNECT_PROTOCOL);
     varint::encode(&mut payload, 1);
     write_frame(out, SETTINGS, &payload);
@@ -186,7 +217,7 @@ mod tests {
     #[test]
     fn write_settings_round_trips_through_parse_settings() {
         let mut out = Vec::new();
-        write_settings(&mut out, 4096, 0);
+        write_settings(&mut out, 4096, 0, DEFAULT_MAX_FIELD_SECTION_SIZE);
         // Strip the frame type+length prefix to get just the payload, as a
         // real receiver would after `H3Parser` hands it a SETTINGS frame.
         let (ty, ty_len) = varint::decode(&out).unwrap();
@@ -200,6 +231,7 @@ mod tests {
             vec![
                 (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 4096),
                 (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
+                (SETTINGS_MAX_FIELD_SECTION_SIZE, DEFAULT_MAX_FIELD_SECTION_SIZE),
                 (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
             ]
         );
@@ -208,11 +240,17 @@ mod tests {
     #[test]
     fn parse_settings_multiple_entries_and_truncated_trailer() {
         let mut payload = Vec::new();
-        varint::encode(&mut payload, 0x06); // SETTINGS_MAX_FIELD_SECTION_SIZE
+        varint::encode(&mut payload, SETTINGS_MAX_FIELD_SECTION_SIZE);
         varint::encode(&mut payload, 4096);
         varint::encode(&mut payload, SETTINGS_ENABLE_CONNECT_PROTOCOL);
         varint::encode(&mut payload, 1);
-        assert_eq!(parse_settings(&payload), vec![(0x06, 4096), (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1)]);
+        assert_eq!(
+            parse_settings(&payload),
+            vec![
+                (SETTINGS_MAX_FIELD_SECTION_SIZE, 4096),
+                (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1)
+            ]
+        );
 
         // A dangling identifier with no value is silently dropped, not a panic.
         let mut truncated = payload.clone();
