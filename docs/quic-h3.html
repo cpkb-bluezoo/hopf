@@ -302,6 +302,7 @@
 <span id="cb4-22"><a href="#cb4-22" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div>
 <p>On connect, the H3 client opens control + QPACK uni streams, then one bi-stream for the application request (<code>ClientHandler::start</code>).</p>
 <p>Each H3 request maps to a QUIC-stream <code>Endpoint</code> driving the same <code>ServerHandler</code> / <code>ClientHandler</code> API as H1/H2.</p>
+<p>QUIC connection and stream teardown mirrors Gumdrop: a peer application or transport <code>CONNECTION_CLOSE</code>, idle timeout, or inbound <code>STOP_SENDING</code> reaches the stream's <code>ProtocolHandler::error</code> with <code>QuicConnectionCloseError</code> / <code>QuicStreamStoppedError</code> (downcast helpers <code>connection_close_error</code> / <code>stream_stopped_error</code>). Clean local shutdown and graceful stream FIN still call <code>disconnected</code>.</p>
 <h2 id="alpn-and-tls-1.3">ALPN and TLS 1.3</h2>
 <table>
 <thead>
@@ -366,6 +367,7 @@
 <li>Plain (non-hooks) server mode installs <code>NopHandler</code> on accepted unidirectional streams.</li>
 <li>No HTTP/2-style server push; no WebTransport / DATAGRAM product API yet.</li>
 <li>0-RTT is off by default; enable via <code>QuicTlsOptions::with_early_data</code> (replay risk — see SECURITY.md). Not polished as an application feature.</li>
+<li>Locally-initiated connection close (<code>LocallyClosed</code>) still calls <code>ProtocolHandler::disconnected</code> on this endpoint's streams; only the peer sees <code>QuicConnectionCloseError</code> via <code>error</code>. Use the return value of <code>close_connection</code> locally if you need the code you just sent.</li>
 </ul>
 <h2 id="see-also">See also</h2>
 <ul>

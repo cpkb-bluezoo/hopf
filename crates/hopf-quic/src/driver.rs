@@ -15,12 +15,13 @@ use bytes::Bytes;
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
 use quinn_proto::{
-    Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint as QuinnEndpoint, EndpointConfig,
-    Event, StreamEvent, StreamId, Transmit, VarInt,
+    Connection, ConnectionError, ConnectionHandle, DatagramEvent, Dir, Endpoint as QuinnEndpoint,
+    EndpointConfig, Event, StreamEvent, StreamId, Transmit, VarInt,
 };
 use hopf_core::{Endpoint, HandlerFactory, ProtocolHandler, SecurityInfo};
 
 use crate::config::{QuicConnectConfig, QuicListenConfig, QuicListenHooksConfig};
+use crate::error::{connection_lost_io_error, stream_stopped_io_error};
 use crate::hooks::{ConnectionFactory, QuicConnApi, QuicConnection};
 use crate::stream::{QuicStreamEndpoint, StreamQueues};
 
@@ -831,8 +832,8 @@ impl Driver {
                 Event::Connected => {
                     self.on_connected(ch);
                 }
-                Event::ConnectionLost { .. } => {
-                    self.on_connection_lost(ch);
+                Event::ConnectionLost { reason } => {
+                    self.on_connection_lost(ch, reason);
                     return;
                 }
                 Event::Stream(se) => self.on_stream_event(ch, se),
@@ -1090,10 +1091,17 @@ impl Driver {
             StreamEvent::Readable { id } => {
                 self.read_stream(ch, id);
             }
-            StreamEvent::Finished { id } | StreamEvent::Stopped { id, .. } => {
+            StreamEvent::Finished { id } => {
                 // Drain any remaining data before tearing down the stream.
                 self.read_stream(ch, id);
-                self.finish_stream(ch, id);
+                self.finish_stream(ch, id, None);
+            }
+            StreamEvent::Stopped { id, error_code } => {
+                // Peer STOP_SENDING (RFC 9000 §19.5) — surface the app error
+                // code via ProtocolHandler::error, not the argument-free
+                // disconnected() path used for a clean FIN.
+                self.read_stream(ch, id);
+                self.finish_stream(ch, id, Some(stream_stopped_io_error(error_code)));
             }
             _ => {}
         }
@@ -1335,22 +1343,37 @@ impl Driver {
         }
     }
 
-    fn finish_stream(&mut self, ch: ConnectionHandle, id: StreamId) {
+    /// Tear down a stream. `err` is `Some` for abnormal teardown
+    /// (STOP_SENDING / connection lost with a reason) and reaches
+    /// [`ProtocolHandler::error`]; `None` is a clean FIN → `disconnected`.
+    fn finish_stream(&mut self, ch: ConnectionHandle, id: StreamId, err: Option<io::Error>) {
         if let Some(slot) = self.connections.get_mut(&ch) {
             if let Some(mut stream) = slot.streams.remove(&id) {
                 stream.endpoint.mark_closed();
-                stream.handler.disconnected(&mut stream.endpoint);
+                match &err {
+                    Some(e) => stream.handler.error(&mut stream.endpoint, e),
+                    None => stream.handler.disconnected(&mut stream.endpoint),
+                }
             }
         }
     }
 
-    fn on_connection_lost(&mut self, ch: ConnectionHandle) {
+    /// Tear down every stream on a lost connection. Clean local shutdown
+    /// (`LocallyClosed`) still calls `disconnected`; every other
+    /// [`ConnectionError`] is mapped to an `io::Error` and delivered via
+    /// `ProtocolHandler::error` (Gumdrop `QuicConnectionCloseException`
+    /// pattern) so protocols can read application / transport error codes.
+    fn on_connection_lost(&mut self, ch: ConnectionHandle, reason: ConnectionError) {
+        let err = connection_lost_io_error(reason);
         if let Some(mut slot) = self.connections.remove(&ch) {
             let ids: Vec<_> = slot.streams.keys().copied().collect();
             for id in ids {
                 if let Some(mut stream) = slot.streams.remove(&id) {
                     stream.endpoint.mark_closed();
-                    stream.handler.disconnected(&mut stream.endpoint);
+                    match &err {
+                        Some(e) => stream.handler.error(&mut stream.endpoint, e),
+                        None => stream.handler.disconnected(&mut stream.endpoint),
+                    }
                 }
             }
         }
@@ -1693,11 +1716,14 @@ mod tests {
         server.shutdown();
     }
 
-    struct DisconnectRecorder {
+    /// Records both clean `disconnected` and abnormal `error` teardown.
+    struct TeardownRecorder {
         disconnected: Arc<std::sync::atomic::AtomicBool>,
+        errored: Arc<std::sync::atomic::AtomicBool>,
+        last_error: Arc<StdMutex<Option<io::Error>>>,
     }
 
-    impl ProtocolHandler for DisconnectRecorder {
+    impl ProtocolHandler for TeardownRecorder {
         fn connected(&mut self, endpoint: &mut dyn Endpoint) {
             // Force the stream onto the wire so the peer's own connected()
             // fires too (a stream that never sends anything is never
@@ -1710,13 +1736,25 @@ mod tests {
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
             self.disconnected.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, err: &io::Error) {
+            self.errored.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Prefer retaining a typed close error when present so tests can
+            // downcast; otherwise keep kind + Display text.
+            let stored = if let Some(close) = crate::connection_close_error(err) {
+                close.clone().into_io()
+            } else {
+                io::Error::new(err.kind(), err.to_string())
+            };
+            *self.last_error.lock().unwrap() = Some(stored);
+        }
     }
 
     /// A real, much-shorter-than-default idle timeout applied via
     /// [`QuicTransportOptions`] actually tears the connection down on its
     /// own — proves the config is wired into quinn-proto's real transport
-    /// parameters, not just accepted and ignored.
+    /// parameters, not just accepted and ignored. Idle timeout is abnormal
+    /// teardown, so it reaches `ProtocolHandler::error` (TimedOut), not
+    /// the clean-close `disconnected` path.
     #[test]
     fn transport_options_shorten_the_idle_timeout() {
         use crate::config::{apply_client_transport_options, apply_server_transport_options, QuicTransportOptions};
@@ -1730,26 +1768,40 @@ mod tests {
         apply_client_transport_options(&mut client_cfg, &opts).unwrap();
 
         let server_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_last = Arc::new(StdMutex::new(None));
         let server_disconnected2 = Arc::clone(&server_disconnected);
+        let server_errored2 = Arc::clone(&server_errored);
+        let server_last2 = Arc::clone(&server_last);
         let server = listen_quic(QuicListenConfig::new(
             "127.0.0.1:0".parse().unwrap(),
             server_cfg,
             Arc::new(move || {
-                Box::new(DisconnectRecorder { disconnected: Arc::clone(&server_disconnected2) })
-                    as Box<dyn ProtocolHandler>
+                Box::new(TeardownRecorder {
+                    disconnected: Arc::clone(&server_disconnected2),
+                    errored: Arc::clone(&server_errored2),
+                    last_error: Arc::clone(&server_last2),
+                }) as Box<dyn ProtocolHandler>
             }),
         ))
         .unwrap();
 
         let client_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client_last = Arc::new(StdMutex::new(None));
         let client_disconnected2 = Arc::clone(&client_disconnected);
+        let client_errored2 = Arc::clone(&client_errored);
+        let client_last2 = Arc::clone(&client_last);
         let _client = connect_quic(QuicConnectConfig::new(
             server.local_addr,
             client_cfg,
             "localhost",
             Arc::new(move || {
-                Box::new(DisconnectRecorder { disconnected: Arc::clone(&client_disconnected2) })
-                    as Box<dyn ProtocolHandler>
+                Box::new(TeardownRecorder {
+                    disconnected: Arc::clone(&client_disconnected2),
+                    errored: Arc::clone(&client_errored2),
+                    last_error: Arc::clone(&client_last2),
+                }) as Box<dyn ProtocolHandler>
             }),
         ))
         .unwrap();
@@ -1758,15 +1810,33 @@ mod tests {
         // timeout, both sides must tear the connection down well within
         // this window; the default (30s) never would.
         for _ in 0..150 {
-            if server_disconnected.load(std::sync::atomic::Ordering::SeqCst)
-                && client_disconnected.load(std::sync::atomic::Ordering::SeqCst)
+            if server_errored.load(std::sync::atomic::Ordering::SeqCst)
+                && client_errored.load(std::sync::atomic::Ordering::SeqCst)
             {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
-        assert!(server_disconnected.load(std::sync::atomic::Ordering::SeqCst), "server never saw the idle timeout");
-        assert!(client_disconnected.load(std::sync::atomic::Ordering::SeqCst), "client never saw the idle timeout");
+        assert!(
+            server_errored.load(std::sync::atomic::Ordering::SeqCst),
+            "server never saw the idle timeout via error()"
+        );
+        assert!(
+            client_errored.load(std::sync::atomic::Ordering::SeqCst),
+            "client never saw the idle timeout via error()"
+        );
+        assert!(
+            !server_disconnected.load(std::sync::atomic::Ordering::SeqCst),
+            "idle timeout must not use the clean disconnected() path"
+        );
+        assert!(
+            !client_disconnected.load(std::sync::atomic::Ordering::SeqCst),
+            "idle timeout must not use the clean disconnected() path"
+        );
+        assert_eq!(
+            server_last.lock().unwrap().as_ref().map(|e| e.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
 
         server.shutdown();
     }
@@ -1796,27 +1866,39 @@ mod tests {
         apply_client_transport_options(&mut client_cfg, &opts).unwrap();
 
         let server_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_last = Arc::new(StdMutex::new(None));
         let server_disconnected2 = Arc::clone(&server_disconnected);
+        let server_errored2 = Arc::clone(&server_errored);
+        let server_last2 = Arc::clone(&server_last);
         let server = listen_quic(QuicListenConfig::new(
             "127.0.0.1:0".parse().unwrap(),
             server_cfg,
             Arc::new(move || {
-                Box::new(DisconnectRecorder {
+                Box::new(TeardownRecorder {
                     disconnected: Arc::clone(&server_disconnected2),
+                    errored: Arc::clone(&server_errored2),
+                    last_error: Arc::clone(&server_last2),
                 }) as Box<dyn ProtocolHandler>
             }),
         ))
         .unwrap();
 
         let client_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client_last = Arc::new(StdMutex::new(None));
         let client_disconnected2 = Arc::clone(&client_disconnected);
+        let client_errored2 = Arc::clone(&client_errored);
+        let client_last2 = Arc::clone(&client_last);
         let _client = connect_quic(QuicConnectConfig::new(
             server.local_addr,
             client_cfg,
             "localhost",
             Arc::new(move || {
-                Box::new(DisconnectRecorder {
+                Box::new(TeardownRecorder {
                     disconnected: Arc::clone(&client_disconnected2),
+                    errored: Arc::clone(&client_errored2),
+                    last_error: Arc::clone(&client_last2),
                 }) as Box<dyn ProtocolHandler>
             }),
         ))
@@ -1826,13 +1908,90 @@ mod tests {
         // idle periods; keep-alive must keep the connection up.
         thread::sleep(Duration::from_millis(800));
         assert!(
-            !server_disconnected.load(std::sync::atomic::Ordering::SeqCst),
+            !server_disconnected.load(std::sync::atomic::Ordering::SeqCst)
+                && !server_errored.load(std::sync::atomic::Ordering::SeqCst),
             "server disconnected despite client keep-alive"
         );
         assert!(
-            !client_disconnected.load(std::sync::atomic::Ordering::SeqCst),
+            !client_disconnected.load(std::sync::atomic::Ordering::SeqCst)
+                && !client_errored.load(std::sync::atomic::Ordering::SeqCst),
             "client disconnected despite its own keep-alive"
         );
+
+        server.shutdown();
+    }
+
+    /// Peer `close_connection(app_error_code)` must reach the other side's
+    /// `ProtocolHandler::error` as a [`crate::QuicConnectionCloseError`]
+    /// carrying that code — not the argument-free `disconnected()` path.
+    #[test]
+    fn peer_application_close_delivers_connection_close_error() {
+        const APP_CODE: u64 = 0x010c; // H3_REQUEST_CANCELLED
+
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"close-test"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"close-test"]).unwrap();
+
+        let server_disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_errored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_last = Arc::new(StdMutex::new(None));
+        let server_disconnected2 = Arc::clone(&server_disconnected);
+        let server_errored2 = Arc::clone(&server_errored);
+        let server_last2 = Arc::clone(&server_last);
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(move || {
+                Box::new(TeardownRecorder {
+                    disconnected: Arc::clone(&server_disconnected2),
+                    errored: Arc::clone(&server_errored2),
+                    last_error: Arc::clone(&server_last2),
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        struct CloseAfterSend;
+        impl ProtocolHandler for CloseAfterSend {
+            fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+                endpoint.send(b"x");
+                endpoint.close_connection(APP_CODE as u32);
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+        }
+
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(|| Box::new(CloseAfterSend) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        for _ in 0..200 {
+            if server_errored.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            server_errored.load(std::sync::atomic::Ordering::SeqCst),
+            "server never received ProtocolHandler::error for the peer application close"
+        );
+        assert!(
+            !server_disconnected.load(std::sync::atomic::Ordering::SeqCst),
+            "application CONNECTION_CLOSE must not use disconnected()"
+        );
+        let last = server_last.lock().unwrap();
+        let err = last.as_ref().expect("error payload");
+        let close = crate::connection_close_error(err).expect("QuicConnectionCloseError");
+        assert!(close.application_error);
+        assert_eq!(close.error_code, APP_CODE);
 
         server.shutdown();
     }
