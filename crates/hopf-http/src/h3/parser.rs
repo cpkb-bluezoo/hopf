@@ -22,6 +22,10 @@ pub trait H3FrameHandler {
     fn goaway_frame(&mut self, payload: &[u8]);
     /// A MAX_PUSH_ID frame (RFC 9114 §7.2.7).
     fn max_push_id_frame(&mut self, payload: &[u8]);
+    /// An unknown or reserved (GREASE) frame type — ignored after SETTINGS
+    /// on the control stream (RFC 9114 §9), but must not count as the
+    /// required first SETTINGS frame (§6.2.1 / §7.2.4).
+    fn unknown_frame(&mut self, _frame_type: u64) {}
     /// A malformed frame was received.
     fn frame_error(&mut self, message: &str);
 }
@@ -92,8 +96,9 @@ impl H3Parser {
                 frame::PUSH_PROMISE => handler.push_promise_frame(payload),
                 frame::GOAWAY => handler.goaway_frame(payload),
                 frame::MAX_PUSH_ID => handler.max_push_id_frame(payload),
-                // Unknown / reserved (GREASE) frame types — ignore per RFC 9114 §9.
-                _ => {}
+                // Unknown / reserved (GREASE) — notify so the control stream
+                // can enforce SETTINGS-first; otherwise ignore per §9.
+                other => handler.unknown_frame(other),
             }
             offset = end;
         }
