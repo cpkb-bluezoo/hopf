@@ -223,7 +223,7 @@ HttpClient::new("api.example.com", 443)
 <p><code>HttpRequest::start_request_body</code> / <code>request_body_content</code> / <code>end_request_body</code> stream a request body in caller-chosen chunks — on both H1 and H2, bytes reach the wire as each chunk arrives rather than being buffered until the whole body is known:</p>
 <table>
 <colgroup><col style="width: 45%" /><col style="width: 54%" /></colgroup>
-<thead><tr><th>Method</th><th>Behavior</th></tr></thead>
+<thead><tr><th>Method</th><th>Behaviour</th></tr></thead>
 <tbody>
 <tr><td><code>start_request_body(handler)</code></td><td>H1: flushes request headers and opens chunked encoding. H2: opens the stream and sends HEADERS immediately (no <code>END_STREAM</code>) — it does not wait for <code>end_request_body</code> the way a one-shot <code>ClientWriter::start</code> call does.</td></tr>
 <tr><td><code>request_body_content(data) -&gt; Result&lt;usize, HttpClientError&gt;</code></td><td>Queues <code>data</code> and returns the number of bytes actually accepted — a <em>short write</em> (less than <code>data.len()</code>, possibly <code>0</code>) when the connection's bounded outbound buffer (H1) or the H2 stream's flow-control backlog is currently full, rather than growing unboundedly. Never blocks.</td></tr>

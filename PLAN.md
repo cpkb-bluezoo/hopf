@@ -208,7 +208,7 @@ XML via tractrix is the locked declarative format once a loader exists.
 | **A — Transport (`hopf-core` / `-quic`)** | `Endpoint` (byte stream); TCP endpoint; UDP endpoint (datagrams — not faked as a stream); QUIC stream endpoint; multiplexed QUIC connection (`open_stream` / accept) |
 | **B — HTTP Stream (`hopf-http`)** | One request/response exchange; `HttpStream` + server / client handlers (`ServerHandler` / `ServerWriter`, `ClientHandler` / `ClientWriter`) — **version- and transport-agnostic** |
 
-H1 **adapts** a TCP `Endpoint` into serialized Streams (`H1Endpoint`); H2 multiplexes Streams on one TCP `Endpoint`; H3 maps each request to a QUIC stream `Endpoint`. Bind vs dial only affects how the transport Endpoint was born; role (server / client) is a separate axis. Terminology: HTTP Stream ≠ H2 stream id ≠ QUIC stream endpoint.
+H1 **adapts** a TCP `Endpoint` into serialised Streams (`H1Endpoint`); H2 multiplexes Streams on one TCP `Endpoint`; H3 maps each request to a QUIC stream `Endpoint`. Bind vs dial only affects how the transport Endpoint was born; role (server / client) is a separate axis. Terminology: HTTP Stream ≠ H2 stream id ≠ QUIC stream endpoint.
 
 ### Dynamic bindings ([#6](https://github.com/cpkb-bluezoo/hopf/issues/6))
 

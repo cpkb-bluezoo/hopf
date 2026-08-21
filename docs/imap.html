@@ -274,7 +274,7 @@ ImapClient::new(&quot;mail.example.com&quot;, 143)
 </table>
 <p>Example binary: <code>cargo run -p imap-fetch -- 127.0.0.1 1143 alice secret</code>.</p>
 <h2 id="pipelining">Pipelining</h2>
-<p>The client keeps a tag-correlated <code>PendingMap</code> of outstanding commands (up to <code>max_pipeline</code>). Untagged replies are classified by prefix (<code>STATUS</code>, <code>LIST</code>, <code>FETCH</code>, <code>SEARCH</code>, …) and routed to the <strong>oldest compatible pending command</strong>, so tagged completions may arrive in any order. <code>pipeline_status_and_list</code> issues STATUS and LIST back-to-back as a demonstration; the Hopf server serializes storage-backed commands per connection and answers in order, but the client also handles out-of-order completion from other servers.</p>
+<p>The client keeps a tag-correlated <code>PendingMap</code> of outstanding commands (up to <code>max_pipeline</code>). Untagged replies are classified by prefix (<code>STATUS</code>, <code>LIST</code>, <code>FETCH</code>, <code>SEARCH</code>, …) and routed to the <strong>oldest compatible pending command</strong>, so tagged completions may arrive in any order. <code>pipeline_status_and_list</code> issues STATUS and LIST back-to-back as a demonstration; the Hopf server serialises storage-backed commands per connection and answers in order, but the client also handles out-of-order completion from other servers.</p>
 <h2 id="timeouts">Timeouts</h2>
 <p><code>ImapClientTimeouts</code> phases:</p>
 <table>

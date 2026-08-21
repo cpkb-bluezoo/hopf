@@ -301,7 +301,7 @@
 </tr>
 </tbody>
 </table>
-<p>H1 adapts a TCP <code>Endpoint</code> into serialized Streams; H2 multiplexes Streams on one TCP <code>Endpoint</code>; H3 maps each request to a QUIC stream <code>Endpoint</code>. Bind vs dial only affects how the transport was born; server/client role is a separate axis. Terminology: HTTP Stream ≠ H2 stream id ≠ QUIC stream endpoint.</p>
+<p>H1 adapts a TCP <code>Endpoint</code> into serialised Streams; H2 multiplexes Streams on one TCP <code>Endpoint</code>; H3 maps each request to a QUIC stream <code>Endpoint</code>. Bind vs dial only affects how the transport was born; server/client role is a separate axis. Terminology: HTTP Stream ≠ H2 stream id ≠ QUIC stream endpoint.</p>
 <h2 id="endpoint-vs-protocolhandler">Endpoint vs ProtocolHandler</h2>
 <table>
 <colgroup>
@@ -377,7 +377,7 @@
 <td>Client and server are separate objects with separate state machines. Reference implementations: <code>hopf-dns</code> (<code>client/</code>, <code>server/</code>, shared <code>wire/</code>, <code>dnssec/</code>, <code>cache.rs</code>), <code>hopf-imap</code> (<code>client/</code>, <code>server/</code>, shared <code>capability.rs</code>, <code>idle.rs</code>, …).</td>
 </tr>
 <tr>
-<td><strong>Role-parameterized file</strong><br>one type/file, constructed as either role</td>
+<td><strong>Role-parameterised file</strong><br>one type/file, constructed as either role</td>
 <td>Client and server share one wire FSM and splitting it would fragment that state machine. E.g. <code>hopf-tls</code> (<code>acceptor()</code> / <code>connector()</code>), <code>hopf-quic</code> (<code>listen_quic</code> / <code>connect_quic</code>), <code>hopf-http</code>'s <code>H1Endpoint::server()</code> / <code>::client()</code>, <code>hopf-websocket</code>'s <code>WsUpgradeHandler::server()</code> / <code>::client()</code>, and each <code>hopf-auth</code> SASL mechanism (<code>PlainServer</code> / <code>PlainClient</code> in one file — SASL client/server are wire roles, see <a href="auth.html">auth</a>).</td>
 </tr>
 <tr>
