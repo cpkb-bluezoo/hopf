@@ -10,6 +10,7 @@
 
 mod config;
 mod driver;
+mod error;
 mod hooks;
 mod runtime_ext;
 mod stream;
@@ -23,6 +24,9 @@ pub use config::{
     QuicListenHooksConfig, QuicServerConfig, QuicTlsOptions, QuicTransportOptions,
 };
 pub use driver::{connect_quic, connect_quic_hooks, listen_quic, listen_quic_hooks, QuicDriverHandle};
+pub use error::{
+    connection_close_error, stream_stopped_error, QuicConnectionCloseError, QuicStreamStoppedError,
+};
 pub use hooks::{ConnectionFactory, QuicConnApi, QuicConnection};
 pub use runtime_ext::RuntimeQuicExt;
 pub use stream::QuicStreamEndpoint;

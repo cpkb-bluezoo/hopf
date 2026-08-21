@@ -511,11 +511,16 @@ impl ProtocolHandler for H3RequestStream {
         self.finish_request(endpoint);
     }
 
-    fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {
+    fn error(&mut self, endpoint: &mut dyn Endpoint, _: &io::Error) {
+        // Abnormal QUIC teardown (CONNECTION_CLOSE / STOP_SENDING / idle
+        // timeout) replaces disconnected() — still cancel QPACK refs and
+        // finish the request so the application sees completion.
+        self.bind_execute_conn();
         // RFC 9204 §4.4.2: this stream won't be acknowledged now — let the
         // peer's encoder release any dynamic-table references it held open
         // for it.
         self.qpack.cancel_stream(self.stream_id);
+        self.finish_request(endpoint);
     }
 }
 

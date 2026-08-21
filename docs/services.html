@@ -121,7 +121,7 @@ Worker reactor (affinity for life)</code></pre>
 </tr>
 <tr>
 <td><code>disconnected</code></td>
-<td>Peer closed / endpoint finished closing</td>
+<td>Peer closed / endpoint finished closing (clean FIN / local shutdown)</td>
 </tr>
 <tr>
 <td><code>security_established</code></td>
@@ -129,7 +129,7 @@ Worker reactor (affinity for life)</code></pre>
 </tr>
 <tr>
 <td><code>error</code></td>
-<td>Unrecoverable I/O or protocol error</td>
+<td>Unrecoverable I/O or protocol error. On QUIC, also used for abnormal teardown (peer CONNECTION_CLOSE, idle timeout, STOP_SENDING) with typed sources such as <code>hopf_quic::QuicConnectionCloseError</code> — not in addition to <code>disconnected</code></td>
 </tr>
 </tbody>
 </table>
