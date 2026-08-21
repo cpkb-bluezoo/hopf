@@ -109,6 +109,9 @@ fn sync_pending_open(handler: &mut FtpControlHandler, endpoint: &mut dyn Endpoin
     else {
         return;
     };
+    // Open finished (or was discarded) — clear the gate even if the
+    // completion callback's `with_endpoint` poke was a no-op.
+    handler.busy.store(false, Ordering::Relaxed);
     if bridge.was_aborted() {
         // `ABOR` already sent its own 426/226 replies — nothing more to do.
         return;
@@ -467,7 +470,9 @@ impl FtpControlHandler {
                 // Drop any stashed offloaded-open outcome so a later
                 // `sync_pending_open` cannot revive it if the captured
                 // bridge Arc somehow diverged from `self.bridge`.
-                let _ = self.pending_open.lock().unwrap().take();
+                if self.pending_open.lock().unwrap().take().is_some() {
+                    self.busy.store(false, Ordering::Relaxed);
+                }
                 let in_progress = self
                     .bridge
                     .as_ref()
@@ -1616,22 +1621,110 @@ mod open_offload_tests {
     use crate::server::fs::BasicFtpFileSystem;
     use crate::server::handler::FilesystemFtpHandler;
     use hopf_auth::PasswordTrustPolicy;
-    use hopf_core::{RuntimeConfig, SecurityInfo, StartTlsError, TimerHandle, WriteReadyCallback};
+    use hopf_core::{
+        ConnHandle, ConnHandleBackend, RuntimeConfig, SecurityInfo, StartTlsError, TimerHandle,
+        WriteReadyCallback,
+    };
+    use std::collections::VecDeque;
     use std::io;
     use std::sync::OnceLock;
     use std::time::Duration;
 
-    /// Minimal `Endpoint`: captures sent bytes, no real I/O or reactor —
-    /// same shape as this session's other crates' own test-only stubs.
+    /// Work posted through the mock [`ConnHandle`] — mirrors a reactor
+    /// queue so storage-pool `execute`/`with_endpoint` are not run on the
+    /// worker thread (a synchronous `from_execute(|t| t())` made opens
+    /// race with `sync_pending_open` at the end of the submitting
+    /// `receive`, which flaked the defer/ABOR tests on CI).
+    enum MockTask {
+        Execute(Box<dyn FnOnce() + Send>),
+        WithEndpoint(Box<dyn FnOnce(&mut dyn Endpoint) + Send>),
+    }
+
+    struct MockBackend {
+        queue: Mutex<VecDeque<MockTask>>,
+    }
+
+    impl ConnHandleBackend for MockBackend {
+        fn with_endpoint(&self, task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>) {
+            self.queue
+                .lock()
+                .unwrap()
+                .push_back(MockTask::WithEndpoint(task));
+        }
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            self.queue.lock().unwrap().push_back(MockTask::Execute(task));
+        }
+        fn is_probably_open(&self) -> bool {
+            true
+        }
+        fn schedule_timer(
+            &self,
+            _delay: Duration,
+            callback: Box<dyn FnOnce() + Send>,
+        ) -> TimerHandle {
+            self.execute(callback);
+            TimerHandle::from_cancel(|| {})
+        }
+    }
+
+    /// Minimal `Endpoint`: captures sent bytes and queues ConnHandle work
+    /// like a real reactor (no I/O).
     struct MockEndpoint {
         sent: Vec<u8>,
         open: bool,
         peer: SocketAddr,
         local: SocketAddr,
+        backend: Arc<MockBackend>,
+        poked: bool,
     }
     impl MockEndpoint {
         fn new(peer: SocketAddr, local: SocketAddr) -> Self {
-            Self { sent: Vec::new(), open: true, peer, local }
+            Self {
+                sent: Vec::new(),
+                open: true,
+                peer,
+                local,
+                backend: Arc::new(MockBackend {
+                    queue: Mutex::new(VecDeque::new()),
+                }),
+                poked: false,
+            }
+        }
+
+        /// Run queued `execute` jobs only (storage completion stash).
+        /// Leaves `with_endpoint`/poke queued so a following `ABOR` can
+        /// discard `pending_open` before `sync_pending_open` applies it.
+        fn drain_executes(&mut self) {
+            loop {
+                let next = {
+                    let mut q = self.backend.queue.lock().unwrap();
+                    match q.front() {
+                        Some(MockTask::Execute(_)) => q.pop_front(),
+                        _ => None,
+                    }
+                };
+                match next {
+                    Some(MockTask::Execute(task)) => task(),
+                    _ => break,
+                }
+            }
+        }
+
+        /// Drain all queued ConnHandle work; re-enter `receive` on poke.
+        fn pump(&mut self, handler: &mut FtpControlHandler) {
+            loop {
+                let next = self.backend.queue.lock().unwrap().pop_front();
+                match next {
+                    Some(MockTask::Execute(task)) => task(),
+                    Some(MockTask::WithEndpoint(task)) => task(self),
+                    None if self.poked => {
+                        self.poked = false;
+                        let mut empty: &[u8] = &[];
+                        handler.receive(self, &mut empty);
+                    }
+                    None => break,
+                }
+            }
         }
     }
     impl Endpoint for MockEndpoint {
@@ -1663,14 +1756,17 @@ mod open_offload_tests {
         fn pause_read(&mut self) {}
         fn resume_read(&mut self) {}
         fn on_write_ready(&mut self, _callback: Option<WriteReadyCallback>) {}
+        fn poke_handler(&mut self) {
+            self.poked = true;
+        }
         fn execute(&self, task: Box<dyn FnOnce() + Send>) {
-            task();
+            self.backend.execute(task);
         }
         fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
             TimerHandle::from_cancel(|| {})
         }
-        fn handle(&self) -> hopf_core::ConnHandle {
-            hopf_core::ConnHandle::from_execute(Arc::new(|task| task()))
+        fn handle(&self) -> ConnHandle {
+            ConnHandle::from_backend(Arc::clone(&self.backend) as Arc<dyn ConnHandleBackend>)
         }
     }
 
@@ -1765,7 +1861,7 @@ mod open_offload_tests {
         assert!(
             wait_for(
                 || {
-                    feed(&mut h, &mut ep, b"");
+                    ep.pump(&mut h);
                     !ep.sent.is_empty()
                 },
                 2000
@@ -1795,7 +1891,7 @@ mod open_offload_tests {
 
         assert!(wait_for(
             || {
-                feed(&mut h, &mut ep, b"");
+                ep.pump(&mut h);
                 !ep.sent.is_empty()
             },
             2000
@@ -1824,12 +1920,17 @@ mod open_offload_tests {
         login_and_pasv(&mut h, &mut ep);
 
         feed(&mut h, &mut ep, b"RETR hello.txt\r\n");
-        // Wait until the offloaded open has stashed its outcome. (The mock
-        // ConnHandle is execute-only, so the completion callback's
-        // `with_endpoint` poke is a no-op — `busy` stays set — but
-        // `pending_open` is still filled before that call.)
+        // Drain storage `execute` callbacks until the open is stashed, but
+        // do not pump `with_endpoint`/poke yet — that would sync the 150
+        // before ABOR can discard the pending outcome.
         assert!(
-            wait_for(|| h.pending_open.lock().unwrap().is_some(), 2000),
+            wait_for(
+                || {
+                    ep.drain_executes();
+                    h.pending_open.lock().unwrap().is_some()
+                },
+                2000
+            ),
             "offloaded open must stash a pending outcome"
         );
         feed(&mut h, &mut ep, b"ABOR\r\n");
@@ -1841,10 +1942,8 @@ mod open_offload_tests {
             String::from_utf8_lossy(&after_abor)
         );
 
-        // Give any late poke a chance, then confirm sync_pending_open
-        // did not queue (or reply for) the aborted open.
-        std::thread::sleep(Duration::from_millis(50));
-        feed(&mut h, &mut ep, b"");
+        // Late poke / with_endpoint must not revive the aborted open.
+        ep.pump(&mut h);
         assert_eq!(
             ep.sent, after_abor,
             "no further replies once the aborted open resolves"
