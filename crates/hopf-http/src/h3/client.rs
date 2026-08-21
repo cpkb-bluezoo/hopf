@@ -210,6 +210,26 @@ struct H3ClientWriter {
     done: bool,
 }
 
+/// Outbound request held while waiting for peer SETTINGS so Extended
+/// CONNECT can consult [`H3PeerState::peer_enable_connect_protocol`].
+struct PendingOutbound {
+    headers: Headers,
+    body: Vec<u8>,
+    trailers: Option<Headers>,
+    done: bool,
+}
+
+/// True when this is Extended CONNECT (`CONNECT` + `:protocol`, RFC 9220).
+fn is_extended_connect(headers: &Headers) -> bool {
+    headers
+        .get(":method")
+        .is_some_and(|m| m.eq_ignore_ascii_case("CONNECT"))
+        && headers.get(":protocol").is_some()
+}
+
+const EXTENDED_CONNECT_NOT_ENABLED: &str =
+    "peer does not support Extended CONNECT (RFC 9220): SETTINGS_ENABLE_CONNECT_PROTOCOL was not advertised";
+
 impl H3ClientWriter {
     fn new() -> Self {
         Self {
@@ -308,6 +328,9 @@ struct H3ClientStream {
     excessive_load: bool,
     /// Connection-level frame violations (e.g. unsolicited PUSH_PROMISE).
     connection_error: Option<u32>,
+    /// Outbound request deferred until peer SETTINGS makes
+    /// `peer_enable_connect_protocol` known (Extended CONNECT only).
+    pending_outbound: Option<PendingOutbound>,
 }
 
 impl H3ClientStream {
@@ -333,54 +356,46 @@ impl H3ClientStream {
             qpack_error: false,
             excessive_load: false,
             connection_error: None,
+            pending_outbound: None,
         }
     }
 
-    fn start_request(&mut self, endpoint: &mut dyn Endpoint) {
-        if self.started {
-            return;
-        }
-        self.started = true;
-
-        let mut handler = self.factory.create_handler();
-        let mut writer = H3ClientWriter::new();
-        handler.start(&mut writer);
-
-        let headers = writer.request_headers.take().unwrap_or_default();
-        let body = writer.body;
-        let trailers = writer.trailers;
-        let done = writer.done;
-
+    fn emit_request(&mut self, endpoint: &mut dyn Endpoint, pending: &PendingOutbound) {
         let req_size = frame::field_section_size(
-            headers
+            pending
+                .headers
                 .iter()
                 .map(|h| (h.name.as_str(), h.value.as_str())),
         );
         if let Some(max) = self.peer_state.lock().unwrap().peer_max_field_section_size {
             if req_size as u64 > max {
-                // RFC 9114 §4.2.2: SHOULD NOT send over the peer's ceiling.
-                handler.request_failed(
-                    &mut NullClientWriter,
-                    &io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "request field section exceeds peer SETTINGS_MAX_FIELD_SECTION_SIZE",
-                    ),
-                );
-                self.handler = Some(handler);
+                if let Some(handler) = &mut self.handler {
+                    handler.request_failed(
+                        &mut NullClientWriter,
+                        &io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "request field section exceeds peer SETTINGS_MAX_FIELD_SECTION_SIZE",
+                        ),
+                    );
+                }
                 endpoint.abort(frame::H3_EXCESSIVE_LOAD);
                 return;
             }
         }
 
         let mut out = Vec::new();
-        let block = self
-            .qpack
-            .encode_field_section(self.stream_id, headers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
+        let block = self.qpack.encode_field_section(
+            self.stream_id,
+            pending
+                .headers
+                .iter()
+                .map(|h| (h.name.as_str(), h.value.as_str())),
+        );
         frame::write_headers(&mut out, &block);
-        if !body.is_empty() {
-            frame::write_data(&mut out, &body);
+        if !pending.body.is_empty() {
+            frame::write_data(&mut out, &pending.body);
         }
-        if let Some(trailers) = trailers {
+        if let Some(trailers) = &pending.trailers {
             let block = self.qpack.encode_field_section(
                 self.stream_id,
                 trailers.iter().map(|h| (h.name.as_str(), h.value.as_str())),
@@ -390,11 +405,90 @@ impl H3ClientStream {
         if !out.is_empty() {
             endpoint.send(&out);
         }
-        if done {
+        if pending.done {
             endpoint.close();
+        }
+    }
+
+    fn fail_extended_connect_disabled(&mut self) {
+        if let Some(handler) = &mut self.handler {
+            handler.request_failed(
+                &mut NullClientWriter,
+                &io::Error::new(io::ErrorKind::Unsupported, EXTENDED_CONNECT_NOT_ENABLED),
+            );
+        }
+    }
+
+    fn start_request(&mut self, endpoint: &mut dyn Endpoint) {
+        if self.started {
+            return;
+        }
+
+        // Resume a previously deferred Extended CONNECT once SETTINGS is known.
+        if self.handler.is_some() {
+            if self.pending_outbound.is_none() {
+                return;
+            }
+            let enable = self.peer_state.lock().unwrap().peer_enable_connect_protocol;
+            match enable {
+                None => return,
+                Some(false) => {
+                    self.pending_outbound = None;
+                    self.started = true;
+                    self.fail_extended_connect_disabled();
+                    return;
+                }
+                Some(true) => {
+                    let pending = self.pending_outbound.take().unwrap();
+                    self.emit_request(endpoint, &pending);
+                    self.started = true;
+                    return;
+                }
+            }
+        }
+
+        let mut handler = self.factory.create_handler();
+        let mut writer = H3ClientWriter::new();
+        handler.start(&mut writer);
+
+        let pending = PendingOutbound {
+            headers: writer.request_headers.take().unwrap_or_default(),
+            body: writer.body,
+            trailers: writer.trailers,
+            done: writer.done,
+        };
+
+        if is_extended_connect(&pending.headers) {
+            let enable = self.peer_state.lock().unwrap().peer_enable_connect_protocol;
+            match enable {
+                Some(false) => {
+                    self.handler = Some(handler);
+                    self.started = true;
+                    self.fail_extended_connect_disabled();
+                    return;
+                }
+                None => {
+                    // RFC 9220 / RFC 8441 §4: MUST NOT send Extended CONNECT
+                    // before peer SETTINGS is known. Defer and poke when it arrives.
+                    let handle = endpoint.handle();
+                    self.peer_state
+                        .lock()
+                        .unwrap()
+                        .settings_waiters
+                        .push(Box::new(move || {
+                            handle.poke();
+                        }));
+                    self.handler = Some(handler);
+                    self.pending_outbound = Some(pending);
+                    return;
+                }
+                Some(true) => {}
+            }
         }
 
         self.handler = Some(handler);
+        self.emit_request(endpoint, &pending);
+        self.started = true;
     }
 
     fn finish_response(&mut self) {
@@ -502,6 +596,11 @@ impl ProtocolHandler for H3ClientStream {
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        // Resume Extended CONNECT deferred until peer SETTINGS (poke from
+        // the control-stream SETTINGS waiter lands here with empty data).
+        if !self.started {
+            self.start_request(endpoint);
+        }
         let mut parser = std::mem::take(&mut self.parser);
         parser.push(data, self);
         self.parser = parser;
@@ -613,7 +712,10 @@ mod status_validation_tests {
             unimplemented!("not exercised by these unit tests")
         }
         fn handle(&self) -> hopf_core::ConnHandle {
-            unimplemented!("not exercised by these unit tests")
+            // Task-only: poke from SETTINGS waiters is a no-op in these
+            // unit tests — callers re-enter `start_request` / `receive`
+            // explicitly after flipping `peer_enable_connect_protocol`.
+            hopf_core::ConnHandle::from_execute(std::sync::Arc::new(|task| task()))
         }
     }
 
@@ -899,6 +1001,117 @@ mod status_validation_tests {
             .expect("trailer QPACK block");
         assert!(trailers.iter().any(|(n, v)| n == "grpc-status" && v == "0"));
         assert!(trailers.iter().any(|(n, v)| n == "grpc-message" && v == "ok"));
+    }
+
+    /// Extended CONNECT request builder (RFC 9220).
+    struct ExtConnectFactory {
+        failed: Arc<Mutex<usize>>,
+    }
+    impl ClientHandlerFactory for ExtConnectFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            let failed = Arc::clone(&self.failed);
+            Box::new(ExtConnectCounting { failed })
+        }
+    }
+    struct ExtConnectCounting {
+        failed: Arc<Mutex<usize>>,
+    }
+    impl ClientHandler for ExtConnectCounting {
+        fn start(&mut self, request: &mut dyn ClientWriter) {
+            let mut h = Headers::new();
+            h.set(":method", "CONNECT");
+            h.set(":protocol", "websocket");
+            h.set(":scheme", "https");
+            h.set(":authority", "example.com");
+            h.set(":path", "/chat");
+            request.headers(h);
+            request.complete_request();
+        }
+        fn response_headers(&mut self, _: &mut dyn ClientWriter, _: &Headers) {}
+        fn response_complete(&mut self, _: &mut dyn ClientWriter) {}
+        fn request_failed(&mut self, _: &mut dyn ClientWriter, err: &io::Error) {
+            assert!(
+                err.to_string().contains("SETTINGS_ENABLE_CONNECT_PROTOCOL"),
+                "unexpected failure: {err}"
+            );
+            *self.failed.lock().unwrap() += 1;
+        }
+    }
+
+    fn ext_connect_stream(
+        peer_enable: Option<bool>,
+    ) -> (H3ClientStream, Arc<Mutex<usize>>, RecordingEndpoint) {
+        let failed = Arc::new(Mutex::new(0usize));
+        let factory: Arc<dyn ClientHandlerFactory> = Arc::new(ExtConnectFactory {
+            failed: Arc::clone(&failed),
+        });
+        let peer_state = Arc::new(Mutex::new({
+            let mut s = H3PeerState::default();
+            s.peer_enable_connect_protocol = peer_enable;
+            s
+        }));
+        let stream = H3ClientStream::new(
+            factory,
+            HttpLimits::default(),
+            0,
+            Arc::new(qpack::H3Qpack::new()),
+            peer_state,
+        );
+        (stream, failed, RecordingEndpoint::default())
+    }
+
+    /// Issue #261: when the peer's SETTINGS omitted (or set to 0)
+    /// SETTINGS_ENABLE_CONNECT_PROTOCOL, Extended CONNECT must fail fast.
+    #[test]
+    fn extended_connect_rejected_when_peer_did_not_advertise() {
+        let (mut stream, failed, mut ep) = ext_connect_stream(Some(false));
+        stream.start_request(&mut ep);
+        assert!(ep.sent.is_empty(), "must not send Extended CONNECT");
+        assert_eq!(*failed.lock().unwrap(), 1);
+        assert!(stream.started);
+    }
+
+    #[test]
+    fn extended_connect_sent_when_peer_advertised() {
+        let (mut stream, failed, mut ep) = ext_connect_stream(Some(true));
+        stream.start_request(&mut ep);
+        assert!(!ep.sent.is_empty(), "must send once peer advertised support");
+        assert_eq!(*failed.lock().unwrap(), 0);
+        assert!(stream.started);
+    }
+
+    /// Before SETTINGS, Extended CONNECT is deferred; a later SETTINGS=0 fails it.
+    #[test]
+    fn extended_connect_deferred_until_settings_then_rejected() {
+        let (mut stream, failed, mut ep) = ext_connect_stream(None);
+        stream.start_request(&mut ep);
+        assert!(ep.sent.is_empty());
+        assert!(!stream.started);
+        assert_eq!(*failed.lock().unwrap(), 0);
+        assert_eq!(stream.peer_state.lock().unwrap().settings_waiters.len(), 1);
+
+        stream.peer_state.lock().unwrap().peer_enable_connect_protocol = Some(false);
+        stream.start_request(&mut ep);
+        assert!(ep.sent.is_empty());
+        assert_eq!(*failed.lock().unwrap(), 1);
+        assert!(stream.started);
+    }
+
+    /// Before SETTINGS, Extended CONNECT is deferred; SETTINGS=1 then sends it.
+    #[test]
+    fn extended_connect_deferred_until_settings_then_sent() {
+        let (mut stream, failed, mut ep) = ext_connect_stream(None);
+        stream.start_request(&mut ep);
+        assert!(ep.sent.is_empty());
+        assert!(!stream.started);
+
+        stream.peer_state.lock().unwrap().peer_enable_connect_protocol = Some(true);
+        // Simulate the SETTINGS waiter poke → empty receive.
+        let mut empty: &[u8] = &[];
+        stream.receive(&mut ep, &mut empty);
+        assert!(!ep.sent.is_empty());
+        assert_eq!(*failed.lock().unwrap(), 0);
+        assert!(stream.started);
     }
 }
 
