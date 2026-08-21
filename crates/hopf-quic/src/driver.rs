@@ -450,9 +450,22 @@ fn deliver_with_residual(pending: &mut Vec<u8>, new_data: &[u8], deliver: impl F
     *pending = buf;
 }
 
+/// Translate the soonest absolute deadline into a mio poll wait.
+///
+/// `None` means block indefinitely (no timer / no quinn deadline); a past
+/// or equal deadline becomes a zero wait so the loop services it immediately.
+fn poll_wait(now: Instant, soonest: Option<Instant>) -> Option<Duration> {
+    match soonest {
+        Some(when) if when > now => Some(when - now),
+        Some(_) => Some(Duration::ZERO),
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod residual_tests {
-    use super::deliver_with_residual;
+    use super::{deliver_with_residual, poll_wait};
+    use std::time::{Duration, Instant};
 
     /// Regression test for a bug where `read_stream` dropped whatever
     /// bytes the handler left unconsumed instead of preserving them for
@@ -524,6 +537,27 @@ mod residual_tests {
         }
         assert_eq!(total, b"foobarbaz");
         assert!(pending.is_empty());
+    }
+
+    /// Issue #249: without a deadline the driver must not invent a 10ms
+    /// cap — `None` lets mio block until UDP or a wake command.
+    #[test]
+    fn poll_wait_with_no_deadline_blocks_indefinitely() {
+        assert_eq!(poll_wait(Instant::now(), None), None);
+    }
+
+    #[test]
+    fn poll_wait_honours_a_future_deadline_exactly() {
+        let now = Instant::now();
+        let when = now + Duration::from_millis(250);
+        assert_eq!(poll_wait(now, Some(when)), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn poll_wait_past_deadline_is_immediate() {
+        let now = Instant::now();
+        let when = now - Duration::from_millis(1);
+        assert_eq!(poll_wait(now, Some(when)), Some(Duration::ZERO));
     }
 }
 
@@ -630,7 +664,14 @@ impl Driver {
         Ok(())
     }
 
-    fn next_timeout(&self) -> Option<Duration> {
+    /// How long the mio poll should sleep before the next wake — the
+    /// soonest of any app-level [`PendingTimer`] and every live connection's
+    /// [`Connection::poll_timeout`] (idle / PTO / loss detection, …).
+    ///
+    /// Returns `None` when there is no deadline (block until UDP or a wake
+    /// command). Previously this hard-capped at 10ms so idle connections
+    /// spun the driver ~100×/s for their whole lifetime.
+    fn next_timeout(&mut self) -> Option<Duration> {
         let now = Instant::now();
         let mut soon: Option<Instant> = None;
         for t in &self.timers {
@@ -638,13 +679,12 @@ impl Driver {
                 soon = Some(soon.map_or(t.when, |s| s.min(t.when)));
             }
         }
-        // Always wake at least every 10ms to drive quinn timers.
-        let max_wait = Duration::from_millis(10);
-        match soon {
-            Some(when) if when > now => Some((when - now).min(max_wait)),
-            Some(_) => Some(Duration::ZERO),
-            None => Some(max_wait),
+        for slot in self.connections.values_mut() {
+            if let Some(t) = slot.conn.poll_timeout() {
+                soon = Some(soon.map_or(t, |s| s.min(t)));
+            }
         }
+        poll_wait(now, soon)
     }
 
     fn fire_timers(&mut self) {
