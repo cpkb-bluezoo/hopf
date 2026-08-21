@@ -22,6 +22,10 @@ pub trait H3FrameHandler {
     fn goaway_frame(&mut self, payload: &[u8]);
     /// A MAX_PUSH_ID frame (RFC 9114 §7.2.7).
     fn max_push_id_frame(&mut self, payload: &[u8]);
+    /// A PRIORITY_UPDATE frame for a request stream (RFC 9218 §7.2).
+    fn priority_update_request_frame(&mut self, _payload: &[u8]) {}
+    /// A PRIORITY_UPDATE frame for a push stream (RFC 9218 §7.2).
+    fn priority_update_push_frame(&mut self, _payload: &[u8]) {}
     /// An unknown or reserved (GREASE) frame type — ignored after SETTINGS
     /// on the control stream (RFC 9114 §9), but must not count as the
     /// required first SETTINGS frame (§6.2.1 / §7.2.4).
@@ -96,6 +100,10 @@ impl H3Parser {
                 frame::PUSH_PROMISE => handler.push_promise_frame(payload),
                 frame::GOAWAY => handler.goaway_frame(payload),
                 frame::MAX_PUSH_ID => handler.max_push_id_frame(payload),
+                frame::PRIORITY_UPDATE_REQUEST => {
+                    handler.priority_update_request_frame(payload)
+                }
+                frame::PRIORITY_UPDATE_PUSH => handler.priority_update_push_frame(payload),
                 // Unknown / reserved (GREASE) — notify so the control stream
                 // can enforce SETTINGS-first; otherwise ignore per §9.
                 other => handler.unknown_frame(other),

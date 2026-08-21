@@ -18,6 +18,10 @@ pub const PUSH_PROMISE: u64 = 0x05;
 pub const GOAWAY: u64 = 0x07;
 /// MAX_PUSH_ID frame type (RFC 9114 §7.2.7) — control stream, client→server.
 pub const MAX_PUSH_ID: u64 = 0x0d;
+/// PRIORITY_UPDATE for a request stream (RFC 9218 §7.2).
+pub const PRIORITY_UPDATE_REQUEST: u64 = 0xF0700;
+/// PRIORITY_UPDATE for a push stream (RFC 9218 §7.2).
+pub const PRIORITY_UPDATE_PUSH: u64 = 0xF0701;
 
 /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (RFC 9204 §5) — decoder's advertised
 /// dynamic-table capacity ceiling for the peer encoder. Default if absent: 0.
@@ -136,6 +140,21 @@ pub fn write_goaway(out: &mut Vec<u8>, id: u64) {
     let mut payload = Vec::new();
     varint::encode(&mut payload, id);
     write_frame(out, GOAWAY, &payload);
+}
+
+/// Append a PRIORITY_UPDATE frame for a request stream (RFC 9218 §7.2).
+pub fn write_priority_update_request(out: &mut Vec<u8>, stream_id: u64, field_value: &str) {
+    let mut payload = Vec::new();
+    varint::encode(&mut payload, stream_id);
+    payload.extend_from_slice(field_value.as_bytes());
+    write_frame(out, PRIORITY_UPDATE_REQUEST, &payload);
+}
+
+/// Decode a request-stream PRIORITY_UPDATE payload.
+pub fn parse_priority_update_request(payload: &[u8]) -> Option<(u64, &str)> {
+    let (stream_id, n) = varint::decode(payload)?;
+    let value = std::str::from_utf8(&payload[n..]).ok()?;
+    Some((stream_id, value))
 }
 
 /// Append a CANCEL_PUSH frame (RFC 9114 §7.2.3).
@@ -271,6 +290,19 @@ mod tests {
         let (len, len_len) = varint::decode(&out[ty_len..]).unwrap();
         let payload = &out[ty_len + len_len..ty_len + len_len + len as usize];
         assert_eq!(parse_goaway(payload), Some(12));
+    }
+
+    #[test]
+    fn priority_update_request_round_trips() {
+        let mut out = Vec::new();
+        write_priority_update_request(&mut out, 8, "u=0");
+        let (ty, ty_len) = varint::decode(&out).unwrap();
+        assert_eq!(ty, PRIORITY_UPDATE_REQUEST);
+        let (len, len_len) = varint::decode(&out[ty_len..]).unwrap();
+        let payload = &out[ty_len + len_len..ty_len + len_len + len as usize];
+        let (sid, value) = parse_priority_update_request(payload).unwrap();
+        assert_eq!(sid, 8);
+        assert_eq!(value, "u=0");
     }
 
     #[test]

@@ -20,7 +20,9 @@
 //! # Not yet implemented
 //!
 //! - PUSH_PROMISE / server push — see TODO comments.
-//! - PRIORITY frames are deprecated in RFC 9113 and ignored.
+//!
+//! RFC 7540 PRIORITY frames are ignored; RFC 9218 Extensible Prioritization
+//! schedules response DATA via the `Priority` header and `PRIORITY_UPDATE`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -44,9 +46,10 @@ use super::frame::{
     ERROR_SETTINGS_TIMEOUT, ERROR_STREAM_CLOSED, FLAG_END_HEADERS, FLAG_END_STREAM,
     SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_ENABLE_PUSH, SETTINGS_HEADER_TABLE_SIZE,
     SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_MAX_FRAME_SIZE,
-    SETTINGS_MAX_HEADER_LIST_SIZE,
+    SETTINGS_MAX_HEADER_LIST_SIZE, SETTINGS_NO_RFC7540_PRIORITIES,
 };
 use super::parser::{H2FrameHandler, H2Parser};
+use crate::priority::PriorityParams;
 
 /// 24-byte HTTP/2 client connection preface (RFC 9113 §3.4).
 pub(crate) const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -222,6 +225,8 @@ struct H2ServerStream {
     /// Capsule Protocol (RFC 9297 §3) after `Capsule-Protocol: ?1`.
     capsule_mode: bool,
     capsule_parser: crate::capsule::CapsuleParser,
+    /// RFC 9218 priority for scheduling response DATA.
+    priority: PriorityParams,
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +376,10 @@ pub struct H2Endpoint {
     graceful_shutdown: bool,
 
     deferred_flush: Arc<H2DeferredFlush>,
+
+    /// PRIORITY_UPDATE received before the referenced stream opens
+    /// (RFC 9218 §7); applied when the stream is created.
+    pending_priority: HashMap<u32, PriorityParams>,
 
     /// Remote/local address and TLS metadata, captured once and handed to
     /// each server stream's [`H2ResponseControl`] as it's (re)bound.
@@ -548,6 +557,7 @@ impl H2Endpoint {
             deferred_flush: Arc::new(H2DeferredFlush {
                 streams: Mutex::new(Vec::new()),
             }),
+            pending_priority: HashMap::new(),
             connection_info: ConnectionInfo::default(),
         }
     }
@@ -658,6 +668,7 @@ impl H2Endpoint {
                     super::flow::INITIAL_WINDOW_SIZE as u32,
                 ),
                 (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
+                (SETTINGS_NO_RFC7540_PRIORITIES, 1),
             ],
             false,
         );
@@ -720,7 +731,11 @@ impl H2Endpoint {
 
     fn send_client_preface_and_settings(&mut self, endpoint: &mut dyn Endpoint) {
         self.out.extend_from_slice(CLIENT_PREFACE);
-        frame::write_settings(&mut self.out, &[(SETTINGS_ENABLE_PUSH, 0)], false);
+        frame::write_settings(
+            &mut self.out,
+            &[(SETTINGS_ENABLE_PUSH, 0), (SETTINGS_NO_RFC7540_PRIORITIES, 1)],
+            false,
+        );
         self.state = ConnState::ExpectSettings;
         endpoint.send(&self.out);
         self.out.clear();
@@ -949,6 +964,7 @@ impl H2Endpoint {
             upgraded: None,
             capsule_mode: false,
             capsule_parser: crate::capsule::CapsuleParser::new(),
+            priority: PriorityParams::default(),
         };
 
         stream.handler.headers(&mut stream.writer, &upgrade_headers);
@@ -1028,6 +1044,15 @@ impl H2Endpoint {
                 }
                 SETTINGS_MAX_CONCURRENT_STREAMS => {
                     self.peer_max_concurrent_streams = Some(val);
+                }
+                SETTINGS_NO_RFC7540_PRIORITIES => {
+                    // RFC 9218 §2.1: must be 0 or 1; changes after first
+                    // SETTINGS are discouraged (we only process peer's
+                    // first non-ACK SETTINGS into Open once).
+                    if val > 1 {
+                        self.send_goaway(ERROR_PROTOCOL_ERROR);
+                        return;
+                    }
                 }
                 _ => { /* unknown setting — ignore per §6.5.2 */ }
             }
@@ -1178,10 +1203,15 @@ impl H2Endpoint {
             upgraded: None,
             capsule_mode: false,
             capsule_parser: crate::capsule::CapsuleParser::new(),
+            priority: PriorityParams::default(),
         };
 
         stream.handler.headers(&mut stream.writer, &headers);
         stream.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);
+        stream.priority = self
+            .pending_priority
+            .remove(&stream_id)
+            .unwrap_or_else(|| PriorityParams::from_headers(&headers));
         if let Some(up) = stream.writer.control.take_upgrade() {
             stream.upgraded = Some(up);
         }
@@ -1572,9 +1602,45 @@ impl H2Endpoint {
     // -----------------------------------------------------------------------
 
     fn flush_server_streams(&mut self) {
-        let stream_ids: Vec<u32> = self.server_streams.keys().copied().collect();
-        for id in stream_ids {
+        // RFC 9218 §10: schedule by urgency (lower first), then give
+        // incremental streams concurrent bandwidth while serving
+        // non-incremental streams of the same urgency one-by-one in
+        // stream-id (request) order.
+        let mut pending: Vec<(u32, PriorityParams)> = self
+            .server_streams
+            .iter()
+            .filter(|(_, s)| stream_needs_flush(s))
+            .map(|(id, s)| (*id, s.priority))
+            .collect();
+        pending.sort_by_key(|(id, p)| crate::priority::schedule_key(*p, u64::from(*id)));
+
+        let mut active_non_inc: [Option<u32>; 8] = [None; 8];
+        for (id, p) in &pending {
+            if !p.incremental {
+                let slot = &mut active_non_inc[p.urgency as usize];
+                if slot.is_none() {
+                    *slot = Some(*id);
+                }
+            }
+        }
+
+        for (id, p) in pending {
+            if !p.incremental && active_non_inc[p.urgency as usize] != Some(id) {
+                continue;
+            }
             self.flush_one_server_stream(id);
+            if self.flow.available_send(0) == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Apply RFC 9218 priority to a server stream (header or PRIORITY_UPDATE).
+    fn apply_stream_priority(&mut self, stream_id: u32, params: PriorityParams) {
+        if let Some(stream) = self.server_streams.get_mut(&stream_id) {
+            stream.priority = params;
+        } else {
+            self.pending_priority.insert(stream_id, params);
         }
     }
 
@@ -1825,6 +1891,18 @@ fn validate_request_header_block(pairs: &[(String, String)]) -> Result<(), ()> {
     Ok(())
 }
 
+/// Whether a server stream has buffered response bytes / headers waiting to
+/// be written (used by the RFC 9218 flush scheduler).
+fn stream_needs_flush(stream: &H2ServerStream) -> bool {
+    let shared = stream.writer.control.shared.lock().unwrap();
+    shared.response_headers.is_some()
+        || shared.headers_sent
+        || !shared.body.is_empty()
+        || shared.trailers.is_some()
+        || shared.needs_flush
+        || stream.upgraded.is_some()
+}
+
 // ---------------------------------------------------------------------------
 // H2FrameHandler — zero-copy event pipeline into the endpoint
 // ---------------------------------------------------------------------------
@@ -1839,7 +1917,28 @@ impl H2FrameHandler for H2Endpoint {
     }
 
     fn priority_frame(&mut self, _stream_id: u32, _payload: &[u8]) {
-        /* TODO: priority (deprecated) */
+        // RFC 9113 deprecated PRIORITY; we advertise SETTINGS_NO_RFC7540_PRIORITIES=1.
+    }
+
+    fn priority_update_frame(&mut self, stream_id: u32, payload: &[u8]) {
+        // RFC 9218 §7.1: frame stream id MUST be 0; servers never send these.
+        if stream_id != 0 {
+            self.send_goaway(ERROR_PROTOCOL_ERROR);
+            return;
+        }
+        if matches!(self.role, H2Role::Client { .. }) {
+            self.send_goaway(ERROR_PROTOCOL_ERROR);
+            return;
+        }
+        let Some((prioritized, value)) = frame::parse_priority_update(payload) else {
+            self.send_goaway(ERROR_PROTOCOL_ERROR);
+            return;
+        };
+        if prioritized == 0 {
+            self.send_goaway(ERROR_PROTOCOL_ERROR);
+            return;
+        }
+        self.apply_stream_priority(prioritized, PriorityParams::parse(value));
     }
 
     fn rst_stream_frame(&mut self, stream_id: u32, payload: &[u8]) {
@@ -2518,6 +2617,7 @@ mod graceful_shutdown_tests {
                 upgraded: None,
                 capsule_mode: false,
                 capsule_parser: crate::capsule::CapsuleParser::new(),
+            priority: PriorityParams::default(),
             },
         );
 
@@ -2774,6 +2874,7 @@ mod state_machine_tests {
                 upgraded: None,
                 capsule_mode: false,
                 capsule_parser: crate::capsule::CapsuleParser::new(),
+            priority: PriorityParams::default(),
             },
         );
         assert_eq!(ep.stream_state(1), StreamState::Open);
@@ -2835,6 +2936,7 @@ mod state_machine_tests {
                 upgraded: None,
                 capsule_mode: false,
                 capsule_parser: crate::capsule::CapsuleParser::new(),
+            priority: PriorityParams::default(),
             },
         );
         ep.on_data(1, 0, b"hello");

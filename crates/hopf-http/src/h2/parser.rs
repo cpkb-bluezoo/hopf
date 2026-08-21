@@ -36,6 +36,10 @@ pub trait H2FrameHandler {
     fn window_update_frame(&mut self, stream_id: u32, payload: &[u8]);
     /// CONTINUATION frame.
     fn continuation_frame(&mut self, stream_id: u32, flags: u8, payload: &[u8]);
+    /// PRIORITY_UPDATE frame (RFC 9218 §7.1). Default: ignore.
+    fn priority_update_frame(&mut self, stream_id: u32, payload: &[u8]) {
+        let _ = (stream_id, payload);
+    }
     /// Parser detected a connection error (e.g. frame too large).
     fn frame_error(&mut self, error_code: u32, stream_id: u32, message: &str);
 }
@@ -192,6 +196,9 @@ impl H2Parser {
                     self.continuation_expected = None;
                 }
                 handler.continuation_frame(hdr.stream_id, hdr.flags, payload);
+            }
+            frame::TYPE_PRIORITY_UPDATE => {
+                handler.priority_update_frame(hdr.stream_id, payload);
             }
             _ => {
                 // Unknown frame types are ignored (RFC 9113 §5.1).

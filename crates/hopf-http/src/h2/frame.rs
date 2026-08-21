@@ -26,6 +26,8 @@ pub const TYPE_GOAWAY: u8 = 0x07;
 pub const TYPE_WINDOW_UPDATE: u8 = 0x08;
 /// CONTINUATION frame type.
 pub const TYPE_CONTINUATION: u8 = 0x09;
+/// PRIORITY_UPDATE frame type (RFC 9218 §7.1).
+pub const TYPE_PRIORITY_UPDATE: u8 = 0x10;
 
 // ---------------------------------------------------------------------------
 // Flag constants
@@ -60,6 +62,8 @@ pub const SETTINGS_MAX_FRAME_SIZE: u16 = 0x05;
 pub const SETTINGS_MAX_HEADER_LIST_SIZE: u16 = 0x06;
 /// SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 8441) — Extended CONNECT / WebSocket.
 pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u16 = 0x08;
+/// SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218 §2.1) — ignore HTTP/2 PRIORITY.
+pub const SETTINGS_NO_RFC7540_PRIORITIES: u16 = 0x09;
 
 // ---------------------------------------------------------------------------
 // Error code constants
@@ -216,6 +220,29 @@ pub fn write_rst_stream(out: &mut Vec<u8>, stream_id: u32, error_code: u32) {
     out.push(error_code as u8);
 }
 
+/// Write a PRIORITY_UPDATE frame on the control stream (RFC 9218 §7.1).
+pub fn write_priority_update(
+    out: &mut Vec<u8>,
+    prioritized_stream_id: u32,
+    priority_field_value: &str,
+) {
+    let value = priority_field_value.as_bytes();
+    let len = 4 + value.len() as u32;
+    write_frame_header(out, len, TYPE_PRIORITY_UPDATE, 0, 0);
+    out.extend_from_slice(&(prioritized_stream_id & 0x7fff_ffff).to_be_bytes());
+    out.extend_from_slice(value);
+}
+
+/// Parse a PRIORITY_UPDATE payload into `(prioritized_stream_id, field_value)`.
+pub fn parse_priority_update(payload: &[u8]) -> Option<(u32, &str)> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let sid = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]) & 0x7fff_ffff;
+    let value = std::str::from_utf8(&payload[4..]).ok()?;
+    Some((sid, value))
+}
+
 // ---------------------------------------------------------------------------
 // Payload helpers
 // ---------------------------------------------------------------------------
@@ -301,5 +328,17 @@ mod tests {
         assert_eq!(hdr.ty, TYPE_PING);
         assert_eq!(hdr.flags, FLAG_ACK);
         assert_eq!(&buf[9..], b"deadbeef");
+    }
+
+    #[test]
+    fn priority_update_round_trips() {
+        let mut out = Vec::new();
+        write_priority_update(&mut out, 7, "u=1, i");
+        let hdr = parse_frame_header(&out[..9]);
+        assert_eq!(hdr.ty, TYPE_PRIORITY_UPDATE);
+        assert_eq!(hdr.stream_id, 0);
+        let (sid, value) = parse_priority_update(&out[9..]).unwrap();
+        assert_eq!(sid, 7);
+        assert_eq!(value, "u=1, i");
     }
 }
