@@ -70,6 +70,10 @@ impl H3ClientConnection {
     /// [`Self::accept_bi`] call it makes for this connection, in the same
     /// order, so factories are handed out FIFO.
     fn drain_pending_opens(&mut self, api: &mut dyn QuicConnApi) {
+        // RFC 9114 §5.2: after a peer GOAWAY, MUST NOT initiate new requests.
+        if self.peer_state.lock().unwrap().goaway_received.is_some() {
+            return;
+        }
         let count = self.pending_opens.lock().unwrap().len();
         for _ in 0..count {
             let _ = api.open_bi();
@@ -764,5 +768,65 @@ mod status_validation_tests {
             .expect("trailer QPACK block");
         assert!(trailers.iter().any(|(n, v)| n == "grpc-status" && v == "0"));
         assert!(trailers.iter().any(|(n, v)| n == "grpc-message" && v == "ok"));
+    }
+}
+
+#[cfg(test)]
+mod goaway_enforcement_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingConnApi {
+        open_bi_calls: usize,
+        next_key: u64,
+    }
+    impl QuicConnApi for RecordingConnApi {
+        fn open_uni(&mut self) -> Option<u64> {
+            let key = self.next_key;
+            self.next_key += 1;
+            Some(key)
+        }
+        fn open_bi(&mut self) -> Option<u64> {
+            self.open_bi_calls += 1;
+            let key = self.next_key;
+            self.next_key += 1;
+            Some(key)
+        }
+        fn write(&mut self, _stream_key: u64, _data: &[u8]) {}
+        fn finish(&mut self, _stream_key: u64) {}
+    }
+
+    struct NoopFactory;
+    impl ClientHandlerFactory for NoopFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            unimplemented!("not exercised")
+        }
+    }
+
+    /// After a peer GOAWAY, the client must not open further request streams
+    /// (RFC 9114 §5.2).
+    #[test]
+    fn drain_pending_opens_stops_after_goaway_received() {
+        let pending: PendingOpens = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            Arc::new(NoopFactory) as Arc<dyn ClientHandlerFactory>,
+            Arc::new(NoopFactory) as Arc<dyn ClientHandlerFactory>,
+        ])));
+        let mut conn =
+            H3ClientConnection::with_shared_state(Arc::clone(&pending), Arc::new(Mutex::new(None)), HttpLimits::default());
+        let mut api = RecordingConnApi::default();
+
+        conn.drain_pending_opens(&mut api);
+        assert_eq!(api.open_bi_calls, 2, "both queued factories open before GOAWAY");
+
+        conn.peer_state.lock().unwrap().goaway_received = Some(0);
+        // Re-queue more requests as a session would after GOAWAY.
+        pending.lock().unwrap().push_back(Arc::new(NoopFactory));
+        pending.lock().unwrap().push_back(Arc::new(NoopFactory));
+        conn.drain_pending_opens(&mut api);
+        assert_eq!(
+            api.open_bi_calls, 2,
+            "no further open_bi after GOAWAY received"
+        );
+        assert_eq!(pending.lock().unwrap().len(), 4); // 2 unmatched from first drain + 2 new
     }
 }

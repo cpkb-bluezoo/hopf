@@ -584,7 +584,9 @@ pub(crate) struct H3PeerState {
     /// Set once the peer's GOAWAY frame arrives (RFC 9114 §5.2): the ID it
     /// carried (the peer's last client-initiated bidirectional stream, if
     /// sent by a server; a push ID, if sent by a client — moot here since
-    /// hopf never pushes).
+    /// hopf never pushes). A later GOAWAY with a higher ID is a connection
+    /// error. On the client, any value here also blocks further
+    /// [`crate::h3::client::H3ClientConnection`] `open_bi` calls.
     pub(crate) goaway_received: Option<u64>,
 }
 
@@ -751,9 +753,29 @@ impl H3FrameHandler for H3UniStream {
             });
     }
     fn goaway_frame(&mut self, payload: &[u8]) {
-        if let Some(id) = frame::parse_goaway(payload) {
-            self.peer_state.lock().unwrap().goaway_received = Some(id);
+        let Some(id) = frame::parse_goaway(payload) else {
+            self.connection_error.get_or_insert(frame::H3_FRAME_ERROR);
+            return;
+        };
+        if self.is_client {
+            // Server→client GOAWAY carries a client-initiated bidirectional
+            // stream ID (RFC 9114 §7.2.6) — those are 0 mod 4.
+            if id % 4 != 0 {
+                self.connection_error.get_or_insert(frame::H3_ID_ERROR);
+                return;
+            }
         }
+        let mut state = self.peer_state.lock().unwrap();
+        if let Some(prev) = state.goaway_received {
+            // RFC 9114 §5.2: each GOAWAY's identifier MUST NOT be greater
+            // than any previously received.
+            if id > prev {
+                drop(state);
+                self.connection_error.get_or_insert(frame::H3_ID_ERROR);
+                return;
+            }
+        }
+        state.goaway_received = Some(id);
     }
     fn cancel_push_frame(&mut self, _payload: &[u8]) {
         // hopf never permits push (no MAX_PUSH_ID sent), so any referenced
@@ -1101,6 +1123,87 @@ mod uni_stream_tests {
 
         assert!(!ep.closed, "GOAWAY reception alone doesn't close anything");
         assert_eq!(state.lock().unwrap().goaway_received, Some(8));
+    }
+
+    /// A later GOAWAY with a higher ID than previously received is
+    /// H3_ID_ERROR (RFC 9114 §5.2).
+    #[test]
+    fn goaway_with_higher_id_than_previous_is_id_error() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+
+        let mut first = Vec::new();
+        frame::write_goaway(&mut first, 4);
+        let mut data: &[u8] = &first;
+        uni.receive(&mut ep, &mut data);
+        assert!(!ep.closed);
+        assert_eq!(state.lock().unwrap().goaway_received, Some(4));
+
+        let mut second = Vec::new();
+        frame::write_goaway(&mut second, 8);
+        let mut data: &[u8] = &second;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
+        assert_eq!(
+            state.lock().unwrap().goaway_received,
+            Some(4),
+            "non-monotonic GOAWAY must not replace the prior ID"
+        );
+    }
+
+    /// A subsequent GOAWAY with a lower-or-equal ID is accepted (RFC 9114 §5.2).
+    #[test]
+    fn goaway_with_lower_id_updates_received() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+
+        let mut first = Vec::new();
+        frame::write_goaway(&mut first, 8);
+        let mut data: &[u8] = &first;
+        uni.receive(&mut ep, &mut data);
+
+        let mut second = Vec::new();
+        frame::write_goaway(&mut second, 4);
+        let mut data: &[u8] = &second;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(!ep.closed);
+        assert_eq!(state.lock().unwrap().goaway_received, Some(4));
+    }
+
+    /// Client must reject a server GOAWAY whose ID is not a client-initiated
+    /// bidirectional stream ID (RFC 9114 §7.2.6).
+    #[test]
+    fn client_rejects_goaway_with_non_client_bi_stream_id() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+
+        // Stream ID 1 is client-initiated unidirectional, not bi.
+        let mut bad = Vec::new();
+        frame::write_goaway(&mut bad, 1);
+        let mut data: &[u8] = &bad;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
+        assert!(state.lock().unwrap().goaway_received.is_none());
     }
 
     /// CANCEL_PUSH on the control stream with no push budget is H3_ID_ERROR
