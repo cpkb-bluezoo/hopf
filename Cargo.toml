@@ -7,6 +7,7 @@ members = [
     "crates/hopf-http",
     "crates/hopf-quic",
     "crates/hopf-dns",
+    "crates/hopf-mdns",
     "crates/hopf-auth",
     "crates/hopf-ldap",
     "crates/hopf-otel",
@@ -53,6 +54,7 @@ default-members = [
     "crates/hopf-http",
     "crates/hopf-quic",
     "crates/hopf-dns",
+    "crates/hopf-mdns",
     "crates/hopf-auth",
     "crates/hopf-ldap",
     "crates/hopf-otel",
@@ -96,6 +98,7 @@ hopf-tls = { version = "0.2.1", path = "crates/hopf-tls" }
 hopf-http = { version = "0.2.1", path = "crates/hopf-http" }
 hopf-quic = { version = "0.2.1", path = "crates/hopf-quic" }
 hopf-dns = { version = "0.2.1", path = "crates/hopf-dns" }
+hopf-mdns = { version = "0.2.1", path = "crates/hopf-mdns" }
 hopf-auth = { version = "0.2.1", path = "crates/hopf-auth" }
 hopf-ldap = { version = "0.2.1", path = "crates/hopf-ldap" }
 hopf-otel = { version = "0.2.1", path = "crates/hopf-otel" }
@@ -111,3 +114,4 @@ hopf-mqtt = { version = "0.2.1", path = "crates/hopf-mqtt" }
 hopf-amqp = { version = "0.2.1", path = "crates/hopf-amqp" }
 getrandom = "0.2"
 tempfile = "3"
+socket2 = { version = "0.5", features = ["all"] }

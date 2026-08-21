@@ -1,0 +1,33 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-mdns"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Multicast DNS (RFC 6762) and DNS-SD (RFC 6763) for Hopf"
+readme = "README.md"
+keywords = ["mdns", "dns-sd", "bonjour", "zeroconf", "discovery"]
+categories = ["network-programming"]
+autotests = false
+
+[features]
+default = []
+# Real loopback-multicast round-trips (`tests/`); not compiled in CI `--lib`.
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-dns = { workspace = true }
+mio = { workspace = true }
+socket2 = { workspace = true }
+getrandom = { workspace = true }
+
+[[test]]
+name = "mdns_stub"
+path = "tests/mdns_stub.rs"
+required-features = ["integration"]
