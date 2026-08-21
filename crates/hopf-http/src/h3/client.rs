@@ -452,10 +452,14 @@ impl ProtocolHandler for H3ClientStream {
     }
 
     fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {
+        // Abnormal QUIC teardown replaces disconnected() — still cancel
+        // QPACK refs and finish the response so the client handler sees
+        // completion.
         // RFC 9204 §4.4.2: this stream won't be acknowledged now — let the
         // peer's encoder release any dynamic-table references it held open
         // for it.
         self.qpack.cancel_stream(self.stream_id);
+        self.finish_response();
     }
 }
 
