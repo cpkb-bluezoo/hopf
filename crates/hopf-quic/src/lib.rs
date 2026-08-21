@@ -27,7 +27,7 @@ pub use driver::{connect_quic, connect_quic_hooks, listen_quic, listen_quic_hook
 pub use error::{
     connection_close_error, stream_stopped_error, QuicConnectionCloseError, QuicStreamStoppedError,
 };
-pub use hooks::{ConnectionFactory, QuicConnApi, QuicConnection};
+pub use hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection};
 pub use runtime_ext::RuntimeQuicExt;
 pub use stream::QuicStreamEndpoint;
 pub use hopf_core::VERSION;

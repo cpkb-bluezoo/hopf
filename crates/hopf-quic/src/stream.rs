@@ -231,6 +231,15 @@ impl Endpoint for QuicStreamEndpoint {
         self.wake();
     }
 
+    fn send_datagram(&mut self, payload: &[u8]) -> io::Result<()> {
+        let _ = self.cmd_tx.send(DriverCmd::SendDatagram {
+            conn: self.conn,
+            payload: payload.to_vec(),
+        });
+        self.wake();
+        Ok(())
+    }
+
     fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local)
     }

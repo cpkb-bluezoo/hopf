@@ -49,6 +49,40 @@ pub trait QuicConnection: Send {
     fn drive(&mut self, api: &mut dyn QuicConnApi) {
         let _ = api;
     }
+
+    /// Inspect an inbound QUIC DATAGRAM payload (RFC 9221) and tell the
+    /// driver how to route it. HTTP/3 demuxes by quarter-stream-ID here
+    /// (RFC 9297 §2.1). Default: drop.
+    fn decode_datagram(&mut self, _data: &[u8]) -> DatagramDecode {
+        DatagramDecode::Drop
+    }
+}
+
+/// How the driver should treat an inbound QUIC DATAGRAM (RFC 9221) after
+/// the connection app has inspected it (e.g. HTTP/3 quarter-stream demux).
+#[derive(Debug)]
+pub enum DatagramDecode {
+    /// Silently drop (no matching stream yet, or deliberately ignored).
+    Drop,
+    /// Deliver `payload` to the bidirectional stream with this QUIC stream id.
+    Deliver {
+        /// Real QUIC stream id (RFC 9000 §2.1).
+        stream_id: u64,
+        /// Bytes after any application demux prefix (e.g. HTTP Datagram payload).
+        payload: Vec<u8>,
+    },
+    /// Abort one stream with an application error code.
+    AbortStream {
+        /// Real QUIC stream id.
+        stream_id: u64,
+        /// Application error code (e.g. HTTP/3 `H3_DATAGRAM_ERROR`).
+        error_code: u32,
+    },
+    /// Close the whole connection with an application error code.
+    CloseConnection {
+        /// Application error code.
+        error_code: u32,
+    },
 }
 
 /// API available during [`QuicConnection::connected`] on the driver thread.
@@ -64,4 +98,13 @@ pub trait QuicConnApi {
 
     /// Finish the send side of a stream.
     fn finish(&mut self, stream_key: u64);
+
+    /// Queue a QUIC DATAGRAM (RFC 9221) for the connection. Default: no-op
+    /// (returns `Unsupported`).
+    fn send_datagram(&mut self, _payload: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "datagrams not supported by this QuicConnApi",
+        ))
+    }
 }

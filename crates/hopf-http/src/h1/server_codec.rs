@@ -107,7 +107,32 @@ impl<H: ServerHandler> H1ServerCodec<H> {
         // protocol layered on WebSocket (e.g. hopf-mqtt's WS transport)
         // resume state mutated from an offloaded storage-pool callback the
         // same way a plain `ProtocolHandler` already can (issue #232).
-        if let Some(up) = self.driver.upgraded.as_mut() {
+        if self.driver.capsule_mode {
+            if !data.is_empty() {
+                match self.driver.capsule_parser.push(data) {
+                    Ok(capsules) => {
+                        if let Some(up) = self.driver.upgraded.as_mut() {
+                            for c in capsules {
+                                if c.ty == crate::capsule::CAPSULE_DATAGRAM {
+                                    if up.wants_datagrams() {
+                                        up.datagram_received(&c.value);
+                                    }
+                                } else {
+                                    up.capsule_received(c.ty, &c.value);
+                                }
+                            }
+                        }
+                    }
+                    Err(()) => {
+                        self.driver
+                            .fail(HttpError::new(400, "malformed Capsule Protocol"));
+                    }
+                }
+            } else if let Some(up) = self.driver.upgraded.as_mut() {
+                // Empty poke — still let the upgrade handler drain outbound.
+                up.receive(data);
+            }
+        } else if let Some(up) = self.driver.upgraded.as_mut() {
             up.receive(data);
         }
         *data = &[];
@@ -210,6 +235,9 @@ struct Driver<H: ServerHandler> {
     line_too_long_status: u16,
     /// Active protocol upgrade (WebSocket, …).
     upgraded: Option<Box<dyn ProtocolUpgradeHandler>>,
+    /// Capsule Protocol (RFC 9297 §3) after `Capsule-Protocol: ?1`.
+    capsule_mode: bool,
+    capsule_parser: crate::capsule::CapsuleParser,
 }
 
 impl<H: ServerHandler> Driver<H> {
@@ -235,6 +263,8 @@ impl<H: ServerHandler> Driver<H> {
             fatal: None,
             line_too_long_status: 414,
             upgraded: None,
+            capsule_mode: false,
+            capsule_parser: crate::capsule::CapsuleParser::new(),
         }
     }
 
@@ -409,6 +439,7 @@ impl<H: ServerHandler> Driver<H> {
         }
 
         let hdrs = self.headers.clone();
+        self.capsule_mode = crate::capsule::capsule_protocol_enabled(&hdrs);
         self.with_app_response(|app, resp| app.headers(resp, &hdrs));
 
         if self.fatal.is_some() {

@@ -3,6 +3,7 @@
 //! HTTP/3 over Hopf QUIC (server and client).
 
 pub(crate) mod client;
+pub mod datagram;
 mod endpoint;
 mod response;
 mod frame;
@@ -10,7 +11,14 @@ mod parser;
 pub mod qpack;
 mod varint;
 
+pub use crate::capsule::{
+    capsule_protocol_enabled, Capsule, CapsuleParser, CAPSULE_DATAGRAM, CAPSULE_PROTOCOL_HEADER,
+};
 pub use client::{connect_h3, H3ClientConnection};
+pub use datagram::{
+    decode as decode_http3_datagram, encode as encode_http3_datagram, send as send_http3_datagram,
+    H3_DATAGRAM_ERROR, SETTINGS_H3_DATAGRAM,
+};
 pub use endpoint::{listen_h3, H3ServerConnection};
 pub use frame::{
     H3_CLOSED_CRITICAL_STREAM, H3_CONNECT_ERROR, H3_EXCESSIVE_LOAD, H3_FRAME_ERROR,

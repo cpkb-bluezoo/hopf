@@ -43,6 +43,13 @@ pub trait ProtocolHandler: Send {
 
     /// Unrecoverable I/O or protocol error on the endpoint.
     fn error(&mut self, endpoint: &mut dyn Endpoint, err: &io::Error);
+
+    /// An unreliable datagram associated with this stream arrived (e.g. an
+    /// HTTP/3 Datagram demuxed by quarter-stream-ID, RFC 9297 §2.1).
+    /// Default: ignore. HTTP/3 request streams override this to abort with
+    /// `H3_DATAGRAM_ERROR` when the request has no datagram semantics, or
+    /// to forward into an upgraded handler that opted in.
+    fn datagram_received(&mut self, _endpoint: &mut dyn Endpoint, _data: &[u8]) {}
 }
 
 /// No-op handler defaults for tests.
