@@ -53,7 +53,14 @@ pub use h2::CleartextHttpEndpoint;
 pub use h2::H2Endpoint;
 pub use h2::H2cUpgradeClientEndpoint;
 #[cfg(feature = "h3")]
-pub use h3::{connect_h3, listen_h3, H3ClientConnection, H3ServerConnection};
+pub use h3::{
+    connect_h3, listen_h3, H3ClientConnection, H3ServerConnection, H3_CLOSED_CRITICAL_STREAM,
+    H3_CONNECT_ERROR, H3_EXCESSIVE_LOAD, H3_FRAME_ERROR, H3_FRAME_UNEXPECTED,
+    H3_GENERAL_PROTOCOL_ERROR, H3_ID_ERROR, H3_INTERNAL_ERROR, H3_MESSAGE_ERROR,
+    H3_MISSING_SETTINGS, H3_NO_ERROR, H3_REQUEST_CANCELLED, H3_REQUEST_INCOMPLETE,
+    H3_REQUEST_REJECTED, H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, H3_VERSION_FALLBACK,
+    QPACK_DECODER_STREAM_ERROR, QPACK_DECOMPRESSION_FAILED, QPACK_ENCODER_STREAM_ERROR,
+};
 pub use headers::{Header, Headers};
 pub use limits::HttpLimits;
 pub use status::reason_phrase;
