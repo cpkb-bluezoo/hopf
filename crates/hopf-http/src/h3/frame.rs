@@ -8,10 +8,16 @@ use super::varint;
 pub const DATA: u64 = 0x00;
 /// HEADERS frame type.
 pub const HEADERS: u64 = 0x01;
+/// CANCEL_PUSH frame type (RFC 9114 §7.2.3) — control stream only.
+pub const CANCEL_PUSH: u64 = 0x03;
 /// SETTINGS frame type.
 pub const SETTINGS: u64 = 0x04;
+/// PUSH_PROMISE frame type (RFC 9114 §7.2.5) — request stream, server→client.
+pub const PUSH_PROMISE: u64 = 0x05;
 /// GOAWAY frame type.
 pub const GOAWAY: u64 = 0x07;
+/// MAX_PUSH_ID frame type (RFC 9114 §7.2.7) — control stream, client→server.
+pub const MAX_PUSH_ID: u64 = 0x0d;
 
 /// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (RFC 9204 §5) — decoder's advertised
 /// dynamic-table capacity ceiling for the peer encoder. Default if absent: 0.
@@ -105,6 +111,28 @@ pub fn write_goaway(out: &mut Vec<u8>, id: u64) {
     let mut payload = Vec::new();
     varint::encode(&mut payload, id);
     write_frame(out, GOAWAY, &payload);
+}
+
+/// Append a CANCEL_PUSH frame (RFC 9114 §7.2.3).
+pub fn write_cancel_push(out: &mut Vec<u8>, push_id: u64) {
+    let mut payload = Vec::new();
+    varint::encode(&mut payload, push_id);
+    write_frame(out, CANCEL_PUSH, &payload);
+}
+
+/// Append a PUSH_PROMISE frame (RFC 9114 §7.2.5).
+pub fn write_push_promise(out: &mut Vec<u8>, push_id: u64, headers_block: &[u8]) {
+    let mut payload = Vec::new();
+    varint::encode(&mut payload, push_id);
+    payload.extend_from_slice(headers_block);
+    write_frame(out, PUSH_PROMISE, &payload);
+}
+
+/// Append a MAX_PUSH_ID frame (RFC 9114 §7.2.7).
+pub fn write_max_push_id(out: &mut Vec<u8>, max_push_id: u64) {
+    let mut payload = Vec::new();
+    varint::encode(&mut payload, max_push_id);
+    write_frame(out, MAX_PUSH_ID, &payload);
 }
 
 /// Parse a GOAWAY frame's payload (RFC 9114 §5.2): a single varint ID.

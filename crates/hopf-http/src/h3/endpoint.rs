@@ -126,7 +126,11 @@ impl QuicConnection for H3ServerConnection {
     }
 
     fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
-        Box::new(H3UniStream::new(Arc::clone(&self.peer_state), Arc::clone(&self.qpack)))
+        Box::new(H3UniStream::new(
+            Arc::clone(&self.peer_state),
+            Arc::clone(&self.qpack),
+            false,
+        ))
     }
 
     fn drive(&mut self, api: &mut dyn QuicConnApi) {
@@ -308,6 +312,9 @@ struct H3RequestStream {
     /// `receive()`'s tail, where an `Endpoint` is available to close the
     /// connection (RFC 9204 §4.5.1: `QPACK_DECOMPRESSION_FAILED`).
     qpack_error: bool,
+    /// Set for connection-level frame violations (push frames, etc.) —
+    /// checked in `receive()`'s tail via `close_connection`.
+    connection_error: Option<u32>,
 }
 
 impl H3RequestStream {
@@ -327,6 +334,7 @@ impl H3RequestStream {
             upgraded: None,
             malformed: false,
             qpack_error: false,
+            connection_error: None,
         };
         let flag = Arc::clone(&needs_protocol_flush);
         stream.writer.control.set_flush(Some(Arc::new(move || {
@@ -480,6 +488,21 @@ impl H3FrameHandler for H3RequestStream {
 
     fn settings_frame(&mut self, _: &[u8]) {}
     fn goaway_frame(&mut self, _: &[u8]) {}
+    fn cancel_push_frame(&mut self, _: &[u8]) {
+        // CANCEL_PUSH is control-stream only (RFC 9114 §7.2.3).
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
+    fn push_promise_frame(&mut self, _: &[u8]) {
+        // Clients MUST NOT send PUSH_PROMISE (RFC 9114 §7.2.5).
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
+    fn max_push_id_frame(&mut self, _: &[u8]) {
+        // MAX_PUSH_ID is control-stream only (RFC 9114 §7.2.7).
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
     fn frame_error(&mut self, _: &str) {}
 }
 
@@ -499,6 +522,10 @@ impl ProtocolHandler for H3RequestStream {
             // desynchronizes the whole connection's QPACK state, not just
             // this stream.
             endpoint.close_connection(frame::QPACK_DECOMPRESSION_FAILED);
+            return;
+        }
+        if let Some(code) = self.connection_error.take() {
+            endpoint.close_connection(code);
             return;
         }
         if self.malformed {
@@ -530,6 +557,7 @@ impl ProtocolHandler for H3RequestStream {
 
 /// RFC 9114 §6.2 / RFC 9204 §4.2 unidirectional stream type identifiers.
 const STREAM_TYPE_CONTROL: u64 = 0x00;
+const STREAM_TYPE_PUSH: u64 = 0x01;
 const STREAM_TYPE_QPACK_ENCODER: u64 = 0x02;
 const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
 
@@ -584,6 +612,9 @@ enum UniKind {
 pub(crate) struct H3UniStream {
     peer_state: Arc<Mutex<H3PeerState>>,
     qpack: Arc<qpack::H3Qpack>,
+    /// `true` when this uni stream belongs to an H3 client connection
+    /// (affects MAX_PUSH_ID / push-stream error codes).
+    is_client: bool,
     kind: UniKind,
     /// Buffered bytes while the type-byte varint is still incomplete —
     /// values above the standard single-byte types (e.g. GREASE, RFC 9114
@@ -599,10 +630,15 @@ pub(crate) struct H3UniStream {
 }
 
 impl H3UniStream {
-    pub(crate) fn new(peer_state: Arc<Mutex<H3PeerState>>, qpack: Arc<qpack::H3Qpack>) -> Self {
+    pub(crate) fn new(
+        peer_state: Arc<Mutex<H3PeerState>>,
+        qpack: Arc<qpack::H3Qpack>,
+        is_client: bool,
+    ) -> Self {
         Self {
             peer_state,
             qpack,
+            is_client,
             kind: UniKind::Unclassified,
             pending_type: Vec::new(),
             qpack_buf: Vec::new(),
@@ -611,35 +647,45 @@ impl H3UniStream {
     }
 
     /// Classify by type byte, updating shared connection state. Returns
-    /// `true` if this is a duplicate critical stream that RFC 9114 wants
-    /// treated as a connection error (`H3_STREAM_CREATION_ERROR`).
-    fn classify(&mut self, ty: u64) -> bool {
+    /// `Some(error_code)` when the stream type is a connection error.
+    fn classify(&mut self, ty: u64) -> Option<u32> {
         let mut state = self.peer_state.lock().unwrap();
         match ty {
             STREAM_TYPE_CONTROL if !state.control_seen => {
                 state.control_seen = true;
                 drop(state);
                 self.kind = UniKind::Control(H3Parser::new());
-                false
+                None
             }
             STREAM_TYPE_QPACK_ENCODER if !state.qpack_encoder_seen => {
                 state.qpack_encoder_seen = true;
                 self.kind = UniKind::QpackEncoderStream;
-                false
+                None
             }
             STREAM_TYPE_QPACK_DECODER if !state.qpack_decoder_seen => {
                 state.qpack_decoder_seen = true;
                 self.kind = UniKind::QpackDecoderStream;
-                false
+                None
             }
             STREAM_TYPE_CONTROL | STREAM_TYPE_QPACK_ENCODER | STREAM_TYPE_QPACK_DECODER => {
                 self.kind = UniKind::Discard;
-                true
+                Some(frame::H3_STREAM_CREATION_ERROR)
+            }
+            STREAM_TYPE_PUSH => {
+                // Push streams: client that never sent MAX_PUSH_ID MUST
+                // treat receipt as H3_ID_ERROR (RFC 9114 §4.6). Servers do
+                // not accept client-opened push streams.
+                self.kind = UniKind::Discard;
+                Some(if self.is_client {
+                    frame::H3_ID_ERROR
+                } else {
+                    frame::H3_STREAM_CREATION_ERROR
+                })
             }
             _ => {
                 // Unknown/reserved type (includes GREASE) — tolerate per RFC 9114 §9.
                 self.kind = UniKind::Discard;
-                false
+                None
             }
         }
     }
@@ -694,6 +740,26 @@ impl H3FrameHandler for H3UniStream {
             self.peer_state.lock().unwrap().goaway_received = Some(id);
         }
     }
+    fn cancel_push_frame(&mut self, _payload: &[u8]) {
+        // hopf never permits push (no MAX_PUSH_ID sent), so any referenced
+        // push ID is greater than currently allowed → H3_ID_ERROR
+        // (RFC 9114 §7.2.3).
+        self.connection_error.get_or_insert(frame::H3_ID_ERROR);
+    }
+    fn push_promise_frame(&mut self, _payload: &[u8]) {
+        // PUSH_PROMISE on the control stream is forbidden (RFC 9114 §7.2.5).
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
+    fn max_push_id_frame(&mut self, _payload: &[u8]) {
+        if self.is_client {
+            // Servers MUST NOT send MAX_PUSH_ID (RFC 9114 §7.2.7).
+            self.connection_error
+                .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+        }
+        // Server role: client is raising our push budget. hopf never pushes,
+        // so ignore (still a legal frame on the control stream).
+    }
     fn frame_error(&mut self, _message: &str) {
         self.connection_error.get_or_insert(frame::H3_FRAME_ERROR);
     }
@@ -712,10 +778,9 @@ impl ProtocolHandler for H3UniStream {
             let remainder = self.pending_type.split_off(ty_len);
             self.pending_type.clear();
 
-            if self.classify(ty) {
-                // RFC 9114 §6.2.1 / RFC 9204 §4.2: a duplicate control or
-                // QPACK critical stream is a connection error.
-                endpoint.close_connection(frame::H3_STREAM_CREATION_ERROR);
+            if let Some(code) = self.classify(ty) {
+                // Duplicate critical stream, unsolicited push stream, etc.
+                endpoint.close_connection(code);
                 return;
             }
 
@@ -835,7 +900,7 @@ mod uni_stream_tests {
     fn control_stream_settings_are_parsed_and_stored() {
         let state = shared_state();
         let qpack = shared_qpack();
-        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
 
         let mut bytes = vec![0x00]; // control stream type
@@ -858,7 +923,7 @@ mod uni_stream_tests {
     fn control_stream_type_and_settings_split_across_receives() {
         let state = shared_state();
         let qpack = shared_qpack();
-        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
 
         let mut settings_bytes = Vec::new();
@@ -881,14 +946,14 @@ mod uni_stream_tests {
         let state = shared_state();
         let qpack = shared_qpack();
 
-        let mut encoder = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+        let mut encoder = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep1 = RecordingEndpoint::default();
         let mut d1: &[u8] = &[0x02];
         encoder.receive(&mut ep1, &mut d1);
         assert!(!ep1.closed);
         assert!(state.lock().unwrap().qpack_encoder_seen);
 
-        let mut decoder = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+        let mut decoder = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep2 = RecordingEndpoint::default();
         let mut d2: &[u8] = &[0x03];
         decoder.receive(&mut ep2, &mut d2);
@@ -905,14 +970,14 @@ mod uni_stream_tests {
         let state = shared_state();
         let qpack = shared_qpack();
         {
-            let mut first = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+            let mut first = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
             let mut ep = RecordingEndpoint::default();
             let mut d: &[u8] = &[0x00];
             first.receive(&mut ep, &mut d);
             assert!(!ep.closed);
         }
 
-        let mut second = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+        let mut second = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
         let mut d: &[u8] = &[0x00];
         second.receive(&mut ep, &mut d);
@@ -929,13 +994,13 @@ mod uni_stream_tests {
         let state = shared_state();
         let qpack = shared_qpack();
         {
-            let mut first = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+            let mut first = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
             let mut ep = RecordingEndpoint::default();
             let mut d: &[u8] = &[0x02];
             first.receive(&mut ep, &mut d);
         }
 
-        let mut second = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+        let mut second = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
         let mut d: &[u8] = &[0x02];
         second.receive(&mut ep, &mut d);
@@ -950,7 +1015,7 @@ mod uni_stream_tests {
     fn unknown_multi_byte_stream_type_is_tolerated() {
         let state = shared_state();
         let qpack = shared_qpack();
-        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
 
         // A 2-byte QUIC varint encoding of a large "reserved" type value.
@@ -974,7 +1039,7 @@ mod uni_stream_tests {
     fn data_frame_on_control_stream_is_a_connection_error() {
         let state = shared_state();
         let qpack = shared_qpack();
-        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x00];
@@ -996,7 +1061,7 @@ mod uni_stream_tests {
     fn goaway_on_control_stream_is_recorded() {
         let state = shared_state();
         let qpack = shared_qpack();
-        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack));
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
         let mut ep = RecordingEndpoint::default();
 
         let mut type_byte: &[u8] = &[0x00];
@@ -1009,6 +1074,86 @@ mod uni_stream_tests {
 
         assert!(!ep.closed, "GOAWAY reception alone doesn't close anything");
         assert_eq!(state.lock().unwrap().goaway_received, Some(8));
+    }
+
+    /// CANCEL_PUSH on the control stream with no push budget is H3_ID_ERROR
+    /// (RFC 9114 §7.2.3 — push ID greater than currently allowed).
+    #[test]
+    fn cancel_push_on_control_stream_is_id_error_when_push_disabled() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+
+        let mut frame_bytes = Vec::new();
+        frame::write_cancel_push(&mut frame_bytes, 0);
+        let mut data: &[u8] = &frame_bytes;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
+    }
+
+    /// PUSH_PROMISE on the control stream is H3_FRAME_UNEXPECTED
+    /// (RFC 9114 §7.2.5).
+    #[test]
+    fn push_promise_on_control_stream_is_frame_unexpected() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+
+        let mut frame_bytes = Vec::new();
+        frame::write_push_promise(&mut frame_bytes, 0, b"");
+        let mut data: &[u8] = &frame_bytes;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    /// A client that never sent MAX_PUSH_ID treats an inbound push stream
+    /// as H3_ID_ERROR (RFC 9114 §4.6).
+    #[test]
+    fn push_uni_stream_on_client_is_id_error() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), true);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x01]; // STREAM_TYPE_PUSH
+        uni.receive(&mut ep, &mut type_byte);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
+    }
+
+    /// GREASE / unknown frame types on the control stream are ignored
+    /// (RFC 9114 §9), not treated as errors.
+    #[test]
+    fn grease_frame_on_control_stream_is_ignored() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x00];
+        uni.receive(&mut ep, &mut type_byte);
+
+        // Reserved frame type 0x21 (N=0 grease form 0x1f*N+0x21).
+        let mut grease = Vec::new();
+        frame::write_frame(&mut grease, 0x21, b"pad");
+        let mut data: &[u8] = &grease;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(!ep.closed);
+        assert_eq!(ep.close_connection_code, None);
     }
 }
 

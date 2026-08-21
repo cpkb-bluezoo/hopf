@@ -130,7 +130,7 @@ impl QuicConnection for H3ClientConnection {
     }
 
     fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
-        Box::new(H3UniStream::new(Arc::clone(&self.peer_state), Arc::clone(&self.qpack)))
+        Box::new(H3UniStream::new(Arc::clone(&self.peer_state), Arc::clone(&self.qpack), true))
     }
 
     fn drive(&mut self, api: &mut dyn QuicConnApi) {
@@ -293,6 +293,8 @@ struct H3ClientStream {
     /// `receive()`'s tail, where an `Endpoint` is available to close the
     /// connection (RFC 9204 §4.5.1: `QPACK_DECOMPRESSION_FAILED`).
     qpack_error: bool,
+    /// Connection-level frame violations (e.g. unsolicited PUSH_PROMISE).
+    connection_error: Option<u32>,
 }
 
 impl H3ClientStream {
@@ -309,6 +311,7 @@ impl H3ClientStream {
             started: false,
             malformed: false,
             qpack_error: false,
+            connection_error: None,
         }
     }
 
@@ -424,6 +427,19 @@ impl H3FrameHandler for H3ClientStream {
 
     fn settings_frame(&mut self, _: &[u8]) {}
     fn goaway_frame(&mut self, _: &[u8]) {}
+    fn cancel_push_frame(&mut self, _: &[u8]) {
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
+    fn push_promise_frame(&mut self, _: &[u8]) {
+        // hopf never sends MAX_PUSH_ID, so any PUSH_PROMISE is
+        // H3_ID_ERROR (RFC 9114 §7.2.5).
+        self.connection_error.get_or_insert(frame::H3_ID_ERROR);
+    }
+    fn max_push_id_frame(&mut self, _: &[u8]) {
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
     fn frame_error(&mut self, _: &str) {}
 }
 
@@ -442,6 +458,10 @@ impl ProtocolHandler for H3ClientStream {
             // desynchronizes the whole connection's QPACK state, not just
             // this stream.
             endpoint.close_connection(frame::QPACK_DECOMPRESSION_FAILED);
+            return;
+        }
+        if let Some(code) = self.connection_error.take() {
+            endpoint.close_connection(code);
             return;
         }
         if self.malformed {
@@ -476,6 +496,7 @@ mod status_validation_tests {
     struct RecordingEndpoint {
         closed: bool,
         abort_code: Option<u32>,
+        close_connection_code: Option<u32>,
         sent: Vec<u8>,
     }
     impl Endpoint for RecordingEndpoint {
@@ -494,6 +515,10 @@ mod status_validation_tests {
         fn abort(&mut self, error_code: u32) {
             self.closed = true;
             self.abort_code = Some(error_code);
+        }
+        fn close_connection(&mut self, error_code: u32) {
+            self.closed = true;
+            self.close_connection_code = Some(error_code);
         }
         fn local_addr(&self) -> std::io::Result<SocketAddr> {
             unimplemented!("not exercised by these unit tests")
@@ -642,6 +667,22 @@ mod status_validation_tests {
         assert_eq!(rec.lock().unwrap().trailers, vec![("grpc-status".to_string(), "0".to_string())]);
     }
 
+    /// hopf never sends MAX_PUSH_ID, so PUSH_PROMISE on a request stream is
+    /// a connection error of type H3_ID_ERROR (RFC 9114 §7.2.5).
+    #[test]
+    fn push_promise_on_request_stream_is_id_error() {
+        let (mut stream, _rec) = stream_with_recorder();
+        let mut ep = RecordingEndpoint::default();
+
+        let mut bytes = Vec::new();
+        frame::write_push_promise(&mut bytes, 0, b"");
+        let mut data: &[u8] = &bytes;
+        stream.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
+    }
+
     /// Collects frame types and HEADERS payloads from a client-encoded request.
     #[derive(Default)]
     struct FrameLog {
@@ -660,6 +701,9 @@ mod status_validation_tests {
         }
         fn settings_frame(&mut self, _: &[u8]) {}
         fn goaway_frame(&mut self, _: &[u8]) {}
+        fn cancel_push_frame(&mut self, _: &[u8]) {}
+        fn push_promise_frame(&mut self, _: &[u8]) {}
+        fn max_push_id_frame(&mut self, _: &[u8]) {}
         fn frame_error(&mut self, msg: &str) {
             panic!("frame error: {msg}");
         }
