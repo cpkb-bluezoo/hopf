@@ -12,10 +12,16 @@ pub trait H3FrameHandler {
     fn data_frame(&mut self, payload: &[u8]);
     /// A HEADERS frame.
     fn headers_frame(&mut self, payload: &[u8]);
+    /// A CANCEL_PUSH frame (RFC 9114 §7.2.3).
+    fn cancel_push_frame(&mut self, payload: &[u8]);
     /// A SETTINGS frame.
     fn settings_frame(&mut self, payload: &[u8]);
+    /// A PUSH_PROMISE frame (RFC 9114 §7.2.5).
+    fn push_promise_frame(&mut self, payload: &[u8]);
     /// A GOAWAY frame.
     fn goaway_frame(&mut self, payload: &[u8]);
+    /// A MAX_PUSH_ID frame (RFC 9114 §7.2.7).
+    fn max_push_id_frame(&mut self, payload: &[u8]);
     /// A malformed frame was received.
     fn frame_error(&mut self, message: &str);
 }
@@ -81,8 +87,12 @@ impl H3Parser {
             match ty {
                 frame::DATA => handler.data_frame(payload),
                 frame::HEADERS => handler.headers_frame(payload),
+                frame::CANCEL_PUSH => handler.cancel_push_frame(payload),
                 frame::SETTINGS => handler.settings_frame(payload),
+                frame::PUSH_PROMISE => handler.push_promise_frame(payload),
                 frame::GOAWAY => handler.goaway_frame(payload),
+                frame::MAX_PUSH_ID => handler.max_push_id_frame(payload),
+                // Unknown / reserved (GREASE) frame types — ignore per RFC 9114 §9.
                 _ => {}
             }
             offset = end;
@@ -105,8 +115,11 @@ mod tests {
             self.0.extend_from_slice(payload);
         }
         fn headers_frame(&mut self, _: &[u8]) {}
+        fn cancel_push_frame(&mut self, _: &[u8]) {}
         fn settings_frame(&mut self, _: &[u8]) {}
+        fn push_promise_frame(&mut self, _: &[u8]) {}
         fn goaway_frame(&mut self, _: &[u8]) {}
+        fn max_push_id_frame(&mut self, _: &[u8]) {}
         fn frame_error(&mut self, _: &str) {}
     }
 
