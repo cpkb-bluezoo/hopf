@@ -328,6 +328,7 @@
 <thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
 <tbody>
 <tr><td>Connection ID gen, packet number spaces, loss detection</td><td>§5,§13</td><td>N/A</td><td>Entirely <code>quinn_proto::Connection</code>/<code>Endpoint</code></td></tr>
+<tr><td>Driver arms mio wait from quinn-proto's real timer deadline</td><td>RFC 9002</td><td>Compliant</td><td><code>Driver::next_timeout()</code> takes the soonest of app-level one-shot timers and every live connection's <code>Connection::poll_timeout()</code> (idle / PTO / loss detection); with no deadline the poll blocks until UDP or a wake instead of the former fixed 10ms cap (<code>driver.rs</code>, <code>poll_wait_*</code> unit tests). <code>handle_timeouts</code> still calls <code>handle_timeout</code> when that deadline is reached</td></tr>
 <tr><td>Server accept, client connect</td><td>§7</td><td>Compliant</td><td><code>driver.rs:443-464,296-338</code></td></tr>
 <tr><td>Handshake completion detection</td><td>§7.3</td><td>Compliant</td><td><code>Event::Connected</code> → <code>on_connected</code> (<code>driver.rs:527-529,558-621</code>)</td></tr>
 <tr><td>TLS 1.3-only pinned for QUIC</td><td>RFC 9001</td><td>Compliant</td><td><code>tls13_server</code>/<code>tls13_client</code> (<code>config.rs:97-124</code>)</td></tr>
