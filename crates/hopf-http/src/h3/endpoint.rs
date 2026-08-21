@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use hopf_core::{ConnHandle, Endpoint, ProtocolHandler};
 use hopf_quic::{
-    listen_quic_hooks, QuicConnApi, QuicConnection, QuicDriverHandle, QuicListenHooksConfig,
-    QuicServerConfig,
+    listen_quic_hooks, DatagramDecode, QuicConnApi, QuicConnection, QuicDriverHandle,
+    QuicListenHooksConfig, QuicServerConfig,
 };
 
 use crate::stream::{
@@ -19,7 +19,7 @@ use crate::stream::{
 use crate::{Headers, HttpLimits};
 
 use super::response::{ArcH3ResponseControl, H3ResponseControl, H3SessionWriter};
-use super::{frame, qpack, H3FrameHandler, H3Parser};
+use super::{datagram, frame, qpack, H3FrameHandler, H3Parser};
 
 /// HTTP/3 connection state installed in the QUIC hooks driver.
 pub struct H3ServerConnection {
@@ -137,6 +137,38 @@ impl QuicConnection for H3ServerConnection {
 
     fn drive(&mut self, api: &mut dyn QuicConnApi) {
         self.flush_qpack(api);
+    }
+
+    fn decode_datagram(&mut self, data: &[u8]) -> DatagramDecode {
+        decode_h3_datagram(&self.peer_state, data)
+    }
+}
+
+/// Shared HTTP/3 Datagram demux (RFC 9297 §2.1) for server and client.
+pub(crate) fn decode_h3_datagram(
+    peer_state: &Arc<Mutex<H3PeerState>>,
+    data: &[u8],
+) -> DatagramDecode {
+    // We always advertise SETTINGS_H3_DATAGRAM=1. The peer must have done
+    // the same before sending QUIC DATAGRAMs.
+    let peer_ok = peer_state
+        .lock()
+        .unwrap()
+        .peer_h3_datagram
+        .unwrap_or(false);
+    if !peer_ok {
+        return DatagramDecode::CloseConnection {
+            error_code: datagram::H3_DATAGRAM_ERROR,
+        };
+    }
+    match datagram::decode(data) {
+        Ok((stream_id, payload)) => DatagramDecode::Deliver {
+            stream_id,
+            payload: payload.to_vec(),
+        },
+        Err(()) => DatagramDecode::CloseConnection {
+            error_code: datagram::H3_DATAGRAM_ERROR,
+        },
     }
 }
 
@@ -348,6 +380,10 @@ struct H3RequestStream {
     /// Set for connection-level frame violations (push frames, etc.) —
     /// checked in `receive()`'s tail via `close_connection`.
     connection_error: Option<u32>,
+    /// Request opted into the Capsule Protocol (RFC 9297 §3) via
+    /// `Capsule-Protocol: ?1` or an upgrade token that implies it.
+    capsule_mode: bool,
+    capsule_parser: crate::capsule::CapsuleParser,
 }
 
 impl H3RequestStream {
@@ -375,6 +411,8 @@ impl H3RequestStream {
             qpack_error: false,
             excessive_load: false,
             connection_error: None,
+            capsule_mode: false,
+            capsule_parser: crate::capsule::CapsuleParser::new(),
         };
         let flag = Arc::clone(&needs_protocol_flush);
         stream.writer.control.set_flush(Some(Arc::new(move || {
@@ -412,7 +450,25 @@ impl H3RequestStream {
 
     fn deliver_request_body(&mut self, payload: &[u8]) {
         if let Some(up) = self.upgraded.as_mut() {
-            if !payload.is_empty() {
+            if self.capsule_mode {
+                match self.capsule_parser.push(payload) {
+                    Ok(capsules) => {
+                        for c in capsules {
+                            if c.ty == crate::capsule::CAPSULE_DATAGRAM {
+                                if up.wants_datagrams() {
+                                    up.datagram_received(&c.value);
+                                }
+                            } else {
+                                up.capsule_received(c.ty, &c.value);
+                            }
+                        }
+                    }
+                    Err(()) => {
+                        self.malformed = true;
+                        return;
+                    }
+                }
+            } else if !payload.is_empty() {
                 up.receive(payload);
             }
             let wants_close = up.wants_close();
@@ -524,6 +580,7 @@ impl H3FrameHandler for H3RequestStream {
         for (name, value) in pairs {
             headers.add(name, value);
         }
+        self.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);
         let mut handler = self.factory.create_handler();
         handler.headers(&mut self.writer, &headers);
         if let Some(up) = self.writer.control.take_upgrade() {
@@ -603,6 +660,18 @@ impl ProtocolHandler for H3RequestStream {
         self.qpack.cancel_stream(self.stream_id);
         self.finish_request(endpoint);
     }
+
+    fn datagram_received(&mut self, endpoint: &mut dyn Endpoint, data: &[u8]) {
+        self.bind_execute_conn();
+        if let Some(up) = self.upgraded.as_mut() {
+            if up.wants_datagrams() {
+                up.datagram_received(data);
+                return;
+            }
+        }
+        // RFC 9297 §2: no known semantics → abort the request stream.
+        endpoint.abort(datagram::H3_DATAGRAM_ERROR);
+    }
 }
 
 /// RFC 9114 §6.2 / RFC 9204 §4.2 unidirectional stream type identifiers.
@@ -627,6 +696,10 @@ pub(crate) struct H3PeerState {
     /// enabled). The H3 client consults this before issuing Extended
     /// CONNECT — see [`crate::h3::client`].
     pub(crate) peer_enable_connect_protocol: Option<bool>,
+    /// Peer's `SETTINGS_H3_DATAGRAM` (RFC 9297 §2.1.1). `None` until
+    /// SETTINGS; absent → `Some(false)`. Both peers must have advertised
+    /// `1` before QUIC DATAGRAMs carry HTTP Datagrams.
+    pub(crate) peer_h3_datagram: Option<bool>,
     /// Run once peer SETTINGS has been applied (so
     /// [`Self::peer_enable_connect_protocol`] is known). Used to resume
     /// Extended CONNECT requests that arrived before SETTINGS.
@@ -797,6 +870,7 @@ impl H3FrameHandler for H3UniStream {
         self.settings_received = true;
 
         let mut enable_connect_protocol = None;
+        let mut h3_datagram = None;
         // RFC 9204 §5: absent → default 0. Track whether the setting was
         // present so we still apply 0 (and keep the encoder gated) when a
         // peer sends SETTINGS without a QPACK capacity entry.
@@ -807,6 +881,13 @@ impl H3FrameHandler for H3UniStream {
         for (id, val) in frame::parse_settings(payload) {
             if id == frame::SETTINGS_ENABLE_CONNECT_PROTOCOL {
                 enable_connect_protocol = Some(val != 0);
+            } else if id == datagram::SETTINGS_H3_DATAGRAM {
+                if val > 1 {
+                    self.connection_error
+                        .get_or_insert(frame::H3_SETTINGS_ERROR);
+                    return;
+                }
+                h3_datagram = Some(val == 1);
             } else if id == frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY {
                 qpack_max_table_capacity = val;
                 saw_qpack_max = true;
@@ -819,6 +900,8 @@ impl H3FrameHandler for H3UniStream {
             // RFC 9220 / RFC 8441 §3: absent → not enabled.
             state.peer_enable_connect_protocol =
                 Some(enable_connect_protocol.unwrap_or(false));
+            // RFC 9297 §2.1.1: absent → not willing to receive HTTP Datagrams.
+            state.peer_h3_datagram = Some(h3_datagram.unwrap_or(false));
             // Always record a capacity once SETTINGS has been seen — either
             // the advertised value or the RFC default of 0.
             state.peer_qpack_max_table_capacity = Some(if saw_qpack_max {

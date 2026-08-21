@@ -60,6 +60,16 @@ pub trait ClientHandler: Send {
     /// error). Mutually exclusive with [`Self::response_complete`] — at
     /// most one of the two fires per request. Default: ignore.
     fn request_failed(&mut self, _request: &mut dyn ClientWriter, _err: &std::io::Error) {}
+
+    /// Whether this request accepts HTTP Datagrams (RFC 9297). Default: no.
+    fn wants_datagrams(&self) -> bool {
+        false
+    }
+
+    /// An HTTP Datagram associated with this request (H3 demux or DATAGRAM
+    /// capsule). Only called when [`wants_datagrams`](Self::wants_datagrams)
+    /// is true.
+    fn datagram_received(&mut self, _data: &[u8]) {}
 }
 
 /// Outbound request writer / in-flight control for a client Stream.
@@ -129,5 +139,13 @@ impl ClientHandler for Box<dyn ClientHandler> {
 
     fn request_failed(&mut self, request: &mut dyn ClientWriter, err: &std::io::Error) {
         (**self).request_failed(request, err);
+    }
+
+    fn wants_datagrams(&self) -> bool {
+        (**self).wants_datagrams()
+    }
+
+    fn datagram_received(&mut self, data: &[u8]) {
+        (**self).datagram_received(data);
     }
 }

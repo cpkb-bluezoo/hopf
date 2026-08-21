@@ -173,6 +173,22 @@ pub trait ProtocolUpgradeHandler: Send {
     fn wants_close(&self) -> bool {
         false
     }
+
+    /// Whether this upgrade accepts HTTP Datagrams (RFC 9297) demuxed onto
+    /// the request stream. Default: no — unknown datagrams abort the stream
+    /// with `H3_DATAGRAM_ERROR`.
+    fn wants_datagrams(&self) -> bool {
+        false
+    }
+
+    /// An HTTP Datagram payload associated with this upgraded request
+    /// (after quarter-stream-ID demux on H3, or a DATAGRAM capsule).
+    /// Only called when [`wants_datagrams`](Self::wants_datagrams) is true.
+    fn datagram_received(&mut self, _data: &[u8]) {}
+
+    /// A Capsule Protocol capsule other than DATAGRAM (RFC 9297 §3.2).
+    /// Unknown types should usually be ignored. Default: ignore.
+    fn capsule_received(&mut self, _ty: u64, _value: &[u8]) {}
 }
 
 /// Outbound response writer for the current server Stream.

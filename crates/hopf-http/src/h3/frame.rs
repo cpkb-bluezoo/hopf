@@ -166,8 +166,8 @@ pub fn parse_goaway(payload: &[u8]) -> Option<u64> {
 }
 
 /// Append a SETTINGS frame advertising QPACK parameters (RFC 9204 §5),
-/// `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1), and Extended
-/// CONNECT (RFC 9220).
+/// `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1), Extended
+/// CONNECT (RFC 9220), and `SETTINGS_H3_DATAGRAM=1` (RFC 9297 §2.1.1).
 ///
 /// `qpack_max_table_capacity` is this endpoint's decoder ceiling (what the
 /// peer encoder may grow to); `qpack_blocked_streams` is how many streams
@@ -188,6 +188,9 @@ pub fn write_settings(
     varint::encode(&mut payload, SETTINGS_MAX_FIELD_SECTION_SIZE);
     varint::encode(&mut payload, max_field_section_size);
     varint::encode(&mut payload, SETTINGS_ENABLE_CONNECT_PROTOCOL);
+    varint::encode(&mut payload, 1);
+    // RFC 9297 §2.1.1 / §4: always advertise to avoid "sticking out".
+    varint::encode(&mut payload, super::datagram::SETTINGS_H3_DATAGRAM);
     varint::encode(&mut payload, 1);
     write_frame(out, SETTINGS, &payload);
 }
@@ -233,6 +236,7 @@ mod tests {
                 (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
                 (SETTINGS_MAX_FIELD_SECTION_SIZE, DEFAULT_MAX_FIELD_SECTION_SIZE),
                 (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
+                (super::super::datagram::SETTINGS_H3_DATAGRAM, 1),
             ]
         );
     }
@@ -299,5 +303,6 @@ mod tests {
         assert_eq!(QPACK_DECOMPRESSION_FAILED, 0x0200);
         assert_eq!(QPACK_ENCODER_STREAM_ERROR, 0x0201);
         assert_eq!(QPACK_DECODER_STREAM_ERROR, 0x0202);
+        assert_eq!(crate::h3::datagram::H3_DATAGRAM_ERROR, 0x33);
     }
 }

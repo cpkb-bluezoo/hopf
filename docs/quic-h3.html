@@ -365,7 +365,7 @@
 <li>Driver thread is <strong>not</strong> a TCP worker reactor; shut down / drop <code>QuicDriverHandle</code> independently of <code>Runtime</code>.</li>
 <li>Addresses must be pre-resolved (no DNS inside <code>connect_quic</code> / <code>connect_h3</code>).</li>
 <li>Plain (non-hooks) server mode installs <code>NopHandler</code> on accepted unidirectional streams.</li>
-<li>No HTTP/2-style server push; no WebTransport / DATAGRAM product API yet.</li>
+<li>No HTTP/2-style server push; no WebTransport / CONNECT-UDP product API yet (RFC 9297 HTTP Datagrams + Capsule Protocol plumbing is present).</li>
 <li>0-RTT is off by default; enable via <code>QuicTlsOptions::with_early_data</code> (replay risk — see SECURITY.md). Plain <code>connect_quic</code> opens the first stream before <code>Event::Connected</code> when a session ticket makes <code>has_0rtt()</code> true; H3 hooks-mode still starts after the full handshake.</li>
 <li>Locally-initiated connection close (<code>LocallyClosed</code>) still calls <code>ProtocolHandler::disconnected</code> on this endpoint's streams; only the peer sees <code>QuicConnectionCloseError</code> via <code>error</code>. Use the return value of <code>close_connection</code> locally if you need the code you just sent.</li>
 </ul>

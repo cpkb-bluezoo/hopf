@@ -219,6 +219,9 @@ struct H2ServerStream {
     paused_end_stream: bool,
     /// Active WebSocket / protocol upgrade on this stream.
     upgraded: Option<Box<dyn ProtocolUpgradeHandler>>,
+    /// Capsule Protocol (RFC 9297 §3) after `Capsule-Protocol: ?1`.
+    capsule_mode: bool,
+    capsule_parser: crate::capsule::CapsuleParser,
 }
 
 // ---------------------------------------------------------------------------
@@ -944,9 +947,12 @@ impl H2Endpoint {
             paused_body: Vec::new(),
             paused_end_stream: false,
             upgraded: None,
+            capsule_mode: false,
+            capsule_parser: crate::capsule::CapsuleParser::new(),
         };
 
         stream.handler.headers(&mut stream.writer, &upgrade_headers);
+        stream.capsule_mode = crate::capsule::capsule_protocol_enabled(&upgrade_headers);
         if let Some(up) = stream.writer.control.take_upgrade() {
             stream.upgraded = Some(up);
         }
@@ -1170,9 +1176,12 @@ impl H2Endpoint {
             paused_body: Vec::new(),
             paused_end_stream: false,
             upgraded: None,
+            capsule_mode: false,
+            capsule_parser: crate::capsule::CapsuleParser::new(),
         };
 
         stream.handler.headers(&mut stream.writer, &headers);
+        stream.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);
         if let Some(up) = stream.writer.control.take_upgrade() {
             stream.upgraded = Some(up);
         }
@@ -1301,24 +1310,51 @@ impl H2Endpoint {
 
         let end_stream = flags & FLAG_END_STREAM != 0;
         if let Some(stream) = self.server_streams.get_mut(&stream_id) {
-            if let Some(up) = stream.upgraded.as_mut() {
-                if !data.is_empty() {
-                    up.receive(data);
-                }
-                if end_stream {
-                    up.closed();
-                }
-                let wants_close = up.wants_close();
-                // Queue any immediate outbound frames into the response body buffer.
-                let out = up.take_outbound();
-                {
-                    let mut shared = stream.writer.control.shared.lock().unwrap();
-                    if !out.is_empty() {
-                        shared.body.extend_from_slice(&out);
+            if stream.upgraded.is_some() {
+                let capsule_mode = stream.capsule_mode;
+                if capsule_mode {
+                    match stream.capsule_parser.push(data) {
+                        Ok(capsules) => {
+                            if let Some(up) = stream.upgraded.as_mut() {
+                                for c in capsules {
+                                    if c.ty == crate::capsule::CAPSULE_DATAGRAM {
+                                        if up.wants_datagrams() {
+                                            up.datagram_received(&c.value);
+                                        }
+                                    } else {
+                                        up.capsule_received(c.ty, &c.value);
+                                    }
+                                }
+                            }
+                        }
+                        Err(()) => {
+                            frame::write_rst_stream(&mut self.out, stream_id, ERROR_PROTOCOL_ERROR);
+                            return;
+                        }
                     }
-                    // Extended CONNECT: end the stream after a WS Close / protocol error.
-                    if wants_close {
-                        shared.done = true;
+                    if end_stream && stream.capsule_parser.finish().is_err() {
+                        frame::write_rst_stream(&mut self.out, stream_id, ERROR_PROTOCOL_ERROR);
+                        return;
+                    }
+                } else if let Some(up) = stream.upgraded.as_mut() {
+                    if !data.is_empty() {
+                        up.receive(data);
+                    }
+                }
+                if let Some(up) = stream.upgraded.as_mut() {
+                    if end_stream {
+                        up.closed();
+                    }
+                    let wants_close = up.wants_close();
+                    let out = up.take_outbound();
+                    {
+                        let mut shared = stream.writer.control.shared.lock().unwrap();
+                        if !out.is_empty() {
+                            shared.body.extend_from_slice(&out);
+                        }
+                        if wants_close {
+                            shared.done = true;
+                        }
                     }
                 }
                 return;
@@ -2480,6 +2516,8 @@ mod graceful_shutdown_tests {
                 paused_body: Vec::new(),
                 paused_end_stream: false,
                 upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
             },
         );
 
@@ -2734,6 +2772,8 @@ mod state_machine_tests {
                 paused_body: Vec::new(),
                 paused_end_stream: false,
                 upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
             },
         );
         assert_eq!(ep.stream_state(1), StreamState::Open);
@@ -2793,6 +2833,8 @@ mod state_machine_tests {
                 paused_body: Vec::new(),
                 paused_end_stream: false,
                 upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
             },
         );
         ep.on_data(1, 0, b"hello");

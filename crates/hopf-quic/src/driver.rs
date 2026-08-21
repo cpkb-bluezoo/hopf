@@ -22,7 +22,7 @@ use hopf_core::{Endpoint, HandlerFactory, ProtocolHandler, SecurityInfo};
 
 use crate::config::{QuicConnectConfig, QuicListenConfig, QuicListenHooksConfig};
 use crate::error::{connection_lost_io_error, stream_stopped_io_error};
-use crate::hooks::{ConnectionFactory, QuicConnApi, QuicConnection};
+use crate::hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection};
 use crate::stream::{QuicStreamEndpoint, StreamQueues};
 
 const UDP_TOKEN: Token = Token(0);
@@ -76,6 +76,11 @@ pub(crate) enum DriverCmd {
         conn: ConnectionHandle,
         stream_id: StreamId,
         task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>,
+    },
+    /// Queue a QUIC DATAGRAM (RFC 9221) on `conn`.
+    SendDatagram {
+        conn: ConnectionHandle,
+        payload: Vec<u8>,
     },
     Shutdown,
 }
@@ -749,6 +754,11 @@ impl Driver {
                         }
                     }
                 }
+                DriverCmd::SendDatagram { conn, payload } => {
+                    if let Some(slot) = self.connections.get_mut(&conn) {
+                        let _ = slot.conn.datagrams().send(Bytes::from(payload), true);
+                    }
+                }
             }
         }
     }
@@ -910,7 +920,9 @@ impl Driver {
                     return;
                 }
                 Event::Stream(se) => self.on_stream_event(ch, se),
-                Event::DatagramReceived => {}
+                Event::DatagramReceived => {
+                    self.drain_datagrams(ch);
+                }
                 _ => {}
             }
         }
@@ -1105,6 +1117,11 @@ impl Driver {
                         }
                     }
                 }
+                RecorderAction::SendDatagram { data } => {
+                    if let Some(slot) = self.connections.get_mut(&ch) {
+                        let _ = slot.conn.datagrams().send(Bytes::from(data), true);
+                    }
+                }
             }
         }
     }
@@ -1171,6 +1188,69 @@ impl Driver {
             for stream in slot.streams.values_mut() {
                 stream.endpoint.set_remote(current);
                 stream.handler.migrated(&mut stream.endpoint);
+            }
+        }
+    }
+
+    /// Drain inbound QUIC DATAGRAMs (RFC 9221), ask the connection app how
+    /// to route each payload, and deliver / abort / close accordingly.
+    fn drain_datagrams(&mut self, ch: ConnectionHandle) {
+        loop {
+            let raw = {
+                let Some(slot) = self.connections.get_mut(&ch) else {
+                    return;
+                };
+                match slot.conn.datagrams().recv() {
+                    Some(b) => b,
+                    None => return,
+                }
+            };
+            let decode = {
+                let Some(slot) = self.connections.get_mut(&ch) else {
+                    return;
+                };
+                match slot.app.as_mut() {
+                    Some(app) => app.decode_datagram(&raw),
+                    None => DatagramDecode::Drop,
+                }
+            };
+            match decode {
+                DatagramDecode::Drop => {}
+                DatagramDecode::Deliver { stream_id, payload } => {
+                    let Ok(vid) = VarInt::from_u64(stream_id) else {
+                        continue;
+                    };
+                    let sid = StreamId::from(vid);
+                    if let Some(slot) = self.connections.get_mut(&ch) {
+                        if let Some(stream) = slot.streams.get_mut(&sid) {
+                            stream
+                                .handler
+                                .datagram_received(&mut stream.endpoint, &payload);
+                        }
+                    }
+                }
+                DatagramDecode::AbortStream {
+                    stream_id,
+                    error_code,
+                } => {
+                    let Ok(vid) = VarInt::from_u64(stream_id) else {
+                        continue;
+                    };
+                    let sid = StreamId::from(vid);
+                    if let Some(slot) = self.connections.get_mut(&ch) {
+                        if let Some(stream) = slot.streams.get_mut(&sid) {
+                            stream.endpoint.abort(error_code);
+                        }
+                    }
+                }
+                DatagramDecode::CloseConnection { error_code } => {
+                    if let Some(slot) = self.connections.get_mut(&ch) {
+                        if let Ok(code) = VarInt::from_u64(u64::from(error_code)) {
+                            slot.conn.close(Instant::now(), code, Bytes::new());
+                        }
+                    }
+                    return;
+                }
             }
         }
     }
@@ -1573,6 +1653,7 @@ enum RecorderAction {
     Open { dir: Dir, key: u64 },
     Write { key: u64, data: Vec<u8> },
     Finish { key: u64 },
+    SendDatagram { data: Vec<u8> },
 }
 
 impl QuicConnApi for ConnRecorder {
@@ -1606,6 +1687,13 @@ impl QuicConnApi for ConnRecorder {
     fn finish(&mut self, stream_key: u64) {
         self.actions.push(RecorderAction::Finish { key: stream_key });
     }
+
+    fn send_datagram(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.actions.push(RecorderAction::SendDatagram {
+            data: payload.to_vec(),
+        });
+        Ok(())
+    }
 }
 
 #[cfg(all(test, feature = "integration"))]
@@ -1613,7 +1701,7 @@ mod tests {
     use super::*;
     use crate::config::{client_config_for_pem_bytes, server_config_self_signed};
     use std::sync::Mutex as StdMutex;
-    use hopf_core::{Endpoint, ProtocolHandler};
+    use hopf_core::{Endpoint, NopHandler, ProtocolHandler};
 
     struct Echo;
 
@@ -2354,5 +2442,101 @@ mod tests {
         }
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    /// RFC 9221: connection-scoped DATAGRAM send/recv via hooks.
+    struct DatagramEchoConn {
+        got: Arc<StdMutex<Vec<u8>>>,
+        reply: Option<Vec<u8>>,
+    }
+
+    impl QuicConnection for DatagramEchoConn {
+        fn connected(&mut self, _api: &mut dyn QuicConnApi) {}
+        fn accept_bi(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+            Box::new(NopHandler)
+        }
+        fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+            Box::new(NopHandler)
+        }
+        fn decode_datagram(&mut self, data: &[u8]) -> crate::DatagramDecode {
+            self.got.lock().unwrap().extend_from_slice(data);
+            self.reply = Some(b"pong".to_vec());
+            crate::DatagramDecode::Drop
+        }
+        fn drive(&mut self, api: &mut dyn QuicConnApi) {
+            if let Some(payload) = self.reply.take() {
+                let _ = api.send_datagram(&payload);
+            }
+        }
+    }
+
+    struct DatagramClientConn {
+        sent: bool,
+        got: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl QuicConnection for DatagramClientConn {
+        fn connected(&mut self, api: &mut dyn QuicConnApi) {
+            let _ = api.send_datagram(b"ping");
+            self.sent = true;
+        }
+        fn accept_bi(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+            Box::new(NopHandler)
+        }
+        fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+            Box::new(NopHandler)
+        }
+        fn decode_datagram(&mut self, data: &[u8]) -> crate::DatagramDecode {
+            self.got.lock().unwrap().extend_from_slice(data);
+            crate::DatagramDecode::Drop
+        }
+    }
+
+    #[test]
+    fn quic_datagram_echo_round_trip() {
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+
+        let server_got = Arc::new(StdMutex::new(Vec::new()));
+        let server_got2 = Arc::clone(&server_got);
+        let server = listen_quic_hooks(crate::QuicListenHooksConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(move || {
+                Box::new(DatagramEchoConn {
+                    got: Arc::clone(&server_got2),
+                    reply: None,
+                }) as Box<dyn QuicConnection>
+            }),
+        ))
+        .unwrap();
+
+        let client_got = Arc::new(StdMutex::new(Vec::new()));
+        let client_got2 = Arc::clone(&client_got);
+        let _client = connect_quic_hooks(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(DatagramClientConn {
+                    sent: false,
+                    got: Arc::clone(&client_got2),
+                }) as Box<dyn QuicConnection>
+            }),
+        )
+        .unwrap();
+
+        for _ in 0..200 {
+            if client_got.lock().unwrap().as_slice() == b"pong"
+                && server_got.lock().unwrap().as_slice() == b"ping"
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(server_got.lock().unwrap().as_slice(), b"ping");
+        assert_eq!(client_got.lock().unwrap().as_slice(), b"pong");
+        server.shutdown();
     }
 }

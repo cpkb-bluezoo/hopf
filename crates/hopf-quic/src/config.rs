@@ -338,6 +338,11 @@ pub struct QuicTransportOptions {
     send_window: Option<u64>,
     max_concurrent_bidi_streams: Option<u32>,
     max_concurrent_uni_streams: Option<u32>,
+    /// `None` = leave quinn default (datagrams enabled with a receive buffer).
+    /// `Some(None)` = disable inbound DATAGRAM (RFC 9221).
+    /// `Some(Some(n))` = set receive buffer to `n` bytes.
+    datagram_receive_buffer_size: Option<Option<usize>>,
+    datagram_send_buffer_size: Option<usize>,
 }
 
 impl QuicTransportOptions {
@@ -398,6 +403,21 @@ impl QuicTransportOptions {
         self
     }
 
+    /// Maximum inbound QUIC DATAGRAM payload bytes to buffer (RFC 9221), or
+    /// `None` to refuse DATAGRAM frames (clears `max_datagram_frame_size`).
+    /// Quinn's default enables a receive buffer; call this only to override.
+    pub fn datagram_receive_buffer_size(mut self, value: Option<usize>) -> Self {
+        self.datagram_receive_buffer_size = Some(value);
+        self
+    }
+
+    /// Maximum outbound QUIC DATAGRAM bytes to buffer before older datagrams
+    /// are dropped (RFC 9221).
+    pub fn datagram_send_buffer_size(mut self, value: usize) -> Self {
+        self.datagram_send_buffer_size = Some(value);
+        self
+    }
+
     fn build(&self) -> io::Result<TransportConfig> {
         let mut transport = TransportConfig::default();
         if let Some(value) = self.max_idle_timeout {
@@ -423,6 +443,12 @@ impl QuicTransportOptions {
         }
         if let Some(value) = self.max_concurrent_uni_streams {
             transport.max_concurrent_uni_streams(VarInt::from_u32(value));
+        }
+        if let Some(value) = self.datagram_receive_buffer_size {
+            transport.datagram_receive_buffer_size(value);
+        }
+        if let Some(value) = self.datagram_send_buffer_size {
+            transport.datagram_send_buffer_size(value);
         }
         Ok(transport)
     }

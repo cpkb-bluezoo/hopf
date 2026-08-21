@@ -150,6 +150,19 @@ pub trait Endpoint: Send {
     fn close_connection(&mut self, error_code: u32) {
         self.abort(error_code);
     }
+
+    /// Queue an unreliable QUIC DATAGRAM frame (RFC 9221) on the underlying
+    /// connection. `payload` is the DATAGRAM frame's application data (for
+    /// HTTP/3 Datagrams this already includes the quarter-stream-ID prefix,
+    /// RFC 9297 §2.1).
+    ///
+    /// Default: not supported (`ErrorKind::Unsupported`).
+    fn send_datagram(&mut self, _payload: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "datagrams not supported on this endpoint",
+        ))
+    }
 }
 
 /// Callback type for [`Endpoint::on_write_ready`].

@@ -11,6 +11,7 @@
 #![warn(missing_docs)]
 
 pub mod auth;
+pub mod capsule;
 pub mod client;
 pub mod h1;
 pub mod h2;
@@ -30,6 +31,7 @@ mod limits;
 mod pseudo_headers;
 mod status;
 mod utils;
+mod varint;
 mod version;
 
 pub use auth::{
@@ -52,14 +54,19 @@ pub use h1::{
 pub use h2::CleartextHttpEndpoint;
 pub use h2::H2Endpoint;
 pub use h2::H2cUpgradeClientEndpoint;
+pub use capsule::{
+    capsule_protocol_enabled, Capsule, CapsuleParser, CAPSULE_DATAGRAM, CAPSULE_PROTOCOL_HEADER,
+};
 #[cfg(feature = "h3")]
 pub use h3::{
-    connect_h3, listen_h3, H3ClientConnection, H3ServerConnection, H3_CLOSED_CRITICAL_STREAM,
-    H3_CONNECT_ERROR, H3_EXCESSIVE_LOAD, H3_FRAME_ERROR, H3_FRAME_UNEXPECTED,
+    connect_h3, decode_http3_datagram, encode_http3_datagram, listen_h3, send_http3_datagram,
+    H3ClientConnection, H3ServerConnection, H3_CLOSED_CRITICAL_STREAM, H3_CONNECT_ERROR,
+    H3_DATAGRAM_ERROR, H3_EXCESSIVE_LOAD, H3_FRAME_ERROR, H3_FRAME_UNEXPECTED,
     H3_GENERAL_PROTOCOL_ERROR, H3_ID_ERROR, H3_INTERNAL_ERROR, H3_MESSAGE_ERROR,
     H3_MISSING_SETTINGS, H3_NO_ERROR, H3_REQUEST_CANCELLED, H3_REQUEST_INCOMPLETE,
     H3_REQUEST_REJECTED, H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, H3_VERSION_FALLBACK,
     QPACK_DECODER_STREAM_ERROR, QPACK_DECOMPRESSION_FAILED, QPACK_ENCODER_STREAM_ERROR,
+    SETTINGS_H3_DATAGRAM,
 };
 pub use headers::{Header, Headers};
 pub use limits::HttpLimits;

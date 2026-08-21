@@ -8,14 +8,15 @@ use std::sync::{Arc, Mutex};
 
 use hopf_core::{Endpoint, ProtocolHandler};
 use hopf_quic::{
-    connect_quic_hooks, QuicClientConfig, QuicConnApi, QuicConnection, QuicDriverHandle,
+    connect_quic_hooks, DatagramDecode, QuicClientConfig, QuicConnApi, QuicConnection,
+    QuicDriverHandle,
 };
 
 use crate::{
     ClientHandler, ClientHandlerFactory, ClientWriter, Headers, HttpLimits,
 };
 
-use super::endpoint::{H3PeerState, H3UniStream};
+use super::endpoint::{decode_h3_datagram, H3PeerState, H3UniStream};
 use super::{frame, qpack, H3FrameHandler, H3Parser};
 
 /// Client-initiated stream factories queued to be opened on a live H3
@@ -147,6 +148,10 @@ impl QuicConnection for H3ClientConnection {
     fn drive(&mut self, api: &mut dyn QuicConnApi) {
         self.flush_qpack(api);
         self.drain_pending_opens(api);
+    }
+
+    fn decode_datagram(&mut self, data: &[u8]) -> DatagramDecode {
+        decode_h3_datagram(&self.peer_state, data)
     }
 }
 
@@ -650,6 +655,16 @@ impl ProtocolHandler for H3ClientStream {
         // for it.
         self.qpack.cancel_stream(self.stream_id);
         self.finish_response();
+    }
+
+    fn datagram_received(&mut self, endpoint: &mut dyn Endpoint, data: &[u8]) {
+        if let Some(handler) = self.handler.as_mut() {
+            if handler.wants_datagrams() {
+                handler.datagram_received(data);
+                return;
+            }
+        }
+        endpoint.abort(super::datagram::H3_DATAGRAM_ERROR);
     }
 }
 
