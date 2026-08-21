@@ -153,8 +153,8 @@
 <tbody>
 <tr>
 <td><code>QuicListenConfig</code></td>
-<td><code>addr</code>, <code>server: Arc&lt;QuicServerConfig&gt;</code>, <code>factory: HandlerFactory</code></td>
-<td>UDP listen; one <code>ProtocolHandler</code> per accepted bi-stream</td>
+<td><code>addr</code>, <code>server: Arc&lt;QuicServerConfig&gt;</code>, <code>factory: HandlerFactory</code>, <code>hardening: QuicListenHardening</code></td>
+<td>UDP listen; one <code>ProtocolHandler</code> per accepted bi-stream. Hardening defaults to <code>QuicListenHardening::high_security()</code> (Retry before handshake)</td>
 </tr>
 <tr>
 <td><code>QuicConnectConfig</code></td>
@@ -163,18 +163,25 @@
 </tr>
 <tr>
 <td><code>QuicListenHooksConfig</code></td>
-<td><code>addr</code>, <code>server</code>, <code>connection_factory: ConnectionFactory</code></td>
-<td>Connection-level hooks (H3)</td>
+<td><code>addr</code>, <code>server</code>, <code>connection_factory: ConnectionFactory</code>, <code>hardening: QuicListenHardening</code></td>
+<td>Connection-level hooks (H3); same hardening default as plain listen</td>
+</tr>
+<tr>
+<td><code>QuicListenHardening</code></td>
+<td><code>require_address_validation</code>, Incoming caps, Retry/NEW_TOKEN lifetimes, <code>migration</code></td>
+<td>RFC 9000 §8 listen hardening. <code>high_security()</code> (default) requires Retry/NEW_TOKEN before accept, caps unfinished handshakes, disables migration; <code>permissive()</code> leaves quinn defaults and accepts without Retry</td>
 </tr>
 </tbody>
 </table>
 <p>Constructors:</p>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_quic::</span><span class="op">{</span>QuicConnectConfig<span class="op">,</span> QuicListenConfig<span class="op">,</span> QuicListenHooksConfig<span class="op">};</span></span>
+<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_quic::</span><span class="op">{</span>QuicConnectConfig<span class="op">,</span> QuicListenConfig<span class="op">,</span> QuicListenHardening<span class="op">,</span> QuicListenHooksConfig<span class="op">};</span></span>
 <span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicListenConfig::</span>new(addr<span class="op">,</span> server_cfg<span class="op">,</span> factory)<span class="op">;</span></span>
-<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicConnectConfig::</span>new(addr<span class="op">,</span> client_cfg<span class="op">,</span> <span class="st">&quot;localhost&quot;</span><span class="op">,</span> factory)<span class="op">;</span></span>
-<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicListenHooksConfig::</span>new(addr<span class="op">,</span> server_cfg<span class="op">,</span> connection_factory)<span class="op">;</span></span></code></pre></div>
-<p>Port <code>0</code> binds an ephemeral UDP port. Addresses must be pre-resolved (<code>SocketAddr</code>) — Stage 0.</p>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicListenConfig::</span>new(addr<span class="op">,</span> server_cfg<span class="op">,</span> factory)</span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_hardening(<span class="pp">QuicListenHardening::</span>permissive())<span class="op">;</span> <span class="co">// lab / trusted path</span></span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicConnectConfig::</span>new(addr<span class="op">,</span> client_cfg<span class="op">,</span> <span class="st">&quot;localhost&quot;</span><span class="op">,</span> factory)<span class="op">;</span></span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a><span class="pp">QuicListenHooksConfig::</span>new(addr<span class="op">,</span> server_cfg<span class="op">,</span> connection_factory)<span class="op">;</span></span></code></pre></div>
+<p>Port <code>0</code> binds an ephemeral UDP port. Addresses must be pre-resolved (<code>SocketAddr</code>) — Stage 0. Listeners apply <code>apply_listen_hardening</code> to the server config at bind time; with the default high-security policy, unvalidated Initials receive a Retry packet before any TLS handshake state is allocated.</p>
 <h3 id="driver-apis">Driver APIs</h3>
 <table>
 <colgroup>

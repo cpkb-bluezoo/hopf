@@ -29,16 +29,26 @@ pub struct QuicListenConfig {
     pub server: Arc<QuicServerConfig>,
     /// Factory for handlers — one per accepted bidirectional stream.
     pub factory: HandlerFactory,
+    /// Address-validation and Incoming DoS hardening (defaults to
+    /// [`QuicListenHardening::high_security`]).
+    pub hardening: QuicListenHardening,
 }
 
 impl QuicListenConfig {
-    /// Create a listen config.
+    /// Create a listen config with [`QuicListenHardening::high_security`].
     pub fn new(addr: SocketAddr, server: Arc<QuicServerConfig>, factory: HandlerFactory) -> Self {
         Self {
             addr,
             server,
             factory,
+            hardening: QuicListenHardening::high_security(),
         }
+    }
+
+    /// Override listen hardening (e.g. [`QuicListenHardening::permissive`] for labs).
+    pub fn with_hardening(mut self, hardening: QuicListenHardening) -> Self {
+        self.hardening = hardening;
+        self
     }
 }
 
@@ -50,10 +60,14 @@ pub struct QuicListenHooksConfig {
     pub server: Arc<QuicServerConfig>,
     /// One [`crate::QuicConnection`] per accepted QUIC connection.
     pub connection_factory: ConnectionFactory,
+    /// Address-validation and Incoming DoS hardening (defaults to
+    /// [`QuicListenHardening::high_security`]).
+    pub hardening: QuicListenHardening,
 }
 
 impl QuicListenHooksConfig {
-    /// Create a hooks-based listen config.
+    /// Create a hooks-based listen config with
+    /// [`QuicListenHardening::high_security`].
     pub fn new(
         addr: SocketAddr,
         server: Arc<QuicServerConfig>,
@@ -63,7 +77,178 @@ impl QuicListenHooksConfig {
             addr,
             server,
             connection_factory,
+            hardening: QuicListenHardening::high_security(),
         }
+    }
+
+    /// Override listen hardening (e.g. [`QuicListenHardening::permissive`] for labs).
+    pub fn with_hardening(mut self, hardening: QuicListenHardening) -> Self {
+        self.hardening = hardening;
+        self
+    }
+}
+
+/// QUIC listener DoS / address-validation hardening (RFC 9000 §8).
+///
+/// Quinn-proto always enforces the 3× anti-amplification limit before an
+/// address is validated. This knob layer goes further for public / high-
+/// security listeners: require Retry (or a valid NEW_TOKEN) before starting
+/// the TLS handshake, tighten Incoming buffer caps, shorten token lifetimes,
+/// and optionally disable connection migration.
+///
+/// Applied via [`apply_listen_hardening`] onto a [`QuicServerConfig`], and
+/// via the driver's accept path when [`Self::require_address_validation`] is
+/// set.
+#[derive(Debug, Clone)]
+pub struct QuicListenHardening {
+    /// If true, unvalidated [`quinn_proto::Incoming`] connections get a Retry
+    /// packet instead of an immediate `accept` (RFC 9000 §8.1.2). Clients
+    /// that present a valid Retry or NEW_TOKEN are accepted without an
+    /// extra RTT.
+    pub require_address_validation: bool,
+    /// Cap concurrent unfinished handshakes ([`QuicServerConfig::max_incoming`]).
+    /// `None` leaves quinn-proto's default (65 536).
+    pub max_incoming: Option<usize>,
+    /// Per-Incoming receive buffer cap. `None` leaves the quinn default (10 MiB).
+    pub incoming_buffer_size: Option<u64>,
+    /// Total Incoming receive buffer cap. `None` leaves the quinn default (100 MiB).
+    pub incoming_buffer_size_total: Option<u64>,
+    /// Retry-token lifetime. `None` leaves the quinn default (15 s).
+    pub retry_token_lifetime: Option<Duration>,
+    /// Whether clients may migrate ([`QuicServerConfig::migration`]).
+    /// `None` leaves the quinn default (`true`).
+    pub migration: Option<bool>,
+    /// NEW_TOKEN lifetime. `None` leaves the quinn default (two weeks).
+    pub validation_token_lifetime: Option<Duration>,
+    /// NEW_TOKEN frames issued when a path is validated. `None` leaves the
+    /// quinn default (typically 2 when the bloom feature is on).
+    pub validation_tokens_sent: Option<u32>,
+}
+
+impl QuicListenHardening {
+    /// Opinionated defaults for public / high-security listeners.
+    ///
+    /// Requires Retry (or NEW_TOKEN) before handshake crypto, caps Incoming
+    /// pressure, uses a 10 s Retry token and 24 h NEW_TOKEN lifetime, and
+    /// disables connection migration.
+    pub fn high_security() -> Self {
+        Self {
+            require_address_validation: true,
+            max_incoming: Some(1_024),
+            incoming_buffer_size: Some(1 << 20),
+            incoming_buffer_size_total: Some(32 << 20),
+            retry_token_lifetime: Some(Duration::from_secs(10)),
+            migration: Some(false),
+            validation_token_lifetime: Some(Duration::from_secs(24 * 60 * 60)),
+            validation_tokens_sent: Some(2),
+        }
+    }
+
+    /// Leave quinn-proto defaults alone and accept without Retry.
+    ///
+    /// Suitable for lab / loopback tests and listeners already behind a
+    /// trusted network path that performs its own anti-spoofing.
+    pub fn permissive() -> Self {
+        Self {
+            require_address_validation: false,
+            max_incoming: None,
+            incoming_buffer_size: None,
+            incoming_buffer_size_total: None,
+            retry_token_lifetime: None,
+            migration: None,
+            validation_token_lifetime: None,
+            validation_tokens_sent: None,
+        }
+    }
+
+    /// Require Retry / NEW_TOKEN validation (fluent).
+    pub fn require_address_validation(mut self, value: bool) -> Self {
+        self.require_address_validation = value;
+        self
+    }
+
+    /// Cap concurrent unfinished handshakes.
+    pub fn max_incoming(mut self, value: usize) -> Self {
+        self.max_incoming = Some(value);
+        self
+    }
+
+    /// Per-Incoming receive buffer size in bytes.
+    pub fn incoming_buffer_size(mut self, value: u64) -> Self {
+        self.incoming_buffer_size = Some(value);
+        self
+    }
+
+    /// Total Incoming receive buffer size in bytes.
+    pub fn incoming_buffer_size_total(mut self, value: u64) -> Self {
+        self.incoming_buffer_size_total = Some(value);
+        self
+    }
+
+    /// Retry token lifetime.
+    pub fn retry_token_lifetime(mut self, value: Duration) -> Self {
+        self.retry_token_lifetime = Some(value);
+        self
+    }
+
+    /// Allow or deny connection migration.
+    pub fn migration(mut self, value: bool) -> Self {
+        self.migration = Some(value);
+        self
+    }
+
+    /// NEW_TOKEN lifetime.
+    pub fn validation_token_lifetime(mut self, value: Duration) -> Self {
+        self.validation_token_lifetime = Some(value);
+        self
+    }
+
+    /// Number of NEW_TOKEN frames to send on path validation.
+    pub fn validation_tokens_sent(mut self, value: u32) -> Self {
+        self.validation_tokens_sent = Some(value);
+        self
+    }
+}
+
+impl Default for QuicListenHardening {
+    fn default() -> Self {
+        Self::high_security()
+    }
+}
+
+/// Apply [`QuicListenHardening`] ServerConfig fields onto `server`
+/// (`Arc::make_mut`). Does not change the driver's Retry policy — that is
+/// read from [`QuicListenHardening::require_address_validation`] at listen
+/// time.
+pub fn apply_listen_hardening(
+    server: &mut Arc<QuicServerConfig>,
+    hardening: &QuicListenHardening,
+) {
+    let cfg = Arc::make_mut(server);
+    if let Some(n) = hardening.max_incoming {
+        cfg.max_incoming(n);
+    }
+    if let Some(n) = hardening.incoming_buffer_size {
+        cfg.incoming_buffer_size(n);
+    }
+    if let Some(n) = hardening.incoming_buffer_size_total {
+        cfg.incoming_buffer_size_total(n);
+    }
+    if let Some(d) = hardening.retry_token_lifetime {
+        cfg.retry_token_lifetime(d);
+    }
+    if let Some(m) = hardening.migration {
+        cfg.migration(m);
+    }
+    if hardening.validation_token_lifetime.is_some() || hardening.validation_tokens_sent.is_some() {
+        let mut tokens = cfg.validation_token.clone();
+        if let Some(d) = hardening.validation_token_lifetime {
+            tokens.lifetime(d);
+        }
+        if let Some(n) = hardening.validation_tokens_sent {
+            tokens.sent(n);
+        }
+        cfg.validation_token_config(tokens);
     }
 }
 
@@ -514,6 +699,31 @@ mod tests {
     }
 
     #[test]
+    fn high_security_requires_retry_and_tightens_incoming() {
+        let h = QuicListenHardening::high_security();
+        assert!(h.require_address_validation);
+        assert_eq!(h.max_incoming, Some(1_024));
+        assert_eq!(h.migration, Some(false));
+        assert_eq!(h.retry_token_lifetime, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn apply_listen_hardening_mutates_server_config() {
+        let (mut server, _) = server_config_self_signed(&["localhost"], &[ALPN_H3]).unwrap();
+        apply_listen_hardening(&mut server, &QuicListenHardening::high_security());
+        // Debug output includes the fields we set; also exercise fluent overrides.
+        let custom = QuicListenHardening::permissive()
+            .require_address_validation(true)
+            .max_incoming(8)
+            .migration(false)
+            .retry_token_lifetime(Duration::from_secs(5));
+        apply_listen_hardening(&mut server, &custom);
+        let _ = format!("{server:?}");
+        assert!(custom.require_address_validation);
+        assert_eq!(custom.max_incoming, Some(8));
+    }
+
+    #[test]
     fn self_signed_server_and_matching_client() {
         let (server, pem) = server_config_self_signed(&["localhost"], &[ALPN_H3]).unwrap();
         let _ = server;
@@ -533,6 +743,9 @@ mod tests {
             }),
         );
         assert_eq!(cfg.addr, addr);
+        assert!(cfg.hardening.require_address_validation);
+        let permissive = cfg.with_hardening(QuicListenHardening::permissive());
+        assert!(!permissive.hardening.require_address_validation);
     }
 
     #[test]

@@ -16,11 +16,13 @@ use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
 use quinn_proto::{
     Connection, ConnectionError, ConnectionHandle, DatagramEvent, Dir, Endpoint as QuinnEndpoint,
-    EndpointConfig, Event, StreamEvent, StreamId, Transmit, VarInt,
+    EndpointConfig, Event, Incoming, StreamEvent, StreamId, Transmit, VarInt,
 };
 use hopf_core::{Endpoint, HandlerFactory, ProtocolHandler, SecurityInfo};
 
-use crate::config::{QuicConnectConfig, QuicListenConfig, QuicListenHooksConfig};
+use crate::config::{
+    apply_listen_hardening, QuicConnectConfig, QuicListenConfig, QuicListenHooksConfig,
+};
 use crate::error::{connection_lost_io_error, stream_stopped_io_error};
 use crate::hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection};
 use crate::stream::{QuicStreamEndpoint, StreamQueues};
@@ -232,16 +234,27 @@ pub fn listen_quic(config: QuicListenConfig) -> io::Result<QuicDriverHandle> {
     let local_addr = std_sock.local_addr()?;
     let socket = UdpSocket::from_std(std_sock);
 
+    let mut server = config.server;
+    apply_listen_hardening(&mut server, &config.hardening);
+    let require_address_validation = config.hardening.require_address_validation;
+
     let endpoint = QuinnEndpoint::new(
         Arc::new(EndpointConfig::default()),
-        Some(Arc::clone(&config.server)),
+        Some(server),
         true,
         None,
     );
 
-    spawn_driver(DriverMode::Server {
-        factory: config.factory,
-    }, endpoint, socket, local_addr, None)
+    spawn_driver(
+        DriverMode::Server {
+            factory: config.factory,
+        },
+        endpoint,
+        socket,
+        local_addr,
+        None,
+        require_address_validation,
+    )
 }
 
 /// Bind UDP and accept QUIC connections using connection-level hooks (H3).
@@ -251,9 +264,13 @@ pub fn listen_quic_hooks(config: QuicListenHooksConfig) -> io::Result<QuicDriver
     let local_addr = std_sock.local_addr()?;
     let socket = UdpSocket::from_std(std_sock);
 
+    let mut server = config.server;
+    apply_listen_hardening(&mut server, &config.hardening);
+    let require_address_validation = config.hardening.require_address_validation;
+
     let endpoint = QuinnEndpoint::new(
         Arc::new(EndpointConfig::default()),
-        Some(Arc::clone(&config.server)),
+        Some(server),
         true,
         None,
     );
@@ -266,6 +283,7 @@ pub fn listen_quic_hooks(config: QuicListenHooksConfig) -> io::Result<QuicDriver
         socket,
         local_addr,
         None,
+        require_address_validation,
     )
 }
 
@@ -289,6 +307,7 @@ pub fn connect_quic(config: QuicConnectConfig) -> io::Result<QuicDriverHandle> {
         socket,
         local_addr,
         Some(config.addr),
+        false,
     )
 }
 
@@ -317,6 +336,7 @@ pub fn connect_quic_hooks(
         socket,
         local_addr,
         Some(addr),
+        false,
     )
 }
 
@@ -381,6 +401,7 @@ fn spawn_driver(
     mut socket: UdpSocket,
     local_addr: SocketAddr,
     _peer_hint: Option<SocketAddr>,
+    require_address_validation: bool,
 ) -> io::Result<QuicDriverHandle> {
     let mut poll = Poll::new()?;
     let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
@@ -419,6 +440,7 @@ fn spawn_driver(
                 timers: Vec::new(),
                 recv_buf: vec![0u8; 65536],
                 send_buf: Vec::with_capacity(2048),
+                require_address_validation,
             };
             if let Err(e) = driver.run(&mut poll) {
                 eprintln!("hopf-quic driver error: {e}");
@@ -586,6 +608,8 @@ struct Driver {
     timers: Vec<PendingTimer>,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
+    /// When true, unvalidated Incoming get Retry before handshake (RFC 9000 §8.1.2).
+    require_address_validation: bool,
 }
 
 impl Driver {
@@ -842,27 +866,7 @@ impl Driver {
             {
                 match event {
                     DatagramEvent::NewConnection(incoming) => {
-                        match self.endpoint.accept(incoming, now, &mut self.send_buf, None) {
-                            Ok((ch, conn)) => {
-                                self.connections.insert(
-                                    ch,
-                                    ConnSlot {
-                                        conn,
-                                        remote,
-                                        streams: HashMap::new(),
-                                        client_pending_open: false,
-                                        pending_open_bi: std::collections::VecDeque::new(),
-                                        app: None,
-                                        local_keys: HashMap::new(),
-                                    },
-                                );
-                            }
-                            Err(e) => {
-                                if let Some(tx) = e.response {
-                                    self.send_transmit(tx);
-                                }
-                            }
-                        }
+                        self.handle_incoming(incoming, remote, now);
                     }
                     DatagramEvent::ConnectionEvent(ch, event) => {
                         if let Some(slot) = self.connections.get_mut(&ch) {
@@ -880,6 +884,51 @@ impl Driver {
             }
         }
         Ok(())
+    }
+
+    /// Accept, Retry, or refuse a new Incoming per listen hardening.
+    ///
+    /// With [`crate::QuicListenHardening::require_address_validation`], an
+    /// unvalidated address gets a Retry packet (RFC 9000 §8.1.2) so spoofed
+    /// Initials never start a TLS handshake. Validated peers (Retry token or
+    /// NEW_TOKEN) are accepted immediately.
+    fn handle_incoming(&mut self, incoming: Incoming, remote: SocketAddr, now: Instant) {
+        if self.require_address_validation && !incoming.remote_address_validated() {
+            match self.endpoint.retry(incoming, &mut self.send_buf) {
+                Ok(tx) => self.send_transmit(tx),
+                Err(err) => {
+                    // Already carried a Retry token but still unvalidated —
+                    // refuse rather than looping Retry forever.
+                    let tx = self
+                        .endpoint
+                        .refuse(err.into_incoming(), &mut self.send_buf);
+                    self.send_transmit(tx);
+                }
+            }
+            return;
+        }
+
+        match self.endpoint.accept(incoming, now, &mut self.send_buf, None) {
+            Ok((ch, conn)) => {
+                self.connections.insert(
+                    ch,
+                    ConnSlot {
+                        conn,
+                        remote,
+                        streams: HashMap::new(),
+                        client_pending_open: false,
+                        pending_open_bi: std::collections::VecDeque::new(),
+                        app: None,
+                        local_keys: HashMap::new(),
+                    },
+                );
+            }
+            Err(e) => {
+                if let Some(tx) = e.response {
+                    self.send_transmit(tx);
+                }
+            }
+        }
     }
 
     fn handle_timeouts(&mut self, now: Instant) {
@@ -1805,6 +1854,53 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(got.lock().unwrap().as_slice(), b"ping");
+        server.shutdown();
+    }
+
+    /// Default listen hardening requires Retry before accept; a normal
+    /// quinn client still completes the handshake (extra localhost RTT).
+    #[test]
+    fn listen_hardening_retry_still_completes_handshake() {
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+
+        let server = listen_quic(
+            QuicListenConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                server_cfg,
+                Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+            )
+            .with_hardening(crate::QuicListenHardening::high_security()),
+        )
+        .unwrap();
+
+        let got = Arc::new(StdMutex::new(Vec::new()));
+        let got2 = Arc::clone(&got);
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(ClientProbe {
+                    sent: false,
+                    got: Arc::clone(&got2),
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        for _ in 0..200 {
+            if got.lock().unwrap().as_slice() == b"ping" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            got.lock().unwrap().as_slice(),
+            b"ping",
+            "handshake through Retry must succeed"
+        );
         server.shutdown();
     }
 
