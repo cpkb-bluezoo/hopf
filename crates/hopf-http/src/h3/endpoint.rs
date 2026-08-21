@@ -622,10 +622,15 @@ pub(crate) struct H3PeerState {
     control_seen: bool,
     qpack_encoder_seen: bool,
     qpack_decoder_seen: bool,
-    /// `true` once the peer's SETTINGS frame advertised
-    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL=1` (RFC 9220).
-    #[allow(dead_code)] // not yet consulted anywhere — see conformance.html
-    pub(crate) peer_enable_connect_protocol: bool,
+    /// Peer's `SETTINGS_ENABLE_CONNECT_PROTOCOL` (RFC 9220). `None` until
+    /// SETTINGS arrives; absent from SETTINGS means `Some(false)` (not
+    /// enabled). The H3 client consults this before issuing Extended
+    /// CONNECT — see [`crate::h3::client`].
+    pub(crate) peer_enable_connect_protocol: Option<bool>,
+    /// Run once peer SETTINGS has been applied (so
+    /// [`Self::peer_enable_connect_protocol`] is known). Used to resume
+    /// Extended CONNECT requests that arrived before SETTINGS.
+    pub(crate) settings_waiters: Vec<Box<dyn FnOnce() + Send>>,
     /// Peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (RFC 9204 §5). `None`
     /// until SETTINGS arrives; absent from SETTINGS means the default of 0
     /// (encoder must not use the dynamic table). Applied to our encoder via
@@ -811,9 +816,9 @@ impl H3FrameHandler for H3UniStream {
         }
         {
             let mut state = self.peer_state.lock().unwrap();
-            if let Some(v) = enable_connect_protocol {
-                state.peer_enable_connect_protocol = v;
-            }
+            // RFC 9220 / RFC 8441 §3: absent → not enabled.
+            state.peer_enable_connect_protocol =
+                Some(enable_connect_protocol.unwrap_or(false));
             // Always record a capacity once SETTINGS has been seen — either
             // the advertised value or the RFC default of 0.
             state.peer_qpack_max_table_capacity = Some(if saw_qpack_max {
@@ -822,6 +827,11 @@ impl H3FrameHandler for H3UniStream {
                 0
             });
             state.peer_max_field_section_size = max_field_section_size;
+            let waiters = std::mem::take(&mut state.settings_waiters);
+            drop(state);
+            for w in waiters {
+                w();
+            }
         }
         self.qpack
             .apply_peer_max_table_capacity(if saw_qpack_max {
@@ -1077,7 +1087,7 @@ mod uni_stream_tests {
         assert!(!ep.closed);
         let s = state.lock().unwrap();
         assert!(s.control_seen);
-        assert!(s.peer_enable_connect_protocol);
+        assert_eq!(s.peer_enable_connect_protocol, Some(true));
         assert_eq!(s.peer_qpack_max_table_capacity, Some(qpack::MAX_TABLE_CAPACITY as u64));
         assert_eq!(qpack.encoder_capacity_for_test(), qpack::MAX_TABLE_CAPACITY);
     }
@@ -1103,7 +1113,7 @@ mod uni_stream_tests {
             uni.receive(&mut ep, &mut one);
         }
 
-        assert!(state.lock().unwrap().peer_enable_connect_protocol);
+        assert_eq!(state.lock().unwrap().peer_enable_connect_protocol, Some(true));
     }
 
     #[test]
