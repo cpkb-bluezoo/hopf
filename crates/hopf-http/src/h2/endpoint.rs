@@ -1238,6 +1238,12 @@ impl H2Endpoint {
             }
         };
 
+        // RFC 9113 §8.2: uppercase field names → malformed → stream error.
+        if !crate::utils::http_binary_field_names_are_lowercase(&pairs) {
+            frame::write_rst_stream(&mut self.out, stream_id, ERROR_PROTOCOL_ERROR);
+            return;
+        }
+
         let mut headers = Headers::new();
         for (name, value) in pairs {
             headers.add(name, value);
@@ -1874,16 +1880,19 @@ const CONNECTION_SPECIFIC_HEADERS: &[&str] = &[
 /// (connection-specific fields, `TE` value, HTTP/2-only). `Err(())` means
 /// the request is malformed and must be rejected with a stream error.
 fn validate_request_header_block(pairs: &[(String, String)]) -> Result<(), ()> {
+    if !crate::utils::http_binary_field_names_are_lowercase(pairs) {
+        return Err(());
+    }
     crate::pseudo_headers::validate_request_pseudo_headers(pairs)?;
 
     for (name, value) in pairs {
         if name.starts_with(':') {
             continue;
         }
-        if CONNECTION_SPECIFIC_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
+        if CONNECTION_SPECIFIC_HEADERS.iter().any(|h| name == *h) {
             return Err(());
         }
-        if name.eq_ignore_ascii_case("te") && !value.eq_ignore_ascii_case("trailers") {
+        if name == "te" && !value.eq_ignore_ascii_case("trailers") {
             return Err(());
         }
     }
@@ -2411,6 +2420,23 @@ mod validation_tests {
             ("connection", "keep-alive"),
         ]);
         ep.process_server_headers_block(1, &block, false);
+        assert_eq!(rst_stream_error_code(&ep.out), ERROR_PROTOCOL_ERROR);
+    }
+
+    #[test]
+    fn uppercase_field_name_is_rejected() {
+        let (mut ep, opened) = server_endpoint_with_limits(HttpLimits::default());
+        // Use a name absent from the HPACK static table so the encoder emits
+        // a literal (static-table name matches are case-insensitive and would
+        // otherwise rewrite "Content-Type" to lowercase on the wire).
+        let block = encode_headers(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("X-Custom-Header", "1"),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+        assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(rst_stream_error_code(&ep.out), ERROR_PROTOCOL_ERROR);
     }
 

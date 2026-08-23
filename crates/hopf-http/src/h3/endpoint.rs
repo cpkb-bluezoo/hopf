@@ -591,11 +591,21 @@ impl H3FrameHandler for H3RequestStream {
         if let Some(handler) = &mut self.handler {
             // Second HEADERS after the request handler exists = request
             // trailers (RFC 9114 §4.1).
+            if !crate::utils::http_binary_field_names_are_lowercase(&pairs) {
+                self.malformed = true;
+                return;
+            }
             let mut trailers = Headers::new();
             for (name, value) in pairs {
                 trailers.add(name, value);
             }
             handler.request_trailers(&mut self.writer, &trailers);
+            return;
+        }
+
+        // RFC 9114 §4.2: uppercase field names → malformed.
+        if !crate::utils::http_binary_field_names_are_lowercase(&pairs) {
+            self.malformed = true;
             return;
         }
 
@@ -1892,6 +1902,22 @@ mod request_validation_tests {
             Some(frame::H3_MESSAGE_ERROR),
             "must be a stream error (RFC 9114 §4.3.1), not a connection-wide close"
         );
+    }
+
+    #[test]
+    fn uppercase_field_name_is_malformed() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+            ("Content-Type", "text/plain"),
+        ]);
+        stream.headers_frame(&payload);
+        assert!(stream.malformed);
+        assert!(stream.handler.is_none());
+        assert_eq!(rec.lock().unwrap().opened, 0);
     }
 
     /// An oversized decoded field section is a stream error of type

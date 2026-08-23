@@ -552,6 +552,21 @@ impl H3FrameHandler for H3ClientStream {
             return;
         }
 
+        // RFC 9114 §4.2: uppercase field names → malformed.
+        if !crate::utils::http_binary_field_names_are_lowercase(&pairs) {
+            if let Some(handler) = &mut self.handler {
+                handler.request_failed(
+                    &mut w,
+                    &io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed H3 response: uppercase field name",
+                    ),
+                );
+            }
+            self.malformed = true;
+            return;
+        }
+
         let mut headers = Headers::new();
         for (name, value) in pairs {
             headers.add(name, value);

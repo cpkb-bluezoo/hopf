@@ -73,6 +73,15 @@ pub fn is_valid_header_name(name: &str) -> bool {
     bytes[start..].iter().all(|&b| is_tchar(b))
 }
 
+/// RFC 9113 §8.2 / RFC 9114 §4.2: HTTP/2 and HTTP/3 field names MUST be
+/// lowercase. A request or response containing an uppercase letter in any
+/// field name is malformed.
+pub fn http_binary_field_names_are_lowercase(pairs: &[(String, String)]) -> bool {
+    pairs
+        .iter()
+        .all(|(name, _)| name.bytes().all(|b| !b.is_ascii_uppercase()))
+}
+
 /// Header field-value: reject CTL bytes (RFC 9112 §5.5 `field-content`
 /// grammar) — HTAB is the only permitted control character; SP, VCHAR
 /// (0x21-0x7E), and obs-text (0x80-0xFF) are otherwise allowed.
@@ -351,6 +360,18 @@ mod tests {
         assert!(method_implies_no_body("GET"));
         assert!(method_implies_no_body("TRACE"));
         assert!(!method_implies_no_body("POST"));
+    }
+
+    #[test]
+    fn binary_http_rejects_uppercase_field_names() {
+        assert!(http_binary_field_names_are_lowercase(&[
+            (":method".into(), "GET".into()),
+            ("content-type".into(), "text/plain".into()),
+        ]));
+        assert!(!http_binary_field_names_are_lowercase(&[
+            (":method".into(), "GET".into()),
+            ("Content-Type".into(), "text/plain".into()),
+        ]));
     }
 
     #[test]
