@@ -32,6 +32,7 @@ use hopf_quic::{client_config_from_pem, QuicDriverHandle, ALPN_H3};
 struct GetOnce {
     host: String,
     path: String,
+    http3: bool,
     out: Arc<Mutex<Outcome>>,
 }
 
@@ -49,7 +50,9 @@ impl ClientHandler for GetOnce {
         h.set(":method", "GET");
         h.set(":path", &self.path);
         h.set("host", &self.host);
-        h.set("connection", "close");
+        if !self.http3 {
+            h.set("connection", "close");
+        }
         request.headers(h);
         request.complete_request();
     }
@@ -65,11 +68,18 @@ impl ClientHandler for GetOnce {
     fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
         self.out.lock().unwrap().done = true;
     }
+
+    fn request_failed(&mut self, _request: &mut dyn ClientWriter, err: &io::Error) {
+        let mut g = self.out.lock().unwrap();
+        g.error = Some(err.to_string());
+        g.done = true;
+    }
 }
 
 struct GetFactory {
     host: String,
     path: String,
+    http3: bool,
     out: Arc<Mutex<Outcome>>,
 }
 
@@ -78,6 +88,7 @@ impl ClientHandlerFactory for GetFactory {
         Box::new(GetOnce {
             host: self.host.clone(),
             path: self.path.clone(),
+            http3: self.http3,
             out: Arc::clone(&self.out),
         })
     }
@@ -125,6 +136,7 @@ fn main() -> io::Result<()> {
     let factory: Arc<dyn ClientHandlerFactory> = Arc::new(GetFactory {
         host: host.clone(),
         path: path.clone(),
+        http3,
         out: Arc::clone(&out),
     });
     let limits = HttpLimits::default();

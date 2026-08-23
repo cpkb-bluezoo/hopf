@@ -367,6 +367,12 @@ struct StreamSlot {
     handler: Box<dyn ProtocolHandler>,
     /// Locally-opened unidirectional stream (send-only; never recv_stream).
     send_only: bool,
+    /// Peer has FINed (or reset) the receive half.
+    recv_finished: bool,
+    /// Local send half is fully acknowledged ([`StreamEvent::Finished`]).
+    send_finished: bool,
+    /// [`ProtocolHandler::disconnected`] / `error` already delivered.
+    app_notified: bool,
     /// Bytes read from the stream but left unconsumed by the handler's
     /// last `receive()` call (NIO compact-buffer semantics — mirrors
     /// `TcpConnection`'s `net_in`/`app_in`). Without this, a handler
@@ -1158,6 +1164,9 @@ impl Driver {
                             endpoint,
                             handler,
                             send_only: matches!(dir, Dir::Uni),
+                            recv_finished: false,
+                            send_finished: false,
+                            app_notified: false,
                             pending_in: Vec::new(),
                         },
                     );
@@ -1345,11 +1354,18 @@ impl Driver {
                 self.read_stream(ch, id);
             }
             StreamEvent::Finished { id } => {
-                // Our send half is fully acknowledged. Drain any final peer
-                // data/FIN first (which may already have torn the stream
-                // down via read_stream), then drop the handler if still live.
+                // Local send half is fully acknowledged. This is *not* the
+                // end of a bidirectional stream — the peer may still be
+                // sending (e.g. an HTTP/3 response after we FINed the
+                // request). Only retire send-only streams, or bi streams
+                // whose receive half is already done.
                 self.read_stream(ch, id);
-                self.finish_stream(ch, id, None);
+                if let Some(slot) = self.connections.get_mut(&ch) {
+                    if let Some(stream) = slot.streams.get_mut(&id) {
+                        stream.send_finished = true;
+                    }
+                }
+                self.maybe_retire_stream(ch, id);
             }
             StreamEvent::Stopped { id, error_code } => {
                 // Peer STOP_SENDING (RFC 9000 §19.5) — surface the app error
@@ -1422,6 +1438,9 @@ impl Driver {
                     endpoint,
                     handler,
                     send_only: matches!(dir, Dir::Uni),
+                    recv_finished: false,
+                    send_finished: false,
+                    app_notified: false,
                     pending_in: Vec::new(),
                 },
             );
@@ -1464,6 +1483,9 @@ impl Driver {
                     endpoint,
                     handler,
                     send_only: false,
+                    recv_finished: false,
+                    send_finished: false,
+                    app_notified: false,
                     pending_in: Vec::new(),
                 },
             );
@@ -1471,58 +1493,102 @@ impl Driver {
     }
 
     fn read_stream(&mut self, ch: ConnectionHandle, id: StreamId) {
-        let Some(slot) = self.connections.get_mut(&ch) else {
-            return;
-        };
-        if slot
-            .streams
-            .get(&id)
-            .map(|s| s.send_only || s.endpoint.is_read_paused())
-            .unwrap_or(true)
-        {
-            return;
-        }
-
-        let mut recv = slot.conn.recv_stream(id);
-        let mut chunks = match recv.read(true) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let mut new_data = Vec::new();
-        let mut peer_finished = false;
-        loop {
-            match chunks.next(usize::MAX) {
-                Ok(Some(chunk)) => {
-                    new_data.extend_from_slice(&chunk.bytes);
-                }
-                Ok(None) => {
-                    // Peer FIN (or reset path already freed recv) — both
-                    // directions must close before MAX_STREAMS credit returns.
-                    peer_finished = true;
-                    break;
-                }
-                Err(_) => break,
+        let (new_data, peer_finished) = {
+            let Some(slot) = self.connections.get_mut(&ch) else {
+                return;
+            };
+            if slot
+                .streams
+                .get(&id)
+                .map(|s| s.send_only || s.endpoint.is_read_paused())
+                .unwrap_or(true)
+            {
+                return;
             }
-        }
-        let _ = chunks.finalize();
 
-        if !new_data.is_empty() {
-            if let Some(stream) = slot.streams.get_mut(&id) {
-                let handler = &mut stream.handler;
-                let endpoint = &mut stream.endpoint;
-                deliver_with_residual(&mut stream.pending_in, &new_data, |slice| {
-                    handler.receive(endpoint, slice);
-                });
+            let mut recv = slot.conn.recv_stream(id);
+            let mut chunks = match recv.read(true) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let mut new_data = Vec::new();
+            let mut peer_finished = false;
+            loop {
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => {
+                        new_data.extend_from_slice(&chunk.bytes);
+                    }
+                    Ok(None) => {
+                        // Peer FIN (or reset path already freed recv).
+                        peer_finished = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
             }
-        }
+            let _ = chunks.finalize();
+
+            if !new_data.is_empty() {
+                if let Some(stream) = slot.streams.get_mut(&id) {
+                    let handler = &mut stream.handler;
+                    let endpoint = &mut stream.endpoint;
+                    deliver_with_residual(&mut stream.pending_in, &new_data, |slice| {
+                        handler.receive(endpoint, slice);
+                    });
+                }
+            }
+            (new_data, peer_finished)
+        };
+        let _ = new_data;
 
         if peer_finished {
-            // Finish our send half so a bidi stream becomes fully closed and
-            // the peer can raise MAX_STREAMS (RFC 9000 §4.6).
-            if let Some(slot) = self.connections.get_mut(&ch) {
-                let _ = slot.conn.send_stream(id).finish();
+            // Peer FIN: deliver half-close to the app (so H3 can flush a
+            // response / complete the request) but keep the stream slot
+            // alive until our send half is also Finished — otherwise we
+            // would drop queued response bytes and tear down before the
+            // client could read them.
+            if let Some(stream) = self
+                .connections
+                .get_mut(&ch)
+                .and_then(|s| s.streams.get_mut(&id))
+            {
+                stream.recv_finished = true;
+                if !stream.app_notified {
+                    stream.app_notified = true;
+                    // Keep the endpoint open so `disconnected` can still
+                    // `send()` (e.g. H3 flushing the response). Closing the
+                    // write half is signaled via `finish_write` below.
+                    stream.handler.disconnected(&mut stream.endpoint);
+                }
+                // Ensure we FIN our send half after any bytes the app just
+                // queued (drive_streams will write then finish).
+                stream.queues.lock().unwrap().finish_write = true;
             }
-            self.finish_stream(ch, id, None);
+            self.maybe_retire_stream(ch, id);
+        }
+    }
+
+    /// Retire a stream slot once both halves are done (or for send-only
+    /// streams, once the local send is acknowledged). Does not re-notify
+    /// the application — that already happened on peer FIN / error.
+    fn maybe_retire_stream(&mut self, ch: ConnectionHandle, id: StreamId) {
+        let retire = self
+            .connections
+            .get(&ch)
+            .and_then(|s| s.streams.get(&id))
+            .map(|st| {
+                if st.send_only {
+                    st.send_finished
+                } else {
+                    st.recv_finished && st.send_finished
+                }
+            })
+            .unwrap_or(false);
+        if !retire {
+            return;
+        }
+        if let Some(slot) = self.connections.get_mut(&ch) {
+            let _ = slot.streams.remove(&id);
         }
     }
 
@@ -1623,10 +1689,13 @@ impl Driver {
     fn finish_stream(&mut self, ch: ConnectionHandle, id: StreamId, err: Option<io::Error>) {
         if let Some(slot) = self.connections.get_mut(&ch) {
             if let Some(mut stream) = slot.streams.remove(&id) {
-                stream.endpoint.mark_closed();
-                match &err {
-                    Some(e) => stream.handler.error(&mut stream.endpoint, e),
-                    None => stream.handler.disconnected(&mut stream.endpoint),
+                if !stream.app_notified {
+                    stream.app_notified = true;
+                    stream.endpoint.mark_closed();
+                    match &err {
+                        Some(e) => stream.handler.error(&mut stream.endpoint, e),
+                        None => stream.handler.disconnected(&mut stream.endpoint),
+                    }
                 }
             }
         }

@@ -76,12 +76,23 @@ impl H3Qpack {
 
     /// Encode a field section for `stream_id`, queuing any resulting
     /// encoder-stream instructions for the next flush.
+    ///
+    /// Field names are lowercased (RFC 9114 §4.2 / RFC 9110 §5.1) so
+    /// callers can keep HTTP/1-style canonical casing in [`crate::Headers`].
     pub(crate) fn encode_field_section<'a>(
         &self,
         stream_id: u64,
         fields: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Vec<u8> {
-        let (section, instructions) = self.encoder.lock().unwrap().encode(stream_id, fields);
+        let lowered: Vec<(String, &str)> = fields
+            .into_iter()
+            .map(|(n, v)| (n.to_ascii_lowercase(), v))
+            .collect();
+        let (section, instructions) = self
+            .encoder
+            .lock()
+            .unwrap()
+            .encode(stream_id, lowered.iter().map(|(n, v)| (n.as_str(), *v)));
         if !instructions.is_empty() {
             self.pending_encoder_stream.lock().unwrap().extend_from_slice(&instructions);
         }
