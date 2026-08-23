@@ -287,8 +287,8 @@ fn tls13_server(
     alpn: &[&[u8]],
     tls: &QuicTlsOptions,
 ) -> io::Result<RustlsServerConfig> {
-    let provider = rustls::crypto::ring::default_provider();
-    let mut cfg = RustlsServerConfig::builder_with_provider(provider.into())
+    let provider = hopf_tls::tls_crypto_provider();
+    let mut cfg = RustlsServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
         .with_no_client_auth()
@@ -310,8 +310,8 @@ fn tls13_client(
     alpn: &[&[u8]],
     tls: &QuicTlsOptions,
 ) -> io::Result<RustlsClientConfig> {
-    let provider = rustls::crypto::ring::default_provider();
-    let mut cfg = RustlsClientConfig::builder_with_provider(provider.into())
+    let provider = hopf_tls::tls_crypto_provider();
+    let mut cfg = RustlsClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
         .with_root_certificates(roots)

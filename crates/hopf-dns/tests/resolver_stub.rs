@@ -720,8 +720,8 @@ fn literal_connect_by_name_skips_dns() {
 fn validate_chain_of_trust_walks_a_real_two_level_delegation_over_the_network() {
     use hopf_dns::dnssec::{compute_ds_digest, DnssecStatus, DnssecTrustAnchor, DnssecValidator};
     use hopf_dns::wire::{encode_name, DnsClass, DnsQuestion, DnsType};
-    use ring::rand::SystemRandom;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sign_rrset(rrset: &[&DnsResourceRecord], name: &str, rtype: DnsType, key_tag: u16, pair: &Ed25519KeyPair) -> DnsResourceRecord {
@@ -858,8 +858,8 @@ fn validate_chain_of_trust_walks_a_real_two_level_delegation_over_the_network() 
 fn validate_denial_of_existence_proves_a_real_nxdomain_over_the_network() {
     use hopf_dns::dnssec::{compute_ds_digest, DnssecStatus, DnssecTrustAnchor, DnssecValidator};
     use hopf_dns::wire::{encode_name, normalize_name, DnsClass, DnsQuestion, DnsType};
-    use ring::rand::SystemRandom;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn sign_rrset(rrset: &[&DnsResourceRecord], name: &str, rtype: DnsType, key_tag: u16, pair: &Ed25519KeyPair) -> DnsResourceRecord {

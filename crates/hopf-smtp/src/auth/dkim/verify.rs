@@ -330,9 +330,9 @@ fn evaluate_key(
                 Ok(v) => v,
                 Err(()) => return DkimResult::PermError,
             };
-            let key = ring::signature::RsaPublicKeyComponents { n: &n, e: &e };
+            let key = aws_lc_rs::signature::RsaPublicKeyComponents { n: &n, e: &e };
             match key.verify(
-                &ring::signature::RSA_PKCS1_2048_8192_SHA256,
+                &aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256,
                 signed_data,
                 signature,
             ) {
@@ -345,7 +345,7 @@ fn evaluate_key(
                 return DkimResult::PermError;
             }
             let key =
-                ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, p.as_slice());
+                aws_lc_rs::signature::UnparsedPublicKey::new(&aws_lc_rs::signature::ED25519, p.as_slice());
             match key.verify(signed_data, signature) {
                 Ok(()) => DkimResult::Pass,
                 Err(_) => DkimResult::Fail,

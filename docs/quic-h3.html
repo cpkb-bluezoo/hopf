@@ -119,7 +119,7 @@
 </tr>
 <tr>
 <td>TLS 1.3 only</td>
-<td>rustls ring; builders pin <code>TLS13</code></td>
+<td>rustls aws-lc-rs; builders pin <code>TLS13</code></td>
 </tr>
 <tr>
 <td>ALPN <code>h3</code></td>
@@ -242,7 +242,7 @@
 </tbody>
 </table>
 <h2 id="pem-builders">PEM builders</h2>
-<p>All builders pin <strong>TLS 1.3 only</strong> (ring provider) and take an ALPN list.</p>
+<p>All builders pin <strong>TLS 1.3 only</strong> (aws-lc-rs provider, hybrid-first PQC KX via rustls <code>prefer-post-quantum</code>) and take an ALPN list.</p>
 <table>
 <colgroup>
 <col style="width: 55%" />

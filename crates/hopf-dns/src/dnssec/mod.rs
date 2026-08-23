@@ -4,8 +4,8 @@
 //!
 //! Supported signature algorithms:
 //! - RSASHA256 (8), RSASHA512 (10), ECDSAP256SHA256 (13),
-//!   ECDSAP384SHA384 (14), Ed25519 (15) — via `ring`
-//! - Ed448 (16) — via the pure-Rust `ed448-goldilocks-plus` (`ring` has no
+//!   ECDSAP384SHA384 (14), Ed25519 (15) — via `aws-lc-rs`
+//! - Ed448 (16) — via the pure-Rust `ed448-goldilocks-plus` (`aws-lc-rs` has no
 //!   Ed448 support)
 
 mod algorithm;

@@ -26,7 +26,7 @@ hopf-otel = { workspace = true }
 hopf-dns = { workspace = true }
 hopf-mailbox = { workspace = true }
 rmimeparser = { workspace = true }
-ring = "0.17"
+aws-lc-rs = { workspace = true }
 getrandom = { workspace = true }
 
 [dev-dependencies]

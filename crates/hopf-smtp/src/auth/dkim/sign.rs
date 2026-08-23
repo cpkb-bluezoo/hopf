@@ -11,16 +11,16 @@ use super::canon::{self, Canonicalization, IncrementalBodyCanon};
 /// A private key usable for DKIM signing.
 pub enum DkimPrivateKey {
     /// RSA key pair (`a=rsa-sha256`), PKCS#8 DER.
-    Rsa(ring::signature::RsaKeyPair),
+    Rsa(aws_lc_rs::signature::RsaKeyPair),
     /// Ed25519 key pair (`a=ed25519-sha256`, RFC 8463), PKCS#8 DER.
-    Ed25519(ring::signature::Ed25519KeyPair),
+    Ed25519(aws_lc_rs::signature::Ed25519KeyPair),
 }
 
 impl DkimPrivateKey {
     /// Load an RSA private key from PKCS#8 DER (e.g. `openssl genpkey
     /// -algorithm RSA ... | openssl pkcs8 -topk8 -nocrypt`).
     pub fn rsa_from_pkcs8(der: &[u8]) -> Result<Self, ()> {
-        ring::signature::RsaKeyPair::from_pkcs8(der)
+        aws_lc_rs::signature::RsaKeyPair::from_pkcs8(der)
             .map(DkimPrivateKey::Rsa)
             .map_err(|_| ())
     }
@@ -30,7 +30,7 @@ impl DkimPrivateKey {
     /// only, no embedded public key) as well as v2 (seed + public key,
     /// consistency-checked).
     pub fn ed25519_from_pkcs8(der: &[u8]) -> Result<Self, ()> {
-        ring::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(der)
+        aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(der)
             .map(DkimPrivateKey::Ed25519)
             .map_err(|_| ())
     }
@@ -45,9 +45,9 @@ impl DkimPrivateKey {
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>, ()> {
         match self {
             DkimPrivateKey::Rsa(kp) => {
-                let rng = ring::rand::SystemRandom::new();
-                let mut sig = vec![0u8; kp.public().modulus_len()];
-                kp.sign(&ring::signature::RSA_PKCS1_SHA256, &rng, data, &mut sig)
+                let rng = aws_lc_rs::rand::SystemRandom::new();
+                let mut sig = vec![0u8; kp.public_modulus_len()];
+                kp.sign(&aws_lc_rs::signature::RSA_PKCS1_SHA256, &rng, data, &mut sig)
                     .map_err(|_| ())?;
                 Ok(sig)
             }

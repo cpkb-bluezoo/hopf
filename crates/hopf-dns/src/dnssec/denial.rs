@@ -197,8 +197,8 @@ pub fn verify_denial(
 mod tests {
     use super::*;
     use crate::wire::{DnsClass, FLAG_QR};
-    use ring::rand::SystemRandom;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 
     fn keypair() -> (Ed25519KeyPair, Vec<u8>) {
         let doc = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();

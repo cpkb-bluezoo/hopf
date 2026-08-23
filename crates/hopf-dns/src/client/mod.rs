@@ -1591,9 +1591,9 @@ mod tests {
     /// the message rather than being told the answer.
     #[cfg(feature = "dnssec")]
     fn signed_secure_message(name: &str, id: u16) -> (DnsMessage, crate::dnssec::DnssecValidator) {
-        use ring::signature::{Ed25519KeyPair, KeyPair};
+        use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
         let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         let pub_bytes = pair.public_key().as_ref().to_vec();
 

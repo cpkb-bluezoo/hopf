@@ -22,13 +22,12 @@ dot = ["dep:hopf-tls"]
 doq = ["dep:hopf-quic"]
 doh = ["dep:hopf-tls"]
 # `ed448-goldilocks-plus` (for Ed448 DNSSEC signatures, RFC 8080) pulls in
-# rand_core 0.10.1, which needs rustc 1.85+ — higher than this workspace's
-# declared rust-version (1.70). This only bites a build with `dnssec`
-# enabled; everything else stays 1.70. The alternative crate that fits
+# rand_core 0.10.1, which needs rustc 1.85+ — matching this workspace's
+# declared rust-version. The alternative crate that fits
 # 1.70 (`ed448-rust`) has a real correctness bug in its public-key byte
 # round-trip (verified locally against RFC 8032 vectors), which would make
 # Ed448 signature verification unreliable — accepted as the better tradeoff.
-dnssec = ["dep:ring", "dep:ed448-goldilocks-plus"]
+dnssec = ["dep:aws-lc-rs", "dep:ed448-goldilocks-plus"]
 # Local UDP stub ↔ resolver smokes (`tests/`); not compiled in CI `--lib`.
 integration = []
 
@@ -41,12 +40,12 @@ hmac = "0.12"
 subtle = "2"
 hopf-tls = { workspace = true, optional = true }
 hopf-quic = { workspace = true, optional = true }
-ring = { version = "0.17", optional = true }
+aws-lc-rs = { workspace = true, optional = true }
 ed448-goldilocks-plus = { version = "0.18.0", default-features = false, features = ["signing"], optional = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
-ring = "0.17"
+aws-lc-rs = { workspace = true }
 
 [[test]]
 name = "resolver_stub"

@@ -1,9 +1,9 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Cryptographic signature verification via `ring`.
+//! Cryptographic signature verification via `aws-lc-rs`.
 
-use ring::digest;
-use ring::signature::{self, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA512};
+use aws_lc_rs::digest;
+use aws_lc_rs::signature::{self, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA512};
 
 use super::algorithm::DnssecAlgorithm;
 
@@ -104,7 +104,7 @@ fn verify_ed25519(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
         .is_ok()
 }
 
-/// `ring` has no Ed448 support, so this uses the pure-Rust
+/// `aws-lc-rs` has no Ed448 support, so this uses the pure-Rust
 /// `ed448-goldilocks-plus` crate instead (its own RFC 8032 test vectors
 /// pass). RFC 8080 §4 uses plain Ed448 (not Ed448ph, no context string),
 /// matching `verify_raw` here.
@@ -189,11 +189,11 @@ fn asn1_length(len: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 
     #[test]
     fn ed25519_roundtrip() {
-        let doc = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let doc = Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
         let pair = Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
         let msg = b"dnssec-test-message";
         let sig = pair.sign(msg);

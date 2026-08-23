@@ -438,8 +438,8 @@ fn zone_chain_from_root(name: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::wire::{DnsClass, DnsType};
-    use ring::rand::SystemRandom;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+    use aws_lc_rs::rand::SystemRandom;
+    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 
     #[test]
     fn ed25519_rrsig_verifies() {

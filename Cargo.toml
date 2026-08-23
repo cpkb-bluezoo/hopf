@@ -73,7 +73,7 @@ default-members = [
 [workspace.package]
 version = "0.2.1"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.85"
 license = "LGPL-2.1-or-later"
 homepage = "https://cpkb-bluezoo.github.io/hopf/"
 repository = "https://github.com/cpkb-bluezoo/hopf"
@@ -81,11 +81,12 @@ authors = ["Chris Burdess <dog@gnu.org>"]
 
 [workspace.dependencies]
 mio = { version = "1", features = ["net", "os-poll", "os-ext"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "prefer-post-quantum", "std", "tls12"] }
 rustls-pemfile = "2"
-rcgen = "0.13"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 # QUIC transport state machine (mio/TPC glue in-tree; not the full `quinn` crate)
-quinn-proto = "0.11"
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "bloom", "log"] }
 tractrix = "0.2"
 self_cell = "1"
 rjsonparser = "0.1"

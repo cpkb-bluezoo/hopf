@@ -243,7 +243,7 @@
 <p>DoT client uses <code>hopf-tls</code> when feature <code>dot</code> is enabled. <code>TcpDnsConnectionPool</code> (shared by plain TCP and DoT) reuses a live connection per destination server across queries instead of dialing fresh every time, transparently reconnecting (and, for DoT, re-handshaking) if a reused connection turns out to be stale. Since <code>query_dot</code> is synchronous, <code>DnsResolver::add_server_dot</code> drives each query on a dedicated spawned thread — the same pattern already used for UDP's own truncation → TCP fallback.</p>
 <p><strong>DoQ limitations:</strong> every query still dials a brand-new QUIC connection — no session-ticket caching, 0-RTT, or cross-query connection reuse (RFC 9250 §4.5/§5.5.1) — and EDNS Padding (<code>encode_edns_padding</code>, RFC 7830/RFC 9250 §5.4) isn't automatically applied to DoQ/DoT queries, though the codec is available for a caller to compose in.</p>
 <h2 id="dnssec">DNSSEC</h2>
-<p>Feature <code>dnssec</code> (+ <code>ring</code>):</p>
+<p>Feature <code>dnssec</code> (+ <code>aws-lc-rs</code> and <code>ed448-goldilocks-plus</code>):</p>
 <table>
 <thead>
 <tr>
@@ -278,7 +278,7 @@
 </tr>
 </tbody>
 </table>
-<p>Validation only — <strong>no signing</strong>. Off by default on the resolver (<code>set_dnssec_enabled</code> / <code>set_dnssec_validator</code>). Algorithms: RSASHA256(8), RSASHA512(10), ECDSAP256SHA256(13), ECDSAP384SHA384(14), Ed25519(15), Ed448(16) — Ed448 verification uses the pure-Rust <code>ed448-goldilocks-plus</code> crate (<code>ring</code> has no Ed448 support), which raises the effective MSRV to 1.85+ <strong>only</strong> when the <code>dnssec</code> feature is enabled.</p>
+<p>Validation only — <strong>no signing</strong>. Off by default on the resolver (<code>set_dnssec_enabled</code> / <code>set_dnssec_validator</code>). Algorithms: RSASHA256(8), RSASHA512(10), ECDSAP256SHA256(13), ECDSAP384SHA384(14), Ed25519(15), Ed448(16) — Ed448 verification uses the pure-Rust <code>ed448-goldilocks-plus</code> crate (<code>aws-lc-rs</code> has no Ed448 support).</p>
 <p>The <code>DnsResolver</code>'s own per-query validation (run automatically whenever a validator is configured) sets the response's <strong>AD bit</strong> when a message validates as <code>Secure</code>, and honours the query's own <strong>CD bit</strong> (RFC 4035 §3.2.2/§3.2.3) — a CD=1 query gets its answer even if validation comes back <code>Bogus</code>, with AD left unset. The forwarder (<code>DnsService</code>) relays a downstream client's own CD bit upstream via <code>DnsResolver::query_with_cd</code>, so a validating downstream resolver's own re-validation still works through the forwarder. <strong>Known limitation:</strong> the AD bit is not currently preserved across a cache hit (resolver- or forwarder-side) — a cached answer is served without re-asserting AD.</p>
 <p>NSEC3 closest-encloser proofs cover direct NXDOMAIN/NODATA denial only — wildcard non-existence (RFC 5155 §8.3's optional extra step) and Opt-Out (§3/§6) are not implemented.</p>
 <h2 id="configuration">Configuration</h2>
@@ -359,7 +359,7 @@
 </tr>
 <tr>
 <td><code>dnssec</code></td>
-<td>Validation (+ <code>ring</code>)</td>
+<td>Validation (+ <code>aws-lc-rs</code> + goldilocks)</td>
 </tr>
 <tr>
 <td><code>integration</code></td>

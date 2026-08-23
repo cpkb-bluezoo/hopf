@@ -12,6 +12,7 @@ use std::io::{self, BufReader, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::{ResolvesServerCert, ResolvesServerCertUsingSni, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
@@ -20,6 +21,29 @@ use hopf_core::{
     SecurityInfo, SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector, TlsProgress,
     TlsSession,
 };
+
+/// Shared rustls [`CryptoProvider`] (aws-lc-rs, hybrid-first PQC key exchange).
+pub fn tls_crypto_provider() -> Arc<CryptoProvider> {
+    rustls::crypto::aws_lc_rs::default_provider().into()
+}
+
+fn server_config_builder() -> Result<
+    rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier>,
+    rustls::Error,
+> {
+    ServerConfig::builder_with_provider(tls_crypto_provider()).with_safe_default_protocol_versions()
+}
+
+fn client_config_builder() -> Result<
+    rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier>,
+    rustls::Error,
+> {
+    ClientConfig::builder_with_provider(tls_crypto_provider()).with_safe_default_protocol_versions()
+}
+
+fn map_rustls_err(e: rustls::Error) -> io::Error {
+    io::Error::new(ErrorKind::InvalidData, e)
+}
 
 /// Load a PEM certificate chain and private key into a rustls [`ServerConfig`].
 ///
@@ -31,10 +55,11 @@ pub fn server_config_from_pem(
 ) -> io::Result<Arc<ServerConfig>> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
-    let mut config = ServerConfig::builder()
+    let mut config = server_config_builder()
+        .map_err(map_rustls_err)?
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        .map_err(map_rustls_err)?;
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(Arc::new(config))
 }
@@ -62,7 +87,8 @@ pub fn server_config_with_resolver(
     resolver: Arc<dyn ResolvesServerCert>,
     alpn: &[&[u8]],
 ) -> Arc<ServerConfig> {
-    let mut config = ServerConfig::builder()
+    let mut config = server_config_builder()
+        .expect("safe default protocol versions")
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
@@ -88,14 +114,15 @@ pub fn server_config_with_sni_certs(
     certs: &[(&str, &Path, &Path)],
     alpn: &[&[u8]],
 ) -> io::Result<Arc<ServerConfig>> {
-    let builder = ServerConfig::builder().with_no_client_auth();
-    let provider = Arc::clone(builder.crypto_provider());
+    let provider = tls_crypto_provider();
+    let builder = server_config_builder()
+        .map_err(map_rustls_err)?
+        .with_no_client_auth();
     let mut resolver = ResolvesServerCertUsingSni::new();
     for (name, cert_path, key_path) in certs {
         let chain = load_certs(cert_path)?;
         let key = load_private_key(key_path)?;
-        let certified = CertifiedKey::from_der(chain, key, &provider)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        let certified = CertifiedKey::from_der(chain, key, &provider).map_err(map_rustls_err)?;
         resolver
             .add(name, certified)
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
@@ -137,17 +164,19 @@ pub fn server_config_with_client_auth(
             .add(cert)
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     }
-    let mut verifier_builder = WebPkiClientVerifier::builder(Arc::new(roots));
+    let mut verifier_builder =
+        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), tls_crypto_provider());
     if !required {
         verifier_builder = verifier_builder.allow_unauthenticated();
     }
     let verifier = verifier_builder
         .build()
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    let mut config = ServerConfig::builder()
+    let mut config = server_config_builder()
+        .map_err(map_rustls_err)?
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        .map_err(map_rustls_err)?;
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(Arc::new(config))
 }
@@ -180,7 +209,8 @@ pub fn client_config_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<Arc<
             .add(cert)
             .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     }
-    let mut config = ClientConfig::builder()
+    let mut config = client_config_builder()
+        .map_err(map_rustls_err)?
         .with_root_certificates(roots)
         .with_no_client_auth();
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
@@ -216,10 +246,11 @@ pub fn client_config_with_identity(
     }
     let identity_certs = load_certs(identity_cert_path)?;
     let identity_key = load_private_key(identity_key_path)?;
-    let mut config = ClientConfig::builder()
+    let mut config = client_config_builder()
+        .map_err(map_rustls_err)?
         .with_root_certificates(roots)
         .with_client_auth_cert(identity_certs, identity_key)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+        .map_err(map_rustls_err)?;
     config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     Ok(Arc::new(config))
 }
@@ -378,7 +409,7 @@ impl TlsSession for RustlsServerSession {
 /// Lowercase hex SHA-256 digest of `der`, used as the SASL EXTERNAL
 /// `cert_key` for a peer's client certificate.
 fn sha256_hex(der: &CertificateDer<'_>) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, der);
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der);
     let mut out = String::with_capacity(digest.as_ref().len() * 2);
     for byte in digest.as_ref() {
         use std::fmt::Write;
@@ -602,7 +633,8 @@ mod tests {
     fn rustls_client(cert: &CertifiedKey, alpn: &[&[u8]]) -> ClientConfig {
         let mut roots = RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
-        let mut cfg = ClientConfig::builder()
+        let mut cfg = client_config_builder()
+            .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
         cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
@@ -840,7 +872,8 @@ mod tests {
             let mut roots = RootCertStore::empty();
             roots.add(alpha_certified.cert.der().clone()).unwrap();
             let cfg = Arc::new(
-                ClientConfig::builder()
+                client_config_builder()
+                    .unwrap()
                     .with_root_certificates(roots)
                     .with_no_client_auth(),
             );
@@ -860,7 +893,8 @@ mod tests {
             let mut roots = RootCertStore::empty();
             roots.add(beta_certified.cert.der().clone()).unwrap();
             let cfg = Arc::new(
-                ClientConfig::builder()
+                client_config_builder()
+                    .unwrap()
                     .with_root_certificates(roots)
                     .with_no_client_auth(),
             );
@@ -882,7 +916,8 @@ mod tests {
             let mut roots = RootCertStore::empty();
             roots.add(alpha_certified.cert.der().clone()).unwrap();
             let cfg = Arc::new(
-                ClientConfig::builder()
+                client_config_builder()
+                    .unwrap()
                     .with_root_certificates(roots)
                     .with_no_client_auth(),
             );
@@ -932,7 +967,8 @@ mod tests {
         let mut roots = RootCertStore::empty();
         roots.add(server_certified.cert.der().clone()).unwrap();
         let cfg = Arc::new(
-            ClientConfig::builder()
+            client_config_builder()
+                .unwrap()
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
         );
@@ -983,7 +1019,8 @@ mod tests {
         let identity_certs = load_certs(&client_cert).unwrap();
         let identity_key = load_private_key(&client_key).unwrap();
         let cfg = Arc::new(
-            ClientConfig::builder()
+            client_config_builder()
+                .unwrap()
                 .with_root_certificates(roots)
                 .with_client_auth_cert(identity_certs, identity_key)
                 .unwrap(),
@@ -1040,7 +1077,8 @@ mod tests {
         let mut roots = RootCertStore::empty();
         roots.add(server_certified.cert.der().clone()).unwrap();
         let cfg = Arc::new(
-            ClientConfig::builder()
+            client_config_builder()
+                .unwrap()
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
         );
