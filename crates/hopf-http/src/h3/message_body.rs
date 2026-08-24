@@ -58,6 +58,9 @@ impl MessageBodyTracker {
         if !self.active {
             return Err(());
         }
+        if self.forbid_body && len > 0 {
+            return Err(());
+        }
         self.data_received = self.data_received.saturating_add(len);
         if let Some(expected) = self.content_length {
             if self.data_received > expected {

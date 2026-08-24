@@ -9,6 +9,7 @@ mod response;
 mod frame;
 mod message_body;
 mod parser;
+mod stream_phase;
 pub mod qpack;
 mod varint;
 

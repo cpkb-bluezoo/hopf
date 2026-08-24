@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::endpoint::{decode_h3_datagram, H3PeerState, H3UniStream};
-use super::{frame, message_body, qpack, H3FrameHandler, H3Parser};
+use super::{frame, message_body, qpack, stream_phase, H3FrameHandler, H3Parser};
 
 /// Client-initiated stream factories queued to be opened on a live H3
 /// connection — FIFO: each [`QuicConnApi::open_bi`] call recorded by
@@ -337,6 +337,7 @@ struct H3ClientStream {
     /// `peer_enable_connect_protocol` known (Extended CONNECT only).
     pending_outbound: Option<PendingOutbound>,
     body_tracker: message_body::MessageBodyTracker,
+    message_phase: stream_phase::StreamMessagePhase,
 }
 
 impl H3ClientStream {
@@ -364,6 +365,7 @@ impl H3ClientStream {
             connection_error: None,
             pending_outbound: None,
             body_tracker: message_body::MessageBodyTracker::default(),
+            message_phase: stream_phase::StreamMessagePhase::default(),
         }
     }
 
@@ -511,6 +513,12 @@ impl H3ClientStream {
 
 impl H3FrameHandler for H3ClientStream {
     fn data_frame(&mut self, payload: &[u8]) {
+        if !self.message_phase.data_allowed() {
+            // RFC 9114 §4.1: DATA before response HEADERS is a connection error.
+            self.connection_error
+                .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+            return;
+        }
         if self
             .body_tracker
             .add_data(payload.len() as u64)
@@ -532,6 +540,12 @@ impl H3FrameHandler for H3ClientStream {
     }
 
     fn headers_frame(&mut self, payload: &[u8]) {
+        if self.message_phase == stream_phase::StreamMessagePhase::AfterTrailers {
+            self.connection_error
+                .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+            return;
+        }
+
         let Ok(pairs) = self.qpack.decode_field_section(self.stream_id, payload) else {
             self.qpack_error = true;
             return;
@@ -606,6 +620,11 @@ impl H3FrameHandler for H3ClientStream {
                 return;
             }
             if self.response_headers_received {
+                if self.message_phase != stream_phase::StreamMessagePhase::InMessage {
+                    self.connection_error
+                        .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+                    return;
+                }
                 if self.body_tracker.finish_message().is_err() {
                     handler.request_failed(
                         &mut w,
@@ -622,7 +641,13 @@ impl H3FrameHandler for H3ClientStream {
                     self.response_body_started = false;
                 }
                 handler.response_trailers(&mut w, &headers);
+                self.message_phase = self.message_phase.opened_trailers();
             } else {
+                if self.message_phase != stream_phase::StreamMessagePhase::AwaitingHeaders {
+                    self.connection_error
+                        .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+                    return;
+                }
                 let forbid =
                     crate::utils::http_response_status_must_not_have_content(headers.status_code());
                 if self.body_tracker.begin_message(&pairs, forbid).is_err() {
@@ -638,12 +663,19 @@ impl H3FrameHandler for H3ClientStream {
                 }
                 self.response_headers_received = true;
                 handler.response_headers(&mut w, &headers);
+                self.message_phase = self.message_phase.opened_message();
             }
         }
     }
 
-    fn settings_frame(&mut self, _: &[u8]) {}
-    fn goaway_frame(&mut self, _: &[u8]) {}
+    fn settings_frame(&mut self, _: &[u8]) {
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
+    fn goaway_frame(&mut self, _: &[u8]) {
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
     fn cancel_push_frame(&mut self, _: &[u8]) {
         self.connection_error
             .get_or_insert(frame::H3_FRAME_UNEXPECTED);
@@ -662,7 +694,9 @@ impl H3FrameHandler for H3ClientStream {
         self.connection_error
             .get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
-    fn frame_error(&mut self, _: &str) {}
+    fn frame_error(&mut self, _: &str) {
+        self.connection_error.get_or_insert(frame::H3_FRAME_ERROR);
+    }
 }
 
 impl ProtocolHandler for H3ClientStream {
@@ -994,6 +1028,43 @@ mod status_validation_tests {
         stream.data_frame(b"x");
         assert!(stream.malformed);
         assert_eq!(rec.lock().unwrap().status, Some(204));
+    }
+
+    #[test]
+    fn data_before_response_headers_is_frame_unexpected() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.data_frame(b"early");
+        assert_eq!(rec.lock().unwrap().status, None);
+
+        let mut ep = RecordingEndpoint::default();
+        let mut empty: &[u8] = &[];
+        stream.receive(&mut ep, &mut empty);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    #[test]
+    fn settings_on_client_stream_is_frame_unexpected() {
+        let (mut stream, _rec) = stream_with_recorder();
+        let mut frame_bytes = Vec::new();
+        frame::write_settings(&mut frame_bytes, 0, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
+
+        let mut ep = RecordingEndpoint::default();
+        let mut data: &[u8] = &frame_bytes;
+        stream.receive(&mut ep, &mut data);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    #[test]
+    fn third_response_headers_is_frame_unexpected() {
+        let (mut stream, _rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[(":status", "200")]));
+        stream.headers_frame(&encode(&[("grpc-status", "0")]));
+
+        let mut ep = RecordingEndpoint::default();
+        let third = encode(&[("grpc-message", "late")]);
+        let mut data: &[u8] = &third;
+        stream.receive(&mut ep, &mut data);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
     }
 
     /// A `100 Continue` / `103 Early Hints` HEADERS frame is surfaced via
