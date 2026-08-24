@@ -229,10 +229,7 @@ impl Drop for QuicDriverHandle {
 
 /// Bind UDP and accept QUIC connections; each bi-stream gets a handler from `config.factory`.
 pub fn listen_quic(config: QuicListenConfig) -> io::Result<QuicDriverHandle> {
-    let std_sock = std::net::UdpSocket::bind(config.addr)?;
-    std_sock.set_nonblocking(true)?;
-    let local_addr = std_sock.local_addr()?;
-    let socket = UdpSocket::from_std(std_sock);
+    let (socket, local_addr) = crate::udp::bind_udp(config.addr)?;
 
     let mut server = config.server;
     apply_listen_hardening(&mut server, &config.hardening);
@@ -259,10 +256,7 @@ pub fn listen_quic(config: QuicListenConfig) -> io::Result<QuicDriverHandle> {
 
 /// Bind UDP and accept QUIC connections using connection-level hooks (H3).
 pub fn listen_quic_hooks(config: QuicListenHooksConfig) -> io::Result<QuicDriverHandle> {
-    let std_sock = std::net::UdpSocket::bind(config.addr)?;
-    std_sock.set_nonblocking(true)?;
-    let local_addr = std_sock.local_addr()?;
-    let socket = UdpSocket::from_std(std_sock);
+    let (socket, local_addr) = crate::udp::bind_udp(config.addr)?;
 
     let mut server = config.server;
     apply_listen_hardening(&mut server, &config.hardening);
@@ -289,10 +283,8 @@ pub fn listen_quic_hooks(config: QuicListenHooksConfig) -> io::Result<QuicDriver
 
 /// Dial a peer, open one bidirectional stream, and attach `config.factory` handler.
 pub fn connect_quic(config: QuicConnectConfig) -> io::Result<QuicDriverHandle> {
-    let std_sock = std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))?;
-    std_sock.set_nonblocking(true)?;
-    let local_addr = std_sock.local_addr()?;
-    let socket = UdpSocket::from_std(std_sock);
+    let (socket, local_addr) =
+        crate::udp::bind_udp(SocketAddr::from(([0, 0, 0, 0], 0)))?;
 
     let endpoint = QuinnEndpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
 
@@ -318,10 +310,8 @@ pub fn connect_quic_hooks(
     server_name: impl Into<String>,
     connection_factory: ConnectionFactory,
 ) -> io::Result<QuicDriverHandle> {
-    let std_sock = std::net::UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))?;
-    std_sock.set_nonblocking(true)?;
-    let local_addr = std_sock.local_addr()?;
-    let socket = UdpSocket::from_std(std_sock);
+    let (socket, local_addr) =
+        crate::udp::bind_udp(SocketAddr::from(([0, 0, 0, 0], 0)))?;
 
     let endpoint = QuinnEndpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
 
@@ -446,6 +436,8 @@ fn spawn_driver(
                 timers: Vec::new(),
                 recv_buf: vec![0u8; 65536],
                 send_buf: Vec::with_capacity(2048),
+                pending_sends: crate::udp::PendingUdpSends::default(),
+                udp_interest: Interest::READABLE,
                 require_address_validation,
             };
             if let Err(e) = driver.run(&mut poll) {
@@ -614,6 +606,9 @@ struct Driver {
     timers: Vec<PendingTimer>,
     recv_buf: Vec<u8>,
     send_buf: Vec<u8>,
+    /// Datagrams that hit `WouldBlock` on `send_to`, retried when writable.
+    pending_sends: crate::udp::PendingUdpSends,
+    udp_interest: Interest,
     /// When true, unvalidated Incoming get Retry before handshake (RFC 9000 §8.1.2).
     require_address_validation: bool,
 }
@@ -680,7 +675,10 @@ impl Driver {
 
         let mut events = Events::with_capacity(256);
         while self.active.load(Ordering::Acquire) {
-            self.flush_all_transmits();
+            self.flush_pending_sends()?;
+            self.sync_udp_interest(poll)?;
+            self.flush_all_transmits()?;
+            self.sync_udp_interest(poll)?;
             self.drain_cmds();
             self.fire_timers();
 
@@ -690,19 +688,65 @@ impl Driver {
             let now = Instant::now();
             for ev in events.iter() {
                 match ev.token() {
-                    UDP_TOKEN => self.on_udp_readable(now)?,
+                    UDP_TOKEN => {
+                        if !self.pending_sends.is_empty() {
+                            self.flush_pending_sends()?;
+                            self.sync_udp_interest(poll)?;
+                        }
+                        self.on_udp_readable(now)?;
+                    }
                     WAKE_TOKEN => {}
                     _ => {}
                 }
             }
 
             self.handle_timeouts(now);
-            self.poll_connections(now);
+            self.poll_connections(now)?;
             self.detect_migrations();
             self.drive_apps();
-            self.flush_all_transmits();
+            self.flush_all_transmits()?;
+            self.sync_udp_interest(poll)?;
         }
         Ok(())
+    }
+
+    fn sync_udp_interest(&mut self, poll: &mut Poll) -> io::Result<()> {
+        let desired = if self.pending_sends.is_empty() {
+            Interest::READABLE
+        } else {
+            Interest::READABLE | Interest::WRITABLE
+        };
+        if desired != self.udp_interest {
+            self.udp_interest = desired;
+            poll.registry()
+                .reregister(&mut self.socket, UDP_TOKEN, desired)?;
+        }
+        Ok(())
+    }
+
+    fn try_send_datagram(&self, dest: SocketAddr, buf: &[u8]) -> io::Result<()> {
+        match self.socket.send_to(buf, dest) {
+            Ok(n) if n == buf.len() => Ok(()),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short UDP send",
+            )),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn flush_pending_sends(&mut self) -> io::Result<()> {
+        let socket = &self.socket;
+        self.pending_sends.flush(|pending| {
+            match socket.send_to(&pending.data, pending.destination) {
+                Ok(n) if n == pending.data.len() => Ok(()),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short UDP send",
+                )),
+                Err(e) => Err(e),
+            }
+        })
     }
 
     /// How long the mio poll should sleep before the next wake — the
@@ -872,7 +916,7 @@ impl Driver {
             {
                 match event {
                     DatagramEvent::NewConnection(incoming) => {
-                        self.handle_incoming(incoming, remote, now);
+                        self.handle_incoming(incoming, remote, now)?;
                     }
                     DatagramEvent::ConnectionEvent(ch, event) => {
                         if let Some(slot) = self.connections.get_mut(&ch) {
@@ -880,7 +924,7 @@ impl Driver {
                         }
                     }
                     DatagramEvent::Response(tx) => {
-                        self.send_transmit(tx);
+                        self.send_transmit(tx)?;
                     }
                 }
             }
@@ -898,20 +942,25 @@ impl Driver {
     /// unvalidated address gets a Retry packet (RFC 9000 §8.1.2) so spoofed
     /// Initials never start a TLS handshake. Validated peers (Retry token or
     /// NEW_TOKEN) are accepted immediately.
-    fn handle_incoming(&mut self, incoming: Incoming, remote: SocketAddr, now: Instant) {
+    fn handle_incoming(
+        &mut self,
+        incoming: Incoming,
+        remote: SocketAddr,
+        now: Instant,
+    ) -> io::Result<()> {
         if self.require_address_validation && !incoming.remote_address_validated() {
             match self.endpoint.retry(incoming, &mut self.send_buf) {
-                Ok(tx) => self.send_transmit(tx),
+                Ok(tx) => self.send_transmit(tx)?,
                 Err(err) => {
                     // Already carried a Retry token but still unvalidated —
                     // refuse rather than looping Retry forever.
                     let tx = self
                         .endpoint
                         .refuse(err.into_incoming(), &mut self.send_buf);
-                    self.send_transmit(tx);
+                    self.send_transmit(tx)?;
                 }
             }
-            return;
+            return Ok(());
         }
 
         match self.endpoint.accept(incoming, now, &mut self.send_buf, None) {
@@ -931,10 +980,11 @@ impl Driver {
             }
             Err(e) => {
                 if let Some(tx) = e.response {
-                    self.send_transmit(tx);
+                    self.send_transmit(tx)?;
                 }
             }
         }
+        Ok(())
     }
 
     fn handle_timeouts(&mut self, now: Instant) {
@@ -950,14 +1000,15 @@ impl Driver {
         }
     }
 
-    fn poll_connections(&mut self, now: Instant) {
+    fn poll_connections(&mut self, now: Instant) -> io::Result<()> {
         let handles: Vec<_> = self.connections.keys().copied().collect();
         for ch in handles {
-            self.poll_one_connection(ch, now);
+            self.poll_one_connection(ch, now)?;
         }
+        Ok(())
     }
 
-    fn poll_one_connection(&mut self, ch: ConnectionHandle, now: Instant) {
+    fn poll_one_connection(&mut self, ch: ConnectionHandle, now: Instant) -> io::Result<()> {
         // Endpoint events first.
         let mut endpoint_events = Vec::new();
         if let Some(slot) = self.connections.get_mut(&ch) {
@@ -987,7 +1038,7 @@ impl Driver {
                 }
                 Event::ConnectionLost { reason } => {
                     self.on_connection_lost(ch, reason);
-                    return;
+                    return Ok(());
                 }
                 Event::Stream(se) => self.on_stream_event(ch, se),
                 Event::DatagramReceived => {
@@ -1008,10 +1059,11 @@ impl Driver {
                 None => break,
             };
             match tx {
-                Some(t) => self.send_transmit(t),
+                Some(t) => self.send_transmit(t)?,
                 None => break,
             }
         }
+        Ok(())
     }
 
     fn on_connected(&mut self, ch: ConnectionHandle) {
@@ -1722,7 +1774,7 @@ impl Driver {
         }
     }
 
-    fn flush_all_transmits(&mut self) {
+    fn flush_all_transmits(&mut self) -> io::Result<()> {
         // Endpoint-level transmits (if any) are handled via DatagramEvent::Response.
         let now = Instant::now();
         let handles: Vec<_> = self.connections.keys().copied().collect();
@@ -1734,33 +1786,31 @@ impl Driver {
                     None => break,
                 };
                 match tx {
-                    Some(t) => self.send_transmit(t),
+                    Some(t) => self.send_transmit(t)?,
                     None => break,
                 }
             }
         }
+        Ok(())
     }
 
-    fn send_transmit(&mut self, transmit: Transmit) {
-        let dest = transmit.destination;
+    fn send_transmit(&mut self, transmit: Transmit) -> io::Result<()> {
         let size = transmit.size;
-        if size == 0 || size > self.send_buf.len() {
-            // poll_transmit writes into send_buf; if empty, nothing to send.
-            if size == 0 {
-                return;
+        if size == 0 {
+            return Ok(());
+        }
+        if size > self.send_buf.len() {
+            return Ok(());
+        }
+        let buf = &self.send_buf[..size];
+        match self.try_send_datagram(transmit.destination, buf) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.pending_sends.enqueue_transmit(&transmit, buf);
+                Ok(())
             }
+            Err(e) => Err(e),
         }
-        let buf = if self.send_buf.len() >= size {
-            &self.send_buf[..size]
-        } else {
-            return;
-        };
-        match self.socket.send_to(buf, dest) {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => eprintln!("hopf-quic send_to: {e}"),
-        }
-        let _ = Bytes::new(); // silence unused if feature changes
     }
 }
 

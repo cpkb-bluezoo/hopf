@@ -14,6 +14,7 @@ mod error;
 mod hooks;
 mod runtime_ext;
 mod stream;
+mod udp;
 
 pub use config::{
     apply_client_transport_options, apply_listen_hardening, apply_server_transport_options,
