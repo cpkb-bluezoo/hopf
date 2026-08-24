@@ -21,7 +21,7 @@ use crate::stream::{
 use crate::{Headers, HttpLimits};
 
 use super::response::{ArcH3ResponseControl, H3ResponseControl, H3SessionWriter};
-use super::{datagram, frame, qpack, H3FrameHandler, H3Parser};
+use super::{datagram, frame, message_body, qpack, H3FrameHandler, H3Parser};
 
 /// HTTP/3 connection state installed in the QUIC hooks driver.
 pub struct H3ServerConnection {
@@ -415,6 +415,7 @@ struct H3RequestStream {
     /// `Capsule-Protocol: ?1` or an upgrade token that implies it.
     capsule_mode: bool,
     capsule_parser: crate::capsule::CapsuleParser,
+    body_tracker: message_body::MessageBodyTracker,
 }
 
 impl H3RequestStream {
@@ -444,6 +445,7 @@ impl H3RequestStream {
             connection_error: None,
             capsule_mode: false,
             capsule_parser: crate::capsule::CapsuleParser::new(),
+            body_tracker: message_body::MessageBodyTracker::default(),
         };
         let flag = Arc::clone(&needs_protocol_flush);
         stream.writer.control.set_flush(Some(Arc::new(move || {
@@ -570,6 +572,14 @@ impl H3RequestStream {
 
 impl H3FrameHandler for H3RequestStream {
     fn data_frame(&mut self, payload: &[u8]) {
+        if self
+            .body_tracker
+            .add_data(payload.len() as u64)
+            .is_err()
+        {
+            self.malformed = true;
+            return;
+        }
         self.deliver_request_body(payload);
     }
 
@@ -594,6 +604,10 @@ impl H3FrameHandler for H3RequestStream {
             if !crate::utils::http_binary_field_names_are_lowercase(&pairs)
                 || !crate::utils::http_connection_specific_fields_are_valid(&pairs)
             {
+                self.malformed = true;
+                return;
+            }
+            if self.body_tracker.finish_message().is_err() {
                 self.malformed = true;
                 return;
             }
@@ -623,8 +637,8 @@ impl H3FrameHandler for H3RequestStream {
         }
 
         let mut headers = Headers::new();
-        for (name, value) in pairs {
-            headers.add(name, value);
+        for (name, value) in &pairs {
+            headers.add(name.clone(), value.clone());
         }
         self.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);
         {
@@ -640,6 +654,17 @@ impl H3FrameHandler for H3RequestStream {
         handler.headers(&mut self.writer, &headers);
         if let Some(up) = self.writer.control.take_upgrade() {
             self.upgraded = Some(up);
+        }
+        self.body_tracker
+            .set_skip(self.capsule_mode || self.upgraded.is_some());
+        if !self.capsule_mode && self.upgraded.is_none() {
+            let forbid = headers
+                .method()
+                .is_some_and(crate::utils::http_request_method_must_not_have_content);
+            if self.body_tracker.begin_message(&pairs, forbid).is_err() {
+                self.malformed = true;
+                return;
+            }
         }
         self.handler = Some(handler);
     }
@@ -714,6 +739,11 @@ impl ProtocolHandler for H3RequestStream {
 
     fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
         self.bind_execute_conn();
+        if self.body_tracker.finish_message().is_err() {
+            self.malformed = true;
+            endpoint.abort(frame::H3_MESSAGE_ERROR);
+            return;
+        }
         self.finish_request(endpoint);
     }
 
@@ -2119,6 +2149,71 @@ mod request_validation_tests {
             vec![("grpc-status".to_string(), "0".to_string()), ("grpc-message".to_string(), "ok".to_string())]
         );
         assert!(!stream.malformed, "trailers must not be run through request pseudo-header validation");
+    }
+
+    #[test]
+    fn content_length_must_match_request_data_on_fin() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+            ("content-length", "5"),
+        ]));
+        stream.data_frame(b"hello");
+        assert!(!stream.malformed);
+
+        let mut ep = RecordingEndpoint::default();
+        stream.disconnected(&mut ep);
+        assert!(!ep.closed);
+        assert_eq!(rec.lock().unwrap().completed, 1);
+    }
+
+    #[test]
+    fn short_request_body_vs_content_length_aborts_stream() {
+        let (mut stream, _rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+            ("content-length", "5"),
+        ]));
+        stream.data_frame(b"hi");
+
+        let mut ep = RecordingEndpoint::default();
+        stream.disconnected(&mut ep);
+        assert!(ep.closed);
+        assert_eq!(ep.abort_code, Some(frame::H3_MESSAGE_ERROR));
+    }
+
+    #[test]
+    fn excess_request_data_vs_content_length_is_malformed() {
+        let (mut stream, _rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+            ("content-length", "3"),
+        ]));
+        stream.data_frame(b"hello");
+        assert!(stream.malformed);
+    }
+
+    #[test]
+    fn head_request_must_not_include_body() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[
+            (":method", "HEAD"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+        ]));
+        assert_eq!(rec.lock().unwrap().opened, 1);
+        stream.data_frame(b"x");
+        assert!(stream.malformed);
     }
 }
 

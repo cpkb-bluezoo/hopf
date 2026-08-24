@@ -7,6 +7,7 @@ pub mod datagram;
 mod endpoint;
 mod response;
 mod frame;
+mod message_body;
 mod parser;
 pub mod qpack;
 mod varint;
