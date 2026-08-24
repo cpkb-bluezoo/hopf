@@ -21,7 +21,7 @@ use crate::stream::{
 use crate::{Headers, HttpLimits};
 
 use super::response::{ArcH3ResponseControl, H3ResponseControl, H3SessionWriter};
-use super::{datagram, frame, message_body, qpack, H3FrameHandler, H3Parser};
+use super::{datagram, frame, message_body, qpack, stream_phase, H3FrameHandler, H3Parser};
 
 /// HTTP/3 connection state installed in the QUIC hooks driver.
 pub struct H3ServerConnection {
@@ -416,6 +416,7 @@ struct H3RequestStream {
     capsule_mode: bool,
     capsule_parser: crate::capsule::CapsuleParser,
     body_tracker: message_body::MessageBodyTracker,
+    message_phase: stream_phase::StreamMessagePhase,
 }
 
 impl H3RequestStream {
@@ -446,6 +447,7 @@ impl H3RequestStream {
             capsule_mode: false,
             capsule_parser: crate::capsule::CapsuleParser::new(),
             body_tracker: message_body::MessageBodyTracker::default(),
+            message_phase: stream_phase::StreamMessagePhase::default(),
         };
         let flag = Arc::clone(&needs_protocol_flush);
         stream.writer.control.set_flush(Some(Arc::new(move || {
@@ -572,6 +574,13 @@ impl H3RequestStream {
 
 impl H3FrameHandler for H3RequestStream {
     fn data_frame(&mut self, payload: &[u8]) {
+        if !self.message_phase.data_allowed() {
+            // RFC 9114 §4.1: DATA before HEADERS (or after trailers) is a
+            // connection error, not a silent drop.
+            self.connection_error
+                .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+            return;
+        }
         if self
             .body_tracker
             .add_data(payload.len() as u64)
@@ -584,6 +593,24 @@ impl H3FrameHandler for H3RequestStream {
     }
 
     fn headers_frame(&mut self, payload: &[u8]) {
+        if self.message_phase == stream_phase::StreamMessagePhase::AfterTrailers {
+            self.connection_error
+                .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+            return;
+        }
+        let is_trailers = self.handler.is_some();
+        if is_trailers && self.message_phase != stream_phase::StreamMessagePhase::InMessage {
+            self.connection_error
+                .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+            return;
+        }
+        if !is_trailers && self.message_phase != stream_phase::StreamMessagePhase::AwaitingHeaders
+        {
+            self.connection_error
+                .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+            return;
+        }
+
         let Ok(pairs) = self.qpack.decode_field_section(self.stream_id, payload) else {
             self.qpack_error = true;
             return;
@@ -616,6 +643,7 @@ impl H3FrameHandler for H3RequestStream {
                 trailers.add(name, value);
             }
             handler.request_trailers(&mut self.writer, &trailers);
+            self.message_phase = self.message_phase.opened_trailers();
             return;
         }
 
@@ -667,10 +695,19 @@ impl H3FrameHandler for H3RequestStream {
             }
         }
         self.handler = Some(handler);
+        self.message_phase = self.message_phase.opened_message();
     }
 
-    fn settings_frame(&mut self, _: &[u8]) {}
-    fn goaway_frame(&mut self, _: &[u8]) {}
+    fn settings_frame(&mut self, _: &[u8]) {
+        // RFC 9114 §7.2.4: SETTINGS is control-stream only.
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
+    fn goaway_frame(&mut self, _: &[u8]) {
+        // RFC 9114 §7.2.6: GOAWAY is control-stream only.
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
     fn cancel_push_frame(&mut self, _: &[u8]) {
         // CANCEL_PUSH is control-stream only (RFC 9114 §7.2.3).
         self.connection_error
@@ -699,7 +736,10 @@ impl H3FrameHandler for H3RequestStream {
         self.connection_error
             .get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
-    fn frame_error(&mut self, _: &str) {}
+    fn frame_error(&mut self, _: &str) {
+        // RFC 9114 §7.1 / §8.1: malformed frames → H3_FRAME_ERROR.
+        self.connection_error.get_or_insert(frame::H3_FRAME_ERROR);
+    }
 }
 
 impl ProtocolHandler for H3RequestStream {
@@ -1900,6 +1940,7 @@ mod request_validation_tests {
     struct RecordingEndpoint {
         closed: bool,
         abort_code: Option<u32>,
+        close_connection_code: Option<u32>,
     }
     impl Endpoint for RecordingEndpoint {
         fn send(&mut self, _data: &[u8]) {}
@@ -1911,6 +1952,10 @@ mod request_validation_tests {
         }
         fn close(&mut self) {
             self.closed = true;
+        }
+        fn close_connection(&mut self, error_code: u32) {
+            self.closed = true;
+            self.close_connection_code = Some(error_code);
         }
         fn abort(&mut self, error_code: u32) {
             self.closed = true;
@@ -2214,6 +2259,90 @@ mod request_validation_tests {
         assert_eq!(rec.lock().unwrap().opened, 1);
         stream.data_frame(b"x");
         assert!(stream.malformed);
+    }
+
+    #[test]
+    fn data_before_request_headers_is_frame_unexpected() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.data_frame(b"early");
+        assert_eq!(rec.lock().unwrap().opened, 0);
+
+        let mut ep = RecordingEndpoint::default();
+        let mut empty: &[u8] = &[];
+        stream.receive(&mut ep, &mut empty);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    #[test]
+    fn settings_on_request_stream_is_frame_unexpected() {
+        let (mut stream, _rec) = stream_with_recorder();
+        let mut frame_bytes = Vec::new();
+        frame::write_settings(&mut frame_bytes, 0, 0, frame::DEFAULT_MAX_FIELD_SECTION_SIZE);
+
+        let mut ep = RecordingEndpoint::default();
+        let mut data: &[u8] = &frame_bytes;
+        stream.receive(&mut ep, &mut data);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    #[test]
+    fn goaway_on_request_stream_is_frame_unexpected() {
+        let (mut stream, _rec) = stream_with_recorder();
+        let mut frame_bytes = Vec::new();
+        frame::write_goaway(&mut frame_bytes, 4);
+
+        let mut ep = RecordingEndpoint::default();
+        let mut data: &[u8] = &frame_bytes;
+        stream.receive(&mut ep, &mut data);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    #[test]
+    fn third_headers_on_request_stream_is_frame_unexpected() {
+        let (mut stream, _rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+        ]));
+        stream.headers_frame(&encode(&[("grpc-status", "0")]));
+
+        let mut ep = RecordingEndpoint::default();
+        let third = encode(&[("grpc-message", "late")]);
+        let mut data: &[u8] = &third;
+        stream.receive(&mut ep, &mut data);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    #[test]
+    fn data_after_request_trailers_is_frame_unexpected() {
+        let (mut stream, _rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+        ]));
+        stream.headers_frame(&encode(&[("grpc-status", "0")]));
+        stream.data_frame(b"late");
+
+        let mut ep = RecordingEndpoint::default();
+        let mut empty: &[u8] = &[];
+        stream.receive(&mut ep, &mut empty);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    #[test]
+    fn malformed_frame_on_request_stream_is_frame_error() {
+        let (mut stream, _rec) = stream_with_recorder();
+        // DATA frame type with a length varint that overflows usize when added.
+        let bytes = vec![0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+
+        let mut ep = RecordingEndpoint::default();
+        let mut data: &[u8] = &bytes;
+        stream.receive(&mut ep, &mut data);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_ERROR));
     }
 }
 
