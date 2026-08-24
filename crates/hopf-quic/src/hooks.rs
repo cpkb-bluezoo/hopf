@@ -56,6 +56,11 @@ pub trait QuicConnection: Send {
     fn decode_datagram(&mut self, _data: &[u8]) -> DatagramDecode {
         DatagramDecode::Drop
     }
+
+    /// An outbound RFC 9221 DATAGRAM could not be queued (peer has no
+    /// DATAGRAM support, payload too large, or DATAGRAM disabled locally).
+    /// Default: ignore.
+    fn datagram_send_failed(&mut self, _err: &std::io::Error) {}
 }
 
 /// How the driver should treat an inbound QUIC DATAGRAM (RFC 9221) after

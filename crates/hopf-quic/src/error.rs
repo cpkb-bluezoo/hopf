@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
-use quinn_proto::{ConnectionError, VarInt};
+use quinn_proto::{ConnectionError, SendDatagramError, VarInt};
 
 /// Peer (or local transport) closed the QUIC connection with a
 /// CONNECTION_CLOSE — RFC 9000 §19.19.
@@ -112,6 +112,66 @@ impl fmt::Display for QuicStreamStoppedError {
 
 impl Error for QuicStreamStoppedError {}
 
+/// Failure to queue an RFC 9221 QUIC DATAGRAM for send.
+///
+/// Delivered as the source of an [`io::Error`] from
+/// [`hopf_core::Endpoint::send_datagram`] / [`crate::QuicConnApi::send_datagram`]
+/// (and, when the send is processed asynchronously, via
+/// [`ProtocolHandler::error`](hopf_core::ProtocolHandler::error) on the
+/// originating stream).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuicDatagramSendError {
+    /// Peer did not advertise `max_datagram_frame_size`.
+    UnsupportedByPeer,
+    /// Local transport config has DATAGRAM receive disabled.
+    Disabled,
+    /// Payload exceeds the current path MTU / peer DATAGRAM size limit.
+    TooLarge,
+    /// Outgoing DATAGRAM buffer is full (`drop = false`).
+    Blocked,
+}
+
+impl QuicDatagramSendError {
+    /// Wrap as an [`io::Error`].
+    pub fn into_io(self) -> io::Error {
+        let kind = match self {
+            Self::UnsupportedByPeer | Self::Disabled => io::ErrorKind::Unsupported,
+            Self::TooLarge => io::ErrorKind::InvalidInput,
+            Self::Blocked => io::ErrorKind::WouldBlock,
+        };
+        io::Error::new(kind, self)
+    }
+}
+
+impl fmt::Display for QuicDatagramSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnsupportedByPeer => "QUIC DATAGRAM not supported by peer",
+            Self::Disabled => "QUIC DATAGRAM support disabled locally",
+            Self::TooLarge => "QUIC DATAGRAM too large for current path",
+            Self::Blocked => "QUIC DATAGRAM send blocked",
+        })
+    }
+}
+
+impl Error for QuicDatagramSendError {}
+
+/// Map quinn-proto [`SendDatagramError`] to [`io::Error`].
+///
+/// `Blocked` carries the unsent payload; the driver queues it and retries
+/// on `Event::DatagramsUnblocked` instead of returning that variant to
+/// callers of the async `Endpoint` path.
+pub(crate) fn datagram_send_io_error(err: SendDatagramError) -> io::Error {
+    match err {
+        SendDatagramError::UnsupportedByPeer => {
+            QuicDatagramSendError::UnsupportedByPeer.into_io()
+        }
+        SendDatagramError::Disabled => QuicDatagramSendError::Disabled.into_io(),
+        SendDatagramError::TooLarge => QuicDatagramSendError::TooLarge.into_io(),
+        SendDatagramError::Blocked(_) => QuicDatagramSendError::Blocked.into_io(),
+    }
+}
+
 /// Map a quinn-proto [`ConnectionError`] to an [`io::Error`] for handler
 /// delivery, or `None` when the close is a clean local shutdown that should
 /// still use [`disconnected`](hopf_core::ProtocolHandler::disconnected).
@@ -167,6 +227,13 @@ pub fn connection_close_error(err: &io::Error) -> Option<&QuicConnectionCloseErr
 /// Downcast helper: extract [`QuicStreamStoppedError`] from an `io::Error`.
 pub fn stream_stopped_error(err: &io::Error) -> Option<&QuicStreamStoppedError> {
     err.get_ref()?.downcast_ref::<QuicStreamStoppedError>()
+}
+
+/// Downcast helper: extract [`QuicDatagramSendError`] from an `io::Error`.
+pub fn datagram_send_error(err: &io::Error) -> Option<QuicDatagramSendError> {
+    err.get_ref()?
+        .downcast_ref::<QuicDatagramSendError>()
+        .copied()
 }
 
 fn transport_error_name(error_code: u64) -> String {
@@ -226,5 +293,25 @@ mod tests {
     fn timed_out_maps_to_timed_out_kind() {
         let err = connection_lost_io_error(ConnectionError::TimedOut).expect("mapped");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn datagram_send_errors_round_trip_through_io_error() {
+        for (src, want) in [
+            (
+                SendDatagramError::UnsupportedByPeer,
+                QuicDatagramSendError::UnsupportedByPeer,
+            ),
+            (SendDatagramError::Disabled, QuicDatagramSendError::Disabled),
+            (SendDatagramError::TooLarge, QuicDatagramSendError::TooLarge),
+            (
+                SendDatagramError::Blocked(bytes::Bytes::new()),
+                QuicDatagramSendError::Blocked,
+            ),
+        ] {
+            let io_err = datagram_send_io_error(src);
+            assert_eq!(datagram_send_error(&io_err), Some(want));
+        }
+        assert!(datagram_send_error(&io::Error::other("nope")).is_none());
     }
 }

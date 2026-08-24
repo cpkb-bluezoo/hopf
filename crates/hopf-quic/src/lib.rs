@@ -27,7 +27,8 @@ pub use config::{
 };
 pub use driver::{connect_quic, connect_quic_hooks, listen_quic, listen_quic_hooks, QuicDriverHandle};
 pub use error::{
-    connection_close_error, stream_stopped_error, QuicConnectionCloseError, QuicStreamStoppedError,
+    connection_close_error, datagram_send_error, stream_stopped_error, QuicConnectionCloseError,
+    QuicDatagramSendError, QuicStreamStoppedError,
 };
 pub use hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection};
 pub use runtime_ext::RuntimeQuicExt;

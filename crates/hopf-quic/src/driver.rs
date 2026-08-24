@@ -16,14 +16,14 @@ use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
 use quinn_proto::{
     Connection, ConnectionError, ConnectionHandle, DatagramEvent, Dir, Endpoint as QuinnEndpoint,
-    EndpointConfig, Event, Incoming, StreamEvent, StreamId, Transmit, VarInt,
+    EndpointConfig, Event, Incoming, SendDatagramError, StreamEvent, StreamId, Transmit, VarInt,
 };
 use hopf_core::{Endpoint, HandlerFactory, ProtocolHandler, SecurityInfo};
 
 use crate::config::{
     apply_listen_hardening, QuicConnectConfig, QuicListenConfig, QuicListenHooksConfig,
 };
-use crate::error::{connection_lost_io_error, stream_stopped_io_error};
+use crate::error::{connection_lost_io_error, datagram_send_io_error, stream_stopped_io_error};
 use crate::hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection};
 use crate::stream::{QuicStreamEndpoint, StreamQueues};
 
@@ -83,6 +83,7 @@ pub(crate) enum DriverCmd {
     SendDatagram {
         conn: ConnectionHandle,
         payload: Vec<u8>,
+        stream_id: Option<StreamId>,
     },
     /// Set send priority for a stream (RFC 9218 via quinn-proto).
     SetStreamPriority {
@@ -393,6 +394,8 @@ struct ConnSlot {
     app: Option<Box<dyn QuicConnection>>,
     /// Keys from ConnRecorder → StreamId for locally opened streams.
     local_keys: HashMap<u64, StreamId>,
+    /// RFC 9221 DATAGRAMs that hit `SendDatagramError::Blocked`.
+    pending_app_datagrams: std::collections::VecDeque<Bytes>,
 }
 
 fn spawn_driver(
@@ -660,6 +663,7 @@ impl Driver {
                             pending_open_bi: std::collections::VecDeque::new(),
                             app: None,
                             local_keys: HashMap::new(),
+                            pending_app_datagrams: std::collections::VecDeque::new(),
                         },
                     );
                     // 0-RTT: open the first bi stream (and any queued
@@ -756,29 +760,10 @@ impl Driver {
         Ok(())
     }
 
-    fn try_send_datagram(&self, dest: SocketAddr, buf: &[u8]) -> io::Result<()> {
-        match self.socket.send_to(buf, dest) {
-            Ok(n) if n == buf.len() => Ok(()),
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short UDP send",
-            )),
-            Err(e) => Err(e),
-        }
-    }
-
     fn flush_pending_sends(&mut self) -> io::Result<()> {
         let socket = &self.socket;
-        self.pending_sends.flush(|pending| {
-            match socket.send_to(&pending.data, pending.destination) {
-                Ok(n) if n == pending.data.len() => Ok(()),
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "short UDP send",
-                )),
-                Err(e) => Err(e),
-            }
-        })
+        self.pending_sends
+            .flush(|pending| crate::udp::send_pending(socket, pending))
     }
 
     /// How long the mio poll should sleep before the next wake — the
@@ -866,9 +851,13 @@ impl Driver {
                         }
                     }
                 }
-                DriverCmd::SendDatagram { conn, payload } => {
-                    if let Some(slot) = self.connections.get_mut(&conn) {
-                        let _ = slot.conn.datagrams().send(Bytes::from(payload), true);
+                DriverCmd::SendDatagram {
+                    conn,
+                    payload,
+                    stream_id,
+                } => {
+                    if let Some(err) = self.try_queue_datagram(conn, payload) {
+                        self.notify_datagram_send_error(conn, stream_id, err);
                     }
                 }
                 DriverCmd::SetStreamPriority {
@@ -935,7 +924,7 @@ impl Driver {
 
     fn on_udp_readable(&mut self, now: Instant) -> io::Result<()> {
         loop {
-            let (n, remote) = match self.socket.recv_from(&mut self.recv_buf) {
+            let (n, remote, ecn) = match crate::udp::recv_one(&self.socket, &mut self.recv_buf) {
                 Ok(x) => x,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
@@ -944,7 +933,7 @@ impl Driver {
             self.send_buf.clear();
             if let Some(event) =
                 self.endpoint
-                    .handle(now, remote, None, None, data, &mut self.send_buf)
+                    .handle(now, remote, None, ecn, data, &mut self.send_buf)
             {
                 match event {
                     DatagramEvent::NewConnection(incoming) => {
@@ -1007,6 +996,7 @@ impl Driver {
                         pending_open_bi: std::collections::VecDeque::new(),
                         app: None,
                         local_keys: HashMap::new(),
+                        pending_app_datagrams: std::collections::VecDeque::new(),
                     },
                 );
             }
@@ -1076,7 +1066,9 @@ impl Driver {
                 Event::DatagramReceived => {
                     self.drain_datagrams(ch);
                 }
-                _ => {}
+                Event::DatagramsUnblocked => {
+                    self.flush_pending_app_datagrams(ch);
+                }
             }
         }
 
@@ -1087,7 +1079,10 @@ impl Driver {
         loop {
             self.send_buf.clear();
             let tx = match self.connections.get_mut(&ch) {
-                Some(slot) => slot.conn.poll_transmit(now, 4, &mut self.send_buf),
+                Some(slot) => {
+                    slot.conn
+                        .poll_transmit(now, crate::udp::max_gso_segments(), &mut self.send_buf)
+                }
                 None => break,
             };
             match tx {
@@ -1275,8 +1270,8 @@ impl Driver {
                     }
                 }
                 RecorderAction::SendDatagram { data } => {
-                    if let Some(slot) = self.connections.get_mut(&ch) {
-                        let _ = slot.conn.datagrams().send(Bytes::from(data), true);
+                    if let Some(err) = self.try_queue_datagram(ch, data) {
+                        self.notify_datagram_send_error(ch, None, err);
                     }
                 }
                 RecorderAction::SetStreamPriority {
@@ -1812,7 +1807,11 @@ impl Driver {
             loop {
                 self.send_buf.clear();
                 let tx = match self.connections.get_mut(&ch) {
-                    Some(slot) => slot.conn.poll_transmit(now, 8, &mut self.send_buf),
+                    Some(slot) => slot.conn.poll_transmit(
+                        now,
+                        crate::udp::max_gso_segments(),
+                        &mut self.send_buf,
+                    ),
                     None => break,
                 };
                 match tx {
@@ -1833,13 +1832,90 @@ impl Driver {
             return Ok(());
         }
         let buf = &self.send_buf[..size];
-        match self.try_send_datagram(transmit.destination, buf) {
+        match crate::udp::send_transmit(&self.socket, &transmit, buf) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 self.pending_sends.enqueue_transmit(&transmit, buf);
                 Ok(())
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Queue an RFC 9221 DATAGRAM. `None` = accepted (or buffered until
+    /// `DatagramsUnblocked`). `Some` = a hard failure the application must see.
+    fn try_queue_datagram(&mut self, ch: ConnectionHandle, payload: Vec<u8>) -> Option<io::Error> {
+        let Some(slot) = self.connections.get_mut(&ch) else {
+            return Some(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no QUIC connection for DATAGRAM",
+            ));
+        };
+        match slot.conn.datagrams().send(Bytes::from(payload), false) {
+            Ok(()) => None,
+            Err(SendDatagramError::Blocked(data)) => {
+                slot.pending_app_datagrams.push_back(data);
+                None
+            }
+            Err(e) => Some(datagram_send_io_error(e)),
+        }
+    }
+
+    fn flush_pending_app_datagrams(&mut self, ch: ConnectionHandle) {
+        loop {
+            let Some(slot) = self.connections.get_mut(&ch) else {
+                return;
+            };
+            let Some(data) = slot.pending_app_datagrams.pop_front() else {
+                return;
+            };
+            match slot.conn.datagrams().send(data, false) {
+                Ok(()) => {}
+                Err(SendDatagramError::Blocked(data)) => {
+                    slot.pending_app_datagrams.push_front(data);
+                    return;
+                }
+                Err(e) => {
+                    let err = datagram_send_io_error(e);
+                    self.notify_datagram_send_error(ch, None, err);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn notify_datagram_send_error(
+        &mut self,
+        ch: ConnectionHandle,
+        stream_id: Option<StreamId>,
+        err: io::Error,
+    ) {
+        if let Some(id) = stream_id {
+            if let Some(stream) = self
+                .connections
+                .get_mut(&ch)
+                .and_then(|s| s.streams.get_mut(&id))
+            {
+                stream.handler.error(&mut stream.endpoint, &err);
+            }
+            return;
+        }
+        let ids: Vec<StreamId> = self
+            .connections
+            .get(&ch)
+            .map(|s| s.streams.keys().copied().collect())
+            .unwrap_or_default();
+        for id in ids {
+            if let Some(stream) = self
+                .connections
+                .get_mut(&ch)
+                .and_then(|s| s.streams.get_mut(&id))
+            {
+                stream.handler.error(&mut stream.endpoint, &err);
+            }
+        }
+        if let Some(app) = self.connections.get_mut(&ch).and_then(|s| s.app.as_mut()) {
+            app.datagram_send_failed(&err);
         }
     }
 }
@@ -2836,7 +2912,8 @@ mod tests {
         }
         fn drive(&mut self, api: &mut dyn QuicConnApi) {
             if let Some(payload) = self.reply.take() {
-                let _ = api.send_datagram(&payload);
+                api.send_datagram(&payload)
+                    .expect("echo DATAGRAM send");
             }
         }
     }
@@ -2848,7 +2925,7 @@ mod tests {
 
     impl QuicConnection for DatagramClientConn {
         fn connected(&mut self, api: &mut dyn QuicConnApi) {
-            let _ = api.send_datagram(b"ping");
+            api.send_datagram(b"ping").expect("client DATAGRAM send");
             self.sent = true;
         }
         fn accept_bi(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
@@ -2990,5 +3067,127 @@ mod tests {
             !client_got_disconnect.load(std::sync::atomic::Ordering::SeqCst),
             "CONNECTION_CLOSE must use error(), not disconnected()"
         );
+    }
+
+    /// RFC 9221: sending a DATAGRAM to a peer that did not advertise
+    /// `max_datagram_frame_size` must surface [`crate::QuicDatagramSendError::UnsupportedByPeer`]
+    /// instead of being swallowed.
+    #[test]
+    fn datagram_send_unsupported_by_peer_is_surfaced() {
+        use crate::config::{apply_server_transport_options, QuicTransportOptions};
+
+        let (mut server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"dgram-off"]).unwrap();
+        apply_server_transport_options(
+            &mut server_cfg,
+            &QuicTransportOptions::new().datagram_receive_buffer_size(None),
+        )
+        .unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"dgram-off"]).unwrap();
+
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(NopHandler) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        let got = Arc::new(StdMutex::new(None));
+        let got2 = Arc::clone(&got);
+        struct SendDatagramOnConnect {
+            got: Arc<StdMutex<Option<crate::QuicDatagramSendError>>>,
+        }
+        impl ProtocolHandler for SendDatagramOnConnect {
+            fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+                let _ = endpoint.send_datagram(b"ping");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, err: &io::Error) {
+                *self.got.lock().unwrap() = crate::datagram_send_error(err);
+            }
+        }
+
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(SendDatagramOnConnect {
+                    got: Arc::clone(&got2),
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        for _ in 0..200 {
+            if got.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let err = *got.lock().unwrap();
+        assert_eq!(err, Some(crate::QuicDatagramSendError::UnsupportedByPeer));
+        server.shutdown();
+    }
+
+    /// Payload larger than the path MTU / DATAGRAM limit is TooLarge, not silent.
+    #[test]
+    fn datagram_send_too_large_is_surfaced() {
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"dgram-big"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"dgram-big"]).unwrap();
+
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(NopHandler) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        let got = Arc::new(StdMutex::new(None));
+        let got2 = Arc::clone(&got);
+        struct SendHuge {
+            got: Arc<StdMutex<Option<crate::QuicDatagramSendError>>>,
+        }
+        impl ProtocolHandler for SendHuge {
+            fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+                let huge = vec![0u8; 65535];
+                let _ = endpoint.send_datagram(&huge);
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, err: &io::Error) {
+                *self.got.lock().unwrap() = crate::datagram_send_error(err);
+            }
+        }
+
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(SendHuge {
+                    got: Arc::clone(&got2),
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        for _ in 0..200 {
+            if got.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            *got.lock().unwrap(),
+            Some(crate::QuicDatagramSendError::TooLarge)
+        );
+        server.shutdown();
     }
 }
