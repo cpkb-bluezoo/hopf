@@ -202,6 +202,11 @@ pub fn parse_goaway(payload: &[u8]) -> Option<u64> {
     varint::decode(payload).map(|(id, _)| id)
 }
 
+/// Parse a MAX_PUSH_ID frame's payload (RFC 9114 §7.2.7): a single varint.
+pub fn parse_max_push_id(payload: &[u8]) -> Option<u64> {
+    varint::decode(payload).map(|(id, _)| id)
+}
+
 /// Append a SETTINGS frame advertising QPACK parameters (RFC 9204 §5),
 /// `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1), Extended
 /// CONNECT (RFC 9220), and `SETTINGS_H3_DATAGRAM=1` (RFC 9297 §2.1.1).

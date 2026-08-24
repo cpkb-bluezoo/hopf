@@ -110,6 +110,11 @@ pub fn http_connection_specific_fields_are_valid(pairs: &[(String, String)]) -> 
     true
 }
 
+/// RFC 9114 §4.1: trailer field sections MUST NOT contain pseudo-headers.
+pub fn field_section_contains_pseudo_headers(pairs: &[(String, String)]) -> bool {
+    pairs.iter().any(|(name, _)| name.starts_with(':'))
+}
+
 /// Header field-value: reject CTL bytes (RFC 9112 §5.5 `field-content`
 /// grammar) — HTAB is the only permitted control character; SP, VCHAR
 /// (0x21-0x7E), and obs-text (0x80-0xFF) are otherwise allowed.
