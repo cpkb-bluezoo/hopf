@@ -73,6 +73,31 @@
         <p class="lead">Native, asynchronous, non-blocking, event-driven <strong>multi-protocol networking framework</strong> in Rust. Successor to <a href="https://github.com/cpkb-bluezoo/gumdrop">Gumdrop</a> without the servlet container — same architectural contracts, TPC execution, plain buffers, and in-tree protocol work.</p>
       </header>
       <p>Hopf is <strong>not</strong> a server-only product. The default topology is a <strong>graph of endpoints</strong> on one Runtime: <strong>listen and dial are equal</strong>. Peer compositions (N listeners + M dialers) are normal. Clients routinely host multiple protocols in one process (at minimum DNS under dial).</p>
+<div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#why-hopf">Why Hopf?</a></li>
+<li><a href="#full-feature-list">Full feature list</a>
+<ul>
+<li><a href="#framework-substrate-hopf-core">Framework substrate</a></li>
+<li><a href="#tls-hopf-tls">TLS</a></li>
+<li><a href="#quic-and-http3-hopf-quic-hopf-http">QUIC and HTTP/3</a></li>
+<li><a href="#http-hopf-http">HTTP</a></li>
+<li><a href="#webdav-hopf-webdav">WebDAV</a></li>
+<li><a href="#websocket-hopf-websocket">WebSocket</a></li>
+<li><a href="#grpc-hopf-grpc">gRPC</a></li>
+<li><a href="#dns-hopf-dns">DNS</a></li>
+<li><a href="#ftp-hopf-ftp">FTP</a></li>
+<li><a href="#smtp-hopf-smtp">SMTP</a></li>
+<li><a href="#pop3-hopf-pop3">POP3</a></li>
+<li><a href="#imap-hopf-imap">IMAP</a></li>
+<li><a href="#mqtt-hopf-mqtt">MQTT</a></li>
+<li><a href="#amqp-hopf-amqp">AMQP</a></li>
+<li><a href="#mailbox-hopf-mailbox">Mailbox</a></li>
+<li><a href="#auth-hopf-auth">Auth</a></li>
+<li><a href="#telemetry-hopf-otel">Telemetry</a></li>
+</ul></li>
+<li><a href="#protocols-at-a-glance">Protocols at a glance</a></li>
+</ul></div>
 <h2 id="why-hopf">Why Hopf?</h2>
 <ul>
 <li><strong>Thread-per-core performance</strong>
@@ -106,7 +131,8 @@
 </ul></li>
 <li><strong>Protocol depth, not a thin HTTP façade</strong>
 <ul>
-<li>HTTP is one peer among many — mail, DNS, FTP, WebDAV, WebSocket, gRPC, MQTT, AMQP share the same substrate</li>
+<li>HTTP is one peer among many — mail, DNS, FTP, WebDAV, WebSocket, gRPC share the same substrate</li>
+<li><a href="mqtt.html">MQTT</a> broker and client; <a href="amqp.html">AMQP 0-9-1</a> client (<code>hopf-amqp</code>, RabbitMQ wire protocol)</li>
 </ul></li>
 </ul>
 <h2 id="full-feature-list">Full feature list</h2>
