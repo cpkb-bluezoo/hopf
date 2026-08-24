@@ -37,6 +37,24 @@ pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
 /// `SETTINGS_ENABLE_CONNECT_PROTOCOL` identifier (RFC 9220).
 pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
 
+/// HTTP/2 frame types with no HTTP/3 counterpart (RFC 9114 §7.2.8 /
+/// §11.2.1): PRIORITY (`0x02`), PING (`0x06`), WINDOW_UPDATE (`0x08`),
+/// CONTINUATION (`0x09`). Receipt MUST be a connection error of type
+/// `H3_FRAME_UNEXPECTED`.
+pub fn is_reserved_http2_frame_type(ty: u64) -> bool {
+    matches!(ty, 0x02 | 0x06 | 0x08 | 0x09)
+}
+
+/// HTTP/2 setting identifiers with no HTTP/3 counterpart (RFC 9114 §7.2.4 /
+/// §11.2.2), plus reserved identifier `0x00`. Receipt MUST be a connection
+/// error of type `H3_SETTINGS_ERROR`.
+///
+/// Note: `0x01` (QPACK max table capacity) and `0x06` (max field section
+/// size) are redefined for HTTP/3 and are not reserved.
+pub fn is_reserved_http2_setting_id(id: u64) -> bool {
+    matches!(id, 0x00 | 0x02 | 0x03 | 0x04 | 0x05)
+}
+
 /// Default / advertised `SETTINGS_MAX_FIELD_SECTION_SIZE` — matches the
 /// HTTP/2 `SETTINGS_MAX_HEADER_LIST_SIZE` hopf advertises (8192).
 pub const DEFAULT_MAX_FIELD_SECTION_SIZE: u64 = 8_192;
@@ -336,5 +354,25 @@ mod tests {
         assert_eq!(QPACK_ENCODER_STREAM_ERROR, 0x0201);
         assert_eq!(QPACK_DECODER_STREAM_ERROR, 0x0202);
         assert_eq!(crate::h3::datagram::H3_DATAGRAM_ERROR, 0x33);
+    }
+
+    #[test]
+    fn reserved_http2_frame_types_match_rfc_9114() {
+        for ty in [0x02u64, 0x06, 0x08, 0x09] {
+            assert!(is_reserved_http2_frame_type(ty), "{ty:#x}");
+        }
+        assert!(!is_reserved_http2_frame_type(DATA));
+        assert!(!is_reserved_http2_frame_type(0x21)); // GREASE
+        assert!(!is_reserved_http2_frame_type(SETTINGS));
+    }
+
+    #[test]
+    fn reserved_http2_setting_ids_match_rfc_9114() {
+        for id in [0x00u64, 0x02, 0x03, 0x04, 0x05] {
+            assert!(is_reserved_http2_setting_id(id), "{id:#x}");
+        }
+        assert!(!is_reserved_http2_setting_id(SETTINGS_QPACK_MAX_TABLE_CAPACITY));
+        assert!(!is_reserved_http2_setting_id(SETTINGS_MAX_FIELD_SECTION_SIZE));
+        assert!(!is_reserved_http2_setting_id(SETTINGS_ENABLE_CONNECT_PROTOCOL));
     }
 }

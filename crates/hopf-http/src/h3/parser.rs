@@ -29,7 +29,15 @@ pub trait H3FrameHandler {
     /// An unknown or reserved (GREASE) frame type — ignored after SETTINGS
     /// on the control stream (RFC 9114 §9), but must not count as the
     /// required first SETTINGS frame (§6.2.1 / §7.2.4).
+    ///
+    /// Must not be used for the HTTP/2 leftovers in
+    /// [`frame::is_reserved_http2_frame_type`] — those go through
+    /// [`Self::reserved_http2_frame`].
     fn unknown_frame(&mut self, _frame_type: u64) {}
+    /// A reserved HTTP/2 frame type (`0x02` / `0x06` / `0x08` / `0x09`) —
+    /// RFC 9114 §7.2.8 requires a connection error of type
+    /// `H3_FRAME_UNEXPECTED`.
+    fn reserved_http2_frame(&mut self, _frame_type: u64) {}
     /// A malformed frame was received.
     fn frame_error(&mut self, message: &str);
 }
@@ -104,6 +112,10 @@ impl H3Parser {
                     handler.priority_update_request_frame(payload)
                 }
                 frame::PRIORITY_UPDATE_PUSH => handler.priority_update_push_frame(payload),
+                // HTTP/2 leftovers (RFC 9114 §7.2.8 / §11.2.1) — never GREASE.
+                other if frame::is_reserved_http2_frame_type(other) => {
+                    handler.reserved_http2_frame(other);
+                }
                 // Unknown / reserved (GREASE) — notify so the control stream
                 // can enforce SETTINGS-first; otherwise ignore per §9.
                 other => handler.unknown_frame(other),

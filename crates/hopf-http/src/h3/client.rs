@@ -607,6 +607,11 @@ impl H3FrameHandler for H3ClientStream {
         self.connection_error
             .get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
+    fn reserved_http2_frame(&mut self, _: u64) {
+        // RFC 9114 §7.2.8 — same on every stream type.
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
     fn frame_error(&mut self, _: &str) {}
 }
 
