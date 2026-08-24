@@ -60,7 +60,8 @@ pub use capsule::{
 };
 #[cfg(feature = "h3")]
 pub use h3::{
-    connect_h3, decode_http3_datagram, encode_http3_datagram, listen_h3, send_http3_datagram,
+    connect_h3, decode_http3_datagram, encode_http3_datagram, listen_h3,
+    peer_accepts_h3_datagram, send_http3_datagram,
     H3ClientConnection, H3ServerConnection, H3_CLOSED_CRITICAL_STREAM, H3_CONNECT_ERROR,
     H3_DATAGRAM_ERROR, H3_EXCESSIVE_LOAD, H3_FRAME_ERROR, H3_FRAME_UNEXPECTED,
     H3_GENERAL_PROTOCOL_ERROR, H3_ID_ERROR, H3_INTERNAL_ERROR, H3_MESSAGE_ERROR,

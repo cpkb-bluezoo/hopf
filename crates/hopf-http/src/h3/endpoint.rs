@@ -153,11 +153,9 @@ pub(crate) fn decode_h3_datagram(
 ) -> DatagramDecode {
     // We always advertise SETTINGS_H3_DATAGRAM=1. The peer must have done
     // the same before sending QUIC DATAGRAMs.
-    let peer_ok = peer_state
-        .lock()
-        .unwrap()
-        .peer_h3_datagram
-        .unwrap_or(false);
+    let peer_ok = datagram::peer_accepts_h3_datagram(
+        peer_state.lock().unwrap().peer_h3_datagram,
+    );
     if !peer_ok {
         return DatagramDecode::CloseConnection {
             error_code: datagram::H3_DATAGRAM_ERROR,

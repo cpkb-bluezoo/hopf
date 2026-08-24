@@ -18,8 +18,9 @@ pub use crate::capsule::{
 };
 pub use client::{connect_h3, H3ClientConnection};
 pub use datagram::{
-    decode as decode_http3_datagram, encode as encode_http3_datagram, send as send_http3_datagram,
-    H3_DATAGRAM_ERROR, SETTINGS_H3_DATAGRAM,
+    decode as decode_http3_datagram, encode as encode_http3_datagram,
+    peer_accepts_h3_datagram, send as send_http3_datagram, H3_DATAGRAM_ERROR,
+    SETTINGS_H3_DATAGRAM,
 };
 pub use endpoint::{listen_h3, H3ServerConnection};
 pub use frame::{
