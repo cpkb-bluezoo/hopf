@@ -284,7 +284,7 @@ pub fn listen_quic_hooks(config: QuicListenHooksConfig) -> io::Result<QuicDriver
 /// Dial a peer, open one bidirectional stream, and attach `config.factory` handler.
 pub fn connect_quic(config: QuicConnectConfig) -> io::Result<QuicDriverHandle> {
     let (socket, local_addr) =
-        crate::udp::bind_udp(SocketAddr::from(([0, 0, 0, 0], 0)))?;
+        crate::udp::bind_udp(crate::udp::unspecified_bind_addr(config.addr))?;
 
     let endpoint = QuinnEndpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
 
@@ -311,7 +311,7 @@ pub fn connect_quic_hooks(
     connection_factory: ConnectionFactory,
 ) -> io::Result<QuicDriverHandle> {
     let (socket, local_addr) =
-        crate::udp::bind_udp(SocketAddr::from(([0, 0, 0, 0], 0)))?;
+        crate::udp::bind_udp(crate::udp::unspecified_bind_addr(addr))?;
 
     let endpoint = QuinnEndpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
 

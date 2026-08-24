@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use mio::net::UdpSocket;
 use quinn_proto::Transmit;
@@ -24,6 +24,17 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<(UdpSocket, SocketAddr)> {
     let std_sock: std::net::UdpSocket = socket.into();
     let local_addr = std_sock.local_addr()?;
     Ok((UdpSocket::from_std(std_sock), local_addr))
+}
+
+/// Unspecified ephemeral bind address matching `peer`'s family.
+///
+/// QUIC clients must bind IPv6 (`[::]:0`) when dialing an IPv6 peer;
+/// binding `0.0.0.0` cannot send to IPv6 destinations.
+pub fn unspecified_bind_addr(peer: SocketAddr) -> SocketAddr {
+    match peer.ip() {
+        IpAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        IpAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+    }
 }
 
 /// Outbound QUIC datagram waiting for a writable UDP socket.
@@ -271,6 +282,36 @@ mod tests {
         let (_sock, local) = bind_udp(addr).unwrap();
         assert!(local.ip().is_ipv4());
         assert_ne!(local.port(), 0);
+    }
+
+    #[test]
+    fn unspecified_bind_matches_peer_family() {
+        let v4: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let bind4 = unspecified_bind_addr(v4);
+        assert!(bind4.ip().is_unspecified());
+        assert!(bind4.ip().is_ipv4());
+        assert_eq!(bind4.port(), 0);
+
+        let v6: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let bind6 = unspecified_bind_addr(v6);
+        assert!(bind6.ip().is_unspecified());
+        assert!(bind6.ip().is_ipv6());
+        assert_eq!(bind6.port(), 0);
+    }
+
+    #[test]
+    fn bind_udp_ephemeral_ipv6_when_available() {
+        let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+        match bind_udp(addr) {
+            Ok((_sock, local)) => {
+                assert!(local.ip().is_ipv6());
+                assert_ne!(local.port(), 0);
+            }
+            Err(e) => {
+                // Hosts without IPv6 still compile and run this test.
+                let _ = e;
+            }
+        }
     }
 
     #[test]
