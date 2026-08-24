@@ -28,5 +28,7 @@ rustls-pemfile = { workspace = true }
 mio = { workspace = true }
 bytes = "1"
 rcgen = { workspace = true }
+socket2 = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
