@@ -591,7 +591,9 @@ impl H3FrameHandler for H3RequestStream {
         if let Some(handler) = &mut self.handler {
             // Second HEADERS after the request handler exists = request
             // trailers (RFC 9114 §4.1).
-            if !crate::utils::http_binary_field_names_are_lowercase(&pairs) {
+            if !crate::utils::http_binary_field_names_are_lowercase(&pairs)
+                || !crate::utils::http_connection_specific_fields_are_valid(&pairs)
+            {
                 self.malformed = true;
                 return;
             }
@@ -603,8 +605,11 @@ impl H3FrameHandler for H3RequestStream {
             return;
         }
 
-        // RFC 9114 §4.2: uppercase field names → malformed.
-        if !crate::utils::http_binary_field_names_are_lowercase(&pairs) {
+        // RFC 9114 §4.2: uppercase field names and connection-specific fields
+        // → malformed.
+        if !crate::utils::http_binary_field_names_are_lowercase(&pairs)
+            || !crate::utils::http_connection_specific_fields_are_valid(&pairs)
+        {
             self.malformed = true;
             return;
         }
@@ -2008,6 +2013,68 @@ mod request_validation_tests {
         assert!(stream.malformed);
         assert!(stream.handler.is_none());
         assert_eq!(rec.lock().unwrap().opened, 0);
+    }
+
+    #[test]
+    fn connection_specific_header_is_malformed() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+            ("connection", "keep-alive"),
+        ]);
+        stream.headers_frame(&payload);
+        assert!(stream.malformed);
+        assert!(stream.handler.is_none());
+        assert_eq!(rec.lock().unwrap().opened, 0);
+    }
+
+    #[test]
+    fn te_trailers_accepted_other_te_values_rejected() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+            ("te", "trailers"),
+        ]);
+        stream.headers_frame(&payload);
+        assert!(!stream.malformed);
+        assert_eq!(rec.lock().unwrap().opened, 1);
+
+        let (mut stream2, rec2) = stream_with_recorder();
+        let payload2 = encode(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+            ("te", "gzip"),
+        ]);
+        stream2.headers_frame(&payload2);
+        assert!(stream2.malformed);
+        assert_eq!(rec2.lock().unwrap().opened, 0);
+    }
+
+    #[test]
+    fn connection_specific_field_in_request_trailers_is_malformed() {
+        let (mut stream, rec) = stream_with_recorder();
+        let first = encode(&[
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+        ]);
+        stream.headers_frame(&first);
+        assert_eq!(rec.lock().unwrap().opened, 1);
+
+        let trailers = encode(&[("transfer-encoding", "chunked")]);
+        stream.headers_frame(&trailers);
+
+        assert!(stream.malformed);
+        assert!(rec.lock().unwrap().trailers.is_empty());
     }
 
     /// An oversized decoded field section is a stream error of type

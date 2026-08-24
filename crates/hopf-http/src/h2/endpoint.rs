@@ -1864,16 +1864,6 @@ fn header_list_size(pairs: &[(String, String)]) -> usize {
     pairs.iter().map(|(name, value)| name.len() + value.len() + 32).sum()
 }
 
-/// Header fields whose framing role HTTP/2 carries out-of-band, so the field
-/// itself is forbidden on the wire (RFC 9113 §8.2.2).
-const CONNECTION_SPECIFIC_HEADERS: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-connection",
-    "transfer-encoding",
-    "upgrade",
-];
-
 /// Validate a decoded request header list against RFC 9113 §8.3.1
 /// (pseudo-header presence/ordering/uniqueness, including RFC 8441 Extended
 /// CONNECT — shared with HTTP/3, see [`crate::pseudo_headers`]) and §8.2.2
@@ -1885,16 +1875,8 @@ fn validate_request_header_block(pairs: &[(String, String)]) -> Result<(), ()> {
     }
     crate::pseudo_headers::validate_request_pseudo_headers(pairs)?;
 
-    for (name, value) in pairs {
-        if name.starts_with(':') {
-            continue;
-        }
-        if CONNECTION_SPECIFIC_HEADERS.iter().any(|h| name == *h) {
-            return Err(());
-        }
-        if name == "te" && !value.eq_ignore_ascii_case("trailers") {
-            return Err(());
-        }
+    if !crate::utils::http_connection_specific_fields_are_valid(pairs) {
+        return Err(());
     }
 
     Ok(())
