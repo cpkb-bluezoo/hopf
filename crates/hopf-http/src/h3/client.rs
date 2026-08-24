@@ -17,7 +17,7 @@ use crate::{
 };
 
 use super::endpoint::{decode_h3_datagram, H3PeerState, H3UniStream};
-use super::{frame, qpack, H3FrameHandler, H3Parser};
+use super::{frame, message_body, qpack, H3FrameHandler, H3Parser};
 
 /// Client-initiated stream factories queued to be opened on a live H3
 /// connection — FIFO: each [`QuicConnApi::open_bi`] call recorded by
@@ -336,6 +336,7 @@ struct H3ClientStream {
     /// Outbound request deferred until peer SETTINGS makes
     /// `peer_enable_connect_protocol` known (Extended CONNECT only).
     pending_outbound: Option<PendingOutbound>,
+    body_tracker: message_body::MessageBodyTracker,
 }
 
 impl H3ClientStream {
@@ -362,6 +363,7 @@ impl H3ClientStream {
             excessive_load: false,
             connection_error: None,
             pending_outbound: None,
+            body_tracker: message_body::MessageBodyTracker::default(),
         }
     }
 
@@ -509,6 +511,14 @@ impl H3ClientStream {
 
 impl H3FrameHandler for H3ClientStream {
     fn data_frame(&mut self, payload: &[u8]) {
+        if self
+            .body_tracker
+            .add_data(payload.len() as u64)
+            .is_err()
+        {
+            self.malformed = true;
+            return;
+        }
         let mut w = NullClientWriter;
         if let Some(handler) = &mut self.handler {
             if !payload.is_empty() {
@@ -571,24 +581,61 @@ impl H3FrameHandler for H3ClientStream {
         }
 
         let mut headers = Headers::new();
-        for (name, value) in pairs {
-            headers.add(name, value);
+        for (name, value) in &pairs {
+            headers.add(name.clone(), value.clone());
         }
         if let Some(handler) = &mut self.handler {
             // RFC 9114 §4.1 / RFC 9110 §15.2: a 1xx HEADERS is an interim
             // response — never terminal, never trailers. The real final
             // response HEADERS still follows on the same stream.
             if !self.response_headers_received && (100..200).contains(&headers.status_code()) {
+                if message_body::MessageBodyTracker::check_interim_no_content(&pairs).is_err()
+                    || self.body_tracker.finish_message().is_err()
+                {
+                    handler.request_failed(
+                        &mut w,
+                        &io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "malformed H3 response: interim response must not have content",
+                        ),
+                    );
+                    self.malformed = true;
+                    return;
+                }
                 handler.informational_response(&mut w, &headers);
                 return;
             }
             if self.response_headers_received {
+                if self.body_tracker.finish_message().is_err() {
+                    handler.request_failed(
+                        &mut w,
+                        &io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "malformed H3 response: Content-Length does not match DATA",
+                        ),
+                    );
+                    self.malformed = true;
+                    return;
+                }
                 if self.response_body_started {
                     handler.end_response_body(&mut w);
                     self.response_body_started = false;
                 }
                 handler.response_trailers(&mut w, &headers);
             } else {
+                let forbid =
+                    crate::utils::http_response_status_must_not_have_content(headers.status_code());
+                if self.body_tracker.begin_message(&pairs, forbid).is_err() {
+                    handler.request_failed(
+                        &mut w,
+                        &io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "malformed H3 response: invalid Content-Length",
+                        ),
+                    );
+                    self.malformed = true;
+                    return;
+                }
                 self.response_headers_received = true;
                 handler.response_headers(&mut w, &headers);
             }
@@ -665,7 +712,12 @@ impl ProtocolHandler for H3ClientStream {
         }
     }
 
-    fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
+    fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
+        if self.body_tracker.finish_message().is_err() {
+            self.malformed = true;
+            endpoint.abort(frame::H3_MESSAGE_ERROR);
+            return;
+        }
         self.finish_response();
     }
 
@@ -906,6 +958,42 @@ mod status_validation_tests {
         assert!(stream.malformed);
         assert_eq!(rec.lock().unwrap().failed, 1);
         assert!(rec.lock().unwrap().trailers.is_empty());
+    }
+
+    #[test]
+    fn content_length_must_match_response_data_on_fin() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[(":status", "200"), ("content-length", "5")]));
+        stream.data_frame(b"hello");
+        assert!(!stream.malformed);
+
+        let mut ep = RecordingEndpoint::default();
+        stream.disconnected(&mut ep);
+        assert!(!ep.closed);
+        assert_eq!(rec.lock().unwrap().status, Some(200));
+    }
+
+    #[test]
+    fn short_response_body_vs_content_length_aborts_stream() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[(":status", "200"), ("content-length", "5")]));
+        stream.data_frame(b"hi");
+
+        let mut ep = RecordingEndpoint::default();
+        stream.disconnected(&mut ep);
+        assert!(stream.malformed);
+        assert!(ep.closed);
+        assert_eq!(ep.abort_code, Some(frame::H3_MESSAGE_ERROR));
+        assert_eq!(rec.lock().unwrap().failed, 0);
+    }
+
+    #[test]
+    fn response_204_must_not_include_data() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[(":status", "204")]));
+        stream.data_frame(b"x");
+        assert!(stream.malformed);
+        assert_eq!(rec.lock().unwrap().status, Some(204));
     }
 
     /// A `100 Continue` / `103 Early Hints` HEADERS frame is surfaced via

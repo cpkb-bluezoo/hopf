@@ -154,6 +154,36 @@ pub fn parse_content_length(value: &str) -> Option<u64> {
     v.parse().ok()
 }
 
+/// RFC 9110 §6.3: a single consistent `Content-Length` from a field section.
+/// `None` when absent; `Err(())` when invalid or conflicting.
+pub fn parse_content_length_from_pairs(pairs: &[(String, String)]) -> Result<Option<u64>, ()> {
+    let mut seen = None;
+    for (name, value) in pairs {
+        if name.eq_ignore_ascii_case("content-length") {
+            let n = parse_content_length(value).ok_or(())?;
+            if let Some(prev) = seen {
+                if prev != n {
+                    return Err(());
+                }
+            } else {
+                seen = Some(n);
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// RFC 9110 §15.2 / §6.4: interim (1xx), 204, and 304 responses MUST NOT
+/// contain content.
+pub fn http_response_status_must_not_have_content(status: u16) -> bool {
+    (100..200).contains(&status) || status == 204 || status == 304
+}
+
+/// RFC 9110 §9.3.2: a HEAD request MUST NOT include a content body.
+pub fn http_request_method_must_not_have_content(method: &str) -> bool {
+    method.eq_ignore_ascii_case("HEAD")
+}
+
 /// Current time as a `Date` response header value: IMF-fixdate, always GMT
 /// (RFC 9110 §5.6.7, §6.6.1).
 pub fn http_date_now() -> String {
@@ -426,6 +456,22 @@ mod tests {
                 "expected {name} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn content_length_from_pairs_rejects_conflicting_values() {
+        assert_eq!(
+            parse_content_length_from_pairs(&[
+                ("content-length".into(), "5".into()),
+            ])
+            .unwrap(),
+            Some(5)
+        );
+        assert!(parse_content_length_from_pairs(&[
+            ("content-length".into(), "5".into()),
+            ("content-length".into(), "6".into()),
+        ])
+        .is_err());
     }
 
     #[test]
