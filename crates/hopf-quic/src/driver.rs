@@ -1608,13 +1608,11 @@ impl Driver {
                 if !stream.app_notified {
                     stream.app_notified = true;
                     // Keep the endpoint open so `disconnected` can still
-                    // `send()` (e.g. H3 flushing the response). Closing the
-                    // write half is signaled via `finish_write` below.
+                    // `send()` or defer work via timers / execute. Peer FIN
+                    // only closes the receive half; the local send half must
+                    // stay application-controlled (true QUIC half-close).
                     stream.handler.disconnected(&mut stream.endpoint);
                 }
-                // Ensure we FIN our send half after any bytes the app just
-                // queued (drive_streams will write then finish).
-                stream.queues.lock().unwrap().finish_write = true;
             }
             self.maybe_retire_stream(ch, id);
         }
@@ -2594,6 +2592,18 @@ mod tests {
     fn open_bi_queues_until_stream_credit_available() {
         use crate::config::{apply_server_transport_options, QuicTransportOptions};
         use std::sync::atomic::{AtomicBool, Ordering};
+        struct EchoCloseOnPeerFin;
+        impl ProtocolHandler for EchoCloseOnPeerFin {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                endpoint.send(data);
+                *data = &[];
+            }
+            fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
+                endpoint.close();
+            }
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+        }
 
         let (mut server_cfg, pem) =
             server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
@@ -2607,7 +2617,7 @@ mod tests {
         let server = listen_quic(QuicListenConfig::new(
             "127.0.0.1:0".parse().unwrap(),
             server_cfg,
-            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+            Arc::new(|| Box::new(EchoCloseOnPeerFin) as Box<dyn ProtocolHandler>),
         ))
         .unwrap();
 
@@ -2672,6 +2682,86 @@ mod tests {
         );
 
         client.shutdown();
+        server.shutdown();
+    }
+
+    /// Peer FIN must not force-close our send half: a handler should still be
+    /// able to send later (e.g. from a timer) after `disconnected()`.
+    #[test]
+    fn peer_fin_does_not_force_finish_write() {
+        struct DelayedReplyAfterPeerFin {
+            payload: &'static [u8],
+        }
+        impl ProtocolHandler for DelayedReplyAfterPeerFin {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                *data = &[];
+            }
+            fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
+                let handle = endpoint.handle();
+                let payload = self.payload.to_vec();
+                endpoint.schedule_timer(
+                    Duration::from_millis(20),
+                    Box::new(move || {
+                        handle.with_endpoint(move |ep| {
+                            ep.send(&payload);
+                            ep.close();
+                        });
+                    }),
+                );
+            }
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+        }
+
+        struct CollectReply {
+            got: Arc<StdMutex<Vec<u8>>>,
+        }
+        impl ProtocolHandler for CollectReply {
+            fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+                endpoint.send(b"request");
+                endpoint.close(); // send FIN immediately after request bytes
+            }
+            fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.got.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+                endpoint.close();
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+        }
+
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| {
+                Box::new(DelayedReplyAfterPeerFin {
+                    payload: b"late-reply",
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        let got = Arc::new(StdMutex::new(Vec::new()));
+        let got2 = Arc::clone(&got);
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || Box::new(CollectReply { got: Arc::clone(&got2) }) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        for _ in 0..200 {
+            if got.lock().unwrap().as_slice() == b"late-reply" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(got.lock().unwrap().as_slice(), b"late-reply");
         server.shutdown();
     }
 
