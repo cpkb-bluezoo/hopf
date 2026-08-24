@@ -664,6 +664,11 @@ impl H3FrameHandler for H3RequestStream {
         self.connection_error
             .get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
+    fn reserved_http2_frame(&mut self, _: u64) {
+        // RFC 9114 §7.2.8 — same on every stream type.
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+    }
     fn frame_error(&mut self, _: &str) {}
 }
 
@@ -964,6 +969,13 @@ impl H3FrameHandler for H3UniStream {
         // RFC 9114 §4.2.2: absent → unlimited.
         let mut max_field_section_size: Option<u64> = None;
         for (id, val) in frame::parse_settings(payload) {
+            // RFC 9114 §7.2.4 / §11.2.2: reserved HTTP/2 setting IDs
+            // (including 0x00) MUST yield H3_SETTINGS_ERROR.
+            if frame::is_reserved_http2_setting_id(id) {
+                self.connection_error
+                    .get_or_insert(frame::H3_SETTINGS_ERROR);
+                return;
+            }
             if id == frame::SETTINGS_ENABLE_CONNECT_PROTOCOL {
                 enable_connect_protocol = Some(val != 0);
             } else if id == datagram::SETTINGS_H3_DATAGRAM {
@@ -1118,6 +1130,12 @@ impl H3FrameHandler for H3UniStream {
         if !self.settings_received {
             self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
         }
+    }
+    fn reserved_http2_frame(&mut self, _frame_type: u64) {
+        // RFC 9114 §7.2.8: PRIORITY/PING/WINDOW_UPDATE/CONTINUATION leftovers
+        // are a connection error, not ignorable GREASE.
+        self.connection_error
+            .get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
     fn frame_error(&mut self, _message: &str) {
         self.connection_error.get_or_insert(frame::H3_FRAME_ERROR);
@@ -1474,6 +1492,78 @@ mod uni_stream_tests {
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    /// Reserved HTTP/2 frame types on the control stream are
+    /// `H3_FRAME_UNEXPECTED` (RFC 9114 §7.2.8), not ignorable GREASE.
+    #[test]
+    fn reserved_http2_frame_on_control_stream_is_frame_unexpected() {
+        for ty in [0x02u64, 0x06, 0x08, 0x09] {
+            let state = shared_state();
+            let qpack = shared_qpack();
+            let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+            let mut ep = RecordingEndpoint::default();
+            open_control_with_settings(&mut uni, &mut ep);
+
+            let mut frame_bytes = Vec::new();
+            frame::write_frame(&mut frame_bytes, ty, b"");
+            let mut data: &[u8] = &frame_bytes;
+            uni.receive(&mut ep, &mut data);
+
+            assert!(
+                ep.closed,
+                "reserved HTTP/2 frame type {ty:#x} must close the connection"
+            );
+            assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+        }
+    }
+
+    /// GREASE frame types remain ignorable after SETTINGS (RFC 9114 §9).
+    #[test]
+    fn grease_frame_after_settings_is_ignored() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+        open_control_with_settings(&mut uni, &mut ep);
+
+        // 0x1f * 0 + 0x21 = 0x21 — canonical GREASE type.
+        let mut grease = Vec::new();
+        frame::write_frame(&mut grease, 0x21, b"ignored");
+        let mut data: &[u8] = &grease;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(!ep.closed);
+        assert_eq!(ep.close_connection_code, None);
+    }
+
+    /// Reserved HTTP/2 SETTINGS identifiers are `H3_SETTINGS_ERROR`
+    /// (RFC 9114 §7.2.4 / §11.2.2).
+    #[test]
+    fn reserved_http2_settings_id_is_settings_error() {
+        for id in [0x00u64, 0x02, 0x03, 0x04, 0x05] {
+            let state = shared_state();
+            let qpack = shared_qpack();
+            let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+            let mut ep = RecordingEndpoint::default();
+
+            let mut type_byte: &[u8] = &[0x00];
+            uni.receive(&mut ep, &mut type_byte);
+
+            let mut payload = Vec::new();
+            super::super::varint::encode(&mut payload, id);
+            super::super::varint::encode(&mut payload, 1);
+            let mut frame_bytes = Vec::new();
+            frame::write_frame(&mut frame_bytes, frame::SETTINGS, &payload);
+            let mut data: &[u8] = &frame_bytes;
+            uni.receive(&mut ep, &mut data);
+
+            assert!(
+                ep.closed,
+                "reserved HTTP/2 SETTINGS id {id:#x} must close the connection"
+            );
+            assert_eq!(ep.close_connection_code, Some(frame::H3_SETTINGS_ERROR));
+        }
     }
 
     /// GOAWAY on the control stream is parsed and stored in the shared
