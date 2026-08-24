@@ -28,29 +28,48 @@ pub(crate) fn encode(out: &mut Vec<u8>, value: u64, prefix_bits: u8, first_byte_
 /// for an already-fully-buffered block, or "wait for more bytes" for a
 /// streaming instruction reader).
 pub(crate) fn decode(input: &[u8], prefix_bits: u8) -> Option<(u64, usize)> {
+    match decode_status(input, prefix_bits) {
+        DecodeStatus::Complete { value, used } => Some((value, used)),
+        DecodeStatus::NeedMore | DecodeStatus::Invalid => None,
+    }
+}
+
+/// Like [`decode`], but distinguishes incomplete input from a malformed
+/// integer (RFC 9204 §4.1.1 — overlong continuation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodeStatus {
+    NeedMore,
+    Complete { value: u64, used: usize },
+    Invalid,
+}
+
+pub(crate) fn decode_status(input: &[u8], prefix_bits: u8) -> DecodeStatus {
     let mask = if prefix_bits >= 8 {
         u8::MAX
     } else {
         (1u8 << prefix_bits) - 1
     };
-    let mut value = u64::from(*input.first()? & mask);
+    let Some(&first) = input.first() else {
+        return DecodeStatus::NeedMore;
+    };
+    let mut value = u64::from(first & mask);
     if value < u64::from(mask) {
-        return Some((value, 1));
+        return DecodeStatus::Complete { value, used: 1 };
     }
     let mut used = 1;
     let mut shift = 0;
     loop {
-        let byte = *input.get(used)?;
+        let Some(&byte) = input.get(used) else {
+            return DecodeStatus::NeedMore;
+        };
         used += 1;
         value += u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
-            return Some((value, used));
+            return DecodeStatus::Complete { value, used };
         }
         shift += 7;
         if shift > 56 {
-            // Absurdly long continuation — treat as malformed by refusing
-            // to grow further; callers see this as "never completes".
-            return None;
+            return DecodeStatus::Invalid;
         }
     }
 }
@@ -80,5 +99,12 @@ mod tests {
         let mut out = Vec::new();
         encode(&mut out, 1337, 5, 0);
         assert_eq!(decode(&out[..1], 5), None);
+    }
+
+    #[test]
+    fn overlong_continuation_is_invalid() {
+        let mut out = vec![0x1f]; // five-bit prefix max, forces continuation
+        out.extend(std::iter::repeat_n(0xff, 12));
+        assert_eq!(decode_status(&out, 5), DecodeStatus::Invalid);
     }
 }

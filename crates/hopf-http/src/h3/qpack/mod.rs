@@ -135,22 +135,28 @@ impl H3Qpack {
 
     /// Feed newly-received bytes from the peer's decoder stream, applying
     /// every complete instruction and leaving any trailing partial one in
-    /// `buf` for next time. Decoder-stream instructions are pure integers
-    /// (RFC 9204 §4.4) — there's no malformed-content case to report here.
-    pub(crate) fn feed_decoder_stream(&self, buf: &mut Vec<u8>) {
-        while let Some((instr, used)) = decoder_stream::parse_next(buf) {
-            buf.drain(..used);
-            let mut enc = self.encoder.lock().unwrap();
-            match instr {
-                decoder_stream::DecoderInstruction::SectionAcknowledgment { stream_id } => {
-                    enc.on_section_acknowledgment(stream_id);
+    /// `buf` for next time. `Err` means a malformed instruction — the
+    /// caller should close the connection with `QPACK_DECODER_STREAM_ERROR`
+    /// (RFC 9204 §4.4).
+    pub(crate) fn feed_decoder_stream(&self, buf: &mut Vec<u8>) -> Result<(), ()> {
+        loop {
+            match decoder_stream::parse_next(buf)? {
+                Some((instr, used)) => {
+                    buf.drain(..used);
+                    let mut enc = self.encoder.lock().unwrap();
+                    match instr {
+                        decoder_stream::DecoderInstruction::SectionAcknowledgment { stream_id } => {
+                            enc.on_section_acknowledgment(stream_id)?;
+                        }
+                        decoder_stream::DecoderInstruction::StreamCancellation { stream_id } => {
+                            enc.on_stream_cancellation(stream_id);
+                        }
+                        decoder_stream::DecoderInstruction::InsertCountIncrement { increment } => {
+                            enc.on_insert_count_increment(increment)?;
+                        }
+                    }
                 }
-                decoder_stream::DecoderInstruction::StreamCancellation { stream_id } => {
-                    enc.on_stream_cancellation(stream_id);
-                }
-                decoder_stream::DecoderInstruction::InsertCountIncrement { increment } => {
-                    enc.on_insert_count_increment(increment);
-                }
+                None => return Ok(()),
             }
         }
     }
@@ -226,7 +232,7 @@ mod h3qpack_tests {
         // Server's Section Acknowledgment flows back to the client's encoder.
         let (_, mut server_dec_out) = server.take_pending();
         assert!(!server_dec_out.is_empty(), "expected a section acknowledgment");
-        client.feed_decoder_stream(&mut server_dec_out);
+        client.feed_decoder_stream(&mut server_dec_out).unwrap();
 
         // Second request: "x-custom: widget" is now known-received, so the
         // client references it by index instead of re-sending it.
@@ -257,6 +263,22 @@ mod h3qpack_tests {
         // Peer advertises more than our ceiling — clamp.
         q.apply_peer_max_table_capacity(u64::from(u32::MAX));
         assert_eq!(q.encoder_capacity_for_test(), MAX_TABLE_CAPACITY);
+    }
+
+    #[test]
+    fn feed_decoder_stream_rejects_zero_insert_count_increment() {
+        let q = H3Qpack::new();
+        let mut buf = Vec::new();
+        super::decoder_stream::write_insert_count_increment(&mut buf, 0);
+        assert!(q.feed_decoder_stream(&mut buf).is_err());
+    }
+
+    #[test]
+    fn feed_decoder_stream_rejects_increment_beyond_sent_inserts() {
+        let q = H3Qpack::new();
+        let mut buf = Vec::new();
+        super::decoder_stream::write_insert_count_increment(&mut buf, 1);
+        assert!(q.feed_decoder_stream(&mut buf).is_err());
     }
 }
 

@@ -31,19 +31,39 @@ pub(crate) fn write_insert_count_increment(out: &mut Vec<u8>, increment: u64) {
 }
 
 /// Parse the next complete instruction from the start of `input`. Returns
-/// `None` if `input` doesn't yet hold a full instruction (wait for more
-/// bytes from the stream).
-pub(crate) fn parse_next(input: &[u8]) -> Option<(DecoderInstruction, usize)> {
-    let &first = input.first()?;
+/// `Ok(None)` if `input` doesn't yet hold a full instruction (wait for
+/// more bytes from the stream). `Err(())` means a malformed instruction.
+pub(crate) fn parse_next(input: &[u8]) -> Result<Option<(DecoderInstruction, usize)>, ()> {
+    let Some(&first) = input.first() else {
+        return Ok(None);
+    };
     if first & 0x80 != 0 {
-        let (stream_id, used) = prefix_int::decode(input, 7)?;
-        Some((DecoderInstruction::SectionAcknowledgment { stream_id }, used))
+        match prefix_int::decode_status(input, 7) {
+            prefix_int::DecodeStatus::NeedMore => Ok(None),
+            prefix_int::DecodeStatus::Invalid => Err(()),
+            prefix_int::DecodeStatus::Complete { value: stream_id, used } => Ok(Some((
+                DecoderInstruction::SectionAcknowledgment { stream_id },
+                used,
+            ))),
+        }
     } else if first & 0x40 != 0 {
-        let (stream_id, used) = prefix_int::decode(input, 6)?;
-        Some((DecoderInstruction::StreamCancellation { stream_id }, used))
+        match prefix_int::decode_status(input, 6) {
+            prefix_int::DecodeStatus::NeedMore => Ok(None),
+            prefix_int::DecodeStatus::Invalid => Err(()),
+            prefix_int::DecodeStatus::Complete { value: stream_id, used } => Ok(Some((
+                DecoderInstruction::StreamCancellation { stream_id },
+                used,
+            ))),
+        }
     } else {
-        let (increment, used) = prefix_int::decode(input, 6)?;
-        Some((DecoderInstruction::InsertCountIncrement { increment }, used))
+        match prefix_int::decode_status(input, 6) {
+            prefix_int::DecodeStatus::NeedMore => Ok(None),
+            prefix_int::DecodeStatus::Invalid => Err(()),
+            prefix_int::DecodeStatus::Complete { value: increment, used } => Ok(Some((
+                DecoderInstruction::InsertCountIncrement { increment },
+                used,
+            ))),
+        }
     }
 }
 
@@ -56,7 +76,7 @@ mod tests {
         let mut out = Vec::new();
         write_section_acknowledgment(&mut out, 4);
         assert_eq!(
-            parse_next(&out),
+            parse_next(&out).unwrap(),
             Some((DecoderInstruction::SectionAcknowledgment { stream_id: 4 }, out.len()))
         );
     }
@@ -66,7 +86,7 @@ mod tests {
         let mut out = Vec::new();
         write_stream_cancellation(&mut out, 8);
         assert_eq!(
-            parse_next(&out),
+            parse_next(&out).unwrap(),
             Some((DecoderInstruction::StreamCancellation { stream_id: 8 }, out.len()))
         );
     }
@@ -76,7 +96,7 @@ mod tests {
         let mut out = Vec::new();
         write_insert_count_increment(&mut out, 3);
         assert_eq!(
-            parse_next(&out),
+            parse_next(&out).unwrap(),
             Some((DecoderInstruction::InsertCountIncrement { increment: 3 }, out.len()))
         );
     }
@@ -86,7 +106,7 @@ mod tests {
         let mut out = Vec::new();
         write_section_acknowledgment(&mut out, 100_000);
         assert_eq!(
-            parse_next(&out),
+            parse_next(&out).unwrap(),
             Some((DecoderInstruction::SectionAcknowledgment { stream_id: 100_000 }, out.len()))
         );
     }
@@ -96,7 +116,11 @@ mod tests {
         let mut out = Vec::new();
         write_section_acknowledgment(&mut out, 100_000);
         for cut in 1..out.len() {
-            assert_eq!(parse_next(&out[..cut]), None, "cut at {cut} should be incomplete");
+            assert_eq!(
+                parse_next(&out[..cut]).unwrap(),
+                None,
+                "cut at {cut} should be incomplete"
+            );
         }
     }
 
@@ -105,10 +129,17 @@ mod tests {
         let mut out = Vec::new();
         write_insert_count_increment(&mut out, 5);
         write_stream_cancellation(&mut out, 2);
-        let (first, used1) = parse_next(&out).unwrap();
+        let (first, used1) = parse_next(&out).unwrap().unwrap();
         assert_eq!(first, DecoderInstruction::InsertCountIncrement { increment: 5 });
-        let (second, used2) = parse_next(&out[used1..]).unwrap();
+        let (second, used2) = parse_next(&out[used1..]).unwrap().unwrap();
         assert_eq!(second, DecoderInstruction::StreamCancellation { stream_id: 2 });
         assert_eq!(used1 + used2, out.len());
+    }
+
+    #[test]
+    fn overlong_prefix_integer_is_malformed() {
+        let mut out = vec![0x80 | 0x7f];
+        out.extend(std::iter::repeat_n(0xff, 12));
+        assert!(parse_next(&out).is_err());
     }
 }
