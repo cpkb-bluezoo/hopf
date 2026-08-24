@@ -552,14 +552,17 @@ impl H3FrameHandler for H3ClientStream {
             return;
         }
 
-        // RFC 9114 §4.2: uppercase field names → malformed.
-        if !crate::utils::http_binary_field_names_are_lowercase(&pairs) {
+        // RFC 9114 §4.2: uppercase field names and connection-specific fields
+        // → malformed.
+        if !crate::utils::http_binary_field_names_are_lowercase(&pairs)
+            || !crate::utils::http_connection_specific_fields_are_valid(&pairs)
+        {
             if let Some(handler) = &mut self.handler {
                 handler.request_failed(
                     &mut w,
                     &io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "malformed H3 response: uppercase field name",
+                        "malformed H3 response: invalid field name or value",
                     ),
                 );
             }
@@ -883,6 +886,26 @@ mod status_validation_tests {
 
         assert!(!stream.malformed, "trailers have no :status and must not be validated as one");
         assert_eq!(rec.lock().unwrap().trailers, vec![("grpc-status".to_string(), "0".to_string())]);
+    }
+
+    #[test]
+    fn connection_specific_header_in_response_is_malformed() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[(":status", "200"), ("connection", "close")]);
+        stream.headers_frame(&payload);
+        assert!(stream.malformed);
+        assert_eq!(rec.lock().unwrap().failed, 1);
+        assert_eq!(rec.lock().unwrap().status, None);
+    }
+
+    #[test]
+    fn connection_specific_field_in_response_trailers_is_malformed() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[(":status", "200")]));
+        stream.headers_frame(&encode(&[("transfer-encoding", "chunked")]));
+        assert!(stream.malformed);
+        assert_eq!(rec.lock().unwrap().failed, 1);
+        assert!(rec.lock().unwrap().trailers.is_empty());
     }
 
     /// A `100 Continue` / `103 Early Hints` HEADERS frame is surfaced via

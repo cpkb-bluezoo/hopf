@@ -82,6 +82,34 @@ pub fn http_binary_field_names_are_lowercase(pairs: &[(String, String)]) -> bool
         .all(|(name, _)| name.bytes().all(|b| !b.is_ascii_uppercase()))
 }
 
+/// Header fields whose framing role HTTP/2 and HTTP/3 carry out-of-band, so
+/// the field itself is forbidden on the wire (RFC 9113 §8.2.2 / RFC 9114 §4.2).
+const CONNECTION_SPECIFIC_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// RFC 9113 §8.2.2 / RFC 9114 §4.2: a message containing a connection-specific
+/// field, or a `TE` field whose value is not `"trailers"`, is malformed.
+/// Pseudo-header fields are skipped (validated separately).
+pub fn http_connection_specific_fields_are_valid(pairs: &[(String, String)]) -> bool {
+    for (name, value) in pairs {
+        if name.starts_with(':') {
+            continue;
+        }
+        if CONNECTION_SPECIFIC_HEADERS.iter().any(|h| name == *h) {
+            return false;
+        }
+        if name == "te" && !value.eq_ignore_ascii_case("trailers") {
+            return false;
+        }
+    }
+    true
+}
+
 /// Header field-value: reject CTL bytes (RFC 9112 §5.5 `field-content`
 /// grammar) — HTAB is the only permitted control character; SP, VCHAR
 /// (0x21-0x7E), and obs-text (0x80-0xFF) are otherwise allowed.
@@ -372,6 +400,32 @@ mod tests {
             (":method".into(), "GET".into()),
             ("Content-Type".into(), "text/plain".into()),
         ]));
+    }
+
+    #[test]
+    fn connection_specific_fields_and_te() {
+        let ok = &[
+            (":method".into(), "GET".into()),
+            ("te".into(), "trailers".into()),
+        ];
+        assert!(http_connection_specific_fields_are_valid(ok));
+
+        for (name, value) in [
+            ("connection", "keep-alive"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "h2c"),
+            ("te", "gzip"),
+        ] {
+            assert!(
+                !http_connection_specific_fields_are_valid(&[
+                    (":method".into(), "GET".into()),
+                    (name.into(), value.into()),
+                ]),
+                "expected {name} to be rejected"
+            );
+        }
     }
 
     #[test]
