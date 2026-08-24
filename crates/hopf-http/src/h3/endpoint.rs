@@ -1263,7 +1263,10 @@ impl ProtocolHandler for H3UniStream {
             }
             UniKind::QpackDecoderStream => {
                 self.qpack_buf.extend_from_slice(data);
-                self.qpack.feed_decoder_stream(&mut self.qpack_buf);
+                if self.qpack.feed_decoder_stream(&mut self.qpack_buf).is_err() {
+                    self.connection_error
+                        .get_or_insert(frame::QPACK_DECODER_STREAM_ERROR);
+                }
             }
             _ => {}
         }
@@ -1438,6 +1441,29 @@ mod uni_stream_tests {
         decoder.receive(&mut ep2, &mut d2);
         assert!(!ep2.closed);
         assert!(state.lock().unwrap().qpack_decoder_seen);
+    }
+
+    /// A malformed decoder-stream instruction closes the connection with
+    /// QPACK_DECODER_STREAM_ERROR (RFC 9204 §4.4).
+    #[test]
+    fn malformed_decoder_stream_instruction_closes_connection() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut type_byte: &[u8] = &[0x03];
+        uni.receive(&mut ep, &mut type_byte);
+
+        let bad = vec![0x00u8]; // Insert Count Increment with Increment=0
+        let mut data: &[u8] = &bad;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(
+            ep.close_connection_code,
+            Some(frame::QPACK_DECODER_STREAM_ERROR)
+        );
     }
 
     /// A second control stream from the same peer is a protocol violation

@@ -247,7 +247,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            super::super::decoder_stream::parse_next(&ack),
+            super::super::decoder_stream::parse_next(&ack).unwrap(),
             Some((super::super::decoder_stream::DecoderInstruction::InsertCountIncrement { increment: 1 }, ack.len()))
         );
         assert_eq!(dec.table.get(0), Some(("x-custom", "widget")));

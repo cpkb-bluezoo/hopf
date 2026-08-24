@@ -22,6 +22,13 @@ pub(crate) struct Encoder {
     /// Entries the peer decoder has acknowledged processing through
     /// (RFC 9204 §2.1.4) — our non-blocking policy's Base/RIC value.
     known_received_count: u64,
+    /// Dynamic-table insertions and duplications sent on the encoder stream
+    /// (RFC 9204 §4.4.3 — peer increments must not exceed this).
+    sent_insert_count: u64,
+    /// Streams whose last encoded field section had a non-zero Required
+    /// Insert Count and are still awaiting a Section Acknowledgment
+    /// (RFC 9204 §4.4.1).
+    pending_section_ack: HashMap<u64, u64>,
     /// Per-outstanding (not yet acknowledged/cancelled) stream: the
     /// Required Insert Count it was encoded with, and the absolute indices
     /// it references, so [`Self::on_section_acknowledgment`] /
@@ -34,6 +41,8 @@ impl Encoder {
         Self {
             table: DynamicTable::new(capacity),
             known_received_count: 0,
+            sent_insert_count: 0,
+            pending_section_ack: HashMap::new(),
             outstanding: HashMap::new(),
         }
     }
@@ -101,6 +110,7 @@ impl Encoder {
                         value.as_bytes(),
                     );
                 }
+                self.sent_insert_count += 1;
             }
 
             if let Some(static_index) = static_table::find_name(name) {
@@ -124,6 +134,9 @@ impl Encoder {
         if !referenced.is_empty() {
             self.outstanding.insert(stream_id, (base, referenced));
         }
+        if base > 0 {
+            self.pending_section_ack.insert(stream_id, base);
+        }
         (section, instructions)
     }
 
@@ -131,18 +144,22 @@ impl Encoder {
     /// field section: release its table references and advance Known
     /// Received Count if this section depended on more insertions than we
     /// already knew were received.
-    pub(crate) fn on_section_acknowledgment(&mut self, stream_id: u64) {
+    pub(crate) fn on_section_acknowledgment(&mut self, stream_id: u64) -> Result<(), ()> {
+        // Duplicate or spurious Section Acknowledgment → decoder stream error.
+        self.pending_section_ack.remove(&stream_id).ok_or(())?;
         if let Some((ric, refs)) = self.outstanding.remove(&stream_id) {
             for abs in refs {
                 self.table.release_ref(abs);
             }
             self.known_received_count = self.known_received_count.max(ric);
         }
+        Ok(())
     }
 
     /// RFC 9204 §4.4.2 — `stream_id` was reset/abandoned: release its
     /// table references without advancing Known Received Count.
     pub(crate) fn on_stream_cancellation(&mut self, stream_id: u64) {
+        self.pending_section_ack.remove(&stream_id);
         if let Some((_, refs)) = self.outstanding.remove(&stream_id) {
             for abs in refs {
                 self.table.release_ref(abs);
@@ -151,8 +168,19 @@ impl Encoder {
     }
 
     /// RFC 9204 §4.4.3 — advance Known Received Count directly.
-    pub(crate) fn on_insert_count_increment(&mut self, increment: u64) {
-        self.known_received_count += increment;
+    pub(crate) fn on_insert_count_increment(&mut self, increment: u64) -> Result<(), ()> {
+        if increment == 0 {
+            return Err(());
+        }
+        let new_count = self
+            .known_received_count
+            .checked_add(increment)
+            .ok_or(())?;
+        if new_count > self.sent_insert_count {
+            return Err(());
+        }
+        self.known_received_count = new_count;
+        Ok(())
     }
 }
 
@@ -181,7 +209,7 @@ mod tests {
             for a in split_decoder_acks(&ack) {
                 match a {
                     super::super::decoder_stream::DecoderInstruction::InsertCountIncrement { increment } => {
-                        enc.on_insert_count_increment(increment);
+                        enc.on_insert_count_increment(increment).unwrap();
                     }
                     _ => unreachable!(),
                 }
@@ -190,7 +218,7 @@ mod tests {
         let (fields1, ack1) = dec.decode(0, &section1).unwrap();
         assert_eq!(fields1, vec![("x-custom".into(), "widget".into()), (":status".into(), "200".into())]);
         if !ack1.is_empty() {
-            enc.on_section_acknowledgment(0);
+            enc.on_section_acknowledgment(0).unwrap();
         }
 
         // Second section: now the dynamic entry from the first section is
@@ -217,12 +245,38 @@ mod tests {
     fn split_decoder_acks(mut input: &[u8]) -> Vec<super::super::decoder_stream::DecoderInstruction> {
         let mut out = Vec::new();
         while !input.is_empty() {
-            let Some((instr, used)) = super::super::decoder_stream::parse_next(input) else {
+            let Some((instr, used)) = super::super::decoder_stream::parse_next(input).unwrap() else {
                 break;
             };
             out.push(instr);
             input = &input[used..];
         }
         out
+    }
+
+    #[test]
+    fn zero_insert_count_increment_is_rejected() {
+        let mut enc = Encoder::new(4096);
+        assert!(enc.on_insert_count_increment(0).is_err());
+    }
+
+    #[test]
+    fn insert_count_increment_beyond_sent_inserts_is_rejected() {
+        let mut enc = Encoder::new(4096);
+        assert!(enc.on_insert_count_increment(1).is_err());
+    }
+
+    #[test]
+    fn duplicate_section_acknowledgment_is_rejected() {
+        let mut enc = Encoder::new(4096);
+        enc.pending_section_ack.insert(4, 1);
+        assert!(enc.on_section_acknowledgment(4).is_ok());
+        assert!(enc.on_section_acknowledgment(4).is_err());
+    }
+
+    #[test]
+    fn spurious_section_acknowledgment_is_rejected() {
+        let mut enc = Encoder::new(4096);
+        assert!(enc.on_section_acknowledgment(0).is_err());
     }
 }
