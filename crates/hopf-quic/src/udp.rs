@@ -7,7 +7,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use mio::net::UdpSocket;
-use quinn_proto::Transmit;
+use quinn_proto::{EcnCodepoint, Transmit};
 use socket2::{Domain, Protocol, Socket, Type};
 
 /// Bind a non-blocking UDP socket for QUIC, applying RFC 9000 §14 path-MTU
@@ -23,6 +23,7 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<(UdpSocket, SocketAddr)> {
     socket.bind(&addr.into())?;
     let std_sock: std::net::UdpSocket = socket.into();
     let local_addr = std_sock.local_addr()?;
+    enable_recv_ecn(&std_sock);
     Ok((UdpSocket::from_std(std_sock), local_addr))
 }
 
@@ -42,6 +43,8 @@ pub fn unspecified_bind_addr(peer: SocketAddr) -> SocketAddr {
 pub(crate) struct PendingUdpSend {
     pub destination: SocketAddr,
     pub data: Vec<u8>,
+    pub ecn: Option<u8>,
+    pub segment_size: Option<usize>,
 }
 
 impl PendingUdpSend {
@@ -49,6 +52,8 @@ impl PendingUdpSend {
         Self {
             destination: transmit.destination,
             data: data.to_vec(),
+            ecn: transmit.ecn.map(|c| c as u8),
+            segment_size: transmit.segment_size,
         }
     }
 }
@@ -92,6 +97,280 @@ impl PendingUdpSends {
             }
         }
         Ok(())
+    }
+}
+
+/// Max UDP datagrams quinn-proto may coalesce into one `Transmit` for GSO.
+pub(crate) fn max_gso_segments() -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        64
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        1
+    }
+}
+
+/// Slice a transmit buffer into UDP payloads honouring `segment_size`.
+pub(crate) fn udp_payloads<'a>(buf: &'a [u8], segment_size: Option<usize>) -> Vec<&'a [u8]> {
+    match segment_size {
+        Some(ss) if ss > 0 && buf.len() > ss => buf.chunks(ss).collect(),
+        _ => vec![buf],
+    }
+}
+
+/// Send one quinn [`Transmit`] (ECN TOS + GSO `segment_size` when the OS
+/// supports them). Falls back to per-datagram `send_to` when GSO/ECN cmsgs
+/// are unavailable.
+pub(crate) fn send_transmit(socket: &UdpSocket, transmit: &Transmit, buf: &[u8]) -> io::Result<()> {
+    send_udp(
+        socket,
+        transmit.destination,
+        buf,
+        transmit.ecn,
+        transmit.segment_size,
+    )
+}
+
+pub(crate) fn send_pending(socket: &UdpSocket, pending: &PendingUdpSend) -> io::Result<()> {
+    send_udp(
+        socket,
+        pending.destination,
+        &pending.data,
+        pending.ecn.and_then(EcnCodepoint::from_bits),
+        pending.segment_size,
+    )
+}
+
+fn send_udp(
+    socket: &UdpSocket,
+    dest: SocketAddr,
+    buf: &[u8],
+    ecn: Option<EcnCodepoint>,
+    segment_size: Option<usize>,
+) -> io::Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        match send_msg(socket, dest, buf, ecn, segment_size) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(e),
+            Err(_) => {}
+        }
+    }
+    for payload in udp_payloads(buf, segment_size) {
+        match socket.send_to(payload, dest) {
+            Ok(n) if n == payload.len() => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short UDP send",
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Receive one datagram, recovering ECN when `IP_RECVTOS` / `IPV6_RECVTCLASS`
+/// is enabled.
+pub(crate) fn recv_one(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, Option<EcnCodepoint>)> {
+    #[cfg(unix)]
+    {
+        match recv_msg(socket, buf) {
+            Ok(x) => return Ok(x),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(e),
+            Err(_) => {}
+        }
+    }
+    let (n, remote) = socket.recv_from(buf)?;
+    Ok((n, remote, None))
+}
+
+fn enable_recv_ecn(sock: &std::net::UdpSocket) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let one: libc::c_int = 1;
+        match sock.local_addr() {
+            Ok(SocketAddr::V4(_)) => {
+                let _ = setsockopt_i32(fd, libc::IPPROTO_IP, libc::IP_RECVTOS, one);
+            }
+            Ok(SocketAddr::V6(_)) => {
+                let _ = setsockopt_i32(fd, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, one);
+            }
+            Err(_) => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sock;
+    }
+}
+
+#[cfg(unix)]
+fn send_msg(
+    socket: &UdpSocket,
+    dest: SocketAddr,
+    buf: &[u8],
+    ecn: Option<EcnCodepoint>,
+    segment_size: Option<usize>,
+) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let sock_addr = socket2::SockAddr::from(dest);
+    let mut iov = libc::iovec {
+        iov_base: buf.as_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+
+    let gso = cfg!(target_os = "linux")
+        && segment_size.map(|ss| ss > 0 && buf.len() > ss).unwrap_or(false);
+    let mut cmsg_buf = [0u8; 128];
+    let mut hdr = libc::msghdr {
+        msg_name: sock_addr.as_ptr() as *mut libc::c_void,
+        msg_namelen: sock_addr.len(),
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+    };
+
+    if ecn.is_some() || gso {
+        hdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        hdr.msg_controllen = cmsg_buf.len() as _;
+        let mut cursor = unsafe { libc::CMSG_FIRSTHDR(&hdr) };
+        let mut used = 0usize;
+        if let Some(code) = ecn {
+            let tos = code as libc::c_int;
+            let (level, opt) = match dest {
+                SocketAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_TOS),
+                SocketAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+            };
+            unsafe {
+                if cursor.is_null() {
+                    return Err(io::Error::other("cmsg space exhausted"));
+                }
+                (*cursor).cmsg_level = level;
+                (*cursor).cmsg_type = opt;
+                (*cursor).cmsg_len =
+                    libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as _) as _;
+                std::ptr::write(libc::CMSG_DATA(cursor) as *mut libc::c_int, tos);
+                used += libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as _) as usize;
+                cursor = libc::CMSG_NXTHDR(&hdr, cursor);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if gso {
+            let ss = segment_size.unwrap() as u16;
+            unsafe {
+                if cursor.is_null() {
+                    return Err(io::Error::other("cmsg space exhausted"));
+                }
+                (*cursor).cmsg_level = libc::SOL_UDP;
+                (*cursor).cmsg_type = libc::UDP_SEGMENT;
+                (*cursor).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as _) as _;
+                std::ptr::write(libc::CMSG_DATA(cursor) as *mut u16, ss);
+                used += libc::CMSG_SPACE(std::mem::size_of::<u16>() as _) as usize;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = cursor;
+        }
+        hdr.msg_controllen = used as _;
+    }
+
+    let n = unsafe { libc::sendmsg(socket.as_raw_fd(), &hdr, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if n as usize != buf.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "short UDP sendmsg",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn recv_msg(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, Option<EcnCodepoint>)> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let mut cmsg_buf = [0u8; 128];
+    let mut hdr = libc::msghdr {
+        msg_name: &mut name as *mut _ as *mut libc::c_void,
+        msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as _,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+        msg_controllen: cmsg_buf.len() as _,
+        msg_flags: 0,
+    };
+    let n = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut hdr, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let remote = sockaddr_storage_to_socket_addr(&name, hdr.msg_namelen)?;
+
+    let mut ecn = None;
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&hdr);
+        while !cmsg.is_null() {
+            let level = (*cmsg).cmsg_level;
+            let ty = (*cmsg).cmsg_type;
+            if (level == libc::IPPROTO_IP && (ty == libc::IP_TOS || ty == libc::IP_RECVTOS))
+                || (level == libc::IPPROTO_IPV6 && ty == libc::IPV6_TCLASS)
+            {
+                let bits = *libc::CMSG_DATA(cmsg);
+                ecn = EcnCodepoint::from_bits(bits);
+            }
+            cmsg = libc::CMSG_NXTHDR(&hdr, cmsg);
+        }
+    }
+    Ok((n as usize, remote, ecn))
+}
+
+#[cfg(unix)]
+fn sockaddr_storage_to_socket_addr(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> io::Result<SocketAddr> {
+    let _ = len;
+    let family = storage.ss_family as i32;
+    if family == libc::AF_INET {
+        let v4 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+        let ip = Ipv4Addr::from(u32::from_be(v4.sin_addr.s_addr));
+        let port = u16::from_be(v4.sin_port);
+        Ok(SocketAddr::from((ip, port)))
+    } else if family == libc::AF_INET6 {
+        let v6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+        let ip = Ipv6Addr::from(v6.sin6_addr.s6_addr);
+        let port = u16::from_be(v6.sin6_port);
+        Ok(SocketAddr::from((ip, port)))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg: not an IP address",
+        ))
     }
 }
 
@@ -320,10 +599,14 @@ mod tests {
         pending.enqueue(PendingUdpSend {
             destination: "127.0.0.1:1".parse().unwrap(),
             data: b"first".to_vec(),
+            ecn: None,
+            segment_size: None,
         });
         pending.enqueue(PendingUdpSend {
             destination: "127.0.0.1:2".parse().unwrap(),
             data: b"second".to_vec(),
+            ecn: None,
+            segment_size: None,
         });
 
         let seen = Arc::new(AtomicUsize::new(0));
@@ -349,6 +632,8 @@ mod tests {
         pending.enqueue(PendingUdpSend {
             destination: "127.0.0.1:1".parse().unwrap(),
             data: b"only".to_vec(),
+            ecn: None,
+            segment_size: None,
         });
 
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -428,5 +713,31 @@ mod tests {
             assert_eq!(rc, 0, "getsockopt failed: {}", io::Error::last_os_error());
             assert_eq!(val, 1);
         }
+    }
+
+    #[test]
+    fn udp_payloads_honours_segment_size() {
+        let buf = b"aaaabbbbccccdd";
+        assert_eq!(udp_payloads(buf, None), vec![&buf[..]]);
+        assert_eq!(
+            udp_payloads(buf, Some(4)),
+            vec![&b"aaaa"[..], &b"bbbb"[..], &b"cccc"[..], &b"dd"[..]]
+        );
+        assert_eq!(udp_payloads(buf, Some(64)), vec![&buf[..]]);
+    }
+
+    #[test]
+    fn pending_from_transmit_keeps_ecn_and_segment_size() {
+        let tx = Transmit {
+            destination: "127.0.0.1:443".parse().unwrap(),
+            ecn: Some(EcnCodepoint::Ect0),
+            size: 3,
+            segment_size: Some(1200),
+            src_ip: None,
+        };
+        let pending = PendingUdpSend::from_transmit(&tx, b"abc");
+        assert_eq!(pending.ecn, Some(EcnCodepoint::Ect0 as u8));
+        assert_eq!(pending.segment_size, Some(1200));
+        assert_eq!(pending.data, b"abc");
     }
 }

@@ -235,6 +235,7 @@ impl Endpoint for QuicStreamEndpoint {
         let _ = self.cmd_tx.send(DriverCmd::SendDatagram {
             conn: self.conn,
             payload: payload.to_vec(),
+            stream_id: Some(self.stream_id),
         });
         self.wake();
         Ok(())
