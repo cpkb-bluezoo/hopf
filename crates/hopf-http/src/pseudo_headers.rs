@@ -62,6 +62,42 @@ pub(crate) fn validate_request_pseudo_headers(pairs: &[(String, String)]) -> Res
         }
     }
 
+    // RFC 9114 §4.3.1: pseudo-header values and routing targets must be valid.
+    for (name, value) in pairs {
+        match name.as_str() {
+            ":path" if !(is_connect && !is_extended_connect) => {
+                if !crate::utils::is_valid_request_target(value) {
+                    return Err(());
+                }
+            }
+            ":authority" => {
+                if !crate::utils::is_valid_host(value) {
+                    return Err(());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if is_connect && !is_extended_connect {
+        return Ok(());
+    }
+
+    // RFC 9114 §4.3.1: routing requires :authority or Host.
+    let has_authority = pairs.iter().any(|(n, _)| n == ":authority");
+    if !has_authority {
+        let Some(host) = pairs
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.as_str())
+        else {
+            return Err(());
+        };
+        if !crate::utils::is_valid_host(host) {
+            return Err(());
+        }
+    }
+
     Ok(())
 }
 
@@ -122,5 +158,33 @@ mod tests {
 
         let p2 = pairs(&[(":method", "CONNECT"), (":authority", "x:443"), (":scheme", "https")]);
         assert!(validate_request_pseudo_headers(&p2).is_err());
+    }
+
+    #[test]
+    fn empty_path_rejected() {
+        let p = pairs(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", ""),
+            (":authority", "x"),
+        ]);
+        assert!(validate_request_pseudo_headers(&p).is_err());
+    }
+
+    #[test]
+    fn missing_authority_and_host_rejected() {
+        let p = pairs(&[(":method", "GET"), (":scheme", "https"), (":path", "/")]);
+        assert!(validate_request_pseudo_headers(&p).is_err());
+    }
+
+    #[test]
+    fn host_without_authority_accepted() {
+        let p = pairs(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", "/"),
+            ("host", "example.com"),
+        ]);
+        assert!(validate_request_pseudo_headers(&p).is_ok());
     }
 }

@@ -126,6 +126,11 @@ impl QuicConnection for H3ClientConnection {
     }
 
     fn accept_bi(&mut self, stream_id: u64) -> Box<dyn ProtocolHandler> {
+        // RFC 9114: clients MUST NOT accept server-initiated bidirectional
+        // streams (IDs where stream_id % 4 == 1).
+        if stream_id % 4 != 0 {
+            return Box::new(RejectServerInitiatedBiStream);
+        }
         let factory = self
             .pending_opens
             .lock()
@@ -309,6 +314,22 @@ fn validate_response_status(pairs: &[(String, String)]) -> Result<(), ()> {
     Ok(())
 }
 
+/// Rejects server-initiated bidirectional streams on an HTTP/3 client.
+struct RejectServerInitiatedBiStream;
+
+impl ProtocolHandler for RejectServerInitiatedBiStream {
+    fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+        endpoint.close_connection(frame::H3_STREAM_CREATION_ERROR);
+    }
+
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, _: &mut &[u8]) {
+        endpoint.close_connection(frame::H3_STREAM_CREATION_ERROR);
+    }
+
+    fn disconnected(&mut self, _: &mut dyn Endpoint) {}
+    fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
+}
+
 /// One outbound H3 request / inbound response on a bidirectional QUIC stream.
 struct H3ClientStream {
     factory: Arc<dyn ClientHandlerFactory>,
@@ -370,6 +391,44 @@ impl H3ClientStream {
     }
 
     fn emit_request(&mut self, endpoint: &mut dyn Endpoint, pending: &PendingOutbound) {
+        let req_pairs: Vec<(String, String)> = pending
+            .headers
+            .iter()
+            .map(|h| (h.name.clone(), h.value.clone()))
+            .collect();
+        if crate::pseudo_headers::validate_request_pseudo_headers(&req_pairs).is_err() {
+            if let Some(handler) = &mut self.handler {
+                handler.request_failed(
+                    &mut NullClientWriter,
+                    &io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed H3 request pseudo-headers",
+                    ),
+                );
+            }
+            endpoint.abort(frame::H3_MESSAGE_ERROR);
+            return;
+        }
+        if let Some(trailers) = &pending.trailers {
+            let trailer_pairs: Vec<(String, String)> = trailers
+                .iter()
+                .map(|h| (h.name.clone(), h.value.clone()))
+                .collect();
+            if crate::utils::field_section_contains_pseudo_headers(&trailer_pairs) {
+                if let Some(handler) = &mut self.handler {
+                    handler.request_failed(
+                        &mut NullClientWriter,
+                        &io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "malformed H3 request trailers: pseudo-headers forbidden",
+                        ),
+                    );
+                }
+                endpoint.abort(frame::H3_MESSAGE_ERROR);
+                return;
+            }
+        }
+
         let req_size = frame::field_section_size(
             pending
                 .headers
@@ -636,6 +695,17 @@ impl H3FrameHandler for H3ClientStream {
                     self.malformed = true;
                     return;
                 }
+                if crate::utils::field_section_contains_pseudo_headers(&pairs) {
+                    handler.request_failed(
+                        &mut w,
+                        &io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "malformed H3 response trailers: pseudo-headers forbidden",
+                        ),
+                    );
+                    self.malformed = true;
+                    return;
+                }
                 if self.response_body_started {
                     handler.end_response_body(&mut w);
                     self.response_body_started = false;
@@ -855,7 +925,14 @@ mod status_validation_tests {
         rec: Arc<Mutex<Recorded>>,
     }
     impl ClientHandler for RecordingHandler {
-        fn start(&mut self, _request: &mut dyn ClientWriter) {}
+        fn start(&mut self, request: &mut dyn ClientWriter) {
+            let mut h = Headers::new();
+            h.set(":method", "GET");
+            h.set(":scheme", "https");
+            h.set(":path", "/");
+            h.set(":authority", "example.com");
+            request.headers(h);
+        }
         fn informational_response(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
             self.rec
                 .lock()
@@ -1113,6 +1190,39 @@ mod status_validation_tests {
         assert!(r.informational_statuses.is_empty());
         assert_eq!(r.status, Some(200));
         assert_eq!(r.trailers, vec![("grpc-status".to_string(), "0".to_string())]);
+    }
+
+    #[test]
+    fn pseudo_header_in_response_trailers_is_malformed() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[(":status", "200")]));
+        stream.headers_frame(&encode(&[(":status", "0")]));
+
+        assert!(stream.malformed);
+        assert!(rec.lock().unwrap().trailers.is_empty());
+
+        let mut ep = RecordingEndpoint::default();
+        let mut empty: &[u8] = &[];
+        stream.receive(&mut ep, &mut empty);
+        assert_eq!(ep.abort_code, Some(frame::H3_MESSAGE_ERROR));
+    }
+
+    #[test]
+    fn server_initiated_bi_stream_closes_connection() {
+        let pending: PendingOpens = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let on_ready: OnReady = Arc::new(Mutex::new(None));
+        let mut conn = H3ClientConnection::with_shared_state(
+            pending,
+            on_ready,
+            HttpLimits::default(),
+        );
+        let mut handler = conn.accept_bi(1);
+        let mut ep = RecordingEndpoint::default();
+        handler.connected(&mut ep);
+        assert_eq!(
+            ep.close_connection_code,
+            Some(frame::H3_STREAM_CREATION_ERROR)
+        );
     }
 
     /// hopf never sends MAX_PUSH_ID, so PUSH_PROMISE on a request stream is

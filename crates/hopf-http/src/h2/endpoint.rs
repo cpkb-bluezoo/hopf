@@ -2429,6 +2429,7 @@ mod validation_tests {
             (":method", "GET"),
             (":scheme", "https"),
             (":path", "/"),
+            (":authority", "example.com"),
             ("te", "trailers"),
         ]);
         ep.process_server_headers_block(1, &block, false);
@@ -2440,6 +2441,7 @@ mod validation_tests {
             (":method", "GET"),
             (":scheme", "https"),
             (":path", "/"),
+            (":authority", "example.com"),
             ("te", "gzip"),
         ]);
         ep2.process_server_headers_block(3, &block2, false);

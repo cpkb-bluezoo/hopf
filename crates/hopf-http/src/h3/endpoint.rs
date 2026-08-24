@@ -482,10 +482,10 @@ impl H3RequestStream {
     }
 
     fn deliver_request_body(&mut self, payload: &[u8]) {
-        if let Some(up) = self.upgraded.as_mut() {
-            if self.capsule_mode {
-                match self.capsule_parser.push(payload) {
-                    Ok(capsules) => {
+        if self.capsule_mode {
+            match self.capsule_parser.push(payload) {
+                Ok(capsules) => {
+                    if let Some(up) = self.upgraded.as_mut() {
                         for c in capsules {
                             if c.ty == crate::capsule::CAPSULE_DATAGRAM {
                                 if up.wants_datagrams() {
@@ -496,12 +496,28 @@ impl H3RequestStream {
                             }
                         }
                     }
-                    Err(()) => {
-                        self.malformed = true;
-                        return;
-                    }
                 }
-            } else if !payload.is_empty() {
+                Err(()) => {
+                    self.malformed = true;
+                    return;
+                }
+            }
+            if let Some(up) = self.upgraded.as_mut() {
+                let wants_close = up.wants_close();
+                let out = up.take_outbound();
+                let mut shared = self.writer.control.shared.lock().unwrap();
+                if !out.is_empty() {
+                    shared.body.extend_from_slice(&out);
+                }
+                if wants_close {
+                    shared.complete = true;
+                    shared.upgrade_fin = true;
+                }
+            }
+            return;
+        }
+        if let Some(up) = self.upgraded.as_mut() {
+            if !payload.is_empty() {
                 up.receive(payload);
             }
             let wants_close = up.wants_close();
@@ -628,6 +644,7 @@ impl H3FrameHandler for H3RequestStream {
             // trailers (RFC 9114 §4.1).
             if !crate::utils::http_binary_field_names_are_lowercase(&pairs)
                 || !crate::utils::http_connection_specific_fields_are_valid(&pairs)
+                || crate::utils::field_section_contains_pseudo_headers(&pairs)
             {
                 self.malformed = true;
                 return;
@@ -777,6 +794,10 @@ impl ProtocolHandler for H3RequestStream {
 
     fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
         self.bind_execute_conn();
+        if self.capsule_mode && self.capsule_parser.finish().is_err() {
+            endpoint.abort(frame::H3_MESSAGE_ERROR);
+            return;
+        }
         if self.body_tracker.finish_message().is_err() {
             self.malformed = true;
             endpoint.abort(frame::H3_MESSAGE_ERROR);
@@ -836,6 +857,9 @@ pub(crate) struct H3PeerState {
     /// SETTINGS; absent → `Some(false)`. Both peers must have advertised
     /// `1` before QUIC DATAGRAMs carry HTTP Datagrams.
     pub(crate) peer_h3_datagram: Option<bool>,
+    /// Peer's last `MAX_PUSH_ID` (RFC 9114 §7.2.7). `None` until the first
+    /// frame arrives on the control stream.
+    pub(crate) peer_max_push_id: Option<u64>,
     /// Run once peer SETTINGS has been applied (so
     /// [`Self::peer_enable_connect_protocol`] is known). Used to resume
     /// Extended CONNECT requests that arrived before SETTINGS.
@@ -1050,7 +1074,12 @@ impl H3FrameHandler for H3UniStream {
                 return;
             }
             if id == frame::SETTINGS_ENABLE_CONNECT_PROTOCOL {
-                enable_connect_protocol = Some(val != 0);
+                if val > 1 {
+                    self.connection_error
+                        .get_or_insert(frame::H3_SETTINGS_ERROR);
+                    return;
+                }
+                enable_connect_protocol = Some(val == 1);
             } else if id == datagram::SETTINGS_H3_DATAGRAM {
                 if val > 1 {
                     self.connection_error
@@ -1184,7 +1213,7 @@ impl H3FrameHandler for H3UniStream {
         self.connection_error
             .get_or_insert(frame::H3_FRAME_UNEXPECTED);
     }
-    fn max_push_id_frame(&mut self, _payload: &[u8]) {
+    fn max_push_id_frame(&mut self, payload: &[u8]) {
         if !self.settings_received {
             self.connection_error.get_or_insert(frame::H3_MISSING_SETTINGS);
             return;
@@ -1193,9 +1222,22 @@ impl H3FrameHandler for H3UniStream {
             // Servers MUST NOT send MAX_PUSH_ID (RFC 9114 §7.2.7).
             self.connection_error
                 .get_or_insert(frame::H3_FRAME_UNEXPECTED);
+            return;
         }
-        // Server role: client is raising our push budget. hopf never pushes,
-        // so ignore (still a legal frame on the control stream).
+        let Some(id) = frame::parse_max_push_id(payload) else {
+            self.connection_error.get_or_insert(frame::H3_FRAME_ERROR);
+            return;
+        };
+        let mut state = self.peer_state.lock().unwrap();
+        if let Some(prev) = state.peer_max_push_id {
+            // RFC 9114 §7.2.7: MAX_PUSH_ID MUST NOT decrease.
+            if id < prev {
+                drop(state);
+                self.connection_error.get_or_insert(frame::H3_ID_ERROR);
+                return;
+            }
+        }
+        state.peer_max_push_id = Some(id);
     }
     fn unknown_frame(&mut self, _frame_type: u64) {
         // RFC 9114 §6.2.1 / §9: GREASE before SETTINGS does not satisfy the
@@ -1395,6 +1437,25 @@ mod uni_stream_tests {
         assert_eq!(s.peer_enable_connect_protocol, Some(true));
         assert_eq!(s.peer_qpack_max_table_capacity, Some(qpack::MAX_TABLE_CAPACITY as u64));
         assert_eq!(qpack.encoder_capacity_for_test(), qpack::MAX_TABLE_CAPACITY);
+    }
+
+    #[test]
+    fn settings_enable_connect_protocol_above_one_is_settings_error() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+
+        let mut bytes = vec![0x00];
+        let mut payload = Vec::new();
+        super::super::varint::encode(&mut payload, frame::SETTINGS_ENABLE_CONNECT_PROTOCOL);
+        super::super::varint::encode(&mut payload, 2);
+        frame::write_frame(&mut bytes, frame::SETTINGS, &payload);
+        let mut data: &[u8] = &bytes;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_SETTINGS_ERROR));
     }
 
     /// The type byte and the SETTINGS frame bytes arriving in separate
@@ -1795,6 +1856,30 @@ mod uni_stream_tests {
 
         assert!(ep.closed);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_UNEXPECTED));
+    }
+
+    #[test]
+    fn decreasing_max_push_id_is_id_error() {
+        let state = shared_state();
+        let qpack = shared_qpack();
+        let mut uni = H3UniStream::new(Arc::clone(&state), Arc::clone(&qpack), false);
+        let mut ep = RecordingEndpoint::default();
+        open_control_with_settings(&mut uni, &mut ep);
+
+        let mut first = Vec::new();
+        frame::write_max_push_id(&mut first, 8);
+        let mut data: &[u8] = &first;
+        uni.receive(&mut ep, &mut data);
+        assert!(!ep.closed);
+        assert_eq!(state.lock().unwrap().peer_max_push_id, Some(8));
+
+        let mut second = Vec::new();
+        frame::write_max_push_id(&mut second, 4);
+        let mut data: &[u8] = &second;
+        uni.receive(&mut ep, &mut data);
+
+        assert!(ep.closed);
+        assert_eq!(ep.close_connection_code, Some(frame::H3_ID_ERROR));
     }
 
     /// A client that never sent MAX_PUSH_ID treats an inbound push stream
@@ -2218,6 +2303,55 @@ mod request_validation_tests {
             vec![("grpc-status".to_string(), "0".to_string()), ("grpc-message".to_string(), "ok".to_string())]
         );
         assert!(!stream.malformed, "trailers must not be run through request pseudo-header validation");
+    }
+
+    #[test]
+    fn empty_path_is_malformed() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[
+            (":method", "GET"),
+            (":scheme", "https"),
+            (":path", ""),
+            (":authority", "x"),
+        ]);
+        stream.headers_frame(&payload);
+        assert!(stream.malformed);
+        assert_eq!(rec.lock().unwrap().opened, 0);
+    }
+
+    #[test]
+    fn pseudo_header_in_request_trailers_is_malformed() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[
+            (":method", "POST"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+        ]));
+        stream.headers_frame(&encode(&[(":status", "0")]));
+
+        assert!(stream.malformed);
+        assert!(rec.lock().unwrap().trailers.is_empty());
+    }
+
+    #[test]
+    fn truncated_capsule_at_stream_fin_aborts() {
+        let (mut stream, _rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[
+            (":method", "CONNECT"),
+            (":protocol", "connect-udp"),
+            (":scheme", "https"),
+            (":path", "/"),
+            (":authority", "x"),
+            ("capsule-protocol", "?1"),
+        ]));
+        assert!(stream.capsule_mode);
+        stream.data_frame(&[0x00]);
+
+        let mut ep = RecordingEndpoint::default();
+        stream.disconnected(&mut ep);
+        assert!(ep.closed);
+        assert_eq!(ep.abort_code, Some(frame::H3_MESSAGE_ERROR));
     }
 
     #[test]
