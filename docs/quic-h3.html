@@ -70,11 +70,12 @@
     <main class="main">
       <header>
         <h1>QUIC / HTTP/3</h1>
-        <p class="lead">Crates <code>hopf-quic</code> and <code>hopf-http</code> (feature <code>h3</code>): QUIC transport via <code>quinn-proto</code> + an in-tree mio UDP driver, and HTTP/3 codecs that reuse the same Stream SPI as H1/H2.</p>
+        <p class="lead">Crates <code>hopf-quic</code> and <code>hopf-http</code> (feature <code>h3</code>): QUIC transport via <code>quinn-proto</code> + an in-tree mio UDP driver, with <strong>PQC-first TLS 1.3</strong> (hybrid ML-KEM offered first on every handshake). HTTP/3 codecs reuse the same Stream SPI as H1/H2.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#architecture">Architecture</a></li>
+<li><a href="#pqc-first-tls-13">PQC-first TLS 1.3</a></li>
 <li><a href="#standards">Standards</a></li>
 <li><a href="#quiclisten--quicconnect-configs">QuicListen / QuicConnect configs</a></li>
 <li><a href="#pem-builders">PEM builders</a></li>
@@ -100,6 +101,14 @@
                                          ▼
                               ServerHandler / ClientHandler  (hopf-http)</code></pre>
 <p>Each bidirectional QUIC stream is a <code>QuicStreamEndpoint</code> implementing <code>hopf_core::Endpoint</code>. HTTP/3 framing lives in <code>hopf-http</code>, not in <code>hopf-quic</code>.</p>
+<h2 id="pqc-first-tls-13">PQC-first TLS 1.3</h2>
+<p>QUIC processing is <strong>post-quantum first</strong> by construction, not an opt-in:</p>
+<ul>
+<li><strong>TLS 1.3 only</strong> (RFC 9001). PEM builders pin <code>&amp;[rustls::version::TLS13]</code>. Unlike TCP <a href="tls.html"><code>hopf-tls</code></a>, the QUIC path never negotiates TLS 1.2.</li>
+<li><strong>Hybrid ML-KEM first.</strong> All QUIC TLS configs use the shared <code>hopf_tls::tls_crypto_provider()</code> — aws-lc-rs with rustls <code>prefer-post-quantum</code>. The client Hello offers <code>X25519MLKEM768</code> (X25519 + ML-KEM-768) as the preferred key-exchange group. Peers that cannot do PQC still complete with classical groups; peers that can do PQC complete a hybrid handshake on the first flight.</li>
+<li><strong>Same provider as TCP TLS</strong>, so cipher and KX policy stay one story; QUIC is the stricter subset (1.3-only + PQC preference on every datagram handshake).</li>
+</ul>
+<p>There is no separate “enable PQC” knob. Turning off hybrid KX would mean replacing the workspace rustls feature set, not a hopf-quic option.</p>
 <h2 id="standards">Standards</h2>
 <table>
 <colgroup>
@@ -119,7 +128,7 @@
 </tr>
 <tr>
 <td>TLS 1.3 only</td>
-<td>rustls aws-lc-rs; builders pin <code>TLS13</code></td>
+<td>rustls aws-lc-rs; builders pin <code>TLS13</code>. <strong>PQC-first:</strong> hybrid <code>X25519MLKEM768</code> offered first (<code>prefer-post-quantum</code>)</td>
 </tr>
 <tr>
 <td>ALPN <code>h3</code></td>
@@ -242,7 +251,7 @@
 </tbody>
 </table>
 <h2 id="pem-builders">PEM builders</h2>
-<p>All builders pin <strong>TLS 1.3 only</strong> (aws-lc-rs provider, hybrid-first PQC KX via rustls <code>prefer-post-quantum</code>) and take an ALPN list.</p>
+<p>All builders pin <strong>TLS 1.3 only</strong> and take an ALPN list. Crypto is always the shared aws-lc-rs provider with <strong>hybrid-first PQC KX</strong> (<code>X25519MLKEM768</code>) — see <a href="#pqc-first-tls-13">PQC-first TLS 1.3</a>.</p>
 <table>
 <colgroup>
 <col style="width: 55%" />
@@ -325,11 +334,15 @@
 </tr>
 <tr>
 <td>Protocol versions</td>
-<td><code>&amp;[rustls::version::TLS13]</code> only</td>
+<td><code>&amp;[rustls::version::TLS13]</code> only — no TLS 1.2 on QUIC</td>
+</tr>
+<tr>
+<td>Key exchange</td>
+<td>PQC-first: <code>X25519MLKEM768</code> then classical (workspace <code>prefer-post-quantum</code>)</td>
 </tr>
 <tr>
 <td>Early data</td>
-<td>Enabled on both sides in PEM builders</td>
+<td>Off by default; opt in with <code>QuicTlsOptions::with_early_data</code></td>
 </tr>
 </tbody>
 </table>
@@ -381,7 +394,7 @@
 <li><a href="http/overview.html">HTTP overview</a></li>
 <li><a href="http/server.html">HTTP server</a></li>
 <li><a href="http/client.html">HTTP client</a></li>
-<li><a href="tls.html">TLS</a> — TCP rustls helpers (separate from QUIC PEM builders)</li>
+<li><a href="tls.html">TLS</a> — TCP rustls helpers (same aws-lc-rs provider; QUIC is the 1.3-only PQC-first subset)</li>
 <li><a href="architecture.html">Architecture</a></li>
 </ul>
 

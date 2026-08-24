@@ -72,7 +72,7 @@
         <h1>TLS</h1>
         <p class="lead">Crate <code>hopf-tls</code>: <strong>rustls</strong> glue implementing the <code>hopf-core</code> TLS seam (<code>TlsAcceptor</code> / <code>TlsConnector</code> / <code>TlsSession</code>). Protocol handlers always see <strong>plaintext</strong> — encryption is under the <code>Endpoint</code>. Supports TLS-from-accept and STARTTLS. ALPN, PEM load, and negotiated <code>SecurityInfo</code> are exposed.</p>
       </header>
-      <p>QUIC/TLS 1.3 for HTTP/3 lives primarily in <a href="quic-h3.html"><code>hopf-quic</code></a>; this crate covers TCP TLS.</p>
+      <p>QUIC/TLS 1.3 for HTTP/3 lives in <a href="quic-h3.html"><code>hopf-quic</code></a> and is <strong>PQC-first</strong> (TLS 1.3 only, hybrid <code>X25519MLKEM768</code> offered first). This crate covers TCP TLS (1.2 + 1.3, same crypto provider).</p>
 <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#standards">Standards</a></li>
@@ -235,7 +235,7 @@ let client_cfg = client_config_with_identity(
 </table>
 <p>Sessions support <code>send_close_notify</code> via the core <code>TlsSession</code> trait.</p>
 <h2 id="configuration">Configuration</h2>
-<p>There are <strong>no numeric knobs</strong> in <code>hopf-tls</code> itself. Versions and cipher suites come from rustls defaults (aws-lc-rs, TLS 1.2 + 1.3 enabled). Key exchange prefers the hybrid post-quantum group <code>X25519MLKEM768</code> when the peer supports it (rustls <code>prefer-post-quantum</code>).</p>
+<p>There are <strong>no numeric knobs</strong> in <code>hopf-tls</code> itself. Versions and cipher suites come from rustls defaults (aws-lc-rs, TLS 1.2 + 1.3 enabled). Key exchange prefers the hybrid post-quantum group <code>X25519MLKEM768</code> when the peer supports it (rustls <code>prefer-post-quantum</code>). <a href="quic-h3.html#pqc-first-tls-13">QUIC</a> uses the same provider but pins TLS 1.3, so every QUIC handshake is PQC-first with no 1.2 fallback.</p>
 <table>
 <thead>
 <tr>

@@ -89,8 +89,9 @@
 </ul></li>
 <li><strong>Single TLS / QUIC story</strong>
 <ul>
-<li>rustls for TCP TLS and STARTTLS</li>
-<li>quinn-proto + in-tree mio glue for QUIC (TLS 1.3); HTTP/3 codecs in-tree</li>
+<li>rustls (aws-lc-rs) for TCP TLS and STARTTLS, hybrid-first PQC key exchange</li>
+<li><strong>PQC-first QUIC</strong>: TLS 1.3 only, no 1.2 fallback; hybrid <code>X25519MLKEM768</code> is offered first on every QUIC handshake (rustls <code>prefer-post-quantum</code>)</li>
+<li>quinn-proto + in-tree mio UDP driver; HTTP/3 codecs in-tree</li>
 </ul></li>
 <li><strong>Shared security and policy</strong>
 <ul>
@@ -105,7 +106,7 @@
 </ul></li>
 <li><strong>Protocol depth, not a thin HTTP façade</strong>
 <ul>
-<li>HTTP is one peer among many — mail, DNS, FTP, WebDAV, WebSocket, gRPC share the same substrate</li>
+<li>HTTP is one peer among many — mail, DNS, FTP, WebDAV, WebSocket, gRPC, MQTT, AMQP share the same substrate</li>
 </ul></li>
 </ul>
 <h2 id="full-feature-list">Full feature list</h2>
@@ -124,7 +125,8 @@
 </ul>
 <h3 id="tls-hopf-tls">TLS (<code>hopf-tls</code>)</h3>
 <ul>
-<li>rustls for TCP; PEM server and client helpers</li>
+<li>rustls (aws-lc-rs) for TCP; PEM server and client helpers</li>
+<li>Hybrid-first PQC key exchange: <code>X25519MLKEM768</code> preferred when the peer supports it</li>
 <li>ALPN negotiation surfaced as <code>SecurityInfo</code></li>
 <li>Always-on TLS listeners and STARTTLS on cleartext endpoints</li>
 <li>Shared acceptor/connector configs across protocols</li>
@@ -134,7 +136,8 @@
 <li>QUIC listen and dial (quinn-proto + dedicated mio UDP driver)</li>
 <li>Each bidirectional QUIC stream is an <code>Endpoint</code></li>
 <li>HTTP/3 server and client (RFC 9114) with in-tree QPACK (RFC 9204)</li>
-<li>ALPN <code>h3</code>; TLS 1.3-only for QUIC crypto</li>
+<li>ALPN <code>h3</code></li>
+<li><strong>PQC-first processing:</strong> QUIC crypto is TLS 1.3-only (RFC 9001) via the shared <code>hopf_tls::tls_crypto_provider()</code>. There is no TLS 1.2 fallback on the QUIC path. Key exchange offers hybrid ML-KEM (<code>X25519MLKEM768</code>) first, then classical groups if the peer cannot do PQC</li>
 <li>Connection-level hooks for control / unidirectional streams</li>
 </ul>
 <h3 id="http-hopf-http">HTTP (<code>hopf-http</code>)</h3>
@@ -215,6 +218,16 @@
 <li>Multi-reactor fan-out via <code>ConnHandle</code>; staged <code>ConnectHandler</code> SPI backed by <code>CredentialStore</code></li>
 <li>Async client: <code>MqttClient</code> + <code>MqttClientDriver</code> callbacks</li>
 <li>Optional MQTT-over-WebSocket bridge (<code>websocket</code> feature) sharing broker state with the TCP listener</li>
+</ul>
+<h3 id="amqp-hopf-amqp">AMQP (<code>hopf-amqp</code>)</h3>
+<ul>
+<li>AMQP 0-9-1 async client (RabbitMQ wire protocol); client-only — no broker in this crate</li>
+<li>Connection handshake (<code>PLAIN</code> / <code>AMQPLAIN</code>), tune negotiation, heartbeats</li>
+<li>Multi-channel open/close; exchange / queue declare, bind, unbind, purge, delete</li>
+<li><code>basic.publish</code> with streamed content frames; publisher confirms and <code>basic.return</code></li>
+<li><code>basic.consume</code> push deliveries (ack / nack / reject / qos)</li>
+<li>AMQPS via implicit TLS on dial; DNS via <code>hopf-dns</code></li>
+<li>Umbrella Cargo feature <code>amqp</code> (<code>hopf::amqp</code>)</li>
 </ul>
 <h3 id="mailbox-hopf-mailbox">Mailbox (<code>hopf-mailbox</code>)</h3>
 <ul>
@@ -331,6 +344,13 @@
 <td>3.1.1 + v5 core; optional WS bridge</td>
 </tr>
 <tr>
+<td>AMQP 0-9-1</td>
+<td><code>hopf-amqp</code></td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+<td>client-only (RabbitMQ); AMQPS</td>
+</tr>
+<tr>
 <td>Mailbox storage</td>
 <td><code>hopf-mailbox</code></td>
 <td style="text-align: center;">SPI</td>
@@ -342,14 +362,14 @@
 <td><code>hopf-quic</code></td>
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
-<td>Endpoint per stream</td>
+<td>Endpoint per stream; <strong>PQC-first</strong> TLS 1.3 (hybrid ML-KEM)</td>
 </tr>
 <tr>
 <td>TLS</td>
 <td><code>hopf-tls</code></td>
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
-<td>rustls</td>
+<td>rustls aws-lc-rs, hybrid-first PQC KX</td>
 </tr>
 </tbody>
 </table>
