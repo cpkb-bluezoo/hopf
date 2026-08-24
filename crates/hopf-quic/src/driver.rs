@@ -133,8 +133,12 @@ impl QuicDriverHandle {
     /// Request shutdown and join the driver thread — unless called from
     /// the driver thread itself, in which case the join is skipped (see
     /// [`Self::join_driver_thread`]).
+    ///
+    /// The driver will flush any queued application writes (e.g. H3 GOAWAY),
+    /// then send CONNECTION_CLOSE on every open connection, transmit those
+    /// datagrams, and only then stop.  Using just `active.store(false)` would
+    /// skip all of that.
     pub fn shutdown(mut self) {
-        self.active.store(false, Ordering::Release);
         let _ = self.cmd_tx.send(DriverCmd::Shutdown);
         let _ = self.waker.wake();
         self.join_driver_thread();
@@ -439,6 +443,7 @@ fn spawn_driver(
                 pending_sends: crate::udp::PendingUdpSends::default(),
                 udp_interest: Interest::READABLE,
                 require_address_validation,
+                shutting_down: false,
             };
             if let Err(e) = driver.run(&mut poll) {
                 eprintln!("hopf-quic driver error: {e}");
@@ -611,6 +616,9 @@ struct Driver {
     udp_interest: Interest,
     /// When true, unvalidated Incoming get Retry before handshake (RFC 9000 §8.1.2).
     require_address_validation: bool,
+    /// Set when a `Shutdown` command has been processed.  The run loop
+    /// performs a final flush + CONNECTION_CLOSE pass before exiting.
+    shutting_down: bool,
 }
 
 impl Driver {
@@ -682,6 +690,10 @@ impl Driver {
             self.drain_cmds();
             self.fire_timers();
 
+            if self.shutting_down {
+                break;
+            }
+
             let timeout = self.next_timeout();
             poll.poll(&mut events, timeout)?;
 
@@ -706,6 +718,26 @@ impl Driver {
             self.drive_apps();
             self.flush_all_transmits()?;
             self.sync_udp_interest(poll)?;
+        }
+
+        if self.shutting_down {
+            // Final pass: flush any application bytes written during
+            // `notify_disconnecting` (e.g. H3 GOAWAY on the control stream),
+            // then send QUIC CONNECTION_CLOSE on every open connection and
+            // transmit the resulting datagrams before the thread exits.
+            let now = Instant::now();
+            let chs: Vec<ConnectionHandle> = self.connections.keys().copied().collect();
+            for ch in &chs {
+                self.drive_streams(*ch, now);
+            }
+            let _ = self.flush_all_transmits();
+            for ch in &chs {
+                if let Some(slot) = self.connections.get_mut(ch) {
+                    slot.conn.close(now, VarInt::from_u32(0), Bytes::new());
+                }
+            }
+            let _ = self.flush_all_transmits();
+            self.active.store(false, Ordering::Release);
         }
         Ok(())
     }
@@ -796,7 +828,7 @@ impl Driver {
             match cmd {
                 DriverCmd::Shutdown => {
                     self.notify_disconnecting();
-                    self.active.store(false, Ordering::Release);
+                    self.shutting_down = true;
                 }
                 DriverCmd::Task(task) => task(),
                 DriverCmd::ScheduleTimer {
@@ -2877,5 +2909,86 @@ mod tests {
         assert_eq!(server_got.lock().unwrap().as_slice(), b"ping");
         assert_eq!(client_got.lock().unwrap().as_slice(), b"pong");
         server.shutdown();
+    }
+
+    /// Calling `shutdown()` must flush queued application bytes (e.g. a GOAWAY
+    /// written by `disconnecting()`) **and** send QUIC CONNECTION_CLOSE to every
+    /// open peer before the driver thread exits.  The peer should therefore
+    /// receive a `QuicConnectionCloseError` rather than an idle-timeout or
+    /// transport-reset error.
+    ///
+    /// Regression test for: shutdown skipped GOAWAY + CONNECTION_CLOSE (#294).
+    #[test]
+    fn shutdown_sends_connection_close_to_peer() {
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"shutdown-cc"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"shutdown-cc"]).unwrap();
+
+        let client_got_error = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client_got_disconnect = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client_error_ref = Arc::clone(&client_got_error);
+        let client_disconnect_ref = Arc::clone(&client_got_disconnect);
+
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(NopHandler) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        struct IdleClient {
+            errored: Arc<std::sync::atomic::AtomicBool>,
+            disconnected: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl ProtocolHandler for IdleClient {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
+                self.disconnected.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {
+                self.errored.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(IdleClient {
+                    errored: Arc::clone(&client_error_ref),
+                    disconnected: Arc::clone(&client_disconnect_ref),
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        // Wait for the connection to be established.
+        thread::sleep(Duration::from_millis(100));
+
+        // Trigger a clean driver shutdown — this must send CONNECTION_CLOSE.
+        server.shutdown();
+
+        // Give the client a moment to receive and process the CONNECTION_CLOSE.
+        for _ in 0..100 {
+            if client_got_error.load(std::sync::atomic::Ordering::SeqCst)
+                || client_got_disconnect.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            client_got_error.load(std::sync::atomic::Ordering::SeqCst),
+            "client must receive a CONNECTION_CLOSE error when server shuts down cleanly"
+        );
+        assert!(
+            !client_got_disconnect.load(std::sync::atomic::Ordering::SeqCst),
+            "CONNECTION_CLOSE must use error(), not disconnected()"
+        );
     }
 }
