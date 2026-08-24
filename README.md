@@ -10,7 +10,8 @@ framework** in Rust. Successor to
 container.
 
 Hopf uses a **thread-per-core** readiness model on
-[mio](https://github.com/tokio-rs/mio), plain buffers, and **rustls** for TCP TLS
+[mio](https://github.com/tokio-rs/mio) where connections are multiplexed
+over the thread, plain buffers, and **rustls** for TCP TLS
 and QUIC ([quinn-proto](https://docs.rs/quinn-proto) + in-tree mio glue).
 **Listen and dial** are equal bindings on one Runtime. Codecs are **incremental
 push parsers**: chunked, resumable ingress; handler-callback egress.
@@ -30,9 +31,9 @@ The [`hopf`](https://crates.io/crates/hopf) umbrella crate re-exports every
 
 ```toml
 [dependencies]
-hopf = "0.1"   # everything
+hopf = "0.2"   # everything
 # or pick crates individually:
-hopf = { version = "0.1", default-features = false, features = ["http", "tls"] }
+hopf = { version = "0.2", default-features = false, features = ["http", "tls"] }
 ```
 
 Individual crates (`hopf-core`, `hopf-http`, …) can also be depended on
