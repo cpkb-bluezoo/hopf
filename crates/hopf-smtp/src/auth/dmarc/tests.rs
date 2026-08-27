@@ -70,12 +70,25 @@ fn run(
     spf_domain: Option<&str>,
     dkim_results: Vec<DkimSignatureResult>,
 ) -> DmarcOutcome {
+    run_with_duplicate_from(dns, from_domain, false, spf_result, spf_domain, dkim_results)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_duplicate_from(
+    dns: FakeDns,
+    from_domain: &str,
+    has_duplicate_from: bool,
+    spf_result: SpfResult,
+    spf_domain: Option<&str>,
+    dkim_results: Vec<DkimSignatureResult>,
+) -> DmarcOutcome {
     let out = Arc::new(Mutex::new(None));
     let out2 = Arc::clone(&out);
     evaluate(
         Arc::new(dns),
         psl(),
         from_domain,
+        has_duplicate_from,
         spf_result,
         spf_domain.map(|s| s.to_string()),
         Arc::new(dkim_results),
@@ -97,6 +110,21 @@ fn spf_aligned_pass() {
     );
     assert_eq!(out.result, DmarcResult::Pass);
     assert_eq!(out.verdict, AuthVerdict::Pass);
+}
+
+#[test]
+fn duplicate_from_forces_fail_even_when_otherwise_aligned() {
+    let dns = FakeDns::default().with_txt("_dmarc.example.com", "v=DMARC1; p=reject");
+    let out = run_with_duplicate_from(
+        dns,
+        "example.com",
+        true,
+        SpfResult::Pass,
+        Some("example.com"),
+        vec![dkim_pass("example.com")],
+    );
+    assert_eq!(out.result, DmarcResult::Fail);
+    assert_eq!(out.verdict, AuthVerdict::Reject);
 }
 
 #[test]
