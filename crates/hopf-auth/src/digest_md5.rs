@@ -302,7 +302,8 @@ mod tests {
     #[test]
     fn rejects_forged_server_rspauth() {
         let mut client = DigestMd5Client::new("u", "p", "host.example", "imap");
-        let challenge = generate_challenge("realm", "abc");
+        let server_nonce = generate_nonce_hex(16);
+        let challenge = generate_challenge("realm", &server_nonce);
         let SaslClientStep::Complete(_) = client.evaluate(Some(challenge.as_bytes())) else {
             panic!("expected Complete for the first step");
         };
@@ -318,16 +319,18 @@ mod tests {
     /// accepted — the fix must check the value, not just reject everything.
     #[test]
     fn accepts_genuine_server_rspauth() {
-        let mut client = DigestMd5Client::new("u", "p", "host.example", "imap");
-        let challenge = generate_challenge("realm", "abc");
+        let password = generate_nonce_hex(8);
+        let mut client = DigestMd5Client::new("u", &password, "host.example", "imap");
+        let server_nonce = generate_nonce_hex(16);
+        let challenge = generate_challenge("realm", &server_nonce);
         let SaslClientStep::Complete(response) = client.evaluate(Some(challenge.as_bytes()))
         else {
             panic!("expected Complete for the first step");
         };
         let response_text = String::from_utf8(response).unwrap();
         let params = parse_params(&response_text);
-        let ha1 = compute_ha1("u", "realm", "p");
-        let rspauth = verify_client_response(&ha1, "abc", &params)
+        let ha1 = compute_ha1("u", "realm", &password);
+        let rspauth = verify_client_response(&ha1, &server_nonce, &params)
             .expect("a genuine client response must verify");
         let final_msg = format!("rspauth={rspauth}");
         assert!(matches!(
