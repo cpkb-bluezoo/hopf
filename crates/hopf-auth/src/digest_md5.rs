@@ -154,6 +154,17 @@ pub(crate) struct DigestMd5Client {
     /// `"pop"`, `"smtp"` — the protocol the caller is authenticating for.
     service: String,
     complete: bool,
+    /// Values from the first step, retained to verify the server's
+    /// `rspauth` in its final message (RFC 2831 §2.1.3) — `None` until the
+    /// first step has run.
+    session: Option<ClientSession>,
+}
+
+struct ClientSession {
+    session_ha1: String,
+    nonce: String,
+    cnonce: String,
+    digest_uri: String,
 }
 
 impl DigestMd5Client {
@@ -164,6 +175,7 @@ impl DigestMd5Client {
             host: host.into(),
             service: service.into(),
             complete: false,
+            session: None,
         }
     }
 }
@@ -182,8 +194,24 @@ impl SaslClient for DigestMd5Client {
             return SaslClientStep::Failure;
         };
         let text = String::from_utf8_lossy(ch);
-        // Ignore rspauth final
-        if text.starts_with("rspauth=") {
+        if let Some(rspauth) = text.strip_prefix("rspauth=") {
+            let Some(session) = &self.session else {
+                return SaslClientStep::Failure;
+            };
+            // Same formula as `verify_client_response`'s response-value,
+            // but with A2 = ":" + digest-uri (no "AUTHENTICATE:" prefix) —
+            // RFC 2831 §2.1.3.
+            let rsp_ha2 = md5_hex(format!(":{}", session.digest_uri).as_bytes());
+            let expected = md5_hex(
+                format!(
+                    "{}:{}:00000001:{}:auth:{rsp_ha2}",
+                    session.session_ha1, session.nonce, session.cnonce
+                )
+                .as_bytes(),
+            );
+            if !ct_eq_hex(rspauth.trim(), &expected) {
+                return SaslClientStep::Failure;
+            }
             self.complete = true;
             return SaslClientStep::Complete(Vec::new());
         }
@@ -210,7 +238,12 @@ impl SaslClient for DigestMd5Client {
             "username=\"{}\",realm=\"{realm}\",nonce=\"{nonce}\",cnonce=\"{cnonce}\",nc={nc},qop={qop},digest-uri=\"{digest_uri}\",response={response},charset=utf-8",
             self.username
         );
-        self.complete = true;
+        self.session = Some(ClientSession {
+            session_ha1,
+            nonce,
+            cnonce,
+            digest_uri,
+        });
         SaslClientStep::Complete(msg.into_bytes())
     }
 
@@ -259,5 +292,50 @@ mod tests {
         };
         let pop_text = String::from_utf8(pop_msg).unwrap();
         assert!(pop_text.contains("digest-uri=\"pop/host.example\""));
+    }
+
+    /// RFC 2831 §2.1.3's mutual-authentication guarantee depends on the
+    /// client checking the server's `rspauth` in its final message. An
+    /// active on-path attacker impersonating the server can send any
+    /// `rspauth=` value; the client must reject the exchange rather than
+    /// accept it unconditionally.
+    #[test]
+    fn rejects_forged_server_rspauth() {
+        let mut client = DigestMd5Client::new("u", &generate_nonce_hex(8), "host.example", "imap");
+        let server_nonce = generate_nonce_hex(16);
+        let challenge = generate_challenge("realm", &server_nonce);
+        let SaslClientStep::Complete(_) = client.evaluate(Some(challenge.as_bytes())) else {
+            panic!("expected Complete for the first step");
+        };
+        let forged = b"rspauth=00000000000000000000000000000000";
+        assert!(matches!(
+            client.evaluate(Some(forged)),
+            SaslClientStep::Failure
+        ));
+    }
+
+    /// The correctly-computed `rspauth` (the same value a real DIGEST-MD5
+    /// server derives via [`verify_client_response`]) must still be
+    /// accepted — the fix must check the value, not just reject everything.
+    #[test]
+    fn accepts_genuine_server_rspauth() {
+        let password = generate_nonce_hex(8);
+        let mut client = DigestMd5Client::new("u", &password, "host.example", "imap");
+        let server_nonce = generate_nonce_hex(16);
+        let challenge = generate_challenge("realm", &server_nonce);
+        let SaslClientStep::Complete(response) = client.evaluate(Some(challenge.as_bytes()))
+        else {
+            panic!("expected Complete for the first step");
+        };
+        let response_text = String::from_utf8(response).unwrap();
+        let params = parse_params(&response_text);
+        let ha1 = compute_ha1("u", "realm", &password);
+        let rspauth = verify_client_response(&ha1, &server_nonce, &params)
+            .expect("a genuine client response must verify");
+        let final_msg = format!("rspauth={rspauth}");
+        assert!(matches!(
+            client.evaluate(Some(final_msg.as_bytes())),
+            SaslClientStep::Complete(_)
+        ));
     }
 }
