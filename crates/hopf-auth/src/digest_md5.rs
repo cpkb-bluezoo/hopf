@@ -301,7 +301,7 @@ mod tests {
     /// accept it unconditionally.
     #[test]
     fn rejects_forged_server_rspauth() {
-        let mut client = DigestMd5Client::new("u", "p", "host.example", "imap");
+        let mut client = DigestMd5Client::new("u", &generate_nonce_hex(8), "host.example", "imap");
         let server_nonce = generate_nonce_hex(16);
         let challenge = generate_challenge("realm", &server_nonce);
         let SaslClientStep::Complete(_) = client.evaluate(Some(challenge.as_bytes())) else {
