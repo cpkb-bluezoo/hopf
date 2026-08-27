@@ -389,7 +389,7 @@ impl SmtpPipeline for AuthPipeline {
                 .collect(),
             None => BodyHashMap::new(),
         };
-        let from_domain = from_header_domain(&headers);
+        let from_header = from_header_domain(&headers);
 
         let dns = Arc::clone(&self.dns);
         let psl = PublicSuffixList::bundled();
@@ -423,7 +423,8 @@ impl SmtpPipeline for AuthPipeline {
                         }));
                 }
                 let dkim_results = Arc::new(dkim_results);
-                let Some(from_domain) = from_domain else {
+                let has_duplicate_from = from_header.has_duplicate;
+                let Some(from_domain) = from_header.domain else {
                     // No usable `From:` header — DMARC cannot be evaluated;
                     // fail open (no enforcement) rather than block forever.
                     verdict.resolve(AuthVerdict::None);
@@ -448,6 +449,7 @@ impl SmtpPipeline for AuthPipeline {
                         dns,
                         psl,
                         &from_domain,
+                        has_duplicate_from,
                         spf_outcome.result,
                         spf_domain,
                         dkim_results,
@@ -513,19 +515,34 @@ pub(crate) fn find_header_boundary(buf: &[u8]) -> Option<usize> {
     None
 }
 
-fn from_header_domain(headers: &[RawHeader]) -> Option<String> {
-    let from = headers
+/// The result of resolving the message's `From:` header domain for DMARC
+/// alignment.
+struct FromHeader {
+    /// Domain parsed from the first `From:` header occurrence, if any.
+    domain: Option<String>,
+    /// Whether more than one `From:` header was present. RFC 5322 §3.6.2
+    /// permits at most one; mail clients disagree on which one they
+    /// display when a message illegally has more, so DMARC must not grant
+    /// a PASS on the strength of whichever domain this resolves to — see
+    /// RFC 7489 §7.6.
+    has_duplicate: bool,
+}
+
+fn from_header_domain(headers: &[RawHeader]) -> FromHeader {
+    let mut froms = headers
         .iter()
-        .find(|h| h.name().eq_ignore_ascii_case("From"))?;
-    let s = from.as_string_unfolded();
-    let value = s.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
-    let addresses = EmailAddressParser::parse_email_address_list(value)?;
-    for addr in &addresses {
-        if let Some(mailbox) = addr.as_mailbox() {
-            return Some(mailbox.domain().to_string());
-        }
-    }
-    None
+        .filter(|h| h.name().eq_ignore_ascii_case("From"));
+    let first = froms.next();
+    let has_duplicate = froms.next().is_some();
+    let domain = first.and_then(|from| {
+        let s = from.as_string_unfolded();
+        let value = s.split_once(':').map(|(_, v)| v.trim()).unwrap_or("");
+        let addresses = EmailAddressParser::parse_email_address_list(value)?;
+        addresses
+            .iter()
+            .find_map(|addr| addr.as_mailbox().map(|m| m.domain().to_string()))
+    });
+    FromHeader { domain, has_duplicate }
 }
 
 #[cfg(test)]
@@ -576,6 +593,38 @@ mod tests {
 
     fn message(from: &str) -> Vec<u8> {
         format!("From: {from}\r\nSubject: hi\r\n\r\nBody text.\r\n").into_bytes()
+    }
+
+    fn message_with_duplicate_from(first: &str, second: &str) -> Vec<u8> {
+        format!("From: {first}\r\nFrom: {second}\r\nSubject: hi\r\n\r\nBody text.\r\n").into_bytes()
+    }
+
+    #[test]
+    fn duplicate_from_header_does_not_grant_dmarc_pass() {
+        // RFC 5322 §3.6.2 permits at most one `From:` header. A message
+        // with two is ambiguous about which one a recipient's mail client
+        // will actually display (RFC 7489 §7.6), so DMARC must not PASS
+        // merely because *a* `From:` domain happens to align — even when,
+        // as here, the domain this pipeline resolves for alignment is SPF-
+        // aligned and would otherwise pass outright.
+        let dns: Arc<dyn DnsLookup> = Arc::new(
+            FakeDns::default()
+                .with_txt("example.com", "v=spf1 ip4:192.0.2.0/24 -all")
+                .with_txt("_dmarc.example.com", "v=DMARC1; p=reject"),
+        );
+        let mut pipeline =
+            AuthPipeline::builder(dns, "192.0.2.5".parse().unwrap(), "mail.example.com").build();
+        let verdict = pipeline.verdict();
+
+        let sender = EmailAddress::new(None, "alice", "example.com", true);
+        pipeline.mail_from(Some(&sender));
+        pipeline.message_content(&message_with_duplicate_from(
+            "alice@example.com",
+            "spoofed@attacker.example",
+        ));
+        pipeline.end_data();
+
+        assert_ne!(verdict.poll(), Some(AuthVerdict::Pass));
     }
 
     #[test]

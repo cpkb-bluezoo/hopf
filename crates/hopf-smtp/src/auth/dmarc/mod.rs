@@ -140,10 +140,12 @@ pub type DmarcCallback = Box<dyn FnOnce(DmarcOutcome) + Send>;
 /// * `dkim_results` — every verified `DKIM-Signature` (from
 ///   [`crate::auth::dkim::verify_all_with_body_hashes`]) — DMARC must
 ///   consider all of them, not just the first, when checking DKIM alignment.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     dns: Arc<dyn DnsLookup>,
     psl: &'static PublicSuffixList,
     from_domain: &str,
+    has_duplicate_from: bool,
     spf_result: SpfResult,
     spf_domain: Option<String>,
     dkim_results: Arc<Vec<DkimSignatureResult>>,
@@ -165,6 +167,7 @@ pub fn evaluate(
                         false,
                         record,
                         psl,
+                        has_duplicate_from,
                         spf_result,
                         spf_domain,
                         dkim_results,
@@ -192,6 +195,7 @@ pub fn evaluate(
                                         true,
                                         record,
                                         psl,
+                                        has_duplicate_from,
                                         spf_result,
                                         spf_domain,
                                         dkim_results,
@@ -230,23 +234,32 @@ fn finish_with_record(
     used_org_fallback: bool,
     record: DmarcRecord,
     psl: &'static PublicSuffixList,
+    has_duplicate_from: bool,
     spf_result: SpfResult,
     spf_domain: Option<String>,
     dkim_results: Arc<Vec<DkimSignatureResult>>,
     cb: DmarcCallback,
 ) {
-    let spf_aligned = spf_result == SpfResult::Pass
+    // RFC 5322 §3.6.2 permits at most one `From:` header; a message with
+    // more than one is ambiguous about which one a recipient's mail client
+    // will display, so alignment against `from_domain` (necessarily just
+    // one of them) cannot be trusted to vouch for what the recipient
+    // actually sees — treat the message the same as a failed alignment
+    // (RFC 7489 §7.6) rather than risk a PASS for the wrong header.
+    let spf_aligned = !has_duplicate_from
+        && spf_result == SpfResult::Pass
         && spf_domain
             .as_deref()
             .map(|d| domain_aligns(d, &from_domain, psl, record.aspf))
             .unwrap_or(false);
-    let dkim_aligned = dkim_results.iter().any(|r| {
-        r.result == DkimResult::Pass
-            && r.signing_domain
-                .as_deref()
-                .map(|d| domain_aligns(d, &from_domain, psl, record.adkim))
-                .unwrap_or(false)
-    });
+    let dkim_aligned = !has_duplicate_from
+        && dkim_results.iter().any(|r| {
+            r.result == DkimResult::Pass
+                && r.signing_domain
+                    .as_deref()
+                    .map(|d| domain_aligns(d, &from_domain, psl, record.adkim))
+                    .unwrap_or(false)
+        });
     let result = if spf_aligned || dkim_aligned {
         DmarcResult::Pass
     } else {
