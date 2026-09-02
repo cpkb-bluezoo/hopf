@@ -91,6 +91,16 @@ pub(crate) enum DriverCmd {
         stream_id: StreamId,
         priority: i32,
     },
+    /// A datagram arrived on a [`crate::path::QuicDatagramPath`] with no
+    /// file descriptor to register with `mio::Poll` — the push-based
+    /// counterpart to the default socket's poll-driven
+    /// [`Driver::on_udp_readable`]. See
+    /// [`QuicDriverHandle::receive_path_datagram`].
+    PathDatagram {
+        data: Vec<u8>,
+        source: SocketAddr,
+        ecn: Option<u8>,
+    },
     Shutdown,
 }
 
@@ -221,6 +231,43 @@ impl QuicDriverHandle {
         let _ = self.waker.wake();
         Ok(())
     }
+
+    /// Deliver a datagram received on a [`crate::path::QuicDatagramPath`]
+    /// to this connection — the push-based counterpart to the default
+    /// socket transport's poll-driven receive, for a path with no file
+    /// descriptor to register with a `Selector`/`mio::Poll`.
+    ///
+    /// Safe to call from any thread: the datagram is handed to the
+    /// driver's own worker thread via the same command channel every other
+    /// externally-triggered entry point into a connection already goes
+    /// through (e.g. [`Self::open_bi`]), never processed inline on the
+    /// calling thread.
+    pub fn receive_path_datagram(&self, data: Vec<u8>, source: SocketAddr) -> io::Result<()> {
+        self.receive_path_datagram_with_ecn(data, source, None)
+    }
+
+    /// [`Self::receive_path_datagram`], additionally reporting the ECN
+    /// codepoint the path itself observed for this datagram, if it can
+    /// recover one (most non-socket paths won't have one to report — `None`
+    /// is the normal case).
+    pub fn receive_path_datagram_with_ecn(
+        &self,
+        data: Vec<u8>,
+        source: SocketAddr,
+        ecn: Option<u8>,
+    ) -> io::Result<()> {
+        if !self.active.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "QUIC driver shut down",
+            ));
+        }
+        self.cmd_tx
+            .send(DriverCmd::PathDatagram { data, source, ecn })
+            .map_err(|_| io::Error::new(io::ErrorKind::NotConnected, "QUIC driver shut down"))?;
+        let _ = self.waker.wake();
+        Ok(())
+    }
 }
 
 impl Drop for QuicDriverHandle {
@@ -252,7 +299,37 @@ pub fn listen_quic(config: QuicListenConfig) -> io::Result<QuicDriverHandle> {
             factory: config.factory,
         },
         endpoint,
-        socket,
+        DatagramTransport::Socket(socket),
+        local_addr,
+        None,
+        require_address_validation,
+    )
+}
+
+/// [`listen_quic`], but accepting connections over `path` instead of a
+/// real UDP socket — see [`crate::QuicDatagramPath`].
+pub fn listen_quic_with_path(
+    config: QuicListenConfig,
+    path: Box<dyn crate::path::QuicDatagramPath>,
+    local_addr: SocketAddr,
+) -> io::Result<QuicDriverHandle> {
+    let mut server = config.server;
+    apply_listen_hardening(&mut server, &config.hardening);
+    let require_address_validation = config.hardening.require_address_validation;
+
+    let endpoint = QuinnEndpoint::new(
+        Arc::new(EndpointConfig::default()),
+        Some(server),
+        true,
+        None,
+    );
+
+    spawn_driver(
+        DriverMode::Server {
+            factory: config.factory,
+        },
+        endpoint,
+        DatagramTransport::Path(path),
         local_addr,
         None,
         require_address_validation,
@@ -279,7 +356,37 @@ pub fn listen_quic_hooks(config: QuicListenHooksConfig) -> io::Result<QuicDriver
             connection_factory: config.connection_factory,
         },
         endpoint,
-        socket,
+        DatagramTransport::Socket(socket),
+        local_addr,
+        None,
+        require_address_validation,
+    )
+}
+
+/// [`listen_quic_hooks`], but accepting connections over `path` instead of
+/// a real UDP socket — see [`crate::QuicDatagramPath`].
+pub fn listen_quic_hooks_with_path(
+    config: QuicListenHooksConfig,
+    path: Box<dyn crate::path::QuicDatagramPath>,
+    local_addr: SocketAddr,
+) -> io::Result<QuicDriverHandle> {
+    let mut server = config.server;
+    apply_listen_hardening(&mut server, &config.hardening);
+    let require_address_validation = config.hardening.require_address_validation;
+
+    let endpoint = QuinnEndpoint::new(
+        Arc::new(EndpointConfig::default()),
+        Some(server),
+        true,
+        None,
+    );
+
+    spawn_driver(
+        DriverMode::ServerHooks {
+            connection_factory: config.connection_factory,
+        },
+        endpoint,
+        DatagramTransport::Path(path),
         local_addr,
         None,
         require_address_validation,
@@ -301,7 +408,34 @@ pub fn connect_quic(config: QuicConnectConfig) -> io::Result<QuicDriverHandle> {
             server_name: config.server_name,
         },
         endpoint,
-        socket,
+        DatagramTransport::Socket(socket),
+        local_addr,
+        Some(config.addr),
+        false,
+    )
+}
+
+/// [`connect_quic`], but over `path` instead of a real UDP socket — see
+/// [`crate::QuicDatagramPath`]. `local_addr` is reported back to the
+/// application (e.g. via [`QuicDriverHandle::local_addr`]) exactly as
+/// given; it does not have to be routable, since `path` (not the OS
+/// network stack) is what actually carries the datagrams.
+pub fn connect_quic_with_path(
+    config: QuicConnectConfig,
+    path: Box<dyn crate::path::QuicDatagramPath>,
+    local_addr: SocketAddr,
+) -> io::Result<QuicDriverHandle> {
+    let endpoint = QuinnEndpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+
+    spawn_driver(
+        DriverMode::Client {
+            factory: config.factory,
+            peer: config.addr,
+            client_config: Arc::clone(&config.client),
+            server_name: config.server_name,
+        },
+        endpoint,
+        DatagramTransport::Path(path),
         local_addr,
         Some(config.addr),
         false,
@@ -328,7 +462,38 @@ pub fn connect_quic_hooks(
             server_name: server_name.into(),
         },
         endpoint,
-        socket,
+        DatagramTransport::Socket(socket),
+        local_addr,
+        Some(addr),
+        false,
+    )
+}
+
+/// [`connect_quic_hooks`], but over `path` instead of a real UDP socket —
+/// see [`crate::QuicDatagramPath`]. `local_addr` is reported back to the
+/// application exactly as given; it does not have to be routable, since
+/// `path` (not the OS network stack) is what actually carries the
+/// datagrams — the intended use is a QUIC (HTTP/3) connection tunnelled
+/// inside another protocol's payload, e.g. an RFC 9298 CONNECT-UDP client.
+pub fn connect_quic_hooks_with_path(
+    addr: SocketAddr,
+    client: Arc<quinn_proto::ClientConfig>,
+    server_name: impl Into<String>,
+    connection_factory: ConnectionFactory,
+    path: Box<dyn crate::path::QuicDatagramPath>,
+    local_addr: SocketAddr,
+) -> io::Result<QuicDriverHandle> {
+    let endpoint = QuinnEndpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+
+    spawn_driver(
+        DriverMode::ClientHooks {
+            connection_factory,
+            peer: addr,
+            client_config: client,
+            server_name: server_name.into(),
+        },
+        endpoint,
+        DatagramTransport::Path(path),
         local_addr,
         Some(addr),
         false,
@@ -401,15 +566,20 @@ struct ConnSlot {
 fn spawn_driver(
     mode: DriverMode,
     endpoint: QuinnEndpoint,
-    mut socket: UdpSocket,
+    mut transport: DatagramTransport,
     local_addr: SocketAddr,
     _peer_hint: Option<SocketAddr>,
     require_address_validation: bool,
 ) -> io::Result<QuicDriverHandle> {
     let mut poll = Poll::new()?;
     let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
-    poll.registry()
-        .register(&mut socket, UDP_TOKEN, Interest::READABLE)?;
+    // A `Path` transport has no file descriptor at all — its inbound
+    // datagrams arrive via `QuicDriverHandle::receive_path_datagram`
+    // instead, so there's nothing to register with `poll` here.
+    if let DatagramTransport::Socket(socket) = &mut transport {
+        poll.registry()
+            .register(socket, UDP_TOKEN, Interest::READABLE)?;
+    }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<DriverCmd>();
     let active = Arc::new(AtomicBool::new(true));
@@ -432,7 +602,7 @@ fn spawn_driver(
             let mut driver = Driver {
                 mode,
                 endpoint,
-                socket,
+                transport,
                 local_addr,
                 connections: HashMap::new(),
                 cmd_rx,
@@ -600,10 +770,24 @@ mod residual_tests {
     }
 }
 
+/// What a [`Driver`] actually sends and receives datagrams on.
+///
+/// `Socket` is the default, used by every existing `connect_quic`/
+/// `listen_quic` entry point and their `_hooks` counterparts — it keeps
+/// the exact ECN/GSO-aware fast path [`crate::udp`] already has, and is
+/// the only variant registered with the driver's `mio::Poll` (a
+/// [`crate::path::QuicDatagramPath`] has no file descriptor to register;
+/// its inbound datagrams arrive via [`QuicDriverHandle::receive_path_datagram`]
+/// instead — see [`Driver::handle_datagram`]).
+enum DatagramTransport {
+    Socket(UdpSocket),
+    Path(Box<dyn crate::path::QuicDatagramPath>),
+}
+
 struct Driver {
     mode: DriverMode,
     endpoint: QuinnEndpoint,
-    socket: UdpSocket,
+    transport: DatagramTransport,
     local_addr: SocketAddr,
     connections: HashMap<ConnectionHandle, ConnSlot>,
     cmd_rx: Receiver<DriverCmd>,
@@ -747,6 +931,11 @@ impl Driver {
     }
 
     fn sync_udp_interest(&mut self, poll: &mut Poll) -> io::Result<()> {
+        // A `Path` transport has no file descriptor registered with `poll`
+        // at all — nothing to keep in sync.
+        let DatagramTransport::Socket(socket) = &mut self.transport else {
+            return Ok(());
+        };
         let desired = if self.pending_sends.is_empty() {
             Interest::READABLE
         } else {
@@ -754,16 +943,24 @@ impl Driver {
         };
         if desired != self.udp_interest {
             self.udp_interest = desired;
-            poll.registry()
-                .reregister(&mut self.socket, UDP_TOKEN, desired)?;
+            poll.registry().reregister(socket, UDP_TOKEN, desired)?;
         }
         Ok(())
     }
 
     fn flush_pending_sends(&mut self) -> io::Result<()> {
-        let socket = &self.socket;
-        self.pending_sends
-            .flush(|pending| crate::udp::send_pending(socket, pending))
+        let transport = &mut self.transport;
+        self.pending_sends.flush(|pending| match transport {
+            DatagramTransport::Socket(socket) => crate::udp::send_pending(socket, pending),
+            DatagramTransport::Path(path) => path
+                .send(
+                    pending.destination,
+                    &pending.data,
+                    pending.ecn,
+                    pending.segment_size,
+                )
+                .map(|_| ()),
+        })
     }
 
     /// How long the mio poll should sleep before the next wake — the
@@ -869,6 +1066,11 @@ impl Driver {
                         let _ = slot.conn.send_stream(stream_id).set_priority(priority);
                     }
                 }
+                DriverCmd::PathDatagram { data, source, ecn } => {
+                    let now = Instant::now();
+                    let data = bytes::BytesMut::from(&data[..]);
+                    let _ = self.handle_datagram(now, source, ecn, data);
+                }
             }
         }
     }
@@ -924,35 +1126,60 @@ impl Driver {
 
     fn on_udp_readable(&mut self, now: Instant) -> io::Result<()> {
         loop {
-            let (n, remote, ecn) = match crate::udp::recv_one(&self.socket, &mut self.recv_buf) {
+            let DatagramTransport::Socket(socket) = &self.transport else {
+                // Never actually reached — a `Path` transport has no fd
+                // registered with `poll`, so no `UDP_TOKEN` event fires for
+                // it in the first place (see `sync_udp_interest`).
+                // Defensive only.
+                return Ok(());
+            };
+            let (n, remote, ecn) = match crate::udp::recv_one(socket, &mut self.recv_buf) {
                 Ok(x) => x,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             };
             let data = bytes::BytesMut::from(&self.recv_buf[..n]);
-            self.send_buf.clear();
-            if let Some(event) =
-                self.endpoint
-                    .handle(now, remote, None, ecn, data, &mut self.send_buf)
-            {
-                match event {
-                    DatagramEvent::NewConnection(incoming) => {
-                        self.handle_incoming(incoming, remote, now)?;
-                    }
-                    DatagramEvent::ConnectionEvent(ch, event) => {
-                        if let Some(slot) = self.connections.get_mut(&ch) {
-                            slot.conn.handle_event(event);
-                        }
-                    }
-                    DatagramEvent::Response(tx) => {
-                        self.send_transmit(tx)?;
+            let ecn = ecn.map(|c| c as u8);
+            self.handle_datagram(now, remote, ecn, data)?;
+        }
+        Ok(())
+    }
+
+    /// Process one received datagram through the `quinn-proto` endpoint,
+    /// regardless of which [`DatagramTransport`] it arrived on — shared by
+    /// [`Self::on_udp_readable`] (the default socket's poll-driven receive)
+    /// and [`DriverCmd::PathDatagram`] (a custom
+    /// [`crate::path::QuicDatagramPath`]'s push-based receive).
+    fn handle_datagram(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<u8>,
+        data: bytes::BytesMut,
+    ) -> io::Result<()> {
+        let ecn = ecn.and_then(quinn_proto::EcnCodepoint::from_bits);
+        self.send_buf.clear();
+        if let Some(event) =
+            self.endpoint
+                .handle(now, remote, None, ecn, data, &mut self.send_buf)
+        {
+            match event {
+                DatagramEvent::NewConnection(incoming) => {
+                    self.handle_incoming(incoming, remote, now)?;
+                }
+                DatagramEvent::ConnectionEvent(ch, event) => {
+                    if let Some(slot) = self.connections.get_mut(&ch) {
+                        slot.conn.handle_event(event);
                     }
                 }
+                DatagramEvent::Response(tx) => {
+                    self.send_transmit(tx)?;
+                }
             }
-            if !self.send_buf.is_empty() {
-                // Response already sent via Transmit.
-                self.send_buf.clear();
-            }
+        }
+        if !self.send_buf.is_empty() {
+            // Response already sent via Transmit.
+            self.send_buf.clear();
         }
         Ok(())
     }
@@ -1832,7 +2059,15 @@ impl Driver {
             return Ok(());
         }
         let buf = &self.send_buf[..size];
-        match crate::udp::send_transmit(&self.socket, &transmit, buf) {
+        let result = match &mut self.transport {
+            DatagramTransport::Socket(socket) => crate::udp::send_transmit(socket, &transmit, buf),
+            DatagramTransport::Path(path) => {
+                let ecn = transmit.ecn.map(|c| c as u8);
+                path.send(transmit.destination, buf, ecn, transmit.segment_size)
+                    .map(|_| ())
+            }
+        };
+        match result {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 self.pending_sends.enqueue_transmit(&transmit, buf);
@@ -2080,6 +2315,127 @@ mod tests {
         }
         assert_eq!(got.lock().unwrap().as_slice(), b"ping");
         server.shutdown();
+    }
+
+    /// [`crate::QuicDatagramPath`] backed by nothing but a channel to the
+    /// peer's own [`QuicDriverHandle`] — no real socket, no OS network
+    /// stack, proving the pluggable-transport seam itself works rather
+    /// than just compiling.
+    struct InMemoryDatagramPath {
+        local_addr: SocketAddr,
+        peer: Arc<StdMutex<Option<QuicDriverHandle>>>,
+        open: Arc<AtomicBool>,
+    }
+
+    impl crate::path::QuicDatagramPath for InMemoryDatagramPath {
+        fn send(
+            &mut self,
+            _dest: SocketAddr,
+            data: &[u8],
+            _ecn: Option<u8>,
+            _segment_size: Option<usize>,
+        ) -> io::Result<usize> {
+            // There's only ever one peer on this pipe — `_dest` (which
+            // `quinn-proto` always sets to the address `connect()`/`accept()`
+            // negotiated) carries no extra routing information a real
+            // multi-destination socket would need.
+            let len = data.len();
+            let guard = self.peer.lock().unwrap();
+            let Some(handle) = guard.as_ref() else {
+                return Err(io::Error::new(io::ErrorKind::NotConnected, "peer not yet attached"));
+            };
+            handle.receive_path_datagram(data.to_vec(), self.local_addr)?;
+            Ok(len)
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok(self.local_addr)
+        }
+
+        fn is_open(&self) -> bool {
+            self.open.load(Ordering::Acquire)
+        }
+
+        fn close(&mut self) -> io::Result<()> {
+            self.open.store(false, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    /// A full QUIC handshake plus one echoed stream, over two
+    /// [`InMemoryDatagramPath`]s instead of real UDP sockets — the same
+    /// scenario [`spike_echo_one_stream`] exercises over real loopback
+    /// sockets, but proving [`listen_quic_with_path`]/
+    /// [`connect_quic_with_path`] and [`QuicDriverHandle::receive_path_datagram`]
+    /// are what actually carry it end to end.
+    #[test]
+    fn spike_echo_one_stream_over_a_pluggable_path() {
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+
+        // Addresses need only be distinct and stable — nothing routes on
+        // them; every send is handed directly to the peer's driver.
+        let server_addr: SocketAddr = "127.0.0.1:44433".parse().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:44434".parse().unwrap();
+
+        let server_handle_cell: Arc<StdMutex<Option<QuicDriverHandle>>> =
+            Arc::new(StdMutex::new(None));
+        let client_handle_cell: Arc<StdMutex<Option<QuicDriverHandle>>> =
+            Arc::new(StdMutex::new(None));
+
+        let server_path = Box::new(InMemoryDatagramPath {
+            local_addr: server_addr,
+            peer: Arc::clone(&client_handle_cell),
+            open: Arc::new(AtomicBool::new(true)),
+        });
+        let client_path = Box::new(InMemoryDatagramPath {
+            local_addr: client_addr,
+            peer: Arc::clone(&server_handle_cell),
+            open: Arc::new(AtomicBool::new(true)),
+        });
+
+        let server = listen_quic_with_path(
+            QuicListenConfig::new(
+                server_addr,
+                server_cfg,
+                Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+            ),
+            server_path,
+            server_addr,
+        )
+        .unwrap();
+        *server_handle_cell.lock().unwrap() = Some(server);
+
+        let got = Arc::new(StdMutex::new(Vec::new()));
+        let got2 = Arc::clone(&got);
+        let client = connect_quic_with_path(
+            QuicConnectConfig::new(
+                server_addr,
+                client_cfg,
+                "localhost",
+                Arc::new(move || {
+                    Box::new(ClientProbe {
+                        sent: false,
+                        got: Arc::clone(&got2),
+                    }) as Box<dyn ProtocolHandler>
+                }),
+            ),
+            client_path,
+            client_addr,
+        )
+        .unwrap();
+        *client_handle_cell.lock().unwrap() = Some(client);
+
+        for _ in 0..200 {
+            if got.lock().unwrap().as_slice() == b"ping" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(got.lock().unwrap().as_slice(), b"ping");
+
+        server_handle_cell.lock().unwrap().take().unwrap().shutdown();
     }
 
     /// Default listen hardening requires Retry before accept; a normal
