@@ -294,6 +294,30 @@ impl ClientWriter for NullClientWriter {
     fn complete_request(&mut self) {}
 }
 
+/// [`ClientWriter`] passed to
+/// [`ClientHandler::switching_protocols`](crate::stream::ClientHandler::switching_protocols)
+/// on a client stream — the request is already fully sent by this point, so
+/// everything except [`ClientWriter::upgrade`] is a no-op.
+struct H2ClientUpgradeWriter<'a> {
+    pending: &'a mut Option<Box<dyn ProtocolUpgradeHandler>>,
+}
+
+impl ClientWriter for H2ClientUpgradeWriter<'_> {
+    fn headers(&mut self, _headers: Headers) {}
+    fn start_request_body(&mut self) {}
+    fn request_body_content(&mut self, _data: &[u8]) {}
+    fn end_request_body(&mut self) {}
+    fn complete_request(&mut self) {}
+
+    fn upgrade(&mut self, handler: Box<dyn ProtocolUpgradeHandler>) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        *self.pending = Some(handler);
+        true
+    }
+}
+
 /// Live state for one outbound H2 stream (client role).
 struct H2ClientStream {
     #[allow(dead_code)]
@@ -308,6 +332,19 @@ struct H2ClientStream {
     /// Whether the final byte of `pending_body` (once fully sent) should
     /// carry END_STREAM.
     pending_end_stream: bool,
+    /// Whether the outbound request was Extended CONNECT (RFC 8441/9220:
+    /// `:method: CONNECT` + `:protocol`) — only such a request's first `2xx`
+    /// response is treated as a protocol switch rather than an ordinary
+    /// response.
+    is_extended_connect: bool,
+    /// Installed once the app calls `ClientWriter::upgrade` from
+    /// `switching_protocols` — subsequent DATA frames on this stream go to
+    /// it instead of `handler.response_body_content`.
+    upgraded: Option<Box<dyn ProtocolUpgradeHandler>>,
+    /// Whether the upgraded stream carries Capsule Protocol framing (RFC
+    /// 9297 §3.4) rather than a raw byte/DATA-frame stream.
+    capsule_mode: bool,
+    capsule_parser: crate::capsule::CapsuleParser,
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +563,10 @@ impl H2Endpoint {
                 response_body_started: false,
                 pending_body: Vec::new(),
                 pending_end_stream: false,
+                is_extended_connect: false,
+                upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
             },
         );
         ep
@@ -788,6 +829,14 @@ impl H2Endpoint {
         let headers = writer.request_headers.take().unwrap_or_default();
         let body = std::mem::take(&mut writer.body);
         let end_stream = writer.done;
+        // RFC 8441 / RFC 9220 Extended CONNECT: only such a request's first
+        // `2xx` response should be treated as a protocol switch rather than
+        // an ordinary response — see where `response_headers_received`
+        // flips below.
+        let is_extended_connect = headers
+            .get(":method")
+            .is_some_and(|m| m.eq_ignore_ascii_case("CONNECT"))
+            && headers.contains(":protocol");
 
         let block = self
             .encoder
@@ -821,6 +870,10 @@ impl H2Endpoint {
                 response_body_started: false,
                 pending_body: remaining,
                 pending_end_stream,
+                is_extended_connect,
+                upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
             },
         );
     }
@@ -881,6 +934,10 @@ impl H2Endpoint {
                 response_body_started: false,
                 pending_body: Vec::new(),
                 pending_end_stream: false,
+                is_extended_connect: false,
+                upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
             },
         );
 
@@ -933,7 +990,15 @@ impl H2Endpoint {
     /// see issue #88).
     fn fail_client_streams(&mut self, err: &std::io::Error) {
         for (_, mut stream) in std::mem::take(&mut self.client_streams) {
-            stream.handler.request_failed(&mut NullClientWriter, err);
+            if let Some(up) = stream.upgraded.as_mut() {
+                // The app already moved on from `ClientHandler` callbacks
+                // once `switching_protocols` installed this handler — tell
+                // it, not the original request handler, that the
+                // connection is gone.
+                up.closed();
+            } else {
+                stream.handler.request_failed(&mut NullClientWriter, err);
+            }
         }
     }
 
@@ -1266,13 +1331,30 @@ impl H2Endpoint {
                 stream.handler.response_trailers(&mut w, &headers);
             } else {
                 stream.response_headers_received = true;
-                stream.handler.response_headers(&mut w, &headers);
+                if stream.is_extended_connect && (200..300).contains(&headers.status_code()) {
+                    stream.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);
+                    let mut uw = H2ClientUpgradeWriter {
+                        pending: &mut stream.upgraded,
+                    };
+                    stream.handler.switching_protocols(&mut uw, &headers);
+                } else {
+                    stream.handler.response_headers(&mut w, &headers);
+                }
             }
             if end_stream {
-                if stream.response_body_started {
-                    stream.handler.end_response_body(&mut w);
+                if let Some(up) = stream.upgraded.as_mut() {
+                    // The server accepted the upgrade and immediately
+                    // closed the stream on the same HEADERS frame — valid,
+                    // if unusual. The app already committed to the upgrade
+                    // path via `switching_protocols`; it no longer expects
+                    // `response_complete`.
+                    up.closed();
+                } else {
+                    if stream.response_body_started {
+                        stream.handler.end_response_body(&mut w);
+                    }
+                    stream.handler.response_complete(&mut w);
                 }
-                stream.handler.response_complete(&mut w);
                 self.flow.close_stream(stream_id);
                 self.client_streams.remove(&stream_id);
             }
@@ -1431,8 +1513,46 @@ impl H2Endpoint {
         }
 
         let end_stream = flags & FLAG_END_STREAM != 0;
-        let mut w = NullClientWriter;
         if let Some(stream) = self.client_streams.get_mut(&stream_id) {
+            if stream.upgraded.is_some() {
+                if stream.capsule_mode {
+                    if !data.is_empty() {
+                        match stream.capsule_parser.push(data) {
+                            Ok(capsules) => {
+                                if let Some(up) = stream.upgraded.as_mut() {
+                                    for c in capsules {
+                                        if c.ty == crate::capsule::CAPSULE_DATAGRAM {
+                                            if up.wants_datagrams() {
+                                                up.datagram_received(&c.value);
+                                            }
+                                        } else {
+                                            up.capsule_received(c.ty, &c.value);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(()) => {
+                                frame::write_rst_stream(&mut self.out, stream_id, ERROR_PROTOCOL_ERROR);
+                                return;
+                            }
+                        }
+                    }
+                } else if let Some(up) = stream.upgraded.as_mut() {
+                    if !data.is_empty() {
+                        up.receive(data);
+                    }
+                }
+                if end_stream {
+                    if let Some(up) = stream.upgraded.as_mut() {
+                        up.closed();
+                    }
+                    self.flow.close_stream(stream_id);
+                    self.client_streams.remove(&stream_id);
+                }
+                return;
+            }
+
+            let mut w = NullClientWriter;
             if !data.is_empty() {
                 if !stream.response_body_started {
                     stream.response_body_started = true;
@@ -1705,6 +1825,24 @@ impl H2Endpoint {
     /// runs on every `receive()` — including one that just processed the
     /// peer's WINDOW_UPDATE.
     fn flush_client_streams(&mut self) {
+        // Pull upgraded streams' outbound bytes into the same flow-controlled
+        // `pending_body`/`pending_end_stream` retry path ordinary request
+        // bodies already use below — DATA frames on an upgraded H2 stream
+        // are still subject to flow control, so there's no shortcut around
+        // it here the way H1's raw byte stream or H3's per-request budget
+        // allow.
+        for stream in self.client_streams.values_mut() {
+            if let Some(up) = stream.upgraded.as_mut() {
+                let out = up.take_outbound();
+                if !out.is_empty() {
+                    stream.pending_body.extend_from_slice(&out);
+                }
+                if up.wants_close() {
+                    stream.pending_end_stream = true;
+                }
+            }
+        }
+
         // Streams with an empty backlog but a still-pending END_STREAM need
         // a pass too — that's an explicit "no more body, but still need to
         // send the empty final DATA frame" state from
@@ -2703,6 +2841,10 @@ mod client_goaway_tests {
                 response_body_started: false,
                 pending_body: Vec::new(),
                 pending_end_stream: false,
+                is_extended_connect: false,
+                upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
             },
         );
         ep.flow.open_stream(id, crate::h2::flow::INITIAL_WINDOW_SIZE);
@@ -2784,6 +2926,10 @@ mod flow_control_error_tests {
                 response_body_started: false,
                 pending_body: Vec::new(),
                 pending_end_stream: false,
+                is_extended_connect: false,
+                upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
             },
         );
         ep.flow.open_stream(id, i32::MAX - 5);
@@ -3050,6 +3196,10 @@ mod client_informational_response_tests {
                 response_body_started: false,
                 pending_body: Vec::new(),
                 pending_end_stream: false,
+                is_extended_connect: false,
+                upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
             },
         );
     }
@@ -3114,6 +3264,171 @@ mod client_informational_response_tests {
         assert_eq!(r.completed, 1);
     }
 
+}
+
+#[cfg(test)]
+mod client_upgrade_tests {
+    use super::*;
+    use crate::stream::{ClientHandler, ClientHandlerFactory, ClientWriter};
+
+    fn encode_headers(pairs: &[(&str, &str)]) -> Vec<u8> {
+        super::super::hpack::Encoder::new(4096).encode(pairs.iter().copied())
+    }
+
+    struct NoopClientFactory;
+    impl ClientHandlerFactory for NoopClientFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+    fn client_endpoint() -> H2Endpoint {
+        H2Endpoint::client(Arc::new(NoopClientFactory), HttpLimits::default(), false)
+    }
+
+    /// Records bytes handed to it via shared state so a test can inspect it
+    /// after the handler itself has moved into a `Box<dyn
+    /// ProtocolUpgradeHandler>`.
+    #[derive(Default)]
+    struct RecordingUpgrade {
+        received: Vec<u8>,
+        outbound: Vec<u8>,
+        closed: bool,
+    }
+
+    struct RecordingUpgradeHandler(Arc<std::sync::Mutex<RecordingUpgrade>>);
+
+    impl ProtocolUpgradeHandler for RecordingUpgradeHandler {
+        fn receive(&mut self, data: &[u8]) {
+            self.0.lock().unwrap().received.extend_from_slice(data);
+        }
+        fn take_outbound(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.0.lock().unwrap().outbound)
+        }
+        fn closed(&mut self) {
+            self.0.lock().unwrap().closed = true;
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorded {
+        switched: bool,
+        final_status: Option<u16>,
+        completed: usize,
+        request_failed_called: bool,
+    }
+
+    struct UpgradingHandler {
+        rec: Arc<std::sync::Mutex<Recorded>>,
+        upgrade: Arc<std::sync::Mutex<RecordingUpgrade>>,
+    }
+    impl ClientHandler for UpgradingHandler {
+        fn start(&mut self, _request: &mut dyn ClientWriter) {}
+        fn switching_protocols(&mut self, request: &mut dyn ClientWriter, _headers: &Headers) {
+            self.rec.lock().unwrap().switched = true;
+            assert!(request.upgrade(Box::new(RecordingUpgradeHandler(Arc::clone(&self.upgrade)))));
+        }
+        fn response_headers(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
+            self.rec.lock().unwrap().final_status = Some(headers.status_code());
+        }
+        fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
+            self.rec.lock().unwrap().completed += 1;
+        }
+        fn request_failed(&mut self, _request: &mut dyn ClientWriter, _err: &std::io::Error) {
+            self.rec.lock().unwrap().request_failed_called = true;
+        }
+    }
+
+    fn insert_extended_connect_stream(
+        ep: &mut H2Endpoint,
+        id: u32,
+        rec: &Arc<std::sync::Mutex<Recorded>>,
+        upgrade: &Arc<std::sync::Mutex<RecordingUpgrade>>,
+    ) {
+        ep.flow.open_stream(id, ep.peer_initial_window_size);
+        ep.client_streams.insert(
+            id,
+            H2ClientStream {
+                id,
+                handler: Box::new(UpgradingHandler {
+                    rec: Arc::clone(rec),
+                    upgrade: Arc::clone(upgrade),
+                }),
+                response_headers_received: false,
+                response_body_started: false,
+                pending_body: Vec::new(),
+                pending_end_stream: false,
+                is_extended_connect: true,
+                upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
+            },
+        );
+    }
+
+    /// A `2xx` response to an Extended CONNECT request fires
+    /// `switching_protocols` (never `response_headers`/`response_complete`),
+    /// and installing a [`ProtocolUpgradeHandler`] via `ClientWriter::upgrade`
+    /// routes subsequent DATA frames to it instead of the original handler.
+    #[test]
+    fn successful_extended_connect_installs_upgrade_handler_and_relays_data() {
+        let mut ep = client_endpoint();
+        let rec = Arc::new(std::sync::Mutex::new(Recorded::default()));
+        let upgrade = Arc::new(std::sync::Mutex::new(RecordingUpgrade::default()));
+        insert_extended_connect_stream(&mut ep, 1, &rec, &upgrade);
+
+        let headers = encode_headers(&[(":status", "200")]);
+        ep.process_client_response_headers(1, &headers, false);
+
+        assert!(rec.lock().unwrap().switched);
+        assert!(rec.lock().unwrap().final_status.is_none(), "must not be treated as an ordinary response");
+        assert_eq!(rec.lock().unwrap().completed, 0);
+
+        ep.on_data(1, 0, b"hello from the peer");
+        assert_eq!(upgrade.lock().unwrap().received, b"hello from the peer");
+
+        upgrade.lock().unwrap().outbound = b"reply".to_vec();
+        ep.out.clear();
+        ep.flush_client_streams();
+        assert!(
+            ep.out.windows(5).any(|w| w == b"reply"),
+            "outbound bytes must reach the flow-controlled send path and go out as a DATA frame: {:?}",
+            ep.out
+        );
+    }
+
+    /// A non-2xx response to an Extended CONNECT request (the peer declined)
+    /// is treated as an ordinary response, not a protocol switch.
+    #[test]
+    fn declined_extended_connect_is_an_ordinary_response() {
+        let mut ep = client_endpoint();
+        let rec = Arc::new(std::sync::Mutex::new(Recorded::default()));
+        let upgrade = Arc::new(std::sync::Mutex::new(RecordingUpgrade::default()));
+        insert_extended_connect_stream(&mut ep, 1, &rec, &upgrade);
+
+        let headers = encode_headers(&[(":status", "403")]);
+        ep.process_client_response_headers(1, &headers, true);
+
+        assert!(!rec.lock().unwrap().switched);
+        assert_eq!(rec.lock().unwrap().final_status, Some(403));
+        assert_eq!(rec.lock().unwrap().completed, 1);
+    }
+
+    /// Connection teardown after a successful upgrade notifies the
+    /// [`ProtocolUpgradeHandler`], not the original request handler.
+    #[test]
+    fn connection_teardown_after_upgrade_closes_the_upgrade_handler() {
+        let mut ep = client_endpoint();
+        let rec = Arc::new(std::sync::Mutex::new(Recorded::default()));
+        let upgrade = Arc::new(std::sync::Mutex::new(RecordingUpgrade::default()));
+        insert_extended_connect_stream(&mut ep, 1, &rec, &upgrade);
+        ep.process_client_response_headers(1, &encode_headers(&[(":status", "200")]), false);
+        assert!(rec.lock().unwrap().switched);
+
+        ep.fail_client_streams(&std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed"));
+
+        assert!(upgrade.lock().unwrap().closed);
+        assert!(!rec.lock().unwrap().request_failed_called, "the original ClientHandler must not see request_failed once upgraded");
+    }
 }
 
 /// [`open_client_stream`](H2Endpoint::open_client_stream) /

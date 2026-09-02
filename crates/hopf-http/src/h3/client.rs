@@ -13,7 +13,7 @@ use hopf_quic::{
 };
 
 use crate::{
-    ClientHandler, ClientHandlerFactory, ClientWriter, Headers, HttpLimits,
+    ClientHandler, ClientHandlerFactory, ClientWriter, Headers, HttpLimits, ProtocolUpgradeHandler,
 };
 
 use super::endpoint::{decode_h3_datagram, H3PeerState, H3UniStream};
@@ -294,6 +294,30 @@ impl ClientWriter for NullClientWriter {
     fn complete_request(&mut self) {}
 }
 
+/// [`ClientWriter`] passed to
+/// [`ClientHandler::switching_protocols`](crate::stream::ClientHandler::switching_protocols)
+/// on a client stream — the request is already fully sent by this point, so
+/// everything except [`ClientWriter::upgrade`] is a no-op.
+struct H3ClientUpgradeWriter<'a> {
+    pending: &'a mut Option<Box<dyn ProtocolUpgradeHandler>>,
+}
+
+impl ClientWriter for H3ClientUpgradeWriter<'_> {
+    fn headers(&mut self, _: Headers) {}
+    fn start_request_body(&mut self) {}
+    fn request_body_content(&mut self, _: &[u8]) {}
+    fn end_request_body(&mut self) {}
+    fn complete_request(&mut self) {}
+
+    fn upgrade(&mut self, handler: Box<dyn ProtocolUpgradeHandler>) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        *self.pending = Some(handler);
+        true
+    }
+}
+
 /// Validate a response header list's `:status` pseudo-header (RFC 9114
 /// §4.3.2): present, first, and a well-formed 3-digit numeric value. No
 /// other pseudo-header is legal in a response.
@@ -359,6 +383,18 @@ struct H3ClientStream {
     pending_outbound: Option<PendingOutbound>,
     body_tracker: message_body::MessageBodyTracker,
     message_phase: stream_phase::StreamMessagePhase,
+    /// Whether the outbound request was Extended CONNECT (RFC 8441/9220) —
+    /// only such a request's first `2xx` response is treated as a protocol
+    /// switch rather than an ordinary response.
+    is_extended_connect: bool,
+    /// Installed once the app calls `ClientWriter::upgrade` from
+    /// `switching_protocols` — subsequent DATA frames (and native QUIC
+    /// datagrams) on this stream go to it instead of `handler`.
+    upgraded: Option<Box<dyn ProtocolUpgradeHandler>>,
+    /// Whether the upgraded stream carries Capsule Protocol framing (RFC
+    /// 9297 §3.4) rather than raw DATA-frame bytes.
+    capsule_mode: bool,
+    capsule_parser: crate::capsule::CapsuleParser,
 }
 
 impl H3ClientStream {
@@ -387,6 +423,10 @@ impl H3ClientStream {
             pending_outbound: None,
             body_tracker: message_body::MessageBodyTracker::default(),
             message_phase: stream_phase::StreamMessagePhase::default(),
+            is_extended_connect: false,
+            upgraded: None,
+            capsule_mode: false,
+            capsule_parser: crate::capsule::CapsuleParser::new(),
         }
     }
 
@@ -527,6 +567,7 @@ impl H3ClientStream {
         };
 
         if is_extended_connect(&pending.headers) {
+            self.is_extended_connect = true;
             let enable = self.peer_state.lock().unwrap().peer_enable_connect_protocol;
             match enable {
                 Some(false) => {
@@ -584,6 +625,35 @@ impl H3FrameHandler for H3ClientStream {
             .is_err()
         {
             self.malformed = true;
+            return;
+        }
+        if self.upgraded.is_some() {
+            if self.capsule_mode {
+                if !payload.is_empty() {
+                    match self.capsule_parser.push(payload) {
+                        Ok(capsules) => {
+                            if let Some(up) = self.upgraded.as_mut() {
+                                for c in capsules {
+                                    if c.ty == crate::capsule::CAPSULE_DATAGRAM {
+                                        if up.wants_datagrams() {
+                                            up.datagram_received(&c.value);
+                                        }
+                                    } else {
+                                        up.capsule_received(c.ty, &c.value);
+                                    }
+                                }
+                            }
+                        }
+                        Err(()) => {
+                            self.malformed = true;
+                        }
+                    }
+                }
+            } else if let Some(up) = self.upgraded.as_mut() {
+                if !payload.is_empty() {
+                    up.receive(payload);
+                }
+            }
             return;
         }
         let mut w = NullClientWriter;
@@ -732,7 +802,15 @@ impl H3FrameHandler for H3ClientStream {
                     return;
                 }
                 self.response_headers_received = true;
-                handler.response_headers(&mut w, &headers);
+                if self.is_extended_connect && (200..300).contains(&headers.status_code()) {
+                    self.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);
+                    let mut uw = H3ClientUpgradeWriter {
+                        pending: &mut self.upgraded,
+                    };
+                    handler.switching_protocols(&mut uw, &headers);
+                } else {
+                    handler.response_headers(&mut w, &headers);
+                }
                 self.message_phase = self.message_phase.opened_message();
             }
         }
@@ -784,6 +862,19 @@ impl ProtocolHandler for H3ClientStream {
         parser.push(data, self);
         self.parser = parser;
         *data = &[];
+        if let Some(up) = self.upgraded.as_mut() {
+            let wants_close = up.wants_close();
+            let out = up.take_outbound();
+            if !out.is_empty() {
+                let mut framed = Vec::with_capacity(out.len() + 8);
+                frame::write_data(&mut framed, &out);
+                endpoint.send(&framed);
+            }
+            if wants_close {
+                endpoint.close();
+                return;
+            }
+        }
         if self.qpack_error {
             // RFC 9204 §4.5.1: a field section this decoder can't process
             // desynchronizes the whole connection's QPACK state, not just
@@ -817,6 +908,10 @@ impl ProtocolHandler for H3ClientStream {
     }
 
     fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
+        if let Some(up) = self.upgraded.as_mut() {
+            up.closed();
+            return;
+        }
         if self.body_tracker.finish_message().is_err() {
             self.malformed = true;
             endpoint.abort(frame::H3_MESSAGE_ERROR);
@@ -833,10 +928,22 @@ impl ProtocolHandler for H3ClientStream {
         // peer's encoder release any dynamic-table references it held open
         // for it.
         self.qpack.cancel_stream(self.stream_id);
+        if let Some(up) = self.upgraded.as_mut() {
+            up.closed();
+            return;
+        }
         self.finish_response();
     }
 
     fn datagram_received(&mut self, endpoint: &mut dyn Endpoint, data: &[u8]) {
+        if let Some(up) = self.upgraded.as_mut() {
+            if up.wants_datagrams() {
+                up.datagram_received(data);
+                return;
+            }
+            endpoint.abort(super::datagram::H3_DATAGRAM_ERROR);
+            return;
+        }
         if let Some(handler) = self.handler.as_mut() {
             if handler.wants_datagrams() {
                 handler.datagram_received(data);
@@ -1499,5 +1606,246 @@ mod goaway_enforcement_tests {
             "no further open_bi after GOAWAY received"
         );
         assert_eq!(pending.lock().unwrap().len(), 4); // 2 unmatched from first drain + 2 new
+    }
+}
+
+#[cfg(test)]
+mod client_upgrade_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct RecordingEndpoint {
+        closed: bool,
+        abort_code: Option<u32>,
+        sent: Vec<u8>,
+    }
+    impl Endpoint for RecordingEndpoint {
+        fn send(&mut self, data: &[u8]) {
+            self.sent.extend_from_slice(data);
+        }
+        fn is_open(&self) -> bool {
+            !self.closed
+        }
+        fn is_closing(&self) -> bool {
+            self.closed
+        }
+        fn close(&mut self) {
+            self.closed = true;
+        }
+        fn abort(&mut self, error_code: u32) {
+            self.closed = true;
+            self.abort_code = Some(error_code);
+        }
+        fn close_connection(&mut self, _error_code: u32) {
+            self.closed = true;
+        }
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn remote_addr(&self) -> std::io::Result<SocketAddr> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn security_info(&self) -> &hopf_core::SecurityInfo {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn start_tls(&mut self) -> Result<(), hopf_core::StartTlsError> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _callback: Option<hopf_core::WriteReadyCallback>) {}
+        fn execute(&self, _task: Box<dyn FnOnce() + Send>) {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn schedule_timer(
+            &self,
+            _delay: Duration,
+            _callback: Box<dyn FnOnce() + Send>,
+        ) -> hopf_core::TimerHandle {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn handle(&self) -> hopf_core::ConnHandle {
+            hopf_core::ConnHandle::from_execute(std::sync::Arc::new(|task| task()))
+        }
+    }
+
+    /// Records bytes handed to it via shared state so a test can inspect it
+    /// after the handler itself has moved into a `Box<dyn
+    /// ProtocolUpgradeHandler>`.
+    #[derive(Default)]
+    struct RecordingUpgrade {
+        received: Vec<u8>,
+        outbound: Vec<u8>,
+        closed: bool,
+    }
+
+    struct RecordingUpgradeHandler(Arc<Mutex<RecordingUpgrade>>);
+
+    impl ProtocolUpgradeHandler for RecordingUpgradeHandler {
+        fn receive(&mut self, data: &[u8]) {
+            self.0.lock().unwrap().received.extend_from_slice(data);
+        }
+        fn take_outbound(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.0.lock().unwrap().outbound)
+        }
+        fn closed(&mut self) {
+            self.0.lock().unwrap().closed = true;
+        }
+        fn wants_datagrams(&self) -> bool {
+            true
+        }
+        fn datagram_received(&mut self, data: &[u8]) {
+            self.0.lock().unwrap().received.extend_from_slice(data);
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorded {
+        switched: bool,
+        final_status: Option<u16>,
+        completed: usize,
+        request_failed_called: bool,
+    }
+
+    struct UpgradingHandler {
+        rec: Arc<Mutex<Recorded>>,
+        upgrade: Arc<Mutex<RecordingUpgrade>>,
+    }
+    impl ClientHandler for UpgradingHandler {
+        fn start(&mut self, request: &mut dyn ClientWriter) {
+            let mut h = Headers::new();
+            h.set(":method", "CONNECT");
+            h.set(":protocol", "connect-udp");
+            h.set(":scheme", "https");
+            h.set(":authority", "example.com");
+            h.set(":path", "/.well-known/masque/udp/target.example/443/");
+            request.headers(h);
+            request.complete_request();
+        }
+        fn switching_protocols(&mut self, request: &mut dyn ClientWriter, _headers: &Headers) {
+            self.rec.lock().unwrap().switched = true;
+            assert!(request.upgrade(Box::new(RecordingUpgradeHandler(Arc::clone(&self.upgrade)))));
+        }
+        fn response_headers(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
+            self.rec.lock().unwrap().final_status = Some(headers.status_code());
+        }
+        fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
+            self.rec.lock().unwrap().completed += 1;
+        }
+        fn request_failed(&mut self, _request: &mut dyn ClientWriter, _err: &io::Error) {
+            self.rec.lock().unwrap().request_failed_called = true;
+        }
+    }
+
+    struct UpgradingFactory {
+        rec: Arc<Mutex<Recorded>>,
+        upgrade: Arc<Mutex<RecordingUpgrade>>,
+    }
+    impl ClientHandlerFactory for UpgradingFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            Box::new(UpgradingHandler {
+                rec: Arc::clone(&self.rec),
+                upgrade: Arc::clone(&self.upgrade),
+            })
+        }
+    }
+
+    fn encode(pairs: &[(&str, &str)]) -> Vec<u8> {
+        qpack::encode(pairs.iter().copied())
+    }
+
+    /// An Extended CONNECT stream, already sent (peer advertised
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL`), ready to feed a response into.
+    fn ext_connect_stream() -> (
+        H3ClientStream,
+        Arc<Mutex<Recorded>>,
+        Arc<Mutex<RecordingUpgrade>>,
+        RecordingEndpoint,
+    ) {
+        let rec = Arc::new(Mutex::new(Recorded::default()));
+        let upgrade = Arc::new(Mutex::new(RecordingUpgrade::default()));
+        let factory: Arc<dyn ClientHandlerFactory> = Arc::new(UpgradingFactory {
+            rec: Arc::clone(&rec),
+            upgrade: Arc::clone(&upgrade),
+        });
+        let peer_state = Arc::new(Mutex::new({
+            let mut s = H3PeerState::default();
+            s.peer_enable_connect_protocol = Some(true);
+            s
+        }));
+        let mut stream = H3ClientStream::new(
+            factory,
+            HttpLimits::default(),
+            0,
+            Arc::new(qpack::H3Qpack::new()),
+            peer_state,
+        );
+        let mut ep = RecordingEndpoint::default();
+        stream.start_request(&mut ep);
+        assert!(stream.started);
+        (stream, rec, upgrade, ep)
+    }
+
+    /// A `2xx` response to an Extended CONNECT request fires
+    /// `switching_protocols` (never `response_headers`/`response_complete`),
+    /// and installing a [`ProtocolUpgradeHandler`] via `ClientWriter::upgrade`
+    /// routes subsequent DATA frames — and native QUIC datagrams — to it
+    /// instead of the original handler.
+    #[test]
+    fn successful_extended_connect_installs_upgrade_handler_and_relays_data() {
+        let (mut stream, rec, upgrade, mut ep) = ext_connect_stream();
+
+        stream.headers_frame(&encode(&[(":status", "200")]));
+
+        assert!(rec.lock().unwrap().switched);
+        assert!(rec.lock().unwrap().final_status.is_none(), "must not be treated as an ordinary response");
+        assert_eq!(rec.lock().unwrap().completed, 0);
+
+        stream.data_frame(b"hello from the peer");
+        assert_eq!(upgrade.lock().unwrap().received, b"hello from the peer");
+
+        // Draining outbound bytes happens in `receive()`'s tail; an empty
+        // poke exercises it without needing real wire-framed input.
+        upgrade.lock().unwrap().outbound = b"reply".to_vec();
+        ep.sent.clear();
+        let mut empty: &[u8] = &[];
+        stream.receive(&mut ep, &mut empty);
+        assert!(
+            ep.sent.windows(5).any(|w| w == b"reply"),
+            "outbound bytes must go out as a DATA frame: {:?}",
+            ep.sent
+        );
+
+        // Native QUIC datagrams also route to the upgrade handler once
+        // installed, not the original `ClientHandler`.
+        stream.datagram_received(&mut ep, b"dgram");
+        assert_eq!(upgrade.lock().unwrap().received, b"hello from the peerdgram");
+    }
+
+    /// A non-2xx response to an Extended CONNECT request (the peer declined)
+    /// is treated as an ordinary response, not a protocol switch.
+    #[test]
+    fn declined_extended_connect_is_an_ordinary_response() {
+        let (mut stream, rec, _upgrade, _ep) = ext_connect_stream();
+
+        stream.headers_frame(&encode(&[(":status", "403")]));
+
+        assert!(!rec.lock().unwrap().switched);
+        assert_eq!(rec.lock().unwrap().final_status, Some(403));
+    }
+
+    /// Connection teardown after a successful upgrade notifies the
+    /// [`ProtocolUpgradeHandler`], not the original request handler.
+    #[test]
+    fn disconnection_after_upgrade_closes_the_upgrade_handler() {
+        let (mut stream, rec, upgrade, mut ep) = ext_connect_stream();
+        stream.headers_frame(&encode(&[(":status", "200")]));
+        assert!(rec.lock().unwrap().switched);
+
+        stream.disconnected(&mut ep);
+
+        assert!(upgrade.lock().unwrap().closed);
+        assert!(!rec.lock().unwrap().request_failed_called, "the original ClientHandler must not see request_failed once upgraded");
     }
 }
