@@ -12,6 +12,7 @@ mod config;
 mod driver;
 mod error;
 mod hooks;
+mod path;
 mod runtime_ext;
 mod stream;
 mod udp;
@@ -25,12 +26,17 @@ pub use config::{
     QuicListenConfig, QuicListenHardening, QuicListenHooksConfig, QuicServerConfig, QuicTlsOptions,
     QuicTransportOptions,
 };
-pub use driver::{connect_quic, connect_quic_hooks, listen_quic, listen_quic_hooks, QuicDriverHandle};
+pub use driver::{
+    connect_quic, connect_quic_hooks, connect_quic_hooks_with_path, connect_quic_with_path,
+    listen_quic, listen_quic_hooks, listen_quic_hooks_with_path, listen_quic_with_path,
+    QuicDriverHandle,
+};
 pub use error::{
     connection_close_error, datagram_send_error, stream_stopped_error, QuicConnectionCloseError,
     QuicDatagramSendError, QuicStreamStoppedError,
 };
 pub use hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection};
+pub use path::QuicDatagramPath;
 pub use runtime_ext::RuntimeQuicExt;
 pub use stream::QuicStreamEndpoint;
 pub use hopf_core::VERSION;
