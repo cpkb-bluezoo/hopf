@@ -14,14 +14,19 @@ categories = ["network-programming"]
 
 [features]
 default = []
+# Client-side transport negotiation (`connect_udp`) needs `hopf-http`'s own
+# `h3` feature, for the same reason `hopf-http` itself needs it: an h3
+# attempt is only possible with a QUIC client config to dial it with.
+h3 = ["hopf-http/h3", "dep:hopf-quic"]
 # Real TCP/UDP loopback round-trips (`src/integration.rs`); excluded from
 # CI unit-test runs.
-integration = []
+integration = ["h3"]
 
 [dependencies]
 hopf-core = { workspace = true }
 hopf-http = { workspace = true }
 hopf-dns = { workspace = true }
+hopf-quic = { workspace = true, optional = true }
 mio = { workspace = true }
 
 [dev-dependencies]

@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use hopf_core::{Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
 
-use crate::client::{connect_auto, connect_http, connect_http2_upgrade, HttpClientTimeouts};
+use crate::client::{
+    connect_auto, connect_http, connect_http2_upgrade, HttpClientTimeouts, HttpFallback,
+};
 use crate::h2::frame;
 use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
 use crate::{
@@ -1010,7 +1012,7 @@ fn connect_auto_uses_dns_https_record_to_reach_h3_with_no_tcp_fallback() {
         80, // origin port -- deliberately not the real h3 port; svcb_port must override it
         factory,
         HttpLimits::default(),
-        false,
+        HttpFallback::PlaintextH1,
         HttpClientTimeouts::default(),
         Some(dns),
         Some(client_cfg),
@@ -1134,7 +1136,7 @@ fn connect_auto_upgrades_to_h3_via_alt_svc_cache_on_the_next_connection() {
         tcp_addr.port(),
         factory1,
         HttpLimits::default(),
-        false,
+        HttpFallback::PlaintextH1,
         HttpClientTimeouts::default(),
         Some(Arc::clone(&dns)),
         Some(Arc::clone(&client_cfg)),
@@ -1163,7 +1165,7 @@ fn connect_auto_upgrades_to_h3_via_alt_svc_cache_on_the_next_connection() {
         tcp_addr.port(),
         factory2,
         HttpLimits::default(),
-        false,
+        HttpFallback::PlaintextH1,
         HttpClientTimeouts::default(),
         Some(dns),
         Some(client_cfg),

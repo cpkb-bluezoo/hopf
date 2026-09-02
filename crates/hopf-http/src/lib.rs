@@ -46,7 +46,7 @@ pub use client::{
     HttpRequest, HttpResponseHandler,
 };
 #[cfg(feature = "h3")]
-pub use client::{connect_auto, connect_h3_by_name};
+pub use client::{connect_auto, connect_h3_by_name, connect_https, HttpFallback};
 pub use server::HttpServer;
 pub use dispatch::AlpnHttpEndpoint;
 pub use error::{HttpError, HttpResult};

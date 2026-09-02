@@ -6,8 +6,9 @@
 //! layers WebSocket framing on top of it, via
 //! [`hopf_http::ProtocolUpgradeHandler`].
 //!
-//! Currently implemented: the RFC 9298 CONNECT-UDP relay, server-side —
-//! see [`ConnectUdpFactory`].
+//! Currently implemented: the RFC 9298 CONNECT-UDP relay, server-side — see
+//! [`ConnectUdpFactory`] — and, behind the `h3` feature, the client side —
+//! see [`connect_udp`](client::connect_udp).
 
 #![warn(missing_docs)]
 
@@ -16,9 +17,15 @@ mod policy;
 mod relay;
 mod target;
 
+#[cfg(feature = "h3")]
+mod client;
+
 pub use handler::{ConnectUdpFactory, DEFAULT_IDLE_TIMEOUT};
 pub use policy::ConnectUdpPolicy;
 pub use target::{parse as parse_connect_udp_target, ConnectUdpTarget};
+
+#[cfg(feature = "h3")]
+pub use client::{connect_udp, ConnectUdpEventHandler, ConnectUdpSession};
 
 #[cfg(all(test, feature = "integration"))]
 mod integration;

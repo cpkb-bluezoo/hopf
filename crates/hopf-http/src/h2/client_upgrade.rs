@@ -66,6 +66,16 @@ impl ClientWriter for InjectingWriter<'_> {
     fn complete_request(&mut self) {
         self.inner.complete_request();
     }
+    fn version(&self) -> crate::version::HttpVersion {
+        // Still genuinely H1 wire framing at this point, whatever the
+        // outcome of the upgrade attempt — matches `self.inner`'s own,
+        // unwrapped answer, kept consistent by delegating rather than
+        // hard-coding a duplicate answer here.
+        self.inner.version()
+    }
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        self.inner.conn_handle()
+    }
 }
 
 /// Wraps the app's real [`ClientHandler`]: injects the Upgrade headers on

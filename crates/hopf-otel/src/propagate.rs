@@ -71,6 +71,14 @@ impl ClientWriter for PropagatingClientWriter<'_> {
     fn complete_request(&mut self) {
         self.inner.complete_request();
     }
+
+    fn version(&self) -> hopf_http::HttpVersion {
+        self.inner.version()
+    }
+
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        self.inner.conn_handle()
+    }
 }
 
 /// Owned `traceparent` wrapper for use when the string comes from `Trace::traceparent()`.
@@ -122,6 +130,14 @@ impl ClientWriter for OwnedPropagatingClientWriter<'_> {
     fn complete_request(&mut self) {
         self.inner.complete_request();
     }
+
+    fn version(&self) -> hopf_http::HttpVersion {
+        self.inner.version()
+    }
+
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        self.inner.conn_handle()
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +157,12 @@ mod tests {
         fn request_body_content(&mut self, _: &[u8]) {}
         fn end_request_body(&mut self) {}
         fn complete_request(&mut self) {}
+        fn version(&self) -> hopf_http::HttpVersion {
+            hopf_http::HttpVersion::Http11
+        }
+        fn conn_handle(&self) -> hopf_core::ConnHandle {
+            hopf_core::ConnHandle::from_execute(std::sync::Arc::new(|task| task()))
+        }
     }
 
     #[test]

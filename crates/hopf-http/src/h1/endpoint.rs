@@ -86,6 +86,12 @@ impl H1Endpoint {
         }
     }
 
+    fn bind_client_handle(&mut self, endpoint: &dyn Endpoint) {
+        if let Some(codec) = self.client.as_mut() {
+            codec.bind_conn_handle(endpoint.handle());
+        }
+    }
+
     fn flush_server(&mut self, endpoint: &mut dyn Endpoint) {
         if let Some(codec) = self.server.as_mut() {
             let out = codec.take_outbound();
@@ -166,6 +172,7 @@ impl H1Endpoint {
 impl ProtocolHandler for H1Endpoint {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
         self.bind_server_handle(endpoint);
+        self.bind_client_handle(endpoint);
         // Plaintext dial: send the request now. TLS dial waits for
         // `security_established` so application data is not queued mid-handshake.
         if self.role == HttpRole::Client && !self.secure {
@@ -179,6 +186,7 @@ impl ProtocolHandler for H1Endpoint {
         info: &hopf_core::SecurityInfo,
     ) {
         self.bind_server_handle(endpoint);
+        self.bind_client_handle(endpoint);
         if self.role == HttpRole::Client && self.secure {
             if let Some(codec) = self.session.as_mut() {
                 codec.notify_security_established(info);

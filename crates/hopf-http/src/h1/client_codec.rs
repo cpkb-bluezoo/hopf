@@ -6,6 +6,8 @@
 //! [`FirstLineKind::Status`] mode; see `h1::parse` for the streaming
 //! contract (every byte consumed, partial tokens owned by the scanner).
 
+use hopf_core::ConnHandle;
+
 use crate::capsule::{self, CapsuleParser, CAPSULE_DATAGRAM};
 use crate::error::{HttpError, HttpResult};
 use crate::h1::parse::{parse_version, FirstLineKind, H1Events, H1Scanner, Next};
@@ -49,6 +51,13 @@ impl<H: ClientHandler> H1ClientCodec<H> {
     /// Assign stream id (for logging / future multiplex).
     pub fn set_stream_id(&mut self, id: u64) {
         self.driver.stream_id = id;
+    }
+
+    /// Bind the real [`ConnHandle`] once the transport is connected —
+    /// see [`ClientWriter::conn_handle`]. Before this is called,
+    /// [`UaView::conn_handle`] answers with a synchronous no-op handle.
+    pub fn bind_conn_handle(&mut self, conn: ConnHandle) {
+        self.driver.conn = conn;
     }
 
     /// Endpoint connected — start the outbound request.
@@ -210,6 +219,9 @@ struct Driver<H: ClientHandler> {
     /// a raw byte stream.
     capsule_mode: bool,
     capsule_parser: CapsuleParser,
+    /// See [`ClientWriter::conn_handle`] — a synchronous no-op handle until
+    /// [`H1ClientCodec::bind_conn_handle`] installs the real one.
+    conn: ConnHandle,
 }
 
 impl<H: ClientHandler> Driver<H> {
@@ -238,6 +250,7 @@ impl<H: ClientHandler> Driver<H> {
             upgraded: None,
             capsule_mode: false,
             capsule_parser: CapsuleParser::new(),
+            conn: ConnHandle::from_execute(std::sync::Arc::new(|task| task())),
         }
     }
 
@@ -276,6 +289,7 @@ impl<H: ClientHandler> Driver<H> {
                 req_method: &mut self.req_method,
                 version: self.version,
                 pending_upgrade: &mut self.pending_upgrade,
+                conn: self.conn.clone(),
             };
             app.start(&mut view);
         }
@@ -294,6 +308,7 @@ impl<H: ClientHandler> Driver<H> {
             req_method: &mut self.req_method,
             version: self.version,
             pending_upgrade: &mut self.pending_upgrade,
+            conn: self.conn.clone(),
         };
         let r = f(&mut app, &mut view);
         self.app = Some(app);
@@ -546,6 +561,7 @@ struct UaView<'a> {
     req_method: &'a mut String,
     version: HttpVersion,
     pending_upgrade: &'a mut Option<Box<dyn ProtocolUpgradeHandler>>,
+    conn: ConnHandle,
 }
 
 impl ClientWriter for UaView<'_> {
@@ -610,6 +626,14 @@ impl ClientWriter for UaView<'_> {
         }
         *self.pending_upgrade = Some(handler);
         true
+    }
+
+    fn version(&self) -> HttpVersion {
+        self.version
+    }
+
+    fn conn_handle(&self) -> ConnHandle {
+        self.conn.clone()
     }
 }
 

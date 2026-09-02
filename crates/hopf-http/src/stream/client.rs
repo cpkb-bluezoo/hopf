@@ -4,7 +4,10 @@
 //!
 //! Peer of [`super::server`] — not a delayed add-on.
 
+use hopf_core::ConnHandle;
+
 use crate::headers::Headers;
+use crate::version::HttpVersion;
 use super::server::ProtocolUpgradeHandler;
 
 /// Factory that creates a client handler per outbound Stream.
@@ -119,6 +122,35 @@ pub trait ClientWriter {
     fn upgrade(&mut self, _handler: Box<dyn ProtocolUpgradeHandler>) -> bool {
         false
     }
+
+    /// The negotiated transport this stream is actually running on.
+    ///
+    /// Most requests don't need this — the point of [`ClientHandler`] is
+    /// that a plain request looks the same regardless of h1/h2/h3. A
+    /// protocol upgrade can genuinely need it, though: unlike a plain
+    /// request, the *shape* of an upgrade request differs by transport
+    /// (an HTTP/1.1 `Upgrade:` header vs. an HTTP/2 or HTTP/3 Extended
+    /// CONNECT's `:protocol` pseudo-header, RFC 9220), so
+    /// [`ClientHandler::start`] needs to know which one it's building —
+    /// checked once, from [`Self::headers`] before anything is sent, not
+    /// something that changes mid-stream.
+    fn version(&self) -> HttpVersion;
+
+    /// A handle to this request's underlying connection, usable from any
+    /// thread — the client-side counterpart of
+    /// [`ServerWriter::conn_handle`](super::ServerWriter::conn_handle).
+    ///
+    /// The one case this actually matters for is a [`ClientWriter::upgrade`]
+    /// handler that needs to wake the connection later from off-thread (e.g.
+    /// an app thread queuing an outbound datagram) so
+    /// [`ProtocolUpgradeHandler::take_outbound`] gets called promptly
+    /// instead of only on the connection's next unrelated event — call this
+    /// from [`ClientHandler::switching_protocols`] and hold onto the result,
+    /// the same place [`Self::upgrade`] itself is called from. Not
+    /// meaningful outside that path: a plain request never needs it, since
+    /// [`ClientHandler`]'s callbacks already run on the connection's own
+    /// thread.
+    fn conn_handle(&self) -> ConnHandle;
 }
 
 impl ClientHandler for Box<dyn ClientHandler> {

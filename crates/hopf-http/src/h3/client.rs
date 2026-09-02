@@ -282,6 +282,16 @@ impl ClientWriter for H3ClientWriter {
     fn complete_request(&mut self) {
         self.done = true;
     }
+
+    fn version(&self) -> crate::version::HttpVersion {
+        crate::version::HttpVersion::Http3
+    }
+
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        // `start()` never needs a working cross-thread handle — see
+        // `ClientWriter::conn_handle`'s own doc comment.
+        hopf_core::ConnHandle::from_execute(Arc::new(|task| task()))
+    }
 }
 
 struct NullClientWriter;
@@ -292,6 +302,17 @@ impl ClientWriter for NullClientWriter {
     fn request_body_content(&mut self, _: &[u8]) {}
     fn end_request_body(&mut self) {}
     fn complete_request(&mut self) {}
+
+    fn version(&self) -> crate::version::HttpVersion {
+        crate::version::HttpVersion::Http3
+    }
+
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        // Only reached for a request that's already failed/completed — not
+        // a meaningful connection to hand out; see
+        // `ClientWriter::conn_handle`'s own doc comment.
+        hopf_core::ConnHandle::from_execute(Arc::new(|task| task()))
+    }
 }
 
 /// [`ClientWriter`] passed to
@@ -300,6 +321,7 @@ impl ClientWriter for NullClientWriter {
 /// everything except [`ClientWriter::upgrade`] is a no-op.
 struct H3ClientUpgradeWriter<'a> {
     pending: &'a mut Option<Box<dyn ProtocolUpgradeHandler>>,
+    conn: hopf_core::ConnHandle,
 }
 
 impl ClientWriter for H3ClientUpgradeWriter<'_> {
@@ -315,6 +337,14 @@ impl ClientWriter for H3ClientUpgradeWriter<'_> {
         }
         *self.pending = Some(handler);
         true
+    }
+
+    fn version(&self) -> crate::version::HttpVersion {
+        crate::version::HttpVersion::Http3
+    }
+
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        self.conn.clone()
     }
 }
 
@@ -395,6 +425,9 @@ struct H3ClientStream {
     /// 9297 §3.4) rather than raw DATA-frame bytes.
     capsule_mode: bool,
     capsule_parser: crate::capsule::CapsuleParser,
+    /// See [`ClientWriter::conn_handle`] — a synchronous no-op handle until
+    /// [`ProtocolHandler::connected`] binds the real one.
+    conn: hopf_core::ConnHandle,
 }
 
 impl H3ClientStream {
@@ -427,6 +460,7 @@ impl H3ClientStream {
             upgraded: None,
             capsule_mode: false,
             capsule_parser: crate::capsule::CapsuleParser::new(),
+            conn: hopf_core::ConnHandle::from_execute(Arc::new(|task| task())),
         }
     }
 
@@ -806,6 +840,7 @@ impl H3FrameHandler for H3ClientStream {
                     self.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);
                     let mut uw = H3ClientUpgradeWriter {
                         pending: &mut self.upgraded,
+                        conn: self.conn.clone(),
                     };
                     handler.switching_protocols(&mut uw, &headers);
                 } else {
@@ -849,6 +884,7 @@ impl H3FrameHandler for H3ClientStream {
 
 impl ProtocolHandler for H3ClientStream {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+        self.conn = endpoint.handle();
         self.start_request(endpoint);
     }
 

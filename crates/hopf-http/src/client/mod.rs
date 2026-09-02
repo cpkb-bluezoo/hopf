@@ -20,5 +20,5 @@ pub use api::{
 };
 pub use connect::{connect_http, connect_http2_upgrade, HttpClientTimeouts};
 #[cfg(feature = "h3")]
-pub use connect::{connect_auto, connect_h3_by_name};
+pub use connect::{connect_auto, connect_h3_by_name, connect_https, HttpFallback};
 pub use facade::HttpClient;
