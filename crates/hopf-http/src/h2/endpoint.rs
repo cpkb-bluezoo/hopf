@@ -34,6 +34,7 @@ use super::hpack::{Decoder, Encoder};
 use super::response::{ArcH2ResponseControl, H2ResponseControl, H2SessionWriter};
 use crate::headers::Headers;
 use crate::limits::HttpLimits;
+use crate::version::HttpVersion;
 use crate::stream::{
     ClientHandler, ClientHandlerFactory, ClientWriter, ConnectionInfo, ProtocolUpgradeHandler,
     ServerHandler, ServerHandlerFactory, ServerResponseHandle, ServerWriter,
@@ -281,6 +282,16 @@ impl ClientWriter for H2ClientStreamWriter {
     fn complete_request(&mut self) {
         self.done = true;
     }
+
+    fn version(&self) -> HttpVersion {
+        HttpVersion::Http2
+    }
+
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        // `start()` never needs a working cross-thread handle — see
+        // `ClientWriter::conn_handle`'s own doc comment.
+        hopf_core::ConnHandle::from_execute(Arc::new(|task| task()))
+    }
 }
 
 /// No-op [`ClientWriter`] passed to response callbacks (no more outbound data).
@@ -292,6 +303,17 @@ impl ClientWriter for NullClientWriter {
     fn request_body_content(&mut self, _data: &[u8]) {}
     fn end_request_body(&mut self) {}
     fn complete_request(&mut self) {}
+
+    fn version(&self) -> HttpVersion {
+        HttpVersion::Http2
+    }
+
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        // Only reached for a request that's already failed/completed — not
+        // a meaningful connection to hand out; see
+        // `ClientWriter::conn_handle`'s own doc comment.
+        hopf_core::ConnHandle::from_execute(Arc::new(|task| task()))
+    }
 }
 
 /// [`ClientWriter`] passed to
@@ -300,6 +322,7 @@ impl ClientWriter for NullClientWriter {
 /// everything except [`ClientWriter::upgrade`] is a no-op.
 struct H2ClientUpgradeWriter<'a> {
     pending: &'a mut Option<Box<dyn ProtocolUpgradeHandler>>,
+    conn: hopf_core::ConnHandle,
 }
 
 impl ClientWriter for H2ClientUpgradeWriter<'_> {
@@ -315,6 +338,14 @@ impl ClientWriter for H2ClientUpgradeWriter<'_> {
         }
         *self.pending = Some(handler);
         true
+    }
+
+    fn version(&self) -> HttpVersion {
+        HttpVersion::Http2
+    }
+
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        self.conn.clone()
     }
 }
 
@@ -421,6 +452,11 @@ pub struct H2Endpoint {
     /// Remote/local address and TLS metadata, captured once and handed to
     /// each server stream's [`H2ResponseControl`] as it's (re)bound.
     connection_info: ConnectionInfo,
+
+    /// Client role only: this connection's [`ClientWriter::conn_handle`] —
+    /// a synchronous no-op handle until `connected`/`security_established`
+    /// binds the real one.
+    conn: hopf_core::ConnHandle,
 }
 
 impl H2Endpoint {
@@ -600,6 +636,7 @@ impl H2Endpoint {
             }),
             pending_priority: HashMap::new(),
             connection_info: ConnectionInfo::default(),
+            conn: hopf_core::ConnHandle::from_execute(Arc::new(|task| task())),
         }
     }
 
@@ -1335,6 +1372,7 @@ impl H2Endpoint {
                     stream.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);
                     let mut uw = H2ClientUpgradeWriter {
                         pending: &mut stream.upgraded,
+                        conn: self.conn.clone(),
                     };
                     stream.handler.switching_protocols(&mut uw, &headers);
                 } else {
@@ -2110,6 +2148,7 @@ impl H2FrameHandler for H2Endpoint {
 impl ProtocolHandler for H2Endpoint {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
         self.bind_server_stream_controls(endpoint);
+        self.conn = endpoint.handle();
         match &self.role {
             H2Role::Server {
                 send_settings_on_connected: true,
@@ -2126,6 +2165,7 @@ impl ProtocolHandler for H2Endpoint {
 
     fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
         self.bind_server_stream_controls(endpoint);
+        self.conn = endpoint.handle();
         match &self.role {
             H2Role::Server {
                 send_settings_on_connected: false,

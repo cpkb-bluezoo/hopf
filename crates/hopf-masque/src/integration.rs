@@ -10,9 +10,12 @@ use std::time::Duration;
 
 use hopf_core::{ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
 use hopf_dns::DnsResolver;
-use hopf_http::{CleartextHttpEndpoint, HttpLimits, ServerHandlerFactory};
+use hopf_http::{
+    AltSvcCache, CleartextHttpEndpoint, HttpClientTimeouts, HttpFallback, HttpLimits,
+    ServerHandlerFactory,
+};
 
-use crate::{ConnectUdpFactory, ConnectUdpPolicy};
+use crate::{connect_udp, ConnectUdpEventHandler, ConnectUdpFactory, ConnectUdpPolicy, ConnectUdpSession};
 
 /// Allows relaying to any target — fine for a loopback test, never for a
 /// real deployment (see [`ConnectUdpPolicy`]'s own docs).
@@ -151,6 +154,90 @@ fn h1_connect_udp_relay_round_trip() {
     assert_eq!(echoed, b"ping");
 
     let _ = rt;
+}
+
+enum ClientEvent {
+    Opened(Arc<dyn ConnectUdpSession>),
+    Datagram(Vec<u8>),
+    Closed,
+    Error(String),
+}
+
+impl std::fmt::Debug for ClientEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opened(_) => write!(f, "Opened"),
+            Self::Datagram(d) => write!(f, "Datagram({d:?})"),
+            Self::Closed => write!(f, "Closed"),
+            Self::Error(e) => write!(f, "Error({e:?})"),
+        }
+    }
+}
+
+struct ChannelEventHandler {
+    tx: std::sync::mpsc::Sender<ClientEvent>,
+}
+
+impl ConnectUdpEventHandler for ChannelEventHandler {
+    fn opened(&mut self, session: Arc<dyn ConnectUdpSession>) {
+        let _ = self.tx.send(ClientEvent::Opened(session));
+    }
+
+    fn datagram_received(&mut self, data: &[u8]) {
+        let _ = self.tx.send(ClientEvent::Datagram(data.to_vec()));
+    }
+
+    fn closed(&mut self) {
+        let _ = self.tx.send(ClientEvent::Closed);
+    }
+
+    fn error(&mut self, err: &std::io::Error) {
+        let _ = self.tx.send(ClientEvent::Error(err.to_string()));
+    }
+}
+
+/// Proves the client side (`connect_udp`) actually interoperates with this
+/// crate's own server relay, not just that each half separately matches
+/// the RFC 9298 wire format on paper: dials the real relay from
+/// `start_connect_udp_server` over a real loopback TCP connection, sends a
+/// UDP payload through it, and checks the target's echo comes all the way
+/// back out through [`ConnectUdpEventHandler::datagram_received`].
+#[test]
+fn client_connect_udp_round_trips_through_the_server_relay() {
+    let target = start_udp_echo();
+    let (rt, server_addr) = start_connect_udp_server(Arc::new(AllowAny));
+    thread::sleep(Duration::from_millis(50));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handler = Box::new(ChannelEventHandler { tx });
+
+    connect_udp(
+        &rt,
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        target.ip().to_string(),
+        target.port(),
+        HttpFallback::PlaintextH1,
+        handler,
+        None,
+        Arc::new(AltSvcCache::new()),
+        HttpClientTimeouts::default(),
+        None,
+    )
+    .unwrap();
+
+    let session = match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(ClientEvent::Opened(s)) => s,
+        Ok(ClientEvent::Error(e)) => panic!("tunnel failed to open: {e}"),
+        other => panic!("expected Opened, got {other:?}"),
+    };
+
+    session.send_datagram(b"ping");
+
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(ClientEvent::Datagram(d)) => assert_eq!(d, b"ping"),
+        other => panic!("expected an echoed Datagram, got {other:?}"),
+    }
 }
 
 /// A policy that denies the target gets a real `403`, not a silent hang

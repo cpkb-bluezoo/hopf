@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hopf_core::{ProtocolHandler, Runtime, TcpConnectorConfig};
+use hopf_core::{Endpoint, ProtocolHandler, Runtime, SecurityInfo, SharedTlsConnector, TcpConnectorConfig};
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
 use crate::{ClientHandlerFactory, H1Endpoint, H2Endpoint, H2cUpgradeClientEndpoint, HttpLimits};
@@ -87,6 +87,130 @@ pub fn connect_http2_upgrade(
     dial(rt, host_or_addr, port, &timeouts, resolver, make_handler)
 }
 
+/// Dial a peer over TLS, negotiating `h2`/`http/1.1` via ALPN — the
+/// `ClientHandler`-layer counterpart of [`crate::HttpClient`]'s own
+/// TLS-ALPN dial (`client/facade.rs`'s `start_tls`), for callers (like a
+/// CONNECT-UDP/CONNECT-IP client) that need the low-level
+/// [`ClientHandler`](crate::ClientHandler) API's protocol-upgrade support
+/// rather than the request/response session API.
+///
+/// Unlike [`connect_http`], which is cleartext-only with a caller-fixed
+/// h1-vs-h2 choice, this negotiates the version from what the peer's TLS
+/// handshake actually offers — the right fallback once an h3 attempt
+/// (always TLS 1.3 via QUIC) has been ruled out, since a peer reachable
+/// over HTTPS at all has no reason to also expect a cleartext h2c dial.
+#[cfg(feature = "h3")]
+pub fn connect_https(
+    rt: &Arc<Runtime>,
+    host_or_addr: &str,
+    port: u16,
+    factory: Arc<dyn ClientHandlerFactory>,
+    limits: HttpLimits,
+    tls_connector: SharedTlsConnector,
+    server_name: impl Into<String>,
+    timeouts: HttpClientTimeouts,
+    resolver: Option<Arc<DnsResolver>>,
+) -> io::Result<()> {
+    let server_name = server_name.into();
+    let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
+        Arc::new(move || -> Box<dyn ProtocolHandler> {
+            Box::new(TlsAlpnClientEndpoint::new(Arc::clone(&factory), limits))
+        });
+    dial_tls(
+        rt,
+        host_or_addr,
+        port,
+        &timeouts,
+        resolver,
+        tls_connector,
+        server_name,
+        make_handler,
+    )
+}
+
+/// [`ProtocolHandler`] that waits for the TLS handshake to complete, then
+/// picks [`H1Endpoint::client`] or [`H2Endpoint::client`] based on the
+/// negotiated ALPN — mirrors `client/connection.rs`'s `HttpClientConnection`
+/// (session API), adapted to the `ClientHandler` layer.
+#[cfg(feature = "h3")]
+struct TlsAlpnClientEndpoint {
+    factory: Arc<dyn ClientHandlerFactory>,
+    limits: HttpLimits,
+    inner: Option<Box<dyn ProtocolHandler>>,
+    pending_receive: Vec<u8>,
+}
+
+#[cfg(feature = "h3")]
+impl TlsAlpnClientEndpoint {
+    fn new(factory: Arc<dyn ClientHandlerFactory>, limits: HttpLimits) -> Self {
+        Self {
+            factory,
+            limits,
+            inner: None,
+            pending_receive: Vec::new(),
+        }
+    }
+
+    fn install(&mut self, is_h2: bool) {
+        let handler: Box<dyn ProtocolHandler> = if is_h2 {
+            Box::new(H2Endpoint::client(Arc::clone(&self.factory), self.limits, true))
+        } else {
+            Box::new(H1Endpoint::client(Arc::clone(&self.factory), self.limits, true))
+        };
+        self.inner = Some(handler);
+    }
+}
+
+#[cfg(feature = "h3")]
+impl ProtocolHandler for TlsAlpnClientEndpoint {
+    fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
+        // Nothing to do yet — this dial is always secure, so the request
+        // only goes out once `security_established` reveals ALPN.
+    }
+
+    fn security_established(&mut self, endpoint: &mut dyn Endpoint, info: &SecurityInfo) {
+        let is_h2 = info.alpn().map(|a| a == b"h2").unwrap_or(false);
+        self.install(is_h2);
+        let inner = self.inner.as_mut().expect("just installed");
+        inner.connected(endpoint);
+        inner.security_established(endpoint, info);
+        if !self.pending_receive.is_empty() {
+            let buf = std::mem::take(&mut self.pending_receive);
+            let mut slice: &[u8] = &buf;
+            inner.receive(endpoint, &mut slice);
+        }
+    }
+
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.receive(endpoint, data);
+        } else {
+            // Arrived before the TLS handshake finished informing us of
+            // ALPN — buffer it (matches the same-shaped race
+            // `HttpClientConnection::receive` already has to handle).
+            self.pending_receive.extend_from_slice(data);
+            *data = &[];
+        }
+    }
+
+    fn disconnected(&mut self, endpoint: &mut dyn Endpoint) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.disconnected(endpoint);
+        }
+        // No app-visible handler exists yet if the connection never got
+        // past the TLS handshake — the same limitation `connect_http`'s
+        // single-path dial already has for a pre-handshake failure
+        // (`H1Endpoint`/`H2Endpoint::error` don't forward to a
+        // `ClientHandler` either), not a new gap introduced here.
+    }
+
+    fn error(&mut self, endpoint: &mut dyn Endpoint, err: &std::io::Error) {
+        if let Some(inner) = self.inner.as_mut() {
+            inner.error(endpoint, err);
+        }
+    }
+}
+
 /// Shared DNS-resolve-then-connect plumbing.
 pub(crate) fn dial(
     rt: &Arc<Runtime>,
@@ -125,6 +249,61 @@ pub(crate) fn dial(
                 let mh = Arc::clone(&make_handler);
                 let cfg = TcpConnectorConfig::new(addr, move || mh())
                     .connect_timeout(connect_timeout);
+                if let Err(e) = rt2.connect(cfg) {
+                    eprintln!("hopf-http: connect error: {e}");
+                }
+            }
+        }),
+    );
+    Ok(())
+}
+
+/// [`dial`], additionally configuring the connector for TLS (ALPN offered
+/// via whatever `tls_connector` itself is set up for — `h2`/`http/1.1` for
+/// [`connect_https`]'s use).
+#[cfg(feature = "h3")]
+fn dial_tls(
+    rt: &Arc<Runtime>,
+    host_or_addr: &str,
+    port: u16,
+    timeouts: &HttpClientTimeouts,
+    resolver: Option<Arc<DnsResolver>>,
+    tls_connector: SharedTlsConnector,
+    server_name: String,
+    make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync>,
+) -> io::Result<()> {
+    let connect_timeout = Some(timeouts.connect);
+
+    if let Some(addr) = resolve_literal(host_or_addr, port) {
+        let mh = Arc::clone(&make_handler);
+        return rt.connect(
+            TcpConnectorConfig::new(addr, move || mh())
+                .connect_timeout(connect_timeout)
+                .with_tls(tls_connector, server_name),
+        );
+    }
+
+    let res = match resolver {
+        Some(r) => r,
+        None => Arc::new(DnsResolver::for_runtime(rt)?),
+    };
+    let rt2 = Arc::clone(rt);
+    res.resolve(
+        host_or_addr,
+        port,
+        Box::new(move |result| {
+            let addrs = match result {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("hopf-http: DNS error: {e}");
+                    return;
+                }
+            };
+            if let Some(addr) = addrs.into_iter().next() {
+                let mh = Arc::clone(&make_handler);
+                let cfg = TcpConnectorConfig::new(addr, move || mh())
+                    .connect_timeout(connect_timeout)
+                    .with_tls(tls_connector, server_name);
                 if let Err(e) = rt2.connect(cfg) {
                     eprintln!("hopf-http: connect error: {e}");
                 }
@@ -275,12 +454,53 @@ pub fn connect_h3_by_name(
     Ok(())
 }
 
-/// Automatic transport negotiation for a secure origin: a DNS HTTPS record
-/// (RFC 9460) advertising `h3` support (tier 1), then a cached Alt-Svc
+/// Fallback transport for [`connect_auto`] once an h3 attempt is off the
+/// table (no [`QuicClientConfig`] supplied, nothing discovered, or a
+/// literal address with no DNS to query).
+#[cfg(feature = "h3")]
+#[derive(Clone)]
+pub enum HttpFallback {
+    /// TLS, negotiating `h2`/`http/1.1` via ALPN (see [`connect_https`]) —
+    /// the right choice for a secure origin once h3 is ruled out: a peer
+    /// reachable over HTTPS at all has no reason to also expect a
+    /// cleartext dial, so there's no cleartext tier to try underneath it.
+    Tls(SharedTlsConnector, String),
+    /// Cleartext, attempting HTTP/1.1 Upgrade to h2c (RFC 7540 §3.2, see
+    /// [`connect_http2_upgrade`]) and completing as plain HTTP/1.1 if the
+    /// peer doesn't accept it.
+    PlaintextH2c,
+    /// Cleartext HTTP/1.1 only — no h2c attempt.
+    PlaintextH1,
+}
+
+#[cfg(feature = "h3")]
+fn dial_with_fallback(
+    rt: &Arc<Runtime>,
+    host: &str,
+    port: u16,
+    factory: Arc<dyn ClientHandlerFactory>,
+    limits: HttpLimits,
+    fallback: HttpFallback,
+    timeouts: HttpClientTimeouts,
+    resolver: Option<Arc<DnsResolver>>,
+) -> io::Result<()> {
+    match fallback {
+        HttpFallback::Tls(connector, server_name) => connect_https(
+            rt, host, port, factory, limits, connector, server_name, timeouts, resolver,
+        ),
+        HttpFallback::PlaintextH2c => {
+            connect_http2_upgrade(rt, host, port, factory, limits, timeouts, resolver)
+        }
+        HttpFallback::PlaintextH1 => {
+            connect_http(rt, host, port, factory, limits, false, timeouts, resolver)
+        }
+    }
+}
+
+/// Automatic transport negotiation for an origin: a DNS HTTPS record (RFC
+/// 9460) advertising `h3` support (tier 1), then a cached Alt-Svc
 /// discovery from an earlier connection to the same origin (tier 2),
-/// falling back to today's TCP-first [`connect_http`] — HTTP/2 via ALPN,
-/// else HTTP/1.1 — when neither applies (tier 3). Mirrors Gumdrop's
-/// `HTTPClient.discoverAndConnect`.
+/// falling back to `fallback` (tier 3) when neither applies.
 ///
 /// Skipped straight to tier 3 for a literal IP/socket-address `host` (no
 /// hostname to query) or when `quic_client_config` is `None` (nothing to
@@ -303,17 +523,17 @@ pub fn connect_auto(
     port: u16,
     factory: Arc<dyn ClientHandlerFactory>,
     limits: HttpLimits,
-    http2: bool,
+    fallback: HttpFallback,
     timeouts: HttpClientTimeouts,
     resolver: Option<Arc<DnsResolver>>,
     quic_client_config: Option<Arc<QuicClientConfig>>,
     alt_svc_cache: Arc<AltSvcCache>,
 ) -> io::Result<()> {
     if resolve_literal(host, port).is_some() {
-        return connect_http(rt, host, port, factory, limits, http2, timeouts, resolver);
+        return dial_with_fallback(rt, host, port, factory, limits, fallback, timeouts, resolver);
     }
     let Some(quic_config) = quic_client_config else {
-        return connect_http(rt, host, port, factory, limits, http2, timeouts, resolver);
+        return dial_with_fallback(rt, host, port, factory, limits, fallback, timeouts, resolver);
     };
 
     let res = match &resolver {
@@ -377,13 +597,13 @@ pub fn connect_auto(
                     host_owned.clone(),
                     port,
                 ));
-            if let Err(e) = connect_http(
+            if let Err(e) = dial_with_fallback(
                 &rt2,
                 &host_for_tier3,
                 port,
                 observing_factory,
                 limits,
-                http2,
+                fallback,
                 timeouts.clone(),
                 resolver.clone(),
             ) {

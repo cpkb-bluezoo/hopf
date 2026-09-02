@@ -34,6 +34,26 @@ pub fn parse(path: &str) -> Option<ConnectUdpTarget> {
     Some(ConnectUdpTarget { host, port })
 }
 
+/// Build the RFC 9298 §2 URI template path for `host`:`port` — the inverse
+/// of [`parse`], for the client side. Percent-encodes `host` (needed for
+/// an IPv6 literal's colons, RFC 9298 §2's own example).
+pub(crate) fn encode(host: &str, port: u16) -> String {
+    format!("{PREFIX}{}/{port}/", percent_encode(host))
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Strict RFC 3986 `%XX` percent-decoding — `None` on a truncated or
 /// non-hex escape, or invalid UTF-8 in the result, rather than silently
 /// passing through whatever bytes happen to be there.
@@ -73,6 +93,22 @@ mod tests {
         let t = parse("/.well-known/masque/udp/target.example/443/").unwrap();
         assert_eq!(t.host, "target.example");
         assert_eq!(t.port, 443);
+    }
+
+    #[test]
+    fn encode_then_parse_round_trips_a_plain_hostname() {
+        let path = encode("target.example", 443);
+        let t = parse(&path).unwrap();
+        assert_eq!(t.host, "target.example");
+        assert_eq!(t.port, 443);
+    }
+
+    #[test]
+    fn encode_then_parse_round_trips_an_ipv6_literal() {
+        let path = encode("2001:db8::1", 53);
+        let t = parse(&path).unwrap();
+        assert_eq!(t.host, "2001:db8::1");
+        assert_eq!(t.port, 53);
     }
 
     #[test]
