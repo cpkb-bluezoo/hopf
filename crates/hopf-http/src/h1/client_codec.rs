@@ -6,11 +6,12 @@
 //! [`FirstLineKind::Status`] mode; see `h1::parse` for the streaming
 //! contract (every byte consumed, partial tokens owned by the scanner).
 
+use crate::capsule::{self, CapsuleParser, CAPSULE_DATAGRAM};
 use crate::error::{HttpError, HttpResult};
 use crate::h1::parse::{parse_version, FirstLineKind, H1Events, H1Scanner, Next};
 use crate::headers::Headers;
 use crate::limits::HttpLimits;
-use crate::stream::{ClientHandler, ClientWriter};
+use crate::stream::{ClientHandler, ClientWriter, ProtocolUpgradeHandler};
 use crate::utils::{is_chunked_te, is_invalid_te, method_implies_no_body, parse_content_length};
 use crate::version::HttpVersion;
 
@@ -25,6 +26,8 @@ enum ParseState {
     BodyChunkedTrailer,
     BodyUntilClose,
     Done,
+    /// Connection has switched protocols (WebSocket, CONNECT-UDP, etc.).
+    Upgraded,
 }
 
 /// Incremental HTTP/1.x client codec for one Stream on an H1 Endpoint.
@@ -53,11 +56,19 @@ impl<H: ClientHandler> H1ClientCodec<H> {
         self.driver.kickoff();
     }
 
-    /// Feed inbound response bytes. Consumes everything given.
+    /// Feed inbound response bytes. Consumes everything given, unless the
+    /// connection has switched protocols (a genuine [`ProtocolUpgradeHandler`]
+    /// installed via [`ClientWriter::upgrade`]) — see [`Self::take_handler`]
+    /// for the older, h2c-Upgrade-specific handoff that instead reclaims the
+    /// [`ClientHandler`] itself.
     pub fn receive(&mut self, data: &mut &[u8]) -> HttpResult<()> {
         if let Some(err) = self.driver.fatal.clone() {
             *data = &[];
             return Err(err);
+        }
+        if self.driver.state == ParseState::Upgraded {
+            self.feed_upgraded(data);
+            return Ok(());
         }
         if matches!(self.driver.state, ParseState::Idle | ParseState::Done) {
             *data = &[];
@@ -65,14 +76,66 @@ impl<H: ClientHandler> H1ClientCodec<H> {
         }
         let consumed = self.scanner.push(data, &mut self.driver);
         *data = &data[consumed..];
+        if self.take_upgrade() {
+            self.feed_upgraded(data);
+            return self.driver.take_error();
+        }
         if self.driver.fatal.is_some() || self.driver.state == ParseState::Done {
             *data = &[];
         }
         self.driver.take_error()
     }
 
+    /// Install a pending upgrade handler, if the app installed one from
+    /// within [`ClientHandler::switching_protocols`] during the last
+    /// [`Self::receive`] call.
+    fn take_upgrade(&mut self) -> bool {
+        if let Some(up) = self.driver.pending_upgrade.take() {
+            self.driver.upgraded = Some(up);
+            self.driver.state = ParseState::Upgraded;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn feed_upgraded(&mut self, data: &mut &[u8]) {
+        if self.driver.capsule_mode {
+            if !data.is_empty() {
+                match self.driver.capsule_parser.push(data) {
+                    Ok(capsules) => {
+                        if let Some(up) = self.driver.upgraded.as_mut() {
+                            for c in capsules {
+                                if c.ty == CAPSULE_DATAGRAM {
+                                    if up.wants_datagrams() {
+                                        up.datagram_received(&c.value);
+                                    }
+                                } else {
+                                    up.capsule_received(c.ty, &c.value);
+                                }
+                            }
+                        }
+                    }
+                    Err(()) => {
+                        self.driver
+                            .fail(HttpError::new(0, "malformed Capsule Protocol"));
+                    }
+                }
+            } else if let Some(up) = self.driver.upgraded.as_mut() {
+                up.receive(data);
+            }
+        } else if let Some(up) = self.driver.upgraded.as_mut() {
+            up.receive(data);
+        }
+        *data = &[];
+    }
+
     /// Connection EOF.
     pub fn close(&mut self) -> HttpResult<()> {
+        if let Some(up) = self.driver.upgraded.as_mut() {
+            up.closed();
+            return Ok(());
+        }
         if self.driver.state == ParseState::BodyUntilClose {
             self.driver.finish_response();
         } else if !matches!(self.driver.state, ParseState::Idle | ParseState::Done) {
@@ -83,13 +146,22 @@ impl<H: ClientHandler> H1ClientCodec<H> {
 
     /// Bytes queued for the peer.
     pub fn take_outbound(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.driver.out)
+        let mut out = std::mem::take(&mut self.driver.out);
+        if let Some(up) = self.driver.upgraded.as_mut() {
+            out.extend(up.take_outbound());
+        }
+        out
     }
 
     /// Reclaim the handler after a `101 Switching Protocols` response halted
     /// this codec (see [`crate::stream::ClientHandler::switching_protocols`]).
     /// The caller now owns the raw transport and any bytes this codec left
     /// unconsumed in the last [`Self::receive`] call.
+    ///
+    /// For h2c Upgrade only — a genuine [`ProtocolUpgradeHandler`] installed
+    /// via [`ClientWriter::upgrade`] is instead driven internally by this
+    /// codec (see [`Self::receive`]/[`Self::take_outbound`]) and needs no
+    /// handoff at all.
     ///
     /// Panics if called twice, or before the handler has been installed —
     /// callers only ever call this once, right after observing the upgrade.
@@ -126,6 +198,18 @@ struct Driver<H: ClientHandler> {
     req_chunked: bool,
     req_method: String,
     fatal: Option<HttpError>,
+    /// Set by [`ClientWriter::upgrade`] from within
+    /// [`ClientHandler::switching_protocols`]; picked up by
+    /// [`H1ClientCodec::take_upgrade`] right afterward.
+    pending_upgrade: Option<Box<dyn ProtocolUpgradeHandler>>,
+    /// Installed once an upgrade has been taken — the connection now
+    /// belongs to it instead of ordinary HTTP/1.1 response framing.
+    upgraded: Option<Box<dyn ProtocolUpgradeHandler>>,
+    /// Whether the upgraded connection carries Capsule Protocol framing
+    /// (`Capsule-Protocol: ?1` on the response, RFC 9297 §3.4) rather than
+    /// a raw byte stream.
+    capsule_mode: bool,
+    capsule_parser: CapsuleParser,
 }
 
 impl<H: ClientHandler> Driver<H> {
@@ -150,6 +234,10 @@ impl<H: ClientHandler> Driver<H> {
             req_chunked: false,
             req_method: String::new(),
             fatal: None,
+            pending_upgrade: None,
+            upgraded: None,
+            capsule_mode: false,
+            capsule_parser: CapsuleParser::new(),
         }
     }
 
@@ -187,6 +275,7 @@ impl<H: ClientHandler> Driver<H> {
                 req_chunked: &mut self.req_chunked,
                 req_method: &mut self.req_method,
                 version: self.version,
+                pending_upgrade: &mut self.pending_upgrade,
             };
             app.start(&mut view);
         }
@@ -204,6 +293,7 @@ impl<H: ClientHandler> Driver<H> {
             req_chunked: &mut self.req_chunked,
             req_method: &mut self.req_method,
             version: self.version,
+            pending_upgrade: &mut self.pending_upgrade,
         };
         let r = f(&mut app, &mut view);
         self.app = Some(app);
@@ -250,8 +340,14 @@ impl<H: ClientHandler> Driver<H> {
             // whatever follows belongs to the new protocol, not another
             // status line. Surface it and halt; the caller (which owns the
             // raw transport) takes it from here with whatever bytes this
-            // scanner didn't consume.
+            // scanner didn't consume. If the app installs a
+            // `ProtocolUpgradeHandler` via `ClientWriter::upgrade`, this
+            // codec keeps driving the connection itself (see
+            // `H1ClientCodec::take_upgrade`) rather than handing off to the
+            // caller the way the h2c-Upgrade-specific `switching_protocols`
+            // observer does.
             let hdrs = self.response_headers.clone();
+            self.capsule_mode = capsule::capsule_protocol_enabled(&hdrs);
             self.with_app(|app, req| app.switching_protocols(req, &hdrs));
             return Next::Stop;
         }
@@ -449,6 +545,7 @@ struct UaView<'a> {
     req_chunked: &'a mut bool,
     req_method: &'a mut String,
     version: HttpVersion,
+    pending_upgrade: &'a mut Option<Box<dyn ProtocolUpgradeHandler>>,
 }
 
 impl ClientWriter for UaView<'_> {
@@ -505,6 +602,14 @@ impl ClientWriter for UaView<'_> {
             self.out.extend_from_slice(b"0\r\n\r\n");
             *self.req_chunked = false;
         }
+    }
+
+    fn upgrade(&mut self, handler: Box<dyn ProtocolUpgradeHandler>) -> bool {
+        if self.pending_upgrade.is_some() {
+            return false;
+        }
+        *self.pending_upgrade = Some(handler);
+        true
     }
 }
 
@@ -702,5 +807,113 @@ mod tests {
         assert_eq!(g.status, 200);
         assert_eq!(g.body, b"ok");
         assert!(g.done);
+    }
+
+    /// Records bytes handed to it via shared state so a test can inspect it
+    /// after the handler itself has been moved into a `Box<dyn
+    /// ProtocolUpgradeHandler>` and handed off to the codec.
+    #[derive(Default)]
+    struct RecordingUpgrade {
+        received: Vec<u8>,
+        outbound: Vec<u8>,
+        closed: bool,
+    }
+
+    struct RecordingUpgradeHandler(Arc<Mutex<RecordingUpgrade>>);
+
+    impl ProtocolUpgradeHandler for RecordingUpgradeHandler {
+        fn receive(&mut self, data: &[u8]) {
+            self.0.lock().unwrap().received.extend_from_slice(data);
+        }
+        fn take_outbound(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.0.lock().unwrap().outbound)
+        }
+        fn closed(&mut self) {
+            self.0.lock().unwrap().closed = true;
+        }
+    }
+
+    struct UpgradingHandler {
+        host: String,
+        rec: Arc<Mutex<Rec>>,
+        upgrade: Arc<Mutex<RecordingUpgrade>>,
+    }
+
+    impl ClientHandler for UpgradingHandler {
+        fn start(&mut self, request: &mut dyn ClientWriter) {
+            let mut h = Headers::new();
+            h.set(":method", "GET");
+            h.set(":path", "/chat");
+            h.set("host", &self.host);
+            h.set("upgrade", "example");
+            h.set("connection", "Upgrade");
+            request.headers(h);
+            request.complete_request();
+        }
+
+        fn switching_protocols(&mut self, request: &mut dyn ClientWriter, _headers: &Headers) {
+            assert!(request.upgrade(Box::new(RecordingUpgradeHandler(Arc::clone(&self.upgrade)))));
+        }
+
+        fn response_headers(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
+            self.rec.lock().unwrap().status = headers.status_code();
+        }
+
+        fn response_body_content(&mut self, _request: &mut dyn ClientWriter, data: &[u8]) {
+            self.rec.lock().unwrap().body.extend_from_slice(data);
+        }
+
+        fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
+            self.rec.lock().unwrap().done = true;
+        }
+    }
+
+    /// End-to-end through [`H1ClientCodec`]: a `101` response whose handler
+    /// calls `ClientWriter::upgrade` hands subsequent connection bytes to
+    /// the installed [`ProtocolUpgradeHandler`] instead of parsing them as
+    /// more HTTP/1.1 — and that handler's own outbound bytes come back out
+    /// through [`H1ClientCodec::take_outbound`].
+    #[test]
+    fn switching_protocols_installs_upgrade_handler_and_relays_bytes() {
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let upgrade = Arc::new(Mutex::new(RecordingUpgrade {
+            outbound: b"pong".to_vec(),
+            ..Default::default()
+        }));
+        let mut c = H1ClientCodec::new(
+            UpgradingHandler {
+                host: "ex.com".into(),
+                rec: Arc::clone(&rec),
+                upgrade: Arc::clone(&upgrade),
+            },
+            HttpLimits::default(),
+            false,
+        );
+        c.on_connected();
+        let _ = c.take_outbound();
+
+        let mut response: &[u8] =
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: example\r\nConnection: Upgrade\r\n\r\nextra";
+        c.receive(&mut response).unwrap();
+        assert!(response.is_empty(), "the whole response head, plus the trailing extra bytes, must be consumed");
+        assert_eq!(upgrade.lock().unwrap().received, b"extra", "bytes left over after the 101 head belong to the upgrade handler");
+
+        // The app-level `ClientHandler` never sees a terminal response for
+        // this request — only `switching_protocols` fired.
+        assert_eq!(rec.lock().unwrap().status, 0);
+        assert!(!rec.lock().unwrap().done);
+
+        // Bytes queued by the upgrade handler must be flushed through the
+        // codec's own `take_outbound`.
+        assert_eq!(c.take_outbound(), b"pong");
+
+        let mut more: &[u8] = b" more bytes belong to the upgraded protocol";
+        c.receive(&mut more).unwrap();
+        assert!(more.is_empty());
+        assert_eq!(upgrade.lock().unwrap().received, b"extra more bytes belong to the upgraded protocol");
+
+        assert!(!upgrade.lock().unwrap().closed);
+        c.close().unwrap();
+        assert!(upgrade.lock().unwrap().closed, "connection EOF must reach the upgrade handler, not be treated as an incomplete HTTP response");
     }
 }

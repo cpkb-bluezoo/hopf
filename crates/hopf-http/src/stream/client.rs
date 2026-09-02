@@ -5,6 +5,7 @@
 //! Peer of [`super::server`] — not a delayed add-on.
 
 use crate::headers::Headers;
+use super::server::ProtocolUpgradeHandler;
 
 /// Factory that creates a client handler per outbound Stream.
 pub trait ClientHandlerFactory: Send + Sync {
@@ -98,6 +99,26 @@ pub trait ClientWriter {
 
     /// Finish the request (flushes headers if body was never started).
     fn complete_request(&mut self);
+
+    /// Switch this connection (H1) or stream (H2/H3) to an upgraded byte
+    /// protocol, once the server has accepted — a `101` on H1, or a `2xx`
+    /// Extended-CONNECT response on H2/H3. Call from within
+    /// [`ClientHandler::switching_protocols`], the same place
+    /// [`ServerWriter::upgrade`](super::ServerWriter::upgrade) is called
+    /// from on the server side.
+    ///
+    /// Every upgrade-seeking client (WebSocket, and protocols layered on
+    /// HTTP Datagrams/Capsules) should install its handler here rather than
+    /// negotiating its own transport — this is the one mechanism shared
+    /// across HTTP versions, so the caller never has to know or care which
+    /// of h1/h2/h3 the connection ended up using.
+    ///
+    /// Returns `false` if an upgrade handler was already installed for this
+    /// request, or the transport doesn't support installing one at this
+    /// point (e.g. called outside `switching_protocols`).
+    fn upgrade(&mut self, _handler: Box<dyn ProtocolUpgradeHandler>) -> bool {
+        false
+    }
 }
 
 impl ClientHandler for Box<dyn ClientHandler> {
