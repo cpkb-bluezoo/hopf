@@ -13,6 +13,7 @@ members = [
     "crates/hopf-otel",
     "crates/hopf-webdav",
     "crates/hopf-websocket",
+    "crates/hopf-masque",
     "crates/hopf-grpc",
     "crates/hopf-ftp",
     "crates/hopf-smtp",
@@ -60,6 +61,7 @@ default-members = [
     "crates/hopf-otel",
     "crates/hopf-webdav",
     "crates/hopf-websocket",
+    "crates/hopf-masque",
     "crates/hopf-grpc",
     "crates/hopf-ftp",
     "crates/hopf-smtp",
@@ -105,6 +107,7 @@ hopf-ldap = { version = "0.2.1", path = "crates/hopf-ldap" }
 hopf-otel = { version = "0.2.1", path = "crates/hopf-otel" }
 hopf-webdav = { version = "0.2.1", path = "crates/hopf-webdav" }
 hopf-websocket = { version = "0.2.1", path = "crates/hopf-websocket" }
+hopf-masque = { version = "0.2.1", path = "crates/hopf-masque" }
 hopf-grpc = { version = "0.2.1", path = "crates/hopf-grpc" }
 hopf-ftp = { version = "0.2.1", path = "crates/hopf-ftp" }
 hopf-smtp = { version = "0.2.1", path = "crates/hopf-smtp" }

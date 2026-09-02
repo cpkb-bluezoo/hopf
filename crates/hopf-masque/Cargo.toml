@@ -1,0 +1,27 @@
+[package]
+name = "hopf-masque"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "MASQUE (RFC 9298 CONNECT-UDP, RFC 9484 CONNECT-IP) for Hopf"
+readme = "README.md"
+keywords = ["masque", "http", "networking"]
+categories = ["network-programming"]
+
+[features]
+default = []
+# Real TCP/UDP loopback round-trips (`src/integration.rs`); excluded from
+# CI unit-test runs.
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-http = { workspace = true }
+hopf-dns = { workspace = true }
+mio = { workspace = true }
+
+[dev-dependencies]
