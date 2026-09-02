@@ -13,6 +13,7 @@
 pub mod auth;
 pub mod capsule;
 pub mod client;
+pub mod context_id;
 pub mod h1;
 pub mod h2;
 pub mod priority;
