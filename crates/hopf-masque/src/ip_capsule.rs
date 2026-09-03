@@ -165,14 +165,6 @@ fn encode_route_entry(out: &mut Vec<u8>, entry: &RouteEntry) {
     out.push(entry.ip_protocol);
 }
 
-// `ROUTE_ADVERTISEMENT` only ever flows server-to-client on the relay
-// (server) side this crate currently implements (issue #317) — decoding
-// one is the future CONNECT-IP client's job (issue #318), not this side's.
-// Kept and `#[allow(dead_code)]`-suppressed rather than deleted: it's the
-// direct counterpart of `encode_route_entries` below, which the relay does
-// need, and dropping it would mean losing the round-trip tests that are
-// the actual proof `encode_route_entries` produces correctly-shaped bytes.
-#[allow(dead_code)]
 fn decode_route_entry(buf: &[u8]) -> Option<(RouteEntry, usize)> {
     let (start, n1) = decode_ip_address(buf)?;
     let addr_len = if start.is_ipv4() { 4 } else { 16 };
@@ -202,10 +194,10 @@ pub(crate) fn encode_route_entries(entries: &[RouteEntry]) -> Vec<u8> {
     out
 }
 
-/// Decode a full `ROUTE_ADVERTISEMENT` capsule value into its entries. See
-/// [`decode_route_entry`]'s doc comment for why this has no production
-/// caller yet on the relay (server) side.
-#[allow(dead_code)]
+/// Decode a full `ROUTE_ADVERTISEMENT` capsule value into its entries —
+/// the relay (server) side only ever encodes one of these (RFC 9484 §4.3
+/// is server-to-client only); decoding is the client's job (see
+/// [`crate::ip_client`]).
 pub(crate) fn decode_route_entries(value: &[u8]) -> Option<Vec<RouteEntry>> {
     let mut out = Vec::new();
     let mut pos = 0;
