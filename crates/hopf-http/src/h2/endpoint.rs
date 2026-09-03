@@ -900,7 +900,12 @@ impl H2Endpoint {
             .encode(headers.iter().map(|h| (h.name.as_str(), h.value.as_str())));
 
         let no_body = body.is_empty();
-        let end_stream_flag = if no_body && end_stream {
+        // Extended CONNECT has no traditional body — the tunnel data that
+        // follows (Capsules, HTTP Datagrams) is written later via
+        // `upgrade()`, not through the ordinary body API — so "no body
+        // written yet" must not be read as "request complete, end the
+        // stream": that would FIN the tunnel before it's used.
+        let end_stream_flag = if no_body && end_stream && !is_extended_connect {
             FLAG_END_STREAM
         } else {
             0
@@ -2487,6 +2492,50 @@ mod settings_tests {
 
         assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(ep.client_streams.len(), 1);
+    }
+
+    struct ExtConnectFactory;
+    impl ClientHandlerFactory for ExtConnectFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            Box::new(ExtConnectHandler)
+        }
+    }
+    struct ExtConnectHandler;
+    impl ClientHandler for ExtConnectHandler {
+        fn start(&mut self, request: &mut dyn ClientWriter) {
+            let mut h = Headers::new();
+            h.set(":method", "CONNECT");
+            h.set(":protocol", "connect-udp");
+            h.set(":scheme", "https");
+            h.set(":authority", "example.test");
+            h.set(":path", "/.well-known/masque/udp/target.example/443/");
+            request.headers(h);
+            request.complete_request();
+        }
+        fn response_headers(&mut self, _: &mut dyn ClientWriter, _: &Headers) {}
+        fn response_complete(&mut self, _: &mut dyn ClientWriter) {}
+    }
+
+    /// Regression test for #336: an Extended CONNECT request never streams
+    /// a traditional body — the tunnel data that follows (Capsules, HTTP
+    /// Datagrams) is written later via `upgrade()`, not through the
+    /// ordinary body API — so `start_client_request` must not read "no
+    /// body written yet" as "request complete" and set `END_STREAM` on the
+    /// initial HEADERS frame: that would FIN the tunnel before it's used.
+    #[test]
+    fn start_client_request_does_not_end_stream_for_extended_connect() {
+        let mut ep = H2Endpoint::client(Arc::new(ExtConnectFactory), HttpLimits::default(), false);
+
+        ep.start_client_request();
+
+        assert_eq!(ep.client_streams.len(), 1);
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_HEADERS);
+        assert_eq!(
+            header.flags & FLAG_END_STREAM,
+            0,
+            "Extended CONNECT's HEADERS frame must not carry END_STREAM"
+        );
     }
 }
 
