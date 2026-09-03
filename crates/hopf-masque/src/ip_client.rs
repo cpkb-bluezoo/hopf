@@ -239,6 +239,7 @@ impl ProtocolUpgradeHandler for ConnectIpClientUpgrade {
 /// [`ClientHandler`] that builds the CONNECT-IP request and, once the
 /// proxy accepts, installs [`ConnectIpClientUpgrade`].
 struct ConnectIpClientHandler {
+    proxy_host: String,
     target: IpTarget,
     ipproto: IpProto,
     event: Option<Box<dyn ConnectIpEventHandler>>,
@@ -264,6 +265,11 @@ impl ClientHandler for ConnectIpClientHandler {
                 h.set(":path", &path);
             }
         }
+        // Every request needs an authority naming the proxy — see
+        // `ConnectUdpClientHandler::start`'s doc comment for why this is
+        // set explicitly, after the pseudo-headers above (RFC 9114 §4.3:
+        // pseudo-headers must precede regular fields in the block).
+        h.set("host", &self.proxy_host);
         h.set("Capsule-Protocol", "?1");
         request.headers(h);
         request.complete_request();
@@ -319,6 +325,7 @@ impl ClientHandler for ConnectIpClientHandler {
 }
 
 struct ConnectIpClientFactory {
+    proxy_host: String,
     target: IpTarget,
     ipproto: IpProto,
     event: Arc<Mutex<Option<Box<dyn ConnectIpEventHandler>>>>,
@@ -332,6 +339,7 @@ impl ClientHandlerFactory for ConnectIpClientFactory {
         // event handler.
         let event = self.event.lock().unwrap().take();
         Box::new(ConnectIpClientHandler {
+            proxy_host: self.proxy_host.clone(),
             target: self.target.clone(),
             ipproto: self.ipproto,
             event,
@@ -360,6 +368,7 @@ pub fn connect_ip(
     resolver: Option<Arc<DnsResolver>>,
 ) -> io::Result<()> {
     let factory: Arc<dyn ClientHandlerFactory> = Arc::new(ConnectIpClientFactory {
+        proxy_host: proxy_host.to_string(),
         target,
         ipproto,
         event: Arc::new(Mutex::new(Some(event_handler))),
@@ -376,4 +385,62 @@ pub fn connect_ip(
         quic_client_config,
         alt_svc_cache,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same reasoning as `crate::client::tests::RecordingWriter`.
+    struct RecordingWriter {
+        version: HttpVersion,
+        headers: Option<Headers>,
+    }
+
+    impl ClientWriter for RecordingWriter {
+        fn headers(&mut self, headers: Headers) {
+            self.headers = Some(headers);
+        }
+        fn start_request_body(&mut self) {}
+        fn request_body_content(&mut self, _data: &[u8]) {}
+        fn end_request_body(&mut self) {}
+        fn complete_request(&mut self) {}
+        fn version(&self) -> HttpVersion {
+            self.version
+        }
+        fn conn_handle(&self) -> ConnHandle {
+            ConnHandle::from_execute(Arc::new(|task| task()))
+        }
+    }
+
+    /// Regression test for #332 — see
+    /// `crate::client::tests::h3_request_sets_an_authority_with_pseudo_headers_first`,
+    /// whose reasoning applies unchanged to CONNECT-IP's client.
+    #[test]
+    fn h3_request_sets_an_authority_with_pseudo_headers_first() {
+        let mut handler = ConnectIpClientHandler {
+            proxy_host: "proxy.example".to_string(),
+            target: IpTarget::Wildcard,
+            ipproto: IpProto::Wildcard,
+            event: None,
+        };
+        let mut writer = RecordingWriter { version: HttpVersion::Http3, headers: None };
+        handler.start(&mut writer);
+        let headers = writer.headers.expect("start() never called ClientWriter::headers");
+
+        assert_eq!(headers.get("host"), Some("proxy.example"));
+
+        let mut seen_regular = false;
+        for h in headers.iter() {
+            if h.name.starts_with(':') {
+                assert!(
+                    !seen_regular,
+                    "pseudo-header {:?} appeared after a regular header",
+                    h.name
+                );
+            } else {
+                seen_regular = true;
+            }
+        }
+    }
 }
