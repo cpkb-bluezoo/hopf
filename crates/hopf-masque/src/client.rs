@@ -168,6 +168,7 @@ impl ProtocolUpgradeHandler for ConnectUdpClientUpgrade {
 /// [`ClientHandler`] that builds the CONNECT-UDP request and, once the
 /// proxy accepts, installs [`ConnectUdpClientUpgrade`].
 struct ConnectUdpClientHandler {
+    proxy_host: String,
     target_host: String,
     target_port: u16,
     event: Option<Box<dyn ConnectUdpEventHandler>>,
@@ -196,6 +197,14 @@ impl ClientHandler for ConnectUdpClientHandler {
                 h.set(":path", &path);
             }
         }
+        // Every request needs an authority naming the proxy this stream is
+        // actually addressed to (RFC 9114 §4.3.1 requires `:authority` or
+        // `Host` on H2/H3 — unlike H1, neither framework `ClientWriter`
+        // fills one in from the dial target on our behalf, so this is the
+        // caller's job regardless of transport). Set after the
+        // pseudo-headers above: RFC 9114 §4.3 requires all pseudo-headers
+        // to precede regular fields in the block.
+        h.set("host", &self.proxy_host);
         h.set("Capsule-Protocol", "?1");
         request.headers(h);
         request.complete_request();
@@ -254,6 +263,7 @@ impl ClientHandler for ConnectUdpClientHandler {
 }
 
 struct ConnectUdpClientFactory {
+    proxy_host: String,
     target_host: String,
     target_port: u16,
     event: Arc<Mutex<Option<Box<dyn ConnectUdpEventHandler>>>>,
@@ -268,6 +278,7 @@ impl ClientHandlerFactory for ConnectUdpClientFactory {
         // what reports the outcome).
         let event = self.event.lock().unwrap().take();
         Box::new(ConnectUdpClientHandler {
+            proxy_host: self.proxy_host.clone(),
             target_host: self.target_host.clone(),
             target_port: self.target_port,
             event,
@@ -300,6 +311,7 @@ pub fn connect_udp(
     resolver: Option<Arc<DnsResolver>>,
 ) -> io::Result<()> {
     let factory: Arc<dyn ClientHandlerFactory> = Arc::new(ConnectUdpClientFactory {
+        proxy_host: proxy_host.to_string(),
         target_host: target_host.into(),
         target_port,
         event: Arc::new(Mutex::new(Some(event_handler))),
@@ -316,4 +328,70 @@ pub fn connect_udp(
         quic_client_config,
         alt_svc_cache,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records the [`Headers`] a [`ClientHandler`] passed to
+    /// [`ClientWriter::headers`], for a fixed, caller-chosen
+    /// [`HttpVersion`] — standing in for a real transport's writer just
+    /// well enough to inspect what `ConnectUdpClientHandler::start` builds.
+    struct RecordingWriter {
+        version: HttpVersion,
+        headers: Option<Headers>,
+    }
+
+    impl ClientWriter for RecordingWriter {
+        fn headers(&mut self, headers: Headers) {
+            self.headers = Some(headers);
+        }
+        fn start_request_body(&mut self) {}
+        fn request_body_content(&mut self, _data: &[u8]) {}
+        fn end_request_body(&mut self) {}
+        fn complete_request(&mut self) {}
+        fn version(&self) -> HttpVersion {
+            self.version
+        }
+        fn conn_handle(&self) -> ConnHandle {
+            ConnHandle::from_execute(Arc::new(|task| task()))
+        }
+    }
+
+    /// Regression test for #332: `ConnectUdpClientHandler::start` never set
+    /// an authority for the proxy on H2/H3 — RFC 9114 §4.3.1 requires
+    /// `:authority` or `Host`, so a real H2/H3 proxy's (or, as here,
+    /// `hopf-http`'s own outbound) pseudo-header validation rejects the
+    /// request outright. RFC 9114 §4.3 also requires every pseudo-header to
+    /// precede all regular fields, so this checks ordering too, not just
+    /// presence — an earlier draft of the fix set `Host` before
+    /// `:method`/`:protocol`/`:path` and failed exactly this way.
+    #[test]
+    fn h3_request_sets_an_authority_with_pseudo_headers_first() {
+        let mut handler = ConnectUdpClientHandler {
+            proxy_host: "proxy.example".to_string(),
+            target_host: "target.example".to_string(),
+            target_port: 443,
+            event: None,
+        };
+        let mut writer = RecordingWriter { version: HttpVersion::Http3, headers: None };
+        handler.start(&mut writer);
+        let headers = writer.headers.expect("start() never called ClientWriter::headers");
+
+        assert_eq!(headers.get("host"), Some("proxy.example"));
+
+        let mut seen_regular = false;
+        for h in headers.iter() {
+            if h.name.starts_with(':') {
+                assert!(
+                    !seen_regular,
+                    "pseudo-header {:?} appeared after a regular header",
+                    h.name
+                );
+            } else {
+                seen_regular = true;
+            }
+        }
+    }
 }
