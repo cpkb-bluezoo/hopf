@@ -108,6 +108,10 @@ pub struct QuicStreamEndpoint {
     execute: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
     write_ready: Option<WriteReadyCallback>,
     read_paused: bool,
+    /// Set by [`Endpoint::poke_handler`], consumed by the driver right
+    /// after running the `DriverCmd::WithStream` task that set it — see
+    /// [`Self::take_wants_poke`].
+    wants_poke: bool,
 }
 
 impl QuicStreamEndpoint {
@@ -137,11 +141,23 @@ impl QuicStreamEndpoint {
             execute,
             write_ready: None,
             read_paused: false,
+            wants_poke: false,
         }
     }
 
     pub(crate) fn is_read_paused(&self) -> bool {
         self.read_paused
+    }
+
+    /// Take-and-clear the poke flag set by [`Endpoint::poke_handler`] — the
+    /// driver calls this right after running a `DriverCmd::WithStream` task,
+    /// and if it comes back `true`, re-invokes the stream's protocol
+    /// handler with an empty slice (mirroring the TCP reactor's
+    /// `poke_handler`, which redelivers/re-calls `receive` with no new
+    /// data so deferred replies queued from another thread's callback get
+    /// flushed without waiting on the peer to send more bytes).
+    pub(crate) fn take_wants_poke(&mut self) -> bool {
+        std::mem::take(&mut self.wants_poke)
     }
 
     pub(crate) fn take_write_ready(&mut self) -> Option<WriteReadyCallback> {
@@ -280,6 +296,10 @@ impl Endpoint for QuicStreamEndpoint {
 
     fn on_write_ready(&mut self, callback: Option<WriteReadyCallback>) {
         self.write_ready = callback;
+    }
+
+    fn poke_handler(&mut self) {
+        self.wants_poke = true;
     }
 
     fn execute(&self, task: Box<dyn FnOnce() + Send>) {
