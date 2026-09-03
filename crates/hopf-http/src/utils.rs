@@ -2,6 +2,8 @@
 
 //! Token / host / Transfer-Encoding helpers.
 
+use crate::headers::Headers;
+
 /// Whether `b` is an RFC 9110 §5.6.2 `tchar`.
 fn is_tchar(b: u8) -> bool {
     matches!(b,
@@ -108,6 +110,28 @@ pub fn http_connection_specific_fields_are_valid(pairs: &[(String, String)]) -> 
         }
     }
     true
+}
+
+/// Strip request headers that are meaningless or outright forbidden on
+/// H2/H3 (RFC 9113 §8.2.2 / RFC 9114 §4.2) before they ever reach the wire
+/// — a caller building a request has no reason to know which transport it
+/// lands on, so the framework is what has to make a connection-specific
+/// header make sense (or safely disappear) rather than the app.
+///
+/// Returns whether a `Connection: close` token was present, so H2 — which
+/// has a real, if degenerate, way to act on the app's intent locally
+/// (close the connection once its current streams finish, rather than
+/// forward a header the peer would reject as malformed) — can still honor
+/// it. H3 has no equivalent notion of a graceful pre-close warning, so its
+/// caller has nothing to do with the return value.
+pub(crate) fn strip_connection_specific_request_headers(headers: &mut Headers) -> bool {
+    let wants_close = headers
+        .get("connection")
+        .is_some_and(|v| v.split(',').map(str::trim).any(|t| t.eq_ignore_ascii_case("close")));
+    for name in CONNECTION_SPECIFIC_HEADERS {
+        headers.remove(name);
+    }
+    wants_close
 }
 
 /// RFC 9114 §4.1: trailer field sections MUST NOT contain pseudo-headers.

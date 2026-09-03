@@ -242,6 +242,12 @@ struct H2ClientStreamWriter {
     body: Vec<u8>,
     done: bool,
     scheme: &'static str,
+    /// Set if the app's headers asked for `Connection: close` — see
+    /// [`crate::utils::strip_connection_specific_request_headers`]. Read
+    /// back by whichever code kicks this stream off, to close the
+    /// connection once every client stream has drained instead of
+    /// forwarding a header H2 forbids on the wire (RFC 9113 §8.2.2).
+    close_after: bool,
 }
 
 impl H2ClientStreamWriter {
@@ -252,6 +258,7 @@ impl H2ClientStreamWriter {
             body: Vec::new(),
             done: false,
             scheme,
+            close_after: false,
         }
     }
 }
@@ -266,6 +273,7 @@ impl ClientWriter for H2ClientStreamWriter {
                 headers.add_pseudo(":authority", host);
             }
         }
+        self.close_after = crate::utils::strip_connection_specific_request_headers(&mut headers);
         self.request_headers = Some(headers);
     }
 
@@ -442,6 +450,14 @@ pub struct H2Endpoint {
     /// set; the final GOAWAY (with the true last-stream-id) and connection
     /// close happen once `server_streams` drains to empty.
     graceful_shutdown: bool,
+
+    /// Client role: `true` once any request's headers asked for
+    /// `Connection: close` (see
+    /// [`crate::utils::strip_connection_specific_request_headers`]) — the
+    /// header itself never reaches the wire (H2 forbids it), but the app's
+    /// intent still applies locally: close the connection once every
+    /// client stream has drained, checked at the tail of `receive()`.
+    client_wants_close: bool,
 
     deferred_flush: Arc<H2DeferredFlush>,
 
@@ -631,6 +647,7 @@ impl H2Endpoint {
             continuation_end_stream: false,
             continuation_block: Vec::new(),
             graceful_shutdown: false,
+            client_wants_close: false,
             deferred_flush: Arc::new(H2DeferredFlush {
                 streams: Mutex::new(Vec::new()),
             }),
@@ -866,6 +883,9 @@ impl H2Endpoint {
         let headers = writer.request_headers.take().unwrap_or_default();
         let body = std::mem::take(&mut writer.body);
         let end_stream = writer.done;
+        if writer.close_after {
+            self.client_wants_close = true;
+        }
         // RFC 8441 / RFC 9220 Extended CONNECT: only such a request's first
         // `2xx` response should be treated as a protocol switch rather than
         // an ordinary response — see where `response_headers_received`
@@ -2226,7 +2246,7 @@ impl ProtocolHandler for H2Endpoint {
             self.out.clear();
         }
 
-        if self.state == ConnState::GoAway {
+        if self.state == ConnState::GoAway || (self.client_wants_close && self.client_streams.is_empty()) {
             endpoint.close();
         }
     }
@@ -2922,6 +2942,122 @@ mod client_goaway_tests {
 
         assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(ep.client_streams.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod client_connection_specific_header_tests {
+    use super::*;
+    use crate::stream::{ClientHandler, ClientHandlerFactory, ClientWriter};
+
+    /// `Connection` (and the rest of RFC 9113 §8.2.2's connection-specific
+    /// set) must never reach the wire on H2 — but `Connection: close`
+    /// specifically still needs to be understood, just acted on locally
+    /// instead of forwarded as a header the peer would reject as malformed.
+    #[test]
+    fn client_stream_writer_strips_connection_close_and_records_it_locally() {
+        let mut writer = H2ClientStreamWriter::new(1, "https");
+        let mut h = Headers::new();
+        h.set(":method", "GET");
+        h.set(":path", "/");
+        h.set("connection", "close");
+        writer.headers(h);
+
+        let sent = writer.request_headers.as_ref().unwrap();
+        assert!(sent.get("connection").is_none(), "must never reach the wire on H2");
+        assert!(writer.close_after, "the app's intent must still be recorded locally");
+    }
+
+    /// A request with no `Connection` header at all doesn't spuriously
+    /// trigger the close-after-drain behavior.
+    #[test]
+    fn client_stream_writer_leaves_close_after_unset_without_the_header() {
+        let mut writer = H2ClientStreamWriter::new(1, "https");
+        let mut h = Headers::new();
+        h.set(":method", "GET");
+        h.set(":path", "/");
+        writer.headers(h);
+
+        assert!(!writer.close_after);
+    }
+
+    struct NoopClientFactory;
+    impl ClientHandlerFactory for NoopClientFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+    fn client_endpoint() -> H2Endpoint {
+        H2Endpoint::client(Arc::new(NoopClientFactory), HttpLimits::default(), false)
+    }
+
+    struct NoopHandler;
+    impl ClientHandler for NoopHandler {
+        fn start(&mut self, _request: &mut dyn ClientWriter) {}
+        fn response_headers(&mut self, _request: &mut dyn ClientWriter, _headers: &Headers) {}
+        fn response_complete(&mut self, _request: &mut dyn ClientWriter) {}
+    }
+
+    fn insert_client_stream(ep: &mut H2Endpoint, id: u32) {
+        ep.client_streams.insert(
+            id,
+            H2ClientStream {
+                id,
+                handler: Box::new(NoopHandler),
+                response_headers_received: false,
+                response_body_started: false,
+                pending_body: Vec::new(),
+                pending_end_stream: false,
+                is_extended_connect: false,
+                upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
+            },
+        );
+        ep.flow.open_stream(id, crate::h2::flow::INITIAL_WINDOW_SIZE);
+    }
+
+    /// Once `client_wants_close` is set and every client stream has
+    /// drained, the connection closes on its own — the app never has to
+    /// know it asked for something H2 can't put on the wire directly.
+    #[test]
+    fn closes_once_drained_when_client_wanted_close() {
+        let mut ep = client_endpoint();
+        ep.state = ConnState::Open;
+        ep.client_wants_close = true;
+
+        let mut endpoint = RecordingEndpoint::default();
+        ep.receive(&mut endpoint, &mut &[][..]);
+
+        assert!(endpoint.closed);
+    }
+
+    /// The same connection, but with a stream still in flight: must not
+    /// close early and orphan it.
+    #[test]
+    fn does_not_close_while_a_client_stream_is_still_open() {
+        let mut ep = client_endpoint();
+        ep.state = ConnState::Open;
+        ep.client_wants_close = true;
+        insert_client_stream(&mut ep, 1);
+
+        let mut endpoint = RecordingEndpoint::default();
+        ep.receive(&mut endpoint, &mut &[][..]);
+
+        assert!(!endpoint.closed);
+    }
+
+    /// No request ever asked for `Connection: close` — an idle connection
+    /// with no streams must not close on its own for an unrelated reason.
+    #[test]
+    fn does_not_close_when_the_client_never_asked_for_it() {
+        let mut ep = client_endpoint();
+        ep.state = ConnState::Open;
+
+        let mut endpoint = RecordingEndpoint::default();
+        ep.receive(&mut endpoint, &mut &[][..]);
+
+        assert!(!endpoint.closed);
     }
 }
 

@@ -261,6 +261,12 @@ impl ClientWriter for H3ClientWriter {
                 headers.add_pseudo(":authority", host);
             }
         }
+        // H3 has no connection-specific fields at all (RFC 9114 §4.2) and
+        // no equivalent of H2's client-initiated graceful shutdown to act
+        // on `Connection: close` with — the caller building the request
+        // has no reason to know that, so this just quietly disappears
+        // rather than reaching the wire as a protocol violation.
+        crate::utils::strip_connection_specific_request_headers(&mut headers);
         self.request_headers = Some(headers);
     }
 
@@ -1148,6 +1154,28 @@ mod status_validation_tests {
         assert!(!stream.malformed);
         assert_eq!(rec.lock().unwrap().status, Some(200));
         assert_eq!(rec.lock().unwrap().failed, 0);
+    }
+
+    /// `Connection` (and the rest of RFC 9114 §4.2's connection-specific
+    /// set) is meaningless on H3 — no half-duplex TCP-style close to
+    /// signal — so it's just dropped rather than reaching the wire as a
+    /// protocol violation. Unlike H2, there's no local behavior to honor
+    /// it with either.
+    #[test]
+    fn writer_strips_connection_specific_headers() {
+        let mut writer = H3ClientWriter::new();
+        let mut h = Headers::new();
+        h.set(":method", "GET");
+        h.set(":path", "/");
+        h.set(":authority", "example.test");
+        h.set("connection", "close");
+        h.set("transfer-encoding", "chunked");
+        writer.headers(h);
+
+        let sent = writer.request_headers.as_ref().unwrap();
+        assert!(sent.get("connection").is_none());
+        assert!(sent.get("transfer-encoding").is_none());
+        assert_eq!(sent.get(":method"), Some("GET"), "unrelated headers must survive untouched");
     }
 
     #[test]
