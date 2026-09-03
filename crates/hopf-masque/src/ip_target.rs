@@ -72,6 +72,20 @@ pub fn parse(path: &str) -> Option<ConnectIpTarget> {
     Some(ConnectIpTarget { target, ipproto })
 }
 
+/// Build the RFC 9484 §3 URI template path for `target`/`ipproto` — the
+/// inverse of [`parse`], for the client side.
+pub(crate) fn encode(target: &IpTarget, ipproto: &IpProto) -> String {
+    let target_seg = match target {
+        IpTarget::Wildcard => "*".to_string(),
+        IpTarget::Named(s) => crate::percent::encode(s),
+    };
+    let ipproto_seg = match ipproto {
+        IpProto::Wildcard => "*".to_string(),
+        IpProto::Number(n) => n.to_string(),
+    };
+    format!("{PREFIX}{target_seg}/{ipproto_seg}/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +95,29 @@ mod tests {
         let t = parse("/.well-known/masque/ip/*/*/").unwrap();
         assert_eq!(t.target, IpTarget::Wildcard);
         assert_eq!(t.ipproto, IpProto::Wildcard);
+    }
+
+    #[test]
+    fn encode_then_parse_round_trips_a_fully_wildcarded_request() {
+        let path = encode(&IpTarget::Wildcard, &IpProto::Wildcard);
+        let t = parse(&path).unwrap();
+        assert_eq!(t.target, IpTarget::Wildcard);
+        assert_eq!(t.ipproto, IpProto::Wildcard);
+    }
+
+    #[test]
+    fn encode_then_parse_round_trips_a_named_target_and_concrete_protocol() {
+        let path = encode(&IpTarget::Named("192.0.2.0/24".to_string()), &IpProto::Number(17));
+        let t = parse(&path).unwrap();
+        assert_eq!(t.target, IpTarget::Named("192.0.2.0/24".to_string()));
+        assert_eq!(t.ipproto, IpProto::Number(17));
+    }
+
+    #[test]
+    fn encode_then_parse_round_trips_an_ipv6_prefix() {
+        let path = encode(&IpTarget::Named("2001:db8::/32".to_string()), &IpProto::Wildcard);
+        let t = parse(&path).unwrap();
+        assert_eq!(t.target, IpTarget::Named("2001:db8::/32".to_string()));
     }
 
     #[test]

@@ -16,9 +16,10 @@ use hopf_http::{
 };
 
 use crate::{
-    connect_udp, ConnectIpFactory, ConnectIpHandler, ConnectIpHandlerFactory, ConnectIpPolicy,
-    ConnectIpSession, ConnectUdpEventHandler, ConnectUdpFactory, ConnectUdpPolicy,
-    ConnectUdpSession, IpProto, IpTarget,
+    connect_ip, connect_udp, ConnectIpClientSession, ConnectIpEventHandler, ConnectIpFactory,
+    ConnectIpHandler, ConnectIpHandlerFactory, ConnectIpPolicy, ConnectIpSession,
+    ConnectUdpEventHandler, ConnectUdpFactory, ConnectUdpPolicy, ConnectUdpSession, IpProto,
+    IpTarget, RequestedAddress,
 };
 
 /// Allows relaying to any target — fine for a loopback test, never for a
@@ -586,4 +587,199 @@ fn connect_ip_policy_denial_returns_403() {
     assert!(resp.contains(" 403 "), "expected 403: {resp}");
 
     let _ = rt;
+}
+
+// ---------------------------------------------------------------------------
+// CONNECT-IP client (`connect_ip`) against this crate's own relay
+// ---------------------------------------------------------------------------
+
+enum IpClientEvent {
+    Opened(Arc<dyn ConnectIpClientSession>),
+    Packet(Vec<u8>),
+    AddressAssigned(u64, IpAddr, u8),
+    RouteAdvertised(IpAddr, IpAddr, u8),
+    Closed,
+    Error(String),
+}
+
+impl std::fmt::Debug for IpClientEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opened(_) => write!(f, "Opened"),
+            Self::Packet(d) => write!(f, "Packet({d:?})"),
+            Self::AddressAssigned(id, a, p) => write!(f, "AddressAssigned({id}, {a}, {p})"),
+            Self::RouteAdvertised(s, e, p) => write!(f, "RouteAdvertised({s}, {e}, {p})"),
+            Self::Closed => write!(f, "Closed"),
+            Self::Error(e) => write!(f, "Error({e:?})"),
+        }
+    }
+}
+
+struct ChannelIpEventHandler {
+    tx: std::sync::mpsc::Sender<IpClientEvent>,
+}
+
+impl ConnectIpEventHandler for ChannelIpEventHandler {
+    fn opened(&mut self, session: Arc<dyn ConnectIpClientSession>) {
+        let _ = self.tx.send(IpClientEvent::Opened(session));
+    }
+
+    fn packet_received(&mut self, packet: &[u8]) {
+        let _ = self.tx.send(IpClientEvent::Packet(packet.to_vec()));
+    }
+
+    fn address_assigned(&mut self, request_id: u64, address: IpAddr, prefix_length: u8) {
+        let _ = self.tx.send(IpClientEvent::AddressAssigned(request_id, address, prefix_length));
+    }
+
+    fn route_advertised(&mut self, start: IpAddr, end: IpAddr, ip_protocol: u8) {
+        let _ = self.tx.send(IpClientEvent::RouteAdvertised(start, end, ip_protocol));
+    }
+
+    fn closed(&mut self) {
+        let _ = self.tx.send(IpClientEvent::Closed);
+    }
+
+    fn error(&mut self, err: &std::io::Error) {
+        let _ = self.tx.send(IpClientEvent::Error(err.to_string()));
+    }
+}
+
+/// Proves the client side (`connect_ip`) actually interoperates with this
+/// crate's own server relay, not just that each half separately matches
+/// the RFC 9484 wire format on paper: dials [`EchoIpHandlerFactory`]'s
+/// relay over a real loopback TCP connection, sends a packet through it,
+/// and checks the echo comes all the way back out through
+/// [`ConnectIpEventHandler::packet_received`].
+#[test]
+fn client_connect_ip_round_trips_packets_through_the_server_relay() {
+    let (rt, server_addr) = start_connect_ip_server(Arc::new(EchoIpHandlerFactory), Arc::new(AllowAnyIp));
+    thread::sleep(Duration::from_millis(50));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handler = Box::new(ChannelIpEventHandler { tx });
+
+    connect_ip(
+        &rt,
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        IpTarget::Wildcard,
+        IpProto::Wildcard,
+        HttpFallback::PlaintextH1,
+        handler,
+        None,
+        Arc::new(AltSvcCache::new()),
+        HttpClientTimeouts::default(),
+        None,
+    )
+    .unwrap();
+
+    let session = match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(IpClientEvent::Opened(s)) => s,
+        Ok(IpClientEvent::Error(e)) => panic!("tunnel failed to open: {e}"),
+        other => panic!("expected Opened, got {other:?}"),
+    };
+
+    session.send_packet(b"fake-ip-packet");
+
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(IpClientEvent::Packet(d)) => assert_eq!(d, b"fake-ip-packet"),
+        other => panic!("expected an echoed Packet, got {other:?}"),
+    }
+}
+
+/// A `send_address_request` from the client gets a real `address_assigned`
+/// callback — the client-side counterpart of
+/// [`h1_connect_ip_address_request_gets_assigned`], proving the same
+/// capsule round trip end to end from the client API rather than a raw
+/// socket.
+#[test]
+fn client_connect_ip_address_request_gets_assigned() {
+    let (rt, server_addr) = start_connect_ip_server(Arc::new(EchoIpHandlerFactory), Arc::new(AllowAnyIp));
+    thread::sleep(Duration::from_millis(50));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handler = Box::new(ChannelIpEventHandler { tx });
+
+    connect_ip(
+        &rt,
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        IpTarget::Wildcard,
+        IpProto::Wildcard,
+        HttpFallback::PlaintextH1,
+        handler,
+        None,
+        Arc::new(AltSvcCache::new()),
+        HttpClientTimeouts::default(),
+        None,
+    )
+    .unwrap();
+
+    let session = match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(IpClientEvent::Opened(s)) => s,
+        other => panic!("expected Opened, got {other:?}"),
+    };
+
+    session.send_address_request(&[RequestedAddress {
+        request_id: 9,
+        address: "0.0.0.0".parse().unwrap(),
+        prefix_length: 0,
+    }]);
+
+    match rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(IpClientEvent::AddressAssigned(id, addr, prefix)) => {
+            assert_eq!(id, 9);
+            assert_eq!(addr, "192.0.2.1".parse::<IpAddr>().unwrap());
+            assert_eq!(prefix, 32);
+        }
+        other => panic!("expected AddressAssigned, got {other:?}"),
+    }
+}
+
+/// A route the server advertises unprompted, the instant the tunnel opens
+/// (see [`RouteAdvertisingIpHandler`]), still reaches the client via
+/// `connect_ip` — the client-side counterpart of
+/// [`h1_connect_ip_route_advertisement_reaches_the_client`].
+#[test]
+fn client_connect_ip_receives_route_advertisement() {
+    let (rt, server_addr) =
+        start_connect_ip_server(Arc::new(RouteAdvertisingIpHandlerFactory), Arc::new(AllowAnyIp));
+    thread::sleep(Duration::from_millis(50));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handler = Box::new(ChannelIpEventHandler { tx });
+
+    connect_ip(
+        &rt,
+        &server_addr.ip().to_string(),
+        server_addr.port(),
+        IpTarget::Wildcard,
+        IpProto::Wildcard,
+        HttpFallback::PlaintextH1,
+        handler,
+        None,
+        Arc::new(AltSvcCache::new()),
+        HttpClientTimeouts::default(),
+        None,
+    )
+    .unwrap();
+
+    // The route is advertised from `opened()` on the *server* side, before
+    // this client's own `opened()` even fires — either event may arrive
+    // first, so accept both orders.
+    let mut saw_opened = false;
+    let mut saw_route = false;
+    while !(saw_opened && saw_route) {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(IpClientEvent::Opened(_)) => saw_opened = true,
+            Ok(IpClientEvent::RouteAdvertised(start, end, ip_protocol)) => {
+                assert_eq!(start, "192.0.2.0".parse::<IpAddr>().unwrap());
+                assert_eq!(end, "192.0.2.255".parse::<IpAddr>().unwrap());
+                assert_eq!(ip_protocol, 0);
+                saw_route = true;
+            }
+            other => panic!("expected Opened or RouteAdvertised, got {other:?}"),
+        }
+    }
 }

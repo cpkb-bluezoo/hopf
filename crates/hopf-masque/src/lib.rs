@@ -8,8 +8,9 @@
 //!
 //! Currently implemented: the RFC 9298 CONNECT-UDP relay, server-side — see
 //! [`ConnectUdpFactory`] — the RFC 9298 client (behind the `h3` feature) —
-//! see [`connect_udp`](client::connect_udp) — and the RFC 9484 CONNECT-IP
-//! relay, server-side — see [`ConnectIpFactory`].
+//! see [`connect_udp`](client::connect_udp) — the RFC 9484 CONNECT-IP
+//! relay, server-side — see [`ConnectIpFactory`] — and the RFC 9484 client
+//! (behind the `h3` feature) — see [`connect_ip`](ip_client::connect_ip).
 
 #![warn(missing_docs)]
 
@@ -27,6 +28,8 @@ mod target;
 
 #[cfg(feature = "h3")]
 mod client;
+#[cfg(feature = "h3")]
+mod ip_client;
 
 pub use handler::{ConnectUdpFactory, DEFAULT_IDLE_TIMEOUT};
 pub use ip_handler::ConnectIpFactory;
@@ -38,6 +41,8 @@ pub use target::{parse as parse_connect_udp_target, ConnectUdpTarget};
 
 #[cfg(feature = "h3")]
 pub use client::{connect_udp, ConnectUdpEventHandler, ConnectUdpSession};
+#[cfg(feature = "h3")]
+pub use ip_client::{connect_ip, ConnectIpClientSession, ConnectIpEventHandler, RequestedAddress};
 
 #[cfg(all(test, feature = "integration"))]
 mod integration;
