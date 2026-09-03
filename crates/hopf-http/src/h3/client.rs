@@ -553,7 +553,12 @@ impl H3ClientStream {
         if !out.is_empty() {
             endpoint.send(&out);
         }
-        if pending.done {
+        // Extended CONNECT has no traditional body — the tunnel data that
+        // follows (Capsules, HTTP Datagrams) is written later via
+        // `upgrade()`, not through the ordinary body API — so "done, no
+        // body was ever streamed" must not be read as "request complete,
+        // close the stream": that would FIN the tunnel before it's used.
+        if pending.done && !self.is_extended_connect {
             endpoint.close();
         }
     }
@@ -1884,6 +1889,22 @@ mod client_upgrade_tests {
         stream.start_request(&mut ep);
         assert!(stream.started);
         (stream, rec, upgrade, ep)
+    }
+
+    /// Regression test for #336: `emit_request` must not FIN its own send
+    /// half just because the request never streamed a traditional body.
+    /// Extended CONNECT has no traditional body — the tunnel data that
+    /// follows is written later via `upgrade()`/Capsules, not through the
+    /// ordinary body API — so treating "done, no body written yet" as
+    /// "request complete, close the stream" kills the tunnel before it can
+    /// ever be used.
+    #[test]
+    fn extended_connect_request_does_not_close_its_own_stream() {
+        let (_stream, _rec, _upgrade, ep) = ext_connect_stream();
+        assert!(
+            !ep.closed,
+            "emit_request must not auto-close an Extended CONNECT stream just because no body was streamed"
+        );
     }
 
     /// A `2xx` response to an Extended CONNECT request fires
