@@ -26,11 +26,11 @@ pub fn parse(path: &str) -> Option<ConnectUdpTarget> {
     if host_enc.is_empty() || port_enc.is_empty() {
         return None;
     }
-    let host = percent_decode(host_enc)?;
+    let host = crate::percent::decode(host_enc)?;
     if host.is_empty() {
         return None;
     }
-    let port: u16 = percent_decode(port_enc)?.parse().ok()?;
+    let port: u16 = crate::percent::decode(port_enc)?.parse().ok()?;
     Some(ConnectUdpTarget { host, port })
 }
 
@@ -38,50 +38,7 @@ pub fn parse(path: &str) -> Option<ConnectUdpTarget> {
 /// of [`parse`], for the client side. Percent-encodes `host` (needed for
 /// an IPv6 literal's colons, RFC 9298 §2's own example).
 pub(crate) fn encode(host: &str, port: u16) -> String {
-    format!("{PREFIX}{}/{port}/", percent_encode(host))
-}
-
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// Strict RFC 3986 `%XX` percent-decoding — `None` on a truncated or
-/// non-hex escape, or invalid UTF-8 in the result, rather than silently
-/// passing through whatever bytes happen to be there.
-fn percent_decode(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hi = from_hex(*bytes.get(i + 1)?)?;
-            let lo = from_hex(*bytes.get(i + 2)?)?;
-            out.push((hi << 4) | lo);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn from_hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    format!("{PREFIX}{}/{port}/", crate::percent::encode(host))
 }
 
 #[cfg(test)]
