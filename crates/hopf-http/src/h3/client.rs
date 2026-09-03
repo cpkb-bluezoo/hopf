@@ -950,6 +950,15 @@ impl ProtocolHandler for H3ClientStream {
         }
         if self.body_tracker.finish_message().is_err() {
             self.malformed = true;
+            if let Some(handler) = &mut self.handler {
+                handler.request_failed(
+                    &mut NullClientWriter,
+                    &io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "connection closed before the response completed",
+                    ),
+                );
+            }
             endpoint.abort(frame::H3_MESSAGE_ERROR);
             return;
         }
@@ -1162,6 +1171,28 @@ mod status_validation_tests {
         );
     }
 
+    /// The peer disconnects (QUIC connection lost, stream reset, etc.)
+    /// mid-response — headers announced a 5-byte body, but the connection
+    /// drops before any of it (or the peer's FIN) arrives. The app must be
+    /// told the request failed, not left hanging forever: a caller blocked
+    /// on this request has no other signal to wait on.
+    #[test]
+    fn disconnect_mid_response_fails_the_request() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[(":status", "200"), ("content-length", "5")]);
+        stream.headers_frame(&payload);
+        assert_eq!(rec.lock().unwrap().status, Some(200), "headers alone should still dispatch normally");
+
+        let mut ep = RecordingEndpoint::default();
+        stream.disconnected(&mut ep);
+
+        assert_eq!(
+            rec.lock().unwrap().failed,
+            1,
+            "app handler must be told the request failed once the promised body never arrived"
+        );
+    }
+
     #[test]
     fn non_numeric_status_rejected() {
         let (mut stream, rec) = stream_with_recorder();
@@ -1238,7 +1269,11 @@ mod status_validation_tests {
         assert!(stream.malformed);
         assert!(ep.closed);
         assert_eq!(ep.abort_code, Some(frame::H3_MESSAGE_ERROR));
-        assert_eq!(rec.lock().unwrap().failed, 0);
+        assert_eq!(
+            rec.lock().unwrap().failed,
+            1,
+            "a truncated response must reach the app as request_failed, not leave it hanging"
+        );
     }
 
     #[test]
