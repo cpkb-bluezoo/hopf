@@ -89,6 +89,13 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 # QUIC transport state machine (mio/TPC glue in-tree; not the full `quinn` crate)
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "bloom", "log"] }
+# Not used directly — quinn-proto pulls this in transitively. Pinned here
+# only to force the resolver away from 1.13.0, which fails to compile
+# ("cannot find macro `vec` in this scope" in its own `alloc`-feature code,
+# an upstream regression). Cargo.lock is intentionally not committed, so
+# every build re-resolves to the latest compatible versions otherwise.
+# Remove once a working tinyvec > 1.13.0 is published.
+tinyvec = "=1.12.0"
 tractrix = "0.2"
 self_cell = "1"
 rjsonparser = "0.1"

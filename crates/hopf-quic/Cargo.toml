@@ -23,6 +23,10 @@ integration = []
 hopf-core = { workspace = true }
 hopf-tls = { workspace = true }
 quinn-proto = { workspace = true }
+# See the workspace root Cargo.toml's comment on this entry — pins a
+# transitive quinn-proto dependency away from a broken release, not
+# something hopf-quic's own code uses.
+tinyvec = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 mio = { workspace = true }
