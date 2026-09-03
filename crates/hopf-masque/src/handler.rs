@@ -14,9 +14,12 @@ use hopf_http::capsule::capsule_protocol_enabled;
 use hopf_http::{Headers, ServerHandler, ServerHandlerFactory, ServerWriter};
 use mio::Token;
 
+use crate::accept::{accept_headers, is_extended_connect, is_h1_upgrade, send_error};
 use crate::policy::ConnectUdpPolicy;
 use crate::relay::ConnectUdpRelay;
 use crate::target;
+
+const PROTOCOL: &str = "connect-udp";
 
 /// RFC 9298 sets no lifetime bound on a CONNECT-UDP session itself — this
 /// is this crate's own default for how long a relay may sit with no
@@ -73,70 +76,10 @@ struct ConnectUdpRequestHandler {
     idle_timeout: Duration,
 }
 
-/// True for an RFC 8441/9220-shaped Extended CONNECT request naming this
-/// protocol (H2/H3): `:method: CONNECT`, `:protocol: connect-udp`.
-fn is_extended_connect_udp(headers: &Headers) -> bool {
-    headers
-        .get(":method")
-        .is_some_and(|m| m.eq_ignore_ascii_case("CONNECT"))
-        && headers
-            .get(":protocol")
-            .is_some_and(|p| p.eq_ignore_ascii_case("connect-udp"))
-}
-
-/// True for an HTTP/1.1 `Upgrade: connect-udp` request — H1 has no
-/// `:protocol` pseudo-header (RFC 9110 §7.8 reserves Upgrade to H1), so
-/// this is the only shape available there.
-fn is_h1_connect_udp_upgrade(headers: &Headers) -> bool {
-    if !headers.get(":method").is_some_and(|m| m.eq_ignore_ascii_case("GET")) {
-        return false;
-    }
-    let upgrade = headers.get("upgrade").unwrap_or("");
-    if !upgrade
-        .split(',')
-        .map(str::trim)
-        .any(|p| p.eq_ignore_ascii_case("connect-udp"))
-    {
-        return false;
-    }
-    let connection = headers.get("connection").unwrap_or("");
-    connection
-        .split(',')
-        .map(str::trim)
-        .any(|p| p.eq_ignore_ascii_case("upgrade"))
-}
-
-fn accept_headers(is_extended_connect: bool) -> Headers {
-    let mut h = Headers::new();
-    if is_extended_connect {
-        h.set(":status", "200");
-    } else {
-        h.set(":status", "101");
-        h.set("Upgrade", "connect-udp");
-        h.set("Connection", "Upgrade");
-    }
-    // Mandatory for this relay on every transport — RFC 9298's payload is
-    // always Context-ID-prefixed and delivered via the DATAGRAM capsule
-    // (see `relay.rs`), never a raw byte stream.
-    h.set("Capsule-Protocol", "?1");
-    h
-}
-
-fn send_error(w: &mut dyn ServerWriter, status: u16, message: &str) {
-    let mut h = Headers::new();
-    h.set(":status", status.to_string());
-    h.set("Content-Type", "text/plain");
-    w.headers(h);
-    w.start_response_body();
-    w.response_body_content(message.as_bytes());
-    w.end_response_body();
-    w.complete();
-}
-
 impl ServerHandler for ConnectUdpRequestHandler {
     fn headers(&mut self, response: &mut dyn ServerWriter, headers: &Headers) {
-        let is_extended_connect = is_extended_connect_udp(headers);
-        if !is_extended_connect && !is_h1_connect_udp_upgrade(headers) {
+        let extended_connect = is_extended_connect(headers, PROTOCOL);
+        if !extended_connect && !is_h1_upgrade(headers, PROTOCOL) {
             send_error(response, 400, "CONNECT-UDP upgrade required");
             return;
         }
@@ -207,7 +150,7 @@ impl ServerHandler for ConnectUdpRequestHandler {
                                         conn,
                                         idle_timeout,
                                     );
-                                    if !w.upgrade(accept_headers(is_extended_connect), Box::new(relay)) {
+                                    if !w.upgrade(accept_headers(extended_connect, PROTOCOL), Box::new(relay)) {
                                         worker.deregister_udp(token);
                                         send_error(w, 500, "upgrade failed");
                                     }
@@ -244,75 +187,4 @@ fn open_relay_socket(
     let worker = runtime.pick_worker().clone();
     let token = worker.register_udp(mio_sock, udp_handler)?;
     Ok((token, worker))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn extended_connect_headers() -> Headers {
-        let mut h = Headers::new();
-        h.set(":method", "CONNECT");
-        h.set(":protocol", "connect-udp");
-        h.set(":path", "/.well-known/masque/udp/target.example/443/");
-        h
-    }
-
-    fn h1_upgrade_headers() -> Headers {
-        let mut h = Headers::new();
-        h.set(":method", "GET");
-        h.set("Upgrade", "connect-udp");
-        h.set("Connection", "Upgrade");
-        h.set(":path", "/.well-known/masque/udp/target.example/443/");
-        h
-    }
-
-    #[test]
-    fn recognizes_extended_connect() {
-        assert!(is_extended_connect_udp(&extended_connect_headers()));
-        assert!(!is_h1_connect_udp_upgrade(&extended_connect_headers()));
-    }
-
-    #[test]
-    fn recognizes_h1_upgrade() {
-        assert!(is_h1_connect_udp_upgrade(&h1_upgrade_headers()));
-        assert!(!is_extended_connect_udp(&h1_upgrade_headers()));
-    }
-
-    #[test]
-    fn extended_connect_requires_the_right_protocol_token() {
-        let mut h = extended_connect_headers();
-        h.set(":protocol", "websocket");
-        assert!(!is_extended_connect_udp(&h));
-    }
-
-    #[test]
-    fn h1_upgrade_requires_both_upgrade_and_connection_tokens() {
-        let mut missing_connection = h1_upgrade_headers();
-        missing_connection.set("Connection", "keep-alive");
-        assert!(!is_h1_connect_udp_upgrade(&missing_connection));
-
-        let mut wrong_upgrade = h1_upgrade_headers();
-        wrong_upgrade.set("Upgrade", "websocket");
-        assert!(!is_h1_connect_udp_upgrade(&wrong_upgrade));
-    }
-
-    #[test]
-    fn h1_upgrade_token_list_is_comma_separated_and_case_insensitive() {
-        let mut h = h1_upgrade_headers();
-        h.set("Upgrade", "h2c, Connect-UDP");
-        assert!(is_h1_connect_udp_upgrade(&h));
-    }
-
-    #[test]
-    fn accept_headers_carry_capsule_protocol_and_the_right_status() {
-        let extended = accept_headers(true);
-        assert_eq!(extended.get(":status"), Some("200"));
-        assert_eq!(extended.get("capsule-protocol"), Some("?1"));
-
-        let h1 = accept_headers(false);
-        assert_eq!(h1.get(":status"), Some("101"));
-        assert_eq!(h1.get("upgrade"), Some("connect-udp"));
-        assert_eq!(h1.get("capsule-protocol"), Some("?1"));
-    }
 }

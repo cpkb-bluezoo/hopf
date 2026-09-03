@@ -7,12 +7,20 @@
 //! [`hopf_http::ProtocolUpgradeHandler`].
 //!
 //! Currently implemented: the RFC 9298 CONNECT-UDP relay, server-side — see
-//! [`ConnectUdpFactory`] — and, behind the `h3` feature, the client side —
-//! see [`connect_udp`](client::connect_udp).
+//! [`ConnectUdpFactory`] — the RFC 9298 client (behind the `h3` feature) —
+//! see [`connect_udp`](client::connect_udp) — and the RFC 9484 CONNECT-IP
+//! relay, server-side — see [`ConnectIpFactory`].
 
 #![warn(missing_docs)]
 
+mod accept;
 mod handler;
+mod ip_capsule;
+mod ip_handler;
+mod ip_policy;
+mod ip_relay;
+mod ip_target;
+mod percent;
 mod policy;
 mod relay;
 mod target;
@@ -21,6 +29,10 @@ mod target;
 mod client;
 
 pub use handler::{ConnectUdpFactory, DEFAULT_IDLE_TIMEOUT};
+pub use ip_handler::ConnectIpFactory;
+pub use ip_policy::ConnectIpPolicy;
+pub use ip_relay::{ConnectIpHandler, ConnectIpHandlerFactory, ConnectIpSession};
+pub use ip_target::{parse as parse_connect_ip_target, ConnectIpTarget, IpProto, IpTarget};
 pub use policy::ConnectUdpPolicy;
 pub use target::{parse as parse_connect_udp_target, ConnectUdpTarget};
 
