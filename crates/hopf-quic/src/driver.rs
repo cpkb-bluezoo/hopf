@@ -1045,6 +1045,18 @@ impl Driver {
                     if let Some(slot) = self.connections.get_mut(&conn) {
                         if let Some(stream) = slot.streams.get_mut(&stream_id) {
                             task(&mut stream.endpoint);
+                            // `Endpoint::poke_handler` (e.g. from
+                            // `ConnHandle::poke`) can only reach the bare
+                            // `&mut dyn Endpoint` this task closure was
+                            // given, not `stream.handler` — so it just
+                            // flags the request here; re-invoke the
+                            // protocol handler's `receive` with no data now
+                            // that we have both halves in scope, same as
+                            // the TCP reactor's `poke_handler` does inline.
+                            if stream.endpoint.take_wants_poke() {
+                                let mut empty: &[u8] = &[];
+                                stream.handler.receive(&mut stream.endpoint, &mut empty);
+                            }
                         }
                     }
                 }
@@ -1743,7 +1755,15 @@ impl Driver {
                     queues,
                     endpoint,
                     handler,
-                    send_only: matches!(dir, Dir::Uni),
+                    // This is a stream the *peer* opened (accepted via
+                    // `StreamEvent::Opened`/`conn.streams().accept(dir)`),
+                    // never one we opened ourselves — for a uni stream that
+                    // means we're the only side that can read it, so unlike
+                    // `apply_recorder`'s `send_only: matches!(dir, Dir::Uni)`
+                    // (correct there: that path is for our *own* outbound
+                    // `open_uni()` streams), it must always be `false` here,
+                    // matching `attach_stream_with_factory`'s same reasoning.
+                    send_only: false,
                     recv_finished: false,
                     send_finished: false,
                     app_notified: false,
@@ -2587,6 +2607,90 @@ mod tests {
         server.shutdown();
     }
 
+    /// Server-side handler for the poke regression test below: on its
+    /// first `receive()` (the client's real opening bytes — a QUIC stream
+    /// isn't visible to the peer at all until some data/FIN actually
+    /// crosses the wire, so `connected()` alone can't be used to capture a
+    /// handle for a still-nonexistent-to-the-peer stream), it defers —
+    /// records nothing back to the client — and instead schedules a timer
+    /// that pokes its own connection ~40ms later, via `ConnHandle::poke()`.
+    /// This is the exact shape `hopf-http`'s H3 client uses: defer a
+    /// response/request until some later fact is known, then resume via a
+    /// cross-thread `poke()` rather than waiting on more inbound bytes.
+    struct DefersThenPokesSelf {
+        calls: Arc<StdMutex<Vec<usize>>>,
+    }
+
+    impl ProtocolHandler for DefersThenPokesSelf {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            let first_call = self.calls.lock().unwrap().is_empty();
+            self.calls.lock().unwrap().push(data.len());
+            *data = &[];
+            if first_call {
+                let handle = endpoint.handle();
+                endpoint.schedule_timer(
+                    Duration::from_millis(40),
+                    Box::new(move || {
+                        handle.poke();
+                    }),
+                );
+            }
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    /// Regression test for #331: `ConnHandle::poke()` on a QUIC stream's
+    /// handle reached `QuicStreamEndpoint::poke_handler` — the trait's
+    /// default no-op — with no path back to the stream's actual
+    /// `ProtocolHandler::receive`. A handler that deferred work until a
+    /// cross-thread `poke()` arrived (the shape `hopf-http`'s H3 client
+    /// uses to resume a request once peer SETTINGS is known) just hung
+    /// forever: nothing ever turned the poke into a `receive()` call.
+    #[test]
+    fn conn_handle_poke_reinvokes_the_stream_handler_with_empty_data() {
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let calls2 = Arc::clone(&calls);
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(move || {
+                Box::new(DefersThenPokesSelf { calls: Arc::clone(&calls2) }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(|| {
+                Box::new(FirstThenSecondSender { first: b"hi", second: b"" }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        for _ in 0..200 {
+            if calls.lock().unwrap().len() >= 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &[2usize, 0],
+            "ConnHandle::poke() never re-invoked the stream's protocol handler \
+             with an empty slice after the deferred first receive"
+        );
+
+        server.shutdown();
+    }
+
     struct SecurityRecorder {
         out: Arc<StdMutex<Option<hopf_core::SecurityInfo>>>,
     }
@@ -3341,6 +3445,108 @@ mod tests {
         }
         assert_eq!(server_got.lock().unwrap().as_slice(), b"ping");
         assert_eq!(client_got.lock().unwrap().as_slice(), b"pong");
+        server.shutdown();
+    }
+
+    /// `QuicConnection` that opens one uni stream on `connected()` and
+    /// writes a fixed payload to it — stands in for a peer's H3 control
+    /// stream (SETTINGS) or QPACK streams, the scenario this regression
+    /// test is really about.
+    struct OpensUniAndWrites {
+        payload: &'static [u8],
+    }
+
+    impl QuicConnection for OpensUniAndWrites {
+        fn connected(&mut self, api: &mut dyn QuicConnApi) {
+            let stream = api.open_uni().expect("open_uni");
+            api.write(stream, self.payload);
+        }
+        fn accept_bi(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+            Box::new(NopHandler)
+        }
+        fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+            Box::new(NopHandler)
+        }
+    }
+
+    /// `ProtocolHandler` recording every byte read off a peer-opened uni
+    /// stream — the receiving side of [`OpensUniAndWrites`].
+    struct RecordsUniBytes {
+        got: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl ProtocolHandler for RecordsUniBytes {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            self.got.lock().unwrap().extend_from_slice(data);
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    struct AcceptsUniIntoRecorder {
+        got: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    impl QuicConnection for AcceptsUniIntoRecorder {
+        fn connected(&mut self, _api: &mut dyn QuicConnApi) {}
+        fn accept_bi(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+            Box::new(NopHandler)
+        }
+        fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+            Box::new(RecordsUniBytes { got: Arc::clone(&self.got) })
+        }
+    }
+
+    /// Regression test for #330: a stream *we* open (`open_uni`, the
+    /// `apply_recorder` path) is correctly `send_only` — there's nothing to
+    /// read from our own outbound stream. But `attach_stream_dir`, used
+    /// exclusively for streams the *peer* opens (`StreamEvent::Opened` →
+    /// `conn.streams().accept(dir)`), copied that same
+    /// `send_only: matches!(dir, Dir::Uni)` — backwards for this case: a
+    /// peer-opened uni stream is one *we* can only read, never write, so
+    /// marking it `send_only` makes `read_stream` skip it forever. This is
+    /// exactly the shape of H3's peer control/QPACK streams (SETTINGS,
+    /// GOAWAY) — reading them is how a client ever learns
+    /// `SETTINGS_ENABLE_CONNECT_PROTOCOL`, which CONNECT-UDP/CONNECT-IP
+    /// (hopf-masque) depend on to send Extended CONNECT at all.
+    #[test]
+    fn client_reads_a_peer_opened_uni_stream() {
+        let (server_cfg, pem) =
+            server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+
+        let server = listen_quic_hooks(crate::QuicListenHooksConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(OpensUniAndWrites { payload: b"hello-uni" }) as Box<dyn QuicConnection>),
+        ))
+        .unwrap();
+
+        let client_got = Arc::new(StdMutex::new(Vec::new()));
+        let client_got2 = Arc::clone(&client_got);
+        let _client = connect_quic_hooks(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(AcceptsUniIntoRecorder { got: Arc::clone(&client_got2) }) as Box<dyn QuicConnection>
+            }),
+        )
+        .unwrap();
+
+        for _ in 0..200 {
+            if client_got.lock().unwrap().as_slice() == b"hello-uni" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            client_got.lock().unwrap().as_slice(),
+            b"hello-uni",
+            "the client never read the peer-opened uni stream"
+        );
         server.shutdown();
     }
 
