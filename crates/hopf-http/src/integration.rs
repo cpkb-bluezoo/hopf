@@ -123,6 +123,10 @@ impl ClientHandler for GetOnce {
         h.set(":method", "GET");
         h.set(":path", "/");
         h.set("host", "test.local");
+        // The framework strips this on H2/H3 (forbidden there, RFC 9113
+        // §8.2.2 / RFC 9114 §4.2) and, on H2, honors it locally instead —
+        // this fixture doesn't need to know or care which transport it's
+        // actually running on.
         h.set("connection", "close");
         request.headers(h);
         request.complete_request();
