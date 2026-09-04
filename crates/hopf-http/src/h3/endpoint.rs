@@ -1365,10 +1365,10 @@ mod uni_stream_tests {
             self.closed = true;
             self.close_connection_code = Some(error_code);
         }
-        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             unimplemented!("not exercised by these unit tests")
         }
-        fn remote_addr(&self) -> std::io::Result<SocketAddr> {
+        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             unimplemented!("not exercised by these unit tests")
         }
         fn security_info(&self) -> &hopf_core::SecurityInfo {
@@ -2070,10 +2070,10 @@ mod request_validation_tests {
             self.closed = true;
             self.abort_code = Some(error_code);
         }
-        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             unimplemented!("not exercised by these unit tests")
         }
-        fn remote_addr(&self) -> std::io::Result<SocketAddr> {
+        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             unimplemented!("not exercised by these unit tests")
         }
         fn security_info(&self) -> &hopf_core::SecurityInfo {

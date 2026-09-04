@@ -3,11 +3,11 @@
 //! Transport-agnostic endpoint trait (Gumdrop `Endpoint`).
 
 use std::io;
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::error::StartTlsError;
 use crate::handle::ConnHandle;
+use crate::peer_addr::PeerAddr;
 use crate::security::SecurityInfo;
 
 /// Cancels a scheduled timer callback.
@@ -51,11 +51,11 @@ pub trait Endpoint: Send {
     /// Graceful close after flushing outbound data.
     fn close(&mut self);
 
-    /// Local socket address.
-    fn local_addr(&self) -> io::Result<SocketAddr>;
+    /// Local address — TCP/IP or a UNIX domain socket path.
+    fn local_addr(&self) -> io::Result<PeerAddr>;
 
-    /// Remote socket address.
-    fn remote_addr(&self) -> io::Result<SocketAddr>;
+    /// Remote address — TCP/IP or a UNIX domain socket path.
+    fn remote_addr(&self) -> io::Result<PeerAddr>;
 
     /// Whether a security layer is active.
     fn is_secure(&self) -> bool {

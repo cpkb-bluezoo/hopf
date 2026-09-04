@@ -4,6 +4,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -11,8 +12,8 @@ use std::thread::JoinHandle;
 use crate::accept::{AcceptHandle, AcceptLoop};
 use crate::binding::BindingId;
 use crate::cmd::ReactorCmd;
-use crate::connector::TcpConnectorConfig;
-use crate::listener::TcpListenerConfig;
+use crate::connector::{TcpConnectorConfig, UnixConnectorConfig};
+use crate::listener::{TcpListenerConfig, UnixListenerConfig};
 use crate::reactor::Reactor;
 use crate::service::Service;
 use crate::storage::{StorageConfig, StorageExecutor};
@@ -109,7 +110,28 @@ impl Runtime {
         Ok((addr, id))
     }
 
-    /// Remove a previously added TCP listener binding.
+    /// Register a UNIX domain socket listener; returns the bound path and
+    /// binding id. Removes a stale socket file left at `config.path` by an
+    /// unclean previous shutdown before binding (only if it's actually a
+    /// socket, never an unrelated file that happens to sit at that path).
+    pub fn add_unix_listener(&self, config: UnixListenerConfig) -> io::Result<(PathBuf, BindingId)> {
+        use std::os::unix::fs::FileTypeExt;
+        if let Ok(meta) = std::fs::symlink_metadata(&config.path) {
+            if meta.file_type().is_socket() {
+                let _ = std::fs::remove_file(&config.path);
+            }
+        }
+        let std_listener = std::os::unix::net::UnixListener::bind(&config.path)?;
+        std_listener.set_nonblocking(true)?;
+        let path = config.path.clone();
+        let listener = mio::net::UnixListener::from_std(std_listener);
+        let id = BindingId::next();
+        self.accept.add_unix_listener(id, listener, config);
+        Ok((path, id))
+    }
+
+    /// Remove a previously added listener binding — TCP or UNIX domain
+    /// socket, whichever `id` refers to.
     pub fn remove_binding(&self, id: BindingId) {
         self.accept.remove_listener(id);
     }
@@ -124,7 +146,24 @@ impl Runtime {
         let params = config.conn_params();
         let idx = self.dial_rr.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         self.workers[idx].send(ReactorCmd::Register {
-            stream,
+            stream: stream.into(),
+            handler,
+            params,
+            connecting: true,
+            telemetry: self.telemetry.clone(),
+        });
+        Ok(())
+    }
+
+    /// Dial a UNIX domain socket peer and register the Endpoint on a worker
+    /// reactor (affinity) — UNIX-domain counterpart of [`Self::connect`].
+    pub fn connect_unix(&self, config: UnixConnectorConfig) -> io::Result<()> {
+        let stream = mio::net::UnixStream::connect(&config.path)?;
+        let handler = config.create_handler();
+        let params = config.conn_params();
+        let idx = self.dial_rr.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        self.workers[idx].send(ReactorCmd::Register {
+            stream: stream.into(),
             handler,
             params,
             connecting: true,

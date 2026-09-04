@@ -23,3 +23,7 @@ integration = []
 mio = { workspace = true }
 tractrix = { workspace = true }
 bytes = "1"
+
+[target.'cfg(unix)'.dependencies]
+# UNIX domain socket peer credentials (SO_PEERCRED / getpeereid).
+libc = "0.2"

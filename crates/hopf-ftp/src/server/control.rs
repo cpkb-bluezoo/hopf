@@ -1480,10 +1480,10 @@ impl ProtocolHandler for FtpControlHandler {
         FtpServerMetrics::add(&self.metrics.connections, 1);
         self.begin_connection_telemetry();
         self.control_handle = Some(endpoint.handle());
-        if let Ok(peer) = endpoint.remote_addr() {
+        if let Some(peer) = endpoint.remote_addr().ok().and_then(|a| a.as_socket_addr()) {
             self.meta.peer = peer;
         }
-        if let Ok(local) = endpoint.local_addr() {
+        if let Some(local) = endpoint.local_addr().ok().and_then(|a| a.as_socket_addr()) {
             self.meta.local = local;
         }
         if let Some(b) = &self.bridge {
@@ -1740,11 +1740,11 @@ mod open_offload_tests {
         fn close(&mut self) {
             self.open = false;
         }
-        fn local_addr(&self) -> io::Result<SocketAddr> {
-            Ok(self.local)
+        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+            Ok(self.local.into())
         }
-        fn remote_addr(&self) -> io::Result<SocketAddr> {
-            Ok(self.peer)
+        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+            Ok(self.peer.into())
         }
         fn security_info(&self) -> &SecurityInfo {
             static PLAINTEXT: OnceLock<SecurityInfo> = OnceLock::new();

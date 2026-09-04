@@ -7,9 +7,10 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use hopf_core::{Runtime, SharedTlsConnector, TcpConnectorConfig};
+use hopf_core::{Runtime, SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig};
 use hopf_dns::DnsResolver;
 
 use super::endpoint::ImapClientEndpoint;
@@ -26,6 +27,7 @@ pub struct ImapClient {
     host: Option<String>,
     port: u16,
     addr: Option<SocketAddr>,
+    unix_path: Option<PathBuf>,
     timeouts: ImapClientTimeouts,
     tls_connector: Option<SharedTlsConnector>,
     tls_server_name: Option<String>,
@@ -41,6 +43,7 @@ impl ImapClient {
             host: Some(host.into()),
             port,
             addr: None,
+            unix_path: None,
             timeouts: ImapClientTimeouts::default(),
             tls_connector: None,
             tls_server_name: None,
@@ -56,6 +59,24 @@ impl ImapClient {
             host: None,
             port: addr.port(),
             addr: Some(addr),
+            unix_path: None,
+            timeouts: ImapClientTimeouts::default(),
+            tls_connector: None,
+            tls_server_name: None,
+            implicit_tls: false,
+            resolver: None,
+            max_pipeline: DEFAULT_MAX_PIPELINE,
+        }
+    }
+
+    /// Create a client that dials a UNIX domain socket instead of TCP/IP —
+    /// skips DNS entirely.
+    pub fn from_unix_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            host: None,
+            port: 0,
+            addr: None,
+            unix_path: Some(path.into()),
             timeouts: ImapClientTimeouts::default(),
             tls_connector: None,
             tls_server_name: None,
@@ -144,12 +165,55 @@ impl ImapClient {
         cfg
     }
 
+    /// UNIX-domain counterpart of [`Self::make_connector`].
+    fn make_unix_connector(
+        &self,
+        factory: Arc<dyn ImapClientHandlerFactory>,
+        path: PathBuf,
+    ) -> UnixConnectorConfig {
+        let tls_connector = self.tls_connector.clone();
+        let tls_server_name = self.tls_server_name.clone();
+        let stage = self.timeouts.stage;
+        let message = self.timeouts.message;
+        let connect = self.timeouts.connect;
+        let implicit = self.implicit_tls;
+        let max_pipeline = self.max_pipeline;
+        let tls_for_dial = self.tls_connector.clone();
+        let sn_for_dial = self.tls_server_name.clone();
+
+        let mut cfg = UnixConnectorConfig::new(path, move || {
+            Box::new(ImapClientEndpoint::new(
+                factory.as_ref(),
+                stage,
+                message,
+                connect,
+                tls_connector.clone(),
+                tls_server_name.clone(),
+                implicit,
+                max_pipeline,
+            ))
+        })
+        .connect_timeout(Some(self.timeouts.connect));
+
+        if implicit {
+            if let (Some(c), Some(n)) = (tls_for_dial, sn_for_dial) {
+                cfg = cfg.with_tls(c, n);
+            }
+        }
+        cfg
+    }
+
     /// Schedule DNS (if needed) then [`Runtime::connect`]. Returns immediately.
+    /// [`Self::from_unix_path`] dials a UNIX domain socket instead — skips
+    /// DNS and address resolution entirely.
     pub fn connect(
         &self,
         rt: &Arc<Runtime>,
         factory: Arc<dyn ImapClientHandlerFactory>,
     ) -> io::Result<()> {
+        if let Some(path) = &self.unix_path {
+            return rt.connect_unix(self.make_unix_connector(factory, path.clone()));
+        }
         if let Some(addr) = self.addr {
             return rt.connect(self.make_connector(factory, addr));
         }

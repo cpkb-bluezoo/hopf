@@ -9,10 +9,11 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hopf_core::{Runtime, SharedTlsConnector, TcpConnectorConfig};
+use hopf_core::{Runtime, SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig};
 use hopf_dns::DnsResolver;
 
 use crate::codec::packet::{ProtocolVersion, Will};
@@ -59,6 +60,7 @@ pub struct MqttClient {
     host: Option<String>,
     port: u16,
     addr: Option<SocketAddr>,
+    unix_path: Option<PathBuf>,
     client_id: String,
     version: ProtocolVersion,
     clean_start: bool,
@@ -82,6 +84,7 @@ impl MqttClient {
             host: Some(host.into()),
             port,
             addr: None,
+            unix_path: None,
             client_id: client_id.into(),
             version: ProtocolVersion::V5,
             clean_start: true,
@@ -105,6 +108,32 @@ impl MqttClient {
             host: None,
             port: addr.port(),
             addr: Some(addr),
+            unix_path: None,
+            client_id: client_id.into(),
+            version: ProtocolVersion::V5,
+            clean_start: true,
+            keep_alive: Duration::from_secs(60),
+            session_expiry_secs: 0,
+            receive_maximum: None,
+            username: None,
+            password: None,
+            will: None,
+            timeouts: MqttClientTimeouts::default(),
+            tls_connector: None,
+            tls_server_name: None,
+            implicit_tls: false,
+            resolver: None,
+        }
+    }
+
+    /// Create a client that dials a UNIX domain socket instead of TCP/IP —
+    /// skips DNS entirely.
+    pub fn from_unix_path(path: impl Into<PathBuf>, client_id: impl Into<String>) -> Self {
+        Self {
+            host: None,
+            port: 0,
+            addr: None,
+            unix_path: Some(path.into()),
             client_id: client_id.into(),
             version: ProtocolVersion::V5,
             clean_start: true,
@@ -224,12 +253,41 @@ impl MqttClient {
         cfg
     }
 
+    /// UNIX-domain counterpart of [`Self::make_connector`].
+    fn make_unix_connector(
+        &self,
+        factory: Arc<dyn MqttClientHandlerFactory>,
+        path: PathBuf,
+    ) -> UnixConnectorConfig {
+        let params = self.params();
+        let tls_for_dial = self.tls_connector.clone();
+        let sn_for_dial = self.tls_server_name.clone();
+        let implicit = self.implicit_tls;
+
+        let mut cfg = UnixConnectorConfig::new(path, move || {
+            Box::new(MqttClientEndpoint::new(factory.as_ref(), params.clone()))
+        })
+        .connect_timeout(Some(self.timeouts.connect));
+
+        if implicit {
+            if let (Some(c), Some(n)) = (tls_for_dial, sn_for_dial) {
+                cfg = cfg.with_tls(c, n);
+            }
+        }
+        cfg
+    }
+
     /// Schedule DNS (if needed) then [`Runtime::connect`]. Returns immediately.
+    /// [`Self::from_unix_path`] dials a UNIX domain socket instead — skips
+    /// DNS and address resolution entirely.
     ///
     /// Takes [`Arc<Runtime>`] so hostname resolution can dial from the DNS
     /// callback without blocking the caller. Literal IPs and `from_addr`
     /// skip DNS.
     pub fn connect(&self, rt: &Arc<Runtime>, factory: Arc<dyn MqttClientHandlerFactory>) -> io::Result<()> {
+        if let Some(path) = &self.unix_path {
+            return rt.connect_unix(self.make_unix_connector(factory, path.clone()));
+        }
         if let Some(addr) = self.addr {
             return rt.connect(self.make_connector(factory, addr));
         }

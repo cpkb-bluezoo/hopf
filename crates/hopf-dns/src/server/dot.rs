@@ -56,7 +56,9 @@ impl ProtocolHandler for DotServerHandler {
             };
             let peer = endpoint
                 .remote_addr()
-                .unwrap_or_else(|_| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
+                .ok()
+                .and_then(|a| a.as_socket_addr())
+                .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
             let resp = self.service.process(&query, peer);
             if let Ok(bytes) = resp.serialize() {
                 let mut out = Vec::with_capacity(2 + bytes.len());

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hopf_core::SharedTlsConnector;
@@ -312,6 +313,7 @@ pub struct LdapClientConfig {
     host: Option<String>,
     port: u16,
     addr: Option<SocketAddr>,
+    unix_path: Option<PathBuf>,
     /// Implicit TLS (LDAPS) at dial time.
     tls_connector: Option<SharedTlsConnector>,
     tls_server_name: Option<String>,
@@ -328,6 +330,7 @@ impl LdapClientConfig {
             host: Some(host.into()),
             port,
             addr: None,
+            unix_path: None,
             tls_connector: None,
             tls_server_name: None,
             starttls_connector: None,
@@ -342,6 +345,23 @@ impl LdapClientConfig {
             host: None,
             port: addr.port(),
             addr: Some(addr),
+            unix_path: None,
+            tls_connector: None,
+            tls_server_name: None,
+            starttls_connector: None,
+            starttls_server_name: None,
+            connect_timeout: Some(Duration::from_secs(30)),
+        }
+    }
+
+    /// Connect over a UNIX domain socket instead of TCP/IP — skips name
+    /// resolution entirely.
+    pub fn from_unix_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            host: None,
+            port: 0,
+            addr: None,
+            unix_path: Some(path.into()),
             tls_connector: None,
             tls_server_name: None,
             starttls_connector: None,
@@ -386,6 +406,12 @@ impl LdapClientConfig {
     pub fn connect_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.connect_timeout = timeout;
         self
+    }
+
+    /// UNIX domain socket path, if this config was built with
+    /// [`Self::from_unix_path`].
+    pub(crate) fn unix_path(&self) -> Option<&Path> {
+        self.unix_path.as_deref()
     }
 
     pub(crate) fn resolve_addr(&self) -> Result<SocketAddr, LdapError> {

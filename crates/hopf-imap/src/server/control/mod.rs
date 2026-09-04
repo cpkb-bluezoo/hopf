@@ -1809,10 +1809,10 @@ impl ImapControlHandler {
 
 impl ProtocolHandler for ImapControlHandler {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
-        if let Ok(peer) = endpoint.remote_addr() {
+        if let Some(peer) = endpoint.remote_addr().ok().and_then(|a| a.as_socket_addr()) {
             self.peer = peer;
         }
-        if let Ok(local) = endpoint.local_addr() {
+        if let Some(local) = endpoint.local_addr().ok().and_then(|a| a.as_socket_addr()) {
             self.local = local;
         }
         if endpoint.is_secure() {
@@ -2068,11 +2068,11 @@ mod append_offload_tests {
             false
         }
         fn close(&mut self) {}
-        fn local_addr(&self) -> io::Result<SocketAddr> {
-            Ok("127.0.0.1:143".parse().unwrap())
+        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+            Ok(hopf_core::PeerAddr::Inet("127.0.0.1:143".parse().unwrap()))
         }
-        fn remote_addr(&self) -> io::Result<SocketAddr> {
-            Ok("127.0.0.1:9999".parse().unwrap())
+        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+            Ok(hopf_core::PeerAddr::Inet("127.0.0.1:9999".parse().unwrap()))
         }
         fn security_info(&self) -> &SecurityInfo {
             static PLAINTEXT: std::sync::OnceLock<SecurityInfo> = std::sync::OnceLock::new();

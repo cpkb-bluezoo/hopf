@@ -266,12 +266,12 @@ impl Endpoint for QuicStreamEndpoint {
         self.wake();
     }
 
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local)
+    fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+        Ok(hopf_core::PeerAddr::Inet(self.local))
     }
 
-    fn remote_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.remote)
+    fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+        Ok(hopf_core::PeerAddr::Inet(self.remote))
     }
 
     fn security_info(&self) -> &SecurityInfo {

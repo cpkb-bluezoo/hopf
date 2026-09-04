@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use hopf_core::{Runtime, TcpConnectorConfig};
+use hopf_core::{Runtime, TcpConnectorConfig, UnixConnectorConfig};
 
 use super::endpoint::LdapEndpoint;
 use super::session::{LdapSession, LdapShared, ReadyCallback};
@@ -34,7 +34,6 @@ impl LdapClient {
     where
         F: FnOnce(Result<LdapSession, LdapError>) + Send + 'static,
     {
-        let addr = config.resolve_addr()?;
         let implicit_tls = config.is_ldaps();
         let tls = config.tls();
         let starttls = config.starttls();
@@ -46,6 +45,25 @@ impl LdapClient {
 
         let shared_f = Arc::clone(&shared);
         let on_ready_f = Arc::clone(&on_ready);
+
+        if let Some(path) = config.unix_path() {
+            let shared_f2 = Arc::clone(&shared_f);
+            let on_ready_f2 = Arc::clone(&on_ready_f);
+            let mut cfg = UnixConnectorConfig::new(path, move || {
+                Box::new(LdapEndpoint::new(
+                    Arc::clone(&shared_f2),
+                    Arc::clone(&on_ready_f2),
+                    implicit_tls,
+                ))
+            })
+            .connect_timeout(connect_timeout);
+            if let Some((connector, server_name)) = tls {
+                cfg = cfg.with_tls(connector, server_name);
+            }
+            return runtime.connect_unix(cfg).map_err(LdapError::Io);
+        }
+
+        let addr = config.resolve_addr()?;
         let mut cfg = TcpConnectorConfig::new(addr, move || {
             Box::new(LdapEndpoint::new(
                 Arc::clone(&shared_f),

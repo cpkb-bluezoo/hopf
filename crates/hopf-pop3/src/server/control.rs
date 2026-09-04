@@ -1277,10 +1277,10 @@ impl Pop3ControlHandler {
 
 impl ProtocolHandler for Pop3ControlHandler {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
-        if let Ok(peer) = endpoint.remote_addr() {
+        if let Some(peer) = endpoint.remote_addr().ok().and_then(|a| a.as_socket_addr()) {
             self.peer = peer;
         }
-        if let Ok(local) = endpoint.local_addr() {
+        if let Some(local) = endpoint.local_addr().ok().and_then(|a| a.as_socket_addr()) {
             self.local = local;
         }
         if endpoint.is_secure() {

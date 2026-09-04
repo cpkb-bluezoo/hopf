@@ -1392,11 +1392,11 @@ impl SmtpControlHandler {
 
 impl ProtocolHandler for SmtpControlHandler {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
-        if let Ok(peer) = endpoint.remote_addr() {
+        if let Some(peer) = endpoint.remote_addr().ok().and_then(|a| a.as_socket_addr()) {
             self.tcp_peer = peer;
             self.meta.peer = peer;
         }
-        if let Ok(local) = endpoint.local_addr() {
+        if let Some(local) = endpoint.local_addr().ok().and_then(|a| a.as_socket_addr()) {
             self.meta.local = local;
         }
         if endpoint.is_secure() {
@@ -2047,11 +2047,11 @@ mod pending_finish_tests {
         fn close(&mut self) {
             self.open = false;
         }
-        fn local_addr(&self) -> std::io::Result<SocketAddr> {
-            Ok("127.0.0.1:25".parse().unwrap())
+        fn local_addr(&self) -> std::io::Result<hopf_core::PeerAddr> {
+            Ok(hopf_core::PeerAddr::Inet("127.0.0.1:25".parse().unwrap()))
         }
-        fn remote_addr(&self) -> std::io::Result<SocketAddr> {
-            Ok("127.0.0.1:9999".parse().unwrap())
+        fn remote_addr(&self) -> std::io::Result<hopf_core::PeerAddr> {
+            Ok(hopf_core::PeerAddr::Inet("127.0.0.1:9999".parse().unwrap()))
         }
         fn security_info(&self) -> &hopf_core::SecurityInfo {
             static PLAINTEXT: OnceLock<hopf_core::SecurityInfo> = OnceLock::new();

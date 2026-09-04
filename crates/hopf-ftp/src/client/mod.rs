@@ -47,11 +47,13 @@ pub use pipeline::{FtpGet, FtpPut};
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hopf_core::{
     ConnHandle, ProtocolHandler, Runtime, SharedTlsAcceptor, SharedTlsConnector, TcpConnectorConfig,
+    UnixConnectorConfig,
 };
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
@@ -453,6 +455,7 @@ impl Default for FtpClientTimeouts {
 pub struct FtpClient {
     host: String,
     port: u16,
+    unix_path: Option<PathBuf>,
     timeouts: FtpClientTimeouts,
     credentials: Option<(String, String)>,
     data_mode: FtpClientDataMode,
@@ -474,6 +477,31 @@ impl FtpClient {
         Self {
             host: host.into(),
             port: 21,
+            unix_path: None,
+            timeouts: FtpClientTimeouts::default(),
+            credentials: None,
+            data_mode: FtpClientDataMode::Passive,
+            prefer_epsv: true,
+            prefer_eprt: true,
+            resolver: None,
+            tls_connector: None,
+            tls_server_name: None,
+            data_tls_acceptor: None,
+            implicit_tls: false,
+        }
+    }
+
+    /// Create a client that dials the control connection over a UNIX
+    /// domain socket instead of TCP/IP — skips DNS entirely. Active-mode
+    /// (`PORT`/`EPRT`) data transfers still require a real TCP/IP address
+    /// and will fail on a UNIX-domain control connection; passive mode
+    /// (`PASV`/`EPSV`) works as long as the server's response gives a
+    /// reachable TCP/IP address for the data channel.
+    pub fn from_unix_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            host: String::new(),
+            port: 0,
+            unix_path: Some(path.into()),
             timeouts: FtpClientTimeouts::default(),
             credentials: None,
             data_mode: FtpClientDataMode::Passive,
@@ -623,6 +651,17 @@ impl FtpClient {
                 )) as Box<dyn ProtocolHandler>
             })
         };
+
+        if let Some(path) = self.unix_path.clone() {
+            let mh2 = Arc::clone(&make_handler);
+            let mut cfg = UnixConnectorConfig::new(path, move || mh2()).connect_timeout(connect_timeout);
+            if implicit_tls {
+                if let (Some(c), Some(n)) = (tls_connector.clone(), tls_server_name.clone()) {
+                    cfg = cfg.with_tls(c, n);
+                }
+            }
+            return rt2.connect_unix(cfg);
+        }
 
         let dial = {
             let rt3 = Arc::clone(&rt2);

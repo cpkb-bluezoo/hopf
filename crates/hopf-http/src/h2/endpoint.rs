@@ -2785,10 +2785,10 @@ impl Endpoint for RecordingEndpoint {
     fn close(&mut self) {
         self.closed = true;
     }
-    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+    fn local_addr(&self) -> std::io::Result<hopf_core::PeerAddr> {
         unimplemented!("not exercised by these unit tests")
     }
-    fn remote_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+    fn remote_addr(&self) -> std::io::Result<hopf_core::PeerAddr> {
         unimplemented!("not exercised by these unit tests")
     }
     fn security_info(&self) -> &SecurityInfo {

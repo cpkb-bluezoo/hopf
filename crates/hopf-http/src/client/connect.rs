@@ -4,10 +4,14 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hopf_core::{Endpoint, ProtocolHandler, Runtime, SecurityInfo, SharedTlsConnector, TcpConnectorConfig};
+use hopf_core::{
+    Endpoint, ProtocolHandler, Runtime, SecurityInfo, SharedTlsConnector, TcpConnectorConfig,
+    UnixConnectorConfig,
+};
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
 use crate::{ClientHandlerFactory, H1Endpoint, H2Endpoint, H2cUpgradeClientEndpoint, HttpLimits};
@@ -70,6 +74,30 @@ pub fn connect_http(
     dial(rt, host_or_addr, port, &timeouts, resolver, make_handler)
 }
 
+/// Dial an HTTP/1.1 or HTTP/2 cleartext peer over a UNIX domain socket
+/// instead of TCP/IP — UNIX-domain counterpart of [`connect_http`].
+pub fn connect_http_unix(
+    rt: &Arc<Runtime>,
+    path: impl Into<PathBuf>,
+    factory: Arc<dyn ClientHandlerFactory>,
+    limits: HttpLimits,
+    http2: bool,
+    timeouts: HttpClientTimeouts,
+) -> io::Result<()> {
+    let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
+        Arc::new(move || -> Box<dyn ProtocolHandler> {
+            if http2 {
+                Box::new(H2Endpoint::client(Arc::clone(&factory), limits, false))
+            } else {
+                Box::new(H1Endpoint::client(Arc::clone(&factory), limits, false))
+            }
+        });
+    rt.connect_unix(
+        UnixConnectorConfig::new(path, move || make_handler())
+            .connect_timeout(Some(timeouts.connect)),
+    )
+}
+
 /// Dial an HTTP/2 peer via HTTP/1.1 h2c Upgrade (RFC 7540 §3.2).
 pub fn connect_http2_upgrade(
     rt: &Arc<Runtime>,
@@ -85,6 +113,25 @@ pub fn connect_http2_upgrade(
             Box::new(H2cUpgradeClientEndpoint::new(Arc::clone(&factory), limits))
         });
     dial(rt, host_or_addr, port, &timeouts, resolver, make_handler)
+}
+
+/// Dial an HTTP/2 peer via HTTP/1.1 h2c Upgrade over a UNIX domain socket
+/// instead of TCP/IP — UNIX-domain counterpart of [`connect_http2_upgrade`].
+pub fn connect_http2_upgrade_unix(
+    rt: &Arc<Runtime>,
+    path: impl Into<PathBuf>,
+    factory: Arc<dyn ClientHandlerFactory>,
+    limits: HttpLimits,
+    timeouts: HttpClientTimeouts,
+) -> io::Result<()> {
+    let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
+        Arc::new(move || -> Box<dyn ProtocolHandler> {
+            Box::new(H2cUpgradeClientEndpoint::new(Arc::clone(&factory), limits))
+        });
+    rt.connect_unix(
+        UnixConnectorConfig::new(path, move || make_handler())
+            .connect_timeout(Some(timeouts.connect)),
+    )
 }
 
 /// Dial a peer over TLS, negotiating `h2`/`http/1.1` via ALPN — the
@@ -497,6 +544,38 @@ fn dial_with_fallback(
     }
 }
 
+/// UNIX-domain counterpart of [`dial_with_fallback`] — used by
+/// [`crate::capsule`]-layer callers (CONNECT-UDP/CONNECT-IP) dialing a
+/// proxy over a local socket. There's no QUIC/h3 transport for a UNIX
+/// domain socket, so this only ever dials `fallback` directly — no tier-1/
+/// tier-2 h3 discovery to attempt first, unlike the TCP/IP path.
+///
+/// [`HttpFallback::Tls`] is not supported here yet (mTLS over a local
+/// socket is a real but rare need) — returns an `Unsupported` error rather
+/// than silently dialing plaintext.
+#[cfg(feature = "h3")]
+fn dial_with_fallback_unix(
+    rt: &Arc<Runtime>,
+    path: PathBuf,
+    factory: Arc<dyn ClientHandlerFactory>,
+    limits: HttpLimits,
+    fallback: HttpFallback,
+    timeouts: HttpClientTimeouts,
+) -> io::Result<()> {
+    match fallback {
+        HttpFallback::Tls(_, _) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "HttpFallback::Tls is not yet supported for a UNIX domain socket dial",
+        )),
+        HttpFallback::PlaintextH2c => {
+            connect_http2_upgrade_unix(rt, path, factory, limits, timeouts)
+        }
+        HttpFallback::PlaintextH1 => {
+            connect_http_unix(rt, path, factory, limits, false, timeouts)
+        }
+    }
+}
+
 /// Automatic transport negotiation for an origin: a DNS HTTPS record (RFC
 /// 9460) advertising `h3` support (tier 1), then a cached Alt-Svc
 /// discovery from an earlier connection to the same origin (tier 2),
@@ -612,6 +691,23 @@ pub fn connect_auto(
         }),
     );
     Ok(())
+}
+
+/// UNIX-domain counterpart of [`connect_auto`] — dials `fallback` directly
+/// over a local socket. QUIC/h3 has no UNIX-domain transport, so there's no
+/// tier-1 (DNS HTTPS record) or tier-2 (Alt-Svc cache) discovery to attempt
+/// first; unlike [`connect_auto`], this needs no `resolver`,
+/// `quic_client_config`, or `alt_svc_cache` at all.
+#[cfg(feature = "h3")]
+pub fn connect_auto_unix(
+    rt: &Arc<Runtime>,
+    path: impl Into<PathBuf>,
+    factory: Arc<dyn ClientHandlerFactory>,
+    limits: HttpLimits,
+    fallback: HttpFallback,
+    timeouts: HttpClientTimeouts,
+) -> io::Result<()> {
+    dial_with_fallback_unix(rt, path.into(), factory, limits, fallback, timeouts)
 }
 
 /// Scans `records` (answers from a batched A/AAAA/HTTPS query) for a

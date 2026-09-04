@@ -269,8 +269,8 @@ mod tests {
         let remote: std::net::SocketAddr = "203.0.113.5:9000".parse().unwrap();
         let local: std::net::SocketAddr = "198.51.100.7:443".parse().unwrap();
         let info = ConnectionInfo::new(
-            Some(remote),
-            Some(local),
+            Some(hopf_core::PeerAddr::Inet(remote)),
+            Some(hopf_core::PeerAddr::Inet(local)),
             hopf_core::SecurityInfo::secure(
                 Some(b"h2".to_vec()),
                 Some("TLSv1.3".into()),
@@ -281,8 +281,8 @@ mod tests {
 
         let w = control.writer();
         let got = ServerWriter::connection_info(&w);
-        assert_eq!(got.remote_addr(), Some(remote));
-        assert_eq!(got.local_addr(), Some(local));
+        assert_eq!(got.remote_addr(), Some(hopf_core::PeerAddr::Inet(remote)));
+        assert_eq!(got.local_addr(), Some(hopf_core::PeerAddr::Inet(local)));
         assert!(got.is_secure());
         assert_eq!(got.security_info().alpn(), Some(&b"h2"[..]));
     }
