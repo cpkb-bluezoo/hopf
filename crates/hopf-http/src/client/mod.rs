@@ -18,7 +18,10 @@ pub use alt_svc::{parse_alt_svc_h3, AltSvcCache, AltSvcEntry, AltSvcH3Entry};
 pub use api::{
     HttpClientError, HttpClientSessionHandle, HttpConnectionHandler, HttpRequest, HttpResponseHandler,
 };
-pub use connect::{connect_http, connect_http2_upgrade, HttpClientTimeouts};
+pub use connect::{
+    connect_http, connect_http2_upgrade, connect_http2_upgrade_unix, connect_http_unix,
+    HttpClientTimeouts,
+};
 #[cfg(feature = "h3")]
-pub use connect::{connect_auto, connect_h3_by_name, connect_https, HttpFallback};
+pub use connect::{connect_auto, connect_auto_unix, connect_h3_by_name, connect_https, HttpFallback};
 pub use facade::HttpClient;

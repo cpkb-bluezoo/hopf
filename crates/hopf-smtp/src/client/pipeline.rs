@@ -1014,11 +1014,11 @@ mod tests {
         fn close(&mut self) {
             self.shared.lock().unwrap().open = false;
         }
-        fn local_addr(&self) -> io::Result<SocketAddr> {
-            Ok("127.0.0.1:25".parse().unwrap())
+        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+            Ok(hopf_core::PeerAddr::Inet("127.0.0.1:25".parse().unwrap()))
         }
-        fn remote_addr(&self) -> io::Result<SocketAddr> {
-            Ok("127.0.0.1:9999".parse().unwrap())
+        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+            Ok(hopf_core::PeerAddr::Inet("127.0.0.1:9999".parse().unwrap()))
         }
         fn security_info(&self) -> &SecurityInfo {
             static PLAINTEXT: std::sync::OnceLock<SecurityInfo> = std::sync::OnceLock::new();

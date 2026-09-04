@@ -2,8 +2,9 @@
 
 //! Telemetry events produced on the hot path (enqueue only).
 
-use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use hopf_core::PeerAddr;
 
 /// Kind of runtime event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,8 +26,8 @@ pub enum EventKind {
 pub struct TelemetryEvent {
     /// Event kind.
     pub kind: EventKind,
-    /// Optional peer address.
-    pub peer: Option<SocketAddr>,
+    /// Optional peer address — TCP/IP or UNIX domain socket path.
+    pub peer: Option<PeerAddr>,
     /// Human-readable body / message.
     pub message: String,
     /// Unix nanoseconds.
@@ -35,7 +36,7 @@ pub struct TelemetryEvent {
 
 impl TelemetryEvent {
     /// Build with current time.
-    pub fn new(kind: EventKind, peer: Option<SocketAddr>, message: impl Into<String>) -> Self {
+    pub fn new(kind: EventKind, peer: Option<PeerAddr>, message: impl Into<String>) -> Self {
         Self {
             kind,
             peer,

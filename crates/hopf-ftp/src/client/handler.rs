@@ -532,8 +532,10 @@ impl FtpControlHandler {
             FtpEvent::EpsvPort(port) => {
                 let ctrl_ip = endpoint
                     .remote_addr()
+                    .ok()
+                    .and_then(|a| a.as_socket_addr())
                     .map(|a| a.ip())
-                    .unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
+                    .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
                 let addr = SocketAddr::new(ctrl_ip, port);
                 self.after_data_setup(
                     endpoint,
@@ -656,14 +658,24 @@ impl FtpControlHandler {
         offset: Option<u64>,
         transfer: Arc<Mutex<TransferState>>,
     ) {
-        let local_ip = match endpoint.local_addr() {
+        let unix_socket_err = || {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "active-mode FTP data channel requires a TCP/IP control connection, not a UNIX domain socket",
+            )
+        };
+        let local_ip = match endpoint.local_addr().and_then(|a| {
+            a.as_socket_addr().ok_or_else(unix_socket_err)
+        }) {
             Ok(a) => a.ip(),
             Err(e) => {
                 self.fail(endpoint, FtpError::Io(e));
                 return;
             }
         };
-        let peer_ip = match endpoint.remote_addr() {
+        let peer_ip = match endpoint.remote_addr().and_then(|a| {
+            a.as_socket_addr().ok_or_else(unix_socket_err)
+        }) {
             Ok(a) => a.ip(),
             Err(e) => {
                 self.fail(endpoint, FtpError::Io(e));

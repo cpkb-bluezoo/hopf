@@ -602,7 +602,7 @@ impl FtpDataHandler {
             return;
         }
         match endpoint.remote_addr() {
-            Ok(peer) if peer.ip() == self.expected_peer => {}
+            Ok(peer) if peer.as_socket_addr().is_some_and(|a| a.ip() == self.expected_peer) => {}
             _ => {
                 // Wrong peer (or unknown) — never wire this connection
                 // into the transfer, and drop it outright.
@@ -755,11 +755,11 @@ mod tests {
         fn close(&mut self) {
             self.closed = true;
         }
-        fn local_addr(&self) -> std::io::Result<SocketAddr> {
-            Ok("127.0.0.1:21".parse().unwrap())
+        fn local_addr(&self) -> std::io::Result<hopf_core::PeerAddr> {
+            Ok(hopf_core::PeerAddr::Inet("127.0.0.1:21".parse().unwrap()))
         }
-        fn remote_addr(&self) -> std::io::Result<SocketAddr> {
-            Ok(self.remote)
+        fn remote_addr(&self) -> std::io::Result<hopf_core::PeerAddr> {
+            Ok(self.remote.into())
         }
         fn security_info(&self) -> &SecurityInfo {
             &self.security

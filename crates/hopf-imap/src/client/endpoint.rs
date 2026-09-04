@@ -1582,12 +1582,13 @@ mod tests {
         fn close(&mut self) {
             self.closed = true;
         }
-        fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             "127.0.0.1:0"
                 .parse::<std::net::SocketAddr>()
+                .map(hopf_core::PeerAddr::Inet)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
         }
-        fn remote_addr(&self) -> io::Result<std::net::SocketAddr> {
+        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             self.local_addr()
         }
         fn security_info(&self) -> &SecurityInfo {

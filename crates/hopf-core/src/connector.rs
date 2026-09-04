@@ -3,17 +3,18 @@
 //! Connector and TCP dial configuration — peer of [`crate::listener`].
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::handler::ProtocolHandler;
 use crate::listener::{HandlerFactory, DEFAULT_MAX_NET_IN, DEFAULT_MAX_NET_OUT};
+use crate::peer_addr::PeerAddr;
 use crate::tls::{SharedTlsAcceptor, SharedTlsConnector};
 
-/// Shared buffer / TLS parameters for an accepted or dialed TCP Endpoint.
-///
-/// Listen and dial birth paths both reduce to registering a stream with these
-/// params on a reactor (affinity).
+/// Shared buffer / TLS parameters for an accepted or dialed Endpoint — TCP
+/// or UNIX domain socket alike (both reduce to registering a stream with
+/// these params on a reactor).
 #[derive(Clone)]
 pub struct TcpConnParams {
     /// Max inbound buffer size before the connection is closed.
@@ -36,12 +37,13 @@ pub struct TcpConnParams {
     /// SNI / certificate name for client TLS.
     pub server_name: Option<String>,
     /// Expected peer address (used while dial connect is in progress).
-    pub remote_hint: SocketAddr,
+    pub remote_hint: PeerAddr,
 }
 
 impl TcpConnParams {
     /// Plaintext params with default buffer caps.
-    pub fn plaintext(remote_hint: SocketAddr) -> Self {
+    pub fn plaintext(remote_hint: impl Into<PeerAddr>) -> Self {
+        let remote_hint = remote_hint.into();
         Self {
             max_net_in: DEFAULT_MAX_NET_IN,
             max_net_out: DEFAULT_MAX_NET_OUT,
@@ -149,7 +151,112 @@ impl TcpConnectorConfig {
             tls_acceptor: None,
             tls_connector: self.tls.clone(),
             server_name: self.server_name.clone(),
-            remote_hint: self.addr,
+            remote_hint: self.addr.into(),
+        }
+    }
+
+    /// Create the protocol handler for this dial.
+    pub fn create_handler(&self) -> Box<dyn ProtocolHandler> {
+        (self.factory)()
+    }
+}
+
+/// UNIX domain socket dial endpoint configuration — peer of
+/// [`crate::UnixListenerConfig`], mirrors [`TcpConnectorConfig`]'s shape.
+#[derive(Clone)]
+pub struct UnixConnectorConfig {
+    /// Socket path to connect to.
+    pub path: PathBuf,
+    /// Creates the protocol handler for this dial.
+    pub factory: HandlerFactory,
+    /// Max inbound buffer size before the connection is closed.
+    pub max_net_in: usize,
+    /// Max outbound buffer size before the connection is closed.
+    pub max_net_out: usize,
+    /// Idle timeout (no receive); `None` disables.
+    pub idle_timeout: Option<Duration>,
+    /// Wall-clock budget for the connect handshake; `None` disables.
+    pub connect_timeout: Option<Duration>,
+    /// When true, TLS handshake begins immediately after connect.
+    pub secure: bool,
+    /// TLS connector (required when [`secure`](Self::secure) is true).
+    pub tls: Option<SharedTlsConnector>,
+    /// Server name for SNI / cert verification. Required when `secure` is
+    /// true and `tls` is set.
+    pub server_name: Option<String>,
+}
+
+impl UnixConnectorConfig {
+    /// Build a plaintext dial config with default buffer caps.
+    pub fn new<F>(path: impl Into<PathBuf>, factory: F) -> Self
+    where
+        F: Fn() -> Box<dyn ProtocolHandler> + Send + Sync + 'static,
+    {
+        Self {
+            path: path.into(),
+            factory: Arc::new(factory),
+            max_net_in: DEFAULT_MAX_NET_IN,
+            max_net_out: DEFAULT_MAX_NET_OUT,
+            idle_timeout: None,
+            connect_timeout: None,
+            secure: false,
+            tls: None,
+            server_name: None,
+        }
+    }
+
+    /// Override inbound buffer cap.
+    pub fn max_net_in(mut self, n: usize) -> Self {
+        self.max_net_in = n;
+        self
+    }
+
+    /// Override outbound buffer cap.
+    pub fn max_net_out(mut self, n: usize) -> Self {
+        self.max_net_out = n;
+        self
+    }
+
+    /// Set idle timeout.
+    pub fn idle_timeout(mut self, d: Option<Duration>) -> Self {
+        self.idle_timeout = d;
+        self
+    }
+
+    /// Set connect handshake timeout.
+    pub fn connect_timeout(mut self, d: Option<Duration>) -> Self {
+        self.connect_timeout = d;
+        self
+    }
+
+    /// Enable TLS-from-dial with the given connector and SNI name.
+    /// Unusual for a local UNIX-domain dial, but not disallowed — some
+    /// deployments run mTLS even over a local socket.
+    pub fn with_tls(mut self, connector: SharedTlsConnector, server_name: impl Into<String>) -> Self {
+        self.secure = true;
+        self.tls = Some(connector);
+        self.server_name = Some(server_name.into());
+        self
+    }
+
+    /// Override SNI / certificate name without changing connector.
+    pub fn server_name(mut self, name: impl Into<String>) -> Self {
+        self.server_name = Some(name.into());
+        self
+    }
+
+    /// Reduce to reactor registration params.
+    pub fn conn_params(&self) -> TcpConnParams {
+        TcpConnParams {
+            max_net_in: self.max_net_in,
+            max_net_out: self.max_net_out,
+            idle_timeout: self.idle_timeout,
+            connect_timeout: self.connect_timeout,
+            secure: self.secure,
+            tls_acceptor: None,
+            tls_connector: self.tls.clone(),
+            server_name: self.server_name.clone(),
+            remote_hint: PeerAddr::Unix(Some(self.path.clone())),
         }
     }
 

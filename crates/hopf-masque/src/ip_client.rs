@@ -352,7 +352,8 @@ impl ClientHandlerFactory for ConnectIpClientFactory {
 /// [`IpTarget`]/[`IpProto`]).
 ///
 /// Transport is negotiated exactly the way [`crate::connect_udp`]'s is —
-/// see that function's own doc comment, which applies unchanged.
+/// see that function's own doc comment, which applies unchanged, including
+/// `unix_path`.
 #[allow(clippy::too_many_arguments)]
 pub fn connect_ip(
     rt: &Arc<Runtime>,
@@ -366,6 +367,7 @@ pub fn connect_ip(
     alt_svc_cache: Arc<hopf_http::AltSvcCache>,
     timeouts: HttpClientTimeouts,
     resolver: Option<Arc<DnsResolver>>,
+    unix_path: Option<std::path::PathBuf>,
 ) -> io::Result<()> {
     let factory: Arc<dyn ClientHandlerFactory> = Arc::new(ConnectIpClientFactory {
         proxy_host: proxy_host.to_string(),
@@ -373,6 +375,9 @@ pub fn connect_ip(
         ipproto,
         event: Arc::new(Mutex::new(Some(event_handler))),
     });
+    if let Some(path) = unix_path {
+        return hopf_http::connect_auto_unix(rt, path, factory, HttpLimits::default(), fallback, timeouts);
+    }
     connect_auto(
         rt,
         proxy_host,

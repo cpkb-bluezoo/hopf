@@ -4,10 +4,9 @@
 //!
 //! Peer of [`super::client`] — not a privileged product centre.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use hopf_core::{ConnHandle, SecurityInfo};
+use hopf_core::{ConnHandle, PeerAddr, SecurityInfo};
 
 use crate::headers::Headers;
 
@@ -18,15 +17,15 @@ use crate::headers::Headers;
 /// lifetime — cheap to read on every [`ServerWriter`] call.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectionInfo {
-    pub(crate) remote_addr: Option<SocketAddr>,
-    pub(crate) local_addr: Option<SocketAddr>,
+    pub(crate) remote_addr: Option<PeerAddr>,
+    pub(crate) local_addr: Option<PeerAddr>,
     pub(crate) security_info: SecurityInfo,
 }
 
 impl ConnectionInfo {
     pub(crate) fn new(
-        remote_addr: Option<SocketAddr>,
-        local_addr: Option<SocketAddr>,
+        remote_addr: Option<PeerAddr>,
+        local_addr: Option<PeerAddr>,
         security_info: SecurityInfo,
     ) -> Self {
         Self {
@@ -36,14 +35,15 @@ impl ConnectionInfo {
         }
     }
 
-    /// Peer address, when the transport is a socket (`None` for in-process tests).
-    pub fn remote_addr(&self) -> Option<SocketAddr> {
-        self.remote_addr
+    /// Peer address, when the transport is a socket (`None` for in-process
+    /// tests) — TCP/IP or UNIX domain socket path.
+    pub fn remote_addr(&self) -> Option<PeerAddr> {
+        self.remote_addr.clone()
     }
 
     /// Local bound address, when the transport is a socket.
-    pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.local_addr
+    pub fn local_addr(&self) -> Option<PeerAddr> {
+        self.local_addr.clone()
     }
 
     /// Whether a TLS layer is active on this connection.

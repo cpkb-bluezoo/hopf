@@ -324,11 +324,11 @@ mod tests {
             false
         }
         fn close(&mut self) {}
-        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-            Ok("127.0.0.1:0".parse().unwrap())
+        fn local_addr(&self) -> std::io::Result<crate::PeerAddr> {
+            Ok(crate::PeerAddr::Inet("127.0.0.1:0".parse().unwrap()))
         }
-        fn remote_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-            Ok("127.0.0.1:0".parse().unwrap())
+        fn remote_addr(&self) -> std::io::Result<crate::PeerAddr> {
+            Ok(crate::PeerAddr::Inet("127.0.0.1:0".parse().unwrap()))
         }
         fn security_info(&self) -> &crate::security::SecurityInfo {
             static PLAINTEXT: std::sync::OnceLock<crate::security::SecurityInfo> =

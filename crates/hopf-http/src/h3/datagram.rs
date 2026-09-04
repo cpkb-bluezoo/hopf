@@ -100,10 +100,10 @@ mod tests {
         }
         fn close(&mut self) {}
         fn abort(&mut self, _error_code: u32) {}
-        fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        fn local_addr(&self) -> std::io::Result<hopf_core::PeerAddr> {
             unimplemented!()
         }
-        fn remote_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        fn remote_addr(&self) -> std::io::Result<hopf_core::PeerAddr> {
             unimplemented!()
         }
         fn security_info(&self) -> &hopf_core::SecurityInfo {

@@ -4,6 +4,8 @@
 
 use rprotobuf::Writer;
 
+use hopf_core::PeerAddr;
+
 use crate::config::OtelConfig;
 use crate::event::TelemetryEvent;
 use crate::metrics::MetricPoint;
@@ -113,9 +115,18 @@ fn write_log_record(
         any.write_string_field(ANY_STRING, &ev.message)
     })?;
     write_kv(w, LOG_ATTRIBUTES, "event.name", ev.event_name())?;
-    if let Some(peer) = ev.peer {
-        write_kv(w, LOG_ATTRIBUTES, "net.peer.ip", &peer.ip().to_string())?;
-        write_kv(w, LOG_ATTRIBUTES, "net.peer.port", &peer.port().to_string())?;
+    match &ev.peer {
+        Some(PeerAddr::Inet(addr)) => {
+            write_kv(w, LOG_ATTRIBUTES, "net.peer.ip", &addr.ip().to_string())?;
+            write_kv(w, LOG_ATTRIBUTES, "net.peer.port", &addr.port().to_string())?;
+        }
+        Some(PeerAddr::Unix(path)) => {
+            write_kv(w, LOG_ATTRIBUTES, "net.sock.family", "unix")?;
+            if let Some(path) = path {
+                write_kv(w, LOG_ATTRIBUTES, "net.sock.peer.name", &path.display().to_string())?;
+            }
+        }
+        None => {}
     }
     Ok(())
 }

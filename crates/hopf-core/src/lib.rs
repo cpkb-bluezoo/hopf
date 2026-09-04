@@ -24,6 +24,8 @@ pub mod error;
 pub mod handle;
 pub mod handler;
 pub mod listener;
+pub mod peer_addr;
+pub mod peer_cred;
 pub mod quota;
 pub mod runtime;
 pub mod security;
@@ -46,15 +48,17 @@ pub use cmd::ReactorHandle;
 pub use composition::{
     Composition, CompositionRegistry, CompositionXmlError, CompositionXmlResult,
 };
-pub use connector::{TcpConnParams, TcpConnectorConfig};
+pub use connector::{TcpConnParams, TcpConnectorConfig, UnixConnectorConfig};
 pub use endpoint::{Endpoint, TimerHandle, WriteReadyCallback};
 pub use error::StartTlsError;
 pub use handle::{ConnHandle, ConnHandleBackend};
 pub use handler::{NopHandler, ProtocolHandler};
 pub use listener::{
-    HandlerFactory, Listener, TcpListenerConfig, DEFAULT_BUFFER_SIZE, DEFAULT_MAX_NET_IN,
-    DEFAULT_MAX_NET_OUT,
+    HandlerFactory, Listener, TcpListenerConfig, UnixListenerConfig, DEFAULT_BUFFER_SIZE,
+    DEFAULT_MAX_NET_IN, DEFAULT_MAX_NET_OUT,
 };
+pub use peer_addr::PeerAddr;
+pub use peer_cred::{PeerCredAllowlist, PeerCredentials};
 pub use quota::{
     CounterQuota, MemoryQuotaManager, Quota, QuotaManager, QuotaPolicy, QuotaSource, QuotaTracker,
     QuotaVerdict, UnlimitedQuota, UnlimitedQuotaManager, UNLIMITED,
@@ -105,6 +109,36 @@ mod tests {
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+    }
+
+    /// Sends `payload` once on connect, records whatever comes back.
+    struct EchoOnceClientHandler {
+        got: Arc<Mutex<Vec<u8>>>,
+        payload: &'static [u8],
+    }
+
+    impl ProtocolHandler for EchoOnceClientHandler {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            endpoint.send(self.payload);
+        }
+
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            self.got.lock().unwrap().extend_from_slice(data);
+            *data = &[];
+        }
+
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+    }
+
+    /// A fresh, collision-free UNIX domain socket path under the OS temp
+    /// dir — `cargo test` runs tests in parallel, so a fixed path shared by
+    /// multiple `#[test]`s in this module would race.
+    fn unique_unix_socket_path(label: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("hopf-test-{label}-{}-{n}.sock", std::process::id()))
     }
 
     /// Leaves a partial line unconsumed in `data` for the next receive (compact).
@@ -260,6 +294,139 @@ mod tests {
         assert_eq!(&b2[..n2], b"world");
 
         rt.shutdown();
+    }
+
+    /// Regression test for issue #340: a UNIX domain socket listener and a
+    /// UNIX domain socket client dial, both through the real `Runtime`
+    /// entry points, exchanging real bytes over a real socket path — not
+    /// just that the types compile.
+    #[test]
+    fn unix_listener_and_client_echo_round_trip() {
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let path = unique_unix_socket_path("echo");
+        let (bound_path, _) = rt
+            .add_unix_listener(UnixListenerConfig::new(path.clone(), || {
+                Box::new(EchoHandler) as Box<dyn ProtocolHandler>
+            }))
+            .unwrap();
+        assert_eq!(bound_path, path);
+
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let got2 = Arc::clone(&got);
+        rt.connect_unix(UnixConnectorConfig::new(path.clone(), move || {
+            Box::new(EchoOnceClientHandler {
+                got: Arc::clone(&got2),
+                payload: b"hello-over-unix-socket",
+            }) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+
+        for _ in 0..100 {
+            if got.lock().unwrap().as_slice() == b"hello-over-unix-socket" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(got.lock().unwrap().as_slice(), b"hello-over-unix-socket");
+
+        rt.shutdown();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression test for issue #340: a UNIX listener's peer-credential
+    /// allowlist must actually permit a peer whose real (kernel-reported)
+    /// uid matches — not just fail closed for everyone.
+    #[test]
+    fn unix_listener_peer_allowlist_permits_a_matching_uid() {
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let path = unique_unix_socket_path("allow");
+        let our_uid = unsafe { libc::getuid() };
+        rt.add_unix_listener(
+            UnixListenerConfig::new(path.clone(), || Box::new(EchoHandler) as Box<dyn ProtocolHandler>)
+                .with_peer_allowlist(PeerCredAllowlist {
+                    allow_uids: vec![our_uid],
+                    allow_gids: vec![],
+                }),
+        )
+        .unwrap();
+
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let got2 = Arc::clone(&got);
+        rt.connect_unix(UnixConnectorConfig::new(path.clone(), move || {
+            Box::new(EchoOnceClientHandler {
+                got: Arc::clone(&got2),
+                payload: b"allowed",
+            }) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+
+        for _ in 0..100 {
+            if got.lock().unwrap().as_slice() == b"allowed" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            got.lock().unwrap().as_slice(),
+            b"allowed",
+            "peer allowlist wrongly denied our own uid"
+        );
+
+        rt.shutdown();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression test for issue #340: a UNIX listener's peer-credential
+    /// allowlist must actually deny a peer whose real (kernel-reported) uid
+    /// doesn't match any configured entry — not something self-reported by
+    /// the peer, so a real accepted connection is the only way to prove
+    /// the check is wired up to the kernel, not skipped.
+    #[test]
+    fn unix_listener_peer_allowlist_denies_a_non_matching_uid() {
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let path = unique_unix_socket_path("deny");
+        rt.add_unix_listener(
+            UnixListenerConfig::new(path.clone(), || Box::new(EchoHandler) as Box<dyn ProtocolHandler>)
+                .with_peer_allowlist(PeerCredAllowlist {
+                    allow_uids: vec![999_999],
+                    allow_gids: vec![],
+                }),
+        )
+        .unwrap();
+
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let got2 = Arc::clone(&got);
+        rt.connect_unix(UnixConnectorConfig::new(path.clone(), move || {
+            Box::new(EchoOnceClientHandler {
+                got: Arc::clone(&got2),
+                payload: b"denied",
+            }) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+
+        // Give the (rejected) connection plenty of time to *not* echo
+        // anything back — the accept-time check is local and instant, so
+        // this margin is about proving absence, not racing a slow peer.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            got.lock().unwrap().is_empty(),
+            "peer allowlist should have denied uid 999999"
+        );
+
+        rt.shutdown();
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -8,10 +8,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mio::net::{TcpStream, UdpSocket};
+use mio::net::UdpSocket;
 use mio::{Token, Waker};
 
-use crate::connection::TcpConnection;
+use crate::connection::{Stream, TcpConnection};
 use crate::connector::TcpConnParams;
 use crate::handler::ProtocolHandler;
 use crate::telemetry::TelemetryHook;
@@ -21,8 +21,8 @@ use crate::udp::UdpDatagramHandler;
 pub(crate) enum ReactorCmd {
     /// Register a newly accepted or dialed connection on this reactor.
     Register {
-        /// TCP stream.
-        stream: TcpStream,
+        /// TCP or UNIX domain socket stream.
+        stream: Stream,
         /// Protocol handler.
         handler: Box<dyn ProtocolHandler>,
         /// Connection parameters.

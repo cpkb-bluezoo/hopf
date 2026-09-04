@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mio::net::TcpStream;
-use mio::{Interest, Token};
+use mio::event::Source;
+use mio::net::{TcpStream, UnixStream};
+use mio::{Interest, Registry, Token};
 
 use crate::bufpool::BufferPool;
 use crate::cmd::{ReactorCmd, ReactorHandle};
@@ -19,13 +20,119 @@ use crate::error::StartTlsError;
 use crate::handle::ConnHandle;
 use crate::handler::ProtocolHandler;
 use crate::listener::DEFAULT_BUFFER_SIZE;
+use crate::peer_addr::PeerAddr;
 use crate::security::SecurityInfo;
 use crate::telemetry::TelemetryHook;
 use crate::tls::{SharedTlsAcceptor, TlsSession};
 
+/// Either half of a stream-oriented connection — TCP or UNIX domain socket.
+/// `std::net::TcpStream` and `std::os::unix::net::UnixStream` don't share a
+/// common trait for the handful of operations [`TcpConnection`] needs
+/// ([`Read`]/[`Write`]/[`mio::event::Source`], plus `peer_addr`/`local_addr`/
+/// `take_error`/`shutdown`), so this wraps whichever one a connection is
+/// actually running over and delegates.
+pub(crate) enum Stream {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+
+impl Stream {
+    pub(crate) fn peer_addr(&self) -> io::Result<PeerAddr> {
+        match self {
+            Stream::Tcp(s) => s.peer_addr().map(PeerAddr::Inet),
+            Stream::Unix(s) => s
+                .peer_addr()
+                .map(|a| PeerAddr::Unix(a.as_pathname().map(|p| p.to_path_buf()))),
+        }
+    }
+
+    pub(crate) fn local_addr(&self) -> io::Result<PeerAddr> {
+        match self {
+            Stream::Tcp(s) => s.local_addr().map(PeerAddr::Inet),
+            Stream::Unix(s) => s
+                .local_addr()
+                .map(|a| PeerAddr::Unix(a.as_pathname().map(|p| p.to_path_buf()))),
+        }
+    }
+
+    pub(crate) fn take_error(&self) -> io::Result<Option<io::Error>> {
+        match self {
+            Stream::Tcp(s) => s.take_error(),
+            Stream::Unix(s) => s.take_error(),
+        }
+    }
+
+    pub(crate) fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.shutdown(how),
+            Stream::Unix(s) => s.shutdown(how),
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.read(buf),
+            Stream::Unix(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Stream::Tcp(s) => s.write(buf),
+            Stream::Unix(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.flush(),
+            Stream::Unix(s) => s.flush(),
+        }
+    }
+}
+
+impl Source for Stream {
+    fn register(&mut self, registry: &Registry, token: Token, interests: Interest) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.register(registry, token, interests),
+            Stream::Unix(s) => s.register(registry, token, interests),
+        }
+    }
+
+    fn reregister(&mut self, registry: &Registry, token: Token, interests: Interest) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.reregister(registry, token, interests),
+            Stream::Unix(s) => s.reregister(registry, token, interests),
+        }
+    }
+
+    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+        match self {
+            Stream::Tcp(s) => s.deregister(registry),
+            Stream::Unix(s) => s.deregister(registry),
+        }
+    }
+}
+
+impl From<TcpStream> for Stream {
+    fn from(s: TcpStream) -> Self {
+        Stream::Tcp(s)
+    }
+}
+
+impl From<UnixStream> for Stream {
+    fn from(s: UnixStream) -> Self {
+        Stream::Unix(s)
+    }
+}
+
 pub(crate) struct TcpConnection {
     pub token: Token,
-    pub stream: TcpStream,
+    pub stream: Stream,
     handler: Option<Box<dyn ProtocolHandler>>,
     /// Wire buffer (ciphertext when TLS is active, plaintext otherwise).
     net_in: Vec<u8>,
@@ -45,8 +152,8 @@ pub(crate) struct TcpConnection {
     /// Cancel flag for the dial connect-timeout timer (`None` if no timer armed).
     connect_timeout_cancel: Option<Arc<AtomicBool>>,
     write_ready: Option<WriteReadyCallback>,
-    local: SocketAddr,
-    remote: SocketAddr,
+    local: PeerAddr,
+    remote: PeerAddr,
     security: SecurityInfo,
     security_notified: bool,
     tls: Option<Box<dyn TlsSession>>,
@@ -77,7 +184,7 @@ pub(crate) enum WriteOutcome {
 impl TcpConnection {
     pub fn new(
         token: Token,
-        stream: TcpStream,
+        stream: Stream,
         handler: Box<dyn ProtocolHandler>,
         params: TcpConnParams,
         reactor: ReactorHandle,
@@ -85,10 +192,12 @@ impl TcpConnection {
         connecting: bool,
         telemetry: Option<Arc<dyn TelemetryHook>>,
     ) -> io::Result<Self> {
-        let remote = stream.peer_addr().unwrap_or(params.remote_hint);
+        let remote = stream
+            .peer_addr()
+            .unwrap_or_else(|_| params.remote_hint.clone());
         let local = stream
             .local_addr()
-            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+            .unwrap_or_else(|_| PeerAddr::Inet(SocketAddr::from(([0, 0, 0, 0], 0))));
         let net_in = pool.acquire(DEFAULT_BUFFER_SIZE);
         let net_out = pool.acquire(DEFAULT_BUFFER_SIZE);
         let tls = if params.secure {
@@ -567,7 +676,7 @@ impl TcpConnection {
 
     pub fn call_error(&mut self, err: &io::Error) {
         if let Some(t) = &self.telemetry {
-            t.on_error(Some(self.remote), &err.to_string());
+            t.on_error(Some(self.remote.clone()), &err.to_string());
         }
         let Some(mut handler) = self.handler.take() else {
             return;
@@ -595,7 +704,7 @@ impl TcpConnection {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         self.call_disconnected();
         if let Some(t) = &self.telemetry {
-            t.on_close(self.remote);
+            t.on_close(self.remote.clone());
         }
     }
 
@@ -688,12 +797,12 @@ impl Endpoint for TcpConnection {
         self.interest_dirty = true;
     }
 
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local)
+    fn local_addr(&self) -> io::Result<PeerAddr> {
+        Ok(self.local.clone())
     }
 
-    fn remote_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.remote)
+    fn remote_addr(&self) -> io::Result<PeerAddr> {
+        Ok(self.remote.clone())
     }
 
     fn security_info(&self) -> &SecurityInfo {
@@ -851,7 +960,7 @@ mod tests {
 
         let result = TcpConnection::new(
             Token(1),
-            stream,
+            stream.into(),
             Box::new(NopHandler),
             params,
             reactor_handle,

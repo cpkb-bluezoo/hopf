@@ -228,6 +228,7 @@ fn client_connect_udp_round_trips_through_the_server_relay() {
         Arc::new(AltSvcCache::new()),
         HttpClientTimeouts::default(),
         None,
+        None,
     )
     .unwrap();
 
@@ -671,6 +672,7 @@ fn client_connect_ip_round_trips_packets_through_the_server_relay() {
         Arc::new(AltSvcCache::new()),
         HttpClientTimeouts::default(),
         None,
+        None,
     )
     .unwrap();
 
@@ -712,6 +714,7 @@ fn client_connect_ip_address_request_gets_assigned() {
         None,
         Arc::new(AltSvcCache::new()),
         HttpClientTimeouts::default(),
+        None,
         None,
     )
     .unwrap();
@@ -761,6 +764,7 @@ fn client_connect_ip_receives_route_advertisement() {
         None,
         Arc::new(AltSvcCache::new()),
         HttpClientTimeouts::default(),
+        None,
         None,
     )
     .unwrap();

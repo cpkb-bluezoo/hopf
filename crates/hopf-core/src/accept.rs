@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use mio::net::TcpListener as MioTcpListener;
+use mio::net::{TcpListener as MioTcpListener, UnixListener as MioUnixListener};
 use mio::{Events, Interest, Poll, Token, Waker};
 
 use crate::binding::BindingId;
 use crate::cmd::{ReactorCmd, ReactorHandle};
-use crate::listener::{Listener, TcpListenerConfig};
+use crate::listener::{Listener, TcpListenerConfig, UnixListenerConfig};
 use crate::telemetry::TelemetryHook;
 
 const WAKER_TOKEN: Token = Token(0);
@@ -29,10 +29,18 @@ struct BoundListener {
     config: TcpListenerConfig,
 }
 
+struct BoundUnixListener {
+    id: BindingId,
+    token: Token,
+    listener: MioUnixListener,
+    config: UnixListenerConfig,
+}
+
 pub(crate) struct AcceptLoop {
     poll: Poll,
     events: Events,
     listeners: Vec<BoundListener>,
+    unix_listeners: Vec<BoundUnixListener>,
     next_token: usize,
     workers: Vec<ReactorHandle>,
     rr: AtomicUsize,
@@ -55,6 +63,11 @@ pub(crate) enum AcceptCmd {
         id: BindingId,
         listener: MioTcpListener,
         config: TcpListenerConfig,
+    },
+    AddUnixListener {
+        id: BindingId,
+        listener: MioUnixListener,
+        config: UnixListenerConfig,
     },
     RemoveListener {
         id: BindingId,
@@ -83,6 +96,22 @@ impl AcceptHandle {
         let _ = self.waker.wake();
     }
 
+    pub fn add_unix_listener(
+        &self,
+        id: BindingId,
+        listener: MioUnixListener,
+        config: UnixListenerConfig,
+    ) {
+        let _ = self.tx.send(AcceptCmd::AddUnixListener {
+            id,
+            listener,
+            config,
+        });
+        let _ = self.waker.wake();
+    }
+
+    /// Removes a previously added listener binding — TCP or UNIX domain
+    /// socket, whichever `id` refers to.
     pub fn remove_listener(&self, id: BindingId) {
         let _ = self.tx.send(AcceptCmd::RemoveListener { id });
         let _ = self.waker.wake();
@@ -114,6 +143,7 @@ impl AcceptLoop {
                     poll,
                     events: Events::with_capacity(128),
                     listeners: Vec::new(),
+                    unix_listeners: Vec::new(),
                     next_token: FIRST_LISTENER_TOKEN,
                     workers,
                     rr: AtomicUsize::new(0),
@@ -159,7 +189,11 @@ impl AcceptLoop {
             // in flight this iteration is held up by this check.
             if self.backoff_until.is_none() {
                 for token in readable_tokens {
-                    self.accept_on(token)?;
+                    if self.unix_listeners.iter().any(|l| l.token == token) {
+                        self.accept_unix_on(token)?;
+                    } else {
+                        self.accept_on(token)?;
+                    }
                 }
             }
         }
@@ -188,6 +222,13 @@ impl AcceptLoop {
                     config,
                 }) => {
                     self.register_listener(id, listener, config)?;
+                }
+                Ok(AcceptCmd::AddUnixListener {
+                    id,
+                    listener,
+                    config,
+                }) => {
+                    self.register_unix_listener(id, listener, config)?;
                 }
                 Ok(AcceptCmd::RemoveListener { id }) => {
                     self.unregister_listener(id)?;
@@ -226,9 +267,34 @@ impl AcceptLoop {
         Ok(())
     }
 
+    fn register_unix_listener(
+        &mut self,
+        id: BindingId,
+        mut listener: MioUnixListener,
+        config: UnixListenerConfig,
+    ) -> io::Result<()> {
+        let token = Token(self.next_token);
+        self.next_token += 1;
+        self.poll
+            .registry()
+            .register(&mut listener, token, Interest::READABLE)?;
+        self.unix_listeners.push(BoundUnixListener {
+            id,
+            token,
+            listener,
+            config,
+        });
+        Ok(())
+    }
+
     fn unregister_listener(&mut self, id: BindingId) -> io::Result<()> {
         if let Some(idx) = self.listeners.iter().position(|l| l.id == id) {
             let mut bound = self.listeners.remove(idx);
+            let _ = self.poll.registry().deregister(&mut bound.listener);
+            return Ok(());
+        }
+        if let Some(idx) = self.unix_listeners.iter().position(|l| l.id == id) {
+            let mut bound = self.unix_listeners.remove(idx);
             let _ = self.poll.registry().deregister(&mut bound.listener);
         }
         Ok(())
@@ -246,7 +312,7 @@ impl AcceptLoop {
                     if !config.acl.allows(addr) {
                         drop(stream);
                         if let Some(t) = &self.telemetry {
-                            t.on_error(Some(addr), "ACL denied");
+                            t.on_error(Some(addr.into()), "ACL denied");
                         }
                         continue;
                     }
@@ -254,19 +320,88 @@ impl AcceptLoop {
                         if !lim.try_acquire(addr) {
                             drop(stream);
                             if let Some(t) = &self.telemetry {
-                                t.on_error(Some(addr), "rate limited");
+                                t.on_error(Some(addr.into()), "rate limited");
                             }
                             continue;
                         }
                     }
                     if let Some(t) = &self.telemetry {
-                        t.on_accept(addr);
+                        t.on_accept(addr.into());
                     }
                     let handler = config.create_handler();
                     let params = config.conn_params(addr);
                     let worker = self.next_worker();
                     worker.send(ReactorCmd::Register {
-                        stream,
+                        stream: stream.into(),
+                        handler,
+                        params,
+                        connecting: false,
+                        telemetry: self.telemetry.clone(),
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) if is_fd_exhaustion(&e) => {
+                    eprintln!("hopf: accept EMFILE/ENFILE, backing off");
+                    self.backoff_until = Some(Instant::now() + ACCEPT_BACKOFF);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("hopf: accept error: {e}");
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn accept_unix_on(&mut self, token: Token) -> io::Result<()> {
+        let Some(idx) = self.unix_listeners.iter().position(|l| l.token == token) else {
+            return Ok(());
+        };
+        loop {
+            let result = self.unix_listeners[idx].listener.accept();
+            match result {
+                Ok((stream, _addr)) => {
+                    let config = &self.unix_listeners[idx].config;
+                    // No peer-supplied address to report (a UNIX-domain
+                    // client socket is typically unnamed) — identify the
+                    // event by the listener's own bind path instead, same
+                    // as `conn_params()` does for `remote_hint`.
+                    let peer = crate::PeerAddr::Unix(Some(config.path.clone()));
+                    // UNIX-domain analogue of the IP ACL/rate-limit checks
+                    // in `accept_on` — filesystem permissions on the
+                    // socket path are the primary gate; this is an
+                    // additional, opt-in check against the kernel-reported
+                    // peer credentials (not self-reported by the peer).
+                    if !config.peer_allowlist.allow_uids.is_empty()
+                        || !config.peer_allowlist.allow_gids.is_empty()
+                    {
+                        match crate::peer_cred::peer_credentials(&stream) {
+                            Ok(creds) if config.peer_allowlist.allows(creds) => {}
+                            Ok(_) => {
+                                drop(stream);
+                                if let Some(t) = &self.telemetry {
+                                    t.on_error(Some(peer), "peer credential allowlist denied");
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                drop(stream);
+                                if let Some(t) = &self.telemetry {
+                                    t.on_error(Some(peer), &format!("peer credentials unavailable: {e}"));
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(t) = &self.telemetry {
+                        t.on_accept(peer);
+                    }
+                    let handler = config.create_handler();
+                    let params = config.conn_params();
+                    let worker = self.next_worker();
+                    worker.send(ReactorCmd::Register {
+                        stream: stream.into(),
                         handler,
                         params,
                         connecting: false,
@@ -314,6 +449,7 @@ mod tests {
             poll,
             events: Events::with_capacity(1),
             listeners: Vec::new(),
+            unix_listeners: Vec::new(),
             next_token: FIRST_LISTENER_TOKEN,
             workers: Vec::new(),
             rr: AtomicUsize::new(0),

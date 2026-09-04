@@ -61,7 +61,9 @@ impl ProtocolHandler for DoqServerHandler {
             };
             let peer = endpoint
                 .remote_addr()
-                .unwrap_or_else(|_| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
+                .ok()
+                .and_then(|a| a.as_socket_addr())
+                .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0));
             let mut resp = self.service.process(&query, peer);
             // RFC 9250 §4.2.1: the DNS message ID MUST be 0 over DoQ,
             // regardless of what the query itself carried.

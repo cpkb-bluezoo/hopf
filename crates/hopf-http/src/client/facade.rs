@@ -4,9 +4,10 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use hopf_core::{ProtocolHandler, Runtime, SharedTlsConnector, TcpConnectorConfig};
+use hopf_core::{ProtocolHandler, Runtime, SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig};
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
 use crate::HttpLimits;
@@ -28,6 +29,7 @@ pub struct HttpClient {
     host: String,
     port: u16,
     addr: Option<SocketAddr>,
+    unix_path: Option<PathBuf>,
     limits: HttpLimits,
     timeouts: HttpClientTimeouts,
     secure: bool,
@@ -52,6 +54,7 @@ impl HttpClient {
             host: host.into(),
             port,
             addr: None,
+            unix_path: None,
             limits: HttpLimits::default(),
             timeouts: HttpClientTimeouts::default(),
             secure: false,
@@ -76,6 +79,35 @@ impl HttpClient {
             host: addr.ip().to_string(),
             port: addr.port(),
             addr: Some(addr),
+            unix_path: None,
+            limits: HttpLimits::default(),
+            timeouts: HttpClientTimeouts::default(),
+            secure: false,
+            h2_prior_knowledge: false,
+            tls_connector: None,
+            tls_server_name: None,
+            resolver: None,
+            #[cfg(feature = "h3")]
+            quic_client_config: None,
+            #[cfg(feature = "h3")]
+            h3_disabled: false,
+            #[cfg(feature = "h3")]
+            h3_prior_knowledge: false,
+            #[cfg(feature = "h3")]
+            alt_svc_cache: Arc::new(super::alt_svc::AltSvcCache::new()),
+        }
+    }
+
+    /// Client that dials a UNIX domain socket instead of TCP/IP — skips DNS
+    /// and h3/QUIC negotiation entirely (QUIC has no UNIX-domain transport,
+    /// so [`Self::connect`] always uses cleartext or TLS-ALPN H1/H2 for a
+    /// UNIX-domain client, regardless of any [`Self::quic_client_config`]).
+    pub fn from_unix_path(path: impl Into<PathBuf>) -> Self {
+        Self {
+            host: String::new(),
+            port: 0,
+            addr: None,
+            unix_path: Some(path.into()),
             limits: HttpLimits::default(),
             timeouts: HttpClientTimeouts::default(),
             secure: false,
@@ -224,18 +256,63 @@ impl HttpClient {
         (cfg, config)
     }
 
+    /// UNIX-domain counterpart of [`Self::connector_for_addr`].
+    fn connector_for_unix_path(
+        &self,
+        path: PathBuf,
+        handler: Box<dyn HttpConnectionHandler>,
+    ) -> (UnixConnectorConfig, Arc<HttpClientSessionConfig>) {
+        let config = Arc::new(HttpClientSessionConfig {
+            host: self.host.clone(),
+            port: self.port,
+            limits: self.limits,
+            secure: self.secure,
+            handler: Mutex::new(Some(handler)),
+            stage: self.timeouts.stage,
+        });
+        let limits = self.limits;
+        let secure = self.secure;
+        let h2_prior = self.h2_prior_knowledge;
+        let connect_timeout = Some(self.timeouts.connect);
+        let config_for_factory = Arc::clone(&config);
+
+        let mut cfg = UnixConnectorConfig::new(path, move || {
+            Box::new(HttpClientConnection::new(
+                Arc::clone(&config_for_factory),
+                limits,
+                secure,
+                h2_prior,
+            )) as Box<dyn ProtocolHandler>
+        })
+        .connect_timeout(connect_timeout);
+
+        if let (Some(tls), Some(name)) = (&self.tls_connector, &self.tls_server_name) {
+            cfg = cfg.with_tls(Arc::clone(tls), name.clone());
+        }
+        (cfg, config)
+    }
+
     /// DNS (if needed) then dial. Returns immediately.
     ///
     /// When h3 is enabled ([`Self::quic_client_config`] set, and not
     /// [`Self::disable_h3`]d) and `self.addr`/a literal host don't already
     /// pin the connection to a bare TCP dial, transport negotiation is
     /// automatic — h3 if discoverable, else h2 via ALPN, else h1.1 — see
-    /// [`Self::negotiate_connect`].
+    /// [`Self::negotiate_connect`]. [`Self::from_unix_path`] dials a UNIX
+    /// domain socket instead — skips DNS and h3 negotiation entirely.
     pub fn connect(
         &self,
         rt: &Arc<Runtime>,
         handler: Box<dyn HttpConnectionHandler>,
     ) -> io::Result<()> {
+        if let Some(path) = self.unix_path.clone() {
+            let (cfg, config) = self.connector_for_unix_path(path, handler);
+            return rt.connect_unix(cfg).inspect_err(|e| {
+                if let Some(mut h) = config.handler.lock().unwrap().take() {
+                    h.on_error(e);
+                }
+            });
+        }
         if let Some(addr) = self.addr {
             let (cfg, config) = self.connector_for_addr(addr, handler);
             return rt.connect(cfg).inspect_err(|e| {
@@ -529,6 +606,7 @@ impl HttpClient {
             host: self.host.clone(),
             port: self.port,
             addr: self.addr,
+            unix_path: self.unix_path.clone(),
             limits: self.limits,
             timeouts: self.timeouts.clone(),
             secure: self.secure,

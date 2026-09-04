@@ -296,6 +296,13 @@ impl ClientHandlerFactory for ConnectUdpClientFactory {
 /// see [`HttpFallback`] for what's actually available for the fallback tier
 /// (TLS+ALPN is the right choice whenever the proxy might also be reached
 /// over h3, since an origin that speaks h3 at all is HTTPS-only).
+///
+/// `unix_path`, when set, dials the proxy over a UNIX domain socket instead
+/// of TCP/IP/QUIC — `proxy_host`/`proxy_port`/`quic_client_config`/
+/// `resolver` are then only used for the `Host` header (`proxy_host`) and
+/// otherwise ignored, since QUIC/h3 has no UNIX-domain transport and there
+/// is nothing to resolve. [`HttpFallback::Tls`] is not yet supported for a
+/// UNIX-domain dial.
 #[allow(clippy::too_many_arguments)]
 pub fn connect_udp(
     rt: &Arc<Runtime>,
@@ -309,6 +316,7 @@ pub fn connect_udp(
     alt_svc_cache: Arc<hopf_http::AltSvcCache>,
     timeouts: HttpClientTimeouts,
     resolver: Option<Arc<DnsResolver>>,
+    unix_path: Option<std::path::PathBuf>,
 ) -> io::Result<()> {
     let factory: Arc<dyn ClientHandlerFactory> = Arc::new(ConnectUdpClientFactory {
         proxy_host: proxy_host.to_string(),
@@ -316,6 +324,9 @@ pub fn connect_udp(
         target_port,
         event: Arc::new(Mutex::new(Some(event_handler))),
     });
+    if let Some(path) = unix_path {
+        return hopf_http::connect_auto_unix(rt, path, factory, HttpLimits::default(), fallback, timeouts);
+    }
     connect_auto(
         rt,
         proxy_host,

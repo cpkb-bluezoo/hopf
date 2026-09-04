@@ -1043,10 +1043,10 @@ mod status_validation_tests {
             self.closed = true;
             self.close_connection_code = Some(error_code);
         }
-        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             unimplemented!("not exercised by these unit tests")
         }
-        fn remote_addr(&self) -> std::io::Result<SocketAddr> {
+        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             unimplemented!("not exercised by these unit tests")
         }
         fn security_info(&self) -> &hopf_core::SecurityInfo {
@@ -1744,10 +1744,10 @@ mod client_upgrade_tests {
         fn close_connection(&mut self, _error_code: u32) {
             self.closed = true;
         }
-        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             unimplemented!("not exercised by these unit tests")
         }
-        fn remote_addr(&self) -> std::io::Result<SocketAddr> {
+        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             unimplemented!("not exercised by these unit tests")
         }
         fn security_info(&self) -> &hopf_core::SecurityInfo {

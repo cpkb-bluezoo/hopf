@@ -9,12 +9,12 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use mio::net::{TcpStream, UdpSocket};
+use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
 
 use crate::bufpool::BufferPool;
 use crate::cmd::{channel, ReactorCmd, ReactorHandle};
-use crate::connection::{ReadOutcome, TcpConnection, WriteOutcome};
+use crate::connection::{ReadOutcome, Stream, TcpConnection, WriteOutcome};
 use crate::connector::TcpConnParams;
 use crate::endpoint::Endpoint;
 use crate::handler::ProtocolHandler;
@@ -242,7 +242,7 @@ impl Reactor {
 
     fn register_connection(
         &mut self,
-        mut stream: TcpStream,
+        mut stream: Stream,
         handler: Box<dyn ProtocolHandler>,
         params: TcpConnParams,
         connecting: bool,

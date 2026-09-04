@@ -41,12 +41,13 @@ pub use auth::{
     BearerAuthFactory, DigestAuthConfig, DigestAuthFactory,
 };
 pub use client::{
-    connect_http, connect_http2_upgrade, parse_alt_svc_h3, AltSvcCache, AltSvcEntry, AltSvcH3Entry,
-    HttpClient, HttpClientError, HttpClientSessionHandle, HttpClientTimeouts, HttpConnectionHandler,
-    HttpRequest, HttpResponseHandler,
+    connect_http, connect_http2_upgrade, connect_http2_upgrade_unix, connect_http_unix,
+    parse_alt_svc_h3, AltSvcCache, AltSvcEntry, AltSvcH3Entry, HttpClient, HttpClientError,
+    HttpClientSessionHandle, HttpClientTimeouts, HttpConnectionHandler, HttpRequest,
+    HttpResponseHandler,
 };
 #[cfg(feature = "h3")]
-pub use client::{connect_auto, connect_h3_by_name, connect_https, HttpFallback};
+pub use client::{connect_auto, connect_auto_unix, connect_h3_by_name, connect_https, HttpFallback};
 pub use server::HttpServer;
 pub use dispatch::AlpnHttpEndpoint;
 pub use error::{HttpError, HttpResult};
