@@ -676,11 +676,7 @@ impl TcpConnection {
 
     pub fn call_error(&mut self, err: &io::Error) {
         if let Some(t) = &self.telemetry {
-            // `TelemetryHook` is IP-only for now (issue #340 introduced
-            // UNIX domain sockets; widening telemetry to a PeerAddr is
-            // tracked separately) — a UNIX-domain peer is simply not
-            // reported here rather than reported wrong.
-            t.on_error(self.remote.as_socket_addr(), &err.to_string());
+            t.on_error(Some(self.remote.clone()), &err.to_string());
         }
         let Some(mut handler) = self.handler.take() else {
             return;
@@ -708,9 +704,7 @@ impl TcpConnection {
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         self.call_disconnected();
         if let Some(t) = &self.telemetry {
-            if let Some(addr) = self.remote.as_socket_addr() {
-                t.on_close(addr);
-            }
+            t.on_close(self.remote.clone());
         }
     }
 

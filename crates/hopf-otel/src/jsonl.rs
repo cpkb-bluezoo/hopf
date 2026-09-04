@@ -6,6 +6,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use hopf_core::PeerAddr;
+
 use crate::config::OtelConfig;
 use crate::event::TelemetryEvent;
 
@@ -101,9 +103,18 @@ pub fn encode_logs_json(config: &OtelConfig, events: &[TelemetryEvent]) -> Strin
             records.push(',');
         }
         let mut attrs = vec![kv_string("event.name", ev.event_name())];
-        if let Some(peer) = ev.peer {
-            attrs.push(kv_string("net.peer.ip", &peer.ip().to_string()));
-            attrs.push(kv_string("net.peer.port", &peer.port().to_string()));
+        match &ev.peer {
+            Some(PeerAddr::Inet(addr)) => {
+                attrs.push(kv_string("net.peer.ip", &addr.ip().to_string()));
+                attrs.push(kv_string("net.peer.port", &addr.port().to_string()));
+            }
+            Some(PeerAddr::Unix(path)) => {
+                attrs.push(kv_string("net.sock.family", "unix"));
+                if let Some(path) = path {
+                    attrs.push(kv_string("net.sock.peer.name", &path.display().to_string()));
+                }
+            }
+            None => {}
         }
         records.push_str(&format!(
             "{{\
@@ -254,7 +265,7 @@ mod tests {
         let cfg = OtelConfig::new("test-svc");
         let ev = TelemetryEvent::new(
             EventKind::Accept,
-            Some("127.0.0.1:9".parse().unwrap()),
+            Some(PeerAddr::Inet("127.0.0.1:9".parse().unwrap())),
             "accept",
         );
         let s = encode_logs_json(&cfg, &[ev]);

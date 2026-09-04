@@ -139,7 +139,7 @@ impl Runtime {
     /// Dial a peer and register the Endpoint on a worker reactor (affinity).
     pub fn connect(&self, config: TcpConnectorConfig) -> io::Result<()> {
         if let Some(t) = &self.telemetry {
-            t.on_dial(config.addr);
+            t.on_dial(config.addr.into());
         }
         let stream = mio::net::TcpStream::connect(config.addr)?;
         let handler = config.create_handler();
@@ -158,6 +158,9 @@ impl Runtime {
     /// Dial a UNIX domain socket peer and register the Endpoint on a worker
     /// reactor (affinity) — UNIX-domain counterpart of [`Self::connect`].
     pub fn connect_unix(&self, config: UnixConnectorConfig) -> io::Result<()> {
+        if let Some(t) = &self.telemetry {
+            t.on_dial(crate::PeerAddr::Unix(Some(config.path.clone())));
+        }
         let stream = mio::net::UnixStream::connect(&config.path)?;
         let handler = config.create_handler();
         let params = config.conn_params();

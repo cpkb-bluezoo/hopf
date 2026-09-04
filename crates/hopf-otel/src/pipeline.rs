@@ -2,12 +2,11 @@
 
 //! [`TelemetryHook`] that only enqueues; export runs off-thread.
 
-use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use hopf_core::TelemetryHook;
+use hopf_core::{PeerAddr, TelemetryHook};
 
 use crate::batch::{spawn_worker, ExportHandle};
 use crate::config::OtelConfig;
@@ -147,31 +146,31 @@ impl Drop for TelemetryPipeline {
 struct Hook(ExportHandle);
 
 impl TelemetryHook for Hook {
-    fn on_accept(&self, peer: SocketAddr) {
+    fn on_accept(&self, peer: PeerAddr) {
         self.0.try_send_log(TelemetryEvent::new(
             EventKind::Accept,
-            Some(peer),
+            Some(peer.clone()),
             format!("accept {peer}"),
         ));
     }
 
-    fn on_dial(&self, peer: SocketAddr) {
+    fn on_dial(&self, peer: PeerAddr) {
         self.0.try_send_log(TelemetryEvent::new(
             EventKind::Dial,
-            Some(peer),
+            Some(peer.clone()),
             format!("dial {peer}"),
         ));
     }
 
-    fn on_close(&self, peer: SocketAddr) {
+    fn on_close(&self, peer: PeerAddr) {
         self.0.try_send_log(TelemetryEvent::new(
             EventKind::Close,
-            Some(peer),
+            Some(peer.clone()),
             format!("close {peer}"),
         ));
     }
 
-    fn on_error(&self, peer: Option<SocketAddr>, msg: &str) {
+    fn on_error(&self, peer: Option<PeerAddr>, msg: &str) {
         self.0.try_send_log(TelemetryEvent::new(
             EventKind::Error,
             peer,
@@ -204,7 +203,7 @@ mod tests {
         let cfg = OtelConfig::new("jsonl-test").with_jsonl_logs(&dir);
         let pipeline = TelemetryPipeline::start(cfg).unwrap();
         let hook = pipeline.hook();
-        TelemetryHook::on_accept(hook.as_ref(), "127.0.0.1:1".parse().unwrap());
+        TelemetryHook::on_accept(hook.as_ref(), PeerAddr::Inet("127.0.0.1:1".parse().unwrap()));
         TelemetryHook::on_error(hook.as_ref(), None, "boom");
         pipeline.flush();
         pipeline.shutdown();

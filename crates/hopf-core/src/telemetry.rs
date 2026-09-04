@@ -2,7 +2,7 @@
 
 //! Telemetry hook seams (OTLP / JSONL exporters live in `hopf-otel`).
 
-use std::net::SocketAddr;
+use crate::peer_addr::PeerAddr;
 
 /// Process-wide telemetry callbacks (no-op by default).
 ///
@@ -10,14 +10,14 @@ use std::net::SocketAddr;
 /// Use the `hopf-otel` crate (`TelemetryPipeline`) for batched OTLP/HTTP
 /// and JSONL export.
 pub trait TelemetryHook: Send + Sync {
-    /// TCP accept succeeded (after ACL).
-    fn on_accept(&self, _peer: SocketAddr) {}
+    /// Accept succeeded (after ACL/peer-allowlist) — TCP or UNIX domain socket.
+    fn on_accept(&self, _peer: PeerAddr) {}
     /// Dial started.
-    fn on_dial(&self, _peer: SocketAddr) {}
+    fn on_dial(&self, _peer: PeerAddr) {}
     /// Connection closed.
-    fn on_close(&self, _peer: SocketAddr) {}
+    fn on_close(&self, _peer: PeerAddr) {}
     /// I/O or protocol error.
-    fn on_error(&self, _peer: Option<SocketAddr>, _msg: &str) {}
+    fn on_error(&self, _peer: Option<PeerAddr>, _msg: &str) {}
     /// Non-fatal configuration / operational warning (e.g. open relay with
     /// no CIDR allowlist). Default: no-op.
     fn on_warn(&self, _msg: &str) {}

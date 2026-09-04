@@ -312,7 +312,7 @@ impl AcceptLoop {
                     if !config.acl.allows(addr) {
                         drop(stream);
                         if let Some(t) = &self.telemetry {
-                            t.on_error(Some(addr), "ACL denied");
+                            t.on_error(Some(addr.into()), "ACL denied");
                         }
                         continue;
                     }
@@ -320,13 +320,13 @@ impl AcceptLoop {
                         if !lim.try_acquire(addr) {
                             drop(stream);
                             if let Some(t) = &self.telemetry {
-                                t.on_error(Some(addr), "rate limited");
+                                t.on_error(Some(addr.into()), "rate limited");
                             }
                             continue;
                         }
                     }
                     if let Some(t) = &self.telemetry {
-                        t.on_accept(addr);
+                        t.on_accept(addr.into());
                     }
                     let handler = config.create_handler();
                     let params = config.conn_params(addr);
@@ -363,6 +363,11 @@ impl AcceptLoop {
             match result {
                 Ok((stream, _addr)) => {
                     let config = &self.unix_listeners[idx].config;
+                    // No peer-supplied address to report (a UNIX-domain
+                    // client socket is typically unnamed) — identify the
+                    // event by the listener's own bind path instead, same
+                    // as `conn_params()` does for `remote_hint`.
+                    let peer = crate::PeerAddr::Unix(Some(config.path.clone()));
                     // UNIX-domain analogue of the IP ACL/rate-limit checks
                     // in `accept_on` — filesystem permissions on the
                     // socket path are the primary gate; this is an
@@ -376,18 +381,21 @@ impl AcceptLoop {
                             Ok(_) => {
                                 drop(stream);
                                 if let Some(t) = &self.telemetry {
-                                    t.on_error(None, "peer credential allowlist denied");
+                                    t.on_error(Some(peer), "peer credential allowlist denied");
                                 }
                                 continue;
                             }
                             Err(e) => {
                                 drop(stream);
                                 if let Some(t) = &self.telemetry {
-                                    t.on_error(None, &format!("peer credentials unavailable: {e}"));
+                                    t.on_error(Some(peer), &format!("peer credentials unavailable: {e}"));
                                 }
                                 continue;
                             }
                         }
+                    }
+                    if let Some(t) = &self.telemetry {
+                        t.on_accept(peer);
                     }
                     let handler = config.create_handler();
                     let params = config.conn_params();
