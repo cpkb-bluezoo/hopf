@@ -200,6 +200,7 @@ impl CompositionDocument {
                 tls: None,
                 acl: PeerAcl::open(),
                 rate_limit: None,
+                proxy_protocol: false,
             };
             let mut acl = PeerAcl::open();
             for c in &listen.allow {

@@ -44,6 +44,15 @@ pub struct TcpListenerConfig {
     pub acl: PeerAcl,
     /// Optional accept rate limit.
     pub rate_limit: Option<AcceptRateLimit>,
+    /// When true, every accepted connection is expected to begin with a
+    /// PROXY protocol v1/v2 header (issue #342) reporting the real client
+    /// address, as sent by an L4 relay (nginx, haproxy, a cloud load
+    /// balancer) in front of this listener. `acl`/`rate_limit` above still
+    /// apply to the real TCP peer (the relay) — trusting *that* peer to
+    /// speak on some client's behalf is a separate, prior decision from
+    /// what address the header then reports; see
+    /// [`with_proxy_protocol`](Self::with_proxy_protocol).
+    pub proxy_protocol: bool,
 }
 
 impl TcpListenerConfig {
@@ -62,6 +71,7 @@ impl TcpListenerConfig {
             tls: None,
             acl: PeerAcl::open(),
             rate_limit: None,
+            proxy_protocol: false,
         }
     }
 
@@ -108,6 +118,20 @@ impl TcpListenerConfig {
         self
     }
 
+    /// Expect every accepted connection to begin with a PROXY protocol
+    /// v1/v2 header (issue #342), and recover the real client address from
+    /// it — [`crate::Endpoint::remote_addr`] reports that address rather
+    /// than the immediate TCP peer once the header has been parsed. A
+    /// connection whose first bytes aren't a valid header is closed rather
+    /// than treated as the start of application data: this listener is
+    /// only meant to be reachable via a relay configured to always send
+    /// one, so a missing/malformed header is a misconfiguration to fail on,
+    /// not something to silently fall back from.
+    pub fn with_proxy_protocol(mut self) -> Self {
+        self.proxy_protocol = true;
+        self
+    }
+
     /// Reduce to reactor registration params (peer address filled in after accept).
     pub fn conn_params(&self, remote: SocketAddr) -> crate::connector::TcpConnParams {
         crate::connector::TcpConnParams {
@@ -120,6 +144,7 @@ impl TcpListenerConfig {
             tls_connector: None,
             server_name: None,
             remote_hint: remote.into(),
+            expect_proxy_protocol: self.proxy_protocol,
         }
     }
 }
@@ -156,6 +181,12 @@ pub struct UnixListenerConfig {
     /// default) allows every peer that can reach the socket path at all —
     /// i.e. filesystem permissions on the path/directory are the only gate.
     pub peer_allowlist: PeerCredAllowlist,
+    /// When true, every accepted connection is expected to begin with a
+    /// PROXY protocol v1/v2 header (issue #342). `peer_allowlist` above
+    /// still checks the real UNIX-socket peer's kernel-reported
+    /// credentials (typically the relay process) — independent of, and
+    /// checked before, whatever client address the header itself reports.
+    pub proxy_protocol: bool,
 }
 
 impl UnixListenerConfig {
@@ -174,6 +205,7 @@ impl UnixListenerConfig {
             secure: false,
             tls: None,
             peer_allowlist: PeerCredAllowlist::open(),
+            proxy_protocol: false,
         }
     }
 
@@ -214,6 +246,14 @@ impl UnixListenerConfig {
         self
     }
 
+    /// Expect every accepted connection to begin with a PROXY protocol
+    /// v1/v2 header (issue #342) — see
+    /// [`TcpListenerConfig::with_proxy_protocol`] for the full behavior.
+    pub fn with_proxy_protocol(mut self) -> Self {
+        self.proxy_protocol = true;
+        self
+    }
+
     /// Reduce to reactor registration params.
     pub fn conn_params(&self) -> crate::connector::TcpConnParams {
         crate::connector::TcpConnParams {
@@ -226,6 +266,7 @@ impl UnixListenerConfig {
             tls_connector: None,
             server_name: None,
             remote_hint: crate::peer_addr::PeerAddr::Unix(None),
+            expect_proxy_protocol: self.proxy_protocol,
         }
     }
 }
