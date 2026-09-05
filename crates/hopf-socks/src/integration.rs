@@ -20,8 +20,9 @@ use hopf_core::{Endpoint, IpNet, PeerAcl, ProtocolHandler, Runtime, RuntimeConfi
 use hopf_dns::DnsResolver;
 
 use crate::{
-    socks_bind_config, socks_connect_config, SocksAddress, SocksAuthenticator, SocksClientConfig,
-    SocksClientVersion, SocksConnectionHandlerFactory, SocksPolicy, SocksService,
+    socks_bind_config, socks_connect_config, socks_udp_associate_config, SocksAddress,
+    SocksAuthenticator, SocksClientConfig, SocksClientVersion, SocksConnectionHandlerFactory,
+    SocksPolicy, SocksService, SocksUdpDatagramHandler, SocksUdpSender,
 };
 
 struct AllowAll;
@@ -1277,4 +1278,158 @@ fn client_bind_reports_an_error_when_the_destination_policy_denies_the_peer() {
         "an error reported for a policy-denied peer",
     );
     assert!(!connected.load(Ordering::Acquire));
+}
+
+// ---------------------------------------------------------------------
+// Client-side UDP ASSOCIATE (`SocksUdpAssociateHandler`) tests, against a
+// real `SocksService` (which already implements the server side).
+// ---------------------------------------------------------------------
+
+type ReceivedDatagrams = Arc<Mutex<Vec<(SocketAddr, Vec<u8>)>>>;
+
+struct RecordingUdpHandler {
+    received: ReceivedDatagrams,
+}
+
+impl SocksUdpDatagramHandler for RecordingUdpHandler {
+    fn on_datagram(&mut self, target: SocketAddr, data: &[u8]) {
+        self.received.lock().unwrap().push((target, data.to_vec()));
+    }
+}
+
+#[test]
+fn client_udp_associate_relays_datagrams_to_and_from_the_target() {
+    let target = start_udp_echo_target();
+    let (rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let sender: Arc<Mutex<Option<SocksUdpSender>>> = Arc::new(Mutex::new(None));
+    let received: ReceivedDatagrams = Arc::new(Mutex::new(Vec::new()));
+    let (sender2, received2) = (Arc::clone(&sender), Arc::clone(&received));
+
+    let on_ready: Arc<dyn Fn(SocksUdpSender) + Send + Sync> = Arc::new(move |s| {
+        *sender2.lock().unwrap() = Some(s);
+    });
+
+    let cfg = socks_udp_associate_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks5),
+        Arc::clone(&rt),
+        on_ready,
+        move || Box::new(RecordingUdpHandler { received: Arc::clone(&received2) }) as Box<dyn SocksUdpDatagramHandler>,
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(|| sender.lock().unwrap().is_some(), Duration::from_secs(5), "UDP association ready");
+    let sender = sender.lock().unwrap().clone().unwrap();
+
+    sender.send_to(target, b"hello-udp-client");
+    wait_until(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+        "echoed datagram received back through the association",
+    );
+    let (from, payload) = received.lock().unwrap()[0].clone();
+    assert_eq!(from, target);
+    assert_eq!(payload, b"hello-udp-client");
+}
+
+#[test]
+fn client_udp_associate_exchanges_multiple_datagrams() {
+    let target = start_udp_echo_target();
+    let (rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let sender: Arc<Mutex<Option<SocksUdpSender>>> = Arc::new(Mutex::new(None));
+    let received: ReceivedDatagrams = Arc::new(Mutex::new(Vec::new()));
+    let (sender2, received2) = (Arc::clone(&sender), Arc::clone(&received));
+
+    let on_ready: Arc<dyn Fn(SocksUdpSender) + Send + Sync> = Arc::new(move |s| {
+        *sender2.lock().unwrap() = Some(s);
+    });
+
+    let cfg = socks_udp_associate_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks5),
+        Arc::clone(&rt),
+        on_ready,
+        move || Box::new(RecordingUdpHandler { received: Arc::clone(&received2) }) as Box<dyn SocksUdpDatagramHandler>,
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(|| sender.lock().unwrap().is_some(), Duration::from_secs(5), "UDP association ready");
+    let sender = sender.lock().unwrap().clone().unwrap();
+
+    for i in 0..5u8 {
+        sender.send_to(target, &[i]);
+    }
+    wait_until(
+        || received.lock().unwrap().len() >= 5,
+        Duration::from_secs(5),
+        "all five echoed datagrams received",
+    );
+    let mut payloads: Vec<u8> = received.lock().unwrap().iter().map(|(_, p)| p[0]).collect();
+    payloads.sort_unstable();
+    assert_eq!(payloads, vec![0, 1, 2, 3, 4]);
+}
+
+#[test]
+fn client_udp_associate_silently_drops_a_datagram_the_policy_denies() {
+    let target = start_udp_echo_target();
+    let (rt, proxy) = start_socks_server(Arc::new(DenyAll), None);
+
+    let sender: Arc<Mutex<Option<SocksUdpSender>>> = Arc::new(Mutex::new(None));
+    let received: ReceivedDatagrams = Arc::new(Mutex::new(Vec::new()));
+    let (sender2, received2) = (Arc::clone(&sender), Arc::clone(&received));
+
+    let on_ready: Arc<dyn Fn(SocksUdpSender) + Send + Sync> = Arc::new(move |s| {
+        *sender2.lock().unwrap() = Some(s);
+    });
+
+    let cfg = socks_udp_associate_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks5),
+        Arc::clone(&rt),
+        on_ready,
+        move || Box::new(RecordingUdpHandler { received: Arc::clone(&received2) }) as Box<dyn SocksUdpDatagramHandler>,
+    );
+    rt.connect(cfg).unwrap();
+
+    // The association itself still succeeds — the destination policy is
+    // checked per datagram, not at ASSOCIATE-request time (the request
+    // names no target).
+    wait_until(|| sender.lock().unwrap().is_some(), Duration::from_secs(5), "UDP association ready");
+    let sender = sender.lock().unwrap().clone().unwrap();
+
+    sender.send_to(target, b"blocked");
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "expected no reply — RFC 1928 §7 has no error channel for a blocked datagram"
+    );
+}
+
+#[test]
+fn client_udp_associate_rejects_socks4_outright() {
+    let (rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let sender: Arc<Mutex<Option<SocksUdpSender>>> = Arc::new(Mutex::new(None));
+    let sender2 = Arc::clone(&sender);
+    let on_ready: Arc<dyn Fn(SocksUdpSender) + Send + Sync> = Arc::new(move |s| {
+        *sender2.lock().unwrap() = Some(s);
+    });
+
+    let cfg = socks_udp_associate_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks4),
+        Arc::clone(&rt),
+        on_ready,
+        || {
+            Box::new(RecordingUdpHandler {
+                received: Arc::new(Mutex::new(Vec::new())),
+            }) as Box<dyn SocksUdpDatagramHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    thread::sleep(Duration::from_millis(300));
+    assert!(sender.lock().unwrap().is_none(), "SOCKS4 has no UDP ASSOCIATE — on_ready must never fire");
 }
