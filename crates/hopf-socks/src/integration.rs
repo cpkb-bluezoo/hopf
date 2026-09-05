@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use hopf_core::{Runtime, RuntimeConfig};
+use hopf_core::{IpNet, PeerAcl, Runtime, RuntimeConfig};
 use hopf_dns::DnsResolver;
 
 use crate::{SocksAuthenticator, SocksConnectionHandlerFactory, SocksPolicy, SocksService};
@@ -640,4 +640,164 @@ fn established_relay_closes_after_the_idle_timeout_with_no_traffic() {
     client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut buf = [0u8; 1];
     assert_eq!(client.read(&mut buf).unwrap(), 0, "expected relay closed by idle timeout");
+}
+
+#[test]
+fn handshake_timeout_closes_a_silent_client() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
+    let factory = SocksConnectionHandlerFactory::new(dns, Arc::clone(&rt), Arc::new(AllowAll))
+        .with_handshake_timeout(Duration::from_millis(200));
+    let service = SocksService::new("127.0.0.1:0".parse().unwrap(), factory);
+    let proxy = service.start(&rt).unwrap();
+
+    let mut client = TcpStream::connect(proxy).unwrap();
+    // Deliberately send nothing at all.
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 1];
+    assert_eq!(client.read(&mut buf).unwrap(), 0, "expected connection closed after the handshake timeout");
+}
+
+#[test]
+fn handshake_timeout_does_not_close_an_established_relay() {
+    let target = start_echo_target();
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
+    let factory = SocksConnectionHandlerFactory::new(dns, Arc::clone(&rt), Arc::new(AllowAll))
+        .with_handshake_timeout(Duration::from_millis(150));
+    let service = SocksService::new("127.0.0.1:0".parse().unwrap(), factory);
+    let proxy = service.start(&rt).unwrap();
+
+    let mut client = TcpStream::connect(proxy).unwrap();
+    client.write_all(&[0x05, 1, 0x00]).unwrap();
+    assert_eq!(read_exact_within(&mut client, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    if let IpAddr::V4(v4) = target.ip() {
+        req.extend_from_slice(&v4.octets());
+    }
+    req.extend_from_slice(&target.port().to_be_bytes());
+    client.write_all(&req).unwrap();
+    let reply = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    assert_eq!(reply[1], 0x00);
+
+    // Outlive the (short) handshake timeout window — the relay must still
+    // be alive, since the handshake itself completed well before it.
+    thread::sleep(Duration::from_millis(400));
+    client.write_all(b"still-alive").unwrap();
+    assert_eq!(read_exact_within(&mut client, 11, Duration::from_secs(5)), b"still-alive");
+}
+
+#[test]
+fn per_source_acl_rejects_a_denied_peer() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
+    let factory = SocksConnectionHandlerFactory::new(dns, Arc::clone(&rt), Arc::new(AllowAll));
+    let acl = PeerAcl {
+        allow: vec![],
+        deny: vec![IpNet::parse("127.0.0.1/32").unwrap()],
+    };
+    let service = SocksService::new("127.0.0.1:0".parse().unwrap(), factory).with_acl(acl);
+    let proxy = service.start(&rt).unwrap();
+
+    let mut client = TcpStream::connect(proxy).unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 1];
+    // The TCP accept itself still succeeds (the ACL is enforced after
+    // accept, at the hopf-core listener level) — the connection is then
+    // dropped immediately, before any SOCKS handshake byte is ever sent.
+    match client.read(&mut buf) {
+        Ok(0) => {}
+        Ok(n) => panic!("expected no data from a denied peer, got {n} byte(s)"),
+        Err(e) => assert!(
+            matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof),
+            "unexpected error kind: {e:?}"
+        ),
+    }
+}
+
+#[test]
+fn max_relays_rejects_once_at_capacity() {
+    let target = start_echo_target();
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
+    let factory = SocksConnectionHandlerFactory::new(dns, Arc::clone(&rt), Arc::new(AllowAll))
+        .with_max_relays(1);
+    let service = SocksService::new("127.0.0.1:0".parse().unwrap(), factory);
+    let proxy = service.start(&rt).unwrap();
+
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    if let IpAddr::V4(v4) = target.ip() {
+        req.extend_from_slice(&v4.octets());
+    }
+    req.extend_from_slice(&target.port().to_be_bytes());
+
+    // First CONNECT succeeds and occupies the one available slot; keep
+    // its connection open so the relay stays active.
+    let mut first = TcpStream::connect(proxy).unwrap();
+    first.write_all(&[0x05, 1, 0x00]).unwrap();
+    assert_eq!(read_exact_within(&mut first, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
+    first.write_all(&req).unwrap();
+    assert_eq!(read_exact_within(&mut first, 10, Duration::from_secs(5))[1], 0x00);
+
+    // A second CONNECT is rejected outright — capacity is exhausted.
+    let mut second = TcpStream::connect(proxy).unwrap();
+    second.write_all(&[0x05, 1, 0x00]).unwrap();
+    assert_eq!(read_exact_within(&mut second, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
+    second.write_all(&req).unwrap();
+    let reply2 = read_exact_within(&mut second, 10, Duration::from_secs(5));
+    assert_eq!(reply2[1], 0x01, "expected GeneralFailure reply once at capacity");
+}
+
+#[test]
+fn socks_over_tls_completes_a_connect_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    let acceptor = hopf_tls::acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+
+    let target = start_echo_target();
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
+    let factory = SocksConnectionHandlerFactory::new(dns, Arc::clone(&rt), Arc::new(AllowAll));
+    let service = SocksService::new("127.0.0.1:0".parse().unwrap(), factory).with_tls(acceptor);
+    let proxy = service.start(&rt).unwrap();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.cert.der().clone()).unwrap();
+    let client_cfg = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
+    let sock = TcpStream::connect(proxy).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut tls = rustls::StreamOwned::new(conn, sock);
+
+    tls.write_all(&[0x05, 1, 0x00]).unwrap();
+    tls.flush().unwrap();
+    let mut buf = [0u8; 2];
+    tls.read_exact(&mut buf).unwrap();
+    assert_eq!(buf, [0x05, 0x00]);
+
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    if let IpAddr::V4(v4) = target.ip() {
+        req.extend_from_slice(&v4.octets());
+    }
+    req.extend_from_slice(&target.port().to_be_bytes());
+    tls.write_all(&req).unwrap();
+    tls.flush().unwrap();
+    let mut reply = [0u8; 10];
+    tls.read_exact(&mut reply).unwrap();
+    assert_eq!(reply[1], 0x00);
+
+    tls.write_all(b"tls-relay").unwrap();
+    tls.flush().unwrap();
+    let mut echoed = [0u8; 9];
+    tls.read_exact(&mut echoed).unwrap();
+    assert_eq!(&echoed, b"tls-relay");
 }

@@ -35,7 +35,7 @@ mod wire;
 pub use auth::SocksAuthenticator;
 pub use bind::DEFAULT_BIND_ACCEPT_TIMEOUT;
 pub use connect::DEFAULT_RELAY_IDLE_TIMEOUT;
-pub use handler::SocksConnectionHandlerFactory;
+pub use handler::{SocksConnectionHandlerFactory, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_RELAYS};
 pub use metrics::SocksServerMetrics;
 pub use policy::SocksPolicy;
 pub use service::SocksService;

@@ -7,6 +7,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,17 @@ use crate::udp_associate::{self, UdpAssociateOutcome, UdpAssociateShared, DEFAUL
 use crate::wire::{self, ParseResult, Socks4Reply, Socks5Reply, SocksAddress, SocksCommand};
 
 const ZERO_ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+
+/// How long a client has to complete the handshake (version detection
+/// through a fully parsed request) before the connection is force-closed.
+/// Established relays, BIND accept-waits, and UDP associations each have
+/// their own separate timeout — this covers the one phase that otherwise
+/// had none: a client that opens a connection and then sends nothing (or
+/// drips bytes forever) would sit there indefinitely.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// No cap on concurrent relays/associations by default.
+pub const DEFAULT_MAX_RELAYS: usize = 0;
 
 /// Which reply framing a pending outcome should be delivered with —
 /// tracked separately from [`Phase`] so the SOCKS4-vs-5 distinction isn't
@@ -66,6 +78,8 @@ pub struct SocksConnectionHandlerFactory {
     idle_timeout: Duration,
     bind_accept_timeout: Duration,
     udp_idle_timeout: Duration,
+    handshake_timeout: Duration,
+    max_relays: usize,
 }
 
 impl SocksConnectionHandlerFactory {
@@ -81,6 +95,8 @@ impl SocksConnectionHandlerFactory {
             idle_timeout: DEFAULT_RELAY_IDLE_TIMEOUT,
             bind_accept_timeout: DEFAULT_BIND_ACCEPT_TIMEOUT,
             udp_idle_timeout: DEFAULT_UDP_IDLE_TIMEOUT,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            max_relays: DEFAULT_MAX_RELAYS,
         }
     }
 
@@ -110,6 +126,24 @@ impl SocksConnectionHandlerFactory {
         self
     }
 
+    /// Override [`DEFAULT_HANDSHAKE_TIMEOUT`].
+    pub fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
+        self.handshake_timeout = handshake_timeout;
+        self
+    }
+
+    /// Cap concurrent relays and UDP associations combined; `0` (the
+    /// default) means unlimited. Checked when a CONNECT/BIND/UDP
+    /// ASSOCIATE request is received, against the count of currently
+    /// *established* sessions — a burst of simultaneous new requests can
+    /// briefly start more setups than this cap in flight before some of
+    /// them are rejected, since a request only counts once it succeeds,
+    /// not while its dial/accept/socket-open is still pending.
+    pub fn with_max_relays(mut self, max_relays: usize) -> Self {
+        self.max_relays = max_relays;
+        self
+    }
+
     /// Shared metrics handle, for exposing counters to the application.
     pub fn metrics(&self) -> Arc<SocksServerMetrics> {
         Arc::clone(&self.metrics)
@@ -127,6 +161,9 @@ impl SocksConnectionHandlerFactory {
             idle_timeout: self.idle_timeout,
             bind_accept_timeout: self.bind_accept_timeout,
             udp_idle_timeout: self.udp_idle_timeout,
+            handshake_timeout: self.handshake_timeout,
+            max_relays: self.max_relays,
+            handshake_done: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -141,9 +178,31 @@ struct SocksConnectionHandler {
     idle_timeout: Duration,
     bind_accept_timeout: Duration,
     udp_idle_timeout: Duration,
+    handshake_timeout: Duration,
+    max_relays: usize,
+    /// Set once the handshake completes (a full CONNECT/BIND/UDP
+    /// ASSOCIATE request has been parsed and dispatched) — checked by the
+    /// one-shot timer armed in `connected()` to decide whether a client
+    /// that's gone quiet needs to be force-closed.
+    handshake_done: Arc<AtomicBool>,
 }
 
 impl SocksConnectionHandler {
+    fn mark_handshake_done(&self) {
+        self.handshake_done.store(true, Ordering::Release);
+    }
+
+    /// Whether a new relay/association may start, given `max_relays`
+    /// (`0` = unlimited) and the count of currently established sessions.
+    fn has_relay_capacity(&self) -> bool {
+        if self.max_relays == 0 {
+            return true;
+        }
+        let active = self.metrics.active_relays.load(Ordering::Relaxed)
+            + self.metrics.active_udp_associations.load(Ordering::Relaxed);
+        (active as usize) < self.max_relays
+    }
+
     fn dispatch_connect(
         &mut self,
         endpoint: &mut dyn Endpoint,
@@ -151,7 +210,13 @@ impl SocksConnectionHandler {
         port: u16,
         reply_kind: ReplyKind,
     ) {
+        self.mark_handshake_done();
         SocksServerMetrics::add(&self.metrics.connect_requests, 1);
+        if !self.has_relay_capacity() {
+            self.send_reply(endpoint, reply_kind, Socks5Reply::GeneralFailure, ZERO_ADDR);
+            endpoint.close();
+            return;
+        }
         let client = endpoint.handle();
         let shared = match address {
             SocksAddress::Ip(ip) => connect::begin_connect_literal(
@@ -175,7 +240,13 @@ impl SocksConnectionHandler {
     }
 
     fn dispatch_bind(&mut self, endpoint: &mut dyn Endpoint, address: SocksAddress, reply_kind: ReplyKind) {
+        self.mark_handshake_done();
         SocksServerMetrics::add(&self.metrics.bind_requests, 1);
+        if !self.has_relay_capacity() {
+            self.send_reply(endpoint, reply_kind, Socks5Reply::GeneralFailure, ZERO_ADDR);
+            endpoint.close();
+            return;
+        }
         // BIND's DST.ADDR is the peer address the client already knows
         // out-of-band (e.g. from a prior CONNECT or a PORT-style exchange)
         // — an unspecified address means "accept from anyone", a concrete
@@ -214,7 +285,13 @@ impl SocksConnectionHandler {
     }
 
     fn dispatch_udp_associate(&mut self, endpoint: &mut dyn Endpoint, address: SocksAddress) {
+        self.mark_handshake_done();
         SocksServerMetrics::add(&self.metrics.udp_associate_requests, 1);
+        if !self.has_relay_capacity() {
+            self.send_reply(endpoint, ReplyKind::Socks5, Socks5Reply::GeneralFailure, ZERO_ADDR);
+            endpoint.close();
+            return;
+        }
         // DST.ADDR here is the address the client will send its own
         // datagrams from — used only as a plausibility check on inbound
         // datagrams (see `crate::udp_associate`), not a target. A
@@ -378,8 +455,18 @@ fn local_bound_addr(endpoint: &dyn Endpoint) -> SocketAddr {
 }
 
 impl ProtocolHandler for SocksConnectionHandler {
-    fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
+    fn connected(&mut self, endpoint: &mut dyn Endpoint) {
         SocksServerMetrics::add(&self.metrics.connections, 1);
+        let flag = Arc::clone(&self.handshake_done);
+        let conn = endpoint.handle();
+        endpoint.schedule_timer(
+            self.handshake_timeout,
+            Box::new(move || {
+                if !flag.load(Ordering::Acquire) {
+                    conn.close();
+                }
+            }),
+        );
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
