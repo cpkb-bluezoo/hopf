@@ -18,9 +18,15 @@ pub struct SocksServerMetrics {
     pub active_bind_waits: AtomicU64,
     /// Relays currently active (CONNECT and BIND alike).
     pub active_relays: AtomicU64,
-    /// Bytes relayed from client to target.
+    /// UDP ASSOCIATE requests received.
+    pub udp_associate_requests: AtomicU64,
+    /// UDP associations currently active.
+    pub active_udp_associations: AtomicU64,
+    /// Bytes relayed from client to target (CONNECT, BIND, and UDP
+    /// ASSOCIATE alike).
     pub bytes_upstream: AtomicU64,
-    /// Bytes relayed from target to client.
+    /// Bytes relayed from target to client (CONNECT, BIND, and UDP
+    /// ASSOCIATE alike).
     pub bytes_downstream: AtomicU64,
     /// Successful RFC 1929 authentications.
     pub auth_ok: AtomicU64,

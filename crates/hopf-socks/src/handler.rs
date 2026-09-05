@@ -2,8 +2,8 @@
 
 //! The SOCKS4/4a/5 connection state machine: version detection, SOCKS5
 //! method negotiation with RFC 1929 authentication, request parsing, and
-//! dispatch into the CONNECT ([`crate::connect`]) and BIND
-//! ([`crate::bind`]) commands.
+//! dispatch into the CONNECT ([`crate::connect`]), BIND ([`crate::bind`]),
+//! and UDP ASSOCIATE ([`crate::udp_associate`]) commands.
 
 use std::io;
 use std::net::SocketAddr;
@@ -19,6 +19,7 @@ use crate::connect::{self, ConnectOutcome, ConnectShared, DEFAULT_RELAY_IDLE_TIM
 use crate::metrics::SocksServerMetrics;
 use crate::policy::SocksPolicy;
 use crate::relay::RelayActivity;
+use crate::udp_associate::{self, UdpAssociateOutcome, UdpAssociateShared, DEFAULT_UDP_IDLE_TIMEOUT};
 use crate::wire::{self, ParseResult, Socks4Reply, Socks5Reply, SocksAddress, SocksCommand};
 
 const ZERO_ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
@@ -40,7 +41,12 @@ enum Phase {
     Socks4Request,
     AwaitingUpstream(Arc<ConnectShared>, ReplyKind),
     AwaitingBindPeer(Arc<BindShared>, ReplyKind),
+    AwaitingUdpAssociate(Arc<UdpAssociateShared>),
     Relay(ConnHandle, Arc<RelayActivity>),
+    /// A UDP association is live; this TCP connection carries no further
+    /// protocol traffic of its own (RFC 1928 §7 ties the association's
+    /// lifetime to it, nothing else) — any bytes that arrive are ignored.
+    UdpAssociated(Arc<UdpAssociateShared>),
 }
 
 /// Builds a `SocksConnectionHandler` for each accepted connection.
@@ -59,6 +65,7 @@ pub struct SocksConnectionHandlerFactory {
     metrics: Arc<SocksServerMetrics>,
     idle_timeout: Duration,
     bind_accept_timeout: Duration,
+    udp_idle_timeout: Duration,
 }
 
 impl SocksConnectionHandlerFactory {
@@ -73,6 +80,7 @@ impl SocksConnectionHandlerFactory {
             metrics: SocksServerMetrics::shared(),
             idle_timeout: DEFAULT_RELAY_IDLE_TIMEOUT,
             bind_accept_timeout: DEFAULT_BIND_ACCEPT_TIMEOUT,
+            udp_idle_timeout: DEFAULT_UDP_IDLE_TIMEOUT,
         }
     }
 
@@ -96,6 +104,12 @@ impl SocksConnectionHandlerFactory {
         self
     }
 
+    /// Override [`crate::udp_associate::DEFAULT_UDP_IDLE_TIMEOUT`].
+    pub fn with_udp_idle_timeout(mut self, udp_idle_timeout: Duration) -> Self {
+        self.udp_idle_timeout = udp_idle_timeout;
+        self
+    }
+
     /// Shared metrics handle, for exposing counters to the application.
     pub fn metrics(&self) -> Arc<SocksServerMetrics> {
         Arc::clone(&self.metrics)
@@ -112,6 +126,7 @@ impl SocksConnectionHandlerFactory {
             metrics: Arc::clone(&self.metrics),
             idle_timeout: self.idle_timeout,
             bind_accept_timeout: self.bind_accept_timeout,
+            udp_idle_timeout: self.udp_idle_timeout,
         })
     }
 }
@@ -125,6 +140,7 @@ struct SocksConnectionHandler {
     metrics: Arc<SocksServerMetrics>,
     idle_timeout: Duration,
     bind_accept_timeout: Duration,
+    udp_idle_timeout: Duration,
 }
 
 impl SocksConnectionHandler {
@@ -195,6 +211,52 @@ impl SocksConnectionHandler {
                 endpoint.close();
             }
         }
+    }
+
+    fn dispatch_udp_associate(&mut self, endpoint: &mut dyn Endpoint, address: SocksAddress) {
+        SocksServerMetrics::add(&self.metrics.udp_associate_requests, 1);
+        // DST.ADDR here is the address the client will send its own
+        // datagrams from — used only as a plausibility check on inbound
+        // datagrams (see `crate::udp_associate`), not a target. A
+        // wildcard means "use whatever the TCP connection's own peer
+        // address is"; a domain name has no real-world precedent worth
+        // an async DNS round trip for, so (mirroring the same scope
+        // decision `dispatch_bind` makes for its DST.ADDR) it's rejected
+        // outright.
+        let expected_client_ip = match address {
+            SocksAddress::Ip(ip) if ip.is_unspecified() => {
+                match endpoint.remote_addr().ok().and_then(|a| a.as_socket_addr()) {
+                    Some(addr) => addr.ip(),
+                    None => {
+                        self.send_reply(endpoint, ReplyKind::Socks5, Socks5Reply::GeneralFailure, ZERO_ADDR);
+                        endpoint.close();
+                        return;
+                    }
+                }
+            }
+            SocksAddress::Ip(ip) => ip,
+            SocksAddress::Domain(_) => {
+                self.send_reply(endpoint, ReplyKind::Socks5, Socks5Reply::AddressTypeNotSupported, ZERO_ADDR);
+                endpoint.close();
+                return;
+            }
+        };
+        // The client-facing UDP socket must bind the same local interface
+        // this TCP connection is already on — its address becomes the
+        // reply's BND.ADDR, so an unspecified bind would report an
+        // address (0.0.0.0/::) nothing can actually send a datagram to.
+        let local_ip = local_bound_addr(endpoint).ip();
+        let client = endpoint.handle();
+        let shared = udp_associate::begin_udp_associate(
+            &self.runtime,
+            Arc::clone(&self.dns),
+            Arc::clone(&self.policy),
+            Arc::clone(&self.metrics),
+            client,
+            expected_client_ip,
+            local_ip,
+        );
+        self.phase = Phase::AwaitingUdpAssociate(shared);
     }
 
     /// Encode and send a reply in whichever framing `reply_kind` calls
@@ -272,6 +334,30 @@ impl SocksConnectionHandler {
         }
     }
 
+    /// Same as [`Self::poll_connect_outcome`], for
+    /// [`Phase::AwaitingUdpAssociate`].
+    fn poll_udp_associate_outcome(&mut self, endpoint: &mut dyn Endpoint) {
+        let shared = match &self.phase {
+            Phase::AwaitingUdpAssociate(shared) => Arc::clone(shared),
+            _ => return,
+        };
+        let Some(outcome) = shared.take_outcome() else {
+            return;
+        };
+        match outcome {
+            UdpAssociateOutcome::Ready => {
+                self.send_reply(endpoint, ReplyKind::Socks5, Socks5Reply::Succeeded, shared.bound_addr());
+                SocksServerMetrics::add(&self.metrics.active_udp_associations, 1);
+                udp_associate::arm_idle_timer(Arc::clone(&shared), endpoint.handle(), self.udp_idle_timeout);
+                self.phase = Phase::UdpAssociated(shared);
+            }
+            UdpAssociateOutcome::Failed(reply) => {
+                self.send_reply(endpoint, ReplyKind::Socks5, reply, ZERO_ADDR);
+                endpoint.close();
+            }
+        }
+    }
+
     fn select_socks5_method(&self, offered: &[u8]) -> Option<u8> {
         if self.authenticator.is_some() {
             offered.contains(&0x02).then_some(0x02)
@@ -300,6 +386,7 @@ impl ProtocolHandler for SocksConnectionHandler {
         match &self.phase {
             Phase::AwaitingUpstream(..) => self.poll_connect_outcome(endpoint),
             Phase::AwaitingBindPeer(..) => self.poll_bind_outcome(endpoint),
+            Phase::AwaitingUdpAssociate(..) => self.poll_udp_associate_outcome(endpoint),
             _ => {}
         }
 
@@ -426,17 +513,24 @@ impl ProtocolHandler for SocksConnectionHandler {
                                 self.dispatch_bind(endpoint, req.address, ReplyKind::Socks5);
                             }
                             SocksCommand::UdpAssociate => {
-                                // Not implemented yet (tracked separately).
-                                endpoint.send(&wire::encode_socks5_reply(Socks5Reply::CommandNotSupported, ZERO_ADDR));
-                                endpoint.close();
+                                self.dispatch_udp_associate(endpoint, req.address);
                             }
                         }
                         return;
                     }
                 },
-                Phase::AwaitingUpstream(..) | Phase::AwaitingBindPeer(..) => return,
+                Phase::AwaitingUpstream(..) | Phase::AwaitingBindPeer(..) | Phase::AwaitingUdpAssociate(..) => {
+                    return;
+                }
                 Phase::Relay(other, activity) => {
                     crate::relay::forward(activity, other, &self.metrics.bytes_upstream, data);
+                    *data = &[];
+                    return;
+                }
+                Phase::UdpAssociated(..) => {
+                    // No further protocol traffic is expected on this
+                    // connection (RFC 1928 §7) — discard rather than
+                    // error, in case a client sends an innocuous keepalive.
                     *data = &[];
                     return;
                 }
@@ -456,6 +550,16 @@ impl ProtocolHandler for SocksConnectionHandler {
                 // one) — `stop_waiting` is idempotent, so this is safe
                 // regardless of whether `poll_bind_outcome` already ran.
                 shared.stop_waiting(&self.metrics);
+            }
+            Phase::AwaitingUdpAssociate(shared) => {
+                // Closes the race between this disconnect and the
+                // sockets still being opened on a setup thread — see
+                // `UdpAssociateShared::abandon`'s doc comment.
+                shared.abandon();
+            }
+            Phase::UdpAssociated(shared) => {
+                shared.teardown();
+                shared.release_once();
             }
             _ => {}
         }

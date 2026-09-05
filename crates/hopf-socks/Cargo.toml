@@ -21,5 +21,6 @@ integration = []
 [dependencies]
 hopf-core = { workspace = true }
 hopf-dns = { workspace = true }
+mio = { workspace = true }
 
 [dev-dependencies]
