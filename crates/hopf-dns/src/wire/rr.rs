@@ -98,6 +98,135 @@ pub struct SoaData {
     pub minimum: u32,
 }
 
+/// TLSA certificate usage field (RFC 6698 §2.1.1) — what the association
+/// data authenticates and how.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsaUsage {
+    /// CA constraint: the association data must match a certificate in a
+    /// chain that *also* validates via ordinary PKIX (WebPKI) rules.
+    PkixTa,
+    /// Service certificate constraint: the association data must match the
+    /// end-entity certificate, which must *also* validate via ordinary
+    /// PKIX rules.
+    PkixEe,
+    /// Trust anchor assertion: the association data must match a
+    /// certificate in the presented chain, which is then trusted as the
+    /// root for validating the rest of the chain — no WebPKI/CA validation
+    /// involved.
+    DaneTa,
+    /// Domain-issued certificate: the association data must match the
+    /// end-entity certificate directly — no chain validation at all.
+    DaneEe,
+    /// Reserved for private use (255) or an unassigned value (RFC 6698
+    /// §7.2) — a record with one of these must never be used to accept or
+    /// reject a connection.
+    Unassigned(u8),
+}
+
+impl TlsaUsage {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::PkixTa,
+            1 => Self::PkixEe,
+            2 => Self::DaneTa,
+            3 => Self::DaneEe,
+            other => Self::Unassigned(other),
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::PkixTa => 0,
+            Self::PkixEe => 1,
+            Self::DaneTa => 2,
+            Self::DaneEe => 3,
+            Self::Unassigned(v) => v,
+        }
+    }
+}
+
+/// TLSA selector field (RFC 6698 §2.1.2) — which part of the certificate
+/// the association data was computed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsaSelector {
+    /// The full DER-encoded certificate.
+    FullCertificate,
+    /// The DER-encoded `SubjectPublicKeyInfo` only.
+    SubjectPublicKeyInfo,
+    /// Reserved for private use (255) or an unassigned value — see
+    /// [`TlsaUsage::Unassigned`].
+    Unassigned(u8),
+}
+
+impl TlsaSelector {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::FullCertificate,
+            1 => Self::SubjectPublicKeyInfo,
+            other => Self::Unassigned(other),
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::FullCertificate => 0,
+            Self::SubjectPublicKeyInfo => 1,
+            Self::Unassigned(v) => v,
+        }
+    }
+}
+
+/// TLSA matching type field (RFC 6698 §2.1.3) — how the association data
+/// was derived from the selected certificate data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsaMatchingType {
+    /// The association data is the selected data itself, byte for byte.
+    Exact,
+    /// The association data is the SHA-256 digest of the selected data.
+    Sha256,
+    /// The association data is the SHA-384 digest of the selected data.
+    Sha384,
+    /// Reserved for private use (255) or an unassigned value — see
+    /// [`TlsaUsage::Unassigned`].
+    Unassigned(u8),
+}
+
+impl TlsaMatchingType {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Exact,
+            1 => Self::Sha256,
+            2 => Self::Sha384,
+            other => Self::Unassigned(other),
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Exact => 0,
+            Self::Sha256 => 1,
+            Self::Sha384 => 2,
+            Self::Unassigned(v) => v,
+        }
+    }
+}
+
+/// Decoded TLSA RDATA (RFC 6698 §2.1) — binds a certificate to the DNS
+/// name a TLSA record is published under (conventionally
+/// `_<port>._<protocol>.<hostname>`, e.g. `_25._tcp.mx.example.com`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsaRecord {
+    /// What the association data authenticates.
+    pub usage: TlsaUsage,
+    /// Which part of the certificate the association data was computed from.
+    pub selector: TlsaSelector,
+    /// How the association data was derived from the selected data.
+    pub matching_type: TlsaMatchingType,
+    /// The association data itself — a raw hash, or the raw selected data
+    /// for matching type [`TlsaMatchingType::Exact`].
+    pub association_data: Vec<u8>,
+}
+
 /// DNS resource record (RFC 1035 §3.2.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsResourceRecord {
@@ -262,6 +391,16 @@ impl DnsResourceRecord {
         rdata.extend_from_slice(&port.to_be_bytes());
         rdata.extend_from_slice(&encode_name(target)?);
         Ok(Self::new(name, DnsType::Srv, DnsClass::In, ttl, rdata))
+    }
+
+    /// TLSA (DANE certificate association, RFC 6698 §2.1).
+    pub fn tlsa(name: impl Into<String>, ttl: u32, record: &TlsaRecord) -> Self {
+        let mut rdata = Vec::with_capacity(3 + record.association_data.len());
+        rdata.push(record.usage.to_u8());
+        rdata.push(record.selector.to_u8());
+        rdata.push(record.matching_type.to_u8());
+        rdata.extend_from_slice(&record.association_data);
+        Self::new(name, DnsType::Tlsa, DnsClass::In, ttl, rdata)
     }
 
     /// SVCB (RFC 9460 §2).
@@ -583,6 +722,20 @@ impl DnsResourceRecord {
         let mut c = 6;
         let target = decode_name(&self.rdata, &mut c).ok()?;
         Some((priority, weight, port, target))
+    }
+
+    /// Parse TLSA RDATA (RFC 6698 §2.1): certificate usage, selector,
+    /// matching type, and association data.
+    pub fn as_tlsa(&self) -> Option<TlsaRecord> {
+        if self.rtype != Some(DnsType::Tlsa) || self.rdata.len() < 3 {
+            return None;
+        }
+        Some(TlsaRecord {
+            usage: TlsaUsage::from_u8(self.rdata[0]),
+            selector: TlsaSelector::from_u8(self.rdata[1]),
+            matching_type: TlsaMatchingType::from_u8(self.rdata[2]),
+            association_data: self.rdata[3..].to_vec(),
+        })
     }
 
     /// Concatenate TXT character-strings.
@@ -1045,6 +1198,69 @@ mod tests {
 
         let a = DnsResourceRecord::a("ex.test.", 60, Ipv4Addr::new(1, 2, 3, 4));
         assert!(a.as_srv().is_none());
+    }
+
+    fn hex_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn tlsa_round_trips_through_as_tlsa_rfc_6698_example() {
+        // RFC 6698 Appendix B.1's example record.
+        let association_data = hex_bytes(
+            "d2abde240d7cd3ee6b4b28c54df034b97983a1d16e8a410e4561cb106618e971",
+        );
+        let record = TlsaRecord {
+            usage: TlsaUsage::PkixTa,
+            selector: TlsaSelector::FullCertificate,
+            matching_type: TlsaMatchingType::Sha256,
+            association_data,
+        };
+        let rr = DnsResourceRecord::tlsa("_443._tcp.www.example.com.", 3600, &record);
+        assert_eq!(rr.rtype, Some(DnsType::Tlsa));
+        assert_eq!(rr.as_tlsa().unwrap(), record);
+
+        let a = DnsResourceRecord::a("ex.test.", 60, Ipv4Addr::new(1, 2, 3, 4));
+        assert!(a.as_tlsa().is_none());
+    }
+
+    #[test]
+    fn tlsa_round_trips_every_usage_selector_matching_type_including_unassigned() {
+        let usages = [
+            TlsaUsage::PkixTa,
+            TlsaUsage::PkixEe,
+            TlsaUsage::DaneTa,
+            TlsaUsage::DaneEe,
+            TlsaUsage::Unassigned(200),
+        ];
+        let selectors = [
+            TlsaSelector::FullCertificate,
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaSelector::Unassigned(200),
+        ];
+        let matching_types = [
+            TlsaMatchingType::Exact,
+            TlsaMatchingType::Sha256,
+            TlsaMatchingType::Sha384,
+            TlsaMatchingType::Unassigned(200),
+        ];
+        for usage in usages {
+            for selector in selectors {
+                for matching_type in matching_types {
+                    let record = TlsaRecord {
+                        usage,
+                        selector,
+                        matching_type,
+                        association_data: vec![1, 2, 3],
+                    };
+                    let rr = DnsResourceRecord::tlsa("x.", 1, &record);
+                    assert_eq!(rr.as_tlsa().unwrap(), record, "usage={usage:?} selector={selector:?} matching_type={matching_type:?}");
+                }
+            }
+        }
     }
 
     #[test]
