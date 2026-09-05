@@ -12,6 +12,7 @@ pub(crate) mod h2_session;
 pub(crate) mod h3_session;
 #[cfg(feature = "h3")]
 pub(crate) mod negotiate;
+pub(crate) mod redirect;
 pub(crate) mod session_config;
 
 pub use alt_svc::{parse_alt_svc_h3, AltSvcCache, AltSvcEntry, AltSvcH3Entry};
@@ -22,6 +23,7 @@ pub use connect::{
     connect_http, connect_http2_upgrade, connect_http2_upgrade_unix, connect_http_unix,
     HttpClientTimeouts,
 };
+pub use redirect::RedirectPolicy;
 #[cfg(feature = "h3")]
 pub use connect::{connect_auto, connect_auto_unix, connect_h3_by_name, connect_https, HttpFallback};
 pub use facade::HttpClient;

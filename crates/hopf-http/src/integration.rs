@@ -8,7 +8,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hopf_core::{Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
@@ -21,7 +21,7 @@ use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
 use crate::{
     AltSvcCache, CleartextHttpEndpoint, ClientHandler, ClientHandlerFactory, ClientWriter,
     H2Endpoint, Headers, HttpClient, HttpClientSessionHandle, HttpConnectionHandler, HttpLimits,
-    HttpRequest, HttpResponseHandler,
+    HttpRequest, HttpResponseHandler, RedirectPolicy,
 };
 
 // ---------------------------------------------------------------------------
@@ -1632,4 +1632,261 @@ fn http_client_h3_prior_knowledge_skips_discovery() {
     assert_eq!(out.lock().unwrap().status, 200);
     assert_eq!(out.lock().unwrap().body, b"hello-h3-via-connect-auto");
     h3_server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// HttpClient::fetch / RedirectPolicy (issue #349)
+// ---------------------------------------------------------------------------
+
+/// Replies with a fixed 3xx status and `Location` header to every request,
+/// no body.
+struct RedirectingHttpServer {
+    buf: Vec<u8>,
+    status: u16,
+    location: String,
+}
+
+impl ProtocolHandler for RedirectingHttpServer {
+    fn connected(&mut self, _: &mut dyn Endpoint) {}
+
+    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+        self.buf.extend_from_slice(data);
+        *data = &[];
+        if self.buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let reason = match self.status {
+                301 => "Moved Permanently",
+                302 => "Found",
+                303 => "See Other",
+                307 => "Temporary Redirect",
+                308 => "Permanent Redirect",
+                _ => "Redirect",
+            };
+            let resp = format!(
+                "HTTP/1.1 {} {reason}\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                self.status, self.location
+            );
+            ep.send(resp.as_bytes());
+            ep.close();
+        }
+    }
+
+    fn disconnected(&mut self, _: &mut dyn Endpoint) {}
+    fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
+}
+
+fn start_redirecting_server(rt: &Arc<Runtime>, status: u16, location: String) -> SocketAddr {
+    let (addr, _) = rt
+        .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+            Box::new(RedirectingHttpServer {
+                buf: Vec::new(),
+                status,
+                location: location.clone(),
+            }) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+    addr
+}
+
+/// Redirects to `other_port` (filled in after both servers in a loop pair
+/// are bound — see [`fetch_gives_up_on_a_redirect_loop_instead_of_looping_forever`]).
+fn start_looping_redirect_server(rt: &Arc<Runtime>, other_port: Arc<OnceLock<u16>>) -> SocketAddr {
+    let (addr, _) = rt
+        .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+            let port = *other_port
+                .get()
+                .expect("other_port must be set before any connection is accepted");
+            Box::new(RedirectingHttpServer {
+                buf: Vec::new(),
+                status: 302,
+                location: format!("http://127.0.0.1:{port}/loop"),
+            }) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+    addr
+}
+
+/// Captures the raw request line + headers (everything before the blank
+/// line) of the first request it receives, then replies `200 OK`.
+struct RawCapturingServer {
+    buf: Vec<u8>,
+    captured: Arc<Mutex<Option<String>>>,
+}
+
+impl ProtocolHandler for RawCapturingServer {
+    fn connected(&mut self, _: &mut dyn Endpoint) {}
+
+    fn receive(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+        self.buf.extend_from_slice(data);
+        *data = &[];
+        if let Some(pos) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&self.buf[..pos]).to_string();
+            *self.captured.lock().unwrap() = Some(head);
+            let body = b"final-ok";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            ep.send(resp.as_bytes());
+            ep.send(body);
+            ep.close();
+        }
+    }
+
+    fn disconnected(&mut self, _: &mut dyn Endpoint) {}
+    fn error(&mut self, _: &mut dyn Endpoint, _: &io::Error) {}
+}
+
+fn start_raw_capturing_server(rt: &Arc<Runtime>) -> (SocketAddr, Arc<Mutex<Option<String>>>) {
+    let captured = Arc::new(Mutex::new(None));
+    let captured2 = Arc::clone(&captured);
+    let (addr, _) = rt
+        .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+            Box::new(RawCapturingServer {
+                buf: Vec::new(),
+                captured: Arc::clone(&captured2),
+            }) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+    (addr, captured)
+}
+
+/// Regression test for issue #349: with a [`RedirectPolicy`] configured,
+/// `HttpClient::fetch` must follow a 302 to a second server and deliver
+/// *that* server's response to the caller — not the intermediate 3xx.
+#[test]
+fn fetch_follows_a_redirect_to_a_second_server() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let addr_b = start_server(&rt); // 200 OK, body "hello-http-client"
+    let addr_a =
+        start_redirecting_server(&rt, 302, format!("http://127.0.0.1:{}/final", addr_b.port()));
+
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let out2 = Arc::clone(&out);
+    let client = HttpClient::from_addr(addr_a).follow_redirects(RedirectPolicy::default());
+    client
+        .fetch(
+            &rt,
+            "GET",
+            "/start",
+            Headers::new(),
+            None,
+            Box::new(RecordingResponseHandler { out: out2 }),
+        )
+        .unwrap();
+
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(5)), "fetch never completed");
+    let g = out.lock().unwrap();
+    assert_eq!(g.status, 200, "should have followed the redirect to a 200");
+    assert_eq!(g.body, b"hello-http-client");
+}
+
+/// Regression test for issue #349, and the specific behavior requested
+/// alongside it: with no [`RedirectPolicy`] configured (the default),
+/// `HttpClient::fetch` must deliver a 3xx response to the caller unchanged
+/// — not follow it.
+#[test]
+fn fetch_without_a_redirect_policy_returns_the_3xx_unchanged() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let addr_b = start_server(&rt);
+    let addr_a =
+        start_redirecting_server(&rt, 302, format!("http://127.0.0.1:{}/final", addr_b.port()));
+
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let out2 = Arc::clone(&out);
+    // No `.follow_redirects(...)` call.
+    let client = HttpClient::from_addr(addr_a);
+    client
+        .fetch(
+            &rt,
+            "GET",
+            "/start",
+            Headers::new(),
+            None,
+            Box::new(RecordingResponseHandler { out: out2 }),
+        )
+        .unwrap();
+
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(5)), "fetch never completed");
+    let g = out.lock().unwrap();
+    assert_eq!(
+        g.status, 302,
+        "without a policy, the 3xx must reach the caller unchanged"
+    );
+}
+
+/// Regression test for issue #349: a redirect loop must not hang or loop
+/// forever — `HttpClient::fetch` gives up (reporting failure) once
+/// `RedirectPolicy`'s hop cap is exceeded.
+#[test]
+fn fetch_gives_up_on_a_redirect_loop_instead_of_looping_forever() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let port_a: Arc<OnceLock<u16>> = Arc::new(OnceLock::new());
+    let port_b: Arc<OnceLock<u16>> = Arc::new(OnceLock::new());
+    let addr_a = start_looping_redirect_server(&rt, Arc::clone(&port_b));
+    let addr_b = start_looping_redirect_server(&rt, Arc::clone(&port_a));
+    port_a.set(addr_a.port()).unwrap();
+    port_b.set(addr_b.port()).unwrap();
+
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let out2 = Arc::clone(&out);
+    let client = HttpClient::from_addr(addr_a).follow_redirects(RedirectPolicy::new(4));
+    client
+        .fetch(
+            &rt,
+            "GET",
+            "/loop",
+            Headers::new(),
+            None,
+            Box::new(RecordingResponseHandler { out: out2 }),
+        )
+        .unwrap();
+
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(5)), "fetch never completed");
+    let g = out.lock().unwrap();
+    assert!(
+        g.failed.is_some(),
+        "expected a 'too many redirects' failure, got status {} (failed={:?})",
+        g.status,
+        g.failed
+    );
+}
+
+/// Regression test for issue #349's cross-origin credential-stripping
+/// design note: an `Authorization` header must not follow a redirect to a
+/// different origin (here, a different port on the same host — enough to
+/// make it cross-origin).
+#[test]
+fn fetch_strips_authorization_header_on_a_cross_origin_redirect() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let (addr_b, captured) = start_raw_capturing_server(&rt);
+    let addr_a =
+        start_redirecting_server(&rt, 302, format!("http://127.0.0.1:{}/final", addr_b.port()));
+
+    let mut headers = Headers::new();
+    headers.add("Authorization", "Bearer secret-token");
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let out2 = Arc::clone(&out);
+    let client = HttpClient::from_addr(addr_a).follow_redirects(RedirectPolicy::default());
+    client
+        .fetch(
+            &rt,
+            "GET",
+            "/start",
+            headers,
+            None,
+            Box::new(RecordingResponseHandler { out: out2 }),
+        )
+        .unwrap();
+
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(5)), "fetch never completed");
+    assert_eq!(out.lock().unwrap().status, 200);
+    let head = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the redirect target should have received a request");
+    assert!(
+        !head.to_ascii_lowercase().contains("authorization"),
+        "Authorization header must be stripped across a cross-origin redirect:\n{head}"
+    );
 }

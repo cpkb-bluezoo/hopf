@@ -44,7 +44,7 @@ pub use client::{
     connect_http, connect_http2_upgrade, connect_http2_upgrade_unix, connect_http_unix,
     parse_alt_svc_h3, AltSvcCache, AltSvcEntry, AltSvcH3Entry, HttpClient, HttpClientError,
     HttpClientSessionHandle, HttpClientTimeouts, HttpConnectionHandler, HttpRequest,
-    HttpResponseHandler,
+    HttpResponseHandler, RedirectPolicy,
 };
 #[cfg(feature = "h3")]
 pub use client::{connect_auto, connect_auto_unix, connect_h3_by_name, connect_https, HttpFallback};
