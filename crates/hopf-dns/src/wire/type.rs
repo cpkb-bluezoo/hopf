@@ -40,6 +40,8 @@ pub enum DnsType {
     Nsec3 = 50,
     /// NSEC3 parameters.
     Nsec3Param = 51,
+    /// TLSA (DANE certificate association, RFC 6698).
+    Tlsa = 52,
     /// Query all types.
     Any = 255,
 }
@@ -71,6 +73,7 @@ impl DnsType {
             48 => Self::Dnskey,
             50 => Self::Nsec3,
             51 => Self::Nsec3Param,
+            52 => Self::Tlsa,
             255 => Self::Any,
             _ => return None,
         })

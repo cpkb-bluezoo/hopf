@@ -29,6 +29,9 @@ pub mod server;
 #[cfg(feature = "dnssec")]
 pub mod dnssec;
 
+#[cfg(feature = "dane")]
+pub mod dane;
+
 pub use bailiwick::{
     filter_answers_in_bailiwick, filter_authorities_in_bailiwick, is_within_bailiwick, names_equal,
 };
@@ -45,7 +48,7 @@ pub use multi_qtype::{
 pub use multi_qtype_cache::MultiQTypeCache;
 pub use wire::{
     DnsClass, DnsFormatError, DnsMessage, DnsQueryIdGenerator, DnsQuestion, DnsResourceRecord,
-    DnsType,
+    DnsType, TlsaMatchingType, TlsaRecord, TlsaSelector, TlsaUsage,
 };
 
 pub use hopf_core::VERSION;

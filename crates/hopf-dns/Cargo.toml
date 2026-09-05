@@ -28,6 +28,11 @@ doh = ["dep:hopf-tls"]
 # round-trip (verified locally against RFC 8032 vectors), which would make
 # Ed448 signature verification unreliable — accepted as the better tradeoff.
 dnssec = ["dep:aws-lc-rs", "dep:ed448-goldilocks-plus"]
+# DANE (RFC 6698/7672) certificate verification against TLSA records —
+# independent of `dnssec` (this crate's caller is responsible for only
+# trusting TLSA records it already validated, e.g. via the `dnssec`
+# feature's `DnsResolver::validate_chain_of_trust`).
+dane = ["dep:rustls"]
 # Local UDP stub ↔ resolver smokes (`tests/`); not compiled in CI `--lib`.
 integration = []
 
@@ -42,6 +47,7 @@ hopf-tls = { workspace = true, optional = true }
 hopf-quic = { workspace = true, optional = true }
 aws-lc-rs = { workspace = true, optional = true }
 ed448-goldilocks-plus = { version = "0.18.0", default-features = false, features = ["signing"], optional = true }
+rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

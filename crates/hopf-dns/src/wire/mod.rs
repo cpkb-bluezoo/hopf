@@ -24,8 +24,8 @@ pub use name::{canonical_compare, decode_name, encode_name, normalize_name};
 pub use query_id::DnsQueryIdGenerator;
 pub use question::DnsQuestion;
 pub use rr::{
-    encode_edns_padding, encode_svcb_alpn, DnsResourceRecord, EDNS_FLAG_DO, EDNS_OPTION_PADDING,
-    OPT_UDP_PAYLOAD, SVCB_PARAM_ALPN, SVCB_PARAM_ECH, SVCB_PARAM_IPV4HINT, SVCB_PARAM_IPV6HINT,
-    SVCB_PARAM_PORT,
+    encode_edns_padding, encode_svcb_alpn, DnsResourceRecord, TlsaMatchingType, TlsaRecord,
+    TlsaSelector, TlsaUsage, EDNS_FLAG_DO, EDNS_OPTION_PADDING, OPT_UDP_PAYLOAD, SVCB_PARAM_ALPN,
+    SVCB_PARAM_ECH, SVCB_PARAM_IPV4HINT, SVCB_PARAM_IPV6HINT, SVCB_PARAM_PORT,
 };
 pub use r#type::DnsType;
