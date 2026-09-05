@@ -33,10 +33,11 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hopf_core::retry::{RetryPolicy, RetryState};
 use hopf_core::Runtime;
 
 use crate::codec::{BasicProperties, FieldTable};
@@ -44,34 +45,32 @@ use crate::codec::{BasicProperties, FieldTable};
 use super::facade::AmqpClient;
 use super::handlers::{AmqpClientControl, AmqpClientDriver, AmqpClientHandlerFactory};
 
-/// Exponential backoff policy for reconnect attempts.
+/// Exponential backoff policy for reconnect attempts — thin wrapper over
+/// [`hopf_core::retry::RetryPolicy`] (issue #348) keeping this crate's own
+/// established defaults/method names as its public API.
 #[derive(Debug, Clone)]
 pub struct RecoveryPolicy {
-    initial_delay: Duration,
-    max_delay: Duration,
-    max_attempts: Option<u32>,
+    inner: RetryPolicy,
 }
 
 impl RecoveryPolicy {
-    /// Gumdrop's defaults: 1s initial delay, doubling each attempt, capped
-    /// at 30s, unlimited attempts.
+    /// 1s initial delay, doubling each attempt, capped at 30s, unlimited
+    /// attempts.
     pub fn exponential_backoff() -> Self {
         Self {
-            initial_delay: Duration::from_secs(1),
-            max_delay: Duration::from_secs(30),
-            max_attempts: None,
+            inner: RetryPolicy::exponential_backoff(),
         }
     }
 
     /// Delay before the first reconnect attempt (default 1s).
     pub fn with_initial_delay(mut self, delay: Duration) -> Self {
-        self.initial_delay = delay;
+        self.inner = self.inner.with_initial_delay(delay);
         self
     }
 
     /// Cap on the backoff delay (default 30s).
     pub fn with_max_delay(mut self, delay: Duration) -> Self {
-        self.max_delay = delay;
+        self.inner = self.inner.with_max_delay(delay);
         self
     }
 
@@ -79,25 +78,19 @@ impl RecoveryPolicy {
     /// unlimited — see [`Self::unlimited_attempts`] to restore that after
     /// calling this).
     pub fn with_max_attempts(mut self, attempts: u32) -> Self {
-        self.max_attempts = Some(attempts);
+        self.inner = self.inner.with_max_attempts(attempts);
         self
     }
 
     /// Never give up reconnecting (the default).
     pub fn unlimited_attempts(mut self) -> Self {
-        self.max_attempts = None;
+        self.inner = self.inner.unlimited();
         self
     }
 
-    /// Delay before reconnect attempt number `attempt` (1-indexed):
-    /// `min(initial_delay * 2^(attempt-1), max_delay)`.
-    fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let shift = attempt.saturating_sub(1).min(32);
-        let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
-        let millis = self.initial_delay.as_millis() as u64;
-        let scaled = millis.saturating_mul(multiplier);
-        let capped = scaled.min(self.max_delay.as_millis() as u64);
-        Duration::from_millis(capped)
+    /// Begin tracking a fresh sequence of reconnect attempts.
+    fn start(&self) -> RetryState {
+        self.inner.start()
     }
 }
 
@@ -606,7 +599,7 @@ struct SharedState {
     user_driver: Arc<Mutex<Option<Box<dyn AmqpClientDriver>>>>,
     topology: Arc<Mutex<Topology>>,
     ever_connected: Arc<AtomicBool>,
-    attempt: Arc<AtomicU32>,
+    retry_state: Arc<Mutex<RetryState>>,
     last_error: Arc<Mutex<Option<String>>>,
     closing: Arc<AtomicBool>,
     backoff_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
@@ -627,22 +620,20 @@ impl SharedState {
         if self.closing.load(Ordering::Acquire) {
             return;
         }
-        let attempt = self.attempt.fetch_add(1, Ordering::AcqRel) + 1;
-        if let Some(max) = self.policy.max_attempts {
-            if attempt > max {
-                let cause = self
-                    .last_error
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or_else(|| "connection lost".to_owned());
-                if let Some(l) = &self.listener {
-                    l.on_recovery_failed(&cause);
-                }
-                return;
+        let delay = self.retry_state.lock().unwrap().next_delay();
+        let Some(delay) = delay else {
+            let cause = self
+                .last_error
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "connection lost".to_owned());
+            if let Some(l) = &self.listener {
+                l.on_recovery_failed(&cause);
             }
-        }
-        let delay = self.policy.delay_for_attempt(attempt);
+            return;
+        };
+        let attempt = self.retry_state.lock().unwrap().attempt();
         if let Some(l) = &self.listener {
             l.on_reconnecting(attempt, delay);
         }
@@ -667,7 +658,7 @@ struct RecoveringDriver {
 impl AmqpClientDriver for RecoveringDriver {
     fn on_connection_open(&mut self, client: &mut dyn AmqpClientControl) {
         let first_connect = !self.shared.ever_connected.swap(true, Ordering::AcqRel);
-        self.shared.attempt.store(0, Ordering::Release);
+        *self.shared.retry_state.lock().unwrap() = self.shared.policy.start();
         *self.shared.backoff_cancel.lock().unwrap() = None;
         if first_connect {
             let mut tracked = TrackingControl { inner: client, topology: &self.shared.topology };
@@ -937,7 +928,7 @@ struct RecoveringHandlerFactory {
     user_driver: Arc<Mutex<Option<Box<dyn AmqpClientDriver>>>>,
     topology: Arc<Mutex<Topology>>,
     ever_connected: Arc<AtomicBool>,
-    attempt: Arc<AtomicU32>,
+    retry_state: Arc<Mutex<RetryState>>,
     last_error: Arc<Mutex<Option<String>>>,
     closing: Arc<AtomicBool>,
     backoff_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
@@ -960,7 +951,7 @@ impl AmqpClientHandlerFactory for RecoveringHandlerFactory {
                 user_driver: Arc::clone(&self.user_driver),
                 topology: Arc::clone(&self.topology),
                 ever_connected: Arc::clone(&self.ever_connected),
-                attempt: Arc::clone(&self.attempt),
+                retry_state: Arc::clone(&self.retry_state),
                 last_error: Arc::clone(&self.last_error),
                 closing: Arc::clone(&self.closing),
                 backoff_cancel: Arc::clone(&self.backoff_cancel),
@@ -1021,7 +1012,7 @@ impl AmqpRecoveringClient {
             user_driver: Arc::new(Mutex::new(None)),
             topology: Arc::new(Mutex::new(Topology::default())),
             ever_connected: Arc::new(AtomicBool::new(false)),
-            attempt: Arc::new(AtomicU32::new(0)),
+            retry_state: Arc::new(Mutex::new(self.policy.start())),
             last_error: Arc::new(Mutex::new(None)),
             closing: Arc::clone(&closing),
             backoff_cancel: Arc::clone(&backoff_cancel),
@@ -1086,17 +1077,22 @@ impl Drop for AmqpRecoveringHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU32;
 
     #[test]
     fn backoff_doubles_and_caps() {
         let p = RecoveryPolicy::exponential_backoff();
-        assert_eq!(p.delay_for_attempt(1), Duration::from_secs(1));
-        assert_eq!(p.delay_for_attempt(2), Duration::from_secs(2));
-        assert_eq!(p.delay_for_attempt(3), Duration::from_secs(4));
-        assert_eq!(p.delay_for_attempt(4), Duration::from_secs(8));
-        assert_eq!(p.delay_for_attempt(5), Duration::from_secs(16));
-        assert_eq!(p.delay_for_attempt(6), Duration::from_secs(30)); // 32s capped to 30s
-        assert_eq!(p.delay_for_attempt(50), Duration::from_secs(30)); // stays capped
+        let mut state = p.start();
+        assert_eq!(state.next_delay(), Some(Duration::from_secs(1)));
+        assert_eq!(state.next_delay(), Some(Duration::from_secs(2)));
+        assert_eq!(state.next_delay(), Some(Duration::from_secs(4)));
+        assert_eq!(state.next_delay(), Some(Duration::from_secs(8)));
+        assert_eq!(state.next_delay(), Some(Duration::from_secs(16)));
+        assert_eq!(state.next_delay(), Some(Duration::from_secs(30))); // 32s capped to 30s
+        for _ in 0..43 {
+            state.next_delay();
+        }
+        assert_eq!(state.next_delay(), Some(Duration::from_secs(30))); // attempt 50, stays capped
     }
 
     #[test]
@@ -1104,18 +1100,36 @@ mod tests {
         let p = RecoveryPolicy::exponential_backoff()
             .with_initial_delay(Duration::from_millis(100))
             .with_max_delay(Duration::from_secs(2));
-        assert_eq!(p.delay_for_attempt(1), Duration::from_millis(100));
-        assert_eq!(p.delay_for_attempt(2), Duration::from_millis(200));
-        assert_eq!(p.delay_for_attempt(5), Duration::from_millis(1600)); // not yet capped
-        assert_eq!(p.delay_for_attempt(6), Duration::from_secs(2)); // 3.2s capped to 2s
+        let mut state = p.start();
+        assert_eq!(state.next_delay(), Some(Duration::from_millis(100)));
+        assert_eq!(state.next_delay(), Some(Duration::from_millis(200)));
+        state.next_delay(); // attempt 3
+        state.next_delay(); // attempt 4
+        assert_eq!(state.next_delay(), Some(Duration::from_millis(1600))); // attempt 5, not yet capped
+        assert_eq!(state.next_delay(), Some(Duration::from_secs(2))); // attempt 6: 3.2s capped to 2s
     }
 
     #[test]
     fn max_attempts_builder() {
-        let p = RecoveryPolicy::exponential_backoff().with_max_attempts(5);
-        assert_eq!(p.max_attempts, Some(5));
+        let p = RecoveryPolicy::exponential_backoff()
+            .with_initial_delay(Duration::from_millis(1))
+            .with_max_attempts(2);
+        let mut state = p.start();
+        assert!(state.next_delay().is_some(), "attempt 1 should be allowed");
+        assert!(state.next_delay().is_some(), "attempt 2 should be allowed");
+        assert!(
+            state.next_delay().is_none(),
+            "should give up after max_attempts(2)"
+        );
+
         let p = p.unlimited_attempts();
-        assert_eq!(p.max_attempts, None);
+        let mut state = p.start();
+        for n in 1..=10 {
+            assert!(
+                state.next_delay().is_some(),
+                "unlimited_attempts should allow attempt {n}"
+            );
+        }
     }
 
     fn ft() -> FieldTable {
@@ -1393,7 +1407,7 @@ mod tests {
             user_driver: Arc::new(Mutex::new(None)),
             topology: Arc::new(Mutex::new(Topology::default())),
             ever_connected: Arc::new(AtomicBool::new(false)),
-            attempt: Arc::new(AtomicU32::new(0)),
+            retry_state: Arc::new(Mutex::new(RecoveryPolicy::exponential_backoff().start())),
             last_error: Arc::new(Mutex::new(None)),
             closing: Arc::new(AtomicBool::new(false)),
             backoff_cancel: Arc::new(Mutex::new(None)),
