@@ -251,6 +251,12 @@ pub fn encode_socks4_request(command: SocksCommand, address: &SocksAddress, port
 pub struct Socks4ReplyMessage {
     /// Whether the request was granted (`CD = 0x5a`).
     pub granted: bool,
+    /// `BND.ADDR` — meaningless for a CONNECT reply, but a BIND client
+    /// needs it from both of its replies (the listening address, then the
+    /// connected peer's address).
+    pub address: Ipv4Addr,
+    /// `BND.PORT`.
+    pub port: u16,
 }
 
 /// Parse a SOCKS4/4a reply. `VN` (conventionally `0x00`) is not
@@ -260,7 +266,10 @@ pub fn parse_socks4_reply(data: &[u8]) -> ParseResult<Socks4ReplyMessage> {
     if data.len() < 8 {
         return ParseResult::Incomplete;
     }
-    ParseResult::Complete(Socks4ReplyMessage { granted: data[1] == 0x5a }, 8)
+    let granted = data[1] == 0x5a;
+    let port = u16::from_be_bytes([data[2], data[3]]);
+    let address = Ipv4Addr::new(data[4], data[5], data[6], data[7]);
+    ParseResult::Complete(Socks4ReplyMessage { granted, address, port }, 8)
 }
 
 /// A parsed SOCKS5 method-selection greeting (`VER,NMETHODS,METHODS[]`).
@@ -974,11 +983,33 @@ mod tests {
     fn client_parses_socks4_reply_granted_and_rejected() {
         let mut granted = vec![0x00, 0x5a];
         granted.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-        assert_complete(parse_socks4_reply(&granted), Socks4ReplyMessage { granted: true }, 8);
+        assert_complete(
+            parse_socks4_reply(&granted),
+            Socks4ReplyMessage { granted: true, address: Ipv4Addr::UNSPECIFIED, port: 0 },
+            8,
+        );
 
         let mut rejected = vec![0x00, 0x5b];
         rejected.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
-        assert_complete(parse_socks4_reply(&rejected), Socks4ReplyMessage { granted: false }, 8);
+        assert_complete(
+            parse_socks4_reply(&rejected),
+            Socks4ReplyMessage { granted: false, address: Ipv4Addr::UNSPECIFIED, port: 0 },
+            8,
+        );
+    }
+
+    #[test]
+    fn client_parses_socks4_reply_bound_address_and_port() {
+        let mut data = vec![0x00, 0x5a];
+        data.extend_from_slice(&4000u16.to_be_bytes());
+        data.extend_from_slice(&[10, 0, 0, 5]);
+        match parse_socks4_reply(&data) {
+            ParseResult::Complete(reply, _) => {
+                assert_eq!(reply.address, Ipv4Addr::new(10, 0, 0, 5));
+                assert_eq!(reply.port, 4000);
+            }
+            _ => panic!("expected Complete"),
+        }
     }
 
     #[test]

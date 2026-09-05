@@ -6,5 +6,5 @@ SOCKS proxy for Hopf: SOCKS4, SOCKS4a, and SOCKS5 (RFC 1928), built on
 
 Currently implemented: version detection, SOCKS5 method negotiation with
 RFC 1929 username/password authentication, and the CONNECT, BIND, and UDP
-ASSOCIATE commands, server-side, plus a CONNECT client. BIND and UDP
-ASSOCIATE client support are tracked separately.
+ASSOCIATE commands, server-side, plus CONNECT and BIND clients. UDP
+ASSOCIATE client support is tracked separately.
