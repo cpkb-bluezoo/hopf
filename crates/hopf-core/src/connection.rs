@@ -21,6 +21,7 @@ use crate::handle::ConnHandle;
 use crate::handler::ProtocolHandler;
 use crate::listener::DEFAULT_BUFFER_SIZE;
 use crate::peer_addr::PeerAddr;
+use crate::proxy_protocol::{self, ProxyHeaderOutcome};
 use crate::security::SecurityInfo;
 use crate::telemetry::TelemetryHook;
 use crate::tls::{SharedTlsAcceptor, TlsSession};
@@ -154,6 +155,11 @@ pub(crate) struct TcpConnection {
     write_ready: Option<WriteReadyCallback>,
     local: PeerAddr,
     remote: PeerAddr,
+    /// Set from `TcpConnParams::expect_proxy_protocol` at construction;
+    /// cleared once a PROXY protocol header has been parsed off the front
+    /// of `net_in` and `remote` rewritten from it. While true, no bytes in
+    /// `net_in` are handed to TLS or the protocol handler.
+    proxy_protocol_pending: bool,
     security: SecurityInfo,
     security_notified: bool,
     tls: Option<Box<dyn TlsSession>>,
@@ -240,6 +246,7 @@ impl TcpConnection {
             write_ready: None,
             local,
             remote,
+            proxy_protocol_pending: params.expect_proxy_protocol,
             security: SecurityInfo::plaintext(),
             security_notified: false,
             tls,
@@ -410,6 +417,20 @@ impl TcpConnection {
     }
 
     pub fn process_inbound(&mut self) {
+        if self.proxy_protocol_pending {
+            if let Err(e) = self.process_proxy_protocol() {
+                self.call_error(&e);
+                self.force_close();
+                self.interest_dirty = true;
+                return;
+            }
+            if self.proxy_protocol_pending {
+                // Header not fully buffered yet — wait for more bytes
+                // before treating anything in `net_in` as TLS/plaintext.
+                self.interest_dirty = true;
+                return;
+            }
+        }
         if self.tls.is_some() {
             if let Err(e) = self.process_tls_inbound() {
                 self.call_error(&e);
@@ -427,6 +448,26 @@ impl TcpConnection {
             }
         }
         self.interest_dirty = true;
+    }
+
+    /// Try to consume a PROXY protocol header off the front of `net_in`.
+    /// Leaves `proxy_protocol_pending` set (and `net_in` untouched) if the
+    /// header hasn't fully arrived yet; clears it and rewrites `remote`
+    /// once one has. Runs strictly before any TLS/plaintext processing, so
+    /// this must never look at or consume bytes belonging to the
+    /// connection's real traffic.
+    fn process_proxy_protocol(&mut self) -> io::Result<()> {
+        match proxy_protocol::try_parse_proxy_header(&self.net_in)? {
+            ProxyHeaderOutcome::Incomplete => Ok(()),
+            ProxyHeaderOutcome::Parsed { consumed, peer } => {
+                self.net_in.drain(..consumed);
+                if let Some(peer) = peer {
+                    self.remote = peer;
+                }
+                self.proxy_protocol_pending = false;
+                Ok(())
+            }
+        }
     }
 
     fn process_tls_inbound(&mut self) -> io::Result<()> {

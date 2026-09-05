@@ -38,6 +38,11 @@ pub struct TcpConnParams {
     pub server_name: Option<String>,
     /// Expected peer address (used while dial connect is in progress).
     pub remote_hint: PeerAddr,
+    /// When true, the connection is expected to begin with a PROXY
+    /// protocol v1/v2 header (issue #342) — only meaningful on the accept
+    /// side; a dialed connection never has one. See
+    /// [`crate::listener::TcpListenerConfig::with_proxy_protocol`].
+    pub expect_proxy_protocol: bool,
 }
 
 impl TcpConnParams {
@@ -54,6 +59,7 @@ impl TcpConnParams {
             tls_connector: None,
             server_name: None,
             remote_hint,
+            expect_proxy_protocol: false,
         }
     }
 }
@@ -152,6 +158,7 @@ impl TcpConnectorConfig {
             tls_connector: self.tls.clone(),
             server_name: self.server_name.clone(),
             remote_hint: self.addr.into(),
+            expect_proxy_protocol: false,
         }
     }
 
@@ -257,6 +264,7 @@ impl UnixConnectorConfig {
             tls_connector: self.tls.clone(),
             server_name: self.server_name.clone(),
             remote_hint: PeerAddr::Unix(Some(self.path.clone())),
+            expect_proxy_protocol: false,
         }
     }
 

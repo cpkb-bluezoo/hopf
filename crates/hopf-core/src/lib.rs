@@ -38,6 +38,7 @@ pub mod udp;
 mod accept;
 mod cmd;
 mod connection;
+mod proxy_protocol;
 mod reactor;
 mod timer;
 
@@ -125,6 +126,26 @@ mod tests {
         fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
             self.got.lock().unwrap().extend_from_slice(data);
             *data = &[];
+        }
+
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+    }
+
+    /// On any receive, sends back `endpoint.remote_addr()` as text instead
+    /// of echoing the received bytes — lets a test observe what address
+    /// the connection resolved to *after* any PROXY protocol header has
+    /// been parsed off the front of the stream.
+    struct RemoteAddrOnReceive;
+
+    impl ProtocolHandler for RemoteAddrOnReceive {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+            let addr = endpoint.remote_addr().unwrap().to_string();
+            endpoint.send(addr.as_bytes());
         }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
@@ -427,6 +448,112 @@ mod tests {
 
         rt.shutdown();
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression test for issue #342: a listener with
+    /// `with_proxy_protocol()` enabled must recover the client address
+    /// from a real PROXY protocol v1 header sent as the first bytes on the
+    /// wire — not just parse the header type-level, but actually rewrite
+    /// what `Endpoint::remote_addr()` reports for the rest of the
+    /// connection's life.
+    #[test]
+    fn tcp_listener_proxy_protocol_v1_rewrites_remote_addr() {
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(RemoteAddrOnReceive) as Box<dyn ProtocolHandler>
+                })
+                .with_proxy_protocol(),
+            )
+            .unwrap();
+
+        let mut c = wait_connect(addr);
+        c.write_all(b"PROXY TCP4 203.0.113.7 198.51.100.1 56324 443\r\n")
+            .unwrap();
+        c.write_all(b"ping").unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = c.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"203.0.113.7:56324");
+
+        rt.shutdown();
+    }
+
+    /// Regression test for issue #342: same as the v1 test above, but for
+    /// the binary v2 wire format.
+    #[test]
+    fn tcp_listener_proxy_protocol_v2_rewrites_remote_addr() {
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(RemoteAddrOnReceive) as Box<dyn ProtocolHandler>
+                })
+                .with_proxy_protocol(),
+            )
+            .unwrap();
+
+        let mut header: Vec<u8> = vec![
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // sig
+            0x21, // version 2, command PROXY
+            0x11, // AF_INET, STREAM
+        ];
+        header.extend_from_slice(&12u16.to_be_bytes());
+        header.extend_from_slice(&[203, 0, 113, 9]); // src ip
+        header.extend_from_slice(&[198, 51, 100, 1]); // dst ip
+        header.extend_from_slice(&56325u16.to_be_bytes()); // src port
+        header.extend_from_slice(&443u16.to_be_bytes()); // dst port
+
+        let mut c = wait_connect(addr);
+        c.write_all(&header).unwrap();
+        c.write_all(b"ping").unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = c.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"203.0.113.9:56325");
+
+        rt.shutdown();
+    }
+
+    /// Regression test for issue #342: a listener with
+    /// `with_proxy_protocol()` enabled must close a connection whose first
+    /// bytes are not a valid PROXY protocol header, rather than treating
+    /// them as the start of application data — this listener is only
+    /// meant to be reached via a relay that always sends one, so a missing
+    /// header is a misconfiguration to fail on, not fall back from.
+    #[test]
+    fn tcp_listener_proxy_protocol_rejects_connection_without_header() {
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(RemoteAddrOnReceive) as Box<dyn ProtocolHandler>
+                })
+                .with_proxy_protocol(),
+            )
+            .unwrap();
+
+        let mut c = wait_connect(addr);
+        c.write_all(b"not a proxy protocol header\r\n").unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = c.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 0, "connection should have been closed, not echoed to");
+
+        rt.shutdown();
     }
 
     #[test]
