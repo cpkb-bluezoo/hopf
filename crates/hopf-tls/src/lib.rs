@@ -12,11 +12,15 @@ use std::io::{self, BufReader, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
 
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::{ResolvesServerCert, ResolvesServerCertUsingSni, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
-use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, ServerConfig,
+    ServerConnection, SignatureScheme,
+};
 use hopf_core::{
     SecurityInfo, SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector, TlsProgress,
     TlsSession,
@@ -220,6 +224,86 @@ pub fn client_config_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<Arc<
 /// Build a [`SharedTlsConnector`] from an existing [`ClientConfig`].
 pub fn connector(config: Arc<ClientConfig>) -> SharedTlsConnector {
     Arc::new(RustlsConnector { config })
+}
+
+/// Accepts any certificate, performing no validation at all — for
+/// opportunistic TLS, where the point is encrypting the connection, not
+/// authenticating the peer. Opportunistic MTA-to-MTA STARTTLS (RFC
+/// 3207/7672) is the motivating case: requiring a valid, trusted
+/// certificate would break delivery to most real-world mail servers,
+/// whose certificates are routinely self-signed, expired, or issued for
+/// the wrong name — none of which should turn off encryption entirely.
+///
+/// Never use this where the peer's identity actually matters.
+/// [`insecure_connector`] is specifically for the "no better option, but
+/// encryption is still better than plaintext" case — DANE
+/// (`hopf_dns::dane::DaneServerCertVerifier`) or a real trust store is
+/// what authenticates the peer when that's actually possible/required.
+#[derive(Debug)]
+struct AcceptAnyServerCert {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Build a [`SharedTlsConnector`] that accepts any certificate, performing
+/// no validation at all — for opportunistic TLS, where the point is
+/// encrypting the connection, not authenticating the peer (see this
+/// module's internal `AcceptAnyServerCert` verifier). `alpn` entries are
+/// protocol names such as `b"smtp"`; pass an empty slice if none apply.
+pub fn insecure_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
+    let provider = tls_crypto_provider();
+    let mut config = ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("the crate's fixed protocol version list is always valid")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert { provider }))
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    connector(Arc::new(config))
 }
 
 /// Convenience: PEM trust roots → shared connector.
@@ -577,7 +661,7 @@ mod tests {
     use rcgen::{CertifiedKey, generate_simple_self_signed};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
     use hopf_core::{
-        Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig,
+        Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpConnectorConfig, TcpListenerConfig,
     };
 
     fn write_temp_pem() -> (std::path::PathBuf, std::path::PathBuf, CertifiedKey) {
@@ -1092,6 +1176,82 @@ mod tests {
 
         wait_for(&infos, 1);
         assert_eq!(infos.lock().unwrap()[0].peer_certificate_fingerprint(), None);
+
+        rt.shutdown();
+    }
+
+    struct NoopServer;
+    impl ProtocolHandler for NoopServer {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+    }
+
+    struct EstablishedProbe {
+        established: Arc<Mutex<bool>>,
+    }
+    impl ProtocolHandler for EstablishedProbe {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn security_established(&mut self, _endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+            *self.established.lock().unwrap() = true;
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+    }
+
+    /// Regression test for issue #353's opportunistic-TLS foundation:
+    /// [`insecure_connector`] must complete a real handshake against a
+    /// certificate that matches neither the claimed server name nor any
+    /// trusted root — proving it genuinely performs no validation, which
+    /// is the whole point of an "encrypt without authenticating" connector.
+    #[test]
+    fn insecure_connector_completes_handshake_despite_hostname_and_trust_mismatch() {
+        let (cert_path, key_path, _certified) = write_temp_pem(); // cert is for "localhost"
+        let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(NoopServer) as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let established = Arc::new(Mutex::new(false));
+        let established2 = Arc::clone(&established);
+        let connector = insecure_connector(&[]);
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EstablishedProbe {
+                    established: Arc::clone(&established2),
+                }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "totally-different-name.example"),
+        )
+        .unwrap();
+
+        for _ in 0..100 {
+            if *established.lock().unwrap() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            *established.lock().unwrap(),
+            "handshake should succeed despite the hostname/trust mismatch"
+        );
 
         rt.shutdown();
     }

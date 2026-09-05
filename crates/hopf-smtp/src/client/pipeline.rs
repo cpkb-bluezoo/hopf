@@ -104,6 +104,12 @@ struct SmtpSendState {
     bdat_lookahead: Option<Vec<u8>>,
     /// Require STARTTLS before sending (skip delivery if unavailable).
     require_starttls: bool,
+    /// Upgrade via STARTTLS if the server advertises it, but proceed in
+    /// plaintext rather than failing if it doesn't (issue #353) — RFC
+    /// 3207/7672's "opportunistic" mode. Ignored when
+    /// [`require_starttls`](Self::require_starttls) is also set; that
+    /// takes precedence.
+    opportunistic_starttls: bool,
     /// AUTH credentials (username/password, driven via the strongest
     /// mechanism the server advertises — see [`SmtpSendDriver::choose_mechanism`]).
     auth: Option<(String, String)>,
@@ -164,6 +170,7 @@ impl SmtpSend {
             message_prefix: None,
             bdat_lookahead: None,
             require_starttls: false,
+            opportunistic_starttls: false,
             auth: None,
             sasl_client: None,
             rcpt_idx: 0,
@@ -282,6 +289,16 @@ impl SmtpSend {
     /// Require STARTTLS; abort delivery if the server does not support it.
     pub fn require_starttls(self, require: bool) -> Self {
         self.0.lock().unwrap().require_starttls = require;
+        self
+    }
+
+    /// Upgrade via STARTTLS if the server advertises it, but proceed in
+    /// plaintext (rather than aborting) if it doesn't — RFC 3207/7672's
+    /// "opportunistic" TLS. Meaningless combined with
+    /// [`Self::require_starttls(true)`](Self::require_starttls), which
+    /// already upgrades unconditionally when offered and aborts otherwise.
+    pub fn opportunistic_starttls(self, enable: bool) -> Self {
+        self.0.lock().unwrap().opportunistic_starttls = enable;
         self
     }
 
@@ -547,16 +564,25 @@ impl SmtpClientDriver for SmtpSendDriver {
         let mut st = self.state.lock().unwrap();
 
         // STARTTLS path (skip if the session is already secure — post-TLS EHLO).
-        if st.require_starttls && !ep.is_secure() {
-            if caps.starttls {
+        if !ep.is_secure() {
+            if st.require_starttls {
+                if caps.starttls {
+                    drop(st);
+                    session.starttls();
+                    return;
+                } else {
+                    drop(st);
+                    // STARTTLS required but not advertised.
+                    self.complete(false);
+                    session.quit();
+                    return;
+                }
+            } else if st.opportunistic_starttls && caps.starttls {
+                // Upgrade because it's offered, but this isn't a hard
+                // requirement — a server that didn't advertise it falls
+                // through to the plaintext path below unremarked.
                 drop(st);
                 session.starttls();
-                return;
-            } else {
-                drop(st);
-                // STARTTLS required but not advertised.
-                self.complete(false);
-                session.quit();
                 return;
             }
         }

@@ -5,6 +5,7 @@
 //! **Security warning:** accepts mail from any sender to any recipient and
 //! forwards it. Intended for development, testing, and closed networks only.
 
+mod dane;
 mod handler;
 mod service;
 

@@ -23,6 +23,8 @@ use crate::server::handler::{
 use crate::server::pipeline::SmtpPipeline;
 use crate::server::spool::{SpoolPipeline, SpoolPipelineHandle};
 
+use super::dane;
+
 /// Factory for [`SimpleRelayHandler`].
 pub struct SimpleRelayHandlerFactory {
     dns: Arc<DnsResolver>,
@@ -555,6 +557,7 @@ fn remove_spool_file_async(runtime: &Runtime, handle: ConnHandle, path: PathBuf)
     );
 }
 
+#[derive(Clone)]
 struct DeliveryContext {
     tracker: Arc<Mutex<DeliveryTracker>>,
     domains: Vec<String>,
@@ -594,40 +597,51 @@ impl DeliveryContext {
                     let mut mx: Vec<(u16, String)> =
                         msg.answers.iter().filter_map(|rr| rr.as_mx()).collect();
                     mx.sort_by_key(|(pref, _)| *pref);
-                    let host = mx
-                        .first()
+                    let mut hosts: Vec<String> = mx
+                        .into_iter()
                         .map(|(_, ex)| ex.trim_end_matches('.').to_string())
-                        .unwrap_or(domain_fallback);
-                    self.deliver_to_host(domain, host, recipients);
+                        .collect();
+                    if hosts.is_empty() {
+                        // RFC 5321 §5.1: no MX records at all — try the
+                        // domain name itself as an implicit MX.
+                        hosts.push(domain_fallback);
+                    }
+                    self.deliver_to_mx(domain, hosts, 0, recipients);
                 }
                 Err(_) => {
-                    self.fail_current(&domain);
+                    self.fail_domain(&domain);
                 }
             }),
         );
     }
 
-    fn fail_current(mut self, domain: &str) {
+    fn fail_domain(mut self, domain: &str) {
         self.tracker.lock().unwrap().record(domain, false);
         self.current += 1;
         self.deliver_next();
     }
 
-    fn deliver_to_host(
+    /// Try MX host `mx_hosts[mx_index]` for `domain`. On a connection-level
+    /// failure (couldn't resolve/connect/negotiate TLS — see
+    /// [`Self::resolve_tls_and_deliver`]'s dispatch), advances to
+    /// `mx_index + 1` (RFC 5321 §5.1's "try the remaining MXs in order",
+    /// and RFC 7672's DANE fallback semantics) rather than failing the
+    /// whole domain on the first host's trouble. Once every MX host has
+    /// been tried, [`Self::fail_domain`] runs.
+    fn deliver_to_mx(
         self,
         domain: String,
-        host: String,
+        mx_hosts: Vec<String>,
+        mx_index: usize,
         recipients: Vec<(EmailAddress, DsnRecipientParams)>,
     ) {
-        let port = self.outbound_port;
-        let dns = Arc::clone(&self.dns);
-
-        if self.require_tls && self.tls_connector.is_none() {
-            self.fail_current(&domain);
+        if mx_index >= mx_hosts.len() {
+            self.fail_domain(&domain);
             return;
         }
-
-        let tls_connector = self.tls_connector.clone();
+        let host = mx_hosts[mx_index].clone();
+        let port = self.outbound_port;
+        let dns = Arc::clone(&self.dns);
         let host_query = host.clone();
         dns.resolve(
             &host_query,
@@ -635,27 +649,106 @@ impl DeliveryContext {
             Box::new(move |result| match result {
                 Ok(addrs) if !addrs.is_empty() => {
                     let addr = addrs[0];
-                    self.deliver_smtp(domain, host, addr, recipients, tls_connector);
+                    self.resolve_tls_and_deliver(domain, mx_hosts, mx_index, host, addr, recipients);
                 }
                 _ => {
-                    self.fail_current(&domain);
+                    self.deliver_to_mx(domain, mx_hosts, mx_index + 1, recipients);
                 }
             }),
         );
     }
 
-    fn deliver_smtp(
-        mut self,
+    /// Decides what TLS policy applies to this hop, then dials.
+    ///
+    /// A message-level `REQUIRETLS` (RFC 8689) hop keeps today's behavior
+    /// exactly: the admin-configured, already-trusted
+    /// [`Self::tls_connector`], mandatory STARTTLS, no DANE lookup — this
+    /// is a different, separately-authenticated requirement, not
+    /// DANE-related. Otherwise, DANE applies if usable (issue #352/#353):
+    /// look up TLSA for `_<port>._tcp.<host>`, and if DNSSEC-Secure
+    /// records exist, require STARTTLS and authenticate against them; if
+    /// not usable, fall back to ordinary opportunistic STARTTLS (upgrade
+    /// if offered, plaintext otherwise — never a hard requirement, and
+    /// never authenticated, since there's nothing trustworthy to check
+    /// the certificate against).
+    fn resolve_tls_and_deliver(
+        self,
         domain: String,
+        mx_hosts: Vec<String>,
+        mx_index: usize,
         host: String,
         addr: std::net::SocketAddr,
         recipients: Vec<(EmailAddress, DsnRecipientParams)>,
-        tls_connector: Option<SharedTlsConnector>,
+    ) {
+        if self.require_tls {
+            if self.tls_connector.is_none() {
+                self.fail_domain(&domain);
+                return;
+            }
+            let connector = self.tls_connector.clone();
+            self.deliver_smtp(
+                domain, mx_hosts, mx_index, host, addr, recipients, connector, true, false,
+            );
+            return;
+        }
+
+        let port = self.outbound_port;
+        let dns = Arc::clone(&self.dns);
+        let host_for_dane = host.clone();
+        dane::lookup_dane_usability(
+            &dns,
+            &host_for_dane,
+            port,
+            Box::new(move |usability| {
+                let (connector, mandatory, opportunistic) = match usability {
+                    dane::DaneUsability::Usable(records) => {
+                        (Some(build_dane_connector(records)), true, false)
+                    }
+                    dane::DaneUsability::NotUsable => {
+                        (Some(hopf_tls::insecure_connector(&[])), false, true)
+                    }
+                };
+                self.deliver_smtp(
+                    domain,
+                    mx_hosts,
+                    mx_index,
+                    host,
+                    addr,
+                    recipients,
+                    connector,
+                    mandatory,
+                    opportunistic,
+                );
+            }),
+        );
+    }
+
+    /// Dials `addr` and attempts delivery. `mandatory_tls`/`opportunistic_tls`
+    /// map to [`SmtpSend::require_starttls`]/[`SmtpSend::opportunistic_starttls`]
+    /// respectively (mutually exclusive by construction from
+    /// [`Self::resolve_tls_and_deliver`]'s two call sites).
+    ///
+    /// The outcome decides how to continue (issue #353): a real SMTP-level
+    /// reply — delivered or rejected — is authoritative for this domain
+    /// (any working MX host should give the same verdict for a given
+    /// recipient, so trying another one would just repeat it), and moves
+    /// on to the next domain. A connection/TLS/DANE-level failure (no real
+    /// reply obtained at all) tries the next MX host instead.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_smtp(
+        self,
+        domain: String,
+        mx_hosts: Vec<String>,
+        mx_index: usize,
+        host: String,
+        addr: std::net::SocketAddr,
+        recipients: Vec<(EmailAddress, DsnRecipientParams)>,
+        connector: Option<SharedTlsConnector>,
+        mandatory_tls: bool,
+        opportunistic_tls: bool,
     ) {
         let hostname = self.hostname.clone();
         let sender = self.sender.as_ref().map(|s| s.address());
-        let tracker = Arc::clone(&self.tracker);
-        let domain_for_cb = domain.clone();
 
         let timeouts = SmtpClientTimeouts {
             stage: self.smtp_timeout,
@@ -663,12 +756,12 @@ impl DeliveryContext {
             ..Default::default()
         };
 
-        let mut send = SmtpSend::new(hostname).on_complete(Box::new(move |ok| {
-            tracker.lock().unwrap().record(&domain_for_cb, ok);
-        }));
+        let mut send = SmtpSend::new(hostname);
         send = send.mail_from_params(self.mail_params.clone());
-        if self.require_tls {
+        if mandatory_tls {
             send = send.require_starttls(true);
+        } else if opportunistic_tls {
+            send = send.opportunistic_starttls(true);
         }
         send = match &self.spool_path {
             Some(path) if self.extra_header_lines.is_empty() => send.message_file(path.clone()),
@@ -693,25 +786,66 @@ impl DeliveryContext {
             send = send.rcpt_to_with(addr.address(), params.clone());
         }
 
-        let mut client = SmtpClient::from_addr(addr);
-        if self.require_tls {
-            if let Some(connector) = tls_connector {
-                client = client.starttls(connector, host);
+        let domain_for_result = domain.clone();
+        let mx_hosts_for_result = mx_hosts.clone();
+        let recipients_for_result = recipients.clone();
+        let context_for_result = self.clone();
+        send = send.on_result(Box::new(move |outcome| {
+            let mut this = context_for_result;
+            match outcome {
+                crate::SmtpSendOutcome::Delivered => {
+                    this.tracker.lock().unwrap().record(&domain_for_result, true);
+                    this.current += 1;
+                    this.deliver_next();
+                }
+                crate::SmtpSendOutcome::Rejected { .. } => {
+                    this.tracker.lock().unwrap().record(&domain_for_result, false);
+                    this.current += 1;
+                    this.deliver_next();
+                }
+                crate::SmtpSendOutcome::Failed(_) => {
+                    this.deliver_to_mx(
+                        domain_for_result,
+                        mx_hosts_for_result,
+                        mx_index + 1,
+                        recipients_for_result,
+                    );
+                }
             }
+        }));
+
+        let mut client = SmtpClient::from_addr(addr);
+        if let Some(connector) = connector {
+            client = client.starttls(connector, host);
         }
 
-        let result = client
-            .timeouts(timeouts)
-            .connect(&self.runtime, Arc::new(send));
-
+        let result = client.timeouts(timeouts).connect(&self.runtime, Arc::new(send));
         if result.is_err() {
-            self.fail_current(&domain);
-            return;
+            // Synchronous dial-setup failure — the `on_result` closure
+            // above never fires for a `send` that was never actually
+            // wired to a connection, so drive the same "try the next MX
+            // host" fallback directly.
+            self.deliver_to_mx(domain, mx_hosts, mx_index + 1, recipients);
         }
-
-        self.current += 1;
-        self.deliver_next();
     }
+}
+
+/// Build a [`SharedTlsConnector`] that authenticates the peer against
+/// `records` via [`hopf_dns::dane::DaneServerCertVerifier`] (issue #352) —
+/// used for a DANE-authenticated hop's mandatory STARTTLS.
+fn build_dane_connector(records: Vec<hopf_dns::TlsaRecord>) -> SharedTlsConnector {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let verifier = Arc::new(hopf_dns::dane::DaneServerCertVerifier::with_provider(
+        records,
+        Arc::clone(&provider),
+    ));
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("the crate's fixed protocol version list is always valid")
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    hopf_tls::connector(Arc::new(config))
 }
 
 /// Builds and sends a failure DSN for a message that never reaches the

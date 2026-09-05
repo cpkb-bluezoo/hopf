@@ -23,11 +23,12 @@ hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
 hopf-tls = { workspace = true }
 hopf-otel = { workspace = true }
-hopf-dns = { workspace = true }
+hopf-dns = { workspace = true, features = ["dnssec", "dane"] }
 hopf-mailbox = { workspace = true }
 rmimeparser = { workspace = true }
 aws-lc-rs = { workspace = true }
 getrandom = { workspace = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
