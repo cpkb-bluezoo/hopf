@@ -664,22 +664,59 @@ mod tests {
         Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpConnectorConfig, TcpListenerConfig,
     };
 
-    fn write_temp_pem() -> (std::path::PathBuf, std::path::PathBuf, CertifiedKey) {
-        let dir = std::env::temp_dir().join(format!(
-            "hopf-tls-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    // Returns the TempDir guard too — the caller must keep it alive for as
+    // long as it uses the paths, since dropping it deletes the directory.
+    // A per-call unique directory (rather than a pid/timestamp-derived
+    // name, which collided under concurrent calls — issue #372) is what
+    // actually matters here: parallel test threads each get their own
+    // directory, so one test's cert/key pair can never be interleaved
+    // with another's.
+    fn write_temp_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, CertifiedKey) {
+        let dir = tempfile::Builder::new().prefix("hopf-tls-").tempdir().unwrap();
         let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert_path = dir.join("cert.pem");
-        let key_path = dir.join("key.pem");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, cert.cert.pem()).unwrap();
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-        (cert_path, key_path, cert)
+        (dir, cert_path, key_path, cert)
+    }
+
+    /// Regression test for issue #372: `write_temp_pem`'s directory name
+    /// is derived from the process ID plus a nanosecond timestamp, both
+    /// shared across every test in this binary — two threads reading the
+    /// clock closely enough together produce the same directory, and
+    /// `create_dir_all` doesn't error on an already-existing one, so both
+    /// happily write differing cert/key content into the same two files.
+    /// Whichever write order loses leaves a reader with a certificate
+    /// from one generated key pair and a private key from the other — the
+    /// `InconsistentKeys(KeyMismatch)` failures seen under full-workspace
+    /// parallel test runs. This drives many concurrent calls to surface
+    /// that duplicate-path behavior directly, rather than trying to race
+    /// the file writes themselves (which is what actually manifests as a
+    /// test failure, but far less reliably on demand).
+    #[test]
+    fn write_temp_pem_never_produces_the_same_directory_twice() {
+        use std::collections::HashSet;
+        let dirs: Arc<Mutex<Vec<std::path::PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let handles: Vec<_> = (0..256)
+            .map(|_| {
+                let dirs = Arc::clone(&dirs);
+                std::thread::spawn(move || {
+                    let (_dir, cert_path, _key_path, _cert) = write_temp_pem();
+                    dirs.lock().unwrap().push(cert_path.parent().unwrap().to_path_buf());
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let dirs = dirs.lock().unwrap();
+        let unique: HashSet<_> = dirs.iter().collect();
+        assert_eq!(
+            unique.len(),
+            dirs.len(),
+            "write_temp_pem produced the same directory for two concurrent calls"
+        );
     }
 
     struct TlsEcho {
@@ -727,7 +764,7 @@ mod tests {
 
     #[test]
     fn tls_echo_exposes_alpn() {
-        let (cert_path, key_path, certified) = write_temp_pem();
+        let (_dir, cert_path, key_path, certified) = write_temp_pem();
         let acceptor =
             acceptor_from_pem(&cert_path, &key_path, &[b"h2", b"http/1.1"]).unwrap();
 
@@ -816,7 +853,7 @@ mod tests {
 
     #[test]
     fn start_tls_upgrades_connection() {
-        let (cert_path, key_path, certified) = write_temp_pem();
+        let (_dir, cert_path, key_path, certified) = write_temp_pem();
         let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
         let upgraded = Arc::new(Mutex::new(false));
         let upgraded_f = Arc::clone(&upgraded);
@@ -859,22 +896,24 @@ mod tests {
         rt.shutdown();
     }
 
-    fn write_temp_pem_named(label: &str, hostname: &str) -> (std::path::PathBuf, std::path::PathBuf, CertifiedKey) {
-        let dir = std::env::temp_dir().join(format!(
-            "hopf-tls-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    // See `write_temp_pem`'s doc comment (issue #372) — same reasoning,
+    // just with a caller-supplied label folded into the prefix purely for
+    // readability of the temp path, not for uniqueness (the random
+    // suffix `tempdir()` appends is what actually guarantees that).
+    fn write_temp_pem_named(
+        label: &str,
+        hostname: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, CertifiedKey) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("hopf-tls-{label}-"))
+            .tempdir()
+            .unwrap();
         let cert = generate_simple_self_signed(vec![hostname.to_string()]).unwrap();
-        let cert_path = dir.join("cert.pem");
-        let key_path = dir.join("key.pem");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
         std::fs::write(&cert_path, cert.cert.pem()).unwrap();
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-        (cert_path, key_path, cert)
+        (dir, cert_path, key_path, cert)
     }
 
     /// Collects every [`SecurityInfo`] seen, in handshake-completion order.
@@ -921,8 +960,8 @@ mod tests {
 
     #[test]
     fn sni_resolver_dispatches_cert_by_hostname() {
-        let (alpha_cert, alpha_key, alpha_certified) = write_temp_pem_named("alpha", "alpha.test");
-        let (beta_cert, beta_key, beta_certified) = write_temp_pem_named("beta", "beta.test");
+        let (_alpha_dir, alpha_cert, alpha_key, alpha_certified) = write_temp_pem_named("alpha", "alpha.test");
+        let (_beta_dir, beta_cert, beta_key, beta_certified) = write_temp_pem_named("beta", "beta.test");
         let acceptor = acceptor_with_sni_certs(
             &[
                 ("alpha.test", &alpha_cert, &alpha_key),
@@ -1024,8 +1063,9 @@ mod tests {
 
     #[test]
     fn required_client_auth_rejects_client_without_cert() {
-        let (server_cert, server_key, server_certified) = write_temp_pem_named("mtls-req-srv", "localhost");
-        let (client_cert, _client_key, _client_certified) =
+        let (_server_dir, server_cert, server_key, server_certified) =
+            write_temp_pem_named("mtls-req-srv", "localhost");
+        let (_client_dir, client_cert, _client_key, _client_certified) =
             write_temp_pem_named("mtls-req-cli", "client1");
         let acceptor =
             acceptor_with_client_auth(&server_cert, &server_key, &client_cert, true, &[]).unwrap();
@@ -1074,8 +1114,9 @@ mod tests {
 
     #[test]
     fn required_client_auth_accepts_valid_cert_and_reports_fingerprint() {
-        let (server_cert, server_key, server_certified) = write_temp_pem_named("mtls-ok-srv", "localhost");
-        let (client_cert, client_key, client_certified) =
+        let (_server_dir, server_cert, server_key, server_certified) =
+            write_temp_pem_named("mtls-ok-srv", "localhost");
+        let (_client_dir, client_cert, client_key, client_certified) =
             write_temp_pem_named("mtls-ok-cli", "client1");
         let acceptor =
             acceptor_with_client_auth(&server_cert, &server_key, &client_cert, true, &[]).unwrap();
@@ -1134,8 +1175,9 @@ mod tests {
 
     #[test]
     fn optional_client_auth_accepts_client_without_cert() {
-        let (server_cert, server_key, server_certified) = write_temp_pem_named("mtls-opt-srv", "localhost");
-        let (client_cert, _client_key, _client_certified) =
+        let (_server_dir, server_cert, server_key, server_certified) =
+            write_temp_pem_named("mtls-opt-srv", "localhost");
+        let (_client_dir, client_cert, _client_key, _client_certified) =
             write_temp_pem_named("mtls-opt-cli", "client1");
         let acceptor =
             acceptor_with_client_auth(&server_cert, &server_key, &client_cert, false, &[]).unwrap();
@@ -1212,7 +1254,7 @@ mod tests {
     /// is the whole point of an "encrypt without authenticating" connector.
     #[test]
     fn insecure_connector_completes_handshake_despite_hostname_and_trust_mismatch() {
-        let (cert_path, key_path, _certified) = write_temp_pem(); // cert is for "localhost"
+        let (_dir, cert_path, key_path, _certified) = write_temp_pem(); // cert is for "localhost"
         let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
 
         let rt = Runtime::start(RuntimeConfig {
