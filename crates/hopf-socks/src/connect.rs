@@ -1,11 +1,11 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
 //! CONNECT command: target resolution, destination authorization, dial,
-//! and the bidirectional relay once the upstream connection is up.
+//! and handing off to the shared relay ([`crate::relay`]) once the
+//! upstream connection is up.
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +14,7 @@ use hopf_dns::DnsResolver;
 
 use crate::metrics::SocksServerMetrics;
 use crate::policy::SocksPolicy;
+use crate::relay::RelayActivity;
 use crate::wire::Socks5Reply;
 
 /// How long a CONNECT relay may sit with no traffic in either direction
@@ -30,18 +31,12 @@ pub(crate) enum ConnectOutcome {
 
 /// State shared between the client-facing connection (driven by its own
 /// reactor) and the dialed upstream connection (which may land on a
-/// different worker reactor) for one CONNECT request's lifetime.
+/// different worker reactor) for one CONNECT request's lifetime — and, once
+/// connected, the relay's own activity tracking (see [`crate::relay`]).
 pub(crate) struct ConnectShared {
     outcome: Mutex<Option<ConnectOutcome>>,
     client: ConnHandle,
-    /// Set by traffic in either direction once the relay is established;
-    /// cleared and checked by the self-rearming idle timer armed in
-    /// [`arm_idle_timer`].
-    activity: AtomicBool,
-    /// Guards the active-relay counter decrement: both the client and
-    /// upstream connections' `disconnected()` may observe the end of the
-    /// same relay, but it must be counted exactly once.
-    released: AtomicBool,
+    pub(crate) activity: Arc<RelayActivity>,
 }
 
 impl ConnectShared {
@@ -49,8 +44,7 @@ impl ConnectShared {
         Arc::new(Self {
             outcome: Mutex::new(None),
             client,
-            activity: AtomicBool::new(false),
-            released: AtomicBool::new(false),
+            activity: RelayActivity::new(),
         })
     }
 
@@ -68,19 +62,6 @@ impl ConnectShared {
     /// awaiting the dial.
     pub(crate) fn take_outcome(&self) -> Option<ConnectOutcome> {
         self.outcome.lock().unwrap().take()
-    }
-
-    fn mark_activity(&self) {
-        self.activity.store(true, Ordering::Release);
-    }
-
-    /// Decrement the active-relay counter exactly once, however many of
-    /// {client disconnect, upstream disconnect, idle timeout} end up
-    /// observing this relay's end.
-    fn release_once(&self, metrics: &SocksServerMetrics) {
-        if !self.released.swap(true, Ordering::AcqRel) {
-            metrics.active_relays.fetch_sub(1, Ordering::Relaxed);
-        }
     }
 }
 
@@ -201,16 +182,12 @@ impl ProtocolHandler for SocksUpstreamHandler {
     }
 
     fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        if !data.is_empty() {
-            self.shared.mark_activity();
-            SocksServerMetrics::add(&self.metrics.bytes_downstream, data.len() as u64);
-            self.client.send(data.to_vec());
-            *data = &[];
-        }
+        crate::relay::forward(&self.shared.activity, &self.client, &self.metrics.bytes_downstream, data);
+        *data = &[];
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
-        self.shared.release_once(&self.metrics);
+        self.shared.activity.release_once(&self.metrics);
         self.client.close();
     }
 
@@ -222,47 +199,4 @@ impl ProtocolHandler for SocksUpstreamHandler {
         }
         endpoint.close();
     }
-}
-
-/// Forward one chunk of client-to-target traffic once the relay is
-/// established. Called from the client-facing handler's `receive()`.
-pub(crate) fn relay_upstream(shared: &ConnectShared, upstream: &ConnHandle, metrics: &SocksServerMetrics, data: &[u8]) {
-    if data.is_empty() {
-        return;
-    }
-    shared.mark_activity();
-    SocksServerMetrics::add(&metrics.bytes_upstream, data.len() as u64);
-    upstream.send(data.to_vec());
-}
-
-/// Arm (or re-arm) the self-rearming relay idle timer: fires after
-/// `timeout`, and either finds activity since the last tick (clears the
-/// flag and reschedules) or finds none (closes both legs and stops).
-pub(crate) fn arm_idle_timer(shared: Arc<ConnectShared>, client: ConnHandle, upstream: ConnHandle, timeout: Duration) {
-    let shared2 = Arc::clone(&shared);
-    let client2 = client.clone();
-    let upstream2 = upstream.clone();
-    // The returned `TimerHandle` is deliberately not retained: there is
-    // nothing to cancel it for (a closed connection makes `close()` here a
-    // harmless no-op, and letting one superseded tick fire is cheaper than
-    // threading a handle through both legs' teardown paths).
-    let _ = client.schedule_timer(
-        timeout,
-        Box::new(move || {
-            if shared2.activity.swap(false, Ordering::AcqRel) {
-                arm_idle_timer(shared2, client2, upstream2, timeout);
-            } else {
-                client2.close();
-                upstream2.close();
-            }
-        }),
-    );
-}
-
-/// Release the active-relay counter for a relay that never got past the
-/// client-facing side alone (e.g. the client disconnected while the dial
-/// was still pending) — exposed so [`crate::handler`] can call it without
-/// reaching into [`ConnectShared`]'s private fields.
-pub(crate) fn release_relay_slot(shared: &ConnectShared, metrics: &SocksServerMetrics) {
-    shared.release_once(metrics);
 }

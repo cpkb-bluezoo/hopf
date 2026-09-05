@@ -17,14 +17,17 @@
 #![warn(missing_docs)]
 
 mod auth;
+mod bind;
 mod connect;
 mod handler;
 mod metrics;
 mod policy;
+mod relay;
 mod service;
 mod wire;
 
 pub use auth::SocksAuthenticator;
+pub use bind::DEFAULT_BIND_ACCEPT_TIMEOUT;
 pub use connect::DEFAULT_RELAY_IDLE_TIMEOUT;
 pub use handler::SocksConnectionHandlerFactory;
 pub use metrics::SocksServerMetrics;

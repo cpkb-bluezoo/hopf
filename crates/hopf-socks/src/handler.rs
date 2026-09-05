@@ -2,7 +2,8 @@
 
 //! The SOCKS4/4a/5 connection state machine: version detection, SOCKS5
 //! method negotiation with RFC 1929 authentication, request parsing, and
-//! dispatch into the CONNECT relay ([`crate::connect`]).
+//! dispatch into the CONNECT ([`crate::connect`]) and BIND
+//! ([`crate::bind`]) commands.
 
 use std::io;
 use std::net::SocketAddr;
@@ -13,14 +14,18 @@ use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime};
 use hopf_dns::DnsResolver;
 
 use crate::auth::SocksAuthenticator;
+use crate::bind::{self, BindOutcome, BindShared, DEFAULT_BIND_ACCEPT_TIMEOUT};
 use crate::connect::{self, ConnectOutcome, ConnectShared, DEFAULT_RELAY_IDLE_TIMEOUT};
 use crate::metrics::SocksServerMetrics;
 use crate::policy::SocksPolicy;
+use crate::relay::RelayActivity;
 use crate::wire::{self, ParseResult, Socks4Reply, Socks5Reply, SocksAddress, SocksCommand};
 
-/// Which reply framing a pending CONNECT outcome should be delivered with —
+const ZERO_ADDR: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
+
+/// Which reply framing a pending outcome should be delivered with —
 /// tracked separately from [`Phase`] so the SOCKS4-vs-5 distinction isn't
-/// lost while awaiting an asynchronous DNS/dial result.
+/// lost while awaiting an asynchronous DNS/dial/accept result.
 #[derive(Clone, Copy)]
 enum ReplyKind {
     Socks4,
@@ -34,16 +39,18 @@ enum Phase {
     Socks5Request,
     Socks4Request,
     AwaitingUpstream(Arc<ConnectShared>, ReplyKind),
-    Relay(ConnHandle, Arc<ConnectShared>),
+    AwaitingBindPeer(Arc<BindShared>, ReplyKind),
+    Relay(ConnHandle, Arc<RelayActivity>),
 }
 
 /// Builds a `SocksConnectionHandler` for each accepted connection.
 ///
-/// Needs a [`Runtime`] (to dial each CONNECT target) and a [`DnsResolver`]
-/// (to resolve hostnames) — construct these once at application setup and
-/// share them, the same way `hopf-masque`'s CONNECT-UDP support does.
-/// `policy` has no permissive default anywhere in this crate — pass one
-/// that actually decides which targets to allow.
+/// Needs a [`Runtime`] (to dial CONNECT targets and open BIND listeners)
+/// and a [`DnsResolver`] (to resolve hostnames) — construct these once at
+/// application setup and share them, the same way `hopf-masque`'s
+/// CONNECT-UDP support does. `policy` has no permissive default anywhere
+/// in this crate — pass one that actually decides which targets/peers to
+/// allow.
 pub struct SocksConnectionHandlerFactory {
     dns: Arc<DnsResolver>,
     runtime: Arc<Runtime>,
@@ -51,6 +58,7 @@ pub struct SocksConnectionHandlerFactory {
     authenticator: Option<Arc<dyn SocksAuthenticator>>,
     metrics: Arc<SocksServerMetrics>,
     idle_timeout: Duration,
+    bind_accept_timeout: Duration,
 }
 
 impl SocksConnectionHandlerFactory {
@@ -64,6 +72,7 @@ impl SocksConnectionHandlerFactory {
             authenticator: None,
             metrics: SocksServerMetrics::shared(),
             idle_timeout: DEFAULT_RELAY_IDLE_TIMEOUT,
+            bind_accept_timeout: DEFAULT_BIND_ACCEPT_TIMEOUT,
         }
     }
 
@@ -78,6 +87,12 @@ impl SocksConnectionHandlerFactory {
     /// Override [`crate::connect::DEFAULT_RELAY_IDLE_TIMEOUT`].
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Override [`crate::bind::DEFAULT_BIND_ACCEPT_TIMEOUT`].
+    pub fn with_bind_accept_timeout(mut self, bind_accept_timeout: Duration) -> Self {
+        self.bind_accept_timeout = bind_accept_timeout;
         self
     }
 
@@ -96,6 +111,7 @@ impl SocksConnectionHandlerFactory {
             authenticator: self.authenticator.clone(),
             metrics: Arc::clone(&self.metrics),
             idle_timeout: self.idle_timeout,
+            bind_accept_timeout: self.bind_accept_timeout,
         })
     }
 }
@@ -108,6 +124,7 @@ struct SocksConnectionHandler {
     authenticator: Option<Arc<dyn SocksAuthenticator>>,
     metrics: Arc<SocksServerMetrics>,
     idle_timeout: Duration,
+    bind_accept_timeout: Duration,
 }
 
 impl SocksConnectionHandler {
@@ -141,6 +158,60 @@ impl SocksConnectionHandler {
         self.phase = Phase::AwaitingUpstream(shared, reply_kind);
     }
 
+    fn dispatch_bind(&mut self, endpoint: &mut dyn Endpoint, address: SocksAddress, reply_kind: ReplyKind) {
+        SocksServerMetrics::add(&self.metrics.bind_requests, 1);
+        // BIND's DST.ADDR is the peer address the client already knows
+        // out-of-band (e.g. from a prior CONNECT or a PORT-style exchange)
+        // — an unspecified address means "accept from anyone", a concrete
+        // literal means "accept only from this address". A domain name has
+        // no real-world precedent here worth an async DNS round trip for,
+        // so it's rejected outright rather than silently treated as "any
+        // peer allowed" (which would quietly drop the peer check).
+        let expected_peer = match address {
+            SocksAddress::Ip(ip) if ip.is_unspecified() => None,
+            SocksAddress::Ip(ip) => Some(ip),
+            SocksAddress::Domain(_) => {
+                self.send_reply(endpoint, reply_kind, Socks5Reply::AddressTypeNotSupported, ZERO_ADDR);
+                endpoint.close();
+                return;
+            }
+        };
+        let client = endpoint.handle();
+        match bind::begin_bind(
+            &self.runtime,
+            Arc::clone(&self.policy),
+            Arc::clone(&self.metrics),
+            client,
+            expected_peer,
+            self.bind_accept_timeout,
+        ) {
+            Ok((bound, shared)) => {
+                SocksServerMetrics::add(&self.metrics.active_bind_waits, 1);
+                self.send_reply(endpoint, reply_kind, Socks5Reply::Succeeded, bound);
+                self.phase = Phase::AwaitingBindPeer(shared, reply_kind);
+            }
+            Err(_) => {
+                self.send_reply(endpoint, reply_kind, Socks5Reply::GeneralFailure, ZERO_ADDR);
+                endpoint.close();
+            }
+        }
+    }
+
+    /// Encode and send a reply in whichever framing `reply_kind` calls
+    /// for — SOCKS4/4a's coarser granted/rejected plus a real bound
+    /// address (used for BIND; CONNECT always passes the zero address),
+    /// or SOCKS5's full reply-code-plus-address form.
+    fn send_reply(&self, endpoint: &mut dyn Endpoint, reply_kind: ReplyKind, reply: Socks5Reply, bound: SocketAddr) {
+        match reply_kind {
+            ReplyKind::Socks4 => {
+                endpoint.send(&wire::encode_socks4_reply(Socks4Reply::from_socks5(reply), bound));
+            }
+            ReplyKind::Socks5 => {
+                endpoint.send(&wire::encode_socks5_reply(reply, bound));
+            }
+        }
+    }
+
     /// Check for (and act on) a CONNECT outcome that's arrived while in
     /// [`Phase::AwaitingUpstream`] — a no-op in any other phase, or if
     /// nothing has arrived yet.
@@ -154,40 +225,48 @@ impl SocksConnectionHandler {
         };
         match outcome {
             ConnectOutcome::Connected(upstream) => {
-                let bound = endpoint
-                    .local_addr()
-                    .ok()
-                    .and_then(|a| a.as_socket_addr())
-                    .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-                match reply_kind {
-                    ReplyKind::Socks4 => {
-                        endpoint.send(&wire::encode_socks4_reply(Socks4Reply::Granted));
-                    }
-                    ReplyKind::Socks5 => {
-                        endpoint.send(&wire::encode_socks5_reply(Socks5Reply::Succeeded, bound));
-                    }
-                }
-                SocksServerMetrics::add(&self.metrics.active_relays, 1);
-                connect::arm_idle_timer(
-                    Arc::clone(&shared),
+                let bound = local_bound_addr(endpoint);
+                self.send_reply(endpoint, reply_kind, Socks5Reply::Succeeded, bound);
+                shared.activity.mark_established(&self.metrics);
+                crate::relay::arm_idle_timer(
+                    Arc::clone(&shared.activity),
                     endpoint.handle(),
                     upstream.clone(),
                     self.idle_timeout,
                 );
-                self.phase = Phase::Relay(upstream, shared);
+                self.phase = Phase::Relay(upstream, Arc::clone(&shared.activity));
             }
             ConnectOutcome::Failed(reply) => {
-                match reply_kind {
-                    ReplyKind::Socks4 => {
-                        endpoint.send(&wire::encode_socks4_reply(Socks4Reply::from_socks5(reply)));
-                    }
-                    ReplyKind::Socks5 => {
-                        endpoint.send(&wire::encode_socks5_reply(
-                            reply,
-                            SocketAddr::from(([0, 0, 0, 0], 0)),
-                        ));
-                    }
-                }
+                self.send_reply(endpoint, reply_kind, reply, ZERO_ADDR);
+                endpoint.close();
+            }
+        }
+    }
+
+    /// Same as [`Self::poll_connect_outcome`], for [`Phase::AwaitingBindPeer`].
+    fn poll_bind_outcome(&mut self, endpoint: &mut dyn Endpoint) {
+        let (shared, reply_kind) = match &self.phase {
+            Phase::AwaitingBindPeer(shared, reply_kind) => (Arc::clone(shared), *reply_kind),
+            _ => return,
+        };
+        let Some(outcome) = shared.take_outcome() else {
+            return;
+        };
+        shared.stop_waiting(&self.metrics);
+        match outcome {
+            BindOutcome::Accepted(peer, peer_addr) => {
+                self.send_reply(endpoint, reply_kind, Socks5Reply::Succeeded, peer_addr);
+                shared.activity.mark_established(&self.metrics);
+                crate::relay::arm_idle_timer(
+                    Arc::clone(&shared.activity),
+                    endpoint.handle(),
+                    peer.clone(),
+                    self.idle_timeout,
+                );
+                self.phase = Phase::Relay(peer, Arc::clone(&shared.activity));
+            }
+            BindOutcome::Failed(reply) => {
+                self.send_reply(endpoint, reply_kind, reply, ZERO_ADDR);
                 endpoint.close();
             }
         }
@@ -202,14 +281,26 @@ impl SocksConnectionHandler {
     }
 }
 
+/// The endpoint's own local address, or the zero address if it can't be
+/// determined — used as a CONNECT/BIND success reply's bound address.
+fn local_bound_addr(endpoint: &dyn Endpoint) -> SocketAddr {
+    endpoint
+        .local_addr()
+        .ok()
+        .and_then(|a| a.as_socket_addr())
+        .unwrap_or(ZERO_ADDR)
+}
+
 impl ProtocolHandler for SocksConnectionHandler {
     fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
         SocksServerMetrics::add(&self.metrics.connections, 1);
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        if matches!(self.phase, Phase::AwaitingUpstream(..)) {
-            self.poll_connect_outcome(endpoint);
+        match &self.phase {
+            Phase::AwaitingUpstream(..) => self.poll_connect_outcome(endpoint),
+            Phase::AwaitingBindPeer(..) => self.poll_bind_outcome(endpoint),
+            _ => {}
         }
 
         loop {
@@ -240,16 +331,24 @@ impl ProtocolHandler for SocksConnectionHandler {
                             // configured authenticator can never be
                             // honored for it — reject outright rather than
                             // silently treating USERID as an identity.
-                            endpoint.send(&wire::encode_socks4_reply(Socks4Reply::Rejected));
+                            self.send_reply(endpoint, ReplyKind::Socks4, Socks5Reply::NotAllowed, ZERO_ADDR);
                             endpoint.close();
                             return;
                         }
-                        if req.command != SocksCommand::Connect {
-                            endpoint.send(&wire::encode_socks4_reply(Socks4Reply::Rejected));
-                            endpoint.close();
-                            return;
+                        match req.command {
+                            SocksCommand::Connect => {
+                                self.dispatch_connect(endpoint, req.address, req.port, ReplyKind::Socks4);
+                            }
+                            SocksCommand::Bind => {
+                                self.dispatch_bind(endpoint, req.address, ReplyKind::Socks4);
+                            }
+                            SocksCommand::UdpAssociate => {
+                                // No SOCKS4 equivalent; tracked separately
+                                // for SOCKS5 only.
+                                self.send_reply(endpoint, ReplyKind::Socks4, Socks5Reply::CommandNotSupported, ZERO_ADDR);
+                                endpoint.close();
+                            }
                         }
-                        self.dispatch_connect(endpoint, req.address, req.port, ReplyKind::Socks4);
                         return;
                     }
                 },
@@ -313,35 +412,32 @@ impl ProtocolHandler for SocksConnectionHandler {
                         // request is reported once version and command
                         // framing are already known-good (both were
                         // already committed to by reaching this phase).
-                        endpoint.send(&wire::encode_socks5_reply(
-                            Socks5Reply::AddressTypeNotSupported,
-                            SocketAddr::from(([0, 0, 0, 0], 0)),
-                        ));
+                        endpoint.send(&wire::encode_socks5_reply(Socks5Reply::AddressTypeNotSupported, ZERO_ADDR));
                         endpoint.close();
                         return;
                     }
                     ParseResult::Complete(req, n) => {
                         *data = &data[n..];
-                        if req.command != SocksCommand::Connect {
-                            // BIND and UDP ASSOCIATE are not implemented
-                            // yet (tracked separately).
-                            endpoint.send(&wire::encode_socks5_reply(
-                                Socks5Reply::CommandNotSupported,
-                                SocketAddr::from(([0, 0, 0, 0], 0)),
-                            ));
-                            endpoint.close();
-                            return;
+                        match req.command {
+                            SocksCommand::Connect => {
+                                self.dispatch_connect(endpoint, req.address, req.port, ReplyKind::Socks5);
+                            }
+                            SocksCommand::Bind => {
+                                self.dispatch_bind(endpoint, req.address, ReplyKind::Socks5);
+                            }
+                            SocksCommand::UdpAssociate => {
+                                // Not implemented yet (tracked separately).
+                                endpoint.send(&wire::encode_socks5_reply(Socks5Reply::CommandNotSupported, ZERO_ADDR));
+                                endpoint.close();
+                            }
                         }
-                        self.dispatch_connect(endpoint, req.address, req.port, ReplyKind::Socks5);
                         return;
                     }
                 },
-                Phase::AwaitingUpstream(..) => return,
-                Phase::Relay(upstream, shared) => {
-                    if !data.is_empty() {
-                        connect::relay_upstream(shared, upstream, &self.metrics, data);
-                        *data = &[];
-                    }
+                Phase::AwaitingUpstream(..) | Phase::AwaitingBindPeer(..) => return,
+                Phase::Relay(other, activity) => {
+                    crate::relay::forward(activity, other, &self.metrics.bytes_upstream, data);
+                    *data = &[];
                     return;
                 }
             }
@@ -349,9 +445,19 @@ impl ProtocolHandler for SocksConnectionHandler {
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
-        if let Phase::Relay(upstream, shared) = &self.phase {
-            connect::release_relay_slot(shared, &self.metrics);
-            upstream.close();
+        match &self.phase {
+            Phase::Relay(other, activity) => {
+                activity.release_once(&self.metrics);
+                other.close();
+            }
+            Phase::AwaitingBindPeer(shared, _) => {
+                // The client disconnected before a BIND outcome ever
+                // arrived (or before this handler got a chance to process
+                // one) — `stop_waiting` is idempotent, so this is safe
+                // regardless of whether `poll_bind_outcome` already ran.
+                shared.stop_waiting(&self.metrics);
+            }
+            _ => {}
         }
     }
 
