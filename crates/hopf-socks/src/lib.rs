@@ -6,13 +6,17 @@
 //!
 //! Currently implemented: version detection, SOCKS5 method negotiation
 //! with RFC 1929 username/password authentication (see
-//! [`SocksAuthenticator`]), and the CONNECT command, server-side. BIND,
-//! UDP ASSOCIATE, and the client side are tracked separately.
+//! [`SocksAuthenticator`]), and the CONNECT, BIND, and UDP ASSOCIATE
+//! commands, server-side. The client side is tracked separately.
 //!
 //! RFC 1961 GSSAPI authentication is a deliberate non-goal: it requires an
 //! external Kerberos/GSSAPI dependency this crate does not take on. A
 //! deployment needing GSSAPI-authenticated SOCKS should terminate TLS in
 //! front of this proxy and use RFC 1929 username/password instead.
+//!
+//! UDP ASSOCIATE implements no RFC 1928 §7 fragment reassembly — only
+//! standalone datagrams are forwarded, matching near-universal real-world
+//! SOCKS5 server practice.
 
 #![warn(missing_docs)]
 
@@ -24,6 +28,8 @@ mod metrics;
 mod policy;
 mod relay;
 mod service;
+mod udp_associate;
+mod udp_header;
 mod wire;
 
 pub use auth::SocksAuthenticator;
@@ -33,6 +39,7 @@ pub use handler::SocksConnectionHandlerFactory;
 pub use metrics::SocksServerMetrics;
 pub use policy::SocksPolicy;
 pub use service::SocksService;
+pub use udp_associate::DEFAULT_UDP_IDLE_TIMEOUT;
 
 #[cfg(all(test, feature = "integration"))]
 mod integration;

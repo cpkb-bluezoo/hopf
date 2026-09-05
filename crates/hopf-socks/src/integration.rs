@@ -8,7 +8,7 @@
 #![cfg(feature = "integration")]
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -62,6 +62,20 @@ fn start_echo_target() -> SocketAddr {
                     }
                 }
             });
+        }
+    });
+    addr
+}
+
+/// A trivial UDP echo server standing in for "the proxied target" —
+/// started on a plain OS thread, not part of the `Runtime` under test.
+fn start_udp_echo_target() -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            let _ = socket.send_to(&buf[..n], from);
         }
     });
     addr
@@ -265,21 +279,131 @@ fn destination_policy_denial_sends_not_allowed_and_closes() {
     assert_eq!(client.read(&mut buf).unwrap(), 0, "expected connection closed");
 }
 
+/// Perform the SOCKS5 no-auth handshake and a UDP ASSOCIATE request with a
+/// wildcard `DST.ADDR`, returning the connected control stream (which
+/// must be kept alive for the association's lifetime) and the
+/// client-facing UDP socket's bound address from Reply 1.
+fn socks5_udp_associate(proxy: SocketAddr) -> (TcpStream, SocketAddr) {
+    let mut client = TcpStream::connect(proxy).unwrap();
+    client.write_all(&[0x05, 1, 0x00]).unwrap();
+    assert_eq!(read_exact_within(&mut client, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
+
+    let mut req = vec![0x05, 0x03, 0x00, 0x01];
+    req.extend_from_slice(&[0, 0, 0, 0]);
+    req.extend_from_slice(&0u16.to_be_bytes());
+    client.write_all(&req).unwrap();
+
+    let reply = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    assert_eq!(reply[1], 0x00, "expected Succeeded reply");
+    let bound = bound_addr_from_socks5_reply(&reply);
+    (client, bound)
+}
+
+/// Encode a client-to-relay UDP ASSOCIATE datagram: RFC 1928 §7 header
+/// naming `target`, wrapping `payload`.
+fn encode_client_datagram(target: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut out = vec![0, 0, 0x00, 0x01];
+    let IpAddr::V4(ip) = target.ip() else {
+        panic!("test targets IPv4");
+    };
+    out.extend_from_slice(&ip.octets());
+    out.extend_from_slice(&target.port().to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
 #[test]
-fn udp_associate_command_is_rejected_as_not_yet_implemented() {
+fn socks5_udp_associate_relays_datagrams_to_and_from_the_target() {
+    let target = start_udp_echo_target();
+    let (_rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+    let (_client, bound) = socks5_udp_associate(proxy);
+
+    let client_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client_udp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    client_udp.send_to(&encode_client_datagram(target, b"hello-udp"), bound).unwrap();
+
+    let mut buf = [0u8; 512];
+    let (n, from) = client_udp.recv_from(&mut buf).unwrap();
+    assert_eq!(from, bound, "reply should come from the client-facing relay socket");
+    let reply = &buf[..n];
+    assert_eq!(reply[2], 0x00, "expected a standalone (non-fragmented) reply");
+    assert_eq!(reply[3], 0x01);
+    let reply_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7])), u16::from_be_bytes([reply[8], reply[9]]));
+    assert_eq!(reply_addr, target, "reply's DST.ADDR should be the echo target");
+    assert_eq!(&reply[10..], b"hello-udp");
+}
+
+#[test]
+fn socks5_udp_associate_rejects_a_domain_name_dst_addr() {
     let (_rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
 
     let mut client = TcpStream::connect(proxy).unwrap();
     client.write_all(&[0x05, 1, 0x00]).unwrap();
     assert_eq!(read_exact_within(&mut client, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
 
-    let mut req = vec![0x05, 0x03, 0x00, 0x01]; // UDP ASSOCIATE
-    req.extend_from_slice(&[0, 0, 0, 0]);
+    let mut req = vec![0x05, 0x03, 0x00, 0x03, 9];
+    req.extend_from_slice(b"localhost");
     req.extend_from_slice(&0u16.to_be_bytes());
     client.write_all(&req).unwrap();
 
     let reply = read_exact_within(&mut client, 10, Duration::from_secs(5));
-    assert_eq!(reply[1], 0x07, "expected CommandNotSupported reply");
+    assert_eq!(reply[1], 0x08, "expected AddressTypeNotSupported reply");
+}
+
+#[test]
+fn socks5_udp_associate_drops_a_non_standalone_fragment() {
+    let target = start_udp_echo_target();
+    let (_rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+    let (_client, bound) = socks5_udp_associate(proxy);
+
+    let client_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client_udp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+    let mut fragment = encode_client_datagram(target, b"fragment");
+    fragment[2] = 0x01; // non-standalone FRAG
+    client_udp.send_to(&fragment, bound).unwrap();
+
+    // Nothing should come back for the dropped fragment; confirm the
+    // relay is still alive by sending a real standalone datagram next and
+    // getting only *that* one echoed.
+    client_udp.send_to(&encode_client_datagram(target, b"real"), bound).unwrap();
+    let mut buf = [0u8; 512];
+    let (n, _) = client_udp.recv_from(&mut buf).unwrap();
+    assert_eq!(&buf[10..n], b"real", "only the standalone datagram should have been relayed");
+}
+
+#[test]
+fn socks5_udp_associate_silently_drops_a_datagram_the_policy_denies() {
+    let target = start_udp_echo_target();
+    let (_rt, proxy) = start_socks_server(Arc::new(DenyAll), None);
+    let (_client, bound) = socks5_udp_associate(proxy);
+
+    let client_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client_udp.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    client_udp.send_to(&encode_client_datagram(target, b"blocked"), bound).unwrap();
+
+    let mut buf = [0u8; 512];
+    let err = client_udp.recv_from(&mut buf).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock, "expected no reply — RFC 1928 §7 has no error channel for a blocked datagram");
+}
+
+#[test]
+fn socks5_udp_associate_closes_the_control_connection_after_the_idle_timeout() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
+    let factory = SocksConnectionHandlerFactory::new(dns, Arc::clone(&rt), Arc::new(AllowAll))
+        .with_udp_idle_timeout(Duration::from_millis(200));
+    let service = SocksService::new("127.0.0.1:0".parse().unwrap(), factory);
+    let proxy = service.start(&rt).unwrap();
+
+    let (mut client, _bound) = socks5_udp_associate(proxy);
+
+    // No UDP traffic at all — the association should time out and close
+    // the control connection within a couple of idle-timeout periods.
+    client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 1];
+    assert_eq!(client.read(&mut buf).unwrap(), 0, "expected control connection closed");
 }
 
 fn bound_addr_from_socks5_reply(reply: &[u8]) -> SocketAddr {
