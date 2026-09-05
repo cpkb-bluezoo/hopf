@@ -21,7 +21,7 @@ use hopf_auth::{
 };
 use hopf_core::retry::RetryPolicy;
 use hopf_core::{Runtime, RuntimeConfig};
-use hopf_tls::{acceptor_from_pem, connector};
+use hopf_tls::{acceptor_from_pem, connector, insecure_connector};
 
 use crate::{
     AcceptAllSmtpHandler, AcceptAllSmtpHandlerFactory, AuthenticateState, ConnectedState,
@@ -210,6 +210,193 @@ fn client_starttls_send() {
     assert!(
         got.windows(b"secret".len()).any(|w| w == b"secret"),
         "capture={got:?}"
+    );
+}
+
+// ── Opportunistic STARTTLS (issue #353) ─────────────────────────────────────
+
+/// Accepts everything like [`AcceptAllSmtpHandler`], but records whether
+/// [`HelloHandler::tls_established`] actually fired — the only way to tell
+/// from the server side whether a client genuinely upgraded the
+/// connection, as opposed to just delivering successfully either way.
+#[derive(Clone)]
+struct TlsTrackingHandler {
+    hostname: String,
+    tls_seen: Arc<Mutex<bool>>,
+}
+
+impl SmtpClientConnected for TlsTrackingHandler {
+    fn connected(&mut self, state: &mut dyn ConnectedState, _meta: &SmtpConnectionMetadata) {
+        let greeting = format!("{} ESMTP Hopf", self.hostname);
+        state.accept_connection(&greeting, Box::new(self.clone()));
+    }
+
+    fn disconnected(&mut self) {}
+}
+
+impl HelloHandler for TlsTrackingHandler {
+    fn hello(&mut self, state: &mut dyn HelloState, _extended: bool, _hostname: &str) {
+        state.accept_hello(Box::new(self.clone()));
+    }
+
+    fn tls_established(&mut self, _info: &hopf_core::SecurityInfo) {
+        *self.tls_seen.lock().unwrap() = true;
+    }
+
+    fn authenticated(&mut self, state: &mut dyn AuthenticateState, _user: &str) {
+        state.accept(Box::new(self.clone()));
+    }
+
+    fn quit(&mut self) {}
+}
+
+impl MailFromHandler for TlsTrackingHandler {
+    fn pipeline(&mut self) -> Option<Box<dyn SmtpPipeline>> {
+        None
+    }
+
+    fn mail_from(
+        &mut self,
+        state: &mut dyn MailFromState,
+        _sender: Option<&EmailAddress>,
+        _smtputf8: bool,
+        _delivery: &crate::DeliveryRequirements,
+    ) {
+        state.accept_sender(Box::new(self.clone()));
+    }
+
+    fn reset(&mut self, state: &mut dyn ResetState) {
+        state.accept_reset(Box::new(self.clone()));
+    }
+
+    fn quit(&mut self) {}
+}
+
+impl RecipientHandler for TlsTrackingHandler {
+    fn rcpt_to(
+        &mut self,
+        state: &mut dyn RecipientState,
+        _recipient: &EmailAddress,
+        _dsn: &DsnRecipientParams,
+    ) {
+        state.accept_recipient(Box::new(self.clone()));
+    }
+
+    fn start_message(&mut self, state: &mut dyn MessageStartState) {
+        state.accept_message(Box::new(self.clone()));
+    }
+
+    fn reset(&mut self, state: &mut dyn ResetState) {
+        state.accept_reset(Box::new(self.clone()));
+    }
+
+    fn quit(&mut self) {}
+}
+
+impl MessageDataHandler for TlsTrackingHandler {
+    fn message_content(&mut self, _chunk: &[u8]) {}
+
+    fn message_complete(&mut self, state: &mut dyn MessageEndState) {
+        state.accept_message_delivery(None, Box::new(self.clone()));
+    }
+
+    fn message_aborted(&mut self) {}
+}
+
+#[derive(Clone)]
+struct TlsTrackingHandlerFactory(TlsTrackingHandler);
+
+impl SmtpHandlerFactory for TlsTrackingHandlerFactory {
+    fn create(&self) -> Box<dyn SmtpClientConnected> {
+        Box::new(self.0.clone())
+    }
+}
+
+/// Regression test for issue #353: `SmtpSend::opportunistic_starttls`
+/// must actually upgrade the connection when the server offers STARTTLS
+/// — proven from the server side (`tls_established` firing), not just by
+/// delivery succeeding either way.
+#[test]
+fn opportunistic_starttls_upgrades_when_the_server_offers_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+
+    let tls_seen = Arc::new(Mutex::new(false));
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(listen, "test.example.com")
+        .auth_required(false)
+        .with_tls(acceptor);
+    let handler = TlsTrackingHandler {
+        hostname: "test.example.com".into(),
+        tls_seen: Arc::clone(&tls_seen),
+    };
+    let factory = Arc::new(TlsTrackingHandlerFactory(handler));
+    let service = SmtpService::with_handler_factory(config, factory);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+
+    let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let done2 = Arc::clone(&done);
+    let send = SmtpSend::new("client.example")
+        .mail_from("a@b.com")
+        .rcpt_to("c@d.com")
+        .message_with(once(b"Subject: hi\r\n\r\nhello\r\n".to_vec()))
+        .opportunistic_starttls(true)
+        .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
+
+    SmtpClient::from_addr(bound)
+        .starttls(insecure_connector(&[]), "localhost")
+        .timeouts(SmtpClientTimeouts {
+            stage: Duration::from_secs(5),
+            ..Default::default()
+        })
+        .connect(&rt, Arc::new(send))
+        .unwrap();
+
+    assert!(wait_for(|| done.lock().unwrap().is_some(), 5000), "delivery timed out");
+    assert_eq!(*done.lock().unwrap(), Some(true), "opportunistic delivery should succeed");
+    assert!(
+        *tls_seen.lock().unwrap(),
+        "server never saw a TLS handshake — opportunistic STARTTLS did not upgrade"
+    );
+}
+
+/// Regression test for issue #353: `SmtpSend::opportunistic_starttls`
+/// must not abort delivery when the server doesn't offer STARTTLS at all
+/// — this is what distinguishes "opportunistic" from `require_starttls`.
+#[test]
+fn opportunistic_starttls_falls_back_to_plaintext_when_not_offered() {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let (rt, addr) = start_accept_all(Arc::clone(&capture)); // no `.with_tls(...)` at all
+
+    let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let done2 = Arc::clone(&done);
+    let send = SmtpSend::new("client.example")
+        .mail_from("a@b.com")
+        .rcpt_to("c@d.com")
+        .message_with(once(b"Subject: hi\r\n\r\nplaintext-ok\r\n".to_vec()))
+        .opportunistic_starttls(true)
+        .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
+
+    SmtpClient::from_addr(addr)
+        .starttls(insecure_connector(&[]), "localhost")
+        .timeouts(SmtpClientTimeouts {
+            stage: Duration::from_secs(5),
+            ..Default::default()
+        })
+        .connect(&rt, Arc::new(send))
+        .unwrap();
+
+    assert!(wait_for(|| done.lock().unwrap().is_some(), 5000), "delivery timed out");
+    assert_eq!(
+        *done.lock().unwrap(),
+        Some(true),
+        "opportunistic mode must not abort delivery just because STARTTLS wasn't offered"
     );
 }
 
@@ -677,6 +864,227 @@ fn simple_relay_accepts_transaction_on_partial_domain_success() {
         *done.lock().unwrap(),
         Some(true),
         "any domain succeeding must accept the transaction"
+    );
+}
+
+/// Regression test for issue #353: the relay must try the next MX host
+/// (by preference order) when the current one fails at the connection
+/// level, rather than failing the whole domain on the first host's
+/// trouble.
+#[test]
+fn simple_relay_multi_mx_fallback_tries_next_host_on_connection_failure() {
+    use crate::{SimpleRelayService, SmtpConfig};
+    use hopf_dns::wire::{DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA};
+    use hopf_dns::DnsResolver;
+    use std::net::Ipv4Addr;
+    use std::thread;
+
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let (rt, sink_addr) = start_accept_all(Arc::clone(&capture));
+
+    // Two MX hosts for example.com: mx1 (higher preference) has its A
+    // lookup answer NOERROR/NODATA — a pure DNS-level failure, deterministic
+    // and fast, independent of how this sandbox's network stack happens to
+    // handle a TCP connect to an address nothing is listening on (the same
+    // reasoning `simple_relay_accepts_transaction_on_partial_domain_success`
+    // above uses). mx2 resolves to the real sink.
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, peer)) = stub.recv_from(&mut buf) else { break };
+            let Ok(q) = DnsMessage::parse(&buf[..n]) else { continue };
+            let mut resp = q.response_template(0);
+            resp.flags |= FLAG_QR | FLAG_RA;
+            if let Some(question) = q.questions.first() {
+                let is_mx1 = question.name.to_ascii_lowercase().starts_with("mx1.");
+                match question.qtype {
+                    Some(DnsType::Mx) => {
+                        resp.answers.push(
+                            DnsResourceRecord::mx(&question.name, 60, 10, "mx1.example.com").unwrap(),
+                        );
+                        resp.answers.push(
+                            DnsResourceRecord::mx(&question.name, 60, 20, "mx2.example.com").unwrap(),
+                        );
+                    }
+                    Some(DnsType::A) if !is_mx1 => {
+                        resp.answers.push(DnsResourceRecord::a(
+                            &question.name,
+                            60,
+                            Ipv4Addr::new(127, 0, 0, 1),
+                        ));
+                    }
+                    // mx1's A lookup answers NOERROR/NODATA — no address, so
+                    // the relay's resolve() call for it fails cleanly and
+                    // falls through to mx2. TLSA: also NODATA throughout —
+                    // exercises the authenticated-denial path with no
+                    // DNSSEC validator configured (Indeterminate), same as
+                    // any ordinary domain today; not what this test is about.
+                    Some(DnsType::A) | Some(DnsType::Aaaa) | Some(DnsType::Tlsa) => {}
+                    _ => {}
+                }
+            }
+            let bytes = resp.serialize().unwrap();
+            let _ = stub.send_to(&bytes, peer);
+        }
+    });
+
+    let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+
+    let relay_listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(relay_listen, "relay.example.com").auth_required(false);
+    let relay = SimpleRelayService::with_resolver(config, Arc::clone(&rt), dns, sink_addr.port());
+    let relay_addr = relay.start(Arc::clone(&rt)).unwrap();
+
+    let timeouts = SmtpClientTimeouts {
+        stage: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let ok = send_one(
+        &rt,
+        relay_addr,
+        timeouts,
+        "alice@elsewhere.test",
+        "bob@example.com",
+        b"Subject: fallback\r\n\r\nfallback-body\r\n",
+    );
+    assert!(ok, "relay inbound submission should succeed");
+
+    assert!(
+        wait_for(
+            || {
+                let got = capture.lock().unwrap().clone();
+                got.windows(b"fallback-body".len()).any(|w| w == b"fallback-body")
+            },
+            5000
+        ),
+        "the second MX host should have received the message after the first host's connection failed"
+    );
+}
+
+/// Regression test for issue #353's core security property: a TLSA
+/// record that arrives with no DNSSEC validation behind it must never be
+/// enforced. The fake nameserver here answers with a TLSA record that
+/// matches nothing real; if the relay wrongly trusted it, the DANE
+/// verifier would reject the sink's real (non-matching) certificate and
+/// the STARTTLS handshake would never complete. Since no DNSSEC validator
+/// is configured — the realistic default — this must fall back to
+/// ordinary opportunistic TLS instead, upgrading successfully.
+#[test]
+fn simple_relay_does_not_enforce_an_unvalidated_tlsa_record() {
+    use crate::{SimpleRelayService, SmtpConfig};
+    use hopf_dns::wire::{
+        DnsMessage, DnsResourceRecord, DnsType, TlsaMatchingType, TlsaRecord, TlsaSelector,
+        TlsaUsage, FLAG_QR, FLAG_RA,
+    };
+    use hopf_dns::DnsResolver;
+    use std::net::Ipv4Addr;
+    use std::thread;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+
+    let tls_seen = Arc::new(Mutex::new(false));
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let sink_config = SmtpConfig::new(listen, "sink.example.com")
+        .auth_required(false)
+        .with_tls(acceptor);
+    let sink_handler = TlsTrackingHandler {
+        hostname: "sink.example.com".into(),
+        tls_seen: Arc::clone(&tls_seen),
+    };
+    let sink_factory = Arc::new(TlsTrackingHandlerFactory(sink_handler));
+    let sink_service = SmtpService::with_handler_factory(sink_config, sink_factory);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let sink_addr = sink_service.start(Arc::clone(&rt)).unwrap();
+
+    let stub = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let stub_addr = stub.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        loop {
+            let Ok((n, peer)) = stub.recv_from(&mut buf) else { break };
+            let Ok(q) = DnsMessage::parse(&buf[..n]) else { continue };
+            let mut resp = q.response_template(0);
+            resp.flags |= FLAG_QR | FLAG_RA;
+            if let Some(question) = q.questions.first() {
+                match question.qtype {
+                    Some(DnsType::Mx) => {
+                        resp.answers.push(
+                            DnsResourceRecord::mx(&question.name, 60, 10, &question.name).unwrap(),
+                        );
+                    }
+                    Some(DnsType::A) => {
+                        resp.answers.push(DnsResourceRecord::a(
+                            &question.name,
+                            60,
+                            Ipv4Addr::new(127, 0, 0, 1),
+                        ));
+                    }
+                    Some(DnsType::Tlsa) => {
+                        // Deliberately bogus, and — the point of this test
+                        // — not DNSSEC-signed at all, so it must never be
+                        // trusted regardless of what it claims.
+                        let bogus = TlsaRecord {
+                            usage: TlsaUsage::DaneEe,
+                            selector: TlsaSelector::FullCertificate,
+                            matching_type: TlsaMatchingType::Sha256,
+                            association_data: vec![0u8; 32],
+                        };
+                        resp.answers.push(DnsResourceRecord::tlsa(&question.name, 60, &bogus));
+                    }
+                    _ => {}
+                }
+            }
+            let bytes = resp.serialize().unwrap();
+            let _ = stub.send_to(&bytes, peer);
+        }
+    });
+
+    let dns = Arc::new(DnsResolver::new(rt.pick_worker().clone()));
+    dns.add_server(stub_addr);
+    dns.set_timeout(Duration::from_millis(500));
+    dns.open().unwrap();
+    // Deliberately no DNSSEC validator configured — the realistic default
+    // for most zones today, and exactly the condition under which a TLSA
+    // answer must not be trusted.
+
+    let relay_listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(relay_listen, "relay.example.com").auth_required(false);
+    let relay = SimpleRelayService::with_resolver(config, Arc::clone(&rt), dns, sink_addr.port());
+    let relay_addr = relay.start(Arc::clone(&rt)).unwrap();
+
+    let timeouts = SmtpClientTimeouts {
+        stage: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let ok = send_one(
+        &rt,
+        relay_addr,
+        timeouts,
+        "alice@elsewhere.test",
+        "bob@example.com",
+        b"Subject: dane\r\n\r\ndane-body\r\n",
+    );
+    assert!(ok, "relay inbound submission should succeed");
+
+    assert!(
+        wait_for(|| *tls_seen.lock().unwrap(), 5000),
+        "opportunistic STARTTLS should still have upgraded the connection; \
+         if the bogus, unvalidated TLSA record were wrongly enforced, the \
+         handshake against the sink's real (non-matching) certificate \
+         would never complete"
     );
 }
 
