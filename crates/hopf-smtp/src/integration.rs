@@ -9,19 +9,27 @@
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use rmimeparser::EmailAddress;
 
 use hopf_auth::{
     CertificateIdentity, Cb, CredentialStore, PasswordStore, ScramCredentials, SaslMechanism,
     TokenValidation,
 };
+use hopf_core::retry::RetryPolicy;
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_tls::{acceptor_from_pem, connector};
 
 use crate::{
-    AcceptAllSmtpHandler, AcceptAllSmtpHandlerFactory, SmtpClient, SmtpClientTimeouts, SmtpConfig,
-    SmtpSend, SmtpService,
+    AcceptAllSmtpHandler, AcceptAllSmtpHandlerFactory, AuthenticateState, ConnectedState,
+    DsnRecipientParams, HelloHandler, HelloState, MailFromHandler, MailFromState,
+    MessageDataHandler, MessageEndState, MessageStartState, RecipientHandler, RecipientState,
+    ResetState, RetryingSend, SmtpClient, SmtpClientConnected, SmtpClientTimeouts, SmtpConfig,
+    SmtpConnectionMetadata, SmtpHandlerFactory, SmtpPipeline, SmtpSend, SmtpSendOutcome,
+    SmtpService, smtp_retry_policy,
 };
 
 /// Test helper: a one-shot `message_with` source yielding `bytes` once.
@@ -776,6 +784,244 @@ fn smtp_auth_pipelined_with_mail_from_is_soft_rejected_until_async_step_resolves
     let r2 = read_until(&mut stream, &mut buf, |s| s.starts_with("250 ") || s.starts_with("5"));
     assert!(r2.starts_with("250 "), "mail from after CRAM-MD5 auth: {r2}");
     drop(rt);
+}
+
+// ── Regression tests for issue #344 (SMTP-aligned retry strategy) ──────────
+
+/// Server-side handler that accepts HELO/MAIL/RCPT unconditionally, then
+/// rejects at message-completion time with a scripted reply code for the
+/// first `reject_first_n` connection attempts (counted via `attempts`,
+/// shared across every clone the factory hands out — one per accepted
+/// connection, i.e. one per [`RetryingSend`] dial), accepting from then on.
+#[derive(Clone)]
+struct ScriptedMessageHandler {
+    hostname: String,
+    attempts: Arc<AtomicUsize>,
+    reject_first_n: usize,
+    reject_code: u16,
+}
+
+impl SmtpClientConnected for ScriptedMessageHandler {
+    fn connected(&mut self, state: &mut dyn ConnectedState, _meta: &SmtpConnectionMetadata) {
+        let greeting = format!("{} ESMTP Hopf", self.hostname);
+        state.accept_connection(&greeting, Box::new(self.clone()));
+    }
+
+    fn disconnected(&mut self) {}
+}
+
+impl HelloHandler for ScriptedMessageHandler {
+    fn hello(&mut self, state: &mut dyn HelloState, _extended: bool, _hostname: &str) {
+        state.accept_hello(Box::new(self.clone()));
+    }
+
+    fn tls_established(&mut self, _info: &hopf_core::SecurityInfo) {}
+
+    fn authenticated(&mut self, state: &mut dyn AuthenticateState, _user: &str) {
+        state.accept(Box::new(self.clone()));
+    }
+
+    fn quit(&mut self) {}
+}
+
+impl MailFromHandler for ScriptedMessageHandler {
+    fn pipeline(&mut self) -> Option<Box<dyn SmtpPipeline>> {
+        None
+    }
+
+    fn mail_from(
+        &mut self,
+        state: &mut dyn MailFromState,
+        _sender: Option<&EmailAddress>,
+        _smtputf8: bool,
+        _delivery: &crate::DeliveryRequirements,
+    ) {
+        state.accept_sender(Box::new(self.clone()));
+    }
+
+    fn reset(&mut self, state: &mut dyn ResetState) {
+        state.accept_reset(Box::new(self.clone()));
+    }
+
+    fn quit(&mut self) {}
+}
+
+impl RecipientHandler for ScriptedMessageHandler {
+    fn rcpt_to(
+        &mut self,
+        state: &mut dyn RecipientState,
+        _recipient: &EmailAddress,
+        _dsn: &DsnRecipientParams,
+    ) {
+        state.accept_recipient(Box::new(self.clone()));
+    }
+
+    fn start_message(&mut self, state: &mut dyn MessageStartState) {
+        state.accept_message(Box::new(self.clone()));
+    }
+
+    fn reset(&mut self, state: &mut dyn ResetState) {
+        state.accept_reset(Box::new(self.clone()));
+    }
+
+    fn quit(&mut self) {}
+}
+
+impl MessageDataHandler for ScriptedMessageHandler {
+    fn message_content(&mut self, _chunk: &[u8]) {}
+
+    fn message_complete(&mut self, state: &mut dyn MessageEndState) {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempt <= self.reject_first_n {
+            state.reject(self.reject_code, "scripted rejection", Box::new(self.clone()));
+        } else {
+            state.accept_message_delivery(None, Box::new(self.clone()));
+        }
+    }
+
+    fn message_aborted(&mut self) {}
+}
+
+#[derive(Clone)]
+struct ScriptedMessageHandlerFactory(ScriptedMessageHandler);
+
+impl SmtpHandlerFactory for ScriptedMessageHandlerFactory {
+    fn create(&self) -> Box<dyn SmtpClientConnected> {
+        Box::new(self.0.clone())
+    }
+}
+
+fn start_scripted_server(reject_first_n: usize, reject_code: u16) -> (Arc<Runtime>, SocketAddr, Arc<AtomicUsize>) {
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(listen, "test.example.com").auth_required(false);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handler = ScriptedMessageHandler {
+        hostname: "test.example.com".into(),
+        attempts: Arc::clone(&attempts),
+        reject_first_n,
+        reject_code,
+    };
+    let factory = Arc::new(ScriptedMessageHandlerFactory(handler));
+    let service = SmtpService::with_handler_factory(config, factory);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+    (rt, bound, attempts)
+}
+
+/// Regression test for issue #344: a server that replies with a transient
+/// (4xx) rejection on the first two delivery attempts, then accepts, must
+/// end up delivered by [`RetryingSend`] — proving the retry loop actually
+/// redials and resends, not just that the policy's math allows it.
+#[test]
+fn retrying_send_delivers_after_transient_rejections_then_success() {
+    let (rt, addr, attempts) = start_scripted_server(2, 452);
+
+    let policy = RetryPolicy::exponential_backoff()
+        .with_initial_delay(Duration::from_millis(20))
+        .with_max_delay(Duration::from_millis(50))
+        .with_max_attempts(5);
+
+    let outcome: Arc<Mutex<Option<SmtpSendOutcome>>> = Arc::new(Mutex::new(None));
+    let outcome2 = Arc::clone(&outcome);
+    let client = SmtpClient::from_addr(addr).timeouts(SmtpClientTimeouts {
+        stage: Duration::from_secs(3),
+        ..Default::default()
+    });
+    let retrying = RetryingSend::new(client, Arc::clone(&rt), policy, || {
+        SmtpSend::new("client.example")
+            .mail_from("from@example.com")
+            .rcpt_to("to@example.com")
+            .message_with(once(b"Subject: hi\r\n\r\nhello\r\n".to_vec()))
+    })
+    .on_final(move |o| *outcome2.lock().unwrap() = Some(o));
+    retrying.send();
+
+    assert!(
+        wait_for(|| outcome.lock().unwrap().is_some(), 5000),
+        "retrying send never reached a final outcome"
+    );
+    let final_outcome = outcome.lock().unwrap().take().unwrap();
+    assert!(
+        matches!(final_outcome, SmtpSendOutcome::Delivered),
+        "expected eventual delivery, got {final_outcome:?}"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        3,
+        "should have redialed exactly 3 times: 2 rejections + 1 success"
+    );
+}
+
+/// Regression test for issue #344: a permanent (5xx) rejection must never
+/// be retried — [`RetryingSend`] should report failure after exactly one
+/// attempt, not redial.
+#[test]
+fn retrying_send_never_retries_a_permanent_rejection() {
+    let (rt, addr, attempts) = start_scripted_server(usize::MAX, 550);
+
+    let policy = RetryPolicy::exponential_backoff()
+        .with_initial_delay(Duration::from_millis(20))
+        .with_max_delay(Duration::from_millis(50))
+        .with_max_attempts(5);
+
+    let outcome: Arc<Mutex<Option<SmtpSendOutcome>>> = Arc::new(Mutex::new(None));
+    let outcome2 = Arc::clone(&outcome);
+    let client = SmtpClient::from_addr(addr).timeouts(SmtpClientTimeouts {
+        stage: Duration::from_secs(3),
+        ..Default::default()
+    });
+    let retrying = RetryingSend::new(client, Arc::clone(&rt), policy, || {
+        SmtpSend::new("client.example")
+            .mail_from("from@example.com")
+            .rcpt_to("to@example.com")
+            .message_with(once(b"Subject: hi\r\n\r\nhello\r\n".to_vec()))
+    })
+    .on_final(move |o| *outcome2.lock().unwrap() = Some(o));
+    retrying.send();
+
+    assert!(
+        wait_for(|| outcome.lock().unwrap().is_some(), 2000),
+        "retrying send never reached a final outcome"
+    );
+    let final_outcome = outcome.lock().unwrap().take().unwrap();
+    assert!(
+        matches!(final_outcome, SmtpSendOutcome::Rejected { code: 550, .. }),
+        "expected an immediate permanent rejection, got {final_outcome:?}"
+    );
+
+    // Give a wrongly-scheduled retry plenty of time to (not) happen.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "a 5xx reply must never be retried"
+    );
+}
+
+/// Sanity check that [`smtp_retry_policy`]'s RFC 5321-aligned defaults are
+/// actually the values the issue calls for, not just "some policy that
+/// compiles" — first retry no sooner than 30 minutes, growing but capped
+/// well under a day between attempts.
+#[test]
+fn smtp_retry_policy_matches_rfc_5321_aligned_defaults() {
+    let policy = smtp_retry_policy();
+    // ±10% jitter is part of the defaults, so check bounds rather than an
+    // exact value: RFC 5321 §4.5.4 recommends the first retry be delayed
+    // at least 30 minutes.
+    let first = policy.delay_for_attempt(1).as_secs();
+    assert!(
+        (30 * 60 * 9 / 10..=30 * 60 * 11 / 10).contains(&first),
+        "expected ~30 minutes (±10% jitter), got {first}s"
+    );
+    assert!(
+        policy.delay_for_attempt(2) > policy.delay_for_attempt(1),
+        "backoff should grow between attempts, not stay fixed"
+    );
+    let capped = policy.delay_for_attempt(20).as_secs();
+    assert!(
+        capped <= 4 * 60 * 60 * 11 / 10,
+        "delay must stay capped well under a day between attempts, got {capped}s"
+    );
 }
 
 /// End-to-end proof that [`crate::AuthPipeline`] can be returned from

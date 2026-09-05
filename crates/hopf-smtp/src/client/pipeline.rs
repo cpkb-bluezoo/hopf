@@ -46,6 +46,29 @@ impl Default for MessageSource {
     }
 }
 
+/// Why an [`SmtpSend`] attempt ended (issue #344) — set via
+/// [`SmtpSend::on_result`] for callers that need to decide whether the
+/// failure is worth retrying. [`SmtpSend::on_complete`]'s plain `bool`
+/// collapses all of this to success/failure and stays unaffected by
+/// whether `on_result` is also set.
+#[derive(Debug, Clone)]
+pub enum SmtpSendOutcome {
+    /// The message was accepted for delivery.
+    Delivered,
+    /// The remote server rejected the message with an explicit SMTP reply
+    /// code.
+    Rejected {
+        /// The SMTP reply code (e.g. 550, 452).
+        code: u16,
+        /// The reply's text.
+        message: String,
+    },
+    /// The attempt ended with no explicit reply code to classify: a
+    /// connection failure, a protocol-level desync, TLS/AUTH failure
+    /// before any MAIL/RCPT/DATA reply, or similar.
+    Failed(String),
+}
+
 /// Result of an offloaded DATA/BDAT chunk read (issue #184), stashed by
 /// the storage callback for [`SmtpSendDriver::resume_pending_data`] to
 /// apply once back on the reactor thread (see
@@ -94,6 +117,8 @@ struct SmtpSendState {
     pipeline_abort: bool,
     /// Completion callback.
     on_complete: Option<Box<dyn FnOnce(bool) + Send>>,
+    /// Richer completion callback (issue #344) — see [`SmtpSend::on_result`].
+    on_result: Option<Box<dyn FnOnce(SmtpSendOutcome) + Send>>,
     /// Set by an offloaded DATA/BDAT chunk read's storage callback (issue
     /// #184); applied by `SmtpSendDriver::resume_pending_data`.
     pending_data: Option<PendingDataOutcome>,
@@ -145,6 +170,7 @@ impl SmtpSend {
             accepted_rcpts: 0,
             pipeline_abort: false,
             on_complete: None,
+            on_result: None,
             pending_data: None,
         })))
     }
@@ -270,6 +296,16 @@ impl SmtpSend {
         self.0.lock().unwrap().on_complete = Some(cb);
         self
     }
+
+    /// Register a richer completion callback (issue #344) carrying the
+    /// SMTP reply code when one is available — use this instead of (or
+    /// alongside) [`Self::on_complete`] when the caller needs to decide
+    /// whether a failure is worth retrying (e.g. [`super::RetryingSend`]).
+    /// Both callbacks fire independently if both are set.
+    pub fn on_result(self, cb: Box<dyn FnOnce(SmtpSendOutcome) + Send>) -> Self {
+        self.0.lock().unwrap().on_result = Some(cb);
+        self
+    }
 }
 
 impl SmtpClientHandlerFactory for SmtpSend {
@@ -289,9 +325,37 @@ struct SmtpSendDriver {
 }
 
 impl SmtpSendDriver {
+    /// Coarse completion — used everywhere a caller only ever distinguished
+    /// success from failure. Reported as [`SmtpSendOutcome::Delivered`] /
+    /// [`SmtpSendOutcome::Failed`] to any [`SmtpSend::on_result`] callback
+    /// too, so a generic failure with no reply code is treated as
+    /// retryable there (matching connection-level failures being worth
+    /// retrying) rather than silently never reaching that callback at all.
     fn complete(&self, ok: bool) {
-        let mut st = self.state.lock().unwrap();
-        if let Some(cb) = st.on_complete.take() {
+        self.finish(if ok {
+            SmtpSendOutcome::Delivered
+        } else {
+            SmtpSendOutcome::Failed(String::new())
+        });
+    }
+
+    /// Completion with an explicit SMTP reply code — used at the sites
+    /// that actually have one (message-level accept/reject).
+    fn complete_rejected(&self, code: u16, message: &str) {
+        self.finish(SmtpSendOutcome::Rejected {
+            code,
+            message: message.to_string(),
+        });
+    }
+
+    fn finish(&self, outcome: SmtpSendOutcome) {
+        let ok = matches!(outcome, SmtpSendOutcome::Delivered);
+        let on_result = self.state.lock().unwrap().on_result.take();
+        if let Some(cb) = on_result {
+            cb(outcome);
+        }
+        let on_complete = self.state.lock().unwrap().on_complete.take();
+        if let Some(cb) = on_complete {
             cb(ok);
         }
     }
@@ -854,12 +918,13 @@ impl SmtpClientDriver for SmtpSendDriver {
         &mut self,
         envelope: &mut dyn SmtpClientEnvelope,
         _ep: &mut dyn Endpoint,
-        _code: u16,
-        _message: &str,
+        code: u16,
+        message: &str,
     ) {
-        // The auto-pilot pipeline doesn't retry — give up like every other
-        // rejection path.
-        self.complete(false);
+        // This one-shot pipeline doesn't retry itself — a caller that
+        // wants retry behavior wraps it (see `SmtpSend::on_result` /
+        // `super::RetryingSend`, issue #344).
+        self.complete_rejected(code, message);
         envelope.quit();
     }
 
@@ -877,10 +942,10 @@ impl SmtpClientDriver for SmtpSendDriver {
         &mut self,
         session: &mut dyn SmtpClientSession,
         _ep: &mut dyn Endpoint,
-        _code: u16,
-        _message: &str,
+        code: u16,
+        message: &str,
     ) {
-        self.complete(false);
+        self.complete_rejected(code, message);
         session.quit();
     }
 
