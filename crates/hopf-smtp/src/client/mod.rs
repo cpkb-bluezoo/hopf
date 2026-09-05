@@ -33,14 +33,16 @@ mod facade;
 mod handlers;
 mod pipeline;
 mod reply;
+mod retry;
 mod state;
 
 pub use endpoint::SmtpClientEndpoint;
 pub use error::{SmtpError, SmtpResult};
 pub use facade::{SmtpClient, SmtpClientTimeouts};
 pub use handlers::{SmtpClientDriver, SmtpClientHandlerFactory};
-pub use pipeline::SmtpSend;
+pub use pipeline::{SmtpSend, SmtpSendOutcome};
 pub use reply::{SmtpEvent, SmtpReplyLexer, SmtpReplyShape, MAX_REPLY_LINE};
+pub use retry::{smtp_retry_policy, RetryingSend};
 pub use state::{
     MailFromParams, SmtpCapabilities, SmtpClientAuthExchange, SmtpClientEnvelope,
     SmtpClientHello, SmtpClientMessageData, SmtpClientPostTls, SmtpClientSession,

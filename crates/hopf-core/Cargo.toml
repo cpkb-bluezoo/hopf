@@ -23,6 +23,7 @@ integration = []
 mio = { workspace = true }
 tractrix = { workspace = true }
 bytes = "1"
+getrandom = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # UNIX domain socket peer credentials (SO_PEERCRED / getpeereid).

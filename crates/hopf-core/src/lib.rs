@@ -28,6 +28,7 @@ pub mod peer_addr;
 pub mod peer_cred;
 pub mod pool;
 pub mod quota;
+pub mod retry;
 pub mod runtime;
 pub mod security;
 pub mod service;
@@ -66,6 +67,7 @@ pub use quota::{
     CounterQuota, MemoryQuotaManager, Quota, QuotaManager, QuotaPolicy, QuotaSource, QuotaTracker,
     QuotaVerdict, UnlimitedQuota, UnlimitedQuotaManager, UNLIMITED,
 };
+pub use retry::{RetryBound, RetryPolicy, RetryState, Retryable};
 pub use runtime::{Runtime, RuntimeConfig};
 pub use security::SecurityInfo;
 pub use service::Service;
