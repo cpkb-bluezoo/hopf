@@ -45,6 +45,15 @@ impl SocksCommand {
         }
     }
 
+    /// Encode as the wire `CMD` byte — used by the client-side request
+    /// encoders ([`encode_socks4_request`], [`encode_socks5_request`]).
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Connect => 0x01,
+            Self::Bind => 0x02,
+            Self::UdpAssociate => 0x03,
+        }
+    }
 }
 
 /// RFC 1928 §5 address type codes.
@@ -210,6 +219,50 @@ pub fn encode_socks4_reply(reply: Socks4Reply, bound: SocketAddr) -> Vec<u8> {
     out
 }
 
+/// Encode a SOCKS4/4a request (`VER,CD,DSTPORT(2),DSTIP(4),USERID,NUL`, or
+/// the SOCKS4a hostname-extension form). `username` is sent as the USERID
+/// field verbatim (empty if `None`) — this is a plaintext identity claim,
+/// not a credential; RFC 1929-style verified authentication only exists
+/// under SOCKS5. Returns `None` for an IPv6 address — SOCKS4 has no IPv6
+/// concept, and there is no encoding to fall back to.
+pub fn encode_socks4_request(command: SocksCommand, address: &SocksAddress, port: u16, username: Option<&str>) -> Option<Vec<u8>> {
+    let mut out = vec![VERSION_4, command.to_u8()];
+    out.extend_from_slice(&port.to_be_bytes());
+    match address {
+        SocksAddress::Ip(IpAddr::V4(v4)) => {
+            out.extend_from_slice(&v4.octets());
+            out.extend_from_slice(username.unwrap_or("").as_bytes());
+            out.push(0);
+        }
+        SocksAddress::Ip(IpAddr::V6(_)) => return None,
+        SocksAddress::Domain(host) => {
+            out.extend_from_slice(&[0, 0, 0, 1]); // SOCKS4a magic IP
+            out.extend_from_slice(username.unwrap_or("").as_bytes());
+            out.push(0);
+            out.extend_from_slice(host.as_bytes());
+            out.push(0);
+        }
+    }
+    Some(out)
+}
+
+/// A parsed SOCKS4/4a reply (`VN,CD,DSTPORT(2),DSTIP(4)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Socks4ReplyMessage {
+    /// Whether the request was granted (`CD = 0x5a`).
+    pub granted: bool,
+}
+
+/// Parse a SOCKS4/4a reply. `VN` (conventionally `0x00`) is not
+/// validated — real-world server implementations are inconsistent about
+/// it, and `CD` alone is unambiguous.
+pub fn parse_socks4_reply(data: &[u8]) -> ParseResult<Socks4ReplyMessage> {
+    if data.len() < 8 {
+        return ParseResult::Incomplete;
+    }
+    ParseResult::Complete(Socks4ReplyMessage { granted: data[1] == 0x5a }, 8)
+}
+
 /// A parsed SOCKS5 method-selection greeting (`VER,NMETHODS,METHODS[]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Socks5Greeting {
@@ -237,9 +290,28 @@ pub fn parse_socks5_greeting(data: &[u8]) -> ParseResult<Socks5Greeting> {
     ParseResult::Complete(Socks5Greeting { methods }, total)
 }
 
+/// Encode a SOCKS5 greeting (`VER,NMETHODS,METHODS[]`).
+pub fn encode_socks5_greeting(methods: &[u8]) -> Vec<u8> {
+    let mut out = vec![VERSION_5, methods.len() as u8];
+    out.extend_from_slice(methods);
+    out
+}
+
 /// Encode the server's method-selection reply (`VER,METHOD`).
 pub fn encode_method_selection(method: u8) -> Vec<u8> {
     vec![VERSION_5, method]
+}
+
+/// Parse a method-selection reply (`VER,METHOD`), returning the selected
+/// method byte.
+pub fn parse_method_selection(data: &[u8]) -> ParseResult<u8> {
+    if data.len() < 2 {
+        return ParseResult::Incomplete;
+    }
+    if data[0] != VERSION_5 {
+        return ParseResult::Invalid;
+    }
+    ParseResult::Complete(data[1], 2)
 }
 
 /// A parsed RFC 1929 username/password sub-negotiation request
@@ -298,6 +370,34 @@ pub fn encode_user_password_reply(success: bool) -> Vec<u8> {
     vec![AUTH_VERSION_1, if success { 0x00 } else { 0x01 }]
 }
 
+/// Encode an RFC 1929 §2 username/password sub-negotiation request
+/// (`VER,ULEN,UNAME,PLEN,PASSWD`). Returns `None` if either string is
+/// longer than 255 bytes — the length prefix is a single byte, so there
+/// is no encoding for a longer value, and silently truncating it would
+/// send a corrupted (and misleadingly different) credential.
+pub fn encode_user_password_request(username: &str, password: &str) -> Option<Vec<u8>> {
+    if username.len() > u8::MAX as usize || password.len() > u8::MAX as usize {
+        return None;
+    }
+    let mut out = vec![AUTH_VERSION_1, username.len() as u8];
+    out.extend_from_slice(username.as_bytes());
+    out.push(password.len() as u8);
+    out.extend_from_slice(password.as_bytes());
+    Some(out)
+}
+
+/// Parse the RFC 1929 §2 username/password sub-negotiation reply
+/// (`VER,STATUS`), returning whether it indicates success.
+pub fn parse_user_password_reply(data: &[u8]) -> ParseResult<bool> {
+    if data.len() < 2 {
+        return ParseResult::Incomplete;
+    }
+    if data[0] != AUTH_VERSION_1 {
+        return ParseResult::Invalid;
+    }
+    ParseResult::Complete(data[1] == 0x00, 2)
+}
+
 /// A parsed SOCKS5 request (`VER,CMD,RSV,ATYP,DST.ADDR,DST.PORT`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Socks5Request {
@@ -307,6 +407,82 @@ pub struct Socks5Request {
     pub address: SocksAddress,
     /// Target port.
     pub port: u16,
+}
+
+/// Parse `ATYP,ADDR,PORT` from `data[0]` onward — the tail shared,
+/// byte-for-byte, by a SOCKS5 request and a SOCKS5 reply alike (both are
+/// `<3 fixed bytes>,ATYP,ADDR,PORT`; only what's in those first 3 bytes
+/// differs). The returned consumed length is relative to `data[0]`, not
+/// to the request/reply's own start — callers add back whatever prefix
+/// they stripped before calling this.
+fn parse_atyp_address_port(data: &[u8]) -> ParseResult<(SocksAddress, u16)> {
+    if data.is_empty() {
+        return ParseResult::Incomplete;
+    }
+    let atyp = data[0];
+    let (address, addr_len) = match atyp {
+        x if x == AddressType::Ipv4 as u8 => {
+            if data.len() < 1 + 4 {
+                return ParseResult::Incomplete;
+            }
+            let ip = Ipv4Addr::new(data[1], data[2], data[3], data[4]);
+            (SocksAddress::Ip(IpAddr::V4(ip)), 4)
+        }
+        x if x == AddressType::Ipv6 as u8 => {
+            if data.len() < 1 + 16 {
+                return ParseResult::Incomplete;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&data[1..17]);
+            (SocksAddress::Ip(IpAddr::V6(Ipv6Addr::from(octets))), 16)
+        }
+        x if x == AddressType::DomainName as u8 => {
+            if data.len() < 2 {
+                return ParseResult::Incomplete;
+            }
+            let len = data[1] as usize;
+            if data.len() < 2 + len {
+                return ParseResult::Incomplete;
+            }
+            let Ok(host) = std::str::from_utf8(&data[2..2 + len]) else {
+                return ParseResult::Invalid;
+            };
+            (SocksAddress::Domain(host.to_string()), 1 + len)
+        }
+        _ => return ParseResult::Invalid,
+    };
+    let port_offset = 1 + addr_len;
+    if data.len() < port_offset + 2 {
+        return ParseResult::Incomplete;
+    }
+    let port = u16::from_be_bytes([data[port_offset], data[port_offset + 1]]);
+    ParseResult::Complete((address, port), port_offset + 2)
+}
+
+/// Encode `ATYP,ADDR` for `address` — the tail shared by
+/// [`encode_socks5_request`] and a SOCKS5 reply. Returns `None` for a
+/// domain name longer than 255 bytes — the length prefix is a single
+/// byte, so there is no encoding for a longer value.
+fn encode_atyp_address(out: &mut Vec<u8>, address: &SocksAddress) -> Option<()> {
+    match address {
+        SocksAddress::Ip(IpAddr::V4(v4)) => {
+            out.push(AddressType::Ipv4 as u8);
+            out.extend_from_slice(&v4.octets());
+        }
+        SocksAddress::Ip(IpAddr::V6(v6)) => {
+            out.push(AddressType::Ipv6 as u8);
+            out.extend_from_slice(&v6.octets());
+        }
+        SocksAddress::Domain(host) => {
+            if host.len() > u8::MAX as usize {
+                return None;
+            }
+            out.push(AddressType::DomainName as u8);
+            out.push(host.len() as u8);
+            out.extend_from_slice(host.as_bytes());
+        }
+    }
+    Some(())
 }
 
 /// Parse a SOCKS5 request. `data` starts at the version byte (`0x05`).
@@ -325,51 +501,58 @@ pub fn parse_socks5_request(data: &[u8]) -> ParseResult<Socks5Request> {
         return ParseResult::Invalid;
     };
     // data[2] is RSV, ignored.
-    let atyp = data[3];
-    let (address, addr_len) = match atyp {
-        x if x == AddressType::Ipv4 as u8 => {
-            if data.len() < 4 + 4 {
-                return ParseResult::Incomplete;
-            }
-            let ip = Ipv4Addr::new(data[4], data[5], data[6], data[7]);
-            (SocksAddress::Ip(IpAddr::V4(ip)), 4)
+    match parse_atyp_address_port(&data[3..]) {
+        ParseResult::Complete((address, port), n) => {
+            ParseResult::Complete(Socks5Request { command, address, port }, 3 + n)
         }
-        x if x == AddressType::Ipv6 as u8 => {
-            if data.len() < 4 + 16 {
-                return ParseResult::Incomplete;
-            }
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&data[4..20]);
-            (SocksAddress::Ip(IpAddr::V6(Ipv6Addr::from(octets))), 16)
-        }
-        x if x == AddressType::DomainName as u8 => {
-            if data.len() < 5 {
-                return ParseResult::Incomplete;
-            }
-            let len = data[4] as usize;
-            if data.len() < 5 + len {
-                return ParseResult::Incomplete;
-            }
-            let Ok(host) = std::str::from_utf8(&data[5..5 + len]) else {
-                return ParseResult::Invalid;
-            };
-            (SocksAddress::Domain(host.to_string()), 1 + len)
-        }
-        _ => return ParseResult::Invalid,
-    };
-    let port_offset = 4 + addr_len;
-    if data.len() < port_offset + 2 {
+        ParseResult::Incomplete => ParseResult::Incomplete,
+        ParseResult::Invalid => ParseResult::Invalid,
+    }
+}
+
+/// Encode a SOCKS5 request (`VER,CMD,RSV,ATYP,DST.ADDR,DST.PORT`). Returns
+/// `None` if `address` is a domain name longer than 255 bytes (see
+/// [`encode_atyp_address`]).
+pub fn encode_socks5_request(command: SocksCommand, address: &SocksAddress, port: u16) -> Option<Vec<u8>> {
+    let mut out = vec![VERSION_5, command.to_u8(), 0x00];
+    encode_atyp_address(&mut out, address)?;
+    out.extend_from_slice(&port.to_be_bytes());
+    Some(out)
+}
+
+/// A parsed SOCKS5 reply (`VER,REP,RSV,ATYP,BND.ADDR,BND.PORT`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Socks5ReplyMessage {
+    /// Raw reply code. Not decoded into [`Socks5Reply`] here — a server
+    /// could in principle send a code this crate doesn't itself ever
+    /// produce, and the client should still be able to report it (as
+    /// "not success") rather than treat an unrecognized code as a parse
+    /// failure.
+    pub reply: u8,
+    /// Bound address (meaningless for most reply codes other than
+    /// success, but always present on the wire).
+    pub address: SocksAddress,
+    /// Bound port.
+    pub port: u16,
+}
+
+/// Parse a SOCKS5 reply. `data` starts at the version byte (`0x05`).
+pub fn parse_socks5_reply(data: &[u8]) -> ParseResult<Socks5ReplyMessage> {
+    if data.len() < 4 {
         return ParseResult::Incomplete;
     }
-    let port = u16::from_be_bytes([data[port_offset], data[port_offset + 1]]);
-    ParseResult::Complete(
-        Socks5Request {
-            command,
-            address,
-            port,
-        },
-        port_offset + 2,
-    )
+    if data[0] != VERSION_5 {
+        return ParseResult::Invalid;
+    }
+    let reply = data[1];
+    // data[2] is RSV, ignored.
+    match parse_atyp_address_port(&data[3..]) {
+        ParseResult::Complete((address, port), n) => {
+            ParseResult::Complete(Socks5ReplyMessage { reply, address, port }, 3 + n)
+        }
+        ParseResult::Incomplete => ParseResult::Incomplete,
+        ParseResult::Invalid => ParseResult::Invalid,
+    }
 }
 
 /// Encode a SOCKS5 reply (`VER,REP,RSV,ATYP,BND.ADDR,BND.PORT`).
@@ -735,5 +918,177 @@ mod tests {
         assert_eq!(encoded[0..3], [0x05, 0x02, 0x00]);
         assert_eq!(encoded[3], 0x04);
         assert_eq!(encoded.len(), 4 + 16 + 2);
+    }
+
+    // -- Client-side codecs (mirror the server-side ones above) --------
+
+    #[test]
+    fn client_socks4_connect_request_round_trips_through_the_server_parser() {
+        let addr = SocksAddress::Ip(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+        let encoded = encode_socks4_request(SocksCommand::Connect, &addr, 443, None).unwrap();
+        assert_complete(
+            parse_socks4_request(&encoded),
+            Socks4Request {
+                command: SocksCommand::Connect,
+                port: 443,
+                address: addr,
+                user_id: vec![],
+            },
+            encoded.len(),
+        );
+    }
+
+    #[test]
+    fn client_socks4_request_carries_a_userid_when_given() {
+        let addr = SocksAddress::Ip(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        let encoded = encode_socks4_request(SocksCommand::Connect, &addr, 80, Some("someuser")).unwrap();
+        match parse_socks4_request(&encoded) {
+            ParseResult::Complete(req, _) => assert_eq!(req.user_id, b"someuser"),
+            _ => panic!("expected Complete"),
+        }
+    }
+
+    #[test]
+    fn client_socks4a_hostname_request_round_trips_through_the_server_parser() {
+        let addr = SocksAddress::Domain("example.com".to_string());
+        let encoded = encode_socks4_request(SocksCommand::Connect, &addr, 443, None).unwrap();
+        assert_complete(
+            parse_socks4_request(&encoded),
+            Socks4Request {
+                command: SocksCommand::Connect,
+                port: 443,
+                address: addr,
+                user_id: vec![],
+            },
+            encoded.len(),
+        );
+    }
+
+    #[test]
+    fn client_socks4_request_rejects_an_ipv6_target() {
+        let addr = SocksAddress::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert!(encode_socks4_request(SocksCommand::Connect, &addr, 80, None).is_none());
+    }
+
+    #[test]
+    fn client_parses_socks4_reply_granted_and_rejected() {
+        let mut granted = vec![0x00, 0x5a];
+        granted.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        assert_complete(parse_socks4_reply(&granted), Socks4ReplyMessage { granted: true }, 8);
+
+        let mut rejected = vec![0x00, 0x5b];
+        rejected.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        assert_complete(parse_socks4_reply(&rejected), Socks4ReplyMessage { granted: false }, 8);
+    }
+
+    #[test]
+    fn client_socks5_greeting_round_trips_through_the_server_parser() {
+        let encoded = encode_socks5_greeting(&[0x00, 0x02]);
+        assert_complete(
+            parse_socks5_greeting(&encoded),
+            Socks5Greeting {
+                methods: vec![0x00, 0x02],
+            },
+            encoded.len(),
+        );
+    }
+
+    #[test]
+    fn client_parses_method_selection() {
+        let encoded = encode_method_selection(0x02);
+        assert_complete(parse_method_selection(&encoded), 0x02, 2);
+    }
+
+    #[test]
+    fn client_user_password_request_round_trips_through_the_server_parser() {
+        let encoded = encode_user_password_request("user", "password").unwrap();
+        assert_complete(
+            parse_user_password_request(&encoded),
+            UserPasswordRequest {
+                username: "user".to_string(),
+                password: "password".to_string(),
+            },
+            encoded.len(),
+        );
+    }
+
+    #[test]
+    fn client_user_password_request_rejects_an_overlong_field() {
+        let too_long = "x".repeat(256);
+        assert!(encode_user_password_request(&too_long, "p").is_none());
+        assert!(encode_user_password_request("u", &too_long).is_none());
+    }
+
+    #[test]
+    fn client_parses_user_password_reply() {
+        assert_complete(parse_user_password_reply(&encode_user_password_reply(true)), true, 2);
+        assert_complete(parse_user_password_reply(&encode_user_password_reply(false)), false, 2);
+    }
+
+    #[test]
+    fn client_socks5_connect_request_round_trips_through_the_server_parser() {
+        for addr in [
+            SocksAddress::Ip(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+            SocksAddress::Ip(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+            SocksAddress::Domain("example.com".to_string()),
+        ] {
+            let encoded = encode_socks5_request(SocksCommand::Connect, &addr, 443).unwrap();
+            assert_complete(
+                parse_socks5_request(&encoded),
+                Socks5Request {
+                    command: SocksCommand::Connect,
+                    address: addr,
+                    port: 443,
+                },
+                encoded.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn client_socks5_request_rejects_an_overlong_domain_name() {
+        let addr = SocksAddress::Domain("x".repeat(256));
+        assert!(encode_socks5_request(SocksCommand::Connect, &addr, 80).is_none());
+    }
+
+    #[test]
+    fn client_parses_socks5_reply_success_and_failure() {
+        let bound: SocketAddr = "93.184.216.34:1080".parse().unwrap();
+        let encoded = encode_socks5_reply(Socks5Reply::Succeeded, bound);
+        assert_complete(
+            parse_socks5_reply(&encoded),
+            Socks5ReplyMessage {
+                reply: 0x00,
+                address: SocksAddress::Ip(bound.ip()),
+                port: bound.port(),
+            },
+            encoded.len(),
+        );
+
+        let encoded = encode_socks5_reply(Socks5Reply::ConnectionRefused, bound);
+        match parse_socks5_reply(&encoded) {
+            ParseResult::Complete(reply, _) => assert_eq!(reply.reply, 0x05),
+            _ => panic!("expected Complete"),
+        }
+    }
+
+    #[test]
+    fn client_parses_socks5_reply_split_across_reads() {
+        let bound: SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
+        let encoded = encode_socks5_reply(Socks5Reply::Succeeded, bound);
+        // Every prefix shorter than the full reply must say Incomplete —
+        // simulating the reply arriving one byte at a time.
+        for n in 0..encoded.len() {
+            assert!(matches!(parse_socks5_reply(&encoded[..n]), ParseResult::Incomplete));
+        }
+        assert_complete(
+            parse_socks5_reply(&encoded),
+            Socks5ReplyMessage {
+                reply: 0x00,
+                address: SocksAddress::Ip(bound.ip()),
+                port: bound.port(),
+            },
+            encoded.len(),
+        );
     }
 }

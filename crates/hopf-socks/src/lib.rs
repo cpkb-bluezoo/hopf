@@ -7,7 +7,9 @@
 //! Currently implemented: version detection, SOCKS5 method negotiation
 //! with RFC 1929 username/password authentication (see
 //! [`SocksAuthenticator`]), and the CONNECT, BIND, and UDP ASSOCIATE
-//! commands, server-side. The client side is tracked separately.
+//! commands, server-side, plus a CONNECT client (see
+//! [`SocksConnectHandler`] / [`socks_connect_config`]). BIND and UDP
+//! ASSOCIATE client support are tracked separately.
 //!
 //! RFC 1961 GSSAPI authentication is a deliberate non-goal: it requires an
 //! external Kerberos/GSSAPI dependency this crate does not take on. A
@@ -22,6 +24,7 @@
 
 mod auth;
 mod bind;
+mod client;
 mod connect;
 mod handler;
 mod metrics;
@@ -34,6 +37,10 @@ mod wire;
 
 pub use auth::SocksAuthenticator;
 pub use bind::DEFAULT_BIND_ACCEPT_TIMEOUT;
+pub use client::{
+    socks_connect_config, SocksClientConfig, SocksClientVersion, SocksConnectHandler,
+    DEFAULT_CLIENT_HANDSHAKE_TIMEOUT,
+};
 pub use connect::DEFAULT_RELAY_IDLE_TIMEOUT;
 pub use handler::{SocksConnectionHandlerFactory, DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_MAX_RELAYS};
 pub use metrics::SocksServerMetrics;

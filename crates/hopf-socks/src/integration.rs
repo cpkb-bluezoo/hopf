@@ -1,22 +1,28 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
 //! Real TCP loopback round-trips through a `SocksService` (feature
-//! `integration`). Drives the raw wire protocol by hand — there is no
-//! `hopf-socks` client yet (tracked separately) — against a plain TCP echo
-//! target standing in for "the proxied destination."
+//! `integration`). The server-side tests drive the raw wire protocol by
+//! hand; the client-side tests exercise `SocksConnectHandler` against a
+//! real `SocksService` instance, both against a plain TCP echo target
+//! standing in for "the proxied destination."
 
 #![cfg(feature = "integration")]
 
+use std::io;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use hopf_core::{IpNet, PeerAcl, Runtime, RuntimeConfig};
+use hopf_core::{Endpoint, IpNet, PeerAcl, ProtocolHandler, Runtime, RuntimeConfig};
 use hopf_dns::DnsResolver;
 
-use crate::{SocksAuthenticator, SocksConnectionHandlerFactory, SocksPolicy, SocksService};
+use crate::{
+    socks_connect_config, SocksAuthenticator, SocksClientConfig, SocksClientVersion,
+    SocksConnectionHandlerFactory, SocksPolicy, SocksService,
+};
 
 struct AllowAll;
 impl SocksPolicy for AllowAll {
@@ -800,4 +806,315 @@ fn socks_over_tls_completes_a_connect_relay() {
     let mut echoed = [0u8; 9];
     tls.read_exact(&mut echoed).unwrap();
     assert_eq!(&echoed, b"tls-relay");
+}
+
+// ---------------------------------------------------------------------
+// Client-side (`SocksConnectHandler`) tests, against a real `SocksService`.
+// ---------------------------------------------------------------------
+
+/// Test-only inner [`ProtocolHandler`]: sends a fixed payload as soon as
+/// the tunnel is up, records whatever comes back, and records any error
+/// (which is how a handshake failure is reported — see
+/// `SocksConnectHandler`'s doc comment).
+struct ClientProbe {
+    connected: Arc<AtomicBool>,
+    received: Arc<Mutex<Vec<u8>>>,
+    error_message: Arc<Mutex<Option<String>>>,
+    send_on_connect: &'static [u8],
+}
+
+impl ProtocolHandler for ClientProbe {
+    fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+        self.connected.store(true, Ordering::Release);
+        if !self.send_on_connect.is_empty() {
+            endpoint.send(self.send_on_connect);
+        }
+    }
+
+    fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        self.received.lock().unwrap().extend_from_slice(data);
+        *data = &[];
+    }
+
+    fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+    fn error(&mut self, _endpoint: &mut dyn Endpoint, err: &io::Error) {
+        *self.error_message.lock().unwrap() = Some(err.to_string());
+    }
+}
+
+/// Poll `condition` until it's true or `timeout` elapses; panics on
+/// timeout with `what` in the message.
+fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration, what: &str) {
+    let start = std::time::Instant::now();
+    while !condition() {
+        if start.elapsed() > timeout {
+            panic!("timed out waiting for: {what}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn client_connects_through_a_socks5_no_auth_proxy_to_the_target() {
+    let target = start_echo_target();
+    let (rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let connected = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let error_message = Arc::new(Mutex::new(None));
+    let (connected2, received2, error2) = (Arc::clone(&connected), Arc::clone(&received), Arc::clone(&error_message));
+
+    let cfg = socks_connect_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks5),
+        target.ip().to_string(),
+        target.port(),
+        move || {
+            Box::new(ClientProbe {
+                connected: Arc::clone(&connected2),
+                received: Arc::clone(&received2),
+                error_message: Arc::clone(&error2),
+                send_on_connect: b"hello-through-proxy",
+            }) as Box<dyn ProtocolHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(|| connected.load(Ordering::Acquire), Duration::from_secs(5), "client tunnel established");
+    wait_until(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+        "echoed payload received back through the tunnel",
+    );
+    assert_eq!(&*received.lock().unwrap(), b"hello-through-proxy");
+    assert!(error_message.lock().unwrap().is_none());
+}
+
+#[test]
+fn client_connects_through_a_socks4_proxy_to_the_target() {
+    let target = start_echo_target();
+    let (rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let connected = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let error_message = Arc::new(Mutex::new(None));
+    let (connected2, received2, error2) = (Arc::clone(&connected), Arc::clone(&received), Arc::clone(&error_message));
+
+    let cfg = socks_connect_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks4),
+        target.ip().to_string(),
+        target.port(),
+        move || {
+            Box::new(ClientProbe {
+                connected: Arc::clone(&connected2),
+                received: Arc::clone(&received2),
+                error_message: Arc::clone(&error2),
+                send_on_connect: b"via-socks4",
+            }) as Box<dyn ProtocolHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(|| connected.load(Ordering::Acquire), Duration::from_secs(5), "client tunnel established");
+    wait_until(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+        "echoed payload received back through the tunnel",
+    );
+    assert_eq!(&*received.lock().unwrap(), b"via-socks4");
+    assert!(error_message.lock().unwrap().is_none());
+}
+
+#[test]
+fn client_connects_through_a_socks4a_proxy_using_a_hostname_target() {
+    let target = start_echo_target();
+    let (rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let connected = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let error_message = Arc::new(Mutex::new(None));
+    let (connected2, received2, error2) = (Arc::clone(&connected), Arc::clone(&received), Arc::clone(&error_message));
+
+    // "localhost" forces the SOCKS4a hostname-extension path rather than
+    // the direct-IPv4 one, since it doesn't parse as an `IpAddr`.
+    let cfg = socks_connect_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks4),
+        "localhost",
+        target.port(),
+        move || {
+            Box::new(ClientProbe {
+                connected: Arc::clone(&connected2),
+                received: Arc::clone(&received2),
+                error_message: Arc::clone(&error2),
+                send_on_connect: b"via-socks4a",
+            }) as Box<dyn ProtocolHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(|| connected.load(Ordering::Acquire), Duration::from_secs(5), "client tunnel established");
+    wait_until(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+        "echoed payload received back through the tunnel",
+    );
+    assert_eq!(&*received.lock().unwrap(), b"via-socks4a");
+}
+
+#[test]
+fn client_connects_through_a_socks5_proxy_requiring_credentials() {
+    let target = start_echo_target();
+    let auth: Arc<dyn SocksAuthenticator> = Arc::new(FixedCredential {
+        username: "u",
+        password: "p",
+    });
+    let (rt, proxy) = start_socks_server(Arc::new(AllowAll), Some(auth));
+
+    let connected = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let error_message = Arc::new(Mutex::new(None));
+    let (connected2, received2, error2) = (Arc::clone(&connected), Arc::clone(&received), Arc::clone(&error_message));
+
+    let cfg = socks_connect_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks5).with_credentials("u", "p"),
+        target.ip().to_string(),
+        target.port(),
+        move || {
+            Box::new(ClientProbe {
+                connected: Arc::clone(&connected2),
+                received: Arc::clone(&received2),
+                error_message: Arc::clone(&error2),
+                send_on_connect: b"authenticated",
+            }) as Box<dyn ProtocolHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(|| connected.load(Ordering::Acquire), Duration::from_secs(5), "client tunnel established");
+    wait_until(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+        "echoed payload received back through the tunnel",
+    );
+    assert_eq!(&*received.lock().unwrap(), b"authenticated");
+}
+
+#[test]
+fn client_reports_an_error_when_the_proxy_rejects_wrong_credentials() {
+    let target = start_echo_target();
+    let auth: Arc<dyn SocksAuthenticator> = Arc::new(FixedCredential {
+        username: "u",
+        password: "p",
+    });
+    let (rt, proxy) = start_socks_server(Arc::new(AllowAll), Some(auth));
+
+    let connected = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let error_message = Arc::new(Mutex::new(None));
+    let (connected2, received2, error2) = (Arc::clone(&connected), Arc::clone(&received), Arc::clone(&error_message));
+
+    let cfg = socks_connect_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks5).with_credentials("u", "wrong"),
+        target.ip().to_string(),
+        target.port(),
+        move || {
+            Box::new(ClientProbe {
+                connected: Arc::clone(&connected2),
+                received: Arc::clone(&received2),
+                error_message: Arc::clone(&error2),
+                send_on_connect: b"",
+            }) as Box<dyn ProtocolHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(
+        || error_message.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+        "an error reported for rejected credentials",
+    );
+    assert!(!connected.load(Ordering::Acquire), "inner handler must not see connected() on a failed handshake");
+}
+
+#[test]
+fn client_reports_an_error_when_the_destination_policy_denies_the_target() {
+    let target = start_echo_target();
+    let (rt, proxy) = start_socks_server(Arc::new(DenyAll), None);
+
+    let connected = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let error_message = Arc::new(Mutex::new(None));
+    let (connected2, received2, error2) = (Arc::clone(&connected), Arc::clone(&received), Arc::clone(&error_message));
+
+    let cfg = socks_connect_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks5),
+        target.ip().to_string(),
+        target.port(),
+        move || {
+            Box::new(ClientProbe {
+                connected: Arc::clone(&connected2),
+                received: Arc::clone(&received2),
+                error_message: Arc::clone(&error2),
+                send_on_connect: b"",
+            }) as Box<dyn ProtocolHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(
+        || error_message.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+        "an error reported for a policy-denied target",
+    );
+    assert!(!connected.load(Ordering::Acquire));
+}
+
+#[test]
+fn client_handshake_timeout_reports_an_error_when_the_peer_never_replies() {
+    // A raw listener that accepts a connection and then sends nothing at
+    // all — standing in for a proxy that hangs mid-handshake.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let stuck_proxy = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        // Keep the accepted connection alive (don't let it drop and
+        // reset) but never write or read from it.
+        if let Ok((stream, _)) = listener.accept() {
+            std::mem::forget(stream);
+        }
+    });
+
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let connected = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let error_message = Arc::new(Mutex::new(None));
+    let (connected2, received2, error2) = (Arc::clone(&connected), Arc::clone(&received), Arc::clone(&error_message));
+
+    let cfg = socks_connect_config(
+        stuck_proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks5).with_handshake_timeout(Duration::from_millis(200)),
+        "93.184.216.34",
+        443,
+        move || {
+            Box::new(ClientProbe {
+                connected: Arc::clone(&connected2),
+                received: Arc::clone(&received2),
+                error_message: Arc::clone(&error2),
+                send_on_connect: b"",
+            }) as Box<dyn ProtocolHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(
+        || error_message.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+        "a handshake-timeout error",
+    );
+    assert!(!connected.load(Ordering::Acquire));
 }
