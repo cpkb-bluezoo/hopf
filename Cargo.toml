@@ -47,7 +47,6 @@ members = [
     "examples/mqtt-pub",
     "examples/amqp-pub",
     "examples/amqp-consume",
-    "examples/tlsa-record",
 ]
 default-members = [
     "crates/hopf",
