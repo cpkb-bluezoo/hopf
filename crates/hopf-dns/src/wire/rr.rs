@@ -124,7 +124,8 @@ pub enum TlsaUsage {
 }
 
 impl TlsaUsage {
-    fn from_u8(v: u8) -> Self {
+    /// Decode the wire byte, preserving any unassigned value (RFC 6698 §7.2).
+    pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::PkixTa,
             1 => Self::PkixEe,
@@ -134,7 +135,8 @@ impl TlsaUsage {
         }
     }
 
-    fn to_u8(self) -> u8 {
+    /// The wire byte this usage encodes to.
+    pub fn to_u8(self) -> u8 {
         match self {
             Self::PkixTa => 0,
             Self::PkixEe => 1,
@@ -159,7 +161,8 @@ pub enum TlsaSelector {
 }
 
 impl TlsaSelector {
-    fn from_u8(v: u8) -> Self {
+    /// Decode the wire byte, preserving any unassigned value.
+    pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::FullCertificate,
             1 => Self::SubjectPublicKeyInfo,
@@ -167,7 +170,8 @@ impl TlsaSelector {
         }
     }
 
-    fn to_u8(self) -> u8 {
+    /// The wire byte this selector encodes to.
+    pub fn to_u8(self) -> u8 {
         match self {
             Self::FullCertificate => 0,
             Self::SubjectPublicKeyInfo => 1,
@@ -192,7 +196,8 @@ pub enum TlsaMatchingType {
 }
 
 impl TlsaMatchingType {
-    fn from_u8(v: u8) -> Self {
+    /// Decode the wire byte, preserving any unassigned value.
+    pub fn from_u8(v: u8) -> Self {
         match v {
             0 => Self::Exact,
             1 => Self::Sha256,
@@ -201,7 +206,8 @@ impl TlsaMatchingType {
         }
     }
 
-    fn to_u8(self) -> u8 {
+    /// The wire byte this matching type encodes to.
+    pub fn to_u8(self) -> u8 {
         match self {
             Self::Exact => 0,
             Self::Sha256 => 1,

@@ -170,31 +170,59 @@ impl ServerCertVerifier for DaneServerCertVerifier {
 /// Whether `cert`'s selected data (per `record.selector`) matches
 /// `record.association_data` (per `record.matching_type`).
 fn matches_record(record: &TlsaRecord, cert: &CertificateDer<'_>) -> bool {
-    let Some(selected) = selected_data(record.selector, cert) else {
+    let Some(selected) = selected_data(record.selector, cert.as_ref()) else {
         return false;
     };
-    match record.matching_type {
-        TlsaMatchingType::Exact => selected == record.association_data,
-        TlsaMatchingType::Sha256 => {
-            use sha2::{Digest, Sha256};
-            Sha256::digest(&selected).as_slice() == record.association_data.as_slice()
-        }
-        TlsaMatchingType::Sha384 => {
-            use sha2::{Digest, Sha384};
-            Sha384::digest(&selected).as_slice() == record.association_data.as_slice()
-        }
-        TlsaMatchingType::Unassigned(_) => false,
-    }
+    let Some(computed) = hash_selected_data(record.matching_type, &selected) else {
+        return false;
+    };
+    computed == record.association_data
 }
 
 /// The bytes a TLSA record's association data is computed over, per its
 /// selector (RFC 6698 §2.1.2).
-fn selected_data(selector: TlsaSelector, cert: &CertificateDer<'_>) -> Option<Vec<u8>> {
+fn selected_data(selector: TlsaSelector, cert_der: &[u8]) -> Option<Vec<u8>> {
     match selector {
-        TlsaSelector::FullCertificate => Some(cert.as_ref().to_vec()),
-        TlsaSelector::SubjectPublicKeyInfo => extract_spki(cert.as_ref()),
+        TlsaSelector::FullCertificate => Some(cert_der.to_vec()),
+        TlsaSelector::SubjectPublicKeyInfo => extract_spki(cert_der),
         TlsaSelector::Unassigned(_) => None,
     }
+}
+
+/// Apply a TLSA matching type to already-selected data (RFC 6698 §2.1.3).
+/// `Exact` is the identity function — the association data *is* the
+/// selected data, unhashed.
+fn hash_selected_data(matching_type: TlsaMatchingType, selected: &[u8]) -> Option<Vec<u8>> {
+    match matching_type {
+        TlsaMatchingType::Exact => Some(selected.to_vec()),
+        TlsaMatchingType::Sha256 => {
+            use sha2::{Digest, Sha256};
+            Some(Sha256::digest(selected).to_vec())
+        }
+        TlsaMatchingType::Sha384 => {
+            use sha2::{Digest, Sha384};
+            Some(Sha384::digest(selected).to_vec())
+        }
+        TlsaMatchingType::Unassigned(_) => None,
+    }
+}
+
+/// Compute a TLSA record's association data for `selector`/`matching_type`
+/// from a DER-encoded certificate (RFC 6698 §2.1) — the same computation
+/// [`DaneServerCertVerifier`] performs internally to check a *presented*
+/// certificate against an existing record, exposed here for tooling that
+/// needs to *generate* one instead (e.g. computing the record an operator
+/// should publish for their own MX certificate). `None` for an
+/// [`TlsaSelector::Unassigned`]/[`TlsaMatchingType::Unassigned`] value, or
+/// if `cert_der` isn't parseable enough to extract its `SubjectPublicKeyInfo`
+/// (only relevant for [`TlsaSelector::SubjectPublicKeyInfo`]).
+pub fn compute_association_data(
+    selector: TlsaSelector,
+    matching_type: TlsaMatchingType,
+    cert_der: &[u8],
+) -> Option<Vec<u8>> {
+    let selected = selected_data(selector, cert_der)?;
+    hash_selected_data(matching_type, &selected)
 }
 
 /// Read one DER TLV (tag, value, and the offset just past it) at `buf[pos]`.
@@ -298,6 +326,82 @@ mod tests {
         assert!(extract_spki(&[]).is_none());
         assert!(extract_spki(&[0x30, 0x00]).is_none()); // empty outer SEQUENCE, no tbsCertificate
         assert!(extract_spki(&[0x02, 0x01, 0x01]).is_none()); // not even a SEQUENCE
+    }
+
+    #[test]
+    fn compute_association_data_full_cert_exact_is_the_raw_certificate_bytes() {
+        let cert = test_cert();
+        let computed = compute_association_data(
+            TlsaSelector::FullCertificate,
+            TlsaMatchingType::Exact,
+            cert.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(computed, cert.as_ref().to_vec());
+    }
+
+    #[test]
+    fn compute_association_data_sha256_matches_an_independently_computed_digest() {
+        use sha2::{Digest, Sha256};
+        let cert = test_cert();
+        let computed = compute_association_data(
+            TlsaSelector::FullCertificate,
+            TlsaMatchingType::Sha256,
+            cert.as_ref(),
+        )
+        .unwrap();
+        let expected = Sha256::digest(cert.as_ref()).to_vec();
+        assert_eq!(computed, expected);
+    }
+
+    #[test]
+    fn compute_association_data_is_none_for_unassigned_selector_or_matching_type() {
+        let cert = test_cert();
+        assert!(compute_association_data(
+            TlsaSelector::Unassigned(200),
+            TlsaMatchingType::Sha256,
+            cert.as_ref()
+        )
+        .is_none());
+        assert!(compute_association_data(
+            TlsaSelector::FullCertificate,
+            TlsaMatchingType::Unassigned(200),
+            cert.as_ref()
+        )
+        .is_none());
+    }
+
+    /// The property that actually matters for a record-generation tool:
+    /// what it computes must be exactly what [`DaneServerCertVerifier`]
+    /// accepts for the same certificate — "generate" and "verify" must
+    /// agree, not just each run without error.
+    #[test]
+    fn compute_association_data_round_trips_through_the_verifier() {
+        let cert = test_cert();
+        for (selector, matching_type) in [
+            (TlsaSelector::FullCertificate, TlsaMatchingType::Exact),
+            (TlsaSelector::FullCertificate, TlsaMatchingType::Sha256),
+            (TlsaSelector::FullCertificate, TlsaMatchingType::Sha384),
+            (TlsaSelector::SubjectPublicKeyInfo, TlsaMatchingType::Sha256),
+            (TlsaSelector::SubjectPublicKeyInfo, TlsaMatchingType::Sha384),
+        ] {
+            let association_data =
+                compute_association_data(selector, matching_type, cert.as_ref()).unwrap();
+            let record = TlsaRecord {
+                usage: TlsaUsage::DaneEe,
+                selector,
+                matching_type,
+                association_data,
+            };
+            let verifier = DaneServerCertVerifier::new(vec![record]);
+            let name = ServerName::try_from("dane.example").unwrap();
+            assert!(
+                verifier
+                    .verify_server_cert(&cert, &[], &name, &[], unix_now())
+                    .is_ok(),
+                "selector={selector:?} matching_type={matching_type:?}"
+            );
+        }
     }
 
     fn dane_ee_record(matching_type: TlsaMatchingType, association_data: Vec<u8>) -> TlsaRecord {

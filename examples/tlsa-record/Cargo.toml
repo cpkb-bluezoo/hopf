@@ -1,0 +1,19 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "tlsa-record"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "tlsa-record"
+path = "main.rs"
+
+[dependencies]
+hopf-dns = { workspace = true, features = ["dane"] }
+rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
