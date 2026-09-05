@@ -26,6 +26,7 @@ pub mod handler;
 pub mod listener;
 pub mod peer_addr;
 pub mod peer_cred;
+pub mod pool;
 pub mod quota;
 pub mod runtime;
 pub mod security;
@@ -60,6 +61,7 @@ pub use listener::{
 };
 pub use peer_addr::PeerAddr;
 pub use peer_cred::{PeerCredAllowlist, PeerCredentials};
+pub use pool::{Pool, PoolConfig, PooledConn};
 pub use quota::{
     CounterQuota, MemoryQuotaManager, Quota, QuotaManager, QuotaPolicy, QuotaSource, QuotaTracker,
     QuotaVerdict, UnlimitedQuota, UnlimitedQuotaManager, UNLIMITED,
@@ -91,7 +93,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::{SocketAddr, TcpStream};
         use std::path::PathBuf;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
 
@@ -984,6 +986,128 @@ mod tests {
         // Accepted socket is dropped before handler; read should see EOF / error.
         let r = c.read(&mut buf);
         assert!(matches!(r, Ok(0) | Err(_)));
+        rt.shutdown();
+    }
+
+    /// Regression test for issue #343: `Pool::checkout` must hand back the
+    /// *same* live connection a prior `adopt`+drop put into the pool —
+    /// proven end-to-end via a real dial through a real `Runtime`, not
+    /// just the pool's internal bookkeeping. A server-side accept counter
+    /// stays at 1 across both the initial dial and the pooled checkout,
+    /// and bytes sent through the checked-out handle still round-trip —
+    /// showing the reused `ConnHandle` genuinely still points at a live
+    /// connection, not a stale one.
+    #[test]
+    fn pool_checkout_reuses_a_real_live_connection_instead_of_dialing_fresh() {
+        struct CountingEcho {
+            count: Arc<AtomicUsize>,
+        }
+
+        impl ProtocolHandler for CountingEcho {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+
+            fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                endpoint.send(data);
+                *data = &[];
+            }
+
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+
+        /// Stashes its `ConnHandle` (for the pool to adopt) and records
+        /// whatever comes back, so a later `pooled.send(...)` issued from
+        /// outside this handler's own callbacks can be observed here.
+        struct HandleCapturingClient {
+            handle_slot: Arc<Mutex<Option<ConnHandle>>>,
+            got: Arc<Mutex<Vec<u8>>>,
+        }
+
+        impl ProtocolHandler for HandleCapturingClient {
+            fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+                *self.handle_slot.lock().unwrap() = Some(endpoint.handle());
+            }
+
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.got.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+            }
+
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 2,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let count2 = Arc::clone(&accept_count);
+        let (addr, _) = rt
+            .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+                Box::new(CountingEcho {
+                    count: Arc::clone(&count2),
+                }) as Box<dyn ProtocolHandler>
+            }))
+            .unwrap();
+
+        let pool: Pool<SocketAddr> = Pool::new(PoolConfig::default());
+
+        let handle_slot = Arc::new(Mutex::new(None));
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let slot2 = Arc::clone(&handle_slot);
+        let got2 = Arc::clone(&got);
+        rt.connect(TcpConnectorConfig::new(addr, move || {
+            Box::new(HandleCapturingClient {
+                handle_slot: Arc::clone(&slot2),
+                got: Arc::clone(&got2),
+            }) as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+
+        let handle = {
+            let mut found = None;
+            for _ in 0..100 {
+                if let Some(h) = handle_slot.lock().unwrap().take() {
+                    found = Some(h);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            found.expect("dial should have connected and captured a ConnHandle")
+        };
+        assert_eq!(accept_count.load(Ordering::SeqCst), 1);
+
+        // Return the freshly-dialed connection to the pool, then check it
+        // back out — this must be the same connection, not a fresh dial.
+        drop(pool.adopt(addr, handle));
+        let pooled = pool
+            .checkout(&addr)
+            .expect("expected the just-returned connection to be reusable");
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            1,
+            "checkout must reuse the pooled connection, not dial a fresh one"
+        );
+
+        // And it must be genuinely live, not just bookkeeping that thinks
+        // so: send through the pooled handle and see the echo arrive back
+        // on the original client handler.
+        pooled.send(b"ping-through-pool".to_vec());
+        for _ in 0..100 {
+            if got.lock().unwrap().as_slice() == b"ping-through-pool" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(got.lock().unwrap().as_slice(), b"ping-through-pool");
+
         rt.shutdown();
     }
     }
