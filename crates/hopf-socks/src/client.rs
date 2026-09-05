@@ -74,6 +74,21 @@ impl SocksClientConfig {
         self.handshake_timeout = handshake_timeout;
         self
     }
+
+    /// Configured version — used directly within this module; exposed to
+    /// [`crate::client_bind`] since its `SocksBindHandler` needs the same
+    /// configuration but lives in a different module.
+    pub(crate) fn version(&self) -> SocksClientVersion {
+        self.version
+    }
+
+    pub(crate) fn credentials(&self) -> Option<&(String, String)> {
+        self.credentials.as_ref()
+    }
+
+    pub(crate) fn handshake_timeout(&self) -> Duration {
+        self.handshake_timeout
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

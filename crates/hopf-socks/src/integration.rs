@@ -20,8 +20,8 @@ use hopf_core::{Endpoint, IpNet, PeerAcl, ProtocolHandler, Runtime, RuntimeConfi
 use hopf_dns::DnsResolver;
 
 use crate::{
-    socks_connect_config, SocksAuthenticator, SocksClientConfig, SocksClientVersion,
-    SocksConnectionHandlerFactory, SocksPolicy, SocksService,
+    socks_bind_config, socks_connect_config, SocksAddress, SocksAuthenticator, SocksClientConfig,
+    SocksClientVersion, SocksConnectionHandlerFactory, SocksPolicy, SocksService,
 };
 
 struct AllowAll;
@@ -1115,6 +1115,166 @@ fn client_handshake_timeout_reports_an_error_when_the_peer_never_replies() {
         || error_message.lock().unwrap().is_some(),
         Duration::from_secs(5),
         "a handshake-timeout error",
+    );
+    assert!(!connected.load(Ordering::Acquire));
+}
+
+// ---------------------------------------------------------------------
+// Client-side BIND (`SocksBindHandler`) tests, against a real
+// `SocksService` (which already implements the server side of BIND).
+// ---------------------------------------------------------------------
+
+#[test]
+fn client_binds_through_a_socks5_proxy_and_relays_to_the_connecting_peer() {
+    let (rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let connected = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let error_message = Arc::new(Mutex::new(None));
+    let bound_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let (connected2, received2, error2, bound2) =
+        (Arc::clone(&connected), Arc::clone(&received), Arc::clone(&error_message), Arc::clone(&bound_addr));
+
+    let on_bound: Arc<dyn Fn(SocketAddr) + Send + Sync> = Arc::new(move |addr| {
+        *bound2.lock().unwrap() = Some(addr);
+    });
+
+    let cfg = socks_bind_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks5),
+        SocksAddress::Ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        0,
+        on_bound,
+        move || {
+            Box::new(ClientProbe {
+                connected: Arc::clone(&connected2),
+                received: Arc::clone(&received2),
+                error_message: Arc::clone(&error2),
+                send_on_connect: b"via-bind",
+            }) as Box<dyn ProtocolHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(|| bound_addr.lock().unwrap().is_some(), Duration::from_secs(5), "listening address known");
+    let listen_addr = bound_addr.lock().unwrap().unwrap();
+
+    // Simulate the remote peer connecting, as the caller would relay the
+    // listening address to it out-of-band.
+    let mut peer = TcpStream::connect(listen_addr).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut greeting = [0u8; 8];
+    peer.read_exact(&mut greeting).unwrap();
+    assert_eq!(&greeting, b"via-bind");
+    assert!(connected.load(Ordering::Acquire));
+
+    peer.write_all(b"reply-from-peer").unwrap();
+    wait_until(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+        "peer reply received through the tunnel",
+    );
+    assert_eq!(&*received.lock().unwrap(), b"reply-from-peer");
+    assert!(error_message.lock().unwrap().is_none());
+}
+
+#[test]
+fn client_binds_through_a_socks4_proxy_and_relays_to_the_connecting_peer() {
+    let (rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let connected = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let error_message = Arc::new(Mutex::new(None));
+    let bound_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let (connected2, received2, error2, bound2) =
+        (Arc::clone(&connected), Arc::clone(&received), Arc::clone(&error_message), Arc::clone(&bound_addr));
+
+    let on_bound: Arc<dyn Fn(SocketAddr) + Send + Sync> = Arc::new(move |addr| {
+        *bound2.lock().unwrap() = Some(addr);
+    });
+
+    let cfg = socks_bind_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks4),
+        SocksAddress::Ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        0,
+        on_bound,
+        move || {
+            Box::new(ClientProbe {
+                connected: Arc::clone(&connected2),
+                received: Arc::clone(&received2),
+                error_message: Arc::clone(&error2),
+                send_on_connect: b"via-bind4",
+            }) as Box<dyn ProtocolHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(|| bound_addr.lock().unwrap().is_some(), Duration::from_secs(5), "listening address known");
+    let listen_addr = bound_addr.lock().unwrap().unwrap();
+
+    let mut peer = TcpStream::connect(listen_addr).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut greeting = [0u8; 9];
+    peer.read_exact(&mut greeting).unwrap();
+    assert_eq!(&greeting, b"via-bind4");
+    assert!(connected.load(Ordering::Acquire));
+
+    peer.write_all(b"pong").unwrap();
+    wait_until(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+        "peer reply received through the tunnel",
+    );
+    assert_eq!(&*received.lock().unwrap(), b"pong");
+}
+
+#[test]
+fn client_bind_reports_an_error_when_the_destination_policy_denies_the_peer() {
+    let (rt, proxy) = start_socks_server(Arc::new(DenyAll), None);
+
+    let connected = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let error_message = Arc::new(Mutex::new(None));
+    let bound_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let (connected2, received2, error2, bound2) =
+        (Arc::clone(&connected), Arc::clone(&received), Arc::clone(&error_message), Arc::clone(&bound_addr));
+
+    let on_bound: Arc<dyn Fn(SocketAddr) + Send + Sync> = Arc::new(move |addr| {
+        *bound2.lock().unwrap() = Some(addr);
+    });
+
+    let cfg = socks_bind_config(
+        proxy,
+        SocksClientConfig::new(SocksClientVersion::Socks5),
+        SocksAddress::Ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        0,
+        on_bound,
+        move || {
+            Box::new(ClientProbe {
+                connected: Arc::clone(&connected2),
+                received: Arc::clone(&received2),
+                error_message: Arc::clone(&error2),
+                send_on_connect: b"",
+            }) as Box<dyn ProtocolHandler>
+        },
+    );
+    rt.connect(cfg).unwrap();
+
+    wait_until(|| bound_addr.lock().unwrap().is_some(), Duration::from_secs(5), "listening address known");
+    let listen_addr = bound_addr.lock().unwrap().unwrap();
+
+    // The connecting peer is denied by the destination policy (checked
+    // against the connecting peer's own address for BIND) — the client
+    // should observe a failure on the *second* reply, not a hang.
+    let _peer = TcpStream::connect(listen_addr).unwrap();
+
+    wait_until(
+        || error_message.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+        "an error reported for a policy-denied peer",
     );
     assert!(!connected.load(Ordering::Acquire));
 }
