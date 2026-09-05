@@ -10,10 +10,12 @@ use std::sync::{Arc, Mutex};
 use hopf_core::{ProtocolHandler, Runtime, SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig};
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
+use crate::headers::Headers;
 use crate::HttpLimits;
 
-use super::api::HttpConnectionHandler;
+use super::api::{HttpConnectionHandler, HttpResponseHandler};
 use super::connection::HttpClientConnection;
+use super::redirect::{FetchState, PlainFetchConnectionHandler, RedirectPolicy, RedirectTarget};
 use super::session_config::HttpClientSessionConfig;
 use super::HttpClientTimeouts;
 
@@ -37,6 +39,9 @@ pub struct HttpClient {
     tls_connector: Option<SharedTlsConnector>,
     tls_server_name: Option<String>,
     resolver: Option<Arc<DnsResolver>>,
+    /// See [`Self::follow_redirects`]. `None` (the default): [`Self::fetch`]
+    /// delivers a 3xx response unchanged, following nothing.
+    redirect_policy: Option<RedirectPolicy>,
     #[cfg(feature = "h3")]
     quic_client_config: Option<Arc<hopf_quic::QuicClientConfig>>,
     #[cfg(feature = "h3")]
@@ -62,6 +67,7 @@ impl HttpClient {
             tls_connector: None,
             tls_server_name: None,
             resolver: None,
+            redirect_policy: None,
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -87,6 +93,7 @@ impl HttpClient {
             tls_connector: None,
             tls_server_name: None,
             resolver: None,
+            redirect_policy: None,
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -115,6 +122,7 @@ impl HttpClient {
             tls_connector: None,
             tls_server_name: None,
             resolver: None,
+            redirect_policy: None,
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -614,12 +622,129 @@ impl HttpClient {
             tls_connector: self.tls_connector.clone(),
             tls_server_name: self.tls_server_name.clone(),
             resolver: self.resolver.clone(),
+            redirect_policy: self.redirect_policy.clone(),
             #[cfg(feature = "h3")]
             quic_client_config: self.quic_client_config.clone(),
             #[cfg(feature = "h3")]
             h3_disabled: self.h3_disabled,
             #[cfg(feature = "h3")]
             h3_prior_knowledge: self.h3_prior_knowledge,
+            #[cfg(feature = "h3")]
+            alt_svc_cache: Arc::clone(&self.alt_svc_cache),
+        }
+    }
+
+    /// Follow redirects (301/302/303/307/308) up to `policy`'s hop cap when
+    /// using [`Self::fetch`] — see [`RedirectPolicy`]. Not set by default:
+    /// without this, [`Self::fetch`] delivers a 3xx response to the
+    /// caller's handler exactly like any other response, following
+    /// nothing. Has no effect on [`Self::connect`]'s low-level
+    /// session/request API.
+    pub fn follow_redirects(mut self, policy: RedirectPolicy) -> Self {
+        self.redirect_policy = Some(policy);
+        self
+    }
+
+    /// Issue one request to `path` on this client's configured origin,
+    /// following redirects per [`Self::follow_redirects`] if configured —
+    /// otherwise behaves exactly like [`Self::connect`] plus issuing one
+    /// request, and a 3xx response reaches `handler` unchanged.
+    ///
+    /// `body`, if given, is sent as one unit (not streamed) — buffered so
+    /// it can be resent unmodified on a 307/308 redirect, which needs the
+    /// original request replayed exactly. A large or genuinely streamed
+    /// request body should use [`Self::connect`] directly instead.
+    ///
+    /// Redirect-driven dials (every hop after the first) don't attempt
+    /// HTTP/3 negotiation even if this client has a QUIC config configured
+    /// — they always dial via the same TCP/TLS path the first hop's
+    /// scheme implies. This is a scope boundary, not a fallback: h3
+    /// redirect-dialing may be added later.
+    pub fn fetch(
+        &self,
+        rt: &Arc<Runtime>,
+        method: &str,
+        path: &str,
+        headers: Headers,
+        body: Option<Vec<u8>>,
+        handler: Box<dyn HttpResponseHandler>,
+    ) -> io::Result<()> {
+        let Some(policy) = self.redirect_policy.clone() else {
+            // No policy configured: behave exactly like plain `connect` +
+            // one request — no interception, no wrapping, 3xx passes
+            // through untouched.
+            return self.connect(
+                rt,
+                Box::new(PlainFetchConnectionHandler {
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    headers,
+                    body,
+                    handler: Mutex::new(Some(handler)),
+                }),
+            );
+        };
+
+        let target = self.initial_redirect_target(path);
+        let state = Arc::new(Mutex::new(FetchState::new(
+            Arc::clone(rt),
+            self.clone_for_dial(),
+            policy,
+            handler,
+        )));
+        FetchState::dial_hop(state, target, method.to_string(), headers, body);
+        Ok(())
+    }
+
+    /// This client's configured TLS connector, if any — used by a redirect
+    /// to a `https://` target to decide whether that hop can even dial
+    /// (issue #349).
+    pub(crate) fn tls_connector(&self) -> Option<&SharedTlsConnector> {
+        self.tls_connector.as_ref()
+    }
+
+    /// The [`RedirectTarget`] this client's own configured origin
+    /// represents for `path` — the starting point a redirect chain resolves
+    /// subsequent `Location` values against.
+    pub(crate) fn initial_redirect_target(&self, path: &str) -> RedirectTarget {
+        let host = self
+            .addr
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| self.host.clone());
+        let port = self.addr.map(|a| a.port()).unwrap_or(self.port);
+        RedirectTarget {
+            secure: self.secure,
+            host,
+            port,
+            path: path.to_string(),
+        }
+    }
+
+    /// Build a fresh client targeting `target` — used to dial a redirect
+    /// hop, possibly to a different host/port/scheme than this client's own
+    /// (issue #349). Carries over TLS connector/timeouts/limits/resolver;
+    /// never a UNIX-domain path (a redirect target is always a network
+    /// origin) and never HTTP/3 (see [`Self::fetch`]'s doc comment).
+    pub(crate) fn for_redirect_target(&self, target: &RedirectTarget) -> Self {
+        Self {
+            host: target.host.clone(),
+            port: target.port,
+            addr: None,
+            unix_path: None,
+            limits: self.limits,
+            timeouts: self.timeouts.clone(),
+            secure: target.secure,
+            h2_prior_knowledge: self.h2_prior_knowledge,
+            tls_connector: self.tls_connector.clone(),
+            tls_server_name: target.secure.then(|| target.host.clone()),
+            resolver: self.resolver.clone(),
+            redirect_policy: None,
+            #[cfg(feature = "h3")]
+            quic_client_config: None,
+            #[cfg(feature = "h3")]
+            h3_disabled: true,
+            #[cfg(feature = "h3")]
+            h3_prior_knowledge: false,
             #[cfg(feature = "h3")]
             alt_svc_cache: Arc::clone(&self.alt_svc_cache),
         }
