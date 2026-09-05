@@ -12,7 +12,11 @@ pub struct SocksServerMetrics {
     pub connections: AtomicU64,
     /// CONNECT requests received.
     pub connect_requests: AtomicU64,
-    /// Relays currently active.
+    /// BIND requests received.
+    pub bind_requests: AtomicU64,
+    /// BIND requests currently waiting for a peer to connect.
+    pub active_bind_waits: AtomicU64,
+    /// Relays currently active (CONNECT and BIND alike).
     pub active_relays: AtomicU64,
     /// Bytes relayed from client to target.
     pub bytes_upstream: AtomicU64,

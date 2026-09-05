@@ -8,7 +8,7 @@
 #![cfg(feature = "integration")]
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -266,20 +266,190 @@ fn destination_policy_denial_sends_not_allowed_and_closes() {
 }
 
 #[test]
-fn bind_command_is_rejected_as_not_yet_implemented() {
+fn udp_associate_command_is_rejected_as_not_yet_implemented() {
     let (_rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
 
     let mut client = TcpStream::connect(proxy).unwrap();
     client.write_all(&[0x05, 1, 0x00]).unwrap();
     assert_eq!(read_exact_within(&mut client, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
 
-    let mut req = vec![0x05, 0x02, 0x00, 0x01]; // BIND
-    req.extend_from_slice(&[127, 0, 0, 1]);
+    let mut req = vec![0x05, 0x03, 0x00, 0x01]; // UDP ASSOCIATE
+    req.extend_from_slice(&[0, 0, 0, 0]);
     req.extend_from_slice(&0u16.to_be_bytes());
     client.write_all(&req).unwrap();
 
     let reply = read_exact_within(&mut client, 10, Duration::from_secs(5));
     assert_eq!(reply[1], 0x07, "expected CommandNotSupported reply");
+}
+
+fn bound_addr_from_socks5_reply(reply: &[u8]) -> SocketAddr {
+    assert_eq!(reply[3], 0x01, "test targets bind on IPv4 loopback");
+    let ip = Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7]);
+    let port = u16::from_be_bytes([reply[8], reply[9]]);
+    SocketAddr::new(IpAddr::V4(ip), port)
+}
+
+#[test]
+fn socks5_bind_relays_bytes_once_a_peer_connects() {
+    let (_rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let mut client = TcpStream::connect(proxy).unwrap();
+    client.write_all(&[0x05, 1, 0x00]).unwrap();
+    assert_eq!(read_exact_within(&mut client, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
+
+    // Wildcard DST.ADDR: accept a connection from any peer.
+    let mut req = vec![0x05, 0x02, 0x00, 0x01];
+    req.extend_from_slice(&[0, 0, 0, 0]);
+    req.extend_from_slice(&0u16.to_be_bytes());
+    client.write_all(&req).unwrap();
+
+    let reply1 = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    assert_eq!(reply1[1], 0x00, "expected Succeeded (listening) reply");
+    let bound = bound_addr_from_socks5_reply(&reply1);
+
+    // Simulate the remote peer connecting back, as Reply 1 directed.
+    let mut peer = TcpStream::connect(bound).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let reply2 = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    assert_eq!(reply2[1], 0x00, "expected Succeeded (connected) reply");
+
+    client.write_all(b"from-client").unwrap();
+    let mut buf = [0u8; 11];
+    peer.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"from-client");
+
+    peer.write_all(b"from-peer!!").unwrap();
+    assert_eq!(read_exact_within(&mut client, 11, Duration::from_secs(5)), b"from-peer!!");
+}
+
+#[test]
+fn socks4_bind_relays_bytes_once_a_peer_connects() {
+    let (_rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let mut client = TcpStream::connect(proxy).unwrap();
+    let mut req = vec![0x04, 0x02]; // BIND
+    req.extend_from_slice(&0u16.to_be_bytes());
+    req.extend_from_slice(&[0, 0, 0, 0]); // wildcard: accept from any peer
+    req.extend_from_slice(b"someuser");
+    req.push(0);
+    client.write_all(&req).unwrap();
+
+    let reply1 = read_exact_within(&mut client, 8, Duration::from_secs(5));
+    assert_eq!(reply1[1], 0x5a, "expected Granted (listening) reply");
+    let bound_port = u16::from_be_bytes([reply1[2], reply1[3]]);
+    let bound_ip = Ipv4Addr::new(reply1[4], reply1[5], reply1[6], reply1[7]);
+
+    let mut peer = TcpStream::connect(SocketAddr::new(IpAddr::V4(bound_ip), bound_port)).unwrap();
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let reply2 = read_exact_within(&mut client, 8, Duration::from_secs(5));
+    assert_eq!(reply2[1], 0x5a, "expected Granted (connected) reply");
+
+    client.write_all(b"ping").unwrap();
+    let mut buf = [0u8; 4];
+    peer.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"ping");
+}
+
+#[test]
+fn socks5_bind_rejects_a_peer_that_does_not_match_the_requested_address() {
+    let (_rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let mut client = TcpStream::connect(proxy).unwrap();
+    client.write_all(&[0x05, 1, 0x00]).unwrap();
+    assert_eq!(read_exact_within(&mut client, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
+
+    // Non-wildcard DST.ADDR naming an address the actual connecting peer
+    // (127.0.0.1, from this same test process) will never match.
+    let mut req = vec![0x05, 0x02, 0x00, 0x01];
+    req.extend_from_slice(&[203, 0, 113, 1]); // TEST-NET-3, RFC 5737
+    req.extend_from_slice(&0u16.to_be_bytes());
+    client.write_all(&req).unwrap();
+
+    let reply1 = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    assert_eq!(reply1[1], 0x00);
+    let bound = bound_addr_from_socks5_reply(&reply1);
+
+    let _peer = TcpStream::connect(bound).unwrap();
+
+    let reply2 = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    assert_eq!(reply2[1], 0x02, "expected NotAllowed reply — peer address does not match DST.ADDR");
+}
+
+#[test]
+fn socks5_bind_applies_the_destination_policy_to_the_connecting_peer() {
+    let (_rt, proxy) = start_socks_server(Arc::new(DenyAll), None);
+
+    let mut client = TcpStream::connect(proxy).unwrap();
+    client.write_all(&[0x05, 1, 0x00]).unwrap();
+    assert_eq!(read_exact_within(&mut client, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
+
+    let mut req = vec![0x05, 0x02, 0x00, 0x01];
+    req.extend_from_slice(&[0, 0, 0, 0]);
+    req.extend_from_slice(&0u16.to_be_bytes());
+    client.write_all(&req).unwrap();
+
+    let reply1 = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    assert_eq!(reply1[1], 0x00);
+    let bound = bound_addr_from_socks5_reply(&reply1);
+
+    let _peer = TcpStream::connect(bound).unwrap();
+
+    let reply2 = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    assert_eq!(reply2[1], 0x02, "expected NotAllowed reply from the destination policy");
+}
+
+#[test]
+fn socks5_bind_times_out_if_no_peer_ever_connects() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let dns = Arc::new(DnsResolver::for_runtime(&rt).unwrap());
+    let factory = SocksConnectionHandlerFactory::new(dns, Arc::clone(&rt), Arc::new(AllowAll))
+        .with_bind_accept_timeout(Duration::from_millis(200));
+    let service = SocksService::new("127.0.0.1:0".parse().unwrap(), factory);
+    let proxy = service.start(&rt).unwrap();
+
+    let mut client = TcpStream::connect(proxy).unwrap();
+    client.write_all(&[0x05, 1, 0x00]).unwrap();
+    assert_eq!(read_exact_within(&mut client, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
+
+    let mut req = vec![0x05, 0x02, 0x00, 0x01];
+    req.extend_from_slice(&[0, 0, 0, 0]);
+    req.extend_from_slice(&0u16.to_be_bytes());
+    client.write_all(&req).unwrap();
+
+    let reply1 = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    assert_eq!(reply1[1], 0x00);
+
+    // No peer ever connects — the accept-wait should time out well within
+    // a couple of timeout periods.
+    let reply2 = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    assert_eq!(reply2[1], 0x06, "expected TtlExpired reply");
+}
+
+#[test]
+fn socks5_bind_listener_stops_accepting_after_the_first_connection() {
+    let (_rt, proxy) = start_socks_server(Arc::new(AllowAll), None);
+
+    let mut client = TcpStream::connect(proxy).unwrap();
+    client.write_all(&[0x05, 1, 0x00]).unwrap();
+    assert_eq!(read_exact_within(&mut client, 2, Duration::from_secs(5)), vec![0x05, 0x00]);
+
+    let mut req = vec![0x05, 0x02, 0x00, 0x01];
+    req.extend_from_slice(&[0, 0, 0, 0]);
+    req.extend_from_slice(&0u16.to_be_bytes());
+    client.write_all(&req).unwrap();
+
+    let reply1 = read_exact_within(&mut client, 10, Duration::from_secs(5));
+    let bound = bound_addr_from_socks5_reply(&reply1);
+
+    let _first_peer = TcpStream::connect(bound).unwrap();
+    let _ = read_exact_within(&mut client, 10, Duration::from_secs(5));
+
+    // The listener must already be gone: a second connection attempt to
+    // the same bound address should fail to connect at all (single-use).
+    let second = TcpStream::connect_timeout(&bound, Duration::from_secs(2));
+    assert!(second.is_err(), "listener should have stopped accepting after the first connection");
 }
 
 #[test]

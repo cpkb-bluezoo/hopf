@@ -10,7 +10,7 @@
 //! the caller whether to wait for more data, how many bytes were consumed,
 //! or that the input is malformed.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// SOCKS4/4a version byte.
 pub const VERSION_4: u8 = 0x04;
@@ -192,11 +192,22 @@ pub fn parse_socks4_request(data: &[u8]) -> ParseResult<Socks4Request> {
 }
 
 /// Encode a SOCKS4/4a reply (`VER=0,CD,DSTPORT(2),DSTIP(4)` — the historical
-/// protocol description reserves the version byte position on the reply for
-/// `0x00`, and BND.ADDR/BND.PORT are conventionally zero-filled since no
-/// real client relies on them for CONNECT).
-pub fn encode_socks4_reply(reply: Socks4Reply) -> Vec<u8> {
-    vec![0x00, reply as u8, 0, 0, 0, 0, 0, 0]
+/// protocol description reserves the version byte position on the reply
+/// for `0x00`). `bound` is conventionally zero for CONNECT (no real client
+/// relies on it there) but is BIND's actual payload: Reply 1 carries the
+/// listener's own bound address, Reply 2 the accepted peer's address.
+/// SOCKS4 has no IPv6 concept — an IPv6 `bound` zero-fills DSTIP, which
+/// only `bind` module callers can produce and only when a request's own
+/// address family makes that impossible in practice (loopback bind chooses
+/// its family to match).
+pub fn encode_socks4_reply(reply: Socks4Reply, bound: SocketAddr) -> Vec<u8> {
+    let mut out = vec![0x00, reply as u8];
+    out.extend_from_slice(&bound.port().to_be_bytes());
+    match bound.ip() {
+        IpAddr::V4(v4) => out.extend_from_slice(&v4.octets()),
+        IpAddr::V6(_) => out.extend_from_slice(&[0, 0, 0, 0]),
+    }
+    out
 }
 
 /// A parsed SOCKS5 method-selection greeting (`VER,NMETHODS,METHODS[]`).
@@ -485,14 +496,33 @@ mod tests {
     }
 
     #[test]
-    fn socks4_reply_encodes_granted_and_rejected() {
+    fn socks4_reply_encodes_granted_and_rejected_with_a_zero_bound_address() {
+        let zero: SocketAddr = "0.0.0.0:0".parse().unwrap();
         assert_eq!(
-            encode_socks4_reply(Socks4Reply::Granted),
+            encode_socks4_reply(Socks4Reply::Granted, zero),
             vec![0, 0x5a, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(
-            encode_socks4_reply(Socks4Reply::Rejected),
+            encode_socks4_reply(Socks4Reply::Rejected, zero),
             vec![0, 0x5b, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn socks4_reply_encodes_a_real_bound_address_for_bind() {
+        let addr: SocketAddr = "10.0.0.5:4000".parse().unwrap();
+        assert_eq!(
+            encode_socks4_reply(Socks4Reply::Granted, addr),
+            vec![0, 0x5a, 0x0f, 0xa0, 10, 0, 0, 5]
+        );
+    }
+
+    #[test]
+    fn socks4_reply_zero_fills_dstip_for_an_ipv6_bound_address() {
+        let addr: SocketAddr = "[::1]:80".parse().unwrap();
+        assert_eq!(
+            encode_socks4_reply(Socks4Reply::Granted, addr),
+            vec![0, 0x5a, 0, 80, 0, 0, 0, 0]
         );
     }
 
