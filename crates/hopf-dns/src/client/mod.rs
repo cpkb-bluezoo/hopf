@@ -2,6 +2,7 @@
 
 //! Asynchronous stub DNS resolver and client transports.
 
+mod capability_cache;
 mod hosts;
 mod tcp;
 mod udp;
@@ -31,6 +32,7 @@ use hopf_core::{ReactorHandle, Runtime, UdpDatagramHandler};
 
 use crate::bailiwick::filter_answers_in_bailiwick;
 use crate::cache::DnsCache;
+use capability_cache::{EncryptedTransport, TransportCapabilityCache};
 use crate::cookie::DnsCookie;
 use crate::multi_qtype::{encode_mqtype_query_option, find_mqtype_option, EDNS_OPTION_MQTYPE_RESPONSE};
 use crate::multi_qtype_cache::MultiQTypeCache;
@@ -119,11 +121,37 @@ enum ServerTransport {
     },
 }
 
+impl ServerTransport {
+    /// The [`EncryptedTransport`] this wire transport corresponds to in
+    /// the capability cache, or `None` for plain UDP/TCP (which the cache
+    /// has nothing to say about — it only ever tracks encrypted
+    /// alternatives).
+    fn encrypted_transport(&self) -> Option<EncryptedTransport> {
+        match self {
+            ServerTransport::UdpTcp => None,
+            #[cfg(feature = "dot")]
+            ServerTransport::Dot { .. } => Some(EncryptedTransport::Dot),
+            #[cfg(feature = "doq")]
+            ServerTransport::Doq { .. } => Some(EncryptedTransport::Doq),
+            #[cfg(feature = "doh")]
+            ServerTransport::Doh { .. } => Some(EncryptedTransport::Doh),
+        }
+    }
+}
+
 /// One configured upstream server: address + how to speak to it.
 #[derive(Clone)]
 struct ConfiguredServer {
     addr: SocketAddr,
     transport: ServerTransport,
+    /// `true` for a server added the plain way (`add_server` and its
+    /// `use_system_resolvers`/`use_public_resolvers` friends) — the
+    /// capability cache's "auto mode" entry point. `false` for a server
+    /// pinned to a specific transport via `add_server_dot`/
+    /// `add_server_doq`/`add_server_doh`: an explicit pin never consults
+    /// or populates the capability cache, so it can't be silently
+    /// overridden by cached or discovered data for that address.
+    auto: bool,
 }
 
 impl ConfiguredServer {
@@ -131,6 +159,7 @@ impl ConfiguredServer {
         Self {
             addr,
             transport: ServerTransport::UdpTcp,
+            auto: true,
         }
     }
 }
@@ -203,8 +232,25 @@ fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
 /// next configured server exactly like a dead UDP one, not just sit until
 /// the timeout eventually fires. `err` becomes the final failure reported
 /// to the caller once every server has been tried.
+///
+/// Also the capability cache's demotion hook: an auto-mode server's
+/// encrypted transport that just failed is exactly the update the cache
+/// exists to record (see `capability_cache`'s module docs) — a pinned
+/// server never has an entry to demote in the first place.
 #[cfg(any(feature = "dot", feature = "doq", feature = "doh"))]
 fn retry_after_transport_error(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error) {
+    {
+        let g = inner.lock().unwrap();
+        if let Some(pending) = g.pending.get(&id) {
+            if let Some(server) = g.servers.get(pending.server_idx) {
+                if server.auto {
+                    if let Some(transport) = server.transport.encrypted_transport() {
+                        g.capability_cache.record_failure(server.addr, transport);
+                    }
+                }
+            }
+        }
+    }
     retry_or_fail_impl(inner, id, move || err);
 }
 
@@ -444,6 +490,11 @@ struct ResolverInner {
     cache: Arc<DnsCache>,
     cookies: DnsCookie,
     multi_qtype_cache: Arc<MultiQTypeCache>,
+    /// What's currently known about each auto-mode server's encrypted
+    /// transport support (see `capability_cache`'s own module docs) — a
+    /// pinned server (`add_server_dot`/`add_server_doq`/`add_server_doh`)
+    /// never touches this.
+    capability_cache: TransportCapabilityCache,
     timeout: Duration,
     use_edns: bool,
     use_cookies: bool,
@@ -487,6 +538,7 @@ impl DnsResolver {
                 cache: Arc::new(DnsCache::default()),
                 cookies: DnsCookie::new(),
                 multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
+                capability_cache: TransportCapabilityCache::new(),
                 timeout: DEFAULT_TIMEOUT,
                 use_edns: true,
                 use_cookies: true,
@@ -569,6 +621,7 @@ impl DnsResolver {
                 server_name: server_name.into(),
                 connector,
             },
+            auto: false,
         });
     }
 
@@ -590,6 +643,7 @@ impl DnsResolver {
                 server_name: server_name.into(),
                 client_config,
             },
+            auto: false,
         });
     }
 
@@ -617,6 +671,7 @@ impl DnsResolver {
                 connector,
                 use_get,
             },
+            auto: false,
         });
     }
 
@@ -1474,6 +1529,17 @@ fn complete_response(
             }
         }
     }
+    // Capability-cache promotion hook, mirroring the demotion hook in
+    // `retry_after_transport_error`: an auto-mode server's encrypted
+    // transport that just produced a real answer is exactly the evidence
+    // that promotes it to (or keeps it) confirmed-working.
+    if let Some(server) = g.servers.get(pending.server_idx) {
+        if server.auto {
+            if let Some(transport) = server.transport.encrypted_transport() {
+                g.capability_cache.record_success(server.addr, transport);
+            }
+        }
+    }
     drop(g);
     (pending.callback)(Ok(msg));
 }
@@ -1550,6 +1616,7 @@ mod tests {
             cache: Arc::new(DnsCache::default()),
             cookies: DnsCookie::new(),
             multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
+            capability_cache: TransportCapabilityCache::new(),
             timeout: DEFAULT_TIMEOUT,
             use_edns: true,
             use_cookies: true,
@@ -1582,6 +1649,157 @@ mod tests {
         for _ in 0..1000 {
             assert_ne!(alloc_id(&inner), taken, "must never hand out an id already in flight");
         }
+        rt.shutdown();
+    }
+
+    /// A single configured DoT server (`insecure_connector` — no real TLS
+    /// handshake ever happens in these tests, only the capability-cache
+    /// bookkeeping around it) plus the address it's reachable at. `auto`
+    /// selects whether it's registered as an `add_server`-style ("auto
+    /// mode") entry or an `add_server_dot`-style explicit pin.
+    #[cfg(feature = "dot")]
+    fn dot_test_server(auto: bool) -> (ConfiguredServer, SocketAddr) {
+        let addr: SocketAddr = "192.0.2.1:853".parse().unwrap();
+        let server = ConfiguredServer {
+            addr,
+            transport: ServerTransport::Dot {
+                server_name: "dot.example".into(),
+                connector: hopf_tls::insecure_connector(&[]),
+            },
+            auto,
+        };
+        (server, addr)
+    }
+
+    #[cfg(feature = "dot")]
+    fn test_inner_with_server(rt: &hopf_core::Runtime, server: ConfiguredServer) -> ResolverInner {
+        ResolverInner {
+            reactor: rt.pick_worker().clone(),
+            udp_token: None,
+            servers: vec![server],
+            pending: HashMap::new(),
+            ids: DnsQueryIdGenerator::new(),
+            cache: Arc::new(DnsCache::default()),
+            cookies: DnsCookie::new(),
+            multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
+            capability_cache: TransportCapabilityCache::new(),
+            timeout: DEFAULT_TIMEOUT,
+            use_edns: true,
+            use_cookies: true,
+            use_bailiwick: true,
+            tcp_fallback: true,
+            tcp_pool: TcpDnsConnectionPool::new(),
+            #[cfg(feature = "doq")]
+            doq_pool: doq::DoqConnectionPool::new(),
+            #[cfg(feature = "dnssec")]
+            dnssec_enabled: false,
+            #[cfg(feature = "dnssec")]
+            dnssec: None,
+        }
+    }
+
+    #[cfg(feature = "dot")]
+    fn test_pending_for(id: u16, server_idx: usize, server: SocketAddr) -> PendingQuery {
+        PendingQuery {
+            callback: Box::new(|_| {}),
+            question: DnsQuestion::in_class("example.com", DnsType::A),
+            server_idx,
+            cname_depth: 0,
+            id,
+            server,
+            cd: false,
+            cancel: None,
+            extra_edns_options: Vec::new(),
+            active_transport: None,
+        }
+    }
+
+    /// Regression test for issue #376's demotion hook: a confirmed-working
+    /// entry for an auto-mode server tolerates one isolated transport
+    /// failure, then is evicted on the very next consecutive one — proving
+    /// `retry_after_transport_error` genuinely drives the capability
+    /// cache's own tolerance rule, not just that the rule works in
+    /// isolation (already covered by `capability_cache`'s own tests).
+    #[cfg(feature = "dot")]
+    #[test]
+    fn retry_after_transport_error_demotes_an_auto_mode_entry_after_a_second_failure() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (server, addr) = dot_test_server(true);
+        let inner = Arc::new(Mutex::new(test_inner_with_server(&rt, server)));
+        inner.lock().unwrap().capability_cache.record_success(addr, EncryptedTransport::Dot);
+
+        inner.lock().unwrap().pending.insert(1, test_pending_for(1, 0, addr));
+        retry_after_transport_error(&inner, 1, io::Error::other("first failure"));
+        assert_eq!(
+            inner.lock().unwrap().capability_cache.known_transports(addr),
+            vec![EncryptedTransport::Dot],
+            "one isolated failure must be tolerated"
+        );
+
+        inner.lock().unwrap().pending.insert(2, test_pending_for(2, 0, addr));
+        retry_after_transport_error(&inner, 2, io::Error::other("second consecutive failure"));
+        assert!(
+            inner.lock().unwrap().capability_cache.known_transports(addr).is_empty(),
+            "a second consecutive failure must evict the entry"
+        );
+
+        rt.shutdown();
+    }
+
+    /// Regression test for issue #376's scope note: a server pinned to an
+    /// explicit transport (`add_server_dot`/`add_server_doq`/
+    /// `add_server_doh`) must never have its failures recorded against the
+    /// capability cache at all — unlike the auto-mode case above, repeated
+    /// failures here must leave a pre-existing entry completely untouched.
+    #[cfg(feature = "dot")]
+    #[test]
+    fn pinned_server_failures_never_touch_the_capability_cache() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (server, addr) = dot_test_server(false);
+        let inner = Arc::new(Mutex::new(test_inner_with_server(&rt, server)));
+        inner.lock().unwrap().capability_cache.record_success(addr, EncryptedTransport::Dot);
+
+        for id in 1..=5u16 {
+            inner.lock().unwrap().pending.insert(id, test_pending_for(id, 0, addr));
+            retry_after_transport_error(&inner, id, io::Error::other("pinned server failure"));
+        }
+
+        assert_eq!(
+            inner.lock().unwrap().capability_cache.known_transports(addr),
+            vec![EncryptedTransport::Dot],
+            "a pinned server's failures must never be recorded against the capability cache"
+        );
+
+        rt.shutdown();
+    }
+
+    /// Regression test for issue #376's promotion hook: a real answer from
+    /// an auto-mode server's encrypted transport must promote it to
+    /// confirmed-working via `complete_response`, not just via the
+    /// capability cache's own directly-tested `record_success`.
+    #[cfg(feature = "dot")]
+    #[test]
+    fn complete_response_promotes_an_auto_mode_server_to_confirmed_working() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (server, addr) = dot_test_server(true);
+        let inner = Arc::new(Mutex::new(test_inner_with_server(&rt, server)));
+
+        let pending = test_pending_for(1, 0, addr);
+        let msg = DnsMessage::new(
+            1,
+            crate::wire::FLAG_QR,
+            vec![DnsQuestion::in_class("example.com", DnsType::A)],
+            vec![DnsResourceRecord::a("example.com", 60, std::net::Ipv4Addr::new(192, 0, 2, 7))],
+            vec![],
+            vec![],
+        );
+        complete_response(&inner, pending, msg, addr);
+
+        assert_eq!(
+            inner.lock().unwrap().capability_cache.known_transports(addr),
+            vec![EncryptedTransport::Dot]
+        );
+
         rt.shutdown();
     }
 
@@ -1659,6 +1877,7 @@ mod tests {
             cache: Arc::new(DnsCache::default()),
             cookies: DnsCookie::new(),
             multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
+            capability_cache: TransportCapabilityCache::new(),
             timeout: DEFAULT_TIMEOUT,
             use_edns: true,
             use_cookies: true,
