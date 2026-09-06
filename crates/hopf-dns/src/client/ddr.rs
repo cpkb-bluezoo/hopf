@@ -41,7 +41,7 @@ use std::time::Duration;
 
 use crate::wire::{DnsResourceRecord, RCODE_FORMERR, RCODE_NOERROR, RCODE_NOTIMP, RCODE_NXDOMAIN};
 
-use super::capability_cache::EncryptedTransport;
+use super::capability_cache::{default_port, EncryptedTransport, EndpointDetails};
 use super::{alloc_id, send_udp_query, DnsMessage, DnsQuestion, DnsType, PendingQuery, QueryCallback, ResolverInner};
 
 #[cfg(feature = "dot")]
@@ -104,6 +104,7 @@ pub(super) fn maybe_trigger_discovery(inner: &Arc<std::sync::Mutex<ResolverInner
                     cancel: Some(cancel),
                     extra_edns_options: Vec::new(),
                     active_transport: None,
+                    actual_transport: None,
                 },
             );
         }
@@ -198,21 +199,19 @@ fn classify(msg: &DnsMessage) -> Outcome {
 /// not yet validated.
 struct Candidate {
     transport: EncryptedTransport,
-    /// Where to dial: the record's own `ipv4hint`/`ipv6hint` (RFC 9460
-    /// §7.3) when present, otherwise the *original* server's address —
-    /// RFC 9462 §4.3 allows falling back to it when no hint is given, on
-    /// the basis that a designated resolver is commonly reachable at the
-    /// same address as the plain one that referred to it.
+    /// Where to dial and what to validate its certificate against — the
+    /// record's own `ipv4hint`/`ipv6hint` (RFC 9460 §7.3) target when
+    /// present, otherwise the *original* server's address (RFC 9462 §4.3
+    /// allows falling back to it when no hint is given, on the basis that
+    /// a designated resolver is commonly reachable at the same address as
+    /// the plain one that referred to it) with the record's own target
+    /// name as SNI. Already the exact shape `record_success` needs, so a
+    /// validated candidate is recorded with no further translation.
     ///
     /// Read only by [`validate_dot`]/[`validate_doq`] — with neither
     /// feature enabled there's nothing to dial a candidate with at all.
     #[cfg_attr(not(any(feature = "dot", feature = "doq")), allow(dead_code))]
-    target_addr: SocketAddr,
-    /// TLS/QUIC server name to validate the candidate's certificate
-    /// against — the SVCB record's own target name, never the original
-    /// server's address.
-    #[cfg_attr(not(any(feature = "dot", feature = "doq")), allow(dead_code))]
-    sni: String,
+    details: EndpointDetails,
 }
 
 fn alpn_to_transport(alpn: &str) -> Option<EncryptedTransport> {
@@ -221,13 +220,6 @@ fn alpn_to_transport(alpn: &str) -> Option<EncryptedTransport> {
         "doq" => Some(EncryptedTransport::Doq),
         "h2" | "h3" => Some(EncryptedTransport::Doh),
         _ => None,
-    }
-}
-
-fn default_port(transport: EncryptedTransport) -> u16 {
-    match transport {
-        EncryptedTransport::Dot | EncryptedTransport::Doq => 853,
-        EncryptedTransport::Doh => 443,
     }
 }
 
@@ -263,8 +255,10 @@ fn extract_candidates(server: SocketAddr, records: &[DnsResourceRecord]) -> Vec<
             }
             out.push(Candidate {
                 transport,
-                target_addr: SocketAddr::new(ip, port_hint.unwrap_or_else(|| default_port(transport))),
-                sni: target.clone(),
+                details: EndpointDetails {
+                    target: SocketAddr::new(ip, port_hint.unwrap_or_else(|| default_port(transport))),
+                    sni: target.clone(),
+                },
             });
         }
     }
@@ -282,7 +276,7 @@ fn spawn_validation(inner: &Arc<std::sync::Mutex<ResolverInner>>, server: Socket
                 .spawn(move || {
                     if validate_dot(&candidate) {
                         let g = inner.lock().unwrap();
-                        g.capability_cache.record_success(server, EncryptedTransport::Dot);
+                        g.capability_cache.record_success(server, EncryptedTransport::Dot, candidate.details.clone());
                     }
                 })
                 .ok();
@@ -295,7 +289,7 @@ fn spawn_validation(inner: &Arc<std::sync::Mutex<ResolverInner>>, server: Socket
                 .spawn(move || {
                     if validate_doq(&candidate) {
                         let g = inner.lock().unwrap();
-                        g.capability_cache.record_success(server, EncryptedTransport::Doq);
+                        g.capability_cache.record_success(server, EncryptedTransport::Doq, candidate.details.clone());
                     }
                 })
                 .ok();
@@ -320,7 +314,7 @@ fn validate_dot(candidate: &Candidate) -> bool {
     };
     let mut pool = TcpDnsConnectionPool::new();
     let probe = DnsQuestion::in_class(DDR_QNAME, DnsType::Svcb);
-    pool.query_dot(candidate.target_addr, &candidate.sni, &connector, &probe, 1)
+    pool.query_dot(candidate.details.target, &candidate.details.sni, &connector, &probe, 1)
         .is_ok()
 }
 
@@ -355,7 +349,7 @@ fn validate_doq(candidate: &Candidate) -> bool {
     let (tx, rx) = std::sync::mpsc::channel();
     let mut pool = DoqConnectionPool::new();
     if pool
-        .send_query(candidate.target_addr, &client_config, &candidate.sni, &bytes, Box::new(ValidationHandler { tx }))
+        .send_query(candidate.details.target, &client_config, &candidate.details.sni, &bytes, Box::new(ValidationHandler { tx }))
         .is_err()
     {
         return false;
@@ -445,8 +439,8 @@ mod tests {
         let server: SocketAddr = "198.51.100.1:53".parse().unwrap();
         let candidates = extract_candidates(server, &[rr]);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].target_addr, "203.0.113.9:853".parse().unwrap());
-        assert_eq!(candidates[0].sni, "dot.example");
+        assert_eq!(candidates[0].details.target, "203.0.113.9:853".parse().unwrap());
+        assert_eq!(candidates[0].details.sni, "dot.example");
     }
 
     #[test]
@@ -455,21 +449,21 @@ mod tests {
         let server: SocketAddr = "198.51.100.1:53".parse().unwrap();
         let candidates = extract_candidates(server, &[rr]);
         assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].target_addr, "198.51.100.1:853".parse().unwrap());
+        assert_eq!(candidates[0].details.target, "198.51.100.1:853".parse().unwrap());
     }
 
     #[test]
     fn extract_candidates_uses_the_explicit_port_hint_when_given() {
         let rr = svcb("dot.example", &["dot"], Some(8853));
         let server: SocketAddr = "198.51.100.1:53".parse().unwrap();
-        assert_eq!(extract_candidates(server, &[rr])[0].target_addr.port(), 8853);
+        assert_eq!(extract_candidates(server, &[rr])[0].details.target.port(), 8853);
     }
 
     #[test]
     fn extract_candidates_defaults_doh_to_port_443() {
         let rr = svcb("doh.example", &["h2"], None);
         let server: SocketAddr = "198.51.100.1:53".parse().unwrap();
-        assert_eq!(extract_candidates(server, &[rr])[0].target_addr.port(), 443);
+        assert_eq!(extract_candidates(server, &[rr])[0].details.target.port(), 443);
     }
 
     #[test]

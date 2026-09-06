@@ -36,6 +36,26 @@ pub(crate) enum EncryptedTransport {
     Doh,
 }
 
+/// Everything transport selection needs to actually dial a known
+/// transport, beyond just "this server supports it" — an entry with no
+/// endpoint details would be useless information to select, since there'd
+/// be nowhere to send the query. Recorded alongside the confidence level
+/// itself, both because a seeded entry (well-known public resolvers) and a
+/// discovered one (RFC 9462 DDR) each know their own dial target, and
+/// because a server can change which address/hostname its encrypted
+/// transport is reachable at independently of losing support for it
+/// entirely.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EndpointDetails {
+    /// Where to actually dial — often the same address as the plain
+    /// server, but not necessarily (an RFC 9462 DDR answer may advertise a
+    /// different one via `ipv4hint`/`ipv6hint`).
+    pub(crate) target: SocketAddr,
+    /// TLS/QUIC server name to present and validate the endpoint's
+    /// certificate against.
+    pub(crate) sni: String,
+}
+
 /// How much evidence backs a recorded transport capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Confidence {
@@ -80,6 +100,7 @@ struct TransportRecord {
     recorded_at: Instant,
     #[cfg_attr(not(any(test, feature = "dot", feature = "doq", feature = "doh")), allow(dead_code))]
     consecutive_failures: u32,
+    details: EndpointDetails,
 }
 
 impl TransportRecord {
@@ -116,20 +137,22 @@ impl TransportCapabilityCache {
     /// confirmed against this specific deployment. A pre-existing entry
     /// for the same `(server, transport)` pair is left untouched: seeding
     /// must never downgrade a confirmed entry back to provisional.
-    pub(crate) fn seed_provisional(&self, server: SocketAddr, transport: EncryptedTransport) {
+    pub(crate) fn seed_provisional(&self, server: SocketAddr, transport: EncryptedTransport, details: EndpointDetails) {
         let mut g = self.inner.lock().unwrap();
         g.transports.entry((server, transport)).or_insert_with(|| TransportRecord {
             confidence: Confidence::Provisional,
             recorded_at: Instant::now(),
             consecutive_failures: 0,
+            details,
         });
     }
 
     /// Record that `transport` just succeeded against `server` — promotes
     /// (or refreshes) it to confirmed-working and resets its failure
     /// count, since a fresh success is exactly the evidence that clears
-    /// an isolated prior failure.
-    pub(crate) fn record_success(&self, server: SocketAddr, transport: EncryptedTransport) {
+    /// an isolated prior failure. `details` replaces whatever was recorded
+    /// before, in case the endpoint moved since the last confirmation.
+    pub(crate) fn record_success(&self, server: SocketAddr, transport: EncryptedTransport, details: EndpointDetails) {
         let mut g = self.inner.lock().unwrap();
         g.transports.insert(
             (server, transport),
@@ -137,6 +160,7 @@ impl TransportCapabilityCache {
                 confidence: Confidence::Confirmed,
                 recorded_at: Instant::now(),
                 consecutive_failures: 0,
+                details,
             },
         );
         // A server that just answered over an encrypted transport is
@@ -198,25 +222,34 @@ impl TransportCapabilityCache {
     }
 
     /// Every transport (confirmed or provisional) currently known for
-    /// `server`, with no ordering guarantee — the priority order among
-    /// them is a transport-selection concern, not this cache's.
+    /// `server`, with no ordering guarantee — for the priority-ordered
+    /// lookup transport selection actually uses, see [`Self::best_known`].
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn known_transports(&self, server: SocketAddr) -> Vec<EncryptedTransport> {
         let mut g = self.inner.lock().unwrap();
-        let expired: Vec<_> = g
-            .transports
-            .iter()
-            .filter(|(k, v)| k.0 == server && v.is_expired())
-            .map(|(k, _)| *k)
-            .collect();
-        for key in expired {
-            g.transports.remove(&key);
-        }
+        expire(&mut g, server);
         g.transports
             .keys()
             .filter(|(addr, _)| *addr == server)
             .map(|(_, transport)| *transport)
             .collect()
+    }
+
+    /// The highest-priority transport (confirmed or provisional) known for
+    /// `server`, in `priority` order, along with what's needed to actually
+    /// dial it — `priority` is the caller's own ordered list of
+    /// transports it's both willing to prefer *and* actually able to dial
+    /// in this build (e.g. skipping DoQ entirely when the `doq` feature
+    /// isn't enabled). `None` means the cache has nothing for `server`
+    /// among the transports offered, and the caller should fall back to
+    /// plain UDP/TCP.
+    #[cfg_attr(not(any(feature = "dot", feature = "doq")), allow(dead_code))]
+    pub(crate) fn best_known(&self, server: SocketAddr, priority: &[EncryptedTransport]) -> Option<(EncryptedTransport, EndpointDetails)> {
+        let mut g = self.inner.lock().unwrap();
+        expire(&mut g, server);
+        priority
+            .iter()
+            .find_map(|transport| g.transports.get(&(server, *transport)).map(|record| (*transport, record.details.clone())))
     }
 
     /// Seed every encrypted transport [`KNOWN_PUBLIC_RESOLVERS`] has on
@@ -225,11 +258,44 @@ impl TransportCapabilityCache {
     /// pre-existing confirmed entry is never downgraded (see
     /// [`Self::seed_provisional`]'s own doc comment).
     pub(crate) fn seed_known_public_resolver(&self, addr: SocketAddr) {
-        if let Some((_, transports)) = KNOWN_PUBLIC_RESOLVERS.iter().find(|(ip, _)| *ip == addr.ip()) {
+        if let Some((_, transports, sni)) = KNOWN_PUBLIC_RESOLVERS.iter().find(|(ip, _, _)| *ip == addr.ip()) {
             for transport in *transports {
-                self.seed_provisional(addr, *transport);
+                let details = EndpointDetails {
+                    target: SocketAddr::new(addr.ip(), default_port(*transport)),
+                    sni: sni.to_string(),
+                };
+                self.seed_provisional(addr, *transport, details);
             }
         }
+    }
+}
+
+/// Evict every expired entry for `server` from `g.transports` — shared by
+/// [`TransportCapabilityCache::known_transports`] and
+/// [`TransportCapabilityCache::best_known`] so both apply the same lazy
+/// TTL expiry.
+fn expire(g: &mut Inner, server: SocketAddr) {
+    let expired: Vec<_> = g
+        .transports
+        .iter()
+        .filter(|(k, v)| k.0 == server && v.is_expired())
+        .map(|(k, _)| *k)
+        .collect();
+    for key in expired {
+        g.transports.remove(&key);
+    }
+}
+
+/// Standard port for a transport when nothing more specific is known —
+/// used to fill in [`EndpointDetails::target`] for a seeded well-known
+/// resolver, which (unlike an RFC 9462 DDR answer) never carries its own
+/// port hint, and by RFC 9462 DDR discovery itself when a candidate's own
+/// SVCB record has no explicit port SvcParam.
+#[cfg_attr(not(any(feature = "dot", feature = "doq", feature = "doh")), allow(dead_code))]
+pub(crate) fn default_port(transport: EncryptedTransport) -> u16 {
+    match transport {
+        EncryptedTransport::Dot | EncryptedTransport::Doq => 853,
+        EncryptedTransport::Doh => 443,
     }
 }
 
@@ -247,57 +313,69 @@ impl TransportCapabilityCache {
 /// with no benefit of the doubt, and RFC 9462 discovery (tracked
 /// separately) is the self-updating alternative for every server not on
 /// this short list.
-const KNOWN_PUBLIC_RESOLVERS: &[(IpAddr, &[EncryptedTransport])] = &[
-    // Cloudflare (cloudflare-dns.com): DoT/DoQ on 853, DoH on 443.
+const KNOWN_PUBLIC_RESOLVERS: &[(IpAddr, &[EncryptedTransport], &str)] = &[
+    // Cloudflare: DoT/DoQ on 853, DoH on 443, all under cloudflare-dns.com.
     (
         IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
         &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "cloudflare-dns.com",
     ),
     (
         IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
         &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "cloudflare-dns.com",
     ),
     (
         IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
         &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "cloudflare-dns.com",
     ),
     (
         IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
         &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "cloudflare-dns.com",
     ),
-    // Quad9 (dns.quad9.net): DoT/DoQ on 853, DoH on 443.
+    // Quad9: DoT/DoQ on 853, DoH on 443, all under dns.quad9.net.
     (
         IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
         &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "dns.quad9.net",
     ),
     (
         IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)),
         &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "dns.quad9.net",
     ),
     (
         IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)),
         &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "dns.quad9.net",
     ),
     (
         IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009)),
         &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "dns.quad9.net",
     ),
-    // Google Public DNS (dns.google): DoT on 853, DoH on 443 — no DoQ.
+    // Google Public DNS: DoT on 853, DoH on 443, under dns.google — no DoQ.
     (
         IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
         &[EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "dns.google",
     ),
     (
         IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
         &[EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "dns.google",
     ),
     (
         IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
         &[EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "dns.google",
     ),
     (
         IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844)),
         &[EncryptedTransport::Dot, EncryptedTransport::Doh],
+        "dns.google",
     ),
 ];
 
@@ -309,18 +387,27 @@ mod tests {
         "127.0.0.1:53".parse().unwrap()
     }
 
+    /// A placeholder [`EndpointDetails`] for tests that only care about
+    /// whether/how a transport is tracked, not where it dials.
+    fn details() -> EndpointDetails {
+        EndpointDetails {
+            target: "127.0.0.1:853".parse().unwrap(),
+            sni: "resolver.example".to_string(),
+        }
+    }
+
     #[test]
     fn seed_provisional_is_visible_via_known_transports() {
         let cache = TransportCapabilityCache::new();
-        cache.seed_provisional(addr(), EncryptedTransport::Doq);
+        cache.seed_provisional(addr(), EncryptedTransport::Doq, details());
         assert_eq!(cache.known_transports(addr()), vec![EncryptedTransport::Doq]);
     }
 
     #[test]
     fn seeding_never_downgrades_an_already_confirmed_entry() {
         let cache = TransportCapabilityCache::new();
-        cache.record_success(addr(), EncryptedTransport::Doq);
-        cache.seed_provisional(addr(), EncryptedTransport::Doq);
+        cache.record_success(addr(), EncryptedTransport::Doq, details());
+        cache.seed_provisional(addr(), EncryptedTransport::Doq, details());
         // A single failure would evict a provisional entry outright but
         // is tolerated for a confirmed one — this proves seeding didn't
         // quietly downgrade the confirmed entry underneath it.
@@ -331,7 +418,7 @@ mod tests {
     #[test]
     fn provisional_entry_is_evicted_immediately_on_first_failure() {
         let cache = TransportCapabilityCache::new();
-        cache.seed_provisional(addr(), EncryptedTransport::Dot);
+        cache.seed_provisional(addr(), EncryptedTransport::Dot, details());
         cache.record_failure(addr(), EncryptedTransport::Dot);
         assert!(cache.known_transports(addr()).is_empty());
     }
@@ -339,7 +426,7 @@ mod tests {
     #[test]
     fn confirmed_entry_tolerates_one_isolated_failure() {
         let cache = TransportCapabilityCache::new();
-        cache.record_success(addr(), EncryptedTransport::Doh);
+        cache.record_success(addr(), EncryptedTransport::Doh, details());
         cache.record_failure(addr(), EncryptedTransport::Doh);
         assert_eq!(
             cache.known_transports(addr()),
@@ -351,7 +438,7 @@ mod tests {
     #[test]
     fn confirmed_entry_is_evicted_on_a_second_consecutive_failure() {
         let cache = TransportCapabilityCache::new();
-        cache.record_success(addr(), EncryptedTransport::Doh);
+        cache.record_success(addr(), EncryptedTransport::Doh, details());
         cache.record_failure(addr(), EncryptedTransport::Doh);
         cache.record_failure(addr(), EncryptedTransport::Doh);
         assert!(cache.known_transports(addr()).is_empty());
@@ -360,11 +447,11 @@ mod tests {
     #[test]
     fn a_fresh_success_resets_the_failure_count() {
         let cache = TransportCapabilityCache::new();
-        cache.record_success(addr(), EncryptedTransport::Doh);
+        cache.record_success(addr(), EncryptedTransport::Doh, details());
         cache.record_failure(addr(), EncryptedTransport::Doh);
         // Confirmed again — the earlier isolated failure must not carry
         // over and combine with a later one to cause eviction.
-        cache.record_success(addr(), EncryptedTransport::Doh);
+        cache.record_success(addr(), EncryptedTransport::Doh, details());
         cache.record_failure(addr(), EncryptedTransport::Doh);
         assert_eq!(cache.known_transports(addr()), vec![EncryptedTransport::Doh]);
     }
@@ -389,14 +476,14 @@ mod tests {
         let cache = TransportCapabilityCache::new();
         cache.record_confirmed_absent(addr());
         assert!(cache.is_confirmed_absent(addr()));
-        cache.record_success(addr(), EncryptedTransport::Doq);
+        cache.record_success(addr(), EncryptedTransport::Doq, details());
         assert!(!cache.is_confirmed_absent(addr()));
     }
 
     #[test]
     fn confirmed_absent_evicts_any_previously_known_transports() {
         let cache = TransportCapabilityCache::new();
-        cache.seed_provisional(addr(), EncryptedTransport::Doq);
+        cache.seed_provisional(addr(), EncryptedTransport::Doq, details());
         cache.record_confirmed_absent(addr());
         assert!(cache.known_transports(addr()).is_empty());
     }
@@ -405,9 +492,49 @@ mod tests {
     fn entries_for_different_servers_are_independent() {
         let other: SocketAddr = "127.0.0.2:53".parse().unwrap();
         let cache = TransportCapabilityCache::new();
-        cache.record_success(addr(), EncryptedTransport::Doq);
+        cache.record_success(addr(), EncryptedTransport::Doq, details());
         assert!(cache.known_transports(other).is_empty());
         assert!(!cache.is_confirmed_absent(other));
+    }
+
+    #[test]
+    fn best_known_prefers_the_first_priority_match() {
+        let cache = TransportCapabilityCache::new();
+        cache.seed_provisional(addr(), EncryptedTransport::Dot, details());
+        cache.seed_provisional(addr(), EncryptedTransport::Doh, details());
+        let priority = [EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh];
+        let (transport, _) = cache.best_known(addr(), &priority).unwrap();
+        assert_eq!(transport, EncryptedTransport::Dot, "Doq isn't known here, so Dot is the highest-priority match");
+    }
+
+    #[test]
+    fn best_known_returns_the_matching_endpoint_details() {
+        let cache = TransportCapabilityCache::new();
+        let target: SocketAddr = "198.51.100.9:853".parse().unwrap();
+        cache.seed_provisional(
+            addr(),
+            EncryptedTransport::Dot,
+            EndpointDetails {
+                target,
+                sni: "dot.example".to_string(),
+            },
+        );
+        let (_, found) = cache.best_known(addr(), &[EncryptedTransport::Dot]).unwrap();
+        assert_eq!(found.target, target);
+        assert_eq!(found.sni, "dot.example");
+    }
+
+    #[test]
+    fn best_known_is_none_when_nothing_in_priority_is_known() {
+        let cache = TransportCapabilityCache::new();
+        cache.seed_provisional(addr(), EncryptedTransport::Doh, details());
+        assert!(cache.best_known(addr(), &[EncryptedTransport::Doq, EncryptedTransport::Dot]).is_none());
+    }
+
+    #[test]
+    fn best_known_is_none_for_a_server_with_no_entries_at_all() {
+        let cache = TransportCapabilityCache::new();
+        assert!(cache.best_known(addr(), &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh]).is_none());
     }
 
     #[test]
@@ -461,5 +588,20 @@ mod tests {
         let cloudflare_on_a_nonstandard_port: SocketAddr = "1.1.1.1:5353".parse().unwrap();
         cache.seed_known_public_resolver(cloudflare_on_a_nonstandard_port);
         assert!(!cache.known_transports(cloudflare_on_a_nonstandard_port).is_empty());
+    }
+
+    #[test]
+    fn seeded_entries_carry_real_dial_details_not_placeholders() {
+        let cache = TransportCapabilityCache::new();
+        let cloudflare: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        cache.seed_known_public_resolver(cloudflare);
+        let (transport, dot) = cache.best_known(cloudflare, &[EncryptedTransport::Dot]).unwrap();
+        assert_eq!(transport, EncryptedTransport::Dot);
+        assert_eq!(dot.sni, "cloudflare-dns.com");
+        assert_eq!(dot.target, "1.1.1.1:853".parse().unwrap());
+
+        let (_, doh) = cache.best_known(cloudflare, &[EncryptedTransport::Doh]).unwrap();
+        assert_eq!(doh.sni, "cloudflare-dns.com");
+        assert_eq!(doh.target, "1.1.1.1:443".parse().unwrap());
     }
 }
