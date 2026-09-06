@@ -23,8 +23,11 @@ full = [
     "auth",
     "ldap",
     "http",
+    "masque",
     "quic",
     "dns",
+    "mdns",
+    "socks",
     "webdav",
     "websocket",
     "grpc",
@@ -41,8 +44,11 @@ tls = ["dep:hopf-tls"]
 auth = ["dep:hopf-auth"]
 ldap = ["dep:hopf-ldap", "auth", "tls"]
 http = ["dep:hopf-http"]
+masque = ["dep:hopf-masque", "dns", "http"]
 quic = ["dep:hopf-quic"]
 dns = ["dep:hopf-dns"]
+mdns = ["dep:hopf-mdns", "dns"]
+socks = ["dep:hopf-socks", "dns"]
 webdav = ["dep:hopf-webdav"]
 websocket = ["dep:hopf-websocket"]
 grpc = ["dep:hopf-grpc"]
@@ -65,6 +71,7 @@ doh = ["dns", "hopf-dns/doh"]
 dnssec = ["dns", "hopf-dns/dnssec"]
 webdav-xattr = ["webdav", "hopf-webdav/xattr"]
 mqtt-ws = ["mqtt", "hopf-mqtt/websocket"]
+masque-h3 = ["masque", "h3", "hopf-masque/h3"]
 
 [dependencies]
 hopf-core = { workspace = true }
@@ -74,6 +81,9 @@ hopf-ldap = { workspace = true, optional = true }
 hopf-http = { workspace = true, optional = true }
 hopf-quic = { workspace = true, optional = true }
 hopf-dns = { workspace = true, optional = true }
+hopf-mdns = { workspace = true, optional = true }
+hopf-masque = { workspace = true, optional = true }
+hopf-socks = { workspace = true, optional = true }
 hopf-webdav = { workspace = true, optional = true }
 hopf-websocket = { workspace = true, optional = true }
 hopf-grpc = { workspace = true, optional = true }

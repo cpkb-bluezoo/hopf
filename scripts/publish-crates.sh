@@ -45,9 +45,12 @@ CRATES=(
   hopf-tls
   hopf-quic
   hopf-dns
+  hopf-mdns
   hopf-mailbox
   hopf-ldap
   hopf-http
+  hopf-masque
+  hopf-socks
   hopf-webdav
   hopf-websocket
   hopf-grpc

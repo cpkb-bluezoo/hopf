@@ -17,4 +17,4 @@ hopf = { version = "0.2", default-features = false, features = ["http", "tls"] }
 ```
 
 `hopf-core` is always included. Pass-through features: `h3`, `dns-server`,
-`dot`, `doq`, `doh`, `dnssec`, `webdav-xattr`.
+`dot`, `doq`, `doh`, `dnssec`, `webdav-xattr`, `masque-h3`.

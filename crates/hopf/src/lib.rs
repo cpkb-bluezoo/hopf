@@ -26,8 +26,11 @@
 //! | [`auth`] | `hopf-auth` | `auth` (`pam` for PAM store) |
 //! | [`ldap`] | `hopf-ldap` | `ldap` |
 //! | [`http`] | `hopf-http` | `http` (`h3` for HTTP/3) |
+//! | [`masque`] | `hopf-masque` | `masque` (`masque-h3` for CONNECT-UDP over HTTP/3) |
 //! | [`quic`] | `hopf-quic` | `quic` |
 //! | [`dns`] | `hopf-dns` | `dns` (`dns-server`, `dot`, `doq`, `doh`, `dnssec`) |
+//! | [`mdns`] | `hopf-mdns` | `mdns` |
+//! | [`socks`] | `hopf-socks` | `socks` |
 //! | [`webdav`] | `hopf-webdav` | `webdav` (`webdav-xattr`) |
 //! | [`websocket`] | `hopf-websocket` | `websocket` |
 //! | [`grpc`] | `hopf-grpc` | `grpc` |
@@ -63,6 +66,10 @@ pub use hopf_ldap as ldap;
 #[cfg(feature = "http")]
 pub use hopf_http as http;
 
+/// MASQUE CONNECT-UDP / CONNECT-IP (feature `masque-h3` for HTTP/3 client).
+#[cfg(feature = "masque")]
+pub use hopf_masque as masque;
+
 /// QUIC transport (quinn-proto + mio glue).
 #[cfg(feature = "quic")]
 pub use hopf_quic as quic;
@@ -70,6 +77,14 @@ pub use hopf_quic as quic;
 /// DNS stub resolver and caching forwarder.
 #[cfg(feature = "dns")]
 pub use hopf_dns as dns;
+
+/// Multicast DNS (RFC 6762) and DNS-SD (RFC 6763).
+#[cfg(feature = "mdns")]
+pub use hopf_mdns as mdns;
+
+/// SOCKS4/4a/5 proxy server and client.
+#[cfg(feature = "socks")]
+pub use hopf_socks as socks;
 
 /// RFC 4918 WebDAV filesystem handler.
 #[cfg(feature = "webdav")]
