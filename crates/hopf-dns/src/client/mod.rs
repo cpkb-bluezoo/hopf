@@ -3,6 +3,7 @@
 //! Asynchronous stub DNS resolver and client transports.
 
 mod capability_cache;
+mod ddr;
 mod hosts;
 mod tcp;
 mod udp;
@@ -495,6 +496,11 @@ struct ResolverInner {
     /// pinned server (`add_server_dot`/`add_server_doq`/`add_server_doh`)
     /// never touches this.
     capability_cache: TransportCapabilityCache,
+    /// Servers with an RFC 9462 DDR discovery query currently outstanding
+    /// (see `ddr`'s own module docs) — prevents a burst of concurrent
+    /// queries to the same still-unknown server from each kicking off
+    /// their own redundant discovery attempt.
+    discovery_in_flight: std::collections::HashSet<SocketAddr>,
     timeout: Duration,
     use_edns: bool,
     use_cookies: bool,
@@ -539,6 +545,7 @@ impl DnsResolver {
                 cookies: DnsCookie::new(),
                 multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
                 capability_cache: TransportCapabilityCache::new(),
+                discovery_in_flight: std::collections::HashSet::new(),
                 timeout: DEFAULT_TIMEOUT,
                 use_edns: true,
                 use_cookies: true,
@@ -1233,6 +1240,7 @@ fn send_query_to_server(
     server_idx: usize,
     extra_edns_options: &[u8],
 ) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
+    ddr::maybe_trigger_discovery(inner, g, server_idx);
     let server = g.servers[server_idx].clone();
     match server.transport {
         ServerTransport::UdpTcp => {
@@ -1651,6 +1659,72 @@ mod tests {
         rt.shutdown();
     }
 
+    /// End-to-end regression test for issue #378: dispatching an ordinary
+    /// query against a freshly-added auto-mode server must, on its own,
+    /// trigger RFC 9462 DDR discovery — no explicit discovery call is
+    /// exposed anywhere for a caller to make. A server whose discovery
+    /// response says it doesn't understand the SVCB qtype at all must end
+    /// up confirmed-absent in the capability cache.
+    #[test]
+    fn a_real_query_triggers_ddr_discovery_which_records_confirmed_absent() {
+        let fake = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        std::thread::Builder::new()
+            .name("ddr-fake-server".into())
+            .spawn(move || {
+                let mut buf = [0u8; 512];
+                loop {
+                    let Ok((n, from)) = fake.recv_from(&mut buf) else {
+                        return;
+                    };
+                    let Ok(query) = DnsMessage::parse(&buf[..n]) else {
+                        continue;
+                    };
+                    let Some(question) = query.questions.first() else {
+                        continue;
+                    };
+                    let mut reply = DnsMessage::query(query.id, question.clone(), true);
+                    reply.flags |= crate::wire::FLAG_QR;
+                    if question.qtype == Some(DnsType::Svcb) {
+                        // NOTIMP: this fake server doesn't understand DDR's
+                        // SVCB query at all — a definitive negative.
+                        reply.flags = (reply.flags & !0x0F) | crate::wire::RCODE_NOTIMP;
+                    } else {
+                        reply.answers.push(DnsResourceRecord::a(
+                            &question.name,
+                            60,
+                            std::net::Ipv4Addr::new(192, 0, 2, 1),
+                        ));
+                    }
+                    let Ok(bytes) = reply.serialize() else {
+                        continue;
+                    };
+                    let _ = fake.send_to(&bytes, from);
+                }
+            })
+            .unwrap();
+
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let resolver = DnsResolver::for_reactor(rt.pick_worker().clone()).unwrap();
+        resolver.set_timeout(Duration::from_millis(500));
+        resolver.add_server(fake_addr);
+
+        resolver.query_a("example.com", Box::new(|_| {}));
+
+        for _ in 0..150 {
+            if resolver.inner.lock().unwrap().capability_cache.is_confirmed_absent(fake_addr) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            resolver.inner.lock().unwrap().capability_cache.is_confirmed_absent(fake_addr),
+            "a real query to a fresh auto-mode server must trigger DDR discovery and record confirmed-absent"
+        );
+
+        rt.shutdown();
+    }
+
     #[test]
     fn alloc_id_avoids_colliding_with_a_pending_query() {
         let rt = hopf_core::Runtime::start(Default::default()).unwrap();
@@ -1664,6 +1738,7 @@ mod tests {
             cookies: DnsCookie::new(),
             multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
             capability_cache: TransportCapabilityCache::new(),
+            discovery_in_flight: std::collections::HashSet::new(),
             timeout: DEFAULT_TIMEOUT,
             use_edns: true,
             use_cookies: true,
@@ -1730,6 +1805,7 @@ mod tests {
             cookies: DnsCookie::new(),
             multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
             capability_cache: TransportCapabilityCache::new(),
+            discovery_in_flight: std::collections::HashSet::new(),
             timeout: DEFAULT_TIMEOUT,
             use_edns: true,
             use_cookies: true,
@@ -1925,6 +2001,7 @@ mod tests {
             cookies: DnsCookie::new(),
             multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
             capability_cache: TransportCapabilityCache::new(),
+            discovery_in_flight: std::collections::HashSet::new(),
             timeout: DEFAULT_TIMEOUT,
             use_edns: true,
             use_cookies: true,
