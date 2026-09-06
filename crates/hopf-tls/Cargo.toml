@@ -21,6 +21,8 @@ integration = []
 hopf-core = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+rustls-native-certs = { workspace = true }
+webpki-roots = { workspace = true }
 aws-lc-rs = { workspace = true }
 
 [dev-dependencies]
