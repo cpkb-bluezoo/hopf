@@ -198,6 +198,17 @@ struct PendingQuery {
     /// `None` for UDP/TCP/DoT/DoQ — DoQ's connection lives in
     /// [`ResolverInner`]'s pool for the lifetime of the resolver.
     active_transport: Option<Box<dyn std::any::Any + Send>>,
+    /// Which encrypted transport this specific attempt actually went out
+    /// over, if any — set identically for a pinned server's static
+    /// transport and for an auto-mode server's dynamically-selected one
+    /// (see `send_query_to_server`'s own doc comment), so the capability
+    /// cache's demotion/promotion hooks and intra-server fallback can all
+    /// key off this one field rather than re-deriving it from
+    /// `ResolverInner::servers`, which only knows an auto-mode server's
+    /// static (always plain) configuration, not what a given attempt
+    /// dynamically chose. `None` for plain UDP/TCP.
+    #[cfg_attr(not(any(feature = "dot", feature = "doq", feature = "doh")), allow(dead_code))]
+    actual_transport: Option<EncryptedTransport>,
 }
 
 /// Allocate a query id that isn't already in use by another outstanding
@@ -229,30 +240,90 @@ fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
 
 /// As [`retry_or_fail`], but triggered by a transport-level failure (DoT
 /// connect/handshake error, DoQ/DoH `on_error`) rather than the timeout
-/// timer — a dead/unreachable encrypted upstream should fail over to the
-/// next configured server exactly like a dead UDP one, not just sit until
-/// the timeout eventually fires. `err` becomes the final failure reported
-/// to the caller once every server has been tried.
+/// timer.
 ///
 /// Also the capability cache's demotion hook: an auto-mode server's
-/// encrypted transport that just failed is exactly the update the cache
-/// exists to record (see `capability_cache`'s module docs) — a pinned
-/// server never has an entry to demote in the first place.
+/// dynamically-selected transport that just failed is exactly the update
+/// the cache exists to record (see `capability_cache`'s module docs) — a
+/// pinned server never has an entry to demote in the first place.
+///
+/// This is also where intra-server fallback (issue #379) branches off
+/// from the plain inter-server one: a failure while `pending`'s attempt
+/// was using a dynamically- or statically-selected encrypted transport
+/// (`actual_transport.is_some()`) retries the *same* server at the next-
+/// best transport ([`retry_same_server`]) rather than jumping to a
+/// different configured server — a dead/unreachable *server* (plain UDP
+/// already failed, or a pinned server's only transport failed) is the
+/// only case that still falls through to [`retry_or_fail_impl`].
 #[cfg(any(feature = "dot", feature = "doq", feature = "doh"))]
 fn retry_after_transport_error(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error) {
-    {
+    // Intra-server fallback (issue #379) only makes sense for an auto-mode
+    // server whose failing transport was itself dynamically selected —
+    // demoting it might still leave a next-best transport (or plain UDP)
+    // to retry against the *same* server. A pinned server's one and only
+    // transport failing has nowhere "better" within that server to fall
+    // back to, so it must still go straight to the existing inter-server
+    // fallback, exactly as before this issue.
+    let auto_dynamic_transport = {
         let g = inner.lock().unwrap();
-        if let Some(pending) = g.pending.get(&id) {
+        let Some(pending) = g.pending.get(&id) else {
+            return;
+        };
+        let is_auto = g.servers.get(pending.server_idx).is_some_and(|s| s.auto);
+        let transport = pending.actual_transport.filter(|_| is_auto);
+        if let Some(t) = transport {
             if let Some(server) = g.servers.get(pending.server_idx) {
-                if server.auto {
-                    if let Some(transport) = server.transport.encrypted_transport() {
-                        g.capability_cache.record_failure(server.addr, transport);
-                    }
-                }
+                g.capability_cache.record_failure(server.addr, t);
             }
         }
+        transport
+    };
+    if auto_dynamic_transport.is_some() {
+        retry_same_server(inner, id, err);
+    } else {
+        retry_or_fail_impl(inner, id, move || err);
     }
-    retry_or_fail_impl(inner, id, move || err);
+}
+
+/// Intra-server fallback (issue #379): re-dispatch `id`'s query against
+/// the *same* `server_idx`, demoted transport already recorded by the
+/// caller — a fresh call to [`send_query_to_server`] re-consults the
+/// capability cache, which naturally picks the next-best remaining
+/// transport (or plain UDP/TCP, if none is left). If dispatch itself
+/// fails outright, `err` (the original transport failure) is what's
+/// reported — a dispatch-time error isn't more informative than the
+/// failure that triggered this retry in the first place.
+#[cfg(any(feature = "dot", feature = "doq", feature = "doh"))]
+fn retry_same_server(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error) {
+    let mut g = inner.lock().unwrap();
+    let Some(mut pending) = g.pending.remove(&id) else {
+        return;
+    };
+    if let Some(c) = &pending.cancel {
+        c.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    let server_idx = pending.server_idx;
+    let new_id = alloc_id(&g);
+    pending.id = new_id;
+    let timeout = g.timeout;
+    let inner2 = Arc::clone(inner);
+    let cancel = g.reactor.schedule_timer(timeout, Box::new(move || retry_or_fail(&inner2, new_id)));
+    pending.cancel = Some(cancel);
+    let question = pending.question.clone();
+    match send_query_to_server(inner, &mut g, new_id, &question, server_idx, &pending.extra_edns_options) {
+        Ok((keepalive, actual_transport)) => {
+            pending.active_transport = keepalive;
+            pending.actual_transport = actual_transport;
+            g.pending.insert(new_id, pending);
+        }
+        Err(_) => {
+            if let Some(c) = &pending.cancel {
+                c.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            drop(g);
+            (pending.callback)(Err(err));
+        }
+    }
 }
 
 fn retry_or_fail_impl(inner: &Arc<Mutex<ResolverInner>>, id: u16, final_error: impl FnOnce() -> io::Error) {
@@ -279,8 +350,9 @@ fn retry_or_fail_impl(inner: &Arc<Mutex<ResolverInner>>, id: u16, final_error: i
     pending.cancel = Some(cancel);
     let question = pending.question.clone();
     match send_query_to_server(inner, &mut g, new_id, &question, next_idx, &pending.extra_edns_options) {
-        Ok(keepalive) => {
+        Ok((keepalive, actual_transport)) => {
             pending.active_transport = keepalive;
+            pending.actual_transport = actual_transport;
             g.pending.insert(new_id, pending);
         }
         Err(e) => {
@@ -510,6 +582,15 @@ struct ResolverInner {
     /// Live DoQ QUIC connections reused across queries (RFC 9250 §5.5.1).
     #[cfg(feature = "doq")]
     doq_pool: doq::DoqConnectionPool,
+    /// Lazily built the first time an auto-mode server's dynamic selection
+    /// needs to dial a confirmed/provisional DoT capability — see
+    /// [`public_trust_dot_connector`].
+    #[cfg(feature = "dot")]
+    public_trust_dot_connector: Option<hopf_core::SharedTlsConnector>,
+    /// As `public_trust_dot_connector`, for DoQ — see
+    /// [`public_trust_doq_config`].
+    #[cfg(feature = "doq")]
+    public_trust_doq_config: Option<Arc<hopf_quic::QuicClientConfig>>,
     #[cfg(feature = "dnssec")]
     dnssec_enabled: bool,
     #[cfg(feature = "dnssec")]
@@ -554,6 +635,10 @@ impl DnsResolver {
                 tcp_pool: TcpDnsConnectionPool::new(),
                 #[cfg(feature = "doq")]
                 doq_pool: doq::DoqConnectionPool::new(),
+                #[cfg(feature = "dot")]
+                public_trust_dot_connector: None,
+                #[cfg(feature = "doq")]
+                public_trust_doq_config: None,
                 #[cfg(feature = "dnssec")]
                 dnssec_enabled: false,
                 #[cfg(feature = "dnssec")]
@@ -944,7 +1029,7 @@ impl DnsResolver {
             }),
         );
         match send_query_to_server(&self.inner, &mut g, id, &question, 0, &extra_edns_options) {
-            Ok(keepalive) => {
+            Ok((keepalive, actual_transport)) => {
                 g.pending.insert(
                     id,
                     PendingQuery {
@@ -958,6 +1043,7 @@ impl DnsResolver {
                         cancel: Some(cancel),
                         extra_edns_options,
                         active_transport: keepalive,
+                        actual_transport,
                     },
                 );
             }
@@ -1215,19 +1301,38 @@ fn send_udp_query(
     Ok(())
 }
 
+/// A dispatch attempt's DoH keepalive handle — see
+/// [`PendingQuery::active_transport`]'s own doc comment.
+type DispatchKeepalive = Option<Box<dyn std::any::Any + Send>>;
+
+/// [`DispatchKeepalive`] paired with which [`EncryptedTransport`] the
+/// attempt actually used, if any — see [`PendingQuery::actual_transport`].
+type DispatchOutcome = (DispatchKeepalive, Option<EncryptedTransport>);
+
 /// Dispatch one query attempt to whichever transport `server_idx` is
 /// configured for, returning an opaque handle the caller must fold into
 /// the resulting [`PendingQuery::active_transport`] — dropping it early
 /// would tear down an in-flight DoH connection before its response can
-/// arrive (see [`PendingQuery::active_transport`]'s doc comment).
+/// arrive (see [`PendingQuery::active_transport`]'s doc comment) — along
+/// with the [`EncryptedTransport`] this attempt actually used, if any (see
+/// [`PendingQuery::actual_transport`]'s own doc comment for why the
+/// caller needs this).
 ///
 /// UDP and DoT are fire-and-forget from the caller's point of view (UDP
 /// sends synchronously via the reactor; DoT spawns a dedicated thread and
 /// drives the whole exchange itself, matching the existing UDP-truncation
-/// TCP-fallback pattern) — both return `Ok(None)`. DoQ reuses a pooled
-/// connection owned by [`ResolverInner::doq_pool`], so it also returns
-/// `Ok(None)`. DoH still needs its transport instance kept alive for the
-/// duration of the query, so it returns `Ok(Some(_))`.
+/// TCP-fallback pattern) — both return `Ok((None, _))`. DoQ reuses a
+/// pooled connection owned by [`ResolverInner::doq_pool`], so it also
+/// returns `Ok((None, _))`. DoH still needs its transport instance kept
+/// alive for the duration of the query, so it returns `Ok((Some(_), _))`.
+///
+/// For an auto-mode server (`ServerTransport::UdpTcp`, `auto: true`) this
+/// is also where dynamic transport selection (issue #379) happens: if the
+/// capability cache has *any* transport on record for it, the
+/// highest-priority one ([`AUTO_TRANSPORT_PRIORITY`]) is dialled instead
+/// of plain UDP — falling back to plain UDP/TCP exactly as today whenever
+/// the cache has nothing, or dialling fails outright before ever reaching
+/// the wire (e.g. no public-trust connector could be built).
 #[cfg_attr(
     not(any(feature = "dot", feature = "doq", feature = "doh")),
     allow(unused_variables)
@@ -1239,13 +1344,20 @@ fn send_query_to_server(
     question: &DnsQuestion,
     server_idx: usize,
     extra_edns_options: &[u8],
-) -> io::Result<Option<Box<dyn std::any::Any + Send>>> {
+) -> io::Result<DispatchOutcome> {
     ddr::maybe_trigger_discovery(inner, g, server_idx);
     let server = g.servers[server_idx].clone();
     match server.transport {
         ServerTransport::UdpTcp => {
+            if server.auto {
+                if let Some((transport, details)) = g.capability_cache.best_known(server.addr, AUTO_TRANSPORT_PRIORITY) {
+                    if let Some(result) = dispatch_auto_transport(inner, g, id, question, transport, &details, extra_edns_options) {
+                        return result.map(|keepalive| (keepalive, Some(transport)));
+                    }
+                }
+            }
             send_udp_query(g, id, question, server.addr, extra_edns_options)?;
-            Ok(None)
+            Ok((None, None))
         }
         #[cfg(feature = "dot")]
         ServerTransport::Dot { server_name, connector } => {
@@ -1258,7 +1370,7 @@ fn send_query_to_server(
             // server. No correctness impact, just no optimization on DoT
             // upstreams yet.
             spawn_dot_query(inner, id, question.clone(), server.addr, server_name, connector);
-            Ok(None)
+            Ok((None, Some(EncryptedTransport::Dot)))
         }
         #[cfg(feature = "doq")]
         ServerTransport::Doq { server_name, client_config } => {
@@ -1272,7 +1384,7 @@ fn send_query_to_server(
             });
             g.doq_pool
                 .send_query(server.addr, &client_config, &server_name, &bytes, handler)?;
-            Ok(None)
+            Ok((None, Some(EncryptedTransport::Doq)))
         }
         #[cfg(feature = "doh")]
         ServerTransport::Doh { runtime, host, path, connector, use_get } => {
@@ -1286,9 +1398,114 @@ fn send_query_to_server(
                 id,
             });
             transport.send_query(server.addr, &bytes, handler)?;
-            Ok(Some(Box::new(transport)))
+            Ok((Some(Box::new(transport)), Some(EncryptedTransport::Doh)))
         }
     }
+}
+
+/// Every transport an auto-mode server's dynamic selection will ever try,
+/// in priority order (issue #379): DoQ, then DoT — DoH is deliberately
+/// absent here even though the capability cache may well have a DoH entry
+/// for a server (every well-known public resolver is seeded with one):
+/// unlike DoT (a synchronous dial) and DoQ (dials its own dedicated
+/// connection via [`hopf_quic::connect_quic`]), this crate's
+/// `DohClientTransport` needs a `hopf_core::Runtime` to dial through, and
+/// nothing guarantees this resolver has one (only a caller of
+/// `add_server_doh` supplies one, for its own server) — see `ddr`'s own
+/// module docs for the identical constraint on DDR validation. A deployer
+/// who wants DoH can still pin it explicitly via `add_server_doh`; auto
+/// mode just never gets there for DoH.
+///
+/// Whichever of `dot`/`doq` aren't compiled in are simply absent from
+/// this list — there'd be nothing this build could use to dial them with
+/// even if the cache had an entry.
+#[cfg(all(feature = "doq", feature = "dot"))]
+const AUTO_TRANSPORT_PRIORITY: &[EncryptedTransport] = &[EncryptedTransport::Doq, EncryptedTransport::Dot];
+#[cfg(all(feature = "doq", not(feature = "dot")))]
+const AUTO_TRANSPORT_PRIORITY: &[EncryptedTransport] = &[EncryptedTransport::Doq];
+#[cfg(all(feature = "dot", not(feature = "doq")))]
+const AUTO_TRANSPORT_PRIORITY: &[EncryptedTransport] = &[EncryptedTransport::Dot];
+#[cfg(not(any(feature = "doq", feature = "dot")))]
+const AUTO_TRANSPORT_PRIORITY: &[EncryptedTransport] = &[];
+
+/// Attempt to dial `transport` at `details` for an auto-mode server,
+/// using a shared, lazily-built public-trust connector/config (see
+/// [`public_trust_dot_connector`]/[`public_trust_doq_config`]) rather than
+/// a caller-supplied one — an auto-discovered or seeded capability has no
+/// caller-supplied root to trust, only the endpoint's own certificate
+/// chaining to the public WebPKI, exactly like RFC 9462 DDR validation
+/// already required to promote it in the first place.
+///
+/// Returns `None` (not an error) when `transport` isn't one this function
+/// knows how to dial at all in this build — the caller falls back to
+/// plain UDP/TCP exactly as if the cache had no entry. Returns
+/// `Some(Err(_))` only once dialling has genuinely been attempted and
+/// failed (e.g. no public-trust connector could be built), which the
+/// caller propagates as this query attempt's own dispatch error.
+#[cfg_attr(not(feature = "doq"), allow(unused_variables))]
+fn dispatch_auto_transport(
+    inner: &Arc<Mutex<ResolverInner>>,
+    g: &mut ResolverInner,
+    id: u16,
+    question: &DnsQuestion,
+    transport: EncryptedTransport,
+    details: &capability_cache::EndpointDetails,
+    extra_edns_options: &[u8],
+) -> Option<io::Result<DispatchKeepalive>> {
+    match transport {
+        #[cfg(feature = "dot")]
+        EncryptedTransport::Dot => {
+            let connector = public_trust_dot_connector(g)?;
+            spawn_dot_query(inner, id, question.clone(), details.target, details.sni.clone(), connector);
+            Some(Ok(None))
+        }
+        #[cfg(feature = "doq")]
+        EncryptedTransport::Doq => {
+            let client_config = public_trust_doq_config(g)?;
+            let msg = build_query_message(g, id, question, None, extra_edns_options);
+            let bytes = match msg.serialize() {
+                Ok(bytes) => bytes,
+                Err(e) => return Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+            };
+            let handler = Box::new(TransportResponseHandler {
+                inner: Arc::clone(inner),
+                id,
+            });
+            Some(
+                g.doq_pool
+                    .send_query(details.target, &client_config, &details.sni, &bytes, handler)
+                    .map(|()| None),
+            )
+        }
+        // Doh (see `AUTO_TRANSPORT_PRIORITY`'s own doc comment), or a
+        // transport `AUTO_TRANSPORT_PRIORITY` wouldn't have offered in
+        // this build anyway.
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Lazily build (and thereafter reuse) a [`hopf_core::SharedTlsConnector`]
+/// trusting the public WebPKI, for dialling an auto-mode server's
+/// dynamically-selected DoT capability — built once per resolver rather
+/// than per query, since [`hopf_tls::public_trust_connector`] reads the
+/// OS trust store. `None` means the one build attempt failed; the caller
+/// then falls back to plain UDP/TCP for this query.
+#[cfg(feature = "dot")]
+fn public_trust_dot_connector(g: &mut ResolverInner) -> Option<hopf_core::SharedTlsConnector> {
+    if g.public_trust_dot_connector.is_none() {
+        g.public_trust_dot_connector = hopf_tls::public_trust_connector(&[b"dot"]).ok();
+    }
+    g.public_trust_dot_connector.clone()
+}
+
+/// As [`public_trust_dot_connector`], for DoQ.
+#[cfg(feature = "doq")]
+fn public_trust_doq_config(g: &mut ResolverInner) -> Option<Arc<hopf_quic::QuicClientConfig>> {
+    if g.public_trust_doq_config.is_none() {
+        g.public_trust_doq_config = hopf_quic::client_config_public_trust(&[doq::ALPN_DOQ]).ok();
+    }
+    g.public_trust_doq_config.clone()
 }
 
 /// Drive one DoT query on a dedicated thread ([`TcpDnsConnectionPool::query_dot`]
@@ -1508,10 +1725,11 @@ fn complete_response(
                     // dispatch error the same way the pre-transport-abstraction code
                     // did: `pending` is still inserted, so the timeout timer (already
                     // armed above) is what eventually cleans it up either way.
-                    let keepalive = send_query_to_server(inner, &mut g, id, &q, server_idx, &pending.extra_edns_options)
-                        .ok()
-                        .flatten();
+                    let (keepalive, actual_transport) =
+                        send_query_to_server(inner, &mut g, id, &q, server_idx, &pending.extra_edns_options)
+                            .unwrap_or((None, None));
                     pending.active_transport = keepalive;
+                    pending.actual_transport = actual_transport;
                     g.pending.insert(id, pending);
                     return;
                 }
@@ -1546,11 +1764,16 @@ fn complete_response(
     // Capability-cache promotion hook, mirroring the demotion hook in
     // `retry_after_transport_error`: an auto-mode server's encrypted
     // transport that just produced a real answer is exactly the evidence
-    // that promotes it to (or keeps it) confirmed-working.
-    if let Some(server) = g.servers.get(pending.server_idx) {
-        if server.auto {
-            if let Some(transport) = server.transport.encrypted_transport() {
-                g.capability_cache.record_success(server.addr, transport);
+    // that promotes it to (or keeps it) confirmed-working. Re-reads the
+    // entry's own endpoint details from the cache rather than threading
+    // them through `PendingQuery` — they were already known and unchanged
+    // between "we just dialled this" and "it just worked".
+    if let Some(transport) = pending.actual_transport {
+        if let Some(server) = g.servers.get(pending.server_idx) {
+            if server.auto {
+                if let Some((_, details)) = g.capability_cache.best_known(server.addr, &[transport]) {
+                    g.capability_cache.record_success(server.addr, transport, details);
+                }
             }
         }
     }
@@ -1725,6 +1948,92 @@ mod tests {
         rt.shutdown();
     }
 
+    /// End-to-end regression test for issue #379: once the capability
+    /// cache has a confirmed DoT entry for an auto-mode server, an
+    /// ordinary query must be dialled dynamically at that entry's own
+    /// endpoint details — not sent over the server's own plain UDP
+    /// address at all. Proven two ways at once: a raw TCP listener at the
+    /// DoT target must see a connection, and the original plain-UDP
+    /// address must never be queried.
+    #[cfg(feature = "dot")]
+    #[test]
+    fn a_confirmed_dot_capability_is_dialed_dynamically_instead_of_plain_udp() {
+        let dot_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dot_addr = dot_listener.local_addr().unwrap();
+        let dot_connected = Arc::new(Mutex::new(false));
+        let dot_connected2 = Arc::clone(&dot_connected);
+        // Accepted connections are kept open (never dropped) rather than
+        // closed right away: a dropped-immediately socket resets the
+        // client's handshake attempt near-instantly, which could demote
+        // and eventually evict this test's own confirmed entry (down to
+        // plain UDP, the correct behavior once every transport genuinely
+        // fails — see the intra-server fallback tests) before the
+        // assertions below ever get a chance to run. Held open, the
+        // client's read just blocks until its own internal timeout,
+        // comfortably outside this test's short assertion window.
+        // Bounded, not `.incoming()` unbounded: an unbounded accept loop
+        // never returns on its own, leaking a thread blocked forever once
+        // this test's own assertions are done with it.
+        let held_streams: Arc<Mutex<Vec<std::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let held_streams2 = Arc::clone(&held_streams);
+        std::thread::Builder::new()
+            .name("fake-dot-listener".into())
+            .spawn(move || {
+                for stream in dot_listener.incoming().take(5).flatten() {
+                    *dot_connected2.lock().unwrap() = true;
+                    held_streams2.lock().unwrap().push(stream);
+                }
+            })
+            .unwrap();
+
+        let plain = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let plain_addr = plain.local_addr().unwrap();
+        // A short read timeout, not an unbounded `recv_from`: this test
+        // expects plain UDP to stay *silent*, so without a timeout a
+        // passing run would leak a thread blocked forever.
+        plain.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let plain_queried = Arc::new(Mutex::new(false));
+        let plain_queried2 = Arc::clone(&plain_queried);
+        std::thread::Builder::new()
+            .name("fake-plain-server".into())
+            .spawn(move || {
+                let mut buf = [0u8; 512];
+                if plain.recv_from(&mut buf).is_ok() {
+                    *plain_queried2.lock().unwrap() = true;
+                }
+            })
+            .unwrap();
+
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let resolver = DnsResolver::for_reactor(rt.pick_worker().clone()).unwrap();
+        resolver.set_timeout(Duration::from_millis(500));
+        resolver.add_server(plain_addr);
+        resolver.inner.lock().unwrap().capability_cache.record_success(
+            plain_addr,
+            EncryptedTransport::Dot,
+            capability_cache::EndpointDetails {
+                target: dot_addr,
+                sni: "localhost".to_string(),
+            },
+        );
+
+        resolver.query_a("example.com", Box::new(|_| {}));
+
+        for _ in 0..100 {
+            if *dot_connected.lock().unwrap() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(*dot_connected.lock().unwrap(), "a confirmed DoT capability must be dialed dynamically");
+        assert!(
+            !*plain_queried.lock().unwrap(),
+            "plain UDP must not be used for a server once a better transport is confirmed"
+        );
+
+        rt.shutdown();
+    }
+
     #[test]
     fn alloc_id_avoids_colliding_with_a_pending_query() {
         let rt = hopf_core::Runtime::start(Default::default()).unwrap();
@@ -1747,6 +2056,10 @@ mod tests {
             tcp_pool: TcpDnsConnectionPool::new(),
             #[cfg(feature = "doq")]
             doq_pool: doq::DoqConnectionPool::new(),
+            #[cfg(feature = "dot")]
+            public_trust_dot_connector: None,
+            #[cfg(feature = "doq")]
+            public_trust_doq_config: None,
             #[cfg(feature = "dnssec")]
             dnssec_enabled: false,
             #[cfg(feature = "dnssec")]
@@ -1766,6 +2079,7 @@ mod tests {
                 cancel: None,
                 extra_edns_options: Vec::new(),
                 active_transport: None,
+                actual_transport: None,
             },
         );
         for _ in 0..1000 {
@@ -1795,10 +2109,15 @@ mod tests {
 
     #[cfg(feature = "dot")]
     fn test_inner_with_server(rt: &hopf_core::Runtime, server: ConfiguredServer) -> ResolverInner {
+        test_inner_with_servers(rt, vec![server])
+    }
+
+    #[cfg(feature = "dot")]
+    fn test_inner_with_servers(rt: &hopf_core::Runtime, servers: Vec<ConfiguredServer>) -> ResolverInner {
         ResolverInner {
             reactor: rt.pick_worker().clone(),
             udp_token: None,
-            servers: vec![server],
+            servers,
             pending: HashMap::new(),
             ids: DnsQueryIdGenerator::new(),
             cache: Arc::new(DnsCache::default()),
@@ -1814,6 +2133,10 @@ mod tests {
             tcp_pool: TcpDnsConnectionPool::new(),
             #[cfg(feature = "doq")]
             doq_pool: doq::DoqConnectionPool::new(),
+            #[cfg(feature = "dot")]
+            public_trust_dot_connector: None,
+            #[cfg(feature = "doq")]
+            public_trust_doq_config: None,
             #[cfg(feature = "dnssec")]
             dnssec_enabled: false,
             #[cfg(feature = "dnssec")]
@@ -1822,7 +2145,7 @@ mod tests {
     }
 
     #[cfg(feature = "dot")]
-    fn test_pending_for(id: u16, server_idx: usize, server: SocketAddr) -> PendingQuery {
+    fn test_pending_for(id: u16, server_idx: usize, server: SocketAddr, actual_transport: Option<EncryptedTransport>) -> PendingQuery {
         PendingQuery {
             callback: Box::new(|_| {}),
             question: DnsQuestion::in_class("example.com", DnsType::A),
@@ -1834,6 +2157,15 @@ mod tests {
             cancel: None,
             extra_edns_options: Vec::new(),
             active_transport: None,
+            actual_transport,
+        }
+    }
+
+    #[cfg(feature = "dot")]
+    fn dot_endpoint_details() -> capability_cache::EndpointDetails {
+        capability_cache::EndpointDetails {
+            target: "192.0.2.1:853".parse().unwrap(),
+            sni: "dot.example".to_string(),
         }
     }
 
@@ -1849,9 +2181,17 @@ mod tests {
         let rt = hopf_core::Runtime::start(Default::default()).unwrap();
         let (server, addr) = dot_test_server(true);
         let inner = Arc::new(Mutex::new(test_inner_with_server(&rt, server)));
-        inner.lock().unwrap().capability_cache.record_success(addr, EncryptedTransport::Dot);
+        inner
+            .lock()
+            .unwrap()
+            .capability_cache
+            .record_success(addr, EncryptedTransport::Dot, dot_endpoint_details());
 
-        inner.lock().unwrap().pending.insert(1, test_pending_for(1, 0, addr));
+        inner
+            .lock()
+            .unwrap()
+            .pending
+            .insert(1, test_pending_for(1, 0, addr, Some(EncryptedTransport::Dot)));
         retry_after_transport_error(&inner, 1, io::Error::other("first failure"));
         assert_eq!(
             inner.lock().unwrap().capability_cache.known_transports(addr),
@@ -1859,7 +2199,11 @@ mod tests {
             "one isolated failure must be tolerated"
         );
 
-        inner.lock().unwrap().pending.insert(2, test_pending_for(2, 0, addr));
+        inner
+            .lock()
+            .unwrap()
+            .pending
+            .insert(2, test_pending_for(2, 0, addr, Some(EncryptedTransport::Dot)));
         retry_after_transport_error(&inner, 2, io::Error::other("second consecutive failure"));
         assert!(
             inner.lock().unwrap().capability_cache.known_transports(addr).is_empty(),
@@ -1880,10 +2224,18 @@ mod tests {
         let rt = hopf_core::Runtime::start(Default::default()).unwrap();
         let (server, addr) = dot_test_server(false);
         let inner = Arc::new(Mutex::new(test_inner_with_server(&rt, server)));
-        inner.lock().unwrap().capability_cache.record_success(addr, EncryptedTransport::Dot);
+        inner
+            .lock()
+            .unwrap()
+            .capability_cache
+            .record_success(addr, EncryptedTransport::Dot, dot_endpoint_details());
 
         for id in 1..=5u16 {
-            inner.lock().unwrap().pending.insert(id, test_pending_for(id, 0, addr));
+            inner
+                .lock()
+                .unwrap()
+                .pending
+                .insert(id, test_pending_for(id, 0, addr, Some(EncryptedTransport::Dot)));
             retry_after_transport_error(&inner, id, io::Error::other("pinned server failure"));
         }
 
@@ -1906,8 +2258,18 @@ mod tests {
         let rt = hopf_core::Runtime::start(Default::default()).unwrap();
         let (server, addr) = dot_test_server(true);
         let inner = Arc::new(Mutex::new(test_inner_with_server(&rt, server)));
+        // A real dynamic dispatch only ever picks a transport `best_known`
+        // already had an entry for — seed one provisionally, matching that
+        // invariant, so `complete_response`'s promotion hook (which
+        // re-reads the entry's own endpoint details rather than having
+        // them threaded through `PendingQuery`) has something to promote.
+        inner
+            .lock()
+            .unwrap()
+            .capability_cache
+            .seed_provisional(addr, EncryptedTransport::Dot, dot_endpoint_details());
 
-        let pending = test_pending_for(1, 0, addr);
+        let pending = test_pending_for(1, 0, addr, Some(EncryptedTransport::Dot));
         let msg = DnsMessage::new(
             1,
             crate::wire::FLAG_QR,
@@ -1922,6 +2284,122 @@ mod tests {
             inner.lock().unwrap().capability_cache.known_transports(addr),
             vec![EncryptedTransport::Dot]
         );
+
+        rt.shutdown();
+    }
+
+    /// Regression test for issue #379's intra-server fallback: a
+    /// transport-level failure for an auto-mode server's dynamically-
+    /// selected transport must retry the *same* server (`server_idx`
+    /// unchanged) rather than advancing to the next configured one — a
+    /// second, distinctly-observable server proves it's never touched.
+    #[cfg(feature = "dot")]
+    #[test]
+    fn intra_server_fallback_never_advances_to_a_different_configured_server() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (server, addr) = dot_test_server(true);
+
+        let second = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        second.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let second_queried = Arc::new(Mutex::new(false));
+        let second_queried2 = Arc::clone(&second_queried);
+        std::thread::Builder::new()
+            .name("unused-second-server".into())
+            .spawn(move || {
+                let mut buf = [0u8; 512];
+                if second.recv_from(&mut buf).is_ok() {
+                    *second_queried2.lock().unwrap() = true;
+                }
+            })
+            .unwrap();
+
+        let inner = Arc::new(Mutex::new(test_inner_with_servers(
+            &rt,
+            vec![server, ConfiguredServer::udp_tcp(second_addr)],
+        )));
+        inner
+            .lock()
+            .unwrap()
+            .capability_cache
+            .record_success(addr, EncryptedTransport::Dot, dot_endpoint_details());
+
+        inner
+            .lock()
+            .unwrap()
+            .pending
+            .insert(1, test_pending_for(1, 0, addr, Some(EncryptedTransport::Dot)));
+        retry_after_transport_error(&inner, 1, io::Error::other("dot transport failure"));
+
+        {
+            let g = inner.lock().unwrap();
+            let retried = g.pending.values().next().expect("a retried pending entry must exist");
+            assert_eq!(retried.server_idx, 0, "intra-server fallback must not advance server_idx");
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !*second_queried.lock().unwrap(),
+            "the second configured server must never be touched by intra-server fallback"
+        );
+
+        rt.shutdown();
+    }
+
+    /// Companion to the intra-server fallback test above: a *pinned*
+    /// server's transport failing must still advance to the next
+    /// configured server exactly as before issue #379 — a pinned server
+    /// has only the one transport it was told to use, so there's nothing
+    /// "next-best" within it to retry.
+    #[cfg(feature = "dot")]
+    #[test]
+    fn pinned_server_transport_failure_still_advances_to_the_next_server() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let addr: SocketAddr = "192.0.2.1:853".parse().unwrap();
+
+        let second = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        second.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let second_queried = Arc::new(Mutex::new(false));
+        let second_queried2 = Arc::clone(&second_queried);
+        std::thread::Builder::new()
+            .name("next-server".into())
+            .spawn(move || {
+                let mut buf = [0u8; 512];
+                if second.recv_from(&mut buf).is_ok() {
+                    *second_queried2.lock().unwrap() = true;
+                }
+            })
+            .unwrap();
+
+        // A real `DnsResolver` (not the raw `ResolverInner` helpers used
+        // above) so its UDP socket is genuinely open — the second
+        // server's dispatch below is plain UDP, which needs it.
+        let resolver = DnsResolver::for_reactor(rt.pick_worker().clone()).unwrap();
+        resolver.add_server_dot(addr, "dot.example", hopf_tls::insecure_connector(&[]));
+        resolver.add_server(second_addr);
+        let inner = Arc::clone(&resolver.inner);
+
+        inner
+            .lock()
+            .unwrap()
+            .pending
+            .insert(1, test_pending_for(1, 0, addr, Some(EncryptedTransport::Dot)));
+        retry_after_transport_error(&inner, 1, io::Error::other("dot transport failure"));
+
+        {
+            let g = inner.lock().unwrap();
+            let retried = g.pending.values().next().expect("a retried pending entry must exist");
+            assert_eq!(retried.server_idx, 1, "a pinned server's failure must advance to the next server");
+        }
+
+        for _ in 0..100 {
+            if *second_queried.lock().unwrap() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(*second_queried.lock().unwrap(), "the next server must actually be queried");
 
         rt.shutdown();
     }
@@ -2010,6 +2488,10 @@ mod tests {
             tcp_pool: TcpDnsConnectionPool::new(),
             #[cfg(feature = "doq")]
             doq_pool: doq::DoqConnectionPool::new(),
+            #[cfg(feature = "dot")]
+            public_trust_dot_connector: None,
+            #[cfg(feature = "doq")]
+            public_trust_doq_config: None,
             dnssec_enabled: true,
             dnssec: Some(validator),
         }
@@ -2028,6 +2510,7 @@ mod tests {
             cancel: None,
             extra_edns_options: Vec::new(),
             active_transport: None,
+            actual_transport: None,
         }
     }
 
