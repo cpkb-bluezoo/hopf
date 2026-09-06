@@ -588,8 +588,15 @@ impl DnsResolver {
     /// TCP-on-truncation fallback — see [`Self::add_server_dot`]/
     /// [`Self::add_server_doq`]/[`Self::add_server_doh`] for encrypted
     /// transports.
+    ///
+    /// This is the capability cache's "auto mode" entry point (see
+    /// `capability_cache`'s own module docs): if `addr` is one of the
+    /// well-known public resolvers this crate ships prior knowledge for,
+    /// that knowledge is seeded into the cache here, provisionally.
     pub fn add_server(&self, addr: SocketAddr) {
-        self.inner.lock().unwrap().servers.push(ConfiguredServer::udp_tcp(addr));
+        let mut g = self.inner.lock().unwrap();
+        g.servers.push(ConfiguredServer::udp_tcp(addr));
+        g.capability_cache.seed_known_public_resolver(addr);
     }
 
     /// Add upstream by IP string + port.
@@ -684,9 +691,8 @@ impl DnsResolver {
     /// Parse `/etc/resolv.conf` nameservers (Unix).
     pub fn use_system_resolvers(&self) -> io::Result<()> {
         let servers = crate::system::system_nameservers()?;
-        let mut g = self.inner.lock().unwrap();
         for s in servers {
-            g.servers.push(ConfiguredServer::udp_tcp(s));
+            self.add_server(s);
         }
         Ok(())
     }
@@ -1602,6 +1608,47 @@ mod tests {
         let base = DnsQuestion::new("example.com", DnsType::A, DnsClass::In);
         assert!(!questions_match(&base, &DnsQuestion::new("other.com", DnsType::A, DnsClass::In)));
         assert!(!questions_match(&base, &DnsQuestion::new("example.com", DnsType::Aaaa, DnsClass::In)));
+    }
+
+    /// Regression test for issue #377: `add_server` is the capability
+    /// cache's "auto mode" entry point, so adding a well-known public
+    /// resolver the plain way must seed its known encrypted transports —
+    /// proving the real public API wiring, not just
+    /// `seed_known_public_resolver` in isolation (already covered by
+    /// `capability_cache`'s own tests).
+    #[test]
+    fn add_server_seeds_a_well_known_public_resolver() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let resolver = DnsResolver::new(rt.pick_worker().clone());
+        let cloudflare: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        resolver.add_server(cloudflare);
+        assert!(!resolver
+            .inner
+            .lock()
+            .unwrap()
+            .capability_cache
+            .known_transports(cloudflare)
+            .is_empty());
+        rt.shutdown();
+    }
+
+    /// An address with no entry in the well-known-resolver table must not
+    /// gain one just by being configured — seeding is opt-in-by-address,
+    /// not a side effect every `add_server` call produces.
+    #[test]
+    fn add_server_does_not_seed_an_unknown_address() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let resolver = DnsResolver::new(rt.pick_worker().clone());
+        let unknown: SocketAddr = "203.0.113.1:53".parse().unwrap();
+        resolver.add_server(unknown);
+        assert!(resolver
+            .inner
+            .lock()
+            .unwrap()
+            .capability_cache
+            .known_transports(unknown)
+            .is_empty());
+        rt.shutdown();
     }
 
     #[test]
