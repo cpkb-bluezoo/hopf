@@ -20,28 +20,19 @@
 //! overridden by cached or discovered data for that address.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// An encrypted DNS wire transport a server might support, beyond plain
 /// UDP/TCP.
-///
-/// Each variant is only ever constructed by
-/// [`ServerTransport::encrypted_transport`](super::ServerTransport::encrypted_transport)'s
-/// own feature-gated match arm in production code — e.g. `Doq` is dead
-/// outside a build with the `doq` feature enabled. This module's own
-/// tests construct all three regardless of which features are on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EncryptedTransport {
     /// DNS-over-QUIC (RFC 9250).
-    #[cfg_attr(not(any(test, feature = "doq")), allow(dead_code))]
     Doq,
     /// DNS-over-TLS (RFC 7858).
-    #[cfg_attr(not(any(test, feature = "dot")), allow(dead_code))]
     Dot,
     /// DNS-over-HTTPS (RFC 8484).
-    #[cfg_attr(not(any(test, feature = "doh")), allow(dead_code))]
     Doh,
 }
 
@@ -125,7 +116,6 @@ impl TransportCapabilityCache {
     /// confirmed against this specific deployment. A pre-existing entry
     /// for the same `(server, transport)` pair is left untouched: seeding
     /// must never downgrade a confirmed entry back to provisional.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn seed_provisional(&self, server: SocketAddr, transport: EncryptedTransport) {
         let mut g = self.inner.lock().unwrap();
         g.transports.entry((server, transport)).or_insert_with(|| TransportRecord {
@@ -228,7 +218,88 @@ impl TransportCapabilityCache {
             .map(|(_, transport)| *transport)
             .collect()
     }
+
+    /// Seed every encrypted transport [`KNOWN_PUBLIC_RESOLVERS`] has on
+    /// record for `addr` — a no-op if `addr` isn't on that list. Safe to
+    /// call unconditionally for every server added the plain way: a
+    /// pre-existing confirmed entry is never downgraded (see
+    /// [`Self::seed_provisional`]'s own doc comment).
+    pub(crate) fn seed_known_public_resolver(&self, addr: SocketAddr) {
+        if let Some((_, transports)) = KNOWN_PUBLIC_RESOLVERS.iter().find(|(ip, _)| *ip == addr.ip()) {
+            for transport in *transports {
+                self.seed_provisional(addr, *transport);
+            }
+        }
+    }
 }
+
+/// Well-known public resolvers whose encrypted-transport support is
+/// public, documented knowledge (e.g. Cloudflare and Quad9 both support
+/// DNS-over-QUIC, but Google's public resolver doesn't) — keyed by IP
+/// address alone (any port), matching the granularity `add_server`/
+/// `add_server_str` are called with.
+///
+/// This table drifts out of date over time: an operator can add, drop, or
+/// change encrypted-transport support at any point without telling anyone
+/// consuming this list. That's an accepted, unavoidable cost of a
+/// hardcoded table, not a bug — every entry is seeded as
+/// [`Confidence::Provisional`], demoted on the very first real failure
+/// with no benefit of the doubt, and RFC 9462 discovery (tracked
+/// separately) is the self-updating alternative for every server not on
+/// this short list.
+const KNOWN_PUBLIC_RESOLVERS: &[(IpAddr, &[EncryptedTransport])] = &[
+    // Cloudflare (cloudflare-dns.com): DoT/DoQ on 853, DoH on 443.
+    (
+        IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+        &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+        &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
+        &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    // Quad9 (dns.quad9.net): DoT/DoQ on 853, DoH on 443.
+    (
+        IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+        &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)),
+        &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)),
+        &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x0009)),
+        &[EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    // Google Public DNS (dns.google): DoT on 853, DoH on 443 — no DoQ.
+    (
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        &[EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    (
+        IpAddr::V4(Ipv4Addr::new(8, 8, 4, 4)),
+        &[EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+        &[EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8844)),
+        &[EncryptedTransport::Dot, EncryptedTransport::Doh],
+    ),
+];
 
 #[cfg(test)]
 mod tests {
@@ -337,5 +408,58 @@ mod tests {
         cache.record_success(addr(), EncryptedTransport::Doq);
         assert!(cache.known_transports(other).is_empty());
         assert!(!cache.is_confirmed_absent(other));
+    }
+
+    #[test]
+    fn seeds_cloudflare_with_doq_dot_and_doh() {
+        let cache = TransportCapabilityCache::new();
+        let cloudflare: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        cache.seed_known_public_resolver(cloudflare);
+        let mut got = cache.known_transports(cloudflare);
+        got.sort_by_key(|t| format!("{t:?}"));
+        let mut want = vec![EncryptedTransport::Doq, EncryptedTransport::Dot, EncryptedTransport::Doh];
+        want.sort_by_key(|t| format!("{t:?}"));
+        assert_eq!(got, want);
+    }
+
+    /// Regression test for issue #377: Google's public resolver is
+    /// documented to support DoT/DoH but not DoQ — this must show up as a
+    /// real difference in what's seeded, not the same table entry for
+    /// every well-known resolver.
+    #[test]
+    fn seeds_google_without_doq() {
+        let cache = TransportCapabilityCache::new();
+        let google: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        cache.seed_known_public_resolver(google);
+        let got = cache.known_transports(google);
+        assert!(!got.contains(&EncryptedTransport::Doq), "Google's public resolver does not support DoQ");
+        assert!(got.contains(&EncryptedTransport::Dot));
+        assert!(got.contains(&EncryptedTransport::Doh));
+    }
+
+    #[test]
+    fn seeds_quad9_ipv6_address_too() {
+        let cache = TransportCapabilityCache::new();
+        let quad9_v6: SocketAddr = "[2620:fe::fe]:53".parse().unwrap();
+        cache.seed_known_public_resolver(quad9_v6);
+        assert!(cache.known_transports(quad9_v6).contains(&EncryptedTransport::Doq));
+    }
+
+    #[test]
+    fn seeding_an_address_not_on_the_list_is_a_no_op() {
+        let cache = TransportCapabilityCache::new();
+        // A TEST-NET-3 address (RFC 5737) — guaranteed not to be a
+        // well-known public resolver.
+        let unknown: SocketAddr = "203.0.113.1:53".parse().unwrap();
+        cache.seed_known_public_resolver(unknown);
+        assert!(cache.known_transports(unknown).is_empty());
+    }
+
+    #[test]
+    fn seeding_a_known_resolver_ignores_the_port() {
+        let cache = TransportCapabilityCache::new();
+        let cloudflare_on_a_nonstandard_port: SocketAddr = "1.1.1.1:5353".parse().unwrap();
+        cache.seed_known_public_resolver(cloudflare_on_a_nonstandard_port);
+        assert!(!cache.known_transports(cloudflare_on_a_nonstandard_port).is_empty());
     }
 }
