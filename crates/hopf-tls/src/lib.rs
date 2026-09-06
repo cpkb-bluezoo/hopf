@@ -311,6 +311,55 @@ pub fn connector_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTl
     Ok(connector(client_config_from_pem(ca_path, alpn)?))
 }
 
+/// Compose a [`RootCertStore`] from the platform's own trust anchors,
+/// falling back to a vendored copy of Mozilla's CA root list when the
+/// native store can't be read or yields nothing usable. Split out from
+/// [`client_config_public_trust`] so the fallback behavior can be tested
+/// directly, without depending on what happens to be trusted on the
+/// machine running the test.
+fn public_root_cert_store_from(native_certs: Vec<CertificateDer<'static>>) -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    for cert in native_certs {
+        // A handful of platform trust stores carry anchors rustls-webpki
+        // can't parse (e.g. non-conformant self-issued roots); skip those
+        // rather than failing the whole load over one bad entry.
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    roots
+}
+
+/// Build a [`ClientConfig`] that trusts the public WebPKI — the standard
+/// "does this chain to a trusted public root and match the hostname"
+/// validation any ordinary HTTPS client performs, with no caller-supplied
+/// root. Primary source is the OS's own trust store
+/// ([`rustls_native_certs`]); when that can't be read, or reads
+/// successfully but yields no usable anchors, falls back to a vendored
+/// copy of Mozilla's CA root list ([`webpki_roots`]).
+///
+/// This is what authenticates a certificate advertised by an endpoint
+/// discovered rather than explicitly configured (e.g. an RFC 9462 DDR
+/// candidate) — [`client_config_from_pem`] and [`insecure_connector`] both
+/// need the caller to already know who they're trusting; this doesn't.
+///
+/// `alpn` entries are protocol names such as `b"h2"`.
+pub fn client_config_public_trust(alpn: &[&[u8]]) -> io::Result<Arc<ClientConfig>> {
+    let roots = public_root_cert_store_from(rustls_native_certs::load_native_certs().certs);
+    let mut config = client_config_builder()
+        .map_err(map_rustls_err)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    Ok(Arc::new(config))
+}
+
+/// Convenience: public WebPKI trust → shared connector.
+pub fn public_trust_connector(alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
+    Ok(connector(client_config_public_trust(alpn)?))
+}
+
 /// Build a [`ClientConfig`] that trusts `ca_path` and presents a client
 /// identity certificate for mutual TLS.
 ///
@@ -647,6 +696,32 @@ mod unit {
         let (_dir, cert_path, key_path) = write_temp_pem();
         let _ = acceptor_from_pem(&cert_path, &key_path, &[b"h2"]).unwrap();
         let _ = connector_from_pem(&cert_path, &[b"h2"]).unwrap();
+    }
+
+    /// Regression test for issue #375: when the native trust store yields
+    /// no usable anchors (simulated here by passing an empty cert list,
+    /// which is exactly what a native-certs read failure or an empty OS
+    /// store degrades to), the public-trust root store must fall back to
+    /// the vendored webpki-roots list rather than silently trusting
+    /// nothing at all.
+    #[test]
+    fn public_root_cert_store_falls_back_to_webpki_roots_when_native_yields_nothing() {
+        let roots = public_root_cert_store_from(Vec::new());
+        assert_eq!(roots.len(), webpki_roots::TLS_SERVER_ROOTS.len());
+        assert!(!roots.is_empty());
+    }
+
+    /// Companion to the fallback test above: when the native store *does*
+    /// yield a usable anchor, it must be preferred outright — the fallback
+    /// list must not also be merged in alongside it. A store containing
+    /// exactly the one native anchor (not `len() + webpki_roots::len()`)
+    /// is what proves preference, not just presence.
+    #[test]
+    fn public_root_cert_store_prefers_native_certs_over_the_fallback() {
+        let cert = generate_simple_self_signed(vec!["example.invalid".into()]).unwrap();
+        let native_der: CertificateDer<'static> = cert.cert.der().clone();
+        let roots = public_root_cert_store_from(vec![native_der]);
+        assert_eq!(roots.len(), 1);
     }
 }
 
@@ -1293,6 +1368,60 @@ mod tests {
         assert!(
             *established.lock().unwrap(),
             "handshake should succeed despite the hostname/trust mismatch"
+        );
+
+        rt.shutdown();
+    }
+
+    /// Regression test for issue #375: unlike every other client path in
+    /// this crate, which either pins an explicit caller-supplied root or
+    /// skips validation outright, `public_trust_connector` must complete a
+    /// real handshake against a certificate chaining to an actual public
+    /// certificate authority — proving the connector's root store is
+    /// genuinely populated (native store, vendored fallback, or both), not
+    /// just non-empty in isolation. Talks to a well-known, stable public
+    /// HTTPS endpoint; needs real internet access, which is exactly why
+    /// this lives behind this module's `integration` feature gate rather
+    /// than running in CI.
+    #[test]
+    fn public_trust_connector_validates_a_real_public_certificate() {
+        use std::net::ToSocketAddrs;
+
+        let host = "cloudflare.com";
+        let addr = (host, 443)
+            .to_socket_addrs()
+            .expect("resolve cloudflare.com")
+            .next()
+            .expect("at least one address for cloudflare.com");
+
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let established = Arc::new(Mutex::new(false));
+        let established2 = Arc::clone(&established);
+        let connector = public_trust_connector(&[]).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EstablishedProbe {
+                    established: Arc::clone(&established2),
+                }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, host),
+        )
+        .unwrap();
+
+        for _ in 0..250 {
+            if *established.lock().unwrap() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            *established.lock().unwrap(),
+            "handshake against a real public certificate should validate and succeed"
         );
 
         rt.shutdown();
