@@ -426,6 +426,28 @@ pub fn client_config_from_pem_with(
     Ok(Arc::new(QuicClientConfig::new(Arc::new(quic_crypto))))
 }
 
+/// Build a QUIC [`QuicClientConfig`] that trusts the public WebPKI
+/// ([`hopf_tls::public_root_cert_store`]) with the given ALPN — for
+/// dialing a server whose identity isn't known ahead of time via a
+/// caller-supplied root (e.g. validating an RFC 9462 DDR-discovered DoQ
+/// candidate against its advertised hostname). Early data is **disabled**;
+/// use [`client_config_public_trust_with`] to opt in.
+pub fn client_config_public_trust(alpn: &[&[u8]]) -> io::Result<Arc<QuicClientConfig>> {
+    client_config_public_trust_with(alpn, QuicTlsOptions::default())
+}
+
+/// [`client_config_public_trust`] with explicit [`QuicTlsOptions`].
+pub fn client_config_public_trust_with(
+    alpn: &[&[u8]],
+    tls: QuicTlsOptions,
+) -> io::Result<Arc<QuicClientConfig>> {
+    let rustls_cfg = tls13_client(hopf_tls::public_root_cert_store(), alpn, &tls)?;
+    let quic_crypto: quinn_proto::crypto::rustls::QuicClientConfig = Arc::new(rustls_cfg)
+        .try_into()
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    Ok(Arc::new(QuicClientConfig::new(Arc::new(quic_crypto))))
+}
+
 /// Build an in-memory self-signed server config (tests / demos).
 ///
 /// Returns `(server_config, leaf_cert_pem)`. Early data is disabled; see

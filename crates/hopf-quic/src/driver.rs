@@ -2337,6 +2337,108 @@ mod tests {
         server.shutdown();
     }
 
+    struct ConnectedProbe {
+        connected: Arc<StdMutex<bool>>,
+    }
+
+    impl ProtocolHandler for ConnectedProbe {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
+            *self.connected.lock().unwrap() = true;
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    /// Regression test for issue #378's DoQ candidate validation: a real
+    /// public DoQ resolver's certificate must validate against
+    /// [`crate::config::client_config_public_trust`]'s public-WebPKI root
+    /// set — every other client config in this crate trusts a
+    /// caller-supplied root, so this is the one path that has to work
+    /// against a genuine public CA chain. Talks to a well-known, stable
+    /// public resolver; needs real internet access, which is exactly why
+    /// this lives behind this module's own `integration` feature gate
+    /// rather than running in CI.
+    #[test]
+    fn client_config_public_trust_validates_a_real_public_doq_resolver() {
+        use crate::config::client_config_public_trust;
+
+        let client_cfg = client_config_public_trust(&[b"doq"]).unwrap();
+        let addr: SocketAddr = "1.1.1.1:853".parse().unwrap();
+
+        let connected = Arc::new(StdMutex::new(false));
+        let connected2 = Arc::clone(&connected);
+        let client = connect_quic(QuicConnectConfig::new(
+            addr,
+            client_cfg,
+            "cloudflare-dns.com",
+            Arc::new(move || {
+                Box::new(ConnectedProbe {
+                    connected: Arc::clone(&connected2),
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        for _ in 0..250 {
+            if *connected.lock().unwrap() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            *connected.lock().unwrap(),
+            "handshake against a real public DoQ resolver should validate and succeed"
+        );
+        client.shutdown();
+    }
+
+    /// Companion to the real-endpoint test above, runnable with no network
+    /// access at all: `client_config_public_trust` must reject a
+    /// self-signed certificate exactly like any other public-WebPKI
+    /// client would — proving the validation is real rather than the
+    /// positive test above merely reaching a server that happens to
+    /// accept anything.
+    #[test]
+    fn client_config_public_trust_rejects_a_self_signed_server() {
+        use crate::config::client_config_public_trust;
+
+        let (server_cfg, _pem) = server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(NopHandler) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        let client_cfg = client_config_public_trust(&[b"hq-interop"]).unwrap();
+        let connected = Arc::new(StdMutex::new(false));
+        let connected2 = Arc::clone(&connected);
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(ConnectedProbe {
+                    connected: Arc::clone(&connected2),
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        // A rejected handshake never calls `connected()` at all — give it
+        // a generous window to make sure this isn't just "slower than the
+        // happy path", then confirm it never arrived.
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            !*connected.lock().unwrap(),
+            "a self-signed certificate must not validate against the public WebPKI trust store"
+        );
+        server.shutdown();
+    }
+
     /// [`crate::QuicDatagramPath`] backed by nothing but a channel to the
     /// peer's own [`QuicDriverHandle`] — no real socket, no OS network
     /// stack, proving the pluggable-transport seam itself works rather

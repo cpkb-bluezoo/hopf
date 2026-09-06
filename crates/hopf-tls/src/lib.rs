@@ -331,6 +331,17 @@ fn public_root_cert_store_from(native_certs: Vec<CertificateDer<'static>>) -> Ro
     roots
 }
 
+/// The public WebPKI root set: the OS's own trust store
+/// ([`rustls_native_certs`]) when it can be read, falling back to a
+/// vendored copy of Mozilla's CA root list ([`webpki_roots`]) otherwise.
+/// Exposed on its own (not just via [`client_config_public_trust`]) so
+/// another crate that needs a differently-shaped `ClientConfig` around the
+/// same trust anchors — e.g. `hopf-quic`'s QUIC-specific, TLS-1.3-only
+/// builder — doesn't have to duplicate the native/fallback logic.
+pub fn public_root_cert_store() -> RootCertStore {
+    public_root_cert_store_from(rustls_native_certs::load_native_certs().certs)
+}
+
 /// Build a [`ClientConfig`] that trusts the public WebPKI — the standard
 /// "does this chain to a trusted public root and match the hostname"
 /// validation any ordinary HTTPS client performs, with no caller-supplied
@@ -346,7 +357,7 @@ fn public_root_cert_store_from(native_certs: Vec<CertificateDer<'static>>) -> Ro
 ///
 /// `alpn` entries are protocol names such as `b"h2"`.
 pub fn client_config_public_trust(alpn: &[&[u8]]) -> io::Result<Arc<ClientConfig>> {
-    let roots = public_root_cert_store_from(rustls_native_certs::load_native_certs().certs);
+    let roots = public_root_cert_store();
     let mut config = client_config_builder()
         .map_err(map_rustls_err)?
         .with_root_certificates(roots)
@@ -1422,6 +1433,53 @@ mod tests {
         assert!(
             *established.lock().unwrap(),
             "handshake against a real public certificate should validate and succeed"
+        );
+
+        rt.shutdown();
+    }
+
+    /// Companion to the real-endpoint test above, runnable with no network
+    /// access at all: `public_trust_connector` must reject a self-signed
+    /// certificate exactly like any other public-WebPKI client would —
+    /// proving the validation is real rather than the positive test above
+    /// merely reaching a server that happens to have a certificate for
+    /// unrelated reasons.
+    #[test]
+    fn public_trust_connector_rejects_a_self_signed_server() {
+        let (_dir, cert_path, key_path, _certified) = write_temp_pem(); // cert is for "localhost"
+        let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+
+        let rt = Runtime::start(RuntimeConfig {
+            worker_threads: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(NoopServer) as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let established = Arc::new(Mutex::new(false));
+        let established2 = Arc::clone(&established);
+        let connector = public_trust_connector(&[]).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EstablishedProbe {
+                    established: Arc::clone(&established2),
+                }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !*established.lock().unwrap(),
+            "a self-signed certificate must not validate against the public WebPKI trust store"
         );
 
         rt.shutdown();
