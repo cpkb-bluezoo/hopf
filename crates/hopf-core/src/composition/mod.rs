@@ -28,7 +28,7 @@ pub use xml::{CompositionXmlError, CompositionXmlResult};
 /// because [`Runtime::start_with_telemetry`] bakes it into each reactor at
 /// spawn time. `listen_tcp` / `dial_tcp` apply immediately against the live
 /// Runtime (fallible), rather than queueing for a later `build()`: this
-/// matches the composition-root ordering in `PLAN.md`
+/// matches the composition-root ordering (`Runtime::start` before the script runs).
 /// (`main → Runtime::start → CompositionScript → add bindings`) and is what
 /// lets bindings close over `Arc<Runtime>` — required by any protocol
 /// service that offloads work to the storage pool (SMTP local delivery,

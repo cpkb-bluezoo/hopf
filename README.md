@@ -11,10 +11,21 @@ container.
 
 Hopf uses a **thread-per-core** readiness model on
 [mio](https://github.com/tokio-rs/mio) where connections are multiplexed
-over the thread, plain buffers, and **rustls** for TCP TLS
-and QUIC ([quinn-proto](https://docs.rs/quinn-proto) + in-tree mio glue).
-**Listen and dial** are equal bindings on one Runtime. Codecs are **incremental
-push parsers**: chunked, resumable ingress; handler-callback egress.
+over the thread and plain buffers. **Listen and dial** are equal bindings on
+one Runtime. Codecs are **incremental push parsers**: chunked, resumable
+ingress; handler-callback egress.
+
+**Security (today):** TCP TLS and STARTTLS via [`hopf-tls`](crates/hopf-tls)
+and **rustls** (aws-lc-rs provider, hybrid-first PQC). QUIC via
+[quinn-proto](https://docs.rs/quinn-proto) for RFC 9000 transport plus
+in-tree mio UDP glue and HTTP/3 codecs. **DTLS is not implemented yet.**
+
+**Security (direction):** consolidate cryptography under
+[`hopf-core`](crates/hopf-core) on **AWS-LC** (BoringSSL lineage) at the
+libcrypto layer — in-tree TLS, DTLS, and QUIC wire work, with rustls and
+quinn-proto retired once parity is proven. See
+[Architecture](https://cpkb-bluezoo.github.io/hopf/architecture.html#security-substrate)
+and the [conformance audit](https://cpkb-bluezoo.github.io/hopf/conformance.html#security-substrate).
 
 Sibling parsers ([crates.io](https://crates.io); local path override via
 `[patch.crates-io]` when hacking):
@@ -31,9 +42,9 @@ The [`hopf`](https://crates.io/crates/hopf) umbrella crate re-exports every
 
 ```toml
 [dependencies]
-hopf = "0.2"   # everything
+hopf = "0.3"   # everything
 # or pick crates individually:
-hopf = { version = "0.2", default-features = false, features = ["http", "tls"] }
+hopf = { version = "0.3", default-features = false, features = ["http", "tls"] }
 ```
 
 Individual crates (`hopf-core`, `hopf-http`, …) can also be depended on
@@ -59,7 +70,7 @@ cargo run -p tls-echo -- 127.0.0.1:8443
 cargo run -p http-hello -- 127.0.0.1:8080
 ```
 
-Requires Rust 1.70+ (edition 2021).
+Requires Rust 1.85+ (edition 2021).
 
 ## License
 

@@ -85,6 +85,7 @@
 <li><a href="#dynamic-bindings-and-composition">Dynamic bindings and composition</a></li>
 <li><a href="#auth-vocabulary">Auth vocabulary</a></li>
 <li><a href="#codec-style">Codec style</a></li>
+<li><a href="#security-substrate">Security substrate</a></li>
 <li><a href="#dependencies">Dependencies</a></li>
 <li><a href="#non-goals">Non-goals</a></li>
 <li><a href="#further-reading">Further reading</a></li>
@@ -442,27 +443,57 @@
 <p>Prefer <strong>TrustPolicy</strong> + <strong>IdentityMaterial</strong> over Realm-as-root naming. Attach to <strong>both</strong> listen and dial. SASL client/server are <strong>wire roles</strong>, independent of listen/dial. See <a href="auth.html">auth</a>.</p>
 <h2 id="codec-style">Codec style</h2>
 <p><strong>Grammar-driven incremental codecs:</strong> each protocol owns a self-contained parser (<code>H1Scanner</code>, <code>Pop3ServerLexer</code>, <code>SmtpServerLexer</code>, <code>FtpServerLexer</code>, <code>ImapServerLexer</code>, …) with its own token alphabet and bounded in-progress-token scratch state; update the parse FSM as each production completes; CRLF is one production, not the only event boundary. A parser consumes every byte it's handed in a single call and never asks the caller to retain or re-supply anything. Early <strong>parse</strong> state ≠ early <strong>app</strong> callbacks. Sibling incremental parsers (tractrix, rjsonparser, rmimeparser, rprotobuf) follow the same push model for XML/JSON/MIME/protobuf.</p>
+<h2 id="security-substrate">Security substrate</h2>
+<p>Encrypted transport and shared authentication crypto are part of <code>hopf-core</code>'s contract — not a bolt-on crate graph. Gumdrop treated TLS and DTLS as framework-transparent; Hopf follows the same idea with Rust ownership and TPC reactors.</p>
+<h3 id="security-today">Today</h3>
+<ul>
+<li><strong>AWS-LC</strong> (BoringSSL lineage) is the native crypto library, reached today through <code>aws-lc-rs</code> / <code>aws-lc-sys</code>.</li>
+<li><strong>TCP TLS / STARTTLS:</strong> <code>hopf-tls</code> drives <code>rustls</code> (<code>TlsSession</code> on <code>hopf-core</code> TCP connections).</li>
+<li><strong>QUIC / HTTP/3:</strong> <code>quinn-proto</code> for RFC 9000 transport; <code>rustls</code> TLS 1.3 for RFC 9001; H3/QPACK in-tree in <code>hopf-http</code>.</li>
+<li><strong>Mail/DNS auth crypto:</strong> DKIM and DNSSEC verification call <code>aws-lc-rs</code> directly from protocol crates.</li>
+<li><strong>UDP:</strong> datagram handlers in core are <strong>cleartext</strong> — DTLS is not implemented yet.</li>
+</ul>
+<h3 id="security-direction">Direction</h3>
+<p>Consolidate on <strong>AWS-LC libcrypto</strong> inside <code>hopf-core</code> and implement wire protocols in-tree on the TPC reactor model — Gumdrop's approach. Gumdrop did <strong>not</strong> use Kwik (thread-per-connection); it implemented QUIC in-house for the same reason Hopf plans to retire <code>quinn-proto</code>:</p>
+<ul>
+<li><strong>TCP:</strong> TLS 1.2/1.3 record layer + handshakes (retire <code>rustls</code>).</li>
+<li><strong>UDP:</strong> DTLS 1.2/1.3 + <code>DtlsSession</code> parallel to <code>TlsSession</code> (Gumdrop UDP/DTLS parity).</li>
+<li><strong>QUIC:</strong> in-tree RFC 9000 transport + TLS 1.3 handshake for RFC 9001 (retire <code>quinn-proto</code>; analogous to Gumdrop's in-tree QUIC plus agent15 handshake-only TLS).</li>
+<li><strong>Primitives:</strong> one trust/identity surface for X.509 (TLS/mTLS), DKIM/ARC signing, DNSSEC, and future host-key models (SSH).</li>
+<li><strong>Auth:</strong> optional GSSAPI/Kerberos SASL on <code>hopf-auth</code> (Gumdrop parity) once the native foundation is settled — KDC work stays on <code>StorageExecutor</code>.</li>
+</ul>
+<p>Other transports (SSH/SFTP, DNSCrypt, CoAP/OSCORE) share the <strong>primitive</strong> layer but bring their own framing and key exchange — they are not TLS handshakes.</p>
+<p>Status table: <a href="conformance.html#security-substrate">Conformance → Security substrate</a>.</p>
 <h2 id="dependencies">Dependencies</h2>
-<h3 id="allowed-hard">Allowed (hard)</h3>
+<h3 id="allowed-hard">Allowed today (hard)</h3>
 <table>
 <thead>
 <tr>
 <th>Dependency</th>
 <th>Role</th>
+<th>Planned fate</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><strong>mio</strong></td>
 <td>Readiness networking (TPC reactors)</td>
+<td>Keep</td>
+</tr>
+<tr>
+<td><strong>aws-lc-rs</strong> / <strong>aws-lc-sys</strong></td>
+<td>Native crypto (AWS-LC / BoringSSL lineage)</td>
+<td>Keep — centralise access through <code>hopf-core</code></td>
 </tr>
 <tr>
 <td><strong>rustls</strong></td>
-<td>TLS for TCP <strong>and</strong> QUIC (single TLS story)</td>
+<td>TLS for TCP and QUIC (interim)</td>
+<td>Replace with in-tree TLS on AWS-LC</td>
 </tr>
 <tr>
 <td><strong>quinn-proto</strong></td>
-<td>QUIC transport state machine; mio glue in-tree</td>
+<td>QUIC transport state machine (interim); mio glue in-tree</td>
+<td>Replace with in-tree RFC 9000</td>
 </tr>
 </tbody>
 </table>
@@ -498,7 +529,12 @@
 </tbody>
 </table>
 <h3 id="explicit-non-dependencies">Explicit non-dependencies</h3>
-<p>Async app runtimes (Tokio et al.), Hyper, Axum, Tower, serde as architecture, the full <code>quinn</code> crate, separate QUIC crypto beside rustls, servlet/JSP/Java EE APIs, reflective XML DI, TOML/YAML as primary composition formats.</p>
+<p>Async app runtimes (Tokio et al.), Hyper, Axum, Tower, serde as architecture, the full <code>quinn</code> crate (only <code>quinn-proto</code> is used today, and that is interim), servlet/JSP/Java EE APIs, reflective XML DI, TOML/YAML as primary composition formats.</p>
+<h2 id="non-goals">Non-goals</h2>
+<ul>
+<li>Replacing AWS-LC with multiple competing pure-Rust crypto stacks for TLS, DTLS, and QUIC.</li>
+<li>Servlet container or Java EE APIs (Gumdrop had these; Hopf does not).</li>
+</ul>
 <h2 id="further-reading">Further reading</h2>
 <ul>
 <li><a href="services.html">Services</a> · <a href="clients.html">Clients</a> · <a href="runtime-options.html">Runtime options</a></li>

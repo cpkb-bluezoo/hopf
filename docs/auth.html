@@ -70,7 +70,7 @@
     <main class="main">
       <header>
         <h1>Auth</h1>
-        <p class="lead">Crate <code>hopf-auth</code>: <strong>TrustPolicy</strong>, credential stores, and <strong>SASL</strong> mechanisms (Gumdrop parity, <strong>no GSSAPI</strong>). Independent of <code>hopf-core</code> (own <code>VERSION</code>). HTTP Basic / Digest / Bearer <strong>factories</strong> live in <code>hopf-http</code> and consume these types; FTP uses <code>TrustPolicy</code> directly, while POP3/IMAP/SMTP drive the full SASL mechanism set from a <code>CredentialStore</code>.</p>
+        <p class="lead">Crate <code>hopf-auth</code>: <strong>TrustPolicy</strong>, credential stores, and <strong>SASL</strong> mechanisms (Gumdrop parity except GSSAPI, which is planned). Independent of <code>hopf-core</code> (own <code>VERSION</code>). HTTP Basic / Digest / Bearer <strong>factories</strong> live in <code>hopf-http</code> and consume these types; FTP uses <code>TrustPolicy</code> directly, while POP3/IMAP/SMTP drive the full SASL mechanism set from a <code>CredentialStore</code>.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -411,7 +411,7 @@
 </ul>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>No GSSAPI / Kerberos</strong> (deliberate).</li>
+<li><strong>GSSAPI / Kerberos</strong> (RFC 4752) — not implemented today; planned as an optional <code>gssapi</code> feature with KDC/keytab work on <code>StorageExecutor</code> (Gumdrop parity). Would also unlock RFC 1961 GSSAPI auth for <a href="index.html#socks-hopf-socks">SOCKS</a>.</li>
 <li>DIGEST-MD5 kept for parity only (deprecated by RFC 6331).</li>
 <li>OAUTHBEARER carries the token in the client “password” slot.</li>
 <li><code>PasswordStore</code> is <strong>in-memory</strong> (demo-grade): enrolls from a password then keeps SCRAM (+ optional Digest HA1) only. For production password AUTH, use <a href="ldap.html"><code>LdapCredentialStore</code></a> or feature <code>pam</code>’s <code>PamCredentialStore</code>.</li>

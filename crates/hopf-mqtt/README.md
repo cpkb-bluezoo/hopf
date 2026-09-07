@@ -3,9 +3,10 @@
 MQTT **broker and async client** for [Hopf](https://cpkb-bluezoo.github.io/hopf/)
 (Gumdrop `mqtt` port).
 
-Status: complete for the current implementation plan tranche (codec, broker
-core, v5 core, async client, MQTT-over-WebSocket bridge, examples). See
-[PLAN.md](../../PLAN.md) for how this fits into the wider Hopf project.
+Status: complete for the current scope (codec, broker core, v5 core, async
+client, MQTT-over-WebSocket bridge, examples). See
+[docs/mqtt.html](https://cpkb-bluezoo.github.io/hopf/mqtt.html) and the
+[conformance audit](https://cpkb-bluezoo.github.io/hopf/conformance.html).
 
 ## Target capabilities
 

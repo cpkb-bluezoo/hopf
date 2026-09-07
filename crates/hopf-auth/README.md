@@ -1,7 +1,7 @@
 # hopf-auth
 
 TrustPolicy, IdentityMaterial, credential stores, and **SASL mechanisms**
-(Gumdrop parity, excluding GSSAPI):
+(Gumdrop parity except GSSAPI, which is planned as an optional `gssapi` feature):
 
 | Mechanism | RFC / notes |
 |-----------|-------------|

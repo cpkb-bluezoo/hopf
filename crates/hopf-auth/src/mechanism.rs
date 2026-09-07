@@ -1,6 +1,6 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! SASL mechanism names (Gumdrop `SASLMechanism`, excluding GSSAPI).
+//! SASL mechanism names (Gumdrop `SASLMechanism`; GSSAPI planned separately).
 
 /// Supported SASL mechanisms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,7 +69,7 @@ impl SaslMechanism {
         )
     }
 
-    /// All mechanisms shipped in this crate (no GSSAPI).
+    /// All mechanisms shipped in this crate today (GSSAPI not included yet).
     ///
     /// [`Self::ScramSha256Plus`] is deliberately excluded: it's fully
     /// implemented (see [`crate::scram`]) and available via

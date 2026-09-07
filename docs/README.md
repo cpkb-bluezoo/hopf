@@ -13,6 +13,11 @@ supported capabilities, configuration tables for every knob, handler SPIs,
 code examples, and limitations. Cookbook pages stay short and point at
 `examples/`.
 
+The [conformance audit](conformance.html) and [architecture](architecture.html#security-substrate)
+pages document what is **implemented today** versus **planned** (notably
+AWS-LC-backed security in `hopf-core`, DTLS, in-tree QUIC, and optional
+GSSAPI/Kerberos SASL).
+
 If you regenerate from Markdown drafts, use
 [`scripts/md_docs_to_html.py`](../scripts/md_docs_to_html.py) (requires `pandoc`).
 The published tree is HTML-only. Use `python3 scripts/md_docs_to_html.py --nav-only`

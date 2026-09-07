@@ -84,6 +84,7 @@
 <li><a href="#runtime-extension">Runtime extension</a></li>
 <li><a href="#examples">Examples</a></li>
 <li><a href="#limitations">Limitations</a></li>
+<li><a href="#implementation-status">Implementation status</a></li>
 <li><a href="#see-also">See also</a></li>
 </ul></div>
 <h2 id="architecture">Architecture</h2>
@@ -389,6 +390,10 @@
 <li>0-RTT is off by default; enable via <code>QuicTlsOptions::with_early_data</code> (replay risk — see SECURITY.md). Plain <code>connect_quic</code> opens the first stream before <code>Event::Connected</code> when a session ticket makes <code>has_0rtt()</code> true; H3 hooks-mode still starts after the full handshake.</li>
 <li>Locally-initiated connection close (<code>LocallyClosed</code>) still calls <code>ProtocolHandler::disconnected</code> on this endpoint's streams; only the peer sees <code>QuicConnectionCloseError</code> via <code>error</code>. Use the return value of <code>close_connection</code> locally if you need the code you just sent.</li>
 </ul>
+<h2 id="implementation-status">Implementation status</h2>
+<p><strong>Shipped today:</strong> HTTP/3 codecs and QPACK in <code>hopf-http</code> (feature <code>h3</code>) are Hopf-owned. QUIC <strong>transport</strong> (RFC 9000 loss recovery, congestion control, connection migration mechanics) and QUIC-TLS <strong>handshake driving</strong> are delegated to <strong>quinn-proto</strong> and <strong>rustls</strong> respectively. Hopf adds the mio UDP driver, stream-as-<code>Endpoint</code> model, PQC-first TLS 1.3 config construction, and hooks-mode connection API for H3.</p>
+<p><strong>Planned:</strong> in-tree RFC 9000 transport state machine and in-tree TLS 1.3 handshake for RFC 9001 (retire quinn-proto and rustls on the QUIC path). TCP TLS migrates on the same AWS-LC foundation in <code>hopf-core</code> — see <a href="tls.html#roadmap">TLS roadmap</a> and <a href="conformance.html#security-substrate">conformance → Security substrate</a>.</p>
+<p><strong>MASQUE:</strong> RFC 9298 CONNECT-UDP / CONNECT-IP building blocks live in <code>hopf-masque</code> (partial product API; HTTP Datagrams + Capsule Protocol plumbing is present in H3).</p>
 <h2 id="see-also">See also</h2>
 <ul>
 <li><a href="http/overview.html">HTTP overview</a></li>

@@ -93,7 +93,8 @@
 <li><a href="#mailbox">Mailbox storage</a></li>
 <li><a href="#mqtt">MQTT</a></li>
 <li><a href="#amqp">AMQP</a></li>
-<li><a href="#deferred">Deferred protocols (not yet started)</a></li>
+<li><a href="#security-substrate">Security substrate</a></li>
+<li><a href="#planned">Planned work</a></li>
 </ul></div>
 
 <h2 id="method">Method and status vocabulary</h2>
@@ -102,9 +103,40 @@
 <li><strong>Compliant</strong> — implemented and verified against the code.</li>
 <li><strong>Partial</strong> — implemented but with a specific, named gap (see Notes).</li>
 <li><strong>Not implemented</strong> — the requirement is not met; a genuine gap.</li>
-<li><strong>Deferred</strong> — explicitly out of scope per hopf's own docs/plan, not a silent gap.</li>
+<li><strong>Deferred</strong> — explicitly documented as deferred or planned in hopf's docs, not a silent gap.</li>
 <li><strong>N/A</strong> — delegated to a lower layer (e.g. rustls, quinn-proto) that is not hopf's own code, or structurally inapplicable to hopf's stated scope (e.g. authoritative DNS serving for a stub resolver).</li>
 </ul>
+
+<h2 id="security-substrate">Security substrate (<code>hopf-core</code> foundation)</h2>
+<p>Most Hopf protocols depend on encrypted transport or on shared cryptographic primitives (mail authentication, DNSSEC). This section records what ships today versus the intended AWS-LC-backed foundation in <code>hopf-core</code>. Protocol-specific conformance tables below still apply to <strong>current</strong> behaviour (rustls / quinn-proto where noted <strong>N/A</strong>).</p>
+<h3 id="security-today">Implemented today</h3>
+<table>
+<thead><tr><th>Area</th><th>Implementation</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Native crypto library</td><td><strong>AWS-LC</strong> via <code>aws-lc-rs</code> / <code>aws-lc-sys</code></td><td>BoringSSL-lineage C library; not a separate Rust crypto stack</td></tr>
+<tr><td>TCP TLS 1.2 / 1.3 + STARTTLS</td><td><code>hopf-tls</code> → <code>rustls</code></td><td>Hybrid-first PQC KX (<code>X25519MLKEM768</code>) via rustls <code>prefer-post-quantum</code></td></tr>
+<tr><td>QUIC transport (RFC 9000)</td><td><code>quinn-proto</code> + in-tree mio UDP driver (<code>hopf-quic</code>)</td><td>Loss recovery, congestion, migration mechanics are quinn's</td></tr>
+<tr><td>QUIC-TLS (RFC 9001)</td><td><code>rustls</code> TLS 1.3 configs via <code>hopf_tls::tls_crypto_provider()</code></td><td>PQC-first; no TLS 1.2 on QUIC</td></tr>
+<tr><td>HTTP/3</td><td>In-tree in <code>hopf-http</code> (feature <code>h3</code>)</td><td>QPACK and H3 framing are Hopf-owned</td></tr>
+<tr><td>DKIM / DNSSEC verify</td><td>Direct <code>aws-lc-rs</code> in <code>hopf-smtp</code> / <code>hopf-dns</code></td><td>RSA / Ed25519 / ECDSA; Ed448 via <code>ed448-goldilocks-plus</code></td></tr>
+<tr><td>UDP datagram I/O</td><td><code>hopf-core</code> (<code>UdpDatagramHandler</code>)</td><td>Cleartext only — no DTLS session yet</td></tr>
+</tbody>
+</table>
+<h3 id="security-planned">Planned (not shipped)</h3>
+<table>
+<thead><tr><th>Area</th><th>Target</th><th>Gumdrop / notes</th></tr></thead>
+<tbody>
+<tr><td>Crypto facade in <code>hopf-core</code></td><td>Single AWS-LC libcrypto entry for all crates</td><td>Replace scattered <code>aws-lc-rs</code> and rustls provider calls; same keys/trust for TLS, DTLS, DKIM, DNSSEC</td></tr>
+<tr><td>TCP TLS wire protocol</td><td>In-tree record layer + TLS 1.2/1.3 handshakes on AWS-LC</td><td>Retire <code>rustls</code> once parity is proven</td></tr>
+<tr><td>DTLS 1.2 / 1.3</td><td>In-tree datagram record layer + handshake; <code>DtlsSession</code> on UDP</td><td>Gumdrop had transparent DTLS on UDP servers; needed for DoDTLS, CoAPS, Gumdrop parity</td></tr>
+<tr><td>QUIC transport</td><td>In-tree RFC 9000 state machine</td><td>Retire <code>quinn-proto</code>; in-tree on TPC reactors (Gumdrop's own QUIC — Kwik is thread-per-connection and was not used)</td></tr>
+<tr><td>QUIC-TLS</td><td>In-tree TLS 1.3 handshake (RFC 8446 §4) + RFC 9001 key schedule</td><td>Analogous to Gumdrop's agent15 + in-tree QUIC transport — TLS 1.3 handshake without a TCP-style record layer on QUIC</td></tr>
+<tr><td>PQC policy</td><td>Central hybrid-first group list on AWS-LC</td><td>Same <code>X25519MLKEM768</code> preference as today</td></tr>
+<tr><td>GSSAPI / Kerberos SASL</td><td>Optional <code>gssapi</code> feature on <code>hopf-auth</code></td><td>Gumdrop parity (RFC 4752); KDC/keytab work on <code>StorageExecutor</code>; acceptable once AWS-LC is the accepted native foundation</td></tr>
+<tr><td>Other transport families</td><td>Separate stacks on same primitives</td><td>SSH/SFTP/SCP (SSH KEX, not TLS), DNSCrypt, CoAP/OSCORE — not DTLS-interoperable</td></tr>
+</tbody>
+</table>
+<p>Details: <a href="architecture.html#security-substrate">Architecture → Security substrate</a>, <a href="tls.html#roadmap">TLS roadmap</a>, <a href="quic-h3.html#implementation-status">QUIC implementation status</a>.</p>
 
 <h2 id="tls">TLS — RFC 8446 / RFC 5246 (as wrapped by <code>hopf-tls</code>)</h2>
 <p>hopf-tls is a thin wrapper over <code>rustls</code>; it does not implement the TLS wire protocol itself. Requirements that are rustls's own responsibility (handshake state machine, record layer, cipher suite negotiation mechanics) are marked <strong>N/A</strong> below — this audits hopf's own config construction, acceptor/connector wiring, ALPN plumbing, STARTTLS integration, and error handling.</p>
@@ -650,7 +682,7 @@
 <tr><td>OAUTHBEARER</td><td>7628</td><td>Compliant</td><td>No structured JSON error-challenge on failure per §3.2.2, but plain failure is spec-permitted</td></tr>
 <tr><td>EXTERNAL</td><td>4422 App. A</td><td>Compliant</td><td>Requires TLS layer to supply a peer certificate first</td></tr>
 <tr><td>Proxy authorization (authzid)</td><td>4422 §4.2</td><td>Compliant</td><td>Used by PLAIN and EXTERNAL</td></tr>
-<tr><td>GSSAPI</td><td>4752</td><td>Not implemented (deliberate)</td><td>"Gumdrop parity, no GSSAPI" per hopf's own docs</td></tr>
+<tr><td>GSSAPI</td><td>4752</td><td>Deferred (planned)</td><td>Not implemented today. Gumdrop ships keytab-based GSSAPI/Kerberos SASL (RFC 4752) with KDC contact offloaded to worker threads. Planned as an optional <code>hopf-auth</code> feature once the AWS-LC security foundation in <code>hopf-core</code> is consolidated — same auth partition as SCRAM/EXTERNAL, not part of the TLS/DTLS wire stack</td></tr>
 <tr><td>Base64, HMAC-MD5/SHA-256, MD5, SHA-256, PBKDF2-HMAC-SHA256, constant-time comparison, CSPRNG nonces</td><td>various</td><td>Compliant</td><td><code>crypto.rs</code>; constant-time compares used consistently across CRAM-MD5/SCRAM/DIGEST-MD5/HTTP Digest</td></tr>
 <tr><td><code>PasswordStore</code> demo-grade / in-memory</td><td>—</td><td>Documented (demo); LDAP + PAM backends available</td><td><code>PasswordStore</code> enrolls a password once then retains SCRAM-SHA-256 (+ optional Digest HA1); PLAIN/LOGIN verify via constant-time <code>StoredKey</code> compare — no plaintext retention. CRAM-MD5 / APOP unsupported here. Production password AUTH: <code>hopf-ldap::LdapCredentialStore</code> and optional <code>pam</code> → <code>PamCredentialStore</code></td></tr>
 <tr><td>HTTP Digest (RFC 7616) challenge/verification, Basic, Bearer factories</td><td>7616,7617,6750</td><td>Compliant</td><td><code>http_digest.rs</code>, <code>hopf-http/src/auth.rs</code></td></tr>
@@ -855,16 +887,26 @@
 </tbody>
 </table>
 
-<h2 id="deferred">Deferred protocols (not yet started)</h2>
-<p>Three protocols Gumdrop implements have no hopf equivalent yet — deliberately deferred, not gaps in what exists:</p>
+<h2 id="planned">Planned work</h2>
+<p>Items below are <strong>not</strong> audited as shipped behaviour. Partial crates are listed with their current gap; unstarted items are Gumdrop parity targets or later protocol work.</p>
+<h3 id="planned-protocols">Protocol crates</h3>
 <table>
-<thead><tr><th>Protocol</th><th>Gumdrop coverage (for reference)</th><th>hopf status</th></tr></thead>
+<thead><tr><th>Protocol</th><th>Gumdrop (reference)</th><th>hopf status</th></tr></thead>
 <tbody>
-<tr><td>SOCKS proxy</td><td>SOCKS5 (RFC 1928) incl. CONNECT/BIND/UDP ASSOCIATE, username/password auth (RFC 1929), GSSAPI (RFC 1961), plus SOCKS4/4a — a large, detailed implementation</td><td>Not started. Planned port from Gumdrop.</td></tr>
-<tr><td>Redis client</td><td>RESP protocol client</td><td>Not started.</td></tr>
-<tr><td>LDAP client + BER + CredentialStore</td><td>RFC 4511 / 4513 / 4515 / 4516</td><td>Started (v1)</td><td>Crate <code>hopf-ldap</code>: definite-length BER (<code>asn1</code>), async bind/search/unbind on the Runtime, LDAPS and STARTTLS via <code>hopf-tls</code>, <code>LdapCredentialStore</code> search-then-bind with referral chase (RFC 4516 URLs). Non-goals: directory admin API, SASL bind to the directory, PAM.</td></tr>
+<tr><td>SOCKS proxy</td><td>SOCKS4/4a/5, CONNECT/BIND/UDP ASSOCIATE, RFC 1929 auth, RFC 1961 GSSAPI</td><td><strong>Partial.</strong> Crate <code>hopf-socks</code>: SOCKS4/4a/5, CONNECT, BIND, UDP ASSOCIATE, RFC 1929 username/password (server and client). RFC 1961 GSSAPI auth not implemented — planned with optional GSSAPI SASL in <code>hopf-auth</code></td></tr>
+<tr><td>LDAP client</td><td>RFC 4511 client, BER, CredentialStore</td><td><strong>Started (v1).</strong> Crate <code>hopf-ldap</code>: definite-length BER, async bind/search/unbind, LDAPS/STARTTLS, <code>LdapCredentialStore</code>, referral chase. Non-goals: directory admin API, SASL bind to the directory</td></tr>
+<tr><td>Redis client</td><td>RESP client</td><td>Not started</td></tr>
+<tr><td>CoAP / CoAPS</td><td>—</td><td>Not started; CoAPS depends on planned DTLS</td></tr>
+<tr><td>SSH / SFTP / SCP</td><td>—</td><td>Not started; SSH KEX + channels (parallel transport family, not TLS)</td></tr>
+<tr><td>DNSCrypt</td><td>—</td><td>Not started; UDP object encryption on shared primitives</td></tr>
+<tr><td>ARC (mail)</td><td>—</td><td>Not started; would reuse DKIM-style crypto on <code>Authentication-Results</code></td></tr>
 </tbody>
 </table>
+<h3 id="planned-gumdrop-gaps">Documented gaps vs Gumdrop (implemented crates)</h3>
+<ul>
+<li><strong>DTLS / DNS over DTLS</strong> — Gumdrop transparent DTLS on UDP; hopf has cleartext UDP only until DTLS lands (see <a href="#security-planned">Security substrate → Planned</a>).</li>
+<li><strong>ARC, auto-injected Authentication-Results, built-in quarantine mailbox</strong> — deliberate v1 omissions on SMTP; see <a href="#smtp">SMTP auth table</a>.</li>
+</ul>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

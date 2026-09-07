@@ -11,10 +11,10 @@
 //! / [`socks_connect_config`], [`SocksBindHandler`] / [`socks_bind_config`],
 //! and [`SocksUdpAssociateHandler`] / [`socks_udp_associate_config`]).
 //!
-//! RFC 1961 GSSAPI authentication is a deliberate non-goal: it requires an
-//! external Kerberos/GSSAPI dependency this crate does not take on. A
-//! deployment needing GSSAPI-authenticated SOCKS should terminate TLS in
-//! front of this proxy and use RFC 1929 username/password instead.
+//! RFC 1961 GSSAPI authentication is not implemented today; it is planned
+//! together with optional GSSAPI/Kerberos SASL in [`hopf_auth`]. Until then,
+//! deployments needing enterprise auth can terminate TLS in front of the proxy
+//! and use RFC 1929 username/password instead.
 //!
 //! UDP ASSOCIATE implements no RFC 1928 §7 fragment reassembly — only
 //! standalone datagrams are forwarded, matching near-universal real-world

@@ -137,7 +137,7 @@
 </tr>
 </tbody>
 </table>
-<p>There is no separate <code>build()</code> step — a <code>Composition</code> is running as soon as it's constructed, matching the composition-root ordering in <a href="https://github.com/cpkb-bluezoo/hopf/blob/main/PLAN.md"><code>PLAN.md</code></a> (<code>Runtime::start</code> before the script runs). This is also what lets a registered listener close over <code>Arc&lt;Runtime&gt;</code> — required by any protocol service that offloads work to the storage pool (SMTP local delivery, POP3, IMAP, ...).</p>
+<p>There is no separate <code>build()</code> step — a <code>Composition</code> is running as soon as it's constructed (<code>Runtime::start</code> before the script runs). This is also what lets a registered listener close over <code>Arc&lt;Runtime&gt;</code> — required by any protocol service that offloads work to the storage pool (SMTP local delivery, POP3, IMAP, ...).</p>
 <h2 id="compositionregistry">CompositionRegistry</h2>
 <p><code>handler="…"</code> in XML (and conceptual names in docs) is <strong>not</strong> a <code>Service</code> or HTTP Stream handler name. It resolves a closed map of connection-level <code>HandlerFactory</code> values (<code>Fn() -&gt; Box&lt;dyn ProtocolHandler&gt;</code>).</p>
 <div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>

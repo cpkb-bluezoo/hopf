@@ -6,15 +6,15 @@ module (`hopf::core`, `hopf::http`, `hopf::smtp`, `hopf::imap`, …).
 
 ```toml
 [dependencies]
-hopf = "0.2"   # everything
+hopf = "0.3"   # everything
 ```
 
 Or pick crates individually:
 
 ```toml
 [dependencies]
-hopf = { version = "0.2", default-features = false, features = ["http", "tls"] }
+hopf = { version = "0.3", default-features = false, features = ["http", "tls"] }
 ```
 
 `hopf-core` is always included. Pass-through features: `h3`, `dns-server`,
-`dot`, `doq`, `doh`, `dnssec`, `webdav-xattr`, `masque-h3`.
+`dot`, `doq`, `doh`, `dnssec`, `webdav-xattr`, `mdns`, `masque`, `masque-h3`, `socks`.

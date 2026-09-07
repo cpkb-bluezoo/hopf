@@ -3,8 +3,8 @@
 //! Trust policy and identity material for Hopf protocols
 //! ([#2](https://github.com/cpkb-bluezoo/hopf/issues/2)).
 //!
-//! SASL mechanisms (Gumdrop parity, excluding GSSAPI): PLAIN, LOGIN, CRAM-MD5,
-//! DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL.
+//! SASL mechanisms (Gumdrop parity except GSSAPI, planned as optional feature):
+//! PLAIN, LOGIN, CRAM-MD5, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL.
 
 #![warn(missing_docs)]
 

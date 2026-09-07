@@ -7,3 +7,6 @@ SOCKS proxy for Hopf: SOCKS4, SOCKS4a, and SOCKS5 (RFC 1928), built on
 Currently implemented: version detection, SOCKS5 method negotiation with
 RFC 1929 username/password authentication, and the CONNECT, BIND, and UDP
 ASSOCIATE commands, both server-side and client-side.
+
+RFC 1961 GSSAPI auth is not implemented yet; it is planned with optional
+GSSAPI/Kerberos SASL in `hopf-auth`.
