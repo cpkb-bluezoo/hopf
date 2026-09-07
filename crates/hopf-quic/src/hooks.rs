@@ -43,7 +43,7 @@ pub trait QuicConnection: Send {
     /// already-open local stream at an arbitrary later time (e.g. flushing
     /// queued QPACK instruction traffic generated while processing an
     /// unrelated stream). Tick cadence follows the soonest
-    /// [`quinn_proto::Connection::poll_timeout`] / app timer (or blocks
+    /// [`crate::transport::connection::Connection::poll_timeout`] / app timer (or blocks
     /// until UDP / a wake), not a fixed poll interval. Default: do
     /// nothing.
     fn drive(&mut self, api: &mut dyn QuicConnApi) {

@@ -8,13 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use quinn_proto::{ConnectionHandle, StreamId};
 use hopf_core::{
     ConnHandle, ConnHandleBackend, Endpoint, SecurityInfo, StartTlsError, TimerHandle,
     WriteReadyCallback,
 };
 
 use crate::driver::DriverCmd;
+use crate::transport::types::{ConnectionHandle, StreamId};
 
 /// [`ConnHandleBackend`] for a QUIC stream — routes `with_endpoint` through
 /// the driver thread's command channel (`DriverCmd::WithStream`), the same

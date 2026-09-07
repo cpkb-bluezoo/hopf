@@ -1,6 +1,6 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! QUIC transport for Hopf (`quinn-proto` + mio UDP).
+//! QUIC transport for Hopf (in-tree RFC 9000 transport + mio UDP).
 //!
 //! HTTP/3 codecs live in [`hopf_http`] (feature `h3`), not here.
 //! Each bidirectional QUIC stream is exposed as a [`QuicStreamEndpoint`]
@@ -11,6 +11,7 @@
 mod config;
 mod crypto;
 mod driver;
+mod transport;
 mod error;
 mod hooks;
 mod path;

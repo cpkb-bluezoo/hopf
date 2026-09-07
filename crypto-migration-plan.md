@@ -9,7 +9,7 @@ It complements the status tables in
 describe *what* is shipped vs planned; this file describes *how* to get there.
 Phase 0 touchpoints and seams: `[crypto-migration-inventory.md](crypto-migration-inventory.md)`.
 
-**Status:** Phase 2 in progress — `hopf-core::tls` handshake engine live; **hopf-quic CRYPTO wired** via `quinn-proto` crypto adapter (`hopf-quic/src/crypto/`); full in-tree transport remains Phase 3.
+**Status:** Phase 3 in progress — in-tree RFC 9000 transport drives `hopf-quic` (quinn-proto removed from the crate); loopback echo (`spike_echo_one_stream_hopf` + `QuicListenHardening::permissive()`) is green. Retry/hardening/GSO/0-RTT and broader integration remain open.
 
 ---
 
@@ -452,10 +452,10 @@ New phase-specific tests are additive; they do not replace the requirement that 
 
 ### Phase 3 — Full `hopf-quic` transport (drop `quinn-proto`)
 
-- [ ] RFC 9000 state machine **in** `hopf-quic` — Gumdrop `quic` package scope; reactive driver; no `quinn_proto`.
-- [ ] Wire Phase 2 handshake from `**hopf-core::tls/handshake**`; RFC 9001 packet protection in `hopf-quic/crypto`.
-- [ ] Rewrite `driver.rs` internals against in-tree `Connection`; keep mio UDP driver, ECN/GSO, Retry hardening, stream-as-`Endpoint`.
-- [ ] **Tests:** `hopf-quic` integration suite (`--features integration`), H3 tests, conformance QUIC rows.
+- [x] RFC 9000 state machine **in** `hopf-quic` — Gumdrop-shaped minimal echo subset; reactive mio driver; **no `quinn-proto` dependency** in `hopf-quic`.
+- [x] Wire Phase 2 handshake from `hopf-core::tls`; RFC 9001 packet protection in `hopf-quic` transport; driver swapped to in-tree `Connection`/`Endpoint` (`spike_echo_one_stream_hopf`).
+- [ ] Finish Retry hardening, GSO, 0-RTT, loss recovery / congestion beyond the echo milestone; keep stream-as-`Endpoint` public API.
+- [ ] **Tests:** full `hopf-quic` integration suite (`--features integration`), H3 tests, conformance QUIC rows.
 
 
 

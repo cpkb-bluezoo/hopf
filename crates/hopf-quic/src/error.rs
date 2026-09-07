@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 
-use quinn_proto::{ConnectionError, SendDatagramError, VarInt};
+use crate::transport::types::{ConnectionError, SendDatagramError, VarInt};
 
 /// Peer (or local transport) closed the QUIC connection with a
 /// CONNECTION_CLOSE — RFC 9000 §19.19.
@@ -60,7 +60,11 @@ impl QuicConnectionCloseError {
 impl fmt::Display for QuicConnectionCloseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.application_error {
-            write!(f, "QUIC connection closed with application error 0x{:x}", self.error_code)?;
+            write!(
+                f,
+                "QUIC connection closed with application error 0x{:x}",
+                self.error_code
+            )?;
         } else {
             write!(
                 f,
@@ -156,7 +160,7 @@ impl fmt::Display for QuicDatagramSendError {
 
 impl Error for QuicDatagramSendError {}
 
-/// Map quinn-proto [`SendDatagramError`] to [`io::Error`].
+/// Map transport [`SendDatagramError`] to [`io::Error`].
 ///
 /// `Blocked` carries the unsent payload; the driver queues it and retries
 /// on `Event::DatagramsUnblocked` instead of returning that variant to
@@ -172,29 +176,29 @@ pub(crate) fn datagram_send_io_error(err: SendDatagramError) -> io::Error {
     }
 }
 
-/// Map a quinn-proto [`ConnectionError`] to an [`io::Error`] for handler
+/// Map a transport [`ConnectionError`] to an [`io::Error`] for handler
 /// delivery, or `None` when the close is a clean local shutdown that should
 /// still use [`disconnected`](hopf_core::ProtocolHandler::disconnected).
 pub(crate) fn connection_lost_io_error(reason: ConnectionError) -> Option<io::Error> {
     match reason {
         ConnectionError::LocallyClosed => None,
-        ConnectionError::ApplicationClosed(close) => Some(
+        ConnectionError::ApplicationClosed { error_code, reason } => Some(
             QuicConnectionCloseError::application(
-                u64::from(close.error_code),
-                String::from_utf8_lossy(&close.reason).into_owned(),
+                error_code.into_inner(),
+                String::from_utf8_lossy(&reason).into_owned(),
             )
             .into_io(),
         ),
-        ConnectionError::ConnectionClosed(close) => Some(
+        ConnectionError::ConnectionClosed { error_code, reason } => Some(
             QuicConnectionCloseError::transport(
-                u64::from(close.error_code),
-                String::from_utf8_lossy(&close.reason).into_owned(),
+                error_code.into_inner(),
+                String::from_utf8_lossy(&reason).into_owned(),
             )
             .into_io(),
         ),
-        ConnectionError::TransportError(err) => Some(
-            QuicConnectionCloseError::transport(u64::from(err.code), err.reason).into_io(),
-        ),
+        ConnectionError::TransportError { code, reason } => {
+            Some(QuicConnectionCloseError::transport(code, reason).into_io())
+        }
         ConnectionError::TimedOut => Some(io::Error::new(
             io::ErrorKind::TimedOut,
             "QUIC connection timed out",
@@ -216,7 +220,7 @@ pub(crate) fn connection_lost_io_error(reason: ConnectionError) -> Option<io::Er
 
 /// Map a STOP_SENDING [`VarInt`] error code to an [`io::Error`].
 pub(crate) fn stream_stopped_io_error(error_code: VarInt) -> io::Error {
-    QuicStreamStoppedError::new(u64::from(error_code)).into_io()
+    QuicStreamStoppedError::new(error_code.into_inner()).into_io()
 }
 
 /// Downcast helper: extract [`QuicConnectionCloseError`] from an `io::Error`.
@@ -265,6 +269,7 @@ fn transport_error_name(error_code: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn application_close_round_trips_through_io_error() {
@@ -305,7 +310,7 @@ mod tests {
             (SendDatagramError::Disabled, QuicDatagramSendError::Disabled),
             (SendDatagramError::TooLarge, QuicDatagramSendError::TooLarge),
             (
-                SendDatagramError::Blocked(bytes::Bytes::new()),
+                SendDatagramError::Blocked(Bytes::new()),
                 QuicDatagramSendError::Blocked,
             ),
         ] {

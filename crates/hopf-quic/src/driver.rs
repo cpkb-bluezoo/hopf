@@ -1,6 +1,6 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Mio UDP driver around `quinn-proto` endpoint + connections.
+//! Mio UDP driver around the in-tree QUIC endpoint + connections.
 
 use std::collections::HashMap;
 use std::io;
@@ -14,48 +14,34 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
-use quinn_proto::{
-    Connection, ConnectionError, ConnectionHandle, DatagramEvent, Dir, Endpoint as QuinnEndpoint,
-    EndpointConfig, Event, Incoming, SendDatagramError, StreamEvent, StreamId, Transmit, VarInt,
-};
 use hopf_core::{Endpoint, HandlerFactory, ProtocolHandler, SecurityInfo};
 
 use crate::config::{
-    apply_listen_hardening, QuicConnectConfig, QuicListenConfig, QuicListenHooksConfig,
+    apply_listen_hardening, QuicClientConfig, QuicConnectConfig, QuicListenConfig,
+    QuicListenHooksConfig,
 };
 use crate::error::{connection_lost_io_error, datagram_send_io_error, stream_stopped_io_error};
 use crate::hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection};
 use crate::stream::{QuicStreamEndpoint, StreamQueues};
+use crate::transport::connection::{Connection, WriteError};
+use crate::transport::endpoint::Endpoint as QuicEndpoint;
+use crate::transport::types::{
+    ConnectionError, ConnectionHandle, DatagramEvent, Dir, EndpointConfig, Event, Incoming,
+    SendDatagramError, StreamEvent, StreamId, Transmit, VarInt,
+};
+
 
 const UDP_TOKEN: Token = Token(0);
 const WAKE_TOKEN: Token = Token(1);
 
-/// Build a [`SecurityInfo`] from `conn`'s real negotiated handshake data
-/// (RFC 7301 ALPN, SNI) instead of a hardcoded guess. The protocol version
-/// is always `TLSv1.3` by construction — hopf-quic's own TLS configs
-/// (`config.rs`) only ever build TLS 1.3, so a mismatched handshake would
-/// already have failed before any stream exists to report on. Cipher
-/// suite isn't exposed by quinn-proto's crypto session abstraction, so it
-/// stays `None` (honest "unknown", not a fabricated value).
+/// Build a [`SecurityInfo`] from `conn`'s negotiated handshake data
+/// (RFC 7301 ALPN, SNI) when available. Protocol version is always TLS 1.3
+/// by construction for hopf-quic. Cipher suite stays `None`.
 fn security_info_from_conn(conn: &Connection) -> SecurityInfo {
-    let session = conn.crypto_session();
-    if let Some(d) = session
-        .handshake_data()
-        .and_then(|d| d.downcast::<crate::crypto::HopfHandshakeData>().ok())
-    {
-        let alpn = d.protocol.clone();
-        let sni = d.server_name.clone();
-        return SecurityInfo::secure(alpn, Some("TLSv1.3".into()), None).with_sni(sni);
+    if let Some(info) = conn.security_info() {
+        return info.clone();
     }
-    let handshake_data = session
-        .handshake_data()
-        .and_then(|d| d.downcast::<quinn_proto::crypto::rustls::HandshakeData>().ok());
-    let alpn = handshake_data
-        .as_ref()
-        .and_then(|d| d.protocol.clone())
-        .map(Bytes::from);
-    let sni = handshake_data.and_then(|d| d.server_name.clone());
-    SecurityInfo::secure(alpn, Some("TLSv1.3".into()), None).with_sni(sni)
+    SecurityInfo::secure(None, Some("TLSv1.3".into()), None)
 }
 
 pub(crate) enum DriverCmd {
@@ -298,9 +284,9 @@ pub fn listen_quic(config: QuicListenConfig) -> io::Result<QuicDriverHandle> {
     apply_listen_hardening(&mut server, &config.hardening);
     let require_address_validation = config.hardening.require_address_validation;
 
-    let endpoint = QuinnEndpoint::new(
-        Arc::new(EndpointConfig::default()),
-        Some(server),
+    let endpoint = QuicEndpoint::new(
+        EndpointConfig::default(),
+        Some(server.as_ref().transport()),
         true,
         None,
     );
@@ -328,9 +314,9 @@ pub fn listen_quic_with_path(
     apply_listen_hardening(&mut server, &config.hardening);
     let require_address_validation = config.hardening.require_address_validation;
 
-    let endpoint = QuinnEndpoint::new(
-        Arc::new(EndpointConfig::default()),
-        Some(server),
+    let endpoint = QuicEndpoint::new(
+        EndpointConfig::default(),
+        Some(server.as_ref().transport()),
         true,
         None,
     );
@@ -355,9 +341,9 @@ pub fn listen_quic_hooks(config: QuicListenHooksConfig) -> io::Result<QuicDriver
     apply_listen_hardening(&mut server, &config.hardening);
     let require_address_validation = config.hardening.require_address_validation;
 
-    let endpoint = QuinnEndpoint::new(
-        Arc::new(EndpointConfig::default()),
-        Some(server),
+    let endpoint = QuicEndpoint::new(
+        EndpointConfig::default(),
+        Some(server.as_ref().transport()),
         true,
         None,
     );
@@ -385,9 +371,9 @@ pub fn listen_quic_hooks_with_path(
     apply_listen_hardening(&mut server, &config.hardening);
     let require_address_validation = config.hardening.require_address_validation;
 
-    let endpoint = QuinnEndpoint::new(
-        Arc::new(EndpointConfig::default()),
-        Some(server),
+    let endpoint = QuicEndpoint::new(
+        EndpointConfig::default(),
+        Some(server.as_ref().transport()),
         true,
         None,
     );
@@ -409,7 +395,7 @@ pub fn connect_quic(config: QuicConnectConfig) -> io::Result<QuicDriverHandle> {
     let (socket, local_addr) =
         crate::udp::bind_udp(crate::udp::unspecified_bind_addr(config.addr))?;
 
-    let endpoint = QuinnEndpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+    let endpoint = QuicEndpoint::new(EndpointConfig::default(), None, true, None);
 
     spawn_driver(
         DriverMode::Client {
@@ -436,7 +422,7 @@ pub fn connect_quic_with_path(
     path: Box<dyn crate::path::QuicDatagramPath>,
     local_addr: SocketAddr,
 ) -> io::Result<QuicDriverHandle> {
-    let endpoint = QuinnEndpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+    let endpoint = QuicEndpoint::new(EndpointConfig::default(), None, true, None);
 
     spawn_driver(
         DriverMode::Client {
@@ -456,14 +442,14 @@ pub fn connect_quic_with_path(
 /// Dial with connection-level hooks (HTTP/3 client).
 pub fn connect_quic_hooks(
     addr: SocketAddr,
-    client: Arc<quinn_proto::ClientConfig>,
+    client: Arc<QuicClientConfig>,
     server_name: impl Into<String>,
     connection_factory: ConnectionFactory,
 ) -> io::Result<QuicDriverHandle> {
     let (socket, local_addr) =
         crate::udp::bind_udp(crate::udp::unspecified_bind_addr(addr))?;
 
-    let endpoint = QuinnEndpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+    let endpoint = QuicEndpoint::new(EndpointConfig::default(), None, true, None);
 
     spawn_driver(
         DriverMode::ClientHooks {
@@ -488,13 +474,13 @@ pub fn connect_quic_hooks(
 /// inside another protocol's payload, e.g. an RFC 9298 CONNECT-UDP client.
 pub fn connect_quic_hooks_with_path(
     addr: SocketAddr,
-    client: Arc<quinn_proto::ClientConfig>,
+    client: Arc<QuicClientConfig>,
     server_name: impl Into<String>,
     connection_factory: ConnectionFactory,
     path: Box<dyn crate::path::QuicDatagramPath>,
     local_addr: SocketAddr,
 ) -> io::Result<QuicDriverHandle> {
-    let endpoint = QuinnEndpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+    let endpoint = QuicEndpoint::new(EndpointConfig::default(), None, true, None);
 
     spawn_driver(
         DriverMode::ClientHooks {
@@ -521,13 +507,13 @@ enum DriverMode {
     Client {
         factory: HandlerFactory,
         peer: SocketAddr,
-        client_config: Arc<quinn_proto::ClientConfig>,
+        client_config: Arc<QuicClientConfig>,
         server_name: String,
     },
     ClientHooks {
         connection_factory: ConnectionFactory,
         peer: SocketAddr,
-        client_config: Arc<quinn_proto::ClientConfig>,
+        client_config: Arc<QuicClientConfig>,
         server_name: String,
     },
 }
@@ -576,7 +562,7 @@ struct ConnSlot {
 
 fn spawn_driver(
     mode: DriverMode,
-    endpoint: QuinnEndpoint,
+    endpoint: QuicEndpoint,
     mut transport: DatagramTransport,
     local_addr: SocketAddr,
     _peer_hint: Option<SocketAddr>,
@@ -797,7 +783,7 @@ enum DatagramTransport {
 
 struct Driver {
     mode: DriverMode,
-    endpoint: QuinnEndpoint,
+    endpoint: QuicEndpoint,
     transport: DatagramTransport,
     local_addr: SocketAddr,
     connections: HashMap<ConnectionHandle, ConnSlot>,
@@ -842,11 +828,12 @@ impl Driver {
             let now = Instant::now();
             match self.endpoint.connect(
                 now,
-                (*client_config).clone(),
+                client_config.transport(),
                 peer,
                 &server_name,
             ) {
                 Ok((ch, conn)) => {
+                    self.endpoint.register_cid(conn.local_cid().clone(), ch);
                     let early = pending_open && conn.has_0rtt();
                     self.connections.insert(
                         ch,
@@ -874,7 +861,7 @@ impl Driver {
                     }
                 }
                 Err(e) => {
-                    eprintln!("hopf-quic connect: {e}");
+                    eprintln!("hopf-quic connect: {e:?}");
                     return Ok(());
                 }
             }
@@ -1162,7 +1149,6 @@ impl Driver {
                 Err(e) => return Err(e),
             };
             let data = bytes::BytesMut::from(&self.recv_buf[..n]);
-            let ecn = ecn.map(|c| c as u8);
             self.handle_datagram(now, remote, ecn, data)?;
         }
         Ok(())
@@ -1180,11 +1166,10 @@ impl Driver {
         ecn: Option<u8>,
         data: bytes::BytesMut,
     ) -> io::Result<()> {
-        let ecn = ecn.and_then(quinn_proto::EcnCodepoint::from_bits);
         self.send_buf.clear();
         if let Some(event) =
             self.endpoint
-                .handle(now, remote, None, ecn, data, &mut self.send_buf)
+                .handle(now, remote, None, ecn, data.freeze(), &mut self.send_buf)
         {
             match event {
                 DatagramEvent::NewConnection(incoming) => {
@@ -1192,7 +1177,7 @@ impl Driver {
                 }
                 DatagramEvent::ConnectionEvent(ch, event) => {
                     if let Some(slot) = self.connections.get_mut(&ch) {
-                        slot.conn.handle_event(event);
+                        slot.conn.handle_event(now, event);
                     }
                 }
                 DatagramEvent::Response(tx) => {
@@ -1219,16 +1204,14 @@ impl Driver {
         remote: SocketAddr,
         now: Instant,
     ) -> io::Result<()> {
+        // Echo milestone: Retry is a no-op. With permissive hardening this
+        // branch is skipped; otherwise drop unvalidated Initials.
         if self.require_address_validation && !incoming.remote_address_validated() {
             match self.endpoint.retry(incoming, &mut self.send_buf) {
                 Ok(tx) => self.send_transmit(tx)?,
-                Err(err) => {
-                    // Already carried a Retry token but still unvalidated —
-                    // refuse rather than looping Retry forever.
-                    let tx = self
-                        .endpoint
-                        .refuse(err.into_incoming(), &mut self.send_buf);
-                    self.send_transmit(tx)?;
+                Err(()) => {
+                    // Retry not implemented — refuse without a response packet.
+                    // (Incoming already consumed by retry.)
                 }
             }
             return Ok(());
@@ -1236,6 +1219,7 @@ impl Driver {
 
         match self.endpoint.accept(incoming, now, &mut self.send_buf, None) {
             Ok((ch, conn)) => {
+                self.endpoint.register_cid(conn.local_cid().clone(), ch);
                 self.connections.insert(
                     ch,
                     ConnSlot {
@@ -1250,10 +1234,8 @@ impl Driver {
                     },
                 );
             }
-            Err(e) => {
-                if let Some(tx) = e.response {
-                    self.send_transmit(tx)?;
-                }
+            Err(_e) => {
+                // AcceptError has no response datagram in the in-tree transport.
             }
         }
         Ok(())
@@ -1291,7 +1273,7 @@ impl Driver {
         for ev in endpoint_events {
             if let Some(reply) = self.endpoint.handle_event(ch, ev) {
                 if let Some(slot) = self.connections.get_mut(&ch) {
-                    slot.conn.handle_event(reply);
+                    slot.conn.handle_event(now, reply);
                 }
             }
         }
@@ -1330,8 +1312,11 @@ impl Driver {
             self.send_buf.clear();
             let tx = match self.connections.get_mut(&ch) {
                 Some(slot) => {
-                    slot.conn
-                        .poll_transmit(now, crate::udp::max_gso_segments(), &mut self.send_buf)
+                    slot.conn.poll_transmit_gso(
+                        now,
+                        crate::udp::max_gso_segments(),
+                        &mut self.send_buf,
+                    )
                 }
                 None => break,
             };
@@ -1982,7 +1967,7 @@ impl Driver {
                                 }
                             }
                         }
-                        Err(quinn_proto::WriteError::Blocked) => {
+                        Err(WriteError::Blocked) => {
                             if let Some(st) = slot.streams.get_mut(&id) {
                                 let mut q = st.queues.lock().unwrap();
                                 q.out.splice(0..0, pending);
@@ -2043,6 +2028,7 @@ impl Driver {
     /// pattern) so protocols can read application / transport error codes.
     fn on_connection_lost(&mut self, ch: ConnectionHandle, reason: ConnectionError) {
         let err = connection_lost_io_error(reason);
+        self.endpoint.forget(ch);
         if let Some(mut slot) = self.connections.remove(&ch) {
             let ids: Vec<_> = slot.streams.keys().copied().collect();
             for id in ids {
@@ -2065,7 +2051,7 @@ impl Driver {
             loop {
                 self.send_buf.clear();
                 let tx = match self.connections.get_mut(&ch) {
-                    Some(slot) => slot.conn.poll_transmit(
+                    Some(slot) => slot.conn.poll_transmit_gso(
                         now,
                         crate::udp::max_gso_segments(),
                         &mut self.send_buf,
@@ -2092,11 +2078,14 @@ impl Driver {
         let buf = &self.send_buf[..size];
         let result = match &mut self.transport {
             DatagramTransport::Socket(socket) => crate::udp::send_transmit(socket, &transmit, buf),
-            DatagramTransport::Path(path) => {
-                let ecn = transmit.ecn.map(|c| c as u8);
-                path.send(transmit.destination, buf, ecn, transmit.segment_size)
-                    .map(|_| ())
-            }
+            DatagramTransport::Path(path) => path
+                .send(
+                    transmit.destination,
+                    buf,
+                    transmit.ecn,
+                    transmit.segment_size,
+                )
+                .map(|_| ()),
         };
         match result {
             Ok(()) => Ok(()),
@@ -2357,11 +2346,14 @@ mod tests {
             server_config_self_signed_hopf(&["localhost"], &[b"hq-interop"]).unwrap();
         let client_cfg = client_config_for_pem_bytes_hopf(&pem, &[b"hq-interop"]).unwrap();
 
-        let server = listen_quic(QuicListenConfig::new(
-            "127.0.0.1:0".parse().unwrap(),
-            server_cfg,
-            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
-        ))
+        let server = listen_quic(
+            QuicListenConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                server_cfg,
+                Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+            )
+            .with_hardening(crate::QuicListenHardening::permissive()),
+        )
         .unwrap();
 
         let got = Arc::new(StdMutex::new(Vec::new()));

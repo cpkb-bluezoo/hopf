@@ -1,6 +1,6 @@
 # hopf-quic
 
-QUIC transport for Hopf: **`quinn-proto`** state machine + **in-tree mio UDP** driver.
+QUIC transport for Hopf: **in-tree RFC 9000 transport** + **mio UDP** driver.
 
 HTTP/3 codecs live in **`hopf-http`** (feature `h3`), not in this crate.
 Each bidirectional QUIC stream is a [`QuicStreamEndpoint`] implementing
@@ -14,7 +14,9 @@ and graceful stream FIN still use `disconnected`.
 
 ## Status
 
-**Today:** quinn-proto for RFC 9000 transport; rustls TLS 1.3 configs for
-RFC 9001 (PQC-first). **Planned:** in-tree RFC 9000 transport and in-tree TLS
-1.3 handshake for QUIC; retire quinn-proto and rustls on this path. See
-[docs/quic-h3.html#implementation-status](../../docs/quic-h3.html#implementation-status).
+**Today:** in-tree transport (no `quinn-proto`); TLS 1.3 handshake via
+`hopf-core::tls` for QUIC. Loopback echo works
+(`spike_echo_one_stream_hopf` with `QuicListenHardening::permissive()`).
+Retry/GSO/0-RTT and broader interop are still Phase 3 follow-ups. See
+[docs/quic-h3.html#implementation-status](../../docs/quic-h3.html#implementation-status)
+and [crypto-migration-plan.md](../../crypto-migration-plan.md).

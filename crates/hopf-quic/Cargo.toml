@@ -9,9 +9,9 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "QUIC transport for Hopf (quinn-proto + mio; no HTTP)"
+description = "QUIC transport for Hopf (in-tree transport + mio; no HTTP)"
 readme = "README.md"
-keywords = ["quic", "quinn-proto", "mio"]
+keywords = ["quic", "mio"]
 categories = ["network-programming"]
 
 [features]
@@ -21,13 +21,6 @@ integration = []
 
 [dependencies]
 hopf-core = { workspace = true }
-hopf-tls = { workspace = true }
-quinn-proto = { workspace = true }
-# See the workspace root Cargo.toml's comment on this entry — pins a
-# transitive quinn-proto dependency away from a broken release, not
-# something hopf-quic's own code uses.
-tinyvec = { workspace = true }
-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 mio = { workspace = true }
 bytes = "1"

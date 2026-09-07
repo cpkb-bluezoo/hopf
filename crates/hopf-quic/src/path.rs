@@ -36,7 +36,7 @@ pub trait QuicDatagramPath: Send {
     /// Send one UDP-equivalent payload to `dest`.
     ///
     /// `ecn`/`segment_size` are the same optional per-datagram hints
-    /// [`quinn_proto::Transmit`] carries for a real socket (ECN codepoint,
+    /// [`Transmit`] carries for a real socket (ECN codepoint,
     /// GSO segment size) — implementations that aren't backed by an actual
     /// IP-layer socket are free to ignore them; they're optimizations, not
     /// something QUIC's correctness depends on.
