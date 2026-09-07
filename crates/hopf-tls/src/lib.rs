@@ -22,7 +22,7 @@ use rustls::{
     ServerConnection, SignatureScheme,
 };
 use hopf_core::{
-    crypto::cert::sha256_fingerprint_hex, SecurityInfo, SharedTlsAcceptor, SharedTlsConnector,
+    crypto::cert::sha256_fingerprint_hex, Bytes, SecurityInfo, SharedTlsAcceptor, SharedTlsConnector,
     TlsAcceptor, TlsConnector, TlsProgress, TlsSession,
 };
 
@@ -526,7 +526,7 @@ impl TlsSession for RustlsServerSession {
             .conn
             .alpn_protocol()
             .filter(|p| !p.is_empty())
-            .map(|p| p.to_vec());
+            .map(Bytes::copy_from_slice);
         let protocol = self.conn.protocol_version().map(|v| format!("{v:?}"));
         let cipher_suite = self
             .conn
@@ -537,8 +537,12 @@ impl TlsSession for RustlsServerSession {
         let peer_certificate_fingerprint = peer_certificates
             .and_then(|certs| certs.first())
             .map(|leaf| sha256_hex(leaf));
-        let peer_certificate_chain = peer_certificates
-            .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect());
+        let peer_certificate_chain = peer_certificates.map(|certs| {
+            certs
+                .iter()
+                .map(|c| Bytes::copy_from_slice(c.as_ref()))
+                .collect()
+        });
         SecurityInfo::secure(alpn, protocol, cipher_suite)
             .with_sni(sni)
             .with_peer_certificate_fingerprint(peer_certificate_fingerprint)
@@ -636,7 +640,7 @@ impl TlsSession for RustlsClientSession {
             .conn
             .alpn_protocol()
             .filter(|p| !p.is_empty())
-            .map(|p| p.to_vec());
+            .map(Bytes::copy_from_slice);
         let protocol = self.conn.protocol_version().map(|v| format!("{v:?}"));
         let cipher_suite = self
             .conn
@@ -646,8 +650,12 @@ impl TlsSession for RustlsClientSession {
         let peer_certificate_fingerprint = peer_certificates
             .and_then(|certs| certs.first())
             .map(|leaf| sha256_hex(leaf));
-        let peer_certificate_chain = peer_certificates
-            .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect());
+        let peer_certificate_chain = peer_certificates.map(|certs| {
+            certs
+                .iter()
+                .map(|c| Bytes::copy_from_slice(c.as_ref()))
+                .collect()
+        });
         SecurityInfo::secure(alpn, protocol, cipher_suite)
             .with_peer_certificate_fingerprint(peer_certificate_fingerprint)
             .with_peer_certificate_chain(peer_certificate_chain)
@@ -800,7 +808,7 @@ mod tests {
     }
 
     struct TlsEcho {
-        alpn_seen: Arc<Mutex<Option<Vec<u8>>>>,
+        alpn_seen: Arc<Mutex<Option<Bytes>>>,
         ready: Arc<Mutex<bool>>,
     }
 
@@ -814,7 +822,7 @@ mod tests {
             _endpoint: &mut dyn Endpoint,
             info: &SecurityInfo,
         ) {
-            *self.alpn_seen.lock().unwrap() = info.alpn().map(|a| a.to_vec());
+            *self.alpn_seen.lock().unwrap() = info.alpn().map(Bytes::copy_from_slice);
             *self.ready.lock().unwrap() = true;
         }
 
@@ -1248,7 +1256,7 @@ mod tests {
         assert_eq!(fingerprint, expected);
         let chain = info.peer_certificate_chain().expect("chain set");
         assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0], client_certified.cert.der().to_vec());
+        assert_eq!(chain[0].as_ref(), client_certified.cert.der().as_ref());
 
         rt.shutdown();
     }

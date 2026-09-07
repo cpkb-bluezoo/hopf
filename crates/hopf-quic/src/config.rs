@@ -9,11 +9,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig};
+use hopf_core::tls::ServerCredentials;
 use hopf_core::HandlerFactory;
 use quinn_proto::{TransportConfig, VarInt};
 
+use crate::crypto::{hopf_client_config, hopf_server_config, HopfTlsBuildParams};
 use crate::hooks::ConnectionFactory;
 
 /// Quinn server crypto + transport config.
@@ -482,6 +485,51 @@ pub fn server_config_self_signed_with(
     ))
 }
 
+fn hopf_server_credentials(names: &[&str]) -> io::Result<(ServerCredentials, Vec<u8>)> {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let params = rcgen::CertificateParams::new(
+        names.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+    )
+    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let creds = ServerCredentials {
+        cert_chain: vec![Bytes::copy_from_slice(cert.der())],
+        signing_key_pkcs8: Bytes::from(key_pair.serialize_der()),
+    };
+    Ok((creds, cert.pem().into_bytes()))
+}
+
+/// In-tree TLS handshake server config (tests / demos).
+///
+/// Same shape as [`server_config_self_signed`] but uses
+/// [`hopf_core::tls::HandshakeEngine`] instead of rustls.
+pub fn server_config_self_signed_hopf(
+    names: &[&str],
+    alpn: &[&[u8]],
+) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
+    server_config_self_signed_with_hopf(names, alpn, QuicTlsOptions::default())
+}
+
+/// [`server_config_self_signed_hopf`] with explicit [`QuicTlsOptions`].
+///
+/// Early data is not supported on the hopf handshake path; `tls` is accepted
+/// for API symmetry with the rustls builders.
+pub fn server_config_self_signed_with_hopf(
+    names: &[&str],
+    alpn: &[&[u8]],
+    _tls: QuicTlsOptions,
+) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
+    let (creds, pem) = hopf_server_credentials(names)?;
+    let params = HopfTlsBuildParams::server(
+        creds,
+        alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+    );
+    Ok((hopf_server_config(params), pem))
+}
+
 /// Client config that trusts a single leaf PEM file (self-signed smoke tests).
 pub fn client_config_for_certified_pem(
     leaf_pem: &Path,
@@ -527,6 +575,34 @@ pub fn client_config_for_pem_bytes_with(
         .try_into()
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     Ok(Arc::new(QuicClientConfig::new(Arc::new(quic_crypto))))
+}
+
+/// Client config trusting in-memory PEM via the in-tree handshake engine.
+pub fn client_config_for_pem_bytes_hopf(
+    leaf_pem: &[u8],
+    alpn: &[&[u8]],
+) -> io::Result<Arc<QuicClientConfig>> {
+    client_config_for_pem_bytes_with_hopf(leaf_pem, alpn, QuicTlsOptions::default())
+}
+
+/// [`client_config_for_pem_bytes_hopf`] with explicit [`QuicTlsOptions`].
+pub fn client_config_for_pem_bytes_with_hopf(
+    leaf_pem: &[u8],
+    alpn: &[&[u8]],
+    _tls: QuicTlsOptions,
+) -> io::Result<Arc<QuicClientConfig>> {
+    let mut reader = BufReader::new(leaf_pem);
+    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
+    let certs = certs.map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let anchor = certs.first().ok_or_else(|| {
+        io::Error::new(ErrorKind::InvalidData, "no certificate in PEM")
+    })?;
+    let params = HopfTlsBuildParams::client_self_signed(
+        alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        "localhost",
+        Bytes::copy_from_slice(anchor.as_ref()),
+    );
+    Ok(hopf_client_config(params))
 }
 
 /// Commonly-tuned QUIC transport parameters (RFC 9000 §18.2), applied on
@@ -743,6 +819,14 @@ mod tests {
         let _ = format!("{server:?}");
         assert!(custom.require_address_validation);
         assert_eq!(custom.max_incoming, Some(8));
+    }
+
+    #[test]
+    fn self_signed_server_and_matching_client_hopf() {
+        let (server, pem) = server_config_self_signed_hopf(&["localhost"], &[ALPN_H3]).unwrap();
+        let _ = server;
+        let client = client_config_for_pem_bytes_hopf(&pem, &[ALPN_H3]).unwrap();
+        let _ = client;
     }
 
     #[test]

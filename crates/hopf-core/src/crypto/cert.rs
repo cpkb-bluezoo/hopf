@@ -2,6 +2,8 @@
 
 //! Certificate digests and SPKI extraction.
 
+use bytes::Bytes;
+
 use super::digest::{hash, HashAlgorithm};
 
 /// Lowercase hex SHA-256 digest of a DER certificate — used for mTLS
@@ -20,13 +22,13 @@ pub fn sha256_fingerprint_hex(der: &[u8]) -> String {
 /// certificate (RFC 5280). Used for DANE TLSA SPKI matching (RFC 6698).
 ///
 /// Returns `None` if `cert_der` is not a minimally well-formed certificate.
-pub fn spki_sha256(cert_der: &[u8]) -> Option<Vec<u8>> {
+pub fn spki_sha256(cert_der: &[u8]) -> Option<Bytes> {
     let spki = extract_spki(cert_der)?;
-    Some(hash(HashAlgorithm::Sha256, &spki).into_vec())
+    Some(hash(HashAlgorithm::Sha256, spki.as_ref()).into_bytes())
 }
 
 /// Extract the DER-encoded SubjectPublicKeyInfo from an X.509 certificate.
-pub fn extract_spki(cert_der: &[u8]) -> Option<Vec<u8>> {
+pub fn extract_spki(cert_der: &[u8]) -> Option<Bytes> {
     // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
     let mut outer = parse_asn1_sequence(cert_der)?;
     let tbs = parse_asn1_sequence(outer.next()?)?;
@@ -42,8 +44,7 @@ pub fn extract_spki(cert_der: &[u8]) -> Option<Vec<u8>> {
     fields.skip_element()?; // issuer
     fields.skip_element()?; // validity
     fields.skip_element()?; // subject
-    let spki = fields.next()?.to_vec();
-    Some(spki)
+    Some(Bytes::copy_from_slice(fields.next()?))
 }
 
 struct Asn1Reader<'a> {

@@ -9,6 +9,7 @@
 #![warn(missing_docs)]
 
 mod config;
+mod crypto;
 mod driver;
 mod error;
 mod hooks;
@@ -17,13 +18,18 @@ mod runtime_ext;
 mod stream;
 mod udp;
 
+pub use crypto::{
+    hopf_client_config, hopf_server_config, HopfHandshakeData, HopfQuicTlsConfig, HopfTlsBuildParams,
+};
 pub use config::{
     apply_client_transport_options, apply_listen_hardening, apply_server_transport_options,
     client_config_for_certified_pem, client_config_for_certified_pem_with,
-    client_config_for_pem_bytes, client_config_for_pem_bytes_with, client_config_from_pem,
+    client_config_for_pem_bytes, client_config_for_pem_bytes_hopf,
+    client_config_for_pem_bytes_with, client_config_for_pem_bytes_with_hopf, client_config_from_pem,
     client_config_from_pem_with, client_config_public_trust, client_config_public_trust_with,
     server_config_from_pem, server_config_from_pem_with,
-    server_config_self_signed, server_config_self_signed_with, QuicClientConfig, QuicConnectConfig,
+    server_config_self_signed, server_config_self_signed_hopf, server_config_self_signed_with,
+    server_config_self_signed_with_hopf, QuicClientConfig, QuicConnectConfig,
     QuicListenConfig, QuicListenHardening, QuicListenHooksConfig, QuicServerConfig, QuicTlsOptions,
     QuicTransportOptions,
 };

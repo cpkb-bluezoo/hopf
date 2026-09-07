@@ -2,6 +2,8 @@
 
 //! Hash digests via AWS-LC.
 
+use bytes::Bytes;
+
 use aws_lc_rs::digest;
 
 /// Supported hash algorithms exposed through the facade.
@@ -27,7 +29,7 @@ impl HashAlgorithm {
 
 /// Finished digest bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Digest(Vec<u8>);
+pub struct Digest(Bytes);
 
 impl Digest {
     /// Raw digest octets.
@@ -36,7 +38,7 @@ impl Digest {
     }
 
     /// Consume into owned bytes.
-    pub fn into_vec(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Bytes {
         self.0
     }
 }
@@ -49,7 +51,9 @@ impl AsRef<[u8]> for Digest {
 
 /// One-shot hash of `data`.
 pub fn hash(algorithm: HashAlgorithm, data: &[u8]) -> Digest {
-    Digest(digest::digest(algorithm.aws_alg(), data).as_ref().to_vec())
+    Digest(Bytes::copy_from_slice(
+        digest::digest(algorithm.aws_alg(), data).as_ref(),
+    ))
 }
 
 /// Incremental SHA-256 hasher (DKIM body hash, streaming canonicalization).
@@ -75,7 +79,7 @@ impl Sha256Context {
     /// Finish and return the digest.
     pub fn finish(self) -> Digest {
         let _ = self.algorithm;
-        Digest(self.inner.finish().as_ref().to_vec())
+        Digest(Bytes::copy_from_slice(self.inner.finish().as_ref()))
     }
 }
 

@@ -38,11 +38,22 @@ const WAKE_TOKEN: Token = Token(1);
 /// suite isn't exposed by quinn-proto's crypto session abstraction, so it
 /// stays `None` (honest "unknown", not a fabricated value).
 fn security_info_from_conn(conn: &Connection) -> SecurityInfo {
-    let handshake_data = conn
-        .crypto_session()
+    let session = conn.crypto_session();
+    if let Some(d) = session
+        .handshake_data()
+        .and_then(|d| d.downcast::<crate::crypto::HopfHandshakeData>().ok())
+    {
+        let alpn = d.protocol.clone();
+        let sni = d.server_name.clone();
+        return SecurityInfo::secure(alpn, Some("TLSv1.3".into()), None).with_sni(sni);
+    }
+    let handshake_data = session
         .handshake_data()
         .and_then(|d| d.downcast::<quinn_proto::crypto::rustls::HandshakeData>().ok());
-    let alpn = handshake_data.as_ref().and_then(|d| d.protocol.clone());
+    let alpn = handshake_data
+        .as_ref()
+        .and_then(|d| d.protocol.clone())
+        .map(Bytes::from);
     let sni = handshake_data.and_then(|d| d.server_name.clone());
     SecurityInfo::secure(alpn, Some("TLSv1.3".into()), None).with_sni(sni)
 }
@@ -2262,7 +2273,10 @@ impl QuicConnApi for ConnRecorder {
 #[cfg(all(test, feature = "integration"))]
 mod tests {
     use super::*;
-    use crate::config::{client_config_for_pem_bytes, server_config_self_signed};
+    use crate::config::{
+        client_config_for_pem_bytes, client_config_for_pem_bytes_hopf, server_config_self_signed,
+        server_config_self_signed_hopf,
+    };
     use std::sync::Mutex as StdMutex;
     use hopf_core::{Endpoint, NopHandler, ProtocolHandler};
 
@@ -2304,6 +2318,44 @@ mod tests {
         let (server_cfg, pem) =
             server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
         let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        let got = Arc::new(StdMutex::new(Vec::new()));
+        let got2 = Arc::clone(&got);
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || {
+                Box::new(ClientProbe {
+                    sent: false,
+                    got: Arc::clone(&got2),
+                }) as Box<dyn ProtocolHandler>
+            }),
+        ))
+        .unwrap();
+
+        for _ in 0..200 {
+            if got.lock().unwrap().as_slice() == b"ping" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(got.lock().unwrap().as_slice(), b"ping");
+        server.shutdown();
+    }
+
+    #[test]
+    fn spike_echo_one_stream_hopf() {
+        let (server_cfg, pem) =
+            server_config_self_signed_hopf(&["localhost"], &[b"hq-interop"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes_hopf(&pem, &[b"hq-interop"]).unwrap();
 
         let server = listen_quic(QuicListenConfig::new(
             "127.0.0.1:0".parse().unwrap(),

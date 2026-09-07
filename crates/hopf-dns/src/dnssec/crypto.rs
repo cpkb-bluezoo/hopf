@@ -37,7 +37,7 @@ pub fn compute_ds_digest(owner_wire: &[u8], dnskey_rdata: &[u8], digest_type: u8
     let mut data = Vec::with_capacity(owner_wire.len() + dnskey_rdata.len());
     data.extend_from_slice(owner_wire);
     data.extend_from_slice(dnskey_rdata);
-    Some(hash(alg, &data).into_vec())
+    Some(hash(alg, &data).into_bytes().to_vec())
 }
 
 /// RFC 5155 §5 iterated NSEC3 hash: `H^(iterations+1)(owner || salt)`,
@@ -48,12 +48,12 @@ pub fn nsec3_hash(owner_wire: &[u8], iterations: u16, salt: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(owner_wire.len() + salt.len());
     buf.extend_from_slice(owner_wire);
     buf.extend_from_slice(salt);
-    let mut h = hash(HashAlgorithm::Sha1Legacy, &buf).into_vec();
+    let mut h = hash(HashAlgorithm::Sha1Legacy, &buf).into_bytes().to_vec();
     for _ in 0..iterations {
         let mut buf = Vec::with_capacity(h.len() + salt.len());
         buf.extend_from_slice(&h);
         buf.extend_from_slice(salt);
-        h = hash(HashAlgorithm::Sha1Legacy, &buf).into_vec();
+        h = hash(HashAlgorithm::Sha1Legacy, &buf).into_bytes().to_vec();
     }
     h
 }
@@ -117,7 +117,7 @@ mod tests {
         assert_ne!(h0a, h1, "different iteration counts must (overwhelmingly) differ");
         let mut buf = h0a.clone();
         buf.extend_from_slice(&salt);
-        let expected = hash(HashAlgorithm::Sha1Legacy, &buf).into_vec();
+        let expected = hash(HashAlgorithm::Sha1Legacy, &buf).into_bytes().to_vec();
         assert_eq!(h1, expected);
     }
 }

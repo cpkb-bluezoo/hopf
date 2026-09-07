@@ -9,7 +9,7 @@ It complements the status tables in
 describe *what* is shipped vs planned; this file describes *how* to get there.
 Phase 0 touchpoints and seams: `[crypto-migration-inventory.md](crypto-migration-inventory.md)`.
 
-**Status:** Phase 1 complete — `hopf-core::crypto` facade live; Phase 2 (TLS 1.3 handshake) is next.
+**Status:** Phase 2 in progress — `hopf-core::tls` handshake engine live; **hopf-quic CRYPTO wired** via `quinn-proto` crypto adapter (`hopf-quic/src/crypto/`); full in-tree transport remains Phase 3.
 
 ---
 
@@ -428,7 +428,7 @@ New phase-specific tests are additive; they do not replace the requirement that 
 ### Phase 1 — `hopf-core::crypto` (facade only)
 
 - [x] Single AWS-LC entry point in core — **wrap, do not reimplement** primitives (`hopf-core/src/crypto/`).
-- [x] Trust anchor storage, SPKI/fingerprint helpers (`TrustStore`, `sha256_fingerprint_hex`, `spki_sha256`) — full chain building and hostname verify land in Phase 2.
+- [x] Trust anchor storage, SPKI/fingerprint helpers (`TrustStore`, `sha256_fingerprint_hex`, `spki_sha256`) — chain building + hostname verify in [`crypto/trust.rs`](crates/hopf-core/src/crypto/trust.rs) + [`crypto/x509.rs`](crates/hopf-core/src/crypto/x509.rs).
 - [x] Migrate **DKIM** sign/verify from `hopf-smtp`'s direct `aws_lc_rs` calls.
 - [x] Migrate **DNSSEC verify** from `hopf-dns`; Ed448 via goldilocks through `hopf-core::crypto::ed448` only.
 - [x] Inventory: every crypto need mapped to aws-lc-rs or thin FFI — see [inventory](crypto-migration-inventory.md) § Direct `aws-lc-rs`.
@@ -438,11 +438,15 @@ New phase-specific tests are additive; they do not replace the requirement that 
 
 ### Phase 2 — TLS 1.3 handshake engine (QUIC-first)
 
-- [ ] Client/server handshake state machines (RFC 8446) — **reactive from the start** (`feed_`* + `TlsEventSink`; no return-value handshake API).
-- [ ] Extensions: SNI, ALPN, supported_groups (hybrid PQC first), key_share, QUIC transport_params.
-- [ ] Export secrets for QUIC key schedule; **no record layer yet**.
-- [ ] Verification gate: `verification_requested` / `feed_verification_result` where chain verify may defer to `StorageExecutor`.
-- [ ] **Tests:** RFC 8446 appendix vectors; scripted stimulus → **event sequence** assertions; interop against OpenSSL / quic-go for CRYPTO-frame handshake only.
+- [x] Reactive API scaffold: [`HandshakeEngine`](crates/hopf-core/src/tls/engine.rs), [`TlsEventSink`](crates/hopf-core/src/tls/sink.rs), `feed_handshake_data` / `feed_verification_result`.
+- [x] Crypto floor: TLS 1.3 HKDF (`crypto/hkdf.rs`), X25519 (`crypto/kx.rs`), key schedule + RFC 8448 vector tests.
+- [x] Handshake message framing + ClientHello builder + ServerHello parser (`tls/handshake/messages.rs`).
+- [x] Client/server complete 1-RTT FSM (EncryptedExtensions, Certificate, CertificateVerify, Finished).
+- [x] Extensions: QUIC `transport_parameters` (opaque RFC 9000 wire codec + TLS ext 0x0039); hybrid PQC via [`KxPolicy`](crates/hopf-core/src/crypto/kx_policy.rs) + `X25519MLKEM768` (Phase 7 expands central policy).
+- [x] Export application traffic secrets in [`QuicSecrets`](crates/hopf-core/src/tls/sink.rs) on `handshake_complete`.
+- [x] Verification gate backed by `hopf-core::crypto` trust (chain build + hostname via `TrustStore`; inline when `HandshakeConfig.trust_store` is set, else `verification_requested` gate for StorageExecutor).
+- [x] Wire into `hopf-quic` CRYPTO stream via `quinn-proto::crypto::Session` adapter (`hopf-quic/src/crypto/`); loopback echo (`spike_echo_one_stream_hopf`). OpenSSL/quic-go interop still open.
+- [x] **Tests:** key schedule RFC 8448 vectors; 1-RTT loopback (classical + hybrid PQC + transport parameters).
 
 *Agent15 equivalent — with proper state machine discipline and AWS-LC underneath.*
 

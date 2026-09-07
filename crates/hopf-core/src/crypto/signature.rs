@@ -2,6 +2,8 @@
 
 //! Digital signatures via AWS-LC.
 
+use bytes::Bytes;
+
 use aws_lc_rs::signature::{
     self, KeyPair, RsaKeyPair, UnparsedPublicKey, ED25519, RSA_PKCS1_2048_8192_SHA256,
     RSA_PKCS1_2048_8192_SHA512, RSA_PKCS1_SHA256,
@@ -37,9 +39,9 @@ impl Ed25519PrivateKey {
     }
 
     /// Generate a new PKCS#8 document (tests and tooling).
-    pub fn generate_pkcs8() -> Result<Vec<u8>, KeyError> {
+    pub fn generate_pkcs8() -> Result<Bytes, KeyError> {
         signature::Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new())
-            .map(|doc| doc.as_ref().to_vec())
+            .map(|doc| Bytes::copy_from_slice(doc.as_ref()))
             .map_err(|_| KeyError)
     }
 
@@ -78,7 +80,7 @@ pub struct RsaPublicKeyComponents<'a> {
 }
 
 /// Sign `data` with RSA PKCS#1 v1.5 + SHA-256 (DKIM `rsa-sha256`).
-pub fn rsa_sign_pkcs1_sha256(key: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>, SignError> {
+pub fn rsa_sign_pkcs1_sha256(key: &RsaPrivateKey, data: &[u8]) -> Result<Bytes, SignError> {
     let mut sig = vec![0u8; key.0.public_modulus_len()];
     key.0
         .sign(
@@ -88,12 +90,12 @@ pub fn rsa_sign_pkcs1_sha256(key: &RsaPrivateKey, data: &[u8]) -> Result<Vec<u8>
             &mut sig,
         )
         .map_err(|_| SignError)?;
-    Ok(sig)
+    Ok(Bytes::from(sig))
 }
 
 /// Sign `data` with Ed25519 (DKIM `ed25519-sha256`, DNSSEC).
-pub fn ed25519_sign(key: &Ed25519PrivateKey, data: &[u8]) -> Vec<u8> {
-    key.0.sign(data).as_ref().to_vec()
+pub fn ed25519_sign(key: &Ed25519PrivateKey, data: &[u8]) -> Bytes {
+    Bytes::copy_from_slice(key.0.sign(data).as_ref())
 }
 
 /// Verify RSA PKCS#1 v1.5 + SHA-256 over `message`.

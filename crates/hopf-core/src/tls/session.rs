@@ -1,7 +1,6 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! TLS session hooks so `hopf-tls` (rustls) can plug into [`crate::TcpConnection`]
-//! without pulling crypto into core.
+//! Interim TLS session traits (rustls adapter in `hopf-tls` until Phase 8).
 
 use std::io;
 use std::sync::Arc;

@@ -45,6 +45,7 @@ mod proxy_protocol;
 mod reactor;
 mod timer;
 
+pub use bytes::Bytes;
 pub use acl::{AcceptRateLimit, IpNet, PeerAcl};
 pub use binding::BindingId;
 pub use bufpool::BufferPool;
@@ -75,7 +76,9 @@ pub use service::Service;
 pub use storage::{StorageConfig, StorageError, StorageExecutor};
 pub use telemetry::{NopTelemetry, TelemetryHook};
 pub use tls::{
-    SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector, TlsProgress, TlsSession,
+    HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, NopTlsEventSink, QuicSecrets,
+    SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector, TlsEventSink, TlsProgress,
+    TlsProtocolError, TlsSession, TlsTimerKind, VerifyRequest, VerifyResult,
 };
 pub use udp::UdpDatagramHandler;
 
