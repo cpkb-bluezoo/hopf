@@ -22,8 +22,8 @@ use rustls::{
     ServerConnection, SignatureScheme,
 };
 use hopf_core::{
-    SecurityInfo, SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector, TlsProgress,
-    TlsSession,
+    crypto::cert::sha256_fingerprint_hex, SecurityInfo, SharedTlsAcceptor, SharedTlsConnector,
+    TlsAcceptor, TlsConnector, TlsProgress, TlsSession,
 };
 
 /// Shared rustls [`CryptoProvider`] (aws-lc-rs, hybrid-first PQC key exchange).
@@ -553,13 +553,7 @@ impl TlsSession for RustlsServerSession {
 /// Lowercase hex SHA-256 digest of `der`, used as the SASL EXTERNAL
 /// `cert_key` for a peer's client certificate.
 fn sha256_hex(der: &CertificateDer<'_>) -> String {
-    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, der);
-    let mut out = String::with_capacity(digest.as_ref().len() * 2);
-    for byte in digest.as_ref() {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    sha256_fingerprint_hex(der.as_ref())
 }
 
 struct RustlsConnector {

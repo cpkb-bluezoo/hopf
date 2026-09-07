@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmimeparser::dkim::RawHeader;
 
+use hopf_core::crypto::{ed25519_verify, rsa_verify_pkcs1_sha256, RsaPublicKeyComponents};
+
 use super::canon::{self, Canonicalization};
 use super::rsa_der;
 use crate::auth::dns_lookup::{DnsLookup, Lookup};
@@ -330,25 +332,24 @@ fn evaluate_key(
                 Ok(v) => v,
                 Err(()) => return DkimResult::PermError,
             };
-            let key = aws_lc_rs::signature::RsaPublicKeyComponents { n: &n, e: &e };
-            match key.verify(
-                &aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256,
+            if rsa_verify_pkcs1_sha256(
+                RsaPublicKeyComponents { n: &n, e: &e },
                 signed_data,
                 signature,
             ) {
-                Ok(()) => DkimResult::Pass,
-                Err(_) => DkimResult::Fail,
+                DkimResult::Pass
+            } else {
+                DkimResult::Fail
             }
         }
         Algorithm::Ed25519Sha256 => {
             if p.len() != 32 {
                 return DkimResult::PermError;
             }
-            let key =
-                aws_lc_rs::signature::UnparsedPublicKey::new(&aws_lc_rs::signature::ED25519, p.as_slice());
-            match key.verify(signed_data, signature) {
-                Ok(()) => DkimResult::Pass,
-                Err(_) => DkimResult::Fail,
+            if ed25519_verify(p, signed_data, signature) {
+                DkimResult::Pass
+            } else {
+                DkimResult::Fail
             }
         }
     }

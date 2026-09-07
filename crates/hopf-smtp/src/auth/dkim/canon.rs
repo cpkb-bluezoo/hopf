@@ -4,6 +4,8 @@
 
 use rmimeparser::dkim::RawHeader;
 
+use hopf_core::crypto::{hash, HashAlgorithm, Sha256Context};
+
 /// `simple`/`relaxed` selector (RFC 6376 §3.4), independently selectable for
 /// header and body (`c=header/body`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -201,7 +203,7 @@ pub fn canon_body(body: &[u8], c: Canonicalization, l: Option<u64>) -> Vec<u8> {
 pub struct IncrementalBodyCanon {
     c: Canonicalization,
     limit: Option<u64>,
-    ctx: aws_lc_rs::digest::Context,
+    ctx: Sha256Context,
     /// Canonicalized bytes fed to `ctx` so far, for `limit` truncation.
     emitted: u64,
     /// Bytes of the current, not-yet-terminated line.
@@ -218,7 +220,7 @@ impl IncrementalBodyCanon {
         Self {
             c,
             limit,
-            ctx: aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256),
+            ctx: Sha256Context::new(HashAlgorithm::Sha256),
             emitted: 0,
             line_buf: Vec::new(),
             pending_blank_lines: 0,
@@ -253,7 +255,7 @@ impl IncrementalBodyCanon {
     /// hash `\r\n` per errata some DKIM implementations apply is a
     /// pre-existing question this streaming rewrite deliberately doesn't
     /// re-litigate.
-    pub fn finish(mut self) -> aws_lc_rs::digest::Digest {
+    pub fn finish(mut self) -> hopf_core::crypto::Digest {
         if !self.line_buf.is_empty() {
             let line = std::mem::take(&mut self.line_buf);
             self.consume_line_bytes(&line);
@@ -423,7 +425,7 @@ mod tests {
     /// to `sha256(canon_body(..))`, regardless of how the input is chunked
     /// — the property #86's streaming DKIM design depends on.
     fn streaming_matches_whole_buffer(body: &[u8], c: Canonicalization, l: Option<u64>) {
-        let expected = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &canon_body(body, c, l));
+        let expected = hash(HashAlgorithm::Sha256, &canon_body(body, c, l));
         for chunk_size in [1usize, 2, 3, 5, 7, 16, 64, 4096] {
             let mut streaming = IncrementalBodyCanon::new(c, l);
             for chunk in body.chunks(chunk_size.max(1)) {
@@ -489,7 +491,7 @@ mod tests {
         let mut c = IncrementalBodyCanon::new(Canonicalization::Simple, None);
         c.feed(b"\r\n\r\n\r\n");
         let got = c.finish();
-        let expected = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, b"\r\n");
+        let expected = hash(HashAlgorithm::Sha256, b"\r\n");
         assert_eq!(got.as_ref(), expected.as_ref());
     }
 

@@ -19,6 +19,7 @@ pub mod binding;
 pub mod bufpool;
 pub mod composition;
 pub mod connector;
+pub mod crypto;
 pub mod endpoint;
 pub mod error;
 pub mod handle;

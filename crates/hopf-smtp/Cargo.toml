@@ -26,7 +26,6 @@ hopf-otel = { workspace = true }
 hopf-dns = { workspace = true, features = ["dnssec", "dane"] }
 hopf-mailbox = { workspace = true }
 rmimeparser = { workspace = true }
-aws-lc-rs = { workspace = true }
 getrandom = { workspace = true }
 rustls = { workspace = true }
 

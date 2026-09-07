@@ -2410,11 +2410,11 @@ mod tests {
     /// the message rather than being told the answer.
     #[cfg(feature = "dnssec")]
     fn signed_secure_message(name: &str, id: u16) -> (DnsMessage, crate::dnssec::DnssecValidator) {
-        use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+        use hopf_core::crypto::{ed25519_sign, Ed25519PrivateKey};
 
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
-        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        let pub_bytes = pair.public_key().as_ref().to_vec();
+        let pkcs8 = Ed25519PrivateKey::generate_pkcs8().unwrap();
+        let pair = Ed25519PrivateKey::from_pkcs8(&pkcs8).unwrap();
+        let pub_bytes = pair.public_key_bytes().to_vec();
 
         let dnskey = DnsResourceRecord::dnskey(name, 3600, 257, 15, &pub_bytes);
         let a = DnsResourceRecord::a(name, 3600, std::net::Ipv4Addr::new(192, 0, 2, 7));
@@ -2447,8 +2447,8 @@ mod tests {
             out.extend_from_slice(&a.rdata);
             out
         };
-        let sig = pair.sign(&signed);
-        rrsig.rdata.extend_from_slice(sig.as_ref());
+        let sig = ed25519_sign(&pair, &signed);
+        rrsig.rdata.extend_from_slice(&sig);
 
         let owner_wire = crate::wire::encode_name(name).unwrap();
         let digest = crate::dnssec::compute_ds_digest(&owner_wire, &dnskey.rdata, 2).unwrap();

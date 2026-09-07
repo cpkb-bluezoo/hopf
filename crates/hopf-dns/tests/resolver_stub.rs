@@ -720,11 +720,10 @@ fn literal_connect_by_name_skips_dns() {
 fn validate_chain_of_trust_walks_a_real_two_level_delegation_over_the_network() {
     use hopf_dns::dnssec::{compute_ds_digest, DnssecStatus, DnssecTrustAnchor, DnssecValidator};
     use hopf_dns::wire::{encode_name, DnsClass, DnsQuestion, DnsType};
-    use aws_lc_rs::rand::SystemRandom;
-    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+    use hopf_core::crypto::{ed25519_sign, Ed25519PrivateKey};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn sign_rrset(rrset: &[&DnsResourceRecord], name: &str, rtype: DnsType, key_tag: u16, pair: &Ed25519KeyPair) -> DnsResourceRecord {
+    fn sign_rrset(rrset: &[&DnsResourceRecord], name: &str, rtype: DnsType, key_tag: u16, pair: &Ed25519PrivateKey) -> DnsResourceRecord {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
         let labels = if name == "." { 0 } else { name.split('.').filter(|s| !s.is_empty()).count() as u8 };
         let mut rdata = Vec::new();
@@ -747,21 +746,21 @@ fn validate_chain_of_trust_walks_a_real_two_level_delegation_over_the_network() 
             signed.extend_from_slice(&(rr.rdata.len() as u16).to_be_bytes());
             signed.extend_from_slice(&rr.rdata);
         }
-        let sig = pair.sign(&signed);
+        let sig = ed25519_sign(pair, &signed);
         let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rdata);
-        rrsig.rdata.extend_from_slice(sig.as_ref());
+        rrsig.rdata.extend_from_slice(&sig);
         rrsig
     }
 
-    let root_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-    let root_pair = Ed25519KeyPair::from_pkcs8(root_pkcs8.as_ref()).unwrap();
-    let root_dnskey = DnsResourceRecord::dnskey(".", 3600, 257, 15, root_pair.public_key().as_ref());
+    let root_pkcs8 = Ed25519PrivateKey::generate_pkcs8().unwrap();
+    let root_pair = Ed25519PrivateKey::from_pkcs8(&root_pkcs8).unwrap();
+    let root_dnskey = DnsResourceRecord::dnskey(".", 3600, 257, 15, root_pair.public_key_bytes());
     let root_key_tag = root_dnskey.dnskey_key_tag().unwrap();
     let root_dnskey_rrsig = sign_rrset(&[&root_dnskey], ".", DnsType::Dnskey, root_key_tag, &root_pair);
 
-    let example_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-    let example_pair = Ed25519KeyPair::from_pkcs8(example_pkcs8.as_ref()).unwrap();
-    let example_dnskey = DnsResourceRecord::dnskey("example.com", 3600, 257, 15, example_pair.public_key().as_ref());
+    let example_pkcs8 = Ed25519PrivateKey::generate_pkcs8().unwrap();
+    let example_pair = Ed25519PrivateKey::from_pkcs8(&example_pkcs8).unwrap();
+    let example_dnskey = DnsResourceRecord::dnskey("example.com", 3600, 257, 15, example_pair.public_key_bytes());
     let example_key_tag = example_dnskey.dnskey_key_tag().unwrap();
     let example_dnskey_rrsig =
         sign_rrset(&[&example_dnskey], "example.com", DnsType::Dnskey, example_key_tag, &example_pair);
@@ -858,11 +857,10 @@ fn validate_chain_of_trust_walks_a_real_two_level_delegation_over_the_network() 
 fn validate_denial_of_existence_proves_a_real_nxdomain_over_the_network() {
     use hopf_dns::dnssec::{compute_ds_digest, DnssecStatus, DnssecTrustAnchor, DnssecValidator};
     use hopf_dns::wire::{encode_name, normalize_name, DnsClass, DnsQuestion, DnsType};
-    use aws_lc_rs::rand::SystemRandom;
-    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+    use hopf_core::crypto::{ed25519_sign, Ed25519PrivateKey};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn sign_rrset(rrset: &[&DnsResourceRecord], name: &str, rtype: DnsType, key_tag: u16, pair: &Ed25519KeyPair) -> DnsResourceRecord {
+    fn sign_rrset(rrset: &[&DnsResourceRecord], name: &str, rtype: DnsType, key_tag: u16, pair: &Ed25519PrivateKey) -> DnsResourceRecord {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
         let labels = if name == "." { 0 } else { name.split('.').filter(|s| !s.is_empty()).count() as u8 };
         let mut rdata = Vec::new();
@@ -887,15 +885,15 @@ fn validate_denial_of_existence_proves_a_real_nxdomain_over_the_network() {
             signed.extend_from_slice(&(rr.rdata.len() as u16).to_be_bytes());
             signed.extend_from_slice(&rr.rdata);
         }
-        let sig = pair.sign(&signed);
+        let sig = ed25519_sign(pair, &signed);
         let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rdata);
-        rrsig.rdata.extend_from_slice(sig.as_ref());
+        rrsig.rdata.extend_from_slice(&sig);
         rrsig
     }
 
-    let root_pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-    let root_pair = Ed25519KeyPair::from_pkcs8(root_pkcs8.as_ref()).unwrap();
-    let root_dnskey = DnsResourceRecord::dnskey(".", 3600, 257, 15, root_pair.public_key().as_ref());
+    let root_pkcs8 = Ed25519PrivateKey::generate_pkcs8().unwrap();
+    let root_pair = Ed25519PrivateKey::from_pkcs8(&root_pkcs8).unwrap();
+    let root_dnskey = DnsResourceRecord::dnskey(".", 3600, 257, 15, root_pair.public_key_bytes());
     let root_key_tag = root_dnskey.dnskey_key_tag().unwrap();
     let root_dnskey_rrsig = sign_rrset(&[&root_dnskey], ".", DnsType::Dnskey, root_key_tag, &root_pair);
     let root_digest = compute_ds_digest(&[0u8], &root_dnskey.rdata, 2).unwrap();
