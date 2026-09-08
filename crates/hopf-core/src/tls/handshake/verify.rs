@@ -117,7 +117,7 @@ pub fn verify_certificate_verify(
 /// `CertificateVerify` scheme without requiring the caller to declare one
 /// alongside their PEM-loaded key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyKind {
+pub(crate) enum KeyKind {
     Ed25519,
     EcdsaP256,
     EcdsaP384,
@@ -133,7 +133,7 @@ const OID_SECP384R1: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
 /// `PrivateKeyInfo ::= SEQUENCE { version INTEGER, algorithm AlgorithmIdentifier, ... }`
 /// (RFC 5958) — reads just the algorithm OID (and, for EC keys, the curve OID) to
 /// classify the key; never touches the private key material itself.
-fn pkcs8_key_kind(pkcs8_der: &[u8]) -> Option<KeyKind> {
+pub(crate) fn pkcs8_key_kind(pkcs8_der: &[u8]) -> Option<KeyKind> {
     let mut outer = parse_asn1_sequence(pkcs8_der)?;
     let _version = outer.next()?;
     let algorithm = outer.next()?;

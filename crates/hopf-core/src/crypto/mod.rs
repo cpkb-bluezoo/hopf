@@ -15,6 +15,7 @@ pub mod digest;
 pub mod hkdf;
 pub mod kx;
 pub mod kx_policy;
+pub mod prf;
 pub mod rand;
 pub mod signature;
 pub mod trust;
@@ -23,15 +24,16 @@ pub mod x509;
 #[cfg(feature = "ed448")]
 pub mod ed448;
 
-pub use aead::{AeadError, Aes128GcmKey};
+pub use aead::{AeadError, AesGcmKey, Aes128GcmKey};
 pub use cert::{sha256_fingerprint_hex, spki_sha256};
 pub use digest::{hash, Digest, HashAlgorithm, Sha256Context};
 pub use hkdf::{empty_hash, expand_label, extract, extract_derived, quic_expand_label, HkdfPrk, TLS13_HKDF};
 pub use kx::{
-    server_agree, EphemeralKeyPair, HybridKeyPair, LocalKeyShare, NamedGroup, StaticKeyPair,
-    MLKEM768_CIPHERTEXT_LEN, MLKEM768_ENCAP_LEN, X25519_PUBLIC_LEN,
+    server_agree, EphemeralKeyPair, EphemeralP256KeyPair, HybridKeyPair, LocalKeyShare, NamedGroup,
+    StaticKeyPair, MLKEM768_CIPHERTEXT_LEN, MLKEM768_ENCAP_LEN, X25519_PUBLIC_LEN,
 };
 pub use kx_policy::KxPolicy;
+pub use prf::{prf, PrfHash};
 pub use rand::SystemRandom;
 pub use signature::{
     ecdsa_p256_sha256_verify, ecdsa_p256_sha256_verify_spki, ecdsa_p256_sign,

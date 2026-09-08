@@ -442,4 +442,125 @@ mod integration_tests {
 
         rt.shutdown();
     }
+
+    /// Phase 5 (TLS 1.2) real interop — a `rustls` client *forced* to
+    /// TLS 1.2 only (`with_protocol_versions(&[&rustls::version::TLS12])`,
+    /// not just "supports 1.2 as a fallback") against
+    /// `hopf_core::acceptor_from_pem_tls12`. Same rationale as the TLS 1.3
+    /// interop tests above: this is the one thing Hopf-to-Hopf loopback
+    /// tests structurally cannot prove — that the wire format this engine
+    /// speaks is actually RFC 5246/5288-compliant, not just internally
+    /// consistent between two instances of the same new code.
+    #[test]
+    fn rustls_tls12_client_completes_handshake_against_hopf_tls12_server() {
+        let (_dir, cert_path, key_path, certified) = write_temp_pem("tls12-interop");
+        let acceptor = hopf_core::acceptor_from_pem_tls12(&cert_path, &key_path).unwrap();
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(TlsEcho { alpn_seen: Arc::new(Mutex::new(None)), ready: Arc::new(Mutex::new(false)) })
+                        as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let client_cfg = ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .expect("TLS 1.2 is a valid restricted version list")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = ClientConnection::new(Arc::new(client_cfg), server_name).unwrap();
+        let sock = StdTcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+
+        tls.write_all(b"hello-tls12").unwrap();
+        tls.flush().unwrap();
+        let mut buf = [0u8; 32];
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello-tls12");
+        assert_eq!(tls.conn.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2));
+
+        rt.shutdown();
+    }
+
+    /// As the test above, with the roles reversed: `hopf_core`'s own TLS 1.2
+    /// *client* (`connector_from_pem_tls12`) against a `rustls` server
+    /// forced to TLS 1.2 only.
+    #[test]
+    fn hopf_tls12_client_completes_handshake_against_rustls_tls12_server() {
+        let (_dir, cert_path, _key_path, certified) = write_temp_pem("tls12-interop-rev");
+
+        let certs = vec![certified.cert.der().clone()];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            certified.key_pair.serialize_der().into(),
+        );
+        let server_cfg = rustls::ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .expect("TLS 1.2 is a valid restricted version list")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(server_cfg)).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).unwrap();
+            tls.write_all(&buf[..n]).unwrap();
+            tls.flush().unwrap();
+        });
+
+        let connector = hopf_core::connector_from_pem_tls12(&cert_path).unwrap();
+        let echoed = Arc::new(Mutex::new(Vec::new()));
+        let echoed2 = Arc::clone(&echoed);
+
+        struct EchoProbe {
+            echoed: Arc<Mutex<Vec<u8>>>,
+        }
+        impl ProtocolHandler for EchoProbe {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+                endpoint.send(b"hopf-tls12-client");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.echoed.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EchoProbe { echoed: Arc::clone(&echoed2) }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+
+        for _ in 0..150 {
+            if echoed.lock().unwrap().as_slice() == b"hopf-tls12-client" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(echoed.lock().unwrap().as_slice(), b"hopf-tls12-client");
+
+        rt.shutdown();
+        server_thread.join().unwrap();
+    }
 }

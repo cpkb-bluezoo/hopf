@@ -24,7 +24,7 @@ use crate::peer_addr::PeerAddr;
 use crate::proxy_protocol::{self, ProxyHeaderOutcome};
 use crate::security::SecurityInfo;
 use crate::telemetry::TelemetryHook;
-use crate::tls::{SharedTlsAcceptor, TlsProtocolError, TlsRecordEngine, TlsRecordSink, VerifyRequest, VerifyResult};
+use crate::tls::{SharedTlsAcceptor, TlsProtocolError, TlsRecordSink, TlsVariant, VerifyRequest, VerifyResult};
 
 /// Either half of a stream-oriented connection — TCP or UNIX domain socket.
 /// `std::net::TcpStream` and `std::os::unix::net::UnixStream` don't share a
@@ -162,7 +162,7 @@ pub(crate) struct TcpConnection {
     proxy_protocol_pending: bool,
     security: SecurityInfo,
     security_notified: bool,
-    tls: Option<TlsRecordEngine>,
+    tls: Option<TlsVariant>,
     tls_acceptor: Option<SharedTlsAcceptor>,
     reactor: ReactorHandle,
     pool: Arc<BufferPool>,
@@ -1007,7 +1007,7 @@ mod tests {
     use super::*;
     use crate::handler::NopHandler;
     use crate::reactor::Reactor;
-    use crate::tls::TlsRecordEngine;
+    use crate::tls::TlsVariant;
     use std::net::TcpListener as StdTcpListener;
     use std::sync::atomic::AtomicBool;
 
@@ -1016,7 +1016,7 @@ mod tests {
     struct UnreachableConnector;
 
     impl crate::tls::TlsConnector for UnreachableConnector {
-        fn connect(&self, _server_name: &str) -> io::Result<TlsRecordEngine> {
+        fn connect(&self, _server_name: &str) -> io::Result<TlsVariant> {
             unreachable!("connector.connect must not be called without a server_name (issue #198)")
         }
     }

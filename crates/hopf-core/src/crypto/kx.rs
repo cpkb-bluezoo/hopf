@@ -2,7 +2,7 @@
 
 //! Ephemeral key agreement (X25519 + hybrid ML-KEM) via AWS-LC.
 
-use aws_lc_rs::agreement::{self, EphemeralPrivateKey, PrivateKey, UnparsedPublicKey, X25519};
+use aws_lc_rs::agreement::{self, EphemeralPrivateKey, PrivateKey, UnparsedPublicKey, ECDH_P256, X25519};
 use aws_lc_rs::error::{KeyRejected, Unspecified};
 use aws_lc_rs::kem::{self, ML_KEM_768};
 use bytes::{Bytes, BytesMut};
@@ -90,6 +90,44 @@ impl EphemeralKeyPair {
     /// ECDH shared secret (consumes this key pair).
     pub fn agree(self, peer_public: &[u8]) -> Result<Bytes, Unspecified> {
         let peer = UnparsedPublicKey::new(&X25519, peer_public);
+        let mut out = vec![0u8; 32];
+        agreement::agree_ephemeral(self.private, &peer, Unspecified, |secret| {
+            if secret.len() != 32 {
+                return Err(Unspecified);
+            }
+            out.copy_from_slice(secret);
+            Ok(())
+        })?;
+        Ok(Bytes::from(out))
+    }
+}
+
+/// Ephemeral NIST P-256 key pair (TLS 1.2 ECDHE — RFC 8422; TLS 1.3 doesn't
+/// use this curve, only classical/hybrid X25519 above). Public key is the
+/// uncompressed point encoding (`0x04 || X || Y`, 65 bytes) — the exact
+/// `ECPoint` wire format TLS 1.2's `ServerECDHParams`/`ClientECDHParams`
+/// use, no re-encoding needed.
+pub struct EphemeralP256KeyPair {
+    private: EphemeralPrivateKey,
+    public: Bytes,
+}
+
+impl EphemeralP256KeyPair {
+    /// Generate a fresh ephemeral key pair.
+    pub fn generate() -> Result<Self, Unspecified> {
+        let private = EphemeralPrivateKey::generate(&ECDH_P256, &aws_lc_rs::rand::SystemRandom::new())?;
+        let public = Bytes::copy_from_slice(private.compute_public_key()?.as_ref());
+        Ok(Self { private, public })
+    }
+
+    /// Uncompressed point public key bytes (65 bytes: `0x04 || X || Y`).
+    pub fn public_key(&self) -> &[u8] {
+        &self.public
+    }
+
+    /// ECDH shared secret (X coordinate only, per RFC 8422 §5.10 — consumes this key pair).
+    pub fn agree(self, peer_public: &[u8]) -> Result<Bytes, Unspecified> {
+        let peer = UnparsedPublicKey::new(&ECDH_P256, peer_public);
         let mut out = vec![0u8; 32];
         agreement::agree_ephemeral(self.private, &peer, Unspecified, |secret| {
             if secret.len() != 32 {
@@ -273,6 +311,20 @@ impl StaticKeyPair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p256_agree_roundtrip() {
+        let a = EphemeralP256KeyPair::generate().unwrap();
+        let b = EphemeralP256KeyPair::generate().unwrap();
+        assert_eq!(a.public_key().len(), 65);
+        assert_eq!(a.public_key()[0], 0x04);
+        let pub_b = b.public_key().to_vec();
+        let pub_a = a.public_key().to_vec();
+        let shared_a = a.agree(&pub_b).unwrap();
+        let shared_b = b.agree(&pub_a).unwrap();
+        assert_eq!(shared_a, shared_b);
+        assert_eq!(shared_a.len(), 32);
+    }
 
     #[test]
     fn x25519_agree_roundtrip() {

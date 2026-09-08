@@ -11,6 +11,7 @@ mod handshake;
 mod pem;
 mod record;
 mod sink;
+mod tls12;
 
 pub use engine::{
     HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, ServerCredentials, VerifyOverride,
@@ -22,7 +23,8 @@ pub use handshake::transport_params::{
     decode_initial_max_data, encode_initial_max_data, RememberedTransportLimits,
 };
 pub use pem::{
-    acceptor_from_pem, connector_from_pem, connector_with_verify_override, insecure_connector,
+    acceptor_from_pem, acceptor_from_pem_tls12, connector_from_pem, connector_from_pem_tls12,
+    connector_with_verify_override, insecure_connector, insecure_connector_tls12,
     public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor, SharedTlsConnector,
     TlsAcceptor, TlsConnector,
 };
@@ -31,3 +33,66 @@ pub use sink::{
     NopTlsEventSink, QuicSecrets, TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyRequest,
     VerifyResult,
 };
+pub use tls12::engine::{Config as Tls12Config, Role as Tls12Role, SUPPORTED_CIPHER_SUITES as TLS12_SUPPORTED_CIPHER_SUITES};
+pub use tls12::record::Tls12RecordEngine;
+
+/// Either TLS version's record engine — `TcpConnection` pumps whichever one
+/// its configured acceptor/connector produced through one shared surface
+/// (both engines expose the same method set and the same
+/// [`TlsRecordSink`], so this is a thin, no-behavior-of-its-own dispatch).
+pub enum TlsVariant {
+    /// TLS 1.3 (the default; every existing `hopf-core::tls::pem` helper builds this).
+    V13(TlsRecordEngine),
+    /// TLS 1.2 (legacy mail/FTPS interop; ECDHE + GCM only for now).
+    V12(Tls12RecordEngine),
+}
+
+impl TlsVariant {
+    /// Begin the handshake — client emits `ClientHello`; server waits for input.
+    pub fn start<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S) {
+        match self {
+            TlsVariant::V13(e) => e.start(sink),
+            TlsVariant::V12(e) => e.start(sink),
+        }
+    }
+
+    /// Whether the handshake has completed.
+    pub fn is_complete(&self) -> bool {
+        match self {
+            TlsVariant::V13(e) => e.is_complete(),
+            TlsVariant::V12(e) => e.is_complete(),
+        }
+    }
+
+    /// Consume raw bytes off the TCP stream.
+    pub fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, input: &mut &[u8], sink: &mut S) {
+        match self {
+            TlsVariant::V13(e) => e.feed_ciphertext(input, sink),
+            TlsVariant::V12(e) => e.feed_ciphertext(input, sink),
+        }
+    }
+
+    /// Encrypt and frame application data. Only valid once [`Self::is_complete`].
+    pub fn send_application_data<S: TlsRecordSink + ?Sized>(&mut self, plaintext: &[u8], sink: &mut S) {
+        match self {
+            TlsVariant::V13(e) => e.send_application_data(plaintext, sink),
+            TlsVariant::V12(e) => e.send_application_data(plaintext, sink),
+        }
+    }
+
+    /// Resume after chain verification (from `StorageExecutor` or inline).
+    pub fn feed_verification_result<S: TlsRecordSink + ?Sized>(&mut self, result: VerifyResult, sink: &mut S) {
+        match self {
+            TlsVariant::V13(e) => e.feed_verification_result(result, sink),
+            TlsVariant::V12(e) => e.feed_verification_result(result, sink),
+        }
+    }
+
+    /// Send a `close_notify` alert under the current epoch.
+    pub fn send_close_notify<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S) {
+        match self {
+            TlsVariant::V13(e) => e.send_close_notify(sink),
+            TlsVariant::V12(e) => e.send_close_notify(sink),
+        }
+    }
+}

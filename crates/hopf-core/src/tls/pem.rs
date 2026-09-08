@@ -18,11 +18,13 @@ use crate::crypto::trust::{public_trust_store, TrustStore};
 use super::engine::{HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials, VerifyOverride};
 use super::handshake::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS;
 use super::record::TlsRecordEngine;
+use super::tls12;
+use super::TlsVariant;
 
 /// Factory for server-side TLS engines (shared across accepts).
 pub trait TlsAcceptor: Send + Sync {
     /// Create a new server-role engine for one TCP connection.
-    fn accept(&self) -> TlsRecordEngine;
+    fn accept(&self) -> TlsVariant;
 }
 
 /// Shared acceptor handle stored on listeners / connections.
@@ -31,7 +33,7 @@ pub type SharedTlsAcceptor = Arc<dyn TlsAcceptor>;
 /// Factory for client-side TLS engines (shared across dials).
 pub trait TlsConnector: Send + Sync {
     /// Create a new client-role engine for `server_name` (SNI / cert identity).
-    fn connect(&self, server_name: &str) -> io::Result<TlsRecordEngine>;
+    fn connect(&self, server_name: &str) -> io::Result<TlsVariant>;
 }
 
 /// Shared connector handle stored on dial configs / connections.
@@ -102,11 +104,11 @@ struct PemAcceptor {
 }
 
 impl TlsAcceptor for PemAcceptor {
-    fn accept(&self) -> TlsRecordEngine {
+    fn accept(&self) -> TlsVariant {
         let mut config = base_config(HandshakeRole::Server, &[]);
         config.alpn = self.alpn.clone();
         config.server = Some(self.creds.clone());
-        TlsRecordEngine::new(config)
+        TlsVariant::V13(TlsRecordEngine::new(config))
     }
 }
 
@@ -127,13 +129,13 @@ struct TrustedConnector {
 }
 
 impl TlsConnector for TrustedConnector {
-    fn connect(&self, server_name: &str) -> io::Result<TlsRecordEngine> {
+    fn connect(&self, server_name: &str) -> io::Result<TlsVariant> {
         let mut config = base_config(HandshakeRole::Client, &[]);
         config.alpn = self.alpn.clone();
         config.server_name = Some(server_name.to_string());
         config.trust_store = self.trust_store.clone();
         config.verify_override = self.verify_override.clone();
-        Ok(TlsRecordEngine::new(config))
+        Ok(TlsVariant::V13(TlsRecordEngine::new(config)))
     }
 }
 
@@ -196,6 +198,69 @@ pub fn public_trust_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
         verify_override: None,
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// TLS 1.2 — explicit legacy interop only (RFC 5246, ECDHE + GCM). Callers
+// dial these deliberately for a known-legacy target; there's no opportunistic
+// version fallback from the TLS 1.3 path above (see crypto-migration-plan.md
+// Phase 5's "explicit connector, not negotiated fallback" scope note).
+// ---------------------------------------------------------------------------
+
+struct PemAcceptorTls12 {
+    creds: ServerCredentials,
+}
+
+impl TlsAcceptor for PemAcceptorTls12 {
+    fn accept(&self) -> TlsVariant {
+        let config = tls12::engine::Config {
+            role: tls12::engine::Role::Server,
+            server_name: None,
+            server: Some(self.creds.clone()),
+            trust_store: None,
+        };
+        TlsVariant::V12(tls12::record::Tls12RecordEngine::new(config))
+    }
+}
+
+/// Build a TLS 1.2 [`SharedTlsAcceptor`] from PEM cert-chain and PKCS#8 key
+/// files — RSA or ECDSA P-256/P-384 only (see `tls12::engine`'s module doc).
+pub fn acceptor_from_pem_tls12(cert_path: &Path, key_path: &Path) -> io::Result<SharedTlsAcceptor> {
+    let creds = server_credentials_from_pem(cert_path, key_path)?;
+    Ok(Arc::new(PemAcceptorTls12 { creds }))
+}
+
+struct TrustedConnectorTls12 {
+    trust_store: Option<TrustStore>,
+}
+
+impl TlsConnector for TrustedConnectorTls12 {
+    fn connect(&self, server_name: &str) -> io::Result<TlsVariant> {
+        let config = tls12::engine::Config {
+            role: tls12::engine::Role::Client,
+            server_name: Some(server_name.to_string()),
+            server: None,
+            trust_store: self.trust_store.clone(),
+        };
+        Ok(TlsVariant::V12(tls12::record::Tls12RecordEngine::new(config)))
+    }
+}
+
+/// Build a TLS 1.2 [`SharedTlsConnector`] that trusts the given PEM CA / leaf
+/// cert file.
+pub fn connector_from_pem_tls12(ca_path: &Path) -> io::Result<SharedTlsConnector> {
+    let mut trust = TrustStore::new();
+    for cert in load_certs(ca_path)? {
+        trust.add_anchor(cert);
+    }
+    Ok(Arc::new(TrustedConnectorTls12 { trust_store: Some(trust) }))
+}
+
+/// TLS 1.2 analogue of [`insecure_connector`] — accepts any certificate, for
+/// opportunistic legacy STARTTLS where encryption without authentication is
+/// still strictly better than plaintext.
+pub fn insecure_connector_tls12() -> SharedTlsConnector {
+    Arc::new(TrustedConnectorTls12 { trust_store: None })
 }
 
 #[cfg(test)]

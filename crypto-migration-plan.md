@@ -9,7 +9,7 @@ It complements the status tables in
 describe *what* is shipped vs planned; this file describes *how* to get there.
 Phase 0 touchpoints and seams: `[crypto-migration-inventory.md](crypto-migration-inventory.md)`.
 
-**Status:** Phase 4 complete — TLS record layer, `TcpConnection`/`hopf-tls` cutover, and public WebPKI/native roots (`hopf-core::crypto::trust::public_trust_store`), all verified against `rustls` and real public CA chains as independent peers (see Phase 4 for the real interop bugs this caught and fixed — several affected `hopf-quic` too, sharing the same key schedule and trust store). Deferred: external OpenSSL/quic-go interop → Phase 2; conformance row flip → Phase 8. Next: TLS 1.2 (Phase 5) or DTLS (Phase 6).
+**Status:** Phase 5 (TLS 1.2 ECDHE+GCM, RFC 5246/5288) complete — separate FSM from the TLS 1.3 engine, dispatched via a new `TlsVariant` enum in `TcpConnection`; verified against `rustls` forced to TLS-1.2-only as an independent peer, both directions. Deferred within Phase 5: CBC suites (timing-side-channel history — own pass), session resumption, client certs, live mail/FTPS/legacy-server interop. Phase 4 (TLS record layer, `TcpConnection`/`hopf-tls` cutover, public WebPKI/native roots) remains complete — see its writeup below for the real interop bugs it caught (several affected `hopf-quic` too, sharing the same key schedule and trust store). Deferred: external OpenSSL/quic-go interop → Phase 2; conformance row flip → Phase 8. Next: DTLS (Phase 6), or the deferred TLS 1.2 CBC/resumption work.
 
 ---
 
@@ -506,9 +506,15 @@ Also fixed while chasing the above: `ServerHello.legacy_session_id_echo` was alw
 
 ### Phase 5 — TLS 1.2
 
-- [ ] Full 1.2 handshake + CBC/GCM record handling (AWS-LC for crypto).
-- [ ] Session resumption; renegotiation disabled.
-- [ ] **Tests:** mail client interop, FTPS, legacy TLS 1.2 servers.
+- [x] Full 1.2 ECDHE handshake + GCM record handling (AWS-LC for crypto). CBC deferred (see below).
+- [ ] Session resumption; renegotiation disabled (renegotiation is out of scope by design, not deferred — TLS 1.2 renegotiation has its own CVE history and this is a legacy-interop-only path).
+- [x] **Tests:** real interop against `rustls` forced to TLS-1.2-only, both directions (Hopf server / rustls client and rustls server / Hopf client) — same methodology that found 7 bugs in Phase 4. Deferred: live mail client / FTPS / legacy-server interop (see below).
+
+`hopf-core::tls::tls12` (new module: `messages.rs`, `engine.rs`, `record.rs`) is a fully separate FSM and cipher-suite set from the TLS 1.3 engine, deliberately not sharing code — TLS 1.2's `Certificate` framing and record layer differ structurally enough that unifying them wasn't worth the coupling. Cipher suites: `ECDHE_ECDSA`/`ECDHE_RSA` × `AES128/256_GCM_SHA256/384` (RFC 5289) — no static-RSA key exchange (preserves forward secrecy), no CBC suites yet, no client certificates. `TcpConnection` now dispatches through a `TlsVariant` enum (`V13`/`V12`) added to `hopf-core::tls`, since both engines' record-layer sink traits turned out to be identical in shape — no duplicate connection-layer plumbing needed. New PEM helpers: `acceptor_from_pem_tls12`, `connector_from_pem_tls12`, `insecure_connector_tls12`.
+
+Unlike every prior phase, the real `rustls` interop tests (`crates/hopf-tls/src/lib.rs::integration_tests`, `rustls_tls12_client_completes_handshake_against_hopf_tls12_server` and the reverse direction) passed on the first run — no protocol bugs surfaced. The two ASN.1/DER bugs actually found during this phase (RSA `SubjectPublicKeyInfo` extraction reading the wrong byte after `read_tlv` had already stripped the tag; `rcgen::RemoteKeyPair::public_key()` needing the bare `RSAPublicKey` DER rather than a full SPKI) were caught by the RSA-server-cert engine test before interop, not by rustls itself.
+
+**Explicitly deferred, not started:** CBC cipher suites (flagged in `tls12/engine.rs`'s module doc — MAC-then-encrypt CBC has a real timing-side-channel history, Lucky Thirteen and friends, and deserves its own dedicated pass rather than being bolted on alongside GCM); session resumption (session-ID caching); client certificates; and live interop tests against an actual mail client, FTPS client, or legacy TLS 1.2 server in the wild (only `rustls`-as-peer interop is done so far).
 
 
 

@@ -76,11 +76,13 @@ pub use service::Service;
 pub use storage::{StorageConfig, StorageError, StorageExecutor};
 pub use telemetry::{NopTelemetry, TelemetryHook};
 pub use tls::{
-    acceptor_from_pem, connector_from_pem, connector_with_verify_override, insecure_connector,
+    acceptor_from_pem, acceptor_from_pem_tls12, connector_from_pem, connector_from_pem_tls12,
+    connector_with_verify_override, insecure_connector, insecure_connector_tls12,
     public_trust_connector, server_credentials_from_pem, HandshakeConfig, HandshakeEngine,
     HandshakeMode, HandshakeRole, NopTlsEventSink, QuicSecrets, SharedTlsAcceptor,
-    SharedTlsConnector, TlsAcceptor, TlsConnector, TlsEventSink, TlsProtocolError, TlsTimerKind,
-    VerifyOverride, VerifyRequest, VerifyResult,
+    SharedTlsConnector, Tls12Config, Tls12Role, TlsAcceptor, TlsConnector, TlsEventSink,
+    TlsProtocolError, TlsTimerKind, TlsVariant, VerifyOverride, VerifyRequest, VerifyResult,
+    TLS12_SUPPORTED_CIPHER_SUITES,
 };
 pub use udp::UdpDatagramHandler;
 

@@ -56,7 +56,10 @@ pub fn hash(algorithm: HashAlgorithm, data: &[u8]) -> Digest {
     ))
 }
 
-/// Incremental SHA-256 hasher (DKIM body hash, streaming canonicalization).
+/// Incremental SHA-256 hasher (DKIM body hash, streaming canonicalization;
+/// also usable as a running SHA-256/384 transcript hash, e.g. TLS 1.2's
+/// `Finished` — see [`Self::new`]'s `algorithm` parameter).
+#[derive(Clone)]
 pub struct Sha256Context {
     inner: digest::Context,
     algorithm: HashAlgorithm,
