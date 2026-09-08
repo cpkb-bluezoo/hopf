@@ -2,7 +2,7 @@
 
 //! LDAPMessage encode helpers (bind / search / unbind).
 
-use crate::asn1::BerEncoder;
+use crate::BerEncoder;
 
 use super::filter::encode_filter;
 use super::types::{
@@ -88,7 +88,7 @@ pub fn encode_extended_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asn1::{Asn1Type, BerDecoder};
+    use crate::{Asn1Type, BerDecoder};
     use crate::client::types::{SearchScope, APP_BIND_RESPONSE};
 
     #[test]

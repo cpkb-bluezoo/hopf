@@ -31,6 +31,7 @@ use crate::crypto::signature::{
     rsa_sign_pkcs1_sha256, rsa_verify_pkcs1_sha256, EcdsaP256PrivateKey, EcdsaP384PrivateKey, RsaPrivateKey,
     RsaPublicKeyComponents,
 };
+use crate::asn1::{parse_sequence, read_bit_string_content, read_tlv_content, strip_integer_padding};
 use crate::crypto::trust::TrustStore;
 use crate::crypto::x509::parse_certificate;
 use crate::security::SecurityInfo;
@@ -898,60 +899,14 @@ fn verify_ske_signature(leaf_cert_der: &[u8], sig_hash: u8, sig_alg: u8, message
 /// `RSAPublicKey ::= SEQUENCE { modulus, publicExponent }` inner BIT STRING.
 fn rsa_n_e_from_spki(spki_der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     // SubjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey BIT STRING }
-    // `read_tlv` already strips each element's own tag+length, so `bit_string`
-    // below is the BIT STRING's raw content (unused-bits count byte + data) —
-    // not a fresh TLV to re-parse a length out of.
-    let outer = read_sequence(spki_der)?;
-    let (_alg, rest) = read_tlv(outer)?;
-    let (bit_string, _) = read_tlv(rest)?;
-    // First byte of BIT STRING content is the unused-bits count (0 here).
-    let rsa_pub = bit_string.get(1..)?;
-    let inner = read_sequence(rsa_pub)?;
-    let (modulus, rest) = read_tlv(inner)?;
-    let (exponent, _) = read_tlv(rest)?;
-    Some((strip_int_padding(modulus).to_vec(), strip_int_padding(exponent).to_vec()))
-}
-
-fn strip_int_padding(der_integer: &[u8]) -> &[u8] {
-    // read_tlv already stripped the 0x02 tag + length; this is just the
-    // INTEGER content, which may carry a leading 0x00 pad byte.
-    if der_integer.len() > 1 && der_integer[0] == 0 {
-        &der_integer[1..]
-    } else {
-        der_integer
-    }
-}
-
-fn read_sequence(bytes: &[u8]) -> Option<&[u8]> {
-    if bytes.first() != Some(&0x30) {
-        return None;
-    }
-    let (_, body) = read_tlv_body(bytes)?;
-    Some(body)
-}
-
-/// Read one DER TLV; returns `(content, rest-of-buffer-after-this-TLV)`.
-fn read_tlv(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
-    let (len, body) = read_tlv_body(bytes)?;
-    Some((&body[..len], &body[len..]))
-}
-
-/// Read one DER TLV's length + content-start, ignoring the tag byte.
-fn read_tlv_body(bytes: &[u8]) -> Option<(usize, &[u8])> {
-    let first_len_byte = *bytes.get(1)?;
-    if first_len_byte & 0x80 == 0 {
-        Some((first_len_byte as usize, bytes.get(2..)?))
-    } else {
-        let n = (first_len_byte & 0x7f) as usize;
-        if n == 0 || n > 4 {
-            return None;
-        }
-        let mut len = 0usize;
-        for i in 0..n {
-            len = (len << 8) | *bytes.get(2 + i)? as usize;
-        }
-        Some((len, bytes.get(2 + n..)?))
-    }
+    let mut outer = parse_sequence(spki_der)?;
+    let _alg = outer.next()?;
+    let bit_string = outer.next()?;
+    let rsa_pub = read_bit_string_content(bit_string)?;
+    let mut inner = parse_sequence(rsa_pub)?;
+    let modulus = read_tlv_content(inner.next()?, 0x02)?;
+    let exponent = read_tlv_content(inner.next()?, 0x02)?;
+    Some((strip_integer_padding(modulus).to_vec(), strip_integer_padding(exponent).to_vec()))
 }
 
 fn sign_ske(signing_key_pkcs8: &[u8], message: &[u8]) -> Option<(u8, u8, Bytes)> {
@@ -1127,34 +1082,12 @@ mod tests {
     /// above), built from the `(n, e)` this module already knows how to
     /// pull out of a full SPKI via [`rsa_n_e_from_spki`].
     fn rsa_public_key_der(n: &[u8], e: &[u8]) -> Vec<u8> {
-        fn asn1_length(len: usize) -> Vec<u8> {
-            if len < 128 {
-                vec![len as u8]
-            } else if len < 256 {
-                vec![0x81, len as u8]
-            } else {
-                vec![0x82, (len >> 8) as u8, (len & 0xff) as u8]
-            }
-        }
-        fn asn1_integer(bytes: &[u8]) -> Vec<u8> {
-            let needs_pad = !bytes.is_empty() && bytes[0] & 0x80 != 0;
-            let len = bytes.len() + usize::from(needs_pad);
-            let mut out = vec![0x02u8];
-            out.extend(asn1_length(len));
-            if needs_pad {
-                out.push(0x00);
-            }
-            out.extend_from_slice(bytes);
-            out
-        }
-        let n_der = asn1_integer(n);
-        let e_der = asn1_integer(e);
-        let mut content = Vec::with_capacity(n_der.len() + e_der.len());
-        content.extend_from_slice(&n_der);
-        content.extend_from_slice(&e_der);
-        let mut out = vec![0x30u8, 0x82, (content.len() >> 8) as u8, content.len() as u8];
-        out.extend_from_slice(&content);
-        out
+        let mut encoder = crate::asn1::BerEncoder::new();
+        encoder.begin_sequence();
+        encoder.write_integer_bytes(n);
+        encoder.write_integer_bytes(e);
+        encoder.end_sequence();
+        encoder.into_bytes()
     }
 
     #[test]

@@ -4,6 +4,8 @@
 
 use bytes::Bytes;
 
+use crate::asn1::parse_sequence;
+
 use super::digest::{hash, HashAlgorithm};
 
 /// Lowercase hex SHA-256 digest of a DER certificate — used for mTLS
@@ -30,8 +32,8 @@ pub fn spki_sha256(cert_der: &[u8]) -> Option<Bytes> {
 /// Extract the DER-encoded SubjectPublicKeyInfo from an X.509 certificate.
 pub fn extract_spki(cert_der: &[u8]) -> Option<Bytes> {
     // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
-    let mut outer = parse_asn1_sequence(cert_der)?;
-    let tbs = parse_asn1_sequence(outer.next()?)?;
+    let mut outer = parse_sequence(cert_der)?;
+    let tbs = parse_sequence(outer.next()?)?;
     // TBSCertificate fields: version [0], serial, sig alg, issuer, validity,
     // subject, subjectPublicKeyInfo, ...
     let mut fields = tbs;
@@ -45,65 +47,6 @@ pub fn extract_spki(cert_der: &[u8]) -> Option<Bytes> {
     fields.skip_element()?; // validity
     fields.skip_element()?; // subject
     Some(Bytes::copy_from_slice(fields.next()?))
-}
-
-struct Asn1Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Asn1Reader<'a> {
-    fn peek_tag(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn next(&mut self) -> Option<&'a [u8]> {
-        let start = self.pos;
-        let _tag = *self.bytes.get(self.pos)?;
-        self.pos += 1;
-        let (len, hdr) = read_length(&self.bytes[self.pos..])?;
-        self.pos += hdr;
-        let end = self.pos.checked_add(len)?;
-        self.pos = end;
-        Some(&self.bytes[start..end])
-    }
-
-    fn skip_element(&mut self) -> Option<()> {
-        self.next()?;
-        Some(())
-    }
-}
-
-fn parse_asn1_sequence(bytes: &[u8]) -> Option<Asn1Reader<'_>> {
-    if bytes.first() != Some(&0x30) {
-        return None;
-    }
-    let (len, hdr) = read_length(&bytes[1..])?;
-    let content_start = 1 + hdr;
-    let content_end = content_start.checked_add(len)?;
-    if content_end > bytes.len() {
-        return None;
-    }
-    Some(Asn1Reader {
-        bytes: &bytes[content_start..content_end],
-        pos: 0,
-    })
-}
-
-fn read_length(bytes: &[u8]) -> Option<(usize, usize)> {
-    let first = *bytes.first()?;
-    if first & 0x80 == 0 {
-        return Some((first as usize, 1));
-    }
-    let count = (first & 0x7f) as usize;
-    if count == 0 || count > 4 || bytes.len() < 1 + count {
-        return None;
-    }
-    let mut len = 0usize;
-    for i in 0..count {
-        len = (len << 8) | bytes[1 + i] as usize;
-    }
-    Some((len, 1 + count))
 }
 
 #[cfg(test)]

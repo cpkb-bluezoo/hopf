@@ -2,9 +2,11 @@
 
 //! BER (Basic Encoding Rules) encoder for ASN.1 data (ITU-T X.690).
 //!
-//! This encoder produces BER-encoded data suitable for LDAP protocol
-//! messages (RFC 4511 section 5.1). It uses definite-length encoding
-//! for all elements.
+//! Definite-length, minimal-length encoding throughout, which makes this
+//! encoder's output valid DER as well as BER — the same type serves LDAP
+//! protocol messages (RFC 4511 §5.1) and DER structures (X.509, PKCS#8,
+//! ECDSA/RSA signatures) alike; see [`Self::write_integer_bytes`] for the
+//! arbitrary-precision `INTEGER` DER needs beyond LDAP's `i32`/`i64` range.
 
 use super::element::Asn1Element;
 use super::types::Asn1Type;
@@ -88,6 +90,28 @@ impl BerEncoder {
     pub fn write_integer_i64(&mut self, value: i64) {
         let bytes = encode_long(value);
         self.write_raw(u32::from(Asn1Type::INTEGER), &bytes);
+    }
+
+    /// Writes an arbitrary-precision non-negative `INTEGER` from its
+    /// big-endian unsigned byte representation — e.g. an RSA modulus or
+    /// exponent, too wide for [`Self::write_integer_i64`]. Strips
+    /// redundant leading zero bytes and adds back exactly one `0x00` pad
+    /// byte when needed so the encoding isn't misread as negative (DER
+    /// `INTEGER`s are two's-complement; a value whose top bit is set needs
+    /// an explicit zero byte to stay non-negative).
+    pub fn write_integer_bytes(&mut self, unsigned_be: &[u8]) {
+        let mut i = 0;
+        while i + 1 < unsigned_be.len() && unsigned_be[i] == 0 {
+            i += 1;
+        }
+        let body = &unsigned_be[i..];
+        let needs_pad = !body.is_empty() && body[0] & 0x80 != 0;
+        let mut value = Vec::with_capacity(body.len() + usize::from(needs_pad));
+        if needs_pad {
+            value.push(0x00);
+        }
+        value.extend_from_slice(body);
+        self.write_raw(u32::from(Asn1Type::INTEGER), &value);
     }
 
     /// Writes an enumerated value.
@@ -338,6 +362,50 @@ mod tests {
             data,
             vec![Asn1Type::INTEGER, 4, 0x12, 0x34, 0x56, 0x78]
         );
+    }
+
+    #[test]
+    fn write_integer_bytes_strips_redundant_leading_zeros() {
+        let mut encoder = BerEncoder::new();
+        encoder.write_integer_bytes(&[0x00, 0x00, 0x01]);
+        assert_eq!(encoder.to_bytes(), vec![Asn1Type::INTEGER, 1, 0x01]);
+    }
+
+    #[test]
+    fn write_integer_bytes_pads_high_bit_to_stay_non_negative() {
+        // RSA moduli routinely have a leading byte >= 0x80; DER must add a
+        // 0x00 pad so this isn't misread as a negative two's-complement value.
+        let mut encoder = BerEncoder::new();
+        encoder.write_integer_bytes(&[0xFF, 0x01]);
+        assert_eq!(encoder.to_bytes(), vec![Asn1Type::INTEGER, 3, 0x00, 0xFF, 0x01]);
+    }
+
+    #[test]
+    fn write_integer_bytes_keeps_a_single_zero_byte_for_zero() {
+        let mut encoder = BerEncoder::new();
+        encoder.write_integer_bytes(&[0x00]);
+        assert_eq!(encoder.to_bytes(), vec![Asn1Type::INTEGER, 1, 0x00]);
+    }
+
+    #[test]
+    fn write_integer_bytes_no_pad_needed() {
+        let mut encoder = BerEncoder::new();
+        encoder.write_integer_bytes(&[0x7F, 0xFF]);
+        assert_eq!(encoder.to_bytes(), vec![Asn1Type::INTEGER, 2, 0x7F, 0xFF]);
+    }
+
+    #[test]
+    fn write_integer_bytes_round_trips_through_decoder() {
+        use crate::asn1::decoder::parse_der;
+        let rsa_like_modulus: Vec<u8> = (0..=255u8).collect(); // starts with 0x00, high bit set later
+        let mut encoder = BerEncoder::new();
+        encoder.begin_sequence();
+        encoder.write_integer_bytes(&rsa_like_modulus);
+        encoder.write_integer_bytes(&[0x01, 0x00, 0x01]); // 65537
+        encoder.end_sequence();
+        let element = parse_der(&encoder.to_bytes()).unwrap();
+        assert_eq!(element.child_count(), 2);
+        assert_eq!(element.child(1).value(), Some(&[0x01, 0x00, 0x01][..]));
     }
 
     #[test]

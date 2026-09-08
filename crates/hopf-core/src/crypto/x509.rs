@@ -4,6 +4,8 @@
 
 use bytes::Bytes;
 
+use crate::asn1::{parse_sequence, read_bit_string_content, read_length, read_oid, read_tlv_content};
+
 use super::signature::ed25519_verify;
 use aws_lc_rs::signature::{
     UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, RSA_PKCS1_2048_8192_SHA256,
@@ -39,12 +41,12 @@ pub struct ParsedCertificate {
 
 /// Parse a DER X.509 certificate.
 pub fn parse_certificate(der: &[u8]) -> Option<ParsedCertificate> {
-    let mut outer = parse_asn1_sequence(der)?;
+    let mut outer = parse_sequence(der)?;
     let tbs_elem = Bytes::copy_from_slice(outer.next()?);
     let sig_alg_elem = Bytes::copy_from_slice(outer.next()?);
     let sig_bit_string = outer.next()?;
 
-    let mut tbs = parse_asn1_sequence(&tbs_elem)?;
+    let mut tbs = parse_sequence(&tbs_elem)?;
     if tbs.peek_tag()? == 0xa0 {
         tbs.skip_element()?;
     }
@@ -60,18 +62,18 @@ pub fn parse_certificate(der: &[u8]) -> Option<ParsedCertificate> {
 
     if tbs.peek_tag()? == 0xa3 {
         let ext_wrapper = tbs.next()?;
-        if let Some(ext_seq_bytes) = explicit_tag_contents(ext_wrapper, 0xa3) {
-            if let Some(mut exts) = parse_asn1_sequence(ext_seq_bytes) {
+        if let Some(ext_seq_bytes) = read_tlv_content(ext_wrapper, 0xa3) {
+            if let Some(mut exts) = parse_sequence(ext_seq_bytes) {
                 while exts.peek_tag().is_some() {
                     let ext_seq = exts.next()?;
-                    if let Some(mut ext) = parse_asn1_sequence(ext_seq) {
-                        let oid = parse_oid(ext.next()?)?;
+                    if let Some(mut ext) = parse_sequence(ext_seq) {
+                        let oid = read_oid(ext.next()?)?;
                         if ext.peek_tag() == Some(0x01) {
                             ext.skip_element()?;
                         }
                         let extn_value = ext.next()?;
                         if oid == OID_SUBJECT_ALT_NAME {
-                            dns_names = parse_subject_alt_names(octet_string_contents(extn_value)?);
+                            dns_names = parse_subject_alt_names(read_tlv_content(extn_value, 0x04)?);
                         }
                     }
                 }
@@ -80,7 +82,7 @@ pub fn parse_certificate(der: &[u8]) -> Option<ParsedCertificate> {
     }
 
     let common_name = parse_common_name(&subject_der);
-    let signature = Bytes::from(bit_string_contents(sig_bit_string)?);
+    let signature = Bytes::copy_from_slice(read_bit_string_content(sig_bit_string)?);
 
     Some(ParsedCertificate {
         der: Bytes::copy_from_slice(der),
@@ -102,33 +104,33 @@ pub fn verify_cert_signature(cert: &ParsedCertificate, issuer_spki: &[u8]) -> bo
     let Some(oid) = sig_alg_oid(&cert.sig_alg_der) else {
         return false;
     };
-    if oid.as_slice() == OID_RAW_ED25519 {
+    if oid == OID_RAW_ED25519 {
         let Some(pubkey) = ed25519_pubkey_from_spki(issuer_spki) else {
             return false;
         };
-        return ed25519_verify(&pubkey, cert.tbs_der.as_ref(), cert.signature.as_ref());
+        return ed25519_verify(pubkey, cert.tbs_der.as_ref(), cert.signature.as_ref());
     }
-    if oid.as_slice() == OID_RAW_ECDSA_SHA256 {
+    if oid == OID_RAW_ECDSA_SHA256 {
         return UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, issuer_spki)
             .verify(cert.tbs_der.as_ref(), cert.signature.as_ref())
             .is_ok();
     }
-    if oid.as_slice() == OID_RAW_ECDSA_SHA384 {
+    if oid == OID_RAW_ECDSA_SHA384 {
         return UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, issuer_spki)
             .verify(cert.tbs_der.as_ref(), cert.signature.as_ref())
             .is_ok();
     }
-    if oid.as_slice() == OID_RAW_RSA_SHA256 {
+    if oid == OID_RAW_RSA_SHA256 {
         return UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, issuer_spki)
             .verify(cert.tbs_der.as_ref(), cert.signature.as_ref())
             .is_ok();
     }
-    if oid.as_slice() == OID_RAW_RSA_SHA384 {
+    if oid == OID_RAW_RSA_SHA384 {
         return UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA384, issuer_spki)
             .verify(cert.tbs_der.as_ref(), cert.signature.as_ref())
             .is_ok();
     }
-    if oid.as_slice() == OID_RAW_RSA_SHA512 {
+    if oid == OID_RAW_RSA_SHA512 {
         return UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA512, issuer_spki)
             .verify(cert.tbs_der.as_ref(), cert.signature.as_ref())
             .is_ok();
@@ -171,29 +173,23 @@ const OID_RAW_RSA_SHA256: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0
 const OID_RAW_RSA_SHA384: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
 const OID_RAW_RSA_SHA512: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
 
-fn sig_alg_oid(sig_alg_der: &[u8]) -> Option<Vec<u8>> {
-    let mut seq = parse_asn1_sequence(sig_alg_der)?;
-    parse_oid(seq.next()?)
+fn sig_alg_oid(sig_alg_der: &[u8]) -> Option<&[u8]> {
+    let mut seq = parse_sequence(sig_alg_der)?;
+    read_oid(seq.next()?)
 }
 
 fn parse_subject_alt_names(ext_value: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
-    let Some(mut seq) = parse_asn1_sequence(ext_value) else {
+    let Some(mut seq) = parse_sequence(ext_value) else {
         return out;
     };
     while seq.peek_tag().is_some() {
         let tag = seq.peek_tag().unwrap();
         if tag == 0x82 {
             let elem = seq.next().unwrap();
-            if elem.len() >= 2 {
-                if let Some((len, hdr)) = read_length(&elem[1..]) {
-                    let start = 1 + hdr;
-                    let end = start + len;
-                    if end <= elem.len() {
-                        if let Ok(s) = std::str::from_utf8(&elem[start..end]) {
-                            out.push(s.to_string());
-                        }
-                    }
+            if let Some(name) = read_tlv_content(elem, 0x82) {
+                if let Ok(s) = std::str::from_utf8(name) {
+                    out.push(s.to_string());
                 }
             }
         } else {
@@ -204,18 +200,18 @@ fn parse_subject_alt_names(ext_value: &[u8]) -> Vec<String> {
 }
 
 fn parse_common_name(name_der: &[u8]) -> Option<String> {
-    let mut rdns = parse_asn1_sequence(name_der)?;
+    let mut rdns = parse_sequence(name_der)?;
     while rdns.peek_tag().is_some() {
         let rdn = rdns.next()?;
-        let Some(mut set) = parse_asn1_sequence(rdn) else {
+        let Some(mut set) = parse_sequence(rdn) else {
             continue;
         };
         while set.peek_tag().is_some() {
             let atv = set.next()?;
-            let Some(mut seq) = parse_asn1_sequence(atv) else {
+            let Some(mut seq) = parse_sequence(atv) else {
                 continue;
             };
-            let oid = parse_oid(seq.next()?)?;
+            let oid = read_oid(seq.next()?)?;
             let val = seq.next()?;
             if oid == [0x55, 0x04, 0x03] {
                 return std::str::from_utf8(strip_asn1_string(val))
@@ -241,7 +237,7 @@ fn strip_asn1_string(elem: &[u8]) -> &[u8] {
 }
 
 fn parse_validity(validity: &[u8]) -> Option<(u64, u64)> {
-    let mut seq = parse_asn1_sequence(validity)?;
+    let mut seq = parse_sequence(validity)?;
     let nb = seq.next()?;
     let na = seq.next()?;
     Some((parse_asn1_time(nb)?, parse_asn1_time(na)?))
@@ -299,119 +295,10 @@ fn utc_to_unix(year: i64, month: i32, day: i32, hour: i32, min: i32, sec: i32) -
     (days * 86_400 + i64::from(hour) * 3600 + i64::from(min) * 60 + i64::from(sec)) as u64
 }
 
-fn ed25519_pubkey_from_spki(spki: &[u8]) -> Option<Vec<u8>> {
-    let mut seq = parse_asn1_sequence(spki)?;
+fn ed25519_pubkey_from_spki(spki: &[u8]) -> Option<&[u8]> {
+    let mut seq = parse_sequence(spki)?;
     seq.skip_element()?;
-    bit_string_contents(seq.next()?)
-}
-
-fn parse_oid(elem: &[u8]) -> Option<Vec<u8>> {
-    if *elem.first()? != 0x06 {
-        return None;
-    }
-    let (len, hdr) = read_length(&elem[1..])?;
-    Some(elem[1 + hdr..1 + hdr + len].to_vec())
-}
-
-fn bit_string_contents(elem: &[u8]) -> Option<Vec<u8>> {
-    if *elem.first()? != 0x03 {
-        return None;
-    }
-    let (len, hdr) = read_length(&elem[1..])?;
-    let start = 1 + hdr;
-    let end = start + len;
-    if elem.len() < end || len < 1 {
-        return None;
-    }
-    Some(elem[start + 1..end].to_vec())
-}
-
-fn octet_string_contents(elem: &[u8]) -> Option<&[u8]> {
-    if *elem.first()? != 0x04 {
-        return None;
-    }
-    let (len, hdr) = read_length(&elem[1..])?;
-    let start = 1 + hdr;
-    let end = start + len;
-    if end > elem.len() {
-        return None;
-    }
-    Some(&elem[start..end])
-}
-
-fn explicit_tag_contents(elem: &[u8], expected_tag: u8) -> Option<&[u8]> {
-    if *elem.first()? != expected_tag {
-        return None;
-    }
-    let (len, hdr) = read_length(&elem[1..])?;
-    let start = 1 + hdr;
-    let end = start + len;
-    if end > elem.len() {
-        return None;
-    }
-    Some(&elem[start..end])
-}
-
-struct Asn1Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Asn1Reader<'a> {
-    fn peek_tag(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn next(&mut self) -> Option<&'a [u8]> {
-        let start = self.pos;
-        let _tag = *self.bytes.get(self.pos)?;
-        self.pos += 1;
-        let (len, hdr) = read_length(&self.bytes[self.pos..])?;
-        self.pos += hdr;
-        let end = self.pos.checked_add(len)?;
-        if end > self.bytes.len() {
-            return None;
-        }
-        self.pos = end;
-        Some(&self.bytes[start..end])
-    }
-
-    fn skip_element(&mut self) -> Option<()> {
-        self.next()?;
-        Some(())
-    }
-}
-
-fn parse_asn1_sequence(bytes: &[u8]) -> Option<Asn1Reader<'_>> {
-    if bytes.first() != Some(&0x30) {
-        return None;
-    }
-    let (len, hdr) = read_length(&bytes[1..])?;
-    let content_start = 1 + hdr;
-    let content_end = content_start.checked_add(len)?;
-    if content_end > bytes.len() {
-        return None;
-    }
-    Some(Asn1Reader {
-        bytes: &bytes[content_start..content_end],
-        pos: 0,
-    })
-}
-
-fn read_length(bytes: &[u8]) -> Option<(usize, usize)> {
-    let first = *bytes.first()?;
-    if first & 0x80 == 0 {
-        return Some((first as usize, 1));
-    }
-    let count = (first & 0x7f) as usize;
-    if count == 0 || count > 4 || bytes.len() < 1 + count {
-        return None;
-    }
-    let mut len = 0usize;
-    for i in 0..count {
-        len = (len << 8) | bytes[1 + i] as usize;
-    }
-    Some((len, 1 + count))
+    read_bit_string_content(seq.next()?)
 }
 
 #[cfg(test)]

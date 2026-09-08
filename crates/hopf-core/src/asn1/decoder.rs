@@ -1,9 +1,21 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Streaming BER (Basic Encoding Rules) decoder for ASN.1 data (ITU-T X.690).
+//! Streaming BER/DER (Basic/Distinguished Encoding Rules) decoder for ASN.1
+//! data (ITU-T X.690). Definite-length only — this already makes it
+//! DER-compatible on the read side (DER is BER restricted to definite
+//! lengths and minimal-length encoding; a conformant DER encoder never
+//! produces anything this decoder would reject).
 //!
-//! Designed for non-blocking I/O: accept data incrementally via [`BerDecoder::receive`]
-//! and retrieve complete elements via [`BerDecoder::next`].
+//! Two entry points, both built on the same incremental state machine:
+//! - [`BerDecoder::push`] is the push-parser shape used throughout this
+//!   crate (see `hopf_http::h2::H2Parser::push`/`drain`) — feed arbitrary
+//!   byte chunks from a socket and get a synchronous callback per complete
+//!   top-level element, for genuinely streamed input (LDAP messages
+//!   arriving over TCP).
+//! - [`parse_der`] is a one-shot convenience over the same machinery for
+//!   the common case of an already-fully-buffered slice (an X.509
+//!   certificate, a PKCS#8 key, a DER signature) — no callback ceremony
+//!   needed when there's only ever going to be exactly one element.
 
 use super::element::Asn1Element;
 use super::error::Asn1Error;
@@ -22,6 +34,19 @@ const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024;
 /// this; a message with deeper nesting than the encoder could ever produce
 /// is necessarily hostile.
 const MAX_DEPTH: usize = 32;
+
+/// Callback sink for [`BerDecoder::push`] — one complete top-level element
+/// per call, in the order they finished decoding.
+pub trait BerEventSink {
+    /// A complete top-level element has been decoded.
+    fn element(&mut self, element: Asn1Element);
+
+    /// The decoder hit malformed, oversized, or too-deeply-nested input and
+    /// is now stuck (matches `H2FrameHandler::frame_error`'s role: report
+    /// and let the caller decide how to close things down — the decoder
+    /// itself doesn't know about connections).
+    fn decode_error(&mut self, err: Asn1Error);
+}
 
 /// Streaming BER decoder (definite-length only).
 #[derive(Debug)]
@@ -90,7 +115,27 @@ impl BerDecoder {
         self.completed.clear();
     }
 
-    /// Receives data for decoding.
+    /// Append `data` and dispatch every complete top-level element to
+    /// `sink`, in order — the standard incremental push-parser entry point
+    /// (append, then drain complete units to callbacks; see this module's
+    /// doc comment). A decode error is reported once via
+    /// [`BerEventSink::decode_error`] and leaves the decoder in a failed
+    /// state matching `H2Parser`'s "stop dispatching on a fatal error"
+    /// behavior — reset before reusing it.
+    pub fn push(&mut self, data: &[u8], sink: &mut dyn BerEventSink) {
+        if let Err(e) = self.receive(data) {
+            sink.decode_error(e);
+            return;
+        }
+        while let Some(element) = self.next() {
+            sink.element(element);
+        }
+    }
+
+    /// Lower-level incremental accumulation: feed bytes without dispatching
+    /// — pair with [`Self::next`] to pull completed elements manually.
+    /// Prefer [`Self::push`] unless you need to interleave decoding with
+    /// other per-chunk work between elements.
     pub fn receive(&mut self, data: &[u8]) -> Result<(), Asn1Error> {
         self.compact_if_needed();
         self.buffer.extend_from_slice(data);
@@ -277,7 +322,7 @@ impl BerDecoder {
     }
 
     fn complete_element(&mut self, value: Vec<u8>) -> Result<(), Asn1Error> {
-        // LDAP tags fit in one byte; multi-byte tags are rare.
+        // LDAP/X.509 tags fit in one byte; multi-byte tags are rare.
         let tag_byte = (self.tag & 0xFF) as u8;
         let element = if Asn1Type::is_constructed(tag_byte) {
             let children = parse_children(&value, self.depth)?;
@@ -321,11 +366,37 @@ fn parse_children(data: &[u8], depth: usize) -> Result<Vec<Asn1Element>, Asn1Err
     Ok(children)
 }
 
+/// Decode exactly one complete top-level element from an already-fully-
+/// buffered slice — e.g. a DER-encoded X.509 certificate, PKCS#8 key, or
+/// signature. Trailing bytes after the element are ignored (callers that
+/// care about exactness can compare against the input length themselves).
+///
+/// This is the one-shot degenerate case of the same incremental machinery
+/// [`BerDecoder::push`] uses for genuinely streamed input — there's no
+/// separate "DER-only" parser to keep in sync, since DER is just BER
+/// restricted to definite lengths, which is all this decoder ever accepts.
+pub fn parse_der(bytes: &[u8]) -> Result<Asn1Element, Asn1Error> {
+    let mut decoder = BerDecoder::with_capacity(bytes.len().max(1));
+    // `receive` decodes eagerly through the whole buffer, so malformed
+    // trailing bytes *after* a complete element surface as an `Err` here
+    // too — but the element itself was already completed and queued
+    // before that happened, so check for it first and only propagate the
+    // error when nothing could be extracted at all.
+    let recv_result = decoder.receive(bytes);
+    if let Some(element) = decoder.next() {
+        return Ok(element);
+    }
+    recv_result?;
+    Err(Asn1Error::new("truncated DER: no complete element"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BerDecoder;
+    use super::{parse_der, BerDecoder, BerEventSink};
     use crate::asn1::encoder::BerEncoder;
+    use crate::asn1::error::Asn1Error;
     use crate::asn1::types::Asn1Type;
+    use crate::asn1::Asn1Element;
 
     #[test]
     fn decode_boolean() {
@@ -678,5 +749,91 @@ mod tests {
             Some("cn=admin,dc=example,dc=com")
         );
         assert_eq!(bind.child(2).value(), Some(b"secret".as_slice()));
+    }
+
+    // --- push() / BerEventSink ---
+
+    #[derive(Default)]
+    struct RecordingSink {
+        elements: Vec<Asn1Element>,
+        errors: Vec<String>,
+    }
+
+    impl BerEventSink for RecordingSink {
+        fn element(&mut self, element: Asn1Element) {
+            self.elements.push(element);
+        }
+        fn decode_error(&mut self, err: Asn1Error) {
+            self.errors.push(err.message().to_string());
+        }
+    }
+
+    #[test]
+    fn push_dispatches_each_complete_element_to_the_sink() {
+        let data = [0x02, 0x01, 0x01, 0x02, 0x01, 0x02];
+        let mut decoder = BerDecoder::new();
+        let mut sink = RecordingSink::default();
+        decoder.push(&data, &mut sink);
+        assert_eq!(sink.elements.len(), 2);
+        assert_eq!(sink.elements[0].as_i32().unwrap(), 1);
+        assert_eq!(sink.elements[1].as_i32().unwrap(), 2);
+        assert!(sink.errors.is_empty());
+    }
+
+    #[test]
+    fn push_across_chunks_dispatches_once_complete() {
+        let data = [0x02, 0x01, 0x2A];
+        let mut decoder = BerDecoder::new();
+        let mut sink = RecordingSink::default();
+        decoder.push(&data[0..1], &mut sink);
+        decoder.push(&data[1..2], &mut sink);
+        assert!(sink.elements.is_empty());
+        decoder.push(&data[2..3], &mut sink);
+        assert_eq!(sink.elements.len(), 1);
+        assert_eq!(sink.elements[0].as_i32().unwrap(), 42);
+    }
+
+    #[test]
+    fn push_reports_decode_error_via_sink() {
+        let data = [0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00]; // indefinite length
+        let mut decoder = BerDecoder::new();
+        let mut sink = RecordingSink::default();
+        decoder.push(&data, &mut sink);
+        assert!(sink.elements.is_empty());
+        assert_eq!(sink.errors.len(), 1);
+        assert!(sink.errors[0].contains("Indefinite length"));
+    }
+
+    // --- parse_der() ---
+
+    #[test]
+    fn parse_der_decodes_a_single_complete_buffer() {
+        let mut encoder = BerEncoder::new();
+        encoder.begin_sequence();
+        encoder.write_integer_i32(7);
+        encoder.write_octet_string_str("hi");
+        encoder.end_sequence();
+        let encoded = encoder.to_bytes();
+
+        let element = parse_der(&encoded).unwrap();
+        assert_eq!(element.tag(), Asn1Type::SEQUENCE);
+        assert_eq!(element.child(0).as_i32().unwrap(), 7);
+        assert_eq!(element.child(1).as_string().as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn parse_der_ignores_trailing_bytes() {
+        let mut encoder = BerEncoder::new();
+        encoder.write_integer_i32(1);
+        let mut encoded = encoder.to_bytes();
+        encoded.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let element = parse_der(&encoded).unwrap();
+        assert_eq!(element.as_i32().unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_der_rejects_truncated_input() {
+        let data = [0x30, 0x05, 0x02, 0x01, 0x01]; // SEQUENCE declares 5 bytes, only 3 present
+        assert!(parse_der(&data).is_err());
     }
 }

@@ -4,6 +4,7 @@
 
 use bytes::{Bytes, BytesMut};
 
+use crate::asn1::{parse_sequence, read_bit_string_content, read_oid};
 use crate::crypto::cert::extract_spki;
 use crate::crypto::signature::{
     ecdsa_p256_sha256_verify_spki, ecdsa_p256_sign, ecdsa_p384_sha384_verify_spki, ecdsa_p384_sign,
@@ -134,10 +135,10 @@ const OID_SECP384R1: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
 /// (RFC 5958) — reads just the algorithm OID (and, for EC keys, the curve OID) to
 /// classify the key; never touches the private key material itself.
 pub(crate) fn pkcs8_key_kind(pkcs8_der: &[u8]) -> Option<KeyKind> {
-    let mut outer = parse_asn1_sequence(pkcs8_der)?;
+    let mut outer = parse_sequence(pkcs8_der)?;
     let _version = outer.next()?;
     let algorithm = outer.next()?;
-    let mut algo_seq = parse_asn1_sequence(algorithm)?;
+    let mut algo_seq = parse_sequence(algorithm)?;
     let oid = read_oid(algo_seq.next()?)?;
     match oid {
         OID_ED25519 => Some(KeyKind::Ed25519),
@@ -151,82 +152,14 @@ pub(crate) fn pkcs8_key_kind(pkcs8_der: &[u8]) -> Option<KeyKind> {
     }
 }
 
-fn read_oid(tlv: &[u8]) -> Option<&[u8]> {
-    if tlv.first() != Some(&0x06) {
-        return None;
-    }
-    let (len, hdr) = read_length(&tlv[1..])?;
-    tlv.get(1 + hdr..1 + hdr + len)
-}
-
 /// Extract a 32-byte Ed25519 public key from SPKI DER.
 fn ed25519_public_key_from_spki(spki: &[u8]) -> Option<[u8; 32]> {
     // SubjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey BIT STRING }
-    let mut outer = parse_asn1_sequence(spki)?;
+    let mut outer = parse_sequence(spki)?;
     let _alg = outer.next()?;
     let bit_string = outer.next()?;
-    if bit_string.first() != Some(&0x03) {
-        return None;
-    }
-    let (len, hdr) = read_length(&bit_string[1..])?;
-    let content_start = 1 + hdr;
-    let content_end = content_start + len;
-    if bit_string.len() < content_end || len < 1 {
-        return None;
-    }
-    // First byte of BIT STRING content is unused-bits count (0 for Ed25519).
-    let key = &bit_string[content_start + 1..content_end];
+    let key = read_bit_string_content(bit_string)?;
     <[u8; 32]>::try_from(key).ok()
-}
-
-struct Asn1Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Asn1Reader<'a> {
-    fn next(&mut self) -> Option<&'a [u8]> {
-        let start = self.pos;
-        let _tag = *self.bytes.get(self.pos)?;
-        self.pos += 1;
-        let (len, hdr) = read_length(&self.bytes[self.pos..])?;
-        self.pos += hdr;
-        let end = self.pos.checked_add(len)?;
-        self.pos = end;
-        Some(&self.bytes[start..end])
-    }
-}
-
-fn parse_asn1_sequence(bytes: &[u8]) -> Option<Asn1Reader<'_>> {
-    if bytes.first() != Some(&0x30) {
-        return None;
-    }
-    let (len, hdr) = read_length(&bytes[1..])?;
-    let content_start = 1 + hdr;
-    let content_end = content_start.checked_add(len)?;
-    if content_end > bytes.len() {
-        return None;
-    }
-    Some(Asn1Reader {
-        bytes: &bytes[content_start..content_end],
-        pos: 0,
-    })
-}
-
-fn read_length(bytes: &[u8]) -> Option<(usize, usize)> {
-    let first = *bytes.first()?;
-    if first & 0x80 == 0 {
-        return Some((first as usize, 1));
-    }
-    let count = (first & 0x7f) as usize;
-    if count == 0 || count > 4 || bytes.len() < 1 + count {
-        return None;
-    }
-    let mut len = 0usize;
-    for i in 0..count {
-        len = (len << 8) | bytes[1 + i] as usize;
-    }
-    Some((len, 1 + count))
 }
 
 #[cfg(test)]

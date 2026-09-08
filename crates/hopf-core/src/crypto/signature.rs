@@ -275,44 +275,14 @@ pub fn rsa_dnskey_to_spki_der(public_key: &[u8]) -> Option<Vec<u8>> {
     if modulus.is_empty() || exponent.is_empty() {
         return None;
     }
-    let mod_der = asn1_integer(modulus);
-    let exp_der = asn1_integer(exponent);
-    let content_len = mod_der.len() + exp_der.len();
-    let mut der = Vec::with_capacity(4 + content_len);
-    der.push(0x30);
-    der.extend(asn1_length(content_len));
-    der.extend_from_slice(&mod_der);
-    der.extend_from_slice(&exp_der);
-    Some(der)
+    let mut encoder = crate::asn1::BerEncoder::new();
+    encoder.begin_sequence();
+    encoder.write_integer_bytes(modulus);
+    encoder.write_integer_bytes(exponent);
+    encoder.end_sequence();
+    Some(encoder.into_bytes())
 }
 
-fn asn1_integer(bytes: &[u8]) -> Vec<u8> {
-    let mut i = 0;
-    while i + 1 < bytes.len() && bytes[i] == 0 {
-        i += 1;
-    }
-    let body = &bytes[i..];
-    let needs_pad = !body.is_empty() && body[0] & 0x80 != 0;
-    let mut out = Vec::with_capacity(2 + body.len() + usize::from(needs_pad));
-    out.push(0x02);
-    let len = body.len() + usize::from(needs_pad);
-    out.extend(asn1_length(len));
-    if needs_pad {
-        out.push(0x00);
-    }
-    out.extend_from_slice(body);
-    out
-}
-
-fn asn1_length(len: usize) -> Vec<u8> {
-    if len < 128 {
-        vec![len as u8]
-    } else if len < 256 {
-        vec![0x81, len as u8]
-    } else {
-        vec![0x82, (len >> 8) as u8, (len & 0xff) as u8]
-    }
-}
 
 #[cfg(test)]
 mod tests {

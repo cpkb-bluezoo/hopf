@@ -231,7 +231,9 @@ pub fn verify_dane_chain(records: &[TlsaRecord], chain: &[hopf_core::Bytes], ser
 fn selected_data(selector: TlsaSelector, cert_der: &[u8]) -> Option<Vec<u8>> {
     match selector {
         TlsaSelector::FullCertificate => Some(cert_der.to_vec()),
-        TlsaSelector::SubjectPublicKeyInfo => extract_spki(cert_der),
+        TlsaSelector::SubjectPublicKeyInfo => {
+            hopf_core::crypto::cert::extract_spki(cert_der).map(|spki| spki.to_vec())
+        }
         TlsaSelector::Unassigned(_) => None,
     }
 }
@@ -272,69 +274,10 @@ pub fn compute_association_data(
     hash_selected_data(matching_type, &selected)
 }
 
-/// Read one DER TLV (tag, value, and the offset just past it) at `buf[pos]`.
-/// Definite-length form only (short or long) — X.509 certificates never use
-/// indefinite length.
-fn read_tlv(buf: &[u8], pos: usize) -> Option<(u8, &[u8], usize)> {
-    let tag = *buf.get(pos)?;
-    let len_byte = *buf.get(pos + 1)?;
-    let (len, header_len) = if len_byte & 0x80 == 0 {
-        (len_byte as usize, 2)
-    } else {
-        let n = (len_byte & 0x7F) as usize;
-        if n == 0 || n > 4 {
-            return None; // indefinite length, or a length too large to fit usize sanely
-        }
-        let mut len = 0usize;
-        for i in 0..n {
-            len = (len << 8) | (*buf.get(pos + 2 + i)? as usize);
-        }
-        (len, 2 + n)
-    };
-    let start = pos.checked_add(header_len)?;
-    let end = start.checked_add(len)?;
-    let value = buf.get(start..end)?;
-    Some((tag, value, end))
-}
-
-/// Extract the DER-encoded `SubjectPublicKeyInfo` from an X.509
-/// certificate (RFC 5280 §4.1): `Certificate ::= SEQUENCE { tbsCertificate,
-/// signatureAlgorithm, signatureValue }`; within `TBSCertificate`, skip the
-/// optional `[0] version`, then `serialNumber`, `signature`, `issuer`,
-/// `validity`, `subject` to reach `subjectPublicKeyInfo`.
-fn extract_spki(cert_der: &[u8]) -> Option<Vec<u8>> {
-    const SEQUENCE: u8 = 0x30;
-    const CONTEXT_CONSTRUCTED_0: u8 = 0xA0;
-
-    let (tag, cert_body, _) = read_tlv(cert_der, 0)?;
-    if tag != SEQUENCE {
-        return None;
-    }
-    let (tag, tbs, _) = read_tlv(cert_body, 0)?;
-    if tag != SEQUENCE {
-        return None;
-    }
-
-    let mut pos = 0;
-    if tbs.first().copied() == Some(CONTEXT_CONSTRUCTED_0) {
-        let (_, _, next) = read_tlv(tbs, pos)?;
-        pos = next;
-    }
-    // serialNumber, signature, issuer, validity, subject.
-    for _ in 0..5 {
-        let (_, _, next) = read_tlv(tbs, pos)?;
-        pos = next;
-    }
-    let (tag, _, end) = read_tlv(tbs, pos)?;
-    if tag != SEQUENCE {
-        return None;
-    }
-    Some(tbs[pos..end].to_vec())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hopf_core::crypto::cert::extract_spki;
 
     fn test_cert() -> CertificateDer<'static> {
         let cert = rcgen::generate_simple_self_signed(vec!["dane.example".to_string()]).unwrap();
@@ -347,11 +290,12 @@ mod tests {
         let spki = extract_spki(cert.as_ref()).expect("should extract an SPKI");
         // SubjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey (BIT STRING) }
         assert_eq!(spki[0], 0x30, "SPKI must be a SEQUENCE");
-        let (tag, alg, next) = read_tlv(&spki, 2).unwrap();
-        assert_eq!(tag, 0x30, "AlgorithmIdentifier must be a SEQUENCE");
-        assert!(!alg.is_empty());
-        let (tag, _, _) = read_tlv(&spki, next).unwrap();
-        assert_eq!(tag, 0x03, "subjectPublicKey must be a BIT STRING");
+        let mut seq = hopf_core::asn1::parse_sequence(&spki).unwrap();
+        let alg = seq.next().unwrap();
+        assert_eq!(alg[0], 0x30, "AlgorithmIdentifier must be a SEQUENCE");
+        assert!(alg.len() > 2);
+        let subject_public_key = seq.next().unwrap();
+        assert_eq!(subject_public_key[0], 0x03, "subjectPublicKey must be a BIT STRING");
     }
 
     #[test]
@@ -363,7 +307,7 @@ mod tests {
         // several in tbsCertificate).
         assert!(spki.len() < cert.as_ref().len());
         assert!(
-            cert.as_ref().windows(spki.len()).any(|w| w == spki.as_slice()),
+            cert.as_ref().windows(spki.len()).any(|w| w == spki.as_ref()),
             "extracted SPKI bytes must appear verbatim in the certificate"
         );
     }

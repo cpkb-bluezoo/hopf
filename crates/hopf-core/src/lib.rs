@@ -15,6 +15,7 @@
 #![warn(missing_docs)]
 
 pub mod acl;
+pub mod asn1;
 pub mod binding;
 pub mod bufpool;
 pub mod composition;

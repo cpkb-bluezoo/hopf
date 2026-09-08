@@ -3,60 +3,28 @@
 //! Minimal DER reader for the one shape DKIM needs: an X.509
 //! `SubjectPublicKeyInfo` wrapping an RSA `RSAPublicKey`, as published by
 //! DNS `p=` (untrusted input — no panics, every length is bounds-checked).
+//! Built on [`hopf_core::asn1`]'s shared zero-copy DER reader; only the
+//! DKIM-specific "unused-bits count must be exactly zero" check (stricter
+//! than that shared reader — reasonable here since `p=` is attacker-
+//! controlled DNS content) stays local.
+
+use hopf_core::asn1::{parse_sequence, read_tlv_content, strip_integer_padding};
 
 /// Extract `(modulus, exponent)` big-endian bytes (leading `0x00` sign byte
 /// stripped) from a DER-encoded RSA `SubjectPublicKeyInfo`.
 pub fn parse_rsa_spki(der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
-    let (spki, _) = read_tlv(der, 0, 0x30)?;
-    let (_alg_id, after_alg) = read_tlv(spki, 0, 0x30)?;
-    let (bitstring, _) = read_tlv(spki, after_alg, 0x03)?;
+    let mut outer = parse_sequence(der).ok_or(())?;
+    let _alg_id = outer.next().ok_or(())?;
+    let bitstring_tlv = outer.next().ok_or(())?;
+    let bitstring = read_tlv_content(bitstring_tlv, 0x03).ok_or(())?;
     if bitstring.is_empty() || bitstring[0] != 0 {
         return Err(());
     }
     let rsa_pub = &bitstring[1..];
-    let (inner, _) = read_tlv(rsa_pub, 0, 0x30)?;
-    let (n, after_n) = read_tlv(inner, 0, 0x02)?;
-    let (e, _) = read_tlv(inner, after_n, 0x02)?;
-    Ok((strip_leading_zero(n), strip_leading_zero(e)))
-}
-
-fn strip_leading_zero(b: &[u8]) -> Vec<u8> {
-    if b.len() > 1 && b[0] == 0 {
-        b[1..].to_vec()
-    } else {
-        b.to_vec()
-    }
-}
-
-/// Read one TLV starting at `pos`, requiring `tag`. Returns `(content, pos_after)`.
-fn read_tlv(data: &[u8], pos: usize, tag: u8) -> Result<(&[u8], usize), ()> {
-    if pos >= data.len() || data[pos] != tag {
-        return Err(());
-    }
-    let mut i = pos + 1;
-    if i >= data.len() {
-        return Err(());
-    }
-    let len_byte = data[i];
-    i += 1;
-    let len = if len_byte & 0x80 == 0 {
-        len_byte as usize
-    } else {
-        let n = (len_byte & 0x7f) as usize;
-        if n == 0 || n > 4 || i + n > data.len() {
-            return Err(());
-        }
-        let mut l: usize = 0;
-        for k in 0..n {
-            l = (l << 8) | data[i + k] as usize;
-        }
-        i += n;
-        l
-    };
-    if i + len > data.len() {
-        return Err(());
-    }
-    Ok((&data[i..i + len], i + len))
+    let mut inner = parse_sequence(rsa_pub).ok_or(())?;
+    let n = read_tlv_content(inner.next().ok_or(())?, 0x02).ok_or(())?;
+    let e = read_tlv_content(inner.next().ok_or(())?, 0x02).ok_or(())?;
+    Ok((strip_integer_padding(n).to_vec(), strip_integer_padding(e).to_vec()))
 }
 
 #[cfg(test)]
