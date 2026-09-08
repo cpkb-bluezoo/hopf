@@ -29,6 +29,8 @@ pub enum MessageType {
     ClientKeyExchange = 16,
     /// Finished.
     Finished = 20,
+    /// NewSessionTicket (RFC 5077 §3.3).
+    NewSessionTicket = 4,
 }
 
 impl MessageType {
@@ -37,6 +39,7 @@ impl MessageType {
         match b {
             1 => Some(Self::ClientHello),
             2 => Some(Self::ServerHello),
+            4 => Some(Self::NewSessionTicket),
             11 => Some(Self::Certificate),
             12 => Some(Self::ServerKeyExchange),
             14 => Some(Self::ServerHelloDone),
@@ -60,6 +63,9 @@ pub mod ext {
     /// Renegotiation Indication (RFC 5746) — empty on an initial handshake;
     /// renegotiation itself is out of scope (see crypto-migration-plan.md).
     pub const RENEGOTIATION_INFO: u16 = 0xff01;
+    /// SessionTicket (RFC 5077 §3.2) — empty to advertise support, or the
+    /// opaque ticket bytes to attempt resumption.
+    pub const SESSION_TICKET: u16 = 35;
 }
 
 /// `SignatureAndHashAlgorithm` (RFC 5246 §7.4.1.4.1) — the legacy 1-byte/1-byte
@@ -108,6 +114,11 @@ pub struct ClientHelloParams<'a> {
     pub cipher_suites: &'a [u16],
     /// SNI hostname, if any.
     pub server_name: Option<&'a str>,
+    /// `SessionTicket` extension to send: `None` omits the extension
+    /// entirely; `Some(&[])` advertises support with no ticket to offer;
+    /// `Some(ticket_bytes)` attempts resumption with a cached ticket (RFC
+    /// 5077 §3.2/§3.4).
+    pub session_ticket: Option<&'a [u8]>,
 }
 
 /// Build a TLS 1.2 `ClientHello`.
@@ -155,6 +166,9 @@ pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
         sni.extend_from_slice(host);
         push_extension(&mut extensions, ext::SERVER_NAME, &sni);
     }
+    if let Some(ticket) = params.session_ticket {
+        push_extension(&mut extensions, ext::SESSION_TICKET, ticket);
+    }
 
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
@@ -189,6 +203,9 @@ pub struct ParsedClientHello {
     pub signature_algorithms: Vec<(u8, u8)>,
     /// SNI hostname, if sent.
     pub server_name: Option<String>,
+    /// `SessionTicket` extension contents, if the client sent one: empty
+    /// bytes means "support, no ticket"; non-empty is a resumption attempt.
+    pub session_ticket: Option<Bytes>,
 }
 
 /// Parse a `ClientHello` body.
@@ -228,6 +245,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
 
     let mut signature_algorithms = Vec::new();
     let mut server_name = None;
+    let mut session_ticket = None;
     if i + 2 <= body.len() {
         let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
         i += 2;
@@ -260,6 +278,9 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
                             }
                         }
                     }
+                    ext::SESSION_TICKET => {
+                        session_ticket = Some(Bytes::copy_from_slice(data));
+                    }
                     _ => {}
                 }
                 k += el;
@@ -273,11 +294,17 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
         cipher_suites,
         signature_algorithms,
         server_name,
+        session_ticket,
     })
 }
 
-/// Build a TLS 1.2 `ServerHello`.
-pub fn build_server_hello(random: &[u8; 32], session_id: &[u8], cipher_suite: u16) -> Bytes {
+/// Build a TLS 1.2 `ServerHello`. `session_ticket` echoes RFC 5077 §3.2's
+/// empty `SessionTicket` extension — the server MUST send it here for a
+/// client to know to expect a `NewSessionTicket` message in this same
+/// handshake; without it, a spec-conformant client (verified against
+/// `rustls`) treats an unadvertised `NewSessionTicket` as a protocol
+/// violation (it's waiting for `ChangeCipherSpec` at that point instead).
+pub fn build_server_hello(random: &[u8; 32], session_id: &[u8], cipher_suite: u16, session_ticket: bool) -> Bytes {
     let mut body = BytesMut::new();
     body.extend_from_slice(&0x0303u16.to_be_bytes());
     body.extend_from_slice(random);
@@ -289,6 +316,9 @@ pub fn build_server_hello(random: &[u8; 32], session_id: &[u8], cipher_suite: u1
     let mut extensions = BytesMut::new();
     push_extension(&mut extensions, ext::RENEGOTIATION_INFO, &[0]);
     push_extension(&mut extensions, ext::EC_POINT_FORMATS, &[1, EC_POINT_FORMAT_UNCOMPRESSED]);
+    if session_ticket {
+        push_extension(&mut extensions, ext::SESSION_TICKET, &[]);
+    }
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
     encode_message(MessageType::ServerHello, &body)
@@ -303,6 +333,10 @@ pub struct ParsedServerHello {
     pub session_id: Bytes,
     /// Selected cipher suite.
     pub cipher_suite: u16,
+    /// Whether the server echoed the (empty) `SessionTicket` extension —
+    /// RFC 5077 §3.2's signal that a `NewSessionTicket` message follows
+    /// later in this same handshake.
+    pub session_ticket_offered: bool,
 }
 
 /// Parse a `ServerHello` body.
@@ -322,7 +356,32 @@ pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
     let session_id = Bytes::copy_from_slice(&body[i..i + sid_len]);
     i += sid_len;
     let cipher_suite = u16::from_be_bytes([body[i], body[i + 1]]);
-    Some(ParsedServerHello { random, session_id, cipher_suite })
+    i += 2;
+    i += 1; // compression_method
+
+    let mut session_ticket_offered = false;
+    if i + 2 <= body.len() {
+        let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        i += 2;
+        if body.len() >= i + ext_len {
+            let ext_block = &body[i..i + ext_len];
+            let mut k = 0;
+            while k + 4 <= ext_block.len() {
+                let et = u16::from_be_bytes([ext_block[k], ext_block[k + 1]]);
+                let el = u16::from_be_bytes([ext_block[k + 2], ext_block[k + 3]]) as usize;
+                k += 4;
+                if k + el > ext_block.len() {
+                    break;
+                }
+                if et == ext::SESSION_TICKET {
+                    session_ticket_offered = true;
+                }
+                k += el;
+            }
+        }
+    }
+
+    Some(ParsedServerHello { random, session_id, cipher_suite, session_ticket_offered })
 }
 
 /// Build a `Certificate` message (RFC 5246 §7.4.2 — no per-entry extensions,
@@ -459,6 +518,29 @@ pub fn build_finished(verify_data: &[u8]) -> Bytes {
     encode_message(MessageType::Finished, verify_data)
 }
 
+/// Build a `NewSessionTicket` message (RFC 5077 §3.3):
+/// `uint32 ticket_lifetime_hint; opaque ticket<0..2^16-1>;`
+pub fn build_new_session_ticket(lifetime_hint: u32, ticket: &[u8]) -> Bytes {
+    let mut body = BytesMut::with_capacity(4 + 2 + ticket.len());
+    body.extend_from_slice(&lifetime_hint.to_be_bytes());
+    body.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+    body.extend_from_slice(ticket);
+    encode_message(MessageType::NewSessionTicket, &body)
+}
+
+/// Parse a `NewSessionTicket` body into `(lifetime_hint, ticket)`.
+pub fn parse_new_session_ticket(body: &[u8]) -> Option<(u32, Bytes)> {
+    if body.len() < 6 {
+        return None;
+    }
+    let lifetime_hint = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    let ticket_len = u16::from_be_bytes([body[4], body[5]]) as usize;
+    if body.len() < 6 + ticket_len {
+        return None;
+    }
+    Some((lifetime_hint, Bytes::copy_from_slice(&body[6..6 + ticket_len])))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +552,7 @@ mod tests {
             session_id: &[],
             cipher_suites: &[0xC02F, 0xC030],
             server_name: Some("example.test"),
+            session_ticket: None,
         };
         let wire = build_client_hello(&params);
         // 1-byte type + 3-byte length header.
@@ -484,11 +567,24 @@ mod tests {
 
     #[test]
     fn server_hello_round_trip() {
-        let wire = build_server_hello(&[9u8; 32], &[1, 2, 3], 0xC02F);
+        let wire = build_server_hello(&[9u8; 32], &[1, 2, 3], 0xC02F, false);
         let parsed = parse_server_hello(&wire[4..]).expect("parse");
         assert_eq!(parsed.random, [9u8; 32]);
         assert_eq!(parsed.session_id.as_ref(), &[1, 2, 3]);
         assert_eq!(parsed.cipher_suite, 0xC02F);
+        assert!(!parsed.session_ticket_offered);
+    }
+
+    #[test]
+    fn server_hello_session_ticket_extension_round_trips() {
+        // RFC 5077 §3.2: a client can only expect a `NewSessionTicket`
+        // message later in this handshake if the server echoed this
+        // extension here — a real `rustls` client rejects an unadvertised
+        // one as a protocol violation (it's waiting for `ChangeCipherSpec`
+        // at that point instead), so this bit has to round-trip exactly.
+        let wire = build_server_hello(&[9u8; 32], &[], 0xC02F, true);
+        let parsed = parse_server_hello(&wire[4..]).expect("parse");
+        assert!(parsed.session_ticket_offered);
     }
 
     #[test]
@@ -519,5 +615,57 @@ mod tests {
         let wire = build_client_key_exchange(&point);
         let parsed = parse_client_key_exchange(&wire[4..]).expect("parse");
         assert_eq!(parsed.as_ref(), &point[..]);
+    }
+
+    #[test]
+    fn client_hello_session_ticket_extension_round_trips() {
+        let params = ClientHelloParams {
+            random: [1u8; 32],
+            session_id: &[9u8; 32],
+            cipher_suites: &[0xC02F],
+            server_name: None,
+            session_ticket: Some(b"opaque-ticket-bytes"),
+        };
+        let wire = build_client_hello(&params);
+        let parsed = parse_client_hello(&wire[4..]).expect("parse");
+        assert_eq!(parsed.session_ticket.as_deref(), Some(&b"opaque-ticket-bytes"[..]));
+        assert_eq!(parsed.session_id.as_ref(), &[9u8; 32]);
+    }
+
+    #[test]
+    fn client_hello_empty_session_ticket_advertises_support() {
+        let params = ClientHelloParams {
+            random: [1u8; 32],
+            session_id: &[],
+            cipher_suites: &[0xC02F],
+            server_name: None,
+            session_ticket: Some(&[]),
+        };
+        let wire = build_client_hello(&params);
+        let parsed = parse_client_hello(&wire[4..]).expect("parse");
+        assert_eq!(parsed.session_ticket.as_deref(), Some(&b""[..]));
+    }
+
+    #[test]
+    fn client_hello_without_session_ticket_extension_parses_as_none() {
+        let params = ClientHelloParams {
+            random: [1u8; 32],
+            session_id: &[],
+            cipher_suites: &[0xC02F],
+            server_name: None,
+            session_ticket: None,
+        };
+        let wire = build_client_hello(&params);
+        let parsed = parse_client_hello(&wire[4..]).expect("parse");
+        assert_eq!(parsed.session_ticket, None);
+    }
+
+    #[test]
+    fn new_session_ticket_round_trip() {
+        let wire = build_new_session_ticket(3600, b"a-sealed-ticket-blob");
+        assert_eq!(wire[0], MessageType::NewSessionTicket as u8);
+        let (lifetime, ticket) = parse_new_session_ticket(&wire[4..]).expect("parse");
+        assert_eq!(lifetime, 3600);
+        assert_eq!(ticket.as_ref(), b"a-sealed-ticket-blob");
     }
 }

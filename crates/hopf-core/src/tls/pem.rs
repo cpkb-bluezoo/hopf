@@ -218,6 +218,11 @@ impl TlsAcceptor for PemAcceptorTls12 {
             server_name: None,
             server: Some(self.creds.clone()),
             trust_store: None,
+            // As with TLS 1.3's `base_config` above: session-ticket support
+            // needs a `Tls12Config` built directly by the caller, not this
+            // simple PEM-loaded helper.
+            ticket_key: None,
+            client_ticket_store: None,
         };
         TlsVariant::V12(tls12::record::Tls12RecordEngine::new(config))
     }
@@ -241,6 +246,8 @@ impl TlsConnector for TrustedConnectorTls12 {
             server_name: Some(server_name.to_string()),
             server: None,
             trust_store: self.trust_store.clone(),
+            ticket_key: None,
+            client_ticket_store: None,
         };
         Ok(TlsVariant::V12(tls12::record::Tls12RecordEngine::new(config)))
     }

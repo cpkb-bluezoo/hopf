@@ -563,4 +563,88 @@ mod integration_tests {
         rt.shutdown();
         server_thread.join().unwrap();
     }
+
+    /// Real interop proof for session resumption (crypto-migration-plan.md
+    /// Phase 5's ticket work): a `rustls` client reusing the same
+    /// `ClientConfig` (and thus its own in-memory ticket cache) across two
+    /// TLS-1.2-only connections to a Hopf server configured with an RFC 5077
+    /// ticket key. The engine-level tests already prove the abbreviated
+    /// flight is well-formed against itself; this proves an independent
+    /// implementation actually recognizes and accepts it as a resumption —
+    /// `rustls` reports this directly via `handshake_kind()`.
+    ///
+    /// `acceptor_from_pem_tls12` doesn't take a ticket key (it deliberately
+    /// mirrors the TLS 1.3 `base_config` helper, which also leaves
+    /// resumption disabled — see crypto-migration-plan.md), so this builds
+    /// the acceptor directly from `hopf_core::Tls12Config` instead.
+    #[test]
+    fn rustls_tls12_client_resumes_second_connection_against_hopf_tls12_ticket_server() {
+        let (_dir, cert_path, key_path, certified) = write_temp_pem("tls12-resume");
+        let creds = hopf_core::server_credentials_from_pem(&cert_path, &key_path).unwrap();
+        let ticket_key = [0x42u8; 32];
+
+        struct Tls12TicketAcceptor {
+            config: hopf_core::Tls12Config,
+        }
+        impl hopf_core::TlsAcceptor for Tls12TicketAcceptor {
+            fn accept(&self) -> hopf_core::TlsVariant {
+                hopf_core::TlsVariant::V12(hopf_core::tls::Tls12RecordEngine::new(self.config.clone()))
+            }
+        }
+        let acceptor: hopf_core::SharedTlsAcceptor = Arc::new(Tls12TicketAcceptor {
+            config: hopf_core::Tls12Config {
+                role: hopf_core::Tls12Role::Server,
+                server_name: None,
+                server: Some(creds),
+                trust_store: None,
+                ticket_key: Some(ticket_key),
+                client_ticket_store: None,
+            },
+        });
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(TlsEcho { alpn_seen: Arc::new(Mutex::new(None)), ready: Arc::new(Mutex::new(false)) })
+                        as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let client_cfg = Arc::new(
+            ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+                .with_protocol_versions(&[&rustls::version::TLS12])
+                .expect("TLS 1.2 is a valid restricted version list")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        let round_trip = |payload: &[u8]| -> rustls::HandshakeKind {
+            let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+            let conn = ClientConnection::new(Arc::clone(&client_cfg), server_name).unwrap();
+            let sock = StdTcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            tls.write_all(payload).unwrap();
+            tls.flush().unwrap();
+            let mut buf = [0u8; 32];
+            let n = tls.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], payload);
+            tls.conn.handshake_kind().expect("handshake completed")
+        };
+
+        assert_eq!(round_trip(b"first"), rustls::HandshakeKind::Full, "first connection has no ticket to offer yet");
+        assert_eq!(
+            round_trip(b"second"),
+            rustls::HandshakeKind::Resumed,
+            "second connection should resume via the ticket issued on the first"
+        );
+
+        rt.shutdown();
+    }
 }

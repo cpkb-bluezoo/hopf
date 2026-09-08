@@ -9,13 +9,17 @@
 //! a real history of subtle timing side channels (Lucky Thirteen and
 //! friends) that deserves its own dedicated, carefully-reviewed pass rather
 //! than being rushed in alongside the rest of this. No client certificates,
-//! no renegotiation, no session resumption yet (session-ID caching is the
-//! plan; also deferred to a follow-up).
+//! no renegotiation. Session resumption is RFC 5077 stateless tickets (see
+//! [`super::ticket`]), not RFC 5246 §7.3 session-ID server-side caching —
+//! no server-side session state to scale/evict, and it reuses the same
+//! opaque-ticket shape this crate already has for TLS 1.3.
 //!
 //! Reactive/sink-based like every other engine in this crate — see
 //! [`Tls12EventSink`]. Deliberately independent of [`super::engine`] (the
 //! TLS 1.3 engine) beyond the shared crypto floor; see [`super::messages`]'s
 //! module doc for why.
+
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 
@@ -35,6 +39,7 @@ use super::super::engine::ServerCredentials;
 use super::super::handshake::verify::{pkcs8_key_kind, KeyKind};
 use super::super::sink::{TlsProtocolError, VerifyRequest, VerifyResult};
 use super::messages::{self, sig_alg, MessageType};
+use super::ticket::{self, StoredTls12Ticket, Tls12ClientTicketStore};
 
 /// `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (RFC 5289).
 pub const ECDHE_ECDSA_AES128_GCM_SHA256: u16 = 0xC02B;
@@ -117,6 +122,13 @@ pub struct Config {
     /// gates on [`Tls12EventSink::verification_requested`], matching the
     /// TLS 1.3 engine's `insecure_connector` pattern.
     pub trust_store: Option<TrustStore>,
+    /// Server-role only: the RFC 5077 ticket-encryption key. `None` disables
+    /// both accepting and issuing tickets — every handshake is full.
+    pub ticket_key: Option<[u8; 32]>,
+    /// Client-role only: shared ticket cache keyed by server name. `None`
+    /// disables offering resumption (the `SessionTicket` extension is
+    /// omitted entirely, not just sent empty).
+    pub client_ticket_store: Option<Arc<Tls12ClientTicketStore>>,
 }
 
 /// Events emitted by [`Tls12Engine`] — consumed by the TLS 1.2 record layer.
@@ -159,9 +171,11 @@ enum State {
     ExpectServerKeyExchange,
     ExpectServerHelloDone,
     ExpectServerFinished,
+    ExpectServerFinishedResumed,
     // server
     ExpectClientKeyExchange,
     ExpectClientFinished,
+    ExpectClientFinishedResumed,
     Complete,
     Failed,
 }
@@ -254,6 +268,23 @@ pub struct Tls12Engine {
     negotiated_alpn: Option<Bytes>,
     verify_id: u64,
     verify_pending: bool,
+    /// Client role: the session ID offered in our own ClientHello, so a
+    /// matching echo in ServerHello signals the server accepted our
+    /// resumption offer (RFC 5077 §3.4 reuses RFC 5246 §7.3's echo signal).
+    sent_session_id: Bytes,
+    /// Client role: the cached ticket we offered, pending confirmation via
+    /// the session-ID echo above. Cleared once the ServerHello resolves
+    /// resumption one way or the other.
+    pending_resume_ticket: Option<StoredTls12Ticket>,
+    /// Server role: whether to mint and send a `NewSessionTicket` at the
+    /// end of the full handshake currently in progress (the client
+    /// advertised `SessionTicket` support and this isn't itself a resume).
+    should_issue_ticket: bool,
+    /// Client role: whether the server echoed `SessionTicket` in its
+    /// ServerHello (RFC 5077 §3.2) — only then should a `NewSessionTicket`
+    /// message in the final flight be accepted rather than treated as a
+    /// protocol violation.
+    expect_new_session_ticket: bool,
 }
 
 impl Tls12Engine {
@@ -277,6 +308,10 @@ impl Tls12Engine {
             negotiated_alpn: None,
             verify_id: 0,
             verify_pending: false,
+            sent_session_id: Bytes::new(),
+            pending_resume_ticket: None,
+            should_issue_ticket: false,
+            expect_new_session_ticket: false,
         }
     }
 
@@ -293,11 +328,28 @@ impl Tls12Engine {
         let mut random = [0u8; 32];
         let _ = getrandom::getrandom(&mut random);
         self.client_random = random;
+
+        let mut session_id = Bytes::new();
+        let mut ticket_offer: Option<Bytes> = None;
+        if let Some(store) = &self.config.client_ticket_store {
+            if let Some(stored) = self.config.server_name.as_deref().and_then(|name| store.get(name)) {
+                let mut sid = [0u8; 32];
+                let _ = getrandom::getrandom(&mut sid);
+                session_id = Bytes::copy_from_slice(&sid);
+                ticket_offer = Some(stored.ticket.clone());
+                self.pending_resume_ticket = Some(stored);
+            } else {
+                ticket_offer = Some(Bytes::new()); // advertise support, no ticket yet
+            }
+        }
+        self.sent_session_id = session_id.clone();
+
         let params = messages::ClientHelloParams {
             random,
-            session_id: &[],
+            session_id: &session_id,
             cipher_suites: SUPPORTED_CIPHER_SUITES,
             server_name: self.config.server_name.as_deref(),
+            session_ticket: ticket_offer.as_deref(),
         };
         let wire = messages::build_client_hello(&params);
         self.emit(&wire, sink);
@@ -364,11 +416,20 @@ impl Tls12Engine {
                 self.on_server_hello_done(wire, sink)
             }
             (Role::Client, State::ExpectServerFinished, MessageType::Finished) => self.on_server_finished(body, wire, sink),
+            (Role::Client, State::ExpectServerFinished, MessageType::NewSessionTicket) => {
+                self.on_new_session_ticket(body, wire, sink)
+            }
+            (Role::Client, State::ExpectServerFinishedResumed, MessageType::Finished) => {
+                self.on_server_finished_resumed(body, wire, sink)
+            }
             (Role::Server, State::Initial, MessageType::ClientHello) => self.on_client_hello(body, wire, sink),
             (Role::Server, State::ExpectClientKeyExchange, MessageType::ClientKeyExchange) => {
                 self.on_client_key_exchange(body, wire, sink)
             }
             (Role::Server, State::ExpectClientFinished, MessageType::Finished) => self.on_client_finished(body, wire, sink),
+            (Role::Server, State::ExpectClientFinishedResumed, MessageType::Finished) => {
+                self.on_client_finished_resumed(body, wire, sink)
+            }
             _ => {
                 self.fail(sink, "unexpected handshake message");
                 false
@@ -396,8 +457,75 @@ impl Tls12Engine {
         self.cipher_kind = Some(kind);
         self.prf_hash = Some(prf_hash);
         self.server_random = sh.random;
+        self.expect_new_session_ticket = sh.session_ticket_offered;
         self.transcript.add_message(&wire);
+
+        let resuming = !self.sent_session_id.is_empty() && sh.session_id == self.sent_session_id;
+        if resuming {
+            let Some(stored) = self.pending_resume_ticket.take() else {
+                self.fail(sink, "server echoed a resumption session id we never offered");
+                return false;
+            };
+            if stored.cipher_suite != sh.cipher_suite {
+                self.fail(sink, "server echoed session id for resumption but selected a different cipher suite");
+                return false;
+            }
+            self.master_secret = Some(stored.master_secret);
+            let Some((client_keys, server_keys)) = self.compute_key_material() else {
+                self.fail(sink, "key material derivation failed");
+                return false;
+            };
+            sink.keys_ready(kind, client_keys, server_keys);
+            self.state = State::ExpectServerFinishedResumed;
+            return true;
+        }
+        self.pending_resume_ticket = None;
         self.state = State::ExpectCertificate;
+        true
+    }
+
+    fn on_server_finished_resumed<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
+        let expected = self.finished_verify_data(false);
+        if body != expected.as_slice() {
+            self.fail(sink, "server Finished verify failed (resumed handshake)");
+            return false;
+        }
+        self.transcript.add_message(&wire);
+
+        sink.send_change_cipher_spec();
+        let vd = self.finished_verify_data(true);
+        let fin = messages::build_finished(&vd);
+        self.emit(&fin, sink);
+        self.finish(sink);
+        true
+    }
+
+    fn on_new_session_ticket<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
+        if !self.expect_new_session_ticket {
+            self.fail(sink, "unexpected NewSessionTicket (server never echoed SessionTicket support)");
+            return false;
+        }
+        if let Some((lifetime_hint, ticket)) = messages::parse_new_session_ticket(body) {
+            if let (Some(store), Some(name), Some(master_secret), Some(cipher_suite)) = (
+                &self.config.client_ticket_store,
+                self.config.server_name.as_deref(),
+                self.master_secret,
+                self.negotiated_suite,
+            ) {
+                let lifetime_secs = if lifetime_hint == 0 { ticket::TICKET_LIFETIME_SECS } else { lifetime_hint };
+                store.put(
+                    name,
+                    StoredTls12Ticket {
+                        ticket,
+                        master_secret,
+                        cipher_suite,
+                        received_at: std::time::Instant::now(),
+                        lifetime_secs,
+                    },
+                );
+            }
+        }
+        self.transcript.add_message(&wire);
         true
     }
 
@@ -512,6 +640,48 @@ impl Tls12Engine {
             self.fail(sink, "unsupported server signing key");
             return false;
         };
+
+        let resume_payload = ch.session_ticket.as_ref().filter(|t| !t.is_empty()).and_then(|offered| {
+            let key = self.config.ticket_key.as_ref()?;
+            let payload = ticket::open_ticket(key, offered)?;
+            if payload.is_expired() || !ch.cipher_suites.contains(&payload.cipher_suite) || cipher_info(payload.cipher_suite).is_none() {
+                return None;
+            }
+            Some(payload)
+        });
+        self.should_issue_ticket = self.config.ticket_key.is_some() && ch.session_ticket.is_some() && resume_payload.is_none();
+        self.client_random = ch.random;
+        self.peer_server_name = ch.server_name.clone();
+        self.transcript.add_message(&wire);
+
+        if let Some(payload) = resume_payload {
+            let (kind, prf_hash, _) = cipher_info(payload.cipher_suite).expect("checked above");
+            self.negotiated_suite = Some(payload.cipher_suite);
+            self.cipher_kind = Some(kind);
+            self.prf_hash = Some(prf_hash);
+            self.master_secret = Some(payload.master_secret);
+
+            let mut server_random = [0u8; 32];
+            let _ = getrandom::getrandom(&mut server_random);
+            self.server_random = server_random;
+            // No new ticket is minted on a resumption in this implementation
+            // (see this module's doc comment), so no SessionTicket echo here.
+            let sh = messages::build_server_hello(&server_random, &ch.session_id, payload.cipher_suite, false);
+            self.emit(&sh, sink);
+
+            let Some((client_keys, server_keys)) = self.compute_key_material() else {
+                self.fail(sink, "key material derivation failed");
+                return false;
+            };
+            sink.keys_ready(kind, client_keys, server_keys);
+            sink.send_change_cipher_spec();
+            let vd = self.finished_verify_data(false);
+            let fin = messages::build_finished(&vd);
+            self.emit(&fin, sink);
+            self.state = State::ExpectClientFinishedResumed;
+            return true;
+        }
+
         let Some(suite) = SUPPORTED_CIPHER_SUITES.iter().copied().find(|s| {
             ch.cipher_suites.contains(s) && cipher_info(*s).is_some_and(|(_, _, k)| k == our_kind)
         }) else {
@@ -522,14 +692,11 @@ impl Tls12Engine {
         self.negotiated_suite = Some(suite);
         self.cipher_kind = Some(kind);
         self.prf_hash = Some(prf_hash);
-        self.client_random = ch.random;
-        self.peer_server_name = ch.server_name;
-        self.transcript.add_message(&wire);
 
         let mut server_random = [0u8; 32];
         let _ = getrandom::getrandom(&mut server_random);
         self.server_random = server_random;
-        let sh = messages::build_server_hello(&server_random, &[], suite);
+        let sh = messages::build_server_hello(&server_random, &[], suite, self.should_issue_ticket);
         self.emit(&sh, sink);
 
         let cert_refs: Vec<&[u8]> = creds.cert_chain.iter().map(|c| c.as_ref()).collect();
@@ -593,10 +760,31 @@ impl Tls12Engine {
         }
         self.transcript.add_message(&wire);
 
+        if self.should_issue_ticket {
+            if let (Some(key), Some(master_secret), Some(suite)) =
+                (&self.config.ticket_key, self.master_secret, self.negotiated_suite)
+            {
+                if let Some(nst) = ticket::mint_new_session_ticket(key, &master_secret, suite) {
+                    self.emit(&nst, sink);
+                }
+            }
+        }
+
         sink.send_change_cipher_spec();
         let vd = self.finished_verify_data(false);
         let fin = messages::build_finished(&vd);
         self.emit(&fin, sink);
+        self.finish(sink);
+        true
+    }
+
+    fn on_client_finished_resumed<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
+        let expected = self.finished_verify_data(true);
+        if body != expected.as_slice() {
+            self.fail(sink, "client Finished verify failed (resumed handshake)");
+            return false;
+        }
+        self.transcript.add_message(&wire);
         self.finish(sink);
         true
     }
@@ -850,8 +1038,22 @@ mod tests {
         let mut trust = TrustStore::new();
         trust.add_anchor(creds.cert_chain[0].clone());
 
-        let client_cfg = Config { role: Role::Client, server_name: Some("localhost".into()), server: None, trust_store: Some(trust) };
-        let server_cfg = Config { role: Role::Server, server_name: None, server: Some(creds), trust_store: None };
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: None,
+        };
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+        };
 
         let mut client = Tls12Engine::new(client_cfg);
         let mut server = Tls12Engine::new(server_cfg);
@@ -976,8 +1178,22 @@ mod tests {
         let mut trust = TrustStore::new();
         trust.add_anchor(creds.cert_chain[0].clone());
 
-        let client_cfg = Config { role: Role::Client, server_name: Some("localhost".into()), server: None, trust_store: Some(trust) };
-        let server_cfg = Config { role: Role::Server, server_name: None, server: Some(creds), trust_store: None };
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: None,
+        };
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+        };
 
         let mut client = Tls12Engine::new(client_cfg);
         let mut server = Tls12Engine::new(server_cfg);
@@ -999,8 +1215,22 @@ mod tests {
         let creds = test_server_credentials_ecdsa();
         let mut trust = TrustStore::new();
         trust.add_anchor(creds.cert_chain[0].clone());
-        let client_cfg = Config { role: Role::Client, server_name: Some("localhost".into()), server: None, trust_store: Some(trust) };
-        let server_cfg = Config { role: Role::Server, server_name: None, server: Some(creds), trust_store: None };
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: None,
+        };
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+        };
         let mut client = Tls12Engine::new(client_cfg);
         let mut server = Tls12Engine::new(server_cfg);
         let mut sink_c = RecordingSink::default();
@@ -1021,5 +1251,161 @@ mod tests {
 
         assert!(!server.is_complete());
         assert!(sink_s.events.iter().any(|e| e.starts_with("protocol_error")), "{:?}", sink_s.events);
+    }
+
+    fn message_types(msgs: &[Bytes]) -> Vec<u8> {
+        msgs.iter().map(|m| m[0]).collect()
+    }
+
+    fn run_full_handshake(
+        client: &mut Tls12Engine,
+        server: &mut Tls12Engine,
+        sink_c: &mut RecordingSink,
+        sink_s: &mut RecordingSink,
+    ) {
+        client.start(sink_c);
+        relay(client, server, take_outbound(sink_c), sink_s);
+        relay(server, client, take_outbound(sink_s), sink_c);
+        relay(client, server, take_outbound(sink_c), sink_s);
+        relay(server, client, take_outbound(sink_s), sink_c);
+    }
+
+    #[test]
+    fn ticket_resumption_completes_abbreviated_handshake_and_skips_key_exchange() {
+        let creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let mut ticket_key = [0u8; 32];
+        getrandom::getrandom(&mut ticket_key).unwrap();
+        let store = Tls12ClientTicketStore::shared();
+
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: Some(store.clone()),
+        };
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: Some(ticket_key),
+            client_ticket_store: None,
+        };
+
+        // --- first connection: full handshake, server issues a ticket ---
+        let mut client = Tls12Engine::new(client_cfg.clone());
+        let mut server = Tls12Engine::new(server_cfg.clone());
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        run_full_handshake(&mut client, &mut server, &mut sink_c, &mut sink_s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+        assert!(store.get("localhost").is_some(), "client should have cached a ticket from the full handshake");
+
+        // --- second connection: abbreviated (resumed) handshake ---
+        let mut client2 = Tls12Engine::new(client_cfg);
+        let mut server2 = Tls12Engine::new(server_cfg);
+        let mut sink_c2 = RecordingSink::default();
+        let mut sink_s2 = RecordingSink::default();
+
+        client2.start(&mut sink_c2);
+        let ch_flight = take_outbound(&mut sink_c2);
+        assert_eq!(message_types(&ch_flight), vec![1], "just ClientHello");
+        relay(&mut client2, &mut server2, ch_flight, &mut sink_s2);
+
+        let sh_flight = take_outbound(&mut sink_s2);
+        assert_eq!(
+            message_types(&sh_flight),
+            vec![2, 20],
+            "abbreviated server flight should be ServerHello + Finished only, no Certificate/ServerKeyExchange/ServerHelloDone"
+        );
+        relay(&mut server2, &mut client2, sh_flight, &mut sink_c2);
+
+        let cf_flight = take_outbound(&mut sink_c2);
+        assert_eq!(message_types(&cf_flight), vec![20], "abbreviated client flight should be just Finished, no ClientKeyExchange");
+        relay(&mut client2, &mut server2, cf_flight, &mut sink_s2);
+
+        assert!(client2.is_complete(), "client2: {:?}", sink_c2.events);
+        assert!(server2.is_complete(), "server2: {:?}", sink_s2.events);
+        let (_, client_keys_c, server_keys_c) = sink_c2.keys.expect("client2 keys_ready");
+        let (_, client_keys_s, server_keys_s) = sink_s2.keys.expect("server2 keys_ready");
+        assert_eq!(client_keys_c.key, client_keys_s.key);
+        assert_eq!(server_keys_c.key, server_keys_s.key);
+    }
+
+    #[test]
+    fn resumption_attempt_falls_back_to_full_handshake_after_ticket_key_rotation() {
+        let creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let mut ticket_key = [0u8; 32];
+        getrandom::getrandom(&mut ticket_key).unwrap();
+        let store = Tls12ClientTicketStore::shared();
+
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: Some(store.clone()),
+        };
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds.clone()),
+            trust_store: None,
+            ticket_key: Some(ticket_key),
+            client_ticket_store: None,
+        };
+
+        let mut client = Tls12Engine::new(client_cfg.clone());
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        run_full_handshake(&mut client, &mut server, &mut sink_c, &mut sink_s);
+        assert!(store.get("localhost").is_some());
+
+        // Server restarts with a freshly generated ticket key — the old
+        // ticket can no longer be decrypted (simulates a STEK rotation).
+        let mut rotated_key = [0u8; 32];
+        getrandom::getrandom(&mut rotated_key).unwrap();
+        let server_cfg2 = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: Some(rotated_key),
+            client_ticket_store: None,
+        };
+
+        let mut client2 = Tls12Engine::new(client_cfg);
+        let mut server2 = Tls12Engine::new(server_cfg2);
+        let mut sink_c2 = RecordingSink::default();
+        let mut sink_s2 = RecordingSink::default();
+
+        client2.start(&mut sink_c2);
+        let ch_flight = take_outbound(&mut sink_c2);
+        relay(&mut client2, &mut server2, ch_flight, &mut sink_s2);
+
+        let sh_flight = take_outbound(&mut sink_s2);
+        assert_eq!(
+            message_types(&sh_flight),
+            vec![2, 11, 12, 14],
+            "server couldn't decrypt the stale ticket, so it must fall back to a full handshake \
+             (ServerHello, Certificate, ServerKeyExchange, ServerHelloDone), not get stuck"
+        );
+        relay(&mut server2, &mut client2, sh_flight, &mut sink_c2);
+        relay(&mut client2, &mut server2, take_outbound(&mut sink_c2), &mut sink_s2);
+        relay(&mut server2, &mut client2, take_outbound(&mut sink_s2), &mut sink_c2);
+
+        assert!(client2.is_complete(), "client2: {:?}", sink_c2.events);
+        assert!(server2.is_complete(), "server2: {:?}", sink_s2.events);
+        // The rotated key can mint a fresh ticket too — resumption support recovers.
+        assert!(store.get("localhost").is_some());
     }
 }

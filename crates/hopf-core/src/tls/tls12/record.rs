@@ -404,8 +404,22 @@ mod tests {
         let creds = test_server_credentials();
         let mut trust = TrustStore::new();
         trust.add_anchor(creds.cert_chain[0].clone());
-        let client = Config { role: Role::Client, server_name: Some("localhost".into()), server: None, trust_store: Some(trust) };
-        let server = Config { role: Role::Server, server_name: None, server: Some(creds), trust_store: None };
+        let client = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: None,
+        };
+        let server = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+        };
         (client, server)
     }
 
@@ -476,6 +490,67 @@ mod tests {
         let wire = std::mem::take(&mut sink_c.outbound);
         server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
         assert!(sink_s.events.iter().any(|e| e == "peer_closed"), "{:?}", sink_s.events);
+    }
+
+    #[test]
+    fn ticket_resumption_round_trips_over_real_record_framing() {
+        let creds = test_server_credentials();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let mut ticket_key = [0u8; 32];
+        getrandom::getrandom(&mut ticket_key).unwrap();
+        let store = crate::tls::Tls12ClientTicketStore::shared();
+
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: Some(store.clone()),
+        };
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: Some(ticket_key),
+            client_ticket_store: None,
+        };
+
+        // First connection: full handshake, real record framing, mints a ticket.
+        let mut client = Tls12RecordEngine::new(client_cfg.clone());
+        let mut server = Tls12RecordEngine::new(server_cfg.clone());
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+        assert!(store.get("localhost").is_some());
+
+        // Second connection: abbreviated handshake over the same real wire
+        // framing — real GCM-encrypted Finished messages, a real CCS record
+        // switching the read epoch, not just engine-level message objects.
+        let mut client2 = Tls12RecordEngine::new(client_cfg);
+        let mut server2 = Tls12RecordEngine::new(server_cfg);
+        let mut sink_c2 = RecordingSink::default();
+        let mut sink_s2 = RecordingSink::default();
+        client2.start(&mut sink_c2);
+        relay(&mut sink_c2, &mut server2, &mut sink_s2); // ClientHello
+        relay(&mut sink_s2, &mut client2, &mut sink_c2); // SH, CCS, server Finished
+        relay(&mut sink_c2, &mut server2, &mut sink_s2); // CCS, client Finished
+
+        assert!(client2.is_complete(), "client2: {:?}", sink_c2.events);
+        assert!(server2.is_complete(), "server2: {:?}", sink_s2.events);
+
+        client2.send_application_data(b"resumed hello", &mut sink_c2);
+        let wire = std::mem::take(&mut sink_c2.outbound);
+        server2.feed_ciphertext(&mut wire.as_slice(), &mut sink_s2);
+        assert_eq!(sink_s2.app_data, vec![b"resumed hello".to_vec()]);
     }
 
     #[test]

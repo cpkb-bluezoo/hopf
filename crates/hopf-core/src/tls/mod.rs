@@ -35,6 +35,7 @@ pub use sink::{
 };
 pub use tls12::engine::{Config as Tls12Config, Role as Tls12Role, SUPPORTED_CIPHER_SUITES as TLS12_SUPPORTED_CIPHER_SUITES};
 pub use tls12::record::Tls12RecordEngine;
+pub use tls12::ticket::{StoredTls12Ticket, Tls12ClientTicketStore, TICKET_LIFETIME_SECS as TLS12_TICKET_LIFETIME_SECS};
 
 /// Either TLS version's record engine — `TcpConnection` pumps whichever one
 /// its configured acceptor/connector produced through one shared surface

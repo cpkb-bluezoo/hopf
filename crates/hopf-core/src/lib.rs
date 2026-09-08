@@ -80,9 +80,10 @@ pub use tls::{
     connector_with_verify_override, insecure_connector, insecure_connector_tls12,
     public_trust_connector, server_credentials_from_pem, HandshakeConfig, HandshakeEngine,
     HandshakeMode, HandshakeRole, NopTlsEventSink, QuicSecrets, SharedTlsAcceptor,
-    SharedTlsConnector, Tls12Config, Tls12Role, TlsAcceptor, TlsConnector, TlsEventSink,
-    TlsProtocolError, TlsTimerKind, TlsVariant, VerifyOverride, VerifyRequest, VerifyResult,
-    TLS12_SUPPORTED_CIPHER_SUITES,
+    SharedTlsConnector, StoredTls12Ticket, Tls12ClientTicketStore, Tls12Config, Tls12Role,
+    TlsAcceptor, TlsConnector, TlsEventSink, TlsProtocolError, TlsTimerKind, TlsVariant,
+    VerifyOverride, VerifyRequest, VerifyResult, TLS12_SUPPORTED_CIPHER_SUITES,
+    TLS12_TICKET_LIFETIME_SECS,
 };
 pub use udp::UdpDatagramHandler;
 
