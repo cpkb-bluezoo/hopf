@@ -27,6 +27,14 @@ pub struct ParsedClientHello {
     pub server_name: Option<String>,
     /// QUIC transport parameters from the client, if present.
     pub transport_parameters: Option<Bytes>,
+    /// Client offered early data.
+    pub early_data: bool,
+    /// First offered PSK identity (opaque ticket).
+    pub psk_identity: Option<Bytes>,
+    /// Obfuscated ticket age for the first PSK identity (RFC 8446 §4.2.11).
+    pub obfuscated_ticket_age: Option<u32>,
+    /// First PSK binder.
+    pub psk_binder: Option<Bytes>,
 }
 
 /// Parsed `ServerHello` fields needed for key schedule (Phase 2 subset).
@@ -40,6 +48,8 @@ pub struct ParsedServerHello {
     pub selected_group: u16,
     /// Server key share for the selected group.
     pub key_share: Bytes,
+    /// Selected PSK identity index (resumption).
+    pub psk_selected_identity: Option<u16>,
 }
 
 /// Parsed EncryptedExtensions content.
@@ -49,6 +59,23 @@ pub struct ParsedEncryptedExtensions {
     pub alpn: Option<Bytes>,
     /// QUIC transport parameters from the server.
     pub transport_parameters: Option<Bytes>,
+    /// Server accepted early data.
+    pub early_data: bool,
+}
+
+/// Parsed NewSessionTicket (post-handshake).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParsedNewSessionTicket {
+    /// Ticket lifetime seconds.
+    pub lifetime: u32,
+    /// Ticket age add.
+    pub age_add: u32,
+    /// Ticket nonce.
+    pub nonce: Bytes,
+    /// Opaque ticket identity.
+    pub ticket: Bytes,
+    /// Max early data size (0 if absent).
+    pub max_early_data: u32,
 }
 
 #[derive(Default)]
@@ -93,6 +120,23 @@ impl HandshakeEvents for ClientHelloCollector {
         }
     }
 
+    fn early_data(&mut self) {
+        self.out.early_data = true;
+    }
+
+    fn psk_identity(&mut self, identity: &[u8], obfuscated_ticket_age: u32) {
+        if self.out.psk_identity.is_none() {
+            self.out.psk_identity = Some(Bytes::copy_from_slice(identity));
+            self.out.obfuscated_ticket_age = Some(obfuscated_ticket_age);
+        }
+    }
+
+    fn psk_binder(&mut self, binder: &[u8]) {
+        if self.out.psk_binder.is_none() {
+            self.out.psk_binder = Some(Bytes::copy_from_slice(binder));
+        }
+    }
+
     fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
 
     fn parse_error(&mut self, _detail: &'static str) {
@@ -124,6 +168,10 @@ impl HandshakeEvents for ServerHelloCollector {
         }
     }
 
+    fn psk_selected_identity(&mut self, index: u16) {
+        self.out.psk_selected_identity = Some(index);
+    }
+
     fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
 
     fn parse_error(&mut self, _detail: &'static str) {
@@ -150,6 +198,45 @@ impl HandshakeEvents for EncryptedExtensionsCollector {
         if self.out.transport_parameters.is_none() {
             self.out.transport_parameters = Some(Bytes::copy_from_slice(params));
         }
+    }
+
+    fn early_data(&mut self) {
+        self.out.early_data = true;
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+#[derive(Default)]
+struct NewSessionTicketCollector {
+    out: ParsedNewSessionTicket,
+    failed: bool,
+    got: bool,
+}
+
+impl HandshakeEvents for NewSessionTicketCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn new_session_ticket(
+        &mut self,
+        lifetime: u32,
+        age_add: u32,
+        nonce: &[u8],
+        ticket: &[u8],
+        max_early_data: u32,
+    ) {
+        self.out = ParsedNewSessionTicket {
+            lifetime,
+            age_add,
+            nonce: Bytes::copy_from_slice(nonce),
+            ticket: Bytes::copy_from_slice(ticket),
+            max_early_data,
+        };
+        self.got = true;
     }
 
     fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
@@ -322,6 +409,8 @@ pub(crate) enum ParsedIncoming {
     CertificateVerify(u16, Bytes),
     /// Finished verify_data.
     Finished(Bytes),
+    /// NewSessionTicket (post-handshake).
+    NewSessionTicket(ParsedNewSessionTicket),
 }
 
 /// Active collector for the message currently being parsed.
@@ -340,6 +429,8 @@ pub(crate) enum MessageCollector {
     CertificateVerify(CertificateVerifyCollector),
     /// Collecting Finished.
     Finished(FinishedCollector),
+    /// Collecting NewSessionTicket.
+    NewSessionTicket(NewSessionTicketCollector),
 }
 
 impl Default for MessageCollector {
@@ -388,6 +479,12 @@ impl MessageCollector {
                 }
                 Some(ParsedIncoming::Finished(c.verify_data))
             }
+            (HandshakeType::NewSessionTicket, Self::NewSessionTicket(c)) => {
+                if c.failed || !c.got {
+                    return None;
+                }
+                Some(ParsedIncoming::NewSessionTicket(c.out))
+            }
             _ => None,
         }
     }
@@ -406,6 +503,9 @@ impl HandshakeEvents for MessageCollector {
                 Self::CertificateVerify(CertificateVerifyCollector::default())
             }
             HandshakeType::Finished => Self::Finished(FinishedCollector::default()),
+            HandshakeType::NewSessionTicket => {
+                Self::NewSessionTicket(NewSessionTicketCollector::default())
+            }
         };
     }
 
@@ -489,6 +589,45 @@ impl HandshakeEvents for MessageCollector {
         }
     }
 
+    fn early_data(&mut self) {
+        match self {
+            Self::ClientHello(c) => c.early_data(),
+            Self::EncryptedExtensions(c) => c.early_data(),
+            _ => {}
+        }
+    }
+
+    fn psk_identity(&mut self, identity: &[u8], obfuscated_ticket_age: u32) {
+        if let Self::ClientHello(c) = self {
+            c.psk_identity(identity, obfuscated_ticket_age);
+        }
+    }
+
+    fn psk_binder(&mut self, binder: &[u8]) {
+        if let Self::ClientHello(c) = self {
+            c.psk_binder(binder);
+        }
+    }
+
+    fn psk_selected_identity(&mut self, index: u16) {
+        if let Self::ServerHello(c) = self {
+            c.psk_selected_identity(index);
+        }
+    }
+
+    fn new_session_ticket(
+        &mut self,
+        lifetime: u32,
+        age_add: u32,
+        nonce: &[u8],
+        ticket: &[u8],
+        max_early_data: u32,
+    ) {
+        if let Self::NewSessionTicket(c) = self {
+            c.new_session_ticket(lifetime, age_add, nonce, ticket, max_early_data);
+        }
+    }
+
     fn extension(&mut self, _ext_type: u16, _data: &[u8]) {}
 
     fn certificate_request_context(&mut self, ctx: &[u8]) {
@@ -525,6 +664,7 @@ impl HandshakeEvents for MessageCollector {
             Self::Certificate(c) => c.parse_error(detail),
             Self::CertificateVerify(c) => c.parse_error(detail),
             Self::Finished(c) => c.parse_error(detail),
+            Self::NewSessionTicket(c) => c.parse_error(detail),
             Self::Idle => {}
         }
     }

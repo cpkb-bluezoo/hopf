@@ -13,10 +13,12 @@ pub use reassembler::StreamReassembler;
 /// Outbound stream half.
 #[derive(Debug, Default)]
 pub struct SendStream {
-    /// Next offset to send.
+    /// Next offset to send for new data.
     pub offset: u64,
     /// Queued chunks waiting for packetization.
     pub pending: VecDeque<Bytes>,
+    /// Lost chunks awaiting retransmission at their original offsets.
+    pub retransmit: VecDeque<(u64, Bytes, bool)>,
     /// FIN queued.
     pub fin: bool,
     /// FIN sent.
@@ -46,24 +48,55 @@ impl SendStream {
         self.fin = true;
     }
 
-    /// Take next chunk up to `max` bytes.
-    pub fn take_chunk(&mut self, max: usize) -> Option<(u64, Bytes, bool)> {
-        let chunk = self.pending.pop_front()?;
-        let offset = self.offset;
-        let (data, rest) = if chunk.len() > max {
-            (chunk.slice(..max), Some(chunk.slice(max..)))
-        } else {
-            (chunk, None)
-        };
-        if let Some(r) = rest {
-            self.pending.push_front(r);
-        }
-        self.offset += data.len() as u64;
-        let fin = self.fin && self.pending.is_empty();
+    /// Requeue a lost STREAM chunk for retransmission at `offset`.
+    pub fn requeue(&mut self, offset: u64, data: Bytes, fin: bool) {
+        self.retransmit.push_back((offset, data, fin));
         if fin {
-            self.fin_sent = true;
+            self.fin_sent = false;
         }
-        Some((offset, data, fin))
+    }
+
+    /// Take next chunk up to `max` bytes (retransmits first).
+    pub fn take_chunk(&mut self, max: usize) -> Option<(u64, Bytes, bool)> {
+        if let Some((offset, chunk, fin)) = self.retransmit.pop_front() {
+            let (data, rest) = if chunk.len() > max {
+                (chunk.slice(..max), Some(chunk.slice(max..)))
+            } else {
+                (chunk, None)
+            };
+            if let Some(r) = rest {
+                self.retransmit
+                    .push_front((offset + data.len() as u64, r, fin));
+                return Some((offset, data, false));
+            }
+            return Some((offset, data, fin));
+        }
+
+        if let Some(chunk) = self.pending.pop_front() {
+            let offset = self.offset;
+            let (data, rest) = if chunk.len() > max {
+                (chunk.slice(..max), Some(chunk.slice(max..)))
+            } else {
+                (chunk, None)
+            };
+            if let Some(r) = rest {
+                self.pending.push_front(r);
+            }
+            self.offset += data.len() as u64;
+            let fin = self.fin && self.pending.is_empty() && self.retransmit.is_empty();
+            if fin {
+                self.fin_sent = true;
+            }
+            return Some((offset, data, fin));
+        }
+
+        // FIN-only frame after all data has already been sent.
+        if self.fin && !self.fin_sent {
+            let offset = self.offset;
+            self.fin_sent = true;
+            return Some((offset, Bytes::new(), true));
+        }
+        None
     }
 }
 

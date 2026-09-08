@@ -2,6 +2,7 @@
 
 //! Core transport types (replacing quinn-proto handles / events).
 
+use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -11,19 +12,24 @@ use bytes::Bytes;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnectionHandle(pub usize);
 
-/// QUIC stream identifier (RFC 9000 §2.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct StreamId(pub u64);
+/// Opaque QUIC stream identifier (RFC 9000 §2.1).
+///
+/// Constructed by the transport (or decoded from the wire via
+/// [`Self::from_wire`]). Not interchangeable with [`crate::StreamKey`]
+/// handles returned by [`crate::QuicConnApi::open_uni`] /
+/// [`crate::QuicConnApi::open_bi`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StreamId(u64);
 
-impl From<u64> for StreamId {
-    fn from(v: u64) -> Self {
-        Self(v)
+impl fmt::Debug for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "StreamId({})", self.0)
     }
 }
 
-impl From<StreamId> for u64 {
-    fn from(id: StreamId) -> u64 {
-        id.0
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -38,6 +44,27 @@ impl StreamId {
     pub const CLIENT_BI_0: Self = Self(0);
     /// Server-initiated bidirectional stream 1.
     pub const SERVER_BI_0: Self = Self(1);
+
+    /// Decode a stream id from a QUIC / HTTP varint on the wire.
+    ///
+    /// Prefer values handed out by [`crate::QuicConnection::accept_bi`] /
+    /// [`crate::QuicConnection::accept_uni`] when referring to live streams;
+    /// use this only when parsing an id carried in application framing
+    /// (QPACK, HTTP Datagrams, GOAWAY, …).
+    pub const fn from_wire(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Encode for QUIC / HTTP varint framing.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// `true` when this is a client-initiated bidirectional stream
+    /// (`id % 4 == 0`) — the request streams HTTP/3 keys on.
+    pub const fn is_client_bidi(self) -> bool {
+        self.0 % 4 == 0
+    }
 
     /// Stream initiator side.
     pub fn initiator(self) -> Side {
@@ -259,6 +286,8 @@ pub struct Incoming {
     pub(crate) packet: Bytes,
     /// Whether the address was already validated (Retry/NEW_TOKEN).
     pub address_validated: bool,
+    /// When set, accept must use this as the server's local CID (Retry SCID).
+    pub retry_local_cid: Option<ConnectionId>,
 }
 
 impl Incoming {

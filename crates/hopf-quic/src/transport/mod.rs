@@ -9,6 +9,7 @@ pub mod connection;
 pub mod endpoint;
 pub mod frame;
 pub mod packet;
+pub mod recovery;
 pub mod stream;
 pub mod tls_bridge;
 pub mod types;

@@ -37,6 +37,10 @@ pub mod ty {
     pub const CONNECTION_CLOSE_APP: u64 = 0x1d;
     /// HANDSHAKE_DONE
     pub const HANDSHAKE_DONE: u64 = 0x1e;
+    /// DATAGRAM without length (to end of packet)
+    pub const DATAGRAM: u64 = 0x30;
+    /// DATAGRAM with length
+    pub const DATAGRAM_LEN: u64 = 0x31;
 }
 
 /// Parsed frame.
@@ -122,6 +126,11 @@ pub enum Frame {
         /// Application error.
         error_code: u64,
     },
+    /// DATAGRAM (RFC 9221).
+    Datagram {
+        /// Payload.
+        data: Bytes,
+    },
 }
 
 fn parse_ack(buf: &mut &[u8], with_ecn: bool) -> Result<Frame, ()> {
@@ -184,7 +193,7 @@ pub fn parse_all(mut buf: &[u8]) -> Result<Vec<Frame>, ()> {
                 let off_bit = t & 0x04 != 0;
                 let len_bit = t & 0x02 != 0;
                 let fin = t & 0x01 != 0;
-                let id = StreamId(varint::decode(&mut buf).ok_or(())?);
+                let id = StreamId::from_wire(varint::decode(&mut buf).ok_or(())?);
                 let offset = if off_bit {
                     varint::decode(&mut buf).ok_or(())?
                 } else {
@@ -215,7 +224,7 @@ pub fn parse_all(mut buf: &[u8]) -> Result<Vec<Frame>, ()> {
                 frames.push(Frame::MaxData { max });
             }
             ty::MAX_STREAM_DATA => {
-                let id = StreamId(varint::decode(&mut buf).ok_or(())?);
+                let id = StreamId::from_wire(varint::decode(&mut buf).ok_or(())?);
                 let max = varint::decode(&mut buf).ok_or(())?;
                 frames.push(Frame::MaxStreamData { id, max });
             }
@@ -246,7 +255,7 @@ pub fn parse_all(mut buf: &[u8]) -> Result<Vec<Frame>, ()> {
             }
             ty::HANDSHAKE_DONE => frames.push(Frame::HandshakeDone),
             ty::RESET_STREAM => {
-                let id = StreamId(varint::decode(&mut buf).ok_or(())?);
+                let id = StreamId::from_wire(varint::decode(&mut buf).ok_or(())?);
                 let error_code = varint::decode(&mut buf).ok_or(())?;
                 let final_size = varint::decode(&mut buf).ok_or(())?;
                 frames.push(Frame::ResetStream {
@@ -256,9 +265,23 @@ pub fn parse_all(mut buf: &[u8]) -> Result<Vec<Frame>, ()> {
                 });
             }
             ty::STOP_SENDING => {
-                let id = StreamId(varint::decode(&mut buf).ok_or(())?);
+                let id = StreamId::from_wire(varint::decode(&mut buf).ok_or(())?);
                 let error_code = varint::decode(&mut buf).ok_or(())?;
                 frames.push(Frame::StopSending { id, error_code });
+            }
+            ty::DATAGRAM => {
+                let data = Bytes::copy_from_slice(buf);
+                buf = &[];
+                frames.push(Frame::Datagram { data });
+            }
+            ty::DATAGRAM_LEN => {
+                let len = varint::decode(&mut buf).ok_or(())? as usize;
+                if buf.len() < len {
+                    return Err(());
+                }
+                let data = Bytes::copy_from_slice(&buf[..len]);
+                buf = &buf[len..];
+                frames.push(Frame::Datagram { data });
             }
             _ => return Err(()),
         }

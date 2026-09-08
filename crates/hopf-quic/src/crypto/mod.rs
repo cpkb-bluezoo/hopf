@@ -4,12 +4,16 @@
 
 use std::sync::Arc;
 
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use bytes::Bytes;
 use hopf_core::crypto::kx_policy::KxPolicy;
 use hopf_core::crypto::trust::TrustStore;
-use hopf_core::tls::{HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials};
+use hopf_core::tls::{
+    AntiReplay, ClientTicketStore, HandshakeConfig, HandshakeMode, HandshakeRole,
+    ServerCredentials, DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+};
 
-use crate::config::{QuicClientConfig, QuicServerConfig};
+use crate::config::{QuicClientConfig, QuicServerConfig, QuicTlsOptions};
 
 pub use crate::transport::packet::protection::{initial_secrets, KeyPair, PacketKeys};
 
@@ -35,6 +39,14 @@ pub struct HopfTlsBuildParams {
     pub server: Option<ServerCredentials>,
     /// Local QUIC transport parameters wire encoding.
     pub local_transport_parameters: Option<Bytes>,
+    /// Early data / ticket options.
+    pub tls: QuicTlsOptions,
+    /// Shared client ticket store (set for client configs).
+    pub ticket_store: Option<Arc<ClientTicketStore>>,
+    /// Server ticket sealing key.
+    pub ticket_key: Option<[u8; 32]>,
+    /// Server early-data anti-replay (shared across accepts).
+    pub anti_replay: Option<Arc<AntiReplay>>,
 }
 
 impl HopfTlsBuildParams {
@@ -53,11 +65,17 @@ impl HopfTlsBuildParams {
             trust_store: Some(trust),
             server: None,
             local_transport_parameters: None,
+            tls: QuicTlsOptions::default(),
+            ticket_store: Some(ClientTicketStore::shared()),
+            ticket_key: None,
+            anti_replay: None,
         }
     }
 
     /// Server parameters with credentials.
     pub fn server(creds: ServerCredentials, alpn: Vec<Bytes>) -> Self {
+        let mut ticket_key = [0u8; 32];
+        let _ = SystemRandom::new().fill(&mut ticket_key);
         Self {
             alpn,
             kx_policy: KxPolicy::classical_only(),
@@ -65,10 +83,29 @@ impl HopfTlsBuildParams {
             trust_store: None,
             server: Some(creds),
             local_transport_parameters: None,
+            tls: QuicTlsOptions::default(),
+            ticket_store: None,
+            ticket_key: Some(ticket_key),
+            anti_replay: None,
         }
     }
 
+    /// Apply [`QuicTlsOptions`].
+    pub fn with_tls(mut self, tls: QuicTlsOptions) -> Self {
+        self.tls = tls;
+        if self.tls.enable_early_data && self.server.is_some() && self.anti_replay.is_none() {
+            self.anti_replay = Some(AntiReplay::shared_default());
+        }
+        self
+    }
+
     fn into_handshake(self, role: HandshakeRole) -> HandshakeConfig {
+        let anti_replay = if role == HandshakeRole::Server && self.tls.enable_early_data {
+            self.anti_replay
+                .or_else(|| Some(AntiReplay::shared_default()))
+        } else {
+            self.anti_replay
+        };
         HandshakeConfig {
             role,
             mode: HandshakeMode::Quic,
@@ -78,6 +115,12 @@ impl HopfTlsBuildParams {
             kx_policy: self.kx_policy,
             local_transport_parameters: self.local_transport_parameters,
             trust_store: self.trust_store,
+            enable_early_data: self.tls.enable_early_data,
+            max_early_data_size: self.tls.max_early_data_size,
+            max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: self.ticket_key,
+            ticket_store: self.ticket_store,
+            anti_replay,
         }
     }
 }

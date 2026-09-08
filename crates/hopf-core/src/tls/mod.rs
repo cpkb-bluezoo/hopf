@@ -12,7 +12,12 @@ mod session;
 mod sink;
 
 pub use engine::{HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, ServerCredentials};
-pub use handshake::transport_params::{decode_initial_max_data, encode_initial_max_data};
+pub use handshake::ticket::{
+    AntiReplay, ClientTicketStore, DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS, TICKET_LIFETIME_SECS,
+};
+pub use handshake::transport_params::{
+    decode_initial_max_data, encode_initial_max_data, RememberedTransportLimits,
+};
 pub use session::{
     SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector, TlsProgress, TlsSession,
 };

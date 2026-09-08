@@ -1240,7 +1240,7 @@ fn doq_connection_pool_reuses_a_connection_across_queries() {
     use hopf_dns::wire::{DnsQuestion, DnsType};
     use hopf_quic::{
         client_config_for_certified_pem, listen_quic_hooks, server_config_self_signed,
-        QuicConnApi, QuicConnection, QuicListenHooksConfig,
+        QuicConnApi, QuicConnection, QuicListenHooksConfig, StreamId,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -1305,10 +1305,10 @@ fn doq_connection_pool_reuses_a_connection_across_queries() {
         fn connected(&mut self, _api: &mut dyn QuicConnApi) {
             self.connect_count.fetch_add(1, Ordering::SeqCst);
         }
-        fn accept_bi(&mut self) -> Box<dyn ProtocolHandler> {
+        fn accept_bi(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
             Box::new(DoqStubStream { buf: Vec::new() })
         }
-        fn accept_uni(&mut self) -> Box<dyn ProtocolHandler> {
+        fn accept_uni(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
             Box::new(NopHandler)
         }
     }

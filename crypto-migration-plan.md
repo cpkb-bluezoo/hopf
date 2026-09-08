@@ -9,7 +9,7 @@ It complements the status tables in
 describe *what* is shipped vs planned; this file describes *how* to get there.
 Phase 0 touchpoints and seams: `[crypto-migration-inventory.md](crypto-migration-inventory.md)`.
 
-**Status:** Phase 3 in progress — in-tree RFC 9000 transport drives `hopf-quic` (quinn-proto removed from the crate); loopback echo (`spike_echo_one_stream_hopf` + `QuicListenHardening::permissive()`) is green. Retry/hardening/GSO/0-RTT and broader integration remain open.
+**Status:** Phase 3b transport parity green (H3 + DoQ + 0-RTT TP consistency / reject-requeue). Deferred elsewhere: external OpenSSL/quic-go interop → Phase 2; public WebPKI → Phase 4; conformance row flip → Phase 8. Next: Phase 4 TLS record layer.
 
 ---
 
@@ -38,6 +38,7 @@ The migration is **not complete** until **all existing workspace unit and integr
 - Servlet/JSP/Java EE APIs.
 - Boiling the ocean: SSH, DNSCrypt, CoAP/OSCORE, and GSSAPI are **related follow-ons**, not blockers for the crypto floor itself.
 - **Tokio-shaped async**, `**async fn` / `.await`**, or **Java** `Future`**-shaped** security APIs — engines are reactor-reactive, not executor-async (see [Engine design](#engine-design)).
+- **Decrypting foreign session-ticket ciphertext** (rustls / OpenSSL / quic-go NST blob formats). Hopf tickets stay hopf-private; external peer interop (Phase 2) exercises wire resume/0-RTT with each stack’s own tickets.
 
 ---
 
@@ -445,17 +446,38 @@ New phase-specific tests are additive; they do not replace the requirement that 
 - [x] Extensions: QUIC `transport_parameters` (opaque RFC 9000 wire codec + TLS ext 0x0039); hybrid PQC via [`KxPolicy`](crates/hopf-core/src/crypto/kx_policy.rs) + `X25519MLKEM768` (Phase 7 expands central policy).
 - [x] Export application traffic secrets in [`QuicSecrets`](crates/hopf-core/src/tls/sink.rs) on `handshake_complete`.
 - [x] Verification gate backed by `hopf-core::crypto` trust (chain build + hostname via `TrustStore`; inline when `HandshakeConfig.trust_store` is set, else `verification_requested` gate for StorageExecutor).
-- [x] Wire into `hopf-quic` CRYPTO stream via `quinn-proto::crypto::Session` adapter (`hopf-quic/src/crypto/`); loopback echo (`spike_echo_one_stream_hopf`). OpenSSL/quic-go interop still open.
+- [x] Wire into `hopf-quic` CRYPTO stream (was `quinn-proto` adapter; now in-tree `hopf-quic` transport after Phase 3a); loopback echo (`spike_echo_one_stream_hopf`).
 - [x] **Tests:** key schedule RFC 8448 vectors; 1-RTT loopback (classical + hybrid PQC + transport parameters).
+- [ ] **External peer interop** (handshake + resume / 0-RTT where applicable): OpenSSL, quic-go, and optionally rustls as *peer* stacks. Each side uses its own ticket ciphertext — hopf NST blobs stay hopf-private (AES-GCM sealed identity); interop is wire PSK/NST/`early_data` behaviour, not decrypting foreign ticket formats. Deferred from Phase 3b; still owned by the handshake/interop gate here.
 
 *Agent15 equivalent — with proper state machine discipline and AWS-LC underneath.*
 
 ### Phase 3 — Full `hopf-quic` transport (drop `quinn-proto`)
 
+#### Phase 3a — Minimal echo cutover (done)
+
 - [x] RFC 9000 state machine **in** `hopf-quic` — Gumdrop-shaped minimal echo subset; reactive mio driver; **no `quinn-proto` dependency** in `hopf-quic`.
-- [x] Wire Phase 2 handshake from `hopf-core::tls`; RFC 9001 packet protection in `hopf-quic` transport; driver swapped to in-tree `Connection`/`Endpoint` (`spike_echo_one_stream_hopf`).
-- [ ] Finish Retry hardening, GSO, 0-RTT, loss recovery / congestion beyond the echo milestone; keep stream-as-`Endpoint` public API.
-- [ ] **Tests:** full `hopf-quic` integration suite (`--features integration`), H3 tests, conformance QUIC rows.
+- [x] Wire Phase 2 handshake from `hopf-core::tls`; RFC 9001 packet protection in `hopf-quic` transport; driver swapped to in-tree `Connection`/`Endpoint` (`spike_echo_one_stream_hopf` + `QuicListenHardening::permissive()`).
+
+#### Phase 3b — Parity beyond echo
+
+- [x] Retry / address validation (`QuicListenHardening::high_security`); keep stream-as-`Endpoint` public API.
+- [x] DATAGRAM (RFC 9221) send/recv + `max_datagram_frame_size` transport option.
+- [x] Loss recovery / PTO / congestion (RFC 9002).
+- [x] GSO `segment_size` (UDP_SEGMENT batching via `poll_transmit_gso` + pre-AEAD PADDING).
+- [x] 0-RTT / early data (opaque hopf tickets + RFC-shaped age / lifetime / anti-replay / ALPN / reject-retry). Ticket ciphertext stays hopf-private; wire PSK/NST/`obfuscated_ticket_age`/early_data accept-reject follow RFC 8446 / 9001.
+- [x] Resume **transport-parameter consistency** for 0-RTT (RFC 9000 §7.4.1): remembered limits sealed in tickets v0x02; server rejects early_data when offer shrinks below remembered; client applies remembered limits for 0-RTT flow control.
+- [x] Connection-level **0-RTT reject → 1-RTT STREAM retransmit** test (`reject_requeues_0rtt_stream_for_1rtt_retransmit`).
+- [x] **Tests:** full `hopf-quic` integration suite (`--features integration`) except `client_config_public_trust*` (deferred to Phase 4 WebPKI).
+- [x] **HTTP/3 consumer re-check:** `hopf-http` H3 integration tests against in-tree `hopf-quic` transport (post-`quinn-proto` cutover). Dial-time SNI always applied; PEM client helpers no longer bake `"localhost"`.
+
+Deferred out of Phase 3 (tracked in destination phases, not blockers here):
+
+| Deferred item | Destination |
+| --- | --- |
+| External OpenSSL / quic-go / rustls peer interop (incl. 0-RTT wire behaviour) | Phase 2 |
+| Public WebPKI / native roots + `client_config_public_trust*` | Phase 4 |
+| Conformance audit row flip (QUIC / TLS from N/A → Compliant) | Phase 8 |
 
 
 
@@ -463,7 +485,8 @@ New phase-specific tests are additive; they do not replace the requirement that 
 
 - [ ] TLS 1.3 record layer on `TcpConnection` via `**hopf-core::tls**` (`TlsEngine` + sink pump).
 - [ ] Move PEM/acceptor/connector helpers from `**hopf-tls**` into core; implicit TLS + STARTTLS unchanged at protocol crate level.
-- [ ] **Tests:** `tls-echo`, SMTP/IMAP/POP3/FTP STARTTLS integration tests; event-order tests for handshake + early app data in one read.
+- [ ] **Public WebPKI / native roots** in `hopf-core::TrustStore` (today: hopf-tls still holds rustls + webpki-roots; hopf-quic `client_config_public_trust*` is intentional `Unsupported`). Unblocks public-trust QUIC/TCP client configs when `hopf-tls` trust path is folded into core.
+- [ ] **Tests:** `tls-echo`, SMTP/IMAP/POP3/FTP STARTTLS integration tests; event-order tests for handshake + early app data in one read; enable `client_config_public_trust*` once TrustStore has public roots.
 
 
 
@@ -497,7 +520,7 @@ New phase-specific tests are additive; they do not replace the requirement that 
 - [ ] **Remove crate** `hopf-tls`; drop `rustls`, `quinn-proto`, redundant PEM/trust helpers from workspace.
 - [ ] Update umbrella `hopf` crate, `scripts/publish-crates.sh`, and docs (TLS from `hopf-core`; QUIC fully in-tree in `hopf-quic`).
 - [ ] Keep `aws-lc-sys` (or direct FFI) as **the** native crypto dependency.
-- [ ] Update conformance audit rows from **N/A (rustls / quinn)** to **Compliant (in-tree)**.
+- [ ] Update conformance audit rows from **N/A (rustls / quinn)** to **Compliant (in-tree)** — includes QUIC transport / 0-RTT / TLS handshake rows deferred from Phase 3b.
 - [ ] **Tests:** full workspace unit + integration matrix passes (see [Verification](#verification)) — this is the migration completion gate.
 
 

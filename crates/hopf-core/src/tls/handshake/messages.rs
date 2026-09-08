@@ -12,6 +12,8 @@ pub enum HandshakeType {
     ClientHello = 1,
     /// ServerHello.
     ServerHello = 2,
+    /// NewSessionTicket (post-handshake).
+    NewSessionTicket = 4,
     /// EncryptedExtensions.
     EncryptedExtensions = 8,
     /// Certificate.
@@ -50,7 +52,7 @@ impl HandshakeMessage {
     }
 }
 
-/// TLS extension type constants used in Phase 2.
+/// TLS extension type constants used in Phase 2 / 0-RTT.
 pub mod ext {
     /// Server Name Indication (RFC 6066).
     pub const SERVER_NAME: u16 = 0;
@@ -64,7 +66,16 @@ pub mod ext {
     pub const QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
     /// Supported Versions (RFC 8446 §4.2.1).
     pub const SUPPORTED_VERSIONS: u16 = 43;
+    /// Early data indication (RFC 8446 §4.2.10).
+    pub const EARLY_DATA: u16 = 42;
+    /// Pre-shared key (RFC 8446 §4.2.11) — must be last in ClientHello.
+    pub const PRE_SHARED_KEY: u16 = 41;
+    /// PSK key exchange modes (RFC 8446 §4.2.9).
+    pub const PSK_KEY_EXCHANGE_MODES: u16 = 45;
 }
+
+/// `psk_dhe_ke` (RFC 8446 §4.2.9).
+pub const PSK_DHE_KE: u8 = 1;
 
 /// One offered key share in ClientHello.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +84,17 @@ pub struct KeyShareEntry {
     pub group: u16,
     /// Key exchange bytes.
     pub share: Bytes,
+}
+
+/// Optional PSK identity for a resumptive ClientHello.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferedPsk {
+    /// Opaque ticket identity.
+    pub identity: Bytes,
+    /// Obfuscated ticket age (milliseconds).
+    pub obfuscated_ticket_age: u32,
+    /// Binder (filled after truncated-CH hash).
+    pub binder: [u8; 32],
 }
 
 /// Inputs for building a TLS 1.3 ClientHello.
@@ -90,10 +112,59 @@ pub struct ClientHelloParams {
     pub server_name: Option<String>,
     /// QUIC transport parameters extension (RFC 9001), if any.
     pub transport_parameters: Option<Bytes>,
+    /// Offer early data (empty early_data extension).
+    pub early_data: bool,
+    /// Optional single PSK offer (implies psk_key_exchange_modes).
+    pub psk: Option<OfferedPsk>,
 }
 
 /// Build a TLS 1.3 `ClientHello`.
+///
+/// When [`ClientHelloParams::psk`] is set, binders must already be computed (or
+/// zeros for a truncated build used only to measure binder offset). Prefer
+/// [`build_client_hello_with_binder`] for the resumptive path.
 pub fn build_client_hello(params: &ClientHelloParams) -> HandshakeMessage {
+    let (msg, _) = build_client_hello_inner(params, true);
+    msg
+}
+
+/// Build ClientHello and return the truncated encoding used for binder computation
+/// (full handshake header + body through PSK identities, excluding binders).
+pub fn build_client_hello_truncated_for_binder(params: &ClientHelloParams) -> Bytes {
+    let (_, truncated) = build_client_hello_inner(params, false);
+    truncated.expect("psk required for truncated CH")
+}
+
+/// Build a resumptive ClientHello: compute binder over the truncated form, then
+/// emit the complete message.
+pub fn build_client_hello_with_binder(
+    mut params: ClientHelloParams,
+    compute_binder: impl FnOnce(&[u8; 32]) -> [u8; 32],
+) -> HandshakeMessage {
+    assert!(params.psk.is_some(), "psk required");
+    // Placeholder binders for length accounting in truncated form.
+    if let Some(psk) = params.psk.as_mut() {
+        psk.binder = [0u8; 32];
+    }
+    let truncated = build_client_hello_truncated_for_binder(&params);
+    let hash = {
+        use aws_lc_rs::digest::{digest, SHA256};
+        let d = digest(&SHA256, &truncated);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(d.as_ref());
+        out
+    };
+    let binder = compute_binder(&hash);
+    if let Some(psk) = params.psk.as_mut() {
+        psk.binder = binder;
+    }
+    build_client_hello(&params)
+}
+
+fn build_client_hello_inner(
+    params: &ClientHelloParams,
+    include_binders: bool,
+) -> (HandshakeMessage, Option<Bytes>) {
     let mut body = BytesMut::new();
     body.extend_from_slice(&0x0303u16.to_be_bytes());
     body.extend_from_slice(&params.random);
@@ -125,8 +196,9 @@ pub fn build_client_hello(params: &ClientHelloParams) -> HandshakeMessage {
     if let Some(name) = &params.server_name {
         let host = name.as_bytes();
         let mut sni = BytesMut::new();
+        // ServerNameList: list_len | NameType(1) | host_len | host (RFC 6066).
         sni.extend_from_slice(&((host.len() as u16 + 3)).to_be_bytes());
-        sni.extend_from_slice(&0u16.to_be_bytes());
+        sni.extend_from_slice(&[0u8]); // host_name
         sni.extend_from_slice(&(host.len() as u16).to_be_bytes());
         sni.extend_from_slice(host);
         push_extension(&mut extensions, ext::SERVER_NAME, &sni);
@@ -134,17 +206,88 @@ pub fn build_client_hello(params: &ClientHelloParams) -> HandshakeMessage {
     if let Some(tp) = &params.transport_parameters {
         push_extension(&mut extensions, ext::QUIC_TRANSPORT_PARAMETERS, tp);
     }
-    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
-    body.extend_from_slice(&extensions);
-
-    HandshakeMessage {
-        msg_type: HandshakeType::ClientHello,
-        body: body.freeze(),
+    if params.early_data {
+        push_extension(&mut extensions, ext::EARLY_DATA, &[]);
     }
+    if params.psk.is_some() {
+        push_extension(&mut extensions, ext::PSK_KEY_EXCHANGE_MODES, &[1, PSK_DHE_KE]);
+    }
+
+    let mut truncated_wire = None;
+    if let Some(psk) = &params.psk {
+        // pre_shared_key MUST be last (RFC 8446 §4.2.11).
+        let mut identities = BytesMut::new();
+        identities.extend_from_slice(&(psk.identity.len() as u16).to_be_bytes());
+        identities.extend_from_slice(&psk.identity);
+        identities.extend_from_slice(&psk.obfuscated_ticket_age.to_be_bytes());
+        let mut id_list = BytesMut::new();
+        id_list.extend_from_slice(&(identities.len() as u16).to_be_bytes());
+        id_list.extend_from_slice(&identities);
+
+        // One binder entry: 1-byte length + 32-byte binder.
+        let binder_entries_len = 1 + 32;
+        let binders_vector_len = binder_entries_len as u16; // length of binder entries only
+        let ext_payload_len = id_list.len() + 2 + binder_entries_len;
+
+        // Truncated CH includes binders' 2-byte length but not the binder bytes
+        // (RFC 8446 §4.2.11.2). Length fields still cover the binders.
+        let mut trunc_ext = extensions.clone();
+        trunc_ext.extend_from_slice(&ext::PRE_SHARED_KEY.to_be_bytes());
+        trunc_ext.extend_from_slice(&(ext_payload_len as u16).to_be_bytes());
+        trunc_ext.extend_from_slice(&id_list);
+        trunc_ext.extend_from_slice(&binders_vector_len.to_be_bytes());
+
+        let full_ext_len = trunc_ext.len() + binder_entries_len;
+        let mut trunc_body = body.clone();
+        trunc_body.extend_from_slice(&(full_ext_len as u16).to_be_bytes());
+        trunc_body.extend_from_slice(&trunc_ext);
+        let full_body_len = trunc_body.len() + binder_entries_len;
+        let mut trunc_msg = BytesMut::with_capacity(4 + trunc_body.len());
+        trunc_msg.extend_from_slice(&[HandshakeType::ClientHello as u8]);
+        trunc_msg.extend_from_slice(&[
+            (full_body_len >> 16) as u8,
+            (full_body_len >> 8) as u8,
+            full_body_len as u8,
+        ]);
+        trunc_msg.extend_from_slice(&trunc_body);
+        truncated_wire = Some(trunc_msg.freeze());
+
+        if include_binders {
+            let mut psk_payload = BytesMut::new();
+            psk_payload.extend_from_slice(&id_list);
+            psk_payload.extend_from_slice(&binders_vector_len.to_be_bytes());
+            psk_payload.extend_from_slice(&[32u8]);
+            psk_payload.extend_from_slice(&psk.binder);
+            push_extension(&mut extensions, ext::PRE_SHARED_KEY, &psk_payload);
+        }
+    }
+
+    if include_binders || params.psk.is_none() {
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+    }
+
+    (
+        HandshakeMessage {
+            msg_type: HandshakeType::ClientHello,
+            body: body.freeze(),
+        },
+        truncated_wire,
+    )
 }
 
 /// Build a TLS 1.3 `ServerHello` for the selected group + key share.
 pub fn build_server_hello(random: &[u8; 32], group: u16, key_share: &[u8]) -> HandshakeMessage {
+    build_server_hello_ext(random, group, key_share, None)
+}
+
+/// ServerHello with optional selected PSK identity index.
+pub fn build_server_hello_ext(
+    random: &[u8; 32],
+    group: u16,
+    key_share: &[u8],
+    selected_identity: Option<u16>,
+) -> HandshakeMessage {
     let mut body = BytesMut::new();
     body.extend_from_slice(&0x0303u16.to_be_bytes());
     body.extend_from_slice(random);
@@ -159,6 +302,9 @@ pub fn build_server_hello(random: &[u8; 32], group: u16, key_share: &[u8]) -> Ha
     ks.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
     ks.extend_from_slice(key_share);
     push_extension(&mut extensions, ext::KEY_SHARE, &ks);
+    if let Some(idx) = selected_identity {
+        push_extension(&mut extensions, ext::PRE_SHARED_KEY, &idx.to_be_bytes());
+    }
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
 
@@ -170,6 +316,15 @@ pub fn build_server_hello(random: &[u8; 32], group: u16, key_share: &[u8]) -> Ha
 
 /// Build `EncryptedExtensions` with ALPN and optional QUIC transport parameters.
 pub fn build_encrypted_extensions(alpn: &[u8], transport_parameters: Option<&[u8]>) -> HandshakeMessage {
+    build_encrypted_extensions_ext(alpn, transport_parameters, false)
+}
+
+/// EncryptedExtensions with optional early_data acceptance.
+pub fn build_encrypted_extensions_ext(
+    alpn: &[u8],
+    transport_parameters: Option<&[u8]>,
+    early_data_accepted: bool,
+) -> HandshakeMessage {
     let mut extensions = BytesMut::new();
     let mut alpn_list = BytesMut::new();
     alpn_list.extend_from_slice(&[alpn.len() as u8]);
@@ -178,11 +333,45 @@ pub fn build_encrypted_extensions(alpn: &[u8], transport_parameters: Option<&[u8
     if let Some(tp) = transport_parameters {
         push_extension(&mut extensions, ext::QUIC_TRANSPORT_PARAMETERS, tp);
     }
+    if early_data_accepted {
+        push_extension(&mut extensions, ext::EARLY_DATA, &[]);
+    }
     let mut body = BytesMut::new();
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
     HandshakeMessage {
         msg_type: HandshakeType::EncryptedExtensions,
+        body: body.freeze(),
+    }
+}
+
+/// Build a NewSessionTicket (RFC 8446 §4.6.1) with optional early_data.
+pub fn build_new_session_ticket(
+    ticket_lifetime: u32,
+    ticket_age_add: u32,
+    ticket_nonce: &[u8],
+    ticket: &[u8],
+    max_early_data_size: u32,
+) -> HandshakeMessage {
+    let mut body = BytesMut::new();
+    body.extend_from_slice(&ticket_lifetime.to_be_bytes());
+    body.extend_from_slice(&ticket_age_add.to_be_bytes());
+    body.extend_from_slice(&[ticket_nonce.len() as u8]);
+    body.extend_from_slice(ticket_nonce);
+    body.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+    body.extend_from_slice(ticket);
+    let mut extensions = BytesMut::new();
+    if max_early_data_size > 0 {
+        push_extension(
+            &mut extensions,
+            ext::EARLY_DATA,
+            &max_early_data_size.to_be_bytes(),
+        );
+    }
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+    HandshakeMessage {
+        msg_type: HandshakeType::NewSessionTicket,
         body: body.freeze(),
     }
 }
@@ -273,6 +462,8 @@ mod tests {
             alpn: vec![Bytes::from_static(b"h3")],
             server_name: Some("localhost".into()),
             transport_parameters: None,
+            early_data: false,
+            psk: None,
         });
         let parsed = parse_client_hello(&hello.body).expect("parse client hello");
         assert!(parsed.peer_key_share.is_some());

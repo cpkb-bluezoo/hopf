@@ -17,6 +17,7 @@ and graceful stream FIN still use `disconnected`.
 **Today:** in-tree transport (no `quinn-proto`); TLS 1.3 handshake via
 `hopf-core::tls` for QUIC. Loopback echo works
 (`spike_echo_one_stream_hopf` with `QuicListenHardening::permissive()`).
-Retry/GSO/0-RTT and broader interop are still Phase 3 follow-ups. See
+Retry, GSO, and loopback-quality 0-RTT/early data are wired; broader interop
+and H3 remain Phase 3 follow-ups. See
 [docs/quic-h3.html#implementation-status](../../docs/quic-h3.html#implementation-status)
 and [crypto-migration-plan.md](../../crypto-migration-plan.md).

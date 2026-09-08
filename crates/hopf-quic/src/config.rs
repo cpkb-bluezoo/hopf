@@ -62,8 +62,10 @@ impl QuicServerConfig {
     /// Total incoming buffer size (no-op for echo).
     pub fn incoming_buffer_size_total(&mut self, _n: u64) {}
 
-    /// Retry token lifetime (no-op for echo).
-    pub fn retry_token_lifetime(&mut self, _d: Duration) {}
+    /// Retry token lifetime.
+    pub fn retry_token_lifetime(&mut self, d: Duration) {
+        self.inner.retry_token_lifetime = d;
+    }
 
     /// Migration flag.
     pub fn migration(&mut self, m: bool) {
@@ -90,6 +92,12 @@ impl Default for QuicServerConfig {
             kx_policy: KxPolicy::classical_only(),
             local_transport_parameters: None,
             trust_store: None,
+            enable_early_data: false,
+            max_early_data_size: 0,
+            max_early_data_freshness_ms: hopf_core::tls::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: None,
+            ticket_store: None,
+            anti_replay: None,
         })
     }
 }
@@ -354,7 +362,7 @@ impl QuicConnectConfig {
     }
 }
 
-/// TLS options (early data — not supported on in-tree path yet).
+/// TLS options (early data / 0-RTT).
 #[derive(Debug, Clone, Copy)]
 pub struct QuicTlsOptions {
     /// Offer / accept TLS 1.3 early data (0-RTT).
@@ -466,7 +474,7 @@ pub fn server_config_from_pem_with(
     cert_path: &Path,
     key_path: &Path,
     alpn: &[&[u8]],
-    _tls: QuicTlsOptions,
+    tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicServerConfig>> {
     let certs = load_pem_certs(cert_path)?;
     let key = load_private_key_pkcs8(key_path)?;
@@ -477,7 +485,8 @@ pub fn server_config_from_pem_with(
     let params = HopfTlsBuildParams::server(
         creds,
         alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-    );
+    )
+    .with_tls(tls);
     Ok(hopf_server_config(params))
 }
 
@@ -493,7 +502,7 @@ pub fn client_config_from_pem(
 pub fn client_config_from_pem_with(
     ca_path: &Path,
     alpn: &[&[u8]],
-    _tls: QuicTlsOptions,
+    tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicClientConfig>> {
     let certs = load_pem_certs(ca_path)?;
     let mut trust = TrustStore::new();
@@ -507,6 +516,10 @@ pub fn client_config_from_pem_with(
         trust_store: Some(trust),
         server: None,
         local_transport_parameters: None,
+        tls,
+        ticket_store: Some(hopf_core::tls::ClientTicketStore::shared()),
+        ticket_key: None,
+        anti_replay: None,
     };
     Ok(hopf_client_config(params))
 }
@@ -539,9 +552,9 @@ pub fn server_config_self_signed(
 pub fn server_config_self_signed_with(
     names: &[&str],
     alpn: &[&[u8]],
-    _tls: QuicTlsOptions,
+    tls: QuicTlsOptions,
 ) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
-    server_config_self_signed_hopf(names, alpn)
+    server_config_self_signed_with_hopf(names, alpn, tls)
 }
 
 /// In-tree TLS handshake server config.
@@ -556,13 +569,14 @@ pub fn server_config_self_signed_hopf(
 pub fn server_config_self_signed_with_hopf(
     names: &[&str],
     alpn: &[&[u8]],
-    _tls: QuicTlsOptions,
+    tls: QuicTlsOptions,
 ) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
     let (creds, pem) = hopf_server_credentials(names)?;
     let params = HopfTlsBuildParams::server(
         creds,
         alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-    );
+    )
+    .with_tls(tls);
     Ok((hopf_server_config(params), pem))
 }
 
@@ -595,9 +609,9 @@ pub fn client_config_for_pem_bytes(
 pub fn client_config_for_pem_bytes_with(
     leaf_pem: &[u8],
     alpn: &[&[u8]],
-    _tls: QuicTlsOptions,
+    tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicClientConfig>> {
-    client_config_for_pem_bytes_hopf(leaf_pem, alpn)
+    client_config_for_pem_bytes_with_hopf(leaf_pem, alpn, tls)
 }
 
 /// Client config trusting in-memory PEM via in-tree handshake.
@@ -612,14 +626,26 @@ pub fn client_config_for_pem_bytes_hopf(
 pub fn client_config_for_pem_bytes_with_hopf(
     leaf_pem: &[u8],
     alpn: &[&[u8]],
-    _tls: QuicTlsOptions,
+    tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicClientConfig>> {
     let certs = pem_to_der_certs(leaf_pem)?;
-    let params = HopfTlsBuildParams::client_self_signed(
-        alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-        "localhost",
-        certs[0].clone(),
-    );
+    let mut trust = TrustStore::new();
+    trust.add_anchor(certs[0].clone());
+    // Leave `server_name` unset so dial-time SNI from `connect_quic*` wins
+    // (HttpClient / connect_auto pass the origin host; baking "localhost"
+    // here breaks certs minted for other names).
+    let params = HopfTlsBuildParams {
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        kx_policy: KxPolicy::classical_only(),
+        server_name: None,
+        trust_store: Some(trust),
+        server: None,
+        local_transport_parameters: None,
+        tls,
+        ticket_store: Some(hopf_core::tls::ClientTicketStore::shared()),
+        ticket_key: None,
+        anti_replay: None,
+    };
     Ok(hopf_client_config(params))
 }
 
@@ -698,19 +724,51 @@ impl QuicTransportOptions {
     }
 }
 
-/// Apply transport options to server (no-op for echo milestone defaults).
+/// Apply transport options to server.
 pub fn apply_server_transport_options(
-    _server: &mut Arc<QuicServerConfig>,
-    _options: &QuicTransportOptions,
+    server: &mut Arc<QuicServerConfig>,
+    options: &QuicTransportOptions,
 ) -> io::Result<()> {
+    let cfg = Arc::make_mut(server);
+    if let Some(v) = options.datagram_receive_buffer_size {
+        cfg.inner.max_datagram_frame_size = v.map(|n| n as u64);
+    }
+    if let Some(d) = options.max_idle_timeout {
+        cfg.inner.max_idle_timeout = Some(d);
+    }
+    if let Some(n) = options.max_concurrent_bidi_streams {
+        cfg.inner.initial_max_streams_bidi = Some(u64::from(n));
+    }
+    if let Some(n) = options.max_concurrent_uni_streams {
+        cfg.inner.initial_max_streams_uni = Some(u64::from(n));
+    }
+    if let Some(d) = options.keep_alive_interval {
+        cfg.inner.keep_alive_interval = Some(d);
+    }
     Ok(())
 }
 
-/// Apply transport options to client (no-op for echo milestone defaults).
+/// Apply transport options to client.
 pub fn apply_client_transport_options(
-    _client: &mut Arc<QuicClientConfig>,
-    _options: &QuicTransportOptions,
+    client: &mut Arc<QuicClientConfig>,
+    options: &QuicTransportOptions,
 ) -> io::Result<()> {
+    let cfg = Arc::make_mut(client);
+    if let Some(v) = options.datagram_receive_buffer_size {
+        cfg.inner.max_datagram_frame_size = v.map(|n| n as u64);
+    }
+    if let Some(d) = options.max_idle_timeout {
+        cfg.inner.max_idle_timeout = Some(d);
+    }
+    if let Some(n) = options.max_concurrent_bidi_streams {
+        cfg.inner.initial_max_streams_bidi = Some(u64::from(n));
+    }
+    if let Some(n) = options.max_concurrent_uni_streams {
+        cfg.inner.initial_max_streams_uni = Some(u64::from(n));
+    }
+    if let Some(d) = options.keep_alive_interval {
+        cfg.inner.keep_alive_interval = Some(d);
+    }
     Ok(())
 }
 

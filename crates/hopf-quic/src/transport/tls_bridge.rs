@@ -30,6 +30,12 @@ pub struct TlsBridgeEvents {
     pub handshake_keys: Option<([u8; 32], [u8; 32])>,
     /// Application keys ready.
     pub app_keys: Option<([u8; 32], [u8; 32])>,
+    /// Client early (0-RTT) traffic secret.
+    pub early_keys: Option<[u8; 32]>,
+    /// Whether the server accepted early data (`None` until EncryptedExtensions on client).
+    pub early_data_accepted: Option<bool>,
+    /// Peer limits to apply for 0-RTT before EE (client resume).
+    pub remembered_0rtt_limits: Option<hopf_core::tls::RememberedTransportLimits>,
     /// Peer transport parameters raw.
     pub peer_tp: Option<Bytes>,
     /// Handshake finished + security info.
@@ -60,8 +66,17 @@ impl TlsEventSink for Sink<'_> {
             ) {
                 self.events.app_keys = Some((c, s));
             }
+            if let Some(early) = secrets.client_early_traffic_secret {
+                // Prefer early keys already installed at ClientHello / PSK accept;
+                // still record if only present at completion.
+                if self.events.early_keys.is_none() {
+                    self.events.early_keys = Some(early);
+                }
+            }
         }
         self.events.complete = Some(info);
+        // Post-handshake CRYPTO (NewSessionTicket) uses 1-RTT.
+        self.events.write_space = SpaceId::Data;
     }
 
     fn verification_requested(&mut self, _req: VerifyRequest) {}
@@ -76,7 +91,22 @@ impl TlsEventSink for Sink<'_> {
         self.events.write_space = SpaceId::Handshake;
     }
 
+    fn quic_early_keys_ready(&mut self, client_early: [u8; 32]) {
+        self.events.early_keys = Some(client_early);
+    }
+
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
+
+    fn early_data_accepted(&mut self, accepted: bool) {
+        self.events.early_data_accepted = Some(accepted);
+    }
+
+    fn quic_0rtt_peer_limits(
+        &mut self,
+        limits: hopf_core::tls::RememberedTransportLimits,
+    ) {
+        self.events.remembered_0rtt_limits = Some(limits);
+    }
 
     fn protocol_error(&mut self, err: TlsProtocolError) {
         self.events.failed = Some(err.message);
@@ -155,13 +185,16 @@ impl TlsBridge {
             write_space: match space {
                 SpaceId::Initial => SpaceId::Initial,
                 SpaceId::Handshake => SpaceId::Handshake,
-                SpaceId::Data => SpaceId::Handshake,
+                SpaceId::Data => SpaceId::Data,
             },
             ..Default::default()
         };
         // After we have handshake keys, server replies on Handshake.
         if self.read_space == SpaceId::Handshake || space == SpaceId::Handshake {
             events.write_space = SpaceId::Handshake;
+        }
+        if self.complete || space == SpaceId::Data {
+            events.write_space = SpaceId::Data;
         }
         {
             let mut sink = Sink {
@@ -175,13 +208,11 @@ impl TlsBridge {
         }
         if events.complete.is_some() {
             self.complete = true;
-            // Client Finished goes on Handshake space.
-            events.write_space = SpaceId::Handshake;
+            events.write_space = SpaceId::Data;
         }
         // Fix write_space for server flight: after processing ClientHello on Initial,
         // ServerHello is Initial; rest is Handshake — connection applies split.
-        if self.side == Side::Server && events.handshake_keys.is_some() {
-            // Outbound already queued; first msg Initial, rest Handshake via split in connection.
+        if self.side == Side::Server && events.handshake_keys.is_some() && !self.complete {
             for o in &mut events.outbound {
                 o.space = SpaceId::Initial; // connection will re-bucket after ServerHello
             }

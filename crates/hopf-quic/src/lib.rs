@@ -43,10 +43,11 @@ pub use error::{
     connection_close_error, datagram_send_error, stream_stopped_error, QuicConnectionCloseError,
     QuicDatagramSendError, QuicStreamStoppedError,
 };
-pub use hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection};
+pub use hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection, StreamKey};
 pub use path::QuicDatagramPath;
 pub use runtime_ext::RuntimeQuicExt;
 pub use stream::QuicStreamEndpoint;
+pub use transport::types::StreamId;
 pub use hopf_core::VERSION;
 
 /// ALPN protocol identifier for HTTP/3.

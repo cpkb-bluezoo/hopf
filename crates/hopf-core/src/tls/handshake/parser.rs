@@ -81,6 +81,36 @@ pub trait HandshakeEvents {
         let _ = (ext_type, data);
     }
 
+    /// Client offered / server selected early data (empty payload in CH/EE).
+    fn early_data(&mut self) {}
+
+    /// ClientHello: offered PSK identity and binder.
+    fn psk_identity(&mut self, identity: &[u8], obfuscated_ticket_age: u32) {
+        let _ = (identity, obfuscated_ticket_age);
+    }
+
+    /// ClientHello: one PSK binder entry.
+    fn psk_binder(&mut self, binder: &[u8]) {
+        let _ = binder;
+    }
+
+    /// ServerHello: selected PSK identity index.
+    fn psk_selected_identity(&mut self, index: u16) {
+        let _ = index;
+    }
+
+    /// NewSessionTicket body fields (opaque ticket + early_data max).
+    fn new_session_ticket(
+        &mut self,
+        lifetime: u32,
+        age_add: u32,
+        nonce: &[u8],
+        ticket: &[u8],
+        max_early_data: u32,
+    ) {
+        let _ = (lifetime, age_add, nonce, ticket, max_early_data);
+    }
+
     /// TLS 1.3 Certificate request context.
     fn certificate_request_context(&mut self, ctx: &[u8]) {
         let _ = ctx;
@@ -171,6 +201,7 @@ fn decode_message_body(msg_type: HandshakeType, body: &[u8], handler: &mut dyn H
     match msg_type {
         HandshakeType::ClientHello => decode_client_hello(body, handler),
         HandshakeType::ServerHello => decode_server_hello(body, handler),
+        HandshakeType::NewSessionTicket => decode_new_session_ticket(body, handler),
         HandshakeType::EncryptedExtensions => decode_encrypted_extensions(body, handler),
         HandshakeType::Certificate => decode_certificate(body, handler),
         HandshakeType::CertificateVerify => decode_certificate_verify(body, handler),
@@ -343,6 +374,57 @@ fn decode_finished(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
     true
 }
 
+fn decode_new_session_ticket(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
+    if body.len() < 4 + 4 + 1 + 2 {
+        handler.parse_error("NewSessionTicket too short");
+        return false;
+    }
+    let mut i = 0;
+    let lifetime = u32::from_be_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+    i += 4;
+    let age_add = u32::from_be_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+    i += 4;
+    let nonce_len = body[i] as usize;
+    i += 1;
+    if body.len() < i + nonce_len + 2 {
+        handler.parse_error("NewSessionTicket truncated nonce");
+        return false;
+    }
+    let nonce = &body[i..i + nonce_len];
+    i += nonce_len;
+    let ticket_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+    i += 2;
+    if body.len() < i + ticket_len + 2 {
+        handler.parse_error("NewSessionTicket truncated ticket");
+        return false;
+    }
+    let ticket = &body[i..i + ticket_len];
+    i += ticket_len;
+    let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+    i += 2;
+    if body.len() < i + ext_len {
+        handler.parse_error("NewSessionTicket truncated extensions");
+        return false;
+    }
+    let mut max_early = 0u32;
+    let exts = &body[i..i + ext_len];
+    let mut j = 0;
+    while j + 4 <= exts.len() {
+        let et = u16::from_be_bytes([exts[j], exts[j + 1]]);
+        let el = u16::from_be_bytes([exts[j + 2], exts[j + 3]]) as usize;
+        j += 4;
+        if j + el > exts.len() {
+            break;
+        }
+        if et == ext::EARLY_DATA && el == 4 {
+            max_early = u32::from_be_bytes([exts[j], exts[j + 1], exts[j + 2], exts[j + 3]]);
+        }
+        j += el;
+    }
+    handler.new_session_ticket(lifetime, age_add, nonce, ticket, max_early);
+    true
+}
+
 fn decode_extensions(extensions: &[u8], handler: &mut dyn HandshakeEvents) {
     decode_extension_block(extensions, handler, KeyShareExtMode::ClientHelloList);
 }
@@ -384,6 +466,16 @@ fn decode_extension_block(
                 }
             }
             ext::QUIC_TRANSPORT_PARAMETERS => handler.transport_parameters(edata),
+            ext::EARLY_DATA => handler.early_data(),
+            ext::PRE_SHARED_KEY => match key_share_mode {
+                KeyShareExtMode::ClientHelloList => decode_psk_client(edata, handler),
+                KeyShareExtMode::ServerHelloSingle => {
+                    if edata.len() == 2 {
+                        handler.psk_selected_identity(u16::from_be_bytes([edata[0], edata[1]]));
+                    }
+                }
+            },
+            ext::PSK_KEY_EXCHANGE_MODES => { /* accepted; no state needed beyond presence via PSK */ }
             _ => handler.extension(etype, edata),
         }
         ext_i += elen;
@@ -471,11 +563,52 @@ fn parse_sni_host(data: &[u8]) -> Option<String> {
     None
 }
 
+fn decode_psk_client(data: &[u8], handler: &mut dyn HandshakeEvents) {
+    if data.len() < 2 {
+        return;
+    }
+    let id_list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let mut i = 2;
+    if data.len() < 2 + id_list_len + 2 {
+        return;
+    }
+    let id_end = 2 + id_list_len;
+    while i + 2 <= id_end {
+        let id_len = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+        i += 2;
+        if i + id_len + 4 > id_end {
+            return;
+        }
+        let identity = &data[i..i + id_len];
+        i += id_len;
+        let age = u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        i += 4;
+        handler.psk_identity(identity, age);
+    }
+    i = id_end;
+    let binders_len = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+    i += 2;
+    let binders_end = i + binders_len;
+    if binders_end > data.len() {
+        return;
+    }
+    while i < binders_end {
+        let blen = data[i] as usize;
+        i += 1;
+        if i + blen > binders_end {
+            return;
+        }
+        handler.psk_binder(&data[i..i + blen]);
+        i += blen;
+    }
+}
+
 impl HandshakeType {
     pub(crate) fn from_u8(v: u8) -> Option<Self> {
         match v {
             1 => Some(HandshakeType::ClientHello),
             2 => Some(HandshakeType::ServerHello),
+            4 => Some(HandshakeType::NewSessionTicket),
             8 => Some(HandshakeType::EncryptedExtensions),
             11 => Some(HandshakeType::Certificate),
             15 => Some(HandshakeType::CertificateVerify),
@@ -531,6 +664,8 @@ mod tests {
             alpn: vec![Bytes::from_static(b"h3")],
             server_name: Some("localhost".into()),
             transport_parameters: None,
+            early_data: false,
+            psk: None,
         });
         let wire = hello.encode();
         let split = wire.len() / 2;

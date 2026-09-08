@@ -5,8 +5,39 @@
 
 use hopf_core::ProtocolHandler;
 
+use crate::StreamId;
+
 /// Factory for one [`QuicConnection`] per accepted/dialed QUIC connection.
 pub type ConnectionFactory = std::sync::Arc<dyn Fn() -> Box<dyn QuicConnection> + Send + Sync>;
+
+/// Opaque handle from [`QuicConnApi::open_uni`] / [`QuicConnApi::open_bi`] for
+/// [`QuicConnApi::write`] / [`QuicConnApi::finish`].
+///
+/// Distinct from [`StreamId`]: a key is a driver-local token issued before the
+/// open is applied to the transport. Do not forge keys or confuse them with
+/// wire stream ids.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StreamKey(u64);
+
+impl std::fmt::Debug for StreamKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StreamKey({})", self.0)
+    }
+}
+
+impl StreamKey {
+    /// Construct a key. Prefer values returned by [`QuicConnApi::open_uni`] /
+    /// [`QuicConnApi::open_bi`]; use this only in test doubles or custom
+    /// [`QuicConnApi`] implementations.
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Numeric value for logging / test assertions.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
 
 /// Application logic for one QUIC connection (control streams + request streams).
 pub trait QuicConnection: Send {
@@ -21,11 +52,11 @@ pub trait QuicConnection: Send {
     /// lifetime; apps that key per-stream state (e.g. HTTP/3 QPACK field
     /// section instructions, RFC 9204 §4.5) by stream id need this to
     /// avoid every stream colliding on the same key.
-    fn accept_bi(&mut self, stream_id: u64) -> Box<dyn ProtocolHandler>;
+    fn accept_bi(&mut self, stream_id: StreamId) -> Box<dyn ProtocolHandler>;
 
     /// A new unidirectional stream — see [`Self::accept_bi`] for
     /// `stream_id`.
-    fn accept_uni(&mut self, stream_id: u64) -> Box<dyn ProtocolHandler>;
+    fn accept_uni(&mut self, stream_id: StreamId) -> Box<dyn ProtocolHandler>;
 
     /// Called once for every still-live connection right before a local,
     /// explicit [`crate::QuicDriverHandle::shutdown`] tears the driver
@@ -72,14 +103,14 @@ pub enum DatagramDecode {
     /// Deliver `payload` to the bidirectional stream with this QUIC stream id.
     Deliver {
         /// Real QUIC stream id (RFC 9000 §2.1).
-        stream_id: u64,
+        stream_id: StreamId,
         /// Bytes after any application demux prefix (e.g. HTTP Datagram payload).
         payload: Vec<u8>,
     },
     /// Abort one stream with an application error code.
     AbortStream {
         /// Real QUIC stream id.
-        stream_id: u64,
+        stream_id: StreamId,
         /// Application error code (e.g. HTTP/3 `H3_DATAGRAM_ERROR`).
         error_code: u32,
     },
@@ -92,17 +123,18 @@ pub enum DatagramDecode {
 
 /// API available during [`QuicConnection::connected`] on the driver thread.
 pub trait QuicConnApi {
-    /// Open a local unidirectional stream; returns an opaque stream key for [`write`](Self::write).
-    fn open_uni(&mut self) -> Option<u64>;
+    /// Open a local unidirectional stream; returns a [`StreamKey`] for
+    /// [`write`](Self::write) / [`finish`](Self::finish).
+    fn open_uni(&mut self) -> Option<StreamKey>;
 
     /// Open a local bidirectional stream.
-    fn open_bi(&mut self) -> Option<u64>;
+    fn open_bi(&mut self) -> Option<StreamKey>;
 
     /// Queue bytes on a stream opened via this API (or later accepted and keyed).
-    fn write(&mut self, stream_key: u64, data: &[u8]);
+    fn write(&mut self, stream_key: StreamKey, data: &[u8]);
 
     /// Finish the send side of a stream.
-    fn finish(&mut self, stream_key: u64);
+    fn finish(&mut self, stream_key: StreamKey);
 
     /// Queue a QUIC DATAGRAM (RFC 9221) for the connection. Default: no-op
     /// (returns `Unsupported`).
@@ -113,8 +145,9 @@ pub trait QuicConnApi {
         ))
     }
 
-    /// Set quinn-proto send priority for a stream (higher = sooner). Used by
-    /// HTTP/3 to apply RFC 9218 urgency. `stream_id` is the real QUIC id.
+    /// Set send priority for a stream (higher = sooner). Used by HTTP/3 to
+    /// apply RFC 9218 urgency. `stream_id` is the real QUIC id from
+    /// [`QuicConnection::accept_bi`] / [`QuicConnection::accept_uni`].
     /// Default: ignore.
-    fn set_stream_priority(&mut self, _stream_id: u64, _priority: i32) {}
+    fn set_stream_priority(&mut self, _stream_id: StreamId, _priority: i32) {}
 }

@@ -60,6 +60,8 @@ pub struct QuicSecrets {
     pub client_application_traffic_secret: Option<[u8; 32]>,
     /// Server application traffic secret.
     pub server_application_traffic_secret: Option<[u8; 32]>,
+    /// Client early (0-RTT) traffic secret, when early data was negotiated.
+    pub client_early_traffic_secret: Option<[u8; 32]>,
 }
 
 /// Events emitted by [`super::HandshakeEngine`] — consumed by the QUIC driver or TCP pump.
@@ -79,8 +81,18 @@ pub trait TlsEventSink {
     /// Handshake traffic secrets are available — install Handshake packet-space keys.
     fn quic_handshake_keys_ready(&mut self, _client: [u8; 32], _server: [u8; 32]) {}
 
+    /// Client early traffic secret available (0-RTT keys) — before or with ClientHello send /
+    /// after accepting a PSK on the server.
+    fn quic_early_keys_ready(&mut self, _client_early: [u8; 32]) {}
+
     /// Negotiated TLS key-exchange group (IANA code, e.g. 0x11ec for X25519MLKEM768).
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
+
+    /// Whether the server accepted early data (client only; after EncryptedExtensions).
+    fn early_data_accepted(&mut self, _accepted: bool) {}
+
+    /// Client-only: peer limits to apply for 0-RTT before EncryptedExtensions (RFC 9000 §7.4.1).
+    fn quic_0rtt_peer_limits(&mut self, _limits: super::handshake::RememberedTransportLimits) {}
 
     /// Non-fatal protocol failure.
     fn protocol_error(&mut self, err: TlsProtocolError);
@@ -102,7 +114,10 @@ impl TlsEventSink for NopTlsEventSink {
     fn verification_requested(&mut self, _req: VerifyRequest) {}
     fn peer_transport_parameters(&mut self, _params: &[u8]) {}
     fn quic_handshake_keys_ready(&mut self, _client: [u8; 32], _server: [u8; 32]) {}
+    fn quic_early_keys_ready(&mut self, _client_early: [u8; 32]) {}
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
+    fn early_data_accepted(&mut self, _accepted: bool) {}
+    fn quic_0rtt_peer_limits(&mut self, _limits: super::handshake::RememberedTransportLimits) {}
     fn protocol_error(&mut self, _err: TlsProtocolError) {}
     fn timeout(&mut self, _kind: TlsTimerKind) {}
     fn peer_closed(&mut self) {}

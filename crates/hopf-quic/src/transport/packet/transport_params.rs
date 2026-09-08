@@ -36,6 +36,10 @@ pub struct TransportParameters {
     pub initial_src_cid: Option<ConnectionId>,
     /// original_destination_connection_id (server)
     pub original_dst_cid: Option<ConnectionId>,
+    /// retry_source_connection_id (server, after Retry)
+    pub retry_src_cid: Option<ConnectionId>,
+    /// max_datagram_frame_size (RFC 9221); `None` = omit (DATAGRAM disabled).
+    pub max_datagram_frame_size: Option<u64>,
 }
 
 impl Default for TransportParameters {
@@ -55,6 +59,8 @@ impl Default for TransportParameters {
             active_connection_id_limit: 2,
             initial_src_cid: None,
             original_dst_cid: None,
+            retry_src_cid: None,
+            max_datagram_frame_size: Some(1452),
         }
     }
 }
@@ -73,6 +79,8 @@ const MAX_ACK_DELAY: u64 = 0x0b;
 const DISABLE_ACTIVE_MIGRATION: u64 = 0x0c;
 const ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0e;
 const INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0f;
+const RETRY_SOURCE_CONNECTION_ID: u64 = 0x10;
+const MAX_DATAGRAM_FRAME_SIZE: u64 = 0x20;
 
 impl TransportParameters {
     /// Encode to TLS extension payload.
@@ -135,12 +143,20 @@ impl TransportParameters {
         if let Some(ref cid) = self.initial_src_cid {
             put_bytes(&mut out, INITIAL_SOURCE_CONNECTION_ID, cid.as_slice());
         }
+        if let Some(ref cid) = self.retry_src_cid {
+            put_bytes(&mut out, RETRY_SOURCE_CONNECTION_ID, cid.as_slice());
+        }
+        if let Some(max) = self.max_datagram_frame_size {
+            put_var(&mut out, MAX_DATAGRAM_FRAME_SIZE, max);
+        }
         out
     }
 
     /// Decode from TLS extension payload (unknown IDs skipped).
     pub fn decode(mut buf: &[u8]) -> Option<Self> {
         let mut tp = Self::default();
+        // Omitted means peer does not support DATAGRAM (RFC 9221).
+        tp.max_datagram_frame_size = None;
         while !buf.is_empty() {
             let id = varint::decode(&mut buf)?;
             let len = varint::decode(&mut buf)? as usize;
@@ -191,6 +207,12 @@ impl TransportParameters {
                 }
                 INITIAL_SOURCE_CONNECTION_ID => {
                     tp.initial_src_cid = Some(ConnectionId::from_slice(value));
+                }
+                RETRY_SOURCE_CONNECTION_ID => {
+                    tp.retry_src_cid = Some(ConnectionId::from_slice(value));
+                }
+                MAX_DATAGRAM_FRAME_SIZE => {
+                    tp.max_datagram_frame_size = Some(varint::decode(&mut value)?);
                 }
                 _ => {}
             }

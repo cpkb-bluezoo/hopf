@@ -15,8 +15,8 @@ pub const TYPE_HANDSHAKE: u8 = 2;
 /// Retry.
 pub const TYPE_RETRY: u8 = 3;
 
-const HEADER_FORM_LONG: u8 = 0x80;
-const FIXED_BIT: u8 = 0x40;
+pub(crate) const HEADER_FORM_LONG: u8 = 0x80;
+pub(crate) const FIXED_BIT: u8 = 0x40;
 
 /// Unprotected long-header prefix (through Length; PN still protected).
 #[derive(Debug, Clone)]
@@ -155,6 +155,26 @@ pub fn build_handshake(
 ) -> Vec<u8> {
     build(
         TYPE_HANDSHAKE,
+        VERSION_V1,
+        dst_cid,
+        src_cid,
+        &[],
+        packet_number,
+        pn_length,
+        protected_payload_len,
+    )
+}
+
+/// Convenience: 0-RTT packet for QUIC v1.
+pub fn build_0rtt(
+    dst_cid: &ConnectionId,
+    src_cid: &ConnectionId,
+    packet_number: u64,
+    pn_length: usize,
+    protected_payload_len: usize,
+) -> Vec<u8> {
+    build(
+        TYPE_0RTT,
         VERSION_V1,
         dst_cid,
         src_cid,

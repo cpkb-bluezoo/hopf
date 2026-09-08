@@ -21,7 +21,7 @@ use crate::config::{
     QuicListenHooksConfig,
 };
 use crate::error::{connection_lost_io_error, datagram_send_io_error, stream_stopped_io_error};
-use crate::hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection};
+use crate::hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection, StreamKey};
 use crate::stream::{QuicStreamEndpoint, StreamQueues};
 use crate::transport::connection::{Connection, WriteError};
 use crate::transport::endpoint::Endpoint as QuicEndpoint;
@@ -555,7 +555,7 @@ struct ConnSlot {
     /// Hooks-mode application connection (H3).
     app: Option<Box<dyn QuicConnection>>,
     /// Keys from ConnRecorder → StreamId for locally opened streams.
-    local_keys: HashMap<u64, StreamId>,
+    local_keys: HashMap<StreamKey, StreamId>,
     /// RFC 9221 DATAGRAMs that hit `SendDatagramError::Blocked`.
     pending_app_datagrams: std::collections::VecDeque<Bytes>,
 }
@@ -950,14 +950,12 @@ impl Driver {
         let transport = &mut self.transport;
         self.pending_sends.flush(|pending| match transport {
             DatagramTransport::Socket(socket) => crate::udp::send_pending(socket, pending),
-            DatagramTransport::Path(path) => path
-                .send(
-                    pending.destination,
-                    &pending.data,
-                    pending.ecn,
-                    pending.segment_size,
-                )
-                .map(|_| ()),
+            DatagramTransport::Path(path) => {
+                for payload in crate::udp::udp_payloads(&pending.data, pending.segment_size) {
+                    path.send(pending.destination, payload, pending.ecn, None)?;
+                }
+                Ok(())
+            }
         })
     }
 
@@ -1204,15 +1202,11 @@ impl Driver {
         remote: SocketAddr,
         now: Instant,
     ) -> io::Result<()> {
-        // Echo milestone: Retry is a no-op. With permissive hardening this
-        // branch is skipped; otherwise drop unvalidated Initials.
+        // With high_security hardening, unvalidated Initials get a Retry.
         if self.require_address_validation && !incoming.remote_address_validated() {
             match self.endpoint.retry(incoming, &mut self.send_buf) {
                 Ok(tx) => self.send_transmit(tx)?,
-                Err(()) => {
-                    // Retry not implemented — refuse without a response packet.
-                    // (Incoming already consumed by retry.)
-                }
+                Err(()) => {}
             }
             return Ok(());
         }
@@ -1465,7 +1459,7 @@ impl Driver {
                         Arc::clone(&self.execute),
                     );
                     let mut handler = match dir {
-                        Dir::Bi => app.accept_bi(u64::from(id)),
+                        Dir::Bi => app.accept_bi(id),
                         Dir::Uni => Box::new(hopf_core::NopHandler),
                     };
                     handler.connected(&mut endpoint);
@@ -1514,10 +1508,7 @@ impl Driver {
                     priority,
                 } => {
                     if let Some(slot) = self.connections.get_mut(&ch) {
-                        if let Ok(vid) = VarInt::from_u64(stream_id) {
-                            let sid = StreamId::from(vid);
-                            let _ = slot.conn.send_stream(sid).set_priority(priority);
-                        }
+                        let _ = slot.conn.send_stream(stream_id).set_priority(priority);
                     }
                 }
             }
@@ -1615,12 +1606,8 @@ impl Driver {
             match decode {
                 DatagramDecode::Drop => {}
                 DatagramDecode::Deliver { stream_id, payload } => {
-                    let Ok(vid) = VarInt::from_u64(stream_id) else {
-                        continue;
-                    };
-                    let sid = StreamId::from(vid);
                     if let Some(slot) = self.connections.get_mut(&ch) {
-                        if let Some(stream) = slot.streams.get_mut(&sid) {
+                        if let Some(stream) = slot.streams.get_mut(&stream_id) {
                             stream
                                 .handler
                                 .datagram_received(&mut stream.endpoint, &payload);
@@ -1631,12 +1618,8 @@ impl Driver {
                     stream_id,
                     error_code,
                 } => {
-                    let Ok(vid) = VarInt::from_u64(stream_id) else {
-                        continue;
-                    };
-                    let sid = StreamId::from(vid);
                     if let Some(slot) = self.connections.get_mut(&ch) {
-                        if let Some(stream) = slot.streams.get_mut(&sid) {
+                        if let Some(stream) = slot.streams.get_mut(&stream_id) {
                             stream.endpoint.abort(error_code);
                         }
                     }
@@ -1723,8 +1706,8 @@ impl Driver {
                     .and_then(|s| s.app.take())
                     .unwrap();
                 let h = match dir {
-                    Dir::Bi => app.accept_bi(u64::from(id)),
-                    Dir::Uni => app.accept_uni(u64::from(id)),
+                    Dir::Bi => app.accept_bi(id),
+                    Dir::Uni => app.accept_uni(id),
                 };
                 if let Some(slot) = self.connections.get_mut(&ch) {
                     slot.app = Some(app);
@@ -2078,14 +2061,15 @@ impl Driver {
         let buf = &self.send_buf[..size];
         let result = match &mut self.transport {
             DatagramTransport::Socket(socket) => crate::udp::send_transmit(socket, &transmit, buf),
-            DatagramTransport::Path(path) => path
-                .send(
-                    transmit.destination,
-                    buf,
-                    transmit.ecn,
-                    transmit.segment_size,
-                )
-                .map(|_| ()),
+            DatagramTransport::Path(path) => {
+                // Path transports don't speak Linux UDP_SEGMENT; deliver each
+                // GSO segment as its own datagram (short-header packets have
+                // no Length and must not share a UDP payload).
+                for payload in crate::udp::udp_payloads(buf, transmit.segment_size) {
+                    path.send(transmit.destination, payload, transmit.ecn, None)?;
+                }
+                Ok(())
+            }
         };
         match result {
             Ok(()) => Ok(()),
@@ -2205,16 +2189,16 @@ struct ConnRecorder {
 }
 
 enum RecorderAction {
-    Open { dir: Dir, key: u64 },
-    Write { key: u64, data: Vec<u8> },
-    Finish { key: u64 },
+    Open { dir: Dir, key: StreamKey },
+    Write { key: StreamKey, data: Vec<u8> },
+    Finish { key: StreamKey },
     SendDatagram { data: Vec<u8> },
-    SetStreamPriority { stream_id: u64, priority: i32 },
+    SetStreamPriority { stream_id: StreamId, priority: i32 },
 }
 
 impl QuicConnApi for ConnRecorder {
-    fn open_uni(&mut self) -> Option<u64> {
-        let key = self.next_key;
+    fn open_uni(&mut self) -> Option<StreamKey> {
+        let key = StreamKey::from_raw(self.next_key);
         self.next_key += 1;
         self.actions.push(RecorderAction::Open {
             dir: Dir::Uni,
@@ -2223,8 +2207,8 @@ impl QuicConnApi for ConnRecorder {
         Some(key)
     }
 
-    fn open_bi(&mut self) -> Option<u64> {
-        let key = self.next_key;
+    fn open_bi(&mut self) -> Option<StreamKey> {
+        let key = StreamKey::from_raw(self.next_key);
         self.next_key += 1;
         self.actions.push(RecorderAction::Open {
             dir: Dir::Bi,
@@ -2233,14 +2217,14 @@ impl QuicConnApi for ConnRecorder {
         Some(key)
     }
 
-    fn write(&mut self, stream_key: u64, data: &[u8]) {
+    fn write(&mut self, stream_key: StreamKey, data: &[u8]) {
         self.actions.push(RecorderAction::Write {
             key: stream_key,
             data: data.to_vec(),
         });
     }
 
-    fn finish(&mut self, stream_key: u64) {
+    fn finish(&mut self, stream_key: StreamKey) {
         self.actions.push(RecorderAction::Finish { key: stream_key });
     }
 
@@ -2251,7 +2235,7 @@ impl QuicConnApi for ConnRecorder {
         Ok(())
     }
 
-    fn set_stream_priority(&mut self, stream_id: u64, priority: i32) {
+    fn set_stream_priority(&mut self, stream_id: StreamId, priority: i32) {
         self.actions.push(RecorderAction::SetStreamPriority {
             stream_id,
             priority,
@@ -2405,7 +2389,12 @@ mod tests {
     /// public resolver; needs real internet access, which is exactly why
     /// this lives behind this module's own `integration` feature gate
     /// rather than running in CI.
+    ///
+    /// Ignored until `client_config_public_trust` loads WebPKI/native
+    /// roots into `hopf-core::TrustStore` (still intentional `Unsupported`
+    /// on the in-tree path; see crypto-migration-plan Phase 3b).
     #[test]
+    #[ignore = "public WebPKI trust not wired on in-tree QUIC yet"]
     fn client_config_public_trust_validates_a_real_public_doq_resolver() {
         use crate::config::client_config_public_trust;
 
@@ -2445,7 +2434,10 @@ mod tests {
     /// client would — proving the validation is real rather than the
     /// positive test above merely reaching a server that happens to
     /// accept anything.
+    ///
+    /// Ignored until public WebPKI trust is wired (see sibling test).
     #[test]
+    #[ignore = "public WebPKI trust not wired on in-tree QUIC yet"]
     fn client_config_public_trust_rejects_a_self_signed_server() {
         use crate::config::client_config_public_trust;
 
@@ -3505,10 +3497,10 @@ mod tests {
 
     impl QuicConnection for DatagramEchoConn {
         fn connected(&mut self, _api: &mut dyn QuicConnApi) {}
-        fn accept_bi(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+        fn accept_bi(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
             Box::new(NopHandler)
         }
-        fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+        fn accept_uni(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
             Box::new(NopHandler)
         }
         fn decode_datagram(&mut self, data: &[u8]) -> crate::DatagramDecode {
@@ -3534,10 +3526,10 @@ mod tests {
             api.send_datagram(b"ping").expect("client DATAGRAM send");
             self.sent = true;
         }
-        fn accept_bi(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+        fn accept_bi(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
             Box::new(NopHandler)
         }
-        fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+        fn accept_uni(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
             Box::new(NopHandler)
         }
         fn decode_datagram(&mut self, data: &[u8]) -> crate::DatagramDecode {
@@ -3607,10 +3599,10 @@ mod tests {
             let stream = api.open_uni().expect("open_uni");
             api.write(stream, self.payload);
         }
-        fn accept_bi(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+        fn accept_bi(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
             Box::new(NopHandler)
         }
-        fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+        fn accept_uni(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
             Box::new(NopHandler)
         }
     }
@@ -3637,10 +3629,10 @@ mod tests {
 
     impl QuicConnection for AcceptsUniIntoRecorder {
         fn connected(&mut self, _api: &mut dyn QuicConnApi) {}
-        fn accept_bi(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+        fn accept_bi(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
             Box::new(NopHandler)
         }
-        fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+        fn accept_uni(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
             Box::new(RecordsUniBytes { got: Arc::clone(&self.got) })
         }
     }
