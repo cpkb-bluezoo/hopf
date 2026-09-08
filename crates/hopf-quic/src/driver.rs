@@ -2390,11 +2390,7 @@ mod tests {
     /// this lives behind this module's own `integration` feature gate
     /// rather than running in CI.
     ///
-    /// Ignored until `client_config_public_trust` loads WebPKI/native
-    /// roots into `hopf-core::TrustStore` (still intentional `Unsupported`
-    /// on the in-tree path; see crypto-migration-plan Phase 3b).
     #[test]
-    #[ignore = "public WebPKI trust not wired on in-tree QUIC yet"]
     fn client_config_public_trust_validates_a_real_public_doq_resolver() {
         use crate::config::client_config_public_trust;
 
@@ -2434,10 +2430,7 @@ mod tests {
     /// client would — proving the validation is real rather than the
     /// positive test above merely reaching a server that happens to
     /// accept anything.
-    ///
-    /// Ignored until public WebPKI trust is wired (see sibling test).
     #[test]
-    #[ignore = "public WebPKI trust not wired on in-tree QUIC yet"]
     fn client_config_public_trust_rejects_a_self_signed_server() {
         use crate::config::client_config_public_trust;
 

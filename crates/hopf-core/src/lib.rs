@@ -77,9 +77,10 @@ pub use storage::{StorageConfig, StorageError, StorageExecutor};
 pub use telemetry::{NopTelemetry, TelemetryHook};
 pub use tls::{
     acceptor_from_pem, connector_from_pem, connector_with_verify_override, insecure_connector,
-    server_credentials_from_pem, HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole,
-    NopTlsEventSink, QuicSecrets, SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector,
-    TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyOverride, VerifyRequest, VerifyResult,
+    public_trust_connector, server_credentials_from_pem, HandshakeConfig, HandshakeEngine,
+    HandshakeMode, HandshakeRole, NopTlsEventSink, QuicSecrets, SharedTlsAcceptor,
+    SharedTlsConnector, TlsAcceptor, TlsConnector, TlsEventSink, TlsProtocolError, TlsTimerKind,
+    VerifyOverride, VerifyRequest, VerifyResult,
 };
 pub use udp::UdpDatagramHandler;
 

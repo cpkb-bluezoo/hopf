@@ -5,7 +5,10 @@
 use bytes::Bytes;
 
 use super::signature::ed25519_verify;
-use aws_lc_rs::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, RSA_PKCS1_2048_8192_SHA256};
+use aws_lc_rs::signature::{
+    UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, RSA_PKCS1_2048_8192_SHA256,
+    RSA_PKCS1_2048_8192_SHA384, RSA_PKCS1_2048_8192_SHA512,
+};
 
 /// Parsed certificate fields needed for chain and hostname verification.
 #[derive(Debug, Clone)]
@@ -110,8 +113,23 @@ pub fn verify_cert_signature(cert: &ParsedCertificate, issuer_spki: &[u8]) -> bo
             .verify(cert.tbs_der.as_ref(), cert.signature.as_ref())
             .is_ok();
     }
+    if oid.as_slice() == OID_RAW_ECDSA_SHA384 {
+        return UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, issuer_spki)
+            .verify(cert.tbs_der.as_ref(), cert.signature.as_ref())
+            .is_ok();
+    }
     if oid.as_slice() == OID_RAW_RSA_SHA256 {
         return UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, issuer_spki)
+            .verify(cert.tbs_der.as_ref(), cert.signature.as_ref())
+            .is_ok();
+    }
+    if oid.as_slice() == OID_RAW_RSA_SHA384 {
+        return UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA384, issuer_spki)
+            .verify(cert.tbs_der.as_ref(), cert.signature.as_ref())
+            .is_ok();
+    }
+    if oid.as_slice() == OID_RAW_RSA_SHA512 {
+        return UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA512, issuer_spki)
             .verify(cert.tbs_der.as_ref(), cert.signature.as_ref())
             .is_ok();
     }
@@ -148,7 +166,10 @@ fn dns_name_matches(pattern: &str, host: &str) -> bool {
 const OID_SUBJECT_ALT_NAME: [u8; 3] = [0x55, 0x1d, 0x11];
 const OID_RAW_ED25519: [u8; 3] = [0x2b, 0x65, 0x70];
 const OID_RAW_ECDSA_SHA256: [u8; 8] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+const OID_RAW_ECDSA_SHA384: [u8; 8] = [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
 const OID_RAW_RSA_SHA256: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
+const OID_RAW_RSA_SHA384: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+const OID_RAW_RSA_SHA512: [u8; 9] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
 
 fn sig_alg_oid(sig_alg_der: &[u8]) -> Option<Vec<u8>> {
     let mut seq = parse_asn1_sequence(sig_alg_der)?;
@@ -410,4 +431,34 @@ mod tests {
         assert!(verify_cert_signature(&parsed, &parsed.spki_der));
         assert!(matches_hostname(&parsed, "localhost"));
     }
+
+    /// Real WebPKI root/intermediate signatures are routinely ECDSA P-384 or
+    /// RSA with SHA-384/512, not just the SHA-256 variants — this is what
+    /// public-trust chain verification against a real CA hierarchy
+    /// (`hopf-tls`'s `public_trust_connector_validates_a_real_public_certificate`
+    /// integration test) needs but a same-algorithm-both-ends loopback like
+    /// `parse_rcgen_ed25519_cert` above can't exercise.
+    #[test]
+    fn verify_cert_signature_covers_ecdsa_p384_sha384() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf_params = rcgen::CertificateParams::new(vec!["leaf.example".into()]).unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let ca_parsed = parse_certificate(ca_cert.der()).expect("parse CA");
+        let leaf_parsed = parse_certificate(leaf_cert.der()).expect("parse leaf");
+        assert!(verify_cert_signature(&leaf_parsed, &ca_parsed.spki_der));
+    }
+
+    // RSA-SHA384/512 CA signatures are covered by hopf-tls's
+    // `public_trust_connector_validates_a_real_public_certificate`
+    // integration test against a real WebPKI chain — rcgen can't generate
+    // RSA keys, and constructing one by hand here just to sign a
+    // synthetic cert would need a `rustls-pki-types` dev-dependency for
+    // little extra coverage beyond what the ECDSA-P384 case above and the
+    // real integration test already prove.
 }

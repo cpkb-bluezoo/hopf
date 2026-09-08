@@ -41,4 +41,7 @@ pub use signature::{
     EcdsaP256PrivateKey, EcdsaP384PrivateKey, Ed25519PrivateKey, Ed25519PublicKey, KeyError,
     RsaPrivateKey, RsaPublicKeyComponents, SignError,
 };
-pub use trust::{verify_server_chain, TrustStore, VerifyError};
+pub use trust::{
+    public_trust_store, public_trust_store_from, verify_server_chain, ComponentAnchor, TrustStore,
+    VerifyError,
+};

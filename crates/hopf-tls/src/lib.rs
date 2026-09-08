@@ -14,8 +14,7 @@
 //! Two things the old `rustls`-backed API supported have no equivalent here
 //! yet: SNI-dispatched multi-certificate acceptors and mutual-TLS client
 //! certificates (`TlsRecordEngine` doesn't request/verify a client cert at
-//! all today), and public-WebPKI trust (`public_trust_connector`) — deferred
-//! to a later phase, matching the migration plan.
+//! all today) — deferred to a later phase, matching the migration plan.
 
 #![warn(missing_docs)]
 
@@ -54,16 +53,11 @@ pub fn insecure_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
     hopf_core::insecure_connector(alpn)
 }
 
-/// Public WebPKI trust — **not implemented yet** (crypto-migration-plan.md
-/// Phase 4 defers this). Always returns an `Unsupported` error; every
-/// existing caller already treats that as "skip this validation path"
-/// (`hopf-quic::client_config_public_trust` has returned the same error
-/// since Phase 3b, for the same reason).
-pub fn public_trust_connector(_alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "public WebPKI trust is not implemented yet (crypto-migration-plan.md Phase 4)",
-    ))
+/// Build a [`SharedTlsConnector`] that trusts the public WebPKI (native OS
+/// roots, falling back to a vendored copy of Mozilla's CA list). See
+/// [`hopf_core::public_trust_connector`].
+pub fn public_trust_connector(alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
+    Ok(hopf_core::public_trust_connector(alpn))
 }
 
 #[cfg(test)]
@@ -98,12 +92,8 @@ mod tests {
     }
 
     #[test]
-    fn public_trust_connector_is_not_implemented_yet() {
-        let err = match public_trust_connector(&[]) {
-            Ok(_) => panic!("expected Unsupported"),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    fn public_trust_connector_builds() {
+        public_trust_connector(&[]).unwrap();
     }
 }
 
@@ -359,6 +349,95 @@ mod integration_tests {
         assert!(
             *established.lock().unwrap(),
             "handshake should succeed despite the hostname/trust mismatch"
+        );
+
+        rt.shutdown();
+    }
+
+    /// Regression test for issue #375: unlike every other client path in
+    /// this crate, which either pins an explicit caller-supplied root or
+    /// skips validation outright, `public_trust_connector` must complete a
+    /// real handshake against a certificate chaining to an actual public
+    /// certificate authority — proving the connector's root store is
+    /// genuinely populated (native store, vendored fallback, or both), not
+    /// just non-empty in isolation. Talks to a well-known, stable public
+    /// HTTPS endpoint; needs real internet access, which is exactly why
+    /// this lives behind this module's `integration` feature gate rather
+    /// than running in CI.
+    #[test]
+    fn public_trust_connector_validates_a_real_public_certificate() {
+        use std::net::ToSocketAddrs;
+
+        let host = "cloudflare.com";
+        let addr = (host, 443)
+            .to_socket_addrs()
+            .expect("resolve cloudflare.com")
+            .next()
+            .expect("at least one address for cloudflare.com");
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+
+        let established = Arc::new(Mutex::new(false));
+        let established2 = Arc::clone(&established);
+        let connector = public_trust_connector(&[]).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EstablishedProbe { established: Arc::clone(&established2) }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, host),
+        )
+        .unwrap();
+
+        for _ in 0..250 {
+            if *established.lock().unwrap() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            *established.lock().unwrap(),
+            "handshake against a real public certificate should validate and succeed"
+        );
+
+        rt.shutdown();
+    }
+
+    /// Companion to the real-endpoint test above, runnable with no network
+    /// access at all: `public_trust_connector` must reject a self-signed
+    /// certificate exactly like any other public-WebPKI client would —
+    /// proving the validation is real rather than the positive test above
+    /// merely reaching a server that happens to have a certificate for
+    /// unrelated reasons.
+    #[test]
+    fn public_trust_connector_rejects_a_self_signed_server() {
+        let (_dir, cert_path, key_path, _certified) = write_temp_pem("public-trust-reject");
+        let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(NoopServer) as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let established = Arc::new(Mutex::new(false));
+        let established2 = Arc::clone(&established);
+        let connector = public_trust_connector(&[]).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EstablishedProbe { established: Arc::clone(&established2) }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !*established.lock().unwrap(),
+            "a self-signed certificate must not validate against the public WebPKI trust store"
         );
 
         rt.shutdown();

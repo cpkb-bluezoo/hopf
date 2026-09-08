@@ -8,10 +8,26 @@ use bytes::Bytes;
 
 use super::x509::{matches_hostname, parse_certificate, verify_cert_signature, ParsedCertificate};
 
-/// Collection of DER-encoded trust anchors (typically self-signed root CAs).
+/// A trust anchor known only by its subject and public key — no full
+/// certificate. This is what compiled-in root bundles (e.g. `webpki-roots`)
+/// provide, since a self-trusted anchor never needs its own signature or
+/// validity checked to terminate chain building; it just can't participate
+/// in the "the peer presented the anchor certificate itself" exact-match
+/// shortcut that a full-DER anchor can (see [`TrustStore::add_anchor`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComponentAnchor {
+    /// Anchor's Subject DER (as it appears in a cert it issued).
+    pub subject_der: Bytes,
+    /// Anchor's SubjectPublicKeyInfo DER.
+    pub spki_der: Bytes,
+}
+
+/// Collection of trust anchors (typically self-signed root CAs) — either
+/// full DER certificates or subject+SPKI-only [`ComponentAnchor`]s.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrustStore {
     anchors: Vec<Bytes>,
+    component_anchors: Vec<ComponentAnchor>,
 }
 
 /// Chain or hostname verification failed.
@@ -63,19 +79,29 @@ impl TrustStore {
         self.add_anchor(Bytes::from(der));
     }
 
-    /// Immutable view of stored anchors.
+    /// Add a subject+SPKI-only trust anchor (see [`ComponentAnchor`]).
+    pub fn add_component_anchor(&mut self, subject_der: Bytes, spki_der: Bytes) {
+        self.component_anchors.push(ComponentAnchor { subject_der, spki_der });
+    }
+
+    /// Immutable view of stored full-DER anchors.
     pub fn anchors(&self) -> &[Bytes] {
         &self.anchors
     }
 
-    /// Number of anchors.
-    pub fn len(&self) -> usize {
-        self.anchors.len()
+    /// Immutable view of stored component (subject+SPKI-only) anchors.
+    pub fn component_anchors(&self) -> &[ComponentAnchor] {
+        &self.component_anchors
     }
 
-    /// Whether the store has no anchors.
+    /// Number of anchors (both full-DER and component).
+    pub fn len(&self) -> usize {
+        self.anchors.len() + self.component_anchors.len()
+    }
+
+    /// Whether the store has no anchors at all.
     pub fn is_empty(&self) -> bool {
-        self.anchors.is_empty()
+        self.anchors.is_empty() && self.component_anchors.is_empty()
     }
 
     /// Verify a TLS server certificate chain and optional SNI hostname.
@@ -86,6 +112,42 @@ impl TrustStore {
     ) -> Result<(), VerifyError> {
         verify_server_chain(self, chain, server_name, SystemTime::now())
     }
+}
+
+/// The public WebPKI root set: the OS's own trust store
+/// ([`rustls_native_certs`]) when it can be read, falling back to a
+/// vendored copy of Mozilla's CA root list ([`webpki_roots`]) otherwise.
+pub fn public_trust_store() -> TrustStore {
+    let native = rustls_native_certs::load_native_certs()
+        .certs
+        .into_iter()
+        .map(|c| Bytes::copy_from_slice(c.as_ref()))
+        .collect();
+    public_trust_store_from(native)
+}
+
+/// [`public_trust_store`], given already-loaded native certs (full DER) —
+/// split out so the fallback behavior is testable without depending on
+/// what happens to be trusted on the machine running the test. A handful of
+/// platform trust stores carry anchors this crate's minimal X.509 parser
+/// can't parse (e.g. non-conformant self-issued roots); those are silently
+/// skipped at verification time ([`verify_server_chain`]'s `filter_map`),
+/// not here — an anchor that fails to parse is simply never matched, rather
+/// than aborting the whole load over one bad entry.
+pub fn public_trust_store_from(native_certs: Vec<Bytes>) -> TrustStore {
+    let mut store = TrustStore::new();
+    for der in native_certs {
+        store.add_anchor(der);
+    }
+    if store.is_empty() {
+        for anchor in webpki_roots::TLS_SERVER_ROOTS {
+            store.add_component_anchor(
+                Bytes::copy_from_slice(anchor.subject.as_ref()),
+                Bytes::copy_from_slice(anchor.subject_public_key_info.as_ref()),
+            );
+        }
+    }
+    store
 }
 
 /// Verify a TLS server chain against `store` at `now`.
@@ -121,14 +183,36 @@ pub fn verify_server_chain(
         .filter_map(|der| parse_certificate(der))
         .collect();
 
-    let anchors: Vec<ParsedCertificate> = store
+    let parsed_anchors: Vec<ParsedCertificate> = store
         .anchors()
         .iter()
         .filter_map(|der| parse_certificate(der))
         .collect();
+    let anchors: Vec<AnchorRef<'_>> = parsed_anchors
+        .iter()
+        .map(|a| AnchorRef {
+            subject_der: &a.subject_der,
+            spki_der: &a.spki_der,
+            full_der: Some(&a.der),
+        })
+        .chain(store.component_anchors().iter().map(|a| AnchorRef {
+            subject_der: &a.subject_der,
+            spki_der: &a.spki_der,
+            full_der: None,
+        }))
+        .collect();
 
     build_and_verify_chain(&leaf, &intermediates, &anchors)?;
     Ok(())
+}
+
+/// A trust anchor as chain-building sees it — either a full parsed
+/// certificate ([`TrustStore::add_anchor`]) or a [`ComponentAnchor`]; only
+/// the former can satisfy the "peer presented the anchor itself" shortcut.
+struct AnchorRef<'a> {
+    subject_der: &'a [u8],
+    spki_der: &'a [u8],
+    full_der: Option<&'a [u8]>,
 }
 
 fn check_validity(cert: &ParsedCertificate, now: u64) -> Result<(), VerifyError> {
@@ -144,43 +228,53 @@ fn check_validity(cert: &ParsedCertificate, now: u64) -> Result<(), VerifyError>
 fn build_and_verify_chain(
     leaf: &ParsedCertificate,
     intermediates: &[ParsedCertificate],
-    anchors: &[ParsedCertificate],
+    anchors: &[AnchorRef<'_>],
 ) -> Result<(), VerifyError> {
     let mut current = leaf;
     let mut pool: Vec<&ParsedCertificate> = intermediates.iter().collect();
 
     loop {
-        if anchors.iter().any(|a| a.der == current.der) {
+        if anchors.iter().any(|a| a.full_der == Some(current.der.as_ref())) {
             return Ok(());
         }
 
-        let issuer = find_issuer(current, &pool, anchors).ok_or(VerifyError::UnknownIssuer)?;
-        if !verify_cert_signature(current, &issuer.spki_der) {
-            return Err(VerifyError::SignatureInvalid);
+        match find_issuer(current, &pool, anchors) {
+            None => return Err(VerifyError::UnknownIssuer),
+            Some(Issuer::Anchor(anchor)) => {
+                if !verify_cert_signature(current, anchor.spki_der) {
+                    return Err(VerifyError::SignatureInvalid);
+                }
+                return Ok(());
+            }
+            Some(Issuer::Intermediate(cert)) => {
+                if !verify_cert_signature(current, &cert.spki_der) {
+                    return Err(VerifyError::SignatureInvalid);
+                }
+                pool.retain(|c| c.der != cert.der);
+                current = cert;
+            }
         }
-
-        if anchors.iter().any(|a| a.subject_der == issuer.subject_der) {
-            return Ok(());
-        }
-
-        pool.retain(|c| c.der != issuer.der);
-        current = issuer;
     }
+}
+
+enum Issuer<'a> {
+    Intermediate(&'a ParsedCertificate),
+    Anchor(&'a AnchorRef<'a>),
 }
 
 fn find_issuer<'a>(
     child: &ParsedCertificate,
     pool: &[&'a ParsedCertificate],
-    anchors: &'a [ParsedCertificate],
-) -> Option<&'a ParsedCertificate> {
+    anchors: &'a [AnchorRef<'a>],
+) -> Option<Issuer<'a>> {
     for cert in pool {
         if cert.subject_der == child.issuer_der {
-            return Some(cert);
+            return Some(Issuer::Intermediate(cert));
         }
     }
     for anchor in anchors {
         if anchor.subject_der == child.issuer_der {
-            return Some(anchor);
+            return Some(Issuer::Anchor(anchor));
         }
     }
     None
@@ -189,6 +283,30 @@ fn find_issuer<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// When native loading yields nothing usable (simulated here by passing
+    /// an empty cert list, which is exactly what a native-certs read
+    /// failure or an empty OS store degrades to), the public-trust store
+    /// must fall back to the vendored webpki-roots list rather than
+    /// silently trusting nothing at all.
+    #[test]
+    fn public_trust_store_falls_back_to_webpki_roots_when_native_yields_nothing() {
+        let store = public_trust_store_from(Vec::new());
+        assert_eq!(store.component_anchors().len(), webpki_roots::TLS_SERVER_ROOTS.len());
+        assert!(store.anchors().is_empty());
+        assert!(!store.is_empty());
+    }
+
+    /// Companion to the fallback test above: when native certs *are*
+    /// present, they must be preferred outright — the fallback list must
+    /// not also be merged in alongside them.
+    #[test]
+    fn public_trust_store_prefers_native_certs_over_the_fallback() {
+        let (der, _) = ed25519_cert("example.invalid");
+        let store = public_trust_store_from(vec![Bytes::copy_from_slice(&der)]);
+        assert_eq!(store.anchors().len(), 1);
+        assert!(store.component_anchors().is_empty());
+    }
 
     fn ed25519_cert(dns: &str) -> (Vec<u8>, rcgen::KeyPair) {
         let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
@@ -262,6 +380,34 @@ mod tests {
                 Some("secure.example"),
             )
             .expect("valid chain");
+    }
+
+    /// Same chain as [`ca_signed_chain_to_trusted_root`], but the root is
+    /// registered as a [`ComponentAnchor`] (subject + SPKI only, no full
+    /// DER) — the shape `webpki-roots`-style compiled-in bundles provide,
+    /// since `TrustStore::add_anchor` needs a real parseable certificate.
+    #[test]
+    fn ca_signed_chain_to_component_anchor_root() {
+        let root_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut root_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        root_params.distinguished_name = rcgen::DistinguishedName::new();
+        root_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Hopf Test Root CA");
+        root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root = root_params.self_signed(&root_key).unwrap();
+
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let leaf_params = rcgen::CertificateParams::new(vec!["secure.example".into()]).unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &root, &root_key).unwrap();
+
+        let parsed_root = parse_certificate(root.der()).unwrap();
+        let mut store = TrustStore::new();
+        store.add_component_anchor(parsed_root.subject_der.clone(), parsed_root.spki_der.clone());
+
+        store
+            .verify_server_chain(&[Bytes::copy_from_slice(leaf.der())], Some("secure.example"))
+            .expect("valid chain via component anchor");
     }
 
     #[test]

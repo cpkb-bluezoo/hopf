@@ -23,7 +23,8 @@ pub use handshake::transport_params::{
 };
 pub use pem::{
     acceptor_from_pem, connector_from_pem, connector_with_verify_override, insecure_connector,
-    server_credentials_from_pem, SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector,
+    public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor, SharedTlsConnector,
+    TlsAcceptor, TlsConnector,
 };
 pub use record::{NopTlsRecordSink, TlsRecordEngine, TlsRecordSink};
 pub use sink::{

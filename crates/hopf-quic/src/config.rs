@@ -525,20 +525,31 @@ pub fn client_config_from_pem_with(
     Ok(hopf_client_config(params))
 }
 
-/// Client config trusting public WebPKI — **not yet supported** on in-tree path.
+/// Client config trusting the public WebPKI (native OS roots, falling back
+/// to a vendored copy of Mozilla's CA list — see
+/// [`hopf_core::crypto::trust::public_trust_store`]).
 pub fn client_config_public_trust(alpn: &[&[u8]]) -> io::Result<Arc<QuicClientConfig>> {
     client_config_public_trust_with(alpn, QuicTlsOptions::default())
 }
 
 /// [`client_config_public_trust`] with options.
 pub fn client_config_public_trust_with(
-    _alpn: &[&[u8]],
-    _tls: QuicTlsOptions,
+    alpn: &[&[u8]],
+    tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicClientConfig>> {
-    Err(io::Error::new(
-        ErrorKind::Unsupported,
-        "public WebPKI trust not yet wired on in-tree QUIC transport",
-    ))
+    let params = HopfTlsBuildParams {
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        kx_policy: KxPolicy::classical_only(),
+        server_name: None,
+        trust_store: Some(hopf_core::crypto::trust::public_trust_store()),
+        server: None,
+        local_transport_parameters: None,
+        tls,
+        ticket_store: Some(hopf_core::tls::ClientTicketStore::shared()),
+        ticket_key: None,
+        anti_replay: None,
+    };
+    Ok(hopf_client_config(params))
 }
 
 /// In-memory self-signed server config (Ed25519 via hopf TLS).

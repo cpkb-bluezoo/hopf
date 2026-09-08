@@ -13,7 +13,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::crypto::kx_policy::KxPolicy;
-use crate::crypto::trust::TrustStore;
+use crate::crypto::trust::{public_trust_store, TrustStore};
 
 use super::engine::{HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials, VerifyOverride};
 use super::handshake::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS;
@@ -175,6 +175,24 @@ pub fn connector_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTl
 pub fn insecure_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
     Arc::new(TrustedConnector {
         trust_store: None,
+        verify_override: None,
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+    })
+}
+
+/// Build a [`SharedTlsConnector`] that trusts the public WebPKI — the
+/// standard "does this chain to a trusted public root and match the
+/// hostname" validation any ordinary HTTPS client performs, with no
+/// caller-supplied root. See [`public_trust_store`] for the native/vendored
+/// fallback behavior.
+///
+/// This is what authenticates a certificate advertised by an endpoint
+/// discovered rather than explicitly configured (e.g. an RFC 9462 DDR
+/// candidate) — [`connector_from_pem`] and [`insecure_connector`] both need
+/// the caller to already know who they're trusting; this doesn't.
+pub fn public_trust_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
+    Arc::new(TrustedConnector {
+        trust_store: Some(public_trust_store()),
         verify_override: None,
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
     })
