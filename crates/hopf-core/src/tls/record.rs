@@ -596,6 +596,55 @@ mod tests {
         assert!(sink_s.events.iter().any(|e| e == "handshake_complete"), "{:?}", sink_s.events);
     }
 
+    /// Validates the design justification for going sink-based at all (see
+    /// crypto-migration-plan.md's "Why sink-based, not return-value-based":
+    /// "multiple outcomes from one stimulus are natural — handshake complete
+    /// *and* early application data in one read"). A real client pipelines
+    /// its Finished and its first application write back-to-back; TCP is
+    /// free to deliver both in a single `read()`, so the server's *one*
+    /// `feed_ciphertext` call for that read must both complete the
+    /// handshake and decrypt/deliver the application data that followed it
+    /// in the same buffer — and in that order, not the reverse.
+    #[test]
+    fn client_finished_and_pipelined_app_data_in_one_read_completes_then_delivers_in_order() {
+        let (client_cfg, server_cfg) = configs();
+        let mut client = TlsRecordEngine::new(client_cfg);
+        let mut server = TlsRecordEngine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+
+        client.start(&mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s); // ClientHello
+        relay(&mut sink_s, &mut client, &mut sink_c); // ServerHello..Finished -> client completes, sends its Finished
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+
+        // Pipeline application data right behind the still-unsent Finished —
+        // both land in sink_c.outbound as one combined buffer, exactly as a
+        // fast local peer's back-to-back writes would coalesce into one read.
+        client.send_application_data(b"pipelined-hello", &mut sink_c);
+        let combined = std::mem::take(&mut sink_c.outbound);
+        assert!(!combined.is_empty());
+        server.feed_ciphertext(&mut combined.as_slice(), &mut sink_s);
+
+        assert!(server.is_complete(), "server must complete the handshake: {:?}", sink_s.events);
+        let hs_idx = sink_s
+            .events
+            .iter()
+            .position(|e| e == "handshake_complete")
+            .expect("handshake_complete fired");
+        let app_idx = sink_s
+            .events
+            .iter()
+            .position(|e| e.starts_with("application_data"))
+            .expect("application_data fired");
+        assert!(
+            hs_idx < app_idx,
+            "handshake must complete before app data is delivered: {:?}",
+            sink_s.events
+        );
+        assert_eq!(sink_s.app_data, vec![b"pipelined-hello".to_vec()]);
+    }
+
     #[test]
     fn application_data_round_trips_after_handshake() {
         let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback();
