@@ -170,13 +170,60 @@ impl ServerCertVerifier for DaneServerCertVerifier {
 /// Whether `cert`'s selected data (per `record.selector`) matches
 /// `record.association_data` (per `record.matching_type`).
 fn matches_record(record: &TlsaRecord, cert: &CertificateDer<'_>) -> bool {
-    let Some(selected) = selected_data(record.selector, cert.as_ref()) else {
+    matches_record_der(record, cert.as_ref())
+}
+
+/// As [`matches_record`], directly against DER bytes rather than a
+/// `rustls`-typed certificate — what [`verify_dane_chain`] uses.
+fn matches_record_der(record: &TlsaRecord, cert_der: &[u8]) -> bool {
+    let Some(selected) = selected_data(record.selector, cert_der) else {
         return false;
     };
     let Some(computed) = hash_selected_data(record.matching_type, &selected) else {
         return false;
     };
     computed == record.association_data
+}
+
+/// Verify a presented certificate chain (DER, leaf first) against `records`
+/// (RFC 6698 §2.1) with no dependency on `rustls` — the shape
+/// [`hopf_core::connector_with_verify_override`] needs. Same matching rules
+/// as [`DaneServerCertVerifier`] (see that type's docs: only DANE-TA(2) and
+/// DANE-EE(3) are matched; DANE-TA re-chains the rest of the presented chain
+/// up to the pinned anchor using [`hopf_core::crypto::trust::TrustStore`]
+/// instead of `rustls`'s `WebPkiServerVerifier`).
+pub fn verify_dane_chain(records: &[TlsaRecord], chain: &[hopf_core::Bytes], server_name: Option<&str>) -> bool {
+    let Some(leaf) = chain.first() else {
+        return false;
+    };
+    for record in records {
+        match record.usage {
+            TlsaUsage::DaneEe => {
+                if matches_record_der(record, leaf) {
+                    return true;
+                }
+            }
+            TlsaUsage::DaneTa => {
+                let Some(anchor_idx) = chain.iter().position(|c| matches_record_der(record, c)) else {
+                    continue;
+                };
+                if anchor_idx == 0 {
+                    // The pinned certificate *is* the presented leaf —
+                    // trivially its own anchor, nothing further to chain.
+                    return true;
+                }
+                let mut trust = hopf_core::crypto::trust::TrustStore::new();
+                trust.add_anchor(chain[anchor_idx].clone());
+                if trust.verify_server_chain(&chain[..=anchor_idx], server_name).is_ok() {
+                    return true;
+                }
+            }
+            // PKIX-TA(0)/PKIX-EE(1) and any unassigned usage are never
+            // matched — see the module doc comment.
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The bytes a TLSA record's association data is computed over, per its

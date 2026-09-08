@@ -37,4 +37,7 @@ pub use transcript::Transcript;
 pub use transport_params::{
     encode_initial_max_data, RememberedTransportLimits, INITIAL_MAX_DATA,
 };
-pub use verify::{sign_ed25519_certificate_verify, verify_certificate_verify};
+pub use verify::{
+    sign_certificate_verify, sign_ed25519_certificate_verify, verify_certificate_verify,
+    SUPPORTED_SIGNATURE_SCHEMES,
+};

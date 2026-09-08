@@ -24,7 +24,7 @@ use crate::peer_addr::PeerAddr;
 use crate::proxy_protocol::{self, ProxyHeaderOutcome};
 use crate::security::SecurityInfo;
 use crate::telemetry::TelemetryHook;
-use crate::tls::{SharedTlsAcceptor, TlsSession};
+use crate::tls::{SharedTlsAcceptor, TlsProtocolError, TlsRecordEngine, TlsRecordSink, VerifyRequest, VerifyResult};
 
 /// Either half of a stream-oriented connection — TCP or UNIX domain socket.
 /// `std::net::TcpStream` and `std::os::unix::net::UnixStream` don't share a
@@ -162,7 +162,7 @@ pub(crate) struct TcpConnection {
     proxy_protocol_pending: bool,
     security: SecurityInfo,
     security_notified: bool,
-    tls: Option<Box<dyn TlsSession>>,
+    tls: Option<TlsRecordEngine>,
     tls_acceptor: Option<SharedTlsAcceptor>,
     reactor: ReactorHandle,
     pool: Arc<BufferPool>,
@@ -185,6 +185,55 @@ pub(crate) enum WriteOutcome {
     WouldBlock,
     CloseAfterFlush,
     Closed,
+}
+
+/// What happened during one `TlsRecordEngine` pump call — recorded by
+/// [`TlsSinkAdapter`] while `net_out`/`app_in` are borrowed, then applied by
+/// [`TcpConnection::apply_tls_outcome`] once that borrow ends (mirroring
+/// `deliver_app_in`'s take-then-restore pattern elsewhere in this file).
+#[derive(Default)]
+struct TlsPumpOutcome {
+    established: Option<SecurityInfo>,
+    error: Option<String>,
+    peer_closed: bool,
+    verification_id: Option<u64>,
+}
+
+/// Bridges [`TlsRecordEngine`]'s sink events onto `TcpConnection`'s buffers —
+/// ciphertext and decrypted application data are pushed straight into
+/// `net_out`/`app_in`; everything else is recorded into `outcome` for the
+/// caller to act on once this adapter's borrow ends (handler callbacks need
+/// `&mut TcpConnection` as a whole, which this partial borrow can't offer).
+struct TlsSinkAdapter<'a> {
+    net_out: &'a mut Vec<u8>,
+    app_in: &'a mut Vec<u8>,
+    outcome: &'a mut TlsPumpOutcome,
+}
+
+impl TlsRecordSink for TlsSinkAdapter<'_> {
+    fn ciphertext_ready(&mut self, data: &[u8]) {
+        self.net_out.extend_from_slice(data);
+    }
+
+    fn application_data(&mut self, plaintext: &[u8]) {
+        self.app_in.extend_from_slice(plaintext);
+    }
+
+    fn handshake_complete(&mut self, info: SecurityInfo) {
+        self.outcome.established = Some(info);
+    }
+
+    fn verification_requested(&mut self, req: VerifyRequest) {
+        self.outcome.verification_id = Some(req.id);
+    }
+
+    fn protocol_error(&mut self, err: TlsProtocolError) {
+        self.outcome.error = Some(err.message);
+    }
+
+    fn peer_closed(&mut self) {
+        self.outcome.peer_closed = true;
+    }
 }
 
 impl TcpConnection {
@@ -226,7 +275,8 @@ impl TcpConnection {
         } else {
             None
         };
-        Ok(Self {
+        let has_tls = tls.is_some();
+        let mut conn = Self {
             token,
             stream,
             handler: Some(handler),
@@ -256,7 +306,13 @@ impl TcpConnection {
             telemetry,
             interest_dirty: false,
             open_flag: Arc::new(AtomicBool::new(true)),
-        })
+        };
+        if has_tls {
+            // Client role emits ClientHello here; server role is a no-op until
+            // ciphertext arrives (HandshakeEngine::start no-ops for the server).
+            conn.pump_tls_start();
+        }
+        Ok(conn)
     }
 
     /// Complete a nonblocking dial if ready. Returns true once when TCP connect succeeds.
@@ -350,10 +406,10 @@ impl TcpConnection {
     }
 
     fn wants_write(&self) -> bool {
-        self.connecting
-            || !self.net_out.is_empty()
-            || self.close_requested
-            || self.tls.as_ref().is_some_and(|t| t.wants_write())
+        // TlsRecordEngine pushes ciphertext straight into net_out as it's
+        // produced (sink-based, unlike the old pull-based TlsSession::write_tls),
+        // so net_out already reflects everything pending — no separate check needed.
+        self.connecting || !self.net_out.is_empty() || self.close_requested
     }
 
     pub fn prepare_net_in(&mut self) -> io::Result<()> {
@@ -471,56 +527,85 @@ impl TcpConnection {
     }
 
     fn process_tls_inbound(&mut self) -> io::Result<()> {
-        // Feed ciphertext into the session.
+        let mut input = std::mem::take(&mut self.net_in);
+        let mut outcome = TlsPumpOutcome::default();
         {
-            let tls = self.tls.as_mut().unwrap();
-            let mut slice = self.net_in.as_slice();
-            while !slice.is_empty() {
-                match tls.read_tls(&mut slice) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e),
+            let tls = self.tls.as_mut().expect("process_tls_inbound called with tls active");
+            let mut adapter = TlsSinkAdapter {
+                net_out: &mut self.net_out,
+                app_in: &mut self.app_in,
+                outcome: &mut outcome,
+            };
+            let mut slice = input.as_slice();
+            tls.feed_ciphertext(&mut slice, &mut adapter);
+        }
+        input.clear();
+        self.net_in = input;
+
+        // Chain verification: this pass doesn't wire an async StorageExecutor
+        // gate, so any trust decision must already be baked into the engine's
+        // HandshakeConfig::trust_store (resolved inline before this fires — see
+        // HandshakeEngine::on_certificate) or the connector is deliberately
+        // insecure (crate::tls::insecure_connector). Either way, resolving the
+        // gate here is always safe: a trust_store-backed verification has
+        // already settled verify_pending by the time we get here, making this
+        // call an inert no-op; only the insecure/no-trust_store case actually
+        // needs it to unblock the handshake.
+        if let Some(id) = outcome.verification_id.take() {
+            let tls = self.tls.as_mut().expect("process_tls_inbound called with tls active");
+            let mut adapter = TlsSinkAdapter {
+                net_out: &mut self.net_out,
+                app_in: &mut self.app_in,
+                outcome: &mut outcome,
+            };
+            tls.feed_verification_result(VerifyResult { id, ok: true }, &mut adapter);
+        }
+
+        self.apply_tls_outcome(outcome)
+    }
+
+    fn apply_tls_outcome(&mut self, outcome: TlsPumpOutcome) -> io::Result<()> {
+        if let Some(msg) = outcome.error {
+            return Err(io::Error::new(ErrorKind::InvalidData, msg));
+        }
+        if self.net_out.len() > self.max_net_out {
+            return Err(io::Error::new(ErrorKind::OutOfMemory, "outbound buffer overflow during TLS flush"));
+        }
+        if let Some(info) = outcome.established {
+            if !self.security_notified {
+                self.security = info;
+                self.security_notified = true;
+                self.call_security_established();
+                if !self.open {
+                    return Ok(());
                 }
             }
-            let remaining = slice.len();
-            let consumed = self.net_in.len() - remaining;
-            if consumed > 0 {
-                self.net_in.drain(..consumed);
-            }
         }
-
-        let progress = {
-            let tls = self.tls.as_mut().unwrap();
-            tls.process_new_packets()?
-        };
-        self.flush_tls_outbound()?;
-
-        if progress.handshake_just_completed && !self.security_notified {
-            self.security = self.tls.as_ref().unwrap().security_info();
-            self.security_notified = true;
-            self.call_security_established();
-            if !self.open {
-                return Ok(());
-            }
+        if outcome.peer_closed && !self.closing {
+            self.closing = true;
+            self.close_requested = true;
         }
-
-        // Drain plaintext into app_in.
-        {
-            let tls = self.tls.as_mut().unwrap();
-            let mut tmp = [0u8; 16 * 1024];
-            loop {
-                match tls.read_plaintext(&mut tmp) {
-                    Ok(0) => break,
-                    Ok(n) => self.app_in.extend_from_slice(&tmp[..n]),
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e),
-                }
-            }
-        }
-
+        self.interest_dirty = true;
         self.deliver_app_in();
         Ok(())
+    }
+
+    /// Pump `HandshakeEngine::start` through the active TLS engine — client
+    /// role emits ClientHello into `net_out`; server role no-ops until
+    /// ciphertext arrives. Shared by `TcpConnection::new`, `start_tls`, and
+    /// `start_client_tls`.
+    fn pump_tls_start(&mut self) {
+        let mut outcome = TlsPumpOutcome::default();
+        {
+            let tls = self.tls.as_mut().expect("pump_tls_start called with tls active");
+            let mut adapter = TlsSinkAdapter {
+                net_out: &mut self.net_out,
+                app_in: &mut self.app_in,
+                outcome: &mut outcome,
+            };
+            tls.start(&mut adapter);
+        }
+        let _ = self.apply_tls_outcome(outcome);
     }
 
     fn deliver_app_in(&mut self) {
@@ -579,55 +664,7 @@ impl TcpConnection {
         }
     }
 
-    pub fn flush_tls_outbound(&mut self) -> io::Result<()> {
-        let Some(tls) = self.tls.as_mut() else {
-            return Ok(());
-        };
-        while tls.wants_write() {
-            let before = self.net_out.len();
-            // Ensure capacity for a TLS record.
-            if self.net_out.capacity() - self.net_out.len() < 4096 {
-                let grow_to = (self.net_out.len() + 16 * 1024)
-                    .next_power_of_two()
-                    .min(self.max_net_out)
-                    .max(self.net_out.len() + 4096);
-                if grow_to > self.max_net_out && self.net_out.len() >= self.max_net_out {
-                    return Err(io::Error::new(
-                        ErrorKind::OutOfMemory,
-                        "outbound buffer full during TLS flush",
-                    ));
-                }
-                if grow_to > self.net_out.capacity() {
-                    let mut new_buf = self.pool.acquire(grow_to.min(self.max_net_out));
-                    new_buf.clear();
-                    new_buf.extend_from_slice(&self.net_out);
-                    let old = std::mem::replace(&mut self.net_out, new_buf);
-                    self.pool.release(old);
-                }
-            }
-            match tls.write_tls(&mut self.net_out) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if self.net_out.len() == before {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
-            }
-            if self.net_out.len() > self.max_net_out {
-                return Err(io::Error::new(
-                    ErrorKind::OutOfMemory,
-                    "outbound buffer overflow during TLS flush",
-                ));
-            }
-        }
-        self.interest_dirty = true;
-        Ok(())
-    }
-
     pub fn write_to_socket(&mut self) -> io::Result<WriteOutcome> {
-        let _ = self.flush_tls_outbound();
         if self.connecting {
             self.interest_dirty = true;
             return Ok(WriteOutcome::WouldBlock);
@@ -789,21 +826,19 @@ impl TcpConnection {
         if !self.open || self.closing {
             return;
         }
-        if let Some(tls) = self.tls.as_mut() {
-            let mut offset = 0;
-            while offset < data.len() {
-                match tls.write_plaintext(&data[offset..]) {
-                    Ok(0) => break,
-                    Ok(n) => offset += n,
-                    Err(e) => {
-                        eprintln!("hopf: TLS write_plaintext failed on {}: {e}", self.remote);
-                        self.force_close();
-                        return;
-                    }
-                }
+        if self.tls.is_some() {
+            let mut outcome = TlsPumpOutcome::default();
+            {
+                let tls = self.tls.as_mut().expect("checked above");
+                let mut adapter = TlsSinkAdapter {
+                    net_out: &mut self.net_out,
+                    app_in: &mut self.app_in,
+                    outcome: &mut outcome,
+                };
+                tls.send_application_data(data, &mut adapter);
             }
-            if let Err(e) = self.flush_tls_outbound() {
-                eprintln!("hopf: TLS flush failed on {}: {e}", self.remote);
+            if let Err(e) = self.apply_tls_outcome(outcome) {
+                eprintln!("hopf: TLS send failed on {}: {e}", self.remote);
                 self.force_close();
             }
         } else {
@@ -831,9 +866,15 @@ impl Endpoint for TcpConnection {
         }
         self.closing = true;
         self.close_requested = true;
-        if let Some(tls) = self.tls.as_mut() {
-            tls.send_close_notify();
-            let _ = self.flush_tls_outbound();
+        if self.tls.is_some() {
+            let mut outcome = TlsPumpOutcome::default();
+            let tls = self.tls.as_mut().expect("checked above");
+            let mut adapter = TlsSinkAdapter {
+                net_out: &mut self.net_out,
+                app_in: &mut self.app_in,
+                outcome: &mut outcome,
+            };
+            tls.send_close_notify(&mut adapter);
         }
         self.interest_dirty = true;
     }
@@ -860,6 +901,7 @@ impl Endpoint for TcpConnection {
         self.tls = Some(acceptor.accept());
         self.security_notified = false;
         self.interest_dirty = true;
+        self.pump_tls_start();
         Ok(())
     }
 
@@ -871,10 +913,11 @@ impl Endpoint for TcpConnection {
         if self.tls.is_some() || self.security.is_secure() {
             return Err(StartTlsError::AlreadySecure);
         }
-        let session = connector.connect(server_name).map_err(StartTlsError::Io)?;
-        self.tls = Some(session);
+        let engine = connector.connect(server_name).map_err(StartTlsError::Io)?;
+        self.tls = Some(engine);
         self.security_notified = false;
         self.interest_dirty = true;
+        self.pump_tls_start();
         Ok(())
     }
 
@@ -964,7 +1007,7 @@ mod tests {
     use super::*;
     use crate::handler::NopHandler;
     use crate::reactor::Reactor;
-    use crate::tls::TlsSession;
+    use crate::tls::TlsRecordEngine;
     use std::net::TcpListener as StdTcpListener;
     use std::sync::atomic::AtomicBool;
 
@@ -973,7 +1016,7 @@ mod tests {
     struct UnreachableConnector;
 
     impl crate::tls::TlsConnector for UnreachableConnector {
-        fn connect(&self, _server_name: &str) -> io::Result<Box<dyn TlsSession>> {
+        fn connect(&self, _server_name: &str) -> io::Result<TlsRecordEngine> {
             unreachable!("connector.connect must not be called without a server_name (issue #198)")
         }
     }

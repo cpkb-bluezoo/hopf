@@ -1,675 +1,74 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! rustls TLS for Hopf endpoints (TLS-from-accept and STARTTLS).
+//! Thin `hopf-core::tls` re-export shim for TCP TLS / STARTTLS.
 //!
-//! Handlers still see only plaintext via [`hopf_core::Endpoint`]. Ciphertext
-//! stays under the connection's TLS session.
+//! Through crypto-migration Phase 3b this crate ran TLS itself, on top of
+//! `rustls`. Phase 4 moved that job into `hopf-core::tls` (the in-tree
+//! `TlsRecordEngine`, RFC 8446 TLS 1.3) — `TcpConnection` no longer knows
+//! anything about `rustls`. This crate now just re-exports the
+//! `hopf-core::tls` PEM/acceptor/connector helpers under their old names, so
+//! existing callers don't need to change, and is kept only for that API
+//! compatibility until crypto-migration-plan.md Phase 8 removes it outright
+//! (folding the remaining call sites onto `hopf_core::tls::*` directly).
+//!
+//! Two things the old `rustls`-backed API supported have no equivalent here
+//! yet: SNI-dispatched multi-certificate acceptors and mutual-TLS client
+//! certificates (`TlsRecordEngine` doesn't request/verify a client cert at
+//! all today), and public-WebPKI trust (`public_trust_connector`) — deferred
+//! to a later phase, matching the migration plan.
 
 #![warn(missing_docs)]
 
-use std::fs::File;
-use std::io::{self, BufReader, ErrorKind};
+use std::io;
 use std::path::Path;
-use std::sync::Arc;
 
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::server::{ResolvesServerCert, ResolvesServerCertUsingSni, WebPkiClientVerifier};
-use rustls::sign::CertifiedKey;
-use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, ServerConfig,
-    ServerConnection, SignatureScheme,
-};
-use hopf_core::{
-    crypto::cert::sha256_fingerprint_hex, Bytes, SecurityInfo, SharedTlsAcceptor, SharedTlsConnector,
-    TlsAcceptor, TlsConnector, TlsProgress, TlsSession,
-};
+pub use hopf_core::{SharedTlsAcceptor, SharedTlsConnector};
 
-/// Shared rustls [`CryptoProvider`] (aws-lc-rs, hybrid-first PQC key exchange).
-pub fn tls_crypto_provider() -> Arc<CryptoProvider> {
-    rustls::crypto::aws_lc_rs::default_provider().into()
-}
-
-fn server_config_builder() -> Result<
-    rustls::ConfigBuilder<ServerConfig, rustls::WantsVerifier>,
-    rustls::Error,
-> {
-    ServerConfig::builder_with_provider(tls_crypto_provider()).with_safe_default_protocol_versions()
-}
-
-fn client_config_builder() -> Result<
-    rustls::ConfigBuilder<ClientConfig, rustls::WantsVerifier>,
-    rustls::Error,
-> {
-    ClientConfig::builder_with_provider(tls_crypto_provider()).with_safe_default_protocol_versions()
-}
-
-fn map_rustls_err(e: rustls::Error) -> io::Error {
-    io::Error::new(ErrorKind::InvalidData, e)
-}
-
-/// Load a PEM certificate chain and private key into a rustls [`ServerConfig`].
-///
+/// Build a [`SharedTlsAcceptor`] from a PEM cert-chain and PKCS#8 private key.
 /// `alpn` entries are protocol names such as `b"h2"` and `b"http/1.1"`.
-pub fn server_config_from_pem(
-    cert_path: &Path,
-    key_path: &Path,
-    alpn: &[&[u8]],
-) -> io::Result<Arc<ServerConfig>> {
-    let certs = load_certs(cert_path)?;
-    let key = load_private_key(key_path)?;
-    let mut config = server_config_builder()
-        .map_err(map_rustls_err)?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(map_rustls_err)?;
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Ok(Arc::new(config))
+pub fn acceptor_from_pem(cert_path: &Path, key_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTlsAcceptor> {
+    hopf_core::acceptor_from_pem(cert_path, key_path, alpn)
 }
 
-/// Build a [`SharedTlsAcceptor`] from an existing [`ServerConfig`].
-pub fn acceptor(config: Arc<ServerConfig>) -> SharedTlsAcceptor {
-    Arc::new(RustlsAcceptor { config })
-}
-
-/// Convenience: PEM paths → shared acceptor.
-pub fn acceptor_from_pem(
-    cert_path: &Path,
-    key_path: &Path,
-    alpn: &[&[u8]],
-) -> io::Result<SharedTlsAcceptor> {
-    Ok(acceptor(server_config_from_pem(cert_path, key_path, alpn)?))
-}
-
-/// Build a [`ServerConfig`] that selects the certificate per connection via
-/// a custom [`ResolvesServerCert`] — e.g. virtual-hosting multiple
-/// certificates behind one listener, keyed by the client's SNI hostname.
-///
-/// `alpn` entries are protocol names such as `b"h2"` and `b"http/1.1"`.
-pub fn server_config_with_resolver(
-    resolver: Arc<dyn ResolvesServerCert>,
-    alpn: &[&[u8]],
-) -> Arc<ServerConfig> {
-    let mut config = server_config_builder()
-        .expect("safe default protocol versions")
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Arc::new(config)
-}
-
-/// Convenience: an existing resolver → shared acceptor.
-pub fn acceptor_with_resolver(
-    resolver: Arc<dyn ResolvesServerCert>,
-    alpn: &[&[u8]],
-) -> SharedTlsAcceptor {
-    acceptor(server_config_with_resolver(resolver, alpn))
-}
-
-/// Build a [`ServerConfig`] that dispatches on SNI hostname to one of
-/// several `(hostname, cert_path, key_path)` PEM triples. A client that
-/// sends no SNI, or a hostname with no matching entry, fails the handshake
-/// (rustls's default behavior for [`ResolvesServerCertUsingSni`]) — include
-/// an entry for every hostname you intend to serve.
-///
-/// `alpn` entries are protocol names such as `b"h2"` and `b"http/1.1"`.
-pub fn server_config_with_sni_certs(
-    certs: &[(&str, &Path, &Path)],
-    alpn: &[&[u8]],
-) -> io::Result<Arc<ServerConfig>> {
-    let provider = tls_crypto_provider();
-    let builder = server_config_builder()
-        .map_err(map_rustls_err)?
-        .with_no_client_auth();
-    let mut resolver = ResolvesServerCertUsingSni::new();
-    for (name, cert_path, key_path) in certs {
-        let chain = load_certs(cert_path)?;
-        let key = load_private_key(key_path)?;
-        let certified = CertifiedKey::from_der(chain, key, &provider).map_err(map_rustls_err)?;
-        resolver
-            .add(name, certified)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    }
-    let mut config = builder.with_cert_resolver(Arc::new(resolver));
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Ok(Arc::new(config))
-}
-
-/// Convenience: SNI PEM triples → shared acceptor.
-pub fn acceptor_with_sni_certs(
-    certs: &[(&str, &Path, &Path)],
-    alpn: &[&[u8]],
-) -> io::Result<SharedTlsAcceptor> {
-    Ok(acceptor(server_config_with_sni_certs(certs, alpn)?))
-}
-
-/// Build a [`ServerConfig`] that requires or optionally accepts a client
-/// certificate for mutual TLS, verified against `client_roots`.
-///
-/// When `required` is `false`, clients that present no certificate are
-/// still accepted (opportunistic mTLS) — check
-/// [`SecurityInfo::peer_certificate_fingerprint`] to see whether one was
-/// actually presented on a given connection.
-///
-/// `alpn` entries are protocol names such as `b"h2"` and `b"http/1.1"`.
-pub fn server_config_with_client_auth(
-    cert_path: &Path,
-    key_path: &Path,
-    client_roots_path: &Path,
-    required: bool,
-    alpn: &[&[u8]],
-) -> io::Result<Arc<ServerConfig>> {
-    let certs = load_certs(cert_path)?;
-    let key = load_private_key(key_path)?;
-    let mut roots = RootCertStore::empty();
-    for cert in load_certs(client_roots_path)? {
-        roots
-            .add(cert)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    }
-    let mut verifier_builder =
-        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), tls_crypto_provider());
-    if !required {
-        verifier_builder = verifier_builder.allow_unauthenticated();
-    }
-    let verifier = verifier_builder
-        .build()
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    let mut config = server_config_builder()
-        .map_err(map_rustls_err)?
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(certs, key)
-        .map_err(map_rustls_err)?;
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Ok(Arc::new(config))
-}
-
-/// Convenience: PEM paths → shared acceptor requiring/accepting client certs.
-pub fn acceptor_with_client_auth(
-    cert_path: &Path,
-    key_path: &Path,
-    client_roots_path: &Path,
-    required: bool,
-    alpn: &[&[u8]],
-) -> io::Result<SharedTlsAcceptor> {
-    Ok(acceptor(server_config_with_client_auth(
-        cert_path,
-        key_path,
-        client_roots_path,
-        required,
-        alpn,
-    )?))
-}
-
-/// Build a [`ClientConfig`] that trusts the given PEM CA / leaf cert file.
-///
+/// Build a [`SharedTlsConnector`] that trusts the given PEM CA / leaf cert file.
 /// `alpn` entries are protocol names such as `b"http/1.1"`.
-pub fn client_config_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<Arc<ClientConfig>> {
-    let certs = load_certs(ca_path)?;
-    let mut roots = RootCertStore::empty();
-    for cert in certs {
-        roots
-            .add(cert)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    }
-    let mut config = client_config_builder()
-        .map_err(map_rustls_err)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Ok(Arc::new(config))
-}
-
-/// Build a [`SharedTlsConnector`] from an existing [`ClientConfig`].
-pub fn connector(config: Arc<ClientConfig>) -> SharedTlsConnector {
-    Arc::new(RustlsConnector { config })
+pub fn connector_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
+    hopf_core::connector_from_pem(ca_path, alpn)
 }
 
 /// Accepts any certificate, performing no validation at all — for
 /// opportunistic TLS, where the point is encrypting the connection, not
 /// authenticating the peer. Opportunistic MTA-to-MTA STARTTLS (RFC
 /// 3207/7672) is the motivating case: requiring a valid, trusted
-/// certificate would break delivery to most real-world mail servers,
-/// whose certificates are routinely self-signed, expired, or issued for
-/// the wrong name — none of which should turn off encryption entirely.
+/// certificate would break delivery to most real-world mail servers, whose
+/// certificates are routinely self-signed, expired, or issued for the
+/// wrong name — none of which should turn off encryption entirely.
 ///
 /// Never use this where the peer's identity actually matters.
 /// [`insecure_connector`] is specifically for the "no better option, but
 /// encryption is still better than plaintext" case — DANE
-/// (`hopf_dns::dane::DaneServerCertVerifier`) or a real trust store is
-/// what authenticates the peer when that's actually possible/required.
-#[derive(Debug)]
-struct AcceptAnyServerCert {
-    provider: Arc<CryptoProvider>,
-}
-
-impl ServerCertVerifier for AcceptAnyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// Build a [`SharedTlsConnector`] that accepts any certificate, performing
-/// no validation at all — for opportunistic TLS, where the point is
-/// encrypting the connection, not authenticating the peer (see this
-/// module's internal `AcceptAnyServerCert` verifier). `alpn` entries are
-/// protocol names such as `b"smtp"`; pass an empty slice if none apply.
+/// (`hopf_dns::dane`, via `hopf_core::connector_with_verify_override`) or
+/// [`connector_from_pem`] is what authenticates the peer when that's
+/// actually possible/required.
 pub fn insecure_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
-    let provider = tls_crypto_provider();
-    let mut config = ClientConfig::builder_with_provider(Arc::clone(&provider))
-        .with_safe_default_protocol_versions()
-        .expect("the crate's fixed protocol version list is always valid")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert { provider }))
-        .with_no_client_auth();
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    connector(Arc::new(config))
+    hopf_core::insecure_connector(alpn)
 }
 
-/// Convenience: PEM trust roots → shared connector.
-pub fn connector_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
-    Ok(connector(client_config_from_pem(ca_path, alpn)?))
-}
-
-/// Compose a [`RootCertStore`] from the platform's own trust anchors,
-/// falling back to a vendored copy of Mozilla's CA root list when the
-/// native store can't be read or yields nothing usable. Split out from
-/// [`client_config_public_trust`] so the fallback behavior can be tested
-/// directly, without depending on what happens to be trusted on the
-/// machine running the test.
-fn public_root_cert_store_from(native_certs: Vec<CertificateDer<'static>>) -> RootCertStore {
-    let mut roots = RootCertStore::empty();
-    for cert in native_certs {
-        // A handful of platform trust stores carry anchors rustls-webpki
-        // can't parse (e.g. non-conformant self-issued roots); skip those
-        // rather than failing the whole load over one bad entry.
-        let _ = roots.add(cert);
-    }
-    if roots.is_empty() {
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-    roots
-}
-
-/// The public WebPKI root set: the OS's own trust store
-/// ([`rustls_native_certs`]) when it can be read, falling back to a
-/// vendored copy of Mozilla's CA root list ([`webpki_roots`]) otherwise.
-/// Exposed on its own (not just via [`client_config_public_trust`]) so
-/// another crate that needs a differently-shaped `ClientConfig` around the
-/// same trust anchors — e.g. `hopf-quic`'s QUIC-specific, TLS-1.3-only
-/// builder — doesn't have to duplicate the native/fallback logic.
-pub fn public_root_cert_store() -> RootCertStore {
-    public_root_cert_store_from(rustls_native_certs::load_native_certs().certs)
-}
-
-/// Build a [`ClientConfig`] that trusts the public WebPKI — the standard
-/// "does this chain to a trusted public root and match the hostname"
-/// validation any ordinary HTTPS client performs, with no caller-supplied
-/// root. Primary source is the OS's own trust store
-/// ([`rustls_native_certs`]); when that can't be read, or reads
-/// successfully but yields no usable anchors, falls back to a vendored
-/// copy of Mozilla's CA root list ([`webpki_roots`]).
-///
-/// This is what authenticates a certificate advertised by an endpoint
-/// discovered rather than explicitly configured (e.g. an RFC 9462 DDR
-/// candidate) — [`client_config_from_pem`] and [`insecure_connector`] both
-/// need the caller to already know who they're trusting; this doesn't.
-///
-/// `alpn` entries are protocol names such as `b"h2"`.
-pub fn client_config_public_trust(alpn: &[&[u8]]) -> io::Result<Arc<ClientConfig>> {
-    let roots = public_root_cert_store();
-    let mut config = client_config_builder()
-        .map_err(map_rustls_err)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Ok(Arc::new(config))
-}
-
-/// Convenience: public WebPKI trust → shared connector.
-pub fn public_trust_connector(alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
-    Ok(connector(client_config_public_trust(alpn)?))
-}
-
-/// Build a [`ClientConfig`] that trusts `ca_path` and presents a client
-/// identity certificate for mutual TLS.
-///
-/// `alpn` entries are protocol names such as `b"http/1.1"`.
-pub fn client_config_with_identity(
-    ca_path: &Path,
-    identity_cert_path: &Path,
-    identity_key_path: &Path,
-    alpn: &[&[u8]],
-) -> io::Result<Arc<ClientConfig>> {
-    let ca_certs = load_certs(ca_path)?;
-    let mut roots = RootCertStore::empty();
-    for cert in ca_certs {
-        roots
-            .add(cert)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    }
-    let identity_certs = load_certs(identity_cert_path)?;
-    let identity_key = load_private_key(identity_key_path)?;
-    let mut config = client_config_builder()
-        .map_err(map_rustls_err)?
-        .with_root_certificates(roots)
-        .with_client_auth_cert(identity_certs, identity_key)
-        .map_err(map_rustls_err)?;
-    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Ok(Arc::new(config))
-}
-
-/// Convenience: CA + identity PEM paths → shared connector presenting a
-/// client certificate.
-pub fn connector_with_identity(
-    ca_path: &Path,
-    identity_cert_path: &Path,
-    identity_key_path: &Path,
-    alpn: &[&[u8]],
-) -> io::Result<SharedTlsConnector> {
-    Ok(connector(client_config_with_identity(
-        ca_path,
-        identity_cert_path,
-        identity_key_path,
-        alpn,
-    )?))
-}
-
-/// Dangerous: trust a specific leaf certificate (self-signed smoke tests).
-pub fn connector_for_certified_pem(
-    leaf_pem: &Path,
-    alpn: &[&[u8]],
-) -> io::Result<SharedTlsConnector> {
-    connector_from_pem(leaf_pem, alpn)
-}
-
-fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let certs = certs.map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    if certs.is_empty() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("no certificates in {}", path.display()),
-        ));
-    }
-    Ok(certs)
-}
-
-fn load_private_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidData,
-                format!("no private key in {}", path.display()),
-            )
-        })
-}
-
-struct RustlsAcceptor {
-    config: Arc<ServerConfig>,
-}
-
-impl TlsAcceptor for RustlsAcceptor {
-    fn accept(&self) -> Box<dyn TlsSession> {
-        let conn = ServerConnection::new(Arc::clone(&self.config))
-            .expect("ServerConnection::new with valid ServerConfig");
-        Box::new(RustlsServerSession {
-            conn,
-            was_handshaking: true,
-        })
-    }
-}
-
-struct RustlsServerSession {
-    conn: ServerConnection,
-    was_handshaking: bool,
-}
-
-impl TlsSession for RustlsServerSession {
-    fn read_tls(&mut self, input: &mut &[u8]) -> io::Result<usize> {
-        match self.conn.read_tls(input) {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn process_new_packets(&mut self) -> io::Result<TlsProgress> {
-        self.conn
-            .process_new_packets()
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-        let handshaking = self.conn.is_handshaking();
-        let just = self.was_handshaking && !handshaking;
-        self.was_handshaking = handshaking;
-        Ok(TlsProgress {
-            handshake_just_completed: just,
-        })
-    }
-
-    fn read_plaintext(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        use std::io::Read;
-        let mut reader = self.conn.reader();
-        match reader.read(buf) {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn write_plaintext(&mut self, buf: &[u8]) -> io::Result<usize> {
-        use std::io::Write;
-        let mut writer = self.conn.writer();
-        writer.write(buf)
-    }
-
-    fn write_tls(&mut self, output: &mut Vec<u8>) -> io::Result<usize> {
-        match self.conn.write_tls(output) {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn wants_write(&self) -> bool {
-        self.conn.wants_write()
-    }
-
-    fn is_handshaking(&self) -> bool {
-        self.conn.is_handshaking()
-    }
-
-    fn security_info(&self) -> SecurityInfo {
-        let alpn = self
-            .conn
-            .alpn_protocol()
-            .filter(|p| !p.is_empty())
-            .map(Bytes::copy_from_slice);
-        let protocol = self.conn.protocol_version().map(|v| format!("{v:?}"));
-        let cipher_suite = self
-            .conn
-            .negotiated_cipher_suite()
-            .map(|cs| format!("{:?}", cs.suite()));
-        let sni = self.conn.server_name().map(|s| s.to_string());
-        let peer_certificates = self.conn.peer_certificates();
-        let peer_certificate_fingerprint = peer_certificates
-            .and_then(|certs| certs.first())
-            .map(|leaf| sha256_hex(leaf));
-        let peer_certificate_chain = peer_certificates.map(|certs| {
-            certs
-                .iter()
-                .map(|c| Bytes::copy_from_slice(c.as_ref()))
-                .collect()
-        });
-        SecurityInfo::secure(alpn, protocol, cipher_suite)
-            .with_sni(sni)
-            .with_peer_certificate_fingerprint(peer_certificate_fingerprint)
-            .with_peer_certificate_chain(peer_certificate_chain)
-    }
-
-    fn send_close_notify(&mut self) {
-        self.conn.send_close_notify();
-    }
-}
-
-/// Lowercase hex SHA-256 digest of `der`, used as the SASL EXTERNAL
-/// `cert_key` for a peer's client certificate.
-fn sha256_hex(der: &CertificateDer<'_>) -> String {
-    sha256_fingerprint_hex(der.as_ref())
-}
-
-struct RustlsConnector {
-    config: Arc<ClientConfig>,
-}
-
-impl TlsConnector for RustlsConnector {
-    fn connect(&self, server_name: &str) -> io::Result<Box<dyn TlsSession>> {
-        let name = ServerName::try_from(server_name.to_string())
-            .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
-        let conn = ClientConnection::new(Arc::clone(&self.config), name)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
-        Ok(Box::new(RustlsClientSession {
-            conn,
-            was_handshaking: true,
-        }))
-    }
-}
-
-struct RustlsClientSession {
-    conn: ClientConnection,
-    was_handshaking: bool,
-}
-
-impl TlsSession for RustlsClientSession {
-    fn read_tls(&mut self, input: &mut &[u8]) -> io::Result<usize> {
-        match self.conn.read_tls(input) {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn process_new_packets(&mut self) -> io::Result<TlsProgress> {
-        self.conn
-            .process_new_packets()
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-        let handshaking = self.conn.is_handshaking();
-        let just = self.was_handshaking && !handshaking;
-        self.was_handshaking = handshaking;
-        Ok(TlsProgress {
-            handshake_just_completed: just,
-        })
-    }
-
-    fn read_plaintext(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        use std::io::Read;
-        let mut reader = self.conn.reader();
-        match reader.read(buf) {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn write_plaintext(&mut self, buf: &[u8]) -> io::Result<usize> {
-        use std::io::Write;
-        let mut writer = self.conn.writer();
-        writer.write(buf)
-    }
-
-    fn write_tls(&mut self, output: &mut Vec<u8>) -> io::Result<usize> {
-        match self.conn.write_tls(output) {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == ErrorKind::WouldBlock => Ok(0),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn wants_write(&self) -> bool {
-        self.conn.wants_write()
-    }
-
-    fn is_handshaking(&self) -> bool {
-        self.conn.is_handshaking()
-    }
-
-    fn security_info(&self) -> SecurityInfo {
-        let alpn = self
-            .conn
-            .alpn_protocol()
-            .filter(|p| !p.is_empty())
-            .map(Bytes::copy_from_slice);
-        let protocol = self.conn.protocol_version().map(|v| format!("{v:?}"));
-        let cipher_suite = self
-            .conn
-            .negotiated_cipher_suite()
-            .map(|cs| format!("{:?}", cs.suite()));
-        let peer_certificates = self.conn.peer_certificates();
-        let peer_certificate_fingerprint = peer_certificates
-            .and_then(|certs| certs.first())
-            .map(|leaf| sha256_hex(leaf));
-        let peer_certificate_chain = peer_certificates.map(|certs| {
-            certs
-                .iter()
-                .map(|c| Bytes::copy_from_slice(c.as_ref()))
-                .collect()
-        });
-        SecurityInfo::secure(alpn, protocol, cipher_suite)
-            .with_peer_certificate_fingerprint(peer_certificate_fingerprint)
-            .with_peer_certificate_chain(peer_certificate_chain)
-    }
-
-    fn send_close_notify(&mut self) {
-        self.conn.send_close_notify();
-    }
+/// Public WebPKI trust — **not implemented yet** (crypto-migration-plan.md
+/// Phase 4 defers this). Always returns an `Unsupported` error; every
+/// existing caller already treats that as "skip this validation path"
+/// (`hopf-quic::client_config_public_trust` has returned the same error
+/// since Phase 3b, for the same reason).
+pub fn public_trust_connector(_alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "public WebPKI trust is not implemented yet (crypto-migration-plan.md Phase 4)",
+    ))
 }
 
 #[cfg(test)]
-mod unit {
+mod tests {
     use super::*;
-    use rcgen::generate_simple_self_signed;
 
     // Returns the TempDir guard too — the caller must keep it alive for as
     // long as it uses the paths, since dropping it deletes the directory.
@@ -677,90 +76,56 @@ mod unit {
     // is what actually matters here: parallel test threads each get their
     // own directory, so one test's cert/key pair can never be interleaved
     // with another's.
-    fn write_temp_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-        let dir = tempfile::Builder::new()
-            .prefix("hopf-tls-unit-")
-            .tempdir()
-            .unwrap();
-        let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    fn write_temp_pem(
+        key_pair: &rcgen::KeyPair,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::Builder::new().prefix("hopf-tls-unit-").tempdir().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(key_pair).unwrap();
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
         (dir, cert_path, key_path)
     }
 
     #[test]
-    fn server_config_from_pem_sets_alpn() {
-        let (_dir, cert_path, key_path) = write_temp_pem();
-        let cfg = server_config_from_pem(&cert_path, &key_path, &[b"h2", b"http/1.1"]).unwrap();
-        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
-    }
-
-    #[test]
-    fn client_config_from_pem_sets_alpn() {
-        let (_dir, cert_path, _key_path) = write_temp_pem();
-        let cfg = client_config_from_pem(&cert_path, &[b"http/1.1"]).unwrap();
-        assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
-    }
-
-    #[test]
     fn acceptor_and_connector_from_pem() {
-        let (_dir, cert_path, key_path) = write_temp_pem();
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
         let _ = acceptor_from_pem(&cert_path, &key_path, &[b"h2"]).unwrap();
         let _ = connector_from_pem(&cert_path, &[b"h2"]).unwrap();
     }
 
-    /// Regression test for issue #375: when the native trust store yields
-    /// no usable anchors (simulated here by passing an empty cert list,
-    /// which is exactly what a native-certs read failure or an empty OS
-    /// store degrades to), the public-trust root store must fall back to
-    /// the vendored webpki-roots list rather than silently trusting
-    /// nothing at all.
     #[test]
-    fn public_root_cert_store_falls_back_to_webpki_roots_when_native_yields_nothing() {
-        let roots = public_root_cert_store_from(Vec::new());
-        assert_eq!(roots.len(), webpki_roots::TLS_SERVER_ROOTS.len());
-        assert!(!roots.is_empty());
-    }
-
-    /// Companion to the fallback test above: when the native store *does*
-    /// yield a usable anchor, it must be preferred outright — the fallback
-    /// list must not also be merged in alongside it. A store containing
-    /// exactly the one native anchor (not `len() + webpki_roots::len()`)
-    /// is what proves preference, not just presence.
-    #[test]
-    fn public_root_cert_store_prefers_native_certs_over_the_fallback() {
-        let cert = generate_simple_self_signed(vec!["example.invalid".into()]).unwrap();
-        let native_der: CertificateDer<'static> = cert.cert.der().clone();
-        let roots = public_root_cert_store_from(vec![native_der]);
-        assert_eq!(roots.len(), 1);
+    fn public_trust_connector_is_not_implemented_yet() {
+        let err = match public_trust_connector(&[]) {
+            Ok(_) => panic!("expected Unsupported"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 }
 
 #[cfg(all(test, feature = "integration"))]
-mod tests {
+mod integration_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpStream as StdTcpStream;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use rcgen::{CertifiedKey, generate_simple_self_signed};
-    use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
     use hopf_core::{
-        Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpConnectorConfig, TcpListenerConfig,
+        Endpoint, ProtocolHandler, Runtime, RuntimeConfig, SecurityInfo, TcpConnectorConfig,
+        TcpListenerConfig,
     };
+    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-    // Returns the TempDir guard too — the caller must keep it alive for as
-    // long as it uses the paths, since dropping it deletes the directory.
-    // A per-call unique directory (rather than a pid/timestamp-derived
-    // name, which collided under concurrent calls — issue #372) is what
-    // actually matters here: parallel test threads each get their own
-    // directory, so one test's cert/key pair can never be interleaved
-    // with another's.
-    fn write_temp_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, CertifiedKey) {
-        let dir = tempfile::Builder::new().prefix("hopf-tls-").tempdir().unwrap();
+    fn write_temp_pem(
+        label: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, CertifiedKey) {
+        let dir = tempfile::Builder::new().prefix(&format!("hopf-tls-{label}-")).tempdir().unwrap();
         let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
@@ -769,60 +134,28 @@ mod tests {
         (dir, cert_path, key_path, cert)
     }
 
-    /// Regression test for issue #372: `write_temp_pem`'s directory name
-    /// is derived from the process ID plus a nanosecond timestamp, both
-    /// shared across every test in this binary — two threads reading the
-    /// clock closely enough together produce the same directory, and
-    /// `create_dir_all` doesn't error on an already-existing one, so both
-    /// happily write differing cert/key content into the same two files.
-    /// Whichever write order loses leaves a reader with a certificate
-    /// from one generated key pair and a private key from the other — the
-    /// `InconsistentKeys(KeyMismatch)` failures seen under full-workspace
-    /// parallel test runs. This drives many concurrent calls to surface
-    /// that duplicate-path behavior directly, rather than trying to race
-    /// the file writes themselves (which is what actually manifests as a
-    /// test failure, but far less reliably on demand).
-    #[test]
-    fn write_temp_pem_never_produces_the_same_directory_twice() {
-        use std::collections::HashSet;
-        let dirs: Arc<Mutex<Vec<std::path::PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
-        let handles: Vec<_> = (0..256)
-            .map(|_| {
-                let dirs = Arc::clone(&dirs);
-                std::thread::spawn(move || {
-                    let (_dir, cert_path, _key_path, _cert) = write_temp_pem();
-                    dirs.lock().unwrap().push(cert_path.parent().unwrap().to_path_buf());
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
-        let dirs = dirs.lock().unwrap();
-        let unique: HashSet<_> = dirs.iter().collect();
-        assert_eq!(
-            unique.len(),
-            dirs.len(),
-            "write_temp_pem produced the same directory for two concurrent calls"
-        );
+    fn rustls_client(cert: &CertifiedKey, alpn: &[&[u8]]) -> ClientConfig {
+        let mut roots = RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let mut cfg = ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        cfg
     }
 
     struct TlsEcho {
-        alpn_seen: Arc<Mutex<Option<Bytes>>>,
+        alpn_seen: Arc<Mutex<Option<Vec<u8>>>>,
         ready: Arc<Mutex<bool>>,
     }
 
     impl ProtocolHandler for TlsEcho {
-        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
-            // Defer traffic until security_established (Gumdrop HTTP/SMTPS pattern).
-        }
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
 
-        fn security_established(
-            &mut self,
-            _endpoint: &mut dyn Endpoint,
-            info: &SecurityInfo,
-        ) {
-            *self.alpn_seen.lock().unwrap() = info.alpn().map(Bytes::copy_from_slice);
+        fn security_established(&mut self, _endpoint: &mut dyn Endpoint, info: &SecurityInfo) {
+            *self.alpn_seen.lock().unwrap() = info.alpn().map(|a| a.to_vec());
             *self.ready.lock().unwrap() = true;
         }
 
@@ -835,44 +168,32 @@ mod tests {
         }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
-
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
     }
 
-    fn rustls_client(cert: &CertifiedKey, alpn: &[&[u8]]) -> ClientConfig {
-        let mut roots = RootCertStore::empty();
-        roots.add(cert.cert.der().clone()).unwrap();
-        let mut cfg = client_config_builder()
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-        cfg
-    }
-
+    /// Interop proof, not just self-consistency: a real independent TLS 1.3
+    /// implementation (rustls, as the client) completing a handshake against
+    /// `hopf-core::tls::TlsRecordEngine` (as the server, via this crate's
+    /// `acceptor_from_pem`) is the thing hopf-tls's own loopback tests
+    /// (Hopf talking to Hopf) can't prove — that the wire format this crate
+    /// now serves is actually RFC 8446-compliant, not just internally
+    /// consistent between two instances of the same new code.
     #[test]
-    fn tls_echo_exposes_alpn() {
-        let (_dir, cert_path, key_path, certified) = write_temp_pem();
-        let acceptor =
-            acceptor_from_pem(&cert_path, &key_path, &[b"h2", b"http/1.1"]).unwrap();
+    fn rustls_client_completes_handshake_against_hopf_engine_server() {
+        let (_dir, cert_path, key_path, certified) = write_temp_pem("interop");
+        let acceptor = acceptor_from_pem(&cert_path, &key_path, &[b"h2", b"http/1.1"]).unwrap();
 
         let alpn_seen = Arc::new(Mutex::new(None));
         let ready = Arc::new(Mutex::new(false));
         let alpn_f = Arc::clone(&alpn_seen);
         let ready_f = Arc::clone(&ready);
 
-        let rt = Runtime::start(RuntimeConfig {
-            worker_threads: 1,
-            ..Default::default()
-        })
-        .unwrap();
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
         let (addr, _) = rt
             .add_tcp_listener(
                 TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
-                    Box::new(TlsEcho {
-                        alpn_seen: Arc::clone(&alpn_f),
-                        ready: Arc::clone(&ready_f),
-                    }) as Box<dyn ProtocolHandler>
+                    Box::new(TlsEcho { alpn_seen: Arc::clone(&alpn_f), ready: Arc::clone(&ready_f) })
+                        as Box<dyn ProtocolHandler>
                 })
                 .with_tls(acceptor),
             )
@@ -913,11 +234,7 @@ mod tests {
             endpoint.send(b"PLAIN\n");
         }
 
-        fn security_established(
-            &mut self,
-            endpoint: &mut dyn Endpoint,
-            _info: &SecurityInfo,
-        ) {
+        fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
             *self.upgraded.lock().unwrap() = true;
             endpoint.send(b"SECURE\n");
         }
@@ -935,28 +252,21 @@ mod tests {
         }
 
         fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
-
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
     }
 
     #[test]
-    fn start_tls_upgrades_connection() {
-        let (_dir, cert_path, key_path, certified) = write_temp_pem();
+    fn start_tls_upgrades_connection_against_a_rustls_client() {
+        let (_dir, cert_path, key_path, certified) = write_temp_pem("starttls");
         let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
         let upgraded = Arc::new(Mutex::new(false));
         let upgraded_f = Arc::clone(&upgraded);
 
-        let rt = Runtime::start(RuntimeConfig {
-            worker_threads: 1,
-            ..Default::default()
-        })
-        .unwrap();
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
         let (addr, _) = rt
             .add_tcp_listener(
                 TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
-                    Box::new(StartTlsProbe {
-                        upgraded: Arc::clone(&upgraded_f),
-                    }) as Box<dyn ProtocolHandler>
+                    Box::new(StartTlsProbe { upgraded: Arc::clone(&upgraded_f) }) as Box<dyn ProtocolHandler>
                 })
                 .with_starttls_acceptor(acceptor),
             )
@@ -984,342 +294,6 @@ mod tests {
         rt.shutdown();
     }
 
-    // See `write_temp_pem`'s doc comment (issue #372) — same reasoning,
-    // just with a caller-supplied label folded into the prefix purely for
-    // readability of the temp path, not for uniqueness (the random
-    // suffix `tempdir()` appends is what actually guarantees that).
-    fn write_temp_pem_named(
-        label: &str,
-        hostname: &str,
-    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, CertifiedKey) {
-        let dir = tempfile::Builder::new()
-            .prefix(&format!("hopf-tls-{label}-"))
-            .tempdir()
-            .unwrap();
-        let cert = generate_simple_self_signed(vec![hostname.to_string()]).unwrap();
-        let cert_path = dir.path().join("cert.pem");
-        let key_path = dir.path().join("key.pem");
-        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-        (dir, cert_path, key_path, cert)
-    }
-
-    /// Collects every [`SecurityInfo`] seen, in handshake-completion order.
-    /// hopf-core only delivers plaintext to `receive()` after
-    /// `security_established` has already fired for that handshake, so
-    /// there's no need to gate echoing on a "ready" flag.
-    struct SecurityCollector {
-        infos: Arc<Mutex<Vec<SecurityInfo>>>,
-    }
-
-    impl ProtocolHandler for SecurityCollector {
-        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-
-        fn security_established(&mut self, _endpoint: &mut dyn Endpoint, info: &SecurityInfo) {
-            self.infos.lock().unwrap().push(info.clone());
-        }
-
-        fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            endpoint.send(data);
-            *data = &[];
-        }
-
-        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
-    }
-
-    fn echo_roundtrip(tls: &mut StreamOwned<ClientConnection, StdTcpStream>, msg: &[u8]) {
-        tls.write_all(msg).unwrap();
-        tls.flush().unwrap();
-        let mut buf = vec![0u8; msg.len()];
-        tls.read_exact(&mut buf).unwrap();
-        assert_eq!(buf, msg);
-    }
-
-    fn wait_for(infos: &Arc<Mutex<Vec<SecurityInfo>>>, count: usize) {
-        for _ in 0..50 {
-            if infos.lock().unwrap().len() >= count {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        panic!("timed out waiting for {count} security_established call(s)");
-    }
-
-    #[test]
-    fn sni_resolver_dispatches_cert_by_hostname() {
-        let (_alpha_dir, alpha_cert, alpha_key, alpha_certified) = write_temp_pem_named("alpha", "alpha.test");
-        let (_beta_dir, beta_cert, beta_key, beta_certified) = write_temp_pem_named("beta", "beta.test");
-        let acceptor = acceptor_with_sni_certs(
-            &[
-                ("alpha.test", &alpha_cert, &alpha_key),
-                ("beta.test", &beta_cert, &beta_key),
-            ],
-            &[],
-        )
-        .unwrap();
-
-        let infos = Arc::new(Mutex::new(Vec::new()));
-        let infos_f = Arc::clone(&infos);
-        let rt = Runtime::start(RuntimeConfig {
-            worker_threads: 1,
-            ..Default::default()
-        })
-        .unwrap();
-        let (addr, _) = rt
-            .add_tcp_listener(
-                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
-                    Box::new(SecurityCollector {
-                        infos: Arc::clone(&infos_f),
-                    }) as Box<dyn ProtocolHandler>
-                })
-                .with_tls(acceptor),
-            )
-            .unwrap();
-
-        // A client that trusts only alpha's cert, requesting SNI "alpha.test",
-        // must get alpha's cert back — and the server must observe that SNI.
-        {
-            let mut roots = RootCertStore::empty();
-            roots.add(alpha_certified.cert.der().clone()).unwrap();
-            let cfg = Arc::new(
-                client_config_builder()
-                    .unwrap()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            );
-            let server_name = rustls::pki_types::ServerName::try_from("alpha.test").unwrap();
-            let conn = ClientConnection::new(cfg, server_name).unwrap();
-            let sock = StdTcpStream::connect(addr).unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-            let mut tls = StreamOwned::new(conn, sock);
-            echo_roundtrip(&mut tls, b"alpha");
-        }
-        wait_for(&infos, 1);
-        assert_eq!(infos.lock().unwrap()[0].sni(), Some("alpha.test"));
-
-        // Same for beta — different hostname, different cert, different SNI.
-        {
-            let mut roots = RootCertStore::empty();
-            roots.add(beta_certified.cert.der().clone()).unwrap();
-            let cfg = Arc::new(
-                client_config_builder()
-                    .unwrap()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            );
-            let server_name = rustls::pki_types::ServerName::try_from("beta.test").unwrap();
-            let conn = ClientConnection::new(cfg, server_name).unwrap();
-            let sock = StdTcpStream::connect(addr).unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-            let mut tls = StreamOwned::new(conn, sock);
-            echo_roundtrip(&mut tls, b"beta");
-        }
-        wait_for(&infos, 2);
-        assert_eq!(infos.lock().unwrap()[1].sni(), Some("beta.test"));
-
-        // A client trusting only alpha's cert but requesting "beta.test" must
-        // fail — proof the resolver actually dispatches per hostname rather
-        // than always serving the same certificate.
-        {
-            let mut roots = RootCertStore::empty();
-            roots.add(alpha_certified.cert.der().clone()).unwrap();
-            let cfg = Arc::new(
-                client_config_builder()
-                    .unwrap()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            );
-            let server_name = rustls::pki_types::ServerName::try_from("beta.test").unwrap();
-            let conn = ClientConnection::new(cfg, server_name).unwrap();
-            let sock = StdTcpStream::connect(addr).unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-            let mut tls = StreamOwned::new(conn, sock);
-            let result = tls
-                .write_all(b"x")
-                .and_then(|_| tls.flush())
-                .and_then(|_| tls.read(&mut [0u8; 8]));
-            assert!(result.is_err(), "expected cert/hostname mismatch to fail");
-        }
-        assert_eq!(infos.lock().unwrap().len(), 2, "mismatched handshake must not complete");
-
-        rt.shutdown();
-    }
-
-    #[test]
-    fn required_client_auth_rejects_client_without_cert() {
-        let (_server_dir, server_cert, server_key, server_certified) =
-            write_temp_pem_named("mtls-req-srv", "localhost");
-        let (_client_dir, client_cert, _client_key, _client_certified) =
-            write_temp_pem_named("mtls-req-cli", "client1");
-        let acceptor =
-            acceptor_with_client_auth(&server_cert, &server_key, &client_cert, true, &[]).unwrap();
-
-        let infos: Arc<Mutex<Vec<SecurityInfo>>> = Arc::new(Mutex::new(Vec::new()));
-        let infos_f = Arc::clone(&infos);
-        let rt = Runtime::start(RuntimeConfig {
-            worker_threads: 1,
-            ..Default::default()
-        })
-        .unwrap();
-        let (addr, _) = rt
-            .add_tcp_listener(
-                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
-                    Box::new(SecurityCollector {
-                        infos: Arc::clone(&infos_f),
-                    }) as Box<dyn ProtocolHandler>
-                })
-                .with_tls(acceptor),
-            )
-            .unwrap();
-
-        let mut roots = RootCertStore::empty();
-        roots.add(server_certified.cert.der().clone()).unwrap();
-        let cfg = Arc::new(
-            client_config_builder()
-                .unwrap()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        );
-        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let conn = ClientConnection::new(cfg, server_name).unwrap();
-        let sock = StdTcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut tls = StreamOwned::new(conn, sock);
-        let result = tls
-            .write_all(b"probe")
-            .and_then(|_| tls.flush())
-            .and_then(|_| tls.read(&mut [0u8; 8]));
-        assert!(result.is_err(), "server must reject a client with no certificate");
-        assert!(infos.lock().unwrap().is_empty(), "handshake must not have completed");
-
-        rt.shutdown();
-    }
-
-    #[test]
-    fn required_client_auth_accepts_valid_cert_and_reports_fingerprint() {
-        let (_server_dir, server_cert, server_key, server_certified) =
-            write_temp_pem_named("mtls-ok-srv", "localhost");
-        let (_client_dir, client_cert, client_key, client_certified) =
-            write_temp_pem_named("mtls-ok-cli", "client1");
-        let acceptor =
-            acceptor_with_client_auth(&server_cert, &server_key, &client_cert, true, &[]).unwrap();
-
-        let infos = Arc::new(Mutex::new(Vec::new()));
-        let infos_f = Arc::clone(&infos);
-        let rt = Runtime::start(RuntimeConfig {
-            worker_threads: 1,
-            ..Default::default()
-        })
-        .unwrap();
-        let (addr, _) = rt
-            .add_tcp_listener(
-                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
-                    Box::new(SecurityCollector {
-                        infos: Arc::clone(&infos_f),
-                    }) as Box<dyn ProtocolHandler>
-                })
-                .with_tls(acceptor),
-            )
-            .unwrap();
-
-        let mut roots = RootCertStore::empty();
-        roots.add(server_certified.cert.der().clone()).unwrap();
-        let identity_certs = load_certs(&client_cert).unwrap();
-        let identity_key = load_private_key(&client_key).unwrap();
-        let cfg = Arc::new(
-            client_config_builder()
-                .unwrap()
-                .with_root_certificates(roots)
-                .with_client_auth_cert(identity_certs, identity_key)
-                .unwrap(),
-        );
-        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let conn = ClientConnection::new(cfg, server_name).unwrap();
-        let sock = StdTcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut tls = StreamOwned::new(conn, sock);
-        echo_roundtrip(&mut tls, b"hi");
-
-        wait_for(&infos, 1);
-        let info = infos.lock().unwrap()[0].clone();
-        let fingerprint = info
-            .peer_certificate_fingerprint()
-            .expect("fingerprint set")
-            .to_string();
-        let expected = sha256_hex(&client_certified.cert.der().clone());
-        assert_eq!(fingerprint, expected);
-        let chain = info.peer_certificate_chain().expect("chain set");
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].as_ref(), client_certified.cert.der().as_ref());
-
-        rt.shutdown();
-    }
-
-    #[test]
-    fn optional_client_auth_accepts_client_without_cert() {
-        let (_server_dir, server_cert, server_key, server_certified) =
-            write_temp_pem_named("mtls-opt-srv", "localhost");
-        let (_client_dir, client_cert, _client_key, _client_certified) =
-            write_temp_pem_named("mtls-opt-cli", "client1");
-        let acceptor =
-            acceptor_with_client_auth(&server_cert, &server_key, &client_cert, false, &[]).unwrap();
-
-        let infos = Arc::new(Mutex::new(Vec::new()));
-        let infos_f = Arc::clone(&infos);
-        let rt = Runtime::start(RuntimeConfig {
-            worker_threads: 1,
-            ..Default::default()
-        })
-        .unwrap();
-        let (addr, _) = rt
-            .add_tcp_listener(
-                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
-                    Box::new(SecurityCollector {
-                        infos: Arc::clone(&infos_f),
-                    }) as Box<dyn ProtocolHandler>
-                })
-                .with_tls(acceptor),
-            )
-            .unwrap();
-
-        let mut roots = RootCertStore::empty();
-        roots.add(server_certified.cert.der().clone()).unwrap();
-        let cfg = Arc::new(
-            client_config_builder()
-                .unwrap()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        );
-        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let conn = ClientConnection::new(cfg, server_name).unwrap();
-        let sock = StdTcpStream::connect(addr).unwrap();
-        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-        let mut tls = StreamOwned::new(conn, sock);
-        echo_roundtrip(&mut tls, b"hi");
-
-        wait_for(&infos, 1);
-        assert_eq!(infos.lock().unwrap()[0].peer_certificate_fingerprint(), None);
-
-        rt.shutdown();
-    }
-
-    struct NoopServer;
-    impl ProtocolHandler for NoopServer {
-        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-            *data = &[];
-        }
-        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
-        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
-    }
-
     struct EstablishedProbe {
         established: Arc<Mutex<bool>>,
     }
@@ -1335,21 +309,27 @@ mod tests {
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
     }
 
+    struct NoopServer;
+    impl ProtocolHandler for NoopServer {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+    }
+
     /// Regression test for issue #353's opportunistic-TLS foundation:
     /// [`insecure_connector`] must complete a real handshake against a
     /// certificate that matches neither the claimed server name nor any
-    /// trusted root — proving it genuinely performs no validation, which
-    /// is the whole point of an "encrypt without authenticating" connector.
+    /// trusted root — proving it genuinely performs no validation, which is
+    /// the whole point of an "encrypt without authenticating" connector.
     #[test]
     fn insecure_connector_completes_handshake_despite_hostname_and_trust_mismatch() {
-        let (_dir, cert_path, key_path, _certified) = write_temp_pem(); // cert is for "localhost"
+        let (_dir, cert_path, key_path, _certified) = write_temp_pem("insecure"); // cert is for "localhost"
         let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
 
-        let rt = Runtime::start(RuntimeConfig {
-            worker_threads: 1,
-            ..Default::default()
-        })
-        .unwrap();
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
         let (addr, _) = rt
             .add_tcp_listener(
                 TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
@@ -1364,9 +344,7 @@ mod tests {
         let connector = insecure_connector(&[]);
         rt.connect(
             TcpConnectorConfig::new(addr, move || {
-                Box::new(EstablishedProbe {
-                    established: Arc::clone(&established2),
-                }) as Box<dyn ProtocolHandler>
+                Box::new(EstablishedProbe { established: Arc::clone(&established2) }) as Box<dyn ProtocolHandler>
             })
             .with_tls(connector, "totally-different-name.example"),
         )
@@ -1381,107 +359,6 @@ mod tests {
         assert!(
             *established.lock().unwrap(),
             "handshake should succeed despite the hostname/trust mismatch"
-        );
-
-        rt.shutdown();
-    }
-
-    /// Regression test for issue #375: unlike every other client path in
-    /// this crate, which either pins an explicit caller-supplied root or
-    /// skips validation outright, `public_trust_connector` must complete a
-    /// real handshake against a certificate chaining to an actual public
-    /// certificate authority — proving the connector's root store is
-    /// genuinely populated (native store, vendored fallback, or both), not
-    /// just non-empty in isolation. Talks to a well-known, stable public
-    /// HTTPS endpoint; needs real internet access, which is exactly why
-    /// this lives behind this module's `integration` feature gate rather
-    /// than running in CI.
-    #[test]
-    fn public_trust_connector_validates_a_real_public_certificate() {
-        use std::net::ToSocketAddrs;
-
-        let host = "cloudflare.com";
-        let addr = (host, 443)
-            .to_socket_addrs()
-            .expect("resolve cloudflare.com")
-            .next()
-            .expect("at least one address for cloudflare.com");
-
-        let rt = Runtime::start(RuntimeConfig {
-            worker_threads: 1,
-            ..Default::default()
-        })
-        .unwrap();
-
-        let established = Arc::new(Mutex::new(false));
-        let established2 = Arc::clone(&established);
-        let connector = public_trust_connector(&[]).unwrap();
-        rt.connect(
-            TcpConnectorConfig::new(addr, move || {
-                Box::new(EstablishedProbe {
-                    established: Arc::clone(&established2),
-                }) as Box<dyn ProtocolHandler>
-            })
-            .with_tls(connector, host),
-        )
-        .unwrap();
-
-        for _ in 0..250 {
-            if *established.lock().unwrap() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            *established.lock().unwrap(),
-            "handshake against a real public certificate should validate and succeed"
-        );
-
-        rt.shutdown();
-    }
-
-    /// Companion to the real-endpoint test above, runnable with no network
-    /// access at all: `public_trust_connector` must reject a self-signed
-    /// certificate exactly like any other public-WebPKI client would —
-    /// proving the validation is real rather than the positive test above
-    /// merely reaching a server that happens to have a certificate for
-    /// unrelated reasons.
-    #[test]
-    fn public_trust_connector_rejects_a_self_signed_server() {
-        let (_dir, cert_path, key_path, _certified) = write_temp_pem(); // cert is for "localhost"
-        let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
-
-        let rt = Runtime::start(RuntimeConfig {
-            worker_threads: 1,
-            ..Default::default()
-        })
-        .unwrap();
-        let (addr, _) = rt
-            .add_tcp_listener(
-                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
-                    Box::new(NoopServer) as Box<dyn ProtocolHandler>
-                })
-                .with_tls(acceptor),
-            )
-            .unwrap();
-
-        let established = Arc::new(Mutex::new(false));
-        let established2 = Arc::clone(&established);
-        let connector = public_trust_connector(&[]).unwrap();
-        rt.connect(
-            TcpConnectorConfig::new(addr, move || {
-                Box::new(EstablishedProbe {
-                    established: Arc::clone(&established2),
-                }) as Box<dyn ProtocolHandler>
-            })
-            .with_tls(connector, "localhost"),
-        )
-        .unwrap();
-
-        std::thread::sleep(Duration::from_millis(500));
-        assert!(
-            !*established.lock().unwrap(),
-            "a self-signed certificate must not validate against the public WebPKI trust store"
         );
 
         rt.shutdown();

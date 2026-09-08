@@ -222,22 +222,15 @@ fn tls_pair(
     hopf_core::tls::SharedTlsAcceptor,
     hopf_core::SharedTlsConnector,
 ) {
-    use hopf_tls::{acceptor_from_pem, connector};
+    use hopf_tls::{acceptor_from_pem, connector_from_pem};
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
     std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
     let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
-
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert.cert.der().clone()).unwrap();
-    let client_cfg = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
-    (acceptor, connector(client_cfg))
+    let connector = connector_from_pem(&cert_path, &[]).unwrap();
+    (acceptor, connector)
 }
 
 fn fetch_timeouts() -> ImapClientTimeouts {

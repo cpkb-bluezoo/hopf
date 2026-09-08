@@ -7,9 +7,9 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "rustls integration for Hopf Endpoints (TCP TLS and STARTTLS)"
+description = "PEM-loaded TLS acceptors/connectors for Hopf Endpoints (thin hopf-core::tls shim, kept for API compatibility until Phase 8 removes this crate)"
 readme = "README.md"
-keywords = ["tls", "rustls", "server"]
+keywords = ["tls", "server"]
 categories = ["network-programming", "cryptography"]
 
 [features]
@@ -19,12 +19,10 @@ integration = []
 
 [dependencies]
 hopf-core = { workspace = true }
-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
-rustls-native-certs = { workspace = true }
-webpki-roots = { workspace = true }
-aws-lc-rs = { workspace = true }
 
 [dev-dependencies]
+# Test peer only, to prove wire interop with a real independent TLS 1.3
+# implementation — hopf-tls's own runtime code no longer touches rustls.
+rustls = { workspace = true }
 rcgen = { workspace = true }
 tempfile = { workspace = true }

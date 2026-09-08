@@ -78,11 +78,14 @@ pub fn compute_finished_verify_data(traffic_secret: &[u8; 32], transcript_hash: 
     out
 }
 
-/// Master secret PRK after the handshake secret.
+/// Master secret PRK after the handshake secret. RFC 8446 §7.1: `IKM` here is
+/// `Hash.length` zero *bytes* (32, for SHA-256) — not an empty string; an
+/// empty IKM silently produces a different (wrong) PRK from HKDF-Extract,
+/// since HMAC over zero bytes and HMAC over no bytes are different messages.
 fn master_secret(psk: Option<&[u8; 32]>, shared_secret: &[u8]) -> HkdfPrk {
     let hs = handshake_secret_with_psk(psk, shared_secret);
     let derived = hs.derive_secret("derived", &empty_hash());
-    extract(Some(&derived), &[] as &[u8])
+    extract(Some(&derived), &[0u8; 32])
 }
 
 /// Derive 1-RTT application traffic secrets after both Finished messages.

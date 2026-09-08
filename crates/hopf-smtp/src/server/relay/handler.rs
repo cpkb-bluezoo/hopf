@@ -831,21 +831,13 @@ impl DeliveryContext {
 }
 
 /// Build a [`SharedTlsConnector`] that authenticates the peer against
-/// `records` via [`hopf_dns::dane::DaneServerCertVerifier`] (issue #352) —
-/// used for a DANE-authenticated hop's mandatory STARTTLS.
+/// `records` via [`hopf_dns::dane::verify_dane_chain`] (issue #352) — used
+/// for a DANE-authenticated hop's mandatory STARTTLS.
 fn build_dane_connector(records: Vec<hopf_dns::TlsaRecord>) -> SharedTlsConnector {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let verifier = Arc::new(hopf_dns::dane::DaneServerCertVerifier::with_provider(
-        records,
-        Arc::clone(&provider),
-    ));
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("the crate's fixed protocol version list is always valid")
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    hopf_tls::connector(Arc::new(config))
+    hopf_core::connector_with_verify_override(
+        Arc::new(move |chain, server_name| hopf_dns::dane::verify_dane_chain(&records, chain, server_name)),
+        &[],
+    )
 }
 
 /// Builds and sends a failure DSN for a message that never reaches the

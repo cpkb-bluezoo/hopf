@@ -9,6 +9,7 @@
 
 #![warn(missing_docs)]
 
+pub mod aead;
 pub mod cert;
 pub mod digest;
 pub mod hkdf;
@@ -22,6 +23,7 @@ pub mod x509;
 #[cfg(feature = "ed448")]
 pub mod ed448;
 
+pub use aead::{AeadError, Aes128GcmKey};
 pub use cert::{sha256_fingerprint_hex, spki_sha256};
 pub use digest::{hash, Digest, HashAlgorithm, Sha256Context};
 pub use hkdf::{empty_hash, expand_label, extract, extract_derived, quic_expand_label, HkdfPrk, TLS13_HKDF};
@@ -32,9 +34,11 @@ pub use kx::{
 pub use kx_policy::KxPolicy;
 pub use rand::SystemRandom;
 pub use signature::{
-    ecdsa_p256_sha256_verify, ecdsa_p384_sha384_verify, ed25519_sign, ed25519_verify,
-    rsa_dnskey_to_spki_der, rsa_sign_pkcs1_sha256, rsa_verify_dnskey, rsa_verify_pkcs1_sha256,
-    rsa_verify_pkcs1_sha512, Ed25519PrivateKey, Ed25519PublicKey, KeyError, RsaPrivateKey,
-    RsaPublicKeyComponents, SignError,
+    ecdsa_p256_sha256_verify, ecdsa_p256_sha256_verify_spki, ecdsa_p256_sign,
+    ecdsa_p384_sha384_verify, ecdsa_p384_sha384_verify_spki, ecdsa_p384_sign, ed25519_sign,
+    ed25519_verify, rsa_dnskey_to_spki_der, rsa_pss_sha256_verify_spki, rsa_sign_pkcs1_sha256,
+    rsa_sign_pss_sha256, rsa_verify_dnskey, rsa_verify_pkcs1_sha256, rsa_verify_pkcs1_sha512,
+    EcdsaP256PrivateKey, EcdsaP384PrivateKey, Ed25519PrivateKey, Ed25519PublicKey, KeyError,
+    RsaPrivateKey, RsaPublicKeyComponents, SignError,
 };
 pub use trust::{verify_server_chain, TrustStore, VerifyError};

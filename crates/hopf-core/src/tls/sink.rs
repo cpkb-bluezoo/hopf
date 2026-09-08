@@ -85,6 +85,12 @@ pub trait TlsEventSink {
     /// after accepting a PSK on the server.
     fn quic_early_keys_ready(&mut self, _client_early: [u8; 32]) {}
 
+    /// Application traffic secrets — fired alongside `handshake_complete` in both
+    /// [`super::HandshakeMode::Quic`] and [`super::HandshakeMode::TcpRecordLayer`] (the QUIC
+    /// path also gets these via `handshake_complete`'s `QuicSecrets`; the TCP record layer has
+    /// no other way to learn them, since `QuicSecrets` is QUIC-only).
+    fn application_traffic_keys_ready(&mut self, _client: [u8; 32], _server: [u8; 32]) {}
+
     /// Negotiated TLS key-exchange group (IANA code, e.g. 0x11ec for X25519MLKEM768).
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
 
@@ -115,6 +121,7 @@ impl TlsEventSink for NopTlsEventSink {
     fn peer_transport_parameters(&mut self, _params: &[u8]) {}
     fn quic_handshake_keys_ready(&mut self, _client: [u8; 32], _server: [u8; 32]) {}
     fn quic_early_keys_ready(&mut self, _client_early: [u8; 32]) {}
+    fn application_traffic_keys_ready(&mut self, _client: [u8; 32], _server: [u8; 32]) {}
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
     fn early_data_accepted(&mut self, _accepted: bool) {}
     fn quic_0rtt_peer_limits(&mut self, _limits: super::handshake::RememberedTransportLimits) {}

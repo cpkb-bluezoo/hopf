@@ -5,8 +5,10 @@
 use bytes::Bytes;
 
 use aws_lc_rs::signature::{
-    self, KeyPair, RsaKeyPair, UnparsedPublicKey, ED25519, RSA_PKCS1_2048_8192_SHA256,
-    RSA_PKCS1_2048_8192_SHA512, RSA_PKCS1_SHA256,
+    self, EcdsaKeyPair, KeyPair, RsaKeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1,
+    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1, ECDSA_P384_SHA384_ASN1_SIGNING, ED25519,
+    RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA512, RSA_PKCS1_SHA256,
+    RSA_PSS_2048_8192_SHA256, RSA_PSS_SHA256,
 };
 
 /// Key parsing or generation failed.
@@ -71,6 +73,32 @@ impl Ed25519PublicKey {
     }
 }
 
+/// ECDSA P-256 PKCS#8 private key for signing (ASN.1 `ECDSA-Sig-Value` output —
+/// the encoding TLS `CertificateVerify` and X.509 both use, unlike the raw
+/// r||s `_FIXED` verifiers below which are DNSSEC's RFC 6605 wire format).
+pub struct EcdsaP256PrivateKey(EcdsaKeyPair);
+
+impl EcdsaP256PrivateKey {
+    /// Load from PKCS#8 DER.
+    pub fn from_pkcs8(der: &[u8]) -> Result<Self, KeyError> {
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, der)
+            .map(EcdsaP256PrivateKey)
+            .map_err(|_| KeyError)
+    }
+}
+
+/// ECDSA P-384 PKCS#8 private key for signing (ASN.1 encoding, see [`EcdsaP256PrivateKey`]).
+pub struct EcdsaP384PrivateKey(EcdsaKeyPair);
+
+impl EcdsaP384PrivateKey {
+    /// Load from PKCS#8 DER.
+    pub fn from_pkcs8(der: &[u8]) -> Result<Self, KeyError> {
+        EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, der)
+            .map(EcdsaP384PrivateKey)
+            .map_err(|_| KeyError)
+    }
+}
+
 /// RSA `(n, e)` public-key components for verification (DKIM, DNSSEC).
 pub struct RsaPublicKeyComponents<'a> {
     /// RSA modulus.
@@ -96,6 +124,32 @@ pub fn rsa_sign_pkcs1_sha256(key: &RsaPrivateKey, data: &[u8]) -> Result<Bytes, 
 /// Sign `data` with Ed25519 (DKIM `ed25519-sha256`, DNSSEC).
 pub fn ed25519_sign(key: &Ed25519PrivateKey, data: &[u8]) -> Bytes {
     Bytes::copy_from_slice(key.0.sign(data).as_ref())
+}
+
+/// Sign `data` with RSA-PSS + SHA-256 (TLS 1.3 `rsa_pss_rsae_sha256` `CertificateVerify`
+/// — TLS 1.3 forbids PKCS#1 v1.5 in `CertificateVerify`, unlike DKIM's `rsa-sha256`).
+pub fn rsa_sign_pss_sha256(key: &RsaPrivateKey, data: &[u8]) -> Result<Bytes, SignError> {
+    let mut sig = vec![0u8; key.0.public_modulus_len()];
+    key.0
+        .sign(&RSA_PSS_SHA256, &aws_lc_rs::rand::SystemRandom::new(), data, &mut sig)
+        .map_err(|_| SignError)?;
+    Ok(Bytes::from(sig))
+}
+
+/// Sign `data` with ECDSA P-256 + SHA-256, ASN.1-encoded (TLS `ecdsa_secp256r1_sha256`).
+pub fn ecdsa_p256_sign(key: &EcdsaP256PrivateKey, data: &[u8]) -> Result<Bytes, SignError> {
+    key.0
+        .sign(&aws_lc_rs::rand::SystemRandom::new(), data)
+        .map(|s| Bytes::copy_from_slice(s.as_ref()))
+        .map_err(|_| SignError)
+}
+
+/// Sign `data` with ECDSA P-384 + SHA-384, ASN.1-encoded (TLS `ecdsa_secp384r1_sha384`).
+pub fn ecdsa_p384_sign(key: &EcdsaP384PrivateKey, data: &[u8]) -> Result<Bytes, SignError> {
+    key.0
+        .sign(&aws_lc_rs::rand::SystemRandom::new(), data)
+        .map(|s| Bytes::copy_from_slice(s.as_ref()))
+        .map_err(|_| SignError)
 }
 
 /// Verify RSA PKCS#1 v1.5 + SHA-256 over `message`.
@@ -174,6 +228,31 @@ pub fn ecdsa_p384_sha384_verify(public_key_xy: &[u8], message: &[u8], signature:
         .is_ok()
 }
 
+/// Verify ECDSA P-256 + SHA-256, ASN.1-encoded signature, against a full SPKI DER
+/// public key (TLS `CertificateVerify` / X.509 — see [`EcdsaP256PrivateKey`] for why
+/// this differs from [`ecdsa_p256_sha256_verify`]'s DNSSEC fixed-format sibling).
+pub fn ecdsa_p256_sha256_verify_spki(spki_der: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, spki_der)
+        .verify(message, signature)
+        .is_ok()
+}
+
+/// Verify ECDSA P-384 + SHA-384, ASN.1-encoded signature, against a full SPKI DER
+/// public key (TLS `CertificateVerify` / X.509).
+pub fn ecdsa_p384_sha384_verify_spki(spki_der: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, spki_der)
+        .verify(message, signature)
+        .is_ok()
+}
+
+/// Verify RSA-PSS + SHA-256 against a full SPKI DER public key (TLS `CertificateVerify`
+/// `rsa_pss_rsae_sha256` — TLS 1.3 forbids PKCS#1 v1.5 here).
+pub fn rsa_pss_sha256_verify_spki(spki_der: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, spki_der)
+        .verify(message, signature)
+        .is_ok()
+}
+
 /// RFC 3110 RSA DNSKEY wire format → DER `RSAPublicKey` (PKCS#1) for verification.
 pub fn rsa_dnskey_to_spki_der(public_key: &[u8]) -> Option<Vec<u8>> {
     if public_key.is_empty() {
@@ -247,5 +326,46 @@ mod tests {
         let sig = ed25519_sign(&key, msg);
         assert!(ed25519_verify(key.public_key_bytes(), msg, &sig));
         assert!(!ed25519_verify(key.public_key_bytes(), b"tampered", &sig));
+    }
+
+    fn spki_from_pkcs8_via_rcgen_p256() -> (rcgen::KeyPair, Vec<u8>) {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let spki = key.public_key_der();
+        (key, spki)
+    }
+
+    #[test]
+    fn ecdsa_p256_asn1_sign_verify_roundtrip() {
+        let (rcgen_key, spki) = spki_from_pkcs8_via_rcgen_p256();
+        let key = EcdsaP256PrivateKey::from_pkcs8(&rcgen_key.serialize_der()).unwrap();
+        let msg = b"hopf-crypto-test-p256";
+        let sig = ecdsa_p256_sign(&key, msg).unwrap();
+        assert!(ecdsa_p256_sha256_verify_spki(&spki, msg, &sig));
+        assert!(!ecdsa_p256_sha256_verify_spki(&spki, b"tampered", &sig));
+    }
+
+    #[test]
+    fn ecdsa_p384_asn1_sign_verify_roundtrip() {
+        let rcgen_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let spki = rcgen_key.public_key_der();
+        let key = EcdsaP384PrivateKey::from_pkcs8(&rcgen_key.serialize_der()).unwrap();
+        let msg = b"hopf-crypto-test-p384";
+        let sig = ecdsa_p384_sign(&key, msg).unwrap();
+        assert!(ecdsa_p384_sha384_verify_spki(&spki, msg, &sig));
+        assert!(!ecdsa_p384_sha384_verify_spki(&spki, b"tampered", &sig));
+    }
+
+    #[test]
+    fn rsa_pss_sha256_sign_verify_roundtrip() {
+        use aws_lc_rs::encoding::{AsDer, Pkcs8V1Der};
+        use aws_lc_rs::rsa::{KeyPair as RsaGenKeyPair, KeySize};
+        let generated = RsaGenKeyPair::generate(KeySize::Rsa2048).unwrap();
+        let pkcs8: Pkcs8V1Der<'_> = generated.as_der().unwrap();
+        let key = RsaPrivateKey::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let spki = generated.public_key().as_der().unwrap();
+        let msg = b"hopf-crypto-test-rsa-pss";
+        let sig = rsa_sign_pss_sha256(&key, msg).unwrap();
+        assert!(rsa_pss_sha256_verify_spki(spki.as_ref(), msg, &sig));
+        assert!(!rsa_pss_sha256_verify_spki(spki.as_ref(), b"tampered", &sig));
     }
 }

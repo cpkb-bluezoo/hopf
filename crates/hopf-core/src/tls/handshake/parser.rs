@@ -18,6 +18,17 @@ use super::messages::{ext, HandshakeType};
 ///
 /// Every `&[u8]` is valid only for the duration of the call.
 pub trait HandshakeEvents {
+    /// Whether the parser should stop popping further complete messages off
+    /// its buffer — checked before each one, not just skipped at dispatch
+    /// time. A handler that gates on external input mid-flight (e.g. a
+    /// certificate-verification callback) must leave any messages that
+    /// arrive after the gate untouched in the buffer, so a later resume can
+    /// still see and process them — silently popping-and-discarding them
+    /// here (as if handled) would lose them for good.
+    fn should_stop(&self) -> bool {
+        false
+    }
+
     /// First event for each complete handshake message.
     fn message_begin(&mut self, msg_type: HandshakeType);
 
@@ -170,6 +181,9 @@ impl HandshakeParser {
 
     fn drain_complete_messages(&mut self, handler: &mut dyn HandshakeEvents) {
         loop {
+            if handler.should_stop() {
+                break;
+            }
             if self.buf.len() < 4 {
                 break;
             }
@@ -527,15 +541,22 @@ fn decode_server_key_share_extension(data: &[u8], handler: &mut dyn HandshakeEve
     handler.key_share(group, &data[4..4 + klen]);
 }
 
+/// ALPN extension_data (RFC 7301 §3.1): 2-byte `ProtocolNameList` length,
+/// then each protocol name as a 1-byte length + bytes.
 fn decode_alpn_extension(data: &[u8], handler: &mut dyn HandshakeEvents) {
+    if data.len() < 2 {
+        return;
+    }
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let list = &data[2..data.len().min(2 + list_len)];
     let mut i = 0;
-    while i < data.len() {
-        let len = data[i] as usize;
+    while i < list.len() {
+        let len = list[i] as usize;
         i += 1;
-        if i + len > data.len() {
+        if i + len > list.len() {
             break;
         }
-        handler.alpn_protocol(&data[i..i + len]);
+        handler.alpn_protocol(&list[i..i + len]);
         i += len;
     }
 }
@@ -689,7 +710,7 @@ mod tests {
     fn server_hello_key_share_single_entry() {
         use crate::crypto::kx::NamedGroup;
         let share = [42u8; 32];
-        let hello = build_server_hello(&[9u8; 32], NamedGroup::X25519.code(), &share);
+        let hello = build_server_hello(&[9u8; 32], &[], NamedGroup::X25519.code(), &share);
         let wire = hello.encode();
 
         let mut parser = HandshakeParser::new();

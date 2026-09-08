@@ -15,6 +15,12 @@ use super::parser::{HandshakeEvents, HandshakeParser};
 pub struct ParsedClientHello {
     /// Client random.
     pub random: [u8; 32],
+    /// `legacy_session_id` as sent by the client (RFC 8446 §4.1.2) — the
+    /// server MUST echo this exact value back in `ServerHello`'s
+    /// `legacy_session_id_echo` (§4.1.3); a client using middlebox-compat
+    /// mode (Appendix D.4, e.g. rustls) sends a random 32 bytes here and
+    /// aborts the handshake if the echo doesn't match.
+    pub legacy_session_id: Bytes,
     /// Client key share bytes.
     pub peer_key_share: Option<Bytes>,
     /// Group id for [`Self::peer_key_share`].
@@ -90,6 +96,10 @@ impl HandshakeEvents for ClientHelloCollector {
 
     fn random(&mut self, value: &[u8; 32]) {
         self.out.random = *value;
+    }
+
+    fn session_id(&mut self, value: &[u8]) {
+        self.out.legacy_session_id = Bytes::copy_from_slice(value);
     }
 
     fn supported_group(&mut self, group: u16) {

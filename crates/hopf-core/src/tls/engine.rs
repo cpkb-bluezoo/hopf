@@ -8,11 +8,10 @@ use bytes::Bytes;
 use crate::crypto::kx::{server_agree, LocalKeyShare, NamedGroup};
 use crate::crypto::trust::TrustStore;
 use crate::crypto::kx_policy::KxPolicy;
-use crate::crypto::signature::Ed25519PrivateKey;
 use crate::security::SecurityInfo;
 use std::sync::Arc;
 
-use super::handshake::verify::{sign_ed25519_certificate_verify, verify_certificate_verify};
+use super::handshake::verify::{sign_certificate_verify, verify_certificate_verify};
 
 use super::handshake::{
     build_certificate, build_certificate_verify, build_client_hello,
@@ -59,6 +58,19 @@ pub struct ServerCredentials {
     pub signing_key_pkcs8: Bytes,
 }
 
+/// Custom server-chain verification callback (client role) — peer chain
+/// (DER, leaf first) and SNI in, trusted-or-not out. Wraps a plain `Fn` so
+/// callers with their own trust model (DANE TLSA, pinned SPKI, …) don't need
+/// to shape a fixed root set into a [`crate::crypto::trust::TrustStore`].
+#[derive(Clone)]
+pub struct VerifyOverride(pub Arc<dyn Fn(&[Bytes], Option<&str>) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for VerifyOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VerifyOverride(..)")
+    }
+}
+
 /// Configuration for a single handshake.
 #[derive(Debug, Clone)]
 pub struct HandshakeConfig {
@@ -76,8 +88,14 @@ pub struct HandshakeConfig {
     pub kx_policy: KxPolicy,
     /// Local QUIC transport parameters (RFC 9001 §8.2) sent in ClientHello / EncryptedExtensions.
     pub local_transport_parameters: Option<Bytes>,
-    /// Trust anchors for server chain verification (client role).
+    /// Trust anchors for server chain verification (client role). Checked
+    /// before [`Self::verify_override`] when both are set.
     pub trust_store: Option<TrustStore>,
+    /// Custom server-chain verification (client role) — e.g. DANE TLSA
+    /// matching, where trust isn't anchored in a fixed root set at all.
+    /// Ignored when [`Self::trust_store`] is set. Resolved inline, exactly
+    /// like `trust_store` — not a `StorageExecutor`-backed async gate.
+    pub verify_override: Option<VerifyOverride>,
     /// Offer / accept TLS 1.3 early data (0-RTT).
     pub enable_early_data: bool,
     /// Server max early data size advertised in NewSessionTicket.
@@ -184,7 +202,7 @@ impl HandshakeEngine {
     pub fn feed_handshake_data<S: TlsEventSink>(&mut self, input: &mut &[u8], sink: &mut S) -> usize {
         let n = input.len();
         // Allow post-handshake NewSessionTicket after Complete (client).
-        if self.verify_pending || self.state == State::Failed {
+        if self.state == State::Failed {
             *input = &[];
             return n;
         }
@@ -192,6 +210,14 @@ impl HandshakeEngine {
             *input = &[];
             return n;
         }
+        // While a verification gate is pending, still buffer incoming bytes
+        // (parser.receive always does) rather than dropping them — the gate
+        // may resolve after more of the peer's flight has already arrived in
+        // a *separate* feed_handshake_data call (its own TLS record); those
+        // bytes must survive to be parsed once feed_verification_result
+        // resumes, not be silently discarded here. should_stop() (checking
+        // self.verify_pending) keeps drain_complete_messages from popping
+        // and dispatching anything while gated.
         let mut parser = HandshakeParser::new();
         std::mem::swap(&mut self.parser, &mut parser);
         {
@@ -492,6 +518,15 @@ impl HandshakeEngine {
             }
             return true;
         }
+        if let Some(verify) = &self.config.verify_override {
+            let ok = (verify.0)(&self.peer_certs, self.config.server_name.as_deref());
+            self.verify_pending = false;
+            if !ok {
+                self.fail(sink, "certificate verification failed");
+                return false;
+            }
+            return true;
+        }
         false
     }
 
@@ -543,16 +578,18 @@ impl HandshakeEngine {
         let th = self.transcript.hash();
         let vd = compute_finished_verify_data(&traffic.client, &th);
         let fin = build_finished(&vd);
-        self.emit_outgoing(&fin, sink);
-        let Some(shared) = self.shared_secret.as_ref() else {
+        let Some(shared) = self.shared_secret.clone() else {
             self.fail(sink, "missing shared secret");
             return false;
         };
-        let psk = self.psk.as_ref();
-        let app_hash = self.transcript.hash();
-        self.application_traffic =
-            Some(derive_application_traffic_with_psk(psk, shared, &app_hash));
-        self.resumption_master = Some(derive_resumption_master_secret(psk, shared, &app_hash));
+        let psk = self.psk;
+        // See on_client_finished's comment: application_traffic_secret_0 uses
+        // `th` (through server Finished, before this Finished is added below);
+        // resumption_master_secret uses the transcript after it's added.
+        self.application_traffic = Some(derive_application_traffic_with_psk(psk.as_ref(), &shared, &th));
+        self.emit_outgoing(&fin, sink);
+        let res_hash = self.transcript.hash();
+        self.resumption_master = Some(derive_resumption_master_secret(psk.as_ref(), &shared, &res_hash));
         self.finish(sink);
         true
     }
@@ -706,6 +743,7 @@ impl HandshakeEngine {
         let selected_psk = if self.resumed { Some(0u16) } else { None };
         let sh = build_server_hello_ext(
             &server_random,
+            &ch.legacy_session_id,
             group.code(),
             server_share.as_ref(),
             selected_psk,
@@ -731,7 +769,7 @@ impl HandshakeEngine {
         let alpn = pick_alpn(&ch.alpn, &self.config.alpn);
         self.negotiated_alpn = alpn.clone();
         let ee = build_encrypted_extensions_ext(
-            alpn.as_deref().unwrap_or(b"h3"),
+            alpn.as_deref(),
             self.config.local_transport_parameters.as_deref(),
             self.early_data_accepted,
         );
@@ -746,15 +784,11 @@ impl HandshakeEngine {
             let cert_msg = build_certificate(&cert_refs);
             self.emit_outgoing(&cert_msg, sink);
 
-            let signing_key = match Ed25519PrivateKey::from_pkcs8(&creds.signing_key_pkcs8) {
-                Ok(k) => k,
-                Err(_) => {
-                    self.fail(sink, "invalid server signing key");
-                    return false;
-                }
-            };
             let cv_th = self.transcript.hash();
-            let (scheme, sig) = sign_ed25519_certificate_verify(false, &signing_key, &cv_th);
+            let Some((scheme, sig)) = sign_certificate_verify(false, &creds.signing_key_pkcs8, &cv_th) else {
+                self.fail(sink, "unsupported or invalid server signing key");
+                return false;
+            };
             let cv = build_certificate_verify(scheme, sig.as_ref());
             self.emit_outgoing(&cv, sink);
         }
@@ -785,16 +819,20 @@ impl HandshakeEngine {
             self.fail(sink, "client Finished verify failed");
             return false;
         }
-        self.transcript.add_message(&encoded);
         let Some(shared) = self.shared_secret.as_ref() else {
             self.fail(sink, "missing shared secret");
             return false;
         };
         let psk = self.psk.as_ref();
-        let app_hash = self.transcript.hash();
-        self.application_traffic =
-            Some(derive_application_traffic_with_psk(psk, shared, &app_hash));
-        self.resumption_master = Some(derive_resumption_master_secret(psk, shared, &app_hash));
+        // RFC 8446 §7.1: application_traffic_secret_0 is derived over the
+        // transcript through *server* Finished only — `th`, captured above
+        // before the client's own Finished (`encoded`) joins the transcript.
+        // resumption_master_secret, in contrast, is derived through the
+        // client's Finished too, so it needs the transcript *after* this add.
+        self.application_traffic = Some(derive_application_traffic_with_psk(psk, shared, &th));
+        self.transcript.add_message(&encoded);
+        let res_hash = self.transcript.hash();
+        self.resumption_master = Some(derive_resumption_master_secret(psk, shared, &res_hash));
         self.finish(sink);
         true
     }
@@ -830,6 +868,9 @@ impl HandshakeEngine {
             Some("TLS_AES_128_GCM_SHA256".to_string()),
         )
         .with_sni(sni);
+        if let Some(a) = app.as_ref() {
+            sink.application_traffic_keys_ready(a.client, a.server);
+        }
         let early = self.early_client_secret;
         let quic = match self.config.mode {
             HandshakeMode::Quic => Some(QuicSecrets {
@@ -897,6 +938,10 @@ struct EngineCodecBridge<'a, S: TlsEventSink> {
 }
 
 impl<S: TlsEventSink> HandshakeEvents for EngineCodecBridge<'_, S> {
+    fn should_stop(&self) -> bool {
+        self.stop || self.engine.verify_pending
+    }
+
     fn message_begin(&mut self, msg_type: HandshakeType) {
         self.collector.message_begin(msg_type);
     }
@@ -1024,19 +1069,17 @@ impl<S: TlsEventSink> HandshakeEvents for EngineCodecBridge<'_, S> {
     }
 }
 
+/// RFC 7301 §3.2: the first of the server's own preferences that the client
+/// also offered — `None` (not a unilateral server pick) when the client
+/// offered no ALPN extension at all, or none of its offers matched.
 fn pick_alpn(client: &[Bytes], server: &[Bytes]) -> Option<Bytes> {
-    for s in server {
-        if client.iter().any(|c| c == s) {
-            return Some(s.clone());
-        }
-    }
-    server.first().cloned()
+    server.iter().find(|s| client.contains(s)).cloned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::sink::{TlsEventSink, VerifyRequest};
+    use crate::tls::sink::{TlsEventSink, VerifyRequest, VerifyResult};
 
     #[derive(Default)]
     struct RecordingSink {
@@ -1145,6 +1188,7 @@ mod tests {
             kx_policy: kx,
             local_transport_parameters: tp,
             trust_store: Some(trust),
+            verify_override: None,
             enable_early_data: false,
             max_early_data_size: 0,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
@@ -1165,6 +1209,7 @@ mod tests {
             kx_policy: KxPolicy::classical_only(),
             local_transport_parameters: None,
             trust_store: None,
+            verify_override: None,
             enable_early_data: false,
             max_early_data_size: 0,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
@@ -1198,6 +1243,7 @@ mod tests {
             kx_policy: KxPolicy::classical_only(),
             local_transport_parameters: None,
             trust_store: None,
+            verify_override: None,
             enable_early_data: true,
             max_early_data_size: u32::MAX,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
@@ -1254,6 +1300,7 @@ mod tests {
             kx_policy: KxPolicy::classical_only(),
             local_transport_parameters: Some(server_tp),
             trust_store: None,
+            verify_override: None,
             enable_early_data: true,
             max_early_data_size: u32::MAX,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
@@ -1390,6 +1437,7 @@ mod tests {
                 kx_policy: KxPolicy::classical_only(),
                 local_transport_parameters: None,
                 trust_store: None,
+                verify_override: None,
             enable_early_data: false,
             max_early_data_size: 0,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
@@ -1401,6 +1449,135 @@ mod tests {
         let quic = sink.quic.expect("quic secrets");
         assert!(quic.client_application_traffic_secret.is_some());
         assert_eq!(sink.negotiated_group, Some(NamedGroup::X25519.code()));
+    }
+
+    fn client_config_with_verify_override(
+        verify: VerifyOverride,
+        kx: KxPolicy,
+    ) -> HandshakeConfig {
+        HandshakeConfig {
+            role: HandshakeRole::Client,
+            mode: HandshakeMode::Quic,
+            alpn: vec![Bytes::from_static(b"h3")],
+            server_name: Some("localhost".into()),
+            server: None,
+            kx_policy: kx,
+            local_transport_parameters: None,
+            trust_store: None,
+            verify_override: Some(verify),
+            enable_early_data: false,
+            max_early_data_size: 0,
+            max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: None,
+            ticket_store: None,
+            anti_replay: None,
+        }
+    }
+
+    fn server_config_for(creds: ServerCredentials, kx: KxPolicy) -> HandshakeConfig {
+        HandshakeConfig {
+            role: HandshakeRole::Server,
+            mode: HandshakeMode::Quic,
+            alpn: vec![Bytes::from_static(b"h3")],
+            server_name: None,
+            server: Some(creds),
+            kx_policy: kx,
+            local_transport_parameters: None,
+            trust_store: None,
+            verify_override: None,
+            enable_early_data: false,
+            max_early_data_size: 0,
+            max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: None,
+            ticket_store: None,
+            anti_replay: None,
+        }
+    }
+
+    /// DANE-style custom verification: `verify_override` is checked instead of
+    /// `trust_store` (server credentials generated fresh, so no fixed root
+    /// would trust it — the point is that this connector doesn't need one).
+    #[test]
+    fn verify_override_accepts_when_callback_returns_true() {
+        let creds = test_server_credentials();
+        let expected_chain = creds.cert_chain.clone();
+        let sink = run_loopback(
+            client_config_with_verify_override(
+                VerifyOverride(Arc::new(move |chain, name| {
+                    chain == expected_chain.as_slice() && name == Some("localhost")
+                })),
+                KxPolicy::classical_only(),
+            ),
+            server_config_for(creds, KxPolicy::classical_only()),
+        );
+        assert!(sink.events.iter().any(|e| e == "handshake_complete"), "{:?}", sink.events);
+    }
+
+    #[test]
+    fn verify_override_rejects_when_callback_returns_false() {
+        let creds = test_server_credentials();
+        let mut server = HandshakeEngine::new(server_config_for(creds.clone(), KxPolicy::classical_only()));
+        let mut client = HandshakeEngine::new(client_config_with_verify_override(
+            VerifyOverride(Arc::new(|_chain, _name| false)),
+            KxPolicy::classical_only(),
+        ));
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        assert!(!client.is_complete());
+        assert!(
+            sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink.events
+        );
+    }
+
+    /// No trust_store and no verify_override — the `insecure_connector`
+    /// shape — must gate on `feed_verification_result` and actually resume
+    /// (not just accept the gate, but successfully process whatever
+    /// CertificateVerify/Finished bytes were already buffered in the same
+    /// relayed chunk) once it's fed `ok: true`.
+    #[test]
+    fn deferred_verification_result_resumes_and_completes_handshake() {
+        let creds = test_server_credentials();
+        let server_cfg = server_config_for(creds, KxPolicy::classical_only());
+        let client_cfg = HandshakeConfig {
+            role: HandshakeRole::Client,
+            mode: HandshakeMode::Quic,
+            alpn: vec![Bytes::from_static(b"h3")],
+            server_name: Some("localhost".into()),
+            server: None,
+            kx_policy: KxPolicy::classical_only(),
+            local_transport_parameters: None,
+            trust_store: None,
+            verify_override: None,
+            enable_early_data: false,
+            max_early_data_size: 0,
+            max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: None,
+            ticket_store: None,
+            anti_replay: None,
+        };
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+
+        assert!(!client.is_complete(), "must gate before verification resolves");
+        let req_id = sink
+            .events
+            .iter()
+            .find_map(|e| e.strip_prefix("verification_requested id=").map(|s| s.parse::<u64>().unwrap()))
+            .expect("verification_requested fired");
+
+        client.feed_verification_result(VerifyResult { id: req_id, ok: true }, &mut sink);
+        assert!(client.is_complete(), "must resume and finish after ok:true: {:?}", sink.events);
+
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        assert!(server.is_complete(), "server: {:?}", sink.events);
     }
 
     #[test]
@@ -1420,6 +1597,7 @@ mod tests {
                 kx_policy: KxPolicy::pqc_first(),
                 local_transport_parameters: Some(server_tp),
                 trust_store: None,
+                verify_override: None,
             enable_early_data: false,
             max_early_data_size: 0,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
@@ -1446,6 +1624,7 @@ mod tests {
             kx_policy: KxPolicy::classical_only(),
             local_transport_parameters: None,
             trust_store: None,
+            verify_override: None,
             enable_early_data: false,
             max_early_data_size: 0,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,

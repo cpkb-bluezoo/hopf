@@ -76,9 +76,10 @@ pub use service::Service;
 pub use storage::{StorageConfig, StorageError, StorageExecutor};
 pub use telemetry::{NopTelemetry, TelemetryHook};
 pub use tls::{
-    HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, NopTlsEventSink, QuicSecrets,
-    SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector, TlsEventSink, TlsProgress,
-    TlsProtocolError, TlsSession, TlsTimerKind, VerifyRequest, VerifyResult,
+    acceptor_from_pem, connector_from_pem, connector_with_verify_override, insecure_connector,
+    server_credentials_from_pem, HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole,
+    NopTlsEventSink, QuicSecrets, SharedTlsAcceptor, SharedTlsConnector, TlsAcceptor, TlsConnector,
+    TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyOverride, VerifyRequest, VerifyResult,
 };
 pub use udp::UdpDatagramHandler;
 
@@ -1113,6 +1114,84 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(got.lock().unwrap().as_slice(), b"ping-through-pool");
+
+        rt.shutdown();
+    }
+
+    /// Diagnostic: Hopf client and Hopf server, both driven through a real
+    /// `TcpConnection` over a real socket (not the in-memory buffer relay
+    /// tls::record's own loopback tests use) — isolates whether a failure is
+    /// in TcpConnection's socket plumbing or in TlsRecordEngine's wire format.
+    #[test]
+    fn tls_acceptor_from_pem_handshake_over_a_real_socket() {
+        let dir = tempfile::Builder::new().prefix("hopf-core-tls-diag-").tempdir().unwrap();
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+
+        let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+        let connector = connector_from_pem(&cert_path, &[]).unwrap();
+
+        let established = Arc::new(Mutex::new(false));
+        let established2 = Arc::clone(&established);
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(EchoHandler) as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        struct Probe {
+            established: Arc<Mutex<bool>>,
+            echoed: Arc<Mutex<Vec<u8>>>,
+        }
+        impl ProtocolHandler for Probe {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+                *self.established.lock().unwrap() = true;
+                endpoint.send(b"ping-through-real-tls-socket");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.echoed.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+
+        let echoed = Arc::new(Mutex::new(Vec::new()));
+        let echoed2 = Arc::clone(&echoed);
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(Probe { established: Arc::clone(&established2), echoed: Arc::clone(&echoed2) })
+                    as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+
+        for _ in 0..100 {
+            if *established.lock().unwrap() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(*established.lock().unwrap(), "Hopf<->Hopf handshake over a real socket must complete");
+
+        for _ in 0..100 {
+            if echoed.lock().unwrap().as_slice() == b"ping-through-real-tls-socket" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(echoed.lock().unwrap().as_slice(), b"ping-through-real-tls-socket");
 
         rt.shutdown();
     }

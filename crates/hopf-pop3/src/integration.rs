@@ -405,7 +405,7 @@ fn client_localhost_hostname_dial() {
 /// Explicit STLS upgrade against a TLS-capable Pop3Service.
 #[test]
 fn client_stls_fetch() {
-    use hopf_tls::{acceptor_from_pem, connector};
+    use hopf_tls::{acceptor_from_pem, connector_from_pem};
 
     let dir = tempfile::tempdir().unwrap();
     let factory = Arc::new(MaildirFactory::new(dir.path()));
@@ -432,14 +432,7 @@ fn client_stls_fetch() {
     let svc = Pop3Service::new(config, Arc::clone(&rt));
     let addr = svc.start().unwrap();
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert.cert.der().clone()).unwrap();
-    let client_cfg = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
-    let tls_connector = connector(client_cfg);
+    let tls_connector = connector_from_pem(&cert_path, &[]).unwrap();
 
     let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
     let done2 = Arc::clone(&done);

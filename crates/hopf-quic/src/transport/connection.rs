@@ -1778,6 +1778,7 @@ mod tests {
             kx_policy: KxPolicy::classical_only(),
             local_transport_parameters: None,
             trust_store: None,
+            verify_override: None,
             enable_early_data: false,
             max_early_data_size: 0,
             max_early_data_freshness_ms: hopf_core::tls::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,

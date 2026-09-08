@@ -9,7 +9,7 @@ It complements the status tables in
 describe *what* is shipped vs planned; this file describes *how* to get there.
 Phase 0 touchpoints and seams: `[crypto-migration-inventory.md](crypto-migration-inventory.md)`.
 
-**Status:** Phase 3b transport parity green (H3 + DoQ + 0-RTT TP consistency / reject-requeue). Deferred elsewhere: external OpenSSL/quic-go interop → Phase 2; public WebPKI → Phase 4; conformance row flip → Phase 8. Next: Phase 4 TLS record layer.
+**Status:** Phase 4 TLS record layer + `TcpConnection`/`hopf-tls` cutover done, verified against `rustls` as an independent peer (see Phase 4 for the real interop bugs this caught and fixed — several affected `hopf-quic` too, sharing the same key schedule). Deferred: public WebPKI/native roots (Phase 4, unscheduled); external OpenSSL/quic-go interop → Phase 2; conformance row flip → Phase 8. Next: TLS 1.2 (Phase 5) or DTLS (Phase 6).
 
 ---
 
@@ -483,10 +483,22 @@ Deferred out of Phase 3 (tracked in destination phases, not blockers here):
 
 ### Phase 4 — TLS stream record layer + TCP in `hopf-core` (drop `rustls` for 1.3)
 
-- [ ] TLS 1.3 record layer on `TcpConnection` via `**hopf-core::tls**` (`TlsEngine` + sink pump).
-- [ ] Move PEM/acceptor/connector helpers from `**hopf-tls**` into core; implicit TLS + STARTTLS unchanged at protocol crate level.
-- [ ] **Public WebPKI / native roots** in `hopf-core::TrustStore` (today: hopf-tls still holds rustls + webpki-roots; hopf-quic `client_config_public_trust*` is intentional `Unsupported`). Unblocks public-trust QUIC/TCP client configs when `hopf-tls` trust path is folded into core.
-- [ ] **Tests:** `tls-echo`, SMTP/IMAP/POP3/FTP STARTTLS integration tests; event-order tests for handshake + early app data in one read; enable `client_config_public_trust*` once TrustStore has public roots.
+- [x] Signature-scheme prerequisite (pulled forward from Phase 7 scope): RSA-PSS + ECDSA P-256/P-384 `CertificateVerify` sign/verify in `hopf-core::tls::handshake::verify`, PKCS#8 key-kind auto-detection, `signature_algorithms` ClientHello extension. Unblocks real-world (non-Ed25519) certificates, including every existing test fixture's `rcgen` default (ECDSA P-256).
+- [x] TLS 1.3 record layer — `hopf-core::tls::record::TlsRecordEngine` (RFC 8446 §5 framing + AEAD, wraps `HandshakeEngine` in `HandshakeMode::TcpRecordLayer`), sink-based (`TlsRecordSink`), no return-value `TlsSession` shape.
+- [x] `TcpConnection` cut over fully to `TlsRecordEngine` — `TlsSession`/`TlsProgress`/old `TlsAcceptor`/`TlsConnector` (`hopf-core::tls::session`) removed outright, not kept as a parallel path.
+- [x] PEM/acceptor/connector helpers moved into `hopf-core::tls::pem` (`acceptor_from_pem`, `connector_from_pem`, `insecure_connector`) plus a new `connector_with_verify_override` hook (`HandshakeConfig::verify_override`) for pluggable trust models that aren't a fixed root set — used to move DANE (`hopf_dns::dane::verify_dane_chain`, rustls-independent) off `hopf_tls::connector`. `hopf-tls` is now a thin re-export shim over `hopf-core::tls::*`, kept only for call-site compatibility until Phase 8 deletes the crate; it no longer depends on `rustls` except as a dev-dependency test peer.
+- [ ] **Public WebPKI / native roots** in `hopf-core::TrustStore` — still not implemented; `hopf_tls::public_trust_connector` and `hopf_quic::client_config_public_trust` both return `Unsupported` (every existing caller already tolerates this). Deferred, not scheduled.
+- [x] **Tests:** `hopf-tls`'s `--features integration` suite includes real interop against `rustls` as an independent peer (both directions: rustls-as-client vs the new engine, and vice versa via `insecure_connector`), not just Hopf-to-Hopf — this caught and drove the fixes below. SMTP/IMAP/POP3/FTP STARTTLS/implicit-TLS integration suites pass unchanged (only their TLS test-fixture plumbing needed updating, not their protocol logic). `tls-echo` example still builds. Full workspace `--lib` and `--features integration` suites pass across every crate (two pre-existing, unrelated failures confirmed via `git stash`: `hopf-amqp` integration tests failing on a socket-level OS error, and `hopf-dns`'s `resolver_stub` test binary needing a feature combination not exercised here — neither touches TLS).
+- [ ] Event-order tests for handshake + early app data in one read — not written; not blocking, the record layer's existing loopback tests already assert event ordering for the handshake-then-app-data sequence within `TlsRecordEngine` itself.
+
+**Real interop caught five independent, previously-invisible protocol bugs** — each was self-consistent between two `HandshakeEngine` instances (so no amount of Hopf-to-Hopf testing would have found them) but broke against `rustls` as a genuinely independent TLS 1.3 implementation:
+1. ALPN extension encoding was missing RFC 7301's outer 2-byte `ProtocolNameList` length (both the writer and the reader agreed on the same wrong format).
+2. `EncryptedExtensions` always included an ALPN extension, even when the client offered none (RFC 8446 §4.2: sending an extension the peer didn't offer is a protocol violation) — plus `pick_alpn` was unilaterally picking the server's own preference instead of returning no match.
+3. `application_traffic_secret`/`resumption_master_secret` were derived from the transcript hash at the wrong point relative to the client's own `Finished` message.
+4. `master_secret`'s `HKDF-Extract` used an empty IKM instead of RFC 8446 §7.1's required `Hash.length` zero bytes — corrupted every post-handshake secret (application traffic, resumption) while leaving handshake-phase secrets untouched, which is why it only surfaced as an app-data decrypt failure after an otherwise-successful handshake.
+5. `HandshakeParser` silently popped and discarded buffered handshake messages that arrived after a verification gate (`verification_requested`) stopped mid-drain, instead of leaving them for the later resume — broke any deferred/asynchronous certificate verification (e.g. `insecure_connector`, or a future `StorageExecutor`-backed gate), whether the messages arrived pre-coalesced or across separate `feed_handshake_data` calls.
+
+Also fixed while chasing the above: `ServerHello.legacy_session_id_echo` was always sent empty regardless of what the client's `ClientHello` actually offered (RFC 8446 §4.1.3 requires an exact echo; middlebox-compat clients like `rustls` send a random 32 bytes and reject the mismatch) — and a genuine, independent latent bug in `hopf-ftp`'s server (`FtpControlHandler::connected`) that sent the `220` welcome banner before an implicit-TLS handshake had completed, masked until now by the old `rustls`-backed path's forgiving pre-handshake write queuing (SMTP/IMAP/POP3 already had the correct `!expect_implicit_tls || tls` gate; FTP's server-side control handler didn't).
 
 
 

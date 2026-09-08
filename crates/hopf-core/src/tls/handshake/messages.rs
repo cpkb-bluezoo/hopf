@@ -4,6 +4,8 @@
 
 use bytes::{Bytes, BytesMut};
 
+use super::verify::SUPPORTED_SIGNATURE_SCHEMES;
+
 /// Handshake message type (RFC 8446 §B.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -72,6 +74,8 @@ pub mod ext {
     pub const PRE_SHARED_KEY: u16 = 41;
     /// PSK key exchange modes (RFC 8446 §4.2.9).
     pub const PSK_KEY_EXCHANGE_MODES: u16 = 45;
+    /// Signature Algorithms (RFC 8446 §4.2.3) — MUST be sent in ClientHello.
+    pub const SIGNATURE_ALGORITHMS: u16 = 13;
 }
 
 /// `psk_dhe_ke` (RFC 8446 §4.2.9).
@@ -185,13 +189,19 @@ fn build_client_hello_inner(
         ext::KEY_SHARE,
         &encode_key_share_list(std::slice::from_ref(&params.key_share)),
     );
-    if !params.alpn.is_empty() {
-        let mut alpn_list = BytesMut::new();
-        for proto in &params.alpn {
-            alpn_list.extend_from_slice(&[proto.len() as u8]);
-            alpn_list.extend_from_slice(proto);
+    {
+        let mut schemes = BytesMut::with_capacity(2 * SUPPORTED_SIGNATURE_SCHEMES.len());
+        for scheme in SUPPORTED_SIGNATURE_SCHEMES {
+            schemes.extend_from_slice(&scheme.to_be_bytes());
         }
-        push_extension(&mut extensions, ext::ALPN, &alpn_list);
+        let mut sig_algs = BytesMut::with_capacity(2 + schemes.len());
+        sig_algs.extend_from_slice(&(schemes.len() as u16).to_be_bytes());
+        sig_algs.extend_from_slice(&schemes);
+        push_extension(&mut extensions, ext::SIGNATURE_ALGORITHMS, &sig_algs);
+    }
+    if !params.alpn.is_empty() {
+        let names: Vec<&[u8]> = params.alpn.iter().map(|p| p.as_ref()).collect();
+        push_extension(&mut extensions, ext::ALPN, &encode_alpn_extension_data(&names));
     }
     if let Some(name) = &params.server_name {
         let host = name.as_bytes();
@@ -276,14 +286,24 @@ fn build_client_hello_inner(
     )
 }
 
-/// Build a TLS 1.3 `ServerHello` for the selected group + key share.
-pub fn build_server_hello(random: &[u8; 32], group: u16, key_share: &[u8]) -> HandshakeMessage {
-    build_server_hello_ext(random, group, key_share, None)
+/// Build a TLS 1.3 `ServerHello` for the selected group + key share. `legacy_session_id_echo`
+/// must be exactly the `legacy_session_id` the client sent in its `ClientHello` (RFC 8446
+/// §4.1.3) — an empty client value is fine to echo as empty, but a client using middlebox-compat
+/// mode (Appendix D.4) sends a random 32 bytes and aborts if the echo doesn't match.
+pub fn build_server_hello(
+    random: &[u8; 32],
+    legacy_session_id_echo: &[u8],
+    group: u16,
+    key_share: &[u8],
+) -> HandshakeMessage {
+    build_server_hello_ext(random, legacy_session_id_echo, group, key_share, None)
 }
 
-/// ServerHello with optional selected PSK identity index.
+/// ServerHello with optional selected PSK identity index. See [`build_server_hello`] for
+/// `legacy_session_id_echo`.
 pub fn build_server_hello_ext(
     random: &[u8; 32],
+    legacy_session_id_echo: &[u8],
     group: u16,
     key_share: &[u8],
     selected_identity: Option<u16>,
@@ -291,7 +311,8 @@ pub fn build_server_hello_ext(
     let mut body = BytesMut::new();
     body.extend_from_slice(&0x0303u16.to_be_bytes());
     body.extend_from_slice(random);
-    body.extend_from_slice(&[0]);
+    body.extend_from_slice(&[legacy_session_id_echo.len() as u8]);
+    body.extend_from_slice(legacy_session_id_echo);
     body.extend_from_slice(&0x1301u16.to_be_bytes());
     body.extend_from_slice(&[0]);
 
@@ -315,21 +336,23 @@ pub fn build_server_hello_ext(
 }
 
 /// Build `EncryptedExtensions` with ALPN and optional QUIC transport parameters.
-pub fn build_encrypted_extensions(alpn: &[u8], transport_parameters: Option<&[u8]>) -> HandshakeMessage {
+pub fn build_encrypted_extensions(alpn: Option<&[u8]>, transport_parameters: Option<&[u8]>) -> HandshakeMessage {
     build_encrypted_extensions_ext(alpn, transport_parameters, false)
 }
 
-/// EncryptedExtensions with optional early_data acceptance.
+/// EncryptedExtensions with optional early_data acceptance. `alpn` is the negotiated protocol —
+/// `None` when the client didn't offer the extension or none of its offers matched (RFC 8446
+/// §4.2: a server MUST NOT send an extension the client didn't offer — `Some(b"h3")` when the
+/// client sent no ALPN extension at all is a real, previously-shipped bug, not padding).
 pub fn build_encrypted_extensions_ext(
-    alpn: &[u8],
+    alpn: Option<&[u8]>,
     transport_parameters: Option<&[u8]>,
     early_data_accepted: bool,
 ) -> HandshakeMessage {
     let mut extensions = BytesMut::new();
-    let mut alpn_list = BytesMut::new();
-    alpn_list.extend_from_slice(&[alpn.len() as u8]);
-    alpn_list.extend_from_slice(alpn);
-    push_extension(&mut extensions, ext::ALPN, &alpn_list);
+    if let Some(alpn) = alpn {
+        push_extension(&mut extensions, ext::ALPN, &encode_alpn_extension_data(&[alpn]));
+    }
     if let Some(tp) = transport_parameters {
         push_extension(&mut extensions, ext::QUIC_TRANSPORT_PARAMETERS, tp);
     }
@@ -418,6 +441,20 @@ fn push_extension(out: &mut BytesMut, ext_type: u16, data: &[u8]) {
     out.extend_from_slice(&ext_type.to_be_bytes());
     out.extend_from_slice(&(data.len() as u16).to_be_bytes());
     out.extend_from_slice(data);
+}
+
+/// ALPN extension_data (RFC 7301 §3.1): `ProtocolNameList` — a 2-byte overall
+/// length, then each protocol name as a 1-byte length + bytes.
+fn encode_alpn_extension_data(protocols: &[&[u8]]) -> BytesMut {
+    let mut names = BytesMut::new();
+    for proto in protocols {
+        names.extend_from_slice(&[proto.len() as u8]);
+        names.extend_from_slice(proto);
+    }
+    let mut out = BytesMut::with_capacity(2 + names.len());
+    out.extend_from_slice(&(names.len() as u16).to_be_bytes());
+    out.extend_from_slice(&names);
+    out
 }
 
 fn encode_group_list(groups: &[u16]) -> Bytes {

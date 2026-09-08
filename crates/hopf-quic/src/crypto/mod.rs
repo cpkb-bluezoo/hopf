@@ -115,6 +115,7 @@ impl HopfTlsBuildParams {
             kx_policy: self.kx_policy,
             local_transport_parameters: self.local_transport_parameters,
             trust_store: self.trust_store,
+            verify_override: None,
             enable_early_data: self.tls.enable_early_data,
             max_early_data_size: self.tls.max_early_data_size,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,

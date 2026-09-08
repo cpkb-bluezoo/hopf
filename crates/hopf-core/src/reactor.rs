@@ -273,7 +273,9 @@ impl Reactor {
         if !connecting {
             conn.call_connected();
         } else {
-            let _ = conn.flush_tls_outbound();
+            // Any TLS output from an eager client connector (e.g. ClientHello)
+            // is already in net_out — TcpConnection::new pumps engine.start()
+            // itself now (sink-based push, not the old pull-based flush).
             if let Some(timeout) = connect_timeout {
                 let cancelled = Arc::new(AtomicBool::new(false));
                 conn.set_connect_timeout_cancel(Arc::clone(&cancelled));
