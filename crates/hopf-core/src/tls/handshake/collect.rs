@@ -43,6 +43,9 @@ pub struct ParsedClientHello {
     pub obfuscated_ticket_age: Option<u32>,
     /// First PSK binder.
     pub psk_binder: Option<Bytes>,
+    /// Cookie extension (RFC 8446 §4.2.2), echoed back after a
+    /// `HelloRetryRequest` that carried one.
+    pub cookie: Option<Bytes>,
 }
 
 /// Parsed `ServerHello` fields needed for key schedule (Phase 2 subset).
@@ -58,6 +61,14 @@ pub struct ParsedServerHello {
     pub key_share: Bytes,
     /// Selected PSK identity index (resumption).
     pub psk_selected_identity: Option<u16>,
+    /// Set when this message is actually a `HelloRetryRequest` (RFC 8446
+    /// §4.1.4) — wire-identical to `ServerHello` except for `random` and
+    /// the shape of the `key_share` extension. When set, [`Self::key_share`]
+    /// is empty (HRR carries only [`Self::selected_group`], no key bytes).
+    pub is_hello_retry_request: bool,
+    /// Cookie extension (RFC 8446 §4.2.2), when the server sent one — only
+    /// meaningful when [`Self::is_hello_retry_request`].
+    pub cookie: Option<Bytes>,
 }
 
 /// Parsed EncryptedExtensions content.
@@ -153,6 +164,12 @@ impl HandshakeEvents for ClientHelloCollector {
         }
     }
 
+    fn cookie(&mut self, data: &[u8]) {
+        if self.out.cookie.is_none() {
+            self.out.cookie = Some(Bytes::copy_from_slice(data));
+        }
+    }
+
     fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
 
     fn parse_error(&mut self, _detail: &'static str) {
@@ -178,7 +195,10 @@ impl HandshakeEvents for ServerHelloCollector {
     }
 
     fn key_share(&mut self, group: u16, share: &[u8]) {
-        if self.out.key_share.is_empty() {
+        // A real ServerHello's key_share is non-empty; HelloRetryRequest's
+        // carries only the group (RFC 8446 §4.2.8) — `selected_group` is
+        // still meaningful there, `key_share` legitimately stays empty.
+        if self.out.selected_group == 0 {
             self.out.selected_group = group;
             self.out.key_share = Bytes::copy_from_slice(share);
         }
@@ -186,6 +206,16 @@ impl HandshakeEvents for ServerHelloCollector {
 
     fn psk_selected_identity(&mut self, index: u16) {
         self.out.psk_selected_identity = Some(index);
+    }
+
+    fn hello_retry_request(&mut self) {
+        self.out.is_hello_retry_request = true;
+    }
+
+    fn cookie(&mut self, data: &[u8]) {
+        if self.out.cookie.is_none() {
+            self.out.cookie = Some(Bytes::copy_from_slice(data));
+        }
     }
 
     fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
@@ -379,13 +409,14 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
     Some(c.out)
 }
 
-/// Parse a `ServerHello` body through the handshake codec.
+/// Parse a `ServerHello` body through the handshake codec. Also handles
+/// `HelloRetryRequest` (wire-identical; see [`ParsedServerHello::is_hello_retry_request`]).
 pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
     let mut c = ServerHelloCollector::default();
     if !decode_one(HandshakeType::ServerHello, body, &mut c) || c.failed {
         return None;
     }
-    if c.out.key_share.is_empty() {
+    if !c.out.is_hello_retry_request && c.out.key_share.is_empty() {
         return None;
     }
     Some(c.out)
@@ -497,7 +528,7 @@ impl MessageCollector {
                 Some(ParsedIncoming::ClientHello(c.out))
             }
             (HandshakeType::ServerHello, Self::ServerHello(c)) => {
-                if c.failed || c.out.key_share.is_empty() {
+                if c.failed || (!c.out.is_hello_retry_request && c.out.key_share.is_empty()) {
                     return None;
                 }
                 Some(ParsedIncoming::ServerHello(c.out))
@@ -668,6 +699,20 @@ impl HandshakeEvents for MessageCollector {
     fn psk_selected_identity(&mut self, index: u16) {
         if let Self::ServerHello(c) = self {
             c.psk_selected_identity(index);
+        }
+    }
+
+    fn hello_retry_request(&mut self) {
+        if let Self::ServerHello(c) = self {
+            c.hello_retry_request();
+        }
+    }
+
+    fn cookie(&mut self, data: &[u8]) {
+        match self {
+            Self::ClientHello(c) => c.cookie(data),
+            Self::ServerHello(c) => c.cookie(data),
+            _ => {}
         }
     }
 

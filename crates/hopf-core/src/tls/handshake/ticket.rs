@@ -289,10 +289,11 @@ pub fn mint_new_session_ticket(
     max_early_data_size: u32,
     alpn: &[u8],
     remembered_limits: Option<RememberedTransportLimits>,
+    dtls: bool,
 ) -> Option<(HandshakeMessage, StoredTicket)> {
     let mut ticket_nonce = [0u8; 8];
     getrandom(&mut ticket_nonce).ok()?;
-    let psk = derive_resumption_psk(resumption_master, &ticket_nonce);
+    let psk = derive_resumption_psk(resumption_master, &ticket_nonce, dtls);
     let mut age_add = [0u8; 4];
     getrandom(&mut age_add).ok()?;
     let ticket_age_add = u32::from_be_bytes(age_add);

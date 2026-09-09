@@ -4,7 +4,10 @@
 
 use bytes::Bytes;
 
-use crate::crypto::hkdf::{empty_hash, expand_label, extract, HkdfPrk};
+use crate::crypto::hkdf::{
+    dtls_expand_label, empty_hash, expand_label, extract, extract_derived, extract_derived_dtls,
+    extract_dtls, HkdfPrk,
+};
 
 /// Traffic secrets derived after ServerHello (handshake phase).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,26 +35,39 @@ pub struct EarlyTrafficSecrets {
 }
 
 /// HKDF-Extract early secret from an optional PSK (zeros IKM when `None`).
-pub fn early_secret(psk: Option<&[u8; 32]>) -> HkdfPrk {
+/// `dtls` selects RFC 9147 §5.9's `"dtls13 "` label prefix throughout this
+/// derivation and everything chained from it, instead of TLS 1.3's
+/// `"tls13 "` — see [`crate::crypto::hkdf::extract_dtls`]'s doc comment for
+/// why this isn't scoped to just a final record-layer step, and for the
+/// verification caveat.
+pub fn early_secret(psk: Option<&[u8; 32]>, dtls: bool) -> HkdfPrk {
     let ikm = psk.map(|p| p.as_slice()).unwrap_or(&[0u8; 32]);
-    extract(Some(&[0u8; 32]), ikm)
+    if dtls {
+        extract_dtls(Some(&[0u8; 32]), ikm)
+    } else {
+        extract(Some(&[0u8; 32]), ikm)
+    }
 }
 
-/// Handshake secret PRK after ECDHE (PSK-less full handshake).
+/// Handshake secret PRK after ECDHE (PSK-less full TLS 1.3 handshake).
 pub fn handshake_secret(shared_secret: &[u8]) -> HkdfPrk {
-    handshake_secret_with_psk(None, shared_secret)
+    handshake_secret_with_psk(None, shared_secret, false)
 }
 
 /// Handshake secret after ECDHE, optionally chaining from a resumption PSK.
-pub fn handshake_secret_with_psk(psk: Option<&[u8; 32]>, shared_secret: &[u8]) -> HkdfPrk {
-    let early = early_secret(psk);
+pub fn handshake_secret_with_psk(psk: Option<&[u8; 32]>, shared_secret: &[u8], dtls: bool) -> HkdfPrk {
+    let early = early_secret(psk, dtls);
     let derived = early.derive_secret("derived", &empty_hash());
-    extract(Some(&derived), shared_secret)
+    if dtls {
+        extract_derived_dtls(&derived, shared_secret)
+    } else {
+        extract_derived(&derived, shared_secret)
+    }
 }
 
-/// Derive handshake traffic secrets after ECDHE (PSK-less full handshake).
+/// Derive handshake traffic secrets after ECDHE (PSK-less full TLS 1.3 handshake).
 pub fn derive_handshake_traffic(shared_secret: &[u8], transcript_hash: &[u8; 32]) -> HandshakeTrafficSecrets {
-    derive_handshake_traffic_with_psk(None, shared_secret, transcript_hash)
+    derive_handshake_traffic_with_psk(None, shared_secret, transcript_hash, false)
 }
 
 /// Derive handshake traffic secrets with optional PSK (PSK-(EC)DHE).
@@ -59,8 +75,9 @@ pub fn derive_handshake_traffic_with_psk(
     psk: Option<&[u8; 32]>,
     shared_secret: &[u8],
     transcript_hash: &[u8; 32],
+    dtls: bool,
 ) -> HandshakeTrafficSecrets {
-    let hs = handshake_secret_with_psk(psk, shared_secret);
+    let hs = handshake_secret_with_psk(psk, shared_secret, dtls);
     HandshakeTrafficSecrets {
         client: hs.derive_secret("c hs traffic", transcript_hash),
         server: hs.derive_secret("s hs traffic", transcript_hash),
@@ -68,9 +85,13 @@ pub fn derive_handshake_traffic_with_psk(
 }
 
 /// Finished verify_data for the given traffic secret (RFC 8446 §4.4.4).
-pub fn compute_finished_verify_data(traffic_secret: &[u8; 32], transcript_hash: &[u8; 32]) -> [u8; 32] {
+pub fn compute_finished_verify_data(traffic_secret: &[u8; 32], transcript_hash: &[u8; 32], dtls: bool) -> [u8; 32] {
     use aws_lc_rs::hmac::{self, Key, HMAC_SHA256};
-    let finished_key = expand_label(traffic_secret, "finished", &[], 32);
+    let finished_key = if dtls {
+        dtls_expand_label(traffic_secret, "finished", &[], 32)
+    } else {
+        expand_label(traffic_secret, "finished", &[], 32)
+    };
     let key = Key::new(HMAC_SHA256, finished_key.as_ref());
     let tag = hmac::sign(&key, transcript_hash);
     let mut out = [0u8; 32];
@@ -82,10 +103,14 @@ pub fn compute_finished_verify_data(traffic_secret: &[u8; 32], transcript_hash: 
 /// `Hash.length` zero *bytes* (32, for SHA-256) — not an empty string; an
 /// empty IKM silently produces a different (wrong) PRK from HKDF-Extract,
 /// since HMAC over zero bytes and HMAC over no bytes are different messages.
-fn master_secret(psk: Option<&[u8; 32]>, shared_secret: &[u8]) -> HkdfPrk {
-    let hs = handshake_secret_with_psk(psk, shared_secret);
+fn master_secret(psk: Option<&[u8; 32]>, shared_secret: &[u8], dtls: bool) -> HkdfPrk {
+    let hs = handshake_secret_with_psk(psk, shared_secret, dtls);
     let derived = hs.derive_secret("derived", &empty_hash());
-    extract(Some(&derived), &[0u8; 32])
+    if dtls {
+        extract_derived_dtls(&derived, &[0u8; 32])
+    } else {
+        extract_derived(&derived, &[0u8; 32])
+    }
 }
 
 /// Derive 1-RTT application traffic secrets after both Finished messages.
@@ -93,7 +118,7 @@ pub fn derive_application_traffic(
     shared_secret: &[u8],
     transcript_hash: &[u8; 32],
 ) -> ApplicationTrafficSecrets {
-    derive_application_traffic_with_psk(None, shared_secret, transcript_hash)
+    derive_application_traffic_with_psk(None, shared_secret, transcript_hash, false)
 }
 
 /// Derive 1-RTT application traffic secrets with optional PSK.
@@ -101,8 +126,9 @@ pub fn derive_application_traffic_with_psk(
     psk: Option<&[u8; 32]>,
     shared_secret: &[u8],
     transcript_hash: &[u8; 32],
+    dtls: bool,
 ) -> ApplicationTrafficSecrets {
-    let master = master_secret(psk, shared_secret);
+    let master = master_secret(psk, shared_secret, dtls);
     ApplicationTrafficSecrets {
         client: master.derive_secret("c ap traffic", transcript_hash),
         server: master.derive_secret("s ap traffic", transcript_hash),
@@ -114,34 +140,39 @@ pub fn derive_resumption_master_secret(
     psk: Option<&[u8; 32]>,
     shared_secret: &[u8],
     transcript_hash: &[u8; 32],
+    dtls: bool,
 ) -> [u8; 32] {
-    let master = master_secret(psk, shared_secret);
+    let master = master_secret(psk, shared_secret, dtls);
     master.derive_secret("res master", transcript_hash)
 }
 
 /// Derive a resumption PSK from the resumption master secret and ticket nonce.
-pub fn derive_resumption_psk(resumption_master: &[u8; 32], ticket_nonce: &[u8]) -> [u8; 32] {
-    let out = expand_label(resumption_master, "resumption", ticket_nonce, 32);
+pub fn derive_resumption_psk(resumption_master: &[u8; 32], ticket_nonce: &[u8], dtls: bool) -> [u8; 32] {
+    let out = if dtls {
+        dtls_expand_label(resumption_master, "resumption", ticket_nonce, 32)
+    } else {
+        expand_label(resumption_master, "resumption", ticket_nonce, 32)
+    };
     let mut psk = [0u8; 32];
     psk.copy_from_slice(out.as_ref());
     psk
 }
 
 /// Resumption binder key (`res binder`) from the early secret.
-pub fn derive_resumption_binder_key(psk: &[u8; 32]) -> [u8; 32] {
-    early_secret(Some(psk)).derive_secret("res binder", &empty_hash())
+pub fn derive_resumption_binder_key(psk: &[u8; 32], dtls: bool) -> [u8; 32] {
+    early_secret(Some(psk), dtls).derive_secret("res binder", &empty_hash())
 }
 
 /// Compute a PSK binder (RFC 8446 §4.2.11) over a truncated ClientHello transcript hash.
-pub fn compute_psk_binder(psk: &[u8; 32], truncated_ch_hash: &[u8; 32]) -> [u8; 32] {
-    let binder_key = derive_resumption_binder_key(psk);
-    compute_finished_verify_data(&binder_key, truncated_ch_hash)
+pub fn compute_psk_binder(psk: &[u8; 32], truncated_ch_hash: &[u8; 32], dtls: bool) -> [u8; 32] {
+    let binder_key = derive_resumption_binder_key(psk, dtls);
+    compute_finished_verify_data(&binder_key, truncated_ch_hash, dtls)
 }
 
 /// Derive client early traffic secret from PSK and ClientHello transcript hash.
-pub fn derive_early_traffic(psk: &[u8; 32], client_hello_hash: &[u8; 32]) -> EarlyTrafficSecrets {
+pub fn derive_early_traffic(psk: &[u8; 32], client_hello_hash: &[u8; 32], dtls: bool) -> EarlyTrafficSecrets {
     EarlyTrafficSecrets {
-        client: early_secret(Some(psk)).derive_secret("c e traffic", client_hello_hash),
+        client: early_secret(Some(psk), dtls).derive_secret("c e traffic", client_hello_hash),
     }
 }
 
@@ -183,8 +214,8 @@ mod tests {
     #[test]
     fn early_secret_from_psk_differs_from_zeros() {
         let psk = [0x42u8; 32];
-        let with = early_secret(Some(&psk)).derive_secret("c e traffic", &empty_hash());
-        let without = early_secret(None).derive_secret("c e traffic", &empty_hash());
+        let with = early_secret(Some(&psk), false).derive_secret("c e traffic", &empty_hash());
+        let without = early_secret(None, false).derive_secret("c e traffic", &empty_hash());
         assert_ne!(with, without);
     }
 
@@ -192,9 +223,23 @@ mod tests {
     fn resumption_psk_roundtrip_shape() {
         let rms = [0x11u8; 32];
         let nonce = b"\x01\x02\x03\x04";
-        let psk = derive_resumption_psk(&rms, nonce);
+        let psk = derive_resumption_psk(&rms, nonce, false);
         assert_ne!(psk, [0u8; 32]);
-        let binder = compute_psk_binder(&psk, &empty_hash());
+        let binder = compute_psk_binder(&psk, &empty_hash(), false);
         assert_ne!(binder, [0u8; 32]);
+    }
+
+    /// The DTLS 1.3 label-prefix variant (RFC 9147 §5.9) must produce
+    /// different secrets from the TLS 1.3 path for the same inputs —
+    /// cryptographic separation between the two protocols is the entire
+    /// point of the prefix change.
+    #[test]
+    fn dtls_prefix_produces_different_secrets_than_tls() {
+        let shared = [0x77u8; 32];
+        let transcript = [0x88u8; 32];
+        let tls = derive_handshake_traffic(&shared, &transcript);
+        let dtls = derive_handshake_traffic_with_psk(None, &shared, &transcript, true);
+        assert_ne!(tls.client, dtls.client);
+        assert_ne!(tls.server, dtls.server);
     }
 }

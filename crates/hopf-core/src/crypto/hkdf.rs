@@ -9,13 +9,18 @@ use aws_lc_rs::hkdf::{self, KeyType, Prk, Salt, HKDF_SHA256};
 /// TLS 1.3 HKDF-SHA-256.
 pub const TLS13_HKDF: hkdf::Algorithm = HKDF_SHA256;
 
-/// Opaque HKDF pseudo-random key from Extract.
-pub struct HkdfPrk(Prk);
+/// Opaque HKDF pseudo-random key from Extract. Remembers which
+/// `HKDF-Expand-Label` prefix (`"tls13 "` or `"dtls13 "`) it was constructed
+/// with, so [`Self::derive_secret`] doesn't need it passed again — every
+/// `HkdfPrk` derived *from* one (via [`extract_derived`]/[`extract_derived_dtls`])
+/// inherits the same prefix through the caller threading the right variant,
+/// same as the rest of the key schedule in `handshake::key_schedule`.
+pub struct HkdfPrk(Prk, &'static str);
 
 impl HkdfPrk {
     /// Derive-Secret (RFC 8446 §7.1).
     pub fn derive_secret(&self, label: &str, context: &[u8]) -> [u8; 32] {
-        let hkdf_label = build_tls_hkdf_label(label, context, 32);
+        let hkdf_label = build_hkdf_label(self.1, label, context, 32);
         let label_slice = [hkdf_label.as_ref()];
         let mut out = [0u8; 32];
         self.0
@@ -38,9 +43,7 @@ pub fn empty_hash() -> [u8; 32] {
 
 /// HKDF-Extract; salt defaults to 32 zero octets when `None`.
 pub fn extract(salt: Option<&[u8]>, ikm: &[u8]) -> HkdfPrk {
-    let salt_bytes = salt.unwrap_or(&[0u8; 32]);
-    let salt = Salt::new(TLS13_HKDF, salt_bytes);
-    HkdfPrk(salt.extract(ikm))
+    extract_with_prefix(TLS13_LABEL_PREFIX, salt, ikm)
 }
 
 /// HKDF-Extract where salt is a prior Derive-Secret output.
@@ -50,7 +53,49 @@ pub fn extract_derived(derived: &[u8; 32], ikm: &[u8]) -> HkdfPrk {
 
 /// HKDF-Expand-Label from raw 32-byte secret (post-Derive-Secret).
 pub fn expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> Bytes {
-    let hkdf_label = build_tls_hkdf_label(label, context, len);
+    expand_label_with_prefix(TLS13_LABEL_PREFIX, secret, label, context, len)
+}
+
+/// DTLS 1.3 label prefix (RFC 9147 §5.9): *"Section 7.1 of \[TLS13\] specifies
+/// that HKDF-Expand-Label uses a label prefix of 'tls13 '. For DTLS 1.3,
+/// that label SHALL be 'dtls13'."* — unlike RFC 9001's QUIC (which layers
+/// its own `"quic "`-prefixed derivation on top of an *unmodified* TLS 1.3
+/// key schedule), this amends RFC 8446 §7.1 itself, so it applies to every
+/// `HKDF-Expand-Label` call throughout the handshake's key schedule, not
+/// just a final record-protection-key step — see [`extract_dtls`] /
+/// [`extract_derived_dtls`] / [`dtls_expand_label`], used throughout
+/// `handshake::key_schedule` wherever its functions are called with
+/// `dtls: true`. **Unverified**: RFC 9147 has no published test vectors
+/// (unlike RFC 8448 for TLS 1.3) and no independent DTLS 1.3 peer was
+/// available to interop-test this against (see `crypto-migration-plan.md`
+/// Phase 6) — this is a best-effort reading of the RFC text, not yet
+/// cross-checked against another implementation.
+const DTLS13_LABEL_PREFIX: &str = "dtls13 ";
+const TLS13_LABEL_PREFIX: &str = "tls13 ";
+
+/// [`extract`], but for DTLS 1.3 (RFC 9147 §5.9's `"dtls13 "` prefix).
+pub fn extract_dtls(salt: Option<&[u8]>, ikm: &[u8]) -> HkdfPrk {
+    extract_with_prefix(DTLS13_LABEL_PREFIX, salt, ikm)
+}
+
+/// [`extract_derived`], but for DTLS 1.3.
+pub fn extract_derived_dtls(derived: &[u8; 32], ikm: &[u8]) -> HkdfPrk {
+    extract_dtls(Some(derived), ikm)
+}
+
+/// [`expand_label`], but for DTLS 1.3.
+pub fn dtls_expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> Bytes {
+    expand_label_with_prefix(DTLS13_LABEL_PREFIX, secret, label, context, len)
+}
+
+fn extract_with_prefix(prefix: &'static str, salt: Option<&[u8]>, ikm: &[u8]) -> HkdfPrk {
+    let salt_bytes = salt.unwrap_or(&[0u8; 32]);
+    let salt = Salt::new(TLS13_HKDF, salt_bytes);
+    HkdfPrk(salt.extract(ikm), prefix)
+}
+
+fn expand_label_with_prefix(prefix: &'static str, secret: &[u8], label: &str, context: &[u8], len: usize) -> Bytes {
+    let hkdf_label = build_hkdf_label(prefix, label, context, len);
     let prk = Prk::new_less_safe(TLS13_HKDF, secret);
     let label_slice = [hkdf_label.as_ref()];
     let okm = prk
@@ -70,10 +115,6 @@ fn build_hkdf_label(prefix: &str, label: &str, context: &[u8], length: usize) ->
     out.extend_from_slice(&[context.len() as u8]);
     out.extend_from_slice(context);
     out.freeze()
-}
-
-fn build_tls_hkdf_label(label: &str, context: &[u8], length: usize) -> Bytes {
-    build_hkdf_label("tls13 ", label, context, length)
 }
 
 /// HKDF-Expand-Label for RFC 9001 QUIC packet protection (uses the `quic ` prefix).

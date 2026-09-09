@@ -92,6 +92,19 @@ pub trait HandshakeEvents {
         let _ = (ext_type, data);
     }
 
+    /// Fired once, right after `random`, when a `ServerHello`-shaped message
+    /// is actually a `HelloRetryRequest` (RFC 8446 §4.1.4) — `random`
+    /// matched the fixed sentinel. `key_share`'s `share` argument for this
+    /// message is empty (RFC 8446 §4.2.8's `KeyShareHelloRetryRequest`
+    /// carries only a group, no key bytes).
+    fn hello_retry_request(&mut self) {}
+
+    /// Cookie extension (RFC 8446 §4.2.2) — in `HelloRetryRequest` (server)
+    /// or echoed back in a followup `ClientHello` (client).
+    fn cookie(&mut self, data: &[u8]) {
+        let _ = data;
+    }
+
     /// Client offered / server selected early data (empty payload in CH/EE).
     fn early_data(&mut self) {}
 
@@ -230,7 +243,8 @@ fn decode_client_hello(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
         return false;
     }
     let mut i = 0;
-    handler.legacy_version(u16::from_be_bytes([body[i], body[i + 1]]));
+    let legacy_version = u16::from_be_bytes([body[i], body[i + 1]]);
+    handler.legacy_version(legacy_version);
     i += 2;
     let mut random = [0u8; 32];
     random.copy_from_slice(&body[i..i + 32]);
@@ -244,6 +258,21 @@ fn decode_client_hello(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
     }
     handler.session_id(&body[i..i + sid_len]);
     i += sid_len;
+    // DTLS's ClientHello has one more fixed-position field here TLS's
+    // doesn't — see the matching comment in `build_client_hello_inner`.
+    if legacy_version == 0xfefd {
+        if body.len() < i + 1 {
+            handler.parse_error("ClientHello truncated at cookie");
+            return false;
+        }
+        let cookie_len = body[i] as usize;
+        i += 1;
+        if body.len() < i + cookie_len + 2 + 1 + 2 {
+            handler.parse_error("ClientHello truncated at cookie");
+            return false;
+        }
+        i += cookie_len;
+    }
     let cs_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
     i += 2;
     if body.len() < i + cs_len + 1 + 2 {
@@ -287,6 +316,10 @@ fn decode_server_hello(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
     let mut random = [0u8; 32];
     random.copy_from_slice(&body[i..i + 32]);
     handler.random(&random);
+    let is_hrr = random == super::messages::HELLO_RETRY_REQUEST_RANDOM;
+    if is_hrr {
+        handler.hello_retry_request();
+    }
     i += 32;
     let sid_len = body[i] as usize;
     i += 1;
@@ -306,7 +339,11 @@ fn decode_server_hello(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
         handler.parse_error("ServerHello truncated at extensions");
         return false;
     }
-    decode_server_hello_extensions(&body[i..i + ext_len], handler);
+    if is_hrr {
+        decode_extension_block(&body[i..i + ext_len], handler, KeyShareExtMode::HelloRetryRequest);
+    } else {
+        decode_server_hello_extensions(&body[i..i + ext_len], handler);
+    }
     true
 }
 
@@ -473,6 +510,9 @@ fn decode_server_hello_extensions(extensions: &[u8], handler: &mut dyn Handshake
 enum KeyShareExtMode {
     ClientHelloList,
     ServerHelloSingle,
+    /// `HelloRetryRequest`'s `key_share` extension carries only a
+    /// `NamedGroup` — no length-prefixed key bytes (RFC 8446 §4.2.8).
+    HelloRetryRequest,
 }
 
 fn decode_extension_block(
@@ -494,6 +534,7 @@ fn decode_extension_block(
             ext::KEY_SHARE => match key_share_mode {
                 KeyShareExtMode::ClientHelloList => decode_key_share_extension(edata, handler),
                 KeyShareExtMode::ServerHelloSingle => decode_server_key_share_extension(edata, handler),
+                KeyShareExtMode::HelloRetryRequest => decode_hello_retry_request_key_share(edata, handler),
             },
             ext::ALPN => decode_alpn_extension(edata, handler),
             ext::SERVER_NAME => {
@@ -503,9 +544,10 @@ fn decode_extension_block(
             }
             ext::QUIC_TRANSPORT_PARAMETERS => handler.transport_parameters(edata),
             ext::EARLY_DATA => handler.early_data(),
+            ext::COOKIE => handler.cookie(edata),
             ext::PRE_SHARED_KEY => match key_share_mode {
                 KeyShareExtMode::ClientHelloList => decode_psk_client(edata, handler),
-                KeyShareExtMode::ServerHelloSingle => {
+                KeyShareExtMode::ServerHelloSingle | KeyShareExtMode::HelloRetryRequest => {
                     if edata.len() == 2 {
                         handler.psk_selected_identity(u16::from_be_bytes([edata[0], edata[1]]));
                     }
@@ -561,6 +603,16 @@ fn decode_server_key_share_extension(data: &[u8], handler: &mut dyn HandshakeEve
         return;
     }
     handler.key_share(group, &data[4..4 + klen]);
+}
+
+/// `HelloRetryRequest`'s `key_share` extension is just a 2-byte `NamedGroup`
+/// (RFC 8446 §4.2.8's `KeyShareHelloRetryRequest`) — no key bytes.
+fn decode_hello_retry_request_key_share(data: &[u8], handler: &mut dyn HandshakeEvents) {
+    if data.len() != 2 {
+        return;
+    }
+    let group = u16::from_be_bytes([data[0], data[1]]);
+    handler.key_share(group, &[]);
 }
 
 /// ALPN extension_data (RFC 7301 §3.1): 2-byte `ProtocolNameList` length,
@@ -711,6 +763,8 @@ mod tests {
             transport_parameters: None,
             early_data: false,
             psk: None,
+            cookie: None,
+            legacy_version: 0x0303,
         });
         let wire = hello.encode();
         let split = wire.len() / 2;
@@ -734,7 +788,7 @@ mod tests {
     fn server_hello_key_share_single_entry() {
         use crate::crypto::kx::NamedGroup;
         let share = [42u8; 32];
-        let hello = build_server_hello(&[9u8; 32], &[], 0x1301, NamedGroup::X25519.code(), &share);
+        let hello = build_server_hello(&[9u8; 32], &[], 0x1301, NamedGroup::X25519.code(), &share, 0x0303);
         let wire = hello.encode();
 
         let mut parser = HandshakeParser::new();

@@ -16,8 +16,8 @@ use super::handshake::verify::{sign_certificate_verify, verify_certificate_verif
 use super::handshake::{
     build_certificate, build_certificate_request, build_certificate_verify, build_client_hello,
     build_client_hello_with_binder, build_encrypted_extensions_ext, build_finished,
-    build_server_hello_ext, compute_finished_verify_data, compute_psk_binder,
-    derive_application_traffic_with_psk, derive_early_traffic,
+    build_hello_retry_request, build_server_hello_ext, compute_finished_verify_data,
+    compute_psk_binder, derive_application_traffic_with_psk, derive_early_traffic,
     derive_handshake_traffic_with_psk, derive_resumption_master_secret, derive_resumption_psk,
     ApplicationTrafficSecrets, ClientHelloParams, HandshakeMessage, HandshakeTrafficSecrets,
     HandshakeType, KeyShareEntry, OfferedPsk, Transcript,
@@ -47,6 +47,33 @@ pub enum HandshakeMode {
     Quic,
     /// TLS record layer wraps messages (Phase 4 TCP).
     TcpRecordLayer,
+    /// DTLS 1.3 (RFC 9147) record/reassembly layer wraps messages (Phase 6).
+    /// Like [`Self::TcpRecordLayer`], no [`super::sink::QuicSecrets`] — the
+    /// `hopf-core::dtls` record layer consumes the same
+    /// `application_traffic_keys_ready` callback the TCP record layer does.
+    Dtls,
+}
+
+impl HandshakeMode {
+    /// `ClientHello`/`ServerHello`/`HelloRetryRequest`'s `legacy_version`
+    /// field (RFC 8446 §4.1.2/§4.1.3 for TLS: `0x0303`; RFC 9147 §5.3 for
+    /// DTLS: `0xfefd`, DTLS 1.2's wire value, for backward-compat framing —
+    /// the real negotiated version is always the `supported_versions`
+    /// extension, identical on both transports).
+    fn legacy_version(self) -> u16 {
+        match self {
+            HandshakeMode::Quic | HandshakeMode::TcpRecordLayer => 0x0303,
+            HandshakeMode::Dtls => 0xfefd,
+        }
+    }
+
+    /// The `SecurityInfo::protocol` string for a completed handshake.
+    fn protocol_name(self) -> &'static str {
+        match self {
+            HandshakeMode::Quic | HandshakeMode::TcpRecordLayer => "TLSv1.3",
+            HandshakeMode::Dtls => "DTLSv1.3",
+        }
+    }
 }
 
 /// `TLS_AES_128_GCM_SHA256` (RFC 8446 §B.4) — MUST implement per RFC 8446 §9.1.
@@ -282,6 +309,23 @@ pub struct HandshakeEngine {
     /// key installation). Threaded into every `*_keys_ready` callback and
     /// the completion `SecurityInfo`.
     negotiated_aead: Option<Tls13Aead>,
+    /// Client role: `ClientHello.random`, cached so a followup ClientHello
+    /// after a `HelloRetryRequest` reuses the same value (RFC 8446 doesn't
+    /// require a fresh one, and the transcript already commits to CH1 via
+    /// the `message_hash` substitution — see [`Transcript::retry`]).
+    client_hello_random: Option<[u8; 32]>,
+    /// Client role: whether a `HelloRetryRequest` has already been
+    /// processed this handshake — RFC 8446 §4.1.4 forbids a second one.
+    client_retried: bool,
+    /// Client role: cookie from the server's `HelloRetryRequest`, if any —
+    /// echoed verbatim in the followup ClientHello, then cleared.
+    client_retry_cookie: Option<Bytes>,
+    /// Server role: the group requested in this engine's own
+    /// `HelloRetryRequest`, kept until the followup `ClientHello` arrives
+    /// so it can be validated (RFC 8446 §4.1.2: the client MUST honor it)
+    /// and to distinguish "first mismatch" (send HRR) from "still
+    /// mismatched after retry" (fail) in `on_client_hello`.
+    server_retry_requested_group: Option<NamedGroup>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +335,8 @@ enum State {
     ReadingServerFlight,
     /// After EE on a resumed handshake — expect Finished next (no Cert).
     ReadingServerFinished,
+    /// Server role: sent `HelloRetryRequest`, waiting for the followup `ClientHello`.
+    HelloRetryRequestSent,
     /// Server role: sent `CertificateRequest`, waiting for the client's `Certificate`.
     AwaitingClientCertificate,
     /// Server role: client's `Certificate` had entries — waiting for `CertificateVerify`.
@@ -330,6 +376,10 @@ impl HandshakeEngine {
             expect_client_certificate_verify: false,
             server_finished_hash: None,
             negotiated_aead: None,
+            client_hello_random: None,
+            client_retried: false,
+            client_retry_cookie: None,
+            server_retry_requested_group: None,
         }
     }
 
@@ -466,9 +516,12 @@ impl HandshakeEngine {
                 self.on_new_session_ticket(nst, sink);
                 true
             }
-            (HandshakeRole::Server, HandshakeType::ClientHello, State::Initial, ParsedIncoming::ClientHello(ch)) => {
-                self.on_client_hello(ch, wire, sink)
-            }
+            (
+                HandshakeRole::Server,
+                HandshakeType::ClientHello,
+                State::Initial | State::HelloRetryRequestSent,
+                ParsedIncoming::ClientHello(ch),
+            ) => self.on_client_hello(ch, wire, sink),
             (
                 HandshakeRole::Server,
                 HandshakeType::Certificate,
@@ -493,12 +546,41 @@ impl HandshakeEngine {
 
     fn client_send_hello<S: TlsEventSink>(&mut self, sink: &mut S) {
         let offer = self.config.kx_policy.preferred();
+        self.client_send_hello_inner(offer, None, sink);
+    }
+
+    /// Resend a ClientHello after a `HelloRetryRequest` requested `group` —
+    /// same [`Self::client_hello_random`], the new group's key share, no
+    /// early data (RFC 8446 §4.1.2: "the client MUST NOT include the
+    /// 'early_data' extension in its followup ClientHello"), and the
+    /// server's cookie (if any) echoed back.
+    fn client_resend_hello_after_retry<S: TlsEventSink>(&mut self, group: NamedGroup, sink: &mut S) {
+        let random = self
+            .client_hello_random
+            .expect("ClientHello1 already sent before any HelloRetryRequest can arrive");
+        self.client_send_hello_inner(group, Some(random), sink);
+    }
+
+    fn client_send_hello_inner<S: TlsEventSink>(
+        &mut self,
+        offer: NamedGroup,
+        retry: Option<[u8; 32]>,
+        sink: &mut S,
+    ) {
+        let dtls = self.config.mode == HandshakeMode::Dtls;
         let Ok(local) = LocalKeyShare::generate(offer) else {
             self.fail(sink, "key generation failed");
             return;
         };
-        let mut random = [0u8; 32];
-        let _ = getrandom(&mut random);
+        let random = if let Some(r) = retry {
+            r
+        } else {
+            let mut r = [0u8; 32];
+            let _ = getrandom(&mut r);
+            self.client_hello_random = Some(r);
+            r
+        };
+        let is_retry = retry.is_some();
         let groups: Vec<u16> = self
             .config
             .kx_policy
@@ -513,7 +595,8 @@ impl HandshakeEngine {
             .as_ref()
             .and_then(|n| self.config.ticket_store.as_ref().and_then(|s| s.get(n)));
 
-        let want_early = self.config.enable_early_data
+        let want_early = !is_retry
+            && self.config.enable_early_data
             && ticket
                 .as_ref()
                 .map(|t| t.max_early_data_size > 0)
@@ -542,10 +625,12 @@ impl HandshakeEngine {
             transport_parameters: self.config.local_transport_parameters.clone(),
             early_data: want_early,
             psk: psk_offer,
+            cookie: self.client_retry_cookie.take(),
+            legacy_version: self.config.mode.legacy_version(),
         };
 
         let hello = if let Some(psk) = self.psk {
-            build_client_hello_with_binder(params, |hash| compute_psk_binder(&psk, hash))
+            build_client_hello_with_binder(params, |hash| compute_psk_binder(&psk, hash, dtls))
         } else {
             build_client_hello(&params)
         };
@@ -560,7 +645,7 @@ impl HandshakeEngine {
                     out.copy_from_slice(d.as_ref());
                     out
                 };
-                let early = derive_early_traffic(&psk, &ch_hash);
+                let early = derive_early_traffic(&psk, &ch_hash, dtls);
                 self.early_client_secret = Some(early.client);
                 self.early_data_offered = true;
                 // The server's actual suite selection hasn't happened yet
@@ -595,6 +680,9 @@ impl HandshakeEngine {
         encoded: Bytes,
         sink: &mut S,
     ) -> bool {
+        if sh.is_hello_retry_request {
+            return self.on_hello_retry_request(sh, encoded, sink);
+        }
         let Some(aead) = Tls13Aead::from_suite(sh.cipher_suite) else {
             self.fail(sink, "unsupported cipher suite");
             return false;
@@ -622,11 +710,49 @@ impl HandshakeEngine {
             psk,
             self.shared_secret.as_ref().unwrap(),
             &self.transcript.hash(),
+            self.config.mode == HandshakeMode::Dtls,
         ));
         if let Some(traffic) = self.handshake_traffic.as_ref() {
             sink.quic_handshake_keys_ready(aead, traffic.client, traffic.server);
         }
         self.state = State::ReadingServerFlight;
+        true
+    }
+
+    /// Client role: handle a `HelloRetryRequest` (RFC 8446 §4.1.4) —
+    /// regenerate the key share for the requested group and resend
+    /// ClientHello. `sh`/`encoded` are the same parse of the
+    /// `ServerHello`-shaped wire message [`ParsedServerHello::is_hello_retry_request`]
+    /// flagged; `on_server_hello` dispatches here before doing any of its
+    /// own (real-`ServerHello`-only) validation.
+    fn on_hello_retry_request<S: TlsEventSink>(
+        &mut self,
+        sh: super::handshake::ParsedServerHello,
+        encoded: Bytes,
+        sink: &mut S,
+    ) -> bool {
+        if self.client_retried {
+            self.fail(sink, "server sent a second HelloRetryRequest");
+            return false;
+        }
+        let Some(group) = NamedGroup::from_code(sh.selected_group) else {
+            self.fail(sink, "HelloRetryRequest requested an unsupported group");
+            return false;
+        };
+        if !self.config.kx_policy.groups().contains(&group) {
+            self.fail(sink, "HelloRetryRequest requested a group we don't offer");
+            return false;
+        }
+        // Nothing but ClientHello1 has been added to the transcript yet
+        // (this is the first message the client processes after sending
+        // it), so its current hash is exactly Hash(ClientHello1) — RFC 8446
+        // §4.4.1's required input for the message_hash substitution.
+        let ch1_hash = self.transcript.hash();
+        self.transcript.retry(ch1_hash);
+        self.transcript.add_message(&encoded);
+        self.client_retried = true;
+        self.client_retry_cookie = sh.cookie;
+        self.client_resend_hello_after_retry(group, sink);
         true
     }
 
@@ -759,7 +885,8 @@ impl HandshakeEngine {
             return false;
         };
         let th = self.transcript.hash();
-        let expected = compute_finished_verify_data(&traffic.server, &th);
+        let dtls = self.config.mode == HandshakeMode::Dtls;
+        let expected = compute_finished_verify_data(&traffic.server, &th, dtls);
         if vd.as_ref() != expected {
             self.fail(sink, "server Finished verify failed");
             return false;
@@ -769,6 +896,7 @@ impl HandshakeEngine {
     }
 
     fn client_send_finished<S: TlsEventSink>(&mut self, sink: &mut S) -> bool {
+        let dtls = self.config.mode == HandshakeMode::Dtls;
         // RFC 8446 §7.1: application_traffic_secret_0 covers the transcript
         // through the *server's* Finished only — captured here, before any
         // client Certificate/CertificateVerify response joins the
@@ -785,7 +913,7 @@ impl HandshakeEngine {
             return false;
         };
         let th = self.transcript.hash();
-        let vd = compute_finished_verify_data(&traffic.client, &th);
+        let vd = compute_finished_verify_data(&traffic.client, &th, dtls);
         let fin = build_finished(&vd);
         let Some(shared) = self.shared_secret.clone() else {
             self.fail(sink, "missing shared secret");
@@ -795,10 +923,10 @@ impl HandshakeEngine {
         // See on_client_finished's comment: application_traffic_secret_0 uses
         // `th_for_app_traffic` (through server Finished only); resumption_master_secret
         // uses the transcript after this client Finished is added, below.
-        self.application_traffic = Some(derive_application_traffic_with_psk(psk.as_ref(), &shared, &th_for_app_traffic));
+        self.application_traffic = Some(derive_application_traffic_with_psk(psk.as_ref(), &shared, &th_for_app_traffic, dtls));
         self.emit_outgoing(&fin, sink);
         let res_hash = self.transcript.hash();
-        self.resumption_master = Some(derive_resumption_master_secret(psk.as_ref(), &shared, &res_hash));
+        self.resumption_master = Some(derive_resumption_master_secret(psk.as_ref(), &shared, &res_hash, dtls));
         self.finish(sink);
         true
     }
@@ -841,7 +969,7 @@ impl HandshakeEngine {
         let Some(store) = self.config.ticket_store.as_ref() else {
             return;
         };
-        let psk = derive_resumption_psk(&rms, &nst.nonce);
+        let psk = derive_resumption_psk(&rms, &nst.nonce, self.config.mode == HandshakeMode::Dtls);
         let alpn = self
             .negotiated_alpn
             .clone()
@@ -864,12 +992,49 @@ impl HandshakeEngine {
         );
     }
 
+    /// Server role: request a different key-exchange group (RFC 8446
+    /// §4.1.4) because the client's single offered `key_share` didn't match
+    /// what [`crate::crypto::kx_policy::KxPolicy::select_mutual`] picked
+    /// from its `supported_groups`. `ch1_encoded` is the just-received
+    /// ClientHello's own wire bytes — nothing has been added to the
+    /// transcript yet at this point (see the call site), so its hash is
+    /// exactly RFC 8446 §4.4.1's required `Hash(ClientHello1)` input.
+    fn send_hello_retry_request<S: TlsEventSink>(
+        &mut self,
+        group: NamedGroup,
+        legacy_session_id: &Bytes,
+        cipher_suite: u16,
+        ch1_encoded: Bytes,
+        sink: &mut S,
+    ) -> bool {
+        let ch1_hash = {
+            use aws_lc_rs::digest::{digest, SHA256};
+            let d = digest(&SHA256, &ch1_encoded);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(d.as_ref());
+            out
+        };
+        self.transcript.retry(ch1_hash);
+        let hrr = build_hello_retry_request(
+            legacy_session_id,
+            cipher_suite,
+            group.code(),
+            None,
+            self.config.mode.legacy_version(),
+        );
+        self.emit_outgoing(&hrr, sink);
+        self.server_retry_requested_group = Some(group);
+        self.state = State::HelloRetryRequestSent;
+        true
+    }
+
     fn on_client_hello<S: TlsEventSink>(
         &mut self,
         ch: super::handshake::ParsedClientHello,
         encoded: Bytes,
         sink: &mut S,
     ) -> bool {
+        let dtls = self.config.mode == HandshakeMode::Dtls;
         if let Some(tp) = &ch.transport_parameters {
             sink.peer_transport_parameters(tp);
         }
@@ -900,7 +1065,7 @@ impl HandshakeEngine {
                         out.copy_from_slice(d.as_ref());
                         out
                     };
-                    let expected = compute_psk_binder(&payload.psk, &trunc_hash);
+                    let expected = compute_psk_binder(&payload.psk, &trunc_hash, dtls);
                     if binder.as_ref() == expected {
                         let obfuscated = ch.obfuscated_ticket_age.unwrap_or(0);
                         let age_ms = recover_ticket_age(obfuscated, payload.ticket_age_add);
@@ -950,7 +1115,7 @@ impl HandshakeEngine {
                                         out.copy_from_slice(d.as_ref());
                                         out
                                     };
-                                    let early = derive_early_traffic(&payload.psk, &ch_hash);
+                                    let early = derive_early_traffic(&payload.psk, &ch_hash, dtls);
                                     self.early_client_secret = Some(early.client);
                                     self.early_data_accepted = true;
                                     sink.quic_early_keys_ready(aead, early.client);
@@ -971,8 +1136,17 @@ impl HandshakeEngine {
             return false;
         };
         if ch.key_share_group != Some(group.code()) {
-            self.fail(sink, "client key share group mismatch");
-            return false;
+            if self.server_retry_requested_group.is_some() {
+                self.fail(sink, "client key share group still mismatched after HelloRetryRequest");
+                return false;
+            }
+            return self.send_hello_retry_request(group, &ch.legacy_session_id, suite, encoded, sink);
+        }
+        if let Some(expected) = self.server_retry_requested_group.take() {
+            if expected != group {
+                self.fail(sink, "server-selected group changed across HelloRetryRequest");
+                return false;
+            }
         }
         let Ok((server_share, shared)) = server_agree(group, &peer_share) else {
             self.fail(sink, "key agreement failed");
@@ -990,6 +1164,7 @@ impl HandshakeEngine {
             group.code(),
             server_share.as_ref(),
             selected_psk,
+            self.config.mode.legacy_version(),
         );
         self.emit_outgoing(&sh, sink);
 
@@ -1001,6 +1176,7 @@ impl HandshakeEngine {
             psk,
             self.shared_secret.as_ref().unwrap(),
             &self.transcript.hash(),
+            dtls,
         ));
         if let Some(traffic) = self.handshake_traffic.as_ref() {
             sink.quic_handshake_keys_ready(aead, traffic.client, traffic.server);
@@ -1043,7 +1219,7 @@ impl HandshakeEngine {
 
         let fin_th = self.transcript.hash();
         let traffic = self.handshake_traffic.as_ref().expect("hs traffic");
-        let vd = compute_finished_verify_data(&traffic.server, &fin_th);
+        let vd = compute_finished_verify_data(&traffic.server, &fin_th, dtls);
         let fin = build_finished(&vd);
         self.emit_outgoing(&fin, sink);
         // RFC 8446 §7.1: application_traffic_secret_0 covers the transcript
@@ -1132,12 +1308,13 @@ impl HandshakeEngine {
         encoded: Bytes,
         sink: &mut S,
     ) -> bool {
+        let dtls = self.config.mode == HandshakeMode::Dtls;
         let Some(traffic) = self.handshake_traffic.as_ref() else {
             self.fail(sink, "missing handshake traffic");
             return false;
         };
         let th = self.transcript.hash();
-        let expected = compute_finished_verify_data(&traffic.client, &th);
+        let expected = compute_finished_verify_data(&traffic.client, &th, dtls);
         if vd.as_ref() != expected {
             self.fail(sink, "client Finished verify failed");
             return false;
@@ -1159,10 +1336,10 @@ impl HandshakeEngine {
             .server_finished_hash
             .take()
             .expect("server Finished sent before client Finished");
-        self.application_traffic = Some(derive_application_traffic_with_psk(psk, shared, &app_th));
+        self.application_traffic = Some(derive_application_traffic_with_psk(psk, shared, &app_th, dtls));
         self.transcript.add_message(&encoded);
         let res_hash = self.transcript.hash();
-        self.resumption_master = Some(derive_resumption_master_secret(psk, shared, &res_hash));
+        self.resumption_master = Some(derive_resumption_master_secret(psk, shared, &res_hash, dtls));
         self.finish(sink);
         true
     }
@@ -1195,7 +1372,7 @@ impl HandshakeEngine {
             self.negotiated_alpn
                 .clone()
                 .or_else(|| self.config.alpn.first().cloned()),
-            Some("TLSv1.3".to_string()),
+            Some(self.config.mode.protocol_name().to_string()),
             Some(aead.name().to_string()),
         )
         .with_sni(sni);
@@ -1219,7 +1396,7 @@ impl HandshakeEngine {
                 server_application_traffic_secret: app.as_ref().map(|a| a.server),
                 client_early_traffic_secret: early,
             }),
-            HandshakeMode::TcpRecordLayer => None,
+            HandshakeMode::TcpRecordLayer | HandshakeMode::Dtls => None,
         };
         self.state = State::Complete;
         sink.handshake_complete(info, quic);
@@ -1247,9 +1424,14 @@ impl HandshakeEngine {
                     .as_deref()
                     .and_then(RememberedTransportLimits::decode_from_tp_blob)
                     .or(Some(RememberedTransportLimits::default_missing()));
-                if let Some((msg, _)) =
-                    mint_new_session_ticket(&key, &rms, max_early, alpn, remembered)
-                {
+                if let Some((msg, _)) = mint_new_session_ticket(
+                    &key,
+                    &rms,
+                    max_early,
+                    alpn,
+                    remembered,
+                    self.config.mode == HandshakeMode::Dtls,
+                ) {
                     // NST is post-handshake: do not add to the handshake transcript used
                     // for Finished; emit as raw CRYPTO only.
                     let wire = msg.encode();
@@ -1343,6 +1525,14 @@ impl<S: TlsEventSink> HandshakeEvents for EngineCodecBridge<'_, S> {
 
     fn psk_selected_identity(&mut self, index: u16) {
         self.collector.psk_selected_identity(index);
+    }
+
+    fn hello_retry_request(&mut self) {
+        self.collector.hello_retry_request();
+    }
+
+    fn cookie(&mut self, data: &[u8]) {
+        self.collector.cookie(data);
     }
 
     fn new_session_ticket(
@@ -2204,6 +2394,8 @@ mod tests {
             transport_parameters: None,
             early_data: false,
             psk: None,
+            cookie: None,
+            legacy_version: 0x0303,
         });
         let wire = hello.encode();
         let mut input = wire.as_ref();
@@ -2242,6 +2434,8 @@ mod tests {
             transport_parameters: None,
             early_data: false,
             psk: None,
+            cookie: None,
+            legacy_version: 0x0303,
         });
         let wire = hello.encode();
         let mut input = wire.as_ref();
@@ -2254,4 +2448,130 @@ mod tests {
         );
     }
 
+    /// Full HelloRetryRequest round trip (RFC 8446 §4.1.4): the client
+    /// offers a hybrid key share (its top preference), the server only
+    /// accepts classical X25519, so the server's mutual-group selection
+    /// disagrees with the client's single offered key_share — the server
+    /// sends HRR instead of failing, the client regenerates its key share
+    /// for X25519 and resends ClientHello, and the handshake completes
+    /// normally from there. If the RFC 8446 §4.4.1 transcript substitution
+    /// (`message_hash(Hash(CH1)) || HRR || CH2 || …`) were wrong on either
+    /// side, the Finished MAC check inside `client_send_finished` /
+    /// `on_client_finished` would fail and `is_complete()` would be false —
+    /// so this test exercises that transcript handling directly, not just
+    /// the retry message exchange.
+    #[test]
+    fn hello_retry_request_round_trip_on_key_share_group_mismatch() {
+        use crate::crypto::kx::NamedGroup;
+        let creds = test_server_credentials();
+        let server_cfg = server_config_for(creds.clone(), KxPolicy::classical_only());
+        let client_cfg = client_config_with_trust(&creds, KxPolicy::default(), None);
+
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+
+        client.start(&mut sink); // CH1: hybrid key_share
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink); // -> HelloRetryRequest (wants X25519)
+        assert!(
+            !sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "server must retry, not fail, on a recoverable group mismatch: {:?}",
+            sink.events
+        );
+        assert!(!client.is_complete());
+        assert!(!server.is_complete());
+
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink); // -> CH2: X25519 key_share
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink); // -> ServerHello..Finished
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink); // client completes, -> client Finished
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink); // server completes
+
+        assert!(client.is_complete(), "client: {:?}", sink.events);
+        assert!(server.is_complete(), "server: {:?}", sink.events);
+        assert_eq!(sink.negotiated_group, Some(NamedGroup::X25519.code()));
+    }
+
+    /// RFC 8446 §4.1.4 forbids a server sending a second `HelloRetryRequest`
+    /// — a client that receives one anyway must fail the handshake, not
+    /// loop retrying forever.
+    #[test]
+    fn second_hello_retry_request_is_rejected() {
+        use crate::crypto::kx::NamedGroup;
+        let creds = test_server_credentials();
+        let client_cfg = client_config_with_trust(&creds, KxPolicy::default(), None);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+
+        client.start(&mut sink); // CH1
+        take_outbound(&mut sink);
+
+        let hrr = build_hello_retry_request(&[], AES_128_GCM_SHA256, NamedGroup::X25519.code(), None, 0x0303).encode();
+        let mut input = hrr.as_ref();
+        client.feed_handshake_data(&mut input, &mut sink);
+        assert!(
+            !sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "first HelloRetryRequest must be accepted: {:?}",
+            sink.events
+        );
+        take_outbound(&mut sink);
+
+        let hrr2 = build_hello_retry_request(&[], AES_128_GCM_SHA256, NamedGroup::X25519.code(), None, 0x0303).encode();
+        let mut input2 = hrr2.as_ref();
+        client.feed_handshake_data(&mut input2, &mut sink);
+        assert!(
+            sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "a second HelloRetryRequest must be rejected: {:?}",
+            sink.events
+        );
+    }
+
+    /// `HandshakeMode::Dtls` end to end at the raw handshake-message level
+    /// (below any record/reassembly layer — Phase 6's `hopf-core::dtls`
+    /// module, not yet built, is what will actually feed reassembled bytes
+    /// in through this same `feed_handshake_data` boundary; this test
+    /// exercises exactly that boundary directly, the same way `run_loopback`
+    /// does for TLS). Confirms `legacy_version` is `0xfefd` on the wire
+    /// (RFC 9147 §5.3), `SecurityInfo::protocol` reports `"DTLSv1.3"`, and
+    /// the handshake — including transcript hash / Finished verification —
+    /// completes correctly with the DTLS `legacy_cookie` field present.
+    #[test]
+    fn dtls_mode_handshake_completes_with_correct_legacy_version_and_protocol_name() {
+        let creds = test_server_credentials();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let client_cfg = HandshakeConfig {
+            role: HandshakeRole::Client,
+            mode: HandshakeMode::Dtls,
+            alpn: vec![Bytes::from_static(b"h3")],
+            server_name: Some("localhost".into()),
+            server: None,
+            kx_policy: KxPolicy::classical_only(),
+            trust_store: Some(trust),
+            ..Default::default()
+        };
+        let server_cfg = HandshakeConfig {
+            role: HandshakeRole::Server,
+            mode: HandshakeMode::Dtls,
+            alpn: vec![Bytes::from_static(b"h3")],
+            server: Some(creds),
+            kx_policy: KxPolicy::classical_only(),
+            ..Default::default()
+        };
+
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+
+        client.start(&mut sink);
+        let ch1 = sink.outbound.first().expect("ClientHello emitted").clone();
+        assert_eq!(&ch1[4..6], &0xfefdu16.to_be_bytes(), "DTLS legacy_version on the wire");
+
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+
+        assert!(client.is_complete(), "client: {:?}", sink.events);
+        assert!(server.is_complete(), "server: {:?}", sink.events);
+        assert_eq!(sink.info.as_ref().and_then(|i| i.protocol()), Some("DTLSv1.3"));
+    }
 }

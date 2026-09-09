@@ -35,6 +35,15 @@ impl HandshakeType {
     }
 }
 
+/// The fixed `ServerHello.random` value that marks a message as a
+/// `HelloRetryRequest` rather than a real `ServerHello` (RFC 8446 §4.1.3) —
+/// `SHA-256("HelloRetryRequest")`. Wire-identical to `ServerHello`
+/// (handshake type 2); this is the only thing that distinguishes them.
+pub const HELLO_RETRY_REQUEST_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
 /// One TLS handshake message (type + body, without the 4-byte header).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandshakeMessage {
@@ -78,6 +87,9 @@ pub mod ext {
     pub const PSK_KEY_EXCHANGE_MODES: u16 = 45;
     /// Signature Algorithms (RFC 8446 §4.2.3) — MUST be sent in ClientHello.
     pub const SIGNATURE_ALGORITHMS: u16 = 13;
+    /// Cookie (RFC 8446 §4.2.2) — carried in `HelloRetryRequest`, echoed
+    /// verbatim by the client in its followup ClientHello.
+    pub const COOKIE: u16 = 44;
 }
 
 /// `psk_dhe_ke` (RFC 8446 §4.2.9).
@@ -125,6 +137,14 @@ pub struct ClientHelloParams {
     pub early_data: bool,
     /// Optional single PSK offer (implies psk_key_exchange_modes).
     pub psk: Option<OfferedPsk>,
+    /// Cookie echoed back verbatim after a `HelloRetryRequest` carried one
+    /// (RFC 8446 §4.2.2) — `None` on an initial ClientHello.
+    pub cookie: Option<Bytes>,
+    /// `legacy_version` wire field — `0x0303` for TLS (RFC 8446 §4.1.2),
+    /// `0xfefd` for DTLS 1.3 (RFC 9147 §5.3, reusing DTLS 1.2's wire value
+    /// for backward-compat framing). The real version is always negotiated
+    /// via `supported_versions`, identical on both transports.
+    pub legacy_version: u16,
 }
 
 /// Build a TLS 1.3 `ClientHello`.
@@ -175,9 +195,19 @@ fn build_client_hello_inner(
     include_binders: bool,
 ) -> (HandshakeMessage, Option<Bytes>) {
     let mut body = BytesMut::new();
-    body.extend_from_slice(&0x0303u16.to_be_bytes());
+    body.extend_from_slice(&params.legacy_version.to_be_bytes());
     body.extend_from_slice(&params.random);
     body.extend_from_slice(&[0]);
+    // DTLS's ClientHello has one more fixed-position field TLS's doesn't:
+    // `opaque legacy_cookie<0..255>`, right after `legacy_session_id`
+    // (RFC 9147 §5.3) — always empty for DTLS 1.3, whose own cookie
+    // exchange uses the `cookie` extension (RFC 8446 §4.2.2) instead, same
+    // as TLS 1.3's HelloRetryRequest. `legacy_version` is the wire's own
+    // discriminator for which shape follows, so no separate mode flag is
+    // threaded through just for this.
+    if params.legacy_version == 0xfefd {
+        body.extend_from_slice(&[0]);
+    }
     body.extend_from_slice(&((params.cipher_suites.len() * 2) as u16).to_be_bytes());
     for suite in &params.cipher_suites {
         body.extend_from_slice(&suite.to_be_bytes());
@@ -228,6 +258,9 @@ fn build_client_hello_inner(
     }
     if params.psk.is_some() {
         push_extension(&mut extensions, ext::PSK_KEY_EXCHANGE_MODES, &[1, PSK_DHE_KE]);
+    }
+    if let Some(cookie) = &params.cookie {
+        push_extension(&mut extensions, ext::COOKIE, cookie);
     }
 
     let mut truncated_wire = None;
@@ -304,12 +337,21 @@ pub fn build_server_hello(
     cipher_suite: u16,
     group: u16,
     key_share: &[u8],
+    legacy_version: u16,
 ) -> HandshakeMessage {
-    build_server_hello_ext(random, legacy_session_id_echo, cipher_suite, group, key_share, None)
+    build_server_hello_ext(
+        random,
+        legacy_session_id_echo,
+        cipher_suite,
+        group,
+        key_share,
+        None,
+        legacy_version,
+    )
 }
 
 /// ServerHello with optional selected PSK identity index. See [`build_server_hello`] for
-/// `legacy_session_id_echo`.
+/// `legacy_session_id_echo` and `legacy_version`.
 pub fn build_server_hello_ext(
     random: &[u8; 32],
     legacy_session_id_echo: &[u8],
@@ -317,9 +359,10 @@ pub fn build_server_hello_ext(
     group: u16,
     key_share: &[u8],
     selected_identity: Option<u16>,
+    legacy_version: u16,
 ) -> HandshakeMessage {
     let mut body = BytesMut::new();
-    body.extend_from_slice(&0x0303u16.to_be_bytes());
+    body.extend_from_slice(&legacy_version.to_be_bytes());
     body.extend_from_slice(random);
     body.extend_from_slice(&[legacy_session_id_echo.len() as u8]);
     body.extend_from_slice(legacy_session_id_echo);
@@ -335,6 +378,44 @@ pub fn build_server_hello_ext(
     push_extension(&mut extensions, ext::KEY_SHARE, &ks);
     if let Some(idx) = selected_identity {
         push_extension(&mut extensions, ext::PRE_SHARED_KEY, &idx.to_be_bytes());
+    }
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    HandshakeMessage {
+        msg_type: HandshakeType::ServerHello,
+        body: body.freeze(),
+    }
+}
+
+/// Build a `HelloRetryRequest` (RFC 8446 §4.1.4) — wire-identical to
+/// `ServerHello` (same handshake type, 2) but with `random` fixed to
+/// [`HELLO_RETRY_REQUEST_RANDOM`] and a `key_share` extension carrying only
+/// the requested `selected_group` (RFC 8446 §4.2.8's
+/// `KeyShareHelloRetryRequest` — no key bytes, unlike a real `ServerHello`'s
+/// `key_share`). `legacy_session_id_echo` follows the same rule as
+/// [`build_server_hello_ext`]. `cookie`, when set, is echoed verbatim by the
+/// client in its followup ClientHello.
+pub fn build_hello_retry_request(
+    legacy_session_id_echo: &[u8],
+    cipher_suite: u16,
+    selected_group: u16,
+    cookie: Option<&[u8]>,
+    legacy_version: u16,
+) -> HandshakeMessage {
+    let mut body = BytesMut::new();
+    body.extend_from_slice(&legacy_version.to_be_bytes());
+    body.extend_from_slice(&HELLO_RETRY_REQUEST_RANDOM);
+    body.extend_from_slice(&[legacy_session_id_echo.len() as u8]);
+    body.extend_from_slice(legacy_session_id_echo);
+    body.extend_from_slice(&cipher_suite.to_be_bytes());
+    body.extend_from_slice(&[0]);
+
+    let mut extensions = BytesMut::new();
+    push_extension(&mut extensions, ext::SUPPORTED_VERSIONS, &[0x03, 0x04]);
+    push_extension(&mut extensions, ext::KEY_SHARE, &selected_group.to_be_bytes());
+    if let Some(cookie) = cookie {
+        push_extension(&mut extensions, ext::COOKIE, cookie);
     }
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
@@ -542,9 +623,47 @@ mod tests {
             transport_parameters: None,
             early_data: false,
             psk: None,
+            cookie: None,
+            legacy_version: 0x0303,
         });
         let parsed = parse_client_hello(&hello.body).expect("parse client hello");
         assert!(parsed.peer_key_share.is_some());
         assert_eq!(parsed.key_share_group, Some(NamedGroup::X25519.code()));
+    }
+
+    /// DTLS's ClientHello (`legacy_version = 0xfefd`) carries one extra
+    /// fixed-position field — `legacy_cookie` — right after
+    /// `legacy_session_id`, which TLS's ClientHello doesn't have at all.
+    /// Proves the writer emits it and the reader correctly skips it so
+    /// every field after it (cipher_suites, key_share, …) still lands at
+    /// the right offset — the one place `messages.rs`/`parser.rs` are
+    /// mode-aware at all; everything else is transport-agnostic.
+    #[test]
+    fn dtls_client_hello_carries_and_skips_legacy_cookie_field() {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [2u8; 32],
+            cipher_suites: vec![0x1301, 0x1303],
+            key_share: KeyShareEntry {
+                group: NamedGroup::X25519.code(),
+                share: Bytes::copy_from_slice(&kp.public_key()),
+            },
+            supported_groups: vec![NamedGroup::X25519.code()],
+            alpn: vec![],
+            server_name: None,
+            transport_parameters: None,
+            early_data: false,
+            psk: None,
+            cookie: None,
+            legacy_version: 0xfefd,
+        });
+        // legacy_version(2) + random(32) + session_id_len(1)=0 +
+        // legacy_cookie_len(1)=0: byte 35 is the cookie length prefix.
+        assert_eq!(hello.body[35], 0, "empty legacy_cookie field present");
+        let parsed = parse_client_hello(&hello.body).expect("parse DTLS-shaped client hello");
+        assert!(parsed.peer_key_share.is_some());
+        assert_eq!(parsed.key_share_group, Some(NamedGroup::X25519.code()));
+        assert_eq!(parsed.cipher_suites, vec![0x1301, 0x1303]);
     }
 }
