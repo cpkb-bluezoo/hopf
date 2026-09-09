@@ -11,8 +11,13 @@
 //! retransmission ([`retransmit`]).
 
 mod engine;
-mod reassembly;
-mod record;
-mod retransmit;
+// `pub(crate)`, not private: `hopf-core::dtls12` (DTLS 1.2) reuses
+// `reassembly::Reassembler`, `retransmit::RetransmitState`, and
+// `record::ReplayWindow` directly — none of the three have any
+// TLS-version awareness, so there's nothing DTLS-1.3-specific to
+// duplicate. See `dtls12`'s own module doc.
+pub(crate) mod reassembly;
+pub(crate) mod record;
+pub(crate) mod retransmit;
 
 pub use engine::{DtlsRecordEngine, DtlsRecordSink, NopDtlsRecordSink};

@@ -22,6 +22,7 @@ pub mod composition;
 pub mod connector;
 pub mod crypto;
 pub mod dtls;
+pub mod dtls12;
 pub mod endpoint;
 pub mod error;
 pub mod handle;

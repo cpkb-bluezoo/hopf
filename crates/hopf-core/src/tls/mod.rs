@@ -11,7 +11,13 @@ mod handshake;
 mod pem;
 mod record;
 mod sink;
-mod tls12;
+// `pub(crate)`, not private: `hopf-core::dtls12` (DTLS 1.2) wraps
+// `tls12::engine::Tls12Engine` directly, the same way `hopf-core::dtls`
+// wraps `engine::HandshakeEngine` (TLS 1.3) — needs `tls12::engine`'s
+// `CipherKind`/`DirectionalKeyMaterial`/`Tls12EventSink`/`Tls12Engine`
+// reachable via the full path, none of which `tls/mod.rs`'s own `pub use`
+// list re-exports today.
+pub(crate) mod tls12;
 
 pub use engine::{
     ClientAuthPolicy, HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, ServerCredentials,

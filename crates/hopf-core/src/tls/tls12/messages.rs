@@ -19,6 +19,9 @@ pub enum MessageType {
     ClientHello = 1,
     /// ServerHello.
     ServerHello = 2,
+    /// HelloVerifyRequest (RFC 6347 §4.2.1 — DTLS 1.2 stateless-cookie
+    /// anti-amplification retry; no TCP TLS 1.2 equivalent).
+    HelloVerifyRequest = 3,
     /// Certificate.
     Certificate = 11,
     /// ServerKeyExchange.
@@ -43,6 +46,7 @@ impl MessageType {
         match b {
             1 => Some(Self::ClientHello),
             2 => Some(Self::ServerHello),
+            3 => Some(Self::HelloVerifyRequest),
             4 => Some(Self::NewSessionTicket),
             11 => Some(Self::Certificate),
             12 => Some(Self::ServerKeyExchange),
@@ -125,15 +129,31 @@ pub struct ClientHelloParams<'a> {
     /// `Some(ticket_bytes)` attempts resumption with a cached ticket (RFC
     /// 5077 §3.2/§3.4).
     pub session_ticket: Option<&'a [u8]>,
+    /// `legacy_version` wire field — `0x0303` for TCP TLS 1.2, `0xfefd` for
+    /// DTLS 1.2 (RFC 6347 §4.1, the *real*, not legacy, protocol version —
+    /// DTLS 1.2 predates TLS 1.3's extension-based version negotiation).
+    pub legacy_version: u16,
+    /// `legacy_cookie` (RFC 6347 §4.2.1) — empty on a DTLS `ClientHello1`;
+    /// the server's cookie, echoed verbatim, on `ClientHello2`. TCP TLS 1.2
+    /// has no such field at all; callers there always pass `&[]`, and
+    /// [`Self::legacy_version`] being `0x0303` means it's never written.
+    pub cookie: &'a [u8],
 }
 
 /// Build a TLS 1.2 `ClientHello`.
 pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
     let mut body = BytesMut::new();
-    body.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy_version: TLS 1.2
+    body.extend_from_slice(&params.legacy_version.to_be_bytes());
     body.extend_from_slice(&params.random);
     body.extend_from_slice(&[params.session_id.len() as u8]);
     body.extend_from_slice(params.session_id);
+    // DTLS's ClientHello has one more fixed-position field TLS's doesn't —
+    // see the matching comment in `tls/handshake/messages.rs`'s
+    // `build_client_hello_inner` for the identical TLS-1.3-side change.
+    if params.legacy_version == 0xfefd {
+        body.extend_from_slice(&[params.cookie.len() as u8]);
+        body.extend_from_slice(params.cookie);
+    }
     body.extend_from_slice(&((params.cipher_suites.len() * 2) as u16).to_be_bytes());
     for cs in params.cipher_suites {
         body.extend_from_slice(&cs.to_be_bytes());
@@ -212,6 +232,11 @@ pub struct ParsedClientHello {
     /// `SessionTicket` extension contents, if the client sent one: empty
     /// bytes means "support, no ticket"; non-empty is a resumption attempt.
     pub session_ticket: Option<Bytes>,
+    /// `legacy_cookie` (RFC 6347 §4.2.1) — empty unless this is a DTLS
+    /// `ClientHello2` echoing a `HelloVerifyRequest` cookie. Always empty
+    /// when parsing a TCP TLS 1.2 `ClientHello` (`legacy_version` `0x0303`
+    /// never carries this field at all — see [`ClientHelloParams::cookie`]).
+    pub cookie: Bytes,
 }
 
 /// Parse a `ClientHello` body.
@@ -219,7 +244,8 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
     if body.len() < 2 + 32 + 1 {
         return None;
     }
-    let mut i = 2; // skip legacy_version
+    let legacy_version = u16::from_be_bytes([body[0], body[1]]);
+    let mut i = 2;
     let mut random = [0u8; 32];
     random.copy_from_slice(&body[i..i + 32]);
     i += 32;
@@ -230,6 +256,16 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
     }
     let session_id = Bytes::copy_from_slice(&body[i..i + sid_len]);
     i += sid_len;
+    let mut cookie = Bytes::new();
+    if legacy_version == 0xfefd {
+        let cookie_len = *body.get(i)? as usize;
+        i += 1;
+        if body.len() < i + cookie_len + 2 {
+            return None;
+        }
+        cookie = Bytes::copy_from_slice(&body[i..i + cookie_len]);
+        i += cookie_len;
+    }
     let cs_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
     i += 2;
     if body.len() < i + cs_len + 1 {
@@ -301,6 +337,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
         signature_algorithms,
         server_name,
         session_ticket,
+        cookie,
     })
 }
 
@@ -310,9 +347,15 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
 /// handshake; without it, a spec-conformant client (verified against
 /// `rustls`) treats an unadvertised `NewSessionTicket` as a protocol
 /// violation (it's waiting for `ChangeCipherSpec` at that point instead).
-pub fn build_server_hello(random: &[u8; 32], session_id: &[u8], cipher_suite: u16, session_ticket: bool) -> Bytes {
+pub fn build_server_hello(
+    random: &[u8; 32],
+    session_id: &[u8],
+    cipher_suite: u16,
+    session_ticket: bool,
+    legacy_version: u16,
+) -> Bytes {
     let mut body = BytesMut::new();
-    body.extend_from_slice(&0x0303u16.to_be_bytes());
+    body.extend_from_slice(&legacy_version.to_be_bytes());
     body.extend_from_slice(random);
     body.extend_from_slice(&[session_id.len() as u8]);
     body.extend_from_slice(session_id);
@@ -388,6 +431,31 @@ pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
     }
 
     Some(ParsedServerHello { random, session_id, cipher_suite, session_ticket_offered })
+}
+
+/// Build a `HelloVerifyRequest` (RFC 6347 §4.2.1) — DTLS 1.2's stateless
+/// anti-amplification retry; no TCP TLS 1.2 equivalent (this message type
+/// is undefined there). `server_version` is conventionally the same
+/// `0xfefd` used elsewhere, though RFC 6347 doesn't require it to match
+/// what the eventual negotiated version turns out to be.
+pub fn build_hello_verify_request(server_version: u16, cookie: &[u8]) -> Bytes {
+    let mut body = BytesMut::with_capacity(2 + 1 + cookie.len());
+    body.extend_from_slice(&server_version.to_be_bytes());
+    body.extend_from_slice(&[cookie.len() as u8]);
+    body.extend_from_slice(cookie);
+    encode_message(MessageType::HelloVerifyRequest, &body)
+}
+
+/// Parse a `HelloVerifyRequest` body into its cookie.
+pub fn parse_hello_verify_request(body: &[u8]) -> Option<Bytes> {
+    if body.len() < 3 {
+        return None;
+    }
+    let cookie_len = body[2] as usize;
+    if body.len() < 3 + cookie_len {
+        return None;
+    }
+    Some(Bytes::copy_from_slice(&body[3..3 + cookie_len]))
 }
 
 /// Build a `Certificate` message (RFC 5246 §7.4.2 — no per-entry extensions,
@@ -632,6 +700,8 @@ mod tests {
             cipher_suites: &[0xC02F, 0xC030],
             server_name: Some("example.test"),
             session_ticket: None,
+            legacy_version: 0x0303,
+            cookie: &[],
         };
         let wire = build_client_hello(&params);
         // 1-byte type + 3-byte length header.
@@ -644,9 +714,40 @@ mod tests {
         assert!(parsed.signature_algorithms.contains(&(sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA)));
     }
 
+    /// DTLS's `ClientHello` (`legacy_version = 0xfefd`) carries one extra
+    /// fixed-position field — `legacy_cookie` — right after `session_id`,
+    /// which TCP TLS 1.2's `ClientHello` doesn't have at all. Proves the
+    /// writer emits it and the reader correctly recovers it (and still
+    /// lands on the right offset for everything after it) — mirrors the
+    /// equivalent TLS-1.3-side test in `tls/handshake/messages.rs`.
+    #[test]
+    fn dtls_client_hello_carries_cookie_field() {
+        let params = ClientHelloParams {
+            random: [3u8; 32],
+            session_id: &[],
+            cipher_suites: &[0xC02F, 0xC030],
+            server_name: None,
+            session_ticket: None,
+            legacy_version: 0xfefd,
+            cookie: b"a-server-issued-cookie",
+        };
+        let wire = build_client_hello(&params);
+        let parsed = parse_client_hello(&wire[4..]).expect("parse DTLS-shaped client hello");
+        assert_eq!(parsed.cookie.as_ref(), b"a-server-issued-cookie");
+        assert_eq!(parsed.cipher_suites, vec![0xC02F, 0xC030]);
+    }
+
+    #[test]
+    fn hello_verify_request_round_trips_cookie() {
+        let wire = build_hello_verify_request(0xfefd, b"stateless-cookie-bytes");
+        assert_eq!(wire[0], MessageType::HelloVerifyRequest as u8);
+        let cookie = parse_hello_verify_request(&wire[4..]).expect("parse");
+        assert_eq!(cookie.as_ref(), b"stateless-cookie-bytes");
+    }
+
     #[test]
     fn server_hello_round_trip() {
-        let wire = build_server_hello(&[9u8; 32], &[1, 2, 3], 0xC02F, false);
+        let wire = build_server_hello(&[9u8; 32], &[1, 2, 3], 0xC02F, false, 0x0303);
         let parsed = parse_server_hello(&wire[4..]).expect("parse");
         assert_eq!(parsed.random, [9u8; 32]);
         assert_eq!(parsed.session_id.as_ref(), &[1, 2, 3]);
@@ -661,7 +762,7 @@ mod tests {
         // extension here — a real `rustls` client rejects an unadvertised
         // one as a protocol violation (it's waiting for `ChangeCipherSpec`
         // at that point instead), so this bit has to round-trip exactly.
-        let wire = build_server_hello(&[9u8; 32], &[], 0xC02F, true);
+        let wire = build_server_hello(&[9u8; 32], &[], 0xC02F, true, 0x0303);
         let parsed = parse_server_hello(&wire[4..]).expect("parse");
         assert!(parsed.session_ticket_offered);
     }
@@ -704,6 +805,9 @@ mod tests {
             cipher_suites: &[0xC02F],
             server_name: None,
             session_ticket: Some(b"opaque-ticket-bytes"),
+       
+            legacy_version: 0x0303,
+            cookie: &[],
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse");
@@ -719,6 +823,9 @@ mod tests {
             cipher_suites: &[0xC02F],
             server_name: None,
             session_ticket: Some(&[]),
+       
+            legacy_version: 0x0303,
+            cookie: &[],
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse");
@@ -733,6 +840,9 @@ mod tests {
             cipher_suites: &[0xC02F],
             server_name: None,
             session_ticket: None,
+       
+            legacy_version: 0x0303,
+            cookie: &[],
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse");

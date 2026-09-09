@@ -173,6 +173,49 @@ pub struct Config {
     /// certificate list (RFC 5246 §7.4.6 permits this) — the handshake
     /// still proceeds unless the server enforces [`ClientAuthPolicy::Require`].
     pub client_credentials: Option<ServerCredentials>,
+    /// Whether this handshake runs over DTLS 1.2 (RFC 6347) rather than TCP
+    /// TLS 1.2 — drives `legacy_version` (`0xfefd` vs `0x0303`) and the
+    /// completed `SecurityInfo.protocol` string. The DTLS `ClientHello1` →
+    /// `HelloVerifyRequest` → `ClientHello2` cookie round trip itself
+    /// happens entirely in `hopf-core::dtls12`, outside this engine — RFC
+    /// 6347 §4.2.1 excludes the cookie-less first exchange from the
+    /// transcript hash, so this engine only ever sees `ClientHello2`, which
+    /// it treats exactly as it already treats a TCP `ClientHello` (the one
+    /// and only one).
+    pub dtls: bool,
+    /// Client role only: the cookie to embed in the one `ClientHello` this
+    /// engine builds (RFC 6347 §4.2.1) — empty for TCP TLS 1.2, for a
+    /// DTLS 1.2 handshake with cookie verification turned off, or for the
+    /// standalone `ClientHello1` probe `hopf-core::dtls12` builds itself
+    /// (outside this engine, since it's discarded from the transcript
+    /// regardless — see this struct's `dtls` doc). Set to the server's
+    /// echoed `HelloVerifyRequest` cookie when `dtls12` constructs *this*
+    /// engine to build the real `ClientHello2`.
+    pub cookie: Bytes,
+    /// Client role only: use this exact `ClientHello.random` instead of
+    /// generating a fresh one. `hopf-core::dtls12` needs `ClientHello2` to
+    /// reuse `ClientHello1`'s random — its stateless cookie is
+    /// `HMAC(secret, ClientHello.random)` (RFC 6347 §4.2.1's suggested
+    /// construction), computed once against `ClientHello1` and only ever
+    /// re-validated by recomputing the same HMAC when `ClientHello2`
+    /// arrives; a different random would make a legitimately-echoed cookie
+    /// fail to validate. `None` (the default, and TCP TLS 1.2's only mode)
+    /// generates a fresh random as before.
+    pub fixed_client_random: Option<[u8; 32]>,
+    /// DTLS role only: starting values for [`Self::hash_message`]'s
+    /// per-direction `message_seq` counters — nonzero exactly when
+    /// `hopf-core::dtls12` is constructing the engine that builds/receives
+    /// the real `ClientHello2` flight *after* a `HelloVerifyRequest` round
+    /// trip. Even though `ClientHello1`/`HelloVerifyRequest` are excluded
+    /// from the transcript *content*, RFC 6347's wire `message_seq` counter
+    /// is **not** reset by a cookie retry (confirmed against RFC 6347
+    /// §4.2.2's own worked example: `ClientHello2` is wire `message_seq =
+    /// 1`, continuing from `ClientHello1`'s `0`) — so the hash still needs
+    /// to start counting from wherever the real wire numbering left off,
+    /// not from 0. `(0, 0)` (both TCP TLS 1.2's only value, and DTLS with
+    /// no cookie round trip) leaves [`Self::hash_message`]'s behaviour
+    /// unchanged from a plain fresh count.
+    pub dtls_initial_seq: (u16, u16),
 }
 
 impl Default for Config {
@@ -187,6 +230,10 @@ impl Default for Config {
             client_auth: ClientAuthPolicy::None,
             client_trust_store: None,
             client_credentials: None,
+            dtls: false,
+            cookie: Bytes::new(),
+            fixed_client_random: None,
+            dtls_initial_seq: (0, 0),
         }
     }
 }
@@ -375,11 +422,19 @@ pub struct Tls12Engine {
     /// Server role: the client's `Certificate` (already processed) had at
     /// least one entry — only then is `CertificateVerify` expected.
     expect_client_certificate_verify: bool,
+    /// DTLS role only (`config.dtls`): independent per-direction
+    /// `message_seq` counters, incremented once per logical handshake
+    /// message — see [`Self::hash_message`] for why this engine needs its
+    /// own copy of a number `hopf-core::dtls12`'s `Reassembler` already
+    /// tracks, rather than being told it externally.
+    dtls_tx_seq: u16,
+    dtls_rx_seq: u16,
 }
 
 impl Tls12Engine {
     /// Create an engine; call [`Self::start`] to emit the first flight (client).
     pub fn new(config: Config) -> Self {
+        let (dtls_tx_seq, dtls_rx_seq) = config.dtls_initial_seq;
         Self {
             config,
             state: State::Initial,
@@ -404,7 +459,55 @@ impl Tls12Engine {
             expect_new_session_ticket: false,
             client_cert_requested: false,
             expect_client_certificate_verify: false,
+            dtls_tx_seq,
+            dtls_rx_seq,
         }
+    }
+
+    /// Add one handshake message's bytes to the transcript hash. `wire` is
+    /// always the TLS-shaped `{type(1), length(3), body}` form this
+    /// engine's own message builders/parsers use — for TCP TLS 1.2
+    /// (`!self.config.dtls`) that's exactly what RFC 5246 hashes too, so
+    /// it's added unchanged. For DTLS 1.2, RFC 6347 §4.2.6 requires the
+    /// *DTLS*-shaped 12-byte header instead — `{type(1), length(3),
+    /// message_seq(2), fragment_offset(3)=0, fragment_length(3)=length}` —
+    /// *"Hash calculations include entire handshake messages, including
+    /// DTLS-specific fields: message_seq, fragment_offset, and
+    /// fragment_length. However, in order to remove sensitivity to
+    /// handshake message fragmentation, the Finished MAC MUST be computed
+    /// as if each handshake message had been sent as a single fragment"* —
+    /// i.e. `fragment_offset` is always 0 and `fragment_length` always
+    /// equals the message's own total `length` here, regardless of how
+    /// `hopf-core::dtls12` actually fragmented it on the wire. This is the
+    /// opposite of DTLS 1.3's rule (RFC 9147 §5.2 excludes these fields
+    /// entirely) — confirmed against real OpenSSL interop, not assumed by
+    /// analogy (an earlier version of this code got that wrong).
+    fn hash_message(&mut self, wire: &[u8], outgoing: bool) {
+        if !self.config.dtls {
+            self.transcript.add_message(wire);
+            return;
+        }
+        debug_assert!(wire.len() >= 4, "wire form always has the 4-byte {{type,length}} header");
+        let msg_type = wire[0];
+        let length = &wire[1..4];
+        let body = &wire[4..];
+        let seq = if outgoing {
+            let s = self.dtls_tx_seq;
+            self.dtls_tx_seq = self.dtls_tx_seq.wrapping_add(1);
+            s
+        } else {
+            let s = self.dtls_rx_seq;
+            self.dtls_rx_seq = self.dtls_rx_seq.wrapping_add(1);
+            s
+        };
+        let mut dtls_wire = BytesMut::with_capacity(12 + body.len());
+        dtls_wire.extend_from_slice(&[msg_type]);
+        dtls_wire.extend_from_slice(length);
+        dtls_wire.extend_from_slice(&seq.to_be_bytes());
+        dtls_wire.extend_from_slice(&[0, 0, 0]);
+        dtls_wire.extend_from_slice(length);
+        dtls_wire.extend_from_slice(body);
+        self.transcript.add_message(&dtls_wire);
     }
 
     /// Begin the handshake — client emits `ClientHello`; server waits for input.
@@ -417,8 +520,13 @@ impl Tls12Engine {
                 return;
             }
         }
-        let mut random = [0u8; 32];
-        let _ = getrandom::getrandom(&mut random);
+        let random = if let Some(fixed) = self.config.fixed_client_random {
+            fixed
+        } else {
+            let mut r = [0u8; 32];
+            let _ = getrandom::getrandom(&mut r);
+            r
+        };
         self.client_random = random;
 
         let mut session_id = Bytes::new();
@@ -442,6 +550,8 @@ impl Tls12Engine {
             cipher_suites: SUPPORTED_CIPHER_SUITES,
             server_name: self.config.server_name.as_deref(),
             session_ticket: ticket_offer.as_deref(),
+            legacy_version: if self.config.dtls { 0xfefd } else { 0x0303 },
+            cookie: &self.config.cookie,
         };
         let wire = messages::build_client_hello(&params);
         self.emit(&wire, sink);
@@ -541,7 +651,7 @@ impl Tls12Engine {
     }
 
     fn emit<S: Tls12EventSink>(&mut self, wire: &[u8], sink: &mut S) {
-        self.transcript.add_message(wire);
+        self.hash_message(wire, true);
         sink.handshake_data_ready(wire);
     }
 
@@ -561,7 +671,7 @@ impl Tls12Engine {
         self.prf_hash = Some(prf_hash);
         self.server_random = sh.random;
         self.expect_new_session_ticket = sh.session_ticket_offered;
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
 
         let resuming = !self.sent_session_id.is_empty() && sh.session_id == self.sent_session_id;
         if resuming {
@@ -593,7 +703,7 @@ impl Tls12Engine {
             self.fail(sink, "server Finished verify failed (resumed handshake)");
             return false;
         }
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
 
         sink.send_change_cipher_spec();
         let vd = self.finished_verify_data(true);
@@ -628,7 +738,7 @@ impl Tls12Engine {
                 );
             }
         }
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
         true
     }
 
@@ -637,7 +747,7 @@ impl Tls12Engine {
             self.fail(sink, "malformed Certificate");
             return false;
         };
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
         self.peer_certs = certs;
         self.verify_id += 1;
         self.verify_pending = true;
@@ -678,7 +788,7 @@ impl Tls12Engine {
             return false;
         }
         self.peer_ec_point = Some(ske.ec_point);
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
         self.state = State::ExpectServerHelloDoneOrCertRequest;
         true
     }
@@ -688,14 +798,14 @@ impl Tls12Engine {
             self.fail(sink, "malformed CertificateRequest");
             return false;
         }
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
         self.client_cert_requested = true;
         self.state = State::ExpectServerHelloDone;
         true
     }
 
     fn on_server_hello_done<S: Tls12EventSink>(&mut self, wire: Bytes, sink: &mut S) -> bool {
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
         let Some(peer_point) = self.peer_ec_point.take() else {
             self.fail(sink, "missing server key share");
             return false;
@@ -761,7 +871,7 @@ impl Tls12Engine {
             self.fail(sink, "server Finished verify failed");
             return false;
         }
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
         self.finish(sink);
         true
     }
@@ -793,7 +903,7 @@ impl Tls12Engine {
         self.should_issue_ticket = self.config.ticket_key.is_some() && ch.session_ticket.is_some() && resume_payload.is_none();
         self.client_random = ch.random;
         self.peer_server_name = ch.server_name.clone();
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
 
         if let Some(payload) = resume_payload {
             let (kind, prf_hash, _) = cipher_info(payload.cipher_suite).expect("checked above");
@@ -807,7 +917,13 @@ impl Tls12Engine {
             self.server_random = server_random;
             // No new ticket is minted on a resumption in this implementation
             // (see this module's doc comment), so no SessionTicket echo here.
-            let sh = messages::build_server_hello(&server_random, &ch.session_id, payload.cipher_suite, false);
+            let sh = messages::build_server_hello(
+                &server_random,
+                &ch.session_id,
+                payload.cipher_suite,
+                false,
+                if self.config.dtls { 0xfefd } else { 0x0303 },
+            );
             self.emit(&sh, sink);
 
             let Some((client_keys, server_keys)) = self.compute_key_material() else {
@@ -837,7 +953,13 @@ impl Tls12Engine {
         let mut server_random = [0u8; 32];
         let _ = getrandom::getrandom(&mut server_random);
         self.server_random = server_random;
-        let sh = messages::build_server_hello(&server_random, &[], suite, self.should_issue_ticket);
+        let sh = messages::build_server_hello(
+            &server_random,
+            &[],
+            suite,
+            self.should_issue_ticket,
+            if self.config.dtls { 0xfefd } else { 0x0303 },
+        );
         self.emit(&sh, sink);
 
         let cert_refs: Vec<&[u8]> = creds.cert_chain.iter().map(|c| c.as_ref()).collect();
@@ -883,7 +1005,7 @@ impl Tls12Engine {
             self.fail(sink, "malformed Certificate");
             return false;
         };
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
         if certs.is_empty() {
             if self.config.client_auth == ClientAuthPolicy::Require {
                 self.fail(sink, "client certificate required but none presented");
@@ -920,7 +1042,7 @@ impl Tls12Engine {
             self.fail(sink, "malformed ClientKeyExchange");
             return false;
         };
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
         let Some(local) = self.local_ecdhe.take() else {
             self.fail(sink, "missing server key share");
             return false;
@@ -959,7 +1081,7 @@ impl Tls12Engine {
             self.fail(sink, "client CertificateVerify signature invalid");
             return false;
         }
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
         self.expect_client_certificate_verify = false;
         self.state = State::ExpectClientFinished;
         true
@@ -971,7 +1093,7 @@ impl Tls12Engine {
             self.fail(sink, "client Finished verify failed");
             return false;
         }
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
 
         if self.should_issue_ticket {
             if let (Some(key), Some(master_secret), Some(suite)) =
@@ -997,7 +1119,7 @@ impl Tls12Engine {
             self.fail(sink, "client Finished verify failed (resumed handshake)");
             return false;
         }
-        self.transcript.add_message(&wire);
+        self.hash_message(&wire, false);
         self.finish(sink);
         true
     }
@@ -1075,7 +1197,8 @@ impl Tls12Engine {
             Some(ECDHE_RSA_CHACHA20_POLY1305_SHA256) => "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
             _ => "unknown",
         };
-        let mut info = SecurityInfo::secure(self.negotiated_alpn.clone(), Some("TLSv1.2".to_string()), Some(suite_name.to_string()))
+        let protocol_name = if self.config.dtls { "DTLSv1.2" } else { "TLSv1.2" };
+        let mut info = SecurityInfo::secure(self.negotiated_alpn.clone(), Some(protocol_name.to_string()), Some(suite_name.to_string()))
             .with_sni(sni);
         if self.config.role == Role::Server {
             if let Some(leaf) = self.peer_certs.first() {
@@ -1607,6 +1730,10 @@ mod tests {
             client_auth: policy,
             client_trust_store: Some(trust),
             client_credentials: None,
+            dtls: false,
+            cookie: Bytes::new(),
+            fixed_client_random: None,
+            dtls_initial_seq: (0, 0),
         }
     }
 

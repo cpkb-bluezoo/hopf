@@ -160,20 +160,24 @@ impl ReadKeys {
 /// after that record has actually authenticated — recording on unauthenticated
 /// input would let an attacker poison the window with forged sequence
 /// numbers and cause a legitimate later record to be misdetected as replayed.
-struct ReplayWindow {
+/// `pub(crate)` (not just private to this module) so `hopf-core::dtls12`
+/// can reuse it directly for DTLS 1.2's anti-replay — the algorithm is
+/// version-agnostic, keyed purely on a reconstructed/on-the-wire 64-bit
+/// sequence number regardless of how that number got there.
+pub(crate) struct ReplayWindow {
     highest: Option<u64>,
     bitmap: u64,
 }
 
 impl ReplayWindow {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             highest: None,
             bitmap: 0,
         }
     }
 
-    fn check(&self, seq: u64) -> bool {
+    pub(crate) fn check(&self, seq: u64) -> bool {
         match self.highest {
             None => true,
             Some(h) if seq > h => true,
@@ -184,7 +188,7 @@ impl ReplayWindow {
         }
     }
 
-    fn record(&mut self, seq: u64) {
+    pub(crate) fn record(&mut self, seq: u64) {
         match self.highest {
             None => {
                 self.highest = Some(seq);
