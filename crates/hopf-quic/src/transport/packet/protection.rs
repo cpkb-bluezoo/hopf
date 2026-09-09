@@ -1,14 +1,17 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! RFC 9001 packet / header protection (AES-128-GCM).
+//! RFC 9001 packet / header protection — AES-128-GCM (RFC 9001 §5.3/§5.4.3,
+//! always used for Initial/Retry per spec) or ChaCha20-Poly1305 (RFC 9001
+//! §5.3/§5.4.4) for Handshake/1-RTT/0-RTT, following whichever AEAD the TLS
+//! layer negotiated ([`hopf_core::tls::Tls13Aead`]).
 
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
-use aws_lc_rs::aead::quic::{HeaderProtectionKey, AES_128};
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, CHACHA20_POLY1305};
+use aws_lc_rs::aead::quic::{HeaderProtectionKey, AES_128, CHACHA20};
 use hopf_core::crypto::{extract, quic_expand_label};
+use hopf_core::tls::Tls13Aead;
 
 use crate::transport::types::Side;
 
-const KEY_LEN: usize = 16;
 const IV_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
@@ -26,19 +29,28 @@ pub struct PacketKeys {
 }
 
 impl PacketKeys {
-    /// Derive from a 32-byte traffic secret.
-    pub fn from_secret(secret: &[u8; 32]) -> Self {
-        let key_bytes = quic_expand_label(secret, "key", &[], KEY_LEN);
+    /// Derive from a 32-byte traffic secret. `aead` selects both the packet
+    /// AEAD and its paired header-protection algorithm (RFC 9001 §5.4.3 for
+    /// AES, §5.4.4 for ChaCha20) — always [`Tls13Aead::Aes128GcmSha256`] for
+    /// Initial/Retry (RFC 9001 §5.2/§5.8 fix the algorithm regardless of
+    /// what the handshake negotiates), and whatever the handshake selected
+    /// for Handshake/0-RTT/1-RTT.
+    pub fn from_secret(aead: Tls13Aead, secret: &[u8; 32]) -> Self {
+        let key_len = aead.key_len();
+        let key_bytes = quic_expand_label(secret, "key", &[], key_len);
         let iv_bytes = quic_expand_label(secret, "iv", &[], IV_LEN);
-        let hp_bytes = quic_expand_label(secret, "hp", &[], KEY_LEN);
+        let hp_bytes = quic_expand_label(secret, "hp", &[], key_len);
         let mut iv = [0u8; IV_LEN];
         iv.copy_from_slice(iv_bytes.as_ref());
+        let (aead_alg, hp_alg): (&'static aws_lc_rs::aead::Algorithm, &'static aws_lc_rs::aead::quic::Algorithm) =
+            match aead {
+                Tls13Aead::Aes128GcmSha256 => (&AES_128_GCM, &AES_128),
+                Tls13Aead::ChaCha20Poly1305Sha256 => (&CHACHA20_POLY1305, &CHACHA20),
+            };
         Self {
-            aead: LessSafeKey::new(
-                UnboundKey::new(&AES_128_GCM, key_bytes.as_ref()).expect("AES-128-GCM key"),
-            ),
+            aead: LessSafeKey::new(UnboundKey::new(aead_alg, key_bytes.as_ref()).expect("AEAD key")),
             iv,
-            hp: HeaderProtectionKey::new(&AES_128, hp_bytes.as_ref()).expect("hp key"),
+            hp: HeaderProtectionKey::new(hp_alg, hp_bytes.as_ref()).expect("hp key"),
         }
     }
 
@@ -101,7 +113,7 @@ impl PacketKeys {
         }
     }
 
-    /// Tag length (AES-GCM).
+    /// Tag length (both supported AEADs use a 16-byte tag).
     pub fn tag_len(&self) -> usize {
         TAG_LEN
     }
@@ -116,9 +128,10 @@ pub struct KeyPair {
 }
 
 impl KeyPair {
-    /// From client/server traffic secrets for `side`.
+    /// From client/server traffic secrets for `side`, under the negotiated `aead`.
     pub fn from_traffic_secrets(
         side: Side,
+        aead: Tls13Aead,
         client_secret: [u8; 32],
         server_secret: [u8; 32],
     ) -> Self {
@@ -127,8 +140,8 @@ impl KeyPair {
             Side::Server => (server_secret, client_secret),
         };
         Self {
-            local: PacketKeys::from_secret(&local_secret),
-            remote: PacketKeys::from_secret(&remote_secret),
+            local: PacketKeys::from_secret(aead, &local_secret),
+            remote: PacketKeys::from_secret(aead, &remote_secret),
         }
     }
 }
@@ -141,10 +154,11 @@ pub fn initial_secrets(dst_cid: &[u8]) -> ([u8; 32], [u8; 32]) {
     (client, server)
 }
 
-/// Initial key pair for `side`.
+/// Initial key pair for `side` — always AES-128-GCM regardless of the
+/// handshake's own negotiated suite (RFC 9001 §5.2 fixes the Initial AEAD).
 pub fn initial_keys(dst_cid: &[u8], side: Side) -> KeyPair {
     let (client, server) = initial_secrets(dst_cid);
-    KeyPair::from_traffic_secrets(side, client, server)
+    KeyPair::from_traffic_secrets(side, Tls13Aead::Aes128GcmSha256, client, server)
 }
 
 #[cfg(test)]
@@ -167,9 +181,48 @@ mod tests {
         assert_eq!(client, expected);
     }
 
+    /// `ChaCha20Poly1305Sha256` (RFC 9001 §5.4.4's paired ChaCha20 header
+    /// protection, not the AES-ECB scheme §5.4.3 uses) round-trips both
+    /// packet-payload AEAD and header protection through real ciphertext —
+    /// proving `PacketKeys::from_secret`'s ChaCha branch actually works, not
+    /// just that it type-checks. Real cross-implementation QUIC interop
+    /// (quiche/msquic/ngtcp2) isn't wired up in this crate at all yet (see
+    /// crypto-migration-plan.md Phase 2's still-unstarted external-peer-interop
+    /// item), so this is the strongest proof available today; the TLS-layer
+    /// suite *negotiation* itself is proven once, generically, by
+    /// `tls::engine`'s `server_selects_chacha20_poly1305_when_its_the_only_offered_suite`
+    /// — both TCP and QUIC key installation consume the same `TlsEventSink`
+    /// callbacks this crate's own `Sink` forwards into `PacketKeys::from_secret`.
+    #[test]
+    fn chacha20_poly1305_packet_and_header_protection_round_trip() {
+        let keys = PacketKeys::from_secret(Tls13Aead::ChaCha20Poly1305Sha256, &[0x11; 32]);
+
+        // Packet payload AEAD.
+        let header = [0xc3u8, 0, 0, 0, 1];
+        let mut payload = b"hello quic chacha".to_vec();
+        keys.encrypt(0, &header, &mut payload);
+        assert_ne!(payload, b"hello quic chacha");
+        let n = keys.decrypt(0, &header, &mut payload).unwrap();
+        assert_eq!(&payload[..n], b"hello quic chacha");
+
+        // Header protection (RFC 9001 §5.4.4's ChaCha20 mask construction,
+        // distinct from AES's — this exercises that specific code path).
+        let mut packet = vec![0xc1u8];
+        packet.extend_from_slice(&[0u8; 20]);
+        let pn_offset = packet.len();
+        packet.extend_from_slice(&[0x12, 0x34]);
+        packet.extend_from_slice(&[0x55; 20]);
+        let original = packet.clone();
+        keys.protect_header(pn_offset, &mut packet, true);
+        assert_ne!(packet[0] & 0x0f, original[0] & 0x0f);
+        keys.protect_header(pn_offset, &mut packet, false);
+        assert_eq!(packet[0] & 0x03, original[0] & 0x03);
+        assert_eq!(&packet[pn_offset..pn_offset + 2], &original[pn_offset..pn_offset + 2]);
+    }
+
     #[test]
     fn header_protection_round_trip_recovers_pn_length() {
-        let keys = PacketKeys::from_secret(&[0x11; 32]);
+        let keys = PacketKeys::from_secret(Tls13Aead::Aes128GcmSha256, &[0x11; 32]);
         // Long header: reserved bits + PN length 2 (encoded as 1 in low bits).
         let mut packet = vec![0xc1u8]; // long form | fixed | type | pn_len=2
         packet.extend_from_slice(&[0u8; 20]); // fake header through pn_offset

@@ -1,9 +1,9 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! TLS 1.2 record layer — GCM only for this pass (RFC 5288 §3
-//! `GenericAEADCipher`; see [`super::engine`]'s module doc for why CBC is
-//! deferred). Wraps [`Tls12Engine`] with record framing and AEAD, sink-based
-//! like every other engine in this crate.
+//! TLS 1.2 record layer — AEAD only (RFC 5288 §3 `GenericAEADCipher`, GCM
+//! today; see [`super::engine`]'s module doc for why CBC is explicitly not
+//! planned, not merely deferred). Wraps [`Tls12Engine`] with record framing
+//! and AEAD, sink-based like every other engine in this crate.
 //!
 //! Unlike the TLS 1.3 record layer ([`super::super::record`]), TLS 1.2's
 //! `ChangeCipherSpec` is a real wire signal (content type 20, not middlebox
@@ -12,7 +12,7 @@
 //! records carry their true content type in the record header even once
 //! encrypted, so there's no inner-type unwrapping to do here either.
 
-use crate::crypto::aead::AesGcmKey;
+use crate::crypto::aead::{AeadError, AesGcmKey, ChaCha20Poly1305Key};
 use crate::security::SecurityInfo;
 
 use super::engine::{CipherKind, Config, DirectionalKeyMaterial, Role, Tls12EventSink, Tls12Engine};
@@ -37,63 +37,134 @@ const ALERT_CLOSE_NOTIFY: u8 = 0;
 
 /// RFC 5246 §6.2.1: plaintext fragments are capped at 2^14 bytes.
 const MAX_FRAGMENT: usize = 16384;
-/// GCM adds an 8-byte explicit nonce + 16-byte tag on top of the fragment.
+/// Upper bound over every supported cipher's per-record overhead — GCM's
+/// 8-byte explicit nonce + 16-byte tag (RFC 5288 §3; ChaCha20-Poly1305 has
+/// no explicit nonce, so its actual overhead is smaller, well within this
+/// bound). Used only as an early sanity check on the record length before
+/// the negotiated cipher's exact overhead is applied in [`Tls12RecordEngine::take_one_record`].
 const MAX_CIPHERTEXT_RECORD: usize = MAX_FRAGMENT + 8 + 16;
 
-struct GcmDirection {
-    key: AesGcmKey,
-    fixed_iv: [u8; 4],
+/// One direction's AEAD key, generalized over TLS 1.2's two nonce-construction
+/// strategies: RFC 5288 GCM (4-byte fixed IV/`salt` concatenated with an
+/// 8-byte explicit per-record nonce carried on the wire) and RFC 7905
+/// ChaCha20-Poly1305 (12-byte fixed IV, no wire nonce at all — the 96-bit
+/// nonce is the IV XORed with the sequence number, the same construction
+/// TLS 1.3's record layer uses throughout, see `super::super::record`).
+enum DirectionKey {
+    Gcm { key: AesGcmKey, fixed_iv: [u8; 4] },
+    ChaCha { key: ChaCha20Poly1305Key, fixed_iv: [u8; 12] },
+}
+
+struct AeadDirection {
+    key: DirectionKey,
     seq: u64,
 }
 
-impl GcmDirection {
-    fn from_material(material: &DirectionalKeyMaterial) -> Option<Self> {
-        Some(Self {
-            key: AesGcmKey::new(&material.key).ok()?,
-            fixed_iv: material.fixed_iv,
-            seq: 0,
-        })
+impl AeadDirection {
+    fn from_material(material: &DirectionalKeyMaterial, cipher: CipherKind) -> Option<Self> {
+        let key = match cipher {
+            CipherKind::Aes128Gcm | CipherKind::Aes256Gcm => {
+                let mut fixed_iv = [0u8; 4];
+                fixed_iv.copy_from_slice(&material.fixed_iv);
+                DirectionKey::Gcm { key: AesGcmKey::new(&material.key).ok()?, fixed_iv }
+            }
+            CipherKind::ChaCha20Poly1305 => {
+                let mut fixed_iv = [0u8; 12];
+                fixed_iv.copy_from_slice(&material.fixed_iv);
+                DirectionKey::ChaCha { key: ChaCha20Poly1305Key::new(&material.key).ok()?, fixed_iv }
+            }
+        };
+        Some(Self { key, seq: 0 })
     }
 
-    fn nonce(&self) -> [u8; 12] {
-        let mut n = [0u8; 12];
-        n[..4].copy_from_slice(&self.fixed_iv);
-        n[4..].copy_from_slice(&self.seq.to_be_bytes());
-        n
+    /// Whether this cipher carries an explicit per-record nonce on the wire
+    /// (GCM) or derives it purely from the sequence number (ChaCha20-Poly1305).
+    fn has_explicit_nonce(&self) -> bool {
+        matches!(self.key, DirectionKey::Gcm { .. })
     }
+
+    /// Nonce for the write side (always the local sequence counter) or for a
+    /// cipher with no wire nonce at all (ChaCha20-Poly1305, both directions).
+    fn local_nonce(&self) -> [u8; 12] {
+        match &self.key {
+            DirectionKey::Gcm { fixed_iv, .. } => gcm_nonce(fixed_iv, &self.seq.to_be_bytes()),
+            DirectionKey::ChaCha { fixed_iv, .. } => chacha_nonce(fixed_iv, self.seq),
+        }
+    }
+
+    /// Nonce for the read side of a GCM direction, from the wire's explicit
+    /// nonce bytes (never called for ChaCha20-Poly1305 — see [`Self::local_nonce`]).
+    fn nonce_from_wire(&self, explicit_nonce: &[u8]) -> [u8; 12] {
+        match &self.key {
+            DirectionKey::Gcm { fixed_iv, .. } => gcm_nonce(fixed_iv, explicit_nonce),
+            DirectionKey::ChaCha { fixed_iv, .. } => chacha_nonce(fixed_iv, self.seq),
+        }
+    }
+
+    fn seal_in_place_append_tag(&self, nonce: [u8; 12], aad: &[u8], plaintext: &mut Vec<u8>) -> Result<(), AeadError> {
+        match &self.key {
+            DirectionKey::Gcm { key, .. } => key.seal_in_place_append_tag(nonce, aad, plaintext),
+            DirectionKey::ChaCha { key, .. } => key.seal_in_place_append_tag(nonce, aad, plaintext),
+        }
+    }
+
+    fn open_in_place(&self, nonce: [u8; 12], aad: &[u8], ciphertext: &mut [u8]) -> Result<usize, AeadError> {
+        match &self.key {
+            DirectionKey::Gcm { key, .. } => key.open_in_place(nonce, aad, ciphertext),
+            DirectionKey::ChaCha { key, .. } => key.open_in_place(nonce, aad, ciphertext),
+        }
+    }
+}
+
+fn gcm_nonce(fixed_iv: &[u8; 4], explicit_nonce: &[u8]) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[..4].copy_from_slice(fixed_iv);
+    n[4..].copy_from_slice(explicit_nonce);
+    n
+}
+
+fn chacha_nonce(fixed_iv: &[u8; 12], seq: u64) -> [u8; 12] {
+    let mut n = *fixed_iv;
+    let seq_bytes = seq.to_be_bytes();
+    for i in 0..8 {
+        n[4 + i] ^= seq_bytes[i];
+    }
+    n
 }
 
 struct RecordState {
     role: Role,
-    write: Option<GcmDirection>,
-    read: Option<GcmDirection>,
+    write: Option<AeadDirection>,
+    read: Option<AeadDirection>,
     pending_write: Option<DirectionalKeyMaterial>,
     pending_read: Option<DirectionalKeyMaterial>,
+    cipher: Option<CipherKind>,
 }
 
 impl RecordState {
     fn new(role: Role) -> Self {
-        Self { role, write: None, read: None, pending_write: None, pending_read: None }
+        Self { role, write: None, read: None, pending_write: None, pending_read: None, cipher: None }
     }
 
-    fn stage_keys(&mut self, client: DirectionalKeyMaterial, server: DirectionalKeyMaterial) {
+    fn stage_keys(&mut self, cipher: CipherKind, client: DirectionalKeyMaterial, server: DirectionalKeyMaterial) {
         let (w, r) = match self.role {
             Role::Client => (client, server),
             Role::Server => (server, client),
         };
+        self.cipher = Some(cipher);
         self.pending_write = Some(w);
         self.pending_read = Some(r);
     }
 
     fn activate_write(&mut self) {
-        if let Some(m) = self.pending_write.take() {
-            self.write = GcmDirection::from_material(&m);
+        if let (Some(m), Some(c)) = (self.pending_write.take(), self.cipher) {
+            self.write = AeadDirection::from_material(&m, c);
         }
     }
 
     fn activate_read(&mut self) {
-        if let Some(m) = self.pending_read.take() {
-            self.read = GcmDirection::from_material(&m);
+        if let (Some(m), Some(c)) = (self.pending_read.take(), self.cipher) {
+            self.read = AeadDirection::from_material(&m, c);
         }
     }
 }
@@ -116,18 +187,20 @@ fn additional_data(seq: u64, content_type: u8, plaintext_len: usize) -> [u8; 13]
     aad
 }
 
-fn write_encrypted_record(dir: &mut GcmDirection, content_type: u8, payload: &[u8], out: &mut Vec<u8>) {
+fn write_encrypted_record(dir: &mut AeadDirection, content_type: u8, payload: &[u8], out: &mut Vec<u8>) {
     let aad = additional_data(dir.seq, content_type, payload.len());
-    let nonce = dir.nonce();
+    let nonce = dir.local_nonce();
     let mut ciphertext = payload.to_vec();
-    dir.key
-        .seal_in_place_append_tag(nonce, &aad, &mut ciphertext)
+    dir.seal_in_place_append_tag(nonce, &aad, &mut ciphertext)
         .expect("seal with a freshly derived key never fails");
+    let has_explicit = dir.has_explicit_nonce();
     let explicit_nonce = dir.seq.to_be_bytes();
-    let record_len = (explicit_nonce.len() + ciphertext.len()) as u16;
+    let record_len = (if has_explicit { explicit_nonce.len() } else { 0 } + ciphertext.len()) as u16;
     out.extend_from_slice(&[content_type, 0x03, 0x03]);
     out.extend_from_slice(&record_len.to_be_bytes());
-    out.extend_from_slice(&explicit_nonce);
+    if has_explicit {
+        out.extend_from_slice(&explicit_nonce);
+    }
     out.extend_from_slice(&ciphertext);
     dir.seq = dir.seq.wrapping_add(1);
 }
@@ -156,8 +229,8 @@ impl<S: Tls12RecordSink + ?Sized> Tls12EventSink for InnerSink<'_, S> {
         write_fragmented(self.state, CONTENT_HANDSHAKE, data, self.outer);
     }
 
-    fn keys_ready(&mut self, _cipher: CipherKind, client: DirectionalKeyMaterial, server: DirectionalKeyMaterial) {
-        self.state.stage_keys(client, server);
+    fn keys_ready(&mut self, cipher: CipherKind, client: DirectionalKeyMaterial, server: DirectionalKeyMaterial) {
+        self.state.stage_keys(cipher, client, server);
     }
 
     fn send_change_cipher_spec(&mut self) {
@@ -330,18 +403,21 @@ impl Tls12RecordEngine {
         match self.state.read.as_mut() {
             None => Ok(Some((hdr_type, body))),
             Some(dir) => {
-                if body.len() < 8 + 16 {
+                let has_explicit = dir.has_explicit_nonce();
+                let overhead = if has_explicit { 8 + 16 } else { 16 };
+                if body.len() < overhead {
                     return Err(());
                 }
-                let explicit_nonce = &body[..8];
-                let ciphertext_len = body.len() - 8;
-                let plain_len = ciphertext_len - 16;
+                let ciphertext_start = if has_explicit { 8 } else { 0 };
+                let plain_len = body.len() - overhead;
                 let aad = additional_data(dir.seq, hdr_type, plain_len);
-                let mut nonce = [0u8; 12];
-                nonce[..4].copy_from_slice(&dir.fixed_iv);
-                nonce[4..].copy_from_slice(explicit_nonce);
-                let mut buf = body[8..].to_vec();
-                let n = dir.key.open_in_place(nonce, &aad, &mut buf).map_err(|_| ())?;
+                let nonce = if has_explicit {
+                    dir.nonce_from_wire(&body[..8])
+                } else {
+                    dir.local_nonce()
+                };
+                let mut buf = body[ciphertext_start..].to_vec();
+                let n = dir.open_in_place(nonce, &aad, &mut buf).map_err(|_| ())?;
                 dir.seq = dir.seq.wrapping_add(1);
                 buf.truncate(n);
                 Ok(Some((hdr_type, buf)))
@@ -411,6 +487,7 @@ mod tests {
             trust_store: Some(trust),
             ticket_key: None,
             client_ticket_store: None,
+            ..Default::default()
         };
         let server = Config {
             role: Role::Server,
@@ -419,6 +496,7 @@ mod tests {
             trust_store: None,
             ticket_key: None,
             client_ticket_store: None,
+            ..Default::default()
         };
         (client, server)
     }
@@ -446,6 +524,51 @@ mod tests {
         assert!(client.is_complete(), "client: {:?}", sink_c.events);
         assert!(server.is_complete(), "server: {:?}", sink_s.events);
         (sink_c, sink_s, client, server)
+    }
+
+    /// Direct proof that `AeadDirection`'s ChaCha20-Poly1305 branch (no
+    /// explicit wire nonce, IV-XOR-sequence-number construction, per
+    /// `CipherKind::iv_len`'s 12-byte IV) actually round-trips real
+    /// ciphertext through the real wire framing — bypassing full handshake
+    /// negotiation (which always prefers AES-128-GCM when both peers offer
+    /// the full suite list, so a full-handshake test can't reach this path
+    /// deterministically; real cipher *negotiation* is instead proven by
+    /// the `rustls` interop tests in `hopf-tls`, which can force the suite).
+    #[test]
+    fn chacha20_poly1305_direction_round_trips_over_real_wire_framing() {
+        let client_material = DirectionalKeyMaterial {
+            key: Bytes::copy_from_slice(&[0x11u8; 32]),
+            fixed_iv: Bytes::copy_from_slice(&[0x22u8; 12]),
+        };
+        let server_material = DirectionalKeyMaterial {
+            key: Bytes::copy_from_slice(&[0x33u8; 32]),
+            fixed_iv: Bytes::copy_from_slice(&[0x44u8; 12]),
+        };
+
+        let mut client_state = RecordState::new(Role::Client);
+        client_state.stage_keys(CipherKind::ChaCha20Poly1305, client_material.clone(), server_material.clone());
+        client_state.activate_write();
+        client_state.activate_read();
+
+        let mut server_state = RecordState::new(Role::Server);
+        server_state.stage_keys(CipherKind::ChaCha20Poly1305, client_material, server_material);
+        server_state.activate_write();
+        server_state.activate_read();
+
+        let mut wire = Vec::new();
+        write_encrypted_record(client_state.write.as_mut().unwrap(), CONTENT_APPLICATION_DATA, b"hello chacha", &mut wire);
+        // No explicit nonce: just the 3-byte header + ciphertext + 16-byte tag.
+        assert_eq!(wire.len(), 3 + 2 + b"hello chacha".len() + 16, "wire: {wire:?}");
+
+        let len = u16::from_be_bytes([wire[3], wire[4]]) as usize;
+        let body = wire[5..5 + len].to_vec();
+        let overhead = 16;
+        let dir = server_state.read.as_mut().unwrap();
+        let aad = additional_data(dir.seq, CONTENT_APPLICATION_DATA, body.len() - overhead);
+        let nonce = dir.local_nonce();
+        let mut buf = body;
+        let n = dir.open_in_place(nonce, &aad, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello chacha");
     }
 
     #[test]
@@ -508,6 +631,7 @@ mod tests {
             trust_store: Some(trust),
             ticket_key: None,
             client_ticket_store: Some(store.clone()),
+            ..Default::default()
         };
         let server_cfg = Config {
             role: Role::Server,
@@ -516,6 +640,7 @@ mod tests {
             trust_store: None,
             ticket_key: Some(ticket_key),
             client_ticket_store: None,
+            ..Default::default()
         };
 
         // First connection: full handshake, real record framing, mints a ticket.

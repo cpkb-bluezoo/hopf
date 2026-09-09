@@ -5,7 +5,7 @@
 use bytes::Bytes;
 use hopf_core::security::SecurityInfo;
 use hopf_core::tls::{
-    HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, QuicSecrets, TlsEventSink,
+    HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, QuicSecrets, Tls13Aead, TlsEventSink,
     TlsProtocolError, TlsTimerKind, VerifyRequest,
 };
 
@@ -32,6 +32,11 @@ pub struct TlsBridgeEvents {
     pub app_keys: Option<([u8; 32], [u8; 32])>,
     /// Client early (0-RTT) traffic secret.
     pub early_keys: Option<[u8; 32]>,
+    /// Negotiated AEAD (RFC 8446 §9.1's MUST `TLS_AES_128_GCM_SHA256` or
+    /// SHOULD `TLS_CHACHA20_POLY1305_SHA256`) — set alongside whichever of
+    /// `handshake_keys`/`app_keys`/`early_keys` fires first; the same suite
+    /// is used for every packet-number space of one connection.
+    pub aead: Option<Tls13Aead>,
     /// Whether the server accepted early data (`None` until EncryptedExtensions on client).
     pub early_data_accepted: Option<bool>,
     /// Peer limits to apply for 0-RTT before EE (client resume).
@@ -60,6 +65,7 @@ impl TlsEventSink for Sink<'_> {
 
     fn handshake_complete(&mut self, info: SecurityInfo, quic: Option<QuicSecrets>) {
         if let Some(secrets) = quic {
+            self.events.aead = Some(secrets.aead);
             if let (Some(c), Some(s)) = (
                 secrets.client_application_traffic_secret,
                 secrets.server_application_traffic_secret,
@@ -85,13 +91,15 @@ impl TlsEventSink for Sink<'_> {
         self.events.peer_tp = Some(Bytes::copy_from_slice(params));
     }
 
-    fn quic_handshake_keys_ready(&mut self, client: [u8; 32], server: [u8; 32]) {
+    fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+        self.events.aead = Some(aead);
         self.events.handshake_keys = Some((client, server));
         // After ServerHello, subsequent CRYPTO is Handshake-protected.
         self.events.write_space = SpaceId::Handshake;
     }
 
-    fn quic_early_keys_ready(&mut self, client_early: [u8; 32]) {
+    fn quic_early_keys_ready(&mut self, aead: Tls13Aead, client_early: [u8; 32]) {
+        self.events.aead = Some(aead);
         self.events.early_keys = Some(client_early);
     }
 

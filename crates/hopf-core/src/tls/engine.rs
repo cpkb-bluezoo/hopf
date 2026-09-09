@@ -14,7 +14,7 @@ use std::sync::Arc;
 use super::handshake::verify::{sign_certificate_verify, verify_certificate_verify};
 
 use super::handshake::{
-    build_certificate, build_certificate_verify, build_client_hello,
+    build_certificate, build_certificate_request, build_certificate_verify, build_client_hello,
     build_client_hello_with_binder, build_encrypted_extensions_ext, build_finished,
     build_server_hello_ext, compute_finished_verify_data, compute_psk_binder,
     derive_application_traffic_with_psk, derive_early_traffic,
@@ -49,6 +49,67 @@ pub enum HandshakeMode {
     TcpRecordLayer,
 }
 
+/// `TLS_AES_128_GCM_SHA256` (RFC 8446 §B.4) — MUST implement per RFC 8446 §9.1.
+pub const AES_128_GCM_SHA256: u16 = 0x1301;
+/// `TLS_CHACHA20_POLY1305_SHA256` (RFC 8446 §B.4) — SHOULD implement per RFC 8446 §9.1.
+pub const CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+
+/// Cipher suites this engine offers/accepts, in preference order. Both use
+/// SHA-256 as the handshake/key-schedule hash (RFC 8446 §B.4), so
+/// negotiating between them only changes the record/packet-protection AEAD,
+/// never the transcript hash. No CBC, no AES-256-GCM — see
+/// `crypto-migration-plan.md`'s Non-goals and Phase 2 entry.
+pub const SUPPORTED_CIPHER_SUITES: &[u16] = &[AES_128_GCM_SHA256, CHACHA20_POLY1305_SHA256];
+
+/// Negotiated TLS 1.3 AEAD — one of [`SUPPORTED_CIPHER_SUITES`]. Threaded
+/// through [`super::sink::TlsEventSink`]'s key-ready callbacks so both this
+/// crate's own TCP record layer ([`super::record`]) and `hopf-quic`'s packet
+/// protection (which consumes the same callbacks directly, bypassing the
+/// TCP record layer) know which AEAD to instantiate — key length is the only
+/// thing that varies (16 vs 32 bytes); nonce construction is identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tls13Aead {
+    /// `TLS_AES_128_GCM_SHA256`.
+    Aes128GcmSha256,
+    /// `TLS_CHACHA20_POLY1305_SHA256`.
+    ChaCha20Poly1305Sha256,
+}
+
+impl Tls13Aead {
+    /// AEAD key length in bytes.
+    pub fn key_len(self) -> usize {
+        match self {
+            Tls13Aead::Aes128GcmSha256 => 16,
+            Tls13Aead::ChaCha20Poly1305Sha256 => 32,
+        }
+    }
+
+    /// Map a wire cipher-suite code to its AEAD, if this crate supports it.
+    pub fn from_suite(suite: u16) -> Option<Self> {
+        match suite {
+            AES_128_GCM_SHA256 => Some(Tls13Aead::Aes128GcmSha256),
+            CHACHA20_POLY1305_SHA256 => Some(Tls13Aead::ChaCha20Poly1305Sha256),
+            _ => None,
+        }
+    }
+
+    /// Wire cipher-suite code for this AEAD.
+    pub fn suite(self) -> u16 {
+        match self {
+            Tls13Aead::Aes128GcmSha256 => AES_128_GCM_SHA256,
+            Tls13Aead::ChaCha20Poly1305Sha256 => CHACHA20_POLY1305_SHA256,
+        }
+    }
+
+    /// Display name for [`crate::security::SecurityInfo::cipher_suite`].
+    pub fn name(self) -> &'static str {
+        match self {
+            Tls13Aead::Aes128GcmSha256 => "TLS_AES_128_GCM_SHA256",
+            Tls13Aead::ChaCha20Poly1305Sha256 => "TLS_CHACHA20_POLY1305_SHA256",
+        }
+    }
+}
+
 /// Server identity for the 1-RTT full handshake (Ed25519 leaf cert in Phase 2).
 #[derive(Debug, Clone)]
 pub struct ServerCredentials {
@@ -69,6 +130,24 @@ impl std::fmt::Debug for VerifyOverride {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("VerifyOverride(..)")
     }
+}
+
+/// Client-certificate authentication policy (server role) — RFC 8446
+/// §4.3.2 / RFC 5246 §7.4.4 `CertificateRequest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClientAuthPolicy {
+    /// Never send `CertificateRequest` (default — today's behavior).
+    #[default]
+    None,
+    /// Send `CertificateRequest`; proceed even if the client presents no
+    /// certificate or an untrusted one — the peer identity (if any) is
+    /// still reported via [`super::sink::VerifyRequest`] for the caller
+    /// to act on.
+    Request,
+    /// Send `CertificateRequest`; fail the handshake unless the client
+    /// presents a certificate that verifies against
+    /// [`HandshakeConfig::client_trust_store`].
+    Require,
 }
 
 /// Configuration for a single handshake.
@@ -108,6 +187,45 @@ pub struct HandshakeConfig {
     pub ticket_store: Option<Arc<ClientTicketStore>>,
     /// Server early-data anti-replay (shared across connections).
     pub anti_replay: Option<Arc<AntiReplay>>,
+    /// Client-certificate policy (server role); mTLS. `None` (default)
+    /// never sends `CertificateRequest`, matching prior behavior.
+    pub client_auth: ClientAuthPolicy,
+    /// Trust anchors for verifying the client's certificate chain (server
+    /// role) — only consulted when [`Self::client_auth`] isn't
+    /// [`ClientAuthPolicy::None`]. `None` gates on
+    /// [`super::sink::TlsEventSink::verification_requested`] instead,
+    /// exactly like [`Self::trust_store`] does for the client role.
+    pub client_trust_store: Option<TrustStore>,
+    /// Certificate + key to present when the server sends
+    /// `CertificateRequest` (client role). `None` responds with an empty
+    /// certificate list (RFC 8446 §4.4.2 permits this) — the handshake
+    /// still proceeds unless the server enforces [`ClientAuthPolicy::Require`].
+    pub client_credentials: Option<ServerCredentials>,
+}
+
+impl Default for HandshakeConfig {
+    fn default() -> Self {
+        Self {
+            role: HandshakeRole::Client,
+            mode: HandshakeMode::Quic,
+            alpn: Vec::new(),
+            server_name: None,
+            server: None,
+            kx_policy: KxPolicy::default(),
+            local_transport_parameters: None,
+            trust_store: None,
+            verify_override: None,
+            enable_early_data: false,
+            max_early_data_size: 0,
+            max_early_data_freshness_ms: super::handshake::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: None,
+            ticket_store: None,
+            anti_replay: None,
+            client_auth: ClientAuthPolicy::None,
+            client_trust_store: None,
+            client_credentials: None,
+        }
+    }
 }
 
 /// Reactive TLS 1.3 handshake engine with full 1-RTT client/server FSM (+ optional 0-RTT).
@@ -139,9 +257,31 @@ pub struct HandshakeEngine {
     peer_remembered_limits: Option<RememberedTransportLimits>,
     /// SNI from the peer ClientHello (server role).
     peer_server_name: Option<String>,
+    /// Server role: peer's certificate chain. Client role: server's chain.
+    /// Reused for both directions — a given engine only ever verifies one
+    /// side's chain, matching its own fixed role.
     peer_certs: Vec<Bytes>,
     verify_id: u64,
     verify_pending: bool,
+    /// Client role: the `certificate_request_context` from the server's
+    /// `CertificateRequest`, if one was received this handshake — echoed
+    /// back verbatim in the client's own `Certificate` response.
+    client_cert_request_context: Option<Bytes>,
+    /// Server role: whether the client's `Certificate` response (already
+    /// processed) carried at least one entry — only then is a
+    /// `CertificateVerify` expected next.
+    expect_client_certificate_verify: bool,
+    /// Server role: transcript hash captured right after this engine sent
+    /// its own Finished (RFC 8446 §7.1's `application_traffic_secret_0`
+    /// input) — needed verbatim in `on_client_finished` since the
+    /// transcript may have grown further by then (an mTLS client
+    /// Certificate/CertificateVerify response), which must not affect it.
+    server_finished_hash: Option<[u8; 32]>,
+    /// Negotiated AEAD (client: from `ServerHello`; server: selected in
+    /// `on_client_hello`, before anything that needs it — including 0-RTT
+    /// key installation). Threaded into every `*_keys_ready` callback and
+    /// the completion `SecurityInfo`.
+    negotiated_aead: Option<Tls13Aead>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +291,10 @@ enum State {
     ReadingServerFlight,
     /// After EE on a resumed handshake — expect Finished next (no Cert).
     ReadingServerFinished,
+    /// Server role: sent `CertificateRequest`, waiting for the client's `Certificate`.
+    AwaitingClientCertificate,
+    /// Server role: client's `Certificate` had entries — waiting for `CertificateVerify`.
+    AwaitingClientCertificateVerify,
     AwaitingClientFinished,
     Complete,
     Failed,
@@ -182,6 +326,10 @@ impl HandshakeEngine {
             peer_certs: Vec::new(),
             verify_id: 0,
             verify_pending: false,
+            client_cert_request_context: None,
+            expect_client_certificate_verify: false,
+            server_finished_hash: None,
+            negotiated_aead: None,
         }
     }
 
@@ -288,9 +436,15 @@ impl HandshakeEngine {
                 State::ReadingServerFlight,
                 ParsedIncoming::EncryptedExtensions(ee),
             ) => self.on_encrypted_extensions(ee, wire, sink),
-            (HandshakeRole::Client, HandshakeType::Certificate, State::ReadingServerFlight, ParsedIncoming::Certificate(certs)) => {
+            (HandshakeRole::Client, HandshakeType::Certificate, State::ReadingServerFlight, ParsedIncoming::Certificate(_ctx, certs)) => {
                 self.on_certificate(certs, wire, sink)
             }
+            (
+                HandshakeRole::Client,
+                HandshakeType::CertificateRequest,
+                State::ReadingServerFlight,
+                ParsedIncoming::CertificateRequest(ctx),
+            ) => self.on_certificate_request(ctx, wire, sink),
             (
                 HandshakeRole::Client,
                 HandshakeType::CertificateVerify,
@@ -315,6 +469,18 @@ impl HandshakeEngine {
             (HandshakeRole::Server, HandshakeType::ClientHello, State::Initial, ParsedIncoming::ClientHello(ch)) => {
                 self.on_client_hello(ch, wire, sink)
             }
+            (
+                HandshakeRole::Server,
+                HandshakeType::Certificate,
+                State::AwaitingClientCertificate,
+                ParsedIncoming::Certificate(ctx, certs),
+            ) => self.on_client_certificate(ctx, certs, wire, sink),
+            (
+                HandshakeRole::Server,
+                HandshakeType::CertificateVerify,
+                State::AwaitingClientCertificateVerify,
+                ParsedIncoming::CertificateVerify(scheme, sig),
+            ) => self.on_client_certificate_verify(scheme, sig, wire, sink),
             (HandshakeRole::Server, HandshakeType::Finished, State::AwaitingClientFinished, ParsedIncoming::Finished(vd)) => {
                 self.on_client_finished(vd, wire, sink)
             }
@@ -365,6 +531,7 @@ impl HandshakeEngine {
 
         let params = ClientHelloParams {
             random,
+            cipher_suites: SUPPORTED_CIPHER_SUITES.to_vec(),
             key_share: KeyShareEntry {
                 group: local.group().code(),
                 share: local.client_share_bytes(),
@@ -396,7 +563,18 @@ impl HandshakeEngine {
                 let early = derive_early_traffic(&psk, &ch_hash);
                 self.early_client_secret = Some(early.client);
                 self.early_data_offered = true;
-                sink.quic_early_keys_ready(early.client);
+                // The server's actual suite selection hasn't happened yet
+                // (that's the whole point of 0-RTT), so this can't read
+                // `self.negotiated_aead`. Safe by construction rather than
+                // guesswork: 0-RTT only ever resumes a hopf-issued ticket
+                // against a hopf server (see crypto-migration-plan.md's
+                // Non-goals — foreign ticket ciphertext is never decrypted),
+                // both always offering/preferring the same fixed
+                // `SUPPORTED_CIPHER_SUITES` — so the server's pick is always
+                // this crate's own top preference.
+                let early_aead = Tls13Aead::from_suite(SUPPORTED_CIPHER_SUITES[0])
+                    .expect("SUPPORTED_CIPHER_SUITES[0] is always a supported suite");
+                sink.quic_early_keys_ready(early_aead, early.client);
                 if let Some(limits) = ticket
                     .as_ref()
                     .and_then(|t| t.remembered_peer_limits)
@@ -417,10 +595,11 @@ impl HandshakeEngine {
         encoded: Bytes,
         sink: &mut S,
     ) -> bool {
-        if sh.cipher_suite != 0x1301 {
+        let Some(aead) = Tls13Aead::from_suite(sh.cipher_suite) else {
             self.fail(sink, "unsupported cipher suite");
             return false;
-        }
+        };
+        self.negotiated_aead = Some(aead);
         let Some(group) = NamedGroup::from_code(sh.selected_group) else {
             self.fail(sink, "unsupported key exchange group");
             return false;
@@ -445,7 +624,7 @@ impl HandshakeEngine {
             &self.transcript.hash(),
         ));
         if let Some(traffic) = self.handshake_traffic.as_ref() {
-            sink.quic_handshake_keys_ready(traffic.client, traffic.server);
+            sink.quic_handshake_keys_ready(aead, traffic.client, traffic.server);
         }
         self.state = State::ReadingServerFlight;
         true
@@ -496,6 +675,10 @@ impl HandshakeEngine {
     ) -> bool {
         if self.resumed {
             self.fail(sink, "unexpected Certificate on resumed handshake");
+            return false;
+        }
+        if certs.is_empty() {
+            self.fail(sink, "server Certificate must not be empty");
             return false;
         }
         self.transcript.add_message(&encoded);
@@ -550,6 +733,21 @@ impl HandshakeEngine {
         true
     }
 
+    fn on_certificate_request<S: TlsEventSink>(
+        &mut self,
+        ctx: Bytes,
+        encoded: Bytes,
+        sink: &mut S,
+    ) -> bool {
+        if self.resumed {
+            self.fail(sink, "unexpected CertificateRequest on resumed handshake");
+            return false;
+        }
+        self.transcript.add_message(&encoded);
+        self.client_cert_request_context = Some(ctx);
+        true
+    }
+
     fn on_server_finished<S: TlsEventSink>(
         &mut self,
         vd: Bytes,
@@ -571,6 +769,17 @@ impl HandshakeEngine {
     }
 
     fn client_send_finished<S: TlsEventSink>(&mut self, sink: &mut S) -> bool {
+        // RFC 8446 §7.1: application_traffic_secret_0 covers the transcript
+        // through the *server's* Finished only — captured here, before any
+        // client Certificate/CertificateVerify response joins the
+        // transcript below (client Finished's own verify_data, in
+        // contrast, must cover those too — it uses a separate, later hash).
+        let th_for_app_traffic = self.transcript.hash();
+        if let Some(ctx) = self.client_cert_request_context.take() {
+            if !self.send_client_certificate_response(&ctx, sink) {
+                return false;
+            }
+        }
         let Some(traffic) = self.handshake_traffic.as_ref() else {
             self.fail(sink, "missing handshake traffic");
             return false;
@@ -584,13 +793,37 @@ impl HandshakeEngine {
         };
         let psk = self.psk;
         // See on_client_finished's comment: application_traffic_secret_0 uses
-        // `th` (through server Finished, before this Finished is added below);
-        // resumption_master_secret uses the transcript after it's added.
-        self.application_traffic = Some(derive_application_traffic_with_psk(psk.as_ref(), &shared, &th));
+        // `th_for_app_traffic` (through server Finished only); resumption_master_secret
+        // uses the transcript after this client Finished is added, below.
+        self.application_traffic = Some(derive_application_traffic_with_psk(psk.as_ref(), &shared, &th_for_app_traffic));
         self.emit_outgoing(&fin, sink);
         let res_hash = self.transcript.hash();
         self.resumption_master = Some(derive_resumption_master_secret(psk.as_ref(), &shared, &res_hash));
         self.finish(sink);
+        true
+    }
+
+    /// Respond to a `CertificateRequest`: `Certificate` (our chain, or empty
+    /// if [`HandshakeConfig::client_credentials`] is unset — RFC 8446
+    /// §4.4.2 permits this), and `CertificateVerify` when a non-empty chain
+    /// was actually sent.
+    fn send_client_certificate_response<S: TlsEventSink>(&mut self, ctx: &Bytes, sink: &mut S) -> bool {
+        let creds = self.config.client_credentials.clone();
+        let cert_refs: Vec<&[u8]> = creds
+            .as_ref()
+            .map(|c| c.cert_chain.iter().map(|c| c.as_ref()).collect())
+            .unwrap_or_default();
+        let cert_msg = build_certificate(ctx, &cert_refs);
+        self.emit_outgoing(&cert_msg, sink);
+        if let Some(creds) = creds.filter(|c| !c.cert_chain.is_empty()) {
+            let cv_th = self.transcript.hash();
+            let Some((scheme, sig)) = sign_certificate_verify(true, &creds.signing_key_pkcs8, &cv_th) else {
+                self.fail(sink, "unsupported or invalid client signing key");
+                return false;
+            };
+            let cv = build_certificate_verify(scheme, sig.as_ref());
+            self.emit_outgoing(&cv, sink);
+        }
         true
     }
 
@@ -640,6 +873,15 @@ impl HandshakeEngine {
         if let Some(tp) = &ch.transport_parameters {
             sink.peer_transport_parameters(tp);
         }
+
+        // Selected up front (before the 0-RTT branch below, which needs it
+        // too) rather than alongside group selection further down.
+        let Some(&suite) = SUPPORTED_CIPHER_SUITES.iter().find(|s| ch.cipher_suites.contains(s)) else {
+            self.fail(sink, "no mutually supported cipher suite");
+            return false;
+        };
+        let aead = Tls13Aead::from_suite(suite).expect("suite drawn from SUPPORTED_CIPHER_SUITES");
+        self.negotiated_aead = Some(aead);
 
         // Try PSK resumption.
         if let (Some(identity), Some(binder), Some(ticket_key)) = (
@@ -711,7 +953,7 @@ impl HandshakeEngine {
                                     let early = derive_early_traffic(&payload.psk, &ch_hash);
                                     self.early_client_secret = Some(early.client);
                                     self.early_data_accepted = true;
-                                    sink.quic_early_keys_ready(early.client);
+                                    sink.quic_early_keys_ready(aead, early.client);
                                 }
                             }
                         }
@@ -744,6 +986,7 @@ impl HandshakeEngine {
         let sh = build_server_hello_ext(
             &server_random,
             &ch.legacy_session_id,
+            suite,
             group.code(),
             server_share.as_ref(),
             selected_psk,
@@ -760,7 +1003,7 @@ impl HandshakeEngine {
             &self.transcript.hash(),
         ));
         if let Some(traffic) = self.handshake_traffic.as_ref() {
-            sink.quic_handshake_keys_ready(traffic.client, traffic.server);
+            sink.quic_handshake_keys_ready(aead, traffic.client, traffic.server);
         }
 
         if ch.server_name.is_some() {
@@ -775,13 +1018,18 @@ impl HandshakeEngine {
         );
         self.emit_outgoing(&ee, sink);
 
+        let request_client_cert = !self.resumed && self.config.client_auth != ClientAuthPolicy::None;
         if !self.resumed {
             let Some(creds) = self.config.server.clone() else {
                 self.fail(sink, "server credentials not configured");
                 return false;
             };
+            if request_client_cert {
+                let cr = build_certificate_request(&[]);
+                self.emit_outgoing(&cr, sink);
+            }
             let cert_refs: Vec<&[u8]> = creds.cert_chain.iter().map(|c| c.as_ref()).collect();
-            let cert_msg = build_certificate(&cert_refs);
+            let cert_msg = build_certificate(&[], &cert_refs);
             self.emit_outgoing(&cert_msg, sink);
 
             let cv_th = self.transcript.hash();
@@ -798,7 +1046,82 @@ impl HandshakeEngine {
         let vd = compute_finished_verify_data(&traffic.server, &fin_th);
         let fin = build_finished(&vd);
         self.emit_outgoing(&fin, sink);
+        // RFC 8446 §7.1: application_traffic_secret_0 covers the transcript
+        // through the server's own Finished (just added above) — captured
+        // here so `on_client_finished` uses this exact hash rather than
+        // whatever the transcript grows to include by then (the client's
+        // optional Certificate/CertificateVerify response, which must NOT
+        // factor into this derivation).
+        self.server_finished_hash = Some(self.transcript.hash());
 
+        self.state = if request_client_cert {
+            State::AwaitingClientCertificate
+        } else {
+            State::AwaitingClientFinished
+        };
+        true
+    }
+
+    fn on_client_certificate<S: TlsEventSink>(
+        &mut self,
+        ctx: Bytes,
+        certs: Vec<Bytes>,
+        encoded: Bytes,
+        sink: &mut S,
+    ) -> bool {
+        if !ctx.is_empty() {
+            self.fail(sink, "client Certificate context does not match CertificateRequest");
+            return false;
+        }
+        self.transcript.add_message(&encoded);
+        if certs.is_empty() {
+            if self.config.client_auth == ClientAuthPolicy::Require {
+                self.fail(sink, "client certificate required but none presented");
+                return false;
+            }
+            self.state = State::AwaitingClientFinished;
+            return true;
+        }
+        self.peer_certs = certs;
+        self.expect_client_certificate_verify = true;
+        self.verify_id += 1;
+        self.verify_pending = true;
+        sink.verification_requested(super::sink::VerifyRequest {
+            id: self.verify_id,
+            peer_chain: self.peer_certs.clone(),
+            server_name: None,
+        });
+        if let Some(store) = &self.config.client_trust_store {
+            let ok = store.verify_server_chain(&self.peer_certs, None).is_ok();
+            self.verify_pending = false;
+            if !ok {
+                self.fail(sink, "client certificate verification failed");
+                return false;
+            }
+            self.state = State::AwaitingClientCertificateVerify;
+            return true;
+        }
+        self.state = State::AwaitingClientCertificateVerify;
+        false // gate: wait for feed_verification_result
+    }
+
+    fn on_client_certificate_verify<S: TlsEventSink>(
+        &mut self,
+        scheme: u16,
+        sig: Bytes,
+        encoded: Bytes,
+        sink: &mut S,
+    ) -> bool {
+        let Some(leaf) = self.peer_certs.first() else {
+            self.fail(sink, "certificate verify without certificate");
+            return false;
+        };
+        let th = self.transcript.hash();
+        if !verify_certificate_verify(true, leaf.as_ref(), scheme, &sig, &th) {
+            self.fail(sink, "client CertificateVerify signature invalid");
+            return false;
+        }
+        self.transcript.add_message(&encoded);
         self.state = State::AwaitingClientFinished;
         true
     }
@@ -825,11 +1148,18 @@ impl HandshakeEngine {
         };
         let psk = self.psk.as_ref();
         // RFC 8446 §7.1: application_traffic_secret_0 is derived over the
-        // transcript through *server* Finished only — `th`, captured above
-        // before the client's own Finished (`encoded`) joins the transcript.
-        // resumption_master_secret, in contrast, is derived through the
+        // transcript through *server* Finished only — `self.server_finished_hash`,
+        // captured right when this engine sent its own Finished, before any
+        // client Certificate/CertificateVerify (mTLS) or this client Finished
+        // itself joined the transcript. `th` above (used for the Finished MAC
+        // check) is NOT the right hash here once a client cert response is in
+        // play. resumption_master_secret, in contrast, is derived through the
         // client's Finished too, so it needs the transcript *after* this add.
-        self.application_traffic = Some(derive_application_traffic_with_psk(psk, shared, &th));
+        let app_th = self
+            .server_finished_hash
+            .take()
+            .expect("server Finished sent before client Finished");
+        self.application_traffic = Some(derive_application_traffic_with_psk(psk, shared, &app_th));
         self.transcript.add_message(&encoded);
         let res_hash = self.transcript.hash();
         self.resumption_master = Some(derive_resumption_master_secret(psk, shared, &res_hash));
@@ -860,20 +1190,29 @@ impl HandshakeEngine {
             HandshakeRole::Server => self.peer_server_name.clone(),
             HandshakeRole::Client => self.config.server_name.clone(),
         };
-        let info = SecurityInfo::secure(
+        let aead = self.negotiated_aead.expect("cipher suite negotiated before completion");
+        let mut info = SecurityInfo::secure(
             self.negotiated_alpn
                 .clone()
                 .or_else(|| self.config.alpn.first().cloned()),
             Some("TLSv1.3".to_string()),
-            Some("TLS_AES_128_GCM_SHA256".to_string()),
+            Some(aead.name().to_string()),
         )
         .with_sni(sni);
+        if self.config.role == HandshakeRole::Server {
+            if let Some(leaf) = self.peer_certs.first() {
+                info = info
+                    .with_peer_certificate_fingerprint(Some(crate::crypto::sha256_fingerprint_hex(leaf)))
+                    .with_peer_certificate_chain(Some(self.peer_certs.clone()));
+            }
+        }
         if let Some(a) = app.as_ref() {
-            sink.application_traffic_keys_ready(a.client, a.server);
+            sink.application_traffic_keys_ready(aead, a.client, a.server);
         }
         let early = self.early_client_secret;
         let quic = match self.config.mode {
             HandshakeMode::Quic => Some(QuicSecrets {
+                aead,
                 client_handshake_traffic_secret: client_hs,
                 server_handshake_traffic_secret: server_hs,
                 client_application_traffic_secret: app.as_ref().map(|a| a.client),
@@ -1090,6 +1429,8 @@ mod tests {
         negotiated_group: Option<u16>,
         early_keys: Option<[u8; 32]>,
         early_data_accepted: Option<bool>,
+        info: Option<SecurityInfo>,
+        negotiated_aead: Option<Tls13Aead>,
     }
 
     impl TlsEventSink for RecordingSink {
@@ -1097,9 +1438,10 @@ mod tests {
             self.events.push(format!("outbound {} bytes", data.len()));
             self.outbound.push(Bytes::copy_from_slice(data));
         }
-        fn handshake_complete(&mut self, _info: SecurityInfo, quic: Option<QuicSecrets>) {
+        fn handshake_complete(&mut self, info: SecurityInfo, quic: Option<QuicSecrets>) {
             self.events.push("handshake_complete".into());
             self.quic = quic;
+            self.info = Some(info);
         }
         fn verification_requested(&mut self, req: VerifyRequest) {
             self.events
@@ -1109,12 +1451,17 @@ mod tests {
             self.peer_tp = Some(Bytes::copy_from_slice(params));
             self.events.push(format!("peer_tp {} bytes", params.len()));
         }
-        fn quic_handshake_keys_ready(&mut self, _client: [u8; 32], _server: [u8; 32]) {
+        fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {
+            self.negotiated_aead = Some(aead);
             self.events.push("handshake_keys".into());
         }
-        fn quic_early_keys_ready(&mut self, client_early: [u8; 32]) {
+        fn quic_early_keys_ready(&mut self, aead: Tls13Aead, client_early: [u8; 32]) {
+            self.negotiated_aead = Some(aead);
             self.early_keys = Some(client_early);
             self.events.push("early_keys".into());
+        }
+        fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {
+            self.negotiated_aead = Some(aead);
         }
         fn early_data_accepted(&mut self, accepted: bool) {
             self.early_data_accepted = Some(accepted);
@@ -1195,6 +1542,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         }
     }
 
@@ -1216,6 +1564,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         });
         let mut sink = RecordingSink::default();
         engine.start(&mut sink);
@@ -1250,6 +1599,7 @@ mod tests {
             ticket_key: Some(ticket_key),
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         };
         let mut server = HandshakeEngine::new(server_cfg.clone());
         let mut client = HandshakeEngine::new(client_cfg.clone());
@@ -1307,6 +1657,7 @@ mod tests {
             ticket_key: Some(ticket_key),
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         };
         let mut server = HandshakeEngine::new(server_cfg.clone());
         let mut client = HandshakeEngine::new(client_cfg.clone());
@@ -1444,6 +1795,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         },
         );
         let quic = sink.quic.expect("quic secrets");
@@ -1471,6 +1823,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         }
     }
 
@@ -1491,6 +1844,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         }
     }
 
@@ -1558,6 +1912,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         };
         let mut server = HandshakeEngine::new(server_cfg);
         let mut client = HandshakeEngine::new(client_cfg);
@@ -1604,6 +1959,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         },
         );
         assert_eq!(
@@ -1631,6 +1987,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         });
         let mut sink = RecordingSink::default();
         engine.start(&mut sink);
@@ -1647,4 +2004,254 @@ mod tests {
             sink.events
         );
     }
+
+    // ---- mTLS (client certificate authentication) ----
+
+    fn client_config_with_cert(
+        server_creds: &ServerCredentials,
+        client_creds: ServerCredentials,
+    ) -> HandshakeConfig {
+        let mut cfg = client_config_with_trust(server_creds, KxPolicy::classical_only(), None);
+        cfg.client_credentials = Some(client_creds);
+        cfg
+    }
+
+    fn server_config_requiring_client_cert(
+        server_creds: ServerCredentials,
+        client_creds: &ServerCredentials,
+        policy: ClientAuthPolicy,
+    ) -> HandshakeConfig {
+        let mut cfg = server_config_for(server_creds, KxPolicy::classical_only());
+        cfg.client_auth = policy;
+        let mut trust = TrustStore::new();
+        trust.add_anchor(client_creds.cert_chain[0].clone());
+        cfg.client_trust_store = Some(trust);
+        cfg
+    }
+
+    #[test]
+    fn mtls_require_completes_when_client_presents_a_trusted_certificate() {
+        let server_creds = test_server_credentials();
+        let client_creds = test_server_credentials();
+        let client_cfg = client_config_with_cert(&server_creds, client_creds.clone());
+        let server_cfg =
+            server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let sink = run_loopback(client_cfg, server_cfg);
+        assert!(sink.events.iter().any(|e| e == "handshake_complete"), "{:?}", sink.events);
+        // Server must have run its own verification_requested for the client's chain,
+        // not just the (absent, server-role) one for a server chain.
+        assert!(
+            sink.events.iter().filter(|e| e.starts_with("verification_requested")).count() >= 1,
+            "{:?}",
+            sink.events
+        );
+    }
+
+    /// The server side's `SecurityInfo` (the only role that runs
+    /// mTLS verification) must expose the verified client certificate's
+    /// fingerprint and chain — this is what SASL EXTERNAL
+    /// (`hopf_auth::external`) keys off via `peer_certificate_fingerprint`.
+    #[test]
+    fn mtls_exposes_client_certificate_fingerprint_and_chain_on_the_server_side() {
+        let server_creds = test_server_credentials();
+        let client_creds = test_server_credentials();
+        let expected_fp = crate::crypto::sha256_fingerprint_hex(&client_creds.cert_chain[0]);
+        let client_cfg = client_config_with_cert(&server_creds, client_creds.clone());
+        let server_cfg =
+            server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay_server(&mut server, take_outbound(&mut sink_c), &mut sink_s);
+        relay_client(&mut client, take_outbound(&mut sink_s), &mut sink_c);
+        relay_server(&mut server, take_outbound(&mut sink_c), &mut sink_s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+
+        let server_info = sink_s.info.expect("server SecurityInfo");
+        assert_eq!(server_info.peer_certificate_fingerprint(), Some(expected_fp.as_str()));
+        assert_eq!(
+            server_info.peer_certificate_chain(),
+            Some(client_creds.cert_chain.as_slice())
+        );
+        // Client side never runs mTLS verification of its own cert — its
+        // SecurityInfo must not carry a client-certificate fingerprint.
+        let client_info = sink_c.info.expect("client SecurityInfo");
+        assert_eq!(client_info.peer_certificate_fingerprint(), None);
+    }
+
+    #[test]
+    fn mtls_require_rejects_handshake_when_client_has_no_certificate() {
+        let server_creds = test_server_credentials();
+        let client_creds = test_server_credentials();
+        // Client configured with no client_credentials at all.
+        let client_cfg = client_config_with_trust(&server_creds, KxPolicy::classical_only(), None);
+        let server_cfg =
+            server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        assert!(!server.is_complete());
+        assert!(
+            sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink.events
+        );
+    }
+
+    #[test]
+    fn mtls_request_completes_when_client_has_no_certificate() {
+        let server_creds = test_server_credentials();
+        let client_creds = test_server_credentials();
+        let client_cfg = client_config_with_trust(&server_creds, KxPolicy::classical_only(), None);
+        let server_cfg =
+            server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Request);
+        let sink = run_loopback(client_cfg, server_cfg);
+        assert!(sink.events.iter().any(|e| e == "handshake_complete"), "{:?}", sink.events);
+    }
+
+    #[test]
+    fn mtls_rejects_untrusted_client_certificate() {
+        let server_creds = test_server_credentials();
+        let client_creds = test_server_credentials();
+        let untrusted_client_creds = test_server_credentials(); // not the one in client_trust_store
+        let client_cfg = client_config_with_cert(&server_creds, untrusted_client_creds);
+        let server_cfg =
+            server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        assert!(!server.is_complete());
+        assert!(
+            sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink.events
+        );
+    }
+
+    #[test]
+    fn mtls_rejects_tampered_client_certificate_verify_signature() {
+        let server_creds = test_server_credentials();
+        let client_creds = test_server_credentials();
+        let client_cfg = client_config_with_cert(&server_creds, client_creds.clone());
+        let server_cfg =
+            server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+
+        let mut outbound = take_outbound(&mut sink);
+        // Client's second flight is [Certificate, CertificateVerify, Finished] in
+        // one call — corrupt the last byte of the CertificateVerify message
+        // (not the final Finished, which would just fail differently).
+        assert!(outbound.len() >= 2, "expected a multi-message client flight: {outbound:?}");
+        let cv_index = outbound.len() - 2;
+        let mut corrupted = outbound[cv_index].to_vec();
+        let n = corrupted.len();
+        corrupted[n - 1] ^= 0xff;
+        outbound[cv_index] = Bytes::from(corrupted);
+        relay_client(&mut client, outbound, &mut sink);
+
+        assert!(!server.is_complete());
+        assert!(
+            sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink.events
+        );
+    }
+
+    // ---- ChaCha20-Poly1305 cipher suite negotiation ----
+
+    /// A normal client always offers both `SUPPORTED_CIPHER_SUITES` entries
+    /// (AES-128-GCM first preference), so a Hopf-vs-Hopf loopback can't
+    /// reach ChaCha20-Poly1305 negotiation deterministically — this drives
+    /// the real `on_client_hello` selection logic directly with a
+    /// ChaCha-only offer (as a peer that doesn't support AES-128-GCM would
+    /// send) and inspects the real `ServerHello` wire bytes. Real
+    /// negotiation against an independent peer is additionally proven by
+    /// the `rustls` interop tests in `hopf-tls`.
+    #[test]
+    fn server_selects_chacha20_poly1305_when_its_the_only_offered_suite() {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let creds = test_server_credentials();
+        let server_cfg = server_config_for(creds, KxPolicy::classical_only());
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut sink = RecordingSink::default();
+
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [3u8; 32],
+            cipher_suites: vec![CHACHA20_POLY1305_SHA256],
+            key_share: KeyShareEntry {
+                group: NamedGroup::X25519.code(),
+                share: Bytes::copy_from_slice(&kp.public_key()),
+            },
+            supported_groups: vec![NamedGroup::X25519.code()],
+            alpn: vec![],
+            server_name: None,
+            transport_parameters: None,
+            early_data: false,
+            psk: None,
+        });
+        let wire = hello.encode();
+        let mut input = wire.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink);
+
+        assert!(
+            !sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "server must accept a ChaCha-only offer: {:?}",
+            sink.events
+        );
+        let sh_wire = sink.outbound.first().expect("ServerHello emitted");
+        let parsed = crate::tls::handshake::parse_server_hello(&sh_wire[4..]).expect("valid ServerHello");
+        assert_eq!(parsed.cipher_suite, CHACHA20_POLY1305_SHA256);
+        assert_eq!(sink.negotiated_aead, Some(Tls13Aead::ChaCha20Poly1305Sha256));
+    }
+
+    #[test]
+    fn server_rejects_client_hello_with_no_mutually_supported_cipher_suite() {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let creds = test_server_credentials();
+        let server_cfg = server_config_for(creds, KxPolicy::classical_only());
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut sink = RecordingSink::default();
+
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [3u8; 32],
+            cipher_suites: vec![0xffff], // unrecognized/unsupported
+            key_share: KeyShareEntry {
+                group: NamedGroup::X25519.code(),
+                share: Bytes::copy_from_slice(&kp.public_key()),
+            },
+            supported_groups: vec![NamedGroup::X25519.code()],
+            alpn: vec![],
+            server_name: None,
+            transport_parameters: None,
+            early_data: false,
+            psk: None,
+        });
+        let wire = hello.encode();
+        let mut input = wire.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink);
+
+        assert!(
+            sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink.events
+        );
+    }
+
 }

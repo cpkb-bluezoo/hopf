@@ -122,6 +122,7 @@ impl HopfTlsBuildParams {
             ticket_key: self.ticket_key,
             ticket_store: self.ticket_store,
             anti_replay,
+            ..Default::default()
         }
     }
 }

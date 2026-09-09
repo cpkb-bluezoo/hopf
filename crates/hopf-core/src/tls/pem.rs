@@ -15,7 +15,9 @@ use bytes::Bytes;
 use crate::crypto::kx_policy::KxPolicy;
 use crate::crypto::trust::{public_trust_store, TrustStore};
 
-use super::engine::{HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials, VerifyOverride};
+use super::engine::{
+    ClientAuthPolicy, HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials, VerifyOverride,
+};
 use super::handshake::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS;
 use super::record::TlsRecordEngine;
 use super::tls12;
@@ -56,6 +58,7 @@ fn base_config(role: HandshakeRole, alpn: &[&[u8]]) -> HandshakeConfig {
         ticket_key: None,
         ticket_store: None,
         anti_replay: None,
+        ..Default::default()
     }
 }
 
@@ -101,6 +104,8 @@ pub fn server_credentials_from_pem(cert_path: &Path, key_path: &Path) -> io::Res
 struct PemAcceptor {
     creds: ServerCredentials,
     alpn: Vec<Bytes>,
+    client_auth: ClientAuthPolicy,
+    client_trust_store: Option<TrustStore>,
 }
 
 impl TlsAcceptor for PemAcceptor {
@@ -108,6 +113,8 @@ impl TlsAcceptor for PemAcceptor {
         let mut config = base_config(HandshakeRole::Server, &[]);
         config.alpn = self.alpn.clone();
         config.server = Some(self.creds.clone());
+        config.client_auth = self.client_auth;
+        config.client_trust_store = self.client_trust_store.clone();
         TlsVariant::V13(TlsRecordEngine::new(config))
     }
 }
@@ -119,6 +126,31 @@ pub fn acceptor_from_pem(cert_path: &Path, key_path: &Path, alpn: &[&[u8]]) -> i
     Ok(Arc::new(PemAcceptor {
         creds,
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        client_auth: ClientAuthPolicy::None,
+        client_trust_store: None,
+    }))
+}
+
+/// Build a mutual-TLS [`SharedTlsAcceptor`]: like [`acceptor_from_pem`], but
+/// also requests a client certificate (`policy`) and verifies it against the
+/// CA(s) in `client_ca_path`.
+pub fn acceptor_from_pem_with_client_auth(
+    cert_path: &Path,
+    key_path: &Path,
+    alpn: &[&[u8]],
+    policy: ClientAuthPolicy,
+    client_ca_path: &Path,
+) -> io::Result<SharedTlsAcceptor> {
+    let creds = server_credentials_from_pem(cert_path, key_path)?;
+    let mut trust = TrustStore::new();
+    for cert in load_certs(client_ca_path)? {
+        trust.add_anchor(cert);
+    }
+    Ok(Arc::new(PemAcceptor {
+        creds,
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        client_auth: policy,
+        client_trust_store: Some(trust),
     }))
 }
 
@@ -126,6 +158,7 @@ struct TrustedConnector {
     trust_store: Option<TrustStore>,
     verify_override: Option<VerifyOverride>,
     alpn: Vec<Bytes>,
+    client_credentials: Option<ServerCredentials>,
 }
 
 impl TlsConnector for TrustedConnector {
@@ -135,6 +168,7 @@ impl TlsConnector for TrustedConnector {
         config.server_name = Some(server_name.to_string());
         config.trust_store = self.trust_store.clone();
         config.verify_override = self.verify_override.clone();
+        config.client_credentials = self.client_credentials.clone();
         Ok(TlsVariant::V13(TlsRecordEngine::new(config)))
     }
 }
@@ -150,6 +184,7 @@ pub fn connector_with_verify_override(
         trust_store: None,
         verify_override: Some(VerifyOverride(verify)),
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        client_credentials: None,
     })
 }
 
@@ -164,6 +199,29 @@ pub fn connector_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTl
         trust_store: Some(trust),
         verify_override: None,
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        client_credentials: None,
+    }))
+}
+
+/// Build a mutual-TLS [`SharedTlsConnector`]: like [`connector_from_pem`], but
+/// also presents `client_cert_path`/`client_key_path` when the server sends
+/// `CertificateRequest`.
+pub fn connector_from_pem_with_client_cert(
+    ca_path: &Path,
+    client_cert_path: &Path,
+    client_key_path: &Path,
+    alpn: &[&[u8]],
+) -> io::Result<SharedTlsConnector> {
+    let mut trust = TrustStore::new();
+    for cert in load_certs(ca_path)? {
+        trust.add_anchor(cert);
+    }
+    let client_creds = server_credentials_from_pem(client_cert_path, client_key_path)?;
+    Ok(Arc::new(TrustedConnector {
+        trust_store: Some(trust),
+        verify_override: None,
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        client_credentials: Some(client_creds),
     }))
 }
 
@@ -179,6 +237,7 @@ pub fn insecure_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
         trust_store: None,
         verify_override: None,
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        client_credentials: None,
     })
 }
 
@@ -197,6 +256,7 @@ pub fn public_trust_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
         trust_store: Some(public_trust_store()),
         verify_override: None,
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        client_credentials: None,
     })
 }
 
@@ -209,6 +269,8 @@ pub fn public_trust_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
 
 struct PemAcceptorTls12 {
     creds: ServerCredentials,
+    client_auth: ClientAuthPolicy,
+    client_trust_store: Option<TrustStore>,
 }
 
 impl TlsAcceptor for PemAcceptorTls12 {
@@ -223,6 +285,9 @@ impl TlsAcceptor for PemAcceptorTls12 {
             // simple PEM-loaded helper.
             ticket_key: None,
             client_ticket_store: None,
+            client_auth: self.client_auth,
+            client_trust_store: self.client_trust_store.clone(),
+            ..Default::default()
         };
         TlsVariant::V12(tls12::record::Tls12RecordEngine::new(config))
     }
@@ -232,11 +297,29 @@ impl TlsAcceptor for PemAcceptorTls12 {
 /// files — RSA or ECDSA P-256/P-384 only (see `tls12::engine`'s module doc).
 pub fn acceptor_from_pem_tls12(cert_path: &Path, key_path: &Path) -> io::Result<SharedTlsAcceptor> {
     let creds = server_credentials_from_pem(cert_path, key_path)?;
-    Ok(Arc::new(PemAcceptorTls12 { creds }))
+    Ok(Arc::new(PemAcceptorTls12 { creds, client_auth: ClientAuthPolicy::None, client_trust_store: None }))
+}
+
+/// Build a mutual-TLS TLS 1.2 [`SharedTlsAcceptor`]: like
+/// [`acceptor_from_pem_tls12`], but also requests a client certificate
+/// (`policy`) and verifies it against the CA(s) in `client_ca_path`.
+pub fn acceptor_from_pem_tls12_with_client_auth(
+    cert_path: &Path,
+    key_path: &Path,
+    policy: ClientAuthPolicy,
+    client_ca_path: &Path,
+) -> io::Result<SharedTlsAcceptor> {
+    let creds = server_credentials_from_pem(cert_path, key_path)?;
+    let mut trust = TrustStore::new();
+    for cert in load_certs(client_ca_path)? {
+        trust.add_anchor(cert);
+    }
+    Ok(Arc::new(PemAcceptorTls12 { creds, client_auth: policy, client_trust_store: Some(trust) }))
 }
 
 struct TrustedConnectorTls12 {
     trust_store: Option<TrustStore>,
+    client_credentials: Option<ServerCredentials>,
 }
 
 impl TlsConnector for TrustedConnectorTls12 {
@@ -248,6 +331,8 @@ impl TlsConnector for TrustedConnectorTls12 {
             trust_store: self.trust_store.clone(),
             ticket_key: None,
             client_ticket_store: None,
+            client_credentials: self.client_credentials.clone(),
+            ..Default::default()
         };
         Ok(TlsVariant::V12(tls12::record::Tls12RecordEngine::new(config)))
     }
@@ -260,14 +345,30 @@ pub fn connector_from_pem_tls12(ca_path: &Path) -> io::Result<SharedTlsConnector
     for cert in load_certs(ca_path)? {
         trust.add_anchor(cert);
     }
-    Ok(Arc::new(TrustedConnectorTls12 { trust_store: Some(trust) }))
+    Ok(Arc::new(TrustedConnectorTls12 { trust_store: Some(trust), client_credentials: None }))
+}
+
+/// Build a mutual-TLS TLS 1.2 [`SharedTlsConnector`]: like
+/// [`connector_from_pem_tls12`], but also presents
+/// `client_cert_path`/`client_key_path` when the server sends `CertificateRequest`.
+pub fn connector_from_pem_tls12_with_client_cert(
+    ca_path: &Path,
+    client_cert_path: &Path,
+    client_key_path: &Path,
+) -> io::Result<SharedTlsConnector> {
+    let mut trust = TrustStore::new();
+    for cert in load_certs(ca_path)? {
+        trust.add_anchor(cert);
+    }
+    let client_creds = server_credentials_from_pem(client_cert_path, client_key_path)?;
+    Ok(Arc::new(TrustedConnectorTls12 { trust_store: Some(trust), client_credentials: Some(client_creds) }))
 }
 
 /// TLS 1.2 analogue of [`insecure_connector`] — accepts any certificate, for
 /// opportunistic legacy STARTTLS where encryption without authentication is
 /// still strictly better than plaintext.
 pub fn insecure_connector_tls12() -> SharedTlsConnector {
-    Arc::new(TrustedConnectorTls12 { trust_store: None })
+    Arc::new(TrustedConnectorTls12 { trust_store: None, client_credentials: None })
 }
 
 #[cfg(test)]

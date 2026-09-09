@@ -217,6 +217,7 @@ fn decode_message_body(msg_type: HandshakeType, body: &[u8], handler: &mut dyn H
         HandshakeType::ServerHello => decode_server_hello(body, handler),
         HandshakeType::NewSessionTicket => decode_new_session_ticket(body, handler),
         HandshakeType::EncryptedExtensions => decode_encrypted_extensions(body, handler),
+        HandshakeType::CertificateRequest => decode_certificate_request(body, handler),
         HandshakeType::Certificate => decode_certificate(body, handler),
         HandshakeType::CertificateVerify => decode_certificate_verify(body, handler),
         HandshakeType::Finished => decode_finished(body, handler),
@@ -323,6 +324,28 @@ fn decode_encrypted_extensions(body: &[u8], handler: &mut dyn HandshakeEvents) -
     true
 }
 
+fn decode_certificate_request(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
+    if body.is_empty() {
+        handler.parse_error("CertificateRequest empty");
+        return false;
+    }
+    let ctx_len = body[0] as usize;
+    if body.len() < 1 + ctx_len + 2 {
+        handler.parse_error("CertificateRequest truncated at context");
+        return false;
+    }
+    handler.certificate_request_context(&body[1..1 + ctx_len]);
+    let mut i = 1 + ctx_len;
+    let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+    i += 2;
+    if body.len() < i + ext_len {
+        handler.parse_error("CertificateRequest truncated at extensions");
+        return false;
+    }
+    decode_extensions(&body[i..i + ext_len], handler);
+    true
+}
+
 fn decode_certificate(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
     if body.is_empty() {
         handler.parse_error("Certificate empty");
@@ -341,9 +364,13 @@ fn decode_certificate(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
         handler.parse_error("Certificate truncated at list");
         return false;
     }
+    // An empty list is valid on the wire (RFC 8446 §4.4.2: a client with no
+    // certificate to present responds with a `Certificate` containing no
+    // entries) — whether that's acceptable is a caller/policy decision
+    // (see `HandshakeEngine::on_certificate` / `on_client_certificate`),
+    // not something this codec should reject outright.
     let list = &body[i..i + list_len];
     let mut j = 0;
-    let mut any = false;
     while j + 3 <= list.len() {
         let clen = u32::from_be_bytes([0, list[j], list[j + 1], list[j + 2]]) as usize;
         j += 3;
@@ -352,14 +379,9 @@ fn decode_certificate(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
             return false;
         }
         handler.certificate_entry(&list[j..j + clen]);
-        any = true;
         j += clen;
         let ext_len = u16::from_be_bytes([list[j], list[j + 1]]) as usize;
         j += 2 + ext_len;
-    }
-    if !any {
-        handler.parse_error("Certificate has no entries");
-        return false;
     }
     true
 }
@@ -632,6 +654,7 @@ impl HandshakeType {
             4 => Some(HandshakeType::NewSessionTicket),
             8 => Some(HandshakeType::EncryptedExtensions),
             11 => Some(HandshakeType::Certificate),
+            13 => Some(HandshakeType::CertificateRequest),
             15 => Some(HandshakeType::CertificateVerify),
             20 => Some(HandshakeType::Finished),
             _ => None,
@@ -677,6 +700,7 @@ mod tests {
         let kp = EphemeralKeyPair::generate().unwrap();
         let hello = build_client_hello(&ClientHelloParams {
             random: [7u8; 32],
+            cipher_suites: vec![0x1301],
             key_share: KeyShareEntry {
                 group: NamedGroup::X25519.code(),
                 share: Bytes::copy_from_slice(&kp.public_key()),
@@ -710,7 +734,7 @@ mod tests {
     fn server_hello_key_share_single_entry() {
         use crate::crypto::kx::NamedGroup;
         let share = [42u8; 32];
-        let hello = build_server_hello(&[9u8; 32], &[], NamedGroup::X25519.code(), &share);
+        let hello = build_server_hello(&[9u8; 32], &[], 0x1301, NamedGroup::X25519.code(), &share);
         let wire = hello.encode();
 
         let mut parser = HandshakeParser::new();

@@ -14,7 +14,8 @@ mod sink;
 mod tls12;
 
 pub use engine::{
-    HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, ServerCredentials, VerifyOverride,
+    ClientAuthPolicy, HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, ServerCredentials,
+    Tls13Aead, VerifyOverride, AES_128_GCM_SHA256, CHACHA20_POLY1305_SHA256, SUPPORTED_CIPHER_SUITES,
 };
 pub use handshake::ticket::{
     AntiReplay, ClientTicketStore, DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS, TICKET_LIFETIME_SECS,
@@ -23,7 +24,9 @@ pub use handshake::transport_params::{
     decode_initial_max_data, encode_initial_max_data, RememberedTransportLimits,
 };
 pub use pem::{
-    acceptor_from_pem, acceptor_from_pem_tls12, connector_from_pem, connector_from_pem_tls12,
+    acceptor_from_pem, acceptor_from_pem_tls12, acceptor_from_pem_tls12_with_client_auth,
+    acceptor_from_pem_with_client_auth, connector_from_pem, connector_from_pem_tls12,
+    connector_from_pem_tls12_with_client_cert, connector_from_pem_with_client_cert,
     connector_with_verify_override, insecure_connector, insecure_connector_tls12,
     public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor, SharedTlsConnector,
     TlsAcceptor, TlsConnector,

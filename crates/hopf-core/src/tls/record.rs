@@ -7,11 +7,11 @@
 //! events come out. No record layer exists for QUIC (RFC 9001 §4 — packet
 //! protection replaces it); this module is TCP/DTLS-family only.
 
-use crate::crypto::aead::Aes128GcmKey;
+use crate::crypto::aead::{AeadError, Aes128GcmKey, ChaCha20Poly1305Key};
 use crate::crypto::hkdf::expand_label;
 use crate::security::SecurityInfo;
 
-use super::engine::{HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole};
+use super::engine::{HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, Tls13Aead};
 use super::sink::{QuicSecrets, TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyRequest, VerifyResult};
 
 const CONTENT_CHANGE_CIPHER_SPEC: u8 = 20;
@@ -72,24 +72,37 @@ enum Epoch {
     Application,
 }
 
+/// One direction's AEAD key. RFC 8446's AEADs (unlike TLS 1.2's GCM suites)
+/// all share the same nonce construction — IV XOR sequence number, no
+/// explicit per-record nonce on the wire — so only the key type varies
+/// between suites, not the framing.
+enum AeadKeyKind {
+    Aes128Gcm(Aes128GcmKey),
+    ChaCha20Poly1305(ChaCha20Poly1305Key),
+}
+
 /// One direction's AEAD key + IV + sequence number (RFC 8446 §5.3).
 struct DirectionalKeys {
-    key: Aes128GcmKey,
+    key: AeadKeyKind,
     iv: [u8; 12],
     seq: u64,
 }
 
 impl DirectionalKeys {
-    fn from_secret(secret: &[u8; 32]) -> Self {
-        let key_bytes = expand_label(secret, "key", &[], 16);
+    fn from_secret(aead: Tls13Aead, secret: &[u8; 32]) -> Self {
+        let key_bytes = expand_label(secret, "key", &[], aead.key_len());
         let iv_bytes = expand_label(secret, "iv", &[], 12);
         let mut iv = [0u8; 12];
         iv.copy_from_slice(iv_bytes.as_ref());
-        Self {
-            key: Aes128GcmKey::new(key_bytes.as_ref()).expect("16-byte AES-128 key"),
-            iv,
-            seq: 0,
-        }
+        let key = match aead {
+            Tls13Aead::Aes128GcmSha256 => {
+                AeadKeyKind::Aes128Gcm(Aes128GcmKey::new(key_bytes.as_ref()).expect("16-byte AES-128 key"))
+            }
+            Tls13Aead::ChaCha20Poly1305Sha256 => AeadKeyKind::ChaCha20Poly1305(
+                ChaCha20Poly1305Key::new(key_bytes.as_ref()).expect("32-byte ChaCha20-Poly1305 key"),
+            ),
+        };
+        Self { key, iv, seq: 0 }
     }
 
     fn nonce(&self) -> [u8; 12] {
@@ -103,6 +116,20 @@ impl DirectionalKeys {
 
     fn advance(&mut self) {
         self.seq = self.seq.wrapping_add(1);
+    }
+
+    fn seal_in_place_append_tag(&self, nonce: [u8; 12], aad: &[u8], plaintext: &mut Vec<u8>) -> Result<(), AeadError> {
+        match &self.key {
+            AeadKeyKind::Aes128Gcm(k) => k.seal_in_place_append_tag(nonce, aad, plaintext),
+            AeadKeyKind::ChaCha20Poly1305(k) => k.seal_in_place_append_tag(nonce, aad, plaintext),
+        }
+    }
+
+    fn open_in_place(&self, nonce: [u8; 12], aad: &[u8], ciphertext: &mut [u8]) -> Result<usize, AeadError> {
+        match &self.key {
+            AeadKeyKind::Aes128Gcm(k) => k.open_in_place(nonce, aad, ciphertext),
+            AeadKeyKind::ChaCha20Poly1305(k) => k.open_in_place(nonce, aad, ciphertext),
+        }
     }
 }
 
@@ -130,23 +157,23 @@ impl RecordState {
         }
     }
 
-    fn install_handshake_keys(&mut self, client: [u8; 32], server: [u8; 32]) {
+    fn install_handshake_keys(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
         let (w, r) = match self.role {
             HandshakeRole::Client => (client, server),
             HandshakeRole::Server => (server, client),
         };
-        self.write = Some(DirectionalKeys::from_secret(&w));
-        self.read = Some(DirectionalKeys::from_secret(&r));
+        self.write = Some(DirectionalKeys::from_secret(aead, &w));
+        self.read = Some(DirectionalKeys::from_secret(aead, &r));
         self.epoch = Epoch::Handshake;
     }
 
-    fn stage_application_keys(&mut self, client: [u8; 32], server: [u8; 32]) {
+    fn stage_application_keys(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
         let (w, r) = match self.role {
             HandshakeRole::Client => (client, server),
             HandshakeRole::Server => (server, client),
         };
-        self.next_write = Some(DirectionalKeys::from_secret(&w));
-        self.next_read = Some(DirectionalKeys::from_secret(&r));
+        self.next_write = Some(DirectionalKeys::from_secret(aead, &w));
+        self.next_read = Some(DirectionalKeys::from_secret(aead, &r));
     }
 
     fn activate_application_keys(&mut self) {
@@ -179,7 +206,6 @@ fn write_encrypted_record(write: &mut DirectionalKeys, inner_type: u8, payload: 
     ];
     let nonce = write.nonce();
     write
-        .key
         .seal_in_place_append_tag(nonce, &header, &mut plain)
         .expect("seal with a freshly derived key never fails");
     write.advance();
@@ -226,12 +252,12 @@ impl<S: TlsRecordSink + ?Sized> TlsEventSink for InnerSink<'_, S> {
         self.outer.verification_requested(req);
     }
 
-    fn quic_handshake_keys_ready(&mut self, client: [u8; 32], server: [u8; 32]) {
-        self.state.install_handshake_keys(client, server);
+    fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+        self.state.install_handshake_keys(aead, client, server);
     }
 
-    fn application_traffic_keys_ready(&mut self, client: [u8; 32], server: [u8; 32]) {
-        self.state.stage_application_keys(client, server);
+    fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+        self.state.stage_application_keys(aead, client, server);
     }
 
     fn protocol_error(&mut self, err: TlsProtocolError) {
@@ -425,7 +451,7 @@ impl TlsRecordEngine {
                 }
                 let read = self.state.read.as_mut().ok_or(())?;
                 let mut buf = body;
-                let n = read.key.open_in_place(read.nonce(), &header, &mut buf).map_err(|_| ())?;
+                let n = read.open_in_place(read.nonce(), &header, &mut buf).map_err(|_| ())?;
                 read.advance();
                 buf.truncate(n);
                 while buf.last() == Some(&0) {
@@ -519,6 +545,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         };
         let server = HandshakeConfig {
             role: HandshakeRole::Server,
@@ -536,6 +563,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         };
         (client, server)
     }
@@ -577,6 +605,35 @@ mod tests {
         assert!(client.is_complete(), "client: {:?}", sink_c.events);
         assert!(server.is_complete(), "server: {:?}", sink_s.events);
         (sink_c, sink_s, client, server)
+    }
+
+    /// Direct proof that `DirectionalKeys`'s ChaCha20-Poly1305 branch
+    /// actually round-trips real ciphertext through the real wire framing —
+    /// a full handshake can't reach this deterministically (a normal client
+    /// always offers both `SUPPORTED_CIPHER_SUITES` entries, and AES-128-GCM
+    /// is first preference on both sides), so this drives the AEAD dispatch
+    /// directly, the same way as the TLS 1.2 record layer's analogous test.
+    /// Real cipher *negotiation* is proven by `tls::engine`'s
+    /// `server_selects_chacha20_poly1305_when_its_the_only_offered_suite`
+    /// and by the `rustls` interop tests in `hopf-tls`.
+    #[test]
+    fn chacha20_poly1305_direction_round_trips_over_real_wire_framing() {
+        let secret = [0x11u8; 32];
+        let mut write = DirectionalKeys::from_secret(Tls13Aead::ChaCha20Poly1305Sha256, &secret);
+        let read = DirectionalKeys::from_secret(Tls13Aead::ChaCha20Poly1305Sha256, &secret);
+
+        let mut wire = Vec::new();
+        write_encrypted_record(&mut write, CONTENT_APPLICATION_DATA, b"hello chacha13", &mut wire);
+
+        let len = u16::from_be_bytes([wire[3], wire[4]]) as usize;
+        assert_eq!(wire.len(), 5 + len, "no explicit nonce on the wire, unlike TLS 1.2 GCM");
+        let header = [wire[0], wire[1], wire[2], wire[3], wire[4]];
+        let mut buf = wire[5..5 + len].to_vec();
+        let n = read.open_in_place(read.nonce(), &header, &mut buf).unwrap();
+        buf.truncate(n);
+        assert_eq!(buf.last(), Some(&CONTENT_APPLICATION_DATA), "inner content type byte");
+        buf.pop();
+        assert_eq!(buf, b"hello chacha13");
     }
 
     #[test]

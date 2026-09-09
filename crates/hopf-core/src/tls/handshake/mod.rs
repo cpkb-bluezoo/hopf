@@ -23,10 +23,10 @@ pub use key_schedule::{
     early_secret, ApplicationTrafficSecrets, EarlyTrafficSecrets, HandshakeTrafficSecrets,
 };
 pub use messages::{
-    build_certificate, build_certificate_verify, build_client_hello, build_client_hello_with_binder,
-    build_encrypted_extensions, build_encrypted_extensions_ext, build_finished,
-    build_new_session_ticket, build_server_hello, build_server_hello_ext, ClientHelloParams,
-    HandshakeMessage, HandshakeType, KeyShareEntry, OfferedPsk,
+    build_certificate, build_certificate_request, build_certificate_verify, build_client_hello,
+    build_client_hello_with_binder, build_encrypted_extensions, build_encrypted_extensions_ext,
+    build_finished, build_new_session_ticket, build_server_hello, build_server_hello_ext,
+    ClientHelloParams, HandshakeMessage, HandshakeType, KeyShareEntry, OfferedPsk,
 };
 pub use parser::{HandshakeEvents, HandshakeParser};
 pub use ticket::{

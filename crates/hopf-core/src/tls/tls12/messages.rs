@@ -23,10 +23,14 @@ pub enum MessageType {
     Certificate = 11,
     /// ServerKeyExchange.
     ServerKeyExchange = 12,
+    /// CertificateRequest (RFC 5246 §7.4.4 — mTLS).
+    CertificateRequest = 13,
     /// ServerHelloDone.
     ServerHelloDone = 14,
     /// ClientKeyExchange.
     ClientKeyExchange = 16,
+    /// CertificateVerify (RFC 5246 §7.4.8 — mTLS).
+    CertificateVerify = 15,
     /// Finished.
     Finished = 20,
     /// NewSessionTicket (RFC 5077 §3.3).
@@ -42,7 +46,9 @@ impl MessageType {
             4 => Some(Self::NewSessionTicket),
             11 => Some(Self::Certificate),
             12 => Some(Self::ServerKeyExchange),
+            13 => Some(Self::CertificateRequest),
             14 => Some(Self::ServerHelloDone),
+            15 => Some(Self::CertificateVerify),
             16 => Some(Self::ClientKeyExchange),
             20 => Some(Self::Finished),
             _ => None,
@@ -420,6 +426,79 @@ pub fn parse_certificate(body: &[u8]) -> Option<Vec<Bytes>> {
         i += len;
     }
     Some(certs)
+}
+
+/// Build a `CertificateRequest` (RFC 5246 §7.4.4): offers both
+/// `rsa_sign`/`ecdsa_sign` client-certificate types and the same
+/// `SignatureAndHashAlgorithm` pairs [`build_client_hello`] advertises, with
+/// an empty `certificate_authorities` (accept any CA).
+pub fn build_certificate_request() -> Bytes {
+    let mut body = BytesMut::new();
+    // ClientCertificateType: rsa_sign(1), ecdsa_sign(64) (RFC 4492 §5.5).
+    body.extend_from_slice(&[2u8, 1, 64]);
+    let sig_algs: &[(u8, u8)] = &[
+        (sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA),
+        (sig_alg::HASH_SHA256, sig_alg::SIG_RSA),
+        (sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA),
+        (sig_alg::HASH_SHA384, sig_alg::SIG_RSA),
+    ];
+    let mut sig_alg_bytes = BytesMut::new();
+    for (h, s) in sig_algs {
+        sig_alg_bytes.extend_from_slice(&[*h, *s]);
+    }
+    body.extend_from_slice(&(sig_alg_bytes.len() as u16).to_be_bytes());
+    body.extend_from_slice(&sig_alg_bytes);
+    body.extend_from_slice(&0u16.to_be_bytes()); // certificate_authorities: empty
+    encode_message(MessageType::CertificateRequest, &body)
+}
+
+/// Validate a `CertificateRequest` body without extracting anything from
+/// it — this engine always offers the caller's single configured client
+/// certificate (or none) regardless of `certificate_authorities` or the
+/// requested types, so only well-formedness matters.
+pub fn parse_certificate_request(body: &[u8]) -> Option<()> {
+    let types_len = *body.first()? as usize;
+    let mut i = 1;
+    if body.len() < i + types_len + 2 {
+        return None;
+    }
+    i += types_len;
+    let sig_algs_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+    i += 2;
+    if body.len() < i + sig_algs_len + 2 {
+        return None;
+    }
+    i += sig_algs_len;
+    let ca_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+    i += 2;
+    if body.len() < i + ca_len {
+        return None;
+    }
+    Some(())
+}
+
+/// Build a `CertificateVerify` (RFC 5246 §7.4.8) — a client proving
+/// possession of the private key for the certificate it just sent.
+pub fn build_certificate_verify(sig_hash: u8, sig_alg: u8, signature: &[u8]) -> Bytes {
+    let mut body = BytesMut::with_capacity(4 + signature.len());
+    body.extend_from_slice(&[sig_hash, sig_alg]);
+    body.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+    body.extend_from_slice(signature);
+    encode_message(MessageType::CertificateVerify, &body)
+}
+
+/// Parse a `CertificateVerify` body into `(sig_hash, sig_alg, signature)`.
+pub fn parse_certificate_verify(body: &[u8]) -> Option<(u8, u8, Bytes)> {
+    if body.len() < 4 {
+        return None;
+    }
+    let sig_hash = body[0];
+    let sig_alg = body[1];
+    let sig_len = u16::from_be_bytes([body[2], body[3]]) as usize;
+    if body.len() < 4 + sig_len {
+        return None;
+    }
+    Some((sig_hash, sig_alg, Bytes::copy_from_slice(&body[4..4 + sig_len])))
 }
 
 /// Build a `ServerKeyExchange` for ECDHE (RFC 4492 §5.4): explicit named

@@ -6,6 +6,8 @@ use bytes::Bytes;
 
 use crate::security::SecurityInfo;
 
+use super::engine::Tls13Aead;
+
 /// TLS protocol error surfaced to the connection pump — not a `Result` from `feed_*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsProtocolError {
@@ -52,6 +54,8 @@ pub struct VerifyResult {
 /// RFC 9001 QUIC-TLS traffic secrets exported when the handshake completes (QUIC-first path).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicSecrets {
+    /// Negotiated AEAD — see [`TlsEventSink::quic_handshake_keys_ready`].
+    pub aead: Tls13Aead,
     /// Client handshake traffic secret (32 bytes).
     pub client_handshake_traffic_secret: [u8; 32],
     /// Server handshake traffic secret (32 bytes).
@@ -79,17 +83,21 @@ pub trait TlsEventSink {
     fn peer_transport_parameters(&mut self, _params: &[u8]) {}
 
     /// Handshake traffic secrets are available — install Handshake packet-space keys.
-    fn quic_handshake_keys_ready(&mut self, _client: [u8; 32], _server: [u8; 32]) {}
+    /// `aead` is the negotiated cipher suite's AEAD (RFC 8446 §9.1's MUST
+    /// `TLS_AES_128_GCM_SHA256` or SHOULD `TLS_CHACHA20_POLY1305_SHA256`) — the
+    /// only thing that differs between them is AEAD key length.
+    fn quic_handshake_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
 
     /// Client early traffic secret available (0-RTT keys) — before or with ClientHello send /
-    /// after accepting a PSK on the server.
-    fn quic_early_keys_ready(&mut self, _client_early: [u8; 32]) {}
+    /// after accepting a PSK on the server. See [`Self::quic_handshake_keys_ready`] for `aead`.
+    fn quic_early_keys_ready(&mut self, _aead: Tls13Aead, _client_early: [u8; 32]) {}
 
     /// Application traffic secrets — fired alongside `handshake_complete` in both
     /// [`super::HandshakeMode::Quic`] and [`super::HandshakeMode::TcpRecordLayer`] (the QUIC
     /// path also gets these via `handshake_complete`'s `QuicSecrets`; the TCP record layer has
-    /// no other way to learn them, since `QuicSecrets` is QUIC-only).
-    fn application_traffic_keys_ready(&mut self, _client: [u8; 32], _server: [u8; 32]) {}
+    /// no other way to learn them, since `QuicSecrets` is QUIC-only). See
+    /// [`Self::quic_handshake_keys_ready`] for `aead`.
+    fn application_traffic_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
 
     /// Negotiated TLS key-exchange group (IANA code, e.g. 0x11ec for X25519MLKEM768).
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
@@ -119,9 +127,9 @@ impl TlsEventSink for NopTlsEventSink {
     fn handshake_complete(&mut self, _info: SecurityInfo, _quic_secrets: Option<QuicSecrets>) {}
     fn verification_requested(&mut self, _req: VerifyRequest) {}
     fn peer_transport_parameters(&mut self, _params: &[u8]) {}
-    fn quic_handshake_keys_ready(&mut self, _client: [u8; 32], _server: [u8; 32]) {}
-    fn quic_early_keys_ready(&mut self, _client_early: [u8; 32]) {}
-    fn application_traffic_keys_ready(&mut self, _client: [u8; 32], _server: [u8; 32]) {}
+    fn quic_handshake_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
+    fn quic_early_keys_ready(&mut self, _aead: Tls13Aead, _client_early: [u8; 32]) {}
+    fn application_traffic_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
     fn early_data_accepted(&mut self, _accepted: bool) {}
     fn quic_0rtt_peer_limits(&mut self, _limits: super::handshake::RememberedTransportLimits) {}

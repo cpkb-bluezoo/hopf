@@ -21,6 +21,8 @@ pub struct ParsedClientHello {
     /// mode (Appendix D.4, e.g. rustls) sends a random 32 bytes here and
     /// aborts the handshake if the echo doesn't match.
     pub legacy_session_id: Bytes,
+    /// Cipher suites offered.
+    pub cipher_suites: Vec<u16>,
     /// Client key share bytes.
     pub peer_key_share: Option<Bytes>,
     /// Group id for [`Self::peer_key_share`].
@@ -100,6 +102,10 @@ impl HandshakeEvents for ClientHelloCollector {
 
     fn session_id(&mut self, value: &[u8]) {
         self.out.legacy_session_id = Bytes::copy_from_slice(value);
+    }
+
+    fn cipher_suite_offered(&mut self, suite: u16) {
+        self.out.cipher_suites.push(suite);
     }
 
     fn supported_group(&mut self, group: u16) {
@@ -258,6 +264,7 @@ impl HandshakeEvents for NewSessionTicketCollector {
 
 #[derive(Default)]
 struct CertificateCollector {
+    context: Bytes,
     certs: Vec<Bytes>,
     failed: bool,
 }
@@ -265,8 +272,32 @@ struct CertificateCollector {
 impl HandshakeEvents for CertificateCollector {
     fn message_begin(&mut self, _msg_type: HandshakeType) {}
 
+    fn certificate_request_context(&mut self, ctx: &[u8]) {
+        self.context = Bytes::copy_from_slice(ctx);
+    }
+
     fn certificate_entry(&mut self, der: &[u8]) {
         self.certs.push(Bytes::copy_from_slice(der));
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+#[derive(Default)]
+struct CertificateRequestCollector {
+    context: Bytes,
+    failed: bool,
+}
+
+impl HandshakeEvents for CertificateRequestCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn certificate_request_context(&mut self, ctx: &[u8]) {
+        self.context = Bytes::copy_from_slice(ctx);
     }
 
     fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
@@ -413,8 +444,12 @@ pub(crate) enum ParsedIncoming {
     ServerHello(ParsedServerHello),
     /// EncryptedExtensions.
     EncryptedExtensions(ParsedEncryptedExtensions),
-    /// Certificate chain (DER, leaf first).
-    Certificate(Vec<Bytes>),
+    /// CertificateRequest's `certificate_request_context`.
+    CertificateRequest(Bytes),
+    /// Certificate `(certificate_request_context, chain)` — chain is DER,
+    /// leaf first, and may legitimately be empty for a client's response to
+    /// `CertificateRequest` when it has no certificate to present.
+    Certificate(Bytes, Vec<Bytes>),
     /// CertificateVerify `(scheme, signature)`.
     CertificateVerify(u16, Bytes),
     /// Finished verify_data.
@@ -433,6 +468,8 @@ pub(crate) enum MessageCollector {
     ServerHello(ServerHelloCollector),
     /// Collecting EncryptedExtensions.
     EncryptedExtensions(EncryptedExtensionsCollector),
+    /// Collecting CertificateRequest.
+    CertificateRequest(CertificateRequestCollector),
     /// Collecting Certificate.
     Certificate(CertificateCollector),
     /// Collecting CertificateVerify.
@@ -471,11 +508,17 @@ impl MessageCollector {
                 }
                 Some(ParsedIncoming::EncryptedExtensions(c.out))
             }
-            (HandshakeType::Certificate, Self::Certificate(c)) => {
-                if c.failed || c.certs.is_empty() {
+            (HandshakeType::CertificateRequest, Self::CertificateRequest(c)) => {
+                if c.failed {
                     return None;
                 }
-                Some(ParsedIncoming::Certificate(c.certs))
+                Some(ParsedIncoming::CertificateRequest(c.context))
+            }
+            (HandshakeType::Certificate, Self::Certificate(c)) => {
+                if c.failed {
+                    return None;
+                }
+                Some(ParsedIncoming::Certificate(c.context, c.certs))
             }
             (HandshakeType::CertificateVerify, Self::CertificateVerify(c)) => {
                 if c.failed || !c.got {
@@ -507,6 +550,9 @@ impl HandshakeEvents for MessageCollector {
             HandshakeType::ServerHello => Self::ServerHello(ServerHelloCollector::default()),
             HandshakeType::EncryptedExtensions => {
                 Self::EncryptedExtensions(EncryptedExtensionsCollector::default())
+            }
+            HandshakeType::CertificateRequest => {
+                Self::CertificateRequest(CertificateRequestCollector::default())
             }
             HandshakeType::Certificate => Self::Certificate(CertificateCollector::default()),
             HandshakeType::CertificateVerify => {
@@ -641,8 +687,10 @@ impl HandshakeEvents for MessageCollector {
     fn extension(&mut self, _ext_type: u16, _data: &[u8]) {}
 
     fn certificate_request_context(&mut self, ctx: &[u8]) {
-        if let Self::Certificate(c) = self {
-            c.certificate_request_context(ctx);
+        match self {
+            Self::Certificate(c) => c.certificate_request_context(ctx),
+            Self::CertificateRequest(c) => c.certificate_request_context(ctx),
+            _ => {}
         }
     }
 
@@ -671,6 +719,7 @@ impl HandshakeEvents for MessageCollector {
             Self::ClientHello(c) => c.parse_error(detail),
             Self::ServerHello(c) => c.parse_error(detail),
             Self::EncryptedExtensions(c) => c.parse_error(detail),
+            Self::CertificateRequest(c) => c.parse_error(detail),
             Self::Certificate(c) => c.parse_error(detail),
             Self::CertificateVerify(c) => c.parse_error(detail),
             Self::Finished(c) => c.parse_error(detail),

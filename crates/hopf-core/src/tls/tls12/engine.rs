@@ -3,16 +3,19 @@
 //! TLS 1.2 handshake engine (RFC 5246 full handshake, RFC 4492/8422 ECDHE).
 //!
 //! Scope for this pass: ECDHE key exchange only (no static-RSA — no forward
-//! secrecy, and it doesn't fit this codebase's PQC-first posture), GCM
-//! cipher suites only (RFC 5289) — CBC is real, still-needed legacy-server
-//! scope per the migration plan, but its MAC-then-encrypt record layer has
-//! a real history of subtle timing side channels (Lucky Thirteen and
-//! friends) that deserves its own dedicated, carefully-reviewed pass rather
-//! than being rushed in alongside the rest of this. No client certificates,
-//! no renegotiation. Session resumption is RFC 5077 stateless tickets (see
-//! [`super::ticket`]), not RFC 5246 §7.3 session-ID server-side caching —
-//! no server-side session state to scale/evict, and it reuses the same
-//! opaque-ticket shape this crate already has for TLS 1.3.
+//! secrecy, and it doesn't fit this codebase's PQC-first posture), AEAD
+//! cipher suites only (RFC 5289 GCM today) — CBC suites are **explicitly
+//! not planned**, not merely deferred: MAC-then-encrypt CBC has a real,
+//! recurring history of timing side channels (Lucky Thirteen and friends,
+//! repeatedly reopened by supposedly-fixed implementations across the
+//! industry), and AEAD (GCM here; ChaCha20-Poly1305 is a reasonable future
+//! addition, per the migration plan) is sufficient for every cipher suite
+//! this crate needs to offer. No renegotiation. Session resumption is RFC
+//! 5077 stateless tickets (see [`super::ticket`]), not RFC 5246 §7.3
+//! session-ID server-side caching — no server-side session state to
+//! scale/evict, and it reuses the same opaque-ticket shape this crate
+//! already has for TLS 1.3. Client certificate authentication (mTLS) is
+//! supported — see [`ClientAuthPolicy`].
 //!
 //! Reactive/sink-based like every other engine in this crate — see
 //! [`Tls12EventSink`]. Deliberately independent of [`super::engine`] (the
@@ -36,7 +39,7 @@ use crate::crypto::trust::TrustStore;
 use crate::crypto::x509::parse_certificate;
 use crate::security::SecurityInfo;
 
-use super::super::engine::ServerCredentials;
+use super::super::engine::{ClientAuthPolicy, ServerCredentials};
 use super::super::handshake::verify::{pkcs8_key_kind, KeyKind};
 use super::super::sink::{TlsProtocolError, VerifyRequest, VerifyResult};
 use super::messages::{self, sig_alg, MessageType};
@@ -50,31 +53,55 @@ pub const ECDHE_ECDSA_AES256_GCM_SHA384: u16 = 0xC02C;
 pub const ECDHE_RSA_AES128_GCM_SHA256: u16 = 0xC02F;
 /// `TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384` (RFC 5289).
 pub const ECDHE_RSA_AES256_GCM_SHA384: u16 = 0xC030;
+/// `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (RFC 7905).
+pub const ECDHE_ECDSA_CHACHA20_POLY1305_SHA256: u16 = 0xCCA9;
+/// `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` (RFC 7905).
+pub const ECDHE_RSA_CHACHA20_POLY1305_SHA256: u16 = 0xCCA8;
 
-/// Cipher suites this engine offers/accepts, in preference order.
+/// Cipher suites this engine offers/accepts, in preference order. AES-128-GCM
+/// first (broadest hardware/peer support), then ChaCha20-Poly1305 (equally
+/// strong, faster without AES-NI), then AES-256-GCM. No CBC suites — see
+/// this module's doc comment and `crypto-migration-plan.md`'s Non-goals.
 pub const SUPPORTED_CIPHER_SUITES: &[u16] = &[
     ECDHE_ECDSA_AES128_GCM_SHA256,
     ECDHE_RSA_AES128_GCM_SHA256,
+    ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
+    ECDHE_RSA_CHACHA20_POLY1305_SHA256,
     ECDHE_ECDSA_AES256_GCM_SHA384,
     ECDHE_RSA_AES256_GCM_SHA384,
 ];
 
-/// GCM key size this suite negotiates to (the record layer's concern; named
-/// here since suite selection is where it's first known).
+/// AEAD this suite negotiates to (the record layer's concern; named here
+/// since suite selection is where it's first known).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CipherKind {
     /// AES-128-GCM.
     Aes128Gcm,
     /// AES-256-GCM.
     Aes256Gcm,
+    /// ChaCha20-Poly1305 (RFC 7905).
+    ChaCha20Poly1305,
 }
 
 impl CipherKind {
-    /// AES key length in bytes.
+    /// AEAD key length in bytes.
     pub fn key_len(self) -> usize {
         match self {
             CipherKind::Aes128Gcm => 16,
             CipherKind::Aes256Gcm => 32,
+            CipherKind::ChaCha20Poly1305 => 32,
+        }
+    }
+
+    /// Fixed IV length in bytes: 4 for GCM's `salt` (RFC 5288 §3 —
+    /// concatenated with an 8-byte explicit per-record nonce carried on the
+    /// wire), 12 for ChaCha20-Poly1305's full IV (RFC 7905 §2 — no explicit
+    /// nonce at all; XORed with the sequence number instead, the same
+    /// construction TLS 1.3 uses throughout).
+    pub fn iv_len(self) -> usize {
+        match self {
+            CipherKind::Aes128Gcm | CipherKind::Aes256Gcm => 4,
+            CipherKind::ChaCha20Poly1305 => 12,
         }
     }
 }
@@ -85,19 +112,22 @@ fn cipher_info(suite: u16) -> Option<(CipherKind, PrfHash, KeyKind)> {
         ECDHE_ECDSA_AES256_GCM_SHA384 => Some((CipherKind::Aes256Gcm, PrfHash::Sha384, KeyKind::EcdsaP256)),
         ECDHE_RSA_AES128_GCM_SHA256 => Some((CipherKind::Aes128Gcm, PrfHash::Sha256, KeyKind::Rsa)),
         ECDHE_RSA_AES256_GCM_SHA384 => Some((CipherKind::Aes256Gcm, PrfHash::Sha384, KeyKind::Rsa)),
+        ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 => Some((CipherKind::ChaCha20Poly1305, PrfHash::Sha256, KeyKind::EcdsaP256)),
+        ECDHE_RSA_CHACHA20_POLY1305_SHA256 => Some((CipherKind::ChaCha20Poly1305, PrfHash::Sha256, KeyKind::Rsa)),
         _ => None,
     }
 }
 
-/// Fixed GCM key material for one direction — RFC 5288 §3 (`GenericAEADCipher`
-/// with a per-record explicit nonce; only the 4-byte `salt`/fixed-IV lives
-/// here, the explicit part is per-record).
+/// Fixed AEAD key material for one direction. `fixed_iv` is 4 bytes for GCM
+/// suites (RFC 5288 §3's `salt`, concatenated with a per-record explicit
+/// nonce) or 12 bytes for ChaCha20-Poly1305 (RFC 7905 §2's full IV, XORed
+/// with the sequence number) — see [`CipherKind::iv_len`].
 #[derive(Clone)]
 pub struct DirectionalKeyMaterial {
-    /// AES-GCM key.
+    /// AEAD key.
     pub key: Bytes,
-    /// 4-byte fixed IV (`salt`), prepended to each record's 8-byte explicit nonce.
-    pub fixed_iv: [u8; 4],
+    /// Fixed IV — length depends on the negotiated cipher, see [`CipherKind::iv_len`].
+    pub fixed_iv: Bytes,
 }
 
 /// Client or server role.
@@ -130,6 +160,35 @@ pub struct Config {
     /// disables offering resumption (the `SessionTicket` extension is
     /// omitted entirely, not just sent empty).
     pub client_ticket_store: Option<Arc<Tls12ClientTicketStore>>,
+    /// Client-certificate policy (server role); mTLS. `None` (default)
+    /// never sends `CertificateRequest`, matching prior behavior.
+    pub client_auth: ClientAuthPolicy,
+    /// Trust anchors for verifying the client's certificate chain (server
+    /// role) — only consulted when [`Self::client_auth`] isn't
+    /// [`ClientAuthPolicy::None`]. `None` gates on
+    /// [`Tls12EventSink::verification_requested`] instead.
+    pub client_trust_store: Option<TrustStore>,
+    /// Certificate + key to present when the server sends
+    /// `CertificateRequest` (client role). `None` responds with an empty
+    /// certificate list (RFC 5246 §7.4.6 permits this) — the handshake
+    /// still proceeds unless the server enforces [`ClientAuthPolicy::Require`].
+    pub client_credentials: Option<ServerCredentials>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            role: Role::Client,
+            server_name: None,
+            server: None,
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+            client_auth: ClientAuthPolicy::None,
+            client_trust_store: None,
+            client_credentials: None,
+        }
+    }
 }
 
 /// Events emitted by [`Tls12Engine`] — consumed by the TLS 1.2 record layer.
@@ -170,11 +229,19 @@ enum State {
     ExpectServerHello,
     ExpectCertificate,
     ExpectServerKeyExchange,
+    /// After ServerKeyExchange — either a `CertificateRequest` or
+    /// `ServerHelloDone` may come next (RFC 5246 §7.4.4/§7.4.5).
+    ExpectServerHelloDoneOrCertRequest,
     ExpectServerHelloDone,
     ExpectServerFinished,
     ExpectServerFinishedResumed,
     // server
+    /// Server sent `CertificateRequest` — waiting for the client's `Certificate`.
+    ExpectClientCertificate,
     ExpectClientKeyExchange,
+    /// Client's `Certificate` had entries — waiting for `CertificateVerify`
+    /// before `Finished`.
+    ExpectClientCertificateVerify,
     ExpectClientFinished,
     ExpectClientFinishedResumed,
     Complete,
@@ -184,6 +251,13 @@ enum State {
 struct Transcript {
     sha256: Sha256Context,
     sha384: Sha256Context,
+    /// Raw concatenated handshake message bytes seen so far. TLS 1.2
+    /// `CertificateVerify` (RFC 5246 §7.4.8) signs `Hash(handshake_messages)`
+    /// directly — not a further-hashed wrapper the way TLS 1.3's
+    /// `CertificateVerify` does — and this crate's signing primitives hash
+    /// their input themselves (see `crypto::signature`), so the exact raw
+    /// bytes are needed here rather than just the running digest.
+    raw: BytesMut,
 }
 
 impl Transcript {
@@ -191,12 +265,14 @@ impl Transcript {
         Self {
             sha256: Sha256Context::new(HashAlgorithm::Sha256),
             sha384: Sha256Context::new(HashAlgorithm::Sha384),
+            raw: BytesMut::new(),
         }
     }
 
     fn add_message(&mut self, wire: &[u8]) {
         self.sha256.update(wire);
         self.sha384.update(wire);
+        self.raw.extend_from_slice(wire);
     }
 
     fn hash(&self, prf_hash: PrfHash) -> Vec<u8> {
@@ -204,6 +280,11 @@ impl Transcript {
             PrfHash::Sha256 => self.sha256.clone().finish().into_bytes().to_vec(),
             PrfHash::Sha384 => self.sha384.clone().finish().into_bytes().to_vec(),
         }
+    }
+
+    /// Raw concatenated handshake bytes so far — see the field doc comment.
+    fn raw_bytes(&self) -> &[u8] {
+        &self.raw
     }
 }
 
@@ -286,6 +367,14 @@ pub struct Tls12Engine {
     /// message in the final flight be accepted rather than treated as a
     /// protocol violation.
     expect_new_session_ticket: bool,
+    /// Client role: the server sent `CertificateRequest` this handshake —
+    /// respond with `Certificate` before `ClientKeyExchange`, and
+    /// `CertificateVerify` right after it if that `Certificate` was
+    /// non-empty (RFC 5246 §7.4.6/§7.4.8).
+    client_cert_requested: bool,
+    /// Server role: the client's `Certificate` (already processed) had at
+    /// least one entry — only then is `CertificateVerify` expected.
+    expect_client_certificate_verify: bool,
 }
 
 impl Tls12Engine {
@@ -313,6 +402,8 @@ impl Tls12Engine {
             pending_resume_ticket: None,
             should_issue_ticket: false,
             expect_new_session_ticket: false,
+            client_cert_requested: false,
+            expect_client_certificate_verify: false,
         }
     }
 
@@ -413,9 +504,14 @@ impl Tls12Engine {
             (Role::Client, State::ExpectServerKeyExchange, MessageType::ServerKeyExchange) => {
                 self.on_server_key_exchange(body, wire, sink)
             }
-            (Role::Client, State::ExpectServerHelloDone, MessageType::ServerHelloDone) => {
-                self.on_server_hello_done(wire, sink)
+            (Role::Client, State::ExpectServerHelloDoneOrCertRequest, MessageType::CertificateRequest) => {
+                self.on_certificate_request(body, wire, sink)
             }
+            (
+                Role::Client,
+                State::ExpectServerHelloDoneOrCertRequest | State::ExpectServerHelloDone,
+                MessageType::ServerHelloDone,
+            ) => self.on_server_hello_done(wire, sink),
             (Role::Client, State::ExpectServerFinished, MessageType::Finished) => self.on_server_finished(body, wire, sink),
             (Role::Client, State::ExpectServerFinished, MessageType::NewSessionTicket) => {
                 self.on_new_session_ticket(body, wire, sink)
@@ -424,8 +520,14 @@ impl Tls12Engine {
                 self.on_server_finished_resumed(body, wire, sink)
             }
             (Role::Server, State::Initial, MessageType::ClientHello) => self.on_client_hello(body, wire, sink),
+            (Role::Server, State::ExpectClientCertificate, MessageType::Certificate) => {
+                self.on_client_certificate(body, wire, sink)
+            }
             (Role::Server, State::ExpectClientKeyExchange, MessageType::ClientKeyExchange) => {
                 self.on_client_key_exchange(body, wire, sink)
+            }
+            (Role::Server, State::ExpectClientCertificateVerify, MessageType::CertificateVerify) => {
+                self.on_client_certificate_verify(body, wire, sink)
             }
             (Role::Server, State::ExpectClientFinished, MessageType::Finished) => self.on_client_finished(body, wire, sink),
             (Role::Server, State::ExpectClientFinishedResumed, MessageType::Finished) => {
@@ -577,6 +679,17 @@ impl Tls12Engine {
         }
         self.peer_ec_point = Some(ske.ec_point);
         self.transcript.add_message(&wire);
+        self.state = State::ExpectServerHelloDoneOrCertRequest;
+        true
+    }
+
+    fn on_certificate_request<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
+        if messages::parse_certificate_request(body).is_none() {
+            self.fail(sink, "malformed CertificateRequest");
+            return false;
+        }
+        self.transcript.add_message(&wire);
+        self.client_cert_requested = true;
         self.state = State::ExpectServerHelloDone;
         true
     }
@@ -598,8 +711,35 @@ impl Tls12Engine {
         };
         self.derive_master_secret(&pre_master);
 
+        // Client's response to CertificateRequest — Certificate goes before
+        // ClientKeyExchange (RFC 5246 §7.4.6); CertificateVerify (if we
+        // presented a non-empty chain) goes right after it, below.
+        let sent_client_cert = if self.client_cert_requested {
+            self.client_cert_requested = false;
+            let creds = self.config.client_credentials.clone();
+            let cert_refs: Vec<&[u8]> = creds
+                .as_ref()
+                .map(|c| c.cert_chain.iter().map(|c| c.as_ref()).collect())
+                .unwrap_or_default();
+            let cert_msg = messages::build_certificate(&cert_refs);
+            self.emit(&cert_msg, sink);
+            creds.filter(|c| !c.cert_chain.is_empty())
+        } else {
+            None
+        };
+
         let cke = messages::build_client_key_exchange(&client_point);
         self.emit(&cke, sink);
+
+        if let Some(creds) = sent_client_cert {
+            let message = self.transcript.raw_bytes().to_vec();
+            let Some((sig_hash, sig_alg, signature)) = sign_ske(&creds.signing_key_pkcs8, &message) else {
+                self.fail(sink, "unsupported or invalid client signing key");
+                return false;
+            };
+            let cv = messages::build_certificate_verify(sig_hash, sig_alg, &signature);
+            self.emit(&cv, sink);
+        }
 
         let Some((client_keys, server_keys)) = self.compute_key_material() else {
             self.fail(sink, "key material derivation failed");
@@ -722,11 +862,57 @@ impl Tls12Engine {
         self.emit(&ske, sink);
         self.local_ecdhe = Some(local);
 
+        if self.config.client_auth != ClientAuthPolicy::None {
+            let cr = messages::build_certificate_request();
+            self.emit(&cr, sink);
+        }
+
         let shd = messages::build_server_hello_done();
         self.emit(&shd, sink);
 
-        self.state = State::ExpectClientKeyExchange;
+        self.state = if self.config.client_auth != ClientAuthPolicy::None {
+            State::ExpectClientCertificate
+        } else {
+            State::ExpectClientKeyExchange
+        };
         true
+    }
+
+    fn on_client_certificate<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
+        let Some(certs) = messages::parse_certificate(body) else {
+            self.fail(sink, "malformed Certificate");
+            return false;
+        };
+        self.transcript.add_message(&wire);
+        if certs.is_empty() {
+            if self.config.client_auth == ClientAuthPolicy::Require {
+                self.fail(sink, "client certificate required but none presented");
+                return false;
+            }
+            self.state = State::ExpectClientKeyExchange;
+            return true;
+        }
+        self.peer_certs = certs;
+        self.expect_client_certificate_verify = true;
+        self.verify_id += 1;
+        self.verify_pending = true;
+        sink.verification_requested(VerifyRequest {
+            id: self.verify_id,
+            peer_chain: self.peer_certs.clone(),
+            server_name: None,
+        });
+        if let Some(store) = &self.config.client_trust_store {
+            let ok = store.verify_server_chain(&self.peer_certs, None).is_ok();
+            self.verify_pending = false;
+            if !ok {
+                self.fail(sink, "client certificate verification failed");
+                return false;
+            }
+            self.state = State::ExpectClientKeyExchange;
+            return true;
+        }
+        self.state = State::ExpectClientKeyExchange;
+        false // gate: wait for feed_verification_result
     }
 
     fn on_client_key_exchange<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
@@ -749,6 +935,32 @@ impl Tls12Engine {
             return false;
         };
         sink.keys_ready(self.cipher_kind.expect("cipher negotiated"), client_keys, server_keys);
+        self.state = if self.expect_client_certificate_verify {
+            State::ExpectClientCertificateVerify
+        } else {
+            State::ExpectClientFinished
+        };
+        true
+    }
+
+    fn on_client_certificate_verify<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
+        let Some((sig_hash, sig_alg, signature)) = messages::parse_certificate_verify(body) else {
+            self.fail(sink, "malformed CertificateVerify");
+            return false;
+        };
+        let Some(leaf) = self.peer_certs.first() else {
+            self.fail(sink, "CertificateVerify without client certificate");
+            return false;
+        };
+        // Signs the transcript through ClientKeyExchange — `wire` (this
+        // message) is not yet added to it below.
+        let message = self.transcript.raw_bytes().to_vec();
+        if !verify_ske_signature(leaf, sig_hash, sig_alg, &message, &signature) {
+            self.fail(sink, "client CertificateVerify signature invalid");
+            return false;
+        }
+        self.transcript.add_message(&wire);
+        self.expect_client_certificate_verify = false;
         self.state = State::ExpectClientFinished;
         true
     }
@@ -811,7 +1023,8 @@ impl Tls12Engine {
         let cipher = self.cipher_kind?;
         let master = self.master_secret?;
         let key_len = cipher.key_len();
-        let total = 2 * key_len + 2 * 4;
+        let iv_len = cipher.iv_len();
+        let total = 2 * key_len + 2 * iv_len;
         let mut seed = Vec::with_capacity(64);
         seed.extend_from_slice(&self.server_random);
         seed.extend_from_slice(&self.client_random);
@@ -822,11 +1035,9 @@ impl Tls12Engine {
         i += key_len;
         let server_key = Bytes::copy_from_slice(&block[i..i + key_len]);
         i += key_len;
-        let mut client_iv = [0u8; 4];
-        client_iv.copy_from_slice(&block[i..i + 4]);
-        i += 4;
-        let mut server_iv = [0u8; 4];
-        server_iv.copy_from_slice(&block[i..i + 4]);
+        let client_iv = Bytes::copy_from_slice(&block[i..i + iv_len]);
+        i += iv_len;
+        let server_iv = Bytes::copy_from_slice(&block[i..i + iv_len]);
 
         Some((
             DirectionalKeyMaterial { key: client_key, fixed_iv: client_iv },
@@ -860,10 +1071,19 @@ impl Tls12Engine {
             Some(ECDHE_ECDSA_AES256_GCM_SHA384) => "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
             Some(ECDHE_RSA_AES128_GCM_SHA256) => "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
             Some(ECDHE_RSA_AES256_GCM_SHA384) => "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+            Some(ECDHE_ECDSA_CHACHA20_POLY1305_SHA256) => "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+            Some(ECDHE_RSA_CHACHA20_POLY1305_SHA256) => "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
             _ => "unknown",
         };
-        let info = SecurityInfo::secure(self.negotiated_alpn.clone(), Some("TLSv1.2".to_string()), Some(suite_name.to_string()))
+        let mut info = SecurityInfo::secure(self.negotiated_alpn.clone(), Some("TLSv1.2".to_string()), Some(suite_name.to_string()))
             .with_sni(sni);
+        if self.config.role == Role::Server {
+            if let Some(leaf) = self.peer_certs.first() {
+                info = info
+                    .with_peer_certificate_fingerprint(Some(crate::crypto::sha256_fingerprint_hex(leaf)))
+                    .with_peer_certificate_chain(Some(self.peer_certs.clone()));
+            }
+        }
         sink.handshake_complete(info);
     }
 
@@ -1000,6 +1220,7 @@ mod tests {
             trust_store: Some(trust),
             ticket_key: None,
             client_ticket_store: None,
+            ..Default::default()
         };
         let server_cfg = Config {
             role: Role::Server,
@@ -1008,6 +1229,7 @@ mod tests {
             trust_store: None,
             ticket_key: None,
             client_ticket_store: None,
+            ..Default::default()
         };
 
         let mut client = Tls12Engine::new(client_cfg);
@@ -1118,6 +1340,7 @@ mod tests {
             trust_store: Some(trust),
             ticket_key: None,
             client_ticket_store: None,
+            ..Default::default()
         };
         let server_cfg = Config {
             role: Role::Server,
@@ -1126,6 +1349,7 @@ mod tests {
             trust_store: None,
             ticket_key: None,
             client_ticket_store: None,
+            ..Default::default()
         };
 
         let mut client = Tls12Engine::new(client_cfg);
@@ -1155,6 +1379,7 @@ mod tests {
             trust_store: Some(trust),
             ticket_key: None,
             client_ticket_store: None,
+            ..Default::default()
         };
         let server_cfg = Config {
             role: Role::Server,
@@ -1163,6 +1388,7 @@ mod tests {
             trust_store: None,
             ticket_key: None,
             client_ticket_store: None,
+            ..Default::default()
         };
         let mut client = Tls12Engine::new(client_cfg);
         let mut server = Tls12Engine::new(server_cfg);
@@ -1219,6 +1445,7 @@ mod tests {
             trust_store: Some(trust),
             ticket_key: None,
             client_ticket_store: Some(store.clone()),
+            ..Default::default()
         };
         let server_cfg = Config {
             role: Role::Server,
@@ -1227,6 +1454,7 @@ mod tests {
             trust_store: None,
             ticket_key: Some(ticket_key),
             client_ticket_store: None,
+            ..Default::default()
         };
 
         // --- first connection: full handshake, server issues a ticket ---
@@ -1286,6 +1514,7 @@ mod tests {
             trust_store: Some(trust),
             ticket_key: None,
             client_ticket_store: Some(store.clone()),
+            ..Default::default()
         };
         let server_cfg = Config {
             role: Role::Server,
@@ -1294,6 +1523,7 @@ mod tests {
             trust_store: None,
             ticket_key: Some(ticket_key),
             client_ticket_store: None,
+            ..Default::default()
         };
 
         let mut client = Tls12Engine::new(client_cfg.clone());
@@ -1314,6 +1544,7 @@ mod tests {
             trust_store: None,
             ticket_key: Some(rotated_key),
             client_ticket_store: None,
+            ..Default::default()
         };
 
         let mut client2 = Tls12Engine::new(client_cfg);
@@ -1340,5 +1571,208 @@ mod tests {
         assert!(server2.is_complete(), "server2: {:?}", sink_s2.events);
         // The rotated key can mint a fresh ticket too — resumption support recovers.
         assert!(store.get("localhost").is_some());
+    }
+
+    // ---- mTLS (client certificate authentication) ----
+
+    fn client_config_with_cert(server_creds: &ServerCredentials, client_creds: ServerCredentials) -> Config {
+        let mut trust = TrustStore::new();
+        trust.add_anchor(server_creds.cert_chain[0].clone());
+        Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: None,
+            client_credentials: Some(client_creds),
+            ..Default::default()
+        }
+    }
+
+    fn server_config_requiring_client_cert(
+        server_creds: ServerCredentials,
+        client_creds: &ServerCredentials,
+        policy: ClientAuthPolicy,
+    ) -> Config {
+        let mut trust = TrustStore::new();
+        trust.add_anchor(client_creds.cert_chain[0].clone());
+        Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(server_creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+            client_auth: policy,
+            client_trust_store: Some(trust),
+            client_credentials: None,
+        }
+    }
+
+    #[test]
+    fn mtls_require_completes_when_client_presents_a_trusted_certificate() {
+        let server_creds = test_server_credentials_ecdsa();
+        let client_creds = test_server_credentials_ecdsa();
+        let client_cfg = client_config_with_cert(&server_creds, client_creds.clone());
+        let server_cfg = server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let mut client = Tls12Engine::new(client_cfg);
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        run_full_handshake(&mut client, &mut server, &mut sink_c, &mut sink_s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+        assert!(
+            sink_s.events.iter().any(|e| e.starts_with("verification_requested")),
+            "{:?}",
+            sink_s.events
+        );
+    }
+
+    /// Same guarantee as the TLS 1.3 engine's analogous test: the server's
+    /// `SecurityInfo` must expose the verified client certificate's
+    /// fingerprint and chain (SASL EXTERNAL's `cert_key`), and the client's
+    /// own `SecurityInfo` must not.
+    #[test]
+    fn mtls_exposes_client_certificate_fingerprint_and_chain_on_the_server_side() {
+        let server_creds = test_server_credentials_ecdsa();
+        let client_creds = test_server_credentials_ecdsa();
+        let expected_fp = crate::crypto::sha256_fingerprint_hex(&client_creds.cert_chain[0]);
+        let client_cfg = client_config_with_cert(&server_creds, client_creds.clone());
+        let server_cfg = server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let mut client = Tls12Engine::new(client_cfg);
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        run_full_handshake(&mut client, &mut server, &mut sink_c, &mut sink_s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+
+        let server_info = sink_s.info.expect("server SecurityInfo");
+        assert_eq!(server_info.peer_certificate_fingerprint(), Some(expected_fp.as_str()));
+        assert_eq!(
+            server_info.peer_certificate_chain(),
+            Some(client_creds.cert_chain.as_slice())
+        );
+        let client_info = sink_c.info.expect("client SecurityInfo");
+        assert_eq!(client_info.peer_certificate_fingerprint(), None);
+    }
+
+    #[test]
+    fn mtls_require_rejects_handshake_when_client_has_no_certificate() {
+        let server_creds = test_server_credentials_ecdsa();
+        let client_creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(server_creds.cert_chain[0].clone());
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let server_cfg = server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let mut client = Tls12Engine::new(client_cfg);
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay(&mut client, &mut server, take_outbound(&mut sink_c), &mut sink_s);
+        relay(&mut server, &mut client, take_outbound(&mut sink_s), &mut sink_c);
+        relay(&mut client, &mut server, take_outbound(&mut sink_c), &mut sink_s);
+        assert!(!server.is_complete());
+        assert!(
+            sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink_s.events
+        );
+    }
+
+    #[test]
+    fn mtls_request_completes_when_client_has_no_certificate() {
+        let server_creds = test_server_credentials_ecdsa();
+        let client_creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(server_creds.cert_chain[0].clone());
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let server_cfg = server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Request);
+        let mut client = Tls12Engine::new(client_cfg);
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        run_full_handshake(&mut client, &mut server, &mut sink_c, &mut sink_s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+    }
+
+    #[test]
+    fn mtls_rejects_untrusted_client_certificate() {
+        let server_creds = test_server_credentials_ecdsa();
+        let client_creds = test_server_credentials_ecdsa();
+        let untrusted_client_creds = test_server_credentials_ecdsa(); // not the one in client_trust_store
+        let client_cfg = client_config_with_cert(&server_creds, untrusted_client_creds);
+        let server_cfg = server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let mut client = Tls12Engine::new(client_cfg);
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay(&mut client, &mut server, take_outbound(&mut sink_c), &mut sink_s);
+        relay(&mut server, &mut client, take_outbound(&mut sink_s), &mut sink_c);
+        relay(&mut client, &mut server, take_outbound(&mut sink_c), &mut sink_s);
+        assert!(!server.is_complete());
+        assert!(
+            sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink_s.events
+        );
+    }
+
+    #[test]
+    fn mtls_rejects_tampered_client_certificate_verify_signature() {
+        let server_creds = test_server_credentials_ecdsa();
+        let client_creds = test_server_credentials_ecdsa();
+        let client_cfg = client_config_with_cert(&server_creds, client_creds.clone());
+        let server_cfg = server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let mut client = Tls12Engine::new(client_cfg);
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay(&mut client, &mut server, take_outbound(&mut sink_c), &mut sink_s);
+        relay(&mut server, &mut client, take_outbound(&mut sink_s), &mut sink_c);
+
+        let mut outbound = take_outbound(&mut sink_c);
+        // Client's second flight: [Certificate, ClientKeyExchange, CertificateVerify, Finished].
+        assert_eq!(
+            message_types(&outbound),
+            vec![11, 16, 15, 20],
+            "expected Certificate, ClientKeyExchange, CertificateVerify, Finished: {:?}",
+            message_types(&outbound)
+        );
+        let cv_index = 2;
+        let mut corrupted = outbound[cv_index].to_vec();
+        let n = corrupted.len();
+        corrupted[n - 1] ^= 0xff;
+        outbound[cv_index] = Bytes::from(corrupted);
+        relay(&mut client, &mut server, outbound, &mut sink_s);
+
+        assert!(!server.is_complete());
+        assert!(
+            sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink_s.events
+        );
     }
 }

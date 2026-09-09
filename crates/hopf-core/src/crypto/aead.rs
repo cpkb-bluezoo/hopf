@@ -5,7 +5,7 @@
 //! Sequence-number-to-nonce construction (record layers, packet protection)
 //! stays with the caller — this wraps only the AEAD operation itself.
 
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, AES_256_GCM};
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305};
 
 /// AES-128-GCM key bound to a fixed 12-byte IV; caller derives the
 /// per-record/per-packet nonce (typically IV XOR a sequence number).
@@ -99,6 +99,48 @@ impl AesGcmKey {
     }
 }
 
+/// ChaCha20-Poly1305 key (RFC 8439), 32 bytes, bound to a fixed 12-byte IV —
+/// same nonce-construction contract as [`Aes128GcmKey`]. A separate type
+/// rather than folded into [`AesGcmKey`]'s length dispatch: both this and
+/// AES-256-GCM take 32-byte keys, so key length alone can't disambiguate
+/// them — callers already know which cipher was negotiated (TLS 1.2's
+/// `CipherKind`, TLS 1.3's negotiated suite) and construct the matching type.
+pub struct ChaCha20Poly1305Key {
+    key: LessSafeKey,
+}
+
+impl ChaCha20Poly1305Key {
+    /// Build from a 32-byte key.
+    pub fn new(key_bytes: &[u8]) -> Result<Self, AeadError> {
+        let key = UnboundKey::new(&CHACHA20_POLY1305, key_bytes).map_err(|_| AeadError)?;
+        Ok(Self {
+            key: LessSafeKey::new(key),
+        })
+    }
+
+    /// Encrypt `plaintext` in place under `nonce`/`aad`; appends the 16-byte tag.
+    pub fn seal_in_place_append_tag(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        plaintext: &mut Vec<u8>,
+    ) -> Result<(), AeadError> {
+        self.key
+            .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(aad), plaintext)
+            .map_err(|_| AeadError)
+    }
+
+    /// Decrypt `ciphertext` (tag included) in place under `nonce`/`aad`.
+    /// Returns the plaintext length (tag truncated) on success.
+    pub fn open_in_place(&self, nonce: [u8; 12], aad: &[u8], ciphertext: &mut [u8]) -> Result<usize, AeadError> {
+        let plain = self
+            .key
+            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), ciphertext)
+            .map_err(|_| AeadError)?;
+        Ok(plain.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +178,20 @@ mod tests {
         let mut buf = b"hello world".to_vec();
         key.seal_in_place_append_tag([0u8; 12], b"aad", &mut buf).unwrap();
         assert_eq!(key.open_in_place([0u8; 12], b"different", &mut buf), Err(AeadError));
+    }
+
+    #[test]
+    fn chacha20_poly1305_key_round_trips() {
+        let key = ChaCha20Poly1305Key::new(&[7u8; 32]).unwrap();
+        let mut buf = b"hello world".to_vec();
+        key.seal_in_place_append_tag([0u8; 12], b"aad", &mut buf).unwrap();
+        assert_ne!(buf, b"hello world");
+        let n = key.open_in_place([0u8; 12], b"aad", &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello world");
+    }
+
+    #[test]
+    fn chacha20_poly1305_key_rejects_wrong_length() {
+        assert!(ChaCha20Poly1305Key::new(&[7u8; 16]).is_err());
     }
 }

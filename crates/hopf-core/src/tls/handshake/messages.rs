@@ -18,6 +18,8 @@ pub enum HandshakeType {
     NewSessionTicket = 4,
     /// EncryptedExtensions.
     EncryptedExtensions = 8,
+    /// CertificateRequest (RFC 8446 §4.3.2 — mTLS).
+    CertificateRequest = 13,
     /// Certificate.
     Certificate = 11,
     /// CertificateVerify.
@@ -106,6 +108,9 @@ pub struct OfferedPsk {
 pub struct ClientHelloParams {
     /// Client random.
     pub random: [u8; 32],
+    /// Cipher suites offered, in preference order (e.g.
+    /// [`SUPPORTED_CIPHER_SUITES`](super::super::engine::SUPPORTED_CIPHER_SUITES)).
+    pub cipher_suites: Vec<u16>,
     /// Key share for the preferred group.
     pub key_share: KeyShareEntry,
     /// Supported groups in preference order.
@@ -173,8 +178,10 @@ fn build_client_hello_inner(
     body.extend_from_slice(&0x0303u16.to_be_bytes());
     body.extend_from_slice(&params.random);
     body.extend_from_slice(&[0]);
-    body.extend_from_slice(&2u16.to_be_bytes());
-    body.extend_from_slice(&0x1301u16.to_be_bytes());
+    body.extend_from_slice(&((params.cipher_suites.len() * 2) as u16).to_be_bytes());
+    for suite in &params.cipher_suites {
+        body.extend_from_slice(&suite.to_be_bytes());
+    }
     body.extend_from_slice(&[1, 0]);
 
     let mut extensions = BytesMut::new();
@@ -286,17 +293,19 @@ fn build_client_hello_inner(
     )
 }
 
-/// Build a TLS 1.3 `ServerHello` for the selected group + key share. `legacy_session_id_echo`
-/// must be exactly the `legacy_session_id` the client sent in its `ClientHello` (RFC 8446
-/// §4.1.3) — an empty client value is fine to echo as empty, but a client using middlebox-compat
-/// mode (Appendix D.4) sends a random 32 bytes and aborts if the echo doesn't match.
+/// Build a TLS 1.3 `ServerHello` for the selected cipher suite, group + key
+/// share. `legacy_session_id_echo` must be exactly the `legacy_session_id`
+/// the client sent in its `ClientHello` (RFC 8446 §4.1.3) — an empty client
+/// value is fine to echo as empty, but a client using middlebox-compat mode
+/// (Appendix D.4) sends a random 32 bytes and aborts if the echo doesn't match.
 pub fn build_server_hello(
     random: &[u8; 32],
     legacy_session_id_echo: &[u8],
+    cipher_suite: u16,
     group: u16,
     key_share: &[u8],
 ) -> HandshakeMessage {
-    build_server_hello_ext(random, legacy_session_id_echo, group, key_share, None)
+    build_server_hello_ext(random, legacy_session_id_echo, cipher_suite, group, key_share, None)
 }
 
 /// ServerHello with optional selected PSK identity index. See [`build_server_hello`] for
@@ -304,6 +313,7 @@ pub fn build_server_hello(
 pub fn build_server_hello_ext(
     random: &[u8; 32],
     legacy_session_id_echo: &[u8],
+    cipher_suite: u16,
     group: u16,
     key_share: &[u8],
     selected_identity: Option<u16>,
@@ -313,7 +323,7 @@ pub fn build_server_hello_ext(
     body.extend_from_slice(random);
     body.extend_from_slice(&[legacy_session_id_echo.len() as u8]);
     body.extend_from_slice(legacy_session_id_echo);
-    body.extend_from_slice(&0x1301u16.to_be_bytes());
+    body.extend_from_slice(&cipher_suite.to_be_bytes());
     body.extend_from_slice(&[0]);
 
     let mut extensions = BytesMut::new();
@@ -399,20 +409,50 @@ pub fn build_new_session_ticket(
     }
 }
 
-/// Build a TLS 1.3 `Certificate` message (empty context, DER chain leaf-first).
-pub fn build_certificate(chain: &[&[u8]]) -> HandshakeMessage {
+/// Build a TLS 1.3 `Certificate` message. `context` is the
+/// `certificate_request_context` (RFC 8446 §4.4.2) — empty for the server's
+/// own unsolicited `Certificate`, or the exact bytes echoed from a peer
+/// `CertificateRequest` when this is a client's response to one.
+pub fn build_certificate(context: &[u8], chain: &[&[u8]]) -> HandshakeMessage {
     let mut cert_list = BytesMut::new();
     for cert in chain {
         cert_list.extend_from_slice(&(cert.len() as u32).to_be_bytes()[1..]);
         cert_list.extend_from_slice(cert);
         cert_list.extend_from_slice(&0u16.to_be_bytes());
     }
-    let mut body = BytesMut::new();
-    body.extend_from_slice(&[0]);
+    let mut body = BytesMut::with_capacity(1 + context.len() + 3 + cert_list.len());
+    body.extend_from_slice(&[context.len() as u8]);
+    body.extend_from_slice(context);
     body.extend_from_slice(&(cert_list.len() as u32).to_be_bytes()[1..]);
     body.extend_from_slice(&cert_list);
     HandshakeMessage {
         msg_type: HandshakeType::Certificate,
+        body: body.freeze(),
+    }
+}
+
+/// Build a `CertificateRequest` (RFC 8446 §4.3.2) offering this crate's
+/// [`SUPPORTED_SIGNATURE_SCHEMES`]. `context` is opaque and echoed back
+/// verbatim in the client's `Certificate` response's own context field.
+pub fn build_certificate_request(context: &[u8]) -> HandshakeMessage {
+    let mut body = BytesMut::new();
+    body.extend_from_slice(&[context.len() as u8]);
+    body.extend_from_slice(context);
+    let mut extensions = BytesMut::new();
+    {
+        let mut schemes = BytesMut::with_capacity(2 * SUPPORTED_SIGNATURE_SCHEMES.len());
+        for scheme in SUPPORTED_SIGNATURE_SCHEMES {
+            schemes.extend_from_slice(&scheme.to_be_bytes());
+        }
+        let mut sig_algs = BytesMut::with_capacity(2 + schemes.len());
+        sig_algs.extend_from_slice(&(schemes.len() as u16).to_be_bytes());
+        sig_algs.extend_from_slice(&schemes);
+        push_extension(&mut extensions, ext::SIGNATURE_ALGORITHMS, &sig_algs);
+    }
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+    HandshakeMessage {
+        msg_type: HandshakeType::CertificateRequest,
         body: body.freeze(),
     }
 }
@@ -491,6 +531,7 @@ mod tests {
         let random = [1u8; 32];
         let hello = build_client_hello(&ClientHelloParams {
             random,
+            cipher_suites: vec![0x1301],
             key_share: KeyShareEntry {
                 group: NamedGroup::X25519.code(),
                 share: Bytes::copy_from_slice(&kp.public_key()),

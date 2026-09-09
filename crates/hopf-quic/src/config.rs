@@ -99,6 +99,7 @@ impl Default for QuicServerConfig {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         })
     }
 }

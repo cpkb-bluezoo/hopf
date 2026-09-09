@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use hopf_core::security::SecurityInfo;
-use hopf_core::tls::HandshakeConfig;
+use hopf_core::tls::{HandshakeConfig, Tls13Aead};
 
 use crate::transport::frame::{parse_all, writer, Frame};
 use crate::transport::packet::long_header::{self, TYPE_0RTT, TYPE_HANDSHAKE, TYPE_INITIAL, TYPE_RETRY};
@@ -30,6 +30,13 @@ use crate::transport::types::{
 struct Space {
     /// Client and server traffic secrets (when installed).
     secrets: Option<([u8; 32], [u8; 32])>,
+    /// AEAD paired with `secrets` — always AES-128-GCM for Initial (RFC 9001
+    /// §5.2 fixes it regardless of the handshake's own negotiated suite);
+    /// for Handshake/1-RTT this is set alongside `secrets` from the
+    /// handshake's actual negotiation (see `TlsBridgeEvents::aead`). The
+    /// default matches Initial's fixed requirement, so Initial's own
+    /// `secrets` assignment never needs to touch this field.
+    aead: Tls13Aead,
     next_pn: u64,
     largest_received: Option<u64>,
     largest_acked: Option<u64>,
@@ -45,6 +52,7 @@ impl Space {
     fn new() -> Self {
         Self {
             secrets: None,
+            aead: Tls13Aead::Aes128GcmSha256,
             next_pn: 0,
             largest_received: None,
             largest_acked: None,
@@ -58,7 +66,7 @@ impl Space {
 
     fn keys(&self, side: Side) -> Option<KeyPair> {
         let (c, s) = self.secrets?;
-        Some(KeyPair::from_traffic_secrets(side, c, s))
+        Some(KeyPair::from_traffic_secrets(side, self.aead, c, s))
     }
 }
 
@@ -124,6 +132,10 @@ pub struct Connection {
     gso_pad_to: Option<usize>,
     /// Client early traffic secret for 0-RTT (client write / server read).
     early_secret: Option<[u8; 32]>,
+    /// AEAD paired with `early_secret` — see `Space::aead`'s doc comment;
+    /// same default-matches-fixed-Initial reasoning (0-RTT never installs
+    /// before `early_secret` is `Some`, so the default is never actually used).
+    early_aead: Tls13Aead,
     /// Client: EE early_data acceptance (`None` until EncryptedExtensions).
     early_data_accepted: Option<bool>,
     /// STREAM chunks sent under 0-RTT keys; requeued on reject for 1-RTT.
@@ -229,6 +241,7 @@ impl Connection {
             pto_ping_pending: [false; 3],
             gso_pad_to: None,
             early_secret: None,
+            early_aead: Tls13Aead::Aes128GcmSha256,
             early_data_accepted: None,
             pending_0rtt_retransmit: Vec::new(),
             remembered_0rtt_stream_max: None,
@@ -321,6 +334,7 @@ impl Connection {
             pto_ping_pending: [false; 3],
             gso_pad_to: None,
             early_secret: None,
+            early_aead: Tls13Aead::Aes128GcmSha256,
             early_data_accepted: None,
             pending_0rtt_retransmit: Vec::new(),
             remembered_0rtt_stream_max: None,
@@ -531,7 +545,7 @@ impl Connection {
             let Some(early) = self.early_secret else {
                 return packet_len;
             };
-            (PacketKeys::from_secret(&early), true)
+            (PacketKeys::from_secret(self.early_aead, &early), true)
         } else {
             match self.space(space).keys(self.side) {
                 Some(k) => (k.remote, false),
@@ -812,9 +826,11 @@ impl Connection {
         }
         if let Some((c, s)) = events.handshake_keys {
             self.spaces[1].secrets = Some((c, s));
+            self.spaces[1].aead = events.aead.unwrap_or(Tls13Aead::Aes128GcmSha256);
         }
         if let Some(early) = events.early_keys {
             self.early_secret = Some(early);
+            self.early_aead = events.aead.unwrap_or(Tls13Aead::Aes128GcmSha256);
         }
         if let Some(limits) = events.remembered_0rtt_limits {
             self.apply_remembered_peer_limits(limits);
@@ -836,6 +852,7 @@ impl Connection {
         }
         if let Some((c, s)) = events.app_keys {
             self.spaces[2].secrets = Some((c, s));
+            self.spaces[2].aead = events.aead.unwrap_or(Tls13Aead::Aes128GcmSha256);
         }
         if let Some(raw) = events.peer_tp {
             if let Some(tp) = TransportParameters::decode(&raw) {
@@ -1135,7 +1152,7 @@ impl Connection {
             && self.early_secret.is_some()
             && self.side == Side::Client;
         let local_keys = if use_0rtt {
-            PacketKeys::from_secret(self.early_secret.as_ref().unwrap())
+            PacketKeys::from_secret(self.early_aead, self.early_secret.as_ref().unwrap())
         } else {
             match self.space(space).keys(self.side) {
                 Some(k) => k.local,
@@ -1785,6 +1802,7 @@ mod tests {
             ticket_key: None,
             ticket_store: None,
             anti_replay: None,
+            ..Default::default()
         };
         let mut conn = Connection::new_client(
             now,

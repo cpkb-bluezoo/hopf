@@ -599,6 +599,7 @@ mod integration_tests {
                 trust_store: None,
                 ticket_key: Some(ticket_key),
                 client_ticket_store: None,
+                ..Default::default()
             },
         });
 
@@ -646,5 +647,630 @@ mod integration_tests {
         );
 
         rt.shutdown();
+    }
+
+    // -------------------------------------------------------------------
+    // mTLS (client certificate authentication) — real interop, both TLS
+    // versions and both directions, matching the rigor of the server-cert
+    // interop tests above: proves `CertificateRequest`/`Certificate`/
+    // `CertificateVerify` actually round-trip against an independent
+    // implementation, not just between two instances of this crate's own
+    // (identically-coded) engine.
+    // -------------------------------------------------------------------
+
+    /// TLS 1.3: a `rustls` client presents its own certificate to a Hopf
+    /// server configured with [`hopf_core::ClientAuthPolicy::Require`].
+    #[test]
+    fn rustls_client_presents_certificate_to_hopf_tls13_server_requiring_one() {
+        let (_dir, cert_path, key_path, certified) = write_temp_pem("mtls13-server");
+        let (_client_dir, client_cert_path, _client_key_path, client_certified) =
+            write_temp_pem("mtls13-client");
+
+        let acceptor = hopf_core::acceptor_from_pem_with_client_auth(
+            &cert_path,
+            &key_path,
+            &[],
+            hopf_core::ClientAuthPolicy::Require,
+            &client_cert_path,
+        )
+        .unwrap();
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(TlsEcho { alpn_seen: Arc::new(Mutex::new(None)), ready: Arc::new(Mutex::new(false)) })
+                        as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let client_key = rustls::pki_types::PrivateKeyDer::Pkcs8(client_certified.key_pair.serialize_der().into());
+        let client_cfg = ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![client_certified.cert.der().clone()], client_key)
+            .unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = ClientConnection::new(Arc::new(client_cfg), server_name).unwrap();
+        let sock = StdTcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+
+        tls.write_all(b"hello-mtls13").unwrap();
+        tls.flush().unwrap();
+        let mut buf = [0u8; 32];
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello-mtls13");
+
+        rt.shutdown();
+    }
+
+    /// TLS 1.3: a Hopf server configured with
+    /// [`hopf_core::ClientAuthPolicy::Require`] must refuse to complete when
+    /// a `rustls` client offers no certificate at all — proving the policy
+    /// is actually enforced against a real peer's (spec-compliant) empty
+    /// `Certificate` response, not just accepted permissively.
+    #[test]
+    fn hopf_tls13_server_rejects_rustls_client_presenting_no_certificate_when_required() {
+        let (_dir, cert_path, key_path, certified) = write_temp_pem("mtls13-reject-server");
+        let (_client_ca_dir, client_ca_cert_path, _client_ca_key_path, _client_ca) =
+            write_temp_pem("mtls13-reject-clientca");
+
+        let acceptor = hopf_core::acceptor_from_pem_with_client_auth(
+            &cert_path,
+            &key_path,
+            &[],
+            hopf_core::ClientAuthPolicy::Require,
+            &client_ca_cert_path,
+        )
+        .unwrap();
+
+        let ready = Arc::new(Mutex::new(false));
+        let ready_f = Arc::clone(&ready);
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+                    Box::new(TlsEcho { alpn_seen: Arc::new(Mutex::new(None)), ready: Arc::clone(&ready_f) })
+                        as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let client_cfg = ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = ClientConnection::new(Arc::new(client_cfg), server_name).unwrap();
+        let sock = StdTcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+        // rustls with no client cert configured sends a spec-compliant empty
+        // Certificate in response to CertificateRequest — this may or may
+        // not itself error; what matters is the server never establishes.
+        let _ = tls.write_all(b"probe").and_then(|_| tls.flush());
+        let mut buf = [0u8; 32];
+        let _ = tls.read(&mut buf);
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !*ready.lock().unwrap(),
+            "server must not reach security_established when it required a client cert and got none"
+        );
+
+        rt.shutdown();
+    }
+
+    /// TLS 1.3, reversed: a Hopf client (`connector_from_pem_with_client_cert`)
+    /// presents its own certificate to a real `rustls` server that requires
+    /// one (`WebPkiClientVerifier`). Uses a raw-socket `rustls` server, same
+    /// pattern as [`hopf_tls12_client_completes_handshake_against_rustls_tls12_server`].
+    #[test]
+    fn hopf_tls13_client_presents_certificate_to_rustls_server_requiring_one() {
+        let (_dir, cert_path, _key_path, certified) = write_temp_pem("mtls13-rev-server");
+        let (_client_dir, client_cert_path, client_key_path, client_certified) =
+            write_temp_pem("mtls13-rev-client");
+
+        let server_certs = vec![certified.cert.der().clone()];
+        let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let mut client_roots = RootCertStore::empty();
+        client_roots.add(client_certified.cert.der().clone()).unwrap();
+        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .unwrap();
+        let server_cfg = rustls::ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(server_certs, server_key)
+            .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(server_cfg)).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).unwrap();
+            tls.write_all(&buf[..n]).unwrap();
+            tls.flush().unwrap();
+        });
+
+        let connector = hopf_core::connector_from_pem_with_client_cert(
+            &cert_path,
+            &client_cert_path,
+            &client_key_path,
+            &[],
+        )
+        .unwrap();
+
+        let echoed = Arc::new(Mutex::new(Vec::new()));
+        let echoed2 = Arc::clone(&echoed);
+        struct EchoProbe {
+            echoed: Arc<Mutex<Vec<u8>>>,
+        }
+        impl ProtocolHandler for EchoProbe {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+                endpoint.send(b"hopf-tls13-mtls-client");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.echoed.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EchoProbe { echoed: Arc::clone(&echoed2) }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+
+        for _ in 0..150 {
+            if echoed.lock().unwrap().as_slice() == b"hopf-tls13-mtls-client" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(echoed.lock().unwrap().as_slice(), b"hopf-tls13-mtls-client");
+
+        rt.shutdown();
+        server_thread.join().unwrap();
+    }
+
+    /// TLS 1.2: a `rustls` client (forced to TLS 1.2) presents its own
+    /// certificate to a Hopf TLS 1.2 server configured with
+    /// [`hopf_core::ClientAuthPolicy::Require`].
+    #[test]
+    fn rustls_tls12_client_presents_certificate_to_hopf_tls12_server_requiring_one() {
+        let (_dir, cert_path, key_path, certified) = write_temp_pem("mtls12-server");
+        let (_client_dir, client_cert_path, _client_key_path, client_certified) =
+            write_temp_pem("mtls12-client");
+
+        let acceptor = hopf_core::acceptor_from_pem_tls12_with_client_auth(
+            &cert_path,
+            &key_path,
+            hopf_core::ClientAuthPolicy::Require,
+            &client_cert_path,
+        )
+        .unwrap();
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(TlsEcho { alpn_seen: Arc::new(Mutex::new(None)), ready: Arc::new(Mutex::new(false)) })
+                        as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let client_key = rustls::pki_types::PrivateKeyDer::Pkcs8(client_certified.key_pair.serialize_der().into());
+        let client_cfg = ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .expect("TLS 1.2 is a valid restricted version list")
+            .with_root_certificates(roots)
+            .with_client_auth_cert(vec![client_certified.cert.der().clone()], client_key)
+            .unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = ClientConnection::new(Arc::new(client_cfg), server_name).unwrap();
+        let sock = StdTcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+
+        tls.write_all(b"hello-mtls12").unwrap();
+        tls.flush().unwrap();
+        let mut buf = [0u8; 32];
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello-mtls12");
+        assert_eq!(tls.conn.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2));
+
+        rt.shutdown();
+    }
+
+    /// TLS 1.2, reversed: a Hopf client
+    /// (`connector_from_pem_tls12_with_client_cert`) presents its own
+    /// certificate to a real `rustls` server (forced to TLS 1.2) that
+    /// requires one.
+    #[test]
+    fn hopf_tls12_client_presents_certificate_to_rustls_tls12_server_requiring_one() {
+        let (_dir, cert_path, _key_path, certified) = write_temp_pem("mtls12-rev-server");
+        let (_client_dir, client_cert_path, client_key_path, client_certified) =
+            write_temp_pem("mtls12-rev-client");
+
+        let server_certs = vec![certified.cert.der().clone()];
+        let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let mut client_roots = RootCertStore::empty();
+        client_roots.add(client_certified.cert.der().clone()).unwrap();
+        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+            .build()
+            .unwrap();
+        let server_cfg = rustls::ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .expect("TLS 1.2 is a valid restricted version list")
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(server_certs, server_key)
+            .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(server_cfg)).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).unwrap();
+            tls.write_all(&buf[..n]).unwrap();
+            tls.flush().unwrap();
+        });
+
+        let connector = hopf_core::connector_from_pem_tls12_with_client_cert(
+            &cert_path,
+            &client_cert_path,
+            &client_key_path,
+        )
+        .unwrap();
+
+        let echoed = Arc::new(Mutex::new(Vec::new()));
+        let echoed2 = Arc::clone(&echoed);
+        struct EchoProbe {
+            echoed: Arc<Mutex<Vec<u8>>>,
+        }
+        impl ProtocolHandler for EchoProbe {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+                endpoint.send(b"hopf-tls12-mtls-client");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.echoed.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EchoProbe { echoed: Arc::clone(&echoed2) }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+
+        for _ in 0..150 {
+            if echoed.lock().unwrap().as_slice() == b"hopf-tls12-mtls-client" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(echoed.lock().unwrap().as_slice(), b"hopf-tls12-mtls-client");
+
+        rt.shutdown();
+        server_thread.join().unwrap();
+    }
+
+    // -------------------------------------------------------------------
+    // ChaCha20-Poly1305 cipher suite — real interop, both TLS versions,
+    // both directions. A `rustls` `CryptoProvider` restricted to *only* the
+    // ChaCha suite forces genuine negotiation (a normal Hopf peer always
+    // offers/prefers AES-128-GCM first, so a Hopf-vs-Hopf loopback can't
+    // reach this deterministically — see the engine-level
+    // `server_selects_chacha20_poly1305_when_its_the_only_offered_suite`
+    // test in `hopf-core` for that half of the proof).
+    // -------------------------------------------------------------------
+
+    fn chacha_only_tls13_provider() -> rustls::crypto::CryptoProvider {
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        provider.cipher_suites = rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES
+            .iter()
+            .filter(|cs| cs.suite() == rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
+            .copied()
+            .collect();
+        provider
+    }
+
+    fn chacha_only_tls12_provider() -> rustls::crypto::CryptoProvider {
+        let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+        provider.cipher_suites = rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES
+            .iter()
+            .filter(|cs| {
+                matches!(
+                    cs.suite(),
+                    rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+                        | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+                )
+            })
+            .copied()
+            .collect();
+        provider
+    }
+
+    /// TLS 1.3: a `rustls` client restricted to `TLS_CHACHA20_POLY1305_SHA256`
+    /// completes a handshake against an unrestricted Hopf server — the
+    /// server's own suite selection must pick ChaCha since it's the only
+    /// suite the client offers.
+    #[test]
+    fn rustls_client_negotiates_chacha20_poly1305_against_hopf_tls13_server() {
+        let (_dir, cert_path, key_path, certified) = write_temp_pem("chacha13-server");
+        let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(TlsEcho { alpn_seen: Arc::new(Mutex::new(None)), ready: Arc::new(Mutex::new(false)) })
+                        as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let client_cfg = ClientConfig::builder_with_provider(chacha_only_tls13_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = ClientConnection::new(Arc::new(client_cfg), server_name).unwrap();
+        let sock = StdTcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+
+        tls.write_all(b"hello-chacha13").unwrap();
+        tls.flush().unwrap();
+        let mut buf = [0u8; 32];
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello-chacha13");
+        assert_eq!(
+            tls.conn.negotiated_cipher_suite().map(|cs| cs.suite()),
+            Some(rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
+        );
+
+        rt.shutdown();
+    }
+
+    /// TLS 1.3, reversed: a Hopf client completes a handshake against a real
+    /// `rustls` server restricted to `TLS_CHACHA20_POLY1305_SHA256` — proving
+    /// the client accepts and correctly installs keys for a server-selected
+    /// ChaCha suite, not just that the server-side selection logic works.
+    #[test]
+    fn hopf_tls13_client_negotiates_chacha20_poly1305_against_rustls_server() {
+        let (_dir, cert_path, _key_path, certified) = write_temp_pem("chacha13-rev-server");
+
+        let server_certs = vec![certified.cert.der().clone()];
+        let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let server_cfg = rustls::ServerConfig::builder_with_provider(chacha_only_tls13_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(server_certs, server_key)
+            .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(server_cfg)).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).unwrap();
+            tls.write_all(&buf[..n]).unwrap();
+            tls.flush().unwrap();
+            assert_eq!(
+                tls.conn.negotiated_cipher_suite().map(|cs| cs.suite()),
+                Some(rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
+            );
+        });
+
+        let connector = connector_from_pem(&cert_path, &[]).unwrap();
+
+        let echoed = Arc::new(Mutex::new(Vec::new()));
+        let echoed2 = Arc::clone(&echoed);
+        struct EchoProbe {
+            echoed: Arc<Mutex<Vec<u8>>>,
+        }
+        impl ProtocolHandler for EchoProbe {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+                endpoint.send(b"hopf-tls13-chacha-client");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.echoed.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EchoProbe { echoed: Arc::clone(&echoed2) }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+
+        for _ in 0..150 {
+            if echoed.lock().unwrap().as_slice() == b"hopf-tls13-chacha-client" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(echoed.lock().unwrap().as_slice(), b"hopf-tls13-chacha-client");
+
+        rt.shutdown();
+        server_thread.join().unwrap();
+    }
+
+    /// TLS 1.2: a `rustls` client (forced to TLS 1.2) restricted to the
+    /// ChaCha suites completes a handshake against an unrestricted Hopf
+    /// TLS 1.2 server.
+    #[test]
+    fn rustls_tls12_client_negotiates_chacha20_poly1305_against_hopf_tls12_server() {
+        let (_dir, cert_path, key_path, certified) = write_temp_pem("chacha12-server");
+        let acceptor = hopf_core::acceptor_from_pem_tls12(&cert_path, &key_path).unwrap();
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(TlsEcho { alpn_seen: Arc::new(Mutex::new(None)), ready: Arc::new(Mutex::new(false)) })
+                        as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let client_cfg = ClientConfig::builder_with_provider(chacha_only_tls12_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .expect("TLS 1.2 is a valid restricted version list")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = ClientConnection::new(Arc::new(client_cfg), server_name).unwrap();
+        let sock = StdTcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+
+        tls.write_all(b"hello-chacha12").unwrap();
+        tls.flush().unwrap();
+        let mut buf = [0u8; 32];
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello-chacha12");
+        assert_eq!(
+            tls.conn.negotiated_cipher_suite().map(|cs| cs.suite()),
+            Some(rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
+        );
+
+        rt.shutdown();
+    }
+
+    /// TLS 1.2, reversed: a Hopf client completes a handshake against a real
+    /// `rustls` server (forced to TLS 1.2) restricted to the ChaCha suites.
+    #[test]
+    fn hopf_tls12_client_negotiates_chacha20_poly1305_against_rustls_server() {
+        let (_dir, cert_path, _key_path, certified) = write_temp_pem("chacha12-rev-server");
+
+        let server_certs = vec![certified.cert.der().clone()];
+        let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let server_cfg = rustls::ServerConfig::builder_with_provider(chacha_only_tls12_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .expect("TLS 1.2 is a valid restricted version list")
+            .with_no_client_auth()
+            .with_single_cert(server_certs, server_key)
+            .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(server_cfg)).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).unwrap();
+            tls.write_all(&buf[..n]).unwrap();
+            tls.flush().unwrap();
+            assert_eq!(
+                tls.conn.negotiated_cipher_suite().map(|cs| cs.suite()),
+                Some(rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256)
+            );
+        });
+
+        let connector = hopf_core::connector_from_pem_tls12(&cert_path).unwrap();
+        let echoed = Arc::new(Mutex::new(Vec::new()));
+        let echoed2 = Arc::clone(&echoed);
+        struct EchoProbe {
+            echoed: Arc<Mutex<Vec<u8>>>,
+        }
+        impl ProtocolHandler for EchoProbe {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+                endpoint.send(b"hopf-tls12-chacha-client");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.echoed.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EchoProbe { echoed: Arc::clone(&echoed2) }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+
+        for _ in 0..150 {
+            if echoed.lock().unwrap().as_slice() == b"hopf-tls12-chacha-client" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(echoed.lock().unwrap().as_slice(), b"hopf-tls12-chacha-client");
+
+        rt.shutdown();
+        server_thread.join().unwrap();
     }
 }

@@ -24,7 +24,7 @@ pub mod x509;
 #[cfg(feature = "ed448")]
 pub mod ed448;
 
-pub use aead::{AeadError, AesGcmKey, Aes128GcmKey};
+pub use aead::{AeadError, Aes128GcmKey, AesGcmKey, ChaCha20Poly1305Key};
 pub use cert::{sha256_fingerprint_hex, spki_sha256};
 pub use digest::{hash, Digest, HashAlgorithm, Sha256Context};
 pub use hkdf::{empty_hash, expand_label, extract, extract_derived, quic_expand_label, HkdfPrk, TLS13_HKDF};
