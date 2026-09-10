@@ -5,6 +5,7 @@
 //! equivalents. Only PKCS#8 private keys are supported (`BEGIN PRIVATE KEY`);
 //! re-encode legacy PKCS#1/SEC1 PEM with e.g. `openssl pkcs8 -topk8 -nocrypt`.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, ErrorKind};
 use std::path::Path;
@@ -16,7 +17,8 @@ use crate::crypto::kx_policy::KxPolicy;
 use crate::crypto::trust::{public_trust_store, TrustStore};
 
 use super::engine::{
-    ClientAuthPolicy, HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials, VerifyOverride,
+    ClientAuthPolicy, HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials,
+    ServerCredentialsResolver, VerifyOverride,
 };
 use super::handshake::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS;
 use super::record::TlsRecordEngine;
@@ -125,6 +127,55 @@ pub fn acceptor_from_pem(cert_path: &Path, key_path: &Path, alpn: &[&[u8]]) -> i
     let creds = server_credentials_from_pem(cert_path, key_path)?;
     Ok(Arc::new(PemAcceptor {
         creds,
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        client_auth: ClientAuthPolicy::None,
+        client_trust_store: None,
+    }))
+}
+
+struct SniAcceptor {
+    by_name: Arc<HashMap<String, ServerCredentials>>,
+    default: ServerCredentials,
+    alpn: Vec<Bytes>,
+    client_auth: ClientAuthPolicy,
+    client_trust_store: Option<TrustStore>,
+}
+
+impl TlsAcceptor for SniAcceptor {
+    fn accept(&self) -> TlsVariant {
+        let mut config = base_config(HandshakeRole::Server, &[]);
+        config.alpn = self.alpn.clone();
+        config.client_auth = self.client_auth;
+        config.client_trust_store = self.client_trust_store.clone();
+        let by_name = Arc::clone(&self.by_name);
+        let default = self.default.clone();
+        // SNI isn't known until the `ClientHello` arrives, well after
+        // `accept()` returns — the actual per-hostname lookup happens
+        // inside the engine at credential-selection time, not here.
+        config.server_resolver = Some(ServerCredentialsResolver(Arc::new(move |sni: Option<&str>| {
+            let creds = sni.and_then(|name| by_name.get(name)).unwrap_or(&default);
+            Some(creds.clone())
+        })));
+        TlsVariant::V13(TlsRecordEngine::new(config))
+    }
+}
+
+/// Build an SNI-dispatching [`SharedTlsAcceptor`]: `default_cert_path`/
+/// `default_key_path` back an unmatched or absent SNI, and `by_name` maps
+/// additional hostnames to their own credentials (load each with
+/// [`server_credentials_from_pem`]). `alpn` entries are protocol names
+/// such as `b"h2"` and `b"http/1.1"`, applied uniformly regardless of
+/// which hostname's credentials get selected.
+pub fn acceptor_from_pem_with_sni(
+    default_cert_path: &Path,
+    default_key_path: &Path,
+    by_name: impl IntoIterator<Item = (String, ServerCredentials)>,
+    alpn: &[&[u8]],
+) -> io::Result<SharedTlsAcceptor> {
+    let default = server_credentials_from_pem(default_cert_path, default_key_path)?;
+    Ok(Arc::new(SniAcceptor {
+        by_name: Arc::new(by_name.into_iter().collect()),
+        default,
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
         client_auth: ClientAuthPolicy::None,
         client_trust_store: None,
@@ -399,6 +450,29 @@ mod tests {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
         let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+        let _engine = acceptor.accept();
+    }
+
+    /// Shallow wiring proof, matching this module's other `acceptor_from_pem*`
+    /// tests — real end-to-end SNI dispatch behavior (resolver consulted
+    /// with the client's actual SNI, correct credentials selected) is
+    /// covered by `tls::engine`'s `server_resolver_*` tests, which drive
+    /// a full loopback handshake.
+    #[test]
+    fn acceptor_from_pem_with_sni_loads_default_and_named_credentials() {
+        let default_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let (_dir1, default_cert, default_key_path) = write_temp_pem(&default_key);
+        let b_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let (_dir2, b_cert, b_key_path) = write_temp_pem(&b_key);
+        let b_creds = server_credentials_from_pem(&b_cert, &b_key_path).unwrap();
+
+        let acceptor = acceptor_from_pem_with_sni(
+            &default_cert,
+            &default_key_path,
+            [("b.example".to_string(), b_creds)],
+            &[b"h2"],
+        )
+        .unwrap();
         let _engine = acceptor.accept();
     }
 

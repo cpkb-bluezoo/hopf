@@ -273,6 +273,15 @@ impl Dtls12RecordEngine {
                 }
                 ReadOutcome::Record { content_type, payload, consumed } => {
                     pos += consumed;
+                    // RFC 8446 §5.5 / RFC 9325 §4.4: RFC 6347 predates
+                    // this guidance and has no rekey mechanism of its
+                    // own, so a read key nearing its AES-GCM
+                    // confidentiality limit must close the connection
+                    // rather than keep decrypting past the safety margin.
+                    if self.state.read.over_confidentiality_limit() {
+                        self.fail(sink, "AES-GCM read key exceeded its confidentiality limit");
+                        return;
+                    }
                     if !self.dispatch_record(content_type, payload, &mut flight, sink) {
                         break;
                     }
@@ -317,6 +326,10 @@ impl Dtls12RecordEngine {
         let mut out = Vec::new();
         record::write_record(&mut self.state.write, CONTENT_APPLICATION_DATA, plaintext, &mut out);
         sink.datagram_ready(&out);
+        // Same reasoning as the read-side check in `feed_datagram`.
+        if self.state.write.over_confidentiality_limit() {
+            self.fail(sink, "AES-GCM write key exceeded its confidentiality limit");
+        }
     }
 
     /// Resume after chain verification (from `StorageExecutor` or inline).
@@ -568,6 +581,7 @@ impl Dtls12RecordEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::record::AES_GCM_CONFIDENTIALITY_LIMIT;
     use crate::crypto::trust::TrustStore;
     use crate::tls::ServerCredentials;
     use std::time::Duration;
@@ -718,6 +732,49 @@ mod tests {
         assert_eq!(sink_c.app_data, vec![b"hello back".to_vec()]);
     }
 
+    /// RFC 8446 §5.5 / RFC 9325 §4.4: RFC 6347 predates this guidance and
+    /// has no rekey mechanism of its own, so a write key nearing its
+    /// AES-GCM confidentiality limit must close the connection rather
+    /// than keep encrypting past the safety margin.
+    #[test]
+    fn send_application_data_closes_connection_at_write_confidentiality_limit() {
+        let (mut sink_c, _sink_s, mut client, _server) = run_loopback(false);
+        client.state.write.set_next_seq_for_test(AES_GCM_CONFIDENTIALITY_LIMIT - 1);
+
+        client.send_application_data(b"the datagram that crosses the limit", &mut sink_c);
+
+        assert!(client.failed, "{:?}", sink_c.events);
+        assert!(
+            sink_c.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink_c.events
+        );
+    }
+
+    /// Symmetric case: a read key nearing its limit closes the connection
+    /// too. Encoding the record directly with `record::write_record`
+    /// (rather than through `client.send_application_data`) keeps this
+    /// isolated to the read-side trigger alone — DTLS 1.2's sequence
+    /// number travels in cleartext in the header (unlike DTLS 1.3's
+    /// truncated/reconstructed form), so unlike the other three record
+    /// layers this doesn't need the two sides' counters kept in lockstep.
+    #[test]
+    fn feed_datagram_closes_connection_at_read_confidentiality_limit() {
+        let (_sink_c, mut sink_s, mut client, mut server) = run_loopback(false);
+        client.state.write.set_next_seq_for_test(AES_GCM_CONFIDENTIALITY_LIMIT);
+        let mut wire = Vec::new();
+        record::write_record(&mut client.state.write, CONTENT_APPLICATION_DATA, b"one more under the old key", &mut wire);
+
+        server.feed_datagram(&wire, &mut sink_s);
+
+        assert!(server.failed, "{:?}", sink_s.events);
+        assert!(
+            sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink_s.events
+        );
+    }
+
     #[test]
     fn close_notify_reported_as_peer_closed() {
         let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback(false);
@@ -795,7 +852,7 @@ mod tests {
         let server_base = Tls12Config {
             role: Role::Server,
             server: Some(creds),
-            ticket_key: Some(ticket_key),
+            ticket_key: Some(crate::tls::TicketKeys::single(ticket_key)),
             ..Default::default()
         };
         let client_cfg = || Dtls12Config {

@@ -47,6 +47,17 @@ const SEQ_LEN: usize = 2;
 /// Fixed header size before the ciphertext: type-byte(1) + seq(2) + length(2).
 const HEADER_LEN: usize = 1 + SEQ_LEN + 2;
 
+/// RFC 8446 §5.5 / RFC 9325 §4.4: an AES-GCM key should be retired after
+/// protecting 2^24.5 (≈23,726,566) full-size records. DTLS 1.3's own
+/// `KeyUpdate` (RFC 9147's epoch-aware variant) isn't implemented here —
+/// this session's TLS 1.3 `KeyUpdate` work is TCP-only — so crossing this
+/// limit means closing the connection outright, the same fail-closed
+/// treatment TLS 1.2 uses. ChaCha20-Poly1305 has no analogous limit (RFC
+/// 8446 §5.5: its sequence number would wrap first). `pub(crate)`, not
+/// just private, so `dtls::engine`'s own tests can set a direction's
+/// counter right up to the boundary without sending millions of records.
+pub(crate) const AES_GCM_CONFIDENTIALITY_LIMIT: u64 = 23_726_566;
+
 enum AeadKeyKind {
     Aes128Gcm(Aes128GcmKey),
     ChaCha20Poly1305(ChaCha20Poly1305Key),
@@ -126,6 +137,21 @@ impl WriteKeys {
             next_seq: 0,
         }
     }
+
+    /// Whether this direction has protected enough records under its
+    /// current AES-GCM key to warrant closing the connection (RFC 8446
+    /// §5.5) — no DTLS 1.3 rekey mechanism exists here to fall back to.
+    pub fn over_confidentiality_limit(&self) -> bool {
+        matches!(self.key, AeadKeyKind::Aes128Gcm(_)) && self.next_seq >= AES_GCM_CONFIDENTIALITY_LIMIT
+    }
+
+    /// Fast-forward this direction's counter without actually sending
+    /// millions of records — for `dtls::engine`'s confidentiality-limit
+    /// tests only.
+    #[cfg(test)]
+    pub(crate) fn set_next_seq_for_test(&mut self, seq: u64) {
+        self.next_seq = seq;
+    }
 }
 
 /// One direction's read state for one epoch — adds the anti-replay window
@@ -150,6 +176,22 @@ impl ReadKeys {
             replay: ReplayWindow::new(),
         }
     }
+
+    /// Same as [`WriteKeys::over_confidentiality_limit`], for the read
+    /// side — the anti-replay window's `highest` seen sequence number
+    /// doubles as this direction's record count.
+    pub fn over_confidentiality_limit(&self) -> bool {
+        matches!(self.key, AeadKeyKind::Aes128Gcm(_))
+            && self.replay.highest().is_some_and(|h| h >= AES_GCM_CONFIDENTIALITY_LIMIT)
+    }
+
+    /// Fast-forward this direction's highest-seen sequence number without
+    /// actually receiving millions of records — for `dtls::engine`'s
+    /// confidentiality-limit tests only.
+    #[cfg(test)]
+    pub(crate) fn set_replay_highest_for_test(&mut self, seq: u64) {
+        self.replay.record(seq);
+    }
 }
 
 /// Per-epoch anti-replay (RFC 9147 §4.2.4/§4.5.1) — a 64-entry sliding
@@ -170,6 +212,13 @@ pub(crate) struct ReplayWindow {
 }
 
 impl ReplayWindow {
+    /// Highest sequence number successfully recorded so far, if any —
+    /// doubles as a rough per-key record count for the AES-GCM
+    /// confidentiality-limit checks in `dtls::record`/`dtls12::record`.
+    pub(crate) fn highest(&self) -> Option<u64> {
+        self.highest
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             highest: None,

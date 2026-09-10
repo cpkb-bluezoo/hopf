@@ -11,10 +11,14 @@
 //! compatibility until crypto-migration-plan.md Phase 8 removes it outright
 //! (folding the remaining call sites onto `hopf_core::tls::*` directly).
 //!
-//! Two things the old `rustls`-backed API supported have no equivalent here
-//! yet: SNI-dispatched multi-certificate acceptors and mutual-TLS client
-//! certificates (`TlsRecordEngine` doesn't request/verify a client cert at
-//! all today) — deferred to a later phase, matching the migration plan.
+//! The two things the old `rustls`-backed API supported that this crate's
+//! own re-exports once lacked — SNI-dispatched multi-certificate acceptors
+//! and mutual-TLS client certificates — both now have equivalents in
+//! `hopf-core::tls`: [`hopf_core::acceptor_from_pem_with_sni`] and
+//! [`hopf_core::acceptor_from_pem_with_client_auth`]/
+//! [`hopf_core::ClientAuthPolicy`], respectively (this shim doesn't
+//! re-export the SNI one under an old name since the pre-migration API
+//! never had one to match).
 
 #![warn(missing_docs)]
 
@@ -597,7 +601,7 @@ mod integration_tests {
                 server_name: None,
                 server: Some(creds),
                 trust_store: None,
-                ticket_key: Some(ticket_key),
+                ticket_key: Some(hopf_core::TicketKeys::single(ticket_key)),
                 client_ticket_store: None,
                 ..Default::default()
             },

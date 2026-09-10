@@ -44,6 +44,15 @@ const MAX_FRAGMENT: usize = 16384;
 /// the negotiated cipher's exact overhead is applied in [`Tls12RecordEngine::take_one_record`].
 const MAX_CIPHERTEXT_RECORD: usize = MAX_FRAGMENT + 8 + 16;
 
+/// RFC 8446 §5.5 / RFC 9325 §4.4: an AES-GCM key should be retired after
+/// protecting 2^24.5 (≈23,726,566) full-size records. TLS 1.2 (RFC 5246)
+/// has no `KeyUpdate`-style rekey mechanism, unlike TLS 1.3, so crossing
+/// this limit here means closing the connection outright rather than
+/// rotating in place — see [`Tls12RecordEngine::send_application_data`]/
+/// [`Tls12RecordEngine::feed_ciphertext`]. ChaCha20-Poly1305 has no
+/// analogous limit (RFC 8446 §5.5: its sequence number would wrap first).
+const AES_GCM_CONFIDENTIALITY_LIMIT: u64 = 23_726_566;
+
 /// One direction's AEAD key, generalized over TLS 1.2's two nonce-construction
 /// strategies: RFC 5288 GCM (4-byte fixed IV/`salt` concatenated with an
 /// 8-byte explicit per-record nonce carried on the wire) and RFC 7905
@@ -81,6 +90,13 @@ impl AeadDirection {
     /// (GCM) or derives it purely from the sequence number (ChaCha20-Poly1305).
     fn has_explicit_nonce(&self) -> bool {
         matches!(self.key, DirectionKey::Gcm { .. })
+    }
+
+    /// Whether this direction has protected enough records under its
+    /// current AES-GCM key to warrant closing the connection (RFC 8446
+    /// §5.5) — TLS 1.2 has no in-protocol rekey to fall back to instead.
+    fn over_confidentiality_limit(&self) -> bool {
+        matches!(self.key, DirectionKey::Gcm { .. }) && self.seq >= AES_GCM_CONFIDENTIALITY_LIMIT
     }
 
     /// Nonce for the write side (always the local sequence counter) or for a
@@ -290,6 +306,15 @@ impl Tls12RecordEngine {
             match self.take_one_record() {
                 Ok(None) => break,
                 Ok(Some((content_type, payload))) => {
+                    // RFC 8446 §5.5 / RFC 9325 §4.4: TLS 1.2 has no
+                    // `KeyUpdate` to fall back on, so a read key that's
+                    // protected too many records under one key must
+                    // close the connection rather than keep decrypting
+                    // past the safety margin.
+                    if self.state.read.as_ref().is_some_and(AeadDirection::over_confidentiality_limit) {
+                        self.fail(sink, "AES-GCM read key exceeded its confidentiality limit");
+                        break;
+                    }
                     if !self.dispatch_record(content_type, payload, sink) {
                         break;
                     }
@@ -312,6 +337,12 @@ impl Tls12RecordEngine {
             return;
         }
         write_fragmented(&mut self.state, CONTENT_APPLICATION_DATA, plaintext, sink);
+        // Same reasoning as the read-side check in `feed_ciphertext`:
+        // no rekey mechanism exists in TLS 1.2, so close rather than
+        // keep encrypting past the AES-GCM safety margin.
+        if self.state.write.as_ref().is_some_and(AeadDirection::over_confidentiality_limit) {
+            self.fail(sink, "AES-GCM write key exceeded its confidentiality limit");
+        }
     }
 
     /// Resume after chain verification (from `StorageExecutor` or inline).
@@ -579,6 +610,55 @@ mod tests {
         assert!(sink_c.events.iter().any(|e| e.starts_with("ciphertext")), "record framing must have produced bytes");
     }
 
+    /// RFC 8446 §5.5 / RFC 9325 §4.4: TLS 1.2 has no rekey mechanism, so a
+    /// write key nearing its AES-GCM confidentiality limit must close the
+    /// connection rather than silently continue past the safety margin.
+    #[test]
+    fn send_application_data_closes_connection_at_write_confidentiality_limit() {
+        let (mut sink_c, _sink_s, mut client, _server) = run_loopback();
+        client.state.write.as_mut().unwrap().seq = AES_GCM_CONFIDENTIALITY_LIMIT - 1;
+
+        client.send_application_data(b"the record that crosses the limit", &mut sink_c);
+
+        assert!(client.failed, "{:?}", sink_c.events);
+        assert!(
+            sink_c.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink_c.events
+        );
+        sink_c.outbound.clear();
+        client.send_application_data(b"must never be sent", &mut sink_c);
+        assert!(sink_c.outbound.is_empty(), "a failed connection must not keep sending");
+    }
+
+    /// Symmetric case: a read key nearing its limit closes the connection too.
+    #[test]
+    fn feed_ciphertext_closes_connection_at_read_confidentiality_limit() {
+        let (_sink_c, mut sink_s, mut client, mut server) = run_loopback();
+        // Both sides' AAD construction uses their own locally-tracked
+        // sequence counter (not just the GCM explicit wire nonce), so
+        // both must be advanced together for this record to still
+        // authenticate correctly.
+        client.state.write.as_mut().unwrap().seq = AES_GCM_CONFIDENTIALITY_LIMIT - 1;
+        server.state.read.as_mut().unwrap().seq = AES_GCM_CONFIDENTIALITY_LIMIT - 1;
+        let mut wire = Vec::new();
+        write_encrypted_record(
+            client.state.write.as_mut().unwrap(),
+            CONTENT_APPLICATION_DATA,
+            b"one more under the old key",
+            &mut wire,
+        );
+
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+
+        assert!(server.failed, "{:?}", sink_s.events);
+        assert!(
+            sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink_s.events
+        );
+    }
+
     #[test]
     fn application_data_round_trips_after_handshake() {
         let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback();
@@ -638,7 +718,7 @@ mod tests {
             server_name: None,
             server: Some(creds),
             trust_store: None,
-            ticket_key: Some(ticket_key),
+            ticket_key: Some(crate::tls::TicketKeys::single(ticket_key)),
             client_ticket_store: None,
             ..Default::default()
         };

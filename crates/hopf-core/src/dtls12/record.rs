@@ -33,6 +33,18 @@ const TAG_LEN: usize = 16;
 /// DTLS 1.2's real (not legacy) wire version (RFC 6347 §4.1).
 const DTLS12_VERSION: u16 = 0xfefd;
 
+/// RFC 8446 §5.5 / RFC 9325 §4.4: an AES-GCM key should be retired after
+/// protecting 2^24.5 (≈23,726,566) full-size records. RFC 6347 predates
+/// this guidance and has no rekey mechanism of its own (a new epoch only
+/// ever comes from a full handshake), so crossing this limit here means
+/// closing the connection outright — see `dtls12::engine`'s
+/// `send_application_data`/`feed_datagram`. ChaCha20-Poly1305 has no
+/// analogous limit (RFC 8446 §5.5: its sequence number would wrap first).
+/// `pub(crate)`, not just private, so `dtls12::engine`'s own tests can set
+/// a direction's counter right up to the boundary without sending
+/// millions of records.
+pub(crate) const AES_GCM_CONFIDENTIALITY_LIMIT: u64 = 23_726_566;
+
 enum DirectionKey {
     Gcm { key: AesGcmKey, fixed_iv: [u8; 4] },
     ChaCha { key: ChaCha20Poly1305Key, fixed_iv: [u8; 12] },
@@ -124,6 +136,21 @@ impl WriteKeys {
             next_seq: 0,
         })
     }
+
+    /// Whether this direction has protected enough records under its
+    /// current AES-GCM key to warrant closing the connection (RFC 8446
+    /// §5.5) — no DTLS 1.2 rekey mechanism exists to fall back to.
+    pub fn over_confidentiality_limit(&self) -> bool {
+        matches!(self.key, Some(DirectionKey::Gcm { .. })) && self.next_seq >= AES_GCM_CONFIDENTIALITY_LIMIT
+    }
+
+    /// Fast-forward this direction's counter without actually sending
+    /// millions of records — for `dtls12::engine`'s confidentiality-limit
+    /// tests only.
+    #[cfg(test)]
+    pub(crate) fn set_next_seq_for_test(&mut self, seq: u64) {
+        self.next_seq = seq;
+    }
 }
 
 /// One direction's read state for one epoch, plus the anti-replay window a
@@ -148,6 +175,14 @@ impl ReadKeys {
             epoch: 1,
             replay: ReplayWindow::new(),
         })
+    }
+
+    /// Same as [`WriteKeys::over_confidentiality_limit`], for the read
+    /// side — the anti-replay window's `highest` seen sequence number
+    /// doubles as this direction's record count.
+    pub fn over_confidentiality_limit(&self) -> bool {
+        matches!(self.key, Some(DirectionKey::Gcm { .. }))
+            && self.replay.highest().is_some_and(|h| h >= AES_GCM_CONFIDENTIALITY_LIMIT)
     }
 }
 

@@ -42,6 +42,7 @@ use crate::security::SecurityInfo;
 use super::super::engine::{ClientAuthPolicy, ServerCredentials};
 use super::super::handshake::verify::{pkcs8_key_kind, KeyKind};
 use super::super::sink::{TlsProtocolError, VerifyRequest, VerifyResult};
+use super::super::ticket_keys::TicketKeys;
 use super::messages::{self, sig_alg, MessageType};
 use super::ticket::{self, StoredTls12Ticket, Tls12ClientTicketStore};
 
@@ -160,9 +161,12 @@ pub struct Config {
     /// gates on [`Tls12EventSink::verification_requested`], matching the
     /// TLS 1.3 engine's `insecure_connector` pattern.
     pub trust_store: Option<TrustStore>,
-    /// Server-role only: the RFC 5077 ticket-encryption key. `None` disables
-    /// both accepting and issuing tickets — every handshake is full.
-    pub ticket_key: Option<[u8; 32]>,
+    /// Server-role only: the RFC 5077 ticket-encryption keyring. `None`
+    /// disables both accepting and issuing tickets — every handshake is
+    /// full. Construct with [`TicketKeys::single`] for the common
+    /// single-key case; [`TicketKeys::rotate`] rotates in place without
+    /// instantly breaking tickets minted under the previous key.
+    pub ticket_key: Option<TicketKeys>,
     /// Client-role only: shared ticket cache keyed by server name. `None`
     /// disables offering resumption (the `SessionTicket` extension is
     /// omitted entirely, not just sent empty).
@@ -951,8 +955,12 @@ impl Tls12Engine {
         }
 
         let resume_payload = ch.session_ticket.as_ref().filter(|t| !t.is_empty()).and_then(|offered| {
-            let key = self.config.ticket_key.as_ref()?;
-            let payload = ticket::open_ticket(key, offered)?;
+            let keys = self.config.ticket_key.as_ref()?;
+            // Try every key still accepted for decryption (current, then
+            // the one most recently rotated away from) — the ticket
+            // carries no key ID, so there's no cheaper way to tell which
+            // one sealed it.
+            let payload = keys.decrypt_candidates().find_map(|key| ticket::open_ticket(key, offered))?;
             if payload.is_expired() || !ch.cipher_suites.contains(&payload.cipher_suite) || cipher_info(payload.cipher_suite).is_none() {
                 return None;
             }
@@ -1159,7 +1167,7 @@ impl Tls12Engine {
             if let (Some(key), Some(master_secret), Some(suite)) =
                 (&self.config.ticket_key, self.master_secret, self.negotiated_suite)
             {
-                if let Some(nst) = ticket::mint_new_session_ticket(key, &master_secret, suite) {
+                if let Some(nst) = ticket::mint_new_session_ticket(key.current(), &master_secret, suite) {
                     self.emit(&nst, sink);
                 }
             }
@@ -2078,7 +2086,7 @@ mod tests {
             server_name: None,
             server: Some(creds),
             trust_store: None,
-            ticket_key: Some(ticket_key),
+            ticket_key: Some(TicketKeys::single(ticket_key)),
             client_ticket_store: None,
             ..Default::default()
         };
@@ -2147,7 +2155,7 @@ mod tests {
             server_name: None,
             server: Some(creds.clone()),
             trust_store: None,
-            ticket_key: Some(ticket_key),
+            ticket_key: Some(TicketKeys::single(ticket_key)),
             client_ticket_store: None,
             ..Default::default()
         };
@@ -2168,7 +2176,7 @@ mod tests {
             server_name: None,
             server: Some(creds),
             trust_store: None,
-            ticket_key: Some(rotated_key),
+            ticket_key: Some(TicketKeys::single(rotated_key)),
             client_ticket_store: None,
             ..Default::default()
         };
@@ -2197,6 +2205,94 @@ mod tests {
         assert!(server2.is_complete(), "server2: {:?}", sink_s2.events);
         // The rotated key can mint a fresh ticket too — resumption support recovers.
         assert!(store.get("localhost").is_some());
+    }
+
+    /// The positive case the test above doesn't cover: a *real* rotation
+    /// via [`TicketKeys::rotate`] (not just two independent servers with
+    /// unrelated keys) must still let a ticket sealed under the
+    /// just-rotated-away key resume — that's the whole point of keeping
+    /// one previous key around. A second rotation then ages that key out
+    /// entirely, and the same ticket must fall back to a full handshake.
+    #[test]
+    fn resumption_survives_one_rotation_then_falls_back_once_the_key_ages_out() {
+        let creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let mut key_a = [0u8; 32];
+        getrandom::getrandom(&mut key_a).unwrap();
+        let store = Tls12ClientTicketStore::shared();
+
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: Some(store.clone()),
+            ..Default::default()
+        };
+        let server_cfg_with = |keys: TicketKeys| Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds.clone()),
+            trust_store: None,
+            ticket_key: Some(keys),
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let mut keys = TicketKeys::single(key_a);
+
+        // --- connection 1: full handshake under key_a, mints a ticket ---
+        let mut client = Tls12Engine::new(client_cfg.clone());
+        let mut server = Tls12Engine::new(server_cfg_with(keys));
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        run_full_handshake(&mut client, &mut server, &mut sink_c, &mut sink_s);
+        assert!(store.get("localhost").is_some());
+
+        // --- rotate: key_a becomes the single accepted `previous` key ---
+        let mut key_b = [0u8; 32];
+        getrandom::getrandom(&mut key_b).unwrap();
+        keys.rotate(key_b);
+
+        // --- connection 2: the key_a-sealed ticket must still resume ---
+        let mut client2 = Tls12Engine::new(client_cfg.clone());
+        let mut server2 = Tls12Engine::new(server_cfg_with(keys));
+        let mut sink_c2 = RecordingSink::default();
+        let mut sink_s2 = RecordingSink::default();
+        client2.start(&mut sink_c2);
+        relay(&mut client2, &mut server2, take_outbound(&mut sink_c2), &mut sink_s2);
+        let sh_flight = take_outbound(&mut sink_s2);
+        assert_eq!(
+            message_types(&sh_flight),
+            vec![2, 20],
+            "ticket sealed under the just-rotated-away key must still resume abbreviated: {:?}",
+            sink_s2.events
+        );
+        relay(&mut server2, &mut client2, sh_flight, &mut sink_c2);
+        relay(&mut client2, &mut server2, take_outbound(&mut sink_c2), &mut sink_s2);
+        assert!(client2.is_complete(), "client2: {:?}", sink_c2.events);
+        assert!(server2.is_complete(), "server2: {:?}", sink_s2.events);
+
+        // --- rotate again: key_a is now two generations old and dropped ---
+        let mut key_c = [0u8; 32];
+        getrandom::getrandom(&mut key_c).unwrap();
+        keys.rotate(key_c);
+
+        // --- connection 3: the same original ticket must now fall back ---
+        let mut client3 = Tls12Engine::new(client_cfg);
+        let mut server3 = Tls12Engine::new(server_cfg_with(keys));
+        let mut sink_c3 = RecordingSink::default();
+        let mut sink_s3 = RecordingSink::default();
+        client3.start(&mut sink_c3);
+        relay(&mut client3, &mut server3, take_outbound(&mut sink_c3), &mut sink_s3);
+        let sh_flight = take_outbound(&mut sink_s3);
+        assert_eq!(
+            message_types(&sh_flight),
+            vec![2, 11, 12, 14],
+            "a ticket sealed under a now-two-generations-old key must fall back to a full handshake: {:?}",
+            sink_s3.events
+        );
     }
 
     // ---- mTLS (client certificate authentication) ----

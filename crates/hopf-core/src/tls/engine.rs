@@ -30,6 +30,7 @@ use super::handshake::ticket::{
 };
 use super::handshake::transport_params::RememberedTransportLimits;
 use super::sink::{KeyUpdateDirection, QuicSecrets, TlsEventSink, TlsProtocolError, VerifyResult};
+use super::ticket_keys::TicketKeys;
 use crate::crypto::hkdf::expand_label;
 
 /// Client or server role.
@@ -160,6 +161,22 @@ impl std::fmt::Debug for VerifyOverride {
     }
 }
 
+/// SNI-based server credential dispatch (server role) — the client's SNI
+/// (`None` if it sent none) in, the credentials to present out. Lets one
+/// acceptor serve multiple hostnames from different certificates, unlike
+/// [`HandshakeConfig::server`]'s single fixed chain. Same wrapped-closure
+/// shape as [`VerifyOverride`], for the same reason: callers with their
+/// own resolution logic (a hostname map, a hot-reloadable cert store, …)
+/// shouldn't need to shape it into a fixed type this crate defines.
+#[derive(Clone)]
+pub struct ServerCredentialsResolver(pub Arc<dyn Fn(Option<&str>) -> Option<ServerCredentials> + Send + Sync>);
+
+impl std::fmt::Debug for ServerCredentialsResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ServerCredentialsResolver(..)")
+    }
+}
+
 /// Client-certificate authentication policy (server role) — RFC 8446
 /// §4.3.2 / RFC 5246 §7.4.4 `CertificateRequest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -189,8 +206,16 @@ pub struct HandshakeConfig {
     pub alpn: Vec<Bytes>,
     /// Client SNI / server expected name.
     pub server_name: Option<String>,
-    /// Server certificate + key (server role only).
+    /// Server certificate + key (server role only). Ignored in favor of
+    /// [`Self::server_resolver`] when that's set.
     pub server: Option<ServerCredentials>,
+    /// SNI-based server credential dispatch (server role only) — takes
+    /// priority over [`Self::server`] when set, so one acceptor can serve
+    /// multiple hostnames from different certificates. Called with the
+    /// client's SNI (`None` if it sent none); whatever it returns
+    /// (including `None`) is used as-is, with no fallback to
+    /// [`Self::server`].
+    pub server_resolver: Option<ServerCredentialsResolver>,
     /// Key-exchange group preference (hybrid PQC first by default).
     pub kx_policy: KxPolicy,
     /// Local QUIC transport parameters (RFC 9001 §8.2) sent in ClientHello / EncryptedExtensions.
@@ -209,8 +234,11 @@ pub struct HandshakeConfig {
     pub max_early_data_size: u32,
     /// Max recovered ticket age (ms) for accepting 0-RTT; resume may still succeed.
     pub max_early_data_freshness_ms: u32,
-    /// Server opaque-ticket sealing key (AES-128-GCM; 32 bytes).
-    pub ticket_key: Option<[u8; 32]>,
+    /// Server opaque-ticket sealing keyring (AES-128-GCM). Construct with
+    /// [`TicketKeys::single`] for the common single-key case; use
+    /// [`TicketKeys::rotate`] to rotate in place without instantly
+    /// breaking tickets minted under the previous key.
+    pub ticket_key: Option<TicketKeys>,
     /// Shared client ticket cache (keyed by server name).
     pub ticket_store: Option<Arc<ClientTicketStore>>,
     /// Server early-data anti-replay (shared across connections).
@@ -239,6 +267,7 @@ impl Default for HandshakeConfig {
             alpn: Vec::new(),
             server_name: None,
             server: None,
+            server_resolver: None,
             kx_policy: KxPolicy::default(),
             local_transport_parameters: None,
             trust_store: None,
@@ -724,7 +753,13 @@ impl HandshakeEngine {
         self.negotiated_group = Some(group);
         sink.key_exchange_group_negotiated(group.code());
         self.shared_secret = Some(shared);
-        let psk = self.psk.as_ref();
+        // `self.psk` reflects "a ticket was offered," not "the server
+        // accepted it" — it stays `Some` even when the ServerHello has no
+        // `pre_shared_key` extension (`self.resumed == false`). Using it
+        // unconditionally here would derive traffic secrets the server
+        // (correctly deriving with `psk: None`) can never match, breaking
+        // every full-handshake fallback after an offered PSK is rejected.
+        let psk = if self.resumed { self.psk.as_ref() } else { None };
         self.handshake_traffic = Some(derive_handshake_traffic_with_psk(
             psk,
             self.shared_secret.as_ref().unwrap(),
@@ -782,6 +817,16 @@ impl HandshakeEngine {
         sink: &mut S,
     ) -> bool {
         self.transcript.add_message(&encoded);
+        // RFC 7301 §3.2: a server MUST NOT select a protocol the client
+        // didn't offer. Accepting it silently would let a misbehaving or
+        // compromised server steer the connection into a protocol
+        // neither side actually agreed on.
+        if let Some(picked) = ee.alpn.as_ref() {
+            if !self.config.alpn.contains(picked) {
+                self.fail(sink, "server selected an ALPN protocol the client never offered");
+                return false;
+            }
+        }
         self.negotiated_alpn = ee.alpn.clone();
         if ee.early_data {
             if let Some(ticket_alpn) = self.offered_ticket_alpn.as_ref() {
@@ -938,7 +983,9 @@ impl HandshakeEngine {
             self.fail(sink, "missing shared secret");
             return false;
         };
-        let psk = self.psk;
+        // Same reasoning as `on_server_hello`: only use `self.psk` once the
+        // server actually selected it, not merely because it was offered.
+        let psk = if self.resumed { self.psk } else { None };
         // See on_client_finished's comment: application_traffic_secret_0 uses
         // `th_for_app_traffic` (through server Finished only); resumption_master_secret
         // uses the transcript after this client Finished is added, below.
@@ -1132,12 +1179,16 @@ impl HandshakeEngine {
         self.negotiated_aead = Some(aead);
 
         // Try PSK resumption.
-        if let (Some(identity), Some(binder), Some(ticket_key)) = (
+        if let (Some(identity), Some(binder), Some(ticket_keys)) = (
             ch.psk_identity.as_ref(),
             ch.psk_binder.as_ref(),
             self.config.ticket_key.as_ref(),
         ) {
-            if let Some(payload) = open_ticket(ticket_key, identity) {
+            // Try every key still accepted for decryption (current, then
+            // the one most recently rotated away from) — the ticket
+            // carries no key ID, so there's no cheaper way to tell which
+            // one sealed it.
+            if let Some(payload) = ticket_keys.decrypt_candidates().find_map(|key| open_ticket(key, identity)) {
                 // Verify binder over truncated ClientHello (drop last binder entry = 33 bytes).
                 if encoded.len() > 33 && binder.len() == 32 {
                     let truncated = &encoded[..encoded.len() - 33];
@@ -1269,6 +1320,14 @@ impl HandshakeEngine {
             self.peer_server_name = ch.server_name.clone();
         }
         let alpn = pick_alpn(&ch.alpn, &self.config.alpn);
+        // RFC 7301 §3.2: if the server has protocols configured and the
+        // client's offer has zero overlap with them, the server SHALL
+        // refuse the connection rather than silently completing a
+        // handshake with no negotiated application protocol.
+        if !ch.alpn.is_empty() && !self.config.alpn.is_empty() && alpn.is_none() {
+            self.fail(sink, "no overlapping ALPN protocol");
+            return false;
+        }
         self.negotiated_alpn = alpn.clone();
         let ee = build_encrypted_extensions_ext(
             alpn.as_deref(),
@@ -1279,7 +1338,14 @@ impl HandshakeEngine {
 
         let request_client_cert = !self.resumed && self.config.client_auth != ClientAuthPolicy::None;
         if !self.resumed {
-            let Some(creds) = self.config.server.clone() else {
+            // `server_resolver`, when set, decides on its own — including
+            // returning `None` — with no fallback to `server`; see its
+            // own doc comment.
+            let resolved = match self.config.server_resolver.as_ref() {
+                Some(resolver) => (resolver.0)(ch.server_name.as_deref()),
+                None => self.config.server.clone(),
+            };
+            let Some(creds) = resolved else {
                 self.fail(sink, "server credentials not configured");
                 return false;
             };
@@ -1514,7 +1580,7 @@ impl HandshakeEngine {
                     .and_then(RememberedTransportLimits::decode_from_tp_blob)
                     .or(Some(RememberedTransportLimits::default_missing()));
                 if let Some((msg, _)) = mint_new_session_ticket(
-                    &key,
+                    key.current(),
                     &rms,
                     max_early,
                     alpn,
@@ -1978,7 +2044,7 @@ mod tests {
             enable_early_data: true,
             max_early_data_size: u32::MAX,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
-            ticket_key: Some(ticket_key),
+            ticket_key: Some(TicketKeys::single(ticket_key)),
             ticket_store: None,
             anti_replay: None,
             ..Default::default()
@@ -2026,7 +2092,13 @@ mod tests {
         let server_cfg = HandshakeConfig {
             role: HandshakeRole::Server,
             mode: HandshakeMode::Quic,
-            alpn: vec![Bytes::from_static(b"h3")],
+            // Both "h3" (what every caller but the ALPN-mismatch test
+            // resumes with) and "hq-interop" (what that one test
+            // resumes with instead of the ticket-bound protocol) are
+            // accepted, so a resumption offering a *different but still
+            // mutually supported* protocol doesn't trip the new RFC
+            // 7301 §3.2 zero-overlap rejection this session added.
+            alpn: vec![Bytes::from_static(b"h3"), Bytes::from_static(b"hq-interop")],
             server_name: None,
             server: Some(creds),
             kx_policy: KxPolicy::classical_only(),
@@ -2036,7 +2108,7 @@ mod tests {
             enable_early_data: true,
             max_early_data_size: u32::MAX,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
-            ticket_key: Some(ticket_key),
+            ticket_key: Some(TicketKeys::single(ticket_key)),
             ticket_store: None,
             anti_replay: None,
             ..Default::default()
@@ -2078,6 +2150,75 @@ mod tests {
         assert!(client.is_complete(), "client: {:?}", sink_c.events);
         assert!(server.is_complete(), "server: {:?}", sink_s.events);
         (sink_c, sink_s)
+    }
+
+    /// Like [`resume_once`], but reports whether the server actually
+    /// treated this as a resumption (PSK accepted) rather than falling
+    /// back to a full handshake — [`resume_once`]'s early-data-focused
+    /// signals don't distinguish the two, and [`TicketKeys`] rotation
+    /// tests need exactly that distinction.
+    fn resume_once_report_resumed(client_cfg: HandshakeConfig, server_cfg: HandshakeConfig) -> bool {
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        for chunk in take_outbound(&mut sink_c) {
+            let mut input = chunk.as_ref();
+            server.feed_handshake_data(&mut input, &mut sink_s);
+        }
+        for chunk in take_outbound(&mut sink_s) {
+            let mut input = chunk.as_ref();
+            client.feed_handshake_data(&mut input, &mut sink_c);
+        }
+        for chunk in take_outbound(&mut sink_c) {
+            let mut input = chunk.as_ref();
+            server.feed_handshake_data(&mut input, &mut sink_s);
+        }
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+        server.resumed
+    }
+
+    /// A ticket sealed under the key just rotated away from must still
+    /// resume — that's the whole point of [`TicketKeys`] keeping one
+    /// previous key around.
+    #[test]
+    fn resumption_succeeds_after_one_ticket_key_rotation() {
+        let store = ClientTicketStore::shared();
+        let (client_cfg, mut server_cfg, key_a) = mint_ticket_pair(&store);
+        let mut keys = TicketKeys::single(key_a);
+        let mut key_b = [0u8; 32];
+        let _ = getrandom(&mut key_b);
+        keys.rotate(key_b);
+        server_cfg.ticket_key = Some(keys);
+
+        assert!(
+            resume_once_report_resumed(client_cfg, server_cfg),
+            "a ticket sealed under the just-rotated-away key must still resume"
+        );
+    }
+
+    /// Once a key is rotated away from *twice*, it's no longer in the
+    /// keyring at all, and a ticket sealed under it must fall back to a
+    /// full handshake rather than fail outright.
+    #[test]
+    fn resumption_falls_back_once_ticket_key_ages_out_of_the_keyring() {
+        let store = ClientTicketStore::shared();
+        let (client_cfg, mut server_cfg, key_a) = mint_ticket_pair(&store);
+        let mut keys = TicketKeys::single(key_a);
+        let mut key_b = [0u8; 32];
+        let _ = getrandom(&mut key_b);
+        keys.rotate(key_b);
+        let mut key_c = [0u8; 32];
+        let _ = getrandom(&mut key_c);
+        keys.rotate(key_c);
+        server_cfg.ticket_key = Some(keys);
+
+        assert!(
+            !resume_once_report_resumed(client_cfg, server_cfg),
+            "a ticket sealed under a now-two-generations-old key must fall back to a full handshake"
+        );
     }
 
     #[test]
@@ -2124,6 +2265,54 @@ mod tests {
         assert_eq!(sink_c.early_data_accepted, Some(false));
         assert!(sink_s.early_keys.is_none());
         assert!(sink_c.events.iter().any(|e| e == "handshake_complete"));
+    }
+
+    /// RFC 7301 §3.2: a server with protocols configured that gets a
+    /// ClientHello offering only non-overlapping ones SHALL refuse the
+    /// connection, not silently complete with no negotiated protocol.
+    #[test]
+    fn server_rejects_handshake_on_zero_alpn_overlap() {
+        let creds = test_server_credentials();
+        let mut client_cfg = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        client_cfg.alpn = vec![Bytes::from_static(b"hq-interop")];
+        let server_cfg = server_config_for(creds, KxPolicy::classical_only());
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        assert!(!server.is_complete());
+        assert!(!client.is_complete());
+        assert!(
+            sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink.events
+        );
+    }
+
+    /// RFC 7301 §3.2: a client MUST treat a server picking a protocol it
+    /// never offered as an error. Our own server can never do this (its
+    /// own `pick_alpn` only chooses from the client's offered list), so
+    /// this exercises the client's defensive check directly against a
+    /// hand-built `EncryptedExtensions`, standing in for a misbehaving or
+    /// compromised peer.
+    #[test]
+    fn client_rejects_alpn_the_server_never_saw_offered() {
+        let creds = test_server_credentials();
+        let mut client = HandshakeEngine::new(client_config_with_trust(&creds, KxPolicy::classical_only(), None));
+        let mut sink = RecordingSink::default();
+        let ee = super::super::handshake::ParsedEncryptedExtensions {
+            alpn: Some(Bytes::from_static(b"not-offered")),
+            transport_parameters: None,
+            early_data: false,
+        };
+        let ok = client.on_encrypted_extensions(ee, Bytes::new(), &mut sink);
+        assert!(!ok);
+        assert!(
+            sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink.events
+        );
     }
 
     #[test]
@@ -2229,6 +2418,91 @@ mod tests {
             anti_replay: None,
             ..Default::default()
         }
+    }
+
+    /// `server_resolver`, when set, is what actually decides credentials —
+    /// not `server` (deliberately set to a third, different identity here
+    /// to prove the resolver isn't just winning because `server` happens
+    /// to be `None`), and it's consulted with the client's real SNI.
+    #[test]
+    fn server_resolver_picks_credentials_by_client_sni() {
+        let creds_unused = test_server_credentials();
+        let creds_default = test_server_credentials();
+        let creds_b = test_server_credentials();
+        let expected_chain = creds_b.cert_chain.clone();
+        let default_for_resolver = creds_default.clone();
+        let b_for_resolver = creds_b.clone();
+
+        let mut server_cfg = server_config_for(creds_unused, KxPolicy::classical_only());
+        server_cfg.server_resolver = Some(ServerCredentialsResolver(Arc::new(move |sni: Option<&str>| {
+            if sni == Some("b.example") {
+                Some(b_for_resolver.clone())
+            } else {
+                Some(default_for_resolver.clone())
+            }
+        })));
+
+        let client_cfg = HandshakeConfig {
+            role: HandshakeRole::Client,
+            mode: HandshakeMode::Quic,
+            alpn: vec![Bytes::from_static(b"h3")],
+            server_name: Some("b.example".into()),
+            server: None,
+            kx_policy: KxPolicy::classical_only(),
+            local_transport_parameters: None,
+            trust_store: None,
+            verify_override: Some(VerifyOverride(Arc::new(move |chain, name| {
+                chain == expected_chain.as_slice() && name == Some("b.example")
+            }))),
+            enable_early_data: false,
+            max_early_data_size: 0,
+            max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: None,
+            ticket_store: None,
+            anti_replay: None,
+            ..Default::default()
+        };
+
+        let sink = run_loopback(client_cfg, server_cfg);
+        assert!(sink.events.iter().any(|e| e == "handshake_complete"), "{:?}", sink.events);
+    }
+
+    /// A client that sends no SNI at all still reaches the resolver
+    /// (`None`, not skipped), and here that falls back to the default
+    /// identity.
+    #[test]
+    fn server_resolver_receives_none_when_client_sends_no_sni() {
+        let creds_default = test_server_credentials();
+        let expected_chain = creds_default.cert_chain.clone();
+        let for_resolver = creds_default.clone();
+
+        let mut server_cfg = server_config_for(creds_default, KxPolicy::classical_only());
+        server_cfg.server_resolver = Some(ServerCredentialsResolver(Arc::new(move |sni: Option<&str>| {
+            assert_eq!(sni, None, "no SNI offered — resolver must see None, not be skipped");
+            Some(for_resolver.clone())
+        })));
+
+        let client_cfg = HandshakeConfig {
+            role: HandshakeRole::Client,
+            mode: HandshakeMode::Quic,
+            alpn: vec![Bytes::from_static(b"h3")],
+            server_name: None,
+            server: None,
+            kx_policy: KxPolicy::classical_only(),
+            local_transport_parameters: None,
+            trust_store: None,
+            verify_override: Some(VerifyOverride(Arc::new(move |chain, _name| chain == expected_chain.as_slice()))),
+            enable_early_data: false,
+            max_early_data_size: 0,
+            max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: None,
+            ticket_store: None,
+            anti_replay: None,
+            ..Default::default()
+        };
+
+        let sink = run_loopback(client_cfg, server_cfg);
+        assert!(sink.events.iter().any(|e| e == "handshake_complete"), "{:?}", sink.events);
     }
 
     /// DANE-style custom verification: `verify_override` is checked instead of

@@ -118,7 +118,7 @@ impl HopfTlsBuildParams {
             enable_early_data: self.tls.enable_early_data,
             max_early_data_size: self.tls.max_early_data_size,
             max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
-            ticket_key: self.ticket_key,
+            ticket_key: self.ticket_key.map(hopf_core::TicketKeys::single),
             ticket_store: self.ticket_store,
             anti_replay,
             ..Default::default()

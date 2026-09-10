@@ -31,6 +31,15 @@ const MAX_FRAGMENT: usize = 16384;
 /// that much on read even though we never write padding ourselves.
 const MAX_CIPHERTEXT_RECORD: usize = MAX_FRAGMENT + 256;
 
+/// RFC 8446 §5.5 / RFC 9325 §4.4: an AES-GCM key SHOULD be retired after
+/// protecting 2^24.5 (≈23,726,566) full-size records — this is the point
+/// where the AEAD's own authenticated-encryption security margin starts
+/// to erode, well before the `u64` sequence number could ever wrap.
+/// ChaCha20-Poly1305 has no analogous limit here: RFC 8446 §5.5 notes its
+/// 64-bit sequence number would wrap before that cipher's own safety
+/// bound is reached, so only the AES-GCM directions are checked below.
+const AES_GCM_CONFIDENTIALITY_LIMIT: u64 = 23_726_566;
+
 /// Events emitted by [`TlsRecordEngine`] — consumed by `TcpConnection`.
 pub trait TlsRecordSink {
     /// TLS record bytes to write to the socket.
@@ -118,6 +127,12 @@ impl DirectionalKeys {
         self.seq = self.seq.wrapping_add(1);
     }
 
+    /// Whether this direction has protected enough records under its
+    /// current AES-GCM key to warrant retiring it (RFC 8446 §5.5).
+    fn over_confidentiality_limit(&self) -> bool {
+        matches!(self.key, AeadKeyKind::Aes128Gcm(_)) && self.seq >= AES_GCM_CONFIDENTIALITY_LIMIT
+    }
+
     fn seal_in_place_append_tag(&self, nonce: [u8; 12], aad: &[u8], plaintext: &mut Vec<u8>) -> Result<(), AeadError> {
         match &self.key {
             AeadKeyKind::Aes128Gcm(k) => k.seal_in_place_append_tag(nonce, aad, plaintext),
@@ -143,6 +158,12 @@ struct RecordState {
     /// the client's own Finished must still go out under Handshake keys.
     next_write: Option<DirectionalKeys>,
     next_read: Option<DirectionalKeys>,
+    /// Set once we've asked the peer to rotate their write key because
+    /// our read-side confidentiality limit was reached; cleared when
+    /// their `KeyUpdate` actually arrives and installs a fresh read key.
+    /// Guards against re-requesting on every subsequent record while
+    /// we're still waiting for them to respond.
+    read_update_requested: bool,
 }
 
 impl RecordState {
@@ -154,6 +175,7 @@ impl RecordState {
             read: None,
             next_write: None,
             next_read: None,
+            read_update_requested: false,
         }
     }
 
@@ -196,6 +218,15 @@ impl RecordState {
     /// matching read key in immediately.
     fn update_read_key(&mut self, aead: Tls13Aead, secret: &[u8; 32]) {
         self.read = Some(DirectionalKeys::from_secret(aead, secret));
+        self.read_update_requested = false;
+    }
+
+    fn write_over_confidentiality_limit(&self) -> bool {
+        self.write.as_ref().is_some_and(DirectionalKeys::over_confidentiality_limit)
+    }
+
+    fn read_over_confidentiality_limit(&self) -> bool {
+        self.read.as_ref().is_some_and(DirectionalKeys::over_confidentiality_limit)
     }
 }
 
@@ -341,6 +372,17 @@ impl TlsRecordEngine {
             match self.take_one_record() {
                 Ok(None) => break,
                 Ok(Some((content_type, payload))) => {
+                    // RFC 8446 §5.5 / RFC 9325 §4.4: our read key has
+                    // protected close to its AES-GCM confidentiality
+                    // limit's worth of records — ask the peer to rotate
+                    // theirs (which also rotates our own write key as a
+                    // side effect). `read_update_requested` stops this
+                    // from firing again on every subsequent record while
+                    // we wait for their reply.
+                    if !self.state.read_update_requested && self.state.read_over_confidentiality_limit() {
+                        self.state.read_update_requested = true;
+                        self.request_key_update(sink, true);
+                    }
                     if !self.dispatch_record(content_type, payload, sink) {
                         break;
                     }
@@ -365,6 +407,13 @@ impl TlsRecordEngine {
             return;
         }
         write_fragmented(&mut self.state, CONTENT_APPLICATION_DATA, plaintext, sink);
+        // RFC 8446 §5.5 / RFC 9325 §4.4: retire our own write key before
+        // it exceeds the AES-GCM confidentiality limit. No peer round
+        // trip needed — `request_key_update` ratchets our write secret
+        // immediately, which resets the sequence counter this checks.
+        if self.state.write_over_confidentiality_limit() {
+            self.request_key_update(sink, false);
+        }
     }
 
     /// Resume after chain verification (from `StorageExecutor` or inline).
@@ -828,6 +877,76 @@ mod tests {
         let wire = std::mem::take(&mut sink_s.outbound);
         client.feed_ciphertext(&mut wire.as_slice(), &mut sink_c);
         assert_eq!(sink_c.app_data, vec![b"server after mutual update".to_vec()], "{:?}", sink_c.events);
+    }
+
+    /// RFC 8446 §5.5 / RFC 9325 §4.4: a write key nearing its AES-GCM
+    /// confidentiality limit must trigger an automatic self key update
+    /// rather than silently continuing past the safety margin.
+    #[test]
+    fn send_application_data_auto_rotates_write_key_at_confidentiality_limit() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback();
+        // TLS 1.3 has no explicit per-record nonce on the wire — both
+        // sides derive it from their own counted-in-lockstep sequence
+        // number, so simulating "23 million records already exchanged"
+        // means advancing *both* sides' counters together, not just the
+        // sender's.
+        client.state.write.as_mut().unwrap().seq = AES_GCM_CONFIDENTIALITY_LIMIT - 1;
+        server.state.read.as_mut().unwrap().seq = AES_GCM_CONFIDENTIALITY_LIMIT - 1;
+
+        client.send_application_data(b"the record that crosses the limit", &mut sink_c);
+
+        assert_eq!(
+            client.state.write.as_ref().unwrap().seq,
+            0,
+            "write key must have rotated (and its sequence counter reset) once the limit was crossed"
+        );
+        let wire = std::mem::take(&mut sink_c.outbound);
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        assert_eq!(
+            sink_s.app_data,
+            vec![b"the record that crosses the limit".to_vec()],
+            "server must still decrypt both the app data and the KeyUpdate that followed it: {:?}",
+            sink_s.events
+        );
+    }
+
+    /// Symmetric case: a read key nearing its limit asks the peer to
+    /// rotate rather than silently continuing to decrypt under an
+    /// over-used key. Only one request goes out per crossing —
+    /// `read_update_requested` guards against re-firing on every
+    /// subsequent record while waiting for the peer's reply.
+    #[test]
+    fn feed_ciphertext_requests_peer_rotation_at_read_confidentiality_limit() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback();
+        // Both sides' counters must stay in lockstep for the nonce to
+        // line up (see the write-side test above), but this test wants
+        // to isolate the *read*-side trigger alone — going through
+        // `client.send_application_data` here would also cross the
+        // client's own write-side limit and fire that self-rotation
+        // too, conflating the two cases. Encoding the record directly
+        // with `write_encrypted_record` advances the same real write
+        // key/state, just without going through that extra check.
+        client.state.write.as_mut().unwrap().seq = AES_GCM_CONFIDENTIALITY_LIMIT - 1;
+        server.state.read.as_mut().unwrap().seq = AES_GCM_CONFIDENTIALITY_LIMIT - 1;
+        let mut wire = Vec::new();
+        write_encrypted_record(
+            client.state.write.as_mut().unwrap(),
+            CONTENT_APPLICATION_DATA,
+            b"one more under the old key",
+            &mut wire,
+        );
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+
+        assert_eq!(sink_s.app_data, vec![b"one more under the old key".to_vec()]);
+        assert!(server.state.read_update_requested);
+        let wire = std::mem::take(&mut sink_s.outbound);
+        assert!(!wire.is_empty(), "server must ask the client to rotate: {:?}", sink_s.events);
+        client.feed_ciphertext(&mut wire.as_slice(), &mut sink_c);
+        assert!(
+            !sink_c.events.iter().any(|e| e.starts_with("protocol_error")),
+            "client must accept the rotation request: {:?}",
+            sink_c.events
+        );
     }
 
     #[test]

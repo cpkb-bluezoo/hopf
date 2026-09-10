@@ -328,6 +328,14 @@ impl DtlsRecordEngine {
                         consumed,
                     } => {
                         pos += consumed;
+                        // RFC 8446 §5.5 / RFC 9325 §4.4: same reasoning as
+                        // the write side in `send_application_data` — no
+                        // DTLS 1.3 rekey to fall back to, so close rather
+                        // than keep decrypting past the safety margin.
+                        if self.state.read.as_ref().is_some_and(ReadKeys::over_confidentiality_limit) {
+                            self.fail(sink, "AES-GCM read key exceeded its confidentiality limit");
+                            return;
+                        }
                         if !self.dispatch_record(inner_content_type, plaintext, &mut flight, sink) {
                             break;
                         }
@@ -373,6 +381,13 @@ impl DtlsRecordEngine {
         let mut out = Vec::new();
         write_records(&mut self.state, CONTENT_APPLICATION_DATA, &[plaintext.to_vec()], &mut out);
         sink.datagram_ready(&out);
+        // RFC 8446 §5.5 / RFC 9325 §4.4: DTLS 1.3's own `KeyUpdate` isn't
+        // implemented (deferred, see the module doc), so a write key
+        // nearing its AES-GCM confidentiality limit must close the
+        // connection rather than keep encrypting past the safety margin.
+        if self.state.write.as_ref().is_some_and(WriteKeys::over_confidentiality_limit) {
+            self.fail(sink, "AES-GCM write key exceeded its confidentiality limit");
+        }
     }
 
     /// Resume after chain verification (from `StorageExecutor` or inline).
@@ -506,6 +521,7 @@ impl DtlsRecordEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::record::AES_GCM_CONFIDENTIALITY_LIMIT;
     use crate::crypto::kx_policy::KxPolicy;
     use crate::crypto::trust::TrustStore;
     use crate::tls::ServerCredentials;
@@ -632,6 +648,60 @@ mod tests {
         let wire = sink_s.outbound.pop().expect("one datagram queued");
         client.feed_datagram(&wire, &mut sink_c);
         assert_eq!(sink_c.app_data, vec![b"hello back".to_vec()]);
+    }
+
+    /// RFC 8446 §5.5 / RFC 9325 §4.4: DTLS 1.3's own `KeyUpdate` isn't
+    /// implemented here (deferred, see `dtls::record`'s module doc), so a
+    /// write key nearing its AES-GCM confidentiality limit must close the
+    /// connection rather than keep encrypting past the safety margin.
+    #[test]
+    fn send_application_data_closes_connection_at_write_confidentiality_limit() {
+        let (mut sink_c, _sink_s, mut client, _server) = run_loopback();
+        client.state.write.as_mut().unwrap().set_next_seq_for_test(AES_GCM_CONFIDENTIALITY_LIMIT - 1);
+
+        client.send_application_data(b"the datagram that crosses the limit", &mut sink_c);
+
+        assert!(client.failed, "{:?}", sink_c.events);
+        assert!(
+            sink_c.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink_c.events
+        );
+    }
+
+    /// Symmetric case: a read key nearing its limit closes the connection
+    /// too. Encoding the record directly with `record::write_record`
+    /// (rather than through `client.send_application_data`) keeps this
+    /// isolated to the read-side trigger alone — going through the real
+    /// client API here would also cross its own write-side limit and fire
+    /// that check too, conflating the two cases the test above already
+    /// covers separately.
+    #[test]
+    fn feed_datagram_closes_connection_at_read_confidentiality_limit() {
+        let (_sink_c, mut sink_s, mut client, mut server) = run_loopback();
+        // Both sides' counters must stay in lockstep — the truncated
+        // on-wire sequence number is reconstructed relative to the
+        // reader's own `highest`-seen value (RFC 9147 §4.2.2), and the
+        // AAD binds the full reconstructed number, so an out-of-sync
+        // writer wouldn't authenticate.
+        client.state.write.as_mut().unwrap().set_next_seq_for_test(AES_GCM_CONFIDENTIALITY_LIMIT);
+        server.state.read.as_mut().unwrap().set_replay_highest_for_test(AES_GCM_CONFIDENTIALITY_LIMIT - 1);
+        let mut wire = Vec::new();
+        record::write_record(
+            client.state.write.as_mut().unwrap(),
+            CONTENT_APPLICATION_DATA,
+            b"one more under the old key",
+            &mut wire,
+        );
+
+        server.feed_datagram(&wire, &mut sink_s);
+
+        assert!(server.failed, "{:?}", sink_s.events);
+        assert!(
+            sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink_s.events
+        );
     }
 
     #[test]
