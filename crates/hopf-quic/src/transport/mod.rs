@@ -15,6 +15,3 @@ pub mod tls_bridge;
 pub mod types;
 pub mod varint;
 
-pub use connection::{Connection, WriteError};
-pub use endpoint::{AcceptError, ClientConfig, ConnectError, Endpoint, ServerConfig};
-pub use types::*;

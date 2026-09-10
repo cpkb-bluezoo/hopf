@@ -15,7 +15,6 @@ use hopf_core::tls::{
 
 use crate::config::{QuicClientConfig, QuicServerConfig, QuicTlsOptions};
 
-pub use crate::transport::packet::protection::{initial_secrets, KeyPair, PacketKeys};
 
 /// Handshake metadata exported to the QUIC driver (legacy shape).
 pub struct HopfHandshakeData {

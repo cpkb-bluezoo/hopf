@@ -48,16 +48,6 @@ pub fn certificate_verify_message(is_client: bool, transcript_hash: &[u8; 32]) -
     out.freeze()
 }
 
-/// Sign CertificateVerify with Ed25519.
-pub fn sign_ed25519_certificate_verify(
-    is_client: bool,
-    key: &Ed25519PrivateKey,
-    transcript_hash: &[u8; 32],
-) -> (u16, Bytes) {
-    let msg = certificate_verify_message(is_client, transcript_hash);
-    (SIG_ED25519, ed25519_sign(key, &msg))
-}
-
 /// Sign CertificateVerify with whichever [`SUPPORTED_SIGNATURE_SCHEMES`] scheme
 /// matches `signing_key_pkcs8`'s own key type (sniffed from the PKCS#8
 /// `AlgorithmIdentifier` — server credentials carry a bare key, not a declared
@@ -172,7 +162,7 @@ mod tests {
         let doc = Ed25519PrivateKey::generate_pkcs8().unwrap();
         let key = Ed25519PrivateKey::from_pkcs8(&doc).unwrap();
         let th = [0xabu8; 32];
-        let (scheme, sig) = sign_ed25519_certificate_verify(false, &key, &th);
+        let (scheme, sig) = sign_certificate_verify(false, &doc, &th).expect("Ed25519 key recognized");
         assert_eq!(scheme, SIG_ED25519);
         let msg = certificate_verify_message(false, &th);
         assert_eq!(msg.len(), 64 + 32 + 1 + "TLS 1.3, server CertificateVerify".len());

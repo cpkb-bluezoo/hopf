@@ -24,7 +24,7 @@ use super::super::sink::{TlsProtocolError, VerifyRequest, VerifyResult};
 // specific, and sharing it means `TcpConnection`'s existing sink adapter
 // drives *either* engine unchanged, with no separate 1.2-flavored trait to
 // keep in sync.
-pub use super::super::record::{NopTlsRecordSink as NopTls12RecordSink, TlsRecordSink as Tls12RecordSink};
+pub use super::super::record::TlsRecordSink as Tls12RecordSink;
 
 const CONTENT_CHANGE_CIPHER_SPEC: u8 = 20;
 const CONTENT_ALERT: u8 = 21;

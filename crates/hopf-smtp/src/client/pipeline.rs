@@ -1057,7 +1057,6 @@ mod tests {
     use super::*;
     use crate::client::endpoint::SmtpClientEndpoint;
     use hopf_core::{ConnHandleBackend, ProtocolHandler, RuntimeConfig, SecurityInfo, StartTlsError, TimerHandle, WriteReadyCallback};
-    use std::net::SocketAddr;
     use std::time::Duration;
 
     #[derive(Default)]

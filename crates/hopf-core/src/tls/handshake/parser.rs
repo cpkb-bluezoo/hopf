@@ -190,8 +190,13 @@ impl HandshakeParser {
         n
     }
 
-    /// End of input — error if a partial message remains.
-    pub fn close(&mut self, handler: &mut dyn HandshakeEvents) {
+    /// End of input — error if a partial message remains. Only exercised by
+    /// this crate's own tests today (production connection-close handling
+    /// doesn't currently call it) — kept as real, general parser behavior
+    /// rather than deleted, but `#[cfg(test)]` reflects actual usage
+    /// honestly instead of a blanket `#[allow(dead_code)]`.
+    #[cfg(test)]
+    pub(crate) fn close(&mut self, handler: &mut dyn HandshakeEvents) {
         if !self.buf.is_empty() {
             handler.parse_error("incomplete handshake message at close");
         }
@@ -733,7 +738,7 @@ impl HandshakeType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::handshake::messages::{build_client_hello, build_server_hello, ClientHelloParams, HandshakeMessage, KeyShareEntry};
+    use crate::tls::handshake::messages::{build_client_hello, build_server_hello_ext, ClientHelloParams, HandshakeMessage, KeyShareEntry};
 
     #[derive(Default)]
     struct RecordingHandler {
@@ -839,7 +844,7 @@ mod tests {
     fn server_hello_key_share_single_entry() {
         use crate::crypto::kx::NamedGroup;
         let share = [42u8; 32];
-        let hello = build_server_hello(&[9u8; 32], &[], 0x1301, NamedGroup::X25519.code(), &share, 0x0303);
+        let hello = build_server_hello_ext(&[9u8; 32], &[], 0x1301, NamedGroup::X25519.code(), &share, None, 0x0303);
         let wire = hello.encode();
 
         let mut parser = HandshakeParser::new();

@@ -5,10 +5,14 @@
 //! These are internal convenience adapters — the parser seam is
 //! [`super::parser::HandshakeParser`] + [`super::parser::HandshakeEvents`].
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+#[cfg(test)]
+use bytes::BytesMut;
 
 use super::messages::HandshakeType;
-use super::parser::{HandshakeEvents, HandshakeParser};
+use super::parser::HandshakeEvents;
+#[cfg(test)]
+use super::parser::HandshakeParser;
 
 /// Parsed `ClientHello` fields needed for the server path.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -98,7 +102,7 @@ pub struct ParsedNewSessionTicket {
 }
 
 #[derive(Default)]
-struct ClientHelloCollector {
+pub(crate) struct ClientHelloCollector {
     out: ParsedClientHello,
     first_key_share: bool,
     failed: bool,
@@ -178,7 +182,7 @@ impl HandshakeEvents for ClientHelloCollector {
 }
 
 #[derive(Default)]
-struct ServerHelloCollector {
+pub(crate) struct ServerHelloCollector {
     out: ParsedServerHello,
     failed: bool,
 }
@@ -226,7 +230,7 @@ impl HandshakeEvents for ServerHelloCollector {
 }
 
 #[derive(Default)]
-struct EncryptedExtensionsCollector {
+pub(crate) struct EncryptedExtensionsCollector {
     out: ParsedEncryptedExtensions,
     failed: bool,
 }
@@ -258,7 +262,7 @@ impl HandshakeEvents for EncryptedExtensionsCollector {
 }
 
 #[derive(Default)]
-struct NewSessionTicketCollector {
+pub(crate) struct NewSessionTicketCollector {
     out: ParsedNewSessionTicket,
     failed: bool,
     got: bool,
@@ -293,7 +297,7 @@ impl HandshakeEvents for NewSessionTicketCollector {
 }
 
 #[derive(Default)]
-struct CertificateCollector {
+pub(crate) struct CertificateCollector {
     context: Bytes,
     certs: Vec<Bytes>,
     failed: bool,
@@ -318,7 +322,7 @@ impl HandshakeEvents for CertificateCollector {
 }
 
 #[derive(Default)]
-struct CertificateRequestCollector {
+pub(crate) struct CertificateRequestCollector {
     context: Bytes,
     failed: bool,
 }
@@ -338,7 +342,7 @@ impl HandshakeEvents for CertificateRequestCollector {
 }
 
 #[derive(Default)]
-struct CertificateVerifyCollector {
+pub(crate) struct CertificateVerifyCollector {
     scheme: u16,
     signature: Bytes,
     failed: bool,
@@ -362,7 +366,7 @@ impl HandshakeEvents for CertificateVerifyCollector {
 }
 
 #[derive(Default)]
-struct FinishedCollector {
+pub(crate) struct FinishedCollector {
     verify_data: Bytes,
     failed: bool,
 }
@@ -403,6 +407,13 @@ impl HandshakeEvents for KeyUpdateCollector {
     }
 }
 
+// The one-shot `parse_*` helpers below (and their shared `decode_one`) are
+// real, but only ever exercised by this crate's own tests, which drive them
+// as a convenience over building a full `HandshakeParser`/`MessageCollector`
+// pair by hand — production code uses the incremental collector path via
+// `tls::engine::HandshakeEngine` instead. `#[cfg(test)]` reflects that
+// actual usage rather than hiding it behind a blanket `#[allow(dead_code)]`.
+#[cfg(test)]
 fn decode_one(msg_type: HandshakeType, body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
     let mut wire = BytesMut::with_capacity(4 + body.len());
     wire.extend_from_slice(&[msg_type as u8]);
@@ -420,7 +431,8 @@ fn decode_one(msg_type: HandshakeType, body: &[u8], handler: &mut dyn HandshakeE
 }
 
 /// Parse a `ClientHello` body through the handshake codec.
-pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
+#[cfg(test)]
+pub(crate) fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
     let mut c = ClientHelloCollector::default();
     if !decode_one(HandshakeType::ClientHello, body, &mut c) || c.failed {
         return None;
@@ -433,7 +445,8 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
 
 /// Parse a `ServerHello` body through the handshake codec. Also handles
 /// `HelloRetryRequest` (wire-identical; see [`ParsedServerHello::is_hello_retry_request`]).
-pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
+#[cfg(test)]
+pub(crate) fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
     let mut c = ServerHelloCollector::default();
     if !decode_one(HandshakeType::ServerHello, body, &mut c) || c.failed {
         return None;
@@ -442,51 +455,6 @@ pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
         return None;
     }
     Some(c.out)
-}
-
-/// Parse `EncryptedExtensions` through the handshake codec.
-pub fn parse_encrypted_extensions(body: &[u8]) -> Option<ParsedEncryptedExtensions> {
-    let mut c = EncryptedExtensionsCollector::default();
-    if !decode_one(HandshakeType::EncryptedExtensions, body, &mut c) || c.failed {
-        return None;
-    }
-    Some(c.out)
-}
-
-/// Parse a TLS 1.3 `Certificate` message — DER entries leaf-first.
-pub fn parse_certificate(body: &[u8]) -> Option<Vec<Bytes>> {
-    let mut c = CertificateCollector::default();
-    if !decode_one(HandshakeType::Certificate, body, &mut c) || c.failed || c.certs.is_empty() {
-        return None;
-    }
-    Some(c.certs)
-}
-
-/// Parse `CertificateVerify` — `(scheme, signature)`.
-pub fn parse_certificate_verify(body: &[u8]) -> Option<(u16, Bytes)> {
-    let mut c = CertificateVerifyCollector::default();
-    if !decode_one(HandshakeType::CertificateVerify, body, &mut c) || c.failed || !c.got {
-        return None;
-    }
-    Some((c.scheme, c.signature))
-}
-
-/// Parse `Finished` verify_data.
-pub fn parse_finished(body: &[u8]) -> Option<Bytes> {
-    let mut c = FinishedCollector::default();
-    if !decode_one(HandshakeType::Finished, body, &mut c) || c.failed || c.verify_data.len() != 32 {
-        return None;
-    }
-    Some(c.verify_data)
-}
-
-/// Feed handshake bytes through `parser`, invoking `handler` for each complete message.
-pub fn feed_parser(
-    parser: &mut HandshakeParser,
-    data: &mut &[u8],
-    handler: &mut dyn HandshakeEvents,
-) -> usize {
-    parser.receive(data, handler)
 }
 
 /// One fully parsed incoming handshake message (assembled from codec events).

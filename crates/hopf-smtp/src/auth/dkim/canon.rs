@@ -4,7 +4,7 @@
 
 use rmimeparser::dkim::RawHeader;
 
-use hopf_core::crypto::{hash, HashAlgorithm, Sha256Context};
+use hopf_core::crypto::{HashAlgorithm, Sha256Context};
 
 /// `simple`/`relaxed` selector (RFC 6376 §3.4), independently selectable for
 /// header and body (`c=header/body`).
@@ -420,6 +420,7 @@ fn canon_body_relaxed(lines: &[&[u8]]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hopf_core::crypto::hash;
 
     /// [`IncrementalBodyCanon`] must produce byte-identical SHA-256 output
     /// to `sha256(canon_body(..))`, regardless of how the input is chunked

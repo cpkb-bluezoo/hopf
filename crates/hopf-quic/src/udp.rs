@@ -70,6 +70,7 @@ impl PendingUdpSends {
         self.queue.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.queue.len()
     }
@@ -79,6 +80,7 @@ impl PendingUdpSends {
             .push_back(PendingUdpSend::from_transmit(transmit, data));
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue(&mut self, send: PendingUdpSend) {
         self.queue.push_back(send);
     }

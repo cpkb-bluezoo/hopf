@@ -49,11 +49,6 @@ pub fn early_secret(psk: Option<&[u8; 32]>, dtls: bool) -> HkdfPrk {
     }
 }
 
-/// Handshake secret PRK after ECDHE (PSK-less full TLS 1.3 handshake).
-pub fn handshake_secret(shared_secret: &[u8]) -> HkdfPrk {
-    handshake_secret_with_psk(None, shared_secret, false)
-}
-
 /// Handshake secret after ECDHE, optionally chaining from a resumption PSK.
 pub fn handshake_secret_with_psk(psk: Option<&[u8; 32]>, shared_secret: &[u8], dtls: bool) -> HkdfPrk {
     let early = early_secret(psk, dtls);
@@ -63,11 +58,6 @@ pub fn handshake_secret_with_psk(psk: Option<&[u8; 32]>, shared_secret: &[u8], d
     } else {
         extract_derived(&derived, shared_secret)
     }
-}
-
-/// Derive handshake traffic secrets after ECDHE (PSK-less full TLS 1.3 handshake).
-pub fn derive_handshake_traffic(shared_secret: &[u8], transcript_hash: &[u8; 32]) -> HandshakeTrafficSecrets {
-    derive_handshake_traffic_with_psk(None, shared_secret, transcript_hash, false)
 }
 
 /// Derive handshake traffic secrets with optional PSK (PSK-(EC)DHE).
@@ -111,14 +101,6 @@ fn master_secret(psk: Option<&[u8; 32]>, shared_secret: &[u8], dtls: bool) -> Hk
     } else {
         extract_derived(&derived, &[0u8; 32])
     }
-}
-
-/// Derive 1-RTT application traffic secrets after both Finished messages.
-pub fn derive_application_traffic(
-    shared_secret: &[u8],
-    transcript_hash: &[u8; 32],
-) -> ApplicationTrafficSecrets {
-    derive_application_traffic_with_psk(None, shared_secret, transcript_hash, false)
 }
 
 /// Derive 1-RTT application traffic secrets with optional PSK.
@@ -200,7 +182,7 @@ mod tests {
     fn rfc8448_handshake_traffic_secrets() {
         let shared = hex32("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d");
         let transcript = hex32("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
-        let secrets = derive_handshake_traffic(&shared, &transcript);
+        let secrets = derive_handshake_traffic_with_psk(None, &shared, &transcript, false);
         assert_eq!(
             secrets.client,
             hex32("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21")
@@ -237,7 +219,7 @@ mod tests {
     fn dtls_prefix_produces_different_secrets_than_tls() {
         let shared = [0x77u8; 32];
         let transcript = [0x88u8; 32];
-        let tls = derive_handshake_traffic(&shared, &transcript);
+        let tls = derive_handshake_traffic_with_psk(None, &shared, &transcript, false);
         let dtls = derive_handshake_traffic_with_psk(None, &shared, &transcript, true);
         assert_ne!(tls.client, dtls.client);
         assert_ne!(tls.server, dtls.server);

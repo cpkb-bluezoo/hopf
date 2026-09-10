@@ -30,13 +30,6 @@ pub enum HandshakeType {
     KeyUpdate = 24,
 }
 
-impl HandshakeType {
-    /// Handshake type byte on the wire.
-    pub fn to_u8(self) -> u8 {
-        self as u8
-    }
-}
-
 /// The fixed `ServerHello.random` value that marks a message as a
 /// `HelloRetryRequest` rather than a real `ServerHello` (RFC 8446 §4.1.3) —
 /// `SHA-256("HelloRetryRequest")`. Wire-identical to `ServerHello`
@@ -347,32 +340,12 @@ fn build_client_hello_inner(
     )
 }
 
-/// Build a TLS 1.3 `ServerHello` for the selected cipher suite, group + key
-/// share. `legacy_session_id_echo` must be exactly the `legacy_session_id`
-/// the client sent in its `ClientHello` (RFC 8446 §4.1.3) — an empty client
-/// value is fine to echo as empty, but a client using middlebox-compat mode
-/// (Appendix D.4) sends a random 32 bytes and aborts if the echo doesn't match.
-pub fn build_server_hello(
-    random: &[u8; 32],
-    legacy_session_id_echo: &[u8],
-    cipher_suite: u16,
-    group: u16,
-    key_share: &[u8],
-    legacy_version: u16,
-) -> HandshakeMessage {
-    build_server_hello_ext(
-        random,
-        legacy_session_id_echo,
-        cipher_suite,
-        group,
-        key_share,
-        None,
-        legacy_version,
-    )
-}
-
-/// ServerHello with optional selected PSK identity index. See [`build_server_hello`] for
-/// `legacy_session_id_echo` and `legacy_version`.
+/// ServerHello with optional selected PSK identity index (`None` for a
+/// full, non-resumptive handshake). `legacy_session_id_echo` must be
+/// exactly the `legacy_session_id` the client sent in its `ClientHello`
+/// (RFC 8446 §4.1.3) — an empty client value is fine to echo as empty,
+/// but a client using middlebox-compat mode (Appendix D.4) sends a
+/// random 32 bytes and aborts if the echo doesn't match.
 pub fn build_server_hello_ext(
     random: &[u8; 32],
     legacy_session_id_echo: &[u8],
@@ -447,12 +420,8 @@ pub fn build_hello_retry_request(
     }
 }
 
-/// Build `EncryptedExtensions` with ALPN and optional QUIC transport parameters.
-pub fn build_encrypted_extensions(alpn: Option<&[u8]>, transport_parameters: Option<&[u8]>) -> HandshakeMessage {
-    build_encrypted_extensions_ext(alpn, transport_parameters, false)
-}
-
-/// EncryptedExtensions with optional early_data acceptance. `alpn` is the negotiated protocol —
+/// EncryptedExtensions with optional early_data acceptance (`false` for a
+/// handshake that never offered/accepted 0-RTT). `alpn` is the negotiated protocol —
 /// `None` when the client didn't offer the extension or none of its offers matched (RFC 8446
 /// §4.2: a server MUST NOT send an extension the client didn't offer — `Some(b"h3")` when the
 /// client sent no ALPN extension at all is a real, previously-shipped bug, not padding).

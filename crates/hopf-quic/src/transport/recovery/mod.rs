@@ -7,7 +7,5 @@ mod loss_detector;
 mod rtt;
 mod sent_packet;
 
-pub use congestion::CongestionController;
-pub use loss_detector::{AckResult, LossDetector, TimeoutResult, K_PACKET_THRESHOLD};
-pub use rtt::{RttEstimator, K_INITIAL_RTT};
+pub use loss_detector::LossDetector;
 pub use sent_packet::{RecoverableFrame, SentPacket};

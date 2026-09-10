@@ -165,6 +165,7 @@ fn encode_route_entry(out: &mut Vec<u8>, entry: &RouteEntry) {
     out.push(entry.ip_protocol);
 }
 
+#[cfg(feature = "h3")]
 fn decode_route_entry(buf: &[u8]) -> Option<(RouteEntry, usize)> {
     let (start, n1) = decode_ip_address(buf)?;
     let addr_len = if start.is_ipv4() { 4 } else { 16 };
@@ -198,6 +199,7 @@ pub(crate) fn encode_route_entries(entries: &[RouteEntry]) -> Vec<u8> {
 /// the relay (server) side only ever encodes one of these (RFC 9484 §4.3
 /// is server-to-client only); decoding is the client's job (see
 /// [`crate::ip_client`]).
+#[cfg(feature = "h3")]
 pub(crate) fn decode_route_entries(value: &[u8]) -> Option<Vec<RouteEntry>> {
     let mut out = Vec::new();
     let mut pos = 0;
@@ -269,6 +271,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h3")]
     fn route_entry_round_trips_ipv4() {
         let e = RouteEntry::new("192.0.2.0".parse().unwrap(), "192.0.2.255".parse().unwrap(), 17).unwrap();
         let bytes = encode_route_entries(&[e]);
@@ -276,6 +279,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h3")]
     fn route_entry_round_trips_ipv6_with_wildcard_protocol() {
         let e = RouteEntry::new("2001:db8::".parse().unwrap(), "2001:db8::ffff".parse().unwrap(), 0).unwrap();
         let bytes = encode_route_entries(&[e]);
@@ -283,6 +287,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h3")]
     fn route_entries_round_trip_multiple_packed_into_one_capsule() {
         let a = RouteEntry::new("192.0.2.0".parse().unwrap(), "192.0.2.255".parse().unwrap(), 6).unwrap();
         let b = RouteEntry::new("2001:db8::".parse().unwrap(), "2001:db8::ffff".parse().unwrap(), 17).unwrap();
@@ -291,6 +296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h3")]
     fn route_entries_reject_a_truncated_trailing_entry() {
         let e = RouteEntry::new("192.0.2.0".parse().unwrap(), "192.0.2.255".parse().unwrap(), 6).unwrap();
         let mut bytes = encode_route_entries(&[e]);

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
 use bytes::{Bytes, BytesMut};
@@ -189,6 +189,7 @@ impl Tls12ClientTicketStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn payload() -> Tls12TicketPayload {
         Tls12TicketPayload {

@@ -269,7 +269,15 @@ pub struct ParsedClientHello {
     pub session_id: Bytes,
     /// Offered cipher suites.
     pub cipher_suites: Vec<u16>,
-    /// `signature_algorithms` pairs, if sent.
+    /// `signature_algorithms` pairs, if sent. Parsed but not currently
+    /// consulted by `engine.rs` (`sign_ske` picks its output algorithm
+    /// from this engine's own key type only, unconditionally — a
+    /// deliberate scope decision from the RSASSA-PSS pass: switching our
+    /// own signing output based on the peer's offer would be a real
+    /// behavioral change with no interop benefit today, since PKCS1v1.5
+    /// stays valid). Read in tests; `#[allow(dead_code)]` reflects that
+    /// honestly rather than pretending it's fully wired in.
+    #[allow(dead_code)]
     pub signature_algorithms: Vec<(u8, u8)>,
     /// SNI hostname, if sent.
     pub server_name: Option<String>,

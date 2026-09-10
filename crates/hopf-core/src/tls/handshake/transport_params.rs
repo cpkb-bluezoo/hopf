@@ -95,7 +95,7 @@ impl RememberedTransportLimits {
             if i + len > encoded.len() {
                 return None;
             }
-            let mut value = &encoded[i..i + len];
+            let value = &encoded[i..i + len];
             i += len;
             let (n, consumed) = read_varint(value)?;
             if consumed != value.len() {

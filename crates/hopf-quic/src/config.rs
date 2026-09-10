@@ -41,11 +41,6 @@ impl QuicServerConfig {
         }
     }
 
-    /// Into transport server config.
-    pub(crate) fn into_transport(self) -> TransportServerConfig {
-        self.inner
-    }
-
     /// Clone transport config.
     pub(crate) fn transport(&self) -> TransportServerConfig {
         self.inner.clone()
@@ -127,11 +122,6 @@ impl QuicClientConfig {
         Self {
             inner: TransportClientConfig::new(handshake),
         }
-    }
-
-    /// Into transport client config.
-    pub(crate) fn into_transport(self) -> TransportClientConfig {
-        self.inner
     }
 
     /// Clone transport config.

@@ -26,9 +26,9 @@ use super::handshake::collect::{MessageCollector, ParsedIncoming};
 use super::handshake::parser::{HandshakeEvents, HandshakeParser};
 use super::handshake::ticket::{
     mint_new_session_ticket, open_ticket, recover_ticket_age, AntiReplay, ClientTicketStore,
-    StoredTicket, DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+    StoredTicket,
 };
-use super::handshake::transport_params::{RememberedTransportLimits, encode_initial_max_data};
+use super::handshake::transport_params::RememberedTransportLimits;
 use super::sink::{KeyUpdateDirection, QuicSecrets, TlsEventSink, TlsProtocolError, VerifyResult};
 use crate::crypto::hkdf::expand_label;
 
@@ -1702,6 +1702,8 @@ fn pick_alpn(client: &[Bytes], server: &[Bytes]) -> Option<Bytes> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::handshake::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS;
+    use super::super::handshake::transport_params::encode_initial_max_data;
     use crate::tls::sink::{TlsEventSink, VerifyRequest, VerifyResult};
 
     #[derive(Default)]
@@ -2155,6 +2157,7 @@ mod tests {
         assert!(sink.early_keys.is_none());
     }
 
+    #[test]
     fn full_1rtt_client_server_loopback() {
         let creds = test_server_credentials();
         let sink = run_loopback(
@@ -2169,14 +2172,14 @@ mod tests {
                 local_transport_parameters: None,
                 trust_store: None,
                 verify_override: None,
-            enable_early_data: false,
-            max_early_data_size: 0,
-            max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
-            ticket_key: None,
-            ticket_store: None,
-            anti_replay: None,
-            ..Default::default()
-        },
+                enable_early_data: false,
+                max_early_data_size: 0,
+                max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+                ticket_key: None,
+                ticket_store: None,
+                anti_replay: None,
+                ..Default::default()
+            },
         );
         let quic = sink.quic.expect("quic secrets");
         assert!(quic.client_application_traffic_secret.is_some());
@@ -2317,7 +2320,6 @@ mod tests {
 
     #[test]
     fn full_1rtt_hybrid_pqc_and_transport_parameters() {
-        use super::super::handshake::encode_initial_max_data;
         let creds = test_server_credentials();
         let client_tp = encode_initial_max_data(1_048_576);
         let server_tp = encode_initial_max_data(2_097_152);
@@ -2597,7 +2599,7 @@ mod tests {
             sink.events
         );
         let sh_wire = sink.outbound.first().expect("ServerHello emitted");
-        let parsed = crate::tls::handshake::parse_server_hello(&sh_wire[4..]).expect("valid ServerHello");
+        let parsed = crate::tls::handshake::collect::parse_server_hello(&sh_wire[4..]).expect("valid ServerHello");
         assert_eq!(parsed.cipher_suite, CHACHA20_POLY1305_SHA256);
         assert_eq!(sink.negotiated_aead, Some(Tls13Aead::ChaCha20Poly1305Sha256));
     }
