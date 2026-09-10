@@ -392,6 +392,13 @@ pub struct Tls12Engine {
     local_ecdhe: Option<EphemeralP256KeyPair>,
     peer_ec_point: Option<Bytes>,
     master_secret: Option<[u8; 48]>,
+    /// Whether Extended Master Secret (RFC 7627 §5.1 / RFC 9846 Appendix D)
+    /// was negotiated this handshake. Both roles refuse the handshake
+    /// before this would ever read `false` at derivation time — see
+    /// `on_client_hello`/`on_server_hello` — so this is effectively always
+    /// `true` by the time [`Self::derive_master_secret`] reads it, but it's
+    /// still the negotiated value, not a hardcoded assumption.
+    use_ems: bool,
     peer_certs: Vec<Bytes>,
     peer_server_name: Option<String>,
     negotiated_alpn: Option<Bytes>,
@@ -448,6 +455,7 @@ impl Tls12Engine {
             local_ecdhe: None,
             peer_ec_point: None,
             master_secret: None,
+            use_ems: false,
             peer_certs: Vec::new(),
             peer_server_name: None,
             negotiated_alpn: None,
@@ -666,6 +674,11 @@ impl Tls12Engine {
             self.fail(sink, "server selected an unsupported cipher suite");
             return false;
         };
+        if !sh.extended_master_secret {
+            self.fail(sink, "server did not negotiate mandatory Extended Master Secret (RFC 7627)");
+            return false;
+        }
+        self.use_ems = true;
         self.negotiated_suite = Some(sh.cipher_suite);
         self.cipher_kind = Some(kind);
         self.prf_hash = Some(prf_hash);
@@ -819,7 +832,6 @@ impl Tls12Engine {
             self.fail(sink, "key agreement failed");
             return false;
         };
-        self.derive_master_secret(&pre_master);
 
         // Client's response to CertificateRequest — Certificate goes before
         // ClientKeyExchange (RFC 5246 §7.4.6); CertificateVerify (if we
@@ -840,6 +852,12 @@ impl Tls12Engine {
 
         let cke = messages::build_client_key_exchange(&client_point);
         self.emit(&cke, sink);
+        // RFC 7627 §3: session_hash covers handshake_messages up to and
+        // including ClientKeyExchange, so the master secret can only be
+        // derived once the transcript includes it — but before
+        // CertificateVerify, which the session_hash excludes even though
+        // it's sent after CKE in this same flight.
+        self.derive_master_secret(&pre_master);
 
         if let Some(creds) = sent_client_cert {
             let message = self.transcript.raw_bytes().to_vec();
@@ -891,6 +909,11 @@ impl Tls12Engine {
             self.fail(sink, "unsupported server signing key");
             return false;
         };
+        if !ch.extended_master_secret {
+            self.fail(sink, "ClientHello missing mandatory Extended Master Secret extension (RFC 7627)");
+            return false;
+        }
+        self.use_ems = true;
 
         let resume_payload = ch.session_ticket.as_ref().filter(|t| !t.is_empty()).and_then(|offered| {
             let key = self.config.ticket_key.as_ref()?;
@@ -923,6 +946,7 @@ impl Tls12Engine {
                 payload.cipher_suite,
                 false,
                 if self.config.dtls { 0xfefd } else { 0x0303 },
+                true,
             );
             self.emit(&sh, sink);
 
@@ -959,6 +983,7 @@ impl Tls12Engine {
             suite,
             self.should_issue_ticket,
             if self.config.dtls { 0xfefd } else { 0x0303 },
+            true,
         );
         self.emit(&sh, sink);
 
@@ -1126,12 +1151,25 @@ impl Tls12Engine {
 
     // ---- shared ----
 
+    /// RFC 7627 §4: when Extended Master Secret is negotiated, the seed is
+    /// `session_hash` (the transcript hash through `ClientKeyExchange`,
+    /// but excluding `CertificateVerify`) instead of `client_random ||
+    /// server_random`, under the `"extended master secret"` label. Both
+    /// `on_client_hello`/`on_server_hello` refuse the handshake before
+    /// `use_ems` could ever be `false` here — see their mandatory checks —
+    /// but this stays a live branch on the negotiated value rather than a
+    /// hardcoded assumption the caller can't verify.
     fn derive_master_secret(&mut self, pre_master: &[u8]) {
         let prf_hash = self.prf_hash.expect("cipher negotiated");
-        let mut seed = Vec::with_capacity(64);
-        seed.extend_from_slice(&self.client_random);
-        seed.extend_from_slice(&self.server_random);
-        let out = prf(prf_hash, pre_master, b"master secret", &seed, 48);
+        let (label, seed): (&[u8], Vec<u8>) = if self.use_ems {
+            (b"extended master secret", self.transcript.hash(prf_hash))
+        } else {
+            let mut seed = Vec::with_capacity(64);
+            seed.extend_from_slice(&self.client_random);
+            seed.extend_from_slice(&self.server_random);
+            (b"master secret", seed)
+        };
+        let out = prf(prf_hash, pre_master, label, &seed, 48);
         let mut master = [0u8; 48];
         master.copy_from_slice(&out);
         self.master_secret = Some(master);
@@ -1533,6 +1571,112 @@ mod tests {
 
         assert!(!server.is_complete());
         assert!(sink_s.events.iter().any(|e| e.starts_with("protocol_error")), "{:?}", sink_s.events);
+    }
+
+    /// Removes one extension from a `ClientHello`/`ServerHello` wire
+    /// message built by this module's own builders — both put extensions
+    /// as the final field, `ext_len(2) || extensions`, so `prefix_len` is
+    /// just the byte count of everything before that. Used to simulate a
+    /// peer that doesn't offer/echo a given extension without duplicating
+    /// this crate's own message-building code.
+    fn strip_extension(wire: &Bytes, prefix_len: usize, ext_type: u16) -> Bytes {
+        let body = &wire[4..];
+        let ext_len = u16::from_be_bytes([body[prefix_len], body[prefix_len + 1]]) as usize;
+        let ext_block = &body[prefix_len + 2..prefix_len + 2 + ext_len];
+        let mut new_ext = BytesMut::new();
+        let mut k = 0;
+        while k + 4 <= ext_block.len() {
+            let et = u16::from_be_bytes([ext_block[k], ext_block[k + 1]]);
+            let el = u16::from_be_bytes([ext_block[k + 2], ext_block[k + 3]]) as usize;
+            let entry = &ext_block[k..k + 4 + el];
+            if et != ext_type {
+                new_ext.extend_from_slice(entry);
+            }
+            k += 4 + el;
+        }
+        let mut new_body = BytesMut::new();
+        new_body.extend_from_slice(&body[..prefix_len]);
+        new_body.extend_from_slice(&(new_ext.len() as u16).to_be_bytes());
+        new_body.extend_from_slice(&new_ext);
+        messages::encode_message(MessageType::from_u8(wire[0]).unwrap(), &new_body)
+    }
+
+    #[test]
+    fn server_refuses_client_hello_without_extended_master_secret() {
+        let creds = test_server_credentials_ecdsa();
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_s = RecordingSink::default();
+
+        let params = messages::ClientHelloParams {
+            random: [1u8; 32],
+            session_id: &[],
+            cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
+            server_name: None,
+            session_ticket: None,
+            legacy_version: 0x0303,
+            cookie: &[],
+        };
+        let wire = messages::build_client_hello(&params);
+        // legacy_version(2) + random(32) + session_id_len(1) + session_id(0)
+        // + cipher_suites_len(2) + cipher_suites(4) + compression(2).
+        let stripped = strip_extension(&wire, 43, messages::ext::EXTENDED_MASTER_SECRET);
+        let mut input = stripped.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink_s);
+
+        assert!(!server.is_complete());
+        assert!(
+            sink_s.events.iter().any(|e| e.contains("protocol_error") && e.contains("Extended Master Secret")),
+            "{:?}",
+            sink_s.events
+        );
+        assert!(sink_s.outbound.is_empty(), "server must not send ServerHello: {:?}", sink_s.events);
+    }
+
+    #[test]
+    fn client_refuses_server_hello_without_extended_master_secret() {
+        let creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let mut client = Tls12Engine::new(client_cfg);
+        let mut sink_c = RecordingSink::default();
+        client.start(&mut sink_c);
+        take_outbound(&mut sink_c); // ClientHello, not needed here
+
+        let wire = messages::build_server_hello(
+            &[2u8; 32],
+            &[],
+            ECDHE_ECDSA_AES128_GCM_SHA256,
+            false,
+            0x0303,
+            false, // no extended_master_secret
+        );
+        let mut input = wire.as_ref();
+        client.feed_handshake_data(&mut input, &mut sink_c);
+
+        assert!(!client.is_complete());
+        assert!(
+            sink_c.events.iter().any(|e| e.contains("protocol_error") && e.contains("Extended Master Secret")),
+            "{:?}",
+            sink_c.events
+        );
     }
 
     fn message_types(msgs: &[Bytes]) -> Vec<u8> {

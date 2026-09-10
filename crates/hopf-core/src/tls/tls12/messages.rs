@@ -76,6 +76,11 @@ pub mod ext {
     /// SessionTicket (RFC 5077 §3.2) — empty to advertise support, or the
     /// opaque ticket bytes to attempt resumption.
     pub const SESSION_TICKET: u16 = 35;
+    /// Extended Master Secret (RFC 7627 §5.1; RFC 9846 Appendix D renames
+    /// the *prose* term to `extended_main_secret` but doesn't move this
+    /// IANA codepoint) — zero-length `extension_data`; mere presence is
+    /// the signal. This engine treats it as mandatory, not optional.
+    pub const EXTENDED_MASTER_SECRET: u16 = 0x0017;
 }
 
 /// `SignatureAndHashAlgorithm` (RFC 5246 §7.4.1.4.1) — the legacy 1-byte/1-byte
@@ -162,6 +167,7 @@ pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
 
     let mut extensions = BytesMut::new();
     push_extension(&mut extensions, ext::RENEGOTIATION_INFO, &[0]); // empty renegotiated_connection
+    push_extension(&mut extensions, ext::EXTENDED_MASTER_SECRET, &[]); // mandatory (RFC 7627 §5.1)
     push_extension(
         &mut extensions,
         ext::SUPPORTED_GROUPS,
@@ -237,6 +243,9 @@ pub struct ParsedClientHello {
     /// when parsing a TCP TLS 1.2 `ClientHello` (`legacy_version` `0x0303`
     /// never carries this field at all — see [`ClientHelloParams::cookie`]).
     pub cookie: Bytes,
+    /// Whether the client offered `extended_master_secret` (RFC 7627
+    /// §5.1). This engine treats it as mandatory — see `engine.rs`.
+    pub extended_master_secret: bool,
 }
 
 /// Parse a `ClientHello` body.
@@ -288,6 +297,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
     let mut signature_algorithms = Vec::new();
     let mut server_name = None;
     let mut session_ticket = None;
+    let mut extended_master_secret = false;
     if i + 2 <= body.len() {
         let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
         i += 2;
@@ -323,6 +333,9 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
                     ext::SESSION_TICKET => {
                         session_ticket = Some(Bytes::copy_from_slice(data));
                     }
+                    ext::EXTENDED_MASTER_SECRET => {
+                        extended_master_secret = true;
+                    }
                     _ => {}
                 }
                 k += el;
@@ -338,6 +351,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
         server_name,
         session_ticket,
         cookie,
+        extended_master_secret,
     })
 }
 
@@ -353,6 +367,7 @@ pub fn build_server_hello(
     cipher_suite: u16,
     session_ticket: bool,
     legacy_version: u16,
+    extended_master_secret: bool,
 ) -> Bytes {
     let mut body = BytesMut::new();
     body.extend_from_slice(&legacy_version.to_be_bytes());
@@ -364,6 +379,9 @@ pub fn build_server_hello(
 
     let mut extensions = BytesMut::new();
     push_extension(&mut extensions, ext::RENEGOTIATION_INFO, &[0]);
+    if extended_master_secret {
+        push_extension(&mut extensions, ext::EXTENDED_MASTER_SECRET, &[]);
+    }
     push_extension(&mut extensions, ext::EC_POINT_FORMATS, &[1, EC_POINT_FORMAT_UNCOMPRESSED]);
     if session_ticket {
         push_extension(&mut extensions, ext::SESSION_TICKET, &[]);
@@ -386,6 +404,9 @@ pub struct ParsedServerHello {
     /// RFC 5077 §3.2's signal that a `NewSessionTicket` message follows
     /// later in this same handshake.
     pub session_ticket_offered: bool,
+    /// Whether the server echoed `extended_master_secret` (RFC 7627
+    /// §5.1). This engine treats it as mandatory — see `engine.rs`.
+    pub extended_master_secret: bool,
 }
 
 /// Parse a `ServerHello` body.
@@ -409,6 +430,7 @@ pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
     i += 1; // compression_method
 
     let mut session_ticket_offered = false;
+    let mut extended_master_secret = false;
     if i + 2 <= body.len() {
         let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
         i += 2;
@@ -425,12 +447,15 @@ pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
                 if et == ext::SESSION_TICKET {
                     session_ticket_offered = true;
                 }
+                if et == ext::EXTENDED_MASTER_SECRET {
+                    extended_master_secret = true;
+                }
                 k += el;
             }
         }
     }
 
-    Some(ParsedServerHello { random, session_id, cipher_suite, session_ticket_offered })
+    Some(ParsedServerHello { random, session_id, cipher_suite, session_ticket_offered, extended_master_secret })
 }
 
 /// Build a `HelloVerifyRequest` (RFC 6347 §4.2.1) — DTLS 1.2's stateless
@@ -712,6 +737,7 @@ mod tests {
         assert_eq!(parsed.cipher_suites, vec![0xC02F, 0xC030]);
         assert_eq!(parsed.server_name.as_deref(), Some("example.test"));
         assert!(parsed.signature_algorithms.contains(&(sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA)));
+        assert!(parsed.extended_master_secret, "this engine always offers extended_master_secret");
     }
 
     /// DTLS's `ClientHello` (`legacy_version = 0xfefd`) carries one extra
@@ -747,12 +773,13 @@ mod tests {
 
     #[test]
     fn server_hello_round_trip() {
-        let wire = build_server_hello(&[9u8; 32], &[1, 2, 3], 0xC02F, false, 0x0303);
+        let wire = build_server_hello(&[9u8; 32], &[1, 2, 3], 0xC02F, false, 0x0303, false);
         let parsed = parse_server_hello(&wire[4..]).expect("parse");
         assert_eq!(parsed.random, [9u8; 32]);
         assert_eq!(parsed.session_id.as_ref(), &[1, 2, 3]);
         assert_eq!(parsed.cipher_suite, 0xC02F);
         assert!(!parsed.session_ticket_offered);
+        assert!(!parsed.extended_master_secret);
     }
 
     #[test]
@@ -762,8 +789,18 @@ mod tests {
         // extension here — a real `rustls` client rejects an unadvertised
         // one as a protocol violation (it's waiting for `ChangeCipherSpec`
         // at that point instead), so this bit has to round-trip exactly.
-        let wire = build_server_hello(&[9u8; 32], &[], 0xC02F, true, 0x0303);
+        let wire = build_server_hello(&[9u8; 32], &[], 0xC02F, true, 0x0303, false);
         let parsed = parse_server_hello(&wire[4..]).expect("parse");
+        assert!(parsed.session_ticket_offered);
+    }
+
+    #[test]
+    fn server_hello_extended_master_secret_round_trips() {
+        // Confirms the new extension's presence doesn't shift the offset
+        // of EC_POINT_FORMATS/SESSION_TICKET parsed after it.
+        let wire = build_server_hello(&[9u8; 32], &[], 0xC02F, true, 0x0303, true);
+        let parsed = parse_server_hello(&wire[4..]).expect("parse");
+        assert!(parsed.extended_master_secret);
         assert!(parsed.session_ticket_offered);
     }
 
