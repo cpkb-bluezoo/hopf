@@ -57,6 +57,13 @@ pub const ECDHE_RSA_AES256_GCM_SHA384: u16 = 0xC030;
 pub const ECDHE_ECDSA_CHACHA20_POLY1305_SHA256: u16 = 0xCCA9;
 /// `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` (RFC 7905).
 pub const ECDHE_RSA_CHACHA20_POLY1305_SHA256: u16 = 0xCCA8;
+/// `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` (RFC 5746 §3.3) — a pseudo-cipher-
+/// suite alternative to the `renegotiation_info` extension, for a peer
+/// that can't send extensions. This engine's own client never sends it
+/// (the extension already covers this engine's own initial handshake),
+/// but the server must still recognise it from a peer that does — see
+/// `on_client_hello`'s secure-renegotiation check.
+pub const TLS_EMPTY_RENEGOTIATION_INFO_SCSV: u16 = 0x00FF;
 
 /// Cipher suites this engine offers/accepts, in preference order. AES-128-GCM
 /// first (broadest hardware/peer support), then ChaCha20-Poly1305 (equally
@@ -679,6 +686,10 @@ impl Tls12Engine {
             return false;
         }
         self.use_ems = true;
+        if !Self::secure_renegotiation_ok(&sh.renegotiation_info) {
+            self.fail(sink, "server did not confirm RFC 5746 secure renegotiation (missing or invalid renegotiation_info)");
+            return false;
+        }
         self.negotiated_suite = Some(sh.cipher_suite);
         self.cipher_kind = Some(kind);
         self.prf_hash = Some(prf_hash);
@@ -914,6 +925,18 @@ impl Tls12Engine {
             return false;
         }
         self.use_ems = true;
+        // RFC 5746 §3.6: a present-but-malformed extension always aborts,
+        // regardless of the SCSV — the SCSV is only an alternate signal
+        // for a peer that omits the extension entirely, not a bypass for
+        // a peer that sends a broken one.
+        let renegotiation_ok = match &ch.renegotiation_info {
+            Some(data) => data.as_ref() == [0u8],
+            None => ch.cipher_suites.contains(&TLS_EMPTY_RENEGOTIATION_INFO_SCSV),
+        };
+        if !renegotiation_ok {
+            self.fail(sink, "ClientHello missing or invalid RFC 5746 secure renegotiation signal");
+            return false;
+        }
 
         let resume_payload = ch.session_ticket.as_ref().filter(|t| !t.is_empty()).and_then(|offered| {
             let key = self.config.ticket_key.as_ref()?;
@@ -1150,6 +1173,16 @@ impl Tls12Engine {
     }
 
     // ---- shared ----
+
+    /// RFC 5746 §3.5 (client) / §3.6 (server): on an initial handshake,
+    /// `renegotiation_info` — if present at all — MUST be exactly the
+    /// empty `renegotiated_connection<0..255>` vector, i.e. this engine's
+    /// own encoding of it: a single zero length-prefix byte. Anything
+    /// else (wrong length, non-zero content) is a spec violation; there's
+    /// no prior handshake for a real value to reference on an initial one.
+    fn secure_renegotiation_ok(info: &Option<Bytes>) -> bool {
+        matches!(info, Some(data) if data.as_ref() == [0u8])
+    }
 
     /// RFC 7627 §4: when Extended Master Secret is negotiated, the seed is
     /// `session_hash` (the transcript hash through `ClientKeyExchange`,
@@ -1599,6 +1632,187 @@ mod tests {
         new_body.extend_from_slice(&(new_ext.len() as u16).to_be_bytes());
         new_body.extend_from_slice(&new_ext);
         messages::encode_message(MessageType::from_u8(wire[0]).unwrap(), &new_body)
+    }
+
+    /// Same shape as [`strip_extension`], but replaces one extension's
+    /// `extension_data` instead of removing the entry — used to simulate a
+    /// peer sending a malformed (non-empty) `renegotiation_info` on an
+    /// initial handshake.
+    fn replace_extension(wire: &Bytes, prefix_len: usize, ext_type: u16, new_data: &[u8]) -> Bytes {
+        let body = &wire[4..];
+        let ext_len = u16::from_be_bytes([body[prefix_len], body[prefix_len + 1]]) as usize;
+        let ext_block = &body[prefix_len + 2..prefix_len + 2 + ext_len];
+        let mut new_ext = BytesMut::new();
+        let mut k = 0;
+        while k + 4 <= ext_block.len() {
+            let et = u16::from_be_bytes([ext_block[k], ext_block[k + 1]]);
+            let el = u16::from_be_bytes([ext_block[k + 2], ext_block[k + 3]]) as usize;
+            if et == ext_type {
+                new_ext.extend_from_slice(&et.to_be_bytes());
+                new_ext.extend_from_slice(&(new_data.len() as u16).to_be_bytes());
+                new_ext.extend_from_slice(new_data);
+            } else {
+                new_ext.extend_from_slice(&ext_block[k..k + 4 + el]);
+            }
+            k += 4 + el;
+        }
+        let mut new_body = BytesMut::new();
+        new_body.extend_from_slice(&body[..prefix_len]);
+        new_body.extend_from_slice(&(new_ext.len() as u16).to_be_bytes());
+        new_body.extend_from_slice(&new_ext);
+        messages::encode_message(MessageType::from_u8(wire[0]).unwrap(), &new_body)
+    }
+
+    #[test]
+    fn server_refuses_client_hello_with_nonempty_renegotiation_info() {
+        let creds = test_server_credentials_ecdsa();
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_s = RecordingSink::default();
+
+        let params = messages::ClientHelloParams {
+            random: [1u8; 32],
+            session_id: &[],
+            cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
+            server_name: None,
+            session_ticket: None,
+            legacy_version: 0x0303,
+            cookie: &[],
+        };
+        let wire = messages::build_client_hello(&params);
+        let tampered = replace_extension(&wire, 43, messages::ext::RENEGOTIATION_INFO, &[1, 2, 3]);
+        let mut input = tampered.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink_s);
+
+        assert!(!server.is_complete());
+        assert!(
+            sink_s.events.iter().any(|e| e.contains("protocol_error") && e.contains("renegotiation")),
+            "{:?}",
+            sink_s.events
+        );
+        assert!(sink_s.outbound.is_empty(), "server must not send ServerHello: {:?}", sink_s.events);
+    }
+
+    #[test]
+    fn server_refuses_client_hello_without_renegotiation_info_or_scsv() {
+        let creds = test_server_credentials_ecdsa();
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_s = RecordingSink::default();
+
+        let params = messages::ClientHelloParams {
+            random: [1u8; 32],
+            session_id: &[],
+            cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
+            server_name: None,
+            session_ticket: None,
+            legacy_version: 0x0303,
+            cookie: &[],
+        };
+        let wire = messages::build_client_hello(&params);
+        let stripped = strip_extension(&wire, 43, messages::ext::RENEGOTIATION_INFO);
+        let mut input = stripped.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink_s);
+
+        assert!(!server.is_complete());
+        assert!(
+            sink_s.events.iter().any(|e| e.contains("protocol_error") && e.contains("renegotiation")),
+            "{:?}",
+            sink_s.events
+        );
+        assert!(sink_s.outbound.is_empty(), "server must not send ServerHello: {:?}", sink_s.events);
+    }
+
+    #[test]
+    fn server_accepts_client_hello_signalling_via_scsv_instead_of_extension() {
+        let creds = test_server_credentials_ecdsa();
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_s = RecordingSink::default();
+
+        let params = messages::ClientHelloParams {
+            random: [1u8; 32],
+            session_id: &[],
+            cipher_suites: &[
+                ECDHE_ECDSA_AES128_GCM_SHA256,
+                ECDHE_RSA_AES128_GCM_SHA256,
+                TLS_EMPTY_RENEGOTIATION_INFO_SCSV,
+            ],
+            server_name: None,
+            session_ticket: None,
+            legacy_version: 0x0303,
+            cookie: &[],
+        };
+        let wire = messages::build_client_hello(&params);
+        // Same prefix as the other tests plus one extra cipher suite (2 bytes).
+        let stripped = strip_extension(&wire, 45, messages::ext::RENEGOTIATION_INFO);
+        let mut input = stripped.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink_s);
+
+        assert!(
+            sink_s.events.iter().all(|e| !e.contains("renegotiation")),
+            "SCSV should satisfy RFC 5746 without the extension: {:?}",
+            sink_s.events
+        );
+        assert!(!sink_s.outbound.is_empty(), "server should proceed to send ServerHello: {:?}", sink_s.events);
+    }
+
+    #[test]
+    fn client_refuses_server_hello_with_nonempty_renegotiation_info() {
+        let creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            server: None,
+            trust_store: Some(trust),
+            ticket_key: None,
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let mut client = Tls12Engine::new(client_cfg);
+        let mut sink_c = RecordingSink::default();
+        client.start(&mut sink_c);
+        take_outbound(&mut sink_c); // ClientHello, not needed here
+
+        let wire = messages::build_server_hello(&[2u8; 32], &[], ECDHE_ECDSA_AES128_GCM_SHA256, false, 0x0303, true);
+        // legacy_version(2) + random(32) + session_id_len(1) + session_id(0)
+        // + cipher_suite(2) + compression_method(1).
+        let tampered = replace_extension(&wire, 38, messages::ext::RENEGOTIATION_INFO, &[9]);
+        let mut input = tampered.as_ref();
+        client.feed_handshake_data(&mut input, &mut sink_c);
+
+        assert!(!client.is_complete());
+        assert!(
+            sink_c.events.iter().any(|e| e.contains("protocol_error") && e.contains("renegotiation")),
+            "{:?}",
+            sink_c.events
+        );
     }
 
     #[test]

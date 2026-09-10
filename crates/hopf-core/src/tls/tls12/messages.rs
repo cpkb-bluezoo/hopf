@@ -246,6 +246,10 @@ pub struct ParsedClientHello {
     /// Whether the client offered `extended_master_secret` (RFC 7627
     /// §5.1). This engine treats it as mandatory — see `engine.rs`.
     pub extended_master_secret: bool,
+    /// `renegotiation_info` (RFC 5746 §3.2), if present: its raw
+    /// `extension_data`. `None` if absent. Validated in `engine.rs`, not
+    /// here — mirrors `session_ticket`'s split between parsing and policy.
+    pub renegotiation_info: Option<Bytes>,
 }
 
 /// Parse a `ClientHello` body.
@@ -298,6 +302,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
     let mut server_name = None;
     let mut session_ticket = None;
     let mut extended_master_secret = false;
+    let mut renegotiation_info = None;
     if i + 2 <= body.len() {
         let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
         i += 2;
@@ -336,6 +341,9 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
                     ext::EXTENDED_MASTER_SECRET => {
                         extended_master_secret = true;
                     }
+                    ext::RENEGOTIATION_INFO => {
+                        renegotiation_info = Some(Bytes::copy_from_slice(data));
+                    }
                     _ => {}
                 }
                 k += el;
@@ -352,6 +360,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
         session_ticket,
         cookie,
         extended_master_secret,
+        renegotiation_info,
     })
 }
 
@@ -407,6 +416,9 @@ pub struct ParsedServerHello {
     /// Whether the server echoed `extended_master_secret` (RFC 7627
     /// §5.1). This engine treats it as mandatory — see `engine.rs`.
     pub extended_master_secret: bool,
+    /// `renegotiation_info` (RFC 5746 §3.2), if present: its raw
+    /// `extension_data`. `None` if absent. Validated in `engine.rs`.
+    pub renegotiation_info: Option<Bytes>,
 }
 
 /// Parse a `ServerHello` body.
@@ -431,6 +443,7 @@ pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
 
     let mut session_ticket_offered = false;
     let mut extended_master_secret = false;
+    let mut renegotiation_info = None;
     if i + 2 <= body.len() {
         let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
         i += 2;
@@ -444,18 +457,29 @@ pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
                 if k + el > ext_block.len() {
                     break;
                 }
+                let data = &ext_block[k..k + el];
                 if et == ext::SESSION_TICKET {
                     session_ticket_offered = true;
                 }
                 if et == ext::EXTENDED_MASTER_SECRET {
                     extended_master_secret = true;
                 }
+                if et == ext::RENEGOTIATION_INFO {
+                    renegotiation_info = Some(Bytes::copy_from_slice(data));
+                }
                 k += el;
             }
         }
     }
 
-    Some(ParsedServerHello { random, session_id, cipher_suite, session_ticket_offered, extended_master_secret })
+    Some(ParsedServerHello {
+        random,
+        session_id,
+        cipher_suite,
+        session_ticket_offered,
+        extended_master_secret,
+        renegotiation_info,
+    })
 }
 
 /// Build a `HelloVerifyRequest` (RFC 6347 §4.2.1) — DTLS 1.2's stateless
@@ -738,6 +762,7 @@ mod tests {
         assert_eq!(parsed.server_name.as_deref(), Some("example.test"));
         assert!(parsed.signature_algorithms.contains(&(sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA)));
         assert!(parsed.extended_master_secret, "this engine always offers extended_master_secret");
+        assert_eq!(parsed.renegotiation_info.as_deref(), Some([0u8].as_slice()));
     }
 
     /// DTLS's `ClientHello` (`legacy_version = 0xfefd`) carries one extra
@@ -780,6 +805,7 @@ mod tests {
         assert_eq!(parsed.cipher_suite, 0xC02F);
         assert!(!parsed.session_ticket_offered);
         assert!(!parsed.extended_master_secret);
+        assert_eq!(parsed.renegotiation_info.as_deref(), Some([0u8].as_slice()), "renegotiation_info is always sent");
     }
 
     #[test]
