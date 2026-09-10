@@ -12,7 +12,7 @@ use crate::crypto::hkdf::expand_label;
 use crate::security::SecurityInfo;
 
 use super::engine::{HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, Tls13Aead};
-use super::sink::{QuicSecrets, TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyRequest, VerifyResult};
+use super::sink::{KeyUpdateDirection, QuicSecrets, TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyRequest, VerifyResult};
 
 const CONTENT_CHANGE_CIPHER_SPEC: u8 = 20;
 const CONTENT_ALERT: u8 = 21;
@@ -183,6 +183,20 @@ impl RecordState {
             self.epoch = Epoch::Application;
         }
     }
+
+    /// `KeyUpdate` (RFC 8446 §4.6.3/§7.2) ratcheted our own write secret —
+    /// swap in immediately (unlike the handshake→application transition,
+    /// no staging is needed: by the time this is called, anything needing
+    /// the old key has already been encrypted and handed off).
+    fn update_write_key(&mut self, aead: Tls13Aead, secret: &[u8; 32]) {
+        self.write = Some(DirectionalKeys::from_secret(aead, secret));
+    }
+
+    /// The peer's `KeyUpdate` ratcheted their write secret — swap our
+    /// matching read key in immediately.
+    fn update_read_key(&mut self, aead: Tls13Aead, secret: &[u8; 32]) {
+        self.read = Some(DirectionalKeys::from_secret(aead, secret));
+    }
 }
 
 fn write_plaintext_record(content_type: u8, payload: &[u8], out: &mut Vec<u8>) {
@@ -258,6 +272,13 @@ impl<S: TlsRecordSink + ?Sized> TlsEventSink for InnerSink<'_, S> {
 
     fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
         self.state.stage_application_keys(aead, client, server);
+    }
+
+    fn application_traffic_key_updated(&mut self, aead: Tls13Aead, direction: KeyUpdateDirection, secret: [u8; 32]) {
+        match direction {
+            KeyUpdateDirection::Write => self.state.update_write_key(aead, &secret),
+            KeyUpdateDirection::Read => self.state.update_read_key(aead, &secret),
+        }
     }
 
     fn protocol_error(&mut self, err: TlsProtocolError) {
@@ -365,6 +386,21 @@ impl TlsRecordEngine {
         }
         let payload = [ALERT_LEVEL_WARNING, ALERT_CLOSE_NOTIFY];
         write_fragmented(&mut self.state, CONTENT_ALERT, &payload, sink);
+    }
+
+    /// Rotate this connection's own application traffic key forward (RFC
+    /// 8446 §4.6.3/§7.2), optionally asking the peer to reciprocate. Only
+    /// valid once [`Self::is_complete`]; returns `false` with no effect
+    /// otherwise (local API misuse, not a peer-caused protocol error).
+    pub fn request_key_update<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S, request_peer_update: bool) -> bool {
+        if self.failed {
+            return false;
+        }
+        let mut inner = InnerSink {
+            state: &mut self.state,
+            outer: sink,
+        };
+        self.engine.request_key_update(&mut inner, request_peer_update)
     }
 
     fn fail<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S, msg: &str) {
@@ -715,6 +751,94 @@ mod tests {
         let wire = std::mem::take(&mut sink_s.outbound);
         client.feed_ciphertext(&mut wire.as_slice(), &mut sink_c);
         assert_eq!(sink_c.app_data, vec![b"hello back".to_vec()]);
+    }
+
+    /// End-to-end proof the `KeyUpdate` ratchet (RFC 8446 §4.6.3/§7.2)
+    /// actually works: the strongest possible test isn't inspecting
+    /// internal secrets (private to this module) but proving application
+    /// data sent *after* the update still round-trips — if the write/read
+    /// key swap were wrong on either side, the server's `open_in_place`
+    /// would fail AEAD authentication and report a `protocol_error`
+    /// instead of delivering the plaintext.
+    #[test]
+    fn key_update_rotates_client_write_key_and_server_still_decrypts() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback();
+
+        client.send_application_data(b"before update", &mut sink_c);
+        let wire = std::mem::take(&mut sink_c.outbound);
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        assert_eq!(sink_s.app_data, vec![b"before update".to_vec()]);
+
+        assert!(client.request_key_update(&mut sink_c, false), "{:?}", sink_c.events);
+        let wire = std::mem::take(&mut sink_c.outbound);
+        assert!(!wire.is_empty(), "KeyUpdate message must be emitted");
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        assert!(
+            !sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
+            "server must accept a well-formed KeyUpdate: {:?}",
+            sink_s.events
+        );
+
+        sink_c.app_data.clear();
+        sink_s.app_data.clear();
+        client.send_application_data(b"after update", &mut sink_c);
+        let wire = std::mem::take(&mut sink_c.outbound);
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        assert_eq!(
+            sink_s.app_data,
+            vec![b"after update".to_vec()],
+            "server must decrypt under the ratcheted key: {:?}",
+            sink_s.events
+        );
+    }
+
+    /// `request_peer_update: true` — the peer must reciprocate before its
+    /// own next application data, and both directions must keep working
+    /// after both sides have rotated.
+    #[test]
+    fn key_update_requesting_reciprocal_keeps_both_directions_working() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback();
+
+        assert!(client.request_key_update(&mut sink_c, true), "{:?}", sink_c.events);
+        let wire = std::mem::take(&mut sink_c.outbound);
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        assert!(
+            !sink_s.events.iter().any(|e| e.starts_with("protocol_error")),
+            "server must accept and reciprocate: {:?}",
+            sink_s.events
+        );
+        // Server's reciprocal KeyUpdate(update_not_requested) must have
+        // gone out as part of processing the request — relay it back so
+        // the client's read key also rotates to match.
+        let wire = std::mem::take(&mut sink_s.outbound);
+        assert!(!wire.is_empty(), "server must send a reciprocal KeyUpdate");
+        client.feed_ciphertext(&mut wire.as_slice(), &mut sink_c);
+        assert!(
+            !sink_c.events.iter().any(|e| e.starts_with("protocol_error")),
+            "client must accept the reciprocal: {:?}",
+            sink_c.events
+        );
+
+        client.send_application_data(b"client after mutual update", &mut sink_c);
+        let wire = std::mem::take(&mut sink_c.outbound);
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        assert_eq!(sink_s.app_data, vec![b"client after mutual update".to_vec()], "{:?}", sink_s.events);
+
+        server.send_application_data(b"server after mutual update", &mut sink_s);
+        let wire = std::mem::take(&mut sink_s.outbound);
+        client.feed_ciphertext(&mut wire.as_slice(), &mut sink_c);
+        assert_eq!(sink_c.app_data, vec![b"server after mutual update".to_vec()], "{:?}", sink_c.events);
+    }
+
+    #[test]
+    fn request_key_update_before_handshake_complete_is_a_no_op() {
+        let (client_cfg, _server_cfg) = configs();
+        let mut client = TlsRecordEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        sink.outbound.clear();
+        assert!(!client.request_key_update(&mut sink, false));
+        assert!(sink.outbound.is_empty(), "must not emit anything: {:?}", sink.events);
     }
 
     #[test]

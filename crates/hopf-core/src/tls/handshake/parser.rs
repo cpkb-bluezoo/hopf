@@ -155,6 +155,11 @@ pub trait HandshakeEvents {
         let _ = data;
     }
 
+    /// `KeyUpdate`'s `KeyUpdateRequest` byte (RFC 8446 §4.6.3), post-handshake.
+    fn key_update_request(&mut self, kind: u8) {
+        let _ = kind;
+    }
+
     /// Last event for each complete message; `wire` includes the 4-byte header.
     fn message_end(&mut self, msg_type: HandshakeType, wire: Bytes);
 
@@ -234,6 +239,7 @@ fn decode_message_body(msg_type: HandshakeType, body: &[u8], handler: &mut dyn H
         HandshakeType::Certificate => decode_certificate(body, handler),
         HandshakeType::CertificateVerify => decode_certificate_verify(body, handler),
         HandshakeType::Finished => decode_finished(body, handler),
+        HandshakeType::KeyUpdate => decode_key_update(body, handler),
     }
 }
 
@@ -444,6 +450,15 @@ fn decode_finished(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
         return false;
     }
     handler.finished_verify_data(body);
+    true
+}
+
+fn decode_key_update(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
+    if body.len() != 1 {
+        handler.parse_error("KeyUpdate body must be exactly one byte");
+        return false;
+    }
+    handler.key_update_request(body[0]);
     true
 }
 
@@ -709,6 +724,7 @@ impl HandshakeType {
             13 => Some(HandshakeType::CertificateRequest),
             15 => Some(HandshakeType::CertificateVerify),
             20 => Some(HandshakeType::Finished),
+            24 => Some(HandshakeType::KeyUpdate),
             _ => None,
         }
     }
@@ -735,6 +751,9 @@ mod tests {
         fn key_share(&mut self, group: u16, share: &[u8]) {
             self.events
                 .push(format!("key_share:0x{group:04x}:{}", share.len()));
+        }
+        fn key_update_request(&mut self, kind: u8) {
+            self.events.push(format!("key_update_request:{kind}"));
         }
         fn message_end(&mut self, msg_type: HandshakeType, wire: Bytes) {
             self.events
@@ -782,6 +801,38 @@ mod tests {
         assert!(!handler.error);
         assert!(handler.events.iter().any(|e| e.starts_with("begin:")));
         assert!(handler.events.iter().any(|e| e.starts_with("end:")));
+    }
+
+    #[test]
+    fn key_update_round_trips_both_kind_values() {
+        use crate::tls::handshake::messages::{build_key_update, key_update_request};
+        for kind in [key_update_request::NOT_REQUESTED, key_update_request::REQUESTED] {
+            let wire = build_key_update(kind).encode();
+            let mut parser = HandshakeParser::new();
+            let mut handler = RecordingHandler::default();
+            let mut input = &wire[..];
+            parser.receive(&mut input, &mut handler);
+            assert!(!handler.error, "{:?}", handler.events);
+            assert!(
+                handler.events.iter().any(|e| e == &format!("key_update_request:{kind}")),
+                "{:?}",
+                handler.events
+            );
+        }
+    }
+
+    #[test]
+    fn key_update_with_wrong_body_length_is_a_parse_error() {
+        use crate::tls::handshake::messages::HandshakeType as HT;
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&[HT::KeyUpdate as u8]);
+        body.extend_from_slice(&[0, 0, 2]); // length = 2, wrong (must be 1)
+        body.extend_from_slice(&[0, 0]);
+        let mut parser = HandshakeParser::new();
+        let mut handler = RecordingHandler::default();
+        let mut input = &body[..];
+        parser.receive(&mut input, &mut handler);
+        assert!(handler.error, "{:?}", handler.events);
     }
 
     #[test]

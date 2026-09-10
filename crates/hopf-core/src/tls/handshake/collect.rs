@@ -381,6 +381,28 @@ impl HandshakeEvents for FinishedCollector {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct KeyUpdateCollector {
+    kind: u8,
+    got: bool,
+    failed: bool,
+}
+
+impl HandshakeEvents for KeyUpdateCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn key_update_request(&mut self, kind: u8) {
+        self.kind = kind;
+        self.got = true;
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
 fn decode_one(msg_type: HandshakeType, body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
     let mut wire = BytesMut::with_capacity(4 + body.len());
     wire.extend_from_slice(&[msg_type as u8]);
@@ -487,6 +509,8 @@ pub(crate) enum ParsedIncoming {
     Finished(Bytes),
     /// NewSessionTicket (post-handshake).
     NewSessionTicket(ParsedNewSessionTicket),
+    /// KeyUpdate's `KeyUpdateRequest` byte (post-handshake).
+    KeyUpdate(u8),
 }
 
 /// Active collector for the message currently being parsed.
@@ -509,6 +533,8 @@ pub(crate) enum MessageCollector {
     Finished(FinishedCollector),
     /// Collecting NewSessionTicket.
     NewSessionTicket(NewSessionTicketCollector),
+    /// Collecting KeyUpdate.
+    KeyUpdate(KeyUpdateCollector),
 }
 
 impl Default for MessageCollector {
@@ -569,6 +595,12 @@ impl MessageCollector {
                 }
                 Some(ParsedIncoming::NewSessionTicket(c.out))
             }
+            (HandshakeType::KeyUpdate, Self::KeyUpdate(c)) => {
+                if c.failed || !c.got {
+                    return None;
+                }
+                Some(ParsedIncoming::KeyUpdate(c.kind))
+            }
             _ => None,
         }
     }
@@ -593,6 +625,7 @@ impl HandshakeEvents for MessageCollector {
             HandshakeType::NewSessionTicket => {
                 Self::NewSessionTicket(NewSessionTicketCollector::default())
             }
+            HandshakeType::KeyUpdate => Self::KeyUpdate(KeyUpdateCollector::default()),
         };
     }
 
@@ -757,6 +790,12 @@ impl HandshakeEvents for MessageCollector {
         }
     }
 
+    fn key_update_request(&mut self, kind: u8) {
+        if let Self::KeyUpdate(c) = self {
+            c.key_update_request(kind);
+        }
+    }
+
     fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
 
     fn parse_error(&mut self, detail: &'static str) {
@@ -769,6 +808,7 @@ impl HandshakeEvents for MessageCollector {
             Self::CertificateVerify(c) => c.parse_error(detail),
             Self::Finished(c) => c.parse_error(detail),
             Self::NewSessionTicket(c) => c.parse_error(detail),
+            Self::KeyUpdate(c) => c.parse_error(detail),
             Self::Idle => {}
         }
     }

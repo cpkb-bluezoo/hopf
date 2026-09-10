@@ -31,6 +31,18 @@ pub enum TlsTimerKind {
     HandshakeTimeout,
 }
 
+/// Which direction's application traffic key a `KeyUpdate` ratcheted
+/// (RFC 8446 §4.6.3) — relative to this engine's own role, not
+/// client/server, since the ratchet logic itself is role-symmetric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyUpdateDirection {
+    /// The peer's traffic key (their `KeyUpdate` was received) — update
+    /// our read key.
+    Read,
+    /// Our own traffic key (we sent a `KeyUpdate`) — update our write key.
+    Write,
+}
+
 /// Certificate chain verification request — engine idles until [`HandshakeEngine::feed_verification_result`].
 #[derive(Debug, Clone)]
 pub struct VerifyRequest {
@@ -99,6 +111,14 @@ pub trait TlsEventSink {
     /// [`Self::quic_handshake_keys_ready`] for `aead`.
     fn application_traffic_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
 
+    /// One direction's application traffic secret ratcheted forward by a
+    /// `KeyUpdate` (RFC 8446 §4.6.3/§7.2), TCP-TLS-1.3 only — never fired
+    /// for [`super::HandshakeMode::Quic`] or [`super::HandshakeMode::Dtls`].
+    /// Carries the raw new secret, same shape as
+    /// [`Self::application_traffic_keys_ready`] — the record layer
+    /// re-derives key+iv itself.
+    fn application_traffic_key_updated(&mut self, _aead: Tls13Aead, _direction: KeyUpdateDirection, _secret: [u8; 32]) {}
+
     /// Negotiated TLS key-exchange group (IANA code, e.g. 0x11ec for X25519MLKEM768).
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
 
@@ -130,6 +150,7 @@ impl TlsEventSink for NopTlsEventSink {
     fn quic_handshake_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
     fn quic_early_keys_ready(&mut self, _aead: Tls13Aead, _client_early: [u8; 32]) {}
     fn application_traffic_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
+    fn application_traffic_key_updated(&mut self, _aead: Tls13Aead, _direction: KeyUpdateDirection, _secret: [u8; 32]) {}
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
     fn early_data_accepted(&mut self, _accepted: bool) {}
     fn quic_0rtt_peer_limits(&mut self, _limits: super::handshake::RememberedTransportLimits) {}

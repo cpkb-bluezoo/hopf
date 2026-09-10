@@ -16,11 +16,11 @@ use super::handshake::verify::{sign_certificate_verify, verify_certificate_verif
 use super::handshake::{
     build_certificate, build_certificate_request, build_certificate_verify, build_client_hello,
     build_client_hello_with_binder, build_encrypted_extensions_ext, build_finished,
-    build_hello_retry_request, build_server_hello_ext, compute_finished_verify_data,
+    build_hello_retry_request, build_key_update, build_server_hello_ext, compute_finished_verify_data,
     compute_psk_binder, derive_application_traffic_with_psk, derive_early_traffic,
     derive_handshake_traffic_with_psk, derive_resumption_master_secret, derive_resumption_psk,
-    ApplicationTrafficSecrets, ClientHelloParams, HandshakeMessage, HandshakeTrafficSecrets,
-    HandshakeType, KeyShareEntry, OfferedPsk, Transcript,
+    key_update_request, ApplicationTrafficSecrets, ClientHelloParams, HandshakeMessage,
+    HandshakeTrafficSecrets, HandshakeType, KeyShareEntry, OfferedPsk, Transcript,
 };
 use super::handshake::collect::{MessageCollector, ParsedIncoming};
 use super::handshake::parser::{HandshakeEvents, HandshakeParser};
@@ -29,7 +29,8 @@ use super::handshake::ticket::{
     StoredTicket, DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
 };
 use super::handshake::transport_params::{RememberedTransportLimits, encode_initial_max_data};
-use super::sink::{QuicSecrets, TlsEventSink, TlsProtocolError, VerifyResult};
+use super::sink::{KeyUpdateDirection, QuicSecrets, TlsEventSink, TlsProtocolError, VerifyResult};
+use crate::crypto::hkdf::expand_label;
 
 /// Client or server role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +267,15 @@ pub struct HandshakeEngine {
     shared_secret: Option<Bytes>,
     handshake_traffic: Option<HandshakeTrafficSecrets>,
     application_traffic: Option<ApplicationTrafficSecrets>,
+    /// This role's own outbound application traffic secret, retained past
+    /// `finish()` (unlike `application_traffic`, which is consumed there)
+    /// so a later `KeyUpdate` (RFC 8446 §4.6.3/§7.2) has something to
+    /// ratchet forward. Named by role-relative direction, not
+    /// client/server, so the ratchet logic itself never branches on role.
+    own_app_secret: Option<[u8; 32]>,
+    /// The peer's application traffic secret, same lifetime/purpose as
+    /// [`Self::own_app_secret`] but for the receive direction.
+    peer_app_secret: Option<[u8; 32]>,
     early_client_secret: Option<[u8; 32]>,
     /// Resumption PSK in use for this handshake (if any).
     psk: Option<[u8; 32]>,
@@ -346,6 +356,15 @@ enum State {
     Failed,
 }
 
+/// RFC 8446 §7.2: `application_traffic_secret_N+1 = HKDF-Expand-Label(
+/// application_traffic_secret_N, "traffic upd", "", Hash.length)`.
+fn ratchet_application_secret(secret: &[u8; 32]) -> [u8; 32] {
+    let out = expand_label(secret, "traffic upd", &[], 32);
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(out.as_ref());
+    buf
+}
+
 impl HandshakeEngine {
     /// Create an engine; call [`Self::start`] to emit the first flight (client).
     pub fn new(config: HandshakeConfig) -> Self {
@@ -359,6 +378,8 @@ impl HandshakeEngine {
             shared_secret: None,
             handshake_traffic: None,
             application_traffic: None,
+            own_app_secret: None,
+            peer_app_secret: None,
             early_client_secret: None,
             psk: None,
             resumed: false,
@@ -399,12 +420,9 @@ impl HandshakeEngine {
     /// Returns the number of bytes consumed from the front of `input`.
     pub fn feed_handshake_data<S: TlsEventSink>(&mut self, input: &mut &[u8], sink: &mut S) -> usize {
         let n = input.len();
-        // Allow post-handshake NewSessionTicket after Complete (client).
+        // Post-handshake messages keep flowing for both roles: client-side
+        // NewSessionTicket, and (either role) KeyUpdate (RFC 8446 §4.6.3).
         if self.state == State::Failed {
-            *input = &[];
-            return n;
-        }
-        if self.state == State::Complete && self.config.role != HandshakeRole::Client {
             *input = &[];
             return n;
         }
@@ -537,6 +555,7 @@ impl HandshakeEngine {
             (HandshakeRole::Server, HandshakeType::Finished, State::AwaitingClientFinished, ParsedIncoming::Finished(vd)) => {
                 self.on_client_finished(vd, wire, sink)
             }
+            (_, HandshakeType::KeyUpdate, State::Complete, ParsedIncoming::KeyUpdate(kind)) => self.on_key_update(kind, sink),
             _ => {
                 self.fail(sink, "unexpected handshake message or state");
                 false
@@ -992,6 +1011,70 @@ impl HandshakeEngine {
         );
     }
 
+    /// Peer's `KeyUpdate` (RFC 8446 §4.6.3), post-handshake. TCP-TLS-1.3
+    /// only — RFC 9001 §4.6 forbids this message over QUIC (QUIC has its
+    /// own separate packet-level key update), and DTLS 1.3's epoch-aware
+    /// variant (RFC 9147 §5.8) is a different, unimplemented mechanism.
+    fn on_key_update<S: TlsEventSink>(&mut self, kind: u8, sink: &mut S) -> bool {
+        if self.config.mode != HandshakeMode::TcpRecordLayer {
+            self.fail(
+                sink,
+                "KeyUpdate is invalid outside TCP TLS 1.3 (forbidden over QUIC by RFC 9001 §4.6; DTLS 1.3's epoch-aware variant is unimplemented)",
+            );
+            return false;
+        }
+        if kind != key_update_request::NOT_REQUESTED && kind != key_update_request::REQUESTED {
+            self.fail(sink, "malformed KeyUpdateRequest");
+            return false;
+        }
+        let Some(secret) = self.peer_app_secret else {
+            self.fail(sink, "KeyUpdate received before application traffic secrets are established");
+            return false;
+        };
+        let aead = self.negotiated_aead.expect("cipher suite negotiated before Complete");
+        let new_secret = ratchet_application_secret(&secret);
+        self.peer_app_secret = Some(new_secret);
+        sink.application_traffic_key_updated(aead, KeyUpdateDirection::Read, new_secret);
+        // RFC 8446 §4.6.3: a reciprocal update MUST go out before any
+        // further application data — this engine controls all outbound
+        // handshake_data_ready ordering, so doing it synchronously here
+        // satisfies that regardless of what the caller does afterward.
+        if kind == key_update_request::REQUESTED {
+            self.send_key_update(sink, false);
+        }
+        true
+    }
+
+    /// Emit a `KeyUpdate` and ratchet our own outbound secret forward.
+    /// Wire bytes go out *before* the key-change callback fires, so the
+    /// message itself is (correctly) encrypted under the pre-update key —
+    /// no staged/deferred key-swap mechanism is needed.
+    fn send_key_update<S: TlsEventSink>(&mut self, sink: &mut S, request_peer_update: bool) {
+        let kind = if request_peer_update { key_update_request::REQUESTED } else { key_update_request::NOT_REQUESTED };
+        let wire = build_key_update(kind).encode();
+        // Post-handshake: never part of the transcript hash used for Finished.
+        sink.handshake_data_ready(&wire);
+        let secret = self.own_app_secret.expect("application traffic established before Complete");
+        let aead = self.negotiated_aead.expect("cipher suite negotiated before Complete");
+        let new_secret = ratchet_application_secret(&secret);
+        self.own_app_secret = Some(new_secret);
+        sink.application_traffic_key_updated(aead, KeyUpdateDirection::Write, new_secret);
+    }
+
+    /// Request that this connection's own application traffic key rotate
+    /// forward (RFC 8446 §4.6.3/§7.2), optionally asking the peer to
+    /// reciprocate. TCP-TLS-1.3 only. Returns `false` with no effect if
+    /// called before the handshake completes or in any other transport
+    /// mode — local API misuse, not a peer-caused protocol error, so no
+    /// sink event fires for that case.
+    pub fn request_key_update<S: TlsEventSink>(&mut self, sink: &mut S, request_peer_update: bool) -> bool {
+        if self.state != State::Complete || self.config.mode != HandshakeMode::TcpRecordLayer {
+            return false;
+        }
+        self.send_key_update(sink, request_peer_update);
+        true
+    }
+
     /// Server role: request a different key-exchange group (RFC 8446
     /// §4.1.4) because the client's single offered `key_share` didn't match
     /// what [`crate::crypto::kx_policy::KxPolicy::select_mutual`] picked
@@ -1385,6 +1468,12 @@ impl HandshakeEngine {
         }
         if let Some(a) = app.as_ref() {
             sink.application_traffic_keys_ready(aead, a.client, a.server);
+            let (own, peer) = match self.config.role {
+                HandshakeRole::Client => (a.client, a.server),
+                HandshakeRole::Server => (a.server, a.client),
+            };
+            self.own_app_secret = Some(own);
+            self.peer_app_secret = Some(peer);
         }
         let early = self.early_client_secret;
         let quic = match self.config.mode {
@@ -1567,6 +1656,10 @@ impl<S: TlsEventSink> HandshakeEvents for EngineCodecBridge<'_, S> {
         self.collector.finished_verify_data(data);
     }
 
+    fn key_update_request(&mut self, kind: u8) {
+        self.collector.key_update_request(kind);
+    }
+
     fn message_end(&mut self, msg_type: HandshakeType, wire: Bytes) {
         if self.stop {
             return;
@@ -1578,6 +1671,7 @@ impl<S: TlsEventSink> HandshakeEvents for EngineCodecBridge<'_, S> {
                     HandshakeType::Certificate => "invalid Certificate message",
                     HandshakeType::CertificateVerify => "invalid CertificateVerify message",
                     HandshakeType::Finished => "invalid Finished message",
+                    HandshakeType::KeyUpdate => "invalid KeyUpdate message",
                     other => {
                         let _ = other;
                         "invalid handshake message"
@@ -1760,6 +1854,102 @@ mod tests {
         engine.start(&mut sink);
         assert_eq!(sink.events.len(), 1);
         assert!(sink.outbound[0].len() > 40);
+    }
+
+    /// RFC 9001 §4.6 forbids `KeyUpdate` over QUIC entirely (QUIC has its
+    /// own separate packet-level key update) — both the receive side and
+    /// the caller-initiated `request_key_update` API must refuse it.
+    #[test]
+    fn key_update_is_rejected_over_quic() {
+        let creds = test_server_credentials();
+        let client_cfg = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        let server_cfg = server_config_for(creds, KxPolicy::classical_only());
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay_server(&mut server, take_outbound(&mut sink_c), &mut sink_s);
+        relay_client(&mut client, take_outbound(&mut sink_s), &mut sink_c);
+        relay_server(&mut server, take_outbound(&mut sink_c), &mut sink_s);
+        assert!(client.is_complete() && server.is_complete());
+
+        assert!(!server.request_key_update(&mut sink_s, false), "caller-initiated API must refuse on QUIC");
+
+        let wire = build_key_update(key_update_request::NOT_REQUESTED).encode();
+        let mut input = wire.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink_s);
+        assert!(
+            sink_s.events.iter().any(|e| e.contains("protocol_error") && e.contains("QUIC")),
+            "{:?}",
+            sink_s.events
+        );
+    }
+
+    fn tcp_configs(creds: ServerCredentials) -> (HandshakeConfig, HandshakeConfig) {
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let client = HandshakeConfig {
+            role: HandshakeRole::Client,
+            mode: HandshakeMode::TcpRecordLayer,
+            alpn: vec![Bytes::from_static(b"test")],
+            server_name: Some("localhost".into()),
+            server: None,
+            kx_policy: KxPolicy::classical_only(),
+            local_transport_parameters: None,
+            trust_store: Some(trust),
+            verify_override: None,
+            enable_early_data: false,
+            max_early_data_size: 0,
+            max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: None,
+            ticket_store: None,
+            anti_replay: None,
+            ..Default::default()
+        };
+        let server = HandshakeConfig {
+            role: HandshakeRole::Server,
+            mode: HandshakeMode::TcpRecordLayer,
+            alpn: vec![Bytes::from_static(b"test")],
+            server_name: None,
+            server: Some(creds),
+            kx_policy: KxPolicy::classical_only(),
+            local_transport_parameters: None,
+            trust_store: None,
+            verify_override: None,
+            enable_early_data: false,
+            max_early_data_size: 0,
+            max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: None,
+            ticket_store: None,
+            anti_replay: None,
+            ..Default::default()
+        };
+        (client, server)
+    }
+
+    /// RFC 8446 doesn't define any `KeyUpdateRequest` value beyond 0/1.
+    #[test]
+    fn key_update_with_malformed_kind_is_rejected() {
+        let (client_cfg, server_cfg) = tcp_configs(test_server_credentials());
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay_server(&mut server, take_outbound(&mut sink_c), &mut sink_s);
+        relay_client(&mut client, take_outbound(&mut sink_s), &mut sink_c);
+        relay_server(&mut server, take_outbound(&mut sink_c), &mut sink_s);
+        assert!(client.is_complete() && server.is_complete());
+
+        let wire = build_key_update(2).encode(); // undefined KeyUpdateRequest value
+        let mut input = wire.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink_s);
+        assert!(
+            sink_s.events.iter().any(|e| e.contains("protocol_error") && e.contains("malformed")),
+            "{:?}",
+            sink_s.events
+        );
     }
 
     #[test]

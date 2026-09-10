@@ -26,6 +26,8 @@ pub enum HandshakeType {
     CertificateVerify = 15,
     /// Finished.
     Finished = 20,
+    /// KeyUpdate (RFC 8446 §4.6.3 — post-handshake, TCP-TLS-1.3 only).
+    KeyUpdate = 24,
 }
 
 impl HandshakeType {
@@ -575,6 +577,20 @@ pub fn build_finished(verify_data: &[u8]) -> HandshakeMessage {
         msg_type: HandshakeType::Finished,
         body: Bytes::copy_from_slice(verify_data),
     }
+}
+
+/// `KeyUpdateRequest` values (RFC 8446 §4.6.3).
+pub mod key_update_request {
+    /// `update_not_requested(0)`.
+    pub const NOT_REQUESTED: u8 = 0;
+    /// `update_requested(1)`.
+    pub const REQUESTED: u8 = 1;
+}
+
+/// Build a `KeyUpdate` message — single-byte `KeyUpdateRequest` body
+/// (RFC 8446 §4.6.3). Post-handshake: never part of the transcript hash.
+pub fn build_key_update(kind: u8) -> HandshakeMessage {
+    HandshakeMessage { msg_type: HandshakeType::KeyUpdate, body: Bytes::copy_from_slice(&[kind]) }
 }
 
 fn push_extension(out: &mut BytesMut, ext_type: u16, data: &[u8]) {
