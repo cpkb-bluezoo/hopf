@@ -87,6 +87,11 @@ pub mod ext {
     pub const PSK_KEY_EXCHANGE_MODES: u16 = 45;
     /// Signature Algorithms (RFC 8446 §4.2.3) — MUST be sent in ClientHello.
     pub const SIGNATURE_ALGORITHMS: u16 = 13;
+    /// Signature Algorithms Cert (RFC 8446 §4.2.3 / RFC 9846 §1.4) — which
+    /// certificate-chain signature algorithms this engine can verify.
+    /// Always sent, never parsed on receipt — see `tls12/messages.rs`'s
+    /// matching constant and `crypto-migration-plan.md` for why.
+    pub const SIGNATURE_ALGORITHMS_CERT: u16 = 0x0032;
     /// Cookie (RFC 8446 §4.2.2) — carried in `HelloRetryRequest`, echoed
     /// verbatim by the client in its followup ClientHello.
     pub const COOKIE: u16 = 44;
@@ -235,6 +240,20 @@ fn build_client_hello_inner(
         sig_algs.extend_from_slice(&(schemes.len() as u16).to_be_bytes());
         sig_algs.extend_from_slice(&schemes);
         push_extension(&mut extensions, ext::SIGNATURE_ALGORITHMS, &sig_algs);
+    }
+    {
+        // RFC 9846 §1.4: which certificate-chain signature algorithms this
+        // engine can verify — always sent, never parsed on receipt (no
+        // consumer today; see crypto::x509's matching constant).
+        let schemes = crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES;
+        let mut bytes = BytesMut::with_capacity(2 * schemes.len());
+        for scheme in schemes {
+            bytes.extend_from_slice(&scheme.to_be_bytes());
+        }
+        let mut sig_algs_cert = BytesMut::with_capacity(2 + bytes.len());
+        sig_algs_cert.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        sig_algs_cert.extend_from_slice(&bytes);
+        push_extension(&mut extensions, ext::SIGNATURE_ALGORITHMS_CERT, &sig_algs_cert);
     }
     if !params.alpn.is_empty() {
         let names: Vec<&[u8]> = params.alpn.iter().map(|p| p.as_ref()).collect();
@@ -665,5 +684,54 @@ mod tests {
         assert!(parsed.peer_key_share.is_some());
         assert_eq!(parsed.key_share_group, Some(NamedGroup::X25519.code()));
         assert_eq!(parsed.cipher_suites, vec![0x1301, 0x1303]);
+    }
+
+    /// `signature_algorithms_cert` (RFC 9846 §1.4) is sent but deliberately
+    /// never parsed by `collect::parse_client_hello` (no consumer — see
+    /// `ext`'s doc comment on this constant), so this scans the raw body
+    /// directly rather than going through the parser.
+    #[test]
+    fn client_hello_advertises_signature_algorithms_cert() {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [6u8; 32],
+            cipher_suites: vec![0x1301],
+            key_share: KeyShareEntry { group: NamedGroup::X25519.code(), share: Bytes::copy_from_slice(&kp.public_key()) },
+            supported_groups: vec![NamedGroup::X25519.code()],
+            alpn: vec![],
+            server_name: None,
+            transport_parameters: None,
+            early_data: false,
+            psk: None,
+            cookie: None,
+            legacy_version: 0x0303,
+        });
+        // legacy_version(2) + random(32) + session_id_len(1) + cipher_suites_len(2)
+        // + cipher_suites(2) + compression(2).
+        let prefix_len = 2 + 32 + 1 + 2 + 2 + 2;
+        let ext_len = u16::from_be_bytes([hello.body[prefix_len], hello.body[prefix_len + 1]]) as usize;
+        let ext_block = &hello.body[prefix_len + 2..prefix_len + 2 + ext_len];
+        let mut k = 0;
+        let mut found = None;
+        while k + 4 <= ext_block.len() {
+            let et = u16::from_be_bytes([ext_block[k], ext_block[k + 1]]);
+            let el = u16::from_be_bytes([ext_block[k + 2], ext_block[k + 3]]) as usize;
+            k += 4;
+            let data = &ext_block[k..k + el];
+            if et == ext::SIGNATURE_ALGORITHMS_CERT {
+                let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                let mut schemes = Vec::with_capacity(list_len / 2);
+                let mut m = 2;
+                while m + 2 <= 2 + list_len {
+                    schemes.push(u16::from_be_bytes([data[m], data[m + 1]]));
+                    m += 2;
+                }
+                found = Some(schemes);
+                break;
+            }
+            k += el;
+        }
+        assert_eq!(found, Some(crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES.to_vec()));
     }
 }

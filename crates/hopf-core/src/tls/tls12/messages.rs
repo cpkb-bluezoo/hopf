@@ -81,6 +81,15 @@ pub mod ext {
     /// IANA codepoint) — zero-length `extension_data`; mere presence is
     /// the signal. This engine treats it as mandatory, not optional.
     pub const EXTENDED_MASTER_SECRET: u16 = 0x0017;
+    /// Supported Versions (RFC 8446 §4.2.1 / RFC 9846 §1.4) — mandated on
+    /// the TLS 1.2 `ClientHello` too, not just TLS 1.3's. Content-mandatory
+    /// if present, but presence itself is optional here — see `engine.rs`.
+    pub const SUPPORTED_VERSIONS: u16 = 43;
+    /// Signature Algorithms Cert (RFC 8446 §4.2.3 / RFC 9846 §1.4) — which
+    /// certificate-chain signature algorithms this engine can verify.
+    /// Always sent, never parsed on receipt — see `engine.rs`'s module doc
+    /// and `crypto-migration-plan.md` for why.
+    pub const SIGNATURE_ALGORITHMS_CERT: u16 = 0x0032;
 }
 
 /// `SignatureAndHashAlgorithm` (RFC 5246 §7.4.1.4.1) — the legacy 1-byte/1-byte
@@ -94,7 +103,25 @@ pub mod sig_alg {
     pub const SIG_RSA: u8 = 1;
     /// `ecdsa` signature algorithm.
     pub const SIG_ECDSA: u8 = 3;
+    /// `rsa_pss_rsae_sha256` (RFC 8446 §4.2.3's `0x0804` `SignatureScheme`,
+    /// newly permitted in TLS 1.2 by RFC 9846 §4.3.3) — split across this
+    /// module's `(u8, u8)` pair shape for matching purposes, but this pair
+    /// is an opaque scheme code, *not* a real `(hash, sig)` combination
+    /// like every other entry in this module.
+    pub const RSA_PSS_SHA256_BYTE0: u8 = 0x08;
+    pub const RSA_PSS_SHA256_BYTE1: u8 = 0x04;
 }
+
+/// `signature_algorithms` pairs this engine offers/accepts, in preference
+/// order — shared by `build_client_hello` and `build_certificate_request`
+/// (previously duplicated between the two).
+const OFFERED_SIGNATURE_ALGORITHMS: &[(u8, u8)] = &[
+    (sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA),
+    (sig_alg::HASH_SHA256, sig_alg::SIG_RSA),
+    (sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA),
+    (sig_alg::HASH_SHA384, sig_alg::SIG_RSA),
+    (sig_alg::RSA_PSS_SHA256_BYTE0, sig_alg::RSA_PSS_SHA256_BYTE1),
+];
 
 /// `NamedCurve` (RFC 4492 §5.1.1) — only the one curve this engine speaks.
 pub const NAMED_CURVE_SECP256R1: u16 = 23;
@@ -168,6 +195,15 @@ pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
     let mut extensions = BytesMut::new();
     push_extension(&mut extensions, ext::RENEGOTIATION_INFO, &[0]); // empty renegotiated_connection
     push_extension(&mut extensions, ext::EXTENDED_MASTER_SECRET, &[]); // mandatory (RFC 7627 §5.1)
+    // RFC 9846 §1.4: mandatory on the TLS 1.2 ClientHello too, not just
+    // TLS 1.3's. `opaque versions<2..254>` — one version, so a 1-byte
+    // length prefix (0x02) followed by legacy_version itself; DTLS's
+    // 0xfefd/TCP's 0x0303 both come through unmodified.
+    push_extension(
+        &mut extensions,
+        ext::SUPPORTED_VERSIONS,
+        &[2, (params.legacy_version >> 8) as u8, params.legacy_version as u8],
+    );
     push_extension(
         &mut extensions,
         ext::SUPPORTED_GROUPS,
@@ -178,17 +214,19 @@ pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
         ext::EC_POINT_FORMATS,
         &[1, EC_POINT_FORMAT_UNCOMPRESSED],
     );
-    let sig_algs: &[(u8, u8)] = &[
-        (sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA),
-        (sig_alg::HASH_SHA256, sig_alg::SIG_RSA),
-        (sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA),
-        (sig_alg::HASH_SHA384, sig_alg::SIG_RSA),
-    ];
     let mut sig_alg_bytes = BytesMut::new();
-    for (h, s) in sig_algs {
+    for (h, s) in OFFERED_SIGNATURE_ALGORITHMS {
         sig_alg_bytes.extend_from_slice(&[*h, *s]);
     }
     push_extension(&mut extensions, ext::SIGNATURE_ALGORITHMS, &encode_u16_prefixed(&sig_alg_bytes));
+    // RFC 9846 §1.4: which certificate-chain signature algorithms this
+    // engine can verify — always sent, never parsed on receipt (no
+    // consumer today; see this module's doc and crypto-migration-plan.md).
+    push_extension(
+        &mut extensions,
+        ext::SIGNATURE_ALGORITHMS_CERT,
+        &encode_u16_list(crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES),
+    );
     if let Some(name) = params.server_name {
         let host = name.as_bytes();
         let mut sni = BytesMut::new();
@@ -250,6 +288,10 @@ pub struct ParsedClientHello {
     /// `extension_data`. `None` if absent. Validated in `engine.rs`, not
     /// here — mirrors `session_ticket`'s split between parsing and policy.
     pub renegotiation_info: Option<Bytes>,
+    /// `supported_versions` (RFC 9846 §1.4), if present. Presence is
+    /// optional (unlike EMS/5746) but content is validated in `engine.rs`
+    /// when present — see its `on_client_hello`.
+    pub supported_versions: Option<Vec<u16>>,
 }
 
 /// Parse a `ClientHello` body.
@@ -303,6 +345,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
     let mut session_ticket = None;
     let mut extended_master_secret = false;
     let mut renegotiation_info = None;
+    let mut supported_versions = None;
     if i + 2 <= body.len() {
         let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
         i += 2;
@@ -344,6 +387,20 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
                     ext::RENEGOTIATION_INFO => {
                         renegotiation_info = Some(Bytes::copy_from_slice(data));
                     }
+                    ext::SUPPORTED_VERSIONS => {
+                        if !data.is_empty() {
+                            let list_len = data[0] as usize;
+                            if data.len() >= 1 + list_len {
+                                let mut versions = Vec::with_capacity(list_len / 2);
+                                let mut m = 1;
+                                while m + 2 <= 1 + list_len {
+                                    versions.push(u16::from_be_bytes([data[m], data[m + 1]]));
+                                    m += 2;
+                                }
+                                supported_versions = Some(versions);
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 k += el;
@@ -361,6 +418,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
         cookie,
         extended_master_secret,
         renegotiation_info,
+        supported_versions,
     })
 }
 
@@ -553,14 +611,8 @@ pub fn build_certificate_request() -> Bytes {
     let mut body = BytesMut::new();
     // ClientCertificateType: rsa_sign(1), ecdsa_sign(64) (RFC 4492 §5.5).
     body.extend_from_slice(&[2u8, 1, 64]);
-    let sig_algs: &[(u8, u8)] = &[
-        (sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA),
-        (sig_alg::HASH_SHA256, sig_alg::SIG_RSA),
-        (sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA),
-        (sig_alg::HASH_SHA384, sig_alg::SIG_RSA),
-    ];
     let mut sig_alg_bytes = BytesMut::new();
-    for (h, s) in sig_algs {
+    for (h, s) in OFFERED_SIGNATURE_ALGORITHMS {
         sig_alg_bytes.extend_from_slice(&[*h, *s]);
     }
     body.extend_from_slice(&(sig_alg_bytes.len() as u16).to_be_bytes());
@@ -763,6 +815,7 @@ mod tests {
         assert!(parsed.signature_algorithms.contains(&(sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA)));
         assert!(parsed.extended_master_secret, "this engine always offers extended_master_secret");
         assert_eq!(parsed.renegotiation_info.as_deref(), Some([0u8].as_slice()));
+        assert_eq!(parsed.supported_versions, Some(vec![0x0303]));
     }
 
     /// DTLS's `ClientHello` (`legacy_version = 0xfefd`) carries one extra
@@ -786,6 +839,58 @@ mod tests {
         let parsed = parse_client_hello(&wire[4..]).expect("parse DTLS-shaped client hello");
         assert_eq!(parsed.cookie.as_ref(), b"a-server-issued-cookie");
         assert_eq!(parsed.cipher_suites, vec![0xC02F, 0xC030]);
+        assert_eq!(parsed.supported_versions, Some(vec![0xfefd]), "DTLS must advertise 0xfefd, not 0x0303");
+    }
+
+    /// `signature_algorithms_cert` (RFC 9846 §1.4) is sent but deliberately
+    /// never parsed by `parse_client_hello` (no consumer — see this
+    /// module's `ext` doc comment), so this scans the raw wire directly
+    /// rather than going through the parser.
+    #[test]
+    fn client_hello_advertises_signature_algorithms_cert() {
+        let params = ClientHelloParams {
+            random: [5u8; 32],
+            session_id: &[],
+            cipher_suites: &[0xC02F],
+            server_name: None,
+            session_ticket: None,
+            legacy_version: 0x0303,
+            cookie: &[],
+        };
+        let wire = build_client_hello(&params);
+        let schemes = find_extension_u16_list(&wire, ext::SIGNATURE_ALGORITHMS_CERT).expect("extension present");
+        assert_eq!(schemes, crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES.to_vec());
+    }
+
+    /// Scans a built `ClientHello`'s extensions for `ext_type` and decodes
+    /// its content as a `u16`-length-prefixed list of `u16`s (the shape
+    /// `SIGNATURE_ALGORITHMS`/`SIGNATURE_ALGORITHMS_CERT` both use).
+    fn find_extension_u16_list(wire: &Bytes, ext_type: u16) -> Option<Vec<u16>> {
+        let body = &wire[4..];
+        // legacy_version(2) + random(32) + session_id_len(1) + session_id(0)
+        // + cipher_suites_len(2) + cipher_suites(2) + compression(2).
+        let prefix_len = 2 + 32 + 1 + 2 + 2 + 2;
+        let ext_len = u16::from_be_bytes([body[prefix_len], body[prefix_len + 1]]) as usize;
+        let ext_block = &body[prefix_len + 2..prefix_len + 2 + ext_len];
+        let mut k = 0;
+        while k + 4 <= ext_block.len() {
+            let et = u16::from_be_bytes([ext_block[k], ext_block[k + 1]]);
+            let el = u16::from_be_bytes([ext_block[k + 2], ext_block[k + 3]]) as usize;
+            k += 4;
+            let data = &ext_block[k..k + el];
+            if et == ext_type {
+                let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                let mut out = Vec::with_capacity(list_len / 2);
+                let mut m = 2;
+                while m + 2 <= 2 + list_len {
+                    out.push(u16::from_be_bytes([data[m], data[m + 1]]));
+                    m += 2;
+                }
+                return Some(out);
+            }
+            k += el;
+        }
+        None
     }
 
     #[test]

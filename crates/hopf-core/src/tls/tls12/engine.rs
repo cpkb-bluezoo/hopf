@@ -31,8 +31,8 @@ use crate::crypto::kx::EphemeralP256KeyPair;
 use crate::crypto::prf::{prf, PrfHash};
 use crate::crypto::signature::{
     ecdsa_p256_sha256_verify_spki, ecdsa_p256_sign, ecdsa_p384_sha384_verify_spki, ecdsa_p384_sign,
-    rsa_sign_pkcs1_sha256, rsa_verify_pkcs1_sha256, EcdsaP256PrivateKey, EcdsaP384PrivateKey, RsaPrivateKey,
-    RsaPublicKeyComponents,
+    rsa_pss_sha256_verify_spki, rsa_sign_pkcs1_sha256, rsa_verify_pkcs1_sha256, EcdsaP256PrivateKey,
+    EcdsaP384PrivateKey, RsaPrivateKey, RsaPublicKeyComponents,
 };
 use crate::asn1::{parse_sequence, read_bit_string_content, read_tlv_content, strip_integer_padding};
 use crate::crypto::trust::TrustStore;
@@ -937,6 +937,18 @@ impl Tls12Engine {
             self.fail(sink, "ClientHello missing or invalid RFC 5746 secure renegotiation signal");
             return false;
         }
+        // RFC 9846 §1.4: content-mandatory-if-present, presence-optional —
+        // unlike EMS/5746, a TLS-1.2-only client has no established-practice
+        // reason to send this (its usual purpose is signalling upward TLS
+        // 1.3 capability), so absence is tolerated; but if it's there, it
+        // must actually include this engine's own version.
+        let expected_version = if self.config.dtls { 0xfefd } else { 0x0303 };
+        if let Some(versions) = &ch.supported_versions {
+            if !versions.contains(&expected_version) {
+                self.fail(sink, "ClientHello supported_versions doesn't include this engine's own version");
+                return false;
+            }
+        }
 
         let resume_payload = ch.session_ticket.as_ref().filter(|t| !t.is_empty()).and_then(|offered| {
             let key = self.config.ticket_key.as_ref()?;
@@ -1302,6 +1314,9 @@ fn verify_ske_signature(leaf_cert_der: &[u8], sig_hash: u8, sig_alg: u8, message
             };
             rsa_verify_pkcs1_sha256(RsaPublicKeyComponents { n: &n, e: &e }, message, signature)
         }
+        (sig_alg::RSA_PSS_SHA256_BYTE0, sig_alg::RSA_PSS_SHA256_BYTE1) => {
+            rsa_pss_sha256_verify_spki(&parsed.spki_der, message, signature)
+        }
         _ => false,
     }
 }
@@ -1562,6 +1577,60 @@ mod tests {
     }
 
     #[test]
+    fn verify_ske_signature_accepts_rsa_pss_sha256() {
+        use aws_lc_rs::encoding::AsDer;
+        use aws_lc_rs::rsa::{KeyPair as RsaGenKeyPair, KeySize};
+        use aws_lc_rs::signature::KeyPair as _;
+        use crate::crypto::signature::rsa_sign_pss_sha256;
+
+        let generated = RsaGenKeyPair::generate(KeySize::Rsa2048).unwrap();
+        let spki_der = generated.public_key().as_der().unwrap().as_ref().to_vec();
+        let (n, e) = rsa_n_e_from_spki(&spki_der).expect("extract n/e from freshly generated key's own SPKI");
+        let signing_key_pkcs8 = pkcs8_der_of(&generated);
+        let remote = RemoteRsaSigner { key: generated, rsa_public_key_der: rsa_public_key_der(&n, &e) };
+        let rcgen_key = rcgen::KeyPair::from_remote(Box::new(remote)).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&rcgen_key).unwrap();
+
+        let rsa_key = RsaPrivateKey::from_pkcs8(&signing_key_pkcs8).unwrap();
+        let message = b"arbitrary transcript-shaped bytes to sign";
+        let signature = rsa_sign_pss_sha256(&rsa_key, message).expect("PSS sign");
+
+        assert!(verify_ske_signature(
+            cert.der(),
+            sig_alg::RSA_PSS_SHA256_BYTE0,
+            sig_alg::RSA_PSS_SHA256_BYTE1,
+            message,
+            &signature,
+        ));
+        // A PSS signature must not verify against PKCS1v1.5's pair either.
+        assert!(!verify_ske_signature(cert.der(), sig_alg::HASH_SHA256, sig_alg::SIG_RSA, message, &signature));
+    }
+
+    #[test]
+    fn offered_signature_algorithms_include_rsa_pss_sha256() {
+        let params = messages::ClientHelloParams {
+            random: [4u8; 32],
+            session_id: &[],
+            cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256],
+            server_name: None,
+            session_ticket: None,
+            legacy_version: 0x0303,
+            cookie: &[],
+        };
+        let wire = messages::build_client_hello(&params);
+        let body = &wire[4..];
+        let parsed = messages::parse_client_hello(body).expect("parse");
+        assert!(
+            parsed
+                .signature_algorithms
+                .contains(&(sig_alg::RSA_PSS_SHA256_BYTE0, sig_alg::RSA_PSS_SHA256_BYTE1)),
+            "{:?}",
+            parsed.signature_algorithms
+        );
+    }
+
+    #[test]
     fn tampered_finished_is_rejected() {
         let creds = test_server_credentials_ecdsa();
         let mut trust = TrustStore::new();
@@ -1737,6 +1806,82 @@ mod tests {
             sink_s.events
         );
         assert!(sink_s.outbound.is_empty(), "server must not send ServerHello: {:?}", sink_s.events);
+    }
+
+    #[test]
+    fn server_refuses_client_hello_with_wrong_supported_versions() {
+        let creds = test_server_credentials_ecdsa();
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_s = RecordingSink::default();
+
+        let params = messages::ClientHelloParams {
+            random: [1u8; 32],
+            session_id: &[],
+            cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
+            server_name: None,
+            session_ticket: None,
+            legacy_version: 0x0303,
+            cookie: &[],
+        };
+        let wire = messages::build_client_hello(&params);
+        // supported_versions listing only TLS 1.0 (0x0301), not 0x0303.
+        let tampered = replace_extension(&wire, 43, messages::ext::SUPPORTED_VERSIONS, &[2, 0x03, 0x01]);
+        let mut input = tampered.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink_s);
+
+        assert!(!server.is_complete());
+        assert!(
+            sink_s.events.iter().any(|e| e.contains("protocol_error") && e.contains("supported_versions")),
+            "{:?}",
+            sink_s.events
+        );
+        assert!(sink_s.outbound.is_empty(), "server must not send ServerHello: {:?}", sink_s.events);
+    }
+
+    #[test]
+    fn server_accepts_client_hello_without_supported_versions() {
+        let creds = test_server_credentials_ecdsa();
+        let server_cfg = Config {
+            role: Role::Server,
+            server_name: None,
+            server: Some(creds),
+            trust_store: None,
+            ticket_key: None,
+            client_ticket_store: None,
+            ..Default::default()
+        };
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_s = RecordingSink::default();
+
+        let params = messages::ClientHelloParams {
+            random: [1u8; 32],
+            session_id: &[],
+            cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
+            server_name: None,
+            session_ticket: None,
+            legacy_version: 0x0303,
+            cookie: &[],
+        };
+        let wire = messages::build_client_hello(&params);
+        let stripped = strip_extension(&wire, 43, messages::ext::SUPPORTED_VERSIONS);
+        let mut input = stripped.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink_s);
+
+        assert!(
+            sink_s.events.iter().all(|e| !e.contains("supported_versions")),
+            "absence of supported_versions must be tolerated: {:?}",
+            sink_s.events
+        );
+        assert!(!sink_s.outbound.is_empty(), "server should proceed to send ServerHello: {:?}", sink_s.events);
     }
 
     #[test]

@@ -99,7 +99,27 @@ pub fn parse_certificate(der: &[u8]) -> Option<ParsedCertificate> {
     })
 }
 
-/// Verify `cert` was signed by the public key in `issuer_spki`.
+/// TLS `SignatureScheme` codes (RFC 8446 §4.2.3) for every certificate
+/// chain signature algorithm [`verify_cert_signature`] accepts — the
+/// single source of truth behind the `signature_algorithms_cert`
+/// extension both TLS engines send (RFC 8446 §4.2.3 / RFC 9846 §1.4).
+/// Same order as, and **must stay in sync with**, the `if oid == ...`
+/// chain below: Ed25519, ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384,
+/// rsa_pkcs1_sha256/384/512. No RSA-PSS certificate signatures — that's
+/// `id-RSASSA-PSS`'s parameterized `AlgorithmIdentifier`, which this
+/// module doesn't parse (a separate, larger addition than what's here).
+pub const ACCEPTED_CERT_SIGNATURE_SCHEMES: &[u16] = &[
+    0x0807, // ed25519
+    0x0403, // ecdsa_secp256r1_sha256
+    0x0503, // ecdsa_secp384r1_sha384
+    0x0401, // rsa_pkcs1_sha256
+    0x0501, // rsa_pkcs1_sha384
+    0x0601, // rsa_pkcs1_sha512
+];
+
+/// Verify `cert` was signed by the public key in `issuer_spki`. Accepts
+/// exactly the algorithms in [`ACCEPTED_CERT_SIGNATURE_SCHEMES`] — keep
+/// the two in sync.
 pub fn verify_cert_signature(cert: &ParsedCertificate, issuer_spki: &[u8]) -> bool {
     let Some(oid) = sig_alg_oid(&cert.sig_alg_der) else {
         return false;
