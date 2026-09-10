@@ -7,7 +7,8 @@ use super::kx::NamedGroup;
 /// Preferred [`NamedGroup`] order for ClientHello / server selection.
 ///
 /// Default matches today's rustls `prefer-post-quantum`: [`NamedGroup::X25519MLKEM768`]
-/// then classical X25519.
+/// first, then the other two RFC 10024 hybrid groups as classical-curve
+/// alternatives, then classical X25519 as a pure-classical fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KxPolicy {
     groups: Vec<NamedGroup>,
@@ -20,10 +21,16 @@ impl Default for KxPolicy {
 }
 
 impl KxPolicy {
-    /// Hybrid ML-KEM + X25519 first, then X25519 alone.
+    /// All three RFC 10024 hybrid groups (X25519MLKEM768 preferred), then
+    /// classical X25519 as a pure-classical fallback.
     pub fn pqc_first() -> Self {
         Self {
-            groups: vec![NamedGroup::X25519MLKEM768, NamedGroup::X25519],
+            groups: vec![
+                NamedGroup::X25519MLKEM768,
+                NamedGroup::SecP256r1MLKEM768,
+                NamedGroup::SecP384r1MLKEM1024,
+                NamedGroup::X25519,
+            ],
         }
     }
 
@@ -74,5 +81,23 @@ mod tests {
         assert_eq!(policy.select_mutual(&peer), Some(NamedGroup::X25519));
         let peer = [NamedGroup::X25519MLKEM768.code(), NamedGroup::X25519.code()];
         assert_eq!(policy.select_mutual(&peer), Some(NamedGroup::X25519MLKEM768));
+    }
+
+    /// A peer that only advertises one of the newer NIST-curve hybrid
+    /// groups (not `X25519MLKEM768`) must still negotiate PQC — proving
+    /// the two new groups are actually reachable through the default
+    /// policy, not just constructible in `crypto::kx`.
+    #[test]
+    fn select_mutual_reaches_secp384r1_mlkem1024_when_that_is_all_the_peer_offers() {
+        let policy = KxPolicy::default();
+        let peer = [NamedGroup::SecP384r1MLKEM1024.code()];
+        assert_eq!(policy.select_mutual(&peer), Some(NamedGroup::SecP384r1MLKEM1024));
+    }
+
+    #[test]
+    fn select_mutual_prefers_secp256r1_mlkem768_over_secp384r1_mlkem1024() {
+        let policy = KxPolicy::default();
+        let peer = [NamedGroup::SecP384r1MLKEM1024.code(), NamedGroup::SecP256r1MLKEM768.code()];
+        assert_eq!(policy.select_mutual(&peer), Some(NamedGroup::SecP256r1MLKEM768));
     }
 }
