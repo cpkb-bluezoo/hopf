@@ -18,7 +18,7 @@ pub struct TcpDnsConnectionPool {
     timeout: Duration,
     connections: HashMap<SocketAddr, TcpStream>,
     #[cfg(feature = "dot")]
-    dot_connections: HashMap<SocketAddr, (TcpStream, Box<dyn hopf_core::TlsSession>)>,
+    dot_connections: HashMap<SocketAddr, (TcpStream, hopf_core::TlsVariant)>,
 }
 
 impl Default for TcpDnsConnectionPool {
@@ -99,9 +99,9 @@ impl TcpDnsConnectionPool {
         len_payload.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         len_payload.extend_from_slice(&payload);
 
-        if let Some((mut stream, mut session)) = self.dot_connections.remove(&server) {
-            if let Ok(resp) = drive_tls_write_read(&mut stream, &mut *session, &len_payload) {
-                self.dot_connections.insert(server, (stream, session));
+        if let Some((mut stream, mut engine)) = self.dot_connections.remove(&server) {
+            if let Ok(resp) = drive_tls_write_read(&mut stream, &mut engine, &len_payload) {
+                self.dot_connections.insert(server, (stream, engine));
                 return Ok(resp);
             }
             // Stale — drop and fall through to a fresh connection + handshake.
@@ -109,9 +109,10 @@ impl TcpDnsConnectionPool {
         let mut stream = TcpStream::connect_timeout(&server, self.timeout)?;
         stream.set_read_timeout(Some(self.timeout))?;
         stream.set_write_timeout(Some(self.timeout))?;
-        let mut session = connector.connect(server_name)?;
-        let resp = drive_tls_write_read(&mut stream, &mut *session, &len_payload)?;
-        self.dot_connections.insert(server, (stream, session));
+        let mut engine = connector.connect(server_name)?;
+        drive_handshake(&mut stream, &mut engine)?;
+        let resp = drive_tls_write_read(&mut stream, &mut engine, &len_payload)?;
+        self.dot_connections.insert(server, (stream, engine));
         Ok(resp)
     }
 }
@@ -146,86 +147,121 @@ impl TcpDnsClientTransport {
     }
 }
 
+/// Blocking [`hopf_core::tls::TlsRecordSink`] for driving a [`hopf_core::TlsVariant`]
+/// synchronously over a real `TcpStream` — the reactive engine pushes
+/// ciphertext/plaintext/error events into this instead of a caller
+/// pulling them, so [`drive_handshake`]/[`drive_tls_write_read`] collect
+/// them here between each blocking socket read.
+#[cfg(feature = "dot")]
+#[derive(Default)]
+struct BlockingDotSink {
+    outbound: Vec<u8>,
+    handshake_done: bool,
+    app_data: Vec<u8>,
+    error: Option<String>,
+    peer_closed: bool,
+}
+
+#[cfg(feature = "dot")]
+impl hopf_core::tls::TlsRecordSink for BlockingDotSink {
+    fn ciphertext_ready(&mut self, data: &[u8]) {
+        self.outbound.extend_from_slice(data);
+    }
+    fn application_data(&mut self, plaintext: &[u8]) {
+        self.app_data.extend_from_slice(plaintext);
+    }
+    fn handshake_complete(&mut self, _info: hopf_core::SecurityInfo) {
+        self.handshake_done = true;
+    }
+    fn verification_requested(&mut self, _req: hopf_core::VerifyRequest) {
+        // Purely informational: the engine always fires this first, then
+        // immediately resolves verification inline, synchronously, in
+        // the same call, whenever `trust_store`/`verify_override` is set
+        // — which every DoT connector (public-trust, pinned, or
+        // `insecure_connector`) does. It never waits for a
+        // `feed_verification_result` call back from us.
+    }
+    fn protocol_error(&mut self, err: hopf_core::TlsProtocolError) {
+        self.error.get_or_insert(err.message);
+    }
+    fn peer_closed(&mut self) {
+        self.peer_closed = true;
+    }
+}
+
+#[cfg(feature = "dot")]
+impl BlockingDotSink {
+    fn flush_outbound(&mut self, stream: &mut TcpStream) -> io::Result<()> {
+        if !self.outbound.is_empty() {
+            stream.write_all(&self.outbound)?;
+            self.outbound.clear();
+        }
+        Ok(())
+    }
+
+    fn check(&mut self) -> io::Result<()> {
+        if let Some(msg) = self.error.take() {
+            return Err(io::Error::new(io::ErrorKind::Other, format!("DoT TLS error: {msg}")));
+        }
+        if self.peer_closed {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "DoT peer closed the connection"));
+        }
+        Ok(())
+    }
+}
+
+/// Drive `engine`'s handshake to completion over a real blocking `TcpStream`.
+#[cfg(feature = "dot")]
+fn drive_handshake(stream: &mut TcpStream, engine: &mut hopf_core::TlsVariant) -> io::Result<()> {
+    let mut sink = BlockingDotSink::default();
+    engine.start(&mut sink);
+    sink.flush_outbound(stream)?;
+    sink.check()?;
+    let mut buf = [0u8; 8192];
+    while !sink.handshake_done {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "DoT: connection closed during handshake"));
+        }
+        let mut slice = &buf[..n];
+        engine.feed_ciphertext(&mut slice, &mut sink);
+        sink.flush_outbound(stream)?;
+        sink.check()?;
+    }
+    Ok(())
+}
+
+/// Send one length-prefixed DoT query and read the length-prefixed
+/// response, over an already-handshake-complete `engine`.
 #[cfg(feature = "dot")]
 fn drive_tls_write_read(
     stream: &mut TcpStream,
-    session: &mut dyn hopf_core::TlsSession,
-    plaintext: &[u8],
+    engine: &mut hopf_core::TlsVariant,
+    len_payload: &[u8],
 ) -> io::Result<DnsMessage> {
-    use hopf_core::TlsProgress;
-    let to_write = plaintext;
-    let mut remaining = plaintext;
-    // Simplified: write all plaintext into session, flush TLS, read response.
-    while !remaining.is_empty() {
-        let n = session.write_plaintext(remaining)?;
-        if n == 0 {
-            break;
-        }
-        remaining = &remaining[n..];
-    }
-    let _ = to_write;
+    let mut sink = BlockingDotSink::default();
+    engine.send_application_data(len_payload, &mut sink);
+    sink.flush_outbound(stream)?;
+    sink.check()?;
+
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
     loop {
-        let mut tls_out = Vec::new();
-        while session.wants_write() {
-            let _ = session.write_tls(&mut tls_out)?;
-        }
-        if !tls_out.is_empty() {
-            stream.write_all(&tls_out)?;
-        }
-        if !session.is_handshaking() {
-            break;
-        }
-        let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf)?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "DoT EOF"));
-        }
-        let mut slice = &buf[..n];
-        while !slice.is_empty() {
-            let n = session.read_tls(&mut slice)?;
-            if n == 0 {
-                break;
-            }
-        }
-        let _ = session.process_new_packets()?;
-    }
-    // Read length-prefixed response
-    let mut plain = Vec::new();
-    loop {
-        let mut buf = [0u8; 8192];
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let mut slice = &buf[..n];
-                while !slice.is_empty() {
-                    let _ = session.read_tls(&mut slice)?;
-                }
-                let _prog: TlsProgress = session.process_new_packets()?;
-                let mut tmp = [0u8; 8192];
-                loop {
-                    match session.read_plaintext(&mut tmp) {
-                        Ok(0) => break,
-                        Ok(m) => plain.extend_from_slice(&tmp[..m]),
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-                break;
-            }
-            Err(e) => return Err(e),
-        }
-        if plain.len() >= 2 {
-            let len = u16::from_be_bytes([plain[0], plain[1]]) as usize;
-            if plain.len() >= 2 + len {
-                return DnsMessage::parse(&plain[2..2 + len])
+        if response.len() >= 2 {
+            let len = u16::from_be_bytes([response[0], response[1]]) as usize;
+            if response.len() >= 2 + len {
+                return DnsMessage::parse(&response[2..2 + len])
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
             }
         }
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "DoT: connection closed mid-response"));
+        }
+        let mut slice = &buf[..n];
+        engine.feed_ciphertext(&mut slice, &mut sink);
+        sink.flush_outbound(stream)?;
+        sink.check()?;
+        response.append(&mut sink.app_data);
     }
-    Err(io::Error::new(
-        io::ErrorKind::UnexpectedEof,
-        "incomplete DoT response",
-    ))
 }

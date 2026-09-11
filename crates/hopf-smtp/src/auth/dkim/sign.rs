@@ -8,19 +8,23 @@ use rmimeparser::dkim::RawHeader;
 
 use super::canon::{self, Canonicalization, IncrementalBodyCanon};
 
+use hopf_core::crypto::{
+    ed25519_sign, rsa_sign_pkcs1_sha256, Ed25519PrivateKey, RsaPrivateKey, SignatureBytes,
+};
+
 /// A private key usable for DKIM signing.
 pub enum DkimPrivateKey {
     /// RSA key pair (`a=rsa-sha256`), PKCS#8 DER.
-    Rsa(aws_lc_rs::signature::RsaKeyPair),
+    Rsa(RsaPrivateKey),
     /// Ed25519 key pair (`a=ed25519-sha256`, RFC 8463), PKCS#8 DER.
-    Ed25519(aws_lc_rs::signature::Ed25519KeyPair),
+    Ed25519(Ed25519PrivateKey),
 }
 
 impl DkimPrivateKey {
     /// Load an RSA private key from PKCS#8 DER (e.g. `openssl genpkey
     /// -algorithm RSA ... | openssl pkcs8 -topk8 -nocrypt`).
     pub fn rsa_from_pkcs8(der: &[u8]) -> Result<Self, ()> {
-        aws_lc_rs::signature::RsaKeyPair::from_pkcs8(der)
+        RsaPrivateKey::from_pkcs8(der)
             .map(DkimPrivateKey::Rsa)
             .map_err(|_| ())
     }
@@ -30,7 +34,7 @@ impl DkimPrivateKey {
     /// only, no embedded public key) as well as v2 (seed + public key,
     /// consistency-checked).
     pub fn ed25519_from_pkcs8(der: &[u8]) -> Result<Self, ()> {
-        aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(der)
+        Ed25519PrivateKey::from_pkcs8(der)
             .map(DkimPrivateKey::Ed25519)
             .map_err(|_| ())
     }
@@ -42,16 +46,10 @@ impl DkimPrivateKey {
         }
     }
 
-    fn sign(&self, data: &[u8]) -> Result<Vec<u8>, ()> {
+    fn sign(&self, data: &[u8]) -> Result<SignatureBytes, ()> {
         match self {
-            DkimPrivateKey::Rsa(kp) => {
-                let rng = aws_lc_rs::rand::SystemRandom::new();
-                let mut sig = vec![0u8; kp.public_modulus_len()];
-                kp.sign(&aws_lc_rs::signature::RSA_PKCS1_SHA256, &rng, data, &mut sig)
-                    .map_err(|_| ())?;
-                Ok(sig)
-            }
-            DkimPrivateKey::Ed25519(kp) => Ok(kp.sign(data).as_ref().to_vec()),
+            DkimPrivateKey::Rsa(kp) => rsa_sign_pkcs1_sha256(kp, data).map_err(|_| ()),
+            DkimPrivateKey::Ed25519(kp) => Ok(ed25519_sign(kp, data)),
         }
     }
 }

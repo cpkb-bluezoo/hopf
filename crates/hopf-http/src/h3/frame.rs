@@ -160,7 +160,18 @@ pub fn write_goaway(out: &mut Vec<u8>, id: u64) {
     write_frame(out, GOAWAY, &payload);
 }
 
+// The four `write_*` frame builders below (PRIORITY_UPDATE request,
+// CANCEL_PUSH, PUSH_PROMISE, MAX_PUSH_ID) are real RFC 9114/9218 wire
+// encoders, exercised by this crate's own frame round-trip tests, but not
+// yet called by production send paths — Server Push and client-initiated
+// Priority Updates aren't wired into the H3 endpoint/client as features
+// yet, only their frame parsing (the receive side, which production code
+// does use). Kept `pub` and `#[allow(dead_code)]` rather than deleted or
+// `#[cfg(test)]`-gated, since they're genuine protocol primitives meant to
+// be called once those features land, not test-only scaffolding.
+
 /// Append a PRIORITY_UPDATE frame for a request stream (RFC 9218 §7.2).
+#[allow(dead_code)]
 pub fn write_priority_update_request(out: &mut Vec<u8>, stream_id: u64, field_value: &str) {
     let mut payload = Vec::new();
     varint::encode(&mut payload, stream_id);
@@ -176,6 +187,7 @@ pub fn parse_priority_update_request(payload: &[u8]) -> Option<(u64, &str)> {
 }
 
 /// Append a CANCEL_PUSH frame (RFC 9114 §7.2.3).
+#[allow(dead_code)]
 pub fn write_cancel_push(out: &mut Vec<u8>, push_id: u64) {
     let mut payload = Vec::new();
     varint::encode(&mut payload, push_id);
@@ -183,6 +195,7 @@ pub fn write_cancel_push(out: &mut Vec<u8>, push_id: u64) {
 }
 
 /// Append a PUSH_PROMISE frame (RFC 9114 §7.2.5).
+#[allow(dead_code)]
 pub fn write_push_promise(out: &mut Vec<u8>, push_id: u64, headers_block: &[u8]) {
     let mut payload = Vec::new();
     varint::encode(&mut payload, push_id);
@@ -191,6 +204,7 @@ pub fn write_push_promise(out: &mut Vec<u8>, push_id: u64, headers_block: &[u8])
 }
 
 /// Append a MAX_PUSH_ID frame (RFC 9114 §7.2.7).
+#[allow(dead_code)]
 pub fn write_max_push_id(out: &mut Vec<u8>, max_push_id: u64) {
     let mut payload = Vec::new();
     varint::encode(&mut payload, max_push_id);

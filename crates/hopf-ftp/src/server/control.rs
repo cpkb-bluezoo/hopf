@@ -298,6 +298,14 @@ impl FtpControlHandler {
         endpoint.send(&reply_charset(code, desc, self.utf8));
     }
 
+    fn send_welcome(&mut self, endpoint: &mut dyn Endpoint) {
+        let mut msg = "Hopf FTP ready".to_string();
+        if let Some(w) = self.app.welcome_message(&self.meta) {
+            msg = w;
+        }
+        self.send_reply(endpoint, 220, &msg);
+    }
+
     fn send_multiline(&self, endpoint: &mut dyn Endpoint, code: u16, lines: &[&str]) {
         endpoint.send(&reply_multiline_charset(code, lines, self.utf8));
     }
@@ -1489,11 +1497,15 @@ impl ProtocolHandler for FtpControlHandler {
         if let Some(b) = &self.bridge {
             b.set_control(endpoint.handle());
         }
-        let mut msg = "Hopf FTP ready".to_string();
-        if let Some(w) = self.app.welcome_message(&self.meta) {
-            msg = w;
+        if self.config.implicit_tls {
+            // Implicit FTPS: the TLS handshake happens automatically before
+            // any bytes are decrypted or encrypted — the welcome banner has
+            // to wait for security_established, same as the client side
+            // waits before expecting it (see FtpControlHandler::connected
+            // in client/handler.rs).
+            return;
         }
-        self.send_reply(endpoint, 220, &msg);
+        self.send_welcome(endpoint);
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
@@ -1518,10 +1530,15 @@ impl ProtocolHandler for FtpControlHandler {
 
     fn security_established(
         &mut self,
-        _endpoint: &mut dyn Endpoint,
+        endpoint: &mut dyn Endpoint,
         _info: &hopf_core::SecurityInfo,
     ) {
+        let just_completed_implicit_handshake = self.config.implicit_tls && !self.meta.tls;
         self.meta.tls = true;
+        if just_completed_implicit_handshake {
+            // The banner was held back in `connected` (see there) until now.
+            self.send_welcome(endpoint);
+        }
     }
 
     fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {

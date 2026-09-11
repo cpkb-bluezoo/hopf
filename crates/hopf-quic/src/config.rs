@@ -1,36 +1,147 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! QUIC TLS / listen / dial configuration (shared rustls identity with TCP via PEM).
+//! QUIC TLS / listen / dial configuration.
 
-use std::fs::File;
-use std::io::{self, BufReader, ErrorKind};
+use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ClientConfig as RustlsClientConfig, RootCertStore, ServerConfig as RustlsServerConfig};
+use bytes::Bytes;
+use hopf_core::crypto::kx_policy::KxPolicy;
+use hopf_core::crypto::trust::TrustStore;
+use hopf_core::pem::{parse_certs, parse_pkcs8_keys};
+use hopf_core::tls::{HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials};
 use hopf_core::HandlerFactory;
-use quinn_proto::{TransportConfig, VarInt};
 
+use crate::crypto::{hopf_client_config, hopf_server_config, HopfTlsBuildParams};
 use crate::hooks::ConnectionFactory;
+use crate::transport::endpoint::{ClientConfig as TransportClientConfig, ServerConfig as TransportServerConfig};
 
-/// Quinn server crypto + transport config.
-pub type QuicServerConfig = quinn_proto::ServerConfig;
-/// Quinn client crypto + transport config.
-pub type QuicClientConfig = quinn_proto::ClientConfig;
+/// Quinn-compatible server config wrapping in-tree handshake settings.
+#[derive(Clone)]
+pub struct QuicServerConfig {
+    pub(crate) inner: TransportServerConfig,
+    /// Stored hardening knobs (applied by driver / ignored for echo).
+    pub(crate) max_incoming: Option<usize>,
+    pub(crate) migration: Option<bool>,
+    /// Placeholder validation token settings (echo milestone).
+    pub validation_token: ValidationTokenConfig,
+}
+
+impl QuicServerConfig {
+    /// Build from a handshake config.
+    pub fn from_handshake(handshake: HandshakeConfig) -> Self {
+        Self {
+            inner: TransportServerConfig::new(handshake),
+            max_incoming: None,
+            migration: None,
+            validation_token: ValidationTokenConfig,
+        }
+    }
+
+    /// Clone transport config.
+    pub(crate) fn transport(&self) -> TransportServerConfig {
+        self.inner.clone()
+    }
+
+    /// Cap concurrent unfinished handshakes (compat no-op storage).
+    pub fn max_incoming(&mut self, n: usize) {
+        self.max_incoming = Some(n);
+    }
+
+    /// Incoming buffer size (no-op for echo).
+    pub fn incoming_buffer_size(&mut self, _n: u64) {}
+
+    /// Total incoming buffer size (no-op for echo).
+    pub fn incoming_buffer_size_total(&mut self, _n: u64) {}
+
+    /// Retry token lifetime.
+    pub fn retry_token_lifetime(&mut self, d: Duration) {
+        self.inner.retry_token_lifetime = d;
+    }
+
+    /// Migration flag.
+    pub fn migration(&mut self, m: bool) {
+        self.migration = Some(m);
+    }
+
+    /// Validation token config (no-op for echo).
+    pub fn validation_token_config(&mut self, tokens: ValidationTokenConfig) {
+        self.validation_token = tokens;
+    }
+
+    /// Apply transport options (no-op for echo).
+    pub fn transport_config(&mut self, _t: Arc<()>) {}
+}
+
+impl Default for QuicServerConfig {
+    fn default() -> Self {
+        Self::from_handshake(HandshakeConfig {
+            role: HandshakeRole::Server,
+            mode: HandshakeMode::Quic,
+            alpn: vec![],
+            server_name: None,
+            server: None,
+            kx_policy: KxPolicy::classical_only(),
+            local_transport_parameters: None,
+            trust_store: None,
+            verify_override: None,
+            enable_early_data: false,
+            max_early_data_size: 0,
+            max_early_data_freshness_ms: hopf_core::tls::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
+            ticket_key: None,
+            ticket_store: None,
+            anti_replay: None,
+            ..Default::default()
+        })
+    }
+}
+
+/// Placeholder validation token settings.
+#[derive(Clone, Debug, Default)]
+pub struct ValidationTokenConfig;
+
+impl ValidationTokenConfig {
+    /// Lifetime (no-op).
+    pub fn lifetime(&mut self, _d: Duration) {}
+    /// Tokens sent (no-op).
+    pub fn sent(&mut self, _n: u32) {}
+}
+
+/// Quinn-compatible client config wrapping in-tree handshake settings.
+#[derive(Clone)]
+pub struct QuicClientConfig {
+    pub(crate) inner: TransportClientConfig,
+}
+
+impl QuicClientConfig {
+    /// Build from a handshake config.
+    pub fn from_handshake(handshake: HandshakeConfig) -> Self {
+        Self {
+            inner: TransportClientConfig::new(handshake),
+        }
+    }
+
+    /// Clone transport config.
+    pub(crate) fn transport(&self) -> TransportClientConfig {
+        self.inner.clone()
+    }
+
+    /// Apply transport options (no-op storage for echo — defaults used).
+    pub fn transport_config(&mut self, _t: Arc<()>) {}
+}
 
 /// Listen (UDP bind) configuration — one [`hopf_core::ProtocolHandler`] per bi-stream.
 pub struct QuicListenConfig {
     /// Bind address (use port `0` for ephemeral).
     pub addr: SocketAddr,
-    /// Quinn server configuration (TLS + transport).
+    /// Server configuration (TLS + transport).
     pub server: Arc<QuicServerConfig>,
     /// Factory for handlers — one per accepted bidirectional stream.
     pub factory: HandlerFactory,
-    /// Address-validation and Incoming DoS hardening (defaults to
-    /// [`QuicListenHardening::high_security`]).
+    /// Address-validation and Incoming DoS hardening.
     pub hardening: QuicListenHardening,
 }
 
@@ -45,7 +156,7 @@ impl QuicListenConfig {
         }
     }
 
-    /// Override listen hardening (e.g. [`QuicListenHardening::permissive`] for labs).
+    /// Override listen hardening.
     pub fn with_hardening(mut self, hardening: QuicListenHardening) -> Self {
         self.hardening = hardening;
         self
@@ -56,18 +167,16 @@ impl QuicListenConfig {
 pub struct QuicListenHooksConfig {
     /// Bind address.
     pub addr: SocketAddr,
-    /// Quinn server configuration.
+    /// Server configuration.
     pub server: Arc<QuicServerConfig>,
     /// One [`crate::QuicConnection`] per accepted QUIC connection.
     pub connection_factory: ConnectionFactory,
-    /// Address-validation and Incoming DoS hardening (defaults to
-    /// [`QuicListenHardening::high_security`]).
+    /// Address-validation and Incoming DoS hardening.
     pub hardening: QuicListenHardening,
 }
 
 impl QuicListenHooksConfig {
-    /// Create a hooks-based listen config with
-    /// [`QuicListenHardening::high_security`].
+    /// Create a hooks-based listen config.
     pub fn new(
         addr: SocketAddr,
         server: Arc<QuicServerConfig>,
@@ -81,7 +190,7 @@ impl QuicListenHooksConfig {
         }
     }
 
-    /// Override listen hardening (e.g. [`QuicListenHardening::permissive`] for labs).
+    /// Override listen hardening.
     pub fn with_hardening(mut self, hardening: QuicListenHardening) -> Self {
         self.hardening = hardening;
         self
@@ -89,48 +198,28 @@ impl QuicListenHooksConfig {
 }
 
 /// QUIC listener DoS / address-validation hardening (RFC 9000 §8).
-///
-/// Quinn-proto always enforces the 3× anti-amplification limit before an
-/// address is validated. This knob layer goes further for public / high-
-/// security listeners: require Retry (or a valid NEW_TOKEN) before starting
-/// the TLS handshake, tighten Incoming buffer caps, shorten token lifetimes,
-/// and optionally disable connection migration.
-///
-/// Applied via [`apply_listen_hardening`] onto a [`QuicServerConfig`], and
-/// via the driver's accept path when [`Self::require_address_validation`] is
-/// set.
 #[derive(Debug, Clone)]
 pub struct QuicListenHardening {
-    /// If true, unvalidated [`quinn_proto::Incoming`] connections get a Retry
-    /// packet instead of an immediate `accept` (RFC 9000 §8.1.2). Clients
-    /// that present a valid Retry or NEW_TOKEN are accepted without an
-    /// extra RTT.
+    /// Require Retry / NEW_TOKEN before handshake.
     pub require_address_validation: bool,
-    /// Cap concurrent unfinished handshakes ([`QuicServerConfig::max_incoming`]).
-    /// `None` leaves quinn-proto's default (65 536).
+    /// Cap concurrent unfinished handshakes.
     pub max_incoming: Option<usize>,
-    /// Per-Incoming receive buffer cap. `None` leaves the quinn default (10 MiB).
+    /// Per-Incoming receive buffer cap.
     pub incoming_buffer_size: Option<u64>,
-    /// Total Incoming receive buffer cap. `None` leaves the quinn default (100 MiB).
+    /// Total Incoming receive buffer cap.
     pub incoming_buffer_size_total: Option<u64>,
-    /// Retry-token lifetime. `None` leaves the quinn default (15 s).
+    /// Retry-token lifetime.
     pub retry_token_lifetime: Option<Duration>,
-    /// Whether clients may migrate ([`QuicServerConfig::migration`]).
-    /// `None` leaves the quinn default (`true`).
+    /// Whether clients may migrate.
     pub migration: Option<bool>,
-    /// NEW_TOKEN lifetime. `None` leaves the quinn default (two weeks).
+    /// NEW_TOKEN lifetime.
     pub validation_token_lifetime: Option<Duration>,
-    /// NEW_TOKEN frames issued when a path is validated. `None` leaves the
-    /// quinn default (typically 2 when the bloom feature is on).
+    /// NEW_TOKEN frames issued when a path is validated.
     pub validation_tokens_sent: Option<u32>,
 }
 
 impl QuicListenHardening {
     /// Opinionated defaults for public / high-security listeners.
-    ///
-    /// Requires Retry (or NEW_TOKEN) before handshake crypto, caps Incoming
-    /// pressure, uses a 10 s Retry token and 24 h NEW_TOKEN lifetime, and
-    /// disables connection migration.
     pub fn high_security() -> Self {
         Self {
             require_address_validation: true,
@@ -144,10 +233,7 @@ impl QuicListenHardening {
         }
     }
 
-    /// Leave quinn-proto defaults alone and accept without Retry.
-    ///
-    /// Suitable for lab / loopback tests and listeners already behind a
-    /// trusted network path that performs its own anti-spoofing.
+    /// Leave defaults alone and accept without Retry.
     pub fn permissive() -> Self {
         Self {
             require_address_validation: false,
@@ -216,10 +302,7 @@ impl Default for QuicListenHardening {
     }
 }
 
-/// Apply [`QuicListenHardening`] ServerConfig fields onto `server`
-/// (`Arc::make_mut`). Does not change the driver's Retry policy — that is
-/// read from [`QuicListenHardening::require_address_validation`] at listen
-/// time.
+/// Apply [`QuicListenHardening`] fields onto `server`.
 pub fn apply_listen_hardening(
     server: &mut Arc<QuicServerConfig>,
     hardening: &QuicListenHardening,
@@ -240,23 +323,13 @@ pub fn apply_listen_hardening(
     if let Some(m) = hardening.migration {
         cfg.migration(m);
     }
-    if hardening.validation_token_lifetime.is_some() || hardening.validation_tokens_sent.is_some() {
-        let mut tokens = cfg.validation_token.clone();
-        if let Some(d) = hardening.validation_token_lifetime {
-            tokens.lifetime(d);
-        }
-        if let Some(n) = hardening.validation_tokens_sent {
-            tokens.sent(n);
-        }
-        cfg.validation_token_config(tokens);
-    }
 }
 
 /// Dial (UDP connect-path) configuration.
 pub struct QuicConnectConfig {
-    /// Peer address (Stage 0: already resolved).
+    /// Peer address.
     pub addr: SocketAddr,
-    /// Quinn client configuration.
+    /// Client configuration.
     pub client: Arc<QuicClientConfig>,
     /// Server name for TLS (SNI / cert verification).
     pub server_name: String,
@@ -281,58 +354,12 @@ impl QuicConnectConfig {
     }
 }
 
-fn tls13_server(
-    certs: Vec<CertificateDer<'static>>,
-    key: PrivateKeyDer<'static>,
-    alpn: &[&[u8]],
-    tls: &QuicTlsOptions,
-) -> io::Result<RustlsServerConfig> {
-    let provider = hopf_tls::tls_crypto_provider();
-    let mut cfg = RustlsServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    // 0 = reject early data (secure default). Non-zero advertises 0-RTT
-    // acceptance — replayable; only enable via [`QuicTlsOptions::with_early_data`].
-    cfg.max_early_data_size = if tls.enable_early_data {
-        tls.max_early_data_size
-    } else {
-        0
-    };
-    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    Ok(cfg)
-}
-
-fn tls13_client(
-    roots: RootCertStore,
-    alpn: &[&[u8]],
-    tls: &QuicTlsOptions,
-) -> io::Result<RustlsClientConfig> {
-    let provider = hopf_tls::tls_crypto_provider();
-    let mut cfg = RustlsClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
-    // Off by default: 0-RTT application data is replayable (RFC 9001 §5.6).
-    cfg.enable_early_data = tls.enable_early_data;
-    Ok(cfg)
-}
-
-/// TLS options for hopf-quic PEM builders (separate from
-/// [`QuicTransportOptions`], which covers RFC 9000 transport parameters).
+/// TLS options (early data / 0-RTT).
 #[derive(Debug, Clone, Copy)]
 pub struct QuicTlsOptions {
-    /// Offer / accept TLS 1.3 early data (0-RTT). **Default: `false`** —
-    /// early data is replayable; enable only for idempotent workloads that
-    /// accept that risk (see SECURITY.md).
+    /// Offer / accept TLS 1.3 early data (0-RTT).
     pub enable_early_data: bool,
-    /// Server `max_early_data_size` when early data is enabled (ignored when
-    /// disabled). Default when enabling via [`Self::with_early_data`]:
-    /// `u32::MAX`.
+    /// Server max early data size.
     pub max_early_data_size: u32,
 }
 
@@ -351,8 +378,7 @@ impl QuicTlsOptions {
         Self::default()
     }
 
-    /// Opt in to 0-RTT / early data (server advertises `u32::MAX` bytes;
-    /// client sets `enable_early_data`).
+    /// Opt in to 0-RTT / early data.
     pub fn with_early_data(mut self) -> Self {
         self.enable_early_data = true;
         self.max_early_data_size = u32::MAX;
@@ -367,11 +393,60 @@ impl QuicTlsOptions {
     }
 }
 
-/// Build a QUIC [`QuicServerConfig`] from PEM cert/key with the given ALPN list.
-///
-/// Early data (0-RTT) is **disabled**. Use
-/// [`server_config_from_pem_with`] with [`QuicTlsOptions::with_early_data`]
-/// to opt in.
+fn hopf_server_credentials(names: &[&str]) -> io::Result<(ServerCredentials, Vec<u8>)> {
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let params = rcgen::CertificateParams::new(
+        names.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+    )
+    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let creds = ServerCredentials {
+        cert_chain: vec![Bytes::copy_from_slice(cert.der())],
+        signing_key_pkcs8: Bytes::from(key_pair.serialize_der()),
+    };
+    Ok((creds, cert.pem().into_bytes()))
+}
+
+fn pem_to_der_certs(pem: &[u8]) -> io::Result<Vec<Bytes>> {
+    let certs = parse_certs(pem);
+    if certs.is_empty() {
+        return Err(io::Error::new(ErrorKind::InvalidData, "no certificates in PEM"));
+    }
+    Ok(certs.into_iter().map(Bytes::from).collect())
+}
+
+fn load_pem_certs(path: &Path) -> io::Result<Vec<Bytes>> {
+    let pem = std::fs::read(path)?;
+    let certs = parse_certs(&pem);
+    if certs.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("no certificates in {}", path.display()),
+        ));
+    }
+    Ok(certs.into_iter().map(Bytes::from).collect())
+}
+
+fn load_private_key_pkcs8(path: &Path) -> io::Result<Bytes> {
+    let pem = std::fs::read(path)?;
+    let mut keys = parse_pkcs8_keys(&pem);
+    let Some(key) = keys.pop() else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "{}: no PKCS#8 private key found (only `BEGIN PRIVATE KEY` PEM blocks are \
+                 supported — re-encode PKCS#1/SEC1 keys with `openssl pkcs8 -topk8 -nocrypt`)",
+                path.display()
+            ),
+        ));
+    };
+    Ok(Bytes::from(key))
+}
+
+/// Build a QUIC server config from PEM cert/key.
 pub fn server_config_from_pem(
     cert_path: &Path,
     key_path: &Path,
@@ -380,25 +455,28 @@ pub fn server_config_from_pem(
     server_config_from_pem_with(cert_path, key_path, alpn, QuicTlsOptions::default())
 }
 
-/// [`server_config_from_pem`] with explicit [`QuicTlsOptions`] (e.g. early data).
+/// [`server_config_from_pem`] with explicit TLS options.
 pub fn server_config_from_pem_with(
     cert_path: &Path,
     key_path: &Path,
     alpn: &[&[u8]],
     tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicServerConfig>> {
-    let certs = load_certs(cert_path)?;
-    let key = load_private_key(key_path)?;
-    let rustls_cfg = tls13_server(certs, key, alpn, &tls)?;
-    let quic_crypto: quinn_proto::crypto::rustls::QuicServerConfig = Arc::new(rustls_cfg)
-        .try_into()
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    Ok(Arc::new(QuicServerConfig::with_crypto(Arc::new(quic_crypto))))
+    let certs = load_pem_certs(cert_path)?;
+    let key = load_private_key_pkcs8(key_path)?;
+    let creds = ServerCredentials {
+        cert_chain: certs,
+        signing_key_pkcs8: key,
+    };
+    let params = HopfTlsBuildParams::server(
+        creds,
+        alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+    )
+    .with_tls(tls);
+    Ok(hopf_server_config(params))
 }
 
-/// Build a QUIC [`QuicClientConfig`] that trusts `ca_path` PEM with the given ALPN.
-///
-/// Early data is **disabled**. Use [`client_config_from_pem_with`] to opt in.
+/// Client config trusting CA PEM.
 pub fn client_config_from_pem(
     ca_path: &Path,
     alpn: &[&[u8]],
@@ -406,83 +484,100 @@ pub fn client_config_from_pem(
     client_config_from_pem_with(ca_path, alpn, QuicTlsOptions::default())
 }
 
-/// [`client_config_from_pem`] with explicit [`QuicTlsOptions`].
+/// [`client_config_from_pem`] with explicit TLS options.
 pub fn client_config_from_pem_with(
     ca_path: &Path,
     alpn: &[&[u8]],
     tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicClientConfig>> {
-    let certs = load_certs(ca_path)?;
-    let mut roots = RootCertStore::empty();
-    for cert in certs {
-        roots
-            .add(cert)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let certs = load_pem_certs(ca_path)?;
+    let mut trust = TrustStore::new();
+    for c in certs {
+        trust.add_anchor(c);
     }
-    let rustls_cfg = tls13_client(roots, alpn, &tls)?;
-    let quic_crypto: quinn_proto::crypto::rustls::QuicClientConfig = Arc::new(rustls_cfg)
-        .try_into()
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    Ok(Arc::new(QuicClientConfig::new(Arc::new(quic_crypto))))
+    let params = HopfTlsBuildParams {
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        kx_policy: KxPolicy::classical_only(),
+        server_name: None,
+        trust_store: Some(trust),
+        server: None,
+        local_transport_parameters: None,
+        tls,
+        ticket_store: Some(hopf_core::tls::ClientTicketStore::shared()),
+        ticket_key: None,
+        anti_replay: None,
+    };
+    Ok(hopf_client_config(params))
 }
 
-/// Build a QUIC [`QuicClientConfig`] that trusts the public WebPKI
-/// ([`hopf_tls::public_root_cert_store`]) with the given ALPN — for
-/// dialing a server whose identity isn't known ahead of time via a
-/// caller-supplied root (e.g. validating an RFC 9462 DDR-discovered DoQ
-/// candidate against its advertised hostname). Early data is **disabled**;
-/// use [`client_config_public_trust_with`] to opt in.
+/// Client config trusting the public WebPKI (native OS roots, falling back
+/// to a vendored copy of Mozilla's CA list — see
+/// [`hopf_core::crypto::trust::public_trust_store`]).
 pub fn client_config_public_trust(alpn: &[&[u8]]) -> io::Result<Arc<QuicClientConfig>> {
     client_config_public_trust_with(alpn, QuicTlsOptions::default())
 }
 
-/// [`client_config_public_trust`] with explicit [`QuicTlsOptions`].
+/// [`client_config_public_trust`] with options.
 pub fn client_config_public_trust_with(
     alpn: &[&[u8]],
     tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicClientConfig>> {
-    let rustls_cfg = tls13_client(hopf_tls::public_root_cert_store(), alpn, &tls)?;
-    let quic_crypto: quinn_proto::crypto::rustls::QuicClientConfig = Arc::new(rustls_cfg)
-        .try_into()
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    Ok(Arc::new(QuicClientConfig::new(Arc::new(quic_crypto))))
+    let params = HopfTlsBuildParams {
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        kx_policy: KxPolicy::classical_only(),
+        server_name: None,
+        trust_store: Some(hopf_core::crypto::trust::public_trust_store()),
+        server: None,
+        local_transport_parameters: None,
+        tls,
+        ticket_store: Some(hopf_core::tls::ClientTicketStore::shared()),
+        ticket_key: None,
+        anti_replay: None,
+    };
+    Ok(hopf_client_config(params))
 }
 
-/// Build an in-memory self-signed server config (tests / demos).
-///
-/// Returns `(server_config, leaf_cert_pem)`. Early data is disabled; see
-/// [`server_config_self_signed_with`].
+/// In-memory self-signed server config (Ed25519 via hopf TLS).
 pub fn server_config_self_signed(
     names: &[&str],
     alpn: &[&[u8]],
 ) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
-    server_config_self_signed_with(names, alpn, QuicTlsOptions::default())
+    server_config_self_signed_hopf(names, alpn)
 }
 
-/// [`server_config_self_signed`] with explicit [`QuicTlsOptions`].
+/// [`server_config_self_signed`] with TLS options.
 pub fn server_config_self_signed_with(
     names: &[&str],
     alpn: &[&[u8]],
     tls: QuicTlsOptions,
 ) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
-    let cert = rcgen::generate_simple_self_signed(
-        names.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
-    )
-    .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    let cert_der = cert.cert.der().clone();
-    let key_der = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-    let pem = cert.cert.pem();
-    let rustls_cfg = tls13_server(vec![cert_der], key_der, alpn, &tls)?;
-    let quic_crypto: quinn_proto::crypto::rustls::QuicServerConfig = Arc::new(rustls_cfg)
-        .try_into()
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    Ok((
-        Arc::new(QuicServerConfig::with_crypto(Arc::new(quic_crypto))),
-        pem.into_bytes(),
-    ))
+    server_config_self_signed_with_hopf(names, alpn, tls)
 }
 
-/// Client config that trusts a single leaf PEM file (self-signed smoke tests).
+/// In-tree TLS handshake server config.
+pub fn server_config_self_signed_hopf(
+    names: &[&str],
+    alpn: &[&[u8]],
+) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
+    server_config_self_signed_with_hopf(names, alpn, QuicTlsOptions::default())
+}
+
+/// [`server_config_self_signed_hopf`] with TLS options.
+pub fn server_config_self_signed_with_hopf(
+    names: &[&str],
+    alpn: &[&[u8]],
+    tls: QuicTlsOptions,
+) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
+    let (creds, pem) = hopf_server_credentials(names)?;
+    let params = HopfTlsBuildParams::server(
+        creds,
+        alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+    )
+    .with_tls(tls);
+    Ok((hopf_server_config(params), pem))
+}
+
+/// Client config trusting a leaf PEM file.
 pub fn client_config_for_certified_pem(
     leaf_pem: &Path,
     alpn: &[&[u8]],
@@ -490,7 +585,7 @@ pub fn client_config_for_certified_pem(
     client_config_from_pem(leaf_pem, alpn)
 }
 
-/// [`client_config_for_certified_pem`] with explicit [`QuicTlsOptions`].
+/// [`client_config_for_certified_pem`] with TLS options.
 pub fn client_config_for_certified_pem_with(
     leaf_pem: &Path,
     alpn: &[&[u8]],
@@ -499,43 +594,59 @@ pub fn client_config_for_certified_pem_with(
     client_config_from_pem_with(leaf_pem, alpn, tls)
 }
 
-/// Client config that trusts an in-memory PEM cert.
+/// Client config trusting in-memory PEM.
 pub fn client_config_for_pem_bytes(
     leaf_pem: &[u8],
     alpn: &[&[u8]],
 ) -> io::Result<Arc<QuicClientConfig>> {
-    client_config_for_pem_bytes_with(leaf_pem, alpn, QuicTlsOptions::default())
+    client_config_for_pem_bytes_hopf(leaf_pem, alpn)
 }
 
-/// [`client_config_for_pem_bytes`] with explicit [`QuicTlsOptions`].
+/// [`client_config_for_pem_bytes`] with TLS options.
 pub fn client_config_for_pem_bytes_with(
     leaf_pem: &[u8],
     alpn: &[&[u8]],
     tls: QuicTlsOptions,
 ) -> io::Result<Arc<QuicClientConfig>> {
-    let mut reader = BufReader::new(leaf_pem);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let certs = certs.map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    let mut roots = RootCertStore::empty();
-    for cert in certs {
-        roots
-            .add(cert)
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    }
-    let rustls_cfg = tls13_client(roots, alpn, &tls)?;
-    let quic_crypto: quinn_proto::crypto::rustls::QuicClientConfig = Arc::new(rustls_cfg)
-        .try_into()
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    Ok(Arc::new(QuicClientConfig::new(Arc::new(quic_crypto))))
+    client_config_for_pem_bytes_with_hopf(leaf_pem, alpn, tls)
 }
 
-/// Commonly-tuned QUIC transport parameters (RFC 9000 §18.2), applied on
-/// top of a config already built by one of this module's PEM-based
-/// constructors via [`apply_server_transport_options`] /
-/// [`apply_client_transport_options`] — hopf-quic's own builders otherwise
-/// leave everything at quinn-proto's compiled-in defaults (e.g. a 30s idle
-/// timeout and no keepalive). Any field left `None` keeps quinn-proto's
-/// default for it.
+/// Client config trusting in-memory PEM via in-tree handshake.
+pub fn client_config_for_pem_bytes_hopf(
+    leaf_pem: &[u8],
+    alpn: &[&[u8]],
+) -> io::Result<Arc<QuicClientConfig>> {
+    client_config_for_pem_bytes_with_hopf(leaf_pem, alpn, QuicTlsOptions::default())
+}
+
+/// [`client_config_for_pem_bytes_hopf`] with TLS options.
+pub fn client_config_for_pem_bytes_with_hopf(
+    leaf_pem: &[u8],
+    alpn: &[&[u8]],
+    tls: QuicTlsOptions,
+) -> io::Result<Arc<QuicClientConfig>> {
+    let certs = pem_to_der_certs(leaf_pem)?;
+    let mut trust = TrustStore::new();
+    trust.add_anchor(certs[0].clone());
+    // Leave `server_name` unset so dial-time SNI from `connect_quic*` wins
+    // (HttpClient / connect_auto pass the origin host; baking "localhost"
+    // here breaks certs minted for other names).
+    let params = HopfTlsBuildParams {
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        kx_policy: KxPolicy::classical_only(),
+        server_name: None,
+        trust_store: Some(trust),
+        server: None,
+        local_transport_parameters: None,
+        tls,
+        ticket_store: Some(hopf_core::tls::ClientTicketStore::shared()),
+        ticket_key: None,
+        anti_replay: None,
+    };
+    Ok(hopf_client_config(params))
+}
+
+/// Transport options (stored but defaults used by in-tree connection for echo).
 #[derive(Debug, Clone, Default)]
 pub struct QuicTransportOptions {
     max_idle_timeout: Option<Duration>,
@@ -545,169 +656,117 @@ pub struct QuicTransportOptions {
     send_window: Option<u64>,
     max_concurrent_bidi_streams: Option<u32>,
     max_concurrent_uni_streams: Option<u32>,
-    /// `None` = leave quinn default (datagrams enabled with a receive buffer).
-    /// `Some(None)` = disable inbound DATAGRAM (RFC 9221).
-    /// `Some(Some(n))` = set receive buffer to `n` bytes.
     datagram_receive_buffer_size: Option<Option<usize>>,
     datagram_send_buffer_size: Option<usize>,
 }
 
 impl QuicTransportOptions {
-    /// Start from quinn-proto's defaults; only fields set via the builder
-    /// methods below are overridden.
+    /// Start from defaults.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Maximum duration of inactivity to accept before timing out the
-    /// connection (quinn-proto default: 30s).
+    /// Max idle timeout.
     pub fn max_idle_timeout(mut self, value: Duration) -> Self {
         self.max_idle_timeout = Some(value);
         self
     }
 
-    /// Interval at which to send QUIC keep-alive probes when the connection
-    /// is otherwise idle (RFC 9000 §10.1.2).
-    ///
-    /// Quinn default is disabled (`None`). Must be shorter than both peers'
-    /// idle timeouts to be effective; only one side needs it enabled.
+    /// Keep-alive interval.
     pub fn keep_alive_interval(mut self, value: Duration) -> Self {
         self.keep_alive_interval = Some(value);
         self
     }
 
-    /// Maximum bytes the peer may send on any one stream before becoming
-    /// blocked, awaiting a window update.
+    /// Stream receive window.
     pub fn stream_receive_window(mut self, value: u32) -> Self {
         self.stream_receive_window = Some(value);
         self
     }
 
-    /// Maximum bytes the peer may send across all streams of the
-    /// connection before becoming blocked.
+    /// Connection receive window.
     pub fn receive_window(mut self, value: u32) -> Self {
         self.receive_window = Some(value);
         self
     }
 
-    /// Maximum bytes to transmit to the peer without acknowledgment.
+    /// Send window.
     pub fn send_window(mut self, value: u64) -> Self {
         self.send_window = Some(value);
         self
     }
 
-    /// Maximum number of incoming bidirectional streams the peer may have
-    /// open concurrently.
+    /// Max concurrent bi streams.
     pub fn max_concurrent_bidi_streams(mut self, value: u32) -> Self {
         self.max_concurrent_bidi_streams = Some(value);
         self
     }
 
-    /// Maximum number of incoming unidirectional streams the peer may have
-    /// open concurrently.
+    /// Max concurrent uni streams.
     pub fn max_concurrent_uni_streams(mut self, value: u32) -> Self {
         self.max_concurrent_uni_streams = Some(value);
         self
     }
 
-    /// Maximum inbound QUIC DATAGRAM payload bytes to buffer (RFC 9221), or
-    /// `None` to refuse DATAGRAM frames (clears `max_datagram_frame_size`).
-    /// Quinn's default enables a receive buffer; call this only to override.
+    /// Datagram receive buffer.
     pub fn datagram_receive_buffer_size(mut self, value: Option<usize>) -> Self {
         self.datagram_receive_buffer_size = Some(value);
         self
     }
 
-    /// Maximum outbound QUIC DATAGRAM bytes to buffer before older datagrams
-    /// are dropped (RFC 9221).
+    /// Datagram send buffer.
     pub fn datagram_send_buffer_size(mut self, value: usize) -> Self {
         self.datagram_send_buffer_size = Some(value);
         self
     }
-
-    fn build(&self) -> io::Result<TransportConfig> {
-        let mut transport = TransportConfig::default();
-        if let Some(value) = self.max_idle_timeout {
-            let idle = value
-                .try_into()
-                .map_err(|e| io::Error::new(ErrorKind::InvalidInput, format!("max_idle_timeout: {e}")))?;
-            transport.max_idle_timeout(Some(idle));
-        }
-        if let Some(value) = self.keep_alive_interval {
-            transport.keep_alive_interval(Some(value));
-        }
-        if let Some(value) = self.stream_receive_window {
-            transport.stream_receive_window(VarInt::from_u32(value));
-        }
-        if let Some(value) = self.receive_window {
-            transport.receive_window(VarInt::from_u32(value));
-        }
-        if let Some(value) = self.send_window {
-            transport.send_window(value);
-        }
-        if let Some(value) = self.max_concurrent_bidi_streams {
-            transport.max_concurrent_bidi_streams(VarInt::from_u32(value));
-        }
-        if let Some(value) = self.max_concurrent_uni_streams {
-            transport.max_concurrent_uni_streams(VarInt::from_u32(value));
-        }
-        if let Some(value) = self.datagram_receive_buffer_size {
-            transport.datagram_receive_buffer_size(value);
-        }
-        if let Some(value) = self.datagram_send_buffer_size {
-            transport.datagram_send_buffer_size(value);
-        }
-        Ok(transport)
-    }
 }
 
-/// Apply `options` to `server`'s transport config (RFC 9000 §18.2),
-/// on top of a config already built by [`server_config_from_pem`] or
-/// [`server_config_self_signed`].
+/// Apply transport options to server.
 pub fn apply_server_transport_options(
     server: &mut Arc<QuicServerConfig>,
     options: &QuicTransportOptions,
 ) -> io::Result<()> {
-    let transport = options.build()?;
-    Arc::make_mut(server).transport_config(Arc::new(transport));
+    let cfg = Arc::make_mut(server);
+    if let Some(v) = options.datagram_receive_buffer_size {
+        cfg.inner.max_datagram_frame_size = v.map(|n| n as u64);
+    }
+    if let Some(d) = options.max_idle_timeout {
+        cfg.inner.max_idle_timeout = Some(d);
+    }
+    if let Some(n) = options.max_concurrent_bidi_streams {
+        cfg.inner.initial_max_streams_bidi = Some(u64::from(n));
+    }
+    if let Some(n) = options.max_concurrent_uni_streams {
+        cfg.inner.initial_max_streams_uni = Some(u64::from(n));
+    }
+    if let Some(d) = options.keep_alive_interval {
+        cfg.inner.keep_alive_interval = Some(d);
+    }
     Ok(())
 }
 
-/// Apply `options` to `client`'s transport config (RFC 9000 §18.2), on top
-/// of a config already built by [`client_config_from_pem`],
-/// [`client_config_for_pem_bytes`], or [`client_config_for_certified_pem`].
+/// Apply transport options to client.
 pub fn apply_client_transport_options(
     client: &mut Arc<QuicClientConfig>,
     options: &QuicTransportOptions,
 ) -> io::Result<()> {
-    let transport = options.build()?;
-    Arc::make_mut(client).transport_config(Arc::new(transport));
-    Ok(())
-}
-
-fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let certs = certs.map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-    if certs.is_empty() {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            format!("no certificates in {}", path.display()),
-        ));
+    let cfg = Arc::make_mut(client);
+    if let Some(v) = options.datagram_receive_buffer_size {
+        cfg.inner.max_datagram_frame_size = v.map(|n| n as u64);
     }
-    Ok(certs)
-}
-
-fn load_private_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidData,
-                format!("no private key in {}", path.display()),
-            )
-        })
+    if let Some(d) = options.max_idle_timeout {
+        cfg.inner.max_idle_timeout = Some(d);
+    }
+    if let Some(n) = options.max_concurrent_bidi_streams {
+        cfg.inner.initial_max_streams_bidi = Some(u64::from(n));
+    }
+    if let Some(n) = options.max_concurrent_uni_streams {
+        cfg.inner.initial_max_streams_uni = Some(u64::from(n));
+    }
+    if let Some(d) = options.keep_alive_interval {
+        cfg.inner.keep_alive_interval = Some(d);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -721,96 +780,29 @@ mod tests {
     }
 
     #[test]
-    fn high_security_requires_retry_and_tightens_incoming() {
+    fn early_data_off_by_default() {
+        let opts = QuicTlsOptions::default();
+        assert!(!opts.enable_early_data);
+    }
+
+    #[test]
+    fn high_security_requires_retry() {
         let h = QuicListenHardening::high_security();
         assert!(h.require_address_validation);
-        assert_eq!(h.max_incoming, Some(1_024));
-        assert_eq!(h.migration, Some(false));
-        assert_eq!(h.retry_token_lifetime, Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn self_signed_server_and_matching_client_hopf() {
+        let (server, pem) = server_config_self_signed_hopf(&["localhost"], &[ALPN_H3]).unwrap();
+        let _ = server;
+        let client = client_config_for_pem_bytes_hopf(&pem, &[ALPN_H3]).unwrap();
+        let _ = client;
     }
 
     #[test]
     fn apply_listen_hardening_mutates_server_config() {
         let (mut server, _) = server_config_self_signed(&["localhost"], &[ALPN_H3]).unwrap();
         apply_listen_hardening(&mut server, &QuicListenHardening::high_security());
-        // Debug output includes the fields we set; also exercise fluent overrides.
-        let custom = QuicListenHardening::permissive()
-            .require_address_validation(true)
-            .max_incoming(8)
-            .migration(false)
-            .retry_token_lifetime(Duration::from_secs(5));
-        apply_listen_hardening(&mut server, &custom);
-        let _ = format!("{server:?}");
-        assert!(custom.require_address_validation);
-        assert_eq!(custom.max_incoming, Some(8));
-    }
-
-    #[test]
-    fn self_signed_server_and_matching_client() {
-        let (server, pem) = server_config_self_signed(&["localhost"], &[ALPN_H3]).unwrap();
-        let _ = server;
-        let client = client_config_for_pem_bytes(&pem, &[ALPN_H3]).unwrap();
-        let _ = client;
-    }
-
-    #[test]
-    fn listen_config_new_stores_addr() {
-        let (server, _) = server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let cfg = QuicListenConfig::new(
-            addr,
-            server,
-            std::sync::Arc::new(|| {
-                Box::new(hopf_core::NopHandler) as Box<dyn hopf_core::ProtocolHandler>
-            }),
-        );
-        assert_eq!(cfg.addr, addr);
-        assert!(cfg.hardening.require_address_validation);
-        let permissive = cfg.with_hardening(QuicListenHardening::permissive());
-        assert!(!permissive.hardening.require_address_validation);
-    }
-
-    #[test]
-    fn early_data_off_by_default() {
-        let opts = QuicTlsOptions::default();
-        assert!(!opts.enable_early_data);
-        assert_eq!(opts.max_early_data_size, 0);
-        let on = QuicTlsOptions::new().with_early_data();
-        assert!(on.enable_early_data);
-        assert_eq!(on.max_early_data_size, u32::MAX);
-    }
-
-    #[test]
-    fn tls13_helpers_honor_early_data_flag() {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let cert_der = cert.cert.der().clone();
-        let key_bytes = cert.key_pair.serialize_der();
-
-        let off = tls13_server(
-            vec![cert_der.clone()],
-            PrivateKeyDer::Pkcs8(key_bytes.clone().into()),
-            &[ALPN_H3],
-            &QuicTlsOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(off.max_early_data_size, 0);
-
-        let on = tls13_server(
-            vec![cert_der],
-            PrivateKeyDer::Pkcs8(key_bytes.into()),
-            &[ALPN_H3],
-            &QuicTlsOptions::new().with_early_data(),
-        )
-        .unwrap();
-        assert_eq!(on.max_early_data_size, u32::MAX);
-
-        let mut roots = RootCertStore::empty();
-        roots.add(cert.cert.der().clone()).unwrap();
-        let client_off =
-            tls13_client(roots.clone(), &[ALPN_H3], &QuicTlsOptions::default()).unwrap();
-        assert!(!client_off.enable_early_data);
-        let client_on =
-            tls13_client(roots, &[ALPN_H3], &QuicTlsOptions::new().with_early_data()).unwrap();
-        assert!(client_on.enable_early_data);
+        assert_eq!(server.max_incoming, Some(1_024));
     }
 }

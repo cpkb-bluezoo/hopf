@@ -2,7 +2,7 @@
 
 //! RFC 4515 search filter string → BER encoding (Gumdrop `encodeFilter` port).
 
-use crate::asn1::BerEncoder;
+use crate::BerEncoder;
 
 /// Encode an RFC 4515 filter string into `encoder` (context-tagged Filter CHOICE).
 pub fn encode_filter(encoder: &mut BerEncoder, filter: &str) {
@@ -153,7 +153,7 @@ fn encode_extensible_match(encoder: &mut BerEncoder, filter: &str) {
 #[cfg(test)]
 mod tests {
     use super::encode_filter;
-    use crate::asn1::{Asn1Type, BerDecoder, BerEncoder};
+    use crate::{Asn1Type, BerDecoder, BerEncoder};
 
     #[test]
     fn encode_equality_uid_alice() {

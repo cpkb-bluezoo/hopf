@@ -7,8 +7,9 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use mio::net::UdpSocket;
-use quinn_proto::{EcnCodepoint, Transmit};
 use socket2::{Domain, Protocol, Socket, Type};
+
+use crate::transport::types::Transmit;
 
 /// Bind a non-blocking UDP socket for QUIC, applying RFC 9000 §14 path-MTU
 /// hardening (Do Not Fragment on IPv4; equivalent on IPv6 where supported).
@@ -52,7 +53,7 @@ impl PendingUdpSend {
         Self {
             destination: transmit.destination,
             data: data.to_vec(),
-            ecn: transmit.ecn.map(|c| c as u8),
+            ecn: transmit.ecn,
             segment_size: transmit.segment_size,
         }
     }
@@ -69,6 +70,7 @@ impl PendingUdpSends {
         self.queue.is_empty()
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.queue.len()
     }
@@ -78,6 +80,7 @@ impl PendingUdpSends {
             .push_back(PendingUdpSend::from_transmit(transmit, data));
     }
 
+    #[cfg(test)]
     pub(crate) fn enqueue(&mut self, send: PendingUdpSend) {
         self.queue.push_back(send);
     }
@@ -100,7 +103,7 @@ impl PendingUdpSends {
     }
 }
 
-/// Max UDP datagrams quinn-proto may coalesce into one `Transmit` for GSO.
+/// Max UDP datagrams the transport may coalesce into one `Transmit` for GSO.
 pub(crate) fn max_gso_segments() -> usize {
     #[cfg(target_os = "linux")]
     {
@@ -120,7 +123,7 @@ pub(crate) fn udp_payloads<'a>(buf: &'a [u8], segment_size: Option<usize>) -> Ve
     }
 }
 
-/// Send one quinn [`Transmit`] (ECN TOS + GSO `segment_size` when the OS
+/// Send one [`Transmit`] (ECN TOS + GSO `segment_size` when the OS
 /// supports them). Falls back to per-datagram `send_to` when GSO/ECN cmsgs
 /// are unavailable.
 pub(crate) fn send_transmit(socket: &UdpSocket, transmit: &Transmit, buf: &[u8]) -> io::Result<()> {
@@ -138,7 +141,7 @@ pub(crate) fn send_pending(socket: &UdpSocket, pending: &PendingUdpSend) -> io::
         socket,
         pending.destination,
         &pending.data,
-        pending.ecn.and_then(EcnCodepoint::from_bits),
+        pending.ecn,
         pending.segment_size,
     )
 }
@@ -147,7 +150,7 @@ fn send_udp(
     socket: &UdpSocket,
     dest: SocketAddr,
     buf: &[u8],
-    ecn: Option<EcnCodepoint>,
+    ecn: Option<u8>,
     segment_size: Option<usize>,
 ) -> io::Result<()> {
     if buf.is_empty() {
@@ -181,7 +184,7 @@ fn send_udp(
 pub(crate) fn recv_one(
     socket: &UdpSocket,
     buf: &mut [u8],
-) -> io::Result<(usize, SocketAddr, Option<EcnCodepoint>)> {
+) -> io::Result<(usize, SocketAddr, Option<u8>)> {
     #[cfg(unix)]
     {
         match recv_msg(socket, buf) {
@@ -221,7 +224,7 @@ fn send_msg(
     socket: &UdpSocket,
     dest: SocketAddr,
     buf: &[u8],
-    ecn: Option<EcnCodepoint>,
+    ecn: Option<u8>,
     segment_size: Option<usize>,
 ) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
@@ -307,7 +310,7 @@ fn send_msg(
 fn recv_msg(
     socket: &UdpSocket,
     buf: &mut [u8],
-) -> io::Result<(usize, SocketAddr, Option<EcnCodepoint>)> {
+) -> io::Result<(usize, SocketAddr, Option<u8>)> {
     use std::os::unix::io::AsRawFd;
 
     let mut name: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -340,8 +343,11 @@ fn recv_msg(
             if (level == libc::IPPROTO_IP && (ty == libc::IP_TOS || ty == libc::IP_RECVTOS))
                 || (level == libc::IPPROTO_IPV6 && ty == libc::IPV6_TCLASS)
             {
-                let bits = *libc::CMSG_DATA(cmsg);
-                ecn = EcnCodepoint::from_bits(bits);
+                // Keep the low 2 ECN bits (RFC 3168).
+                let bits = *libc::CMSG_DATA(cmsg) & 0x03;
+                if bits != 0 {
+                    ecn = Some(bits);
+                }
             }
             cmsg = libc::CMSG_NXTHDR(&hdr, cmsg);
         }
@@ -730,13 +736,13 @@ mod tests {
     fn pending_from_transmit_keeps_ecn_and_segment_size() {
         let tx = Transmit {
             destination: "127.0.0.1:443".parse().unwrap(),
-            ecn: Some(EcnCodepoint::Ect0),
+            ecn: Some(0x02), // ECT(0)
             size: 3,
             segment_size: Some(1200),
             src_ip: None,
         };
         let pending = PendingUdpSend::from_transmit(&tx, b"abc");
-        assert_eq!(pending.ecn, Some(EcnCodepoint::Ect0 as u8));
+        assert_eq!(pending.ecn, Some(0x02));
         assert_eq!(pending.segment_size, Some(1200));
         assert_eq!(pending.data, b"abc");
     }

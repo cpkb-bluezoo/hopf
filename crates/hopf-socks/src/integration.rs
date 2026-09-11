@@ -16,7 +16,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use hopf_core::{Endpoint, IpNet, PeerAcl, ProtocolHandler, Runtime, RuntimeConfig};
+use hopf_core::tls::TlsRecordSink;
+use hopf_core::{
+    Endpoint, IpNet, PeerAcl, ProtocolHandler, Runtime, RuntimeConfig, SecurityInfo,
+    SharedTlsConnector, TlsProtocolError, TlsVariant, VerifyRequest,
+};
 use hopf_dns::DnsResolver;
 
 use crate::{
@@ -755,6 +759,128 @@ fn max_relays_rejects_once_at_capacity() {
     assert_eq!(reply2[1], 0x01, "expected GeneralFailure reply once at capacity");
 }
 
+/// Blocking [`TlsRecordSink`] collecting ciphertext-to-write and
+/// plaintext-received in order — [`BlockingTlsClient`] drains/feeds these
+/// between blocking socket reads, so this reactive engine can be driven
+/// like a plain synchronous stream.
+#[derive(Default)]
+struct CollectingTlsSink {
+    outbound: Vec<u8>,
+    handshake_done: bool,
+    inbound: Vec<u8>,
+    error: Option<String>,
+    peer_closed: bool,
+}
+
+impl TlsRecordSink for CollectingTlsSink {
+    fn ciphertext_ready(&mut self, data: &[u8]) {
+        self.outbound.extend_from_slice(data);
+    }
+    fn application_data(&mut self, plaintext: &[u8]) {
+        self.inbound.extend_from_slice(plaintext);
+    }
+    fn handshake_complete(&mut self, _info: SecurityInfo) {
+        self.handshake_done = true;
+    }
+    fn verification_requested(&mut self, _req: VerifyRequest) {
+        // Purely informational: the engine already resolves this inline,
+        // synchronously, in the same call, whenever `trust_store`/
+        // `verify_override` is configured (as this test's connector
+        // always is) — it doesn't wait for `feed_verification_result`.
+    }
+    fn protocol_error(&mut self, err: TlsProtocolError) {
+        self.error.get_or_insert(err.message);
+    }
+    fn peer_closed(&mut self) {
+        self.peer_closed = true;
+    }
+}
+
+/// Minimal blocking `Read`/`Write` TLS client stream over
+/// [`hopf_core::TlsVariant`] — a synchronous test double for `rustls`'s
+/// own `StreamOwned`, since this test is exercising SOCKS-over-TLS
+/// end-to-end (does `SocksService::with_tls` correctly wire an acceptor
+/// in), not proving interop with an independent TLS implementation —
+/// that's `hopf-tls`'s own dedicated interop suite's job.
+struct BlockingTlsClient {
+    stream: TcpStream,
+    engine: TlsVariant,
+    sink: CollectingTlsSink,
+}
+
+impl BlockingTlsClient {
+    fn connect(connector: &SharedTlsConnector, stream: TcpStream, server_name: &str) -> io::Result<Self> {
+        let mut engine = connector.connect(server_name)?;
+        let mut sink = CollectingTlsSink::default();
+        let mut stream = stream;
+        engine.start(&mut sink);
+        Self::flush_outbound(&mut stream, &mut sink)?;
+        Self::check(&mut sink)?;
+        while !sink.handshake_done {
+            Self::pump_read(&mut stream, &mut engine, &mut sink)?;
+        }
+        Ok(Self { stream, engine, sink })
+    }
+
+    fn flush_outbound(stream: &mut TcpStream, sink: &mut CollectingTlsSink) -> io::Result<()> {
+        if !sink.outbound.is_empty() {
+            stream.write_all(&sink.outbound)?;
+            sink.outbound.clear();
+        }
+        Ok(())
+    }
+
+    fn check(sink: &mut CollectingTlsSink) -> io::Result<()> {
+        if let Some(msg) = sink.error.take() {
+            return Err(io::Error::new(io::ErrorKind::Other, format!("TLS error: {msg}")));
+        }
+        if sink.peer_closed {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "peer closed the connection"));
+        }
+        Ok(())
+    }
+
+    fn pump_read(stream: &mut TcpStream, engine: &mut TlsVariant, sink: &mut CollectingTlsSink) -> io::Result<()> {
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"));
+        }
+        let mut slice = &buf[..n];
+        engine.feed_ciphertext(&mut slice, sink);
+        Self::flush_outbound(stream, sink)?;
+        Self::check(sink)
+    }
+}
+
+impl Read for BlockingTlsClient {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while self.sink.inbound.is_empty() {
+            if self.sink.peer_closed {
+                return Ok(0);
+            }
+            Self::pump_read(&mut self.stream, &mut self.engine, &mut self.sink)?;
+        }
+        let n = buf.len().min(self.sink.inbound.len());
+        buf[..n].copy_from_slice(&self.sink.inbound[..n]);
+        self.sink.inbound.drain(..n);
+        Ok(n)
+    }
+}
+
+impl Write for BlockingTlsClient {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.engine.send_application_data(buf, &mut self.sink);
+        Self::flush_outbound(&mut self.stream, &mut self.sink)?;
+        Self::check(&mut self.sink)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn socks_over_tls_completes_a_connect_relay() {
     let dir = tempfile::tempdir().unwrap();
@@ -763,7 +889,7 @@ fn socks_over_tls_completes_a_connect_relay() {
     let key_path = dir.path().join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
     std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
-    let acceptor = hopf_tls::acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+    let acceptor = hopf_core::acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
 
     let target = start_echo_target();
     let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
@@ -772,18 +898,13 @@ fn socks_over_tls_completes_a_connect_relay() {
     let service = SocksService::new("127.0.0.1:0".parse().unwrap(), factory).with_tls(acceptor);
     let proxy = service.start(&rt).unwrap();
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert.cert.der().clone()).unwrap();
-    let client_cfg = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
-    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let conn = rustls::ClientConnection::new(client_cfg, server_name).unwrap();
+    // The cert is self-signed, so it's its own trust anchor — same
+    // `connector_from_pem(ca_path, ...)` shape used throughout this
+    // workspace's other tests for a pinned single-CA connector.
+    let connector = hopf_core::connector_from_pem(&cert_path, &[]).unwrap();
     let sock = TcpStream::connect(proxy).unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut tls = rustls::StreamOwned::new(conn, sock);
+    let mut tls = BlockingTlsClient::connect(&connector, sock, "localhost").unwrap();
 
     tls.write_all(&[0x05, 1, 0x00]).unwrap();
     tls.flush().unwrap();

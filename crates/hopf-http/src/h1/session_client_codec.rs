@@ -829,7 +829,7 @@ mod tests {
         });
         let mut codec = H1SessionClientCodec::new(config);
         let info = hopf_core::SecurityInfo::secure(
-            Some(b"http/1.1".to_vec()),
+            Some(hopf_core::Bytes::from_static(b"http/1.1")),
             Some("TLSv1.3".into()),
             None,
         );

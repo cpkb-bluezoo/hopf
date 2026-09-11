@@ -7,7 +7,10 @@
 //! unreserved set" logic for their own path segments.
 
 /// Percent-encode every byte of `s` outside RFC 3986's unreserved set
-/// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`).
+/// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`). Only the client (request)
+/// side builds a URI path to encode — `decode` below is used
+/// unconditionally by the server-side `parse` in `target`/`ip_target`.
+#[cfg(feature = "h3")]
 pub(crate) fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -56,16 +59,19 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "h3")]
     fn round_trips_a_plain_hostname() {
         assert_eq!(decode(&encode("target.example")).unwrap(), "target.example");
     }
 
     #[test]
+    #[cfg(feature = "h3")]
     fn round_trips_an_ipv6_literal() {
         assert_eq!(decode(&encode("2001:db8::1")).unwrap(), "2001:db8::1");
     }
 
     #[test]
+    #[cfg(feature = "h3")]
     fn encodes_a_literal_slash() {
         // RFC 9484's own use: an IP prefix length is separated from the
         // address by a percent-encoded slash within one path segment.

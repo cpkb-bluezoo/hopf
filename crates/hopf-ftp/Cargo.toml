@@ -21,10 +21,8 @@ integration = []
 hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
 hopf-dns = { workspace = true }
-hopf-tls = { workspace = true }
 hopf-otel = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 rcgen = { workspace = true }
-rustls = { workspace = true }

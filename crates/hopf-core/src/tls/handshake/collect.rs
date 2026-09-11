@@ -1,0 +1,791 @@
+// Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+//! Collectors that assemble [`HandshakeEvents`] into small parsed message views.
+//!
+//! These are internal convenience adapters — the parser seam is
+//! [`super::parser::HandshakeParser`] + [`super::parser::HandshakeEvents`].
+
+use bytes::Bytes;
+#[cfg(test)]
+use bytes::BytesMut;
+
+use super::messages::HandshakeType;
+use super::parser::HandshakeEvents;
+#[cfg(test)]
+use super::parser::HandshakeParser;
+
+/// Parsed `ClientHello` fields needed for the server path.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParsedClientHello {
+    /// Client random.
+    pub random: [u8; 32],
+    /// `legacy_session_id` as sent by the client (RFC 8446 §4.1.2) — the
+    /// server MUST echo this exact value back in `ServerHello`'s
+    /// `legacy_session_id_echo` (§4.1.3); a client using middlebox-compat
+    /// mode (Appendix D.4, e.g. rustls) sends a random 32 bytes here and
+    /// aborts the handshake if the echo doesn't match.
+    pub legacy_session_id: Bytes,
+    /// Cipher suites offered.
+    pub cipher_suites: Vec<u16>,
+    /// Client key share bytes.
+    pub peer_key_share: Option<Bytes>,
+    /// Group id for [`Self::peer_key_share`].
+    pub key_share_group: Option<u16>,
+    /// Supported groups extension.
+    pub supported_groups: Vec<u16>,
+    /// ALPN protocol names offered.
+    pub alpn: Vec<Bytes>,
+    /// SNI hostname, if present.
+    pub server_name: Option<String>,
+    /// QUIC transport parameters from the client, if present.
+    pub transport_parameters: Option<Bytes>,
+    /// Client offered early data.
+    pub early_data: bool,
+    /// First offered PSK identity (opaque ticket).
+    pub psk_identity: Option<Bytes>,
+    /// Obfuscated ticket age for the first PSK identity (RFC 8446 §4.2.11).
+    pub obfuscated_ticket_age: Option<u32>,
+    /// First PSK binder.
+    pub psk_binder: Option<Bytes>,
+    /// Cookie extension (RFC 8446 §4.2.2), echoed back after a
+    /// `HelloRetryRequest` that carried one.
+    pub cookie: Option<Bytes>,
+}
+
+/// Parsed `ServerHello` fields needed for key schedule (Phase 2 subset).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParsedServerHello {
+    /// Server random.
+    pub random: [u8; 32],
+    /// Selected cipher suite.
+    pub cipher_suite: u16,
+    /// Selected key-exchange group.
+    pub selected_group: u16,
+    /// Server key share for the selected group.
+    pub key_share: Bytes,
+    /// Selected PSK identity index (resumption).
+    pub psk_selected_identity: Option<u16>,
+    /// Set when this message is actually a `HelloRetryRequest` (RFC 8446
+    /// §4.1.4) — wire-identical to `ServerHello` except for `random` and
+    /// the shape of the `key_share` extension. When set, [`Self::key_share`]
+    /// is empty (HRR carries only [`Self::selected_group`], no key bytes).
+    pub is_hello_retry_request: bool,
+    /// Cookie extension (RFC 8446 §4.2.2), when the server sent one — only
+    /// meaningful when [`Self::is_hello_retry_request`].
+    pub cookie: Option<Bytes>,
+}
+
+/// Parsed EncryptedExtensions content.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParsedEncryptedExtensions {
+    /// Negotiated ALPN (first entry).
+    pub alpn: Option<Bytes>,
+    /// QUIC transport parameters from the server.
+    pub transport_parameters: Option<Bytes>,
+    /// Server accepted early data.
+    pub early_data: bool,
+}
+
+/// Parsed NewSessionTicket (post-handshake).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ParsedNewSessionTicket {
+    /// Ticket lifetime seconds.
+    pub lifetime: u32,
+    /// Ticket age add.
+    pub age_add: u32,
+    /// Ticket nonce.
+    pub nonce: Bytes,
+    /// Opaque ticket identity.
+    pub ticket: Bytes,
+    /// Max early data size (0 if absent).
+    pub max_early_data: u32,
+}
+
+#[derive(Default)]
+pub(crate) struct ClientHelloCollector {
+    out: ParsedClientHello,
+    first_key_share: bool,
+    failed: bool,
+}
+
+impl HandshakeEvents for ClientHelloCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn random(&mut self, value: &[u8; 32]) {
+        self.out.random = *value;
+    }
+
+    fn session_id(&mut self, value: &[u8]) {
+        self.out.legacy_session_id = Bytes::copy_from_slice(value);
+    }
+
+    fn cipher_suite_offered(&mut self, suite: u16) {
+        self.out.cipher_suites.push(suite);
+    }
+
+    fn supported_group(&mut self, group: u16) {
+        self.out.supported_groups.push(group);
+    }
+
+    fn key_share(&mut self, group: u16, share: &[u8]) {
+        if !self.first_key_share {
+            self.first_key_share = true;
+            self.out.key_share_group = Some(group);
+            self.out.peer_key_share = Some(Bytes::copy_from_slice(share));
+        }
+    }
+
+    fn alpn_protocol(&mut self, proto: &[u8]) {
+        self.out.alpn.push(Bytes::copy_from_slice(proto));
+    }
+
+    fn server_name(&mut self, host: &str) {
+        if self.out.server_name.is_none() {
+            self.out.server_name = Some(host.to_string());
+        }
+    }
+
+    fn transport_parameters(&mut self, params: &[u8]) {
+        if self.out.transport_parameters.is_none() {
+            self.out.transport_parameters = Some(Bytes::copy_from_slice(params));
+        }
+    }
+
+    fn early_data(&mut self) {
+        self.out.early_data = true;
+    }
+
+    fn psk_identity(&mut self, identity: &[u8], obfuscated_ticket_age: u32) {
+        if self.out.psk_identity.is_none() {
+            self.out.psk_identity = Some(Bytes::copy_from_slice(identity));
+            self.out.obfuscated_ticket_age = Some(obfuscated_ticket_age);
+        }
+    }
+
+    fn psk_binder(&mut self, binder: &[u8]) {
+        if self.out.psk_binder.is_none() {
+            self.out.psk_binder = Some(Bytes::copy_from_slice(binder));
+        }
+    }
+
+    fn cookie(&mut self, data: &[u8]) {
+        if self.out.cookie.is_none() {
+            self.out.cookie = Some(Bytes::copy_from_slice(data));
+        }
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ServerHelloCollector {
+    out: ParsedServerHello,
+    failed: bool,
+}
+
+impl HandshakeEvents for ServerHelloCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn random(&mut self, value: &[u8; 32]) {
+        self.out.random = *value;
+    }
+
+    fn cipher_suite_selected(&mut self, suite: u16) {
+        self.out.cipher_suite = suite;
+    }
+
+    fn key_share(&mut self, group: u16, share: &[u8]) {
+        // A real ServerHello's key_share is non-empty; HelloRetryRequest's
+        // carries only the group (RFC 8446 §4.2.8) — `selected_group` is
+        // still meaningful there, `key_share` legitimately stays empty.
+        if self.out.selected_group == 0 {
+            self.out.selected_group = group;
+            self.out.key_share = Bytes::copy_from_slice(share);
+        }
+    }
+
+    fn psk_selected_identity(&mut self, index: u16) {
+        self.out.psk_selected_identity = Some(index);
+    }
+
+    fn hello_retry_request(&mut self) {
+        self.out.is_hello_retry_request = true;
+    }
+
+    fn cookie(&mut self, data: &[u8]) {
+        if self.out.cookie.is_none() {
+            self.out.cookie = Some(Bytes::copy_from_slice(data));
+        }
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct EncryptedExtensionsCollector {
+    out: ParsedEncryptedExtensions,
+    failed: bool,
+}
+
+impl HandshakeEvents for EncryptedExtensionsCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn alpn_protocol(&mut self, proto: &[u8]) {
+        if self.out.alpn.is_none() {
+            self.out.alpn = Some(Bytes::copy_from_slice(proto));
+        }
+    }
+
+    fn transport_parameters(&mut self, params: &[u8]) {
+        if self.out.transport_parameters.is_none() {
+            self.out.transport_parameters = Some(Bytes::copy_from_slice(params));
+        }
+    }
+
+    fn early_data(&mut self) {
+        self.out.early_data = true;
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct NewSessionTicketCollector {
+    out: ParsedNewSessionTicket,
+    failed: bool,
+    got: bool,
+}
+
+impl HandshakeEvents for NewSessionTicketCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn new_session_ticket(
+        &mut self,
+        lifetime: u32,
+        age_add: u32,
+        nonce: &[u8],
+        ticket: &[u8],
+        max_early_data: u32,
+    ) {
+        self.out = ParsedNewSessionTicket {
+            lifetime,
+            age_add,
+            nonce: Bytes::copy_from_slice(nonce),
+            ticket: Bytes::copy_from_slice(ticket),
+            max_early_data,
+        };
+        self.got = true;
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CertificateCollector {
+    context: Bytes,
+    certs: Vec<Bytes>,
+    failed: bool,
+}
+
+impl HandshakeEvents for CertificateCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn certificate_request_context(&mut self, ctx: &[u8]) {
+        self.context = Bytes::copy_from_slice(ctx);
+    }
+
+    fn certificate_entry(&mut self, der: &[u8]) {
+        self.certs.push(Bytes::copy_from_slice(der));
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CertificateRequestCollector {
+    context: Bytes,
+    failed: bool,
+}
+
+impl HandshakeEvents for CertificateRequestCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn certificate_request_context(&mut self, ctx: &[u8]) {
+        self.context = Bytes::copy_from_slice(ctx);
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CertificateVerifyCollector {
+    scheme: u16,
+    signature: Bytes,
+    failed: bool,
+    got: bool,
+}
+
+impl HandshakeEvents for CertificateVerifyCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn certificate_verify(&mut self, scheme: u16, signature: &[u8]) {
+        self.scheme = scheme;
+        self.signature = Bytes::copy_from_slice(signature);
+        self.got = true;
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FinishedCollector {
+    verify_data: Bytes,
+    failed: bool,
+}
+
+impl HandshakeEvents for FinishedCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn finished_verify_data(&mut self, data: &[u8]) {
+        self.verify_data = Bytes::copy_from_slice(data);
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct KeyUpdateCollector {
+    kind: u8,
+    got: bool,
+    failed: bool,
+}
+
+impl HandshakeEvents for KeyUpdateCollector {
+    fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn key_update_request(&mut self, kind: u8) {
+        self.kind = kind;
+        self.got = true;
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, _detail: &'static str) {
+        self.failed = true;
+    }
+}
+
+// The one-shot `parse_*` helpers below (and their shared `decode_one`) are
+// real, but only ever exercised by this crate's own tests, which drive them
+// as a convenience over building a full `HandshakeParser`/`MessageCollector`
+// pair by hand — production code uses the incremental collector path via
+// `tls::engine::HandshakeEngine` instead. `#[cfg(test)]` reflects that
+// actual usage rather than hiding it behind a blanket `#[allow(dead_code)]`.
+#[cfg(test)]
+fn decode_one(msg_type: HandshakeType, body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
+    let mut wire = BytesMut::with_capacity(4 + body.len());
+    wire.extend_from_slice(&[msg_type as u8]);
+    wire.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+    wire.extend_from_slice(body);
+    let mut parser = HandshakeParser::new();
+    let mut slice = wire.as_ref();
+    parser.receive(&mut slice, handler);
+    if !slice.is_empty() {
+        handler.parse_error("trailing data");
+        return false;
+    }
+    parser.close(handler);
+    true
+}
+
+/// Parse a `ClientHello` body through the handshake codec.
+#[cfg(test)]
+pub(crate) fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
+    let mut c = ClientHelloCollector::default();
+    if !decode_one(HandshakeType::ClientHello, body, &mut c) || c.failed {
+        return None;
+    }
+    if c.out.peer_key_share.is_none() {
+        return None;
+    }
+    Some(c.out)
+}
+
+/// Parse a `ServerHello` body through the handshake codec. Also handles
+/// `HelloRetryRequest` (wire-identical; see [`ParsedServerHello::is_hello_retry_request`]).
+#[cfg(test)]
+pub(crate) fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
+    let mut c = ServerHelloCollector::default();
+    if !decode_one(HandshakeType::ServerHello, body, &mut c) || c.failed {
+        return None;
+    }
+    if !c.out.is_hello_retry_request && c.out.key_share.is_empty() {
+        return None;
+    }
+    Some(c.out)
+}
+
+/// One fully parsed incoming handshake message (assembled from codec events).
+pub(crate) enum ParsedIncoming {
+    /// ClientHello.
+    ClientHello(ParsedClientHello),
+    /// ServerHello.
+    ServerHello(ParsedServerHello),
+    /// EncryptedExtensions.
+    EncryptedExtensions(ParsedEncryptedExtensions),
+    /// CertificateRequest's `certificate_request_context`.
+    CertificateRequest(Bytes),
+    /// Certificate `(certificate_request_context, chain)` — chain is DER,
+    /// leaf first, and may legitimately be empty for a client's response to
+    /// `CertificateRequest` when it has no certificate to present.
+    Certificate(Bytes, Vec<Bytes>),
+    /// CertificateVerify `(scheme, signature)`.
+    CertificateVerify(u16, Bytes),
+    /// Finished verify_data.
+    Finished(Bytes),
+    /// NewSessionTicket (post-handshake).
+    NewSessionTicket(ParsedNewSessionTicket),
+    /// KeyUpdate's `KeyUpdateRequest` byte (post-handshake).
+    KeyUpdate(u8),
+}
+
+/// Active collector for the message currently being parsed.
+pub(crate) enum MessageCollector {
+    /// No message yet.
+    Idle,
+    /// Collecting ClientHello.
+    ClientHello(ClientHelloCollector),
+    /// Collecting ServerHello.
+    ServerHello(ServerHelloCollector),
+    /// Collecting EncryptedExtensions.
+    EncryptedExtensions(EncryptedExtensionsCollector),
+    /// Collecting CertificateRequest.
+    CertificateRequest(CertificateRequestCollector),
+    /// Collecting Certificate.
+    Certificate(CertificateCollector),
+    /// Collecting CertificateVerify.
+    CertificateVerify(CertificateVerifyCollector),
+    /// Collecting Finished.
+    Finished(FinishedCollector),
+    /// Collecting NewSessionTicket.
+    NewSessionTicket(NewSessionTicketCollector),
+    /// Collecting KeyUpdate.
+    KeyUpdate(KeyUpdateCollector),
+}
+
+impl Default for MessageCollector {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+impl MessageCollector {
+    /// Take the parsed message if collection succeeded.
+    pub(crate) fn take_parsed(&mut self, msg_type: HandshakeType) -> Option<ParsedIncoming> {
+        match (msg_type, std::mem::take(self)) {
+            (HandshakeType::ClientHello, Self::ClientHello(c)) => {
+                // RFC 8446 §4.1.4: a client may legitimately send no
+                // `key_share` at all (or one for a group the server doesn't
+                // want) when it already expects a `HelloRetryRequest` round
+                // trip — common for DTLS, where RFC 9147 §5.1's cookie
+                // exchange forces a retry anyway. `on_client_hello` (the
+                // only consumer) already treats "wrong group" and "no
+                // group" identically via the same HRR path, so a missing
+                // `peer_key_share` must not be rejected here.
+                if c.failed {
+                    return None;
+                }
+                Some(ParsedIncoming::ClientHello(c.out))
+            }
+            (HandshakeType::ServerHello, Self::ServerHello(c)) => {
+                if c.failed || (!c.out.is_hello_retry_request && c.out.key_share.is_empty()) {
+                    return None;
+                }
+                Some(ParsedIncoming::ServerHello(c.out))
+            }
+            (HandshakeType::EncryptedExtensions, Self::EncryptedExtensions(c)) => {
+                if c.failed {
+                    return None;
+                }
+                Some(ParsedIncoming::EncryptedExtensions(c.out))
+            }
+            (HandshakeType::CertificateRequest, Self::CertificateRequest(c)) => {
+                if c.failed {
+                    return None;
+                }
+                Some(ParsedIncoming::CertificateRequest(c.context))
+            }
+            (HandshakeType::Certificate, Self::Certificate(c)) => {
+                if c.failed {
+                    return None;
+                }
+                Some(ParsedIncoming::Certificate(c.context, c.certs))
+            }
+            (HandshakeType::CertificateVerify, Self::CertificateVerify(c)) => {
+                if c.failed || !c.got {
+                    return None;
+                }
+                Some(ParsedIncoming::CertificateVerify(c.scheme, c.signature))
+            }
+            (HandshakeType::Finished, Self::Finished(c)) => {
+                if c.failed || c.verify_data.len() != 32 {
+                    return None;
+                }
+                Some(ParsedIncoming::Finished(c.verify_data))
+            }
+            (HandshakeType::NewSessionTicket, Self::NewSessionTicket(c)) => {
+                if c.failed || !c.got {
+                    return None;
+                }
+                Some(ParsedIncoming::NewSessionTicket(c.out))
+            }
+            (HandshakeType::KeyUpdate, Self::KeyUpdate(c)) => {
+                if c.failed || !c.got {
+                    return None;
+                }
+                Some(ParsedIncoming::KeyUpdate(c.kind))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl HandshakeEvents for MessageCollector {
+    fn message_begin(&mut self, msg_type: HandshakeType) {
+        *self = match msg_type {
+            HandshakeType::ClientHello => Self::ClientHello(ClientHelloCollector::default()),
+            HandshakeType::ServerHello => Self::ServerHello(ServerHelloCollector::default()),
+            HandshakeType::EncryptedExtensions => {
+                Self::EncryptedExtensions(EncryptedExtensionsCollector::default())
+            }
+            HandshakeType::CertificateRequest => {
+                Self::CertificateRequest(CertificateRequestCollector::default())
+            }
+            HandshakeType::Certificate => Self::Certificate(CertificateCollector::default()),
+            HandshakeType::CertificateVerify => {
+                Self::CertificateVerify(CertificateVerifyCollector::default())
+            }
+            HandshakeType::Finished => Self::Finished(FinishedCollector::default()),
+            HandshakeType::NewSessionTicket => {
+                Self::NewSessionTicket(NewSessionTicketCollector::default())
+            }
+            HandshakeType::KeyUpdate => Self::KeyUpdate(KeyUpdateCollector::default()),
+        };
+    }
+
+    fn legacy_version(&mut self, version: u16) {
+        match self {
+            Self::ClientHello(c) => c.legacy_version(version),
+            Self::ServerHello(c) => c.legacy_version(version),
+            _ => {}
+        }
+    }
+
+    fn random(&mut self, value: &[u8; 32]) {
+        match self {
+            Self::ClientHello(c) => c.random(value),
+            Self::ServerHello(c) => c.random(value),
+            _ => {}
+        }
+    }
+
+    fn session_id(&mut self, value: &[u8]) {
+        match self {
+            Self::ClientHello(c) => c.session_id(value),
+            Self::ServerHello(c) => c.session_id(value),
+            _ => {}
+        }
+    }
+
+    fn cipher_suite_offered(&mut self, suite: u16) {
+        if let Self::ClientHello(c) = self {
+            c.cipher_suite_offered(suite);
+        }
+    }
+
+    fn cipher_suite_selected(&mut self, suite: u16) {
+        if let Self::ServerHello(c) = self {
+            c.cipher_suite_selected(suite);
+        }
+    }
+
+    fn compression_method(&mut self, method: u8) {
+        match self {
+            Self::ClientHello(c) => c.compression_method(method),
+            Self::ServerHello(c) => c.compression_method(method),
+            _ => {}
+        }
+    }
+
+    fn supported_group(&mut self, group: u16) {
+        if let Self::ClientHello(c) = self {
+            c.supported_group(group);
+        }
+    }
+
+    fn key_share(&mut self, group: u16, share: &[u8]) {
+        match self {
+            Self::ClientHello(c) => c.key_share(group, share),
+            Self::ServerHello(c) => c.key_share(group, share),
+            _ => {}
+        }
+    }
+
+    fn alpn_protocol(&mut self, proto: &[u8]) {
+        match self {
+            Self::ClientHello(c) => c.alpn_protocol(proto),
+            Self::EncryptedExtensions(c) => c.alpn_protocol(proto),
+            _ => {}
+        }
+    }
+
+    fn server_name(&mut self, host: &str) {
+        if let Self::ClientHello(c) = self {
+            c.server_name(host);
+        }
+    }
+
+    fn transport_parameters(&mut self, params: &[u8]) {
+        match self {
+            Self::ClientHello(c) => c.transport_parameters(params),
+            Self::EncryptedExtensions(c) => c.transport_parameters(params),
+            _ => {}
+        }
+    }
+
+    fn early_data(&mut self) {
+        match self {
+            Self::ClientHello(c) => c.early_data(),
+            Self::EncryptedExtensions(c) => c.early_data(),
+            _ => {}
+        }
+    }
+
+    fn psk_identity(&mut self, identity: &[u8], obfuscated_ticket_age: u32) {
+        if let Self::ClientHello(c) = self {
+            c.psk_identity(identity, obfuscated_ticket_age);
+        }
+    }
+
+    fn psk_binder(&mut self, binder: &[u8]) {
+        if let Self::ClientHello(c) = self {
+            c.psk_binder(binder);
+        }
+    }
+
+    fn psk_selected_identity(&mut self, index: u16) {
+        if let Self::ServerHello(c) = self {
+            c.psk_selected_identity(index);
+        }
+    }
+
+    fn hello_retry_request(&mut self) {
+        if let Self::ServerHello(c) = self {
+            c.hello_retry_request();
+        }
+    }
+
+    fn cookie(&mut self, data: &[u8]) {
+        match self {
+            Self::ClientHello(c) => c.cookie(data),
+            Self::ServerHello(c) => c.cookie(data),
+            _ => {}
+        }
+    }
+
+    fn new_session_ticket(
+        &mut self,
+        lifetime: u32,
+        age_add: u32,
+        nonce: &[u8],
+        ticket: &[u8],
+        max_early_data: u32,
+    ) {
+        if let Self::NewSessionTicket(c) = self {
+            c.new_session_ticket(lifetime, age_add, nonce, ticket, max_early_data);
+        }
+    }
+
+    fn extension(&mut self, _ext_type: u16, _data: &[u8]) {}
+
+    fn certificate_request_context(&mut self, ctx: &[u8]) {
+        match self {
+            Self::Certificate(c) => c.certificate_request_context(ctx),
+            Self::CertificateRequest(c) => c.certificate_request_context(ctx),
+            _ => {}
+        }
+    }
+
+    fn certificate_entry(&mut self, der: &[u8]) {
+        if let Self::Certificate(c) = self {
+            c.certificate_entry(der);
+        }
+    }
+
+    fn certificate_verify(&mut self, scheme: u16, signature: &[u8]) {
+        if let Self::CertificateVerify(c) = self {
+            c.certificate_verify(scheme, signature);
+        }
+    }
+
+    fn finished_verify_data(&mut self, data: &[u8]) {
+        if let Self::Finished(c) = self {
+            c.finished_verify_data(data);
+        }
+    }
+
+    fn key_update_request(&mut self, kind: u8) {
+        if let Self::KeyUpdate(c) = self {
+            c.key_update_request(kind);
+        }
+    }
+
+    fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
+
+    fn parse_error(&mut self, detail: &'static str) {
+        match self {
+            Self::ClientHello(c) => c.parse_error(detail),
+            Self::ServerHello(c) => c.parse_error(detail),
+            Self::EncryptedExtensions(c) => c.parse_error(detail),
+            Self::CertificateRequest(c) => c.parse_error(detail),
+            Self::Certificate(c) => c.parse_error(detail),
+            Self::CertificateVerify(c) => c.parse_error(detail),
+            Self::Finished(c) => c.parse_error(detail),
+            Self::NewSessionTicket(c) => c.parse_error(detail),
+            Self::KeyUpdate(c) => c.parse_error(detail),
+            Self::Idle => {}
+        }
+    }
+}

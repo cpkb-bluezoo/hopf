@@ -1488,13 +1488,14 @@ fn dispatch_auto_transport(
 /// Lazily build (and thereafter reuse) a [`hopf_core::SharedTlsConnector`]
 /// trusting the public WebPKI, for dialling an auto-mode server's
 /// dynamically-selected DoT capability — built once per resolver rather
-/// than per query, since [`hopf_tls::public_trust_connector`] reads the
-/// OS trust store. `None` means the one build attempt failed; the caller
-/// then falls back to plain UDP/TCP for this query.
+/// than per query, since [`hopf_core::public_trust_connector`] reads the
+/// OS trust store. Wrapped in `Option` purely as a build-once-and-cache
+/// memo, not a fallibility signal — the connector itself never fails to
+/// construct.
 #[cfg(feature = "dot")]
 fn public_trust_dot_connector(g: &mut ResolverInner) -> Option<hopf_core::SharedTlsConnector> {
     if g.public_trust_dot_connector.is_none() {
-        g.public_trust_dot_connector = hopf_tls::public_trust_connector(&[b"dot"]).ok();
+        g.public_trust_dot_connector = Some(hopf_core::public_trust_connector(&[b"dot"]));
     }
     g.public_trust_dot_connector.clone()
 }
@@ -2100,7 +2101,7 @@ mod tests {
             addr,
             transport: ServerTransport::Dot {
                 server_name: "dot.example".into(),
-                connector: hopf_tls::insecure_connector(&[]),
+                connector: hopf_core::insecure_connector(&[]),
             },
             auto,
         };
@@ -2376,7 +2377,7 @@ mod tests {
         // above) so its UDP socket is genuinely open — the second
         // server's dispatch below is plain UDP, which needs it.
         let resolver = DnsResolver::for_reactor(rt.pick_worker().clone()).unwrap();
-        resolver.add_server_dot(addr, "dot.example", hopf_tls::insecure_connector(&[]));
+        resolver.add_server_dot(addr, "dot.example", hopf_core::insecure_connector(&[]));
         resolver.add_server(second_addr);
         let inner = Arc::clone(&resolver.inner);
 
@@ -2410,11 +2411,11 @@ mod tests {
     /// the message rather than being told the answer.
     #[cfg(feature = "dnssec")]
     fn signed_secure_message(name: &str, id: u16) -> (DnsMessage, crate::dnssec::DnssecValidator) {
-        use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+        use hopf_core::crypto::{ed25519_sign, Ed25519PrivateKey};
 
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
-        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        let pub_bytes = pair.public_key().as_ref().to_vec();
+        let pkcs8 = Ed25519PrivateKey::generate_pkcs8().unwrap();
+        let pair = Ed25519PrivateKey::from_pkcs8(&pkcs8).unwrap();
+        let pub_bytes = pair.public_key_bytes().to_vec();
 
         let dnskey = DnsResourceRecord::dnskey(name, 3600, 257, 15, &pub_bytes);
         let a = DnsResourceRecord::a(name, 3600, std::net::Ipv4Addr::new(192, 0, 2, 7));
@@ -2447,8 +2448,8 @@ mod tests {
             out.extend_from_slice(&a.rdata);
             out
         };
-        let sig = pair.sign(&signed);
-        rrsig.rdata.extend_from_slice(sig.as_ref());
+        let sig = ed25519_sign(&pair, &signed);
+        rrsig.rdata.extend_from_slice(sig.as_bytes());
 
         let owner_wire = crate::wire::encode_name(name).unwrap();
         let digest = crate::dnssec::compute_ds_digest(&owner_wire, &dnskey.rdata, 2).unwrap();

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use hopf_core::SharedTlsConnector;
 
-use crate::asn1::Asn1Error;
+use crate::Asn1Error;
 
 /// Default LDAP port (RFC 4511).
 pub const DEFAULT_LDAP_PORT: u16 = 389;

@@ -38,3 +38,15 @@ See [docs/architecture.html](../../docs/architecture.html) and
 ships today (TCP TLS via rustls, QUIC via quinn-proto, cleartext UDP) versus
 planned in-tree TLS/DTLS/QUIC on AWS-LC in core.
 Run `cargo run -p echo` for a live echo server.
+
+## Crypto facade (Phase 1+)
+
+`hopf_core::crypto` is the AWS-LC entry point for hashes, signatures, cert
+fingerprints, HKDF, and X25519 (feature `ed448` for DNSSEC Ed448). Protocol
+crates should use it instead of calling `aws-lc-rs` directly.
+
+## TLS handshake engine (Phase 2+)
+
+`hopf_core::tls::HandshakeEngine` is the reactive QUIC-first TLS 1.3 handshake
+(`TlsEventSink`, `QuicSecrets`). Interim TCP TLS remains on `hopf-tls`/rustls
+until Phase 4.

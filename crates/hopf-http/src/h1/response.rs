@@ -446,7 +446,7 @@ mod tests {
             Some(hopf_core::PeerAddr::Inet(remote)),
             Some(hopf_core::PeerAddr::Inet(local)),
             hopf_core::SecurityInfo::secure(
-                Some(b"http/1.1".to_vec()),
+                Some(hopf_core::Bytes::from_static(b"http/1.1")),
                 Some("TLSv1.3".into()),
                 None,
             ),

@@ -197,19 +197,18 @@ pub fn verify_denial(
 mod tests {
     use super::*;
     use crate::wire::{DnsClass, FLAG_QR};
-    use aws_lc_rs::rand::SystemRandom;
-    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+    use hopf_core::crypto::{ed25519_sign, Ed25519PrivateKey};
 
-    fn keypair() -> (Ed25519KeyPair, Vec<u8>) {
-        let doc = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        let pair = Ed25519KeyPair::from_pkcs8(doc.as_ref()).unwrap();
-        let public = pair.public_key().as_ref().to_vec();
+    fn keypair() -> (Ed25519PrivateKey, Vec<u8>) {
+        let doc = Ed25519PrivateKey::generate_pkcs8().unwrap();
+        let pair = Ed25519PrivateKey::from_pkcs8(&doc).unwrap();
+        let public = pair.public_key_bytes().to_vec();
         (pair, public)
     }
 
     /// RFC 4034 §3.1.8 canonical RRSIG signing, matching the pattern used
     /// elsewhere in this crate's DNSSEC tests.
-    fn sign_rrset(rrset: &[&DnsResourceRecord], name: &str, rtype: DnsType, key_tag: u16, pair: &Ed25519KeyPair) -> DnsResourceRecord {
+    fn sign_rrset(rrset: &[&DnsResourceRecord], name: &str, rtype: DnsType, key_tag: u16, pair: &Ed25519PrivateKey) -> DnsResourceRecord {
         // Canonical form (RFC 4034 §6.2) lowercases the owner name before
         // wire-encoding it for signing — the real verifier does the same
         // (`build_canonical_rrset`), so this must match or verification
@@ -240,10 +239,10 @@ mod tests {
             signed_data.extend_from_slice(&(rr.rdata.len() as u16).to_be_bytes());
             signed_data.extend_from_slice(&rr.rdata);
         }
-        let sig = pair.sign(&signed_data);
+        let sig = ed25519_sign(pair, &signed_data);
         let mut full_rdata = rdata;
         full_rdata.truncate(header_len);
-        full_rdata.extend_from_slice(sig.as_ref());
+        full_rdata.extend_from_slice(sig.as_bytes());
         DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, full_rdata)
     }
 

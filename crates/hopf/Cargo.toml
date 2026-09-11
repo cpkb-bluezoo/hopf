@@ -40,7 +40,7 @@ full = [
     "mqtt",
     "amqp",
 ]
-tls = ["dep:hopf-tls"]
+tls = []
 auth = ["dep:hopf-auth"]
 ldap = ["dep:hopf-ldap", "auth", "tls"]
 http = ["dep:hopf-http"]
@@ -75,7 +75,6 @@ masque-h3 = ["masque", "h3", "hopf-masque/h3"]
 
 [dependencies]
 hopf-core = { workspace = true }
-hopf-tls = { workspace = true, optional = true }
 hopf-auth = { workspace = true, optional = true }
 hopf-ldap = { workspace = true, optional = true }
 hopf-http = { workspace = true, optional = true }

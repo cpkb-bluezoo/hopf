@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, StartTlsError};
 
-use crate::asn1::{Asn1Element, Asn1Error, Asn1Type, BerDecoder};
+use hopf_core::asn1::BerEventSink;
+
+use crate::{Asn1Element, Asn1Error, Asn1Type, BerDecoder};
 
 use super::session::{LdapSession, LdapShared, PendingOp, ReadyCallback, StartTlsCallback};
 use super::types::{
@@ -361,6 +363,42 @@ impl ErrCloneCompat for LdapError {
     }
 }
 
+/// Adapts one `receive()` call's worth of decoded elements to
+/// `LdapEndpoint::process_message` — holds `&mut LdapEndpoint` (with its own
+/// `decoder` field temporarily moved out by the caller) alongside the live
+/// `&mut dyn Endpoint`, since `process_message` needs both (e.g. to trigger
+/// a STARTTLS upgrade from an ExtendedResponse). `failed` stops processing
+/// further elements once one has already closed the connection, mirroring
+/// how `H2FrameHandler::frame_error` implementations stop after the first
+/// fatal error in one `push`/`drain` call.
+struct MessageSink<'a> {
+    inner: &'a mut LdapEndpoint,
+    endpoint: &'a mut dyn Endpoint,
+    failed: bool,
+}
+
+impl BerEventSink for MessageSink<'_> {
+    fn element(&mut self, element: Asn1Element) {
+        if self.failed {
+            return;
+        }
+        if let Err(e) = self.inner.process_message(self.endpoint, element) {
+            self.inner.deliver_ready_err(LdapError::Asn1(e));
+            self.endpoint.close();
+            self.failed = true;
+        }
+    }
+
+    fn decode_error(&mut self, err: Asn1Error) {
+        if self.failed {
+            return;
+        }
+        self.inner.deliver_ready_err(LdapError::Asn1(err));
+        self.endpoint.close();
+        self.failed = true;
+    }
+}
+
 impl ProtocolHandler for LdapEndpoint {
     fn connected(&mut self, endpoint: &mut dyn Endpoint) {
         *self
@@ -375,25 +413,15 @@ impl ProtocolHandler for LdapEndpoint {
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        if let Err(e) = self.decoder.receive(data) {
-            *data = &[];
-            self.deliver_ready_err(LdapError::Asn1(e));
-            endpoint.close();
-            return;
-        }
+        // Standard push-parser shape (see `hopf_core::asn1::BerDecoder::push`
+        // / `hopf_http::h2::H2Parser::push`): take the decoder out so the
+        // sink adapter can hold both `&mut self` (minus its own `decoder`
+        // field) and `&mut dyn Endpoint` at once, push, then restore it.
+        let mut decoder = std::mem::take(&mut self.decoder);
+        let mut sink = MessageSink { inner: self, endpoint, failed: false };
+        decoder.push(data, &mut sink);
         *data = &[];
-        loop {
-            match self.decoder.next() {
-                Some(msg) => {
-                    if let Err(e) = self.process_message(endpoint, msg) {
-                        self.deliver_ready_err(LdapError::Asn1(e));
-                        endpoint.close();
-                        return;
-                    }
-                }
-                None => break,
-            }
-        }
+        self.decoder = decoder;
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
@@ -426,5 +454,141 @@ impl ProtocolHandler for LdapEndpoint {
         };
         self.deliver_ready_err(ldap_err);
         endpoint.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hopf_core::{ConnHandle, PeerAddr, TimerHandle, WriteReadyCallback};
+    use std::time::Duration;
+
+    use crate::BerEncoder;
+
+    struct FakeEp {
+        closed: bool,
+        secure: SecurityInfo,
+        handle: ConnHandle,
+    }
+
+    impl FakeEp {
+        fn new() -> Self {
+            Self {
+                closed: false,
+                secure: SecurityInfo::plaintext(),
+                handle: ConnHandle::from_execute(Arc::new(|task| task())),
+            }
+        }
+    }
+
+    impl Endpoint for FakeEp {
+        fn send(&mut self, _data: &[u8]) {}
+        fn is_open(&self) -> bool {
+            !self.closed
+        }
+        fn is_closing(&self) -> bool {
+            false
+        }
+        fn close(&mut self) {
+            self.closed = true;
+        }
+        fn local_addr(&self) -> io::Result<PeerAddr> {
+            "127.0.0.1:0".parse::<std::net::SocketAddr>().map(PeerAddr::Inet).map_err(io::Error::other)
+        }
+        fn remote_addr(&self) -> io::Result<PeerAddr> {
+            self.local_addr()
+        }
+        fn security_info(&self) -> &SecurityInfo {
+            &self.secure
+        }
+        fn start_tls(&mut self) -> Result<(), StartTlsError> {
+            Err(StartTlsError::Unsupported)
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _cb: Option<WriteReadyCallback>) {}
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            task();
+        }
+        fn schedule_timer(&self, _delay: Duration, _cb: Box<dyn FnOnce() + Send>) -> TimerHandle {
+            TimerHandle::from_cancel(|| {})
+        }
+        fn handle(&self) -> ConnHandle {
+            self.handle.clone()
+        }
+    }
+
+    fn bind_response_wire(message_id: i32, result_code: i32) -> Vec<u8> {
+        let mut encoder = BerEncoder::new();
+        encoder.begin_sequence();
+        encoder.write_integer_i32(message_id);
+        encoder.begin_application(APP_BIND_RESPONSE, true);
+        encoder.write_enumerated(result_code);
+        encoder.write_octet_string_str("");
+        encoder.write_octet_string_str("");
+        encoder.end_application();
+        encoder.end_sequence();
+        encoder.to_bytes()
+    }
+
+    /// Exercises the full `receive()` pipeline this module's push-parser
+    /// reshape rewired: `mem::take` the decoder out, drive it via
+    /// `BerDecoder::push`, dispatch each decoded `LDAPMessage` through
+    /// `MessageSink::element` → `process_message` → `handle_bind_response`,
+    /// then restore the decoder. Proves it's not just type-checking —
+    /// registered per-message-id callbacks actually fire with the right
+    /// results, for two messages arriving in one `receive()` call.
+    #[test]
+    fn receive_dispatches_each_decoded_message_to_its_pending_callback() {
+        let shared = Arc::new(LdapShared::new(None));
+        let on_ready: Arc<Mutex<Option<ReadyCallback>>> = Arc::new(Mutex::new(Some(Box::new(|_| {}))));
+        let mut ep = LdapEndpoint::new(Arc::clone(&shared), on_ready, false);
+        let mut fake = FakeEp::new();
+        ep.connected(&mut fake);
+
+        let result1: Arc<Mutex<Option<Result<BindResult, LdapError>>>> = Arc::new(Mutex::new(None));
+        let result2: Arc<Mutex<Option<Result<BindResult, LdapError>>>> = Arc::new(Mutex::new(None));
+        {
+            let mut pending = shared.pending.lock().unwrap();
+            let r1 = Arc::clone(&result1);
+            pending.insert(1, PendingOp::Bind(Box::new(move |r| *r1.lock().unwrap() = Some(r))));
+            let r2 = Arc::clone(&result2);
+            pending.insert(2, PendingOp::Bind(Box::new(move |r| *r2.lock().unwrap() = Some(r))));
+        }
+
+        let mut wire = bind_response_wire(1, 0); // success
+        wire.extend(bind_response_wire(2, 49)); // invalidCredentials
+        ep.receive(&mut fake, &mut wire.as_slice());
+
+        let got1 = result1.lock().unwrap().take().expect("message 1 dispatched");
+        let bind1 = got1.expect("message 1 decoded without error");
+        assert!(bind1.success);
+        assert_eq!(bind1.result_code, LdapResultCode::Success);
+
+        let got2 = result2.lock().unwrap().take().expect("message 2 dispatched");
+        let bind2 = got2.expect("message 2 decoded without error");
+        assert!(!bind2.success);
+        assert_eq!(bind2.result_code, LdapResultCode::InvalidCredentials);
+
+        assert!(!fake.closed, "well-formed messages must not close the connection");
+        assert!(shared.pending.lock().unwrap().is_empty(), "both pending ops must be consumed");
+    }
+
+    /// Malformed input must reach `MessageSink::decode_error` and close the
+    /// connection — not silently stall (the pre-reshape code did this via
+    /// `receive()`'s own `Result`; this proves the callback-based
+    /// `BerEventSink::decode_error` path reaches the same outcome).
+    #[test]
+    fn receive_closes_connection_on_malformed_ber() {
+        let shared = Arc::new(LdapShared::new(None));
+        let on_ready: Arc<Mutex<Option<ReadyCallback>>> = Arc::new(Mutex::new(Some(Box::new(|_| {}))));
+        let mut ep = LdapEndpoint::new(shared, on_ready, false);
+        let mut fake = FakeEp::new();
+        ep.connected(&mut fake);
+
+        let wire: Vec<u8> = vec![0x30, 0x80, 0x02, 0x01, 0x01, 0x00, 0x00]; // indefinite length
+        ep.receive(&mut fake, &mut wire.as_slice());
+
+        assert!(fake.closed);
     }
 }

@@ -16,7 +16,6 @@ categories = ["network-programming", "authentication"]
 
 [dependencies]
 hopf-core = { workspace = true }
-hopf-tls = { workspace = true }
 hopf-auth = { workspace = true }
 
 [dev-dependencies]

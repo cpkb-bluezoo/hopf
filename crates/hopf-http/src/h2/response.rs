@@ -272,7 +272,7 @@ mod tests {
             Some(hopf_core::PeerAddr::Inet(remote)),
             Some(hopf_core::PeerAddr::Inet(local)),
             hopf_core::SecurityInfo::secure(
-                Some(b"h2".to_vec()),
+                Some(hopf_core::Bytes::from_static(b"h2")),
                 Some("TLSv1.3".into()),
                 Some("TLS_AES_128_GCM_SHA256".into()),
             ),

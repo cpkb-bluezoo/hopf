@@ -438,14 +438,13 @@ fn zone_chain_from_root(name: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::wire::{DnsClass, DnsType};
-    use aws_lc_rs::rand::SystemRandom;
-    use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
+    use hopf_core::crypto::{ed25519_sign, Ed25519PrivateKey};
 
     #[test]
     fn ed25519_rrsig_verifies() {
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        let pub_bytes = pair.public_key().as_ref().to_vec();
+        let pkcs8 = Ed25519PrivateKey::generate_pkcs8().unwrap();
+        let pair = Ed25519PrivateKey::from_pkcs8(&pkcs8).unwrap();
+        let pub_bytes = pair.public_key_bytes().to_vec();
 
         let dnskey = DnsResourceRecord::dnskey("example.com", 3600, 257, 15, &pub_bytes);
         let a = DnsResourceRecord::a("example.com", 3600, std::net::Ipv4Addr::new(192, 0, 2, 1));
@@ -485,8 +484,8 @@ mod tests {
             }
             out
         };
-        let sig = pair.sign(&signed);
-        rrsig.rdata.extend_from_slice(sig.as_ref());
+        let sig = ed25519_sign(&pair, &signed);
+        rrsig.rdata.extend_from_slice(sig.as_bytes());
 
         assert!(verify_rrsig(&[&a], &rrsig, &dnskey));
         assert!(is_rrsig_current(&rrsig));
@@ -535,7 +534,7 @@ mod tests {
         name: &str,
         rtype: DnsType,
         key_tag: u16,
-        pair: &Ed25519KeyPair,
+        pair: &Ed25519PrivateKey,
     ) -> DnsResourceRecord {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u32;
         let labels = if name == "." { 0 } else { name.split('.').filter(|s| !s.is_empty()).count() as u8 };
@@ -550,16 +549,15 @@ mod tests {
         rrsig_rdata.extend_from_slice(&encode_name(name).unwrap());
         let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rrsig_rdata);
         let signed = build_signed_data(rrset, &rrsig).unwrap();
-        let sig = pair.sign(&signed);
-        rrsig.rdata.extend_from_slice(sig.as_ref());
+        let sig = ed25519_sign(&pair, &signed);
+        rrsig.rdata.extend_from_slice(sig.as_bytes());
         rrsig
     }
 
-    fn generate_ed25519() -> (Ed25519KeyPair, Vec<u8>) {
-        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        // Safety-free: PKCS8 doc owns the key material for the pair's lifetime.
-        let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        let pub_bytes = pair.public_key().as_ref().to_vec();
+    fn generate_ed25519() -> (Ed25519PrivateKey, Vec<u8>) {
+        let pkcs8 = Ed25519PrivateKey::generate_pkcs8().unwrap();
+        let pair = Ed25519PrivateKey::from_pkcs8(&pkcs8).unwrap();
+        let pub_bytes = pair.public_key_bytes().to_vec();
         (pair, pub_bytes)
     }
 

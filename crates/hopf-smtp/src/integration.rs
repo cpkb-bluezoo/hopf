@@ -21,7 +21,7 @@ use hopf_auth::{
 };
 use hopf_core::retry::RetryPolicy;
 use hopf_core::{Runtime, RuntimeConfig};
-use hopf_tls::{acceptor_from_pem, connector, insecure_connector};
+use hopf_core::{acceptor_from_pem, connector_from_pem, insecure_connector};
 
 use crate::{
     AcceptAllSmtpHandler, AcceptAllSmtpHandlerFactory, AuthenticateState, ConnectedState,
@@ -172,14 +172,7 @@ fn client_starttls_send() {
     let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
     let bound = service.start(Arc::clone(&rt)).unwrap();
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert.cert.der().clone()).unwrap();
-    let client_config = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    );
-    let tls_connector = connector(client_config);
+    let tls_connector = connector_from_pem(&cert_path, &[]).unwrap();
 
     let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
     let done2 = Arc::clone(&done);

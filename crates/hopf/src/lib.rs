@@ -22,7 +22,7 @@
 //! | Module | Crate | Feature |
 //! |--------|-------|---------|
 //! | [`core`] | `hopf-core` | always |
-//! | [`tls`] | `hopf-tls` | `tls` |
+//! | [`tls`] | `hopf-core::tls` | `tls` |
 //! | [`auth`] | `hopf-auth` | `auth` (`pam` for PAM store) |
 //! | [`ldap`] | `hopf-ldap` | `ldap` |
 //! | [`http`] | `hopf-http` | `http` (`h3` for HTTP/3) |
@@ -50,9 +50,9 @@
 /// Thread-per-core Runtime, `Endpoint`, `ProtocolHandler`, Composition.
 pub use hopf_core as core;
 
-/// rustls integration: TCP TLS and STARTTLS.
+/// In-tree TCP TLS / STARTTLS (RFC 8446 TLS 1.3, RFC 5246 TLS 1.2).
 #[cfg(feature = "tls")]
-pub use hopf_tls as tls;
+pub use hopf_core::tls;
 
 /// TrustPolicy / IdentityMaterial / SASL.
 #[cfg(feature = "auth")]

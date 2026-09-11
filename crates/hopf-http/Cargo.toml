@@ -23,6 +23,3 @@ hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
 hopf-dns = { workspace = true }
 hopf-quic = { workspace = true, optional = true }
-
-[dev-dependencies]
-hopf-tls = { workspace = true }

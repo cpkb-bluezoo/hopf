@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use hopf_core::{Endpoint, ProtocolHandler};
 use hopf_quic::{
     connect_quic_hooks, DatagramDecode, QuicClientConfig, QuicConnApi, QuicConnection,
-    QuicDriverHandle,
+    QuicDriverHandle, StreamId, StreamKey,
 };
 
 use crate::{
@@ -35,8 +35,8 @@ pub struct H3ClientConnection {
     limits: HttpLimits,
     peer_state: Arc<Mutex<H3PeerState>>,
     qpack: Arc<qpack::H3Qpack>,
-    qpack_encoder_stream_key: Option<u64>,
-    qpack_decoder_stream_key: Option<u64>,
+    qpack_encoder_stream_key: Option<StreamKey>,
+    qpack_decoder_stream_key: Option<StreamKey>,
     pending_opens: PendingOpens,
     on_ready: OnReady,
 }
@@ -125,10 +125,10 @@ impl QuicConnection for H3ClientConnection {
         }
     }
 
-    fn accept_bi(&mut self, stream_id: u64) -> Box<dyn ProtocolHandler> {
+    fn accept_bi(&mut self, stream_id: StreamId) -> Box<dyn ProtocolHandler> {
         // RFC 9114: clients MUST NOT accept server-initiated bidirectional
         // streams (IDs where stream_id % 4 == 1).
-        if stream_id % 4 != 0 {
+        if !stream_id.is_client_bidi() {
             return Box::new(RejectServerInitiatedBiStream);
         }
         let factory = self
@@ -140,13 +140,13 @@ impl QuicConnection for H3ClientConnection {
         Box::new(H3ClientStream::new(
             factory,
             self.limits,
-            stream_id,
+            stream_id.as_u64(),
             Arc::clone(&self.qpack),
             Arc::clone(&self.peer_state),
         ))
     }
 
-    fn accept_uni(&mut self, _stream_id: u64) -> Box<dyn ProtocolHandler> {
+    fn accept_uni(&mut self, _stream_id: StreamId) -> Box<dyn ProtocolHandler> {
         Box::new(H3UniStream::new(Arc::clone(&self.peer_state), Arc::clone(&self.qpack), true))
     }
 
@@ -1427,7 +1427,7 @@ mod status_validation_tests {
             on_ready,
             HttpLimits::default(),
         );
-        let mut handler = conn.accept_bi(1);
+        let mut handler = conn.accept_bi(StreamId::from_wire(1));
         let mut ep = RecordingEndpoint::default();
         handler.connected(&mut ep);
         assert_eq!(
@@ -1663,19 +1663,19 @@ mod goaway_enforcement_tests {
         next_key: u64,
     }
     impl QuicConnApi for RecordingConnApi {
-        fn open_uni(&mut self) -> Option<u64> {
-            let key = self.next_key;
+        fn open_uni(&mut self) -> Option<StreamKey> {
+            let key = StreamKey::from_raw(self.next_key);
             self.next_key += 1;
             Some(key)
         }
-        fn open_bi(&mut self) -> Option<u64> {
+        fn open_bi(&mut self) -> Option<StreamKey> {
             self.open_bi_calls += 1;
-            let key = self.next_key;
+            let key = StreamKey::from_raw(self.next_key);
             self.next_key += 1;
             Some(key)
         }
-        fn write(&mut self, _stream_key: u64, _data: &[u8]) {}
-        fn finish(&mut self, _stream_key: u64) {}
+        fn write(&mut self, _stream_key: StreamKey, _data: &[u8]) {}
+        fn finish(&mut self, _stream_key: StreamKey) {}
     }
 
     struct NoopFactory;

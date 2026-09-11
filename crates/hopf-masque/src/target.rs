@@ -36,7 +36,10 @@ pub fn parse(path: &str) -> Option<ConnectUdpTarget> {
 
 /// Build the RFC 9298 §2 URI template path for `host`:`port` — the inverse
 /// of [`parse`], for the client side. Percent-encodes `host` (needed for
-/// an IPv6 literal's colons, RFC 9298 §2's own example).
+/// an IPv6 literal's colons, RFC 9298 §2's own example). Client-side only
+/// (used by `client`, `h3`-feature-gated); `parse` above is used
+/// unconditionally by the server side.
+#[cfg(feature = "h3")]
 pub(crate) fn encode(host: &str, port: u16) -> String {
     format!("{PREFIX}{}/{port}/", crate::percent::encode(host))
 }
@@ -53,6 +56,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h3")]
     fn encode_then_parse_round_trips_a_plain_hostname() {
         let path = encode("target.example", 443);
         let t = parse(&path).unwrap();
@@ -61,6 +65,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "h3")]
     fn encode_then_parse_round_trips_an_ipv6_literal() {
         let path = encode("2001:db8::1", 53);
         let t = parse(&path).unwrap();
