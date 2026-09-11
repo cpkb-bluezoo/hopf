@@ -16,7 +16,7 @@ use crate::crypto::aead::{AeadError, AesGcmKey, ChaCha20Poly1305Key};
 use crate::security::SecurityInfo;
 
 use super::engine::{CipherKind, Config, DirectionalKeyMaterial, Role, Tls12EventSink, Tls12Engine};
-use super::super::sink::{TlsProtocolError, VerifyRequest, VerifyResult};
+use super::super::sink::{AlertDescription, TlsProtocolError, VerifyRequest, VerifyResult};
 
 // Reuses the TLS 1.3 record layer's sink trait verbatim — its shape
 // (ciphertext out; application data, handshake completion, verification
@@ -155,11 +155,15 @@ struct RecordState {
     pending_write: Option<DirectionalKeyMaterial>,
     pending_read: Option<DirectionalKeyMaterial>,
     cipher: Option<CipherKind>,
+    /// See [`super::super::record`]'s `RecordState::alert_sent` — same
+    /// purpose (at most one fatal alert per connection, and no reply to a
+    /// peer's own alert).
+    alert_sent: bool,
 }
 
 impl RecordState {
     fn new(role: Role) -> Self {
-        Self { role, write: None, read: None, pending_write: None, pending_read: None, cipher: None }
+        Self { role, write: None, read: None, pending_write: None, pending_read: None, cipher: None, alert_sent: false }
     }
 
     fn stage_keys(&mut self, cipher: CipherKind, client: DirectionalKeyMaterial, server: DirectionalKeyMaterial) {
@@ -235,6 +239,16 @@ fn write_fragmented<S: Tls12RecordSink + ?Sized>(state: &mut RecordState, conten
     }
 }
 
+/// See [`super::super::record::send_fatal_alert`] — same purpose, adapted
+/// to this module's `RecordState`/`write_fragmented`.
+fn send_fatal_alert<S: Tls12RecordSink + ?Sized>(state: &mut RecordState, alert: AlertDescription, sink: &mut S) {
+    if state.alert_sent {
+        return;
+    }
+    state.alert_sent = true;
+    write_fragmented(state, CONTENT_ALERT, &[ALERT_LEVEL_FATAL, alert.code()], sink);
+}
+
 struct InnerSink<'a, S: Tls12RecordSink + ?Sized> {
     state: &'a mut RecordState,
     outer: &'a mut S,
@@ -263,6 +277,7 @@ impl<S: Tls12RecordSink + ?Sized> Tls12EventSink for InnerSink<'_, S> {
     }
 
     fn protocol_error(&mut self, err: TlsProtocolError) {
+        send_fatal_alert(self.state, err.alert, self.outer);
         self.outer.protocol_error(err);
     }
 }
@@ -312,7 +327,7 @@ impl Tls12RecordEngine {
                     // close the connection rather than keep decrypting
                     // past the safety margin.
                     if self.state.read.as_ref().is_some_and(AeadDirection::over_confidentiality_limit) {
-                        self.fail(sink, "AES-GCM read key exceeded its confidentiality limit");
+                        self.fail(sink, AlertDescription::InternalError, "AES-GCM read key exceeded its confidentiality limit");
                         break;
                     }
                     if !self.dispatch_record(content_type, payload, sink) {
@@ -320,7 +335,7 @@ impl Tls12RecordEngine {
                     }
                 }
                 Err(()) => {
-                    self.fail(sink, "malformed or unauthenticated TLS record");
+                    self.fail(sink, AlertDescription::BadRecordMac, "malformed or unauthenticated TLS record");
                     break;
                 }
             }
@@ -333,7 +348,10 @@ impl Tls12RecordEngine {
             return;
         }
         if self.state.write.is_none() {
-            sink.protocol_error(TlsProtocolError::new("application data sent before handshake completed"));
+            sink.protocol_error(TlsProtocolError::new(
+                AlertDescription::InternalError,
+                "application data sent before handshake completed",
+            ));
             return;
         }
         write_fragmented(&mut self.state, CONTENT_APPLICATION_DATA, plaintext, sink);
@@ -341,7 +359,7 @@ impl Tls12RecordEngine {
         // no rekey mechanism exists in TLS 1.2, so close rather than
         // keep encrypting past the AES-GCM safety margin.
         if self.state.write.as_ref().is_some_and(AeadDirection::over_confidentiality_limit) {
-            self.fail(sink, "AES-GCM write key exceeded its confidentiality limit");
+            self.fail(sink, AlertDescription::InternalError, "AES-GCM write key exceeded its confidentiality limit");
         }
     }
 
@@ -362,11 +380,12 @@ impl Tls12RecordEngine {
         write_fragmented(&mut self.state, CONTENT_ALERT, &[ALERT_LEVEL_WARNING, ALERT_CLOSE_NOTIFY], sink);
     }
 
-    fn fail<S: Tls12RecordSink + ?Sized>(&mut self, sink: &mut S, msg: &str) {
+    fn fail<S: Tls12RecordSink + ?Sized>(&mut self, sink: &mut S, alert: AlertDescription, msg: &str) {
         if !self.failed {
             self.failed = true;
             self.inbound.clear();
-            sink.protocol_error(TlsProtocolError::new(msg));
+            send_fatal_alert(&mut self.state, alert, sink);
+            sink.protocol_error(TlsProtocolError::new(alert, msg));
         }
     }
 
@@ -378,15 +397,24 @@ impl Tls12RecordEngine {
             }
             CONTENT_ALERT => {
                 if payload.len() != 2 {
-                    self.fail(sink, "malformed alert record");
+                    self.fail(sink, AlertDescription::DecodeError, "malformed alert record");
                     return false;
                 }
                 if payload[1] == ALERT_CLOSE_NOTIFY {
                     self.failed = true;
+                    self.state.alert_sent = true; // no close_notify echo needed
                     sink.peer_closed();
                 } else {
+                    // Relay the peer's own alert; don't send one back (no
+                    // alert-acknowledgment concept in RFC 5246 §7.2 either,
+                    // and the peer is already tearing the connection down).
                     let level = if payload[0] == ALERT_LEVEL_FATAL { "fatal" } else { "warning" };
-                    self.fail(sink, &format!("{level} alert {}", payload[1]));
+                    self.failed = true;
+                    self.state.alert_sent = true;
+                    sink.protocol_error(TlsProtocolError::new(
+                        AlertDescription::from_code(payload[1]),
+                        format!("peer sent {level} alert {}", payload[1]),
+                    ));
                 }
                 false
             }
@@ -398,14 +426,14 @@ impl Tls12RecordEngine {
             }
             CONTENT_APPLICATION_DATA => {
                 if !self.engine.is_complete() {
-                    self.fail(sink, "application data before handshake completed");
+                    self.fail(sink, AlertDescription::UnexpectedMessage, "application data before handshake completed");
                     return false;
                 }
                 sink.application_data(&payload);
                 true
             }
             _ => {
-                self.fail(sink, "unknown record content type");
+                self.fail(sink, AlertDescription::UnexpectedMessage, "unknown record content type");
                 false
             }
         }
@@ -693,6 +721,34 @@ mod tests {
         let wire = std::mem::take(&mut sink_c.outbound);
         server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
         assert!(sink_s.events.iter().any(|e| e == "peer_closed"), "{:?}", sink_s.events);
+    }
+
+    /// Same round trip as `tls::record`'s test of the same name — TLS 1.2
+    /// must also alert the peer for a locally-detected violation, and
+    /// that alert's code must survive to the peer's own `TlsProtocolError`.
+    #[test]
+    fn a_locally_detected_failure_sends_a_real_fatal_alert_the_peer_can_decode() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback();
+        client.send_application_data(b"hello", &mut sink_c);
+        let mut wire = std::mem::take(&mut sink_c.outbound);
+        let last = wire.len() - 1;
+        wire[last] ^= 0xff; // corrupt the AEAD tag
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+
+        let alert_wire = std::mem::take(&mut sink_s.outbound);
+        assert!(!alert_wire.is_empty(), "server must send a fatal alert on the wire: {:?}", sink_s.events);
+
+        client.feed_ciphertext(&mut alert_wire.as_slice(), &mut sink_c);
+        assert!(
+            sink_c.events.iter().any(|e| e.contains("peer sent fatal alert 20")),
+            "client must surface the peer's exact alert code: {:?}",
+            sink_c.events
+        );
+        assert!(
+            sink_c.outbound.is_empty(),
+            "client must not echo an alert back to a peer that already sent one: {:?}",
+            sink_c.outbound
+        );
     }
 
     #[test]

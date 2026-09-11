@@ -516,7 +516,15 @@ impl MessageCollector {
     pub(crate) fn take_parsed(&mut self, msg_type: HandshakeType) -> Option<ParsedIncoming> {
         match (msg_type, std::mem::take(self)) {
             (HandshakeType::ClientHello, Self::ClientHello(c)) => {
-                if c.failed || c.out.peer_key_share.is_none() {
+                // RFC 8446 §4.1.4: a client may legitimately send no
+                // `key_share` at all (or one for a group the server doesn't
+                // want) when it already expects a `HelloRetryRequest` round
+                // trip — common for DTLS, where RFC 9147 §5.1's cookie
+                // exchange forces a retry anyway. `on_client_hello` (the
+                // only consumer) already treats "wrong group" and "no
+                // group" identically via the same HRR path, so a missing
+                // `peer_key_share` must not be rejected here.
+                if c.failed {
                     return None;
                 }
                 Some(ParsedIncoming::ClientHello(c.out))

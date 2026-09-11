@@ -43,7 +43,7 @@ use crate::dtls::DtlsRecordSink;
 use crate::security::SecurityInfo;
 use crate::tls::tls12::engine::{CipherKind, DirectionalKeyMaterial, Role, Tls12EventSink, Tls12Engine};
 use crate::tls::tls12::messages;
-use crate::tls::{Tls12Config, TlsProtocolError, VerifyRequest, VerifyResult};
+use crate::tls::{AlertDescription, Tls12Config, TlsProtocolError, VerifyRequest, VerifyResult};
 
 use super::record::{self, ReadKeys, ReadOutcome, WriteKeys};
 
@@ -90,6 +90,10 @@ struct RecordState {
     // `pending_read` split exactly.
     pending_write: Option<(CipherKind, DirectionalKeyMaterial)>,
     pending_read: Option<(CipherKind, DirectionalKeyMaterial)>,
+    /// See [`crate::tls::record`]'s (private) `RecordState::alert_sent` —
+    /// same purpose: at most one fatal alert per connection, none sent in
+    /// reply to a peer's own alert.
+    alert_sent: bool,
 }
 
 impl RecordState {
@@ -100,6 +104,7 @@ impl RecordState {
             read: ReadKeys::cleartext(),
             pending_write: None,
             pending_read: None,
+            alert_sent: false,
         }
     }
 
@@ -135,6 +140,19 @@ fn write_fragmented(state: &mut RecordState, reassembler: &mut Reassembler, cont
     } else {
         record::write_record(&mut state.write, content_type, data, out);
     }
+}
+
+/// Send a fatal alert for a violation *this side* detected, at most once
+/// per connection — same purpose as `crate::dtls::engine`'s DTLS 1.3
+/// counterpart of the same name.
+fn send_fatal_alert<S: DtlsRecordSink + ?Sized>(state: &mut RecordState, alert: AlertDescription, sink: &mut S) {
+    if state.alert_sent {
+        return;
+    }
+    state.alert_sent = true;
+    let mut out = Vec::new();
+    record::write_record(&mut state.write, CONTENT_ALERT, &[ALERT_LEVEL_FATAL, alert.code()], &mut out);
+    sink.datagram_ready(&out);
 }
 
 #[derive(Default)]
@@ -265,7 +283,7 @@ impl Dtls12RecordEngine {
             match record::read_record(&mut self.state.read, &input[pos..]) {
                 ReadOutcome::Incomplete => break,
                 ReadOutcome::Invalid => {
-                    self.fail(sink, "malformed or unauthenticated DTLS record");
+                    self.fail(sink, AlertDescription::BadRecordMac, "malformed or unauthenticated DTLS record");
                     return;
                 }
                 ReadOutcome::WrongEpoch { consumed } | ReadOutcome::Replay { consumed } => {
@@ -279,7 +297,7 @@ impl Dtls12RecordEngine {
                     // confidentiality limit must close the connection
                     // rather than keep decrypting past the safety margin.
                     if self.state.read.over_confidentiality_limit() {
-                        self.fail(sink, "AES-GCM read key exceeded its confidentiality limit");
+                        self.fail(sink, AlertDescription::InternalError, "AES-GCM read key exceeded its confidentiality limit");
                         return;
                     }
                     if !self.dispatch_record(content_type, payload, &mut flight, sink) {
@@ -303,11 +321,11 @@ impl Dtls12RecordEngine {
                 sink.arm_retransmit_timer(self.retransmit.current_timeout());
             }
             Some(RetransmitOutcome::GiveUp) => {
-                self.failed = true;
-                sink.arm_retransmit_timer(None);
-                sink.protocol_error(TlsProtocolError::new(
+                self.fail(
+                    sink,
+                    AlertDescription::HandshakeFailure,
                     "DTLS 1.2 handshake timed out (retransmit limit exceeded)",
-                ));
+                );
             }
         }
     }
@@ -319,6 +337,7 @@ impl Dtls12RecordEngine {
         }
         if !self.is_complete() {
             sink.protocol_error(TlsProtocolError::new(
+                AlertDescription::InternalError,
                 "application data sent before handshake completed",
             ));
             return;
@@ -328,7 +347,7 @@ impl Dtls12RecordEngine {
         sink.datagram_ready(&out);
         // Same reasoning as the read-side check in `feed_datagram`.
         if self.state.write.over_confidentiality_limit() {
-            self.fail(sink, "AES-GCM write key exceeded its confidentiality limit");
+            self.fail(sink, AlertDescription::InternalError, "AES-GCM write key exceeded its confidentiality limit");
         }
     }
 
@@ -381,16 +400,24 @@ impl Dtls12RecordEngine {
             }
             CONTENT_ALERT => {
                 if payload.len() != 2 {
-                    self.fail(sink, "malformed alert record");
+                    self.fail(sink, AlertDescription::DecodeError, "malformed alert record");
                     return false;
                 }
                 if payload[1] == ALERT_CLOSE_NOTIFY {
                     self.failed = true;
+                    self.state.alert_sent = true; // no close_notify echo needed
                     sink.arm_retransmit_timer(None);
                     sink.peer_closed();
                 } else {
+                    // Relay the peer's own alert; don't send one back.
                     let level = if payload[0] == ALERT_LEVEL_FATAL { "fatal" } else { "warning" };
-                    self.fail(sink, &format!("{level} alert {}", payload[1]));
+                    self.failed = true;
+                    self.state.alert_sent = true;
+                    sink.arm_retransmit_timer(None);
+                    sink.protocol_error(TlsProtocolError::new(
+                        AlertDescription::from_code(payload[1]),
+                        format!("peer sent {level} alert {}", payload[1]),
+                    ));
                 }
                 false
             }
@@ -405,14 +432,14 @@ impl Dtls12RecordEngine {
             }
             CONTENT_APPLICATION_DATA => {
                 if !self.is_complete() {
-                    self.fail(sink, "application data before handshake completed");
+                    self.fail(sink, AlertDescription::UnexpectedMessage, "application data before handshake completed");
                     return false;
                 }
                 sink.application_data(&payload);
                 true
             }
             _ => {
-                self.fail(sink, "unknown DTLS record content type");
+                self.fail(sink, AlertDescription::UnexpectedMessage, "unknown DTLS record content type");
                 false
             }
         }
@@ -434,7 +461,7 @@ impl Dtls12RecordEngine {
             }
             _ => {
                 let Some(engine) = self.engine.as_mut() else {
-                    self.fail(sink, "handshake message before ClientHello");
+                    self.fail(sink, AlertDescription::UnexpectedMessage, "handshake message before ClientHello");
                     return false;
                 };
                 let mut events = EngineEvents::default();
@@ -466,7 +493,7 @@ impl Dtls12RecordEngine {
         sink: &mut S,
     ) -> bool {
         let Some(cookie) = messages::parse_hello_verify_request(&msg[4..]) else {
-            self.fail(sink, "malformed HelloVerifyRequest");
+            self.fail(sink, AlertDescription::DecodeError, "malformed HelloVerifyRequest");
             return false;
         };
         let mut cfg = self.base.clone();
@@ -507,7 +534,7 @@ impl Dtls12RecordEngine {
         sink: &mut S,
     ) -> bool {
         let Some(ch) = messages::parse_client_hello(&msg[4..]) else {
-            self.fail(sink, "malformed ClientHello");
+            self.fail(sink, AlertDescription::DecodeError, "malformed ClientHello");
             return false;
         };
         if self.require_cookie {
@@ -553,6 +580,7 @@ impl Dtls12RecordEngine {
         for err in events.errors {
             self.failed = true;
             sink.arm_retransmit_timer(None);
+            send_fatal_alert(&mut self.state, err.alert, sink);
             sink.protocol_error(err);
         }
         if let Some(info) = events.complete {
@@ -569,11 +597,12 @@ impl Dtls12RecordEngine {
         sink.arm_retransmit_timer(self.retransmit.current_timeout());
     }
 
-    fn fail<S: DtlsRecordSink + ?Sized>(&mut self, sink: &mut S, msg: &str) {
+    fn fail<S: DtlsRecordSink + ?Sized>(&mut self, sink: &mut S, alert: AlertDescription, msg: &str) {
         if !self.failed {
             self.failed = true;
             sink.arm_retransmit_timer(None);
-            sink.protocol_error(TlsProtocolError::new(msg));
+            send_fatal_alert(&mut self.state, alert, sink);
+            sink.protocol_error(TlsProtocolError::new(alert, msg));
         }
     }
 }
@@ -798,6 +827,32 @@ mod tests {
             sink_s.events
         );
         assert!(sink_s.app_data.is_empty());
+    }
+
+    /// Same round trip as `dtls::engine`'s test of the same name — DTLS 1.2
+    /// must also alert the peer for a locally-detected violation, and that
+    /// alert's code must survive to the peer's own `TlsProtocolError`.
+    #[test]
+    fn a_locally_detected_failure_sends_a_real_fatal_alert_the_peer_can_decode() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback(false);
+        client.send_application_data(b"hello", &mut sink_c);
+        let mut wire = sink_c.outbound.pop().expect("one datagram queued");
+        let last = wire.len() - 1;
+        wire[last] ^= 0xff; // corrupt the AEAD tag
+        server.feed_datagram(&wire, &mut sink_s);
+
+        let alert_datagram = sink_s.outbound.pop().expect("server must send a fatal alert datagram");
+        client.feed_datagram(&alert_datagram, &mut sink_c);
+        assert!(
+            sink_c.events.iter().any(|e| e.contains("peer sent fatal alert 20")),
+            "client must surface the peer's exact alert code: {:?}",
+            sink_c.events
+        );
+        assert!(
+            sink_c.outbound.is_empty(),
+            "client must not echo an alert back to a peer that already sent one: {:?}",
+            sink_c.outbound
+        );
     }
 
     /// The DTLS-specific case with no TCP analogue: a flight is lost

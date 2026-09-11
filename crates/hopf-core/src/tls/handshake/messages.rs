@@ -215,7 +215,11 @@ fn build_client_hello_inner(
     body.extend_from_slice(&[1, 0]);
 
     let mut extensions = BytesMut::new();
-    push_extension(&mut extensions, ext::SUPPORTED_VERSIONS, &[0x02, 0x03, 0x04]);
+    // RFC 9147 §5.3: DTLS 1.3's own `supported_versions` codepoint is
+    // {0xfe, 0xfc}, not TLS 1.3's {0x03, 0x04} — `legacy_version` is this
+    // message's own DTLS/TLS discriminator (see its use above).
+    let real_version: [u8; 2] = if params.legacy_version == 0xfefd { [0xfe, 0xfc] } else { [0x03, 0x04] };
+    push_extension(&mut extensions, ext::SUPPORTED_VERSIONS, &[0x02, real_version[0], real_version[1]]);
     push_extension(
         &mut extensions,
         ext::SUPPORTED_GROUPS,
@@ -364,7 +368,8 @@ pub fn build_server_hello_ext(
     body.extend_from_slice(&[0]);
 
     let mut extensions = BytesMut::new();
-    push_extension(&mut extensions, ext::SUPPORTED_VERSIONS, &[0x03, 0x04]);
+    let real_version: [u8; 2] = if legacy_version == 0xfefd { [0xfe, 0xfc] } else { [0x03, 0x04] };
+    push_extension(&mut extensions, ext::SUPPORTED_VERSIONS, &real_version);
     let mut ks = BytesMut::new();
     ks.extend_from_slice(&group.to_be_bytes());
     ks.extend_from_slice(&(key_share.len() as u16).to_be_bytes());
@@ -406,7 +411,8 @@ pub fn build_hello_retry_request(
     body.extend_from_slice(&[0]);
 
     let mut extensions = BytesMut::new();
-    push_extension(&mut extensions, ext::SUPPORTED_VERSIONS, &[0x03, 0x04]);
+    let real_version: [u8; 2] = if legacy_version == 0xfefd { [0xfe, 0xfc] } else { [0x03, 0x04] };
+    push_extension(&mut extensions, ext::SUPPORTED_VERSIONS, &real_version);
     push_extension(&mut extensions, ext::KEY_SHARE, &selected_group.to_be_bytes());
     if let Some(cookie) = cookie {
         push_extension(&mut extensions, ext::COOKIE, cookie);

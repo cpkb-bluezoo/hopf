@@ -42,7 +42,7 @@ use crate::security::SecurityInfo;
 
 use super::super::engine::{ClientAuthPolicy, ServerCredentials};
 use super::super::handshake::verify::{pkcs8_key_kind, KeyKind};
-use super::super::sink::{TlsProtocolError, VerifyRequest, VerifyResult};
+use super::super::sink::{AlertDescription, TlsProtocolError, VerifyRequest, VerifyResult};
 use super::super::ticket_keys::TicketKeys;
 use super::messages::{self, sig_alg, MessageType};
 use super::ticket::{self, StoredTls12Ticket, Tls12ClientTicketStore};
@@ -592,7 +592,7 @@ impl Tls12Engine {
         }
         self.verify_pending = false;
         if !result.ok {
-            self.fail(sink, "certificate verification failed");
+            self.fail(sink, AlertDescription::BadCertificate, "certificate verification failed");
             return;
         }
         self.drain(sink);
@@ -610,7 +610,7 @@ impl Tls12Engine {
             }
             match self.parser.take_one() {
                 Err(()) => {
-                    self.fail(sink, "oversized or malformed handshake message");
+                    self.fail(sink, AlertDescription::DecodeError, "oversized or malformed handshake message");
                     return;
                 }
                 Ok(None) => return,
@@ -625,7 +625,7 @@ impl Tls12Engine {
 
     fn dispatch<S: Tls12EventSink>(&mut self, msg_type: u8, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let Some(mt) = MessageType::from_u8(msg_type) else {
-            self.fail(sink, "unknown handshake message type");
+            self.fail(sink, AlertDescription::UnexpectedMessage, "unknown handshake message type");
             return false;
         };
         match (self.config.role, self.state, mt) {
@@ -664,7 +664,7 @@ impl Tls12Engine {
                 self.on_client_finished_resumed(body, wire, sink)
             }
             _ => {
-                self.fail(sink, "unexpected handshake message");
+                self.fail(sink, AlertDescription::UnexpectedMessage, "unexpected handshake message");
                 false
             }
         }
@@ -679,20 +679,20 @@ impl Tls12Engine {
 
     fn on_server_hello<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let Some(sh) = messages::parse_server_hello(body) else {
-            self.fail(sink, "malformed ServerHello");
+            self.fail(sink, AlertDescription::DecodeError, "malformed ServerHello");
             return false;
         };
         let Some((kind, prf_hash, _)) = cipher_info(sh.cipher_suite) else {
-            self.fail(sink, "server selected an unsupported cipher suite");
+            self.fail(sink, AlertDescription::IllegalParameter, "server selected an unsupported cipher suite");
             return false;
         };
         if !sh.extended_master_secret {
-            self.fail(sink, "server did not negotiate mandatory Extended Master Secret (RFC 7627)");
+            self.fail(sink, AlertDescription::InsufficientSecurity, "server did not negotiate mandatory Extended Master Secret (RFC 7627)");
             return false;
         }
         self.use_ems = true;
         if !Self::secure_renegotiation_ok(&sh.renegotiation_info) {
-            self.fail(sink, "server did not confirm RFC 5746 secure renegotiation (missing or invalid renegotiation_info)");
+            self.fail(sink, AlertDescription::HandshakeFailure, "server did not confirm RFC 5746 secure renegotiation (missing or invalid renegotiation_info)");
             return false;
         }
         self.negotiated_suite = Some(sh.cipher_suite);
@@ -705,16 +705,16 @@ impl Tls12Engine {
         let resuming = !self.sent_session_id.is_empty() && sh.session_id == self.sent_session_id;
         if resuming {
             let Some(stored) = self.pending_resume_ticket.take() else {
-                self.fail(sink, "server echoed a resumption session id we never offered");
+                self.fail(sink, AlertDescription::IllegalParameter, "server echoed a resumption session id we never offered");
                 return false;
             };
             if stored.cipher_suite != sh.cipher_suite {
-                self.fail(sink, "server echoed session id for resumption but selected a different cipher suite");
+                self.fail(sink, AlertDescription::IllegalParameter, "server echoed session id for resumption but selected a different cipher suite");
                 return false;
             }
             self.master_secret = Some(stored.master_secret);
             let Some((client_keys, server_keys)) = self.compute_key_material() else {
-                self.fail(sink, "key material derivation failed");
+                self.fail(sink, AlertDescription::InternalError, "key material derivation failed");
                 return false;
             };
             sink.keys_ready(kind, client_keys, server_keys);
@@ -729,7 +729,7 @@ impl Tls12Engine {
     fn on_server_finished_resumed<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let expected = self.finished_verify_data(false);
         if body != expected.as_slice() {
-            self.fail(sink, "server Finished verify failed (resumed handshake)");
+            self.fail(sink, AlertDescription::DecryptError, "server Finished verify failed (resumed handshake)");
             return false;
         }
         self.hash_message(&wire, false);
@@ -744,7 +744,7 @@ impl Tls12Engine {
 
     fn on_new_session_ticket<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         if !self.expect_new_session_ticket {
-            self.fail(sink, "unexpected NewSessionTicket (server never echoed SessionTicket support)");
+            self.fail(sink, AlertDescription::UnexpectedMessage, "unexpected NewSessionTicket (server never echoed SessionTicket support)");
             return false;
         }
         if let Some((lifetime_hint, ticket)) = messages::parse_new_session_ticket(body) {
@@ -773,7 +773,7 @@ impl Tls12Engine {
 
     fn on_certificate<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let Some(certs) = messages::parse_certificate(body) else {
-            self.fail(sink, "malformed Certificate");
+            self.fail(sink, AlertDescription::DecodeError, "malformed Certificate");
             return false;
         };
         self.hash_message(&wire, false);
@@ -789,7 +789,7 @@ impl Tls12Engine {
             let ok = store.verify_server_chain(&self.peer_certs, self.config.server_name.as_deref()).is_ok();
             self.verify_pending = false;
             if !ok {
-                self.fail(sink, "certificate verification failed");
+                self.fail(sink, AlertDescription::BadCertificate, "certificate verification failed");
                 return false;
             }
             self.state = State::ExpectServerKeyExchange;
@@ -801,11 +801,11 @@ impl Tls12Engine {
 
     fn on_server_key_exchange<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let Some(ske) = messages::parse_server_key_exchange(body) else {
-            self.fail(sink, "malformed or unsupported ServerKeyExchange (only named-curve secp256r1 ECDHE is supported)");
+            self.fail(sink, AlertDescription::DecodeError, "malformed or unsupported ServerKeyExchange (only named-curve secp256r1 ECDHE is supported)");
             return false;
         };
         let Some(leaf) = self.peer_certs.first() else {
-            self.fail(sink, "ServerKeyExchange before Certificate");
+            self.fail(sink, AlertDescription::UnexpectedMessage, "ServerKeyExchange before Certificate");
             return false;
         };
         let mut signed = BytesMut::with_capacity(64 + ske.signed_params.len());
@@ -813,7 +813,7 @@ impl Tls12Engine {
         signed.extend_from_slice(&self.server_random);
         signed.extend_from_slice(&ske.signed_params);
         if !verify_ske_signature(leaf, ske.sig_hash, ske.sig_alg, &signed, &ske.signature) {
-            self.fail(sink, "ServerKeyExchange signature invalid");
+            self.fail(sink, AlertDescription::DecryptError, "ServerKeyExchange signature invalid");
             return false;
         }
         self.peer_ec_point = Some(ske.ec_point);
@@ -824,7 +824,7 @@ impl Tls12Engine {
 
     fn on_certificate_request<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         if messages::parse_certificate_request(body).is_none() {
-            self.fail(sink, "malformed CertificateRequest");
+            self.fail(sink, AlertDescription::DecodeError, "malformed CertificateRequest");
             return false;
         }
         self.hash_message(&wire, false);
@@ -836,16 +836,16 @@ impl Tls12Engine {
     fn on_server_hello_done<S: Tls12EventSink>(&mut self, wire: Bytes, sink: &mut S) -> bool {
         self.hash_message(&wire, false);
         let Some(peer_point) = self.peer_ec_point.take() else {
-            self.fail(sink, "missing server key share");
+            self.fail(sink, AlertDescription::InternalError, "missing server key share");
             return false;
         };
         let Ok(local) = EphemeralP256KeyPair::generate() else {
-            self.fail(sink, "key generation failed");
+            self.fail(sink, AlertDescription::InternalError, "key generation failed");
             return false;
         };
         let client_point = Bytes::copy_from_slice(local.public_key());
         let Ok(pre_master) = local.agree(&peer_point) else {
-            self.fail(sink, "key agreement failed");
+            self.fail(sink, AlertDescription::IllegalParameter, "key agreement failed");
             return false;
         };
 
@@ -878,7 +878,7 @@ impl Tls12Engine {
         if let Some(creds) = sent_client_cert {
             let message = self.transcript.raw_bytes().to_vec();
             let Some((sig_hash, sig_alg, signature)) = sign_ske(&creds.signing_key_pkcs8, &message) else {
-                self.fail(sink, "unsupported or invalid client signing key");
+                self.fail(sink, AlertDescription::InternalError, "unsupported or invalid client signing key");
                 return false;
             };
             let cv = messages::build_certificate_verify(sig_hash, sig_alg, signature.as_bytes());
@@ -886,7 +886,7 @@ impl Tls12Engine {
         }
 
         let Some((client_keys, server_keys)) = self.compute_key_material() else {
-            self.fail(sink, "key material derivation failed");
+            self.fail(sink, AlertDescription::InternalError, "key material derivation failed");
             return false;
         };
         sink.keys_ready(self.cipher_kind.expect("cipher negotiated"), client_keys, server_keys);
@@ -902,7 +902,7 @@ impl Tls12Engine {
     fn on_server_finished<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let expected = self.finished_verify_data(false);
         if body != expected.as_slice() {
-            self.fail(sink, "server Finished verify failed");
+            self.fail(sink, AlertDescription::DecryptError, "server Finished verify failed");
             return false;
         }
         self.hash_message(&wire, false);
@@ -914,19 +914,19 @@ impl Tls12Engine {
 
     fn on_client_hello<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let Some(ch) = messages::parse_client_hello(body) else {
-            self.fail(sink, "malformed ClientHello");
+            self.fail(sink, AlertDescription::DecodeError, "malformed ClientHello");
             return false;
         };
         let Some(creds) = self.config.server.clone() else {
-            self.fail(sink, "server credentials not configured");
+            self.fail(sink, AlertDescription::InternalError, "server credentials not configured");
             return false;
         };
         let Some(our_kind) = pkcs8_key_kind(&creds.signing_key_pkcs8) else {
-            self.fail(sink, "unsupported server signing key");
+            self.fail(sink, AlertDescription::InternalError, "unsupported server signing key");
             return false;
         };
         if !ch.extended_master_secret {
-            self.fail(sink, "ClientHello missing mandatory Extended Master Secret extension (RFC 7627)");
+            self.fail(sink, AlertDescription::InsufficientSecurity, "ClientHello missing mandatory Extended Master Secret extension (RFC 7627)");
             return false;
         }
         self.use_ems = true;
@@ -939,7 +939,7 @@ impl Tls12Engine {
             None => ch.cipher_suites.contains(&TLS_EMPTY_RENEGOTIATION_INFO_SCSV),
         };
         if !renegotiation_ok {
-            self.fail(sink, "ClientHello missing or invalid RFC 5746 secure renegotiation signal");
+            self.fail(sink, AlertDescription::HandshakeFailure, "ClientHello missing or invalid RFC 5746 secure renegotiation signal");
             return false;
         }
         // RFC 9846 §1.4: content-mandatory-if-present, presence-optional —
@@ -950,7 +950,7 @@ impl Tls12Engine {
         let expected_version = if self.config.dtls { 0xfefd } else { 0x0303 };
         if let Some(versions) = &ch.supported_versions {
             if !versions.contains(&expected_version) {
-                self.fail(sink, "ClientHello supported_versions doesn't include this engine's own version");
+                self.fail(sink, AlertDescription::ProtocolVersion, "ClientHello supported_versions doesn't include this engine's own version");
                 return false;
             }
         }
@@ -995,7 +995,7 @@ impl Tls12Engine {
             self.emit(&sh, sink);
 
             let Some((client_keys, server_keys)) = self.compute_key_material() else {
-                self.fail(sink, "key material derivation failed");
+                self.fail(sink, AlertDescription::InternalError, "key material derivation failed");
                 return false;
             };
             sink.keys_ready(kind, client_keys, server_keys);
@@ -1010,7 +1010,7 @@ impl Tls12Engine {
         let Some(suite) = SUPPORTED_CIPHER_SUITES.iter().copied().find(|s| {
             ch.cipher_suites.contains(s) && cipher_info(*s).is_some_and(|(_, _, k)| k == our_kind)
         }) else {
-            self.fail(sink, "no mutually supported cipher suite for this server's key type");
+            self.fail(sink, AlertDescription::HandshakeFailure, "no mutually supported cipher suite for this server's key type");
             return false;
         };
         let (kind, prf_hash, _) = cipher_info(suite).expect("just matched");
@@ -1036,7 +1036,7 @@ impl Tls12Engine {
         self.emit(&cert_msg, sink);
 
         let Ok(local) = EphemeralP256KeyPair::generate() else {
-            self.fail(sink, "key generation failed");
+            self.fail(sink, AlertDescription::InternalError, "key generation failed");
             return false;
         };
         let server_point = Bytes::copy_from_slice(local.public_key());
@@ -1046,7 +1046,7 @@ impl Tls12Engine {
         signed.extend_from_slice(&self.server_random);
         signed.extend_from_slice(&signed_params);
         let Some((sig_hash, sig_alg, signature)) = sign_ske(&creds.signing_key_pkcs8, &signed) else {
-            self.fail(sink, "unsupported or invalid server signing key");
+            self.fail(sink, AlertDescription::InternalError, "unsupported or invalid server signing key");
             return false;
         };
         let ske = messages::build_server_key_exchange(&server_point, sig_hash, sig_alg, signature.as_bytes());
@@ -1071,13 +1071,13 @@ impl Tls12Engine {
 
     fn on_client_certificate<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let Some(certs) = messages::parse_certificate(body) else {
-            self.fail(sink, "malformed Certificate");
+            self.fail(sink, AlertDescription::DecodeError, "malformed Certificate");
             return false;
         };
         self.hash_message(&wire, false);
         if certs.is_empty() {
             if self.config.client_auth == ClientAuthPolicy::Require {
-                self.fail(sink, "client certificate required but none presented");
+                self.fail(sink, AlertDescription::HandshakeFailure, "client certificate required but none presented");
                 return false;
             }
             self.state = State::ExpectClientKeyExchange;
@@ -1096,7 +1096,7 @@ impl Tls12Engine {
             let ok = store.verify_server_chain(&self.peer_certs, None).is_ok();
             self.verify_pending = false;
             if !ok {
-                self.fail(sink, "client certificate verification failed");
+                self.fail(sink, AlertDescription::BadCertificate, "client certificate verification failed");
                 return false;
             }
             self.state = State::ExpectClientKeyExchange;
@@ -1108,21 +1108,21 @@ impl Tls12Engine {
 
     fn on_client_key_exchange<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let Some(client_point) = messages::parse_client_key_exchange(body) else {
-            self.fail(sink, "malformed ClientKeyExchange");
+            self.fail(sink, AlertDescription::DecodeError, "malformed ClientKeyExchange");
             return false;
         };
         self.hash_message(&wire, false);
         let Some(local) = self.local_ecdhe.take() else {
-            self.fail(sink, "missing server key share");
+            self.fail(sink, AlertDescription::InternalError, "missing server key share");
             return false;
         };
         let Ok(pre_master) = local.agree(&client_point) else {
-            self.fail(sink, "key agreement failed");
+            self.fail(sink, AlertDescription::IllegalParameter, "key agreement failed");
             return false;
         };
         self.derive_master_secret(&pre_master);
         let Some((client_keys, server_keys)) = self.compute_key_material() else {
-            self.fail(sink, "key material derivation failed");
+            self.fail(sink, AlertDescription::InternalError, "key material derivation failed");
             return false;
         };
         sink.keys_ready(self.cipher_kind.expect("cipher negotiated"), client_keys, server_keys);
@@ -1136,18 +1136,18 @@ impl Tls12Engine {
 
     fn on_client_certificate_verify<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let Some((sig_hash, sig_alg, signature)) = messages::parse_certificate_verify(body) else {
-            self.fail(sink, "malformed CertificateVerify");
+            self.fail(sink, AlertDescription::DecodeError, "malformed CertificateVerify");
             return false;
         };
         let Some(leaf) = self.peer_certs.first() else {
-            self.fail(sink, "CertificateVerify without client certificate");
+            self.fail(sink, AlertDescription::UnexpectedMessage, "CertificateVerify without client certificate");
             return false;
         };
         // Signs the transcript through ClientKeyExchange — `wire` (this
         // message) is not yet added to it below.
         let message = self.transcript.raw_bytes().to_vec();
         if !verify_ske_signature(leaf, sig_hash, sig_alg, &message, &signature) {
-            self.fail(sink, "client CertificateVerify signature invalid");
+            self.fail(sink, AlertDescription::DecryptError, "client CertificateVerify signature invalid");
             return false;
         }
         self.hash_message(&wire, false);
@@ -1159,7 +1159,7 @@ impl Tls12Engine {
     fn on_client_finished<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let expected = self.finished_verify_data(true);
         if body != expected.as_slice() {
-            self.fail(sink, "client Finished verify failed");
+            self.fail(sink, AlertDescription::DecryptError, "client Finished verify failed");
             return false;
         }
         self.hash_message(&wire, false);
@@ -1185,7 +1185,7 @@ impl Tls12Engine {
     fn on_client_finished_resumed<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let expected = self.finished_verify_data(true);
         if body != expected.as_slice() {
-            self.fail(sink, "client Finished verify failed (resumed handshake)");
+            self.fail(sink, AlertDescription::DecryptError, "client Finished verify failed (resumed handshake)");
             return false;
         }
         self.hash_message(&wire, false);
@@ -1302,10 +1302,10 @@ impl Tls12Engine {
         sink.handshake_complete(info);
     }
 
-    fn fail<S: Tls12EventSink>(&mut self, sink: &mut S, msg: &str) {
+    fn fail<S: Tls12EventSink>(&mut self, sink: &mut S, alert: AlertDescription, msg: &str) {
         if self.state != State::Failed {
             self.state = State::Failed;
-            sink.protocol_error(TlsProtocolError::new(msg));
+            sink.protocol_error(TlsProtocolError::new(alert, msg));
         }
     }
 }

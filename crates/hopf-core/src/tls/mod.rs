@@ -41,8 +41,8 @@ pub use pem::{
 };
 pub use record::{NopTlsRecordSink, TlsRecordEngine, TlsRecordSink};
 pub use sink::{
-    NopTlsEventSink, QuicSecrets, TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyRequest,
-    VerifyResult,
+    AlertDescription, NopTlsEventSink, QuicSecrets, TlsEventSink, TlsProtocolError, TlsTimerKind,
+    VerifyRequest, VerifyResult,
 };
 pub use ticket_keys::TicketKeys;
 pub use tls12::engine::{Config as Tls12Config, Role as Tls12Role, SUPPORTED_CIPHER_SUITES as TLS12_SUPPORTED_CIPHER_SUITES};

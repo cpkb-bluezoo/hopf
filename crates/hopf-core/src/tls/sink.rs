@@ -11,15 +11,170 @@ use super::engine::Tls13Aead;
 /// TLS protocol error surfaced to the connection pump — not a `Result` from `feed_*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsProtocolError {
+    /// The alert this side either sent to the peer (a locally-detected
+    /// violation) or received from them (relayed verbatim, not re-sent —
+    /// see [`super::TlsRecordEngine`]'s module doc for why).
+    pub alert: AlertDescription,
     /// Human-readable detail for logs.
     pub message: String,
 }
 
 impl TlsProtocolError {
-    /// Construct from a static or owned message.
-    pub fn new(message: impl Into<String>) -> Self {
+    /// Construct from an alert description and a static or owned message.
+    pub fn new(alert: AlertDescription, message: impl Into<String>) -> Self {
         Self {
+            alert,
             message: message.into(),
+        }
+    }
+}
+
+/// RFC 8446 §6.2 alert description codes. TLS 1.2 (RFC 5246 §7.2.2) and
+/// DTLS 1.2/1.3 (RFC 6347/RFC 9147, which both defer to the TLS alert
+/// registry) assign the same numeric values to every code they share with
+/// TLS 1.3, so one enum serves every engine in this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AlertDescription {
+    /// Orderly connection shutdown, warning-level only.
+    CloseNotify,
+    /// A message arrived out of order, in the wrong state, or of a kind
+    /// not valid here.
+    UnexpectedMessage,
+    /// Record-layer MAC/AEAD-tag verification failed.
+    BadRecordMac,
+    /// A record exceeded its maximum permitted length.
+    RecordOverflow,
+    /// Negotiation couldn't produce an acceptable set of parameters.
+    HandshakeFailure,
+    /// A certificate was corrupt, unparseable, or otherwise failed to verify.
+    BadCertificate,
+    /// A certificate's type isn't supported.
+    UnsupportedCertificate,
+    /// A certificate has been revoked by its signer.
+    CertificateRevoked,
+    /// A certificate has expired or isn't yet valid.
+    CertificateExpired,
+    /// A certificate is unusable for a reason not covered by a more
+    /// specific code.
+    CertificateUnknown,
+    /// A field in the handshake was out of range or inconsistent with
+    /// other fields.
+    IllegalParameter,
+    /// A valid certificate chain led to an untrusted or unknown CA.
+    UnknownCa,
+    /// A valid certificate was rejected by local policy.
+    AccessDenied,
+    /// A message couldn't be decoded because a field was out of range or
+    /// the message length was wrong.
+    DecodeError,
+    /// A handshake cryptographic operation failed — signature, Finished,
+    /// or PSK binder verification.
+    DecryptError,
+    /// The protocol version the peer attempted isn't supported or
+    /// recognized.
+    ProtocolVersion,
+    /// The negotiated security parameters don't meet local requirements.
+    InsufficientSecurity,
+    /// An error local to this side, unrelated to the peer or protocol
+    /// correctness.
+    InternalError,
+    /// A client's fallback to a lower protocol version was rejected
+    /// (RFC 7507).
+    InappropriateFallback,
+    /// The handshake was canceled by the user for a reason unrelated to a
+    /// protocol failure.
+    UserCanceled,
+    /// A required extension was missing.
+    MissingExtension,
+    /// An extension was present that isn't permitted in this message.
+    UnsupportedExtension,
+    /// The `server_name` extension carried an unrecognized name (RFC 6066).
+    UnrecognizedName,
+    /// The OCSP response carried in the `status_request` extension was
+    /// invalid.
+    BadCertificateStatusResponse,
+    /// The offered PSK identity isn't recognized.
+    UnknownPskIdentity,
+    /// A client certificate was required but none was presented
+    /// (TLS 1.3 only).
+    CertificateRequired,
+    /// No application-layer protocol overlapped during ALPN negotiation
+    /// (RFC 7301).
+    NoApplicationProtocol,
+    /// A wire code outside the set above — only constructed when relaying
+    /// an alert the *peer* sent, never when this crate sends its own.
+    Other(u8),
+}
+
+impl AlertDescription {
+    /// The RFC 8446 §6.2 wire value.
+    pub fn code(self) -> u8 {
+        match self {
+            Self::CloseNotify => 0,
+            Self::UnexpectedMessage => 10,
+            Self::BadRecordMac => 20,
+            Self::RecordOverflow => 22,
+            Self::HandshakeFailure => 40,
+            Self::BadCertificate => 42,
+            Self::UnsupportedCertificate => 43,
+            Self::CertificateRevoked => 44,
+            Self::CertificateExpired => 45,
+            Self::CertificateUnknown => 46,
+            Self::IllegalParameter => 47,
+            Self::UnknownCa => 48,
+            Self::AccessDenied => 49,
+            Self::DecodeError => 50,
+            Self::DecryptError => 51,
+            Self::ProtocolVersion => 70,
+            Self::InsufficientSecurity => 71,
+            Self::InternalError => 80,
+            Self::InappropriateFallback => 86,
+            Self::UserCanceled => 90,
+            Self::MissingExtension => 109,
+            Self::UnsupportedExtension => 110,
+            Self::UnrecognizedName => 112,
+            Self::BadCertificateStatusResponse => 113,
+            Self::UnknownPskIdentity => 115,
+            Self::CertificateRequired => 116,
+            Self::NoApplicationProtocol => 120,
+            Self::Other(code) => code,
+        }
+    }
+
+    /// Parse a wire value received from a peer — never fails, since an
+    /// alert code this crate doesn't otherwise construct is still worth
+    /// surfacing to the embedder verbatim rather than discarding.
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::CloseNotify,
+            10 => Self::UnexpectedMessage,
+            20 => Self::BadRecordMac,
+            22 => Self::RecordOverflow,
+            40 => Self::HandshakeFailure,
+            42 => Self::BadCertificate,
+            43 => Self::UnsupportedCertificate,
+            44 => Self::CertificateRevoked,
+            45 => Self::CertificateExpired,
+            46 => Self::CertificateUnknown,
+            47 => Self::IllegalParameter,
+            48 => Self::UnknownCa,
+            49 => Self::AccessDenied,
+            50 => Self::DecodeError,
+            51 => Self::DecryptError,
+            70 => Self::ProtocolVersion,
+            71 => Self::InsufficientSecurity,
+            80 => Self::InternalError,
+            86 => Self::InappropriateFallback,
+            90 => Self::UserCanceled,
+            109 => Self::MissingExtension,
+            110 => Self::UnsupportedExtension,
+            112 => Self::UnrecognizedName,
+            113 => Self::BadCertificateStatusResponse,
+            115 => Self::UnknownPskIdentity,
+            116 => Self::CertificateRequired,
+            120 => Self::NoApplicationProtocol,
+            other => Self::Other(other),
         }
     }
 }

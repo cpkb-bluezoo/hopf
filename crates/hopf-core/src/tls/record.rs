@@ -12,7 +12,10 @@ use crate::crypto::hkdf::expand_label;
 use crate::security::SecurityInfo;
 
 use super::engine::{HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, Tls13Aead};
-use super::sink::{KeyUpdateDirection, QuicSecrets, TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyRequest, VerifyResult};
+use super::sink::{
+    AlertDescription, KeyUpdateDirection, QuicSecrets, TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyRequest,
+    VerifyResult,
+};
 
 const CONTENT_CHANGE_CIPHER_SPEC: u8 = 20;
 const CONTENT_ALERT: u8 = 21;
@@ -164,6 +167,11 @@ struct RecordState {
     /// Guards against re-requesting on every subsequent record while
     /// we're still waiting for them to respond.
     read_update_requested: bool,
+    /// Set once a fatal alert has gone out (or a peer's own fatal/close
+    /// alert has been relayed without a reply) — guards against sending a
+    /// second one, and against replying to a peer's alert with one of our
+    /// own (RFC 8446 §6.1/§6.2 don't call for acknowledging an alert).
+    alert_sent: bool,
 }
 
 impl RecordState {
@@ -176,6 +184,7 @@ impl RecordState {
             next_write: None,
             next_read: None,
             read_update_requested: false,
+            alert_sent: false,
         }
     }
 
@@ -277,6 +286,17 @@ fn write_fragmented<S: TlsRecordSink + ?Sized>(state: &mut RecordState, content_
     }
 }
 
+/// Send a fatal alert for a violation *this side* detected (RFC 8446
+/// §6.2) — at most once per connection (see [`RecordState::alert_sent`]),
+/// since after the first fatal alert the connection is already going down.
+fn send_fatal_alert<S: TlsRecordSink + ?Sized>(state: &mut RecordState, alert: AlertDescription, sink: &mut S) {
+    if state.alert_sent {
+        return;
+    }
+    state.alert_sent = true;
+    write_fragmented(state, CONTENT_ALERT, &[ALERT_LEVEL_FATAL, alert.code()], sink);
+}
+
 /// Bridges [`HandshakeEngine`]'s handshake-message events onto record framing.
 struct InnerSink<'a, S: TlsRecordSink + ?Sized> {
     state: &'a mut RecordState,
@@ -313,6 +333,7 @@ impl<S: TlsRecordSink + ?Sized> TlsEventSink for InnerSink<'_, S> {
     }
 
     fn protocol_error(&mut self, err: TlsProtocolError) {
+        send_fatal_alert(self.state, err.alert, self.outer);
         self.outer.protocol_error(err);
     }
 
@@ -388,7 +409,7 @@ impl TlsRecordEngine {
                     }
                 }
                 Err(()) => {
-                    self.fail(sink, "malformed or unauthenticated TLS record");
+                    self.fail(sink, AlertDescription::BadRecordMac, "malformed or unauthenticated TLS record");
                     break;
                 }
             }
@@ -402,6 +423,7 @@ impl TlsRecordEngine {
         }
         if self.state.epoch != Epoch::Application {
             sink.protocol_error(TlsProtocolError::new(
+                AlertDescription::InternalError,
                 "application data sent before handshake completed",
             ));
             return;
@@ -452,11 +474,12 @@ impl TlsRecordEngine {
         self.engine.request_key_update(&mut inner, request_peer_update)
     }
 
-    fn fail<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S, msg: &str) {
+    fn fail<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S, alert: AlertDescription, msg: &str) {
         if !self.failed {
             self.failed = true;
             self.inbound.clear();
-            sink.protocol_error(TlsProtocolError::new(msg));
+            send_fatal_alert(&mut self.state, alert, sink);
+            sink.protocol_error(TlsProtocolError::new(alert, msg));
         }
     }
 
@@ -468,15 +491,24 @@ impl TlsRecordEngine {
             CONTENT_CHANGE_CIPHER_SPEC => true,
             CONTENT_ALERT => {
                 if payload.len() != 2 {
-                    self.fail(sink, "malformed alert record");
+                    self.fail(sink, AlertDescription::DecodeError, "malformed alert record");
                     return false;
                 }
                 if payload[1] == ALERT_CLOSE_NOTIFY {
                     self.failed = true; // no more records expected after close_notify
+                    self.state.alert_sent = true; // no close_notify echo needed
                     sink.peer_closed();
                 } else {
+                    // Relay the peer's own alert; don't send one back (RFC
+                    // 8446 §6 has no alert-acknowledgment concept, and the
+                    // peer is already tearing the connection down).
                     let level = if payload[0] == ALERT_LEVEL_FATAL { "fatal" } else { "warning" };
-                    self.fail(sink, &format!("{level} alert {}", payload[1]));
+                    self.failed = true;
+                    self.state.alert_sent = true;
+                    sink.protocol_error(TlsProtocolError::new(
+                        AlertDescription::from_code(payload[1]),
+                        format!("peer sent {level} alert {}", payload[1]),
+                    ));
                 }
                 false
             }
@@ -491,14 +523,14 @@ impl TlsRecordEngine {
             }
             CONTENT_APPLICATION_DATA => {
                 if !self.engine.is_complete() {
-                    self.fail(sink, "application data before handshake completed");
+                    self.fail(sink, AlertDescription::UnexpectedMessage, "application data before handshake completed");
                     return false;
                 }
                 sink.application_data(&payload);
                 true
             }
             _ => {
-                self.fail(sink, "unknown record content type");
+                self.fail(sink, AlertDescription::UnexpectedMessage, "unknown record content type");
                 false
             }
         }
@@ -983,6 +1015,39 @@ mod tests {
             sink_s.events
         );
         assert!(sink_s.app_data.is_empty());
+    }
+
+    /// A locally-detected violation (here: a corrupted AEAD tag) must not
+    /// just be reported to the local embedder — it has to reach the peer
+    /// as a real wire `Alert` record (RFC 8446 §6.2) so *they* know why
+    /// the connection dropped, and that alert's description must survive
+    /// the round trip to the peer's own `TlsProtocolError`.
+    #[test]
+    fn a_locally_detected_failure_sends_a_real_fatal_alert_the_peer_can_decode() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback();
+        client.send_application_data(b"hello", &mut sink_c);
+        let mut wire = std::mem::take(&mut sink_c.outbound);
+        let last = wire.len() - 1;
+        wire[last] ^= 0xff; // corrupt the AEAD tag
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+
+        let alert_wire = std::mem::take(&mut sink_s.outbound);
+        assert!(!alert_wire.is_empty(), "server must send a fatal alert on the wire: {:?}", sink_s.events);
+
+        // Feed the server's alert back to the client — it must decode as
+        // AlertDescription::BadRecordMac (20) without the client sending
+        // anything of its own in reply (no alert ping-pong).
+        client.feed_ciphertext(&mut alert_wire.as_slice(), &mut sink_c);
+        assert!(
+            sink_c.events.iter().any(|e| e.contains("peer sent fatal alert 20")),
+            "client must surface the peer's exact alert code: {:?}",
+            sink_c.events
+        );
+        assert!(
+            sink_c.outbound.is_empty(),
+            "client must not echo an alert back to a peer that already sent one: {:?}",
+            sink_c.outbound
+        );
     }
 
     #[test]

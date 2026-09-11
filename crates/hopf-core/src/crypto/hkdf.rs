@@ -58,19 +58,22 @@ pub fn expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> B
 
 /// DTLS 1.3 label prefix (RFC 9147 §5.9): *"Section 7.1 of \[TLS13\] specifies
 /// that HKDF-Expand-Label uses a label prefix of 'tls13 '. For DTLS 1.3,
-/// that label SHALL be 'dtls13'."* — unlike RFC 9001's QUIC (which layers
-/// its own `"quic "`-prefixed derivation on top of an *unmodified* TLS 1.3
-/// key schedule), this amends RFC 8446 §7.1 itself, so it applies to every
+/// that label SHALL be 'dtls13'."* — note there is deliberately **no
+/// trailing space**, unlike TLS 1.3's `"tls13 "`: the full label is the
+/// literal concatenation `"dtls13" + label` (e.g. `"dtls13key"`, not
+/// `"dtls13 key"`). Confirmed against a real independent DTLS 1.3 peer
+/// (wolfSSL) — an earlier version of this constant included the space by
+/// analogy with TLS 1.3, which decrypted nothing but was invisible to
+/// hopf-vs-hopf loopback testing (both sides made the same mistake
+/// symmetrically). Unlike RFC 9001's QUIC (which layers its own
+/// `"quic "`-prefixed derivation on top of an *unmodified* TLS 1.3 key
+/// schedule), this amends RFC 8446 §7.1 itself, so it applies to every
 /// `HKDF-Expand-Label` call throughout the handshake's key schedule, not
 /// just a final record-protection-key step — see [`extract_dtls`] /
 /// [`extract_derived_dtls`] / [`dtls_expand_label`], used throughout
 /// `handshake::key_schedule` wherever its functions are called with
-/// `dtls: true`. **Unverified**: RFC 9147 has no published test vectors
-/// (unlike RFC 8448 for TLS 1.3) and no independent DTLS 1.3 peer was
-/// available to interop-test this against (see `crypto-migration-plan.md`
-/// Phase 6) — this is a best-effort reading of the RFC text, not yet
-/// cross-checked against another implementation.
-const DTLS13_LABEL_PREFIX: &str = "dtls13 ";
+/// `dtls: true`.
+const DTLS13_LABEL_PREFIX: &str = "dtls13";
 const TLS13_LABEL_PREFIX: &str = "tls13 ";
 
 /// [`extract`], but for DTLS 1.3 (RFC 9147 §5.9's `"dtls13 "` prefix).
@@ -159,6 +162,33 @@ mod tests {
         assert_eq!(
             derived,
             hex("6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")
+        );
+    }
+
+    /// RFC 9147 §5.9: *"For DTLS 1.3, that label SHALL be 'dtls13'"* — with
+    /// **no trailing space**, unlike TLS 1.3's `"tls13 "`. An earlier
+    /// version of this crate's `DTLS13_LABEL_PREFIX` included the space by
+    /// analogy with TLS 1.3; every derived key was consequently wrong, but
+    /// symmetrically wrong on both sides of a hopf-vs-hopf handshake, so it
+    /// went undetected until interop-tested against a real DTLS 1.3 peer
+    /// (wolfSSL) — decryption failed on the very first Handshake-epoch
+    /// record. This pins the exact wire bytes so that regression can't
+    /// recur silently again.
+    #[test]
+    fn dtls_expand_label_has_no_space_after_the_dtls13_prefix() {
+        assert_eq!(DTLS13_LABEL_PREFIX, "dtls13", "must NOT have a trailing space — RFC 9147 §5.9");
+        // Pin the exact wire bytes of the constructed `HkdfLabel`
+        // (RFC 8446 §7.1) for the concatenation "dtls13" + "key", so a
+        // regression back to the wrong ("dtls13 key") shape fails loudly
+        // even without official RFC 9147 test vectors to check against.
+        let hkdf_label = build_hkdf_label(DTLS13_LABEL_PREFIX, "key", &[], 16);
+        assert_eq!(
+            hkdf_label.as_ref(),
+            [
+                0x00, 0x10, // length = 16
+                0x09, // label length = 9 ("dtls13key")
+                b'd', b't', b'l', b's', b'1', b'3', b'k', b'e', b'y', 0x00, // context length = 0
+            ]
         );
     }
 

@@ -30,7 +30,7 @@ use super::handshake::ticket::{
     StoredTicket,
 };
 use super::handshake::transport_params::RememberedTransportLimits;
-use super::sink::{KeyUpdateDirection, QuicSecrets, TlsEventSink, TlsProtocolError, VerifyResult};
+use super::sink::{AlertDescription, KeyUpdateDirection, QuicSecrets, TlsEventSink, TlsProtocolError, VerifyResult};
 use super::ticket_keys::TicketKeys;
 use crate::crypto::hkdf::expand_label;
 
@@ -488,7 +488,7 @@ impl HandshakeEngine {
         if result.ok {
             self.drain_parser(sink);
         } else {
-            self.fail(sink, "certificate verification failed");
+            self.fail(sink, AlertDescription::BadCertificate, "certificate verification failed");
         }
     }
 
@@ -587,7 +587,7 @@ impl HandshakeEngine {
             }
             (_, HandshakeType::KeyUpdate, State::Complete, ParsedIncoming::KeyUpdate(kind)) => self.on_key_update(kind, sink),
             _ => {
-                self.fail(sink, "unexpected handshake message or state");
+                self.fail(sink, AlertDescription::UnexpectedMessage, "unexpected handshake message or state");
                 false
             }
         }
@@ -618,7 +618,7 @@ impl HandshakeEngine {
     ) {
         let dtls = self.config.mode == HandshakeMode::Dtls;
         let Ok(local) = LocalKeyShare::generate(offer) else {
-            self.fail(sink, "key generation failed");
+            self.fail(sink, AlertDescription::InternalError, "key generation failed");
             return;
         };
         let random = if let Some(r) = retry {
@@ -735,20 +735,20 @@ impl HandshakeEngine {
             return self.on_hello_retry_request(sh, encoded, sink);
         }
         let Some(aead) = Tls13Aead::from_suite(sh.cipher_suite) else {
-            self.fail(sink, "unsupported cipher suite");
+            self.fail(sink, AlertDescription::HandshakeFailure, "unsupported cipher suite");
             return false;
         };
         self.negotiated_aead = Some(aead);
         let Some(group) = NamedGroup::from_code(sh.selected_group) else {
-            self.fail(sink, "unsupported key exchange group");
+            self.fail(sink, AlertDescription::HandshakeFailure, "unsupported key exchange group");
             return false;
         };
         let Some(local) = self.local_key_share.take() else {
-            self.fail(sink, "missing local key share");
+            self.fail(sink, AlertDescription::InternalError, "missing local key share");
             return false;
         };
         let Ok(shared) = local.agree_client(group, &sh.key_share) else {
-            self.fail(sink, "key agreement failed");
+            self.fail(sink, AlertDescription::IllegalParameter, "key agreement failed");
             return false;
         };
         self.resumed = sh.psk_selected_identity.is_some();
@@ -789,17 +789,31 @@ impl HandshakeEngine {
         sink: &mut S,
     ) -> bool {
         if self.client_retried {
-            self.fail(sink, "server sent a second HelloRetryRequest");
+            self.fail(sink, AlertDescription::UnexpectedMessage, "server sent a second HelloRetryRequest");
             return false;
         }
-        let Some(group) = NamedGroup::from_code(sh.selected_group) else {
-            self.fail(sink, "HelloRetryRequest requested an unsupported group");
-            return false;
+        // RFC 8446 §4.1.4: the server MUST NOT include `key_share` in the
+        // HelloRetryRequest unless it actually needs to change the group —
+        // a cookie-only HRR (no `key_share` extension at all) is valid and
+        // common, especially over DTLS, where RFC 9147 §5.1 has servers
+        // routinely require a cookie round trip for anti-amplification
+        // regardless of whether ClientHello1's group was acceptable.
+        // `selected_group` defaults to 0 (not a real IANA group id) when
+        // that extension was absent — keep using the group already
+        // offered rather than treating "absent" as "invalid".
+        let group = if sh.selected_group == 0 {
+            self.config.kx_policy.preferred()
+        } else {
+            let Some(group) = NamedGroup::from_code(sh.selected_group) else {
+                self.fail(sink, AlertDescription::IllegalParameter, "HelloRetryRequest requested an unsupported group");
+                return false;
+            };
+            if !self.config.kx_policy.groups().contains(&group) {
+                self.fail(sink, AlertDescription::IllegalParameter, "HelloRetryRequest requested a group we don't offer");
+                return false;
+            }
+            group
         };
-        if !self.config.kx_policy.groups().contains(&group) {
-            self.fail(sink, "HelloRetryRequest requested a group we don't offer");
-            return false;
-        }
         // Nothing but ClientHello1 has been added to the transcript yet
         // (this is the first message the client processes after sending
         // it), so its current hash is exactly Hash(ClientHello1) — RFC 8446
@@ -826,7 +840,7 @@ impl HandshakeEngine {
         // neither side actually agreed on.
         if let Some(picked) = ee.alpn.as_ref() {
             if !self.config.alpn.contains(picked) {
-                self.fail(sink, "server selected an ALPN protocol the client never offered");
+                self.fail(sink, AlertDescription::IllegalParameter, "server selected an ALPN protocol the client never offered");
                 return false;
             }
         }
@@ -834,7 +848,7 @@ impl HandshakeEngine {
         if ee.early_data {
             if let Some(ticket_alpn) = self.offered_ticket_alpn.as_ref() {
                 if !ticket_alpn.is_empty() && ee.alpn.as_ref() != Some(ticket_alpn) {
-                    self.fail(sink, "early_data accepted with ALPN mismatch");
+                    self.fail(sink, AlertDescription::IllegalParameter, "early_data accepted with ALPN mismatch");
                     return false;
                 }
             }
@@ -867,11 +881,11 @@ impl HandshakeEngine {
         sink: &mut S,
     ) -> bool {
         if self.resumed {
-            self.fail(sink, "unexpected Certificate on resumed handshake");
+            self.fail(sink, AlertDescription::UnexpectedMessage, "unexpected Certificate on resumed handshake");
             return false;
         }
         if certs.is_empty() {
-            self.fail(sink, "server Certificate must not be empty");
+            self.fail(sink, AlertDescription::DecodeError, "server Certificate must not be empty");
             return false;
         }
         self.transcript.add_message(&encoded);
@@ -889,7 +903,7 @@ impl HandshakeEngine {
                 .is_ok();
             self.verify_pending = false;
             if !ok {
-                self.fail(sink, "certificate verification failed");
+                self.fail(sink, AlertDescription::BadCertificate, "certificate verification failed");
                 return false;
             }
             return true;
@@ -898,7 +912,7 @@ impl HandshakeEngine {
             let ok = (verify.0)(&self.peer_certs, self.config.server_name.as_deref());
             self.verify_pending = false;
             if !ok {
-                self.fail(sink, "certificate verification failed");
+                self.fail(sink, AlertDescription::BadCertificate, "certificate verification failed");
                 return false;
             }
             return true;
@@ -914,12 +928,12 @@ impl HandshakeEngine {
         sink: &mut S,
     ) -> bool {
         let Some(leaf) = self.peer_certs.first() else {
-            self.fail(sink, "certificate verify without certificate");
+            self.fail(sink, AlertDescription::UnexpectedMessage, "certificate verify without certificate");
             return false;
         };
         let th = self.transcript.hash();
         if !verify_certificate_verify(false, leaf.as_ref(), scheme, &sig, &th) {
-            self.fail(sink, "CertificateVerify signature invalid");
+            self.fail(sink, AlertDescription::DecryptError, "CertificateVerify signature invalid");
             return false;
         }
         self.transcript.add_message(&encoded);
@@ -933,7 +947,7 @@ impl HandshakeEngine {
         sink: &mut S,
     ) -> bool {
         if self.resumed {
-            self.fail(sink, "unexpected CertificateRequest on resumed handshake");
+            self.fail(sink, AlertDescription::UnexpectedMessage, "unexpected CertificateRequest on resumed handshake");
             return false;
         }
         self.transcript.add_message(&encoded);
@@ -948,14 +962,14 @@ impl HandshakeEngine {
         sink: &mut S,
     ) -> bool {
         let Some(traffic) = self.handshake_traffic.as_ref() else {
-            self.fail(sink, "missing handshake traffic");
+            self.fail(sink, AlertDescription::InternalError, "missing handshake traffic");
             return false;
         };
         let th = self.transcript.hash();
         let dtls = self.config.mode == HandshakeMode::Dtls;
         let expected = compute_finished_verify_data(&traffic.server, &th, dtls);
         if vd.as_ref() != expected {
-            self.fail(sink, "server Finished verify failed");
+            self.fail(sink, AlertDescription::DecryptError, "server Finished verify failed");
             return false;
         }
         self.transcript.add_message(&encoded);
@@ -976,14 +990,14 @@ impl HandshakeEngine {
             }
         }
         let Some(traffic) = self.handshake_traffic.as_ref() else {
-            self.fail(sink, "missing handshake traffic");
+            self.fail(sink, AlertDescription::InternalError, "missing handshake traffic");
             return false;
         };
         let th = self.transcript.hash();
         let vd = compute_finished_verify_data(&traffic.client, &th, dtls);
         let fin = build_finished(&vd);
         let Some(shared) = self.shared_secret.clone() else {
-            self.fail(sink, "missing shared secret");
+            self.fail(sink, AlertDescription::InternalError, "missing shared secret");
             return false;
         };
         // Same reasoning as `on_server_hello`: only use `self.psk` once the
@@ -1015,7 +1029,7 @@ impl HandshakeEngine {
         if let Some(creds) = creds.filter(|c| !c.cert_chain.is_empty()) {
             let cv_th = self.transcript.hash();
             let Some((scheme, sig)) = sign_certificate_verify(true, &creds.signing_key_pkcs8, &cv_th) else {
-                self.fail(sink, "unsupported or invalid client signing key");
+                self.fail(sink, AlertDescription::InternalError, "unsupported or invalid client signing key");
                 return false;
             };
             let cv = build_certificate_verify(scheme, sig.as_ref());
@@ -1069,16 +1083,16 @@ impl HandshakeEngine {
         if self.config.mode != HandshakeMode::TcpRecordLayer {
             self.fail(
                 sink,
-                "KeyUpdate is invalid outside TCP TLS 1.3 (forbidden over QUIC by RFC 9001 §4.6; DTLS 1.3's epoch-aware variant is unimplemented)",
+                AlertDescription::UnexpectedMessage, "KeyUpdate is invalid outside TCP TLS 1.3 (forbidden over QUIC by RFC 9001 §4.6; DTLS 1.3's epoch-aware variant is unimplemented)",
             );
             return false;
         }
         if kind != key_update_request::NOT_REQUESTED && kind != key_update_request::REQUESTED {
-            self.fail(sink, "malformed KeyUpdateRequest");
+            self.fail(sink, AlertDescription::DecodeError, "malformed KeyUpdateRequest");
             return false;
         }
         let Some(secret) = self.peer_app_secret else {
-            self.fail(sink, "KeyUpdate received before application traffic secrets are established");
+            self.fail(sink, AlertDescription::UnexpectedMessage, "KeyUpdate received before application traffic secrets are established");
             return false;
         };
         let aead = self.negotiated_aead.expect("cipher suite negotiated before Complete");
@@ -1175,7 +1189,7 @@ impl HandshakeEngine {
         // Selected up front (before the 0-RTT branch below, which needs it
         // too) rather than alongside group selection further down.
         let Some(&suite) = SUPPORTED_CIPHER_SUITES.iter().find(|s| ch.cipher_suites.contains(s)) else {
-            self.fail(sink, "no mutually supported cipher suite");
+            self.fail(sink, AlertDescription::HandshakeFailure, "no mutually supported cipher suite");
             return false;
         };
         let aead = Tls13Aead::from_suite(suite).expect("suite drawn from SUPPORTED_CIPHER_SUITES");
@@ -1265,28 +1279,34 @@ impl HandshakeEngine {
         }
 
         let Some(group) = self.config.kx_policy.select_mutual(&ch.supported_groups) else {
-            self.fail(sink, "no mutually supported key exchange group");
+            self.fail(sink, AlertDescription::HandshakeFailure, "no mutually supported key exchange group");
             return false;
         };
-        let Some(peer_share) = ch.peer_key_share else {
-            self.fail(sink, "missing client key share");
-            return false;
-        };
+        // RFC 8446 §4.1.4: a client may send no `key_share` at all when it
+        // already expects a `HelloRetryRequest` round trip — DTLS clients
+        // commonly do this, since RFC 9147 §5.1's cookie exchange forces a
+        // retry anyway, so guessing a group up front buys nothing. Treated
+        // identically to "key share for a group we don't want": both need
+        // the same `HelloRetryRequest`.
         if ch.key_share_group != Some(group.code()) {
             if self.server_retry_requested_group.is_some() {
-                self.fail(sink, "client key share group still mismatched after HelloRetryRequest");
+                self.fail(sink, AlertDescription::IllegalParameter, "client key share group still mismatched after HelloRetryRequest");
                 return false;
             }
             return self.send_hello_retry_request(group, &ch.legacy_session_id, suite, encoded, sink);
         }
+        let Some(peer_share) = ch.peer_key_share else {
+            self.fail(sink, AlertDescription::InternalError, "key share group matched but bytes missing");
+            return false;
+        };
         if let Some(expected) = self.server_retry_requested_group.take() {
             if expected != group {
-                self.fail(sink, "server-selected group changed across HelloRetryRequest");
+                self.fail(sink, AlertDescription::IllegalParameter, "server-selected group changed across HelloRetryRequest");
                 return false;
             }
         }
         let Ok((server_share, shared)) = server_agree(group, &peer_share) else {
-            self.fail(sink, "key agreement failed");
+            self.fail(sink, AlertDescription::IllegalParameter, "key agreement failed");
             return false;
         };
         self.transcript.add_message(&encoded);
@@ -1328,7 +1348,7 @@ impl HandshakeEngine {
         // refuse the connection rather than silently completing a
         // handshake with no negotiated application protocol.
         if !ch.alpn.is_empty() && !self.config.alpn.is_empty() && alpn.is_none() {
-            self.fail(sink, "no overlapping ALPN protocol");
+            self.fail(sink, AlertDescription::NoApplicationProtocol, "no overlapping ALPN protocol");
             return false;
         }
         self.negotiated_alpn = alpn.clone();
@@ -1349,7 +1369,7 @@ impl HandshakeEngine {
                 None => self.config.server.clone(),
             };
             let Some(creds) = resolved else {
-                self.fail(sink, "server credentials not configured");
+                self.fail(sink, AlertDescription::InternalError, "server credentials not configured");
                 return false;
             };
             if request_client_cert {
@@ -1362,7 +1382,7 @@ impl HandshakeEngine {
 
             let cv_th = self.transcript.hash();
             let Some((scheme, sig)) = sign_certificate_verify(false, &creds.signing_key_pkcs8, &cv_th) else {
-                self.fail(sink, "unsupported or invalid server signing key");
+                self.fail(sink, AlertDescription::InternalError, "unsupported or invalid server signing key");
                 return false;
             };
             let cv = build_certificate_verify(scheme, sig.as_ref());
@@ -1398,13 +1418,13 @@ impl HandshakeEngine {
         sink: &mut S,
     ) -> bool {
         if !ctx.is_empty() {
-            self.fail(sink, "client Certificate context does not match CertificateRequest");
+            self.fail(sink, AlertDescription::IllegalParameter, "client Certificate context does not match CertificateRequest");
             return false;
         }
         self.transcript.add_message(&encoded);
         if certs.is_empty() {
             if self.config.client_auth == ClientAuthPolicy::Require {
-                self.fail(sink, "client certificate required but none presented");
+                self.fail(sink, AlertDescription::CertificateRequired, "client certificate required but none presented");
                 return false;
             }
             self.state = State::AwaitingClientFinished;
@@ -1423,7 +1443,7 @@ impl HandshakeEngine {
             let ok = store.verify_server_chain(&self.peer_certs, None).is_ok();
             self.verify_pending = false;
             if !ok {
-                self.fail(sink, "client certificate verification failed");
+                self.fail(sink, AlertDescription::BadCertificate, "client certificate verification failed");
                 return false;
             }
             self.state = State::AwaitingClientCertificateVerify;
@@ -1441,12 +1461,12 @@ impl HandshakeEngine {
         sink: &mut S,
     ) -> bool {
         let Some(leaf) = self.peer_certs.first() else {
-            self.fail(sink, "certificate verify without certificate");
+            self.fail(sink, AlertDescription::UnexpectedMessage, "certificate verify without certificate");
             return false;
         };
         let th = self.transcript.hash();
         if !verify_certificate_verify(true, leaf.as_ref(), scheme, &sig, &th) {
-            self.fail(sink, "client CertificateVerify signature invalid");
+            self.fail(sink, AlertDescription::DecryptError, "client CertificateVerify signature invalid");
             return false;
         }
         self.transcript.add_message(&encoded);
@@ -1462,17 +1482,17 @@ impl HandshakeEngine {
     ) -> bool {
         let dtls = self.config.mode == HandshakeMode::Dtls;
         let Some(traffic) = self.handshake_traffic.as_ref() else {
-            self.fail(sink, "missing handshake traffic");
+            self.fail(sink, AlertDescription::InternalError, "missing handshake traffic");
             return false;
         };
         let th = self.transcript.hash();
         let expected = compute_finished_verify_data(&traffic.client, &th, dtls);
         if vd.as_ref() != expected {
-            self.fail(sink, "client Finished verify failed");
+            self.fail(sink, AlertDescription::DecryptError, "client Finished verify failed");
             return false;
         }
         let Some(shared) = self.shared_secret.as_ref() else {
-            self.fail(sink, "missing shared secret");
+            self.fail(sink, AlertDescription::InternalError, "missing shared secret");
             return false;
         };
         let psk = self.psk.as_ref();
@@ -1511,7 +1531,7 @@ impl HandshakeEngine {
         let (client_hs, server_hs) = match hs {
             Some(t) => (t.client, t.server),
             None => {
-                self.fail(sink, "handshake traffic missing at completion");
+                self.fail(sink, AlertDescription::InternalError, "handshake traffic missing at completion");
                 return;
             }
         };
@@ -1599,10 +1619,10 @@ impl HandshakeEngine {
         }
     }
 
-    fn fail<S: TlsEventSink>(&mut self, sink: &mut S, msg: &str) {
+    fn fail<S: TlsEventSink>(&mut self, sink: &mut S, alert: AlertDescription, msg: &str) {
         if self.state != State::Failed {
             self.state = State::Failed;
-            sink.protocol_error(TlsProtocolError::new(msg));
+            sink.protocol_error(TlsProtocolError::new(alert, msg));
         }
     }
 }
@@ -1736,6 +1756,7 @@ impl<S: TlsEventSink> HandshakeEvents for EngineCodecBridge<'_, S> {
         let Some(parsed) = self.collector.take_parsed(msg_type) else {
             self.engine.fail(
                 self.sink,
+                AlertDescription::DecodeError,
                 match msg_type {
                     HandshakeType::Certificate => "invalid Certificate message",
                     HandshakeType::CertificateVerify => "invalid CertificateVerify message",
@@ -1756,7 +1777,7 @@ impl<S: TlsEventSink> HandshakeEvents for EngineCodecBridge<'_, S> {
     }
 
     fn parse_error(&mut self, detail: &'static str) {
-        self.engine.fail(self.sink, detail);
+        self.engine.fail(self.sink, AlertDescription::DecodeError, detail);
         self.stop = true;
     }
 }
@@ -1773,6 +1794,8 @@ mod tests {
     use super::*;
     use super::super::handshake::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS;
     use super::super::handshake::transport_params::encode_initial_max_data;
+    use super::super::handshake::messages::HELLO_RETRY_REQUEST_RANDOM;
+    use bytes::BytesMut;
     use crate::tls::sink::{TlsEventSink, VerifyRequest, VerifyResult};
 
     #[derive(Default)]
@@ -3034,6 +3057,19 @@ mod tests {
         client.start(&mut sink);
         let ch1 = sink.outbound.first().expect("ClientHello emitted").clone();
         assert_eq!(&ch1[4..6], &0xfefdu16.to_be_bytes(), "DTLS legacy_version on the wire");
+        // RFC 9147 §5.3: the `supported_versions` extension must carry
+        // DTLS 1.3's own codepoint {0xfe, 0xfc}, not TLS 1.3's {0x03, 0x04}
+        // — `legacy_version` alone being correct doesn't prove this, since
+        // it's a separate field; this crate's builders used to hardcode
+        // the TLS value here regardless of transport, which a real DTLS
+        // 1.3 peer (confirmed: wolfSSL) correctly rejected with a
+        // `protocol_version` alert. Invisible to hopf-vs-hopf loopback
+        // since both sides made the identical mistake.
+        assert!(
+            ch1.windows(7).any(|w| w == [0x00, 0x2b, 0x00, 0x03, 0x02, 0xfe, 0xfc]),
+            "ClientHello must carry DTLS 1.3's supported_versions codepoint: {}",
+            ch1.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
 
         relay_server(&mut server, take_outbound(&mut sink), &mut sink);
         relay_client(&mut client, take_outbound(&mut sink), &mut sink);
@@ -3042,5 +3078,172 @@ mod tests {
         assert!(client.is_complete(), "client: {:?}", sink.events);
         assert!(server.is_complete(), "server: {:?}", sink.events);
         assert_eq!(sink.info.as_ref().and_then(|i| i.protocol()), Some("DTLSv1.3"));
+    }
+
+    /// Raw DTLS 1.3 ClientHello wire bytes with a caller-chosen, possibly
+    /// empty `key_share` list — `build_client_hello`/`ClientHelloParams`
+    /// always send exactly one entry, so this hand-builds the shape a real
+    /// peer legitimately sends when it defers its key share to a followup
+    /// ClientHello after an expected cookie round trip (RFC 8446 §4.1.4
+    /// permits zero entries; confirmed: wolfSSL's DTLS 1.3 client does
+    /// exactly this).
+    fn build_dtls_client_hello_raw(supported_groups: &[u16], key_share_entries: &[(u16, &[u8])]) -> Bytes {
+        let mut ext = BytesMut::new();
+        ext.extend_from_slice(&43u16.to_be_bytes()); // supported_versions
+        ext.extend_from_slice(&3u16.to_be_bytes());
+        ext.extend_from_slice(&[2, 0xfe, 0xfc]);
+        let mut sg = BytesMut::new();
+        sg.extend_from_slice(&((supported_groups.len() * 2) as u16).to_be_bytes());
+        for g in supported_groups {
+            sg.extend_from_slice(&g.to_be_bytes());
+        }
+        ext.extend_from_slice(&10u16.to_be_bytes()); // supported_groups
+        ext.extend_from_slice(&(sg.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&sg);
+        let mut ks_list = BytesMut::new();
+        for (g, share) in key_share_entries {
+            ks_list.extend_from_slice(&g.to_be_bytes());
+            ks_list.extend_from_slice(&(share.len() as u16).to_be_bytes());
+            ks_list.extend_from_slice(share);
+        }
+        let mut ks = BytesMut::new();
+        ks.extend_from_slice(&(ks_list.len() as u16).to_be_bytes());
+        ks.extend_from_slice(&ks_list);
+        ext.extend_from_slice(&51u16.to_be_bytes()); // key_share
+        ext.extend_from_slice(&(ks.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&ks);
+
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&0xfefdu16.to_be_bytes()); // legacy_version
+        body.extend_from_slice(&[0x11u8; 32]); // random
+        body.extend_from_slice(&[0]); // legacy_session_id
+        body.extend_from_slice(&[0]); // DTLS legacy_cookie
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&0x1301u16.to_be_bytes()); // TLS_AES_128_GCM_SHA256
+        body.extend_from_slice(&[1, 0]); // compression
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+
+        let mut msg = BytesMut::new();
+        msg.extend_from_slice(&[HandshakeType::ClientHello as u8]);
+        let len = body.len() as u32;
+        msg.extend_from_slice(&len.to_be_bytes()[1..]);
+        msg.extend_from_slice(&body);
+        msg.freeze()
+    }
+
+    /// RFC 8446 §4.1.4: a ClientHello with no (or too few) `key_share`
+    /// entries must be answered with a `HelloRetryRequest` requesting a
+    /// mutually-supported group, not rejected outright. Regression test
+    /// for a real bug: `MessageCollector::take_parsed` used to hard-reject
+    /// any `ClientHello` whose `peer_key_share` was `None`, before
+    /// `on_client_hello`'s own (correct) group-mismatch-triggers-HRR logic
+    /// ever got a chance to run. Found via real interop (wolfSSL's DTLS
+    /// 1.3 client sends exactly this shape) — hopf's own `kx_policy`
+    /// always generates a key share for its top preference, so no
+    /// loopback test ever exercised an empty one.
+    #[test]
+    fn server_sends_hello_retry_request_when_client_offers_no_key_share() {
+        use crate::crypto::kx::NamedGroup;
+        let creds = test_server_credentials();
+        let server_cfg = HandshakeConfig {
+            role: HandshakeRole::Server,
+            mode: HandshakeMode::Dtls,
+            server: Some(creds),
+            kx_policy: KxPolicy::classical_only(),
+            ..Default::default()
+        };
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut sink = RecordingSink::default();
+
+        let ch = build_dtls_client_hello_raw(&[NamedGroup::X25519.code()], &[]);
+        let mut input = ch.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink);
+
+        assert!(
+            !sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "server must retry, not fail, on an empty key_share list: {:?}",
+            sink.events
+        );
+        assert!(!server.is_complete());
+        assert!(!sink.outbound.is_empty(), "server must have sent a HelloRetryRequest");
+    }
+
+    /// Raw cookie-only `HelloRetryRequest` wire bytes — `supported_versions`
+    /// and `cookie` extensions only, no `key_share` at all. Real peers
+    /// (confirmed: wolfSSL's DTLS 1.3 server) send exactly this when the
+    /// client's already-offered group is fine and only the RFC 9147 §5.1
+    /// anti-amplification cookie round trip is needed.
+    fn build_cookie_only_hrr_raw(cookie: &[u8]) -> Bytes {
+        let mut ext = BytesMut::new();
+        ext.extend_from_slice(&43u16.to_be_bytes()); // supported_versions
+        ext.extend_from_slice(&2u16.to_be_bytes());
+        ext.extend_from_slice(&[0xfe, 0xfc]);
+        ext.extend_from_slice(&44u16.to_be_bytes()); // cookie
+        ext.extend_from_slice(&((cookie.len() + 2) as u16).to_be_bytes());
+        ext.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+        ext.extend_from_slice(cookie);
+
+        let mut body = BytesMut::new();
+        body.extend_from_slice(&0xfefdu16.to_be_bytes());
+        body.extend_from_slice(&HELLO_RETRY_REQUEST_RANDOM);
+        body.extend_from_slice(&[0]); // legacy_session_id_echo
+        body.extend_from_slice(&AES_128_GCM_SHA256.to_be_bytes());
+        body.extend_from_slice(&[0]); // compression
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+
+        let mut msg = BytesMut::new();
+        msg.extend_from_slice(&[HandshakeType::ServerHello as u8]);
+        let len = body.len() as u32;
+        msg.extend_from_slice(&len.to_be_bytes()[1..]);
+        msg.extend_from_slice(&body);
+        msg.freeze()
+    }
+
+    /// RFC 8446 §4.1.4: a server MUST NOT include `key_share` in its
+    /// `HelloRetryRequest` unless it actually needs to change the group —
+    /// a cookie-only HRR is valid and, over DTLS, common (RFC 9147 §5.1).
+    /// Regression test for a real bug: `on_hello_retry_request` used to
+    /// require `sh.selected_group` to decode as a valid `NamedGroup`
+    /// unconditionally, failing with `IllegalParameter` whenever
+    /// `key_share` was absent instead of keeping the already-offered
+    /// group. Found via real interop (wolfSSL's DTLS 1.3 server sends
+    /// exactly this) — hopf's own server never sends a cookie-only HRR
+    /// today, so no loopback test ever exercised receiving one.
+    #[test]
+    fn client_accepts_a_cookie_only_hello_retry_request_and_reuses_its_offered_group() {
+        let creds = test_server_credentials();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let client_cfg = HandshakeConfig {
+            role: HandshakeRole::Client,
+            mode: HandshakeMode::Dtls,
+            server_name: Some("localhost".into()),
+            trust_store: Some(trust),
+            kx_policy: KxPolicy::classical_only(),
+            ..Default::default()
+        };
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+
+        client.start(&mut sink); // CH1, offering X25519
+        take_outbound(&mut sink);
+
+        let hrr = build_cookie_only_hrr_raw(b"a cookie");
+        let mut input = hrr.as_ref();
+        client.feed_handshake_data(&mut input, &mut sink);
+
+        assert!(
+            !sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "client must accept a cookie-only HelloRetryRequest: {:?}",
+            sink.events
+        );
+        let ch2 = take_outbound(&mut sink);
+        assert!(!ch2.is_empty(), "client must resend ClientHello2");
+        assert!(
+            ch2[0].windows(2).any(|w| w == crate::crypto::kx::NamedGroup::X25519.code().to_be_bytes()),
+            "ClientHello2 must still offer the same (only) group it originally offered"
+        );
     }
 }

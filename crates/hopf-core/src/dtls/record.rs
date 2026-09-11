@@ -330,6 +330,9 @@ pub enum ReadOutcome {
         inner_content_type: u8,
         plaintext: Vec<u8>,
         consumed: usize,
+        /// This record's own (epoch, full 64-bit sequence number) — RFC
+        /// 9147 §7's `RecordNumber`, needed by the caller to ACK it.
+        record_number: (u64, u64),
     },
     /// Same sequence number already processed this epoch — drop silently
     /// (RFC 9147 §4.5.1), not a protocol error.
@@ -392,6 +395,14 @@ pub fn read_record(read: &mut ReadKeys, input: &[u8]) -> ReadOutcome {
         return ReadOutcome::Invalid;
     };
     buf.truncate(n);
+    // RFC 9147 §4.2.1 incorporates RFC 8446 §5.4's TLSInnerPlaintext
+    // structure unchanged: `content || type || zeros` — a peer may pad
+    // with trailing zero bytes before the real (non-zero) content type,
+    // which must be stripped first (see `crate::tls::record`'s matching
+    // strip, this DTLS record layer's TCP counterpart).
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
     let Some(inner_content_type) = buf.pop() else {
         return ReadOutcome::Invalid;
     };
@@ -400,6 +411,7 @@ pub fn read_record(read: &mut ReadKeys, input: &[u8]) -> ReadOutcome {
         inner_content_type,
         plaintext: buf,
         consumed,
+        record_number: (read.epoch, seq),
     }
 }
 
@@ -488,6 +500,7 @@ mod tests {
                 inner_content_type,
                 plaintext,
                 consumed,
+                ..
             } => {
                 assert_eq!(inner_content_type, 23);
                 assert_eq!(plaintext, b"hello dtls");
@@ -505,6 +518,53 @@ mod tests {
         match read_record(&mut r, &wire) {
             ReadOutcome::Record { plaintext, .. } => assert_eq!(plaintext, b"handshake bytes"),
             _ => panic!("expected a decrypted record"),
+        }
+    }
+
+    /// RFC 9147 §4.2.1 incorporates RFC 8446 §5.4's `TLSInnerPlaintext`
+    /// unchanged (`content || type || zeros`) — a peer is free to pad with
+    /// trailing zero bytes before the real content type. `read_record` used
+    /// to pop the byte immediately after the AEAD-opened plaintext as the
+    /// content type unconditionally, so any padding made it read a zero
+    /// (not a real content type) and reject the record as
+    /// `ReadOutcome::Invalid` — invisible in hopf-vs-hopf loopback since
+    /// this crate's own `write_record` never pads, only caught once a real
+    /// peer (wolfSSL) sent a padded application-data record.
+    #[test]
+    fn trailing_zero_padding_before_the_content_type_is_stripped() {
+        let (mut w, mut r) = pair(Tls13Aead::Aes128GcmSha256, 3);
+        let mut wire = Vec::new();
+        // Manually seal a padded `TLSInnerPlaintext` — `write_record`
+        // itself never pads, so this reproduces what a real peer's padded
+        // record looks like on the wire.
+        let seq = w.next_seq;
+        w.next_seq = w.next_seq.wrapping_add(1);
+        let mut plain = b"hello dtls".to_vec();
+        plain.push(23); // real inner content type: application_data
+        plain.extend_from_slice(&[0u8; 8]); // zero padding
+        let byte0 = UNIFIED_HEADER_FIXED | ((w.epoch & 0x3) as u8);
+        let seq_bytes = (seq as u16).to_be_bytes();
+        let cipher_len = (plain.len() + TAG_LEN) as u16;
+        let mut aad = [0u8; HEADER_LEN];
+        aad[0] = byte0;
+        aad[1..3].copy_from_slice(&seq_bytes);
+        aad[3..5].copy_from_slice(&cipher_len.to_be_bytes());
+        let nonce = nonce_for(&w.iv, seq);
+        w.key.seal_in_place_append_tag(nonce, &aad, &mut plain).unwrap();
+        let sample = &plain[..SN_SAMPLE_LEN];
+        let mask = w.sn_hp.new_mask(sample).unwrap();
+        let masked_seq = [seq_bytes[0] ^ mask[0], seq_bytes[1] ^ mask[1]];
+        wire.push(byte0);
+        wire.extend_from_slice(&masked_seq);
+        wire.extend_from_slice(&cipher_len.to_be_bytes());
+        wire.extend_from_slice(&plain);
+
+        match read_record(&mut r, &wire) {
+            ReadOutcome::Record { inner_content_type, plaintext, .. } => {
+                assert_eq!(inner_content_type, 23);
+                assert_eq!(plaintext, b"hello dtls");
+            }
+            _ => panic!("expected a decrypted, unpadded record, got a different outcome"),
         }
     }
 
