@@ -232,7 +232,7 @@ fn publish_consume_roundtrip() {
 /// Same publish/consume round-trip as `publish_consume_roundtrip`, but over
 /// implicit TLS (amqps, port 5671) against the broker's leaf certificate,
 /// issued by a throwaway local CA generated for this dev broker. The client
-/// trusts that CA (`hopf_tls::connector_from_pem`), the standard way a
+/// trusts that CA (`hopf_core::connector_from_pem`), the standard way a
 /// private/self-signed CA is pinned — not a bypass of certificate
 /// verification.
 ///
@@ -252,7 +252,7 @@ fn amqps_publish_consume_roundtrip_over_implicit_tls() {
         );
         return;
     }
-    let connector = hopf_tls::connector_from_pem(&ca_path, &[]).expect("tls connector");
+    let connector = hopf_core::connector_from_pem(&ca_path, &[]).expect("tls connector");
 
     let queue = format!("hopf.amqp.integ.tls.{}", std::process::id());
     let state = Arc::new(Mutex::new(State::default()));

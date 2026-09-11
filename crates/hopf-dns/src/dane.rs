@@ -3,12 +3,16 @@
 //! DANE (RFC 6698/7672) certificate verification against TLSA records
 //! (issue #352, feature `dane`).
 //!
-//! [`DaneServerCertVerifier`] implements rustls's
-//! [`ServerCertVerifier`] extension point, so it plugs into any
-//! `rustls::ClientConfig` via
-//! `.dangerous().with_custom_certificate_verifier(...)` — no changes to
-//! `hopf-tls` are needed; build a `ClientConfig` with this verifier and
-//! hand it to `hopf_tls::connector()` as usual.
+//! [`verify_dane_chain`] has no dependency on `rustls` — it takes a plain
+//! DER certificate chain and plugs into
+//! [`hopf_core::connector_with_verify_override`] as a verification
+//! callback (see `hopf-smtp`'s relay handler for the real, in-production
+//! use). An earlier `rustls`-based `ServerCertVerifier` implementation of
+//! this same matching logic existed here before the crypto-migration
+//! moved this crate's TLS engine off `rustls`; it was removed once
+//! nothing constructed it any more — everything routes through
+//! `hopf-core`'s own TLS stack now, so a second, `rustls`-specific
+//! verifier had no real caller left.
 //!
 //! This module only matches a certificate chain against TLSA records it's
 //! given — it does not look up TLSA records itself, and does not perform
@@ -30,151 +34,11 @@
 //! matches DANE-TA(2) and DANE-EE(3) records — a usage-0/1 record is
 //! never treated as a match, the same as an unassigned one.
 
-use std::fmt;
-use std::sync::Arc;
-
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::client::WebPkiServerVerifier;
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
-
 use crate::wire::{TlsaMatchingType, TlsaRecord, TlsaSelector, TlsaUsage};
 
-/// Verifies a server's certificate chain against a set of TLSA records
-/// (RFC 6698 §2.1), instead of (or as well as) ordinary WebPKI validation.
-///
-/// Construct with the TLSA records for the specific `_<port>._<protocol>.<hostname>`
-/// name being dialed — one verifier per dial, since different hostnames
-/// have different TLSA records.
-pub struct DaneServerCertVerifier {
-    records: Vec<TlsaRecord>,
-    provider: Arc<CryptoProvider>,
-}
-
-impl fmt::Debug for DaneServerCertVerifier {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DaneServerCertVerifier")
-            .field("records", &self.records)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DaneServerCertVerifier {
-    /// Build a verifier for `records` using the default (aws-lc-rs)
-    /// crypto provider.
-    pub fn new(records: Vec<TlsaRecord>) -> Self {
-        Self::with_provider(records, Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
-    }
-
-    /// Build a verifier for `records` using an explicit crypto provider —
-    /// for a caller that already has one (e.g. to share with the rest of
-    /// its `ClientConfig`) and wants to avoid building a second.
-    pub fn with_provider(records: Vec<TlsaRecord>, provider: Arc<CryptoProvider>) -> Self {
-        Self { records, provider }
-    }
-}
-
-impl ServerCertVerifier for DaneServerCertVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
-        now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        let chain: Vec<&CertificateDer<'_>> =
-            std::iter::once(end_entity).chain(intermediates.iter()).collect();
-
-        for record in &self.records {
-            match record.usage {
-                TlsaUsage::DaneEe => {
-                    if matches_record(record, end_entity) {
-                        return Ok(ServerCertVerified::assertion());
-                    }
-                }
-                TlsaUsage::DaneTa => {
-                    let Some(anchor_idx) = chain.iter().position(|c| matches_record(record, c))
-                    else {
-                        continue;
-                    };
-                    if anchor_idx == 0 {
-                        // The pinned certificate *is* the presented leaf —
-                        // trivially its own anchor, nothing further to chain.
-                        return Ok(ServerCertVerified::assertion());
-                    }
-                    let mut roots = RootCertStore::empty();
-                    if roots.add(chain[anchor_idx].clone()).is_err() {
-                        continue;
-                    }
-                    let Ok(webpki) =
-                        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&self.provider))
-                            .build()
-                    else {
-                        continue;
-                    };
-                    let sub_intermediates: Vec<CertificateDer<'_>> =
-                        chain[1..anchor_idx].iter().map(|c| (*c).clone()).collect();
-                    if webpki
-                        .verify_server_cert(end_entity, &sub_intermediates, server_name, ocsp_response, now)
-                        .is_ok()
-                    {
-                        return Ok(ServerCertVerified::assertion());
-                    }
-                }
-                // PKIX-TA(0)/PKIX-EE(1) and any unassigned usage are never
-                // matched — see the module doc comment.
-                _ => {}
-            }
-        }
-
-        Err(rustls::Error::General(
-            "DANE: no TLSA record matched the presented certificate chain".into(),
-        ))
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.provider.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// Whether `cert`'s selected data (per `record.selector`) matches
-/// `record.association_data` (per `record.matching_type`).
-fn matches_record(record: &TlsaRecord, cert: &CertificateDer<'_>) -> bool {
-    matches_record_der(record, cert.as_ref())
-}
-
-/// As [`matches_record`], directly against DER bytes rather than a
-/// `rustls`-typed certificate — what [`verify_dane_chain`] uses.
+/// Whether `cert_der`'s selected data (per `record.selector`) matches
+/// `record.association_data` (per `record.matching_type`) — what
+/// [`verify_dane_chain`] uses.
 fn matches_record_der(record: &TlsaRecord, cert_der: &[u8]) -> bool {
     let Some(selected) = selected_data(record.selector, cert_der) else {
         return false;
@@ -278,10 +142,11 @@ pub fn compute_association_data(
 mod tests {
     use super::*;
     use hopf_core::crypto::cert::extract_spki;
+    use hopf_core::Bytes;
 
-    fn test_cert() -> CertificateDer<'static> {
+    fn test_cert() -> Bytes {
         let cert = rcgen::generate_simple_self_signed(vec!["dane.example".to_string()]).unwrap();
-        cert.cert.der().clone()
+        Bytes::copy_from_slice(cert.cert.der())
     }
 
     #[test]
@@ -363,7 +228,7 @@ mod tests {
     }
 
     /// The property that actually matters for a record-generation tool:
-    /// what it computes must be exactly what [`DaneServerCertVerifier`]
+    /// what it computes must be exactly what [`verify_dane_chain`]
     /// accepts for the same certificate — "generate" and "verify" must
     /// agree, not just each run without error.
     #[test]
@@ -384,12 +249,8 @@ mod tests {
                 matching_type,
                 association_data,
             };
-            let verifier = DaneServerCertVerifier::new(vec![record]);
-            let name = ServerName::try_from("dane.example").unwrap();
             assert!(
-                verifier
-                    .verify_server_cert(&cert, &[], &name, &[], unix_now())
-                    .is_ok(),
+                verify_dane_chain(&[record], &[cert.clone()], Some("dane.example")),
                 "selector={selector:?} matching_type={matching_type:?}"
             );
         }
@@ -404,21 +265,11 @@ mod tests {
         }
     }
 
-    fn unix_now() -> UnixTime {
-        UnixTime::since_unix_epoch(std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap())
-    }
-
     #[test]
     fn dane_ee_exact_match_accepts_the_pinned_leaf_certificate() {
         let cert = test_cert();
         let record = dane_ee_record(TlsaMatchingType::Exact, cert.as_ref().to_vec());
-        let verifier = DaneServerCertVerifier::new(vec![record]);
-        let name = ServerName::try_from("dane.example").unwrap();
-        assert!(verifier
-            .verify_server_cert(&cert, &[], &name, &[], unix_now())
-            .is_ok());
+        assert!(verify_dane_chain(&[record], &[cert], Some("dane.example")));
     }
 
     #[test]
@@ -427,11 +278,7 @@ mod tests {
         let cert = test_cert();
         let digest = Sha256::digest(cert.as_ref()).to_vec();
         let record = dane_ee_record(TlsaMatchingType::Sha256, digest);
-        let verifier = DaneServerCertVerifier::new(vec![record]);
-        let name = ServerName::try_from("dane.example").unwrap();
-        assert!(verifier
-            .verify_server_cert(&cert, &[], &name, &[], unix_now())
-            .is_ok());
+        assert!(verify_dane_chain(&[record], &[cert], Some("dane.example")));
     }
 
     #[test]
@@ -455,13 +302,10 @@ mod tests {
             matching_type: TlsaMatchingType::Sha256,
             association_data: digest,
         };
-        let verifier = DaneServerCertVerifier::new(vec![record]);
-        let name = ServerName::try_from("dane.example").unwrap();
         // The *other* certificate (different serial/validity, same key)
         // must also verify, since the pin is on the key, not the cert.
-        assert!(verifier
-            .verify_server_cert(cert2.der(), &[], &name, &[], unix_now())
-            .is_ok());
+        let cert2_bytes = Bytes::copy_from_slice(cert2.der());
+        assert!(verify_dane_chain(&[record], &[cert2_bytes], Some("dane.example")));
     }
 
     #[test]
@@ -469,11 +313,7 @@ mod tests {
         let cert = test_cert();
         let other = test_cert();
         let record = dane_ee_record(TlsaMatchingType::Exact, other.as_ref().to_vec());
-        let verifier = DaneServerCertVerifier::new(vec![record]);
-        let name = ServerName::try_from("dane.example").unwrap();
-        assert!(verifier
-            .verify_server_cert(&cert, &[], &name, &[], unix_now())
-            .is_err());
+        assert!(!verify_dane_chain(&[record], &[cert], Some("dane.example")));
     }
 
     #[test]
@@ -489,10 +329,8 @@ mod tests {
                 matching_type: TlsaMatchingType::Exact,
                 association_data: cert.as_ref().to_vec(),
             };
-            let verifier = DaneServerCertVerifier::new(vec![record]);
-            let name = ServerName::try_from("dane.example").unwrap();
             assert!(
-                verifier.verify_server_cert(&cert, &[], &name, &[], unix_now()).is_err(),
+                !verify_dane_chain(&[record], &[cert.clone()], Some("dane.example")),
                 "usage {usage:?} must never be matched"
             );
         }
@@ -526,14 +364,10 @@ mod tests {
             matching_type: TlsaMatchingType::Exact,
             association_data: intermediate_cert.der().as_ref().to_vec(),
         };
-        let verifier = DaneServerCertVerifier::new(vec![record]);
-        let name = ServerName::try_from("dane.example").unwrap();
-        let leaf_der = leaf_cert.der().clone();
-        let intermediate_der = intermediate_cert.der().clone();
+        let leaf_bytes = Bytes::copy_from_slice(leaf_cert.der());
+        let intermediate_bytes = Bytes::copy_from_slice(intermediate_cert.der());
         assert!(
-            verifier
-                .verify_server_cert(&leaf_der, &[intermediate_der], &name, &[], unix_now())
-                .is_ok(),
+            verify_dane_chain(&[record], &[leaf_bytes, intermediate_bytes], Some("dane.example")),
             "leaf chaining validly to the pinned intermediate must be accepted"
         );
     }
@@ -566,13 +400,9 @@ mod tests {
             matching_type: TlsaMatchingType::Exact,
             association_data: intermediate_cert.der().as_ref().to_vec(),
         };
-        let verifier = DaneServerCertVerifier::new(vec![record]);
-        let name = ServerName::try_from("dane.example").unwrap();
-        let intermediate_der = intermediate_cert.der().clone();
+        let intermediate_bytes = Bytes::copy_from_slice(intermediate_cert.der());
         assert!(
-            verifier
-                .verify_server_cert(&unrelated_leaf, &[intermediate_der], &name, &[], unix_now())
-                .is_err(),
+            !verify_dane_chain(&[record], &[unrelated_leaf, intermediate_bytes], Some("dane.example")),
             "an unrelated leaf must not be accepted just because the pinned cert's bytes are somewhere in the chain"
         );
     }

@@ -8,6 +8,40 @@ use bytes::Bytes;
 
 use super::x509::{matches_hostname, parse_certificate, verify_cert_signature, ParsedCertificate};
 
+/// A certificate's Subject field, DER-encoded (RDNSequence). Distinct from
+/// [`SpkiDer`] so [`TrustStore::add_component_anchor`]'s two same-shaped
+/// DER blobs can't be passed in the wrong order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubjectDer(Bytes);
+
+impl SubjectDer {
+    /// Wrap already-encoded Subject DER bytes.
+    pub fn from_bytes(der: Bytes) -> Self {
+        Self(der)
+    }
+
+    /// Borrow the DER bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// A certificate's SubjectPublicKeyInfo, DER-encoded. See [`SubjectDer`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpkiDer(Bytes);
+
+impl SpkiDer {
+    /// Wrap already-encoded SubjectPublicKeyInfo DER bytes.
+    pub fn from_bytes(der: Bytes) -> Self {
+        Self(der)
+    }
+
+    /// Borrow the DER bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// A trust anchor known only by its subject and public key — no full
 /// certificate. This is what compiled-in root bundles (e.g. `webpki-roots`)
 /// provide, since a self-trusted anchor never needs its own signature or
@@ -17,9 +51,9 @@ use super::x509::{matches_hostname, parse_certificate, verify_cert_signature, Pa
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComponentAnchor {
     /// Anchor's Subject DER (as it appears in a cert it issued).
-    pub subject_der: Bytes,
+    pub subject_der: SubjectDer,
     /// Anchor's SubjectPublicKeyInfo DER.
-    pub spki_der: Bytes,
+    pub spki_der: SpkiDer,
 }
 
 /// Collection of trust anchors (typically self-signed root CAs) — either
@@ -80,7 +114,7 @@ impl TrustStore {
     }
 
     /// Add a subject+SPKI-only trust anchor (see [`ComponentAnchor`]).
-    pub fn add_component_anchor(&mut self, subject_der: Bytes, spki_der: Bytes) {
+    pub fn add_component_anchor(&mut self, subject_der: SubjectDer, spki_der: SpkiDer) {
         self.component_anchors.push(ComponentAnchor { subject_der, spki_der });
     }
 
@@ -142,8 +176,8 @@ pub fn public_trust_store_from(native_certs: Vec<Bytes>) -> TrustStore {
     if store.is_empty() {
         for anchor in webpki_roots::TLS_SERVER_ROOTS {
             store.add_component_anchor(
-                Bytes::copy_from_slice(anchor.subject.as_ref()),
-                Bytes::copy_from_slice(anchor.subject_public_key_info.as_ref()),
+                SubjectDer::from_bytes(Bytes::copy_from_slice(anchor.subject.as_ref())),
+                SpkiDer::from_bytes(Bytes::copy_from_slice(anchor.subject_public_key_info.as_ref())),
             );
         }
     }
@@ -196,8 +230,8 @@ pub fn verify_server_chain(
             full_der: Some(&a.der),
         })
         .chain(store.component_anchors().iter().map(|a| AnchorRef {
-            subject_der: &a.subject_der,
-            spki_der: &a.spki_der,
+            subject_der: a.subject_der.as_bytes(),
+            spki_der: a.spki_der.as_bytes(),
             full_der: None,
         }))
         .collect();
@@ -403,7 +437,10 @@ mod tests {
 
         let parsed_root = parse_certificate(root.der()).unwrap();
         let mut store = TrustStore::new();
-        store.add_component_anchor(parsed_root.subject_der.clone(), parsed_root.spki_der.clone());
+        store.add_component_anchor(
+            SubjectDer::from_bytes(parsed_root.subject_der.clone()),
+            SpkiDer::from_bytes(parsed_root.spki_der.clone()),
+        );
 
         store
             .verify_server_chain(&[Bytes::copy_from_slice(leaf.der())], Some("secure.example"))

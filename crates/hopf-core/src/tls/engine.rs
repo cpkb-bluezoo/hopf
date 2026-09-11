@@ -20,7 +20,8 @@ use super::handshake::{
     compute_psk_binder, derive_application_traffic_with_psk, derive_early_traffic,
     derive_handshake_traffic_with_psk, derive_resumption_master_secret, derive_resumption_psk,
     key_update_request, ApplicationTrafficSecrets, ClientHelloParams, HandshakeMessage,
-    HandshakeTrafficSecrets, HandshakeType, KeyShareEntry, OfferedPsk, Transcript,
+    HandshakeTrafficSecrets, HandshakeType, KeyShareEntry, OfferedPsk, PskSecret, ResumptionMasterSecret,
+    TrafficSecret, Transcript, TranscriptHash,
 };
 use super::handshake::collect::{MessageCollector, ParsedIncoming};
 use super::handshake::parser::{HandshakeEvents, HandshakeParser};
@@ -301,13 +302,13 @@ pub struct HandshakeEngine {
     /// so a later `KeyUpdate` (RFC 8446 §4.6.3/§7.2) has something to
     /// ratchet forward. Named by role-relative direction, not
     /// client/server, so the ratchet logic itself never branches on role.
-    own_app_secret: Option<[u8; 32]>,
+    own_app_secret: Option<TrafficSecret>,
     /// The peer's application traffic secret, same lifetime/purpose as
     /// [`Self::own_app_secret`] but for the receive direction.
-    peer_app_secret: Option<[u8; 32]>,
-    early_client_secret: Option<[u8; 32]>,
+    peer_app_secret: Option<TrafficSecret>,
+    early_client_secret: Option<TrafficSecret>,
     /// Resumption PSK in use for this handshake (if any).
-    psk: Option<[u8; 32]>,
+    psk: Option<PskSecret>,
     /// True when this handshake is PSK-resumption (omit Certificate).
     resumed: bool,
     /// Client offered early data; server may accept.
@@ -315,7 +316,7 @@ pub struct HandshakeEngine {
     /// Server accepted early data (echoed in EE).
     early_data_accepted: bool,
     /// Resumption master secret retained until NST is minted / stored.
-    resumption_master: Option<[u8; 32]>,
+    resumption_master: Option<ResumptionMasterSecret>,
     negotiated_alpn: Option<Bytes>,
     /// ALPN from the ticket offered in ClientHello (client role; for EE check).
     offered_ticket_alpn: Option<Bytes>,
@@ -342,7 +343,7 @@ pub struct HandshakeEngine {
     /// input) — needed verbatim in `on_client_finished` since the
     /// transcript may have grown further by then (an mTLS client
     /// Certificate/CertificateVerify response), which must not affect it.
-    server_finished_hash: Option<[u8; 32]>,
+    server_finished_hash: Option<TranscriptHash>,
     /// Negotiated AEAD (client: from `ServerHello`; server: selected in
     /// `on_client_hello`, before anything that needs it — including 0-RTT
     /// key installation). Threaded into every `*_keys_ready` callback and
@@ -387,11 +388,11 @@ enum State {
 
 /// RFC 8446 §7.2: `application_traffic_secret_N+1 = HKDF-Expand-Label(
 /// application_traffic_secret_N, "traffic upd", "", Hash.length)`.
-fn ratchet_application_secret(secret: &[u8; 32]) -> [u8; 32] {
-    let out = expand_label(secret, "traffic upd", &[], 32);
+fn ratchet_application_secret(secret: &TrafficSecret) -> TrafficSecret {
+    let out = expand_label(secret.as_bytes(), "traffic upd", &[], 32);
     let mut buf = [0u8; 32];
     buf.copy_from_slice(out.as_ref());
-    buf
+    TrafficSecret::from_bytes(buf)
 }
 
 impl HandshakeEngine {
@@ -678,7 +679,9 @@ impl HandshakeEngine {
         };
 
         let hello = if let Some(psk) = self.psk {
-            build_client_hello_with_binder(params, |hash| compute_psk_binder(&psk, hash, dtls))
+            build_client_hello_with_binder(params, |hash| {
+                compute_psk_binder(&psk, &TranscriptHash::from_bytes(*hash), dtls)
+            })
         } else {
             build_client_hello(&params)
         };
@@ -691,7 +694,7 @@ impl HandshakeEngine {
                     let d = digest(&SHA256, &wire);
                     let mut out = [0u8; 32];
                     out.copy_from_slice(d.as_ref());
-                    out
+                    TranscriptHash::from_bytes(out)
                 };
                 let early = derive_early_traffic(&psk, &ch_hash, dtls);
                 self.early_client_secret = Some(early.client);
@@ -707,7 +710,7 @@ impl HandshakeEngine {
                 // this crate's own top preference.
                 let early_aead = Tls13Aead::from_suite(SUPPORTED_CIPHER_SUITES[0])
                     .expect("SUPPORTED_CIPHER_SUITES[0] is always a supported suite");
-                sink.quic_early_keys_ready(early_aead, early.client);
+                sink.quic_early_keys_ready(early_aead, *early.client.as_bytes());
                 if let Some(limits) = ticket
                     .as_ref()
                     .and_then(|t| t.remembered_peer_limits)
@@ -767,7 +770,7 @@ impl HandshakeEngine {
             self.config.mode == HandshakeMode::Dtls,
         ));
         if let Some(traffic) = self.handshake_traffic.as_ref() {
-            sink.quic_handshake_keys_ready(aead, traffic.client, traffic.server);
+            sink.quic_handshake_keys_ready(aead, *traffic.client.as_bytes(), *traffic.server.as_bytes());
         }
         self.state = State::ReadingServerFlight;
         true
@@ -1081,7 +1084,7 @@ impl HandshakeEngine {
         let aead = self.negotiated_aead.expect("cipher suite negotiated before Complete");
         let new_secret = ratchet_application_secret(&secret);
         self.peer_app_secret = Some(new_secret);
-        sink.application_traffic_key_updated(aead, KeyUpdateDirection::Read, new_secret);
+        sink.application_traffic_key_updated(aead, KeyUpdateDirection::Read, *new_secret.as_bytes());
         // RFC 8446 §4.6.3: a reciprocal update MUST go out before any
         // further application data — this engine controls all outbound
         // handshake_data_ready ordering, so doing it synchronously here
@@ -1105,7 +1108,7 @@ impl HandshakeEngine {
         let aead = self.negotiated_aead.expect("cipher suite negotiated before Complete");
         let new_secret = ratchet_application_secret(&secret);
         self.own_app_secret = Some(new_secret);
-        sink.application_traffic_key_updated(aead, KeyUpdateDirection::Write, new_secret);
+        sink.application_traffic_key_updated(aead, KeyUpdateDirection::Write, *new_secret.as_bytes());
     }
 
     /// Request that this connection's own application traffic key rotate
@@ -1142,7 +1145,7 @@ impl HandshakeEngine {
             let d = digest(&SHA256, &ch1_encoded);
             let mut out = [0u8; 32];
             out.copy_from_slice(d.as_ref());
-            out
+            TranscriptHash::from_bytes(out)
         };
         self.transcript.retry(ch1_hash);
         let hrr = build_hello_retry_request(
@@ -1197,7 +1200,7 @@ impl HandshakeEngine {
                         let d = digest(&SHA256, truncated);
                         let mut out = [0u8; 32];
                         out.copy_from_slice(d.as_ref());
-                        out
+                        TranscriptHash::from_bytes(out)
                     };
                     let expected = compute_psk_binder(&payload.psk, &trunc_hash, dtls);
                     if binder.as_ref() == expected {
@@ -1247,12 +1250,12 @@ impl HandshakeEngine {
                                         let d = digest(&SHA256, &encoded);
                                         let mut out = [0u8; 32];
                                         out.copy_from_slice(d.as_ref());
-                                        out
+                                        TranscriptHash::from_bytes(out)
                                     };
                                     let early = derive_early_traffic(&payload.psk, &ch_hash, dtls);
                                     self.early_client_secret = Some(early.client);
                                     self.early_data_accepted = true;
-                                    sink.quic_early_keys_ready(aead, early.client);
+                                    sink.quic_early_keys_ready(aead, *early.client.as_bytes());
                                 }
                             }
                         }
@@ -1313,7 +1316,7 @@ impl HandshakeEngine {
             dtls,
         ));
         if let Some(traffic) = self.handshake_traffic.as_ref() {
-            sink.quic_handshake_keys_ready(aead, traffic.client, traffic.server);
+            sink.quic_handshake_keys_ready(aead, *traffic.client.as_bytes(), *traffic.server.as_bytes());
         }
 
         if ch.server_name.is_some() {
@@ -1533,7 +1536,7 @@ impl HandshakeEngine {
             }
         }
         if let Some(a) = app.as_ref() {
-            sink.application_traffic_keys_ready(aead, a.client, a.server);
+            sink.application_traffic_keys_ready(aead, *a.client.as_bytes(), *a.server.as_bytes());
             let (own, peer) = match self.config.role {
                 HandshakeRole::Client => (a.client, a.server),
                 HandshakeRole::Server => (a.server, a.client),
@@ -1545,11 +1548,11 @@ impl HandshakeEngine {
         let quic = match self.config.mode {
             HandshakeMode::Quic => Some(QuicSecrets {
                 aead,
-                client_handshake_traffic_secret: client_hs,
-                server_handshake_traffic_secret: server_hs,
-                client_application_traffic_secret: app.as_ref().map(|a| a.client),
-                server_application_traffic_secret: app.as_ref().map(|a| a.server),
-                client_early_traffic_secret: early,
+                client_handshake_traffic_secret: *client_hs.as_bytes(),
+                server_handshake_traffic_secret: *server_hs.as_bytes(),
+                client_application_traffic_secret: app.as_ref().map(|a| *a.client.as_bytes()),
+                server_application_traffic_secret: app.as_ref().map(|a| *a.server.as_bytes()),
+                client_early_traffic_secret: early.map(|e| *e.as_bytes()),
             }),
             HandshakeMode::TcpRecordLayer | HandshakeMode::Dtls => None,
         };

@@ -1150,8 +1150,8 @@ fn dot_connection_pool_reuses_a_connection_across_queries() {
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
     std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
 
-    let acceptor = hopf_tls::acceptor_from_pem(&cert_path, &key_path, &[b"dot"]).unwrap();
-    let connector = hopf_tls::connector_from_pem(&cert_path, &[b"dot"]).unwrap();
+    let acceptor = hopf_core::acceptor_from_pem(&cert_path, &key_path, &[b"dot"]).unwrap();
+    let connector = hopf_core::connector_from_pem(&cert_path, &[b"dot"]).unwrap();
 
     struct DotStub {
         connect_count: Arc<AtomicUsize>,
@@ -1423,8 +1423,8 @@ fn doh_get_and_post_round_trip_over_a_real_tls_http_stub() {
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
     std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
 
-    let acceptor = hopf_tls::acceptor_from_pem(&cert_path, &key_path, &[b"http/1.1"]).unwrap();
-    let connector = hopf_tls::connector_from_pem(&cert_path, &[b"http/1.1"]).unwrap();
+    let acceptor = hopf_core::acceptor_from_pem(&cert_path, &key_path, &[b"http/1.1"]).unwrap();
+    let connector = hopf_core::connector_from_pem(&cert_path, &[b"http/1.1"]).unwrap();
 
     struct DohStubHandler {
         buf: Vec<u8>,
@@ -1574,8 +1574,8 @@ fn resolver_queries_a_real_dot_server_end_to_end() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let (cert_path, key_path) = write_self_signed_pem("resolver-dot-test");
-    let acceptor = hopf_tls::acceptor_from_pem(&cert_path, &key_path, &[b"dot"]).unwrap();
-    let connector = hopf_tls::connector_from_pem(&cert_path, &[b"dot"]).unwrap();
+    let acceptor = hopf_core::acceptor_from_pem(&cert_path, &key_path, &[b"dot"]).unwrap();
+    let connector = hopf_core::connector_from_pem(&cert_path, &[b"dot"]).unwrap();
 
     let hits = Arc::new(AtomicUsize::new(0));
     let hits2 = Arc::clone(&hits);
@@ -1726,8 +1726,8 @@ fn resolver_queries_a_real_doh_server_end_to_end() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let (cert_path, key_path) = write_self_signed_pem("resolver-doh-test");
-    let acceptor = hopf_tls::acceptor_from_pem(&cert_path, &key_path, &[b"http/1.1"]).unwrap();
-    let connector = hopf_tls::connector_from_pem(&cert_path, &[b"http/1.1"]).unwrap();
+    let acceptor = hopf_core::acceptor_from_pem(&cert_path, &key_path, &[b"http/1.1"]).unwrap();
+    let connector = hopf_core::connector_from_pem(&cert_path, &[b"http/1.1"]).unwrap();
 
     struct DohStubHandler {
         buf: Vec<u8>,

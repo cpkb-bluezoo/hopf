@@ -17,7 +17,9 @@ pub use collect::{
 pub use key_schedule::{
     compute_finished_verify_data, compute_psk_binder,
     derive_application_traffic_with_psk, derive_early_traffic,
-    derive_handshake_traffic_with_psk, derive_resumption_master_secret, derive_resumption_psk, ApplicationTrafficSecrets, HandshakeTrafficSecrets,
+    derive_handshake_traffic_with_psk, derive_resumption_master_secret, derive_resumption_psk,
+    ApplicationTrafficSecrets, HandshakeTrafficSecrets, PskSecret,
+    ResumptionMasterSecret, TrafficSecret, TranscriptHash,
 };
 pub use messages::{
     build_certificate, build_certificate_request, build_certificate_verify, build_client_hello,

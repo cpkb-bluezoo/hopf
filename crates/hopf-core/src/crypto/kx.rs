@@ -350,7 +350,11 @@ impl HybridKeyPair {
             .decapsulate(pq.into())
             .map_err(|_| Unspecified)?;
         let x_secret = self.classical.agree(classical)?;
-        Ok(combine_hybrid_secret(pq_secret.as_ref(), x_secret.as_ref(), self.group.pq_first()))
+        Ok(combine_hybrid_secret(
+            PqSharedSecret(pq_secret.as_ref()),
+            ClassicalSharedSecret(x_secret.as_ref()),
+            self.group.pq_first(),
+        ))
     }
 }
 
@@ -379,7 +383,11 @@ pub fn server_agree_hybrid(group: NamedGroup, client_share: &[u8]) -> Result<(By
         server_share.extend_from_slice(&server_classical_pub);
         server_share.extend_from_slice(ciphertext.as_ref());
     }
-    let shared = combine_hybrid_secret(pq_secret.as_ref(), x_secret.as_ref(), group.pq_first());
+    let shared = combine_hybrid_secret(
+        PqSharedSecret(pq_secret.as_ref()),
+        ClassicalSharedSecret(x_secret.as_ref()),
+        group.pq_first(),
+    );
     Ok((server_share.freeze(), shared))
 }
 
@@ -443,20 +451,29 @@ pub fn server_agree(group: NamedGroup, client_share: &[u8]) -> Result<(Bytes, By
     }
 }
 
+/// The post-quantum (ML-KEM) half of a hybrid key-exchange shared secret.
+/// A distinct type from [`ClassicalSharedSecret`] so the two halves can't
+/// be transposed when calling `combine_hybrid_secret`.
+struct PqSharedSecret<'a>(&'a [u8]);
+
+/// The classical (ECDH) half of a hybrid key-exchange shared secret. See
+/// [`PqSharedSecret`].
+struct ClassicalSharedSecret<'a>(&'a [u8]);
+
 /// Concatenate the ML-KEM and classical shared secrets in `group`'s own
 /// combiner order (matches its wire concatenation order — RFC 10024
 /// keeps the two consistent per group, even though `X25519MLKEM768`'s
 /// order differs from the other two groups'). Each half's length is
 /// already fixed by the `aws-lc-rs` algorithm that produced it, so
 /// there's nothing to validate here.
-fn combine_hybrid_secret(pq: &[u8], classical: &[u8], pq_first: bool) -> Bytes {
-    let mut out = BytesMut::with_capacity(pq.len() + classical.len());
+fn combine_hybrid_secret(pq: PqSharedSecret<'_>, classical: ClassicalSharedSecret<'_>, pq_first: bool) -> Bytes {
+    let mut out = BytesMut::with_capacity(pq.0.len() + classical.0.len());
     if pq_first {
-        out.extend_from_slice(pq);
-        out.extend_from_slice(classical);
+        out.extend_from_slice(pq.0);
+        out.extend_from_slice(classical.0);
     } else {
-        out.extend_from_slice(classical);
-        out.extend_from_slice(pq);
+        out.extend_from_slice(classical.0);
+        out.extend_from_slice(pq.0);
     }
     out.freeze()
 }

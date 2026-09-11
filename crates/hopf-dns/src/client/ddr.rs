@@ -19,7 +19,7 @@
 //!   all): cached as confirmed-absent.
 //! - A real SVCB answer: each candidate transport it advertises is
 //!   *dialled and its certificate validated* against the public WebPKI
-//!   (see `hopf_tls::client_config_public_trust`/
+//!   (see `hopf_core::public_trust_connector`/
 //!   `hopf_quic::client_config_public_trust`) before ever being promoted —
 //!   the discovery query itself travelled over plain UDP, so an on-path
 //!   attacker could otherwise forge a response redirecting to a malicious
@@ -309,9 +309,7 @@ fn spawn_validation(inner: &Arc<std::sync::Mutex<ResolverInner>>, server: Socket
 /// small, valid, harmless query, so there's no need to build another one.
 #[cfg(feature = "dot")]
 fn validate_dot(candidate: &Candidate) -> bool {
-    let Ok(connector) = hopf_tls::public_trust_connector(&[b"dot"]) else {
-        return false;
-    };
+    let connector = hopf_core::public_trust_connector(&[b"dot"]);
     let mut pool = TcpDnsConnectionPool::new();
     let probe = DnsQuestion::in_class(DDR_QNAME, DnsType::Svcb);
     pool.query_dot(candidate.details.target, &candidate.details.sni, &connector, &probe, 1)

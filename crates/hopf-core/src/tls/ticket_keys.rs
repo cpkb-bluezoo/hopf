@@ -16,12 +16,40 @@
 //! policy, not something a synchronous handshake engine should own (see
 //! `crypto-migration-plan.md`'s RFC 9325 entry for the fuller reasoning).
 
+/// A server's local ticket-encryption key (AES-128-GCM sealing/opening of
+/// session tickets) — distinct from the protocol-derived secrets
+/// (`ResumptionMasterSecret`, `PskSecret`) that get sealed inside a
+/// ticket, so `mint_new_session_ticket`/`open_ticket` can't have the two
+/// transposed: sealing a ticket under protocol secret material, or
+/// deriving a PSK from the local ticket key, would both be silent,
+/// exploitable mistakes rather than compiler errors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TicketKey([u8; 32]);
+
+impl TicketKey {
+    /// Wrap a raw 32-byte ticket key.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Raw key octets.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for TicketKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TicketKey(..)")
+    }
+}
+
 /// A ticket-encryption key plus the one key rotated away from most
 /// recently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TicketKeys {
-    current: [u8; 32],
-    previous: Option<[u8; 32]>,
+    current: TicketKey,
+    previous: Option<TicketKey>,
 }
 
 impl TicketKeys {
@@ -29,16 +57,16 @@ impl TicketKeys {
     /// bare `[u8; 32]` config field for every caller that doesn't need
     /// rotation.
     pub fn single(key: [u8; 32]) -> Self {
-        Self { current: key, previous: None }
+        Self { current: TicketKey::from_bytes(key), previous: None }
     }
 
     /// The key new tickets are sealed under.
-    pub fn current(&self) -> &[u8; 32] {
+    pub fn current(&self) -> &TicketKey {
         &self.current
     }
 
     /// Every key worth trying to decrypt a ticket against, current first.
-    pub fn decrypt_candidates(&self) -> impl Iterator<Item = &[u8; 32]> {
+    pub fn decrypt_candidates(&self) -> impl Iterator<Item = &TicketKey> {
         std::iter::once(&self.current).chain(self.previous.iter())
     }
 
@@ -46,7 +74,7 @@ impl TicketKeys {
     /// becomes the (single) key still accepted for decryption, and
     /// whatever was accepted before that is dropped.
     pub fn rotate(&mut self, new_key: [u8; 32]) {
-        self.previous = Some(std::mem::replace(&mut self.current, new_key));
+        self.previous = Some(std::mem::replace(&mut self.current, TicketKey::from_bytes(new_key)));
     }
 }
 
@@ -57,24 +85,27 @@ mod tests {
     #[test]
     fn single_only_offers_the_one_key() {
         let keys = TicketKeys::single([1u8; 32]);
-        assert_eq!(keys.current(), &[1u8; 32]);
-        assert_eq!(keys.decrypt_candidates().collect::<Vec<_>>(), vec![&[1u8; 32]]);
+        assert_eq!(keys.current().as_bytes(), &[1u8; 32]);
+        assert_eq!(
+            keys.decrypt_candidates().map(TicketKey::as_bytes).collect::<Vec<_>>(),
+            vec![&[1u8; 32]]
+        );
     }
 
     #[test]
     fn rotate_keeps_exactly_the_immediately_prior_key() {
         let mut keys = TicketKeys::single([1u8; 32]);
         keys.rotate([2u8; 32]);
-        assert_eq!(keys.current(), &[2u8; 32]);
+        assert_eq!(keys.current().as_bytes(), &[2u8; 32]);
         assert_eq!(
-            keys.decrypt_candidates().collect::<Vec<_>>(),
+            keys.decrypt_candidates().map(TicketKey::as_bytes).collect::<Vec<_>>(),
             vec![&[2u8; 32], &[1u8; 32]],
             "must still accept tickets sealed under the just-rotated-away key"
         );
 
         keys.rotate([3u8; 32]);
         assert_eq!(
-            keys.decrypt_candidates().collect::<Vec<_>>(),
+            keys.decrypt_candidates().map(TicketKey::as_bytes).collect::<Vec<_>>(),
             vec![&[3u8; 32], &[2u8; 32]],
             "a second rotation must drop the now-two-generations-old key"
         );

@@ -78,7 +78,7 @@ fn start_server(root: &std::path::Path) -> (Arc<Runtime>, SocketAddr) {
 fn tls_pair(
     dir: &tempfile::TempDir,
 ) -> (hopf_core::tls::SharedTlsAcceptor, hopf_core::SharedTlsConnector) {
-    use hopf_tls::{acceptor_from_pem, connector_from_pem};
+    use hopf_core::{acceptor_from_pem, connector_from_pem};
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_path = dir.path().join("cert.pem");
     let key_path = dir.path().join("key.pem");

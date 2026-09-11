@@ -32,7 +32,7 @@ use super::engine::{Dtls12Config, Dtls12RecordEngine};
 use crate::dtls::DtlsRecordSink;
 use crate::security::SecurityInfo;
 use crate::tls::tls12::engine::Role;
-use crate::tls::{ServerCredentials, Tls12Config, TlsProtocolError, VerifyRequest, VerifyResult};
+use crate::tls::{ServerCredentials, Tls12Config, TlsProtocolError, VerifyRequest};
 
 const OVERALL_DEADLINE: Duration = Duration::from_secs(10);
 const RECV_POLL: Duration = Duration::from_millis(100);

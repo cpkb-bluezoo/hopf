@@ -18,9 +18,9 @@ autotests = false
 [features]
 default = []
 server = []
-dot = ["dep:hopf-tls"]
+dot = []
 doq = ["dep:hopf-quic"]
-doh = ["dep:hopf-tls"]
+doh = []
 # `ed448-goldilocks-plus` (for Ed448 DNSSEC signatures, RFC 8080) pulls in
 # rand_core 0.10.1, which needs rustc 1.85+ — matching this workspace's
 # declared rust-version. The alternative crate that fits
@@ -32,7 +32,7 @@ dnssec = ["hopf-core/ed448"]
 # independent of `dnssec` (this crate's caller is responsible for only
 # trusting TLSA records it already validated, e.g. via the `dnssec`
 # feature's `DnsResolver::validate_chain_of_trust`).
-dane = ["dep:rustls"]
+dane = []
 # Local UDP stub ↔ resolver smokes (`tests/`); not compiled in CI `--lib`.
 integration = []
 
@@ -43,9 +43,7 @@ getrandom = { workspace = true }
 sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
-hopf-tls = { workspace = true, optional = true }
 hopf-quic = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

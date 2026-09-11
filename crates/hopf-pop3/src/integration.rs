@@ -405,7 +405,7 @@ fn client_localhost_hostname_dial() {
 /// Explicit STLS upgrade against a TLS-capable Pop3Service.
 #[test]
 fn client_stls_fetch() {
-    use hopf_tls::{acceptor_from_pem, connector_from_pem};
+    use hopf_core::{acceptor_from_pem, connector_from_pem};
 
     let dir = tempfile::tempdir().unwrap();
     let factory = Arc::new(MaildirFactory::new(dir.path()));

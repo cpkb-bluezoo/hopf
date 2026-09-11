@@ -6,6 +6,8 @@ use bytes::BytesMut;
 
 use crate::crypto::{hash, HashAlgorithm};
 
+use super::key_schedule::TranscriptHash;
+
 /// Running transcript for Derive-Secret inputs.
 #[derive(Debug, Default, Clone)]
 pub struct Transcript {
@@ -24,8 +26,8 @@ impl Transcript {
     }
 
     /// Transcript-Hash = Hash(messages).
-    pub fn hash(&self) -> [u8; 32] {
-        hash(HashAlgorithm::Sha256, &self.messages).as_bytes().try_into().unwrap()
+    pub fn hash(&self) -> TranscriptHash {
+        TranscriptHash::from_bytes(hash(HashAlgorithm::Sha256, &self.messages).as_bytes().try_into().unwrap())
     }
 
     /// RFC 8446 §4.4.1: when a `HelloRetryRequest` happens, the transcript
@@ -36,9 +38,9 @@ impl Transcript {
     /// with nothing but `ClientHello1` added so far (`ch1_hash` is that
     /// message's own hash, computed by the caller); the `HelloRetryRequest`
     /// and the followup `ClientHello2` are appended normally afterwards.
-    pub fn retry(&mut self, ch1_hash: [u8; 32]) {
+    pub fn retry(&mut self, ch1_hash: TranscriptHash) {
         self.messages.clear();
         self.messages.extend_from_slice(&[254, 0, 0, 32]);
-        self.messages.extend_from_slice(&ch1_hash);
+        self.messages.extend_from_slice(ch1_hash.as_bytes());
     }
 }

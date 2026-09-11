@@ -1488,13 +1488,14 @@ fn dispatch_auto_transport(
 /// Lazily build (and thereafter reuse) a [`hopf_core::SharedTlsConnector`]
 /// trusting the public WebPKI, for dialling an auto-mode server's
 /// dynamically-selected DoT capability — built once per resolver rather
-/// than per query, since [`hopf_tls::public_trust_connector`] reads the
-/// OS trust store. `None` means the one build attempt failed; the caller
-/// then falls back to plain UDP/TCP for this query.
+/// than per query, since [`hopf_core::public_trust_connector`] reads the
+/// OS trust store. Wrapped in `Option` purely as a build-once-and-cache
+/// memo, not a fallibility signal — the connector itself never fails to
+/// construct.
 #[cfg(feature = "dot")]
 fn public_trust_dot_connector(g: &mut ResolverInner) -> Option<hopf_core::SharedTlsConnector> {
     if g.public_trust_dot_connector.is_none() {
-        g.public_trust_dot_connector = hopf_tls::public_trust_connector(&[b"dot"]).ok();
+        g.public_trust_dot_connector = Some(hopf_core::public_trust_connector(&[b"dot"]));
     }
     g.public_trust_dot_connector.clone()
 }
@@ -2100,7 +2101,7 @@ mod tests {
             addr,
             transport: ServerTransport::Dot {
                 server_name: "dot.example".into(),
-                connector: hopf_tls::insecure_connector(&[]),
+                connector: hopf_core::insecure_connector(&[]),
             },
             auto,
         };
@@ -2376,7 +2377,7 @@ mod tests {
         // above) so its UDP socket is genuinely open — the second
         // server's dispatch below is plain UDP, which needs it.
         let resolver = DnsResolver::for_reactor(rt.pick_worker().clone()).unwrap();
-        resolver.add_server_dot(addr, "dot.example", hopf_tls::insecure_connector(&[]));
+        resolver.add_server_dot(addr, "dot.example", hopf_core::insecure_connector(&[]));
         resolver.add_server(second_addr);
         let inner = Arc::clone(&resolver.inner);
 

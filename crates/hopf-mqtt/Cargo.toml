@@ -25,7 +25,6 @@ integration = []
 [dependencies]
 hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
-hopf-tls = { workspace = true }
 hopf-dns = { workspace = true }
 hopf-otel = { workspace = true }
 hopf-websocket = { workspace = true, optional = true }

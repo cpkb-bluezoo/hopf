@@ -5,7 +5,7 @@
 //!
 //! This decides *whether* DANE applies to a given MX host and, if so,
 //! *which* TLSA records to authenticate against — the actual certificate
-//! matching is [`hopf_dns::dane::DaneServerCertVerifier`] (issue #352);
+//! matching is [`hopf_dns::dane::verify_dane_chain`] (issue #352);
 //! DNSSEC validation is `hopf_dns`'s existing `dnssec` module. This is the
 //! RFC 7672 §2.1-2.2 policy glue between the two, kept separate from
 //! [`super::handler`] so the classification itself — the part a bug would

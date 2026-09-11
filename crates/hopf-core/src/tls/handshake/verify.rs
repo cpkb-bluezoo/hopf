@@ -12,6 +12,8 @@ use crate::crypto::signature::{
     EcdsaP256PrivateKey, EcdsaP384PrivateKey, Ed25519PrivateKey, RsaPrivateKey,
 };
 
+use super::key_schedule::TranscriptHash;
+
 /// IANA `SignatureScheme` for Ed25519 (RFC 8446 §4.2.3).
 pub const SIG_ED25519: u16 = 0x0807;
 /// IANA `SignatureScheme` for ECDSA P-256 + SHA-256 (RFC 8446 §4.2.3).
@@ -34,7 +36,7 @@ pub const SUPPORTED_SIGNATURE_SCHEMES: &[u16] = &[
 ];
 
 /// Build the signed payload for CertificateVerify.
-pub fn certificate_verify_message(is_client: bool, transcript_hash: &[u8; 32]) -> Bytes {
+pub fn certificate_verify_message(is_client: bool, transcript_hash: &TranscriptHash) -> Bytes {
     let context = if is_client {
         b"TLS 1.3, client CertificateVerify"
     } else {
@@ -44,7 +46,7 @@ pub fn certificate_verify_message(is_client: bool, transcript_hash: &[u8; 32]) -
     out.extend(core::iter::repeat_n(0x20u8, 64));
     out.extend_from_slice(context);
     out.extend_from_slice(&[0]);
-    out.extend_from_slice(transcript_hash);
+    out.extend_from_slice(transcript_hash.as_bytes());
     out.freeze()
 }
 
@@ -55,7 +57,7 @@ pub fn certificate_verify_message(is_client: bool, transcript_hash: &[u8; 32]) -
 pub fn sign_certificate_verify(
     is_client: bool,
     signing_key_pkcs8: &[u8],
-    transcript_hash: &[u8; 32],
+    transcript_hash: &TranscriptHash,
 ) -> Option<(u16, Bytes)> {
     let msg = certificate_verify_message(is_client, transcript_hash);
     match pkcs8_key_kind(signing_key_pkcs8)? {
@@ -84,7 +86,7 @@ pub fn verify_certificate_verify(
     leaf_cert_der: &[u8],
     scheme: u16,
     signature: &[u8],
-    transcript_hash: &[u8; 32],
+    transcript_hash: &TranscriptHash,
 ) -> bool {
     let Some(spki) = extract_spki(leaf_cert_der) else {
         return false;
@@ -161,7 +163,7 @@ mod tests {
     fn ed25519_certificate_verify_roundtrip() {
         let doc = Ed25519PrivateKey::generate_pkcs8().unwrap();
         let key = Ed25519PrivateKey::from_pkcs8(&doc).unwrap();
-        let th = [0xabu8; 32];
+        let th = TranscriptHash::from_bytes([0xabu8; 32]);
         let (scheme, sig) = sign_certificate_verify(false, &doc, &th).expect("Ed25519 key recognized");
         assert_eq!(scheme, SIG_ED25519);
         let msg = certificate_verify_message(false, &th);

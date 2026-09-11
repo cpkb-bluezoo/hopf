@@ -14,9 +14,10 @@ use aws_lc_rs::digest::{digest, SHA256};
 use bytes::{BufMut, Bytes, BytesMut};
 use getrandom::getrandom;
 
-use super::key_schedule::derive_resumption_psk;
+use super::key_schedule::{derive_resumption_psk, PskSecret, ResumptionMasterSecret};
 use super::messages::{build_new_session_ticket, HandshakeMessage};
 use super::transport_params::RememberedTransportLimits;
+use crate::tls::ticket_keys::TicketKey;
 
 /// Lifetime advertised in NewSessionTicket (seconds).
 pub const TICKET_LIFETIME_SECS: u32 = 24 * 60 * 60;
@@ -34,7 +35,7 @@ pub struct StoredTicket {
     /// Opaque ticket identity presented in `pre_shared_key`.
     pub identity: Bytes,
     /// Resumption PSK (32 bytes).
-    pub psk: [u8; 32],
+    pub psk: PskSecret,
     /// Max early data from the ticket's `early_data` extension (0 = no 0-RTT).
     pub max_early_data_size: u32,
     /// ALPN negotiated when the ticket was issued.
@@ -136,7 +137,7 @@ pub struct TicketPayload {
     /// `ticket_age_add` so the server can recover age without trusting the client.
     pub ticket_age_add: u32,
     /// Resumption PSK.
-    pub psk: [u8; 32],
+    pub psk: PskSecret,
     /// Max early data size.
     pub max_early_data_size: u32,
     /// ALPN at issue time.
@@ -146,8 +147,8 @@ pub struct TicketPayload {
 }
 
 /// Seal a ticket with the server's 32-byte ticket key (AES-128-GCM; first 16 bytes of key).
-pub fn seal_ticket(ticket_key: &[u8; 32], payload: &TicketPayload) -> Option<Bytes> {
-    let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &ticket_key[..16]).ok()?);
+pub fn seal_ticket(ticket_key: &TicketKey, payload: &TicketPayload) -> Option<Bytes> {
+    let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &ticket_key.as_bytes()[..16]).ok()?);
     let mut nonce_bytes = [0u8; 12];
     getrandom(&mut nonce_bytes).ok()?;
     let mut plain = BytesMut::with_capacity(1 + 8 + 4 + 4 + 4 + 2 + payload.alpn.len() + 32 + 56);
@@ -158,7 +159,7 @@ pub fn seal_ticket(ticket_key: &[u8; 32], payload: &TicketPayload) -> Option<Byt
     plain.put_u32(payload.max_early_data_size);
     plain.put_u16(payload.alpn.len() as u16);
     plain.extend_from_slice(&payload.alpn);
-    plain.extend_from_slice(&payload.psk);
+    plain.extend_from_slice(payload.psk.as_bytes());
     if let Some(limits) = &payload.remembered_limits {
         plain.extend_from_slice(&limits.encode_fixed());
     } else {
@@ -176,11 +177,11 @@ pub fn seal_ticket(ticket_key: &[u8; 32], payload: &TicketPayload) -> Option<Byt
 }
 
 /// Open an opaque ticket sealed by [`seal_ticket`].
-pub fn open_ticket(ticket_key: &[u8; 32], identity: &[u8]) -> Option<TicketPayload> {
+pub fn open_ticket(ticket_key: &TicketKey, identity: &[u8]) -> Option<TicketPayload> {
     if identity.len() < 12 + 16 {
         return None;
     }
-    let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &ticket_key[..16]).ok()?);
+    let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &ticket_key.as_bytes()[..16]).ok()?);
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes.copy_from_slice(&identity[..12]);
     let mut buf = identity[12..].to_vec();
@@ -210,6 +211,7 @@ pub fn open_ticket(ticket_key: &[u8; 32], identity: &[u8]) -> Option<TicketPaylo
     let alpn = Bytes::copy_from_slice(&plain[23..23 + alpn_len]);
     let mut psk = [0u8; 32];
     psk.copy_from_slice(&plain[23 + alpn_len..23 + alpn_len + 32]);
+    let psk = PskSecret::from_bytes(psk);
     let remembered_limits = if version == TICKET_PAYLOAD_VERSION {
         let tail = &plain[23 + alpn_len + 32..];
         RememberedTransportLimits::decode_fixed(tail)
@@ -284,8 +286,8 @@ impl AntiReplay {
 
 /// Mint a NewSessionTicket message and the client-side [`StoredTicket`] material.
 pub fn mint_new_session_ticket(
-    ticket_key: &[u8; 32],
-    resumption_master: &[u8; 32],
+    ticket_key: &TicketKey,
+    resumption_master: &ResumptionMasterSecret,
     max_early_data_size: u32,
     alpn: &[u8],
     remembered_limits: Option<RememberedTransportLimits>,
@@ -336,12 +338,12 @@ mod tests {
 
     #[test]
     fn seal_open_roundtrip() {
-        let key = [0x55u8; 32];
+        let key = TicketKey::from_bytes([0x55u8; 32]);
         let payload = TicketPayload {
             issued_at_ms: 1_700_000_000_000,
             lifetime_secs: TICKET_LIFETIME_SECS,
             ticket_age_add: 0xdead_beef,
-            psk: [0xaau8; 32],
+            psk: PskSecret::from_bytes([0xaau8; 32]),
             max_early_data_size: u32::MAX,
             alpn: Bytes::from_static(b"hq-interop"),
             remembered_limits: Some(RememberedTransportLimits::default_missing()),
@@ -369,7 +371,7 @@ mod tests {
         let store = ClientTicketStore::new();
         let t = StoredTicket {
             identity: Bytes::from_static(b"id"),
-            psk: [1u8; 32],
+            psk: PskSecret::from_bytes([1u8; 32]),
             max_early_data_size: 100,
             alpn: Bytes::from_static(b"h3"),
             ticket_age_add: 42,
@@ -386,7 +388,7 @@ mod tests {
         let store = ClientTicketStore::new();
         let t = StoredTicket {
             identity: Bytes::from_static(b"id"),
-            psk: [1u8; 32],
+            psk: PskSecret::from_bytes([1u8; 32]),
             max_early_data_size: 100,
             alpn: Bytes::from_static(b"h3"),
             ticket_age_add: 1,

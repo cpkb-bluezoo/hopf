@@ -705,7 +705,7 @@ impl DeliveryContext {
                         (Some(build_dane_connector(records)), true, false)
                     }
                     dane::DaneUsability::NotUsable => {
-                        (Some(hopf_tls::insecure_connector(&[])), false, true)
+                        (Some(hopf_core::insecure_connector(&[])), false, true)
                     }
                 };
                 self.deliver_smtp(

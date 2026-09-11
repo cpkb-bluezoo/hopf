@@ -21,7 +21,7 @@ use hopf_auth::{
 };
 use hopf_core::retry::RetryPolicy;
 use hopf_core::{Runtime, RuntimeConfig};
-use hopf_tls::{acceptor_from_pem, connector_from_pem, insecure_connector};
+use hopf_core::{acceptor_from_pem, connector_from_pem, insecure_connector};
 
 use crate::{
     AcceptAllSmtpHandler, AcceptAllSmtpHandlerFactory, AuthenticateState, ConnectedState,

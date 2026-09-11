@@ -21,6 +21,7 @@ use bytes::{Bytes, BytesMut};
 use getrandom::getrandom;
 
 use super::messages::build_new_session_ticket;
+use crate::tls::ticket_keys::TicketKey;
 
 /// Lifetime advertised in `NewSessionTicket` (seconds) and enforced on open.
 pub const TICKET_LIFETIME_SECS: u32 = 24 * 60 * 60;
@@ -58,8 +59,8 @@ fn unix_now_ms() -> Option<u64> {
 }
 
 /// Seal a ticket with the server's 32-byte ticket key (AES-128-GCM; first 16 bytes of key).
-pub fn seal_ticket(ticket_key: &[u8; 32], payload: &Tls12TicketPayload) -> Option<Bytes> {
-    let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &ticket_key[..16]).ok()?);
+pub fn seal_ticket(ticket_key: &TicketKey, payload: &Tls12TicketPayload) -> Option<Bytes> {
+    let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &ticket_key.as_bytes()[..16]).ok()?);
     let mut nonce_bytes = [0u8; 12];
     getrandom(&mut nonce_bytes).ok()?;
     let mut plain = BytesMut::with_capacity(1 + 48 + 2 + 8 + 4);
@@ -80,11 +81,11 @@ pub fn seal_ticket(ticket_key: &[u8; 32], payload: &Tls12TicketPayload) -> Optio
 }
 
 /// Open an opaque ticket sealed by [`seal_ticket`].
-pub fn open_ticket(ticket_key: &[u8; 32], ticket: &[u8]) -> Option<Tls12TicketPayload> {
+pub fn open_ticket(ticket_key: &TicketKey, ticket: &[u8]) -> Option<Tls12TicketPayload> {
     if ticket.len() < 12 + 16 {
         return None;
     }
-    let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &ticket_key[..16]).ok()?);
+    let key = LessSafeKey::new(UnboundKey::new(&AES_128_GCM, &ticket_key.as_bytes()[..16]).ok()?);
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes.copy_from_slice(&ticket[..12]);
     let mut buf = ticket[12..].to_vec();
@@ -104,7 +105,7 @@ pub fn open_ticket(ticket_key: &[u8; 32], ticket: &[u8]) -> Option<Tls12TicketPa
 
 /// Seal a fresh ticket and build the `NewSessionTicket` wire message in one
 /// step, for the server's post-`Finished` full-handshake flight.
-pub fn mint_new_session_ticket(ticket_key: &[u8; 32], master_secret: &[u8; 48], cipher_suite: u16) -> Option<Bytes> {
+pub fn mint_new_session_ticket(ticket_key: &TicketKey, master_secret: &[u8; 48], cipher_suite: u16) -> Option<Bytes> {
     let issued_at_ms = unix_now_ms()?;
     let payload = Tls12TicketPayload {
         master_secret: *master_secret,
@@ -202,7 +203,7 @@ mod tests {
 
     #[test]
     fn seal_open_roundtrip() {
-        let key = [0x55u8; 32];
+        let key = TicketKey::from_bytes([0x55u8; 32]);
         let p = payload();
         let ticket = seal_ticket(&key, &p).unwrap();
         let opened = open_ticket(&key, &ticket).unwrap();
@@ -211,15 +212,15 @@ mod tests {
 
     #[test]
     fn wrong_key_fails_to_open() {
-        let key = [0x55u8; 32];
-        let other_key = [0x66u8; 32];
+        let key = TicketKey::from_bytes([0x55u8; 32]);
+        let other_key = TicketKey::from_bytes([0x66u8; 32]);
         let ticket = seal_ticket(&key, &payload()).unwrap();
         assert!(open_ticket(&other_key, &ticket).is_none());
     }
 
     #[test]
     fn tampered_ticket_fails_to_open() {
-        let key = [0x55u8; 32];
+        let key = TicketKey::from_bytes([0x55u8; 32]);
         let mut ticket = seal_ticket(&key, &payload()).unwrap().to_vec();
         let n = ticket.len();
         ticket[n - 1] ^= 0xff; // flip a tag byte
@@ -236,7 +237,7 @@ mod tests {
 
     #[test]
     fn mint_produces_a_new_session_ticket_message() {
-        let key = [0x77u8; 32];
+        let key = TicketKey::from_bytes([0x77u8; 32]);
         let msg = mint_new_session_ticket(&key, &[0xabu8; 48], 0xC02B).unwrap();
         // 1-byte type (NewSessionTicket=4) + 3-byte length header.
         assert_eq!(msg[0], 4);

@@ -39,7 +39,7 @@ impl HttpServer {
 
     /// Terminate TLS at accept, negotiating `h2`/`http/1.1` via ALPN.
     /// `acceptor` must already advertise those protocols (see
-    /// [`hopf_tls::acceptor_from_pem`] and friends).
+    /// [`hopf_core::acceptor_from_pem`] and friends).
     pub fn tls(mut self, acceptor: SharedTlsAcceptor) -> Self {
         self.tls_acceptor = Some(acceptor);
         self

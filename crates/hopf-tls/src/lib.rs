@@ -1,18 +1,30 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Thin `hopf-core::tls` re-export shim for TCP TLS / STARTTLS.
+//! Thin `hopf-core::tls` re-export shim, kept permanently as this
+//! workspace's real-`rustls`-interop test harness for TCP TLS.
 //!
 //! Through crypto-migration Phase 3b this crate ran TLS itself, on top of
 //! `rustls`. Phase 4 moved that job into `hopf-core::tls` (the in-tree
 //! `TlsRecordEngine`, RFC 8446 TLS 1.3) — `TcpConnection` no longer knows
-//! anything about `rustls`. This crate now just re-exports the
-//! `hopf-core::tls` PEM/acceptor/connector helpers under their old names, so
-//! existing callers don't need to change, and is kept only for that API
-//! compatibility until crypto-migration-plan.md Phase 8 removes it outright
-//! (folding the remaining call sites onto `hopf_core::tls::*` directly).
+//! anything about `rustls`, and by Phase 8 no other crate in this
+//! workspace depends on this one for production code either; every
+//! former caller now goes straight to `hopf_core::tls::*`.
 //!
-//! The two things the old `rustls`-backed API supported that this crate's
-//! own re-exports once lacked — SNI-dispatched multi-certificate acceptors
+//! What's left is this crate's own small shim (re-exporting the
+//! `hopf-core::tls` PEM/acceptor/connector helpers under their pre-Phase-4
+//! names, so its own tests below don't need touching) plus
+//! `integration_tests`: real wire interop against `rustls` as an
+//! independent TLS 1.3/1.2 implementation, kept as a
+//! `[dev-dependencies]`-only test peer here — `rustls` doesn't appear
+//! anywhere else in this workspace's production dependency graph. This is
+//! the *only* independent-implementation cross-check TCP TLS gets in this
+//! workspace (DTLS 1.3 gets its own separate real-peer interop, see
+//! `crypto-migration-plan.md` Phase 8), so this crate stays, not because
+//! anything still needs its API, but because deleting it would silently
+//! regress that coverage down to Hopf-talking-to-itself.
+//!
+//! Two things the old `rustls`-backed API supported that this crate's own
+//! re-exports once lacked — SNI-dispatched multi-certificate acceptors
 //! and mutual-TLS client certificates — both now have equivalents in
 //! `hopf-core::tls`: [`hopf_core::acceptor_from_pem_with_sni`] and
 //! [`hopf_core::acceptor_from_pem_with_client_auth`]/
