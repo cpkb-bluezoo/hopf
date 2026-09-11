@@ -26,13 +26,14 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 
+use crate::crypto::cert::SpkiDer;
 use crate::crypto::digest::{HashAlgorithm, Sha256Context};
 use crate::crypto::kx::EphemeralP256KeyPair;
 use crate::crypto::prf::{prf, PrfHash};
 use crate::crypto::signature::{
     ecdsa_p256_sha256_verify_spki, ecdsa_p256_sign, ecdsa_p384_sha384_verify_spki, ecdsa_p384_sign,
     rsa_pss_sha256_verify_spki, rsa_sign_pkcs1_sha256, rsa_verify_pkcs1_sha256, EcdsaP256PrivateKey,
-    EcdsaP384PrivateKey, RsaPrivateKey, RsaPublicKeyComponents,
+    EcdsaP384PrivateKey, RsaPrivateKey, RsaPublicKeyComponents, SignatureBytes,
 };
 use crate::asn1::{parse_sequence, read_bit_string_content, read_tlv_content, strip_integer_padding};
 use crate::crypto::trust::TrustStore;
@@ -880,7 +881,7 @@ impl Tls12Engine {
                 self.fail(sink, "unsupported or invalid client signing key");
                 return false;
             };
-            let cv = messages::build_certificate_verify(sig_hash, sig_alg, &signature);
+            let cv = messages::build_certificate_verify(sig_hash, sig_alg, signature.as_bytes());
             self.emit(&cv, sink);
         }
 
@@ -1048,7 +1049,7 @@ impl Tls12Engine {
             self.fail(sink, "unsupported or invalid server signing key");
             return false;
         };
-        let ske = messages::build_server_key_exchange(&server_point, sig_hash, sig_alg, &signature);
+        let ske = messages::build_server_key_exchange(&server_point, sig_hash, sig_alg, signature.as_bytes());
         self.emit(&ske, sink);
         self.local_ecdhe = Some(local);
 
@@ -1313,17 +1314,19 @@ fn verify_ske_signature(leaf_cert_der: &[u8], sig_hash: u8, sig_alg: u8, message
     let Some(parsed) = parse_certificate(leaf_cert_der) else {
         return false;
     };
+    let spki_der = SpkiDer::from_bytes(parsed.spki_der.clone());
+    let signature = SignatureBytes::from_bytes(Bytes::copy_from_slice(signature));
     match (sig_hash, sig_alg) {
-        (sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA) => ecdsa_p256_sha256_verify_spki(&parsed.spki_der, message, signature),
-        (sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA) => ecdsa_p384_sha384_verify_spki(&parsed.spki_der, message, signature),
+        (sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA) => ecdsa_p256_sha256_verify_spki(&spki_der, message, &signature),
+        (sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA) => ecdsa_p384_sha384_verify_spki(&spki_der, message, &signature),
         (sig_alg::HASH_SHA256, sig_alg::SIG_RSA) => {
             let Some((n, e)) = rsa_n_e_from_spki(&parsed.spki_der) else {
                 return false;
             };
-            rsa_verify_pkcs1_sha256(RsaPublicKeyComponents { n: &n, e: &e }, message, signature)
+            rsa_verify_pkcs1_sha256(RsaPublicKeyComponents { n: &n, e: &e }, message, &signature)
         }
         (sig_alg::RSA_PSS_SHA256_BYTE0, sig_alg::RSA_PSS_SHA256_BYTE1) => {
-            rsa_pss_sha256_verify_spki(&parsed.spki_der, message, signature)
+            rsa_pss_sha256_verify_spki(&spki_der, message, &signature)
         }
         _ => false,
     }
@@ -1346,7 +1349,7 @@ fn rsa_n_e_from_spki(spki_der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((strip_integer_padding(modulus).to_vec(), strip_integer_padding(exponent).to_vec()))
 }
 
-fn sign_ske(signing_key_pkcs8: &[u8], message: &[u8]) -> Option<(u8, u8, Bytes)> {
+fn sign_ske(signing_key_pkcs8: &[u8], message: &[u8]) -> Option<(u8, u8, SignatureBytes)> {
     match pkcs8_key_kind(signing_key_pkcs8)? {
         KeyKind::EcdsaP256 => {
             let key = EcdsaP256PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
@@ -1503,7 +1506,7 @@ mod tests {
         }
         fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
             rsa_sign_pkcs1_sha256(&RsaPrivateKey::from_pkcs8(&pkcs8_der_of(&self.key)).unwrap(), msg)
-                .map(|b| b.to_vec())
+                .map(|b| b.as_bytes().to_vec())
                 .map_err(|_| rcgen::Error::RemoteKeyError)
         }
         fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
@@ -1609,10 +1612,10 @@ mod tests {
             sig_alg::RSA_PSS_SHA256_BYTE0,
             sig_alg::RSA_PSS_SHA256_BYTE1,
             message,
-            &signature,
+            signature.as_bytes(),
         ));
         // A PSS signature must not verify against PKCS1v1.5's pair either.
-        assert!(!verify_ske_signature(cert.der(), sig_alg::HASH_SHA256, sig_alg::SIG_RSA, message, &signature));
+        assert!(!verify_ske_signature(cert.der(), sig_alg::HASH_SHA256, sig_alg::SIG_RSA, message, signature.as_bytes()));
     }
 
     #[test]

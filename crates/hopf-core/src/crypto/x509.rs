@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use crate::asn1::{parse_sequence, read_bit_string_content, read_length, read_oid, read_tlv_content};
 
-use super::signature::ed25519_verify;
+use super::signature::{ed25519_verify, SignatureBytes};
 use aws_lc_rs::signature::{
     UnparsedPublicKey, ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, ML_DSA_44, ML_DSA_65, ML_DSA_87,
     RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA384, RSA_PKCS1_2048_8192_SHA512,
@@ -137,7 +137,7 @@ pub fn verify_cert_signature(cert: &ParsedCertificate, issuer_spki: &[u8]) -> bo
         let Some(pubkey) = ed25519_pubkey_from_spki(issuer_spki) else {
             return false;
         };
-        return ed25519_verify(pubkey, cert.tbs_der.as_ref(), cert.signature.as_ref());
+        return ed25519_verify(pubkey, cert.tbs_der.as_ref(), &SignatureBytes::from_bytes(cert.signature.clone()));
     }
     if oid == OID_RAW_ECDSA_SHA256 {
         return UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, issuer_spki)
@@ -544,7 +544,7 @@ mod tests {
         ]);
 
         let signature = ed25519_sign(&key_pair, &tbs);
-        let cert = der_seq(&[&tbs, &alg_id, &der_bit_string(&signature)]);
+        let cert = der_seq(&[&tbs, &alg_id, &der_bit_string(signature.as_bytes())]);
         (cert, spki_der)
     }
 

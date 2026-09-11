@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
+use super::cert::SpkiDer;
 use super::x509::{matches_hostname, parse_certificate, verify_cert_signature, ParsedCertificate};
 
 /// A certificate's Subject field, DER-encoded (RDNSequence). Distinct from
@@ -16,22 +17,6 @@ pub struct SubjectDer(Bytes);
 
 impl SubjectDer {
     /// Wrap already-encoded Subject DER bytes.
-    pub fn from_bytes(der: Bytes) -> Self {
-        Self(der)
-    }
-
-    /// Borrow the DER bytes.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-/// A certificate's SubjectPublicKeyInfo, DER-encoded. See [`SubjectDer`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpkiDer(Bytes);
-
-impl SpkiDer {
-    /// Wrap already-encoded SubjectPublicKeyInfo DER bytes.
     pub fn from_bytes(der: Bytes) -> Self {
         Self(der)
     }

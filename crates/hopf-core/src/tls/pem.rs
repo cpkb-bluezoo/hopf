@@ -6,14 +6,14 @@
 //! re-encode legacy PKCS#1/SEC1 PEM with e.g. `openssl pkcs8 -topk8 -nocrypt`.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, BufReader, ErrorKind};
+use std::io::{self, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
 
 use crate::crypto::kx_policy::KxPolicy;
+use crate::pem::{parse_certs, parse_pkcs8_keys};
 use crate::crypto::trust::{public_trust_store, TrustStore};
 
 use super::engine::{
@@ -65,23 +65,20 @@ fn base_config(role: HandshakeRole, alpn: &[&[u8]]) -> HandshakeConfig {
 }
 
 fn load_certs(path: &Path) -> io::Result<Vec<Bytes>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let certs = certs.map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let pem = std::fs::read(path)?;
+    let certs = parse_certs(&pem);
     if certs.is_empty() {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             format!("no certificates in {}", path.display()),
         ));
     }
-    Ok(certs.into_iter().map(|c| Bytes::copy_from_slice(c.as_ref())).collect())
+    Ok(certs.into_iter().map(Bytes::from).collect())
 }
 
 fn load_pkcs8_key(path: &Path) -> io::Result<Bytes> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut keys: Vec<_> = rustls_pemfile::pkcs8_private_keys(&mut reader)
-        .collect::<Result<_, _>>()
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let pem = std::fs::read(path)?;
+    let mut keys = parse_pkcs8_keys(&pem);
     let Some(key) = keys.pop() else {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
@@ -92,7 +89,7 @@ fn load_pkcs8_key(path: &Path) -> io::Result<Bytes> {
             ),
         ));
     };
-    Ok(Bytes::copy_from_slice(key.secret_pkcs8_der()))
+    Ok(Bytes::from(key))
 }
 
 /// Load a PEM certificate chain and PKCS#8 private key into [`ServerCredentials`].

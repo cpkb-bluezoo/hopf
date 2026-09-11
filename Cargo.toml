@@ -86,7 +86,6 @@ authors = ["Chris Burdess <dog@gnu.org>"]
 [workspace.dependencies]
 mio = { version = "1", features = ["net", "os-poll", "os-ext"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "prefer-post-quantum", "std", "tls12"] }
-rustls-pemfile = "2"
 # Public WebPKI trust: OS trust store at runtime, with a vendored fallback
 # for environments where the native store can't be read.
 rustls-native-certs = "0.8"

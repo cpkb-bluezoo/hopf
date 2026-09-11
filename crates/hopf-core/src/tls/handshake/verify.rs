@@ -9,7 +9,7 @@ use crate::crypto::cert::extract_spki;
 use crate::crypto::signature::{
     ecdsa_p256_sha256_verify_spki, ecdsa_p256_sign, ecdsa_p384_sha384_verify_spki, ecdsa_p384_sign,
     ed25519_sign, ed25519_verify, rsa_pss_sha256_verify_spki, rsa_sign_pss_sha256,
-    EcdsaP256PrivateKey, EcdsaP384PrivateKey, Ed25519PrivateKey, RsaPrivateKey,
+    EcdsaP256PrivateKey, EcdsaP384PrivateKey, Ed25519PrivateKey, RsaPrivateKey, SignatureBytes,
 };
 
 use super::key_schedule::TranscriptHash;
@@ -58,7 +58,7 @@ pub fn sign_certificate_verify(
     is_client: bool,
     signing_key_pkcs8: &[u8],
     transcript_hash: &TranscriptHash,
-) -> Option<(u16, Bytes)> {
+) -> Option<(u16, SignatureBytes)> {
     let msg = certificate_verify_message(is_client, transcript_hash);
     match pkcs8_key_kind(signing_key_pkcs8)? {
         KeyKind::Ed25519 => {
@@ -92,16 +92,17 @@ pub fn verify_certificate_verify(
         return false;
     };
     let msg = certificate_verify_message(peer_is_client, transcript_hash);
+    let signature = SignatureBytes::from_bytes(Bytes::copy_from_slice(signature));
     match scheme {
         SIG_ED25519 => {
             let Some(pk) = ed25519_public_key_from_spki(spki.as_ref()) else {
                 return false;
             };
-            ed25519_verify(&pk, &msg, signature)
+            ed25519_verify(&pk, &msg, &signature)
         }
-        SIG_ECDSA_SECP256R1_SHA256 => ecdsa_p256_sha256_verify_spki(spki.as_ref(), &msg, signature),
-        SIG_ECDSA_SECP384R1_SHA384 => ecdsa_p384_sha384_verify_spki(spki.as_ref(), &msg, signature),
-        SIG_RSA_PSS_RSAE_SHA256 => rsa_pss_sha256_verify_spki(spki.as_ref(), &msg, signature),
+        SIG_ECDSA_SECP256R1_SHA256 => ecdsa_p256_sha256_verify_spki(&spki, &msg, &signature),
+        SIG_ECDSA_SECP384R1_SHA384 => ecdsa_p384_sha384_verify_spki(&spki, &msg, &signature),
+        SIG_RSA_PSS_RSAE_SHA256 => rsa_pss_sha256_verify_spki(&spki, &msg, &signature),
         _ => false,
     }
 }
@@ -168,6 +169,6 @@ mod tests {
         assert_eq!(scheme, SIG_ED25519);
         let msg = certificate_verify_message(false, &th);
         assert_eq!(msg.len(), 64 + 32 + 1 + "TLS 1.3, server CertificateVerify".len());
-        assert!(ed25519_verify(key.public_key_bytes(), msg.as_ref(), sig.as_ref()));
+        assert!(ed25519_verify(key.public_key_bytes(), msg.as_ref(), &sig));
     }
 }

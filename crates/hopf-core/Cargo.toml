@@ -20,7 +20,6 @@ tractrix = { workspace = true }
 bytes = "1"
 getrandom = { workspace = true }
 aws-lc-rs = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-native-certs = { workspace = true }
 webpki-roots = { workspace = true }
 ed448-goldilocks-plus = { version = "0.18.0", default-features = false, features = ["signing"], optional = true }

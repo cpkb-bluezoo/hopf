@@ -30,6 +30,7 @@ pub mod handler;
 pub mod listener;
 pub mod peer_addr;
 pub mod peer_cred;
+pub mod pem;
 pub mod pool;
 pub mod quota;
 pub mod retry;

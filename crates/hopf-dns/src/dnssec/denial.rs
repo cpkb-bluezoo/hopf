@@ -242,7 +242,7 @@ mod tests {
         let sig = ed25519_sign(pair, &signed_data);
         let mut full_rdata = rdata;
         full_rdata.truncate(header_len);
-        full_rdata.extend_from_slice(&sig);
+        full_rdata.extend_from_slice(sig.as_bytes());
         DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, full_rdata)
     }
 

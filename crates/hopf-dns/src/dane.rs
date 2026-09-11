@@ -96,7 +96,7 @@ fn selected_data(selector: TlsaSelector, cert_der: &[u8]) -> Option<Vec<u8>> {
     match selector {
         TlsaSelector::FullCertificate => Some(cert_der.to_vec()),
         TlsaSelector::SubjectPublicKeyInfo => {
-            hopf_core::crypto::cert::extract_spki(cert_der).map(|spki| spki.to_vec())
+            hopf_core::crypto::cert::extract_spki(cert_der).map(|spki| spki.as_bytes().to_vec())
         }
         TlsaSelector::Unassigned(_) => None,
     }
@@ -154,8 +154,8 @@ mod tests {
         let cert = test_cert();
         let spki = extract_spki(cert.as_ref()).expect("should extract an SPKI");
         // SubjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey (BIT STRING) }
-        assert_eq!(spki[0], 0x30, "SPKI must be a SEQUENCE");
-        let mut seq = hopf_core::asn1::parse_sequence(&spki).unwrap();
+        assert_eq!(spki.as_bytes()[0], 0x30, "SPKI must be a SEQUENCE");
+        let mut seq = hopf_core::asn1::parse_sequence(spki.as_bytes()).unwrap();
         let alg = seq.next().unwrap();
         assert_eq!(alg[0], 0x30, "AlgorithmIdentifier must be a SEQUENCE");
         assert!(alg.len() > 2);
@@ -170,9 +170,9 @@ mod tests {
         // Sanity: the SPKI is a genuine substring of the certificate, and
         // strictly shorter than the whole thing (it's one field among
         // several in tbsCertificate).
-        assert!(spki.len() < cert.as_ref().len());
+        assert!(spki.as_bytes().len() < cert.as_ref().len());
         assert!(
-            cert.as_ref().windows(spki.len()).any(|w| w == spki.as_ref()),
+            cert.as_ref().windows(spki.as_bytes().len()).any(|w| w == spki.as_bytes()),
             "extracted SPKI bytes must appear verbatim in the certificate"
         );
     }
@@ -295,7 +295,7 @@ mod tests {
         assert_ne!(cert1.der(), cert2.der(), "test needs two distinct certificates");
 
         let spki = extract_spki(cert1.der().as_ref()).unwrap();
-        let digest = Sha256::digest(&spki).to_vec();
+        let digest = Sha256::digest(spki.as_bytes()).to_vec();
         let record = TlsaRecord {
             usage: TlsaUsage::DaneEe,
             selector: TlsaSelector::SubjectPublicKeyInfo,

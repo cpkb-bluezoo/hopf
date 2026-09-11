@@ -10,22 +10,39 @@ use std::time::Duration;
 
 use hopf_core::Runtime;
 use hopf_dns::server::DnsService;
-use hopf_dns::wire::{DnsMessage, DnsResourceRecord, FLAG_QR, FLAG_RA, FLAG_TC};
+use hopf_dns::wire::{DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA, FLAG_TC};
 use hopf_dns::{DnsCache, DnsResolver};
+
+/// Every `DnsResolver::add_server`-added server is `auto`-mode (RFC 9462
+/// DDR eligible), and `maybe_trigger_discovery` fires one `_dns.resolver.arpa`
+/// SVCB probe on the first real query dispatched to it — "safe to call on
+/// every real query dispatch" per its own doc comment, i.e. genuinely
+/// by-design, not a bug. A stub server built to handle exactly one
+/// choreographed exchange must recognize and skip this probe (never
+/// respond, never count it) rather than mistake it for the query under
+/// test — otherwise the probe silently "steals" the stub's one crafted
+/// reply. Real DNS servers are large enough that a stray SVCB probe never
+/// perturbs anything; these local stubs are not.
+fn is_ddr_probe(q: &DnsMessage) -> bool {
+    q.questions.first().and_then(|qq| qq.qtype) == Some(DnsType::Svcb)
+}
 
 #[test]
 fn resolve_a_against_local_stub() {
     let stub = UdpSocket::bind("127.0.0.1:0").unwrap();
     stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let stub_addr = stub.local_addr().unwrap();
-    thread::spawn(move || {
+    thread::spawn(move || loop {
         let mut buf = [0u8; 512];
         let Ok((n, peer)) = stub.recv_from(&mut buf) else {
             return;
         };
         let Ok(q) = DnsMessage::parse(&buf[..n]) else {
-            return;
+            continue;
         };
+        if is_ddr_probe(&q) {
+            continue;
+        }
         let mut resp = q.response_template(0);
         resp.flags |= FLAG_QR | FLAG_RA;
         if let Some(question) = q.questions.first() {
@@ -37,6 +54,7 @@ fn resolve_a_against_local_stub() {
         }
         let bytes = resp.serialize().unwrap();
         let _ = stub.send_to(&bytes, peer);
+        return;
     });
 
     let rt = Runtime::start(Default::default()).unwrap();
@@ -90,6 +108,9 @@ fn nodata_response_is_negatively_cached_so_a_repeat_query_skips_upstream() {
         let Ok(q) = DnsMessage::parse(&buf[..n]) else {
             continue;
         };
+        if is_ddr_probe(&q) {
+            continue;
+        }
         hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // NOERROR, no answers: NODATA.
         let mut resp = q.response_template(0);
@@ -129,7 +150,6 @@ fn nodata_response_is_negatively_cached_so_a_repeat_query_skips_upstream() {
 /// lets `query_batch` resolve everything from a single wire exchange.
 #[test]
 fn query_batch_merges_additional_types_in_one_exchange_when_server_supports_it() {
-    use hopf_dns::wire::DnsType;
     use hopf_dns::{encode_mqtype_response_option, find_mqtype_option, EDNS_OPTION_MQTYPE_QUERY};
     use std::net::Ipv6Addr;
 
@@ -138,14 +158,17 @@ fn query_batch_merges_additional_types_in_one_exchange_when_server_supports_it()
     let stub = UdpSocket::bind("127.0.0.1:0").unwrap();
     stub.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let stub_addr = stub.local_addr().unwrap();
-    thread::spawn(move || {
+    thread::spawn(move || loop {
         let mut buf = [0u8; 512];
         let Ok((n, peer)) = stub.recv_from(&mut buf) else {
             return;
         };
         let Ok(q) = DnsMessage::parse(&buf[..n]) else {
-            return;
+            continue;
         };
+        if is_ddr_probe(&q) {
+            continue;
+        }
         request_count2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let additional = q
             .additionals
@@ -172,6 +195,7 @@ fn query_batch_merges_additional_types_in_one_exchange_when_server_supports_it()
             .push(DnsResourceRecord::opt(4096, false, &response_opt_data));
         let bytes = resp.serialize().unwrap();
         let _ = stub.send_to(&bytes, peer);
+        return;
     });
 
     let rt = Runtime::start(Default::default()).unwrap();
@@ -391,18 +415,22 @@ fn forwarder_retries_truncated_upstream_answer_over_tcp() {
     let upstream_addr = udp.local_addr().unwrap();
     let tcp = TcpListener::bind(upstream_addr).unwrap();
 
-    thread::spawn(move || {
+    thread::spawn(move || loop {
         let mut buf = [0u8; 512];
         let Ok((n, peer)) = udp.recv_from(&mut buf) else {
             return;
         };
         let Ok(q) = DnsMessage::parse(&buf[..n]) else {
-            return;
+            continue;
         };
+        if is_ddr_probe(&q) {
+            continue;
+        }
         // Truncated UDP answer: no answers, TC set.
         let mut truncated = q.response_template(0);
         truncated.flags |= FLAG_QR | FLAG_RA | FLAG_TC;
         let _ = udp.send_to(&truncated.serialize().unwrap(), peer);
+        return;
     });
     thread::spawn(move || {
         let Ok((mut stream, _)) = tcp.accept() else {
@@ -466,20 +494,24 @@ fn retries_against_second_configured_server_when_first_is_dead() {
     let live = UdpSocket::bind("127.0.0.1:0").unwrap();
     live.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let live_addr = live.local_addr().unwrap();
-    thread::spawn(move || {
+    thread::spawn(move || loop {
         let mut buf = [0u8; 512];
         let Ok((n, peer)) = live.recv_from(&mut buf) else {
             return;
         };
         let Ok(q) = DnsMessage::parse(&buf[..n]) else {
-            return;
+            continue;
         };
+        if is_ddr_probe(&q) {
+            continue;
+        }
         let mut resp = q.response_template(0);
         resp.flags |= FLAG_QR | FLAG_RA;
         if let Some(question) = q.questions.first() {
             resp.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(203, 0, 113, 30)));
         }
         let _ = live.send_to(&resp.serialize().unwrap(), peer);
+        return;
     });
 
     let rt = Runtime::start(Default::default()).unwrap();
@@ -522,14 +554,17 @@ fn spoofed_source_address_is_rejected_but_real_reply_still_accepted() {
     let real_addr = real_server.local_addr().unwrap();
     let attacker = UdpSocket::bind("127.0.0.1:0").unwrap();
 
-    thread::spawn(move || {
+    thread::spawn(move || loop {
         let mut buf = [0u8; 512];
         let Ok((n, peer)) = real_server.recv_from(&mut buf) else {
             return;
         };
         let Ok(q) = DnsMessage::parse(&buf[..n]) else {
-            return;
+            continue;
         };
+        if is_ddr_probe(&q) {
+            continue;
+        }
 
         // Forged reply with the right id/question, sent from a different
         // socket than the one the query was actually sent to.
@@ -549,6 +584,7 @@ fn spoofed_source_address_is_rejected_but_real_reply_still_accepted() {
             resp.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(203, 0, 113, 10)));
         }
         let _ = real_server.send_to(&resp.serialize().unwrap(), peer);
+        return;
     });
 
     let rt = Runtime::start(Default::default()).unwrap();
@@ -589,14 +625,17 @@ fn mismatched_question_is_rejected_but_real_reply_still_accepted() {
     server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let server_addr = server.local_addr().unwrap();
 
-    thread::spawn(move || {
+    thread::spawn(move || loop {
         let mut buf = [0u8; 512];
         let Ok((n, peer)) = server.recv_from(&mut buf) else {
             return;
         };
         let Ok(q) = DnsMessage::parse(&buf[..n]) else {
-            return;
+            continue;
         };
+        if is_ddr_probe(&q) {
+            continue;
+        }
 
         // Same id, same source, but a question for a different name than
         // what was actually queried.
@@ -615,6 +654,7 @@ fn mismatched_question_is_rejected_but_real_reply_still_accepted() {
             resp.answers.push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(203, 0, 113, 20)));
         }
         let _ = server.send_to(&resp.serialize().unwrap(), peer);
+        return;
     });
 
     let rt = Runtime::start(Default::default()).unwrap();
@@ -748,7 +788,7 @@ fn validate_chain_of_trust_walks_a_real_two_level_delegation_over_the_network() 
         }
         let sig = ed25519_sign(pair, &signed);
         let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rdata);
-        rrsig.rdata.extend_from_slice(&sig);
+        rrsig.rdata.extend_from_slice(sig.as_bytes());
         rrsig
     }
 
@@ -887,7 +927,7 @@ fn validate_denial_of_existence_proves_a_real_nxdomain_over_the_network() {
         }
         let sig = ed25519_sign(pair, &signed);
         let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rdata);
-        rrsig.rdata.extend_from_slice(&sig);
+        rrsig.rdata.extend_from_slice(sig.as_bytes());
         rrsig
     }
 

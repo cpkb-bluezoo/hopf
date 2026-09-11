@@ -4,8 +4,9 @@
 
 use hopf_core::crypto::{
     ecdsa_p256_sha256_verify, ecdsa_p384_sha384_verify, ed25519_verify, hash, rsa_verify_dnskey,
-    HashAlgorithm,
+    HashAlgorithm, SignatureBytes,
 };
+use hopf_core::Bytes;
 
 use super::algorithm::DnssecAlgorithm;
 
@@ -16,13 +17,14 @@ pub fn verify_signature(
     message: &[u8],
     signature: &[u8],
 ) -> bool {
+    let signature = SignatureBytes::from_bytes(Bytes::copy_from_slice(signature));
     match algorithm {
-        DnssecAlgorithm::RsaSha256 => rsa_verify_dnskey(public_key, message, signature, false),
-        DnssecAlgorithm::RsaSha512 => rsa_verify_dnskey(public_key, message, signature, true),
-        DnssecAlgorithm::EcdsaP256Sha256 => ecdsa_p256_sha256_verify(public_key, message, signature),
-        DnssecAlgorithm::EcdsaP384Sha384 => ecdsa_p384_sha384_verify(public_key, message, signature),
-        DnssecAlgorithm::Ed25519 => ed25519_verify(public_key, message, signature),
-        DnssecAlgorithm::Ed448 => verify_ed448(public_key, message, signature),
+        DnssecAlgorithm::RsaSha256 => rsa_verify_dnskey(public_key, message, &signature, false),
+        DnssecAlgorithm::RsaSha512 => rsa_verify_dnskey(public_key, message, &signature, true),
+        DnssecAlgorithm::EcdsaP256Sha256 => ecdsa_p256_sha256_verify(public_key, message, &signature),
+        DnssecAlgorithm::EcdsaP384Sha384 => ecdsa_p384_sha384_verify(public_key, message, &signature),
+        DnssecAlgorithm::Ed25519 => ed25519_verify(public_key, message, &signature),
+        DnssecAlgorithm::Ed448 => verify_ed448(public_key, message, signature.as_bytes()),
     }
 }
 
@@ -83,13 +85,13 @@ mod tests {
             DnssecAlgorithm::Ed25519,
             pair.public_key_bytes(),
             msg,
-            &sig
+            sig.as_bytes()
         ));
         assert!(!verify_signature(
             DnssecAlgorithm::Ed25519,
             pair.public_key_bytes(),
             b"tampered",
-            &sig
+            sig.as_bytes()
         ));
     }
 

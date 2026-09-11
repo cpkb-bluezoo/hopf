@@ -21,7 +21,6 @@ integration = []
 
 [dependencies]
 hopf-core = { workspace = true }
-rustls-pemfile = { workspace = true }
 mio = { workspace = true }
 bytes = "1"
 aws-lc-rs = { workspace = true }

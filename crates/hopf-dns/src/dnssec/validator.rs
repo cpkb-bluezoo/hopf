@@ -485,7 +485,7 @@ mod tests {
             out
         };
         let sig = ed25519_sign(&pair, &signed);
-        rrsig.rdata.extend_from_slice(&sig);
+        rrsig.rdata.extend_from_slice(sig.as_bytes());
 
         assert!(verify_rrsig(&[&a], &rrsig, &dnskey));
         assert!(is_rrsig_current(&rrsig));
@@ -550,7 +550,7 @@ mod tests {
         let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rrsig_rdata);
         let signed = build_signed_data(rrset, &rrsig).unwrap();
         let sig = ed25519_sign(&pair, &signed);
-        rrsig.rdata.extend_from_slice(&sig);
+        rrsig.rdata.extend_from_slice(sig.as_bytes());
         rrsig
     }
 

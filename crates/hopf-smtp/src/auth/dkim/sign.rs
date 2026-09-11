@@ -9,9 +9,8 @@ use rmimeparser::dkim::RawHeader;
 use super::canon::{self, Canonicalization, IncrementalBodyCanon};
 
 use hopf_core::crypto::{
-    ed25519_sign, rsa_sign_pkcs1_sha256, Ed25519PrivateKey, RsaPrivateKey,
+    ed25519_sign, rsa_sign_pkcs1_sha256, Ed25519PrivateKey, RsaPrivateKey, SignatureBytes,
 };
-use hopf_core::Bytes;
 
 /// A private key usable for DKIM signing.
 pub enum DkimPrivateKey {
@@ -47,7 +46,7 @@ impl DkimPrivateKey {
         }
     }
 
-    fn sign(&self, data: &[u8]) -> Result<Bytes, ()> {
+    fn sign(&self, data: &[u8]) -> Result<SignatureBytes, ()> {
         match self {
             DkimPrivateKey::Rsa(kp) => rsa_sign_pkcs1_sha256(kp, data).map_err(|_| ()),
             DkimPrivateKey::Ed25519(kp) => Ok(ed25519_sign(kp, data)),

@@ -2449,7 +2449,7 @@ mod tests {
             out
         };
         let sig = ed25519_sign(&pair, &signed);
-        rrsig.rdata.extend_from_slice(&sig);
+        rrsig.rdata.extend_from_slice(sig.as_bytes());
 
         let owner_wire = crate::wire::encode_name(name).unwrap();
         let digest = crate::dnssec::compute_ds_digest(&owner_wire, &dnskey.rdata, 2).unwrap();

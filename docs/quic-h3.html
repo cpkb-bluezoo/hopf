@@ -70,12 +70,12 @@
     <main class="main">
       <header>
         <h1>QUIC / HTTP/3</h1>
-        <p class="lead">Crates <code>hopf-quic</code> and <code>hopf-http</code> (feature <code>h3</code>): QUIC transport via <code>quinn-proto</code> + an in-tree mio UDP driver, with <strong>PQC-first TLS 1.3</strong> (hybrid ML-KEM offered first on every handshake). HTTP/3 codecs reuse the same Stream SPI as H1/H2.</p>
+        <p class="lead">Crates <code>hopf-quic</code> and <code>hopf-http</code> (feature <code>h3</code>): a fully in-tree QUIC transport (RFC 9000/9001/9002) driven by a dedicated mio UDP thread, sharing the same TLS 1.3 handshake engine TCP TLS uses. HTTP/3 codecs reuse the same Stream SPI as H1/H2.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#architecture">Architecture</a></li>
-<li><a href="#pqc-first-tls-13">PQC-first TLS 1.3</a></li>
+<li><a href="#pqc-first-tls-13">TLS 1.3 on QUIC</a></li>
 <li><a href="#standards">Standards</a></li>
 <li><a href="#quiclisten--quicconnect-configs">QuicListen / QuicConnect configs</a></li>
 <li><a href="#pem-builders">PEM builders</a></li>
@@ -102,14 +102,11 @@
                                          ▼
                               ServerHandler / ClientHandler  (hopf-http)</code></pre>
 <p>Each bidirectional QUIC stream is a <code>QuicStreamEndpoint</code> implementing <code>hopf_core::Endpoint</code>. HTTP/3 framing lives in <code>hopf-http</code>, not in <code>hopf-quic</code>.</p>
-<h2 id="pqc-first-tls-13">PQC-first TLS 1.3</h2>
-<p>QUIC processing is <strong>post-quantum first</strong> by construction, not an opt-in:</p>
+<h2 id="pqc-first-tls-13">TLS 1.3 on QUIC</h2>
 <ul>
-<li><strong>TLS 1.3 only</strong> (RFC 9001). PEM builders pin <code>&amp;[rustls::version::TLS13]</code>. Unlike TCP <a href="tls.html"><code>hopf-tls</code></a>, the QUIC path never negotiates TLS 1.2.</li>
-<li><strong>Hybrid ML-KEM first.</strong> All QUIC TLS configs use the shared <code>hopf_tls::tls_crypto_provider()</code> — aws-lc-rs with rustls <code>prefer-post-quantum</code>. The client Hello offers <code>X25519MLKEM768</code> (X25519 + ML-KEM-768) as the preferred key-exchange group. Peers that cannot do PQC still complete with classical groups; peers that can do PQC complete a hybrid handshake on the first flight.</li>
-<li><strong>Same provider as TCP TLS</strong>, so cipher and KX policy stay one story; QUIC is the stricter subset (1.3-only + PQC preference on every datagram handshake).</li>
+<li><strong>TLS 1.3 only</strong> (RFC 9001). Every QUIC TLS config builds a <code>hopf_core::tls::HandshakeConfig</code> with <code>HandshakeMode::Quic</code> — the same in-tree TLS 1.3 engine TCP <a href="tls.html">TLS</a> uses. There's no TLS 1.2 mode for QUIC at all, so the question of negotiating down never arises.</li>
+<li><strong>Key exchange is classical X25519 only</strong>, not the hybrid PQC key exchange TCP TLS 1.3 offers by default. Every QUIC config builder currently hardcodes the classical-only key-exchange policy with no way to opt into the hybrid <code>X25519MLKEM768</code> group — a real gap relative to TCP TLS, not a deliberate QUIC-specific choice. See <a href="conformance.html#quic">Conformance → QUIC</a> for the exact call sites.</li>
 </ul>
-<p>There is no separate “enable PQC” knob. Turning off hybrid KX would mean replacing the workspace rustls feature set, not a hopf-quic option.</p>
 <h2 id="standards">Standards</h2>
 <table>
 <colgroup>
@@ -125,11 +122,11 @@
 <tbody>
 <tr>
 <td>RFC 9000 family</td>
-<td>QUIC via <code>quinn-proto</code></td>
+<td>QUIC via an in-tree transport (<code>hopf-quic</code>)</td>
 </tr>
 <tr>
 <td>TLS 1.3 only</td>
-<td>rustls aws-lc-rs; builders pin <code>TLS13</code>. <strong>PQC-first:</strong> hybrid <code>X25519MLKEM768</code> offered first (<code>prefer-post-quantum</code>)</td>
+<td>In-tree handshake engine (shared with TCP TLS); no TLS 1.2 mode on QUIC. Key exchange is classical X25519 only — not PQC-first, unlike TCP TLS 1.3</td>
 </tr>
 <tr>
 <td>ALPN <code>h3</code></td>
@@ -179,7 +176,7 @@
 <tr>
 <td><code>QuicListenHardening</code></td>
 <td><code>require_address_validation</code>, Incoming caps, Retry/NEW_TOKEN lifetimes, <code>migration</code></td>
-<td>RFC 9000 §8 listen hardening. <code>high_security()</code> (default) requires Retry/NEW_TOKEN before accept, caps unfinished handshakes, disables migration; <code>permissive()</code> leaves quinn defaults and accepts without Retry</td>
+<td>RFC 9000 §8 listen hardening. <code>high_security()</code> (default) requires a Retry round trip before accept, caps unfinished handshakes, disables migration; <code>permissive()</code> accepts without Retry</td>
 </tr>
 </tbody>
 </table>
@@ -283,7 +280,7 @@
 </tr>
 </tbody>
 </table>
-<p>Type aliases: <code>QuicServerConfig = quinn_proto::ServerConfig</code>, <code>QuicClientConfig = quinn_proto::ClientConfig</code>.</p>
+<p><code>QuicServerConfig</code>/<code>QuicClientConfig</code> are hopf's own in-tree config types (<code>hopf-quic/src/config.rs</code>).</p>
 <div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_quic::</span><span class="op">{</span>server_config_from_pem<span class="op">,</span> client_config_from_pem<span class="op">,</span> ALPN_H3<span class="op">};</span></span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::path::</span><span class="dt">Path</span><span class="op">;</span></span>
 <span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
@@ -335,11 +332,11 @@
 </tr>
 <tr>
 <td>Protocol versions</td>
-<td><code>&amp;[rustls::version::TLS13]</code> only — no TLS 1.2 on QUIC</td>
+<td>TLS 1.3 only — no TLS 1.2 mode exists on QUIC</td>
 </tr>
 <tr>
 <td>Key exchange</td>
-<td>PQC-first: <code>X25519MLKEM768</code> then classical (workspace <code>prefer-post-quantum</code>)</td>
+<td>Classical <code>X25519</code> only today — not PQC-first, unlike TCP TLS 1.3 (see <a href="conformance.html#quic">Conformance → QUIC</a>)</td>
 </tr>
 <tr>
 <td>Early data</td>
@@ -389,17 +386,18 @@
 <li>No HTTP/2-style server push; no WebTransport / CONNECT-UDP product API yet (RFC 9297 HTTP Datagrams + Capsule Protocol plumbing is present).</li>
 <li>0-RTT is off by default; enable via <code>QuicTlsOptions::with_early_data</code> (replay risk — see SECURITY.md). Plain <code>connect_quic</code> opens the first stream before <code>Event::Connected</code> when a session ticket makes <code>has_0rtt()</code> true; H3 hooks-mode still starts after the full handshake.</li>
 <li>Locally-initiated connection close (<code>LocallyClosed</code>) still calls <code>ProtocolHandler::disconnected</code> on this endpoint's streams; only the peer sees <code>QuicConnectionCloseError</code> via <code>error</code>. Use the return value of <code>close_connection</code> locally if you need the code you just sent.</li>
+<li>Connection migration (RFC 9000 §9) is not implemented — a connection keeps the remote address it was created with for its whole lifetime, and there's no <code>NEW_TOKEN</code> (§8.1.3) support either, only Retry-based address validation (§8.1.2). See <a href="conformance.html#quic">Conformance → QUIC</a> for the specifics.</li>
 </ul>
 <h2 id="implementation-status">Implementation status</h2>
-<p><strong>Shipped today:</strong> HTTP/3 codecs and QPACK in <code>hopf-http</code> (feature <code>h3</code>) are Hopf-owned. QUIC <strong>transport</strong> (RFC 9000 loss recovery, congestion control, connection migration mechanics) and QUIC-TLS <strong>handshake driving</strong> are delegated to <strong>quinn-proto</strong> and <strong>rustls</strong> respectively. Hopf adds the mio UDP driver, stream-as-<code>Endpoint</code> model, PQC-first TLS 1.3 config construction, and hooks-mode connection API for H3.</p>
-<p><strong>Planned:</strong> in-tree RFC 9000 transport state machine and in-tree TLS 1.3 handshake for RFC 9001 (retire quinn-proto and rustls on the QUIC path). TCP TLS migrates on the same AWS-LC foundation in <code>hopf-core</code> — see <a href="tls.html#roadmap">TLS roadmap</a> and <a href="conformance.html#security-substrate">conformance → Security substrate</a>.</p>
+<p><strong>Shipped:</strong> QUIC transport (RFC 9000 loss recovery and congestion control, RFC 9001 packet protection) and the TLS 1.3 handshake are both in-tree, with no external QUIC or TLS library dependency — the handshake is driven by the same engine TCP TLS 1.3 uses. HTTP/3 codecs and QPACK in <code>hopf-http</code> (feature <code>h3</code>) are Hopf-owned. Hopf adds the mio UDP driver, stream-as-<code>Endpoint</code> model, and hooks-mode connection API for H3.</p>
+<p><strong>Known gaps:</strong> connection migration and <code>NEW_TOKEN</code> address validation aren't implemented, and QUIC's key exchange is classical-only rather than the hybrid PQC key exchange TCP TLS 1.3 offers — see <a href="conformance.html#quic">Conformance → QUIC</a> for the full, row-by-row detail.</p>
 <p><strong>MASQUE:</strong> RFC 9298 CONNECT-UDP / CONNECT-IP building blocks live in <code>hopf-masque</code> (partial product API; HTTP Datagrams + Capsule Protocol plumbing is present in H3).</p>
 <h2 id="see-also">See also</h2>
 <ul>
 <li><a href="http/overview.html">HTTP overview</a></li>
 <li><a href="http/server.html">HTTP server</a></li>
 <li><a href="http/client.html">HTTP client</a></li>
-<li><a href="tls.html">TLS</a> — TCP rustls helpers (same aws-lc-rs provider; QUIC is the 1.3-only PQC-first subset)</li>
+<li><a href="tls.html">TLS</a> — TCP TLS helpers (same in-tree engine; QUIC is the 1.3-only subset)</li>
 <li><a href="architecture.html">Architecture</a></li>
 </ul>
 

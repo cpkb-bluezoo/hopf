@@ -2,8 +2,7 @@
 
 //! QUIC TLS / listen / dial configuration.
 
-use std::fs::File;
-use std::io::{self, BufReader, ErrorKind};
+use std::io::{self, ErrorKind};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,6 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use hopf_core::crypto::kx_policy::KxPolicy;
 use hopf_core::crypto::trust::TrustStore;
+use hopf_core::pem::{parse_certs, parse_pkcs8_keys};
 use hopf_core::tls::{HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials};
 use hopf_core::HandlerFactory;
 
@@ -411,45 +411,39 @@ fn hopf_server_credentials(names: &[&str]) -> io::Result<(ServerCredentials, Vec
 }
 
 fn pem_to_der_certs(pem: &[u8]) -> io::Result<Vec<Bytes>> {
-    let mut reader = BufReader::new(pem);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let certs = certs.map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let certs = parse_certs(pem);
     if certs.is_empty() {
         return Err(io::Error::new(ErrorKind::InvalidData, "no certificates in PEM"));
     }
-    Ok(certs
-        .into_iter()
-        .map(|c| Bytes::copy_from_slice(c.as_ref()))
-        .collect())
+    Ok(certs.into_iter().map(Bytes::from).collect())
 }
 
 fn load_pem_certs(path: &Path) -> io::Result<Vec<Bytes>> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut reader).collect();
-    let certs = certs.map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
+    let pem = std::fs::read(path)?;
+    let certs = parse_certs(&pem);
     if certs.is_empty() {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             format!("no certificates in {}", path.display()),
         ));
     }
-    Ok(certs
-        .into_iter()
-        .map(|c| Bytes::copy_from_slice(c.as_ref()))
-        .collect())
+    Ok(certs.into_iter().map(Bytes::from).collect())
 }
 
 fn load_private_key_pkcs8(path: &Path) -> io::Result<Bytes> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-        .ok_or_else(|| {
-            io::Error::new(
-                ErrorKind::InvalidData,
-                format!("no private key in {}", path.display()),
-            )
-        })?;
-    Ok(Bytes::copy_from_slice(key.secret_der()))
+    let pem = std::fs::read(path)?;
+    let mut keys = parse_pkcs8_keys(&pem);
+    let Some(key) = keys.pop() else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "{}: no PKCS#8 private key found (only `BEGIN PRIVATE KEY` PEM blocks are \
+                 supported — re-encode PKCS#1/SEC1 keys with `openssl pkcs8 -topk8 -nocrypt`)",
+                path.display()
+            ),
+        ));
+    };
+    Ok(Bytes::from(key))
 }
 
 /// Build a QUIC server config from PEM cert/key.

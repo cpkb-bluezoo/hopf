@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_core::{Endpoint, ProtocolHandler, Runtime, SharedTlsConnector, TcpConnectorConfig};
+use hopf_core::{Endpoint, ProtocolHandler, Runtime, SecurityInfo, SharedTlsConnector, TcpConnectorConfig};
 
 use super::{DnsClientTransport, DnsClientTransportHandler, DEFAULT_TIMEOUT};
 
@@ -134,7 +134,15 @@ impl DohClientHandler {
 }
 
 impl ProtocolHandler for DohClientHandler {
-    fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+    fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
+        // Nothing to do yet — a DoH dial is always TLS (`DohClientTransport`
+        // only ever constructs via `https()`), so the request only goes out
+        // once `security_established` confirms the handshake actually
+        // finished. Sending here would write plaintext application data to
+        // a socket the TLS layer hasn't finished securing yet.
+    }
+
+    fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
         if self.started {
             return;
         }

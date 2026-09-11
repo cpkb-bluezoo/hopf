@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmimeparser::dkim::RawHeader;
 
-use hopf_core::crypto::{ed25519_verify, rsa_verify_pkcs1_sha256, RsaPublicKeyComponents};
+use hopf_core::crypto::{ed25519_verify, rsa_verify_pkcs1_sha256, RsaPublicKeyComponents, SignatureBytes};
 
 use super::canon::{self, Canonicalization};
 use super::rsa_der;
@@ -243,7 +243,7 @@ fn verify_tags_and_hash(
     }
 
     let signature = match base64_decode(&tags.b) {
-        Some(b) => b,
+        Some(b) => SignatureBytes::from_bytes(hopf_core::Bytes::from(b)),
         None => {
             cb(DkimSignatureResult {
                 result: DkimResult::PermError,
@@ -294,7 +294,7 @@ enum Algorithm {
 fn evaluate_key(
     key: &KeyTags,
     algo: Algorithm,
-    signature: &[u8],
+    signature: &SignatureBytes,
     signed_data: &[u8],
 ) -> DkimResult {
     let key_algo_rsa = key.k.eq_ignore_ascii_case("rsa") || key.k.is_empty();
