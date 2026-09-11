@@ -73,13 +73,11 @@ impl AeadDirection {
     fn from_material(material: &DirectionalKeyMaterial, cipher: CipherKind) -> Option<Self> {
         let key = match cipher {
             CipherKind::Aes128Gcm | CipherKind::Aes256Gcm => {
-                let mut fixed_iv = [0u8; 4];
-                fixed_iv.copy_from_slice(&material.fixed_iv);
+                let fixed_iv: [u8; 4] = material.fixed_iv.as_ref().try_into().ok()?;
                 DirectionKey::Gcm { key: AesGcmKey::new(&material.key).ok()?, fixed_iv }
             }
             CipherKind::ChaCha20Poly1305 => {
-                let mut fixed_iv = [0u8; 12];
-                fixed_iv.copy_from_slice(&material.fixed_iv);
+                let fixed_iv: [u8; 12] = material.fixed_iv.as_ref().try_into().ok()?;
                 DirectionKey::ChaCha { key: ChaCha20Poly1305Key::new(&material.key).ok()?, fixed_iv }
             }
         };
@@ -133,10 +131,13 @@ impl AeadDirection {
 }
 
 fn gcm_nonce(fixed_iv: &[u8; 4], explicit_nonce: &[u8]) -> [u8; 12] {
-    let mut n = [0u8; 12];
-    n[..4].copy_from_slice(fixed_iv);
-    n[4..].copy_from_slice(explicit_nonce);
-    n
+    std::array::from_fn(|i| {
+        if i < 4 {
+            fixed_iv[i]
+        } else {
+            explicit_nonce[i - 4]
+        }
+    })
 }
 
 fn chacha_nonce(fixed_iv: &[u8; 12], seq: u64) -> [u8; 12] {

@@ -104,8 +104,7 @@ impl DirectionalKeys {
     fn from_secret(aead: Tls13Aead, secret: &[u8; 32]) -> Self {
         let key_bytes = expand_label(secret, "key", &[], aead.key_len());
         let iv_bytes = expand_label(secret, "iv", &[], 12);
-        let mut iv = [0u8; 12];
-        iv.copy_from_slice(iv_bytes.as_ref());
+        let iv: [u8; 12] = iv_bytes.as_ref().try_into().expect("12-byte TLS 1.3 IV");
         let key = match aead {
             Tls13Aead::Aes128GcmSha256 => {
                 AeadKeyKind::Aes128Gcm(Aes128GcmKey::new(key_bytes.as_ref()).expect("16-byte AES-128 key"))

@@ -746,9 +746,14 @@ mod tests {
         error: bool,
     }
 
+    fn wire_handshake_type(msg_type: HandshakeType) -> u8 {
+        msg_type as u8
+    }
+
     impl HandshakeEvents for RecordingHandler {
         fn message_begin(&mut self, msg_type: HandshakeType) {
-            self.events.push(format!("begin:{msg_type:?}"));
+            self.events
+                .push(format!("begin:{}", wire_handshake_type(msg_type)));
         }
         fn random(&mut self, value: &[u8; 32]) {
             self.events.push(format!("random:{}", value[0]));
@@ -761,8 +766,11 @@ mod tests {
             self.events.push(format!("key_update_request:{kind}"));
         }
         fn message_end(&mut self, msg_type: HandshakeType, wire: Bytes) {
-            self.events
-                .push(format!("end:{msg_type:?}:{}b", wire.len()));
+            self.events.push(format!(
+                "end:{}:{}b",
+                wire_handshake_type(msg_type),
+                wire.len()
+            ));
         }
         fn parse_error(&mut self, detail: &'static str) {
             self.error = true;
@@ -797,7 +805,7 @@ mod tests {
         let mut handler = RecordingHandler::default();
         let mut first = &wire[..split];
         parser.receive(&mut first, &mut handler);
-        assert!(handler.events.is_empty(), "{:?}", handler.events);
+        assert!(handler.events.is_empty(), "unexpected events during first chunk");
 
         let mut second = &wire[split..];
         parser.receive(&mut second, &mut handler);
@@ -817,11 +825,10 @@ mod tests {
             let mut handler = RecordingHandler::default();
             let mut input = &wire[..];
             parser.receive(&mut input, &mut handler);
-            assert!(!handler.error, "{:?}", handler.events);
+            assert!(!handler.error, "parser error during key_update roundtrip");
             assert!(
                 handler.events.iter().any(|e| e == &format!("key_update_request:{kind}")),
-                "{:?}",
-                handler.events
+                "missing key_update_request event"
             );
         }
     }
@@ -837,7 +844,7 @@ mod tests {
         let mut handler = RecordingHandler::default();
         let mut input = &body[..];
         parser.receive(&mut input, &mut handler);
-        assert!(handler.error, "{:?}", handler.events);
+        assert!(handler.error, "expected parse error for malformed key_update");
     }
 
     #[test]
@@ -853,7 +860,7 @@ mod tests {
         parser.receive(&mut input, &mut handler);
         parser.close(&mut handler);
 
-        assert!(!handler.error, "{:?}", handler.events);
+        assert!(!handler.error, "parser error during server_hello parse");
         assert!(handler
             .events
             .iter()

@@ -54,13 +54,11 @@ impl DirectionKey {
     fn from_material(material: &DirectionalKeyMaterial, cipher: CipherKind) -> Option<Self> {
         Some(match cipher {
             CipherKind::Aes128Gcm | CipherKind::Aes256Gcm => {
-                let mut fixed_iv = [0u8; 4];
-                fixed_iv.copy_from_slice(&material.fixed_iv);
+                let fixed_iv: [u8; 4] = material.fixed_iv.as_ref().try_into().ok()?;
                 DirectionKey::Gcm { key: AesGcmKey::new(&material.key).ok()?, fixed_iv }
             }
             CipherKind::ChaCha20Poly1305 => {
-                let mut fixed_iv = [0u8; 12];
-                fixed_iv.copy_from_slice(&material.fixed_iv);
+                let fixed_iv: [u8; 12] = material.fixed_iv.as_ref().try_into().ok()?;
                 DirectionKey::ChaCha { key: ChaCha20Poly1305Key::new(&material.key).ok()?, fixed_iv }
             }
         })
@@ -87,12 +85,13 @@ impl DirectionKey {
 
 fn nonce_for(key: &DirectionKey, epoch_seq: &[u8; 8]) -> [u8; 12] {
     match key {
-        DirectionKey::Gcm { fixed_iv, .. } => {
-            let mut n = [0u8; 12];
-            n[..4].copy_from_slice(fixed_iv);
-            n[4..].copy_from_slice(epoch_seq);
-            n
-        }
+        DirectionKey::Gcm { fixed_iv, .. } => std::array::from_fn(|i| {
+            if i < 4 {
+                fixed_iv[i]
+            } else {
+                epoch_seq[i - 4]
+            }
+        }),
         DirectionKey::ChaCha { fixed_iv, .. } => {
             let mut n = *fixed_iv;
             for i in 0..8 {

@@ -145,14 +145,17 @@ impl ChaCha20Poly1305Key {
 mod tests {
     use super::*;
 
+    const TEST_NONCE: [u8; 12] =
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c];
+
     #[test]
     fn aes_gcm_key_round_trips_both_sizes() {
         for key_bytes in [&[7u8; 16][..], &[7u8; 32][..]] {
             let key = AesGcmKey::new(key_bytes).unwrap();
             let mut buf = b"hello world".to_vec();
-            key.seal_in_place_append_tag([0u8; 12], b"aad", &mut buf).unwrap();
+            key.seal_in_place_append_tag(TEST_NONCE, b"aad", &mut buf).unwrap();
             assert_ne!(buf, b"hello world");
-            let n = key.open_in_place([0u8; 12], b"aad", &mut buf).unwrap();
+            let n = key.open_in_place(TEST_NONCE, b"aad", &mut buf).unwrap();
             assert_eq!(&buf[..n], b"hello world");
         }
     }
@@ -166,9 +169,9 @@ mod tests {
     fn round_trip() {
         let key = Aes128GcmKey::new(&[7u8; 16]).unwrap();
         let mut buf = b"hello world".to_vec();
-        key.seal_in_place_append_tag([0u8; 12], b"aad", &mut buf).unwrap();
+        key.seal_in_place_append_tag(TEST_NONCE, b"aad", &mut buf).unwrap();
         assert_ne!(buf, b"hello world");
-        let n = key.open_in_place([0u8; 12], b"aad", &mut buf).unwrap();
+        let n = key.open_in_place(TEST_NONCE, b"aad", &mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello world");
     }
 
@@ -176,17 +179,17 @@ mod tests {
     fn wrong_aad_rejected() {
         let key = Aes128GcmKey::new(&[7u8; 16]).unwrap();
         let mut buf = b"hello world".to_vec();
-        key.seal_in_place_append_tag([0u8; 12], b"aad", &mut buf).unwrap();
-        assert_eq!(key.open_in_place([0u8; 12], b"different", &mut buf), Err(AeadError));
+        key.seal_in_place_append_tag(TEST_NONCE, b"aad", &mut buf).unwrap();
+        assert_eq!(key.open_in_place(TEST_NONCE, b"different", &mut buf), Err(AeadError));
     }
 
     #[test]
     fn chacha20_poly1305_key_round_trips() {
         let key = ChaCha20Poly1305Key::new(&[7u8; 32]).unwrap();
         let mut buf = b"hello world".to_vec();
-        key.seal_in_place_append_tag([0u8; 12], b"aad", &mut buf).unwrap();
+        key.seal_in_place_append_tag(TEST_NONCE, b"aad", &mut buf).unwrap();
         assert_ne!(buf, b"hello world");
-        let n = key.open_in_place([0u8; 12], b"aad", &mut buf).unwrap();
+        let n = key.open_in_place(TEST_NONCE, b"aad", &mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello world");
     }
 
