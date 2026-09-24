@@ -11,6 +11,7 @@
 #![warn(missing_docs)]
 
 pub mod auth;
+pub mod caching;
 pub mod capsule;
 pub mod client;
 pub mod content_coding;
@@ -49,8 +50,12 @@ pub use client::{
 };
 #[cfg(feature = "h3")]
 pub use client::{connect_auto, connect_auto_unix, connect_h3_by_name, connect_https, HttpFallback};
+pub use caching::{
+    evaluate_preconditions, parse_entity_tag_list, CacheControl, EntityTag, EntityTagList,
+    Precondition, Validators,
+};
 pub use server::{
-    CompressibleFn, ContentEncodingServerFactory, HttpServer, ServerContentEncodingPolicy,
+    CompressibleFn, ConditionalServerFactory, ContentEncodingServerFactory, HttpServer, ServerContentEncodingPolicy,
 };
 pub use dispatch::AlpnHttpEndpoint;
 pub use error::{HttpError, HttpResult};

@@ -10,7 +10,8 @@ use std::sync::Arc;
 use hopf_core::{BindingId, ProtocolHandler, Runtime, SharedTlsAcceptor, TcpListenerConfig};
 
 use crate::{
-    AlpnHttpEndpoint, CleartextHttpEndpoint, ContentEncodingServerFactory, HttpLimits,
+    AlpnHttpEndpoint, CleartextHttpEndpoint, ConditionalServerFactory, ContentEncodingServerFactory,
+    HttpLimits,
     ServerContentEncodingPolicy, ServerHandlerFactory,
 };
 
@@ -27,6 +28,15 @@ pub struct HttpServer {
     limits: HttpLimits,
     tls_acceptor: Option<SharedTlsAcceptor>,
     content_encoding: ContentEncodingSetting,
+    conditional: ConditionalSetting,
+}
+
+/// Whether [`HttpServer`] answers conditional `GET`/`HEAD` requests itself.
+#[derive(Default, PartialEq, Eq)]
+enum ConditionalSetting {
+    #[default]
+    On,
+    Off,
 }
 
 /// How [`HttpServer`] applies content coding.
@@ -75,6 +85,21 @@ impl HttpServer {
         self
     }
 
+    /// Stop [`HttpServer`] answering conditional requests itself.
+    ///
+    /// By default every handler is wrapped in a [`ConditionalServerFactory`]:
+    /// a `GET` or `HEAD` carrying `If-None-Match`, `If-Modified-Since`,
+    /// `If-Match` or `If-Unmodified-Since` whose `200` response has an `ETag`
+    /// and/or `Last-Modified` becomes a `304 Not Modified` or `412
+    /// Precondition Failed` (RFC 9110 section 13). Requests without a
+    /// precondition, other methods and other statuses are untouched; a
+    /// handler that changes state evaluates preconditions itself with
+    /// [`evaluate_preconditions`](crate::evaluate_preconditions).
+    pub fn disable_conditional_requests(mut self) -> Self {
+        self.conditional = ConditionalSetting::Off;
+        self
+    }
+
     /// Terminate TLS at accept, negotiating `h2`/`http/1.1` via ALPN.
     /// `acceptor` must already advertise those protocols (see
     /// [`hopf_core::acceptor_from_pem`] and friends).
@@ -102,6 +127,13 @@ impl HttpServer {
                 factory,
                 ServerContentEncodingPolicy::new(&limits),
             )),
+        };
+        let factory: Arc<dyn ServerHandlerFactory> = match self.conditional {
+            // Outside content coding: a 304 must carry the `Vary` and weak
+            // `ETag` the compressed 200 would have had, and only this layer
+            // sees the final headers.
+            ConditionalSetting::On => Arc::new(ConditionalServerFactory::new(factory)),
+            ConditionalSetting::Off => factory,
         };
         let config = if let Some(acceptor) = &self.tls_acceptor {
             let acceptor = Arc::clone(acceptor);

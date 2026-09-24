@@ -12,7 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use hopf_core::storage::{StorageError, StorageExecutor};
 use hopf_http::Headers;
-use hopf_http::{parse_http_date, ServerHandler, ServerResponseHandle, ServerWriter};
+use hopf_http::{
+    evaluate_preconditions, EntityTag, Precondition, ServerHandler,
+    ServerResponseHandle, ServerWriter, Validators,
+};
 
 use crate::constants::{
     self, CONTENT_TYPE_XML, DEPTH_0, DEPTH_1, DEPTH_INFINITY, HEADER_DAV, HEADER_DEPTH,
@@ -49,7 +52,9 @@ pub struct WebDavHandler {
     method: String,
     request_path: String,
     path: Option<PathBuf>,
-    if_modified_since: Option<SystemTime>,
+    /// The request's `If-Match` / `If-Unmodified-Since` / `If-None-Match` /
+    /// `If-Modified-Since` fields, evaluated by [`evaluate_preconditions`].
+    preconditions: Headers,
     depth: i32,
     destination: Option<String>,
     overwrite: bool,
@@ -102,7 +107,7 @@ impl WebDavHandler {
             method: String::new(),
             request_path: String::new(),
             path: None,
-            if_modified_since: None,
+            preconditions: Headers::new(),
             depth: DEPTH_INFINITY,
             destination: None,
             overwrite: true,
@@ -178,8 +183,13 @@ impl ServerHandler for WebDavHandler {
             self.path = resolve_path_lexical(&self.root_path, &self.request_path);
         }
 
-        if let Some(v) = headers.get("if-modified-since") {
-            self.if_modified_since = parse_http_date(v);
+        for f in headers.iter() {
+            if ["if-match", "if-unmodified-since", "if-none-match", "if-modified-since"]
+                .iter()
+                .any(|n| f.name.eq_ignore_ascii_case(n))
+            {
+                self.preconditions.add(f.name.to_ascii_lowercase(), f.value.clone());
+            }
         }
 
         if self.config.webdav_enabled {
@@ -359,7 +369,9 @@ impl WebDavHandler {
     }
 
     fn handle_get_head(&mut self, w: &mut dyn ServerWriter) {
-        let if_mod = self.if_modified_since;
+        let preconditions = self.preconditions.clone();
+        let method = self.method.clone();
+        let cache_control = self.config.cache_control.as_ref().filter(|c| !c.is_empty()).map(|c| c.to_string());
         let path = self.path.clone();
         let request_path = self.request_path.clone();
         let welcome = self.welcome_files.clone();
@@ -410,21 +422,39 @@ impl WebDavHandler {
                 }
                 let meta = fs::metadata(&target)?;
                 let modified = meta.modified()?;
-                if let Some(since) = if_mod {
-                    if modified <= since {
-                        rh.execute(|w| {
+                let etag = weak_etag(&target, &meta);
+                let last_modified = http_date(modified);
+                match evaluate_preconditions(
+                    &method,
+                    &preconditions,
+                    Some(&validators_of(&target, &meta)),
+                ) {
+                    Precondition::NotModified => {
+                        // RFC 9110 §15.4.5: a 304 repeats the validators (and any
+                        // freshness fields) the 200 would have carried.
+                        let (etag, last_modified) = (etag.clone(), last_modified.clone());
+                        let cache_control = cache_control.clone();
+                        rh.execute(move |w| {
                             let mut h = Headers::new();
                             h.status(304);
+                            h.set("Last-Modified", last_modified);
+                            h.set("ETag", etag);
+                            if let Some(cc) = cache_control {
+                                h.set("Cache-Control", cc);
+                            }
                             w.headers(h);
                             w.complete();
                         });
                         return Ok(());
                     }
+                    Precondition::PreconditionFailed => {
+                        rh.execute(|w| Self::send_error(w, 412));
+                        return Ok(());
+                    }
+                    Precondition::Proceed => {}
                 }
                 let content_type = content_type_for(&target, &types);
                 let size = meta.len();
-                let etag = weak_etag(&target, &meta);
-                let last_modified = http_date(modified);
                 let stream_body = is_get && size > 0;
 
                 // Open (and fail fast on) the file *before* sending headers,
@@ -447,6 +477,9 @@ impl WebDavHandler {
                     h.status(200);
                     h.set("Last-Modified", last_modified);
                     h.set("ETag", &etag);
+                    if let Some(cc) = cache_control {
+                        h.set("Cache-Control", cc);
+                    }
                     h.set("Content-Type", &content_type);
                     h.set("Content-Length", size.to_string());
                     w.headers(h);
@@ -525,6 +558,7 @@ impl WebDavHandler {
         let root = self.root_path.clone();
         let canonical = self.canonical_root.clone();
         let storage = Arc::clone(&self.storage);
+        let preconditions = self.preconditions.clone();
 
         let op_state = Arc::clone(&state);
         let cb_state = Arc::clone(&state);
@@ -538,6 +572,16 @@ impl WebDavHandler {
                 };
                 if resolved.is_dir() {
                     return Ok(Some(409));
+                }
+                // RFC 9110 §13.1: evaluate before `File::create` truncates,
+                // so a lost-update guard (`If-Match`) or create-only
+                // (`If-None-Match: *`) request never destroys what it meant
+                // to protect.
+                let current = fs::metadata(&resolved).ok().map(|m| validators_of(&resolved, &m));
+                if evaluate_preconditions("PUT", &preconditions, current.as_ref())
+                    != Precondition::Proceed
+                {
+                    return Ok(Some(412));
                 }
                 if let Some(parent) = resolved.parent() {
                     if fs::create_dir_all(parent).is_err() {
@@ -598,6 +642,7 @@ impl WebDavHandler {
         let canonical = self.canonical_root.clone();
         let href = self.href();
         let mut store = self.dead_store.clone();
+        let preconditions = self.preconditions.clone();
         self.offload(w, move || {
             let Some(lexical) = path else {
                 return Ok(DeleteOutcome::Status(404));
@@ -607,6 +652,12 @@ impl WebDavHandler {
             };
             if !resolved.exists() || is_sidecar_file(&resolved) {
                 return Ok(DeleteOutcome::Status(404));
+            }
+            let current = fs::metadata(&resolved).ok().map(|m| validators_of(&resolved, &m));
+            if evaluate_preconditions("DELETE", &preconditions, current.as_ref())
+                != Precondition::Proceed
+            {
+                return Ok(DeleteOutcome::Status(412));
             }
             let mut errors: Vec<(String, u16)> = Vec::new();
             delete_recursive(&resolved, &href, &mut store, &mut errors);
@@ -1220,6 +1271,19 @@ fn weak_etag(path: &Path, meta: &fs::Metadata) -> String {
     format!("W/\"{:02x}{:02x}{:02x}{:02x}\"", digest[0], digest[1], digest[2], digest[3])
 }
 
+/// The current validators of a file or collection: its weak entity-tag and
+/// modification time.
+fn validators_of(path: &Path, meta: &fs::Metadata) -> Validators {
+    let mut v = Validators::new();
+    if let Some(tag) = EntityTag::parse(&weak_etag(path, meta)) {
+        v = v.etag(tag);
+    }
+    if let Ok(t) = meta.modified() {
+        v = v.last_modified(t);
+    }
+    v
+}
+
 fn http_date(t: SystemTime) -> String {
     let secs = t
         .duration_since(UNIX_EPOCH)
@@ -1629,6 +1693,7 @@ fn parse_timeout_header(raw: Option<&str>) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hopf_http::parse_http_date;
     use crate::dead_props::DeadPropMode;
     use std::time::Duration;
 

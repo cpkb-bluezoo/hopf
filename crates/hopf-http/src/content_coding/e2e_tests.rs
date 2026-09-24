@@ -165,17 +165,17 @@ fn start_server(rt: &Arc<Runtime>, policy: ServerContentEncodingPolicy) -> Socke
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-struct Outcome {
-    version: Option<crate::version::HttpVersion>,
-    status: u16,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-    closed: bool,
-    failed: Option<std::io::Error>,
+pub(crate) struct Outcome {
+    pub(crate) version: Option<crate::version::HttpVersion>,
+    pub(crate) status: u16,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
+    pub(crate) closed: bool,
+    pub(crate) failed: Option<std::io::Error>,
 }
 
 impl Outcome {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
@@ -206,9 +206,9 @@ impl HttpResponseHandler for Rec {
     }
 }
 
-type Extra = Vec<(&'static str, &'static str)>;
+pub(crate) type Extra = Vec<(&'static str, &'static str)>;
 
-enum Job {
+pub(crate) enum Job {
     Get(&'static str),
     GetWith(&'static str, Extra),
     Post { path: &'static str, coding: Option<ContentCoding>, body: Vec<u8>, extra: Extra },
@@ -303,13 +303,13 @@ fn pump(state: Arc<Mutex<Pump>>) {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Proto {
+pub(crate) enum Proto {
     H1,
     H2,
 }
 
 /// Client for `proto`: `None` turns content coding off, `Some` supplies the policy.
-fn client_for(addr: SocketAddr, proto: Proto, policy: Option<ContentEncodingPolicy>) -> HttpClient {
+pub(crate) fn client_for(addr: SocketAddr, proto: Proto, policy: Option<ContentEncodingPolicy>) -> HttpClient {
     let mut client = HttpClient::from_addr(addr);
     if let Proto::H2 = proto {
         client = client.h2_prior_knowledge(true);
@@ -320,12 +320,12 @@ fn client_for(addr: SocketAddr, proto: Proto, policy: Option<ContentEncodingPoli
     }
 }
 
-fn run(rt: &Arc<Runtime>, addr: SocketAddr, proto: Proto, policy: Option<ContentEncodingPolicy>, job: Job) -> Outcome {
+pub(crate) fn run(rt: &Arc<Runtime>, addr: SocketAddr, proto: Proto, policy: Option<ContentEncodingPolicy>, job: Job) -> Outcome {
     run_with(rt, &client_for(addr, proto, policy), job)
 }
 
 /// Run one job on `client` (reusing it shares its capability cache).
-fn run_with(rt: &Arc<Runtime>, client: &HttpClient, job: Job) -> Outcome {
+pub(crate) fn run_with(rt: &Arc<Runtime>, client: &HttpClient, job: Job) -> Outcome {
     let out = Arc::new(Mutex::new(Outcome::default()));
     client
         .connect(rt, Box::new(Conn { job: Some(job), out: Arc::clone(&out) }))
@@ -345,7 +345,7 @@ fn run_with(rt: &Arc<Runtime>, client: &HttpClient, job: Job) -> Outcome {
     std::mem::take(&mut *g)
 }
 
-fn rt() -> Arc<Runtime> {
+pub(crate) fn rt() -> Arc<Runtime> {
     Arc::new(Runtime::start(RuntimeConfig::default()).unwrap())
 }
 
@@ -362,7 +362,7 @@ const CODED: [ContentCoding; 3] = [ContentCoding::Brotli, ContentCoding::Gzip, C
 /// Read one complete HTTP/1.1 response off `s`, framed by its own headers
 /// (the server keeps the connection alive, so EOF cannot delimit it).
 /// `head_only` for HEAD. Returns (head, body-as-received).
-fn read_response(s: &mut TcpStream, head_only: bool) -> (String, Vec<u8>) {
+pub(crate) fn read_response(s: &mut TcpStream, head_only: bool) -> (String, Vec<u8>) {
     let mut all = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -399,21 +399,21 @@ fn raw_get(addr: SocketAddr, path: &str, accept_encoding: Option<&str>) -> (Stri
     read_response(&mut s, false)
 }
 
-fn head_has(head: &str, name: &str, value: &str) -> bool {
+pub(crate) fn head_has(head: &str, name: &str, value: &str) -> bool {
     head.lines().any(|l| {
         l.split_once(':')
             .is_some_and(|(n, v)| n.eq_ignore_ascii_case(name) && v.trim().eq_ignore_ascii_case(value))
     })
 }
 
-fn head_lacks(head: &str, name: &str) -> bool {
+pub(crate) fn head_lacks(head: &str, name: &str) -> bool {
     !head
         .lines()
         .any(|l| l.split_once(':').is_some_and(|(n, _)| n.eq_ignore_ascii_case(name)))
 }
 
 /// De-chunk an HTTP/1.1 chunked body.
-fn dechunk(mut b: &[u8]) -> Vec<u8> {
+pub(crate) fn dechunk(mut b: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
         let eol = b.windows(2).position(|w| w == b"\r\n").expect("chunk size line");
