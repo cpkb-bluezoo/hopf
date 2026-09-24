@@ -55,7 +55,12 @@ pub struct DnsService {
     metrics: std::sync::Mutex<DnsServerMetrics>,
     /// Optional local resolve hook: return `Some` to answer, `None` to forward.
     local: Option<Box<dyn Fn(&DnsMessage) -> Option<DnsMessage> + Send + Sync>>,
+    /// Optional hook for messages whose opcode is not QUERY.
+    opcode: Option<Box<OpcodeHandler>>,
 }
+
+/// See [`DnsService::set_opcode_handler`].
+type OpcodeHandler = dyn Fn(&DnsMessage, SocketAddr) -> Option<DnsMessage> + Send + Sync;
 
 impl DnsService {
     /// New service with shared cache.
@@ -66,6 +71,7 @@ impl DnsService {
             cookies: DnsCookie::new(),
             metrics: std::sync::Mutex::new(DnsServerMetrics::default()),
             local: None,
+            opcode: None,
         }
     }
 
@@ -75,11 +81,55 @@ impl DnsService {
     }
 
     /// Custom local answers (override `resolve`).
+    ///
+    /// Only reached for standard queries (opcode QUERY). For other opcodes
+    /// see [`Self::set_opcode_handler`].
     pub fn set_local_resolver<F>(&mut self, f: F)
     where
         F: Fn(&DnsMessage) -> Option<DnsMessage> + Send + Sync + 'static,
     {
         self.local = Some(Box::new(f));
+    }
+
+    /// Handle messages with an opcode other than QUERY, such as NOTIFY
+    /// (RFC 1996) and dynamic UPDATE (RFC 2136).
+    ///
+    /// This is the counterpart of [`Self::set_local_resolver`] for the rest
+    /// of the opcode space. `hopf-dns` is a caching forwarder and implements
+    /// none of these itself: it has no zone store to notify about or mutate.
+    /// A caller that serves a zone through `set_local_resolver` can plug in
+    /// its own handling here instead of having the message refused before its
+    /// code ever sees it.
+    ///
+    /// `f` receives the parsed message and the peer's address (an UPDATE
+    /// handler needs the source to authorise the change) and returns
+    /// `Some(response)` to answer, or `None` to decline, in which case the
+    /// reply is `NOTIMP` exactly as if no handler were set. Build responses
+    /// with [`DnsMessage::response_template`], which echoes the request's
+    /// opcode as RFC 1996 §4.7 and RFC 2136 §3.8 require. The opcode
+    /// constants are [`OPCODE_NOTIFY`](crate::wire::OPCODE_NOTIFY) and
+    /// [`OPCODE_UPDATE`](crate::wire::OPCODE_UPDATE); the sections of an
+    /// UPDATE message (zone, prerequisite, update, additional) arrive in the
+    /// question, answer, authority and additional fields, with the RFC 2136
+    /// `NONE` class (254) preserved in each record's `raw_class`.
+    ///
+    /// Notes:
+    ///
+    /// - The handler sees only requests: a message with the QR bit set is a
+    ///   response, never a query, and is refused with `NOTIMP` without
+    ///   reaching it.
+    /// - It is subject to the same DNS Cookie anti-amplification rule as
+    ///   resolution (RFC 7873 §5.2.3): a client that presents a cookie
+    ///   without a verifiable server cookie gets a cookie-only reply and the
+    ///   handler is not called. A client presenting *no* cookie is not
+    ///   filtered, so an UPDATE handler must authenticate and authorise the
+    ///   sender itself; `hopf-dns` provides no TSIG or SIG(0).
+    /// - It runs on the listener's thread, so it should not block.
+    pub fn set_opcode_handler<F>(&mut self, f: F)
+    where
+        F: Fn(&DnsMessage, SocketAddr) -> Option<DnsMessage> + Send + Sync + 'static,
+    {
+        self.opcode = Some(Box::new(f));
     }
 
     /// Shared cache.
@@ -108,7 +158,7 @@ impl DnsService {
     /// against a spoofed victim address.
     pub fn process_query_sync(&self, query: &DnsMessage, peer: SocketAddr) -> DnsMessage {
         match crate::cookie::parse_client_cookie(&query.additionals) {
-            ClientCookieOption::Absent => self.compute_response(query),
+            ClientCookieOption::Absent => self.compute_response(query, peer),
             ClientCookieOption::Malformed => query.response_template(RCODE_FORMERR),
             ClientCookieOption::Present { client, server } => {
                 let ip_bytes = ip_octets(peer.ip());
@@ -123,7 +173,7 @@ impl DnsService {
                 drop(m);
                 let option = self.cookies.encode_response_edns_option(&client, &ip_bytes);
                 let mut resp = if verified {
-                    self.compute_response(query)
+                    self.compute_response(query, peer)
                 } else {
                     query.response_template(0)
                 };
@@ -136,14 +186,24 @@ impl DnsService {
 
     /// Core query handling, without the cookie exchange (factored out so
     /// [`Self::process_query_sync`] can wrap every return path uniformly).
-    fn compute_response(&self, query: &DnsMessage) -> DnsMessage {
+    fn compute_response(&self, query: &DnsMessage, peer: SocketAddr) -> DnsMessage {
         {
             let mut m = self.metrics.lock().unwrap();
             m.queries += 1;
         }
-        // RFC 1035 §4.1.1: only actual queries (QR clear) with the standard
-        // QUERY opcode are supported.
-        if !query.is_query() || query.opcode() != OPCODE_QUERY {
+        // RFC 1035 §4.1.1: a message with QR set is a response, not a query.
+        if !query.is_query() {
+            return query.response_template(RCODE_NOTIMP);
+        }
+        // Only the standard QUERY opcode is implemented here. Anything else
+        // (NOTIFY, UPDATE, ...) is offered to the caller's own handler, and
+        // is NOTIMP if there is none or it declines.
+        if query.opcode() != OPCODE_QUERY {
+            if let Some(ref handler) = self.opcode {
+                if let Some(resp) = handler(query, peer) {
+                    return resp;
+                }
+            }
             return query.response_template(RCODE_NOTIMP);
         }
         // RFC 1035 §4.1.2: the question section must not be empty.
@@ -388,6 +448,155 @@ mod tests {
         query.flags |= crate::wire::FLAG_QR;
         let resp = service.process_query_sync(&query, peer);
         assert_eq!(resp.rcode(), RCODE_NOTIMP);
+    }
+
+    /// A NOTIFY (opcode 4) query for `zone`.
+    fn notify(id: u16, zone: &str) -> DnsMessage {
+        let mut m = DnsMessage::query(id, DnsQuestion::in_class(zone, DnsType::Soa), false);
+        m.flags |= 4 << 11;
+        m
+    }
+
+    #[test]
+    fn unhandled_opcode_is_notimp_and_the_reply_carries_that_opcode() {
+        let service = service_answering(Ipv4Addr::new(203, 0, 113, 9));
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let resp = service.process_query_sync(&notify(11, "example.com"), peer);
+        assert_eq!(resp.rcode(), RCODE_NOTIMP);
+        assert_eq!(resp.opcode(), 4, "the reply must echo the NOTIFY opcode");
+    }
+
+    /// What an opcode handler was asked, recorded for assertions.
+    type Seen = Arc<std::sync::Mutex<Vec<(u16, u16, String, SocketAddr)>>>;
+
+    fn service_with_recording_handler(reply: bool) -> (DnsService, Seen) {
+        let mut service = service_answering(Ipv4Addr::new(203, 0, 113, 9));
+        let seen: Seen = Arc::default();
+        let seen2 = Arc::clone(&seen);
+        service.set_opcode_handler(move |m, peer| {
+            let zone = m.questions.first().map(|q| q.name.clone()).unwrap_or_default();
+            seen2.lock().unwrap().push((m.opcode(), m.id, zone, peer));
+            reply.then(|| m.response_template(crate::wire::RCODE_NOERROR))
+        });
+        (service, seen)
+    }
+
+    #[test]
+    fn opcode_handler_answers_notify_and_sees_the_message_and_peer() {
+        let (service, seen) = service_with_recording_handler(true);
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let resp = service.process_query_sync(&notify(21, "example.com"), peer);
+
+        assert_eq!(resp.rcode(), crate::wire::RCODE_NOERROR);
+        assert_eq!(resp.opcode(), crate::wire::OPCODE_NOTIFY, "a reply built from the template echoes NOTIFY");
+        assert!(resp.is_response());
+        assert_eq!(resp.id, 21);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [(crate::wire::OPCODE_NOTIFY, 21, "example.com".to_string(), peer)]
+        );
+    }
+
+    #[test]
+    fn a_declining_opcode_handler_leaves_the_default_notimp() {
+        let (service, seen) = service_with_recording_handler(false);
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let resp = service.process_query_sync(&notify(22, "example.com"), peer);
+        assert_eq!(resp.rcode(), RCODE_NOTIMP);
+        assert_eq!(resp.opcode(), 4);
+        assert_eq!(seen.lock().unwrap().len(), 1, "it was consulted, and declined");
+    }
+
+    #[test]
+    fn opcode_handler_is_not_consulted_for_queries_or_for_responses() {
+        let (service, seen) = service_with_recording_handler(true);
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+
+        // An ordinary query still goes to the local resolver / forwarder.
+        let q = DnsMessage::query(23, DnsQuestion::in_class("example.com", DnsType::A), true);
+        let resp = service.process_query_sync(&q, peer);
+        assert_eq!(resp.answers.len(), 1);
+
+        // A message with QR set is a response even when its opcode is not
+        // QUERY: refused, never handed to the handler.
+        let mut echo = notify(24, "example.com");
+        echo.flags |= crate::wire::FLAG_QR;
+        let resp = service.process_query_sync(&echo, peer);
+        assert_eq!(resp.rcode(), RCODE_NOTIMP);
+        assert!(seen.lock().unwrap().is_empty(), "the handler must only ever see requests");
+    }
+
+    #[test]
+    fn opcode_handler_is_skipped_for_a_cookie_that_has_not_been_verified() {
+        // RFC 7873 §5.2.3 anti-amplification applies to it as to resolution.
+        let (service, seen) = service_with_recording_handler(true);
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let client_cookie = [6u8; 8];
+
+        let mut unverified = notify(25, "example.com");
+        unverified.additionals.push(cookie_option(&client_cookie, None));
+        let resp = service.process_query_sync(&unverified, peer);
+        assert!(seen.lock().unwrap().is_empty(), "no verified server cookie: no handler call");
+        assert!(resp.additionals.iter().any(|rr| rr.rtype == Some(DnsType::Opt)), "cookie-only reply");
+
+        let server_cookie = service.cookies().generate_server_cookie(&client_cookie, &ip_octets(peer.ip()));
+        let mut verified = notify(26, "example.com");
+        verified.additionals.push(cookie_option(&client_cookie, Some(&server_cookie)));
+        service.process_query_sync(&verified, peer);
+        assert_eq!(seen.lock().unwrap().len(), 1, "a verified cookie reaches the handler");
+    }
+
+    /// An RFC 2136 UPDATE carries records the query path never sees: the
+    /// `NONE` class (254) and `ANY` type/class prerequisites and deletions.
+    /// They must survive parsing intact for a handler to act on them.
+    #[test]
+    fn an_rfc_2136_update_reaches_the_handler_with_its_sections_intact() {
+        use crate::wire::{DnsResourceRecord as Rr, OPCODE_UPDATE};
+        const NONE: u16 = 254;
+        const ANY: u16 = 255;
+        let a = DnsType::A as u16;
+
+        let mut update = DnsMessage::new(
+            30,
+            OPCODE_UPDATE << 11,
+            // Zone section: the zone being updated (type SOA).
+            vec![DnsQuestion::in_class("example.com", DnsType::Soa)],
+            // Prerequisite: "name is in use" (class ANY, type ANY, no data).
+            vec![Rr::opaque("host.example.com", ANY, ANY, 0, vec![])],
+            // Update section: add one A record, delete another (class NONE, with its rdata).
+            vec![
+                Rr::opaque("host.example.com", a, 1, 300, vec![192, 0, 2, 1]),
+                Rr::opaque("host.example.com", a, NONE, 0, vec![192, 0, 2, 2]),
+            ],
+            Vec::new(),
+        );
+        update.flags &= !crate::wire::FLAG_RD;
+        let wire = update.serialize().unwrap();
+        let parsed = DnsMessage::parse(&wire).unwrap();
+
+        let observed: Arc<std::sync::Mutex<Option<DnsMessage>>> = Arc::default();
+        let observed2 = Arc::clone(&observed);
+        let mut service = DnsService::new(Arc::new(DnsCache::default()));
+        service.set_opcode_handler(move |m, _| {
+            *observed2.lock().unwrap() = Some(m.clone());
+            Some(m.response_template(crate::wire::RCODE_NOERROR))
+        });
+        let peer: SocketAddr = "198.51.100.7:5353".parse().unwrap();
+        let resp = service.process_query_sync(&parsed, peer);
+
+        assert_eq!(resp.opcode(), OPCODE_UPDATE);
+        assert_eq!(resp.rcode(), crate::wire::RCODE_NOERROR);
+        // The reply survives the wire too.
+        let back = DnsMessage::parse(&resp.serialize().unwrap()).unwrap();
+        assert_eq!(back.opcode(), OPCODE_UPDATE);
+
+        let m = observed.lock().unwrap().clone().expect("handler must have run");
+        assert_eq!(m.opcode(), OPCODE_UPDATE);
+        assert_eq!(m.questions[0].name, "example.com");
+        assert_eq!((m.answers[0].raw_type, m.answers[0].raw_class), (ANY, ANY), "prerequisite");
+        assert_eq!((m.authorities[0].raw_type, m.authorities[0].raw_class, m.authorities[0].ttl), (a, 1, 300));
+        assert_eq!(m.authorities[0].rdata, [192, 0, 2, 1]);
+        assert_eq!((m.authorities[1].raw_class, m.authorities[1].rdata.as_slice()), (NONE, &[192u8, 0, 2, 2][..]), "class NONE deletion");
     }
 
     #[test]
