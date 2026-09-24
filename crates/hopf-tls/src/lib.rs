@@ -580,6 +580,145 @@ mod integration_tests {
         server_thread.join().unwrap();
     }
 
+    /// ALPN (RFC 7301, issue #436) on TLS 1.2 against an independent
+    /// implementation: a `rustls` client forced to TLS 1.2 offers `h2` and
+    /// `http/1.1`; a hopf TLS 1.2 server that prefers `http/1.1` picks by *its
+    /// own* order, and both sides agree on it. A no-overlap offer is refused.
+    #[test]
+    fn rustls_tls12_client_negotiates_alpn_with_hopf_tls12_server() {
+        let (_dir, cert_path, key_path, certified) = write_temp_pem("tls12-alpn");
+        let acceptor = hopf_core::acceptor_with_alpn(
+            hopf_core::acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(),
+            &[b"http/1.1", b"h2"],
+        );
+        let alpn_seen = Arc::new(Mutex::new(None));
+        let alpn_seen2 = Arc::clone(&alpn_seen);
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+                    Box::new(TlsEcho { alpn_seen: Arc::clone(&alpn_seen2), ready: Arc::new(Mutex::new(false)) })
+                        as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let client_with = |alpn: &[&[u8]]| {
+            let mut roots = RootCertStore::empty();
+            roots.add(certified.cert.der().clone()).unwrap();
+            let mut cfg = ClientConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+                .with_protocol_versions(&[&rustls::version::TLS12])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+            let conn = ClientConnection::new(
+                Arc::new(cfg),
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            )
+            .unwrap();
+            let sock = StdTcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            StreamOwned::new(conn, sock)
+        };
+
+        let mut tls = client_with(&[b"h2", b"http/1.1"]);
+        tls.write_all(b"alpn-tls12").unwrap();
+        tls.flush().unwrap();
+        let mut buf = [0u8; 16];
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"alpn-tls12");
+        assert_eq!(tls.conn.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2));
+        assert_eq!(tls.conn.alpn_protocol(), Some(&b"http/1.1"[..]), "rustls must see the server's pick");
+        assert_eq!(alpn_seen.lock().unwrap().as_deref(), Some(&b"http/1.1"[..]), "and hopf must report the same");
+
+        // Nothing in common: hopf refuses, and rustls reports the failed handshake.
+        let mut tls = client_with(&[b"spdy/3"]);
+        let outcome = tls.write_all(b"x").and_then(|_| tls.flush()).and_then(|_| tls.read(&mut buf).map(|_| ()));
+        assert!(outcome.is_err(), "a client with no ALPN overlap must not get a working connection");
+
+        rt.shutdown();
+    }
+
+    /// The reverse: hopf's TLS 1.2 *client* offers ALPN to a `rustls` server
+    /// forced to TLS 1.2, and reads back what the server chose.
+    #[test]
+    fn hopf_tls12_client_negotiates_alpn_with_rustls_tls12_server() {
+        let (_dir, cert_path, _key_path, certified) = write_temp_pem("tls12-alpn-rev");
+        let certs = vec![certified.cert.der().clone()];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let mut server_cfg = rustls::ServerConfig::builder_with_provider(rustls::crypto::aws_lc_rs::default_provider().into())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        server_cfg.alpn_protocols = vec![b"h2".to_vec()];
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_alpn: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let server_alpn2 = Arc::clone(&server_alpn);
+        let server_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(server_cfg)).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).unwrap();
+            *server_alpn2.lock().unwrap() = tls.conn.alpn_protocol().map(<[u8]>::to_vec);
+            tls.write_all(&buf[..n]).unwrap();
+            tls.flush().unwrap();
+        });
+
+        let connector = hopf_core::connector_with_alpn(
+            hopf_core::connector_from_pem_tls12(&cert_path).unwrap(),
+            &[b"http/1.1", b"h2"],
+        );
+        let client_alpn: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let echoed = Arc::new(Mutex::new(Vec::new()));
+        struct Probe {
+            alpn: Arc<Mutex<Option<Vec<u8>>>>,
+            echoed: Arc<Mutex<Vec<u8>>>,
+        }
+        impl ProtocolHandler for Probe {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn security_established(&mut self, endpoint: &mut dyn Endpoint, info: &SecurityInfo) {
+                *self.alpn.lock().unwrap() = info.alpn().map(<[u8]>::to_vec);
+                endpoint.send(b"hopf-alpn-client");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.echoed.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+        let (a2, e2) = (Arc::clone(&client_alpn), Arc::clone(&echoed));
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(Probe { alpn: Arc::clone(&a2), echoed: Arc::clone(&e2) }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+        for _ in 0..150 {
+            if echoed.lock().unwrap().as_slice() == b"hopf-alpn-client" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(echoed.lock().unwrap().as_slice(), b"hopf-alpn-client");
+        assert_eq!(client_alpn.lock().unwrap().as_deref(), Some(&b"h2"[..]), "hopf client's SecurityInfo::alpn()");
+        rt.shutdown();
+        server_thread.join().unwrap();
+        assert_eq!(server_alpn.lock().unwrap().as_deref(), Some(&b"h2"[..]), "rustls agrees");
+    }
+
     /// Real interop proof for session resumption (crypto-migration-plan.md
     /// Phase 5's ticket work): a `rustls` client reusing the same
     /// `ClientConfig` (and thus its own in-memory ticket cache) across two

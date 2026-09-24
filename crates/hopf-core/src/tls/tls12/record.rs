@@ -12,6 +12,8 @@
 //! records carry their true content type in the record header even once
 //! encrypted, so there's no inner-type unwrapping to do here either.
 
+use bytes::Bytes;
+
 use crate::crypto::aead::{AeadError, AesGcmKey, ChaCha20Poly1305Key};
 use crate::security::SecurityInfo;
 
@@ -297,6 +299,12 @@ impl Tls12RecordEngine {
     pub fn new(config: Config) -> Self {
         let role = config.role;
         Self { engine: Tls12Engine::new(config), state: RecordState::new(role), inbound: Vec::new(), failed: false }
+    }
+
+    /// Set the ALPN protocol names (RFC 7301); see [`Config::alpn`]. Must be
+    /// called before [`Self::start`]; returns whether it took effect.
+    pub fn set_alpn(&mut self, protocols: Vec<Bytes>) -> bool {
+        self.engine.set_alpn(protocols)
     }
 
     /// Begin the handshake — client emits `ClientHello`; server waits for input.
@@ -586,6 +594,70 @@ mod tests {
         (sink_c, sink_s, client, server)
     }
 
+    // ---- ALPN (RFC 7301) ----
+
+    fn loopback_with_alpn(client: &[&[u8]], server: &[&[u8]]) -> (RecordingSink, RecordingSink, Tls12RecordEngine, Tls12RecordEngine) {
+        let (mut client_cfg, mut server_cfg) = configs();
+        client_cfg.alpn = client.iter().map(|p| Bytes::copy_from_slice(p)).collect();
+        server_cfg.alpn = server.iter().map(|p| Bytes::copy_from_slice(p)).collect();
+        let mut client = Tls12RecordEngine::new(client_cfg);
+        let mut server = Tls12RecordEngine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        (sink_c, sink_s, client, server)
+    }
+
+    /// The server picks by its own preference (RFC 7301 §3.2), and both sides
+    /// report the result through `SecurityInfo::alpn()` - which is how STARTTLS
+    /// consumers (SMTP, IMAP, FTP, LDAP) read it.
+    #[test]
+    fn overlapping_alpn_lists_negotiate_the_servers_preference_on_both_sides() {
+        let (sink_c, sink_s, client, server) = loopback_with_alpn(&[b"http/1.1", b"h2"], &[b"h2", b"http/1.1"]);
+        assert!(client.is_complete() && server.is_complete(), "{:?} / {:?}", sink_c.events, sink_s.events);
+        assert_eq!(sink_c.info.as_ref().unwrap().alpn(), Some(&b"h2"[..]), "client side");
+        assert_eq!(sink_s.info.as_ref().unwrap().alpn(), Some(&b"h2"[..]), "server side");
+    }
+
+    #[test]
+    fn a_single_shared_protocol_is_chosen() {
+        let (sink_c, sink_s, _c, _s) = loopback_with_alpn(&[b"h2", b"http/1.1"], &[b"http/1.1"]);
+        assert_eq!(sink_c.info.as_ref().unwrap().alpn(), Some(&b"http/1.1"[..]));
+        assert_eq!(sink_s.info.as_ref().unwrap().alpn(), Some(&b"http/1.1"[..]));
+    }
+
+    /// RFC 7301 §3.2, and the same policy as the TLS 1.3 engine: a server with
+    /// protocols configured refuses a client whose offer has no overlap,
+    /// rather than completing a handshake with nothing agreed.
+    #[test]
+    fn no_overlap_fails_the_handshake_with_no_application_protocol() {
+        let (sink_c, sink_s, client, server) = loopback_with_alpn(&[b"h2"], &[b"http/1.1"]);
+        assert!(!client.is_complete() && !server.is_complete());
+        assert!(sink_s.events.iter().any(|e| e.starts_with("protocol_error")), "{:?}", sink_s.events);
+        // The client is told why: a real, decodable no_application_protocol (120).
+        assert!(
+            sink_c.events.iter().any(|e| e.starts_with("protocol_error") && e.contains("alert 120")),
+            "{:?}",
+            sink_c.events
+        );
+    }
+
+    /// Either side leaving ALPN out means nothing is negotiated and the
+    /// handshake completes exactly as it did before ALPN was supported.
+    #[test]
+    fn alpn_absent_on_either_side_negotiates_nothing_and_still_completes() {
+        for (c, s) in [(&[b"h2".as_slice()][..], &[][..]), (&[][..], &[b"h2".as_slice()][..]), (&[][..], &[][..])] {
+            let (sink_c, sink_s, client, server) = loopback_with_alpn(c, s);
+            assert!(client.is_complete() && server.is_complete(), "{c:?}/{s:?}: {:?} / {:?}", sink_c.events, sink_s.events);
+            assert_eq!(sink_c.info.as_ref().unwrap().alpn(), None, "client offered {c:?}, server {s:?}");
+            assert_eq!(sink_s.info.as_ref().unwrap().alpn(), None);
+        }
+    }
+
     /// Direct proof that `AeadDirection`'s ChaCha20-Poly1305 branch (no
     /// explicit wire nonce, IV-XOR-sequence-number construction, per
     /// `CipherKind::iv_len`'s 12-byte IV) actually round-trips real
@@ -813,6 +885,60 @@ mod tests {
         let wire = std::mem::take(&mut sink_c2.outbound);
         server2.feed_ciphertext(&mut wire.as_slice(), &mut sink_s2);
         assert_eq!(sink_s2.app_data, vec![b"resumed hello".to_vec()]);
+    }
+
+    /// ALPN is negotiated afresh on every handshake, an abbreviated one
+    /// included (RFC 7301 §3.1): the resumed connection reports it too, and can
+    /// even choose differently from the one that minted the ticket.
+    #[test]
+    fn alpn_is_negotiated_again_on_a_resumed_handshake() {
+        let creds = test_server_credentials();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let mut ticket_key = [0u8; 32];
+        getrandom::getrandom(&mut ticket_key).unwrap();
+        let store = crate::tls::Tls12ClientTicketStore::shared();
+        let protos = |l: &[&[u8]]| l.iter().map(|p| Bytes::copy_from_slice(p)).collect::<Vec<_>>();
+        let client_cfg = |alpn: &[&[u8]]| Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            trust_store: Some(trust.clone()),
+            client_ticket_store: Some(store.clone()),
+            alpn: protos(alpn),
+            ..Default::default()
+        };
+        let server_cfg = |alpn: &[&[u8]]| Config {
+            role: Role::Server,
+            server: Some(creds.clone()),
+            ticket_key: Some(crate::tls::TicketKeys::single(ticket_key)),
+            alpn: protos(alpn),
+            ..Default::default()
+        };
+        let run = |c: Config, s: Config| {
+            let (mut client, mut server) = (Tls12RecordEngine::new(c), Tls12RecordEngine::new(s));
+            let (mut sc, mut ss) = (RecordingSink::default(), RecordingSink::default());
+            client.start(&mut sc);
+            for _ in 0..2 {
+                relay(&mut sc, &mut server, &mut ss);
+                relay(&mut ss, &mut client, &mut sc);
+            }
+            assert!(client.is_complete() && server.is_complete(), "{:?} / {:?}", sc.events, ss.events);
+            (sc, ss)
+        };
+
+        let (first_c, _) = run(client_cfg(&[b"h2", b"http/1.1"]), server_cfg(&[b"h2", b"http/1.1"]));
+        assert_eq!(first_c.info.as_ref().unwrap().alpn(), Some(&b"h2"[..]));
+        assert!(store.get("localhost").is_some(), "the first handshake must have minted a ticket");
+
+        // Same ticket, but the server now prefers the other protocol.
+        let (second_c, second_s) = run(client_cfg(&[b"h2", b"http/1.1"]), server_cfg(&[b"http/1.1", b"h2"]));
+        assert!(
+            !second_s.events.iter().any(|e| e.starts_with("verification_requested")),
+            "the second handshake must actually have been resumed: {:?}",
+            second_s.events
+        );
+        assert_eq!(second_c.info.as_ref().unwrap().alpn(), Some(&b"http/1.1"[..]), "client, resumed");
+        assert_eq!(second_s.info.as_ref().unwrap().alpn(), Some(&b"http/1.1"[..]), "server, resumed");
     }
 
     #[test]

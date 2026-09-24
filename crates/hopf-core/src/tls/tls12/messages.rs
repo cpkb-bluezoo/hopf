@@ -64,6 +64,8 @@ impl MessageType {
 pub mod ext {
     /// Server Name Indication (RFC 6066).
     pub const SERVER_NAME: u16 = 0;
+    /// Application-Layer Protocol Negotiation (RFC 7301).
+    pub const ALPN: u16 = 16;
     /// Supported (elliptic curve) Groups (RFC 4492 §5.1.1 `elliptic_curves`).
     pub const SUPPORTED_GROUPS: u16 = 10;
     /// EC Point Formats (RFC 4492 §5.1.2) — we only ever offer/accept uncompressed.
@@ -161,6 +163,9 @@ pub struct ClientHelloParams<'a> {
     /// `Some(ticket_bytes)` attempts resumption with a cached ticket (RFC
     /// 5077 §3.2/§3.4).
     pub session_ticket: Option<&'a [u8]>,
+    /// ALPN protocol names to offer (RFC 7301), in preference order; empty
+    /// omits the extension.
+    pub alpn: &'a [Bytes],
     /// `legacy_version` wire field — `0x0303` for TCP TLS 1.2, `0xfefd` for
     /// DTLS 1.2 (RFC 6347 §4.1, the *real*, not legacy, protocol version —
     /// DTLS 1.2 predates TLS 1.3's extension-based version negotiation).
@@ -236,6 +241,9 @@ pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
         sni.extend_from_slice(host);
         push_extension(&mut extensions, ext::SERVER_NAME, &sni);
     }
+    if !params.alpn.is_empty() {
+        push_extension(&mut extensions, ext::ALPN, &encode_alpn_list(params.alpn));
+    }
     if let Some(ticket) = params.session_ticket {
         push_extension(&mut extensions, ext::SESSION_TICKET, ticket);
     }
@@ -243,6 +251,42 @@ pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
     encode_message(MessageType::ClientHello, &body)
+}
+
+/// `ProtocolNameList` (RFC 7301 §3.1): `opaque ProtocolName<1..2^8-1>`
+/// entries in a `<2..2^16-1>` list.
+fn encode_alpn_list<T: AsRef<[u8]>>(protocols: &[T]) -> Bytes {
+    let mut names = BytesMut::new();
+    for p in protocols {
+        let p = p.as_ref();
+        names.extend_from_slice(&[p.len() as u8]);
+        names.extend_from_slice(p);
+    }
+    encode_u16_prefixed(&names)
+}
+
+/// Every non-empty protocol name in a `ProtocolNameList`. Lenient about a
+/// truncated tail, like the TLS 1.3 parser.
+fn decode_alpn_list(data: &[u8]) -> Vec<Bytes> {
+    let mut out = Vec::new();
+    if data.len() < 2 {
+        return out;
+    }
+    let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let list = &data[2..data.len().min(2 + list_len)];
+    let mut i = 0;
+    while i < list.len() {
+        let len = list[i] as usize;
+        i += 1;
+        if i + len > list.len() {
+            break;
+        }
+        if len > 0 {
+            out.push(Bytes::copy_from_slice(&list[i..i + len]));
+        }
+        i += len;
+    }
+    out
 }
 
 fn encode_u16_list(values: &[u16]) -> Bytes {
@@ -300,6 +344,9 @@ pub struct ParsedClientHello {
     /// optional (unlike EMS/5746) but content is validated in `engine.rs`
     /// when present — see its `on_client_hello`.
     pub supported_versions: Option<Vec<u16>>,
+    /// ALPN protocol names the client offered (RFC 7301), empty if the
+    /// extension was absent.
+    pub alpn: Vec<Bytes>,
 }
 
 /// Parse a `ClientHello` body.
@@ -354,6 +401,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
     let mut extended_master_secret = false;
     let mut renegotiation_info = None;
     let mut supported_versions = None;
+    let mut alpn: Vec<Bytes> = Vec::new();
     if i + 2 <= body.len() {
         let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
         i += 2;
@@ -388,6 +436,9 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
                     }
                     ext::SESSION_TICKET => {
                         session_ticket = Some(Bytes::copy_from_slice(data));
+                    }
+                    ext::ALPN => {
+                        alpn = decode_alpn_list(data);
                     }
                     ext::EXTENDED_MASTER_SECRET => {
                         extended_master_secret = true;
@@ -427,6 +478,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
         extended_master_secret,
         renegotiation_info,
         supported_versions,
+        alpn,
     })
 }
 
@@ -436,6 +488,9 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
 /// handshake; without it, a spec-conformant client (verified against
 /// `rustls`) treats an unadvertised `NewSessionTicket` as a protocol
 /// violation (it's waiting for `ChangeCipherSpec` at that point instead).
+///
+/// `alpn` is the protocol selected under RFC 7301, or `None` to send no ALPN
+/// extension.
 pub fn build_server_hello(
     random: &[u8; 32],
     session_id: &[u8],
@@ -443,6 +498,7 @@ pub fn build_server_hello(
     session_ticket: bool,
     legacy_version: u16,
     extended_master_secret: bool,
+    alpn: Option<&[u8]>,
 ) -> Bytes {
     let mut body = BytesMut::new();
     body.extend_from_slice(&legacy_version.to_be_bytes());
@@ -460,6 +516,11 @@ pub fn build_server_hello(
     push_extension(&mut extensions, ext::EC_POINT_FORMATS, &[1, EC_POINT_FORMAT_UNCOMPRESSED]);
     if session_ticket {
         push_extension(&mut extensions, ext::SESSION_TICKET, &[]);
+    }
+    // RFC 7301 §3.1: the server's answer is a list of exactly one name, and
+    // is sent only in reply to a client that offered ALPN.
+    if let Some(protocol) = alpn {
+        push_extension(&mut extensions, ext::ALPN, &encode_alpn_list(&[protocol]));
     }
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
@@ -485,6 +546,12 @@ pub struct ParsedServerHello {
     /// `renegotiation_info` (RFC 5746 §3.2), if present: its raw
     /// `extension_data`. `None` if absent. Validated in `engine.rs`.
     pub renegotiation_info: Option<Bytes>,
+    /// The protocol the server selected under RFC 7301, if it sent the
+    /// extension with a well-formed single-name list.
+    pub alpn: Option<Bytes>,
+    /// The server sent an ALPN extension whose list did not hold exactly one
+    /// name (RFC 7301 §3.1), which is a `decode_error`.
+    pub alpn_malformed: bool,
 }
 
 /// Parse a `ServerHello` body.
@@ -510,6 +577,8 @@ pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
     let mut session_ticket_offered = false;
     let mut extended_master_secret = false;
     let mut renegotiation_info = None;
+    let mut alpn = None;
+    let mut alpn_malformed = false;
     if i + 2 <= body.len() {
         let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
         i += 2;
@@ -533,6 +602,20 @@ pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
                 if et == ext::RENEGOTIATION_INFO {
                     renegotiation_info = Some(Bytes::copy_from_slice(data));
                 }
+                if et == ext::ALPN {
+                    let mut names = decode_alpn_list(data);
+                    // Exactly one name, with the declared list length agreeing
+                    // with both the name and the extension body around it.
+                    let declared = data.get(..2).map(|l| u16::from_be_bytes([l[0], l[1]]) as usize);
+                    let well_formed = names.len() == 1
+                        && declared == Some(1 + names[0].len())
+                        && data.len() == 2 + 1 + names[0].len();
+                    if well_formed {
+                        alpn = names.pop();
+                    } else {
+                        alpn_malformed = true;
+                    }
+                }
                 k += el;
             }
         }
@@ -545,6 +628,8 @@ pub fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
         session_ticket_offered,
         extended_master_secret,
         renegotiation_info,
+        alpn,
+        alpn_malformed,
     })
 }
 
@@ -809,6 +894,7 @@ mod tests {
             cipher_suites: &[0xC02F, 0xC030],
             server_name: Some("example.test"),
             session_ticket: None,
+            alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
         };
@@ -840,6 +926,7 @@ mod tests {
             cipher_suites: &[0xC02F, 0xC030],
             server_name: None,
             session_ticket: None,
+            alpn: &[],
             legacy_version: 0xfefd,
             cookie: b"a-server-issued-cookie",
         };
@@ -862,6 +949,7 @@ mod tests {
             cipher_suites: &[0xC02F],
             server_name: None,
             session_ticket: None,
+            alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
         };
@@ -911,7 +999,7 @@ mod tests {
 
     #[test]
     fn server_hello_round_trip() {
-        let wire = build_server_hello(&[9u8; 32], &[1, 2, 3], 0xC02F, false, 0x0303, false);
+        let wire = build_server_hello(&[9u8; 32], &[1, 2, 3], 0xC02F, false, 0x0303, false, None);
         let parsed = parse_server_hello(&wire[4..]).expect("parse");
         assert_eq!(parsed.random, [9u8; 32]);
         assert_eq!(parsed.session_id.as_ref(), &[1, 2, 3]);
@@ -928,7 +1016,7 @@ mod tests {
         // extension here — a real `rustls` client rejects an unadvertised
         // one as a protocol violation (it's waiting for `ChangeCipherSpec`
         // at that point instead), so this bit has to round-trip exactly.
-        let wire = build_server_hello(&[9u8; 32], &[], 0xC02F, true, 0x0303, false);
+        let wire = build_server_hello(&[9u8; 32], &[], 0xC02F, true, 0x0303, false, None);
         let parsed = parse_server_hello(&wire[4..]).expect("parse");
         assert!(parsed.session_ticket_offered);
     }
@@ -937,7 +1025,7 @@ mod tests {
     fn server_hello_extended_master_secret_round_trips() {
         // Confirms the new extension's presence doesn't shift the offset
         // of EC_POINT_FORMATS/SESSION_TICKET parsed after it.
-        let wire = build_server_hello(&[9u8; 32], &[], 0xC02F, true, 0x0303, true);
+        let wire = build_server_hello(&[9u8; 32], &[], 0xC02F, true, 0x0303, true, None);
         let parsed = parse_server_hello(&wire[4..]).expect("parse");
         assert!(parsed.extended_master_secret);
         assert!(parsed.session_ticket_offered);
@@ -981,6 +1069,7 @@ mod tests {
             cipher_suites: &[0xC02F],
             server_name: None,
             session_ticket: Some(b"opaque-ticket-bytes"),
+            alpn: &[],
        
             legacy_version: 0x0303,
             cookie: &[],
@@ -999,6 +1088,7 @@ mod tests {
             cipher_suites: &[0xC02F],
             server_name: None,
             session_ticket: Some(&[]),
+            alpn: &[],
        
             legacy_version: 0x0303,
             cookie: &[],
@@ -1016,6 +1106,7 @@ mod tests {
             cipher_suites: &[0xC02F],
             server_name: None,
             session_ticket: None,
+            alpn: &[],
        
             legacy_version: 0x0303,
             cookie: &[],

@@ -7,6 +7,8 @@
 //! events come out. No record layer exists for QUIC (RFC 9001 §4 — packet
 //! protection replaces it); this module is TCP/DTLS-family only.
 
+use bytes::Bytes;
+
 use crate::crypto::aead::{AeadError, Aes128GcmKey, ChaCha20Poly1305Key};
 use crate::crypto::hkdf::expand_label;
 use crate::security::SecurityInfo;
@@ -405,6 +407,12 @@ impl TlsRecordEngine {
     /// Whether the handshake has completed.
     pub fn is_complete(&self) -> bool {
         self.engine.is_complete()
+    }
+
+    /// Set the ALPN protocol names (RFC 7301); see [`HandshakeConfig::alpn`].
+    /// Must be called before [`Self::start`]; returns whether it took effect.
+    pub fn set_alpn(&mut self, protocols: Vec<Bytes>) -> bool {
+        self.engine.set_alpn(protocols)
     }
 
     /// Advertise a `record_size_limit` (RFC 8449): the largest protected

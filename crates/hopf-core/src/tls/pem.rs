@@ -43,6 +43,56 @@ pub trait TlsConnector: Send + Sync {
 /// Shared connector handle stored on dial configs / connections.
 pub type SharedTlsConnector = Arc<dyn TlsConnector>;
 
+struct AlpnAcceptor {
+    inner: SharedTlsAcceptor,
+    protocols: Vec<Vec<u8>>,
+}
+
+impl TlsAcceptor for AlpnAcceptor {
+    fn accept(&self) -> TlsVariant {
+        let mut engine = self.inner.accept();
+        let refs: Vec<&[u8]> = self.protocols.iter().map(Vec::as_slice).collect();
+        engine.set_alpn(&refs);
+        engine
+    }
+}
+
+/// Wrap `inner` so every accepted connection selects an ALPN protocol
+/// (RFC 7301) from `protocols`, in the server's own order of preference,
+/// replacing whatever list the builder was given.
+///
+/// This is how a TLS 1.2 acceptor gets ALPN, since the `*_tls12` builders take
+/// no protocol list; it works on any acceptor, TLS 1.3 included. A client that
+/// offers ALPN with nothing in common with `protocols` is refused with
+/// `no_application_protocol` (RFC 7301 §3.2). A client that offers none is
+/// unaffected. Read the outcome from [`SecurityInfo::alpn`](crate::SecurityInfo::alpn),
+/// including in STARTTLS handlers.
+pub fn acceptor_with_alpn(inner: SharedTlsAcceptor, protocols: &[&[u8]]) -> SharedTlsAcceptor {
+    Arc::new(AlpnAcceptor { inner, protocols: protocols.iter().map(|p| p.to_vec()).collect() })
+}
+
+struct AlpnConnector {
+    inner: SharedTlsConnector,
+    protocols: Vec<Vec<u8>>,
+}
+
+impl TlsConnector for AlpnConnector {
+    fn connect(&self, server_name: &str) -> io::Result<TlsVariant> {
+        let mut engine = self.inner.connect(server_name)?;
+        let refs: Vec<&[u8]> = self.protocols.iter().map(Vec::as_slice).collect();
+        engine.set_alpn(&refs);
+        Ok(engine)
+    }
+}
+
+/// Client-side counterpart of [`acceptor_with_alpn`]: every connection made
+/// through the wrapped connector offers `protocols`, in preference order, on
+/// either TLS version. A server that answers with a protocol outside the
+/// offer fails the handshake.
+pub fn connector_with_alpn(inner: SharedTlsConnector, protocols: &[&[u8]]) -> SharedTlsConnector {
+    Arc::new(AlpnConnector { inner, protocols: protocols.iter().map(|p| p.to_vec()).collect() })
+}
+
 struct RecordSizeLimitAcceptor {
     inner: SharedTlsAcceptor,
     limit: u16,
@@ -488,6 +538,7 @@ mod tests {
         written: Vec<u8>,
         received: Vec<u8>,
         errors: Vec<String>,
+        alpn: Option<Vec<u8>>,
     }
 
     impl crate::tls::TlsRecordSink for Wire {
@@ -497,7 +548,9 @@ mod tests {
         fn application_data(&mut self, plaintext: &[u8]) {
             self.received.extend_from_slice(plaintext);
         }
-        fn handshake_complete(&mut self, _info: crate::security::SecurityInfo) {}
+        fn handshake_complete(&mut self, info: crate::security::SecurityInfo) {
+            self.alpn = info.alpn().map(<[u8]>::to_vec);
+        }
         fn verification_requested(&mut self, _req: crate::tls::VerifyRequest) {}
         fn protocol_error(&mut self, err: crate::tls::TlsProtocolError) {
             self.errors.push(err.message);
@@ -558,6 +611,67 @@ mod tests {
         drain(&mut ws, &mut client, &mut wc);
         assert_eq!(ws.received, sent);
         assert_eq!(wc.received, sent);
+    }
+
+    fn handshake(client: &mut TlsVariant, server: &mut TlsVariant) -> (Wire, Wire) {
+        let (mut wc, mut ws) = (Wire::default(), Wire::default());
+        client.start(&mut wc);
+        for _ in 0..2 {
+            drain(&mut wc, server, &mut ws);
+            drain(&mut ws, client, &mut wc);
+        }
+        (wc, ws)
+    }
+
+    /// The wrappers give the `*_tls12` builders (which take no protocol list) an
+    /// ALPN, and override the list a TLS 1.3 builder was given.
+    #[test]
+    fn alpn_wrappers_apply_to_both_tls_versions() {
+        use crate::tls::{connector_from_pem, connector_from_pem_tls12};
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+
+        let tls12 = (
+            connector_with_alpn(connector_from_pem_tls12(&cert_path).unwrap(), &[b"http/1.1", b"h2"]),
+            acceptor_with_alpn(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(), &[b"h2", b"http/1.1"]),
+        );
+        // The TLS 1.3 builder is given a different list, which the wrapper replaces.
+        let tls13 = (
+            connector_with_alpn(connector_from_pem(&cert_path, &[b"nope"]).unwrap(), &[b"http/1.1", b"h2"]),
+            acceptor_with_alpn(acceptor_from_pem(&cert_path, &key_path, &[b"nope"]).unwrap(), &[b"h2", b"http/1.1"]),
+        );
+        for (label, (connector, acceptor)) in [("TLS 1.2", tls12), ("TLS 1.3", tls13)] {
+            let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
+            let (wc, ws) = handshake(&mut client, &mut server);
+            assert!(client.is_complete() && server.is_complete(), "{label}: {:?} {:?}", wc.errors, ws.errors);
+            assert_eq!(wc.alpn.as_deref(), Some(&b"h2"[..]), "{label}: client saw the server's preference");
+            assert_eq!(ws.alpn.as_deref(), Some(&b"h2"[..]), "{label}: server");
+        }
+    }
+
+    #[test]
+    fn a_wrapped_acceptor_refuses_a_client_with_nothing_in_common() {
+        use crate::tls::connector_from_pem_tls12;
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let connector = connector_with_alpn(connector_from_pem_tls12(&cert_path).unwrap(), &[b"h2"]);
+        let acceptor = acceptor_with_alpn(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(), &[b"smtp"]);
+        let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
+        let (wc, ws) = handshake(&mut client, &mut server);
+        assert!(!client.is_complete() && !server.is_complete());
+        assert!(ws.errors.iter().any(|e| e.contains("ALPN")), "{:?}", ws.errors);
+        assert!(!wc.errors.is_empty(), "the client must be told: {:?}", wc.errors);
+    }
+
+    #[test]
+    fn alpn_cannot_be_changed_once_the_handshake_has_started() {
+        use crate::tls::connector_from_pem_tls12;
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, _key_path) = write_temp_pem(&key_pair);
+        let mut client = connector_from_pem_tls12(&cert_path).unwrap().connect("localhost").unwrap();
+        assert!(client.set_alpn(&[b"h2"]));
+        client.start(&mut Wire::default());
+        assert!(!client.set_alpn(&[b"h3"]), "too late: the ClientHello is already out");
     }
 
     #[test]

@@ -695,7 +695,13 @@ mod tests {
     }
 
     fn run_loopback(require_cookie: bool) -> (RecordingSink, RecordingSink, Dtls12RecordEngine, Dtls12RecordEngine) {
-        let (client_cfg, server_cfg) = configs(require_cookie);
+        run_loopback_with(configs(require_cookie))
+    }
+
+    fn run_loopback_with(
+        (client_cfg, server_cfg): (Dtls12Config, Dtls12Config),
+    ) -> (RecordingSink, RecordingSink, Dtls12RecordEngine, Dtls12RecordEngine) {
+        let require_cookie = server_cfg.require_cookie;
         let mut client = Dtls12RecordEngine::new(client_cfg);
         let mut server = Dtls12RecordEngine::new(server_cfg);
         let mut sink_c = RecordingSink::default();
@@ -716,6 +722,29 @@ mod tests {
         assert!(client.is_complete(), "client: {:?}", sink_c.events);
         assert!(server.is_complete(), "server: {:?}", sink_s.events);
         (sink_c, sink_s, client, server)
+    }
+
+    /// DTLS 1.2 runs on the TLS 1.2 engine, so ALPN (RFC 7301) comes with it:
+    /// negotiated by the server's preference, with and without the cookie round
+    /// trip (whose `ClientHello2` is built by a fresh engine that must still
+    /// carry the offer).
+    #[test]
+    fn alpn_is_negotiated_over_dtls_1_2_with_and_without_the_cookie_round_trip() {
+        for require_cookie in [false, true] {
+            let (mut client_cfg, mut server_cfg) = configs(require_cookie);
+            client_cfg.base.alpn = vec![Bytes::from_static(b"http/1.1"), Bytes::from_static(b"h2")];
+            server_cfg.base.alpn = vec![Bytes::from_static(b"h2"), Bytes::from_static(b"http/1.1")];
+            let (sink_c, sink_s, _client, _server) = run_loopback_with((client_cfg, server_cfg));
+            assert_eq!(sink_c.info.as_ref().unwrap().alpn(), Some(&b"h2"[..]), "cookie={require_cookie}, client");
+            assert_eq!(sink_s.info.as_ref().unwrap().alpn(), Some(&b"h2"[..]), "cookie={require_cookie}, server");
+        }
+    }
+
+    #[test]
+    fn dtls_1_2_with_no_alpn_configured_negotiates_none() {
+        let (sink_c, sink_s, _c, _s) = run_loopback(false);
+        assert_eq!(sink_c.info.as_ref().unwrap().alpn(), None);
+        assert_eq!(sink_s.info.as_ref().unwrap().alpn(), None);
     }
 
     #[test]

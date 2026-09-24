@@ -35,8 +35,8 @@ pub use pem::{
     acceptor_from_pem, acceptor_from_pem_tls12, acceptor_from_pem_tls12_with_client_auth,
     acceptor_from_pem_with_client_auth, acceptor_from_pem_with_sni, connector_from_pem,
     connector_from_pem_tls12, connector_from_pem_tls12_with_client_cert,
-    connector_from_pem_with_client_cert, connector_with_record_size_limit, connector_with_verify_override,
-    acceptor_with_record_size_limit, insecure_connector,
+    connector_from_pem_with_client_cert, connector_with_alpn, connector_with_record_size_limit,
+    connector_with_verify_override, acceptor_with_alpn, acceptor_with_record_size_limit, insecure_connector,
     insecure_connector_tls12, public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor,
     SharedTlsConnector, TlsAcceptor, TlsConnector,
 };
@@ -75,6 +75,19 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.is_complete(),
             TlsVariant::V12(e) => e.is_complete(),
+        }
+    }
+
+    /// Set the ALPN protocol names (RFC 7301) this connection offers (client)
+    /// or selects from (server), replacing whatever the builder configured.
+    /// Works for both TLS versions. Must be called before [`Self::start`];
+    /// returns whether it took effect. The outcome is
+    /// [`SecurityInfo::alpn`](crate::SecurityInfo::alpn).
+    pub fn set_alpn(&mut self, protocols: &[&[u8]]) -> bool {
+        let list: Vec<bytes::Bytes> = protocols.iter().map(|p| bytes::Bytes::copy_from_slice(p)).collect();
+        match self {
+            TlsVariant::V13(e) => e.set_alpn(list),
+            TlsVariant::V12(e) => e.set_alpn(list),
         }
     }
 
