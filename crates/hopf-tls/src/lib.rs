@@ -1152,6 +1152,200 @@ mod integration_tests {
     }
 
     // -------------------------------------------------------------------
+    // TLS 1.2 server/client key types (issue #401, RFC 8422): Ed25519 and
+    // ECDSA P-384, against real rustls in both directions, with and without
+    // client authentication. Hopf-to-Hopf loopback cannot prove the wire
+    // format (an Ed25519 ServerKeyExchange / CertificateVerify signs the raw
+    // message with no hash), only an independent implementation can.
+    // -------------------------------------------------------------------
+
+    fn temp_pem_with(
+        label: &str,
+        alg: &'static rcgen::SignatureAlgorithm,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, CertifiedKey) {
+        let dir = tempfile::Builder::new().prefix(&format!("hopf-tls-{label}-")).tempdir().unwrap();
+        let key_pair = rcgen::KeyPair::generate_for(alg).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap().self_signed(&key_pair).unwrap();
+        let (cert_path, key_path) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+        (dir, cert_path, key_path, CertifiedKey { cert, key_pair })
+    }
+
+    fn tls12_provider() -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    }
+
+    /// A real rustls TLS 1.2 client (optionally presenting a client certificate)
+    /// against a hopf TLS 1.2 server holding a `server_alg` key.
+    fn rustls_client_against_hopf_server(
+        server_alg: &'static rcgen::SignatureAlgorithm,
+        client_alg: Option<&'static rcgen::SignatureAlgorithm>,
+    ) {
+        let (_dir, cert_path, key_path, certified) = temp_pem_with("tls12-keys-srv", server_alg);
+        let client_identity = client_alg.map(|a| temp_pem_with("tls12-keys-cli", a));
+        let acceptor = match &client_identity {
+            Some((_, client_cert_path, _, _)) => hopf_core::acceptor_from_pem_tls12_with_client_auth(
+                &cert_path,
+                &key_path,
+                hopf_core::ClientAuthPolicy::Require,
+                client_cert_path,
+            )
+            .unwrap(),
+            None => hopf_core::acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(),
+        };
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(TlsEcho { alpn_seen: Arc::new(Mutex::new(None)), ready: Arc::new(Mutex::new(false)) })
+                        as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certified.cert.der().clone()).unwrap();
+        let builder = ClientConfig::builder_with_provider(tls12_provider())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap()
+            .with_root_certificates(roots);
+        let cfg = match &client_identity {
+            Some((_, _, _, c)) => builder
+                .with_client_auth_cert(
+                    vec![c.cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(c.key_pair.serialize_der().into()),
+                )
+                .unwrap(),
+            None => builder.with_no_client_auth(),
+        };
+        let conn = ClientConnection::new(
+            Arc::new(cfg),
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let sock = StdTcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut tls = StreamOwned::new(conn, sock);
+        tls.write_all(b"tls12-keys").unwrap();
+        tls.flush().unwrap();
+        let mut buf = [0u8; 16];
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"tls12-keys");
+        assert_eq!(tls.conn.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2));
+        rt.shutdown();
+    }
+
+    /// A hopf TLS 1.2 client (optionally presenting a client certificate)
+    /// against a real rustls TLS 1.2 server holding a `server_alg` key.
+    fn hopf_client_against_rustls_server(
+        server_alg: &'static rcgen::SignatureAlgorithm,
+        client_alg: Option<&'static rcgen::SignatureAlgorithm>,
+    ) {
+        let (_dir, cert_path, _key_path, certified) = temp_pem_with("tls12-keys-rsrv", server_alg);
+        let client_identity = client_alg.map(|a| temp_pem_with("tls12-keys-rcli", a));
+
+        let builder = rustls::ServerConfig::builder_with_provider(tls12_provider())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .unwrap();
+        let builder = match &client_identity {
+            Some((_, _, _, c)) => {
+                let mut roots = RootCertStore::empty();
+                roots.add(c.cert.der().clone()).unwrap();
+                builder.with_client_cert_verifier(
+                    rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build().unwrap(),
+                )
+            }
+            None => builder.with_no_client_auth(),
+        };
+        let server_cfg = builder
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(server_cfg)).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).unwrap();
+            tls.write_all(&buf[..n]).unwrap();
+            tls.flush().unwrap();
+        });
+
+        let connector = match &client_identity {
+            Some((_, client_cert_path, client_key_path, _)) => {
+                hopf_core::connector_from_pem_tls12_with_client_cert(&cert_path, client_cert_path, client_key_path).unwrap()
+            }
+            None => hopf_core::connector_from_pem_tls12(&cert_path).unwrap(),
+        };
+        let echoed = Arc::new(Mutex::new(Vec::new()));
+        let echoed2 = Arc::clone(&echoed);
+        struct Probe {
+            echoed: Arc<Mutex<Vec<u8>>>,
+        }
+        impl ProtocolHandler for Probe {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+                endpoint.send(b"hopf-tls12-keys");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.echoed.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(Probe { echoed: Arc::clone(&echoed2) }) as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+        for _ in 0..150 {
+            if echoed.lock().unwrap().as_slice() == b"hopf-tls12-keys" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(echoed.lock().unwrap().as_slice(), b"hopf-tls12-keys");
+        rt.shutdown();
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn rustls_tls12_client_against_hopf_tls12_server_with_ed25519_and_p384_keys() {
+        rustls_client_against_hopf_server(&rcgen::PKCS_ED25519, None);
+        rustls_client_against_hopf_server(&rcgen::PKCS_ECDSA_P384_SHA384, None);
+    }
+
+    #[test]
+    fn hopf_tls12_client_against_rustls_tls12_server_with_ed25519_and_p384_keys() {
+        hopf_client_against_rustls_server(&rcgen::PKCS_ED25519, None);
+        hopf_client_against_rustls_server(&rcgen::PKCS_ECDSA_P384_SHA384, None);
+    }
+
+    /// Client authentication: the `CertificateVerify` of an Ed25519 client key
+    /// is checked by rustls (hopf signing), and hopf checks rustls's (hopf
+    /// verifying), under both Ed25519 and ECDSA server keys.
+    #[test]
+    fn tls12_client_authentication_with_an_ed25519_client_key_both_ways() {
+        for server_alg in [&rcgen::PKCS_ED25519, &rcgen::PKCS_ECDSA_P256_SHA256] {
+            rustls_client_against_hopf_server(server_alg, Some(&rcgen::PKCS_ED25519));
+            hopf_client_against_rustls_server(server_alg, Some(&rcgen::PKCS_ED25519));
+        }
+    }
+
+    // -------------------------------------------------------------------
     // ChaCha20-Poly1305 cipher suite — real interop, both TLS versions,
     // both directions. A `rustls` `CryptoProvider` restricted to *only* the
     // ChaCha suite forces genuine negotiation (a normal Hopf peer always

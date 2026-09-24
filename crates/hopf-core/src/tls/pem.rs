@@ -440,7 +440,7 @@ impl TlsAcceptor for PemAcceptorTls12 {
 }
 
 /// Build a TLS 1.2 [`SharedTlsAcceptor`] from PEM cert-chain and PKCS#8 key
-/// files — RSA or ECDSA P-256/P-384 only (see `tls12::engine`'s module doc).
+/// files — RSA, ECDSA P-256/P-384 or Ed25519 keys (see `tls12::engine`'s module doc).
 pub fn acceptor_from_pem_tls12(cert_path: &Path, key_path: &Path) -> io::Result<SharedTlsAcceptor> {
     let creds = server_credentials_from_pem(cert_path, key_path)?;
     Ok(Arc::new(PemAcceptorTls12 { creds, client_auth: ClientAuthPolicy::None, client_trust_store: None }))

@@ -101,10 +101,18 @@ pub mod sig_alg {
     pub const HASH_SHA256: u8 = 4;
     /// `sha384` hash algorithm.
     pub const HASH_SHA384: u8 = 5;
+    /// `intrinsic` hash: the signature algorithm carries its own hash (RFC
+    /// 8422 section 5.1's `ed25519(0x0807)` is this hash byte `8` with signature
+    /// byte `7`), so there is no separate digest for the pair to name.
+    pub const HASH_INTRINSIC: u8 = 8;
     /// `rsa` signature algorithm (PKCS#1 v1.5).
     pub const SIG_RSA: u8 = 1;
     /// `ecdsa` signature algorithm.
     pub const SIG_ECDSA: u8 = 3;
+    /// `ed25519` signature algorithm (RFC 8422 section 5.1), used with
+    /// [`HASH_INTRINSIC`]. Pure EdDSA: it signs the message itself, not a hash
+    /// of it, so a `CertificateVerify` signs the raw handshake messages.
+    pub const SIG_ED25519: u8 = 7;
     /// `rsa_pss_rsae_sha256` (RFC 8446 §4.2.3's `0x0804` `SignatureScheme`,
     /// newly permitted in TLS 1.2 by RFC 9846 §4.3.3) — split across this
     /// module's `(u8, u8)` pair shape for matching purposes, but this pair
@@ -123,6 +131,7 @@ const OFFERED_SIGNATURE_ALGORITHMS: &[(u8, u8)] = &[
     (sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA),
     (sig_alg::HASH_SHA384, sig_alg::SIG_RSA),
     (sig_alg::RSA_PSS_SHA256_BYTE0, sig_alg::RSA_PSS_SHA256_BYTE1),
+    (sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519),
 ];
 
 /// `NamedCurve` (RFC 4492 §5.1.1) — only the one curve this engine speaks.

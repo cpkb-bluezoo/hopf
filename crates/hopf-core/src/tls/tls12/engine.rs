@@ -17,6 +17,15 @@
 //! already has for TLS 1.3. Client certificate authentication (mTLS) is
 //! supported — see [`ClientAuthPolicy`].
 //!
+//! Key types, on either side of the handshake: RSA, ECDSA P-256 and P-384, and
+//! Ed25519 (RFC 8422 section 5: the `ECDHE_ECDSA` suites with an Edwards-curve
+//! certificate, signed with pure EdDSA over the raw message, which for a
+//! `CertificateVerify` is the raw handshake bytes). One limit remains on the
+//! *client* side: it advertises only `secp256r1` in `supported_groups`, since
+//! P-256 is the only ECDHE curve implemented, and a strict server (OpenSSL)
+//! refuses an ECDSA certificate on a curve the client did not advertise, so a
+//! hopf client cannot connect to such a server with a P-384 certificate.
+//!
 //! Reactive/sink-based like every other engine in this crate — see
 //! [`Tls12EventSink`]. Deliberately independent of [`super::engine`] (the
 //! TLS 1.3 engine) beyond the shared crypto floor; see [`super::messages`]'s
@@ -32,8 +41,9 @@ use crate::crypto::kx::EphemeralP256KeyPair;
 use crate::crypto::prf::{prf, PrfHash};
 use crate::crypto::signature::{
     ecdsa_p256_sha256_verify_spki, ecdsa_p256_sign, ecdsa_p384_sha384_verify_spki, ecdsa_p384_sign,
-    rsa_pss_sha256_verify_spki, rsa_sign_pkcs1_sha256, rsa_verify_pkcs1_sha256, EcdsaP256PrivateKey,
-    EcdsaP384PrivateKey, RsaPrivateKey, RsaPublicKeyComponents, SignatureBytes,
+    ed25519_sign, ed25519_verify, rsa_pss_sha256_verify_spki, rsa_sign_pkcs1_sha256, rsa_verify_pkcs1_sha256,
+    EcdsaP256PrivateKey, EcdsaP384PrivateKey, Ed25519PrivateKey, RsaPrivateKey, RsaPublicKeyComponents,
+    SignatureBytes,
 };
 use crate::asn1::{parse_sequence, read_bit_string_content, read_tlv_content, strip_integer_padding};
 use crate::crypto::trust::TrustStore;
@@ -41,7 +51,7 @@ use crate::crypto::x509::parse_certificate;
 use crate::security::SecurityInfo;
 
 use super::super::engine::{pick_alpn, ClientAuthPolicy, ServerCredentials};
-use super::super::handshake::verify::{pkcs8_key_kind, KeyKind};
+use super::super::handshake::verify::{ed25519_public_key_from_spki, pkcs8_key_kind, KeyKind};
 use super::super::sink::{AlertDescription, TlsProtocolError, VerifyRequest, VerifyResult};
 use super::super::ticket_keys::TicketKeys;
 use super::messages::{self, sig_alg, MessageType};
@@ -115,6 +125,11 @@ impl CipherKind {
     }
 }
 
+/// `(AEAD, PRF hash, authentication family)` for a supported suite. The
+/// [`KeyKind`] names the *family* of server key the suite authenticates with,
+/// not one exact key: every `ECDHE_ECDSA` suite is tagged
+/// [`KeyKind::EcdsaP256`] and stands for all of them. Compare it to a real key
+/// with [`suite_accepts_key`], never with `==`.
 fn cipher_info(suite: u16) -> Option<(CipherKind, PrfHash, KeyKind)> {
     match suite {
         ECDHE_ECDSA_AES128_GCM_SHA256 => Some((CipherKind::Aes128Gcm, PrfHash::Sha256, KeyKind::EcdsaP256)),
@@ -124,6 +139,22 @@ fn cipher_info(suite: u16) -> Option<(CipherKind, PrfHash, KeyKind)> {
         ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 => Some((CipherKind::ChaCha20Poly1305, PrfHash::Sha256, KeyKind::EcdsaP256)),
         ECDHE_RSA_CHACHA20_POLY1305_SHA256 => Some((CipherKind::ChaCha20Poly1305, PrfHash::Sha256, KeyKind::Rsa)),
         _ => None,
+    }
+}
+
+/// Whether a suite of authentication family `suite_family` (see
+/// [`cipher_info`]) can be used with a server key of kind `key`.
+///
+/// The `ECDHE_ECDSA` suites accept any elliptic-curve or Edwards-curve key: an
+/// ECDSA P-256 or P-384 key, or an Ed25519 key (RFC 8422 section 5, where the
+/// suite names the key-exchange and certificate family, and the certificate's
+/// key type picks the signature algorithm). The `ECDHE_RSA` suites accept RSA.
+fn suite_accepts_key(suite_family: KeyKind, key: KeyKind) -> bool {
+    match suite_family {
+        KeyKind::EcdsaP256 | KeyKind::EcdsaP384 | KeyKind::Ed25519 => {
+            matches!(key, KeyKind::EcdsaP256 | KeyKind::EcdsaP384 | KeyKind::Ed25519)
+        }
+        KeyKind::Rsa => key == KeyKind::Rsa,
     }
 }
 
@@ -155,8 +186,10 @@ pub struct Config {
     pub role: Role,
     /// Client SNI / server expected name.
     pub server_name: Option<String>,
-    /// Server certificate + key (server role only) — RSA or ECDSA P-256/P-384
-    /// PKCS#8, auto-detected the same way as the TLS 1.3 engine.
+    /// Server certificate + key (server role only) — RSA, ECDSA P-256/P-384 or
+    /// Ed25519 PKCS#8, auto-detected the same way as the TLS 1.3 engine. An
+    /// Ed25519 key needs a client that offers it in `signature_algorithms`
+    /// (RFC 8422 section 5.1), and signs with pure EdDSA.
     pub server: Option<ServerCredentials>,
     /// Trust anchors for server chain verification (client role). `None`
     /// gates on [`Tls12EventSink::verification_requested`], matching the
@@ -1054,8 +1087,20 @@ impl Tls12Engine {
             return true;
         }
 
+        // RFC 8422 section 5.1: a server may sign only with an algorithm the
+        // client listed. Ed25519 is not among the defaults an absent
+        // `signature_algorithms` implies, so it must be offered explicitly. (The
+        // other key types keep this engine's earlier, deliberately unconditional
+        // behaviour; see `ParsedClientHello::signature_algorithms`.)
+        if our_kind == KeyKind::Ed25519
+            && !ch.signature_algorithms.contains(&(sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519))
+        {
+            self.fail(sink, AlertDescription::HandshakeFailure, "server key is Ed25519 but the client did not offer it in signature_algorithms");
+            return false;
+        }
+
         let Some(suite) = SUPPORTED_CIPHER_SUITES.iter().copied().find(|s| {
-            ch.cipher_suites.contains(s) && cipher_info(*s).is_some_and(|(_, _, k)| k == our_kind)
+            ch.cipher_suites.contains(s) && cipher_info(*s).is_some_and(|(_, _, k)| suite_accepts_key(k, our_kind))
         }) else {
             self.fail(sink, AlertDescription::HandshakeFailure, "no mutually supported cipher suite for this server's key type");
             return false;
@@ -1367,6 +1412,13 @@ fn verify_ske_signature(leaf_cert_der: &[u8], sig_hash: u8, sig_alg: u8, message
     match (sig_hash, sig_alg) {
         (sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA) => ecdsa_p256_sha256_verify_spki(&spki_der, message, &signature),
         (sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA) => ecdsa_p384_sha384_verify_spki(&spki_der, message, &signature),
+        (sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519) => {
+            // Pure EdDSA over `message` itself (RFC 8422 section 5.3).
+            let Some(public_key) = ed25519_public_key_from_spki(&parsed.spki_der) else {
+                return false;
+            };
+            ed25519_verify(&public_key, message, &signature)
+        }
         (sig_alg::HASH_SHA256, sig_alg::SIG_RSA) => {
             let Some((n, e)) = rsa_n_e_from_spki(&parsed.spki_der) else {
                 return false;
@@ -1411,7 +1463,10 @@ fn sign_ske(signing_key_pkcs8: &[u8], message: &[u8]) -> Option<(u8, u8, Signatu
             let key = RsaPrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
             Some((sig_alg::HASH_SHA256, sig_alg::SIG_RSA, rsa_sign_pkcs1_sha256(&key, message).ok()?))
         }
-        KeyKind::Ed25519 => None, // TLS 1.2 has no SignatureAndHashAlgorithm codepoint for Ed25519
+        KeyKind::Ed25519 => {
+            let key = Ed25519PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
+            Some((sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519, ed25519_sign(&key, message)))
+        }
     }
 }
 
@@ -2064,6 +2119,151 @@ mod tests {
             sink_s.events
         );
         assert!(sink_s.outbound.is_empty(), "server must not send ServerHello: {:?}", sink_s.events);
+    }
+
+    // ---- Ed25519 and ECDSA P-384 keys (RFC 8422) ----
+
+    fn creds_for(alg: &'static rcgen::SignatureAlgorithm) -> ServerCredentials {
+        let key_pair = rcgen::KeyPair::generate_for(alg).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        ServerCredentials {
+            cert_chain: vec![Bytes::copy_from_slice(cert.der())],
+            signing_key_pkcs8: Bytes::from(key_pair.serialize_der()),
+        }
+    }
+
+    fn client_signing_alg(sink: &RecordingSink) -> Option<(u8, u8)> {
+        // The CertificateVerify the client sent: its handshake message body
+        // starts `sig_hash sig_alg`.
+        sink.outbound.iter().find_map(|m| {
+            (m.len() > 6 && m[0] == MessageType::CertificateVerify as u8).then(|| (m[4], m[5]))
+        })
+    }
+
+    /// Client authentication with an Ed25519 client key: the client's
+    /// `CertificateVerify` is pure EdDSA over the raw handshake messages, and
+    /// the server verifies it. Covers every server/client key-type pairing, so
+    /// the two paths cannot depend on each other.
+    #[test]
+    fn mtls_with_ed25519_and_ecdsa_keys_in_every_pairing() {
+        let ed = || creds_for(&rcgen::PKCS_ED25519);
+        let p256 = || creds_for(&rcgen::PKCS_ECDSA_P256_SHA256);
+        let p384 = || creds_for(&rcgen::PKCS_ECDSA_P384_SHA384);
+        let kinds: [(&str, &dyn Fn() -> ServerCredentials); 3] = [("Ed25519", &ed), ("P-256", &p256), ("P-384", &p384)];
+        for (server_name, make_server) in kinds {
+            for (client_name, make_client) in kinds {
+                let (server_creds, client_creds) = (make_server(), make_client());
+                let client_cfg = client_config_with_cert(&server_creds, client_creds.clone());
+                let server_cfg = server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+                let (mut client, mut server) = (Tls12Engine::new(client_cfg), Tls12Engine::new(server_cfg));
+                let (mut sc, mut ss) = (RecordingSink::default(), RecordingSink::default());
+                // Keep what the client sends so its CertificateVerify can be inspected.
+                client.start(&mut sc);
+                let hello = take_outbound(&mut sc);
+                relay(&mut client, &mut server, hello, &mut ss);
+                relay(&mut server, &mut client, take_outbound(&mut ss), &mut sc);
+                let flight = take_outbound(&mut sc);
+                sc.outbound = flight.clone();
+                let cv = client_signing_alg(&sc);
+                relay(&mut client, &mut server, flight, &mut ss);
+                relay(&mut server, &mut client, take_outbound(&mut ss), &mut sc);
+                assert!(
+                    client.is_complete() && server.is_complete(),
+                    "server {server_name} / client {client_name}: {:?} / {:?}",
+                    sc.events,
+                    ss.events
+                );
+                if client_name == "Ed25519" {
+                    assert_eq!(cv, Some((sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519)), "server {server_name}");
+                }
+            }
+        }
+    }
+
+    /// RFC 8422 section 5.1: a server may sign only with an algorithm the
+    /// client listed, and Ed25519 is not among the defaults an absent list
+    /// implies. A ClientHello that omits it (patched here, by turning the
+    /// Ed25519 entry into a duplicate ECDSA one so every length stays valid)
+    /// is refused rather than answered with a signature it cannot check.
+    #[test]
+    fn an_ed25519_server_refuses_a_client_that_did_not_offer_ed25519() {
+        let server_creds = creds_for(&rcgen::PKCS_ED25519);
+        let mut trust = TrustStore::new();
+        trust.add_anchor(server_creds.cert_chain[0].clone());
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            trust_store: Some(trust),
+            ..Default::default()
+        };
+        let server_cfg = Config { role: Role::Server, server: Some(server_creds), ..Default::default() };
+        let (mut client, mut server) = (Tls12Engine::new(client_cfg), Tls12Engine::new(server_cfg));
+        let (mut sc, mut ss) = (RecordingSink::default(), RecordingSink::default());
+        client.start(&mut sc);
+        let mut hello = take_outbound(&mut sc).concat();
+        let ed25519 = [sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519];
+        let at = hello.windows(2).position(|w| w == ed25519).expect("the ClientHello offers Ed25519");
+        hello[at..at + 2].copy_from_slice(&[sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA]);
+        server.feed_handshake_data(&mut hello.as_slice(), &mut ss);
+        assert!(!server.is_complete());
+        assert!(
+            ss.events.iter().any(|e| e.starts_with("protocol_error") && e.contains("Ed25519")),
+            "{:?}",
+            ss.events
+        );
+    }
+
+    /// The client offers Ed25519 in the first place.
+    #[test]
+    fn the_client_hello_offers_ed25519() {
+        let mut client = Tls12Engine::new(Config::default());
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        let hello = take_outbound(&mut sink).concat();
+        assert!(hello.windows(2).any(|w| w == [sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519]));
+    }
+
+    #[test]
+    fn verify_ske_signature_accepts_ed25519_and_rejects_forgeries() {
+        let creds = creds_for(&rcgen::PKCS_ED25519);
+        let other = creds_for(&rcgen::PKCS_ED25519);
+        let message = b"client_random || server_random || params";
+        let (h, a, sig) = sign_ske(&creds.signing_key_pkcs8, message).expect("Ed25519 key signs");
+        assert_eq!((h, a), (sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519));
+        assert_eq!(sig.as_bytes().len(), 64);
+
+        let leaf = &creds.cert_chain[0];
+        assert!(verify_ske_signature(leaf, h, a, message, sig.as_bytes()), "genuine signature");
+        assert!(!verify_ske_signature(leaf, h, a, b"different message", sig.as_bytes()), "wrong message");
+        assert!(!verify_ske_signature(&other.cert_chain[0], h, a, message, sig.as_bytes()), "wrong key");
+        let mut bad = sig.as_bytes().to_vec();
+        bad[10] ^= 0x01;
+        assert!(!verify_ske_signature(leaf, h, a, message, &bad), "corrupted signature");
+        assert!(!verify_ske_signature(leaf, h, a, message, &bad[..63]), "short signature");
+        // An Ed25519 certificate cannot vouch for an ECDSA or RSA signature.
+        assert!(!verify_ske_signature(leaf, sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA, message, sig.as_bytes()));
+    }
+
+    /// Which server keys each suite family can be used with.
+    #[test]
+    fn ecdsa_suites_accept_every_elliptic_and_edwards_key_and_rsa_suites_only_rsa() {
+        use KeyKind::*;
+        for suite_family in [EcdsaP256] {
+            for key in [EcdsaP256, EcdsaP384, Ed25519] {
+                assert!(suite_accepts_key(suite_family, key), "{key:?}");
+            }
+            assert!(!suite_accepts_key(suite_family, Rsa));
+        }
+        assert!(suite_accepts_key(Rsa, Rsa));
+        for key in [EcdsaP256, EcdsaP384, Ed25519] {
+            assert!(!suite_accepts_key(Rsa, key), "{key:?}");
+        }
+        // Every supported suite is tagged with one of the two families.
+        for suite in SUPPORTED_CIPHER_SUITES {
+            let (_, _, family) = cipher_info(*suite).unwrap();
+            assert!(matches!(family, EcdsaP256 | Rsa), "{suite:#06x} {family:?}");
+        }
     }
 
     // ---- ALPN (RFC 7301) ----
