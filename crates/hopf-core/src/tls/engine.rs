@@ -19,7 +19,8 @@ use super::handshake::{
     build_hello_retry_request, build_key_update, build_server_hello_ext, compute_finished_verify_data,
     compute_psk_binder, derive_application_traffic_with_psk, derive_early_traffic,
     derive_handshake_traffic_with_psk, derive_resumption_master_secret, derive_resumption_psk,
-    key_update_request, ApplicationTrafficSecrets, ClientHelloParams, HandshakeMessage,
+    decode_record_size_limit, key_update_request, ApplicationTrafficSecrets, ClientHelloParams,
+    HandshakeMessage, MAX_RECORD_SIZE_LIMIT_13, MIN_RECORD_SIZE_LIMIT,
     HandshakeTrafficSecrets, HandshakeType, KeyShareEntry, OfferedPsk, PskSecret, ResumptionMasterSecret,
     TrafficSecret, Transcript, TranscriptHash,
 };
@@ -30,7 +31,10 @@ use super::handshake::ticket::{
     StoredTicket,
 };
 use super::handshake::transport_params::RememberedTransportLimits;
-use super::sink::{AlertDescription, KeyUpdateDirection, QuicSecrets, TlsEventSink, TlsProtocolError, VerifyResult};
+use super::sink::{
+    AlertDescription, KeyUpdateDirection, QuicSecrets, RecordSizeLimits, TlsEventSink, TlsProtocolError,
+    VerifyResult,
+};
 use super::ticket_keys::TicketKeys;
 use crate::crypto::hkdf::expand_label;
 
@@ -258,6 +262,23 @@ pub struct HandshakeConfig {
     /// certificate list (RFC 8446 §4.4.2 permits this) — the handshake
     /// still proceeds unless the server enforces [`ClientAuthPolicy::Require`].
     pub client_credentials: Option<ServerCredentials>,
+    /// `record_size_limit` (RFC 8449): the largest protected record this
+    /// endpoint will receive.
+    ///
+    /// - **Client:** `Some` offers the extension with this value; `None` (the
+    ///   default) leaves it out, so nothing changes on the wire.
+    /// - **Server:** a client that sends the extension is always honoured (its
+    ///   limit caps the records this server sends) and answered in
+    ///   `EncryptedExtensions`; this value only chooses what the server
+    ///   answers with, and so what it will accept. `None` answers with the
+    ///   protocol maximum (16385), i.e. accepts records of any legal size.
+    ///   A client that does not send the extension is unaffected either way.
+    ///
+    /// Clamped to 64..=16385 (the extension's own bounds for TLS 1.3 and
+    /// DTLS 1.3). Ignored on QUIC, which has no record layer. The limits take
+    /// effect only once both sides have sent the extension; see
+    /// [`TlsEventSink::record_size_limit_negotiated`].
+    pub record_size_limit: Option<u16>,
 }
 
 impl Default for HandshakeConfig {
@@ -282,6 +303,7 @@ impl Default for HandshakeConfig {
             client_auth: ClientAuthPolicy::None,
             client_trust_store: None,
             client_credentials: None,
+            record_size_limit: None,
         }
     }
 }
@@ -318,6 +340,8 @@ pub struct HandshakeEngine {
     /// Resumption master secret retained until NST is minted / stored.
     resumption_master: Option<ResumptionMasterSecret>,
     negotiated_alpn: Option<Bytes>,
+    /// `record_size_limit` (RFC 8449) limits, once both sides have sent it.
+    record_size_limits: Option<RecordSizeLimits>,
     /// ALPN from the ticket offered in ClientHello (client role; for EE check).
     offered_ticket_alpn: Option<Bytes>,
     /// Peer server limits from EncryptedExtensions (client; for ticket cache / 0-RTT).
@@ -417,6 +441,7 @@ impl HandshakeEngine {
             early_data_accepted: false,
             resumption_master: None,
             negotiated_alpn: None,
+            record_size_limits: None,
             offered_ticket_alpn: None,
             peer_remembered_limits: None,
             peer_server_name: None,
@@ -675,6 +700,7 @@ impl HandshakeEngine {
             early_data: want_early,
             psk: psk_offer,
             cookie: self.client_retry_cookie.take(),
+            record_size_limit: self.offered_record_size_limit(),
             legacy_version: self.config.mode.legacy_version(),
         };
 
@@ -860,6 +886,11 @@ impl HandshakeEngine {
                 // Do not export early keys at handshake_complete after reject.
                 self.early_client_secret = None;
                 sink.early_data_accepted(false);
+            }
+        }
+        if let Some(raw) = ee.record_size_limit.as_ref() {
+            if !self.on_server_record_size_limit(raw, sink) {
+                return false;
             }
         }
         if let Some(tp) = ee.transport_parameters {
@@ -1195,6 +1226,13 @@ impl HandshakeEngine {
         let aead = Tls13Aead::from_suite(suite).expect("suite drawn from SUPPORTED_CIPHER_SUITES");
         self.negotiated_aead = Some(aead);
 
+        // RFC 8449: validated up front so a bad value is refused before any
+        // of our own flight is sent.
+        let record_size_limit_peer = match self.client_record_size_limit(&ch, sink) {
+            Ok(v) => v,
+            Err(()) => return false,
+        };
+
         // Try PSK resumption.
         if let (Some(identity), Some(binder), Some(ticket_keys)) = (
             ch.psk_identity.as_ref(),
@@ -1352,10 +1390,25 @@ impl HandshakeEngine {
             return false;
         }
         self.negotiated_alpn = alpn.clone();
+        // RFC 8449 §4: answer in EncryptedExtensions, and only if the client
+        // sent the extension. Announced to the
+        // record layer first, because EncryptedExtensions is itself the first
+        // protected record the client's limit applies to.
+        let record_size_limit_reply = match record_size_limit_peer {
+            Some(peer) => {
+                let local = self.reply_record_size_limit();
+                let limits = RecordSizeLimits { send: peer, receive: local };
+                self.record_size_limits = Some(limits);
+                sink.record_size_limit_negotiated(limits);
+                Some(local)
+            }
+            None => None,
+        };
         let ee = build_encrypted_extensions_ext(
             alpn.as_deref(),
             self.config.local_transport_parameters.as_deref(),
             self.early_data_accepted,
+            record_size_limit_reply,
         );
         self.emit_outgoing(&ee, sink);
 
@@ -1619,6 +1672,104 @@ impl HandshakeEngine {
         }
     }
 
+    /// The `record_size_limit` (RFC 8449) a *client* offers in its
+    /// ClientHello: configured, valid for this transport (QUIC has no record
+    /// layer), and clamped to the extension's bounds. `None` offers nothing.
+    fn offered_record_size_limit(&self) -> Option<u16> {
+        if self.config.mode == HandshakeMode::Quic || self.config.role != HandshakeRole::Client {
+            return None;
+        }
+        self.config
+            .record_size_limit
+            .map(|l| l.clamp(MIN_RECORD_SIZE_LIMIT, MAX_RECORD_SIZE_LIMIT_13))
+    }
+
+    /// What a *server* answers with: its configured limit, or the protocol
+    /// maximum (no restriction on what it receives) when none is configured.
+    fn reply_record_size_limit(&self) -> u16 {
+        self.config
+            .record_size_limit
+            .map_or(MAX_RECORD_SIZE_LIMIT_13, |l| l.clamp(MIN_RECORD_SIZE_LIMIT, MAX_RECORD_SIZE_LIMIT_13))
+    }
+
+    /// Set the `record_size_limit` (RFC 8449) to advertise, as
+    /// [`HandshakeConfig::record_size_limit`] does. Only possible before the
+    /// handshake has started; returns whether it took effect.
+    pub fn set_record_size_limit(&mut self, limit: Option<u16>) -> bool {
+        if self.state != State::Initial {
+            return false;
+        }
+        self.config.record_size_limit = limit;
+        true
+    }
+
+    /// The limits in force, once `record_size_limit` (RFC 8449) has been
+    /// negotiated; `None` before that, or if either side left it out.
+    pub fn record_size_limits(&self) -> Option<RecordSizeLimits> {
+        self.record_size_limits
+    }
+
+    /// Server: read the ClientHello's `record_size_limit`. `Ok(Some(peer))`
+    /// when the client sent a valid value (so it is honoured and answered),
+    /// `Ok(None)` when it sent none (or on QUIC), `Err(())` after failing the
+    /// handshake over a malformed or illegal value.
+    ///
+    /// The server always honours the extension when a client sends it, whether
+    /// or not the operator configured a limit of its own: the extension exists
+    /// for clients that cannot buffer full-size records, and a server that
+    /// ignored it would send them records they must reject (RFC 8449 §4).
+    fn client_record_size_limit<S: TlsEventSink>(
+        &mut self,
+        ch: &super::handshake::ParsedClientHello,
+        sink: &mut S,
+    ) -> Result<Option<u16>, ()> {
+        let Some(raw) = ch.record_size_limit.as_ref() else {
+            return Ok(None);
+        };
+        if self.config.mode == HandshakeMode::Quic {
+            return Ok(None);
+        }
+        let Some(value) = decode_record_size_limit(raw) else {
+            self.fail(sink, AlertDescription::DecodeError, "malformed record_size_limit extension");
+            return Err(());
+        };
+        if value < MIN_RECORD_SIZE_LIMIT {
+            // RFC 8449 §4: a value below 64 is a fatal illegal_parameter.
+            self.fail(sink, AlertDescription::IllegalParameter, "record_size_limit below 64");
+            return Err(());
+        }
+        // A client may advertise more than TLS 1.3 can carry (it could not know
+        // which version we would pick), which a server must accept (RFC 8449
+        // §4); what we send is capped at the protocol maximum regardless.
+        Ok(Some(value.min(MAX_RECORD_SIZE_LIMIT_13)))
+    }
+
+    /// Client: read the server's `record_size_limit` from EncryptedExtensions.
+    /// `false` after failing the handshake.
+    fn on_server_record_size_limit<S: TlsEventSink>(&mut self, raw: &Bytes, sink: &mut S) -> bool {
+        let Some(local) = self.offered_record_size_limit() else {
+            // RFC 8446 §4.2: an extension the client did not offer is
+            // `unsupported_extension` (and QUIC never offers this one).
+            self.fail(sink, AlertDescription::UnsupportedExtension, "server sent record_size_limit the client never offered");
+            return false;
+        };
+        let Some(value) = decode_record_size_limit(raw) else {
+            self.fail(sink, AlertDescription::DecodeError, "malformed record_size_limit extension");
+            return false;
+        };
+        if value < MIN_RECORD_SIZE_LIMIT {
+            self.fail(sink, AlertDescription::IllegalParameter, "record_size_limit below 64");
+            return false;
+        }
+        // RFC 8449 §4 lets a client abort on a value above the protocol
+        // maximum; it is harmless to clamp instead, since what we send never
+        // exceeds that maximum anyway.
+        let limits = RecordSizeLimits { send: value.min(MAX_RECORD_SIZE_LIMIT_13), receive: local };
+        self.record_size_limits = Some(limits);
+        sink.record_size_limit_negotiated(limits);
+        true
+    }
+
     fn fail<S: TlsEventSink>(&mut self, sink: &mut S, alert: AlertDescription, msg: &str) {
         if self.state != State::Failed {
             self.state = State::Failed;
@@ -1809,6 +1960,8 @@ mod tests {
         early_data_accepted: Option<bool>,
         info: Option<SecurityInfo>,
         negotiated_aead: Option<Tls13Aead>,
+        record_limits: Option<RecordSizeLimits>,
+        alerts: Vec<AlertDescription>,
     }
 
     impl TlsEventSink for RecordingSink {
@@ -1851,7 +2004,12 @@ mod tests {
             self.events
                 .push(format!("negotiated_group=0x{group:04x}"));
         }
+        fn record_size_limit_negotiated(&mut self, limits: RecordSizeLimits) {
+            self.record_limits = Some(limits);
+            self.events.push(format!("record_size_limit send={} receive={}", limits.send, limits.receive));
+        }
         fn protocol_error(&mut self, err: TlsProtocolError) {
+            self.alerts.push(err.alert);
             self.events.push(format!("protocol_error: {}", err.message));
         }
         fn timeout(&mut self, _kind: super::super::sink::TlsTimerKind) {}
@@ -2331,6 +2489,7 @@ mod tests {
             alpn: Some(Bytes::from_static(b"not-offered")),
             transport_parameters: None,
             early_data: false,
+            record_size_limit: None,
         };
         let ok = client.on_encrypted_extensions(ee, Bytes::new(), &mut sink);
         assert!(!ok);
@@ -2854,6 +3013,286 @@ mod tests {
         );
     }
 
+
+    // ---- record_size_limit (RFC 8449) ----
+
+    /// A TCP-record-layer config with `record_size_limit` set.
+    fn tcp_config(mut cfg: HandshakeConfig, limit: Option<u16>) -> HandshakeConfig {
+        cfg.mode = HandshakeMode::TcpRecordLayer;
+        cfg.record_size_limit = limit;
+        cfg
+    }
+
+    /// A ClientHello carrying `client_limit`, fed to a server configured
+    /// with `server_limit`; returns the server's sink and outbound bytes.
+    fn server_sees_client_hello_with(client_limit: Option<u16>, server_limit: Option<u16>) -> RecordingSink {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let mut server = HandshakeEngine::new(tcp_config(
+            server_config_for(test_server_credentials(), KxPolicy::classical_only()),
+            server_limit,
+        ));
+        let mut sink = RecordingSink::default();
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [3u8; 32],
+            cipher_suites: SUPPORTED_CIPHER_SUITES.to_vec(),
+            key_share: KeyShareEntry {
+                group: NamedGroup::X25519.code(),
+                share: Bytes::copy_from_slice(&kp.public_key()),
+            },
+            supported_groups: vec![NamedGroup::X25519.code()],
+            alpn: vec![],
+            server_name: None,
+            transport_parameters: None,
+            early_data: false,
+            psk: None,
+            cookie: None,
+            record_size_limit: client_limit,
+            legacy_version: 0x0303,
+        });
+        let wire = hello.encode();
+        server.feed_handshake_data(&mut wire.as_ref(), &mut sink);
+        sink
+    }
+
+    /// The bytes of a `record_size_limit` extension carrying `v`, as it sits
+    /// inside a message.
+    fn rsl_ext(v: u16) -> [u8; 6] {
+        let b = v.to_be_bytes();
+        [0x00, 0x1c, 0x00, 0x02, b[0], b[1]]
+    }
+
+    fn outbound_contains(sink: &RecordingSink, needle: &[u8]) -> bool {
+        sink.outbound.iter().any(|m| m.windows(needle.len()).any(|w| w == needle))
+    }
+
+    #[test]
+    fn server_negotiates_and_answers_in_encrypted_extensions() {
+        let sink = server_sees_client_hello_with(Some(1000), Some(4000));
+        assert_eq!(
+            sink.record_limits,
+            Some(RecordSizeLimits { send: 1000, receive: 4000 }),
+            "{:?}",
+            sink.events
+        );
+        assert!(outbound_contains(&sink, &rsl_ext(4000)), "EncryptedExtensions must carry the server's own limit");
+        assert!(sink.alerts.is_empty(), "{:?}", sink.events);
+    }
+
+    #[test]
+    fn the_limit_is_announced_before_the_first_protected_record_is_written() {
+        // EncryptedExtensions is itself a protected record the client's limit
+        // applies to, so the record layer must hear about it first.
+        let sink = server_sees_client_hello_with(Some(1000), Some(4000));
+        let limit_at = sink.events.iter().position(|e| e.starts_with("record_size_limit")).unwrap();
+        let first_flight_after = sink.events.iter().skip(limit_at).any(|e| e.starts_with("outbound"));
+        assert!(first_flight_after, "{:?}", sink.events);
+        let keys_at = sink.events.iter().position(|e| e == "handshake_keys").unwrap();
+        let ee_at = sink.events.iter().enumerate().filter(|(_, e)| e.starts_with("outbound")).nth(1).map(|(i, _)| i).unwrap();
+        assert!(limit_at < ee_at && keys_at < ee_at, "{:?}", sink.events);
+    }
+
+    #[test]
+    fn server_accepts_a_client_value_above_the_protocol_maximum_and_caps_what_it_sends() {
+        // RFC 8449 §4: a server MUST NOT reject a limit larger than TLS 1.3 can
+        // carry (the client did not know which version would be chosen).
+        let sink = server_sees_client_hello_with(Some(65535), Some(4000));
+        assert_eq!(sink.record_limits, Some(RecordSizeLimits { send: 16385, receive: 4000 }), "{:?}", sink.events);
+    }
+
+    #[test]
+    fn our_own_advertised_limit_is_clamped_to_the_extensions_bounds() {
+        let sink = server_sees_client_hello_with(Some(1000), Some(10));
+        assert_eq!(sink.record_limits.unwrap().receive, 64, "below the RFC floor");
+        assert!(outbound_contains(&sink, &rsl_ext(64)));
+        let sink = server_sees_client_hello_with(Some(1000), Some(60000));
+        assert_eq!(sink.record_limits.unwrap().receive, 16385);
+    }
+
+    #[test]
+    fn a_client_value_below_64_is_a_fatal_illegal_parameter() {
+        for bad in [0u16, 1, 63] {
+            let sink = server_sees_client_hello_with(Some(bad), Some(4000));
+            assert_eq!(sink.alerts, [AlertDescription::IllegalParameter], "value {bad}: {:?}", sink.events);
+            assert!(sink.record_limits.is_none());
+            assert!(sink.outbound.is_empty(), "nothing of our flight goes out first: {:?}", sink.events);
+        }
+        // Exactly the floor is fine.
+        let sink = server_sees_client_hello_with(Some(64), Some(4000));
+        assert!(sink.alerts.is_empty(), "{:?}", sink.events);
+        assert_eq!(sink.record_limits.unwrap().send, 64);
+    }
+
+    /// The extension exists for clients that cannot buffer full-size records,
+    /// so a server that implements it must honour one even when its operator
+    /// never configured a limit of its own; ignoring it would send that
+    /// client records it has to reject. (Found against GnuTLS, which aborts on
+    /// exactly that.) The server then answers with the protocol maximum, i.e.
+    /// no restriction on what it will accept.
+    #[test]
+    fn a_server_with_no_limit_of_its_own_still_honours_and_answers_the_client() {
+        let sink = server_sees_client_hello_with(Some(1000), None);
+        assert_eq!(
+            sink.record_limits,
+            Some(RecordSizeLimits { send: 1000, receive: 16385 }),
+            "{:?}",
+            sink.events
+        );
+        assert!(outbound_contains(&sink, &rsl_ext(16385)), "answers with the protocol maximum");
+        assert!(sink.alerts.is_empty(), "{:?}", sink.events);
+    }
+
+    #[test]
+    fn an_illegal_client_value_is_refused_whether_or_not_the_server_configured_a_limit() {
+        let sink = server_sees_client_hello_with(Some(63), None);
+        assert_eq!(sink.alerts, [AlertDescription::IllegalParameter], "{:?}", sink.events);
+        assert!(sink.record_limits.is_none());
+    }
+
+    #[test]
+    fn a_server_on_quic_ignores_the_extension() {
+        // QUIC has no record layer; nothing about it may be negotiated there.
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let mut cfg = server_config_for(test_server_credentials(), KxPolicy::classical_only());
+        cfg.mode = HandshakeMode::Quic;
+        let mut server = HandshakeEngine::new(cfg);
+        let mut sink = RecordingSink::default();
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [3u8; 32],
+            cipher_suites: SUPPORTED_CIPHER_SUITES.to_vec(),
+            key_share: KeyShareEntry {
+                group: NamedGroup::X25519.code(),
+                share: Bytes::copy_from_slice(&kp.public_key()),
+            },
+            supported_groups: vec![NamedGroup::X25519.code()],
+            alpn: vec![],
+            server_name: None,
+            transport_parameters: None,
+            early_data: false,
+            psk: None,
+            cookie: None,
+            record_size_limit: Some(63),
+            legacy_version: 0x0303,
+        });
+        server.feed_handshake_data(&mut hello.encode().as_ref(), &mut sink);
+        assert!(sink.alerts.is_empty(), "even an illegal value is ignored on QUIC: {:?}", sink.events);
+        assert!(sink.record_limits.is_none());
+        assert!(!outbound_contains(&sink, &[0x00, 0x1c, 0x00, 0x02]));
+    }
+
+    #[test]
+    fn a_server_only_answers_a_client_that_asked() {
+        // RFC 8446 §4.2: a server may not send an extension the client did not,
+        // however it is configured.
+        let sink = server_sees_client_hello_with(None, Some(4000));
+        assert!(sink.record_limits.is_none());
+        assert!(sink.alerts.is_empty(), "{:?}", sink.events);
+        assert!(!outbound_contains(&sink, &[0x00, 0x1c, 0x00, 0x02]));
+    }
+
+    /// A client engine's first flight (its ClientHello), for `mode`/`limit`.
+    fn client_hello_bytes(mode: HandshakeMode, limit: Option<u16>) -> RecordingSink {
+        let creds = test_server_credentials();
+        let mut cfg = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        cfg.mode = mode;
+        cfg.record_size_limit = limit;
+        let mut client = HandshakeEngine::new(cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        sink
+    }
+
+    #[test]
+    fn the_client_offers_the_extension_only_when_configured_and_never_on_quic() {
+        let on = client_hello_bytes(HandshakeMode::TcpRecordLayer, Some(2000));
+        assert!(outbound_contains(&on, &rsl_ext(2000)));
+        let dtls = client_hello_bytes(HandshakeMode::Dtls, Some(2000));
+        assert!(outbound_contains(&dtls, &rsl_ext(2000)), "DTLS 1.3 offers it too");
+        let off = client_hello_bytes(HandshakeMode::TcpRecordLayer, None);
+        assert!(!outbound_contains(&off, &[0x00, 0x1c, 0x00, 0x02]), "absent by default");
+        let quic = client_hello_bytes(HandshakeMode::Quic, Some(2000));
+        assert!(!outbound_contains(&quic, &[0x00, 0x1c, 0x00, 0x02]), "QUIC has no record layer");
+    }
+
+    /// Feed `client` a hand-built EncryptedExtensions carrying `raw` as its
+    /// `record_size_limit` body.
+    fn client_gets_ee_with(client_limit: Option<u16>, raw: Option<&[u8]>) -> (bool, RecordingSink) {
+        let creds = test_server_credentials();
+        let mut cfg = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        cfg.mode = HandshakeMode::TcpRecordLayer;
+        cfg.record_size_limit = client_limit;
+        cfg.alpn = vec![];
+        let mut client = HandshakeEngine::new(cfg);
+        let mut sink = RecordingSink::default();
+        let ee = super::super::handshake::ParsedEncryptedExtensions {
+            alpn: None,
+            transport_parameters: None,
+            early_data: false,
+            record_size_limit: raw.map(Bytes::copy_from_slice),
+        };
+        let ok = client.on_encrypted_extensions(ee, Bytes::new(), &mut sink);
+        (ok, sink)
+    }
+
+    #[test]
+    fn the_client_applies_the_servers_limit() {
+        let (ok, sink) = client_gets_ee_with(Some(3000), Some(&1500u16.to_be_bytes()));
+        assert!(ok, "{:?}", sink.events);
+        assert_eq!(sink.record_limits, Some(RecordSizeLimits { send: 1500, receive: 3000 }));
+        // Above the protocol maximum is clamped rather than fatal.
+        let (ok, sink) = client_gets_ee_with(Some(3000), Some(&40000u16.to_be_bytes()));
+        assert!(ok);
+        assert_eq!(sink.record_limits.unwrap().send, 16385);
+    }
+
+    #[test]
+    fn the_client_ignores_a_server_that_sent_none_and_applies_no_limit() {
+        let (ok, sink) = client_gets_ee_with(Some(3000), None);
+        assert!(ok);
+        assert!(sink.record_limits.is_none(), "not negotiated: neither direction is limited");
+    }
+
+    #[test]
+    fn the_client_rejects_an_extension_it_never_offered() {
+        let (ok, sink) = client_gets_ee_with(None, Some(&1500u16.to_be_bytes()));
+        assert!(!ok);
+        assert_eq!(sink.alerts, [AlertDescription::UnsupportedExtension]);
+    }
+
+    #[test]
+    fn the_client_rejects_a_malformed_or_illegal_server_value() {
+        let (ok, sink) = client_gets_ee_with(Some(3000), Some(&[0x05]));
+        assert!(!ok);
+        assert_eq!(sink.alerts, [AlertDescription::DecodeError], "one octet is not a uint16");
+        let (ok, sink) = client_gets_ee_with(Some(3000), Some(&[0, 5, 0]));
+        assert!(!ok);
+        assert_eq!(sink.alerts, [AlertDescription::DecodeError], "three octets neither");
+        let (ok, sink) = client_gets_ee_with(Some(3000), Some(&63u16.to_be_bytes()));
+        assert!(!ok);
+        assert_eq!(sink.alerts, [AlertDescription::IllegalParameter]);
+    }
+
+    #[test]
+    fn engine_reports_the_negotiated_limits() {
+        let creds = test_server_credentials();
+        let mut cfg = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        cfg.mode = HandshakeMode::TcpRecordLayer;
+        cfg.record_size_limit = Some(3000);
+        cfg.alpn = vec![];
+        let mut client = HandshakeEngine::new(cfg);
+        assert_eq!(client.record_size_limits(), None);
+        let mut sink = RecordingSink::default();
+        let ee = super::super::handshake::ParsedEncryptedExtensions {
+            alpn: None,
+            transport_parameters: None,
+            early_data: false,
+            record_size_limit: Some(Bytes::copy_from_slice(&1500u16.to_be_bytes())),
+        };
+        assert!(client.on_encrypted_extensions(ee, Bytes::new(), &mut sink));
+        assert_eq!(client.record_size_limits(), Some(RecordSizeLimits { send: 1500, receive: 3000 }));
+    }
+
     // ---- ChaCha20-Poly1305 cipher suite negotiation ----
 
     /// A normal client always offers both `SUPPORTED_CIPHER_SUITES` entries
@@ -2887,6 +3326,7 @@ mod tests {
             early_data: false,
             psk: None,
             cookie: None,
+            record_size_limit: None,
             legacy_version: 0x0303,
         });
         let wire = hello.encode();
@@ -2927,6 +3367,7 @@ mod tests {
             early_data: false,
             psk: None,
             cookie: None,
+            record_size_limit: None,
             legacy_version: 0x0303,
         });
         let wire = hello.encode();

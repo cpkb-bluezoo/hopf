@@ -13,7 +13,8 @@ use crate::security::SecurityInfo;
 
 use super::engine::{HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, Tls13Aead};
 use super::sink::{
-    AlertDescription, KeyUpdateDirection, QuicSecrets, TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyRequest,
+    AlertDescription, KeyUpdateDirection, QuicSecrets, RecordSizeLimits, TlsEventSink, TlsProtocolError,
+    TlsTimerKind, VerifyRequest,
     VerifyResult,
 };
 
@@ -171,6 +172,14 @@ struct RecordState {
     /// second one, and against replying to a peer's alert with one of our
     /// own (RFC 8446 §6.1/§6.2 don't call for acknowledging an alert).
     alert_sent: bool,
+    /// Most content octets one *protected* record may carry: the peer's
+    /// `record_size_limit` (RFC 8449) less the inner content-type octet,
+    /// or the protocol maximum when none was negotiated. Records sent in the
+    /// clear are not subject to it.
+    send_content_max: usize,
+    /// Our own advertised `record_size_limit`, checked against the whole
+    /// decrypted inner plaintext of every protected record once negotiated.
+    recv_limit: Option<usize>,
 }
 
 impl RecordState {
@@ -184,6 +193,8 @@ impl RecordState {
             next_read: None,
             read_update_requested: false,
             alert_sent: false,
+            send_content_max: MAX_FRAGMENT,
+            recv_limit: None,
         }
     }
 
@@ -229,6 +240,14 @@ impl RecordState {
         self.read_update_requested = false;
     }
 
+    /// Apply a negotiated `record_size_limit` (RFC 8449). For TLS 1.3 the
+    /// limit counts the whole `TLSInnerPlaintext`, so the content-type octet
+    /// comes out of what each record may carry. No padding is ever added.
+    fn apply_record_size_limits(&mut self, limits: RecordSizeLimits) {
+        self.send_content_max = MAX_FRAGMENT.min((limits.send as usize).saturating_sub(1)).max(1);
+        self.recv_limit = Some(limits.receive as usize);
+    }
+
     fn write_over_confidentiality_limit(&self) -> bool {
         self.write.as_ref().is_some_and(DirectionalKeys::over_confidentiality_limit)
     }
@@ -268,7 +287,12 @@ fn write_encrypted_record(write: &mut DirectionalKeys, inner_type: u8, payload: 
 
 fn write_fragmented<S: TlsRecordSink + ?Sized>(state: &mut RecordState, content_type: u8, data: &[u8], sink: &mut S) {
     let mut out = Vec::new();
-    for chunk in if data.is_empty() { vec![&data[..]] } else { data.chunks(MAX_FRAGMENT).collect() } {
+    // Only protected records are subject to `record_size_limit`.
+    let max = match state.epoch {
+        Epoch::Plaintext => MAX_FRAGMENT,
+        Epoch::Handshake | Epoch::Application => state.send_content_max,
+    };
+    for chunk in if data.is_empty() { vec![&data[..]] } else { data.chunks(max).collect() } {
         match state.epoch {
             Epoch::Plaintext => write_plaintext_record(content_type, chunk, &mut out),
             Epoch::Handshake | Epoch::Application => {
@@ -322,6 +346,10 @@ impl<S: TlsRecordSink + ?Sized> TlsEventSink for InnerSink<'_, S> {
 
     fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
         self.state.stage_application_keys(aead, client, server);
+    }
+
+    fn record_size_limit_negotiated(&mut self, limits: RecordSizeLimits) {
+        self.state.apply_record_size_limits(limits);
     }
 
     fn application_traffic_key_updated(&mut self, aead: Tls13Aead, direction: KeyUpdateDirection, secret: [u8; 32]) {
@@ -379,6 +407,21 @@ impl TlsRecordEngine {
         self.engine.is_complete()
     }
 
+    /// Advertise a `record_size_limit` (RFC 8449): the largest protected
+    /// record this endpoint will receive. Clamped to 64..=16385. `None`
+    /// leaves the extension out, which is the default. Must be called before
+    /// [`Self::start`]; returns whether it took effect. See
+    /// [`HandshakeConfig::record_size_limit`].
+    pub fn set_record_size_limit(&mut self, limit: Option<u16>) -> bool {
+        self.engine.set_record_size_limit(limit)
+    }
+
+    /// The limits in force once both sides have sent `record_size_limit`;
+    /// `None` before that, or if either side left it out.
+    pub fn record_size_limits(&self) -> Option<RecordSizeLimits> {
+        self.engine.record_size_limits()
+    }
+
     /// Consume raw bytes off the TCP stream — any number of complete or
     /// partial records. Buffers a trailing partial record for the next call.
     pub fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, input: &mut &[u8], sink: &mut S) {
@@ -407,8 +450,12 @@ impl TlsRecordEngine {
                         break;
                     }
                 }
-                Err(()) => {
-                    self.fail(sink, AlertDescription::BadRecordMac, "malformed or unauthenticated TLS record");
+                Err(AlertDescription::RecordOverflow) => {
+                    self.fail(sink, AlertDescription::RecordOverflow, "record exceeds the advertised record_size_limit");
+                    break;
+                }
+                Err(alert) => {
+                    self.fail(sink, alert, "malformed or unauthenticated TLS record");
                     break;
                 }
             }
@@ -539,14 +586,14 @@ impl TlsRecordEngine {
     /// epoch requires it. Returns the record's *inner* content type — for an
     /// encrypted record this is the last non-zero-padding byte of the
     /// decrypted plaintext, not the on-wire opaque type (RFC 8446 §5.2).
-    fn take_one_record(&mut self) -> Result<Option<(u8, Vec<u8>)>, ()> {
+    fn take_one_record(&mut self) -> Result<Option<(u8, Vec<u8>)>, AlertDescription> {
         if self.inbound.len() < 5 {
             return Ok(None);
         }
         let hdr_type = self.inbound[0];
         let len = u16::from_be_bytes([self.inbound[3], self.inbound[4]]) as usize;
         if len > MAX_CIPHERTEXT_RECORD {
-            return Err(());
+            return Err(AlertDescription::BadRecordMac);
         }
         if self.inbound.len() < 5 + len {
             return Ok(None);
@@ -563,17 +610,22 @@ impl TlsRecordEngine {
             Epoch::Plaintext => Ok(Some((hdr_type, body))),
             Epoch::Handshake | Epoch::Application => {
                 if hdr_type != CONTENT_APPLICATION_DATA {
-                    return Err(());
+                    return Err(AlertDescription::BadRecordMac);
                 }
-                let read = self.state.read.as_mut().ok_or(())?;
+                let read = self.state.read.as_mut().ok_or(AlertDescription::BadRecordMac)?;
                 let mut buf = body;
-                let n = read.open_in_place(read.nonce(), &header, &mut buf).map_err(|_| ())?;
+                let n = read.open_in_place(read.nonce(), &header, &mut buf).map_err(|_| AlertDescription::BadRecordMac)?;
                 read.advance();
                 buf.truncate(n);
+                // RFC 8449 §4: `n` is the whole TLSInnerPlaintext, which is
+                // what the limit counts (content, type octet and padding).
+                if self.state.recv_limit.is_some_and(|limit| n > limit) {
+                    return Err(AlertDescription::RecordOverflow);
+                }
                 while buf.last() == Some(&0) {
                     buf.pop();
                 }
-                let inner_type = buf.pop().ok_or(())?;
+                let inner_type = buf.pop().ok_or(AlertDescription::BadRecordMac)?;
                 Ok(Some((inner_type, buf)))
             }
         }
@@ -593,12 +645,15 @@ mod tests {
         outbound: Vec<u8>,
         app_data: Vec<Vec<u8>>,
         info: Option<SecurityInfo>,
+        /// Every byte ever written, kept even after `relay` drains `outbound`.
+        all_written: Vec<u8>,
     }
 
     impl TlsRecordSink for RecordingSink {
         fn ciphertext_ready(&mut self, data: &[u8]) {
             self.events.push(format!("ciphertext {} bytes", data.len()));
             self.outbound.extend_from_slice(data);
+            self.all_written.extend_from_slice(data);
         }
         fn application_data(&mut self, plaintext: &[u8]) {
             self.events.push(format!("application_data {} bytes", plaintext.len()));
@@ -721,6 +776,212 @@ mod tests {
         assert!(client.is_complete(), "client: {:?}", sink_c.events);
         assert!(server.is_complete(), "server: {:?}", sink_s.events);
         (sink_c, sink_s, client, server)
+    }
+
+    // ---- record_size_limit (RFC 8449) ----
+
+    /// `(outer content type, ciphertext body length)` of each record in `wire`.
+    fn records(wire: &[u8]) -> Vec<(u8, usize)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 5 <= wire.len() {
+            let len = u16::from_be_bytes([wire[i + 3], wire[i + 4]]) as usize;
+            out.push((wire[i], len));
+            i += 5 + len;
+        }
+        assert_eq!(i, wire.len(), "wire must be a whole number of records");
+        out
+    }
+
+    /// The protected records (outer type application_data) in `wire`. A
+    /// ciphertext body is inner plaintext plus a 16-octet AEAD tag.
+    fn protected(wire: &[u8]) -> Vec<usize> {
+        records(wire)
+            .into_iter()
+            .filter(|(t, _)| *t == CONTENT_APPLICATION_DATA)
+            .map(|(_, len)| len)
+            .collect()
+    }
+
+    const TAG: usize = 16;
+
+    fn configs_with_limits(client: Option<u16>, server: Option<u16>) -> (HandshakeConfig, HandshakeConfig) {
+        let (mut c, mut s) = configs();
+        c.record_size_limit = client;
+        s.record_size_limit = server;
+        (c, s)
+    }
+
+    fn all_app_data(sink: &RecordingSink) -> Vec<u8> {
+        sink.app_data.iter().flatten().copied().collect()
+    }
+
+    /// The whole feature end to end over real handshakes and real records:
+    /// once both sides negotiate, every *protected* record each side writes -
+    /// handshake flight and application data alike - carries at most the
+    /// peer's limit of inner plaintext, and the data still arrives intact.
+    #[test]
+    fn negotiated_limits_cap_every_protected_record_in_both_directions() {
+        let (client_limit, server_limit) = (100u16, 130u16);
+        let (mut sink_c, mut sink_s, mut client, mut server) =
+            run_loopback_with(configs_with_limits(Some(client_limit), Some(server_limit)));
+
+        // The server's protected handshake records (EncryptedExtensions,
+        // Certificate, CertificateVerify, Finished) obeyed the *client's* limit.
+        let server_protected = protected(&sink_s.all_written);
+        assert!(
+            server_protected.len() > 4,
+            "the Certificate alone must have been fragmented across several records: {server_protected:?}"
+        );
+        for len in &server_protected {
+            assert!(*len <= client_limit as usize + TAG, "server record of {len} exceeds the client's {client_limit}");
+        }
+        // And the client's (Finished) obeyed the server's.
+        for len in protected(&sink_c.all_written) {
+            assert!(len <= server_limit as usize + TAG, "client record of {len} exceeds the server's {server_limit}");
+        }
+
+        // Application data, both ways, is fragmented to fit and reassembles.
+        let from_client: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        let from_server: Vec<u8> = (0..4000u32).map(|i| (i % 241) as u8).collect();
+        let (c_mark, s_mark) = (sink_c.all_written.len(), sink_s.all_written.len());
+        client.send_application_data(&from_client, &mut sink_c);
+        server.send_application_data(&from_server, &mut sink_s);
+        for len in protected(&sink_c.all_written[c_mark..]) {
+            assert!(len <= server_limit as usize + TAG, "client app record {len}");
+        }
+        for len in protected(&sink_s.all_written[s_mark..]) {
+            assert!(len <= client_limit as usize + TAG, "server app record {len}");
+        }
+        assert!(protected(&sink_c.all_written[c_mark..]).len() >= from_client.len() / server_limit as usize);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        assert_eq!(all_app_data(&sink_s), from_client);
+        assert_eq!(all_app_data(&sink_c), from_server);
+    }
+
+    /// TLS 1.3 counts the content-type octet inside the limit, so a limit of
+    /// N allows N-1 octets of content, and never more.
+    #[test]
+    fn the_content_type_octet_counts_towards_the_limit() {
+        let (mut sink_c, mut sink_s, mut client, mut server) =
+            run_loopback_with(configs_with_limits(Some(200), Some(64)));
+        let mark = sink_c.all_written.len();
+        client.send_application_data(&vec![7u8; 63 * 3], &mut sink_c);
+        // The server's limit is 64: each record holds 63 content octets + 1 type octet.
+        let lens = protected(&sink_c.all_written[mark..]);
+        assert_eq!(lens, vec![64 + TAG; 3], "exactly three records of 64 inner octets");
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert_eq!(all_app_data(&sink_s).len(), 63 * 3);
+    }
+
+    /// Absent on both sides: nothing changes from today's full-size records.
+    #[test]
+    fn without_the_extension_records_are_full_size_as_before() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback();
+        let mark = sink_c.all_written.len();
+        client.send_application_data(&vec![1u8; 40000], &mut sink_c);
+        let lens = protected(&sink_c.all_written[mark..]);
+        assert_eq!(lens, vec![MAX_FRAGMENT + 1 + TAG, MAX_FRAGMENT + 1 + TAG, 40000 - 2 * MAX_FRAGMENT + 1 + TAG]);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert_eq!(all_app_data(&sink_s).len(), 40000);
+    }
+
+    /// The limits bind once the *client* has sent the extension, which the
+    /// server then always honours and answers. A server that merely has a limit
+    /// configured, facing a client that did not ask, changes nothing (RFC 8446
+    /// §4.2: it may not answer an extension the client did not send).
+    #[test]
+    fn a_server_limit_alone_changes_nothing_without_the_client_asking() {
+        let (mut sink_c, mut sink_s, mut client, mut server) =
+            run_loopback_with(configs_with_limits(None, Some(100)));
+        let (c_mark, s_mark) = (sink_c.all_written.len(), sink_s.all_written.len());
+        client.send_application_data(&vec![1u8; 5000], &mut sink_c);
+        server.send_application_data(&vec![2u8; 5000], &mut sink_s);
+        assert_eq!(protected(&sink_c.all_written[c_mark..]), vec![5000 + 1 + TAG]);
+        assert_eq!(protected(&sink_s.all_written[s_mark..]), vec![5000 + 1 + TAG]);
+        // And the receiver did not enforce a limit nobody agreed to.
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        assert_eq!(all_app_data(&sink_s).len(), 5000, "{:?}", sink_s.events);
+        assert_eq!(all_app_data(&sink_c).len(), 5000, "{:?}", sink_c.events);
+    }
+
+    /// The case that motivates the extension: a constrained client that
+    /// advertises a small limit, against a server nobody configured. The
+    /// server must cap what it sends, or the client has to reject its records
+    /// (GnuTLS aborts the connection on exactly that, which is how this was
+    /// found). The server's own answer is the protocol maximum, so the client
+    /// stays free to send full-size records back.
+    #[test]
+    fn a_server_with_no_limit_configured_still_honours_the_clients() {
+        let (mut sink_c, mut sink_s, mut client, mut server) =
+            run_loopback_with(configs_with_limits(Some(100), None));
+        // The server's protected handshake records already obeyed the client.
+        for len in protected(&sink_s.all_written) {
+            assert!(len <= 100 + TAG, "server handshake record {len} exceeds the client's 100");
+        }
+        let (c_mark, s_mark) = (sink_c.all_written.len(), sink_s.all_written.len());
+        let from_server: Vec<u8> = (0..5000u32).map(|i| (i % 239) as u8).collect();
+        server.send_application_data(&from_server, &mut sink_s);
+        client.send_application_data(&vec![1u8; 5000], &mut sink_c);
+        for len in protected(&sink_s.all_written[s_mark..]) {
+            assert!(len <= 100 + TAG, "server app record {len} exceeds the client's 100");
+        }
+        assert_eq!(
+            protected(&sink_c.all_written[c_mark..]),
+            vec![5000 + 1 + TAG],
+            "the server asked for no restriction, so the client is unrestricted"
+        );
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert_eq!(all_app_data(&sink_c), from_server, "{:?}", sink_c.events);
+        assert_eq!(all_app_data(&sink_s).len(), 5000, "{:?}", sink_s.events);
+    }
+
+    /// RFC 8449 §4: "A TLS endpoint that receives a record larger than its
+    /// advertised limit MUST generate a fatal record_overflow alert."
+    #[test]
+    fn a_record_over_the_advertised_limit_is_a_fatal_record_overflow() {
+        let (mut sink_c, mut sink_s, mut client, mut server) =
+            run_loopback_with(configs_with_limits(Some(200), Some(200)));
+        // Make the server misbehave: ignore the client's limit and send big.
+        server.state.send_content_max = MAX_FRAGMENT;
+        server.send_application_data(&vec![9u8; 1000], &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+
+        assert!(
+            sink_c.events.iter().any(|e| e.starts_with("protocol_error") && e.contains("record_size_limit")),
+            "{:?}",
+            sink_c.events
+        );
+        assert!(sink_c.app_data.is_empty(), "the oversize record's data must not be delivered");
+        // The alert the client sent back is a real, decodable record_overflow (22).
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert!(
+            sink_s.events.iter().any(|e| e.contains("fatal alert 22")),
+            "the peer must be told record_overflow: {:?}",
+            sink_s.events
+        );
+    }
+
+    /// A record exactly at the limit is fine; one octet over is not.
+    #[test]
+    fn the_limit_itself_is_allowed() {
+        let (mut sink_c, mut sink_s, mut client, mut server) =
+            run_loopback_with(configs_with_limits(Some(200), Some(200)));
+        let _ = &mut client;
+        // 199 content + 1 type = 200 inner octets: exactly the limit.
+        server.send_application_data(&vec![3u8; 199], &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        assert_eq!(all_app_data(&sink_c).len(), 199, "{:?}", sink_c.events);
+        assert!(!sink_c.events.iter().any(|e| e.starts_with("protocol_error")));
+        // 200 content + 1 type = 201: one over.
+        server.state.send_content_max = MAX_FRAGMENT;
+        server.send_application_data(&vec![3u8; 200], &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        assert!(sink_c.events.iter().any(|e| e.starts_with("protocol_error")), "{:?}", sink_c.events);
+        let _ = (&mut sink_s, &mut server);
     }
 
     /// Direct proof that `DirectionalKeys`'s ChaCha20-Poly1305 branch

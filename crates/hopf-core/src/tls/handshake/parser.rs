@@ -796,6 +796,7 @@ mod tests {
             early_data: false,
             psk: None,
             cookie: None,
+            record_size_limit: None,
             legacy_version: 0x0303,
         });
         let wire = hello.encode();

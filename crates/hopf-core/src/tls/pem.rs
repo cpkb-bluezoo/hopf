@@ -43,6 +43,54 @@ pub trait TlsConnector: Send + Sync {
 /// Shared connector handle stored on dial configs / connections.
 pub type SharedTlsConnector = Arc<dyn TlsConnector>;
 
+struct RecordSizeLimitAcceptor {
+    inner: SharedTlsAcceptor,
+    limit: u16,
+}
+
+impl TlsAcceptor for RecordSizeLimitAcceptor {
+    fn accept(&self) -> TlsVariant {
+        let mut engine = self.inner.accept();
+        engine.set_record_size_limit(Some(self.limit));
+        engine
+    }
+}
+
+/// Wrap `inner` so every accepted TLS 1.3 connection advertises a
+/// `record_size_limit` (RFC 8449): the largest protected record it will
+/// receive, clamped to 64..=16385 (the extension's bounds for TLS 1.3).
+///
+/// It works with any acceptor this module builds (SNI, mutual TLS, ...). The
+/// limit only takes effect when the client sends the extension too; then each
+/// side caps the records it sends at the other's limit, and a received record
+/// over its own limit is a fatal `record_overflow`. Without this wrapper the
+/// extension is neither sent nor acted on. TLS 1.2 acceptors are left
+/// unchanged: the extension is implemented for TLS 1.3 only.
+pub fn acceptor_with_record_size_limit(inner: SharedTlsAcceptor, limit: u16) -> SharedTlsAcceptor {
+    Arc::new(RecordSizeLimitAcceptor { inner, limit })
+}
+
+struct RecordSizeLimitConnector {
+    inner: SharedTlsConnector,
+    limit: u16,
+}
+
+impl TlsConnector for RecordSizeLimitConnector {
+    fn connect(&self, server_name: &str) -> io::Result<TlsVariant> {
+        let mut engine = self.inner.connect(server_name)?;
+        engine.set_record_size_limit(Some(self.limit));
+        Ok(engine)
+    }
+}
+
+/// Client-side counterpart of [`acceptor_with_record_size_limit`]: every
+/// TLS 1.3 connection made through the wrapped connector offers a
+/// `record_size_limit` (RFC 8449). Works with any connector this module
+/// builds; TLS 1.2 connectors are left unchanged.
+pub fn connector_with_record_size_limit(inner: SharedTlsConnector, limit: u16) -> SharedTlsConnector {
+    Arc::new(RecordSizeLimitConnector { inner, limit })
+}
+
 fn base_config(role: HandshakeRole, alpn: &[&[u8]]) -> HandshakeConfig {
     HandshakeConfig {
         role,
@@ -432,6 +480,104 @@ mod tests {
         std::fs::write(&cert_path, cert.pem()).unwrap();
         std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
         (dir, cert_path, key_path)
+    }
+
+    /// Collects the bytes an engine writes.
+    #[derive(Default)]
+    struct Wire {
+        written: Vec<u8>,
+        received: Vec<u8>,
+        errors: Vec<String>,
+    }
+
+    impl crate::tls::TlsRecordSink for Wire {
+        fn ciphertext_ready(&mut self, data: &[u8]) {
+            self.written.extend_from_slice(data);
+        }
+        fn application_data(&mut self, plaintext: &[u8]) {
+            self.received.extend_from_slice(plaintext);
+        }
+        fn handshake_complete(&mut self, _info: crate::security::SecurityInfo) {}
+        fn verification_requested(&mut self, _req: crate::tls::VerifyRequest) {}
+        fn protocol_error(&mut self, err: crate::tls::TlsProtocolError) {
+            self.errors.push(err.message);
+        }
+        fn peer_closed(&mut self) {}
+    }
+
+    fn drain(from: &mut Wire, to: &mut TlsVariant, to_wire: &mut Wire) {
+        let bytes = std::mem::take(&mut from.written);
+        to.feed_ciphertext(&mut bytes.as_slice(), to_wire);
+    }
+
+    /// Sizes of the protected (application_data outer type) records in `wire`.
+    fn protected_sizes(wire: &[u8]) -> Vec<usize> {
+        let (mut out, mut i) = (Vec::new(), 0);
+        while i + 5 <= wire.len() {
+            let len = u16::from_be_bytes([wire[i + 3], wire[i + 4]]) as usize;
+            if wire[i] == 23 {
+                out.push(len);
+            }
+            i += 5 + len;
+        }
+        out
+    }
+
+    /// The wrappers reach real engines built by the ordinary PEM helpers:
+    /// both sides advertise, and afterwards every protected record fits the
+    /// other's limit while the data still arrives intact.
+    #[test]
+    fn the_wrappers_apply_the_limit_to_engines_from_the_ordinary_builders() {
+        use crate::tls::connector_from_pem;
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let acceptor = acceptor_with_record_size_limit(
+            acceptor_from_pem(&cert_path, &key_path, &[b"h2"]).unwrap(),
+            150,
+        );
+        let connector = connector_with_record_size_limit(connector_from_pem(&cert_path, &[b"h2"]).unwrap(), 120);
+
+        let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
+        let (mut wc, mut ws) = (Wire::default(), Wire::default());
+        client.start(&mut wc);
+        drain(&mut wc, &mut server, &mut ws);
+        drain(&mut ws, &mut client, &mut wc);
+        drain(&mut wc, &mut server, &mut ws);
+        assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
+
+        let sent: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        client.send_application_data(&sent, &mut wc);
+        server.send_application_data(&sent, &mut ws);
+        for len in protected_sizes(&wc.written) {
+            assert!(len <= 150 + 16, "client record {len} exceeds the server's limit of 150");
+        }
+        for len in protected_sizes(&ws.written) {
+            assert!(len <= 120 + 16, "server record {len} exceeds the client's limit of 120");
+        }
+        drain(&mut wc, &mut server, &mut ws);
+        drain(&mut ws, &mut client, &mut wc);
+        assert_eq!(ws.received, sent);
+        assert_eq!(wc.received, sent);
+    }
+
+    #[test]
+    fn a_wrapped_tls12_engine_is_left_alone() {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let acceptor = acceptor_with_record_size_limit(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(), 200);
+        let mut engine = acceptor.accept();
+        assert!(matches!(engine, TlsVariant::V12(_)));
+        assert!(!engine.set_record_size_limit(Some(200)), "TLS 1.2 does not implement the extension");
+    }
+
+    #[test]
+    fn the_limit_cannot_be_changed_once_the_handshake_has_started() {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, _key_path) = write_temp_pem(&key_pair);
+        let mut client = crate::tls::connector_from_pem(&cert_path, &[]).unwrap().connect("localhost").unwrap();
+        assert!(client.set_record_size_limit(Some(500)));
+        client.start(&mut Wire::default());
+        assert!(!client.set_record_size_limit(Some(600)), "too late: the ClientHello is already out");
     }
 
     #[test]
