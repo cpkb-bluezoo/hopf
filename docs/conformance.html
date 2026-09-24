@@ -80,6 +80,7 @@
 <li><a href="#http1">HTTP/1.1</a></li>
 <li><a href="#http2">HTTP/2</a></li>
 <li><a href="#http3">HTTP/3</a></li>
+<li><a href="#caching">HTTP caching and conditional requests</a></li>
 <li><a href="#quic">QUIC transport</a></li>
 <li><a href="#webdav">WebDAV</a></li>
 <li><a href="#websocket">WebSocket</a></li>
@@ -359,6 +360,27 @@
 <tr><td>Static table (99 entries)</td><td>§3.1 / Appendix A</td><td>Compliant</td><td>Full RFC 9204 Appendix A table in <code>h3/qpack/static_table.rs</code> (indices 0–98); index-by-index regression test guards against the former truncated table that collided from index 30</td></tr>
 </tbody>
 </table>
+<h2 id="caching">HTTP caching and conditional requests &#8212; RFC 9111 / RFC 9110 &#167;8.8, &#167;13</h2>
+<p>Scope is <strong>origin-server correctness</strong>: producing validators and freshness information and honouring conditional requests. <code>hopf-http</code> does not store responses, so the cache-side rules of RFC 9111 (storing, freshness calculation, <code>Age</code>, invalidation, <code>Vary</code> secondary keys) do not apply and a shared-cache or reverse-proxy mode is a separate piece of work, not part of this section. Before this work <code>hopf-http</code> had no validator or precondition handling at all, and <code>hopf-webdav</code> compared a nanosecond file mtime against a whole-second <code>If-Modified-Since</code>, so its revalidations never matched.</p>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Entity-tag syntax, strong and weak comparison</td><td>RFC 9110 &#167;8.8.3</td><td>Compliant</td><td><code>caching::EntityTag</code>; <code>strong_eq</code> for <code>If-Match</code>, <code>weak_eq</code> for <code>If-None-Match</code>; tag lists are scanned quote-aware because a tag may contain a comma</td></tr>
+<tr><td>Precondition evaluation order</td><td>RFC 9110 &#167;13.2.2</td><td>Compliant</td><td><code>caching::evaluate_preconditions</code>: <code>If-Match</code>, then <code>If-Unmodified-Since</code>, then <code>If-None-Match</code>, then <code>If-Modified-Since</code>, each only when its predecessor is absent, as specified</td></tr>
+<tr><td>Ignore malformed, repeated or inapplicable fields</td><td>RFC 9110 &#167;13.1.3-4</td><td>Compliant</td><td>Invalid HTTP-dates and multi-line date fields are ignored; <code>If-Modified-Since</code> only acts on <code>GET</code>/<code>HEAD</code>; obsolete RFC 850 and <code>asctime</code> dates are understood</td></tr>
+<tr><td>Date comparison at one-second resolution</td><td>RFC 9110 &#167;5.6.7</td><td>Compliant</td><td>A modification time is truncated to whole seconds before comparison; previously a file with a fractional mtime never revalidated</td></tr>
+<tr><td>304 for a matching safe request; 412 for a failed one</td><td>RFC 9110 &#167;13.1, &#167;15.4.5</td><td>Compliant</td><td><code>ConditionalServerFactory</code> (on by default in <code>HttpServer</code>) for <code>GET</code>/<code>HEAD</code>; HTTP/3 listeners wrap it explicitly</td></tr>
+<tr><td>304 repeats the fields a 200 would carry</td><td>RFC 9110 &#167;15.4.5</td><td>Compliant</td><td><code>Cache-Control</code>, <code>Content-Location</code>, <code>Date</code>, <code>ETag</code>, <code>Expires</code>, <code>Vary</code> and <code>Last-Modified</code>; layered outside content coding so the <code>Vary</code> and weakened <code>ETag</code> of a compressed 200 are what the 304 shows</td></tr>
+<tr><td>Ignore preconditions unless the response is 2xx or 412</td><td>RFC 9110 &#167;13.2.1</td><td>Compliant</td><td>Only a <code>200</code> is converted; every other status passes through</td></tr>
+<tr><td>Preconditions on state-changing methods</td><td>RFC 9110 &#167;13.1</td><td>Partial</td><td>A decorator cannot stop an action already taken, so handlers call <code>evaluate_preconditions</code> before acting. <code>hopf-webdav</code> does for <code>PUT</code> (before the file is truncated) and <code>DELETE</code>; <code>MKCOL</code>, <code>COPY</code>, <code>MOVE</code>, <code>PROPPATCH</code> and <code>LOCK</code> still rely on the WebDAV <code>If</code> header alone</td></tr>
+<tr><td>WebDAV entity-tags usable with <code>If-Match</code></td><td>RFC 9110 &#167;13.1.1</td><td>Partial</td><td>WebDAV file ETags are weak (a hash of path, size and mtime), and <code>If-Match</code> needs a strong match, so <code>If-Match</code> on a WebDAV resource always fails closed with 412. <code>If-None-Match</code>, <code>If-Unmodified-Since</code> and <code>If-Modified-Since</code> work</td></tr>
+<tr><td><code>Cache-Control</code> generation</td><td>RFC 9111 &#167;5.2.2</td><td>Compliant</td><td><code>CacheControl</code> builder (<code>public</code>, <code>private</code>, <code>no-cache</code>, <code>no-store</code>, <code>no-transform</code>, <code>must-revalidate</code>, <code>max-age</code>, <code>s-maxage</code>, <code>immutable</code>, and more). Handlers opt in; WebDAV takes it from <code>WebDavConfig::cache_control</code> for file <code>GET</code>/<code>HEAD</code>. Nothing is added by default</td></tr>
+<tr><td><code>Expires</code></td><td>RFC 9111 &#167;5.3</td><td>Compliant</td><td>Set by the handler using <code>format_http_date</code>; ignored by caches when <code>max-age</code> is present</td></tr>
+<tr><td><code>If-Range</code> and range requests</td><td>RFC 9110 &#167;13.1.5, &#167;14</td><td>Not implemented</td><td>No <code>Range</code> support anywhere in <code>hopf-http</code>, so there is nothing for <code>If-Range</code> to guard</td></tr>
+<tr><td>Cache storage, freshness, <code>Age</code>, invalidation</td><td>RFC 9111 &#167;3-4</td><td>N/A</td><td>Not a cache. See the scope note above</td></tr>
+</tbody>
+</table>
+
 <h2 id="quic">QUIC Transport — RFC 9000 / RFC 9001 (in-tree, <code>hopf-quic</code>)</h2>
 <p><code>hopf-quic</code> is a full in-tree RFC 9000/9001/9002 implementation — transport state machine, loss recovery, congestion control, and packet protection are all Hopf-owned, with no external QUIC library dependency. Four real gaps are called out below rather than smoothed over: connection migration is wired up but structurally inert (nothing ever updates the address it compares against), <code>NEW_TOKEN</code>-based address validation doesn't exist despite config fields that look like it does, the RFC 9000 §8.1 3× anti-amplification byte cap isn't enforced, and QUIC's TLS configs use classical-only key exchange rather than the hybrid PQC key exchange TCP TLS 1.3 and DTLS 1.3 offer by default.</p>
 <table>

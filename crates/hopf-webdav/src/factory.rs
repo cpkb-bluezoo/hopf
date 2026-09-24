@@ -43,6 +43,12 @@ pub struct WebDavConfig {
     /// (or mTLS) and set this to acknowledge that auth lives outside the
     /// WebDAV crate, or set it for intentional cleartext demos.
     pub allow_unauthenticated_access: bool,
+    /// `Cache-Control` sent on file `GET`/`HEAD` responses (and their `304`s),
+    /// telling caches how long a file stays fresh. `None` (the default) sends
+    /// none, leaving caches to their own heuristics, which work from
+    /// `Last-Modified`; set e.g. `CacheControl::new().no_cache()` to force
+    /// revalidation on every use, or a `max_age` for static assets.
+    pub cache_control: Option<hopf_http::CacheControl>,
 }
 
 impl Default for WebDavConfig {
@@ -57,6 +63,7 @@ impl Default for WebDavConfig {
             max_tree_entries: crate::constants::DEFAULT_MAX_TREE_ENTRIES,
             content_language: None,
             allow_unauthenticated_access: false,
+            cache_control: None,
         }
     }
 }
@@ -65,6 +72,12 @@ impl WebDavConfig {
     /// Enable mutating methods.
     pub fn with_write(mut self, yes: bool) -> Self {
         self.allow_write = yes;
+        self
+    }
+
+    /// Send `policy` as `Cache-Control` on file `GET`/`HEAD` responses.
+    pub fn with_cache_control(mut self, policy: hopf_http::CacheControl) -> Self {
+        self.cache_control = Some(policy);
         self
     }
 

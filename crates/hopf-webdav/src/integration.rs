@@ -2,6 +2,7 @@
 
 //! Runtime TCP smoke tests (enable with `--features integration`).
 
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
@@ -473,5 +474,239 @@ fn lock_unmapped_with_missing_parent_is_409() {
     assert!(lock.contains("409"), "expected 409, got: {lock}");
     assert!(!dir.path().join("missing").exists());
 
+    rt.shutdown();
+}
+
+fn header_value(resp: &str, name: &str) -> Option<String> {
+    resp.lines().find_map(|l| {
+        let (n, v) = l.split_once(':')?;
+        n.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+    })
+}
+
+/// A file's mtime carries sub-second precision but `Last-Modified` is sent
+/// truncated to whole seconds. Echoing that exact value back in
+/// `If-Modified-Since` must therefore mean "not modified" (RFC 9110
+/// §13.1.3), not a full re-send: comparing the untruncated mtime against
+/// the truncated date made every such revalidation miss.
+#[test]
+fn if_modified_since_echoing_last_modified_gets_304_despite_subsecond_mtime() {
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("a.txt");
+    fs::write(&file, b"hello").unwrap();
+    // 2023-11-14T22:13:20.5Z: a half-second past a whole second.
+    let mtime = std::time::UNIX_EPOCH + Duration::from_millis(1_700_000_000_500);
+    fs::OpenOptions::new().write(true).open(&file).unwrap().set_modified(mtime).unwrap();
+
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let first = http_exchange(
+        addr,
+        "GET /a.txt HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+    let lm = header_value(&first, "last-modified").expect("Last-Modified");
+
+    let again = http_exchange(
+        addr,
+        &format!("GET /a.txt HTTP/1.1\r\nHost: localhost\r\nIf-Modified-Since: {lm}\r\nConnection: close\r\n\r\n"),
+    );
+    assert!(again.starts_with("HTTP/1.1 304"), "expected 304 for {lm}, got: {again}");
+    rt.shutdown();
+}
+
+/// One request, read up to the end of its own framing (head plus any
+/// `Content-Length` body) rather than to connection close.
+fn exchange(addr: std::net::SocketAddr, req: &str) -> String {
+    let head_only = req.starts_with("HEAD ");
+    let mut c = TcpStream::connect(addr).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    c.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    loop {
+        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..p + 4]).into_owned();
+            let want = header_value(&head, "content-length")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            if head_only || buf.len() >= p + 4 + want {
+                break;
+            }
+        }
+        let n = c.read(&mut tmp).expect("response timed out");
+        assert!(n > 0, "connection closed early: {:?}", String::from_utf8_lossy(&buf));
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn req(method: &str, path: &str, fields: &[(&str, &str)], body: &str) -> String {
+    let mut r = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n");
+    for (n, v) in fields {
+        r.push_str(&format!("{n}: {v}\r\n"));
+    }
+    if !body.is_empty() || method == "PUT" {
+        r.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    r.push_str("\r\n");
+    r.push_str(body);
+    r
+}
+
+fn status_of(resp: &str) -> u16 {
+    resp.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+/// A file with a fixed mtime (2023-11-14T22:13:20Z) so date conditions are exact.
+fn dated_file(dir: &std::path::Path, name: &str, content: &[u8]) {
+    let f = dir.join(name);
+    fs::write(&f, content).unwrap();
+    let t = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    fs::OpenOptions::new().write(true).open(&f).unwrap().set_modified(t).unwrap();
+}
+
+const AFTER_MTIME: &str = "Tue, 14 Nov 2023 22:13:21 GMT";
+const BEFORE_MTIME: &str = "Tue, 14 Nov 2023 22:13:19 GMT";
+
+#[test]
+fn get_revalidates_with_if_none_match_and_the_304_repeats_the_validators() {
+    let dir = tempdir().unwrap();
+    dated_file(dir.path(), "a.txt", b"hello");
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let first = exchange(addr, &req("GET", "/a.txt", &[], ""));
+    assert_eq!(status_of(&first), 200, "{first}");
+    let etag = header_value(&first, "etag").expect("ETag");
+
+    for method in ["GET", "HEAD"] {
+        let r = exchange(addr, &req(method, "/a.txt", &[("If-None-Match", &etag)], ""));
+        assert_eq!(status_of(&r), 304, "{method}: {r}");
+        assert_eq!(header_value(&r, "etag").as_deref(), Some(etag.as_str()), "{method}: {r}");
+        assert!(header_value(&r, "last-modified").is_some(), "{method}: {r}");
+        assert!(!r.contains("hello"), "{method}: a 304 has no body");
+    }
+    let r = exchange(addr, &req("GET", "/a.txt", &[("If-None-Match", "\"other\"")], ""));
+    assert_eq!(status_of(&r), 200, "{r}");
+    assert!(r.contains("hello"), "{r}");
+    let r = exchange(addr, &req("GET", "/a.txt", &[("If-Modified-Since", BEFORE_MTIME)], ""));
+    assert_eq!(status_of(&r), 200, "{r}");
+    rt.shutdown();
+}
+
+#[test]
+fn get_with_a_failed_if_match_or_if_unmodified_since_is_412() {
+    let dir = tempdir().unwrap();
+    dated_file(dir.path(), "a.txt", b"hello");
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+    let r = exchange(addr, &req("GET", "/a.txt", &[("If-Unmodified-Since", BEFORE_MTIME)], ""));
+    assert_eq!(status_of(&r), 412, "{r}");
+    let r = exchange(addr, &req("GET", "/a.txt", &[("If-Match", "\"other\"")], ""));
+    assert_eq!(status_of(&r), 412, "{r}");
+    rt.shutdown();
+}
+
+/// `If-None-Match: *` makes a PUT create-only: it must fail on an existing
+/// resource *without* having truncated it.
+#[test]
+fn put_if_none_match_star_is_create_only_and_never_clobbers() {
+    let dir = tempdir().unwrap();
+    dated_file(dir.path(), "a.txt", b"original");
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let r = exchange(addr, &req("PUT", "/a.txt", &[("If-None-Match", "*")], "replacement"));
+    assert_eq!(status_of(&r), 412, "{r}");
+    assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"original", "a refused PUT must not truncate");
+
+    let r = exchange(addr, &req("PUT", "/new.txt", &[("If-None-Match", "*")], "fresh"));
+    assert_eq!(status_of(&r), 201, "{r}");
+    assert_eq!(fs::read(dir.path().join("new.txt")).unwrap(), b"fresh");
+    rt.shutdown();
+}
+
+/// A date-based lost-update guard: the client last saw the resource before
+/// somebody else changed it.
+#[test]
+fn put_if_unmodified_since_guards_against_lost_updates() {
+    let dir = tempdir().unwrap();
+    dated_file(dir.path(), "a.txt", b"original");
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let r = exchange(addr, &req("PUT", "/a.txt", &[("If-Unmodified-Since", BEFORE_MTIME)], "stale write"));
+    assert_eq!(status_of(&r), 412, "{r}");
+    assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"original");
+
+    let r = exchange(addr, &req("PUT", "/a.txt", &[("If-Unmodified-Since", AFTER_MTIME)], "current write"));
+    assert!(matches!(status_of(&r), 200 | 201 | 204), "{r}");
+    assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"current write");
+    rt.shutdown();
+}
+
+#[test]
+fn delete_honours_preconditions() {
+    let dir = tempdir().unwrap();
+    dated_file(dir.path(), "a.txt", b"keep me");
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let r = exchange(addr, &req("DELETE", "/a.txt", &[("If-Unmodified-Since", BEFORE_MTIME)], ""));
+    assert_eq!(status_of(&r), 412, "{r}");
+    assert!(dir.path().join("a.txt").exists(), "a refused DELETE must not delete");
+
+    let r = exchange(addr, &req("DELETE", "/a.txt", &[("If-Unmodified-Since", AFTER_MTIME)], ""));
+    assert_eq!(status_of(&r), 204, "{r}");
+    assert!(!dir.path().join("a.txt").exists());
+    rt.shutdown();
+}
+
+/// The ETag is weak, and `If-Match` compares strongly (RFC 9110 §13.1.1), so
+/// it can never match: a conditional write guarded by it fails closed
+/// rather than silently succeeding.
+#[test]
+fn if_match_against_the_weak_etag_fails_closed() {
+    let dir = tempdir().unwrap();
+    dated_file(dir.path(), "a.txt", b"original");
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let etag = header_value(&exchange(addr, &req("GET", "/a.txt", &[], "")), "etag").unwrap();
+    assert!(etag.starts_with("W/"), "{etag}");
+    let r = exchange(addr, &req("PUT", "/a.txt", &[("If-Match", &etag)], "x"));
+    assert_eq!(status_of(&r), 412, "{r}");
+    assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"original");
+    rt.shutdown();
+}
+
+#[test]
+fn cache_control_is_sent_on_file_responses_only_when_configured() {
+    let dir = tempdir().unwrap();
+    dated_file(dir.path(), "a.txt", b"hello");
+
+    let (rt, addr) = listen_webdav(dir.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+    let r = exchange(addr, &req("GET", "/a.txt", &[], ""));
+    assert!(header_value(&r, "cache-control").is_none(), "off by default: {r}");
+    rt.shutdown();
+
+    let (rt, addr) = listen_webdav_cfg(
+        WebDavConfig {
+            root_path: dir.path().to_path_buf(),
+            allow_unauthenticated_access: true,
+            ..Default::default()
+        }
+        .with_cache_control(hopf_http::CacheControl::new().public().max_age(Duration::from_secs(300))),
+    );
+    thread::sleep(Duration::from_millis(50));
+    let ok = exchange(addr, &req("GET", "/a.txt", &[], ""));
+    assert_eq!(header_value(&ok, "cache-control").as_deref(), Some("public, max-age=300"), "{ok}");
+    let etag = header_value(&ok, "etag").unwrap();
+    let nm = exchange(addr, &req("GET", "/a.txt", &[("If-None-Match", &etag)], ""));
+    assert_eq!(status_of(&nm), 304, "{nm}");
+    assert_eq!(header_value(&nm, "cache-control").as_deref(), Some("public, max-age=300"), "the 304 repeats it: {nm}");
     rt.shutdown();
 }

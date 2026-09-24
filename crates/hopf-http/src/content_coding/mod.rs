@@ -577,6 +577,6 @@ pub fn negotiate_accept_encoding(
 }
 
 #[cfg(test)]
-mod e2e_tests;
+pub(crate) mod e2e_tests;
 #[cfg(test)]
 mod tests;

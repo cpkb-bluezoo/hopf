@@ -175,15 +175,15 @@ WebDavFactory → WebDavHandler (ServerHandler)
 </tr>
 <tr>
 <td>GET / HEAD</td>
-<td>Welcome files, <code>If-Modified-Since</code>, ETag / MD5</td>
+<td>Welcome files, weak ETag and <code>Last-Modified</code>, conditional requests (<code>If-None-Match</code>, <code>If-Modified-Since</code>, <code>If-Match</code>, <code>If-Unmodified-Since</code> answered with 304 or 412), optional <code>Cache-Control</code> via <code>WebDavConfig::cache_control</code></td>
 </tr>
 <tr>
 <td>PUT</td>
-<td>Create / overwrite (write)</td>
+<td>Create / overwrite (write); honours <code>If-None-Match: *</code> (create-only) and <code>If-Unmodified-Since</code> before truncating the file. <code>If-Match</code> needs a strong ETag, and file ETags are weak, so it always answers 412</td>
 </tr>
 <tr>
 <td>DELETE</td>
-<td>Remove (write)</td>
+<td>Remove (write); honours <code>If-Unmodified-Since</code> / <code>If-None-Match</code> before deleting</td>
 </tr>
 <tr>
 <td>PROPFIND</td>
