@@ -11,8 +11,7 @@ use hopf_core::{BindingId, ProtocolHandler, Runtime, SharedTlsAcceptor, TcpListe
 
 use crate::{
     AlpnHttpEndpoint, CleartextHttpEndpoint, ConditionalServerFactory, ContentEncodingServerFactory,
-    HttpLimits,
-    ServerContentEncodingPolicy, ServerHandlerFactory,
+    HstsPolicy, HstsServerFactory, HttpLimits, ServerContentEncodingPolicy, ServerHandlerFactory,
 };
 
 /// Async HTTP server: picks the cleartext (h2c prior-knowledge + Upgrade +
@@ -29,6 +28,7 @@ pub struct HttpServer {
     tls_acceptor: Option<SharedTlsAcceptor>,
     content_encoding: ContentEncodingSetting,
     conditional: ConditionalSetting,
+    hsts: Option<HstsPolicy>,
 }
 
 /// Whether [`HttpServer`] answers conditional `GET`/`HEAD` requests itself.
@@ -85,6 +85,28 @@ impl HttpServer {
         self
     }
 
+    /// Send `Strict-Transport-Security` (RFC 6797) on every response served
+    /// over TLS. Off by default: it is a long-lived promise to browsers, so
+    /// it must be a deliberate choice.
+    ///
+    /// The field is **never** sent over a plaintext connection, so this has
+    /// no effect on a listener without [`Self::tls`] (and none behind a
+    /// TLS-terminating proxy, where the connection this server sees is
+    /// plaintext: set the field at the proxy instead). A handler that sets
+    /// the field itself keeps its own value. [`Self::bind`] fails with
+    /// `InvalidInput` for a policy that asks for `preload` without a
+    /// one-year `max-age` and `includeSubDomains`.
+    ///
+    /// HSTS only takes effect once a browser has reached the site over
+    /// HTTPS, so it does not replace an HTTP-to-HTTPS redirect: hopf-http
+    /// does not redirect for you, so send users to `https://` from your
+    /// plaintext listener's handler, and let HSTS stop them coming back
+    /// over HTTP afterwards.
+    pub fn hsts(mut self, policy: HstsPolicy) -> Self {
+        self.hsts = Some(policy);
+        self
+    }
+
     /// Stop [`HttpServer`] answering conditional requests itself.
     ///
     /// By default every handler is wrapped in a [`ConditionalServerFactory`]:
@@ -134,6 +156,12 @@ impl HttpServer {
             // sees the final headers.
             ConditionalSetting::On => Arc::new(ConditionalServerFactory::new(factory)),
             ConditionalSetting::Off => factory,
+        };
+        let factory: Arc<dyn ServerHandlerFactory> = match &self.hsts {
+            // Outermost, so every response is covered, including the 304/412
+            // and error responses other layers generate.
+            Some(policy) => Arc::new(HstsServerFactory::new(factory, policy)?),
+            None => factory,
         };
         let config = if let Some(acceptor) = &self.tls_acceptor {
             let acceptor = Arc::clone(acceptor);

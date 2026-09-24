@@ -55,7 +55,8 @@ pub use caching::{
     Precondition, Validators,
 };
 pub use server::{
-    CompressibleFn, ConditionalServerFactory, ContentEncodingServerFactory, HttpServer, ServerContentEncodingPolicy,
+    CompressibleFn, ConditionalServerFactory, ContentEncodingServerFactory, HstsPolicy,
+    HstsServerFactory, HttpServer, ServerContentEncodingPolicy,
 };
 pub use dispatch::AlpnHttpEndpoint;
 pub use error::{HttpError, HttpResult};

@@ -469,11 +469,13 @@ fn deferred_response_writes_go_through_the_encoder() {
     let coded = dechunk(&body);
     assert!(coded.len() * 10 < want.len(), "deferred body was not compressed");
     assert!(decode(ContentCoding::Gzip, &coded, 4096, 1 << 30).unwrap() == want);
-    // Through the decoding client, streamed across several handle calls (H1)
-    // and produced in one handle call (H1 and H2).
-    let o = run(&rt, addr, Proto::H1, Some(client_policy(&CODED)), Job::Get("/deferred"));
-    assert!(o.failed.is_none(), "{:?}", o.failed);
-    assert!(o.body == want);
+    // Through the decoding client, streamed across several handle calls and
+    // produced in one handle call, on both protocols.
+    for proto in [Proto::H1, Proto::H2] {
+        let o = run(&rt, addr, proto, Some(client_policy(&CODED)), Job::Get("/deferred"));
+        assert!(o.failed.is_none(), "{proto:?}: {:?}", o.failed);
+        assert!(o.body == want, "{proto:?}: multi-call deferred body");
+    }
     for proto in [Proto::H1, Proto::H2] {
         let o = run(&rt, addr, proto, Some(client_policy(&CODED)), Job::Get("/deferred-one"));
         assert!(o.failed.is_none(), "{proto:?}: {:?}", o.failed);
