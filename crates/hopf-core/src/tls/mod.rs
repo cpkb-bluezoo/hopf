@@ -35,13 +35,14 @@ pub use pem::{
     acceptor_from_pem, acceptor_from_pem_tls12, acceptor_from_pem_tls12_with_client_auth,
     acceptor_from_pem_with_client_auth, acceptor_from_pem_with_sni, connector_from_pem,
     connector_from_pem_tls12, connector_from_pem_tls12_with_client_cert,
-    connector_from_pem_with_client_cert, connector_with_verify_override, insecure_connector,
+    connector_from_pem_with_client_cert, connector_with_record_size_limit, connector_with_verify_override,
+    acceptor_with_record_size_limit, insecure_connector,
     insecure_connector_tls12, public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor,
     SharedTlsConnector, TlsAcceptor, TlsConnector,
 };
 pub use record::{NopTlsRecordSink, TlsRecordEngine, TlsRecordSink};
 pub use sink::{
-    AlertDescription, NopTlsEventSink, QuicSecrets, TlsEventSink, TlsProtocolError, TlsTimerKind,
+    AlertDescription, NopTlsEventSink, QuicSecrets, RecordSizeLimits, TlsEventSink, TlsProtocolError, TlsTimerKind,
     VerifyRequest, VerifyResult,
 };
 pub use ticket_keys::TicketKeys;
@@ -74,6 +75,17 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.is_complete(),
             TlsVariant::V12(e) => e.is_complete(),
+        }
+    }
+
+    /// Advertise a `record_size_limit` (RFC 8449) on this connection; see
+    /// [`TlsRecordEngine::set_record_size_limit`]. Only TLS 1.3 supports the
+    /// extension: for a TLS 1.2 engine this does nothing and returns `false`.
+    /// Must be called before [`Self::start`].
+    pub fn set_record_size_limit(&mut self, limit: Option<u16>) -> bool {
+        match self {
+            TlsVariant::V13(e) => e.set_record_size_limit(limit),
+            TlsVariant::V12(_) => false,
         }
     }
 

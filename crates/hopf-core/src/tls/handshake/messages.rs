@@ -90,6 +90,25 @@ pub mod ext {
     /// Cookie (RFC 8446 §4.2.2) — carried in `HelloRetryRequest`, echoed
     /// verbatim by the client in its followup ClientHello.
     pub const COOKIE: u16 = 44;
+    /// Record Size Limit (RFC 8449): the largest protected-record plaintext
+    /// this endpoint is willing to receive.
+    pub const RECORD_SIZE_LIMIT: u16 = 0x001c;
+}
+
+/// Smallest `record_size_limit` value an endpoint may send (RFC 8449 §4).
+pub const MIN_RECORD_SIZE_LIMIT: u16 = 64;
+/// Largest TLS 1.3 `TLSInnerPlaintext`: 2^14 content octets plus the one
+/// content-type octet (RFC 8446 §5.4), and so the largest meaningful
+/// `record_size_limit` for TLS 1.3 / DTLS 1.3 (RFC 8449 §4).
+pub const MAX_RECORD_SIZE_LIMIT_13: u16 = 16385;
+
+/// Decode a `record_size_limit` extension body (RFC 8449 §4): exactly one
+/// `uint16`. `None` if the length is wrong.
+pub fn decode_record_size_limit(data: &[u8]) -> Option<u16> {
+    match data {
+        [a, b] => Some(u16::from_be_bytes([*a, *b])),
+        _ => None,
+    }
 }
 
 /// `psk_dhe_ke` (RFC 8446 §4.2.9).
@@ -140,6 +159,10 @@ pub struct ClientHelloParams {
     /// Cookie echoed back verbatim after a `HelloRetryRequest` carried one
     /// (RFC 8446 §4.2.2) — `None` on an initial ClientHello.
     pub cookie: Option<Bytes>,
+    /// `record_size_limit` (RFC 8449) to advertise: the largest protected
+    /// record plaintext this endpoint will receive. `None` omits the
+    /// extension.
+    pub record_size_limit: Option<u16>,
     /// `legacy_version` wire field — `0x0303` for TLS (RFC 8446 §4.1.2),
     /// `0xfefd` for DTLS 1.3 (RFC 9147 §5.3, reusing DTLS 1.2's wire value
     /// for backward-compat framing). The real version is always negotiated
@@ -273,6 +296,9 @@ fn build_client_hello_inner(
     }
     if params.early_data {
         push_extension(&mut extensions, ext::EARLY_DATA, &[]);
+    }
+    if let Some(limit) = params.record_size_limit {
+        push_extension(&mut extensions, ext::RECORD_SIZE_LIMIT, &limit.to_be_bytes());
     }
     if params.psk.is_some() {
         push_extension(&mut extensions, ext::PSK_KEY_EXCHANGE_MODES, &[1, PSK_DHE_KE]);
@@ -435,6 +461,7 @@ pub fn build_encrypted_extensions_ext(
     alpn: Option<&[u8]>,
     transport_parameters: Option<&[u8]>,
     early_data_accepted: bool,
+    record_size_limit: Option<u16>,
 ) -> HandshakeMessage {
     let mut extensions = BytesMut::new();
     if let Some(alpn) = alpn {
@@ -445,6 +472,11 @@ pub fn build_encrypted_extensions_ext(
     }
     if early_data_accepted {
         push_extension(&mut extensions, ext::EARLY_DATA, &[]);
+    }
+    // RFC 8449 §4: in TLS 1.3 the server answers in EncryptedExtensions, and
+    // only when the client sent the extension.
+    if let Some(limit) = record_size_limit {
+        push_extension(&mut extensions, ext::RECORD_SIZE_LIMIT, &limit.to_be_bytes());
     }
     let mut body = BytesMut::new();
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
@@ -634,6 +666,7 @@ mod tests {
             early_data: false,
             psk: None,
             cookie: None,
+            record_size_limit: None,
             legacy_version: 0x0303,
         });
         let parsed = parse_client_hello(&hello.body).expect("parse client hello");
@@ -666,6 +699,7 @@ mod tests {
             early_data: false,
             psk: None,
             cookie: None,
+            record_size_limit: None,
             legacy_version: 0xfefd,
         });
         // legacy_version(2) + random(32) + session_id_len(1)=0 +
@@ -696,6 +730,7 @@ mod tests {
             early_data: false,
             psk: None,
             cookie: None,
+            record_size_limit: None,
             legacy_version: 0x0303,
         });
         // legacy_version(2) + random(32) + session_id_len(1) + cipher_suites_len(2)

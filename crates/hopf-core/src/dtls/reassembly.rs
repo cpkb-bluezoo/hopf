@@ -24,6 +24,10 @@ use std::collections::BTreeMap;
 /// to any PMTU discovery (none implemented).
 pub const MAX_FRAGMENT: usize = 1024;
 
+/// Octets of DTLS handshake header (RFC 9147 §5.2) carried in every
+/// fragment on top of its body bytes.
+pub const HANDSHAKE_HEADER_LEN: usize = 12;
+
 struct PartialMessage {
     msg_type: u8,
     body: Vec<u8>,
@@ -81,6 +85,15 @@ impl Reassembler {
     /// `DTLSCiphertext` record — this function only produces fragment
     /// bytes, it doesn't touch the record layer.
     pub fn fragment(&mut self, tls_message: &[u8], out: &mut Vec<Vec<u8>>) {
+        self.fragment_with_max(tls_message, out, MAX_FRAGMENT);
+    }
+
+    /// Like [`Self::fragment`], with at most `max_body` message-body octets in
+    /// each fragment (`fragment` uses [`MAX_FRAGMENT`]). A smaller size is what
+    /// a negotiated `record_size_limit` (RFC 8449) needs: each fragment travels
+    /// in one protected record, and the whole record plaintext counts.
+    pub fn fragment_with_max(&mut self, tls_message: &[u8], out: &mut Vec<Vec<u8>>, max_body: usize) {
+        let max_body = max_body.clamp(1, MAX_FRAGMENT);
         if tls_message.len() < 4 {
             return;
         }
@@ -97,7 +110,7 @@ impl Reassembler {
         }
         let mut offset = 0;
         while offset < body.len() {
-            let chunk_len = (body.len() - offset).min(MAX_FRAGMENT);
+            let chunk_len = (body.len() - offset).min(max_body);
             let mut frag = dtls_fragment_header(msg_type, total_len, message_seq, offset, chunk_len);
             frag.extend_from_slice(&body[offset..offset + chunk_len]);
             out.push(frag);

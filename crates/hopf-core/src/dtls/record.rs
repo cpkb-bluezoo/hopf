@@ -332,6 +332,10 @@ pub enum ReadOutcome {
         /// This record's own (epoch, full 64-bit sequence number) — RFC
         /// 9147 §7's `RecordNumber`, needed by the caller to ACK it.
         record_number: (u64, u64),
+        /// Length of the whole decrypted `TLSInnerPlaintext` (content, the
+        /// content-type octet and any padding) — what RFC 8449's
+        /// `record_size_limit` counts.
+        inner_len: usize,
     },
     /// Same sequence number already processed this epoch — drop silently
     /// (RFC 9147 §4.5.1), not a protocol error.
@@ -394,6 +398,7 @@ pub fn read_record(read: &mut ReadKeys, input: &[u8]) -> ReadOutcome {
         return ReadOutcome::Invalid;
     };
     buf.truncate(n);
+    let inner_len = n;
     // RFC 9147 §4.2.1 incorporates RFC 8446 §5.4's TLSInnerPlaintext
     // structure unchanged: `content || type || zeros` — a peer may pad
     // with trailing zero bytes before the real (non-zero) content type,
@@ -411,6 +416,7 @@ pub fn read_record(read: &mut ReadKeys, input: &[u8]) -> ReadOutcome {
         plaintext: buf,
         consumed,
         record_number: (read.epoch, seq),
+        inner_len,
     }
 }
 

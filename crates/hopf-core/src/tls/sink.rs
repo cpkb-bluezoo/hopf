@@ -235,6 +235,20 @@ pub struct QuicSecrets {
     pub client_early_traffic_secret: Option<[u8; 32]>,
 }
 
+/// The record size limits in force once `record_size_limit` (RFC 8449) has
+/// been negotiated. Both are counted the way the extension counts them: for
+/// TLS 1.3 and DTLS 1.3, the whole `TLSInnerPlaintext`, so the content-type
+/// octet (and any padding) is included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordSizeLimits {
+    /// What the peer will accept: the cap on each protected record *this*
+    /// endpoint sends. Already clamped to the protocol maximum (16385).
+    pub send: u16,
+    /// What this endpoint advertised: the cap on each protected record it
+    /// accepts. Anything larger is a `record_overflow`.
+    pub receive: u16,
+}
+
 /// Events emitted by [`super::HandshakeEngine`] — consumed by the QUIC driver or TCP pump.
 pub trait TlsEventSink {
     /// Handshake transcript bytes to send (QUIC CRYPTO stream or TCP TLS records in Phase 4).
@@ -280,6 +294,13 @@ pub trait TlsEventSink {
     /// Whether the server accepted early data (client only; after EncryptedExtensions).
     fn early_data_accepted(&mut self, _accepted: bool) {}
 
+    /// `record_size_limit` (RFC 8449) was negotiated: both endpoints sent it.
+    /// Called once, before the first protected record the limits apply to is
+    /// written (server: before `EncryptedExtensions`; client: on receiving
+    /// it), so a record layer can apply them from then on. Never called when
+    /// either side omitted the extension, or on QUIC.
+    fn record_size_limit_negotiated(&mut self, _limits: RecordSizeLimits) {}
+
     /// Client-only: peer limits to apply for 0-RTT before EncryptedExtensions (RFC 9000 §7.4.1).
     fn quic_0rtt_peer_limits(&mut self, _limits: super::handshake::RememberedTransportLimits) {}
 
@@ -308,6 +329,7 @@ impl TlsEventSink for NopTlsEventSink {
     fn application_traffic_key_updated(&mut self, _aead: Tls13Aead, _direction: KeyUpdateDirection, _secret: [u8; 32]) {}
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
     fn early_data_accepted(&mut self, _accepted: bool) {}
+    fn record_size_limit_negotiated(&mut self, _limits: RecordSizeLimits) {}
     fn quic_0rtt_peer_limits(&mut self, _limits: super::handshake::RememberedTransportLimits) {}
     fn protocol_error(&mut self, _err: TlsProtocolError) {}
     fn timeout(&mut self, _kind: TlsTimerKind) {}

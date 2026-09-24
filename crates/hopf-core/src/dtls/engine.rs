@@ -16,11 +16,11 @@ use std::time::Duration;
 
 use crate::security::SecurityInfo;
 use crate::tls::{
-    AlertDescription, HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, QuicSecrets, Tls13Aead,
-    TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyRequest, VerifyResult,
+    AlertDescription, HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, QuicSecrets,
+    RecordSizeLimits, Tls13Aead, TlsEventSink, TlsProtocolError, TlsTimerKind, VerifyRequest, VerifyResult,
 };
 
-use super::reassembly::Reassembler;
+use super::reassembly::{Reassembler, HANDSHAKE_HEADER_LEN, MAX_FRAGMENT};
 use super::record::{self, PlaintextReadOutcome, ReadKeys, ReadOutcome, WriteKeys};
 use super::retransmit::{RetransmitOutcome, RetransmitState};
 
@@ -28,6 +28,10 @@ const CONTENT_CHANGE_CIPHER_SPEC: u8 = 20;
 const CONTENT_ALERT: u8 = 21;
 const CONTENT_HANDSHAKE: u8 = 22;
 const CONTENT_APPLICATION_DATA: u8 = 23;
+
+/// Most content octets a protected record carries when no `record_size_limit`
+/// (RFC 8449) applies: 2^14 (RFC 8446 §5.1).
+const MAX_PROTECTED_CONTENT: usize = 16384;
 /// RFC 9147 §7 — DTLS 1.3's own content type, not part of the shared TLS
 /// registry the other constants above come from.
 const CONTENT_ACK: u8 = 26;
@@ -114,6 +118,12 @@ struct RecordState {
     /// same purpose: at most one fatal alert per connection, none sent in
     /// reply to a peer's own alert.
     alert_sent: bool,
+    /// The peer's `record_size_limit` (RFC 8449), once negotiated: the most
+    /// `TLSInnerPlaintext` octets one protected record we send may carry.
+    send_limit: Option<usize>,
+    /// Our own advertised `record_size_limit`, enforced on every protected
+    /// record we receive once negotiated.
+    recv_limit: Option<usize>,
 }
 
 impl RecordState {
@@ -127,6 +137,31 @@ impl RecordState {
             next_write: None,
             next_read: None,
             alert_sent: false,
+            send_limit: None,
+            recv_limit: None,
+        }
+    }
+
+    /// Most content octets one protected record may carry: the peer's limit
+    /// less the inner content-type octet (no padding is ever added), or the
+    /// protocol maximum when nothing was negotiated.
+    fn max_protected_content(&self) -> usize {
+        match self.send_limit {
+            Some(limit) => limit.saturating_sub(1).clamp(1, MAX_PROTECTED_CONTENT),
+            None => MAX_PROTECTED_CONTENT,
+        }
+    }
+
+    /// Most handshake-message body octets one fragment may carry, given
+    /// that its record also holds the 12-octet DTLS handshake header.
+    /// Records sent in the clear are not subject to the limit.
+    fn max_fragment_body(&self) -> usize {
+        match self.epoch {
+            Epoch::Plaintext => MAX_FRAGMENT,
+            Epoch::Handshake | Epoch::Application => self
+                .max_protected_content()
+                .saturating_sub(HANDSHAKE_HEADER_LEN)
+                .clamp(1, MAX_FRAGMENT),
         }
     }
 
@@ -226,7 +261,7 @@ struct EngineEvents {
 impl TlsEventSink for InnerSink<'_> {
     fn handshake_data_ready(&mut self, data: &[u8]) {
         let mut frags = Vec::new();
-        self.reassembler.fragment(data, &mut frags);
+        self.reassembler.fragment_with_max(data, &mut frags, self.state.max_fragment_body());
         write_records(self.state, CONTENT_HANDSHAKE, &frags, self.flight);
     }
 
@@ -245,6 +280,11 @@ impl TlsEventSink for InnerSink<'_> {
 
     fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
         self.state.stage_application_keys(aead, client, server);
+    }
+
+    fn record_size_limit_negotiated(&mut self, limits: RecordSizeLimits) {
+        self.state.send_limit = Some(limits.send as usize);
+        self.state.recv_limit = Some(limits.receive as usize);
     }
 
     fn protocol_error(&mut self, err: TlsProtocolError) {
@@ -305,6 +345,20 @@ impl DtlsRecordEngine {
         self.engine.is_complete()
     }
 
+    /// The `record_size_limit` (RFC 8449) limits in force, once both sides
+    /// have sent the extension; `None` before that or if either omitted it.
+    pub fn record_size_limits(&self) -> Option<RecordSizeLimits> {
+        self.engine.record_size_limits()
+    }
+
+    /// The most application-data octets one [`Self::send_application_data`]
+    /// call may carry: the peer's `record_size_limit` less the content-type
+    /// octet when negotiated, otherwise the protocol maximum (16384). Larger
+    /// datagrams are refused, not split.
+    pub fn max_application_data(&self) -> usize {
+        self.state.max_protected_content()
+    }
+
     /// Consume one received UDP datagram — any number of coalesced records.
     pub fn feed_datagram<S: DtlsRecordSink + ?Sized>(&mut self, input: &[u8], sink: &mut S) {
         if self.failed {
@@ -361,8 +415,17 @@ impl DtlsRecordEngine {
                         plaintext,
                         consumed,
                         record_number,
+                        inner_len,
                     } => {
                         pos += consumed;
+                        // RFC 8449 §4: a record over our advertised limit is a
+                        // fatal record_overflow. (DTLS may alternatively drop
+                        // it, but this one authenticated, so the peer is at
+                        // fault rather than the network.)
+                        if self.state.recv_limit.is_some_and(|limit| inner_len > limit) {
+                            self.fail(sink, AlertDescription::RecordOverflow, "record exceeds the advertised record_size_limit");
+                            return;
+                        }
                         // RFC 8446 §5.5 / RFC 9325 §4.4: same reasoning as
                         // the write side in `send_application_data` — no
                         // DTLS 1.3 rekey to fall back to, so close rather
@@ -425,6 +488,16 @@ impl DtlsRecordEngine {
             sink.protocol_error(TlsProtocolError::new(
                 AlertDescription::InternalError,
                 "application data sent before handshake completed",
+            ));
+            return;
+        }
+        // One call is one datagram, and its record must respect the peer's
+        // `record_size_limit` (RFC 8449). Splitting it would silently break
+        // the datagram boundary the caller relies on, so it is refused instead.
+        if plaintext.len() > self.state.max_protected_content() {
+            sink.protocol_error(TlsProtocolError::new(
+                AlertDescription::InternalError,
+                "application datagram exceeds the peer's record_size_limit",
             ));
             return;
         }
@@ -605,12 +678,15 @@ mod tests {
         app_data: Vec<Vec<u8>>,
         info: Option<SecurityInfo>,
         armed_timeout: Option<Duration>,
+        /// Every datagram ever written, kept after `relay` drains `outbound`.
+        all_written: Vec<Vec<u8>>,
     }
 
     impl DtlsRecordSink for RecordingSink {
         fn datagram_ready(&mut self, data: &[u8]) {
             self.events.push(format!("datagram {} bytes", data.len()));
             self.outbound.push(data.to_vec());
+            self.all_written.push(data.to_vec());
         }
         fn application_data(&mut self, plaintext: &[u8]) {
             self.events.push(format!("application_data {} bytes", plaintext.len()));
@@ -695,6 +771,161 @@ mod tests {
         assert!(client.is_complete(), "client: {:?}", sink_c.events);
         assert!(server.is_complete(), "server: {:?}", sink_s.events);
         (sink_c, sink_s, client, server)
+    }
+
+    // ---- record_size_limit (RFC 8449) ----
+
+    /// Ciphertext body length of every *protected* (unified-header) record
+    /// in `datagrams`. A body is inner plaintext plus the 16-octet AEAD tag.
+    fn protected_lengths(datagrams: &[Vec<u8>]) -> Vec<usize> {
+        let mut out = Vec::new();
+        for d in datagrams {
+            let mut i = 0;
+            while i < d.len() {
+                if d[i] & 0b1110_0000 == 0b0010_0000 {
+                    let len = u16::from_be_bytes([d[i + 3], d[i + 4]]) as usize;
+                    out.push(len);
+                    i += 5 + len;
+                } else {
+                    // Epoch-0 DTLSPlaintext: 13-octet header, length at 11..13.
+                    let len = u16::from_be_bytes([d[i + 11], d[i + 12]]) as usize;
+                    i += 13 + len;
+                }
+            }
+            assert_eq!(i, d.len(), "datagram must be a whole number of records");
+        }
+        out
+    }
+
+    const TAG: usize = 16;
+
+    fn dtls_with_limits(client: Option<u16>, server: Option<u16>) -> (RecordingSink, RecordingSink, DtlsRecordEngine, DtlsRecordEngine) {
+        let (mut client_cfg, mut server_cfg) = configs();
+        client_cfg.record_size_limit = client;
+        server_cfg.record_size_limit = server;
+        let mut client = DtlsRecordEngine::new(client_cfg);
+        let mut server = DtlsRecordEngine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+        (sink_c, sink_s, client, server)
+    }
+
+    /// DTLS 1.3 shares the engine's negotiation; this proves the record
+    /// layer half over real handshakes: a Certificate that needs many
+    /// fragments under a small limit still completes, and no protected
+    /// record either side writes exceeds what the peer will accept.
+    #[test]
+    fn negotiated_limits_cap_every_protected_record_including_handshake_fragments() {
+        let (client_limit, server_limit) = (100u16, 130u16);
+        let (sink_c, sink_s, client, server) = dtls_with_limits(Some(client_limit), Some(server_limit));
+
+        let server_records = protected_lengths(&sink_s.all_written);
+        assert!(server_records.len() > 4, "handshake must have been fragmented: {server_records:?}");
+        for len in &server_records {
+            assert!(*len <= client_limit as usize + TAG, "server record {len} exceeds the client's {client_limit}");
+        }
+        for len in protected_lengths(&sink_c.all_written) {
+            assert!(len <= server_limit as usize + TAG, "client record {len} exceeds the server's {server_limit}");
+        }
+        assert_eq!(
+            client.record_size_limits(),
+            Some(RecordSizeLimits { send: server_limit, receive: client_limit })
+        );
+        assert_eq!(server.record_size_limits().unwrap().send, client_limit);
+    }
+
+    #[test]
+    fn application_datagrams_are_capped_and_an_oversize_one_is_refused_not_split() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = dtls_with_limits(Some(100), Some(130));
+        // The server's limit is 130: 129 content octets + the type octet fit.
+        assert_eq!(client.max_application_data(), 129);
+        assert_eq!(server.max_application_data(), 99);
+
+        client.send_application_data(&vec![5u8; 129], &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert_eq!(sink_s.app_data.last().map(Vec::len), Some(129), "{:?}", sink_s.events);
+
+        // One over: refused as a whole, never split (the boundary matters to
+        // a datagram protocol), and not fatal - the connection carries on.
+        let written_before = sink_c.all_written.len();
+        client.send_application_data(&vec![5u8; 130], &mut sink_c);
+        assert_eq!(sink_c.all_written.len(), written_before, "nothing may be sent");
+        assert!(
+            sink_c.events.iter().any(|e| e.starts_with("protocol_error") && e.contains("record_size_limit")),
+            "{:?}",
+            sink_c.events
+        );
+        client.send_application_data(&vec![6u8; 10], &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert_eq!(sink_s.app_data.last().map(Vec::len), Some(10), "still usable afterwards");
+    }
+
+    #[test]
+    fn without_the_extension_nothing_changes() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = dtls_with_limits(None, None);
+        assert_eq!(client.record_size_limits(), None);
+        assert_eq!(client.max_application_data(), 16384);
+        client.send_application_data(&vec![1u8; 3000], &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert_eq!(sink_s.app_data.last().map(Vec::len), Some(3000));
+    }
+
+    #[test]
+    fn a_server_limit_alone_changes_nothing_without_the_client_asking() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = dtls_with_limits(None, Some(100));
+        assert_eq!(client.record_size_limits(), None);
+        client.send_application_data(&vec![1u8; 2000], &mut sink_c);
+        server.send_application_data(&vec![2u8; 2000], &mut sink_s);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        assert_eq!(sink_s.app_data.last().map(Vec::len), Some(2000), "{:?}", sink_s.events);
+        assert_eq!(sink_c.app_data.last().map(Vec::len), Some(2000), "{:?}", sink_c.events);
+    }
+
+    /// A server nobody configured still honours a client that asks, and
+    /// answers with the protocol maximum so the client stays unrestricted.
+    #[test]
+    fn a_server_with_no_limit_configured_still_honours_the_clients() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = dtls_with_limits(Some(100), None);
+        assert_eq!(server.record_size_limits(), Some(RecordSizeLimits { send: 100, receive: 16385 }));
+        assert_eq!(server.max_application_data(), 99);
+        assert_eq!(client.max_application_data(), 16384);
+        for len in protected_lengths(&sink_s.all_written) {
+            assert!(len <= 100 + TAG, "server record {len} exceeds the client's 100");
+        }
+        client.send_application_data(&vec![1u8; 2000], &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert_eq!(sink_s.app_data.last().map(Vec::len), Some(2000), "{:?}", sink_s.events);
+    }
+
+    /// RFC 8449 §4: a DTLS endpoint receiving a record over its advertised
+    /// limit may alert or discard; this one authenticated, so it alerts.
+    #[test]
+    fn a_record_over_the_advertised_limit_is_a_fatal_record_overflow() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = dtls_with_limits(Some(200), Some(200));
+        // Make the server misbehave: forget the client's limit.
+        server.state.send_limit = None;
+        server.send_application_data(&vec![9u8; 1000], &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        assert!(
+            sink_c.events.iter().any(|e| e.starts_with("protocol_error") && e.contains("record_size_limit")),
+            "{:?}",
+            sink_c.events
+        );
+        assert!(sink_c.app_data.is_empty(), "the oversize record must not be delivered");
+        // The client told the server why: a real, decodable record_overflow (22).
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert!(
+            sink_s.events.iter().any(|e| e.starts_with("protocol_error") && e.contains("alert 22")),
+            "{:?}",
+            sink_s.events
+        );
     }
 
     #[test]

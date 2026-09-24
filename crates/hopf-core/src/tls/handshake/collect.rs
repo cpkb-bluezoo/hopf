@@ -50,6 +50,10 @@ pub struct ParsedClientHello {
     /// Cookie extension (RFC 8446 §4.2.2), echoed back after a
     /// `HelloRetryRequest` that carried one.
     pub cookie: Option<Bytes>,
+    /// Raw body of a `record_size_limit` extension (RFC 8449), if the
+    /// client sent one. Decoded by the engine so a malformed length is a
+    /// `decode_error` rather than silently ignored.
+    pub record_size_limit: Option<Bytes>,
 }
 
 /// Parsed `ServerHello` fields needed for key schedule (Phase 2 subset).
@@ -84,6 +88,8 @@ pub struct ParsedEncryptedExtensions {
     pub transport_parameters: Option<Bytes>,
     /// Server accepted early data.
     pub early_data: bool,
+    /// Raw body of a `record_size_limit` extension (RFC 8449), if present.
+    pub record_size_limit: Option<Bytes>,
 }
 
 /// Parsed NewSessionTicket (post-handshake).
@@ -153,6 +159,12 @@ impl HandshakeEvents for ClientHelloCollector {
 
     fn early_data(&mut self) {
         self.out.early_data = true;
+    }
+
+    fn extension(&mut self, ext_type: u16, data: &[u8]) {
+        if ext_type == super::messages::ext::RECORD_SIZE_LIMIT {
+            self.out.record_size_limit = Some(Bytes::copy_from_slice(data));
+        }
     }
 
     fn psk_identity(&mut self, identity: &[u8], obfuscated_ticket_age: u32) {
@@ -252,6 +264,12 @@ impl HandshakeEvents for EncryptedExtensionsCollector {
 
     fn early_data(&mut self) {
         self.out.early_data = true;
+    }
+
+    fn extension(&mut self, ext_type: u16, data: &[u8]) {
+        if ext_type == super::messages::ext::RECORD_SIZE_LIMIT {
+            self.out.record_size_limit = Some(Bytes::copy_from_slice(data));
+        }
     }
 
     fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
@@ -738,7 +756,13 @@ impl HandshakeEvents for MessageCollector {
         }
     }
 
-    fn extension(&mut self, _ext_type: u16, _data: &[u8]) {}
+    fn extension(&mut self, ext_type: u16, data: &[u8]) {
+        match self {
+            Self::ClientHello(c) => c.extension(ext_type, data),
+            Self::EncryptedExtensions(c) => c.extension(ext_type, data),
+            _ => {}
+        }
+    }
 
     fn certificate_request_context(&mut self, ctx: &[u8]) {
         match self {
