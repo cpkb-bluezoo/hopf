@@ -129,6 +129,10 @@ impl ServerResponseHandle {
         Self { conn, control }
     }
 
+    pub(crate) fn control(&self) -> &Arc<dyn ResponseControl> {
+        &self.control
+    }
+
     /// Connection handle for [`hopf_core::StorageExecutor`] / reactor hops.
     pub fn conn_handle(&self) -> &ConnHandle {
         &self.conn

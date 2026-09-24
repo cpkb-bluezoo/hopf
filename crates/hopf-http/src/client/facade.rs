@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use hopf_core::{ProtocolHandler, Runtime, SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig};
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
+use crate::content_coding::ContentEncodingPolicy;
 use crate::headers::Headers;
 use crate::HttpLimits;
 
@@ -42,6 +43,8 @@ pub struct HttpClient {
     /// See [`Self::follow_redirects`]. `None` (the default): [`Self::fetch`]
     /// delivers a 3xx response unchanged, following nothing.
     redirect_policy: Option<RedirectPolicy>,
+    /// See [`Self::content_encoding`].
+    content_encoding: Option<ContentEncodingPolicy>,
     #[cfg(feature = "h3")]
     quic_client_config: Option<Arc<hopf_quic::QuicClientConfig>>,
     #[cfg(feature = "h3")]
@@ -68,6 +71,7 @@ impl HttpClient {
             tls_server_name: None,
             resolver: None,
             redirect_policy: None,
+            content_encoding: None,
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -94,6 +98,7 @@ impl HttpClient {
             tls_server_name: None,
             resolver: None,
             redirect_policy: None,
+            content_encoding: None,
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -123,6 +128,7 @@ impl HttpClient {
             tls_server_name: None,
             resolver: None,
             redirect_policy: None,
+            content_encoding: None,
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -313,6 +319,13 @@ impl HttpClient {
         rt: &Arc<Runtime>,
         handler: Box<dyn HttpConnectionHandler>,
     ) -> io::Result<()> {
+        let handler: Box<dyn HttpConnectionHandler> = match self.content_encoding.clone() {
+            Some(policy) => Box::new(ContentEncodingConnectionHandler {
+                inner: handler,
+                policy,
+            }),
+            None => handler,
+        };
         if let Some(path) = self.unix_path.clone() {
             let (cfg, config) = self.connector_for_unix_path(path, handler);
             return rt.connect_unix(cfg).inspect_err(|e| {
@@ -623,6 +636,7 @@ impl HttpClient {
             tls_server_name: self.tls_server_name.clone(),
             resolver: self.resolver.clone(),
             redirect_policy: self.redirect_policy.clone(),
+            content_encoding: self.content_encoding.clone(),
             #[cfg(feature = "h3")]
             quic_client_config: self.quic_client_config.clone(),
             #[cfg(feature = "h3")]
@@ -632,6 +646,19 @@ impl HttpClient {
             #[cfg(feature = "h3")]
             alt_svc_cache: Arc::clone(&self.alt_svc_cache),
         }
+    }
+
+    /// Decode content-coded (`br`, `gzip`, `deflate`) responses on every
+    /// request made through this client - [`Self::connect`] sessions and
+    /// [`Self::fetch`] alike, on HTTP/1.1, HTTP/2 and HTTP/3. Each request
+    /// advertises `Accept-Encoding` and its handler receives decoded bytes;
+    /// see [`crate::HttpRequest::content_encoding`] and
+    /// [`crate::client::DecodingResponseHandler`] for the header and
+    /// failure rules. Off by default: without it handlers see the body
+    /// exactly as it came off the wire.
+    pub fn content_encoding(mut self, policy: ContentEncodingPolicy) -> Self {
+        self.content_encoding = Some(policy);
+        self
     }
 
     /// Follow redirects (301/302/303/307/308) up to `policy`'s hop cap when
@@ -739,6 +766,7 @@ impl HttpClient {
             tls_server_name: target.secure.then(|| target.host.clone()),
             resolver: self.resolver.clone(),
             redirect_policy: None,
+            content_encoding: self.content_encoding.clone(),
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -756,4 +784,30 @@ fn resolve_literal(host: &str, port: u16) -> Option<SocketAddr> {
         return Some(addr);
     }
     parse_literal_ip(host).map(|ip| SocketAddr::new(ip, port))
+}
+
+/// Applies the client's [`ContentEncodingPolicy`] to the session handed to
+/// the application's handler, so every request it makes decodes responses.
+struct ContentEncodingConnectionHandler {
+    inner: Box<dyn HttpConnectionHandler>,
+    policy: ContentEncodingPolicy,
+}
+
+impl HttpConnectionHandler for ContentEncodingConnectionHandler {
+    fn on_security_established(&mut self, info: &hopf_core::SecurityInfo) {
+        self.inner.on_security_established(info);
+    }
+
+    fn on_connected(&mut self, session: &mut super::api::HttpClientSessionHandle) {
+        session.content_encoding(self.policy.clone());
+        self.inner.on_connected(session);
+    }
+
+    fn on_disconnected(&mut self) {
+        self.inner.on_disconnected();
+    }
+
+    fn on_error(&mut self, err: &io::Error) {
+        self.inner.on_error(err);
+    }
 }

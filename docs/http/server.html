@@ -77,6 +77,7 @@
 <li><a href="#serverhandler-spi">ServerHandler SPI</a></li>
 <li><a href="#serverwriter-methods">ServerWriter methods</a></li>
 <li><a href="#deferred-responses">Deferred responses</a></li>
+<li><a href="#content-encoding">Content-Encoding</a></li>
 <li><a href="#authentication-factories">Authentication factories</a></li>
 <li><a href="#protocol-upgrades">Protocol upgrades</a></li>
 <li><a href="#httpserver-facade">HttpServer facade</a></li>
@@ -259,6 +260,14 @@
 <span id="cb2-36"><a href="#cb2-36" aria-hidden="true" tabindex="-1"></a>    <span class="kw">fn</span> request_complete(<span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">self</span><span class="op">,</span> _response<span class="op">:</span> <span class="op">&amp;</span><span class="kw">mut</span> <span class="kw">dyn</span> ServerWriter) <span class="op">{}</span></span>
 <span id="cb2-37"><a href="#cb2-37" aria-hidden="true" tabindex="-1"></a><span class="op">}</span></span></code></pre></div>
 <p>Framing stays inside the transport’s <code>ResponseControl</code>; application code only sees <code>ServerWriter</code> / <code>ServerResponseHandle</code>.</p>
+<h2 id="content-encoding">Content-Encoding (br, gzip, deflate)</h2>
+<p><code>ContentEncodingServerFactory</code> wraps any <code>ServerHandlerFactory</code> (like the auth factories) and works identically on HTTP/1.1, HTTP/2 and HTTP/3. Configure it with <code>ServerContentEncodingPolicy</code>.</p>
+<p><strong>Responses.</strong> The application&#8217;s headers are held until its first body byte. If the response is eligible - not <code>HEAD</code>/<code>CONNECT</code>, status not 1xx/204/205/304, no existing <code>Content-Encoding</code>, no <code>Content-Range</code>, not <code>Cache-Control: no-transform</code>, a compressible <code>Content-Type</code> (text, JSON, XML, JavaScript, SVG, <code>+json</code>/<code>+xml</code> by default; replaceable) and a declared <code>Content-Length</code> of at least 256 bytes (or none) - then <code>Vary: Accept-Encoding</code> is added. If the client&#8217;s <code>Accept-Encoding</code> also allows one of the policy&#8217;s codings (preference <code>br</code>, <code>gzip</code>, <code>deflate</code>; <code>q=0</code> and <code>*</code> honoured), the body is compressed chunk by chunk as the handler writes it, <code>Content-Encoding</code> is set, <code>Content-Length</code> is removed and a strong <code>ETag</code> becomes weak. Bodies written later through <code>ServerResponseHandle::execute</code> go through the same encoder. A response with no body is forwarded untouched.</p>
+<p><strong>Requests.</strong> A request carrying <code>Content-Encoding</code> is decoded before the wrapped handler sees it, and <code>Content-Encoding</code>/<code>Content-Length</code> are removed from the headers it is shown (turn off with <code>decode_requests(false)</code>). Failures answer directly and the wrapped handler hears nothing further: <strong>415</strong> for an unknown coding, <strong>400</strong> for a corrupt or truncated body, <strong>413</strong> for output past <code>HttpLimits::max_decoded_body</code> (default 64 MiB).</p>
+<pre><code>let factory = Arc::new(ContentEncodingServerFactory::new(
+    inner,
+    ServerContentEncodingPolicy::new(&amp;HttpLimits::default()),
+));</code></pre>
 <h2 id="authentication-factories">Authentication factories</h2>
 <p>All three wrap an inner <code>ServerHandlerFactory</code> and challenge before forwarding. They depend on <code>hopf-auth</code> (<code>TrustPolicy</code> / <code>CredentialStore</code>).</p>
 <table>

@@ -77,6 +77,7 @@
 <li><a href="#clienthandler-spi">ClientHandler SPI</a></li>
 <li><a href="#clientwriter-methods">ClientWriter methods</a></li>
 <li><a href="#httpclient-session-api">HttpClient session API</a></li>
+<li><a href="#content-encoding">Content-Encoding</a></li>
 <li><a href="#dial-patterns">Dial patterns</a></li>
 <li><a href="#http-get-flags">http-get flags</a></li>
 <li><a href="#examples">Examples</a></li>
@@ -257,6 +258,17 @@ conn_handle.poke();</code></pre>
 <tr><td><code>stage</code></td><td>60s</td><td>Budget for one request/response round trip once bytes are on the wire — renewed on outbound and inbound progress alike, so an actively-streaming request or response doesn't spuriously time out; a genuinely stalled peer fails the request via <code>HttpResponseHandler::failed</code> with <code>TimedOut</code>. <code>Duration::ZERO</code> disables it.</td></tr>
 </tbody>
 </table>
+<h2 id="content-encoding">Content-Encoding (br, gzip, deflate)</h2>
+<p>Opt in with <code>ContentEncodingPolicy</code> and the handler receives <em>decoded</em> body bytes on HTTP/1.1, HTTP/2 and HTTP/3. Set it on the whole client (<code>HttpClient::content_encoding</code>, which also covers <code>fetch</code> and its redirect hops), a session (<code>HttpClientSessionHandle::content_encoding</code>) or one request (<code>HttpRequest::content_encoding</code>). Off by default: without a policy nothing is added or altered.</p>
+<ul>
+<li><strong>Request:</strong> <code>Accept-Encoding</code> is added from the policy (<code>br, gzip, deflate, identity;q=0.5</code> by default) unless the request already set one.</li>
+<li><strong>Response headers:</strong> when a body is decoded, <code>Content-Encoding</code> and <code>Content-Length</code> are <em>removed</em> from the headers the handler sees (they describe the coded body it never receives). Every other header, the trailers and the status pass through unchanged. A response with no body (HEAD, 204, 304, empty) is forwarded untouched.</li>
+<li><strong>Streaming:</strong> decoding is an incremental push state machine with one fixed 16 KiB scratch buffer plus the coding&#8217;s window, so memory does not grow with the body and a body split into 1-byte segments decodes identically. Stacked codings (<code>gzip, br</code>) are undone in reverse order.</li>
+<li><strong>Fail closed:</strong> an unknown coding, a corrupt or truncated stream, or decoded output past <code>HttpLimits::max_decoded_body</code> (default 64 MiB; a per-policy override exists) ends the request through <code>HttpResponseHandler::failed</code> with <code>InvalidData</code>, and no further body bytes are delivered.</li>
+<li><strong>Codings:</strong> <code>br</code> (RFC 7932), <code>gzip</code> (RFC 1952, including concatenated members; <code>x-gzip</code> accepted) and <code>deflate</code> (zlib per RFC 9110; a bare RFC 1951 stream is also accepted, as many peers send one).</li>
+</ul>
+<p>The codec layer is public as <code>hopf_http::{Decoder, Encoder, ContentCoding}</code> (push <code>&amp;[u8]</code> in, receive output through a sink) for anything that needs to compress or decompress outside an HTTP exchange. <code>Encoder::flush</code> forces out everything pushed so far without ending the stream.</p>
+<p>Compressing <em>request</em> bodies from the client is not built in: set <code>Content-Encoding</code> yourself and push the body through an <code>Encoder</code> before <code>request_body_content</code>.</p>
 <h2 id="dial-patterns">Dial patterns</h2>
 <p>Listen and dial are peers: the same Stream SPI runs under a <code>TcpConnectorConfig</code> factory or H3 <code>connect_h3</code>. Prefer <code>connect_http</code> when the peer is a hostname (async DNS + connect timeouts).</p>
 <h3 id="connect_http-hostname">connect_http (hostname or literal)</h3>

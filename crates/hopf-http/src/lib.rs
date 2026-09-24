@@ -13,6 +13,7 @@
 pub mod auth;
 pub mod capsule;
 pub mod client;
+pub mod content_coding;
 pub mod context_id;
 pub mod h1;
 pub mod h2;
@@ -48,7 +49,9 @@ pub use client::{
 };
 #[cfg(feature = "h3")]
 pub use client::{connect_auto, connect_auto_unix, connect_h3_by_name, connect_https, HttpFallback};
-pub use server::HttpServer;
+pub use server::{
+    CompressibleFn, ContentEncodingServerFactory, HttpServer, ServerContentEncodingPolicy,
+};
 pub use dispatch::AlpnHttpEndpoint;
 pub use error::{HttpError, HttpResult};
 pub use h1::{
@@ -71,6 +74,10 @@ pub use h3::{
     H3_REQUEST_REJECTED, H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, H3_VERSION_FALLBACK,
     QPACK_DECODER_STREAM_ERROR, QPACK_DECOMPRESSION_FAILED, QPACK_ENCODER_STREAM_ERROR,
     SETTINGS_H3_DATAGRAM,
+};
+pub use content_coding::{
+    negotiate_accept_encoding, parse_content_encoding, CodingError, ContentCoding,
+    ContentEncodingPolicy, Decoder, Encoder,
 };
 pub use headers::{Header, Headers};
 pub use limits::HttpLimits;

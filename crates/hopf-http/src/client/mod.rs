@@ -6,6 +6,7 @@ pub(crate) mod alt_svc;
 pub(crate) mod api;
 pub(crate) mod connect;
 pub(crate) mod connection;
+pub(crate) mod content_encoding;
 pub(crate) mod facade;
 pub(crate) mod h2_session;
 #[cfg(feature = "h3")]
@@ -23,6 +24,7 @@ pub use connect::{
     connect_http, connect_http2_upgrade, connect_http2_upgrade_unix, connect_http_unix,
     HttpClientTimeouts,
 };
+pub use content_encoding::DecodingResponseHandler;
 pub use redirect::RedirectPolicy;
 #[cfg(feature = "h3")]
 pub use connect::{connect_auto, connect_auto_unix, connect_h3_by_name, connect_https, HttpFallback};

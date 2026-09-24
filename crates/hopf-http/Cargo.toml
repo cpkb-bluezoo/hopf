@@ -23,3 +23,5 @@ hopf-core = { workspace = true }
 hopf-auth = { workspace = true }
 hopf-dns = { workspace = true }
 hopf-quic = { workspace = true, optional = true }
+brotli = { version = "9", default-features = false, features = ["std"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

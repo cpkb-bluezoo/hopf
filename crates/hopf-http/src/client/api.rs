@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use hopf_core::{ConnHandle, SecurityInfo};
 
+use crate::content_coding::ContentEncodingPolicy;
 use crate::headers::Headers;
+
+use super::content_encoding::DecodingResponseHandler;
 use crate::version::HttpVersion;
 
 /// Client-side error from [`HttpRequest`] or session operations.
@@ -87,6 +90,7 @@ pub struct HttpClientSessionHandle {
     pub(crate) ops: Arc<Mutex<dyn SessionRequestOps + Send>>,
     version: HttpVersion,
     conn_handle: Option<ConnHandle>,
+    content_encoding: Option<ContentEncodingPolicy>,
 }
 
 impl HttpClientSessionHandle {
@@ -99,7 +103,15 @@ impl HttpClientSessionHandle {
             ops,
             version,
             conn_handle,
+            content_encoding: None,
         }
+    }
+
+    /// Decode content-coded responses for every request made from this
+    /// handle (see [`HttpRequest::content_encoding`]). Requests already
+    /// created are unaffected.
+    pub fn content_encoding(&mut self, policy: ContentEncodingPolicy) {
+        self.content_encoding = Some(policy);
     }
 
     /// Negotiated protocol version.
@@ -166,7 +178,9 @@ impl HttpClientSessionHandle {
 
     /// Request with a custom HTTP method.
     pub fn method(&mut self, method: &str, path: &str) -> HttpRequest {
-        HttpRequest::new(Arc::clone(&self.ops), method.to_string(), path.to_string())
+        let mut req = HttpRequest::new(Arc::clone(&self.ops), method.to_string(), path.to_string());
+        req.content_encoding = self.content_encoding.clone();
+        req
     }
 }
 
@@ -177,6 +191,7 @@ pub struct HttpRequest {
     path: String,
     headers: Headers,
     phase: RequestPhase,
+    content_encoding: Option<ContentEncodingPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,6 +230,36 @@ pub(crate) trait SessionRequestOps: Send {
 }
 
 impl HttpRequest {
+    /// Decode content-coded (`br`, `gzip`, `deflate`) responses to this
+    /// request transparently, on any HTTP version.
+    ///
+    /// Adds an `Accept-Encoding` header advertising the policy's codings
+    /// (unless one was already set with [`Self::header`]) and hands the
+    /// response handler *decoded* body bytes. `Content-Encoding` and
+    /// `Content-Length` are dropped from the headers it sees when a body was
+    /// decoded; an unknown coding, corrupt stream or decoded size over
+    /// [`HttpLimits::max_decoded_body`](crate::HttpLimits::max_decoded_body)
+    /// fails the response. Details: [`DecodingResponseHandler`].
+    pub fn content_encoding(&mut self, policy: ContentEncodingPolicy) {
+        self.content_encoding = Some(policy);
+    }
+
+    /// Apply the content-encoding policy, if any: advertise codings and wrap
+    /// the handler. Called once, as headers are sent.
+    fn prepare_response_decoding(
+        &mut self,
+        handler: Box<dyn HttpResponseHandler>,
+    ) -> Box<dyn HttpResponseHandler> {
+        let Some(policy) = self.content_encoding.take() else {
+            return handler;
+        };
+        if !self.headers.contains("accept-encoding") {
+            self.headers
+                .add("Accept-Encoding", policy.accept_encoding_value());
+        }
+        Box::new(DecodingResponseHandler::new(handler, policy))
+    }
+
     /// Add a request header (before send / start_request_body).
     pub fn header(
         &mut self,
@@ -239,6 +284,7 @@ impl HttpRequest {
         if !self.session.lock().unwrap().is_open() {
             return Err(HttpClientError::new("connection not open"));
         }
+        let handler = self.prepare_response_decoding(handler);
         let method = self.method.clone();
         let path = self.path.clone();
         let headers = std::mem::take(&mut self.headers);
@@ -265,6 +311,7 @@ impl HttpRequest {
         if !self.session.lock().unwrap().is_open() {
             return Err(HttpClientError::new("connection not open"));
         }
+        let handler = self.prepare_response_decoding(handler);
         let method = self.method.clone();
         let path = self.path.clone();
         let headers = std::mem::take(&mut self.headers);
@@ -334,6 +381,7 @@ impl HttpRequest {
             path,
             headers: Headers::new(),
             phase: RequestPhase::Building,
+            content_encoding: None,
         }
     }
 }
