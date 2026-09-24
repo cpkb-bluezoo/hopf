@@ -36,7 +36,7 @@ pub use pem::{
     acceptor_from_pem_with_client_auth, acceptor_from_pem_with_sni, connector_from_pem,
     connector_from_pem_tls12, connector_from_pem_tls12_with_client_cert,
     connector_from_pem_with_client_cert, connector_with_alpn, connector_with_record_size_limit,
-    connector_with_verify_override, acceptor_with_alpn, acceptor_with_record_size_limit, insecure_connector,
+    connector_with_verify_override, acceptor_requiring_supported_versions, acceptor_with_alpn, acceptor_with_record_size_limit, insecure_connector,
     insecure_connector_tls12, public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor,
     SharedTlsConnector, TlsAcceptor, TlsConnector,
 };
@@ -88,6 +88,18 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.set_alpn(list),
             TlsVariant::V12(e) => e.set_alpn(list),
+        }
+    }
+
+    /// Server side: refuse a TLS 1.2 `ClientHello` that lacks the
+    /// `supported_versions` extension, as RFC 9846 section 1.4 requires; see
+    /// [`Tls12Config::require_supported_versions`].
+    /// Only TLS 1.2 has the requirement: for a TLS 1.3 engine this does nothing
+    /// and returns `false`. Must be called before [`Self::start`].
+    pub fn set_require_supported_versions(&mut self, required: bool) -> bool {
+        match self {
+            TlsVariant::V13(_) => false,
+            TlsVariant::V12(e) => e.set_require_supported_versions(required),
         }
     }
 

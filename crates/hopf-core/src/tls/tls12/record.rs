@@ -307,6 +307,13 @@ impl Tls12RecordEngine {
         self.engine.set_alpn(protocols)
     }
 
+    /// Require the `supported_versions` extension of a `ClientHello`; see
+    /// [`Config::require_supported_versions`]. Must be called before
+    /// [`Self::start`]; returns whether it took effect.
+    pub fn set_require_supported_versions(&mut self, required: bool) -> bool {
+        self.engine.set_require_supported_versions(required)
+    }
+
     /// Begin the handshake — client emits `ClientHello`; server waits for input.
     pub fn start<S: Tls12RecordSink + ?Sized>(&mut self, sink: &mut S) {
         let mut inner = InnerSink { state: &mut self.state, outer: sink };
