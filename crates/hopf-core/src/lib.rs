@@ -81,7 +81,7 @@ pub use storage::{StorageConfig, StorageError, StorageExecutor};
 pub use telemetry::{NopTelemetry, TelemetryHook};
 pub use tls::{
     acceptor_from_pem, acceptor_from_pem_tls12, acceptor_from_pem_tls12_with_client_auth,
-    acceptor_from_pem_with_client_auth, acceptor_from_pem_with_sni, acceptor_with_alpn, acceptor_with_record_size_limit,
+    acceptor_from_pem_with_client_auth, acceptor_from_pem_with_sni, acceptor_requiring_supported_versions, acceptor_with_alpn, acceptor_with_record_size_limit,
     connector_from_pem, connector_from_pem_tls12, connector_from_pem_tls12_with_client_cert,
     connector_from_pem_with_client_cert, connector_with_alpn, connector_with_record_size_limit, connector_with_verify_override, insecure_connector, insecure_connector_tls12,
     public_trust_connector, server_credentials_from_pem, ClientAuthPolicy, HandshakeConfig,

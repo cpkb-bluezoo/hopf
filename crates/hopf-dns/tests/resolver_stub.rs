@@ -1896,7 +1896,7 @@ fn notify_over_udp_reaches_the_opcode_handler_or_is_notimp() {
     let unhandled = DnsService::new(Arc::new(DnsCache::default()));
 
     let rt = Runtime::start(Default::default()).unwrap();
-    let mut listen = |service: DnsService| {
+    let listen = |service: DnsService| {
         listen_dns_udp(
             rt.pick_worker(),
             DnsUdpListenConfig {

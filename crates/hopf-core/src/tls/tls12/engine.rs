@@ -267,6 +267,17 @@ pub struct Config {
     /// is negotiated and the handshake is unchanged from before ALPN existed.
     /// The result is [`SecurityInfo::alpn`].
     pub alpn: Vec<Bytes>,
+    /// Server role only: refuse a `ClientHello` that lacks the
+    /// `supported_versions` extension, as RFC 9846 §1.4 requires of every TLS
+    /// 1.2 `ClientHello`. `false` (the default) tolerates its absence.
+    ///
+    /// The default is tolerant because real TLS 1.2 clients omit it: measured
+    /// against OpenSSL 3.6 `-tls1_2`, GnuTLS restricted to 1.2, Python's `ssl`
+    /// and curl `--tls-max 1.2`, every one sends no `supported_versions` at all
+    /// (only stacks that also speak TLS 1.3 send it). Turn this on only where
+    /// every client is known to send it. Whatever this is set to, an extension
+    /// that *is* present must list this engine's own version.
+    pub require_supported_versions: bool,
 }
 
 impl Default for Config {
@@ -286,6 +297,7 @@ impl Default for Config {
             fixed_client_random: None,
             dtls_initial_seq: (0, 0),
             alpn: Vec::new(),
+            require_supported_versions: false,
         }
     }
 }
@@ -568,6 +580,16 @@ impl Tls12Engine {
         dtls_wire.extend_from_slice(length);
         dtls_wire.extend_from_slice(body);
         self.transcript.add_message(&dtls_wire);
+    }
+
+    /// Turn [`Config::require_supported_versions`] on or off. Only possible
+    /// before the handshake has started; returns whether it took effect.
+    pub fn set_require_supported_versions(&mut self, required: bool) -> bool {
+        if self.state != State::Initial {
+            return false;
+        }
+        self.config.require_supported_versions = required;
+        true
     }
 
     /// Set the ALPN protocol names (RFC 7301), as [`Config::alpn`] does. Only
@@ -1009,17 +1031,24 @@ impl Tls12Engine {
             self.fail(sink, AlertDescription::HandshakeFailure, "ClientHello missing or invalid RFC 5746 secure renegotiation signal");
             return false;
         }
-        // RFC 9846 §1.4: content-mandatory-if-present, presence-optional —
-        // unlike EMS/5746, a TLS-1.2-only client has no established-practice
-        // reason to send this (its usual purpose is signalling upward TLS
-        // 1.3 capability), so absence is tolerated; but if it's there, it
-        // must actually include this engine's own version.
+        // RFC 9846 §1.4 makes `supported_versions` mandatory on a TLS 1.2
+        // ClientHello, but real TLS 1.2 clients omit it (its usual purpose is
+        // signalling upward TLS 1.3 capability): OpenSSL `-tls1_2`, GnuTLS
+        // restricted to 1.2, Python's `ssl` and curl all send none. So by default
+        // absence is tolerated, and `Config::require_supported_versions` turns
+        // the mandate on. When the extension *is* present, its content is
+        // always checked: it must include this engine's own version.
         let expected_version = if self.config.dtls { 0xfefd } else { 0x0303 };
-        if let Some(versions) = &ch.supported_versions {
-            if !versions.contains(&expected_version) {
+        match &ch.supported_versions {
+            Some(versions) if !versions.contains(&expected_version) => {
                 self.fail(sink, AlertDescription::ProtocolVersion, "ClientHello supported_versions doesn't include this engine's own version");
                 return false;
             }
+            None if self.config.require_supported_versions => {
+                self.fail(sink, AlertDescription::MissingExtension, "ClientHello lacks the mandatory supported_versions extension (RFC 9846 1.4)");
+                return false;
+            }
+            _ => {}
         }
 
         // RFC 7301 §3.2: pick by the server's own preference, and refuse a
@@ -2003,6 +2032,64 @@ mod tests {
         assert!(!sink_s.outbound.is_empty(), "server should proceed to send ServerHello: {:?}", sink_s.events);
     }
 
+    // ---- require_supported_versions (RFC 9846 1.4) ----
+
+    /// A server with the given strictness fed a ClientHello that either keeps
+    /// or has had its `supported_versions` extension stripped.
+    fn server_fed_client_hello(strict: bool, keep_extension: bool) -> RecordingSink {
+        let creds = test_server_credentials_ecdsa();
+        let server_cfg = Config {
+            role: Role::Server,
+            server: Some(creds),
+            require_supported_versions: strict,
+            ..Default::default()
+        };
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink = RecordingSink::default();
+        let params = messages::ClientHelloParams {
+            random: [1u8; 32],
+            session_id: &[],
+            cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
+            server_name: None,
+            session_ticket: None,
+            alpn: &[],
+            legacy_version: 0x0303,
+            cookie: &[],
+        };
+        let wire = messages::build_client_hello(&params);
+        let wire = if keep_extension { wire } else { strip_extension(&wire, 43, messages::ext::SUPPORTED_VERSIONS) };
+        server.feed_handshake_data(&mut wire.as_ref(), &mut sink);
+        sink
+    }
+
+    /// The four combinations: only strict-and-absent is refused.
+    #[test]
+    fn a_strict_server_refuses_a_client_hello_without_supported_versions() {
+        let refused = server_fed_client_hello(true, false);
+        assert!(
+            refused.events.iter().any(|e| e.starts_with("protocol_error") && e.contains("supported_versions")),
+            "{:?}",
+            refused.events
+        );
+        assert!(refused.outbound.is_empty(), "no ServerHello may go out: {:?}", refused.events);
+    }
+
+    #[test]
+    fn a_strict_server_accepts_a_client_hello_that_carries_it() {
+        let ok = server_fed_client_hello(true, true);
+        assert!(ok.events.iter().all(|e| !e.starts_with("protocol_error")), "{:?}", ok.events);
+        assert!(!ok.outbound.is_empty(), "the handshake must proceed: {:?}", ok.events);
+    }
+
+    #[test]
+    fn a_default_server_still_tolerates_its_absence() {
+        // Real TLS 1.2 clients omit it, so the default must keep accepting them.
+        let ok = server_fed_client_hello(false, false);
+        assert!(ok.events.iter().all(|e| !e.starts_with("protocol_error")), "{:?}", ok.events);
+        assert!(!ok.outbound.is_empty(), "{:?}", ok.events);
+    }
+
+
     #[test]
     fn server_accepts_client_hello_signalling_via_scsv_instead_of_extension() {
         let creds = test_server_credentials_ecdsa();
@@ -2711,6 +2798,7 @@ mod tests {
             fixed_client_random: None,
             dtls_initial_seq: (0, 0),
             alpn: Vec::new(),
+            require_supported_versions: false,
         }
     }
 

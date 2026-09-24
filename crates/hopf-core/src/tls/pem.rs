@@ -71,6 +71,29 @@ pub fn acceptor_with_alpn(inner: SharedTlsAcceptor, protocols: &[&[u8]]) -> Shar
     Arc::new(AlpnAcceptor { inner, protocols: protocols.iter().map(|p| p.to_vec()).collect() })
 }
 
+struct StrictVersionsAcceptor {
+    inner: SharedTlsAcceptor,
+}
+
+impl TlsAcceptor for StrictVersionsAcceptor {
+    fn accept(&self) -> TlsVariant {
+        let mut engine = self.inner.accept();
+        engine.set_require_supported_versions(true);
+        engine
+    }
+}
+
+/// Wrap `inner` so every accepted TLS 1.2 connection refuses a `ClientHello`
+/// that lacks the `supported_versions` extension, with a `missing_extension`
+/// alert. RFC 9846 section 1.4 makes the extension mandatory on TLS 1.2, but
+/// TLS 1.2-only clients (OpenSSL `-tls1_2`, GnuTLS restricted to 1.2, Python's
+/// `ssl`, curl `--tls-max 1.2`) routinely omit it, so the default tolerates its
+/// absence; use this only where every client is known to send it. TLS 1.3
+/// acceptors are unaffected (their clients always send it).
+pub fn acceptor_requiring_supported_versions(inner: SharedTlsAcceptor) -> SharedTlsAcceptor {
+    Arc::new(StrictVersionsAcceptor { inner })
+}
+
 struct AlpnConnector {
     inner: SharedTlsConnector,
     protocols: Vec<Vec<u8>>,
@@ -672,6 +695,28 @@ mod tests {
         assert!(client.set_alpn(&[b"h2"]));
         client.start(&mut Wire::default());
         assert!(!client.set_alpn(&[b"h3"]), "too late: the ClientHello is already out");
+    }
+
+    #[test]
+    fn a_strict_acceptor_still_serves_a_client_that_sends_supported_versions() {
+        use crate::tls::connector_from_pem_tls12;
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let acceptor = acceptor_requiring_supported_versions(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap());
+        let (mut client, mut server) =
+            (connector_from_pem_tls12(&cert_path).unwrap().connect("localhost").unwrap(), acceptor.accept());
+        let (wc, ws) = handshake(&mut client, &mut server);
+        assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
+    }
+
+    #[test]
+    fn requiring_supported_versions_is_a_tls12_matter_only() {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let mut v13 = acceptor_requiring_supported_versions(acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()).accept();
+        assert!(!v13.set_require_supported_versions(true), "TLS 1.3 has nothing to require");
+        let mut v12 = acceptor_from_pem_tls12(&cert_path, &key_path).unwrap().accept();
+        assert!(v12.set_require_supported_versions(true));
     }
 
     #[test]
