@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use hopf_core::{ProtocolHandler, Runtime, SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig};
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
+use crate::content_coding::{ContentCodingCache, ContentEncodingPolicy};
 use crate::headers::Headers;
 use crate::HttpLimits;
 
@@ -18,6 +19,17 @@ use super::connection::HttpClientConnection;
 use super::redirect::{FetchState, PlainFetchConnectionHandler, RedirectPolicy, RedirectTarget};
 use super::session_config::HttpClientSessionConfig;
 use super::HttpClientTimeouts;
+
+/// How [`HttpClient`] applies content coding.
+#[derive(Clone)]
+enum ContentEncodingSetting {
+    /// [`ContentEncodingPolicy::new`] with this client's limits and cache.
+    Default,
+    /// A caller-supplied policy.
+    Custom(ContentEncodingPolicy),
+    /// No content coding.
+    Off,
+}
 
 /// Async HTTP client with Gumdrop-style request objects.
 ///
@@ -42,6 +54,11 @@ pub struct HttpClient {
     /// See [`Self::follow_redirects`]. `None` (the default): [`Self::fetch`]
     /// delivers a 3xx response unchanged, following nothing.
     redirect_policy: Option<RedirectPolicy>,
+    /// See [`Self::content_encoding`].
+    content_encoding: ContentEncodingSetting,
+    /// Capability cache shared by this client's connections; see
+    /// [`Self::coding_cache`].
+    coding_cache: Arc<ContentCodingCache>,
     #[cfg(feature = "h3")]
     quic_client_config: Option<Arc<hopf_quic::QuicClientConfig>>,
     #[cfg(feature = "h3")]
@@ -68,6 +85,8 @@ impl HttpClient {
             tls_server_name: None,
             resolver: None,
             redirect_policy: None,
+            content_encoding: ContentEncodingSetting::Default,
+            coding_cache: Arc::new(ContentCodingCache::new()),
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -94,6 +113,8 @@ impl HttpClient {
             tls_server_name: None,
             resolver: None,
             redirect_policy: None,
+            content_encoding: ContentEncodingSetting::Default,
+            coding_cache: Arc::new(ContentCodingCache::new()),
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -123,6 +144,8 @@ impl HttpClient {
             tls_server_name: None,
             resolver: None,
             redirect_policy: None,
+            content_encoding: ContentEncodingSetting::Default,
+            coding_cache: Arc::new(ContentCodingCache::new()),
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -313,6 +336,14 @@ impl HttpClient {
         rt: &Arc<Runtime>,
         handler: Box<dyn HttpConnectionHandler>,
     ) -> io::Result<()> {
+        let handler: Box<dyn HttpConnectionHandler> = match self.effective_content_encoding() {
+            Some(policy) => Box::new(ContentEncodingConnectionHandler {
+                inner: handler,
+                policy,
+                origin: self.coding_origin(),
+            }),
+            None => handler,
+        };
         if let Some(path) = self.unix_path.clone() {
             let (cfg, config) = self.connector_for_unix_path(path, handler);
             return rt.connect_unix(cfg).inspect_err(|e| {
@@ -623,6 +654,8 @@ impl HttpClient {
             tls_server_name: self.tls_server_name.clone(),
             resolver: self.resolver.clone(),
             redirect_policy: self.redirect_policy.clone(),
+            content_encoding: self.content_encoding.clone(),
+            coding_cache: Arc::clone(&self.coding_cache),
             #[cfg(feature = "h3")]
             quic_client_config: self.quic_client_config.clone(),
             #[cfg(feature = "h3")]
@@ -631,6 +664,65 @@ impl HttpClient {
             h3_prior_knowledge: self.h3_prior_knowledge,
             #[cfg(feature = "h3")]
             alt_svc_cache: Arc::clone(&self.alt_svc_cache),
+        }
+    }
+
+    /// Replace the default content-coding policy; see
+    /// [`ContentEncodingPolicy`] and [`Self::disable_content_encoding`].
+    ///
+    /// The policy's own capability cache is used as given. To make several
+    /// clients share what they learn, build the policy with
+    /// [`ContentEncodingPolicy::cache`] and the same `Arc`.
+    pub fn content_encoding(mut self, policy: ContentEncodingPolicy) -> Self {
+        self.content_encoding = ContentEncodingSetting::Custom(policy);
+        self
+    }
+
+    /// Turn content coding off: no `Accept-Encoding` is added, no response is
+    /// decoded and no request body is compressed. Handlers see bodies
+    /// exactly as they are on the wire.
+    ///
+    /// By default the client, on every request made through [`Self::connect`]
+    /// or [`Self::fetch`] and on HTTP/1.1, HTTP/2 and HTTP/3 alike:
+    ///
+    /// - sends `Accept-Encoding: br, gzip, deflate` and hands the handler
+    ///   decoded bodies (see [`crate::client::DecodingResponseHandler`] for
+    ///   the header and failure rules); and
+    /// - compresses a request body only for an origin that has advertised
+    ///   support in an `Accept-Encoding` response header, never for one it
+    ///   knows nothing about, and never when the request sets
+    ///   `Content-Encoding` itself.
+    pub fn disable_content_encoding(mut self) -> Self {
+        self.content_encoding = ContentEncodingSetting::Off;
+        self
+    }
+
+    /// Use `cache` to record which request-body codings origins accept, so
+    /// several clients can share what they have learned (or a caller can
+    /// pre-seed a known origin). Ignored if [`Self::content_encoding`]
+    /// supplied a policy with its own cache.
+    pub fn coding_cache(mut self, cache: Arc<ContentCodingCache>) -> Self {
+        self.coding_cache = cache;
+        self
+    }
+
+    /// The policy to apply to a new connection, if content coding is on.
+    fn effective_content_encoding(&self) -> Option<ContentEncodingPolicy> {
+        match &self.content_encoding {
+            ContentEncodingSetting::Off => None,
+            ContentEncodingSetting::Custom(p) => Some(p.clone()),
+            ContentEncodingSetting::Default => Some(
+                ContentEncodingPolicy::new(&self.limits).cache(Arc::clone(&self.coding_cache)),
+            ),
+        }
+    }
+
+    /// The origin key content-coding capabilities are recorded under.
+    fn coding_origin(&self) -> (String, u16) {
+        match (&self.unix_path, self.addr) {
+            (Some(path), _) => (path.to_string_lossy().into_owned(), 0),
+            (None, Some(addr)) => (addr.ip().to_string(), addr.port()),
+            (None, None) => (self.host.clone(), self.port),
         }
     }
 
@@ -739,6 +831,8 @@ impl HttpClient {
             tls_server_name: target.secure.then(|| target.host.clone()),
             resolver: self.resolver.clone(),
             redirect_policy: None,
+            content_encoding: self.content_encoding.clone(),
+            coding_cache: Arc::clone(&self.coding_cache),
             #[cfg(feature = "h3")]
             quic_client_config: None,
             #[cfg(feature = "h3")]
@@ -756,4 +850,32 @@ fn resolve_literal(host: &str, port: u16) -> Option<SocketAddr> {
         return Some(addr);
     }
     parse_literal_ip(host).map(|ip| SocketAddr::new(ip, port))
+}
+
+/// Applies the client's [`ContentEncodingPolicy`] to the session handed to
+/// the application's handler, so every request it makes decodes responses.
+struct ContentEncodingConnectionHandler {
+    inner: Box<dyn HttpConnectionHandler>,
+    policy: ContentEncodingPolicy,
+    origin: (String, u16),
+}
+
+impl HttpConnectionHandler for ContentEncodingConnectionHandler {
+    fn on_security_established(&mut self, info: &hopf_core::SecurityInfo) {
+        self.inner.on_security_established(info);
+    }
+
+    fn on_connected(&mut self, session: &mut super::api::HttpClientSessionHandle) {
+        session.content_encoding(self.policy.clone());
+        session.set_origin(self.origin.0.clone(), self.origin.1);
+        self.inner.on_connected(session);
+    }
+
+    fn on_disconnected(&mut self) {
+        self.inner.on_disconnected();
+    }
+
+    fn on_error(&mut self, err: &io::Error) {
+        self.inner.on_error(err);
+    }
 }

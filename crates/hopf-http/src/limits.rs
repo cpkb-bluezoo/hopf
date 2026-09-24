@@ -13,6 +13,11 @@ pub struct HttpLimits {
     pub max_chunk_size: usize,
     /// Max aggregate request body (default 16 MiB).
     pub max_request_body: usize,
+    /// Max decoded size of one content-coded (`br`/`gzip`/`deflate`) body
+    /// (default 64 MiB). Applies to every body this crate decodes - client
+    /// responses and server requests - and is the decompression-bomb guard:
+    /// a body that would decode past it is abandoned (fail closed).
+    pub max_decoded_body: usize,
     /// Max concurrently open HTTP/2 streams a peer may have open on this
     /// connection (default 100). Advertised to the peer via
     /// `SETTINGS_MAX_CONCURRENT_STREAMS` and enforced with
@@ -28,6 +33,7 @@ impl Default for HttpLimits {
             max_header_count: 100,
             max_chunk_size: 10 * 1024 * 1024,
             max_request_body: 16 * 1024 * 1024,
+            max_decoded_body: 64 * 1024 * 1024,
             max_concurrent_streams: 100,
         }
     }
