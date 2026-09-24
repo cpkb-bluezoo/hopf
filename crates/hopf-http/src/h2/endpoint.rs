@@ -667,19 +667,32 @@ impl H2Endpoint {
             endpoint.local_addr().ok(),
             endpoint.security_info().clone(),
         );
-        let df = Arc::clone(&self.deferred_flush);
         for stream in self.server_streams.values_mut() {
-            stream.writer.control.bind_conn(conn.clone());
-            stream
-                .writer
-                .control
-                .bind_connection_info(self.connection_info.clone());
-            let df = Arc::clone(&df);
-            let sid = stream.id;
-            stream.writer.control.set_flush(Some(Arc::new(move || {
-                df.streams.lock().unwrap().push(sid);
-            })));
+            Self::bind_server_stream(&conn, &self.connection_info, &self.deferred_flush, stream);
         }
+    }
+
+    /// Give one server stream's response control the connection it lives on:
+    /// its reactor handle, remote/local addresses and TLS metadata, and the
+    /// deferred-flush hook.
+    ///
+    /// A stream must be bound as it is *created*, before its handler runs.
+    /// Binding only the streams that already exist at the start of a
+    /// `receive` leaves the stream a request creates during that call with
+    /// the plaintext, address-less default while the handler is executing.
+    fn bind_server_stream(
+        conn: &hopf_core::ConnHandle,
+        info: &ConnectionInfo,
+        df: &Arc<H2DeferredFlush>,
+        stream: &mut H2ServerStream,
+    ) {
+        stream.writer.control.bind_conn(conn.clone());
+        stream.writer.control.bind_connection_info(info.clone());
+        let df = Arc::clone(df);
+        let sid = stream.id;
+        stream.writer.control.set_flush(Some(Arc::new(move || {
+            df.streams.lock().unwrap().push(sid);
+        })));
     }
 
     fn drain_deferred_flush(&mut self) {
@@ -1093,6 +1106,7 @@ impl H2Endpoint {
             capsule_parser: crate::capsule::CapsuleParser::new(),
             priority: PriorityParams::default(),
         };
+        Self::bind_server_stream(&self.conn, &self.connection_info, &self.deferred_flush, &mut stream);
 
         stream.handler.headers(&mut stream.writer, &upgrade_headers);
         stream.capsule_mode = crate::capsule::capsule_protocol_enabled(&upgrade_headers);
@@ -1332,6 +1346,7 @@ impl H2Endpoint {
             capsule_parser: crate::capsule::CapsuleParser::new(),
             priority: PriorityParams::default(),
         };
+        Self::bind_server_stream(&self.conn, &self.connection_info, &self.deferred_flush, &mut stream);
 
         stream.handler.headers(&mut stream.writer, &headers);
         stream.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);

@@ -105,6 +105,13 @@ impl H2ResponseControl {
         if let Some(cb) = self.flush.lock().unwrap().clone() {
             cb();
         }
+        // The callback only queues this stream for the endpoint to drain, and
+        // nothing else will run the endpoint: without an inbound frame to
+        // trigger `receive`, a deferred write would sit unsent (a response
+        // produced across several `execute` calls never completing). Wake it,
+        // as the HTTP/1.1 response control does by re-entering its endpoint.
+        // A task-only handle has no endpoint to wake, so this is a no-op there.
+        self.conn_handle().poke();
     }
 
     fn pause_request_body(&self) {

@@ -81,6 +81,7 @@
 <li><a href="#http2">HTTP/2</a></li>
 <li><a href="#http3">HTTP/3</a></li>
 <li><a href="#caching">HTTP caching and conditional requests</a></li>
+<li><a href="#hsts">HSTS</a></li>
 <li><a href="#quic">QUIC transport</a></li>
 <li><a href="#webdav">WebDAV</a></li>
 <li><a href="#websocket">WebSocket</a></li>
@@ -378,6 +379,20 @@
 <tr><td><code>Expires</code></td><td>RFC 9111 &#167;5.3</td><td>Compliant</td><td>Set by the handler using <code>format_http_date</code>; ignored by caches when <code>max-age</code> is present</td></tr>
 <tr><td><code>If-Range</code> and range requests</td><td>RFC 9110 &#167;13.1.5, &#167;14</td><td>Not implemented</td><td>No <code>Range</code> support anywhere in <code>hopf-http</code>, so there is nothing for <code>If-Range</code> to guard</td></tr>
 <tr><td>Cache storage, freshness, <code>Age</code>, invalidation</td><td>RFC 9111 &#167;3-4</td><td>N/A</td><td>Not a cache. See the scope note above</td></tr>
+</tbody>
+</table>
+
+<h2 id="hsts">HTTP Strict Transport Security &#8212; RFC 6797</h2>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Field syntax: <code>max-age</code>, <code>includeSubDomains</code>, <code>preload</code></td><td>&#167;6.1</td><td>Compliant</td><td><code>HstsPolicy</code> formats the value; <code>max-age=0</code> clears a host (&#167;6.1.1); <code>preload</code> is validated against the browser lists' one-year and <code>includeSubDomains</code> conditions when the server binds</td></tr>
+<tr><td>Never send over insecure transport</td><td>&#167;7.2</td><td>Compliant</td><td>Added only when the connection reports TLS, on HTTP/1.1 and HTTP/2; covered by an end-to-end test against a plaintext listener</td></tr>
+<tr><td>Send in all secure responses, error statuses included</td><td>&#167;7.1</td><td>Compliant</td><td><code>HstsServerFactory</code> is the outermost layer, so it covers 304/412 from the conditional layer and responses a handler writes later through the response handle. A value the handler set itself is kept</td></tr>
+<tr><td>Send on HTTP/3</td><td>&#167;7.1</td><td>Partial</td><td><code>HttpServer::hsts</code> covers TCP listeners; <code>listen_h3</code> takes a factory directly, so it must be wrapped with <code>HstsServerFactory</code> by hand</td></tr>
+<tr><td>Enabled by default</td><td>&#8212;</td><td>N/A</td><td>Deliberately opt-in: it is a long-lived promise to browsers that is painful to retract</td></tr>
+<tr><td>HTTP-to-HTTPS redirect for plaintext visitors</td><td>&#167;7.2, &#167;8.3</td><td>Not implemented</td><td>hopf-http has no built-in redirect; HSTS does not replace one, because a browser only honours the field once it has been received over HTTPS. See the server page for the recommended pattern</td></tr>
+<tr><td>User-agent processing (Known HSTS Hosts, URI rewriting)</td><td>&#167;8</td><td>N/A</td><td>Client-side browser behaviour; <code>HttpClient</code> is not a user agent and keeps no HSTS store</td></tr>
 </tbody>
 </table>
 
