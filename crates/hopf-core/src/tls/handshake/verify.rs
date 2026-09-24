@@ -146,7 +146,7 @@ pub(crate) fn pkcs8_key_kind(pkcs8_der: &[u8]) -> Option<KeyKind> {
 }
 
 /// Extract a 32-byte Ed25519 public key from SPKI DER.
-fn ed25519_public_key_from_spki(spki: &[u8]) -> Option<[u8; 32]> {
+pub(crate) fn ed25519_public_key_from_spki(spki: &[u8]) -> Option<[u8; 32]> {
     // SubjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey BIT STRING }
     let mut outer = parse_sequence(spki)?;
     let _alg = outer.next()?;

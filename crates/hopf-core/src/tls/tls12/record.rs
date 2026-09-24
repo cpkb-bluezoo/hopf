@@ -658,6 +658,58 @@ mod tests {
         }
     }
 
+    // ---- server key types (RFC 8422) ----
+
+    fn creds_for(alg: &'static rcgen::SignatureAlgorithm) -> ServerCredentials {
+        let key_pair = rcgen::KeyPair::generate_for(alg).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        ServerCredentials {
+            cert_chain: vec![Bytes::copy_from_slice(cert.der())],
+            signing_key_pkcs8: Bytes::from(key_pair.serialize_der()),
+        }
+    }
+
+    /// A TLS 1.2 handshake against a server holding `creds`, over real record
+    /// framing. Returns whether both sides completed, with the sinks.
+    fn loopback_with_server_creds(creds: ServerCredentials) -> (bool, RecordingSink, RecordingSink) {
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let client_cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            trust_store: Some(trust),
+            ..Default::default()
+        };
+        let server_cfg = Config { role: Role::Server, server: Some(creds), ..Default::default() };
+        let mut client = Tls12RecordEngine::new(client_cfg);
+        let mut server = Tls12RecordEngine::new(server_cfg);
+        let (mut sc, mut ss) = (RecordingSink::default(), RecordingSink::default());
+        client.start(&mut sc);
+        for _ in 0..2 {
+            relay(&mut sc, &mut server, &mut ss);
+            relay(&mut ss, &mut client, &mut sc);
+        }
+        (client.is_complete() && server.is_complete(), sc, ss)
+    }
+
+    /// The server's key type must not stop it finding a cipher suite: an
+    /// ECDSA P-384 key authenticates the ECDHE_ECDSA suites just as P-256 does.
+    #[test]
+    fn a_p384_server_key_completes_a_handshake() {
+        let (ok, sc, ss) = loopback_with_server_creds(creds_for(&rcgen::PKCS_ECDSA_P384_SHA384));
+        assert!(ok, "client: {:?} / server: {:?}", sc.events, ss.events);
+    }
+
+    /// RFC 8422 section 5: an Ed25519 certificate authenticates the
+    /// ECDHE_ECDSA suites, with the ServerKeyExchange signed by pure EdDSA.
+    #[test]
+    fn an_ed25519_server_key_completes_a_handshake() {
+        let (ok, sc, ss) = loopback_with_server_creds(creds_for(&rcgen::PKCS_ED25519));
+        assert!(ok, "client: {:?} / server: {:?}", sc.events, ss.events);
+        assert_eq!(sc.info.as_ref().unwrap().protocol(), Some("TLSv1.2"));
+    }
+
     /// Direct proof that `AeadDirection`'s ChaCha20-Poly1305 branch (no
     /// explicit wire nonce, IV-XOR-sequence-number construction, per
     /// `CipherKind::iv_len`'s 12-byte IV) actually round-trips real
