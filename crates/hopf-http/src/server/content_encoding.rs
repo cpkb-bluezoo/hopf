@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex};
 use hopf_core::ConnHandle;
 
 use crate::content_coding::{
-    negotiate_accept_encoding, CodingError, ContentCoding, Decoder, Encoder,
+    default_compressible, negotiate_accept_encoding, CodingError, CompressibleFn, ContentCoding,
+    Decoder, Encoder, ALL_CODINGS,
 };
 use crate::headers::Headers;
 use crate::limits::HttpLimits;
@@ -29,9 +30,6 @@ use crate::stream::{
     ConnectionInfo, ProtocolUpgradeHandler, ResponseControl, ServerHandler, ServerHandlerFactory,
     ServerResponseHandle, ServerWriter,
 };
-
-/// Predicate deciding whether a `Content-Type` is worth compressing.
-pub type CompressibleFn = dyn Fn(&str) -> bool + Send + Sync;
 
 /// What the server compresses and decodes.
 #[derive(Clone)]
@@ -107,38 +105,24 @@ impl ServerContentEncodingPolicy {
     }
 }
 
-/// `text/*`, JSON, XML, JavaScript, SVG and `+json` / `+xml` suffix types.
-fn default_compressible(ct: &str) -> bool {
-    let ct = ct.trim().to_ascii_lowercase();
-    ct.starts_with("text/")
-        || ct.ends_with("+json")
-        || ct.ends_with("+xml")
-        || matches!(
-            ct.as_str(),
-            "application/json"
-                | "application/xml"
-                | "application/javascript"
-                | "application/x-javascript"
-                | "application/xhtml+xml"
-                | "application/wasm"
-                | "image/svg+xml"
-        )
-}
-
 /// [`ServerHandlerFactory`] decorator applying a [`ServerContentEncodingPolicy`].
 ///
 /// # Response header policy
 ///
 /// The application's headers are held until its first body byte (or
 /// `start_response_body`). If the response is eligible - a 2xx-or-error
-/// with a body, not `HEAD`/`204`/`304`, no existing `Content-Encoding`, not
+/// with a body, not `HEAD`/`204`/`304`, no `Content-Encoding` set by the handler (any value, `identity`
+/// included, is an explicit instruction to leave the response alone), not
 /// `Cache-Control: no-transform`, no `Content-Range`, a compressible
 /// `Content-Type`, and at least the policy's minimum length - `Vary:
 /// Accept-Encoding` is added. If the client also accepts one of the
 /// policy's codings, the response is compressed: `Content-Encoding` is set,
 /// `Content-Length` removed (the length is unknown until the end, so the
 /// transport frames the body by chunking / stream end), and a strong `ETag`
-/// is weakened. A response with no body is forwarded untouched.
+/// is weakened. A response with no body is forwarded untouched. Unless
+/// request decoding is turned off, every response also carries
+/// `Accept-Encoding: br, gzip, deflate` (RFC 9110 §12.5.3) so clients learn
+/// they may compress the bodies they send.
 ///
 /// # Request handling
 ///
@@ -179,6 +163,8 @@ struct ResponseState {
     /// Coding negotiated from the request, if the client accepts one.
     negotiated: Option<ContentCoding>,
     eligible_method: bool,
+    /// Advertise request-body codings on responses.
+    advertise_requests: bool,
     policy: Option<Arc<ServerContentEncodingPolicy>>,
     pending: Option<Headers>,
     /// Headers have been handed to the transport (compress decision made).
@@ -200,6 +186,11 @@ impl ResponseState {
         if allow_compress {
             self.apply(&mut h);
         }
+        if self.advertise_requests && !h.contains("accept-encoding") {
+            // RFC 9110 §12.5.3: tell clients which codings we accept in
+            // requests, so they can compress bodies they send us.
+            h.set("accept-encoding", ALL_CODINGS.map(|c| c.token()).join(", "));
+        }
         inner.headers(h);
     }
 
@@ -217,10 +208,10 @@ impl ResponseState {
         if h.contains("content-range") {
             return;
         }
-        if let Some(ce) = h.get("content-encoding") {
-            if !ce.trim().eq_ignore_ascii_case("identity") {
-                return;
-            }
+        // A Content-Encoding the handler set itself - `identity` included -
+        // is an explicit instruction: leave the response exactly as built.
+        if h.contains("content-encoding") {
+            return;
         }
         if h.get("cache-control")
             .is_some_and(|v| v.split(',').any(|d| d.trim().eq_ignore_ascii_case("no-transform")))
@@ -438,6 +429,8 @@ impl ContentEncodingHandler {
         let mut h = Headers::new();
         h.status(code);
         h.set("content-length", "0");
+        // RFC 9110 §15.5.16: a 415 for a content coding names what is accepted.
+        h.set("accept-encoding", ALL_CODINGS.map(|c| c.token()).join(", "));
         // Straight to the transport: an error reply is never re-compressed.
         {
             let mut st = self.resp.lock().unwrap();
@@ -461,6 +454,7 @@ impl ServerHandler for ContentEncodingHandler {
         {
             let mut st = self.resp.lock().unwrap();
             st.policy = Some(Arc::clone(&self.policy));
+            st.advertise_requests = self.policy.decode_requests;
             let method = headers.method().unwrap_or("");
             st.eligible_method = !method.eq_ignore_ascii_case("HEAD")
                 && !method.eq_ignore_ascii_case("CONNECT");

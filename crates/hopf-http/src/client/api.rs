@@ -15,7 +15,7 @@ use hopf_core::{ConnHandle, SecurityInfo};
 use crate::content_coding::ContentEncodingPolicy;
 use crate::headers::Headers;
 
-use super::content_encoding::DecodingResponseHandler;
+use super::content_encoding::{DecodingResponseHandler, RequestCompressor};
 use crate::version::HttpVersion;
 
 /// Client-side error from [`HttpRequest`] or session operations.
@@ -91,6 +91,7 @@ pub struct HttpClientSessionHandle {
     version: HttpVersion,
     conn_handle: Option<ConnHandle>,
     content_encoding: Option<ContentEncodingPolicy>,
+    origin: Option<(String, u16)>,
 }
 
 impl HttpClientSessionHandle {
@@ -104,7 +105,14 @@ impl HttpClientSessionHandle {
             version,
             conn_handle,
             content_encoding: None,
+            origin: None,
         }
+    }
+
+    /// The origin (host, port) this session talks to, used to look up and
+    /// learn its content-coding capabilities.
+    pub(crate) fn set_origin(&mut self, host: String, port: u16) {
+        self.origin = Some((host, port));
     }
 
     /// Decode content-coded responses for every request made from this
@@ -180,6 +188,7 @@ impl HttpClientSessionHandle {
     pub fn method(&mut self, method: &str, path: &str) -> HttpRequest {
         let mut req = HttpRequest::new(Arc::clone(&self.ops), method.to_string(), path.to_string());
         req.content_encoding = self.content_encoding.clone();
+        req.origin = self.origin.clone();
         req
     }
 }
@@ -192,6 +201,8 @@ pub struct HttpRequest {
     headers: Headers,
     phase: RequestPhase,
     content_encoding: Option<ContentEncodingPolicy>,
+    origin: Option<(String, u16)>,
+    compressor: Option<RequestCompressor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,22 +241,47 @@ pub(crate) trait SessionRequestOps: Send {
 }
 
 impl HttpRequest {
-    /// Decode content-coded (`br`, `gzip`, `deflate`) responses to this
-    /// request transparently, on any HTTP version.
+    /// Override the content-coding policy for this request. The
+    /// [`HttpClient`](crate::HttpClient) already applies one by default; see
+    /// [`ContentEncodingPolicy`] for what it does and how to opt out.
     ///
-    /// Adds an `Accept-Encoding` header advertising the policy's codings
-    /// (unless one was already set with [`Self::header`]) and hands the
-    /// response handler *decoded* body bytes. `Content-Encoding` and
-    /// `Content-Length` are dropped from the headers it sees when a body was
-    /// decoded; an unknown coding, corrupt stream or decoded size over
+    /// For **responses** it adds `Accept-Encoding` (unless you set one, or
+    /// the request has `Range`/`If-Range`, is `CONNECT`, or is an upgrade)
+    /// and hands the response handler *decoded* body bytes. `Content-Encoding`
+    /// and `Content-Length` are dropped from the headers it sees when a body
+    /// was decoded; an unknown coding, corrupt stream or decoded size over
     /// [`HttpLimits::max_decoded_body`](crate::HttpLimits::max_decoded_body)
     /// fails the response. Details: [`DecodingResponseHandler`].
+    ///
+    /// For **request bodies** it compresses only with a coding this origin is
+    /// known to accept, and never when you set `Content-Encoding` yourself
+    /// (any value, `identity` included).
     pub fn content_encoding(&mut self, policy: ContentEncodingPolicy) {
         self.content_encoding = Some(policy);
     }
 
-    /// Apply the content-encoding policy, if any: advertise codings and wrap
-    /// the handler. Called once, as headers are sent.
+    /// Decide whether to compress the request body about to be started.
+    fn prepare_request_compression(&mut self) {
+        let Some(policy) = self.content_encoding.as_ref() else {
+            return;
+        };
+        if self.headers.contains("content-encoding") {
+            return;
+        }
+        let len = self
+            .headers
+            .get("content-length")
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let origin = self.origin.as_ref().map(|(h, p)| (h.as_str(), *p));
+        if let Some(coding) = policy.request_coding(origin, self.headers.get("content-type"), len) {
+            self.headers.set("Content-Encoding", coding.token());
+            self.headers.remove("content-length");
+            self.compressor = Some(RequestCompressor::new(coding));
+        }
+    }
+
+    /// Apply the response side of the policy, if any: advertise codings and
+    /// wrap the handler. Called once, as headers are sent.
     fn prepare_response_decoding(
         &mut self,
         handler: Box<dyn HttpResponseHandler>,
@@ -253,11 +289,13 @@ impl HttpRequest {
         let Some(policy) = self.content_encoding.take() else {
             return handler;
         };
-        if !self.headers.contains("accept-encoding") {
+        let partial = self.headers.contains("range") || self.headers.contains("if-range");
+        let tunnel = self.method.eq_ignore_ascii_case("CONNECT") || self.headers.contains("upgrade");
+        if !self.headers.contains("accept-encoding") && !partial && !tunnel {
             self.headers
                 .add("Accept-Encoding", policy.accept_encoding_value());
         }
-        Box::new(DecodingResponseHandler::new(handler, policy))
+        Box::new(DecodingResponseHandler::new(handler, policy, self.origin.clone()))
     }
 
     /// Add a request header (before send / start_request_body).
@@ -311,6 +349,7 @@ impl HttpRequest {
         if !self.session.lock().unwrap().is_open() {
             return Err(HttpClientError::new("connection not open"));
         }
+        self.prepare_request_compression();
         let handler = self.prepare_response_decoding(handler);
         let method = self.method.clone();
         let path = self.path.clone();
@@ -334,6 +373,9 @@ impl HttpRequest {
         if self.phase != RequestPhase::BodyStreaming {
             return Err(HttpClientError::new("must call start_request_body first"));
         }
+        if let Some(c) = &self.compressor {
+            return c.push(&self.session, data);
+        }
         self.session.lock().unwrap().body_content(data)
     }
 
@@ -347,6 +389,9 @@ impl HttpRequest {
         if self.phase != RequestPhase::BodyStreaming {
             return Err(HttpClientError::new("must call start_request_body first"));
         }
+        if let Some(c) = &self.compressor {
+            return c.on_writable(&self.session, cb);
+        }
         self.session.lock().unwrap().on_body_writable(cb);
         Ok(())
     }
@@ -356,7 +401,10 @@ impl HttpRequest {
         if self.phase != RequestPhase::BodyStreaming {
             return Err(HttpClientError::new("must call start_request_body first"));
         }
-        self.session.lock().unwrap().end_body()?;
+        match &self.compressor {
+            Some(c) => c.finish(&self.session)?,
+            None => self.session.lock().unwrap().end_body()?,
+        }
         self.phase = RequestPhase::Complete;
         Ok(())
     }
@@ -382,6 +430,8 @@ impl HttpRequest {
             headers: Headers::new(),
             phase: RequestPhase::Building,
             content_encoding: None,
+            origin: None,
+            compressor: None,
         }
     }
 }

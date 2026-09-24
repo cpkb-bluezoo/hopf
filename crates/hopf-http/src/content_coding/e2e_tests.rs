@@ -15,7 +15,7 @@ use hopf_core::{Runtime, RuntimeConfig};
 use super::tests::{decode, encode, plain, GOLDEN_BROTLI, GOLDEN_GZIP, GOLDEN_ZLIB};
 use super::*;
 use crate::{
-    ContentEncodingServerFactory, Headers, HttpClient, HttpClientSessionHandle,
+    Headers, HttpClient, HttpClientSessionHandle,
     HttpConnectionHandler, HttpLimits, HttpResponseHandler, HttpServer, ServerContentEncodingPolicy,
 };
 use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
@@ -103,6 +103,19 @@ impl ServerHandler for App {
                 });
                 return;
             }
+            (_, "/identity") => {
+                // Explicit instruction: the handler set Content-Encoding itself.
+                h.set("content-type", "text/plain");
+                h.set("content-encoding", "identity");
+                w.headers(h);
+                w.response_body_content(&text_body()[..5000]);
+            }
+            (_, "/notransform") => {
+                h.set("content-type", "text/plain");
+                h.set("cache-control", "public, no-transform");
+                w.headers(h);
+                w.response_body_content(&text_body()[..5000]);
+            }
             (_, "/small") => {
                 h.set("content-type", "text/plain");
                 h.set("content-length", "10");
@@ -140,10 +153,9 @@ impl ServerHandlerFactory for AppFactory {
 }
 
 fn start_server(rt: &Arc<Runtime>, policy: ServerContentEncodingPolicy) -> SocketAddr {
-    let factory: Arc<dyn ServerHandlerFactory> =
-        Arc::new(ContentEncodingServerFactory::new(Arc::new(AppFactory), policy));
     HttpServer::new()
-        .bind(rt, "127.0.0.1:0".parse().unwrap(), factory)
+        .content_encoding(policy)
+        .bind(rt, "127.0.0.1:0".parse().unwrap(), Arc::new(AppFactory))
         .unwrap()
         .0
 }
@@ -194,9 +206,14 @@ impl HttpResponseHandler for Rec {
     }
 }
 
+type Extra = Vec<(&'static str, &'static str)>;
+
 enum Job {
     Get(&'static str),
-    Post { path: &'static str, coding: Option<ContentCoding>, body: Vec<u8> },
+    GetWith(&'static str, Extra),
+    Post { path: &'static str, coding: Option<ContentCoding>, body: Vec<u8>, extra: Extra },
+    /// A large body streamed with short-write handling (compressed if the client decides so).
+    PostPumped { path: &'static str, body: Vec<u8> },
 }
 
 struct Conn {
@@ -211,8 +228,27 @@ impl HttpConnectionHandler for Conn {
             Job::Get(path) => {
                 session.get(path).send(Box::new(Rec(Arc::clone(&self.out)))).unwrap();
             }
-            Job::Post { path, coding, body } => {
+            Job::GetWith(path, extra) => {
+                let mut req = session.get(path);
+                for (n, v) in extra {
+                    req.header(n, v).unwrap();
+                }
+                req.send(Box::new(Rec(Arc::clone(&self.out)))).unwrap();
+            }
+            Job::PostPumped { path, body } => {
                 let mut req = session.post(path);
+                req.header("Content-Type", "text/plain").unwrap();
+                req.start_request_body(Box::new(Rec(Arc::clone(&self.out)))).unwrap();
+                pump(Arc::new(Mutex::new(Pump { req, body, off: 0 })));
+            }
+            Job::Post { path, coding, body, extra } => {
+                let mut req = session.post(path);
+                if !extra.iter().any(|(n, _)| n.eq_ignore_ascii_case("content-type")) {
+                    req.header("Content-Type", "text/plain").unwrap();
+                }
+                for (n, v) in extra {
+                    req.header(n, v).unwrap();
+                }
                 let wire = match coding {
                     Some(c) => {
                         req.header("Content-Encoding", c.token()).unwrap();
@@ -237,21 +273,60 @@ impl HttpConnectionHandler for Conn {
     }
 }
 
+struct Pump {
+    req: crate::HttpRequest,
+    body: Vec<u8>,
+    off: usize,
+}
+
+/// Feed `body` in 64 KiB pieces, resuming from `on_body_writable` after a
+/// short write - the documented way to stream a large request body.
+fn pump(state: Arc<Mutex<Pump>>) {
+    let mut g = state.lock().unwrap();
+    loop {
+        if g.off >= g.body.len() {
+            g.req.end_request_body().unwrap();
+            return;
+        }
+        let end = (g.off + 65_536).min(g.body.len());
+        let n = {
+            let Pump { req, body, off } = &mut *g;
+            req.request_body_content(&body[*off..end]).unwrap()
+        };
+        g.off += n;
+        if n == 0 {
+            let again = Arc::clone(&state);
+            g.req.on_body_writable(Box::new(move || pump(again))).unwrap();
+            return;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Proto {
     H1,
     H2,
 }
 
-fn run(rt: &Arc<Runtime>, addr: SocketAddr, proto: Proto, policy: Option<ContentEncodingPolicy>, job: Job) -> Outcome {
-    let out = Arc::new(Mutex::new(Outcome::default()));
+/// Client for `proto`: `None` turns content coding off, `Some` supplies the policy.
+fn client_for(addr: SocketAddr, proto: Proto, policy: Option<ContentEncodingPolicy>) -> HttpClient {
     let mut client = HttpClient::from_addr(addr);
     if let Proto::H2 = proto {
         client = client.h2_prior_knowledge(true);
     }
-    if let Some(p) = policy {
-        client = client.content_encoding(p);
+    match policy {
+        Some(p) => client.content_encoding(p),
+        None => client.disable_content_encoding(),
     }
+}
+
+fn run(rt: &Arc<Runtime>, addr: SocketAddr, proto: Proto, policy: Option<ContentEncodingPolicy>, job: Job) -> Outcome {
+    run_with(rt, &client_for(addr, proto, policy), job)
+}
+
+/// Run one job on `client` (reusing it shares its capability cache).
+fn run_with(rt: &Arc<Runtime>, client: &HttpClient, job: Job) -> Outcome {
+    let out = Arc::new(Mutex::new(Outcome::default()));
     client
         .connect(rt, Box::new(Conn { job: Some(job), out: Arc::clone(&out) }))
         .unwrap();
@@ -457,11 +532,11 @@ fn ineligible_responses_are_left_alone() {
 }
 
 #[test]
-fn client_without_a_policy_sees_the_raw_wire_body() {
+fn client_with_content_encoding_disabled_sees_the_raw_wire_body() {
     let rt = rt();
     let addr = start_server(&rt, server_policy());
-    // The client sends no Accept-Encoding of its own, so the server answers
-    // plain; with no policy nothing is added or altered.
+    // Disabled: no Accept-Encoding is sent, so the server answers plain and
+    // nothing is added or altered.
     let o = run(&rt, addr, Proto::H1, None, Job::Get("/text"));
     assert!(o.body == text_body());
     assert!(o.header("content-encoding").is_none());
@@ -494,7 +569,7 @@ fn server_decodes_content_coded_request_bodies() {
     let want = format!("len={} sum={}", body.len(), sum);
     for proto in [Proto::H1, Proto::H2] {
         for coding in [None, Some(ContentCoding::Gzip), Some(ContentCoding::Deflate), Some(ContentCoding::Brotli)] {
-            let o = run(&rt, addr, proto, None, Job::Post { path: "/echo", coding, body: body.clone() });
+            let o = run(&rt, addr, proto, None, Job::Post { path: "/echo", coding, body: body.clone(), extra: vec![] });
             assert_eq!(o.status, 200, "{proto:?} {coding:?}");
             assert_eq!(String::from_utf8_lossy(&o.body), want, "{proto:?} {coding:?}");
         }
@@ -646,6 +721,7 @@ fn stacked_response_codings_are_undone_in_reverse() {
 #[test]
 fn h3_round_trip_decodes_and_server_decodes_requests() {
     use crate::client::h3_session::connect_h3_session;
+    use crate::ContentEncodingServerFactory;
     use hopf_quic::{client_config_for_pem_bytes, server_config_self_signed, ALPN_H3};
 
     let (server_cfg, pem) = server_config_self_signed(&["localhost"], &[ALPN_H3]).unwrap();
@@ -708,7 +784,270 @@ fn h3_round_trip_decodes_and_server_decodes_requests() {
 
     let body = text_body()[..100_000].to_vec();
     let sum: u64 = body.iter().map(|&b| b as u64).sum();
-    let o = run_h3(None, Job::Post { path: "/echo", coding: Some(ContentCoding::Brotli), body: body.clone() });
+    let o = run_h3(None, Job::Post { path: "/echo", coding: Some(ContentCoding::Brotli), body: body.clone(), extra: vec![] });
     assert_eq!(String::from_utf8_lossy(&o.body), format!("len={} sum={}", body.len(), sum));
     server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Activation: defaults, opt-outs and capability learning
+// ---------------------------------------------------------------------------
+
+fn default_server(rt: &Arc<Runtime>) -> SocketAddr {
+    HttpServer::new()
+        .bind(rt, "127.0.0.1:0".parse().unwrap(), Arc::new(AppFactory))
+        .unwrap()
+        .0
+}
+
+#[test]
+fn default_server_and_client_need_no_configuration() {
+    let rt = rt();
+    let addr = default_server(&rt);
+    let want = text_body();
+
+    // Wire: the default server compresses for a client that accepts it, and
+    // prefers br over gzip.
+    let (head, body) = raw_get(addr, "/text", Some("gzip, br"));
+    assert!(head_has(&head, "content-encoding", "br"), "{head}");
+    assert!(decode(ContentCoding::Brotli, &dechunk(&body), 4096, 1 << 30).unwrap() == want);
+
+    // A default client (no content-coding calls at all) decodes transparently.
+    for proto in [Proto::H1, Proto::H2] {
+        let mut client = HttpClient::from_addr(addr);
+        if let Proto::H2 = proto {
+            client = client.h2_prior_knowledge(true);
+        }
+        let o = run_with(&rt, &client, Job::Get("/text"));
+        assert!(o.failed.is_none(), "{proto:?}: {:?}", o.failed);
+        assert!(o.body == want, "{proto:?}");
+        assert!(o.header("content-encoding").is_none(), "{proto:?}");
+    }
+}
+
+#[test]
+fn responses_advertise_the_codings_the_server_accepts_in_requests() {
+    let rt = rt();
+    let addr = default_server(&rt);
+    for path in ["/text", "/small", "/binary"] {
+        let (head, _) = raw_get(addr, path, None);
+        assert!(head_has(&head, "accept-encoding", "br, gzip, deflate"), "{path}: {head}");
+    }
+    // Not when request decoding is off.
+    let addr = start_server(&rt, server_policy().decode_requests(false));
+    let (head, _) = raw_get(addr, "/small", None);
+    assert!(head_lacks(&head, "accept-encoding"), "{head}");
+}
+
+#[test]
+fn handler_opts_out_with_explicit_content_encoding_or_no_transform() {
+    let rt = rt();
+    let addr = default_server(&rt);
+    for path in ["/identity", "/notransform"] {
+        let (head, body) = raw_get(addr, path, Some("br, gzip"));
+        assert!(head_lacks(&head, "vary"), "{path}: {head}");
+        assert!(!head_has(&head, "content-encoding", "br") && !head_has(&head, "content-encoding", "gzip"), "{path}: {head}");
+        assert_eq!(dechunk(&body), &text_body()[..5000], "{path}: body must be untouched");
+    }
+}
+
+#[test]
+fn disabled_server_touches_nothing() {
+    let rt = rt();
+    let addr = HttpServer::new()
+        .disable_content_encoding()
+        .bind(&rt, "127.0.0.1:0".parse().unwrap(), Arc::new(AppFactory))
+        .unwrap()
+        .0;
+    let (head, body) = raw_get(addr, "/text", Some("br, gzip"));
+    assert!(head_lacks(&head, "content-encoding"), "{head}");
+    assert!(head_lacks(&head, "vary"), "{head}");
+    assert!(head_lacks(&head, "accept-encoding"), "{head}");
+    assert!(dechunk(&body) == text_body());
+}
+
+// --- a raw peer that records exactly what the client put on the wire -----------
+
+struct Captured {
+    head: String,
+    /// Body with any chunked framing removed.
+    body: Vec<u8>,
+}
+
+/// Serve one request per connection, recording each. `replies[i]` is the
+/// status and optional `Accept-Encoding` header for the i-th request.
+fn capture_server(replies: Vec<(u16, Option<&'static str>)>) -> (SocketAddr, Arc<Mutex<Vec<Captured>>>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for (status, ae) in replies {
+            let Ok((mut s, _)) = l.accept() else { return };
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let cap = read_request(&mut s);
+            seen2.lock().unwrap().push(cap);
+            let ae = ae.map(|v| format!("Accept-Encoding: {v}\r\n")).unwrap_or_default();
+            let _ = write!(s, "HTTP/1.1 {status} X\r\nContent-Length: 2\r\n{ae}\r\nok");
+        }
+    });
+    (addr, seen)
+}
+
+fn read_request(s: &mut TcpStream) -> Captured {
+    let mut all = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        if let Some(p) = all.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&all[..p + 4]).to_string();
+            let body = &all[p + 4..];
+            let chunked = head_has(&head, "transfer-encoding", "chunked");
+            let len = head
+                .lines()
+                .find_map(|l| l.split_once(':').filter(|(n, _)| n.eq_ignore_ascii_case("content-length")))
+                .and_then(|(_, v)| v.trim().parse::<usize>().ok());
+            if chunked && body.ends_with(b"0\r\n\r\n") {
+                return Captured { head, body: dechunk(body) };
+            }
+            if !chunked && len.is_none() {
+                return Captured { head, body: Vec::new() };
+            }
+            if let Some(n) = len.filter(|n| body.len() >= *n && !chunked) {
+                return Captured { head, body: body[..n].to_vec() };
+            }
+        }
+        let n = s.read(&mut buf).expect("capture server read");
+        assert!(n > 0, "client closed mid-request");
+        all.extend_from_slice(&buf[..n]);
+    }
+}
+
+fn post(rt: &Arc<Runtime>, client: &HttpClient, body: &[u8], extra: Extra) -> Outcome {
+    run_with(
+        rt,
+        client,
+        Job::Post { path: "/up", coding: None, body: body.to_vec(), extra },
+    )
+}
+
+#[test]
+fn request_bodies_are_compressed_only_once_the_origin_advertises_support() {
+    let rt = rt();
+    let (addr, seen) = capture_server(vec![(200, Some("gzip, br")); 4]);
+    let body = text_body()[..50_000].to_vec();
+    let client = HttpClient::from_addr(addr);
+
+    // Nothing is known about this origin yet: sent as is.
+    post(&rt, &client, &body, vec![]);
+    // Its first response advertised gzip and br: now compressed, br preferred.
+    post(&rt, &client, &body, vec![]);
+    // An explicit Content-Encoding (identity too) is never overridden.
+    post(&rt, &client, &body, vec![("Content-Encoding", "identity")]);
+    // A client with a fresh cache knows nothing again.
+    post(&rt, &HttpClient::from_addr(addr), &body, vec![]);
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4);
+
+    assert!(head_lacks(&seen[0].head, "content-encoding"), "{}", seen[0].head);
+    assert!(seen[0].body == body);
+
+    assert!(head_has(&seen[1].head, "content-encoding", "br"), "{}", seen[1].head);
+    assert!(head_lacks(&seen[1].head, "content-length"), "{}", seen[1].head);
+    assert!(seen[1].body.len() * 5 < body.len(), "not compressed: {} bytes", seen[1].body.len());
+    assert!(decode(ContentCoding::Brotli, &seen[1].body, 4096, 1 << 30).unwrap() == body);
+
+    assert!(head_has(&seen[2].head, "content-encoding", "identity"), "{}", seen[2].head);
+    assert!(seen[2].body == body, "explicit identity must be sent untouched");
+
+    assert!(head_lacks(&seen[3].head, "content-encoding"), "{}", seen[3].head);
+    assert!(seen[3].body == body);
+}
+
+#[test]
+fn only_a_coding_the_origin_advertised_is_used_and_small_or_binary_bodies_are_left() {
+    let rt = rt();
+    let (addr, seen) = capture_server(vec![(200, Some("deflate")); 4]);
+    let client = HttpClient::from_addr(addr);
+    let body = text_body()[..50_000].to_vec();
+    post(&rt, &client, &body, vec![]); // learn: deflate only
+    post(&rt, &client, &body, vec![]); // deflate, though br is preferred locally
+    post(&rt, &client, &body[..100], vec![("Content-Length", "100")]); // declared tiny
+    post(&rt, &client, &body, vec![("Content-Type", "image/png")]); // not compressible
+    let seen = seen.lock().unwrap();
+    assert!(head_has(&seen[1].head, "content-encoding", "deflate"), "{}", seen[1].head);
+    assert!(decode(ContentCoding::Deflate, &seen[1].body, 4096, 1 << 30).unwrap() == body);
+    assert!(head_lacks(&seen[2].head, "content-encoding"), "{}", seen[2].head);
+    assert!(head_lacks(&seen[3].head, "content-encoding"), "{}", seen[3].head);
+}
+
+#[test]
+fn a_415_teaches_a_capability_and_a_bare_415_unlearns_it() {
+    let rt = rt();
+    let (addr, seen) = capture_server(vec![
+        (415, Some("gzip")), // learn: gzip
+        (200, None),         // request 2 is compressed and accepted
+        (415, None),         // request 3 is compressed and refused, no capability named
+        (200, None),         // request 4: back to unknown
+    ]);
+    let client = HttpClient::from_addr(addr);
+    let body = text_body()[..50_000].to_vec();
+    for _ in 0..4 {
+        post(&rt, &client, &body, vec![]);
+    }
+    let seen = seen.lock().unwrap();
+    assert!(head_lacks(&seen[0].head, "content-encoding"));
+    assert!(head_has(&seen[1].head, "content-encoding", "gzip"), "{}", seen[1].head);
+    assert!(head_has(&seen[2].head, "content-encoding", "gzip"), "{}", seen[2].head);
+    assert!(head_lacks(&seen[3].head, "content-encoding"), "{}", seen[3].head);
+}
+
+#[test]
+fn a_seeded_cache_lets_the_first_request_compress() {
+    let rt = rt();
+    let (addr, seen) = capture_server(vec![(200, None)]);
+    let cache = Arc::new(ContentCodingCache::new());
+    cache.put(&addr.ip().to_string(), addr.port(), vec![ContentCoding::Gzip]);
+    let client = HttpClient::from_addr(addr).coding_cache(cache);
+    let body = text_body()[..50_000].to_vec();
+    post(&rt, &client, &body, vec![]);
+    let seen = seen.lock().unwrap();
+    assert!(head_has(&seen[0].head, "content-encoding", "gzip"), "{}", seen[0].head);
+}
+
+#[test]
+fn accept_encoding_is_not_sent_for_range_requests_or_by_a_disabled_client() {
+    let rt = rt();
+    let (addr, seen) = capture_server(vec![(200, None); 3]);
+    run_with(&rt, &HttpClient::from_addr(addr), Job::GetWith("/", vec![("Range", "bytes=0-5")]));
+    run_with(&rt, &HttpClient::from_addr(addr), Job::Get("/"));
+    run_with(&rt, &HttpClient::from_addr(addr).disable_content_encoding(), Job::Get("/"));
+    let seen = seen.lock().unwrap();
+    assert!(head_lacks(&seen[0].head, "accept-encoding"), "Range: {}", seen[0].head);
+    assert!(head_has(&seen[1].head, "accept-encoding", "br, gzip, deflate, identity;q=0.5"), "{}", seen[1].head);
+    assert!(head_lacks(&seen[2].head, "accept-encoding"), "disabled: {}", seen[2].head);
+}
+
+#[test]
+fn a_large_request_body_streams_compressed_to_a_hopf_server() {
+    let rt = rt();
+    let addr = default_server(&rt);
+    // 6 MB of compressible text pushed with short-write handling.
+    let mut body = Vec::new();
+    while body.len() < 6 * 1024 * 1024 {
+        body.extend_from_slice(&text_body());
+    }
+    let sum: u64 = body.iter().map(|&b| b as u64).sum();
+    let want = format!("len={} sum={}", body.len(), sum);
+    for proto in [Proto::H1, Proto::H2] {
+        let mut client = HttpClient::from_addr(addr);
+        if let Proto::H2 = proto {
+            client = client.h2_prior_knowledge(true);
+        }
+        // Any response teaches the client this origin takes br/gzip/deflate.
+        run_with(&rt, &client, Job::Get("/small"));
+        let o = run_with(&rt, &client, Job::PostPumped { path: "/echo", body: body.clone() });
+        assert!(o.failed.is_none(), "{proto:?}: {:?}", o.failed);
+        assert_eq!(String::from_utf8_lossy(&o.body), want, "{proto:?}");
+    }
 }

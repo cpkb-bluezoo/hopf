@@ -5,5 +5,6 @@
 mod content_encoding;
 mod facade;
 
-pub use content_encoding::{CompressibleFn, ContentEncodingServerFactory, ServerContentEncodingPolicy};
+pub use crate::content_coding::CompressibleFn;
+pub use content_encoding::{ContentEncodingServerFactory, ServerContentEncodingPolicy};
 pub use facade::HttpServer;

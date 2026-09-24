@@ -259,16 +259,24 @@ conn_handle.poke();</code></pre>
 </tbody>
 </table>
 <h2 id="content-encoding">Content-Encoding (br, gzip, deflate)</h2>
-<p>Opt in with <code>ContentEncodingPolicy</code> and the handler receives <em>decoded</em> body bytes on HTTP/1.1, HTTP/2 and HTTP/3. Set it on the whole client (<code>HttpClient::content_encoding</code>, which also covers <code>fetch</code> and its redirect hops), a session (<code>HttpClientSessionHandle::content_encoding</code>) or one request (<code>HttpRequest::content_encoding</code>). Off by default: without a policy nothing is added or altered.</p>
+<p><code>HttpClient</code> applies content coding <strong>by default</strong> on every request made through <code>connect</code> or <code>fetch</code>, on HTTP/1.1, HTTP/2 and HTTP/3. Turn it off with <code>HttpClient::disable_content_encoding()</code>, or tune it by passing a <code>ContentEncodingPolicy</code> to <code>HttpClient::content_encoding</code>, <code>HttpClientSessionHandle::content_encoding</code> or <code>HttpRequest::content_encoding</code>. The low-level <code>ClientHandler</code> SPI is unaffected and always sees the wire bytes.</p>
+<h3 id="ce-responses">Responses: always ask, always decode</h3>
 <ul>
-<li><strong>Request:</strong> <code>Accept-Encoding</code> is added from the policy (<code>br, gzip, deflate, identity;q=0.5</code> by default) unless the request already set one.</li>
+<li><strong>Request:</strong> <code>Accept-Encoding: br, gzip, deflate, identity;q=0.5</code> is added unless you set one yourself. It is left off for <code>Range</code>/<code>If-Range</code> requests, <code>CONNECT</code> and upgrades.</li>
 <li><strong>Response headers:</strong> when a body is decoded, <code>Content-Encoding</code> and <code>Content-Length</code> are <em>removed</em> from the headers the handler sees (they describe the coded body it never receives). Every other header, the trailers and the status pass through unchanged. A response with no body (HEAD, 204, 304, empty) is forwarded untouched.</li>
 <li><strong>Streaming:</strong> decoding is an incremental push state machine with one fixed 16 KiB scratch buffer plus the coding&#8217;s window, so memory does not grow with the body and a body split into 1-byte segments decodes identically. Stacked codings (<code>gzip, br</code>) are undone in reverse order.</li>
-<li><strong>Fail closed:</strong> an unknown coding, a corrupt or truncated stream, or decoded output past <code>HttpLimits::max_decoded_body</code> (default 64 MiB; a per-policy override exists) ends the request through <code>HttpResponseHandler::failed</code> with <code>InvalidData</code>, and no further body bytes are delivered.</li>
-<li><strong>Codings:</strong> <code>br</code> (RFC 7932), <code>gzip</code> (RFC 1952, including concatenated members; <code>x-gzip</code> accepted) and <code>deflate</code> (zlib per RFC 9110; a bare RFC 1951 stream is also accepted, as many peers send one).</li>
+<li><strong>Fail closed:</strong> an unknown coding, a corrupt or truncated stream, or decoded output past <code>HttpLimits::max_decoded_body</code> (default 64 MiB) ends the request through <code>HttpResponseHandler::failed</code> with <code>InvalidData</code>, and no further body bytes are delivered.</li>
 </ul>
-<p>The codec layer is public as <code>hopf_http::{Decoder, Encoder, ContentCoding}</code> (push <code>&amp;[u8]</code> in, receive output through a sink) for anything that needs to compress or decompress outside an HTTP exchange. <code>Encoder::flush</code> forces out everything pushed so far without ending the stream.</p>
-<p>Compressing <em>request</em> bodies from the client is not built in: set <code>Content-Encoding</code> yourself and push the body through an <code>Encoder</code> before <code>request_body_content</code>.</p>
+<h3 id="ce-requests">Request bodies: only where the server is known to accept them</h3>
+<p>HTTP has no request-side negotiation, so the client never guesses. It records, per origin, the codings a server accepts in requests, in a <code>ContentCodingCache</code>:</p>
+<ul>
+<li><strong>Learned from</strong> an <code>Accept-Encoding</code> header on any response from that origin (RFC 9110 &#167;12.5.3), including a <code>415</code> that names what it accepts. A <code>415</code> that names nothing clears the entry. hopf servers send it on every response.</li>
+<li><strong>Unknown origin means uncompressed.</strong> The first request to a server that has not advertised anything goes out plain. Entries expire after an hour. Share a cache between clients with <code>HttpClient::coding_cache</code>, which also lets you pre-seed a server you know.</li>
+<li><strong>When it compresses:</strong> the body has a compressible <code>Content-Type</code> (text, JSON, XML and similar), is not declared shorter than 256 bytes, and the origin advertised a coding we also support (best of <code>br</code>, <code>gzip</code>, <code>deflate</code>). <code>Content-Encoding</code> is set and <code>Content-Length</code> removed, so the request is sent chunked on HTTP/1.1.</li>
+<li><strong>Opting out:</strong> set <code>Content-Encoding</code> yourself on the request. Any value, <code>identity</code> included, means the body is sent exactly as you give it.</li>
+<li><strong>Backpressure:</strong> compression is streamed. <code>request_body_content</code> reports a short write while a small backlog is still draining, and <code>on_body_writable</code> works as documented above.</li>
+</ul>
+<p>The codec layer is public as <code>hopf_http::{Decoder, Encoder, ContentCoding}</code> (push <code>&amp;[u8]</code> in, receive output through a sink) for compressing or decompressing outside an HTTP exchange. <code>Encoder::flush</code> forces out everything pushed so far without ending the stream.</p>
 <h2 id="dial-patterns">Dial patterns</h2>
 <p>Listen and dial are peers: the same Stream SPI runs under a <code>TcpConnectorConfig</code> factory or H3 <code>connect_h3</code>. Prefer <code>connect_http</code> when the peer is a hostname (async DNS + connect timeouts).</p>
 <h3 id="connect_http-hostname">connect_http (hostname or literal)</h3>

@@ -16,10 +16,14 @@
 //! version; see [`crate::client`] and [`crate::server`] for the decorators.
 
 mod brotli_codec;
+mod cache;
 mod gzip;
+
+pub use cache::ContentCodingCache;
 
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 
 use crate::limits::HttpLimits;
 use brotli_codec::{BrotliDecoder, BrotliEncoder};
@@ -139,34 +143,93 @@ pub fn parse_content_encoding(value: &str) -> Result<Vec<ContentCoding>, CodingE
     Ok(out)
 }
 
-/// Client-side policy: which codings to advertise in `Accept-Encoding` and
-/// decode, and the decoded-size cap.
+/// Predicate deciding whether a `Content-Type` is worth compressing. It
+/// receives the field value with parameters (`; charset=...`) stripped.
+pub type CompressibleFn = dyn Fn(&str) -> bool + Send + Sync;
+
+/// `text/*`, JSON, XML, JavaScript, SVG and `+json` / `+xml` suffix types.
+pub(crate) fn default_compressible(ct: &str) -> bool {
+    let ct = ct.trim().to_ascii_lowercase();
+    ct.starts_with("text/")
+        || ct.ends_with("+json")
+        || ct.ends_with("+xml")
+        || matches!(
+            ct.as_str(),
+            "application/json"
+                | "application/xml"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/xhtml+xml"
+                | "application/wasm"
+                | "image/svg+xml"
+        )
+}
+
+/// Every coding this crate can decode, best first.
+pub(crate) const ALL_CODINGS: [ContentCoding; 3] =
+    [ContentCoding::Brotli, ContentCoding::Gzip, ContentCoding::Deflate];
+
+/// Client-side content-coding policy.
 ///
-/// Set it on a request ([`crate::HttpRequest::content_encoding`]), a session
-/// ([`crate::HttpClientSessionHandle::content_encoding`]) or a whole client
-/// ([`crate::HttpClient::content_encoding`]). With a policy in force the
-/// handler receives *decoded* body bytes; see
-/// [`DecodingResponseHandler`](crate::client::DecodingResponseHandler) for
-/// exactly what happens to the `Content-Encoding` and `Content-Length`
-/// headers.
-#[derive(Debug, Clone)]
+/// The high-level [`HttpClient`](crate::HttpClient) applies one by default,
+/// so unless you say otherwise it:
+///
+/// - **decodes responses**: advertises `Accept-Encoding` (except on `Range`
+///   requests, `CONNECT` and upgrades) and hands the handler decoded bytes;
+///   see [`DecodingResponseHandler`](crate::client::DecodingResponseHandler)
+///   for the header rules; and
+/// - **compresses request bodies** only for an origin that has advertised
+///   support, learned into a [`ContentCodingCache`] from `Accept-Encoding`
+///   on its responses. An origin nothing is known about gets an
+///   uncompressed body. A request that already carries a `Content-Encoding`
+///   header (any value, `identity` included) is sent exactly as the caller
+///   built it. Only bodies of a compressible type, and at least
+///   [`min_request_length`](Self::min_request_length) when the length is
+///   declared, are compressed.
+///
+/// Turn it off with [`HttpClient::disable_content_encoding`](crate::HttpClient::disable_content_encoding),
+/// or tune it and pass it to [`HttpClient::content_encoding`](crate::HttpClient::content_encoding),
+/// [`HttpClientSessionHandle::content_encoding`](crate::HttpClientSessionHandle::content_encoding)
+/// or [`HttpRequest::content_encoding`](crate::HttpRequest::content_encoding).
+#[derive(Clone)]
 pub struct ContentEncodingPolicy {
     accept: Vec<ContentCoding>,
     max_decoded: u64,
+    cache: Arc<ContentCodingCache>,
+    compress_requests: bool,
+    min_length: u64,
+    compressible: Arc<CompressibleFn>,
+}
+
+impl std::fmt::Debug for ContentEncodingPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContentEncodingPolicy")
+            .field("accept", &self.accept)
+            .field("max_decoded", &self.max_decoded)
+            .field("compress_requests", &self.compress_requests)
+            .field("min_length", &self.min_length)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ContentEncodingPolicy {
-    /// Accept `br`, `gzip` and `deflate`, capping decoded bodies at
-    /// [`HttpLimits::max_decoded_body`].
+    /// Accept `br`, `gzip` and `deflate` (in that order of preference) for
+    /// both directions, capping decoded bodies at
+    /// [`HttpLimits::max_decoded_body`]. Request compression requires the
+    /// origin's capability to be learned first.
     pub fn new(limits: &HttpLimits) -> Self {
         Self {
-            accept: vec![ContentCoding::Brotli, ContentCoding::Gzip, ContentCoding::Deflate],
+            accept: ALL_CODINGS.to_vec(),
             max_decoded: limits.max_decoded_body as u64,
+            cache: Arc::new(ContentCodingCache::new()),
+            compress_requests: true,
+            min_length: 256,
+            compressible: Arc::new(default_compressible),
         }
     }
 
-    /// Replace the advertised codings (most preferred first). `identity`
-    /// entries are ignored.
+    /// Replace the codings used, most preferred first, for `Accept-Encoding`
+    /// and for compressing requests. `identity` entries are ignored.
     pub fn accept(mut self, codings: &[ContentCoding]) -> Self {
         self.accept = codings
             .iter()
@@ -182,6 +245,37 @@ impl ContentEncodingPolicy {
         self
     }
 
+    /// Use this capability cache (share one between clients or pre-seed it).
+    pub fn cache(mut self, cache: Arc<ContentCodingCache>) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// Whether to compress request bodies for origins known to accept it
+    /// (default on).
+    pub fn compress_requests(mut self, on: bool) -> Self {
+        self.compress_requests = on;
+        self
+    }
+
+    /// Skip request compression when the body's declared `Content-Length` is
+    /// below this (default 256). A body of unknown length is always eligible.
+    pub fn min_request_length(mut self, bytes: u64) -> Self {
+        self.min_length = bytes;
+        self
+    }
+
+    /// Replace the compressible-`Content-Type` test used for requests.
+    pub fn compressible(mut self, f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        self.compressible = Arc::new(f);
+        self
+    }
+
+    /// The capability cache this policy reads and writes.
+    pub fn capability_cache(&self) -> &Arc<ContentCodingCache> {
+        &self.cache
+    }
+
     /// The `Accept-Encoding` field value this policy advertises.
     pub fn accept_encoding_value(&self) -> String {
         if self.accept.is_empty() {
@@ -194,6 +288,32 @@ impl ContentEncodingPolicy {
 
     pub(crate) fn max_decoded(&self) -> u64 {
         self.max_decoded
+    }
+
+    pub(crate) fn cache_arc(&self) -> &Arc<ContentCodingCache> {
+        &self.cache
+    }
+
+    /// The coding to compress a request body with, or `None`.
+    pub(crate) fn request_coding(
+        &self,
+        origin: Option<(&str, u16)>,
+        content_type: Option<&str>,
+        content_length: Option<u64>,
+    ) -> Option<ContentCoding> {
+        if !self.compress_requests {
+            return None;
+        }
+        let (host, port) = origin?;
+        let known = self.cache.get(host, port)?;
+        let ct = content_type?.split(';').next().unwrap_or("");
+        if !(self.compressible)(ct) {
+            return None;
+        }
+        if content_length.is_some_and(|n| n < self.min_length) {
+            return None;
+        }
+        self.accept.iter().copied().find(|c| known.contains(c))
     }
 }
 
@@ -404,16 +524,12 @@ impl Encoder {
     }
 }
 
-/// Pick a coding from an `Accept-Encoding` field value, in the server's
-/// preference order.
+/// Every coding in `candidates` an `Accept-Encoding` field value allows, in
+/// `candidates` order.
 ///
-/// Honours `q=0` (explicitly refused) and a `*` wildcard. Returns the first
-/// of `preference` the client accepts, or `None` when only `identity`
-/// remains (send the body uncompressed).
-pub fn negotiate_accept_encoding(
-    accept_encoding: &str,
-    preference: &[ContentCoding],
-) -> Option<ContentCoding> {
+/// Honours `q=0` (explicitly refused) and a `*` wildcard; `identity` is
+/// never returned.
+pub fn acceptable_codings(accept_encoding: &str, candidates: &[ContentCoding]) -> Vec<ContentCoding> {
     let mut wildcard: Option<bool> = None;
     let mut explicit: Vec<(ContentCoding, bool)> = Vec::new();
     for item in accept_encoding.split(',') {
@@ -435,15 +551,29 @@ pub fn negotiate_accept_encoding(
             explicit.push((c, allowed));
         }
     }
-    preference.iter().copied().find(|&c| {
-        c != ContentCoding::Identity
-            && explicit
-                .iter()
-                .find(|(e, _)| *e == c)
-                .map(|(_, a)| *a)
-                .or(wildcard)
-                .unwrap_or(false)
-    })
+    candidates
+        .iter()
+        .copied()
+        .filter(|&c| {
+            c != ContentCoding::Identity
+                && explicit
+                    .iter()
+                    .find(|(e, _)| *e == c)
+                    .map(|(_, a)| *a)
+                    .or(wildcard)
+                    .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Pick a coding from an `Accept-Encoding` field value, in the server's
+/// preference order, or `None` when only `identity` remains (send the body
+/// uncompressed). See [`acceptable_codings`] for the matching rules.
+pub fn negotiate_accept_encoding(
+    accept_encoding: &str,
+    preference: &[ContentCoding],
+) -> Option<ContentCoding> {
+    acceptable_codings(accept_encoding, preference).into_iter().next()
 }
 
 #[cfg(test)]

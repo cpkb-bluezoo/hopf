@@ -76,8 +76,8 @@ pub use h3::{
     SETTINGS_H3_DATAGRAM,
 };
 pub use content_coding::{
-    negotiate_accept_encoding, parse_content_encoding, CodingError, ContentCoding,
-    ContentEncodingPolicy, Decoder, Encoder,
+    acceptable_codings, negotiate_accept_encoding, parse_content_encoding, CodingError,
+    ContentCodingCache, ContentCoding, ContentEncodingPolicy, Decoder, Encoder,
 };
 pub use headers::{Header, Headers};
 pub use limits::HttpLimits;

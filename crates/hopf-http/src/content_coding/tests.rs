@@ -280,3 +280,35 @@ fn accept_encoding_negotiation() {
     assert_eq!(negotiate_accept_encoding("zstd", &pref), None);
     assert_eq!(negotiate_accept_encoding("gzip;q=0.5, br;q=0", &pref), Some(Gzip));
 }
+
+#[test]
+fn capability_cache_learns_expires_and_forgets() {
+    use std::time::Duration;
+    let cache = ContentCodingCache::new();
+    assert_eq!(cache.get("Example.test", 80), None);
+    cache.put("Example.test", 80, vec![ContentCoding::Gzip]);
+    assert_eq!(cache.get("example.test", 80), Some(vec![ContentCoding::Gzip]), "host is case-insensitive");
+    assert_eq!(cache.get("example.test", 8080), None, "port is part of the origin");
+    // Known to accept nothing is distinct from unknown.
+    cache.put("none.test", 80, vec![]);
+    assert_eq!(cache.get("none.test", 80), Some(vec![]));
+    cache.forget("example.test", 80);
+    assert_eq!(cache.get("example.test", 80), None);
+
+    let short = ContentCodingCache::with_ttl(Duration::from_millis(20));
+    short.put("a.test", 1, vec![ContentCoding::Brotli]);
+    assert!(short.get("a.test", 1).is_some());
+    std::thread::sleep(Duration::from_millis(40));
+    assert_eq!(short.get("a.test", 1), None, "expired entries are unknown again");
+}
+
+#[test]
+fn acceptable_codings_lists_all_allowed_in_candidate_order() {
+    use ContentCoding::*;
+    let all = [Brotli, Gzip, Deflate];
+    assert_eq!(acceptable_codings("gzip, br", &all), [Brotli, Gzip]);
+    assert_eq!(acceptable_codings("*", &all), [Brotli, Gzip, Deflate]);
+    assert_eq!(acceptable_codings("*, gzip;q=0", &all), [Brotli, Deflate]);
+    assert!(acceptable_codings("identity", &all).is_empty());
+    assert!(acceptable_codings("", &all).is_empty());
+}

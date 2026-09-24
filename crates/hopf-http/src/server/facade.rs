@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use hopf_core::{BindingId, ProtocolHandler, Runtime, SharedTlsAcceptor, TcpListenerConfig};
 
-use crate::{AlpnHttpEndpoint, CleartextHttpEndpoint, HttpLimits, ServerHandlerFactory};
+use crate::{
+    AlpnHttpEndpoint, CleartextHttpEndpoint, ContentEncodingServerFactory, HttpLimits,
+    ServerContentEncodingPolicy, ServerHandlerFactory,
+};
 
 /// Async HTTP server: picks the cleartext (h2c prior-knowledge + Upgrade +
 /// HTTP/1.1) or TLS (ALPN `h2`/`http/1.1`) endpoint per listener based on
@@ -23,6 +26,20 @@ use crate::{AlpnHttpEndpoint, CleartextHttpEndpoint, HttpLimits, ServerHandlerFa
 pub struct HttpServer {
     limits: HttpLimits,
     tls_acceptor: Option<SharedTlsAcceptor>,
+    content_encoding: ContentEncodingSetting,
+}
+
+/// How [`HttpServer`] applies content coding.
+#[derive(Default)]
+enum ContentEncodingSetting {
+    /// Compress eligible responses and decode request bodies, using
+    /// [`ServerContentEncodingPolicy::new`] with this server's limits.
+    #[default]
+    Default,
+    /// A caller-supplied policy.
+    Custom(ServerContentEncodingPolicy),
+    /// Leave every body exactly as the handler wrote / the peer sent it.
+    Off,
 }
 
 impl HttpServer {
@@ -34,6 +51,27 @@ impl HttpServer {
     /// Override [`HttpLimits`].
     pub fn limits(mut self, limits: HttpLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Replace the default content-coding policy (see
+    /// [`Self::disable_content_encoding`] for what the default does).
+    pub fn content_encoding(mut self, policy: ServerContentEncodingPolicy) -> Self {
+        self.content_encoding = ContentEncodingSetting::Custom(policy);
+        self
+    }
+
+    /// Turn content coding off entirely.
+    ///
+    /// By default every handler is wrapped in a [`ContentEncodingServerFactory`]:
+    /// responses are compressed (`br`, then `gzip`, then `deflate`, whichever
+    /// the client's `Accept-Encoding` allows) when that is safe, and
+    /// `Content-Encoding` request bodies are decoded before the handler sees
+    /// them. A handler opts a response out by setting `Content-Encoding`
+    /// itself (`identity` will do) or `Cache-Control: no-transform`. See
+    /// [`ContentEncodingServerFactory`] for the exact rules.
+    pub fn disable_content_encoding(mut self) -> Self {
+        self.content_encoding = ContentEncodingSetting::Off;
         self
     }
 
@@ -55,6 +93,16 @@ impl HttpServer {
         factory: Arc<dyn ServerHandlerFactory>,
     ) -> io::Result<(SocketAddr, BindingId)> {
         let limits = self.limits;
+        let factory: Arc<dyn ServerHandlerFactory> = match &self.content_encoding {
+            ContentEncodingSetting::Off => factory,
+            ContentEncodingSetting::Custom(p) => {
+                Arc::new(ContentEncodingServerFactory::new(factory, p.clone()))
+            }
+            ContentEncodingSetting::Default => Arc::new(ContentEncodingServerFactory::new(
+                factory,
+                ServerContentEncodingPolicy::new(&limits),
+            )),
+        };
         let config = if let Some(acceptor) = &self.tls_acceptor {
             let acceptor = Arc::clone(acceptor);
             TcpListenerConfig::new(addr, move || {
