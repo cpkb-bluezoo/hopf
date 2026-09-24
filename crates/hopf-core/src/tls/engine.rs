@@ -1692,6 +1692,17 @@ impl HandshakeEngine {
             .map_or(MAX_RECORD_SIZE_LIMIT_13, |l| l.clamp(MIN_RECORD_SIZE_LIMIT, MAX_RECORD_SIZE_LIMIT_13))
     }
 
+    /// Set the ALPN protocol names (RFC 7301), as [`HandshakeConfig::alpn`]
+    /// does. Only possible before the handshake has started; returns whether
+    /// it took effect.
+    pub fn set_alpn(&mut self, protocols: Vec<Bytes>) -> bool {
+        if self.state != State::Initial {
+            return false;
+        }
+        self.config.alpn = protocols;
+        true
+    }
+
     /// Set the `record_size_limit` (RFC 8449) to advertise, as
     /// [`HandshakeConfig::record_size_limit`] does. Only possible before the
     /// handshake has started; returns whether it took effect.
@@ -1936,7 +1947,7 @@ impl<S: TlsEventSink> HandshakeEvents for EngineCodecBridge<'_, S> {
 /// RFC 7301 §3.2: the first of the server's own preferences that the client
 /// also offered — `None` (not a unilateral server pick) when the client
 /// offered no ALPN extension at all, or none of its offers matched.
-fn pick_alpn(client: &[Bytes], server: &[Bytes]) -> Option<Bytes> {
+pub(crate) fn pick_alpn(client: &[Bytes], server: &[Bytes]) -> Option<Bytes> {
     server.iter().find(|s| client.contains(s)).cloned()
 }
 

@@ -40,7 +40,7 @@ use crate::crypto::trust::TrustStore;
 use crate::crypto::x509::parse_certificate;
 use crate::security::SecurityInfo;
 
-use super::super::engine::{ClientAuthPolicy, ServerCredentials};
+use super::super::engine::{pick_alpn, ClientAuthPolicy, ServerCredentials};
 use super::super::handshake::verify::{pkcs8_key_kind, KeyKind};
 use super::super::sink::{AlertDescription, TlsProtocolError, VerifyRequest, VerifyResult};
 use super::super::ticket_keys::TicketKeys;
@@ -228,6 +228,12 @@ pub struct Config {
     /// no cookie round trip) leaves [`Self::hash_message`]'s behaviour
     /// unchanged from a plain fresh count.
     pub dtls_initial_seq: (u16, u16),
+    /// ALPN protocol names (RFC 7301), in preference order. A client offers
+    /// them all; a server selects the first of *its own* that the client also
+    /// offered. Empty (the default) sends and answers nothing, so no protocol
+    /// is negotiated and the handshake is unchanged from before ALPN existed.
+    /// The result is [`SecurityInfo::alpn`].
+    pub alpn: Vec<Bytes>,
 }
 
 impl Default for Config {
@@ -246,6 +252,7 @@ impl Default for Config {
             cookie: Bytes::new(),
             fixed_client_random: None,
             dtls_initial_seq: (0, 0),
+            alpn: Vec::new(),
         }
     }
 }
@@ -530,6 +537,17 @@ impl Tls12Engine {
         self.transcript.add_message(&dtls_wire);
     }
 
+    /// Set the ALPN protocol names (RFC 7301), as [`Config::alpn`] does. Only
+    /// possible before the handshake has started; returns whether it took
+    /// effect.
+    pub fn set_alpn(&mut self, protocols: Vec<Bytes>) -> bool {
+        if self.state != State::Initial {
+            return false;
+        }
+        self.config.alpn = protocols;
+        true
+    }
+
     /// Begin the handshake — client emits `ClientHello`; server waits for input.
     pub fn start<S: Tls12EventSink>(&mut self, sink: &mut S) {
         if self.state != State::Initial || self.config.role != Role::Client {
@@ -570,6 +588,7 @@ impl Tls12Engine {
             cipher_suites: SUPPORTED_CIPHER_SUITES,
             server_name: self.config.server_name.as_deref(),
             session_ticket: ticket_offer.as_deref(),
+            alpn: &self.config.alpn,
             legacy_version: if self.config.dtls { 0xfefd } else { 0x0303 },
             cookie: &self.config.cookie,
         };
@@ -695,6 +714,21 @@ impl Tls12Engine {
             self.fail(sink, AlertDescription::HandshakeFailure, "server did not confirm RFC 5746 secure renegotiation (missing or invalid renegotiation_info)");
             return false;
         }
+        if sh.alpn_malformed {
+            self.fail(sink, AlertDescription::DecodeError, "malformed ALPN extension in ServerHello");
+            return false;
+        }
+        // RFC 7301 §3.1: the server may answer only with a protocol the client
+        // offered. This also covers an ALPN extension sent to a client that
+        // offered none, since its list is then empty. Same policy as the TLS 1.3
+        // engine's EncryptedExtensions check.
+        if let Some(picked) = sh.alpn.as_ref() {
+            if !self.config.alpn.contains(picked) {
+                self.fail(sink, AlertDescription::IllegalParameter, "server selected an ALPN protocol the client never offered");
+                return false;
+            }
+        }
+        self.negotiated_alpn = sh.alpn.clone();
         self.negotiated_suite = Some(sh.cipher_suite);
         self.cipher_kind = Some(kind);
         self.prf_hash = Some(prf_hash);
@@ -955,6 +989,18 @@ impl Tls12Engine {
             }
         }
 
+        // RFC 7301 §3.2: pick by the server's own preference, and refuse a
+        // client whose offer has no overlap with the protocols configured,
+        // rather than silently completing with nothing agreed. Done before the
+        // resumption branch: ALPN is negotiated afresh on every handshake, an
+        // abbreviated one included. The same policy as the TLS 1.3 engine.
+        let alpn = pick_alpn(&ch.alpn, &self.config.alpn);
+        if !ch.alpn.is_empty() && !self.config.alpn.is_empty() && alpn.is_none() {
+            self.fail(sink, AlertDescription::NoApplicationProtocol, "no overlapping ALPN protocol");
+            return false;
+        }
+        self.negotiated_alpn = alpn.clone();
+
         let resume_payload = ch.session_ticket.as_ref().filter(|t| !t.is_empty()).and_then(|offered| {
             let keys = self.config.ticket_key.as_ref()?;
             // Try every key still accepted for decryption (current, then
@@ -991,6 +1037,7 @@ impl Tls12Engine {
                 false,
                 if self.config.dtls { 0xfefd } else { 0x0303 },
                 true,
+                alpn.as_deref(),
             );
             self.emit(&sh, sink);
 
@@ -1028,6 +1075,7 @@ impl Tls12Engine {
             self.should_issue_ticket,
             if self.config.dtls { 0xfefd } else { 0x0303 },
             true,
+            alpn.as_deref(),
         );
         self.emit(&sh, sink);
 
@@ -1626,6 +1674,7 @@ mod tests {
             cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256],
             server_name: None,
             session_ticket: None,
+            alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
         };
@@ -1764,6 +1813,7 @@ mod tests {
             cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
             server_name: None,
             session_ticket: None,
+            alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
         };
@@ -1802,6 +1852,7 @@ mod tests {
             cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
             server_name: None,
             session_ticket: None,
+            alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
         };
@@ -1840,6 +1891,7 @@ mod tests {
             cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
             server_name: None,
             session_ticket: None,
+            alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
         };
@@ -1879,6 +1931,7 @@ mod tests {
             cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
             server_name: None,
             session_ticket: None,
+            alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
         };
@@ -1920,6 +1973,7 @@ mod tests {
             ],
             server_name: None,
             session_ticket: None,
+            alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
         };
@@ -1956,7 +2010,7 @@ mod tests {
         client.start(&mut sink_c);
         take_outbound(&mut sink_c); // ClientHello, not needed here
 
-        let wire = messages::build_server_hello(&[2u8; 32], &[], ECDHE_ECDSA_AES128_GCM_SHA256, false, 0x0303, true);
+        let wire = messages::build_server_hello(&[2u8; 32], &[], ECDHE_ECDSA_AES128_GCM_SHA256, false, 0x0303, true, None);
         // legacy_version(2) + random(32) + session_id_len(1) + session_id(0)
         // + cipher_suite(2) + compression_method(1).
         let tampered = replace_extension(&wire, 38, messages::ext::RENEGOTIATION_INFO, &[9]);
@@ -1992,6 +2046,7 @@ mod tests {
             cipher_suites: &[ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_AES128_GCM_SHA256],
             server_name: None,
             session_ticket: None,
+            alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
         };
@@ -2009,6 +2064,124 @@ mod tests {
             sink_s.events
         );
         assert!(sink_s.outbound.is_empty(), "server must not send ServerHello: {:?}", sink_s.events);
+    }
+
+    // ---- ALPN (RFC 7301) ----
+
+    /// A client that offered `offered`, fed `server_hello` right after its own
+    /// ClientHello; returns whether it carried on.
+    fn client_gets_server_hello(offered: &[&[u8]], server_hello: Bytes) -> (bool, RecordingSink) {
+        let creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            trust_store: Some(trust),
+            alpn: offered.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+            ..Default::default()
+        };
+        let mut client = Tls12Engine::new(cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        take_outbound(&mut sink);
+        client.feed_handshake_data(&mut server_hello.as_ref(), &mut sink);
+        let carried_on = !sink.events.iter().any(|e| e.contains("protocol_error"));
+        (carried_on, sink)
+    }
+
+    fn server_hello_with_alpn(alpn: Option<&[u8]>) -> Bytes {
+        messages::build_server_hello(&[2u8; 32], &[], ECDHE_ECDSA_AES128_GCM_SHA256, false, 0x0303, true, alpn)
+    }
+
+    /// A valid ServerHello with one extra raw extension appended, its length
+    /// fields patched: the 4-octet handshake header, then version(2) random(32)
+    /// session_id(1+0) suite(2) compression(1), then the extensions block.
+    fn server_hello_with_raw_extension(ext_type: u16, data: &[u8]) -> Bytes {
+        let mut sh = server_hello_with_alpn(None).to_vec();
+        let block_len_at = 4 + 2 + 32 + 1 + 2 + 1;
+        let mut ext = ext_type.to_be_bytes().to_vec();
+        ext.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        ext.extend_from_slice(data);
+        sh.extend_from_slice(&ext);
+        let block_len = u16::from_be_bytes([sh[block_len_at], sh[block_len_at + 1]]) as usize + ext.len();
+        sh[block_len_at..block_len_at + 2].copy_from_slice(&(block_len as u16).to_be_bytes());
+        let body_len = sh.len() - 4;
+        sh[1..4].copy_from_slice(&(body_len as u32).to_be_bytes()[1..]);
+        Bytes::from(sh)
+    }
+
+    #[test]
+    fn client_accepts_a_server_selection_from_its_own_offer() {
+        let (ok, sink) = client_gets_server_hello(&[b"h2", b"http/1.1"], server_hello_with_alpn(Some(b"http/1.1")));
+        assert!(ok, "{:?}", sink.events);
+    }
+
+    /// RFC 7301 §3.1: a server may answer only with a protocol the client
+    /// offered. Our own server can never do otherwise, so this hand-builds the
+    /// ServerHello of a misbehaving peer, as the TLS 1.3 engine's own test does.
+    #[test]
+    fn client_rejects_a_protocol_it_never_offered() {
+        let (ok, sink) = client_gets_server_hello(&[b"h2"], server_hello_with_alpn(Some(b"spdy/3")));
+        assert!(!ok);
+        assert!(sink.events.iter().any(|e| e.contains("never offered")), "{:?}", sink.events);
+    }
+
+    /// An ALPN extension to a client that offered none is unsolicited.
+    #[test]
+    fn client_rejects_an_alpn_extension_it_did_not_solicit() {
+        let (ok, sink) = client_gets_server_hello(&[], server_hello_with_alpn(Some(b"h2")));
+        assert!(!ok);
+        assert!(sink.events.iter().any(|e| e.contains("never offered")), "{:?}", sink.events);
+    }
+
+    #[test]
+    fn client_carries_on_when_the_server_sends_no_alpn_at_all() {
+        let (ok, sink) = client_gets_server_hello(&[b"h2"], server_hello_with_alpn(None));
+        assert!(ok, "a server may simply not support ALPN: {:?}", sink.events);
+    }
+
+    /// RFC 7301 §3.1: the server's list holds exactly one name.
+    #[test]
+    fn client_rejects_a_server_alpn_list_that_is_not_exactly_one_name() {
+        let empty: &[u8] = &[0, 0];
+        let two: &[u8] = &[0, 6, 2, b'h', b'2', 2, b'h', b'3'];
+        let short_length: &[u8] = &[0, 9, 2, b'h', b'2'];
+        for body in [empty, two, short_length] {
+            let (ok, sink) = client_gets_server_hello(&[b"h2", b"h3"], server_hello_with_raw_extension(16, body));
+            assert!(!ok, "{body:?} must be refused");
+            assert!(sink.events.iter().any(|e| e.contains("malformed ALPN")), "{body:?}: {:?}", sink.events);
+        }
+    }
+
+    /// The offer is on the wire as a real ProtocolNameList, in preference order.
+    #[test]
+    fn client_hello_carries_the_offer_in_preference_order() {
+        let creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let cfg = Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            trust_store: Some(trust),
+            alpn: vec![Bytes::from_static(b"h2"), Bytes::from_static(b"http/1.1")],
+            ..Default::default()
+        };
+        let mut client = Tls12Engine::new(cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        let wire = take_outbound(&mut sink).concat();
+        let needle: Vec<u8> = [&[0x00u8, 0x10, 0x00, 0x0e, 0x00, 0x0c][..], &[2], b"h2", &[8], b"http/1.1"].concat();
+        assert!(wire.windows(needle.len()).any(|w| w == needle.as_slice()), "{wire:02x?}");
+    }
+
+    #[test]
+    fn alpn_can_only_be_changed_before_the_handshake_starts() {
+        let mut client = Tls12Engine::new(Config::default());
+        assert!(client.set_alpn(vec![Bytes::from_static(b"h2")]));
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        assert!(!client.set_alpn(vec![Bytes::from_static(b"h3")]), "the ClientHello is already out");
     }
 
     #[test]
@@ -2037,6 +2210,7 @@ mod tests {
             false,
             0x0303,
             false, // no extended_master_secret
+            None,
         );
         let mut input = wire.as_ref();
         client.feed_handshake_data(&mut input, &mut sink_c);
@@ -2336,6 +2510,7 @@ mod tests {
             cookie: Bytes::new(),
             fixed_client_random: None,
             dtls_initial_seq: (0, 0),
+            alpn: Vec::new(),
         }
     }
 

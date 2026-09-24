@@ -21,7 +21,10 @@ use hopf_auth::{
 };
 use hopf_core::retry::RetryPolicy;
 use hopf_core::{Runtime, RuntimeConfig};
-use hopf_core::{acceptor_from_pem, connector_from_pem, insecure_connector};
+use hopf_core::{
+    acceptor_from_pem, acceptor_from_pem_tls12, acceptor_with_alpn, connector_from_pem,
+    connector_from_pem_tls12, connector_with_alpn, insecure_connector,
+};
 
 use crate::{
     AcceptAllSmtpHandler, AcceptAllSmtpHandlerFactory, AuthenticateState, ConnectedState,
@@ -216,6 +219,8 @@ fn client_starttls_send() {
 struct TlsTrackingHandler {
     hostname: String,
     tls_seen: Arc<Mutex<bool>>,
+    /// The `SecurityInfo` the STARTTLS upgrade handed the handler.
+    tls_info: Arc<Mutex<Option<hopf_core::SecurityInfo>>>,
 }
 
 impl SmtpClientConnected for TlsTrackingHandler {
@@ -232,8 +237,9 @@ impl HelloHandler for TlsTrackingHandler {
         state.accept_hello(Box::new(self.clone()));
     }
 
-    fn tls_established(&mut self, _info: &hopf_core::SecurityInfo) {
+    fn tls_established(&mut self, info: &hopf_core::SecurityInfo) {
         *self.tls_seen.lock().unwrap() = true;
+        *self.tls_info.lock().unwrap() = Some(info.clone());
     }
 
     fn authenticated(&mut self, state: &mut dyn AuthenticateState, _user: &str) {
@@ -327,6 +333,7 @@ fn opportunistic_starttls_upgrades_when_the_server_offers_it() {
     let handler = TlsTrackingHandler {
         hostname: "test.example.com".into(),
         tls_seen: Arc::clone(&tls_seen),
+        tls_info: Arc::default(),
     };
     let factory = Arc::new(TlsTrackingHandlerFactory(handler));
     let service = SmtpService::with_handler_factory(config, factory);
@@ -357,6 +364,62 @@ fn opportunistic_starttls_upgrades_when_the_server_offers_it() {
         *tls_seen.lock().unwrap(),
         "server never saw a TLS handshake — opportunistic STARTTLS did not upgrade"
     );
+}
+
+/// A STARTTLS consumer sees the negotiated ALPN through `SecurityInfo` on TLS
+/// 1.2 as well as 1.3 (issue #436): the server's `tls_established` callback is
+/// handed a `SecurityInfo` whose `alpn()` is the agreed protocol, which the
+/// TLS 1.2 engine used to leave `None` whatever was configured.
+#[test]
+fn starttls_over_tls_1_2_exposes_the_negotiated_alpn_to_the_handler() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    // TLS 1.2 on both ends; the `*_tls12` builders take no protocol list, so
+    // the wrappers supply it.
+    let acceptor = acceptor_with_alpn(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(), &[b"smtp"]);
+    let connector = connector_with_alpn(connector_from_pem_tls12(&cert_path).unwrap(), &[b"smtp"]);
+
+    let tls_seen = Arc::new(Mutex::new(false));
+    let tls_info: Arc<Mutex<Option<hopf_core::SecurityInfo>>> = Arc::default();
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(listen, "test.example.com")
+        .auth_required(false)
+        .with_tls(acceptor);
+    let handler = TlsTrackingHandler {
+        hostname: "test.example.com".into(),
+        tls_seen: Arc::clone(&tls_seen),
+        tls_info: Arc::clone(&tls_info),
+    };
+    let service = SmtpService::with_handler_factory(config, Arc::new(TlsTrackingHandlerFactory(handler)));
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+
+    let done: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+    let done2 = Arc::clone(&done);
+    let send = SmtpSend::new("client.example")
+        .mail_from("a@b.com")
+        .rcpt_to("c@d.com")
+        .message_with(once(b"Subject: hi\r\n\r\nhello\r\n".to_vec()))
+        .require_starttls(true)
+        .on_complete(Box::new(move |ok| *done2.lock().unwrap() = Some(ok)));
+    SmtpClient::from_addr(bound)
+        .starttls(connector, "localhost")
+        .timeouts(SmtpClientTimeouts {
+            stage: Duration::from_secs(5),
+            ..Default::default()
+        })
+        .connect(&rt, Arc::new(send))
+        .unwrap();
+
+    assert!(wait_for(|| done.lock().unwrap().is_some(), 5000), "delivery timed out");
+    assert_eq!(*done.lock().unwrap(), Some(true), "STARTTLS delivery over TLS 1.2 with ALPN failed");
+    let info = tls_info.lock().unwrap().clone().expect("handler never saw the STARTTLS upgrade");
+    assert_eq!(info.protocol(), Some("TLSv1.2"), "must really have been a TLS 1.2 session");
+    assert_eq!(info.alpn(), Some(&b"smtp"[..]), "the handler must see the negotiated ALPN");
 }
 
 /// Regression test for issue #353: `SmtpSend::opportunistic_starttls`
@@ -995,6 +1058,7 @@ fn simple_relay_does_not_enforce_an_unvalidated_tlsa_record() {
     let sink_handler = TlsTrackingHandler {
         hostname: "sink.example.com".into(),
         tls_seen: Arc::clone(&tls_seen),
+        tls_info: Arc::default(),
     };
     let sink_factory = Arc::new(TlsTrackingHandlerFactory(sink_handler));
     let sink_service = SmtpService::with_handler_factory(sink_config, sink_factory);
