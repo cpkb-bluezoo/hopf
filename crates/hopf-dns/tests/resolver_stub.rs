@@ -1875,3 +1875,58 @@ fn resolver_queries_a_real_doh_server_end_to_end() {
     // rather than an owning `shutdown()`.
     drop(rt_arc);
 }
+
+/// A NOTIFY (RFC 1996) sent to a real UDP listener reaches the caller's
+/// opcode handler and gets its answer back, opcode intact; without a
+/// handler the same message is refused with NOTIMP.
+#[test]
+fn notify_over_udp_reaches_the_opcode_handler_or_is_notimp() {
+    use hopf_dns::server::{listen_dns_udp, DnsServiceHandle, DnsUdpListenConfig};
+    use hopf_dns::wire::{
+        DnsQuestion, OPCODE_NOTIFY, RCODE_NOERROR, RCODE_NOTIMP,
+    };
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen2 = Arc::clone(&seen);
+    let mut handled = DnsService::new(Arc::new(DnsCache::default()));
+    handled.set_opcode_handler(move |m, _peer| {
+        seen2.lock().unwrap().push(m.questions[0].name.clone());
+        Some(m.response_template(RCODE_NOERROR))
+    });
+    let unhandled = DnsService::new(Arc::new(DnsCache::default()));
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let mut listen = |service: DnsService| {
+        listen_dns_udp(
+            rt.pick_worker(),
+            DnsUdpListenConfig {
+                addr: "127.0.0.1:0".parse().unwrap(),
+                service: DnsServiceHandle::new(service),
+            },
+        )
+        .unwrap()
+        .0
+    };
+    let (handled_addr, unhandled_addr) = (listen(handled), listen(unhandled));
+
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut notify = DnsMessage::query(77, DnsQuestion::in_class("zone.example", DnsType::Soa), false);
+    notify.flags |= OPCODE_NOTIFY << 11;
+    let wire = notify.serialize().unwrap();
+    let mut buf = [0u8; 512];
+
+    client.send_to(&wire, handled_addr).unwrap();
+    let n = client.recv(&mut buf).unwrap();
+    let resp = DnsMessage::parse(&buf[..n]).unwrap();
+    assert_eq!((resp.id, resp.opcode(), resp.rcode()), (77, OPCODE_NOTIFY, RCODE_NOERROR));
+    assert!(resp.is_response());
+    assert_eq!(*seen.lock().unwrap(), ["zone.example"]);
+
+    client.send_to(&wire, unhandled_addr).unwrap();
+    let n = client.recv(&mut buf).unwrap();
+    let resp = DnsMessage::parse(&buf[..n]).unwrap();
+    assert_eq!((resp.opcode(), resp.rcode()), (OPCODE_NOTIFY, RCODE_NOTIMP));
+
+    rt.shutdown();
+}

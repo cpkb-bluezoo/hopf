@@ -26,8 +26,15 @@ pub const FLAG_AD: u16 = 0x0020;
 /// Checking Disabled.
 pub const FLAG_CD: u16 = 0x0010;
 
+/// The four OPCODE bits within the header flags word.
+const OPCODE_MASK: u16 = 0x7800;
+
 /// Standard query opcode.
 pub const OPCODE_QUERY: u16 = 0;
+/// Zone-change notification opcode (RFC 1996).
+pub const OPCODE_NOTIFY: u16 = 4;
+/// Dynamic update opcode (RFC 2136).
+pub const OPCODE_UPDATE: u16 = 5;
 
 /// No error.
 pub const RCODE_NOERROR: u16 = 0;
@@ -94,9 +101,11 @@ impl DnsMessage {
         Self::new(id, flags, vec![question], Vec::new(), Vec::new(), Vec::new())
     }
 
-    /// Response shell copying questions.
+    /// Response shell copying the question section, the request's OPCODE and
+    /// RD bit (RFC 1035 §4.1.1: a response echoes the query's opcode, so a
+    /// reply to a NOTIFY or UPDATE still says so).
     pub fn response_template(&self, rcode: u16) -> Self {
-        let mut flags = FLAG_QR | (self.flags & FLAG_RD) | (rcode & 0x0F);
+        let mut flags = FLAG_QR | (self.flags & (FLAG_RD | OPCODE_MASK)) | (rcode & 0x0F);
         flags |= FLAG_RA;
         Self::new(
             self.id,
@@ -304,6 +313,24 @@ fn write_rr(
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// RFC 1035 §4.1.1: a response carries the same OPCODE as the query it
+    /// answers. Building it from only QR/RD/RCODE turned every reply to a
+    /// non-QUERY opcode (NOTIFY, UPDATE, ...) into one claiming opcode 0.
+    #[test]
+    fn response_template_copies_the_opcode() {
+        for opcode in [0u16, 1, 2, 4, 5, 6] {
+            let q = DnsQuestion::in_class("example.com", DnsType::Soa);
+            let mut query = DnsMessage::query(7, q, true);
+            query.flags |= opcode << 11;
+            assert_eq!(query.opcode(), opcode);
+            let resp = query.response_template(RCODE_NOTIMP);
+            assert_eq!(resp.opcode(), opcode, "opcode {opcode} must be echoed");
+            assert!(resp.is_response());
+            assert_eq!(resp.rcode(), RCODE_NOTIMP);
+            assert!(resp.is_recursion_desired(), "RD is still copied");
+        }
+    }
 
     #[test]
     fn query_roundtrip() {
