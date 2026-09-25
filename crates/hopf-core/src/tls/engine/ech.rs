@@ -1002,4 +1002,73 @@ mod tests {
         assert!(o.server.ech_server.rejected);
         assert_eq!(o.client_sink.errors[0].alert, AlertDescription::EchRequired);
     }
+
+    fn ech_ok(o: &Outcome) {
+        assert_completes(o);
+        assert!(o.server.ech_server.accepted.is_some(), "ECH must have been accepted, not just completed plain");
+    }
+
+    #[test]
+    fn two_active_configs_both_work_on_one_listener() {
+        let creds = creds_for(&[INNER, PUBLIC]);
+        let (k1, c1) = server_key(1);
+        let (k2, c2) = server_key(2);
+        for config in [c1, c2] {
+            let client = client_cfg(&creds, Some(EchClientConfig::new(vec![config])), KxPolicy::classical_only());
+            let o = run(client, server_cfg(&creds, Some(vec![k1.clone(), k2.clone()]), KxPolicy::classical_only()), |_| {});
+            ech_ok(&o);
+        }
+    }
+
+    #[test]
+    fn removing_a_config_keeps_the_other_and_refuses_the_removed_one_with_retry_configs() {
+        let creds = creds_for(&[INNER, PUBLIC]);
+        let (k1, c1) = server_key(1);
+        let (k2, c2) = server_key(2);
+        // Only key 2 remains.
+        let server = || server_cfg(&creds, Some(vec![k2.clone()]), KxPolicy::classical_only());
+        let o = run(client_cfg(&creds, Some(EchClientConfig::new(vec![c2.clone()])), KxPolicy::classical_only()), server(), |_| {});
+        ech_ok(&o);
+        let o = run(client_cfg(&creds, Some(EchClientConfig::new(vec![c1])), KxPolicy::classical_only()), server(), |_| {});
+        let err = o.client_sink.errors.first().expect("removed config is rejected");
+        assert_eq!(err.alert, AlertDescription::EchRequired);
+        assert_eq!(&err.ech_retry_configs.as_ref().unwrap()[..], &EchConfig::encode_list(&[c2]).unwrap()[..]);
+        drop(k1);
+    }
+
+    #[test]
+    fn a_retired_key_still_decrypts_but_is_not_advertised() {
+        let creds = creds_for(&[INNER, PUBLIC]);
+        let (old, old_config) = server_key(1);
+        let (current, current_config) = server_key(2);
+        let (_gone, stale_config) = server_key(3);
+        let server = || server_cfg(&creds, Some(vec![current.clone(), old.clone().retired()]), KxPolicy::classical_only());
+        // A client that still holds the retired config keeps working.
+        let o = run(client_cfg(&creds, Some(EchClientConfig::new(vec![old_config])), KxPolicy::classical_only()), server(), |_| {});
+        ech_ok(&o);
+        // A client with a config the server no longer knows is told only the current one.
+        let o = run(client_cfg(&creds, Some(EchClientConfig::new(vec![stale_config])), KxPolicy::classical_only()), server(), |_| {});
+        let retry = o.client_sink.errors[0].ech_retry_configs.clone().unwrap();
+        assert_eq!(&retry[..], &EchConfig::encode_list(&[current_config]).unwrap()[..]);
+    }
+
+    #[test]
+    fn a_shared_config_id_is_resolved_by_trial_decryption() {
+        let creds = creds_for(&[INNER, PUBLIC]);
+        let (k_a, _) = server_key(5);
+        let (k_b, c_b) = server_key(5); // same id, different key
+        let client = client_cfg(&creds, Some(EchClientConfig::new(vec![c_b])), KxPolicy::classical_only());
+        let o = run(client, server_cfg(&creds, Some(vec![k_a, k_b]), KxPolicy::classical_only()), |_| {});
+        ech_ok(&o);
+    }
+
+    #[test]
+    fn retry_configs_list_every_advertised_config_in_order() {
+        let (k1, c1) = server_key(1);
+        let (k2, c2) = server_key(2);
+        let (k3, _) = server_key(3);
+        let server = EchServerConfig::new(vec![k1, k2, k3.retired()]);
+        assert_eq!(server.retry_configs().unwrap(), EchConfig::encode_list(&[c1, c2]).unwrap());
+        assert!(EchServerConfig::new(vec![]).retry_configs().is_none());
+    }
 }

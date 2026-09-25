@@ -25,6 +25,7 @@
 //! machinery would need a GREASE PSK in the outer hello (RFC 9849 §6.1.2).
 
 pub mod config;
+mod keys;
 pub(crate) mod wire;
 
 use std::sync::Arc;
