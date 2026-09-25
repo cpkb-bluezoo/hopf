@@ -11,10 +11,11 @@ use bytes::Bytes;
 use hopf_core::security::SecurityInfo;
 use hopf_core::tls::{HandshakeConfig, Tls13Aead};
 
+use crate::transport::varint;
 use crate::transport::frame::{parse_all, writer, Frame};
 use crate::transport::packet::long_header::{self, TYPE_0RTT, TYPE_HANDSHAKE, TYPE_INITIAL, TYPE_RETRY};
 use crate::transport::packet::pn;
-use crate::transport::packet::protection::{KeyPair, PacketKeys};
+use crate::transport::packet::protection::{KeyPair, PacketKeys, TAG_LEN};
 use crate::transport::packet::retry;
 use crate::transport::packet::short_header;
 use crate::transport::packet::TransportParameters;
@@ -25,6 +26,14 @@ use crate::transport::types::{
     ConnectionError, ConnectionId, Dir, Event, Side, SpaceId, StreamEvent, StreamId, Transmit,
     VarInt, VERSION_V1,
 };
+
+/// Maximum datagram size we send until the path is shown to support more
+/// (RFC 9000 §14). The single source of truth for stream chunking,
+/// congestion gating and GSO padding.
+const MAX_DATAGRAM_SIZE: usize = 1200;
+
+/// Minimum size of a datagram carrying an Initial packet (RFC 9000 §14.1).
+const MIN_INITIAL_DATAGRAM_SIZE: usize = 1200;
 
 /// Per-PN-space state.
 struct Space {
@@ -237,7 +246,7 @@ impl Connection {
             datagram_rx: VecDeque::new(),
             datagram_tx: VecDeque::new(),
             peer_max_datagram: 0,
-            loss: LossDetector::new(1200),
+            loss: LossDetector::new(MAX_DATAGRAM_SIZE),
             pto_ping_pending: [false; 3],
             gso_pad_to: None,
             early_secret: None,
@@ -330,7 +339,7 @@ impl Connection {
             datagram_rx: VecDeque::new(),
             datagram_tx: VecDeque::new(),
             peer_max_datagram: 0,
-            loss: LossDetector::new(1200),
+            loss: LossDetector::new(MAX_DATAGRAM_SIZE),
             pto_ping_pending: [false; 3],
             gso_pad_to: None,
             early_secret: None,
@@ -1015,7 +1024,7 @@ impl Connection {
                 let Some((offset, chunk)) = retransmit else {
                     break;
                 };
-                if space == SpaceId::Data && !self.loss.congestion().can_send(1200) {
+                if space == SpaceId::Data && !self.loss.congestion().can_send(MAX_DATAGRAM_SIZE) {
                     self.space_mut(space)
                         .crypto_retransmit
                         .push_front((offset, chunk));
@@ -1037,7 +1046,7 @@ impl Connection {
                 let sp = self.space_mut(space);
                 sp.crypto_pending.pop_front()
             } {
-                if space == SpaceId::Data && !self.loss.congestion().can_send(1200) {
+                if space == SpaceId::Data && !self.loss.congestion().can_send(MAX_DATAGRAM_SIZE) {
                     self.space_mut(space).crypto_pending.push_front(chunk);
                     break;
                 }
@@ -1061,13 +1070,16 @@ impl Connection {
         let ids: Vec<StreamId> = self.streams.keys().copied().collect();
         for id in ids {
             loop {
-                if !self.loss.congestion().can_send(1200) {
+                if !self.loss.congestion().can_send(MAX_DATAGRAM_SIZE) {
                     break;
                 }
+                let Some(max_chunk) = self.stream_chunk_budget(id) else {
+                    break;
+                };
                 let Some((offset, data, fin)) = self
                     .streams
                     .get_mut(&id)
-                    .and_then(|st| st.send.take_chunk(1200))
+                    .and_then(|st| st.send.take_chunk(max_chunk))
                 else {
                     break;
                 };
@@ -1108,7 +1120,7 @@ impl Connection {
                 self.datagram_tx.push_front(data);
                 break;
             }
-            if !self.loss.congestion().can_send(1200) {
+            if !self.loss.congestion().can_send(MAX_DATAGRAM_SIZE) {
                 self.datagram_tx.push_front(data);
                 break;
             }
@@ -1119,16 +1131,59 @@ impl Connection {
         }
     }
 
+    /// Largest datagram this endpoint will send: 1200 bytes until path MTU
+    /// discovery shows more (RFC 9000 §14), bounded by the peer's
+    /// `max_udp_payload_size` (§18.2).
+    fn max_datagram_size(&self) -> usize {
+        match &self.peer_tp {
+            Some(tp) => {
+                usize::try_from(tp.max_udp_payload_size).map_or(MAX_DATAGRAM_SIZE, |peer| {
+                    MAX_DATAGRAM_SIZE.min(peer)
+                })
+            }
+            None => MAX_DATAGRAM_SIZE,
+        }
+    }
+
+    /// Largest STREAM payload that keeps the next Data-space packet within
+    /// [`Self::max_datagram_size`]: the datagram budget minus the header for
+    /// the current connection ID and packet number lengths, the AEAD tag, and
+    /// the STREAM frame header for this stream's next offset. `None` if the
+    /// stream has nothing to send or the budget cannot fit any payload.
+    fn stream_chunk_budget(&self, id: StreamId) -> Option<usize> {
+        let send = &self.streams.get(&id)?.send;
+        let offset = send.next_offset();
+        let space = self.space(SpaceId::Data);
+        let pn_len = pn::encoded_length(space.next_pn, space.largest_acked);
+        let use_0rtt = space.secrets.is_none()
+            && self.early_secret.is_some()
+            && self.side == Side::Client;
+        let budget = self.max_datagram_size();
+        let header_len = if use_0rtt {
+            // The Length field is at most two bytes at this size.
+            long_header::build_0rtt(&self.rem_cid, &self.local_cid, 0, pn_len, budget).len()
+        } else {
+            1 + self.rem_cid.len() + pn_len
+        };
+        // Type + stream ID + offset + a two-byte length varint (payload < 16384).
+        let frame_overhead = 1
+            + varint::encoded_length(id.as_u64())
+            + varint::encoded_length(offset)
+            + 2;
+        budget.checked_sub(header_len + TAG_LEN + frame_overhead)
+            .filter(|n| *n > 0)
+    }
+
     fn queue_packet_pad_initial(
         &mut self,
         mut payload: Vec<u8>,
         frames: Vec<RecoverableFrame>,
         now: Instant,
     ) {
-        // Estimate: pad payload so final UDP datagram ≥ 1200.
+        // Estimate: pad payload so final UDP datagram ≥ 1200 (RFC 9000 §14.1).
         // Rough header ~ 50 bytes + tag 16.
         let header_est = 50 + 16;
-        let need = 1200usize.saturating_sub(header_est + payload.len());
+        let need = MIN_INITIAL_DATAGRAM_SIZE.saturating_sub(header_est + payload.len());
         let target = payload.len() + need;
         if need > 0 {
             writer::pad_to(&mut payload, target);
@@ -1564,7 +1619,7 @@ impl Connection {
         }
 
         let max_udp = self.local_tp.max_udp_payload_size as usize;
-        let pad_to = 1200usize.min(max_udp);
+        let pad_to = self.max_datagram_size().min(max_udp);
         self.gso_pad_to = Some(pad_to);
         self.flush_pending_packets(now);
         self.gso_pad_to = None;
@@ -1783,9 +1838,13 @@ mod tests {
     use hopf_core::tls::{HandshakeMode, HandshakeRole};
 
     fn test_client(now: Instant) -> Connection {
+        test_client_with_dcid_len(now, 8)
+    }
+
+    fn test_client_with_dcid_len(now: Instant, dcid_len: usize) -> Connection {
         let remote: SocketAddr = "127.0.0.1:4433".parse().unwrap();
         let local = ConnectionId::from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        let dcid = ConnectionId::from_slice(&[9, 9, 9, 9, 9, 9, 9, 9]);
+        let dcid = ConnectionId::from_slice(&vec![9u8; dcid_len]);
         let hs = HandshakeConfig {
             role: HandshakeRole::Client,
             mode: HandshakeMode::Quic,
@@ -1880,5 +1939,73 @@ mod tests {
         let st = conn.streams.get(&id).unwrap();
         assert_eq!(st.send.retransmit.len(), 1);
         assert_eq!(&st.send.retransmit[0].1[..], b"early-payload");
+    }
+
+    /// Drain `poll_transmit`, returning every datagram length.
+    fn drain_lens(conn: &mut Connection, now: Instant) -> Vec<usize> {
+        let mut lens = Vec::new();
+        let mut buf = Vec::new();
+        while let Some(tx) = conn.poll_transmit(now, &mut buf) {
+            lens.push(tx.size);
+        }
+        lens
+    }
+
+    fn assert_within_max_datagram(lens: &[usize]) {
+        assert!(lens.len() > 4, "expected several datagrams, got {}", lens.len());
+        let max = *lens.iter().max().unwrap();
+        assert!(max <= 1200, "datagram of {max} bytes exceeds 1200");
+        // Chunks should still be sized to fill the budget, not shrink far below it.
+        assert!(max >= 1150, "largest datagram only {max} bytes");
+    }
+
+    #[test]
+    fn stream_datagrams_do_not_exceed_max_datagram_size() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = conn.open_bi().expect("stream");
+        conn.streams.get_mut(&id).unwrap().send.max_data = u64::MAX;
+        conn.write_stream(id, &vec![0xab; 200_000]).unwrap();
+        assert_within_max_datagram(&drain_lens(&mut conn, now));
+    }
+
+    #[test]
+    fn stream_datagrams_fit_with_longest_cid_and_long_pn() {
+        let now = Instant::now();
+        let mut conn = test_client_with_dcid_len(now, 20);
+        conn.spaces[2].next_pn = 1 << 30;
+        let id = conn.open_bi().expect("stream");
+        {
+            let send = &mut conn.streams.get_mut(&id).unwrap().send;
+            send.max_data = u64::MAX;
+            send.offset = 1 << 40;
+        }
+        conn.write_stream(id, &vec![0xab; 200_000]).unwrap();
+        assert_within_max_datagram(&drain_lens(&mut conn, now));
+    }
+
+    #[test]
+    fn retransmitted_stream_chunk_fits_max_datagram_size() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = conn.open_bi().expect("stream");
+        conn.streams.get_mut(&id).unwrap().send.requeue(
+            1 << 40,
+            Bytes::from(vec![0xcd; 100_000]),
+            false,
+        );
+        assert_within_max_datagram(&drain_lens(&mut conn, now));
+    }
+
+    #[test]
+    fn gso_stream_segments_do_not_exceed_max_datagram_size() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = conn.open_bi().expect("stream");
+        conn.streams.get_mut(&id).unwrap().send.max_data = u64::MAX;
+        conn.write_stream(id, &vec![0xab; 200_000]).unwrap();
+        let mut buf = Vec::new();
+        let tx = conn.poll_transmit_gso(now, 16, &mut buf).expect("gso");
+        assert_eq!(tx.segment_size, Some(1200));
     }
 }
