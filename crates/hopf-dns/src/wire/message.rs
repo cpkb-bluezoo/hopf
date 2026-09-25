@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use super::error::DnsFormatError;
-use super::name::{decode_name, write_name_compressed};
+use super::name::{decode_name, encode_name, write_name_compressed};
 use super::question::DnsQuestion;
 use super::rr::DnsResourceRecord;
 use super::r#type::DnsType;
@@ -48,6 +48,16 @@ pub const RCODE_NXDOMAIN: u16 = 3;
 pub const RCODE_NOTIMP: u16 = 4;
 /// Refused.
 pub const RCODE_REFUSED: u16 = 5;
+/// YXDOMAIN: a name exists that should not (RFC 2136 §2.2).
+pub const RCODE_YXDOMAIN: u16 = 6;
+/// YXRRSET: an RRset exists that should not (RFC 2136 §2.2).
+pub const RCODE_YXRRSET: u16 = 7;
+/// NXRRSET: an RRset that should exist does not (RFC 2136 §2.2).
+pub const RCODE_NXRRSET: u16 = 8;
+/// NOTAUTH: server not authoritative for the zone (RFC 2136 §2.2).
+pub const RCODE_NOTAUTH: u16 = 9;
+/// NOTZONE: a name is not within the zone (RFC 2136 §2.2).
+pub const RCODE_NOTZONE: u16 = 10;
 /// Bad EDNS VERSION (RFC 6891 §7) — requires the EDNS extended-RCODE
 /// octet ([`super::DnsResourceRecord::edns_extended_rcode`]) since it
 /// doesn't fit in the header's own 4-bit RCODE field.
@@ -276,9 +286,42 @@ fn parse_rr(data: &[u8], cursor: &mut usize) -> Result<DnsResourceRecord, DnsFor
     if *cursor + rdlen > data.len() {
         return Err(DnsFormatError::new("truncated rdata"));
     }
-    let rdata = data[*cursor..*cursor + rdlen].to_vec();
+    let start = *cursor;
     *cursor += rdlen;
+    // RFC 3597 §4: only the well-known types below may carry compressed
+    // names in RDATA. Expand them so the stored RDATA is self-contained; on
+    // anything malformed keep it verbatim rather than fail the message.
+    let rdata = expand_rdata_names(data, type_v, start, start + rdlen)
+        .unwrap_or_else(|| data[start..start + rdlen].to_vec());
     Ok(DnsResourceRecord::opaque(name, type_v, class_v, ttl, rdata))
+}
+
+/// Rebuild RDATA of a type that may contain compressed domain names
+/// (RFC 1035 §3.3, RFC 3597 §4) with every name written out in full.
+/// `None` if the type carries no such names, or the RDATA is malformed.
+fn expand_rdata_names(data: &[u8], rtype: u16, start: usize, end: usize) -> Option<Vec<u8>> {
+    // (fixed octets before the names, names, fixed octets after them)
+    let (prefix, names, suffix): (usize, usize, usize) = match rtype {
+        2 | 3 | 4 | 5 | 7 | 8 | 9 | 12 => (0, 1, 0), // NS MD MF CNAME MB MG MR PTR
+        6 => (0, 2, 20),                              // SOA
+        14 | 17 => (0, 2, 0),                         // MINFO RP
+        15 | 18 | 21 => (2, 1, 0),                    // MX AFSDB RT
+        _ => return None,
+    };
+    if start + prefix > end {
+        return None;
+    }
+    let mut out = data[start..start + prefix].to_vec();
+    let mut cursor = start + prefix;
+    for _ in 0..names {
+        let name = decode_name(&data[..end], &mut cursor).ok()?;
+        out.extend_from_slice(&encode_name(&name).ok()?);
+    }
+    if cursor + suffix != end {
+        return None;
+    }
+    out.extend_from_slice(&data[cursor..end]);
+    Some(out)
 }
 
 fn write_question(
@@ -376,5 +419,69 @@ mod tests {
         assert_eq!(parsed.questions[0].raw_qtype, 65280);
         assert_eq!(parsed.questions[0].qclass, None);
         assert_eq!(parsed.questions[0].raw_qclass, 65281);
+    }
+
+    /// RFC 3597 §4: names inside the RDATA of well-known types (NS, CNAME,
+    /// SOA, MX, ...) may be compressed against the whole message. `parse`
+    /// must expand them, or the stored RDATA holds pointers that mean
+    /// something else once the record leaves this message (cached, copied
+    /// into a zone, re-serialised).
+    #[test]
+    fn compressed_names_in_rdata_are_expanded_on_parse() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&[0, 1, 0x84, 0, 0, 1, 0, 4, 0, 0, 0, 0]);
+        // Question: example.com IN SOA (name at offset 12).
+        wire.extend_from_slice(&[7]);
+        wire.extend_from_slice(b"example");
+        wire.extend_from_slice(&[3]);
+        wire.extend_from_slice(b"com");
+        wire.push(0);
+        wire.extend_from_slice(&[0, 6, 0, 1]);
+        let rr_header = |wire: &mut Vec<u8>, ty: u16, rdlen: usize| {
+            wire.extend_from_slice(&[0xC0, 12]);
+            wire.extend_from_slice(&ty.to_be_bytes());
+            wire.extend_from_slice(&[0, 1, 0, 0, 1, 0x2C]);
+            wire.extend_from_slice(&(rdlen as u16).to_be_bytes());
+        };
+        // CNAME www -> pointer to example.com
+        rr_header(&mut wire, 5, 2);
+        wire.extend_from_slice(&[0xC0, 12]);
+        // MX 10 mail.<ptr example.com>
+        rr_header(&mut wire, 15, 2 + 1 + 4 + 2);
+        wire.extend_from_slice(&[0, 10, 4]);
+        wire.extend_from_slice(b"mail");
+        wire.extend_from_slice(&[0xC0, 12]);
+        // SOA ns.<ptr> hostmaster.<ptr> 1 2 3 4 5
+        rr_header(&mut wire, 6, (1 + 2 + 2) + (1 + 10 + 2) + 20);
+        wire.extend_from_slice(&[2]);
+        wire.extend_from_slice(b"ns");
+        wire.extend_from_slice(&[0xC0, 12]);
+        wire.extend_from_slice(&[10]);
+        wire.extend_from_slice(b"hostmaster");
+        wire.extend_from_slice(&[0xC0, 12]);
+        for v in 1u32..=5 {
+            wire.extend_from_slice(&v.to_be_bytes());
+        }
+        // NS -> plain (uncompressed) name must be left alone.
+        rr_header(&mut wire, 2, 4 + 1);
+        wire.push(3);
+        wire.extend_from_slice(b"ns2");
+        wire.push(0);
+
+        let msg = DnsMessage::parse(&wire).unwrap();
+        assert_eq!(msg.answers[0].as_domain_name().as_deref(), Some("example.com"));
+        assert_eq!(msg.answers[1].as_mx(), Some((10, "mail.example.com".to_string())));
+        let soa = msg.answers[2].as_soa().unwrap();
+        assert_eq!((soa.mname.as_str(), soa.rname.as_str()), ("ns.example.com", "hostmaster.example.com"));
+        assert_eq!((soa.serial, soa.minimum), (1, 5));
+        // No compression pointer survives in stored RDATA.
+        assert!(!msg.answers[0].rdata.contains(&0xC0));
+        // And the record is self-contained: it survives a re-serialise into
+        // a message where the old offsets mean something else.
+        let mut other = DnsMessage::query(2, DnsQuestion::in_class("a.b", DnsType::A), false);
+        other.answers = msg.answers[..3].to_vec();
+        let back = DnsMessage::parse(&other.serialize().unwrap()).unwrap();
+        assert_eq!(back.answers[0].as_domain_name().as_deref(), Some("example.com"));
+        assert_eq!(back.answers[1].as_mx(), Some((10, "mail.example.com".to_string())));
     }
 }

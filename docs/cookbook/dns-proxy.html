@@ -59,6 +59,7 @@
 <li><a href="../cookbook/tls-echo.html">TLS echo</a></li>
 <li><a href="../cookbook/http-hello-get.html">HTTP hello / get</a></li>
 <li><a href="../cookbook/dns-proxy.html" aria-current="page">DNS proxy</a></li>
+<li><a href="../cookbook/dns-authoritative.html">DNS authoritative</a></li>
 <li><a href="../cookbook/webdav.html">WebDAV</a></li>
 <li><a href="../cookbook/websocket.html">WebSocket</a></li>
 <li><a href="../cookbook/grpc.html">gRPC</a></li>
@@ -74,7 +75,7 @@
       </header>
       <div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> dns-proxy <span class="at">--</span> …</span>
 <span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="co"># point a stub resolver / dig @… at the bound address</span></span></code></pre></div>
-<p>Source: <a href="../../examples/dns-proxy"><code>examples/dns-proxy</code></a>. Caching forwarder using <code>DnsService</code> + UDP (and optional DoT/DoQ features). See <a href="../dns.html">DNS</a>.</p>
+<p>Source: <a href="../../examples/dns-proxy"><code>examples/dns-proxy</code></a>. Caching forwarder using <code>DnsService</code> with a <code>ForwarderHandler</code> + UDP (and optional DoT/DoQ features). See <a href="../dns.html">DNS</a>.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

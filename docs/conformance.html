@@ -59,6 +59,7 @@
 <li><a href="cookbook/tls-echo.html">TLS echo</a></li>
 <li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
 <li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/dns-authoritative.html">DNS authoritative</a></li>
 <li><a href="cookbook/webdav.html">WebDAV</a></li>
 <li><a href="cookbook/websocket.html">WebSocket</a></li>
 <li><a href="cookbook/grpc.html">gRPC</a></li>
@@ -521,8 +522,8 @@
 </tbody>
 </table>
 
-<h2 id="dns">DNS — RFC 1035 (stub resolver + caching forwarder, not authoritative)</h2>
-<p>hopf-dns is explicitly non-authoritative: no zone files, AXFR/IXFR, TSIG, dynamic UPDATE, or DNSSEC signing. RFC 1035 §6 (authoritative serving) rows are marked <strong>N/A</strong> on that basis.</p>
+<h2 id="dns">DNS — RFC 1035 (stub resolver, caching forwarder, authoritative zone server)</h2>
+<p>hopf-dns is a stub resolver plus a DNS server shell whose stock handlers are a caching forwarder and an <strong>authoritative zone server</strong> (zone files, RFC 2136 UPDATE, RFC 1996 NOTIFY, AXFR/IXFR, TSIG, secondaries). It does <strong>not</strong> sign zones (DNSSEC signing is out of scope; an externally signed zone is served as data). The authoritative rows are in <a href="#dns-authoritative">their own table</a> below.</p>
 <h3>Message Format and Name Encoding (RFC 1035 §3-4)</h3>
 <table>
 <thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
@@ -533,14 +534,40 @@
 <tr><td>Case-insensitive name comparison</td><td>§2.3.3</td><td>Compliant</td><td><code>wire/name.rs:14-20</code></td></tr>
 <tr><td>Header/flags/OPCODE/RCODE, Z-bit masking</td><td>§4.1.1</td><td>Compliant</td><td><code>wire/message.rs:16-131</code></td></tr>
 <tr><td>Response echoes the query's OPCODE</td><td>§4.1.1</td><td>Compliant</td><td><code>DnsMessage::response_template</code> copies the OPCODE and RD bit; it previously built the flags from QR/RD/RCODE alone, so a reply to any non-QUERY opcode (including the default NOTIMP) claimed opcode 0</td></tr>
-<tr><td>Non-QUERY opcodes (NOTIFY, UPDATE, others) are offered to the caller before being refused</td><td>RFC 1996, RFC 2136</td><td>Compliant</td><td><code>DnsService::set_opcode_handler</code>; with no handler, or one that declines, the reply is NOTIMP. Zone storage, transfer, TSIG/SIG(0) and update authorisation are not implemented and stay out of scope: <code>hopf-dns</code> only makes the message reachable</td></tr>
+<tr><td>Non-QUERY opcodes (NOTIFY, UPDATE, others) are offered to the handler before being refused</td><td>RFC 1996, RFC 2136</td><td>Compliant</td><td><code>DnsQueryHandler::handle_non_query_opcode</code>; with no handler, or one that <code>Decline</code>s, the reply is NOTIMP. The authoritative handler implements NOTIFY and UPDATE (see <a href="#dns-authoritative">Authoritative serving</a>)</td></tr>
 <tr><td>AD/CD flags</td><td>§4.1.1, RFC 4035 §3.2</td><td>Compliant</td><td>See the DNSSEC table below for details</td></tr>
 <tr><td>Unknown QTYPE/QCLASS in the question section</td><td>§4.1.2, RFC 3597</td><td>Compliant</td><td><code>DnsQuestion</code> now mirrors <code>DnsResourceRecord</code>'s raw-preservation shape: <code>qtype</code>/<code>qclass</code> are <code>Option&lt;DnsType&gt;</code>/<code>Option&lt;DnsClass&gt;</code> (<code>None</code> for an unrecognized value) alongside always-present <code>raw_qtype</code>/<code>raw_qclass</code> fields; <code>parse_question</code> builds via the new <code>DnsQuestion::opaque()</code> instead of rejecting the message (<code>wire/question.rs</code>, <code>wire/message.rs</code>). The RFC 5452 response/question verification added for issue #4 was updated to compare the raw values, since two different unrecognized types would otherwise both parse to <code>None</code> and wrongly compare equal</td></tr>
 <tr><td>Name compression, pointer-loop guard</td><td>§4.1.4</td><td>Compliant</td><td><code>wire/name.rs:52-134</code></td></tr>
+<tr><td>Names inside RDATA of NS/CNAME/PTR/SOA/MX (and MD, MF, MB, MG, MR, MINFO, RP, AFSDB, RT) expanded on parse</td><td>RFC 3597 §4</td><td>Compliant</td><td><code>wire/message.rs</code> <code>expand_rdata_names</code>. Previously RDATA was stored exactly as received, so a compression pointer inside it pointed into a message that no longer existed once the record was cached, copied into a zone or re-serialised (proven by <code>compressed_names_in_rdata_are_expanded_on_parse</code>)</td></tr>
 <tr><td>UDP transport, TCP 2-byte length prefix</td><td>§4.2</td><td>Compliant</td><td>Client and DoT/DoQ server framing</td></tr>
 <tr><td>TCP fallback on truncation — client</td><td>§4.2.1</td><td>Compliant</td><td><code>client/mod.rs:523-545</code></td></tr>
 <tr><td>TCP fallback on truncation — forwarder</td><td>§4.2.1</td><td>Compliant</td><td>The forwarder's own upstream query already goes through <code>DnsResolver::query()</code>, whose TC-triggered TCP retry (client-side path above) was already unconditionally enabled (<code>tcp_fallback</code> has no public setter, only ever <code>true</code>) — this was working correctly but untested through the actual forwarder code path; now proven with a real test driving <code>DnsService::process_query_sync</code> against a stub upstream that answers truncated over UDP and complete over TCP on the same address (<code>tests/resolver_stub.rs</code>, <code>forwarder_retries_truncated_upstream_answer_over_tcp</code>)</td></tr>
-<tr><td>Forwarder truncates/sets TC on oversized UDP responses</td><td>§4.2.1</td><td>Compliant</td><td><code>DnsUdpHandler::on_datagram</code> (<code>server/udp.rs</code>) now compares the serialised response against the querying client's advertised UDP payload size (new <code>DnsMessage::requested_udp_payload_size()</code>: the inbound OPT record's CLASS field per RFC 6891 §6.2.3, or the legacy 512-octet limit with no EDNS at all) and, if oversized, clears all record sections and sets TC instead of sending an oversized datagram. Proven with a real UDP client sending both a plain (no-EDNS) and an EDNS(4096) query against a 40-answer response, confirming the first truncates to empty+TC and the second doesn't (<code>forwarder_truncates_oversized_udp_response_for_the_clients_advertised_size</code>)</td></tr>
+<tr><td>Forwarder truncates/sets TC on oversized UDP responses</td><td>§4.2.1</td><td>Compliant</td><td><code>DnsService::process_wire</code> (<code>server/mod.rs</code>, called by the UDP listener) now compares the serialised response against the querying client's advertised UDP payload size (new <code>DnsMessage::requested_udp_payload_size()</code>: the inbound OPT record's CLASS field per RFC 6891 §6.2.3, or the legacy 512-octet limit with no EDNS at all) and, if oversized, clears all record sections and sets TC instead of sending an oversized datagram. Proven with a real UDP client sending both a plain (no-EDNS) and an EDNS(4096) query against a 40-answer response, confirming the first truncates to empty+TC and the second doesn't (<code>forwarder_truncates_oversized_udp_response_for_the_clients_advertised_size</code>)</td></tr>
+</tbody>
+</table>
+<h3 id="dns-authoritative">Authoritative serving (RFC 1034/1035 §6, RFC 1996, 2136, 1995, 5936, 8945)</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Master file format: <code>$ORIGIN</code>, <code>$TTL</code>, <code>$INCLUDE</code>, <code>@</code>, blank owner, <code>;</code> comments, parenthesised groups, quoted strings and escapes</td><td>RFC 1035 §5</td><td>Compliant</td><td><code>server/zone/{lexer,parser,loader,rdata}.rs</code>. Push parser: proven identical for every chunk split and one byte at a time. <code>$GENERATE</code> and BIND TTL units are BIND extensions. Structured types A, AAAA, NS, CNAME, PTR, MX, TXT/SPF, SOA, SRV, HINFO; every other type via the generic form. Owner names with backslash escapes are rejected</td></tr>
+<tr><td>Unknown / unstructured RR types</td><td>RFC 3597 §5</td><td>Compliant</td><td><code>\# length hex</code> read and written for any type</td></tr>
+<tr><td>Zone lookup algorithm: exact match, CNAME, referral at a cut, wildcard, NXDOMAIN</td><td>RFC 1034 §4.3.2</td><td>Compliant</td><td><code>Zone::lookup</code>; AA set on answers, clear on referrals; in-zone CNAME chains followed (loop is SERVFAIL)</td></tr>
+<tr><td>Wildcards at the closest encloser, owner rewritten to the query name</td><td>RFC 4592 §3.3</td><td>Compliant</td><td>Not applied to a name that exists (including an empty non-terminal)</td></tr>
+<tr><td>Empty non-terminals are NODATA, not NXDOMAIN</td><td>RFC 8020 §2</td><td>Compliant</td><td>Descendant counts kept per name</td></tr>
+<tr><td>Negative answers carry the SOA, TTL = min(SOA TTL, MINIMUM)</td><td>RFC 2308 §2-3</td><td>Compliant</td><td><code>Zone::negative_soa</code></td></tr>
+<tr><td>Minimal <code>ANY</code> response</td><td>RFC 8482</td><td>Compliant</td><td>Single <code>HINFO "RFC8482" ""</code>; switchable</td></tr>
+<tr><td>Glue in the additional section for in-zone NS and MX targets</td><td>RFC 1034 §4.3.2, RFC 1035 §3.3.9</td><td>Compliant</td><td>Includes glue below a zone cut</td></tr>
+<tr><td>Exactly one SOA at the apex; owners within the zone; CNAME alone; RRset TTLs equal; duplicate RRs collapsed</td><td>RFC 1034 §3.6.2, RFC 2181 §5</td><td>Compliant</td><td>Enforced at load, transfer and update</td></tr>
+<tr><td>EDNS: OPT echoed with DO; version above 0 is BADVERS</td><td>RFC 6891 §6.1.1, §6.1.3</td><td>Compliant</td><td>DNSSEC signing and NSEC/NSEC3 generation are <strong>not</strong> provided</td></tr>
+<tr><td>NOTIFY: sent to configured peers, hosts (every resolved address) and in-zone NS glue except the primary; accepted only from a secondary's primary</td><td>RFC 1996</td><td>Compliant</td><td><code>ZoneOptions::also_notify</code> / <code>also_notify_host</code>; three UDP attempts per peer. NOTAUTH for an unserved zone, REFUSED from anyone else</td></tr>
+<tr><td>Dynamic update: prerequisite checks (all five kinds, value-dependent by whole RRset), prescan, atomic apply, one serial bump</td><td>RFC 2136 §3</td><td>Compliant</td><td><code>server/zone/update.rs</code>; verified against BIND <code>nsupdate</code>. Apex SOA/NS protected; CNAME conflicts ignored; newer SOA accepted. Secondaries answer REFUSED rather than forward (§6 forwarding not implemented)</td></tr>
+<tr><td>Update authorisation</td><td>RFC 2136 §3.3</td><td>Compliant</td><td>Default deny; <code>Acl</code> by source network and/or TSIG key. SIG(0) is not implemented</td></tr>
+<tr><td>AXFR: SOA first and last, question in the first message, messages within a TCP frame, TC over UDP</td><td>RFC 5936 §2, §4</td><td>Compliant</td><td>Default deny (<code>allow_transfer</code>); verified against BIND <code>dig</code></td></tr>
+<tr><td>IXFR: current / differences / AXFR-style fallback; RFC 1982 serial arithmetic</td><td>RFC 1995, RFC 1982</td><td>Compliant</td><td>In-memory journal of 512 changes, empty after a restart</td></tr>
+<tr><td>Secondary: refresh at start, on NOTIFY, on REFRESH; RETRY after failure; EXPIRE stops answering; SOA serial compared first</td><td>RFC 1034 §4.3.5, RFC 1035 §3.3.13</td><td>Compliant</td><td><code>server/zone/maintain.rs</code>, proven over real sockets without any NOTIFY (<code>tests/authoritative.rs</code>). Expired or never-loaded zones answer SERVFAIL</td></tr>
+<tr><td>TSIG: HMAC-SHA256/384/512, request/response chaining, multi-message transfers, BADKEY/BADSIG/BADTIME, 300 s fudge</td><td>RFC 8945</td><td>Compliant</td><td><code>tsig.rs</code>; verified in both directions against BIND <code>dig -y</code> and <code>nsupdate -y</code>. HMAC-MD5 and HMAC-SHA1 are deliberately not offered. Not applied over DoQ</td></tr>
+<tr><td>DNSSEC signing, NSEC/NSEC3 generation, automated key rollover</td><td>RFC 4034, 5155</td><td>N/A</td><td>Out of scope; a pre-signed zone loads and serves as data</td></tr>
+<tr><td>Zone write-back and secondary persistence</td><td>—</td><td>Compliant</td><td>Atomic temp-file-and-rename to the zone's own file; <code>ZoneFileMode::ReadOnly</code> never writes</td></tr>
 </tbody>
 </table>
 <h3>Resolver Behaviour and Cache-Poisoning Resilience</h3>

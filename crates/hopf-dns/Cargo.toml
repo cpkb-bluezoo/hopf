@@ -9,9 +9,9 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "DNS stub resolver and caching forwarder for Hopf (UDP/TCP/DoT/DoQ/DoH)"
+description = "DNS stub resolver, caching forwarder and authoritative server for Hopf (UDP/TCP/DoT/DoQ/DoH)"
 readme = "README.md"
-keywords = ["dns", "resolver", "dot", "doq", "doh"]
+keywords = ["dns", "resolver", "authoritative", "dot", "doq"]
 categories = ["network-programming"]
 autotests = false
 
@@ -48,6 +48,11 @@ hopf-quic = { workspace = true, optional = true }
 [dev-dependencies]
 rcgen = { workspace = true }
 hopf-core = { workspace = true, features = ["ed448"] }
+
+[[test]]
+name = "authoritative"
+path = "tests/authoritative.rs"
+required-features = ["integration"]
 
 [[test]]
 name = "resolver_stub"
