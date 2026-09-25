@@ -23,7 +23,7 @@ pub use key_schedule::{
 };
 pub use messages::{
     build_certificate, build_certificate_request, build_certificate_verify, build_client_hello,
-    build_client_hello_with_binder, build_encrypted_extensions_ext,
+    build_client_hello_with_binder, build_client_hello_with_ech, build_encrypted_extensions_ext,
     build_finished, build_hello_retry_request, build_key_update, build_server_hello_ext, decode_record_size_limit,
     key_update_request, ClientHelloParams, HandshakeMessage, HandshakeType, KeyShareEntry, OfferedPsk,
     MAX_RECORD_SIZE_LIMIT_13, MIN_RECORD_SIZE_LIMIT,

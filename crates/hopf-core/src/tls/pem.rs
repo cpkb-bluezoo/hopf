@@ -164,6 +164,60 @@ pub fn connector_with_record_size_limit(inner: SharedTlsConnector, limit: u16) -
     Arc::new(RecordSizeLimitConnector { inner, limit })
 }
 
+struct EchAcceptor {
+    inner: SharedTlsAcceptor,
+    config: Arc<super::ech::EchServerConfig>,
+}
+
+impl TlsAcceptor for EchAcceptor {
+    fn accept(&self) -> TlsVariant {
+        let mut engine = self.inner.accept();
+        engine.set_ech_server(Arc::clone(&self.config));
+        engine
+    }
+}
+
+/// Wrap `inner` so every accepted TLS 1.3 connection accepts Encrypted Client
+/// Hello (RFC 9849) with `config`'s keys and offers its advertised configs as
+/// `retry_configs` to clients that used a stale one. Clients that do not offer
+/// ECH are unaffected. TLS 1.2 acceptors are left unchanged.
+pub fn acceptor_with_ech(inner: SharedTlsAcceptor, config: Arc<super::ech::EchServerConfig>) -> SharedTlsAcceptor {
+    Arc::new(EchAcceptor { inner, config })
+}
+
+struct EchConnector {
+    inner: SharedTlsConnector,
+    resolver: Arc<dyn Fn(&str) -> Option<super::ech::EchClientConfig> + Send + Sync>,
+}
+
+impl TlsConnector for EchConnector {
+    fn connect(&self, server_name: &str) -> io::Result<TlsVariant> {
+        let mut engine = self.inner.connect(server_name)?;
+        if let Some(config) = (self.resolver)(server_name) {
+            engine.set_ech_client(config);
+        }
+        Ok(engine)
+    }
+}
+
+/// Wrap `inner` so TLS 1.3 connections offer Encrypted Client Hello (RFC 9849).
+/// `resolver` is called with the server name for every connection and returns
+/// that server's ECH settings - its `ECHConfig`s, or
+/// [`EchClientConfig::grease_only`](super::ech::EchClientConfig::grease_only) -
+/// or `None` to send a plain ClientHello. It runs on the connecting thread, so
+/// it must not block: look configs up in a cache, never resolve DNS inline.
+/// TLS 1.2 connectors are left unchanged.
+///
+/// A rejected offer surfaces as an `ech_required` [`TlsProtocolError`](super::TlsProtocolError)
+/// whose `ech_retry_configs` holds the server's replacement `ECHConfigList`,
+/// which the caller may use for one retry.
+pub fn connector_with_ech(
+    inner: SharedTlsConnector,
+    resolver: impl Fn(&str) -> Option<super::ech::EchClientConfig> + Send + Sync + 'static,
+) -> SharedTlsConnector {
+    Arc::new(EchConnector { inner, resolver: Arc::new(resolver) })
+}
+
 fn base_config(role: HandshakeRole, alpn: &[&[u8]]) -> HandshakeConfig {
     HandshakeConfig {
         role,

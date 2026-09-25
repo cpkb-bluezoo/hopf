@@ -37,7 +37,7 @@ pub use pem::{
     acceptor_from_pem_with_client_auth, acceptor_from_pem_with_sni, connector_from_pem,
     connector_from_pem_tls12, connector_from_pem_tls12_with_client_cert,
     connector_from_pem_with_client_cert, connector_with_alpn, connector_with_record_size_limit,
-    connector_with_verify_override, acceptor_requiring_supported_versions, acceptor_with_alpn, acceptor_with_record_size_limit, insecure_connector,
+    connector_with_verify_override, acceptor_requiring_supported_versions, acceptor_with_alpn, acceptor_with_record_size_limit, acceptor_with_ech, connector_with_ech, insecure_connector,
     insecure_connector_tls12, public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor,
     SharedTlsConnector, TlsAcceptor, TlsConnector,
 };
@@ -111,6 +111,26 @@ impl TlsVariant {
     pub fn set_record_size_limit(&mut self, limit: Option<u16>) -> bool {
         match self {
             TlsVariant::V13(e) => e.set_record_size_limit(limit),
+            TlsVariant::V12(_) => false,
+        }
+    }
+
+    /// Client side: offer Encrypted Client Hello (RFC 9849) with `config`, or
+    /// GREASE when it holds no usable config. Only TLS 1.3 supports it: for a
+    /// TLS 1.2 engine this does nothing and returns `false`. Must be called
+    /// before [`Self::start`].
+    pub fn set_ech_client(&mut self, config: ech::EchClientConfig) -> bool {
+        match self {
+            TlsVariant::V13(e) => e.set_ech_client(Some(config)),
+            TlsVariant::V12(_) => false,
+        }
+    }
+
+    /// Server side: accept and publish Encrypted Client Hello keys. TLS 1.3
+    /// only (`false` on TLS 1.2). Must be called before [`Self::start`].
+    pub fn set_ech_server(&mut self, config: std::sync::Arc<ech::EchServerConfig>) -> bool {
+        match self {
+            TlsVariant::V13(e) => e.set_ech_server(Some(config)),
             TlsVariant::V12(_) => false,
         }
     }
