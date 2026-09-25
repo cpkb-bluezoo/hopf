@@ -63,3 +63,8 @@ required-features = ["integration"]
 name = "ech_bootstrap"
 path = "tests/ech_bootstrap.rs"
 required-features = ["integration"]
+
+[[test]]
+name = "forwarder_policy"
+path = "tests/forwarder_policy.rs"
+required-features = ["integration", "server"]

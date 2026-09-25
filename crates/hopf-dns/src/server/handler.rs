@@ -64,6 +64,11 @@ impl MetricsSink<'_> {
         self.0.lock().unwrap().upstreams += 1;
     }
 
+    /// Count an answer served stale (RFC 8767) because the upstream failed.
+    pub fn stale_served(&self) {
+        self.0.lock().unwrap().stale_served += 1;
+    }
+
     /// Count an error.
     pub fn error(&self) {
         self.0.lock().unwrap().errors += 1;
