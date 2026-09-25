@@ -24,15 +24,17 @@
 //! `messages::parse_client_hello` directly, a plain function, not an engine.
 //!
 //! **Cookie policy** (see `crypto-migration-plan.md` Phase 6's DTLS 1.2
-//! section): real RFC 6347 §4.2.1 anti-amplification protection needs the
-//! cookie bound to the client's source address, which this engine — like
-//! every other engine in this crate — doesn't have (transport/socket
-//! agnostic by design; real address binding needs the deferred UDP driver
-//! wiring). The cookie here is `HMAC(secret, ClientHello.random)`: real
-//! cryptographic binding to *this* handshake attempt, not to a network
-//! address. [`Dtls12Config::require_cookie`] defaults to `false` for
-//! exactly this reason — forcing an extra round trip for protection that
-//! isn't real yet has a cost and no benefit until address binding lands.
+//! section): RFC 6347 §4.2.1 anti-amplification protection needs the cookie
+//! bound to the client's source address. This engine is transport-agnostic
+//! and does not know it, so the caller supplies it as
+//! [`Dtls12Config::cookie_binding`] (the UDP driver,
+//! [`crate::dtls::driver`], passes the peer address). The cookie is
+//! `HMAC(secret, binding || ClientHello.random)`: bound to this handshake
+//! attempt *and* to that binding. With an empty binding (the default) it is
+//! bound to the handshake attempt only, which stops nothing an attacker who
+//! can send a `ClientHello` cannot also do, so
+//! [`Dtls12Config::require_cookie`] defaults to `false` and should be turned
+//! on together with a real binding.
 
 use aws_lc_rs::hmac::{self, Key, HMAC_SHA256};
 use bytes::Bytes;
@@ -76,6 +78,13 @@ pub struct Dtls12Config {
     /// across restarts in a way that would help an attacker — a random
     /// 32-byte value generated at listener startup is enough.
     pub cookie_secret: [u8; 32],
+    /// Server role only: opaque data the cookie is bound to, normally the
+    /// client's source address (see [`crate::dtls::driver::peer_cookie_binding`]).
+    /// A cookie issued for one binding does not validate under another, so
+    /// a `ClientHello` from a spoofed source cannot complete the round trip
+    /// and never gets the (much larger) server flight. Empty binds to the
+    /// handshake attempt only.
+    pub cookie_binding: Bytes,
 }
 
 struct RecordState {
@@ -196,13 +205,15 @@ impl Tls12EventSink for InnerSink<'_> {
     }
 }
 
-/// `HMAC-SHA256(secret, client_hello_random)`, truncated — real
-/// cryptographic binding to one handshake attempt; see this module's doc
-/// for why it isn't (yet) bound to a network address.
-fn compute_cookie(secret: &[u8; 32], client_random: &[u8; 32]) -> Bytes {
+/// `HMAC-SHA256(secret, binding || client_hello_random)`, truncated. The
+/// random is a fixed 32 octets and comes last, so the two parts cannot be
+/// confused for one another whatever the binding's length.
+fn compute_cookie(secret: &[u8; 32], binding: &[u8], client_random: &[u8; 32]) -> Bytes {
     let key = Key::new(HMAC_SHA256, secret);
-    let tag = hmac::sign(&key, client_random);
-    Bytes::copy_from_slice(&tag.as_ref()[..COOKIE_LEN])
+    let mut ctx = hmac::Context::with_key(&key);
+    ctx.update(binding);
+    ctx.update(client_random);
+    Bytes::copy_from_slice(&ctx.sign().as_ref()[..COOKIE_LEN])
 }
 
 /// Reactive DTLS 1.2 engine.
@@ -210,6 +221,7 @@ pub struct Dtls12RecordEngine {
     base: Tls12Config,
     require_cookie: bool,
     cookie_secret: [u8; 32],
+    cookie_binding: Bytes,
     engine: Option<Tls12Engine>,
     state: RecordState,
     reassembler: Reassembler,
@@ -229,6 +241,7 @@ impl Dtls12RecordEngine {
             base: config.base,
             require_cookie: config.require_cookie,
             cookie_secret: config.cookie_secret,
+            cookie_binding: config.cookie_binding,
             engine: None,
             state: RecordState::new(role),
             reassembler: Reassembler::new(),
@@ -538,10 +551,9 @@ impl Dtls12RecordEngine {
             return false;
         };
         if self.require_cookie {
-            let expected = compute_cookie(&self.cookie_secret, &ch.random);
+            let expected = compute_cookie(&self.cookie_secret, &self.cookie_binding, &ch.random);
             if ch.cookie.as_ref() != expected.as_ref() {
-                let cookie = compute_cookie(&self.cookie_secret, &ch.random);
-                let hvr = messages::build_hello_verify_request(DTLS12_VERSION, &cookie);
+                let hvr = messages::build_hello_verify_request(DTLS12_VERSION, &expected);
                 write_fragmented(&mut self.state, &mut self.reassembler, CONTENT_HANDSHAKE, &hvr, flight);
                 return true;
             }
@@ -675,6 +687,7 @@ mod tests {
             },
             require_cookie: false,
             cookie_secret: [0u8; 32],
+            cookie_binding: Bytes::new(),
         };
         let server = Dtls12Config {
             base: Tls12Config {
@@ -684,6 +697,7 @@ mod tests {
             },
             require_cookie,
             cookie_secret: [0x42u8; 32],
+            cookie_binding: Bytes::new(),
         };
         (client, server)
     }
@@ -943,11 +957,13 @@ mod tests {
             base: client_base.clone(),
             require_cookie: false,
             cookie_secret: [0u8; 32],
+            cookie_binding: Bytes::new(),
         };
         let server_cfg = || Dtls12Config {
             base: server_base.clone(),
             require_cookie: false,
             cookie_secret: [0x42u8; 32],
+            cookie_binding: Bytes::new(),
         };
 
         // First connection: full handshake, mints a ticket.
@@ -984,5 +1000,55 @@ mod tests {
         server2.feed_datagram(&wire, &mut sink_s2);
         assert_eq!(sink_s2.app_data, vec![b"resumed hello".to_vec()]);
     }
-}
 
+    /// A cookie is bound to the binding it was issued under (RFC 6347 §4.2.1
+    /// anti-spoofing): the same `ClientHello2` that completes against the
+    /// server that issued the cookie gets only a fresh `HelloVerifyRequest`
+    /// from one holding a different binding, e.g. a different peer address.
+    #[test]
+    fn a_cookie_does_not_validate_under_a_different_binding() {
+        let (client_cfg, mut server_cfg) = configs(true);
+        server_cfg.cookie_binding = Bytes::from_static(b"203.0.113.7:4433");
+        let (_, mut other_cfg) = configs(true);
+        other_cfg.cookie_binding = Bytes::from_static(b"198.51.100.9:4433");
+        // The same secret, so only the binding differs.
+        other_cfg.cookie_secret = server_cfg.cookie_secret;
+        // A second server that shares the first's credentials, so a completed
+        // handshake would be possible if the cookie were accepted.
+        other_cfg.base.server = server_cfg.base.server.clone();
+
+        let mut client = Dtls12RecordEngine::new(client_cfg);
+        let mut issuer = Dtls12RecordEngine::new(server_cfg);
+        let mut other = Dtls12RecordEngine::new(other_cfg);
+        let (mut sink_c, mut sink_i, mut sink_o) =
+            (RecordingSink::default(), RecordingSink::default(), RecordingSink::default());
+
+        client.start(&mut sink_c);
+        let client_hello1 = sink_c.outbound.clone();
+        relay(&mut sink_c, &mut issuer, &mut sink_i); // ClientHello1 -> HelloVerifyRequest
+        relay(&mut sink_i, &mut client, &mut sink_c); // -> ClientHello2 carrying the cookie
+        let client_hello2 = sink_c.outbound.clone();
+        assert!(!client_hello2.is_empty());
+
+        // The issuing server accepts it and answers with its full flight...
+        for d in &client_hello2 {
+            issuer.feed_datagram(d, &mut sink_i);
+        }
+        let issued_flight: usize = sink_i.outbound.iter().map(Vec::len).sum();
+        assert!(issued_flight > 300, "ServerHello..Finished, not another cookie request");
+
+        // ...one with a different binding (having seen ClientHello1, as it
+        // would have from its own peer) refuses the cookie and repeats the
+        // (tiny) HelloVerifyRequest instead.
+        for d in &client_hello1 {
+            other.feed_datagram(d, &mut sink_o);
+        }
+        sink_o.outbound.clear();
+        for d in &client_hello2 {
+            other.feed_datagram(d, &mut sink_o);
+        }
+        let refused: usize = sink_o.outbound.iter().map(Vec::len).sum();
+        assert!(refused > 0 && refused < 100, "a HelloVerifyRequest only, got {refused} bytes");
+        assert!(!other.is_complete());
+    }
+}

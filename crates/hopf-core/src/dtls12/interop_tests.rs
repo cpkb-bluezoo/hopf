@@ -175,6 +175,7 @@ fn hopf_server_completes_handshake_against_openssl_client() {
         },
         require_cookie: false,
         cookie_secret: [0x11u8; 32],
+        cookie_binding: bytes::Bytes::new(),
     };
     let mut engine = Dtls12RecordEngine::new(server_cfg);
     let deadline = Instant::now() + OVERALL_DEADLINE;
@@ -258,6 +259,7 @@ fn hopf_client_completes_handshake_against_openssl_server() {
         },
         require_cookie: false,
         cookie_secret: [0u8; 32],
+        cookie_binding: bytes::Bytes::new(),
     };
     let mut engine = Dtls12RecordEngine::new(client_cfg);
     let mut start_sink = DriverSink::default();
