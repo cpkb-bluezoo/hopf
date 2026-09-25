@@ -576,8 +576,16 @@ mod tests {
         assert!(feed(XfrCollector::new(None), &[junk]).is_err(), "must start with SOA");
     }
 
+    /// A key with a random secret, fixed for the life of the test process
+    /// (the tests only need every call to agree, not a particular value).
     fn key() -> TsigKey {
-        TsigKey::new("k", crate::tsig::TsigAlgorithm::HmacSha256, vec![7; 32])
+        static SECRET: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+        let secret = SECRET.get_or_init(|| {
+            let mut b = [0u8; 32];
+            getrandom::getrandom(&mut b).expect("OS RNG");
+            b
+        });
+        TsigKey::new("k", crate::tsig::TsigAlgorithm::HmacSha256, secret.to_vec())
     }
 
     /// Signed, unsigned-intermediate and final-signed transfer messages as a
