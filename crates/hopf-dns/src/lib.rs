@@ -20,6 +20,7 @@ pub mod bailiwick;
 pub mod cache;
 pub mod client;
 pub mod cookie;
+pub mod ech;
 pub mod multi_qtype;
 pub mod multi_qtype_cache;
 pub mod system;

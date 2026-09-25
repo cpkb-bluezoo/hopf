@@ -58,3 +58,8 @@ required-features = ["integration"]
 name = "resolver_stub"
 path = "tests/resolver_stub.rs"
 required-features = ["integration"]
+
+[[test]]
+name = "ech_bootstrap"
+path = "tests/ech_bootstrap.rs"
+required-features = ["integration"]
