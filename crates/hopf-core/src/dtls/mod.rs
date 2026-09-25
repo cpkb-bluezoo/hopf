@@ -10,6 +10,7 @@
 //! fragmentation and reassembly ([`reassembly`]), and flight-based
 //! retransmission ([`retransmit`]).
 
+pub mod driver;
 mod engine;
 // `pub(crate)`, not private: `hopf-core::dtls12` (DTLS 1.2) reuses
 // `reassembly::Reassembler`, `retransmit::RetransmitState`, and

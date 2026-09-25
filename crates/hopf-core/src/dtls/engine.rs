@@ -8,9 +8,10 @@
 //! [`TlsEventSink`] callbacks into DTLS wire behaviour via an internal
 //! bridge, sink-based like every other engine in this crate.
 //!
-//! Loopback-only for now — no real UDP driver wiring, no external
-//! interop (see the crate-level module doc and `crypto-migration-plan.md`
-//! Phase 6 for the reasons and what's explicitly deferred).
+//! Engine tests here are loopback-only. The reactor-driven UDP driver that
+//! puts this engine on a real socket is [`super::driver`]; there is still no
+//! external DTLS 1.3 interop peer (see the crate-level module doc and
+//! `crypto-migration-plan.md` Phase 6 for what's explicitly deferred).
 
 use std::time::Duration;
 
@@ -41,8 +42,7 @@ const ALERT_LEVEL_FATAL: u8 = 2;
 const ALERT_CLOSE_NOTIFY: u8 = 0;
 
 /// Events emitted by [`DtlsRecordEngine`] — consumed by whatever owns the
-/// UDP socket (a future `hopf-core`/protocol-crate driver; loopback tests
-/// today). Shaped like [`crate::tls::TlsRecordSink`], with two DTLS-specific
+/// UDP socket ([`super::driver`] on a reactor; loopback tests). Shaped like [`crate::tls::TlsRecordSink`], with two DTLS-specific
 /// differences: `datagram_ready` hands over one complete outgoing UDP
 /// payload rather than an appendable byte stream (UDP has no stream to
 /// append to), and `arm_retransmit_timer` is new — DTLS is the first engine
