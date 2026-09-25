@@ -160,6 +160,15 @@ impl HandshakeEngine {
                     retry_configs: None,
                 });
             }
+            None if cfg.required => {
+                // Nothing has been sent: fail before the peer learns anything.
+                self.fail(
+                    sink,
+                    AlertDescription::EchRequired,
+                    "ECH is required but no usable ECHConfig is available (check the DNS HTTPS record or static configuration)",
+                );
+                return false;
+            }
             None if cfg.grease => {
                 self.ech_client = Some(EchClientState {
                     real: None,
@@ -448,19 +457,41 @@ impl HandshakeEngine {
 
     /// The server rejected ECH but the outer handshake authenticated for
     /// `public_name` and completed: abort with `ech_required` (RFC 9849
-    /// §6.1.6), reporting `retry_configs`, without ever finishing.
+    /// §6.1.6), without ever finishing.
+    ///
+    /// The server's `retry_configs` are reported only if they are worth
+    /// acting on: at least one config this stack can use, and this attempt
+    /// was not itself a retry. The message says which case applies.
     pub(super) fn ech_client_abort_rejected<S: TlsEventSink>(&mut self, sink: &mut S) {
-        let retry = self.ech_client.as_mut().and_then(|e| e.retry_configs.take());
+        let supplied = self.ech_client.as_mut().and_then(|e| e.retry_configs.take());
+        let (is_retry, preference) = self
+            .config
+            .ech_client
+            .as_ref()
+            .map(|c| (c.is_retry, c.preference.clone()))
+            .unwrap_or_default();
+        let (msg, retry) = match supplied {
+            None => ("server rejected ECH and supplied no retry_configs: ECH is disabled or not deployed there", None),
+            Some(_) if is_retry => (
+                "server rejected ECH again after retry_configs: it is misconfigured (inconsistent configs across nodes?)",
+                None,
+            ),
+            Some(raw) => {
+                let usable = EchConfig::parse_list(&raw)
+                    .map(|l| super::super::ech::usable_configs(&l, &preference))
+                    .unwrap_or_default();
+                match EchConfig::encode_list(&usable) {
+                    Ok(list) if !usable.is_empty() => (
+                        "server rejected ECH and supplied retry_configs",
+                        Some(Bytes::from(list)),
+                    ),
+                    _ => ("server rejected ECH and its retry_configs contain no usable config", None),
+                }
+            }
+        };
         if self.state != State::Failed {
             self.state = State::Failed;
-            let msg = if retry.is_some() {
-                "server rejected ECH and supplied retry_configs"
-            } else {
-                "server rejected ECH"
-            };
-            sink.protocol_error(
-                TlsProtocolError::new(AlertDescription::EchRequired, msg).with_ech_retry_configs(retry),
-            );
+            sink.protocol_error(TlsProtocolError::new(AlertDescription::EchRequired, msg).with_ech_retry_configs(retry));
         }
     }
 
@@ -1070,5 +1101,114 @@ mod tests {
         let server = EchServerConfig::new(vec![k1, k2, k3.retired()]);
         assert_eq!(server.retry_configs().unwrap(), EchConfig::encode_list(&[c1, c2]).unwrap());
         assert!(EchServerConfig::new(vec![]).retry_configs().is_none());
+    }
+
+    fn required(configs: Vec<EchConfig>) -> Option<EchClientConfig> {
+        Some(EchClientConfig::new(configs).require())
+    }
+
+    #[test]
+    fn required_with_no_config_fails_before_sending_anything() {
+        let creds = creds_for(&[INNER]);
+        for cfg in [EchClientConfig::grease_only().require(), EchClientConfig::new(vec![unusable_config()]).require()] {
+            let mut client = HandshakeEngine::new(client_cfg(&creds, Some(cfg), KxPolicy::classical_only()));
+            let mut sink = Sink::default();
+            client.start(&mut sink);
+            assert!(sink.out.is_empty(), "nothing may reach the network");
+            assert_eq!(sink.errors[0].alert, AlertDescription::EchRequired);
+            assert!(sink.errors[0].message.contains("no usable ECHConfig"), "{}", sink.errors[0].message);
+        }
+        // Without `required`, the same configs fall back to GREASE.
+        let mut client = HandshakeEngine::new(client_cfg(&creds, Some(EchClientConfig::new(vec![unusable_config()])), KxPolicy::classical_only()));
+        let mut sink = Sink::default();
+        client.start(&mut sink);
+        assert!(sink.errors.is_empty() && !sink.out.is_empty());
+    }
+
+    fn unusable_config() -> EchConfig {
+        // DHKEM(X448): a KEM this stack does not implement.
+        EchConfig::new(1, 0x21, vec![1; 56], vec![HpkeCipherSuite { kdf_id: 1, aead_id: 1 }], 0, PUBLIC, vec![]).unwrap()
+    }
+
+    #[test]
+    fn required_against_a_non_ech_server_fails_with_a_documented_error() {
+        let creds = creds_for(&[PUBLIC]);
+        let (_k, config) = server_key(7);
+        let o = run(
+            client_cfg(&creds, required(vec![config]), KxPolicy::classical_only()),
+            server_cfg(&creds, None, KxPolicy::classical_only()),
+            |_| {},
+        );
+        let err = o.client_sink.errors.first().expect("must fail");
+        assert_eq!(err.alert, AlertDescription::EchRequired);
+        assert!(err.message.contains("no retry_configs"), "{}", err.message);
+        assert!(err.ech_retry_configs.is_none());
+        assert!(o.client_sink.info.is_none(), "never reported as a success");
+    }
+
+    #[test]
+    fn a_retry_with_valid_retry_configs_succeeds_and_is_marked_as_a_retry() {
+        let creds = creds_for(&[INNER, PUBLIC]);
+        let (_old, stale) = server_key(7);
+        let (current, _) = server_key(8);
+        let server = || server_cfg(&creds, Some(vec![current.clone()]), KxPolicy::classical_only());
+        let o = run(client_cfg(&creds, required(vec![stale]), KxPolicy::classical_only()), server(), |_| {});
+        let retry = o.client_sink.errors[0].ech_retry_configs.clone().expect("retry_configs");
+        let cfg = EchClientConfig::from_retry_configs(&retry).unwrap().require();
+        assert!(cfg.is_retry && !cfg.grease);
+        let o = run(client_cfg(&creds, Some(cfg), KxPolicy::classical_only()), server(), |_| {});
+        ech_ok(&o);
+    }
+
+    #[test]
+    fn a_second_rejection_after_a_retry_is_reported_as_misconfiguration() {
+        // Rejected, told to retry with key 8, but the retry lands on a node
+        // that only knows key 9: no further retry_configs are offered.
+        let creds = creds_for(&[PUBLIC]);
+        let (_old, stale) = server_key(7);
+        let (node_a, _) = server_key(8);
+        let (node_b, _) = server_key(9);
+        let o = run(
+            client_cfg(&creds, required(vec![stale]), KxPolicy::classical_only()),
+            server_cfg(&creds, Some(vec![node_a]), KxPolicy::classical_only()),
+            |_| {},
+        );
+        let retry = o.client_sink.errors[0].ech_retry_configs.clone().unwrap();
+        let cfg = EchClientConfig::from_retry_configs(&retry).unwrap();
+        let o = run(client_cfg(&creds, Some(cfg), KxPolicy::classical_only()), server_cfg(&creds, Some(vec![node_b]), KxPolicy::classical_only()), |_| {});
+        let err = &o.client_sink.errors[0];
+        assert_eq!(err.alert, AlertDescription::EchRequired);
+        assert!(err.message.contains("misconfigured"), "{}", err.message);
+        assert!(err.ech_retry_configs.is_none(), "must not chain retries");
+    }
+
+    #[test]
+    fn bogus_retry_configs_are_not_reported() {
+        // A server that "retries" us with a config whose public_name is an IP
+        // literal: authenticated or not, no client may act on it.
+        let creds = creds_for(&[PUBLIC]);
+        let (_old, stale) = server_key(7);
+        let suites = vec![HpkeCipherSuite { kdf_id: 1, aead_id: 1 }];
+        let (bogus, bogus_key) = EchConfig::generate(8, Kem::DhkemX25519HkdfSha256, suites, 0, "192.0.2.1").unwrap();
+        let server_key = EchServerKey::new(bogus, bogus_key).unwrap();
+        let o = run(
+            client_cfg(&creds, required(vec![stale]), KxPolicy::classical_only()),
+            server_cfg(&creds, Some(vec![server_key]), KxPolicy::classical_only()),
+            |_| {},
+        );
+        let err = &o.client_sink.errors[0];
+        assert_eq!(err.alert, AlertDescription::EchRequired);
+        assert!(err.message.contains("no usable config"), "{}", err.message);
+        assert!(err.ech_retry_configs.is_none());
+        assert!(EchClientConfig::from_retry_configs(&EchConfig::encode_list(&[unusable_config()]).unwrap()).is_err());
+    }
+
+    #[test]
+    fn only_usable_retry_configs_are_passed_on() {
+        let suites = vec![HpkeCipherSuite { kdf_id: 1, aead_id: 1 }];
+        let (good, _) = EchConfig::generate(1, Kem::DhkemX25519HkdfSha256, suites, 0, PUBLIC).unwrap();
+        let list = EchConfig::encode_list(&[unusable_config(), good.clone()]).unwrap();
+        let cfg = EchClientConfig::from_retry_configs(&list).unwrap();
+        assert_eq!(cfg.configs, vec![good]);
     }
 }

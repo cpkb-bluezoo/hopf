@@ -21,6 +21,18 @@
 //! `retry_configs` to the caller. GREASE ECH is sent when no config is
 //! available. Split-mode topologies (a separate backend) are out of scope.
 //!
+//! # Trust model for configs
+//!
+//! An `ECHConfig` is only as trustworthy as where it came from. Configs from
+//! static configuration are as trusted as the configuration. Configs from DNS
+//! (HTTPS/SVCB `ech`) are only as trustworthy as that DNS answer: without
+//! DNSSEC or an authenticated transport an on-path attacker can strip or
+//! replace them, so pair them with [`EchClientConfig::required`] where ECH
+//! is a security requirement. `retry_configs` from a server are different:
+//! the engine reports them only after the handshake has authenticated the
+//! server for the config's `public_name`, so they are safe to use for one
+//! retry - see [`EchClientConfig::from_retry_configs`].
+//!
 //! A real ECH offer does not offer session resumption or 0-RTT: the PSK
 //! machinery would need a GREASE PSK in the outer hello (RFC 9849 §6.1.2).
 
@@ -33,7 +45,7 @@ use std::sync::Arc;
 use crate::crypto::hpke::{Aead, HpkePrivateKey, Kdf};
 
 pub use config::{
-    select_config, EchConfig, EchConfigError, EchSelection, HpkeCipherSuite, ECH_VERSION,
+    select_config, usable_configs, EchConfig, EchConfigError, EchSelection, HpkeCipherSuite, ECH_VERSION,
     SUPPORTED_HPKE_SUITES,
 };
 
@@ -51,6 +63,18 @@ pub struct EchClientConfig {
     /// KDF/AEAD preference, most preferred first. Only pairs a config
     /// advertises are ever used.
     pub preference: Vec<(Kdf, Aead)>,
+    /// Require ECH: with no usable config the handshake fails before
+    /// anything is sent (no GREASE, no plain hello), with an `ech_required`
+    /// error. A rejected offer already ends in `ech_required`
+    /// (RFC 9849 §6.1.6) whatever this says; this flag additionally closes
+    /// the "no config" gap, e.g. a DNS lookup that returned nothing. The
+    /// caller must not fall back to a plain connection after such an error.
+    pub required: bool,
+    /// These configs came from a previous rejection's `retry_configs`
+    /// (see [`Self::from_retry_configs`]). A server that rejects them too is
+    /// misconfigured; its new `retry_configs` are not offered again
+    /// (RFC 9849 §6.1.6: one retry per connection attempt).
+    pub is_retry: bool,
 }
 
 impl EchClientConfig {
@@ -60,7 +84,35 @@ impl EchClientConfig {
             configs,
             grease: true,
             preference: SUPPORTED_HPKE_SUITES.to_vec(),
+            required: false,
+            is_retry: false,
         }
+    }
+
+    /// Require ECH; see [`Self::required`].
+    pub fn require(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
+    /// Build the configuration for the one retry that follows an ECH
+    /// rejection, from the `ECHConfigList` in
+    /// [`TlsProtocolError::ech_retry_configs`](crate::tls::TlsProtocolError::ech_retry_configs).
+    /// Configs this stack cannot use (unsupported KEM or suites, invalid
+    /// `public_name`, unsupported mandatory extension) are dropped; if none
+    /// is left the server has effectively disabled ECH for us and this
+    /// returns an error. Marks the result [`Self::is_retry`]. The retry must
+    /// use a new transport connection, and only the addresses the original
+    /// ECH configuration allowed (RFC 9849 §6.1.6).
+    pub fn from_retry_configs(encoded: &[u8]) -> Result<Self, EchConfigError> {
+        let usable = usable_configs(&EchConfig::parse_list(encoded)?, &SUPPORTED_HPKE_SUITES);
+        if usable.is_empty() {
+            return Err(EchConfigError::InvalidField("no usable retry config"));
+        }
+        let mut cfg = Self::new(usable);
+        cfg.grease = false;
+        cfg.is_retry = true;
+        Ok(cfg)
     }
 
     /// Parse an encoded `ECHConfigList`.

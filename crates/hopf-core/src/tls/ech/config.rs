@@ -425,6 +425,16 @@ pub fn select_config<'a>(
     })
 }
 
+/// The configs a client could actually use: [`select_config`]'s criteria,
+/// applied to each config on its own, order kept.
+pub fn usable_configs(configs: &[EchConfig], preference: &[(Kdf, Aead)]) -> Vec<EchConfig> {
+    configs
+        .iter()
+        .filter(|c| select_config(std::slice::from_ref(c), preference).is_some())
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +571,18 @@ mod tests {
         let all = [x448, short, ip, good];
         let sel = select_config(&all, &SUPPORTED_HPKE_SUITES).unwrap();
         assert_eq!(sel.config.config_id, 4);
+    }
+
+    #[test]
+    fn usable_configs_keeps_only_what_a_client_could_use() {
+        let suites = vec![HpkeCipherSuite { kdf_id: 1, aead_id: 1 }];
+        let good = EchConfig::new(1, 0x20, vec![1; 32], suites.clone(), 0, "a.example", vec![]).unwrap();
+        let bad_kem = EchConfig::new(2, 0x21, vec![1; 56], suites.clone(), 0, "a.example", vec![]).unwrap();
+        let bad_name = EchConfig::new(3, 0x20, vec![1; 32], suites, 0, "1.2.3.4", vec![]).unwrap();
+        let no_suite = EchConfig::new(4, 0x20, vec![1; 32], vec![HpkeCipherSuite { kdf_id: 9, aead_id: 9 }], 0, "a.example", vec![]).unwrap();
+        let all = [bad_kem, good.clone(), bad_name, no_suite];
+        assert_eq!(usable_configs(&all, &SUPPORTED_HPKE_SUITES), vec![good]);
+        assert!(usable_configs(&[], &SUPPORTED_HPKE_SUITES).is_empty());
     }
 
     #[test]
