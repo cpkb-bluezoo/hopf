@@ -24,7 +24,7 @@ use crate::wire::{base32hex, canonical_compare, encode_name, normalize_name, Dns
 /// wraparound: the last NSEC(3) in a zone points back to the first, so
 /// its range covers everything after `owner` *and* everything before
 /// `next`.
-fn in_canonical_range(owner: &str, next: &str, name: &str) -> bool {
+pub(crate) fn in_canonical_range(owner: &str, next: &str, name: &str) -> bool {
     use std::cmp::Ordering::*;
     match canonical_compare(owner, next) {
         Less => canonical_compare(owner, name) == Less && canonical_compare(name, next) == Less,
@@ -59,7 +59,7 @@ fn nsec_proves_denial(records: &[&DnsResourceRecord], qname: &str, qtype: DnsTyp
 /// Raw-byte range membership for NSEC3 hashes: fixed-length digests, so
 /// unsigned byte-wise comparison already matches RFC 5155's ordering,
 /// with the same zone-apex wraparound as [`in_canonical_range`].
-fn hash_in_range(owner_hash: &[u8], next_hash: &[u8], candidate: &[u8]) -> bool {
+pub(crate) fn hash_in_range(owner_hash: &[u8], next_hash: &[u8], candidate: &[u8]) -> bool {
     match owner_hash.cmp(next_hash) {
         std::cmp::Ordering::Less => owner_hash < candidate && candidate < next_hash,
         std::cmp::Ordering::Equal => false,

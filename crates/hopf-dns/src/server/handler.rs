@@ -69,6 +69,11 @@ impl MetricsSink<'_> {
         self.0.lock().unwrap().stale_served += 1;
     }
 
+    /// Count a negative answer synthesised from cached NSEC/NSEC3 proofs.
+    pub fn aggressive_nsec(&self) {
+        self.0.lock().unwrap().aggressive_nsec_hits += 1;
+    }
+
     /// Count an error.
     pub fn error(&self) {
         self.0.lock().unwrap().errors += 1;

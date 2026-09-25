@@ -7,6 +7,8 @@
 //! * [`NxdomainCutPolicy`] - RFC 8020 "NXDOMAIN: there really is nothing
 //!   underneath".
 //! * [`MinimalAnyPolicy`](super::MinimalAnyPolicy) - RFC 8482 minimal `ANY`.
+//! * `AggressiveNsecPolicy` (feature `dnssec`) - RFC 8198 aggressive use of
+//!   validated NSEC/NSEC3 proofs.
 //!
 //! All three are attached to a [`ForwarderHandler`](super::ForwarderHandler)
 //! and, like the handler chain itself, take a closure where a policy is a
@@ -128,6 +130,54 @@ where
     F: Fn(&DnsQuestion) -> bool + Send + Sync,
 {
     fn nxdomain_cut(&self, question: &DnsQuestion) -> bool {
+        self(question)
+    }
+}
+
+/// Decides whether the forwarder may answer from cached, validated NSEC/NSEC3
+/// proofs (RFC 8198) instead of asking the upstream, and whether it should
+/// bother learning proofs for the question at all.
+///
+/// It only ever applies while DNSSEC validation is enabled on the upstream
+/// resolver. Turn it off where every query must reach the upstream (logging,
+/// telemetry, or an upstream that must see negative lookups). Any
+/// `Fn(&DnsQuestion) -> bool` is a policy.
+#[cfg(feature = "dnssec")]
+pub trait AggressiveNsecPolicy: Send + Sync {
+    /// `true` to synthesise (and learn proofs) for `question`.
+    fn aggressive_nsec(&self, question: &DnsQuestion) -> bool;
+}
+
+/// Use validated proofs wherever they apply (the default).
+#[cfg(feature = "dnssec")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AggressiveNsecEnabled;
+
+/// Never synthesise from cached proofs; every negative lookup goes upstream.
+#[cfg(feature = "dnssec")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AggressiveNsecDisabled;
+
+#[cfg(feature = "dnssec")]
+impl AggressiveNsecPolicy for AggressiveNsecEnabled {
+    fn aggressive_nsec(&self, _question: &DnsQuestion) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "dnssec")]
+impl AggressiveNsecPolicy for AggressiveNsecDisabled {
+    fn aggressive_nsec(&self, _question: &DnsQuestion) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "dnssec")]
+impl<F> AggressiveNsecPolicy for F
+where
+    F: Fn(&DnsQuestion) -> bool + Send + Sync,
+{
+    fn aggressive_nsec(&self, question: &DnsQuestion) -> bool {
         self(question)
     }
 }

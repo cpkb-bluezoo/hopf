@@ -33,6 +33,8 @@ mod dot;
 mod doq;
 
 pub use forwarder::ForwarderHandler;
+#[cfg(feature = "dnssec")]
+pub use policy::{AggressiveNsecDisabled, AggressiveNsecEnabled, AggressiveNsecPolicy};
 pub use policy::{
     NxdomainCutDisabled, NxdomainCutEnabled, NxdomainCutPolicy, ServeStale, ServeStaleDisabled, StalePolicy, StaleTerms,
 };
@@ -77,6 +79,10 @@ pub struct DnsServerMetrics {
     /// not be reached (RFC 8767). Counted apart from `cache_hits`: a rising
     /// value is a sign of upstream trouble.
     pub stale_served: u64,
+    /// Negative answers synthesised from cached, validated NSEC/NSEC3 proofs
+    /// without asking the upstream (RFC 8198; feature `dnssec`). Counted apart
+    /// from `cache_hits`.
+    pub aggressive_nsec_hits: u64,
     /// Queries that presented a DNS Cookie (RFC 7873) option.
     pub cookies_presented: u64,
     /// Of those, queries whose presented server cookie was verified

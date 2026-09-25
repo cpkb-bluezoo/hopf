@@ -14,6 +14,10 @@
 //!   name beneath it.
 //! * **RFC 8482 minimal `ANY`** - an `ANY` answer is reduced to one synthesised
 //!   `HINFO` record.
+//! * **RFC 8198 aggressive NSEC/NSEC3** (feature `dnssec`) - while the upstream
+//!   resolver validates DNSSEC, a negative answer whose denial it has verified
+//!   is remembered as a proof, and later queries the proof covers are answered
+//!   locally.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -21,6 +25,8 @@ use std::time::{Duration, Instant};
 
 use super::handler::{DnsQueryHandler, HandlerOutcome, QueryContext};
 use super::minimal_any::{MinimalAnyEnabled, MinimalAnyPolicy};
+#[cfg(feature = "dnssec")]
+use super::policy::{AggressiveNsecEnabled, AggressiveNsecPolicy};
 use super::policy::{NxdomainCutEnabled, NxdomainCutPolicy, ServeStale, StalePolicy};
 use crate::cache::DnsCache;
 use crate::client::DnsResolver;
@@ -55,6 +61,8 @@ pub struct ForwarderHandler {
     stale: Box<dyn StalePolicy>,
     nxdomain_cut: Box<dyn NxdomainCutPolicy>,
     minimal_any: Box<dyn MinimalAnyPolicy>,
+    #[cfg(feature = "dnssec")]
+    aggressive_nsec: Box<dyn AggressiveNsecPolicy>,
     minimal_any_ttl: u32,
     upstream_timeout: Duration,
     client_response_timer: Duration,
@@ -73,6 +81,8 @@ impl ForwarderHandler {
             stale: Box::new(ServeStale::default()),
             nxdomain_cut: Box::new(NxdomainCutEnabled),
             minimal_any: Box::new(MinimalAnyEnabled),
+            #[cfg(feature = "dnssec")]
+            aggressive_nsec: Box::new(AggressiveNsecEnabled),
             minimal_any_ttl: DEFAULT_MINIMAL_ANY_TTL,
             upstream_timeout: DEFAULT_UPSTREAM_TIMEOUT,
             client_response_timer: DEFAULT_CLIENT_RESPONSE_TIMER,
@@ -103,6 +113,15 @@ impl ForwarderHandler {
     /// Replace the minimal-`ANY` policy (RFC 8482); see [`MinimalAnyPolicy`].
     pub fn with_minimal_any_policy(mut self, policy: impl MinimalAnyPolicy + 'static) -> Self {
         self.minimal_any = Box::new(policy);
+        self
+    }
+
+    /// Replace the aggressive-NSEC policy (RFC 8198); see
+    /// [`AggressiveNsecPolicy`]. It has an effect only while the upstream
+    /// resolver has DNSSEC validation enabled.
+    #[cfg(feature = "dnssec")]
+    pub fn with_aggressive_nsec_policy(mut self, policy: impl AggressiveNsecPolicy + 'static) -> Self {
+        self.aggressive_nsec = Box::new(policy);
         self
     }
 
@@ -199,6 +218,33 @@ fn minimise_any(resp: &mut DnsMessage, q: &DnsQuestion, ttl: u32) {
     resp.additionals.retain(|rr| rr.rtype == Some(DnsType::Opt));
 }
 
+/// Remember the NSEC/NSEC3 proof in a negative response for RFC 8198, but only
+/// once the resolver has verified it: the denial is validated up its own chain
+/// of trust in the background, and a proof that does not come out `Secure` is
+/// discarded. The client's own answer never waits for this.
+#[cfg(feature = "dnssec")]
+fn learn_denial(resolver: &DnsResolver, cache: &Arc<DnsCache>, q: &DnsQuestion, resp: &DnsMessage) {
+    let negative = resp.rcode() == RCODE_NXDOMAIN || (resp.rcode() == 0 && resp.answers.is_empty());
+    let proof = resp.authorities.iter().any(|rr| matches!(rr.rtype, Some(DnsType::Nsec | DnsType::Nsec3)));
+    let Some(qtype) = q.qtype else {
+        return;
+    };
+    if !negative || !proof {
+        return;
+    }
+    let cache = Arc::clone(cache);
+    resolver.validate_denial_of_existence(
+        &q.name,
+        qtype,
+        resp.clone(),
+        Box::new(move |msg, status| {
+            if status == crate::dnssec::DnssecStatus::Secure {
+                cache.denials().store_validated(&msg);
+            }
+        }),
+    );
+}
+
 impl DnsQueryHandler for ForwarderHandler {
     fn handle_query(&self, query: &DnsMessage, ctx: &QueryContext<'_>) -> HandlerOutcome {
         let q = &query.questions[0];
@@ -222,6 +268,25 @@ impl DnsQueryHandler for ForwarderHandler {
             let mut resp = query.response_template(0);
             resp.answers = answers;
             return HandlerOutcome::Respond(resp);
+        }
+
+        // RFC 8198: a cached, validated NSEC/NSEC3 proof may already answer.
+        #[cfg(feature = "dnssec")]
+        let learn_proofs = self.upstream.as_ref().is_some_and(DnsResolver::is_dnssec_enabled)
+            && self.aggressive_nsec.aggressive_nsec(q);
+        #[cfg(feature = "dnssec")]
+        if learn_proofs {
+            if let Some(denial) = self.cache.denials().synthesize(q) {
+                ctx.metrics.aggressive_nsec();
+                let has_do = query.has_do();
+                let mut resp = query.response_template(denial.rcode);
+                resp.authorities = denial.authorities(has_do);
+                if has_do {
+                    // We validated these proofs when we cached them.
+                    resp.flags |= crate::wire::FLAG_AD;
+                }
+                return HandlerOutcome::Respond(resp);
+            }
         }
 
         // Anything expired but still inside the stale window that policy lets
@@ -258,6 +323,8 @@ impl DnsQueryHandler for ForwarderHandler {
         let cache = Arc::clone(&self.cache);
         let failures = Arc::clone(&self.failures);
         let (id, question, key) = (query.id, q.clone(), Self::failure_key(q));
+        #[cfg(feature = "dnssec")]
+        let resolver = learn_proofs.then(|| upstream.clone());
         upstream.query_with_cd(
             q.clone(),
             query.is_checking_disabled(),
@@ -271,6 +338,10 @@ impl DnsQueryHandler for ForwarderHandler {
                         minimise_any(&mut resp, &question, ttl);
                     }
                     cache.put_response(&resp);
+                    #[cfg(feature = "dnssec")]
+                    if let Some(resolver) = resolver.as_ref() {
+                        learn_denial(resolver, &cache, &question, &resp);
+                    }
                     if matches!(resp.rcode(), 0 | RCODE_NXDOMAIN) {
                         failures.lock().unwrap().remove(&key);
                     }
