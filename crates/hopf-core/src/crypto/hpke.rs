@@ -335,8 +335,9 @@ impl Context {
         let nonce = labeled_expand(kdf, &suite_id, &secret, b"base_nonce", &ks_context, NONCE_LEN)?;
         let exporter_secret =
             labeled_expand(kdf, &suite_id, &secret, b"exp", &ks_context, kdf.hash_len())?;
-        let mut base_nonce = [0u8; NONCE_LEN];
-        base_nonce.copy_from_slice(&nonce);
+        // Taken straight from the derived bytes rather than copied into a
+        // zero-initialised buffer.
+        let base_nonce: [u8; NONCE_LEN] = nonce.as_slice().try_into().map_err(|_| HpkeError)?;
         Ok(Self {
             suite,
             key,
