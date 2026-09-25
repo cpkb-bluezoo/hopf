@@ -1211,4 +1211,21 @@ mod tests {
         let cfg = EchClientConfig::from_retry_configs(&list).unwrap();
         assert_eq!(cfg.configs, vec![good]);
     }
+
+    #[test]
+    fn ech_works_over_quic_including_transport_parameters() {
+        // The same engine drives QUIC: transport parameters travel in the inner
+        // hello (and are copied to the outer), and the record layer is absent.
+        let creds = creds_for(&[INNER, PUBLIC]);
+        let (key, config) = server_key(7);
+        let mut client = client_cfg(&creds, Some(EchClientConfig::new(vec![config])), KxPolicy::classical_only());
+        let mut server = server_cfg(&creds, Some(vec![key]), KxPolicy::classical_only());
+        client.mode = HandshakeMode::Quic;
+        server.mode = HandshakeMode::Quic;
+        client.local_transport_parameters = Some(Bytes::from_static(b"\x01\x02\x40\x64"));
+        server.local_transport_parameters = Some(Bytes::from_static(b"\x01\x02\x40\x64"));
+        let o = run(client, server, |_| {});
+        ech_ok(&o);
+        assert!(!contains(&o.client_sent, INNER.as_bytes()));
+    }
 }
