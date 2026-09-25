@@ -104,6 +104,8 @@ pub struct DnsCache {
     max_entries: usize,
     negative_ttl: u32,
     max_stale: Duration,
+    #[cfg(feature = "dnssec")]
+    denials: crate::dnssec::DenialCache,
 }
 
 impl Default for DnsCache {
@@ -120,7 +122,17 @@ impl DnsCache {
             max_entries,
             negative_ttl,
             max_stale: DEFAULT_MAX_STALE,
+            #[cfg(feature = "dnssec")]
+            denials: crate::dnssec::DenialCache::new(),
         }
+    }
+
+    /// Validated NSEC/NSEC3 proofs for aggressive negative answers (RFC 8198).
+    /// Kept beside the record cache but separate from it: entries are whole
+    /// proofs per zone, not per name. See [`crate::dnssec::DenialCache`].
+    #[cfg(feature = "dnssec")]
+    pub fn denials(&self) -> &crate::dnssec::DenialCache {
+        &self.denials
     }
 
     /// How long an expired positive entry is retained for Serve-Stale

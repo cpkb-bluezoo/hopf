@@ -8,6 +8,7 @@
 //! - Ed448 (16) — via [`hopf_core::crypto::ed448`] (`aws-lc-rs` has no
 //!   Ed448 support)
 
+mod aggressive;
 mod algorithm;
 mod crypto;
 mod denial;
@@ -15,6 +16,7 @@ mod status;
 mod trust_anchor;
 mod validator;
 
+pub use aggressive::{DenialCache, SynthesizedDenial, SynthesizedRecord};
 pub use algorithm::DnssecAlgorithm;
 pub use crypto::{compute_ds_digest, nsec3_hash};
 pub use denial::verify_denial;

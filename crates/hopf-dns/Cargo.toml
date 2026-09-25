@@ -68,3 +68,8 @@ required-features = ["integration"]
 name = "forwarder_policy"
 path = "tests/forwarder_policy.rs"
 required-features = ["integration", "server"]
+
+[[test]]
+name = "aggressive_nsec"
+path = "tests/aggressive_nsec.rs"
+required-features = ["integration", "server", "dnssec"]
