@@ -93,6 +93,11 @@ pub mod ext {
     /// Record Size Limit (RFC 8449): the largest protected-record plaintext
     /// this endpoint is willing to receive.
     pub const RECORD_SIZE_LIMIT: u16 = 0x001c;
+    /// Encrypted Client Hello (RFC 9849 §5).
+    pub const ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
+    /// `ech_outer_extensions` (RFC 9849 §5.1) - only ever inside an
+    /// `EncodedClientHelloInner`, never on the wire.
+    pub const ECH_OUTER_EXTENSIONS: u16 = 0xfd00;
 }
 
 /// Smallest `record_size_limit` value an endpoint may send (RFC 8449 §4).
@@ -176,21 +181,28 @@ pub struct ClientHelloParams {
 /// zeros for a truncated build used only to measure binder offset). Prefer
 /// [`build_client_hello_with_binder`] for the resumptive path.
 pub fn build_client_hello(params: &ClientHelloParams) -> HandshakeMessage {
-    let (msg, _) = build_client_hello_inner(params, true);
+    let (msg, _) = build_client_hello_inner(params, true, None);
     msg
 }
 
-/// Build ClientHello and return the truncated encoding used for binder computation
-/// (full handshake header + body through PSK identities, excluding binders).
-pub fn build_client_hello_truncated_for_binder(params: &ClientHelloParams) -> Bytes {
-    let (_, truncated) = build_client_hello_inner(params, false);
-    truncated.expect("psk required for truncated CH")
+/// Build a `ClientHello` carrying an `encrypted_client_hello` extension
+/// (RFC 9849 §5) whose body is `ech_extension` - the inner marker for a
+/// ClientHelloInner, or the outer variant for a ClientHelloOuter. Placed after
+/// every other extension, which ECH's outer construction requires (its
+/// payload is computed last). A real ECH offer never carries a PSK; a GREASE
+/// one may (then use [`build_client_hello_with_binder`]).
+pub fn build_client_hello_with_ech(params: &ClientHelloParams, ech_extension: &[u8]) -> HandshakeMessage {
+    let (msg, _) = build_client_hello_inner(params, true, Some(ech_extension));
+    msg
 }
 
-/// Build a resumptive ClientHello: compute binder over the truncated form, then
-/// emit the complete message.
+/// Build a resumptive ClientHello: compute the binder over the truncated
+/// form, then emit the complete message. `ech_extension` is an optional
+/// (GREASE) `encrypted_client_hello` body, RFC 9849 §6.2; it precedes
+/// `pre_shared_key`, so the binder covers it.
 pub fn build_client_hello_with_binder(
     mut params: ClientHelloParams,
+    ech_extension: Option<&[u8]>,
     compute_binder: impl FnOnce(&[u8; 32]) -> [u8; 32],
 ) -> HandshakeMessage {
     assert!(params.psk.is_some(), "psk required");
@@ -198,7 +210,8 @@ pub fn build_client_hello_with_binder(
     if let Some(psk) = params.psk.as_mut() {
         psk.binder = [0u8; 32];
     }
-    let truncated = build_client_hello_truncated_for_binder(&params);
+    let (_, truncated) = build_client_hello_inner(&params, false, ech_extension);
+    let truncated = truncated.expect("psk required for truncated CH");
     let hash = {
         use aws_lc_rs::digest::{digest, SHA256};
         let d = digest(&SHA256, &truncated);
@@ -210,12 +223,13 @@ pub fn build_client_hello_with_binder(
     if let Some(psk) = params.psk.as_mut() {
         psk.binder = binder;
     }
-    build_client_hello(&params)
+    build_client_hello_inner(&params, true, ech_extension).0
 }
 
 fn build_client_hello_inner(
     params: &ClientHelloParams,
     include_binders: bool,
+    ech_extension: Option<&[u8]>,
 ) -> (HandshakeMessage, Option<Bytes>) {
     let mut body = BytesMut::new();
     body.extend_from_slice(&params.legacy_version.to_be_bytes());
@@ -305,6 +319,9 @@ fn build_client_hello_inner(
     }
     if let Some(cookie) = &params.cookie {
         push_extension(&mut extensions, ext::COOKIE, cookie);
+    }
+    if let Some(ech) = ech_extension {
+        push_extension(&mut extensions, ext::ENCRYPTED_CLIENT_HELLO, ech);
     }
 
     let mut truncated_wire = None;
@@ -421,12 +438,17 @@ pub fn build_server_hello_ext(
 /// `key_share`). `legacy_session_id_echo` follows the same rule as
 /// [`build_server_hello_ext`]. `cookie`, when set, is echoed verbatim by the
 /// client in its followup ClientHello.
+/// `ech_confirmation`, when set, becomes an `encrypted_client_hello`
+/// extension of 8 octets: `hrr_accept_confirmation` (RFC 9849 §7.2.1) when
+/// ECH was accepted, or - for a client-facing server that rejected ECH -
+/// optionally 8 random octets (§7.1).
 pub fn build_hello_retry_request(
     legacy_session_id_echo: &[u8],
     cipher_suite: u16,
     selected_group: u16,
     cookie: Option<&[u8]>,
     legacy_version: u16,
+    ech_confirmation: Option<&[u8; 8]>,
 ) -> HandshakeMessage {
     let mut body = BytesMut::new();
     body.extend_from_slice(&legacy_version.to_be_bytes());
@@ -443,6 +465,9 @@ pub fn build_hello_retry_request(
     if let Some(cookie) = cookie {
         push_extension(&mut extensions, ext::COOKIE, cookie);
     }
+    if let Some(conf) = ech_confirmation {
+        push_extension(&mut extensions, ext::ENCRYPTED_CLIENT_HELLO, conf);
+    }
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
     body.extend_from_slice(&extensions);
 
@@ -457,11 +482,15 @@ pub fn build_hello_retry_request(
 /// `None` when the client didn't offer the extension or none of its offers matched (RFC 8446
 /// §4.2: a server MUST NOT send an extension the client didn't offer — `Some(b"h3")` when the
 /// client sent no ALPN extension at all is a real, previously-shipped bug, not padding).
+/// `ech_retry_configs`, when set, becomes an `encrypted_client_hello`
+/// extension carrying an encoded `ECHConfigList` (RFC 9849 §7.1) - sent when
+/// the server rejected (or could not decrypt) the client's ECH.
 pub fn build_encrypted_extensions_ext(
     alpn: Option<&[u8]>,
     transport_parameters: Option<&[u8]>,
     early_data_accepted: bool,
     record_size_limit: Option<u16>,
+    ech_retry_configs: Option<&[u8]>,
 ) -> HandshakeMessage {
     let mut extensions = BytesMut::new();
     if let Some(alpn) = alpn {
@@ -477,6 +506,9 @@ pub fn build_encrypted_extensions_ext(
     // only when the client sent the extension.
     if let Some(limit) = record_size_limit {
         push_extension(&mut extensions, ext::RECORD_SIZE_LIMIT, &limit.to_be_bytes());
+    }
+    if let Some(configs) = ech_retry_configs {
+        push_extension(&mut extensions, ext::ENCRYPTED_CLIENT_HELLO, configs);
     }
     let mut body = BytesMut::new();
     body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());

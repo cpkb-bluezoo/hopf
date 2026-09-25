@@ -91,6 +91,28 @@ pub fn dtls_expand_label(secret: &[u8], label: &str, context: &[u8], len: usize)
     expand_label_with_prefix(DTLS13_LABEL_PREFIX, secret, label, context, len)
 }
 
+/// The 8-octet ECH acceptance signal of RFC 9849 §7.2 / §7.2.1:
+/// `HKDF-Expand-Label(HKDF-Extract(0, client_random), label, transcript_hash, 8)`,
+/// where `label` is `"ech accept confirmation"` (ServerHello) or
+/// `"hrr ech accept confirmation"` (HelloRetryRequest), `client_random` is
+/// the `ClientHelloInner.random`, and `dtls` selects RFC 9147 §5.9's label
+/// prefix.
+pub fn ech_accept_confirmation(
+    client_random: &[u8; 32],
+    label: &str,
+    transcript_hash: &[u8; 32],
+    dtls: bool,
+) -> [u8; 8] {
+    use aws_lc_rs::hmac;
+    // HKDF-Extract(salt, ikm) = HMAC-Hash(salt, ikm); the salt is Hash.length zeros.
+    let prk = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &[0u8; 32]), client_random);
+    let prefix = if dtls { DTLS13_LABEL_PREFIX } else { TLS13_LABEL_PREFIX };
+    let out = expand_label_with_prefix(prefix, prk.as_ref(), label, transcript_hash, 8);
+    let mut conf = [0u8; 8];
+    conf.copy_from_slice(&out);
+    conf
+}
+
 fn extract_with_prefix(prefix: &'static str, salt: Option<&[u8]>, ikm: &[u8]) -> HkdfPrk {
     let salt_bytes = salt.unwrap_or(&[0u8; 32]);
     let salt = Salt::new(TLS13_HKDF, salt_bytes);

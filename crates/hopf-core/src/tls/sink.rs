@@ -17,6 +17,13 @@ pub struct TlsProtocolError {
     pub alert: AlertDescription,
     /// Human-readable detail for logs.
     pub message: String,
+    /// Set when the peer rejected Encrypted Client Hello and supplied
+    /// `retry_configs` (RFC 9849 §6.1.6): the raw `ECHConfigList` the server
+    /// offered, **unauthenticated by the ECH outer handshake alone** - it is
+    /// only usable if the handshake also authenticated the server for the
+    /// config's `public_name`, which the engine has already required by the
+    /// time it reports this. `None` for every other error.
+    pub ech_retry_configs: Option<Bytes>,
 }
 
 impl TlsProtocolError {
@@ -25,7 +32,14 @@ impl TlsProtocolError {
         Self {
             alert,
             message: message.into(),
+            ech_retry_configs: None,
         }
+    }
+
+    /// Attach the server's ECH `retry_configs` (see [`Self::ech_retry_configs`]).
+    pub fn with_ech_retry_configs(mut self, configs: Option<Bytes>) -> Self {
+        self.ech_retry_configs = configs;
+        self
     }
 }
 
@@ -102,6 +116,9 @@ pub enum AlertDescription {
     /// No application-layer protocol overlapped during ALPN negotiation
     /// (RFC 7301).
     NoApplicationProtocol,
+    /// The client offered Encrypted Client Hello and the server did not
+    /// accept it (RFC 9849 §11.2).
+    EchRequired,
     /// A wire code outside the set above — only constructed when relaying
     /// an alert the *peer* sent, never when this crate sends its own.
     Other(u8),
@@ -138,6 +155,7 @@ impl AlertDescription {
             Self::UnknownPskIdentity => 115,
             Self::CertificateRequired => 116,
             Self::NoApplicationProtocol => 120,
+            Self::EchRequired => 121,
             Self::Other(code) => code,
         }
     }
@@ -174,6 +192,7 @@ impl AlertDescription {
             115 => Self::UnknownPskIdentity,
             116 => Self::CertificateRequired,
             120 => Self::NoApplicationProtocol,
+            121 => Self::EchRequired,
             other => Self::Other(other),
         }
     }

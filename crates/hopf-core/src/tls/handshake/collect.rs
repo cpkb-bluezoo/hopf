@@ -54,6 +54,9 @@ pub struct ParsedClientHello {
     /// client sent one. Decoded by the engine so a malformed length is a
     /// `decode_error` rather than silently ignored.
     pub record_size_limit: Option<Bytes>,
+    /// Raw body of an `encrypted_client_hello` extension (RFC 9849 §5), if
+    /// the client sent one. Interpreted by the engine's ECH handling.
+    pub ech: Option<Bytes>,
 }
 
 /// Parsed `ServerHello` fields needed for key schedule (Phase 2 subset).
@@ -77,6 +80,9 @@ pub struct ParsedServerHello {
     /// Cookie extension (RFC 8446 §4.2.2), when the server sent one — only
     /// meaningful when [`Self::is_hello_retry_request`].
     pub cookie: Option<Bytes>,
+    /// Raw body of an `encrypted_client_hello` extension - the ECH
+    /// acceptance confirmation in a `HelloRetryRequest` (RFC 9849 §7.2.1).
+    pub ech: Option<Bytes>,
 }
 
 /// Parsed EncryptedExtensions content.
@@ -90,6 +96,9 @@ pub struct ParsedEncryptedExtensions {
     pub early_data: bool,
     /// Raw body of a `record_size_limit` extension (RFC 8449), if present.
     pub record_size_limit: Option<Bytes>,
+    /// Raw body of an `encrypted_client_hello` extension: the server's
+    /// `retry_configs` (RFC 9849 §5).
+    pub ech: Option<Bytes>,
 }
 
 /// Parsed NewSessionTicket (post-handshake).
@@ -164,6 +173,8 @@ impl HandshakeEvents for ClientHelloCollector {
     fn extension(&mut self, ext_type: u16, data: &[u8]) {
         if ext_type == super::messages::ext::RECORD_SIZE_LIMIT {
             self.out.record_size_limit = Some(Bytes::copy_from_slice(data));
+        } else if ext_type == super::messages::ext::ENCRYPTED_CLIENT_HELLO {
+            self.out.ech = Some(Bytes::copy_from_slice(data));
         }
     }
 
@@ -234,6 +245,12 @@ impl HandshakeEvents for ServerHelloCollector {
         }
     }
 
+    fn extension(&mut self, ext_type: u16, data: &[u8]) {
+        if ext_type == super::messages::ext::ENCRYPTED_CLIENT_HELLO {
+            self.out.ech = Some(Bytes::copy_from_slice(data));
+        }
+    }
+
     fn message_end(&mut self, _msg_type: HandshakeType, _wire: Bytes) {}
 
     fn parse_error(&mut self, _detail: &'static str) {
@@ -269,6 +286,8 @@ impl HandshakeEvents for EncryptedExtensionsCollector {
     fn extension(&mut self, ext_type: u16, data: &[u8]) {
         if ext_type == super::messages::ext::RECORD_SIZE_LIMIT {
             self.out.record_size_limit = Some(Bytes::copy_from_slice(data));
+        } else if ext_type == super::messages::ext::ENCRYPTED_CLIENT_HELLO {
+            self.out.ech = Some(Bytes::copy_from_slice(data));
         }
     }
 
@@ -759,6 +778,7 @@ impl HandshakeEvents for MessageCollector {
     fn extension(&mut self, ext_type: u16, data: &[u8]) {
         match self {
             Self::ClientHello(c) => c.extension(ext_type, data),
+            Self::ServerHello(c) => c.extension(ext_type, data),
             Self::EncryptedExtensions(c) => c.extension(ext_type, data),
             _ => {}
         }

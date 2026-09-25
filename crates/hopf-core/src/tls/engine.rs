@@ -11,12 +11,14 @@ use crate::crypto::kx_policy::KxPolicy;
 use crate::security::SecurityInfo;
 use std::sync::Arc;
 
+mod ech;
+
 use super::handshake::verify::{sign_certificate_verify, verify_certificate_verify};
 
 use super::handshake::{
     build_certificate, build_certificate_request, build_certificate_verify, build_client_hello,
-    build_client_hello_with_binder, build_encrypted_extensions_ext, build_finished,
-    build_hello_retry_request, build_key_update, build_server_hello_ext, compute_finished_verify_data,
+    build_client_hello_with_binder, build_client_hello_with_ech, build_encrypted_extensions_ext,
+    build_finished, build_hello_retry_request, build_key_update, build_server_hello_ext, compute_finished_verify_data,
     compute_psk_binder, derive_application_traffic_with_psk, derive_early_traffic,
     derive_handshake_traffic_with_psk, derive_resumption_master_secret, derive_resumption_psk,
     decode_record_size_limit, key_update_request, ApplicationTrafficSecrets, ClientHelloParams,
@@ -279,6 +281,15 @@ pub struct HandshakeConfig {
     /// effect only once both sides have sent the extension; see
     /// [`TlsEventSink::record_size_limit_negotiated`].
     pub record_size_limit: Option<u16>,
+    /// Encrypted Client Hello (RFC 9849), client role: encrypt the
+    /// ClientHello to the server's `ECHConfig`, or GREASE when there is
+    /// none. `None` (the default) sends a plain ClientHello. Ignored on the
+    /// server.
+    pub ech_client: Option<super::ech::EchClientConfig>,
+    /// Encrypted Client Hello, server role: the ECH keys this server accepts
+    /// and publishes. `None` (the default) ignores `encrypted_client_hello`
+    /// like any unknown extension. Ignored on the client.
+    pub ech_server: Option<Arc<super::ech::EchServerConfig>>,
 }
 
 impl Default for HandshakeConfig {
@@ -304,6 +315,8 @@ impl Default for HandshakeConfig {
             client_trust_store: None,
             client_credentials: None,
             record_size_limit: None,
+            ech_client: None,
+            ech_server: None,
         }
     }
 }
@@ -390,6 +403,10 @@ pub struct HandshakeEngine {
     /// and to distinguish "first mismatch" (send HRR) from "still
     /// mismatched after retry" (fail) in `on_client_hello`.
     server_retry_requested_group: Option<NamedGroup>,
+    /// Client role: Encrypted Client Hello / GREASE state (RFC 9849).
+    ech_client: Option<ech::EchClientState>,
+    /// Server role: Encrypted Client Hello state.
+    ech_server: ech::EchServerState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -456,6 +473,8 @@ impl HandshakeEngine {
             client_retried: false,
             client_retry_cookie: None,
             server_retry_requested_group: None,
+            ech_client: None,
+            ech_server: ech::EchServerState::default(),
         }
     }
 
@@ -594,7 +613,10 @@ impl HandshakeEngine {
                 HandshakeType::ClientHello,
                 State::Initial | State::HelloRetryRequestSent,
                 ParsedIncoming::ClientHello(ch),
-            ) => self.on_client_hello(ch, wire, sink),
+            ) => match self.ech_server_unwrap(ch, wire, sink) {
+                Some((ch, wire)) => self.on_client_hello(ch, wire, sink),
+                None => false,
+            },
             (
                 HandshakeRole::Server,
                 HandshakeType::Certificate,
@@ -619,6 +641,9 @@ impl HandshakeEngine {
     }
 
     fn client_send_hello<S: TlsEventSink>(&mut self, sink: &mut S) {
+        if !self.ech_client_init(sink) {
+            return;
+        }
         let offer = self.config.kx_policy.preferred();
         self.client_send_hello_inner(offer, None, sink);
     }
@@ -663,11 +688,15 @@ impl HandshakeEngine {
             .map(|g| g.code())
             .collect();
 
-        let ticket = self
-            .config
-            .server_name
-            .as_ref()
-            .and_then(|n| self.config.ticket_store.as_ref().and_then(|s| s.get(n)));
+        // A real ECH offer does not resume (no GREASE PSK in the outer hello).
+        let ticket = if self.ech_client_is_real() {
+            None
+        } else {
+            self.config
+                .server_name
+                .as_ref()
+                .and_then(|n| self.config.ticket_store.as_ref().and_then(|s| s.get(n)))
+        };
 
         let want_early = !is_retry
             && self.config.enable_early_data
@@ -704,10 +733,21 @@ impl HandshakeEngine {
             legacy_version: self.config.mode.legacy_version(),
         };
 
+        if self.ech_client_is_real() {
+            if !self.ech_client_send_real(params, is_retry, sink) {
+                return;
+            }
+            self.local_key_share = Some(local);
+            self.state = State::ClientHelloSent;
+            return;
+        }
+        let grease = self.ech_grease_extension(&params, is_retry);
         let hello = if let Some(psk) = self.psk {
-            build_client_hello_with_binder(params, |hash| {
+            build_client_hello_with_binder(params, grease.as_deref(), |hash| {
                 compute_psk_binder(&psk, &TranscriptHash::from_bytes(*hash), dtls)
             })
+        } else if let Some(ext) = grease.as_deref() {
+            build_client_hello_with_ech(&params, ext)
         } else {
             build_client_hello(&params)
         };
@@ -759,6 +799,9 @@ impl HandshakeEngine {
     ) -> bool {
         if sh.is_hello_retry_request {
             return self.on_hello_retry_request(sh, encoded, sink);
+        }
+        if !self.ech_client_on_server_hello(&encoded, sink) {
+            return false;
         }
         let Some(aead) = Tls13Aead::from_suite(sh.cipher_suite) else {
             self.fail(sink, AlertDescription::HandshakeFailure, "unsupported cipher suite");
@@ -818,6 +861,9 @@ impl HandshakeEngine {
             self.fail(sink, AlertDescription::UnexpectedMessage, "server sent a second HelloRetryRequest");
             return false;
         }
+        if !self.ech_client_on_hello_retry_request(&sh, &encoded, sink) {
+            return false;
+        }
         // RFC 8446 §4.1.4: the server MUST NOT include `key_share` in the
         // HelloRetryRequest unless it actually needs to change the group —
         // a cookie-only HRR (no `key_share` extension at all) is valid and
@@ -860,6 +906,9 @@ impl HandshakeEngine {
         sink: &mut S,
     ) -> bool {
         self.transcript.add_message(&encoded);
+        if !self.ech_client_on_encrypted_extensions(&ee, sink) {
+            return false;
+        }
         // RFC 7301 §3.2: a server MUST NOT select a protocol the client
         // didn't offer. Accepting it silently would let a misbehaving or
         // compromised server steer the connection into a protocol
@@ -926,11 +975,11 @@ impl HandshakeEngine {
         sink.verification_requested(super::sink::VerifyRequest {
             id: self.verify_id,
             peer_chain: self.peer_certs.clone(),
-            server_name: self.config.server_name.clone(),
+            server_name: self.verification_name().map(str::to_owned),
         });
         if let Some(store) = &self.config.trust_store {
             let ok = store
-                .verify_server_chain(&self.peer_certs, self.config.server_name.as_deref())
+                .verify_server_chain(&self.peer_certs, self.verification_name())
                 .is_ok();
             self.verify_pending = false;
             if !ok {
@@ -940,7 +989,7 @@ impl HandshakeEngine {
             return true;
         }
         if let Some(verify) = &self.config.verify_override {
-            let ok = (verify.0)(&self.peer_certs, self.config.server_name.as_deref());
+            let ok = (verify.0)(&self.peer_certs, self.verification_name());
             self.verify_pending = false;
             if !ok {
                 self.fail(sink, AlertDescription::BadCertificate, "certificate verification failed");
@@ -1004,6 +1053,12 @@ impl HandshakeEngine {
             return false;
         }
         self.transcript.add_message(&encoded);
+        if self.ech_client_rejected() {
+            // ECH was rejected: this handshake only authenticated the
+            // public name and must never be reported as a success.
+            self.ech_client_abort_rejected(sink);
+            return false;
+        }
         self.client_send_finished(sink)
     }
 
@@ -1193,13 +1248,17 @@ impl HandshakeEngine {
             TranscriptHash::from_bytes(out)
         };
         self.transcript.retry(ch1_hash);
-        let hrr = build_hello_retry_request(
-            legacy_session_id,
-            cipher_suite,
-            group.code(),
-            None,
-            self.config.mode.legacy_version(),
-        );
+        let legacy_version = self.config.mode.legacy_version();
+        let hrr = self.ech_server_confirm_hello_retry_request(|confirmation| {
+            build_hello_retry_request(
+                legacy_session_id,
+                cipher_suite,
+                group.code(),
+                None,
+                legacy_version,
+                confirmation,
+            )
+        });
         self.emit_outgoing(&hrr, sink);
         self.server_retry_requested_group = Some(group);
         self.state = State::HelloRetryRequestSent;
@@ -1352,15 +1411,18 @@ impl HandshakeEngine {
         let mut server_random = [0u8; 32];
         let _ = getrandom(&mut server_random);
         let selected_psk = if self.resumed { Some(0u16) } else { None };
-        let sh = build_server_hello_ext(
-            &server_random,
-            &ch.legacy_session_id,
-            suite,
-            group.code(),
-            server_share.as_ref(),
-            selected_psk,
-            self.config.mode.legacy_version(),
-        );
+        let legacy_version = self.config.mode.legacy_version();
+        let sh = self.ech_server_confirm_server_hello(server_random, |random| {
+            build_server_hello_ext(
+                random,
+                &ch.legacy_session_id,
+                suite,
+                group.code(),
+                server_share.as_ref(),
+                selected_psk,
+                legacy_version,
+            )
+        });
         self.emit_outgoing(&sh, sink);
 
         self.negotiated_group = Some(group);
@@ -1404,11 +1466,13 @@ impl HandshakeEngine {
             }
             None => None,
         };
+        let ech_retry_configs = self.ech_server_retry_configs();
         let ee = build_encrypted_extensions_ext(
             alpn.as_deref(),
             self.config.local_transport_parameters.as_deref(),
             self.early_data_accepted,
             record_size_limit_reply,
+            ech_retry_configs.as_deref(),
         );
         self.emit_outgoing(&ee, sink);
 
@@ -1700,6 +1764,28 @@ impl HandshakeEngine {
             return false;
         }
         self.config.alpn = protocols;
+        true
+    }
+
+    /// Set the client's Encrypted Client Hello configuration, as
+    /// [`HandshakeConfig::ech_client`] does. Only possible before the
+    /// handshake has started; returns whether it took effect.
+    pub fn set_ech_client(&mut self, config: Option<super::ech::EchClientConfig>) -> bool {
+        if self.state != State::Initial {
+            return false;
+        }
+        self.config.ech_client = config;
+        true
+    }
+
+    /// Set the server's Encrypted Client Hello keys, as
+    /// [`HandshakeConfig::ech_server`] does. Only possible before the
+    /// handshake has started; returns whether it took effect.
+    pub fn set_ech_server(&mut self, config: Option<Arc<super::ech::EchServerConfig>>) -> bool {
+        if self.state != State::Initial {
+            return false;
+        }
+        self.config.ech_server = config;
         true
     }
 
@@ -2501,6 +2587,7 @@ mod tests {
             transport_parameters: None,
             early_data: false,
             record_size_limit: None,
+            ech: None,
         };
         let ok = client.on_encrypted_extensions(ee, Bytes::new(), &mut sink);
         assert!(!ok);
@@ -3241,6 +3328,7 @@ mod tests {
             transport_parameters: None,
             early_data: false,
             record_size_limit: raw.map(Bytes::copy_from_slice),
+            ech: None,
         };
         let ok = client.on_encrypted_extensions(ee, Bytes::new(), &mut sink);
         (ok, sink)
@@ -3299,6 +3387,7 @@ mod tests {
             transport_parameters: None,
             early_data: false,
             record_size_limit: Some(Bytes::copy_from_slice(&1500u16.to_be_bytes())),
+            ech: None,
         };
         assert!(client.on_encrypted_extensions(ee, Bytes::new(), &mut sink));
         assert_eq!(client.record_size_limits(), Some(RecordSizeLimits { send: 1500, receive: 3000 }));
@@ -3449,7 +3538,7 @@ mod tests {
         client.start(&mut sink); // CH1
         take_outbound(&mut sink);
 
-        let hrr = build_hello_retry_request(&[], AES_128_GCM_SHA256, NamedGroup::X25519.code(), None, 0x0303).encode();
+        let hrr = build_hello_retry_request(&[], AES_128_GCM_SHA256, NamedGroup::X25519.code(), None, 0x0303, None).encode();
         let mut input = hrr.as_ref();
         client.feed_handshake_data(&mut input, &mut sink);
         assert!(
@@ -3459,7 +3548,7 @@ mod tests {
         );
         take_outbound(&mut sink);
 
-        let hrr2 = build_hello_retry_request(&[], AES_128_GCM_SHA256, NamedGroup::X25519.code(), None, 0x0303).encode();
+        let hrr2 = build_hello_retry_request(&[], AES_128_GCM_SHA256, NamedGroup::X25519.code(), None, 0x0303, None).encode();
         let mut input2 = hrr2.as_ref();
         client.feed_handshake_data(&mut input2, &mut sink);
         assert!(

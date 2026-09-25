@@ -415,6 +415,20 @@ impl TlsRecordEngine {
         self.engine.set_alpn(protocols)
     }
 
+    /// Configure client-side Encrypted Client Hello (RFC 9849); see
+    /// [`HandshakeConfig::ech_client`]. Must be called before [`Self::start`];
+    /// returns whether it took effect.
+    pub fn set_ech_client(&mut self, config: Option<super::ech::EchClientConfig>) -> bool {
+        self.engine.set_ech_client(config)
+    }
+
+    /// Configure server-side Encrypted Client Hello keys; see
+    /// [`HandshakeConfig::ech_server`]. Must be called before [`Self::start`];
+    /// returns whether it took effect.
+    pub fn set_ech_server(&mut self, config: Option<std::sync::Arc<super::ech::EchServerConfig>>) -> bool {
+        self.engine.set_ech_server(config)
+    }
+
     /// Advertise a `record_size_limit` (RFC 8449): the largest protected
     /// record this endpoint will receive. Clamped to 64..=16385. `None`
     /// leaves the extension out, which is the default. Must be called before

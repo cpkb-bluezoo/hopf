@@ -20,4 +20,7 @@ pub(crate) mod reassembly;
 pub(crate) mod record;
 pub(crate) mod retransmit;
 
+#[cfg(test)]
+mod ech_tests;
+
 pub use engine::{DtlsRecordEngine, DtlsRecordSink, NopDtlsRecordSink};
