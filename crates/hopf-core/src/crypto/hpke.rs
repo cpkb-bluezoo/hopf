@@ -259,7 +259,9 @@ fn extract(kdf: Kdf, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
 fn expand(kdf: Kdf, prk: &[u8], info: &[&[u8]], len: usize) -> Result<Vec<u8>, HpkeError> {
     let prk = Prk::new_less_safe(kdf.hkdf(), prk);
     let okm = prk.expand(info, Len(len)).map_err(|_| HpkeError)?;
-    let mut out = vec![0u8; len];
+    // Sized buffer for `fill` to overwrite; not a value of any meaning.
+    let mut out = Vec::new();
+    out.resize_with(len, u8::default);
     okm.fill(&mut out).map_err(|_| HpkeError)?;
     Ok(out)
 }
