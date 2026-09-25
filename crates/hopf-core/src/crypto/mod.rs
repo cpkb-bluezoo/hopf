@@ -13,6 +13,7 @@ pub mod aead;
 pub mod cert;
 pub mod digest;
 pub mod hkdf;
+pub mod hpke;
 pub mod kx;
 pub mod kx_policy;
 pub mod prf;
