@@ -696,9 +696,17 @@ mod tests {
         ]
     }
 
+    /// A random NSEC3 salt: any salt will do, and two calls differ.
+    fn random_salt() -> Vec<u8> {
+        let mut salt = Vec::new();
+        salt.resize_with(8, u8::default);
+        getrandom::getrandom(&mut salt).expect("OS randomness");
+        salt
+    }
+
     fn cached_nsec3(names: &[(&str, Vec<u16>)], flags: u8, iterations: u16) -> DenialCache {
         let cache = DenialCache::new();
-        cache.store_validated(&negative(3600, nsec3_ring(names, flags, iterations, &[0xAB, 0xCD])));
+        cache.store_validated(&negative(3600, nsec3_ring(names, flags, iterations, &random_salt())));
         cache
     }
 
@@ -746,9 +754,9 @@ mod tests {
     #[test]
     fn new_nsec3_parameters_replace_the_old_chain() {
         let cache = DenialCache::new();
-        cache.store_validated(&negative(3600, nsec3_ring(&zone_names(), 0, 3, &[1])));
+        cache.store_validated(&negative(3600, nsec3_ring(&zone_names(), 0, 3, &random_salt())));
         let before = cache.len();
-        cache.store_validated(&negative(3600, nsec3_ring(&zone_names(), 0, 5, &[2])));
+        cache.store_validated(&negative(3600, nsec3_ring(&zone_names(), 0, 5, &random_salt())));
         assert_eq!(cache.len(), before, "the re-signed chain replaced, not joined, the old one");
     }
 }
