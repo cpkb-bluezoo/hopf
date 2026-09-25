@@ -6,6 +6,7 @@
 //! [`TlsAcceptor`]/[`TlsConnector`] factories that `TcpConnection` pumps
 //! directly — `hopf-tls` (rustls) is no longer in `TcpConnection`'s path.
 
+pub mod ech;
 mod engine;
 mod handshake;
 mod pem;
