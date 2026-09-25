@@ -56,6 +56,13 @@ impl SendStream {
         }
     }
 
+    /// Offset of the chunk `take_chunk` would return next.
+    pub fn next_offset(&self) -> u64 {
+        self.retransmit
+            .front()
+            .map_or(self.offset, |(offset, _, _)| *offset)
+    }
+
     /// Take next chunk up to `max` bytes (retransmits first).
     pub fn take_chunk(&mut self, max: usize) -> Option<(u64, Bytes, bool)> {
         if let Some((offset, chunk, fin)) = self.retransmit.pop_front() {

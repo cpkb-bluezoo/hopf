@@ -13,7 +13,8 @@ use hopf_core::tls::Tls13Aead;
 use crate::transport::types::Side;
 
 const IV_LEN: usize = 12;
-const TAG_LEN: usize = 16;
+/// AEAD tag length shared by every QUIC v1 cipher suite.
+pub(crate) const TAG_LEN: usize = 16;
 
 /// QUIC v1 Initial salt (RFC 9001 §5.2).
 const SALT_V1: [u8; 20] = [
