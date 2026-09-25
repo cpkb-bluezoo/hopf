@@ -17,14 +17,15 @@ pub use class::DnsClass;
 pub use error::DnsFormatError;
 pub use message::{
     FLAG_AA, FLAG_AD, FLAG_CD, FLAG_QR, FLAG_RA, FLAG_RD, FLAG_TC, HEADER_SIZE, OPCODE_NOTIFY, OPCODE_QUERY, OPCODE_UPDATE,
-    RCODE_BADVERS, RCODE_FORMERR, RCODE_NOERROR, RCODE_NOTIMP, RCODE_NXDOMAIN, RCODE_REFUSED,
+    RCODE_BADVERS, RCODE_FORMERR, RCODE_NOERROR, RCODE_NOTAUTH, RCODE_NOTIMP, RCODE_NOTZONE, RCODE_NXDOMAIN, RCODE_NXRRSET,
+    RCODE_REFUSED, RCODE_YXDOMAIN, RCODE_YXRRSET,
     RCODE_SERVFAIL, DnsMessage,
 };
 pub use name::{canonical_compare, decode_name, encode_name, normalize_name};
 pub use query_id::DnsQueryIdGenerator;
 pub use question::DnsQuestion;
 pub use rr::{
-    encode_edns_padding, encode_svcb_alpn, DnsResourceRecord, TlsaMatchingType, TlsaRecord,
+    encode_edns_padding, encode_svcb_alpn, DnsResourceRecord, SoaData, TlsaMatchingType, TlsaRecord,
     TlsaSelector, TlsaUsage, EDNS_FLAG_DO, EDNS_OPTION_PADDING, OPT_UDP_PAYLOAD, SVCB_PARAM_ALPN,
     SVCB_PARAM_ECH, SVCB_PARAM_IPV4HINT, SVCB_PARAM_IPV6HINT, SVCB_PARAM_PORT,
 };

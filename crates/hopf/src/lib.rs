@@ -74,7 +74,7 @@ pub use hopf_masque as masque;
 #[cfg(feature = "quic")]
 pub use hopf_quic as quic;
 
-/// DNS stub resolver and caching forwarder.
+/// DNS stub resolver and DNS server (caching forwarder, authoritative zones).
 #[cfg(feature = "dns")]
 pub use hopf_dns as dns;
 

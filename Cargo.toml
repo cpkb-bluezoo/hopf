@@ -28,6 +28,7 @@ members = [
     "examples/http-hello",
     "examples/http-get",
     "examples/http3-hello",
+    "examples/dns-authoritative",
     "examples/dns-proxy",
     "examples/webdav",
     "examples/websocket",

@@ -1,16 +1,18 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! DNS stub resolver and caching forwarder for Hopf.
+//! DNS stub resolver and DNS server for Hopf.
 //!
 //! # Modules
 //!
 //! - [`wire`] — RFC 1035 message / RR codecs
 //! - [`client`] — reactor-affine [`client::DnsResolver`] (UDP/TCP; DoT/DoQ/DoH features)
-//! - [`server`] — caching forwarder (`server` feature) + UDP/DoT/DoQ listeners
+//! - [`server`] — DNS server shell with pluggable handlers (`server` feature):
+//!   caching forwarder, authoritative zones (zone files, NOTIFY, UPDATE,
+//!   AXFR/IXFR, secondaries) and UDP/TCP/DoT/DoQ listeners
+//! - [`tsig`] — RFC 8945 transaction signatures for zone transfers and updates
 //! - [`dnssec`] — cryptographic validation (`dnssec` feature): RSASHA256/512,
 //!   ECDSAP256/384, Ed25519; IANA root DS anchors
 //!
-//! Gumdrop parity: stub resolver + caching proxy — not an authoritative nameserver.
 
 #![warn(missing_docs)]
 
@@ -25,6 +27,9 @@ pub mod wire;
 
 #[cfg(feature = "server")]
 pub mod server;
+
+#[cfg(feature = "server")]
+pub mod tsig;
 
 #[cfg(feature = "dnssec")]
 pub mod dnssec;

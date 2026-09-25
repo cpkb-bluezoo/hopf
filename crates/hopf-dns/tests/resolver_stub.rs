@@ -9,7 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use hopf_core::Runtime;
-use hopf_dns::server::DnsService;
+use hopf_dns::server::{DnsService, FnHandler, ForwarderHandler};
 use hopf_dns::wire::{DnsMessage, DnsResourceRecord, DnsType, FLAG_QR, FLAG_RA, FLAG_TC};
 use hopf_dns::{DnsCache, DnsResolver};
 
@@ -354,8 +354,7 @@ fn forwarder_truncates_oversized_udp_response_for_the_clients_advertised_size() 
     use hopf_dns::server::{listen_dns_udp, DnsServiceHandle, DnsUdpListenConfig};
     use hopf_dns::wire::{DnsQuestion, DnsResourceRecord, DnsType};
 
-    let mut service = DnsService::new(Arc::new(DnsCache::default()));
-    service.set_local_resolver(|query| {
+    let service = DnsService::with_handler(FnHandler::new().on_query(|query| {
         let mut resp = query.response_template(0);
         let name = query.questions.first().map(|q| q.name.clone()).unwrap_or_default();
         // Comfortably over 512 bytes (legacy limit) but well under 4096
@@ -364,7 +363,7 @@ fn forwarder_truncates_oversized_udp_response_for_the_clients_advertised_size() 
             resp.answers.push(DnsResourceRecord::a(&name, 60, Ipv4Addr::new(203, 0, 113, i)));
         }
         Some(resp)
-    });
+    }));
     let handle = DnsServiceHandle::new(service);
 
     let rt = Runtime::start(Default::default()).unwrap();
@@ -464,8 +463,9 @@ fn forwarder_retries_truncated_upstream_answer_over_tcp() {
     upstream.add_server(upstream_addr);
     upstream.open().unwrap();
 
-    let mut service = DnsService::new(Arc::new(DnsCache::default()));
-    service.set_upstream(upstream);
+    let service = DnsService::with_handler(
+        ForwarderHandler::new(Arc::new(DnsCache::default())).with_upstream(upstream),
+    );
 
     let query = DnsMessage::query(
         4242,
@@ -1619,15 +1619,14 @@ fn resolver_queries_a_real_dot_server_end_to_end() {
 
     let hits = Arc::new(AtomicUsize::new(0));
     let hits2 = Arc::clone(&hits);
-    let mut service = DnsService::new(Arc::new(DnsCache::default()));
-    service.set_local_resolver(move |q| {
+    let service = DnsService::with_handler(FnHandler::new().on_query(move |q| {
         hits2.fetch_add(1, Ordering::SeqCst);
         let question = q.questions.first()?;
         let mut resp = q.response_template(0);
         resp.answers
             .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 40)));
         Some(resp)
-    });
+    }));
     let handle = DnsServiceHandle::new(service);
 
     let rt = Runtime::start(RuntimeConfig {
@@ -1698,15 +1697,14 @@ fn resolver_queries_a_real_doq_server_end_to_end() {
 
     let hits = Arc::new(AtomicUsize::new(0));
     let hits2 = Arc::clone(&hits);
-    let mut service = DnsService::new(Arc::new(DnsCache::default()));
-    service.set_local_resolver(move |q| {
+    let service = DnsService::with_handler(FnHandler::new().on_query(move |q| {
         hits2.fetch_add(1, Ordering::SeqCst);
         let question = q.questions.first()?;
         let mut resp = q.response_template(0);
         resp.answers
             .push(DnsResourceRecord::a(&question.name, 60, Ipv4Addr::new(198, 51, 100, 50)));
         Some(resp)
-    });
+    }));
     let handle = DnsServiceHandle::new(service);
 
     let driver = listen_dns_doq("127.0.0.1:0".parse().unwrap(), server_config, handle).unwrap();
@@ -1888,12 +1886,11 @@ fn notify_over_udp_reaches_the_opcode_handler_or_is_notimp() {
 
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let seen2 = Arc::clone(&seen);
-    let mut handled = DnsService::new(Arc::new(DnsCache::default()));
-    handled.set_opcode_handler(move |m, _peer| {
+    let handled = DnsService::with_handler(FnHandler::new().on_opcode(move |m, _peer| {
         seen2.lock().unwrap().push(m.questions[0].name.clone());
         Some(m.response_template(RCODE_NOERROR))
-    });
-    let unhandled = DnsService::new(Arc::new(DnsCache::default()));
+    }));
+    let unhandled = DnsService::new();
 
     let rt = Runtime::start(Default::default()).unwrap();
     let listen = |service: DnsService| {
@@ -1928,5 +1925,53 @@ fn notify_over_udp_reaches_the_opcode_handler_or_is_notimp() {
     let resp = DnsMessage::parse(&buf[..n]).unwrap();
     assert_eq!((resp.opcode(), resp.rcode()), (OPCODE_NOTIFY, RCODE_NOTIMP));
 
+    rt.shutdown();
+}
+
+/// Cleartext DNS over TCP (RFC 1035 §4.2.2): the listener frames messages
+/// with a two-octet length and can answer with more than one message.
+#[test]
+fn tcp_listener_frames_queries_and_multi_message_responses() {
+    use hopf_dns::server::{
+        listen_dns_tcp, DnsQueryHandler, DnsServiceHandle, HandlerOutcome, QueryContext,
+    };
+    use hopf_dns::wire::{DnsQuestion, DnsResourceRecord, DnsType};
+    use std::io::{Read, Write};
+
+    struct TwoMessages;
+    impl DnsQueryHandler for TwoMessages {
+        fn handle_query(&self, q: &DnsMessage, _ctx: &QueryContext<'_>) -> HandlerOutcome {
+            let mut first = q.response_template(0);
+            first.answers.push(DnsResourceRecord::a("a.test", 1, Ipv4Addr::new(192, 0, 2, 1)));
+            let mut second = q.response_template(0);
+            second.answers.push(DnsResourceRecord::a("a.test", 1, Ipv4Addr::new(192, 0, 2, 2)));
+            HandlerOutcome::Sequence(vec![first, second])
+        }
+    }
+
+    let rt = Runtime::start(Default::default()).unwrap();
+    let addr = listen_dns_tcp(
+        &rt,
+        "127.0.0.1:0".parse().unwrap(),
+        DnsServiceHandle::new(DnsService::with_handler(TwoMessages)),
+    )
+    .unwrap();
+
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let q = DnsMessage::query(77, DnsQuestion::in_class("a.test", DnsType::A), false);
+    let bytes = q.serialize().unwrap();
+    stream.write_all(&(bytes.len() as u16).to_be_bytes()).unwrap();
+    stream.write_all(&bytes).unwrap();
+
+    let mut read_one = || {
+        let mut len = [0u8; 2];
+        stream.read_exact(&mut len).unwrap();
+        let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
+        stream.read_exact(&mut buf).unwrap();
+        DnsMessage::parse(&buf).unwrap()
+    };
+    assert_eq!(read_one().answers[0].as_a(), Some(Ipv4Addr::new(192, 0, 2, 1)));
+    assert_eq!(read_one().answers[0].as_a(), Some(Ipv4Addr::new(192, 0, 2, 2)));
     rt.shutdown();
 }

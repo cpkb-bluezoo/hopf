@@ -59,6 +59,7 @@
 <li><a href="cookbook/tls-echo.html">TLS echo</a></li>
 <li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
 <li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/dns-authoritative.html">DNS authoritative</a></li>
 <li><a href="cookbook/webdav.html">WebDAV</a></li>
 <li><a href="cookbook/websocket.html">WebSocket</a></li>
 <li><a href="cookbook/grpc.html">gRPC</a></li>
@@ -70,14 +71,15 @@
     <main class="main">
       <header>
         <h1>DNS</h1>
-        <p class="lead">Crate <code>hopf-dns</code>: async <strong>stub resolver</strong> and optional <strong>caching forwarder</strong> (Gumdrop parity). The resolver is reactor-affine (UDP on a worker). Optional features add a forwarder service, DoT / DoQ / DoH clients, and DNSSEC validation.</p>
+        <p class="lead">Crate <code>hopf-dns</code>: async <strong>stub resolver</strong> and a composable <strong>DNS server</strong>: a protocol shell with pluggable handlers, of which the <strong>caching forwarder</strong> and <strong>authoritative zone server</strong> (zone files, NOTIFY, dynamic UPDATE, AXFR/IXFR, TSIG, secondaries) are stock implementations. The resolver is reactor-affine (UDP on a worker). Optional features add the server, DoT / DoQ / DoH, and DNSSEC validation.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#standards">Standards</a></li>
 <li><a href="#architecture">Architecture</a></li>
 <li><a href="#resolver">Resolver</a></li>
-<li><a href="#caching-forwarder-server-feature">Caching forwarder (server feature)</a></li>
+<li><a href="#dns-server-server-feature">DNS server (server feature)</a></li>
+<li><a href="#authoritative-zones">Authoritative zones</a></li>
 <li><a href="#transports">Transports</a></li>
 <li><a href="#dnssec">DNSSEC</a></li>
 <li><a href="#configuration">Configuration</a></li>
@@ -143,6 +145,22 @@
 <td><a href="https://www.rfc-editor.org/rfc/rfc5155">RFC 5155</a></td>
 <td>NSEC3 authenticated denial-of-existence</td>
 </tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc1996">RFC 1996</a> / <a href="https://www.rfc-editor.org/rfc/rfc2136">2136</a></td>
+<td>NOTIFY (sent after a change, accepted by secondaries from their primary) and dynamic UPDATE with prerequisites</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc5936">RFC 5936</a> / <a href="https://www.rfc-editor.org/rfc/rfc1995">1995</a></td>
+<td>AXFR and IXFR, server and client</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc8945">RFC 8945</a></td>
+<td>TSIG (HMAC-SHA256/384/512) on requests, responses and multi-message transfers</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc2308">RFC 2308</a>, <a href="https://www.rfc-editor.org/rfc/rfc4592">4592</a>, <a href="https://www.rfc-editor.org/rfc/rfc8020">8020</a>, <a href="https://www.rfc-editor.org/rfc/rfc8482">8482</a></td>
+<td>Authoritative negative answers, wildcards, empty non-terminals, minimal <code>ANY</code></td>
+</tr>
 </tbody>
 </table>
 <p>See <a href="#dnssec">DNSSEC</a> below for algorithm support and trust anchors.</p>
@@ -156,8 +174,15 @@
  │    ├── CNAME chase (depth ≤ 8, same transport as the server it started on)
  │    └── optional DnsCache + DnssecValidator (identical for every transport)
  │
- └── (feature server) DnsService caching forwarder
+ └── (feature server) DnsService  - protocol shell: cookies, TSIG, framing
+         │     └── DnsQueryHandler  - policy, composed as needed
+         │           ├── EmptyHandler               (default: NOERROR, no answers)
+         │           ├── ForwarderHandler           (cache + upstream resolver)
+         │           ├── AuthoritativeZoneHandler   (zones, NOTIFY, UPDATE, AXFR/IXFR)
+         │           ├── FnHandler                  (closures)
+         │           └── ChainHandler               (first that does not decline)
          ├── listen_dns_udp
+         ├── listen_dns_tcp
          ├── listen_dns_dot  (+dot)
          └── listen_dns_doq  (+doq)</code></pre>
 <p><code>RuntimeDnsExt::connect_by_name</code> — async resolve then <code>Runtime::connect</code> on <code>Arc&lt;Runtime&gt;</code> (returns immediately; dial runs from the DNS callback).</p>
@@ -168,8 +193,8 @@
 <p><strong>Helpers:</strong> <code>HostsFile</code>, <code>parse_literal_ip</code>, <code>DnsCache</code>, <code>DnsCookie</code>, bailiwick filters (<code>filter_answers_in_bailiwick</code>, <code>is_within_bailiwick</code>, <code>names_equal</code>).</p>
 <p>Wire types: <code>DnsMessage</code>, <code>DnsQuestion</code>, <code>DnsResourceRecord</code>, <code>SoaData</code>, <code>DnsType</code>, <code>DnsClass</code>, <code>DnsQueryIdGenerator</code>, <code>DnsFormatError</code>, plus <code>FLAG_*</code> / <code>RCODE_*</code> (including <code>RCODE_BADVERS</code>) / <code>OPCODE_QUERY</code> / <code>EDNS_FLAG_DO</code> / <code>OPT_UDP_PAYLOAD</code> / <code>EDNS_OPTION_PADDING</code> constants.</p>
 <p>Every standard record type has a matching constructor and decode accessor on <code>DnsResourceRecord</code>: <code>a()</code>/<code>as_a()</code>, <code>aaaa()</code>/<code>as_aaaa()</code>, <code>cname()</code>/<code>ns()</code>/<code>ptr()</code> via <code>as_domain_name()</code>, <code>mx()</code>/<code>as_mx()</code>, <code>txt()</code>/<code>as_txt()</code>, <code>soa()</code>/<code>as_soa() -&gt; Option&lt;SoaData&gt;</code>, <code>srv()</code>/<code>as_srv() -&gt; Option&lt;(u16, u16, u16, String)&gt;</code>.</p>
-<h2 id="caching-forwarder-server-feature">Caching forwarder (server feature)</h2>
-<p>Enable Cargo feature <code>server</code>:</p>
+<h2 id="dns-server-server-feature">DNS server (server feature)</h2>
+<p>Enable Cargo feature <code>server</code>. <code>DnsService</code> is the <strong>protocol shell</strong>: it validates messages, runs the DNS Cookie exchange, verifies and signs TSIG, frames responses for each transport and truncates over UDP. It makes no decisions about answers. With no handler attached it answers every query with an empty <code>NOERROR</code> and every other opcode with <code>NOTIMP</code>. All behaviour comes from a composed <code>DnsQueryHandler</code>.</p>
 <table>
 <thead>
 <tr>
@@ -179,12 +204,36 @@
 </thead>
 <tbody>
 <tr>
-<td><code>DnsService</code></td>
+<td><code>DnsService</code> / <code>DnsServiceHandle</code></td>
+<td>Shell; <code>with_handler</code>, <code>set_tsig_keyring</code>, <code>start</code>/<code>stop</code>, <code>process_wire</code>, <code>metrics</code></td>
+</tr>
+<tr>
+<td><code>DnsQueryHandler</code></td>
+<td>Trait: <code>handle_query</code>, <code>handle_non_query_opcode</code>, <code>start</code>, <code>stop</code>. Returns <code>HandlerOutcome::{Respond, Sequence, Decline}</code></td>
+</tr>
+<tr>
+<td><code>EmptyHandler</code></td>
+<td>The default no-op</td>
+</tr>
+<tr>
+<td><code>ForwarderHandler</code></td>
 <td>Caching forwarder</td>
 </tr>
 <tr>
-<td><code>DnsServiceHandle</code></td>
-<td>Handle</td>
+<td><code>AuthoritativeZoneHandler</code></td>
+<td>Authoritative zones (<a href="#authoritative-zones">below</a>)</td>
+</tr>
+<tr>
+<td><code>FnHandler</code></td>
+<td>Closure handler: <code>on_query</code>, <code>on_opcode</code></td>
+</tr>
+<tr>
+<td><code>ChainHandler</code></td>
+<td>Tries handlers in order; the first that does not <code>Decline</code> answers</td>
+</tr>
+<tr>
+<td><code>QueryContext</code></td>
+<td>Per-message context: <code>peer</code>, <code>transport</code> (<code>DnsTransport::{Udp, Tcp, Dot, Doq}</code>), <code>tsig_key</code>, metrics</td>
 </tr>
 <tr>
 <td><code>DnsServerMetrics</code></td>
@@ -193,6 +242,10 @@
 <tr>
 <td><code>listen_dns_udp</code> / <code>DnsUdpListenConfig</code></td>
 <td>UDP listen</td>
+</tr>
+<tr>
+<td><code>listen_dns_tcp</code></td>
+<td>Cleartext TCP listen (RFC 7766). Needed for zone transfers and truncated-answer retries</td>
 </tr>
 <tr>
 <td><code>listen_dns_dot</code></td>
@@ -208,10 +261,124 @@
 </tr>
 </tbody>
 </table>
-<p><code>DnsService::set_upstream</code>, <code>set_local_resolver</code>, <code>set_opcode_handler</code>, <code>cache</code>, <code>metrics</code>. Strips DNSSEC RRs when the client query lacks DO.</p>
-<p><strong>Other opcodes (NOTIFY, UPDATE).</strong> <code>set_local_resolver</code> is only consulted for ordinary queries (opcode QUERY). <code>set_opcode_handler(|message, peer| ...)</code> is the same kind of hook for every other opcode, so a caller can handle zone-change notification (RFC 1996) or dynamic update (RFC 2136) for a zone it serves itself through <code>set_local_resolver</code>. Return <code>Some(response)</code> to answer, or <code>None</code> to decline, which gives the default <code>NOTIMP</code>. Build responses with <code>DnsMessage::response_template</code>, which echoes the request's opcode as those RFCs require. An UPDATE's zone, prerequisite, update and additional sections arrive in the <code>questions</code>, <code>answers</code>, <code>authorities</code> and <code>additionals</code> fields, with the <code>NONE</code> class (254) kept in each record's <code>raw_class</code>. The handler only ever sees requests (a message with QR set is refused first), sits behind the same DNS Cookie anti-amplification rule as resolution, and runs on the listener's thread, so it should not block. hopf-dns implements no zone store, transfer, TSIG or SIG(0), so an UPDATE handler must authenticate and authorise the sender itself.</p>
-<p><strong>Server-side DNS Cookies</strong> (RFC 7873 §5.2): an inbound query's COOKIE option (if any) is parsed and any presented server cookie validated — via HMAC-SHA256 over the client cookie and source address, keyed by a per-service secret from <code>getrandom</code> (fail closed), compared in constant time. A COOKIE option shorter than the mandatory 8-byte client cookie is FORMERR with no cookie exchange (§5.2.2). Otherwise the response always carries a COOKIE option echoing the client cookie plus a valid server cookie — but a client that hasn't yet echoed back a server cookie we can verify gets only that minimal cookie-only response, never full resolution: §5.2.3's anti-amplification guard against using the resolver to attack a spoofed source address. <code>DnsServerMetrics::cookies_presented</code>/<code>cookies_verified</code> expose the counts.</p>
-<p><code>process_query_sync</code> uses a <strong>blocking</strong> upstream path (pragmatic).</p>
+<p><strong>Composition.</strong> A handler that does not want a message returns <code>Decline</code>; for a query the shell then answers an empty <code>NOERROR</code>, for another opcode <code>NOTIMP</code>. Only requests reach a handler: a message with the QR bit set is refused by the shell. Handlers run on the listener thread and should not block. Handlers that need background work (the authoritative handler's NOTIFY, write-back and secondary refresh) get it from <code>DnsService::start(&amp;rt)</code>, which calls <code>DnsQueryHandler::start</code>; call it before binding listeners and <code>stop()</code> on shutdown.</p>
+<pre><code>// Caching forwarder
+let service = DnsService::with_handler(ForwarderHandler::new(cache).with_upstream(resolver));
+
+// Authoritative zones first; anything else is forwarded (split horizon)
+let zones = AuthoritativeZoneHandler::builder()
+    .zone_file(path, None, ZoneFileMode::ReadWrite, options)?
+    .decline_outside_zones(true)
+    .build()?;
+let service = DnsService::with_handler(
+    ChainHandler::new().then(zones).then(ForwarderHandler::new(cache).with_upstream(resolver)),
+);
+service.start(&amp;rt)?;
+let handle = DnsServiceHandle::new(service);
+listen_dns_udp(rt.pick_worker(), DnsUdpListenConfig { addr, service: handle.clone() })?;
+listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
+<h3 id="forwarder">Caching forwarder</h3>
+<p><code>ForwarderHandler::new(cache).with_upstream(resolver)</code>, plus <code>cache()</code>. It never declines, so in a chain it goes last. Strips DNSSEC RRs when the client query lacks DO. With no upstream a cache miss is <code>SERVFAIL</code>.</p>
+<p><strong>Other opcodes (NOTIFY, UPDATE).</strong> <code>DnsQueryHandler::handle_non_query_opcode</code> is offered every request whose opcode is not QUERY (RFC 1996 NOTIFY, RFC 2136 UPDATE, ...). Update sections arrive in the question (zone), answer (prerequisite), authority (update) and additional fields with the <code>NONE</code> class (254) preserved in each record's <code>raw_class</code>. For a closure, <code>FnHandler::on_opcode(|message, peer| ...)</code>. Build responses with <code>DnsMessage::response_template</code>, which echoes the opcode.</p>
+<p><strong>Server-side DNS Cookies</strong> (RFC 7873 §5.2): an inbound query's COOKIE option (if any) is parsed and any presented server cookie validated, via HMAC-SHA256 over the client cookie and source address keyed by a per-service secret from <code>getrandom</code> (fail closed), compared in constant time. A COOKIE option shorter than the mandatory 8-byte client cookie is FORMERR with no cookie exchange (§5.2.2). Otherwise the response carries a COOKIE option echoing the client cookie plus a freshly issued server cookie. A client that presents a cookie without a verifiable server cookie gets a cookie-only reply and the handler is <strong>not</strong> called (RFC 7873 §5.2.3 anti-amplification), which covers upstream forwarding, zone transfers and updates alike. A client presenting no cookie is not filtered.</p>
+<p><code>process_wire</code> is what every listener calls: it parses, verifies TSIG, dispatches, truncates UDP answers to the size the client advertised (records dropped, TC set), zeroes the message ID over DoQ, and signs. The forwarder uses a <strong>blocking</strong> upstream path (pragmatic).</p>
+<h2 id="authoritative-zones">Authoritative zones</h2>
+<p><code>AuthoritativeZoneHandler</code> serves one or more zones from memory. Zones are loaded from BIND-style zone files, built with <code>Zone::from_records</code>, or transferred from a primary. Answers carry the AA bit and no RA; names outside every zone are <code>REFUSED</code>, or, with <code>decline_outside_zones(true)</code>, declined so a <code>ChainHandler</code> can forward them. The most specific zone wins when zones nest.</p>
+<h3 id="zone-lookup">Answers</h3>
+<ul>
+<li>RFC 1034 §4.3.2 lookup: positive answers with the apex NS set in the authority section and in-zone <strong>glue</strong> (A/AAAA of NS and MX targets) in the additional section.</li>
+<li><strong>CNAME</strong> chains followed within the zone (a loop is <code>SERVFAIL</code>); a chain leaving the zone is returned as far as it goes.</li>
+<li><strong>Wildcards</strong> synthesised at the closest encloser (RFC 4592), with the queried name as owner. <strong>Empty non-terminals</strong> exist: NODATA, not NXDOMAIN (RFC 8020).</li>
+<li><strong>Delegations</strong>: a name at or below a zone cut gets a referral (NS in authority, glue, AA clear); <code>DS</code> is answered by the parent side.</li>
+<li><strong>Negative answers</strong> (NXDOMAIN, NODATA) carry the SOA with TTL <code>min(SOA TTL, MINIMUM)</code> (RFC 2308 §3).</li>
+<li><strong>Minimal <code>ANY</code></strong> (RFC 8482): a single synthesised <code>HINFO "RFC8482" ""</code>; <code>minimal_any(false)</code> returns the whole node, and <code>minimal_any_policy(...)</code> takes a <code>MinimalAnyPolicy</code> (or any <code>Fn(&amp;DnsQuestion) -&gt; bool</code>) to decide per question. Non-existent names stay NXDOMAIN.</li>
+<li>EDNS: an OPT record is echoed (with DO); an EDNS version above 0 is <code>BADVERS</code>. Classes other than IN are refused.</li>
+</ul>
+<h3 id="zone-files">Zone files</h3>
+<p><code>Zone::from_zone_file(path, origin)</code> and <code>Zone::from_zone_text(text, origin)</code>. The parser is a single-pass push parser (chunk-fed lexer, explicit state machine, events), so a file is never held in memory whole and any chunking gives the same zone. Loading blocks on file I/O: do it at start-up or on a storage worker.</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>$ORIGIN</code>, <code>$TTL</code></td>
+<td><code>$TTL</code> accepts BIND units (<code>1h30m</code>, <code>2w</code>). A record with no TTL takes <code>$TTL</code>, else the previous explicit TTL, else the SOA MINIMUM</td>
+</tr>
+<tr>
+<td><code>$INCLUDE file [origin]</code></td>
+<td>Path relative to the including file; origin and last owner restored afterwards; nesting limited to 8</td>
+</tr>
+<tr>
+<td><code>$GENERATE range lhs [ttl] [class] type rhs</code></td>
+<td><code>start-stop[/step]</code>, <code>$</code>, <code>${offset,width,radix}</code>, <code>$$</code>; at most 65536 records per directive</td>
+</tr>
+<tr>
+<td>Owner names</td>
+<td><code>@</code>, relative and absolute names; a line beginning with whitespace reuses the previous owner; parenthesised multi-line groups and <code>;</code> comments</td>
+</tr>
+<tr>
+<td>Types</td>
+<td>A, AAAA, NS, CNAME, PTR, MX, TXT/SPF (several strings), SOA, SRV, HINFO in presentation format. <strong>Any</strong> type (RRSIG, DNSKEY, TLSA, CAA, ...) in the RFC 3597 generic form <code>\# length hex</code>, so a pre-signed zone serves and transfers intact. <code>TYPEnnn</code> mnemonics</td>
+</tr>
+<tr>
+<td>Validation</td>
+<td>Exactly one SOA, at the origin; no owner outside the zone; CNAME alone at its name; duplicates collapsed; RRset TTLs harmonised to the lowest (RFC 2181 §5.2). Errors carry the line number</td>
+</tr>
+</tbody>
+</table>
+<p>Only class <code>IN</code> is supported. DNSSEC <strong>signing</strong> is not: a zone signed by an external tool is served as data.</p>
+<p><code>Zone::to_zone_text</code> and <code>write_zone_file</code> write a zone back (atomic temp-file-and-rename) in a form the loader reads identically.</p>
+<h3 id="zone-options">Per-zone options</h3>
+<p>The defaults are <strong>closed</strong>: nobody can transfer or update a zone until <code>ZoneOptions</code> says so.</p>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>allow_transfer(Acl)</code></td>
+<td>Who may AXFR/IXFR. Default: nobody</td>
+</tr>
+<tr>
+<td><code>allow_update(Acl)</code></td>
+<td>Who may send RFC 2136 updates (ignored on a secondary, which always refuses). Default: nobody</td>
+</tr>
+<tr>
+<td><code>also_notify(addr)</code> / <code>also_notify_host(name, port)</code></td>
+<td>NOTIFY targets. A <em>host</em> is resolved on each change and every address gets a NOTIFY, so a headless service reaches every replica (a single address behind a load balancer would reach only one)</td>
+</tr>
+<tr>
+<td><code>notify_ns_records(bool)</code></td>
+<td>Also NOTIFY in-zone NS targets with address records (port 53), except the SOA MNAME (the primary itself). Default on</td>
+</tr>
+<tr>
+<td><code>persist(path, ZoneFileMode)</code></td>
+<td><code>ReadOnly</code>: changes stay in memory. <code>ReadWrite</code>: every successful update, and on a secondary every transfer, is written back atomically to <em>this</em> zone's file. Do not point two processes at one path</td>
+</tr>
+<tr>
+<td><code>tsig_key(TsigKey)</code></td>
+<td>Key this server signs its own requests with (a secondary's SOA queries and transfers; NOTIFYs)</td>
+</tr>
+</tbody>
+</table>
+<p><code>Acl</code> is built from <code>Acl::none()</code>, <code>Acl::any()</code>, <code>Acl::from_cidrs(["192.0.2.0/24", "2001:db8::/32"])</code>, <code>Acl::tsig_key(name)</code> and <code>.or_tsig_key(name)</code>: a request is allowed if its source matches a network <em>or</em> it is authenticated by a listed key.</p>
+<h3 id="zone-update">Dynamic update (RFC 2136)</h3>
+<p>Prerequisites (name in use / not in use, RRset exists / does not exist, value-dependent RRset match) are checked, every update record is prescanned, and only then are changes applied, so an update is <strong>atomic</strong>. The SOA serial advances once per change (unless the update itself installs a newer SOA), and the change is journalled for IXFR. Class NONE deletes an exact record; class ANY deletes an RRset or a name. The apex SOA and NS are protected, CNAME/data conflicts are ignored as the RFC specifies, and an RRset takes the TTL of the record last added to it. Response codes: <code>NOERROR</code>, <code>FORMERR</code>, <code>NOTAUTH</code>, <code>NOTZONE</code>, <code>YXDOMAIN</code>, <code>YXRRSET</code>, <code>NXRRSET</code>, <code>NXDOMAIN</code>, <code>REFUSED</code> (not permitted, or a secondary).</p>
+<h3 id="zone-transfer">Zone transfer and secondaries</h3>
+<p><strong>Server.</strong> AXFR (RFC 5936): SOA, every record, SOA, split into messages that each fit a TCP frame. IXFR (RFC 1995): nothing if the client is current, the journalled differences (up to 512 changes) in RFC 1995 order, or an AXFR-style full transfer when the journal does not reach back. Stream transports only: over UDP an AXFR is answered with TC so the client retries over TCP, and an IXFR that fits one message is answered directly.</p>
+<p><strong>Secondary.</strong> <code>builder.secondary("example.org", primary_addr, options)</code>. The secondary transfers at start-up, when its primary sends NOTIFY (only the configured primary's address is accepted), and on the SOA <strong>REFRESH</strong> timer, retrying on <strong>RETRY</strong> after a failure, so it converges even if every NOTIFY is lost. It compares the primary's SOA serial (RFC 1982 arithmetic) first and asks for an IXFR when it has data, falling back to AXFR if a difference does not apply. If the primary cannot be reached for the SOA <strong>EXPIRE</strong> interval it stops answering the zone (<code>SERVFAIL</code>) until a transfer succeeds. Until its first transfer (or a persisted file) it also answers <code>SERVFAIL</code>. With <code>persist(path, ...)</code> an existing file is served straight away while the primary is checked. Secondaries refuse updates (<code>REFUSED</code>) and reply to NOTIFY from anyone else with <code>REFUSED</code> (<code>NOTAUTH</code> for a zone not served).</p>
+<p>The NOTIFY, write-back and refresh work runs on one background thread per handler, between <code>DnsService::start</code> and <code>stop</code>. Each network step is bounded by a 3 second timeout, and work is sequential, so a dead peer delays maintenance but cannot wedge it. Failures are reported on standard error with the <code>hopf-dns:</code> prefix.</p>
+<h3 id="tsig">TSIG (RFC 8945)</h3>
+<p><code>TsigKey::new(name, TsigAlgorithm::HmacSha256, secret)</code> or <code>TsigKey::from_base64(...)</code> (BIND key-file secrets), collected in a <code>TsigKeyring</code> and installed with <code>DnsService::set_tsig_keyring</code>. HMAC-SHA256, SHA384 and SHA512 are supported; HMAC-MD5 and SHA1 deliberately are not. A signed request that verifies is authenticated as its key (<code>QueryContext::tsig_key</code>, checked by <code>Acl</code>) and its responses, including every message of a transfer, are signed. A signature that does not verify is answered <code>NOTAUTH</code> with <code>BADKEY</code>, <code>BADSIG</code> or <code>BADTIME</code> in the TSIG record and never reaches a handler. Clock skew of up to 300 seconds is tolerated. Verification works on the wire bytes as received, so it interoperates with other implementations' name compression; a transfer from a primary that signs only some messages (up to 99 unsigned in between) verifies too. TSIG is not applied over DoQ.</p>
+<h3 id="zone-client">Zone client</h3>
+<p><code>server::zone::client::ZoneClient</code> is a <strong>blocking</strong> client (run it from a worker thread) with <code>notify</code>, <code>soa_serial</code>, <code>transfer(server, origin, have_serial) -&gt; Transfer::{UpToDate, Full, Incremental}</code> and <code>update</code>, optionally signing with <code>with_tsig</code>; <code>build_update</code> assembles an UPDATE message. The secondary refresh uses it.</p>
 <h2 id="transports">Transports</h2>
 <table>
 <thead>
@@ -381,13 +548,13 @@
 <span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a><span class="co">// Extension on Arc&lt;Runtime&gt; — async DNS, dial from callback:</span></span>
 <span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect_by_name(<span class="st">&quot;example.com&quot;</span><span class="op">,</span> <span class="dv">443</span><span class="op">,</span> factory)<span class="op">?;</span></span></code></pre></div>
 <p>Forwarder sketch:</p>
-<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_dns::</span><span class="op">{</span>DnsCache<span class="op">,</span> DnsService<span class="op">,</span> listen_dns_udp<span class="op">,</span> DnsUdpListenConfig<span class="op">};</span></span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> cache <span class="op">=</span> <span class="pp">Arc::</span>new(<span class="pp">DnsCache::</span><span class="kw">default</span>())<span class="op">;</span></span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> svc <span class="op">=</span> <span class="pp">DnsService::</span>new(<span class="pp">Arc::</span>clone(<span class="op">&amp;</span>cache))<span class="op">;</span></span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a>svc<span class="op">.</span>set_upstream(upstream_resolver)<span class="op">;</span></span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a>listen_dns_udp(DnsUdpListenConfig <span class="op">{</span> <span class="co">/* bind + service handle */</span> <span class="op">}</span>)<span class="op">?;</span></span></code></pre></div>
+<pre><code>use hopf_dns::server::{listen_dns_udp, DnsService, DnsServiceHandle, DnsUdpListenConfig, ForwarderHandler};
+use hopf_dns::DnsCache;
+use std::sync::Arc;
+
+let cache = Arc::new(DnsCache::default());
+let service = DnsService::with_handler(ForwarderHandler::new(cache).with_upstream(upstream_resolver));
+listen_dns_udp(worker, DnsUdpListenConfig { addr, service: DnsServiceHandle::new(service) })?;</code></pre>
 <h2 id="examples">Examples</h2>
 <p>See <a href="cookbook/dns-proxy.html">Cookbook: DNS proxy</a>.</p>
 <div class="sourceCode" id="cb4"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="co"># UDP caching forwarder</span></span>
@@ -411,9 +578,18 @@
 <td>UDP caching forwarder</td>
 <td>arg1 = bind; <code>DNS_UPSTREAM</code> (def <code>8.8.8.8 1.1.1.1</code>)</td>
 </tr>
+<tr>
+<td><code>examples/dns-authoritative</code></td>
+<td>Authoritative server for a zone file (UDP + TCP), transfers and updates from loopback written back to the file, optional TSIG and forwarding of other names</td>
+<td>arg1 = zone file; arg2 = bind (def <code>127.0.0.1:5353</code>); <code>DNS_UPSTREAM</code>; <code>DNS_TSIG_KEY=name:algorithm:base64</code></td>
+</tr>
 </tbody>
 </table>
-<p>Smoke: <code>cargo test -p hopf-dns --features integration</code> (<code>tests/resolver_stub.rs</code>).</p>
+<pre><code>cargo run -p dns-authoritative -- examples/dns-authoritative/example.com.zone 127.0.0.1:5353
+dig @127.0.0.1 -p 5353 www.example.com A +norecurse
+dig @127.0.0.1 -p 5353 example.com AXFR
+printf 'server 127.0.0.1 5353\nzone example.com\nupdate add new.example.com 60 A 192.0.2.77\nsend\n' | nsupdate</code></pre>
+<p>Smoke: <code>cargo test -p hopf-dns --features integration</code> (<code>tests/resolver_stub.rs</code>; <code>tests/authoritative.rs</code> runs a primary and secondary over real sockets: UPDATE, NOTIFY, timer-only refresh, expiry, IXFR, TSIG).</p>
 <h2 id="telemetry">Telemetry</h2>
 <p>DNS is <strong>not</strong> wired for W3C Trace Context propagation the way HTTP (and Hopf’s mail/MQTT services) are. There is no IETF standard for carrying <code>traceparent</code> on DNS queries; experimental EDNS options (e.g. PowerDNS TRACEPARENT) are out of scope.</p>
 <p>What is typical in practice — and what Hopf supports today:</p>
@@ -424,18 +600,24 @@
 </ul>
 <p>See <a href="telemetry.html#dns">Telemetry: DNS</a> for the same guidance from the OTel side.</p>
 <h2 id="limitations">Limitations</h2>
-<p>Explicitly <strong>out of scope</strong> (Gumdrop parity):</p>
+<p>Explicitly <strong>out of scope</strong>:</p>
 <ul>
-<li>Authoritative zones</li>
-<li>AXFR / IXFR</li>
-<li>TSIG</li>
-<li>Dynamic UPDATE and NOTIFY handling (only the <a href="#caching-forwarder-server-feature"><code>set_opcode_handler</code></a> extension point is provided)</li>
-<li>DNSSEC <strong>signing</strong></li>
+<li>DNSSEC <strong>signing</strong> of authoritative zones (an externally signed zone is served as data)</li>
 <li>DoH <strong>server</strong></li>
+<li>Recursive resolution (the forwarder relies on configured upstreams)</li>
+</ul>
+<p>Authoritative serving:</p>
+<ul>
+<li>Class <code>IN</code> only; zone-file owner names may not contain backslash escapes; only the types listed under <a href="#zone-files">Zone files</a> have a presentation format (any type can use the generic form).</li>
+<li>Write-back, NOTIFY target selection and applying an IXFR take a copy of the zone under a read lock, so a very large zone costs a copy per change. An update or a completed transfer holds the write lock only while it is applied. Zone loading is blocking file I/O; write-back runs on the maintenance thread.</li>
+<li>Zone maintenance is one sequential thread per handler; NOTIFY is UDP with three attempts per peer.</li>
+<li>The IXFR journal is in memory (512 changes) and starts empty at each start-up, so a restarted primary answers an IXFR with a full transfer.</li>
+<li>Secondaries do not forward updates to the primary (RFC 2136 §6): they refuse them.</li>
+<li>No access control beyond source address and TSIG key (no per-record-type or per-name update policy).</li>
 </ul>
 <p>Other:</p>
 <ul>
-<li><code>process_query_sync</code> blocks on upstream (forwarder).</li>
+<li>The forwarder blocks on its upstream (bounded at five seconds).</li>
 <li>Server addresses must be pre-resolved IPs.</li>
 <li>No W3C Trace Context on the DNS wire (see <a href="#telemetry">Telemetry</a>).</li>
 <li><strong>DNS over DTLS (DoDTLS)</strong> — not implemented; Gumdrop had transparent DTLS on UDP. Planned when DTLS lands in <code>hopf-core</code> (see <a href="conformance.html#security-planned">conformance → Security substrate</a>).</li>

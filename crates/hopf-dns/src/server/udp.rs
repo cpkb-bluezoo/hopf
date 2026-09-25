@@ -9,8 +9,7 @@ use std::sync::Arc;
 use mio::Token;
 use hopf_core::{ReactorHandle, UdpDatagramHandler};
 
-use super::DnsServiceHandle;
-use crate::wire::{DnsMessage, FLAG_TC};
+use super::{DnsServiceHandle, DnsTransport};
 
 /// UDP listen configuration.
 pub struct DnsUdpListenConfig {
@@ -28,30 +27,13 @@ struct DnsUdpHandler {
 
 impl UdpDatagramHandler for DnsUdpHandler {
     fn on_datagram(&mut self, peer: SocketAddr, data: &[u8]) {
-        let Ok(query) = DnsMessage::parse(data) else {
+        let Some(responses) = self.service.process_wire(data, peer, DnsTransport::Udp) else {
             return;
         };
-        let mut resp = self.service.process(&query, peer);
-        let Ok(mut bytes) = resp.serialize() else {
+        let Some(token) = *self.token.lock().unwrap() else {
             return;
         };
-        // RFC 1035 §4.1.1 / RFC 2181 §9: a response too large for what the
-        // client advertised (RFC 6891 §6.2.3 OPT payload size, or the
-        // legacy 512-octet limit with no EDNS at all) gets its records
-        // dropped and TC set instead of being sent oversized — the client
-        // is expected to retry over TCP for the full answer.
-        let limit = query.requested_udp_payload_size() as usize;
-        if bytes.len() > limit {
-            resp.answers.clear();
-            resp.authorities.clear();
-            resp.additionals.clear();
-            resp.flags |= FLAG_TC;
-            let Ok(truncated) = resp.serialize() else {
-                return;
-            };
-            bytes = truncated;
-        }
-        if let Some(token) = *self.token.lock().unwrap() {
+        for bytes in responses {
             self.reactor.udp_send(token, peer, bytes);
         }
     }

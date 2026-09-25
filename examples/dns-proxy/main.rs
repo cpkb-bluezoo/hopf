@@ -10,6 +10,7 @@ use std::time::Duration;
 use hopf_core::Runtime;
 use hopf_dns::server::{
     listen_dns_udp, parse_upstream_list, DnsService, DnsServiceHandle, DnsUdpListenConfig,
+    ForwarderHandler,
 };
 use hopf_dns::{DnsCache, DnsResolver};
 
@@ -31,8 +32,7 @@ fn main() -> std::io::Result<()> {
     }
     resolver.open()?;
 
-    let mut service = DnsService::new(Arc::clone(&cache));
-    service.set_upstream(resolver);
+    let service = DnsService::with_handler(ForwarderHandler::new(cache).with_upstream(resolver));
     let handle = DnsServiceHandle::new(service);
 
     let worker = rt.pick_worker();
