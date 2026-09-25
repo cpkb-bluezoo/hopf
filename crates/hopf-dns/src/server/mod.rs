@@ -22,6 +22,7 @@ mod forwarder;
 mod framed;
 mod handler;
 mod minimal_any;
+mod policy;
 mod udp;
 pub mod zone;
 
@@ -32,6 +33,9 @@ mod dot;
 mod doq;
 
 pub use forwarder::ForwarderHandler;
+pub use policy::{
+    NxdomainCutDisabled, NxdomainCutEnabled, NxdomainCutPolicy, ServeStale, ServeStaleDisabled, StalePolicy, StaleTerms,
+};
 pub use framed::listen_dns_tcp;
 pub use handler::{
     ChainHandler, DnsQueryHandler, DnsTransport, EmptyHandler, FnHandler, HandlerOutcome,
@@ -69,6 +73,10 @@ pub struct DnsServerMetrics {
     pub upstreams: u64,
     /// Errors.
     pub errors: u64,
+    /// Answers served from an expired cache entry because the upstream could
+    /// not be reached (RFC 8767). Counted apart from `cache_hits`: a rising
+    /// value is a sign of upstream trouble.
+    pub stale_served: u64,
     /// Queries that presented a DNS Cookie (RFC 7873) option.
     pub cookies_presented: u64,
     /// Of those, queries whose presented server cookie was verified

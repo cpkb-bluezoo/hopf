@@ -15,6 +15,8 @@ pub const OPT_UDP_PAYLOAD: u16 = 4096;
 /// EDNS Padding option code (RFC 7830).
 pub const EDNS_OPTION_PADDING: u16 = 12;
 
+/// HINFO TYPE (RFC 1035 §3.3.2), carried opaquely: [`DnsType`] has no variant for it.
+pub const HINFO_TYPE: u16 = 13;
 /// SVCB/HTTPS "alpn" SvcParamKey (RFC 9460 §7.1.1).
 pub const SVCB_PARAM_ALPN: u16 = 1;
 /// SVCB/HTTPS "port" SvcParamKey (RFC 9460 §7.1.2).
@@ -294,6 +296,18 @@ impl DnsResourceRecord {
     /// A record.
     pub fn a(name: impl Into<String>, ttl: u32, addr: Ipv4Addr) -> Self {
         Self::new(name, DnsType::A, DnsClass::In, ttl, addr.octets().to_vec())
+    }
+
+    /// HINFO record (RFC 1035 §3.3.2): two `<character-string>`s, CPU and OS.
+    /// `None` if either is longer than 255 octets.
+    pub fn hinfo(name: impl Into<String>, ttl: u32, cpu: &str, os: &str) -> Option<Self> {
+        let (cpu, os) = (cpu.as_bytes(), os.as_bytes());
+        let mut rdata = Vec::with_capacity(2 + cpu.len() + os.len());
+        rdata.push(u8::try_from(cpu.len()).ok()?);
+        rdata.extend_from_slice(cpu);
+        rdata.push(u8::try_from(os.len()).ok()?);
+        rdata.extend_from_slice(os);
+        Some(Self::opaque(name, HINFO_TYPE, DnsClass::In.value(), ttl, rdata))
     }
 
     /// AAAA record.
