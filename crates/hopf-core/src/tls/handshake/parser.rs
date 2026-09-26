@@ -937,7 +937,7 @@ mod tests {
         let mut parser = HandshakeParser::new().with_certificate_compression(true);
         let mut got = RecordingHandler::default();
         parser.receive(&mut &wire[..], &mut got);
-        assert!(!got.error, "{:?}", got.events);
+        assert!(!got.error, "parser reported an error for a valid CompressedCertificate");
         let strip_end = |v: &Vec<String>| v.iter().filter(|e| !e.starts_with("end:")).cloned().collect::<Vec<_>>();
         assert_eq!(strip_end(&got.events), strip_end(&expected.events));
         assert_eq!(got.events.last().unwrap(), &format!("end:11:{}b", wire.len()));
@@ -957,10 +957,10 @@ mod tests {
         let chunks: Vec<&[u8]> = wire.chunks(5).collect();
         for chunk in &chunks[..chunks.len() - 1] {
             parser.receive(&mut &chunk[..], &mut got);
-            assert!(got.events.is_empty(), "emitted before the message completed: {:?}", got.events);
+            assert!(got.events.is_empty(), "events emitted before the message completed");
         }
         parser.receive(&mut &chunks[chunks.len() - 1][..], &mut got);
-        assert!(!got.error, "{:?}", got.events);
+        assert!(!got.error, "parser reported an error for a valid CompressedCertificate");
         assert_eq!(got.events.iter().filter(|e| e.starts_with("certificate_entry:")).count(), 3);
         assert_eq!(got.events.last().unwrap(), &format!("end:11:{}b", wire.len()));
     }
