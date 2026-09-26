@@ -54,6 +54,10 @@ pub struct ParsedClientHello {
     /// client sent one. Decoded by the engine so a malformed length is a
     /// `decode_error` rather than silently ignored.
     pub record_size_limit: Option<Bytes>,
+    /// Schemes from the client's `signature_algorithms_cert` extension
+    /// (RFC 8446 §4.2.3), if it sent one: the certificate-chain signature
+    /// algorithms it can verify. `None` when the extension is absent.
+    pub signature_algorithms_cert: Option<Vec<u16>>,
     /// Raw body of an `encrypted_client_hello` extension (RFC 9849 §5), if
     /// the client sent one. Interpreted by the engine's ECH handling.
     pub ech: Option<Bytes>,
@@ -173,6 +177,14 @@ impl HandshakeEvents for ClientHelloCollector {
     fn extension(&mut self, ext_type: u16, data: &[u8]) {
         if ext_type == super::messages::ext::RECORD_SIZE_LIMIT {
             self.out.record_size_limit = Some(Bytes::copy_from_slice(data));
+        } else if ext_type == super::messages::ext::SIGNATURE_ALGORITHMS_CERT {
+            // `SignatureScheme supported_signature_algorithms<2..2^16-2>`:
+            // a u16 byte length, then u16 schemes. Malformed (odd or
+            // mismatched length) is treated as absent rather than trusted.
+            if data.len() >= 2 && usize::from(u16::from_be_bytes([data[0], data[1]])) == data.len() - 2 && data.len() % 2 == 0 {
+                self.out.signature_algorithms_cert =
+                    Some(data[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect());
+            }
         } else if ext_type == super::messages::ext::ENCRYPTED_CLIENT_HELLO {
             self.out.ech = Some(Bytes::copy_from_slice(data));
         }

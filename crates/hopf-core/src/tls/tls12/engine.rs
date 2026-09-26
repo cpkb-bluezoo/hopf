@@ -1128,6 +1128,23 @@ impl Tls12Engine {
             return false;
         }
 
+        // RFC 8446 §4.2.3 / RFC 9846 §1.4: when the client lists the
+        // certificate signature algorithms it can verify, don't send it a
+        // chain that needs another. (The RFC only says to continue anyway
+        // if no compatible chain exists; the peer would then reject the
+        // chain, so fail here with a clearer diagnosis instead.) Absent
+        // extension: no constraint is applied.
+        if let Some(offered) = ch.signature_algorithms_cert.as_deref() {
+            if let Some(scheme) = crate::crypto::x509::chain_scheme_not_offered(&creds.cert_chain, offered) {
+                self.fail(
+                    sink,
+                    AlertDescription::HandshakeFailure,
+                    &format!("server certificate chain is signed with scheme 0x{scheme:04x}, which the client did not list in signature_algorithms_cert"),
+                );
+                return false;
+            }
+        }
+
         let Some(suite) = SUPPORTED_CIPHER_SUITES.iter().copied().find(|s| {
             ch.cipher_suites.contains(s) && cipher_info(*s).is_some_and(|(_, _, k)| suite_accepts_key(k, our_kind))
         }) else {
@@ -1545,6 +1562,84 @@ mod tests {
             cert_chain: vec![Bytes::copy_from_slice(cert.der())],
             signing_key_pkcs8: Bytes::from(key_pair.serialize_der()),
         }
+    }
+
+    /// `[leaf, ca]` credentials: an ECDSA P-256 leaf issued by a P-256 CA, so
+    /// the leaf's certificate signature scheme is `ecdsa_secp256r1_sha256`
+    /// (0x0403).
+    fn ca_issued_server_credentials_ecdsa() -> ServerCredentials {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .unwrap();
+        ServerCredentials {
+            cert_chain: vec![Bytes::copy_from_slice(leaf.der()), Bytes::copy_from_slice(ca.der())],
+            signing_key_pkcs8: Bytes::from(leaf_key.serialize_der()),
+        }
+    }
+
+    /// Feed a TLS 1.2 server the client's ClientHello after rewriting its
+    /// `signature_algorithms_cert` to `offered` (`None` = untouched).
+    fn server_reply_to_client_offering(creds: ServerCredentials, offered: Option<&[u16]>) -> RecordingSink {
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let mut client = Tls12Engine::new(Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            trust_store: Some(trust),
+            ..Default::default()
+        });
+        let mut server = Tls12Engine::new(Config {
+            role: Role::Server,
+            server: Some(creds),
+            ..Default::default()
+        });
+        let mut client_sink = RecordingSink::default();
+        let mut server_sink = RecordingSink::default();
+        client.start(&mut client_sink);
+        for chunk in take_outbound(&mut client_sink) {
+            let chunk = match offered {
+                Some(schemes) => Bytes::from(crate::tls::handshake::messages::rewrite_client_hello_sig_algs_cert(&chunk, schemes)),
+                None => chunk,
+            };
+            let mut input = chunk.as_ref();
+            server.feed_handshake_data(&mut input, &mut server_sink);
+        }
+        server_sink
+    }
+
+    fn protocol_errors(sink: &RecordingSink) -> Vec<&String> {
+        sink.events.iter().filter(|e| e.starts_with("protocol_error")).collect()
+    }
+
+    /// RFC 9846 §1.4 applies `signature_algorithms_cert` to TLS 1.2: a
+    /// client that lists the chain signature algorithms it can verify must
+    /// not be sent a chain that needs one it didn't list.
+    #[test]
+    fn server_rejects_chain_needing_a_scheme_the_client_did_not_offer() {
+        let sink = server_reply_to_client_offering(ca_issued_server_credentials_ecdsa(), Some(&[0x0807, 0x0503]));
+        let errs = protocol_errors(&sink);
+        assert_eq!(errs.len(), 1, "{:?}", sink.events);
+        assert!(errs[0].contains("signature_algorithms_cert"), "{errs:?}");
+    }
+
+    #[test]
+    fn server_sends_chain_when_client_offers_the_scheme_it_needs() {
+        let sink = server_reply_to_client_offering(ca_issued_server_credentials_ecdsa(), Some(&[0x0403]));
+        assert!(protocol_errors(&sink).is_empty(), "{:?}", sink.events);
+        let sink = server_reply_to_client_offering(ca_issued_server_credentials_ecdsa(), None);
+        assert!(protocol_errors(&sink).is_empty(), "{:?}", sink.events);
+    }
+
+    #[test]
+    fn server_ignores_client_scheme_list_for_a_self_signed_chain() {
+        let sink = server_reply_to_client_offering(test_server_credentials_ecdsa(), Some(&[0x0807]));
+        assert!(protocol_errors(&sink).is_empty(), "{:?}", sink.events);
     }
 
     fn take_outbound(sink: &mut RecordingSink) -> Vec<Bytes> {
