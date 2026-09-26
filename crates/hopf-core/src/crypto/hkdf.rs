@@ -142,9 +142,20 @@ fn build_hkdf_label(prefix: &str, label: &str, context: &[u8], length: usize) ->
     out.freeze()
 }
 
-/// HKDF-Expand-Label for RFC 9001 QUIC packet protection (uses the `quic ` prefix).
+/// HKDF-Expand-Label for RFC 9001 QUIC packet protection (label prefix `quic `,
+/// after the `tls13 ` prefix HKDF-Expand-Label itself adds).
 pub fn quic_expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> Bytes {
-    let hkdf_label = build_hkdf_label("quic ", label, context, len);
+    quic_expand_label_with_prefix("quic ", secret, label, context, len)
+}
+
+/// [`quic_expand_label`] with a caller-chosen label prefix: QUIC version 2
+/// (RFC 9369 section 3.3.2) derives packet protection keys under `quicv2 `.
+pub fn quic_expand_label_with_prefix(prefix: &str, secret: &[u8], label: &str, context: &[u8], len: usize) -> Bytes {
+    // RFC 9001 section 5.1 names the label "quic key"; HKDF-Expand-Label
+    // (RFC 8446 section 7.1) prepends "tls13 " to whatever it is given, so the
+    // bytes hashed are "tls13 quic key" (RFC 9001 Appendix A.1). Omitting it
+    // yields keys no other QUIC implementation can read.
+    let hkdf_label = build_hkdf_label(&format!("{TLS13_LABEL_PREFIX}{prefix}"), label, context, len);
     let prk = Prk::new_less_safe(TLS13_HKDF, secret);
     let label_slice = [hkdf_label.as_ref()];
     let okm = prk

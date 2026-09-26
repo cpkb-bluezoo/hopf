@@ -32,7 +32,7 @@ pub use config::{
     server_config_from_pem, server_config_from_pem_with,
     server_config_self_signed, server_config_self_signed_hopf, server_config_self_signed_with,
     server_config_self_signed_with_hopf, QuicClientConfig, QuicConnectConfig,
-    QuicListenConfig, QuicListenHardening, QuicListenHooksConfig, QuicServerConfig, QuicTlsOptions,
+    QuicListenConfig, QuicListenHardening, QuicListenHooksConfig, QuicServerConfig, QuicTlsOptions, QuicVersion,
     QuicTransportOptions,
 };
 pub use transport::quic_lb::{

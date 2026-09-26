@@ -15,4 +15,5 @@ pub mod stream;
 pub mod tls_bridge;
 pub mod types;
 pub mod varint;
+pub mod version;
 

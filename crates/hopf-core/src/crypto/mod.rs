@@ -28,7 +28,7 @@ pub mod ed448;
 pub use aead::{AeadError, Aes128GcmKey, AesGcmKey, ChaCha20Poly1305Key};
 pub use cert::{extract_spki, sha256_fingerprint_hex, spki_sha256, SpkiDer};
 pub use digest::{hash, Digest, HashAlgorithm, Sha256Context};
-pub use hkdf::{empty_hash, expand_label, extract, extract_derived, quic_expand_label, HkdfPrk, TLS13_HKDF};
+pub use hkdf::{empty_hash, expand_label, extract, extract_derived, quic_expand_label, quic_expand_label_with_prefix, HkdfPrk, TLS13_HKDF};
 pub use kx::{
     server_agree, EphemeralKeyPair, EphemeralP256KeyPair, HybridKeyPair, LocalKeyShare, NamedGroup,
     StaticKeyPair, MLKEM768_CIPHERTEXT_LEN, MLKEM768_ENCAP_LEN, X25519_PUBLIC_LEN,

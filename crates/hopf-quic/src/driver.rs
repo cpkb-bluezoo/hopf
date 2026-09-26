@@ -2180,6 +2180,10 @@ mod early_open_probe {
     pub(super) fn took() -> bool {
         DID_EARLY_OPEN.load(Ordering::SeqCst)
     }
+
+    /// The probe is one process-wide flag, so tests that read it must not
+    /// overlap.
+    pub(super) static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 #[derive(Default)]
@@ -2425,6 +2429,43 @@ mod tests {
         client.shutdown();
     }
 
+    /// On the wire: a client preferring version 2 sends a v2 Initial, and on
+    /// a genuine Version Negotiation packet offering only version 1 sends a
+    /// fresh v1 Initial (new destination CID, same source CID).
+    #[test]
+    fn client_sends_a_version_1_initial_after_a_version_2_probe_is_negotiated_away() {
+        use crate::QuicVersion::{V1, V2};
+        let (_server_cfg, pem) = server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let mut client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+        Arc::make_mut(&mut client_cfg).versions(&[V2, V1]);
+        let fake_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        fake_server.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let client = connect_quic(QuicConnectConfig::new(
+            fake_server.local_addr().unwrap(),
+            client_cfg,
+            "localhost",
+            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (n, client_addr) = fake_server.recv_from(&mut buf).expect("first Initial");
+        let (v, dcid, scid) = {
+            let (v, d, s) = crate::transport::packet::version_negotiation::parse_invariants(&buf[..n]).unwrap();
+            (v, d.to_vec(), s.to_vec())
+        };
+        assert_eq!(v, V2.wire(), "first flight in the preferred version");
+        assert!(n >= 1200, "an Initial datagram is padded to 1200 octets");
+
+        fake_server.send_to(&version_negotiation_reply(&scid, &dcid, &[V1.wire()]), client_addr).unwrap();
+        let (n2, _) = fake_server.recv_from(&mut buf).expect("restarted Initial");
+        let (v2, dcid2, scid2) = crate::transport::packet::version_negotiation::parse_invariants(&buf[..n2]).unwrap();
+        assert_eq!(v2, V1.wire(), "restarted in the offered version");
+        assert_ne!(dcid2, dcid.as_slice(), "new destination connection ID");
+        assert_eq!(scid2, scid.as_slice(), "same source connection ID");
+        client.shutdown();
+    }
+
     /// A Version Negotiation packet as a server would send it: the client's
     /// SCID first, its DCID second, then the offered versions.
     fn version_negotiation_reply(client_scid: &[u8], client_dcid: &[u8], versions: &[u32]) -> Vec<u8> {
@@ -2485,6 +2526,125 @@ mod tests {
             client.shutdown();
             server.shutdown();
         }
+    }
+
+    /// Dial `server` echoing `ping` with a client speaking `client_versions`;
+    /// true if the echo came back within a few seconds.
+    fn echo_with_versions(
+        server_versions: &[crate::QuicVersion],
+        client_versions: &[crate::QuicVersion],
+    ) -> bool {
+        let (mut server_cfg, pem) = server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        Arc::make_mut(&mut server_cfg).versions(server_versions);
+        let mut client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+        Arc::make_mut(&mut client_cfg).versions(client_versions);
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+        let got = Arc::new(StdMutex::new(Vec::new()));
+        let got2 = Arc::clone(&got);
+        let client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(move || Box::new(ClientProbe { sent: false, got: Arc::clone(&got2) }) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+        for _ in 0..150 {
+            if got.lock().unwrap().as_slice() == b"ping" {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let ok = got.lock().unwrap().as_slice() == b"ping";
+        client.shutdown();
+        server.shutdown();
+        ok
+    }
+
+    /// A version 2 client and a version 2 (and 1) server complete a real
+    /// handshake over UDP, through the default Retry, and echo.
+    #[test]
+    fn echo_over_udp_in_quic_version_2() {
+        use crate::QuicVersion::{V1, V2};
+        assert!(echo_with_versions(&[V1, V2], &[V2]), "v2 client, dual-version server");
+        assert!(echo_with_versions(&[V2], &[V2]), "v2 client, v2-only server");
+        assert!(echo_with_versions(&[V1, V2], &[V1]), "v1 client stays supported");
+    }
+
+    /// Dual-stack: a client that prefers version 2 but also speaks version 1
+    /// probes a v1-only server, receives Version Negotiation, restarts in
+    /// version 1 and completes the handshake. A client with no version in
+    /// common with the server gets nowhere, in either direction.
+    #[test]
+    fn a_version_2_client_falls_back_to_a_version_1_only_server() {
+        use crate::QuicVersion::{V1, V2};
+        assert!(echo_with_versions(&[V1], &[V2, V1]), "v2 probe, v1-only server: restart in v1");
+        assert!(!echo_with_versions(&[V1], &[V2]), "v2-only client cannot reach a v1-only server");
+        assert!(!echo_with_versions(&[V2], &[V1]), "v1-only client cannot reach a v2-only server");
+    }
+
+    /// RFC 9369 section 5: a session ticket is specific to the QUIC version
+    /// that issued it. A ticket earned over version 1 must not be offered on a
+    /// version 2 connection to the same server (and vice versa); each version
+    /// resumes with its own. Observed as 0-RTT: the client opens its first
+    /// stream before the handshake completes only when it holds a usable ticket.
+    #[test]
+    fn a_session_ticket_is_only_reused_on_the_version_that_issued_it() {
+        use crate::config::{client_config_for_pem_bytes_with, server_config_self_signed_with, QuicTlsOptions};
+        use crate::QuicVersion::{V1, V2};
+        let _serial = early_open_probe::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        let tls = QuicTlsOptions::new().with_early_data();
+        let (server_cfg, pem) = server_config_self_signed_with(&["localhost"], &[b"hq-interop"], tls.clone()).unwrap();
+        let mut client_cfg = client_config_for_pem_bytes_with(&pem, &[b"hq-interop"], tls).unwrap();
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        // Dial once in `version`, returning whether the first stream was
+        // opened as 0-RTT. The cloned config shares its ticket store.
+        let mut dial = |version: crate::QuicVersion| -> bool {
+            Arc::make_mut(&mut client_cfg).versions(&[version]);
+            early_open_probe::reset();
+            let got = Arc::new(StdMutex::new(Vec::new()));
+            let got2 = Arc::clone(&got);
+            let client = connect_quic(QuicConnectConfig::new(
+                server.local_addr,
+                Arc::clone(&client_cfg),
+                "localhost",
+                Arc::new(move || Box::new(ClientProbe { sent: false, got: Arc::clone(&got2) }) as Box<dyn ProtocolHandler>),
+            ))
+            .unwrap();
+            for _ in 0..200 {
+                if got.lock().unwrap().as_slice() == b"ping" {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(got.lock().unwrap().as_slice(), b"ping", "echo over {version:?}");
+            for _ in 0..50 {
+                if early_open_probe::took() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            let took = early_open_probe::took();
+            client.shutdown();
+            took
+        };
+
+        assert!(!dial(V1), "cold v1 dial has no ticket");
+        assert!(!dial(V2), "v2 must not use the v1 ticket");
+        assert!(dial(V2), "v2 resumes with the ticket its own dial earned");
+        assert!(dial(V1), "v1 still resumes with its own ticket");
+        server.shutdown();
     }
 
     #[test]
@@ -3382,6 +3542,7 @@ mod tests {
             client_config_for_pem_bytes_with, server_config_self_signed_with, QuicTlsOptions,
         };
 
+        let _serial = early_open_probe::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let tls = QuicTlsOptions::new().with_early_data();
         let (server_cfg, pem) =
             server_config_self_signed_with(&["localhost"], &[b"hq-interop"], tls.clone()).unwrap();

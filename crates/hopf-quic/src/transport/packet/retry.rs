@@ -9,21 +9,11 @@ use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, AES_256_
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
 use crate::transport::packet::long_header::{HEADER_FORM_LONG, FIXED_BIT, TYPE_RETRY};
-use crate::transport::types::{ConnectionId, VERSION_V1};
+use crate::transport::types::ConnectionId;
+use crate::transport::version::QuicVersion;
 
 /// Retry Integrity Tag length (RFC 9000 §17.2.5.1).
 pub const INTEGRITY_TAG_LEN: usize = 16;
-
-/// RFC 9001 §5.8 fixed AES-128-GCM key.
-const INTEGRITY_KEY: [u8; 16] = [
-    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8,
-    0x4e,
-];
-
-/// RFC 9001 §5.8 fixed nonce.
-const INTEGRITY_NONCE: [u8; 12] = [
-    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
-];
 
 const TOKEN_NONCE_LEN: usize = 12;
 const TOKEN_GCM_TAG_LEN: usize = 16;
@@ -31,6 +21,8 @@ const TOKEN_GCM_TAG_LEN: usize = 16;
 /// Parsed Retry packet (RFC 9000 §17.2.5).
 #[derive(Debug, Clone)]
 pub struct RetryPacket {
+    /// QUIC version the Retry is in.
+    pub version: QuicVersion,
     /// Client's SCID from the Initial that triggered this Retry.
     pub dst_cid: ConnectionId,
     /// Server's newly chosen SCID (client's next Initial DCID).
@@ -45,14 +37,15 @@ pub struct RetryPacket {
 
 /// Build Retry header + token (no integrity tag).
 pub fn build_without_tag(
+    version: QuicVersion,
     dst_cid: &ConnectionId,
     src_cid: &ConnectionId,
     token: &[u8],
 ) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 4 + 2 + dst_cid.len() + src_cid.len() + token.len());
-    let first = HEADER_FORM_LONG | FIXED_BIT | ((TYPE_RETRY & 0x03) << 4);
+    let first = HEADER_FORM_LONG | FIXED_BIT | (version.wire_type(TYPE_RETRY) << 4);
     out.push(first);
-    out.extend_from_slice(&VERSION_V1.to_be_bytes());
+    out.extend_from_slice(&version.wire().to_be_bytes());
     out.push(dst_cid.len() as u8);
     out.extend_from_slice(dst_cid.as_slice());
     out.push(src_cid.len() as u8);
@@ -70,12 +63,8 @@ pub fn parse(packet: &[u8]) -> Option<RetryPacket> {
     if first & HEADER_FORM_LONG == 0 {
         return None;
     }
-    let packet_type = (first >> 4) & 0x03;
-    if packet_type != TYPE_RETRY {
-        return None;
-    }
-    let version = u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
-    if version != VERSION_V1 {
+    let version = QuicVersion::from_wire(u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]))?;
+    if version.logical_type((first >> 4) & 0x03) != TYPE_RETRY {
         return None;
     }
     let mut rest = &packet[5..];
@@ -99,6 +88,7 @@ pub fn parse(packet: &[u8]) -> Option<RetryPacket> {
     tag.copy_from_slice(&rest[token_len..]);
     let without_tag = packet[..packet.len() - INTEGRITY_TAG_LEN].to_vec();
     Some(RetryPacket {
+        version,
         dst_cid,
         src_cid,
         token,
@@ -108,19 +98,19 @@ pub fn parse(packet: &[u8]) -> Option<RetryPacket> {
 }
 
 /// Compute Retry Integrity Tag (RFC 9001 §5.8).
-pub fn integrity_tag(original_dst_cid: &[u8], retry_without_tag: &[u8]) -> [u8; INTEGRITY_TAG_LEN] {
+pub fn integrity_tag(version: QuicVersion, original_dst_cid: &[u8], retry_without_tag: &[u8]) -> [u8; INTEGRITY_TAG_LEN] {
     let mut aad = Vec::with_capacity(1 + original_dst_cid.len() + retry_without_tag.len());
     aad.push(original_dst_cid.len() as u8);
     aad.extend_from_slice(original_dst_cid);
     aad.extend_from_slice(retry_without_tag);
 
     let key = LessSafeKey::new(
-        UnboundKey::new(&AES_128_GCM, &INTEGRITY_KEY).expect("integrity key"),
+        UnboundKey::new(&AES_128_GCM, &version.retry_key()).expect("integrity key"),
     );
     let mut empty = Vec::new();
     let tag = key
         .seal_in_place_separate_tag(
-            Nonce::assume_unique_for_key(INTEGRITY_NONCE),
+            Nonce::assume_unique_for_key(version.retry_nonce()),
             Aad::from(&aad),
             &mut empty,
         )
@@ -132,6 +122,7 @@ pub fn integrity_tag(original_dst_cid: &[u8], retry_without_tag: &[u8]) -> [u8; 
 
 /// Verify a received integrity tag (constant-time).
 pub fn verify_integrity(
+    version: QuicVersion,
     original_dst_cid: &[u8],
     retry_without_tag: &[u8],
     received_tag: &[u8],
@@ -139,7 +130,7 @@ pub fn verify_integrity(
     if received_tag.len() != INTEGRITY_TAG_LEN {
         return false;
     }
-    let expected = integrity_tag(original_dst_cid, retry_without_tag);
+    let expected = integrity_tag(version, original_dst_cid, retry_without_tag);
     let mut diff = 0u8;
     for (a, b) in expected.iter().zip(received_tag.iter()) {
         diff |= a ^ b;
@@ -149,13 +140,14 @@ pub fn verify_integrity(
 
 /// Build a complete Retry packet (header + token + integrity tag).
 pub fn build_packet(
+    version: QuicVersion,
     client_scid: &ConnectionId,
     retry_scid: &ConnectionId,
     original_dst_cid: &[u8],
     token: &[u8],
 ) -> Vec<u8> {
-    let without_tag = build_without_tag(client_scid, retry_scid, token);
-    let tag = integrity_tag(original_dst_cid, &without_tag);
+    let without_tag = build_without_tag(version, client_scid, retry_scid, token);
+    let tag = integrity_tag(version, original_dst_cid, &without_tag);
     let mut packet = without_tag;
     packet.extend_from_slice(&tag);
     packet
@@ -171,6 +163,7 @@ pub fn generate_token_key() -> [u8; 32] {
 /// Seal a Retry Token (Gumdrop scheme: AES-256-GCM, AAD = client IP).
 pub fn seal_token(
     key: &[u8; 32],
+    version: QuicVersion,
     original_dst_cid: &[u8],
     client_ip: IpAddr,
     issued_at: SystemTime,
@@ -187,6 +180,9 @@ pub fn seal_token(
     plaintext.push(original_dst_cid.len() as u8);
     plaintext.extend_from_slice(original_dst_cid);
     plaintext.extend_from_slice(&issued_ms.to_be_bytes());
+    // The version the Retry was sent in: the returning Initial must use the
+    // same one (RFC 9369 section 4.1 lets the server enforce this).
+    plaintext.extend_from_slice(&version.wire().to_be_bytes());
 
     let aead = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("token key"));
     let aad = ip_aad(client_ip);
@@ -208,6 +204,7 @@ pub fn seal_token(
 /// Unseal and validate a Retry Token. Returns the original Destination CID.
 pub fn unseal_token(
     key: &[u8; 32],
+    version: QuicVersion,
     token: &[u8],
     client_ip: IpAddr,
     max_age: Duration,
@@ -233,13 +230,18 @@ pub fn unseal_token(
         return None;
     }
     let dcid_len = ciphertext[0] as usize;
-    if ciphertext.len() < 1 + dcid_len + 8 {
+    if ciphertext.len() < 1 + dcid_len + 8 + 4 {
         return None;
     }
     let dcid = ciphertext[1..1 + dcid_len].to_vec();
     let mut issued_bytes = [0u8; 8];
     issued_bytes.copy_from_slice(&ciphertext[1 + dcid_len..1 + dcid_len + 8]);
     let issued_ms = u64::from_be_bytes(issued_bytes);
+    let v = 1 + dcid_len + 8;
+    let token_version = u32::from_be_bytes([ciphertext[v], ciphertext[v + 1], ciphertext[v + 2], ciphertext[v + 3]]);
+    if token_version != version.wire() {
+        return None;
+    }
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -268,12 +270,14 @@ mod tests {
         let scid = ConnectionId::from_slice(&[9, 10, 11, 12]);
         let token = b"opaque-retry-token";
         let odcid = ConnectionId::from_slice(&[0xaa; 8]);
-        let packet = build_packet(&dcid, &scid, odcid.as_slice(), token);
+        let packet = build_packet(QuicVersion::V1, &dcid, &scid, odcid.as_slice(), token);
         let parsed = parse(&packet).unwrap();
         assert_eq!(parsed.dst_cid.as_slice(), dcid.as_slice());
         assert_eq!(parsed.src_cid.as_slice(), scid.as_slice());
         assert_eq!(parsed.token, token);
+        assert_eq!(parsed.version, QuicVersion::V1);
         assert!(verify_integrity(
+            QuicVersion::V1,
             odcid.as_slice(),
             &parsed.without_tag,
             &parsed.tag
@@ -283,12 +287,13 @@ mod tests {
     #[test]
     fn integrity_rejects_wrong_odcid() {
         let without = build_without_tag(
+            QuicVersion::V1,
             &ConnectionId::from_slice(&[1; 8]),
             &ConnectionId::from_slice(&[2; 8]),
             b"tok",
         );
-        let tag = integrity_tag(&[3; 8], &without);
-        assert!(!verify_integrity(&[4; 8], &without, &tag));
+        let tag = integrity_tag(QuicVersion::V1, &[3; 8], &without);
+        assert!(!verify_integrity(QuicVersion::V1, &[4; 8], &without, &tag));
     }
 
     #[test]
@@ -296,8 +301,8 @@ mod tests {
         let key = generate_token_key();
         let odcid = [7u8; 8];
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let token = seal_token(&key, &odcid, ip, SystemTime::now());
-        let recovered = unseal_token(&key, &token, ip, Duration::from_secs(30)).unwrap();
+        let token = seal_token(&key, QuicVersion::V1, &odcid, ip, SystemTime::now());
+        let recovered = unseal_token(&key, QuicVersion::V1, &token, ip, Duration::from_secs(30)).unwrap();
         assert_eq!(recovered, odcid);
     }
 
@@ -307,16 +312,63 @@ mod tests {
         let odcid = [7u8; 8];
         let token = seal_token(
             &key,
+            QuicVersion::V1,
             &odcid,
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             SystemTime::now(),
         );
         assert!(unseal_token(
             &key,
+            QuicVersion::V1,
             &token,
             IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
             Duration::from_secs(30)
         )
         .is_none());
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len() / 2).map(|i| u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap()).collect()
+    }
+
+    /// The Retry samples of RFC 9001 A.4 (v1) and RFC 9369 A.4 (v2). The
+    /// RFC's integrity tags must verify under our per-version key and nonce.
+    /// A packet built here matches the sample apart from the four unused
+    /// low bits of the first octet (arbitrary on the wire, and covered by
+    /// the tag, so the tag differs too) and verifies under the same rules.
+    #[test]
+    fn rfc_sample_retry_packets() {
+        use crate::transport::packet::{rfc9001_vectors as v1, rfc9369_vectors as v2};
+        let odcid = hex(v1::DCID);
+        let scid = ConnectionId::from_slice(&hex("f067a5502a4262b5"));
+        for (version, sample) in [(QuicVersion::V1, v1::RETRY_PACKET), (QuicVersion::V2, v2::RETRY_PACKET)] {
+            let sample = hex(sample);
+            let parsed = parse(&sample).unwrap_or_else(|| panic!("{version:?} sample parses"));
+            assert_eq!((parsed.version, parsed.token.as_slice()), (version, &b"token"[..]));
+            assert_eq!(parsed.src_cid.as_slice(), scid.as_slice());
+            assert!(verify_integrity(version, &odcid, &parsed.without_tag, &parsed.tag), "{version:?} RFC tag");
+            assert_eq!(integrity_tag(version, &odcid, &parsed.without_tag).to_vec(), parsed.tag.to_vec());
+
+            let built = build_packet(version, &ConnectionId::empty(), &scid, &odcid, b"token");
+            assert_eq!(built.len(), sample.len());
+            assert_eq!(built[0] & 0xf0, sample[0] & 0xf0, "form, fixed and type bits");
+            assert_eq!(built[1..built.len() - INTEGRITY_TAG_LEN], sample[1..sample.len() - INTEGRITY_TAG_LEN]);
+            let rebuilt = parse(&built).unwrap();
+            assert!(verify_integrity(version, &odcid, &rebuilt.without_tag, &rebuilt.tag));
+        }
+        // A tag made for one version does not verify under the other.
+        let p = parse(&hex(v2::RETRY_PACKET)).unwrap();
+        assert!(!verify_integrity(QuicVersion::V1, &odcid, &p.without_tag, &p.tag));
+    }
+
+    /// RFC 9369 section 4.1: a server may bind the Retry token to the
+    /// version so a client cannot switch versions on the returning Initial.
+    #[test]
+    fn a_token_is_only_valid_for_the_version_it_was_issued_in() {
+        let key = generate_token_key();
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let token = seal_token(&key, QuicVersion::V2, &[7; 8], ip, SystemTime::now());
+        assert!(unseal_token(&key, QuicVersion::V2, &token, ip, Duration::from_secs(30)).is_some());
+        assert!(unseal_token(&key, QuicVersion::V1, &token, ip, Duration::from_secs(30)).is_none());
     }
 }

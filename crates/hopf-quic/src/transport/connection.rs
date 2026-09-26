@@ -13,19 +13,21 @@ use hopf_core::tls::{HandshakeConfig, Tls13Aead};
 
 use crate::transport::varint;
 use crate::transport::frame::{parse_all, writer, Frame};
-use crate::transport::packet::long_header::{self, TYPE_0RTT, TYPE_HANDSHAKE, TYPE_INITIAL, TYPE_RETRY};
+use crate::transport::packet::long_header::{self, TYPE_0RTT, TYPE_HANDSHAKE, TYPE_INITIAL};
 use crate::transport::packet::pn;
 use crate::transport::packet::protection::{KeyPair, PacketKeys, TAG_LEN};
 use crate::transport::packet::retry;
 use crate::transport::packet::short_header;
 use crate::transport::packet::version_negotiation;
+use crate::transport::version::{self, QuicVersion};
+use crate::transport::packet::transport_params::VersionInformation;
 use crate::transport::packet::TransportParameters;
 use crate::transport::recovery::{LossDetector, RecoverableFrame};
 use crate::transport::stream::{RecvStream, SendStream, StreamReassembler};
 use crate::transport::tls_bridge::{self, OutboundCrypto, TlsBridge, TlsBridgeEvents};
 use crate::transport::types::{
     ConnectionError, ConnectionId, Dir, Event, Side, SpaceId, StreamEvent, StreamId, Transmit,
-    VarInt, VERSION_V1,
+    VarInt,
 };
 
 /// Maximum datagram size we send until the path is shown to support more
@@ -35,6 +37,10 @@ const MAX_DATAGRAM_SIZE: usize = 1200;
 
 /// Minimum size of a datagram carrying an Initial packet (RFC 9000 §14.1).
 const MIN_INITIAL_DATAGRAM_SIZE: usize = 1200;
+/// TRANSPORT_PARAMETER_ERROR (RFC 9000 section 20.1).
+const TRANSPORT_PARAMETER_ERROR: u64 = 0x08;
+/// VERSION_NEGOTIATION_ERROR (RFC 9368 section 10.2).
+const VERSION_NEGOTIATION_ERROR: u64 = 0x11;
 
 /// Per-PN-space state.
 struct Space {
@@ -74,15 +80,40 @@ impl Space {
         }
     }
 
-    fn keys(&self, side: Side) -> Option<KeyPair> {
+    fn keys(&self, side: Side, version: QuicVersion) -> Option<KeyPair> {
         let (c, s) = self.secrets?;
-        Some(KeyPair::from_traffic_secrets(side, self.aead, c, s))
+        Some(KeyPair::from_traffic_secrets(version, side, self.aead, c, s))
     }
+}
+
+/// The client-side constructor arguments a version restart replays.
+#[derive(Clone)]
+struct ClientRestart {
+    server_name: String,
+    handshake: HandshakeConfig,
+    max_datagram_frame_size: Option<u64>,
+    max_idle_timeout: Option<Duration>,
+    initial_max_streams_bidi: Option<u64>,
+    initial_max_streams_uni: Option<u64>,
+    keep_alive_interval: Option<Duration>,
 }
 
 /// In-tree QUIC connection.
 pub struct Connection {
     side: Side,
+    /// The QUIC version in use (RFC 9000/9369): selects Initial salt, key
+    /// derivation labels, long-header type bits and Retry integrity keys.
+    version: QuicVersion,
+    /// Client: the versions this connection may speak, most preferred first
+    /// (empty for a server). A Version Negotiation packet restarts the
+    /// attempt in the first of these the server offers.
+    client_versions: Vec<QuicVersion>,
+    /// Client: what a restart needs to rebuild the connection from scratch.
+    client_restart: Option<ClientRestart>,
+    /// Client: this attempt began by reacting to a Version Negotiation packet
+    /// (RFC 9368 section 4: further ones are ignored, and the server's
+    /// `version_information` must then be present and consistent).
+    reacted_to_version_negotiation: bool,
     remote: SocketAddr,
     /// Our local CID (SCID we advertise).
     local_cid: ConnectionId,
@@ -186,15 +217,34 @@ impl Connection {
         handshake: HandshakeConfig,
         local_cid: ConnectionId,
         initial_dcid: ConnectionId,
+        // Versions this client speaks, most preferred first (kept for
+        // Version Negotiation and its downgrade check), and the one this
+        // attempt opens with.
+        preference: &[QuicVersion],
+        version: QuicVersion,
         max_datagram_frame_size: Option<u64>,
         max_idle_timeout: Option<Duration>,
         initial_max_streams_bidi: Option<u64>,
         initial_max_streams_uni: Option<u64>,
         keep_alive_interval: Option<Duration>,
     ) -> Self {
+        let restart = ClientRestart {
+            server_name: server_name.to_string(),
+            handshake: handshake.clone(),
+            max_datagram_frame_size,
+            max_idle_timeout,
+            initial_max_streams_bidi,
+            initial_max_streams_uni,
+            keep_alive_interval,
+        };
         let mut local_tp = TransportParameters::default();
         local_tp.initial_src_cid = Some(local_cid.clone());
         local_tp.max_datagram_frame_size = max_datagram_frame_size;
+        // RFC 9369 section 4 / RFC 9368: send version_information. Only the
+        // chosen version is listed as available, which disables compatible
+        // version negotiation (RFC 9368 section 3) - this client does not
+        // switch versions mid-handshake.
+        local_tp.version_information = Some(VersionInformation { chosen: version.wire(), available: vec![version.wire()] });
         if let Some(d) = max_idle_timeout {
             local_tp.max_idle_timeout = d.as_millis() as u64;
         }
@@ -211,9 +261,15 @@ impl Connection {
         // Dial-time SNI always wins over any name baked into the client
         // config (shared configs / PEM helpers must not pin "localhost").
         hs.server_name = Some(server_name.to_string());
+        // RFC 9369 section 5: never present a ticket another version issued.
+        hs.ticket_namespace = version.ticket_namespace();
         let (tls, events) = TlsBridge::start_client(hs, &local_tp);
         let mut conn = Self {
             side: Side::Client,
+            version,
+            client_versions: preference.to_vec(),
+            client_restart: Some(restart),
+            reacted_to_version_negotiation: false,
             remote,
             local_cid,
             rem_cid: initial_dcid.clone(),
@@ -263,6 +319,7 @@ impl Connection {
             last_keep_alive: now,
         };
         conn.spaces[0].secrets = Some(crate::transport::packet::protection::initial_secrets(
+            version,
             initial_dcid.as_slice(),
         ));
         conn.apply_tls_events(events);
@@ -277,6 +334,10 @@ impl Connection {
         local_cid: ConnectionId,
         // DCID the client used on this Initial (Initial keying material).
         initial_dcid: ConnectionId,
+        // Version of the client's Initial, which this connection speaks, and
+        // every version this listener offers.
+        version: QuicVersion,
+        server_versions: &[QuicVersion],
         client_src_cid: ConnectionId,
         // original_destination_connection_id transport parameter.
         original_dst_cid: ConnectionId,
@@ -292,6 +353,12 @@ impl Connection {
         local_tp.initial_src_cid = Some(local_cid.clone());
         local_tp.original_dst_cid = Some(original_dst_cid);
         local_tp.retry_src_cid = retry_src_cid;
+        // RFC 9368 section 3: the server's Available Versions are its
+        // deployment's versions; the Chosen Version is the one in use.
+        local_tp.version_information = Some(VersionInformation {
+            chosen: version.wire(),
+            available: server_versions.iter().map(|v| v.wire()).collect(),
+        });
         local_tp.max_datagram_frame_size = max_datagram_frame_size;
         if let Some(d) = max_idle_timeout {
             local_tp.max_idle_timeout = d.as_millis() as u64;
@@ -305,9 +372,16 @@ impl Connection {
         let local_idle_timeout_ms = local_tp.max_idle_timeout;
         let idle_timeout = idle_timeout_from_ms(local_idle_timeout_ms);
         let local_max_streams_bidi = local_tp.initial_max_streams_bidi;
+        // RFC 9369 section 5: only accept tickets this version issued.
+        let mut handshake = handshake;
+        handshake.ticket_key = handshake.ticket_key.map(|k| version.ticket_keys(k));
         let tls = TlsBridge::start_server(handshake, &local_tp);
         let mut conn = Self {
             side: Side::Server,
+            version,
+            client_versions: Vec::new(),
+            client_restart: None,
+            reacted_to_version_negotiation: false,
             remote,
             local_cid,
             rem_cid: client_src_cid,
@@ -358,6 +432,7 @@ impl Connection {
         };
         conn.short_cid_len = conn.rem_cid.len();
         conn.spaces[0].secrets = Some(crate::transport::packet::protection::initial_secrets(
+            version,
             initial_dcid.as_slice(),
         ));
         conn
@@ -535,23 +610,25 @@ impl Connection {
     }
 
     fn handle_long_packet(&mut self, data: &[u8], now: Instant) -> usize {
-        if data.len() >= 6 && (data[0] >> 4) & 0x03 == TYPE_RETRY {
-            return self.handle_retry_packet(data);
-        }
-        // Version Negotiation (version 0) and other versions can't go through
-        // the v1 header parser: only the RFC 8999 invariants are readable.
+        // Version Negotiation (version 0) and versions we don't speak can't go
+        // through the header parsers: only the RFC 8999 invariants are readable.
         if let Some((version, _, _)) = version_negotiation::parse_invariants(data) {
             if version == 0 {
-                return self.handle_version_negotiation(data);
+                return self.handle_version_negotiation(data, now);
             }
-            if version != VERSION_V1 {
+            // A connection speaks one version (RFC 9369 section 4.1: an endpoint
+            // drops packets in any other), and a Retry's type bits depend on it.
+            if version != self.version.wire() {
                 return data.len();
             }
+        }
+        if long_header::is_retry(data) {
+            return self.handle_retry_packet(data);
         }
         let Some(prefix) = long_header::parse_prefix(data) else {
             return data.len();
         };
-        if prefix.version != VERSION_V1 {
+        if prefix.version != self.version {
             return data.len();
         }
         let space = match prefix.packet_type {
@@ -570,9 +647,9 @@ impl Connection {
             let Some(early) = self.early_secret else {
                 return packet_len;
             };
-            (PacketKeys::from_secret(self.early_aead, &early), true)
+            (PacketKeys::from_secret(self.version, self.early_aead, &early), true)
         } else {
-            match self.space(space).keys(self.side) {
+            match self.space(space).keys(self.side, self.version) {
                 Some(k) => (k.remote, false),
                 None => return packet_len,
             }
@@ -604,14 +681,23 @@ impl Connection {
         packet_len
     }
 
-    /// RFC 9000 section 6.2. This client speaks only version 1, so a valid
-    /// Version Negotiation packet that offers nothing usable means the
-    /// server has no version in common with us: abandon the attempt. Ignore
-    /// it if it lists version 1 (we already chose it, so the packet is
-    /// bogus), if it doesn't echo our connection IDs (an off-path forgery),
-    /// or if we've already processed any other server packet.
-    fn handle_version_negotiation(&mut self, data: &[u8]) -> usize {
-        if self.side != Side::Client || self.established || self.retry_processed || self.server_packet_processed {
+    /// RFC 9000 section 6.2 and RFC 9368 section 2.1: a valid Version
+    /// Negotiation packet that offers a version this client speaks restarts
+    /// the attempt in the first such version (a new first flight, with a new
+    /// destination CID); one that offers none abandons it.
+    ///
+    /// Ignored when it lists the version the client already used (bogus), when
+    /// it doesn't echo our connection IDs (an off-path forgery), when the
+    /// client has already processed any other server packet, and when this
+    /// attempt is itself the result of a Version Negotiation packet (RFC 9368
+    /// section 4).
+    fn handle_version_negotiation(&mut self, data: &[u8], now: Instant) -> usize {
+        if self.side != Side::Client
+            || self.established
+            || self.retry_processed
+            || self.server_packet_processed
+            || self.reacted_to_version_negotiation
+        {
             return data.len();
         }
         let Some(pkt) = version_negotiation::parse(data) else {
@@ -620,12 +706,44 @@ impl Connection {
         if pkt.dst_cid != self.local_cid.as_slice() || pkt.src_cid != self.initial_dcid.as_slice() {
             return data.len();
         }
-        if pkt.versions.contains(&VERSION_V1) {
+        if pkt.versions.contains(&self.version.wire()) {
             return data.len();
         }
-        self.closed = true;
-        self.events.push_back(Event::ConnectionLost { reason: ConnectionError::VersionMismatch });
+        let Some(next) = self.client_versions.iter().copied().find(|v| pkt.versions.contains(&v.wire())) else {
+            self.closed = true;
+            self.events.push_back(Event::ConnectionLost { reason: ConnectionError::VersionMismatch });
+            return data.len();
+        };
+        self.restart_client(now, next);
         data.len()
+    }
+
+    /// Start the client attempt over in `version`: a new first flight, keyed
+    /// from a fresh destination CID, as if it were a new connection (RFC 9368
+    /// section 2.4). Our own connection ID is kept, so the endpoint's routing
+    /// entry still reaches this connection.
+    fn restart_client(&mut self, now: Instant, version: QuicVersion) {
+        let Some(ctx) = self.client_restart.clone() else {
+            return;
+        };
+        let preference = self.client_versions.clone();
+        let mut fresh = Connection::new_client(
+            now,
+            self.remote,
+            &ctx.server_name,
+            ctx.handshake,
+            self.local_cid.clone(),
+            ConnectionId::random(8),
+            &preference,
+            version,
+            ctx.max_datagram_frame_size,
+            ctx.max_idle_timeout,
+            ctx.initial_max_streams_bidi,
+            ctx.initial_max_streams_uni,
+            ctx.keep_alive_interval,
+        );
+        fresh.reacted_to_version_negotiation = true;
+        *self = fresh;
     }
 
     fn handle_retry_packet(&mut self, data: &[u8]) -> usize {
@@ -640,6 +758,7 @@ impl Connection {
             return data.len();
         }
         if !retry::verify_integrity(
+            self.version,
             self.initial_dcid.as_slice(),
             &retry_pkt.without_tag,
             &retry_pkt.tag,
@@ -656,6 +775,7 @@ impl Connection {
         // RFC 9001 §5.2: after Retry, Initial secrets use the new DCID
         // (Retry SCID).
         self.spaces[0].secrets = Some(crate::transport::packet::protection::initial_secrets(
+            self.version,
             self.rem_cid.as_slice(),
         ));
         self.spaces[0].pending_ack.clear();
@@ -679,7 +799,7 @@ impl Connection {
         let Some(prefix) = short_header::parse_prefix(data, cid_len) else {
             return data.len();
         };
-        let keys = match self.space(SpaceId::Data).keys(self.side) {
+        let keys = match self.space(SpaceId::Data).keys(self.side, self.version) {
             Some(k) => k,
             None => return data.len(),
         };
@@ -908,6 +1028,10 @@ impl Connection {
         }
         if let Some(raw) = events.peer_tp {
             if let Some(tp) = TransportParameters::decode(&raw) {
+                if let Some((code, reason)) = self.check_version_information(&tp) {
+                    self.fail_transport(code, reason);
+                    return;
+                }
                 self.peer_max_streams_bidi = tp.initial_max_streams_bidi;
                 self.peer_max_streams_uni = tp.initial_max_streams_uni;
                 self.conn_max_data = tp.initial_max_data;
@@ -964,6 +1088,66 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Validate the peer's `version_information` (RFC 9368 section 4), which
+    /// every endpoint supporting version 2 must process (RFC 9369 section 4).
+    /// Returns the transport error to close the connection with, if any.
+    fn check_version_information(&self, tp: &TransportParameters) -> Option<(u64, &'static str)> {
+        if tp.version_information_invalid {
+            return Some((TRANSPORT_PARAMETER_ERROR, "malformed version_information"));
+        }
+        let in_use = self.version.wire();
+        match (self.side, &tp.version_information) {
+            // A server may complete the handshake without it.
+            (Side::Server, None) => None,
+            (Side::Server, Some(vi)) => {
+                if !vi.available.contains(&vi.chosen) {
+                    Some((TRANSPORT_PARAMETER_ERROR, "chosen version missing from available versions"))
+                } else if vi.chosen != in_use {
+                    Some((VERSION_NEGOTIATION_ERROR, "client chosen version differs from the version in use"))
+                } else {
+                    None
+                }
+            }
+            // A client may too, unless it is reacting to Version Negotiation.
+            (Side::Client, None) if self.reacted_to_version_negotiation => {
+                Some((VERSION_NEGOTIATION_ERROR, "server sent no version_information after version negotiation"))
+            }
+            (Side::Client, None) => None,
+            (Side::Client, Some(vi)) => {
+                if vi.chosen != in_use {
+                    Some((VERSION_NEGOTIATION_ERROR, "server chosen version differs from the version in use"))
+                } else if self.reacted_to_version_negotiation
+                    && !version::validates_negotiation(&self.client_versions, &vi.available, self.version)
+                {
+                    Some((VERSION_NEGOTIATION_ERROR, "version negotiation was not genuine"))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Close the connection with a transport error: tell the peer with a
+    /// CONNECTION_CLOSE (type 0x1c) in the highest packet space we have keys
+    /// for, and report it locally.
+    fn fail_transport(&mut self, code: u64, reason: &'static str) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let mut payload = Vec::new();
+        writer::connection_close(&mut payload, code, reason.as_bytes());
+        let now = self.last_activity;
+        for space in [SpaceId::Data, SpaceId::Handshake, SpaceId::Initial] {
+            if self.space(space).secrets.is_some() && self.queue_packet(space, payload.clone(), Vec::new(), false, false, now) {
+                break;
+            }
+        }
+        self.events.push_back(Event::ConnectionLost {
+            reason: ConnectionError::TransportError { code, reason: reason.to_string() },
+        });
     }
 
     fn maybe_establish(&mut self) {
@@ -1204,7 +1388,9 @@ impl Connection {
         let budget = self.max_datagram_size();
         let header_len = if use_0rtt {
             // The Length field is at most two bytes at this size.
-            long_header::build_0rtt(&self.rem_cid, &self.local_cid, 0, pn_len, budget).len()
+            long_header::build_0rtt(
+self.version,
+&self.rem_cid, &self.local_cid, 0, pn_len, budget).len()
         } else {
             1 + self.rem_cid.len() + pn_len
         };
@@ -1219,20 +1405,18 @@ impl Connection {
 
     fn queue_packet_pad_initial(
         &mut self,
-        mut payload: Vec<u8>,
+        payload: Vec<u8>,
         frames: Vec<RecoverableFrame>,
         now: Instant,
     ) {
-        // Estimate: pad payload so final UDP datagram ≥ 1200 (RFC 9000 §14.1).
-        // Rough header ~ 50 bytes + tag 16.
-        let header_est = 50 + 16;
-        let need = MIN_INITIAL_DATAGRAM_SIZE.saturating_sub(header_est + payload.len());
-        let target = payload.len() + need;
-        if need > 0 {
-            writer::pad_to(&mut payload, target);
-        }
+        // RFC 9000 section 14.1: expand the datagram to at least 1200 octets.
+        // `queue_packet` knows the real header length (which varies with the
+        // CID lengths, token and packet number), so let it pad exactly.
+        let previous = self.gso_pad_to;
+        self.gso_pad_to = Some(previous.unwrap_or(0).max(MIN_INITIAL_DATAGRAM_SIZE));
         // Padded Initial is in flight even beyond ack-eliciting frames.
         self.queue_packet(SpaceId::Initial, payload, frames, true, true, now);
+        self.gso_pad_to = previous;
     }
 
     /// Build and enqueue a protected packet. Returns false if congestion-blocked (Data only).
@@ -1250,9 +1434,9 @@ impl Connection {
             && self.early_secret.is_some()
             && self.side == Side::Client;
         let local_keys = if use_0rtt {
-            PacketKeys::from_secret(self.early_aead, self.early_secret.as_ref().unwrap())
+            PacketKeys::from_secret(self.version, self.early_aead, self.early_secret.as_ref().unwrap())
         } else {
-            match self.space(space).keys(self.side) {
+            match self.space(space).keys(self.side, self.version) {
                 Some(k) => k.local,
                 None => return false,
             }
@@ -1283,7 +1467,8 @@ impl Connection {
 
         let header = match space {
             SpaceId::Initial => long_header::build_initial(
-                &self.rem_cid,
+self.version,
+&self.rem_cid,
                 &self.local_cid,
                 &self.token,
                 pn,
@@ -1291,14 +1476,16 @@ impl Connection {
                 protected_len,
             ),
             SpaceId::Handshake => long_header::build_handshake(
-                &self.rem_cid,
+self.version,
+&self.rem_cid,
                 &self.local_cid,
                 pn,
                 pn_len,
                 protected_len,
             ),
             SpaceId::Data if use_0rtt => long_header::build_0rtt(
-                &self.rem_cid,
+self.version,
+&self.rem_cid,
                 &self.local_cid,
                 pn,
                 pn_len,
@@ -1357,7 +1544,8 @@ impl Connection {
                     let protected_len = payload.len() + tag_len;
                     let header_len = match space {
                         SpaceId::Initial => long_header::build_initial(
-                            &self.rem_cid,
+self.version,
+&self.rem_cid,
                             &self.local_cid,
                             &self.token,
                             0,
@@ -1366,7 +1554,8 @@ impl Connection {
                         )
                         .len(),
                         SpaceId::Handshake => long_header::build_handshake(
-                            &self.rem_cid,
+self.version,
+&self.rem_cid,
                             &self.local_cid,
                             0,
                             pn_len,
@@ -1913,6 +2102,8 @@ mod tests {
             hs,
             local,
             dcid,
+            &[QuicVersion::V1],
+            QuicVersion::V1,
             Some(65535),
             None,
             None,
@@ -1926,7 +2117,7 @@ mod tests {
             sp.pending_ack.clear();
         }
         conn.transmits.clear();
-        let secrets = crate::transport::packet::protection::initial_secrets(&[1, 2, 3, 4]);
+        let secrets = crate::transport::packet::protection::initial_secrets(QuicVersion::V1, &[1, 2, 3, 4]);
         conn.spaces[2].secrets = Some(secrets);
         conn.peer_max_datagram = 65535;
         conn
@@ -1956,6 +2147,285 @@ mod tests {
         None
     }
 
+    /// RFC 9000 section 14.1: a client MUST expand every datagram carrying an
+    /// Initial packet to at least 1200 octets, or servers drop it. Regression:
+    /// the padding used a fixed guess of the header size, which is longer than
+    /// a real Initial header, so first flights were about 1180 octets.
+    #[test]
+    fn the_first_initial_datagram_is_at_least_1200_octets() {
+        for version in [QuicVersion::V1, QuicVersion::V2] {
+            for (scid_len, dcid_len) in [(8usize, 8usize), (4, 8), (20, 20), (1, 16)] {
+                let mut conn = Connection::new_client(
+                    Instant::now(),
+                    "127.0.0.1:4433".parse().unwrap(),
+                    "localhost",
+                    HandshakeConfig {
+                        role: HandshakeRole::Client,
+                        mode: HandshakeMode::Quic,
+                        alpn: vec![Bytes::from_static(b"hq-interop")],
+                        kx_policy: KxPolicy::classical_only(),
+                        ..Default::default()
+                    },
+                    ConnectionId::from_slice(&vec![1u8; scid_len]),
+                    ConnectionId::from_slice(&vec![2u8; dcid_len]),
+                    &[version],
+                    version,
+                    Some(1452),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let mut buf = Vec::new();
+                conn.poll_transmit(Instant::now(), &mut buf).expect("a first flight");
+                assert!(buf.len() >= 1200, "{version:?} scid {scid_len} dcid {dcid_len}: {} octets", buf.len());
+                assert!(buf.len() <= 1252, "not wildly oversized: {}", buf.len());
+            }
+        }
+    }
+
+    fn test_server(version: QuicVersion, server_versions: &[QuicVersion]) -> Connection {
+        Connection::new_server(
+            Instant::now(),
+            "127.0.0.1:50000".parse().unwrap(),
+            HandshakeConfig {
+                role: HandshakeRole::Server,
+                mode: HandshakeMode::Quic,
+                ..Default::default()
+            },
+            ConnectionId::from_slice(&[0xaa; 8]),
+            ConnectionId::from_slice(&[0xbb; 8]),
+            version,
+            server_versions,
+            ConnectionId::from_slice(&[0xcc; 8]),
+            ConnectionId::from_slice(&[0xbb; 8]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Feed `conn` the peer's transport parameters as the TLS layer would.
+    fn receive_peer_tp(conn: &mut Connection, tp: &TransportParameters) {
+        conn.apply_tls_events(TlsBridgeEvents {
+            peer_tp: Some(Bytes::from(tp.encode())),
+            ..Default::default()
+        });
+    }
+
+    fn tp_with(chosen: u32, available: &[u32]) -> TransportParameters {
+        let mut tp = TransportParameters::default();
+        tp.version_information = Some(VersionInformation { chosen, available: available.to_vec() });
+        tp
+    }
+
+    /// The `TransportError` code a connection was closed with, if any.
+    fn closed_with(conn: &mut Connection) -> Option<u64> {
+        match lost_with(conn) {
+            Some(ConnectionError::TransportError { code, .. }) => Some(code),
+            _ => None,
+        }
+    }
+
+    const V1: u32 = 1;
+    const V2: u32 = 0x6b33_43cf;
+
+    /// RFC 9369 section 4: every v2-capable endpoint sends version_information.
+    /// A client lists only its chosen version as available (compatible version
+    /// negotiation off); a server lists its whole deployment.
+    #[test]
+    fn both_roles_send_version_information() {
+        let client = versioned_client(Instant::now(), &[QuicVersion::V2, QuicVersion::V1]);
+        assert_eq!(client.local_tp.version_information, Some(VersionInformation { chosen: V1, available: vec![V1] }));
+        let mut v2_client = Connection::new_client(
+            Instant::now(),
+            "127.0.0.1:4433".parse().unwrap(),
+            "localhost",
+            HandshakeConfig { role: HandshakeRole::Client, mode: HandshakeMode::Quic, ..Default::default() },
+            ConnectionId::from_slice(&[1; 8]),
+            ConnectionId::from_slice(&[2; 8]),
+            &[QuicVersion::V2, QuicVersion::V1],
+            QuicVersion::V2,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(v2_client.local_tp.version_information, Some(VersionInformation { chosen: V2, available: vec![V2] }));
+        let _ = &mut v2_client;
+
+        let server = test_server(QuicVersion::V1, &[QuicVersion::V2, QuicVersion::V1]);
+        assert_eq!(server.local_tp.version_information, Some(VersionInformation { chosen: V1, available: vec![V2, V1] }));
+    }
+
+    #[test]
+    fn client_accepts_consistent_server_version_information() {
+        let mut conn = versioned_client(Instant::now(), &[QuicVersion::V1]);
+        receive_peer_tp(&mut conn, &tp_with(V1, &[V1, V2]));
+        assert_eq!(closed_with(&mut conn), None);
+        // Absent is allowed when the client did not react to Version Negotiation.
+        let mut conn = versioned_client(Instant::now(), &[QuicVersion::V1]);
+        receive_peer_tp(&mut conn, &TransportParameters::default());
+        assert_eq!(closed_with(&mut conn), None);
+    }
+
+    /// RFC 9368 section 4: the server's Chosen Version must be the version in
+    /// use; anything else is a version negotiation error.
+    #[test]
+    fn client_closes_when_the_servers_chosen_version_is_not_the_one_in_use() {
+        let mut conn = versioned_client(Instant::now(), &[QuicVersion::V1, QuicVersion::V2]);
+        receive_peer_tp(&mut conn, &tp_with(V2, &[V1, V2]));
+        assert_eq!(closed_with(&mut conn), Some(VERSION_NEGOTIATION_ERROR));
+        assert!(conn.closed);
+    }
+
+    #[test]
+    fn client_closes_on_malformed_version_information() {
+        let mut conn = versioned_client(Instant::now(), &[QuicVersion::V1]);
+        let mut tp = TransportParameters::default();
+        tp.version_information_invalid = true;
+        // (decode sets the flag; feed it through the wire form instead.)
+        let mut raw = TransportParameters::default().encode();
+        varint::encode(0x11, &mut raw);
+        varint::encode(3, &mut raw);
+        raw.extend_from_slice(&[0, 0, 1]);
+        conn.apply_tls_events(TlsBridgeEvents { peer_tp: Some(Bytes::from(raw)), ..Default::default() });
+        assert_eq!(closed_with(&mut conn), Some(TRANSPORT_PARAMETER_ERROR));
+    }
+
+    /// A client that restarted after Version Negotiation must not complete a
+    /// handshake without the server's version information (RFC 9368 section 4).
+    #[test]
+    fn a_restarted_client_requires_the_servers_version_information() {
+        let mut conn = versioned_client(Instant::now(), &[QuicVersion::V2, QuicVersion::V1]);
+        conn.version = QuicVersion::V1;
+        conn.reacted_to_version_negotiation = true;
+        receive_peer_tp(&mut conn, &TransportParameters::default());
+        assert_eq!(closed_with(&mut conn), Some(VERSION_NEGOTIATION_ERROR));
+    }
+
+    /// The downgrade check: steered to v1 by a Version Negotiation packet, the
+    /// client learns from the server's own list whether v2 was on offer.
+    #[test]
+    fn a_restarted_client_detects_a_forged_downgrade() {
+        let steered = |available: &[u32]| {
+            let mut conn = versioned_client(Instant::now(), &[QuicVersion::V2, QuicVersion::V1]);
+            conn.version = QuicVersion::V1;
+            conn.reacted_to_version_negotiation = true;
+            receive_peer_tp(&mut conn, &tp_with(V1, available));
+            closed_with(&mut conn)
+        };
+        assert_eq!(steered(&[V1]), None, "a genuinely v1-only server");
+        assert_eq!(steered(&[V1, V2]), Some(VERSION_NEGOTIATION_ERROR), "the server also speaks v2: downgrade");
+        assert_eq!(steered(&[]), Some(VERSION_NEGOTIATION_ERROR), "an empty list never validates");
+    }
+
+    #[test]
+    fn server_accepts_consistent_client_version_information() {
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1, QuicVersion::V2]);
+        receive_peer_tp(&mut conn, &tp_with(V1, &[V1]));
+        assert_eq!(closed_with(&mut conn), None);
+        // A missing parameter is tolerated by a server.
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1, QuicVersion::V2]);
+        receive_peer_tp(&mut conn, &TransportParameters::default());
+        assert_eq!(closed_with(&mut conn), None);
+    }
+
+    /// RFC 9368 section 4: the client's Chosen Version must match the
+    /// version its first flight used; and it must appear in its own list.
+    #[test]
+    fn server_closes_on_inconsistent_client_version_information() {
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1, QuicVersion::V2]);
+        receive_peer_tp(&mut conn, &tp_with(V2, &[V2]));
+        assert_eq!(closed_with(&mut conn), Some(VERSION_NEGOTIATION_ERROR), "chosen differs from the version in use");
+
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1, QuicVersion::V2]);
+        receive_peer_tp(&mut conn, &tp_with(V1, &[V2]));
+        assert_eq!(closed_with(&mut conn), Some(TRANSPORT_PARAMETER_ERROR), "chosen not among available");
+
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1, QuicVersion::V2]);
+        let mut raw = TransportParameters::default().encode();
+        varint::encode(0x11, &mut raw);
+        varint::encode(4, &mut raw);
+        raw.extend_from_slice(&[0, 0, 0, 0]);
+        conn.apply_tls_events(TlsBridgeEvents { peer_tp: Some(Bytes::from(raw)), ..Default::default() });
+        assert_eq!(closed_with(&mut conn), Some(TRANSPORT_PARAMETER_ERROR), "zero chosen version");
+    }
+
+    /// A client that speaks `versions` (first = first flight), as the endpoint
+    /// builds it.
+    fn versioned_client(now: Instant, versions: &[QuicVersion]) -> Connection {
+        let mut conn = test_client(now);
+        conn.version = versions[0];
+        conn.client_versions = versions.to_vec();
+        conn
+    }
+
+    fn first_initial_version(conn: &mut Connection, now: Instant) -> Option<u32> {
+        let mut buf = Vec::new();
+        conn.poll_transmit(now, &mut buf)?;
+        (buf.len() >= 5 && buf[0] & 0x80 != 0).then(|| u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]))
+    }
+
+    /// RFC 9000 section 6.2: a client that speaks several versions restarts
+    /// in the first the server offers, instead of abandoning the attempt.
+    #[test]
+    fn client_restarts_in_a_mutually_supported_version_after_version_negotiation() {
+        let now = Instant::now();
+        let mut conn = versioned_client(now, &[QuicVersion::V2, QuicVersion::V1]);
+        let old_dcid = conn.initial_dcid.clone();
+        let vn = version_negotiation_packet(conn.local_cid.as_slice(), old_dcid.as_slice(), &[0xff00_0020, 1]);
+        conn.handle_packet(now, &vn);
+        assert!(lost_with(&mut conn).is_none(), "not abandoned");
+        assert!(!conn.closed);
+        assert_eq!(conn.version, QuicVersion::V1);
+        assert_ne!(conn.initial_dcid, old_dcid, "a fresh first flight uses a new destination CID");
+        // Its Initial keys are the version 1 ones for the new DCID, and the
+        // first datagram out is a version 1 Initial.
+        assert_eq!(first_initial_version(&mut conn, now), Some(1));
+    }
+
+    /// The restart is single-shot: the version negotiation reply to the new
+    /// attempt is ignored (RFC 9368 section 4), so a forged follow-up cannot
+    /// bounce the client around.
+    #[test]
+    fn a_restarted_client_ignores_further_version_negotiation() {
+        let now = Instant::now();
+        let mut conn = versioned_client(now, &[QuicVersion::V2, QuicVersion::V1]);
+        let vn = version_negotiation_packet(conn.local_cid.as_slice(), conn.initial_dcid.as_slice(), &[1]);
+        conn.handle_packet(now, &vn);
+        assert_eq!(conn.version, QuicVersion::V1);
+        let again = version_negotiation_packet(conn.local_cid.as_slice(), conn.initial_dcid.as_slice(), &[QuicVersion::V2.wire()]);
+        conn.handle_packet(now, &again);
+        assert_eq!(conn.version, QuicVersion::V1);
+        assert!(!conn.closed);
+    }
+
+    #[test]
+    fn client_abandons_when_the_server_offers_none_of_its_versions() {
+        let now = Instant::now();
+        let mut conn = versioned_client(now, &[QuicVersion::V2]);
+        let vn = version_negotiation_packet(conn.local_cid.as_slice(), conn.initial_dcid.as_slice(), &[1, 0xff00_0020]);
+        conn.handle_packet(now, &vn);
+        assert!(matches!(lost_with(&mut conn), Some(ConnectionError::VersionMismatch)));
+    }
+
+    /// A packet listing the version the client used is bogus whichever
+    /// version that is (RFC 9000 section 6.2).
+    #[test]
+    fn client_discards_version_negotiation_listing_the_version_it_used() {
+        let now = Instant::now();
+        let mut conn = versioned_client(now, &[QuicVersion::V2, QuicVersion::V1]);
+        let vn = version_negotiation_packet(conn.local_cid.as_slice(), conn.initial_dcid.as_slice(), &[QuicVersion::V2.wire(), 1]);
+        conn.handle_packet(now, &vn);
+        assert_eq!(conn.version, QuicVersion::V2);
+        assert!(!conn.closed);
+    }
+
     /// RFC 9000 section 6.2: a client that supports only version 1 abandons
     /// the attempt when the server offers no version it speaks.
     #[test]
@@ -1972,7 +2442,7 @@ mod tests {
     #[test]
     fn client_discards_version_negotiation_that_lists_its_own_version() {
         let mut conn = test_client(Instant::now());
-        let vn = version_negotiation_packet(&[1, 2, 3, 4, 5, 6, 7, 8], &[9u8; 8], &[0xff00_0020, VERSION_V1]);
+        let vn = version_negotiation_packet(&[1, 2, 3, 4, 5, 6, 7, 8], &[9u8; 8], &[0xff00_0020, QuicVersion::V1.wire()]);
         conn.handle_packet(Instant::now(), &vn);
         assert!(lost_with(&mut conn).is_none());
         assert!(!conn.closed);
