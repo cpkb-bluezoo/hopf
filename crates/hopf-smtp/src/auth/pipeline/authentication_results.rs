@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::auth::arc::ArcValidationResult;
 use crate::auth::dkim::DkimSignatureResult;
 use crate::auth::dmarc::DmarcOutcome;
 use crate::auth::spf::SpfOutcome;
@@ -54,6 +55,7 @@ pub(super) fn render_authentication_results(
     spf_domain: &str,
     dkim_results: &[DkimSignatureResult],
     dmarc: Option<&DmarcOutcome>,
+    arc: Option<&ArcValidationResult>,
 ) -> String {
     let mut out = format!("Authentication-Results: {authserv_id};");
 
@@ -90,6 +92,11 @@ pub(super) fn render_authentication_results(
         }
     }
 
+    // RFC 8617 section 7: the `arc` method records the chain validation result.
+    if let Some(arc) = arc {
+        out.push_str(&format!(";\r\n\tarc={}", arc.cv.as_str()));
+    }
+
     out
 }
 
@@ -114,6 +121,7 @@ mod tests {
             &spf(SpfResult::Pass),
             "example.com",
             &[],
+            None,
             None,
         );
         assert_eq!(
@@ -142,6 +150,7 @@ mod tests {
             "example.com",
             &dkim,
             Some(&dmarc),
+            None,
         );
         assert!(rendered.starts_with("Authentication-Results: mail.example.com;"));
         assert!(rendered.contains("spf=pass smtp.mailfrom=example.com;"));
@@ -169,6 +178,7 @@ mod tests {
             &spf(SpfResult::None),
             "example.com",
             &dkim,
+            None,
             None,
         );
         assert!(rendered.contains("dkim=pass header.d=a.example;"));

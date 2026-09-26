@@ -8,6 +8,10 @@ use std::sync::{Arc, Mutex};
 use rmimeparser::dkim::{DkimMessageParser, RawHeader};
 use rmimeparser::{EmailAddress, EmailAddressParser, MessageHandler, MimeHandler};
 
+use crate::auth::arc::{
+    self, ArcAuthSnapshot, ArcDmarcPolicy, ArcSealError, ArcSealer, ArcSetHeaders,
+    ArcValidationResult,
+};
 use crate::auth::dkim::{self, BodyHashMap, Canonicalization, DkimSignatureResult, IncrementalBodyCanon};
 use crate::auth::dmarc::{self, AuthVerdict, DmarcOutcome};
 use crate::auth::dns_lookup::DnsLookup;
@@ -99,6 +103,39 @@ impl AuthVerdictHandle {
     }
 }
 
+/// Shared handle to the message's [`ArcValidationResult`] - see
+/// [`AuthPipeline::arc_result`].
+#[derive(Clone)]
+pub struct ArcResultHandle(Arc<Relay<ArcValidationResult>>);
+
+impl ArcResultHandle {
+    /// Non-blocking check: `Some(result)` once validation has completed.
+    pub fn poll(&self) -> Option<ArcValidationResult> {
+        self.0.peek()
+    }
+
+    /// Run `cb` once the result is available (immediately, if it already is).
+    pub fn on_ready(&self, cb: impl FnOnce(ArcValidationResult) + Send + 'static) {
+        self.0.on_ready(Box::new(cb));
+    }
+}
+
+/// Shared handle to this hop's sealed ARC set - see [`AuthPipeline::arc_seal`].
+#[derive(Clone)]
+pub struct ArcSealHandle(Arc<Relay<Result<ArcSetHeaders, ArcSealError>>>);
+
+impl ArcSealHandle {
+    /// Non-blocking check: `Some(..)` once sealing has completed.
+    pub fn poll(&self) -> Option<Result<ArcSetHeaders, ArcSealError>> {
+        self.0.peek()
+    }
+
+    /// Run `cb` once sealing has completed (immediately, if it already has).
+    pub fn on_ready(&self, cb: impl FnOnce(Result<ArcSetHeaders, ArcSealError>) + Send + 'static) {
+        self.0.on_ready(Box::new(cb));
+    }
+}
+
 struct NoopMessageHandler;
 impl MimeHandler for NoopMessageHandler {}
 impl MessageHandler for NoopMessageHandler {}
@@ -114,6 +151,10 @@ pub struct AuthPipelineBuilder {
     on_dmarc: Option<Box<dyn FnOnce(DmarcOutcome) + Send>>,
     inner: Option<Box<dyn SmtpPipeline>>,
     authserv_id: Option<String>,
+    arc_validate: bool,
+    arc_policy: Option<Arc<dyn ArcDmarcPolicy>>,
+    arc_sealer: Option<Arc<ArcSealer>>,
+    on_arc: Option<Box<dyn FnOnce(ArcValidationResult) + Send>>,
 }
 
 impl AuthPipelineBuilder {
@@ -133,6 +174,10 @@ impl AuthPipelineBuilder {
             on_dmarc: None,
             inner: None,
             authserv_id: None,
+            arc_validate: false,
+            arc_policy: None,
+            arc_sealer: None,
+            on_arc: None,
         }
     }
 
@@ -193,6 +238,46 @@ impl AuthPipelineBuilder {
         self
     }
 
+    /// Validate any RFC 8617 ARC chain on the message at end-of-DATA.
+    /// The result is available from [`AuthPipeline::arc_result`] and
+    /// [`Self::on_arc`], and is recorded as an `arc=` result in a
+    /// synthesized `Authentication-Results` field.
+    pub fn arc_validation(mut self) -> Self {
+        self.arc_validate = true;
+        self
+    }
+
+    /// Called once with the ARC chain validation result (implies
+    /// [`Self::arc_validation`]).
+    pub fn on_arc(mut self, cb: impl FnOnce(ArcValidationResult) + Send + 'static) -> Self {
+        self.arc_validate = true;
+        self.on_arc = Some(Box::new(cb));
+        self
+    }
+
+    /// Let a validated ARC chain inform DMARC (implies
+    /// [`Self::arc_validation`]). After validation, `policy` is asked which
+    /// SPF/DKIM results DMARC should evaluate; returning `None` (or a
+    /// snapshot that overrides nothing) leaves this hop's own results in
+    /// force. Which sealers to trust is entirely the policy's decision.
+    pub fn arc_dmarc_policy(mut self, policy: Arc<dyn ArcDmarcPolicy>) -> Self {
+        self.arc_validate = true;
+        self.arc_policy = Some(policy);
+        self
+    }
+
+    /// Seal the message with this hop's ARC set once SPF, DKIM, DMARC and
+    /// chain validation are known (implies [`Self::arc_validation`]; the
+    /// sealer's `cv=` is that validation result). Fetch the headers via
+    /// [`AuthPipeline::arc_seal`] and prepend them to the forwarded
+    /// message; like `Authentication-Results`, they cannot be applied
+    /// automatically for the reasons given on [`Self::authentication_results`].
+    pub fn arc_sealer(mut self, sealer: Arc<ArcSealer>) -> Self {
+        self.arc_validate = true;
+        self.arc_sealer = Some(sealer);
+        self
+    }
+
     /// Build the pipeline.
     pub fn build(self) -> AuthPipeline {
         AuthPipeline {
@@ -212,6 +297,12 @@ impl AuthPipelineBuilder {
             body_canons: None,
             authserv_id: self.authserv_id,
             auth_results: AuthResultsHandle(Arc::new(Relay::new())),
+            arc_validate: self.arc_validate,
+            arc_policy: self.arc_policy,
+            arc_sealer: self.arc_sealer,
+            on_arc: self.on_arc,
+            arc_result: ArcResultHandle(Arc::new(Relay::new())),
+            arc_seal: ArcSealHandle(Arc::new(Relay::new())),
         }
     }
 }
@@ -264,6 +355,12 @@ pub struct AuthPipeline {
     /// `auth_results` at all, and whether `end_data` bothers rendering it.
     authserv_id: Option<String>,
     auth_results: AuthResultsHandle,
+    arc_validate: bool,
+    arc_policy: Option<Arc<dyn ArcDmarcPolicy>>,
+    arc_sealer: Option<Arc<ArcSealer>>,
+    on_arc: Option<Box<dyn FnOnce(ArcValidationResult) + Send>>,
+    arc_result: ArcResultHandle,
+    arc_seal: ArcSealHandle,
 }
 
 impl AuthPipeline {
@@ -288,6 +385,22 @@ impl AuthPipeline {
     pub fn authentication_results(&self) -> Option<AuthResultsHandle> {
         self.authserv_id.as_ref()?;
         Some(self.auth_results.clone())
+    }
+
+    /// A cloneable handle to the ARC chain validation result; `None`
+    /// unless ARC validation was enabled on the builder
+    /// ([`AuthPipelineBuilder::arc_validation`], `on_arc`,
+    /// `arc_dmarc_policy` or `arc_sealer`).
+    pub fn arc_result(&self) -> Option<ArcResultHandle> {
+        self.arc_validate.then(|| self.arc_result.clone())
+    }
+
+    /// A cloneable handle to the ARC set this hop sealed the message with,
+    /// or the reason it could not; `None` unless
+    /// [`AuthPipelineBuilder::arc_sealer`] was used.
+    pub fn arc_seal(&self) -> Option<ArcSealHandle> {
+        self.arc_sealer.as_ref()?;
+        Some(self.arc_seal.clone())
     }
 }
 
@@ -344,7 +457,15 @@ impl SmtpPipeline for AuthPipeline {
                 let _ = parser.receive(&mut data);
                 let headers = parser.raw_headers().to_vec();
 
-                let keys = dkim::required_body_hash_keys(&headers);
+                let mut keys = dkim::required_body_hash_keys(&headers);
+                if self.arc_validate {
+                    keys.extend(arc::required_body_hash_keys(&headers));
+                }
+                if let Some(sealer) = &self.arc_sealer {
+                    keys.push(sealer.body_canonicalization_key());
+                }
+                keys.sort_by_key(|&(c, l)| (c as u8, l));
+                keys.dedup();
                 let mut canons: Vec<_> = keys
                     .into_iter()
                     .map(|(c, l)| (c, l, IncrementalBodyCanon::new(c, l)))
@@ -390,6 +511,7 @@ impl SmtpPipeline for AuthPipeline {
             None => BodyHashMap::new(),
         };
         let from_header = from_header_domain(&headers);
+        let body_hashes = Arc::new(body_hashes);
 
         let dns = Arc::clone(&self.dns);
         let psl = PublicSuffixList::bundled();
@@ -403,14 +525,27 @@ impl SmtpPipeline for AuthPipeline {
         // every input (SPF, DKIM, and DMARC when evaluated) is known —
         // None end to end when authentication_results() was never opted
         // into, so this adds no work in the common case.
-        let authserv_id = self.authserv_id.clone();
-        let auth_results = self.auth_results.clone();
-        let spf_domain_for_ar = self.spf_domain.clone();
+        let finish = Finish {
+            authserv_id: self.authserv_id.clone(),
+            auth_results: self.auth_results.clone(),
+            sealer: self.arc_sealer.clone(),
+            arc_seal: self.arc_seal.clone(),
+            headers: Arc::clone(&headers),
+            body_hashes: Arc::clone(&body_hashes),
+            spf_domain: self.spf_domain.clone(),
+        };
+        let arc_enabled = self.arc_validate;
+        let arc_policy = self.arc_policy.clone();
+        let on_arc = self.on_arc.take();
+        let arc_result = self.arc_result.clone();
+        let headers_for_arc = Arc::clone(&headers);
+        let body_hashes_for_arc = Arc::clone(&body_hashes);
+        let dns_for_arc = Arc::clone(&dns);
 
         dkim::verify_all_with_body_hashes(
             Arc::clone(&dns),
             headers,
-            Arc::new(body_hashes),
+            body_hashes,
             Box::new(move |dkim_results| {
                 if let Some(cb) = on_dkim {
                     cb(dkim_results
@@ -424,53 +559,77 @@ impl SmtpPipeline for AuthPipeline {
                 }
                 let dkim_results = Arc::new(dkim_results);
                 let has_duplicate_from = from_header.has_duplicate;
-                let Some(from_domain) = from_header.domain else {
-                    // No usable `From:` header — DMARC cannot be evaluated;
-                    // fail open (no enforcement) rather than block forever.
-                    verdict.resolve(AuthVerdict::None);
-                    if let Some(authserv_id) = authserv_id {
-                        let dkim_results = Arc::clone(&dkim_results);
+                // Everything after DKIM: DMARC (informed by the ARC chain,
+                // if any) and the final Authentication-Results / ARC seal.
+                let proceed = move |arc: Option<ArcValidationResult>| {
+                    let Some(from_domain) = from_header.domain else {
+                        // No usable `From:` header — DMARC cannot be evaluated;
+                        // fail open (no enforcement) rather than block forever.
+                        verdict.resolve(AuthVerdict::None);
                         spf_relay.on_ready(Box::new(move |spf_outcome| {
-                            auth_results.0.resolve(render_authentication_results(
-                                &authserv_id,
-                                &spf_outcome,
-                                spf_domain_for_ar.as_deref().unwrap_or(""),
-                                &dkim_results,
-                                None,
-                            ));
+                            finish.run(&spf_outcome, &dkim_results, None, arc.as_ref());
                         }));
-                    }
-                    return;
+                        return;
+                    };
+                    spf_relay.on_ready(Box::new(move |spf_outcome| {
+                        let (eval_spf, eval_spf_domain, eval_dkim) = match (&arc, &arc_policy) {
+                            (Some(chain), Some(policy)) => {
+                                let snapshot = policy.auth_snapshot(
+                                    chain,
+                                    &from_domain,
+                                    spf_outcome.result,
+                                    spf_domain.as_deref(),
+                                    &dkim_results,
+                                );
+                                apply_snapshot(
+                                    snapshot,
+                                    spf_outcome.result,
+                                    spf_domain.clone(),
+                                    Arc::clone(&dkim_results),
+                                )
+                            }
+                            _ => (
+                                spf_outcome.result,
+                                spf_domain.clone(),
+                                Arc::clone(&dkim_results),
+                            ),
+                        };
+                        dmarc::evaluate(
+                            dns,
+                            psl,
+                            &from_domain,
+                            has_duplicate_from,
+                            eval_spf,
+                            eval_spf_domain,
+                            eval_dkim,
+                            Box::new(move |outcome| {
+                                let v = outcome.verdict;
+                                finish.run(&spf_outcome, &dkim_results, Some(&outcome), arc.as_ref());
+                                if let Some(cb) = on_dmarc {
+                                    cb(outcome);
+                                }
+                                verdict.resolve(v);
+                            }),
+                        );
+                    }));
                 };
-                spf_relay.on_ready(Box::new(move |spf_outcome| {
-                    let spf_outcome_for_ar = spf_outcome.clone();
-                    let dkim_results_for_ar = Arc::clone(&dkim_results);
-                    dmarc::evaluate(
-                        dns,
-                        psl,
-                        &from_domain,
-                        has_duplicate_from,
-                        spf_outcome.result,
-                        spf_domain,
-                        dkim_results,
-                        Box::new(move |outcome| {
-                            let v = outcome.verdict;
-                            if let Some(authserv_id) = authserv_id {
-                                auth_results.0.resolve(render_authentication_results(
-                                    &authserv_id,
-                                    &spf_outcome_for_ar,
-                                    spf_domain_for_ar.as_deref().unwrap_or(""),
-                                    &dkim_results_for_ar,
-                                    Some(&outcome),
-                                ));
+
+                if arc_enabled {
+                    arc::validate(
+                        dns_for_arc,
+                        headers_for_arc,
+                        body_hashes_for_arc,
+                        Box::new(move |result| {
+                            arc_result.0.resolve(result.clone());
+                            if let Some(cb) = on_arc {
+                                cb(result.clone());
                             }
-                            if let Some(cb) = on_dmarc {
-                                cb(outcome);
-                            }
-                            verdict.resolve(v);
+                            proceed(Some(result));
                         }),
                     );
-                }));
+                } else {
+                    proceed(None);
+                }
             }),
         );
 
@@ -487,6 +646,72 @@ impl SmtpPipeline for AuthPipeline {
             inner.reset();
         }
     }
+}
+
+/// What happens once every authentication result for a message is known:
+/// resolve the synthesized `Authentication-Results` field (if opted in) and
+/// this hop's ARC seal (if a sealer is configured).
+struct Finish {
+    authserv_id: Option<String>,
+    auth_results: AuthResultsHandle,
+    sealer: Option<Arc<ArcSealer>>,
+    arc_seal: ArcSealHandle,
+    headers: Arc<Vec<RawHeader>>,
+    body_hashes: Arc<BodyHashMap>,
+    spf_domain: Option<String>,
+}
+
+impl Finish {
+    fn run(
+        self,
+        spf: &SpfOutcome,
+        dkim_results: &[DkimSignatureResult],
+        dmarc: Option<&DmarcOutcome>,
+        arc_result: Option<&ArcValidationResult>,
+    ) {
+        let spf_domain = self.spf_domain.as_deref().unwrap_or("");
+        if let Some(authserv_id) = &self.authserv_id {
+            self.auth_results.0.resolve(render_authentication_results(
+                authserv_id,
+                spf,
+                spf_domain,
+                dkim_results,
+                dmarc,
+                arc_result,
+            ));
+        }
+        if let (Some(sealer), Some(arc_result)) = (&self.sealer, arc_result) {
+            let rendered = render_authentication_results(
+                sealer.authserv_id(),
+                spf,
+                spf_domain,
+                dkim_results,
+                dmarc,
+                Some(arc_result),
+            );
+            self.arc_seal.0.resolve(sealer.seal(
+                &self.headers,
+                &self.body_hashes,
+                arc_result,
+                &rendered,
+            ));
+        }
+    }
+}
+
+/// Merge an [`ArcDmarcPolicy`]'s snapshot over this hop's own results.
+fn apply_snapshot(
+    snapshot: Option<ArcAuthSnapshot>,
+    local_spf: spf::SpfResult,
+    local_spf_domain: Option<String>,
+    local_dkim: Arc<Vec<DkimSignatureResult>>,
+) -> (spf::SpfResult, Option<String>, Arc<Vec<DkimSignatureResult>>) {
+    let Some(snapshot) = snapshot else {
+        return (local_spf, local_spf_domain, local_dkim);
+    };
+    let (spf_result, spf_domain) = snapshot.spf.unwrap_or((local_spf, local_spf_domain));
+    let dkim = snapshot.dkim.map(Arc::new).unwrap_or(local_dkim);
+    (spf_result, spf_domain, dkim)
 }
 
 /// The offset right after the first blank line in `buf` (i.e. where the
@@ -776,5 +1001,156 @@ mod tests {
         let rendered = auth_results.poll().expect("resolved on the fail-open path");
         assert!(rendered.contains("spf=pass"));
         assert!(rendered.ends_with("dmarc=none"));
+    }
+
+    // --- ARC (RFC 8617) -------------------------------------------------
+
+    const ARC_ED25519_PKCS8_B64: &str =
+        "MC4CAQAwBQYDK2VwBCIEIJOr3cUYESkwGr3t08+NHi5fO++QEUtI7YDNn9ruV59R";
+    const ARC_ED25519_RAW_PUB_B64: &str = "7qcUfZUf3KQSvsFseKVzOm5hlukTWGugsb87LtL2Wuo=";
+
+    fn arc_sealer(domain: &str) -> Arc<ArcSealer> {
+        let der = rmimeparser::charset::base64::decode(ARC_ED25519_PKCS8_B64).unwrap();
+        let key = Arc::new(crate::auth::dkim::DkimPrivateKey::ed25519_from_pkcs8(&der).unwrap());
+        Arc::new(ArcSealer::new(key, domain, "arc", domain).timestamp(1_753_700_000))
+    }
+
+    fn arc_dns() -> FakeDns {
+        FakeDns::default()
+            .with_txt("example.com", "v=spf1 ip4:192.0.2.0/24 -all")
+            .with_txt("_dmarc.example.com", "v=DMARC1; p=reject")
+            .with_txt(
+                "arc._domainkey.list.example",
+                &format!("v=DKIM1; k=ed25519; p={ARC_ED25519_RAW_PUB_B64}"),
+            )
+    }
+
+    /// Runs `message` through a pipeline (as if delivered by `client_ip`
+    /// for envelope sender alice@example.com) configured by `configure`,
+    /// returning the pipeline for handle inspection.
+    fn run_pipeline(
+        client_ip: &str,
+        message: &[u8],
+        configure: impl FnOnce(AuthPipelineBuilder) -> AuthPipelineBuilder,
+    ) -> AuthPipeline {
+        let dns: Arc<dyn DnsLookup> = Arc::new(arc_dns());
+        let mut pipeline = configure(AuthPipeline::builder(
+            dns,
+            client_ip.parse().unwrap(),
+            "mail.example.com",
+        ))
+        .build();
+        let sender = EmailAddress::new(None, "alice", "example.com", true);
+        pipeline.mail_from(Some(&sender));
+        pipeline.message_content(message);
+        pipeline.end_data();
+        pipeline
+    }
+
+    /// A message an intermediary at `list.example` received from an
+    /// authorised sender (SPF pass, DMARC pass) and forwarded with an ARC
+    /// set recording that.
+    fn forwarded_message() -> Vec<u8> {
+        let original = message("alice@example.com");
+        let sealed = run_pipeline("192.0.2.5", &original, |b| {
+            b.arc_sealer(arc_sealer("list.example"))
+        })
+        .arc_seal()
+        .unwrap()
+        .poll()
+        .expect("sealing resolved")
+        .expect("sealing succeeded");
+        let mut out = sealed.to_prepend().into_bytes();
+        out.extend_from_slice(&original);
+        out
+    }
+
+    /// Trusts `list.example` and takes the SPF/DKIM verdicts it recorded.
+    struct TrustList;
+    impl ArcDmarcPolicy for TrustList {
+        fn auth_snapshot(
+            &self,
+            chain: &ArcValidationResult,
+            _from_domain: &str,
+            _local_spf: spf::SpfResult,
+            _local_spf_domain: Option<&str>,
+            _local_dkim: &[DkimSignatureResult],
+        ) -> Option<ArcAuthSnapshot> {
+            if chain.cv != crate::auth::arc::ArcCv::Pass {
+                return None;
+            }
+            let first = chain.chain.sets.first()?;
+            if first.sealer_domain().as_deref() != Some("list.example") {
+                return None;
+            }
+            let recorded = first.recorded_results();
+            Some(ArcAuthSnapshot {
+                spf: recorded.spf,
+                dkim: None,
+            })
+        }
+    }
+
+    #[test]
+    fn sealer_produces_a_set_a_second_pipeline_validates() {
+        let forwarded = forwarded_message();
+        let text = String::from_utf8(forwarded.clone()).unwrap();
+        assert!(text.starts_with("ARC-Seal: i=1; a=ed25519-sha256; t=1753700000; cv=none;"));
+        assert!(text.contains("ARC-Authentication-Results: i=1; list.example;"));
+        assert!(text.contains("spf=pass smtp.mailfrom=example.com"));
+
+        let pipeline = run_pipeline("10.0.0.1", &forwarded, |b| b.arc_validation());
+        let result = pipeline.arc_result().unwrap().poll().unwrap();
+        assert_eq!(result.cv, crate::auth::arc::ArcCv::Pass);
+        assert_eq!(result.chain.sets.len(), 1);
+    }
+
+    #[test]
+    fn forwarded_mail_is_rejected_without_an_arc_policy() {
+        // At the receiving hop the forwarder's IP is not in example.com's
+        // SPF record, and there is no DKIM: plain DMARC rejects.
+        let pipeline = run_pipeline("10.0.0.1", &forwarded_message(), |b| b.arc_validation());
+        assert_eq!(pipeline.verdict().poll(), Some(AuthVerdict::Reject));
+    }
+
+    #[test]
+    fn trusted_arc_chain_rescues_forwarded_mail_under_dmarc() {
+        let pipeline = run_pipeline("10.0.0.1", &forwarded_message(), |b| {
+            b.arc_dmarc_policy(Arc::new(TrustList))
+        });
+        assert_eq!(pipeline.verdict().poll(), Some(AuthVerdict::Pass));
+    }
+
+    #[test]
+    fn broken_arc_chain_does_not_rescue_forwarded_mail() {
+        // Tampering with the body invalidates the newest message signature,
+        // so the policy sees a failed chain and declines to override.
+        let mut forwarded = forwarded_message();
+        let len = forwarded.len();
+        forwarded[len - 8..len - 2].copy_from_slice(b"XXXXXX");
+        let pipeline = run_pipeline("10.0.0.1", &forwarded, |b| {
+            b.arc_dmarc_policy(Arc::new(TrustList))
+        });
+        assert_eq!(
+            pipeline.arc_result().unwrap().poll().unwrap().cv,
+            crate::auth::arc::ArcCv::Fail
+        );
+        assert_eq!(pipeline.verdict().poll(), Some(AuthVerdict::Reject));
+    }
+
+    #[test]
+    fn arc_handles_are_absent_unless_opted_in() {
+        let pipeline = run_pipeline("192.0.2.5", &message("alice@example.com"), |b| b);
+        assert!(pipeline.arc_result().is_none());
+        assert!(pipeline.arc_seal().is_none());
+    }
+
+    #[test]
+    fn arc_result_is_recorded_in_authentication_results() {
+        let pipeline = run_pipeline("10.0.0.1", &forwarded_message(), |b| {
+            b.authentication_results("mail.example.com").arc_validation()
+        });
+        let rendered = pipeline.authentication_results().unwrap().poll().unwrap();
+        assert!(rendered.contains(";\r\n\tarc=pass"), "{rendered}");
     }
 }
