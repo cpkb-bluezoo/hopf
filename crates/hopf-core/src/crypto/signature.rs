@@ -7,7 +7,8 @@ use bytes::Bytes;
 use super::cert::SpkiDer;
 
 use aws_lc_rs::signature::{
-    self, EcdsaKeyPair, KeyPair, RsaKeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1,
+    self, EcdsaKeyPair, KeyPair, PqdsaKeyPair, PqdsaSigningAlgorithm, RsaKeyPair, UnparsedPublicKey,
+    ML_DSA_44, ML_DSA_44_SIGNING, ML_DSA_65, ML_DSA_65_SIGNING, ML_DSA_87, ML_DSA_87_SIGNING, ECDSA_P256_SHA256_ASN1,
     ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1, ECDSA_P384_SHA384_ASN1_SIGNING, ED25519,
     RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA512, RSA_PKCS1_SHA256,
     RSA_PSS_2048_8192_SHA256, RSA_PSS_SHA256,
@@ -368,4 +369,118 @@ mod tests {
         assert!(rsa_pss_sha256_verify_spki(&spki, msg, &sig));
         assert!(!rsa_pss_sha256_verify_spki(&spki, b"tampered", &sig));
     }
+}
+
+/// ML-DSA parameter set (FIPS 204). One key, one level: the level is fixed by
+/// the key's PKCS#8/SPKI `AlgorithmIdentifier` and by the TLS
+/// `SignatureScheme` it signs under (`mldsa44`/`mldsa65`/`mldsa87`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlDsaLevel {
+    /// ML-DSA-44 (NIST security category 2).
+    MlDsa44,
+    /// ML-DSA-65 (category 3).
+    MlDsa65,
+    /// ML-DSA-87 (category 5).
+    MlDsa87,
+}
+
+impl MlDsaLevel {
+    /// Every level, smallest first.
+    pub const ALL: [MlDsaLevel; 3] = [Self::MlDsa44, Self::MlDsa65, Self::MlDsa87];
+
+    /// TLS `SignatureScheme` codepoint (`mldsa44` 0x0904, `mldsa65` 0x0905,
+    /// `mldsa87` 0x0906) - the same values `crypto::x509` accepts for
+    /// certificate signatures, read from the vendored AWS-LC headers
+    /// (`SSL_SIGN_MLDSA44/65/87`).
+    pub const fn signature_scheme(self) -> u16 {
+        match self {
+            Self::MlDsa44 => 0x0904,
+            Self::MlDsa65 => 0x0905,
+            Self::MlDsa87 => 0x0906,
+        }
+    }
+
+    /// The level a TLS `SignatureScheme` names, if it is an ML-DSA one.
+    pub fn from_signature_scheme(scheme: u16) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.signature_scheme() == scheme)
+    }
+
+    /// Raw content octets of the algorithm's OID (`id-ml-dsa-44/65/87`,
+    /// 2.16.840.1.101.3.4.3.17-19), as used in `AlgorithmIdentifier`s.
+    pub const fn oid(self) -> [u8; 9] {
+        let last = match self {
+            Self::MlDsa44 => 0x11,
+            Self::MlDsa65 => 0x12,
+            Self::MlDsa87 => 0x13,
+        };
+        [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, last]
+    }
+
+    /// The level named by an `AlgorithmIdentifier` OID's content octets.
+    pub fn from_oid(oid: &[u8]) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.oid() == oid)
+    }
+
+    fn signing_algorithm(self) -> &'static PqdsaSigningAlgorithm {
+        match self {
+            Self::MlDsa44 => &ML_DSA_44_SIGNING,
+            Self::MlDsa65 => &ML_DSA_65_SIGNING,
+            Self::MlDsa87 => &ML_DSA_87_SIGNING,
+        }
+    }
+}
+
+/// Generate an ML-DSA key and return it as PKCS#8 DER (RFC 5958; the
+/// private key is the 32-byte seed form, which AWS-LC also accepts back
+/// alongside the expanded and "both" encodings other tools emit).
+pub fn ml_dsa_generate_pkcs8(level: MlDsaLevel) -> Result<Bytes, KeyError> {
+    let key = PqdsaKeyPair::generate(level.signing_algorithm()).map_err(|_| KeyError)?;
+    let doc = key.to_pkcs8v1().map_err(|_| KeyError)?;
+    Ok(Bytes::copy_from_slice(doc.as_ref()))
+}
+
+/// ML-DSA private key loaded from PKCS#8 DER.
+pub struct MlDsaPrivateKey {
+    level: MlDsaLevel,
+    pair: PqdsaKeyPair,
+}
+
+impl MlDsaPrivateKey {
+    /// Parse `pkcs8` as a key for `level`.
+    pub fn from_pkcs8(level: MlDsaLevel, pkcs8: &[u8]) -> Result<Self, KeyError> {
+        let pair = PqdsaKeyPair::from_pkcs8(level.signing_algorithm(), pkcs8).map_err(|_| KeyError)?;
+        Ok(Self { level, pair })
+    }
+
+    /// This key's parameter set.
+    pub fn level(&self) -> MlDsaLevel {
+        self.level
+    }
+
+    /// SubjectPublicKeyInfo DER of the matching public key.
+    pub fn public_key_spki_der(&self) -> Result<Bytes, KeyError> {
+        use aws_lc_rs::encoding::AsDer;
+        let der = self.pair.public_key().as_der().map_err(|_| KeyError)?;
+        Ok(Bytes::copy_from_slice(der.as_ref()))
+    }
+}
+
+/// Sign `message` with an ML-DSA key (pure ML-DSA, empty context - what TLS
+/// 1.3 `CertificateVerify` and X.509 signatures use).
+pub fn ml_dsa_sign(key: &MlDsaPrivateKey, message: &[u8]) -> Result<SignatureBytes, SignError> {
+    let alg = key.level.signing_algorithm();
+    let mut out = vec![0u8; alg.signature_len()];
+    let n = key.pair.sign(message, &mut out).map_err(|_| SignError)?;
+    out.truncate(n);
+    Ok(SignatureBytes::from_bytes(Bytes::from(out)))
+}
+
+/// Verify an ML-DSA signature over `message` against a SubjectPublicKeyInfo.
+pub fn ml_dsa_verify_spki(level: MlDsaLevel, spki_der: &[u8], message: &[u8], signature: &SignatureBytes) -> bool {
+    let alg = match level {
+        MlDsaLevel::MlDsa44 => &ML_DSA_44,
+        MlDsaLevel::MlDsa65 => &ML_DSA_65,
+        MlDsaLevel::MlDsa87 => &ML_DSA_87,
+    };
+    UnparsedPublicKey::new(alg, spki_der).verify(message, signature.as_bytes()).is_ok()
 }

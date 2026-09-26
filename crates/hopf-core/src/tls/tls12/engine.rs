@@ -1642,6 +1642,23 @@ mod tests {
         assert!(protocol_errors(&sink).is_empty(), "{:?}", sink.events);
     }
 
+    /// ML-DSA has no TLS 1.2 `SignatureAlgorithm` codepoint, so a server
+    /// configured with an ML-DSA key must refuse a TLS 1.2 handshake with a
+    /// clear error rather than mis-sign.
+    #[test]
+    fn server_with_an_ml_dsa_key_refuses_tls12() {
+        let id = crate::crypto::x509::generate_ml_dsa_self_signed(
+            &["localhost"],
+            crate::crypto::signature::MlDsaLevel::MlDsa65,
+        )
+        .unwrap();
+        let creds = ServerCredentials { cert_chain: vec![id.cert_der], signing_key_pkcs8: id.pkcs8_der };
+        let sink = server_reply_to_client_offering(creds, None);
+        let errs = protocol_errors(&sink);
+        assert_eq!(errs.len(), 1, "{:?}", sink.events);
+        assert!(errs[0].contains("unsupported server signing key"), "{errs:?}");
+    }
+
     fn take_outbound(sink: &mut RecordingSink) -> Vec<Bytes> {
         std::mem::take(&mut sink.outbound)
     }

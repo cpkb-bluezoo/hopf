@@ -2455,6 +2455,38 @@ mod tests {
         assert!(off_sink.alerts.contains(&AlertDescription::IllegalParameter), "{:?} {:?}", off_sink.alerts, off_sink.events);
     }
 
+    fn ml_dsa_credentials(level: crate::crypto::signature::MlDsaLevel) -> ServerCredentials {
+        let id = crate::crypto::x509::generate_ml_dsa_self_signed(&["localhost"], level).unwrap();
+        ServerCredentials { cert_chain: vec![id.cert_der], signing_key_pkcs8: id.pkcs8_der }
+    }
+
+    /// TLS 1.3 handshake whose server authenticates with an ML-DSA
+    /// certificate and `CertificateVerify` - the chain and the handshake
+    /// signature are both post-quantum - at every parameter set.
+    #[test]
+    fn full_1rtt_loopback_with_ml_dsa_server_credentials() {
+        for level in crate::crypto::signature::MlDsaLevel::ALL {
+            let creds = ml_dsa_credentials(level);
+            let sink = run_loopback(
+                client_config_with_trust(&creds, KxPolicy::classical_only(), None),
+                server_config_for(creds, KxPolicy::classical_only()),
+            );
+            assert!(sink.events.iter().any(|e| e == "handshake_complete"), "{level:?}: {:?}", sink.events);
+        }
+    }
+
+    /// Client authentication with an ML-DSA client certificate, too.
+    #[test]
+    fn mtls_with_ml_dsa_client_certificate() {
+        use crate::crypto::signature::MlDsaLevel;
+        let server_creds = ml_dsa_credentials(MlDsaLevel::MlDsa65);
+        let client_creds = ml_dsa_credentials(MlDsaLevel::MlDsa44);
+        let client_cfg = client_config_with_cert(&server_creds, client_creds.clone());
+        let server_cfg = server_config_requiring_client_cert(server_creds, &client_creds, ClientAuthPolicy::Require);
+        let sink = run_loopback(client_cfg, server_cfg);
+        assert!(sink.events.iter().any(|e| e == "handshake_complete"), "{:?}", sink.events);
+    }
+
     #[test]
     fn client_start_emits_client_hello() {
         let mut engine = HandshakeEngine::new(HandshakeConfig {
