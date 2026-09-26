@@ -29,6 +29,10 @@ pub(crate) const APP_SEARCH_REQUEST: u8 = 3;
 pub(crate) const APP_SEARCH_RESULT_ENTRY: u8 = 4;
 pub(crate) const APP_SEARCH_RESULT_DONE: u8 = 5;
 pub(crate) const APP_SEARCH_RESULT_REFERENCE: u8 = 19;
+/// AbandonRequest - RFC 4511 section 4.11 (APPLICATION 16).
+pub(crate) const APP_ABANDON_REQUEST: u8 = 16;
+/// IntermediateResponse - RFC 4511 section 4.13 (APPLICATION 25).
+pub(crate) const APP_INTERMEDIATE_RESPONSE: u8 = 25;
 /// ExtendedRequest — RFC 4511 §4.12 (APPLICATION 23).
 pub(crate) const APP_EXTENDED_REQUEST: u8 = 23;
 /// ExtendedResponse — RFC 4511 §4.12 (APPLICATION 24).
@@ -65,6 +69,10 @@ pub enum LdapResultCode {
     InvalidCredentials,
     /// An unknown or other error occurred.
     Other,
+    /// `e-syncRefreshRequired` (RFC 4533 section 2.6): the server cannot
+    /// continue a content synchronisation incrementally from the client's
+    /// cookie; it must discard the cookie and reload.
+    SyncRefreshRequired,
     /// Numeric code not mapped to a named variant.
     Unknown(i32),
 }
@@ -82,6 +90,7 @@ impl LdapResultCode {
             32 => Self::NoSuchObject,
             49 => Self::InvalidCredentials,
             80 => Self::Other,
+            4096 => Self::SyncRefreshRequired,
             n => Self::Unknown(n),
         }
     }
@@ -98,6 +107,7 @@ impl LdapResultCode {
             Self::NoSuchObject => 32,
             Self::InvalidCredentials => 49,
             Self::Other => 80,
+            Self::SyncRefreshRequired => 4096,
             Self::Unknown(n) => n,
         }
     }
@@ -120,6 +130,7 @@ impl fmt::Display for LdapResultCode {
             Self::NoSuchObject => write!(f, "noSuchObject (32)"),
             Self::InvalidCredentials => write!(f, "invalidCredentials (49)"),
             Self::Other => write!(f, "other (80)"),
+            Self::SyncRefreshRequired => write!(f, "e-syncRefreshRequired (4096)"),
             Self::Unknown(n) => write!(f, "unknown ({n})"),
         }
     }
@@ -148,6 +159,8 @@ pub enum LdapError {
     Referral(String),
     /// Invalid configuration (missing host/addr, etc.).
     Config(String),
+    /// The operation was cancelled by the caller (an Abandon was sent).
+    Cancelled,
 }
 
 impl fmt::Display for LdapError {
@@ -163,6 +176,7 @@ impl fmt::Display for LdapError {
             Self::StartTlsFailed(c) => write!(f, "LDAP STARTTLS failed: {c}"),
             Self::Referral(m) => write!(f, "LDAP referral error: {m}"),
             Self::Config(m) => write!(f, "LDAP config error: {m}"),
+            Self::Cancelled => write!(f, "LDAP operation cancelled"),
         }
     }
 }
@@ -275,7 +289,7 @@ impl SearchRequest {
 }
 
 /// A SearchResultEntry (RFC 4511 §4.5.2).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchEntry {
     /// Entry distinguished name.
     pub dn: String,

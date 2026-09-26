@@ -9,13 +9,17 @@ use std::sync::{Arc, Mutex};
 use hopf_core::{ConnHandle, SharedTlsConnector};
 
 use super::message::{
-    encode_bind_request, encode_search_request, encode_starttls_request, encode_unbind_request,
+    encode_abandon_request, encode_bind_request, encode_search_request,
+    encode_search_request_with_controls, encode_starttls_request, encode_unbind_request,
 };
+use super::sync::{SyncDone, SyncEvent, SyncRequest};
 use super::types::{BindResult, LdapError, SearchDone, SearchEntry, SearchRequest};
 
 pub(crate) type BindCallback = Box<dyn FnOnce(Result<BindResult, LdapError>) + Send>;
 pub(crate) type SearchEntryCallback = Box<dyn FnMut(SearchEntry) + Send>;
 pub(crate) type SearchDoneCallback = Box<dyn FnOnce(Result<SearchDone, LdapError>) + Send>;
+pub(crate) type SyncEventCallback = Box<dyn FnMut(SyncEvent) + Send>;
+pub(crate) type SyncDoneCallback = Box<dyn FnOnce(Result<SyncDone, LdapError>) + Send>;
 pub(crate) type StartTlsCallback = Box<dyn FnOnce(Result<(), LdapError>) + Send>;
 pub(crate) type ReadyCallback = Box<dyn FnOnce(Result<LdapSession, LdapError>) + Send>;
 
@@ -24,6 +28,12 @@ pub(crate) enum PendingOp {
     Search {
         on_entry: SearchEntryCallback,
         on_done: SearchDoneCallback,
+        referrals: Vec<String>,
+    },
+    /// A content synchronisation (RFC 4533): a search that may stay open.
+    Sync {
+        on_event: SyncEventCallback,
+        on_done: SyncDoneCallback,
         referrals: Vec<String>,
     },
     StartTls(StartTlsCallback),
@@ -84,6 +94,7 @@ impl LdapShared {
             match op {
                 PendingOp::Bind(cb) => cb(Err(e)),
                 PendingOp::Search { on_done, .. } => on_done(Err(e)),
+                PendingOp::Sync { on_done, .. } => on_done(Err(e)),
                 PendingOp::StartTls(cb) => cb(Err(e)),
             }
         }
@@ -222,6 +233,53 @@ impl LdapSession {
         }
     }
 
+    /// Content synchronisation (RFC 4533): a search that keeps a local copy of
+    /// a directory subtree up to date.
+    ///
+    /// `request` is the ordinary search (base, scope, filter, attributes); RFC
+    /// 4533 section 3.5 wants a size and time limit of 0 and no alias
+    /// dereferencing, which is the default. `sync` says how: poll
+    /// ([`SyncMode::RefreshOnly`](super::SyncMode)) or keep listening
+    /// ([`SyncMode::RefreshAndPersist`](super::SyncMode)), and from which
+    /// cookie.
+    ///
+    /// `on_event` is called on the reactor for each entry, cookie update and
+    /// phase marker in the order the server sent them - use
+    /// [`SyncReplica`](super::SyncReplica) to apply them - and must not block.
+    /// `on_done` is called once when the operation ends: for a poll after the
+    /// last event, for a persistent sync only if the server ends it (or the
+    /// connection drops), or with [`LdapError::Cancelled`] after
+    /// [`SyncHandle::cancel`]. A `Success` result and `e-syncRefreshRequired`
+    /// are both delivered as `Ok` (the latter tells the caller to discard its
+    /// cookie and reload); every other result code is an `Err`.
+    ///
+    /// Nothing here blocks: a persistent sync just leaves the search
+    /// outstanding on the connection.
+    pub fn sync<E, D>(&self, request: SearchRequest, sync: SyncRequest, on_event: E, on_done: D) -> SyncHandle
+    where
+        E: FnMut(SyncEvent) + Send + 'static,
+        D: FnOnce(Result<SyncDone, LdapError>) + Send + 'static,
+    {
+        let message_id = self.shared.alloc_message_id();
+        self.shared.pending.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            message_id,
+            PendingOp::Sync {
+                on_event: Box::new(on_event),
+                on_done: Box::new(on_done),
+                referrals: Vec::new(),
+            },
+        );
+        let bytes = encode_search_request_with_controls(message_id, &request, &[sync.to_control()]);
+        if let Err(e) = self.shared.send_bytes(bytes) {
+            if let Some(PendingOp::Sync { on_done, .. }) =
+                self.shared.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&message_id)
+            {
+                on_done(Err(e));
+            }
+        }
+        SyncHandle { shared: Arc::clone(&self.shared), message_id }
+    }
+
     /// Unbind and close the connection (RFC 4511 §4.3). No response expected.
     pub fn unbind(&self) {
         if self.shared.closed.swap(true, Ordering::AcqRel) {
@@ -245,5 +303,33 @@ impl LdapSession {
     /// Whether the session has been closed / unbound.
     pub fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::Acquire)
+    }
+}
+
+/// A handle on a running content synchronisation, for ending it.
+#[derive(Clone)]
+pub struct SyncHandle {
+    shared: Arc<LdapShared>,
+    message_id: i32,
+}
+
+impl SyncHandle {
+    /// The LDAP message ID of the sync search.
+    pub fn message_id(&self) -> i32 {
+        self.message_id
+    }
+
+    /// End the synchronisation (RFC 4533 section 3.7): send an Abandon for the
+    /// search and complete `on_done` with [`LdapError::Cancelled`]. A no-op if
+    /// the operation has already finished. The cookie to resume from later is
+    /// whatever the caller last received in an event.
+    pub fn cancel(&self) {
+        let op = self.shared.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.message_id);
+        let Some(PendingOp::Sync { on_done, .. }) = op else {
+            return;
+        };
+        let abandon_id = self.shared.alloc_message_id();
+        let _ = self.shared.send_bytes(encode_abandon_request(abandon_id, self.message_id));
+        on_done(Err(LdapError::Cancelled));
     }
 }
