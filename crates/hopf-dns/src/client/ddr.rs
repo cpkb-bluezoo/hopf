@@ -94,6 +94,7 @@ pub(super) fn maybe_trigger_discovery(inner: &Arc<std::sync::Mutex<ResolverInner
             g.pending.insert(
                 id,
                 PendingQuery {
+                    alt_server: None,
                     callback,
                     question,
                     server_idx,
