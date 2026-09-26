@@ -39,14 +39,14 @@ impl DkimPrivateKey {
             .map_err(|_| ())
     }
 
-    fn algorithm_tag(&self) -> &'static str {
+    pub(crate) fn algorithm_tag(&self) -> &'static str {
         match self {
             DkimPrivateKey::Rsa(_) => "rsa-sha256",
             DkimPrivateKey::Ed25519(_) => "ed25519-sha256",
         }
     }
 
-    fn sign(&self, data: &[u8]) -> Result<SignatureBytes, ()> {
+    pub(crate) fn sign(&self, data: &[u8]) -> Result<SignatureBytes, ()> {
         match self {
             DkimPrivateKey::Rsa(kp) => rsa_sign_pkcs1_sha256(kp, data).map_err(|_| ()),
             DkimPrivateKey::Ed25519(kp) => Ok(ed25519_sign(kp, data)),
@@ -221,7 +221,7 @@ impl DkimSignStream<'_, '_> {
 /// Same bottom-up-per-name selection algorithm the verifier uses (RFC 6376
 /// §5.4) — a signer using a repeated header name in `h=` must select
 /// instances the same way a verifier will.
-fn select_headers<'a>(all: &'a [RawHeader], h_list: &[String]) -> Vec<&'a RawHeader> {
+pub(crate) fn select_headers<'a>(all: &'a [RawHeader], h_list: &[String]) -> Vec<&'a RawHeader> {
     let mut used: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut selected = Vec::with_capacity(h_list.len());
     for name in h_list {
@@ -239,14 +239,14 @@ fn select_headers<'a>(all: &'a [RawHeader], h_list: &[String]) -> Vec<&'a RawHea
     selected
 }
 
-fn canon_name(c: Canonicalization) -> &'static str {
+pub(crate) fn canon_name(c: Canonicalization) -> &'static str {
     match c {
         Canonicalization::Simple => "simple",
         Canonicalization::Relaxed => "relaxed",
     }
 }
 
-fn base64_encode(data: impl AsRef<[u8]>) -> String {
+pub(crate) fn base64_encode(data: impl AsRef<[u8]>) -> String {
     rmimeparser::charset::base64::encode(data.as_ref())
 }
 

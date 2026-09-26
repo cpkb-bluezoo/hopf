@@ -9,6 +9,7 @@
 //! a shared [`AuthVerdictHandle`] that [`crate::server::DeferredDelivery`] can
 //! wait on when DNS hasn't resolved by the time the transaction completes.
 
+pub mod arc;
 pub mod dkim;
 pub mod dmarc;
 mod dns_lookup;
@@ -19,6 +20,9 @@ pub mod spf;
 
 pub use dmarc::AuthVerdict;
 pub use dns_lookup::{DnsLookup, Lookup};
-pub use pipeline::{AuthPipeline, AuthPipelineBuilder, AuthResultsHandle, AuthVerdictHandle};
+pub use pipeline::{
+    ArcResultHandle, ArcSealHandle, AuthPipeline, AuthPipelineBuilder, AuthResultsHandle,
+    AuthVerdictHandle,
+};
 pub(crate) use pipeline::find_header_boundary;
 pub use psl::PublicSuffixList;

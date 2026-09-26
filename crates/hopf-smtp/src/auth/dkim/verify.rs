@@ -255,10 +255,22 @@ fn verify_tags_and_hash(
     };
 
     let signed_data = build_signed_data(&headers, &tags, &sig_header);
+    fetch_key_and_verify(dns, algo, tags.d, tags.s, signed_data, signature, cb);
+}
 
-    let key_name = format!("{}._domainkey.{}", tags.s, tags.d);
-    let d = tags.d.clone();
-    let s = tags.s.clone();
+/// Final stage shared by DKIM signatures and RFC 8617 ARC signatures: fetch
+/// the `<selector>._domainkey.<domain>` key record and check `signature`
+/// over `signed_data`.
+fn fetch_key_and_verify(
+    dns: Arc<dyn DnsLookup>,
+    algo: Algorithm,
+    d: String,
+    s: String,
+    signed_data: Vec<u8>,
+    signature: SignatureBytes,
+    cb: DkimCallback,
+) {
+    let key_name = format!("{s}._domainkey.{d}");
     dns.query_txt(
         &key_name,
         Box::new(move |lookup| {
@@ -282,6 +294,118 @@ fn verify_tags_and_hash(
                 selector: Some(s),
             });
         }),
+    );
+}
+
+// --- RFC 8617 ARC signature verification ----------------------------------
+//
+// ARC's `ARC-Message-Signature` and `ARC-Seal` reuse RFC 6376's algorithms,
+// key records and `<selector>._domainkey.<domain>` lookup (RFC 8617 §4.1),
+// so they share everything below the tag parsing with DKIM.
+
+/// The `(c=body-side, l=)` pair an `ARC-Message-Signature` needs a body
+/// hash for, or `None` if the header doesn't parse.
+pub(crate) fn arc_message_signature_body_key(
+    header: &RawHeader,
+) -> Option<(Canonicalization, Option<u64>)> {
+    let tags = parse_signature_tags_for(&header.as_string_unfolded(), SigKind::ArcMessage).ok()?;
+    Some((tags.c.1, tags.l))
+}
+
+/// Verify one `ARC-Message-Signature` (RFC 8617 §4.1.2) against a
+/// precomputed body hash and the message's headers.
+pub(crate) fn verify_arc_message_signature(
+    dns: Arc<dyn DnsLookup>,
+    headers: Arc<Vec<RawHeader>>,
+    body_hashes: Arc<BodyHashMap>,
+    sig_header: RawHeader,
+    cb: DkimCallback,
+) {
+    let tags = match parse_signature_tags_for(&sig_header.as_string_unfolded(), SigKind::ArcMessage)
+    {
+        Ok(t) => t,
+        Err(()) => {
+            cb(DkimSignatureResult {
+                result: DkimResult::PermError,
+                signing_domain: None,
+                selector: None,
+            });
+            return;
+        }
+    };
+    let Some(computed_bh) = body_hashes.get(&(tags.c.1, tags.l)).cloned() else {
+        cb(DkimSignatureResult {
+            result: DkimResult::PermError,
+            signing_domain: Some(tags.d.clone()),
+            selector: Some(tags.s.clone()),
+        });
+        return;
+    };
+    verify_tags_and_hash(dns, headers, tags, computed_bh, sig_header, cb);
+}
+
+/// Verify one `ARC-Seal` (RFC 8617 §4.1.3). `signed_data` is the
+/// already-canonicalized header chain the seal covers (§5.1.1), ending in
+/// the seal's own header with `b=` blanked — the caller assembles it since
+/// it depends on the whole ARC chain, not just this header.
+pub(crate) fn verify_arc_seal(
+    dns: Arc<dyn DnsLookup>,
+    seal_header: &RawHeader,
+    signed_data: Vec<u8>,
+    cb: DkimCallback,
+) {
+    let value = seal_header
+        .as_string_unfolded()
+        .split_once(':')
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
+    let tags = parse_tag_list(&value);
+    let (Some(a), Some(b), Some(d), Some(s)) =
+        (tags.get("a"), tags.get("b"), tags.get("d"), tags.get("s"))
+    else {
+        cb(DkimSignatureResult {
+            result: DkimResult::PermError,
+            signing_domain: None,
+            selector: None,
+        });
+        return;
+    };
+    let algo = match a.as_str() {
+        "rsa-sha256" => Algorithm::RsaSha256,
+        "ed25519-sha256" => Algorithm::Ed25519Sha256,
+        _ => {
+            cb(DkimSignatureResult {
+                result: DkimResult::PermError,
+                signing_domain: Some(d.clone()),
+                selector: Some(s.clone()),
+            });
+            return;
+        }
+    };
+    let Some(sig) = base64_decode(b) else {
+        cb(DkimSignatureResult {
+            result: DkimResult::PermError,
+            signing_domain: Some(d.clone()),
+            selector: Some(s.clone()),
+        });
+        return;
+    };
+    if d.is_empty() || s.is_empty() {
+        cb(DkimSignatureResult {
+            result: DkimResult::PermError,
+            signing_domain: None,
+            selector: None,
+        });
+        return;
+    }
+    fetch_key_and_verify(
+        dns,
+        algo,
+        d.clone(),
+        s.clone(),
+        signed_data,
+        SignatureBytes::from_bytes(hopf_core::Bytes::from(sig)),
+        cb,
     );
 }
 
@@ -432,11 +556,25 @@ fn parse_tag_list(value: &str) -> HashMap<String, String> {
     tags
 }
 
+/// Which signature header a tag list belongs to: `DKIM-Signature`
+/// (RFC 6376 §3.5) or `ARC-Message-Signature` (RFC 8617 §4.1.2, which drops
+/// `v=`, repurposes `i=` as the ARC instance and doesn't require `From` in
+/// `h=`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SigKind {
+    Dkim,
+    ArcMessage,
+}
+
 fn parse_signature_tags(header_line: &str) -> Result<SigTags, ()> {
+    parse_signature_tags_for(header_line, SigKind::Dkim)
+}
+
+fn parse_signature_tags_for(header_line: &str, kind: SigKind) -> Result<SigTags, ()> {
     let value = header_line.split_once(':').map(|(_, v)| v).unwrap_or("");
     let tags = parse_tag_list(value);
 
-    if tags.get("v").map(|v| v.as_str()) != Some("1") {
+    if kind == SigKind::Dkim && tags.get("v").map(|v| v.as_str()) != Some("1") {
         return Err(());
     }
     let a = tags.get("a").ok_or(())?.clone();
@@ -462,11 +600,11 @@ fn parse_signature_tags(header_line: &str) -> Result<SigTags, ()> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    if !h.iter().any(|n| n.eq_ignore_ascii_case("from")) {
+    if kind == SigKind::Dkim && !h.iter().any(|n| n.eq_ignore_ascii_case("from")) {
         return Err(());
     }
 
-    if let Some(i) = tags.get("i") {
+    if let (SigKind::Dkim, Some(i)) = (kind, tags.get("i")) {
         let idom = i.rsplit_once('@').map(|(_, d)| d).unwrap_or("");
         if !domain_eq_or_subdomain(idom, &d) {
             return Err(());
