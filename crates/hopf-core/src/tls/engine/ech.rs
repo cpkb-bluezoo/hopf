@@ -1015,6 +1015,7 @@ mod tests {
             cookie: None,
             record_size_limit: None,
             legacy_version: 0x0303,
+            compress_certificate: false,
         };
         let wire = build_client_hello_with_ech(&params, &INNER_EXTENSION_BODY).encode();
         let mut ss = Sink::default();

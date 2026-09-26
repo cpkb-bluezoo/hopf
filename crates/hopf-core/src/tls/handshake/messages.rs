@@ -89,6 +89,9 @@ pub mod ext {
     /// `on_client_hello`); local chain *verification* stays governed by the
     /// fixed `ACCEPTED_CERT_SIGNATURE_SCHEMES` allowlist regardless.
     pub const SIGNATURE_ALGORITHMS_CERT: u16 = 0x0032;
+    /// `compress_certificate` (RFC 8879 §3): the certificate compression
+    /// algorithms this endpoint can decompress.
+    pub const COMPRESS_CERTIFICATE: u16 = 27;
     /// Cookie (RFC 8446 §4.2.2) — carried in `HelloRetryRequest`, echoed
     /// verbatim by the client in its followup ClientHello.
     pub const COOKIE: u16 = 44;
@@ -175,6 +178,9 @@ pub struct ClientHelloParams {
     /// for backward-compat framing). The real version is always negotiated
     /// via `supported_versions`, identical on both transports.
     pub legacy_version: u16,
+    /// Offer `compress_certificate` (RFC 8879) with every algorithm in
+    /// [`SUPPORTED_ALGORITHMS`](super::cert_compression::SUPPORTED_ALGORITHMS).
+    pub compress_certificate: bool,
 }
 
 /// Build a TLS 1.3 `ClientHello`.
@@ -292,6 +298,16 @@ fn build_client_hello_inner(
         sig_algs_cert.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
         sig_algs_cert.extend_from_slice(&bytes);
         push_extension(&mut extensions, ext::SIGNATURE_ALGORITHMS_CERT, &sig_algs_cert);
+    }
+    if params.compress_certificate {
+        // `CertificateCompressionAlgorithm algorithms<2..2^8-2>`.
+        let algs = super::cert_compression::SUPPORTED_ALGORITHMS;
+        let mut body = BytesMut::with_capacity(1 + 2 * algs.len());
+        body.extend_from_slice(&[(2 * algs.len()) as u8]);
+        for a in algs {
+            body.extend_from_slice(&a.to_be_bytes());
+        }
+        push_extension(&mut extensions, ext::COMPRESS_CERTIFICATE, &body);
     }
     if !params.alpn.is_empty() {
         let names: Vec<&[u8]> = params.alpn.iter().map(|p| p.as_ref()).collect();
@@ -743,6 +759,7 @@ mod tests {
             cookie: None,
             record_size_limit: None,
             legacy_version: 0x0303,
+            compress_certificate: false,
         });
         let parsed = parse_client_hello(&hello.body).expect("parse client hello");
         assert!(parsed.peer_key_share.is_some());
@@ -776,6 +793,7 @@ mod tests {
             cookie: None,
             record_size_limit: None,
             legacy_version: 0xfefd,
+            compress_certificate: false,
         });
         // legacy_version(2) + random(32) + session_id_len(1)=0 +
         // legacy_cookie_len(1)=0: byte 35 is the cookie length prefix.
@@ -806,6 +824,7 @@ mod tests {
             cookie: None,
             record_size_limit: None,
             legacy_version: 0x0303,
+            compress_certificate: false,
         });
         // legacy_version(2) + random(32) + session_id_len(1) + cipher_suites_len(2)
         // + cipher_suites(2) + compression(2).
@@ -852,6 +871,7 @@ mod tests {
             cookie: None,
             record_size_limit: None,
             legacy_version: 0x0303,
+            compress_certificate: false,
         });
         let parsed = parse_client_hello(&hello.body).expect("parse");
         assert_eq!(

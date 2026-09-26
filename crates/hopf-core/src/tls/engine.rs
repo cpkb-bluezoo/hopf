@@ -290,6 +290,16 @@ pub struct HandshakeConfig {
     /// and publishes. `None` (the default) ignores `encrypted_client_hello`
     /// like any unknown extension. Ignored on the client.
     pub ech_server: Option<Arc<super::ech::EchServerConfig>>,
+    /// Certificate compression (RFC 8879, Brotli). Default `true`.
+    ///
+    /// - **Client:** offer `compress_certificate` and accept a Brotli
+    ///   `CompressedCertificate` from the server.
+    /// - **Server:** compress the certificate chain sent to a client that
+    ///   offered Brotli, whenever that makes the message smaller.
+    ///
+    /// Worth having for large (e.g. post-quantum) chains; `false` restores
+    /// the uncompressed exchange.
+    pub certificate_compression: bool,
 }
 
 impl Default for HandshakeConfig {
@@ -317,6 +327,7 @@ impl Default for HandshakeConfig {
             record_size_limit: None,
             ech_client: None,
             ech_server: None,
+            certificate_compression: true,
         }
     }
 }
@@ -444,11 +455,12 @@ fn ratchet_application_secret(secret: &TrafficSecret, dtls: bool) -> TrafficSecr
 impl HandshakeEngine {
     /// Create an engine; call [`Self::start`] to emit the first flight (client).
     pub fn new(config: HandshakeConfig) -> Self {
+        let accept_compressed_certificate = config.certificate_compression && config.role == HandshakeRole::Client;
         Self {
             config,
             state: State::Initial,
             transcript: Transcript::new(),
-            parser: HandshakeParser::new(),
+            parser: HandshakeParser::new().with_certificate_compression(accept_compressed_certificate),
             local_key_share: None,
             negotiated_group: None,
             shared_secret: None,
@@ -736,6 +748,7 @@ impl HandshakeEngine {
             cookie: self.client_retry_cookie.take(),
             record_size_limit: self.offered_record_size_limit(),
             legacy_version: self.config.mode.legacy_version(),
+            compress_certificate: self.config.certificate_compression,
         };
 
         if self.ech_client_is_real() {
@@ -1519,7 +1532,15 @@ impl HandshakeEngine {
             }
             let cert_refs: Vec<&[u8]> = creds.cert_chain.iter().map(|c| c.as_ref()).collect();
             let cert_msg = build_certificate(&[], &cert_refs);
-            self.emit_outgoing(&cert_msg, sink);
+            match self.compressed_certificate_wire(&cert_msg, &ch.compress_certificate) {
+                Some(wire) => {
+                    // RFC 8879 §4: the transcript covers the message as sent,
+                    // i.e. the CompressedCertificate.
+                    self.transcript.add_message(&wire);
+                    sink.handshake_data_ready(&wire);
+                }
+                None => self.emit_outgoing(&cert_msg, sink),
+            }
 
             let cv_th = self.transcript.hash();
             let Some((scheme, sig)) = sign_certificate_verify(false, &creds.signing_key_pkcs8, &cv_th) else {
@@ -1655,6 +1676,28 @@ impl HandshakeEngine {
         self.resumption_master = Some(derive_resumption_master_secret(psk, shared, &res_hash, dtls));
         self.finish(sink);
         true
+    }
+
+    /// RFC 8879: the wire encoding of `cert` as a `CompressedCertificate`,
+    /// when certificate compression is enabled, the client offered an
+    /// algorithm we support, and compressing actually makes the message
+    /// smaller. `None` means send `cert` as is.
+    fn compressed_certificate_wire(&self, cert: &HandshakeMessage, offered: &[u16]) -> Option<Bytes> {
+        use super::handshake::cert_compression::{compress, encode_compressed_certificate, HEADER_LEN, MAX_UNCOMPRESSED_CERTIFICATE_LEN, SUPPORTED_ALGORITHMS};
+        if !self.config.certificate_compression || cert.body.len() > MAX_UNCOMPRESSED_CERTIFICATE_LEN {
+            return None;
+        }
+        let algorithm = SUPPORTED_ALGORITHMS.iter().copied().find(|a| offered.contains(a))?;
+        let compressed = compress(algorithm, &cert.body)?;
+        if HEADER_LEN + compressed.len() >= cert.body.len() {
+            return None;
+        }
+        let body = encode_compressed_certificate(algorithm, cert.body.len(), &compressed);
+        let mut wire = Vec::with_capacity(4 + body.len());
+        wire.push(25); // CompressedCertificate
+        wire.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        wire.extend_from_slice(&body);
+        Some(Bytes::from(wire))
     }
 
     fn emit_outgoing<S: TlsEventSink>(&mut self, msg: &HandshakeMessage, sink: &mut S) {
@@ -2052,6 +2095,19 @@ impl<S: TlsEventSink> HandshakeEvents for EngineCodecBridge<'_, S> {
         self.engine.fail(self.sink, AlertDescription::DecodeError, detail);
         self.stop = true;
     }
+
+    fn certificate_compression_error(&mut self, err: super::handshake::cert_compression::CertCompressionError) {
+        use super::handshake::cert_compression::CertCompressionError as E;
+        // RFC 8879 §4: an unknown/unoffered algorithm is `illegal_parameter`,
+        // a body that won't decompress to the declared length `bad_certificate`.
+        let alert = match err {
+            E::Unsolicited | E::UnsupportedAlgorithm => AlertDescription::IllegalParameter,
+            E::Malformed => AlertDescription::DecodeError,
+            E::BadDeclaredLength | E::Corrupt | E::LengthMismatch => AlertDescription::BadCertificate,
+        };
+        self.engine.fail(self.sink, alert, err.detail());
+        self.stop = true;
+    }
 }
 
 /// RFC 7301 §3.2: the first of the server's own preferences that the client
@@ -2275,6 +2331,128 @@ mod tests {
     fn server_ignores_client_scheme_list_for_a_self_signed_chain() {
         let sink = server_reply_to_client_offering(test_server_credentials(), Some(&[0x0403]));
         assert!(protocol_errors(&sink).is_empty(), "{:?}", sink.events);
+    }
+
+    /// Self-signed Ed25519 credentials whose certificate carries a ~40 KiB
+    /// pseudo-random extension: the size (and incompressibility) of a
+    /// post-quantum chain, several TLS records long.
+    fn pq_sized_server_credentials() -> ServerCredentials {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let mut filler = vec![0u8; 40_000];
+        getrandom(&mut filler[..20_000]).unwrap(); // half random, half repetitive
+        let mut content = vec![0x04];
+        content.extend_from_slice(&[0x82, (filler.len() >> 8) as u8, filler.len() as u8]);
+        content.extend_from_slice(&filler);
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(&[1, 3, 6, 1, 4, 1, 55555, 1], content));
+        let cert = params.self_signed(&key_pair).unwrap();
+        ServerCredentials {
+            cert_chain: vec![Bytes::copy_from_slice(cert.der())],
+            signing_key_pkcs8: Bytes::from(key_pair.serialize_der()),
+        }
+    }
+
+    /// Drive a QUIC-mode handshake, feeding the client the server flight in
+    /// `chunk` byte slices. Returns (server flight wire chunks, client done).
+    fn compression_loopback(client_on: bool, server_on: bool, chunk: usize) -> (Vec<Bytes>, bool, bool) {
+        let creds = pq_sized_server_credentials();
+        let mut client_cfg = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        client_cfg.certificate_compression = client_on;
+        let mut server_cfg = server_config_for(creds, KxPolicy::classical_only());
+        server_cfg.certificate_compression = server_on;
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client_sink = RecordingSink::default();
+        let mut server_sink = RecordingSink::default();
+        client.start(&mut client_sink);
+        relay_server(&mut server, take_outbound(&mut client_sink), &mut server_sink);
+        let flight = take_outbound(&mut server_sink);
+        for msg in &flight {
+            for piece in msg.chunks(chunk) {
+                let mut input = piece;
+                client.feed_handshake_data(&mut input, &mut client_sink);
+            }
+        }
+        relay_server(&mut server, take_outbound(&mut client_sink), &mut server_sink);
+        (flight, client.is_complete(), server.is_complete())
+    }
+
+    /// The handshake message types in a server flight (each chunk is one
+    /// whole handshake message).
+    fn message_types(flight: &[Bytes]) -> Vec<u8> {
+        flight.iter().map(|m| m[0]).collect()
+    }
+
+    /// RFC 8879: a client that offers Brotli gets a `CompressedCertificate`
+    /// (type 25) instead of `Certificate` (11), the handshake still
+    /// completes (so the transcript hash covers the compressed form on both
+    /// sides), and the flight is smaller.
+    #[test]
+    fn server_compresses_a_pq_sized_chain_for_a_client_that_offers_brotli() {
+        let (plain, c1, s1) = compression_loopback(false, true, usize::MAX);
+        assert!(c1 && s1, "baseline handshake");
+        assert!(message_types(&plain).contains(&11) && !message_types(&plain).contains(&25));
+
+        let (compressed, c2, s2) = compression_loopback(true, true, usize::MAX);
+        assert!(c2 && s2, "handshake with certificate compression");
+        let types = message_types(&compressed);
+        assert!(types.contains(&25) && !types.contains(&11), "{types:?}");
+        let total = |f: &[Bytes]| f.iter().map(|m| m.len()).sum::<usize>();
+        assert!(total(&compressed) < total(&plain), "{} !< {}", total(&compressed), total(&plain));
+    }
+
+    /// The client inflates while the compressed message is still trickling
+    /// in: 7-byte deliveries of a multi-record-sized flight still complete.
+    #[test]
+    fn client_completes_when_the_compressed_certificate_arrives_in_tiny_pieces() {
+        let (flight, client_done, server_done) = compression_loopback(true, true, 7);
+        assert!(message_types(&flight).contains(&25));
+        assert!(client_done && server_done);
+    }
+
+    #[test]
+    fn server_does_not_compress_unless_the_client_offered_it() {
+        let (flight, c, s) = compression_loopback(false, true, usize::MAX);
+        assert!(c && s);
+        assert!(!message_types(&flight).contains(&25));
+    }
+
+    #[test]
+    fn server_with_compression_disabled_sends_a_plain_certificate() {
+        let (flight, c, s) = compression_loopback(true, false, usize::MAX);
+        assert!(c && s);
+        assert!(!message_types(&flight).contains(&25));
+    }
+
+    /// A client that never offered the extension must refuse a
+    /// `CompressedCertificate` (RFC 8879 §4) with `illegal_parameter`.
+    #[test]
+    fn client_that_did_not_offer_compression_rejects_a_compressed_certificate() {
+        let creds = pq_sized_server_credentials();
+        let mut client_cfg = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        client_cfg.certificate_compression = true;
+        let mut server = HandshakeEngine::new(server_config_for(creds.clone(), KxPolicy::classical_only()));
+        let mut off_cfg = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        off_cfg.certificate_compression = false;
+        // Same ClientHello offer as an enabled client, so the server compresses...
+        let mut on_client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+        on_client.start(&mut sink);
+        let hello = take_outbound(&mut sink);
+        let mut server_sink = RecordingSink::default();
+        relay_server(&mut server, hello, &mut server_sink);
+        let flight = take_outbound(&mut server_sink);
+        assert!(message_types(&flight).contains(&25));
+        // ...but a client configured off (which would never have offered) refuses it.
+        let mut off_client = HandshakeEngine::new(off_cfg);
+        let mut off_sink = RecordingSink::default();
+        off_client.start(&mut off_sink);
+        let _ = take_outbound(&mut off_sink);
+        relay_client(&mut off_client, flight, &mut off_sink);
+        assert!(!off_client.is_complete());
+        assert!(off_sink.alerts.contains(&AlertDescription::IllegalParameter), "{:?} {:?}", off_sink.alerts, off_sink.events);
     }
 
     #[test]
@@ -3245,6 +3423,7 @@ mod tests {
             cookie: None,
             record_size_limit: client_limit,
             legacy_version: 0x0303,
+            compress_certificate: false,
         });
         let wire = hello.encode();
         server.feed_handshake_data(&mut wire.as_ref(), &mut sink);
@@ -3370,6 +3549,7 @@ mod tests {
             cookie: None,
             record_size_limit: Some(63),
             legacy_version: 0x0303,
+            compress_certificate: false,
         });
         server.feed_handshake_data(&mut hello.encode().as_ref(), &mut sink);
         assert!(sink.alerts.is_empty(), "even an illegal value is ignored on QUIC: {:?}", sink.events);
@@ -3526,6 +3706,7 @@ mod tests {
             cookie: None,
             record_size_limit: None,
             legacy_version: 0x0303,
+            compress_certificate: false,
         });
         let wire = hello.encode();
         let mut input = wire.as_ref();
@@ -3567,6 +3748,7 @@ mod tests {
             cookie: None,
             record_size_limit: None,
             legacy_version: 0x0303,
+            compress_certificate: false,
         });
         let wire = hello.encode();
         let mut input = wire.as_ref();
