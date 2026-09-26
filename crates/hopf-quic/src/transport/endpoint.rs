@@ -14,6 +14,7 @@ use crate::transport::cid::CidMap;
 use crate::transport::connection::Connection;
 use crate::transport::packet::long_header::{self, TYPE_INITIAL, TYPE_RETRY};
 use crate::transport::packet::retry;
+use crate::transport::packet::version_negotiation as vn;
 use crate::transport::types::{
     ConnectionEvent, ConnectionHandle, ConnectionId, DatagramEvent, EndpointConfig, Incoming,
     Transmit, VERSION_V1,
@@ -171,12 +172,19 @@ impl Endpoint {
         _local: Option<std::net::IpAddr>,
         _ecn: Option<u8>,
         data: Bytes,
-        _send_buf: &mut Vec<u8>,
+        send_buf: &mut Vec<u8>,
     ) -> Option<DatagramEvent> {
         if data.is_empty() {
             return None;
         }
         if data[0] & 0x80 != 0 {
+            // Anything but version 1 can't be parsed past the RFC 8999
+            // invariants, so it never reaches the v1 header parser below.
+            if let Some((version, dcid, scid)) = vn::parse_invariants(&data) {
+                if version != VERSION_V1 {
+                    return self.unsupported_version(version, dcid, scid, &data, remote, send_buf);
+                }
+            }
             let first_type = (data[0] >> 4) & 0x03;
             // Retry has no Length; demux by DCID only.
             if first_type == TYPE_RETRY {
@@ -223,6 +231,45 @@ impl Endpoint {
             }
         }
         None
+    }
+
+    /// A long-header packet in a version other than 1 (RFC 9000 section
+    /// 5.2.2): a Version Negotiation packet is handed to the outbound
+    /// connection it echoes (and never answered, section 6), a big-enough
+    /// datagram to a server gets a Version Negotiation packet, and anything
+    /// else - too small, for a connection we already have, or arriving at a
+    /// client-only endpoint - is dropped.
+    fn unsupported_version(
+        &mut self,
+        version: u32,
+        dcid: &[u8],
+        scid: &[u8],
+        data: &Bytes,
+        remote: SocketAddr,
+        send_buf: &mut Vec<u8>,
+    ) -> Option<DatagramEvent> {
+        if version == 0 {
+            // A Version Negotiation packet: only ever for one of our own
+            // outbound connections, demultiplexed on its DCID (our SCID).
+            let handle = self.cids.get(&ConnectionId::from_slice(dcid))?;
+            return Some(DatagramEvent::ConnectionEvent(handle, ConnectionEvent { datagram: data.clone() }));
+        }
+        if self.server.is_none()
+            || data.len() < vn::MIN_INITIAL_DATAGRAM_LEN
+            || self.cids.get(&ConnectionId::from_slice(dcid)).is_some()
+        {
+            return None;
+        }
+        let packet = vn::build(scid, dcid);
+        send_buf.clear();
+        send_buf.extend_from_slice(&packet);
+        Some(DatagramEvent::Response(Transmit {
+            destination: remote,
+            ecn: None,
+            size: packet.len(),
+            segment_size: None,
+            src_ip: None,
+        }))
     }
 
     fn validate_initial_token(
@@ -365,4 +412,141 @@ pub enum ConnectError {
 pub enum AcceptError {
     /// No server config.
     NoServerConfig,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::packet::long_header;
+    use hopf_core::tls::{HandshakeMode, HandshakeRole};
+
+    const UNKNOWN_VERSION: u32 = 0xbabababa;
+    const MIN_INITIAL_DATAGRAM: usize = 1200;
+
+    fn endpoint(server: bool) -> Endpoint {
+        let server = server.then(|| {
+            ServerConfig::new(HandshakeConfig {
+                role: HandshakeRole::Server,
+                mode: HandshakeMode::Quic,
+                ..Default::default()
+            })
+        });
+        Endpoint::new(EndpointConfig::default(), server, false, None)
+    }
+
+    /// A long-header datagram of `total` bytes in a version-invariant shape
+    /// (RFC 8999): first byte, version, DCID, SCID, then filler.
+    fn long_header_datagram(version: u32, dcid: &[u8], scid: &[u8], total: usize) -> Bytes {
+        let mut d = vec![0xc0u8];
+        d.extend_from_slice(&version.to_be_bytes());
+        d.push(dcid.len() as u8);
+        d.extend_from_slice(dcid);
+        d.push(scid.len() as u8);
+        d.extend_from_slice(scid);
+        d.resize(total, 0x55);
+        Bytes::from(d)
+    }
+
+    fn remote() -> SocketAddr {
+        "192.0.2.7:4433".parse().unwrap()
+    }
+
+    /// Feed a datagram; return the Version Negotiation bytes if the
+    /// endpoint answered with one.
+    fn response_to(ep: &mut Endpoint, datagram: Bytes) -> Option<Vec<u8>> {
+        let mut send_buf = Vec::new();
+        match ep.handle(Instant::now(), remote(), None, None, datagram, &mut send_buf) {
+            Some(DatagramEvent::Response(tx)) => {
+                assert_eq!(tx.destination, remote());
+                assert_eq!(tx.size, send_buf.len());
+                Some(send_buf)
+            }
+            _ => None,
+        }
+    }
+
+    /// Split a Version Negotiation packet (RFC 9000 section 17.2.1) into
+    /// (first byte, version, DCID, SCID, supported versions).
+    fn split_vn(p: &[u8]) -> (u8, u32, Vec<u8>, Vec<u8>, Vec<u32>) {
+        let version = u32::from_be_bytes([p[1], p[2], p[3], p[4]]);
+        let dl = p[5] as usize;
+        let dcid = p[6..6 + dl].to_vec();
+        let sl = p[6 + dl] as usize;
+        let scid = p[7 + dl..7 + dl + sl].to_vec();
+        let list = &p[7 + dl + sl..];
+        assert_eq!(list.len() % 4, 0, "version list is whole 32-bit values");
+        let versions = list.chunks(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
+        (p[0], version, dcid, scid, versions)
+    }
+
+    /// RFC 9000 section 5.2.2: an unsupported version in a datagram big
+    /// enough to be an Initial gets a Version Negotiation packet echoing the
+    /// client's connection IDs (swapped) and listing what we support.
+    #[test]
+    fn server_answers_an_unsupported_version_with_version_negotiation() {
+        let mut ep = endpoint(true);
+        let dcid = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let scid = [9u8, 10, 11, 12, 13];
+        let vn = response_to(&mut ep, long_header_datagram(UNKNOWN_VERSION, &dcid, &scid, MIN_INITIAL_DATAGRAM))
+            .expect("Version Negotiation response");
+        let (first, version, vn_dcid, vn_scid, versions) = split_vn(&vn);
+        assert_eq!(first & 0x80, 0x80, "long header form bit");
+        assert_eq!(version, 0);
+        assert_eq!(vn_dcid, scid, "DCID is the client's SCID");
+        assert_eq!(vn_scid, dcid, "SCID is the client's DCID");
+        assert!(versions.contains(&VERSION_V1), "{versions:x?}");
+        assert!(!versions.contains(&UNKNOWN_VERSION));
+        assert!(vn.len() < MIN_INITIAL_DATAGRAM, "must not amplify");
+    }
+
+    /// Connection IDs of an unknown version may be up to 255 bytes long
+    /// (RFC 8999); they are echoed verbatim, not truncated to v1's 20.
+    #[test]
+    fn version_negotiation_echoes_long_connection_ids_verbatim() {
+        let mut ep = endpoint(true);
+        let dcid: Vec<u8> = (0..30u8).collect();
+        let scid: Vec<u8> = (100..125u8).collect();
+        let vn = response_to(&mut ep, long_header_datagram(UNKNOWN_VERSION, &dcid, &scid, 1350)).unwrap();
+        let (_, _, vn_dcid, vn_scid, _) = split_vn(&vn);
+        assert_eq!(vn_dcid, scid);
+        assert_eq!(vn_scid, dcid);
+    }
+
+    /// Below the smallest possible Initial the datagram can't start a
+    /// connection in any supported version, so no reply (RFC 9000 5.2.2).
+    #[test]
+    fn undersized_unsupported_version_datagram_is_dropped_without_a_reply() {
+        let mut ep = endpoint(true);
+        let d = long_header_datagram(UNKNOWN_VERSION, &[1; 8], &[2; 8], MIN_INITIAL_DATAGRAM - 1);
+        assert!(response_to(&mut ep, d).is_none());
+    }
+
+    /// RFC 9000 section 6: never answer a Version Negotiation packet
+    /// (version 0) with another - that could loop between two endpoints.
+    #[test]
+    fn a_version_negotiation_packet_is_never_answered() {
+        let mut ep = endpoint(true);
+        let d = long_header_datagram(0, &[1; 8], &[2; 8], MIN_INITIAL_DATAGRAM);
+        assert!(response_to(&mut ep, d).is_none());
+    }
+
+    #[test]
+    fn a_client_only_endpoint_never_sends_version_negotiation() {
+        let mut ep = endpoint(false);
+        let d = long_header_datagram(UNKNOWN_VERSION, &[1; 8], &[2; 8], MIN_INITIAL_DATAGRAM);
+        assert!(response_to(&mut ep, d).is_none());
+    }
+
+    /// Regression: a version 1 Initial still becomes a new connection.
+    #[test]
+    fn a_version_1_initial_still_starts_a_connection() {
+        let mut ep = endpoint(true);
+        let dcid = ConnectionId::from_slice(&[7u8; 8]);
+        let scid = ConnectionId::from_slice(&[8u8; 8]);
+        let mut d = long_header::build(TYPE_INITIAL, VERSION_V1, &dcid, &scid, &[], 0, 1, 1180);
+        d.resize(MIN_INITIAL_DATAGRAM, 0);
+        let mut send_buf = Vec::new();
+        let ev = ep.handle(Instant::now(), remote(), None, None, Bytes::from(d), &mut send_buf);
+        assert!(matches!(ev, Some(DatagramEvent::NewConnection(_))), "{ev:?}");
+    }
 }
