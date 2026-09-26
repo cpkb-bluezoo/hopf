@@ -91,6 +91,7 @@ impl HopfTlsBuildParams {
 
     /// Apply [`QuicTlsOptions`].
     pub fn with_tls(mut self, tls: QuicTlsOptions) -> Self {
+        self.kx_policy = tls.kx_policy.clone();
         self.tls = tls;
         if self.tls.enable_early_data && self.server.is_some() && self.anti_replay.is_none() {
             self.anti_replay = Some(AntiReplay::shared_default());

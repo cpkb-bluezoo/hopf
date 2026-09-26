@@ -2286,6 +2286,53 @@ mod tests {
         fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
     }
 
+    /// Echo over a real UDP loopback with the hybrid ML-KEM policy on both
+    /// peers, and with a PQC-enabled server facing a classical-only client.
+    #[test]
+    fn echo_with_hybrid_kx_and_classical_fallback() {
+        use crate::config::{
+            client_config_for_pem_bytes_with, server_config_self_signed_with, QuicTlsOptions,
+        };
+
+        let pqc = QuicTlsOptions::new().with_pqc();
+        let (server_cfg, pem) =
+            server_config_self_signed_with(&["localhost"], &[b"hq-interop"], pqc.clone()).unwrap();
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        for client_tls in [pqc, QuicTlsOptions::new()] {
+            let client_cfg =
+                client_config_for_pem_bytes_with(&pem, &[b"hq-interop"], client_tls).unwrap();
+            let got = Arc::new(StdMutex::new(Vec::new()));
+            let got2 = Arc::clone(&got);
+            let client = connect_quic(QuicConnectConfig::new(
+                server.local_addr,
+                client_cfg,
+                "localhost",
+                Arc::new(move || {
+                    Box::new(ClientProbe {
+                        sent: false,
+                        got: Arc::clone(&got2),
+                    }) as Box<dyn ProtocolHandler>
+                }),
+            ))
+            .unwrap();
+            for _ in 0..200 {
+                if got.lock().unwrap().as_slice() == b"ping" {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(got.lock().unwrap().as_slice(), b"ping");
+            client.shutdown();
+        }
+        server.shutdown();
+    }
+
     #[test]
     fn spike_echo_one_stream() {
         let (server_cfg, pem) =
@@ -3183,7 +3230,7 @@ mod tests {
 
         let tls = QuicTlsOptions::new().with_early_data();
         let (server_cfg, pem) =
-            server_config_self_signed_with(&["localhost"], &[b"hq-interop"], tls).unwrap();
+            server_config_self_signed_with(&["localhost"], &[b"hq-interop"], tls.clone()).unwrap();
         let client_cfg =
             client_config_for_pem_bytes_with(&pem, &[b"hq-interop"], tls).unwrap();
 
