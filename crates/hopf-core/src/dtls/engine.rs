@@ -566,8 +566,18 @@ impl DtlsRecordEngine {
         // message or reception-informed retransmission tuning.
         if !was_complete && self.engine.is_complete() && flight.is_empty() {
             if let Some(record_number) = last_handshake_record {
-                write_records(&mut self.state, CONTENT_ACK, &[encode_ack(&[record_number])], &mut flight);
+                // Its own datagram, not part of a retransmittable flight:
+                // an ACK is never itself retransmitted.
+                let mut ack = Vec::new();
+                write_records(&mut self.state, CONTENT_ACK, &[encode_ack(&[record_number])], &mut ack);
+                sink.datagram_ready(&ack);
             }
+        }
+        if !was_complete && self.engine.is_complete() && self.state.role == HandshakeRole::Server {
+            // The client's Finished acknowledges the server's whole flight
+            // (RFC 9147 §5.8.1): nothing of it is left to retransmit.
+            self.retransmit.on_progress();
+            sink.arm_retransmit_timer(None);
         }
         if had_pending_key_update {
             // Both our unacknowledged `KeyUpdate` and a reciprocal one that
@@ -594,6 +604,12 @@ impl DtlsRecordEngine {
             Some(RetransmitOutcome::Resend(bytes)) => {
                 sink.datagram_ready(&bytes);
                 sink.arm_retransmit_timer(self.retransmit.current_timeout());
+            }
+            Some(RetransmitOutcome::GiveUp) if self.engine.is_complete() && self.state.pending_writes.is_empty() => {
+                // Only the last handshake flight (or a post-handshake ticket)
+                // was never acknowledged; the connection itself is healthy,
+                // so stop retransmitting rather than fail it.
+                sink.arm_retransmit_timer(None);
             }
             Some(RetransmitOutcome::GiveUp) => {
                 self.fail(sink, AlertDescription::HandshakeFailure, "DTLS handshake timed out (retransmit limit exceeded)");
@@ -783,6 +799,13 @@ impl DtlsRecordEngine {
     /// acknowledges (in order) becomes the write key (RFC 9147 §8).
     fn on_ack<S: DtlsRecordSink + ?Sized>(&mut self, body: &[u8], sink: &mut S) {
         if self.state.pending_writes.is_empty() {
+            // No `KeyUpdate` outstanding: an ACK after the handshake
+            // completed acknowledges the client's final flight (RFC 9147
+            // §5.8.1), so stop retransmitting it.
+            if self.engine.is_complete() {
+                self.retransmit.on_progress();
+                sink.arm_retransmit_timer(None);
+            }
             return;
         }
         let acked = decode_ack(body);
@@ -1379,6 +1402,46 @@ mod tests {
         relay(&mut sink_c, &mut server, &mut sink_s);
         assert_eq!(sink_s.app_data.last().unwrap(), b"rotated");
         assert!(!client.failed && !server.failed);
+    }
+
+    /// The peer's ACK of the client's final flight (Finished) ends its
+    /// retransmission: no timer stays armed and a stray timer fire resends
+    /// nothing.
+    #[test]
+    fn the_peers_ack_of_the_final_flight_stops_client_retransmission() {
+        let (mut sink_c, mut sink_s, mut client, _server) = run_loopback();
+        assert!(sink_c.armed_timeout.is_some(), "Finished is outstanding until acknowledged");
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        assert_eq!(sink_c.armed_timeout, None, "{:?}", sink_c.events);
+        sink_c.outbound.clear();
+        client.feed_timer(&mut sink_c);
+        assert!(sink_c.outbound.is_empty(), "nothing left to resend: {:?}", sink_c.events);
+    }
+
+    /// The client's Finished implicitly acknowledges the server's flight, so
+    /// a completed server has nothing left to retransmit.
+    #[test]
+    fn a_completed_server_does_not_retransmit_its_handshake_flight() {
+        let (_sink_c, mut sink_s, _client, mut server) = run_loopback();
+        sink_s.outbound.clear();
+        server.feed_timer(&mut sink_s);
+        assert!(sink_s.outbound.is_empty(), "{:?}", sink_s.events);
+    }
+
+    /// Even if the ACK of the final flight never arrives, exhausting the
+    /// retransmit budget must not kill a connection whose handshake already
+    /// completed - only an unfinished handshake "times out".
+    #[test]
+    fn exhausting_retransmits_after_the_handshake_does_not_fail_the_connection() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = established();
+        for _ in 0..8 {
+            client.feed_timer(&mut sink_c);
+        }
+        assert!(!client.failed, "{:?}", sink_c.events);
+        sink_c.outbound.clear();
+        client.send_application_data(b"still alive", &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert_eq!(sink_s.app_data, vec![b"still alive".to_vec()], "{:?}", sink_s.events);
     }
 
     #[test]
