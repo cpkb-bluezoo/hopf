@@ -126,6 +126,56 @@ pub const ACCEPTED_CERT_SIGNATURE_SCHEMES: &[u16] = &[
     0x0906, // ML-DSA-87 (SSL_SIGN_MLDSA87)
 ];
 
+/// TLS `SignatureScheme` code for the algorithm `cert`'s own signature was
+/// made with, if it is one of [`ACCEPTED_CERT_SIGNATURE_SCHEMES`]. `None`
+/// for an algorithm this module doesn't verify (e.g. RSA-PSS).
+pub fn cert_signature_scheme(cert: &ParsedCertificate) -> Option<u16> {
+    let oid = sig_alg_oid(&cert.sig_alg_der)?;
+    Some(if oid == OID_RAW_ED25519 {
+        0x0807
+    } else if oid == OID_RAW_ECDSA_SHA256 {
+        0x0403
+    } else if oid == OID_RAW_ECDSA_SHA384 {
+        0x0503
+    } else if oid == OID_RAW_RSA_SHA256 {
+        0x0401
+    } else if oid == OID_RAW_RSA_SHA384 {
+        0x0501
+    } else if oid == OID_RAW_RSA_SHA512 {
+        0x0601
+    } else if oid == OID_RAW_ML_DSA_44 {
+        0x0904
+    } else if oid == OID_RAW_ML_DSA_65 {
+        0x0905
+    } else if oid == OID_RAW_ML_DSA_87 {
+        0x0906
+    } else {
+        return None;
+    })
+}
+
+/// Check a certificate chain about to be sent against the peer's
+/// `signature_algorithms_cert` list (RFC 8446 §4.2.3, applied to TLS 1.2
+/// by RFC 9846 §1.4). Returns the first signature scheme used in the chain
+/// that `peer_offered` does not contain, or `None` if the peer can verify
+/// every signature in it.
+///
+/// A self-signed certificate (same issuer and subject, and its signature
+/// verifies under its own key) is skipped: its signature is never verified
+/// (§4.2.3), so it may use any algorithm. Certificates that fail to parse,
+/// or whose algorithm isn't one this module recognises, are skipped too -
+/// the peer's list can't be applied to a scheme we can't name.
+pub fn chain_scheme_not_offered(chain: &[Bytes], peer_offered: &[u16]) -> Option<u16> {
+    chain.iter().find_map(|der| {
+        let cert = parse_certificate(der)?;
+        if cert.issuer_der == cert.subject_der && verify_cert_signature(&cert, &cert.spki_der) {
+            return None;
+        }
+        let scheme = cert_signature_scheme(&cert)?;
+        (!peer_offered.contains(&scheme)).then_some(scheme)
+    })
+}
+
 /// Verify `cert` was signed by the public key in `issuer_spki`. Accepts
 /// exactly the algorithms in [`ACCEPTED_CERT_SIGNATURE_SCHEMES`] — keep
 /// the two in sync.
@@ -368,6 +418,43 @@ mod tests {
         );
         assert!(verify_cert_signature(&parsed, &parsed.spki_der));
         assert!(matches_hostname(&parsed, "localhost"));
+    }
+
+    /// Leaf (ECDSA P-256) issued by an Ed25519 CA, plus that CA's cert:
+    /// DER for `[leaf, ca]`.
+    fn issued_chain() -> Vec<Bytes> {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let leaf_params = rcgen::CertificateParams::new(vec!["leaf.example".into()]).unwrap();
+        let leaf = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+        vec![Bytes::copy_from_slice(leaf.der()), Bytes::copy_from_slice(ca_cert.der())]
+    }
+
+    #[test]
+    fn cert_signature_scheme_names_the_issuer_algorithm() {
+        let chain = issued_chain();
+        // The leaf is signed by the Ed25519 CA key, whatever its own key type.
+        let leaf = parse_certificate(&chain[0]).unwrap();
+        assert_eq!(cert_signature_scheme(&leaf), Some(0x0807));
+    }
+
+    #[test]
+    fn chain_scheme_not_offered_reports_the_first_missing_scheme() {
+        let chain = issued_chain();
+        assert_eq!(chain_scheme_not_offered(&chain, ACCEPTED_CERT_SIGNATURE_SCHEMES), None);
+        // Peer can verify everything except Ed25519.
+        assert_eq!(chain_scheme_not_offered(&chain, &[0x0403, 0x0503]), Some(0x0807));
+        assert_eq!(chain_scheme_not_offered(&chain, &[]), Some(0x0807));
+    }
+
+    #[test]
+    fn chain_scheme_not_offered_ignores_a_self_signed_certificate() {
+        let chain = issued_chain();
+        // Only the self-signed CA: its signature is never verified.
+        assert_eq!(chain_scheme_not_offered(&chain[1..], &[0x0403]), None);
     }
 
     /// Real WebPKI root/intermediate signatures are routinely ECDSA P-384 or

@@ -1497,6 +1497,22 @@ impl HandshakeEngine {
                 self.fail(sink, AlertDescription::InternalError, "server credentials not configured");
                 return false;
             };
+            // RFC 8446 §4.2.3: when the client lists the certificate
+            // signature algorithms it can verify, don't send it a chain
+            // that needs another. (The RFC only says to continue anyway if
+            // no compatible chain exists; the peer would then reject the
+            // chain, so fail here with a clearer diagnosis instead.) Absent
+            // extension: no constraint is applied.
+            if let Some(offered) = ch.signature_algorithms_cert.as_deref() {
+                if let Some(scheme) = crate::crypto::x509::chain_scheme_not_offered(&creds.cert_chain, offered) {
+                    self.fail(
+                        sink,
+                        AlertDescription::HandshakeFailure,
+                        &format!("server certificate chain is signed with scheme 0x{scheme:04x}, which the client did not list in signature_algorithms_cert"),
+                    );
+                    return false;
+                }
+            }
             if request_client_cert {
                 let cr = build_certificate_request(&[]);
                 self.emit_outgoing(&cr, sink);
@@ -2185,6 +2201,80 @@ mod tests {
             anti_replay: None,
             ..Default::default()
         }
+    }
+
+    /// `[leaf, ca]` credentials: an ECDSA P-256 leaf issued by an Ed25519 CA,
+    /// so the leaf's certificate signature scheme is `ed25519` (0x0807).
+    fn ca_issued_server_credentials() -> ServerCredentials {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .unwrap();
+        ServerCredentials {
+            cert_chain: vec![Bytes::copy_from_slice(leaf.der()), Bytes::copy_from_slice(ca.der())],
+            signing_key_pkcs8: Bytes::from(leaf_key.serialize_der()),
+        }
+    }
+
+    /// Feed a server the client's first flight after rewriting its
+    /// `signature_algorithms_cert` to `offered` (`None` = untouched);
+    /// returns the server's sink.
+    fn server_reply_to_client_offering(
+        creds: ServerCredentials,
+        offered: Option<&[u16]>,
+    ) -> RecordingSink {
+        let mut client_sink = RecordingSink::default();
+        let mut client = HandshakeEngine::new(client_config_with_trust(&creds, KxPolicy::classical_only(), None));
+        client.start(&mut client_sink);
+        let mut server = HandshakeEngine::new(server_config_for(creds, KxPolicy::classical_only()));
+        let mut server_sink = RecordingSink::default();
+        for chunk in take_outbound(&mut client_sink) {
+            let chunk = match offered {
+                Some(schemes) => Bytes::from(super::super::handshake::messages::rewrite_client_hello_sig_algs_cert(&chunk, schemes)),
+                None => chunk,
+            };
+            let mut input = chunk.as_ref();
+            server.feed_handshake_data(&mut input, &mut server_sink);
+        }
+        server_sink
+    }
+
+    fn protocol_errors(sink: &RecordingSink) -> Vec<&String> {
+        sink.events.iter().filter(|e| e.starts_with("protocol_error")).collect()
+    }
+
+    /// RFC 8446 §4.2.3: a client that lists the certificate signature
+    /// algorithms it can verify must not be sent a chain that needs one it
+    /// didn't list.
+    #[test]
+    fn server_rejects_chain_needing_a_scheme_the_client_did_not_offer() {
+        // The leaf is signed with ed25519; the client offers only ECDSA.
+        let sink = server_reply_to_client_offering(ca_issued_server_credentials(), Some(&[0x0403, 0x0503]));
+        let errs = protocol_errors(&sink);
+        assert_eq!(errs.len(), 1, "{:?}", sink.events);
+        assert!(errs[0].contains("signature_algorithms_cert"), "{errs:?}");
+        assert!(sink.alerts.contains(&AlertDescription::HandshakeFailure), "{:?}", sink.alerts);
+    }
+
+    #[test]
+    fn server_sends_chain_when_client_offers_the_scheme_it_needs() {
+        let sink = server_reply_to_client_offering(ca_issued_server_credentials(), Some(&[0x0807]));
+        assert!(protocol_errors(&sink).is_empty(), "{:?}", sink.events);
+        let sink = server_reply_to_client_offering(ca_issued_server_credentials(), None);
+        assert!(protocol_errors(&sink).is_empty(), "{:?}", sink.events);
+    }
+
+    /// A self-signed certificate's signature is never verified (§4.2.3), so
+    /// the client's list can't rule it out.
+    #[test]
+    fn server_ignores_client_scheme_list_for_a_self_signed_chain() {
+        let sink = server_reply_to_client_offering(test_server_credentials(), Some(&[0x0403]));
+        assert!(protocol_errors(&sink).is_empty(), "{:?}", sink.events);
     }
 
     #[test]

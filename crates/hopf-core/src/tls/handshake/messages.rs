@@ -84,8 +84,10 @@ pub mod ext {
     pub const SIGNATURE_ALGORITHMS: u16 = 13;
     /// Signature Algorithms Cert (RFC 8446 §4.2.3 / RFC 9846 §1.4) — which
     /// certificate-chain signature algorithms this engine can verify.
-    /// Always sent, never parsed on receipt — see `tls12/messages.rs`'s
-    /// matching constant and `crypto-migration-plan.md` for why.
+    /// Always sent. A server also reads the client's list and refuses to
+    /// send a chain signed with a scheme outside it (see the engine's
+    /// `on_client_hello`); local chain *verification* stays governed by the
+    /// fixed `ACCEPTED_CERT_SIGNATURE_SCHEMES` allowlist regardless.
     pub const SIGNATURE_ALGORITHMS_CERT: u16 = 0x0032;
     /// Cookie (RFC 8446 §4.2.2) — carried in `HelloRetryRequest`, echoed
     /// verbatim by the client in its followup ClientHello.
@@ -279,8 +281,8 @@ fn build_client_hello_inner(
     }
     {
         // RFC 9846 §1.4: which certificate-chain signature algorithms this
-        // engine can verify — always sent, never parsed on receipt (no
-        // consumer today; see crypto::x509's matching constant).
+        // engine can verify — always sent; see crypto::x509's matching
+        // constant.
         let schemes = crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES;
         let mut bytes = BytesMut::with_capacity(2 * schemes.len());
         for scheme in schemes {
@@ -674,6 +676,47 @@ fn encode_key_share_list(entries: &[KeyShareEntry]) -> Bytes {
     out.freeze()
 }
 
+/// Test helper: rewrite the `signature_algorithms_cert` extension of a
+/// TCP-framed (non-DTLS) `ClientHello` handshake message - TLS 1.3 or
+/// TLS 1.2, they share the layout - to carry exactly `schemes`, fixing up
+/// the handshake and extensions-block lengths. Lets an engine test play a
+/// client that can verify only some chain signature algorithms.
+#[cfg(test)]
+pub(crate) fn rewrite_client_hello_sig_algs_cert(hello: &[u8], schemes: &[u16]) -> Vec<u8> {
+    let mut i = 4 + 2 + 32; // handshake header, legacy_version, random
+    i += 1 + hello[i] as usize; // session id
+    i += 2 + u16::from_be_bytes([hello[i], hello[i + 1]]) as usize; // cipher suites
+    i += 1 + hello[i] as usize; // compression methods
+    let ext_len_at = i;
+    let ext_end = i + 2 + u16::from_be_bytes([hello[i], hello[i + 1]]) as usize;
+    i += 2;
+    let mut body = hello[..ext_len_at].to_vec();
+    let mut exts = Vec::new();
+    let mut found = false;
+    while i < ext_end {
+        let et = u16::from_be_bytes([hello[i], hello[i + 1]]);
+        let el = u16::from_be_bytes([hello[i + 2], hello[i + 3]]) as usize;
+        if et == ext::SIGNATURE_ALGORITHMS_CERT {
+            found = true;
+            exts.extend_from_slice(&et.to_be_bytes());
+            exts.extend_from_slice(&((2 + 2 * schemes.len()) as u16).to_be_bytes());
+            exts.extend_from_slice(&((2 * schemes.len()) as u16).to_be_bytes());
+            for sc in schemes {
+                exts.extend_from_slice(&sc.to_be_bytes());
+            }
+        } else {
+            exts.extend_from_slice(&hello[i..i + 4 + el]);
+        }
+        i += 4 + el;
+    }
+    assert!(found, "ClientHello carries no signature_algorithms_cert");
+    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts);
+    let len = body.len() - 4;
+    body[1..4].copy_from_slice(&(len as u32).to_be_bytes()[1..]);
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -743,10 +786,9 @@ mod tests {
         assert_eq!(parsed.cipher_suites, vec![0x1301, 0x1303]);
     }
 
-    /// `signature_algorithms_cert` (RFC 9846 §1.4) is sent but deliberately
-    /// never parsed by `collect::parse_client_hello` (no consumer — see
-    /// `ext`'s doc comment on this constant), so this scans the raw body
-    /// directly rather than going through the parser.
+    /// `signature_algorithms_cert` (RFC 9846 §1.4) is advertised; scans the
+    /// raw body independently of the parser so the wire encoding itself is
+    /// checked.
     #[test]
     fn client_hello_advertises_signature_algorithms_cert() {
         use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
@@ -791,5 +833,34 @@ mod tests {
             k += el;
         }
         assert_eq!(found, Some(crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES.to_vec()));
+    }
+
+    #[test]
+    fn parse_client_hello_reads_signature_algorithms_cert() {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [7u8; 32],
+            cipher_suites: vec![0x1301],
+            key_share: KeyShareEntry { group: NamedGroup::X25519.code(), share: Bytes::copy_from_slice(&kp.public_key()) },
+            supported_groups: vec![NamedGroup::X25519.code()],
+            alpn: vec![],
+            server_name: None,
+            transport_parameters: None,
+            early_data: false,
+            psk: None,
+            cookie: None,
+            record_size_limit: None,
+            legacy_version: 0x0303,
+        });
+        let parsed = parse_client_hello(&hello.body).expect("parse");
+        assert_eq!(
+            parsed.signature_algorithms_cert,
+            Some(crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES.to_vec())
+        );
+        let wire = hello.encode();
+        let rewritten = rewrite_client_hello_sig_algs_cert(&wire, &[0x0403]);
+        let parsed = parse_client_hello(&rewritten[4..]).expect("parse rewritten");
+        assert_eq!(parsed.signature_algorithms_cert, Some(vec![0x0403]));
     }
 }

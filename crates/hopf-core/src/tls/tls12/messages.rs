@@ -89,8 +89,10 @@ pub mod ext {
     pub const SUPPORTED_VERSIONS: u16 = 43;
     /// Signature Algorithms Cert (RFC 8446 §4.2.3 / RFC 9846 §1.4) — which
     /// certificate-chain signature algorithms this engine can verify.
-    /// Always sent, never parsed on receipt — see `engine.rs`'s module doc
-    /// and `crypto-migration-plan.md` for why.
+    /// Always sent. A server also reads the client's list and refuses to
+    /// send a chain signed with a scheme outside it (see the engine's
+    /// `on_client_hello`); local chain *verification* stays governed by the
+    /// fixed `ACCEPTED_CERT_SIGNATURE_SCHEMES` allowlist regardless.
     pub const SIGNATURE_ALGORITHMS_CERT: u16 = 0x0032;
 }
 
@@ -234,8 +236,8 @@ pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
     }
     push_extension(&mut extensions, ext::SIGNATURE_ALGORITHMS, &encode_u16_prefixed(&sig_alg_bytes));
     // RFC 9846 §1.4: which certificate-chain signature algorithms this
-    // engine can verify — always sent, never parsed on receipt (no
-    // consumer today; see this module's doc and crypto-migration-plan.md).
+    // engine can verify — always sent; see crypto::x509's matching
+    // constant.
     push_extension(
         &mut extensions,
         ext::SIGNATURE_ALGORITHMS_CERT,
@@ -332,6 +334,11 @@ pub struct ParsedClientHello {
     /// honestly rather than pretending it's fully wired in.
     #[allow(dead_code)]
     pub signature_algorithms: Vec<(u8, u8)>,
+    /// Schemes from the client's `signature_algorithms_cert` extension
+    /// (RFC 8446 §4.2.3, applied to TLS 1.2 by RFC 9846 §1.4): the
+    /// certificate-chain signature algorithms it can verify. `None` when
+    /// the extension is absent or malformed.
+    pub signature_algorithms_cert: Option<Vec<u16>>,
     /// SNI hostname, if sent.
     pub server_name: Option<String>,
     /// `SessionTicket` extension contents, if the client sent one: empty
@@ -405,6 +412,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
     i += comp_len;
 
     let mut signature_algorithms = Vec::new();
+    let mut signature_algorithms_cert = None;
     let mut server_name = None;
     let mut session_ticket = None;
     let mut extended_master_secret = false;
@@ -433,6 +441,15 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
                                 signature_algorithms.push((data[m], data[m + 1]));
                                 m += 2;
                             }
+                        }
+                    }
+                    ext::SIGNATURE_ALGORITHMS_CERT => {
+                        if data.len() >= 2
+                            && usize::from(u16::from_be_bytes([data[0], data[1]])) == data.len() - 2
+                            && data.len() % 2 == 0
+                        {
+                            signature_algorithms_cert =
+                                Some(data[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect());
                         }
                     }
                     ext::SERVER_NAME => {
@@ -481,6 +498,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
         session_id,
         cipher_suites,
         signature_algorithms,
+        signature_algorithms_cert,
         server_name,
         session_ticket,
         cookie,
@@ -946,10 +964,9 @@ mod tests {
         assert_eq!(parsed.supported_versions, Some(vec![0xfefd]), "DTLS must advertise 0xfefd, not 0x0303");
     }
 
-    /// `signature_algorithms_cert` (RFC 9846 §1.4) is sent but deliberately
-    /// never parsed by `parse_client_hello` (no consumer — see this
-    /// module's `ext` doc comment), so this scans the raw wire directly
-    /// rather than going through the parser.
+    /// `signature_algorithms_cert` (RFC 9846 §1.4) is advertised; scans the
+    /// raw wire independently of the parser so the wire encoding itself is
+    /// checked.
     #[test]
     fn client_hello_advertises_signature_algorithms_cert() {
         let params = ClientHelloParams {
