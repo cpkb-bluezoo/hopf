@@ -405,8 +405,9 @@ mod role_tests {
 
     #[test]
     fn password_store_role_membership() {
+        let password = generate_nonce_hex(12);
         let store = PasswordStore::new()
-            .with_user("alice", "pw")
+            .with_user("alice", &password)
             .with_role("alice", "webdav:read");
         assert!(store.is_user_in_role("alice", "webdav:read"));
         assert!(!store.is_user_in_role("alice", "webdav:write"));

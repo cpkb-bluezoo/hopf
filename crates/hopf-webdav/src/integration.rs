@@ -713,14 +713,20 @@ fn cache_control_is_sent_on_file_responses_only_when_configured() {
 
 #[test]
 fn acl_options_and_propfind_with_basic_auth() {
+    use hopf_auth::crypto::{encode_base64, generate_nonce_hex};
     use hopf_auth::{PasswordStore, RolePolicy};
     use hopf_http::auth::{BasicAuthConfig, BasicAuthFactory};
 
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
+    let password = generate_nonce_hex(16);
+    let basic_auth = format!(
+        "Basic {}",
+        encode_base64(format!("alice:{password}").as_bytes())
+    );
     let store = Arc::new(
         PasswordStore::new()
-            .with_user("alice", "secret")
+            .with_user("alice", &password)
             .with_role("alice", "webdav:read")
             .with_role("alice", "webdav:write"),
     );
@@ -763,7 +769,9 @@ fn acl_options_and_propfind_with_basic_auth() {
 
     let options = http_exchange(
         addr,
-        "OPTIONS / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\nConnection: close\r\n\r\n",
+        &format!(
+            "OPTIONS / HTTP/1.1\r\nHost: localhost\r\nAuthorization: {basic_auth}\r\nConnection: close\r\n\r\n"
+        ),
     );
     assert!(options.contains("200"), "{options}");
     assert!(
@@ -774,7 +782,7 @@ fn acl_options_and_propfind_with_basic_auth() {
 
     let body = r#"<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:current-user-privilege-set/></D:prop></D:propfind>"#;
     let propfind_req = format!(
-        "PROPFIND /hello.txt HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "PROPFIND /hello.txt HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\nAuthorization: {basic_auth}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -787,7 +795,9 @@ fn acl_options_and_propfind_with_basic_auth() {
 
     let acl = http_exchange(
         addr,
-        "ACL /hello.txt HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\nConnection: close\r\n\r\n",
+        &format!(
+            "ACL /hello.txt HTTP/1.1\r\nHost: localhost\r\nAuthorization: {basic_auth}\r\nConnection: close\r\n\r\n"
+        ),
     );
     assert!(acl.contains("403"), "{acl}");
 
