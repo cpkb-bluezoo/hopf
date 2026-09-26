@@ -354,13 +354,17 @@ impl QuicConnectConfig {
     }
 }
 
-/// TLS options (early data / 0-RTT).
-#[derive(Debug, Clone, Copy)]
+/// TLS options (early data / 0-RTT, key-exchange groups).
+#[derive(Debug, Clone)]
 pub struct QuicTlsOptions {
     /// Offer / accept TLS 1.3 early data (0-RTT).
     pub enable_early_data: bool,
     /// Server max early data size.
     pub max_early_data_size: u32,
+    /// Key-exchange group preference (RFC 8446 `supported_groups` /
+    /// `key_share`). Defaults to [`KxPolicy::classical_only`]; see
+    /// [`QuicTlsOptions::with_kx_policy`].
+    pub kx_policy: KxPolicy,
 }
 
 impl Default for QuicTlsOptions {
@@ -368,6 +372,7 @@ impl Default for QuicTlsOptions {
         Self {
             enable_early_data: false,
             max_early_data_size: 0,
+            kx_policy: KxPolicy::classical_only(),
         }
     }
 }
@@ -383,6 +388,29 @@ impl QuicTlsOptions {
         self.enable_early_data = true;
         self.max_early_data_size = u32::MAX;
         self
+    }
+
+    /// Select the key-exchange group preference.
+    ///
+    /// The default is [`KxPolicy::classical_only`] (X25519), which every
+    /// QUIC peer supports and which keeps the ClientHello small. A hybrid
+    /// policy such as [`KxPolicy::pqc_first`] offers the RFC 10024 hybrid
+    /// ML-KEM groups (`X25519MLKEM768` first) with X25519 as a fallback,
+    /// protecting recorded traffic against a future quantum adversary. The
+    /// trade-off is a ClientHello carrying a ~1.2 KiB ML-KEM key share,
+    /// which no longer fits a single 1200-byte Initial datagram, so the
+    /// handshake needs a second client Initial packet (one extra datagram,
+    /// no extra round trip). Both peers must opt in for a hybrid group to
+    /// be negotiated; otherwise the handshake falls back to X25519.
+    pub fn with_kx_policy(mut self, kx_policy: KxPolicy) -> Self {
+        self.kx_policy = kx_policy;
+        self
+    }
+
+    /// Shorthand for [`QuicTlsOptions::with_kx_policy`] with
+    /// [`KxPolicy::pqc_first`].
+    pub fn with_pqc(self) -> Self {
+        self.with_kx_policy(KxPolicy::pqc_first())
     }
 
     /// Opt in to early data with an explicit server byte cap.
@@ -497,7 +525,7 @@ pub fn client_config_from_pem_with(
     }
     let params = HopfTlsBuildParams {
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-        kx_policy: KxPolicy::classical_only(),
+        kx_policy: tls.kx_policy.clone(),
         server_name: None,
         trust_store: Some(trust),
         server: None,
@@ -524,7 +552,7 @@ pub fn client_config_public_trust_with(
 ) -> io::Result<Arc<QuicClientConfig>> {
     let params = HopfTlsBuildParams {
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-        kx_policy: KxPolicy::classical_only(),
+        kx_policy: tls.kx_policy.clone(),
         server_name: None,
         trust_store: Some(hopf_core::crypto::trust::public_trust_store()),
         server: None,
@@ -633,7 +661,7 @@ pub fn client_config_for_pem_bytes_with_hopf(
     // here breaks certs minted for other names).
     let params = HopfTlsBuildParams {
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-        kx_policy: KxPolicy::classical_only(),
+        kx_policy: tls.kx_policy.clone(),
         server_name: None,
         trust_store: Some(trust),
         server: None,

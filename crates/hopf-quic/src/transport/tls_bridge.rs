@@ -45,6 +45,8 @@ pub struct TlsBridgeEvents {
     pub peer_tp: Option<Bytes>,
     /// Handshake finished + security info.
     pub complete: Option<SecurityInfo>,
+    /// Key-exchange group codepoint negotiated for this handshake.
+    pub negotiated_group: Option<u16>,
     /// Protocol failure.
     pub failed: Option<String>,
     /// Current space for new outbound CRYPTO (updated as handshake progresses).
@@ -103,7 +105,9 @@ impl TlsEventSink for Sink<'_> {
         self.events.early_keys = Some(client_early);
     }
 
-    fn key_exchange_group_negotiated(&mut self, _group: u16) {}
+    fn key_exchange_group_negotiated(&mut self, group: u16) {
+        self.events.negotiated_group = Some(group);
+    }
 
     fn early_data_accepted(&mut self, accepted: bool) {
         self.events.early_data_accepted = Some(accepted);
@@ -259,5 +263,80 @@ mod tests {
         let (a, b) = split_server_hello(&buf).unwrap();
         assert_eq!(a.as_ref(), &sh);
         assert_eq!(b.as_ref(), &rest);
+    }
+
+    /// Run a full in-memory QUIC-mode handshake and return the key-exchange
+    /// group codepoint each side saw negotiated.
+    fn handshake_groups(
+        client_tls: crate::config::QuicTlsOptions,
+        server_tls: crate::config::QuicTlsOptions,
+    ) -> (Option<u16>, Option<u16>) {
+        use crate::config::{client_config_for_pem_bytes_with, server_config_self_signed_with};
+        let alpn: &[&[u8]] = &[b"hq-interop"];
+        let (server_cfg, pem) =
+            server_config_self_signed_with(&["localhost"], alpn, server_tls).unwrap();
+        let client_cfg = client_config_for_pem_bytes_with(&pem, alpn, client_tls).unwrap();
+        let tp = TransportParameters::default();
+
+        let mut chs = client_cfg.transport().handshake;
+        chs.server_name = Some("localhost".into());
+        let (mut client, ev) = TlsBridge::start_client(chs, &tp);
+        let mut server = TlsBridge::start_server(server_cfg.transport().handshake, &tp);
+
+        let mut client_group = ev.negotiated_group;
+        let mut server_group = None;
+        let mut to_server: Vec<u8> = ev.outbound.iter().flat_map(|o| o.data.to_vec()).collect();
+        for _ in 0..8 {
+            let mut to_client = Vec::new();
+            if !to_server.is_empty() {
+                let ev = server.feed_crypto(SpaceId::Initial, &to_server);
+                assert!(ev.failed.is_none(), "server: {:?}", ev.failed);
+                server_group = server_group.or(ev.negotiated_group);
+                to_client.extend(ev.outbound.iter().flat_map(|o| o.data.to_vec()));
+            }
+            to_server = Vec::new();
+            if !to_client.is_empty() {
+                let ev = client.feed_crypto(SpaceId::Initial, &to_client);
+                assert!(ev.failed.is_none(), "client: {:?}", ev.failed);
+                client_group = client_group.or(ev.negotiated_group);
+                to_server.extend(ev.outbound.iter().flat_map(|o| o.data.to_vec()));
+            }
+            if client.is_complete() && server.is_complete() {
+                break;
+            }
+        }
+        assert!(client.is_complete() && server.is_complete(), "handshake incomplete");
+        (client_group, server_group)
+    }
+
+    #[test]
+    fn quic_handshake_negotiates_hybrid_group_when_both_offer_pqc() {
+        use crate::config::QuicTlsOptions;
+        use hopf_core::crypto::kx::NamedGroup;
+        use hopf_core::crypto::kx_policy::KxPolicy;
+        let tls = QuicTlsOptions::new().with_kx_policy(KxPolicy::pqc_first());
+        let (c, s) = handshake_groups(tls.clone(), tls);
+        assert_eq!(c, Some(NamedGroup::X25519MLKEM768.code()));
+        assert_eq!(s, Some(NamedGroup::X25519MLKEM768.code()));
+    }
+
+    #[test]
+    fn quic_handshake_falls_back_to_classical_when_client_offers_no_pqc() {
+        use crate::config::QuicTlsOptions;
+        use hopf_core::crypto::kx::NamedGroup;
+        use hopf_core::crypto::kx_policy::KxPolicy;
+        let server = QuicTlsOptions::new().with_kx_policy(KxPolicy::pqc_first());
+        let (c, s) = handshake_groups(QuicTlsOptions::new(), server);
+        assert_eq!(c, Some(NamedGroup::X25519.code()));
+        assert_eq!(s, Some(NamedGroup::X25519.code()));
+    }
+
+    #[test]
+    fn quic_handshake_default_stays_classical() {
+        use crate::config::QuicTlsOptions;
+        use hopf_core::crypto::kx::NamedGroup;
+        let (c, s) = handshake_groups(QuicTlsOptions::new(), QuicTlsOptions::new());
+        assert_eq!(c, Some(NamedGroup::X25519.code()));
+        assert_eq!(s, Some(NamedGroup::X25519.code()));
     }
 }
