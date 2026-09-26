@@ -20,6 +20,76 @@ mod ticket_keys;
 // reachable via the full path, none of which `tls/mod.rs`'s own `pub use`
 // list re-exports today.
 pub(crate) mod tls12;
+mod negotiating;
+mod tcp_version_policy;
+pub(crate) mod version_pick;
+
+pub use tcp_version_policy::TcpTlsVersionPolicy;
+
+/// Opaque handle for in-handshake TLS version negotiation (see [`TlsVariant::Negotiating`]).
+pub struct NegotiatingTls(Box<negotiating::NegotiatingTls>);
+
+impl NegotiatingTls {
+    pub(crate) fn new(inner: negotiating::NegotiatingTls) -> Self {
+        Self(Box::new(inner))
+    }
+
+    fn inner(&self) -> &negotiating::NegotiatingTls {
+        &self.0
+    }
+
+    fn inner_mut(&mut self) -> &mut negotiating::NegotiatingTls {
+        &mut self.0
+    }
+
+    pub(crate) fn start<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S) {
+        self.inner_mut().start(sink);
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.inner().is_complete()
+    }
+
+    pub(crate) fn set_alpn(&mut self, protocols: &[&[u8]]) -> bool {
+        self.inner_mut().set_alpn(protocols)
+    }
+
+    pub(crate) fn set_require_supported_versions(&mut self, required: bool) -> bool {
+        self.inner_mut().set_require_supported_versions(required)
+    }
+
+    pub(crate) fn set_record_size_limit(&mut self, limit: Option<u16>) -> bool {
+        self.inner_mut().set_record_size_limit(limit)
+    }
+
+    pub(crate) fn set_ech_client(&mut self, config: ech::EchClientConfig) -> bool {
+        self.inner_mut().set_ech_client(config)
+    }
+
+    pub(crate) fn set_ech_server(&mut self, config: std::sync::Arc<ech::EchServerConfig>) -> bool {
+        self.inner_mut().set_ech_server(config)
+    }
+
+    pub(crate) fn feed_ciphertext<S: TlsRecordSink + ?Sized>(&mut self, input: &mut &[u8], sink: &mut S) {
+        self.inner_mut().feed_ciphertext(input, sink);
+    }
+
+    pub(crate) fn send_application_data<S: TlsRecordSink + ?Sized>(&mut self, plaintext: &[u8], sink: &mut S) {
+        self.inner_mut().send_application_data(plaintext, sink);
+    }
+
+    pub(crate) fn feed_verification_result<S: TlsRecordSink + ?Sized>(
+        &mut self,
+        result: VerifyResult,
+        sink: &mut S,
+    ) {
+        self.inner_mut().feed_verification_result(result, sink);
+    }
+
+    pub(crate) fn send_close_notify<S: TlsRecordSink + ?Sized>(&mut self, sink: &mut S) {
+        self.inner_mut().send_close_notify(sink);
+    }
+}
 
 pub use engine::{
     ClientAuthPolicy, HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole,
@@ -38,6 +108,7 @@ pub use pem::{
     connector_from_pem_tls12, connector_from_pem_tls12_with_client_cert,
     connector_from_pem_with_client_cert, connector_with_alpn, connector_with_record_size_limit,
     connector_with_verify_override, acceptor_requiring_supported_versions, acceptor_with_alpn, acceptor_with_record_size_limit, acceptor_with_ech, connector_with_ech, insecure_connector,
+    acceptor_from_pem_with_tcp_version_policy, connector_from_pem_with_tcp_version_policy,
     insecure_connector_tls12, public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor,
     SharedTlsConnector, TlsAcceptor, TlsConnector,
 };
@@ -60,6 +131,8 @@ pub enum TlsVariant {
     V13(TlsRecordEngine),
     /// TLS 1.2 (legacy mail/FTPS interop; ECDHE + GCM only for now).
     V12(Tls12RecordEngine),
+    /// TCP only: buffer the first handshake flight, pick 1.2 vs 1.3, then delegate.
+    Negotiating(NegotiatingTls),
 }
 
 impl TlsVariant {
@@ -68,6 +141,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.start(sink),
             TlsVariant::V12(e) => e.start(sink),
+            TlsVariant::Negotiating(n) => n.start(sink),
         }
     }
 
@@ -76,6 +150,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.is_complete(),
             TlsVariant::V12(e) => e.is_complete(),
+            TlsVariant::Negotiating(n) => n.is_complete(),
         }
     }
 
@@ -89,6 +164,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.set_alpn(list),
             TlsVariant::V12(e) => e.set_alpn(list),
+            TlsVariant::Negotiating(n) => n.set_alpn(protocols),
         }
     }
 
@@ -101,6 +177,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(_) => false,
             TlsVariant::V12(e) => e.set_require_supported_versions(required),
+            TlsVariant::Negotiating(n) => n.set_require_supported_versions(required),
         }
     }
 
@@ -112,6 +189,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.set_record_size_limit(limit),
             TlsVariant::V12(_) => false,
+            TlsVariant::Negotiating(n) => n.set_record_size_limit(limit),
         }
     }
 
@@ -123,6 +201,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.set_ech_client(Some(config)),
             TlsVariant::V12(_) => false,
+            TlsVariant::Negotiating(n) => n.set_ech_client(config),
         }
     }
 
@@ -132,6 +211,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.set_ech_server(Some(config)),
             TlsVariant::V12(_) => false,
+            TlsVariant::Negotiating(n) => n.set_ech_server(config),
         }
     }
 
@@ -140,6 +220,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.feed_ciphertext(input, sink),
             TlsVariant::V12(e) => e.feed_ciphertext(input, sink),
+            TlsVariant::Negotiating(n) => n.feed_ciphertext(input, sink),
         }
     }
 
@@ -148,6 +229,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.send_application_data(plaintext, sink),
             TlsVariant::V12(e) => e.send_application_data(plaintext, sink),
+            TlsVariant::Negotiating(n) => n.send_application_data(plaintext, sink),
         }
     }
 
@@ -156,6 +238,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.feed_verification_result(result, sink),
             TlsVariant::V12(e) => e.feed_verification_result(result, sink),
+            TlsVariant::Negotiating(n) => n.feed_verification_result(result, sink),
         }
     }
 
@@ -164,6 +247,7 @@ impl TlsVariant {
         match self {
             TlsVariant::V13(e) => e.send_close_notify(sink),
             TlsVariant::V12(e) => e.send_close_notify(sink),
+            TlsVariant::Negotiating(n) => n.send_close_notify(sink),
         }
     }
 }

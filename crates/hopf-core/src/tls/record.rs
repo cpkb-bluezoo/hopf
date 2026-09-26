@@ -409,6 +409,11 @@ impl TlsRecordEngine {
         self.engine.is_complete()
     }
 
+    /// See [`HandshakeEngine::client_hello_outbound_wire`].
+    pub(crate) fn client_hello_outbound_wire(&self) -> Option<Bytes> {
+        self.engine.client_hello_outbound_wire()
+    }
+
     /// Set the ALPN protocol names (RFC 7301); see [`HandshakeConfig::alpn`].
     /// Must be called before [`Self::start`]; returns whether it took effect.
     pub fn set_alpn(&mut self, protocols: Vec<Bytes>) -> bool {

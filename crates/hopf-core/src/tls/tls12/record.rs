@@ -325,6 +325,10 @@ impl Tls12RecordEngine {
         self.engine.is_complete()
     }
 
+    pub(crate) fn engine_mut(&mut self) -> &mut Tls12Engine {
+        &mut self.engine
+    }
+
     /// Consume raw bytes off the TCP stream.
     pub fn feed_ciphertext<S: Tls12RecordSink + ?Sized>(&mut self, input: &mut &[u8], sink: &mut S) {
         self.inbound.extend_from_slice(input);

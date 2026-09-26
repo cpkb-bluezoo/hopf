@@ -12,12 +12,21 @@
 //!
 //! ```ignore
 //! let rt = Runtime::start(Default::default())?;
-//! // Server: an engine per peer, built by the acceptor.
+//! // Server: an engine per peer, built by the acceptor (1.3-only shown).
 //! let socket = listen(rt.pick_worker(), udp_socket, Arc::new(move |peer| {
 //!     DtlsEngine::V13(DtlsRecordEngine::new(server_config(peer)))
 //! }), Box::new(MyObserver), DtlsSocketConfig::default())?;
 //! socket.send(peer, b"hello")?; // once `established` has fired for `peer`
 //! ```
+//!
+//! # TLS 1.2 vs 1.3
+//!
+//! For one UDP listener that accepts both DTLS 1.3 and 1.2 clients, use
+//! [`crate::dtls::dtls_server_engine`] with [`crate::dtls::DtlsServerMaterial`] and
+//! [`crate::dtls::DtlsVersionPolicy::Negotiate`] (the default). Clients use
+//! [`crate::dtls::dtls_client_engine`] with the same policy. The acceptor closure
+//! can be `|peer| dtls_server_engine(material.clone(), peer)`. There is no
+//! mid-session version switch after the first flight.
 //!
 //! # Model
 //!
@@ -78,6 +87,8 @@ pub enum DtlsEngine {
     V13(DtlsRecordEngine),
     /// DTLS 1.2 (RFC 6347).
     V12(Dtls12RecordEngine),
+    /// Pick 1.2 vs 1.3 from the first handshake flight ([`crate::dtls::DtlsVersionPolicy`]).
+    Negotiating(super::negotiating::NegotiatingDtls),
 }
 
 impl From<DtlsRecordEngine> for DtlsEngine {
@@ -97,6 +108,7 @@ impl DtlsEngine {
         match self {
             Self::V13(e) => e.start(sink),
             Self::V12(e) => e.start(sink),
+            Self::Negotiating(n) => n.start(sink),
         }
     }
 
@@ -104,6 +116,7 @@ impl DtlsEngine {
         match self {
             Self::V13(e) => e.feed_datagram(data, sink),
             Self::V12(e) => e.feed_datagram(data, sink),
+            Self::Negotiating(n) => n.feed_datagram(data, sink),
         }
     }
 
@@ -111,6 +124,7 @@ impl DtlsEngine {
         match self {
             Self::V13(e) => e.feed_timer(sink),
             Self::V12(e) => e.feed_timer(sink),
+            Self::Negotiating(n) => n.feed_timer(sink),
         }
     }
 
@@ -118,6 +132,7 @@ impl DtlsEngine {
         match self {
             Self::V13(e) => e.send_application_data(data, sink),
             Self::V12(e) => e.send_application_data(data, sink),
+            Self::Negotiating(n) => n.send_application_data(data, sink),
         }
     }
 
@@ -125,6 +140,7 @@ impl DtlsEngine {
         match self {
             Self::V13(e) => e.feed_verification_result(result, sink),
             Self::V12(e) => e.feed_verification_result(result, sink),
+            Self::Negotiating(n) => n.feed_verification_result(result, sink),
         }
     }
 
@@ -132,6 +148,7 @@ impl DtlsEngine {
         match self {
             Self::V13(e) => e.send_close_notify(sink),
             Self::V12(e) => e.send_close_notify(sink),
+            Self::Negotiating(n) => n.send_close_notify(sink),
         }
     }
 
@@ -140,6 +157,7 @@ impl DtlsEngine {
         match self {
             Self::V13(e) => e.is_complete(),
             Self::V12(e) => e.is_complete(),
+            Self::Negotiating(n) => n.is_complete(),
         }
     }
 }
@@ -721,6 +739,66 @@ mod tests {
         expect_data(&s_rx, b"still fine");
 
         client.close();
+        server.close();
+        rt.shutdown();
+    }
+
+    #[test]
+    fn negotiating_acceptor_handles_dtls13_and_dtls12_clients() {
+        let rt = Runtime::start(Default::default()).unwrap();
+        let (creds, trust) = creds();
+        let material = crate::dtls::DtlsServerMaterial {
+            creds: creds.clone(),
+            kx_policy: KxPolicy::classical_only(),
+            version_policy: crate::dtls::DtlsVersionPolicy::Negotiate,
+            cookie_secret: [0; 32],
+            require_cookie: false,
+        };
+        let acceptor: Arc<dyn DtlsAcceptor> = Arc::new(move |peer| crate::dtls::dtls_server_engine(material.clone(), peer));
+        let (s_obs, s_rx) = observer();
+        let server = listen(rt.pick_worker(), udp(), acceptor, s_obs, DtlsSocketConfig::default()).unwrap();
+
+        let (c_obs, c_rx) = observer();
+        let client13 = connect(
+            rt.pick_worker(),
+            udp(),
+            server.local_addr(),
+            crate::dtls::dtls_client_engine("localhost", trust.clone(), KxPolicy::classical_only(), crate::dtls::DtlsVersionPolicy::Negotiate),
+            c_obs,
+            DtlsSocketConfig::default(),
+        )
+        .unwrap();
+        expect_established(&s_rx);
+        expect_established(&c_rx);
+        client13.send(server.local_addr(), b"v13").unwrap();
+        expect_data(&s_rx, b"v13");
+        client13.close();
+
+        let (c_obs, c_rx) = observer();
+        let client12 = connect(
+            rt.pick_worker(),
+            udp(),
+            server.local_addr(),
+            DtlsEngine::V12(Dtls12RecordEngine::new(Dtls12Config {
+                base: Tls12Config {
+                    role: Tls12Role::Client,
+                    server_name: Some("localhost".into()),
+                    trust_store: Some(trust),
+                    ..Default::default()
+                },
+                require_cookie: false,
+                cookie_secret: [0; 32],
+                cookie_binding: Bytes::new(),
+            })),
+            c_obs,
+            DtlsSocketConfig::default(),
+        )
+        .unwrap();
+        expect_established(&s_rx);
+        expect_established(&c_rx);
+        client12.send(server.local_addr(), b"v12").unwrap();
+        expect_data(&s_rx, b"v12");
+        client12.close();
         server.close();
         rt.shutdown();
     }

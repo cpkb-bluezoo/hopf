@@ -63,6 +63,7 @@ const COOKIE_LEN: usize = 16;
 
 /// Config for [`Dtls12RecordEngine`] — every field [`Tls12Config`] has,
 /// plus the cookie policy [`Tls12Config`] has no concept of.
+#[derive(Clone)]
 pub struct Dtls12Config {
     /// Base TLS 1.2 config (role, credentials, trust, ticket, client-auth
     /// policy). Its `dtls`/`cookie` fields are managed internally by this
@@ -249,6 +250,30 @@ impl Dtls12RecordEngine {
             failed: false,
             client_hello_random: None,
         }
+    }
+
+    /// Client role: `ClientHello` already sent on the wire by a version-negotiating
+    /// connector; continue from the next epoch-0 sequence number.
+    pub(crate) fn client_continue_after_sent_client_hello(
+        &mut self,
+        handshake_wire: &[u8],
+        next_plaintext_seq: u64,
+    ) {
+        if self.base.role != Role::Client || handshake_wire.len() < 4 + 34 {
+            return;
+        }
+        let body = &handshake_wire[4..];
+        let mut random = [0u8; 32];
+        random.copy_from_slice(&body[2..34]);
+        self.client_hello_random = Some(random);
+        self.state.write.set_next_seq(next_plaintext_seq);
+        let mut cfg = self.base.clone();
+        cfg.dtls = true;
+        cfg.cookie = Bytes::new();
+        cfg.fixed_client_random = Some(random);
+        let mut engine = Tls12Engine::new(cfg);
+        engine.client_note_client_hello_sent(handshake_wire);
+        self.engine = Some(engine);
     }
 
     /// Begin the handshake — client sends `ClientHello1`; server waits.

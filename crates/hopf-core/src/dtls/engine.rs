@@ -428,6 +428,16 @@ impl DtlsRecordEngine {
         self.engine.is_complete()
     }
 
+    /// Epoch-0 plaintext write sequence after the next record would use.
+    pub(crate) fn plaintext_write_seq(&self) -> u64 {
+        self.state.plaintext_write_seq
+    }
+
+    /// Handshake bytes of the outbound `ClientHello` after [`Self::start`] on a client.
+    pub(crate) fn client_hello_outbound_wire(&self) -> Option<bytes::Bytes> {
+        self.engine.client_hello_outbound_wire()
+    }
+
     /// The `record_size_limit` (RFC 8449) limits in force, once both sides
     /// have sent the extension; `None` before that or if either omitted it.
     pub fn record_size_limits(&self) -> Option<RecordSizeLimits> {

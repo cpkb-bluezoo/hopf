@@ -1040,6 +1040,7 @@ mod tests {
             record_size_limit: None,
             legacy_version: 0x0303,
             compress_certificate: false,
+            offer_tls12_fallback: false,
         });
         let wire = hello.encode();
         let split = wire.len() / 2;

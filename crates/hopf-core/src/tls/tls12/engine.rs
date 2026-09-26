@@ -749,6 +749,15 @@ impl Tls12Engine {
         sink.handshake_data_ready(wire);
     }
 
+    /// Client role: `ClientHello` already sent by a version-negotiating connector.
+    pub(crate) fn client_note_client_hello_sent(&mut self, wire: &[u8]) {
+        if self.config.role != Role::Client || self.state != State::Initial {
+            return;
+        }
+        self.hash_message(wire, true);
+        self.state = State::ExpectServerHello;
+    }
+
     // ---- client ----
 
     fn on_server_hello<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {

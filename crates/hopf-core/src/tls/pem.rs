@@ -1,9 +1,18 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! PEM-loaded TLS 1.3 acceptors/connectors on the in-tree [`TlsRecordEngine`]
-//! (TCP TLS / STARTTLS) — the Phase 4 replacement for `hopf-tls`'s rustls-backed
+//! PEM-loaded TLS acceptors/connectors on the in-tree record engines (TCP TLS /
+//! STARTTLS) — the Phase 4 replacement for `hopf-tls`'s rustls-backed
 //! equivalents. Only PKCS#8 private keys are supported (`BEGIN PRIVATE KEY`);
 //! re-encode legacy PKCS#1/SEC1 PEM with e.g. `openssl pkcs8 -topk8 -nocrypt`.
+//!
+//! **Version policy:** [`acceptor_from_pem`] and [`connector_from_pem`] default to
+//! [`TcpTlsVersionPolicy::Negotiate`]: one TCP connection picks TLS 1.3 vs 1.2 from
+//! the first handshake flight (prefer 1.3). Pin with
+//! [`acceptor_from_pem_with_tcp_version_policy`] /
+//! [`connector_from_pem_with_tcp_version_policy`], or the `*_tls12` helpers for
+//! 1.2-only. UDP DTLS uses the same policy type as [`crate::dtls::DtlsVersionPolicy`]
+//! via [`crate::dtls::dtls_server_engine`] / [`crate::dtls::dtls_client_engine`].
+//! QUIC remains TLS 1.3 only.
 
 use std::collections::HashMap;
 use std::io::{self, ErrorKind};
@@ -12,15 +21,15 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::crypto::kx_policy::KxPolicy;
 use crate::pem::{parse_certs, parse_pkcs8_keys};
 use crate::crypto::trust::{public_trust_store, TrustStore};
 
 use super::engine::{
-    ClientAuthPolicy, HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials,
-    ServerCredentialsResolver, VerifyOverride,
+    handshake_config_tcp_record_layer, ClientAuthPolicy, HandshakeConfig, HandshakeRole,
+    ServerCredentials, ServerCredentialsResolver, VerifyOverride,
 };
-use super::handshake::DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS;
+use super::negotiating::{NegotiatingTls, ServerTlsMaterial};
+use super::TcpTlsVersionPolicy;
 use super::record::TlsRecordEngine;
 use super::tls12;
 use super::TlsVariant;
@@ -219,24 +228,7 @@ pub fn connector_with_ech(
 }
 
 fn base_config(role: HandshakeRole, alpn: &[&[u8]]) -> HandshakeConfig {
-    HandshakeConfig {
-        role,
-        mode: HandshakeMode::TcpRecordLayer,
-        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-        server_name: None,
-        server: None,
-        kx_policy: KxPolicy::default(),
-        local_transport_parameters: None,
-        trust_store: None,
-        verify_override: None,
-        enable_early_data: false,
-        max_early_data_size: 0,
-        max_early_data_freshness_ms: DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
-        ticket_key: None,
-        ticket_store: None,
-        anti_replay: None,
-        ..Default::default()
-    }
+    handshake_config_tcp_record_layer(role, alpn)
 }
 
 fn load_certs(path: &Path) -> io::Result<Vec<Bytes>> {
@@ -280,28 +272,43 @@ struct PemAcceptor {
     alpn: Vec<Bytes>,
     client_auth: ClientAuthPolicy,
     client_trust_store: Option<TrustStore>,
+    version_policy: TcpTlsVersionPolicy,
 }
 
 impl TlsAcceptor for PemAcceptor {
     fn accept(&self) -> TlsVariant {
-        let mut config = base_config(HandshakeRole::Server, &[]);
-        config.alpn = self.alpn.clone();
-        config.server = Some(self.creds.clone());
-        config.client_auth = self.client_auth;
-        config.client_trust_store = self.client_trust_store.clone();
-        TlsVariant::V13(TlsRecordEngine::new(config))
+        ServerTlsMaterial {
+            creds: Some(self.creds.clone()),
+            alpn: self.alpn.clone(),
+            client_auth: self.client_auth,
+            client_trust_store: self.client_trust_store.clone(),
+            server_resolver: None,
+            version_policy: self.version_policy,
+        }
+        .into_variant()
     }
 }
 
 /// Build a [`SharedTlsAcceptor`] from PEM cert-chain and PKCS#8 key files.
 /// `alpn` entries are protocol names such as `b"h2"` and `b"http/1.1"`.
 pub fn acceptor_from_pem(cert_path: &Path, key_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTlsAcceptor> {
+    acceptor_from_pem_with_tcp_version_policy(cert_path, key_path, alpn, TcpTlsVersionPolicy::Negotiate)
+}
+
+/// Like [`acceptor_from_pem`], but pin which TLS versions this listener accepts.
+pub fn acceptor_from_pem_with_tcp_version_policy(
+    cert_path: &Path,
+    key_path: &Path,
+    alpn: &[&[u8]],
+    version_policy: TcpTlsVersionPolicy,
+) -> io::Result<SharedTlsAcceptor> {
     let creds = server_credentials_from_pem(cert_path, key_path)?;
     Ok(Arc::new(PemAcceptor {
         creds,
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
         client_auth: ClientAuthPolicy::None,
         client_trust_store: None,
+        version_policy,
     }))
 }
 
@@ -311,24 +318,29 @@ struct SniAcceptor {
     alpn: Vec<Bytes>,
     client_auth: ClientAuthPolicy,
     client_trust_store: Option<TrustStore>,
+    version_policy: TcpTlsVersionPolicy,
 }
 
 impl TlsAcceptor for SniAcceptor {
     fn accept(&self) -> TlsVariant {
-        let mut config = base_config(HandshakeRole::Server, &[]);
-        config.alpn = self.alpn.clone();
-        config.client_auth = self.client_auth;
-        config.client_trust_store = self.client_trust_store.clone();
         let by_name = Arc::clone(&self.by_name);
         let default = self.default.clone();
         // SNI isn't known until the `ClientHello` arrives, well after
         // `accept()` returns — the actual per-hostname lookup happens
         // inside the engine at credential-selection time, not here.
-        config.server_resolver = Some(ServerCredentialsResolver(Arc::new(move |sni: Option<&str>| {
+        let server_resolver = ServerCredentialsResolver(Arc::new(move |sni: Option<&str>| {
             let creds = sni.and_then(|name| by_name.get(name)).unwrap_or(&default);
             Some(creds.clone())
-        })));
-        TlsVariant::V13(TlsRecordEngine::new(config))
+        }));
+        ServerTlsMaterial {
+            creds: None,
+            alpn: self.alpn.clone(),
+            client_auth: self.client_auth,
+            client_trust_store: self.client_trust_store.clone(),
+            server_resolver: Some(server_resolver),
+            version_policy: self.version_policy,
+        }
+        .into_variant()
     }
 }
 
@@ -351,6 +363,7 @@ pub fn acceptor_from_pem_with_sni(
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
         client_auth: ClientAuthPolicy::None,
         client_trust_store: None,
+        version_policy: TcpTlsVersionPolicy::Negotiate,
     }))
 }
 
@@ -374,6 +387,7 @@ pub fn acceptor_from_pem_with_client_auth(
         alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
         client_auth: policy,
         client_trust_store: Some(trust),
+        version_policy: TcpTlsVersionPolicy::Negotiate,
     }))
 }
 
@@ -382,18 +396,65 @@ struct TrustedConnector {
     verify_override: Option<VerifyOverride>,
     alpn: Vec<Bytes>,
     client_credentials: Option<ServerCredentials>,
+    version_policy: TcpTlsVersionPolicy,
 }
 
 impl TlsConnector for TrustedConnector {
     fn connect(&self, server_name: &str) -> io::Result<TlsVariant> {
-        let mut config = base_config(HandshakeRole::Client, &[]);
-        config.alpn = self.alpn.clone();
-        config.server_name = Some(server_name.to_string());
-        config.trust_store = self.trust_store.clone();
-        config.verify_override = self.verify_override.clone();
-        config.client_credentials = self.client_credentials.clone();
-        Ok(TlsVariant::V13(TlsRecordEngine::new(config)))
+        let mut config_v13 = base_config(HandshakeRole::Client, &[]);
+        config_v13.alpn = self.alpn.clone();
+        config_v13.server_name = Some(server_name.to_string());
+        config_v13.trust_store = self.trust_store.clone();
+        config_v13.verify_override = self.verify_override.clone();
+        config_v13.client_credentials = self.client_credentials.clone();
+        match self.version_policy {
+            TcpTlsVersionPolicy::Negotiate => {
+                config_v13.offer_tls12_fallback = true;
+                let config_v12 = tls12::engine::Config {
+                    role: tls12::engine::Role::Client,
+                    server_name: Some(server_name.to_string()),
+                    trust_store: self.trust_store.clone(),
+                    alpn: self.alpn.clone(),
+                    client_credentials: self.client_credentials.clone(),
+                    ..Default::default()
+                };
+                Ok(TlsVariant::Negotiating(crate::tls::NegotiatingTls::new(
+                    NegotiatingTls::client(config_v13, config_v12, self.version_policy),
+                )))
+            }
+            TcpTlsVersionPolicy::Tls13Only => {
+                config_v13.offer_tls12_fallback = false;
+                Ok(TlsVariant::V13(TlsRecordEngine::new(config_v13)))
+            }
+            TcpTlsVersionPolicy::Tls12Only => {
+                let config = tls12::engine::Config {
+                    role: tls12::engine::Role::Client,
+                    server_name: Some(server_name.to_string()),
+                    trust_store: self.trust_store.clone(),
+                    alpn: self.alpn.clone(),
+                    client_credentials: self.client_credentials.clone(),
+                    ..Default::default()
+                };
+                Ok(TlsVariant::V12(tls12::record::Tls12RecordEngine::new(config)))
+            }
+        }
     }
+}
+
+fn trusted_connector(
+    trust_store: Option<TrustStore>,
+    verify_override: Option<VerifyOverride>,
+    alpn: Vec<Bytes>,
+    client_credentials: Option<ServerCredentials>,
+    version_policy: TcpTlsVersionPolicy,
+) -> SharedTlsConnector {
+    Arc::new(TrustedConnector {
+        trust_store,
+        verify_override,
+        alpn,
+        client_credentials,
+        version_policy,
+    })
 }
 
 /// Build a [`SharedTlsConnector`] whose server-chain verification is entirely
@@ -403,27 +464,38 @@ pub fn connector_with_verify_override(
     verify: Arc<dyn Fn(&[Bytes], Option<&str>) -> bool + Send + Sync>,
     alpn: &[&[u8]],
 ) -> SharedTlsConnector {
-    Arc::new(TrustedConnector {
-        trust_store: None,
-        verify_override: Some(VerifyOverride(verify)),
-        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-        client_credentials: None,
-    })
+    trusted_connector(
+        None,
+        Some(VerifyOverride(verify)),
+        alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        None,
+        TcpTlsVersionPolicy::Negotiate,
+    )
 }
 
 /// Build a [`SharedTlsConnector`] that trusts the given PEM CA / leaf cert file.
 /// `alpn` entries are protocol names such as `b"http/1.1"`.
 pub fn connector_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
+    connector_from_pem_with_tcp_version_policy(ca_path, alpn, TcpTlsVersionPolicy::Negotiate)
+}
+
+/// Like [`connector_from_pem`], but pin which TLS versions this connector uses.
+pub fn connector_from_pem_with_tcp_version_policy(
+    ca_path: &Path,
+    alpn: &[&[u8]],
+    version_policy: TcpTlsVersionPolicy,
+) -> io::Result<SharedTlsConnector> {
     let mut trust = TrustStore::new();
     for cert in load_certs(ca_path)? {
         trust.add_anchor(cert);
     }
-    Ok(Arc::new(TrustedConnector {
-        trust_store: Some(trust),
-        verify_override: None,
-        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-        client_credentials: None,
-    }))
+    Ok(trusted_connector(
+        Some(trust),
+        None,
+        alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        None,
+        version_policy,
+    ))
 }
 
 /// Build a mutual-TLS [`SharedTlsConnector`]: like [`connector_from_pem`], but
@@ -440,12 +512,13 @@ pub fn connector_from_pem_with_client_cert(
         trust.add_anchor(cert);
     }
     let client_creds = server_credentials_from_pem(client_cert_path, client_key_path)?;
-    Ok(Arc::new(TrustedConnector {
-        trust_store: Some(trust),
-        verify_override: None,
-        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-        client_credentials: Some(client_creds),
-    }))
+    Ok(trusted_connector(
+        Some(trust),
+        None,
+        alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        Some(client_creds),
+        TcpTlsVersionPolicy::Negotiate,
+    ))
 }
 
 /// Accepts any certificate, performing no validation at all — for opportunistic
@@ -456,12 +529,13 @@ pub fn connector_from_pem_with_client_cert(
 /// (`hopf_dns::dane::DaneServerCertVerifier`) or [`connector_from_pem`] is what
 /// authenticates the peer when that's actually possible/required.
 pub fn insecure_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
-    Arc::new(TrustedConnector {
-        trust_store: None,
-        verify_override: None,
-        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-        client_credentials: None,
-    })
+    trusted_connector(
+        None,
+        None,
+        alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        None,
+        TcpTlsVersionPolicy::Negotiate,
+    )
 }
 
 /// Build a [`SharedTlsConnector`] that trusts the public WebPKI — the
@@ -475,19 +549,19 @@ pub fn insecure_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
 /// candidate) — [`connector_from_pem`] and [`insecure_connector`] both need
 /// the caller to already know who they're trusting; this doesn't.
 pub fn public_trust_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
-    Arc::new(TrustedConnector {
-        trust_store: Some(public_trust_store()),
-        verify_override: None,
-        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
-        client_credentials: None,
-    })
+    trusted_connector(
+        Some(public_trust_store()),
+        None,
+        alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        None,
+        TcpTlsVersionPolicy::Negotiate,
+    )
 }
 
 // ---------------------------------------------------------------------------
-// TLS 1.2 — explicit legacy interop only (RFC 5246, ECDHE + GCM). Callers
-// dial these deliberately for a known-legacy target; there's no opportunistic
-// version fallback from the TLS 1.3 path above (see crypto-migration-plan.md
-// Phase 5's "explicit connector, not negotiated fallback" scope note).
+// TLS 1.2 — explicit legacy interop only (RFC 5246, ECDHE + GCM). The default
+// PEM acceptor/connector above negotiate 1.2 vs 1.3 on one TCP port; use these
+// when the peer must speak TLS 1.2 only.
 // ---------------------------------------------------------------------------
 
 struct PemAcceptorTls12 {
@@ -693,11 +767,37 @@ mod tests {
     fn handshake(client: &mut TlsVariant, server: &mut TlsVariant) -> (Wire, Wire) {
         let (mut wc, mut ws) = (Wire::default(), Wire::default());
         client.start(&mut wc);
-        for _ in 0..2 {
+        server.start(&mut ws);
+        for _ in 0..24 {
+            if client.is_complete() && server.is_complete() {
+                break;
+            }
             drain(&mut wc, server, &mut ws);
             drain(&mut ws, client, &mut wc);
         }
         (wc, ws)
+    }
+
+    /// Default PEM acceptor/connector negotiate TLS 1.2 vs 1.3 on one TCP endpoint.
+    #[test]
+    fn default_pem_negotiates_tls12_and_tls13_on_one_acceptor() {
+        use crate::tls::{connector_from_pem, connector_from_pem_tls12};
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let acceptor = acceptor_from_pem(&cert_path, &key_path, &[]).unwrap();
+        for (label, connector) in [
+            ("TLS 1.3 client", connector_from_pem(&cert_path, &[]).unwrap()),
+            ("TLS 1.2 client", connector_from_pem_tls12(&cert_path).unwrap()),
+        ] {
+            let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
+            let (wc, ws) = handshake(&mut client, &mut server);
+            assert!(
+                client.is_complete() && server.is_complete(),
+                "{label}: {:?} {:?}",
+                wc.errors,
+                ws.errors
+            );
+        }
     }
 
     /// The wrappers give the `*_tls12` builders (which take no protocol list) an
@@ -767,8 +867,12 @@ mod tests {
     fn requiring_supported_versions_is_a_tls12_matter_only() {
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
-        let mut v13 = acceptor_requiring_supported_versions(acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()).accept();
-        assert!(!v13.set_require_supported_versions(true), "TLS 1.3 has nothing to require");
+        let mut negotiating =
+            acceptor_requiring_supported_versions(acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()).accept();
+        assert!(
+            negotiating.set_require_supported_versions(true),
+            "stored for the TLS 1.2 leg of a negotiating acceptor"
+        );
         let mut v12 = acceptor_from_pem_tls12(&cert_path, &key_path).unwrap().accept();
         assert!(v12.set_require_supported_versions(true));
     }

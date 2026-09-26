@@ -1016,6 +1016,7 @@ mod tests {
             record_size_limit: None,
             legacy_version: 0x0303,
             compress_certificate: false,
+            offer_tls12_fallback: false,
         };
         let wire = build_client_hello_with_ech(&params, &INNER_EXTENSION_BODY).encode();
         let mut ss = Sink::default();

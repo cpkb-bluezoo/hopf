@@ -452,13 +452,13 @@
 <li><strong>TCP TLS / STARTTLS:</strong> <code>hopf-tls</code> drives <code>rustls</code> (<code>TlsSession</code> on <code>hopf-core</code> TCP connections).</li>
 <li><strong>QUIC / HTTP/3:</strong> <code>quinn-proto</code> for RFC 9000 transport; <code>rustls</code> TLS 1.3 for RFC 9001; H3/QPACK in-tree in <code>hopf-http</code>.</li>
 <li><strong>Mail/DNS auth crypto:</strong> DKIM and DNSSEC verification call <code>aws-lc-rs</code> directly from protocol crates.</li>
-<li><strong>UDP:</strong> datagram handlers in core are <strong>cleartext</strong> — DTLS is not implemented yet.</li>
+<li><strong>UDP:</strong> datagram handlers in core are <strong>cleartext</strong>; DTLS 1.2/1.3 sessions use <code>hopf-core::dtls</code> (reactor driver in <code>dtls::driver</code>). One UDP port can negotiate 1.3 vs 1.2 per peer (<code>DtlsVersionPolicy</code>, same as TCP <code>TcpTlsVersionPolicy</code>).</li>
 </ul>
 <h3 id="security-direction">Direction</h3>
 <p>Consolidate on <strong>AWS-LC libcrypto</strong> inside <code>hopf-core</code> and implement wire protocols in-tree on the TPC reactor model — Gumdrop's approach. Gumdrop did <strong>not</strong> use Kwik (thread-per-connection); it implemented QUIC in-house for the same reason Hopf plans to retire <code>quinn-proto</code>:</p>
 <ul>
 <li><strong>TCP:</strong> TLS 1.2/1.3 record layer + handshakes (retire <code>rustls</code>).</li>
-<li><strong>UDP:</strong> DTLS 1.2/1.3 + <code>DtlsSession</code> parallel to <code>TlsSession</code> (Gumdrop UDP/DTLS parity).</li>
+<li><strong>UDP:</strong> DTLS 1.2/1.3 in <code>hopf-core::dtls</code>/<code>dtls12</code> (driver + version negotiation shipped; higher-level <code>Endpoint</code> integration still TBD).</li>
 <li><strong>QUIC:</strong> in-tree RFC 9000 transport + TLS 1.3 handshake for RFC 9001 (retire <code>quinn-proto</code>; analogous to Gumdrop's in-tree QUIC plus agent15 handshake-only TLS).</li>
 <li><strong>Primitives:</strong> one trust/identity surface for X.509 (TLS/mTLS), DKIM/ARC signing, DNSSEC, and future host-key models (SSH).</li>
 <li><strong>Auth:</strong> optional GSSAPI/Kerberos SASL on <code>hopf-auth</code> (Gumdrop parity) once the native foundation is settled — KDC work stays on <code>StorageExecutor</code>.</li>

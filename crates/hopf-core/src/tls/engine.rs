@@ -296,6 +296,8 @@ pub struct HandshakeConfig {
     /// the plain server-name key. QUIC uses one namespace per QUIC version
     /// (RFC 9369 section 5).
     pub ticket_namespace: u32,
+    /// TCP TLS client: offer TLS 1.2 in `supported_versions` alongside 1.3.
+    pub offer_tls12_fallback: bool,
     /// Certificate compression (RFC 8879, Brotli). Default `true`.
     ///
     /// - **Client:** offer `compress_certificate` and accept a Brotli
@@ -306,6 +308,17 @@ pub struct HandshakeConfig {
     /// Worth having for large (e.g. post-quantum) chains; `false` restores
     /// the uncompressed exchange.
     pub certificate_compression: bool,
+}
+
+/// TCP record-layer handshake defaults (TLS 1.3 engine), used by PEM factories
+/// and version negotiation.
+pub(crate) fn handshake_config_tcp_record_layer(role: HandshakeRole, alpn: &[&[u8]]) -> HandshakeConfig {
+    HandshakeConfig {
+        role,
+        mode: HandshakeMode::TcpRecordLayer,
+        alpn: alpn.iter().map(|p| bytes::Bytes::copy_from_slice(p)).collect(),
+        ..Default::default()
+    }
 }
 
 impl Default for HandshakeConfig {
@@ -335,6 +348,7 @@ impl Default for HandshakeConfig {
             ech_server: None,
             certificate_compression: true,
             ticket_namespace: 0,
+            offer_tls12_fallback: false,
         }
     }
 }
@@ -764,6 +778,7 @@ impl HandshakeEngine {
             record_size_limit: self.offered_record_size_limit(),
             legacy_version: self.config.mode.legacy_version(),
             compress_certificate: self.config.certificate_compression,
+            offer_tls12_fallback: self.config.offer_tls12_fallback,
         };
 
         if self.ech_client_is_real() {
@@ -1719,6 +1734,25 @@ impl HandshakeEngine {
         let wire = msg.encode();
         self.transcript.add_message(&wire);
         sink.handshake_data_ready(&wire);
+    }
+
+    /// Client role: a `ClientHello` was already placed on the wire by a
+    /// version-negotiating connector; continue from `ClientHelloSent`.
+    #[allow(dead_code)]
+    pub(crate) fn client_note_client_hello_sent(&mut self, wire: &[u8]) {
+        if self.config.role != HandshakeRole::Client || self.state != State::Initial {
+            return;
+        }
+        self.transcript.add_message(wire);
+        self.state = State::ClientHelloSent;
+    }
+
+    /// Outbound `ClientHello` handshake bytes after [`Self::start`] on a client.
+    pub(crate) fn client_hello_outbound_wire(&self) -> Option<bytes::Bytes> {
+        if self.config.role != HandshakeRole::Client || self.state != State::ClientHelloSent {
+            return None;
+        }
+        self.transcript.first_message()
     }
 
     fn finish<S: TlsEventSink>(&mut self, sink: &mut S) {
@@ -3484,6 +3518,7 @@ mod tests {
             record_size_limit: client_limit,
             legacy_version: 0x0303,
             compress_certificate: false,
+            offer_tls12_fallback: false,
         });
         let wire = hello.encode();
         server.feed_handshake_data(&mut wire.as_ref(), &mut sink);
@@ -3610,6 +3645,7 @@ mod tests {
             record_size_limit: Some(63),
             legacy_version: 0x0303,
             compress_certificate: false,
+            offer_tls12_fallback: false,
         });
         server.feed_handshake_data(&mut hello.encode().as_ref(), &mut sink);
         assert!(sink.alerts.is_empty(), "even an illegal value is ignored on QUIC: {:?}", sink.events);
@@ -3767,6 +3803,7 @@ mod tests {
             record_size_limit: None,
             legacy_version: 0x0303,
             compress_certificate: false,
+            offer_tls12_fallback: false,
         });
         let wire = hello.encode();
         let mut input = wire.as_ref();
@@ -3809,6 +3846,7 @@ mod tests {
             record_size_limit: None,
             legacy_version: 0x0303,
             compress_certificate: false,
+            offer_tls12_fallback: false,
         });
         let wire = hello.encode();
         let mut input = wire.as_ref();

@@ -2,7 +2,7 @@
 
 //! Handshake transcript hash (RFC 8446 §4.4.1).
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 
 use crate::crypto::{hash, HashAlgorithm};
 
@@ -23,6 +23,15 @@ impl Transcript {
     /// Append a serialized handshake message (with type/length header).
     pub fn add_message(&mut self, encoded: &[u8]) {
         self.messages.extend_from_slice(encoded);
+    }
+
+    /// First appended handshake message (type/length/body), if any.
+    pub(crate) fn first_message(&self) -> Option<Bytes> {
+        if self.messages.is_empty() {
+            None
+        } else {
+            Some(self.messages.clone().freeze())
+        }
     }
 
     /// Transcript-Hash = Hash(messages).

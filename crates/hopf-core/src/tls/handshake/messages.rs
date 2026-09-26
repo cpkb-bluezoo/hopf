@@ -181,6 +181,30 @@ pub struct ClientHelloParams {
     /// Offer `compress_certificate` (RFC 8879) with every algorithm in
     /// [`SUPPORTED_ALGORITHMS`](super::cert_compression::SUPPORTED_ALGORITHMS).
     pub compress_certificate: bool,
+    /// When true on TCP TLS, `supported_versions` lists TLS 1.3 then TLS 1.2
+    /// so a single `ClientHello` can be answered by either protocol version.
+    pub offer_tls12_fallback: bool,
+}
+
+impl Default for ClientHelloParams {
+    fn default() -> Self {
+        Self {
+            random: [0; 32],
+            cipher_suites: Vec::new(),
+            key_share: KeyShareEntry { group: 0, share: Bytes::new() },
+            supported_groups: Vec::new(),
+            alpn: Vec::new(),
+            server_name: None,
+            transport_parameters: None,
+            early_data: false,
+            psk: None,
+            cookie: None,
+            record_size_limit: None,
+            legacy_version: 0x0303,
+            compress_certificate: false,
+            offer_tls12_fallback: false,
+        }
+    }
 }
 
 /// Build a TLS 1.3 `ClientHello`.
@@ -264,7 +288,16 @@ fn build_client_hello_inner(
     // {0xfe, 0xfc}, not TLS 1.3's {0x03, 0x04} — `legacy_version` is this
     // message's own DTLS/TLS discriminator (see its use above).
     let real_version: [u8; 2] = if params.legacy_version == 0xfefd { [0xfe, 0xfc] } else { [0x03, 0x04] };
-    push_extension(&mut extensions, ext::SUPPORTED_VERSIONS, &[0x02, real_version[0], real_version[1]]);
+    let supported_versions: &[u8] = if params.offer_tls12_fallback {
+        match params.legacy_version {
+            0xfefd => &[0x04, 0xfe, 0xfc, 0xfe, 0xfd],
+            0x0303 => &[0x04, 0x03, 0x04, 0x03, 0x03],
+            _ => &[0x02, real_version[0], real_version[1]],
+        }
+    } else {
+        &[0x02, real_version[0], real_version[1]]
+    };
+    push_extension(&mut extensions, ext::SUPPORTED_VERSIONS, supported_versions);
     push_extension(
         &mut extensions,
         ext::SUPPORTED_GROUPS,
@@ -760,6 +793,7 @@ mod tests {
             record_size_limit: None,
             legacy_version: 0x0303,
             compress_certificate: false,
+            offer_tls12_fallback: false,
         });
         let parsed = parse_client_hello(&hello.body).expect("parse client hello");
         assert!(parsed.peer_key_share.is_some());
@@ -794,6 +828,7 @@ mod tests {
             record_size_limit: None,
             legacy_version: 0xfefd,
             compress_certificate: false,
+            offer_tls12_fallback: false,
         });
         // legacy_version(2) + random(32) + session_id_len(1)=0 +
         // legacy_cookie_len(1)=0: byte 35 is the cookie length prefix.
@@ -825,6 +860,7 @@ mod tests {
             record_size_limit: None,
             legacy_version: 0x0303,
             compress_certificate: false,
+            offer_tls12_fallback: false,
         });
         // legacy_version(2) + random(32) + session_id_len(1) + cipher_suites_len(2)
         // + cipher_suites(2) + compression(2).
@@ -872,6 +908,7 @@ mod tests {
             record_size_limit: None,
             legacy_version: 0x0303,
             compress_certificate: false,
+            offer_tls12_fallback: false,
         });
         let parsed = parse_client_hello(&hello.body).expect("parse");
         assert_eq!(

@@ -150,6 +150,10 @@ impl WriteKeys {
     pub(crate) fn set_next_seq_for_test(&mut self, seq: u64) {
         self.next_seq = seq;
     }
+
+    pub(crate) fn set_next_seq(&mut self, seq: u64) {
+        self.next_seq = seq;
+    }
 }
 
 /// One direction's read state for one epoch, plus the anti-replay window a

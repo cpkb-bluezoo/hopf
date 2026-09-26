@@ -48,5 +48,10 @@ crates should use it instead of calling `aws-lc-rs` directly.
 ## TLS handshake engine (Phase 2+)
 
 `hopf_core::tls::HandshakeEngine` is the reactive QUIC-first TLS 1.3 handshake
-(`TlsEventSink`, `QuicSecrets`). Interim TCP TLS remains on `hopf-tls`/rustls
-until Phase 4.
+(`TlsEventSink`, `QuicSecrets`). TCP TLS 1.2/1.3 and DTLS 1.2/1.3 live in
+`hopf_core::tls` and `hopf_core::dtls` / `dtls12`.
+
+**Version policy (TCP and UDP):** default PEM acceptors/connectors negotiate 1.3
+vs 1.2 once per connection (`TcpTlsVersionPolicy::Negotiate`, aliased as
+`dtls::DtlsVersionPolicy`). See `tls::pem` and `dtls::{dtls_server_engine,
+dtls_client_engine}`. QUIC is always TLS 1.3.
