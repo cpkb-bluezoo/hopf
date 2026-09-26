@@ -84,6 +84,7 @@
 <li><a href="#alpn-and-tls-13">ALPN and TLS 1.3</a></li>
 <li><a href="#runtime-extension">Runtime extension</a></li>
 <li><a href="#examples">Examples</a></li>
+<li><a href="#quic-lb">QUIC-LB connection IDs</a></li>
 <li><a href="#limitations">Limitations</a></li>
 <li><a href="#implementation-status">Implementation status</a></li>
 <li><a href="#see-also">See also</a></li>
@@ -378,6 +379,26 @@
 </tbody>
 </table>
 <p>Smokes: <code>cargo test -p hopf-quic --features integration</code>, <code>cargo test -p hopf-http --features h3 h3_get_hello</code>.</p>
+<h2 id="quic-lb">QUIC-LB connection IDs</h2>
+<p>A load balancer that forwards UDP by Destination Connection ID needs to find the owning backend from the CID alone, so a datagram keeps reaching the same server when the client's address changes. <code>hopf-quic</code> can issue such IDs following <a href="https://www.ietf.org/archive/id/draft-ietf-quic-load-balancers-21.html">draft-ietf-quic-load-balancers-21</a> (revision 21; the encoder lives in one module, <code>transport/quic_lb.rs</code>, so a later revision touches only that file).</p>
+<pre><code>use hopf_quic::{apply_server_quic_lb, QuicLbConfig};
+
+// Same config ID, key and nonce length on every backend and on the balancer;
+// only the server ID differs per backend.
+let lb = QuicLbConfig::new(/* config id 0-6 */ 1, &amp;[0xa1, 0x01], /* nonce */ 6)?
+    .with_key(shared_16_byte_key)?;
+
+let (mut server_cfg, _pem) = server_config_self_signed(&amp;["example.test"], &amp;[b"h3"])?;
+apply_server_quic_lb(&amp;mut server_cfg, &amp;lb);      // or server_cfg.quic_lb(&amp;lb) on a QuicServerConfig
+listen_h3(addr, server_cfg, factory, limits)?;   // HTTP/3 takes the same Arc&lt;QuicServerConfig&gt;
+</code></pre>
+<ul>
+<li><strong>Encodings.</strong> Without a key the server ID is sent in the clear (linkable across migration). With a 16-octet AES-128 key it is encrypted: one AES block when server ID and nonce total exactly 16 octets, otherwise the draft's four-round Feistel network. Server ID (at least 1 octet) and nonce (at least 4) total at most 19 octets, so the CID is at most 20. Optional length self-description (<code>with_length_self_description</code>) fills the first octet's low bits with the CID length; otherwise they are random.</li>
+<li><strong>Where it applies.</strong> The Initial response's source CID and the Retry source CID (Retry is on by default under <code>QuicListenHardening::high_security</code>). Nonces count up from a random start and are never reused; on exhaustion the server falls back to the reserved unroutable <code>0b111</code> codepoint, as the draft requires. In plaintext mode the nonce is random, and the endpoint redraws on a clash with a live connection and refuses an accept whose fixed post-Retry CID clashes.</li>
+<li><strong>Shared state.</strong> None beyond the config: the balancer decodes the server ID with <code>QuicLbConfig::decode_server_id</code>'s logic and forwards; backends keep their own connection tables. Clones of a server config share one nonce sequence.</li>
+<li><strong>Default.</strong> Without <code>quic_lb</code>, connection IDs remain 8 random octets. <code>connection_id_generator</code> accepts any custom <code>ConnectionIdGenerator</code>.</li>
+<li><strong>Not covered.</strong> Terminating QUIC or TLS at the balancer; the draft's optional extra server-owned CID octets; <code>NEW_CONNECTION_ID</code> issuance, because this stack does not issue additional CIDs yet (connection migration itself is still structurally inert, see <a href="conformance.html#quic">Conformance</a>), so only the Initial and Retry source CIDs are QUIC-LB encoded.</li>
+</ul>
 <h2 id="limitations">Limitations</h2>
 <ul>
 <li><code>QuicStreamEndpoint::start_tls</code> returns <code>StartTlsError::Unsupported</code> (QUIC is already TLS 1.3).</li>

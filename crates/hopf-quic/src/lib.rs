@@ -23,7 +23,8 @@ pub use crypto::{
     hopf_client_config, hopf_server_config, HopfHandshakeData, HopfQuicTlsConfig, HopfTlsBuildParams,
 };
 pub use config::{
-    apply_client_transport_options, apply_listen_hardening, apply_server_transport_options,
+    apply_client_transport_options, apply_listen_hardening, apply_server_quic_lb,
+    apply_server_transport_options,
     client_config_for_certified_pem, client_config_for_certified_pem_with,
     client_config_for_pem_bytes, client_config_for_pem_bytes_hopf,
     client_config_for_pem_bytes_with, client_config_for_pem_bytes_with_hopf, client_config_from_pem,
@@ -33,6 +34,9 @@ pub use config::{
     server_config_self_signed_with_hopf, QuicClientConfig, QuicConnectConfig,
     QuicListenConfig, QuicListenHardening, QuicListenHooksConfig, QuicServerConfig, QuicTlsOptions,
     QuicTransportOptions,
+};
+pub use transport::quic_lb::{
+    ConnectionIdGenerator, QuicLbConfig, QuicLbError, QuicLbGenerator, RandomConnectionIdGenerator,
 };
 pub use driver::{
     connect_quic, connect_quic_hooks, connect_quic_hooks_with_path, connect_quic_with_path,
