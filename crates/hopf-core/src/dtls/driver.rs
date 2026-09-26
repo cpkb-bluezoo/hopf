@@ -603,6 +603,8 @@ mod tests {
     enum Ev {
         Established(SocketAddr, Option<String>),
         Data(Vec<u8>),
+        // The peer address is only asserted by the integration-only test.
+        #[cfg_attr(not(feature = "integration"), allow(dead_code))]
         Closed(SocketAddr, Option<String>),
     }
 
@@ -818,6 +820,10 @@ mod tests {
         rt.shutdown();
     }
 
+    // Integration-only: asserts a send issued right after `connect` precedes
+    // handshake completion, which races on a fast loopback (nondeterministic,
+    // so it must not run in CI's `--lib` unit-test pass).
+    #[cfg(feature = "integration")]
     #[test]
     fn send_needs_an_established_session_and_close_session_notifies_the_peer() {
         let rt = Runtime::start(Default::default()).unwrap();
