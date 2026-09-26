@@ -41,8 +41,8 @@ pub use signature::{
     ecdsa_p384_sha384_verify, ecdsa_p384_sha384_verify_spki, ecdsa_p384_sign, ed25519_sign,
     ed25519_verify, rsa_dnskey_to_spki_der, rsa_pss_sha256_verify_spki, rsa_sign_pkcs1_sha256,
     rsa_sign_pss_sha256, rsa_verify_dnskey, rsa_verify_pkcs1_sha256, rsa_verify_pkcs1_sha512,
-    EcdsaP256PrivateKey, EcdsaP384PrivateKey, Ed25519PrivateKey, Ed25519PublicKey, KeyError,
-    RsaPrivateKey, RsaPublicKeyComponents, SignError, SignatureBytes,
+    ml_dsa_generate_pkcs8, ml_dsa_sign, ml_dsa_verify_spki, EcdsaP256PrivateKey, EcdsaP384PrivateKey,
+    Ed25519PrivateKey, Ed25519PublicKey, KeyError, MlDsaLevel, MlDsaPrivateKey, RsaPrivateKey, RsaPublicKeyComponents, SignError, SignatureBytes,
 };
 pub use trust::{
     public_trust_store, public_trust_store_from, verify_server_chain, ComponentAnchor, TrustStore,

@@ -176,6 +176,115 @@ pub fn chain_scheme_not_offered(chain: &[Bytes], peer_offered: &[u16]) -> Option
     })
 }
 
+/// One DER TLV: tag + length (short or long form) + content.
+fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let len = content.len();
+    if len < 128 {
+        out.push(len as u8);
+    } else if len < 256 {
+        out.push(0x81);
+        out.push(len as u8);
+    } else if len < 65536 {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    } else {
+        out.push(0x83);
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+fn der_seq(parts: &[&[u8]]) -> Vec<u8> {
+    let mut content = Vec::new();
+    for p in parts {
+        content.extend_from_slice(p);
+    }
+    der_tlv(0x30, &content)
+}
+
+/// `BIT STRING` with a zero-length unused-bits prefix (every value this
+/// module ever wraps is a whole number of bytes).
+fn der_bit_string(content: &[u8]) -> Vec<u8> {
+    let mut inner = vec![0u8];
+    inner.extend_from_slice(content);
+    der_tlv(0x03, &inner)
+}
+
+/// `AlgorithmIdentifier ::= SEQUENCE { OID }` - no parameters, the same
+/// minimal shape as Ed25519's (RFC 8410 section 3), which ML-DSA follows too.
+fn der_alg_id(oid_raw: &[u8]) -> Vec<u8> {
+    der_seq(&[&der_tlv(0x06, oid_raw)])
+}
+
+/// A freshly generated ML-DSA identity: a self-signed certificate and its key.
+#[derive(Debug, Clone)]
+pub struct MlDsaIdentity {
+    /// Certificate DER.
+    pub cert_der: bytes::Bytes,
+    /// PKCS#8 private key DER (seed form).
+    pub pkcs8_der: bytes::Bytes,
+}
+
+/// Generate an ML-DSA key and a self-signed certificate for `names`, which
+/// `rcgen` cannot do (it has no ML-DSA support). The first name becomes the
+/// subject `commonName`; every name is a `dNSName` in `subjectAltName`.
+///
+/// Deliberately minimal: an X.509 v3 end-entity certificate valid from
+/// 2026-01-01 to 2049-01-01 with a random serial, `subjectAltName` and no
+/// other extensions (no `basicConstraints`, `keyUsage`, or issuer
+/// chaining). It is meant for development, tests and loopback use, to be
+/// trusted directly as its own anchor; production deployments should
+/// obtain a certificate from a real CA (e.g. `openssl req -x509 -newkey
+/// ml-dsa-65`, OpenSSL 3.5+) and load it with the usual PEM helpers.
+pub fn generate_ml_dsa_self_signed(
+    names: &[&str],
+    level: crate::crypto::signature::MlDsaLevel,
+) -> Result<MlDsaIdentity, crate::crypto::signature::KeyError> {
+    use crate::crypto::signature::{ml_dsa_generate_pkcs8, ml_dsa_sign, KeyError, MlDsaPrivateKey};
+
+    let pkcs8 = ml_dsa_generate_pkcs8(level)?;
+    let key = MlDsaPrivateKey::from_pkcs8(level, &pkcs8)?;
+    let spki = key.public_key_spki_der()?;
+    let alg_id = der_alg_id(&level.oid());
+
+    let cn = names.first().copied().unwrap_or("localhost");
+    let name = der_seq(&[&der_tlv(0x31, &der_seq(&[&der_tlv(0x06, &[0x55, 0x04, 0x03]), &der_tlv(0x0c, cn.as_bytes())]))]);
+    let validity = der_seq(&[&der_tlv(0x17, b"260101000000Z"), &der_tlv(0x17, b"490101000000Z")]);
+
+    let mut serial = [0u8; 16];
+    getrandom::getrandom(&mut serial).map_err(|_| KeyError)?;
+    serial[0] &= 0x7f; // positive INTEGER
+    serial[0] |= 0x40; // no leading zero octet to trim
+
+    // subjectAltName (2.5.29.17): GeneralNames of [2] dNSName entries.
+    let mut general_names = Vec::new();
+    for n in names {
+        general_names.extend_from_slice(&der_tlv(0x82, n.as_bytes()));
+    }
+    let san_value = der_tlv(0x04, &der_tlv(0x30, &general_names));
+    let san_ext = der_seq(&[&der_tlv(0x06, &[0x55, 0x1d, 0x11]), &san_value]);
+    let extensions = der_tlv(0xa3, &der_seq(&[&san_ext]));
+
+    let tbs = der_seq(&[
+        &der_tlv(0xa0, &der_tlv(0x02, &[0x02])), // version v3
+        &der_tlv(0x02, &serial),
+        &alg_id, // signature
+        &name,   // issuer
+        &validity,
+        &name, // subject (self-signed)
+        &spki,
+        &extensions,
+    ]);
+    let signature = ml_dsa_sign(&key, &tbs).map_err(|_| KeyError)?;
+    let cert = der_seq(&[&tbs, &alg_id, &der_bit_string(signature.as_bytes())]);
+    Ok(MlDsaIdentity { cert_der: bytes::Bytes::from(cert), pkcs8_der: pkcs8 })
+}
+
 /// Verify `cert` was signed by the public key in `issuer_spki`. Accepts
 /// exactly the algorithms in [`ACCEPTED_CERT_SIGNATURE_SCHEMES`] — keep
 /// the two in sync.
@@ -495,40 +604,6 @@ mod tests {
     // `parse_certificate`/`verify_cert_signature` to round-trip — not a
     // fully RFC 5280-compliant certificate.
 
-    /// One DER TLV: tag + length (short or long form) + content.
-    fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
-        let mut out = vec![tag];
-        let len = content.len();
-        if len < 128 {
-            out.push(len as u8);
-        } else if len < 256 {
-            out.push(0x81);
-            out.push(len as u8);
-        } else {
-            out.push(0x82);
-            out.push((len >> 8) as u8);
-            out.push(len as u8);
-        }
-        out.extend_from_slice(content);
-        out
-    }
-
-    fn der_seq(parts: &[&[u8]]) -> Vec<u8> {
-        let mut content = Vec::new();
-        for p in parts {
-            content.extend_from_slice(p);
-        }
-        der_tlv(0x30, &content)
-    }
-
-    /// `BIT STRING` with a zero-length unused-bits prefix (every value
-    /// this module ever wraps is a whole number of bytes).
-    fn der_bit_string(content: &[u8]) -> Vec<u8> {
-        let mut inner = vec![0u8];
-        inner.extend_from_slice(content);
-        der_tlv(0x03, &inner)
-    }
-
     /// Minimal `RDNSequence` — a single `commonName` RDN. Good enough for
     /// `parse_certificate`'s generic `Name` handling; not asserted on by
     /// the tests below (they only care about the signature).
@@ -544,12 +619,6 @@ mod tests {
         let not_before = der_tlv(0x17, b"260101000000Z"); // UTCTime
         let not_after = der_tlv(0x17, b"300101000000Z");
         der_seq(&[&not_before, &not_after])
-    }
-
-    /// `AlgorithmIdentifier ::= SEQUENCE { OID }` — no parameters, same
-    /// minimal shape as Ed25519's (RFC 8410 §3), which ML-DSA follows too.
-    fn der_alg_id(oid_raw: &[u8]) -> Vec<u8> {
-        der_seq(&[&der_tlv(0x06, oid_raw)])
     }
 
     /// Hand-build a minimal self-signed ML-DSA-44 certificate. Returns
@@ -586,6 +655,21 @@ mod tests {
         let cert = der_seq(&[&tbs, &alg_id, &der_bit_string(&signature)]);
         (cert, spki_der)
     }
+
+    #[test]
+    fn generated_ml_dsa_identity_verifies_and_matches_its_names_at_every_level() {
+        use crate::crypto::signature::MlDsaLevel;
+        for level in MlDsaLevel::ALL {
+            let id = generate_ml_dsa_self_signed(&["localhost", "example.test"], level).unwrap();
+            let cert = parse_certificate(&id.cert_der).expect("parse generated cert");
+            assert!(verify_cert_signature(&cert, &cert.spki_der), "{level:?} self-signature");
+            assert_eq!(cert_signature_scheme(&cert), Some(level.signature_scheme()));
+            assert!(matches_hostname(&cert, "localhost"));
+            assert!(matches_hostname(&cert, "example.test"));
+            assert!(!matches_hostname(&cert, "other.test"));
+        }
+    }
+
 
     #[test]
     fn verify_cert_signature_covers_ml_dsa_44() {
