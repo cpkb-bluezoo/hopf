@@ -20,9 +20,9 @@
 //! 16-bit truncated sequence number (`S=1`), and an explicit length field
 //! (`L=1`). Connection IDs and the 8-bit sequence-number form are not
 //! implemented (`crypto-migration-plan.md` Phase 6 tracks this as a
-//! follow-up). Old-epoch keys are dropped as soon as new ones are
-//! installed — RFC 9147 §4.2.1's optional short overlap window (to tolerate
-//! reordered datagrams arriving just after a key update) isn't implemented.
+//! follow-up). Key updates are driven by [`crate::dtls::DtlsRecordEngine`],
+//! which keeps the previous epoch's read keys briefly so reordered datagrams
+//! still decrypt (RFC 9147 §5.8.4).
 
 use aws_lc_rs::aead::quic::{HeaderProtectionKey, AES_128, CHACHA20};
 
@@ -48,11 +48,9 @@ const SEQ_LEN: usize = 2;
 const HEADER_LEN: usize = 1 + SEQ_LEN + 2;
 
 /// RFC 8446 §5.5 / RFC 9325 §4.4: an AES-GCM key should be retired after
-/// protecting 2^24.5 (≈23,726,566) full-size records. DTLS 1.3's own
-/// `KeyUpdate` (RFC 9147's epoch-aware variant) isn't implemented here —
-/// this session's TLS 1.3 `KeyUpdate` work is TCP-only — so crossing this
-/// limit means closing the connection outright, the same fail-closed
-/// treatment TLS 1.2 uses. ChaCha20-Poly1305 has no analogous limit (RFC
+/// protecting 2^24.5 (≈23,726,566) full-size records. Crossing it makes
+/// `dtls::engine` rotate the key with a DTLS 1.3 `KeyUpdate` (RFC 9147
+/// §5.8.4). ChaCha20-Poly1305 has no analogous limit (RFC
 /// 8446 §5.5: its sequence number would wrap first). `pub(crate)`, not
 /// just private, so `dtls::engine`'s own tests can set a direction's
 /// counter right up to the boundary without sending millions of records.
@@ -137,9 +135,19 @@ impl WriteKeys {
         }
     }
 
+    /// This direction's epoch number (RFC 9147 §4.1).
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// `RecordNumber` (epoch, sequence number) of the record most recently
+    /// written.
+    pub(crate) fn last_record_number(&self) -> (u64, u64) {
+        (self.epoch, self.next_seq.wrapping_sub(1))
+    }
+
     /// Whether this direction has protected enough records under its
-    /// current AES-GCM key to warrant closing the connection (RFC 8446
-    /// §5.5) — no DTLS 1.3 rekey mechanism exists here to fall back to.
+    /// current AES-GCM key that it should be rotated (RFC 8446 §5.5).
     pub fn over_confidentiality_limit(&self) -> bool {
         matches!(self.key, AeadKeyKind::Aes128Gcm(_)) && self.next_seq >= AES_GCM_CONFIDENTIALITY_LIMIT
     }
@@ -174,6 +182,11 @@ impl ReadKeys {
             epoch,
             replay: ReplayWindow::new(),
         }
+    }
+
+    /// This direction's epoch number (RFC 9147 §4.1).
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Same as [`WriteKeys::over_confidentiality_limit`], for the read

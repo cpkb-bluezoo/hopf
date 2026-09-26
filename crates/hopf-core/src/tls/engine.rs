@@ -38,7 +38,7 @@ use super::sink::{
     VerifyResult,
 };
 use super::ticket_keys::TicketKeys;
-use crate::crypto::hkdf::expand_label;
+use crate::crypto::hkdf::{dtls_expand_label, expand_label};
 
 /// Client or server role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -428,9 +428,14 @@ enum State {
 }
 
 /// RFC 8446 §7.2: `application_traffic_secret_N+1 = HKDF-Expand-Label(
-/// application_traffic_secret_N, "traffic upd", "", Hash.length)`.
-fn ratchet_application_secret(secret: &TrafficSecret) -> TrafficSecret {
-    let out = expand_label(secret.as_bytes(), "traffic upd", &[], 32);
+/// application_traffic_secret_N, "traffic upd", "", Hash.length)`. DTLS 1.3
+/// uses the same derivation under RFC 9147 §5.9's `dtls13` label prefix.
+fn ratchet_application_secret(secret: &TrafficSecret, dtls: bool) -> TrafficSecret {
+    let out = if dtls {
+        dtls_expand_label(secret.as_bytes(), "traffic upd", &[], 32)
+    } else {
+        expand_label(secret.as_bytes(), "traffic upd", &[], 32)
+    };
     let mut buf = [0u8; 32];
     buf.copy_from_slice(out.as_ref());
     TrafficSecret::from_bytes(buf)
@@ -1161,15 +1166,18 @@ impl HandshakeEngine {
         );
     }
 
-    /// Peer's `KeyUpdate` (RFC 8446 §4.6.3), post-handshake. TCP-TLS-1.3
-    /// only — RFC 9001 §4.6 forbids this message over QUIC (QUIC has its
-    /// own separate packet-level key update), and DTLS 1.3's epoch-aware
-    /// variant (RFC 9147 §5.8) is a different, unimplemented mechanism.
+    /// Peer's `KeyUpdate` (RFC 8446 §4.6.3 / RFC 9147 §5.8.4), post-handshake.
+    /// TCP-TLS-1.3 and DTLS 1.3 only — RFC 9001 §4.6 forbids this message
+    /// over QUIC (QUIC has its own separate packet-level key update). The
+    /// secret ratchet is identical for DTLS; what differs (epoch bump,
+    /// deferring our own write-key switch until the peer ACKs) belongs to
+    /// the record layer, which sees the same `application_traffic_key_updated`
+    /// events.
     fn on_key_update<S: TlsEventSink>(&mut self, kind: u8, sink: &mut S) -> bool {
-        if self.config.mode != HandshakeMode::TcpRecordLayer {
+        if self.config.mode == HandshakeMode::Quic {
             self.fail(
                 sink,
-                AlertDescription::UnexpectedMessage, "KeyUpdate is invalid outside TCP TLS 1.3 (forbidden over QUIC by RFC 9001 §4.6; DTLS 1.3's epoch-aware variant is unimplemented)",
+                AlertDescription::UnexpectedMessage, "KeyUpdate is forbidden over QUIC (RFC 9001 §4.6)",
             );
             return false;
         }
@@ -1182,7 +1190,7 @@ impl HandshakeEngine {
             return false;
         };
         let aead = self.negotiated_aead.expect("cipher suite negotiated before Complete");
-        let new_secret = ratchet_application_secret(&secret);
+        let new_secret = ratchet_application_secret(&secret, self.config.mode == HandshakeMode::Dtls);
         self.peer_app_secret = Some(new_secret);
         sink.application_traffic_key_updated(aead, KeyUpdateDirection::Read, *new_secret.as_bytes());
         // RFC 8446 §4.6.3: a reciprocal update MUST go out before any
@@ -1206,19 +1214,19 @@ impl HandshakeEngine {
         sink.handshake_data_ready(&wire);
         let secret = self.own_app_secret.expect("application traffic established before Complete");
         let aead = self.negotiated_aead.expect("cipher suite negotiated before Complete");
-        let new_secret = ratchet_application_secret(&secret);
+        let new_secret = ratchet_application_secret(&secret, self.config.mode == HandshakeMode::Dtls);
         self.own_app_secret = Some(new_secret);
         sink.application_traffic_key_updated(aead, KeyUpdateDirection::Write, *new_secret.as_bytes());
     }
 
     /// Request that this connection's own application traffic key rotate
     /// forward (RFC 8446 §4.6.3/§7.2), optionally asking the peer to
-    /// reciprocate. TCP-TLS-1.3 only. Returns `false` with no effect if
-    /// called before the handshake completes or in any other transport
-    /// mode — local API misuse, not a peer-caused protocol error, so no
-    /// sink event fires for that case.
+    /// reciprocate. Not available over QUIC. Returns `false` with no effect if
+    /// called before the handshake completes or over QUIC — local API
+    /// misuse, not a peer-caused protocol error, so no sink event fires for
+    /// that case.
     pub fn request_key_update<S: TlsEventSink>(&mut self, sink: &mut S, request_peer_update: bool) -> bool {
-        if self.state != State::Complete || self.config.mode != HandshakeMode::TcpRecordLayer {
+        if self.state != State::Complete || self.config.mode == HandshakeMode::Quic {
             return false;
         }
         self.send_key_update(sink, request_peer_update);

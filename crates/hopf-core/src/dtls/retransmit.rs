@@ -59,6 +59,19 @@ impl RetransmitState {
         self.retransmit_count = 0;
     }
 
+    /// Another flight went out while the previous one is still unacknowledged
+    /// and both must stay retransmittable (two `KeyUpdate`s in flight at
+    /// once, RFC 9147 §5.8.4) — keep the existing backoff schedule and
+    /// resend the two together. Behaves like [`Self::on_flight_sent`] when
+    /// nothing is outstanding.
+    pub fn append_flight(&mut self, wire: &[u8]) {
+        if self.flight.is_empty() {
+            self.on_flight_sent(wire.to_vec());
+        } else {
+            self.flight.extend_from_slice(wire);
+        }
+    }
+
     /// The handshake advanced (the peer's expected response arrived and was
     /// processed) — nothing left to retransmit. Caller should cancel any
     /// armed timer.
