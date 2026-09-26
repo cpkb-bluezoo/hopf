@@ -85,7 +85,7 @@
 <li><a href="#authentication">Authentication</a></li>
 <li><a href="#handler-spi">Handler SPI</a></li>
 <li><a href="#pipelines">Pipelines</a></li>
-<li><a href="#email-authentication">Email authentication (SPF/DKIM/DMARC)</a></li>
+<li><a href="#email-authentication">Email authentication (SPF/DKIM/DMARC/ARC)</a></li>
 <li><a href="#relay">Relay</a></li>
 <li><a href="#local-delivery">Local delivery</a></li>
 <li><a href="#configuration">Configuration</a></li>
@@ -407,7 +407,7 @@
 </tbody>
 </table>
 <p>Return a pipeline from <code>MailFromHandler::pipeline()</code>. The stock <code>LocalDeliveryHandler</code> and <code>SimpleRelayHandler</code> (below) use an internal streaming pipeline rather than <code>MessageBufferPipeline</code>, so neither one ever holds a whole message in memory.</p>
-<h2 id="email-authentication">Email authentication (SPF/DKIM/DMARC)</h2>
+<h2 id="email-authentication">Email authentication (SPF/DKIM/DMARC/ARC)</h2>
 <p><code>hopf_smtp::auth</code> is a from-scratch port of Gumdrop's <code>org.bluezoo.gumdrop.smtp.auth</code> package: SPF (RFC 7208), DKIM verify + sign (RFC 6376, Ed25519 per RFC 8463), and DMARC (RFC 7489), plus a Public Suffix List for organizational-domain resolution and DMARC aggregate/forensic report rendering. See the <a href="conformance.html#smtp">conformance audit</a> for the full RFC-by-RFC breakdown, including the couple of deliberately-deferred DMARCbis extras.</p>
 <p><code>AuthPipeline</code> implements <code>SmtpPipeline</code> and can be returned from <code>MailFromHandler::pipeline()</code>. SPF starts at <code>MAIL FROM</code>; DKIM verification and DMARC evaluation start once the message finishes at end-of-DATA. All three depend on DNS, so none of them complete synchronously — observe results via the <code>on_spf</code>/<code>on_dkim</code>/<code>on_dmarc</code> callbacks and/or a cloneable, pollable <code>AuthVerdictHandle</code>:</p>
 <pre><code>use hopf_smtp::{AuthPipeline, MessageEndState};
@@ -450,6 +450,14 @@ fn message_complete(&amp;mut self, state: &amp;mut dyn MessageEndState) {
     .build();
 self.auth_results = p.authentication_results(); // stash alongside p.verdict()</code></pre>
 <p><strong><code>AuthPipeline</code> never inserts the header into the message itself.</strong> It doesn't rewrite bytes flowing through <code>message_handler</code>'s <code>inner</code> tee (e.g. a spool file) — and by the time the header is ready (after end-of-DATA, DNS-bound) that tee has typically already streamed the whole message onward. Apply the rendered field yourself wherever your own <code>message_complete</code>/delivery logic already has a chance to touch the stored message — e.g. prepend it to a spool file before streaming that file onward for delivery — the same place you'd already be consulting <code>AuthVerdictHandle</code>. This also keeps the header out of DKIM's own signed-header set, since a receiver-added <code>Authentication-Results</code> header must never be part of what a signature covers.</p>
+<h3 id="arc">ARC (RFC&nbsp;8617)</h3>
+<p><code>hopf_smtp::auth::arc</code> covers both roles a deployment can play in an Authenticated Received Chain. All three builder options below imply chain validation at end-of-DATA; results are available from <code>AuthPipeline::arc_result()</code> (an <code>ArcResultHandle</code>) and, when <code>authentication_results(..)</code> is enabled, as an <code>arc=</code> result.</p>
+<ul>
+<li><strong>Validator</strong> - <code>arc_validation()</code> / <code>on_arc(cb)</code>, or call <code>arc::validate</code> directly. Groups the <code>ARC-*</code> headers by instance, checks <code>cv=</code> sequencing, verifies the newest <code>ARC-Message-Signature</code> and every <code>ARC-Seal</code> using the same DNS key lookup as DKIM.</li>
+<li><strong>Sealer</strong> - <code>arc_sealer(Arc&lt;ArcSealer&gt;)</code>. <code>ArcSealer::new(key, domain, selector, authserv_id)</code> takes the same <code>DkimPrivateKey</code> DKIM signing uses. Once SPF, DKIM, DMARC and validation are known, <code>AuthPipeline::arc_seal()</code> resolves to the three headers (<code>ArcSetHeaders::to_prepend()</code>); as with <code>Authentication-Results</code>, applying them to the forwarded message is the caller's job. A malformed or already-failed incoming chain is never extended.</li>
+<li><strong>ARC-aware DMARC</strong> - <code>arc_dmarc_policy(Arc&lt;dyn ArcDmarcPolicy&gt;)</code>. After validation the policy is handed the chain and this hop's own results and may return an <code>ArcAuthSnapshot</code> whose SPF/DKIM results DMARC evaluates instead. hopf ships no trust list: deciding which sealers to believe is the policy's job, and <code>ArcSet::sealer_domain()</code> / <code>recorded_results()</code> give it what it needs.</li>
+</ul>
+
 <h2 id="relay">Relay</h2>
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_smtp::</span>SimpleRelayService<span class="op">;</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
