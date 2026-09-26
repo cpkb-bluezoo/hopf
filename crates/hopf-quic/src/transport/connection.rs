@@ -18,6 +18,7 @@ use crate::transport::packet::pn;
 use crate::transport::packet::protection::{KeyPair, PacketKeys, TAG_LEN};
 use crate::transport::packet::retry;
 use crate::transport::packet::short_header;
+use crate::transport::packet::version_negotiation;
 use crate::transport::packet::TransportParameters;
 use crate::transport::recovery::{LossDetector, RecoverableFrame};
 use crate::transport::stream::{RecvStream, SendStream, StreamReassembler};
@@ -122,6 +123,9 @@ pub struct Connection {
     short_cid_len: usize,
     /// Client: already processed one Retry.
     retry_processed: bool,
+    /// A server packet has been decrypted and processed (RFC 9000 section
+    /// 6.2: from then on Version Negotiation packets are ignored).
+    server_packet_processed: bool,
     /// Client: Retry SCID that must match peer `retry_source_connection_id`.
     expected_retry_scid: Option<ConnectionId>,
     /// Client: Initial CRYPTO chunks for requeue after Retry.
@@ -241,6 +245,7 @@ impl Connection {
             token: Vec::new(),
             short_cid_len: initial_dcid.len(),
             retry_processed: false,
+            server_packet_processed: false,
             expected_retry_scid: None,
             initial_crypto_chunks: Vec::new(),
             datagram_rx: VecDeque::new(),
@@ -334,6 +339,7 @@ impl Connection {
             token: Vec::new(),
             short_cid_len: 0,
             retry_processed: false,
+            server_packet_processed: false,
             expected_retry_scid: None,
             initial_crypto_chunks: Vec::new(),
             datagram_rx: VecDeque::new(),
@@ -532,6 +538,16 @@ impl Connection {
         if data.len() >= 6 && (data[0] >> 4) & 0x03 == TYPE_RETRY {
             return self.handle_retry_packet(data);
         }
+        // Version Negotiation (version 0) and other versions can't go through
+        // the v1 header parser: only the RFC 8999 invariants are readable.
+        if let Some((version, _, _)) = version_negotiation::parse_invariants(data) {
+            if version == 0 {
+                return self.handle_version_negotiation(data);
+            }
+            if version != VERSION_V1 {
+                return data.len();
+            }
+        }
         let Some(prefix) = long_header::parse_prefix(data) else {
             return data.len();
         };
@@ -581,8 +597,35 @@ impl Connection {
             self.short_cid_len = self.rem_cid.len();
         }
         let _ = is_0rtt;
+        if self.side == Side::Client {
+            self.server_packet_processed = true;
+        }
         self.on_decrypted(space, full_pn, &payload, now);
         packet_len
+    }
+
+    /// RFC 9000 section 6.2. This client speaks only version 1, so a valid
+    /// Version Negotiation packet that offers nothing usable means the
+    /// server has no version in common with us: abandon the attempt. Ignore
+    /// it if it lists version 1 (we already chose it, so the packet is
+    /// bogus), if it doesn't echo our connection IDs (an off-path forgery),
+    /// or if we've already processed any other server packet.
+    fn handle_version_negotiation(&mut self, data: &[u8]) -> usize {
+        if self.side != Side::Client || self.established || self.retry_processed || self.server_packet_processed {
+            return data.len();
+        }
+        let Some(pkt) = version_negotiation::parse(data) else {
+            return data.len();
+        };
+        if pkt.dst_cid != self.local_cid.as_slice() || pkt.src_cid != self.initial_dcid.as_slice() {
+            return data.len();
+        }
+        if pkt.versions.contains(&VERSION_V1) {
+            return data.len();
+        }
+        self.closed = true;
+        self.events.push_back(Event::ConnectionLost { reason: ConnectionError::VersionMismatch });
+        data.len()
     }
 
     fn handle_retry_packet(&mut self, data: &[u8]) -> usize {
@@ -1887,6 +1930,89 @@ mod tests {
         conn.spaces[2].secrets = Some(secrets);
         conn.peer_max_datagram = 65535;
         conn
+    }
+
+    /// A Version Negotiation packet (RFC 9000 section 17.2.1) as a server
+    /// would send it to a client whose SCID / DCID are given.
+    fn version_negotiation_packet(client_scid: &[u8], client_dcid: &[u8], versions: &[u32]) -> Vec<u8> {
+        let mut p = vec![0x80 | 0x2a];
+        p.extend_from_slice(&0u32.to_be_bytes());
+        p.push(client_scid.len() as u8);
+        p.extend_from_slice(client_scid);
+        p.push(client_dcid.len() as u8);
+        p.extend_from_slice(client_dcid);
+        for v in versions {
+            p.extend_from_slice(&v.to_be_bytes());
+        }
+        p
+    }
+
+    fn lost_with(conn: &mut Connection) -> Option<ConnectionError> {
+        while let Some(ev) = conn.poll() {
+            if let Event::ConnectionLost { reason } = ev {
+                return Some(reason);
+            }
+        }
+        None
+    }
+
+    /// RFC 9000 section 6.2: a client that supports only version 1 abandons
+    /// the attempt when the server offers no version it speaks.
+    #[test]
+    fn client_abandons_the_attempt_on_version_negotiation_offering_nothing_usable() {
+        let mut conn = test_client(Instant::now());
+        let vn = version_negotiation_packet(&[1, 2, 3, 4, 5, 6, 7, 8], &[9u8; 8], &[0xff00_0020, 0x6b33_43cf]);
+        conn.handle_packet(Instant::now(), &vn);
+        assert!(matches!(lost_with(&mut conn), Some(ConnectionError::VersionMismatch)));
+        assert!(conn.closed);
+    }
+
+    /// A Version Negotiation packet listing the version the client already
+    /// chose is bogus (RFC 9000 section 6.2) and must be discarded.
+    #[test]
+    fn client_discards_version_negotiation_that_lists_its_own_version() {
+        let mut conn = test_client(Instant::now());
+        let vn = version_negotiation_packet(&[1, 2, 3, 4, 5, 6, 7, 8], &[9u8; 8], &[0xff00_0020, VERSION_V1]);
+        conn.handle_packet(Instant::now(), &vn);
+        assert!(lost_with(&mut conn).is_none());
+        assert!(!conn.closed);
+    }
+
+    /// Off-path attackers can't guess our connection IDs: the echoed IDs
+    /// must match what we sent.
+    #[test]
+    fn client_discards_version_negotiation_with_wrong_connection_ids() {
+        for (scid, dcid) in [([1u8, 2, 3, 4, 5, 6, 7, 9], [9u8; 8]), ([1, 2, 3, 4, 5, 6, 7, 8], [7u8; 8])] {
+            let mut conn = test_client(Instant::now());
+            let vn = version_negotiation_packet(&scid, &dcid, &[0xff00_0020]);
+            conn.handle_packet(Instant::now(), &vn);
+            assert!(lost_with(&mut conn).is_none(), "{scid:?} {dcid:?}");
+            assert!(!conn.closed);
+        }
+    }
+
+    /// Once the client has processed any other server packet (here a Retry),
+    /// a later Version Negotiation packet must be ignored.
+    #[test]
+    fn client_discards_version_negotiation_after_processing_another_packet() {
+        let mut conn = test_client(Instant::now());
+        conn.retry_processed = true;
+        let vn = version_negotiation_packet(&[1, 2, 3, 4, 5, 6, 7, 8], &[9u8; 8], &[0xff00_0020]);
+        conn.handle_packet(Instant::now(), &vn);
+        assert!(lost_with(&mut conn).is_none());
+        assert!(!conn.closed);
+    }
+
+    /// A truncated or list-less Version Negotiation packet is just dropped.
+    #[test]
+    fn malformed_version_negotiation_is_ignored() {
+        for len in [7usize, 12, 24] {
+            let mut conn = test_client(Instant::now());
+            let mut vn = version_negotiation_packet(&[1, 2, 3, 4, 5, 6, 7, 8], &[9u8; 8], &[0xff00_0020]);
+            vn.truncate(len.min(vn.len() - 1));
+            conn.handle_packet(Instant::now(), &vn);
+            assert!(lost_with(&mut conn).is_none(), "len {len}");
+        }
     }
 
     #[test]

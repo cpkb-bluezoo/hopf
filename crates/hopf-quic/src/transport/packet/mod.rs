@@ -8,5 +8,6 @@ pub mod protection;
 pub mod retry;
 pub mod short_header;
 pub mod transport_params;
+pub mod version_negotiation;
 
 pub use transport_params::TransportParameters;

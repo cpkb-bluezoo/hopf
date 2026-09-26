@@ -2333,6 +2333,111 @@ mod tests {
         server.shutdown();
     }
 
+    /// A raw UDP datagram in an unsupported version, big enough to be an
+    /// Initial, gets a Version Negotiation packet back from a real listener.
+    #[test]
+    fn listener_answers_an_unsupported_version_over_udp_with_version_negotiation() {
+        let (server_cfg, _pem) = server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let server = listen_quic(QuicListenConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg,
+            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (dcid, scid) = ([0xd0u8; 8], [0x5cu8; 6]);
+        let mut probe = vec![0xc0u8];
+        probe.extend_from_slice(&0x1a2a_3a4au32.to_be_bytes());
+        probe.push(dcid.len() as u8);
+        probe.extend_from_slice(&dcid);
+        probe.push(scid.len() as u8);
+        probe.extend_from_slice(&scid);
+        probe.resize(1200, 0);
+        sock.send_to(&probe, server.local_addr).unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (n, from) = sock.recv_from(&mut buf).expect("Version Negotiation reply");
+        assert_eq!(from, server.local_addr);
+        let vn = crate::transport::packet::version_negotiation::parse(&buf[..n]).expect("a Version Negotiation packet");
+        assert_eq!(vn.dst_cid, scid);
+        assert_eq!(vn.src_cid, dcid);
+        assert!(vn.versions.contains(&crate::transport::types::VERSION_V1), "{:x?}", vn.versions);
+
+        // An undersized datagram is dropped without a reply.
+        sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        sock.send_to(&probe[..1199], server.local_addr).unwrap();
+        assert!(sock.recv_from(&mut buf).is_err(), "no reply expected to an undersized datagram");
+        server.shutdown();
+    }
+
+    /// A v1-only client whose server answers with a Version Negotiation
+    /// packet offering no v1 abandons the attempt (RFC 9000 section 6.2): it
+    /// stops dialling instead of retransmitting its Initial or retrying.
+    ///
+    /// Observed on the wire, since a failure before the handshake completes
+    /// has no stream handler to report to.
+    #[test]
+    fn client_stops_dialling_after_version_negotiation_offers_no_common_version() {
+        let (_server_cfg, pem) = server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+        let fake_server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        fake_server.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+        let client = connect_quic(QuicConnectConfig::new(
+            fake_server.local_addr().unwrap(),
+            client_cfg,
+            "localhost",
+            Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        let mut buf = [0u8; 2048];
+        let (n, client_addr) = fake_server.recv_from(&mut buf).expect("client Initial");
+        let (version, dcid, scid) = {
+            let (v, d, s) = crate::transport::packet::version_negotiation::parse_invariants(&buf[..n]).unwrap();
+            (v, d.to_vec(), s.to_vec())
+        };
+        assert_eq!(version, crate::transport::types::VERSION_V1);
+        let (dcid, scid) = (&dcid[..], &scid[..]);
+
+        // A forged reply (wrong echoed IDs) must not stop the dial: the
+        // client still retransmits its Initial after the ~1s probe timeout.
+        // (This is also the control showing that silence below means abandon.)
+        let forged = version_negotiation_reply(&[0xee; 8], dcid, &[0xff00_0020]);
+        fake_server.send_to(&forged, client_addr).unwrap();
+        fake_server.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        fake_server.recv_from(&mut buf).expect("client should keep dialling after a forged reply");
+
+        // A genuine one, from a server with no version in common, stops it.
+        let genuine = version_negotiation_reply(scid, dcid, &[0xff00_0020, 0x6b33_43cf]);
+        fake_server.send_to(&genuine, client_addr).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        fake_server.set_nonblocking(true).unwrap();
+        while fake_server.recv_from(&mut buf).is_ok() {} // datagrams already in flight
+        fake_server.set_nonblocking(false).unwrap();
+        fake_server.set_read_timeout(Some(Duration::from_millis(2600))).unwrap();
+        assert!(
+            fake_server.recv_from(&mut buf).is_err(),
+            "client kept sending after a genuine Version Negotiation packet"
+        );
+        client.shutdown();
+    }
+
+    /// A Version Negotiation packet as a server would send it: the client's
+    /// SCID first, its DCID second, then the offered versions.
+    fn version_negotiation_reply(client_scid: &[u8], client_dcid: &[u8], versions: &[u32]) -> Vec<u8> {
+        let mut vn = vec![0x8au8, 0, 0, 0, 0, client_scid.len() as u8];
+        vn.extend_from_slice(client_scid);
+        vn.push(client_dcid.len() as u8);
+        vn.extend_from_slice(client_dcid);
+        for v in versions {
+            vn.extend_from_slice(&v.to_be_bytes());
+        }
+        vn
+    }
+
     #[test]
     fn spike_echo_one_stream() {
         let (server_cfg, pem) =
