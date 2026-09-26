@@ -15,6 +15,7 @@ use crate::transport::connection::Connection;
 use crate::transport::packet::long_header::{self, TYPE_INITIAL, TYPE_RETRY};
 use crate::transport::packet::retry;
 use crate::transport::packet::version_negotiation as vn;
+use crate::transport::quic_lb::{ConnectionIdGenerator, RandomConnectionIdGenerator};
 use crate::transport::types::{
     ConnectionEvent, ConnectionHandle, ConnectionId, DatagramEvent, EndpointConfig, Incoming,
     Transmit, VERSION_V1,
@@ -41,6 +42,9 @@ pub struct ServerConfig {
     pub initial_max_streams_uni: Option<u64>,
     /// Keep-alive PING interval (`None` = disabled).
     pub keep_alive_interval: Option<Duration>,
+    /// Where server-issued connection IDs come from. `None` = 8 random
+    /// octets; set it to issue QUIC-LB IDs (see [`crate::transport::quic_lb`]).
+    pub cid_generator: Option<Arc<dyn ConnectionIdGenerator>>,
 }
 
 impl ServerConfig {
@@ -56,6 +60,7 @@ impl ServerConfig {
             initial_max_streams_bidi: None,
             initial_max_streams_uni: None,
             keep_alive_interval: None,
+            cid_generator: None,
         }
     }
 }
@@ -101,6 +106,8 @@ impl ClientConfig {
 pub struct Endpoint {
     config: EndpointConfig,
     server: Option<ServerConfig>,
+    /// Source of every connection ID this endpoint issues.
+    cid_generator: Arc<dyn ConnectionIdGenerator>,
     cids: CidMap,
     connections: HashMap<ConnectionHandle, Connection>,
     next_handle: usize,
@@ -116,16 +123,36 @@ impl Endpoint {
         _enable_client: bool,
         _reset_token_key: Option<()>,
     ) -> Self {
+        // A configured generator (QUIC-LB) fixes the CID length, which the
+        // short-header demux below depends on; otherwise 8 random octets.
+        let cid_generator = server
+            .as_ref()
+            .and_then(|s| s.cid_generator.clone())
+            .unwrap_or_else(|| Arc::new(RandomConnectionIdGenerator::new(if config.cid_len == 0 { 8 } else { config.cid_len })));
         Self {
-            config: EndpointConfig {
-                cid_len: if config.cid_len == 0 { 8 } else { config.cid_len },
-            },
+            config: EndpointConfig { cid_len: cid_generator.cid_len() },
+            cid_generator,
             server,
             cids: CidMap::default(),
             connections: HashMap::new(),
             next_handle: 0,
             client_handle: None,
         }
+    }
+
+    /// A new local connection ID from the generator that no live connection
+    /// already uses. Collisions are only possible for a generator with a
+    /// random component (e.g. QUIC-LB's plaintext nonce), and are rare, so a
+    /// few retries suffice.
+    fn new_local_cid(&self) -> ConnectionId {
+        let mut cid = self.cid_generator.generate();
+        for _ in 0..16 {
+            if self.cids.get(&cid).is_none() {
+                break;
+            }
+            cid = self.cid_generator.generate();
+        }
+        cid
     }
 
     fn alloc_handle(&mut self) -> ConnectionHandle {
@@ -142,7 +169,7 @@ impl Endpoint {
         remote: SocketAddr,
         server_name: &str,
     ) -> Result<(ConnectionHandle, Connection), ConnectError> {
-        let local_cid = ConnectionId::random(self.config.cid_len);
+        let local_cid = self.new_local_cid();
         let initial_dcid = ConnectionId::random(8);
         let conn = Connection::new_client(
             now,
@@ -309,10 +336,18 @@ impl Endpoint {
     ) -> Result<(ConnectionHandle, Connection), AcceptError> {
         let server = self.server.clone().ok_or(AcceptError::NoServerConfig)?;
         let via_retry = incoming.retry_local_cid.is_some();
+        // The Retry source CID was chosen statelessly, before this connection
+        // existed; if a live connection has since been given the same one,
+        // taking it would overwrite that connection's routing entry.
+        if let Some(cid) = &incoming.retry_local_cid {
+            if self.cids.get(cid).is_some() {
+                return Err(AcceptError::CidInUse);
+            }
+        }
         let local_cid = incoming
             .retry_local_cid
             .clone()
-            .unwrap_or_else(|| ConnectionId::random(self.config.cid_len));
+            .unwrap_or_else(|| self.new_local_cid());
         // Initial keys use the DCID the client addressed (post-Retry: Retry SCID).
         let initial_dcid = if via_retry {
             incoming.dst_cid.clone()
@@ -347,7 +382,7 @@ impl Endpoint {
         send_buf: &mut Vec<u8>,
     ) -> Result<Transmit, ()> {
         let server = self.server.as_ref().ok_or(())?;
-        let retry_scid = ConnectionId::random(self.config.cid_len);
+        let retry_scid = self.new_local_cid();
         let token = retry::seal_token(
             &server.retry_token_key,
             incoming.orig_dst_cid.as_slice(),
@@ -412,6 +447,9 @@ pub enum ConnectError {
 pub enum AcceptError {
     /// No server config.
     NoServerConfig,
+    /// The post-Retry local connection ID (fixed by the Retry already sent)
+    /// is already held by a live connection.
+    CidInUse,
 }
 
 #[cfg(test)]
@@ -548,5 +586,189 @@ mod tests {
         let mut send_buf = Vec::new();
         let ev = ep.handle(Instant::now(), remote(), None, None, Bytes::from(d), &mut send_buf);
         assert!(matches!(ev, Some(DatagramEvent::NewConnection(_))), "{ev:?}");
+    }
+
+    // ---- QUIC-LB server-issued connection IDs (issue 413) ----
+
+    use crate::transport::quic_lb::{ConnectionIdGenerator, QuicLbConfig};
+
+    /// Two backends of one deployment: same config ID, key and nonce length,
+    /// distinct server IDs; the load balancer's config is the same again
+    /// without any server ID of its own (it only decodes).
+    fn lb_config(server_id: &[u8]) -> QuicLbConfig {
+        QuicLbConfig::new(1, server_id, 6).unwrap().with_key([0x42; 16]).unwrap()
+    }
+
+    fn lb_endpoint(cfg: &QuicLbConfig) -> Endpoint {
+        let mut server = ServerConfig::new(HandshakeConfig {
+            role: HandshakeRole::Server,
+            mode: HandshakeMode::Quic,
+            ..Default::default()
+        });
+        server.cid_generator = Some(cfg.generator());
+        Endpoint::new(EndpointConfig::default(), Some(server), false, None)
+    }
+
+    fn incoming(validated: bool, retry_local_cid: Option<ConnectionId>) -> Incoming {
+        Incoming {
+            remote: remote(),
+            dst_cid: ConnectionId::from_slice(&[7u8; 8]),
+            src_cid: ConnectionId::from_slice(&[8u8; 8]),
+            orig_dst_cid: ConnectionId::from_slice(&[7u8; 8]),
+            packet: Bytes::new(),
+            address_validated: validated,
+            retry_local_cid,
+        }
+    }
+
+    fn accept(ep: &mut Endpoint) -> (ConnectionHandle, ConnectionId) {
+        let (h, conn) = ep.accept(incoming(true, None), Instant::now(), &mut Vec::new(), None).unwrap();
+        (h, conn.local_cid().clone())
+    }
+
+    /// The Initial-response source CID is a QUIC-LB CID naming this backend.
+    #[test]
+    fn accepted_connections_get_lb_connection_ids_that_decode_to_the_server_id() {
+        let cfg = lb_config(&[0xa1, 0x01]);
+        let mut ep = lb_endpoint(&cfg);
+        for _ in 0..5 {
+            let (_, cid) = accept(&mut ep);
+            assert_eq!(cid.len(), cfg.cid_len());
+            assert_eq!(cfg.decode_server_id(cid.as_slice()), Some(vec![0xa1, 0x01]));
+        }
+    }
+
+    /// A Retry's source CID becomes the connection's CID after the client
+    /// returns with the token, so it must be routable too.
+    #[test]
+    fn retry_source_connection_ids_decode_to_the_server_id() {
+        let cfg = lb_config(&[0xa1, 0x01]);
+        let mut ep = lb_endpoint(&cfg);
+        let mut buf = Vec::new();
+        ep.retry(incoming(false, None), &mut buf).unwrap();
+        let retry_scid = retry::parse(&buf).expect("a Retry packet").src_cid;
+        assert_eq!(cfg.decode_server_id(retry_scid.as_slice()), Some(vec![0xa1, 0x01]));
+    }
+
+    /// The migration scenario the issue asks for. The client's address
+    /// changes (NAT rebinding) but its DCID does not: a stateless load
+    /// balancer decodes the same server ID from the datagram and picks the
+    /// same backend, whose own table then finds the connection. Without
+    /// QUIC-LB the other backend would get it and drop it.
+    #[test]
+    fn a_datagram_keeps_reaching_the_same_backend_after_the_client_address_changes() {
+        let (id_a, id_b) = ([0xa1u8, 0x01], [0xb2u8, 0x02]);
+        let (mut a, mut b) = (lb_endpoint(&lb_config(&id_a)), lb_endpoint(&lb_config(&id_b)));
+        let lb = lb_config(&[0, 0]); // the balancer only decodes; its own server ID is unused
+        let route = |dcid: &[u8]| match lb.decode_server_id(dcid).as_deref() {
+            Some(x) if x == id_a => "a",
+            Some(x) if x == id_b => "b",
+            _ => "unroutable",
+        };
+
+        let (handle, cid) = accept(&mut a);
+        let mut short = vec![0x41u8];
+        short.extend_from_slice(cid.as_slice());
+        short.extend_from_slice(&[0x99; 40]);
+
+        for new_addr in ["192.0.2.7:4433", "198.51.100.9:61000", "203.0.113.5:1024"] {
+            assert_eq!(route(&short[1..1 + cid.len()]), "a", "balancer picks the issuing backend");
+            let mut buf = Vec::new();
+            let ev = a.handle(Instant::now(), new_addr.parse().unwrap(), None, None, Bytes::from(short.clone()), &mut buf);
+            match ev {
+                Some(DatagramEvent::ConnectionEvent(h, _)) => assert_eq!(h, handle),
+                other => panic!("backend a lost the connection: {other:?}"),
+            }
+        }
+        // The other backend has no such connection - which is exactly why the
+        // balancer must not send it there.
+        let mut buf = Vec::new();
+        assert!(b.handle(Instant::now(), remote(), None, None, Bytes::from(short), &mut buf).is_none());
+
+        // And backend b's own CIDs route to b.
+        let (_, cid_b) = accept(&mut b);
+        assert_eq!(route(cid_b.as_slice()), "b");
+    }
+
+    /// The endpoint's short-header demux length follows the generator.
+    #[test]
+    fn the_endpoint_demultiplexes_short_headers_at_the_generators_length() {
+        for (sid_len, nonce_len) in [(1usize, 4usize), (2, 6), (4, 12), (1, 18)] {
+            let cfg = QuicLbConfig::new(0, &vec![0x5a; sid_len], nonce_len).unwrap().with_key([1; 16]).unwrap();
+            let mut ep = lb_endpoint(&cfg);
+            let (handle, cid) = accept(&mut ep);
+            assert_eq!(cid.len(), 1 + sid_len + nonce_len);
+            let mut d = vec![0x40u8];
+            d.extend_from_slice(cid.as_slice());
+            d.extend_from_slice(&[1; 30]);
+            let ev = ep.handle(Instant::now(), remote(), None, None, Bytes::from(d), &mut Vec::new());
+            assert!(matches!(ev, Some(DatagramEvent::ConnectionEvent(h, _)) if h == handle), "{sid_len}/{nonce_len}");
+        }
+    }
+
+    /// Without QUIC-LB, connection IDs stay 8 random octets.
+    #[test]
+    fn random_connection_ids_remain_the_default() {
+        let mut ep = endpoint(true);
+        let (_, a) = accept(&mut ep);
+        let (_, b) = accept(&mut ep);
+        assert_eq!(a.len(), 8);
+        assert_ne!(a, b);
+    }
+
+    /// A plaintext-mode QUIC-LB nonce is random, so two CIDs can collide; the
+    /// endpoint must never register one CID for two connections.
+    #[test]
+    fn a_colliding_generated_connection_id_is_never_reused() {
+        #[derive(Debug)]
+        struct Colliding(Arc<std::sync::atomic::AtomicUsize>);
+        impl ConnectionIdGenerator for Colliding {
+            fn cid_len(&self) -> usize {
+                8
+            }
+            fn generate(&self) -> ConnectionId {
+                // The same ID for the first four calls, then fresh ones.
+                let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n < 4 {
+                    ConnectionId::from_slice(&[0xcc; 8])
+                } else {
+                    ConnectionId::from_slice(&[n as u8; 8])
+                }
+            }
+        }
+        let mut server = ServerConfig::new(HandshakeConfig {
+            role: HandshakeRole::Server,
+            mode: HandshakeMode::Quic,
+            ..Default::default()
+        });
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        server.cid_generator = Some(Arc::new(Colliding(Arc::clone(&calls))));
+        let mut ep = Endpoint::new(EndpointConfig::default(), Some(server), false, None);
+        let (h1, c1) = accept(&mut ep);
+        let (h2, c2) = accept(&mut ep);
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 2, "the endpoint should have drawn again after the clash");
+        assert_ne!(c1, c2, "two connections must not share a connection ID");
+        assert_ne!(h1, h2);
+    }
+
+    /// After a Retry the server must keep the Retry source CID as its own; if
+    /// a live connection has meanwhile taken the same CID, accepting would
+    /// silently steal that connection's traffic, so the accept is refused.
+    #[test]
+    fn accept_after_retry_refuses_a_connection_id_a_live_connection_holds() {
+        let cfg = lb_config(&[0xa1, 0x01]);
+        let mut ep = lb_endpoint(&cfg);
+        let (_, live_cid) = accept(&mut ep);
+        let clash = incoming(true, Some(live_cid.clone()));
+        let refused = ep.accept(clash, Instant::now(), &mut Vec::new(), None);
+        assert!(matches!(refused, Err(AcceptError::CidInUse)), "{:?}", refused.map(|_| ()));
+        // The live connection still owns its CID.
+        let mut d = vec![0x40u8];
+        d.extend_from_slice(live_cid.as_slice());
+        d.extend_from_slice(&[1; 30]);
+        assert!(matches!(
+            ep.handle(Instant::now(), remote(), None, None, Bytes::from(d), &mut Vec::new()),
+            Some(DatagramEvent::ConnectionEvent(..))
+        ));
     }
 }

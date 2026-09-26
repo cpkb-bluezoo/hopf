@@ -2438,6 +2438,55 @@ mod tests {
         vn
     }
 
+    /// A listener issuing QUIC-LB connection IDs of assorted shapes (plaintext,
+    /// single-block, odd and maximum-length four-pass) still completes real
+    /// handshakes - through a Retry, since high-security hardening is the
+    /// default - and echoes, so the short-header demux runs at the generator's
+    /// CID length rather than the default 8.
+    #[test]
+    fn echo_over_udp_with_quic_lb_connection_ids() {
+        use crate::{apply_server_quic_lb, QuicLbConfig};
+
+        let shapes: Vec<QuicLbConfig> = vec![
+            QuicLbConfig::new(0, &[0x11], 4).unwrap(),
+            QuicLbConfig::new(2, &[1, 2, 3, 4], 12).unwrap().with_key([0x33; 16]).unwrap(),
+            QuicLbConfig::new(4, &[9, 9, 9], 6).unwrap().with_key([0x44; 16]).unwrap().with_length_self_description(true),
+            QuicLbConfig::new(6, &[7, 7], 17).unwrap().with_key([0x55; 16]).unwrap(),
+        ];
+        for lb in shapes {
+            let (mut server_cfg, pem) = server_config_self_signed(&["localhost"], &[b"hq-interop"]).unwrap();
+            apply_server_quic_lb(&mut server_cfg, &lb);
+            let client_cfg = client_config_for_pem_bytes(&pem, &[b"hq-interop"]).unwrap();
+            let server = listen_quic(QuicListenConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                server_cfg,
+                Arc::new(|| Box::new(Echo) as Box<dyn ProtocolHandler>),
+            ))
+            .unwrap();
+
+            let got = Arc::new(StdMutex::new(Vec::new()));
+            let got2 = Arc::clone(&got);
+            let client = connect_quic(QuicConnectConfig::new(
+                server.local_addr,
+                client_cfg,
+                "localhost",
+                Arc::new(move || {
+                    Box::new(ClientProbe { sent: false, got: Arc::clone(&got2) }) as Box<dyn ProtocolHandler>
+                }),
+            ))
+            .unwrap();
+            for _ in 0..200 {
+                if got.lock().unwrap().as_slice() == b"ping" {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(got.lock().unwrap().as_slice(), b"ping", "cid_len {}", lb.cid_len());
+            client.shutdown();
+            server.shutdown();
+        }
+    }
+
     #[test]
     fn spike_echo_one_stream() {
         let (server_cfg, pem) =

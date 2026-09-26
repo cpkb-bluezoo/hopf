@@ -18,6 +18,7 @@ use hopf_core::HandlerFactory;
 use crate::crypto::{hopf_client_config, hopf_server_config, HopfTlsBuildParams};
 use crate::hooks::ConnectionFactory;
 use crate::transport::endpoint::{ClientConfig as TransportClientConfig, ServerConfig as TransportServerConfig};
+use crate::transport::quic_lb::{ConnectionIdGenerator, QuicLbConfig};
 
 /// Quinn-compatible server config wrapping in-tree handshake settings.
 #[derive(Clone)]
@@ -60,6 +61,24 @@ impl QuicServerConfig {
     /// Retry token lifetime.
     pub fn retry_token_lifetime(&mut self, d: Duration) {
         self.inner.retry_token_lifetime = d;
+    }
+
+    /// Issue QUIC-LB connection IDs (draft-ietf-quic-load-balancers-21) that
+    /// a connection-ID-aware load balancer can route on, so a datagram keeps
+    /// reaching this backend after the client's address changes.
+    ///
+    /// Every backend behind the balancer needs the same config ID, key and
+    /// nonce length but its own server ID; the balancer holds the same
+    /// [`QuicLbConfig`] to decode. Without this call, connection IDs are 8
+    /// random octets. Clones of this config share one nonce sequence.
+    pub fn quic_lb(&mut self, config: &QuicLbConfig) {
+        self.inner.cid_generator = Some(config.generator());
+    }
+
+    /// Issue connection IDs from a custom [`ConnectionIdGenerator`] instead
+    /// of 8 random octets. Every ID must have the generator's fixed length.
+    pub fn connection_id_generator(&mut self, generator: Arc<dyn ConnectionIdGenerator>) {
+        self.inner.cid_generator = Some(generator);
     }
 
     /// Migration flag.
@@ -747,6 +766,13 @@ impl QuicTransportOptions {
         self.datagram_send_buffer_size = Some(value);
         self
     }
+}
+
+/// Issue QUIC-LB connection IDs from this server (see
+/// [`QuicServerConfig::quic_lb`]); for configs held as
+/// `Arc<QuicServerConfig>`, as the builders return them.
+pub fn apply_server_quic_lb(server: &mut Arc<QuicServerConfig>, config: &QuicLbConfig) {
+    Arc::make_mut(server).quic_lb(config);
 }
 
 /// Apply transport options to server.
