@@ -36,6 +36,18 @@ impl TicketKey {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    fn derived(&self, context: &[u8]) -> Self {
+        use aws_lc_rs::hmac;
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
+        let mut ctx = hmac::Context::with_key(&key);
+        ctx.update(b"hopf ticket key domain\0");
+        ctx.update(context);
+        let tag = ctx.sign();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(tag.as_ref());
+        Self(out)
+    }
 }
 
 impl std::fmt::Debug for TicketKey {
@@ -68,6 +80,18 @@ impl TicketKeys {
     /// Every key worth trying to decrypt a ticket against, current first.
     pub fn decrypt_candidates(&self) -> impl Iterator<Item = &TicketKey> {
         std::iter::once(&self.current).chain(self.previous.iter())
+    }
+
+    /// A keyring for a separate ticket *domain*: every key mapped through
+    /// HMAC-SHA-256 keyed by itself over a label and `context`, so tickets
+    /// sealed in one domain cannot be opened in another, and neither can be
+    /// opened under the parent keys. The rotation ring keeps its shape.
+    ///
+    /// QUIC uses this to bind tickets to the QUIC version (RFC 9369 section
+    /// 5: a version 2 connection must reject a version 1 connection's ticket
+    /// and vice versa) without changing the ticket format.
+    pub fn derived(&self, context: &[u8]) -> Self {
+        Self { current: self.current.derived(context), previous: self.previous.map(|k| k.derived(context)) }
     }
 
     /// Rotate: `new_key` becomes [`Self::current`], the old current key
@@ -108,6 +132,35 @@ mod tests {
             keys.decrypt_candidates().map(TicketKey::as_bytes).collect::<Vec<_>>(),
             vec![&[3u8; 32], &[2u8; 32]],
             "a second rotation must drop the now-two-generations-old key"
+        );
+    }
+
+    /// A key derived for one context opens nothing sealed under another (or
+    /// under the parent): RFC 9369 section 5 - a QUIC version 2 connection
+    /// must not accept a ticket a version 1 connection issued.
+    #[test]
+    fn derived_keys_are_distinct_per_context_and_deterministic() {
+        let keys = TicketKeys::single([1u8; 32]);
+        let a = keys.derived(b"quicv2");
+        let b = keys.derived(b"other");
+        assert_ne!(a.current().as_bytes(), keys.current().as_bytes());
+        assert_ne!(a.current().as_bytes(), b.current().as_bytes());
+        assert_eq!(a.current().as_bytes(), keys.derived(b"quicv2").current().as_bytes());
+    }
+
+    /// Derivation applies to the retained previous key too, so tickets minted
+    /// just before a rotation still resume under the derived ring.
+    #[test]
+    fn derivation_preserves_the_rotation_ring() {
+        let mut keys = TicketKeys::single([1u8; 32]);
+        keys.rotate([2u8; 32]);
+        let derived = keys.derived(b"ctx");
+        assert_eq!(derived.decrypt_candidates().count(), 2);
+        let mut plain = TicketKeys::single([1u8; 32]);
+        plain.rotate([2u8; 32]);
+        assert_eq!(
+            derived.decrypt_candidates().map(|k| *k.as_bytes()).collect::<Vec<_>>(),
+            plain.decrypt_candidates().map(|k| *TicketKeys::single(*k.as_bytes()).derived(b"ctx").current().as_bytes()).collect::<Vec<_>>()
         );
     }
 }

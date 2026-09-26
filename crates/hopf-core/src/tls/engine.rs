@@ -290,6 +290,12 @@ pub struct HandshakeConfig {
     /// and publishes. `None` (the default) ignores `encrypted_client_hello`
     /// like any unknown extension. Ignored on the client.
     pub ech_server: Option<Arc<super::ech::EchServerConfig>>,
+    /// Client: partition of the session-ticket cache. A ticket is stored and
+    /// looked up under `(server name, namespace)`, so clients in different
+    /// namespaces never present each other's tickets. Default `0`, which is
+    /// the plain server-name key. QUIC uses one namespace per QUIC version
+    /// (RFC 9369 section 5).
+    pub ticket_namespace: u32,
     /// Certificate compression (RFC 8879, Brotli). Default `true`.
     ///
     /// - **Client:** offer `compress_certificate` and accept a Brotli
@@ -328,6 +334,7 @@ impl Default for HandshakeConfig {
             ech_client: None,
             ech_server: None,
             certificate_compression: true,
+            ticket_namespace: 0,
         }
     }
 }
@@ -657,6 +664,16 @@ impl HandshakeEngine {
         }
     }
 
+    /// Session-ticket cache key: the server name, qualified by
+    /// [`HandshakeConfig::ticket_namespace`] when that is non-zero.
+    fn ticket_cache_key(&self) -> Option<String> {
+        let name = self.config.server_name.as_ref()?;
+        Some(match self.config.ticket_namespace {
+            0 => name.clone(),
+            ns => format!("{name}\u{0}{ns}"),
+        })
+    }
+
     fn client_send_hello<S: TlsEventSink>(&mut self, sink: &mut S) {
         if !self.ech_client_init(sink) {
             return;
@@ -709,10 +726,8 @@ impl HandshakeEngine {
         let ticket = if self.ech_client_is_real() {
             None
         } else {
-            self.config
-                .server_name
-                .as_ref()
-                .and_then(|n| self.config.ticket_store.as_ref().and_then(|s| s.get(n)))
+            self.ticket_cache_key()
+                .and_then(|n| self.config.ticket_store.as_ref().and_then(|s| s.get(&n)))
         };
 
         let want_early = !is_retry
@@ -1150,7 +1165,7 @@ impl HandshakeEngine {
         let Some(rms) = self.resumption_master else {
             return;
         };
-        let Some(name) = self.config.server_name.as_ref() else {
+        let Some(name) = self.ticket_cache_key() else {
             return;
         };
         let Some(store) = self.config.ticket_store.as_ref() else {
@@ -1163,7 +1178,7 @@ impl HandshakeEngine {
             .or_else(|| self.config.alpn.first().cloned())
             .unwrap_or_default();
         store.put(
-            name,
+            &name,
             StoredTicket {
                 identity: nst.ticket,
                 psk,
@@ -2665,6 +2680,19 @@ mod tests {
         assert!(client2.is_complete(), "resume client: {:?}", sink2.events);
         assert!(server2.is_complete(), "resume server: {:?}", sink2.events);
         assert_eq!(sink2.early_data_accepted, Some(true));
+    }
+
+    /// A ticket is cached under the client's `ticket_namespace` as well as
+    /// the server name, so a client in another namespace (a different QUIC
+    /// version, RFC 9369 section 5) never presents it.
+    #[test]
+    fn a_ticket_is_only_offered_within_its_namespace() {
+        let store = ClientTicketStore::shared();
+        let (client_cfg, server_cfg, _key) = mint_ticket_pair(&store);
+        assert!(resume_once_report_resumed(client_cfg.clone(), server_cfg.clone()), "control: same namespace resumes");
+        let mut other = client_cfg;
+        other.ticket_namespace = 2;
+        assert!(!resume_once_report_resumed(other, server_cfg), "another namespace must not find the ticket");
     }
 
     fn mint_ticket_pair(

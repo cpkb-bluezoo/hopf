@@ -84,6 +84,7 @@
 <li><a href="#alpn-and-tls-13">ALPN and TLS 1.3</a></li>
 <li><a href="#runtime-extension">Runtime extension</a></li>
 <li><a href="#examples">Examples</a></li>
+<li><a href="#quic-versions">QUIC versions</a></li>
 <li><a href="#quic-lb">QUIC-LB connection IDs</a></li>
 <li><a href="#limitations">Limitations</a></li>
 <li><a href="#implementation-status">Implementation status</a></li>
@@ -379,6 +380,24 @@
 </tbody>
 </table>
 <p>Smokes: <code>cargo test -p hopf-quic --features integration</code>, <code>cargo test -p hopf-http --features h3 h3_get_hello</code>.</p>
+<h2 id="quic-versions">QUIC versions</h2>
+<p><code>hopf-quic</code> speaks QUIC version 1 (RFC 9000) and version 2 (RFC 9369). Version 2 changes only the version number, the Initial salt, the HKDF labels, the long-header type bits and the Retry key, so HTTP/3 (<code>h3</code>) and DNS over QUIC (<code>doq</code>) run over it unchanged.</p>
+<pre><code>use hopf_quic::QuicVersion::{V1, V2};
+
+// A listener accepts both by default; restrict it if you need to.
+server_cfg.versions(&amp;[V1, V2]);      // QuicServerConfig (or Arc::make_mut on the Arc the builders return)
+
+// A client speaks version 1 unless told otherwise. The first entry opens the
+// connection; if the server answers with Version Negotiation the client
+// restarts in the first listed version the server offers.
+client_cfg.versions(&amp;[V2, V1]);
+</code></pre>
+<ul>
+<li><strong>Dual stack.</strong> A client preferring v2 that meets a v1-only server receives a Version Negotiation packet and completes the handshake in v1 after one extra round trip. A client with no version in common abandons the attempt.</li>
+<li><strong>Downgrade protection.</strong> Both endpoints exchange and validate the <code>version_information</code> transport parameter (RFC 9368), so a forged Version Negotiation packet cannot silently force a v2-capable client down to v1.</li>
+<li><strong>Tickets.</strong> Session tickets (and so 0-RTT) are per version: a ticket earned over v1 is never offered on a v2 connection and vice versa.</li>
+<li><strong>Not implemented.</strong> Compatible version negotiation (RFC 9368 section 2.3), where a server upgrades a v1 first flight to v2 without a round trip. A client that wants v2 should ask for it in its first flight.</li>
+</ul>
 <h2 id="quic-lb">QUIC-LB connection IDs</h2>
 <p>A load balancer that forwards UDP by Destination Connection ID needs to find the owning backend from the CID alone, so a datagram keeps reaching the same server when the client's address changes. <code>hopf-quic</code> can issue such IDs following <a href="https://www.ietf.org/archive/id/draft-ietf-quic-load-balancers-21.html">draft-ietf-quic-load-balancers-21</a> (revision 21; the encoder lives in one module, <code>transport/quic_lb.rs</code>, so a later revision touches only that file).</p>
 <pre><code>use hopf_quic::{apply_server_quic_lb, QuicLbConfig};

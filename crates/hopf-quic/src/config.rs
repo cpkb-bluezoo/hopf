@@ -19,6 +19,7 @@ use crate::crypto::{hopf_client_config, hopf_server_config, HopfTlsBuildParams};
 use crate::hooks::ConnectionFactory;
 use crate::transport::endpoint::{ClientConfig as TransportClientConfig, ServerConfig as TransportServerConfig};
 use crate::transport::quic_lb::{ConnectionIdGenerator, QuicLbConfig};
+pub use crate::transport::version::QuicVersion;
 
 /// Quinn-compatible server config wrapping in-tree handshake settings.
 #[derive(Clone)]
@@ -79,6 +80,15 @@ impl QuicServerConfig {
     /// of 8 random octets. Every ID must have the generator's fixed length.
     pub fn connection_id_generator(&mut self, generator: Arc<dyn ConnectionIdGenerator>) {
         self.inner.cid_generator = Some(generator);
+    }
+
+    /// QUIC versions this listener accepts (default: every version this
+    /// stack speaks). Also what it offers in a Version Negotiation packet. An
+    /// empty list is ignored.
+    pub fn versions(&mut self, versions: &[QuicVersion]) {
+        if !versions.is_empty() {
+            self.inner.versions = versions.to_vec();
+        }
     }
 
     /// Migration flag.
@@ -146,6 +156,17 @@ impl QuicClientConfig {
     /// Clone transport config.
     pub(crate) fn transport(&self) -> TransportClientConfig {
         self.inner.clone()
+    }
+
+    /// QUIC versions to speak, most preferred first (default: version 1
+    /// only). The first is used for the first flight; if the server answers
+    /// with a Version Negotiation packet the client restarts in the first of
+    /// these the server offers (RFC 9000 section 6.2). An empty list is
+    /// ignored.
+    pub fn versions(&mut self, versions: &[QuicVersion]) {
+        if !versions.is_empty() {
+            self.inner.versions = versions.to_vec();
+        }
     }
 
     /// Apply transport options (no-op storage for echo — defaults used).

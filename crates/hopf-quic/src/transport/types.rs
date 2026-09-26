@@ -282,6 +282,9 @@ pub struct Incoming {
     pub src_cid: ConnectionId,
     /// Original Destination CID (for Retry).
     pub orig_dst_cid: ConnectionId,
+    /// QUIC version of the client's Initial: the version this connection
+    /// will speak.
+    pub(crate) version: crate::transport::version::QuicVersion,
     /// Raw Initial packet bytes (for accept).
     pub(crate) packet: Bytes,
     /// Whether the address was already validated (Retry/NEW_TOKEN).

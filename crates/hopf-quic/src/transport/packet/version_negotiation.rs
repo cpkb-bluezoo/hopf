@@ -9,10 +9,8 @@
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
+#[cfg(test)]
 use crate::transport::types::VERSION_V1;
-
-/// QUIC versions this endpoint speaks, most preferred first.
-pub const SUPPORTED_VERSIONS: &[u32] = &[VERSION_V1];
 
 /// Smallest UDP payload that could carry a client Initial in any supported
 /// version (RFC 9000 section 14.1): a server only answers unsupported
@@ -68,19 +66,19 @@ fn grease_version() -> u32 {
 }
 
 /// Build the Version Negotiation reply to a client packet whose SCID was
-/// `client_scid` and DCID `client_dcid`: the IDs are swapped so the client
-/// can recognise it (RFC 9000 section 17.2.1).
-pub fn build(client_scid: &[u8], client_dcid: &[u8]) -> Vec<u8> {
+/// `client_scid` and DCID `client_dcid`, offering `supported` versions: the
+/// IDs are swapped so the client can recognise it (RFC 9000 section 17.2.1).
+pub fn build(client_scid: &[u8], client_dcid: &[u8], supported: &[u32]) -> Vec<u8> {
     let mut first = [0u8; 1];
     let _ = SystemRandom::new().fill(&mut first);
-    let mut out = Vec::with_capacity(7 + client_scid.len() + client_dcid.len() + 4 * (SUPPORTED_VERSIONS.len() + 1));
+    let mut out = Vec::with_capacity(7 + client_scid.len() + client_dcid.len() + 4 * (supported.len() + 1));
     out.push(0x80 | (first[0] & 0x7f)); // unused bits are arbitrary
     out.extend_from_slice(&0u32.to_be_bytes());
     out.push(client_scid.len() as u8);
     out.extend_from_slice(client_scid);
     out.push(client_dcid.len() as u8);
     out.extend_from_slice(client_dcid);
-    for v in SUPPORTED_VERSIONS {
+    for v in supported {
         out.extend_from_slice(&v.to_be_bytes());
     }
     out.extend_from_slice(&grease_version().to_be_bytes());
@@ -95,7 +93,7 @@ mod tests {
     fn build_then_parse_round_trips_with_swapped_ids() {
         let client_scid = [1u8, 2, 3, 4, 5];
         let client_dcid: Vec<u8> = (0..30u8).collect();
-        let pkt = build(&client_scid, &client_dcid);
+        let pkt = build(&client_scid, &client_dcid, &[VERSION_V1]);
         let vn = parse(&pkt).expect("parses");
         assert_eq!(vn.dst_cid, client_scid);
         assert_eq!(vn.src_cid, client_dcid.as_slice());
@@ -108,7 +106,7 @@ mod tests {
     #[test]
     fn version_field_is_zero_and_form_bit_set_whatever_the_random_bits() {
         for _ in 0..64 {
-            let pkt = build(&[1], &[2]);
+            let pkt = build(&[1], &[2], &[VERSION_V1]);
             assert_eq!(pkt[0] & 0x80, 0x80);
             assert_eq!(&pkt[1..5], &[0, 0, 0, 0]);
         }
@@ -116,7 +114,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_non_vn_and_malformed_packets() {
-        let good = build(&[1, 2], &[3, 4]);
+        let good = build(&[1, 2], &[3, 4], &[VERSION_V1]);
         // Short header, non-zero version, empty / ragged version list, truncated CIDs.
         let mut short = good.clone();
         short[0] &= 0x7f;

@@ -2667,8 +2667,32 @@ mod smoke {
 
     #[test]
     fn h3_get_hello_over_quic() {
-        let (server_cfg, pem) = server_config_self_signed(&["localhost"], &[ALPN_H3]).unwrap();
-        let client_cfg = client_config_for_pem_bytes(&pem, &[ALPN_H3]).unwrap();
+        h3_get_hello(&[], &[]);
+    }
+
+    /// HTTP/3 rides on QUIC version 2 unchanged (RFC 9369 section 7): same
+    /// ALPN, same request and response.
+    #[test]
+    fn h3_get_hello_over_quic_version_2() {
+        use hopf_quic::QuicVersion::{V1, V2};
+        h3_get_hello(&[V1, V2], &[V2]);
+        h3_get_hello(&[V2], &[V2]);
+    }
+
+    /// A client preferring version 2 reaches a version 1 only server through
+    /// Version Negotiation.
+    #[test]
+    fn h3_get_hello_falls_back_from_version_2_to_version_1() {
+        use hopf_quic::QuicVersion::{V1, V2};
+        h3_get_hello(&[V1], &[V2, V1]);
+    }
+
+    /// GET / over HTTP/3 with the given QUIC versions (empty = defaults).
+    fn h3_get_hello(server_versions: &[hopf_quic::QuicVersion], client_versions: &[hopf_quic::QuicVersion]) {
+        let (mut server_cfg, pem) = server_config_self_signed(&["localhost"], &[ALPN_H3]).unwrap();
+        let mut client_cfg = client_config_for_pem_bytes(&pem, &[ALPN_H3]).unwrap();
+        Arc::make_mut(&mut server_cfg).versions(server_versions);
+        Arc::make_mut(&mut client_cfg).versions(client_versions);
 
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let hits2 = Arc::clone(&hits);

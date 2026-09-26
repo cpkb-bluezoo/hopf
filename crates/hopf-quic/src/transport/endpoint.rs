@@ -12,13 +12,14 @@ use hopf_core::tls::HandshakeConfig;
 
 use crate::transport::cid::CidMap;
 use crate::transport::connection::Connection;
-use crate::transport::packet::long_header::{self, TYPE_INITIAL, TYPE_RETRY};
+use crate::transport::packet::long_header::{self, TYPE_INITIAL};
 use crate::transport::packet::retry;
 use crate::transport::packet::version_negotiation as vn;
+use crate::transport::version::QuicVersion;
 use crate::transport::quic_lb::{ConnectionIdGenerator, RandomConnectionIdGenerator};
 use crate::transport::types::{
     ConnectionEvent, ConnectionHandle, ConnectionId, DatagramEvent, EndpointConfig, Incoming,
-    Transmit, VERSION_V1,
+    Transmit,
 };
 
 /// Server crypto + transport settings.
@@ -45,6 +46,9 @@ pub struct ServerConfig {
     /// Where server-issued connection IDs come from. `None` = 8 random
     /// octets; set it to issue QUIC-LB IDs (see [`crate::transport::quic_lb`]).
     pub cid_generator: Option<Arc<dyn ConnectionIdGenerator>>,
+    /// QUIC versions this listener accepts; also what a Version Negotiation
+    /// packet offers. Default: every version this stack speaks.
+    pub versions: Vec<QuicVersion>,
 }
 
 impl ServerConfig {
@@ -61,6 +65,7 @@ impl ServerConfig {
             initial_max_streams_uni: None,
             keep_alive_interval: None,
             cid_generator: None,
+            versions: QuicVersion::ALL.to_vec(),
         }
     }
 }
@@ -70,8 +75,10 @@ impl ServerConfig {
 pub struct ClientConfig {
     /// TLS handshake config.
     pub handshake: HandshakeConfig,
-    /// QUIC version.
-    pub version: u32,
+    /// QUIC versions this client speaks, most preferred first. The first is
+    /// used for the first flight; after a Version Negotiation packet the
+    /// client restarts in the first of these the server offers.
+    pub versions: Vec<QuicVersion>,
     /// Transport placeholder.
     pub transport: Arc<()>,
     /// Local `max_datagram_frame_size` (`None` = DATAGRAM disabled).
@@ -91,7 +98,7 @@ impl ClientConfig {
     pub fn new(handshake: HandshakeConfig) -> Self {
         Self {
             handshake,
-            version: VERSION_V1,
+            versions: vec![QuicVersion::V1],
             transport: Arc::new(()),
             max_datagram_frame_size: Some(1452),
             max_idle_timeout: None,
@@ -178,6 +185,8 @@ impl Endpoint {
             config.handshake,
             local_cid.clone(),
             initial_dcid,
+            &config.versions,
+            config.versions.first().copied().unwrap_or(QuicVersion::V1),
             config.max_datagram_frame_size,
             config.max_idle_timeout,
             config.initial_max_streams_bidi,
@@ -205,16 +214,17 @@ impl Endpoint {
             return None;
         }
         if data[0] & 0x80 != 0 {
-            // Anything but version 1 can't be parsed past the RFC 8999
-            // invariants, so it never reaches the v1 header parser below.
-            if let Some((version, dcid, scid)) = vn::parse_invariants(&data) {
-                if version != VERSION_V1 {
-                    return self.unsupported_version(version, dcid, scid, &data, remote, send_buf);
+            // A version we don't speak can't be parsed past the RFC 8999
+            // invariants, so it never reaches the header parsers below.
+            if let Some((wire, dcid, scid)) = vn::parse_invariants(&data) {
+                let usable = QuicVersion::from_wire(wire).is_some_and(|v| self.speaks(v));
+                if !usable {
+                    return self.unsupported_version(wire, dcid, scid, &data, remote, send_buf);
                 }
             }
-            let first_type = (data[0] >> 4) & 0x03;
-            // Retry has no Length; demux by DCID only.
-            if first_type == TYPE_RETRY {
+            // Retry has no Length; demux by DCID only. (Its type bits are
+            // version-specific, so this reads the version first.)
+            if long_header::is_retry(&data) {
                 let parsed = retry::parse(&data)?;
                 let handle = self.cids.get(&parsed.dst_cid)?;
                 return Some(DatagramEvent::ConnectionEvent(
@@ -229,17 +239,18 @@ impl Endpoint {
                     ConnectionEvent { datagram: data },
                 ));
             }
-            if prefix.packet_type == TYPE_INITIAL && prefix.version == VERSION_V1 {
+            if prefix.packet_type == TYPE_INITIAL {
                 if self.server.is_none() {
                     return None;
                 }
                 let (address_validated, orig_dst_cid, retry_local_cid) =
-                    self.validate_initial_token(&prefix.token, remote, &prefix.dst_cid);
+                    self.validate_initial_token(&prefix.token, remote, &prefix.dst_cid, prefix.version);
                 return Some(DatagramEvent::NewConnection(Incoming {
                     remote,
                     dst_cid: prefix.dst_cid.clone(),
                     src_cid: prefix.src_cid,
                     orig_dst_cid,
+                    version: prefix.version,
                     packet: data,
                     address_validated,
                     retry_local_cid,
@@ -281,13 +292,15 @@ impl Endpoint {
             let handle = self.cids.get(&ConnectionId::from_slice(dcid))?;
             return Some(DatagramEvent::ConnectionEvent(handle, ConnectionEvent { datagram: data.clone() }));
         }
-        if self.server.is_none()
-            || data.len() < vn::MIN_INITIAL_DATAGRAM_LEN
+        let Some(server) = self.server.as_ref() else {
+            return None;
+        };
+        if data.len() < vn::MIN_INITIAL_DATAGRAM_LEN
             || self.cids.get(&ConnectionId::from_slice(dcid)).is_some()
         {
             return None;
         }
-        let packet = vn::build(scid, dcid);
+        let packet = vn::build(scid, dcid, &server.versions.iter().map(|v| v.wire()).collect::<Vec<_>>());
         send_buf.clear();
         send_buf.extend_from_slice(&packet);
         Some(DatagramEvent::Response(Transmit {
@@ -299,11 +312,19 @@ impl Endpoint {
         }))
     }
 
+    /// Whether this endpoint speaks `version`: a listener only the versions
+    /// it is configured for, a client-only endpoint any (each of its
+    /// connections filters to the one it uses).
+    fn speaks(&self, version: QuicVersion) -> bool {
+        self.server.as_ref().is_none_or(|s| s.versions.contains(&version))
+    }
+
     fn validate_initial_token(
         &self,
         token: &[u8],
         remote: SocketAddr,
         packet_dst_cid: &ConnectionId,
+        version: QuicVersion,
     ) -> (bool, ConnectionId, Option<ConnectionId>) {
         if token.is_empty() {
             return (false, packet_dst_cid.clone(), None);
@@ -313,6 +334,7 @@ impl Endpoint {
         };
         match retry::unseal_token(
             &server.retry_token_key,
+            version,
             token,
             remote.ip(),
             server.retry_token_lifetime,
@@ -360,6 +382,8 @@ impl Endpoint {
             server.handshake,
             local_cid.clone(),
             initial_dcid,
+            incoming.version,
+            &server.versions,
             incoming.src_cid,
             incoming.orig_dst_cid,
             incoming.retry_local_cid.clone(),
@@ -385,11 +409,13 @@ impl Endpoint {
         let retry_scid = self.new_local_cid();
         let token = retry::seal_token(
             &server.retry_token_key,
+            incoming.version,
             incoming.orig_dst_cid.as_slice(),
             incoming.remote.ip(),
             SystemTime::now(),
         );
         let packet = retry::build_packet(
+            incoming.version,
             &incoming.src_cid,
             &retry_scid,
             incoming.orig_dst_cid.as_slice(),
@@ -532,7 +558,7 @@ mod tests {
         assert_eq!(version, 0);
         assert_eq!(vn_dcid, scid, "DCID is the client's SCID");
         assert_eq!(vn_scid, dcid, "SCID is the client's DCID");
-        assert!(versions.contains(&VERSION_V1), "{versions:x?}");
+        assert!(versions.contains(&QuicVersion::V1.wire()), "{versions:x?}");
         assert!(!versions.contains(&UNKNOWN_VERSION));
         assert!(vn.len() < MIN_INITIAL_DATAGRAM, "must not amplify");
     }
@@ -581,7 +607,7 @@ mod tests {
         let mut ep = endpoint(true);
         let dcid = ConnectionId::from_slice(&[7u8; 8]);
         let scid = ConnectionId::from_slice(&[8u8; 8]);
-        let mut d = long_header::build(TYPE_INITIAL, VERSION_V1, &dcid, &scid, &[], 0, 1, 1180);
+        let mut d = long_header::build(TYPE_INITIAL, QuicVersion::V1, &dcid, &scid, &[], 0, 1, 1180);
         d.resize(MIN_INITIAL_DATAGRAM, 0);
         let mut send_buf = Vec::new();
         let ev = ep.handle(Instant::now(), remote(), None, None, Bytes::from(d), &mut send_buf);
@@ -615,6 +641,7 @@ mod tests {
             dst_cid: ConnectionId::from_slice(&[7u8; 8]),
             src_cid: ConnectionId::from_slice(&[8u8; 8]),
             orig_dst_cid: ConnectionId::from_slice(&[7u8; 8]),
+            version: QuicVersion::V1,
             packet: Bytes::new(),
             address_validated: validated,
             retry_local_cid,
