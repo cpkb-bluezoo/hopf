@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use aws_lc_rs::cipher::{
     DecryptionContext, PaddedBlockDecryptingKey, PaddedBlockEncryptingKey, UnboundCipherKey, AES_128,
 };
-use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+use aws_lc_rs::rand::{generate, Random, SecureRandom, SystemRandom};
 
 use crate::transport::types::ConnectionId;
 
@@ -383,11 +383,11 @@ impl QuicLbGenerator {
         let n = st.next;
         st.next = (st.next + 1) & mask(bits);
         st.remaining -= 1;
-        // A nonce longer than the 16-octet counter is left-padded with zeros;
-        // the nonce is encrypted, so only its uniqueness matters.
+        // A nonce longer than the 16-octet counter gets random leading octets;
+        // the nonce is encrypted and uniqueness comes from the counter part.
         let be = n.to_be_bytes();
         let nonce_len = self.config.nonce_len;
-        let mut out = vec![0u8; nonce_len.saturating_sub(16)];
+        let mut out = random_octets(nonce_len.saturating_sub(16));
         out.extend_from_slice(&be[16usize.saturating_sub(nonce_len)..]);
         Some(out)
     }
@@ -396,6 +396,13 @@ impl QuicLbGenerator {
     fn set_remaining(&self, n: u128) {
         self.state.lock().unwrap().remaining = n;
     }
+}
+
+/// `n` (at most 18, the longest nonce a configuration allows) random octets.
+fn random_octets(n: usize) -> Vec<u8> {
+    debug_assert!(n <= 18);
+    let r: Random<[u8; 18]> = generate(&SystemRandom::new()).expect("system randomness");
+    r.expose()[..n].to_vec()
 }
 
 /// Bits of nonce counter: the whole nonce, up to the 128 a `u128` holds.
@@ -425,11 +432,7 @@ impl ConnectionIdGenerator for QuicLbGenerator {
             // Without a key the nonce is a plain field: it must have no
             // observable relationship between CIDs (section 5.4), so random
             // rather than a counter. Uniqueness is the endpoint's to enforce.
-            None => {
-                let mut nonce = vec![0u8; self.config.nonce_len];
-                let _ = SystemRandom::new().fill(&mut nonce);
-                self.config.encode(&nonce)
-            }
+            None => self.config.encode(&random_octets(self.config.nonce_len)),
         }
     }
 }
@@ -593,6 +596,18 @@ mod tests {
             assert_eq!(cid.as_slice()[0] & 0x1f, (cfg.cid_len() - 1) as u8);
             assert_eq!(cfg.decode_server_id(cid.as_slice()), None);
         }
+    }
+
+    /// The longest legal nonce (18 octets, beside a 1-octet server ID) has
+    /// more octets than the counter: still unique, still decodable.
+    #[test]
+    fn the_longest_nonce_stays_unique_and_decodable() {
+        let cfg = QuicLbConfig::new(0, &[0x42], 18).unwrap().with_key([6; 16]).unwrap();
+        let g = cfg.generator();
+        let cids: Vec<_> = (0..2000).map(|_| g.generate()).collect();
+        let distinct: std::collections::HashSet<_> = cids.iter().map(|c| c.as_slice().to_vec()).collect();
+        assert_eq!(distinct.len(), cids.len());
+        assert!(cids.iter().all(|c| cfg.decode_server_id(c.as_slice()) == Some(vec![0x42])));
     }
 
     #[test]
