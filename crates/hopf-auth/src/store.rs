@@ -2,7 +2,7 @@
 
 //! Credential store (Gumdrop `Realm` surface used by SASL / HTTP Digest).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::crypto::{
@@ -10,6 +10,7 @@ use crate::crypto::{
     sha256, from_hex,
 };
 use crate::mechanism::SaslMechanism;
+use crate::role::RolePolicy;
 use crate::{IdentityMaterial, PeerContext, TrustDecision, TrustPolicy};
 
 /// SCRAM-SHA-256 stored credentials (RFC 5802).
@@ -159,6 +160,8 @@ pub struct PasswordStore {
     scram_iterations: u32,
     /// Realm used to precompute HA1 at [`Self::insert`] / [`Self::with_user`].
     digest_realm: String,
+    /// Role names per enrolled username ([`RolePolicy`]).
+    roles: HashMap<String, HashSet<String>>,
 }
 
 impl PasswordStore {
@@ -250,9 +253,38 @@ impl PasswordStore {
         self
     }
 
+    /// Grant `role` to `username` ([`RolePolicy::is_user_in_role`]).
+    pub fn with_role(mut self, username: impl Into<String>, role: impl Into<String>) -> Self {
+        self.add_role(username, role);
+        self
+    }
+
+    /// Grant `role` to `username`.
+    pub fn add_role(&mut self, username: impl Into<String>, role: impl Into<String>) {
+        self.roles
+            .entry(username.into())
+            .or_default()
+            .insert(role.into());
+    }
+
     /// Shared trait object.
     pub fn shared(self) -> Arc<dyn CredentialStore> {
         Arc::new(self)
+    }
+}
+
+impl RolePolicy for PasswordStore {
+    fn is_user_in_role(&self, username: &str, role: &str) -> bool {
+        self.roles
+            .get(username)
+            .map(|r| r.contains(role))
+            .unwrap_or(false)
+    }
+}
+
+impl RolePolicy for Arc<PasswordStore> {
+    fn is_user_in_role(&self, username: &str, role: &str) -> bool {
+        (**self).is_user_in_role(username, role)
     }
 }
 
@@ -364,6 +396,20 @@ impl TrustPolicy for PasswordStore {
             }
             IdentityMaterial::Opaque(_) => TrustDecision::Reject,
         }
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    #[test]
+    fn password_store_role_membership() {
+        let store = PasswordStore::new()
+            .with_user("alice", "pw")
+            .with_role("alice", "webdav:read");
+        assert!(store.is_user_in_role("alice", "webdav:read"));
+        assert!(!store.is_user_in_role("alice", "webdav:write"));
     }
 }
 

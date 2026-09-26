@@ -710,3 +710,86 @@ fn cache_control_is_sent_on_file_responses_only_when_configured() {
     assert_eq!(header_value(&nm, "cache-control").as_deref(), Some("public, max-age=300"), "the 304 repeats it: {nm}");
     rt.shutdown();
 }
+
+#[test]
+fn acl_options_and_propfind_with_basic_auth() {
+    use hopf_auth::{PasswordStore, RolePolicy};
+    use hopf_http::auth::{BasicAuthConfig, BasicAuthFactory};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
+    let store = Arc::new(
+        PasswordStore::new()
+            .with_user("alice", "secret")
+            .with_role("alice", "webdav:read")
+            .with_role("alice", "webdav:write"),
+    );
+    let roles: Arc<dyn RolePolicy> = store.clone();
+    let storage = Arc::new(StorageExecutor::new(StorageConfig::default()));
+    let inner = Arc::new(
+        WebDavFactory::new(
+            WebDavConfig {
+                root_path: dir.path().to_path_buf(),
+                allow_write: true,
+                webdav_enabled: true,
+                allow_unauthenticated_access: true,
+                role_policy: Some(roles),
+                ..Default::default()
+            },
+            storage,
+        )
+        .unwrap(),
+    );
+    let policy: Arc<dyn hopf_auth::TrustPolicy> = store.clone();
+    let factory = Arc::new(BasicAuthFactory::new(
+        inner,
+        policy,
+        BasicAuthConfig::new("test"),
+    ));
+    let rt = Runtime::start(RuntimeConfig::default()).unwrap();
+    let factory2 = Arc::clone(&factory);
+    let (addr, _) = rt
+        .add_tcp_listener(TcpListenerConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            move || {
+                Box::new(CleartextHttpEndpoint::new(
+                    Arc::clone(&factory2) as Arc<dyn ServerHandlerFactory>,
+                    HttpLimits::default(),
+                )) as Box<dyn ProtocolHandler>
+            },
+        ))
+        .unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let options = http_exchange(
+        addr,
+        "OPTIONS / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\nConnection: close\r\n\r\n",
+    );
+    assert!(options.contains("200"), "{options}");
+    assert!(
+        options.to_ascii_lowercase().contains("access-control"),
+        "{options}"
+    );
+    assert!(options.contains("ACL"), "{options}");
+
+    let body = r#"<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:current-user-privilege-set/></D:prop></D:propfind>"#;
+    let propfind_req = format!(
+        "PROPFIND /hello.txt HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let propfind = http_exchange(addr, &propfind_req);
+    assert!(propfind.contains("207"), "{propfind}");
+    assert!(
+        propfind.contains("read") && propfind.contains("write"),
+        "{propfind}"
+    );
+
+    let acl = http_exchange(
+        addr,
+        "ACL /hello.txt HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic YWxpY2U6c2VjcmV0\r\nConnection: close\r\n\r\n",
+    );
+    assert!(acl.contains("403"), "{acl}");
+
+    rt.shutdown();
+}

@@ -16,6 +16,22 @@ use hopf_auth::{
 use crate::headers::Headers;
 use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
 
+/// Hopf-internal request header: authenticated username for downstream
+/// handlers (e.g. WebDAV RFC 3744). Set by auth wrappers in this module;
+/// never sent on the wire to clients.
+pub const AUTHENTICATED_USER: &str = "x-hopf-authenticated-user";
+
+fn forward_with_user(
+    inner: &mut dyn ServerHandler,
+    response: &mut dyn ServerWriter,
+    headers: &Headers,
+    username: &str,
+) {
+    let mut h = headers.clone();
+    h.set(AUTHENTICATED_USER, username);
+    inner.headers(response, &h);
+}
+
 /// Realm string for `WWW-Authenticate: Basic realm="…"`.
 #[derive(Debug, Clone)]
 pub struct BasicAuthConfig {
@@ -75,11 +91,15 @@ struct BasicAuthHandler {
 }
 
 impl BasicAuthHandler {
-    fn check_auth(&mut self, headers: &Headers) -> bool {
-        if let Some(id) = parse_basic_authorization(headers.get("authorization")) {
-            return self.policy.evaluate(&id, &PeerContext::unknown()) == TrustDecision::Accept;
+    fn check_auth(&mut self, headers: &Headers) -> Option<String> {
+        let id = parse_basic_authorization(headers.get("authorization"))?;
+        if self.policy.evaluate(&id, &PeerContext::unknown()) != TrustDecision::Accept {
+            return None;
         }
-        false
+        match id {
+            IdentityMaterial::UsernamePassword { username, .. } => Some(username),
+            _ => None,
+        }
     }
 
     fn send_challenge(&mut self, response: &mut dyn ServerWriter) {
@@ -98,9 +118,9 @@ impl BasicAuthHandler {
 
 impl ServerHandler for BasicAuthHandler {
     fn headers(&mut self, response: &mut dyn ServerWriter, headers: &Headers) {
-        if self.check_auth(headers) {
+        if let Some(username) = self.check_auth(headers) {
             self.authorized = true;
-            self.inner.headers(response, headers);
+            forward_with_user(&mut self.inner, response, headers, &username);
         } else {
             self.send_challenge(response);
         }
@@ -246,33 +266,33 @@ impl DigestAuthHandler {
         nonces.remove(nonce).is_some()
     }
 
-    fn check_auth(&mut self, headers: &Headers) -> bool {
+    fn check_auth(&mut self, headers: &Headers) -> Option<String> {
         let Some(auth) = headers.get("authorization") else {
-            return false;
+            return None;
         };
         let auth = auth.trim();
         let Some(creds) = auth
             .strip_prefix("Digest ")
             .or_else(|| auth.strip_prefix("digest "))
         else {
-            return false;
+            return None;
         };
         let params = parse_params(creds);
         let Some(username) = params.get("username") else {
-            return false;
+            return None;
         };
         let Some(nonce) = params.get("nonce") else {
-            return false;
+            return None;
         };
         // Consult (and consume) the tracked nonce *before* verifying the
         // credential hash — an untracked/expired/already-used nonce is
         // rejected outright, regardless of whether `response` is
         // otherwise cryptographically correct.
         if !self.consume_nonce(nonce) {
-            return false;
+            return None;
         }
         let Some(ha1) = self.store.digest_ha1(username, &self.realm) else {
-            return false;
+            return None;
         };
         let method = headers.method().unwrap_or("GET");
         let uri = params
@@ -280,7 +300,11 @@ impl DigestAuthHandler {
             .map(|s| s.as_str())
             .or_else(|| headers.path())
             .unwrap_or("/");
-        verify_authorization(creds, &ha1, method, uri, Some(nonce))
+        if verify_authorization(creds, &ha1, method, uri, Some(nonce)) {
+            Some(username.clone())
+        } else {
+            None
+        }
     }
 
     fn send_challenge(&mut self, response: &mut dyn ServerWriter) {
@@ -305,9 +329,9 @@ impl DigestAuthHandler {
 
 impl ServerHandler for DigestAuthHandler {
     fn headers(&mut self, response: &mut dyn ServerWriter, headers: &Headers) {
-        if self.check_auth(headers) {
+        if let Some(username) = self.check_auth(headers) {
             self.authorized = true;
-            self.inner.headers(response, headers);
+            forward_with_user(&mut self.inner, response, headers, &username);
         } else {
             self.send_challenge(response);
         }

@@ -19,6 +19,7 @@ xattr = ["dep:xattr"]
 integration = []
 
 [dependencies]
+hopf-auth = { workspace = true }
 hopf-core = { workspace = true }
 hopf-http = { workspace = true }
 tractrix = { workspace = true }

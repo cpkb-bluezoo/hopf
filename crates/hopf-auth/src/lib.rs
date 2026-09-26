@@ -19,6 +19,7 @@ pub mod oauth_introspection;
 pub mod oauthbearer;
 pub mod plain;
 pub mod scram;
+pub mod role;
 pub mod session;
 pub mod store;
 
@@ -34,6 +35,7 @@ pub use session::{
     create_client, create_server, SaslClient, SaslClientStep, SaslServer, SaslServerOptions,
     SaslServerStep,
 };
+pub use role::{RoleMembership, RolePolicy};
 pub use store::{
     CertificateIdentity, Cb, CredentialStore, PasswordStore, ScramCredentials, TokenValidation,
 };

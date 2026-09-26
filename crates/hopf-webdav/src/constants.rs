@@ -65,6 +65,40 @@ pub const PROP_RESOURCETYPE: &str = "resourcetype";
 pub const PROP_SOURCE: &str = "source";
 pub const PROP_SUPPORTEDLOCK: &str = "supportedlock";
 
+// RFC 3744 (WebDAV ACL)
+pub const ELEM_ACL: &str = "acl";
+pub const ELEM_ACE: &str = "ace";
+pub const ELEM_PRINCIPAL: &str = "principal";
+pub const ELEM_GRANT: &str = "grant";
+pub const ELEM_DENY: &str = "deny";
+pub const ELEM_PRIVILEGE: &str = "privilege";
+pub const ELEM_SUPPORTED_PRIVILEGE: &str = "supported-privilege";
+pub const ELEM_ABSTRACT: &str = "abstract";
+pub const ELEM_DESCRIPTION: &str = "description";
+pub const ELEM_AUTHENTICATED: &str = "authenticated";
+pub const ELEM_UNAUTHENTICATED: &str = "unauthenticated";
+pub const ELEM_ALL: &str = "all";
+
+pub const PRIV_READ: &str = "read";
+pub const PRIV_WRITE_PROPERTIES: &str = "write-properties";
+pub const PRIV_WRITE_CONTENT: &str = "write-content";
+pub const PRIV_UNLOCK: &str = "unlock";
+pub const PRIV_READ_ACL: &str = "read-acl";
+pub const PRIV_READ_CURRENT_USER_PRIVILEGE_SET: &str = "read-current-user-privilege-set";
+pub const PRIV_WRITE_ACL: &str = "write-acl";
+pub const PRIV_BIND: &str = "bind";
+pub const PRIV_UNBIND: &str = "unbind";
+
+pub const PROP_OWNER: &str = "owner";
+pub const PROP_GROUP: &str = "group";
+pub const PROP_SUPPORTED_PRIVILEGE_SET: &str = "supported-privilege-set";
+pub const PROP_CURRENT_USER_PRIVILEGE_SET: &str = "current-user-privilege-set";
+pub const PROP_ACL: &str = "acl";
+pub const PROP_PRINCIPAL_COLLECTION_SET: &str = "principal-collection-set";
+
+/// Prefix for [`hopf_auth::RolePolicy`] role names that map to RFC 3744 privileges.
+pub const ROLE_PREFIX: &str = "webdav:";
+
 pub const TIMEOUT_INFINITE: &str = "Infinite";
 pub const TIMEOUT_SECOND_PREFIX: &str = "Second-";
 pub const DEFAULT_LOCK_TIMEOUT_SECONDS: i64 = 3600;
