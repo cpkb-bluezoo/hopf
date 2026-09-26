@@ -4,9 +4,11 @@
 
 use crate::BerEncoder;
 
+use super::control::{encode_controls, Control};
 use super::filter::encode_filter;
 use super::types::{
-    SearchRequest, APP_BIND_REQUEST, APP_SEARCH_REQUEST, APP_UNBIND_REQUEST, LDAP_VERSION_3,
+    SearchRequest, APP_ABANDON_REQUEST, APP_BIND_REQUEST, APP_SEARCH_REQUEST, APP_UNBIND_REQUEST,
+    LDAP_VERSION_3,
 };
 
 /// Encode a simple BindRequest LDAPMessage.
@@ -25,6 +27,12 @@ pub fn encode_bind_request(message_id: i32, dn: &str, password: &str) -> Vec<u8>
 
 /// Encode a SearchRequest LDAPMessage.
 pub fn encode_search_request(message_id: i32, request: &SearchRequest) -> Vec<u8> {
+    encode_search_request_with_controls(message_id, request, &[])
+}
+
+/// Encode a SearchRequest LDAPMessage carrying `controls` (RFC 4511
+/// section 4.1.11), e.g. an RFC 4533 Sync Request Control.
+pub fn encode_search_request_with_controls(message_id: i32, request: &SearchRequest, controls: &[Control]) -> Vec<u8> {
     let mut enc = BerEncoder::new();
     enc.begin_sequence();
     enc.write_integer_i32(message_id);
@@ -42,8 +50,32 @@ pub fn encode_search_request(message_id: i32, request: &SearchRequest) -> Vec<u8
     }
     enc.end_sequence();
     enc.end_application();
+    encode_controls(&mut enc, controls);
     enc.end_sequence();
     enc.into_bytes()
+}
+
+/// Encode an AbandonRequest LDAPMessage (RFC 4511 section 4.11):
+/// `[APPLICATION 16] MessageID`, an INTEGER with an implicit application tag.
+/// Abandon has no response; it is how a client ends an operation such as a
+/// persistent content synchronisation (RFC 4533 section 3.7).
+pub fn encode_abandon_request(message_id: i32, abandon_id: i32) -> Vec<u8> {
+    let mut enc = BerEncoder::new();
+    enc.begin_sequence();
+    enc.write_integer_i32(message_id);
+    enc.write_application(APP_ABANDON_REQUEST, &minimal_integer(abandon_id));
+    enc.end_sequence();
+    enc.into_bytes()
+}
+
+/// Two's-complement big-endian content octets of an INTEGER, minimal length.
+fn minimal_integer(value: i32) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let mut start = 0;
+    while start < 3 && ((bytes[start] == 0x00 && bytes[start + 1] & 0x80 == 0) || (bytes[start] == 0xff && bytes[start + 1] & 0x80 != 0)) {
+        start += 1;
+    }
+    bytes[start..].to_vec()
 }
 
 /// Encode an UnbindRequest LDAPMessage.
@@ -89,7 +121,7 @@ pub fn encode_extended_request(
 mod tests {
     use super::*;
     use crate::{Asn1Type, BerDecoder};
-    use crate::client::types::{SearchScope, APP_BIND_RESPONSE};
+    use crate::client::types::{SearchScope, APP_ABANDON_REQUEST, APP_BIND_RESPONSE};
 
     #[test]
     fn bind_request_round_trip_decode() {
@@ -177,5 +209,40 @@ mod tests {
             op.child(0).as_string().as_deref(),
             Some(OID_STARTTLS)
         );
+    }
+
+    #[test]
+    fn search_request_carries_controls_after_the_operation() {
+        use crate::client::control::Control;
+        let req = SearchRequest::new("dc=example,dc=com", "(objectClass=*)");
+        let control = Control { oid: "1.2.3".into(), critical: true, value: Some(vec![0x30, 0x00]) };
+        let bytes = encode_search_request_with_controls(4, &req, std::slice::from_ref(&control));
+        let mut dec = BerDecoder::new();
+        dec.receive(&bytes).unwrap();
+        let msg = dec.next().unwrap();
+        assert_eq!(msg.child_count(), 3, "id, operation, controls");
+        assert_eq!(msg.child(2).tag(), Asn1Type::context_tag(0, true));
+        assert_eq!(crate::client::control::decode_controls(&msg).unwrap(), vec![control]);
+        // Without controls the message is unchanged.
+        let plain = encode_search_request(4, &req);
+        let mut dec = BerDecoder::new();
+        dec.receive(&plain).unwrap();
+        assert_eq!(dec.next().unwrap().child_count(), 2);
+    }
+
+    /// RFC 4511 section 4.11: `AbandonRequest ::= [APPLICATION 16] MessageID`.
+    #[test]
+    fn abandon_request_is_an_application_16_integer() {
+        for (target, content) in [(1, vec![0x01]), (127, vec![0x7f]), (128, vec![0x00, 0x80]), (256, vec![0x01, 0x00]), (65_536, vec![0x01, 0x00, 0x00])] {
+            let bytes = encode_abandon_request(9, target);
+            let mut dec = BerDecoder::new();
+            dec.receive(&bytes).unwrap();
+            let msg = dec.next().unwrap();
+            assert_eq!(msg.child(0).as_i32().unwrap(), 9);
+            let op = msg.child(1);
+            assert_eq!(op.tag(), Asn1Type::application_tag(APP_ABANDON_REQUEST, false));
+            assert_eq!(op.as_octet_string(), Some(content.as_slice()), "target {target}");
+            assert_eq!(op.as_i32().unwrap(), target);
+        }
     }
 }

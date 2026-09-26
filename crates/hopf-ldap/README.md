@@ -6,7 +6,7 @@ LDAPv3 client and [`CredentialStore`](../hopf-auth) backend for Hopf
 | Module | Role |
 |--------|------|
 | `asn1` | Definite-length BER codec (ITU-T X.690 subset used by LDAP) |
-| `client` | Async LDAPv3 bind / search / unbind on the Hopf Runtime |
+| `client` | Async LDAPv3 bind / search / unbind on the Hopf Runtime, plus RFC 4533 content synchronization (`LdapSession::sync`, `SyncReplica`) |
 | `store` | `LdapCredentialStore` — search-then-bind Realm |
 
 `CredentialStore` stays LDAP-free in `hopf-auth`; this crate plugs in as a

@@ -14,9 +14,12 @@ pub mod client;
 pub mod store;
 
 pub use client::{
-    BindResult, LdapClient, LdapClientConfig, LdapError, LdapResultCode, LdapSession, LdapUrl,
-    SearchDone, SearchEntry, SearchRequest, SearchScope, DEFAULT_LDAP_PORT, DEFAULT_LDAPS_PORT,
-    DEFAULT_MAX_REFERRAL_HOPS, OID_STARTTLS,
+    BindResult, Control, LdapClient, LdapClientConfig, LdapError, LdapResultCode, LdapSession,
+    LdapUrl, ReplicaError, SearchDone, SearchEntry, SearchRequest, SearchScope, SyncDone,
+    SyncEvent, SyncHandle, SyncInfo, SyncMode, SyncReplica, SyncRequest, SyncState,
+    SyncStateValue, DEFAULT_LDAP_PORT, DEFAULT_LDAPS_PORT, DEFAULT_MAX_REFERRAL_HOPS,
+    OID_STARTTLS, OID_SYNC_DONE_CONTROL, OID_SYNC_INFO_MESSAGE, OID_SYNC_REQUEST_CONTROL,
+    OID_SYNC_STATE_CONTROL,
 };
 pub use store::{escape_ldap_filter, LdapCredentialStore, LdapStoreConfig};
 

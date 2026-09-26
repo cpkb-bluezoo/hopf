@@ -81,6 +81,7 @@
 <li><a href="#client">Client</a></li>
 <li><a href="#ldaps">LDAPS / STARTTLS</a></li>
 <li><a href="#referrals">Referral chase</a></li>
+<li><a href="#content-sync">Content synchronization</a></li>
 <li><a href="#store">LdapCredentialStore</a></li>
 <li><a href="#wiring">Wiring mail services</a></li>
 <li><a href="#limitations">Limitations</a></li>
@@ -95,6 +96,7 @@
 <tr><td>LDAPv3</td><td>RFC 4511</td></tr>
 <tr><td>Authentication methods / LDAPS</td><td>RFC 4513</td></tr>
 <tr><td>String representation of filters</td><td>RFC 4515</td></tr>
+<tr><td>Content Synchronization (syncrepl), client side</td><td>RFC 4533</td></tr>
 <tr><td>BER (definite length)</td><td>ITU-T X.690 (LDAP subset)</td></tr>
 </tbody>
 </table>
@@ -140,6 +142,31 @@ LdapClient<span class="op">::</span>connect(<span class="op">&amp;</span>rt<span
 
 <h2 id="referrals">Referral chase</h2>
 <p><code>LdapCredentialStore</code> does <strong>not</strong> chase search/bind referrals by default (enable with <code>with_chase_referrals(true)</code>; hop cap <code>max_referral_hops</code>, default 5). URLs are parsed per RFC 4516 (<code>ldap://</code> / <code>ldaps://</code>); empty DN in the URL keeps the referring operation’s base DN (RFC 4511 §4.1.10). <code>ldaps://</code> referrals need a TLS connector already configured on the store.</p>
+
+<h2 id="content-sync">Content synchronization (RFC 4533)</h2>
+<p>A client that keeps a local copy of a directory subtree can resume incrementally after a disconnect instead of polling full search results. <code>LdapSession::sync</code> is an ordinary search carrying the Sync Request Control; its events are the server's entries (each tagged with a Sync State Control), cookie updates and phase markers, delivered on the reactor in the order sent. <code>SyncReplica</code> applies them.</p>
+<pre><code>let mut replica = SyncReplica::new();          // cookie() is None: an initial sync
+
+replica.begin_refresh();
+let mut request = SyncRequest::new(SyncMode::RefreshOnly);
+if let Some(c) = replica.cookie() { request = request.with_cookie(c.to_vec()); }
+
+session.sync(
+    SearchRequest::new("dc=example,dc=com", "(objectClass=*)"),
+    request,
+    move |event| { let _ = replica.apply(&amp;event); },     // entries, cookies, phase markers
+    move |done| { /* Ok(SyncDone): replica.finish(&amp;done); Err(_): failed or cancelled */ },
+);
+</code></pre>
+<ul>
+<li><strong>Modes.</strong> <code>RefreshOnly</code> is a poll: the changes since the cookie, then <code>on_done</code>. <code>RefreshAndPersist</code> sends the same refresh, marks its end with a Sync Info Message, then leaves the search open and streams changes as they happen. <code>SyncHandle::cancel</code> ends it with an Abandon (RFC 4533 §3.7) and completes <code>on_done</code> with <code>LdapError::Cancelled</code>.</li>
+<li><strong>Non-blocking.</strong> Nothing waits: a persistent sync is one outstanding search on the connection. Callbacks run on the reactor and must not block; other operations on the same session proceed while it is open.</li>
+<li><strong>Cookies.</strong> Resume from the newest cookie received, from any source (an entry, a Sync Info message, the final Sync Done). <code>SyncReplica::cookie</code> tracks it. <code>e-syncRefreshRequired</code> (<code>LdapResultCode::SyncRefreshRequired</code>) is delivered as <code>Ok</code> because it is an instruction: <code>finish</code> resets the replica, and the caller reloads with no cookie. Every other failing result code is an <code>Err(SearchFailed)</code>.</li>
+<li><strong>Present and delete phases.</strong> Entries are keyed by <code>entryUUID</code>, never DN. <code>add</code>/<code>modify</code> replace, <code>delete</code> removes, and a <em>present</em> entry (or a UUID in a <code>syncIdSet</code>) is unchanged and adopts any renamed DN. A refresh that ends on a present phase removes every held entry it did not confirm, because the server says nothing about entries that are gone; a refresh that ends on a delete phase removes only what it names. All three server styles of RFC 4533 §3.3.2 converge.</li>
+<li><strong>Errors.</strong> An unreadable Sync Info Message ends the operation with <code>LdapError::Protocol</code> and abandons the search, because carrying on could silently lose a cookie or a phase boundary. An entry with no readable Sync State Control makes <code>SyncReplica::apply</code> return <code>ReplicaError::MissingSyncState</code> rather than guess its identity.</li>
+<li><strong>Controls.</strong> The message layer now carries LDAP controls both ways (<code>Control</code>, <code>encode_search_request_with_controls</code>) and understands IntermediateResponse and Abandon, so other controls can be layered on the same plumbing.</li>
+<li><strong>Not implemented.</strong> The server side of RFC 4533, and the search-time interactions with other controls of section 5.</li>
+</ul>
 
 <h2 id="store">LdapCredentialStore</h2>
 <p>Search-then-bind (Gumdrop <code>LDAPRealm.passwordMatch</code>):</p>

@@ -987,7 +987,7 @@
 <thead><tr><th>Protocol</th><th>Gumdrop (reference)</th><th>hopf status</th></tr></thead>
 <tbody>
 <tr><td>SOCKS proxy</td><td>SOCKS4/4a/5, CONNECT/BIND/UDP ASSOCIATE, RFC 1929 auth, RFC 1961 GSSAPI</td><td><strong>Partial.</strong> Crate <code>hopf-socks</code>: SOCKS4/4a/5, CONNECT, BIND, UDP ASSOCIATE, RFC 1929 username/password (server and client). RFC 1961 GSSAPI auth not implemented — planned with optional GSSAPI SASL in <code>hopf-auth</code></td></tr>
-<tr><td>LDAP client</td><td>RFC 4511 client, BER, CredentialStore</td><td><strong>Started (v1).</strong> Crate <code>hopf-ldap</code>: definite-length BER, async bind/search/unbind, LDAPS/STARTTLS, <code>LdapCredentialStore</code>, referral chase. Non-goals: directory admin API, SASL bind to the directory</td></tr>
+<tr><td>LDAP client</td><td>RFC 4511 client, BER, CredentialStore</td><td><strong>Started (v1).</strong> Crate <code>hopf-ldap</code>: definite-length BER, async bind/search/unbind, LDAPS/STARTTLS, <code>LdapCredentialStore</code>, referral chase, LDAP controls, and the client side of RFC 4533 content synchronization (refresh-only and refresh-and-persist, cookie resume, present/delete phases, <code>e-syncRefreshRequired</code>, Abandon; see <a href="ldap.html#content-sync">LDAP</a>). Non-goals: directory admin API, SASL bind to the directory</td></tr>
 <tr><td>Redis client</td><td>RESP client</td><td>Not started</td></tr>
 <tr><td>CoAP / CoAPS</td><td>—</td><td>Not started; CoAPS depends on planned DTLS</td></tr>
 <tr><td>SSH / SFTP / SCP</td><td>—</td><td>Not started; SSH KEX + channels (parallel transport family, not TLS)</td></tr>

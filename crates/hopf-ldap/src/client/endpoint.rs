@@ -13,11 +13,16 @@ use hopf_core::asn1::BerEventSink;
 
 use crate::{Asn1Element, Asn1Error, Asn1Type, BerDecoder};
 
+use super::control::{decode_controls, Control};
+use super::message::encode_abandon_request;
 use super::session::{LdapSession, LdapShared, PendingOp, ReadyCallback, StartTlsCallback};
+use super::sync::{
+    find_sync_done, find_sync_state, SyncDone, SyncEvent, SyncInfo, OID_SYNC_INFO_MESSAGE,
+};
 use super::types::{
     BindResult, LdapError, LdapResultCode, SearchDone, SearchEntry, APP_BIND_RESPONSE,
-    APP_EXTENDED_RESPONSE, APP_SEARCH_RESULT_DONE, APP_SEARCH_RESULT_ENTRY,
-    APP_SEARCH_RESULT_REFERENCE, CTX_REFERRAL,
+    APP_EXTENDED_RESPONSE, APP_INTERMEDIATE_RESPONSE, APP_SEARCH_RESULT_DONE,
+    APP_SEARCH_RESULT_ENTRY, APP_SEARCH_RESULT_REFERENCE, CTX_REFERRAL,
 };
 
 /// Reactor-side LDAP client endpoint.
@@ -117,16 +122,22 @@ impl LdapEndpoint {
             return Ok(());
         }
 
+        // The optional `[0] Controls` after the operation (RFC 4511 4.1.1).
+        let controls = decode_controls(&message)?;
+
         match tag_number {
             n if n == APP_BIND_RESPONSE => self.handle_bind_response(message_id, protocol_op)?,
             n if n == APP_SEARCH_RESULT_ENTRY => {
-                self.handle_search_entry(message_id, protocol_op)?;
+                self.handle_search_entry(message_id, protocol_op, &controls)?;
             }
             n if n == APP_SEARCH_RESULT_DONE => {
-                self.handle_search_done(message_id, protocol_op)?;
+                self.handle_search_done(message_id, protocol_op, &controls)?;
             }
             n if n == APP_SEARCH_RESULT_REFERENCE => {
-                self.handle_search_reference(message_id, protocol_op)?;
+                self.handle_search_reference(message_id, protocol_op, &controls)?;
+            }
+            n if n == APP_INTERMEDIATE_RESPONSE => {
+                self.handle_intermediate_response(message_id, protocol_op);
             }
             n if n == APP_EXTENDED_RESPONSE => {
                 self.handle_extended_response(endpoint, message_id, protocol_op)?;
@@ -198,6 +209,7 @@ impl LdapEndpoint {
         &mut self,
         message_id: i32,
         element: &Asn1Element,
+        controls: &[Control],
     ) -> Result<(), Asn1Error> {
         if element.child_count() < 2 {
             return Err(Asn1Error::new("Invalid SearchResultEntry structure"));
@@ -229,8 +241,13 @@ impl LdapEndpoint {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(PendingOp::Search { on_entry, .. }) = pending.get_mut(&message_id) {
-            on_entry(entry);
+        match pending.get_mut(&message_id) {
+            Some(PendingOp::Search { on_entry, .. }) => on_entry(entry),
+            Some(PendingOp::Sync { on_event, .. }) => {
+                let state = find_sync_state(controls);
+                on_event(SyncEvent::Entry { entry, state });
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -239,28 +256,77 @@ impl LdapEndpoint {
         &mut self,
         message_id: i32,
         element: &Asn1Element,
+        controls: &[Control],
     ) -> Result<(), Asn1Error> {
         let mut pending = self
             .shared
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(PendingOp::Search { referrals, .. }) = pending.get_mut(&message_id) {
-            for i in 0..element.child_count() {
-                if let Some(url) = element.child(i).as_string() {
-                    if !url.is_empty() {
-                        referrals.push(url);
-                    }
+        let urls = || {
+            (0..element.child_count())
+                .filter_map(|i| element.child(i).as_string())
+                .filter(|u| !u.is_empty())
+                .collect::<Vec<_>>()
+        };
+        match pending.get_mut(&message_id) {
+            Some(PendingOp::Search { referrals, .. }) => referrals.extend(urls()),
+            // A sync reference is content: it carries its own sync state (a
+            // present or delete has an empty URL list), so deliver it as an
+            // event rather than folding it into the referral list.
+            Some(PendingOp::Sync { on_event, .. }) => {
+                on_event(SyncEvent::Reference { urls: urls(), state: find_sync_state(controls) });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// RFC 4511 section 4.13 IntermediateResponse: `SEQUENCE { responseName
+    /// [0] LDAPOID OPTIONAL, responseValue [1] OCTET STRING OPTIONAL }`. Only
+    /// the RFC 4533 Sync Info Message is understood, and only for a sync
+    /// operation; anything else is ignored.
+    fn handle_intermediate_response(&mut self, message_id: i32, element: &Asn1Element) {
+        let mut name = None;
+        let mut value = None;
+        for i in 0..element.child_count() {
+            let part = element.child(i);
+            match Asn1Type::tag_number(part.tag()) {
+                0 => name = part.as_string(),
+                1 => value = part.as_octet_string().map(<[u8]>::to_vec),
+                _ => {}
+            }
+        }
+        if name.as_deref() != Some(OID_SYNC_INFO_MESSAGE) {
+            return;
+        }
+        let parsed = value.as_deref().map(SyncInfo::parse);
+        let mut pending = self.shared.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match parsed {
+            Some(Ok(info)) => {
+                if let Some(PendingOp::Sync { on_event, .. }) = pending.get_mut(&message_id) {
+                    on_event(info.into_event());
+                }
+            }
+            // A server that sends an unreadable Sync Info Message has broken
+            // the protocol: carrying on would let the replica silently miss
+            // a cookie or a phase boundary, so end the operation instead.
+            _ => {
+                if let Some(PendingOp::Sync { on_done, .. }) = pending.remove(&message_id) {
+                    drop(pending);
+                    let abandon = self.shared.alloc_message_id();
+                    let _ = self.shared.send_bytes(encode_abandon_request(abandon, message_id));
+                    on_done(Err(LdapError::Protocol("malformed syncInfoValue".into())));
                 }
             }
         }
-        Ok(())
     }
 
     fn handle_search_done(
         &mut self,
         message_id: i32,
         element: &Asn1Element,
+        controls: &[Control],
     ) -> Result<(), Asn1Error> {
         let (code, _, _, mut result_referrals) = Self::parse_result(element)?;
         let op = self
@@ -269,6 +335,29 @@ impl LdapEndpoint {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&message_id);
+        if let Some(PendingOp::Sync { on_done, mut referrals, .. }) = op {
+            referrals.append(&mut result_referrals);
+            // Success ends a poll; e-syncRefreshRequired tells the caller to
+            // reload. Both are outcomes to act on, so both are `Ok`.
+            if !(code.is_success() || code == LdapResultCode::SyncRefreshRequired) {
+                on_done(Err(LdapError::SearchFailed(code)));
+                return Ok(());
+            }
+            let done = match find_sync_done(controls) {
+                Ok(d) => d,
+                Err(_) => {
+                    on_done(Err(LdapError::Protocol("malformed syncDoneValue".into())));
+                    return Ok(());
+                }
+            };
+            on_done(Ok(SyncDone {
+                result_code: code,
+                cookie: done.cookie,
+                refresh_deletes: done.refresh_deletes,
+                referrals,
+            }));
+            return Ok(());
+        }
         if let Some(PendingOp::Search {
             on_done,
             mut referrals,
@@ -359,6 +448,7 @@ impl ErrCloneCompat for LdapError {
             Self::StartTlsFailed(c) => Self::StartTlsFailed(*c),
             Self::Referral(m) => Self::Referral(m.clone()),
             Self::Config(m) => Self::Config(m.clone()),
+            Self::Cancelled => Self::Cancelled,
         }
     }
 }
