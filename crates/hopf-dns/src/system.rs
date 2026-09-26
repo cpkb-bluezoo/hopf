@@ -8,6 +8,41 @@ use std::net::{IpAddr, SocketAddr};
 
 use crate::client::DEFAULT_DNS_PORT;
 
+/// The nameservers the host is actually configured with: `nameserver` lines
+/// of `/etc/resolv.conf` on Unix. Empty - not an error - when the file is
+/// missing or names none, which is when a resolver should use the well-known
+/// public fallbacks ([`crate::client::DnsResolver::use_public_resolvers`]).
+/// On Windows nothing is read yet, so this is always empty.
+pub fn configured_nameservers() -> io::Result<Vec<SocketAddr>> {
+    #[cfg(windows)]
+    {
+        Ok(Vec::new())
+    }
+    #[cfg(not(windows))]
+    {
+        let file = match File::open("/etc/resolv.conf") {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut out = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            let line = line.split('#').next().unwrap_or("").trim();
+            let mut parts = line.split_whitespace();
+            if parts.next() != Some("nameserver") {
+                continue;
+            }
+            if let Some(ip_s) = parts.next() {
+                if let Ok(ip) = ip_s.parse::<IpAddr>() {
+                    out.push(SocketAddr::new(ip, DEFAULT_DNS_PORT));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Parse nameserver lines from `/etc/resolv.conf` (Unix).
 pub fn system_nameservers() -> io::Result<Vec<SocketAddr>> {
     #[cfg(windows)]

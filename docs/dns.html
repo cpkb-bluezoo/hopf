@@ -501,8 +501,23 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 </tbody>
 </table>
 <h3 id="resolver-setters">Resolver setters</h3>
-<p><code>set_timeout</code>, <code>set_cache</code> / <code>cache</code>, <code>add_server</code> / <code>add_server_str</code> (UDP+TCP-fallback), <code>add_server_dot</code> (<code>dot</code> feature), <code>add_server_doq</code> (<code>doq</code> feature), <code>add_server_doh</code> (<code>doh</code> feature), <code>use_public_resolvers</code>, <code>use_system_resolvers</code>, <code>set_dnssec_enabled</code>, <code>set_dnssec_validator</code>.</p>
+<p><code>set_timeout</code>, <code>set_cache</code> / <code>cache</code>, <code>add_server</code> / <code>add_server_str</code> (UDP+TCP-fallback), <code>add_server_dot</code> (<code>dot</code> feature), <code>add_server_doq</code> (<code>doq</code> feature), <code>add_server_doh</code> (<code>doh</code> feature), <code>use_public_resolvers</code> (Cloudflare, Quad9 and Google over IPv6 and IPv4 - see <a href="#public-fallbacks">below</a>), <code>use_system_resolvers</code>, <code>set_dnssec_enabled</code>, <code>set_dnssec_validator</code>.</p>
 <p><strong>Note:</strong> addresses passed to any <code>add_server*</code> method must be <strong>pre-resolved</strong>. <code>add_server_dot</code> takes a TLS SNI name + <code>SharedTlsConnector</code>; <code>add_server_doq</code> takes a TLS SNI name + <code>Arc&lt;QuicClientConfig&gt;</code> (ALPN <code>doq</code>); <code>add_server_doh</code> takes an <code>Arc&lt;Runtime&gt;</code> (needed to dial), host/path, a <code>SharedTlsConnector</code>, and a GET-vs-POST flag.</p>
+<h3 id="public-fallbacks">Public fallback resolvers and IPv6</h3>
+<p>When the host has no nameserver configured (<code>/etc/resolv.conf</code> missing or empty), <code>use_system_resolvers</code> falls back to the well-known public resolvers, as does an explicit <code>use_public_resolvers()</code>. Nameservers from <code>resolv.conf</code>, and anything added with <code>add_server*</code>, are used exactly as configured and are never subject to what follows.</p>
+<p>The list is Cloudflare, Quad9, then Google (Google last, having no DNS over QUIC), each provider's IPv6 address placed just ahead of its IPv4 one, primaries then secondaries:</p>
+<pre><code>2606:4700:4700::1111  1.1.1.1      2620:fe::fe  9.9.9.9      2001:4860:4860::8888  8.8.8.8
+2606:4700:4700::1001  1.0.0.1      2620:fe::9   149.112.112.112   2001:4860:4860::8844  8.8.4.4
+</code></pre>
+<p>Interleaving means a dead address family cannot stack timeouts: a query advances only after the query timeout (5&nbsp;s by default), so listing all six IPv6 addresses first would cost 30&nbsp;s on a host without IPv6. Instead each IPv6 entry is subject to three separate signals, each with its own bounded memory:</p>
+<ol>
+<li><strong>No route.</strong> Before using an IPv6 fallback the resolver asks the kernel, sending nothing (a connected UDP socket's source address). No route, no IPv6 at all, or only link-local, loopback or unique-local addresses means no path to the public IPv6 internet: every IPv6 fallback is skipped instantly and not probed again for 5 minutes, so a host that later gains IPv6 is noticed.</li>
+<li><strong>This address failed.</strong> A timeout marks that one address bad for 2 minutes. Other IPv6 addresses stay eligible, so providers cover each other and the probe moves on to the next provider.</li>
+<li><strong>Path blackholed.</strong> When IPv6 addresses of two or more providers have timed out and an IPv4 address answers, or when a hedged IPv4 copy beats the IPv6 attempt, IPv6 loses its head start for 5 minutes. An answer over IPv6 restores it immediately.</li>
+</ol>
+<p><strong>Head start.</strong> While IPv6 is eligible it is tried first, but only briefly: if nothing has come back after 250&nbsp;ms (RFC 8305's connection attempt delay) the same query is also sent to that provider's IPv4 address and the first answer wins. A timeout of the pair skips to the next provider rather than repeating the IPv4 address. IPv4 addresses always stay in the list.</p>
+<p><strong>Encrypted transports.</strong> Every listed address is seeded with the encrypted transports its operator is known to offer, and a dynamically chosen transport that <em>times out</em> (for instance UDP/853 filtered) is now demoted just like one that errors, so a network that blocks DoQ costs one query timeout per address, once, before falling back to DoT or plain UDP, instead of one on every lookup. A hedged copy uses the same transport selection as the primary attempt, so hedging never downgrades a query to cleartext.</p>
+<p>Not covered: a filtered encrypted transport is learned per address, not per provider, so each address of an affected provider pays its one timeout; and an explicitly configured IPv6 nameserver is never probed or skipped.</p>
 <h3 id="cargo-features">Cargo features</h3>
 <table>
 <thead>

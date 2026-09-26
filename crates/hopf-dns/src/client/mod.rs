@@ -5,6 +5,7 @@
 mod capability_cache;
 mod ddr;
 mod hosts;
+mod public_fallback;
 mod tcp;
 mod udp;
 
@@ -26,7 +27,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mio::Token;
 use hopf_core::{ReactorHandle, Runtime, UdpDatagramHandler};
@@ -153,6 +154,12 @@ struct ConfiguredServer {
     /// or populates the capability cache, so it can't be silently
     /// overridden by cached or discovered data for that address.
     auto: bool,
+    /// `Some` for a server added as part of the well-known public fallback
+    /// list ([`DnsResolver::use_public_resolvers`], or system discovery
+    /// finding no nameserver): only these get the IPv6 reachability policy of
+    /// [`public_fallback`]. A nameserver from `resolv.conf` or an explicit
+    /// `add_server*` never does.
+    well_known: Option<public_fallback::WellKnown>,
 }
 
 impl ConfiguredServer {
@@ -161,11 +168,47 @@ impl ConfiguredServer {
             addr,
             transport: ServerTransport::UdpTcp,
             auto: true,
+            well_known: None,
+        }
+    }
+}
+
+/// How the resolver learns whether the host can reach a destination over
+/// IPv6: `Ok(source address)` the kernel would use, or the error routing
+/// failed with. The default asks the kernel with an unconnected-then-connected
+/// UDP socket, which sends nothing; tests substitute a simulation.
+type RouteProbe = Arc<dyn Fn(SocketAddr) -> io::Result<IpAddr> + Send + Sync>;
+
+fn kernel_route_probe(target: SocketAddr) -> io::Result<IpAddr> {
+    let socket = std::net::UdpSocket::bind("[::]:0")?;
+    socket.connect(target)?;
+    Ok(socket.local_addr()?.ip())
+}
+
+/// Reachability state for the well-known public fallbacks.
+struct FallbackState {
+    health: public_fallback::Ipv6Health,
+    probe: RouteProbe,
+    /// The IPv6 UDP socket, if the host could bind one.
+    udp6_token: Option<Token>,
+}
+
+impl Default for FallbackState {
+    fn default() -> Self {
+        Self {
+            health: public_fallback::Ipv6Health::default(),
+            probe: Arc::new(kernel_route_probe),
+            udp6_token: None,
         }
     }
 }
 
 struct PendingQuery {
+    /// Set once a hedged copy of this query has also been sent to this
+    /// address (the IPv4 partner of a well-known IPv6 server): a response is
+    /// accepted from it as well as from `server`, and whichever answers
+    /// first wins.
+    alt_server: Option<SocketAddr>,
     callback: QueryCallback,
     question: DnsQuestion,
     server_idx: usize,
@@ -232,8 +275,45 @@ fn alloc_id(g: &ResolverInner) -> u16 {
 /// On timeout, retry against the next configured server (see
 /// [`retry_or_fail`]'s own doc comment above); exhausting the list fails
 /// with `TimedOut`.
+/// After a query was sent to the well-known IPv6 fallback at `idx`, arrange
+/// for the same query to also go to that provider's IPv4 address if nothing
+/// has come back after the IPv6 head start ([`public_fallback::HEDGE_DELAY`],
+/// RFC 8305's connection attempt delay) - far sooner than the query timeout a
+/// blackholed IPv6 path would otherwise cost. The first answer wins.
+fn schedule_hedge(inner: &Arc<Mutex<ResolverInner>>, g: &mut ResolverInner, id: u16, idx: usize) {
+    if g.partner_of(idx).is_none() {
+        return;
+    }
+    let inner2 = Arc::clone(inner);
+    let _ = g.reactor.schedule_timer(public_fallback::HEDGE_DELAY, Box::new(move || hedge_fire(&inner2, id, idx)));
+}
+
+/// The IPv6 head start is over: send `id`'s query to the IPv4 partner as well.
+fn hedge_fire(inner: &Arc<Mutex<ResolverInner>>, id: u16, idx: usize) {
+    let mut g = inner.lock().unwrap();
+    let Some(pending) = g.pending.get(&id) else {
+        return; // answered (or failed over) already
+    };
+    if pending.server_idx != idx || pending.alt_server.is_some() {
+        return;
+    }
+    let Some(partner) = g.partner_of(idx) else {
+        return;
+    };
+    let question = pending.question.clone();
+    let extra = pending.extra_edns_options.clone();
+    let partner_addr = g.servers[partner].addr;
+    // The same id: an answer from either address completes the one pending
+    // entry, and only one of them can be first.
+    if send_query_to_server(inner, &mut g, id, &question, partner, &extra).is_ok() {
+        if let Some(p) = g.pending.get_mut(&id) {
+            p.alt_server = Some(partner_addr);
+        }
+    }
+}
+
 fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
-    retry_or_fail_impl(inner, id, || {
+    retry_or_fail_impl(inner, id, true, || {
         io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out")
     });
 }
@@ -255,8 +335,23 @@ fn retry_or_fail(inner: &Arc<Mutex<ResolverInner>>, id: u16) {
 /// different configured server — a dead/unreachable *server* (plain UDP
 /// already failed, or a pinned server's only transport failed) is the
 /// only case that still falls through to [`retry_or_fail_impl`].
-#[cfg(any(feature = "dot", feature = "doq", feature = "doh"))]
+#[cfg(all(test, any(feature = "dot", feature = "doq", feature = "doh")))]
 fn retry_after_transport_error(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error) {
+    retry_after_transport_error_from(inner, id, None, err);
+}
+
+/// As [`retry_after_transport_error`], knowing which server the failed attempt
+/// was aimed at. A failure of a query's *hedged* copy (see [`schedule_hedge`])
+/// says nothing about the primary attempt still in flight, so it is dropped:
+/// the primary answers, times out, or fails on its own.
+#[cfg(any(feature = "dot", feature = "doq", feature = "doh"))]
+fn retry_after_transport_error_from(inner: &Arc<Mutex<ResolverInner>>, id: u16, target: Option<SocketAddr>, err: io::Error) {
+    if let Some(target) = target {
+        let g = inner.lock().unwrap();
+        if g.pending.get(&id).is_some_and(|p| p.alt_server == Some(target)) {
+            return;
+        }
+    }
     // Intra-server fallback (issue #379) only makes sense for an auto-mode
     // server whose failing transport was itself dynamically selected —
     // demoting it might still leave a next-best transport (or plain UDP)
@@ -265,7 +360,15 @@ fn retry_after_transport_error(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: 
     // back to, so it must still go straight to the existing inter-server
     // fallback, exactly as before this issue.
     let auto_dynamic_transport = {
-        let g = inner.lock().unwrap();
+        let mut g = inner.lock().unwrap();
+        let Some(pending) = g.pending.get(&id) else {
+            return;
+        };
+        // "Network unreachable" from a well-known IPv6 fallback is the host
+        // saying it has no IPv6 route, not that one server is down.
+        if public_fallback::is_unreachable(&err) && g.is_well_known_v6(pending.server_idx) {
+            g.fallback.health.record_no_route(Instant::now());
+        }
         let Some(pending) = g.pending.get(&id) else {
             return;
         };
@@ -281,7 +384,7 @@ fn retry_after_transport_error(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: 
     if auto_dynamic_transport.is_some() {
         retry_same_server(inner, id, err);
     } else {
-        retry_or_fail_impl(inner, id, move || err);
+        retry_or_fail_impl(inner, id, false, move || err);
     }
 }
 
@@ -303,6 +406,7 @@ fn retry_same_server(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error)
         c.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     let server_idx = pending.server_idx;
+    pending.alt_server = None;
     let new_id = alloc_id(&g);
     pending.id = new_id;
     let timeout = g.timeout;
@@ -326,7 +430,17 @@ fn retry_same_server(inner: &Arc<Mutex<ResolverInner>>, id: u16, err: io::Error)
     }
 }
 
-fn retry_or_fail_impl(inner: &Arc<Mutex<ResolverInner>>, id: u16, final_error: impl FnOnce() -> io::Error) {
+/// Move `id`'s query on to the next usable server, or fail it with
+/// `final_error`. `timed_out`: the attempt got no answer in time (rather than
+/// failing outright), which for a well-known IPv6 fallback is remembered so it
+/// is not tried again straight away; a hedged copy that already went to the
+/// IPv4 partner is not sent there twice.
+fn retry_or_fail_impl(
+    inner: &Arc<Mutex<ResolverInner>>,
+    id: u16,
+    timed_out: bool,
+    final_error: impl FnOnce() -> io::Error,
+) {
     let mut g = inner.lock().unwrap();
     let Some(mut pending) = g.pending.remove(&id) else {
         return; // already answered, or a stale timer/callback from an earlier attempt
@@ -334,12 +448,32 @@ fn retry_or_fail_impl(inner: &Arc<Mutex<ResolverInner>>, id: u16, final_error: i
     if let Some(c) = &pending.cancel {
         c.store(true, std::sync::atomic::Ordering::SeqCst);
     }
-    let next_idx = pending.server_idx + 1;
-    if next_idx >= g.servers.len() {
+    let now = Instant::now();
+    let hedged = pending.alt_server.is_some();
+    // A dynamically-selected encrypted transport that got no answer at all is
+    // as unusable as one that errored (UDP/853 filtered, a middlebox eating
+    // QUIC): tell the capability cache, or every later lookup would pay the
+    // full timeout on it again. A pinned server, and plain UDP, have nothing
+    // to demote.
+    if timed_out {
+        if let Some(transport) = pending.actual_transport {
+            if let Some(server) = g.servers.get(pending.server_idx).filter(|s| s.auto) {
+                let addr = server.addr;
+                g.capability_cache.record_failure(addr, transport);
+            }
+        }
+    }
+    let next = if timed_out {
+        g.next_after_timeout(pending.server_idx, hedged, now)
+    } else {
+        g.usable_server_from(pending.server_idx + 1, now)
+    };
+    let Some(next_idx) = next else {
         drop(g);
         (pending.callback)(Err(final_error()));
         return;
-    }
+    };
+    pending.alt_server = None;
     pending.server_idx = next_idx;
     pending.server = g.servers[next_idx].addr;
     let new_id = alloc_id(&g);
@@ -354,6 +488,7 @@ fn retry_or_fail_impl(inner: &Arc<Mutex<ResolverInner>>, id: u16, final_error: i
             pending.active_transport = keepalive;
             pending.actual_transport = actual_transport;
             g.pending.insert(new_id, pending);
+            schedule_hedge(inner, &mut g, new_id, next_idx);
         }
         Err(e) => {
             if let Some(c) = &pending.cancel {
@@ -579,6 +714,8 @@ struct ResolverInner {
     use_bailiwick: bool,
     tcp_fallback: bool,
     tcp_pool: TcpDnsConnectionPool,
+    /// IPv6 reachability memory and sockets for the well-known fallbacks.
+    fallback: FallbackState,
     /// Live DoQ QUIC connections reused across queries (RFC 9250 §5.5.1).
     #[cfg(feature = "doq")]
     doq_pool: doq::DoqConnectionPool,
@@ -595,6 +732,90 @@ struct ResolverInner {
     dnssec_enabled: bool,
     #[cfg(feature = "dnssec")]
     dnssec: Option<crate::dnssec::DnssecValidator>,
+}
+
+impl ResolverInner {
+    /// Whether the server at `idx` is a well-known fallback reached over IPv6
+    /// - the only kind [`public_fallback`]'s policy applies to.
+    fn is_well_known_v6(&self, idx: usize) -> bool {
+        self.servers.get(idx).is_some_and(|s| s.well_known.is_some() && s.addr.is_ipv6())
+    }
+
+    /// The first server at or after `from` worth trying for this lookup: every
+    /// server except a well-known IPv6 one that [`public_fallback::Ipv6Health`]
+    /// or a route probe rules out. Ruling one out costs nothing - no packet is
+    /// sent and no timeout waited for - which is the point: a host with no
+    /// IPv6 route reaches its first IPv4 fallback immediately.
+    fn usable_server_from(&mut self, from: usize, now: Instant) -> Option<usize> {
+        for idx in from..self.servers.len() {
+            if !self.is_well_known_v6(idx) {
+                return Some(idx);
+            }
+            let addr = self.servers[idx].addr;
+            // No way to send IPv6 UDP at all (the socket could not be bound)
+            // is the same as having no route.
+            if self.fallback.udp6_token.is_none() {
+                self.fallback.health.record_no_route(now);
+                continue;
+            }
+            // Memory first: a known-bad address or a recent no-route verdict
+            // skips without asking the kernel again.
+            if self.fallback.health.decide(now, addr.ip()) == public_fallback::V6Decision::Skip {
+                continue;
+            }
+            // Then ask the kernel now (this sends nothing): an immediate
+            // ENETUNREACH, or a host whose only IPv6 addresses are link-local,
+            // means no route - remember that for a few minutes.
+            match public_fallback::classify_probe((self.fallback.probe)(addr)) {
+                public_fallback::Route::Usable => return Some(idx),
+                public_fallback::Route::None => self.fallback.health.record_no_route(now),
+            }
+        }
+        None
+    }
+
+    /// The IPv4 address paired with the well-known IPv6 server at `idx`: the
+    /// next entry, when it is the same provider's same-tier IPv4 address.
+    fn partner_of(&self, idx: usize) -> Option<usize> {
+        if !self.is_well_known_v6(idx) {
+            return None;
+        }
+        let here = self.servers[idx].well_known?;
+        let next = self.servers.get(idx + 1)?;
+        (next.addr.is_ipv4() && next.well_known == Some(here)).then_some(idx + 1)
+    }
+
+    /// Where to go after the attempt at `idx` timed out. `hedged`: the same
+    /// query already also went to `idx`'s IPv4 partner, which must not be
+    /// tried again. A timed-out well-known IPv6 address is remembered as bad.
+    fn next_after_timeout(&mut self, idx: usize, hedged: bool, now: Instant) -> Option<usize> {
+        if self.is_well_known_v6(idx) {
+            if let Some(wk) = self.servers[idx].well_known {
+                self.fallback.health.record_v6_timeout(now, self.servers[idx].addr.ip(), wk.provider);
+            }
+        }
+        let mut start = idx + 1;
+        if hedged && self.partner_of(idx) == Some(idx + 1) {
+            start = idx + 2;
+        }
+        self.usable_server_from(start, now)
+    }
+
+    /// A response arrived from `server`; `via_hedge` if it was the hedged
+    /// IPv4 copy that answered first. Only well-known fallbacks count.
+    fn note_answer(&mut self, server: SocketAddr, via_hedge: bool, now: Instant) {
+        if !self.servers.iter().any(|s| s.addr == server && s.well_known.is_some()) {
+            return;
+        }
+        if server.is_ipv6() {
+            self.fallback.health.record_v6_answer(now, server.ip());
+        } else {
+            if via_hedge {
+                self.fallback.health.record_hedge_won_by_v4(now);
+            }
+            self.fallback.health.record_v4_answer(now);
+        }
+    }
 }
 
 /// Reactor-affine stub resolver (Gumdrop `DNSResolver`). Cheap to clone —
@@ -633,6 +854,7 @@ impl DnsResolver {
                 use_bailiwick: true,
                 tcp_fallback: true,
                 tcp_pool: TcpDnsConnectionPool::new(),
+                fallback: FallbackState::default(),
                 #[cfg(feature = "doq")]
                 doq_pool: doq::DoqConnectionPool::new(),
                 #[cfg(feature = "dot")]
@@ -721,6 +943,7 @@ impl DnsResolver {
                 connector,
             },
             auto: false,
+            well_known: None,
         });
     }
 
@@ -743,6 +966,7 @@ impl DnsResolver {
                 client_config,
             },
             auto: false,
+            well_known: None,
         });
     }
 
@@ -771,18 +995,41 @@ impl DnsResolver {
                 use_get,
             },
             auto: false,
+            well_known: None,
         });
     }
 
-    /// Use Google + Cloudflare public resolvers.
+    /// Use the well-known public resolvers - Cloudflare, Quad9 and Google -
+    /// over IPv6 and IPv4.
+    ///
+    /// Each provider's IPv6 address is listed just ahead of its IPv4 one so a
+    /// dead address family cannot stack timeouts. IPv6 is tried first only
+    /// while the host can reach the public IPv6 internet, with a short head
+    /// start before the same query also goes to IPv4; on a host without IPv6
+    /// the IPv6 entries are skipped instantly, and a later network change is
+    /// noticed after a few minutes. See [`public_fallback`] for the algorithm.
+    /// Nameservers added any other way (including from `resolv.conf`) are
+    /// used exactly as configured.
     pub fn use_public_resolvers(&self) {
-        let _ = self.add_server_str("8.8.8.8", DEFAULT_DNS_PORT);
-        let _ = self.add_server_str("1.1.1.1", DEFAULT_DNS_PORT);
+        let mut g = self.inner.lock().unwrap();
+        for addr in public_fallback::fallback_servers(DEFAULT_DNS_PORT) {
+            g.servers.push(ConfiguredServer {
+                well_known: public_fallback::classify(addr.ip()),
+                ..ConfiguredServer::udp_tcp(addr)
+            });
+            g.capability_cache.seed_known_public_resolver(addr);
+        }
     }
 
     /// Parse `/etc/resolv.conf` nameservers (Unix).
     pub fn use_system_resolvers(&self) -> io::Result<()> {
-        let servers = crate::system::system_nameservers()?;
+        let servers = crate::system::configured_nameservers()?;
+        if servers.is_empty() {
+            // Nothing configured: fall back to the well-known public
+            // resolvers, IPv6 included (see `use_public_resolvers`).
+            self.use_public_resolvers();
+            return Ok(());
+        }
         for s in servers {
             self.add_server(s);
         }
@@ -892,6 +1139,18 @@ impl DnsResolver {
         });
         let token = g.reactor.register_udp(socket, handler)?;
         g.udp_token = Some(token);
+        // An IPv6 socket for IPv6 upstreams. A host without IPv6 simply has
+        // none, which the well-known fallbacks read as "no IPv6 route".
+        if g.fallback.udp6_token.is_none() {
+            if let Ok(sock6) = std::net::UdpSocket::bind("[::]:0") {
+                if sock6.set_nonblocking(true).is_ok() {
+                    let handler6 = Box::new(ResolverUdpHandler { inner: Arc::clone(&self.inner) });
+                    if let Ok(token6) = g.reactor.register_udp(mio::net::UdpSocket::from_std(sock6), handler6) {
+                        g.fallback.udp6_token = Some(token6);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -911,6 +1170,9 @@ impl DnsResolver {
     pub fn close(&self) {
         let mut g = self.inner.lock().unwrap();
         if let Some(token) = g.udp_token.take() {
+            g.reactor.deregister_udp(token);
+        }
+        if let Some(token) = g.fallback.udp6_token.take() {
             g.reactor.deregister_udp(token);
         }
         g.pending.clear();
@@ -1018,8 +1280,13 @@ impl DnsResolver {
             )));
             return;
         }
+        let Some(first) = g.usable_server_from(0, Instant::now()) else {
+            drop(g);
+            cb(Err(io::Error::new(io::ErrorKind::NetworkUnreachable, "no usable DNS server")));
+            return;
+        };
         let id = alloc_id(&g);
-        let server = g.servers[0].addr;
+        let server = g.servers[first].addr;
         let timeout = g.timeout;
         let cancel = g.reactor.schedule_timer(
             timeout,
@@ -1028,14 +1295,15 @@ impl DnsResolver {
                 move || retry_or_fail(&inner, id)
             }),
         );
-        match send_query_to_server(&self.inner, &mut g, id, &question, 0, &extra_edns_options) {
+        match send_query_to_server(&self.inner, &mut g, id, &question, first, &extra_edns_options) {
             Ok((keepalive, actual_transport)) => {
                 g.pending.insert(
                     id,
                     PendingQuery {
+                        alt_server: None,
                         callback: cb,
                         question: question.clone(),
-                        server_idx: 0,
+                        server_idx: first,
                         cname_depth: 0,
                         id,
                         server,
@@ -1046,6 +1314,7 @@ impl DnsResolver {
                         actual_transport,
                     },
                 );
+                schedule_hedge(&self.inner, &mut g, id, first);
             }
             Err(e) => {
                 cancel.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1290,9 +1559,14 @@ fn send_udp_query(
     server: SocketAddr,
     extra_edns_options: &[u8],
 ) -> io::Result<()> {
-    let token = g
-        .udp_token
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "resolver not open"))?;
+    let token = if server.is_ipv6() {
+        g.fallback
+            .udp6_token
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NetworkUnreachable, "no IPv6 UDP socket"))?
+    } else {
+        g.udp_token
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "resolver not open"))?
+    };
     let msg = build_query_message(g, id, question, Some(server), extra_edns_options);
     let bytes = msg
         .serialize()
@@ -1553,7 +1827,7 @@ fn spawn_dot_query(
                     }
                     complete_response(&inner, pending, msg, addr);
                 }
-                Err(e) => retry_after_transport_error(&inner, id, e),
+                Err(e) => retry_after_transport_error_from(&inner, id, Some(addr), e),
             }
         })
         .ok();
@@ -1602,8 +1876,8 @@ impl DnsClientTransportHandler for TransportResponseHandler {
         complete_response(&self.inner, pending, msg, server);
     }
 
-    fn on_error(&mut self, _server: SocketAddr, err: io::Error) {
-        retry_after_transport_error(&self.inner, self.id, err);
+    fn on_error(&mut self, server: SocketAddr, err: io::Error) {
+        retry_after_transport_error_from(&self.inner, self.id, Some(server), err);
     }
 }
 
@@ -1644,7 +1918,7 @@ impl UdpDatagramHandler for ResolverUdpHandler {
         // outstanding and may yet get its real answer.
         match g.pending.get(&msg.id) {
             Some(candidate)
-                if candidate.server == peer
+                if (candidate.server == peer || candidate.alt_server == Some(peer))
                     && msg.questions.first().is_some_and(|q| questions_match(q, &candidate.question)) => {}
             _ => return,
         }
@@ -1695,6 +1969,10 @@ fn complete_response(
     server: SocketAddr,
 ) {
     let mut g = inner.lock().unwrap();
+    // Well-known fallback bookkeeping: which family answered, and whether it
+    // was the hedged IPv4 copy that beat the IPv6 attempt (see
+    // `public_fallback::Ipv6Health`).
+    g.note_answer(server, pending.alt_server == Some(server), Instant::now());
     if !pending.question.name.is_empty() && g.use_bailiwick {
         msg.answers = filter_answers_in_bailiwick(&pending.question.name, &msg.answers);
     }
@@ -1717,6 +1995,7 @@ fn complete_response(
                     pending.id = id;
                     let server_idx = pending.server_idx;
                     pending.server = g.servers.get(server_idx).map(|s| s.addr).unwrap_or(server);
+                    pending.alt_server = None;
                     let timeout = g.timeout;
                     let inner2 = Arc::clone(inner);
                     let cancel = g.reactor.schedule_timer(timeout, Box::new(move || retry_or_fail(&inner2, id)));
@@ -2055,6 +2334,7 @@ mod tests {
             use_bailiwick: true,
             tcp_fallback: true,
             tcp_pool: TcpDnsConnectionPool::new(),
+            fallback: FallbackState::default(),
             #[cfg(feature = "doq")]
             doq_pool: doq::DoqConnectionPool::new(),
             #[cfg(feature = "dot")]
@@ -2070,6 +2350,7 @@ mod tests {
         inner.pending.insert(
             taken,
             PendingQuery {
+                alt_server: None,
                 callback: Box::new(|_| {}),
                 question: DnsQuestion::in_class("example.com", DnsType::A),
                 server_idx: 0,
@@ -2104,8 +2385,255 @@ mod tests {
                 connector: hopf_core::insecure_connector(&[]),
             },
             auto,
+            well_known: None,
         };
         (server, addr)
+    }
+
+    // ---- well-known public fallbacks: IPv6 without long stalls ----
+
+    /// A resolver holding the well-known fallback list (as `use_public_resolvers`
+    /// builds it) whose IPv6 route probe is `probe`, plus a counter of how many
+    /// times the probe ran.
+    fn fallback_inner(
+        rt: &hopf_core::Runtime,
+        probe: impl Fn(SocketAddr) -> io::Result<IpAddr> + Send + Sync + 'static,
+    ) -> (ResolverInner, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        let servers = public_fallback::fallback_servers(DEFAULT_DNS_PORT)
+            .into_iter()
+            .map(|addr| ConfiguredServer {
+                addr,
+                transport: ServerTransport::UdpTcp,
+                auto: true,
+                well_known: public_fallback::classify(addr.ip()),
+            })
+            .collect();
+        let mut inner = ResolverInner {
+            reactor: rt.pick_worker().clone(),
+            udp_token: None,
+            servers,
+            pending: HashMap::new(),
+            ids: DnsQueryIdGenerator::new(),
+            cache: Arc::new(DnsCache::default()),
+            cookies: DnsCookie::new(),
+            multi_qtype_cache: Arc::new(MultiQTypeCache::new()),
+            capability_cache: TransportCapabilityCache::new(),
+            discovery_in_flight: std::collections::HashSet::new(),
+            timeout: DEFAULT_TIMEOUT,
+            use_edns: true,
+            use_cookies: true,
+            use_bailiwick: true,
+            tcp_fallback: true,
+            tcp_pool: TcpDnsConnectionPool::new(),
+            fallback: FallbackState::default(),
+            #[cfg(feature = "doq")]
+            doq_pool: doq::DoqConnectionPool::new(),
+            #[cfg(feature = "dot")]
+            public_trust_dot_connector: None,
+            #[cfg(feature = "doq")]
+            public_trust_doq_config: None,
+            #[cfg(feature = "dnssec")]
+            dnssec_enabled: false,
+            #[cfg(feature = "dnssec")]
+            dnssec: None,
+        };
+        inner.fallback.probe = Arc::new(move |target| {
+            calls2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            probe(target)
+        });
+        inner.fallback.udp6_token = Some(Token(7));
+        (inner, calls)
+    }
+
+    fn v6_global(_: SocketAddr) -> io::Result<IpAddr> {
+        Ok("2001:db8::17".parse().unwrap())
+    }
+
+    fn unreachable(_: SocketAddr) -> io::Result<IpAddr> {
+        Err(io::Error::from(io::ErrorKind::NetworkUnreachable))
+    }
+
+    /// Address of the server `usable_server_from(from, now)` picks.
+    fn pick(inner: &mut ResolverInner, from: usize, now: Instant) -> SocketAddr {
+        let i = inner.usable_server_from(from, now).expect("a usable server");
+        inner.servers[i].addr
+    }
+
+    fn idx_of(inner: &ResolverInner, ip: &str) -> usize {
+        let ip: IpAddr = ip.parse().unwrap();
+        inner.servers.iter().position(|s| s.addr.ip() == ip).unwrap()
+    }
+
+    /// The default probe really asks the kernel (sending nothing). Toward the
+    /// IPv6 loopback it can only pick a loopback source, which is not a route
+    /// to the internet - so the verdict is "no route". Skipped on a host
+    /// without IPv6 loopback, where it would fail earlier still.
+    #[test]
+    fn the_kernel_probe_reads_the_source_address_without_sending_anything() {
+        let target: SocketAddr = "[::1]:53".parse().unwrap();
+        match kernel_route_probe(target) {
+            Ok(source) => {
+                assert_eq!(source, "::1".parse::<IpAddr>().unwrap());
+                assert_eq!(public_fallback::classify_probe(Ok(source)), public_fallback::Route::None);
+            }
+            Err(e) => {
+                // No IPv6 at all: exactly what "no route" must be made of.
+                assert_eq!(public_fallback::classify_probe(Err(e)), public_fallback::Route::None);
+            }
+        }
+    }
+
+    /// The corporate case: an immediate ENETUNREACH from the route probe skips
+    /// every IPv6 fallback on the spot - the first server used is Cloudflare's
+    /// IPv4 address, not a 5 second timeout later - and, having learned that
+    /// the host has no route, doesn't probe again for the rest of the lookup.
+    #[test]
+    fn an_unreachable_ipv6_route_falls_straight_through_to_ipv4() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (mut inner, probes) = fallback_inner(&rt, unreachable);
+        let now = Instant::now();
+        assert_eq!(pick(&mut inner, 0, now).ip(), "1.1.1.1".parse::<IpAddr>().unwrap());
+        // Walk the whole list: only IPv4 addresses are ever chosen.
+        let mut idx = 0;
+        let mut chosen = Vec::new();
+        while let Some(i) = inner.usable_server_from(idx, now) {
+            chosen.push(inner.servers[i].addr.ip());
+            idx = i + 1;
+        }
+        assert_eq!(chosen.len(), 6);
+        assert!(chosen.iter().all(|ip| ip.is_ipv4()), "{chosen:?}");
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1, "one probe taught it; no repeats");
+    }
+
+    /// A working IPv6 route: the first fallback tried is Cloudflare's IPv6.
+    #[test]
+    fn a_usable_ipv6_route_puts_ipv6_first() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (mut inner, _) = fallback_inner(&rt, v6_global);
+        assert_eq!(pick(&mut inner, 0, Instant::now()).ip(), "2606:4700:4700::1111".parse::<IpAddr>().unwrap());
+    }
+
+    /// Only link-local (or loopback) IPv6 addresses is not a route to the
+    /// internet: treated exactly like an unreachable error.
+    #[test]
+    fn a_host_with_only_link_local_ipv6_has_no_route() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (mut inner, _) = fallback_inner(&rt, |_| Ok("fe80::1".parse().unwrap()));
+        assert!(pick(&mut inner, 0, Instant::now()).is_ipv4());
+    }
+
+    /// No route is remembered only for a bounded time: later the probe runs
+    /// again and a changed network is used.
+    #[test]
+    fn a_later_network_change_is_noticed() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let routed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let routed2 = Arc::clone(&routed);
+        let (mut inner, probes) = fallback_inner(&rt, move |t| {
+            if routed2.load(std::sync::atomic::Ordering::SeqCst) { v6_global(t) } else { unreachable(t) }
+        });
+        let now = Instant::now();
+        assert!(pick(&mut inner, 0, now).is_ipv4());
+        routed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Still inside the memory: no new probe, still IPv4.
+        assert!(pick(&mut inner, 0, now + Duration::from_secs(60)).is_ipv4());
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let later = now + public_fallback::NO_ROUTE_TTL + Duration::from_secs(1);
+        assert!(pick(&mut inner, 0, later).is_ipv6());
+    }
+
+    /// Nameservers that did not come from the fallback list are never subject
+    /// to the policy, whatever the IPv6 route looks like.
+    #[test]
+    fn configured_nameservers_are_never_skipped() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (mut inner, probes) = fallback_inner(&rt, unreachable);
+        inner.servers = vec![
+            ConfiguredServer { well_known: None, ..ConfiguredServer::udp_tcp("[2001:db8::53]:53".parse().unwrap()) },
+            ConfiguredServer::udp_tcp("192.0.2.53:53".parse().unwrap()),
+        ];
+        assert_eq!(inner.usable_server_from(0, Instant::now()), Some(0), "an IPv6 resolv.conf entry stays as configured");
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 0, "no probe for a configured server");
+    }
+
+    /// A timeout, unlike no-route, is about one address: after Cloudflare's
+    /// IPv6 times out, the next lookup skips just that address - Quad9's IPv6
+    /// is still tried, which is how probing rotates across providers.
+    #[test]
+    fn a_timeout_skips_only_that_address() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (mut inner, _) = fallback_inner(&rt, v6_global);
+        let now = Instant::now();
+        let cf6 = idx_of(&inner, "2606:4700:4700::1111");
+        // The timeout of the IPv6 attempt: not hedged, so the IPv4 partner is next.
+        assert_eq!(inner.next_after_timeout(cf6, false, now), Some(cf6 + 1));
+        // On a later lookup Cloudflare's IPv6 is skipped, Quad9's is not.
+        assert_eq!(inner.usable_server_from(0, now), Some(cf6 + 1), "Cloudflare v6 skipped, its IPv4 is next");
+        assert_eq!(pick(&mut inner, cf6 + 2, now).ip(), "2620:fe::fe".parse::<IpAddr>().unwrap());
+    }
+
+    /// If the same query already also went to the IPv4 partner, a timeout must
+    /// not send it there a second time.
+    #[test]
+    fn a_hedged_attempt_that_times_out_skips_its_ipv4_partner() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (mut inner, _) = fallback_inner(&rt, v6_global);
+        let cf6 = idx_of(&inner, "2606:4700:4700::1111");
+        let next = inner.next_after_timeout(cf6, true, Instant::now()).unwrap();
+        assert_eq!(inner.servers[next].addr.ip(), "2620:fe::fe".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn each_ipv6_fallback_has_its_own_providers_ipv4_partner() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (inner, _) = fallback_inner(&rt, v6_global);
+        for (v6, v4) in [
+            ("2606:4700:4700::1111", "1.1.1.1"),
+            ("2620:fe::fe", "9.9.9.9"),
+            ("2001:4860:4860::8888", "8.8.8.8"),
+            ("2606:4700:4700::1001", "1.0.0.1"),
+            ("2620:fe::9", "149.112.112.112"),
+            ("2001:4860:4860::8844", "8.8.4.4"),
+        ] {
+            let p = inner.partner_of(idx_of(&inner, v6)).unwrap_or_else(|| panic!("{v6} has a partner"));
+            assert_eq!(inner.servers[p].addr.ip(), v4.parse::<IpAddr>().unwrap());
+            assert_eq!(inner.partner_of(idx_of(&inner, v4)), None, "IPv4 servers have no partner");
+        }
+    }
+
+    /// When IPv4 wins the hedged race, IPv6 loses its head start for a
+    /// while; an IPv6 answer gives it back at once.
+    #[test]
+    fn a_hedge_won_by_ipv4_ends_the_head_start_until_ipv6_answers() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (mut inner, _) = fallback_inner(&rt, v6_global);
+        let now = Instant::now();
+        let cf4 = idx_of(&inner, "1.1.1.1");
+        let cf4_addr = inner.servers[cf4].addr;
+        inner.note_answer(cf4_addr, true, now);
+        assert!(pick(&mut inner, 0, now).is_ipv4(), "no head start for IPv6");
+        inner.note_answer("[2606:4700:4700::1111]:53".parse().unwrap(), false, now);
+        assert!(pick(&mut inner, 0, now).is_ipv6(), "an IPv6 answer restores it");
+    }
+
+    /// Several providers' IPv6 timing out and then an IPv4 address answering
+    /// is the blackholed-path signal, without any hedge involved.
+    #[test]
+    fn ipv6_timeouts_across_providers_then_an_ipv4_answer_end_the_head_start() {
+        let rt = hopf_core::Runtime::start(Default::default()).unwrap();
+        let (mut inner, _) = fallback_inner(&rt, v6_global);
+        let now = Instant::now();
+        let cf6 = idx_of(&inner, "2606:4700:4700::1111");
+        let q96 = idx_of(&inner, "2620:fe::fe");
+        inner.next_after_timeout(cf6, false, now);
+        // One provider's IPv6 timing out and then IPv4 answering proves nothing.
+        inner.note_answer("8.8.8.8:53".parse().unwrap(), false, now);
+        assert!(pick(&mut inner, q96, now).is_ipv6(), "one provider is not a blackholed path");
+        inner.next_after_timeout(q96, false, now);
+        inner.note_answer("8.8.8.8:53".parse().unwrap(), false, now);
+        assert!(pick(&mut inner, 0, now).is_ipv4(), "two providers are");
     }
 
     #[cfg(feature = "dot")]
@@ -2132,6 +2660,7 @@ mod tests {
             use_bailiwick: true,
             tcp_fallback: true,
             tcp_pool: TcpDnsConnectionPool::new(),
+            fallback: FallbackState::default(),
             #[cfg(feature = "doq")]
             doq_pool: doq::DoqConnectionPool::new(),
             #[cfg(feature = "dot")]
@@ -2148,6 +2677,7 @@ mod tests {
     #[cfg(feature = "dot")]
     fn test_pending_for(id: u16, server_idx: usize, server: SocketAddr, actual_transport: Option<EncryptedTransport>) -> PendingQuery {
         PendingQuery {
+            alt_server: None,
             callback: Box::new(|_| {}),
             question: DnsQuestion::in_class("example.com", DnsType::A),
             server_idx,
@@ -2487,6 +3017,7 @@ mod tests {
             use_bailiwick: false, // bailiwick would strip an out-of-zone A for this synthetic name
             tcp_fallback: true,
             tcp_pool: TcpDnsConnectionPool::new(),
+            fallback: FallbackState::default(),
             #[cfg(feature = "doq")]
             doq_pool: doq::DoqConnectionPool::new(),
             #[cfg(feature = "dot")]
@@ -2501,6 +3032,7 @@ mod tests {
     #[cfg(feature = "dnssec")]
     fn test_pending(cd: bool, cb: QueryCallback) -> PendingQuery {
         PendingQuery {
+            alt_server: None,
             callback: cb,
             question: DnsQuestion::in_class("secure.example", DnsType::A),
             server_idx: 0,
