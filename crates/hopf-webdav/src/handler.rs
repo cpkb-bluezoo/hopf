@@ -10,13 +10,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+use hopf_auth::RolePolicy;
 use hopf_core::storage::{StorageError, StorageExecutor};
+use hopf_http::auth::AUTHENTICATED_USER;
 use hopf_http::Headers;
 use hopf_http::{
     evaluate_preconditions, EntityTag, Precondition, ServerHandler,
     ServerResponseHandle, ServerWriter, Validators,
 };
 
+use crate::acl::{acl_live_property_names, write_acl_live_properties, AclContext};
 use crate::constants::{
     self, CONTENT_TYPE_XML, DEPTH_0, DEPTH_1, DEPTH_INFINITY, HEADER_DAV, HEADER_DEPTH,
     HEADER_DESTINATION, HEADER_IF, HEADER_LOCK_TOKEN, HEADER_OVERWRITE,
@@ -43,6 +46,8 @@ pub struct WebDavHandler {
     storage: Arc<StorageExecutor>,
     lock_manager: Arc<WebDavLockManager>,
     dead_store: DeadPropertyStore,
+    acl_enabled: bool,
+    role_policy: Option<Arc<dyn RolePolicy>>,
     allowed_options: String,
     welcome_files: Vec<String>,
     content_types: HashMap<String, String>,
@@ -80,6 +85,7 @@ pub struct WebDavHandler {
     /// be rejected with 415 (RFC 4918 §9.3).
     mkcol_pending: bool,
     mkcol_had_body: bool,
+    request_username: Option<String>,
 }
 
 impl WebDavHandler {
@@ -88,6 +94,8 @@ impl WebDavHandler {
         storage: Arc<StorageExecutor>,
         lock_manager: Arc<WebDavLockManager>,
         dead_store: DeadPropertyStore,
+        acl_enabled: bool,
+        role_policy: Option<Arc<dyn RolePolicy>>,
         allowed_options: String,
         welcome_files: Vec<String>,
         content_types: HashMap<String, String>,
@@ -99,6 +107,8 @@ impl WebDavHandler {
             storage,
             lock_manager,
             dead_store,
+            acl_enabled,
+            role_policy,
             allowed_options,
             welcome_files,
             content_types,
@@ -121,6 +131,15 @@ impl WebDavHandler {
             put_rejected: false,
             mkcol_pending: false,
             mkcol_had_body: false,
+            request_username: None,
+        }
+    }
+
+    fn acl_context(&self) -> AclContext {
+        AclContext {
+            enabled: self.acl_enabled,
+            username: self.request_username.clone(),
+            roles: self.role_policy.clone(),
         }
     }
 
@@ -176,6 +195,11 @@ impl ServerHandler for WebDavHandler {
         self.method = headers.method().unwrap_or("GET").to_string();
         self.request_path = headers.path().unwrap_or("/").to_string();
         self.host = headers.get("host").map(|s| s.to_string());
+        self.request_username = if self.acl_enabled {
+            headers.get(AUTHENTICATED_USER).map(|s| s.to_string())
+        } else {
+            None
+        };
 
         if self.request_path == "*" {
             self.path = None;
@@ -235,6 +259,7 @@ impl ServerHandler for WebDavHandler {
             "UNLOCK" if self.config.webdav_enabled && self.config.allow_write => {
                 self.handle_unlock(response)
             }
+            "ACL" if self.acl_enabled => Self::send_error(response, 403),
             _ => Self::send_error(response, 405),
         }
     }
@@ -347,7 +372,12 @@ impl WebDavHandler {
         h.status(200);
         h.set("Allow", &self.allowed_options);
         if self.config.webdav_enabled {
-            h.set(HEADER_DAV, "1,2");
+            let dav = if self.acl_enabled {
+                "1,2,access-control"
+            } else {
+                "1,2"
+            };
+            h.set(HEADER_DAV, dav);
         }
         h.set("Content-Length", "0");
         w.headers(h);
@@ -978,6 +1008,7 @@ impl WebDavHandler {
         let types = self.content_types.clone();
         let content_language = self.config.content_language.clone();
         let max_tree_entries = self.config.max_tree_entries;
+        let acl_ctx = self.acl_context();
 
         let rh = w.response_handle();
         let rh_for_reject = rh.clone();
@@ -1028,6 +1059,7 @@ impl WebDavHandler {
                                 &lock_mgr,
                                 &mut store,
                                 content_language.as_deref(),
+                                &acl_ctx,
                             )
                                 .map_err(|c| {
                                     io::Error::new(io::ErrorKind::Other, format!("propfind {c}"))
@@ -1494,6 +1526,7 @@ fn append_propfind_props(
     lock_mgr: &WebDavLockManager,
     store: &mut DeadPropertyStore,
     content_language: Option<&str>,
+    acl_ctx: &AclContext,
 ) -> Result<(), u16> {
     let meta = fs::metadata(path).map_err(|_| 500u16)?;
     let is_dir = meta.is_dir();
@@ -1501,9 +1534,9 @@ fn append_propfind_props(
 
     match pf.kind {
         PropfindType::Propname => {
-            for name in live_prop_names() {
+            for name in live_prop_names(acl_ctx.enabled) {
                 // Only advertise getcontentlanguage when configured.
-                if *name == constants::PROP_GETCONTENTLANGUAGE && content_language.is_none() {
+                if *name == *constants::PROP_GETCONTENTLANGUAGE && content_language.is_none() {
                     continue;
                 }
                 write_live_property(w, NAMESPACE, name, "").map_err(|_| 500u16)?;
@@ -1520,10 +1553,11 @@ fn append_propfind_props(
                 lock_mgr,
                 store,
                 content_language,
+                acl_ctx,
             )?;
             if pf.kind == PropfindType::Prop {
                 for req in &pf.properties {
-                    if !is_live_prop(&req.local_name) {
+                    if !is_live_prop(&req.local_name, acl_ctx.enabled) {
                         let props = store.get_properties(path, Some(is_dir)).map_err(|_| 500u16)?;
                         let key = crate::dead_props::make_key(&req.namespace_uri, &req.local_name);
                         if let Some(dp) = props.get(&key) {
@@ -1537,8 +1571,8 @@ fn append_propfind_props(
     Ok(())
 }
 
-fn live_prop_names() -> &'static [&'static str] {
-    &[
+fn live_prop_names(acl_enabled: bool) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = vec![
         constants::PROP_CREATIONDATE,
         constants::PROP_DISPLAYNAME,
         constants::PROP_GETCONTENTLANGUAGE,
@@ -1550,11 +1584,15 @@ fn live_prop_names() -> &'static [&'static str] {
         constants::PROP_SOURCE,
         constants::PROP_SUPPORTEDLOCK,
         constants::PROP_LOCKDISCOVERY,
-    ]
+    ];
+    if acl_enabled {
+        names.extend(acl_live_property_names());
+    }
+    names
 }
 
-fn is_live_prop(name: &str) -> bool {
-    live_prop_names().contains(&name)
+fn is_live_prop(name: &str, acl_enabled: bool) -> bool {
+    live_prop_names(acl_enabled).contains(&name)
 }
 
 fn append_live_props(
@@ -1567,6 +1605,7 @@ fn append_live_props(
     lock_mgr: &WebDavLockManager,
     store: &mut DeadPropertyStore,
     content_language: Option<&str>,
+    acl_ctx: &AclContext,
 ) -> Result<(), u16> {
     let created = meta.created().or_else(|_| meta.modified()).ok();
     if let Some(t) = created {
@@ -1628,6 +1667,7 @@ fn append_live_props(
     for dp in dead.values() {
         write_dead_property(w, dp).map_err(|_| 500u16)?;
     }
+    write_acl_live_properties(w, acl_ctx)?;
     Ok(())
 }
 

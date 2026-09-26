@@ -2,6 +2,7 @@
 
 //! WebDAV filesystem handler for Hopf HTTP servers (RFC 4918).
 
+mod acl;
 mod constants;
 mod dead_props;
 mod factory;

@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use hopf_auth::RolePolicy;
 use hopf_core::storage::StorageExecutor;
 use hopf_http::{ServerHandler, ServerHandlerFactory};
 
@@ -15,7 +16,7 @@ use crate::handler::WebDavHandler;
 use crate::lock::WebDavLockManager;
 
 /// WebDAV service configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WebDavConfig {
     pub root_path: PathBuf,
     /// Allow mutating methods (PUT/DELETE/MKCOL/…). Default: `false`.
@@ -43,6 +44,14 @@ pub struct WebDavConfig {
     /// (or mTLS) and set this to acknowledge that auth lives outside the
     /// WebDAV crate, or set it for intentional cleartext demos.
     pub allow_unauthenticated_access: bool,
+    /// Optional role map for RFC 3744 ACL live properties and the `ACL`
+    /// method. When set together with [`webdav_enabled`](Self::webdav_enabled),
+    /// the handler advertises the `access-control` DAV compliance class and
+    /// answers PROPFIND for `DAV:acl` / `DAV:current-user-privilege-set` /
+    /// related properties. Privileges are checked via
+    /// [`RolePolicy::is_user_in_role`] using role names prefixed with
+    /// [`crate::constants::ROLE_PREFIX`] (e.g. `webdav:read`).
+    pub role_policy: Option<Arc<dyn RolePolicy>>,
     /// `Cache-Control` sent on file `GET`/`HEAD` responses (and their `304`s),
     /// telling caches how long a file stays fresh. `None` (the default) sends
     /// none, leaving caches to their own heuristics, which work from
@@ -63,6 +72,7 @@ impl Default for WebDavConfig {
             max_tree_entries: crate::constants::DEFAULT_MAX_TREE_ENTRIES,
             content_language: None,
             allow_unauthenticated_access: false,
+            role_policy: None,
             cache_control: None,
         }
     }
@@ -99,6 +109,12 @@ impl WebDavConfig {
         self.allow_unauthenticated_access = true;
         self
     }
+
+    /// Enable RFC 3744 ACL property support backed by `policy`.
+    pub fn with_role_policy(mut self, policy: Arc<dyn RolePolicy>) -> Self {
+        self.role_policy = Some(policy);
+        self
+    }
 }
 
 /// Shared factory for [`WebDavHandler`] instances.
@@ -107,6 +123,8 @@ pub struct WebDavFactory {
     pub(crate) storage: Arc<StorageExecutor>,
     pub(crate) lock_manager: Arc<WebDavLockManager>,
     pub(crate) dead_store: DeadPropertyStore,
+    pub(crate) acl_enabled: bool,
+    pub(crate) role_policy: Option<Arc<dyn RolePolicy>>,
     pub(crate) allowed_options: String,
     pub(crate) welcome_files: Vec<String>,
     pub(crate) content_types: HashMap<String, String>,
@@ -140,20 +158,25 @@ impl WebDavFactory {
                 .normalize()
         });
 
+        let acl_enabled = config.webdav_enabled && config.role_policy.is_some();
         let allowed_options = build_allow_header(
             config.webdav_enabled,
             config.allow_write,
+            acl_enabled,
         );
         let welcome_files = parse_welcome_files(&config.welcome_file);
         let content_types = default_content_types();
         let dead_store = DeadPropertyStore::new(config.dead_property_storage);
         let lock_manager = Arc::new(WebDavLockManager::new());
+        let role_policy = config.role_policy.clone();
 
         Ok(Self {
             config: Arc::new(config),
             storage,
             lock_manager,
             dead_store,
+            acl_enabled,
+            role_policy,
             allowed_options,
             welcome_files,
             content_types,
@@ -177,6 +200,8 @@ impl ServerHandlerFactory for WebDavFactory {
             Arc::clone(&self.storage),
             Arc::clone(&self.lock_manager),
             self.dead_store.clone(),
+            self.acl_enabled,
+            self.role_policy.clone(),
             self.allowed_options.clone(),
             self.welcome_files.clone(),
             self.content_types.clone(),
@@ -185,12 +210,14 @@ impl ServerHandlerFactory for WebDavFactory {
     }
 }
 
-fn build_allow_header(webdav: bool, write: bool) -> String {
+fn build_allow_header(webdav: bool, write: bool, acl: bool) -> String {
+    let acl_suffix = if acl { ", ACL" } else { "" };
     if webdav && write {
-        "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK"
-            .to_string()
+        format!(
+            "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK{acl_suffix}"
+        )
     } else if webdav {
-        "OPTIONS, GET, HEAD, PROPFIND".to_string()
+        format!("OPTIONS, GET, HEAD, PROPFIND{acl_suffix}")
     } else if write {
         "OPTIONS, GET, HEAD, PUT, DELETE".to_string()
     } else {
@@ -292,6 +319,25 @@ mod tests {
     }
 
     #[test]
+    fn allow_header_includes_acl_when_role_policy_set() {
+        let dir = tempdir().unwrap();
+        let storage = Arc::new(StorageExecutor::new(StorageConfig::default()));
+        let roles = hopf_auth::RoleMembership::new().shared();
+        let factory = WebDavFactory::new(
+            WebDavConfig {
+                root_path: dir.path().to_path_buf(),
+                allow_write: true,
+                webdav_enabled: true,
+                allow_unauthenticated_access: true,
+                role_policy: Some(roles),
+                ..Default::default()
+            },
+            storage,
+        )
+        .unwrap();
+        assert!(factory.allowed_options.contains("ACL"));
+    }
+
     fn unauth_opt_in_allows_factory() {
         let dir = tempdir().unwrap();
         let storage = Arc::new(StorageExecutor::new(StorageConfig::default()));

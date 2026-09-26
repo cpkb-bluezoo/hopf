@@ -29,7 +29,7 @@ pub(crate) fn dav_end(w: &mut DavWriter) -> io::Result<()> {
     w.write_end_element()
 }
 
-fn dav_empty(w: &mut DavWriter, local: &str) -> io::Result<()> {
+pub(crate) fn dav_empty(w: &mut DavWriter, local: &str) -> io::Result<()> {
     dav_start(w, local)?;
     dav_end(w)
 }

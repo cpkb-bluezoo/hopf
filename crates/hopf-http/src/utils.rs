@@ -171,6 +171,7 @@ pub fn is_default_method(method: &str) -> bool {
             | "MOVE"
             | "LOCK"
             | "UNLOCK"
+            | "ACL"
     )
 }
 
@@ -442,6 +443,7 @@ mod tests {
         assert!(is_default_method("GET"));
         assert!(is_default_method("PROPFIND"));
         assert!(is_default_method("LOCK"));
+        assert!(is_default_method("ACL"));
         assert!(!is_default_method("FOO"));
         assert!(!is_default_method("TRACE"));
         assert!(method_implies_no_body("GET"));
