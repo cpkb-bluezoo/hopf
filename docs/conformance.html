@@ -124,13 +124,13 @@
 <tr><td>Encrypted Client Hello</td><td>In-tree, <code>hopf-core::tls::ech</code> (HPKE in <code>hopf-core::crypto::hpke</code>)</td><td>Shared-mode ECH on the TLS 1.3 engine for TCP, DTLS 1.3 and QUIC; DNS bootstrap in <code>hopf-dns::ech</code>. See the TLS section</td></tr>
 <tr><td>DKIM / DNSSEC verify</td><td>Direct <code>aws-lc-rs</code> in <code>hopf-smtp</code> / <code>hopf-dns</code></td><td>RSA / Ed25519 / ECDSA; Ed448 via <code>ed448-goldilocks-plus</code>; ML-DSA (FIPS 204) certificate verification also shipped in <code>hopf-core::crypto::x509</code></td></tr>
 <tr><td>UDP datagram I/O</td><td><code>hopf-core</code> (<code>UdpDatagramHandler</code>)</td><td>Cleartext; DTLS now exists as a separate session layer above it (<code>hopf-core::dtls</code>/<code>dtls12</code>), not fused into the datagram handler itself</td></tr>
+<tr><td>TLS Certificate Compression</td><td><code>hopf-core::tls</code> (<code>handshake/cert_compression.rs</code>, <code>HandshakeConfig::certificate_compression</code>)</td><td>RFC 8879, Brotli (algorithm 2) only, on by default; TLS 1.3, DTLS 1.3 and QUIC through the shared engine (not TLS 1.2, which the RFC does not cover). A client offers <code>compress_certificate</code> and inflates a server's <code>CompressedCertificate</code> incrementally as it arrives; output is capped by the declared <code>uncompressed_length</code> (itself capped at 256&nbsp;KiB), so a decompression bomb is cut off before any chain parsing. A server compresses its chain for a client that offered Brotli whenever that makes it smaller. Unknown or unoffered algorithms are refused (<code>illegal_parameter</code>), bad bodies or wrong lengths are <code>bad_certificate</code>. Not done: zlib/zstd, and the mTLS direction (a server's <code>compress_certificate</code> in <code>CertificateRequest</code>, compressing the client certificate). Verified against real GnuTLS in both directions</td></tr>
 </tbody>
 </table>
 <h3 id="security-planned">Remaining</h3>
 <table>
 <thead><tr><th>Area</th><th>Target</th><th>Notes</th></tr></thead>
 <tbody>
-<tr><td>TLS Certificate Compression (optional)</td><td>RFC 8879</td><td>Stable since 2020; not yet scoped in implementation depth</td></tr>
 <tr><td>GSSAPI / Kerberos SASL</td><td>Optional <code>gssapi</code> feature on <code>hopf-auth</code></td><td>Gumdrop parity (RFC 4752); KDC/keytab work on <code>StorageExecutor</code>; acceptable once AWS-LC is the accepted native foundation</td></tr>
 <tr><td>Other transport families</td><td>Separate stacks on same primitives</td><td>SSH/SFTP/SCP (SSH KEX, not TLS), DNSCrypt, CoAP/OSCORE — not DTLS-interoperable</td></tr>
 </tbody>

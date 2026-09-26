@@ -2,6 +2,7 @@
 
 //! TLS 1.3 handshake (RFC 8446 §4) — shared by QUIC and (Phase 4+) TCP.
 
+pub mod cert_compression;
 pub mod collect;
 pub mod key_schedule;
 pub mod messages;

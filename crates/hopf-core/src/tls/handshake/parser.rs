@@ -12,7 +12,24 @@
 
 use bytes::{Bytes, BytesMut};
 
+use super::cert_compression::{CertCompressionError, CertDecoder, HEADER_LEN as COMPRESSED_CERT_HEADER_LEN};
 use super::messages::{ext, HandshakeType};
+
+/// Wire type of `CompressedCertificate` (RFC 8879 §4). Surfaced to
+/// [`HandshakeEvents`] as an ordinary `Certificate` carrying the inflated
+/// body, so nothing downstream needs to know the message was compressed;
+/// the `wire` handed to `message_end` stays the compressed encoding, which is
+/// what the transcript hash covers.
+const COMPRESSED_CERTIFICATE: u8 = 25;
+
+/// A `CompressedCertificate` being inflated while the rest of it is still
+/// arriving.
+#[derive(Debug)]
+struct InflightCertificate {
+    decoder: CertDecoder,
+    /// Compressed bytes (after the 8-byte header) already fed to `decoder`.
+    fed: usize,
+}
 
 /// Semantic events emitted by [`HandshakeParser`].
 ///
@@ -167,18 +184,92 @@ pub trait HandshakeEvents {
     fn parse_error(&mut self, detail: &'static str) {
         let _ = detail;
     }
+
+    /// A `CompressedCertificate` (RFC 8879 §4) was refused. The reason picks
+    /// the alert the caller should send; the default treats it as plain
+    /// malformed input.
+    fn certificate_compression_error(&mut self, err: CertCompressionError) {
+        self.parse_error(err.detail());
+    }
 }
 
 /// Incremental TLS 1.3 handshake message parser (no record layer).
 #[derive(Debug, Default)]
 pub struct HandshakeParser {
     buf: BytesMut,
+    /// Whether a `CompressedCertificate` is expected (we offered
+    /// `compress_certificate`); otherwise type 25 is refused.
+    accept_compressed_certificate: bool,
+    inflight: Option<InflightCertificate>,
 }
 
 impl HandshakeParser {
     /// Empty parser.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Accept (or refuse) `CompressedCertificate` messages - set when this
+    /// endpoint offered `compress_certificate` (RFC 8879 §4: receiving one
+    /// unoffered is an `illegal_parameter` error).
+    pub fn with_certificate_compression(mut self, accept: bool) -> Self {
+        self.accept_compressed_certificate = accept;
+        self
+    }
+
+    /// Advance an in-progress (or new) `CompressedCertificate` whose handshake
+    /// length is `len`, feeding it whatever compressed bytes have arrived.
+    fn advance_compressed_certificate(&mut self, len: usize, handler: &mut dyn HandshakeEvents) -> CompressedStep {
+        if !self.accept_compressed_certificate {
+            handler.certificate_compression_error(CertCompressionError::Unsolicited);
+            return CompressedStep::Failed;
+        }
+        let avail = self.buf.len().min(4 + len).saturating_sub(4);
+        if self.inflight.is_none() {
+            if len < COMPRESSED_CERT_HEADER_LEN {
+                handler.certificate_compression_error(CertCompressionError::Malformed);
+                return CompressedStep::Failed;
+            }
+            if avail < COMPRESSED_CERT_HEADER_LEN {
+                return CompressedStep::NeedMore;
+            }
+            let b = &self.buf[4..4 + COMPRESSED_CERT_HEADER_LEN];
+            let algorithm = u16::from_be_bytes([b[0], b[1]]);
+            let uncompressed = u32::from_be_bytes([0, b[2], b[3], b[4]]) as usize;
+            let compressed = u32::from_be_bytes([0, b[5], b[6], b[7]]) as usize;
+            if compressed != len - COMPRESSED_CERT_HEADER_LEN {
+                handler.certificate_compression_error(CertCompressionError::Malformed);
+                return CompressedStep::Failed;
+            }
+            match CertDecoder::new(algorithm, uncompressed) {
+                Ok(decoder) => self.inflight = Some(InflightCertificate { decoder, fed: 0 }),
+                Err(e) => {
+                    handler.certificate_compression_error(e);
+                    return CompressedStep::Failed;
+                }
+            }
+        }
+        let inflight = self.inflight.as_mut().expect("set above");
+        let from = 4 + COMPRESSED_CERT_HEADER_LEN + inflight.fed;
+        let to = 4 + avail;
+        if to > from {
+            if let Err(e) = inflight.decoder.push(&self.buf[from..to]) {
+                handler.certificate_compression_error(e);
+                return CompressedStep::Failed;
+            }
+            inflight.fed += to - from;
+        }
+        if self.buf.len() < 4 + len {
+            return CompressedStep::NeedMore;
+        }
+        let inflight = self.inflight.take().expect("in flight");
+        match inflight.decoder.finish() {
+            Ok(body) => CompressedStep::Complete(body),
+            Err(e) => {
+                handler.certificate_compression_error(e);
+                CompressedStep::Failed
+            }
+        }
     }
 
     /// Feed bytes; advance `data` past consumed prefix. Returns bytes consumed.
@@ -210,6 +301,26 @@ impl HandshakeParser {
             if self.buf.len() < 4 {
                 break;
             }
+            if self.buf[0] == COMPRESSED_CERTIFICATE {
+                let len = u32::from_be_bytes([0, self.buf[1], self.buf[2], self.buf[3]]) as usize;
+                match self.advance_compressed_certificate(len, handler) {
+                    CompressedStep::NeedMore => break,
+                    CompressedStep::Failed => {
+                        self.inflight = None;
+                        self.buf.clear();
+                        break;
+                    }
+                    CompressedStep::Complete(body) => {
+                        let wire = self.buf.split_to(4 + len).freeze();
+                        handler.message_begin(HandshakeType::Certificate);
+                        if !decode_certificate(&body, handler) {
+                            break;
+                        }
+                        handler.message_end(HandshakeType::Certificate, wire);
+                        continue;
+                    }
+                }
+            }
             let msg_type = match HandshakeType::from_u8(self.buf[0]) {
                 Some(t) => t,
                 None => {
@@ -232,6 +343,12 @@ impl HandshakeParser {
             handler.message_end(msg_type, wire);
         }
     }
+}
+
+enum CompressedStep {
+    NeedMore,
+    Failed,
+    Complete(Vec<u8>),
 }
 
 fn decode_message_body(msg_type: HandshakeType, body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
@@ -772,10 +889,134 @@ mod tests {
                 wire.len()
             ));
         }
+        fn certificate_entry(&mut self, der: &[u8]) {
+            self.events.push(format!("certificate_entry:{}b", der.len()));
+        }
+        fn certificate_compression_error(&mut self, err: CertCompressionError) {
+            self.error = true;
+            self.events.push(format!("compression_error:{err:?}"));
+        }
         fn parse_error(&mut self, detail: &'static str) {
             self.error = true;
             self.events.push(format!("error:{detail}"));
         }
+    }
+
+    /// A `CompressedCertificate` wire message for a chain of `certs`, built
+    /// with `algorithm` and a declared uncompressed length of `declared`
+    /// (`None` = the true length).
+    fn compressed_certificate_wire(certs: &[&[u8]], algorithm: u16, declared: Option<usize>) -> (Bytes, Bytes) {
+        use crate::tls::handshake::cert_compression::{compress, encode_compressed_certificate};
+        use crate::tls::handshake::messages::build_certificate;
+        let plain = build_certificate(&[], certs);
+        let compressed = compress(2, &plain.body).unwrap();
+        let mut body = encode_compressed_certificate(algorithm, declared.unwrap_or(plain.body.len()), &compressed);
+        let mut wire = vec![25u8];
+        wire.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        wire.append(&mut body);
+        (Bytes::from(wire), plain.encode())
+    }
+
+    fn fake_certs() -> Vec<Vec<u8>> {
+        (0..3u8).map(|n| (0..6000).map(|i| (i as u8).wrapping_mul(7).wrapping_add(n)).collect()).collect()
+    }
+
+    /// A Brotli `CompressedCertificate` surfaces exactly as the plain
+    /// `Certificate` it wraps (same entries) - but `message_end` carries the
+    /// compressed wire form, which is what the transcript must hash.
+    #[test]
+    fn compressed_certificate_surfaces_as_the_plain_certificate() {
+        let certs = fake_certs();
+        let refs: Vec<&[u8]> = certs.iter().map(|c| c.as_slice()).collect();
+        let (wire, plain) = compressed_certificate_wire(&refs, 2, None);
+
+        let mut plain_parser = HandshakeParser::new();
+        let mut expected = RecordingHandler::default();
+        plain_parser.receive(&mut &plain[..], &mut expected);
+
+        let mut parser = HandshakeParser::new().with_certificate_compression(true);
+        let mut got = RecordingHandler::default();
+        parser.receive(&mut &wire[..], &mut got);
+        assert!(!got.error, "{:?}", got.events);
+        let strip_end = |v: &Vec<String>| v.iter().filter(|e| !e.starts_with("end:")).cloned().collect::<Vec<_>>();
+        assert_eq!(strip_end(&got.events), strip_end(&expected.events));
+        assert_eq!(got.events.last().unwrap(), &format!("end:11:{}b", wire.len()));
+    }
+
+    /// The compressed body is inflated as it arrives: fed a few bytes at a
+    /// time, nothing is emitted until the message completes, and the result
+    /// is identical.
+    #[test]
+    fn compressed_certificate_can_arrive_in_tiny_chunks() {
+        let certs = fake_certs();
+        let refs: Vec<&[u8]> = certs.iter().map(|c| c.as_slice()).collect();
+        let (wire, _) = compressed_certificate_wire(&refs, 2, None);
+
+        let mut parser = HandshakeParser::new().with_certificate_compression(true);
+        let mut got = RecordingHandler::default();
+        let chunks: Vec<&[u8]> = wire.chunks(5).collect();
+        for chunk in &chunks[..chunks.len() - 1] {
+            parser.receive(&mut &chunk[..], &mut got);
+            assert!(got.events.is_empty(), "emitted before the message completed: {:?}", got.events);
+        }
+        parser.receive(&mut &chunks[chunks.len() - 1][..], &mut got);
+        assert!(!got.error, "{:?}", got.events);
+        assert_eq!(got.events.iter().filter(|e| e.starts_with("certificate_entry:")).count(), 3);
+        assert_eq!(got.events.last().unwrap(), &format!("end:11:{}b", wire.len()));
+    }
+
+    #[test]
+    fn compressed_certificate_is_refused_when_not_offered() {
+        let (wire, _) = compressed_certificate_wire(&[&[1u8; 100]], 2, None);
+        let mut parser = HandshakeParser::new();
+        let mut got = RecordingHandler::default();
+        parser.receive(&mut &wire[..], &mut got);
+        assert_eq!(got.events, vec!["compression_error:Unsolicited".to_string()]);
+    }
+
+    #[test]
+    fn compressed_certificate_with_unknown_algorithm_is_refused() {
+        for alg in [0u16, 1, 3, 0x7777] {
+            let (wire, _) = compressed_certificate_wire(&[&[1u8; 100]], alg, None);
+            let mut parser = HandshakeParser::new().with_certificate_compression(true);
+            let mut got = RecordingHandler::default();
+            parser.receive(&mut &wire[..], &mut got);
+            assert_eq!(got.events, vec!["compression_error:UnsupportedAlgorithm".to_string()], "alg {alg}");
+        }
+    }
+
+    /// Both a declared length over the cap and a stream that inflates past
+    /// (or short of) the declared length are refused, the former before any
+    /// decompression starts.
+    #[test]
+    fn compressed_certificate_size_lies_are_refused() {
+        use crate::tls::handshake::cert_compression::MAX_UNCOMPRESSED_CERTIFICATE_LEN;
+        let certs = fake_certs();
+        let refs: Vec<&[u8]> = certs.iter().map(|c| c.as_slice()).collect();
+        for (declared, expect) in [
+            (MAX_UNCOMPRESSED_CERTIFICATE_LEN + 1, "BadDeclaredLength"),
+            (0, "BadDeclaredLength"),
+            (100, "LengthMismatch"),   // real body is far longer
+            (1 << 17, "LengthMismatch"), // real body is shorter
+        ] {
+            let (wire, _) = compressed_certificate_wire(&refs, 2, Some(declared));
+            let mut parser = HandshakeParser::new().with_certificate_compression(true);
+            let mut got = RecordingHandler::default();
+            parser.receive(&mut &wire[..], &mut got);
+            assert_eq!(got.events, vec![format!("compression_error:{expect}")], "declared {declared}");
+        }
+    }
+
+    /// The compressed-length field must agree with the handshake length.
+    #[test]
+    fn compressed_certificate_with_inconsistent_inner_length_is_malformed() {
+        let (wire, _) = compressed_certificate_wire(&[&[1u8; 100]], 2, None);
+        let mut bad = wire.to_vec();
+        bad[4 + 7] ^= 1; // low byte of compressed_certificate_message length
+        let mut parser = HandshakeParser::new().with_certificate_compression(true);
+        let mut got = RecordingHandler::default();
+        parser.receive(&mut &bad[..], &mut got);
+        assert_eq!(got.events, vec!["compression_error:Malformed".to_string()]);
     }
 
     #[test]
@@ -798,6 +1039,7 @@ mod tests {
             cookie: None,
             record_size_limit: None,
             legacy_version: 0x0303,
+            compress_certificate: false,
         });
         let wire = hello.encode();
         let split = wire.len() / 2;
