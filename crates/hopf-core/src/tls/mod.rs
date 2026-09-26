@@ -43,7 +43,7 @@ pub use pem::{
 };
 pub use record::{NopTlsRecordSink, TlsRecordEngine, TlsRecordSink};
 pub use sink::{
-    AlertDescription, NopTlsEventSink, QuicSecrets, RecordSizeLimits, TlsEventSink, TlsProtocolError, TlsTimerKind,
+    AlertDescription, KeyUpdateDirection, NopTlsEventSink, QuicSecrets, RecordSizeLimits, TlsEventSink, TlsProtocolError, TlsTimerKind,
     VerifyRequest, VerifyResult,
 };
 pub use ticket_keys::TicketKeys;
