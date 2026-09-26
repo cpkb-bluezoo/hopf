@@ -712,17 +712,24 @@ mod tests {
 
     #[test]
     fn nsec3_nodata_and_nxdomain_from_a_closest_encloser_proof() {
-        let cache = cached_nsec3(&zone_names(), 0, 3);
-        let nodata = cache.synthesize(&q("a.example.com", DnsType::Txt)).expect("a has no TXT");
-        assert_eq!((nodata.rcode, nodata.proofs.len()), (0, 1));
+        // The salt is random, so the ring's layout varies from run to run:
+        // exercise many layouts rather than whichever one this run drew.
+        for _ in 0..300 {
+            let cache = cached_nsec3(&zone_names(), 0, 3);
+            let nodata = cache.synthesize(&q("a.example.com", DnsType::Txt)).expect("a has no TXT");
+            assert_eq!((nodata.rcode, nodata.proofs.len()), (0, 1));
 
-        let nx = cache.synthesize(&q("b.example.com", DnsType::A)).expect("closest encloser proof");
-        assert_eq!(nx.rcode, RCODE_NXDOMAIN);
-        assert!(nx.proofs.iter().all(|p| p.rr.rtype == Some(DnsType::Nsec3)));
-        assert!(nx.proofs.len() >= 2, "encloser match plus covers");
+            let nx = cache.synthesize(&q("b.example.com", DnsType::A)).expect("closest encloser proof");
+            assert_eq!(nx.rcode, RCODE_NXDOMAIN);
+            assert!(nx.proofs.iter().all(|p| p.rr.rtype == Some(DnsType::Nsec3)));
+            // Match at the encloser plus covers of the next closer name and of
+            // the wildcard: three roles, but one record can fill several (the
+            // encloser's own range may contain both hashes), so 1 to 3 records.
+            assert!((1..=3).contains(&nx.proofs.len()), "{} proof records", nx.proofs.len());
 
-        // Deeper names walk up to the same encloser.
-        assert_eq!(cache.synthesize(&q("x.y.example.com", DnsType::Aaaa)).unwrap().rcode, RCODE_NXDOMAIN);
+            // Deeper names walk up to the same encloser.
+            assert_eq!(cache.synthesize(&q("x.y.example.com", DnsType::Aaaa)).unwrap().rcode, RCODE_NXDOMAIN);
+        }
     }
 
     #[test]
