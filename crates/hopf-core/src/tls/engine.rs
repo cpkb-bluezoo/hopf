@@ -93,8 +93,8 @@ pub const CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 /// Cipher suites this engine offers/accepts, in preference order. Both use
 /// SHA-256 as the handshake/key-schedule hash (RFC 8446 §B.4), so
 /// negotiating between them only changes the record/packet-protection AEAD,
-/// never the transcript hash. No CBC, no AES-256-GCM — see
-/// `crypto-migration-plan.md`'s Non-goals and Phase 2 entry.
+/// never the transcript hash. No CBC (permanently excluded) and no
+/// AES-256-GCM (out of scope for now).
 pub const SUPPORTED_CIPHER_SUITES: &[u16] = &[AES_128_GCM_SHA256, CHACHA20_POLY1305_SHA256];
 
 /// Negotiated TLS 1.3 AEAD — one of [`SUPPORTED_CIPHER_SUITES`]. Threaded
@@ -817,9 +817,9 @@ impl HandshakeEngine {
                 // (that's the whole point of 0-RTT), so this can't read
                 // `self.negotiated_aead`. Safe by construction rather than
                 // guesswork: 0-RTT only ever resumes a hopf-issued ticket
-                // against a hopf server (see crypto-migration-plan.md's
-                // Non-goals — foreign ticket ciphertext is never decrypted),
-                // both always offering/preferring the same fixed
+                // against a hopf server (foreign ticket ciphertext is never
+                // decrypted — out of scope by design), both always
+                // offering/preferring the same fixed
                 // `SUPPORTED_CIPHER_SUITES` — so the server's pick is always
                 // this crate's own top preference.
                 let early_aead = Tls13Aead::from_suite(SUPPORTED_CIPHER_SUITES[0])

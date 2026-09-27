@@ -18,8 +18,8 @@
 //! `[dev-dependencies]`-only test peer here — `rustls` doesn't appear
 //! anywhere else in this workspace's production dependency graph. This is
 //! the *only* independent-implementation cross-check TCP TLS gets in this
-//! workspace (DTLS 1.3 gets its own separate real-peer interop, see
-//! `crypto-migration-plan.md` Phase 8), so this crate stays, not because
+//! workspace (DTLS 1.3 gets its own separate real-peer interop), so this
+//! crate stays, not because
 //! anything still needs its API, but because deleting it would silently
 //! regress that coverage down to Hopf-talking-to-itself.
 //!
@@ -719,19 +719,18 @@ mod integration_tests {
         assert_eq!(server_alpn.lock().unwrap().as_deref(), Some(&b"h2"[..]), "rustls agrees");
     }
 
-    /// Real interop proof for session resumption (crypto-migration-plan.md
-    /// Phase 5's ticket work): a `rustls` client reusing the same
-    /// `ClientConfig` (and thus its own in-memory ticket cache) across two
-    /// TLS-1.2-only connections to a Hopf server configured with an RFC 5077
-    /// ticket key. The engine-level tests already prove the abbreviated
-    /// flight is well-formed against itself; this proves an independent
-    /// implementation actually recognizes and accepts it as a resumption —
-    /// `rustls` reports this directly via `handshake_kind()`.
+    /// Real interop proof for session resumption: a `rustls` client reusing
+    /// the same `ClientConfig` (and thus its own in-memory ticket cache)
+    /// across two TLS-1.2-only connections to a Hopf server configured with
+    /// an RFC 5077 ticket key. The engine-level tests already prove the
+    /// abbreviated flight is well-formed against itself; this proves an
+    /// independent implementation actually recognizes and accepts it as a
+    /// resumption — `rustls` reports this directly via `handshake_kind()`.
     ///
     /// `acceptor_from_pem_tls12` doesn't take a ticket key (it deliberately
     /// mirrors the TLS 1.3 `base_config` helper, which also leaves
-    /// resumption disabled — see crypto-migration-plan.md), so this builds
-    /// the acceptor directly from `hopf_core::Tls12Config` instead.
+    /// resumption disabled), so this builds the acceptor directly from
+    /// `hopf_core::Tls12Config` instead.
     #[test]
     fn rustls_tls12_client_resumes_second_connection_against_hopf_tls12_ticket_server() {
         let (_dir, cert_path, key_path, certified) = write_temp_pem("tls12-resume");

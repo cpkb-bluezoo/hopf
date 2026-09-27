@@ -1057,10 +1057,9 @@ mod tests {
         assert!(sink_s.events.iter().any(|e| e == "handshake_complete"), "{:?}", sink_s.events);
     }
 
-    /// Validates the design justification for going sink-based at all (see
-    /// crypto-migration-plan.md's "Why sink-based, not return-value-based":
-    /// "multiple outcomes from one stimulus are natural — handshake complete
-    /// *and* early application data in one read"). A real client pipelines
+    /// Validates the design justification for going sink-based at all —
+    /// multiple outcomes from one stimulus are natural: handshake complete
+    /// *and* early application data in one read. A real client pipelines
     /// its Finished and its first application write back-to-back; TCP is
     /// free to deliver both in a single `read()`, so the server's *one*
     /// `feed_ciphertext` call for that read must both complete the

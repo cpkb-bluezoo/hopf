@@ -13,8 +13,7 @@
 //! *cadence* (e.g. "weekly") is deliberately not this type's job — there's
 //! no timer-tick entry point in the TCP/QUIC TLS engines to drive it
 //! autonomously, and deciding *when* to rotate is a caller/deployment
-//! policy, not something a synchronous handshake engine should own (see
-//! `crypto-migration-plan.md`'s RFC 9325 entry for the fuller reasoning).
+//! policy, not something a synchronous handshake engine should own.
 
 /// A server's local ticket-encryption key (AES-128-GCM sealing/opening of
 /// session tickets) — distinct from the protocol-derived secrets

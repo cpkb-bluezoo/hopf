@@ -73,7 +73,7 @@ pub mod ext {
     /// Signature Algorithms (RFC 5246 §7.4.1.4.1).
     pub const SIGNATURE_ALGORITHMS: u16 = 13;
     /// Renegotiation Indication (RFC 5746) — empty on an initial handshake;
-    /// renegotiation itself is out of scope (see crypto-migration-plan.md).
+    /// renegotiation itself is out of scope for this engine.
     pub const RENEGOTIATION_INFO: u16 = 0xff01;
     /// SessionTicket (RFC 5077 §3.2) — empty to advertise support, or the
     /// opaque ticket bytes to attempt resumption.
@@ -816,7 +816,7 @@ pub fn server_ecdh_params_bytes(ec_point: &[u8]) -> Bytes {
 }
 
 /// Parsed `ServerKeyExchange` (ECDHE only — the only key exchange this
-/// engine speaks; see crypto-migration-plan.md's "ECDHE only" scope note).
+/// engine speaks; see [`super`]'s module doc for why).
 #[derive(Debug, Clone)]
 pub struct ParsedServerKeyExchange {
     /// Server's EC point (uncompressed, 65 bytes for P-256).
