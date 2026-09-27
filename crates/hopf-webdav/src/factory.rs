@@ -401,6 +401,7 @@ mod tests {
         assert!(factory.allowed_options.contains("ACL"));
     }
 
+    #[test]
     fn unauth_opt_in_allows_factory() {
         let dir = tempdir().unwrap();
         let storage = Arc::new(StorageExecutor::new(StorageConfig::default()));
