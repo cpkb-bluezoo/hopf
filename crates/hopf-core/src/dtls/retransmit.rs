@@ -12,9 +12,8 @@
 //! arming/cancelling the actual wall-clock timer is the caller's job (the
 //! reactor/connection pump), signalled through
 //! [`crate::dtls::engine::DtlsRecordSink::arm_retransmit_timer`], the same
-//! separation this crate's engines already use for every other timer
-//! (`crypto-migration-plan.md`'s Engine design: reactive stimuli in,
-//! sink-requested timers armed by the caller).
+//! separation this crate's engines already use for every other timer:
+//! reactive stimuli in, sink-requested timers armed by the caller.
 
 use std::time::Duration;
 

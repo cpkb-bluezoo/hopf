@@ -9,8 +9,7 @@
 //! TLS 1.3's `resumption_master_secret` → per-ticket PSK scheme), so a
 //! leaked TLS 1.2 ticket-encryption key or ticket exposes every resumed
 //! session's traffic directly, with no forward secrecy across resumptions.
-//! Short ticket lifetimes and real key rotation are the only mitigation;
-//! see crypto-migration-plan.md's Phase 5 write-up.
+//! Short ticket lifetimes and real key rotation are the only mitigation.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

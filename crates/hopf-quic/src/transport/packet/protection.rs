@@ -302,9 +302,8 @@ mod tests {
     /// packet-payload AEAD and header protection through real ciphertext —
     /// proving `PacketKeys::from_secret`'s ChaCha branch actually works, not
     /// just that it type-checks. Real cross-implementation QUIC interop
-    /// (quiche/msquic/ngtcp2) isn't wired up in this crate at all yet (see
-    /// crypto-migration-plan.md Phase 2's still-unstarted external-peer-interop
-    /// item), so this is the strongest proof available today; the TLS-layer
+    /// (quiche/msquic/ngtcp2) isn't wired up in this crate at all yet, so
+    /// this is the strongest proof available today; the TLS-layer
     /// suite *negotiation* itself is proven once, generically, by
     /// `tls::engine`'s `server_selects_chacha20_poly1305_when_its_the_only_offered_suite`
     /// — both TCP and QUIC key installation consume the same `TlsEventSink`

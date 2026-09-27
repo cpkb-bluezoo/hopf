@@ -12,15 +12,14 @@
 //! (unified-header flag choice, nonce/AAD construction, sequence-number
 //! encryption) are a best-effort reading of RFC 9147, cross-checked
 //! sentence-by-sentence against the RFC text but not proven against a real
-//! DTLS 1.3 peer — none was available when this was written (see
-//! `crypto-migration-plan.md` Phase 6). Revisit once one exists.
+//! DTLS 1.3 peer — none was available when this was written. Revisit once
+//! one exists.
 //!
 //! This implementation always uses the unified header's simplest compliant
 //! flag combination (RFC 9147 §4, Figure 3): no Connection ID (`C=0`), a
 //! 16-bit truncated sequence number (`S=1`), and an explicit length field
 //! (`L=1`). Connection IDs and the 8-bit sequence-number form are not
-//! implemented (`crypto-migration-plan.md` Phase 6 tracks this as a
-//! follow-up). Key updates are driven by [`crate::dtls::DtlsRecordEngine`],
+//! implemented. Key updates are driven by [`crate::dtls::DtlsRecordEngine`],
 //! which keeps the previous epoch's read keys briefly so reordered datagrams
 //! still decrypt (RFC 9147 §5.8.4).
 

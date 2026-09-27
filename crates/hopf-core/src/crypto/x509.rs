@@ -112,8 +112,8 @@ pub fn parse_certificate(der: &[u8]) -> Option<ParsedCertificate> {
 /// (`SSL_SIGN_MLDSA44/65/87`, FIPS 204) are read from this repo's own
 /// vendored `aws-lc-sys` build output
 /// (`target/debug/build/aws-lc-sys-*/out/include/openssl/ssl.h`), not
-/// guessed — verify-only (no ML-DSA signing support here; see
-/// `crypto-migration-plan.md` for why).
+/// guessed — verify-only; this module doesn't sign certificates, only
+/// verifies signatures within a chain.
 pub const ACCEPTED_CERT_SIGNATURE_SCHEMES: &[u16] = &[
     0x0807, // ed25519
     0x0403, // ecdsa_secp256r1_sha256

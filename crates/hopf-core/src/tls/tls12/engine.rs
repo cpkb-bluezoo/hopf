@@ -4,13 +4,12 @@
 //!
 //! Scope for this pass: ECDHE key exchange only (no static-RSA — no forward
 //! secrecy, and it doesn't fit this codebase's PQC-first posture), AEAD
-//! cipher suites only (RFC 5289 GCM today) — CBC suites are **explicitly
-//! not planned**, not merely deferred: MAC-then-encrypt CBC has a real,
-//! recurring history of timing side channels (Lucky Thirteen and friends,
-//! repeatedly reopened by supposedly-fixed implementations across the
-//! industry), and AEAD (GCM here; ChaCha20-Poly1305 is a reasonable future
-//! addition, per the migration plan) is sufficient for every cipher suite
-//! this crate needs to offer. No renegotiation. Session resumption is RFC
+//! cipher suites only (RFC 5289 GCM and ChaCha20-Poly1305) — CBC suites are
+//! **explicitly not planned**, not merely deferred: MAC-then-encrypt CBC has
+//! a real, recurring history of timing side channels (Lucky Thirteen and
+//! friends, repeatedly reopened by supposedly-fixed implementations across
+//! the industry), and AEAD is sufficient for every cipher suite this crate
+//! needs to offer. No renegotiation. Session resumption is RFC
 //! 5077 stateless tickets (see [`super::ticket`]), not RFC 5246 §7.3
 //! session-ID server-side caching — no server-side session state to
 //! scale/evict, and it reuses the same opaque-ticket shape this crate
@@ -80,7 +79,7 @@ pub const TLS_EMPTY_RENEGOTIATION_INFO_SCSV: u16 = 0x00FF;
 /// Cipher suites this engine offers/accepts, in preference order. AES-128-GCM
 /// first (broadest hardware/peer support), then ChaCha20-Poly1305 (equally
 /// strong, faster without AES-NI), then AES-256-GCM. No CBC suites — see
-/// this module's doc comment and `crypto-migration-plan.md`'s Non-goals.
+/// this module's doc comment.
 pub const SUPPORTED_CIPHER_SUITES: &[u16] = &[
     ECDHE_ECDSA_AES128_GCM_SHA256,
     ECDHE_RSA_AES128_GCM_SHA256,
@@ -403,8 +402,8 @@ impl Transcript {
 /// messages are pulled one at a time (`take_one`) from inside the engine's
 /// own drain loop rather than eagerly batch-decoded: a verification gate
 /// stopping mid-batch must leave undispatched messages untouched in here,
-/// not silently discard them (the exact bug the TLS 1.3 engine had until
-/// Phase 4 — see crypto-migration-plan.md).
+/// not silently discard them (the exact bug the TLS 1.3 engine used to
+/// have, since fixed).
 struct MessageBuffer {
     buf: BytesMut,
 }

@@ -10,8 +10,7 @@
 //!
 //! Engine tests here are loopback-only. The reactor-driven UDP driver that
 //! puts this engine on a real socket is [`super::driver`]; there is still no
-//! external DTLS 1.3 interop peer (see the crate-level module doc and
-//! `crypto-migration-plan.md` Phase 6 for what's explicitly deferred).
+//! external DTLS 1.3 interop peer.
 
 use std::collections::VecDeque;
 use std::time::Duration;

@@ -23,8 +23,7 @@
 //! in hand is the real one; extracting the cookie to check first uses
 //! `messages::parse_client_hello` directly, a plain function, not an engine.
 //!
-//! **Cookie policy** (see `crypto-migration-plan.md` Phase 6's DTLS 1.2
-//! section): RFC 6347 §4.2.1 anti-amplification protection needs the cookie
+//! **Cookie policy**: RFC 6347 §4.2.1 anti-amplification protection needs the cookie
 //! bound to the client's source address. This engine is transport-agnostic
 //! and does not know it, so the caller supplies it as
 //! [`Dtls12Config::cookie_binding`] (the UDP driver,
