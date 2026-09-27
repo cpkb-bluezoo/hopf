@@ -16,7 +16,7 @@ use hopf_core::{
 };
 use hopf_http::{CleartextHttpEndpoint, HttpLimits, ServerHandlerFactory};
 
-use crate::{WebDavConfig, WebDavFactory};
+use crate::{DeadPropMode, WebDavConfig, WebDavFactory};
 
 fn listen_webdav(root: std::path::PathBuf) -> (Runtime, std::net::SocketAddr) {
     listen_webdav_cfg(WebDavConfig {
@@ -800,6 +800,159 @@ fn acl_options_and_propfind_with_basic_auth() {
         ),
     );
     assert!(acl.contains("403"), "{acl}");
+
+    rt.shutdown();
+}
+
+// Issue #415: WebDAV lock and dead-property storage roots, separated from
+// the content tree.
+
+/// Two independent [`WebDavFactory`] instances, each serving its own
+/// content directory (as two pods mounting one logical tree at different
+/// absolute paths would), sharing one lock root.
+fn listen_two_pods_sharing_a_lock_root(
+    lock_root: std::path::PathBuf,
+) -> (Runtime, std::net::SocketAddr, Runtime, std::net::SocketAddr, tempfile::TempDir, tempfile::TempDir)
+{
+    let dir_a = tempdir().unwrap();
+    let dir_b = tempdir().unwrap();
+    // Each pod's own copy of the logically-shared file (as two pods mounting
+    // one real shared volume would each see it already there), so both LOCK
+    // requests below resolve an *existing* resource identically rather than
+    // one of them exercising RFC 4918 §7.3 empty-resource creation.
+    fs::write(dir_a.path().join("shared.txt"), b"").unwrap();
+    fs::write(dir_b.path().join("shared.txt"), b"").unwrap();
+    let (rt_a, addr_a) = listen_webdav_cfg(WebDavConfig {
+        root_path: dir_a.path().to_path_buf(),
+        allow_write: true,
+        webdav_enabled: true,
+        allow_unauthenticated_access: true,
+        lock_root: Some(lock_root.clone()),
+        ..Default::default()
+    });
+    let (rt_b, addr_b) = listen_webdav_cfg(WebDavConfig {
+        root_path: dir_b.path().to_path_buf(),
+        allow_write: true,
+        webdav_enabled: true,
+        allow_unauthenticated_access: true,
+        lock_root: Some(lock_root),
+        ..Default::default()
+    });
+    (rt_a, addr_a, rt_b, addr_b, dir_a, dir_b)
+}
+
+/// Acceptance criterion: a configured lock root makes an exclusive lock
+/// conflict visible across two separate handler instances on the same lock
+/// volume, even though each serves its own (otherwise independent) content
+/// directory.
+#[test]
+fn lock_root_makes_exclusive_lock_conflicts_visible_across_two_instances() {
+    let lock_root = tempdir().unwrap();
+    let (rt_a, addr_a, rt_b, addr_b, _dir_a, _dir_b) =
+        listen_two_pods_sharing_a_lock_root(lock_root.path().to_path_buf());
+    thread::sleep(Duration::from_millis(50));
+
+    let body = lock_body_exclusive();
+    let lock_req = format!(
+        "LOCK /shared.txt HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\n\
+         Content-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+
+    let lock_a = http_exchange(addr_a, &lock_req);
+    assert!(lock_a.contains("200"), "instance A's LOCK: {lock_a}");
+
+    // Instance B has never seen this request, and its own in-process state
+    // is entirely separate — only the shared lock root ties them together.
+    let lock_b = http_exchange(addr_b, &lock_req);
+    assert!(
+        lock_b.contains("423"),
+        "instance B must see instance A's exclusive lock via the shared lock root: {lock_b}"
+    );
+
+    let token = extract_lock_token(&lock_a);
+    let unlock_a = http_exchange(
+        addr_a,
+        &format!(
+            "UNLOCK /shared.txt HTTP/1.1\r\nHost: localhost\r\n\
+             Lock-Token: <{token}>\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    assert!(unlock_a.contains("204"), "{unlock_a}");
+
+    // Once released on A, B can now acquire it.
+    let lock_b_again = http_exchange(addr_b, &lock_req);
+    assert!(
+        lock_b_again.contains("200"),
+        "instance B must be able to lock once instance A released it: {lock_b_again}"
+    );
+
+    rt_a.shutdown();
+    rt_b.shutdown();
+}
+
+fn proppatch_set_body(value: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+         <D:propertyupdate xmlns:D=\"DAV:\" xmlns:X=\"https://example.com/ns\">\
+           <D:set><D:prop><X:custom>{value}</X:custom></D:prop></D:set>\
+         </D:propertyupdate>"
+    )
+}
+
+/// Acceptance criterion: with a sidecar root, dead properties do not create
+/// `.webdav_*` siblings in the content tree, and PROPFIND still reports the
+/// property that was set.
+#[test]
+fn sidecar_root_keeps_dead_properties_out_of_the_content_tree() {
+    let content = tempdir().unwrap();
+    let sidecars = tempdir().unwrap();
+    fs::write(content.path().join("doc.txt"), b"hello").unwrap();
+    let (rt, addr) = listen_webdav_cfg(WebDavConfig {
+        root_path: content.path().to_path_buf(),
+        allow_write: true,
+        webdav_enabled: true,
+        allow_unauthenticated_access: true,
+        // Force the sidecar backend rather than `Auto`, which would
+        // otherwise prefer xattr on a filesystem that supports it —
+        // masking the very sidecar-root behaviour this test checks.
+        dead_property_storage: DeadPropMode::Sidecar,
+        sidecar_root: Some(sidecars.path().to_path_buf()),
+        ..Default::default()
+    });
+    thread::sleep(Duration::from_millis(50));
+
+    let body = proppatch_set_body("hello-value");
+    let req = format!(
+        "PROPPATCH /doc.txt HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let resp = http_exchange(addr, &req);
+    assert!(resp.contains("207"), "{resp}");
+
+    let content_entries: Vec<String> = fs::read_dir(content.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        content_entries.iter().all(|n| !n.starts_with(".webdav_")),
+        "no sidecar sibling should appear in the content tree: {content_entries:?}"
+    );
+    assert!(
+        sidecars.path().join("doc.txt").is_file(),
+        "the property should be stored under the sidecar root instead"
+    );
+
+    let propfind_body = "<?xml version=\"1.0\"?><D:propfind xmlns:D=\"DAV:\"><D:allprop/></D:propfind>";
+    let propfind_req = format!(
+        "PROPFIND /doc.txt HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\n\
+         Content-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{propfind_body}",
+        propfind_body.len()
+    );
+    let propfind = http_exchange(addr, &propfind_req);
+    assert!(propfind.contains("hello-value"), "{propfind}");
 
     rt.shutdown();
 }

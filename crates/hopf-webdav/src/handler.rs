@@ -409,6 +409,7 @@ impl WebDavHandler {
         let root = self.root_path.clone();
         let canonical = self.canonical_root.clone();
         let is_get = self.method == "GET";
+        let sidecar_active = self.dead_store.has_sidecar_root();
 
         let rh = w.response_handle();
         let conn = rh.conn_handle().clone();
@@ -424,7 +425,7 @@ impl WebDavHandler {
                     rh.execute(|w| Self::send_error(w, 404));
                     return Ok(());
                 };
-                if !resolved.exists() || is_sidecar_file(&resolved) {
+                if !resolved.exists() || (!sidecar_active && is_sidecar_file(&resolved)) {
                     rh.execute(|w| Self::send_error(w, 404));
                     return Ok(());
                 }
@@ -433,7 +434,7 @@ impl WebDavHandler {
                     if let Some(index) = find_welcome(&resolved, &welcome) {
                         target = index;
                     } else {
-                        let html = build_listing(&request_path, &resolved)?;
+                        let html = build_listing(&request_path, &resolved, sidecar_active)?;
                         rh.execute(move |w| {
                             let mut h = Headers::new();
                             h.status(200);
@@ -680,7 +681,7 @@ impl WebDavHandler {
             let Some(resolved) = canonicalize_path(&root, &canonical, &lexical) else {
                 return Ok(DeleteOutcome::Status(404));
             };
-            if !resolved.exists() || is_sidecar_file(&resolved) {
+            if !resolved.exists() || store.is_sidecar(&resolved) {
                 return Ok(DeleteOutcome::Status(404));
             }
             let current = fs::metadata(&resolved).ok().map(|m| validators_of(&resolved, &m));
@@ -787,6 +788,7 @@ impl WebDavHandler {
             if !src_path.exists() {
                 return Ok(404);
             }
+            let src_is_dir = src_path.is_dir();
             // MOVE requires Depth: infinity when Depth is present (RFC 4918 §9.9).
             if is_move && depth == DEPTH_0 {
                 return Ok(403);
@@ -803,8 +805,12 @@ impl WebDavHandler {
             }
             if is_move {
                 fs::rename(&src_path, &dest_path)?;
-                store.delete_properties(&src_path)?;
-            } else if src_path.is_dir() {
+                if store.has_sidecar_root() {
+                    store.move_properties(&src_path, &dest_path)?;
+                } else {
+                    store.delete_properties(&src_path, src_is_dir)?;
+                }
+            } else if src_is_dir {
                 if depth == DEPTH_0 {
                     // Copy the collection only — no members (RFC 4918 §9.8.3).
                     fs::create_dir(&dest_path)?;
@@ -834,11 +840,19 @@ impl WebDavHandler {
             return;
         };
         let token = token.trim().trim_matches(|c| c == '<' || c == '>').to_string();
-        if !self.lock_manager.unlock(&token) {
-            Self::send_error(w, 409);
-        } else {
-            Self::send_error(w, 204);
-        }
+        let Some(lex) = self.path.clone() else {
+            Self::send_error(w, 404);
+            return;
+        };
+        let root = self.root_path.clone();
+        let canonical = self.canonical_root.clone();
+        let lock_mgr = Arc::clone(&self.lock_manager);
+        self.offload(w, move || {
+            let resource = canonicalize_path(&root, &canonical, &lex).unwrap_or(lex);
+            Ok(lock_mgr.unlock(&resource, &token))
+        }, |unlocked: bool, writer| {
+            Self::send_error(writer, if unlocked { 204 } else { 409 });
+        });
     }
 
     fn handle_lock(&mut self, w: &mut dyn ServerWriter, parsed: WebDavParsed) {
@@ -854,12 +868,24 @@ impl WebDavHandler {
 
         if let Some(token) = refresh_token {
             let token = token.trim().trim_matches(|c| c == '<' || c == '>').to_string();
-            if let Some(lock) = lock_mgr.refresh(&token, timeout) {
-                let body = write_active_lock(&lock, &href);
-                Self::send_bytes(w, 200, CONTENT_TYPE_XML, &body);
-                return;
-            }
-            Self::send_error(w, 412);
+            let refresh_path = path.clone();
+            let refresh_root = root.clone();
+            let refresh_canonical = canonical.clone();
+            let refresh_lock_mgr = Arc::clone(&lock_mgr);
+            let refresh_href = href.clone();
+            self.offload(w, move || {
+                let Some(lex) = refresh_path else {
+                    return Ok(None);
+                };
+                let resource = canonicalize_path(&refresh_root, &refresh_canonical, &lex).unwrap_or(lex);
+                Ok(refresh_lock_mgr.refresh(&resource, &token, timeout))
+            }, move |lock: Option<WebDavLock>, writer| match lock {
+                Some(lock) => {
+                    let body = write_active_lock(&lock, &refresh_href);
+                    Self::send_bytes(writer, 200, CONTENT_TYPE_XML, &body);
+                }
+                None => Self::send_error(writer, 412),
+            });
             return;
         }
 
@@ -1004,6 +1030,7 @@ impl WebDavHandler {
         let depth = self.depth;
         let request_path = self.request_path.clone();
         let mut store = self.dead_store.clone();
+        let sidecar_active = store.has_sidecar_root();
         let lock_mgr = Arc::clone(&self.lock_manager);
         let types = self.content_types.clone();
         let content_language = self.config.content_language.clone();
@@ -1024,13 +1051,17 @@ impl WebDavHandler {
                     rh.execute(|writer| Self::send_error(writer, 404));
                     return Ok(());
                 };
-                if !resolved.exists() || is_sidecar_file(&resolved) {
+                if !resolved.exists() || store.is_sidecar(&resolved) {
                     rh.execute(|writer| Self::send_error(writer, 404));
                     return Ok(());
                 }
-                let resources =
-                    match collect_propfind_resources(&resolved, &request_path, depth, max_tree_entries)
-                    {
+                let resources = match collect_propfind_resources(
+                    &resolved,
+                    &request_path,
+                    depth,
+                    max_tree_entries,
+                    sidecar_active,
+                ) {
                         Ok(r) => r,
                         Err(code) => {
                             rh.execute(move |writer| Self::send_error(writer, code));
@@ -1236,7 +1267,11 @@ fn find_welcome(dir: &Path, names: &[String]) -> Option<PathBuf> {
     None
 }
 
-fn build_listing(request_path: &str, dir: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+fn build_listing(
+    request_path: &str,
+    dir: &Path,
+    sidecar_active: bool,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut html = format!(
         "<!DOCTYPE html><html><head><title>Index of {}</title></head><body><h1>Index of {}</h1><ul>",
         html_escape(request_path),
@@ -1245,7 +1280,7 @@ fn build_listing(request_path: &str, dir: &Path) -> Result<Vec<u8>, Box<dyn std:
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_sidecar_name(&name) {
+        if !sidecar_active && is_sidecar_name(&name) {
             continue;
         }
         let href = if request_path.ends_with('/') {
@@ -1422,11 +1457,12 @@ fn delete_recursive(
     store: &mut DeadPropertyStore,
     errors: &mut Vec<(String, u16)>,
 ) {
+    let sidecar_active = store.has_sidecar_root();
     if path.is_dir() {
         if let Ok(entries) = fs::read_dir(path) {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if is_sidecar_name(&name) {
+                if !sidecar_active && is_sidecar_name(&name) {
                     continue;
                 }
                 let child_path = entry.path();
@@ -1442,7 +1478,7 @@ fn delete_recursive(
         }
         match fs::remove_dir(path) {
             Ok(()) => {
-                let _ = store.delete_properties(path);
+                let _ = store.delete_properties(path, true);
             }
             Err(_) => {
                 // Children that failed leave the directory non-empty → 424.
@@ -1453,7 +1489,7 @@ fn delete_recursive(
     } else {
         match fs::remove_file(path) {
             Ok(()) => {
-                let _ = store.delete_properties(path);
+                let _ = store.delete_properties(path, false);
             }
             Err(_) => errors.push((href.to_string(), 403)),
         }
@@ -1465,6 +1501,7 @@ fn collect_propfind_resources(
     request_path: &str,
     depth: i32,
     max_entries: usize,
+    sidecar_active: bool,
 ) -> Result<Vec<(PathBuf, String)>, u16> {
     let mut out = Vec::new();
     let base_href = href_for_path(request_path);
@@ -1479,6 +1516,7 @@ fn collect_propfind_resources(
             &base_href,
             depth == DEPTH_INFINITY,
             max_entries,
+            sidecar_active,
         )?;
     }
     Ok(out)
@@ -1491,11 +1529,12 @@ fn collect_propfind_children(
     base_href: &str,
     recursive: bool,
     max_entries: usize,
+    sidecar_active: bool,
 ) -> Result<(), u16> {
     for entry in fs::read_dir(dir).map_err(|_| 500u16)? {
         let entry = entry.map_err(|_| 500u16)?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if is_sidecar_name(&name) {
+        if !sidecar_active && is_sidecar_name(&name) {
             continue;
         }
         if out.len() >= max_entries {
@@ -1511,7 +1550,7 @@ fn collect_propfind_children(
         let href = ensure_trailing_slash_for_collection(&child_href, is_dir);
         out.push((path.clone(), href.clone()));
         if recursive && is_dir {
-            collect_propfind_children(out, &path, &href, true, max_entries)?;
+            collect_propfind_children(out, &path, &href, true, max_entries, sidecar_active)?;
         }
     }
     Ok(())
@@ -1775,7 +1814,7 @@ mod tests {
             html_escape(r#"a&b<c>d"e'f"#),
             "a&amp;b&lt;c&gt;d&quot;e&#39;f"
         );
-        let listing = build_listing("/dir", Path::new(".")).unwrap();
+        let listing = build_listing("/dir", Path::new("."), false).unwrap();
         let s = String::from_utf8(listing).unwrap();
         assert!(s.contains("Index of /dir"));
         assert!(!s.contains("Index of /dir<script"));

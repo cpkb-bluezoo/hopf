@@ -58,6 +58,40 @@ pub struct WebDavConfig {
     /// `Last-Modified`; set e.g. `CacheControl::new().no_cache()` to force
     /// revalidation on every use, or a `max_age` for static assets.
     pub cache_control: Option<hopf_http::CacheControl>,
+    /// Directory for WebDAV lock records, or `None` (the default) to keep
+    /// locks in this factory's memory (issue #415).
+    ///
+    /// Locks live in memory by default, which is the right authority for a
+    /// single handler on a private content tree — a second handler serving
+    /// the same tree has empty in-memory maps and would grant a second
+    /// exclusive lock. Setting a lock root switches to file-backed records
+    /// there instead, shared by every handler pointed at the same
+    /// directory, keyed by each resource's path relative to
+    /// [`Self::root_path`] — handlers may mount that same content tree at
+    /// different absolute paths.
+    ///
+    /// Every LOCK/UNLOCK/refresh, and the mutating-request lock check,
+    /// then does blocking file I/O rather than an in-memory lookup; the
+    /// lock root needs a filesystem where a create-new open is atomic and
+    /// a record one handler writes becomes visible to the others before
+    /// they finish their own conflict check (a local disk or a typical
+    /// `ReadWriteOnce` volume — NFS attribute caching, for one, does not
+    /// reliably give you that, and two grants can both succeed).
+    pub lock_root: Option<PathBuf>,
+    /// Directory for dead-property sidecar files, or `None` (the default)
+    /// for the existing xattr-then-sibling-file behaviour (issue #415).
+    ///
+    /// A sidecar normally lives next to its resource (`.webdav_<name>`, or
+    /// `.webdav_.` inside a collection) — fine for a private, writable
+    /// content tree, but it collides with a real resource of that name and
+    /// needs a writable directory the served tree may not have (a
+    /// read-only content volume, or one shared read-only across several
+    /// handlers). Setting a sidecar root moves sidecars into their own
+    /// tree instead, mirroring [`Self::root_path`] one-to-one, so nothing
+    /// is ever written into the content tree and no `.webdav_*` name in it
+    /// is treated as a sidecar. Extended attributes are unaffected either
+    /// way.
+    pub sidecar_root: Option<PathBuf>,
 }
 
 impl Default for WebDavConfig {
@@ -74,6 +108,8 @@ impl Default for WebDavConfig {
             allow_unauthenticated_access: false,
             role_policy: None,
             cache_control: None,
+            lock_root: None,
+            sidecar_root: None,
         }
     }
 }
@@ -100,6 +136,21 @@ impl WebDavConfig {
     /// Cap Depth: infinity PROPFIND / recursive COPY resource visits.
     pub fn with_max_tree_entries(mut self, max: usize) -> Self {
         self.max_tree_entries = max.max(1);
+        self
+    }
+
+    /// Share WebDAV locks across handlers via file-backed records under
+    /// `lock_root`, instead of keeping them in this factory's memory
+    /// (issue #415; see [`WebDavConfig::lock_root`]).
+    pub fn with_lock_root(mut self, lock_root: PathBuf) -> Self {
+        self.lock_root = Some(lock_root);
+        self
+    }
+
+    /// Keep dead-property sidecars under `sidecar_root` instead of next to
+    /// their resources (issue #415; see [`WebDavConfig::sidecar_root`]).
+    pub fn with_sidecar_root(mut self, sidecar_root: PathBuf) -> Self {
+        self.sidecar_root = Some(sidecar_root);
         self
     }
 
@@ -166,8 +217,20 @@ impl WebDavFactory {
         );
         let welcome_files = parse_welcome_files(&config.welcome_file);
         let content_types = default_content_types();
-        let dead_store = DeadPropertyStore::new(config.dead_property_storage);
-        let lock_manager = Arc::new(WebDavLockManager::new());
+        let mut dead_store = DeadPropertyStore::new(config.dead_property_storage);
+        dead_store.set_sidecar_root(
+            root_path.clone(),
+            canonical_root.clone(),
+            config.sidecar_root.clone(),
+        );
+        let lock_manager = Arc::new(match &config.lock_root {
+            Some(lock_root) => WebDavLockManager::with_lock_root(
+                root_path.clone(),
+                canonical_root.clone(),
+                lock_root.clone(),
+            ),
+            None => WebDavLockManager::new(),
+        });
         let role_policy = config.role_policy.clone();
 
         Ok(Self {

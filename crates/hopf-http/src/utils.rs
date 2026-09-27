@@ -393,10 +393,16 @@ fn civil_to_unix(year: i64, month: u32, day: u32, hour: u32, min: u32, sec: u32)
 }
 
 /// Methods that never have a request body in practice for H1 framing.
+///
+/// `UNLOCK` (RFC 4918 §9.11) is included alongside the core HTTP methods:
+/// it carries the lock token in a header, never a body, on either side of
+/// the connection — a request encoder omits `Content-Length` for it just
+/// as it would for `DELETE`, and a server decoder defaults its body to
+/// empty rather than requiring a length it will never see.
 pub fn method_implies_no_body(method: &str) -> bool {
     matches!(
         method,
-        "GET" | "HEAD" | "DELETE" | "OPTIONS" | "TRACE" | "CONNECT"
+        "GET" | "HEAD" | "DELETE" | "OPTIONS" | "TRACE" | "CONNECT" | "UNLOCK"
     )
 }
 

@@ -57,6 +57,16 @@ pub fn make_key(ns: &str, name: &str) -> String {
 pub struct DeadPropertyStore {
     mode: DeadPropMode,
     xattr_supported: Option<bool>,
+    /// Where sidecars go instead of next to their resources, or `None` for
+    /// the sibling layout (issue #415).
+    sidecar_root: Option<PathBuf>,
+    /// The content root with symlinks resolved, and as configured
+    /// (pre-resolution) — a resource that does not exist on disk yet is
+    /// given in the latter form (see [`crate::path::canonicalize_path`]).
+    /// Both are `None` until [`Self::set_sidecar_root`] is called; a
+    /// sidecar root is only ever used once they are set alongside it.
+    content_root: Option<PathBuf>,
+    configured_root: Option<PathBuf>,
 }
 
 impl Default for DeadPropertyStore {
@@ -64,6 +74,9 @@ impl Default for DeadPropertyStore {
         Self {
             mode: DeadPropMode::Auto,
             xattr_supported: None,
+            sidecar_root: None,
+            content_root: None,
+            configured_root: None,
         }
     }
 }
@@ -73,11 +86,104 @@ impl DeadPropertyStore {
         Self {
             mode,
             xattr_supported: None,
+            sidecar_root: None,
+            content_root: None,
+            configured_root: None,
         }
     }
 
     pub fn mode(&self) -> DeadPropMode {
         self.mode
+    }
+
+    /// Keeps sidecars in their own directory tree instead of next to their
+    /// resources (issue #415). A resource's sidecar becomes the file at its
+    /// path relative to `configured_root`/`canonical_root`, under
+    /// `sidecar_root` — so handlers that mount the same tree at different
+    /// absolute paths read the same properties. A collection's own
+    /// properties become the `.webdav_.` file inside its mirrored
+    /// directory there, as they are inside the collection itself in the
+    /// sibling layout.
+    ///
+    /// Nothing is written into the content tree, and nothing in it is a
+    /// sidecar: a content file named `.webdav_report.pdf` is an ordinary
+    /// file. Extended attributes are unaffected.
+    ///
+    /// `sidecar_root` of `None` restores the sibling layout.
+    pub fn set_sidecar_root(
+        &mut self,
+        configured_root: PathBuf,
+        canonical_root: PathBuf,
+        sidecar_root: Option<PathBuf>,
+    ) {
+        self.configured_root = Some(configured_root);
+        self.content_root = Some(canonical_root);
+        self.sidecar_root = sidecar_root;
+    }
+
+    pub fn has_sidecar_root(&self) -> bool {
+        self.sidecar_root.is_some()
+    }
+
+    /// Whether `path` is a dead-property sidecar file of this store: never
+    /// true once a sidecar root is set, since the content tree then holds
+    /// none (a resource literally named `.webdav_*` is an ordinary file).
+    pub fn is_sidecar(&self, path: &Path) -> bool {
+        self.sidecar_root.is_none() && is_sidecar_file(path)
+    }
+
+    /// As [`Self::is_sidecar`], for a directory-entry filename rather than
+    /// a full path.
+    pub fn is_sidecar_entry(&self, name: &str) -> bool {
+        self.sidecar_root.is_none() && is_sidecar_name(name)
+    }
+
+    /// `resource`'s path relative to the content root, whether given as
+    /// already-resolved (under `content_root`) or in its pre-resolution
+    /// form (under `configured_root` — a resource that does not exist yet
+    /// takes this form).
+    fn relative_to_content_root(&self, resource: &Path) -> PathBuf {
+        if let Some(root) = &self.content_root {
+            if let Ok(rel) = resource.strip_prefix(root) {
+                return rel.to_path_buf();
+            }
+        }
+        if let Some(root) = &self.configured_root {
+            if let Ok(rel) = resource.strip_prefix(root) {
+                return rel.to_path_buf();
+            }
+        }
+        resource.to_path_buf()
+    }
+
+    /// The resource's place under the sidecar root: its path relative to
+    /// the content root, mirrored one-to-one (a real collection becomes a
+    /// directory there; a real file becomes a plain file there).
+    fn key_for(&self, resource: &Path) -> PathBuf {
+        let mut key = self
+            .sidecar_root
+            .clone()
+            .expect("key_for called without a sidecar root");
+        for component in self.relative_to_content_root(resource).components() {
+            key.push(component.as_os_str());
+        }
+        key
+    }
+
+    /// Where this store keeps the sidecar of a resource: next to it, or
+    /// under the sidecar root when one is configured.
+    fn sidecar_for(&self, resource: &Path, is_directory: bool) -> PathBuf {
+        match &self.sidecar_root {
+            None => sidecar_path(resource, is_directory),
+            Some(_) => {
+                let key = self.key_for(resource);
+                if is_directory {
+                    key.join(format!("{SIDECAR_PREFIX}."))
+                } else {
+                    key
+                }
+            }
+        }
     }
 
     pub fn get_properties(
@@ -98,7 +204,7 @@ impl DeadPropertyStore {
             merged = self.load_xattr_properties(resource)?;
         }
         if self.use_sidecar() {
-            let sidecar = sidecar_path(resource, is_dir);
+            let sidecar = self.sidecar_for(resource, is_dir);
             if sidecar.is_file() {
                 let side = self.read_sidecar_file(&sidecar)?;
                 for (k, v) in side {
@@ -158,7 +264,7 @@ impl DeadPropertyStore {
             let mut props = self.get_properties(resource, Some(is_dir))?;
             props.remove(&make_key(ns, name));
             if props.is_empty() {
-                let side = sidecar_path(resource, is_dir);
+                let side = self.sidecar_for(resource, is_dir);
                 let _ = fs::remove_file(side);
             } else {
                 self.write_sidecar(resource, is_dir, &props)?;
@@ -172,10 +278,10 @@ impl DeadPropertyStore {
             return Ok(());
         }
         let src_dir = source.is_dir();
-        let src_side = sidecar_path(source, src_dir);
+        let src_side = self.sidecar_for(source, src_dir);
         if src_side.is_file() {
             let tgt_dir = target.is_dir();
-            let dst_side = sidecar_path(target, tgt_dir);
+            let dst_side = self.sidecar_for(target, tgt_dir);
             if let Some(parent) = dst_side.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -196,18 +302,52 @@ impl DeadPropertyStore {
         Ok(())
     }
 
-    pub fn delete_properties(&mut self, resource: &Path) -> io::Result<()> {
+    /// Removes a resource's properties. `is_directory` must be given
+    /// explicitly rather than detected: callers reach this after the
+    /// resource itself was already removed or renamed away, when
+    /// `resource.is_dir()` would always read back `false`.
+    pub fn delete_properties(&mut self, resource: &Path, is_directory: bool) -> io::Result<()> {
         if self.mode == DeadPropMode::None {
             return Ok(());
         }
-        let is_dir = resource.is_dir();
-        let side = sidecar_path(resource, is_dir);
-        let _ = fs::remove_file(side);
+        let side = self.sidecar_for(resource, is_directory);
+        let _ = fs::remove_file(&side);
+        if self.sidecar_root.is_some() && is_directory {
+            // `side` is `<mirrored dir>/.webdav_.`; once every descendant's
+            // own key is gone too (guaranteed when callers clean up
+            // bottom-up, as `delete_recursive` does) this removes the now
+            // -empty mirrored directory rather than leaking it.
+            if let Some(mirrored_dir) = side.parent() {
+                let _ = fs::remove_dir(mirrored_dir);
+            }
+        }
         if self.use_xattr(resource) {
             let props = self.load_xattr_properties(resource)?;
             for prop in props.values() {
                 let _ = self.remove_xattr_property(resource, &prop.namespace_uri, &prop.local_name);
             }
+        }
+        Ok(())
+    }
+
+    /// Carries a resource's properties across a MOVE, once the resource
+    /// itself has already moved from `source` to `target`. With no sidecar
+    /// root this is a no-op — the sibling layout leaves nothing to move.
+    /// With a sidecar root, moves the resource's whole key subtree.
+    pub fn move_properties(&mut self, source: &Path, target: &Path) -> io::Result<()> {
+        if self.mode == DeadPropMode::None || self.sidecar_root.is_none() {
+            return Ok(());
+        }
+        let to = self.key_for(target);
+        if to.exists() {
+            remove_key_tree(&to)?;
+        }
+        let from = self.key_for(source);
+        if from.exists() {
+            if let Some(parent) = to.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&from, &to)?;
         }
         Ok(())
     }
@@ -324,12 +464,24 @@ impl DeadPropertyStore {
         is_directory: bool,
         props: &HashMap<String, DeadProperty>,
     ) -> io::Result<()> {
-        let side = sidecar_path(resource, is_directory);
+        let side = self.sidecar_for(resource, is_directory);
         if let Some(parent) = side.parent() {
             fs::create_dir_all(parent)?;
         }
         let xml = serialize_sidecar_xml(props);
         fs::write(side, xml)
+    }
+}
+
+/// Recursively removes a sidecar-root key (file or directory subtree).
+fn remove_key_tree(key: &Path) -> io::Result<()> {
+    if key.is_dir() {
+        for entry in fs::read_dir(key)? {
+            remove_key_tree(&entry?.path())?;
+        }
+        fs::remove_dir(key)
+    } else {
+        fs::remove_file(key)
     }
 }
 
@@ -490,5 +642,118 @@ mod tests {
         let p = props.values().next().unwrap();
         assert_eq!(p.value, "value");
         assert!(sidecar_path(&file, false).is_file());
+    }
+
+    // Issue #415: with a sidecar root, properties move out of the content
+    // tree entirely.
+
+    fn store_with_sidecar_root(content_root: &Path, sidecar_root: &Path) -> DeadPropertyStore {
+        let mut store = DeadPropertyStore::new(DeadPropMode::Sidecar);
+        store.set_sidecar_root(
+            content_root.to_path_buf(),
+            content_root.to_path_buf(),
+            Some(sidecar_root.to_path_buf()),
+        );
+        store
+    }
+
+    #[test]
+    fn sidecar_root_keeps_the_content_tree_free_of_sidecars() {
+        let content = tempdir().unwrap();
+        let sidecars = tempdir().unwrap();
+        let file = content.path().join("doc.txt");
+        fs::write(&file, b"data").unwrap();
+        let mut store = store_with_sidecar_root(content.path(), sidecars.path());
+
+        store
+            .set_property(&file, "http://ex/", "tag", "value", false)
+            .unwrap();
+
+        assert!(
+            fs::read_dir(content.path())
+                .unwrap()
+                .flatten()
+                .all(|e| !is_sidecar_name(&e.file_name().to_string_lossy())),
+            "no .webdav_* sibling should appear in the content tree"
+        );
+        let props = store.get_properties(&file, Some(false)).unwrap();
+        assert_eq!(props.values().next().unwrap().value, "value");
+        assert!(sidecars.path().join("doc.txt").is_file());
+    }
+
+    #[test]
+    fn sidecar_root_does_not_treat_a_real_dotwebdav_file_as_a_sidecar() {
+        let content = tempdir().unwrap();
+        let sidecars = tempdir().unwrap();
+        let store = store_with_sidecar_root(content.path(), sidecars.path());
+        let real_file = content.path().join(".webdav_report.pdf");
+        assert!(!store.is_sidecar(&real_file));
+        assert!(!store.is_sidecar_entry(".webdav_report.pdf"));
+
+        let sibling_mode = DeadPropertyStore::new(DeadPropMode::Sidecar);
+        assert!(sibling_mode.is_sidecar(&real_file));
+    }
+
+    #[test]
+    fn directorys_own_properties_land_under_the_mirrored_subdirectory() {
+        let content = tempdir().unwrap();
+        let sidecars = tempdir().unwrap();
+        let collection = content.path().join("docs");
+        fs::create_dir(&collection).unwrap();
+        let mut store = store_with_sidecar_root(content.path(), sidecars.path());
+
+        store
+            .set_property(&collection, "http://ex/", "tag", "value", false)
+            .unwrap();
+
+        assert!(sidecars.path().join("docs").join(".webdav_.").is_file());
+    }
+
+    #[test]
+    fn move_properties_carries_the_sidecar_key_to_the_target() {
+        let content = tempdir().unwrap();
+        let sidecars = tempdir().unwrap();
+        let source = content.path().join("a.txt");
+        let target = content.path().join("b.txt");
+        fs::write(&source, b"data").unwrap();
+        let mut store = store_with_sidecar_root(content.path(), sidecars.path());
+        store
+            .set_property(&source, "http://ex/", "tag", "value", false)
+            .unwrap();
+
+        fs::rename(&source, &target).unwrap();
+        store.move_properties(&source, &target).unwrap();
+
+        assert!(!sidecars.path().join("a.txt").exists());
+        let props = store.get_properties(&target, Some(false)).unwrap();
+        assert_eq!(props.values().next().unwrap().value, "value");
+    }
+
+    #[test]
+    fn delete_properties_prunes_the_now_empty_mirrored_directory() {
+        let content = tempdir().unwrap();
+        let sidecars = tempdir().unwrap();
+        let collection = content.path().join("docs");
+        let child = collection.join("a.txt");
+        fs::create_dir(&collection).unwrap();
+        fs::write(&child, b"data").unwrap();
+        let mut store = store_with_sidecar_root(content.path(), sidecars.path());
+        store
+            .set_property(&child, "http://ex/", "tag", "value", false)
+            .unwrap();
+        store
+            .set_property(&collection, "http://ex/", "tag", "value", false)
+            .unwrap();
+        assert!(sidecars.path().join("docs").is_dir());
+
+        // Bottom-up, as `delete_recursive` does: the child's key first...
+        store.delete_properties(&child, false).unwrap();
+        // ...then the collection's own key.
+        store.delete_properties(&collection, true).unwrap();
+
+        assert!(
+            !sidecars.path().join("docs").exists(),
+            "the emptied mirrored directory should not be left behind"
+        );
     }
 }
