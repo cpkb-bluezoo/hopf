@@ -39,6 +39,7 @@ full = [
     "otel",
     "mqtt",
     "amqp",
+    "amqp1",
 ]
 tls = []
 auth = ["dep:hopf-auth"]
@@ -60,6 +61,7 @@ mailbox = ["dep:hopf-mailbox"]
 otel = ["dep:hopf-otel"]
 mqtt = ["dep:hopf-mqtt"]
 amqp = ["dep:hopf-amqp"]
+amqp1 = ["dep:hopf-amqp1"]
 # Pass-throughs to optional sub-crate features.
 # `pam` is opt-in (links libpam); not included in `full`.
 pam = ["auth", "hopf-auth/pam"]
@@ -94,3 +96,4 @@ hopf-mailbox = { workspace = true, optional = true }
 hopf-otel = { workspace = true, optional = true }
 hopf-mqtt = { workspace = true, optional = true }
 hopf-amqp = { workspace = true, optional = true }
+hopf-amqp1 = { workspace = true, optional = true }

@@ -1,0 +1,26 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-amqp1"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "AMQP 1.0 async client for Hopf (RabbitMQ 4 native AMQP 1.0, ActiveMQ Artemis)"
+readme = "README.md"
+keywords = ["amqp", "amqp1.0", "messaging", "networking"]
+categories = ["network-programming"]
+
+[features]
+default = []
+# Opt-in real-broker integration tests. CI runs unit tests without this
+# feature; run manually with `cargo test -p hopf-amqp1 --features integration`.
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-auth = { workspace = true }
+hopf-dns = { workspace = true }
