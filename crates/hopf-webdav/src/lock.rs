@@ -4,9 +4,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::constants::{self, DEPTH_1, DEPTH_INFINITY, LOCK_TOKEN_SCHEME};
+use crate::lock_store::FileLockStore;
 
 /// Lock scope (RFC 4918 §14.13 / §14.26).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,10 +16,42 @@ pub enum LockScope {
     Shared,
 }
 
+impl LockScope {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            LockScope::Exclusive => "EXCLUSIVE",
+            LockScope::Shared => "SHARED",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "EXCLUSIVE" => Some(LockScope::Exclusive),
+            "SHARED" => Some(LockScope::Shared),
+            _ => None,
+        }
+    }
+}
+
 /// Lock type (RFC 4918 §14.29).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockType {
     Write,
+}
+
+impl LockType {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            LockType::Write => "WRITE",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "WRITE" => Some(LockType::Write),
+            _ => None,
+        }
+    }
 }
 
 /// A WebDAV lock on a resource.
@@ -27,11 +60,9 @@ pub struct WebDavLock {
     token: String,
     path: PathBuf,
     scope: LockScope,
-    #[allow(dead_code)]
     ty: LockType,
     depth: i32,
     owner: String,
-    #[allow(dead_code)]
     created_at: SystemTime,
     expires_at: Option<SystemTime>,
 }
@@ -64,6 +95,30 @@ impl WebDavLock {
         }
     }
 
+    /// Reconstructs a lock read back from a [`FileLockStore`] record, with
+    /// its original token, creation time and expiry preserved verbatim.
+    pub(crate) fn from_record(
+        token: String,
+        path: PathBuf,
+        scope: LockScope,
+        ty: LockType,
+        depth: i32,
+        owner: String,
+        created_at: SystemTime,
+        expires_at: Option<SystemTime>,
+    ) -> Self {
+        Self {
+            token,
+            path,
+            scope,
+            ty,
+            depth,
+            owner,
+            created_at,
+            expires_at,
+        }
+    }
+
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -76,12 +131,34 @@ impl WebDavLock {
         self.scope
     }
 
+    pub(crate) fn lock_type(&self) -> LockType {
+        self.ty
+    }
+
     pub fn depth(&self) -> i32 {
         self.depth
     }
 
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    /// Milliseconds since the Unix epoch this lock was created at.
+    pub(crate) fn created_at_millis(&self) -> i64 {
+        self.created_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_millis() as i64
+    }
+
+    /// Milliseconds since the Unix epoch this lock expires at, or `None`
+    /// for an infinite timeout.
+    pub(crate) fn expires_at_millis(&self) -> Option<i64> {
+        self.expires_at.map(|t| {
+            t.duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_millis() as i64
+        })
     }
 
     pub fn is_expired(&self) -> bool {
@@ -155,8 +232,17 @@ fn new_opaque_token() -> String {
 }
 
 /// Manages WebDAV locks for resources.
+///
+/// By default locks live in this manager's memory, which is the right
+/// authority for one handler on a private content tree. Given a lock root
+/// ([`WebDavLockManager::with_lock_root`]; see [`FileLockStore`]), every
+/// lock is a file there instead, so that handlers sharing the tree also
+/// share the locks, and the in-memory maps are not consulted at all — in
+/// that mode every method does blocking file I/O and must only be called
+/// from a storage thread, same as [`crate::dead_props::DeadPropertyStore`].
 pub struct WebDavLockManager {
     inner: Mutex<LockTable>,
+    shared: Option<FileLockStore>,
 }
 
 struct LockTable {
@@ -171,12 +257,33 @@ impl Default for WebDavLockManager {
 }
 
 impl WebDavLockManager {
+    /// Locks kept in memory (the default: one handler, one private tree).
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(LockTable {
                 by_token: std::collections::HashMap::new(),
                 by_path: std::collections::HashMap::new(),
             }),
+            shared: None,
+        }
+    }
+
+    /// Locks kept as files under `lock_root`, keyed by each resource's path
+    /// relative to the content root — shared with every other handler
+    /// pointed at the same `lock_root` (issue #415).
+    ///
+    /// `configured_root` is the content root as configured (used for
+    /// resources that do not exist on disk yet, and so were resolved
+    /// lexically rather than canonicalized — see
+    /// [`crate::path::canonicalize_path`]); `canonical_root` is that same
+    /// root with symlinks resolved.
+    pub fn with_lock_root(configured_root: PathBuf, canonical_root: PathBuf, lock_root: PathBuf) -> Self {
+        Self {
+            inner: Mutex::new(LockTable {
+                by_token: std::collections::HashMap::new(),
+                by_path: std::collections::HashMap::new(),
+            }),
+            shared: Some(FileLockStore::new(configured_root, canonical_root, lock_root)),
         }
     }
 
@@ -189,6 +296,9 @@ impl WebDavLockManager {
         owner: String,
         timeout_seconds: i64,
     ) -> Option<WebDavLock> {
+        if let Some(shared) = &self.shared {
+            return shared.lock(&path, scope, ty, depth, owner, timeout_seconds);
+        }
         let mut table = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         table.clean_expired();
         if table.has_conflicting_lock(&path, scope) {
@@ -201,7 +311,11 @@ impl WebDavLockManager {
         Some(lock)
     }
 
-    pub fn unlock(&self, token: &str) -> bool {
+    /// Releases the lock with this token that covers `path` (RFC 4918 §9.11).
+    pub fn unlock(&self, path: &Path, token: &str) -> bool {
+        if let Some(shared) = &self.shared {
+            return shared.unlock(path, token);
+        }
         let mut table = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(lock) = table.by_token.remove(token) else {
             return false;
@@ -215,7 +329,11 @@ impl WebDavLockManager {
         true
     }
 
-    pub fn refresh(&self, token: &str, timeout_seconds: i64) -> Option<WebDavLock> {
+    /// Refreshes a lock timeout (RFC 4918 §9.10.2).
+    pub fn refresh(&self, path: &Path, token: &str, timeout_seconds: i64) -> Option<WebDavLock> {
+        if let Some(shared) = &self.shared {
+            return shared.refresh(path, token, timeout_seconds);
+        }
         let mut table = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let lock = table.by_token.get_mut(token)?;
         if lock.is_expired() {
@@ -226,7 +344,10 @@ impl WebDavLockManager {
         Some(lock.clone())
     }
 
-    pub fn get_lock(&self, token: &str) -> Option<WebDavLock> {
+    pub fn get_lock(&self, path: &Path, token: &str) -> Option<WebDavLock> {
+        if let Some(shared) = &self.shared {
+            return shared.get_lock(path, token);
+        }
         let mut table = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let expired = table
             .by_token
@@ -241,6 +362,9 @@ impl WebDavLockManager {
     }
 
     pub fn get_locks(&self, path: &Path) -> Vec<WebDavLock> {
+        if let Some(shared) = &self.shared {
+            return shared.get_locks_at(path);
+        }
         let table = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(tokens) = table.by_path.get(path) else {
             return Vec::new();
@@ -252,6 +376,9 @@ impl WebDavLockManager {
     }
 
     pub fn get_covering_locks(&self, path: &Path) -> Vec<WebDavLock> {
+        if let Some(shared) = &self.shared {
+            return shared.get_covering_locks(path);
+        }
         let table = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         table
             .by_token
@@ -266,7 +393,7 @@ impl WebDavLockManager {
     }
 
     pub fn validate_token(&self, path: &Path, token: &str) -> bool {
-        self.get_lock(token)
+        self.get_lock(path, token)
             .map(|l| l.covers(path))
             .unwrap_or(false)
     }
@@ -383,7 +510,7 @@ mod tests {
             &PathBuf::from("/dav/sub/file"),
             lock.token()
         ));
-        assert!(mgr.unlock(lock.token()));
+        assert!(mgr.unlock(&PathBuf::from("/dav/sub/file"), lock.token()));
         assert!(!mgr.validate_token(&PathBuf::from("/dav/sub/file"), lock.token()));
     }
 }

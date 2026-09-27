@@ -9,6 +9,7 @@ mod factory;
 mod handler;
 mod if_header;
 mod lock;
+mod lock_store;
 mod multistatus;
 mod parser;
 mod path;

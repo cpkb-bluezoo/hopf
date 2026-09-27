@@ -313,7 +313,26 @@ impl WebDavXmlHandler {
     }
 
     fn handle_property_element(&mut self, ns: &str, local: &str) {
-        if self.in_prop {
+        // `<D:prop>` wraps property *names* in a PROPFIND request but
+        // property *name-and-value* pairs in a PROPPATCH `<set>`/`<remove>`
+        // block (RFC 4918 §9.2) — and the DAV-element handler above sets
+        // `in_prop` on either one, since both share the same `<D:prop>`
+        // start tag. Check `in_set`/`in_remove` first so a PROPPATCH body's
+        // property children are captured as updates rather than mistaken
+        // for a PROPFIND request's (here absent) property list.
+        // `<D:prop>` wraps property *names* in a PROPFIND request but
+        // property *name-and-value* pairs in a PROPPATCH `<set>`/`<remove>`
+        // block (RFC 4918 §9.2) — and the DAV-element handler above sets
+        // `in_prop` on either one, since both share the same `<D:prop>`
+        // start tag. Check `in_set`/`in_remove` first so a PROPPATCH body's
+        // property children are captured as updates rather than mistaken
+        // for a PROPFIND request's (here absent) property list.
+        if self.in_set || self.in_remove {
+            self.cur_ns = Some(ns.to_string());
+            self.cur_name = Some(local.to_string());
+            self.cur_value.clear();
+            self.prop_value_depth = 1;
+        } else if self.in_prop {
             if let Some(p) = self.propfind.as_mut() {
                 p.properties.push(PropertyRef {
                     namespace_uri: ns.to_string(),
@@ -327,11 +346,6 @@ impl WebDavXmlHandler {
                     local_name: local.to_string(),
                 });
             }
-        } else if self.in_set || self.in_remove {
-            self.cur_ns = Some(ns.to_string());
-            self.cur_name = Some(local.to_string());
-            self.cur_value.clear();
-            self.prop_value_depth = 1;
         }
     }
 
@@ -506,6 +520,26 @@ mod tests {
         assert_eq!(pf.kind, PropfindType::Prop);
         assert_eq!(pf.properties.len(), 1);
         assert_eq!(pf.properties[0].local_name, "displayname");
+    }
+
+    /// `<D:prop>` wraps property *names* in a PROPFIND request but
+    /// property *name-and-value* pairs in a PROPPATCH `<set>`/`<remove>`
+    /// block (RFC 4918 §9.2). Both start the same `<D:prop>` element, and
+    /// `handle_property_element` used to check `in_prop` before `in_set`/
+    /// `in_remove`, so a PROPPATCH body's property child was mistaken for a
+    /// PROPFIND-style name and the update was silently dropped.
+    #[test]
+    fn parse_proppatch_set_captures_the_property_value() {
+        let body = br#"<?xml version="1.0"?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:X="https://example.com/ns">
+  <D:set><D:prop><X:custom>hello-value</X:custom></D:prop></D:set>
+</D:propertyupdate>"#;
+        let parsed = parse_webdav_body(body).unwrap();
+        let patch = parsed.proppatch.unwrap();
+        assert_eq!(patch.updates.len(), 1);
+        assert_eq!(patch.updates[0].operation, ProppatchOp::Set);
+        assert_eq!(patch.updates[0].local_name, "custom");
+        assert_eq!(patch.updates[0].value, "hello-value");
     }
 
     /// Issue #191: `WebDavRequestParser` must hold one real `Parser` alive
