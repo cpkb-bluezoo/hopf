@@ -15,9 +15,13 @@ and graceful stream FIN still use `disconnected`.
 ## Status
 
 **Today:** in-tree transport (no `quinn-proto`); TLS 1.3 handshake via
-`hopf-core::tls` for QUIC. Loopback echo works
-(`spike_echo_one_stream_hopf` with `QuicListenHardening::permissive()`).
-Retry, GSO, and loopback-quality 0-RTT/early data are wired; broader interop
-and H3 remain Phase 3 follow-ups. See
+`hopf-core::tls` for QUIC. HTTP/3 (RFC 9114) and QPACK (RFC 9204) ship
+in-tree in `hopf-http` on top of this crate. Retry, GSO, 0-RTT/early data,
+QUIC version 2 (RFC 9369), version negotiation, and QUIC-LB connection IDs
+are all implemented. Remaining gaps: connection migration is structurally
+inert, `NEW_TOKEN`-based address validation doesn't exist, and the 3×
+anti-amplification byte cap isn't enforced (moot under the default
+high-security Retry hardening). See
 [docs/quic-h3.html#implementation-status](../../docs/quic-h3.html#implementation-status)
-and [crypto-migration-plan.md](../../crypto-migration-plan.md).
+and [docs/conformance.html#quic](../../docs/conformance.html#quic) for the
+full row-by-row detail.

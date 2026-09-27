@@ -15,15 +15,17 @@ over the thread and plain buffers. **Listen and dial** are equal bindings on
 one Runtime. Codecs are **incremental push parsers**: chunked, resumable
 ingress; handler-callback egress.
 
-**Security (today):** TCP TLS and STARTTLS via [`hopf-tls`](crates/hopf-tls)
-and **rustls** (aws-lc-rs provider, hybrid-first PQC). QUIC via
-[quinn-proto](https://docs.rs/quinn-proto) for RFC 9000 transport plus
-in-tree mio UDP glue and HTTP/3 codecs. **DTLS is not implemented yet.**
-
-**Security (direction):** consolidate cryptography under
-[`hopf-core`](crates/hopf-core) on **AWS-LC** (BoringSSL lineage) at the
-libcrypto layer — in-tree TLS, DTLS, and QUIC wire work, with rustls and
-quinn-proto retired once parity is proven. See
+**Security:** cryptography is consolidated under
+[`hopf-core`](crates/hopf-core) on **AWS-LC** (BoringSSL lineage, reached
+through `aws-lc-rs`/`aws-lc-sys`), with TLS, DTLS, and QUIC implemented
+in-tree on the same thread-per-core reactor model — TCP TLS 1.2/1.3
+(`hopf-core::tls`), UDP DTLS 1.2/1.3 with per-peer version negotiation
+(`hopf-core::dtls`/`dtls12`), and QUIC's RFC 9000 transport plus its TLS 1.3
+handshake (`hopf-quic`), hybrid-first PQC key exchange. No `rustls` or
+`quinn-proto` dependency remains in any production crate; `hopf-tls` is
+kept only as a `rustls`-based interop test harness for `hopf-core::tls`.
+Remaining work — DTLS's generic `Endpoint` integration, optional
+GSSAPI/Kerberos SASL — is tracked in
 [Architecture](https://cpkb-bluezoo.github.io/hopf/architecture.html#security-substrate)
 and the [conformance audit](https://cpkb-bluezoo.github.io/hopf/conformance.html#security-substrate).
 

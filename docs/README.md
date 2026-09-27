@@ -14,10 +14,10 @@ code examples, and limitations. Cookbook pages stay short and point at
 `examples/`.
 
 The [conformance audit](conformance.html) and [architecture](architecture.html#security-substrate)
-pages document what is **implemented today** versus **planned** (notably
-AWS-LC-backed security in `hopf-core`, DTLS, in-tree QUIC, and optional
-GSSAPI/Kerberos SASL). Migration planning: [`crypto-migration-plan.md`](../crypto-migration-plan.md)
-and Phase 0 inventory [`crypto-migration-inventory.md`](../crypto-migration-inventory.md).
+pages document what is **implemented today** versus **planned**. The AWS-LC
+crypto consolidation, in-tree TLS/QUIC, and DTLS's handshake/record engine
+are done; DTLS's generic `Endpoint` integration and optional GSSAPI/Kerberos
+SASL remain (see architecture.html's Security substrate → Direction).
 
 If you regenerate from Markdown drafts, use
 [`scripts/md_docs_to_html.py`](../scripts/md_docs_to_html.py) (requires `pandoc`).

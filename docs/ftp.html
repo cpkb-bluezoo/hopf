@@ -32,17 +32,21 @@
 <li><a href="http/server.html">HTTP server</a></li>
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
 <li><a href="ldap.html">LDAP</a></li>
 <li><a href="webdav.html">WebDAV</a></li>
 <li><a href="websocket.html">WebSocket</a></li>
 <li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
 <li><a href="ftp.html" aria-current="page">FTP</a></li>
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
-<li><a href="amqp.html">AMQP</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -71,7 +75,7 @@
     <main class="main">
       <header>
         <h1>FTP</h1>
-        <p class="lead">Crate <code>hopf-ftp</code>: FTP / FTPS <strong>server</strong> and callback-driven <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.ftp</code>. The server runs on the Hopf thread-per-core reactor; data connections use dynamic PASV listeners on a shared <code>Arc&lt;Runtime&gt;</code>. TLS is provided by <a href="tls.html"><code>hopf-tls</code></a> (rustls). Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code>.</p>
+        <p class="lead">Crate <code>hopf-ftp</code>: FTP / FTPS <strong>server</strong> and callback-driven <strong>client</strong>, a port of Gumdrop <code>org.bluezoo.gumdrop.ftp</code>. The server runs on the Hopf thread-per-core reactor; data connections use dynamic PASV listeners on a shared <code>Arc&lt;Runtime&gt;</code>. TLS is provided by <a href="tls.html"><code>hopf-core::tls</code></a> (in-tree, on AWS-LC). Authentication uses <a href="auth.html"><code>hopf-auth</code></a> <code>TrustPolicy</code>.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>

@@ -32,17 +32,21 @@
 <li><a href="http/server.html">HTTP server</a></li>
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
 <li><a href="ldap.html">LDAP</a></li>
 <li><a href="webdav.html">WebDAV</a></li>
 <li><a href="websocket.html">WebSocket</a></li>
 <li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
 <li><a href="ftp.html">FTP</a></li>
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
-<li><a href="amqp.html" aria-current="page">AMQP</a></li>
+<li><a href="amqp.html" aria-current="page">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -70,8 +74,8 @@
 </nav>
     <main class="main">
       <header>
-        <h1>AMQP</h1>
-        <p class="lead"><code>hopf-amqp</code> is an <strong>AMQP 0-9-1 async client</strong> (RabbitMQ wire protocol). Client-only: publish opaque bodies and consume via push <code>basic.consume</code> deliveries on the Hopf TPC runtime. There is no broker in this crate.</p>
+        <h1>AMQP 0-9-1</h1>
+        <p class="lead"><code>hopf-amqp</code> is an <strong>AMQP 0-9-1 async client</strong> (RabbitMQ wire protocol). Client-only: publish opaque bodies and consume via push <code>basic.consume</code> deliveries on the Hopf TPC runtime. There is no broker in this crate. For the unrelated AMQP 1.0 wire protocol, see <a href="amqp1.html">AMQP 1.0</a> (<code>hopf-amqp1</code>) — the two share only the <code>AMQP</code> magic bytes.</p>
       </header>
       <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
@@ -87,7 +91,7 @@
 <table>
 <thead><tr><th>Area</th><th>Support</th></tr></thead>
 <tbody>
-<tr><td>Protocol</td><td>AMQP 0-9-1 only (not 1.0)</td></tr>
+<tr><td>Protocol</td><td>AMQP 0-9-1 only — see <a href="amqp1.html">AMQP 1.0</a> for the separate <code>hopf-amqp1</code> crate</td></tr>
 <tr><td>Role</td><td>Client only</td></tr>
 <tr><td>Auth</td><td><code>PLAIN</code> (via <code>hopf-auth</code>) or <code>AMQPLAIN</code></td></tr>
 <tr><td>Channels</td><td>Multi-channel; control methods take <code>channel_id</code></td></tr>
@@ -126,7 +130,7 @@ cargo run -p amqp-consume -- 127.0.0.1 5672 demo.queue</code></pre>
       <h2 id="limitations">Limitations</h2>
 <ul>
 <li>No broker / server module</li>
-<li>No <code>basic.get</code>, transactions (<code>tx.*</code>), or AMQP 1.0</li>
+<li>No <code>basic.get</code> or transactions (<code>tx.*</code>)</li>
 <li>No Composition/XML registration in v1</li>
 </ul>
 

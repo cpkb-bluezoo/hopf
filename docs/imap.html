@@ -32,17 +32,21 @@
 <li><a href="http/server.html">HTTP server</a></li>
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
 <li><a href="ldap.html">LDAP</a></li>
 <li><a href="webdav.html">WebDAV</a></li>
 <li><a href="websocket.html">WebSocket</a></li>
 <li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
 <li><a href="ftp.html">FTP</a></li>
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html" aria-current="page">IMAP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
-<li><a href="amqp.html">AMQP</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -139,6 +143,18 @@
 <td><a href="https://www.rfc-editor.org/rfc/rfc9208">RFC 9208</a> — <code>GETQUOTA</code> / <code>GETQUOTAROOT</code> / <code>SETQUOTA</code> via pluggable <code>QuotaManager</code> (default unlimited). The stock <code>MemoryQuotaManager</code> is an adapter over a shared <a href="quota.html"><code>hopf_core::QuotaManager</code></a> — the same backend an <code>hopf-ftp</code> service can enforce against, so a user's mailbox and FTP storage can share one real quota instead of two independent trackers.</td>
 </tr>
 <tr>
+<td><code>COMPRESS=DEFLATE</code> / <code>UTF8=ACCEPT</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc4978">RFC 4978</a> — raw DEFLATE (<a href="https://www.rfc-editor.org/rfc/rfc1951">RFC 1951</a>, no zlib/gzip wrapper) compression activated by <code>COMPRESS DEFLATE</code> and kept active for the rest of the connection (both directions); advertised only once authenticated and only while not already compressed. <a href="https://www.rfc-editor.org/rfc/rfc6855">RFC 6855</a> <code>UTF8=ACCEPT</code> is tracked via <code>ENABLE</code> — no wire-format change is needed, since IMAP4rev2 responses are already raw UTF-8 rather than modified UTF-7.</td>
+</tr>
+<tr>
+<td><code>SORT</code> / <code>THREAD</code> / <code>STATUS=SIZE</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc5256">RFC 5256</a> <code>SORT</code> (<code>ARRIVAL</code>/<code>CC</code>/<code>DATE</code>/<code>FROM</code>/<code>SIZE</code>/<code>SUBJECT</code>/<code>TO</code> keys, per-key <code>REVERSE</code>) and <code>THREAD</code> (<code>THREAD=ORDEREDSUBJECT</code> and <code>THREAD=REFERENCES</code>, both advertised); <a href="https://www.rfc-editor.org/rfc/rfc8438">RFC 8438</a> <code>STATUS=SIZE</code>. <code>SORT</code>/<code>THREAD</code>'s <code>charset</code> argument accepts only <code>UTF-8</code>/<code>US-ASCII</code> (anything else is rejected <code>NO [BADCHARSET (UTF-8 US-ASCII)]</code>), since header/body matching is UTF-8 throughout regardless of what the client declares.</td>
+</tr>
+<tr>
+<td><code>OBJECTID</code> / <code>METADATA</code> / <code>NOTIFY</code></td>
+<td><a href="https://www.rfc-editor.org/rfc/rfc8474">RFC 8474</a> <code>OBJECTID</code> — <code>MAILBOXID</code> generated once per mailbox and persisted (survives <code>RENAME</code>); <code>EMAILID</code> derived deterministically from <code>MAILBOXID</code> + UID. <a href="https://www.rfc-editor.org/rfc/rfc5464">RFC 5464</a> <code>METADATA</code> — <code>GETMETADATA</code>/<code>SETMETADATA</code> with <code>DEPTH</code>/<code>MAXSIZE</code>, backed by a directory tree per mailbox (and a separate one for server-level annotations). <a href="https://www.rfc-editor.org/rfc/rfc5465">RFC 5465</a> <code>NOTIFY</code> — a documented subset: <code>SET</code>/<code>NONE</code> for the <em>currently selected</em> mailbox's <code>MessageNew</code>/<code>MessageExpunge</code>/<code>FlagChange</code> events only, reusing <code>IDLE</code>'s poll-and-diff machinery so an event is never reported twice regardless of which mechanism observes it first (see Limitations).</td>
+</tr>
+<tr>
 <td>Auth</td>
 <td><code>CredentialStore</code> — LOGIN and AUTHENTICATE (all 7 <a href="auth.html">hopf-auth</a> SASL mechanisms: PLAIN, LOGIN, CRAM-MD5, DIGEST-MD5, SCRAM-SHA-256, OAUTHBEARER, EXTERNAL — SASL-IR, capability advertisement via <code>store.supported_mechanisms()</code> filtered by TLS requirement); <code>LOGINDISABLED</code> before STARTTLS</td>
 </tr>
@@ -175,7 +191,7 @@ let store = Arc::new(PasswordStore::new().with_user(&quot;alice&quot;, &quot;sec
 let config = ImapConfig::new(&quot;127.0.0.1:1143&quot;.parse()?, &quot;localhost&quot;, store, factory);
 let svc = ImapService::new(config, Arc::clone(&amp;rt));
 svc.start()?;</code></pre>
-<p><code>ImapConfig</code> knobs: <code>with_tls(acceptor)</code> (+ <code>implicit_tls()</code> for IMAPS), <code>with_greeting</code>, <code>with_quota_manager</code>, <code>with_server_id</code>, and per-extension <code>enable_*</code> flags (<code>idle</code>, <code>namespace</code>, <code>quota</code>, <code>move</code>, <code>condstore</code>, <code>qresync</code>, <code>enable</code>).</p>
+<p><code>ImapConfig</code> knobs: <code>with_tls(acceptor)</code> (+ <code>implicit_tls()</code> for IMAPS), <code>with_greeting</code>, <code>with_quota_manager</code>, <code>with_server_id</code>, and per-extension <code>enable_*</code> flags (<code>idle</code>, <code>namespace</code>, <code>quota</code>, <code>move</code>, <code>condstore</code>, <code>qresync</code>, <code>enable</code>, <code>compress</code>, <code>utf8_accept</code>, <code>sort</code>, <code>thread_ordered_subject</code>, <code>thread_references</code>, <code>status_size</code>, <code>objectid</code>, <code>metadata</code>, <code>notify</code>) — all default to enabled.</p>
 <p>Example binary: <code>cargo run -p imap -- 127.0.0.1:1143 localhost ./mail</code>.</p>
 <h2 id="client">Client</h2>
 <p>The high-level <code>ImapFetch</code> auto-pilot drives greeting → CAPABILITY → (STARTTLS → CAPABILITY) → LOGIN / AUTHENTICATE PLAIN → SELECT → FETCH → LOGOUT. <code>ImapIdle</code> drives the same preamble then IDLE, delivering unsolicited EXISTS/EXPUNGE/FLAGS through a <code>MailboxEventListener</code> until <code>DONE</code>.</p>
@@ -325,6 +341,9 @@ ImapClient::new(&quot;mail.example.com&quot;, 143)
 <li>mbox backend: no hierarchy / COPY / MOVE (see <a href="mailbox.html">Mailbox</a>); IDLE <code>refresh</code> is a no-op for mbox (Maildir rescans <code>new/</code>/<code>cur/</code> each poll).</li>
 <li>BODYSTRUCTURE body size/line counts reflect <code>rmimeparser</code>'s decoded body bytes; for <code>base64</code>/<code>quoted-printable</code>-encoded parts this differs from the RFC-mandated wire-encoded octet count (<code>7bit</code>/<code>8bit</code>/<code>binary</code> parts, including <code>message/rfc822</code>, are unaffected since decoded and wire bytes are identical there).</li>
 <li>BODYSTRUCTURE extension data always reports Content-Language/Content-Location as <code>NIL</code> (not parsed by <code>rmimeparser</code>'s handler trait) and Content-Disposition parameters other than <code>filename</code> are omitted (<code>rmimeparser</code> only supports named parameter lookup, not enumeration).</li>
+<li><code>NOTIFY</code> (RFC 5465) is a deliberately partial implementation: the <code>personal</code>/<code>inboxes</code>/<code>subtree</code>/<code>mailboxes</code> mailbox-selectors (real support needs polling every mailbox in the store, not just the selected one), the <code>AnnotationChange</code>/<code>MailboxName</code>/<code>SubscriptionChange</code>/<code>MailboxMetadataChange</code>/<code>ServerMetadataChange</code> event groups, <code>MessageNew</code>'s optional status-item sublist, and <code>SET STATUS</code>'s immediate catch-up response are all rejected with a tagged <code>BAD</code> rather than silently ignored.</li>
+<li>THREAD REFERENCES doesn't fabricate a new dummy parent to join two root-level messages that share a base subject when neither is itself a reply/forward (RFC 5256 §2.2 step 5C) — there is no <code>thread-list</code> wire form for a parent-less placeholder there, so the two threads are left separate instead of merged.</li>
+<li>OBJECTID (<code>MAILBOXID</code>/<code>EMAILID</code>) and per-mailbox/server METADATA storage are implemented against the Maildir backend only; the mbox backend returns no id/entries for either (the underlying <code>Mailbox</code>/<code>MailboxStore</code> trait methods default to <code>None</code>/empty).</li>
 </ul>
 
       <p class="footer">

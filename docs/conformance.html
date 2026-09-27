@@ -32,17 +32,21 @@
 <li><a href="http/server.html">HTTP server</a></li>
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
 <li><a href="ldap.html">LDAP</a></li>
 <li><a href="webdav.html">WebDAV</a></li>
 <li><a href="websocket.html">WebSocket</a></li>
 <li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
 <li><a href="ftp.html">FTP</a></li>
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
-<li><a href="amqp.html">AMQP</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -136,7 +140,7 @@
 <tr><td>Other transport families</td><td>Separate stacks on same primitives</td><td>SSH/SFTP/SCP (SSH KEX, not TLS), DNSCrypt, CoAP/OSCORE — not DTLS-interoperable</td></tr>
 </tbody>
 </table>
-<p>Details: <a href="architecture.html#security-substrate">Architecture → Security substrate</a>, <a href="tls.html#roadmap">TLS roadmap</a>, <a href="quic-h3.html#implementation-status">QUIC implementation status</a>.</p>
+<p>Details: <a href="architecture.html#security-substrate">Architecture → Security substrate</a>, <a href="tls.html#hopf-tls-interop">hopf-tls interop harness</a>, <a href="quic-h3.html#implementation-status">QUIC implementation status</a>.</p>
 
 <h2 id="tls">TLS — RFC 8446 / RFC 5246 (in-tree, <code>hopf-core::tls</code>)</h2>
 <p>TLS 1.3 and TLS 1.2 are implemented in-tree in <code>hopf-core::tls</code> (<code>HandshakeEngine</code>/<code>TlsRecordEngine</code> for 1.3, <code>tls12::{Tls12Engine, Tls12RecordEngine}</code> for 1.2).</p>
@@ -333,7 +337,7 @@
 <tr><td>Response HEADERS with <code>:status</code>, DATA, trailers, FIN</td><td>§4.1,§4.3.2</td><td>Compliant</td><td><code>h3/endpoint.rs:119-142</code></td></tr>
 <tr><td>Request trailers (second HEADERS received)</td><td>§4.1</td><td>Compliant</td><td><code>H3RequestStream::headers_frame()</code> delivers a second HEADERS frame to the new <code>ServerHandler::request_trailers</code> callback (default no-op) instead of discarding it</td></tr>
 <tr><td>Extended CONNECT / WebSocket-over-H3</td><td>RFC 9220</td><td>Compliant</td><td>Server upgrade via <code>h3/response.rs</code>; client Extended CONNECT gated on peer <code>SETTINGS_ENABLE_CONNECT_PROTOCOL</code> (<code>H3ClientStream::start_request</code>) — deferred until SETTINGS if unknown, fail-fast with <code>request_failed</code> when the peer did not advertise support</td></tr>
-<tr><td>Extensible Prioritization</td><td>RFC 9218</td><td>Compliant</td><td><code>Priority</code> header on requests; <code>PRIORITY_UPDATE</code> (0xF0700) on the control stream updates <code>H3PeerState::stream_priority</code>; urgency mapped to quinn <code>SendStream::set_priority</code>; non-incremental same-urgency responses gated one-at-a-time via <code>non_inc_active</code></td></tr>
+<tr><td>Extensible Prioritization</td><td>RFC 9218</td><td>Compliant</td><td><code>Priority</code> header on requests; <code>PRIORITY_UPDATE</code> (0xF0700) on the control stream updates <code>H3PeerState::stream_priority</code>; urgency mapped to <code>hopf-quic</code>'s own <code>SendStream::set_priority</code>; non-incremental same-urgency responses gated one-at-a-time via <code>non_inc_active</code></td></tr>
 <tr><td>HTTP/3 Datagrams (QUIC DATAGRAM)</td><td>RFC 9297 §2.1</td><td>Compliant</td><td><code>SETTINGS_H3_DATAGRAM=1</code> always advertised; peer setting stored in <code>H3PeerState</code>. Inbound QUIC DATAGRAMs demuxed by quarter-stream-ID (<code>h3/datagram.rs</code>) via <code>QuicConnection::decode_datagram</code>; delivered to the request stream's <code>ProtocolHandler::datagram_received</code>. Streams without datagram semantics abort with <code>H3_DATAGRAM_ERROR</code> (0x33). Outbound via <code>send_http3_datagram</code> / <code>Endpoint::send_datagram</code></td></tr>
 <tr><td>Capsule Protocol + DATAGRAM capsule</td><td>RFC 9297 §3</td><td>Compliant</td><td><code>capsule.rs</code>: streaming Type/Length/Value parser; <code>DATAGRAM</code> capsule type 0x00; unknown types forwarded to <code>ProtocolUpgradeHandler::capsule_received</code>. <code>Capsule-Protocol: ?1</code> on the request enables capsule mode on the H3 data stream after upgrade</td></tr>
 <tr><td>HTTP/3 + QPACK application error-code namespace</td><td>§8.1 / RFC 9204 §6</td><td>Compliant</td><td>Full RFC registry exposed as <code>u32</code> constants in <code>h3/frame.rs</code> (re-exported from <code>hopf_http::h3</code> / <code>hopf_http</code>): all 17 <code>H3_*</code> codes (<code>H3_NO_ERROR</code>…<code>H3_VERSION_FALLBACK</code>) plus <code>QPACK_DECOMPRESSION_FAILED</code> / <code>QPACK_ENCODER_STREAM_ERROR</code> / <code>QPACK_DECODER_STREAM_ERROR</code>, and RFC 9297 <code>H3_DATAGRAM_ERROR</code> (0x33). Numeric values locked by <code>h3_and_qpack_error_codes_match_rfc_registry</code></td></tr>
@@ -450,6 +454,46 @@
 </tbody>
 </table>
 
+<h2 id="masque">MASQUE — RFC 9298 / RFC 9484 (<code>hopf-masque</code>)</h2>
+<p><code>hopf-masque</code> layers RFC 9298 CONNECT-UDP and RFC 9484 CONNECT-IP on <code>hopf-http</code>'s <code>ProtocolUpgradeHandler</code> and Capsule Protocol machinery. CONNECT-UDP is a complete server relay (DNS resolution, outbound UDP socket, bidirectional pump) plus a client; CONNECT-IP is protocol plumbing only — target/ipproto parsing, acceptance, and the RFC 9484 capsule types are implemented, but this crate does no IP packet forwarding, address allocation, or target resolution of its own by design (the application supplies a <code>ConnectIpHandler</code>). Both protocols interoperate end to end against this crate's own client and server (loopback), not against an external MASQUE implementation. See <a href="masque.html">masque.html</a>.</p>
+<h3>CONNECT-UDP — RFC 9298</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Target URI template parsing</td><td>§2</td><td>Compliant</td><td><code>parse_connect_udp_target</code> strictly rejects a truncated/non-hex percent-escape, invalid UTF-8, a non-numeric or out-of-<code>u16</code>-range port, or a missing segment — no best-effort decode, since the result feeds a DNS lookup</td></tr>
+<tr><td>Extended CONNECT (H2/H3) and HTTP/1.1 Upgrade acceptance</td><td>§3</td><td>Compliant</td><td><code>crate::accept</code> is shared verbatim between CONNECT-UDP and CONNECT-IP; matches the <code>:protocol</code>/<code>Upgrade</code> token case-insensitively and requires the paired <code>Connection: Upgrade</code> token on H1</td></tr>
+<tr><td>Context ID framing for the registered UDP payload</td><td>§5</td><td>Compliant</td><td><code>hopf_http::context_id</code> (shared with CONNECT-IP); a nonzero, unrecognized Context ID is silently ignored per the RFC rather than treated as an error</td></tr>
+<tr><td>Server relay: resolve, authorize, open outbound socket, pump bidirectionally</td><td>§3, §7</td><td>Compliant</td><td><code>ConnectUdpFactory</code>/<code>ConnectUdpRelay</code>; resolves via the supplied <code>DnsResolver</code> and relays to only the first returned address — no Happy-Eyeballs-style racing and no re-resolution mid-tunnel</td></tr>
+<tr><td>Relay idle timeout</td><td>—</td><td>Compliant</td><td>Self-rearming timer, <code>DEFAULT_IDLE_TIMEOUT</code> = 5 minutes, overridable via <code>ConnectUdpFactory::with_idle_timeout</code></td></tr>
+<tr><td>Target authorization policy</td><td>—</td><td>Compliant</td><td><code>ConnectUdpPolicy::is_target_allowed</code> is checked against the <em>resolved</em> address, not the original hostname; no permissive default exists anywhere in the crate</td></tr>
+<tr><td>Client dial + tunnel</td><td>§3</td><td>Compliant (feature <code>h3</code>)</td><td><code>connect_udp</code> negotiates transport via <code>hopf_http::connect_auto</code> (h3 first when a <code>QuicClientConfig</code> is supplied, else the given <code>HttpFallback</code>); requires the <code>h3</code> feature even for h1/h2-only use, since the shared dial path pulls in <code>hopf-quic</code> regardless</td></tr>
+<tr><td>Non-capsule HTTP Datagram fallback (native QUIC DATAGRAM frames)</td><td>RFC 9297 §6</td><td>Not implemented</td><td>Every payload — on H1, H2, and H3 alike — goes through Capsule Protocol DATAGRAM-capsule framing unconditionally; a peer lacking <code>Capsule-Protocol: ?1</code> is rejected with a plain 400 before its target is even parsed</td></tr>
+</tbody>
+</table>
+<h3>CONNECT-IP — RFC 9484</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Target/ipproto URI template parsing, including wildcards</td><td>§3</td><td>Compliant</td><td><code>parse_connect_ip_target</code> — <code>IpTarget::Wildcard</code>/<code>Named(String)</code>, <code>IpProto::Wildcard</code>/<code>Number(u8)</code>, either literal <code>*</code></td></tr>
+<tr><td>Extended CONNECT / HTTP/1.1 Upgrade acceptance</td><td>§3</td><td>Compliant</td><td>Shares <code>crate::accept</code> with CONNECT-UDP</td></tr>
+<tr><td>IP packet relaying / forwarding</td><td>§5</td><td>Not implemented (by design)</td><td>This crate does no packet forwarding, address allocation, or target resolution of its own — no TUN device, no userspace router, no kernel network stack dependency anywhere in the workspace. The application supplies a <code>ConnectIpHandler</code>/<code>ConnectIpHandlerFactory</code></td></tr>
+<tr><td><code>ADDRESS_ASSIGN</code> / <code>ADDRESS_REQUEST</code> capsules</td><td>§4.2</td><td>Compliant</td><td><code>ip_capsule::{encode,decode}_address_entries</code>; round-trips single and multi-entry capsules, IPv4 and IPv6, and rejects a prefix length past the address width or a truncated trailing entry</td></tr>
+<tr><td><code>ROUTE_ADVERTISEMENT</code> capsule</td><td>§4.3</td><td>Compliant</td><td><code>ip_capsule::{encode,decode}_route_entries</code>; <code>RouteEntry::new</code> rejects a mismatched address family or <code>start &gt; end</code>. Server-to-client only, matching the RFC</td></tr>
+<tr><td>Client dial + tunnel, incl. address requests / route advertisements</td><td>§3-4</td><td>Compliant (feature <code>h3</code>)</td><td><code>connect_ip</code>; <code>RequestedAddress.request_id</code> must be nonzero and not reused within a tunnel per §4.2, but this is a documented caller obligation, not enforced by the crate</td></tr>
+<tr><td>Target/ipproto authorization policy</td><td>—</td><td>Compliant</td><td><code>ConnectIpPolicy::is_target_allowed</code>; a separate trait from <code>ConnectUdpPolicy</code> since a scope here is never resolved and either half may be wildcarded. No permissive default</td></tr>
+</tbody>
+</table>
+<h3>Capsule Protocol / HTTP Datagrams — RFC 9297</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>Capsule-Protocol</code> header required on every accept and every request</td><td>§3.1</td><td>Compliant</td><td><code>hopf_http::capsule::capsule_protocol_enabled</code>; a missing header is a 400 on the server side and an <code>error()</code> callback on the client side, before the target is parsed or the tunnel opens</td></tr>
+<tr><td><code>DATAGRAM</code> capsule + Context ID multiplexing</td><td>§3.2, RFC 9298 §5</td><td>Compliant</td><td>Shared <code>hopf_http::capsule::Capsule::datagram</code> + <code>hopf_http::context_id</code> codec, identical across H1/H2/H3 and across both CONNECT-UDP and CONNECT-IP</td></tr>
+<tr><td>Non-<code>DATAGRAM</code> capsules dispatched to the upgrade handler</td><td>§3.2</td><td>Compliant</td><td><code>ProtocolUpgradeHandler::capsule_received</code>; an unrecognized capsule type is ignored by default</td></tr>
+<tr><td>Native QUIC DATAGRAM frame fast path bypassing Capsule Protocol on H3</td><td>§6</td><td>Not implemented</td><td>Every payload takes the capsule-framed path even over H3 — see the matching CONNECT-UDP row above</td></tr>
+</tbody>
+</table>
+
 <h2 id="webdav">WebDAV — RFC 4918 (Class 1+2)</h2>
 <h3>HTTP Methods</h3>
 <table>
@@ -481,10 +525,10 @@
 <thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
 <tbody>
 <tr><td>DAV/Depth/Destination/If/Lock-Token/Overwrite/Timeout headers</td><td>§10</td><td>Compliant</td><td>Full grammar including weak-ETag comparison (<code>if_header.rs</code>); COPY honours Depth 0/infinity</td></tr>
-<tr><td>Exclusive/shared write lock, conflict detection, Depth-infinity coverage, expiry cleanup</td><td>§6</td><td>Compliant</td><td><code>lock.rs</code>, in-process only (matches docs)</td></tr>
+<tr><td>Exclusive/shared write lock, conflict detection, Depth-infinity coverage, expiry cleanup</td><td>§6</td><td>Compliant</td><td><code>lock.rs</code> — in-process by default; <code>WebDavConfig::lock_root</code> (issue #415) switches to file-backed records under <code>lock_store.rs</code>'s <code>FileLockStore</code>, keyed by each resource's path relative to the content root and shared by every handler pointed at the same <code>lock_root</code>, for a filesystem with atomic create-new and immediately-visible writes (not NFS)</td></tr>
 <tr><td>creationdate / getcontentlanguage / source live properties</td><td>§15.1,§15.4,§15.10</td><td>Compliant</td><td><code>creationdate</code> from birth time (mtime fallback) as ISO-8601; <code>getcontentlanguage</code> from optional <code>WebDavConfig::content_language</code>; empty <code>source</code></td></tr>
 <tr><td>displayname/getcontentlength/getcontenttype/getetag/getlastmodified/lockdiscovery/resourcetype/supportedlock</td><td>§15.2-15.11</td><td>Compliant</td><td><code>handler.rs:1018-1073</code></td></tr>
-<tr><td>Dead properties (xattr/sidecar/none)</td><td>§4</td><td>Compliant</td><td><code>dead_props.rs:71-333</code></td></tr>
+<tr><td>Dead properties (xattr/sidecar/none)</td><td>§4</td><td>Compliant</td><td><code>dead_props.rs:71-333</code>; sidecar files sit next to their resource by default, or under <code>WebDavConfig::sidecar_root</code> (issue #415) mirroring the content tree one-to-one instead, so nothing is written into the content tree and no <code>.webdav_*</code> name in it is mistaken for a sidecar — MOVE carries the sidecar key across, DELETE prunes emptied mirrored directories</td></tr>
 <tr><td>Class 3 ordered collections, Auth/ACL</td><td>—</td><td>Deferred / N/A</td><td>Explicit scope: Class 1+2 only, compose with HTTP auth</td></tr>
 </tbody>
 </table>
@@ -637,6 +681,100 @@
 </tbody>
 </table>
 
+<h2 id="mdns">mDNS / DNS-SD — RFC 6762 / RFC 6763 (<code>hopf-mdns</code>)</h2>
+<p><code>hopf-mdns</code> is a standalone crate providing both an RFC 6762 multicast DNS responder/querier and RFC 6763 DNS-SD service advertisement/browsing, reusing <code>hopf-dns</code>'s wire types directly (no parallel codec) via thin QU-bit/cache-flush-bit helpers in its own <code>bits</code> module. See <a href="mdns.html">mdns.html</a>.</p>
+<h3>Responder: Probing and Announcing (RFC 6762 §8)</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Probing before claiming a name, proposed record in Authority section</td><td>§8.1</td><td>Compliant</td><td><code>responder.rs</code>'s <code>begin_probing</code>/<code>send_next_probe</code>; random initial delay, <code>probe_count</code> probes (default 3) spaced <code>probe_interval</code> apart</td></tr>
+<tr><td>Conflict during probing: rename and restart</td><td>§8.1</td><td>Compliant</td><td>An incoming response asserting the candidate name restarts probing under a renamed candidate (<code>label-2.local</code>, ...)</td></tr>
+<tr><td>Simultaneous-probe tie-break</td><td>§8.2</td><td>Compliant (simplified)</td><td>Compares one representative record (the host's first A record) unsigned byte-wise rather than the full lexicographic RRset ordering the RFC technically specifies; loser waits <code>probe_conflict_wait</code> and retries the same name</td></tr>
+<tr><td>Announcing: unsolicited multicast responses, cache-flush bit set</td><td>§8.3</td><td>Compliant</td><td><code>announce_count</code> (default 2) announcements, <code>announce_interval</code> apart, carrying every published record</td></tr>
+<tr><td>Known-answer suppression</td><td>§7.1</td><td>Compliant</td><td>A record already listed in the query's own Answer section with more than half its TTL remaining is not repeated</td></tr>
+<tr><td>Unicast response (QU bit)</td><td>§5.4</td><td>Compliant</td><td><code>bits::unicast_response_requested</code>; a query with any QU-flagged question gets a unicast, not multicast, reply</td></tr>
+<tr><td>Goodbye (TTL-0 departure announcement)</td><td>§10.1</td><td>Compliant</td><td>Sent on <code>MdnsService::goodbye()</code>, on <code>Drop</code> (best-effort, if still announced), and per-service on <code>ServiceHandle::drop</code></td></tr>
+</tbody>
+</table>
+<h3>Querier and Cache (RFC 6762 §5, §10)</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Active TTL-fraction cache refresh (80/85/90/95%)</td><td>§5.2</td><td>Compliant</td><td><code>cache::REFRESH_FRACTIONS</code>; generation-guarded against stale timers after a re-upsert</td></tr>
+<tr><td>Cache-flush bit honoured on ingest</td><td>§10.2</td><td>Compliant</td><td>Records for a name/type not reasserted in a cache-flush-bearing answer group are scheduled for removal after a 1 s grace period (tolerates the flush answer arriving split across packets), not deleted immediately</td></tr>
+<tr><td>Goodbye (TTL-0) removes cached record</td><td>§10.1</td><td>Compliant</td><td>Same grace-period removal path as cache-flush</td></tr>
+<tr><td>One-shot query resolves from cache after a fixed timeout</td><td>—</td><td>Compliant (simplified)</td><td><code>MdnsService::query</code> waits <code>query_timeout</code> (default 750 ms) rather than resolving on the first matching answer, by design</td></tr>
+<tr><td>IPv6 (<code>ff02::fb</code>)</td><td>§3</td><td>N/A</td><td>Out of scope; IPv4 only</td></tr>
+</tbody>
+</table>
+<h3>DNS-SD (RFC 6763)</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Service instance enumeration: PTR + SRV + TXT</td><td>§4</td><td>Compliant</td><td><code>dnssd::build_records</code>; PTR shared (not cache-flush, §10.1), SRV and TXT unique (cache-flush)</td></tr>
+<tr><td><code>_services._dns-sd._udp</code> meta-query PTR</td><td>§9</td><td>Compliant</td><td>Published alongside every registered service type</td></tr>
+<tr><td>TXT record attribute encoding</td><td>§6.1</td><td>Compliant</td><td><code>key=value</code> character-strings, capped at 255 bytes per entry (over-length attributes dropped, not truncated); a service with no attributes still emits the required zero-length string</td></tr>
+<tr><td>Browse (discovery side)</td><td>§4</td><td>Compliant</td><td><code>MdnsService::browse</code>; fixed 10 s re-poll layered on the cache's own TTL-fraction refresh, resolves SRV/TXT from cache, emits <code>Found</code>/<code>Lost</code> events</td></tr>
+<tr><td>Instance-name escaping</td><td>§4.3</td><td>Not implemented</td><td>Special characters (<code>.</code>, <code>\</code>) in an instance name are not escaped</td></tr>
+<tr><td>SRV priority/weight</td><td>§4.1.2</td><td>N/A</td><td>Always published as 0/0; not configurable per registration</td></tr>
+<tr><td>Central service registry (pull-based advertisement)</td><td>—</td><td>N/A — architectural choice</td><td>Every service must be registered explicitly via <code>register_service</code>; there is no workspace-wide listener registry to draw from, since every Hopf protocol is an independent crate</td></tr>
+</tbody>
+</table>
+
+<h2 id="ldap">LDAP — RFC 4511 (client only, <code>hopf-ldap</code>)</h2>
+<p><code>hopf-ldap</code> is an async LDAPv3 client and <code>LdapCredentialStore</code>; no directory/server side. See <a href="ldap.html">ldap.html</a>.</p>
+<table>
+<thead><tr><th>Capability</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>BER codec (definite length)</td><td>ITU-T X.690 (LDAP subset)</td><td>Compliant</td><td><code>hopf_ldap::asn1</code>; indefinite length rejected — LDAP-oriented BER, not full DER/CER</td></tr>
+<tr><td>Bind (simple, anonymous), Search, Unbind</td><td>RFC 4511 §4.2-4.5</td><td>Compliant</td><td><code>LdapSession::bind</code>/<code>bind_anonymous</code>/<code>search</code>/<code>unbind</code>; RFC 4515 filter strings compiled to BER</td></tr>
+<tr><td>LDAPS (implicit TLS)</td><td>RFC 4513 §3</td><td>Compliant</td><td><code>LdapClientConfig::with_tls</code>; session withheld until <code>security_established</code></td></tr>
+<tr><td>StartTLS</td><td>RFC 4511 §4.14</td><td>Compliant</td><td><code>LdapSession::start_tls</code> after an ExtendedResponse for OID 1.3.6.1.4.1.1466.20037; mutually exclusive with LDAPS on one dial</td></tr>
+<tr><td>Referral chase</td><td>RFC 4511 §4.1.10, RFC 4516</td><td>Compliant (opt-in)</td><td><code>with_chase_referrals(true)</code>, hop cap <code>max_referral_hops</code> (default 5); empty-DN referral URLs keep the referring base DN; same bind credentials reused across hops rather than rewritten per URL</td></tr>
+<tr><td>Content synchronization, client side</td><td>RFC 4533</td><td>Compliant</td><td><code>LdapSession::sync</code> + <code>SyncReplica</code>: RefreshOnly and RefreshAndPersist modes, cookie resume from any source, present/delete phase convergence keyed by <code>entryUUID</code>, <code>e-syncRefreshRequired</code> handling, Abandon-based cancellation (§3.7). Server side of RFC 4533 not implemented</td></tr>
+<tr><td>LDAP controls, IntermediateResponse, Abandon</td><td>RFC 4511 §4.1.11-4.1.12</td><td>Compliant</td><td>Message layer carries controls both ways (<code>Control</code>, <code>encode_search_request_with_controls</code>), built to layer further controls beyond Sync</td></tr>
+<tr><td><code>LdapCredentialStore</code> (search-then-bind)</td><td>—</td><td>Compliant</td><td>PLAIN/LOGIN mechanisms only — digest/SCRAM/CRAM/plaintext/bearer unsupported; <code>password_match</code> blocks on a Condvar and must run off the reactor thread</td></tr>
+<tr><td>Directory admin API (modify/add/delete/compare)</td><td>RFC 4511 §4.6-4.10</td><td>Not implemented</td><td>Deferred — non-goal for a CredentialStore-focused client</td></tr>
+<tr><td>SASL bind to the directory</td><td>RFC 4513 §5</td><td>Not implemented</td><td>Store uses simple bind only</td></tr>
+<tr><td>Role / <code>memberOf</code> lookup API</td><td>—</td><td>Not implemented</td><td>No consumer yet; quota uses a separate lookup callback if needed</td></tr>
+</tbody>
+</table>
+
+<h2 id="socks">SOCKS — RFC 1928 (SOCKS5), historical SOCKS4/4a (in-tree, <code>hopf-socks</code>)</h2>
+<h3>Server — Versions, Commands, Addressing</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>SOCKS4 CONNECT/BIND</td><td>Historical protocol description</td><td>Compliant</td><td><code>wire.rs</code> parse/encode; no IPv6 concept, USERID field carried but not validated</td></tr>
+<tr><td>SOCKS4a hostname extension (magic IP <code>0.0.0.x</code>, x≠0)</td><td>Historical protocol description</td><td>Compliant</td><td>Resolved server-side via <code>hopf-dns</code>; <code>connect.rs</code></td></tr>
+<tr><td>SOCKS5 method negotiation, CONNECT/BIND/UDP ASSOCIATE</td><td>§3–4</td><td>Compliant</td><td><code>handler.rs</code> dispatch; IPv4/IPv6/domain-name addressing (§5)</td></tr>
+<tr><td>UDP ASSOCIATE datagram relay</td><td>§7</td><td>Compliant (no fragment reassembly)</td><td>Only standalone (<code>FRAG=0x00</code>) datagrams forwarded; non-standalone fragments silently dropped — matches near-universal real-world server practice, documented as a scope decision</td></tr>
+<tr><td>Per-resolved-address destination policy check on hostname targets</td><td>—</td><td>Compliant</td><td>Every resolved address is checked, not just the first — a multi-answer DNS response can't bypass the policy by ordering</td></tr>
+</tbody>
+</table>
+<h3>Server — Authentication and Policy</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Section</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Username/password authentication</td><td>RFC 1929 §2</td><td>Compliant</td><td><code>SocksAuthenticator</code> trait (<code>auth.rs</code>); configuring one withdraws no-auth from SOCKS5's offered methods and rejects SOCKS4/4a outright (no credential field to check)</td></tr>
+<tr><td>GSSAPI authentication</td><td>RFC 1961</td><td>Not implemented</td><td>No GSSAPI method byte, sub-negotiation, or per-message protection anywhere in <code>wire.rs</code>/<code>handler.rs</code>/client handlers; planned with optional GSSAPI/Kerberos SASL in <code>hopf-auth</code></td></tr>
+<tr><td>Destination authorization (no permissive default)</td><td>—</td><td>Compliant</td><td><code>SocksPolicy</code> trait (<code>policy.rs</code>) has no default implementation anywhere in the crate; checked for CONNECT targets, BIND's connecting peer, and every UDP ASSOCIATE datagram's target</td></tr>
+<tr><td>Per-source-address listener ACL</td><td>—</td><td>Compliant</td><td><code>SocksService::with_acl</code>, enforced at the <code>hopf-core</code> listener level before any SOCKS byte is read — distinct from <code>SocksPolicy</code>'s per-target check</td></tr>
+<tr><td>SOCKS over TLS</td><td>—</td><td>Compliant</td><td><code>SocksService::with_tls</code>; transport-level only, no protocol state machine changes needed</td></tr>
+</tbody>
+</table>
+<h3>Client</h3>
+<table>
+<thead><tr><th>Requirement</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>CONNECT client (SOCKS4/4a/5)</td><td>Compliant</td><td><code>SocksConnectHandler</code>/<code>socks_connect_config</code> (<code>client.rs</code>) — a transport decorator forwarding every callback to a caller-supplied inner <code>ProtocolHandler</code> once the tunnel is up</td></tr>
+<tr><td>BIND client</td><td>Compliant</td><td><code>SocksBindHandler</code>/<code>socks_bind_config</code> (<code>client_bind.rs</code>) — beyond this crate's original CONNECT-only reference scope, added for symmetry with the server's own BIND support</td></tr>
+<tr><td>UDP ASSOCIATE client</td><td>Compliant</td><td><code>SocksUdpAssociateHandler</code>/<code>socks_udp_associate_config</code> (<code>client_udp_associate.rs</code>) — same symmetry rationale as BIND; opens its own UDP socket once the association is confirmed</td></tr>
+<tr><td>RFC 1929 username/password (client side)</td><td>Compliant</td><td><code>SocksClientConfig::with_credentials</code>; silently unused under SOCKS4/4a</td></tr>
+<tr><td>Handshake timeout with proper error delivery</td><td>Compliant</td><td>A silent proxy force-fails via <code>Endpoint::fail</code> (reaches the inner handler's <code>error()</code>) rather than a bare close, which the inner handler — having never seen <code>connected()</code> — would have no way to observe</td></tr>
+</tbody>
+</table>
+
 <h2 id="ftp">FTP — RFC 959</h2>
 <h3>Server — Data Types, Structures, Access/Transfer Commands</h3>
 <table>
@@ -786,6 +924,23 @@
 </table>
 <p>hopf-auth implements seven SASL mechanisms; hopf-pop3, hopf-imap, and hopf-smtp all wire the full set (PLAIN/LOGIN/CRAM-MD5/DIGEST-MD5/SCRAM-SHA-256/OAUTHBEARER/EXTERNAL, filtered by TLS requirement) onto their wire protocols, server and client alike. EXTERNAL's peer-certificate fingerprint is threaded through on all three servers via <code>SecurityInfo::peer_certificate_fingerprint</code>.</p>
 
+<h2 id="otel">Telemetry — OpenTelemetry OTLP/HTTP (<code>hopf-otel</code>)</h2>
+<p><code>hopf-otel</code> provides connection-level and HTTP Stream instrumentation plus OTLP/JSONL export; not a Gumdrop port. See <a href="telemetry.html">telemetry.html</a>.</p>
+<table>
+<thead><tr><th>Capability</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>OTLP/HTTP export (protobuf)</td><td>Compliant</td><td><code>/v1/logs</code>, <code>/v1/traces</code>, <code>/v1/metrics</code>; validated URLs, errors if no sink is configured</td></tr>
+<tr><td>JSONL file export</td><td>Compliant</td><td>Optional sink alongside or instead of OTLP, per signal (logs/traces/metrics)</td></tr>
+<tr><td>Off-hot-path batching</td><td>Compliant</td><td>Hot-path methods only enqueue; encoding and I/O run on a dedicated export worker, never on accept or reactor threads</td></tr>
+<tr><td>Connection-level hooks (Accept/Dial/Close/Error)</td><td>Compliant</td><td><code>TelemetryHook</code>, attached via <code>Runtime::start_with_telemetry</code> / <code>Composition::new_with_telemetry</code>; applies to every protocol</td></tr>
+<tr><td>HTTP Stream instrumentation (SERVER spans, RED metrics)</td><td>Compliant</td><td><code>InstrumentedServerFactory</code>, instruments at the Stream handler layer, not at TCP accept</td></tr>
+<tr><td>W3C Trace Context propagation</td><td>Compliant</td><td><code>traceparent</code> inject/extract; wired into SMTP, FTP, POP3, IMAP, and MQTT handler <code>traceparent</code> plus duration histograms via each service's <code>with_telemetry</code></td></tr>
+<tr><td>DNS trace propagation on the wire</td><td>N/A</td><td>No IETF standard for it (experimental EDNS TRACEPARENT out of scope); client lookups can still be timed as local child spans, and <code>DnsService::metrics()</code> stays process-local rather than an OTLP instrument set</td></tr>
+<tr><td>OTLP gRPC exporter</td><td>Not implemented</td><td>HTTP/protobuf only</td></tr>
+<tr><td>Overflow handling</td><td>Compliant (documented)</td><td>Bounded export queue drops on overflow rather than blocking hot-path callers</td></tr>
+</tbody>
+</table>
+
 <h2 id="pop3">POP3 — RFC 1939</h2>
 <h3>Server</h3>
 <table>
@@ -844,6 +999,8 @@
 <tr><td>FETCH / UID FETCH — <code>ENVELOPE</code> and <code>BODYSTRUCTURE</code></td><td>§6.4.5</td><td>Compliant (with documented scope limits)</td><td><code>server/envelope.rs</code> / <code>server/bodystructure.rs</code>: ENVELOPE parsed from RFC 5322 headers, BODYSTRUCTURE built by streaming the whole message through <code>rmimeparser</code>'s push MIME parser (recursive <code>multipart/*</code> nesting, <code>message/rfc822</code> nested envelope+structure via a bounded 8 MiB capture). Two known gaps, both documented in the IMAP page's Limitations: body <code>size</code>/<code>lines</code> reflect <code>rmimeparser</code>'s <em>decoded</em> bytes for <code>base64</code>/<code>quoted-printable</code> parts rather than the RFC-mandated wire-encoded octet count (identity encodings are unaffected); Content-Language/Content-Location are always <code>NIL</code> and Content-Disposition parameters other than <code>filename</code> are omitted, since <code>rmimeparser</code>'s public API doesn't expose either.</td></tr>
 <tr><td>FETCH partial content <code>BODY[section]&lt;start.count&gt;</code></td><td>§6.4.5</td><td>Compliant</td><td><code>fetch_format.rs::parse_fetch_items</code> now consumes a trailing <code>&lt;start.count&gt;</code> after the section's closing <code>]</code> instead of leaving it for the next token; <code>push_fetch_attrs</code> streams only the requested byte window (clamped to an empty string, never an error, when <code>start</code> is beyond the end) without ever buffering the full section first</td></tr>
 <tr><td>STORE / UID STORE, COPY / UID COPY (+ COPYUID), MOVE / UID MOVE (RFC 6851)</td><td>§6.4.6-7, RFC 6851</td><td>Compliant</td><td>MOVE is an atomic copy+expunge, correctly emits VANISHED under QRESYNC or per-message EXPUNGE otherwise</td></tr>
+<tr><td>SORT / UID SORT</td><td>RFC 5256 §3</td><td>Compliant</td><td><code>server/sort.rs</code>: <code>ARRIVAL</code>/<code>CC</code>/<code>DATE</code>/<code>FROM</code>/<code>SIZE</code>/<code>SUBJECT</code>/<code>TO</code> keys, per-key <code>REVERSE</code>, sequence-number tie-break; <code>charset</code> restricted to <code>UTF-8</code>/<code>US-ASCII</code> (<code>NO [BADCHARSET (UTF-8 US-ASCII)]</code> otherwise)</td></tr>
+<tr><td>THREAD / UID THREAD</td><td>RFC 5256 §2,§4</td><td>Compliant</td><td><code>server/thread.rs</code>: both <code>ORDEREDSUBJECT</code> and <code>REFERENCES</code> algorithms, including the base-subject algorithm (§2.1) shared with the <code>SORT SUBJECT</code> key. REFERENCES §2.2 step 5C (fabricating a new dummy parent to merge two same-subject, non-reply root messages) is skipped — no <code>thread-list</code> wire form exists to write a parent-less placeholder there — so those two threads stay separate instead of merged; every other step (dummy creation/pruning, cycle guard, sibling sort) is implemented</td></tr>
 </tbody>
 </table>
 <h3>Server — Responses and Extension Capabilities</h3>
@@ -856,6 +1013,12 @@
 <tr><td>ENABLE, UNSELECT, ID, LIST-EXTENDED/LIST-STATUS</td><td>5161,3691,2971,5258/5819</td><td>Compliant</td><td></td></tr>
 <tr><td>CONDSTORE / QRESYNC</td><td>RFC 7162</td><td>Compliant (with a documented scope limit)</td><td>HIGHESTMODSEQ/MODSEQ/CHANGEDSINCE are now backed by real per-message mod-sequence tracking in both shipped backends — Maildir++'s <code>.uidlist</code> and mbox's <code>.flags</code> sidecar each gained a persisted, monotonic counter (<code>maildir/uidlist.rs</code>, <code>mbox/flags.rs</code>); <code>Mailbox::modseq()</code>/<code>highest_modseq()</code>/<code>changed_since()</code> return genuine values that survive a mailbox reopen. <code>expunged_since()</code> (VANISHED (EARLIER) history) is unchanged — still returns empty rather than fabricating history, a deliberate scope boundary, not an oversight.</td></tr>
 <tr><td>LITERAL- (non-sync literals, 4096-byte cap)</td><td>RFC 7888</td><td>Compliant</td><td></td></tr>
+<tr><td>COMPRESS=DEFLATE</td><td>RFC 4978</td><td>Compliant</td><td><code>compress.rs</code>: raw DEFLATE (RFC 1951, no zlib/gzip wrapper), one compressor/decompressor pair for the whole connection, each outbound write flushed with <code>Z_SYNC_FLUSH</code> so the peer can decode without waiting for stream end; advertised only once authenticated and only while not already compressed. Fixed two bugs surfaced while wiring this up: the LOGIN/AUTHENTICATE completion's embedded <code>[CAPABILITY …]</code> was built from pre-auth session state, and a pipelined second <code>COMPRESS DEFLATE</code> inside an already-compressed read could be wrongly granted (a re-entrancy gap while the compression state was transiently taken out of <code>self</code>)</td></tr>
+<tr><td>UTF8=ACCEPT</td><td>RFC 6855</td><td>Compliant</td><td>Tracked via <code>ENABLE</code>; no wire-format change needed since IMAP4rev2 responses are already raw UTF-8, not modified UTF-7</td></tr>
+<tr><td>STATUS=SIZE</td><td>RFC 8438</td><td>Compliant</td><td><code>server/status_items.rs</code>: <code>SIZE</code> status data item (message octets)</td></tr>
+<tr><td>OBJECTID</td><td>RFC 8474</td><td>Compliant (Maildir only)</td><td><code>MAILBOXID</code> generated once per mailbox and persisted in <code>.uidlist</code> (survives RENAME); <code>EMAILID</code> derived deterministically from <code>MAILBOXID</code> + UID, avoiding a reverse index for <code>SEARCH EMAILID</code>. The mbox backend doesn't assign either (<code>Mailbox::mailbox_id()</code>/<code>email_id()</code> trait defaults return <code>None</code>)</td></tr>
+<tr><td>METADATA</td><td>RFC 5464</td><td>Compliant (Maildir only)</td><td><code>server/metadata.rs</code> (parsing) / <code>maildir/store.rs</code> (storage): <code>GETMETADATA</code>/<code>SETMETADATA</code> with <code>DEPTH</code>/<code>MAXSIZE</code> and <code>METADATA LONGENTRIES</code>, backed by a directory tree per mailbox plus a separate <code>.server-metadata</code> tree for server-level (empty-mailbox) annotations — kept distinct from INBOX's own annotations, since Maildir++ resolves INBOX's directory to the user root itself</td></tr>
+<tr><td>NOTIFY</td><td>RFC 5465</td><td>Compliant (documented subset)</td><td><code>server/notify.rs</code>: <code>SET</code>/<code>NONE</code> for the selected mailbox's <code>MessageNew</code>/<code>MessageExpunge</code>/<code>FlagChange</code> events, reusing IDLE's poll-and-diff machinery against the same baseline so an event is reported exactly once regardless of which mechanism observes it first. Cross-mailbox selectors and the annotation/mailbox-name/subscription event groups are rejected with a tagged BAD rather than silently ignored</td></tr>
 </tbody>
 </table>
 <h3>Client</h3>
@@ -867,6 +1030,7 @@
 <tr><td>Non-PLAIN SASL mechanisms (client)</td><td>Compliant (with the same documented scope limit as hopf-pop3)</td><td>The underlying protocol is mechanism-agnostic — <code>authenticate(mechanism, initial)</code> takes any mechanism name and <code>ImapClientAuthExchange::respond</code>/<code>abort</code> drive an arbitrary challenge/response exchange; <code>ImapCapabilities</code> retains every raw <code>AUTH=</code> token via <code>.tokens</code>/<code>.has()</code>, not just PLAIN. The <code>ImapFetch</code>/<code>ImapIdle</code> auto-pilots still only drive PLAIN themselves — same accepted scope limit as hopf-pop3's auto-pilot; a custom driver is required for other mechanisms</td></tr>
 <tr><td>Full RFC 9051 §6.3-6.4 command surface (SELECT through MOVE, IDLE/DONE, GETQUOTA)</td><td>Compliant</td><td><code>ImapFetch</code>/<code>ImapIdle</code> auto-pilots exercise the whole surface</td></tr>
 <tr><td><strong>Tag-correlated pipelining with out-of-order completion</strong></td><td>Compliant</td><td><code>PendingMap</code> routes untagged replies to the oldest pending command of a compatible kind regardless of tag-completion order — directly unit-tested (<code>out_of_order_completion</code>, <code>status_and_list_both_compatible_simultaneously</code>)</td></tr>
+<tr><td>SORT/THREAD, COMPRESS=DEFLATE, OBJECTID/METADATA/NOTIFY (client parity)</td><td>Compliant</td><td><code>client/state.rs</code>/<code>client/endpoint.rs</code>: <code>ImapClientSelected::sort</code>/<code>uid_sort</code>/<code>thread</code>/<code>uid_thread</code> with a SORT numeric-list event and a THREAD chain/nested response parser producing a client-side thread tree; <code>compress_deflate</code> activating the same raw-DEFLATE layer as the server; <code>notify_set_selected</code>/<code>notify_none</code>; <code>get_metadata</code>/<code>set_metadata</code>; <code>mailbox_id</code>/<code>email_id</code> surfaced on the relevant response data structs</td></tr>
 </tbody>
 </table>
 
@@ -977,7 +1141,27 @@
 <tr><td>Publisher confirms + <code>basic.return</code></td><td>Compliant</td><td></td></tr>
 <tr><td><code>basic.consume</code> push deliveries + ack / nack / reject / qos</td><td>Compliant</td><td><code>basic.get</code> deferred</td></tr>
 <tr><td>AMQPS (implicit TLS)</td><td>Compliant</td><td></td></tr>
-<tr><td>Broker / AMQP 1.0 / transactions</td><td>Out of scope</td><td>Client-only by design</td></tr>
+<tr><td>Broker / transactions</td><td>Out of scope</td><td>Client-only by design</td></tr>
+</tbody>
+</table>
+
+<h2 id="amqp1">AMQP 1.0 — ISO/IEC 19464 (client only, <code>hopf-amqp1</code>)</h2>
+<p><code>hopf-amqp1</code> is a separate crate from <code>hopf-amqp</code> — AMQP 1.0 shares only the four-byte <code>AMQP</code> magic with AMQP 0-9-1; framing, the type system, and the connection/session/link model are unrelated. Client-only, no broker. See <a href="amqp.html">amqp.html</a>.</p>
+<table>
+<thead><tr><th>Capability</th><th>Status</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td>Frame layer, type system, described types</td><td>Compliant</td><td><code>hopf_amqp1::codec</code>: protocol header exchange, frame header (size/DOFF/type/channel), compact-encoded type system with depth-guarded recursive decode</td></tr>
+<tr><td>SASL PLAIN / ANONYMOUS, auto-negotiated</td><td>Compliant</td><td>PLAIN when credentials are configured and advertised, else ANONYMOUS</td></tr>
+<tr><td>Connection open, sessions (begin/end), links (attach/detach)</td><td>Compliant</td><td></td></tr>
+<tr><td>Session-level flow control, link credit</td><td>Compliant</td><td>Incoming/outgoing window; RFC 1982 serial arithmetic for delivery-ids and window comparisons</td></tr>
+<tr><td>Sending: header / properties / application-properties / data</td><td>Compliant</td><td>Automatically split across multiple <code>transfer</code> frames for messages larger than the negotiated max frame size</td></tr>
+<tr><td>Receiving, streamed incrementally</td><td>Compliant</td><td>Delivered to the application as <code>transfer</code> frames arrive rather than buffered whole (genuinely incremental <code>MessageParser</code>)</td></tr>
+<tr><td>Delivery settlement (accept/reject/release/modify), outcomes</td><td>Compliant</td><td></td></tr>
+<tr><td>AMQPS (implicit TLS)</td><td>Compliant</td><td></td></tr>
+<tr><td>Automatic reconnection</td><td>Not implemented</td><td>Unlike <code>hopf-amqp</code>'s <code>AmqpRecoveringClient</code></td></tr>
+<tr><td>Heartbeat send / peer idle-time-out enforcement</td><td>Not implemented</td><td>Advertises no requirement of its own; a long-idle connection against a broker with a strict idle timeout could be dropped</td></tr>
+<tr><td>Sending delivery-annotations / message-annotations / footer</td><td>Partial</td><td>Received as raw maps; not yet offered on the send side</td></tr>
+<tr><td>Broker / transactions</td><td>Out of scope</td><td>Client-only by design</td></tr>
 </tbody>
 </table>
 
@@ -987,8 +1171,6 @@
 <table>
 <thead><tr><th>Protocol</th><th>Gumdrop (reference)</th><th>hopf status</th></tr></thead>
 <tbody>
-<tr><td>SOCKS proxy</td><td>SOCKS4/4a/5, CONNECT/BIND/UDP ASSOCIATE, RFC 1929 auth, RFC 1961 GSSAPI</td><td><strong>Partial.</strong> Crate <code>hopf-socks</code>: SOCKS4/4a/5, CONNECT, BIND, UDP ASSOCIATE, RFC 1929 username/password (server and client). RFC 1961 GSSAPI auth not implemented — planned with optional GSSAPI SASL in <code>hopf-auth</code></td></tr>
-<tr><td>LDAP client</td><td>RFC 4511 client, BER, CredentialStore</td><td><strong>Started (v1).</strong> Crate <code>hopf-ldap</code>: definite-length BER, async bind/search/unbind, LDAPS/STARTTLS, <code>LdapCredentialStore</code>, referral chase, LDAP controls, and the client side of RFC 4533 content synchronization (refresh-only and refresh-and-persist, cookie resume, present/delete phases, <code>e-syncRefreshRequired</code>, Abandon; see <a href="ldap.html#content-sync">LDAP</a>). Non-goals: directory admin API, SASL bind to the directory</td></tr>
 <tr><td>Redis client</td><td>RESP client</td><td>Not started</td></tr>
 <tr><td>CoAP / CoAPS</td><td>—</td><td>Not started; CoAPS depends on planned DTLS</td></tr>
 <tr><td>SSH / SFTP / SCP</td><td>—</td><td>Not started; SSH KEX + channels (parallel transport family, not TLS)</td></tr>
@@ -998,7 +1180,7 @@
 </table>
 <h3 id="planned-gumdrop-gaps">Documented gaps vs Gumdrop (implemented crates)</h3>
 <ul>
-<li><strong>DTLS / DNS over DTLS</strong> — Gumdrop transparent DTLS on UDP; hopf has cleartext UDP only until DTLS lands (see <a href="#security-planned">Security substrate → Planned</a>).</li>
+<li><strong>DNS over DTLS</strong> — DTLS 1.2/1.3 have landed in <code>hopf-core</code>, but no protocol crate (including <code>hopf-dns</code>) is wired up to dial/listen over them yet; this needs DTLS's generic <code>Endpoint</code> integration first (see <a href="#security-planned">Security substrate → Remaining</a>).</li>
 <li><strong>Auto-injected Authentication-Results, built-in quarantine mailbox</strong> — deliberate v1 omissions on SMTP; see <a href="#smtp">SMTP auth table</a>.</li>
 </ul>
 

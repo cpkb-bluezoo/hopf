@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MASQUE — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html" aria-current="page">MASQUE</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
+<li><a href="ldap.html">LDAP</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="quota.html">Quota</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Architecture audit</h2><ul>
+<li><a href="conformance.html">Conformance</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/dns-authoritative.html">DNS authoritative</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>MASQUE</h1>
+        <p class="lead">Crate <code>hopf-masque</code>: RFC 9298 (Proxying UDP in HTTP, "CONNECT-UDP") and RFC 9484 (Proxying IP in HTTP, "CONNECT-IP") building blocks layered on <a href="http/overview.html">hopf-http</a>'s <code>ProtocolUpgradeHandler</code> and Capsule Protocol machinery — the same upgrade pattern <a href="websocket.html">hopf-websocket</a> uses for its own framing. This is not a standalone MASQUE proxy program: it is a pair of server-side request handlers plus a pair of client dial functions that an application assembles into one, with the actual UDP relaying (CONNECT-UDP) or IP packet forwarding (CONNECT-IP) either fully handled or left to application-supplied hooks — see <a href="#building-blocks">What "building blocks" means</a>.</p>
+      </header>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#building-blocks">What &quot;building blocks&quot; means</a></li>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#connect-udp-server">CONNECT-UDP server (<code>ConnectUdpFactory</code>)</a></li>
+<li><a href="#connect-ip-server">CONNECT-IP server (<code>ConnectIpFactory</code>)</a></li>
+<li><a href="#capsules">RFC 9484 capsules</a></li>
+<li><a href="#datagrams-and-capsules">HTTP Datagrams and the Capsule Protocol</a></li>
+<li><a href="#connect-udp-client">CONNECT-UDP client (<code>connect_udp</code>)</a></li>
+<li><a href="#connect-ip-client">CONNECT-IP client (<code>connect_ip</code>)</a></li>
+<li><a href="#cargo-features">Cargo features</a></li>
+<li><a href="#example">Example</a></li>
+<li><a href="#limitations">Limitations</a></li>
+<li><a href="#implementation-status">Implementation status</a></li>
+<li><a href="#see-also">See also</a></li>
+</ul></div>
+<h2 id="building-blocks">What &quot;building blocks&quot; means</h2>
+<p><code>hopf-masque</code> ships no proxy binary and no example crate. It gives an application, on the server side, two <code>ServerHandlerFactory</code> implementations that plug into any of hopf-http's H1/H2/H3 servers, and, on the client side (feature <code>h3</code>), two functions that dial a proxy the same way any other <code>hopf-http</code> request would. What each side does past accepting/dialling the tunnel differs by protocol:</p>
+<ul>
+<li><strong>CONNECT-UDP is a complete relay on its own.</strong> <code>ConnectUdpFactory</code> resolves the request's <code>{host}/{port}</code> target via a supplied <code>DnsResolver</code>, opens a real outbound UDP socket on one of the supplied <code>Runtime</code>'s workers, and pumps datagrams between it and the HTTP Datagram / Capsule Protocol channel for the tunnel's lifetime (<code>crates/hopf-masque/src/relay.rs</code>). The only thing an application supplies is a <a href="#connect-udp-server"><code>ConnectUdpPolicy</code></a> deciding which resolved targets to allow.</li>
+<li><strong>CONNECT-IP has no relay of its own.</strong> RFC 9484's <code>target</code>/<code>ipproto</code> segments are optionally wildcarded and are never resolved by this crate — what a hostname, IP literal, IP prefix, or bare <code>*</code> even means is left to the deployment (RFC 9484 itself takes no position either). <code>hopf-masque</code> therefore has zero packet-forwarding code: no TUN device, no userspace router, no kernel network stack dependency anywhere in the workspace. <code>ConnectIpFactory</code> only parses the target, asks a <a href="#connect-ip-server"><code>ConnectIpPolicy</code></a> whether to accept it, and — once accepted — hands the application a <code>ConnectIpHandler</code> that receives raw decoded IP packets and address requests and a <code>ConnectIpSession</code> to send packets, assign addresses, and advertise routes back. What happens to a packet in between is entirely the application's job.</li>
+<li><strong>The client side (feature <code>h3</code>) is a dial helper, not a user agent.</strong> <code>connect_udp</code>/<code>connect_ip</code> build the RFC 9298/9484 request, negotiate transport through <code>hopf_http::connect_auto</code> (h3 first when a QUIC client config is supplied, falling back per <code>HttpFallback</code>), and hand the application a session handle plus an event-handler trait. There is no bundled SOCKS-to-MASQUE or TUN-to-MASQUE adapter — an application wanting to expose a MASQUE tunnel as, say, a local SOCKS proxy or a virtual network interface has to write that glue itself.</li>
+</ul>
+<p>In short: CONNECT-UDP is proxy-grade out of the box (bring a policy); CONNECT-IP is protocol plumbing only (bring a policy <em>and</em> a forwarder).</p>
+<h2 id="standards">Standards</h2>
+<table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 59%" />
+</colgroup>
+<thead>
+<tr>
+<th>Spec</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RFC 9298 (Proxying UDP in HTTP)</td>
+<td>CONNECT-UDP: server relay (<code>ConnectUdpFactory</code>) and client (<code>connect_udp</code>, feature <code>h3</code>), both over H1/H2/H3</td>
+</tr>
+<tr>
+<td>RFC 9484 (Proxying IP in HTTP)</td>
+<td>CONNECT-IP: server accept + application-driven forwarding (<code>ConnectIpFactory</code>) and client (<code>connect_ip</code>, feature <code>h3</code>)</td>
+</tr>
+<tr>
+<td>RFC 9297 (HTTP Datagrams and the Capsule Protocol)</td>
+<td>Provided by <code>hopf-http</code> (<code>capsule</code>/<code>context_id</code> modules); every accept response and every client request in this crate unconditionally sends <code>Capsule-Protocol: ?1</code> and rejects a peer that doesn't — raw byte-stream fallback is never used</td>
+</tr>
+<tr>
+<td>RFC 9220 / RFC 8441 Extended CONNECT</td>
+<td>H2/H3 request shape: <code>:method: CONNECT</code>, <code>:protocol: connect-udp</code> or <code>connect-ip</code></td>
+</tr>
+<tr>
+<td>HTTP/1.1 Upgrade (RFC 9110 §7.8)</td>
+<td>H1 request shape: <code>GET</code> + <code>Upgrade: connect-udp</code>/<code>connect-ip</code> + <code>Connection: Upgrade</code> — H1 has no <code>:protocol</code> pseudo-header, so this is the only shape available there</td>
+</tr>
+</tbody>
+</table>
+<h2 id="connect-udp-server">CONNECT-UDP server (<code>ConnectUdpFactory</code>)</h2>
+<p><code>ConnectUdpFactory::new(dns, runtime, policy)</code> builds a <code>ServerHandlerFactory</code> to hand to any hopf-http server (H1, H2, or H3 via <code>listen_h3</code>). Per accepted request it: matches the Extended-CONNECT or Upgrade shape for <code>connect-udp</code>, requires <code>Capsule-Protocol: ?1</code>, parses the target path, resolves it via the supplied <code>DnsResolver</code>, asks the policy, opens an outbound UDP socket on one of the supplied <code>Runtime</code>'s workers, and installs a <code>ConnectUdpRelay</code> (<code>ProtocolUpgradeHandler</code>) that pumps datagrams both ways until closed or idle.</p>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 32%" />
+<col style="width: 39%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type / fn</th>
+<th>Shape</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ConnectUdpFactory::new</code></td>
+<td><code>(Arc&lt;DnsResolver&gt;, Arc&lt;Runtime&gt;, Arc&lt;dyn ConnectUdpPolicy&gt;) -&gt; Self</code></td>
+<td>No permissive default policy exists anywhere in the crate — an open UDP relay is never the default</td>
+</tr>
+<tr>
+<td><code>ConnectUdpFactory::with_idle_timeout</code></td>
+<td><code>(self, Duration) -&gt; Self</code></td>
+<td>Overrides <code>DEFAULT_IDLE_TIMEOUT</code> (5 minutes) — RFC 9298 sets no lifetime bound itself; this is purely this crate's own relay-teardown policy</td>
+</tr>
+<tr>
+<td><code>ConnectUdpPolicy</code></td>
+<td><code>trait: is_target_allowed(&amp;self, addr: IpAddr, port: u16) -&gt; bool</code></td>
+<td>Checked against the <em>resolved</em> address, not the original hostname — implement DNS-rebinding protection here if a public-facing relay needs it (e.g. rejecting private/loopback ranges)</td>
+</tr>
+<tr>
+<td><code>parse_connect_udp_target</code></td>
+<td><code>(path: &amp;str) -&gt; Option&lt;ConnectUdpTarget { host, port }&gt;</code></td>
+<td>Parses the RFC 9298 §2 URI template below; strict — a truncated percent-escape, non-hex escape, invalid UTF-8, non-numeric or out-of-range port all reject rather than best-effort decode</td>
+</tr>
+</tbody>
+</table>
+<p>URI template (RFC 9298 §2): <code>/.well-known/masque/udp/{target_host}/{target_port}/</code> — both segments required, non-empty, percent-encoded (needed for an IPv6 literal's colons).</p>
+<pre><code>use hopf_masque::{ConnectUdpFactory, ConnectUdpPolicy};
+use std::net::IpAddr;
+use std::sync::Arc;
+
+struct OnlyPort443;
+impl ConnectUdpPolicy for OnlyPort443 {
+    fn is_target_allowed(&amp;self, _addr: IpAddr, port: u16) -&gt; bool {
+        port == 443
+    }
+}
+
+let factory = ConnectUdpFactory::new(dns_resolver, Arc::clone(&amp;runtime), Arc::new(OnlyPort443))
+    .with_idle_timeout(std::time::Duration::from_secs(120));
+// `factory` is a `ServerHandlerFactory` — wrap it the same way as any
+// other hopf-http server handler (CleartextHttpEndpoint, TLS, or listen_h3).</code></pre>
+<p>The relay's idle timer is self-rearming: any traffic in either direction resets it, and a full <code>idle_timeout</code> with none tears the tunnel down. Opening the outbound socket happens off the reactor thread entirely (a plain, dedicated thread) — <code>ReactorHandle::register_udp</code>'s blocking round trip would deadlock if run from the same worker it targets, the same constraint <code>hopf-mdns</code>'s own one-time registration documents.</p>
+<h2 id="connect-ip-server">CONNECT-IP server (<code>ConnectIpFactory</code>)</h2>
+<p><code>ConnectIpFactory::new(app, policy)</code> builds a <code>ServerHandlerFactory</code>. Per accepted request it matches the Extended-CONNECT/Upgrade shape for <code>connect-ip</code>, requires <code>Capsule-Protocol: ?1</code>, parses the target/ipproto scope, asks the policy, then — with no DNS lookup or socket of its own to open — synchronously builds an app-supplied <code>ConnectIpHandler</code> and installs a <code>ConnectIpRelay</code>.</p>
+<table>
+<colgroup>
+<col style="width: 28%" />
+<col style="width: 32%" />
+<col style="width: 39%" />
+</colgroup>
+<thead>
+<tr>
+<th>Type / fn</th>
+<th>Shape</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ConnectIpFactory::new</code></td>
+<td><code>(Arc&lt;dyn ConnectIpHandlerFactory&gt;, Arc&lt;dyn ConnectIpPolicy&gt;) -&gt; Self</code></td>
+<td>No permissive default policy, same reasoning as CONNECT-UDP</td>
+</tr>
+<tr>
+<td><code>ConnectIpPolicy</code></td>
+<td><code>trait: is_target_allowed(&amp;self, target: &amp;IpTarget, ipproto: &amp;IpProto) -&gt; bool</code></td>
+<td>Separate trait from <code>ConnectUdpPolicy</code> on purpose — CONNECT-IP's scope is never resolved and each half may be a wildcard, so one shared trait would leave one side or the other ignoring fields it doesn't need</td>
+</tr>
+<tr>
+<td><code>ConnectIpHandlerFactory</code></td>
+<td><code>trait: create_handler(&amp;self) -&gt; Box&lt;dyn ConnectIpHandler&gt;</code></td>
+<td>Builds one handler per accepted tunnel — the application's forwarding logic, entirely outside this crate</td>
+</tr>
+<tr>
+<td><code>ConnectIpHandler</code></td>
+<td><code>trait: opened(session)</code>, <code>packet_received(&amp;[u8])</code>, <code>address_requested(request_id, addr, prefix_len)</code> (default: ignore), <code>closed()</code> (default: ignore)</td>
+<td><code>packet_received</code> gets the Context-ID-0 payload: a full IP packet, IP Version field through the last payload byte (RFC 9484 §5)</td>
+</tr>
+<tr>
+<td><code>ConnectIpSession</code></td>
+<td><code>trait: send_packet(&amp;[u8])</code>, <code>assign_address(request_id, addr, prefix_len)</code>, <code>advertise_route(start, end, ip_protocol)</code>, <code>close()</code></td>
+<td>Safe to call from any thread, not just the one <code>opened</code> ran on — every method pokes the connection's reactor to flush promptly rather than waiting for the next inbound activity</td>
+</tr>
+<tr>
+<td><code>parse_connect_ip_target</code></td>
+<td><code>(path: &amp;str) -&gt; Option&lt;ConnectIpTarget { target: IpTarget, ipproto: IpProto }&gt;</code></td>
+<td><code>IpTarget::Wildcard</code>/<code>IpTarget::Named(String)</code>, <code>IpProto::Wildcard</code>/<code>IpProto::Number(u8)</code> — either literal <code>*</code>, per RFC 9484 §3</td>
+</tr>
+</tbody>
+</table>
+<p>URI template (RFC 9484 §3): <code>/.well-known/masque/ip/{target}/{ipproto}/</code> — both segments required (either may be the literal <code>*</code>); <code>target</code> may be a hostname, an IPv4/IPv6 address, or an address+prefix (the slash before the prefix length is itself percent-encoded, e.g. <code>192.0.2.0%2F24</code>, RFC 9484 §3's own example).</p>
+<pre><code>use hopf_masque::{
+    ConnectIpFactory, ConnectIpHandler, ConnectIpHandlerFactory, ConnectIpPolicy,
+    ConnectIpSession, IpProto, IpTarget,
+};
+use std::net::IpAddr;
+use std::sync::Arc;
+
+struct AllowWildcardOnly;
+impl ConnectIpPolicy for AllowWildcardOnly {
+    fn is_target_allowed(&amp;self, target: &amp;IpTarget, _ipproto: &amp;IpProto) -&gt; bool {
+        matches!(target, IpTarget::Wildcard)
+    }
+}
+
+struct EchoHandler { session: Option&lt;Arc&lt;dyn ConnectIpSession&gt;&gt; }
+impl ConnectIpHandler for EchoHandler {
+    fn opened(&amp;mut self, session: Arc&lt;dyn ConnectIpSession&gt;) { self.session = Some(session); }
+    fn packet_received(&amp;mut self, packet: &amp;[u8]) {
+        if let Some(s) = &amp;self.session { s.send_packet(packet); } // trivial echo
+    }
+}
+struct EchoHandlerFactory;
+impl ConnectIpHandlerFactory for EchoHandlerFactory {
+    fn create_handler(&amp;self) -&gt; Box&lt;dyn ConnectIpHandler&gt; {
+        Box::new(EchoHandler { session: None })
+    }
+}
+
+let factory = ConnectIpFactory::new(Arc::new(EchoHandlerFactory), Arc::new(AllowWildcardOnly));</code></pre>
+<h2 id="capsules">RFC 9484 capsules</h2>
+<p><code>crate::ip_capsule</code> (private) codes the three RFC 9484 capsule types CONNECT-IP layers on top of <code>hopf_http::capsule</code>'s generic Capsule Protocol framing (RFC 9297 §3); <code>DATAGRAM</code> itself needs no codec of its own here since it carries an opaque, <code>context_id</code>-prefixed payload both CONNECT-UDP and CONNECT-IP already share.</p>
+<table>
+<colgroup>
+<col style="width: 26%" />
+<col style="width: 16%" />
+<col style="width: 22%" />
+<col style="width: 36%" />
+</colgroup>
+<thead>
+<tr>
+<th>Capsule</th>
+<th>Type</th>
+<th>Direction</th>
+<th>Entry shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DATAGRAM (RFC 9297)</td>
+<td><code>0x00</code></td>
+<td>either</td>
+<td><code>context_id::encode(REGISTERED_CONTEXT_ID, payload)</code> — Context ID 0 is the tunnel's own IP packet; a nonzero, unrecognized Context ID is ignored per RFC 9484 §5, not treated as an error</td>
+</tr>
+<tr>
+<td>ADDRESS_ASSIGN</td>
+<td><code>0x01</code></td>
+<td>server→client</td>
+<td>One or more <code>{request_id, address, prefix_length}</code> entries (RFC 9484 §4.2)</td>
+</tr>
+<tr>
+<td>ADDRESS_REQUEST</td>
+<td><code>0x02</code></td>
+<td>client→server</td>
+<td>Identically shaped to ADDRESS_ASSIGN; the Request ID is client-chosen and echoed back on the matching assign</td>
+</tr>
+<tr>
+<td>ROUTE_ADVERTISEMENT</td>
+<td><code>0x03</code></td>
+<td>server→client only</td>
+<td>One or more <code>{start, end, ip_protocol}</code> entries (RFC 9484 §4.3); <code>ip_protocol: 0</code> means all protocols. <code>RouteEntry::new</code> rejects a mismatched address family or <code>start &gt; end</code> rather than encoding an invalid range</td>
+</tr>
+</tbody>
+</table>
+<h2 id="datagrams-and-capsules">HTTP Datagrams and the Capsule Protocol</h2>
+<p>Both CONNECT-UDP and CONNECT-IP are unconditional Capsule Protocol users: <code>crate::accept::accept_headers</code> always sets <code>Capsule-Protocol: ?1</code> on the <code>200</code>/<code>101</code> accept response, and both server request handlers reject any request missing <code>Capsule-Protocol: ?1</code> of its own (via <code>hopf_http::capsule::capsule_protocol_enabled</code>) with a <code>400</code> before ever looking at the target. Neither this crate's relays nor its clients implement the RFC 9297 §6 fallback of raw, non-capsule HTTP Datagrams for H3 — every payload here, on every transport (H1/H2/H3 alike), goes through the generic <code>hopf_http::capsule</code> DATAGRAM capsule and the <code>hopf_http::context_id</code> varint prefix, keeping the wire format identical across transports rather than branching on whether native QUIC DATAGRAM frames are available.</p>
+<p><code>ProtocolUpgradeHandler::wants_datagrams</code> always returns <code>true</code> for every upgrade handler in this crate; <code>datagram_received</code>/<code>capsule_received</code> decode the Context ID or capsule type and dispatch to the relay/client event handler. See <a href="quic-h3.html">QUIC / HTTP/3</a> for how <code>hopf-http</code> itself demultiplexes HTTP Datagrams and Capsule Protocol capsules onto a request stream.</p>
+<h2 id="connect-udp-client">CONNECT-UDP client (<code>connect_udp</code>)</h2>
+<p>Feature <code>h3</code> only (needs <code>hopf-http/h3</code> and <code>hopf-quic</code> for the transport-negotiating dial path, the same reason <code>hopf-http</code> itself gates <code>h3</code>). Dials <code>proxy_host:proxy_port</code> via <code>hopf_http::connect_auto</code> — an h3 attempt first when a <code>QuicClientConfig</code> is supplied, falling back per <code>HttpFallback</code>, exactly as any other outbound hopf-http request negotiates transport — and relays to <code>target_host:target_port</code> once the proxy accepts.</p>
+<table>
+<colgroup>
+<col style="width: 30%" />
+<col style="width: 70%" />
+</colgroup>
+<thead>
+<tr>
+<th>Item</th>
+<th>Shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>connect_udp</code></td>
+<td><code>(rt: &amp;Arc&lt;Runtime&gt;, proxy_host: &amp;str, proxy_port: u16, target_host: impl Into&lt;String&gt;, target_port: u16, fallback: HttpFallback, event_handler: Box&lt;dyn ConnectUdpEventHandler&gt;, quic_client_config: Option&lt;Arc&lt;QuicClientConfig&gt;&gt;, alt_svc_cache: Arc&lt;AltSvcCache&gt;, timeouts: HttpClientTimeouts, resolver: Option&lt;Arc&lt;DnsResolver&gt;&gt;, unix_path: Option&lt;PathBuf&gt;) -&gt; io::Result&lt;()&gt;</code></td>
+</tr>
+<tr>
+<td><code>ConnectUdpEventHandler</code></td>
+<td><code>trait: opened(session)</code>, <code>datagram_received(&amp;[u8])</code> (default: ignore), <code>closed()</code> (default: ignore), <code>error(&amp;io::Error)</code> (default: ignore) — called before the tunnel ever opens if the proxy rejects the request or the connection fails</td>
+</tr>
+<tr>
+<td><code>ConnectUdpSession</code></td>
+<td><code>trait: send_datagram(&amp;[u8])</code>, <code>close()</code> — handed to <code>opened</code>; safe from any thread</td>
+</tr>
+</tbody>
+</table>
+<p><code>unix_path</code>, when set, dials the proxy over a UNIX domain socket instead of TCP/IP/QUIC (<code>proxy_host</code>/<code>proxy_port</code>/<code>quic_client_config</code>/<code>resolver</code> are then used only to fill the <code>Host</code> header, since QUIC/h3 has no UNIX-domain transport); <code>HttpFallback::Tls</code> is not yet supported for a UNIX-domain dial.</p>
+<h2 id="connect-ip-client">CONNECT-IP client (<code>connect_ip</code>)</h2>
+<p>Mirrors <code>connect_udp</code> closely — same transport negotiation, same <code>unix_path</code> caveat — scoped to a <code>target</code>/<code>ipproto</code> pair (either may be a wildcard) instead of a concrete resolved host/port, and with the extra RFC 9484 capsule types surfaced on the event handler.</p>
+<table>
+<colgroup>
+<col style="width: 30%" />
+<col style="width: 70%" />
+</colgroup>
+<thead>
+<tr>
+<th>Item</th>
+<th>Shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>connect_ip</code></td>
+<td><code>(rt: &amp;Arc&lt;Runtime&gt;, proxy_host: &amp;str, proxy_port: u16, target: IpTarget, ipproto: IpProto, fallback: HttpFallback, event_handler: Box&lt;dyn ConnectIpEventHandler&gt;, quic_client_config: Option&lt;Arc&lt;QuicClientConfig&gt;&gt;, alt_svc_cache: Arc&lt;AltSvcCache&gt;, timeouts: HttpClientTimeouts, resolver: Option&lt;Arc&lt;DnsResolver&gt;&gt;, unix_path: Option&lt;PathBuf&gt;) -&gt; io::Result&lt;()&gt;</code></td>
+</tr>
+<tr>
+<td><code>ConnectIpEventHandler</code></td>
+<td><code>trait: opened(session)</code>, <code>packet_received(&amp;[u8])</code> (default: ignore), <code>address_assigned(request_id, addr, prefix_len)</code> (default: ignore), <code>route_advertised(start, end, ip_protocol)</code> (default: ignore), <code>closed()</code>, <code>error(&amp;io::Error)</code></td>
+</tr>
+<tr>
+<td><code>ConnectIpClientSession</code></td>
+<td><code>trait: send_packet(&amp;[u8])</code>, <code>send_address_request(&amp;[RequestedAddress])</code>, <code>close()</code></td>
+</tr>
+<tr>
+<td><code>RequestedAddress</code></td>
+<td><code>{ request_id: u64, address: IpAddr, prefix_length: u8 }</code> — <code>request_id</code> is caller-chosen, must be nonzero, and must not be reused within a tunnel (RFC 9484 §4.2)</td>
+</tr>
+</tbody>
+</table>
+<p>Each <code>send_address_request</code> call encodes its whole slice into one <code>ADDRESS_REQUEST</code> capsule together — call it again separately if a later, distinct request shouldn't share a capsule with one already in flight.</p>
+<h2 id="cargo-features">Cargo features</h2>
+<table>
+<colgroup>
+<col style="width: 22%" />
+<col style="width: 78%" />
+</colgroup>
+<thead>
+<tr>
+<th>Feature (<code>hopf-masque</code>)</th>
+<th>Gates</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>default</code></td>
+<td>Empty — the server-side relays (<code>ConnectUdpFactory</code>, <code>ConnectIpFactory</code>) build with nothing enabled; they need only <code>hopf-core</code>, <code>hopf-http</code>, and <code>hopf-dns</code>, none of which require QUIC</td>
+</tr>
+<tr>
+<td><code>h3</code></td>
+<td><code>hopf-http/h3</code> + <code>dep:hopf-quic</code> — required for <code>connect_udp</code>/<code>connect_ip</code> and their supporting types (<code>client</code>/<code>ip_client</code> modules are <code>#[cfg(feature = "h3")]</code>): an h3 dial attempt is only possible with a QUIC client config, the same reason <code>hopf-http</code> itself gates <code>h3</code></td>
+</tr>
+<tr>
+<td><code>integration</code></td>
+<td><code>h3</code> — real TCP/UDP loopback round-trip tests (<code>src/integration.rs</code>), excluded from ordinary <code>cargo test</code> runs; run with <code>cargo test -p hopf-masque --features integration</code></td>
+</tr>
+</tbody>
+</table>
+<p>In the <code>hopf</code> umbrella crate: feature <code>masque</code> pulls in <code>hopf-masque</code> (plus its own <code>dns</code>/<code>http</code> features); feature <code>masque-h3</code> additionally enables <code>hopf-masque/h3</code> (and the umbrella's own <code>h3</code> feature) for the client functions.</p>
+<h2 id="example">Example</h2>
+<p>No example binary ships yet (see <a href="#limitations">Limitations</a>). This is adapted from the crate's own loopback test suite (<code>crates/hopf-masque/src/integration.rs</code>), which is the most realistic end-to-end usage currently in the tree — a CONNECT-UDP server relay accepting a request, plus a client dialling it and round-tripping one datagram through a UDP echo target:</p>
+<pre><code>use hopf_core::{ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
+use hopf_dns::DnsResolver;
+use hopf_http::{AltSvcCache, CleartextHttpEndpoint, HttpClientTimeouts, HttpFallback, HttpLimits};
+use hopf_masque::{connect_udp, ConnectUdpEventHandler, ConnectUdpFactory, ConnectUdpPolicy, ConnectUdpSession};
+use std::net::IpAddr;
+use std::sync::Arc;
+
+struct AllowAny; // never do this in a real deployment
+impl ConnectUdpPolicy for AllowAny {
+    fn is_target_allowed(&amp;self, _addr: IpAddr, _port: u16) -&gt; bool { true }
+}
+
+// --- server: accept CONNECT-UDP over plain HTTP/1.1 ---
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+let dns = Arc::new(DnsResolver::for_runtime(&amp;rt)?);
+let factory = Arc::new(ConnectUdpFactory::new(dns, Arc::clone(&amp;rt), Arc::new(AllowAny)));
+let (server_addr, _) = rt.add_tcp_listener(TcpListenerConfig::new(
+    "127.0.0.1:0".parse()?,
+    move || Box::new(CleartextHttpEndpoint::new(
+        Arc::clone(&amp;factory) as _, HttpLimits::default(),
+    )) as Box&lt;dyn ProtocolHandler&gt;,
+))?;
+
+// --- client: dial the relay, tunnel to a UDP target through it ---
+struct PrintHandler;
+impl ConnectUdpEventHandler for PrintHandler {
+    fn opened(&amp;mut self, session: Arc&lt;dyn ConnectUdpSession&gt;) {
+        session.send_datagram(b"ping");
+    }
+    fn datagram_received(&amp;mut self, data: &amp;[u8]) {
+        println!("target replied: {data:?}");
+    }
+}
+
+connect_udp(
+    &amp;rt,
+    &amp;server_addr.ip().to_string(), server_addr.port(),
+    "udp-target.example", 53,
+    HttpFallback::PlaintextH1,
+    Box::new(PrintHandler),
+    None,                          // no QUIC client config -&gt; h1/h2 only
+    Arc::new(AltSvcCache::new()),
+    HttpClientTimeouts::default(),
+    None,                          // default resolver
+    None,                          // no UNIX-domain dial
+)?;</code></pre>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>No example binaries or CLI proxy tool ship for either protocol — the crate is consumed as a library, and there is nothing in <code>examples/</code> exercising it.</li>
+<li>CONNECT-IP does no target resolution, address allocation, or packet forwarding of its own — an application must supply both a <code>ConnectIpPolicy</code> and a real <code>ConnectIpHandler</code>/<code>ConnectIpHandlerFactory</code> for a tunnel to do anything beyond accept.</li>
+<li>Neither protocol falls back to raw, non-capsule HTTP Datagrams over native QUIC DATAGRAM frames (RFC 9297 §6) — every payload goes through Capsule Protocol framing unconditionally, on every transport including H3. A peer that only speaks the non-capsule form is rejected (missing <code>Capsule-Protocol: ?1</code> is a <code>400</code>).</li>
+<li>CONNECT-UDP's relay resolves a target hostname once, using the first address <code>DnsResolver::resolve</code> returns — there is no Happy-Eyeballs-style multi-address racing and no re-resolution mid-tunnel.</li>
+<li>The server-side <code>ConnectUdpPolicy</code>/<code>ConnectIpPolicy</code> traits have no permissive default anywhere in the crate by design — omitting a real policy is a compile-time (constructor-argument) requirement, not a runtime opt-in an application could silently skip.</li>
+<li><code>connect_udp</code>/<code>connect_ip</code> require the <code>h3</code> feature even for an application that only ever wants h1/h2 fallback — the shared <code>connect_auto</code> dial path pulls in <code>hopf-quic</code> regardless of whether a <code>QuicClientConfig</code> is actually supplied at the call site.</li>
+<li>No standalone MASQUE proxy application, and no bundled adapter exposing an accepted tunnel as a SOCKS proxy or a virtual network interface — see <a href="#building-blocks">What &quot;building blocks&quot; means</a>.</li>
+</ul>
+<h2 id="implementation-status">Implementation status</h2>
+<p><strong>Shipped:</strong> RFC 9298 CONNECT-UDP, both server relay and client, feature-complete against the RFC's URI template and Context ID framing, over H1, H2, and H3. RFC 9484 CONNECT-IP's protocol plumbing — target/ipproto parsing including wildcards, Extended CONNECT/Upgrade acceptance, all three RFC 9484 capsule types (<code>ADDRESS_ASSIGN</code>, <code>ADDRESS_REQUEST</code>, <code>ROUTE_ADVERTISEMENT</code>), and the client side — is complete and interop-tested end to end against this crate's own relay (loopback, not against an external MASQUE implementation). Both protocols share <code>hopf-http</code>'s Capsule Protocol/HTTP Datagram machinery and reuse the same Extended-CONNECT/Upgrade acceptance helper (<code>crate::accept</code>).</p>
+<p><strong>Known gaps:</strong> CONNECT-IP ships no actual IP forwarding — that is an explicit non-goal of this crate, not an oversight, per <a href="#building-blocks">What &quot;building blocks&quot; means</a>. No example binaries exist for either protocol. No non-capsule HTTP Datagram fallback. See <a href="#limitations">Limitations</a> for the rest.</p>
+<h2 id="see-also">See also</h2>
+<ul>
+<li><a href="quic-h3.html">QUIC / HTTP/3</a> — the H3 transport CONNECT-UDP/CONNECT-IP dial through, and where the underlying HTTP Datagram/Capsule Protocol demux lives</li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="websocket.html">WebSocket</a> — the other <code>ProtocolUpgradeHandler</code>-based upgrade in the tree</li>
+<li><a href="dns.html">DNS</a> — <code>DnsResolver</code>, used by <code>ConnectUdpFactory</code> to resolve CONNECT-UDP targets</li>
+</ul>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

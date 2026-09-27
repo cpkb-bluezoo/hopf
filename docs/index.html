@@ -32,17 +32,21 @@
 <li><a href="http/server.html">HTTP server</a></li>
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
 <li><a href="ldap.html">LDAP</a></li>
 <li><a href="webdav.html">WebDAV</a></li>
 <li><a href="websocket.html">WebSocket</a></li>
 <li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
 <li><a href="ftp.html">FTP</a></li>
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
-<li><a href="amqp.html">AMQP</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -116,11 +120,11 @@
 <li>one Runtime, one composition script, server and client roles as peers</li>
 <li>dynamic bindings: add and remove listeners and dialers while running</li>
 </ul></li>
-<li><strong>Security substrate (today → AWS-LC in core)</strong>
+<li><strong>Security substrate (AWS-LC in core)</strong>
 <ul>
-<li><strong>Today:</strong> TCP TLS/STARTTLS via <code>hopf-tls</code> + rustls (aws-lc-rs, hybrid-first PQC); QUIC via quinn-proto + in-tree UDP driver; HTTP/3 in-tree. <strong>No DTLS yet.</strong></li>
-<li><strong>Direction:</strong> AWS-LC libcrypto under <code>hopf-core</code>; in-tree TLS, DTLS, and QUIC wire protocols; retire rustls and quinn-proto. See <a href="conformance.html#security-substrate">conformance → Security substrate</a>.</li>
-<li>PQC-first QUIC today: TLS 1.3 only; hybrid <code>X25519MLKEM768</code> offered first (<code>prefer-post-quantum</code>)</li>
+<li>TCP TLS 1.2/1.3 and UDP DTLS 1.2/1.3, both in-tree in <code>hopf-core</code> on AWS-LC (<code>aws-lc-rs</code>); QUIC's RFC 9000 transport and TLS 1.3 handshake in-tree in <code>hopf-quic</code>, also on AWS-LC directly. No <code>rustls</code> or <code>quinn-proto</code> dependency in any production crate — <code>hopf-tls</code> is kept only as a <code>rustls</code>-based interop test harness for <code>hopf-core::tls</code>.</li>
+<li><strong>Remaining:</strong> DTLS's generic <code>Endpoint</code> integration (the handshake/record engine and version negotiation are shipped; no protocol crate dials/listens over DTLS yet), and optional GSSAPI/Kerberos SASL. See <a href="conformance.html#security-substrate">conformance → Security substrate</a>.</li>
+<li>PQC-first QUIC: TLS 1.3 only; hybrid <code>X25519MLKEM768</code> offered first (<code>prefer-post-quantum</code>)</li>
 </ul></li>
 <li><strong>Shared security and policy</strong>
 <ul>
@@ -153,24 +157,23 @@
 <li>Peer ACL (CIDR allow/deny), accept rate limits, quota tracker seam</li>
 <li>Telemetry hook seam (implementations in <code>hopf-otel</code>)</li>
 </ul>
-<h3 id="tls-hopf-tls">TLS (<code>hopf-tls</code>)</h3>
+<h3 id="tls-hopf-tls">TLS (<code>hopf-core::tls</code>)</h3>
 <ul>
-<li><strong>Today:</strong> rustls (aws-lc-rs) for TCP; PEM server and client helpers</li>
+<li>In-tree TLS 1.2/1.3 record layer and handshakes on AWS-LC (<code>aws-lc-rs</code>); PEM server and client helpers (<code>acceptor_from_pem</code>, <code>connector_from_pem</code>, and variants)</li>
 <li>Hybrid-first PQC key exchange: <code>X25519MLKEM768</code> preferred when the peer supports it</li>
 <li>ALPN negotiation surfaced as <code>SecurityInfo</code></li>
 <li>Always-on TLS listeners and STARTTLS on cleartext endpoints</li>
 <li>Shared acceptor/connector configs across protocols</li>
-<li><strong>Planned:</strong> in-tree TLS 1.2/1.3 on AWS-LC in core; retire rustls — see <a href="tls.html#roadmap">TLS roadmap</a></li>
+<li>No <code>rustls</code> dependency in this path — <code>hopf-tls</code> is kept only as a <code>rustls</code>-based interop test harness for <code>hopf-core::tls</code>, not a production dependency of any crate</li>
 </ul>
 <h3 id="quic-and-http3-hopf-quic-hopf-http">QUIC and HTTP/3 (<code>hopf-quic</code>, <code>hopf-http</code>)</h3>
 <ul>
-<li><strong>Today:</strong> QUIC listen and dial (quinn-proto + dedicated mio UDP driver)</li>
+<li>In-tree RFC 9000 transport and RFC 9001 TLS 1.3 handshake, both in <code>hopf-quic</code> on AWS-LC directly — no <code>quinn-proto</code> or other external QUIC/TLS library dependency, plus a dedicated mio UDP driver</li>
 <li>Each bidirectional QUIC stream is an <code>Endpoint</code></li>
 <li>HTTP/3 server and client (RFC 9114) with in-tree QPACK (RFC 9204)</li>
 <li>ALPN <code>h3</code></li>
-<li><strong>PQC-first processing:</strong> QUIC crypto is TLS 1.3-only (RFC 9001) via the shared <code>hopf_tls::tls_crypto_provider()</code>. There is no TLS 1.2 fallback on the QUIC path. Key exchange offers hybrid ML-KEM (<code>X25519MLKEM768</code>) first, then classical groups if the peer cannot do PQC</li>
+<li><strong>PQC-first processing:</strong> QUIC crypto is TLS 1.3-only (RFC 9001), driven by the same in-tree handshake engine TCP TLS 1.3 uses. There is no TLS 1.2 fallback on the QUIC path. Key exchange offers hybrid ML-KEM (<code>X25519MLKEM768</code>) first, then classical groups if the peer cannot do PQC</li>
 <li>Connection-level hooks for control / unidirectional streams</li>
-<li><strong>Planned:</strong> in-tree RFC 9000 transport and RFC 9001 handshake (retire quinn-proto) — see <a href="quic-h3.html#implementation-status">QUIC implementation status</a></li>
 </ul>
 <h3 id="http-hopf-http">HTTP (<code>hopf-http</code>)</h3>
 <ul>
@@ -188,7 +191,7 @@
 <ul>
 <li>RFC 4918 Class 1+2 filesystem handler for Hopf HTTP servers</li>
 <li>PROPFIND / PROPPATCH / MKCOL / COPY / MOVE / LOCK / UNLOCK</li>
-<li>Dead properties (xattr / sidecar / none) and in-process locks</li>
+<li>Dead properties (xattr / sidecar / none) and in-process locks, or file-backed shared locks / mirrored sidecar tree via <code>lock_root</code> / <code>sidecar_root</code></li>
 <li>GET/HEAD/PUT/DELETE with optional write; welcome files</li>
 <li>Filesystem work on <code>StorageExecutor</code></li>
 </ul>
@@ -218,20 +221,32 @@
 </ul>
 <h3 id="mdns-hopf-mdns">mDNS / DNS-SD (<code>hopf-mdns</code>)</h3>
 <ul>
-<li>Multicast DNS (RFC 6762) and DNS-SD (RFC 6763) on UDP</li>
-<li>Standalone crate; optional umbrella feature <code>mdns</code></li>
+<li>Multicast DNS responder (RFC 6762): probing with simultaneous-probe tie-break and automatic rename on conflict, announcing with cache-flush, known-answer suppression, unicast (QU) reply support, goodbye on shutdown/drop</li>
+<li>Multicast DNS querier: one-shot and periodic queries backed by an active TTL-fraction-refresh cache (RFC 6762 §5.2) with cache-flush and goodbye grace-period handling (§10.1/§10.2)</li>
+<li>DNS-SD (RFC 6763): <code>register_service</code>/<code>browse</code> push-based API — PTR/SRV/TXT publication, the <code>_services._dns-sd._udp</code> meta-query, TXT attribute codec</li>
+<li>Reuses <code>hopf-dns</code>'s wire types directly (no parallel DNS codec); IPv4 only (no <code>ff02::fb</code>)</li>
+<li>Standalone crate; optional umbrella feature <code>mdns</code> (pulls in <code>dns</code>)</li>
 </ul>
 <h3 id="masque-hopf-masque">MASQUE (<code>hopf-masque</code>)</h3>
 <ul>
-<li>RFC 9298 CONNECT-UDP and CONNECT-IP building blocks on HTTP/3</li>
-<li>Standalone crate; optional umbrella features <code>masque</code>, <code>masque-h3</code></li>
+<li>RFC 9298 CONNECT-UDP (full server relay + client) and RFC 9484 CONNECT-IP (accept/capsule plumbing; app supplies IP forwarding) over HTTP/1.1, HTTP/2, and HTTP/3</li>
+<li>Standalone crate; optional umbrella feature <code>masque</code>, <code>masque-h3</code> (client dial helpers only need <code>h3</code>)</li>
 </ul>
 <h3 id="socks-hopf-socks">SOCKS (<code>hopf-socks</code>)</h3>
 <ul>
 <li>SOCKS4, SOCKS4a, SOCKS5 (RFC 1928): CONNECT, BIND, UDP ASSOCIATE</li>
-<li>Server and client; RFC 1929 username/password auth</li>
+<li>Server and client for all three commands (BIND and UDP ASSOCIATE clients go beyond SOCKS's usual CONNECT-only client scope, added for symmetry with the server)</li>
+<li>RFC 1929 username/password auth, server and client</li>
 <li>RFC 1961 GSSAPI auth not implemented — planned with optional GSSAPI in <code>hopf-auth</code></li>
 <li>Optional umbrella feature <code>socks</code></li>
+</ul>
+<h3 id="ldap-hopf-ldap">LDAP (<code>hopf-ldap</code>)</h3>
+<ul>
+<li>Async LDAPv3 client (RFC 4511) and <code>LdapCredentialStore</code>; no directory/server side</li>
+<li>Bind (simple, anonymous), search (RFC 4515 filters), unbind; definite-length BER codec</li>
+<li>LDAPS (implicit TLS) and StartTLS (RFC 4511 §4.14); referral chase (RFC 4516, opt-in)</li>
+<li>Content synchronization client side (RFC 4533): RefreshOnly/RefreshAndPersist, cookie resume, present/delete phase convergence</li>
+<li><code>LdapCredentialStore</code> does search-then-bind for PLAIN/LOGIN; no SASL bind to the directory, no admin API (modify/add/delete/compare)</li>
 </ul>
 <h3 id="ftp-hopf-ftp">FTP (<code>hopf-ftp</code>)</h3>
 <ul>
@@ -259,6 +274,7 @@
 <ul>
 <li>IMAP4rev2 / IMAPS server (RFC 9051) over <code>hopf-mailbox</code>; staged handler SPI</li>
 <li>IDLE, UIDPLUS, MOVE, NAMESPACE, ENABLE / CONDSTORE / QRESYNC, UNSELECT, ID, LIST-EXTENDED / LIST-STATUS, QUOTA</li>
+<li>COMPRESS=DEFLATE, UTF8=ACCEPT, SORT, THREAD (ORDEREDSUBJECT / REFERENCES), STATUS=SIZE, OBJECTID, METADATA, NOTIFY (SELECTED-mailbox subset)</li>
 <li>Storage work on the pool; pipelined commands queued and answered in order</li>
 <li>Async client: <code>ImapClient</code> + <code>ImapFetch</code> / <code>ImapIdle</code> auto-pilots; tag-correlated pipelining, STARTTLS/IMAPS, production IDLE</li>
 </ul>
@@ -270,7 +286,7 @@
 <li>Async client: <code>MqttClient</code> + <code>MqttClientDriver</code> callbacks</li>
 <li>Optional MQTT-over-WebSocket bridge (<code>websocket</code> feature) sharing broker state with the TCP listener</li>
 </ul>
-<h3 id="amqp-hopf-amqp">AMQP (<code>hopf-amqp</code>)</h3>
+<h3 id="amqp-hopf-amqp">AMQP 0-9-1 (<code>hopf-amqp</code>)</h3>
 <ul>
 <li>AMQP 0-9-1 async client (RabbitMQ wire protocol); client-only — no broker in this crate</li>
 <li>Connection handshake (<code>PLAIN</code> / <code>AMQPLAIN</code>), tune negotiation, heartbeats</li>
@@ -279,6 +295,16 @@
 <li><code>basic.consume</code> push deliveries (ack / nack / reject / qos)</li>
 <li>AMQPS via implicit TLS on dial; DNS via <code>hopf-dns</code></li>
 <li>Umbrella Cargo feature <code>amqp</code> (<code>hopf::amqp</code>)</li>
+</ul>
+<h3 id="amqp1-hopf-amqp1">AMQP 1.0 (<code>hopf-amqp1</code>)</h3>
+<ul>
+<li>AMQP 1.0 (ISO/IEC 19464) async client; separate crate from <code>hopf-amqp</code> — shares only the <code>AMQP</code> wire magic, framing/types/session model are unrelated. Client-only — no broker</li>
+<li>SASL PLAIN (when credentials configured) or ANONYMOUS, auto-negotiated</li>
+<li>Connection open, sessions (begin/end), sender/receiver links (attach/detach); session flow control and link credit</li>
+<li>Sending header/properties/application-properties/data, auto-split across <code>transfer</code> frames for large messages; receiving streamed incrementally as transfers arrive</li>
+<li>Delivery settlement (accept/reject/release/modify) and outcome notifications</li>
+<li>AMQPS via implicit TLS on dial; DNS via <code>hopf-dns</code></li>
+<li>Umbrella Cargo feature <code>amqp1</code> (<code>hopf::amqp1</code>)</li>
 </ul>
 <h3 id="mailbox-hopf-mailbox">Mailbox (<code>hopf-mailbox</code>)</h3>
 <ul>
@@ -403,6 +429,20 @@
 <td>client-only (RabbitMQ); AMQPS</td>
 </tr>
 <tr>
+<td>AMQP 1.0</td>
+<td><code>hopf-amqp1</code></td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+<td>client-only (ISO/IEC 19464); separate crate from <code>hopf-amqp</code>; AMQPS</td>
+</tr>
+<tr>
+<td>LDAP</td>
+<td><code>hopf-ldap</code></td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+<td>client-only; LDAPS/StartTLS; RFC 4533 content sync</td>
+</tr>
+<tr>
 <td>Mailbox storage</td>
 <td><code>hopf-mailbox</code></td>
 <td style="text-align: center;">SPI</td>
@@ -419,9 +459,9 @@
 <tr>
 <td>MASQUE</td>
 <td><code>hopf-masque</code></td>
-<td style="text-align: center;">partial</td>
-<td style="text-align: center;">partial</td>
-<td>CONNECT-UDP / CONNECT-IP on H3</td>
+<td style="text-align: center;">✓</td>
+<td style="text-align: center;">✓</td>
+<td>CONNECT-UDP full relay; CONNECT-IP is app-driven plumbing; H1/H2/H3</td>
 </tr>
 <tr>
 <td>SOCKS</td>
@@ -435,14 +475,14 @@
 <td><code>hopf-quic</code></td>
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
-<td>Endpoint per stream; quinn-proto today; in-tree RFC 9000 planned</td>
+<td>Endpoint per stream; in-tree RFC 9000 transport, no external QUIC library</td>
 </tr>
 <tr>
-<td>TLS</td>
-<td><code>hopf-tls</code></td>
+<td>TLS / DTLS</td>
+<td><code>hopf-core</code></td>
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
-<td>rustls aws-lc-rs today; in-tree TLS on AWS-LC planned</td>
+<td>in-tree TLS 1.2/1.3 and DTLS 1.2/1.3 on AWS-LC; <code>hopf-tls</code> is now a rustls interop test harness only</td>
 </tr>
 </tbody>
 </table>

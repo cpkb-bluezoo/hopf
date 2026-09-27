@@ -32,17 +32,21 @@
 <li><a href="http/server.html">HTTP server</a></li>
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
 <li><a href="ldap.html">LDAP</a></li>
 <li><a href="webdav.html">WebDAV</a></li>
 <li><a href="websocket.html">WebSocket</a></li>
 <li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
 <li><a href="ftp.html">FTP</a></li>
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
-<li><a href="amqp.html">AMQP</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -71,9 +75,9 @@
     <main class="main">
       <header>
         <h1>TLS</h1>
-        <p class="lead">Crate <code>hopf-tls</code>: <strong>rustls</strong> glue implementing the <code>hopf-core</code> TLS seam (<code>TlsAcceptor</code> / <code>TlsConnector</code> / <code>TlsSession</code>). Protocol handlers always see <strong>plaintext</strong> — encryption is under the <code>Endpoint</code>. Supports TLS-from-accept and STARTTLS. ALPN, PEM load, and negotiated <code>SecurityInfo</code> are exposed.</p>
+        <p class="lead"><code>hopf-core::tls</code>: an <strong>in-tree</strong> TLS 1.2 (RFC 5246) and TLS 1.3 (RFC 8446) implementation — handshake state machines and record layers built directly on <strong>AWS-LC</strong> (via <code>aws-lc-rs</code>), with no <code>rustls</code> anywhere in the path. The module implements its own <code>TlsAcceptor</code> / <code>TlsConnector</code> factory traits and produces a <code>TlsVariant</code> session that <code>TcpConnection</code> drives through the sink-based <code>TlsRecordSink</code> interface. Protocol handlers always see <strong>plaintext</strong> — encryption is under the <code>Endpoint</code>. Supports TLS-from-accept and STARTTLS, one-port 1.2/1.3 version negotiation, hybrid post-quantum key exchange, ALPN, mutual TLS, session tickets, Encrypted Client Hello, and certificate compression.</p>
       </header>
-      <p>QUIC/TLS 1.3 for HTTP/3 lives in <a href="quic-h3.html"><code>hopf-quic</code></a> and is <strong>PQC-first</strong> (TLS 1.3 only, hybrid <code>X25519MLKEM768</code> offered first). This crate covers TCP TLS (1.2 + 1.3, same crypto provider).</p>
+      <p>QUIC/TLS 1.3 for HTTP/3 lives in <a href="quic-h3.html"><code>hopf-quic</code></a> and is <strong>PQC-first</strong> (TLS 1.3 only, hybrid <code>X25519MLKEM768</code> offered first) — it also runs on the same in-tree AWS-LC foundation, with no separate TLS record layer (QUIC packet protection replaces it). This page covers TCP TLS (1.2 + 1.3, same crypto provider and key-exchange policy).</p>
 <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#standards">Standards</a></li>
@@ -84,7 +88,7 @@
 <li><a href="#securityinfo">SecurityInfo</a></li>
 <li><a href="#examples">Examples</a></li>
 <li><a href="#limitations">Limitations</a></li>
-<li><a href="#roadmap">Roadmap</a></li>
+<li><a href="#hopf-tls-interop">hopf-tls: interop test harness</a></li>
 </ul></div>
 <h2 id="standards">Standards</h2>
 <table>
@@ -97,83 +101,103 @@
 <tbody>
 <tr>
 <td>TLS</td>
-<td>1.2 + 1.3 via rustls (<strong>aws-lc-rs</strong> provider, hybrid-first PQC KX)</td>
+<td>1.2 (RFC 5246) + 1.3 (RFC 8446), in-tree handshake + record engines on <strong>AWS-LC</strong> (<code>aws-lc-rs</code>); AEAD-only cipher suites (AES-GCM, ChaCha20-Poly1305) — no CBC, permanent exclusion</td>
+</tr>
+<tr>
+<td>Version selection</td>
+<td><code>TcpTlsVersionPolicy</code>: <code>Negotiate</code> (default — buffers the first flight, prefers 1.3, falls back to 1.2), <code>Tls13Only</code>, <code>Tls12Only</code></td>
+</tr>
+<tr>
+<td>Key exchange</td>
+<td>Hybrid PQC first (RFC 10024): <code>X25519MLKEM768</code> preferred, <code>SecP256r1MLKEM768</code> / <code>SecP384r1MLKEM1024</code> as alternatives, classical X25519/P-256/P-384 fallback</td>
 </tr>
 <tr>
 <td>ALPN</td>
-<td>e.g. <code>h2</code>, <code>http/1.1</code></td>
+<td>RFC 7301, e.g. <code>h2</code>, <code>http/1.1</code> — TLS 1.2 and TLS 1.3 alike</td>
+</tr>
+<tr>
+<td>Session resumption</td>
+<td>RFC 5077 / RFC 8446 §2.2 tickets on both versions, PSK-DHE only on TLS 1.3 (forward secrecy on resumption); <code>TicketKeys</code> keyring with in-place rotation</td>
+</tr>
+<tr>
+<td>Encrypted Client Hello</td>
+<td>RFC 9849, TLS 1.3 only, shared mode (client + server)</td>
+</tr>
+<tr>
+<td>Certificate compression</td>
+<td>RFC 8879, Brotli, TLS 1.3 only</td>
 </tr>
 <tr>
 <td>PEM</td>
-<td>PKCS#8 / RSA via <code>rustls-pemfile</code></td>
+<td>PKCS#8 private keys only (<code>BEGIN PRIVATE KEY</code>); RSA, ECDSA P-256/P-384, or Ed25519 certificates. Re-encode legacy PKCS#1/SEC1 keys with <code>openssl pkcs8 -topk8 -nocrypt</code></td>
 </tr>
 <tr>
 <td>Patterns</td>
-<td>TLS-from-accept; STARTTLS (<code>Endpoint::start_tls</code>)</td>
+<td>TLS-from-accept; STARTTLS (<code>Endpoint::start_tls</code> / <code>start_client_tls</code>)</td>
 </tr>
 </tbody>
 </table>
+<p>Full requirement-by-requirement status, including gaps: <a href="conformance.html#tls">Conformance → TLS</a>.</p>
 <h2 id="architecture">Architecture</h2>
 <pre><code>TcpListenerConfig / TcpConnectorConfig
-        │  SharedTlsAcceptor / SharedTlsConnector
+        │  SharedTlsAcceptor / SharedTlsConnector   (hopf-core::tls::pem)
         ▼
-hopf-tls (RustlsAcceptor / RustlsConnector / Rustls*Session)
-        │
+TlsVariant::V13(TlsRecordEngine)        — HandshakeEngine + TLS 1.3 record layer
+TlsVariant::V12(Tls12RecordEngine)      — tls12::Tls12Engine + TLS 1.2 record layer
+TlsVariant::Negotiating(..)             — buffers the first flight, picks 1.3 or 1.2, then delegates
+        │  driven via TlsRecordSink (TcpConnection is the sink)
         ▼
 Endpoint  →  ProtocolHandler sees plaintext
              security_info() after handshake</code></pre>
-<p>Internal types implement core traits; callers use free functions returning <code>SharedTlsAcceptor</code> / <code>SharedTlsConnector</code> (<code>Arc</code>).</p>
+<p>There is no separate adapter crate in this path: <code>PemAcceptor</code> / <code>SniAcceptor</code> / <code>TrustedConnector</code> and their TLS-1.2 counterparts (private types in <code>hopf-core/src/tls/pem.rs</code>) implement the crate's own <code>TlsAcceptor</code> / <code>TlsConnector</code> traits directly; the PEM helper functions just return them as <code>Arc&lt;dyn TlsAcceptor&gt;</code> / <code>Arc&lt;dyn TlsConnector&gt;</code> (<code>SharedTlsAcceptor</code> / <code>SharedTlsConnector</code>).</p>
+<p><code>TlsVariant</code> is a thin enum, not a trait object: <code>V13</code> wraps <code>TlsRecordEngine</code> (<code>tls/record.rs</code>), which frames <code>HandshakeEngine</code>'s (<code>tls/engine.rs</code>) handshake messages into TLS 1.3 records and does the AEAD sealing/opening; <code>V12</code> wraps <code>tls12::Tls12RecordEngine</code> (<code>tls/tls12/record.rs</code>) around <code>tls12::Tls12Engine</code> (<code>tls/tls12/engine.rs</code>) the same way for TLS 1.2/RFC 5246. Both record engines expose the same method set and consume the same <code>TlsRecordSink</code>, so <code>TcpConnection</code> pumps whichever one it got without caring which version is underneath.</p>
+<p>The default PEM builders (<code>acceptor_from_pem</code> / <code>connector_from_pem</code>) produce <code>TlsVariant::Negotiating</code>: the server buffers the first flight until a complete <code>ClientHello</code> is seen, inspects its <code>supported_versions</code> (falling back to the legacy version field) to pick 1.3 or 1.2 (preferring 1.3), materializes the matching engine, and replays the buffered bytes into it — the same approach on the client side, keyed off the first <code>ServerHello</code>. One TCP connection speaks exactly one version for its life; there is no mid-connection renegotiation. Pin a fixed version with <code>*_with_tcp_version_policy</code> or the <code>*_tls12</code> builders instead of negotiating.</p>
+<p><code>hopf-core::dtls</code> and <code>hopf-core::dtls12</code> reuse this same <code>HandshakeEngine</code> / <code>tls12::Tls12Engine</code> machinery over UDP with their own DTLS record/reassembly layer and a parallel <code>DtlsVersionPolicy</code> — see <a href="architecture.html#security-substrate">Architecture → Security substrate</a> and <a href="#limitations">Limitations</a> below; they are not reachable through this page's <code>TlsAcceptor</code>/<code>TlsConnector</code>/<code>TlsVariant</code> types.</p>
 <h2 id="public-api">Public API</h2>
-<div class="sourceCode" id="cb2"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::path::</span><span class="dt">Path</span><span class="op">;</span></span>
-<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
-<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_tls::</span><span class="op">{</span></span>
-<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    acceptor<span class="op">,</span> acceptor_from_pem<span class="op">,</span> client_config_from_pem<span class="op">,</span> connector<span class="op">,</span></span>
-<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>    connector_for_certified_pem<span class="op">,</span> connector_from_pem<span class="op">,</span> server_config_from_pem<span class="op">,</span></span>
-<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
-<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="co">// Server</span></span>
-<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> server_cfg <span class="op">=</span> server_config_from_pem(</span>
-<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;cert.pem&quot;</span>)<span class="op">,</span></span>
-<span id="cb2-11"><a href="#cb2-11" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;key.pem&quot;</span>)<span class="op">,</span></span>
-<span id="cb2-12"><a href="#cb2-12" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>[<span class="st">b&quot;h2&quot;</span><span class="op">,</span> <span class="st">b&quot;http/1.1&quot;</span>]<span class="op">,</span></span>
-<span id="cb2-13"><a href="#cb2-13" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span>
-<span id="cb2-14"><a href="#cb2-14" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> acceptor <span class="op">=</span> acceptor(server_cfg)<span class="op">;</span></span>
-<span id="cb2-15"><a href="#cb2-15" aria-hidden="true" tabindex="-1"></a><span class="co">// or: acceptor_from_pem(cert, key, alpn)?</span></span>
-<span id="cb2-16"><a href="#cb2-16" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-17"><a href="#cb2-17" aria-hidden="true" tabindex="-1"></a><span class="co">// Client</span></span>
-<span id="cb2-18"><a href="#cb2-18" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> client_cfg <span class="op">=</span> client_config_from_pem(<span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;ca.pem&quot;</span>)<span class="op">,</span> <span class="op">&amp;</span>[<span class="st">b&quot;h2&quot;</span><span class="op">,</span> <span class="st">b&quot;http/1.1&quot;</span>])<span class="op">?;</span></span>
-<span id="cb2-19"><a href="#cb2-19" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> connector <span class="op">=</span> connector(client_cfg)<span class="op">;</span></span>
-<span id="cb2-20"><a href="#cb2-20" aria-hidden="true" tabindex="-1"></a><span class="co">// or: connector_from_pem(ca, alpn)?</span></span>
-<span id="cb2-21"><a href="#cb2-21" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb2-22"><a href="#cb2-22" aria-hidden="true" tabindex="-1"></a><span class="co">// Dangerous: trust a single leaf (self-signed smoke tests only)</span></span>
-<span id="cb2-23"><a href="#cb2-23" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> connector <span class="op">=</span> connector_for_certified_pem(<span class="dt">Path</span><span class="pp">::</span>new(<span class="st">&quot;leaf.pem&quot;</span>)<span class="op">,</span> <span class="op">&amp;</span>[<span class="st">b&quot;http/1.1&quot;</span>])<span class="op">?;</span></span></code></pre></div>
-<h3 id="virtual-hosting-and-mtls">Virtual hosting (SNI) and mutual TLS</h3>
-<pre class="rust,ignore"><code>use hopf_tls::{acceptor_with_sni_certs, acceptor_with_client_auth, client_config_with_identity};
+<pre class="rust,ignore"><code>use std::path::Path;
+use hopf_core::{
+    acceptor_from_pem, connector_from_pem, server_credentials_from_pem,
+    acceptor_from_pem_with_client_auth, connector_from_pem_with_client_cert,
+    ClientAuthPolicy,
+};
 
-// One listener, one cert per hostname, dispatched by client SNI.
-let acceptor = acceptor_with_sni_certs(
-    &amp;[
-        (&quot;a.example.com&quot;, Path::new(&quot;a-cert.pem&quot;), Path::new(&quot;a-key.pem&quot;)),
-        (&quot;b.example.com&quot;, Path::new(&quot;b-cert.pem&quot;), Path::new(&quot;b-key.pem&quot;)),
-    ],
-    &amp;[b&quot;h2&quot;, b&quot;http/1.1&quot;],
+// Server
+let acceptor = acceptor_from_pem(
+    Path::new("cert.pem"),
+    Path::new("key.pem"),
+    &[b"h2", b"http/1.1"],
 )?;
-// A hostname with no matching entry (or no SNI at all) fails the handshake —
-// include every hostname you intend to serve.
 
-// Require a client certificate, verified against client_roots.pem.
-let acceptor = acceptor_with_client_auth(
-    Path::new(&quot;cert.pem&quot;), Path::new(&quot;key.pem&quot;),
-    Path::new(&quot;client_roots.pem&quot;), /* required = */ true, &amp;[],
+// Client
+let connector = connector_from_pem(Path::new("ca.pem"), &[b"h2", b"http/1.1"])?;
+
+// Mutual TLS: server requires a client certificate, verified against client_roots.pem.
+let acceptor = acceptor_from_pem_with_client_auth(
+    Path::new("cert.pem"), Path::new("key.pem"),
+    &[b"h2", b"http/1.1"], ClientAuthPolicy::Require,
+    Path::new("client_roots.pem"),
 )?;
-// Pass `required = false` for opportunistic mTLS — check
+// ClientAuthPolicy::Request is opportunistic mTLS — check
 // SecurityInfo::peer_certificate_fingerprint() to see whether a client cert
 // was actually presented on a given connection.
 
 // Client side: present an identity certificate for mTLS.
-let client_cfg = client_config_with_identity(
-    Path::new(&quot;ca.pem&quot;), Path::new(&quot;client-cert.pem&quot;), Path::new(&quot;client-key.pem&quot;), &amp;[],
+let connector = connector_from_pem_with_client_cert(
+    Path::new("ca.pem"), Path::new("client-cert.pem"), Path::new("client-key.pem"), &[],
 )?;</code></pre>
+<h3 id="virtual-hosting-and-mtls">Virtual hosting (SNI)</h3>
+<pre class="rust,ignore"><code>use hopf_core::{acceptor_from_pem_with_sni, server_credentials_from_pem};
+
+// One listener, one cert per hostname, dispatched by client SNI.
+// `default_cert_path`/`default_key_path` back an unmatched or absent SNI.
+let b_creds = server_credentials_from_pem(Path::new("b-cert.pem"), Path::new("b-key.pem"))?;
+let acceptor = acceptor_from_pem_with_sni(
+    Path::new("a-cert.pem"), Path::new("a-key.pem"),
+    [("b.example.com".to_string(), b_creds)],
+    &[b"h2", b"http/1.1"],
+)?;
+// A hostname with no matching entry (or no SNI at all) falls back to the
+// default credentials rather than failing the handshake.</code></pre>
 <table>
 <colgroup>
 <col style="width: 38%" />
@@ -189,55 +213,95 @@ let client_cfg = client_config_with_identity(
 </thead>
 <tbody>
 <tr>
-<td><code>server_config_from_pem</code></td>
-<td><code>Arc&lt;ServerConfig&gt;</code></td>
-<td><code>with_single_cert</code>; no client auth</td>
+<td><code>server_credentials_from_pem</code></td>
+<td><code>io::Result&lt;ServerCredentials&gt;</code></td>
+<td>Cert chain + PKCS#8 key, shared by every acceptor builder below</td>
 </tr>
 <tr>
-<td><code>acceptor</code> / <code>acceptor_from_pem</code></td>
+<td><code>acceptor_from_pem</code></td>
 <td><code>SharedTlsAcceptor</code></td>
-<td></td>
+<td>Default <code>TcpTlsVersionPolicy::Negotiate</code> (prefers 1.3)</td>
 </tr>
 <tr>
-<td><code>client_config_from_pem</code></td>
-<td><code>Arc&lt;ClientConfig&gt;</code></td>
-<td><code>with_no_client_auth</code> root store</td>
+<td><code>acceptor_from_pem_with_tcp_version_policy</code></td>
+<td><code>SharedTlsAcceptor</code></td>
+<td>Pin <code>Tls13Only</code> / <code>Tls12Only</code> instead of negotiating</td>
 </tr>
 <tr>
-<td><code>connector</code> / <code>connector_from_pem</code></td>
+<td><code>acceptor_from_pem_with_sni</code></td>
+<td><code>SharedTlsAcceptor</code></td>
+<td>Default + hostname-keyed credential map; virtual hosting</td>
+</tr>
+<tr>
+<td><code>acceptor_from_pem_with_client_auth</code></td>
+<td><code>SharedTlsAcceptor</code></td>
+<td>mTLS; <code>ClientAuthPolicy::Request</code>/<code>Require</code> toggles opportunistic vs mandatory</td>
+</tr>
+<tr>
+<td><code>acceptor_from_pem_tls12</code> / <code>_with_client_auth</code></td>
+<td><code>SharedTlsAcceptor</code></td>
+<td>TLS 1.2 only, explicit legacy interop; RSA/ECDSA P-256/P-384/Ed25519</td>
+</tr>
+<tr>
+<td><code>connector_from_pem</code></td>
 <td><code>SharedTlsConnector</code></td>
-<td></td>
+<td>Trusts the given PEM CA/leaf; default <code>Negotiate</code></td>
 </tr>
 <tr>
-<td><code>connector_for_certified_pem</code></td>
+<td><code>connector_from_pem_with_tcp_version_policy</code></td>
 <td><code>SharedTlsConnector</code></td>
-<td><strong>Dangerous</strong> single-leaf trust</td>
+<td>Pin <code>Tls13Only</code> / <code>Tls12Only</code></td>
 </tr>
 <tr>
-<td><code>server_config_with_resolver</code> / <code>acceptor_with_resolver</code></td>
-<td><code>Arc&lt;ServerConfig&gt;</code> / <code>SharedTlsAcceptor</code></td>
-<td>Any <code>rustls::server::ResolvesServerCert</code> — custom per-connection cert dispatch</td>
+<td><code>connector_from_pem_with_client_cert</code></td>
+<td><code>SharedTlsConnector</code></td>
+<td>mTLS: presents a client identity cert when asked</td>
 </tr>
 <tr>
-<td><code>server_config_with_sni_certs</code> / <code>acceptor_with_sni_certs</code></td>
-<td><code>Arc&lt;ServerConfig&gt;</code> / <code>SharedTlsAcceptor</code></td>
-<td>PEM triples keyed by hostname, via <code>ResolvesServerCertUsingSni</code>; virtual hosting</td>
+<td><code>connector_from_pem_tls12</code> / <code>_with_client_cert</code></td>
+<td><code>SharedTlsConnector</code></td>
+<td>TLS 1.2 only</td>
 </tr>
 <tr>
-<td><code>server_config_with_client_auth</code> / <code>acceptor_with_client_auth</code></td>
-<td><code>Arc&lt;ServerConfig&gt;</code> / <code>SharedTlsAcceptor</code></td>
-<td>mTLS via <code>WebPkiClientVerifier</code>; <code>required: bool</code> toggles mandatory vs opportunistic</td>
+<td><code>connector_with_verify_override</code></td>
+<td><code>SharedTlsConnector</code></td>
+<td>Fully custom server-chain verification (e.g. DANE TLSA) instead of a fixed root set</td>
 </tr>
 <tr>
-<td><code>client_config_with_identity</code> / <code>connector_with_identity</code></td>
-<td><code>Arc&lt;ClientConfig&gt;</code> / <code>SharedTlsConnector</code></td>
-<td>Presents a client identity cert for mTLS via <code>with_client_auth_cert</code></td>
+<td><code>public_trust_connector</code></td>
+<td><code>SharedTlsConnector</code></td>
+<td>Public WebPKI trust — native OS store, vendored <code>webpki-roots</code> fallback</td>
+</tr>
+<tr>
+<td><code>insecure_connector</code> / <code>insecure_connector_tls12</code></td>
+<td><code>SharedTlsConnector</code></td>
+<td><strong>Dangerous</strong>: accepts any certificate, no validation — opportunistic STARTTLS only</td>
+</tr>
+<tr>
+<td><code>acceptor_with_alpn</code> / <code>connector_with_alpn</code></td>
+<td>Wraps a <code>SharedTlsAcceptor</code>/<code>SharedTlsConnector</code></td>
+<td>Adds/overrides ALPN on any acceptor or connector — the only way to give the <code>*_tls12</code> builders a protocol list</td>
+</tr>
+<tr>
+<td><code>acceptor_with_record_size_limit</code> / <code>connector_with_record_size_limit</code></td>
+<td>Wraps a <code>SharedTlsAcceptor</code>/<code>SharedTlsConnector</code></td>
+<td>RFC 8449 <code>record_size_limit</code>; TLS 1.3 only</td>
+</tr>
+<tr>
+<td><code>acceptor_with_ech</code> / <code>connector_with_ech</code></td>
+<td>Wraps a <code>SharedTlsAcceptor</code>/<code>SharedTlsConnector</code></td>
+<td>RFC 9849 Encrypted Client Hello; TLS 1.3 only</td>
+</tr>
+<tr>
+<td><code>acceptor_requiring_supported_versions</code></td>
+<td>Wraps a <code>SharedTlsAcceptor</code></td>
+<td>Refuse a TLS 1.2 <code>ClientHello</code> missing <code>supported_versions</code> (RFC 9846 §1.4); TLS 1.3 unaffected</td>
 </tr>
 </tbody>
 </table>
-<p>Sessions support <code>send_close_notify</code> via the core <code>TlsSession</code> trait.</p>
+<p>Sessions support <code>send_close_notify</code> via <code>TlsVariant</code>'s inherent methods, driven the same way on both TLS versions.</p>
 <h2 id="configuration">Configuration</h2>
-<p>There are <strong>no numeric knobs</strong> in <code>hopf-tls</code> itself. Versions and cipher suites come from rustls defaults (aws-lc-rs, TLS 1.2 + 1.3 enabled). Key exchange prefers the hybrid post-quantum group <code>X25519MLKEM768</code> when the peer supports it (rustls <code>prefer-post-quantum</code>). <a href="quic-h3.html#pqc-first-tls-13">QUIC</a> uses the same provider but pins TLS 1.3, so every QUIC handshake is PQC-first with no 1.2 fallback.</p>
+<p>The PEM builders take no numeric knobs beyond what's listed below; everything else is a fixed, spec-conformant default. Key exchange always prefers the hybrid post-quantum group <code>X25519MLKEM768</code> when the peer supports it, falling back through <code>SecP256r1MLKEM768</code> / <code>SecP384r1MLKEM1024</code> to classical curves — this isn't a caller-adjustable setting via the PEM helpers. <a href="quic-h3.html#pqc-first-tls-13">QUIC</a> uses the same crypto provider but pins TLS 1.3, so every QUIC handshake is PQC-first with no 1.2 fallback.</p>
 <table>
 <thead>
 <tr>
@@ -250,12 +314,12 @@ let client_cfg = client_config_with_identity(
 <tr>
 <td>Certificate PEM path</td>
 <td><code>&amp;Path</code></td>
-<td>Server leaf (+ chain as presented)</td>
+<td>Server leaf (+ chain as presented); RSA, ECDSA P-256/P-384, or Ed25519</td>
 </tr>
 <tr>
 <td>Private key PEM path</td>
 <td><code>&amp;Path</code></td>
-<td>PKCS#8 or RSA</td>
+<td>PKCS#8 only (<code>BEGIN PRIVATE KEY</code>)</td>
 </tr>
 <tr>
 <td>CA PEM path</td>
@@ -265,44 +329,52 @@ let client_cfg = client_config_with_identity(
 <tr>
 <td>ALPN</td>
 <td><code>&amp;[&amp;[u8]]</code></td>
-<td>e.g. <code>b"h2"</code>, <code>b"http/1.1"</code></td>
+<td>e.g. <code>b"h2"</code>, <code>b"http/1.1"</code></td>
+</tr>
+<tr>
+<td>Version policy</td>
+<td><code>TcpTlsVersionPolicy</code></td>
+<td><code>Negotiate</code> (default) / <code>Tls13Only</code> / <code>Tls12Only</code>, via the <code>*_with_tcp_version_policy</code> builders</td>
+</tr>
+<tr>
+<td>Client-auth policy</td>
+<td><code>ClientAuthPolicy</code></td>
+<td><code>None</code> (default) / <code>Request</code> / <code>Require</code></td>
+</tr>
+<tr>
+<td>Session tickets</td>
+<td><code>TicketKeys</code></td>
+<td>Not wired into the simple PEM builders — build a <code>HandshakeConfig</code>/<code>Tls12Config</code> directly (see <code>tls::HandshakeConfig::ticket_key</code> / <code>tls::Tls12Config::ticket_key</code>) to enable resumption; <code>TicketKeys::rotate</code> rotates the sealing key without breaking tickets minted just before rotation</td>
+</tr>
+<tr>
+<td>Encrypted Client Hello</td>
+<td><code>EchClientConfig</code> / <code>EchServerConfig</code></td>
+<td>Via <code>acceptor_with_ech</code> / <code>connector_with_ech</code>, or <code>HandshakeConfig::ech_client</code>/<code>ech_server</code> directly; TLS 1.3 only</td>
+</tr>
+<tr>
+<td>Record size limit</td>
+<td><code>u16</code> (64..=16385)</td>
+<td>Via <code>acceptor_with_record_size_limit</code> / <code>connector_with_record_size_limit</code>; RFC 8449, TLS 1.3 only</td>
 </tr>
 </tbody>
 </table>
 <h3 id="cargo-features">Cargo features</h3>
-<table>
-<thead>
-<tr>
-<th>Feature</th>
-<th>Effect</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>(default)</td>
-<td>PEM helpers + rustls glue</td>
-</tr>
-<tr>
-<td><code>integration</code></td>
-<td>Runtime smoke tests</td>
-</tr>
-</tbody>
-</table>
+<p>None. <code>hopf-core::tls</code> is always built in — it's not gated behind a feature flag.</p>
 <h2 id="wiring-listeners-and-connectors">Wiring listeners and connectors</h2>
-<div class="sourceCode" id="cb3"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>TcpListenerConfig<span class="op">;</span></span>
-<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="co">// TLS-from-accept (HTTPS, implicit FTPS/SMTPS, …)</span></span>
-<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> cfg <span class="op">=</span> <span class="pp">TcpListenerConfig::</span>new(addr<span class="op">,</span> factory)</span>
-<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_tls(acceptor)<span class="op">;</span></span>
-<span id="cb3-6"><a href="#cb3-6" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb3-7"><a href="#cb3-7" aria-hidden="true" tabindex="-1"></a><span class="co">// Cleartext first, then STARTTLS (SMTP, explicit FTPS, …)</span></span>
-<span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> cfg <span class="op">=</span> <span class="pp">TcpListenerConfig::</span>new(addr<span class="op">,</span> factory)</span>
-<span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_starttls_acceptor(acceptor)<span class="op">;</span></span></code></pre></div>
+<pre class="rust,ignore"><code>use hopf_core::TcpListenerConfig;
+
+// TLS-from-accept (HTTPS, implicit FTPS/SMTPS, …)
+let cfg = TcpListenerConfig::new(addr, factory)
+    .with_tls(acceptor);
+
+// Cleartext first, then STARTTLS (SMTP, explicit FTPS, …)
+let cfg = TcpListenerConfig::new(addr, factory)
+    .with_starttls_acceptor(acceptor);</code></pre>
 <p>Client dial:</p>
-<div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>TcpConnectorConfig<span class="op">;</span></span>
-<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> cfg <span class="op">=</span> <span class="pp">TcpConnectorConfig::</span>new(addr<span class="op">,</span> factory)</span>
-<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>with_tls(connector<span class="op">,</span> <span class="st">&quot;server.example.com&quot;</span>)<span class="op">;</span></span></code></pre></div>
+<pre class="rust,ignore"><code>use hopf_core::TcpConnectorConfig;
+
+let cfg = TcpConnectorConfig::new(addr, factory)
+    .with_tls(connector, "server.example.com");</code></pre>
 <p>Protocol crates:</p>
 <ul>
 <li><a href="ftp.html">FTP</a> — <code>FtpConfig::with_tls</code> / <code>implicit_ftps</code></li>
@@ -311,7 +383,7 @@ let client_cfg = client_config_with_identity(
 <li>Cookbook: <a href="cookbook/tls-echo.html">TLS echo</a></li>
 </ul>
 <h2 id="securityinfo">SecurityInfo</h2>
-<p>After handshake, <code>Endpoint::security_info()</code> reports (via core <code>SecurityInfo</code>): secure flag, ALPN protocol, TLS protocol version, cipher suite, the SNI hostname the peer requested (<code>sni()</code>, server side), and — when mTLS presented a client certificate — its SHA-256 fingerprint as lowercase hex (<code>peer_certificate_fingerprint()</code>, server side). Handlers may gate AUTH or HTTP/2 on this metadata (<code>ProtocolHandler::security_established</code>). The fingerprint is the <code>cert_key</code> expected by <a href="auth.html">SASL EXTERNAL</a>'s <code>CredentialStore::authenticate_certificate</code>.</p>
+<p>After handshake, <code>Endpoint::security_info()</code> reports (via core <code>SecurityInfo</code>): secure flag, ALPN protocol, TLS protocol version, cipher suite, the SNI hostname the peer requested (<code>sni()</code>, server side), and — when mTLS presented a client certificate — its SHA-256 fingerprint as lowercase hex (<code>peer_certificate_fingerprint()</code>) and full certificate chain (<code>peer_certificate_chain()</code>), server side. Handlers may gate AUTH or HTTP/2 on this metadata (<code>ProtocolHandler::security_established</code>). The fingerprint is the <code>cert_key</code> expected by <a href="auth.html">SASL EXTERNAL</a>'s <code>CredentialStore::authenticate_certificate</code>.</p>
 <h2 id="examples">Examples</h2>
 <div class="sourceCode" id="cb5"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> tls-echo <span class="at">--</span> 127.0.0.1:8443 cert.pem key.pem</span></code></pre></div>
 <table>
@@ -331,15 +403,18 @@ let client_cfg = client_config_with_identity(
 <p>See <a href="cookbook/tls-echo.html">Cookbook: TLS echo</a>. No environment variables.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><code>connector_for_certified_pem</code> is explicitly dangerous (self-signed demos).</li>
-<li>Cipher / version policy is rustls default — not customizable via Hopf knobs.</li>
-<li>QUIC crypto is configured in <code>hopf-quic</code>, not here.</li>
-<li><strong>No DTLS.</strong> Datagram TLS (DoDTLS, CoAPS, Gumdrop-style transparent UDP encryption) is planned in <code>hopf-core</code>, not in this crate.</li>
+<li><code>insecure_connector</code> / <code>insecure_connector_tls12</code> perform no validation at all — opportunistic STARTTLS only, never where the peer's identity matters.</li>
+<li>Hybrid PQC key-exchange preference is fixed (hybrid-first) — not customizable via the PEM builders.</li>
+<li>Session tickets aren't wired into the simple PEM builders; enabling resumption means constructing a <code>HandshakeConfig</code>/<code>Tls12Config</code> directly.</li>
+<li>RFC 8446 §4.1.3's downgrade sentinel is not implemented on the negotiating client's 1.2-fallback path.</li>
+<li><code>record_size_limit</code> (RFC 8449) is TLS 1.3 only — the TLS 1.2 engine neither sends nor answers it.</li>
+<li>Encrypted Client Hello is shared-mode only (no split-mode backend), and a real ECH offer does not support session resumption or 0-RTT.</li>
+<li>QUIC crypto is configured in <code>hopf-quic</code>, not here (though it shares this module's AWS-LC provider and key-exchange policy).</li>
+<li><strong>No DTLS through this page's types.</strong> DTLS 1.2 and DTLS 1.3 (RFC 6347 / RFC 9147) are implemented — <code>hopf-core::dtls</code> / <code>dtls12</code>, reusing this same handshake engine over a UDP driver with per-peer version negotiation — but as a low-level seam only, not yet exposed through the generic <code>Endpoint</code>/<code>ProtocolHandler</code> contract or through this page's <code>TlsAcceptor</code>/<code>TlsConnector</code>/<code>TlsVariant</code> types. See <a href="conformance.html#tls">Conformance → TLS</a> and <a href="architecture.html#security-substrate">Architecture → Security substrate</a>.</li>
 </ul>
-<h2 id="roadmap">Roadmap</h2>
-<p><strong>Today:</strong> <code>hopf-tls</code> is a thin rustls adapter implementing <code>hopf-core</code>'s <code>TlsAcceptor</code> / <code>TlsConnector</code> / <code>TlsSession</code> traits. The TLS wire protocol, record layer, and handshake state machine are rustls's; crypto comes from the shared <code>aws-lc-rs</code> provider via <code>tls_crypto_provider()</code>.</p>
-<p><strong>Planned:</strong> move the TCP TLS record layer and TLS 1.2/1.3 handshakes in-tree on AWS-LC libcrypto (facade in <code>hopf-core</code>), then retire rustls once parity is proven. A parallel <code>DtlsSession</code> on UDP is part of the same substrate work — see <a href="conformance.html#security-substrate">conformance → Security substrate</a> and <a href="architecture.html#security-substrate">Architecture → Security substrate</a>.</p>
-<p>QUIC-TLS (RFC 9001) is owned by <code>hopf-quic</code> today (rustls TLS 1.3 configs only — no TLS record layer on QUIC). That path migrates to an in-tree TLS 1.3 handshake + RFC 9001 key schedule on the same AWS-LC foundation.</p>
+<h2 id="hopf-tls-interop">hopf-tls: interop test harness</h2>
+<p>The <code>hopf-tls</code> crate is <strong>not</strong> a production TLS implementation and nothing in this workspace depends on it for production code. It exists solely to verify <code>hopf-core::tls</code>'s wire behaviour against a real, independent TLS implementation: its <code>dev-dependencies</code>-only use of <code>rustls</code> (aws-lc-rs provider) drives real handshakes — TLS 1.3 and TLS 1.2, both roles, ALPN, mutual TLS, session resumption, and STARTTLS — against <code>hopf-core::tls</code> over an actual socket. This is the only independent-implementation cross-check TCP TLS gets in this workspace; deleting the crate would silently regress that coverage down to Hopf talking to itself.</p>
+<p>Its runtime-facing API is a thin re-export shim (<code>acceptor_from_pem</code>, <code>connector_from_pem</code>, <code>insecure_connector</code>, <code>public_trust_connector</code>) that forwards straight to the identically-named <code>hopf_core::tls</code> functions, kept only so the crate's own tests didn't need touching when the engine moved in-tree. New code should call <code>hopf_core::tls</code> (or the re-exports at the <code>hopf_core</code> crate root) directly, as shown throughout this page, rather than depending on <code>hopf-tls</code>.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

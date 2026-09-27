@@ -34,9 +34,10 @@ fn main() -> std::io::Result<()> {
 ```
 
 See [docs/architecture.html](../../docs/architecture.html) and
-[Security substrate](../../docs/conformance.html#security-substrate) for what
-ships today (TCP TLS via rustls, QUIC via quinn-proto, cleartext UDP) versus
-planned in-tree TLS/DTLS/QUIC on AWS-LC in core.
+[Security substrate](../../docs/conformance.html#security-substrate) for the
+full picture: TCP TLS and UDP DTLS (1.2/1.3) are in-tree here on AWS-LC, and
+QUIC's transport and TLS 1.3 handshake are in-tree in `hopf-quic` on AWS-LC
+directly — no `rustls` or `quinn-proto` dependency in any production crate.
 Run `cargo run -p echo` for a live echo server.
 
 ## Crypto facade (Phase 1+)

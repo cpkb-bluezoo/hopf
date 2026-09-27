@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mDNS — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html" aria-current="page">mDNS</a></li>
+<li><a href="ldap.html">LDAP</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="quota.html">Quota</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Architecture audit</h2><ul>
+<li><a href="conformance.html">Conformance</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/dns-authoritative.html">DNS authoritative</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>mDNS</h1>
+        <p class="lead">Crate <code>hopf-mdns</code>: Multicast DNS (RFC 6762) and DNS-SD (RFC 6763) over UDP — both a <strong>responder</strong> (probe, announce, answer queries, goodbye) for one hostname and any number of DNS-SD services, and a <strong>querier</strong> with an active-refresh cache, wrapped in a push-based <code>browse</code>/<code>register_service</code> API. Reuses <code>hopf-dns</code>'s wire types directly rather than a parallel codec, and is entirely async on the same reactor/timer model as the rest of Hopf.</p>
+      </header>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#standards">Standards</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#responder">Responder: probing, announcing, conflicts</a></li>
+<li><a href="#querier-cache">Querier and cache</a></li>
+<li><a href="#dns-sd">DNS-SD: advertise and browse</a></li>
+<li><a href="#configuration">Configuration</a></li>
+<li><a href="#cargo-features">Cargo features</a></li>
+<li><a href="#quick-start">Quick start</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+<h2 id="standards">Standards</h2>
+<table>
+<colgroup>
+<col style="width: 64%" />
+<col style="width: 35%" />
+</colgroup>
+<thead>
+<tr>
+<th>Reference</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc6762">RFC 6762</a></td>
+<td>Multicast DNS: probing, simultaneous-probe tie-break, announcing, cache-flush, known-answer suppression, unicast-response (QU) bit, goodbye</td>
+</tr>
+<tr>
+<td><a href="https://www.rfc-editor.org/rfc/rfc6763">RFC 6763</a></td>
+<td>DNS-SD: service instance enumeration (PTR/SRV/TXT), the <code>_services._dns-sd._udp</code> meta-query, TXT record attributes</td>
+</tr>
+</tbody>
+</table>
+<h2 id="architecture">Architecture</h2>
+<pre><code>App
+ │  MdnsService::start(&amp;rt, hostname_label, addresses)
+ │    ├── responder: begin_probing → send_next_probe × N → begin_announcing
+ │    │     └── register_service / ServiceHandle (DNS-SD)
+ │    ├── querier: query(name, qtype, cb) / browse(service_type, cb)
+ │    └── cache: MdnsCache (TTL-fraction refresh, cache-flush/goodbye grace)
+ │
+ └── socket::listen_mdns_udp — one UDP socket, group 224.0.0.251:5353,
+       registered on a hopf-core ReactorHandle worker</code></pre>
+<p>This crate does not reimplement DNS wire format: <code>hopf_dns::wire::{DnsMessage, DnsQuestion, DnsResourceRecord, DnsType, DnsClass}</code> are used directly for parsing, serialising and constructing records (A, PTR, SRV, TXT). The <code>bits</code> module layers only the two mDNS-specific high-bit conventions on top — the QU "unicast response requested" bit (top bit of a question's QCLASS, §5.4) and the cache-flush bit (top bit of a record's CLASS, §10.2) — as pure bitmask helpers over <code>raw_qclass</code>/<code>raw_class</code>, since a class value with either bit set matches no <code>DnsClass</code> variant by design (RFC 3597 unknown-value preservation).</p>
+<p>Every timer (probe/announce cadence, cache TTL-fraction refresh, goodbye/cache-flush grace period, browse re-poll, query timeout) is a one-shot <code>hopf_core::ReactorHandle::schedule_timer</code> callback that re-arms itself on firing — there is no repeating-timer primitive in <code>hopf-core</code> to lean on instead — and every send goes through <code>ReactorHandle::udp_send</code>, which only enqueues and never blocks the caller. The one synchronous stretch is one-time socket setup (bind, multicast join, <code>register_udp</code>) in <code>socket::listen_mdns_udp</code>, the same shape <code>hopf-dns</code>'s own <code>listen_dns_udp</code> already uses. Public methods on <code>MdnsService</code> (and the handles it returns) may be called from any thread; internal state (<code>responder::Shared</code>) sits behind one <code>Mutex</code> that is never held across I/O.</p>
+<p>IPv4 only: the mDNS group <code>ff02::fb</code> and IPv6 address records are not implemented.</p>
+<h2 id="responder">Responder: probing, announcing, conflicts</h2>
+<p><code>MdnsService::start</code> takes a hostname label and the caller's own IPv4 address(es) — this crate has no interface-enumeration utility, so, matching its push-rather-than-pull design throughout, the application supplies its routable addresses rather than the crate guessing at them. It then runs the full RFC 6762 §8 state machine before any record is served:</p>
+<ul>
+<li><strong>Probing (§8.1):</strong> after a random initial delay, sends <code>probe_count</code> (default 3) probe queries for the candidate name's A record, each carrying the proposed record in the Authority section, spaced <code>probe_interval</code> apart.</li>
+<li><strong>Conflict during probing (§8.1):</strong> an incoming <em>response</em> that already asserts the candidate name (from an established host) restarts probing from scratch under a renamed candidate (<code>label-2.local</code>, <code>label-3.local</code>, ...).</li>
+<li><strong>Simultaneous probing (§8.2):</strong> an incoming <em>query</em> for the same candidate name, itself carrying a proposed record in its Authority section, is a tie-break rather than a conflict — the two proposed A records are compared unsigned byte-wise (one representative record, not the full RRset ordering the RFC technically specifies); the loser waits <code>probe_conflict_wait</code> and retries the <em>same</em> name (not a rename, since the other host lost equally and nothing says it will keep contesting it).</li>
+<li><strong>Announcing (§8.3):</strong> once probing completes uncontested, sends <code>announce_count</code> (default 2) unsolicited multicast responses, <code>announce_interval</code> apart, carrying every published record (hostname A record(s) plus any registered DNS-SD records) with the cache-flush bit set.</li>
+<li><strong>Answering queries:</strong> while announced, a query matching a published name/type gets a response — multicast by default, or unicast back to the querier if any question in the message carried the QU bit. <strong>Known-answer suppression (§7.1)</strong> is implemented: a record the query already lists as a known answer with more than half its TTL remaining is skipped.</li>
+<li><strong>Goodbye (§10.1):</strong> <code>MdnsService::goodbye()</code> sends a TTL-0 response for every published record; <code>Drop</code> calls it automatically (best-effort) if the service is still announced when the last handle goes away, and dropping a <code>ServiceHandle</code> sends a targeted goodbye for just that service's records (or folds into the next re-announcement if the responder hasn't finished announcing yet).</li>
+</ul>
+<h2 id="querier-cache">Querier and cache</h2>
+<p><code>MdnsService::query(name, qtype, cb)</code> fires a one-shot multicast query and resolves <code>cb</code> with whatever is cached once <code>query_timeout</code> elapses, rather than racing to resolve the instant a matching answer arrives — a deliberate v1 simplification, since resolving on the first answer would ignore a slower-but-still-answering-within-a-second responder. <code>MdnsService::lookup(name, qtype)</code> is a synchronous, non-blocking peek at the cache with no query sent.</p>
+<p>The cache (<code>MdnsCache</code>) is a pure, timer-free data structure — it never touches <code>hopf-core</code> itself; the responder owns the real <code>ReactorHandle</code> and calls back into it when scheduled timers fire, which keeps the cache's own logic testable as plain data in / data out.</p>
+<ul>
+<li><strong>Active TTL refresh (§5.2):</strong> each cached record schedules a refresh query at 80/85/90/95% of its TTL, and expires at 100% if never refreshed. Each stage captures the record's generation (bumped on every upsert) so a stale timer from a since-superseded record is a harmless no-op.</li>
+<li><strong>Cache-flush handling (§10.2):</strong> when an incoming answer group for a name/type carries the cache-flush bit, every currently cached record for that key <em>not</em> reasserted in the same group is scheduled for removal after a short grace period (1 second) rather than deleted immediately — tolerating the flush answer arriving split across more than one packet.</li>
+<li><strong>Goodbye handling (§10.1):</strong> a TTL-0 answer schedules the matching cached record for the same grace-period removal.</li>
+</ul>
+<h2 id="dns-sd">DNS-SD: advertise and browse</h2>
+<p><code>MdnsService::register_service(ServiceRegistration { service_type, instance_name, port, txt })</code> builds and publishes one service instance's RRset, then re-announces:</p>
+<ul>
+<li><strong>PTR</strong> <code>&lt;type&gt;.local</code> → <code>&lt;instance&gt;.&lt;type&gt;.local</code> — shared (not cache-flush; other instances share the same owner name, per §10.1).</li>
+<li><strong>SRV</strong> <code>&lt;instance&gt;.&lt;type&gt;.local</code> → this responder's own hostname, with the registered port (priority and weight are always 0) — cache-flush.</li>
+<li><strong>TXT</strong> on the same owner name, encoding the registration's key/value pairs as RFC 6763 §6.1 character-strings (a value over 255 bytes is dropped rather than silently truncated; no attributes still emits one required zero-length string) — cache-flush.</li>
+<li><strong>Meta-PTR</strong> (§9): <code>_services._dns-sd._udp.local</code> → <code>&lt;type&gt;.local</code>, so a client enumerating all advertised service <em>types</em> on the network finds this one — shared, not cache-flush.</li>
+</ul>
+<p>The target host is always this responder's own current name (already probed for conflicts), so registering a service republishes the current RRset rather than running a separate probe cycle for the new records — close enough to RFC 6763 §8.3's "adding a new instance" flow for a first version. Dropping the returned <code>ServiceHandle</code> (or calling <code>unregister()</code>) removes that instance's records and announces the change.</p>
+<p><code>MdnsService::browse(service_type, cb)</code> queries the type's PTR periodically (every 10 seconds, layered on top of the cache's own per-record active refresh so a brand-new instance is found promptly rather than waiting for something else's TTL to near expiry), resolves each returned instance's SRV and TXT from the cache, and delivers <code>BrowseEvent::Found { instance, host, port, txt }</code> / <code>BrowseEvent::Lost { instance }</code> to the callback as instances appear or drop out of the PTR set. TXT values without an <code>=</code> are reported with an empty value. The returned <code>BrowseHandle</code> stops the browse when dropped.</p>
+<h2 id="configuration">Configuration</h2>
+<p><code>Timing</code> (all fields public, defaults match RFC 6762 exactly):</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>probe_initial_delay_max</code></td>
+<td>250 ms</td>
+<td>§8.1: upper bound of the random delay before the first probe</td>
+</tr>
+<tr>
+<td><code>probe_interval</code></td>
+<td>250 ms</td>
+<td>§8.1: delay between probes</td>
+</tr>
+<tr>
+<td><code>probe_count</code></td>
+<td>3</td>
+<td>§8.1: probes sent before announcing</td>
+</tr>
+<tr>
+<td><code>probe_conflict_wait</code></td>
+<td>1 s</td>
+<td>§8.2: wait before retrying after losing a simultaneous-probe tie-break</td>
+</tr>
+<tr>
+<td><code>announce_interval</code></td>
+<td>1 s</td>
+<td>§8.3: delay between announcements</td>
+</tr>
+<tr>
+<td><code>announce_count</code></td>
+<td>2</td>
+<td>§8.3: announcements sent</td>
+</tr>
+<tr>
+<td><code>record_ttl</code></td>
+<td>120 s</td>
+<td>TTL applied to published records (not RFC-mandated as a single value; a longer conventional TTL for PTR records isn't distinguished from host/service records in this first version)</td>
+</tr>
+<tr>
+<td><code>query_timeout</code></td>
+<td>750 ms</td>
+<td>How long <code>query</code> waits before resolving from whatever is cached by then</td>
+</tr>
+</tbody>
+</table>
+<p><code>MdnsService::start_with_timing(&amp;rt, hostname_label, addresses, timing, multicast_if)</code> takes a non-default <code>Timing</code> and, optionally, a single local interface (<code>Ipv4Addr</code>) to scope mDNS to — for multi-homed hosts, or a test pinned to loopback since not every host's default route is multicast-capable. <code>listen_mdns_udp</code> also sets IP/multicast TTL to 255 (§11), enables multicast loopback, and sets <code>SO_REUSEADDR</code>/<code>SO_REUSEPORT</code> so more than one mDNS-aware process can coexist on the host (§15.1).</p>
+<h2 id="cargo-features">Cargo features</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>(default)</td>
+<td>Responder (probe/announce/goodbye), querier + cache, DNS-SD advertise/browse — a standalone crate with no optional pieces</td>
+</tr>
+<tr>
+<td><code>integration</code></td>
+<td>Real loopback-multicast round-trip tests (<code>tests/mdns_stub.rs</code>); not compiled into the default <code>--lib</code> test run</td>
+</tr>
+</tbody>
+</table>
+<p>Depends on <code>hopf-core</code> and <code>hopf-dns</code> (for wire types) plus <code>mio</code>, <code>socket2</code> and <code>getrandom</code>. The umbrella <code>hopf</code> crate exposes it via feature <code>mdns</code>, which also pulls in <code>dns</code>.</p>
+<h2 id="quick-start">Quick start</h2>
+<pre class="rust,ignore"><code>use std::sync::Arc;
+use hopf_core::Runtime;
+use hopf_mdns::{MdnsService, ServiceRegistration};
+
+let rt = Arc::new(Runtime::start(Default::default())?);
+let mdns = MdnsService::start(&amp;rt, "my-host", vec![local_ipv4_addr])?;
+
+// Advertise a service via DNS-SD.
+let _service = mdns.register_service(ServiceRegistration {
+    service_type: "_http._tcp".into(),
+    instance_name: "My Web Server".into(),
+    port: 8080,
+    txt: vec![("path".into(), "/".into())],
+});
+
+// Browse for other instances of the same type.
+let _browse = mdns.browse("_http._tcp", |event| {
+    println!("{event:?}");
+});</code></pre>
+<p>Smoke: <code>cargo test -p hopf-mdns --features integration</code> (<code>tests/mdns_stub.rs</code>) — real loopback-multicast round trips: probe-then-announce with the right record, a name conflict renaming the loser, known-answer suppression, DNS-SD register-and-browse between two separate responder instances, and goodbye on drop.</p>
+<h2 id="limitations">Limitations</h2>
+<p>Explicitly <strong>out of scope</strong> in this first version:</p>
+<ul>
+<li><strong>IPv6</strong> — no <code>ff02::fb</code> group, no AAAA records advertised or queried.</li>
+<li><strong>RFC 6763 §4.3 instance-name escaping</strong> — special characters (<code>.</code>, <code>\</code>) in a service instance name are not escaped, so one containing them produces a technically-invalid but still-usable-in-practice owner name.</li>
+<li><strong>SRV priority/weight</strong> — always published as 0/0; not configurable per registration.</li>
+<li><strong>Conflict tie-break</strong> compares one representative record (the hostname's first address) unsigned byte-wise, not the full lexicographic RRset ordering RFC 6762 §8.2 technically specifies.</li>
+<li><strong>No central service registry</strong> — unlike a pull-based DNS-SD advertiser that walks a server's own listener registry, every service this crate advertises must be registered explicitly via <code>register_service</code>; there is no workspace-wide registry to draw from since every Hopf protocol is an independent crate.</li>
+<li><strong>Browse re-poll</strong> is a fixed 10-second interval layered on top of the cache's own TTL-fraction refresh, not a dynamic schedule.</li>
+<li>No W3C Trace Context propagation and no process-local metrics counters (contrast <a href="dns.html#telemetry">DNS's telemetry</a>).</li>
+</ul>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

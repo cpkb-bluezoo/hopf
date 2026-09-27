@@ -32,17 +32,21 @@
 <li><a href="http/server.html">HTTP server</a></li>
 <li><a href="http/client.html">HTTP client</a></li>
 <li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
 <li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
 <li><a href="ldap.html">LDAP</a></li>
 <li><a href="webdav.html" aria-current="page">WebDAV</a></li>
 <li><a href="websocket.html">WebSocket</a></li>
 <li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
 <li><a href="ftp.html">FTP</a></li>
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
-<li><a href="amqp.html">AMQP</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
 <li><a href="mailbox.html">Mailbox</a></li>
 </ul>
 <h2>Cross-cutting</h2><ul>
@@ -73,7 +77,7 @@
         <h1>WebDAV</h1>
         <p class="lead">Crate <code>hopf-webdav</code>: WebDAV <strong>Class 1 + Class 2</strong> filesystem backend as an HTTP <code>ServerHandler</code> (RFC 4918). It is <strong>not</strong> a standalone TCP service — wire it under <a href="http/overview.html"><code>hopf-http</code></a> (<code>CleartextHttpEndpoint</code> / <code>AlpnHttpEndpoint</code>) on a Hopf <code>Runtime</code>. Blocking filesystem work runs on <code>StorageExecutor</code>.</p>
       </header>
-      <p>Locks are in-process per factory (not distributed). Dead properties use xattrs (optional Cargo feature) or sidecar files.</p>
+      <p>Locks default to in-process per factory; dead properties default to xattrs (optional Cargo feature) or sidecar files next to their resources. Both can instead be moved out of the content tree — see <code>WebDavConfig::lock_root</code> / <code>sidecar_root</code> below — so several handlers can share one lock table and one property store for the same content, including a read-only content tree.</p>
 <div class="toc"><h2 id="contents">Contents</h2>
 <ul>
 <li><a href="#standards">Standards</a></li>
@@ -121,8 +125,8 @@
 WebDavFactory → WebDavHandler (ServerHandler)
         │
         ├── StorageExecutor  (FS read/write off reactor)
-        ├── WebDavLockManager (in-memory Class 2 locks)
-        └── DeadPropertyStore (xattr | sidecar | none)</code></pre>
+        ├── WebDavLockManager (in-memory, or file-backed under lock_root)
+        └── DeadPropertyStore (xattr | sidecar [next to resource | under sidecar_root] | none)</code></pre>
 <p>Auth is <strong>not</strong> implemented in this crate. Put HTTP Basic/Digest/Bearer (<a href="auth.html">Auth</a> / <code>hopf-http</code> auth factories) or ACL (<a href="access-control.html">Access control</a>) around the listener.</p>
 <h2 id="methods-and-allow-matrix">Methods and Allow matrix</h2>
 <table>
@@ -239,7 +243,7 @@ WebDavFactory → WebDavHandler (ServerHandler)
 </tr>
 </tbody>
 </table>
-<p>Locks are <strong>per <code>WebDavFactory</code> process</strong> — not shared across hosts.</p>
+<p>Locks are <strong>per <code>WebDavFactory</code> process</strong> by default — not shared across hosts. Setting <code>WebDavConfig::lock_root</code> (issue #415) switches <code>WebDavLockManager</code> to file-backed records under that directory instead, keyed by each resource's path relative to <code>root_path</code>: every handler pointed at the same <code>lock_root</code> then shares the same lock table, which is what a second handler process serving the same content tree needs (its in-memory table would otherwise start empty and grant a conflicting lock). Every lock operation then does blocking file I/O, so <code>lock_root</code> needs a filesystem where a create-new open is atomic and one handler's write is visible to the others before they finish their own conflict check — a local disk or a true <code>ReadWriteOnce</code> volume, not NFS's attribute-cached semantics.</p>
 <h2 id="live-and-dead-properties">Live and dead properties</h2>
 <p><strong>Live properties</strong> (examples): <code>creationdate</code>, <code>displayname</code>, <code>getcontentlength</code>, <code>getcontenttype</code>, <code>getetag</code>, <code>getlastmodified</code>, <code>lockdiscovery</code>, <code>resourcetype</code>, <code>supportedlock</code>, …</p>
 <p><strong>Dead properties</strong> — <code>DeadPropMode</code>:</p>
@@ -261,7 +265,7 @@ WebDavFactory → WebDavHandler (ServerHandler)
 </tr>
 <tr>
 <td><code>Sidecar</code></td>
-<td>Files <code>.webdav_*</code>; NS <code>urn:gumdrop:webdav-props</code></td>
+<td>Files <code>.webdav_*</code>, normally next to the resource; with <code>WebDavConfig::sidecar_root</code> set (issue #415), the sidecar for a resource is instead the file at its path relative to <code>root_path</code>, mirrored under <code>sidecar_root</code> — nothing is written into the content tree, and a content file actually named <code>.webdav_*</code> is never mistaken for one</td>
 </tr>
 <tr>
 <td><code>None</code></td>
@@ -328,6 +332,18 @@ WebDavFactory → WebDavHandler (ServerHandler)
 <td><code>bool</code></td>
 <td><code>false</code></td>
 <td>Required when write/WebDAV enabled without acknowledging no built-in auth</td>
+</tr>
+<tr>
+<td><code>lock_root</code></td>
+<td><code>Option&lt;PathBuf&gt;</code></td>
+<td><code>None</code></td>
+<td>File-backed, cross-handler-shared lock records under this directory instead of in-memory (issue #415); see <code>with_lock_root</code></td>
+</tr>
+<tr>
+<td><code>sidecar_root</code></td>
+<td><code>Option&lt;PathBuf&gt;</code></td>
+<td><code>None</code></td>
+<td>Dead-property sidecars mirrored under this directory instead of next to their resources (issue #415); see <code>with_sidecar_root</code></td>
 </tr>
 </tbody>
 </table>
@@ -460,7 +476,7 @@ WebDavFactory → WebDavHandler (ServerHandler)
 <p>Note: the example defaults <code>WEBDAV_WRITE</code> to <strong>true</strong>, while <code>WebDavConfig</code> defaults <code>allow_write</code> to <strong>false</strong>.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li>Locks are <strong>in-memory per factory</strong> (not clustered).</li>
+<li>Locks are <strong>in-memory per factory</strong> by default (not clustered); set <code>WebDavConfig::lock_root</code> to share file-backed lock records across handlers pointed at the same content, but only on a filesystem with atomic create-new and immediately-visible writes (a local disk, not NFS).</li>
 <li>No in-crate auth or ACL — compose with HTTP auth / <code>PeerAcl</code>.</li>
 <li>Feature <code>xattr</code> required for real xattrs; <code>Auto</code> falls back to sidecar.</li>
 <li>Not a standalone service crate; always behind HTTP.</li>

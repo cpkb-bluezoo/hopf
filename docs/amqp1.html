@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AMQP 1.0 — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
+<li><a href="ldap.html">LDAP</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html" aria-current="page">AMQP 1.0</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="quota.html">Quota</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Architecture audit</h2><ul>
+<li><a href="conformance.html">Conformance</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/dns-authoritative.html">DNS authoritative</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>AMQP 1.0</h1>
+        <p class="lead"><code>hopf-amqp1</code> is an <strong>AMQP 1.0 async client</strong> (ISO/IEC 19464) targeting brokers with native AMQP 1.0 support (RabbitMQ 4's native AMQP 1.0 listener, ActiveMQ Artemis). Client-only: no broker in this crate. AMQP 1.0 shares only the four-byte <code>AMQP</code> magic with <a href="amqp.html"><code>hopf-amqp</code></a>'s AMQP 0-9-1 (RabbitMQ classic protocol) — framing, the type system, and the connection/session/link model are unrelated.</p>
+      </header>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#scope">Scope</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#sasl">SASL handshake</a></li>
+<li><a href="#sessions-and-links">Sessions and links</a></li>
+<li><a href="#client">Client</a></li>
+<li><a href="#messages">Messages</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+
+      <h2 id="scope">Scope</h2>
+<table>
+<thead><tr><th>Area</th><th>Support</th></tr></thead>
+<tbody>
+<tr><td>Protocol</td><td>AMQP 1.0 (ISO/IEC 19464) only — see <a href="amqp.html">AMQP 0-9-1</a> for the separate <code>hopf-amqp</code> crate</td></tr>
+<tr><td>Role</td><td>Client only</td></tr>
+<tr><td>Auth</td><td>SASL <code>PLAIN</code> (when credentials are configured) or <code>ANONYMOUS</code>, auto-negotiated against what the peer advertises</td></tr>
+<tr><td>Sessions / links</td><td>Multiple sessions per connection, multiple sender/receiver links per session</td></tr>
+<tr><td>Flow control</td><td>Session-level incoming/outgoing window; per-link credit</td></tr>
+<tr><td>Send</td><td><code>transfer</code> with header/properties/application-properties/data, auto-split across frames for messages larger than the negotiated max frame size</td></tr>
+<tr><td>Receive</td><td>Streamed to the application as <code>transfer</code> frames arrive, not buffered whole</td></tr>
+<tr><td>Settlement</td><td>accept / reject / release / modify; outcome notifications for sent messages</td></tr>
+<tr><td>TLS</td><td>AMQPS via implicit TLS on dial</td></tr>
+</tbody>
+</table>
+
+      <h2 id="architecture">Architecture</h2>
+<pre><code>Amqp1Client::connect
+    → Runtime::connect(TcpConnectorConfig)
+    → Amqp1ClientEndpoint (ProtocolHandler)
+         protocol header → SASL mechanisms/init/outcome (if advertised)
+         → AMQP protocol header (re-armed) → open/open
+         → Amqp1ClientDriver::on_connection_open
+         → begin_session / attach_sender / attach_receiver via Amqp1ClientControl
+         ← transfer (streamed) → on_message_header/properties/application_properties/data
+         ← disposition → on_delivery_outcome</code></pre>
+<p>Inbound is reactor-driven: socket readable → <code>receive</code> → <code>Amqp1FrameParser</code> → <code>MessageParser</code> for transfer payloads → driver callbacks. There is no application poll loop. The frame parser and message-section parser are both genuinely incremental push parsers — a large message body streams to the driver as bytes arrive rather than being buffered whole first.</p>
+
+      <h2 id="sasl">SASL handshake</h2>
+<p>On connect, the client sends the AMQP protocol header for the SASL sub-protocol first. If the peer advertises <code>PLAIN</code> and credentials are configured, <code>PLAIN</code> is used; otherwise the client falls back to <code>ANONYMOUS</code>. After a successful <code>sasl-outcome</code>, the connection re-arms to expect the AMQP (non-SASL) protocol header, then proceeds with <code>open</code>. This re-arming happens correctly even when a peer pipelines the SASL outcome and the following AMQP header into the same TCP read — a real broker commonly does this, and the frame parser handles it within a single <code>feed()</code> call rather than needing a second read to notice the mode switch.</p>
+
+      <h2 id="sessions-and-links">Sessions and links</h2>
+<p>AMQP 1.0 layers <strong>sessions</strong> (RFC-1982 serial-numbered transfer windows over one connection) and <strong>links</strong> (named, unidirectional, credit-flow-controlled sender or receiver attachments within a session) on top of the connection — a structure AMQP 0-9-1 doesn't have. <code>Amqp1ClientControl::begin_session</code> opens a session on a channel; <code>attach_sender</code>/<code>attach_receiver</code> attach named links with a <code>Source</code>/<code>Target</code> address. A receiver must be given link credit (<code>add_credit</code>) before the peer will send it any deliveries.</p>
+
+      <h2 id="client">Client</h2>
+<p>SPI mirrors the other Hopf async clients: <code>Amqp1Client</code> facade, <code>Amqp1ClientHandlerFactory</code>, flat <code>Amqp1ClientDriver</code> / <code>Amqp1ClientControl</code>.</p>
+<pre class="text"><code>Amqp1Client::new("127.0.0.1", 5672)
+    .credentials("guest", "guest")
+    .connect(&amp;rt, Arc::new(Factory))?;</code></pre>
+<p>On <code>on_connection_open</code>, begin a session; on <code>on_session_begin</code>, attach a sender and/or receiver; on <code>on_link_attached</code> for a receiver, call <code>add_credit</code> before expecting deliveries; on <code>on_credit</code> for a sender, <code>send</code> is safe to call.</p>
+
+      <h2 id="messages">Messages</h2>
+<p><code>MessageHeader</code> (durability, priority, TTL, …) and <code>MessageProperties</code> (content-type, message-id, correlation-id, …) are list-based sections; <code>application-properties</code>, <code>delivery-annotations</code>, and <code>message-annotations</code> are bare maps, encoded/decoded as such (not wrapped in a list — a spec-correctness detail this crate gets right). <code>delivery-annotations</code>, <code>message-annotations</code>, and <code>footer</code> sections are received as raw maps but not yet offered on the send side.</p>
+
+      <h2 id="examples">Examples</h2>
+<pre><code>cargo test -p hopf-amqp1 --lib client::tests
+cargo test -p hopf-amqp1 --features integration</code></pre>
+<p>No standalone <code>cargo run</code> example binary ships yet (unlike <code>hopf-amqp</code>'s <code>amqp-pub</code>/<code>amqp-consume</code>) — see the <a href="https://docs.rs/hopf-amqp1"><code>client</code> module docs</a> for a full quick-start (connect, begin a session, attach a sender, send a message). The opt-in integration test targets a broker with native AMQP 1.0 support; defaults to <code>127.0.0.1:5672</code> / <code>guest</code>/<code>guest</code> (RabbitMQ 4 node addressing, <code>/queues/&lt;name&gt;</code>), overridable with <code>HOPF_AMQP1_HOST</code>, <code>HOPF_AMQP1_PORT</code>, <code>HOPF_AMQP1_USER</code>, <code>HOPF_AMQP1_PASS</code>, and <code>HOPF_AMQP1_ADDRESS_STYLE=artemis</code> for a plain queue-name address instead. <code>HOPF_AMQP1_TLS_PORT</code> / <code>HOPF_AMQP1_TLS_CA</code> configure the amqps (implicit TLS) test; it's skipped if no CA cert is found.</p>
+
+      <h2 id="limitations">Limitations</h2>
+<ul>
+<li>No automatic reconnection (unlike <code>hopf-amqp</code>'s <code>AmqpRecoveringClient</code>)</li>
+<li>No heartbeat send, and no enforcement of a peer's advertised <code>idle-time-out</code>; advertises no requirement of its own. Fine for short-lived or steadily-busy connections; a long-idle connection against a broker with a strict idle timeout could be dropped</li>
+<li><code>delivery-annotations</code>, <code>message-annotations</code>, and <code>footer</code> message sections are received (raw maps) but not yet offered on the send side</li>
+<li>No broker / server module, and no transactions</li>
+<li>No Composition/XML registration in v1</li>
+</ul>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>

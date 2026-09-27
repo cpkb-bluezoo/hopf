@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SOCKS — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
+<li><a href="ldap.html">LDAP</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html" aria-current="page">SOCKS</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="quota.html">Quota</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Architecture audit</h2><ul>
+<li><a href="conformance.html">Conformance</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/dns-authoritative.html">DNS authoritative</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>SOCKS</h1>
+        <p class="lead"><code>hopf-socks</code> is a SOCKS4, SOCKS4a, and SOCKS5 (RFC 1928) <strong>proxy server and client</strong>, built as a peer crate to <code>hopf-core</code> (listener/connector infrastructure) and <code>hopf-dns</code> (asynchronous target resolution). It implements CONNECT, BIND, and UDP ASSOCIATE on both sides of the wire.</p>
+      </header>
+      <div class="toc"><h2 id="contents">Contents</h2>
+<ul>
+<li><a href="#versions">Versions and scope</a></li>
+<li><a href="#architecture">Architecture</a></li>
+<li><a href="#commands">Commands</a></li>
+<li><a href="#authentication">Authentication</a></li>
+<li><a href="#destination-policy">Destination policy</a></li>
+<li><a href="#server-quick-start">Server quick start</a></li>
+<li><a href="#server-configuration">Server configuration</a></li>
+<li><a href="#tls">SOCKS over TLS</a></li>
+<li><a href="#client">Client</a></li>
+<li><a href="#metrics">Metrics</a></li>
+<li><a href="#limitations">Limitations</a></li>
+</ul></div>
+      <h2 id="versions">Versions and scope</h2>
+<table>
+<colgroup>
+<col style="width: 25%" />
+<col style="width: 20%" />
+<col style="width: 55%" />
+</colgroup>
+<thead>
+<tr>
+<th>Version</th>
+<th>Reference</th>
+<th>Support</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SOCKS4</td>
+<td>No formal RFC — the historical protocol description</td>
+<td>CONNECT and BIND, server and client. No credential field on the wire; a configured authenticator rejects SOCKS4 requests outright rather than silently accepting them unauthenticated.</td>
+</tr>
+<tr>
+<td>SOCKS4a</td>
+<td>Same historical description, "magic IP" <code>0.0.0.x</code> (<code>x != 0</code>) extension</td>
+<td>Hostname targets, resolved by the server via <code>hopf-dns</code> instead of requiring the client to resolve first.</td>
+</tr>
+<tr>
+<td>SOCKS5</td>
+<td>RFC 1928</td>
+<td>Method negotiation, CONNECT/BIND/UDP ASSOCIATE, IPv4/IPv6/domain-name addressing, server and client.</td>
+</tr>
+<tr>
+<td>Username/password auth</td>
+<td>RFC 1929</td>
+<td>Server (<code>SocksAuthenticator</code>) and client (<code>SocksClientConfig::with_credentials</code>).</td>
+</tr>
+<tr>
+<td>GSSAPI auth</td>
+<td>RFC 1961</td>
+<td><strong>Not implemented.</strong> See <a href="#limitations">Limitations</a>.</td>
+</tr>
+</tbody>
+</table>
+<p>UDP ASSOCIATE implements no RFC 1928 §7 fragment reassembly — only standalone datagrams (<code>FRAG = 0x00</code>) are forwarded; a non-standalone fragment is silently dropped. This matches near-universal real-world SOCKS5 server practice.</p>
+      <h2 id="architecture">Architecture</h2>
+<p>Following this workspace's server/client-as-peers convention (see <a href="architecture.html#module-layout-server-and-client-as-peers">Architecture → Module layout</a>), <code>hopf-socks</code> keeps server-side and client-side state machines in separate files that share the same wire codec rather than one FSM serving both roles:</p>
+<table>
+<colgroup>
+<col style="width: 30%" />
+<col style="width: 70%" />
+</colgroup>
+<thead>
+<tr>
+<th>Module</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>wire</code>, <code>udp_header</code></td>
+<td>Shared, incremental, allocation-light request/reply codecs for SOCKS4/4a and SOCKS5, and the RFC 1928 §7 UDP datagram header. Every TCP-side parser returns <code>ParseResult::{Incomplete, Invalid, Complete}</code> against a possibly-partial byte slice.</td>
+</tr>
+<tr>
+<td><code>handler</code>, <code>service</code></td>
+<td>Server side: <code>SocksConnectionHandlerFactory</code> builds one <code>SocksConnectionHandler</code> (a <code>ProtocolHandler</code>) per accepted connection; <code>SocksService</code> registers the listener on a <code>Runtime</code>.</td>
+</tr>
+<tr>
+<td><code>connect</code>, <code>bind</code>, <code>udp_associate</code></td>
+<td>Server side: per-command setup (resolve/authorize/dial for CONNECT, ephemeral single-use listener for BIND, UDP socket pair for UDP ASSOCIATE), each handing off to <code>relay</code> once established.</td>
+</tr>
+<tr>
+<td><code>relay</code></td>
+<td>Server side: shared byte-relay plumbing and idle-timeout tracking used by CONNECT and BIND once a tunnel is up.</td>
+</tr>
+<tr>
+<td><code>auth</code>, <code>policy</code>, <code>metrics</code></td>
+<td>Shared seams: <code>SocksAuthenticator</code> (RFC 1929 verification), <code>SocksPolicy</code> (destination authorization), and <code>SocksServerMetrics</code> (atomic counters) — all injected into the server side, and reusable independently of it.</td>
+</tr>
+<tr>
+<td><code>client</code>, <code>client_bind</code>, <code>client_udp_associate</code></td>
+<td>Client side: <code>SocksConnectHandler</code>, <code>SocksBindHandler</code>, and <code>SocksUdpAssociateHandler</code> — each a transport decorator that performs its handshake over an already-dialed connection to the proxy, then hands off to (or alongside) an arbitrary caller-supplied inner <code>ProtocolHandler</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>The client handlers are not modeled on <code>hopf-http</code>'s protocol-upgrade negotiation (WebSocket, CONNECT-UDP, CONNECT-IP), which operates <em>above</em> an already-established HTTP connection. A SOCKS proxy sits <em>below</em> the client protocol entirely: once CONNECT succeeds, the tunnel is just the same raw TCP stream, so the inner handler talks to the real <code>Endpoint</code> directly with no reframing.</p>
+      <h2 id="commands">Commands</h2>
+<table>
+<colgroup>
+<col style="width: 18%" />
+<col style="width: 10%" />
+<col style="width: 10%" />
+<col style="width: 62%" />
+</colgroup>
+<thead>
+<tr>
+<th>Command</th>
+<th>SOCKS4/4a</th>
+<th>SOCKS5</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CONNECT</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Resolves (if a hostname), authorizes via <code>SocksPolicy</code>, dials the target, then relays bytes bidirectionally until either side closes or <code>DEFAULT_RELAY_IDLE_TIMEOUT</code> (5&nbsp;minutes) elapses with no traffic.</td>
+</tr>
+<tr>
+<td>BIND</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Opens an ephemeral, loopback-scoped, single-use listener; sends a first reply with the bound address; on the first (and only) accepted connection, checks it against the request's own <code>DST.ADDR</code> (an unspecified address accepts any peer) and the destination policy, then sends a second reply and starts relaying. Times out after <code>DEFAULT_BIND_ACCEPT_TIMEOUT</code> (2&nbsp;minutes) if no peer ever connects.</td>
+</tr>
+<tr>
+<td>UDP ASSOCIATE</td>
+<td>No SOCKS4 equivalent</td>
+<td>Yes</td>
+<td>Opens a client-facing and an upstream-facing UDP socket; unwraps/wraps the RFC 1928 §7 header on each datagram; the association's lifetime is tied to the TCP control connection (closing either ends both) and also times out after <code>DEFAULT_UDP_IDLE_TIMEOUT</code> (5&nbsp;minutes) of no datagrams.</td>
+</tr>
+</tbody>
+</table>
+<p>An unrecognized address type (SOCKS5) gets the specific RFC 1928 §6 <code>AddressTypeNotSupported</code> reply rather than a bare connection close, once the request's version and command framing are already known-good. A destination a hostname resolves to more than one address is checked against <em>every</em> resolved address, not just the first — if any is denied, the whole request is rejected, so a multi-answer DNS response can't bypass the policy by ordering.</p>
+      <h2 id="authentication">Authentication</h2>
+<p>The server offers no-auth (<code>0x00</code>) by default. Attaching a <code>SocksAuthenticator</code> to <code>SocksConnectionHandlerFactory::with_authenticator</code> flips two things at once: SOCKS5 no longer offers no-auth even if the client asks for it (only <code>0x02</code>, username/password, is selected), and SOCKS4/4a requests — which carry no credential field to check — are rejected outright rather than treated as an implicit identity claim.</p>
+<pre class="rust,ignore"><code>use hopf_socks::SocksAuthenticator;
+
+struct FixedCredential {
+    username: String,
+    password: String,
+}
+
+impl SocksAuthenticator for FixedCredential {
+    fn verify(&self, username: &str, password: &str) -> bool {
+        username == self.username &amp;&amp; password == self.password
+    }
+}</code></pre>
+<p>There is no built-in <code>CredentialStore</code>/<code>TrustPolicy</code> integration (unlike the mail and directory protocol crates) — <code>SocksAuthenticator</code> is a single-method seam an application implements directly, typically backed by whatever credential source it already has.</p>
+<p>On the client side, <code>SocksClientConfig::with_credentials(username, password)</code> offers <code>0x02</code> alongside no-auth in the SOCKS5 greeting and drives the RFC 1929 sub-negotiation automatically if the proxy selects it. SOCKS4/4a has no credential field; a configured credential is silently unused when <code>SocksClientVersion::Socks4</code> is selected.</p>
+<p><strong>RFC 1961 GSSAPI authentication is not implemented.</strong> There is no GSSAPI method byte, sub-negotiation, or per-message protection in <code>wire</code>, <code>handler</code>, or either client handler. It is planned together with optional GSSAPI/Kerberos SASL in <code>hopf-auth</code>; until then, deployments needing enterprise authentication can terminate TLS in front of the proxy (see <a href="#tls">SOCKS over TLS</a>) and use RFC 1929 username/password instead.</p>
+      <h2 id="destination-policy">Destination policy</h2>
+<p><code>SocksPolicy</code> approves or denies a relay target and has <strong>no permissive default anywhere in this crate</strong> — an open SOCKS proxy is not something an application should get by omission:</p>
+<pre class="rust,ignore"><code>use std::net::IpAddr;
+use hopf_socks::SocksPolicy;
+
+struct PrivateNetworksOnly;
+
+impl SocksPolicy for PrivateNetworksOnly {
+    fn is_target_allowed(&self, addr: IpAddr, _port: u16) -> bool {
+        match addr {
+            IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+            IpAddr::V6(v6) => v6.is_loopback(),
+        }
+    }
+}</code></pre>
+<p>This governs <em>where</em> an already-accepted client may relay to. It is separate from <code>SocksService::with_acl</code>, which governs <em>who</em> may connect to the proxy at all (enforced at the <code>hopf-core</code> listener level, before any SOCKS byte is read) — see <a href="access-control.html">Access control</a>.</p>
+      <h2 id="server-quick-start">Server quick start</h2>
+<pre class="rust,ignore"><code>use std::net::IpAddr;
+use std::sync::Arc;
+use hopf_core::{Runtime, RuntimeConfig};
+use hopf_dns::DnsResolver;
+use hopf_socks::{SocksConnectionHandlerFactory, SocksPolicy, SocksService};
+
+struct AllowAll;
+impl SocksPolicy for AllowAll {
+    fn is_target_allowed(&self, _addr: IpAddr, _port: u16) -&gt; bool {
+        true
+    }
+}
+
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+let dns = Arc::new(DnsResolver::for_runtime(&amp;rt)?);
+let factory = SocksConnectionHandlerFactory::new(dns, Arc::clone(&amp;rt), Arc::new(AllowAll));
+let service = SocksService::new(&quot;127.0.0.1:1080&quot;.parse()?, factory);
+let bound = service.start(&amp;rt)?;
+println!(&quot;SOCKS proxy listening on {bound}&quot;);</code></pre>
+<p><code>AllowAll</code> is shown here for brevity only — see <a href="#destination-policy">Destination policy</a> for why a real deployment should not actually ship it.</p>
+      <h2 id="server-configuration">Server configuration</h2>
+<table>
+<thead>
+<tr>
+<th>Builder method</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SocksConnectionHandlerFactory::new(dns, runtime, policy)</code></td>
+<td>—</td>
+<td>No authentication (SOCKS5 offers no-auth only; SOCKS4/4a accepted as-is)</td>
+</tr>
+<tr>
+<td><code>.with_authenticator(authenticator)</code></td>
+<td>none</td>
+<td>Require RFC 1929 username/password; see <a href="#authentication">Authentication</a></td>
+</tr>
+<tr>
+<td><code>.with_idle_timeout(duration)</code></td>
+<td>5 minutes</td>
+<td>CONNECT/BIND relay idle timeout (<code>DEFAULT_RELAY_IDLE_TIMEOUT</code>)</td>
+</tr>
+<tr>
+<td><code>.with_bind_accept_timeout(duration)</code></td>
+<td>2 minutes</td>
+<td>How long a BIND request waits for a peer (<code>DEFAULT_BIND_ACCEPT_TIMEOUT</code>)</td>
+</tr>
+<tr>
+<td><code>.with_udp_idle_timeout(duration)</code></td>
+<td>5 minutes</td>
+<td>UDP ASSOCIATE idle timeout (<code>DEFAULT_UDP_IDLE_TIMEOUT</code>)</td>
+</tr>
+<tr>
+<td><code>.with_handshake_timeout(duration)</code></td>
+<td>30 seconds</td>
+<td>Time to complete version detection through a parsed request (<code>DEFAULT_HANDSHAKE_TIMEOUT</code>); a silent client is force-closed</td>
+</tr>
+<tr>
+<td><code>.with_max_relays(n)</code></td>
+<td>0 (unlimited, <code>DEFAULT_MAX_RELAYS</code>)</td>
+<td>Cap concurrent relays and UDP associations combined, checked against currently <em>established</em> sessions</td>
+</tr>
+<tr>
+<td><code>SocksService::new(listen, factory)</code></td>
+<td>—</td>
+<td>Bind <code>listen</code>, open to all source addresses, plaintext</td>
+</tr>
+<tr>
+<td><code>.with_acl(peer_acl)</code></td>
+<td>open</td>
+<td>Restrict which client source addresses may use this listener at all — see <a href="#destination-policy">Destination policy</a> for how this differs from <code>SocksPolicy</code></td>
+</tr>
+<tr>
+<td><code>.with_tls(acceptor)</code></td>
+<td>none</td>
+<td>SOCKS over TLS — see <a href="#tls">below</a></td>
+</tr>
+</tbody>
+</table>
+      <h2 id="tls">SOCKS over TLS</h2>
+<p><code>SocksService::with_tls</code> wraps the listener in TLS-from-accept ("SOCKS over TLS"). The protocol state machine needs no changes for this at all — it only ever sees already-decrypted bytes either way — so this is purely a transport-level listener option, the same shape as every other protocol crate in this workspace:</p>
+<pre class="rust,ignore"><code>let acceptor = hopf_core::acceptor_from_pem(&amp;cert_path, &amp;key_path, &amp;[])?;
+let service = SocksService::new(&quot;0.0.0.0:1080&quot;.parse()?, factory).with_tls(acceptor);
+service.start(&amp;rt)?;</code></pre>
+      <h2 id="client">Client</h2>
+<p>Each client handler is a <code>ProtocolHandler</code> transport decorator: it performs its SOCKS handshake over a connection already dialed to the proxy, then forwards every subsequent callback to a caller-supplied inner handler as if that handler were talking to the target directly. A handshake failure is reported to the inner handler's <code>error()</code> — it never sees <code>connected()</code> in that case.</p>
+<h3 id="client-connect">CONNECT client</h3>
+<pre class="rust,ignore"><code>use hopf_core::{Endpoint, ProtocolHandler, Runtime, RuntimeConfig};
+use hopf_socks::{socks_connect_config, SocksClientConfig, SocksClientVersion};
+use std::sync::Arc;
+
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+let proxy_addr = &quot;127.0.0.1:1080&quot;.parse()?;
+
+let config = SocksClientConfig::new(SocksClientVersion::Socks5)
+    .with_credentials(&quot;alice&quot;, &quot;secret&quot;);
+
+let cfg = socks_connect_config(proxy_addr, config, &quot;example.com&quot;, 443, || {
+    Box::new(MyTargetHandler::default()) as Box&lt;dyn ProtocolHandler&gt;
+});
+rt.connect(cfg)?;</code></pre>
+<p><code>SocksClientVersion::Socks4</code> speaks SOCKS4/4a instead (falling back to the SOCKS4a hostname extension automatically when the target doesn't parse as an IP literal). There is deliberately no "auto-detect, prefer 5, fall back to 4" mode — the proxy's version is treated as known configuration.</p>
+<h3 id="client-bind">BIND client</h3>
+<p><code>socks_bind_config</code> follows the same shape for BIND's two-reply sequence: <code>on_bound</code> is called once, with the listening address the caller must relay to a remote peer out-of-band (for example, embedded in an FTP <code>PORT</code> command sent over a different connection); the inner handler's <code>connected()</code> fires only once a peer has actually connected (the second reply).</p>
+<pre class="rust,ignore"><code>use hopf_socks::{socks_bind_config, SocksAddress};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
+let expected_peer = SocksAddress::Ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)); // accept any peer
+let cfg = socks_bind_config(
+    proxy_addr,
+    config.clone(),
+    expected_peer,
+    0,
+    Arc::new(|bound: SocketAddr| {
+        // Relay `bound` to the remote peer out-of-band, then wait.
+    }),
+    || Box::new(MyTargetHandler::default()) as Box&lt;dyn ProtocolHandler&gt;,
+);
+rt.connect(cfg)?;</code></pre>
+<h3 id="client-udp-associate">UDP ASSOCIATE client</h3>
+<p><code>socks_udp_associate_config</code> is SOCKS5-only (RFC 1928 §7 has no SOCKS4 equivalent). Unlike CONNECT/BIND, the data plane is never the TCP control connection itself — it's a separate UDP socket the client opens once the association is confirmed, exchanging RFC 1928 §7-framed datagrams with the proxy's relay address. The TCP connection carries no further protocol traffic once established; its only remaining job is to anchor the association's lifetime.</p>
+<pre class="rust,ignore"><code>use hopf_socks::{socks_udp_associate_config, SocksUdpDatagramHandler, SocksUdpSender};
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+struct EchoBack;
+impl SocksUdpDatagramHandler for EchoBack {
+    fn on_datagram(&amp;mut self, target: SocketAddr, data: &amp;[u8]) {
+        println!(&quot;{} bytes from {target}&quot;, data.len());
+    }
+}
+
+let cfg = socks_udp_associate_config(
+    proxy_addr,
+    config,
+    Arc::clone(&amp;rt),
+    Arc::new(|sender: SocksUdpSender| {
+        sender.send_to(&quot;198.51.100.1:53&quot;.parse().unwrap(), b&quot;hello&quot;);
+    }),
+    || Box::new(EchoBack) as Box&lt;dyn SocksUdpDatagramHandler&gt;,
+);
+rt.connect(cfg)?;</code></pre>
+<h3 id="client-options">Client options</h3>
+<table>
+<thead>
+<tr>
+<th>Builder method</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SocksClientConfig::new(version)</code></td>
+<td>—</td>
+<td><code>SocksClientVersion::Socks4</code> or <code>::Socks5</code>, no authentication</td>
+</tr>
+<tr>
+<td><code>.with_credentials(username, password)</code></td>
+<td>none</td>
+<td>Offer RFC 1929 username/password (SOCKS5 only; silently unused under SOCKS4/4a)</td>
+</tr>
+<tr>
+<td><code>.with_handshake_timeout(duration)</code></td>
+<td>30 seconds (<code>DEFAULT_CLIENT_HANDSHAKE_TIMEOUT</code>)</td>
+<td>A handshake that hasn't completed by this deadline force-fails the connection via <code>Endpoint::fail</code> (reaching the inner handler's <code>error()</code>, unlike a bare close)</td>
+</tr>
+</tbody>
+</table>
+      <h2 id="metrics">Metrics</h2>
+<p>Process-local <code>SocksServerMetrics</code> (atomic counters, in <code>hopf-socks</code>), obtained via <code>SocksConnectionHandlerFactory::metrics()</code>: <code>connections</code>, <code>connect_requests</code>, <code>bind_requests</code>, <code>active_bind_waits</code>, <code>active_relays</code>, <code>udp_associate_requests</code>, <code>active_udp_associations</code>, <code>bytes_upstream</code> / <code>bytes_downstream</code>, <code>auth_ok</code> / <code>auth_fail</code>, and <code>destinations_blocked</code>.</p>
+<p>There is no OTLP/JSONL exporter for these counters in <code>hopf-otel</code> yet (unlike the mail and directory protocol crates' <code>*ServerMetrics</code> types) — applications that need centralized telemetry currently read the atomics directly.</p>
+      <h2 id="limitations">Limitations</h2>
+<ul>
+<li>RFC 1961 GSSAPI authentication is not implemented — see <a href="#authentication">Authentication</a>.</li>
+<li>No RFC 1928 §7 UDP fragment reassembly — only standalone datagrams are relayed, matching near-universal real-world practice, but a client relying on fragmentation will not work.</li>
+<li>No built-in <code>CredentialStore</code>/<code>TrustPolicy</code> integration — <code>SocksAuthenticator</code> is a standalone single-method trait, not wired to this workspace's shared credential-store abstraction.</li>
+<li>No OTLP/JSONL metrics export via <code>hopf-otel</code> — only the in-process atomic counters.</li>
+<li>BIND's peer-address check and UDP ASSOCIATE's client-address check are plausibility checks against the RFC's own stated expectations, not a security boundary against a spoofed source on a hostile network.</li>
+<li>There is no "auto-detect SOCKS version" client mode — <code>SocksClientVersion</code> must be chosen by the caller.</li>
+</ul>
+
+      <p class="footer">
+        <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>
+      </p>
+    </main>
+  </div>
+</body>
+</html>
