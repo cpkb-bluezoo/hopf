@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use crate::error::{MailboxError, MailboxResult};
 
@@ -22,9 +23,30 @@ pub struct UidList {
     /// whatever survives. 0 means "no CONDSTORE data yet" (e.g. a mailbox
     /// with no flag/keyword change or append since this field was added).
     pub highest_modseq: u64,
+    /// RFC 8474 MAILBOXID — assigned once (on first creation of this
+    /// `.uidlist`, or lazily for a pre-#409 file that predates it) and
+    /// never regenerated afterward, so it survives every reopen. It lives
+    /// here (rather than a separate sidecar) because `.uidlist` already
+    /// moves atomically with the mailbox directory on RENAME, which is
+    /// exactly the stability RFC 8474 requires.
+    pub mailboxid: String,
     /// base → (uid, modseq)
     map: BTreeMap<String, (u64, u64)>,
     dirty: bool,
+}
+
+/// Generate a fresh, practically-unique MAILBOXID: hex-encoded wall-clock
+/// nanoseconds plus the process id, so two mailboxes created in the same
+/// process at different instants (the only case that matters — a
+/// `.uidlist` is only ever created once per mailbox directory) can't
+/// collide. Prefixed `M` to keep the whole token in the RFC 8474 `objectid`
+/// alphabet (`1*(ALPHA / DIGIT / "_" / ".")`) regardless of leading digit.
+fn generate_mailboxid() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("M{:x}{:x}", nanos, std::process::id())
 }
 
 impl UidList {
@@ -40,6 +62,7 @@ impl UidList {
                 uid_validity: default_uv,
                 uid_next: 1,
                 highest_modseq: 0,
+                mailboxid: generate_mailboxid(),
                 map: BTreeMap::new(),
                 dirty: true,
             });
@@ -48,6 +71,7 @@ impl UidList {
         let mut uid_validity = default_uv;
         let mut uid_next = 1u64;
         let mut highest_modseq = 0u64;
+        let mut mailboxid = String::new();
         let mut map = BTreeMap::new();
         for line in BufReader::new(f).lines() {
             let line = line?;
@@ -69,6 +93,8 @@ impl UidList {
                     .trim()
                     .parse()
                     .map_err(|_| MailboxError::Corrupt("uidlist highestmodseq".into()))?;
+            } else if let Some(rest) = line.strip_prefix("mailboxid ") {
+                mailboxid = rest.trim().to_string();
             } else {
                 let mut parts = line.splitn(2, char::is_whitespace);
                 let uid: u64 = parts
@@ -83,13 +109,22 @@ impl UidList {
                 }
             }
         }
+        // A `.uidlist` written before issue #409 has no `mailboxid` line —
+        // assign one now (marking dirty so it gets persisted on the next
+        // `save`) rather than leaving MAILBOXID unset for mailboxes that
+        // predate RFC 8474 support.
+        let dirty = mailboxid.is_empty();
+        if dirty {
+            mailboxid = generate_mailboxid();
+        }
         Ok(Self {
             path,
             uid_validity,
             uid_next,
             highest_modseq,
+            mailboxid,
             map,
-            dirty: false,
+            dirty,
         })
     }
 
@@ -154,6 +189,7 @@ impl UidList {
             writeln!(f, "uidvalidity {}", self.uid_validity)?;
             writeln!(f, "uidnext {}", self.uid_next)?;
             writeln!(f, "highestmodseq {}", self.highest_modseq)?;
+            writeln!(f, "mailboxid {}", self.mailboxid)?;
             let mut by_uid: Vec<_> = self.map.iter().collect();
             by_uid.sort_by_key(|(_, (u, _))| *u);
             for (base, (uid, modseq)) in by_uid {
@@ -263,6 +299,56 @@ mod tests {
         assert_eq!(ul2.modseq_for("base1"), 3);
         assert_eq!(ul2.modseq_for("base2"), 2);
         assert_eq!(ul2.highest_modseq, 3);
+    }
+
+    #[test]
+    fn fresh_uidlist_gets_a_nonempty_mailboxid_that_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let mut ul = UidList::load_or_new(dir.path(), 1).unwrap();
+            assert!(!ul.mailboxid.is_empty());
+            ul.assign("base1");
+            ul.save().unwrap();
+            ul.mailboxid.clone()
+        };
+        let ul2 = UidList::load_or_new(dir.path(), 0).unwrap();
+        assert_eq!(ul2.mailboxid, id, "MAILBOXID must survive a reopen");
+    }
+
+    #[test]
+    fn two_mailboxes_get_different_mailboxids() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let ul1 = UidList::load_or_new(dir1.path(), 1).unwrap();
+        let ul2 = UidList::load_or_new(dir2.path(), 1).unwrap();
+        assert_ne!(ul1.mailboxid, ul2.mailboxid);
+    }
+
+    #[test]
+    fn a_pre_409_uidlist_with_no_mailboxid_line_gets_one_assigned_and_persisted() {
+        // Simulates a `.uidlist` written before issue #409 introduced the
+        // `mailboxid` line — RFC 8474 support must upgrade it lazily rather
+        // than leaving MAILBOXID unset forever.
+        let dir = tempfile::tempdir().unwrap();
+        let path = UidList::path_in(dir.path());
+        std::fs::write(
+            &path,
+            "# gumdrop-uidlist v2\nuidvalidity 7\nuidnext 3\nhighestmodseq 0\n1 0 1234567890.1.1.host\n",
+        )
+        .unwrap();
+        let id = {
+            let mut ul = UidList::load_or_new(dir.path(), 0).unwrap();
+            assert!(!ul.mailboxid.is_empty());
+            ul.save().unwrap();
+            ul.mailboxid.clone()
+        };
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains(&format!("mailboxid {id}")),
+            "upgraded mailboxid must be persisted: {contents}"
+        );
+        let ul2 = UidList::load_or_new(dir.path(), 0).unwrap();
+        assert_eq!(ul2.mailboxid, id, "must not regenerate on next load");
     }
 
     #[test]

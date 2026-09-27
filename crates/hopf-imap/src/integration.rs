@@ -1743,3 +1743,250 @@ fn server_sort_thread_and_status_size_raw() {
 
     drop(rt);
 }
+
+/// A STATUS command issued while a mailbox is selected must not lose the
+/// session's "selected" handler — found while adding STATUS (MAILBOXID)
+/// coverage for issue #409: `StatusState::proceed`/`no` only ever hand
+/// back a `Box<dyn AuthenticatedHandler>` (STATUS is valid from either
+/// Authenticated or Selected state), so a naive restore after the async
+/// completion silently dropped `self.selected` forever, breaking every
+/// following SELECTED-state command (FETCH, STORE, SEARCH, …) until the
+/// client re-SELECTed — with no error response at all, just a hang.
+#[test]
+fn server_status_while_selected_does_not_lose_the_selected_session_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 8192];
+
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+    write_cmd(&mut stream, b"a1 LOGIN alice secret\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("a1 OK"));
+    write_cmd(&mut stream, b"a2 SELECT INBOX\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
+    assert!(r.contains("a2 OK"), "select: {r}");
+
+    write_cmd(&mut stream, b"a3 STATUS INBOX (MESSAGES)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a3 "));
+    assert!(r.contains("a3 OK"), "status: {r}");
+
+    // Before the fix, this FETCH got no response at all: `self.selected`
+    // had been silently cleared by the STATUS above.
+    write_cmd(&mut stream, b"a4 FETCH 1 (FLAGS)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a4 "));
+    assert!(
+        r.contains("a4 OK"),
+        "FETCH after STATUS-while-selected must still work: {r}"
+    );
+
+    write_cmd(&mut stream, b"a5 LOGOUT\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("a5 "));
+    drop(rt);
+}
+
+/// OBJECTID (RFC 8474): CAPABILITY, `MAILBOXID` on SELECT/STATUS, and
+/// `EMAILID`/SEARCH EMAILID — over a real loopback server and real
+/// Maildir-backed mailbox.
+#[test]
+fn server_objectid_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 8192];
+
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+    write_cmd(&mut stream, b"a1 LOGIN alice secret\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
+    assert!(r.contains("a1 OK"), "login: {r}");
+    assert!(
+        r.contains("OBJECTID") && r.contains("METADATA") && r.contains("NOTIFY"),
+        "post-auth CAPABILITY must advertise OBJECTID, METADATA, and NOTIFY: {r}"
+    );
+
+    write_cmd(&mut stream, b"a2 SELECT INBOX\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
+    assert!(r.contains("a2 OK") && r.contains("1 EXISTS"), "select: {r}");
+    assert!(
+        r.contains("OK [MAILBOXID ("),
+        "SELECT must report MAILBOXID: {r}"
+    );
+    let mailboxid = extract_paren_value(&r, "MAILBOXID (");
+
+    write_cmd(&mut stream, b"a3 STATUS INBOX (MAILBOXID)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a3 "));
+    assert!(r.contains("a3 OK"), "status mailboxid: {r}");
+    assert!(
+        r.contains(&format!("MAILBOXID ({mailboxid})")),
+        "STATUS MAILBOXID must match SELECT's: {r}"
+    );
+
+    write_cmd(&mut stream, b"a4 FETCH 1 (EMAILID THREADID)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a4 "));
+    assert!(r.contains("a4 OK"), "fetch emailid: {r}");
+    assert!(r.contains("THREADID NIL"), "threadid unsupported: {r}");
+    assert!(r.contains("EMAILID ("), "fetch emailid: {r}");
+    let emailid = extract_paren_value(&r, "EMAILID (");
+    assert!(
+        emailid.starts_with(&format!("E{mailboxid}.")),
+        "EMAILID must be derived from this mailbox's MAILBOXID: {emailid}"
+    );
+
+    write_cmd(
+        &mut stream,
+        format!("a5 SEARCH EMAILID \"{emailid}\"\r\n").as_bytes(),
+    );
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a5 "));
+    assert!(
+        r.contains("a5 OK") && r.contains("* SEARCH 1"),
+        "search by emailid must find message 1: {r}"
+    );
+
+    write_cmd(&mut stream, b"a6 LOGOUT\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("a6 "));
+    drop(rt);
+}
+
+/// Extract the value inside `"{prefix}<value>)"` from `s` — a small test
+/// helper for pulling a MAILBOXID/EMAILID out of a raw server response
+/// line without a full IMAP response parser.
+fn extract_paren_value(s: &str, prefix: &str) -> String {
+    let start = s.find(prefix).unwrap_or_else(|| panic!("{prefix} not found in: {s}")) + prefix.len();
+    let end = s[start..].find(')').unwrap_or_else(|| panic!("unclosed {prefix} in: {s}"));
+    s[start..start + end].to_string()
+}
+
+/// METADATA (RFC 5464): SETMETADATA / GETMETADATA on a real mailbox, with
+/// DEPTH and server-vs-mailbox scoping, over a real loopback server.
+#[test]
+fn server_metadata_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 8192];
+
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+    write_cmd(&mut stream, b"a1 LOGIN alice secret\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("a1 OK"));
+
+    write_cmd(
+        &mut stream,
+        b"a2 SETMETADATA INBOX (/private/comment \"hello\")\r\n",
+    );
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
+    assert!(r.contains("a2 OK"), "setmetadata: {r}");
+
+    write_cmd(&mut stream, b"a3 GETMETADATA INBOX (/private/comment)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a3 "));
+    assert!(r.contains("a3 OK"), "getmetadata: {r}");
+    assert!(
+        r.contains("* METADATA INBOX (/private/comment \"hello\")"),
+        "getmetadata response: {r}"
+    );
+
+    // Server-level ("" mailbox) annotations are a separate namespace from
+    // the same entry set on a real mailbox.
+    write_cmd(
+        &mut stream,
+        b"a4 SETMETADATA \"\" (/private/comment \"server-wide\")\r\n",
+    );
+    read_until(&mut stream, &mut buf, |s| s.contains("a4 OK"));
+    write_cmd(&mut stream, b"a5 GETMETADATA \"\" (/private/comment)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a5 "));
+    assert!(
+        r.contains("\"server-wide\""),
+        "server metadata must be independent of INBOX's: {r}"
+    );
+    write_cmd(&mut stream, b"a6 GETMETADATA INBOX (/private/comment)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a6 "));
+    assert!(
+        r.contains("\"hello\"") && !r.contains("server-wide"),
+        "mailbox metadata must be unaffected by the server-level SETMETADATA: {r}"
+    );
+
+    // NIL deletes the entry.
+    write_cmd(
+        &mut stream,
+        b"a7 SETMETADATA INBOX (/private/comment NIL)\r\n",
+    );
+    read_until(&mut stream, &mut buf, |s| s.contains("a7 OK"));
+    write_cmd(&mut stream, b"a8 GETMETADATA INBOX (/private/comment)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a8 "));
+    assert!(
+        r.contains("* METADATA INBOX ()"),
+        "deleted entry must not appear: {r}"
+    );
+
+    write_cmd(&mut stream, b"a9 LOGOUT\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("a9 "));
+    drop(rt);
+}
+
+/// NOTIFY (RFC 5465, SELECTED subset): after `NOTIFY SET (SELECTED
+/// MessageNew)`, an APPEND from a *second* connection is pushed to the
+/// first as an unsolicited `EXISTS` without that connection ever issuing
+/// IDLE or another command — the whole point of NOTIFY over plain IDLE.
+#[test]
+fn server_notify_selected_message_new_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut watcher = TcpStream::connect(addr).unwrap();
+    watcher
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut wbuf = vec![0u8; 8192];
+    read_until(&mut watcher, &mut wbuf, |s| s.contains("* OK"));
+    write_cmd(&mut watcher, b"a1 LOGIN alice secret\r\n");
+    read_until(&mut watcher, &mut wbuf, |s| s.contains("a1 OK"));
+    write_cmd(&mut watcher, b"a2 SELECT INBOX\r\n");
+    let r = read_until(&mut watcher, &mut wbuf, |s| s.contains("a2 "));
+    assert!(r.contains("a2 OK") && r.contains("1 EXISTS"), "select: {r}");
+
+    write_cmd(
+        &mut watcher,
+        b"a3 NOTIFY SET (SELECTED MessageNew MessageExpunge FlagChange)\r\n",
+    );
+    let r = read_until(&mut watcher, &mut wbuf, |s| s.contains("a3 "));
+    assert!(r.contains("a3 OK"), "notify set: {r}");
+
+    let mut appender = TcpStream::connect(addr).unwrap();
+    appender
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut abuf = vec![0u8; 8192];
+    read_until(&mut appender, &mut abuf, |s| s.contains("* OK"));
+    write_cmd(&mut appender, b"b1 LOGIN alice secret\r\n");
+    read_until(&mut appender, &mut abuf, |s| s.contains("b1 OK"));
+    let payload = b"From: c@d\r\nSubject: pushed\r\n\r\nnotify me\r\n";
+    write_cmd(
+        &mut appender,
+        format!("b2 APPEND INBOX {{{}}}\r\n", payload.len()).as_bytes(),
+    );
+    read_until(&mut appender, &mut abuf, |s| s.contains("+ "));
+    write_cmd(&mut appender, payload);
+    write_cmd(&mut appender, b"\r\n");
+    let r = read_until(&mut appender, &mut abuf, |s| s.contains("b2 "));
+    assert!(r.contains("b2 OK"), "append: {r}");
+
+    // The watcher never sends another command — this must arrive from the
+    // NOTIFY poll timer, not a NOOP/IDLE-triggered diff.
+    let r = read_until(&mut watcher, &mut wbuf, |s| s.contains("2 EXISTS"));
+    assert!(
+        r.contains("2 EXISTS"),
+        "NOTIFY must push the new message without any command on this connection: {r}"
+    );
+
+    drop(rt);
+}

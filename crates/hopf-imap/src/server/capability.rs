@@ -79,6 +79,15 @@ pub fn build_capabilities(
         if config.enable_status_size {
             caps.push("STATUS=SIZE".to_string());
         }
+        if config.enable_objectid {
+            caps.push("OBJECTID".to_string());
+        }
+        if config.enable_metadata {
+            caps.push("METADATA".to_string());
+        }
+        if config.enable_notify {
+            caps.push("NOTIFY".to_string());
+        }
     }
 
     // Always advertised when implemented (independent of auth).
@@ -174,6 +183,37 @@ mod tests {
         let caps = build_capabilities(&cfg, true, true, true);
         assert!(!caps.split_whitespace().any(|c| c == "COMPRESS=DEFLATE"));
         assert!(caps.split_whitespace().any(|c| c == "UTF8=ACCEPT"));
+    }
+
+    #[test]
+    fn objectid_metadata_notify_are_authenticated_only_and_disablable() {
+        let cfg = test_config(true);
+        let pre_auth = build_capabilities(&cfg, false, false, false);
+        for cap in ["OBJECTID", "METADATA", "NOTIFY"] {
+            assert!(
+                !pre_auth.split_whitespace().any(|c| c == cap),
+                "{cap} must not be advertised pre-auth"
+            );
+        }
+        let post_auth = build_capabilities(&cfg, true, true, false);
+        for cap in ["OBJECTID", "METADATA", "NOTIFY"] {
+            assert!(
+                post_auth.split_whitespace().any(|c| c == cap),
+                "{cap} must be advertised once authenticated"
+            );
+        }
+
+        let mut disabled = cfg;
+        disabled.enable_objectid = false;
+        disabled.enable_metadata = false;
+        disabled.enable_notify = false;
+        let caps = build_capabilities(&disabled, true, true, false);
+        for cap in ["OBJECTID", "METADATA", "NOTIFY"] {
+            assert!(
+                !caps.split_whitespace().any(|c| c == cap),
+                "{cap} must not be advertised once disabled"
+            );
+        }
     }
 
     #[test]

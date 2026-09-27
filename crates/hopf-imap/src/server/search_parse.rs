@@ -183,6 +183,7 @@ impl<'a> Parser<'a> {
                     .ok_or_else(|| self.err("expected keyword"))?,
             ),
             "UID" => SearchCriteria::Uid(self.parse_message_set()?),
+            "EMAILID" => SearchCriteria::EmailId(self.parse_string()?),
             "MODSEQ" => {
                 // Simplified: MODSEQ value (skip optional entry-name/type).
                 self.skip_ws();
@@ -460,6 +461,15 @@ mod tests {
                 assert_eq!(pattern, "café");
             }
             _ => panic!("expected Header"),
+        }
+    }
+
+    #[test]
+    fn emailid_criterion() {
+        let c = parse_search("EMAILID \"E1234.a\"").unwrap();
+        match c {
+            SearchCriteria::EmailId(id) => assert_eq!(id, "E1234.a"),
+            _ => panic!("expected EmailId"),
         }
     }
 

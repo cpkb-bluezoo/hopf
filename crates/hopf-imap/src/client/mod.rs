@@ -77,8 +77,9 @@ pub use state::{
     parse_thread_response, ImapAppendUid, ImapCapabilities, ImapClientAppend,
     ImapClientAuthExchange, ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated,
     ImapClientPostStarttls, ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData,
-    ImapListEntry, ImapMailboxInfo, ImapNamespace, ImapNamespaceData, ImapQuotaData,
-    ImapQuotaResource, ImapQuotaRootData, ImapStatusData, ImapThreadNode,
+    ImapListEntry, ImapMailboxInfo, ImapMetadataData, ImapMetadataEntry, ImapNamespace,
+    ImapNamespaceData, ImapQuotaData, ImapQuotaResource, ImapQuotaRootData, ImapStatusData,
+    ImapThreadNode,
 };
 pub use timeout::ImapClientTimeouts;
 

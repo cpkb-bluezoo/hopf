@@ -9,6 +9,7 @@ use hopf_mailbox::{Flag, MailboxInfo, MailboxStore};
 
 use super::{AuthenticatedHandler, NotAuthenticatedHandler, SelectedHandler};
 use crate::server::fetch_format::FetchItem;
+use crate::server::metadata::GetMetadataOptions;
 use crate::server::status_items::StatusItem;
 
 /// STORE flag operation.
@@ -136,6 +137,35 @@ pub trait QuotaState {
     /// Protocol performs the quota operation.
     fn proceed(&mut self, handler: Box<dyn AuthenticatedHandler>);
     /// Quota not supported / denied.
+    fn no(&mut self, message: &str, handler: Box<dyn AuthenticatedHandler>);
+}
+
+/// GETMETADATA (RFC 5464).
+pub trait GetMetadataState {
+    /// Protocol runs GETMETADATA on the storage pool for the requested
+    /// entries/options.
+    fn proceed(
+        &mut self,
+        mailbox: String,
+        entries: Vec<String>,
+        options: GetMetadataOptions,
+        handler: Box<dyn AuthenticatedHandler>,
+    );
+    /// Failed / denied.
+    fn no(&mut self, message: &str, handler: Box<dyn AuthenticatedHandler>);
+}
+
+/// SETMETADATA (RFC 5464).
+pub trait SetMetadataState {
+    /// Protocol runs SETMETADATA on the storage pool for the given
+    /// `(entry, value)` pairs (`None` value = delete that entry).
+    fn proceed(
+        &mut self,
+        mailbox: String,
+        entries: Vec<(String, Option<String>)>,
+        handler: Box<dyn AuthenticatedHandler>,
+    );
+    /// Failed / denied.
     fn no(&mut self, message: &str, handler: Box<dyn AuthenticatedHandler>);
 }
 

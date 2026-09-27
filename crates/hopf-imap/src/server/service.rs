@@ -74,6 +74,13 @@ pub struct ImapConfig {
     pub enable_thread_references: bool,
     /// Advertise STATUS=SIZE (RFC 8438).
     pub enable_status_size: bool,
+    /// Advertise and accept OBJECTID (RFC 8474: MAILBOXID / EMAILID).
+    pub enable_objectid: bool,
+    /// Advertise and accept METADATA (RFC 5464).
+    pub enable_metadata: bool,
+    /// Advertise and accept NOTIFY (RFC 5465). See [`crate::server::notify`]
+    /// for which selectors/event-groups this implementation covers.
+    pub enable_notify: bool,
     /// Quota backend (default: unlimited).
     pub quota_manager: Arc<dyn QuotaManager>,
     /// Server ID fields for the ID command (RFC 2971). Empty → built-in defaults.
@@ -133,6 +140,9 @@ impl ImapConfig {
             enable_thread_ordered_subject: true,
             enable_thread_references: true,
             enable_status_size: true,
+            enable_objectid: true,
+            enable_metadata: true,
+            enable_notify: true,
             quota_manager: Arc::new(UnlimitedQuotaManager),
             server_id: BTreeMap::new(),
         }

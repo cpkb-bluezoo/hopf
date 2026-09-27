@@ -331,6 +331,29 @@ impl Mailbox for MaildirMailbox {
         self.uidlist.uid_next
     }
 
+    fn mailbox_id(&self) -> Option<&str> {
+        Some(&self.uidlist.mailboxid)
+    }
+
+    fn email_id(&self, message_number: u32) -> MailboxResult<Option<String>> {
+        let idx = self.seq_index(message_number)?;
+        Ok(Some(compose_email_id(
+            &self.uidlist.mailboxid,
+            self.messages[idx].uid,
+        )))
+    }
+
+    fn sequence_for_email_id(&self, email_id: &str) -> MailboxResult<Option<u32>> {
+        let Some(uid) = parse_email_id(&self.uidlist.mailboxid, email_id) else {
+            return Ok(None);
+        };
+        Ok(self
+            .messages
+            .iter()
+            .position(|m| m.uid == uid)
+            .map(|i| (i + 1) as u32))
+    }
+
     fn flags(&self, message_number: u32) -> MailboxResult<BTreeSet<Flag>> {
         let idx = self.seq_index(message_number)?;
         Ok(self.messages[idx].filename.flags.clone())
@@ -671,6 +694,7 @@ impl Mailbox for MaildirMailbox {
                 body_path,
                 header_path: &m.path,
                 modseq,
+                mailboxid: &self.uidlist.mailboxid,
             };
             if criteria.matches(&ctx).map_err(MailboxError::Io)? {
                 results.push(seq);
@@ -706,6 +730,7 @@ impl Mailbox for MaildirMailbox {
             body_path: None,
             header_path: &m.path,
             modseq,
+            mailboxid: &self.uidlist.mailboxid,
         };
         f(&ctx)
     }
@@ -735,6 +760,7 @@ struct MdMessageContext<'a> {
     body_path: Option<&'a Path>,
     header_path: &'a Path,
     modseq: u64,
+    mailboxid: &'a str,
 }
 
 impl MessageContext for MdMessageContext<'_> {
@@ -789,6 +815,9 @@ impl MessageContext for MdMessageContext<'_> {
     fn modseq(&self) -> Option<u64> {
         Some(self.modseq)
     }
+    fn email_id(&self) -> Option<String> {
+        Some(compose_email_id(self.mailboxid, self.e.uid))
+    }
 }
 
 fn letters_to_keywords(kw: &KeywordsFile, letters: &BTreeSet<char>) -> BTreeSet<String> {
@@ -825,6 +854,24 @@ fn move_new_to_cur(dir: &Path) -> MailboxResult<()> {
         fs::rename(ent.path(), dest)?;
     }
     Ok(())
+}
+
+/// RFC 8474 EMAILID for `uid` within the mailbox identified by `mailboxid`:
+/// `mailboxid` is already account-unique (see `UidList::mailboxid`'s doc
+/// comment), so appending the UID — itself never reused within one
+/// mailbox — as a fixed hex suffix keeps the whole token account-unique
+/// too, with no separate identifier or reverse index to maintain.
+fn compose_email_id(mailboxid: &str, uid: u64) -> String {
+    format!("E{mailboxid}.{uid:x}")
+}
+
+/// Inverse of [`compose_email_id`] for `mailboxid`: `None` if `id` wasn't
+/// composed for this mailbox (wrong prefix, or an unparseable suffix) —
+/// callers treat that as "no such message" rather than an error, same as
+/// any other id that simply doesn't resolve.
+fn parse_email_id(mailboxid: &str, id: &str) -> Option<u64> {
+    let prefix = format!("E{mailboxid}.");
+    u64::from_str_radix(id.strip_prefix(&prefix)?, 16).ok()
 }
 
 fn dir_uid_validity(dir: &Path) -> MailboxResult<u64> {
@@ -1239,5 +1286,85 @@ mod tests {
 
         let result = mb.with_message_context(2, &mut |_| Ok(()));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn mailbox_id_is_stable_across_reopen_and_rename() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("objectiduser").unwrap();
+        store.create_mailbox("Archive").unwrap();
+
+        let id_before = {
+            let mb = store.open_mailbox("Archive", false).unwrap();
+            mb.mailbox_id().unwrap().to_string()
+        };
+        // Reopen: same id.
+        let id_reopened = {
+            let mb = store.open_mailbox("Archive", false).unwrap();
+            mb.mailbox_id().unwrap().to_string()
+        };
+        assert_eq!(id_before, id_reopened);
+
+        // RENAME: the id moves with the directory.
+        store.rename_mailbox("Archive", "Archived").unwrap();
+        let id_after_rename = {
+            let mb = store.open_mailbox("Archived", false).unwrap();
+            mb.mailbox_id().unwrap().to_string()
+        };
+        assert_eq!(id_before, id_after_rename, "RENAME must not change MAILBOXID");
+    }
+
+    #[test]
+    fn email_id_is_stable_and_reverses_to_the_right_sequence() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("emailiduser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        append_whole(mb.as_mut(), &sample("one"), &BTreeSet::new(), None).unwrap();
+        append_whole(mb.as_mut(), &sample("two"), &BTreeSet::new(), None).unwrap();
+
+        let id1 = mb.email_id(1).unwrap().expect("assigned");
+        let id2 = mb.email_id(2).unwrap().expect("assigned");
+        assert_ne!(id1, id2);
+        assert!(id1.starts_with(&format!("E{}.", mb.mailbox_id().unwrap())));
+
+        assert_eq!(mb.sequence_for_email_id(&id1).unwrap(), Some(1));
+        assert_eq!(mb.sequence_for_email_id(&id2).unwrap(), Some(2));
+        assert_eq!(
+            mb.sequence_for_email_id("Ebogus.ff").unwrap(),
+            None,
+            "an id from a different mailbox must not resolve here"
+        );
+
+        // Stable after an EXPUNGE renumbers a later message's sequence:
+        // delete message 1, expunge, and message 2's EMAILID must be
+        // unchanged even though its sequence number is now 1.
+        let mut deleted = BTreeSet::new();
+        deleted.insert(Flag::Deleted);
+        mb.set_flags(1, &deleted, true).unwrap();
+        mb.expunge().unwrap();
+        assert_eq!(mb.message_count().unwrap(), 1);
+        assert_eq!(mb.email_id(1).unwrap().as_deref(), Some(id2.as_str()));
+        assert_eq!(mb.sequence_for_email_id(&id2).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn search_by_email_id_finds_exactly_one_message() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("emailidsearchuser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        append_whole(mb.as_mut(), &sample("one"), &BTreeSet::new(), None).unwrap();
+        append_whole(mb.as_mut(), &sample("two"), &BTreeSet::new(), None).unwrap();
+        let id2 = mb.email_id(2).unwrap().unwrap();
+
+        let hits = mb
+            .search(&crate::search::SearchCriteria::EmailId(id2))
+            .unwrap();
+        assert_eq!(hits, vec![2]);
     }
 }

@@ -11,11 +11,13 @@ use hopf_mailbox::{Flag, Mailbox, MailboxFactory, MailboxStore, MessageSet, Sear
 use super::{
     AppendState, AuthenticateState, AuthenticatedHandler, ClientConnected, CloseState,
     ConnectedState, CopyState, CreateState, DeleteState, ExpungeState, FetchState,
-    ImapConnectionMetadata, ImapHandlerFactory, ListState, MoveState, NotAuthenticatedHandler,
-    QuotaState, RenameState, SearchState, SelectState, SelectedHandler, SortState, StatusState,
-    StoreAction, StoreState, SubscribeState, ThreadState,
+    GetMetadataState, ImapConnectionMetadata, ImapHandlerFactory, ListState, MoveState,
+    NotAuthenticatedHandler, QuotaState, RenameState, SearchState, SelectState, SelectedHandler,
+    SetMetadataState, SortState, StatusState, StoreAction, StoreState, SubscribeState,
+    ThreadState,
 };
 use crate::server::fetch_format::FetchItem;
+use crate::server::metadata::GetMetadataOptions;
 use crate::server::quota::QuotaManager;
 use crate::server::sort::SortKey;
 use crate::server::status_items::StatusItem;
@@ -198,6 +200,32 @@ macro_rules! auth_mailbox_impl {
         ) {
             state.proceed(Box::new(self.clone()));
         }
+
+        fn get_metadata(
+            &mut self,
+            state: &mut dyn GetMetadataState,
+            _store: &dyn MailboxStore,
+            mailbox: &str,
+            entries: &[String],
+            options: &GetMetadataOptions,
+        ) {
+            state.proceed(
+                mailbox.to_string(),
+                entries.to_vec(),
+                options.clone(),
+                Box::new(self.clone()),
+            );
+        }
+
+        fn set_metadata(
+            &mut self,
+            state: &mut dyn SetMetadataState,
+            _store: &dyn MailboxStore,
+            mailbox: &str,
+            entries: &[(String, Option<String>)],
+        ) {
+            state.proceed(mailbox.to_string(), entries.to_vec(), Box::new(self.clone()));
+        }
     };
 }
 
@@ -314,6 +342,27 @@ impl SelectedHandler for DefaultImapHandler {
         quota_root: &str,
     ) {
         AuthenticatedHandler::set_quota(self, state, quota, store, quota_root);
+    }
+
+    fn get_metadata(
+        &mut self,
+        state: &mut dyn GetMetadataState,
+        store: &dyn MailboxStore,
+        mailbox: &str,
+        entries: &[String],
+        options: &GetMetadataOptions,
+    ) {
+        AuthenticatedHandler::get_metadata(self, state, store, mailbox, entries, options);
+    }
+
+    fn set_metadata(
+        &mut self,
+        state: &mut dyn SetMetadataState,
+        store: &dyn MailboxStore,
+        mailbox: &str,
+        entries: &[(String, Option<String>)],
+    ) {
+        AuthenticatedHandler::set_metadata(self, state, store, mailbox, entries);
     }
 
     fn close(&mut self, state: &mut dyn CloseState, _mailbox: &dyn Mailbox) {

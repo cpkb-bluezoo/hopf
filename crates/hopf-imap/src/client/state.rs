@@ -112,6 +112,8 @@ pub struct ImapMailboxInfo {
     pub read_write: Option<bool>,
     /// `HIGHESTMODSEQ` when CONDSTORE is active.
     pub highest_modseq: Option<u64>,
+    /// RFC 8474 `MAILBOXID` response code.
+    pub mailbox_id: Option<String>,
 }
 
 /// Basic parsed FETCH attribute bag (core subset).
@@ -127,6 +129,11 @@ pub struct ImapFetchData {
     pub size: Option<u64>,
     /// `MODSEQ` if present.
     pub modseq: Option<u64>,
+    /// RFC 8474 `EMAILID`, if requested and returned.
+    pub email_id: Option<String>,
+    /// RFC 8474 `THREADID`, if requested and returned as a real value
+    /// (rather than `NIL`).
+    pub thread_id: Option<String>,
     /// Accumulated literal / body octets for simple RFC822 / BODY[] fetches.
     pub body: Vec<u8>,
 }
@@ -152,6 +159,8 @@ pub struct ImapStatusData {
     pub size: Option<u64>,
     /// `HIGHESTMODSEQ`.
     pub highest_modseq: Option<u64>,
+    /// RFC 8474 `MAILBOXID`.
+    pub mailbox_id: Option<String>,
 }
 
 impl ImapStatusData {
@@ -178,6 +187,12 @@ impl ImapStatusData {
                 "DELETED" => data.deleted = val.parse().ok(),
                 "SIZE" => data.size = val.parse().ok(),
                 "HIGHESTMODSEQ" => data.highest_modseq = val.parse().ok(),
+                "MAILBOXID" => {
+                    data.mailbox_id = val
+                        .strip_prefix('(')
+                        .and_then(|s| s.strip_suffix(')'))
+                        .map(|s| s.to_string());
+                }
                 _ => {}
             }
         }
@@ -227,6 +242,60 @@ impl ImapListEntry {
             delimiter,
             name,
         })
+    }
+}
+
+/// One RFC 5464 METADATA entry/value pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImapMetadataEntry {
+    /// Annotation entry path (e.g. `/private/comment`).
+    pub entry: String,
+    /// Its value; `None` for a literal `NIL` (not expected in a
+    /// GETMETADATA response per RFC 5464 §3, but tolerated).
+    pub value: Option<String>,
+}
+
+/// Parsed untagged `METADATA` response.
+///
+/// Values sent as a wire literal (`{n}\r\n…`) rather than a quoted string
+/// or bare atom aren't supported — the same limitation `ImapNamespaceData`
+/// / `ImapQuotaData` already have, inherited from the lexer's single-line
+/// bounded-capture for these responses (see [`super::reply::ImapEvent::Metadata`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ImapMetadataData {
+    /// Mailbox the entries apply to (`""` = server annotations).
+    pub mailbox: String,
+    /// `(entry, value)` pairs, in response order.
+    pub entries: Vec<ImapMetadataEntry>,
+}
+
+impl ImapMetadataData {
+    /// Parse `mailbox (entry value entry value …)` — the `METADATA`
+    /// keyword itself is already consumed by the lexer's bounded capture.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let rest = raw.trim_start();
+        let (mailbox, items) = split_mailbox_and_list(rest)?;
+        let mut entries = Vec::new();
+        let mut cursor = items.as_str();
+        loop {
+            cursor = cursor.trim_start();
+            if cursor.is_empty() {
+                break;
+            }
+            let (entry_tok, after) = split_astring(cursor)?;
+            let entry = unquote(entry_tok);
+            let after = after.trim_start();
+            let (value, after) = if after.get(..3).map(|s| s.eq_ignore_ascii_case("NIL")) == Some(true)
+            {
+                (None, after[3..].trim_start())
+            } else {
+                let (value_tok, after) = split_astring(after)?;
+                (Some(unquote(value_tok)), after)
+            };
+            entries.push(ImapMetadataEntry { entry, value });
+            cursor = after;
+        }
+        Some(Self { mailbox, entries })
     }
 }
 
@@ -528,6 +597,21 @@ pub trait ImapClientAuthenticated {
     fn get_quota_root(&mut self, mailbox: &str);
     /// Send `SETQUOTA` when advertised (`resources` = `"STORAGE 1024 MESSAGE 100"`).
     fn set_quota(&mut self, root: &str, resources: &str);
+    /// Send `GETMETADATA mailbox (entries…)` when advertised. `mailbox`
+    /// is `""` for server annotations; `options` is an already-formatted
+    /// `(DEPTH … MAXSIZE …)` prefix, or empty for none.
+    fn get_metadata(&mut self, mailbox: &str, entries: &str, options: &str);
+    /// Send `SETMETADATA mailbox (entry value…)` when advertised.
+    /// `entries` is an already-formatted `entry value entry value…` body
+    /// (a value of `NIL` deletes that entry).
+    fn set_metadata(&mut self, mailbox: &str, entries: &str);
+    /// Send `NOTIFY SET (SELECTED <events>)` when advertised — see
+    /// `crate::server::notify` for which selectors/event-groups a hopf
+    /// server actually supports (`events` is e.g.
+    /// `"MessageNew MessageExpunge FlagChange"`).
+    fn notify_set_selected(&mut self, events: &str);
+    /// Send `NOTIFY NONE` when advertised.
+    fn notify_none(&mut self);
     /// Enter IDLE (RFC 2177) when advertised.
     fn idle(&mut self);
     /// Send `NOOP`.

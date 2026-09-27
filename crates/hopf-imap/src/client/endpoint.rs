@@ -23,8 +23,8 @@ use super::state::{
     parse_thread_response, ImapAppendUid, ImapCapabilities, ImapClientAppend,
     ImapClientAuthExchange, ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated,
     ImapClientPostStarttls, ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData,
-    ImapListEntry, ImapMailboxInfo, ImapNamespaceData, ImapQuotaData, ImapQuotaRootData,
-    ImapStatusData,
+    ImapListEntry, ImapMailboxInfo, ImapMetadataData, ImapNamespaceData, ImapQuotaData,
+    ImapQuotaRootData, ImapStatusData,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +367,7 @@ impl ImapClientEndpoint {
             ImapEvent::Quota(payload) => self.on_quota(&payload, ep),
             ImapEvent::QuotaRoot(payload) => self.on_quota_root(&payload, ep),
             ImapEvent::IdParams(payload) => self.on_id_params(&payload, ep),
+            ImapEvent::Metadata(payload) => self.on_metadata(&payload, ep),
             ImapEvent::Other => {}
         }
     }
@@ -422,6 +423,16 @@ impl ImapClientEndpoint {
             self.select_info.unseen = v.trim().parse().ok();
         } else if let Some(v) = cu.strip_prefix("HIGHESTMODSEQ ") {
             self.select_info.highest_modseq = v.trim().parse().ok();
+        } else if cu.starts_with("MAILBOXID (") {
+            // Extracted from the original-case `code`, not `cu` — the
+            // objectid itself is case-sensitive, unlike the keyword.
+            self.select_info.mailbox_id = code
+                .find('(')
+                .and_then(|start| {
+                    code[start + 1..]
+                        .find(')')
+                        .map(|end| code[start + 1..start + 1 + end].to_string())
+                });
         } else if cu.starts_with("PERMANENTFLAGS") {
             let rest = code.get("PERMANENTFLAGS".len()..).unwrap_or("").trim_start();
             self.select_info.permanent_flags = parse_flag_list(rest);
@@ -747,6 +758,19 @@ impl ImapClientEndpoint {
         }
     }
 
+    fn on_metadata(&mut self, payload: &str, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if self.pending.oldest_of_kind(PendingKind::Metadata).is_none() {
+            return;
+        }
+        if let Some(data) = ImapMetadataData::parse(payload) {
+            if let Some(mut driver) = self.driver.take() {
+                driver.on_metadata(&data);
+                self.driver = Some(driver);
+            }
+        }
+    }
+
     fn on_continuation(&mut self, text: String, ep: &mut dyn Endpoint) {
         let owner = self.pending.continuation_owner().map(|s| s.to_string());
         let kind = owner
@@ -1057,6 +1081,22 @@ impl ImapClientEndpoint {
                 driver.on_quota_complete(self, ep, status, &message);
                 self.driver = Some(driver);
             }
+            PendingKind::Metadata => {
+                let mut driver = match self.driver.take() {
+                    Some(d) => d,
+                    None => return,
+                };
+                driver.on_metadata_complete(ep, status, &message);
+                self.driver = Some(driver);
+            }
+            PendingKind::Notify => {
+                let mut driver = match self.driver.take() {
+                    Some(d) => d,
+                    None => return,
+                };
+                driver.on_notify_complete(ep, status, &message);
+                self.driver = Some(driver);
+            }
             PendingKind::Close | PendingKind::Unselect => {
                 if status == ImapStatus::Ok {
                     self.session = SessionState::Authenticated;
@@ -1269,6 +1309,46 @@ impl ImapClientAuthenticated for ImapClientEndpoint {
         };
         let cmd = format!("SETQUOTA {} {res}", Self::quote_astring(root));
         let _ = self.issue_no_ep(PendingKind::Quota, &cmd);
+    }
+
+    fn get_metadata(&mut self, mailbox: &str, entries: &str, options: &str) {
+        let opts = options.trim();
+        let mut cmd = String::from("GETMETADATA ");
+        if !opts.is_empty() {
+            cmd.push_str(opts);
+            cmd.push(' ');
+        }
+        cmd.push_str(&Self::quote_astring(mailbox));
+        cmd.push(' ');
+        let entries = entries.trim();
+        if entries.starts_with('(') {
+            cmd.push_str(entries);
+        } else {
+            cmd.push('(');
+            cmd.push_str(entries);
+            cmd.push(')');
+        }
+        let _ = self.issue_no_ep(PendingKind::Metadata, &cmd);
+    }
+
+    fn set_metadata(&mut self, mailbox: &str, entries: &str) {
+        let entries = entries.trim();
+        let entries = if entries.starts_with('(') {
+            entries.to_string()
+        } else {
+            format!("({entries})")
+        };
+        let cmd = format!("SETMETADATA {} {entries}", Self::quote_astring(mailbox));
+        let _ = self.issue_no_ep(PendingKind::Metadata, &cmd);
+    }
+
+    fn notify_set_selected(&mut self, events: &str) {
+        let cmd = format!("NOTIFY SET (SELECTED {})", events.trim());
+        let _ = self.issue_no_ep(PendingKind::Notify, &cmd);
+    }
+
+    fn notify_none(&mut self) {
+        let _ = self.issue_no_ep(PendingKind::Notify, "NOTIFY NONE");
     }
 
     fn idle(&mut self) {
@@ -2015,6 +2095,35 @@ mod tests {
                 .unwrap()
                 .push(format!("store_done:{status:?}"));
         }
+        fn on_metadata(&mut self, data: &ImapMetadataData) {
+            let entries = data
+                .entries
+                .iter()
+                .map(|e| format!("{}={}", e.entry, e.value.as_deref().unwrap_or("NIL")))
+                .collect::<Vec<_>>()
+                .join(",");
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("metadata:{}:{entries}", data.mailbox));
+        }
+        fn on_metadata_complete(
+            &mut self,
+            _e: &mut dyn Endpoint,
+            status: ImapStatus,
+            _m: &str,
+        ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("metadata_done:{status:?}"));
+        }
+        fn on_notify_complete(&mut self, _e: &mut dyn Endpoint, status: ImapStatus, _m: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("notify_done:{status:?}"));
+        }
         fn on_move_complete(
             &mut self,
             _s: &mut dyn ImapClientSelected,
@@ -2343,6 +2452,72 @@ mod tests {
         );
         assert!(
             events.iter().any(|e| e.starts_with("thread_done")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_and_notify_callbacks() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut ep = make_ep(&log);
+        ep.session = SessionState::Authenticated;
+        let mut fake = FakeEp::new();
+
+        ImapClientAuthenticated::get_metadata(&mut ep, "INBOX", "/private/comment", "");
+        ep.flush_outbound(&mut fake);
+        assert!(
+            fake.sent_str()
+                .contains("GETMETADATA INBOX (/private/comment)"),
+            "{}",
+            fake.sent_str()
+        );
+        feed(
+            &mut ep,
+            &mut fake,
+            b"* METADATA INBOX (/private/comment \"hello\")\r\nA000 OK GETMETADATA completed\r\n",
+        );
+        let events = log.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|e| e == "metadata:INBOX:/private/comment=hello"),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e.starts_with("metadata_done")),
+            "{events:?}"
+        );
+
+        ImapClientAuthenticated::set_metadata(&mut ep, "INBOX", "/private/comment NIL");
+        ep.flush_outbound(&mut fake);
+        assert!(
+            fake.sent_str()
+                .contains("SETMETADATA INBOX (/private/comment NIL)"),
+            "{}",
+            fake.sent_str()
+        );
+        feed(&mut ep, &mut fake, b"A001 OK SETMETADATA completed\r\n");
+        let events = log.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e.starts_with("metadata_done")),
+            "{events:?}"
+        );
+
+        ImapClientAuthenticated::notify_set_selected(
+            &mut ep,
+            "MessageNew MessageExpunge FlagChange",
+        );
+        ep.flush_outbound(&mut fake);
+        assert!(
+            fake.sent_str()
+                .contains("NOTIFY SET (SELECTED MessageNew MessageExpunge FlagChange)"),
+            "{}",
+            fake.sent_str()
+        );
+        feed(&mut ep, &mut fake, b"A002 OK NOTIFY completed\r\n");
+        let events = log.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e.starts_with("notify_done")),
             "{events:?}"
         );
     }

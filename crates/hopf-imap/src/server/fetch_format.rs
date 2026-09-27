@@ -41,6 +41,13 @@ pub enum FetchItem {
     Envelope,
     /// `BODYSTRUCTURE` (RFC 9051 §7.5.2, recursive MIME structure).
     BodyStructure,
+    /// `EMAILID` (RFC 8474 OBJECTID) — always has a value once assigned.
+    EmailId,
+    /// `THREADID` (RFC 8474 OBJECTID) — this implementation never assigns
+    /// one, so it always formats as `THREADID NIL` (a compliant answer:
+    /// THREADID support beyond OBJECTID's own MAILBOXID/EMAILID pair is
+    /// optional).
+    ThreadId,
     /// Unknown / passthrough atom (echoed as NIL).
     Other(String),
 }
@@ -149,6 +156,8 @@ fn parse_one_item(tok: &str) -> Result<FetchItem, String> {
         "MODSEQ" => FetchItem::ModSeq,
         "ENVELOPE" => FetchItem::Envelope,
         "BODYSTRUCTURE" => FetchItem::BodyStructure,
+        "EMAILID" => FetchItem::EmailId,
+        "THREADID" => FetchItem::ThreadId,
         _ if upper.starts_with("BODY.PEEK[") || upper.starts_with("BODY[") => {
             let peek = upper.starts_with("BODY.PEEK[");
             let section_start = tok.find('[').ok_or("bad BODY item")?;
@@ -470,6 +479,7 @@ fn parse_fetch_modifiers(s: &str) -> Result<FetchModifiers, String> {
 /// Build one untagged FETCH body (without the `* N FETCH` prefix / CRLF).
 ///
 /// Returns the parenthesized attribute list bytes, e.g. `(FLAGS (\\Seen) UID 1)`.
+#[allow(clippy::too_many_arguments)]
 pub fn format_fetch_attrs(
     items: &[FetchItem],
     seq: u32,
@@ -480,6 +490,7 @@ pub fn format_fetch_attrs(
     msg: Option<&[u8]>,
     by_uid: bool,
     modseq: Option<u64>,
+    email_id: Option<&str>,
 ) -> Vec<u8> {
     let _ = seq;
     let mut out = Vec::from(b"(".as_slice());
@@ -568,6 +579,13 @@ pub fn format_fetch_attrs(
                     None => b"NIL".to_vec(),
                 };
                 emit("BODYSTRUCTURE", &bytes, &mut out, &mut first);
+            }
+            FetchItem::EmailId => {
+                let v = format!("({})", email_id.unwrap_or(""));
+                emit("EMAILID", v.as_bytes(), &mut out, &mut first);
+            }
+            FetchItem::ThreadId => {
+                emit("THREADID", b"NIL", &mut out, &mut first);
             }
             FetchItem::Other(name) => {
                 emit(name, b"NIL", &mut out, &mut first);
@@ -730,6 +748,7 @@ pub fn push_fetch_attrs(
     keywords: &BTreeSet<String>,
     by_uid: bool,
     modseq: Option<u64>,
+    email_id: Option<&str>,
     push: &mut dyn FnMut(&[u8]),
 ) -> MailboxResult<()> {
     let needs_header_scan = items.iter().any(|it| {
@@ -875,6 +894,14 @@ pub fn push_fetch_attrs(
                 push(b"BODYSTRUCTURE ");
                 push(&format_bodystructure(node));
             }
+            FetchItem::EmailId => {
+                push(b"EMAILID (");
+                push(email_id.unwrap_or("").as_bytes());
+                push(b")");
+            }
+            FetchItem::ThreadId => {
+                push(b"THREADID NIL");
+            }
             FetchItem::Other(name) => {
                 push(name.as_bytes());
                 push(b" NIL");
@@ -1009,7 +1036,7 @@ mod tests {
         let flags = BTreeSet::new();
         let keywords = BTreeSet::new();
         let mut out = Vec::new();
-        push_fetch_attrs(mb, items, 1, 1, size, &flags, &keywords, false, None, &mut |c| {
+        push_fetch_attrs(mb, items, 1, 1, size, &flags, &keywords, false, None, None, &mut |c| {
             out.extend_from_slice(c);
         })
         .unwrap();
@@ -1054,6 +1081,7 @@ mod tests {
             Some(&msg),
             false,
             None,
+            None,
         );
         assert_eq!(streamed, whole);
     }
@@ -1090,6 +1118,7 @@ mod tests {
             Some(&msg),
             false,
             None,
+            None,
         );
         assert_eq!(streamed, whole);
     }
@@ -1115,6 +1144,7 @@ mod tests {
             &BTreeSet::new(),
             Some(&msg),
             false,
+            None,
             None,
         );
         assert_eq!(streamed, whole);
@@ -1164,6 +1194,7 @@ mod tests {
             Some(&msg),
             false,
             None,
+            None,
         );
         assert_eq!(streamed, whole);
     }
@@ -1172,6 +1203,65 @@ mod tests {
     fn parse_envelope_and_bodystructure_items() {
         let items = parse_fetch_items("(ENVELOPE BODYSTRUCTURE)").unwrap();
         assert_eq!(items, vec![FetchItem::Envelope, FetchItem::BodyStructure]);
+    }
+
+    #[test]
+    fn parse_emailid_and_threadid_items() {
+        let items = parse_fetch_items("(EMAILID THREADID)").unwrap();
+        assert_eq!(items, vec![FetchItem::EmailId, FetchItem::ThreadId]);
+    }
+
+    #[test]
+    fn format_emailid_and_threadid() {
+        let attrs = format_fetch_attrs(
+            &[FetchItem::EmailId, FetchItem::ThreadId],
+            1,
+            1,
+            0,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+            false,
+            None,
+            Some("E1234.a"),
+        );
+        assert_eq!(attrs, b"(EMAILID (E1234.a) THREADID NIL)");
+    }
+
+    #[test]
+    fn push_emailid_and_threadid_matches_format() {
+        let msg = b"From: a@b\r\n\r\nbody\r\n".to_vec();
+        let (_dir, mut mb) = mailbox_with(&msg);
+        let size = msg.len() as u64;
+        let items = vec![FetchItem::EmailId, FetchItem::ThreadId];
+        let mut streamed = Vec::new();
+        push_fetch_attrs(
+            mb.as_mut(),
+            &items,
+            1,
+            1,
+            size,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false,
+            None,
+            Some("E1234.a"),
+            &mut |c| streamed.extend_from_slice(c),
+        )
+        .unwrap();
+        let whole = format_fetch_attrs(
+            &items,
+            1,
+            1,
+            size,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            Some(&msg),
+            false,
+            None,
+            Some("E1234.a"),
+        );
+        assert_eq!(streamed, whole);
     }
 
     #[test]
@@ -1238,6 +1328,7 @@ mod tests {
             Some(&msg),
             false,
             None,
+            None,
         );
         assert_eq!(streamed, whole);
         let s = String::from_utf8_lossy(&streamed);
@@ -1286,6 +1377,7 @@ mod tests {
             Some(&msg),
             false,
             None,
+            None,
         );
         assert_eq!(streamed, whole);
     }
@@ -1306,6 +1398,7 @@ mod tests {
             &BTreeSet::new(),
             Some(&msg),
             false,
+            None,
             None,
         );
         assert_eq!(streamed, whole);
@@ -1332,6 +1425,7 @@ mod tests {
             &BTreeSet::new(),
             Some(&msg),
             false,
+            None,
             None,
         );
         assert_eq!(streamed, whole);
@@ -1360,6 +1454,7 @@ mod tests {
             &BTreeSet::new(),
             Some(&msg),
             false,
+            None,
             None,
         );
         assert_eq!(streamed, whole);
