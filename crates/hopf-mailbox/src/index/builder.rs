@@ -15,7 +15,8 @@ use crate::flag::Flag;
 
 use super::entry::{
     IndexEntry, DESCRIPTOR_COUNT_BODY, DESCRIPTOR_COUNT_HEADERS, DESC_BCC, DESC_BODY, DESC_CC,
-    DESC_FROM, DESC_KEYWORDS, DESC_LOCATION, DESC_MESSAGE_ID, DESC_SUBJECT, DESC_TO,
+    DESC_FROM, DESC_IN_REPLY_TO, DESC_KEYWORDS, DESC_LOCATION, DESC_MESSAGE_ID, DESC_REFERENCES,
+    DESC_SUBJECT, DESC_TO,
 };
 
 /// Collects indexed fields while parsing a message.
@@ -27,6 +28,13 @@ struct CollectHandler {
     bcc: String,
     subject: String,
     message_id: String,
+    /// `References` header's message-IDs, space-joined in header order
+    /// (RFC 5256 THREAD REFERENCES walks the whole chain).
+    references: String,
+    /// `In-Reply-To` header's message-IDs, space-joined (the threading
+    /// algorithm only uses the first, but the full header is kept intact
+    /// same as `references`).
+    in_reply_to: String,
     sent_millis: i64,
     body: Vec<u8>,
     capture_body: bool,
@@ -92,6 +100,10 @@ impl MessageHandler for CollectHandler {
             if let Some(id) = content_ids.first() {
                 self.message_id = id.to_string().to_ascii_lowercase();
             }
+        } else if name.eq_ignore_ascii_case("References") && self.references.is_empty() {
+            self.references = join_ids(content_ids);
+        } else if name.eq_ignore_ascii_case("In-Reply-To") && self.in_reply_to.is_empty() {
+            self.in_reply_to = join_ids(content_ids);
         }
         Ok(())
     }
@@ -207,6 +219,8 @@ impl IndexBuilder {
         props[DESC_SUBJECT] = handler.subject;
         props[DESC_MESSAGE_ID] = handler.message_id;
         props[DESC_KEYWORDS] = kw;
+        props[DESC_REFERENCES] = handler.references;
+        props[DESC_IN_REPLY_TO] = handler.in_reply_to;
         if self.config.body_indexing {
             let body = String::from_utf8_lossy(&handler.body).to_ascii_lowercase();
             props[DESC_BODY] = truncate_str(body, self.config.max_body_bytes);
@@ -222,6 +236,13 @@ impl IndexBuilder {
             props,
         ))
     }
+}
+
+fn join_ids(ids: &[ContentId]) -> String {
+    ids.iter()
+        .map(|id| id.to_string().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn join_addrs(addrs: &[EmailAddress]) -> String {
@@ -326,6 +347,55 @@ This is the body.\r\nSecond line of the body.\r\n";
         );
         assert_eq!(entry.prop(DESC_FROM), "alice@example.com");
         assert_eq!(entry.prop(DESC_SUBJECT), "hello there");
+    }
+
+    const REPLY_MSG: &[u8] = b"From: bob@example.com\r\n\
+Subject: Re: Hello there\r\n\
+Message-ID: <reply-1@example.com>\r\n\
+In-Reply-To: <orig-1@example.com>\r\n\
+References: <orig-0@example.com> <orig-1@example.com>\r\n\
+\r\n\
+Thanks!\r\n";
+
+    #[test]
+    fn build_indexes_references_and_in_reply_to() {
+        let builder = IndexBuilder::new(IndexConfig::default());
+        let entry = builder.build(
+            2,
+            2,
+            REPLY_MSG.len() as u64,
+            "loc",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            0,
+            REPLY_MSG,
+        );
+        assert_eq!(
+            entry.references(),
+            Some("<orig-0@example.com> <orig-1@example.com>")
+        );
+        assert_eq!(entry.in_reply_to(), Some("<orig-1@example.com>"));
+    }
+
+    #[test]
+    fn build_without_references_header_reports_empty_not_missing() {
+        // A message with no References/In-Reply-To still gets the new
+        // descriptors (empty strings, not absent) — it's freshly indexed
+        // by *this* build, so it's never the "old entry" case
+        // `IndexEntry::references`/`in_reply_to` (`None`) exists for.
+        let builder = IndexBuilder::new(IndexConfig::default());
+        let entry = builder.build(
+            1,
+            1,
+            MSG.len() as u64,
+            "loc",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            0,
+            MSG,
+        );
+        assert_eq!(entry.references(), Some(""));
+        assert_eq!(entry.in_reply_to(), Some(""));
     }
 
     #[test]

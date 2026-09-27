@@ -8,7 +8,10 @@ mod gidx;
 
 pub use builder::IndexBuilder;
 pub use entry::IndexEntry;
-pub use gidx::{IndexFile, INDEX_MAGIC, INDEX_VERSION_BODY, INDEX_VERSION_HEADERS};
+pub use gidx::{
+    IndexFile, INDEX_MAGIC, INDEX_VERSION_BODY, INDEX_VERSION_HEADERS, INDEX_VERSION_THREADING,
+    INDEX_VERSION_THREADING_BODY,
+};
 
 use std::collections::BTreeMap;
 use std::io;
@@ -76,9 +79,9 @@ impl MessageIndex {
             return Ok(());
         }
         let version = if self.config.body_indexing {
-            INDEX_VERSION_BODY
+            INDEX_VERSION_THREADING_BODY
         } else {
-            INDEX_VERSION_HEADERS
+            INDEX_VERSION_THREADING
         };
         let file = IndexFile {
             version,

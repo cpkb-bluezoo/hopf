@@ -9,7 +9,8 @@ pub use default::{DefaultImapHandler, DefaultImapHandlerFactory};
 pub use state::{
     AppendState, AuthenticateState, CloseState, ConnectedState, CopyState, CreateState,
     DeleteState, ExpungeState, FetchState, ListState, MoveState, QuotaState, RenameState,
-    SearchState, SelectState, StatusState, StoreAction, StoreState, SubscribeState,
+    SearchState, SelectState, SortState, StatusState, StoreAction, StoreState, SubscribeState,
+    ThreadState,
 };
 
 use std::collections::BTreeSet;
@@ -258,6 +259,24 @@ pub trait SelectedHandler: Send {
         state: &mut dyn SearchState,
         mailbox: &dyn Mailbox,
         criteria: &SearchCriteria,
+        by_uid: bool,
+    );
+    /// SORT / UID SORT (RFC 5256).
+    fn sort(
+        &mut self,
+        state: &mut dyn SortState,
+        mailbox: &dyn Mailbox,
+        sort_criteria: &[crate::server::sort::SortKey],
+        search_criteria: &SearchCriteria,
+        by_uid: bool,
+    );
+    /// THREAD / UID THREAD (RFC 5256).
+    fn thread(
+        &mut self,
+        state: &mut dyn ThreadState,
+        mailbox: &dyn Mailbox,
+        algorithm: crate::server::thread::ThreadAlgorithm,
+        search_criteria: &SearchCriteria,
         by_uid: bool,
     );
     /// COPY / UID COPY.

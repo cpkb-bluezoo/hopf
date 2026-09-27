@@ -12,12 +12,14 @@ use super::{
     AppendState, AuthenticateState, AuthenticatedHandler, ClientConnected, CloseState,
     ConnectedState, CopyState, CreateState, DeleteState, ExpungeState, FetchState,
     ImapConnectionMetadata, ImapHandlerFactory, ListState, MoveState, NotAuthenticatedHandler,
-    QuotaState, RenameState, SearchState, SelectState, SelectedHandler, StatusState, StoreAction,
-    StoreState, SubscribeState,
+    QuotaState, RenameState, SearchState, SelectState, SelectedHandler, SortState, StatusState,
+    StoreAction, StoreState, SubscribeState, ThreadState,
 };
 use crate::server::fetch_format::FetchItem;
 use crate::server::quota::QuotaManager;
+use crate::server::sort::SortKey;
 use crate::server::status_items::StatusItem;
+use crate::server::thread::ThreadAlgorithm;
 
 /// Factory for [`DefaultImapHandler`].
 pub struct DefaultImapHandlerFactory {
@@ -359,6 +361,28 @@ impl SelectedHandler for DefaultImapHandler {
         state: &mut dyn SearchState,
         _mailbox: &dyn Mailbox,
         _criteria: &SearchCriteria,
+        by_uid: bool,
+    ) {
+        state.proceed(by_uid, Box::new(self.clone()));
+    }
+
+    fn sort(
+        &mut self,
+        state: &mut dyn SortState,
+        _mailbox: &dyn Mailbox,
+        _sort_criteria: &[SortKey],
+        _search_criteria: &SearchCriteria,
+        by_uid: bool,
+    ) {
+        state.proceed(by_uid, Box::new(self.clone()));
+    }
+
+    fn thread(
+        &mut self,
+        state: &mut dyn ThreadState,
+        _mailbox: &dyn Mailbox,
+        _algorithm: ThreadAlgorithm,
+        _search_criteria: &SearchCriteria,
         by_uid: bool,
     ) {
         state.proceed(by_uid, Box::new(self.clone()));

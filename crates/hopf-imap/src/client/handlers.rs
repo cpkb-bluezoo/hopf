@@ -194,6 +194,40 @@ pub trait ImapClientDriver: Send {
         let _ = (selected, ep, status, message);
     }
 
+    /// Untagged SORT numbers.
+    fn on_sort_numbers(&mut self, numbers: &[u32]) {
+        let _ = numbers;
+    }
+
+    /// SORT completed.
+    fn on_sort_complete(
+        &mut self,
+        selected: &mut dyn ImapClientSelected,
+        ep: &mut dyn Endpoint,
+        status: ImapStatus,
+        message: &str,
+    ) {
+        let _ = (selected, ep, status, message);
+    }
+
+    /// Parsed THREAD response (empty when the server sent no untagged
+    /// THREAD at all — RFC 5256 §2 omits it when there's nothing to
+    /// thread).
+    fn on_thread_data(&mut self, threads: &[crate::client::state::ImapThreadNode]) {
+        let _ = threads;
+    }
+
+    /// THREAD completed.
+    fn on_thread_complete(
+        &mut self,
+        selected: &mut dyn ImapClientSelected,
+        ep: &mut dyn Endpoint,
+        status: ImapStatus,
+        message: &str,
+    ) {
+        let _ = (selected, ep, status, message);
+    }
+
     /// Parsed LIST / LSUB entry.
     fn on_list_entry(&mut self, entry: &ImapListEntry) {
         let _ = entry;

@@ -74,11 +74,11 @@ pub use pending::{
 pub use pipeline::{pipeline_status_and_list, ImapFetch, ImapIdle, MessageReceiveCallback};
 pub use reply::{ImapEvent, ImapReplyLexer, ImapStatus, MAX_TOKEN};
 pub use state::{
-    ImapAppendUid, ImapCapabilities, ImapClientAppend, ImapClientAuthExchange,
-    ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls,
-    ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData, ImapListEntry,
-    ImapMailboxInfo, ImapNamespace, ImapNamespaceData, ImapQuotaData, ImapQuotaResource,
-    ImapQuotaRootData, ImapStatusData,
+    parse_thread_response, ImapAppendUid, ImapCapabilities, ImapClientAppend,
+    ImapClientAuthExchange, ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated,
+    ImapClientPostStarttls, ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData,
+    ImapListEntry, ImapMailboxInfo, ImapNamespace, ImapNamespaceData, ImapQuotaData,
+    ImapQuotaResource, ImapQuotaRootData, ImapStatusData, ImapThreadNode,
 };
 pub use timeout::ImapClientTimeouts;
 

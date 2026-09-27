@@ -20,10 +20,11 @@ use super::handlers::{ImapClientDriver, ImapClientHandlerFactory};
 use super::pending::{ImapTagGenerator, PendingCommand, PendingKind, PendingMap, UntaggedClass};
 use super::reply::{ImapEvent, ImapReplyLexer, ImapStatus};
 use super::state::{
-    ImapAppendUid, ImapCapabilities, ImapClientAppend, ImapClientAuthExchange,
-    ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls,
-    ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData, ImapListEntry,
-    ImapMailboxInfo, ImapNamespaceData, ImapQuotaData, ImapQuotaRootData, ImapStatusData,
+    parse_thread_response, ImapAppendUid, ImapCapabilities, ImapClientAppend,
+    ImapClientAuthExchange, ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated,
+    ImapClientPostStarttls, ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData,
+    ImapListEntry, ImapMailboxInfo, ImapNamespaceData, ImapQuotaData, ImapQuotaRootData,
+    ImapStatusData,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +350,8 @@ impl ImapClientEndpoint {
             ImapEvent::ListEntry(entry) => self.on_list_entry(entry, ep),
             ImapEvent::StatusData(data) => self.on_status_data(data, ep),
             ImapEvent::SearchNumbers(nums) => self.on_search_numbers(nums, ep),
+            ImapEvent::SortNumbers(nums) => self.on_sort_numbers(nums, ep),
+            ImapEvent::ThreadData(payload) => self.on_thread_data(&payload, ep),
             ImapEvent::Exists(n) => self.on_exists(n, ep),
             ImapEvent::Recent(n) => self.on_recent(n, ep),
             ImapEvent::Expunge(n) => self.on_expunge(n, ep),
@@ -500,6 +503,31 @@ impl ImapClientEndpoint {
             self.driver = Some(driver);
         }
         let _ = ep;
+    }
+
+    fn on_sort_numbers(&mut self, nums: Vec<u32>, ep: &mut dyn Endpoint) {
+        if self.pending.oldest_compatible(UntaggedClass::Sort).is_none() {
+            return;
+        }
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_sort_numbers(&nums);
+            self.driver = Some(driver);
+        }
+        let _ = ep;
+    }
+
+    fn on_thread_data(&mut self, payload: &str, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if self.pending.oldest_of_kind(PendingKind::Thread).is_none() {
+            return;
+        }
+        let Some(threads) = parse_thread_response(payload) else {
+            return;
+        };
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_thread_data(&threads);
+            self.driver = Some(driver);
+        }
     }
 
     fn on_exists(&mut self, n: u32, ep: &mut dyn Endpoint) {
@@ -892,6 +920,22 @@ impl ImapClientEndpoint {
                     None => return,
                 };
                 driver.on_search_complete(self, ep, status, &message);
+                self.driver = Some(driver);
+            }
+            PendingKind::Sort => {
+                let mut driver = match self.driver.take() {
+                    Some(d) => d,
+                    None => return,
+                };
+                driver.on_sort_complete(self, ep, status, &message);
+                self.driver = Some(driver);
+            }
+            PendingKind::Thread => {
+                let mut driver = match self.driver.take() {
+                    Some(d) => d,
+                    None => return,
+                };
+                driver.on_thread_complete(self, ep, status, &message);
                 self.driver = Some(driver);
             }
             PendingKind::List => {
@@ -1312,6 +1356,26 @@ impl ImapClientSelected for ImapClientEndpoint {
     fn uid_search(&mut self, criteria: &str) {
         let cmd = format!("UID SEARCH {criteria}");
         let _ = self.issue_no_ep(PendingKind::Search, &cmd);
+    }
+
+    fn sort(&mut self, sort_criteria: &str, charset: &str, search_criteria: &str) {
+        let cmd = format!("SORT {sort_criteria} {charset} {search_criteria}");
+        let _ = self.issue_no_ep(PendingKind::Sort, &cmd);
+    }
+
+    fn uid_sort(&mut self, sort_criteria: &str, charset: &str, search_criteria: &str) {
+        let cmd = format!("UID SORT {sort_criteria} {charset} {search_criteria}");
+        let _ = self.issue_no_ep(PendingKind::Sort, &cmd);
+    }
+
+    fn thread(&mut self, algorithm: &str, charset: &str, search_criteria: &str) {
+        let cmd = format!("THREAD {algorithm} {charset} {search_criteria}");
+        let _ = self.issue_no_ep(PendingKind::Thread, &cmd);
+    }
+
+    fn uid_thread(&mut self, algorithm: &str, charset: &str, search_criteria: &str) {
+        let cmd = format!("UID THREAD {algorithm} {charset} {search_criteria}");
+        let _ = self.issue_no_ep(PendingKind::Thread, &cmd);
     }
 
     fn store(&mut self, sequence_set: &str, action: &str, flags: &str) {
@@ -1888,6 +1952,57 @@ mod tests {
                 .unwrap()
                 .push(format!("search_done:{status:?}"));
         }
+        fn on_sort_numbers(&mut self, numbers: &[u32]) {
+            self.events.lock().unwrap().push(format!(
+                "sort:{}",
+                numbers
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        fn on_sort_complete(
+            &mut self,
+            _s: &mut dyn ImapClientSelected,
+            _e: &mut dyn Endpoint,
+            status: ImapStatus,
+            _m: &str,
+        ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("sort_done:{status:?}"));
+        }
+        fn on_thread_data(&mut self, threads: &[crate::client::state::ImapThreadNode]) {
+            fn fmt(n: &crate::client::state::ImapThreadNode) -> String {
+                if n.children.is_empty() {
+                    n.result_number.to_string()
+                } else {
+                    format!(
+                        "{}({})",
+                        n.result_number,
+                        n.children.iter().map(fmt).collect::<Vec<_>>().join(",")
+                    )
+                }
+            }
+            self.events.lock().unwrap().push(format!(
+                "thread:{}",
+                threads.iter().map(fmt).collect::<Vec<_>>().join(";")
+            ));
+        }
+        fn on_thread_complete(
+            &mut self,
+            _s: &mut dyn ImapClientSelected,
+            _e: &mut dyn Endpoint,
+            status: ImapStatus,
+            _m: &str,
+        ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("thread_done:{status:?}"));
+        }
         fn on_store_complete(
             &mut self,
             _s: &mut dyn ImapClientSelected,
@@ -2187,6 +2302,47 @@ mod tests {
             events
                 .iter()
                 .any(|e| e.contains("move_done") && e.contains("1:99")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn sort_and_thread_callbacks() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut ep = make_ep(&log);
+        ep.session = SessionState::Selected;
+        let mut fake = FakeEp::new();
+
+        ImapClientSelected::sort(&mut ep, "(SUBJECT)", "UTF-8", "ALL");
+        ep.flush_outbound(&mut fake);
+        assert!(
+            fake.sent_str().contains("SORT (SUBJECT) UTF-8 ALL"),
+            "{}",
+            fake.sent_str()
+        );
+        feed(&mut ep, &mut fake, b"* SORT 3 1 2\r\nA000 OK SORT\r\n");
+        let events = log.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e == "sort:3,1,2"), "{events:?}");
+        assert!(
+            events.iter().any(|e| e.starts_with("sort_done")),
+            "{events:?}"
+        );
+
+        ImapClientSelected::thread(&mut ep, "REFERENCES", "UTF-8", "ALL");
+        ep.flush_outbound(&mut fake);
+        assert!(
+            fake.sent_str().contains("THREAD REFERENCES UTF-8 ALL"),
+            "{}",
+            fake.sent_str()
+        );
+        feed(&mut ep, &mut fake, b"* THREAD (3)(1 2)\r\nA001 OK THREAD\r\n");
+        let events = log.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| e == "thread:3;1(2)"),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e.starts_with("thread_done")),
             "{events:?}"
         );
     }

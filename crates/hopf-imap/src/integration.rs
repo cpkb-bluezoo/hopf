@@ -131,6 +131,47 @@ fn seed_mailbox(dir: &tempfile::TempDir) -> Arc<MaildirFactory> {
     factory
 }
 
+/// Populate alice's INBOX with three messages exercising SORT (base-subject
+/// folding with a sequence tie-break) and THREAD REFERENCES (a real reply
+/// chain alongside an unrelated root) together: message 1 is the original,
+/// message 2 is a reply to it sent an hour later, message 3 is unrelated
+/// and sent an hour before message 1.
+fn seed_sort_thread_mailbox(dir: &tempfile::TempDir) -> Arc<MaildirFactory> {
+    let factory = Arc::new(MaildirFactory::new(dir.path()));
+    {
+        let mut store = factory.create_store();
+        store.open("alice").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        let msgs: [&[u8]; 3] = [
+            b"From: a@b\r\nSubject: Question\r\nMessage-Id: <1@x>\r\nDate: Thu, 01 Jan 2026 10:00:00 +0000\r\n\r\nfirst\r\n",
+            b"From: c@d\r\nSubject: Re: Question\r\nMessage-Id: <2@x>\r\nIn-Reply-To: <1@x>\r\nReferences: <1@x>\r\nDate: Thu, 01 Jan 2026 11:00:00 +0000\r\n\r\nreply\r\n",
+            b"From: e@f\r\nSubject: Other\r\nMessage-Id: <3@x>\r\nDate: Thu, 01 Jan 2026 09:00:00 +0000\r\n\r\nunrelated\r\n",
+        ];
+        for m in msgs {
+            let mut guard =
+                hopf_mailbox::AppendGuard::start(mb.as_mut(), &BTreeSet::new(), None).unwrap();
+            guard.append_content(m).unwrap();
+            guard.commit().unwrap();
+        }
+        mb.close(false).unwrap();
+        store.close().unwrap();
+    }
+    factory
+}
+
+/// Start an ImapService against [`seed_sort_thread_mailbox`]'s fixture.
+fn start_imap_server_with_sort_thread_fixture(
+    dir: &tempfile::TempDir,
+) -> (Arc<Runtime>, SocketAddr) {
+    let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
+    let factory = seed_sort_thread_mailbox(dir);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let config = ImapConfig::new("127.0.0.1:0".parse().unwrap(), "localhost", store, factory);
+    let svc = ImapService::new(config, Arc::clone(&rt));
+    let addr = svc.start().unwrap();
+    (rt, addr)
+}
+
 /// Start an ImapService with one message in alice's INBOX; returns (rt, addr).
 fn start_imap_server(dir: &tempfile::TempDir) -> (Arc<Runtime>, SocketAddr) {
     let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
@@ -1636,6 +1677,68 @@ fn server_compress_deflate_rejection_paths_raw() {
     assert!(
         text.contains("a5 NO"),
         "a second COMPRESS while already active must be refused: {text}"
+    );
+
+    drop(rt);
+}
+
+/// SORT (RFC 5256 §3) and THREAD REFERENCES (RFC 5256 §2.2) over a real
+/// server and Maildir-backed mailbox, plus STATUS=SIZE (RFC 8438) —
+/// capability advertisement and one success path per command family.
+#[test]
+fn server_sort_thread_and_status_size_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server_with_sort_thread_fixture(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut buf = vec![0u8; 8192];
+
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+    write_cmd(&mut stream, b"a1 LOGIN alice secret\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
+    assert!(r.contains("a1 OK"), "login: {r}");
+    assert!(
+        r.contains(" SORT")
+            && r.contains("THREAD=REFERENCES")
+            && r.contains("THREAD=ORDEREDSUBJECT")
+            && r.contains("STATUS=SIZE"),
+        "post-auth CAPABILITY must advertise SORT, THREAD=*, and STATUS=SIZE: {r}"
+    );
+
+    write_cmd(&mut stream, b"a2 SELECT INBOX\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
+    assert!(r.contains("a2 OK") && r.contains("3 EXISTS"), "select: {r}");
+
+    // Base subject folds "Re: Question" and "Question" together, so the
+    // sort tie between messages 1 and 2 must fall back to sequence order,
+    // after "Other" sorts first.
+    write_cmd(&mut stream, b"a3 SORT (SUBJECT) UTF-8 ALL\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a3 "));
+    assert!(r.contains("a3 OK"), "sort: {r}");
+    assert!(
+        r.contains("* SORT 3 1 2"),
+        "expected \"Other\" then the \"Question\"/\"Re: Question\" tie in sequence order: {r}"
+    );
+
+    // Message 2 is a reply to message 1 (References); message 3 is
+    // unrelated and sent earlier, so it threads as an independent root
+    // ahead of the reply chain.
+    write_cmd(&mut stream, b"a4 THREAD REFERENCES UTF-8 ALL\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a4 "));
+    assert!(r.contains("a4 OK"), "thread: {r}");
+    assert!(
+        r.contains("* THREAD (3)(1 2)"),
+        "expected message 3 as an earlier standalone root, then 1's reply chain to 2: {r}"
+    );
+
+    write_cmd(&mut stream, b"a5 STATUS INBOX (SIZE)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a5 "));
+    assert!(
+        r.contains("a5 OK") && r.contains("SIZE"),
+        "status size: {r}"
     );
 
     drop(rt);

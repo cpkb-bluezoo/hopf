@@ -67,6 +67,18 @@ pub fn build_capabilities(
         if config.enable_utf8_accept {
             caps.push("UTF8=ACCEPT".to_string());
         }
+        if config.enable_sort {
+            caps.push("SORT".to_string());
+        }
+        if config.enable_thread_ordered_subject {
+            caps.push("THREAD=ORDEREDSUBJECT".to_string());
+        }
+        if config.enable_thread_references {
+            caps.push("THREAD=REFERENCES".to_string());
+        }
+        if config.enable_status_size {
+            caps.push("STATUS=SIZE".to_string());
+        }
     }
 
     // Always advertised when implemented (independent of auth).

@@ -10,15 +10,24 @@ use crate::error::{MailboxError, MailboxResult};
 use crate::flag::flags_from_byte;
 
 use super::entry::{
-    IndexEntry, DESC_BODY, DESCRIPTOR_COUNT_BODY, DESCRIPTOR_COUNT_HEADERS,
+    IndexEntry, DESCRIPTOR_COUNT_BODY, DESCRIPTOR_COUNT_BODY_V1, DESCRIPTOR_COUNT_HEADERS,
+    DESCRIPTOR_COUNT_HEADERS_V1,
 };
 
 /// Magic `GIDX`.
 pub const INDEX_MAGIC: [u8; 4] = *b"GIDX";
-/// Headers-only (8 descriptors).
+/// Headers-only, pre-#407 layout (8 descriptors) — read-only; a file this
+/// old is rewritten as [`INDEX_VERSION_THREADING`] (or `_BODY`) the next
+/// time anything in it changes, since [`super::IndexBuilder`] no longer
+/// produces entries this short. See [`DESCRIPTOR_COUNT_HEADERS_V1`].
 pub const INDEX_VERSION_HEADERS: u16 = 1;
-/// Includes optional body descriptor (9 descriptors).
+/// Headers-plus-body, pre-#407 layout (9 descriptors) — read-only, ditto.
 pub const INDEX_VERSION_BODY: u16 = 2;
+/// Adds `References` / `In-Reply-To` for RFC 5256 THREAD REFERENCES (issue
+/// #407): 10 descriptors.
+pub const INDEX_VERSION_THREADING: u16 = 3;
+/// [`INDEX_VERSION_THREADING`] plus the optional body descriptor: 11.
+pub const INDEX_VERSION_THREADING_BODY: u16 = 4;
 
 const MAX_ENTRY_COUNT: i32 = 10_000_000;
 const MAX_VAR: i32 = 10 * 1024 * 1024;
@@ -59,7 +68,7 @@ impl IndexFile {
 
         let version = read_u16(data, 4);
         update_crc_u16(&mut crc, version);
-        if version > INDEX_VERSION_BODY {
+        if version == 0 || version > INDEX_VERSION_THREADING_BODY {
             return Err(MailboxError::Corrupt(format!(
                 "gidx unsupported version {version}"
             )));
@@ -82,18 +91,22 @@ impl IndexFile {
             return Err(MailboxError::Corrupt("gidx header checksum".into()));
         }
 
-        let body_indexing = version >= INDEX_VERSION_BODY;
-        let desc_count = if body_indexing {
-            DESCRIPTOR_COUNT_BODY
-        } else {
-            DESCRIPTOR_COUNT_HEADERS
-        };
+        let body_indexing = matches!(
+            version,
+            INDEX_VERSION_BODY | INDEX_VERSION_THREADING_BODY
+        );
 
         let mut offset = 32usize;
         let mut entries = Vec::with_capacity(entry_count as usize);
         let mut seen = std::collections::HashSet::new();
         for i in 0..entry_count as usize {
-            let (entry, next) = read_entry(data, offset, desc_count)?;
+            // Each entry declares its own descriptor count, independent of
+            // the file-level `version` — see `read_entry`. This lets an
+            // entry an older hopf version indexed (fewer descriptors)
+            // survive being re-saved alongside newer ones without silently
+            // gaining zero-filled fields it was never actually indexed
+            // with (`IndexEntry::references`/`in_reply_to` depend on this).
+            let (entry, next) = read_entry(data, offset)?;
             if entry.uid == 0 || entry.uid >= uid_next {
                 return Err(MailboxError::Corrupt(format!(
                     "gidx invalid uid at {i}"
@@ -143,14 +156,9 @@ impl IndexFile {
 
     fn serialize(&self) -> MailboxResult<Vec<u8>> {
         let version = if self.body_indexing {
-            INDEX_VERSION_BODY
+            INDEX_VERSION_THREADING_BODY
         } else {
-            INDEX_VERSION_HEADERS
-        };
-        let desc_count = if self.body_indexing {
-            DESCRIPTOR_COUNT_BODY
-        } else {
-            DESCRIPTOR_COUNT_HEADERS
+            INDEX_VERSION_THREADING
         };
 
         let mut out = Vec::new();
@@ -171,7 +179,7 @@ impl IndexFile {
 
         let mut entry_crc = crc32fast::Hasher::new();
         for e in &self.entries {
-            let eb = serialize_entry(e, desc_count)?;
+            let eb = serialize_entry(e)?;
             entry_crc.update(&eb);
             out.extend_from_slice(&eb);
         }
@@ -180,20 +188,16 @@ impl IndexFile {
     }
 }
 
-fn serialize_entry(e: &IndexEntry, desc_count: usize) -> MailboxResult<Vec<u8>> {
-    let mut props: Vec<&str> = (0..desc_count)
-        .map(|i| {
-            if i == DESC_BODY && e.props().len() <= DESC_BODY {
-                ""
-            } else {
-                e.prop(i)
-            }
-        })
-        .collect();
-    // Ensure we have enough props
-    while props.len() < desc_count {
-        props.push("");
-    }
+/// Serializes `e` with exactly the descriptor count it actually holds —
+/// never coerced to some file-wide count. An entry built by an older hopf
+/// version (fewer descriptors, still sitting in the in-memory map because
+/// its UID was already indexed) round-trips as-is rather than being padded
+/// with zero-length `References`/`In-Reply-To` fields it was never really
+/// indexed with; it's upgraded in place the next time that message itself
+/// is re-indexed (a UID's entry is only ever rebuilt, never patched).
+fn serialize_entry(e: &IndexEntry) -> MailboxResult<Vec<u8>> {
+    let desc_count = e.props().len();
+    let props: Vec<&str> = (0..desc_count).map(|i| e.prop(i)).collect();
 
     let mut var = Vec::new();
     let mut descriptors = Vec::with_capacity(desc_count);
@@ -226,7 +230,12 @@ fn serialize_entry(e: &IndexEntry, desc_count: usize) -> MailboxResult<Vec<u8>> 
     Ok(out)
 }
 
-fn read_entry(data: &[u8], offset: usize, expected_desc: usize) -> MailboxResult<(IndexEntry, usize)> {
+/// Reads one entry starting at `offset`. The entry's own recorded
+/// `descriptor_count` governs how many fields are read back — not
+/// anything derived from the file-level `version` — so an entry any
+/// supported hopf version could have written (8/9/10/11 descriptors)
+/// round-trips exactly as stored; see `serialize_entry`.
+fn read_entry(data: &[u8], offset: usize) -> MailboxResult<(IndexEntry, usize)> {
     if offset + 48 > data.len() {
         return Err(MailboxError::Corrupt("gidx truncated entry".into()));
     }
@@ -238,14 +247,14 @@ fn read_entry(data: &[u8], offset: usize, expected_desc: usize) -> MailboxResult
     let flags_byte = data[offset + 36];
     let descriptor_count = read_i32(data, offset + 40) as usize;
     let var_size = read_i32(data, offset + 44);
-    if descriptor_count != expected_desc && descriptor_count != DESCRIPTOR_COUNT_HEADERS {
-        // Allow v1 entries even if we expected body (upgrade path).
-        if descriptor_count != DESCRIPTOR_COUNT_HEADERS && descriptor_count != DESCRIPTOR_COUNT_BODY
-        {
-            return Err(MailboxError::Corrupt(format!(
-                "bad descriptor count {descriptor_count}"
-            )));
-        }
+    if !matches!(
+        descriptor_count,
+        DESCRIPTOR_COUNT_HEADERS_V1 | DESCRIPTOR_COUNT_BODY_V1 | DESCRIPTOR_COUNT_HEADERS
+            | DESCRIPTOR_COUNT_BODY
+    ) {
+        return Err(MailboxError::Corrupt(format!(
+            "bad descriptor count {descriptor_count}"
+        )));
     }
     if !(0..=MAX_VAR).contains(&var_size) {
         return Err(MailboxError::Corrupt("bad variable size".into()));
@@ -273,9 +282,6 @@ fn read_entry(data: &[u8], offset: usize, expected_desc: usize) -> MailboxResult
         let s = String::from_utf8_lossy(&var[off..off + len])
             .into_owned();
         props.push(s);
-    }
-    while props.len() < expected_desc {
-        props.push(String::new());
     }
     let mut entry = IndexEntry::new(
         uid,
@@ -398,5 +404,74 @@ mod tests {
         assert_eq!(loaded.uid_validity, 42);
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].prop(5), "hello");
+    }
+
+    fn entry_with_props(uid: u64, props: Vec<String>) -> IndexEntry {
+        IndexEntry::new(uid, uid as u32, 100, 1_700_000_000_000, 0, &BTreeSet::new(), props)
+    }
+
+    /// Issue #407: a mailbox indexed by an older hopf version has entries
+    /// with only 8 (or 9, with body) descriptors; once anything else in
+    /// the same mailbox is re-indexed and the whole file is rewritten,
+    /// those old entries must survive with their *own* descriptor count
+    /// untouched — not silently padded to the new 10/11-descriptor layout,
+    /// which would bake in "no References/In-Reply-To" for mail that was
+    /// simply never re-indexed to capture it.
+    #[test]
+    fn old_and_new_generation_entries_coexist_in_one_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("box.gidx");
+
+        let old_entry = entry_with_props(
+            1,
+            vec![
+                "loc1".into(),
+                "old@sender".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "old subject".into(),
+                "<old@x>".into(),
+                String::new(),
+            ],
+        );
+        let new_entry = entry_with_props(
+            2,
+            vec![
+                "loc2".into(),
+                "new@sender".into(),
+                String::new(),
+                String::new(),
+                String::new(),
+                "new subject".into(),
+                "<new@x>".into(),
+                String::new(),
+                "<ref1@x> <ref2@x>".into(),
+                "<ref2@x>".into(),
+            ],
+        );
+        assert_eq!(old_entry.references(), None);
+        assert_eq!(new_entry.references(), Some("<ref1@x> <ref2@x>"));
+
+        let file = IndexFile {
+            version: INDEX_VERSION_THREADING,
+            uid_validity: 42,
+            uid_next: 3,
+            entries: vec![old_entry, new_entry],
+            body_indexing: false,
+        };
+        file.save(&path).unwrap();
+
+        let loaded = IndexFile::load(&path).unwrap();
+        assert_eq!(loaded.entries.len(), 2);
+        let reloaded_old = loaded.entries.iter().find(|e| e.uid == 1).unwrap();
+        let reloaded_new = loaded.entries.iter().find(|e| e.uid == 2).unwrap();
+        assert_eq!(
+            reloaded_old.references(),
+            None,
+            "an old entry must not gain a fabricated empty References field on re-save"
+        );
+        assert_eq!(reloaded_new.references(), Some("<ref1@x> <ref2@x>"));
+        assert_eq!(reloaded_new.in_reply_to(), Some("<ref2@x>"));
     }
 }

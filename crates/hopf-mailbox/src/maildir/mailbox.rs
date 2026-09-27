@@ -12,8 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::IndexConfig;
 use crate::error::{MailboxError, MailboxResult};
 use crate::flag::Flag;
-use crate::index::{IndexBuilder, MessageIndex};
-use crate::search::SearchCriteria;
+use crate::index::{IndexBuilder, IndexEntry, MessageIndex};
+use crate::search::{MessageContext, SearchCriteria};
 use crate::traits::{Mailbox, MessageDescriptor};
 
 use super::filename::MaildirFilename;
@@ -663,88 +663,131 @@ impl Mailbox for MaildirMailbox {
             let Some(e) = self.index.get(m.uid) else {
                 continue;
             };
+            let entry = build_context_entry(e, seq);
+            let modseq = self.uidlist.modseq_for(&m.filename.base);
             let body_path: Option<&Path> = if need_body { Some(&m.path) } else { None };
-            let entry = crate::index::IndexEntry::new(
-                e.uid,
-                seq,
-                e.size,
-                e.internal_date,
-                e.sent_date,
-                &e.flags(),
-                e.props().to_vec(),
-            );
-            struct Ctx<'a> {
-                e: &'a crate::index::IndexEntry,
-                body_path: Option<&'a Path>,
-                header_path: &'a Path,
-                modseq: u64,
-            }
-            impl crate::search::MessageContext for Ctx<'_> {
-                fn message_number(&self) -> u32 {
-                    self.e.message_number
-                }
-                fn uid(&self) -> u64 {
-                    self.e.uid
-                }
-                fn size(&self) -> u64 {
-                    self.e.size
-                }
-                fn flags(&self) -> BTreeSet<Flag> {
-                    self.e.flags()
-                }
-                fn keywords(&self) -> BTreeSet<String> {
-                    self.e.keywords_set()
-                }
-                fn internal_date_millis(&self) -> Option<i64> {
-                    if self.e.internal_date == 0 {
-                        None
-                    } else {
-                        Some(self.e.internal_date)
-                    }
-                }
-                fn sent_date_millis(&self) -> Option<i64> {
-                    if self.e.sent_date == 0 {
-                        None
-                    } else {
-                        Some(self.e.sent_date)
-                    }
-                }
-                fn header(&self, name: &str) -> std::io::Result<String> {
-                    if let Some(v) = self.e.header_value(name) {
-                        return Ok(v.to_string());
-                    }
-                    let file = File::open(self.header_path)?;
-                    Ok(crate::search::header_lookup_streaming(file, name)?.unwrap_or_default())
-                }
-                fn body_contains(&self, needle_lower: &str) -> std::io::Result<bool> {
-                    if let Some(path) = self.body_path {
-                        let file = File::open(path)?;
-                        return crate::search::body_contains_streaming(file, needle_lower);
-                    }
-                    Ok(self
-                        .e
-                        .body()
-                        .unwrap_or("")
-                        .to_ascii_lowercase()
-                        .contains(needle_lower))
-                }
-                fn modseq(&self) -> Option<u64> {
-                    Some(self.modseq)
-                }
-            }
-            let hit = criteria
-                .matches(&Ctx {
-                    e: &entry,
-                    body_path,
-                    header_path: &m.path,
-                    modseq: self.uidlist.modseq_for(&m.filename.base),
-                })
-                .map_err(MailboxError::Io)?;
-            if hit {
+            let ctx = MdMessageContext {
+                e: &entry,
+                body_path,
+                header_path: &m.path,
+                modseq,
+            };
+            if criteria.matches(&ctx).map_err(MailboxError::Io)? {
                 results.push(seq);
             }
         }
         Ok(results)
+    }
+
+    fn with_message_context(
+        &self,
+        message_number: u32,
+        f: &mut dyn FnMut(&dyn MessageContext) -> MailboxResult<()>,
+    ) -> MailboxResult<()> {
+        let Some(m) = message_number
+            .checked_sub(1)
+            .and_then(|i| self.messages.get(i as usize))
+        else {
+            return Err(MailboxError::NotFound(format!(
+                "no message {message_number}"
+            )));
+        };
+        let Some(e) = self.index.get(m.uid) else {
+            return Err(MailboxError::NotFound(format!(
+                "no message {message_number}"
+            )));
+        };
+        let entry = build_context_entry(e, message_number);
+        let modseq = self.uidlist.modseq_for(&m.filename.base);
+        let ctx = MdMessageContext {
+            e: &entry,
+            // SORT/THREAD sort/thread keys never need BODY substring
+            // matching — only `SearchCriteria::Body`/`Text` do.
+            body_path: None,
+            header_path: &m.path,
+            modseq,
+        };
+        f(&ctx)
+    }
+}
+
+/// Rebuilds an [`IndexEntry`] with `seq` as its recorded sequence number —
+/// the cached one may be stale (renumbered by an EXPUNGE since it was
+/// indexed), while everything else about the entry is immutable.
+fn build_context_entry(e: &IndexEntry, seq: u32) -> IndexEntry {
+    IndexEntry::new(
+        e.uid,
+        seq,
+        e.size,
+        e.internal_date,
+        e.sent_date,
+        &e.flags(),
+        e.props().to_vec(),
+    )
+}
+
+/// [`MessageContext`] over one Maildir message: the fast path answers from
+/// the cached [`IndexEntry`] wherever it was indexed; `header` and
+/// `body_contains` fall back to a live read of the message file itself for
+/// anything the cache doesn't (yet) cover.
+struct MdMessageContext<'a> {
+    e: &'a IndexEntry,
+    body_path: Option<&'a Path>,
+    header_path: &'a Path,
+    modseq: u64,
+}
+
+impl MessageContext for MdMessageContext<'_> {
+    fn message_number(&self) -> u32 {
+        self.e.message_number
+    }
+    fn uid(&self) -> u64 {
+        self.e.uid
+    }
+    fn size(&self) -> u64 {
+        self.e.size
+    }
+    fn flags(&self) -> BTreeSet<Flag> {
+        self.e.flags()
+    }
+    fn keywords(&self) -> BTreeSet<String> {
+        self.e.keywords_set()
+    }
+    fn internal_date_millis(&self) -> Option<i64> {
+        if self.e.internal_date == 0 {
+            None
+        } else {
+            Some(self.e.internal_date)
+        }
+    }
+    fn sent_date_millis(&self) -> Option<i64> {
+        if self.e.sent_date == 0 {
+            None
+        } else {
+            Some(self.e.sent_date)
+        }
+    }
+    fn header(&self, name: &str) -> std::io::Result<String> {
+        if let Some(v) = self.e.header_value(name) {
+            return Ok(v.to_string());
+        }
+        let file = File::open(self.header_path)?;
+        Ok(crate::search::header_lookup_streaming(file, name)?.unwrap_or_default())
+    }
+    fn body_contains(&self, needle_lower: &str) -> std::io::Result<bool> {
+        if let Some(path) = self.body_path {
+            let file = File::open(path)?;
+            return crate::search::body_contains_streaming(file, needle_lower);
+        }
+        Ok(self
+            .e
+            .body()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains(needle_lower))
+    }
+    fn modseq(&self) -> Option<u64> {
+        Some(self.modseq)
     }
 }
 
@@ -1152,5 +1195,49 @@ mod tests {
             "HIGHESTMODSEQ must be durable across a reopen, not reset to 0"
         );
         assert_eq!(mb2.modseq(1).unwrap(), 2);
+    }
+
+    /// Issue #407: `with_message_context` exposes the same per-message
+    /// header/date access `search()` evaluates `SearchCriteria` against —
+    /// including `References`/`In-Reply-To`, needed for RFC 5256 THREAD
+    /// REFERENCES.
+    #[test]
+    fn with_message_context_exposes_references_and_subject() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("threaduser").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        let reply = b"From: bob@example.com\r\nSubject: Re: hi\r\n\
+            Message-ID: <reply@x>\r\nIn-Reply-To: <orig@x>\r\n\
+            References: <orig@x>\r\n\r\nthanks\r\n";
+        append_whole(mb.as_mut(), reply, &BTreeSet::new(), None).unwrap();
+
+        let mut subject = String::new();
+        let mut references = None;
+        let mut in_reply_to = None;
+        mb.with_message_context(1, &mut |ctx| {
+            subject = ctx.header("Subject").unwrap();
+            references = Some(ctx.header("References").unwrap());
+            in_reply_to = Some(ctx.header("In-Reply-To").unwrap());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(subject, "re: hi");
+        assert_eq!(references.as_deref(), Some("<orig@x>"));
+        assert_eq!(in_reply_to.as_deref(), Some("<orig@x>"));
+    }
+
+    #[test]
+    fn with_message_context_rejects_an_out_of_range_sequence_number() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("threaduser2").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        append_whole(mb.as_mut(), &sample("a"), &BTreeSet::new(), None).unwrap();
+
+        let result = mb.with_message_context(2, &mut |_| Ok(()));
+        assert!(result.is_err());
     }
 }

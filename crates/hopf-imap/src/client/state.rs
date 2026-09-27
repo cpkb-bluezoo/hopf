@@ -326,6 +326,77 @@ impl ImapQuotaRootData {
     }
 }
 
+/// One node of a parsed `THREAD` response tree (RFC 5256 §2): a message's
+/// result number (sequence number or UID, per the issuing command), plus
+/// its replies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImapThreadNode {
+    /// Sequence number or UID (per `THREAD`/`UID THREAD`) of this message.
+    pub result_number: u32,
+    /// Direct replies to this message, in wire order.
+    pub children: Vec<ImapThreadNode>,
+}
+
+/// Parse a `THREAD` response body into its forest of threads — the
+/// `THREAD` keyword itself is already consumed by the lexer's bounded
+/// capture ([`ImapEvent::ThreadData`](super::reply::ImapEvent::ThreadData)).
+/// An empty (all-whitespace) body parses as no threads, matching RFC 5256
+/// §2's "no untagged THREAD at all when there's nothing to thread" — a
+/// caller that never sees the event should treat that the same way.
+pub fn parse_thread_response(raw: &str) -> Option<Vec<ImapThreadNode>> {
+    let mut out = Vec::new();
+    let mut cursor = raw.trim();
+    while cursor.starts_with('(') {
+        let close = find_closing_paren(cursor)?;
+        let inner = &cursor[1..close];
+        let (node, leftover) = parse_thread_chain(inner)?;
+        if !leftover.trim().is_empty() {
+            return None;
+        }
+        out.push(node);
+        cursor = cursor[close + 1..].trim_start();
+    }
+    if cursor.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Parse one `thread-chain`/`thread-nested` body (the contents of one
+/// top-level pair of parentheses, with the parentheses already stripped),
+/// returning the resulting subtree and whatever text follows it (always
+/// empty at the top level; recursion needs the remainder to detect
+/// trailing sibling groups).
+fn parse_thread_chain(s: &str) -> Option<(ImapThreadNode, &str)> {
+    let s = s.trim_start();
+    let end = s.find([' ', '(', ')']).unwrap_or(s.len());
+    let result_number: u32 = s[..end].parse().ok()?;
+    let rest = s[end..].trim_start();
+    if rest.is_empty() {
+        return Some((ImapThreadNode { result_number, children: Vec::new() }, rest));
+    }
+    if rest.starts_with('(') {
+        // One or more parenthesized sibling groups: each is a separate reply.
+        let mut children = Vec::new();
+        let mut cursor = rest;
+        while cursor.starts_with('(') {
+            let close = find_closing_paren(cursor)?;
+            let inner = &cursor[1..close];
+            let (child, leftover) = parse_thread_chain(inner)?;
+            if !leftover.trim().is_empty() {
+                return None;
+            }
+            children.push(child);
+            cursor = &cursor[close + 1..];
+        }
+        return Some((ImapThreadNode { result_number, children }, cursor));
+    }
+    // A bare number continues the chain as this node's single reply.
+    let (child, leftover) = parse_thread_chain(rest)?;
+    Some((ImapThreadNode { result_number, children: vec![child] }, leftover))
+}
+
 /// Parsed `[COPYUID uidvalidity from to]` / move response code payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImapCopyUid {
@@ -496,6 +567,14 @@ pub trait ImapClientSelected: ImapClientAuthenticated {
     fn search(&mut self, criteria: &str);
     /// Send `UID SEARCH criteria`.
     fn uid_search(&mut self, criteria: &str);
+    /// Send `SORT (sort-criteria) charset search-criteria` (RFC 5256 §3).
+    fn sort(&mut self, sort_criteria: &str, charset: &str, search_criteria: &str);
+    /// Send `UID SORT`.
+    fn uid_sort(&mut self, sort_criteria: &str, charset: &str, search_criteria: &str);
+    /// Send `THREAD algorithm charset search-criteria` (RFC 5256 §2).
+    fn thread(&mut self, algorithm: &str, charset: &str, search_criteria: &str);
+    /// Send `UID THREAD`.
+    fn uid_thread(&mut self, algorithm: &str, charset: &str, search_criteria: &str);
     /// Send `STORE sequence action flags` (`action` = `+FLAGS`, `-FLAGS`, `FLAGS`).
     fn store(&mut self, sequence_set: &str, action: &str, flags: &str);
     /// Send `UID STORE`.
@@ -697,6 +776,40 @@ mod parse_tests {
         let a = ImapAppendUid::parse("APPENDUID 38505 3956").unwrap();
         assert_eq!(a.uid_validity, 38505);
         assert_eq!(a.uid, 3956);
+    }
+
+    #[test]
+    fn parse_thread_response_chain_and_nested() {
+        // A leaf, a single-child chain, and a multi-child (nested) root.
+        let threads = parse_thread_response("(2)(3 6)(6 (4 23)(44 7))").unwrap();
+        assert_eq!(threads.len(), 3);
+        assert_eq!(threads[0], ImapThreadNode { result_number: 2, children: vec![] });
+        assert_eq!(
+            threads[1],
+            ImapThreadNode {
+                result_number: 3,
+                children: vec![ImapThreadNode { result_number: 6, children: vec![] }],
+            }
+        );
+        let multi = &threads[2];
+        assert_eq!(multi.result_number, 6);
+        assert_eq!(multi.children.len(), 2);
+        assert_eq!(multi.children[0].result_number, 4);
+        assert_eq!(multi.children[0].children[0].result_number, 23);
+        assert_eq!(multi.children[1].result_number, 44);
+        assert_eq!(multi.children[1].children[0].result_number, 7);
+    }
+
+    #[test]
+    fn parse_thread_response_empty_body_is_no_threads() {
+        assert_eq!(parse_thread_response("").unwrap(), Vec::new());
+        assert_eq!(parse_thread_response("   ").unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn parse_thread_response_rejects_malformed_input() {
+        assert!(parse_thread_response("not a thread").is_none());
+        assert!(parse_thread_response("(1").is_none());
     }
 
     #[test]
