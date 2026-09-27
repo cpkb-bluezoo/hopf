@@ -74,4 +74,5 @@ Requires Rust 1.85+ (edition 2021).
 
 ## License
 
-[GNU Lesser General Public License v2.1 or later](LICENSE).
+[GNU Lesser General Public License v3 or later](COPYING.LESSER) (incorporates
+the terms of the [GNU General Public License v3](COPYING), per LGPLv3 §0).
