@@ -310,6 +310,19 @@ pub trait ImapClientDriver: Send {
         let _ = (session, ep, status, message);
     }
 
+    /// COMPRESS DEFLATE completed. On `ImapStatus::Ok`, every subsequent
+    /// byte in both directions on this connection is already being
+    /// transparently DEFLATE-compressed by the time this fires.
+    fn on_compress_complete(
+        &mut self,
+        session: &mut dyn ImapClientAuthenticated,
+        ep: &mut dyn Endpoint,
+        status: ImapStatus,
+        message: &str,
+    ) {
+        let _ = (session, ep, status, message);
+    }
+
     /// Server `ID` parameter list as `key/value` pairs (`NIL` → empty).
     fn on_id_params(&mut self, params: &[(String, String)]) {
         let _ = params;

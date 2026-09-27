@@ -9,8 +9,16 @@ use crate::ImapConfig;
 /// Build the space-separated capability list advertised to clients.
 ///
 /// Only extensions that are implemented and enabled in [`ImapConfig`] are
-/// included. Pre-auth capabilities differ from post-auth.
-pub fn build_capabilities(config: &ImapConfig, authenticated: bool, tls: bool) -> String {
+/// included. Pre-auth capabilities differ from post-auth. `already_compressed`
+/// hides `COMPRESS=DEFLATE` once RFC 4978 compression is already active on
+/// this connection (irrelevant pre-auth, since COMPRESS itself is
+/// authenticated-only).
+pub fn build_capabilities(
+    config: &ImapConfig,
+    authenticated: bool,
+    tls: bool,
+    already_compressed: bool,
+) -> String {
     let mut caps = vec!["IMAP4rev2".to_string()];
 
     if !authenticated && !tls && config.tls_acceptor.is_some() && !config.implicit_tls {
@@ -48,6 +56,16 @@ pub fn build_capabilities(config: &ImapConfig, authenticated: bool, tls: bool) -
         }
         if config.enable_qresync {
             caps.push("QRESYNC".to_string());
+        }
+        // RFC 4978 §3: only advertised once authenticated, and only while
+        // this connection isn't already compressed (the client has no use
+        // for negotiating it twice, and doing so mid-stream would be
+        // ambiguous about which bytes the second negotiation covers).
+        if config.enable_compress && !already_compressed {
+            caps.push("COMPRESS=DEFLATE".to_string());
+        }
+        if config.enable_utf8_accept {
+            caps.push("UTF8=ACCEPT".to_string());
         }
     }
 
@@ -96,7 +114,7 @@ mod tests {
     #[test]
     fn capability_truthfulness_pre_auth() {
         let cfg = test_config(true);
-        let caps = build_capabilities(&cfg, false, false);
+        let caps = build_capabilities(&cfg, false, false, false);
         assert!(caps.contains("IMAP4rev2"));
         assert!(caps.contains("UIDPLUS"));
         assert!(caps.contains("UNSELECT"));
@@ -112,7 +130,7 @@ mod tests {
     #[test]
     fn capability_truthfulness_authenticated() {
         let cfg = test_config(true);
-        let caps = build_capabilities(&cfg, true, true);
+        let caps = build_capabilities(&cfg, true, true, false);
         assert!(caps.contains("IDLE"));
         assert!(caps.contains("ENABLE"));
         assert!(!caps.contains("STARTTLS"));
@@ -122,7 +140,37 @@ mod tests {
     #[test]
     fn disabled_idle_not_advertised() {
         let cfg = test_config(false);
-        let caps = build_capabilities(&cfg, true, true);
+        let caps = build_capabilities(&cfg, true, true, false);
         assert!(!caps.split_whitespace().any(|c| c == "IDLE"));
+    }
+
+    #[test]
+    fn compress_and_utf8_accept_are_authenticated_only() {
+        let cfg = test_config(true);
+        let pre_auth = build_capabilities(&cfg, false, false, false);
+        assert!(!pre_auth.split_whitespace().any(|c| c == "COMPRESS=DEFLATE"));
+        assert!(!pre_auth.split_whitespace().any(|c| c == "UTF8=ACCEPT"));
+
+        let post_auth = build_capabilities(&cfg, true, true, false);
+        assert!(post_auth.split_whitespace().any(|c| c == "COMPRESS=DEFLATE"));
+        assert!(post_auth.split_whitespace().any(|c| c == "UTF8=ACCEPT"));
+    }
+
+    #[test]
+    fn compress_disappears_once_already_active_but_utf8_accept_does_not() {
+        let cfg = test_config(true);
+        let caps = build_capabilities(&cfg, true, true, true);
+        assert!(!caps.split_whitespace().any(|c| c == "COMPRESS=DEFLATE"));
+        assert!(caps.split_whitespace().any(|c| c == "UTF8=ACCEPT"));
+    }
+
+    #[test]
+    fn disabled_compress_and_utf8_accept_not_advertised() {
+        let mut cfg = test_config(true);
+        cfg.enable_compress = false;
+        cfg.enable_utf8_accept = false;
+        let caps = build_capabilities(&cfg, true, true, false);
+        assert!(!caps.split_whitespace().any(|c| c == "COMPRESS=DEFLATE"));
+        assert!(!caps.split_whitespace().any(|c| c == "UTF8=ACCEPT"));
     }
 }

@@ -500,6 +500,15 @@ impl ImapServerMetrics {
         });
     }
 
+    /// COMPRESS DEFLATE negotiated.
+    pub fn compress(&self) {
+        self.export.try_send_metric(MetricPoint::Counter {
+            name: "imap.server.compress",
+            attributes: Vec::new(),
+            value: 1,
+        });
+    }
+
     /// One tagged command finished.
     ///
     /// `verb` is the IMAP command name (e.g. `"FETCH"`). `outcome` is `"ok"` or `"fail"`.

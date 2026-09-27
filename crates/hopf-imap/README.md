@@ -15,19 +15,21 @@ implemented support only.
 | `UIDPLUS` | `APPENDUID`, `COPYUID`, `UID EXPUNGE` |
 | `MOVE` | Copy + `\Deleted` + expunge with `COPYUID` |
 | `NAMESPACE` | Personal + optional other-users/shared from config |
-| `ENABLE` | `CONDSTORE` / `QRESYNC` per session |
+| `ENABLE` | `CONDSTORE` / `QRESYNC` / `UTF8=ACCEPT` per session |
 | `CONDSTORE` | `HIGHESTMODSEQ` on SELECT when enabled; `CHANGEDSINCE` FETCH; `MODSEQ` when backend provides modseqs |
 | `QRESYNC` | Degrades safely — no fabricated `VANISHED (EARLIER)` history |
+| `UTF8=ACCEPT` | UTF-8 mailbox names / command and response text (already the wire format regardless — IMAP4rev2 baselines UTF-8 over modified UTF-7) |
 | `UNSELECT` | Deselect without expunge |
 | `ID` | RFC 2971 server identity |
 | `LIST-EXTENDED` / `LIST-STATUS` / `CHILDREN` | Selection/return options; `RETURN (STATUS (…))` |
 | `STATUS` | Standalone STATUS |
 | `QUOTA` | `GETQUOTA` / `GETQUOTAROOT` / `SETQUOTA` via pluggable `QuotaManager` (default unlimited) |
+| `COMPRESS=DEFLATE` | Raw DEFLATE (RFC 1951, no zlib wrapper) over the whole connection once negotiated, authenticated-only, `Z_SYNC_FLUSH` per write |
 
 The client supports tag-correlated pipelining (STATUS+LIST outstanding
 simultaneously), asynchronous DNS, STARTTLS/IMAPS, production IDLE
-(`ImapIdle`), ENABLE/CONDSTORE/QRESYNC tracking, and unsolicited mailbox
-events via `MailboxEventListener`.
+(`ImapIdle`), ENABLE/CONDSTORE/QRESYNC/UTF8=ACCEPT tracking, COMPRESS=DEFLATE,
+and unsolicited mailbox events via `MailboxEventListener`.
 
 ## Server quick start
 

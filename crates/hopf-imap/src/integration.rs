@@ -260,6 +260,14 @@ fn server_login_select_fetch_append_raw() {
     write_cmd(&mut stream, b"a1 LOGIN alice secret\r\n");
     let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
     assert!(r.contains("a1 OK"), "login: {r}");
+    // The capability string embedded in the LOGIN `OK` response (RFC 9051
+    // §6.2.3) must reflect the *post*-auth capability set: IDLE is
+    // authenticated-only, so its presence here proves the response wasn't
+    // built from session state captured before authentication completed.
+    assert!(
+        r.contains("[CAPABILITY") && r.contains("IDLE"),
+        "LOGIN's embedded CAPABILITY must already be the authenticated set: {r}"
+    );
 
     write_cmd(&mut stream, b"a2 SELECT INBOX\r\n");
     let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
@@ -1230,5 +1238,405 @@ fn server_authenticate_pipelined_with_select_waits_for_async_step() {
         "pipelined SELECT must be processed only after the offloaded SASL \
          step completes, against authenticated state: {r}"
     );
+    drop(rt);
+}
+
+// ── COMPRESS=DEFLATE (RFC 4978) ───────────────────────────────────────────────
+
+#[derive(Default)]
+struct CompressState {
+    compress_ok: Option<bool>,
+    selected: Option<bool>,
+    done: Option<bool>,
+}
+
+struct CompressDriver {
+    state: Arc<Mutex<CompressState>>,
+}
+
+struct CompressFactory(Arc<Mutex<CompressState>>);
+
+impl ImapClientHandlerFactory for CompressFactory {
+    fn create(&self) -> Box<dyn ImapClientDriver> {
+        Box::new(CompressDriver {
+            state: Arc::clone(&self.0),
+        })
+    }
+}
+
+impl ImapClientDriver for CompressDriver {
+    fn on_greeting(
+        &mut self,
+        auth: &mut dyn ImapClientNotAuthenticated,
+        _ep: &mut dyn Endpoint,
+        _text: &str,
+        _preauth: bool,
+        _caps: &ImapCapabilities,
+    ) {
+        auth.capability();
+    }
+
+    fn on_capability(
+        &mut self,
+        auth: &mut dyn ImapClientNotAuthenticated,
+        _ep: &mut dyn Endpoint,
+        caps: &ImapCapabilities,
+    ) {
+        // RFC 4978 §3 / issue #408: COMPRESS=DEFLATE is authenticated-only,
+        // so it must not appear on the pre-auth CAPABILITY response.
+        assert!(!caps.compress_deflate, "COMPRESS=DEFLATE must not be advertised pre-auth");
+        auth.login("alice", "secret");
+    }
+
+    fn on_tls_established(
+        &mut self,
+        _post: &mut dyn crate::ImapClientPostStarttls,
+        _ep: &mut dyn Endpoint,
+    ) {
+    }
+
+    fn on_tls_unavailable(
+        &mut self,
+        _auth: &mut dyn ImapClientNotAuthenticated,
+        _ep: &mut dyn Endpoint,
+        _message: &str,
+    ) {
+    }
+
+    fn on_authenticated(
+        &mut self,
+        session: &mut dyn ImapClientAuthenticated,
+        _ep: &mut dyn Endpoint,
+        caps: &ImapCapabilities,
+    ) {
+        assert!(caps.compress_deflate, "post-auth capability must include COMPRESS=DEFLATE");
+        session.compress_deflate();
+    }
+
+    fn on_auth_failed(
+        &mut self,
+        _auth: &mut dyn ImapClientNotAuthenticated,
+        ep: &mut dyn Endpoint,
+        _message: &str,
+    ) {
+        self.state.lock().unwrap().done = Some(false);
+        ep.close();
+    }
+
+    fn on_auth_continue(
+        &mut self,
+        _exchange: &mut dyn ImapClientAuthExchange,
+        _ep: &mut dyn Endpoint,
+        _text: &str,
+    ) {
+    }
+
+    fn on_compress_complete(
+        &mut self,
+        session: &mut dyn ImapClientAuthenticated,
+        ep: &mut dyn Endpoint,
+        status: ImapStatus,
+        _message: &str,
+    ) {
+        let ok = status == ImapStatus::Ok;
+        self.state.lock().unwrap().compress_ok = Some(ok);
+        if ok {
+            // Every byte from here on, in both directions, is DEFLATE
+            // -compressed — SELECT's multi-line untagged response
+            // (FLAGS/EXISTS/RECENT/OK[...]) must still parse correctly.
+            session.select("INBOX");
+        } else {
+            self.state.lock().unwrap().done = Some(false);
+            ep.close();
+        }
+    }
+
+    fn on_selected(
+        &mut self,
+        selected: &mut dyn ImapClientSelected,
+        _ep: &mut dyn Endpoint,
+        _info: &ImapMailboxInfo,
+        _read_only: bool,
+    ) {
+        self.state.lock().unwrap().selected = Some(true);
+        selected.logout();
+    }
+
+    fn on_select_failed(
+        &mut self,
+        _session: &mut dyn ImapClientAuthenticated,
+        _ep: &mut dyn Endpoint,
+        _message: &str,
+    ) {
+        let mut st = self.state.lock().unwrap();
+        st.selected = Some(false);
+        st.done = Some(false);
+    }
+
+    fn on_fetch_literal(&mut self, _data: &[u8], _ep: &mut dyn Endpoint) {}
+
+    fn on_fetch_complete(
+        &mut self,
+        _selected: &mut dyn ImapClientSelected,
+        _ep: &mut dyn Endpoint,
+        _status: ImapStatus,
+        _message: &str,
+    ) {
+    }
+
+    fn on_append_continue(
+        &mut self,
+        _append: &mut dyn ImapClientAppend,
+        _ep: &mut dyn Endpoint,
+        _text: &str,
+    ) {
+    }
+
+    fn on_append_complete(
+        &mut self,
+        _session: &mut dyn ImapClientAuthenticated,
+        _ep: &mut dyn Endpoint,
+        _status: ImapStatus,
+        _appenduid: Option<&ImapAppendUid>,
+        _message: &str,
+    ) {
+    }
+
+    fn on_error(&mut self, _ep: &mut dyn Endpoint, _err: &io::Error) {
+        let mut st = self.state.lock().unwrap();
+        if st.done.is_none() {
+            st.done = Some(false);
+        }
+    }
+
+    fn on_timeout(&mut self, _ep: &mut dyn Endpoint) {
+        let mut st = self.state.lock().unwrap();
+        if st.done.is_none() {
+            st.done = Some(false);
+        }
+    }
+
+    fn on_disconnected(&mut self, _ep: &mut dyn Endpoint) {
+        let mut st = self.state.lock().unwrap();
+        if st.done.is_none() {
+            st.done = Some(st.selected == Some(true));
+        }
+    }
+}
+
+/// Full client+server round trip through `COMPRESS DEFLATE`: LOGIN, then
+/// negotiate compression, then SELECT (whose multi-line untagged response
+/// must still parse correctly) over the now-compressed connection, then
+/// LOGOUT — exercising both hopf-imap's server-side and client-side RFC
+/// 4978 support against each other.
+#[test]
+fn client_compress_deflate_round_trip_real_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let state = Arc::new(Mutex::new(CompressState::default()));
+    ImapClient::from_addr(addr)
+        .timeouts(fetch_timeouts())
+        .connect(&rt, Arc::new(CompressFactory(Arc::clone(&state))))
+        .unwrap();
+
+    assert!(wait_for(|| state.lock().unwrap().done.is_some(), 5000));
+    let st = state.lock().unwrap();
+    assert_eq!(st.compress_ok, Some(true), "COMPRESS DEFLATE must succeed");
+    assert_eq!(st.selected, Some(true), "SELECT over the compressed connection must succeed");
+    assert_eq!(st.done, Some(true));
+}
+
+/// Wire-level proof independent of hopf-imap's own `ImapCompressLayer`: a
+/// hand-rolled raw-DEFLATE (RFC 1951, no zlib wrapper) encoder/decoder,
+/// exactly matching what any RFC 4978-conformant peer would use, both
+/// reads the server's compressed reply and writes a compressed command —
+/// standing in for interop with a second implementation.
+#[test]
+fn server_compress_deflate_wire_bytes_round_trip_raw() {
+    use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = vec![0u8; 8192];
+
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+    write_cmd(&mut stream, b"a1 LOGIN alice secret\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
+    assert!(r.contains("a1 OK"), "login: {r}");
+
+    write_cmd(&mut stream, b"a2 COMPRESS DEFLATE\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
+    assert!(r.contains("a2 OK"), "compress negotiation: {r}");
+
+    // From here on the wire is raw DEFLATE (RFC 4978 §3), flushed with
+    // Z_SYNC_FLUSH per write so a peer can decode it immediately — a fresh,
+    // independent `Compress`/`Decompress` pair, not hopf-imap's own
+    // `ImapCompressLayer`.
+    let mut compressor = Compress::new(Compression::default(), false);
+    let mut wire_cmd = vec![0u8; 256];
+    compressor
+        .compress(b"a3 NOOP\r\n", &mut wire_cmd, FlushCompress::Sync)
+        .unwrap();
+    wire_cmd.truncate(compressor.total_out() as usize);
+    stream.write_all(&wire_cmd).unwrap();
+
+    let mut decompressor = Decompress::new(false);
+    let mut plaintext = Vec::new();
+    let mut scratch = vec![0u8; 4096];
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !String::from_utf8_lossy(&plaintext).contains("a3 OK") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for a3 OK: {:?}",
+            String::from_utf8_lossy(&plaintext)
+        );
+        let n = stream.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            continue;
+        }
+        let out0 = decompressor.total_out();
+        decompressor
+            .decompress(&buf[..n], &mut scratch, FlushDecompress::None)
+            .unwrap();
+        let produced = (decompressor.total_out() - out0) as usize;
+        plaintext.extend_from_slice(&scratch[..produced]);
+    }
+    let text = String::from_utf8_lossy(&plaintext);
+    assert!(text.contains("a3 OK"), "NOOP over compressed wire: {text}");
+
+    drop(rt);
+}
+
+// ── UTF8=ACCEPT (RFC 6855) ────────────────────────────────────────────────────
+
+/// `ENABLE UTF8=ACCEPT` followed by CREATE/LIST/SELECT of a non-ASCII
+/// mailbox name, sent and echoed back as raw UTF-8 (no modified UTF-7).
+#[test]
+fn server_utf8_accept_enable_and_internationalized_mailbox_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = vec![0u8; 8192];
+
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+    write_cmd(&mut stream, b"a1 LOGIN alice secret\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
+    assert!(r.contains("a1 OK"), "login: {r}");
+    assert!(
+        r.contains("UTF8=ACCEPT"),
+        "post-auth CAPABILITY must include UTF8=ACCEPT: {r}"
+    );
+
+    write_cmd(&mut stream, b"a2 ENABLE UTF8=ACCEPT\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
+    assert!(r.contains("a2 OK"), "enable: {r}");
+    assert!(
+        r.contains("ENABLED") && r.contains("UTF8=ACCEPT"),
+        "server must confirm UTF8=ACCEPT was enabled: {r}"
+    );
+
+    // "Buzon Francais" with accented characters, sent as raw UTF-8 in a
+    // quoted string — RFC 6855 §4 replaces the modified-UTF-7 requirement
+    // with plain UTF-8 once UTF8=ACCEPT is enabled.
+    let name = "Bu\u{00ee}te \u{00e9}t\u{00e9}"; // "Boîte été"
+    let create_cmd = format!("a3 CREATE \"{name}\"\r\n");
+    write_cmd(&mut stream, create_cmd.as_bytes());
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a3 "));
+    assert!(r.contains("a3 OK"), "create: {r}");
+
+    write_cmd(&mut stream, b"a4 LIST \"\" \"*\"\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a4 "));
+    assert!(r.contains("a4 OK"), "list: {r}");
+    assert!(
+        r.contains(name),
+        "LIST must echo the mailbox name as raw UTF-8, not modified UTF-7: {r}"
+    );
+
+    let select_cmd = format!("a5 SELECT \"{name}\"\r\n");
+    write_cmd(&mut stream, select_cmd.as_bytes());
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a5 "));
+    assert!(r.contains("a5 OK"), "select the internationalized mailbox: {r}");
+
+    drop(rt);
+}
+
+/// COMPRESS DEFLATE's rejection paths must not disturb the (still
+/// uncompressed) connection: wrong mechanism name, then a real negotiation,
+/// then a second attempt correctly refused as already active.
+#[test]
+fn server_compress_deflate_rejection_paths_raw() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server(&dir);
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = vec![0u8; 8192];
+
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+
+    // Pre-auth: COMPRESS is authenticated-only.
+    write_cmd(&mut stream, b"a1 COMPRESS DEFLATE\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a1 "));
+    assert!(
+        r.contains("a1 NO") || r.contains("a1 BAD"),
+        "COMPRESS before LOGIN must be refused: {r}"
+    );
+
+    write_cmd(&mut stream, b"a2 LOGIN alice secret\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 "));
+    assert!(r.contains("a2 OK"), "login: {r}");
+
+    // Unsupported mechanism name.
+    write_cmd(&mut stream, b"a3 COMPRESS GZIP\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a3 "));
+    assert!(r.contains("a3 BAD"), "unsupported mechanism must be BAD: {r}");
+
+    // Real negotiation succeeds.
+    write_cmd(&mut stream, b"a4 COMPRESS DEFLATE\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a4 "));
+    assert!(r.contains("a4 OK"), "compress: {r}");
+
+    // A second attempt, now compressed on the wire — encode with a fresh,
+    // independent raw-DEFLATE compressor and confirm the server answers NO
+    // without corrupting the (still-compressed) connection state.
+    use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
+    let mut c = Compress::new(Compression::default(), false);
+    let mut wire = vec![0u8; 256];
+    c.compress(b"a5 COMPRESS DEFLATE\r\n", &mut wire, FlushCompress::Sync)
+        .unwrap();
+    wire.truncate(c.total_out() as usize);
+    stream.write_all(&wire).unwrap();
+
+    let mut d = Decompress::new(false);
+    let mut plaintext = Vec::new();
+    let mut scratch = vec![0u8; 4096];
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !String::from_utf8_lossy(&plaintext).contains("a5 ") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for a5 reply: {:?}",
+            String::from_utf8_lossy(&plaintext)
+        );
+        let n = stream.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            continue;
+        }
+        let out0 = d.total_out();
+        d.decompress(&buf[..n], &mut scratch, FlushDecompress::None).unwrap();
+        let produced = (d.total_out() - out0) as usize;
+        plaintext.extend_from_slice(&scratch[..produced]);
+    }
+    let text = String::from_utf8_lossy(&plaintext);
+    assert!(
+        text.contains("a5 NO"),
+        "a second COMPRESS while already active must be refused: {text}"
+    );
+
     drop(rt);
 }

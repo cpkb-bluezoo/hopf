@@ -14,6 +14,8 @@ use std::time::Duration;
 use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
 use rmimeparser::charset::base64;
 
+use crate::compress::ImapCompressLayer;
+
 use super::handlers::{ImapClientDriver, ImapClientHandlerFactory};
 use super::pending::{ImapTagGenerator, PendingCommand, PendingKind, PendingMap, UntaggedClass};
 use super::reply::{ImapEvent, ImapReplyLexer, ImapStatus};
@@ -82,6 +84,8 @@ pub struct ImapClientEndpoint {
     /// to tell a real content-bearing FETCH response apart from an
     /// unsolicited flags-only one. Consumed (reset) by `on_fetch`.
     fetch_streamed_literal: bool,
+    /// RFC 4978 COMPRESS DEFLATE layer, once negotiated.
+    compress: Option<ImapCompressLayer>,
 }
 
 impl ImapClientEndpoint {
@@ -123,6 +127,7 @@ impl ImapClientEndpoint {
             last_appenduid: None,
             was_selected: false,
             fetch_streamed_literal: false,
+            compress: None,
         }
     }
 
@@ -153,7 +158,10 @@ impl ImapClientEndpoint {
         self.ensure_pending_timers(ep);
         if !self.outbound.is_empty() {
             let out = std::mem::take(&mut self.outbound);
-            ep.send(&out);
+            match &mut self.compress {
+                Some(layer) => ep.send(&layer.deflate_and_flush(&out)),
+                None => ep.send(&out),
+            }
         }
     }
 
@@ -651,6 +659,7 @@ impl ImapClientEndpoint {
             &refs,
             self.caps.condstore || self.caps.enable,
             self.caps.qresync || self.caps.enable,
+            self.caps.utf8_accept || self.caps.enable,
         );
         let enabled = self.enabled.clone();
         if let Some(mut driver) = self.driver.take() {
@@ -974,6 +983,20 @@ impl ImapClientEndpoint {
                 driver.on_namespace_complete(self, ep, status, &message);
                 self.driver = Some(driver);
             }
+            PendingKind::Compress => {
+                // The `OK` itself goes out over the still-plaintext
+                // connection; only bytes exchanged after this point are
+                // compressed, matching the server's own activation point.
+                if status == ImapStatus::Ok {
+                    self.compress = Some(ImapCompressLayer::new());
+                }
+                let mut driver = match self.driver.take() {
+                    Some(d) => d,
+                    None => return,
+                };
+                driver.on_compress_complete(self, ep, status, &message);
+                self.driver = Some(driver);
+            }
             PendingKind::Id => {
                 let mut driver = match self.driver.take() {
                     Some(d) => d,
@@ -1175,6 +1198,10 @@ impl ImapClientAuthenticated for ImapClientEndpoint {
         let _ = self.issue_no_ep(PendingKind::Enable, &format!("ENABLE {features}"));
     }
 
+    fn compress_deflate(&mut self) {
+        let _ = self.issue_no_ep(PendingKind::Compress, "COMPRESS DEFLATE");
+    }
+
     fn id(&mut self, fields: Option<&[(&str, &str)]>) {
         let _ = self.issue_no_ep(PendingKind::Id, &Self::format_id_cmd(fields));
     }
@@ -1372,20 +1399,20 @@ impl ProtocolHandler for ImapClientEndpoint {
             *data = &[];
             return;
         }
-        let events = match self.lexer.feed(data) {
-            Ok(e) => e,
-            Err(e) => {
-                self.protocol_error(ep, e.to_string());
-                return;
-            }
-        };
-        for event in events {
-            if matches!(self.session, SessionState::Closed | SessionState::Error) {
-                break;
-            }
-            self.dispatch(event, ep);
-            self.flush_outbound(ep);
+        if let Some(layer) = self.compress.as_mut() {
+            let plaintext = match layer.inflate(data) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    *data = &[];
+                    self.protocol_error(ep, e.to_string());
+                    return;
+                }
+            };
+            *data = &[];
+            return self.receive_plaintext(ep, &plaintext);
         }
+        self.receive_plaintext(ep, *data);
+        *data = &[];
     }
 
     fn security_established(&mut self, ep: &mut dyn Endpoint, _info: &SecurityInfo) {
@@ -1439,6 +1466,29 @@ impl ProtocolHandler for ImapClientEndpoint {
             self.driver = Some(driver);
         }
         ep.close();
+    }
+}
+
+impl ImapClientEndpoint {
+    /// The inflated-if-compressed, always-plaintext continuation of
+    /// [`ProtocolHandler::receive`] — every byte of `data` is consumed here
+    /// in one pass, matching the underlying [`ImapReplyLexer`]'s own
+    /// "no partial input held by the caller" contract.
+    fn receive_plaintext(&mut self, ep: &mut dyn Endpoint, mut data: &[u8]) {
+        let events = match self.lexer.feed(&mut data) {
+            Ok(e) => e,
+            Err(e) => {
+                self.protocol_error(ep, e.to_string());
+                return;
+            }
+        };
+        for event in events {
+            if matches!(self.session, SessionState::Closed | SessionState::Error) {
+                break;
+            }
+            self.dispatch(event, ep);
+            self.flush_outbound(ep);
+        }
     }
 }
 

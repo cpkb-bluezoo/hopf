@@ -11,6 +11,9 @@ pub struct EnabledExtensions {
     pub condstore: bool,
     /// QRESYNC enabled.
     pub qresync: bool,
+    /// UTF8=ACCEPT enabled (RFC 6855) — sticky for the session; RFC 6855
+    /// forbids un-enabling it once set.
+    pub utf8_accept: bool,
 }
 
 impl EnabledExtensions {
@@ -20,6 +23,7 @@ impl EnabledExtensions {
         tokens: &[&str],
         allow_condstore: bool,
         allow_qresync: bool,
+        allow_utf8_accept: bool,
     ) -> Vec<&'static str> {
         let mut newly = Vec::new();
         for tok in tokens {
@@ -33,6 +37,10 @@ impl EnabledExtensions {
                     self.qresync = true;
                     self.condstore = true;
                     newly.push("QRESYNC");
+                }
+                "UTF8=ACCEPT" if allow_utf8_accept && !self.utf8_accept => {
+                    self.utf8_accept = true;
+                    newly.push("UTF8=ACCEPT");
                 }
                 _ => {}
             }
@@ -48,6 +56,9 @@ impl EnabledExtensions {
         }
         if self.qresync {
             s.insert("QRESYNC");
+        }
+        if self.utf8_accept {
+            s.insert("UTF8=ACCEPT");
         }
         s
     }
@@ -67,23 +78,43 @@ mod tests {
     #[test]
     fn enable_condstore_then_qresync() {
         let mut e = EnabledExtensions::default();
-        let n = e.enable(&["CONDSTORE"], true, true);
+        let n = e.enable(&["CONDSTORE"], true, true, true);
         assert_eq!(n, vec!["CONDSTORE"]);
         assert!(e.condstore);
-        let n2 = e.enable(&["QRESYNC"], true, true);
+        let n2 = e.enable(&["QRESYNC"], true, true, true);
         assert_eq!(n2, vec!["QRESYNC"]);
         assert!(e.qresync);
         // Re-enable is a no-op for ENABLED list.
-        let n3 = e.enable(&["CONDSTORE", "QRESYNC"], true, true);
+        let n3 = e.enable(&["CONDSTORE", "QRESYNC"], true, true, true);
         assert!(n3.is_empty());
     }
 
     #[test]
     fn enable_respects_config() {
         let mut e = EnabledExtensions::default();
-        let n = e.enable(&["CONDSTORE", "QRESYNC"], false, false);
+        let n = e.enable(&["CONDSTORE", "QRESYNC"], false, false, false);
         assert!(n.is_empty());
         assert!(!e.condstore);
+    }
+
+    #[test]
+    fn enable_utf8_accept_is_sticky() {
+        let mut e = EnabledExtensions::default();
+        let n = e.enable(&["UTF8=ACCEPT"], true, true, true);
+        assert_eq!(n, vec!["UTF8=ACCEPT"]);
+        assert!(e.utf8_accept);
+        assert!(e.names().contains("UTF8=ACCEPT"));
+        // Re-enable is a no-op for ENABLED list.
+        let n2 = e.enable(&["UTF8=ACCEPT"], true, true, true);
+        assert!(n2.is_empty());
+    }
+
+    #[test]
+    fn enable_utf8_accept_respects_config() {
+        let mut e = EnabledExtensions::default();
+        let n = e.enable(&["UTF8=ACCEPT"], true, true, false);
+        assert!(n.is_empty());
+        assert!(!e.utf8_accept);
     }
 
     #[test]

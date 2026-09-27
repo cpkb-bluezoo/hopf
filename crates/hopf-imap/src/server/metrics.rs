@@ -18,6 +18,8 @@ pub struct ImapServerMetrics {
     pub commands: AtomicU64,
     /// STARTTLS upgrades completed.
     pub starttls: AtomicU64,
+    /// COMPRESS DEFLATE negotiations completed.
+    pub compress: AtomicU64,
 }
 
 impl ImapServerMetrics {
