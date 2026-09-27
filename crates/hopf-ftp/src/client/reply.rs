@@ -167,19 +167,28 @@ impl FtpReplyLexer {
         self.shape = shape;
     }
 
-    /// Feed newly-arrived bytes, returning every reply completed so far.
-    /// `data` is advanced past every byte consumed (i.e. all of it, on
-    /// success).
+    /// Feed newly-arrived bytes, returning the first reply completed (if
+    /// any) and stopping there - even if `data` holds more replies after
+    /// it. `data` is advanced only past the bytes actually consumed.
+    ///
+    /// A pipelining server can send replies to several already-issued
+    /// commands back to back, so more than one routinely lands in the same
+    /// read; but each reply's meaning depends on the [`FtpReplyShape`]
+    /// active when *that* reply is parsed (`expect()`, called by the
+    /// caller in response to the previous reply), not on whatever shape
+    /// was set before this `feed()` call. Stopping after one reply lets
+    /// the caller re-`expect()` and feed the remainder back in, instead of
+    /// parsing a whole burst under one stale shape (issue #373).
     pub fn feed(&mut self, data: &mut &[u8]) -> Result<Vec<FtpEvent>, FtpError> {
         let mut events = Vec::new();
-        let mut rest = *data;
-        while let Some((&b, tail)) = rest.split_first() {
-            rest = tail;
-            if let Some(event) = self.feed_byte(b)? {
+        for i in 0..data.len() {
+            if let Some(event) = self.feed_byte(data[i])? {
                 events.push(event);
+                *data = &data[i + 1..];
+                return Ok(events);
             }
         }
-        *data = rest;
+        *data = &[];
         Ok(events)
     }
 
@@ -743,20 +752,60 @@ mod tests {
     }
 
     #[test]
-    fn two_replies_in_one_feed_same_shape() {
-        // A single feed() call can legitimately contain more than one
-        // complete reply (e.g. a burst read) — every reply in that burst
-        // shares the shape active when feed() was called.
+    fn two_replies_in_one_feed_stops_after_first() {
+        // A single feed() call can see more than one complete reply at once
+        // (e.g. a burst read) - `feed` must stop right after the first one
+        // completes, leaving the rest of `data` unconsumed, so the caller
+        // can `expect()` the next reply's shape before those bytes are
+        // parsed. See `xfer_start_then_end_in_one_read_are_each_parsed_correctly`
+        // for why parsing a burst under one stale shape is wrong even when,
+        // as here, both replies happen to share a shape.
         let mut lex = FtpReplyLexer::new();
         lex.expect(FtpReplyShape::Cmd { expect: 200 });
         let mut data: &[u8] = b"200 First OK\r\n200 Second OK\r\n";
         assert_eq!(
             lex.feed(&mut data).unwrap(),
-            vec![
-                FtpEvent::CmdOk { text: "First OK".into() },
-                FtpEvent::CmdOk { text: "Second OK".into() },
-            ]
+            vec![FtpEvent::CmdOk { text: "First OK".into() }]
         );
+        assert_eq!(data, b"200 Second OK\r\n", "second reply must be left for the next feed() call");
+
+        lex.expect(FtpReplyShape::Cmd { expect: 200 });
+        assert_eq!(
+            lex.feed(&mut data).unwrap(),
+            vec![FtpEvent::CmdOk { text: "Second OK".into() }]
+        );
+        assert!(data.is_empty());
+    }
+
+    /// Regression for issue #373: a pipelined FTP data transfer's `150`
+    /// (XferStart) and `226` (XferEnd) replies carry *different* shapes,
+    /// and under load a delayed `receive()` can see both in a single read.
+    /// Parsing the second one under the stale `XferStart` shape reads a
+    /// perfectly valid `226` as an unexpected code (226 doesn't match
+    /// `XferStart`'s `125|150`), which is exactly the "expected 226, got
+    /// 226" mismatch reported on CI under full-workspace parallel runs.
+    #[test]
+    fn xfer_start_then_end_in_one_read_are_each_parsed_correctly() {
+        let mut lex = FtpReplyLexer::new();
+        lex.expect(FtpReplyShape::XferStart);
+        let mut data: &[u8] =
+            b"150 Opening BINARY mode data connection\r\n226 Transfer complete\r\n";
+
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(
+            events,
+            vec![FtpEvent::XferStartOk { text: "Opening BINARY mode data connection".into() }]
+        );
+        assert!(!data.is_empty(), "second reply must not be consumed yet");
+
+        lex.expect(FtpReplyShape::XferEnd);
+        let events = lex.feed(&mut data).unwrap();
+        assert_eq!(
+            events,
+            vec![FtpEvent::XferEndOk],
+            "must parse against XferEnd, not the stale XferStart shape"
+        );
+        assert!(data.is_empty());
     }
 
     #[test]
