@@ -221,18 +221,37 @@ impl FtpControlHandler {
     // -----------------------------------------------------------------------
 
     /// Process all complete replies buffered so far.
+    ///
+    /// `lexer.feed` stops after each completed reply so `process_event` can
+    /// call `expect()` for the *next* reply's shape before any more bytes
+    /// are parsed - a burst read can contain replies belonging to more than
+    /// one command (e.g. a transfer's `150` and `226` landing in the same
+    /// read under load), and each one's meaning depends on the shape active
+    /// when that specific reply is parsed, not on whatever shape was set
+    /// before this `receive()` call. Keep re-feeding whatever `feed` left
+    /// unconsumed until there's nothing left or nothing more parses out of
+    /// it (issue #373).
     fn process_all_replies(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
-        let events = match self.lexer.feed(data) {
-            Ok(events) => events,
-            Err(err) => {
-                self.fail(endpoint, err);
-                return;
+        loop {
+            let events = match self.lexer.feed(data) {
+                Ok(events) => events,
+                Err(err) => {
+                    self.fail(endpoint, err);
+                    return;
+                }
+            };
+            if events.is_empty() {
+                break;
             }
-        };
-        for event in events {
-            self.cancel_timer();
-            self.process_event(endpoint, event);
-            if matches!(self.state, ControlState::Done) {
+            for event in events {
+                self.cancel_timer();
+                self.process_event(endpoint, event);
+                if matches!(self.state, ControlState::Done) {
+                    self.arm_for_state(endpoint);
+                    return;
+                }
+            }
+            if data.is_empty() {
                 break;
             }
         }
