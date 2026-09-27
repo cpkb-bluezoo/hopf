@@ -5,14 +5,16 @@
 //! The server exposes a Gumdrop-shaped staged policy SPI and stores messages
 //! through [`hopf_mailbox`]. Implemented extensions (advertised only when
 //! enabled/configured) include IDLE, UIDPLUS, MOVE, NAMESPACE, ENABLE /
-//! CONDSTORE / QRESYNC, UNSELECT, ID, LIST-EXTENDED / LIST-STATUS, STATUS, and
-//! QUOTA. The client supports multiple outstanding tagged commands, routes
+//! CONDSTORE / QRESYNC / UTF8=ACCEPT, UNSELECT, ID, LIST-EXTENDED /
+//! LIST-STATUS, STATUS, QUOTA, and COMPRESS=DEFLATE. The client supports
+//! multiple outstanding tagged commands, routes
 //! untagged replies by prefix to the oldest compatible pending command
 //! (pipelined STATUS+LIST, SEARCH, STORE, MOVE, …), and provides a production
 //! IDLE state machine with [`ImapIdle`] as the default auto-pilot pipeline.
 
 #![warn(missing_docs)]
 
+mod compress;
 pub mod client;
 pub mod enable;
 pub mod server;

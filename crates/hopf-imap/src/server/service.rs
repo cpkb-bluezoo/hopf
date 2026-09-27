@@ -61,6 +61,11 @@ pub struct ImapConfig {
     pub enable_qresync: bool,
     /// Advertise ENABLE (RFC 5161).
     pub enable_enable: bool,
+    /// Advertise and accept COMPRESS DEFLATE (RFC 4978). Only ever
+    /// advertised once authenticated and not already compressed.
+    pub enable_compress: bool,
+    /// Advertise and accept ENABLE UTF8=ACCEPT (RFC 6855).
+    pub enable_utf8_accept: bool,
     /// Quota backend (default: unlimited).
     pub quota_manager: Arc<dyn QuotaManager>,
     /// Server ID fields for the ID command (RFC 2971). Empty → built-in defaults.
@@ -114,6 +119,8 @@ impl ImapConfig {
             enable_condstore: true,
             enable_qresync: true,
             enable_enable: true,
+            enable_compress: true,
+            enable_utf8_accept: true,
             quota_manager: Arc::new(UnlimitedQuotaManager),
             server_id: BTreeMap::new(),
         }

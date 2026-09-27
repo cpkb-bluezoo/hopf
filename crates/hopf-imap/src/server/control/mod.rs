@@ -19,6 +19,7 @@ use hopf_otel::{
 
 use rmimeparser::charset::base64;
 
+use crate::compress::{CompressingEndpoint, ImapCompressLayer};
 use crate::enable::EnabledExtensions;
 use crate::server::capability::build_capabilities;
 use crate::server::codec::{
@@ -192,6 +193,18 @@ pub struct ImapControlHandler {
     traces_enabled: bool,
     conn_trace: Option<Trace>,
     pending_cmd_tel: Option<CommandTelemetry>,
+    /// RFC 4978 COMPRESS DEFLATE layer, once negotiated — `None` means the
+    /// connection is (still) uncompressed. Temporarily taken out (and put
+    /// back) by `receive()` while draining one inbound chunk, so
+    /// `cmd_compress`'s "already active" check cannot use this directly —
+    /// see `compress_active`.
+    compress: Option<ImapCompressLayer>,
+    /// Mirrors `compress.is_some()`, except it stays `true` for the whole
+    /// `receive()` call that activated compression — including a
+    /// re-entrant `COMPRESS` command the lexer produces from the *same*
+    /// inbound chunk, while `compress` itself is transiently `None`
+    /// (taken out for that call's `CompressingEndpoint`).
+    compress_active: bool,
 }
 
 impl ImapControlHandler {
@@ -256,6 +269,8 @@ impl ImapControlHandler {
             traces_enabled: false,
             conn_trace: None,
             pending_cmd_tel: None,
+            compress: None,
+            compress_active: false,
         }
     }
 
@@ -365,6 +380,13 @@ impl ImapControlHandler {
         }
     }
 
+    fn record_compress(&self) {
+        ImapServerMetrics::add(&self.metrics.compress, 1);
+        if let Some(m) = &self.otel_metrics {
+            m.compress();
+        }
+    }
+
     pub(super) fn send(&mut self, endpoint: &mut dyn Endpoint, bytes: Vec<u8>) {
         endpoint.send(&bytes);
     }
@@ -374,7 +396,11 @@ impl ImapControlHandler {
             self.session,
             ImapSessionState::Authenticated | ImapSessionState::Selected
         );
-        build_capabilities(&self.config, authenticated, self.tls)
+        self.capabilities_as(authenticated)
+    }
+
+    fn capabilities_as(&self, authenticated: bool) -> String {
+        build_capabilities(&self.config, authenticated, self.tls, self.compress_active)
     }
 
     fn greet(&mut self, endpoint: &mut dyn Endpoint) {
@@ -719,6 +745,7 @@ impl ImapControlHandler {
             "AUTHENTICATE" => self.cmd_authenticate(endpoint, cmd),
             "ID" => self.cmd_id(endpoint, cmd),
             "ENABLE" => self.cmd_enable(endpoint, cmd),
+            "COMPRESS" => self.cmd_compress(endpoint, cmd),
             "SELECT" => self.cmd_select(endpoint, cmd, false),
             "EXAMINE" => self.cmd_select(endpoint, cmd, true),
             "CLOSE" => self.cmd_close(endpoint, &cmd.tag, true),
@@ -1023,7 +1050,14 @@ impl ImapControlHandler {
             self.send(endpoint, tagged_no(tag, "No authentication handler"));
             return;
         };
-        let caps = self.capabilities();
+        // `self.session` hasn't transitioned out of `NotAuthenticated` yet
+        // (the view below does that, inside `h.authenticate`) — but
+        // authentication has already succeeded by the time `finish_auth`
+        // runs, so the capability string embedded in the LOGIN/AUTHENTICATE
+        // `OK` response (RFC 9051 §6.2.3, §6.2.2) must reflect the
+        // post-auth set, not whatever `self.capabilities()` would compute
+        // from the stale pre-auth state.
+        let caps = self.capabilities_as(true);
         let mut view = AuthView {
             endpoint,
             tag,
@@ -1827,6 +1861,71 @@ impl ProtocolHandler for ImapControlHandler {
     }
 
     fn receive(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+        let Some(mut layer) = self.compress.take() else {
+            self.receive_inner(endpoint, data);
+            return;
+        };
+        // RFC 4978: once negotiated, every byte in both directions is raw
+        // DEFLATE for the rest of the session — inflate what just arrived,
+        // then let `receive_inner` process it exactly as it would an
+        // uncompressed connection, through a `CompressingEndpoint` that
+        // transparently deflates every `send()` it forwards.
+        let result = layer.inflate(data);
+        *data = &[];
+        match result {
+            Ok(plaintext) => {
+                let mut cursor: &[u8] = &plaintext;
+                {
+                    let mut wrapped = CompressingEndpoint::new(endpoint, &mut layer);
+                    self.receive_inner(&mut wrapped, &mut cursor);
+                }
+                self.compress = Some(layer);
+            }
+            Err(_) => {
+                // Malformed compressed data: nothing safe to recover to.
+                self.compress = Some(layer);
+                endpoint.close();
+            }
+        }
+    }
+
+    fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
+        if let Some(mut c) = self.client_connected.take() {
+            c.disconnected();
+        }
+        if self.session != ImapSessionState::Logout {
+            self.offload_close(false);
+        }
+        self.end_connection_telemetry();
+    }
+
+    fn security_established(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        info: &hopf_core::SecurityInfo,
+    ) {
+        self.tls = true;
+        self.meta.tls = true;
+        self.peer_certificate = info.peer_certificate_fingerprint().map(str::to_string);
+        if self.expect_implicit_tls && !self.greeting_sent {
+            self.greet(endpoint);
+            return;
+        }
+        if self.starttls_used {
+            self.record_starttls();
+            self.starttls_used = false;
+            return;
+        }
+        self.starttls_used = false;
+    }
+
+    fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
+        endpoint.close();
+    }
+}
+
+impl ImapControlHandler {
+    fn receive_inner(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
         self.sync_pending(endpoint);
         self.sync_pending_auth_check(endpoint);
         self.sync_pending_append(endpoint);
@@ -1887,40 +1986,6 @@ impl ProtocolHandler for ImapControlHandler {
         self.sync_pending_auth_check(endpoint);
         self.sync_pending_append(endpoint);
         self.drain_queue(endpoint);
-    }
-
-    fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
-        if let Some(mut c) = self.client_connected.take() {
-            c.disconnected();
-        }
-        if self.session != ImapSessionState::Logout {
-            self.offload_close(false);
-        }
-        self.end_connection_telemetry();
-    }
-
-    fn security_established(
-        &mut self,
-        endpoint: &mut dyn Endpoint,
-        info: &hopf_core::SecurityInfo,
-    ) {
-        self.tls = true;
-        self.meta.tls = true;
-        self.peer_certificate = info.peer_certificate_fingerprint().map(str::to_string);
-        if self.expect_implicit_tls && !self.greeting_sent {
-            self.greet(endpoint);
-            return;
-        }
-        if self.starttls_used {
-            self.record_starttls();
-            self.starttls_used = false;
-            return;
-        }
-        self.starttls_used = false;
-    }
-
-    fn error(&mut self, endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
-        endpoint.close();
     }
 }
 

@@ -61,6 +61,8 @@ pub enum PendingKind {
     Enable,
     /// `NAMESPACE`
     Namespace,
+    /// `COMPRESS`
+    Compress,
     /// `ID`
     Id,
     /// `GETQUOTA` / `GETQUOTAROOT` / `SETQUOTA`

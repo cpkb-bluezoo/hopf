@@ -9,6 +9,7 @@ use hopf_core::{Endpoint, StorageError, TimerHandle};
 use hopf_mailbox::{MailboxAttribute, MessageSet};
 
 use super::ImapControlHandler;
+use crate::compress::ImapCompressLayer;
 use crate::enable::parse_enable_args;
 use crate::server::codec::{parse_astring, parse_sequence_set, ImapCommand};
 use crate::server::idle::{
@@ -98,11 +99,44 @@ impl ImapControlHandler {
             &refs,
             self.config.enable_condstore,
             self.config.enable_qresync,
+            self.config.enable_utf8_accept,
         );
         if !newly.is_empty() {
             self.send(endpoint, untagged(&format!("ENABLED {}", newly.join(" "))));
         }
         self.send(endpoint, tagged_ok(&cmd.tag, "ENABLE completed"));
+    }
+
+    /// RFC 4978 COMPRESS DEFLATE. The `OK` response is sent uncompressed —
+    /// the layer only activates for bytes exchanged after it, matching "the
+    /// client MUST NOT send further data until it sees the result" (and
+    /// mirroring the same fresh-frame boundary at the far end).
+    pub(super) fn cmd_compress(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
+        if !self.require_auth(endpoint, &cmd.tag) {
+            return;
+        }
+        if !self.config.enable_compress {
+            self.send(endpoint, tagged_bad(&cmd.tag, "COMPRESS not available"));
+            return;
+        }
+        if self.compress_active {
+            self.send(
+                endpoint,
+                tagged_no(&cmd.tag, "COMPRESS DEFLATE already active"),
+            );
+            return;
+        }
+        if !cmd.args.trim().eq_ignore_ascii_case("DEFLATE") {
+            self.send(
+                endpoint,
+                tagged_bad(&cmd.tag, "Unsupported compression mechanism"),
+            );
+            return;
+        }
+        self.send(endpoint, tagged_ok(&cmd.tag, "DEFLATE active"));
+        self.record_compress();
+        self.compress = Some(ImapCompressLayer::new());
+        self.compress_active = true;
     }
 
     pub(super) fn cmd_namespace(&mut self, endpoint: &mut dyn Endpoint, tag: &str) {

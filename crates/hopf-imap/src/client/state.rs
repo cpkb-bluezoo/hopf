@@ -41,6 +41,10 @@ pub struct ImapCapabilities {
     pub id: bool,
     /// `QUOTA`.
     pub quota: bool,
+    /// `COMPRESS=DEFLATE` (RFC 4978).
+    pub compress_deflate: bool,
+    /// `UTF8=ACCEPT` (RFC 6855).
+    pub utf8_accept: bool,
 }
 
 impl ImapCapabilities {
@@ -63,6 +67,8 @@ impl ImapCapabilities {
                 "UNSELECT" => caps.unselect = true,
                 "ID" => caps.id = true,
                 "QUOTA" => caps.quota = true,
+                "COMPRESS=DEFLATE" => caps.compress_deflate = true,
+                "UTF8=ACCEPT" => caps.utf8_accept = true,
                 _ => {
                     if let Some(mech) = u.strip_prefix("AUTH=") {
                         if mech == "PLAIN" {
@@ -439,6 +445,10 @@ pub trait ImapClientAuthenticated {
     fn namespace(&mut self);
     /// Send `ENABLE` with space-separated features (e.g. `CONDSTORE QRESYNC`).
     fn enable(&mut self, features: &str);
+    /// Send `COMPRESS DEFLATE` (RFC 4978) when advertised. Once the tagged
+    /// `OK` arrives, every subsequent byte in both directions on this
+    /// connection is transparently DEFLATE-compressed.
+    fn compress_deflate(&mut self);
     /// Send `ID` (RFC 2971).
     fn id(&mut self, fields: Option<&[(&str, &str)]>);
     /// Send `GETQUOTA` when advertised.

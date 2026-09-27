@@ -26,6 +26,7 @@ hopf-auth = { workspace = true }
 hopf-mailbox = { workspace = true }
 hopf-otel = { workspace = true }
 rmimeparser = { workspace = true }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
