@@ -28,8 +28,9 @@ pub use client::{
     ImapClientEndpoint, ImapClientHandlerFactory, ImapClientIdle, ImapClientNotAuthenticated,
     ImapClientPostStarttls, ImapClientSelected, ImapClientTimeouts, ImapCopyUid,
     ImapEnabledFeatures, ImapError, ImapEvent, ImapFetch, ImapFetchData, ImapIdle, ImapListEntry,
-    ImapMailboxInfo, ImapNamespace, ImapNamespaceData, ImapQuotaData, ImapQuotaResource,
-    ImapQuotaRootData, ImapReplyLexer, ImapResult, ImapStatus, ImapStatusData, ImapTagGenerator,
+    ImapMailboxInfo, ImapMetadataData, ImapMetadataEntry, ImapNamespace, ImapNamespaceData,
+    ImapQuotaData, ImapQuotaResource, ImapQuotaRootData, ImapReplyLexer, ImapResult, ImapStatus,
+    ImapStatusData, ImapTagGenerator,
     ImapThreadNode, MailboxEventListener, MessageReceiveCallback, NopMailboxEventListener,
     PendingCommand, PendingKind, PendingMap, Tag, UntaggedClass, DEFAULT_MAX_PIPELINE, MAX_TOKEN,
 };

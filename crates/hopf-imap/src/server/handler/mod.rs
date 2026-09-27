@@ -8,9 +8,9 @@ mod state;
 pub use default::{DefaultImapHandler, DefaultImapHandlerFactory};
 pub use state::{
     AppendState, AuthenticateState, CloseState, ConnectedState, CopyState, CreateState,
-    DeleteState, ExpungeState, FetchState, ListState, MoveState, QuotaState, RenameState,
-    SearchState, SelectState, SortState, StatusState, StoreAction, StoreState, SubscribeState,
-    ThreadState,
+    DeleteState, ExpungeState, FetchState, GetMetadataState, ListState, MoveState, QuotaState,
+    RenameState, SearchState, SelectState, SetMetadataState, SortState, StatusState, StoreAction,
+    StoreState, SubscribeState, ThreadState,
 };
 
 use std::collections::BTreeSet;
@@ -20,6 +20,7 @@ use std::time::SystemTime;
 use hopf_mailbox::{Flag, Mailbox, MailboxFactory, MailboxStore, MessageSet, SearchCriteria};
 
 use crate::server::fetch_format::FetchItem;
+use crate::server::metadata::GetMetadataOptions;
 use crate::server::quota::QuotaManager;
 use crate::server::status_items::StatusItem;
 
@@ -147,6 +148,23 @@ pub trait AuthenticatedHandler: Send {
         store: &dyn MailboxStore,
         quota_root: &str,
     );
+    /// GETMETADATA.
+    fn get_metadata(
+        &mut self,
+        state: &mut dyn GetMetadataState,
+        store: &dyn MailboxStore,
+        mailbox: &str,
+        entries: &[String],
+        options: &GetMetadataOptions,
+    );
+    /// SETMETADATA.
+    fn set_metadata(
+        &mut self,
+        state: &mut dyn SetMetadataState,
+        store: &dyn MailboxStore,
+        mailbox: &str,
+        entries: &[(String, Option<String>)],
+    );
 }
 
 /// SELECTED-state message commands (also inherits authenticated mailbox ops).
@@ -227,6 +245,23 @@ pub trait SelectedHandler: Send {
         quota: &dyn QuotaManager,
         store: &dyn MailboxStore,
         quota_root: &str,
+    );
+    /// GETMETADATA.
+    fn get_metadata(
+        &mut self,
+        state: &mut dyn GetMetadataState,
+        store: &dyn MailboxStore,
+        mailbox: &str,
+        entries: &[String],
+        options: &GetMetadataOptions,
+    );
+    /// SETMETADATA.
+    fn set_metadata(
+        &mut self,
+        state: &mut dyn SetMetadataState,
+        store: &dyn MailboxStore,
+        mailbox: &str,
+        entries: &[(String, Option<String>)],
     );
     /// CLOSE (expunge + deselect).
     fn close(&mut self, state: &mut dyn CloseState, mailbox: &dyn Mailbox);

@@ -23,6 +23,8 @@ pub enum StatusItem {
     Size,
     /// HIGHESTMODSEQ (CONDSTORE)
     HighestModseq,
+    /// MAILBOXID (RFC 8474 OBJECTID)
+    MailboxId,
 }
 
 impl StatusItem {
@@ -37,6 +39,7 @@ impl StatusItem {
             "DELETED" => Self::Deleted,
             "SIZE" => Self::Size,
             "HIGHESTMODSEQ" => Self::HighestModseq,
+            "MAILBOXID" => Self::MailboxId,
             _ => return None,
         })
     }
@@ -52,6 +55,7 @@ impl StatusItem {
             Self::Deleted => "DELETED",
             Self::Size => "SIZE",
             Self::HighestModseq => "HIGHESTMODSEQ",
+            Self::MailboxId => "MAILBOXID",
         }
     }
 }
@@ -127,5 +131,11 @@ mod tests {
     #[test]
     fn parse_status_rejects_unknown() {
         assert!(parse_status_items("(BOGUS)").is_err());
+    }
+
+    #[test]
+    fn parse_status_items_mailboxid() {
+        let items = parse_status_items("(MAILBOXID)").unwrap();
+        assert!(items.contains(&StatusItem::MailboxId));
     }
 }

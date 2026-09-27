@@ -201,6 +201,8 @@ pub struct ImapControlHandler {
     enabled: EnabledExtensions,
     /// IDLE session.
     idle: IdleState,
+    /// RFC 5465 NOTIFY registration (see [`crate::server::notify`]).
+    notify: crate::server::notify::NotifyShared,
     /// QRESYNC parameters from the last SELECT (uidvalidity, modseq).
     pending_qresync: Option<(u64, u64)>,
     otel_metrics: Option<Arc<OtelImapMetrics>>,
@@ -278,6 +280,7 @@ impl ImapControlHandler {
             pending_open: Arc::new(Mutex::new(None)),
             enabled: EnabledExtensions::default(),
             idle: IdleState::default(),
+            notify: crate::server::notify::NotifyShared::default(),
             pending_qresync: None,
             otel_metrics: None,
             export: None,
@@ -516,7 +519,7 @@ impl ImapControlHandler {
             } => match outcome {
                 Ok(payload) => {
                     let s = String::from_utf8_lossy(&payload);
-                    // exists|recent|uidvalidity|uidnext|highestmodseq[|VANISHED uids]
+                    // exists|recent|uidvalidity|uidnext|highestmodseq|mailboxid[|VANISHED uids]
                     // `recent` stays in the payload for backends; unsolicited RECENT is
                     // not emitted (IMAP4rev2 / RFC 9051).
                     let parts: Vec<&str> = s.split('|').collect();
@@ -527,6 +530,7 @@ impl ImapControlHandler {
                     } else {
                         ("0", "0", "0", "1", "0")
                     };
+                    let mailboxid = parts.get(5).copied().unwrap_or("");
                     self.send(
                         endpoint,
                         untagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)"),
@@ -546,6 +550,12 @@ impl ImapControlHandler {
                         endpoint,
                         untagged(&format!("OK [UIDNEXT {uidnext}] Predicted next UID")),
                     );
+                    if self.config.enable_objectid && !mailboxid.is_empty() {
+                        self.send(
+                            endpoint,
+                            untagged(&format!("OK [MAILBOXID ({mailboxid})] Object id")),
+                        );
+                    }
                     if condstore {
                         if let Ok(h) = highest.parse::<u64>() {
                             if h > 0 {
@@ -557,10 +567,10 @@ impl ImapControlHandler {
                         }
                     }
                     // Optional VANISHED (EARLIER) from QRESYNC — only when backend provided UIDs.
-                    if parts.len() >= 6 && !parts[5].is_empty() {
+                    if parts.len() >= 7 && !parts[6].is_empty() {
                         self.send(
                             endpoint,
-                            untagged(&format!("VANISHED (EARLIER) {}", parts[5])),
+                            untagged(&format!("VANISHED (EARLIER) {}", parts[6])),
                         );
                     }
                     if let Ok(n) = exists.parse::<u32>() {
@@ -814,6 +824,9 @@ impl ImapControlHandler {
             "GETQUOTA" => self.cmd_getquota(endpoint, cmd),
             "GETQUOTAROOT" => self.cmd_getquotaroot(endpoint, cmd),
             "SETQUOTA" => self.cmd_setquota(endpoint, cmd),
+            "GETMETADATA" => self.cmd_getmetadata(endpoint, cmd),
+            "SETMETADATA" => self.cmd_setmetadata(endpoint, cmd),
+            "NOTIFY" => self.cmd_notify(endpoint, cmd),
             "APPEND" => self.cmd_append(endpoint, cmd),
             "FETCH" => self.cmd_fetch(endpoint, cmd, false),
             "STORE" => self.cmd_store(endpoint, cmd, false),
@@ -875,6 +888,37 @@ impl ImapControlHandler {
         } else {
             self.send(endpoint, tagged_no(tag, "No mailbox selected"));
             false
+        }
+    }
+
+    /// Restore `self.selected` after a call into a state-trait `proceed`/
+    /// `no` pair whose SPI signature can only carry a `Box<dyn
+    /// AuthenticatedHandler>` — used by commands valid from *either*
+    /// Authenticated or Selected state (STATUS, GETMETADATA, SETMETADATA),
+    /// whose trait signature therefore uses the lowest common denominator
+    /// rather than `Box<dyn SelectedHandler>`.
+    ///
+    /// Without this, a Selected-state call into one of those commands
+    /// would silently lose `self.selected` forever (until the next
+    /// SELECT): the async completion path only knows how to restore
+    /// whichever of `auth_handler` / `selected_handler` its `PendingOpen`
+    /// carries, and these commands' `proceed`/`no` only ever hand back an
+    /// `AuthenticatedHandler` clone — even when the call actually came
+    /// from Selected state. `h` here is the *real* `Box<dyn
+    /// SelectedHandler>` the caller took out of `self.selected` before
+    /// invoking the command; this overwrites the just-stashed throwaway
+    /// clone with it (if the call is still pending an async completion),
+    /// or restores it immediately (if nothing is pending — e.g. a custom
+    /// handler's `no()` already ran synchronously).
+    pub(super) fn restore_selected_after_authenticated_shaped_call(
+        &mut self,
+        h: Box<dyn SelectedHandler>,
+    ) {
+        if let Some(p) = self.pending_open.lock().unwrap().as_mut() {
+            p.auth_handler = None;
+            p.selected_handler = Some(h);
+        } else if self.selected.is_none() {
+            self.selected = Some(h);
         }
     }
 

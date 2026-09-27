@@ -180,6 +180,9 @@ pub enum ImapEvent {
     /// `* ID …` (bounded-captured; caller parses with the `ID` params
     /// helper).
     IdParams(String),
+    /// `* METADATA mailbox (…)` (bounded-captured; caller parses with
+    /// [`super::state::ImapMetadataData::parse`]).
+    Metadata(String),
     /// Unrecognised untagged response — a server extension hopf doesn't
     /// know about. The line has already been consumed.
     Other,
@@ -215,6 +218,7 @@ enum BoundedKind {
     QuotaRoot,
     Id,
     Thread,
+    Metadata,
 }
 
 /// Which space-separated *number* list we're reading (`SEARCH`/`SORT`
@@ -360,6 +364,21 @@ enum State {
     FetchModseqValue,
     /// `)` expected to close `MODSEQ (n)`.
     FetchModseqClose,
+    /// `(` expected (`EMAILID`'s value is `(objectid)`).
+    FetchEmailIdOpen,
+    /// Reading `EMAILID`'s objectid atom.
+    FetchEmailIdValue,
+    /// `)` expected to close `EMAILID (objectid)`.
+    FetchEmailIdClose,
+    /// First byte of `THREADID`'s value: `(` (has a value) or the start of
+    /// `NIL`.
+    FetchThreadIdStart,
+    /// Matching literal `NIL` for `THREADID`.
+    FetchThreadIdNil,
+    /// Reading `THREADID`'s objectid atom (once `(` was seen).
+    FetchThreadIdValue,
+    /// `)` expected to close `THREADID (objectid)`.
+    FetchThreadIdClose,
     /// `(` expected (`FLAGS`'s value).
     FetchFlagsOpen,
     /// Reading `FLAGS`'s value (depth 1 = inside the list).
@@ -596,6 +615,13 @@ impl ImapReplyLexer {
             State::FetchModseqOpen => self.on_fetch_modseq_open(b),
             State::FetchModseqValue => self.on_fetch_modseq_value(b),
             State::FetchModseqClose => self.on_fetch_modseq_close(b),
+            State::FetchEmailIdOpen => self.on_fetch_emailid_open(b),
+            State::FetchEmailIdValue => self.on_fetch_emailid_value(b),
+            State::FetchEmailIdClose => self.on_fetch_emailid_close(b),
+            State::FetchThreadIdStart => self.on_fetch_threadid_start(b),
+            State::FetchThreadIdNil => self.on_fetch_threadid_nil(b),
+            State::FetchThreadIdValue => self.on_fetch_threadid_value(b),
+            State::FetchThreadIdClose => self.on_fetch_threadid_close(b),
             State::FetchFlagsOpen => self.on_fetch_flags_open(b),
             State::FetchFlagsBody { depth } => self.on_fetch_flags_body(depth, b),
             State::FetchBodySection => self.on_fetch_body_section(b),
@@ -739,6 +765,7 @@ impl ImapReplyLexer {
                     "QUOTA" => self.begin_bounded(BoundedKind::Quota, by_cr),
                     "QUOTAROOT" => self.begin_bounded(BoundedKind::QuotaRoot, by_cr),
                     "ID" => self.begin_bounded(BoundedKind::Id, by_cr),
+                    "METADATA" => self.begin_bounded(BoundedKind::Metadata, by_cr),
                     _ => {
                         if by_cr {
                             self.state = State::AwaitLf(AwaitLfKind::Other);
@@ -1445,6 +1472,14 @@ impl ImapReplyLexer {
                 self.state = State::FetchModseqOpen;
                 Ok(None)
             }
+            ("EMAILID", b' ') => {
+                self.state = State::FetchEmailIdOpen;
+                Ok(None)
+            }
+            ("THREADID", b' ') => {
+                self.state = State::FetchThreadIdStart;
+                Ok(None)
+            }
             ("FLAGS", b' ') => {
                 self.flags_is_fetch_attr = true;
                 self.state = State::FetchFlagsOpen;
@@ -1549,6 +1584,102 @@ impl ImapReplyLexer {
                 Ok(None)
             }
             _ => Err(ImapError::Parse("expected SP or ')' after MODSEQ value".into())),
+        }
+    }
+
+    fn on_fetch_emailid_open(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        if b == b'(' {
+            self.state = State::FetchEmailIdValue;
+            return Ok(None);
+        }
+        Err(ImapError::Parse("expected '(' opening EMAILID value".into()))
+    }
+
+    fn on_fetch_emailid_value(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        if b == b')' {
+            self.fetch_data.email_id = Some(self.take_word());
+            self.state = State::FetchEmailIdClose;
+            return Ok(None);
+        }
+        self.push_word(b)?;
+        self.state = State::FetchEmailIdValue;
+        Ok(None)
+    }
+
+    fn on_fetch_emailid_close(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        match b {
+            b' ' => {
+                self.state = State::FetchAttrNameStart;
+                Ok(None)
+            }
+            b')' => {
+                self.state = State::FetchListCloseCr;
+                self.list_close_kind = Some(ListCloseKind::Fetch);
+                Ok(None)
+            }
+            _ => Err(ImapError::Parse("expected SP or ')' after EMAILID value".into())),
+        }
+    }
+
+    fn on_fetch_threadid_start(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        if b == b'(' {
+            self.state = State::FetchThreadIdValue;
+            return Ok(None);
+        }
+        self.push_word(b)?;
+        self.state = State::FetchThreadIdNil;
+        Ok(None)
+    }
+
+    fn on_fetch_threadid_nil(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        match b {
+            b' ' | b')' => {
+                let w = self.take_word();
+                if !w.eq_ignore_ascii_case("NIL") {
+                    return Err(ImapError::Parse(format!(
+                        "expected THREADID NIL or a value, got {w:?}"
+                    )));
+                }
+                self.fetch_data.thread_id = None;
+                if b == b')' {
+                    self.state = State::FetchListCloseCr;
+                    self.list_close_kind = Some(ListCloseKind::Fetch);
+                    return Ok(None);
+                }
+                self.state = State::FetchAttrNameStart;
+                Ok(None)
+            }
+            _ => {
+                self.push_word(b)?;
+                self.state = State::FetchThreadIdNil;
+                Ok(None)
+            }
+        }
+    }
+
+    fn on_fetch_threadid_value(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        if b == b')' {
+            self.fetch_data.thread_id = Some(self.take_word());
+            self.state = State::FetchThreadIdClose;
+            return Ok(None);
+        }
+        self.push_word(b)?;
+        self.state = State::FetchThreadIdValue;
+        Ok(None)
+    }
+
+    fn on_fetch_threadid_close(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        match b {
+            b' ' => {
+                self.state = State::FetchAttrNameStart;
+                Ok(None)
+            }
+            b')' => {
+                self.state = State::FetchListCloseCr;
+                self.list_close_kind = Some(ListCloseKind::Fetch);
+                Ok(None)
+            }
+            _ => Err(ImapError::Parse("expected SP or ')' after THREADID value".into())),
         }
     }
 
@@ -1878,6 +2009,7 @@ impl ImapReplyLexer {
             BoundedKind::QuotaRoot => ImapEvent::QuotaRoot(payload),
             BoundedKind::Id => ImapEvent::IdParams(payload),
             BoundedKind::Thread => ImapEvent::ThreadData(payload),
+            BoundedKind::Metadata => ImapEvent::Metadata(payload),
         }
     }
 

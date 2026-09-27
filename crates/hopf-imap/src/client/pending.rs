@@ -71,6 +71,10 @@ pub enum PendingKind {
     Id,
     /// `GETQUOTA` / `GETQUOTAROOT` / `SETQUOTA`
     Quota,
+    /// `GETMETADATA` / `SETMETADATA`
+    Metadata,
+    /// `NOTIFY`
+    Notify,
     /// `CLOSE`
     Close,
     /// `UNSELECT`
@@ -105,6 +109,7 @@ impl PendingKind {
                 | Self::Namespace
                 | Self::Id
                 | Self::Quota
+                | Self::Metadata
         )
     }
 
@@ -131,6 +136,7 @@ impl PendingKind {
             UntaggedClass::Namespace => matches!(self, Self::Namespace),
             UntaggedClass::Id => matches!(self, Self::Id),
             UntaggedClass::Quota | UntaggedClass::QuotaRoot => matches!(self, Self::Quota),
+            UntaggedClass::Metadata => matches!(self, Self::Metadata),
             UntaggedClass::MailboxEvent => false,
             UntaggedClass::Other => false,
         }
@@ -172,6 +178,8 @@ pub enum UntaggedClass {
     Quota,
     /// `QUOTAROOT …`
     QuotaRoot,
+    /// `METADATA …`
+    Metadata,
     /// Unsolicited mailbox noise routed via [`super::handlers::MailboxEventListener`]
     /// when no pending command claims it (also used as a sentinel).
     MailboxEvent,

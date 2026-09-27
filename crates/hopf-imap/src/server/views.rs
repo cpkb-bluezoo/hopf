@@ -14,14 +14,16 @@ use hopf_mailbox::{
 
 use crate::server::control::{MailboxBundle, PendingOpen};
 use crate::server::fetch_format::{
-    fetch_sets_seen, format_fetch_attrs, push_fetch_attrs, FetchItem,
+    fetch_sets_seen, format_fetch_attrs, format_nstring, push_fetch_attrs, FetchItem,
 };
 use crate::server::handler::{
     AppendState, AuthenticateState, AuthenticatedHandler, CloseState, ConnectedState, CopyState,
-    CreateState, DeleteState, ExpungeState, FetchState, ListState, MoveState,
-    NotAuthenticatedHandler, RenameState, SearchState, SelectState, SelectedHandler, SortState,
-    StatusState, StoreAction, StoreState, SubscribeState, ThreadState,
+    CreateState, DeleteState, ExpungeState, FetchState, GetMetadataState, ListState, MoveState,
+    NotAuthenticatedHandler, RenameState, SearchState, SelectState, SelectedHandler,
+    SetMetadataState, SortState, StatusState, StoreAction, StoreState, SubscribeState,
+    ThreadState,
 };
+use crate::server::metadata::GetMetadataOptions;
 use crate::server::reply::{format_list_attrs, quote_astring, tagged_no, tagged_ok, untagged};
 use crate::server::session::ImapSessionState;
 use crate::server::sort::{sort_messages, SortCriterion, SortableMessage};
@@ -293,15 +295,17 @@ impl SelectState for SelectView<'_> {
                         }
                     }
                 }
+                let mailboxid = mb.mailbox_id().unwrap_or("").to_string();
                 g.mailbox = Some(mb);
                 g.read_only = examine;
                 let mut payload = format!(
-                    "{}|{}|{}|{}|{}",
+                    "{}|{}|{}|{}|{}|{}",
                     status.messages,
                     status.recent,
                     status.uid_validity,
                     status.uid_next,
-                    status.highest_modseq
+                    status.highest_modseq,
+                    mailboxid
                 );
                 if !vanished.is_empty() {
                     payload.push('|');
@@ -883,6 +887,7 @@ impl FetchState for FetchView<'_> {
                         let _ = mb.set_flags(seq, &seen, true);
                     }
                     let modseq_opt = if modseq > 0 { Some(modseq) } else { None };
+                    let email_id = mb.email_id(seq).ok().flatten();
 
                     buf.clear();
                     buf.extend_from_slice(format!("* {seq} FETCH ").as_bytes());
@@ -896,6 +901,7 @@ impl FetchState for FetchView<'_> {
                         &keywords,
                         by_uid,
                         modseq_opt,
+                        email_id.as_deref(),
                         &mut |chunk: &[u8]| {
                             buf.extend_from_slice(chunk);
                             if buf.len() >= 8192 {
@@ -1019,6 +1025,7 @@ impl StoreState for StoreView<'_> {
                             None,
                             by_uid,
                             modseq,
+                            None,
                         );
                         let mut line = format!("* {seq} FETCH ").into_bytes();
                         line.extend_from_slice(&attrs);
@@ -1432,6 +1439,11 @@ pub(crate) fn format_status_line(
                 let size = mb.mailbox_size().unwrap_or(0);
                 parts.push(format!("SIZE {size}"));
             }
+            StatusItem::MailboxId => {
+                if let Some(id) = mb.mailbox_id() {
+                    parts.push(format!("MAILBOXID ({id})"));
+                }
+            }
         }
     }
     Ok(format!("{} ({})", quote_astring(name), parts.join(" ")))
@@ -1490,6 +1502,191 @@ impl StatusState for StatusView<'_> {
                 };
                 let out = untagged(&format!("STATUS {line}"));
                 Ok(out)
+            },
+            move |result: Result<Vec<u8>, StorageError>| {
+                handle.with_endpoint(move |ep| {
+                    if let Some(p) = pending.lock().unwrap().as_mut() {
+                        p.outcome = Some(result.map_err(|e| e.to_string()));
+                    }
+                    end_busy(ep, &busy);
+                });
+            },
+        );
+    }
+
+    fn no(&mut self, message: &str, handler: Box<dyn AuthenticatedHandler>) {
+        *self.authenticated = Some(handler);
+        self.endpoint.send(&tagged_no(self.tag, message));
+    }
+}
+
+pub(crate) struct GetMetadataView<'a> {
+    pub endpoint: &'a mut dyn Endpoint,
+    pub tag: &'a str,
+    #[allow(dead_code)]
+    pub mailbox: String,
+    #[allow(dead_code)]
+    pub entries: Vec<String>,
+    #[allow(dead_code)]
+    pub options: GetMetadataOptions,
+    pub authenticated: &'a mut Option<Box<dyn AuthenticatedHandler>>,
+    pub bundle: &'a Arc<Mutex<MailboxBundle>>,
+    pub runtime: &'a Arc<Runtime>,
+    pub busy: &'a Arc<AtomicBool>,
+    pub control_handle: &'a Option<ConnHandle>,
+    pub pending_open: &'a Arc<Mutex<Option<PendingOpen>>>,
+}
+
+impl GetMetadataState for GetMetadataView<'_> {
+    fn proceed(
+        &mut self,
+        mailbox: String,
+        entries: Vec<String>,
+        options: GetMetadataOptions,
+        handler: Box<dyn AuthenticatedHandler>,
+    ) {
+        let Some(handle) = self.control_handle.clone() else {
+            self.endpoint.send(&tagged_no(self.tag, "Internal error"));
+            return;
+        };
+        let bundle = Arc::clone(self.bundle);
+        let tag = self.tag.to_string();
+        let busy = Arc::clone(self.busy);
+        let pending = Arc::clone(self.pending_open);
+        *pending.lock().unwrap() = Some(PendingOpen {
+            auth_handler: Some(handler),
+            selected_handler: None,
+            outcome: None,
+            kind: crate::server::control::PendingKind::Data {
+                tag: tag.clone(),
+                ok: "GETMETADATA completed".into(),
+            },
+        });
+        begin_busy(self.endpoint, self.busy);
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || {
+                let g = bundle.lock().unwrap();
+                let store = g.store.as_ref().ok_or_else(|| "no store".to_string())?;
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                let mut longest_skipped: u64 = 0;
+                for entry in &entries {
+                    let mut candidates = vec![entry.clone()];
+                    if options.depth != Some(0) {
+                        let children = store
+                            .list_metadata_children(&mailbox, entry, options.depth)
+                            .map_err(|e| e.to_string())?;
+                        candidates.extend(children);
+                    }
+                    for cand in candidates {
+                        let value = store
+                            .get_metadata_entry(&mailbox, &cand)
+                            .map_err(|e| e.to_string())?;
+                        if let Some(v) = value {
+                            if let Some(max) = options.max_size {
+                                if v.len() as u32 > max {
+                                    longest_skipped = longest_skipped.max(v.len() as u64);
+                                    continue;
+                                }
+                            }
+                            pairs.push((cand, v));
+                        }
+                    }
+                }
+                let mut buf = Vec::from(b"* METADATA ".as_slice());
+                buf.extend_from_slice(quote_astring(&mailbox).as_bytes());
+                buf.extend_from_slice(b" (");
+                let mut first = true;
+                for (e, v) in &pairs {
+                    if !first {
+                        buf.push(b' ');
+                    }
+                    first = false;
+                    buf.extend_from_slice(quote_astring(e).as_bytes());
+                    buf.push(b' ');
+                    buf.extend_from_slice(&format_nstring(v.as_bytes()));
+                }
+                buf.extend_from_slice(b")\r\n");
+                if longest_skipped > 0 {
+                    // A separate untagged `OK` line — RFC 5464's response
+                    // code grammar allows it here as well as on the tagged
+                    // completion, and keeping the tagged OK text fixed
+                    // lets this reuse the same generic `Data` completion
+                    // every other read-only command already uses.
+                    buf.extend_from_slice(&untagged(&format!(
+                        "OK [METADATA LONGENTRIES {longest_skipped}] Some entries exceeded MAXSIZE"
+                    )));
+                }
+                Ok(buf)
+            },
+            move |result: Result<Vec<u8>, StorageError>| {
+                handle.with_endpoint(move |ep| {
+                    if let Some(p) = pending.lock().unwrap().as_mut() {
+                        p.outcome = Some(result.map_err(|e| e.to_string()));
+                    }
+                    end_busy(ep, &busy);
+                });
+            },
+        );
+    }
+
+    fn no(&mut self, message: &str, handler: Box<dyn AuthenticatedHandler>) {
+        *self.authenticated = Some(handler);
+        self.endpoint.send(&tagged_no(self.tag, message));
+    }
+}
+
+pub(crate) struct SetMetadataView<'a> {
+    pub endpoint: &'a mut dyn Endpoint,
+    pub tag: &'a str,
+    #[allow(dead_code)]
+    pub mailbox: String,
+    #[allow(dead_code)]
+    pub entries: Vec<(String, Option<String>)>,
+    pub authenticated: &'a mut Option<Box<dyn AuthenticatedHandler>>,
+    pub bundle: &'a Arc<Mutex<MailboxBundle>>,
+    pub runtime: &'a Arc<Runtime>,
+    pub busy: &'a Arc<AtomicBool>,
+    pub control_handle: &'a Option<ConnHandle>,
+    pub pending_open: &'a Arc<Mutex<Option<PendingOpen>>>,
+}
+
+impl SetMetadataState for SetMetadataView<'_> {
+    fn proceed(
+        &mut self,
+        mailbox: String,
+        entries: Vec<(String, Option<String>)>,
+        handler: Box<dyn AuthenticatedHandler>,
+    ) {
+        let Some(handle) = self.control_handle.clone() else {
+            self.endpoint.send(&tagged_no(self.tag, "Internal error"));
+            return;
+        };
+        let bundle = Arc::clone(self.bundle);
+        let tag = self.tag.to_string();
+        let busy = Arc::clone(self.busy);
+        let pending = Arc::clone(self.pending_open);
+        *pending.lock().unwrap() = Some(PendingOpen {
+            auth_handler: Some(handler),
+            selected_handler: None,
+            outcome: None,
+            kind: crate::server::control::PendingKind::Data {
+                tag: tag.clone(),
+                ok: "SETMETADATA completed".into(),
+            },
+        });
+        begin_busy(self.endpoint, self.busy);
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || {
+                let mut g = bundle.lock().unwrap();
+                let store = g.store.as_mut().ok_or_else(|| "no store".to_string())?;
+                for (entry, value) in &entries {
+                    store
+                        .set_metadata_entry(&mailbox, entry, value.as_deref())
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(Vec::new())
             },
             move |result: Result<Vec<u8>, StorageError>| {
                 handle.with_endpoint(move |ep| {

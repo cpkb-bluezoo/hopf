@@ -16,6 +16,8 @@ use crate::server::idle::{
     idle_diff_lines, IdleMailboxSnapshot, IdleMsgSnap, IDLE_POLL_INTERVAL,
 };
 use crate::server::list_ext::ListCommand;
+use crate::server::metadata::{parse_getmetadata, parse_setmetadata};
+use crate::server::notify::{filter_notify_lines, parse_notify, NotifyState};
 use crate::server::quota::parse_quota_resource_list;
 use crate::server::reply::{
     continuation, format_list_attrs, quote_astring, tagged_bad, tagged_no, tagged_ok, untagged,
@@ -23,7 +25,8 @@ use crate::server::reply::{
 use crate::server::session::ImapSessionState;
 use crate::server::status_items::parse_status_command;
 use crate::server::views::{
-    begin_busy, end_busy, format_status_line, ExpungeView, MoveView, StatusView,
+    begin_busy, end_busy, format_status_line, ExpungeView, GetMetadataView, MoveView,
+    SetMetadataView, StatusView,
 };
 
 impl ImapControlHandler {
@@ -286,6 +289,133 @@ impl ImapControlHandler {
         schedule(endpoint, handle, bundle, shared, runtime, max_idle);
     }
 
+    pub(super) fn cmd_notify(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
+        if !self.require_auth(endpoint, &cmd.tag) {
+            return;
+        }
+        if !self.config.enable_notify {
+            self.send(endpoint, tagged_bad(&cmd.tag, "NOTIFY not available"));
+            return;
+        }
+        match parse_notify(&cmd.args) {
+            Ok(NotifyState::None) => {
+                self.notify.set(None);
+                self.send(endpoint, tagged_ok(&cmd.tag, "NOTIFY completed"));
+            }
+            Ok(NotifyState::Selected(events)) => {
+                self.notify.set(Some(events));
+                if !self.notify.is_armed() {
+                    self.notify.set_armed(true);
+                    self.arm_notify_timer(endpoint);
+                }
+                self.send(endpoint, tagged_ok(&cmd.tag, "NOTIFY completed"));
+            }
+            Err(e) => self.send(endpoint, tagged_bad(&cmd.tag, &e)),
+        }
+    }
+
+    /// Poll-and-push chain for NOTIFY's `SELECTED` selector, active any
+    /// time the connection is *not* blocked inside `IDLE` (IDLE's own
+    /// timer already covers that window — see `arm_idle_timer` above).
+    /// Both chains read and advance the same [`crate::server::idle::IdleShared`]
+    /// baseline, so an event already reported by one is never re-reported
+    /// by the other.
+    fn arm_notify_timer(&mut self, endpoint: &mut dyn Endpoint) {
+        let handle = endpoint.handle();
+        let bundle = Arc::clone(&self.bundle);
+        let runtime = Arc::clone(&self.runtime);
+        let notify = self.notify.clone();
+        let idle_shared = self.idle.shared.clone();
+
+        fn schedule(
+            endpoint: &mut dyn Endpoint,
+            handle: hopf_core::ConnHandle,
+            bundle: Arc<std::sync::Mutex<super::MailboxBundle>>,
+            runtime: Arc<hopf_core::Runtime>,
+            notify: crate::server::notify::NotifyShared,
+            idle_shared: crate::server::idle::IdleShared,
+        ) {
+            if notify.wanted().is_none() {
+                notify.set_armed(false);
+                return;
+            }
+            let handle_cb = handle.clone();
+            let bundle_cb = Arc::clone(&bundle);
+            let runtime_cb = Arc::clone(&runtime);
+            let notify_cb = notify.clone();
+            let idle_shared_cb = idle_shared.clone();
+            // The returned handle is intentionally dropped, not stored:
+            // unlike IDLE (which wants to cancel its poll loop the instant
+            // `DONE` arrives), this chain only needs to notice `NOTIFY
+            // NONE` by its next tick — `TimerHandle` has no cancel-on-drop
+            // behaviour, so the timer still fires on schedule either way.
+            let _timer: TimerHandle = endpoint.schedule_timer(
+                IDLE_POLL_INTERVAL,
+                Box::new(move || {
+                    let Some(events) = notify_cb.wanted() else {
+                        notify_cb.set_armed(false);
+                        return;
+                    };
+                    if idle_shared_cb.is_active() {
+                        // Let IDLE's own timer handle delivery while the
+                        // client is blocked inside IDLE; just keep this
+                        // chain alive so it resumes once IDLE ends.
+                        let handle2 = handle_cb.clone();
+                        handle2.with_endpoint(move |ep| {
+                            schedule(
+                                ep,
+                                handle_cb.clone(),
+                                bundle_cb.clone(),
+                                runtime_cb.clone(),
+                                notify_cb.clone(),
+                                idle_shared_cb.clone(),
+                            );
+                        });
+                        return;
+                    }
+                    let handle2 = handle_cb.clone();
+                    let bundle2 = Arc::clone(&bundle_cb);
+                    let runtime2 = Arc::clone(&runtime_cb);
+                    let notify2 = notify_cb.clone();
+                    let idle_shared2 = idle_shared_cb.clone();
+                    runtime_cb.storage().submit_on(
+                        handle_cb.clone(),
+                        move || {
+                            let mut g = bundle_cb.lock().map_err(|e| e.to_string())?;
+                            let Some(mb) = g.mailbox.as_mut() else {
+                                return Ok(None);
+                            };
+                            Ok(ImapControlHandler::mailbox_idle_snapshot(mb.as_mut())
+                                .map(Some)?)
+                        },
+                        move |result: Result<Option<IdleMailboxSnapshot>, StorageError>| {
+                            let handle3 = handle2.clone();
+                            handle2.with_endpoint(move |ep| {
+                                if let Ok(Some(snap)) = result {
+                                    let prev_exists = *idle_shared2.exists.lock().unwrap();
+                                    let prev_msgs = idle_shared2.messages.lock().unwrap().clone();
+                                    let lines = idle_diff_lines(
+                                        &prev_msgs,
+                                        prev_exists,
+                                        &snap,
+                                    );
+                                    for line in filter_notify_lines(lines, &events) {
+                                        ep.send(&untagged(&line));
+                                    }
+                                    *idle_shared2.exists.lock().unwrap() = snap.exists;
+                                    *idle_shared2.messages.lock().unwrap() = snap.messages;
+                                }
+                                schedule(ep, handle3, bundle2, runtime2, notify2, idle_shared2);
+                            });
+                        },
+                    );
+                }),
+            );
+        }
+
+        schedule(endpoint, handle, bundle, runtime, notify, idle_shared);
+    }
+
     pub(super) fn cmd_status(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
         if !self.require_auth(endpoint, &cmd.tag) {
             return;
@@ -315,9 +445,7 @@ impl ImapControlHandler {
                 h.status(&mut view, store.as_ref(), &name, &items);
             }
             drop(g);
-            if self.selected.is_none() && self.pending_open.lock().unwrap().is_none() {
-                self.selected = Some(h);
-            }
+            self.restore_selected_after_authenticated_shaped_call(h);
             return;
         }
         if let Some(mut h) = self.authenticated.take() {
@@ -336,6 +464,140 @@ impl ImapControlHandler {
             let g = self.bundle.lock().unwrap();
             if let Some(store) = g.store.as_ref() {
                 h.status(&mut view, store.as_ref(), &name, &items);
+            }
+            drop(g);
+            if self.authenticated.is_none() && self.pending_open.lock().unwrap().is_none() {
+                self.authenticated = Some(h);
+            }
+        }
+    }
+
+    pub(super) fn cmd_getmetadata(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
+        if !self.require_auth(endpoint, &cmd.tag) {
+            return;
+        }
+        if !self.config.enable_metadata {
+            self.send(endpoint, tagged_bad(&cmd.tag, "METADATA not available"));
+            return;
+        }
+        let parsed = match parse_getmetadata(&cmd.args) {
+            Ok(v) => v,
+            Err(e) => {
+                self.send(endpoint, tagged_bad(&cmd.tag, &e));
+                return;
+            }
+        };
+        if let Some(mut h) = self.selected.take() {
+            let mut view = GetMetadataView {
+                endpoint,
+                tag: &cmd.tag,
+                mailbox: parsed.mailbox.clone(),
+                entries: parsed.entries.clone(),
+                options: parsed.options.clone(),
+                authenticated: &mut self.authenticated,
+                bundle: &self.bundle,
+                runtime: &self.runtime,
+                busy: &self.busy,
+                control_handle: &self.control_handle,
+                pending_open: &self.pending_open,
+            };
+            let g = self.bundle.lock().unwrap();
+            if let Some(store) = g.store.as_ref() {
+                h.get_metadata(
+                    &mut view,
+                    store.as_ref(),
+                    &parsed.mailbox,
+                    &parsed.entries,
+                    &parsed.options,
+                );
+            }
+            drop(g);
+            self.restore_selected_after_authenticated_shaped_call(h);
+            return;
+        }
+        if let Some(mut h) = self.authenticated.take() {
+            let mut view = GetMetadataView {
+                endpoint,
+                tag: &cmd.tag,
+                mailbox: parsed.mailbox.clone(),
+                entries: parsed.entries.clone(),
+                options: parsed.options.clone(),
+                authenticated: &mut self.authenticated,
+                bundle: &self.bundle,
+                runtime: &self.runtime,
+                busy: &self.busy,
+                control_handle: &self.control_handle,
+                pending_open: &self.pending_open,
+            };
+            let g = self.bundle.lock().unwrap();
+            if let Some(store) = g.store.as_ref() {
+                h.get_metadata(
+                    &mut view,
+                    store.as_ref(),
+                    &parsed.mailbox,
+                    &parsed.entries,
+                    &parsed.options,
+                );
+            }
+            drop(g);
+            if self.authenticated.is_none() && self.pending_open.lock().unwrap().is_none() {
+                self.authenticated = Some(h);
+            }
+        }
+    }
+
+    pub(super) fn cmd_setmetadata(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
+        if !self.require_auth(endpoint, &cmd.tag) {
+            return;
+        }
+        if !self.config.enable_metadata {
+            self.send(endpoint, tagged_bad(&cmd.tag, "METADATA not available"));
+            return;
+        }
+        let parsed = match parse_setmetadata(&cmd.args) {
+            Ok(v) => v,
+            Err(e) => {
+                self.send(endpoint, tagged_bad(&cmd.tag, &e));
+                return;
+            }
+        };
+        if let Some(mut h) = self.selected.take() {
+            let mut view = SetMetadataView {
+                endpoint,
+                tag: &cmd.tag,
+                mailbox: parsed.mailbox.clone(),
+                entries: parsed.entries.clone(),
+                authenticated: &mut self.authenticated,
+                bundle: &self.bundle,
+                runtime: &self.runtime,
+                busy: &self.busy,
+                control_handle: &self.control_handle,
+                pending_open: &self.pending_open,
+            };
+            let g = self.bundle.lock().unwrap();
+            if let Some(store) = g.store.as_ref() {
+                h.set_metadata(&mut view, store.as_ref(), &parsed.mailbox, &parsed.entries);
+            }
+            drop(g);
+            self.restore_selected_after_authenticated_shaped_call(h);
+            return;
+        }
+        if let Some(mut h) = self.authenticated.take() {
+            let mut view = SetMetadataView {
+                endpoint,
+                tag: &cmd.tag,
+                mailbox: parsed.mailbox.clone(),
+                entries: parsed.entries.clone(),
+                authenticated: &mut self.authenticated,
+                bundle: &self.bundle,
+                runtime: &self.runtime,
+                busy: &self.busy,
+                control_handle: &self.control_handle,
+                pending_open: &self.pending_open,
+            };
+            let g = self.bundle.lock().unwrap();
+            if let Some(store) = g.store.as_ref() {
+                h.set_metadata(&mut view, store.as_ref(), &parsed.mailbox, &parsed.entries);
             }
             drop(g);
             if self.authenticated.is_none() && self.pending_open.lock().unwrap().is_none() {

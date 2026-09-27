@@ -11,7 +11,8 @@ use super::state::{
     ImapAppendUid, ImapCapabilities, ImapClientAppend, ImapClientAuthExchange,
     ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls,
     ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData, ImapListEntry,
-    ImapMailboxInfo, ImapNamespaceData, ImapQuotaData, ImapQuotaRootData, ImapStatusData,
+    ImapMailboxInfo, ImapMetadataData, ImapNamespaceData, ImapQuotaData, ImapQuotaRootData,
+    ImapStatusData,
 };
 
 /// Creates the connection driver for each new IMAP client connection.
@@ -386,6 +387,21 @@ pub trait ImapClientDriver: Send {
         message: &str,
     ) {
         let _ = (session, ep, status, message);
+    }
+
+    /// Untagged METADATA (RFC 5464).
+    fn on_metadata(&mut self, data: &ImapMetadataData) {
+        let _ = data;
+    }
+
+    /// GETMETADATA / SETMETADATA completed.
+    fn on_metadata_complete(&mut self, ep: &mut dyn Endpoint, status: ImapStatus, message: &str) {
+        let _ = (ep, status, message);
+    }
+
+    /// NOTIFY (RFC 5465) completed.
+    fn on_notify_complete(&mut self, ep: &mut dyn Endpoint, status: ImapStatus, message: &str) {
+        let _ = (ep, status, message);
     }
 
     /// IDLE continuation received — session is now actively idling.

@@ -35,6 +35,12 @@ pub trait MessageContext {
     fn modseq(&self) -> Option<u64> {
         None
     }
+
+    /// RFC 8474 EMAILID, if the backend assigns one (see
+    /// [`crate::traits::Mailbox::email_id`]).
+    fn email_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// IMAP SEARCH predicate tree (RFC 9051 §6.4.4).
@@ -87,6 +93,8 @@ pub enum SearchCriteria {
     Sequence(MessageSet),
     /// MODSEQ (CONDSTORE)
     ModSeq(u64),
+    /// RFC 8474 EMAILID
+    EmailId(String),
     /// AND of criteria
     And(Vec<SearchCriteria>),
     /// OR of two criteria
@@ -248,6 +256,7 @@ impl SearchCriteria {
                 set.contains(ctx.message_number() as u64, ctx.message_number() as u64)
             }
             Self::ModSeq(n) => ctx.modseq().map(|m| m >= *n).unwrap_or(false),
+            Self::EmailId(id) => ctx.email_id().as_deref() == Some(id.as_str()),
             Self::And(parts) => {
                 let mut ok = true;
                 for p in parts {

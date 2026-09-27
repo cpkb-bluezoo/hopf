@@ -93,6 +93,69 @@ impl MaildirStore {
         fs::write(path, body)?;
         Ok(())
     }
+
+    /// RFC 5464 METADATA storage root for `mailbox` — `.metadata/` under
+    /// the mailbox's own directory (so it moves with RENAME, same as
+    /// `.uidlist`), or `.server-metadata/` under the user root for server
+    /// annotations (`mailbox == ""`, the RFC's own convention for "the
+    /// server itself"). This can't just be `.metadata` under the user
+    /// root: `resolve_mailbox_dir` resolves INBOX to the user root itself
+    /// (Maildir++ convention), so INBOX's own `.metadata` would otherwise
+    /// collide with the server-level store, silently merging the two
+    /// namespaces.
+    fn metadata_base_dir(&self, mailbox: &str) -> MailboxResult<PathBuf> {
+        let root = self.user_root()?;
+        if mailbox.is_empty() {
+            Ok(root.join(".server-metadata"))
+        } else {
+            Ok(resolve_mailbox_dir(root, mailbox)?.join(".metadata"))
+        }
+    }
+}
+
+/// Validate and resolve a METADATA `entry` path (e.g. `/private/comment`)
+/// to a file under `base` — entries nest via `/`, exactly like a
+/// filesystem path, so a leaf entry's value and a deeper entry sharing its
+/// prefix can't coexist (the prefix would need to be both a file and a
+/// directory); this implementation accepts that as the cost of needing no
+/// separate index.
+fn metadata_entry_path(base: &Path, entry: &str) -> MailboxResult<PathBuf> {
+    let trimmed = entry.strip_prefix('/').unwrap_or(entry);
+    if trimmed.is_empty()
+        || trimmed
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(MailboxError::Invalid(format!(
+            "invalid metadata entry {entry}"
+        )));
+    }
+    Ok(base.join(trimmed))
+}
+
+/// Collect value-bearing entries strictly beneath `dir` (already resolved
+/// from the queried entry), as full `/`-rooted entry strings relative to
+/// `base`, stopping recursion once `depth` would exceed `max_depth`
+/// (`None` = unbounded — GETMETADATA `DEPTH infinity`).
+fn walk_metadata_dir(
+    base: &Path,
+    dir: &Path,
+    max_depth: Option<u32>,
+    depth: u32,
+    out: &mut Vec<String>,
+) -> MailboxResult<()> {
+    for ent in fs::read_dir(dir)? {
+        let ent = ent?;
+        let path = ent.path();
+        if path.is_file() {
+            let rel = path.strip_prefix(base).unwrap_or(&path);
+            let entry = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+            out.push(format!("/{entry}"));
+        } else if path.is_dir() && max_depth.is_none_or(|m| depth < m) {
+            walk_metadata_dir(base, &path, max_depth, depth + 1, out)?;
+        }
+    }
+    Ok(())
 }
 
 impl MailboxStore for MaildirStore {
@@ -139,6 +202,8 @@ impl MailboxStore for MaildirStore {
                 || name == ".uidlist"
                 || name == ".keywords"
                 || name == ".gidx"
+                || name == ".metadata"
+                || name == ".server-metadata"
             {
                 continue;
             }
@@ -230,6 +295,80 @@ impl MailboxStore for MaildirStore {
         self.save_subscriptions(&subs)
     }
 
+    fn get_metadata_entry(&self, mailbox: &str, entry: &str) -> MailboxResult<Option<String>> {
+        let base = self.metadata_base_dir(mailbox)?;
+        let path = metadata_entry_path(&base, entry)?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        // Lossy: annotation values are treated as text throughout this
+        // implementation (like header/body content elsewhere in this
+        // crate), not preserved as arbitrary binary octets.
+        Ok(Some(String::from_utf8_lossy(&fs::read(&path)?).into_owned()))
+    }
+
+    fn set_metadata_entry(
+        &mut self,
+        mailbox: &str,
+        entry: &str,
+        value: Option<&str>,
+    ) -> MailboxResult<()> {
+        if !mailbox.is_empty() {
+            let root = self.user_root()?;
+            let dir = resolve_mailbox_dir(root, mailbox)?;
+            if !dir.join("cur").is_dir() {
+                return Err(MailboxError::NotFound(mailbox.into()));
+            }
+        }
+        let base = self.metadata_base_dir(mailbox)?;
+        let path = metadata_entry_path(&base, entry)?;
+        match value {
+            None => {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+                // Best-effort cleanup of now-empty intermediate directories
+                // an entry like `/private/vendor/x` created for its
+                // hierarchy — never removes `base` itself.
+                let mut dir = path.parent();
+                while let Some(d) = dir {
+                    if d == base || fs::remove_dir(d).is_err() {
+                        break;
+                    }
+                    dir = d.parent();
+                }
+            }
+            Some(v) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, v.as_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn list_metadata_children(
+        &self,
+        mailbox: &str,
+        entry: &str,
+        max_depth: Option<u32>,
+    ) -> MailboxResult<Vec<String>> {
+        if max_depth == Some(0) {
+            return Ok(Vec::new());
+        }
+        let base = self.metadata_base_dir(mailbox)?;
+        let path = metadata_entry_path(&base, entry)?;
+        if !path.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        walk_metadata_dir(&base, &path, max_depth, 1, &mut out)?;
+        Ok(out)
+    }
+
     fn open_mailbox(&mut self, name: &str, read_only: bool) -> MailboxResult<Box<dyn Mailbox>> {
         let root = self.user_root()?;
         let paths = self
@@ -308,5 +447,170 @@ mod tests {
         let names: BTreeSet<_> = sub.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, BTreeSet::from(["Archive", "INBOX"]));
         assert!(!names.contains("Sent"));
+    }
+
+    #[test]
+    fn mailbox_metadata_set_get_and_delete() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("metadatauser").unwrap();
+        store.create_mailbox("Archive").unwrap();
+
+        assert_eq!(
+            store.get_metadata_entry("Archive", "/private/comment").unwrap(),
+            None
+        );
+        store
+            .set_metadata_entry("Archive", "/private/comment", Some("hello"))
+            .unwrap();
+        assert_eq!(
+            store.get_metadata_entry("Archive", "/private/comment").unwrap(),
+            Some("hello".to_string())
+        );
+        store
+            .set_metadata_entry("Archive", "/private/comment", None)
+            .unwrap();
+        assert_eq!(
+            store.get_metadata_entry("Archive", "/private/comment").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn server_metadata_uses_empty_mailbox_name_and_is_separate_from_mailbox_metadata() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("servermetadatauser").unwrap();
+        store.create_mailbox("Archive").unwrap();
+
+        store
+            .set_metadata_entry("", "/private/comment", Some("server-level"))
+            .unwrap();
+        store
+            .set_metadata_entry("Archive", "/private/comment", Some("mailbox-level"))
+            .unwrap();
+        assert_eq!(
+            store.get_metadata_entry("", "/private/comment").unwrap(),
+            Some("server-level".to_string())
+        );
+        assert_eq!(
+            store.get_metadata_entry("Archive", "/private/comment").unwrap(),
+            Some("mailbox-level".to_string())
+        );
+    }
+
+    #[test]
+    fn server_metadata_does_not_collide_with_inbox_metadata() {
+        // INBOX's mailbox directory *is* the user root (Maildir++
+        // convention — see `resolve_mailbox_dir`), so server-level
+        // annotations must live somewhere INBOX's own `.metadata` can
+        // never reach, or the two namespaces silently merge.
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("inboxmetadatauser").unwrap();
+        // INBOX must exist as an open-able mailbox before SETMETADATA
+        // will accept it (mirrors the nonexistent-mailbox rejection test).
+        store.open_mailbox("INBOX", false).unwrap().close(false).unwrap();
+
+        store
+            .set_metadata_entry("", "/private/comment", Some("server-wide"))
+            .unwrap();
+        store
+            .set_metadata_entry("INBOX", "/private/comment", Some("inbox-only"))
+            .unwrap();
+        assert_eq!(
+            store.get_metadata_entry("", "/private/comment").unwrap(),
+            Some("server-wide".to_string()),
+            "server-level value must be unaffected by INBOX's own SETMETADATA"
+        );
+        assert_eq!(
+            store.get_metadata_entry("INBOX", "/private/comment").unwrap(),
+            Some("inbox-only".to_string()),
+            "INBOX's value must be unaffected by the server-level SETMETADATA"
+        );
+    }
+
+    #[test]
+    fn metadata_directories_are_not_listed_as_mailboxes() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("listmetadatauser").unwrap();
+        store.open_mailbox("INBOX", false).unwrap().close(false).unwrap();
+        store
+            .set_metadata_entry("", "/private/comment", Some("x"))
+            .unwrap();
+        store
+            .set_metadata_entry("INBOX", "/private/comment", Some("y"))
+            .unwrap();
+
+        let names: BTreeSet<_> = store
+            .list("", "*")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, BTreeSet::from(["INBOX".to_string()]));
+    }
+
+    #[test]
+    fn setting_metadata_on_a_nonexistent_mailbox_is_an_error() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("nometadatauser").unwrap();
+        assert!(store
+            .set_metadata_entry("NoSuchBox", "/private/comment", Some("x"))
+            .is_err());
+    }
+
+    #[test]
+    fn metadata_entry_rejects_path_traversal() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("traversaluser").unwrap();
+        assert!(store
+            .set_metadata_entry("", "/private/../../etc/passwd", Some("x"))
+            .is_err());
+    }
+
+    #[test]
+    fn list_metadata_children_respects_depth() {
+        let dir = tempdir().unwrap();
+        let factory = MaildirFactory::new(dir.path());
+        let mut store = factory.create_store();
+        store.open("depthuser").unwrap();
+        store
+            .set_metadata_entry("", "/private/vendor/a", Some("1"))
+            .unwrap();
+        store
+            .set_metadata_entry("", "/private/vendor/nested/b", Some("2"))
+            .unwrap();
+
+        let depth1 = store
+            .list_metadata_children("", "/private/vendor", Some(1))
+            .unwrap();
+        assert_eq!(depth1, vec!["/private/vendor/a".to_string()]);
+
+        let mut depth_inf = store
+            .list_metadata_children("", "/private/vendor", None)
+            .unwrap();
+        depth_inf.sort();
+        assert_eq!(
+            depth_inf,
+            vec![
+                "/private/vendor/a".to_string(),
+                "/private/vendor/nested/b".to_string(),
+            ]
+        );
+
+        let depth0 = store
+            .list_metadata_children("", "/private/vendor", Some(0))
+            .unwrap();
+        assert!(depth0.is_empty());
     }
 }

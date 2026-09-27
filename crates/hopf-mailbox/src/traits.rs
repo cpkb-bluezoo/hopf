@@ -176,6 +176,33 @@ pub trait Mailbox: Send {
     /// UIDNEXT.
     fn uid_next(&self) -> u64;
 
+    /// RFC 8474 MAILBOXID — a stable identifier for this mailbox that
+    /// survives RENAME (unlike the name) and is never reused for a
+    /// different mailbox. `None` when the backend doesn't assign one (the
+    /// OBJECTID extension is then not truthfully advertisable against it).
+    fn mailbox_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// RFC 8474 EMAILID for `message_number` — a stable identifier for this
+    /// message that survives everything a UID doesn't need to survive
+    /// (RENAME of its mailbox; re-indexing). `Ok(None)` when the backend
+    /// doesn't assign one.
+    fn email_id(&self, message_number: u32) -> MailboxResult<Option<String>> {
+        let _ = message_number;
+        Ok(None)
+    }
+
+    /// Reverse of [`Self::email_id`]: the sequence number currently holding
+    /// `email_id`, or `Ok(None)` if it names no message in this mailbox
+    /// (never seen, expunged, or produced by a different mailbox/backend).
+    /// Backends that can derive a message's identity from the id itself
+    /// (see the Maildir implementation) answer this without a linear scan.
+    fn sequence_for_email_id(&self, email_id: &str) -> MailboxResult<Option<u32>> {
+        let _ = email_id;
+        Ok(None)
+    }
+
     /// Flags for a message.
     fn flags(&self, message_number: u32) -> MailboxResult<BTreeSet<Flag>>;
 
@@ -456,6 +483,47 @@ pub trait MailboxStore: Send {
 
     /// Open a mailbox (blocking). Prefer calling from the storage pool.
     fn open_mailbox(&mut self, name: &str, read_only: bool) -> MailboxResult<Box<dyn Mailbox>>;
+
+    /// RFC 5464 GETMETADATA: the value of one annotation `entry` (e.g.
+    /// `/private/comment`) on `mailbox`, or on the server itself when
+    /// `mailbox` is empty (the RFC's own convention for server
+    /// annotations). `Ok(None)` when the entry has no value set — that is
+    /// not an error, per RFC 5464 §3: "the server MUST NOT include entries
+    /// that do not exist". Default: unsupported.
+    fn get_metadata_entry(&self, mailbox: &str, entry: &str) -> MailboxResult<Option<String>> {
+        let _ = (mailbox, entry);
+        Err(crate::error::MailboxError::Unsupported("METADATA"))
+    }
+
+    /// RFC 5464 SETMETADATA: set (`Some`) or delete (`None`) one annotation
+    /// `entry` on `mailbox` (or the server itself when `mailbox` is empty).
+    /// Default: unsupported.
+    fn set_metadata_entry(
+        &mut self,
+        mailbox: &str,
+        entry: &str,
+        value: Option<&str>,
+    ) -> MailboxResult<()> {
+        let _ = (mailbox, entry, value);
+        Err(crate::error::MailboxError::Unsupported("METADATA"))
+    }
+
+    /// Entries strictly beneath `entry` that currently have a value, for
+    /// GETMETADATA's `DEPTH` option — `max_depth` of `Some(1)` returns
+    /// direct children only, `None` returns every descendant, and
+    /// `Some(0)` (no children wanted) always returns empty without this
+    /// even being called by a well-behaved caller. Order is unspecified.
+    /// Default: unsupported (empty, since the base entry lookup itself
+    /// already reports [`crate::error::MailboxError::Unsupported`]).
+    fn list_metadata_children(
+        &self,
+        mailbox: &str,
+        entry: &str,
+        max_depth: Option<u32>,
+    ) -> MailboxResult<Vec<String>> {
+        let _ = (mailbox, entry, max_depth);
+        Ok(Vec::new())
+    }
 }
 
 /// Factory for per-session stores.
