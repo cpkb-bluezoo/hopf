@@ -340,6 +340,20 @@ pub trait Mailbox: Send {
 
     /// IMAP SEARCH — **must** be invoked on the storage pool.
     fn search(&self, criteria: &SearchCriteria) -> MailboxResult<Vec<u32>>;
+
+    /// Run `f` with the [`MessageContext`] for `message_number` — the same
+    /// per-message metadata/header access [`Self::search`] evaluates
+    /// [`SearchCriteria`] against, exposed here for RFC 5256 SORT/THREAD
+    /// sort-key and threading-header extraction (issue #407). **Must** be
+    /// invoked on the storage pool, same as `search`. Default: unsupported.
+    fn with_message_context(
+        &self,
+        message_number: u32,
+        f: &mut dyn FnMut(&dyn crate::search::MessageContext) -> MailboxResult<()>,
+    ) -> MailboxResult<()> {
+        let _ = (message_number, f);
+        Err(crate::error::MailboxError::Unsupported("SORT/THREAD"))
+    }
 }
 
 /// RAII wrapper around an in-progress [`Mailbox::start_append`]: stream

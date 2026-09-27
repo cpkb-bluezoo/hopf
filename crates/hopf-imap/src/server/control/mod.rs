@@ -37,9 +37,10 @@ use crate::server::reply::{continuation, tagged_bad, tagged_no, tagged_ok, untag
 use crate::server::search_parse::parse_search;
 use crate::server::service::ImapConfig;
 use crate::server::session::ImapSessionState;
+use crate::server::thread::ThreadAlgorithm;
 use crate::server::views::{
     begin_busy, end_busy, AppendView, AuthView, CloseView, ConnectedView, CopyView, FetchView,
-    MgmtOp, MgmtView, SearchView, SelectView, StoreView,
+    MgmtOp, MgmtView, SearchView, SelectView, SortView, StoreView, ThreadView,
 };
 
 /// In-flight command telemetry finished when the tagged reply is sent.
@@ -90,6 +91,20 @@ pub(crate) enum PendingKind {
         ok: String,
     },
     Search {
+        tag: String,
+        #[allow(dead_code)]
+        by_uid: bool,
+    },
+    Sort {
+        tag: String,
+        #[allow(dead_code)]
+        by_uid: bool,
+    },
+    /// `payload` is the response text for `* THREAD ...`, or empty when
+    /// there is nothing to thread — RFC 5256 sends no untagged THREAD
+    /// response at all in that case (unlike SEARCH/SORT, which always
+    /// send one, possibly with no numbers).
+    Thread {
         tag: String,
         #[allow(dead_code)]
         by_uid: bool,
@@ -677,6 +692,42 @@ impl ImapControlHandler {
                     self.send(endpoint, tagged_no(&tag, &e));
                 }
             },
+            PendingKind::Sort { tag, .. } => match outcome {
+                Ok(payload) => {
+                    let nums = String::from_utf8_lossy(&payload);
+                    self.send(endpoint, untagged(&format!("SORT {nums}")));
+                    if let Some(h) = selected_handler {
+                        self.selected = Some(h);
+                    }
+                    self.send(endpoint, tagged_ok(&tag, "SORT completed"));
+                }
+                Err(e) => {
+                    if let Some(h) = selected_handler {
+                        self.selected = Some(h);
+                    }
+                    self.send(endpoint, tagged_no(&tag, &e));
+                }
+            },
+            PendingKind::Thread { tag, .. } => match outcome {
+                Ok(payload) => {
+                    // No untagged THREAD line at all when there's nothing
+                    // to thread (RFC 5256 §5) — `payload` is empty then.
+                    if !payload.is_empty() {
+                        let text = String::from_utf8_lossy(&payload);
+                        self.send(endpoint, untagged(&format!("THREAD {text}")));
+                    }
+                    if let Some(h) = selected_handler {
+                        self.selected = Some(h);
+                    }
+                    self.send(endpoint, tagged_ok(&tag, "THREAD completed"));
+                }
+                Err(e) => {
+                    if let Some(h) = selected_handler {
+                        self.selected = Some(h);
+                    }
+                    self.send(endpoint, tagged_no(&tag, &e));
+                }
+            },
         }
         if let Some(tel) = self.pending_cmd_tel.take() {
             self.finish_command_telemetry(tel, if cmd_ok { "ok" } else { "fail" });
@@ -767,6 +818,8 @@ impl ImapControlHandler {
             "FETCH" => self.cmd_fetch(endpoint, cmd, false),
             "STORE" => self.cmd_store(endpoint, cmd, false),
             "SEARCH" => self.cmd_search(endpoint, cmd, false),
+            "SORT" => self.cmd_sort(endpoint, cmd, false),
+            "THREAD" => self.cmd_thread(endpoint, cmd, false),
             "COPY" => self.cmd_copy(endpoint, cmd, false),
             "MOVE" => self.cmd_move(endpoint, cmd, false),
             "EXPUNGE" => self.cmd_expunge(endpoint, &cmd.tag, None),
@@ -1659,6 +1712,113 @@ impl ImapControlHandler {
         }
     }
 
+    fn cmd_sort(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, by_uid: bool) {
+        if !self.require_selected(endpoint, &cmd.tag) {
+            return;
+        }
+        if !self.config.enable_sort {
+            self.send(endpoint, tagged_bad(&cmd.tag, "SORT not available"));
+            return;
+        }
+        let (sort_criteria, search_args) = match crate::server::sort::parse_sort_command(&cmd.args)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                self.send(endpoint, tagged_bad(&cmd.tag, &e));
+                return;
+            }
+        };
+        let search_criteria = match parse_search(&search_args) {
+            Ok(c) => c,
+            Err(e) => {
+                self.send(endpoint, tagged_bad(&cmd.tag, &e.to_string()));
+                return;
+            }
+        };
+        let Some(mut h) = self.selected.take() else {
+            return;
+        };
+        let mut view = SortView {
+            endpoint,
+            tag: &cmd.tag,
+            sort_criteria: sort_criteria.clone(),
+            search_criteria: search_criteria.clone(),
+            by_uid,
+            selected: &mut self.selected,
+            bundle: &self.bundle,
+            runtime: &self.runtime,
+            busy: &self.busy,
+            control_handle: &self.control_handle,
+            pending_open: &self.pending_open,
+        };
+        let sort_keys: Vec<crate::server::sort::SortKey> =
+            sort_criteria.iter().map(|c| c.key).collect();
+        let g = self.bundle.lock().unwrap();
+        if let Some(mb) = g.mailbox.as_ref() {
+            h.sort(&mut view, mb.as_ref(), &sort_keys, &search_criteria, by_uid);
+        }
+        drop(g);
+        if self.selected.is_none() && self.pending_open.lock().unwrap().is_none() {
+            self.selected = Some(h);
+        }
+    }
+
+    fn cmd_thread(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, by_uid: bool) {
+        if !self.require_selected(endpoint, &cmd.tag) {
+            return;
+        }
+        let (algorithm, search_args) = match crate::server::thread::parse_thread_command(&cmd.args)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                self.send(endpoint, tagged_bad(&cmd.tag, &e));
+                return;
+            }
+        };
+        let enabled = match algorithm {
+            ThreadAlgorithm::OrderedSubject => self.config.enable_thread_ordered_subject,
+            ThreadAlgorithm::References => self.config.enable_thread_references,
+        };
+        if !enabled {
+            self.send(
+                endpoint,
+                tagged_bad(&cmd.tag, "THREAD algorithm not available"),
+            );
+            return;
+        }
+        let search_criteria = match parse_search(&search_args) {
+            Ok(c) => c,
+            Err(e) => {
+                self.send(endpoint, tagged_bad(&cmd.tag, &e.to_string()));
+                return;
+            }
+        };
+        let Some(mut h) = self.selected.take() else {
+            return;
+        };
+        let mut view = ThreadView {
+            endpoint,
+            tag: &cmd.tag,
+            algorithm,
+            search_criteria: search_criteria.clone(),
+            by_uid,
+            selected: &mut self.selected,
+            bundle: &self.bundle,
+            runtime: &self.runtime,
+            busy: &self.busy,
+            control_handle: &self.control_handle,
+            pending_open: &self.pending_open,
+        };
+        let g = self.bundle.lock().unwrap();
+        if let Some(mb) = g.mailbox.as_ref() {
+            h.thread(&mut view, mb.as_ref(), algorithm, &search_criteria, by_uid);
+        }
+        drop(g);
+        if self.selected.is_none() && self.pending_open.lock().unwrap().is_none() {
+            self.selected = Some(h);
+        }
+    }
+
     fn cmd_copy(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, by_uid: bool) {
         if !self.require_selected(endpoint, &cmd.tag) {
             return;
@@ -1718,6 +1878,8 @@ impl ImapControlHandler {
             "FETCH" => self.cmd_fetch(endpoint, sub_cmd, true),
             "STORE" => self.cmd_store(endpoint, sub_cmd, true),
             "SEARCH" => self.cmd_search(endpoint, sub_cmd, true),
+            "SORT" => self.cmd_sort(endpoint, sub_cmd, true),
+            "THREAD" => self.cmd_thread(endpoint, sub_cmd, true),
             "COPY" => self.cmd_copy(endpoint, sub_cmd, true),
             "MOVE" => self.cmd_move(endpoint, sub_cmd, true),
             "EXPUNGE" => {

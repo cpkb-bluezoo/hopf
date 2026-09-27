@@ -66,6 +66,14 @@ pub struct ImapConfig {
     pub enable_compress: bool,
     /// Advertise and accept ENABLE UTF8=ACCEPT (RFC 6855).
     pub enable_utf8_accept: bool,
+    /// Advertise and accept the SORT extension (RFC 5256).
+    pub enable_sort: bool,
+    /// Advertise and accept THREAD=ORDEREDSUBJECT (RFC 5256).
+    pub enable_thread_ordered_subject: bool,
+    /// Advertise and accept THREAD=REFERENCES (RFC 5256).
+    pub enable_thread_references: bool,
+    /// Advertise STATUS=SIZE (RFC 8438).
+    pub enable_status_size: bool,
     /// Quota backend (default: unlimited).
     pub quota_manager: Arc<dyn QuotaManager>,
     /// Server ID fields for the ID command (RFC 2971). Empty → built-in defaults.
@@ -121,6 +129,10 @@ impl ImapConfig {
             enable_enable: true,
             enable_compress: true,
             enable_utf8_accept: true,
+            enable_sort: true,
+            enable_thread_ordered_subject: true,
+            enable_thread_references: true,
+            enable_status_size: true,
             quota_manager: Arc::new(UnlimitedQuotaManager),
             server_id: BTreeMap::new(),
         }

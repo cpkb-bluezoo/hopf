@@ -171,6 +171,22 @@ pub trait SearchState {
     fn no(&mut self, message: &str, handler: Box<dyn SelectedHandler>);
 }
 
+/// SORT (RFC 5256).
+pub trait SortState {
+    /// Protocol performs SORT on the storage pool.
+    fn proceed(&mut self, by_uid: bool, handler: Box<dyn SelectedHandler>);
+    /// Failed.
+    fn no(&mut self, message: &str, handler: Box<dyn SelectedHandler>);
+}
+
+/// THREAD (RFC 5256).
+pub trait ThreadState {
+    /// Protocol performs THREAD on the storage pool.
+    fn proceed(&mut self, by_uid: bool, handler: Box<dyn SelectedHandler>);
+    /// Failed.
+    fn no(&mut self, message: &str, handler: Box<dyn SelectedHandler>);
+}
+
 /// COPY.
 pub trait CopyState {
     /// Protocol performs COPY on the storage pool.

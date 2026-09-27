@@ -17,7 +17,9 @@ mod reply;
 mod search_parse;
 mod service;
 mod session;
+pub mod sort;
 pub mod status_items;
+pub mod thread;
 pub mod uidplus;
 mod views;
 

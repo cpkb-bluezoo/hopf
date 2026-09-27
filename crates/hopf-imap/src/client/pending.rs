@@ -41,6 +41,10 @@ pub enum PendingKind {
     Fetch,
     /// `SEARCH` / `UID SEARCH`
     Search,
+    /// `SORT` / `UID SORT`
+    Sort,
+    /// `THREAD` / `UID THREAD`
+    Thread,
     /// `LIST` / `LSUB`
     List,
     /// `STATUS`
@@ -89,6 +93,8 @@ impl PendingKind {
             self,
             Self::Fetch
                 | Self::Search
+                | Self::Sort
+                | Self::Thread
                 | Self::List
                 | Self::Status
                 | Self::Select
@@ -114,6 +120,8 @@ impl PendingKind {
             UntaggedClass::List => matches!(self, Self::List),
             UntaggedClass::Status => matches!(self, Self::Status),
             UntaggedClass::Search => matches!(self, Self::Search),
+            UntaggedClass::Sort => matches!(self, Self::Sort),
+            UntaggedClass::Thread => matches!(self, Self::Thread),
             UntaggedClass::Fetch => matches!(self, Self::Fetch | Self::Store),
             UntaggedClass::Exists | UntaggedClass::Recent | UntaggedClass::FlagsList => {
                 matches!(self, Self::Select | Self::Examine)
@@ -140,6 +148,10 @@ pub enum UntaggedClass {
     Status,
     /// `SEARCH …`
     Search,
+    /// `SORT …`
+    Sort,
+    /// `THREAD …`
+    Thread,
     /// `n FETCH …`
     Fetch,
     /// `n EXISTS`

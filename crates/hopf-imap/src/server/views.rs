@@ -19,12 +19,14 @@ use crate::server::fetch_format::{
 use crate::server::handler::{
     AppendState, AuthenticateState, AuthenticatedHandler, CloseState, ConnectedState, CopyState,
     CreateState, DeleteState, ExpungeState, FetchState, ListState, MoveState,
-    NotAuthenticatedHandler, RenameState, SearchState, SelectState, SelectedHandler, StatusState,
-    StoreAction, StoreState, SubscribeState,
+    NotAuthenticatedHandler, RenameState, SearchState, SelectState, SelectedHandler, SortState,
+    StatusState, StoreAction, StoreState, SubscribeState, ThreadState,
 };
 use crate::server::reply::{format_list_attrs, quote_astring, tagged_no, tagged_ok, untagged};
 use crate::server::session::ImapSessionState;
+use crate::server::sort::{sort_messages, SortCriterion, SortableMessage};
 use crate::server::status_items::StatusItem;
+use crate::server::thread::{format_thread_response, ThreadAlgorithm, ThreadInput};
 use crate::server::uidplus::{format_appenduid, format_copyuid};
 
 /// Shared offload helpers.
@@ -1096,6 +1098,171 @@ impl SearchState for SearchView<'_> {
                     }
                 }
                 Ok(nums.join(" ").into_bytes())
+            },
+            move |result: Result<Vec<u8>, StorageError>| {
+                handle.with_endpoint(move |ep| {
+                    if let Some(p) = pending.lock().unwrap().as_mut() {
+                        p.outcome = Some(result.map_err(|e| e.to_string()));
+                    }
+                    end_busy(ep, &busy);
+                });
+            },
+        );
+    }
+
+    fn no(&mut self, message: &str, handler: Box<dyn SelectedHandler>) {
+        *self.selected = Some(handler);
+        self.endpoint.send(&tagged_no(self.tag, message));
+    }
+}
+
+pub(crate) struct SortView<'a> {
+    pub endpoint: &'a mut dyn Endpoint,
+    pub tag: &'a str,
+    pub sort_criteria: Vec<SortCriterion>,
+    pub search_criteria: SearchCriteria,
+    #[allow(dead_code)]
+    pub by_uid: bool,
+    pub selected: &'a mut Option<Box<dyn SelectedHandler>>,
+    pub bundle: &'a Arc<Mutex<MailboxBundle>>,
+    pub runtime: &'a Arc<Runtime>,
+    pub busy: &'a Arc<AtomicBool>,
+    pub control_handle: &'a Option<ConnHandle>,
+    pub pending_open: &'a Arc<Mutex<Option<PendingOpen>>>,
+}
+
+impl SortState for SortView<'_> {
+    fn proceed(&mut self, by_uid: bool, handler: Box<dyn SelectedHandler>) {
+        let Some(handle) = self.control_handle.clone() else {
+            self.endpoint.send(&tagged_no(self.tag, "Internal error"));
+            return;
+        };
+        let bundle = Arc::clone(self.bundle);
+        let sort_criteria = self.sort_criteria.clone();
+        let search_criteria = self.search_criteria.clone();
+        let tag = self.tag.to_string();
+        let busy = Arc::clone(self.busy);
+        let pending = Arc::clone(self.pending_open);
+        *pending.lock().unwrap() = Some(PendingOpen {
+            auth_handler: None,
+            selected_handler: Some(handler),
+            outcome: None,
+            kind: crate::server::control::PendingKind::Sort {
+                tag: tag.clone(),
+                by_uid,
+            },
+        });
+        begin_busy(self.endpoint, self.busy);
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || {
+                let g = bundle.lock().unwrap();
+                let mb = g.mailbox.as_ref().ok_or_else(|| "no mailbox".to_string())?;
+                let seqs = mb.search(&search_criteria).map_err(|e| e.to_string())?;
+                let mut messages = Vec::with_capacity(seqs.len());
+                for seq in seqs {
+                    let result_number = if by_uid {
+                        mb.uid(seq).map_err(|e| e.to_string())?
+                    } else {
+                        seq as u64
+                    };
+                    mb.with_message_context(seq, &mut |ctx| {
+                        let m = SortableMessage::gather(ctx, result_number)
+                            .map_err(hopf_mailbox::MailboxError::Io)?;
+                        messages.push(m);
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                }
+                sort_messages(&mut messages, &sort_criteria);
+                let nums: Vec<String> = messages
+                    .iter()
+                    .map(|m| m.result_number.to_string())
+                    .collect();
+                Ok(nums.join(" ").into_bytes())
+            },
+            move |result: Result<Vec<u8>, StorageError>| {
+                handle.with_endpoint(move |ep| {
+                    if let Some(p) = pending.lock().unwrap().as_mut() {
+                        p.outcome = Some(result.map_err(|e| e.to_string()));
+                    }
+                    end_busy(ep, &busy);
+                });
+            },
+        );
+    }
+
+    fn no(&mut self, message: &str, handler: Box<dyn SelectedHandler>) {
+        *self.selected = Some(handler);
+        self.endpoint.send(&tagged_no(self.tag, message));
+    }
+}
+
+pub(crate) struct ThreadView<'a> {
+    pub endpoint: &'a mut dyn Endpoint,
+    pub tag: &'a str,
+    pub algorithm: ThreadAlgorithm,
+    pub search_criteria: SearchCriteria,
+    #[allow(dead_code)]
+    pub by_uid: bool,
+    pub selected: &'a mut Option<Box<dyn SelectedHandler>>,
+    pub bundle: &'a Arc<Mutex<MailboxBundle>>,
+    pub runtime: &'a Arc<Runtime>,
+    pub busy: &'a Arc<AtomicBool>,
+    pub control_handle: &'a Option<ConnHandle>,
+    pub pending_open: &'a Arc<Mutex<Option<PendingOpen>>>,
+}
+
+impl ThreadState for ThreadView<'_> {
+    fn proceed(&mut self, by_uid: bool, handler: Box<dyn SelectedHandler>) {
+        let Some(handle) = self.control_handle.clone() else {
+            self.endpoint.send(&tagged_no(self.tag, "Internal error"));
+            return;
+        };
+        let bundle = Arc::clone(self.bundle);
+        let algorithm = self.algorithm;
+        let search_criteria = self.search_criteria.clone();
+        let tag = self.tag.to_string();
+        let busy = Arc::clone(self.busy);
+        let pending = Arc::clone(self.pending_open);
+        *pending.lock().unwrap() = Some(PendingOpen {
+            auth_handler: None,
+            selected_handler: Some(handler),
+            outcome: None,
+            kind: crate::server::control::PendingKind::Thread {
+                tag: tag.clone(),
+                by_uid,
+            },
+        });
+        begin_busy(self.endpoint, self.busy);
+        self.runtime.storage().submit_on(
+            handle.clone(),
+            move || {
+                let g = bundle.lock().unwrap();
+                let mb = g.mailbox.as_ref().ok_or_else(|| "no mailbox".to_string())?;
+                let seqs = mb.search(&search_criteria).map_err(|e| e.to_string())?;
+                let mut inputs = Vec::with_capacity(seqs.len());
+                for seq in seqs {
+                    let result_number = if by_uid {
+                        mb.uid(seq).map_err(|e| e.to_string())?
+                    } else {
+                        seq as u64
+                    };
+                    mb.with_message_context(seq, &mut |ctx| {
+                        let m = ThreadInput::gather(ctx, result_number)
+                            .map_err(hopf_mailbox::MailboxError::Io)?;
+                        inputs.push(m);
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                }
+                let threads = match algorithm {
+                    ThreadAlgorithm::OrderedSubject => {
+                        crate::server::thread::thread_ordered_subject(inputs)
+                    }
+                    ThreadAlgorithm::References => crate::server::thread::thread_references(inputs),
+                };
+                Ok(format_thread_response(&threads).unwrap_or_default().into_bytes())
             },
             move |result: Result<Vec<u8>, StorageError>| {
                 handle.with_endpoint(move |ep| {

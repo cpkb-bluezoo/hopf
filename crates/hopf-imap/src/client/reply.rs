@@ -126,6 +126,11 @@ pub enum ImapEvent {
     StatusData(ImapStatusData),
     /// `* SEARCH n1 n2 …`.
     SearchNumbers(Vec<u32>),
+    /// `* SORT n1 n2 …`.
+    SortNumbers(Vec<u32>),
+    /// `* THREAD …` (bounded-captured; caller parses with
+    /// [`super::state::parse_thread_response`]).
+    ThreadData(String),
     /// `* n EXISTS`.
     Exists(u32),
     /// `* n RECENT`.
@@ -209,6 +214,15 @@ enum BoundedKind {
     Quota,
     QuotaRoot,
     Id,
+    Thread,
+}
+
+/// Which space-separated *number* list we're reading (`SEARCH`/`SORT`
+/// share an identical wire grammar, just a different result kind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumListKind {
+    Search,
+    Sort,
 }
 
 /// A recognised STATUS item name, or `Other` for one we skip the value of.
@@ -253,7 +267,7 @@ enum AwaitLfKind {
     Preauth { code: Option<String> },
     Capability,
     Enabled,
-    SearchNumbers,
+    NumList(NumListKind),
     Other,
     Exists(u32),
     Recent(u32),
@@ -288,11 +302,11 @@ enum State {
     RespMessage { ctx: RespCtx },
     /// Space-separated atom list to CRLF (`CAPABILITY` / `ENABLED`).
     TokenList { use_: TokenListUse },
-    /// Space-separated numbers to CRLF (`SEARCH`).
-    SearchNums,
-    /// Optional `(MODSEQ n)`-style trailer after SEARCH numbers, or the
-    /// remainder of an unrecognised line — quote/depth aware skip.
-    SearchTrailerSkip { depth: i32, in_quote: bool, escape: bool },
+    /// Space-separated numbers to CRLF (`SEARCH`/`SORT`).
+    NumList { kind: NumListKind },
+    /// Optional `(MODSEQ n)`-style trailer after SEARCH/SORT numbers, or
+    /// the remainder of an unrecognised line — quote/depth aware skip.
+    NumListTrailerSkip { kind: NumListKind, depth: i32, in_quote: bool, escape: bool },
     /// Discard remaining bytes of an unrecognised untagged line to CRLF.
     SkipToCrlf,
     /// `(` expected (`LIST`/`LSUB` attribute list).
@@ -550,9 +564,9 @@ impl ImapReplyLexer {
             State::RespCodeGap { ctx } => self.on_resp_code_gap(ctx, b),
             State::RespMessage { ctx } => self.on_resp_message(ctx, b),
             State::TokenList { use_ } => self.on_token_list(use_, b),
-            State::SearchNums => self.on_search_nums(b),
-            State::SearchTrailerSkip { depth, in_quote, escape } => {
-                self.on_search_trailer_skip(depth, in_quote, escape, b)
+            State::NumList { kind } => self.on_num_list(kind, b),
+            State::NumListTrailerSkip { kind, depth, in_quote, escape } => {
+                self.on_num_list_trailer_skip(kind, depth, in_quote, escape, b)
             }
             State::SkipToCrlf => self.on_skip_to_crlf(b),
             State::ListAttrsOpen => self.on_list_attrs_open(b),
@@ -682,12 +696,22 @@ impl ImapReplyLexer {
                     "SEARCH" | "ESEARCH" => {
                         self.search_nums.clear();
                         if by_cr {
-                            self.state = State::AwaitLf(AwaitLfKind::SearchNumbers);
+                            self.state = State::AwaitLf(AwaitLfKind::NumList(NumListKind::Search));
                             return Ok(None);
                         }
-                        self.state = State::SearchNums;
+                        self.state = State::NumList { kind: NumListKind::Search };
                         Ok(None)
                     }
+                    "SORT" => {
+                        self.search_nums.clear();
+                        if by_cr {
+                            self.state = State::AwaitLf(AwaitLfKind::NumList(NumListKind::Sort));
+                            return Ok(None);
+                        }
+                        self.state = State::NumList { kind: NumListKind::Sort };
+                        Ok(None)
+                    }
+                    "THREAD" => self.begin_bounded(BoundedKind::Thread, by_cr),
                     "LIST" | "LSUB" => {
                         if by_cr {
                             return Err(ImapError::Parse("truncated LIST response".into()));
@@ -951,96 +975,122 @@ impl ImapReplyLexer {
 
     // ── SEARCH numbers ───────────────────────────────────────────────────
 
-    fn on_search_nums(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+    fn on_num_list(&mut self, kind: NumListKind, b: u8) -> Result<Option<ImapEvent>, ImapError> {
         match b {
             b' ' => {
                 let w = self.take_word();
                 if w.is_empty() {
-                    self.state = State::SearchNums;
+                    self.state = State::NumList { kind };
                     return Ok(None);
                 }
                 if let Ok(n) = w.parse::<u32>() {
                     self.search_nums.push(n);
-                    self.state = State::SearchNums;
+                    self.state = State::NumList { kind };
                     Ok(None)
                 } else if w.starts_with('(') {
-                    self.state =
-                        State::SearchTrailerSkip { depth: 1, in_quote: false, escape: false };
+                    self.state = State::NumListTrailerSkip {
+                        kind,
+                        depth: 1,
+                        in_quote: false,
+                        escape: false,
+                    };
                     Ok(None)
                 } else {
-                    Err(ImapError::Parse(format!("unexpected SEARCH token: {w:?}")))
+                    Err(ImapError::Parse(format!("unexpected SEARCH/SORT token: {w:?}")))
                 }
             }
             b'\r' => {
                 let w = self.take_word();
                 if !w.is_empty() {
-                    let n: u32 = w
-                        .parse()
-                        .map_err(|_| ImapError::Parse(format!("unexpected SEARCH token: {w:?}")))?;
+                    let n: u32 = w.parse().map_err(|_| {
+                        ImapError::Parse(format!("unexpected SEARCH/SORT token: {w:?}"))
+                    })?;
                     self.search_nums.push(n);
                 }
-                self.state = State::AwaitLf(AwaitLfKind::SearchNumbers);
+                self.state = State::AwaitLf(AwaitLfKind::NumList(kind));
                 Ok(None)
             }
             b'(' if self.word.is_empty() => {
-                self.state = State::SearchTrailerSkip { depth: 1, in_quote: false, escape: false };
+                self.state = State::NumListTrailerSkip {
+                    kind,
+                    depth: 1,
+                    in_quote: false,
+                    escape: false,
+                };
                 Ok(None)
             }
             _ => {
                 self.push_word(b)?;
-                self.state = State::SearchNums;
+                self.state = State::NumList { kind };
                 Ok(None)
             }
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn on_search_trailer_skip(
+    fn on_num_list_trailer_skip(
         &mut self,
+        kind: NumListKind,
         depth: i32,
         in_quote: bool,
         escape: bool,
         b: u8,
     ) -> Result<Option<ImapEvent>, ImapError> {
         if escape {
-            self.state = State::SearchTrailerSkip { depth, in_quote, escape: false };
+            self.state = State::NumListTrailerSkip { kind, depth, in_quote, escape: false };
             return Ok(None);
         }
         if in_quote {
             match b {
-                b'\\' => self.state = State::SearchTrailerSkip { depth, in_quote, escape: true },
-                b'"' => {
-                    self.state = State::SearchTrailerSkip { depth, in_quote: false, escape: false }
+                b'\\' => {
+                    self.state = State::NumListTrailerSkip { kind, depth, in_quote, escape: true }
                 }
-                _ => self.state = State::SearchTrailerSkip { depth, in_quote, escape: false },
+                b'"' => {
+                    self.state =
+                        State::NumListTrailerSkip { kind, depth, in_quote: false, escape: false }
+                }
+                _ => {
+                    self.state = State::NumListTrailerSkip { kind, depth, in_quote, escape: false }
+                }
             }
             return Ok(None);
         }
         match b {
             b'"' => {
-                self.state = State::SearchTrailerSkip { depth, in_quote: true, escape: false };
+                self.state =
+                    State::NumListTrailerSkip { kind, depth, in_quote: true, escape: false };
                 Ok(None)
             }
             b'(' => {
-                self.state =
-                    State::SearchTrailerSkip { depth: depth + 1, in_quote: false, escape: false };
+                self.state = State::NumListTrailerSkip {
+                    kind,
+                    depth: depth + 1,
+                    in_quote: false,
+                    escape: false,
+                };
                 Ok(None)
             }
             b')' if depth > 1 => {
-                self.state =
-                    State::SearchTrailerSkip { depth: depth - 1, in_quote: false, escape: false };
+                self.state = State::NumListTrailerSkip {
+                    kind,
+                    depth: depth - 1,
+                    in_quote: false,
+                    escape: false,
+                };
                 Ok(None)
             }
             b')' => {
-                self.state = State::SearchTrailerSkip { depth: 0, in_quote: false, escape: false };
+                self.state =
+                    State::NumListTrailerSkip { kind, depth: 0, in_quote: false, escape: false };
                 Ok(None)
             }
             b'\r' if depth <= 0 => {
-                self.state = State::AwaitLf(AwaitLfKind::SearchNumbers);
+                self.state = State::AwaitLf(AwaitLfKind::NumList(kind));
                 Ok(None)
             }
             _ => {
-                self.state = State::SearchTrailerSkip { depth, in_quote: false, escape: false };
+                self.state =
+                    State::NumListTrailerSkip { kind, depth, in_quote: false, escape: false };
                 Ok(None)
             }
         }
@@ -1827,6 +1877,7 @@ impl ImapReplyLexer {
             BoundedKind::Quota => ImapEvent::Quota(payload),
             BoundedKind::QuotaRoot => ImapEvent::QuotaRoot(payload),
             BoundedKind::Id => ImapEvent::IdParams(payload),
+            BoundedKind::Thread => ImapEvent::ThreadData(payload),
         }
     }
 
@@ -1858,8 +1909,11 @@ impl ImapReplyLexer {
             AwaitLfKind::Preauth { code } => ImapEvent::Preauth { code, text: self.take_text() },
             AwaitLfKind::Capability => ImapEvent::Capability(std::mem::take(&mut self.caps)),
             AwaitLfKind::Enabled => ImapEvent::Enabled(std::mem::take(&mut self.tokens)),
-            AwaitLfKind::SearchNumbers => {
+            AwaitLfKind::NumList(NumListKind::Search) => {
                 ImapEvent::SearchNumbers(std::mem::take(&mut self.search_nums))
+            }
+            AwaitLfKind::NumList(NumListKind::Sort) => {
+                ImapEvent::SortNumbers(std::mem::take(&mut self.search_nums))
             }
             AwaitLfKind::Other => ImapEvent::Other,
             AwaitLfKind::Exists(n) => ImapEvent::Exists(n),
@@ -2181,6 +2235,39 @@ mod tests {
         assert_eq!(
             feed_all(&mut lex, "* SEARCH 2 5 (MODSEQ 12345)\r\n"),
             vec![ImapEvent::SearchNumbers(vec![2, 5])]
+        );
+    }
+
+    #[test]
+    fn sort_numbers_and_empty() {
+        let mut lex = ImapReplyLexer::new();
+        assert_eq!(
+            feed_all(&mut lex, "* SORT 3 1 2\r\n"),
+            vec![ImapEvent::SortNumbers(vec![3, 1, 2])]
+        );
+
+        let mut lex2 = ImapReplyLexer::new();
+        assert_eq!(
+            feed_all(&mut lex2, "* SORT\r\n"),
+            vec![ImapEvent::SortNumbers(vec![])]
+        );
+    }
+
+    #[test]
+    fn thread_data_bounded_capture() {
+        let mut lex = ImapReplyLexer::new();
+        assert_eq!(
+            feed_all(&mut lex, "* THREAD (3)(1 2)\r\n"),
+            vec![ImapEvent::ThreadData("(3)(1 2)".into())]
+        );
+
+        // RFC 5256 §2: nothing to thread emits no untagged THREAD line at
+        // all, but the lexer must still handle an empty body gracefully if
+        // one ever arrives.
+        let mut lex2 = ImapReplyLexer::new();
+        assert_eq!(
+            feed_all(&mut lex2, "* THREAD\r\n"),
+            vec![ImapEvent::ThreadData(String::new())]
         );
     }
 
