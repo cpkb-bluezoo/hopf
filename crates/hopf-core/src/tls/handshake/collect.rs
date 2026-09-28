@@ -497,9 +497,7 @@ pub(crate) fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
     if !decode_one(HandshakeType::ClientHello, body, &mut c) || c.failed {
         return None;
     }
-    if c.out.peer_key_share.is_none() {
-        return None;
-    }
+    c.out.peer_key_share.as_ref()?;
     Some(c.out)
 }
 
@@ -518,6 +516,11 @@ pub(crate) fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
 }
 
 /// One fully parsed incoming handshake message (assembled from codec events).
+///
+/// `ClientHello` carries far more parsed extension data than the other
+/// variants; one per handshake message (not a hot per-record allocation),
+/// so boxing it isn't worth the diff across every arm below.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ParsedIncoming {
     /// ClientHello.
     ClientHello(ParsedClientHello),
@@ -542,8 +545,13 @@ pub(crate) enum ParsedIncoming {
 }
 
 /// Active collector for the message currently being parsed.
+///
+/// Same reasoning as `ParsedIncoming`: one per in-flight handshake message.
+#[allow(clippy::large_enum_variant)]
+#[derive(Default)]
 pub(crate) enum MessageCollector {
     /// No message yet.
+    #[default]
     Idle,
     /// Collecting ClientHello.
     ClientHello(ClientHelloCollector),
@@ -565,11 +573,6 @@ pub(crate) enum MessageCollector {
     KeyUpdate(KeyUpdateCollector),
 }
 
-impl Default for MessageCollector {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 impl MessageCollector {
     /// Take the parsed message if collection succeeded.

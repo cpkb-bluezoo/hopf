@@ -267,23 +267,14 @@ impl DigestAuthHandler {
     }
 
     fn check_auth(&mut self, headers: &Headers) -> Option<String> {
-        let Some(auth) = headers.get("authorization") else {
-            return None;
-        };
+        let auth = headers.get("authorization")?;
         let auth = auth.trim();
-        let Some(creds) = auth
+        let creds = auth
             .strip_prefix("Digest ")
-            .or_else(|| auth.strip_prefix("digest "))
-        else {
-            return None;
-        };
+            .or_else(|| auth.strip_prefix("digest "))?;
         let params = parse_params(creds);
-        let Some(username) = params.get("username") else {
-            return None;
-        };
-        let Some(nonce) = params.get("nonce") else {
-            return None;
-        };
+        let username = params.get("username")?;
+        let nonce = params.get("nonce")?;
         // Consult (and consume) the tracked nonce *before* verifying the
         // credential hash — an untracked/expired/already-used nonce is
         // rejected outright, regardless of whether `response` is
@@ -291,9 +282,7 @@ impl DigestAuthHandler {
         if !self.consume_nonce(nonce) {
             return None;
         }
-        let Some(ha1) = self.store.digest_ha1(username, &self.realm) else {
-            return None;
-        };
+        let ha1 = self.store.digest_ha1(username, &self.realm)?;
         let method = headers.method().unwrap_or("GET");
         let uri = params
             .get("uri")

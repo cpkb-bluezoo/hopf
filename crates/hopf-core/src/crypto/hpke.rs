@@ -237,7 +237,7 @@ impl HpkePrivateKey {
             return Err(HpkeError);
         }
         let peer = UnparsedPublicKey::new(self.kem.agreement(), peer_public);
-        agreement::agree(&self.key, &peer, HpkeError, |secret| Ok(secret.to_vec()))
+        agreement::agree(&self.key, peer, HpkeError, |secret| Ok(secret.to_vec()))
     }
 }
 

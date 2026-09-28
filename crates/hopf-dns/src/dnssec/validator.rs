@@ -204,10 +204,10 @@ pub fn find_matching_dnskey<'a>(
 }
 
 /// RRSIGs covering a type.
-pub fn find_rrsigs<'a>(
-    records: &'a [DnsResourceRecord],
+pub fn find_rrsigs(
+    records: &[DnsResourceRecord],
     covered_type: u16,
-) -> Vec<&'a DnsResourceRecord> {
+) -> Vec<&DnsResourceRecord> {
     records
         .iter()
         .filter(|rr| {
@@ -549,7 +549,7 @@ mod tests {
         rrsig_rdata.extend_from_slice(&encode_name(name).unwrap());
         let mut rrsig = DnsResourceRecord::new(name, DnsType::Rrsig, DnsClass::In, 3600, rrsig_rdata);
         let signed = build_signed_data(rrset, &rrsig).unwrap();
-        let sig = ed25519_sign(&pair, &signed);
+        let sig = ed25519_sign(pair, &signed);
         rrsig.rdata.extend_from_slice(sig.as_bytes());
         rrsig
     }

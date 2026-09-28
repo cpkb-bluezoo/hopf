@@ -330,6 +330,8 @@ fn digest(key: &TsigKey, chain: Chain<'_>, message: &[u8], vars: &[u8]) -> Vec<u
     key.algorithm.compute(&key.secret, &parts)
 }
 
+// RFC 8945 TSIG RR fields are each independently required by the wire format.
+#[allow(clippy::too_many_arguments)]
 fn tsig_rr(key_name: &str, algorithm: &str, time: u64, fudge: u16, mac: &[u8], id: u16, error: u16, other: &[u8]) -> Vec<u8> {
     let mut rdata = encode_name(algorithm).expect("valid algorithm name");
     rdata.extend_from_slice(&time.to_be_bytes()[2..]);

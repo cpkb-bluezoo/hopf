@@ -10,7 +10,7 @@ pub use state::{
     AppendState, AuthenticateState, CloseState, ConnectedState, CopyState, CreateState,
     DeleteState, ExpungeState, FetchState, GetMetadataState, ListState, MoveState, QuotaState,
     RenameState, SearchState, SelectState, SetMetadataState, SortState, StatusState, StoreAction,
-    StoreState, SubscribeState, ThreadState,
+    StoreRequest, StoreState, SubscribeState, ThreadState,
 };
 
 use std::collections::BTreeSet;
@@ -282,10 +282,7 @@ pub trait SelectedHandler: Send {
         state: &mut dyn StoreState,
         mailbox: &dyn Mailbox,
         messages: &MessageSet,
-        action: StoreAction,
-        flags: &BTreeSet<Flag>,
-        keywords: &BTreeSet<String>,
-        silent: bool,
+        request: &StoreRequest,
         by_uid: bool,
     );
     /// SEARCH / UID SEARCH.

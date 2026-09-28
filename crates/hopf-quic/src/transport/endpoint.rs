@@ -240,9 +240,7 @@ impl Endpoint {
                 ));
             }
             if prefix.packet_type == TYPE_INITIAL {
-                if self.server.is_none() {
-                    return None;
-                }
+                self.server.as_ref()?;
                 let (address_validated, orig_dst_cid, retry_local_cid) =
                     self.validate_initial_token(&prefix.token, remote, &prefix.dst_cid, prefix.version);
                 return Some(DatagramEvent::NewConnection(Incoming {
@@ -292,9 +290,7 @@ impl Endpoint {
             let handle = self.cids.get(&ConnectionId::from_slice(dcid))?;
             return Some(DatagramEvent::ConnectionEvent(handle, ConnectionEvent { datagram: data.clone() }));
         }
-        let Some(server) = self.server.as_ref() else {
-            return None;
-        };
+        let server = self.server.as_ref()?;
         if data.len() < vn::MIN_INITIAL_DATAGRAM_LEN
             || self.cids.get(&ConnectionId::from_slice(dcid)).is_some()
         {

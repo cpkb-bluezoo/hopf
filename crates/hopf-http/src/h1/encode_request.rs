@@ -46,11 +46,10 @@ pub(crate) fn write_request_headers(
     let has_te = headers.contains("transfer-encoding");
     if has_body && !has_cl && !has_te {
         msg.push_str("Transfer-Encoding: chunked\r\n");
-    } else if !has_cl && !has_te && !method_implies_no_body(method) {
-        if matches!(method, "POST" | "PUT" | "PATCH") && !has_body {
+    } else if !has_cl && !has_te && !method_implies_no_body(method)
+        && matches!(method, "POST" | "PUT" | "PATCH") && !has_body {
             msg.push_str("Content-Length: 0\r\n");
         }
-    }
 
     msg.push_str("\r\n");
     out.extend_from_slice(msg.as_bytes());

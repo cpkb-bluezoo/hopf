@@ -33,7 +33,7 @@ impl ImapControlHandler {
     fn mailbox_idle_snapshot(
         mb: &mut dyn hopf_mailbox::Mailbox,
     ) -> Result<IdleMailboxSnapshot, String> {
-        let _ = mb.refresh().map_err(|e| e.to_string())?;
+        mb.refresh().map_err(|e| e.to_string())?;
         let exists = mb.message_count().map_err(|e| e.to_string())?;
         let mut messages = Vec::with_capacity(exists as usize);
         for seq in 1..=exists {
@@ -241,7 +241,7 @@ impl ImapControlHandler {
                                 .mailbox
                                 .as_mut()
                                 .ok_or_else(|| "no mailbox".to_string())?;
-                            let _ = mb.refresh().map_err(|e| e.to_string())?;
+                            mb.refresh().map_err(|e| e.to_string())?;
                             let exists = mb.message_count().map_err(|e| e.to_string())?;
                             let mut messages = Vec::with_capacity(exists as usize);
                             for seq in 1..=exists {

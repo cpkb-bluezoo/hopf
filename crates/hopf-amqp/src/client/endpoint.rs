@@ -32,7 +32,7 @@ use crate::codec::types::{
 };
 use crate::codec::{AmqpError, BasicProperties};
 
-use super::handlers::{AmqpClientControl, AmqpClientDriver, AmqpClientHandlerFactory};
+use super::handlers::{AmqpClientControl, AmqpClientDriver, AmqpClientHandlerFactory, BasicReturnInfo};
 
 /// Marker on TimedOut errors meaning "send a heartbeat".
 const HEARTBEAT_DUE: &str = "hopf-amqp-heartbeat-due";
@@ -710,12 +710,14 @@ impl AmqpClientEndpoint {
                 if let Some(ref mut driver) = self.driver {
                     driver.on_return_start(
                         channel,
-                        r.reply_code,
-                        &r.reply_text,
-                        &r.exchange,
-                        &r.routing_key,
-                        &properties,
-                        body_size,
+                        &BasicReturnInfo {
+                            reply_code: r.reply_code,
+                            reply_text: &r.reply_text,
+                            exchange: &r.exchange,
+                            routing_key: &r.routing_key,
+                            properties: &properties,
+                            body_len: body_size,
+                        },
                     );
                 }
             }
@@ -819,251 +821,6 @@ fn choose_mechanism(forced: Option<&str>, advertised: &[&str]) -> Result<String,
             .find(|want| advertised.iter().any(|m| m.eq_ignore_ascii_case(want)))
             .map(str::to_owned)
             .ok_or(AmqpError::Malformed("no supported SASL mechanism"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_prefers_plain_over_amqplain() {
-        assert_eq!(
-            choose_mechanism(None, &["AMQPLAIN", "PLAIN"]).unwrap(),
-            "PLAIN"
-        );
-    }
-
-    #[test]
-    fn default_falls_back_to_amqplain() {
-        assert_eq!(
-            choose_mechanism(None, &["AMQPLAIN", "EXTERNAL"]).unwrap(),
-            "AMQPLAIN"
-        );
-    }
-
-    #[test]
-    fn default_errors_when_neither_advertised() {
-        assert!(choose_mechanism(None, &["EXTERNAL", "GSSAPI"]).is_err());
-    }
-
-    #[test]
-    fn forced_mechanism_used_case_insensitively_when_advertised() {
-        assert_eq!(
-            choose_mechanism(Some("external"), &["PLAIN", "EXTERNAL"]).unwrap(),
-            "external"
-        );
-    }
-
-    #[test]
-    fn forced_mechanism_errors_when_not_advertised() {
-        assert!(choose_mechanism(Some("EXTERNAL"), &["PLAIN", "AMQPLAIN"]).is_err());
-    }
-
-    // -------------------------------------------------------------------
-    // Interleaved-channel content reassembly (issue #180)
-    // -------------------------------------------------------------------
-
-    use crate::codec::table::encode_shortstr;
-    use crate::codec::types::basic;
-    use hopf_core::ConnHandle;
-    use std::sync::{Arc, Mutex};
-
-    struct FakeEp {
-        secure: hopf_core::SecurityInfo,
-        handle: ConnHandle,
-    }
-
-    impl FakeEp {
-        fn new() -> Self {
-            Self {
-                secure: hopf_core::SecurityInfo::plaintext(),
-                handle: ConnHandle::from_execute(Arc::new(|task| task())),
-            }
-        }
-    }
-
-    impl Endpoint for FakeEp {
-        fn send(&mut self, _data: &[u8]) {}
-        fn is_open(&self) -> bool {
-            true
-        }
-        fn is_closing(&self) -> bool {
-            false
-        }
-        fn close(&mut self) {}
-        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
-            "127.0.0.1:0"
-                .parse::<std::net::SocketAddr>()
-                .map(hopf_core::PeerAddr::Inet)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-        }
-        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
-            self.local_addr()
-        }
-        fn security_info(&self) -> &hopf_core::SecurityInfo {
-            &self.secure
-        }
-        fn start_tls(&mut self) -> Result<(), hopf_core::StartTlsError> {
-            Err(hopf_core::StartTlsError::Unsupported)
-        }
-        fn pause_read(&mut self) {}
-        fn resume_read(&mut self) {}
-        fn on_write_ready(&mut self, _cb: Option<hopf_core::WriteReadyCallback>) {}
-        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
-            task();
-        }
-        fn schedule_timer(&self, _delay: Duration, _cb: Box<dyn FnOnce() + Send>) -> TimerHandle {
-            TimerHandle::from_cancel(|| {})
-        }
-        fn handle(&self) -> ConnHandle {
-            self.handle.clone()
-        }
-        fn fail(&mut self, _err: io::Error) {}
-    }
-
-    #[derive(Default)]
-    struct RecordingState {
-        log: Vec<String>,
-        body_by_channel: HashMap<u16, Vec<u8>>,
-    }
-
-    struct RecordingDriver {
-        state: Arc<Mutex<RecordingState>>,
-    }
-
-    impl AmqpClientDriver for RecordingDriver {
-        fn on_connection_open(&mut self, _: &mut dyn AmqpClientControl) {}
-        fn on_channel_open(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
-        fn on_channel_close(&mut self, _: &mut dyn AmqpClientControl, _: u16, _: u16, _: &str) {}
-        fn on_exchange_declare_ok(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
-        fn on_queue_declare_ok(
-            &mut self,
-            _: &mut dyn AmqpClientControl,
-            _: u16,
-            _: &str,
-            _: u32,
-            _: u32,
-        ) {
-        }
-        fn on_consume_ok(&mut self, _: &mut dyn AmqpClientControl, _: u16, _: &str) {}
-        fn on_delivery_start(
-            &mut self,
-            channel: u16,
-            _consumer_tag: &str,
-            delivery_tag: u64,
-            _redelivered: bool,
-            _exchange: &str,
-            _routing_key: &str,
-            _properties: &BasicProperties,
-            _body_len: u64,
-        ) {
-            self.state.lock().unwrap().log.push(format!("start:{channel}:{delivery_tag}"));
-        }
-        fn on_delivery_data(&mut self, channel: u16, data: &[u8]) {
-            self.state
-                .lock()
-                .unwrap()
-                .body_by_channel
-                .entry(channel)
-                .or_default()
-                .extend_from_slice(data);
-        }
-        fn on_delivery_complete(&mut self, _: &mut dyn AmqpClientControl, channel: u16) {
-            self.state.lock().unwrap().log.push(format!("complete:{channel}"));
-        }
-        fn on_error(&mut self, _: &io::Error) {}
-        fn on_disconnected(&mut self) {}
-    }
-
-    struct RecordingFactory {
-        state: Arc<Mutex<RecordingState>>,
-    }
-
-    impl AmqpClientHandlerFactory for RecordingFactory {
-        fn create(&self) -> Box<dyn AmqpClientDriver> {
-            Box::new(RecordingDriver {
-                state: Arc::clone(&self.state),
-            })
-        }
-    }
-
-    fn test_params() -> AmqpClientParams {
-        AmqpClientParams {
-            virtual_host: "/".into(),
-            username: "guest".into(),
-            password: "guest".into(),
-            mechanism: None,
-            heartbeat: 0,
-            frame_max: 0,
-            channel_max: 0,
-            tls_connector: None,
-            tls_server_name: None,
-            implicit_tls: false,
-            handshake_timeout: Duration::ZERO,
-            heartbeat_timeout: Duration::ZERO,
-        }
-    }
-
-    /// Wire-level encoding of `basic.deliver` arguments — this crate has no
-    /// encoder for it (it's normally broker-to-client only), so tests build
-    /// it manually per RFC-equivalent AMQP 0-9-1 spec §1.8.3.4 layout.
-    fn encode_deliver_args(consumer_tag: &str, delivery_tag: u64, exchange: &str, routing_key: &str) -> Vec<u8> {
-        let mut out = Vec::new();
-        encode_shortstr(&mut out, consumer_tag).unwrap();
-        out.extend_from_slice(&delivery_tag.to_be_bytes());
-        out.push(0); // redelivered = false
-        encode_shortstr(&mut out, exchange).unwrap();
-        encode_shortstr(&mut out, routing_key).unwrap();
-        out
-    }
-
-    /// AMQP 0-9-1 permits the broker to interleave content frames from
-    /// *different* channels on one connection (only same-channel content
-    /// must stay contiguous). Two concurrent deliveries — method, method,
-    /// header, header, body, body across channels 1 and 2 — must reassemble
-    /// each channel's body and fire each channel's start/complete
-    /// callbacks independently, not cross-attribute bytes or corrupt state
-    /// (issue #180: this previously used connection-global scalar fields).
-    #[test]
-    fn interleaved_channel_deliveries_reassemble_independently() {
-        let state = Arc::new(Mutex::new(RecordingState::default()));
-        let factory = RecordingFactory { state: Arc::clone(&state) };
-        let mut ep = AmqpClientEndpoint::new(&factory, test_params());
-        let mut fake = FakeEp::new();
-
-        let deliver1 = encode_method(
-            1,
-            class::BASIC,
-            basic::DELIVER,
-            &encode_deliver_args("ctag1", 1, "ex", "rk1"),
-        );
-        let deliver2 = encode_method(
-            2,
-            class::BASIC,
-            basic::DELIVER,
-            &encode_deliver_args("ctag2", 2, "ex", "rk2"),
-        );
-        let header1 = encode_content_header(1, 5, &BasicProperties::new()).unwrap();
-        let header2 = encode_content_header(2, 6, &BasicProperties::new()).unwrap();
-        let body1 = encode_content_body_chunk(1, b"one-A", 131_072);
-        let body2 = encode_content_body_chunk(2, b"two-AB", 131_072);
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&deliver1);
-        data.extend_from_slice(&deliver2);
-        data.extend_from_slice(&header1);
-        data.extend_from_slice(&header2);
-        data.extend_from_slice(&body1);
-        data.extend_from_slice(&body2);
-
-        let mut slice: &[u8] = &data;
-        ep.receive(&mut fake, &mut slice);
-
-        let s = state.lock().unwrap();
-        assert_eq!(s.body_by_channel.get(&1).map(Vec::as_slice), Some(&b"one-A"[..]));
-        assert_eq!(s.body_by_channel.get(&2).map(Vec::as_slice), Some(&b"two-AB"[..]));
-        assert_eq!(s.log, vec!["start:1:1", "start:2:2", "complete:1", "complete:2"]);
     }
 }
 
@@ -1528,5 +1285,250 @@ impl ProtocolHandler for AmqpClientEndpoint {
         if let Some(ref mut d) = self.driver {
             d.on_error(err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_prefers_plain_over_amqplain() {
+        assert_eq!(
+            choose_mechanism(None, &["AMQPLAIN", "PLAIN"]).unwrap(),
+            "PLAIN"
+        );
+    }
+
+    #[test]
+    fn default_falls_back_to_amqplain() {
+        assert_eq!(
+            choose_mechanism(None, &["AMQPLAIN", "EXTERNAL"]).unwrap(),
+            "AMQPLAIN"
+        );
+    }
+
+    #[test]
+    fn default_errors_when_neither_advertised() {
+        assert!(choose_mechanism(None, &["EXTERNAL", "GSSAPI"]).is_err());
+    }
+
+    #[test]
+    fn forced_mechanism_used_case_insensitively_when_advertised() {
+        assert_eq!(
+            choose_mechanism(Some("external"), &["PLAIN", "EXTERNAL"]).unwrap(),
+            "external"
+        );
+    }
+
+    #[test]
+    fn forced_mechanism_errors_when_not_advertised() {
+        assert!(choose_mechanism(Some("EXTERNAL"), &["PLAIN", "AMQPLAIN"]).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // Interleaved-channel content reassembly (issue #180)
+    // -------------------------------------------------------------------
+
+    use crate::codec::table::encode_shortstr;
+    use crate::codec::types::basic;
+    use hopf_core::ConnHandle;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeEp {
+        secure: hopf_core::SecurityInfo,
+        handle: ConnHandle,
+    }
+
+    impl FakeEp {
+        fn new() -> Self {
+            Self {
+                secure: hopf_core::SecurityInfo::plaintext(),
+                handle: ConnHandle::from_execute(Arc::new(|task| task())),
+            }
+        }
+    }
+
+    impl Endpoint for FakeEp {
+        fn send(&mut self, _data: &[u8]) {}
+        fn is_open(&self) -> bool {
+            true
+        }
+        fn is_closing(&self) -> bool {
+            false
+        }
+        fn close(&mut self) {}
+        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+            "127.0.0.1:0"
+                .parse::<std::net::SocketAddr>()
+                .map(hopf_core::PeerAddr::Inet)
+                .map_err(io::Error::other)
+        }
+        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+            self.local_addr()
+        }
+        fn security_info(&self) -> &hopf_core::SecurityInfo {
+            &self.secure
+        }
+        fn start_tls(&mut self) -> Result<(), hopf_core::StartTlsError> {
+            Err(hopf_core::StartTlsError::Unsupported)
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _cb: Option<hopf_core::WriteReadyCallback>) {}
+        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+            task();
+        }
+        fn schedule_timer(&self, _delay: Duration, _cb: Box<dyn FnOnce() + Send>) -> TimerHandle {
+            TimerHandle::from_cancel(|| {})
+        }
+        fn handle(&self) -> ConnHandle {
+            self.handle.clone()
+        }
+        fn fail(&mut self, _err: io::Error) {}
+    }
+
+    #[derive(Default)]
+    struct RecordingState {
+        log: Vec<String>,
+        body_by_channel: HashMap<u16, Vec<u8>>,
+    }
+
+    struct RecordingDriver {
+        state: Arc<Mutex<RecordingState>>,
+    }
+
+    impl AmqpClientDriver for RecordingDriver {
+        fn on_connection_open(&mut self, _: &mut dyn AmqpClientControl) {}
+        fn on_channel_open(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
+        fn on_channel_close(&mut self, _: &mut dyn AmqpClientControl, _: u16, _: u16, _: &str) {}
+        fn on_exchange_declare_ok(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
+        fn on_queue_declare_ok(
+            &mut self,
+            _: &mut dyn AmqpClientControl,
+            _: u16,
+            _: &str,
+            _: u32,
+            _: u32,
+        ) {
+        }
+        fn on_consume_ok(&mut self, _: &mut dyn AmqpClientControl, _: u16, _: &str) {}
+        fn on_delivery_start(
+            &mut self,
+            channel: u16,
+            _consumer_tag: &str,
+            delivery_tag: u64,
+            _redelivered: bool,
+            _exchange: &str,
+            _routing_key: &str,
+            _properties: &BasicProperties,
+            _body_len: u64,
+        ) {
+            self.state.lock().unwrap().log.push(format!("start:{channel}:{delivery_tag}"));
+        }
+        fn on_delivery_data(&mut self, channel: u16, data: &[u8]) {
+            self.state
+                .lock()
+                .unwrap()
+                .body_by_channel
+                .entry(channel)
+                .or_default()
+                .extend_from_slice(data);
+        }
+        fn on_delivery_complete(&mut self, _: &mut dyn AmqpClientControl, channel: u16) {
+            self.state.lock().unwrap().log.push(format!("complete:{channel}"));
+        }
+        fn on_error(&mut self, _: &io::Error) {}
+        fn on_disconnected(&mut self) {}
+    }
+
+    struct RecordingFactory {
+        state: Arc<Mutex<RecordingState>>,
+    }
+
+    impl AmqpClientHandlerFactory for RecordingFactory {
+        fn create(&self) -> Box<dyn AmqpClientDriver> {
+            Box::new(RecordingDriver {
+                state: Arc::clone(&self.state),
+            })
+        }
+    }
+
+    fn test_params() -> AmqpClientParams {
+        AmqpClientParams {
+            virtual_host: "/".into(),
+            username: "guest".into(),
+            password: "guest".into(),
+            mechanism: None,
+            heartbeat: 0,
+            frame_max: 0,
+            channel_max: 0,
+            tls_connector: None,
+            tls_server_name: None,
+            implicit_tls: false,
+            handshake_timeout: Duration::ZERO,
+            heartbeat_timeout: Duration::ZERO,
+        }
+    }
+
+    /// Wire-level encoding of `basic.deliver` arguments — this crate has no
+    /// encoder for it (it's normally broker-to-client only), so tests build
+    /// it manually per RFC-equivalent AMQP 0-9-1 spec §1.8.3.4 layout.
+    fn encode_deliver_args(consumer_tag: &str, delivery_tag: u64, exchange: &str, routing_key: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_shortstr(&mut out, consumer_tag).unwrap();
+        out.extend_from_slice(&delivery_tag.to_be_bytes());
+        out.push(0); // redelivered = false
+        encode_shortstr(&mut out, exchange).unwrap();
+        encode_shortstr(&mut out, routing_key).unwrap();
+        out
+    }
+
+    /// AMQP 0-9-1 permits the broker to interleave content frames from
+    /// *different* channels on one connection (only same-channel content
+    /// must stay contiguous). Two concurrent deliveries — method, method,
+    /// header, header, body, body across channels 1 and 2 — must reassemble
+    /// each channel's body and fire each channel's start/complete
+    /// callbacks independently, not cross-attribute bytes or corrupt state
+    /// (issue #180: this previously used connection-global scalar fields).
+    #[test]
+    fn interleaved_channel_deliveries_reassemble_independently() {
+        let state = Arc::new(Mutex::new(RecordingState::default()));
+        let factory = RecordingFactory { state: Arc::clone(&state) };
+        let mut ep = AmqpClientEndpoint::new(&factory, test_params());
+        let mut fake = FakeEp::new();
+
+        let deliver1 = encode_method(
+            1,
+            class::BASIC,
+            basic::DELIVER,
+            &encode_deliver_args("ctag1", 1, "ex", "rk1"),
+        );
+        let deliver2 = encode_method(
+            2,
+            class::BASIC,
+            basic::DELIVER,
+            &encode_deliver_args("ctag2", 2, "ex", "rk2"),
+        );
+        let header1 = encode_content_header(1, 5, &BasicProperties::new()).unwrap();
+        let header2 = encode_content_header(2, 6, &BasicProperties::new()).unwrap();
+        let body1 = encode_content_body_chunk(1, b"one-A", 131_072);
+        let body2 = encode_content_body_chunk(2, b"two-AB", 131_072);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&deliver1);
+        data.extend_from_slice(&deliver2);
+        data.extend_from_slice(&header1);
+        data.extend_from_slice(&header2);
+        data.extend_from_slice(&body1);
+        data.extend_from_slice(&body2);
+
+        let mut slice: &[u8] = &data;
+        ep.receive(&mut fake, &mut slice);
+
+        let s = state.lock().unwrap();
+        assert_eq!(s.body_by_channel.get(&1).map(Vec::as_slice), Some(&b"one-A"[..]));
+        assert_eq!(s.body_by_channel.get(&2).map(Vec::as_slice), Some(&b"two-AB"[..]));
+        assert_eq!(s.log, vec!["start:1:1", "start:2:2", "complete:1", "complete:2"]);
     }
 }

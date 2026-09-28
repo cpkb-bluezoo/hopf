@@ -29,7 +29,7 @@ use crate::server::codec::{
 use crate::server::fetch_format::parse_fetch_args;
 use crate::server::handler::{
     AuthenticatedHandler, ClientConnected, ImapConnectionMetadata, NotAuthenticatedHandler,
-    SelectedHandler,
+    SelectedHandler, StoreRequest,
 };
 use crate::server::idle::{is_idle_done, IdleState};
 use crate::server::metrics::ImapServerMetrics;
@@ -1479,6 +1479,8 @@ impl ImapControlHandler {
         }
     }
 
+    // Each parameter is an independent piece of per-command dispatch context.
+    #[allow(clippy::too_many_arguments)]
     fn run_mgmt(
         &mut self,
         endpoint: &mut dyn Endpoint,
@@ -1701,18 +1703,15 @@ impl ImapControlHandler {
             control_handle: &self.control_handle,
             pending_open: &self.pending_open,
         };
+        let request = StoreRequest {
+            action,
+            flags: flist.flags,
+            keywords: flist.keywords,
+            silent,
+        };
         let g = self.bundle.lock().unwrap();
         if let Some(mb) = g.mailbox.as_ref() {
-            h.store(
-                &mut view,
-                mb.as_ref(),
-                &set,
-                action,
-                &flist.flags,
-                &flist.keywords,
-                silent,
-                by_uid,
-            );
+            h.store(&mut view, mb.as_ref(), &set, &request, by_uid);
         }
         drop(g);
         if self.selected.is_none() && self.pending_open.lock().unwrap().is_none() {

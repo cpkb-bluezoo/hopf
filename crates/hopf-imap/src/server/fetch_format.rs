@@ -943,10 +943,7 @@ fn body_item_name(
         BodySection::Text => format!("{prefix}[TEXT]"),
         BodySection::HeaderFields => {
             let list = fields
-                .unwrap_or(&[])
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
+                .unwrap_or(&[]).to_vec()
                 .join(" ");
             format!("{prefix}[HEADER.FIELDS ({list})]")
         }

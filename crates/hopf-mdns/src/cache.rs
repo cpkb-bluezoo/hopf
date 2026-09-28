@@ -67,6 +67,14 @@ pub enum UpsertOutcome {
 /// answer arriving split across more than one packet.
 pub const GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// [`MdnsCache::ingest`]'s result: upsert schedules to arm, alongside the
+/// `(name, qtype, rdata, generation)` grace-removals to schedule after
+/// [`GRACE_PERIOD`].
+pub type IngestResult = (
+    Vec<(String, DnsType, [ScheduledStage; 5])>,
+    Vec<(String, DnsType, Vec<u8>, u64)>,
+);
+
 /// Querier-side cache. See the module docs for the timer-ownership split.
 #[derive(Default)]
 pub struct MdnsCache {
@@ -154,10 +162,7 @@ impl MdnsCache {
     /// normally. Returns the upsert schedules (for the caller to arm)
     /// alongside the `(name, qtype, rdata, generation)` grace-removals to
     /// schedule after [`GRACE_PERIOD`].
-    pub fn ingest(
-        &mut self,
-        answers: &[DnsResourceRecord],
-    ) -> (Vec<(String, DnsType, [ScheduledStage; 5])>, Vec<(String, DnsType, Vec<u8>, u64)>) {
+    pub fn ingest(&mut self, answers: &[DnsResourceRecord]) -> IngestResult {
         let mut by_key: HashMap<Key, Vec<&DnsResourceRecord>> = HashMap::new();
         for rr in answers {
             if let Some(rtype) = rr.rtype {

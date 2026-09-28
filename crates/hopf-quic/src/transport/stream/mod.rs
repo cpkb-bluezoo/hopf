@@ -116,6 +116,8 @@ pub struct RecvStream {
     pub readable: VecDeque<Bytes>,
     /// Peer sent FIN.
     pub fin: bool,
+    /// Total stream length, known once a FIN-bearing frame has been seen.
+    final_size: Option<u64>,
     /// Max data we advertise.
     pub max_data: u64,
 }
@@ -127,12 +129,14 @@ impl RecvStream {
             reassembler: StreamReassembler::new(max_data),
             readable: VecDeque::new(),
             fin: false,
+            final_size: None,
             max_data,
         }
     }
 
     /// Ingest a STREAM frame chunk.
     pub fn ingest(&mut self, offset: u64, data: Bytes, fin: bool) -> Result<bool, ()> {
+        let end = offset.saturating_add(data.len() as u64);
         let contiguous = self.reassembler.receive(offset, data)?;
         let became_readable = !contiguous.is_empty();
         if !contiguous.is_empty() {
@@ -140,8 +144,17 @@ impl RecvStream {
         }
         if fin {
             self.fin = true;
+            self.final_size = Some(end);
         }
         Ok(became_readable)
+    }
+
+    /// Whether every byte up to the peer's declared final size has been
+    /// reassembled contiguously (as opposed to merely having seen a FIN,
+    /// which may have arrived out of order ahead of a gap).
+    fn fully_reassembled(&self) -> bool {
+        self.final_size
+            .is_some_and(|fs| self.reassembler.next_offset() >= fs)
     }
 
     /// Read buffered data into `buf`; returns (bytes, fin_seen).
@@ -150,15 +163,40 @@ impl RecvStream {
             return (Bytes::new(), false);
         }
         let Some(front) = self.readable.pop_front() else {
-            return (Bytes::new(), self.fin && self.reassembler.next_offset() > 0 || self.fin);
+            return (Bytes::new(), self.fully_reassembled());
         };
         if front.len() <= max {
-            let fin = self.fin && self.readable.is_empty();
+            let fin = self.readable.is_empty() && self.fully_reassembled();
             (front, fin)
         } else {
             let got = front.slice(..max);
             self.readable.push_front(front.slice(max..));
             (got, false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_does_not_report_fin_while_a_gap_remains() {
+        let mut recv = RecvStream::new(1024);
+        // Peer's final chunk (offset 4, carrying FIN) arrives before the
+        // preceding bytes at offset 0..4, so a gap remains.
+        recv.ingest(4, Bytes::from_static(b"ef"), true).unwrap();
+        let (data, fin) = recv.read(1024);
+        assert!(data.is_empty());
+        assert!(
+            !fin,
+            "must not report end-of-stream while a gap precedes the FIN offset"
+        );
+
+        // The missing prefix arrives, closing the gap.
+        recv.ingest(0, Bytes::from_static(b"abcd"), false).unwrap();
+        let (data, fin) = recv.read(1024);
+        assert_eq!(data.as_ref(), b"abcdef");
+        assert!(fin, "stream is fully reassembled and should now report FIN");
     }
 }

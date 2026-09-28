@@ -126,6 +126,12 @@ pub use tls12::ticket::{StoredTls12Ticket, Tls12ClientTicketStore, TICKET_LIFETI
 /// its configured acceptor/connector produced through one shared surface
 /// (both engines expose the same method set and the same
 /// [`TlsRecordSink`], so this is a thin, no-behavior-of-its-own dispatch).
+///
+/// TLS 1.3's record-layer state is substantially larger than 1.2's; one
+/// allocation per connection (already behind that connection's own
+/// indirection, not a hot-loop copy), so boxing it isn't worth the diff
+/// across every match site that dispatches on this enum.
+#[allow(clippy::large_enum_variant)]
 pub enum TlsVariant {
     /// TLS 1.3 (the default; every existing `hopf-core::tls::pem` helper builds this).
     V13(TlsRecordEngine),

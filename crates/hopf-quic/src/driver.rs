@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
-use hopf_core::{Endpoint, HandlerFactory, ProtocolHandler, SecurityInfo};
+use hopf_core::{Endpoint, EndpointTask, ExecuteFn, HandlerFactory, ProtocolHandler, SecurityInfo, Task};
 
 use crate::config::{
     apply_listen_hardening, QuicClientConfig, QuicConnectConfig, QuicListenConfig,
@@ -61,10 +61,10 @@ pub(crate) enum DriverCmd {
     },
     ScheduleTimer {
         delay: Duration,
-        callback: Box<dyn FnOnce() + Send>,
+        callback: Task,
         cancelled: Arc<AtomicBool>,
     },
-    Task(Box<dyn FnOnce() + Send>),
+    Task(Task),
     /// Run `task` against a specific stream's endpoint — the QUIC side of
     /// [`hopf_core::ConnHandle::with_endpoint`] (see `stream.rs`'s
     /// `QuicStreamBackend`), mirroring how `hopf_core::Reactor` handles
@@ -74,7 +74,7 @@ pub(crate) enum DriverCmd {
     WithStream {
         conn: ConnectionHandle,
         stream_id: StreamId,
-        task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>,
+        task: EndpointTask,
     },
     /// Queue a QUIC DATAGRAM (RFC 9221) on `conn`.
     SendDatagram {
@@ -584,7 +584,7 @@ fn spawn_driver(
     let waker2 = Arc::clone(&waker);
     let cmd_tx2 = cmd_tx.clone();
 
-    let execute: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync> = {
+    let execute: ExecuteFn = {
         let tx = cmd_tx.clone();
         let w = Arc::clone(&waker);
         Arc::new(move |task| {
@@ -632,7 +632,7 @@ fn spawn_driver(
 
 struct PendingTimer {
     when: Instant,
-    callback: Box<dyn FnOnce() + Send>,
+    callback: Task,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -790,7 +790,7 @@ struct Driver {
     cmd_rx: Receiver<DriverCmd>,
     cmd_tx: Sender<DriverCmd>,
     waker: Arc<Waker>,
-    execute: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
+    execute: ExecuteFn,
     active: Arc<AtomicBool>,
     timers: Vec<PendingTimer>,
     recv_buf: Vec<u8>,
@@ -1204,10 +1204,7 @@ impl Driver {
     ) -> io::Result<()> {
         // With high_security hardening, unvalidated Initials get a Retry.
         if self.require_address_validation && !incoming.remote_address_validated() {
-            match self.endpoint.retry(incoming, &mut self.send_buf) {
-                Ok(tx) => self.send_transmit(tx)?,
-                Err(()) => {}
-            }
+            if let Ok(tx) = self.endpoint.retry(incoming, &mut self.send_buf) { self.send_transmit(tx)? }
             return Ok(());
         }
 
@@ -1273,11 +1270,8 @@ impl Driver {
         }
 
         // App events.
-        loop {
-            let event = match self.connections.get_mut(&ch) {
-                Some(slot) => slot.conn.poll(),
-                None => break,
-            };
+        while let Some(slot) = self.connections.get_mut(&ch) {
+            let event = slot.conn.poll();
             let Some(event) = event else { break };
             match event {
                 Event::HandshakeDataReady => {}

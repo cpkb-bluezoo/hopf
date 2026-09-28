@@ -60,6 +60,9 @@ impl CapsuleParser {
     /// Returns `Err(())` if a capsule is malformed (inconsistent length /
     /// truncated after stream end is the caller's responsibility — call
     /// [`finish`](Self::finish) on clean FIN).
+    // Both callers (h1 client/server codecs) treat any failure alike, as a
+    // fatal protocol error — no caller inspects error detail today.
+    #[allow(clippy::result_unit_err)]
     pub fn push(&mut self, data: &[u8]) -> Result<Vec<Capsule>, ()> {
         self.buf.extend_from_slice(data);
         let mut out = Vec::new();
@@ -77,6 +80,7 @@ impl CapsuleParser {
 
     /// Signal that the receive side ended cleanly. Returns `Err` if a
     /// partial capsule remains (RFC 9297 §3.3).
+    #[allow(clippy::result_unit_err)]
     pub fn finish(&self) -> Result<(), ()> {
         if self.buf.is_empty() {
             Ok(())

@@ -1384,6 +1384,9 @@ impl ConnectedState for ConnectedView<'_> {
     }
 }
 
+/// Result of opening a user's mailbox on the storage executor.
+type OpenMailboxResult = Result<(Box<dyn MailboxStore>, Box<dyn Mailbox>), StorageError>;
+
 struct AuthView<'a> {
     endpoint: &'a mut dyn Endpoint,
     authorization: &'a mut Option<Box<dyn AuthorizationHandler>>,
@@ -1424,7 +1427,7 @@ impl AuthenticateState for AuthView<'_> {
                     .map_err(|e| e.to_string())?;
                 Ok((store, mb))
             },
-            move |result: Result<(Box<dyn MailboxStore>, Box<dyn Mailbox>), StorageError>| {
+            move |result: OpenMailboxResult| {
                 handle.with_endpoint(move |ep| {
                     match result {
                         Ok((store, mb)) => {

@@ -274,7 +274,7 @@ impl Quota {
     }
     /// Whether one more message can be stored without exceeding the limit.
     pub fn can_add_message(&self) -> bool {
-        self.message_limit < 0 || self.message_count + 1 <= self.message_limit
+        self.message_limit < 0 || self.message_count < self.message_limit
     }
 
     /// Record bytes added.
@@ -441,6 +441,9 @@ impl QuotaManager for UnlimitedQuotaManager {
     }
 }
 
+/// Signature of a [`MemoryQuotaManager`] role-lookup callback.
+type RoleLookupFn = Box<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+
 /// In-memory [`QuotaManager`]: usage tracked in the process, limits
 /// resolved user-specific → role-based → default → unlimited. When a user
 /// matches more than one role policy, the most generous storage limit
@@ -453,7 +456,7 @@ impl QuotaManager for UnlimitedQuotaManager {
 pub struct MemoryQuotaManager {
     users: Mutex<BTreeMap<String, Quota>>,
     roles: Vec<QuotaPolicy>,
-    role_lookup: Option<Box<dyn Fn(&str) -> Vec<String> + Send + Sync>>,
+    role_lookup: Option<RoleLookupFn>,
     default_policy: Option<QuotaPolicy>,
 }
 

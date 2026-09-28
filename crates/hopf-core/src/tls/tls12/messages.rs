@@ -246,7 +246,7 @@ pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
     if let Some(name) = params.server_name {
         let host = name.as_bytes();
         let mut sni = BytesMut::new();
-        sni.extend_from_slice(&((host.len() as u16 + 3)).to_be_bytes());
+        sni.extend_from_slice(&(host.len() as u16 + 3).to_be_bytes());
         sni.extend_from_slice(&[0u8]);
         sni.extend_from_slice(&(host.len() as u16).to_be_bytes());
         sni.extend_from_slice(host);
@@ -475,7 +475,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
                     ext::SUPPORTED_VERSIONS => {
                         if !data.is_empty() {
                             let list_len = data[0] as usize;
-                            if data.len() >= 1 + list_len {
+                            if data.len() > list_len {
                                 let mut versions = Vec::with_capacity(list_len / 2);
                                 let mut m = 1;
                                 while m + 2 <= 1 + list_len {

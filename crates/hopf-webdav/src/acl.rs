@@ -25,16 +25,6 @@ pub(crate) struct AclContext {
     pub roles: Option<Arc<dyn RolePolicy>>,
 }
 
-impl AclContext {
-    pub(crate) fn disabled() -> Self {
-        Self {
-            enabled: false,
-            username: None,
-            roles: None,
-        }
-    }
-}
-
 const LEAF_PRIVILEGES: &[&str] = &[
     PRIV_READ,
     PRIV_WRITE_PROPERTIES,

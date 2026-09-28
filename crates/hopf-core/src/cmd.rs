@@ -13,6 +13,7 @@ use mio::{Token, Waker};
 
 use crate::connection::{Stream, TcpConnection};
 use crate::connector::TcpConnParams;
+use crate::handle::Task;
 use crate::handler::ProtocolHandler;
 use crate::telemetry::TelemetryHook;
 use crate::udp::UdpDatagramHandler;
@@ -56,7 +57,7 @@ pub(crate) enum ReactorCmd {
         token: Token,
     },
     /// Run on the reactor thread (from [`crate::Endpoint::execute`] or internal).
-    Task(Box<dyn FnOnce() + Send>),
+    Task(Task),
     /// Run on the reactor thread with a specific connection as [`crate::Endpoint`].
     WithConn {
         /// Connection token.
@@ -69,7 +70,7 @@ pub(crate) enum ReactorCmd {
         /// Delay.
         delay: Duration,
         /// Callback.
-        callback: Box<dyn FnOnce() + Send>,
+        callback: Task,
         /// Cancel flag.
         cancelled: Arc<AtomicBool>,
     },
@@ -92,7 +93,7 @@ impl ReactorHandle {
     }
 
     /// Queue a task on the reactor thread.
-    pub fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+    pub fn execute(&self, task: Task) {
         self.send(ReactorCmd::Task(task));
     }
 
@@ -100,7 +101,7 @@ impl ReactorHandle {
     pub fn schedule_timer(
         &self,
         delay: Duration,
-        callback: Box<dyn FnOnce() + Send>,
+        callback: Task,
     ) -> Arc<AtomicBool> {
         let cancelled = Arc::new(AtomicBool::new(false));
         self.send(ReactorCmd::ScheduleTimer {

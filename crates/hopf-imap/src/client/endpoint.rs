@@ -267,7 +267,7 @@ impl ImapClientEndpoint {
             self.pending_issue_error = Some(msg.clone());
             return Err(msg);
         }
-        let tag = self.tags.next();
+        let tag = self.tags.next_tag();
         let cmd = PendingCommand {
             tag: tag.clone(),
             kind,
@@ -305,8 +305,7 @@ impl ImapClientEndpoint {
 
     fn format_id_cmd(fields: Option<&[(&str, &str)]>) -> String {
         match fields {
-            None => "ID NIL".into(),
-            Some(pairs) if pairs.is_empty() => "ID NIL".into(),
+            None | Some([]) => "ID NIL".into(),
             Some(pairs) => {
                 let mut parts = Vec::with_capacity(pairs.len() * 2);
                 for (k, v) in pairs {
@@ -1555,7 +1554,7 @@ impl ProtocolHandler for ImapClientEndpoint {
             *data = &[];
             return self.receive_plaintext(ep, &plaintext);
         }
-        self.receive_plaintext(ep, *data);
+        self.receive_plaintext(ep, data);
         *data = &[];
     }
 
@@ -1780,7 +1779,7 @@ mod tests {
             "127.0.0.1:0"
                 .parse::<std::net::SocketAddr>()
                 .map(hopf_core::PeerAddr::Inet)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                .map_err(io::Error::other)
         }
         fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
             self.local_addr()

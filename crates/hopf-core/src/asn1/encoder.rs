@@ -199,9 +199,7 @@ impl BerEncoder {
             panic!("Nesting too deep");
         }
         // Push a new buffer; tag is written first, length prepended on end.
-        let mut buf = Vec::new();
-        buf.push(tag);
-        self.stack.push(buf);
+        self.stack.push(vec![tag]);
     }
 
     fn end_construct(&mut self) {
@@ -290,7 +288,7 @@ fn encode_long(mut value: i64) -> Vec<u8> {
     let mut test = value;
     for i in 0..7 {
         let high = test >> 8;
-        if (test >= -128 && test <= 127)
+        if (-128..=127).contains(&test)
             && ((original >= 0 && (test & 0x80) == 0) || (original < 0 && (test & 0x80) != 0))
         {
             bytes = i + 1;

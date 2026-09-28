@@ -201,7 +201,7 @@ impl LdapCredentialStore {
         let need_starttls = cfg.has_starttls();
         let session = wait_for(self.config.timeout, |tx| {
             LdapClient::connect(self.config.runtime.as_ref(), cfg, move |r| {
-                let _ = tx.send(r);
+                tx.send(r);
             })
         })
         .and_then(std::convert::identity)?;
@@ -209,7 +209,7 @@ impl LdapCredentialStore {
         if need_starttls {
             wait_for(self.config.timeout, |tx| {
                 session.start_tls(move |r| {
-                    let _ = tx.send(r);
+                    tx.send(r);
                 });
                 Ok(())
             })
@@ -224,11 +224,11 @@ impl LdapCredentialStore {
         let result = wait_for(self.config.timeout, |tx| {
             if dn.is_empty() {
                 session.bind_anonymous(move |r| {
-                    let _ = tx.send(r);
+                    tx.send(r);
                 });
             } else {
                 session.bind(&dn, &password, move |r| {
-                    let _ = tx.send(r);
+                    tx.send(r);
                 });
             }
             Ok(())
@@ -268,7 +268,7 @@ impl LdapCredentialStore {
                     }
                 },
                 move |r| {
-                    let _ = tx.send(r);
+                    tx.send(r);
                 },
             );
             Ok(())
@@ -348,7 +348,7 @@ impl LdapCredentialStore {
             let session = self.connect_session(cfg)?;
             let result = wait_for(self.config.timeout, |tx| {
                 session.bind(dn, password, move |r| {
-                    let _ = tx.send(r);
+                    tx.send(r);
                 });
                 Ok(())
             })

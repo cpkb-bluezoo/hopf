@@ -394,8 +394,8 @@ impl ProtoFileParser {
                 None,
             )
         } else {
-            let full_type_name = if type_name.starts_with('.') {
-                type_name[1..].to_string()
+            let full_type_name = if let Some(rest) = type_name.strip_prefix('.') {
+                rest.to_string()
             } else if parent_full_name.is_empty() {
                 type_name.clone()
             } else {
@@ -601,15 +601,15 @@ impl ProtoFileParser {
             self.expect(';')?;
         }
 
-        let in_full = if input_type.starts_with('.') {
-            input_type[1..].to_string()
+        let in_full = if let Some(rest) = input_type.strip_prefix('.') {
+            rest.to_string()
         } else if pkg.is_empty() {
             input_type
         } else {
             format!("{pkg}.{input_type}")
         };
-        let out_full = if output_type.starts_with('.') {
-            output_type[1..].to_string()
+        let out_full = if let Some(rest) = output_type.strip_prefix('.') {
+            rest.to_string()
         } else if pkg.is_empty() {
             output_type
         } else {
@@ -673,7 +673,7 @@ impl ProtoFileParser {
                 if next == '/' {
                     self.pos += 2;
                     while self.pos < self.input.len()
-                        && self.input[self.pos..].chars().next() != Some('\n')
+                        && !self.input[self.pos..].starts_with('\n')
                     {
                         let ch = self.input[self.pos..].chars().next().unwrap();
                         self.pos += ch.len_utf8();

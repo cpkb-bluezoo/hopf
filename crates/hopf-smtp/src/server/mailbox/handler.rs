@@ -340,6 +340,8 @@ fn local_recipient_username(
 /// Returns `None` when at least one recipient succeeded (SMTP 250 — partial
 /// failures are reported via DSN so clients do not retry and duplicate).
 /// Returns `Some(error)` only when every recipient failed.
+// Each parameter is an independent delivery-context input threaded through from the caller.
+#[allow(clippy::too_many_arguments)]
 fn deliver_spooled(
     factory: &dyn MailboxFactory,
     recipients: &[(String, EmailAddress, DsnRecipientParams)],

@@ -127,7 +127,7 @@ impl BerDecoder {
             sink.decode_error(e);
             return;
         }
-        while let Some(element) = self.next() {
+        for element in self.by_ref() {
             sink.element(element);
         }
     }
@@ -140,11 +140,6 @@ impl BerDecoder {
         self.compact_if_needed();
         self.buffer.extend_from_slice(data);
         self.decode()
-    }
-
-    /// Returns the next complete element, or `None` if none available.
-    pub fn next(&mut self) -> Option<Asn1Element> {
-        self.completed.pop_front()
     }
 
     /// Returns whether there is data still being accumulated.
@@ -342,6 +337,15 @@ impl BerDecoder {
     }
 }
 
+impl Iterator for BerDecoder {
+    type Item = Asn1Element;
+
+    /// Returns the next complete element, or `None` if none available.
+    fn next(&mut self) -> Option<Asn1Element> {
+        self.completed.pop_front()
+    }
+}
+
 fn parse_children(data: &[u8], depth: usize) -> Result<Vec<Asn1Element>, Asn1Error> {
     if depth >= MAX_DEPTH {
         return Err(Asn1Error::new(format!(
@@ -353,7 +357,7 @@ fn parse_children(data: &[u8], depth: usize) -> Result<Vec<Asn1Element>, Asn1Err
     child_decoder.receive(data)?;
 
     let mut children = Vec::new();
-    while let Some(child) = child_decoder.next() {
+    for child in child_decoder.by_ref() {
         children.push(child);
     }
 
@@ -635,10 +639,6 @@ mod tests {
         // One nesting level beyond what the encoder itself will produce —
         // must be rejected with an error, not recursed into.
         let depth = 10_000;
-        let mut data = Vec::new();
-        for _ in 0..depth {
-            data.push(0x30); // SEQUENCE, constructed
-        }
         // Build lengths from the innermost element outward so every
         // declared length is correct definite-length BER (long-form once
         // nesting pushes the content past 127 bytes).

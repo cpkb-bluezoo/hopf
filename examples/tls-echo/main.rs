@@ -75,7 +75,7 @@ fn main() -> io::Result<()> {
     let dir = std::env::temp_dir().join("hopf-tls-echo");
     std::fs::create_dir_all(&dir)?;
     let cert = generate_simple_self_signed(vec!["localhost".into()])
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     let cert_path: PathBuf = dir.join("cert.pem");
     let key_path: PathBuf = dir.join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem())?;

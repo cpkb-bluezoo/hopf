@@ -56,9 +56,7 @@ pub fn parse_alt_svc_h3(value: &str) -> Option<AltSvcH3Entry> {
                 }
                 i += 1;
             }
-            let Some(colon_pos) = colon_pos else {
-                return None;
-            };
+            let colon_pos = colon_pos?;
             if i >= len {
                 return None;
             }

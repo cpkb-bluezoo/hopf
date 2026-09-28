@@ -71,6 +71,9 @@ impl DtlsServerMaterial {
     }
 }
 
+// See `DtlsEngine`'s doc comment: same one-time-per-connection allocation
+// tradeoff, not worth boxing across every match site here.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum MaterializedDtls {
     V13(DtlsRecordEngine),
     V12(Dtls12RecordEngine),
@@ -248,6 +251,10 @@ impl ClientNegotiator {
     }
 }
 
+// Same tradeoff as `MaterializedDtls` above: one allocation per negotiating
+// connection, already behind `NegotiatingDtls`'s own `Box` at its storage
+// site, so boxing the inner variant too buys little for a wider diff.
+#[allow(clippy::large_enum_variant)]
 enum NegotiatingDtlsInner {
     Server(ServerNegotiator),
     Client(ClientNegotiator),
@@ -257,7 +264,7 @@ enum NegotiatingDtlsInner {
 pub struct NegotiatingDtls(Box<NegotiatingDtlsInner>);
 
 impl NegotiatingDtls {
-    pub(crate) fn new(inner: NegotiatingDtlsInner) -> Self {
+    fn new(inner: NegotiatingDtlsInner) -> Self {
         Self(Box::new(inner))
     }
 

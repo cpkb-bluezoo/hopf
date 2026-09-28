@@ -28,6 +28,7 @@ pub(crate) struct ServerTlsMaterial {
 }
 
 /// Per-connection knobs applied when a fixed-version or post-pick server engine is built.
+#[derive(Default)]
 pub(crate) struct ServerEngineExtras {
     pub alpn: Option<Vec<Bytes>>,
     pub require_supported_versions: bool,
@@ -80,16 +81,6 @@ impl ServerTlsMaterial {
     }
 }
 
-impl Default for ServerEngineExtras {
-    fn default() -> Self {
-        Self {
-            alpn: None,
-            require_supported_versions: false,
-            record_size_limit: None,
-            ech_server: None,
-        }
-    }
-}
 
 /// Server-side version negotiation before a concrete record engine is chosen.
 pub(crate) struct ServerNegotiator {
@@ -239,6 +230,10 @@ impl ClientNegotiator {
 }
 
 /// Combined negotiator stored in [`TlsVariant::Negotiating`].
+///
+/// Same one-time-per-connection allocation tradeoff as the DTLS engine
+/// enums (see `dtls::driver::DtlsEngine`'s doc comment).
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum NegotiatingTls {
     Server(ServerNegotiator),
     Client(ClientNegotiator),
@@ -368,7 +363,7 @@ impl NegotiatingTls {
         match self {
             NegotiatingTls::Server(s) => {
                 if s.active.is_none() {
-                    s.buffer.extend_from_slice(*input);
+                    s.buffer.extend_from_slice(input);
                     *input = &[];
                     if !s.try_activate(sink) {
                         return;
@@ -380,7 +375,7 @@ impl NegotiatingTls {
             }
             NegotiatingTls::Client(c) => {
                 if c.active.is_none() {
-                    c.buffer.extend_from_slice(*input);
+                    c.buffer.extend_from_slice(input);
                     *input = &[];
                     if !c.try_activate(sink) {
                         return;

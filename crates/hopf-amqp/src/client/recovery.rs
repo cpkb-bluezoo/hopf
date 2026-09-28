@@ -43,7 +43,7 @@ use hopf_core::Runtime;
 use crate::codec::{BasicProperties, FieldTable};
 
 use super::facade::AmqpClient;
-use super::handlers::{AmqpClientControl, AmqpClientDriver, AmqpClientHandlerFactory};
+use super::handlers::{AmqpClientControl, AmqpClientDriver, AmqpClientHandlerFactory, BasicReturnInfo};
 
 /// Exponential backoff policy for reconnect attempts — thin wrapper over
 /// [`hopf_core::retry::RetryPolicy`] (issue #348) keeping this crate's own
@@ -190,6 +190,8 @@ impl Topology {
         self.channels.remove(&channel);
     }
 
+    // Each parameter is an independent piece of recovery state to replay after reconnect.
+    #[allow(clippy::too_many_arguments)]
     fn declare_exchange(
         &mut self,
         channel: u16,
@@ -220,6 +222,8 @@ impl Topology {
         }
     }
 
+    // Each parameter is an independent piece of recovery state to replay after reconnect.
+    #[allow(clippy::too_many_arguments)]
     fn declare_queue(
         &mut self,
         channel: u16,
@@ -279,6 +283,8 @@ impl Topology {
         }
     }
 
+    // Each parameter is an independent piece of recovery state to replay after reconnect.
+    #[allow(clippy::too_many_arguments)]
     fn consume(
         &mut self,
         channel: u16,
@@ -591,6 +597,10 @@ impl AmqpClientControl for TrackingControl<'_> {
 // RecoveringDriver — wraps the caller's driver, orchestrates replay/reconnect
 // ---------------------------------------------------------------------
 
+/// Callback that kicks off a reconnect attempt, installed once the current
+/// connection is set up and cleared while one is in flight.
+type ReconnectTrigger = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
 /// Cross-reconnect state shared by every [`RecoveringDriver`] instance
 /// [`RecoveringHandlerFactory::create`] produces (a new `RecoveringDriver`
 /// is built per physical connection, but this state persists across all of
@@ -603,7 +613,7 @@ struct SharedState {
     last_error: Arc<Mutex<Option<String>>>,
     closing: Arc<AtomicBool>,
     backoff_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
-    reconnect_trigger: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    reconnect_trigger: ReconnectTrigger,
     rt: Arc<Runtime>,
     policy: RecoveryPolicy,
     listener: Option<Arc<dyn RecoveryListener>>,
@@ -780,19 +790,8 @@ impl AmqpClientDriver for RecoveringDriver {
         self.shared.with_user_driver(|d| d.on_delivery_complete(&mut tracked, channel));
     }
 
-    fn on_return_start(
-        &mut self,
-        channel: u16,
-        reply_code: u16,
-        reply_text: &str,
-        exchange: &str,
-        routing_key: &str,
-        properties: &BasicProperties,
-        body_len: u64,
-    ) {
-        self.shared.with_user_driver(|d| {
-            d.on_return_start(channel, reply_code, reply_text, exchange, routing_key, properties, body_len)
-        });
+    fn on_return_start(&mut self, channel: u16, info: &BasicReturnInfo) {
+        self.shared.with_user_driver(|d| d.on_return_start(channel, info));
     }
 
     fn on_return_data(&mut self, channel: u16, data: &[u8]) {
@@ -932,7 +931,7 @@ struct RecoveringHandlerFactory {
     last_error: Arc<Mutex<Option<String>>>,
     closing: Arc<AtomicBool>,
     backoff_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
-    reconnect_trigger: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    reconnect_trigger: ReconnectTrigger,
     rt: Arc<Runtime>,
     policy: RecoveryPolicy,
     listener: Option<Arc<dyn RecoveryListener>>,
@@ -1004,7 +1003,7 @@ impl AmqpRecoveringClient {
     pub fn connect(self, factory: Arc<dyn AmqpClientHandlerFactory>) -> io::Result<AmqpRecoveringHandle> {
         let closing = Arc::new(AtomicBool::new(false));
         let backoff_cancel = Arc::new(Mutex::new(None));
-        let reconnect_trigger: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>> =
+        let reconnect_trigger: ReconnectTrigger =
             Arc::new(Mutex::new(None));
 
         let recovering_factory = Arc::new(RecoveringHandlerFactory {
@@ -1455,7 +1454,7 @@ mod tests {
 
         t.close_channel(1);
 
-        assert!(t.channels.get(&1).is_none());
-        assert!(t.channels.get(&2).is_some());
+        assert!(!t.channels.contains_key(&1));
+        assert!(t.channels.contains_key(&2));
     }
 }

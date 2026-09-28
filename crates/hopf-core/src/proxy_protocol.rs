@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn v1_line_without_crlf_within_max_length_is_rejected() {
         let mut buf = b"PROXY TCP4 ".to_vec();
-        buf.extend(std::iter::repeat(b'1').take(200));
+        buf.extend(std::iter::repeat_n(b'1', 200));
         assert!(try_parse_proxy_header(&buf).is_err());
     }
 

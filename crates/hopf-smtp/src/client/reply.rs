@@ -462,7 +462,7 @@ impl SmtpReplyLexer {
                 }
             }
             SmtpReplyShape::RcptTo => {
-                if matches!(code, 250 | 251 | 252) {
+                if matches!(code, 250..=252) {
                     Field::SkipToEol
                 } else {
                     Field::KeepText
@@ -664,7 +664,7 @@ impl SmtpReplyLexer {
                 }
             }
             SmtpReplyShape::RcptTo => {
-                if matches!(code, 250 | 251 | 252) {
+                if matches!(code, 250..=252) {
                     SmtpEvent::RcptOk
                 } else {
                     SmtpEvent::RcptRejected { code, message: message.unwrap_or_default() }
@@ -691,7 +691,7 @@ impl SmtpReplyLexer {
             SmtpReplyShape::Rset => SmtpEvent::RsetOk,
             SmtpReplyShape::Quit => return None, // no driver callback exists for QUIT
             SmtpReplyShape::Vrfy => {
-                if matches!(code, 250 | 251 | 252) {
+                if matches!(code, 250..=252) {
                     SmtpEvent::VrfyOk { code, text: message.unwrap_or_default() }
                 } else {
                     SmtpEvent::VrfyFailed { code, message: message.unwrap_or_default() }
@@ -1206,7 +1206,7 @@ mod tests {
         lex.expect(SmtpReplyShape::MailFrom);
         let mut junk = Vec::new();
         junk.extend_from_slice(b"250 ");
-        junk.extend(std::iter::repeat(b'x').take(MAX_REPLY_LINE * 4));
+        junk.extend(std::iter::repeat_n(b'x', MAX_REPLY_LINE * 4));
         junk.extend_from_slice(b"\r\n");
         let mut data: &[u8] = &junk;
         assert_eq!(lex.feed(&mut data).unwrap(), vec![SmtpEvent::MailOk]);
@@ -1218,7 +1218,7 @@ mod tests {
         lex.expect(SmtpReplyShape::MailFrom);
         let mut junk = Vec::new();
         junk.extend_from_slice(b"550 ");
-        junk.extend(std::iter::repeat(b'x').take(MAX_REPLY_LINE + 1));
+        junk.extend(std::iter::repeat_n(b'x', MAX_REPLY_LINE + 1));
         let mut data: &[u8] = &junk;
         assert!(lex.feed(&mut data).is_err());
     }

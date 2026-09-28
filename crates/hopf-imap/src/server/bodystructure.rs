@@ -40,6 +40,13 @@ use crate::server::fetch_format::format_nstring;
 const MAX_NESTED_MESSAGE_CAP: usize = 8 << 20;
 
 /// One MIME body part in a BODYSTRUCTURE tree.
+///
+/// `Leaf`'s several metadata fields make it larger than `Multipart` (whose
+/// children already live behind `Vec`'s own heap allocation); boxing would
+/// turn its named-field shape into a wrapped struct across every
+/// construction and match site in the BODYSTRUCTURE builder/parser for a
+/// data type populated once per FETCH response, not a hot loop.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum BodyStructureNode {
     /// A non-multipart leaf (`text/plain`, `application/pdf`,

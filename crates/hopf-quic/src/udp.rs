@@ -116,7 +116,7 @@ pub(crate) fn max_gso_segments() -> usize {
 }
 
 /// Slice a transmit buffer into UDP payloads honouring `segment_size`.
-pub(crate) fn udp_payloads<'a>(buf: &'a [u8], segment_size: Option<usize>) -> Vec<&'a [u8]> {
+pub(crate) fn udp_payloads(buf: &[u8], segment_size: Option<usize>) -> Vec<&[u8]> {
     match segment_size {
         Some(ss) if ss > 0 && buf.len() > ss => buf.chunks(ss).collect(),
         _ => vec![buf],

@@ -123,6 +123,10 @@ impl HandlerCell {
     /// while that `Parser` (the `self_cell` dependent) is alive, and
     /// `self_cell` heap-pins the owner so this pointer stays valid for as
     /// long as the `Parser` borrowing it does.
+    // clippy's `mut_from_ref` targets accidental aliasing from casting away
+    // constness; this is the deliberate `UnsafeCell` interior-mutability
+    // pattern instead, with the single-caller invariant documented above.
+    #[allow(clippy::mut_from_ref)]
     unsafe fn handler_mut(&self) -> &mut WebDavXmlHandler {
         unsafe { &mut *self.0.get() }
     }

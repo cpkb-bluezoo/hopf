@@ -63,9 +63,9 @@ impl Default for TransportParameters {
     fn default() -> Self {
         Self {
             initial_max_data: 10 * 1024 * 1024,
-            initial_max_stream_data_bidi_local: 1 * 1024 * 1024,
-            initial_max_stream_data_bidi_remote: 1 * 1024 * 1024,
-            initial_max_stream_data_uni: 1 * 1024 * 1024,
+            initial_max_stream_data_bidi_local: 1024 * 1024,
+            initial_max_stream_data_bidi_remote: 1024 * 1024,
+            initial_max_stream_data_uni: 1024 * 1024,
             initial_max_streams_bidi: 100,
             initial_max_streams_uni: 100,
             max_idle_timeout: 30_000,
@@ -182,9 +182,11 @@ impl TransportParameters {
 
     /// Decode from TLS extension payload (unknown IDs skipped).
     pub fn decode(mut buf: &[u8]) -> Option<Self> {
-        let mut tp = Self::default();
         // Omitted means peer does not support DATAGRAM (RFC 9221).
-        tp.max_datagram_frame_size = None;
+        let mut tp = Self {
+            max_datagram_frame_size: None,
+            ..Self::default()
+        };
         while !buf.is_empty() {
             let id = varint::decode(&mut buf)?;
             let len = varint::decode(&mut buf)? as usize;
@@ -274,8 +276,10 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let mut tp = TransportParameters::default();
-        tp.initial_src_cid = Some(ConnectionId::from_slice(&[1, 2, 3, 4]));
+        let tp = TransportParameters {
+            initial_src_cid: Some(ConnectionId::from_slice(&[1, 2, 3, 4])),
+            ..Default::default()
+        };
         let enc = tp.encode();
         let dec = TransportParameters::decode(&enc).unwrap();
         assert_eq!(dec.initial_max_data, tp.initial_max_data);
@@ -289,8 +293,10 @@ mod tests {
     /// zero or more Available Versions, all 32-bit and non-zero.
     #[test]
     fn version_information_round_trips() {
-        let mut tp = TransportParameters::default();
-        tp.version_information = Some(VersionInformation { chosen: 0x6b33_43cf, available: vec![0x6b33_43cf, 1] });
+        let tp = TransportParameters {
+            version_information: Some(VersionInformation { chosen: 0x6b33_43cf, available: vec![0x6b33_43cf, 1] }),
+            ..Default::default()
+        };
         let dec = TransportParameters::decode(&tp.encode()).unwrap();
         assert_eq!(dec.version_information, tp.version_information);
         assert!(!dec.version_information_invalid);
@@ -298,8 +304,10 @@ mod tests {
         let none = TransportParameters::decode(&TransportParameters::default().encode()).unwrap();
         assert!(none.version_information.is_none() && !none.version_information_invalid);
         // An empty Available Versions list is legal (a server may send it).
-        let mut empty = TransportParameters::default();
-        empty.version_information = Some(VersionInformation { chosen: 1, available: vec![] });
+        let empty = TransportParameters {
+            version_information: Some(VersionInformation { chosen: 1, available: vec![] }),
+            ..Default::default()
+        };
         let dec = TransportParameters::decode(&empty.encode()).unwrap();
         assert_eq!(dec.version_information, empty.version_information);
     }

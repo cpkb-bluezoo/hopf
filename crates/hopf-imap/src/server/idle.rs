@@ -213,9 +213,11 @@ mod tests {
 
     #[test]
     fn update_lines_exists_only_on_change() {
-        let mut prev = IdleState::default();
-        prev.last_exists = 2;
-        prev.last_messages = vec![snap(1, &[]), snap(2, &[])];
+        let prev = IdleState {
+            last_exists: 2,
+            last_messages: vec![snap(1, &[]), snap(2, &[])],
+            ..Default::default()
+        };
         let lines = idle_update_lines(
             &prev,
             &IdleMailboxSnapshot {
@@ -250,9 +252,11 @@ mod tests {
 
     #[test]
     fn no_recent_in_updates() {
-        let mut prev = IdleState::default();
-        prev.last_exists = 1;
-        prev.last_messages = vec![snap(1, &[])];
+        let prev = IdleState {
+            last_exists: 1,
+            last_messages: vec![snap(1, &[])],
+            ..Default::default()
+        };
         let lines = idle_update_lines(
             &prev,
             &IdleMailboxSnapshot {

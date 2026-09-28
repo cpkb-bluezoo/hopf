@@ -114,12 +114,9 @@ impl<H: ProtoMessageHandler> Handler for ProtoModelAdapter<H> {
             FieldType::Sint64 => {
                 ScalarValue::I64(((value >> 1) as i64) ^ (-((value & 1) as i64)))
             }
-            FieldType::Enum
-            | FieldType::Int64
-            | FieldType::Uint64
-            | FieldType::Fixed64
-            | FieldType::Sfixed64
-            | _ => ScalarValue::U64(value),
+            // Enum, Int64, Uint64, Fixed64, Sfixed64 (and any other varint
+            // field type) all pass the raw wire value through as-is.
+            _ => ScalarValue::U64(value),
         };
         self.emit_field(&name, val);
     }

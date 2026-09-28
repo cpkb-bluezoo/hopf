@@ -1128,7 +1128,7 @@ mod tests {
         lex.expect(Pop3ReplyShape::Noop);
         let mut junk = Vec::new();
         junk.extend_from_slice(b"-ERR ");
-        junk.extend(std::iter::repeat(b'x').take(MAX_REPLY_LINE + 1));
+        junk.extend(std::iter::repeat_n(b'x', MAX_REPLY_LINE + 1));
         let mut data: &[u8] = &junk;
         assert!(lex.feed(&mut data).is_err());
     }
@@ -1142,7 +1142,7 @@ mod tests {
         lex.expect(Pop3ReplyShape::Noop);
         let mut junk = Vec::new();
         junk.extend_from_slice(b"+OK ");
-        junk.extend(std::iter::repeat(b'x').take(MAX_REPLY_LINE * 4));
+        junk.extend(std::iter::repeat_n(b'x', MAX_REPLY_LINE * 4));
         junk.extend_from_slice(b"\r\n");
         let mut data: &[u8] = &junk;
         assert_eq!(lex.feed(&mut data).unwrap(), vec![Pop3Event::NoopOk]);

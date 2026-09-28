@@ -118,16 +118,7 @@ fn connect_subscribe_publish_fanout_round_trip() {
     publisher.write_all(&connect_packet("publisher")).unwrap();
     let _ = read_exact_timeout(&mut publisher, 4);
 
-    let publish_wire = encode::encode_publish(
-        "test/topic",
-        crate::codec::QoS::AtMostOnce,
-        false,
-        false,
-        0,
-        b"hello subscribers",
-        &Properties::new(),
-        ProtocolVersion::V311,
-    );
+    let publish_wire = encode::encode_publish(&encode::PublishFields { topic: "test/topic", qos: crate::codec::QoS::AtMostOnce, dup: false, retain: false, packet_id: 0, props: &Properties::new(), version: ProtocolVersion::V311 }, b"hello subscribers");
     publisher.write_all(&publish_wire).unwrap();
 
     // The subscriber should receive the forwarded PUBLISH.
@@ -171,16 +162,7 @@ fn qos1_subscriber_receives_large_multi_chunk_publish() {
     let mut publisher = wait_connect(addr);
     publisher.write_all(&connect_packet("qos1-publisher")).unwrap();
     let _ = read_exact_timeout(&mut publisher, 4);
-    let publish_wire = encode::encode_publish(
-        "big/topic",
-        crate::codec::QoS::AtLeastOnce,
-        false,
-        false,
-        0x55,
-        &payload,
-        &Properties::new(),
-        ProtocolVersion::V311,
-    );
+    let publish_wire = encode::encode_publish(&encode::PublishFields { topic: "big/topic", qos: crate::codec::QoS::AtLeastOnce, dup: false, retain: false, packet_id: 0x55, props: &Properties::new(), version: ProtocolVersion::V311 }, &payload);
     publisher.write_all(&publish_wire).unwrap();
     let puback = read_exact_timeout(&mut publisher, 4);
     assert_eq!(puback[0], 0x40, "expected PUBACK fixed header byte");
@@ -233,16 +215,7 @@ fn publish_over_max_payload_is_rejected() {
     publisher.write_all(&connect_packet("oversized-publisher")).unwrap();
     let _ = read_exact_timeout(&mut publisher, 4);
 
-    let publish_wire = encode::encode_publish(
-        "t",
-        crate::codec::QoS::AtMostOnce,
-        false,
-        false,
-        0,
-        b"this payload is over eight bytes",
-        &Properties::new(),
-        ProtocolVersion::V311,
-    );
+    let publish_wire = encode::encode_publish(&encode::PublishFields { topic: "t", qos: crate::codec::QoS::AtMostOnce, dup: false, retain: false, packet_id: 0, props: &Properties::new(), version: ProtocolVersion::V311 }, b"this payload is over eight bytes");
     publisher.write_all(&publish_wire).unwrap();
 
     // The server disconnects rather than accepting the oversized PUBLISH.
@@ -269,14 +242,16 @@ fn retained_message_delivered_on_new_subscribe() {
     publisher.write_all(&connect_packet("retainer")).unwrap();
     let _ = read_exact_timeout(&mut publisher, 4);
     let publish_wire = encode::encode_publish(
-        "status/online",
-        crate::codec::QoS::AtMostOnce,
-        false,
-        true, // retain
-        0,
+        &encode::PublishFields {
+            topic: "status/online",
+            qos: crate::codec::QoS::AtMostOnce,
+            dup: false,
+            retain: true, // retain
+            packet_id: 0,
+            props: &Properties::new(),
+            version: ProtocolVersion::V311,
+        },
         b"yes",
-        &Properties::new(),
-        ProtocolVersion::V311,
     );
     publisher.write_all(&publish_wire).unwrap();
     std::thread::sleep(Duration::from_millis(50));
@@ -344,16 +319,7 @@ fn v5_session_resume_after_unclean_disconnect_preserves_subscription() {
     let mut publisher = wait_connect(addr);
     publisher.write_all(&connect_packet("publisher")).unwrap();
     let _ = read_exact_timeout(&mut publisher, 4);
-    let publish_wire = encode::encode_publish(
-        "resume/topic",
-        crate::codec::QoS::AtMostOnce,
-        false,
-        false,
-        0,
-        b"still subscribed",
-        &Properties::new(),
-        ProtocolVersion::V311,
-    );
+    let publish_wire = encode::encode_publish(&encode::PublishFields { topic: "resume/topic", qos: crate::codec::QoS::AtMostOnce, dup: false, retain: false, packet_id: 0, props: &Properties::new(), version: ProtocolVersion::V311 }, b"still subscribed");
     publisher.write_all(&publish_wire).unwrap();
 
     let mut buf = vec![0u8; 256];
@@ -383,8 +349,9 @@ fn real_client_publishes_and_subscribes_against_real_server() {
 
     // Subscriber driver: on CONNACK, subscribe; report the first received
     // message body (topic, payload) back to the test thread.
+    type ReceivedMessageSender = mpsc::Sender<(String, Vec<u8>)>;
     struct SubDriver {
-        tx: Mutex<Option<mpsc::Sender<(String, Vec<u8>)>>>,
+        tx: Mutex<Option<ReceivedMessageSender>>,
         topic: Mutex<String>,
         buf: Mutex<Vec<u8>>,
     }
@@ -973,16 +940,7 @@ fn ws_subscriber_and_tcp_publisher_share_broker_state() {
     let mut publisher = wait_connect(tcp_addr);
     publisher.write_all(&connect_packet("tcp-publisher")).unwrap();
     let _ = read_exact_timeout(&mut publisher, 4);
-    let publish_wire = encode::encode_publish(
-        "ws/topic",
-        crate::codec::QoS::AtMostOnce,
-        false,
-        false,
-        0,
-        b"hello over ws",
-        &Properties::new(),
-        ProtocolVersion::V311,
-    );
+    let publish_wire = encode::encode_publish(&encode::PublishFields { topic: "ws/topic", qos: crate::codec::QoS::AtMostOnce, dup: false, retain: false, packet_id: 0, props: &Properties::new(), version: ProtocolVersion::V311 }, b"hello over ws");
     publisher.write_all(&publish_wire).unwrap();
 
     let received = read_ws_frame(&mut ws);

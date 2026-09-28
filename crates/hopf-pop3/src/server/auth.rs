@@ -143,7 +143,7 @@ mod tests {
         assert!(ts.starts_with('<') && ts.ends_with('>'));
         assert!(ts.ends_with("@mail.example.com>"));
         let inner = &ts[1..ts.len() - 1];
-        let parts: Vec<&str> = inner.splitn(2, '@').next().unwrap().split('.').collect();
+        let parts: Vec<&str> = inner.split('@').next().unwrap().split('.').collect();
         assert_eq!(parts.len(), 3, "expected pid.millis.nonce, got {inner:?}");
         let nonce = parts[2];
         assert_eq!(nonce.len(), 32, "128-bit nonce as hex");

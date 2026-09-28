@@ -17,7 +17,7 @@ use crate::cmd::{ReactorCmd, ReactorHandle};
 use crate::connector::TcpConnParams;
 use crate::endpoint::{Endpoint, TimerHandle, WriteReadyCallback};
 use crate::error::StartTlsError;
-use crate::handle::ConnHandle;
+use crate::handle::{ConnHandle, Task};
 use crate::handler::ProtocolHandler;
 use crate::listener::DEFAULT_BUFFER_SIZE;
 use crate::peer_addr::PeerAddr;
@@ -237,6 +237,8 @@ impl TlsRecordSink for TlsSinkAdapter<'_> {
 }
 
 impl TcpConnection {
+    // TCP connection constructor; each parameter is an independently-configurable handshake/socket setting.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         token: Token,
         stream: Stream,
@@ -866,9 +868,8 @@ impl Endpoint for TcpConnection {
         }
         self.closing = true;
         self.close_requested = true;
-        if self.tls.is_some() {
+        if let Some(tls) = self.tls.as_mut() {
             let mut outcome = TlsPumpOutcome::default();
-            let tls = self.tls.as_mut().expect("checked above");
             let mut adapter = TlsSinkAdapter {
                 net_out: &mut self.net_out,
                 app_in: &mut self.app_in,
@@ -941,11 +942,11 @@ impl Endpoint for TcpConnection {
         self.write_ready = callback;
     }
 
-    fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+    fn execute(&self, task: Task) {
         self.reactor.execute(task);
     }
 
-    fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+    fn schedule_timer(&self, delay: Duration, callback: Task) -> TimerHandle {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel_flag = Arc::clone(&cancelled);
         self.reactor.send(ReactorCmd::ScheduleTimer {

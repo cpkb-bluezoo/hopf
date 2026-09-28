@@ -251,7 +251,7 @@ pub fn parse_priority_update(payload: &[u8]) -> Option<(u32, &str)> {
 /// raw HPACK header block fragment.
 ///
 /// `flags` is the frame's flags byte.
-pub fn strip_headers_payload<'a>(payload: &'a [u8], flags: u8) -> &'a [u8] {
+pub fn strip_headers_payload(payload: &[u8], flags: u8) -> &[u8] {
     let mut pos = 0;
     let padded = flags & FLAG_PADDED != 0;
     let priority = flags & FLAG_PRIORITY != 0;
@@ -279,7 +279,7 @@ pub fn strip_headers_payload<'a>(payload: &'a [u8], flags: u8) -> &'a [u8] {
 }
 
 /// Strip the pad-length byte from a DATA payload if PADDED is set.
-pub fn strip_data_payload<'a>(payload: &'a [u8], flags: u8) -> &'a [u8] {
+pub fn strip_data_payload(payload: &[u8], flags: u8) -> &[u8] {
     if flags & FLAG_PADDED == 0 {
         return payload;
     }

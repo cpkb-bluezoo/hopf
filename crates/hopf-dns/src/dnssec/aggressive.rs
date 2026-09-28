@@ -373,7 +373,7 @@ impl DenialCache {
 }
 
 /// Deduplicate by pointer identity, keeping order.
-fn distinct<'a>(items: Vec<&'a Proof>) -> Vec<&'a Proof> {
+fn distinct(items: Vec<&Proof>) -> Vec<&Proof> {
     let mut out: Vec<&Proof> = Vec::new();
     for p in items {
         if !out.iter().any(|q| std::ptr::eq(*q, p)) {

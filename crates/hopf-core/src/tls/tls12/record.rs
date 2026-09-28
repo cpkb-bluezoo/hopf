@@ -230,7 +230,7 @@ fn write_encrypted_record(dir: &mut AeadDirection, content_type: u8, payload: &[
 
 fn write_fragmented<S: Tls12RecordSink + ?Sized>(state: &mut RecordState, content_type: u8, data: &[u8], sink: &mut S) {
     let mut out = Vec::new();
-    let chunks: Vec<&[u8]> = if data.is_empty() { vec![&data[..]] } else { data.chunks(MAX_FRAGMENT).collect() };
+    let chunks: Vec<&[u8]> = if data.is_empty() { vec![data] } else { data.chunks(MAX_FRAGMENT).collect() };
     for chunk in chunks {
         match state.write.as_mut() {
             Some(dir) => write_encrypted_record(dir, content_type, chunk, &mut out),

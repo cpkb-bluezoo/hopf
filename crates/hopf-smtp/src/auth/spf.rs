@@ -934,7 +934,10 @@ fn parse_ip6_network(s: &str) -> Result<(Ipv6Addr, u8), ()> {
     Ok((addr, cidr))
 }
 
-fn parse_domain_and_cidr(s: &str) -> Result<(Option<String>, Option<u8>, Option<u8>), ()> {
+/// `(domain, ipv4 CIDR prefix, ipv6 CIDR prefix)`.
+type DomainAndCidr = (Option<String>, Option<u8>, Option<u8>);
+
+fn parse_domain_and_cidr(s: &str) -> Result<DomainAndCidr, ()> {
     if s.is_empty() {
         return Ok((None, None, None));
     }

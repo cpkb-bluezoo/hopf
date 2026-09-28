@@ -834,7 +834,7 @@ mod tests {
         lex.expect(FtpReplyShape::Cmd { expect: 200 });
         let mut data = Vec::new();
         data.extend_from_slice(b"500 ");
-        data.extend(std::iter::repeat(b'x').take(MAX_REPLY_LINE + 1));
+        data.extend(std::iter::repeat_n(b'x', MAX_REPLY_LINE + 1));
         data.extend_from_slice(b"\r\n");
         let mut slice: &[u8] = &data;
         let err = lex.feed(&mut slice).unwrap_err();

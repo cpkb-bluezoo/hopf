@@ -99,22 +99,34 @@ pub fn encode_connack(session_present: bool, reason_code: u8, props: &Properties
     out
 }
 
+/// PUBLISH packet fields shared between [`encode_publish`] and
+/// [`encode_publish_header`] — everything except the payload itself, which
+/// the two functions take separately (materialized vs. streamed
+/// separately — see [`encode_publish`]'s doc comment).
+pub struct PublishFields<'a> {
+    /// Topic name.
+    pub topic: &'a str,
+    /// QoS level.
+    pub qos: QoS,
+    /// Redelivery flag.
+    pub dup: bool,
+    /// Retain flag.
+    pub retain: bool,
+    /// Packet identifier (ignored when `qos == QoS::AtMostOnce`).
+    pub packet_id: u16,
+    /// MQTT 5.0 properties (empty for a v3.1.1 packet).
+    pub props: &'a Properties,
+    /// Protocol version, since v5 properties are only encoded for v5.
+    pub version: ProtocolVersion,
+}
+
 /// Encode a complete PUBLISH packet (variable header + payload in one buffer).
 ///
 /// For streaming large payloads without materialising them alongside the
 /// header, encode the header alone with [`encode_publish_header`] and send
 /// the payload separately.
-pub fn encode_publish(
-    topic: &str,
-    qos: QoS,
-    dup: bool,
-    retain: bool,
-    packet_id: u16,
-    payload: &[u8],
-    props: &Properties,
-    version: ProtocolVersion,
-) -> Vec<u8> {
-    let mut out = encode_publish_header(topic, qos, dup, retain, packet_id, payload.len() as u64, props, version);
+pub fn encode_publish(fields: &PublishFields, payload: &[u8]) -> Vec<u8> {
+    let mut out = encode_publish_header(fields, payload.len() as u64);
     out.extend_from_slice(payload);
     out
 }
@@ -126,16 +138,8 @@ pub fn encode_publish(
 /// The Remaining Length written into the fixed header includes
 /// `payload_size`, so the receiver can determine the frame boundary from
 /// this header alone.
-pub fn encode_publish_header(
-    topic: &str,
-    qos: QoS,
-    dup: bool,
-    retain: bool,
-    packet_id: u16,
-    payload_size: u64,
-    props: &Properties,
-    version: ProtocolVersion,
-) -> Vec<u8> {
+pub fn encode_publish_header(fields: &PublishFields, payload_size: u64) -> Vec<u8> {
+    let PublishFields { topic, qos, dup, retain, packet_id, props, version } = *fields;
     let v5 = version.is_v5();
     let mut var_header = Vec::new();
     write_utf8(&mut var_header, topic);
@@ -337,20 +341,11 @@ mod tests {
         let mut props = Properties::new();
         props.set_byte(crate::codec::properties::property::PAYLOAD_FORMAT_INDICATOR, 1);
         let payload = b"hello world";
-        let header = encode_publish_header(
-            "sensors/temp",
-            QoS::AtLeastOnce,
-            false,
-            true,
-            99,
-            payload.len() as u64,
-            &props,
-            ProtocolVersion::V5,
-        );
+        let header = encode_publish_header(&PublishFields { topic: "sensors/temp", qos: QoS::AtLeastOnce, dup: false, retain: true, packet_id: 99, props: &props, version: ProtocolVersion::V5 }, payload.len() as u64);
         let mut full = header.clone();
         full.extend_from_slice(payload);
 
-        let one_shot = encode_publish("sensors/temp", QoS::AtLeastOnce, false, true, 99, payload, &props, ProtocolVersion::V5);
+        let one_shot = encode_publish(&PublishFields { topic: "sensors/temp", qos: QoS::AtLeastOnce, dup: false, retain: true, packet_id: 99, props: &props, version: ProtocolVersion::V5 }, payload);
         assert_eq!(full, one_shot);
 
         // Decode: skip fixed header (type+flags byte + varint), then var-header.

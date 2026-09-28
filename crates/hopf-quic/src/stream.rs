@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hopf_core::{
-    ConnHandle, ConnHandleBackend, Endpoint, SecurityInfo, StartTlsError, TimerHandle,
-    WriteReadyCallback,
+    ConnHandle, ConnHandleBackend, Endpoint, EndpointTask, ExecuteFn, SecurityInfo, StartTlsError,
+    Task, TimerHandle, WriteReadyCallback,
 };
 
 use crate::driver::DriverCmd;
@@ -27,11 +27,11 @@ struct QuicStreamBackend {
     stream_id: StreamId,
     cmd_tx: std::sync::mpsc::Sender<DriverCmd>,
     waker: Arc<mio::Waker>,
-    execute: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
+    execute: ExecuteFn,
 }
 
 impl ConnHandleBackend for QuicStreamBackend {
-    fn with_endpoint(&self, task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>) {
+    fn with_endpoint(&self, task: EndpointTask) {
         let _ = self.cmd_tx.send(DriverCmd::WithStream {
             conn: self.conn,
             stream_id: self.stream_id,
@@ -40,7 +40,7 @@ impl ConnHandleBackend for QuicStreamBackend {
         let _ = self.waker.wake();
     }
 
-    fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+    fn execute(&self, task: Task) {
         (self.execute)(task);
     }
 
@@ -51,7 +51,7 @@ impl ConnHandleBackend for QuicStreamBackend {
         true
     }
 
-    fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+    fn schedule_timer(&self, delay: Duration, callback: Task) -> TimerHandle {
         // Route through the driver's own timer queue (DriverCmd::
         // ScheduleTimer, already handled in drain_cmds) — the same
         // mechanism QuicStreamEndpoint::schedule_timer already uses, now
@@ -105,7 +105,7 @@ pub struct QuicStreamEndpoint {
     queues: Arc<Mutex<StreamQueues>>,
     cmd_tx: std::sync::mpsc::Sender<DriverCmd>,
     waker: Arc<mio::Waker>,
-    execute: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
+    execute: ExecuteFn,
     write_ready: Option<WriteReadyCallback>,
     read_paused: bool,
     /// Set by [`Endpoint::poke_handler`], consumed by the driver right
@@ -125,7 +125,7 @@ impl QuicStreamEndpoint {
         queues: Arc<Mutex<StreamQueues>>,
         cmd_tx: std::sync::mpsc::Sender<DriverCmd>,
         waker: Arc<mio::Waker>,
-        execute: Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
+        execute: ExecuteFn,
     ) -> Self {
         Self {
             stream_id,
@@ -302,11 +302,11 @@ impl Endpoint for QuicStreamEndpoint {
         self.wants_poke = true;
     }
 
-    fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+    fn execute(&self, task: Task) {
         (self.execute)(task);
     }
 
-    fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+    fn schedule_timer(&self, delay: Duration, callback: Task) -> TimerHandle {
         let cancelled = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancelled);
         let _ = self.cmd_tx.send(DriverCmd::ScheduleTimer {

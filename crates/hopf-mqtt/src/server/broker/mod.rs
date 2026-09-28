@@ -443,9 +443,7 @@ impl BrokerState {
                     let Some((conn, version, _, _)) = try_reserve_delivery(sub, effective_qos) else {
                         continue;
                     };
-                    let header = crate::codec::encode::encode_publish_header(
-                        topic, effective_qos, false, effective_retain, 0, payload_len, properties, version,
-                    );
+                    let header = crate::codec::encode::encode_publish_header(&crate::codec::encode::PublishFields { topic, qos: effective_qos, dup: false, retain: effective_retain, packet_id: 0, props: properties, version }, payload_len);
                     conn.send(header);
                     live.push(conn);
                 } else {
@@ -547,9 +545,7 @@ impl BrokerState {
                             }
                         }
                         None => {
-                            let header = crate::codec::encode::encode_publish_header(
-                                &topic_op, effective_qos, false, effective_retain, packet_id, 0, &properties_op, version,
-                            );
+                            let header = crate::codec::encode::encode_publish_header(&crate::codec::encode::PublishFields { topic: &topic_op, qos: effective_qos, dup: false, retain: effective_retain, packet_id, props: &properties_op, version }, 0);
                             c.send(header);
                             Ok(None)
                         }
@@ -659,16 +655,7 @@ impl BrokerState {
             }
         };
         drop(subscribers);
-        let wire = crate::codec::encode::encode_publish(
-            &msg.topic,
-            msg.qos,
-            dup,
-            msg.retain,
-            packet_id,
-            &msg.payload,
-            &msg.properties,
-            version,
-        );
+        let wire = crate::codec::encode::encode_publish(&crate::codec::encode::PublishFields { topic: &msg.topic, qos: msg.qos, dup, retain: msg.retain, packet_id, props: &msg.properties, version }, &msg.payload);
         conn.send(wire);
         if msg.qos != QoS::AtMostOnce && forced_packet_id.is_none() {
             self.store.track_inflight(id, packet_id, msg.clone());
@@ -762,9 +749,7 @@ impl BrokerState {
                         atomic_send,
                     ),
                     None => {
-                        let header = crate::codec::encode::encode_publish_header(
-                            &topic_owned, effective_qos, false, true, packet_id, 0, &props, version,
-                        );
+                        let header = crate::codec::encode::encode_publish_header(&crate::codec::encode::PublishFields { topic: &topic_owned, qos: effective_qos, dup: false, retain: true, packet_id, props: &props, version }, 0);
                         c.send(header);
                     }
                 }
@@ -840,9 +825,7 @@ fn stream_file_publish(
     version: ProtocolVersion,
     atomic: bool,
 ) {
-    let mut header = crate::codec::encode::encode_publish_header(
-        topic, qos, false, retain, packet_id, payload_size, properties, version,
-    );
+    let mut header = crate::codec::encode::encode_publish_header(&crate::codec::encode::PublishFields { topic, qos, dup: false, retain, packet_id, props: properties, version }, payload_size);
     if atomic {
         if let Ok(mut f) = std::fs::File::open(path) {
             let _ = f.read_to_end(&mut header);

@@ -11,7 +11,7 @@ use std::time::Duration;
 use hopf_core::{ConnHandle, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
 use hopf_http::{
     connect_http, CleartextHttpEndpoint, ClientHandler, ClientHandlerFactory, ClientWriter,
-    Headers, HttpClientTimeouts, HttpLimits, ServerHandlerFactory,
+    DialSettings, Headers, HttpClientTimeouts, HttpLimits, ServerHandlerFactory,
 };
 use crate::{
     calculate_accept, write_frame, EchoFactory, Opcode, WebSocketConfig, WebSocketFactory,
@@ -182,10 +182,8 @@ fn h1_websocket_client_round_trip() {
         &addr.ip().to_string(),
         addr.port(),
         factory,
-        HttpLimits::default(),
         false,
-        HttpClientTimeouts::default(),
-        None,
+        DialSettings { limits: HttpLimits::default(), timeouts: HttpClientTimeouts::default(), resolver: None },
     )
     .unwrap();
 

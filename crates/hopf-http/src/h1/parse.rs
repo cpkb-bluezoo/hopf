@@ -844,8 +844,10 @@ mod tests {
     #[test]
     fn counted_body_streams_without_buffering() {
         let mut sc = req_scanner();
-        let mut r = Rec::default();
-        r.after_headers = Some(Next::Body(11));
+        let mut r = Rec {
+            after_headers: Some(Next::Body(11)),
+            ..Default::default()
+        };
         sc.push(b"POST / HTTP/1.1\r\nHost: h\r\n\r\nhello ", &mut r);
         sc.push(b"world", &mut r);
         let bodies: Vec<Vec<u8>> = r
@@ -863,9 +865,11 @@ mod tests {
     #[test]
     fn chunked_body_size_data_crlf_cycle() {
         let mut sc = req_scanner();
-        let mut r = Rec::default();
-        r.after_headers = Some(Next::ChunkSize);
-        r.after_chunk_size = Some(Next::ChunkBody(5));
+        let mut r = Rec {
+            after_headers: Some(Next::ChunkSize),
+            after_chunk_size: Some(Next::ChunkBody(5)),
+            ..Default::default()
+        };
         sc.push(b"POST / HTTP/1.1\r\nHost: h\r\n\r\n5\r\nhello\r\n", &mut r);
         assert!(r.evs.contains(&Ev::ChunkSize("5".into())), "{:?}", r.evs);
         assert!(r.evs.contains(&Ev::Body(b"hello".to_vec())), "{:?}", r.evs);

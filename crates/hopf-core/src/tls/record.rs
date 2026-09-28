@@ -294,7 +294,7 @@ fn write_fragmented<S: TlsRecordSink + ?Sized>(state: &mut RecordState, content_
         Epoch::Plaintext => MAX_FRAGMENT,
         Epoch::Handshake | Epoch::Application => state.send_content_max,
     };
-    for chunk in if data.is_empty() { vec![&data[..]] } else { data.chunks(max).collect() } {
+    for chunk in if data.is_empty() { vec![data] } else { data.chunks(max).collect() } {
         match state.epoch {
             Epoch::Plaintext => write_plaintext_record(content_type, chunk, &mut out),
             Epoch::Handshake | Epoch::Application => {
@@ -894,7 +894,7 @@ mod tests {
         let (mut sink_c, mut sink_s, mut client, mut server) =
             run_loopback_with(configs_with_limits(Some(200), Some(64)));
         let mark = sink_c.all_written.len();
-        client.send_application_data(&vec![7u8; 63 * 3], &mut sink_c);
+        client.send_application_data(&[7u8; 63 * 3], &mut sink_c);
         // The server's limit is 64: each record holds 63 content octets + 1 type octet.
         let lens = protected(&sink_c.all_written[mark..]);
         assert_eq!(lens, vec![64 + TAG; 3], "exactly three records of 64 inner octets");
@@ -999,13 +999,13 @@ mod tests {
             run_loopback_with(configs_with_limits(Some(200), Some(200)));
         let _ = &mut client;
         // 199 content + 1 type = 200 inner octets: exactly the limit.
-        server.send_application_data(&vec![3u8; 199], &mut sink_s);
+        server.send_application_data(&[3u8; 199], &mut sink_s);
         relay(&mut sink_s, &mut client, &mut sink_c);
         assert_eq!(all_app_data(&sink_c).len(), 199, "{:?}", sink_c.events);
         assert!(!sink_c.events.iter().any(|e| e.starts_with("protocol_error")));
         // 200 content + 1 type = 201: one over.
         server.state.send_content_max = MAX_FRAGMENT;
-        server.send_application_data(&vec![3u8; 200], &mut sink_s);
+        server.send_application_data(&[3u8; 200], &mut sink_s);
         relay(&mut sink_s, &mut client, &mut sink_c);
         assert!(sink_c.events.iter().any(|e| e.starts_with("protocol_error")), "{:?}", sink_c.events);
         let _ = (&mut sink_s, &mut server);

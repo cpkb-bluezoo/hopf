@@ -11,6 +11,16 @@ use mio::Token;
 use crate::cmd::{ReactorCmd, ReactorHandle};
 use crate::endpoint::{Endpoint, TimerHandle};
 
+/// A unit of work handed to [`ConnHandle::execute`] / [`ConnHandleBackend::execute`].
+pub type Task = Box<dyn FnOnce() + Send>;
+
+/// A unit of work handed to [`ConnHandle::with_endpoint`] / [`ConnHandleBackend::with_endpoint`].
+pub type EndpointTask = Box<dyn FnOnce(&mut dyn Endpoint) + Send>;
+
+/// An executor callback backing [`ConnHandle::from_execute`] — runs a
+/// [`Task`] wherever the handle's owner considers appropriate.
+pub type ExecuteFn = Arc<dyn Fn(Task) + Send + Sync>;
+
 /// Backend for a [`ConnHandle`] that can genuinely service
 /// [`ConnHandle::with_endpoint`] without being a `hopf-core` TCP connection —
 /// e.g. a QUIC stream on its own driver thread (see
@@ -20,13 +30,13 @@ use crate::endpoint::{Endpoint, TimerHandle};
 /// just a bare executor.
 pub trait ConnHandleBackend: Send + Sync {
     /// See [`ConnHandle::with_endpoint`].
-    fn with_endpoint(&self, task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>);
+    fn with_endpoint(&self, task: EndpointTask);
     /// See [`ConnHandle::execute`].
-    fn execute(&self, task: Box<dyn FnOnce() + Send>);
+    fn execute(&self, task: Task);
     /// See [`ConnHandle::is_probably_open`].
     fn is_probably_open(&self) -> bool;
     /// See [`ConnHandle::schedule_timer`].
-    fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle;
+    fn schedule_timer(&self, delay: Duration, callback: Task) -> TimerHandle;
 }
 
 /// Cloneable handle to a connection pinned to one reactor.
@@ -51,7 +61,7 @@ enum ConnHandleInner {
     /// [`ConnHandleInner::Custom`] instead when there's a real endpoint
     /// to reach, just not through a `hopf-core` reactor token.
     Tasks {
-        execute: std::sync::Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
+        execute: ExecuteFn,
     },
     /// A non-TCP transport that can genuinely service every `ConnHandle`
     /// operation via its own dispatch mechanism (e.g. a QUIC driver
@@ -81,9 +91,7 @@ impl ConnHandle {
     /// Handle that only supports [`execute`](Self::execute) (no TCP `with_endpoint`).
     ///
     /// Used by QUIC stream endpoints whose I/O lives on a dedicated driver thread.
-    pub fn from_execute(
-        execute: std::sync::Arc<dyn Fn(Box<dyn FnOnce() + Send>) + Send + Sync>,
-    ) -> Self {
+    pub fn from_execute(execute: ExecuteFn) -> Self {
         Self {
             inner: ConnHandleInner::Tasks { execute },
         }
@@ -113,7 +121,7 @@ impl ConnHandle {
     }
 
     /// Queue a task on the owning reactor (no endpoint borrow).
-    pub fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+    pub fn execute(&self, task: Task) {
         match &self.inner {
             ConnHandleInner::Tcp { reactor, .. } => reactor.execute(task),
             ConnHandleInner::Tasks { execute } => execute(task),
@@ -233,7 +241,7 @@ impl ConnHandle {
     ///
     /// Used by layered protocols (e.g. MQTT-over-WebSocket) that hold a
     /// [`ConnHandle`] but not a live [`Endpoint`] borrow.
-    pub fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+    pub fn schedule_timer(&self, delay: Duration, callback: Task) -> TimerHandle {
         match &self.inner {
             ConnHandleInner::Tcp { reactor, .. } => {
                 let cancelled = reactor.schedule_timer(delay, callback);
@@ -341,10 +349,10 @@ mod tests {
         fn pause_read(&mut self) {}
         fn resume_read(&mut self) {}
         fn on_write_ready(&mut self, _callback: Option<crate::endpoint::WriteReadyCallback>) {}
-        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+        fn execute(&self, task: Task) {
             task();
         }
-        fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        fn schedule_timer(&self, _delay: Duration, _callback: Task) -> TimerHandle {
             TimerHandle::new(|| {})
         }
         fn handle(&self) -> ConnHandle {
@@ -358,19 +366,19 @@ mod tests {
     }
 
     impl ConnHandleBackend for FakeBackend {
-        fn with_endpoint(&self, task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>) {
+        fn with_endpoint(&self, task: EndpointTask) {
             self.with_endpoint_calls.fetch_add(1, Ordering::SeqCst);
             let mut ep = FakeEndpoint;
             task(&mut ep);
         }
-        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+        fn execute(&self, task: Task) {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
             task();
         }
         fn is_probably_open(&self) -> bool {
             true
         }
-        fn schedule_timer(&self, _delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        fn schedule_timer(&self, _delay: Duration, callback: Task) -> TimerHandle {
             callback();
             TimerHandle::new(|| {})
         }

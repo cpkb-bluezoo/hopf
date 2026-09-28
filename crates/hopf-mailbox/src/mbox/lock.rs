@@ -122,7 +122,7 @@ fn is_stale(lock_path: &Path) -> bool {
         .and_then(|modified| {
             modified
                 .elapsed()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+                .map_err(io::Error::other)
         })
         .map(|age| age > STALE_LOCK_AGE)
         .unwrap_or(false)

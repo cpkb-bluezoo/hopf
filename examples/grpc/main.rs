@@ -59,10 +59,10 @@ impl ProtoMessageHandler for EchoHandler {
         let mut msg = self
             .response
             .open_message(None)
-            .map_err(|e| ProtoParseError::new(e))?;
+            .map_err(ProtoParseError::new)?;
         msg.field("text", ScalarValue::String(self.text.clone()))
-            .map_err(|e| ProtoParseError::new(e))?;
-        msg.complete().map_err(|e| ProtoParseError::new(e))?;
+            .map_err(ProtoParseError::new)?;
+        msg.complete().map_err(ProtoParseError::new)?;
         Ok(())
     }
     fn field(&mut self, name: &str, value: ScalarValue) -> Result<(), ProtoParseError> {

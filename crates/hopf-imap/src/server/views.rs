@@ -20,8 +20,8 @@ use crate::server::handler::{
     AppendState, AuthenticateState, AuthenticatedHandler, CloseState, ConnectedState, CopyState,
     CreateState, DeleteState, ExpungeState, FetchState, GetMetadataState, ListState, MoveState,
     NotAuthenticatedHandler, RenameState, SearchState, SelectState, SelectedHandler,
-    SetMetadataState, SortState, StatusState, StoreAction, StoreState, SubscribeState,
-    ThreadState,
+    SetMetadataState, SortState, StatusState, StoreAction, StoreRequest, StoreState,
+    SubscribeState, ThreadState,
 };
 use crate::server::metadata::GetMetadataOptions;
 use crate::server::reply::{format_list_attrs, quote_astring, tagged_no, tagged_ok, untagged};
@@ -947,15 +947,8 @@ pub(crate) struct StoreView<'a> {
 }
 
 impl StoreState for StoreView<'_> {
-    fn proceed(
-        &mut self,
-        action: StoreAction,
-        flags: BTreeSet<Flag>,
-        keywords: BTreeSet<String>,
-        silent: bool,
-        by_uid: bool,
-        handler: Box<dyn SelectedHandler>,
-    ) {
+    fn proceed(&mut self, request: StoreRequest, by_uid: bool, handler: Box<dyn SelectedHandler>) {
+        let StoreRequest { action, flags, keywords, silent } = request;
         let Some(handle) = self.control_handle.clone() else {
             self.endpoint.send(&tagged_no(self.tag, "Internal error"));
             return;

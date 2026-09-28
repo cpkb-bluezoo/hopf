@@ -1159,7 +1159,7 @@ impl H2Endpoint {
                     self.encoder.set_max_size(val as usize);
                 }
                 SETTINGS_MAX_FRAME_SIZE => {
-                    if val < 16_384 || val > 16_777_215 {
+                    if !(16_384..=16_777_215).contains(&val) {
                         self.send_goaway(ERROR_PROTOCOL_ERROR);
                         return;
                     }

@@ -294,8 +294,7 @@ impl FtpControlHandler {
                         Err(e) => {
                             self.fail(
                                 endpoint,
-                                FtpError::Io(io::Error::new(
-                                    io::ErrorKind::Other,
+                                FtpError::Io(io::Error::other(
                                     format!("start_client_tls: {e}"),
                                 )),
                             );

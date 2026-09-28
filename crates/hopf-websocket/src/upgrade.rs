@@ -255,7 +255,6 @@ impl FrameBridge<'_> {
                 if let Ok(s) = std::str::from_utf8(payload) {
                     self.event.text_message(&mut session, s);
                 } else {
-                    drop(session);
                     self.fail(1007, WsFrameError::Protocol("invalid utf-8 text"));
                 }
             }

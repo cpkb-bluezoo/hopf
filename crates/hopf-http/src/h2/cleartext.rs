@@ -241,11 +241,9 @@ impl ProtocolHandler for CleartextHttpEndpoint {
         match &mut self.phase {
             Phase::H1(ep) => {
                 ep.receive(endpoint, data);
-                return;
             }
             Phase::H2(ep) => {
                 ep.receive(endpoint, data);
-                return;
             }
             Phase::Sniff => {
                 self.buf.extend_from_slice(data);

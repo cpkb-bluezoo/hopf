@@ -135,7 +135,7 @@ fn main() -> io::Result<()> {
         }
         Some(false) => {
             eprintln!("fetch failed");
-            return Err(io::Error::new(io::ErrorKind::Other, "IMAP fetch failed"));
+            return Err(io::Error::other("IMAP fetch failed"));
         }
         None => {
             eprintln!("timeout — no response within 30 s");

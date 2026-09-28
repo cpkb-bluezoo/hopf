@@ -450,16 +450,7 @@ mod tests {
         let mut handler = Collect::default();
 
         let payload = vec![0xABu8; 200_000];
-        let wire = encode::encode_publish(
-            "big/topic",
-            QoS::AtMostOnce,
-            false,
-            false,
-            0,
-            &payload,
-            &Properties::new(),
-            ProtocolVersion::V5,
-        );
+        let wire = encode::encode_publish(&encode::PublishFields { topic: "big/topic", qos: QoS::AtMostOnce, dup: false, retain: false, packet_id: 0, props: &Properties::new(), version: ProtocolVersion::V5 }, &payload);
 
         // Feed in small, irregular chunks straddling the header/payload boundary.
         let mut max_buffered = 0usize;
@@ -479,16 +470,7 @@ mod tests {
     fn qos1_publish_then_puback_round_trip() {
         let mut parser = MqttFrameParser::new(ProtocolVersion::V311);
         let mut handler = Collect::default();
-        let mut wire = encode::encode_publish(
-            "t",
-            QoS::AtLeastOnce,
-            false,
-            false,
-            42,
-            b"payload",
-            &Properties::new(),
-            ProtocolVersion::V311,
-        );
+        let mut wire = encode::encode_publish(&encode::PublishFields { topic: "t", qos: QoS::AtLeastOnce, dup: false, retain: false, packet_id: 42, props: &Properties::new(), version: ProtocolVersion::V311 }, b"payload");
         wire.extend_from_slice(&encode::encode_puback(42, 0, &Properties::new(), ProtocolVersion::V311));
 
         parser.push(&wire, &mut handler);
@@ -537,16 +519,7 @@ mod tests {
         let mut parser = MqttFrameParser::new(ProtocolVersion::V311);
         parser.set_max_packet_size(10);
         let mut handler = Collect::default();
-        let wire = encode::encode_publish(
-            "t",
-            QoS::AtMostOnce,
-            false,
-            false,
-            0,
-            &[0u8; 100],
-            &Properties::new(),
-            ProtocolVersion::V311,
-        );
+        let wire = encode::encode_publish(&encode::PublishFields { topic: "t", qos: QoS::AtMostOnce, dup: false, retain: false, packet_id: 0, props: &Properties::new(), version: ProtocolVersion::V311 }, &[0u8; 100]);
         parser.push(&wire, &mut handler);
         assert_eq!(handler.errors.len(), 1);
         assert!(matches!(handler.errors[0], MqttError::PacketTooLarge { .. }));

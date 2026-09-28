@@ -38,7 +38,7 @@ impl FtpError {
     pub fn into_io(self) -> io::Error {
         match self {
             Self::Io(e) => e,
-            other => io::Error::new(io::ErrorKind::Other, other.to_string()),
+            other => io::Error::other(other.to_string()),
         }
     }
 }

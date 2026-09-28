@@ -1444,9 +1444,7 @@ mod publish_finish_tests {
         let after_connack = ep.sent.len();
 
         let payload = vec![0x5A; 64 * 1024];
-        let publish = encode::encode_publish(
-            "t/deferred", QoS::AtLeastOnce, false, true, 42, &payload, &Properties::new(), ProtocolVersion::V311,
-        );
+        let publish = encode::encode_publish(&encode::PublishFields { topic: "t/deferred", qos: QoS::AtLeastOnce, dup: false, retain: true, packet_id: 42, props: &Properties::new(), version: ProtocolVersion::V311 }, &payload);
         data = publish.into_boxed_slice();
         h.receive(&mut ep, &mut &*data);
 
@@ -1511,12 +1509,8 @@ mod publish_finish_tests {
 
         let payload_a = vec![0xAA; 32 * 1024];
         let payload_b = vec![0xBB; 48 * 1024];
-        let publish_a = encode::encode_publish(
-            "t/a", QoS::AtLeastOnce, false, true, 1, &payload_a, &Properties::new(), ProtocolVersion::V311,
-        );
-        let publish_b = encode::encode_publish(
-            "t/b", QoS::AtLeastOnce, false, true, 2, &payload_b, &Properties::new(), ProtocolVersion::V311,
-        );
+        let publish_a = encode::encode_publish(&encode::PublishFields { topic: "t/a", qos: QoS::AtLeastOnce, dup: false, retain: true, packet_id: 1, props: &Properties::new(), version: ProtocolVersion::V311 }, &payload_a);
+        let publish_b = encode::encode_publish(&encode::PublishFields { topic: "t/b", qos: QoS::AtLeastOnce, dup: false, retain: true, packet_id: 2, props: &Properties::new(), version: ProtocolVersion::V311 }, &payload_b);
         data = publish_a.into_boxed_slice();
         h.receive(&mut ep, &mut &*data);
         data = publish_b.into_boxed_slice();

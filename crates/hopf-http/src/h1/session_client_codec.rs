@@ -266,7 +266,7 @@ impl H1SessionInner {
         self.fatal = Some(err);
         self.cancel_stage_timer();
         if let Some(mut h) = self.response_handler.take() {
-            h.failed(io::Error::new(io::ErrorKind::Other, "HTTP protocol error"));
+            h.failed(io::Error::other("HTTP protocol error"));
         }
     }
 
@@ -483,10 +483,7 @@ impl H1SessionInner {
             }
         }
 
-        if status == 204 || status == 304 {
-            self.content_length = Some(0);
-            self.chunked = false;
-        } else if self.req_method.eq_ignore_ascii_case("HEAD") {
+        if status == 204 || status == 304 || self.req_method.eq_ignore_ascii_case("HEAD") {
             self.content_length = Some(0);
             self.chunked = false;
         }

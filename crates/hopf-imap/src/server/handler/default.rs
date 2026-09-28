@@ -13,7 +13,7 @@ use super::{
     ConnectedState, CopyState, CreateState, DeleteState, ExpungeState, FetchState,
     GetMetadataState, ImapConnectionMetadata, ImapHandlerFactory, ListState, MoveState,
     NotAuthenticatedHandler, QuotaState, RenameState, SearchState, SelectState, SelectedHandler,
-    SetMetadataState, SortState, StatusState, StoreAction, StoreState, SubscribeState,
+    SetMetadataState, SortState, StatusState, StoreRequest, StoreState, SubscribeState,
     ThreadState,
 };
 use crate::server::fetch_format::FetchItem;
@@ -40,7 +40,7 @@ impl DefaultImapHandlerFactory {
 
     /// When set, connections are greeted with PREAUTH for this user.
     pub fn with_preauth(mut self, username: Option<String>) -> Self {
-        self.preauth_username = username.map(|u| Arc::<str>::from(u));
+        self.preauth_username = username.map(Arc::<str>::from);
         self
     }
 }
@@ -389,20 +389,10 @@ impl SelectedHandler for DefaultImapHandler {
         state: &mut dyn StoreState,
         _mailbox: &dyn Mailbox,
         _messages: &MessageSet,
-        action: StoreAction,
-        flags: &BTreeSet<Flag>,
-        keywords: &BTreeSet<String>,
-        silent: bool,
+        request: &StoreRequest,
         by_uid: bool,
     ) {
-        state.proceed(
-            action,
-            flags.clone(),
-            keywords.clone(),
-            silent,
-            by_uid,
-            Box::new(self.clone()),
-        );
+        state.proceed(request.clone(), by_uid, Box::new(self.clone()));
     }
 
     fn search(

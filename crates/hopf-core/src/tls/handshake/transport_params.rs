@@ -74,9 +74,9 @@ impl RememberedTransportLimits {
         Self {
             active_connection_id_limit: 2,
             initial_max_data: 10 * 1024 * 1024,
-            initial_max_stream_data_bidi_local: 1 * 1024 * 1024,
-            initial_max_stream_data_bidi_remote: 1 * 1024 * 1024,
-            initial_max_stream_data_uni: 1 * 1024 * 1024,
+            initial_max_stream_data_bidi_local: 1024 * 1024,
+            initial_max_stream_data_bidi_remote: 1024 * 1024,
+            initial_max_stream_data_uni: 1024 * 1024,
             initial_max_streams_bidi: 100,
             initial_max_streams_uni: 100,
         }
@@ -182,7 +182,7 @@ impl VarintSize for u64 {
 }
 
 /// Find a transport parameter value by id in an encoded block.
-pub fn find_parameter<'a>(encoded: &'a [u8], id: u64) -> Option<&'a [u8]> {
+pub fn find_parameter(encoded: &[u8], id: u64) -> Option<&[u8]> {
     let mut i = 0;
     while i < encoded.len() {
         let (param_id, id_len) = read_varint(&encoded[i..])?;

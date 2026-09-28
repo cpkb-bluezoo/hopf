@@ -39,6 +39,10 @@ pub(crate) enum DecodeError {
     CapacityExceeded,
 }
 
+/// [`Decoder::decode`]'s result: the decoded `(name, value)` fields, and
+/// the decoder-stream Section Acknowledgment bytes to send back.
+type DecodedFieldSection = (Vec<(String, String)>, Vec<u8>);
+
 pub(crate) struct Decoder {
     table: DynamicTable,
     /// The capacity ceiling this decoder declared via
@@ -137,7 +141,7 @@ impl Decoder {
     /// to send back (RFC 9204 §4.4.1) — empty if the section didn't
     /// reference the dynamic table, since acknowledging then would be a
     /// meaningless no-op.
-    pub(crate) fn decode(&self, stream_id: u64, block: &[u8]) -> Result<(Vec<(String, String)>, Vec<u8>), DecodeError> {
+    pub(crate) fn decode(&self, stream_id: u64, block: &[u8]) -> Result<DecodedFieldSection, DecodeError> {
         let (encoded_ric, a) = integer(block, 8)?;
         let ric = insert_count::decode(encoded_ric, self.table.insert_count(), self.table.capacity())
             .ok_or(DecodeError::Blocked)?;

@@ -13,16 +13,16 @@ pub fn encoded_length(full_pn: u64, largest_acked: Option<u64>) -> usize {
     } else {
         64 - num_unacked.leading_zeros() as usize + 1
     };
-    ((min_bits + 7) / 8).clamp(1, 4)
+    min_bits.div_ceil(8).clamp(1, 4)
 }
 
 /// Write low-order `length` bytes of `full_pn` big-endian into `out`.
 pub fn encode(full_pn: u64, length: usize, out: &mut [u8]) {
     debug_assert!((1..=4).contains(&length));
     debug_assert!(out.len() >= length);
-    for i in 0..length {
+    for (i, byte) in out.iter_mut().enumerate().take(length) {
         let shift = 8 * (length - 1 - i);
-        out[i] = ((full_pn >> shift) & 0xff) as u8;
+        *byte = ((full_pn >> shift) & 0xff) as u8;
     }
 }
 

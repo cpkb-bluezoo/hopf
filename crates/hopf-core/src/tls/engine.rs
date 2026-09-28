@@ -155,18 +155,24 @@ pub struct ServerCredentials {
     pub signing_key_pkcs8: Bytes,
 }
 
+/// Signature of a [`VerifyOverride`] callback.
+pub type VerifyFn = Arc<dyn Fn(&[Bytes], Option<&str>) -> bool + Send + Sync>;
+
 /// Custom server-chain verification callback (client role) — peer chain
 /// (DER, leaf first) and SNI in, trusted-or-not out. Wraps a plain `Fn` so
 /// callers with their own trust model (DANE TLSA, pinned SPKI, …) don't need
 /// to shape a fixed root set into a [`crate::crypto::trust::TrustStore`].
 #[derive(Clone)]
-pub struct VerifyOverride(pub Arc<dyn Fn(&[Bytes], Option<&str>) -> bool + Send + Sync>);
+pub struct VerifyOverride(pub VerifyFn);
 
 impl std::fmt::Debug for VerifyOverride {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("VerifyOverride(..)")
     }
 }
+
+/// Signature of a [`ServerCredentialsResolver`] callback.
+pub type ServerCredentialsFn = Arc<dyn Fn(Option<&str>) -> Option<ServerCredentials> + Send + Sync>;
 
 /// SNI-based server credential dispatch (server role) — the client's SNI
 /// (`None` if it sent none) in, the credentials to present out. Lets one
@@ -176,7 +182,7 @@ impl std::fmt::Debug for VerifyOverride {
 /// own resolution logic (a hostname map, a hot-reloadable cert store, …)
 /// shouldn't need to shape it into a fixed type this crate defines.
 #[derive(Clone)]
-pub struct ServerCredentialsResolver(pub Arc<dyn Fn(Option<&str>) -> Option<ServerCredentials> + Send + Sync>);
+pub struct ServerCredentialsResolver(pub ServerCredentialsFn);
 
 impl std::fmt::Debug for ServerCredentialsResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3506,7 +3512,7 @@ mod tests {
             cipher_suites: SUPPORTED_CIPHER_SUITES.to_vec(),
             key_share: KeyShareEntry {
                 group: NamedGroup::X25519.code(),
-                share: Bytes::copy_from_slice(&kp.public_key()),
+                share: Bytes::copy_from_slice(kp.public_key()),
             },
             supported_groups: vec![NamedGroup::X25519.code()],
             alpn: vec![],
@@ -3633,7 +3639,7 @@ mod tests {
             cipher_suites: SUPPORTED_CIPHER_SUITES.to_vec(),
             key_share: KeyShareEntry {
                 group: NamedGroup::X25519.code(),
-                share: Bytes::copy_from_slice(&kp.public_key()),
+                share: Bytes::copy_from_slice(kp.public_key()),
             },
             supported_groups: vec![NamedGroup::X25519.code()],
             alpn: vec![],
@@ -3791,7 +3797,7 @@ mod tests {
             cipher_suites: vec![CHACHA20_POLY1305_SHA256],
             key_share: KeyShareEntry {
                 group: NamedGroup::X25519.code(),
-                share: Bytes::copy_from_slice(&kp.public_key()),
+                share: Bytes::copy_from_slice(kp.public_key()),
             },
             supported_groups: vec![NamedGroup::X25519.code()],
             alpn: vec![],
@@ -3834,7 +3840,7 @@ mod tests {
             cipher_suites: vec![0xffff], // unrecognized/unsupported
             key_share: KeyShareEntry {
                 group: NamedGroup::X25519.code(),
-                share: Bytes::copy_from_slice(&kp.public_key()),
+                share: Bytes::copy_from_slice(kp.public_key()),
             },
             supported_groups: vec![NamedGroup::X25519.code()],
             alpn: vec![],

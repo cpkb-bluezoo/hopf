@@ -383,12 +383,9 @@ pub fn connect_ip(
         proxy_host,
         proxy_port,
         factory,
-        HttpLimits::default(),
         fallback,
-        timeouts,
-        resolver,
-        quic_client_config,
-        alt_svc_cache,
+        hopf_http::DialSettings { limits: HttpLimits::default(), timeouts, resolver },
+        hopf_http::H3Discovery { quic_client_config, alt_svc_cache },
     )
 }
 

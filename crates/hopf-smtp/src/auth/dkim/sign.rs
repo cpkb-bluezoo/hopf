@@ -9,7 +9,8 @@ use rmimeparser::dkim::RawHeader;
 use super::canon::{self, Canonicalization, IncrementalBodyCanon};
 
 use hopf_core::crypto::{
-    ed25519_sign, rsa_sign_pkcs1_sha256, Ed25519PrivateKey, RsaPrivateKey, SignatureBytes,
+    ed25519_sign, rsa_sign_pkcs1_sha256, Ed25519PrivateKey, KeyError, RsaPrivateKey, SignError,
+    SignatureBytes,
 };
 
 /// A private key usable for DKIM signing.
@@ -23,20 +24,16 @@ pub enum DkimPrivateKey {
 impl DkimPrivateKey {
     /// Load an RSA private key from PKCS#8 DER (e.g. `openssl genpkey
     /// -algorithm RSA ... | openssl pkcs8 -topk8 -nocrypt`).
-    pub fn rsa_from_pkcs8(der: &[u8]) -> Result<Self, ()> {
-        RsaPrivateKey::from_pkcs8(der)
-            .map(DkimPrivateKey::Rsa)
-            .map_err(|_| ())
+    pub fn rsa_from_pkcs8(der: &[u8]) -> Result<Self, KeyError> {
+        RsaPrivateKey::from_pkcs8(der).map(DkimPrivateKey::Rsa)
     }
 
     /// Load an Ed25519 private key from PKCS#8 (v1 or v2) DER. Accepts the
     /// PKCS#8 v1 form `openssl genpkey -algorithm ED25519` produces (seed
     /// only, no embedded public key) as well as v2 (seed + public key,
     /// consistency-checked).
-    pub fn ed25519_from_pkcs8(der: &[u8]) -> Result<Self, ()> {
-        Ed25519PrivateKey::from_pkcs8(der)
-            .map(DkimPrivateKey::Ed25519)
-            .map_err(|_| ())
+    pub fn ed25519_from_pkcs8(der: &[u8]) -> Result<Self, KeyError> {
+        Ed25519PrivateKey::from_pkcs8(der).map(DkimPrivateKey::Ed25519)
     }
 
     pub(crate) fn algorithm_tag(&self) -> &'static str {
@@ -46,9 +43,9 @@ impl DkimPrivateKey {
         }
     }
 
-    pub(crate) fn sign(&self, data: &[u8]) -> Result<SignatureBytes, ()> {
+    pub(crate) fn sign(&self, data: &[u8]) -> Result<SignatureBytes, SignError> {
         match self {
-            DkimPrivateKey::Rsa(kp) => rsa_sign_pkcs1_sha256(kp, data).map_err(|_| ()),
+            DkimPrivateKey::Rsa(kp) => rsa_sign_pkcs1_sha256(kp, data),
             DkimPrivateKey::Ed25519(kp) => Ok(ed25519_sign(kp, data)),
         }
     }
@@ -169,7 +166,7 @@ impl DkimSignStream<'_, '_> {
     }
 
     /// Finish: compute the body hash from everything fed so far, then sign.
-    pub fn finish(self) -> Result<String, ()> {
+    pub fn finish(self) -> Result<String, SignError> {
         let signer = self.signer;
         let t = signer.timestamp.unwrap_or_else(|| {
             SystemTime::now()

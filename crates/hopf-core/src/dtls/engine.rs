@@ -1091,21 +1091,21 @@ mod tests {
         assert_eq!(client.max_application_data(), 129);
         assert_eq!(server.max_application_data(), 99);
 
-        client.send_application_data(&vec![5u8; 129], &mut sink_c);
+        client.send_application_data(&[5u8; 129], &mut sink_c);
         relay(&mut sink_c, &mut server, &mut sink_s);
         assert_eq!(sink_s.app_data.last().map(Vec::len), Some(129), "{:?}", sink_s.events);
 
         // One over: refused as a whole, never split (the boundary matters to
         // a datagram protocol), and not fatal - the connection carries on.
         let written_before = sink_c.all_written.len();
-        client.send_application_data(&vec![5u8; 130], &mut sink_c);
+        client.send_application_data(&[5u8; 130], &mut sink_c);
         assert_eq!(sink_c.all_written.len(), written_before, "nothing may be sent");
         assert!(
             sink_c.events.iter().any(|e| e.starts_with("protocol_error") && e.contains("record_size_limit")),
             "{:?}",
             sink_c.events
         );
-        client.send_application_data(&vec![6u8; 10], &mut sink_c);
+        client.send_application_data(&[6u8; 10], &mut sink_c);
         relay(&mut sink_c, &mut server, &mut sink_s);
         assert_eq!(sink_s.app_data.last().map(Vec::len), Some(10), "still usable afterwards");
     }

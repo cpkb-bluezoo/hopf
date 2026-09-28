@@ -210,6 +210,8 @@ impl Connection {
     }
 
     /// Client connection after `Endpoint::connect`.
+    // QUIC client connection constructor; each parameter is an independent transport/handshake setting.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_client(
         now: Instant,
         remote: SocketAddr,
@@ -237,14 +239,16 @@ impl Connection {
             initial_max_streams_uni,
             keep_alive_interval,
         };
-        let mut local_tp = TransportParameters::default();
-        local_tp.initial_src_cid = Some(local_cid.clone());
-        local_tp.max_datagram_frame_size = max_datagram_frame_size;
         // RFC 9369 section 4 / RFC 9368: send version_information. Only the
         // chosen version is listed as available, which disables compatible
         // version negotiation (RFC 9368 section 3) - this client does not
         // switch versions mid-handshake.
-        local_tp.version_information = Some(VersionInformation { chosen: version.wire(), available: vec![version.wire()] });
+        let mut local_tp = TransportParameters {
+            initial_src_cid: Some(local_cid.clone()),
+            max_datagram_frame_size,
+            version_information: Some(VersionInformation { chosen: version.wire(), available: vec![version.wire()] }),
+            ..Default::default()
+        };
         if let Some(d) = max_idle_timeout {
             local_tp.max_idle_timeout = d.as_millis() as u64;
         }
@@ -327,6 +331,8 @@ impl Connection {
     }
 
     /// Server connection after accept.
+    // QUIC server connection constructor; same shape as new_client above.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_server(
         now: Instant,
         remote: SocketAddr,
@@ -349,17 +355,19 @@ impl Connection {
         initial_max_streams_uni: Option<u64>,
         keep_alive_interval: Option<Duration>,
     ) -> Self {
-        let mut local_tp = TransportParameters::default();
-        local_tp.initial_src_cid = Some(local_cid.clone());
-        local_tp.original_dst_cid = Some(original_dst_cid);
-        local_tp.retry_src_cid = retry_src_cid;
         // RFC 9368 section 3: the server's Available Versions are its
         // deployment's versions; the Chosen Version is the one in use.
-        local_tp.version_information = Some(VersionInformation {
-            chosen: version.wire(),
-            available: server_versions.iter().map(|v| v.wire()).collect(),
-        });
-        local_tp.max_datagram_frame_size = max_datagram_frame_size;
+        let mut local_tp = TransportParameters {
+            initial_src_cid: Some(local_cid.clone()),
+            original_dst_cid: Some(original_dst_cid),
+            retry_src_cid,
+            version_information: Some(VersionInformation {
+                chosen: version.wire(),
+                available: server_versions.iter().map(|v| v.wire()).collect(),
+            }),
+            max_datagram_frame_size,
+            ..Default::default()
+        };
         if let Some(d) = max_idle_timeout {
             local_tp.max_idle_timeout = d.as_millis() as u64;
         }
@@ -2217,9 +2225,10 @@ mod tests {
     }
 
     fn tp_with(chosen: u32, available: &[u32]) -> TransportParameters {
-        let mut tp = TransportParameters::default();
-        tp.version_information = Some(VersionInformation { chosen, available: available.to_vec() });
-        tp
+        TransportParameters {
+            version_information: Some(VersionInformation { chosen, available: available.to_vec() }),
+            ..Default::default()
+        }
     }
 
     /// The `TransportError` code a connection was closed with, if any.
@@ -2286,8 +2295,6 @@ mod tests {
     #[test]
     fn client_closes_on_malformed_version_information() {
         let mut conn = versioned_client(Instant::now(), &[QuicVersion::V1]);
-        let mut tp = TransportParameters::default();
-        tp.version_information_invalid = true;
         // (decode sets the flag; feed it through the wire form instead.)
         let mut raw = TransportParameters::default().encode();
         varint::encode(0x11, &mut raw);

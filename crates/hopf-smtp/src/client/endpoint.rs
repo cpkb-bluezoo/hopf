@@ -421,7 +421,7 @@ impl SmtpClientEndpoint {
                             // security_established callback will fire when handshake completes.
                         }
                         Err(e) => {
-                            let err = io::Error::new(io::ErrorKind::Other, format!("start_client_tls: {e}"));
+                            let err = io::Error::other(format!("start_client_tls: {e}"));
                             self.proto_state = ProtoState::Error;
                             if let Some(mut driver) = self.driver.take() {
                                 driver.on_error(ep, &err);

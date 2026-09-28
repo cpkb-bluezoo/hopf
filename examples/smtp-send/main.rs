@@ -65,7 +65,7 @@ fn main() -> io::Result<()> {
             eprintln!("sent to {to} via {host}:{port}");
             Ok(())
         }
-        Some(false) => Err(io::Error::new(io::ErrorKind::Other, "SMTP delivery failed")),
+        Some(false) => Err(io::Error::other("SMTP delivery failed")),
         None => Err(io::Error::new(io::ErrorKind::TimedOut, "SMTP delivery timed out")),
     }
 }

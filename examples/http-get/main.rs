@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use hopf_core::{Runtime, RuntimeConfig};
 use hopf_http::{
-    client::{connect_http, HttpClientTimeouts},
+    client::{connect_http, DialSettings, HttpClientTimeouts},
     h3::connect_h3,
     Headers, HttpLimits, ClientHandler, ClientHandlerFactory, ClientWriter,
 };
@@ -178,10 +178,8 @@ fn main() -> io::Result<()> {
             &host,
             port,
             Arc::clone(&factory),
-            limits,
             http2,
-            HttpClientTimeouts::default(),
-            None,
+            DialSettings { limits, timeouts: HttpClientTimeouts::default(), resolver: None },
         )?;
         if http2 {
             eprintln!("hopf http-get dialing http2://{host}:{port}{path} (prior-knowledge)");
@@ -209,7 +207,7 @@ fn main() -> io::Result<()> {
 
     let g = out.lock().unwrap();
     if let Some(err) = &g.error {
-        return Err(io::Error::new(io::ErrorKind::Other, err.clone()));
+        return Err(io::Error::other(err.clone()));
     }
     print!("{}", String::from_utf8_lossy(&g.body));
     eprintln!("status {}", g.status);
@@ -232,8 +230,8 @@ fn split_host_port(s: &str, default_port: u16) -> (String, u16) {
         if let Some(bracket) = s.rfind(']') {
             let ip = &s[1..bracket];
             let rest = &s[bracket + 1..];
-            let port = if rest.starts_with(':') {
-                rest[1..].parse().unwrap_or(default_port)
+            let port = if let Some(rest) = rest.strip_prefix(':') {
+                rest.parse().unwrap_or(default_port)
             } else {
                 default_port
             };

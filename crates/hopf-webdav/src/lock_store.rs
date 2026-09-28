@@ -452,7 +452,7 @@ fn walk_files(dir: &Path, visit: &mut impl FnMut(PathBuf)) {
 
 fn token_file_name(token: &str) -> String {
     let name = token.rsplit(':').next().unwrap_or(token);
-    name.replace('/', "_").replace('\\', "_")
+    name.replace(['/', '\\'], "_")
 }
 
 fn new_temp_suffix() -> String {

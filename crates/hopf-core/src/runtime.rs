@@ -13,6 +13,7 @@ use crate::accept::{AcceptHandle, AcceptLoop};
 use crate::binding::BindingId;
 use crate::cmd::ReactorCmd;
 use crate::connector::{TcpConnectorConfig, UnixConnectorConfig};
+use crate::handle::Task;
 use crate::listener::{TcpListenerConfig, UnixListenerConfig};
 use crate::reactor::Reactor;
 use crate::service::Service;
@@ -20,7 +21,7 @@ use crate::storage::{StorageConfig, StorageExecutor};
 use crate::telemetry::TelemetryHook;
 
 /// Runtime configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RuntimeConfig {
     /// Number of worker reactor threads. `0` means `available_parallelism * 2` (min 2).
     pub worker_threads: usize,
@@ -28,14 +29,6 @@ pub struct RuntimeConfig {
     pub storage: StorageConfig,
 }
 
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            worker_threads: 0,
-            storage: StorageConfig::default(),
-        }
-    }
-}
 
 impl RuntimeConfig {
     pub(crate) fn resolved_workers(&self) -> usize {
@@ -218,7 +211,7 @@ impl Runtime {
         &self,
         worker_index: usize,
         delay: std::time::Duration,
-        callback: Box<dyn FnOnce() + Send>,
+        callback: Task,
     ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
         let w = self.workers.get(worker_index)?;
         Some(w.schedule_timer(delay, callback))

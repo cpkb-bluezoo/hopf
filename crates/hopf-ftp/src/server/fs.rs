@@ -162,8 +162,7 @@ impl BasicFtpFileSystem {
     pub fn new(root: impl AsRef<Path>, read_only: bool) -> io::Result<Self> {
         let root = root.as_ref().canonicalize()?;
         if !root.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "ftp root must be a directory",
             ));
         }

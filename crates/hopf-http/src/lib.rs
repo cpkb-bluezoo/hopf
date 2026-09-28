@@ -44,12 +44,15 @@ pub use auth::{
 };
 pub use client::{
     connect_http, connect_http2_upgrade, connect_http2_upgrade_unix, connect_http_unix,
-    parse_alt_svc_h3, AltSvcCache, AltSvcEntry, AltSvcH3Entry, HttpClient, HttpClientError,
-    HttpClientSessionHandle, HttpClientTimeouts, HttpConnectionHandler, HttpRequest,
-    HttpResponseHandler, RedirectPolicy,
+    parse_alt_svc_h3, AltSvcCache, AltSvcEntry, AltSvcH3Entry, DialSettings, HttpClient,
+    HttpClientError, HttpClientSessionHandle, HttpClientTimeouts, HttpConnectionHandler,
+    HttpRequest, HttpResponseHandler, RedirectPolicy,
 };
 #[cfg(feature = "h3")]
-pub use client::{connect_auto, connect_auto_unix, connect_h3_by_name, connect_https, HttpFallback};
+pub use client::{
+    connect_auto, connect_auto_unix, connect_h3_by_name, connect_https, H3DialSettings,
+    H3Discovery, HttpFallback,
+};
 pub use caching::{
     evaluate_preconditions, parse_entity_tag_list, CacheControl, EntityTag, EntityTagList,
     Precondition, Validators,

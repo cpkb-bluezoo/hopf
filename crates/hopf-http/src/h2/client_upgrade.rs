@@ -129,11 +129,15 @@ impl ClientHandler for UpgradeProbeHandler {
 // H2cUpgradeClientEndpoint
 // ---------------------------------------------------------------------------
 
+// `H2` is already boxed (down from 872 to 456 bytes for the enum overall);
+// further shrinking would mean boxing the now-comparatively-larger `H1`
+// too, chasing this lint's ratio heuristic rather than any real saving.
+#[allow(clippy::large_enum_variant)]
 enum Phase {
     /// Sending/awaiting the HTTP/1.1 upgrade request and response.
     H1(H1ClientCodec<UpgradeProbeHandler>),
     /// `101` accepted; full H2 connection.
-    H2(H2Endpoint),
+    H2(Box<H2Endpoint>),
 }
 
 /// Client [`ProtocolHandler`] that dials via HTTP/1.1 h2c Upgrade
@@ -182,8 +186,11 @@ impl H2cUpgradeClientEndpoint {
             return;
         };
         let probe = codec.take_handler();
-        let mut h2ep =
-            H2Endpoint::client_after_h2c_upgrade(probe.inner, Arc::clone(&self.factory), self.limits);
+        let mut h2ep = Box::new(H2Endpoint::client_after_h2c_upgrade(
+            probe.inner,
+            Arc::clone(&self.factory),
+            self.limits,
+        ));
         h2ep.connected(endpoint);
         if !remainder.is_empty() {
             h2ep.receive(endpoint, remainder);

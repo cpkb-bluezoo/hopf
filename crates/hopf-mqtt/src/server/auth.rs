@@ -56,6 +56,8 @@ pub(crate) struct PendingConnectAuth {
 /// continuation / re-AUTH branches, and the pending CONNECT fields for the
 /// first of those) travels in [`AuthStepOutcome`] instead of living on the
 /// call stack.
+// Each parameter is an independent offloaded-auth-step input threaded through from the caller.
+#[allow(clippy::too_many_arguments)]
 fn offload_step(
     handler: &mut MqttControlHandler,
     endpoint: &mut dyn Endpoint,

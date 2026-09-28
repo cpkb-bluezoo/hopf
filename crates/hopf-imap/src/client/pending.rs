@@ -235,7 +235,7 @@ impl ImapTagGenerator {
     }
 
     /// Next tag.
-    pub fn next(&mut self) -> Tag {
+    pub fn next_tag(&mut self) -> Tag {
         let tag = format!("{}{:03}", self.prefix as char, self.counter);
         self.counter += 1;
         if self.counter > 999 {
@@ -461,12 +461,12 @@ mod tests {
     #[test]
     fn tags_a001_sequence() {
         let mut g = ImapTagGenerator::new();
-        assert_eq!(g.next(), "A000");
-        assert_eq!(g.next(), "A001");
+        assert_eq!(g.next_tag(), "A000");
+        assert_eq!(g.next_tag(), "A001");
         for _ in 0..998 {
-            g.next();
+            g.next_tag();
         }
-        assert_eq!(g.next(), "B000");
+        assert_eq!(g.next_tag(), "B000");
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::crypto::trust::{public_trust_store, TrustStore};
 
 use super::engine::{
     handshake_config_tcp_record_layer, ClientAuthPolicy, HandshakeConfig, HandshakeRole,
-    ServerCredentials, ServerCredentialsResolver, VerifyOverride,
+    ServerCredentials, ServerCredentialsResolver, VerifyFn, VerifyOverride,
 };
 use super::negotiating::{NegotiatingTls, ServerTlsMaterial};
 use super::TcpTlsVersionPolicy;
@@ -194,9 +194,11 @@ pub fn acceptor_with_ech(inner: SharedTlsAcceptor, config: Arc<super::ech::EchSe
     Arc::new(EchAcceptor { inner, config })
 }
 
+type EchResolverFn = Arc<dyn Fn(&str) -> Option<super::ech::EchClientConfig> + Send + Sync>;
+
 struct EchConnector {
     inner: SharedTlsConnector,
-    resolver: Arc<dyn Fn(&str) -> Option<super::ech::EchClientConfig> + Send + Sync>,
+    resolver: EchResolverFn,
 }
 
 impl TlsConnector for EchConnector {
@@ -461,7 +463,7 @@ fn trusted_connector(
 /// custom — e.g. DANE TLSA matching, or any trust model that isn't a fixed
 /// root set. See [`VerifyOverride`].
 pub fn connector_with_verify_override(
-    verify: Arc<dyn Fn(&[Bytes], Option<&str>) -> bool + Send + Sync>,
+    verify: VerifyFn,
     alpn: &[&[u8]],
 ) -> SharedTlsConnector {
     trusted_connector(

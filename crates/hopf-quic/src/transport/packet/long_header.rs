@@ -45,6 +45,8 @@ pub struct LongHeaderPrefix {
 }
 
 /// Build unprotected long header (through PN, before header protection).
+// Long-header packet fields are each independently required by RFC 9000; no natural sub-grouping.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     packet_type: u8,
     version: QuicVersion,

@@ -178,6 +178,25 @@ pub trait AmqpClientControl {
     fn connection_close(&mut self, reply_code: u16, reply_text: &str);
 }
 
+/// A returned (`basic.return`) message's metadata — see
+/// [`AmqpClientDriver::on_return_start`]. `channel` is passed alongside
+/// this, not inside it, matching every other `on_return_*`/`on_delivery_*`
+/// callback in this trait.
+pub struct BasicReturnInfo<'a> {
+    /// Reply code (AMQP 0-9-1 §1.1, e.g. 312 `NO_ROUTE`).
+    pub reply_code: u16,
+    /// Human-readable reply text.
+    pub reply_text: &'a str,
+    /// Exchange the message was published to.
+    pub exchange: &'a str,
+    /// Routing key it was published with.
+    pub routing_key: &'a str,
+    /// Content-header properties.
+    pub properties: &'a BasicProperties,
+    /// Body length in bytes (streamed via `on_return_data`).
+    pub body_len: u64,
+}
+
 /// Receives all AMQP protocol callbacks for a single client connection.
 pub trait AmqpClientDriver: Send {
     /// Connection is open (`connection.open-ok`). Open channels from here.
@@ -287,25 +306,8 @@ pub trait AmqpClientDriver: Send {
     fn on_delivery_complete(&mut self, client: &mut dyn AmqpClientControl, channel: u16);
 
     /// Undeliverable mandatory/immediate publish (`basic.return` + content).
-    fn on_return_start(
-        &mut self,
-        channel: u16,
-        reply_code: u16,
-        reply_text: &str,
-        exchange: &str,
-        routing_key: &str,
-        properties: &BasicProperties,
-        body_len: u64,
-    ) {
-        let _ = (
-            channel,
-            reply_code,
-            reply_text,
-            exchange,
-            routing_key,
-            properties,
-            body_len,
-        );
+    fn on_return_start(&mut self, channel: u16, info: &BasicReturnInfo) {
+        let _ = (channel, info);
     }
 
     /// Chunk of a returned message body on `channel` (see [`Self::on_delivery_data`]

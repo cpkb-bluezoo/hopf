@@ -211,8 +211,7 @@ pub(crate) fn connection_lost_io_error(reason: ConnectionError) -> Option<io::Er
             io::ErrorKind::InvalidData,
             "QUIC version mismatch",
         )),
-        ConnectionError::CidsExhausted => Some(io::Error::new(
-            io::ErrorKind::Other,
+        ConnectionError::CidsExhausted => Some(io::Error::other(
             "QUIC connection IDs exhausted",
         )),
     }

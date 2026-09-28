@@ -294,7 +294,6 @@ impl H3Writer {
             return;
         }
 
-        let body = body;
         if !body.is_empty() {
             let allowed = {
                 let mut state = self.peer_state.lock().unwrap();

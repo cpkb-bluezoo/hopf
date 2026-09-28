@@ -167,7 +167,7 @@ impl EphemeralKeyPair {
     pub fn agree(self, peer_public: &[u8]) -> Result<Bytes, Unspecified> {
         let peer = UnparsedPublicKey::new(&X25519, peer_public);
         let mut out = vec![0u8; 32];
-        agreement::agree_ephemeral(self.private, &peer, Unspecified, |secret| {
+        agreement::agree_ephemeral(self.private, peer, Unspecified, |secret| {
             if secret.len() != 32 {
                 return Err(Unspecified);
             }
@@ -205,7 +205,7 @@ impl EphemeralP256KeyPair {
     pub fn agree(self, peer_public: &[u8]) -> Result<Bytes, Unspecified> {
         let peer = UnparsedPublicKey::new(&ECDH_P256, peer_public);
         let mut out = vec![0u8; 32];
-        agreement::agree_ephemeral(self.private, &peer, Unspecified, |secret| {
+        agreement::agree_ephemeral(self.private, peer, Unspecified, |secret| {
             if secret.len() != 32 {
                 return Err(Unspecified);
             }
@@ -244,7 +244,7 @@ impl EphemeralP384KeyPair {
     pub fn agree(self, peer_public: &[u8]) -> Result<Bytes, Unspecified> {
         let peer = UnparsedPublicKey::new(&ECDH_P384, peer_public);
         let mut out = vec![0u8; 48];
-        agreement::agree_ephemeral(self.private, &peer, Unspecified, |secret| {
+        agreement::agree_ephemeral(self.private, peer, Unspecified, |secret| {
             if secret.len() != 48 {
                 return Err(Unspecified);
             }
@@ -501,7 +501,7 @@ impl StaticKeyPair {
     pub fn agree(&self, peer_public: &[u8]) -> Result<Bytes, Unspecified> {
         let peer = UnparsedPublicKey::new(&X25519, peer_public);
         let mut out = vec![0u8; 32];
-        agreement::agree(&self.private, &peer, Unspecified, |secret| {
+        agreement::agree(&self.private, peer, Unspecified, |secret| {
             if secret.len() != 32 {
                 return Err(Unspecified);
             }

@@ -52,17 +52,46 @@ impl Default for HttpClientTimeouts {
     }
 }
 
+/// Shared "how to dial" settings threaded through every cleartext/TLS
+/// `connect_*`/`dial_*` helper below: response/body size limits, per-phase
+/// timeouts, and which DNS resolver to use (`None` = a fresh one attached
+/// to the runtime's system nameservers). Not used by the h3/QUIC path
+/// ([`connect_h3_by_name`]) — see [`H3DialSettings`], since QUIC connection
+/// timing comes from its own `QuicClientConfig` rather than
+/// [`HttpClientTimeouts`].
+#[derive(Clone)]
+pub struct DialSettings {
+    /// Response/body size limits.
+    pub limits: HttpLimits,
+    /// Per-phase timeouts.
+    pub timeouts: HttpClientTimeouts,
+    /// DNS resolver to use (`None` = a fresh one attached to the runtime).
+    pub resolver: Option<Arc<DnsResolver>>,
+}
+
+/// Shared "how to dial" settings for the h3/QUIC path
+/// ([`connect_h3_by_name`]) — see [`DialSettings`] for the cleartext/TLS
+/// counterpart. No timeouts field: QUIC connection timing comes from the
+/// dial's own `QuicClientConfig`.
+#[cfg(feature = "h3")]
+#[derive(Clone)]
+pub struct H3DialSettings {
+    /// Response/body size limits.
+    pub limits: HttpLimits,
+    /// DNS resolver to use (`None` = a fresh one attached to the runtime).
+    pub resolver: Option<Arc<DnsResolver>>,
+}
+
 /// Dial an HTTP/1.1 or HTTP/2 cleartext peer by hostname or socket-address.
 pub fn connect_http(
     rt: &Arc<Runtime>,
     host_or_addr: &str,
     port: u16,
     factory: Arc<dyn ClientHandlerFactory>,
-    limits: HttpLimits,
     http2: bool,
-    timeouts: HttpClientTimeouts,
-    resolver: Option<Arc<DnsResolver>>,
+    settings: DialSettings,
 ) -> io::Result<()> {
+    let limits = settings.limits;
     let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
         Arc::new(move || -> Box<dyn ProtocolHandler> {
             if http2 {
@@ -71,7 +100,7 @@ pub fn connect_http(
                 Box::new(H1Endpoint::client(Arc::clone(&factory), limits, false))
             }
         });
-    dial(rt, host_or_addr, port, &timeouts, resolver, make_handler)
+    dial(rt, host_or_addr, port, &settings, make_handler)
 }
 
 /// Dial an HTTP/1.1 or HTTP/2 cleartext peer over a UNIX domain socket
@@ -104,15 +133,14 @@ pub fn connect_http2_upgrade(
     host_or_addr: &str,
     port: u16,
     factory: Arc<dyn ClientHandlerFactory>,
-    limits: HttpLimits,
-    timeouts: HttpClientTimeouts,
-    resolver: Option<Arc<DnsResolver>>,
+    settings: DialSettings,
 ) -> io::Result<()> {
+    let limits = settings.limits;
     let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
         Arc::new(move || -> Box<dyn ProtocolHandler> {
             Box::new(H2cUpgradeClientEndpoint::new(Arc::clone(&factory), limits))
         });
-    dial(rt, host_or_addr, port, &timeouts, resolver, make_handler)
+    dial(rt, host_or_addr, port, &settings, make_handler)
 }
 
 /// Dial an HTTP/2 peer via HTTP/1.1 h2c Upgrade over a UNIX domain socket
@@ -152,27 +180,17 @@ pub fn connect_https(
     host_or_addr: &str,
     port: u16,
     factory: Arc<dyn ClientHandlerFactory>,
-    limits: HttpLimits,
     tls_connector: SharedTlsConnector,
     server_name: impl Into<String>,
-    timeouts: HttpClientTimeouts,
-    resolver: Option<Arc<DnsResolver>>,
+    settings: DialSettings,
 ) -> io::Result<()> {
     let server_name = server_name.into();
+    let limits = settings.limits;
     let make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync> =
         Arc::new(move || -> Box<dyn ProtocolHandler> {
             Box::new(TlsAlpnClientEndpoint::new(Arc::clone(&factory), limits))
         });
-    dial_tls(
-        rt,
-        host_or_addr,
-        port,
-        &timeouts,
-        resolver,
-        tls_connector,
-        server_name,
-        make_handler,
-    )
+    dial_tls(rt, host_or_addr, port, &settings, tls_connector, server_name, make_handler)
 }
 
 /// [`ProtocolHandler`] that waits for the TLS handshake to complete, then
@@ -263,11 +281,10 @@ pub(crate) fn dial(
     rt: &Arc<Runtime>,
     host_or_addr: &str,
     port: u16,
-    timeouts: &HttpClientTimeouts,
-    resolver: Option<Arc<DnsResolver>>,
+    settings: &DialSettings,
     make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync>,
 ) -> io::Result<()> {
-    let connect_timeout = Some(timeouts.connect);
+    let connect_timeout = Some(settings.timeouts.connect);
 
     if let Some(addr) = resolve_literal(host_or_addr, port) {
         let mh = Arc::clone(&make_handler);
@@ -276,8 +293,8 @@ pub(crate) fn dial(
         );
     }
 
-    let res = match resolver {
-        Some(r) => r,
+    let res = match &settings.resolver {
+        Some(r) => Arc::clone(r),
         None => Arc::new(DnsResolver::for_runtime(rt)?),
     };
     let rt2 = Arc::clone(rt);
@@ -313,13 +330,12 @@ fn dial_tls(
     rt: &Arc<Runtime>,
     host_or_addr: &str,
     port: u16,
-    timeouts: &HttpClientTimeouts,
-    resolver: Option<Arc<DnsResolver>>,
+    settings: &DialSettings,
     tls_connector: SharedTlsConnector,
     server_name: String,
     make_handler: Arc<dyn Fn() -> Box<dyn ProtocolHandler> + Send + Sync>,
 ) -> io::Result<()> {
-    let connect_timeout = Some(timeouts.connect);
+    let connect_timeout = Some(settings.timeouts.connect);
 
     if let Some(addr) = resolve_literal(host_or_addr, port) {
         let mh = Arc::clone(&make_handler);
@@ -330,8 +346,8 @@ fn dial_tls(
         );
     }
 
-    let res = match resolver {
-        Some(r) => r,
+    let res = match &settings.resolver {
+        Some(r) => Arc::clone(r),
         None => Arc::new(DnsResolver::for_runtime(rt)?),
     };
     let rt2 = Arc::clone(rt);
@@ -465,15 +481,15 @@ pub fn connect_h3_by_name(
     client_config: Arc<QuicClientConfig>,
     server_name: Option<String>,
     factory: Arc<dyn ClientHandlerFactory>,
-    limits: HttpLimits,
-    resolver: Option<Arc<DnsResolver>>,
+    settings: H3DialSettings,
 ) -> io::Result<()> {
+    let limits = settings.limits;
     let sni = server_name.unwrap_or_else(|| host_or_addr.to_string());
     if let Some(addr) = resolve_literal(host_or_addr, port) {
         connect_h3_with_keepalive(addr, client_config, sni, factory, limits)?;
         return Ok(());
     }
-    let res = match resolver {
+    let res = match settings.resolver {
         Some(r) => r,
         None => Arc::new(DnsResolver::for_runtime(rt)?),
     };
@@ -526,21 +542,15 @@ fn dial_with_fallback(
     host: &str,
     port: u16,
     factory: Arc<dyn ClientHandlerFactory>,
-    limits: HttpLimits,
     fallback: HttpFallback,
-    timeouts: HttpClientTimeouts,
-    resolver: Option<Arc<DnsResolver>>,
+    settings: DialSettings,
 ) -> io::Result<()> {
     match fallback {
-        HttpFallback::Tls(connector, server_name) => connect_https(
-            rt, host, port, factory, limits, connector, server_name, timeouts, resolver,
-        ),
-        HttpFallback::PlaintextH2c => {
-            connect_http2_upgrade(rt, host, port, factory, limits, timeouts, resolver)
+        HttpFallback::Tls(connector, server_name) => {
+            connect_https(rt, host, port, factory, connector, server_name, settings)
         }
-        HttpFallback::PlaintextH1 => {
-            connect_http(rt, host, port, factory, limits, false, timeouts, resolver)
-        }
+        HttpFallback::PlaintextH2c => connect_http2_upgrade(rt, host, port, factory, settings),
+        HttpFallback::PlaintextH1 => connect_http(rt, host, port, factory, false, settings),
     }
 }
 
@@ -576,14 +586,28 @@ fn dial_with_fallback_unix(
     }
 }
 
+/// h3-tier discovery settings for [`connect_auto`]: the QUIC config to
+/// dial with if an h3 tier is found (`None` skips h3 discovery entirely,
+/// going straight to tier 3), and the Alt-Svc cache to feed for the next
+/// connection attempt to this origin.
+#[cfg(feature = "h3")]
+#[derive(Clone)]
+pub struct H3Discovery {
+    /// QUIC client config to dial an h3 tier with, if one is found.
+    pub quic_client_config: Option<Arc<QuicClientConfig>>,
+    /// Cache fed with any `Alt-Svc` response header seen on the fallback
+    /// tier, for the *next* connection attempt to this origin.
+    pub alt_svc_cache: Arc<AltSvcCache>,
+}
+
 /// Automatic transport negotiation for an origin: a DNS HTTPS record (RFC
 /// 9460) advertising `h3` support (tier 1), then a cached Alt-Svc
 /// discovery from an earlier connection to the same origin (tier 2),
 /// falling back to `fallback` (tier 3) when neither applies.
 ///
 /// Skipped straight to tier 3 for a literal IP/socket-address `host` (no
-/// hostname to query) or when `quic_client_config` is `None` (nothing to
-/// dial an h3 tier with even if discovered).
+/// hostname to query) or when `discovery.quic_client_config` is `None`
+/// (nothing to dial an h3 tier with even if discovered).
 ///
 /// The tier-1 HTTPS-record lookup batches the A/AAAA/HTTPS query (RFC
 /// 10029 where the upstream resolver supports it — see
@@ -591,31 +615,27 @@ fn dial_with_fallback_unix(
 /// costs no more than today's plain address resolution already did.
 ///
 /// The tier-3 fallback factory is wrapped to watch for an `Alt-Svc`
-/// response header, feeding `alt_svc_cache` for the *next* connection
-/// attempt to this origin — this call's own connection does not
-/// opportunistically upgrade itself mid-flight.
+/// response header, feeding `discovery.alt_svc_cache` for the *next*
+/// connection attempt to this origin — this call's own connection does
+/// not opportunistically upgrade itself mid-flight.
 #[cfg(feature = "h3")]
-#[allow(clippy::too_many_arguments)]
 pub fn connect_auto(
     rt: &Arc<Runtime>,
     host: &str,
     port: u16,
     factory: Arc<dyn ClientHandlerFactory>,
-    limits: HttpLimits,
     fallback: HttpFallback,
-    timeouts: HttpClientTimeouts,
-    resolver: Option<Arc<DnsResolver>>,
-    quic_client_config: Option<Arc<QuicClientConfig>>,
-    alt_svc_cache: Arc<AltSvcCache>,
+    settings: DialSettings,
+    discovery: H3Discovery,
 ) -> io::Result<()> {
     if resolve_literal(host, port).is_some() {
-        return dial_with_fallback(rt, host, port, factory, limits, fallback, timeouts, resolver);
+        return dial_with_fallback(rt, host, port, factory, fallback, settings);
     }
-    let Some(quic_config) = quic_client_config else {
-        return dial_with_fallback(rt, host, port, factory, limits, fallback, timeouts, resolver);
+    let Some(quic_config) = discovery.quic_client_config else {
+        return dial_with_fallback(rt, host, port, factory, fallback, settings);
     };
 
-    let res = match &resolver {
+    let res = match &settings.resolver {
         Some(r) => Arc::clone(r),
         None => Arc::new(DnsResolver::for_runtime(rt)?),
     };
@@ -623,6 +643,8 @@ pub fn connect_auto(
     let rt2 = Arc::clone(rt);
     let host_owned = host.to_string();
     let host_for_tier3 = host_owned.clone();
+    let alt_svc_cache = discovery.alt_svc_cache;
+    let limits = settings.limits;
 
     let collected: Arc<Mutex<Vec<DnsResourceRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let collected_for_result = Arc::clone(&collected);
@@ -661,8 +683,7 @@ pub fn connect_auto(
                     Arc::clone(&quic_config),
                     Some(host_owned.clone()),
                     Arc::clone(&factory),
-                    limits,
-                    resolver.clone(),
+                    H3DialSettings { limits, resolver: settings.resolver.clone() },
                 )
                 .is_ok()
                 {
@@ -676,16 +697,9 @@ pub fn connect_auto(
                     host_owned.clone(),
                     port,
                 ));
-            if let Err(e) = dial_with_fallback(
-                &rt2,
-                &host_for_tier3,
-                port,
-                observing_factory,
-                limits,
-                fallback,
-                timeouts.clone(),
-                resolver.clone(),
-            ) {
+            if let Err(e) =
+                dial_with_fallback(&rt2, &host_for_tier3, port, observing_factory, fallback, settings.clone())
+            {
                 eprintln!("hopf-http: connect error: {e}");
             }
         }),

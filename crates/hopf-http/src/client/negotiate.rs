@@ -259,15 +259,17 @@ impl HttpResponseHandler for AltSvcObservingResponseHandler {
 /// but routes a failure to `on_fallback` (try the next tier) instead of
 /// the real handler's `on_error` — only the *last* tier actually attempted
 /// should ever report a failure to the caller.
+type FallbackFn = Box<dyn FnOnce(io::Error) + Send>;
+
 pub(crate) struct SpeculativeHandler {
     inner: Arc<Mutex<Box<dyn HttpConnectionHandler>>>,
-    on_fallback: Mutex<Option<Box<dyn FnOnce(io::Error) + Send>>>,
+    on_fallback: Mutex<Option<FallbackFn>>,
 }
 
 impl SpeculativeHandler {
     pub(crate) fn new(
         inner: Arc<Mutex<Box<dyn HttpConnectionHandler>>>,
-        on_fallback: Box<dyn FnOnce(io::Error) + Send>,
+        on_fallback: FallbackFn,
     ) -> Self {
         Self {
             inner,

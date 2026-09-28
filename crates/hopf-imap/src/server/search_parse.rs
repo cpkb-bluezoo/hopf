@@ -372,7 +372,7 @@ fn parse_imap_date(s: &str) -> Option<(i32, u32, u32)> {
         _ => return None,
     };
     let y: i32 = parts[2].parse().ok()?;
-    if d < 1 || d > 31 {
+    if !(1..=31).contains(&d) {
         return None;
     }
     Some((y, m, d))

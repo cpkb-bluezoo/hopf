@@ -6,7 +6,7 @@ const ENC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 
 /// Encode `data` as standard Base64 with padding.
 pub fn encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     let mut i = 0;
     while i + 3 <= data.len() {
         let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
@@ -62,7 +62,7 @@ pub fn decode(s: &str) -> Option<Vec<u8>> {
         // Allow unpadded input by synthetically padding.
         let need = (4 - (len % 4)) % 4;
         let mut padded = bytes;
-        padded.extend(std::iter::repeat(b'=').take(need));
+        padded.extend(std::iter::repeat_n(b'=', need));
         return decode_padded(&padded);
     }
     decode_padded(&bytes)

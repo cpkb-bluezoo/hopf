@@ -16,7 +16,7 @@ use hopf_core::{Runtime, RuntimeConfig};
 
 use crate::client::{
     AmqpClient, AmqpClientControl, AmqpClientDriver, AmqpClientHandlerFactory,
-    AmqpRecoveringClient, RecoveryListener,
+    AmqpRecoveringClient, BasicReturnInfo, RecoveryListener,
 };
 use crate::codec::{BasicProperties, FieldTable, FieldValue};
 
@@ -1145,6 +1145,8 @@ struct ExchangeRoutingState {
 /// consumer, `publish` is called once with `(channel, control)` so the
 /// test can send whatever routing-key/body pairs it needs. Deliveries land
 /// in `state.received[queue_name]`.
+type PublishOnceFn = Arc<dyn Fn(u16, &mut dyn AmqpClientControl) + Send + Sync>;
+
 struct ExchangeRoutingDriver {
     exchange: String,
     exchange_type: &'static str,
@@ -1154,7 +1156,7 @@ struct ExchangeRoutingDriver {
     consuming: usize,
     current_tag: Option<String>,
     current_buf: Vec<u8>,
-    publish: Arc<dyn Fn(u16, &mut dyn AmqpClientControl) + Send + Sync>,
+    publish: PublishOnceFn,
     published: bool,
 }
 
@@ -1250,7 +1252,7 @@ struct ExchangeRoutingFactory {
     exchange_type: &'static str,
     bindings: Vec<(String, String)>,
     state: Arc<Mutex<ExchangeRoutingState>>,
-    publish: Arc<dyn Fn(u16, &mut dyn AmqpClientControl) + Send + Sync>,
+    publish: PublishOnceFn,
 }
 
 impl AmqpClientHandlerFactory for ExchangeRoutingFactory {
@@ -2132,19 +2134,10 @@ impl AmqpClientDriver for MandatoryReturnDriver {
         );
     }
 
-    fn on_return_start(
-        &mut self,
-        _channel: u16,
-        reply_code: u16,
-        _reply_text: &str,
-        _exchange: &str,
-        routing_key: &str,
-        _properties: &BasicProperties,
-        _body_len: u64,
-    ) {
+    fn on_return_start(&mut self, _channel: u16, info: &BasicReturnInfo) {
         let mut s = self.state.lock().unwrap();
-        s.return_reply_code = Some(reply_code);
-        s.return_routing_key = Some(routing_key.to_string());
+        s.return_reply_code = Some(info.reply_code);
+        s.return_routing_key = Some(info.routing_key.to_string());
     }
 
     fn on_return_data(&mut self, _channel: u16, data: &[u8]) {

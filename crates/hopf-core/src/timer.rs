@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::handle::Task;
+
 /// Cancel flag shared with [`crate::endpoint::TimerHandle`].
 pub(crate) type CancelFlag = Arc<AtomicBool>;
 
@@ -15,7 +17,7 @@ struct TimerEntry {
     deadline: Instant,
     id: u64,
     cancelled: CancelFlag,
-    callback: Box<dyn FnOnce() + Send>,
+    callback: Task,
 }
 
 impl PartialEq for TimerEntry {
@@ -69,7 +71,7 @@ impl TimerQueue {
     pub fn schedule(
         &mut self,
         delay: Duration,
-        callback: Box<dyn FnOnce() + Send>,
+        callback: Task,
     ) -> CancelFlag {
         let cancelled = Arc::new(AtomicBool::new(false));
         self.schedule_with_cancel(delay, callback, Arc::clone(&cancelled));
@@ -79,7 +81,7 @@ impl TimerQueue {
     pub fn schedule_with_cancel(
         &mut self,
         delay: Duration,
-        callback: Box<dyn FnOnce() + Send>,
+        callback: Task,
         cancelled: CancelFlag,
     ) {
         let id = self.next_id.fetch_add(1, AtomicOrdering::Relaxed);
@@ -105,7 +107,7 @@ impl TimerQueue {
 
     /// Rebuild the heap with every currently-cancelled entry dropped.
     fn compact(&mut self) {
-        let old = std::mem::replace(&mut self.heap, BinaryHeap::new());
+        let old = std::mem::take(&mut self.heap);
         let live: Vec<TimerEntry> = old
             .into_vec()
             .into_iter()

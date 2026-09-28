@@ -132,7 +132,7 @@ fn main() -> io::Result<()> {
         }
         Some(false) => {
             eprintln!("fetch failed");
-            return Err(io::Error::new(io::ErrorKind::Other, "POP3 fetch failed"));
+            return Err(io::Error::other("POP3 fetch failed"));
         }
         None => {
             eprintln!("timeout — no response within 30 s");

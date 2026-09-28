@@ -467,10 +467,10 @@ mod tests {
     fn padding_rounds_to_32_and_covers_sni() {
         // With an SNI of 11 and M=20: 9 name-pad, then round up to 32.
         let p = padding_len(100, Some(11), 20);
-        assert_eq!(p, 9 + ((32 - (109 % 32)) % 32));
+        assert_eq!(p, 9 + (32 - (109 % 32)));
         assert_eq!((100 + p) % 32, 0);
         // No SNI: M + 9.
-        assert_eq!(padding_len(64, None, 10), 19 + ((32 - (83 % 32)) % 32));
+        assert_eq!(padding_len(64, None, 10), 19 + (32 - (83 % 32)));
         // Longer name than M adds no name padding; still rounds.
         assert_eq!(padding_len(60, Some(50), 20) % 32, 4);
         assert_eq!((60 + padding_len(60, Some(50), 20)) % 32, 0);

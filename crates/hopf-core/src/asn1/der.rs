@@ -32,9 +32,19 @@ impl<'a> DerReader<'a> {
         self.bytes.get(self.pos).copied()
     }
 
+    /// Read and discard the next TLV.
+    pub fn skip_element(&mut self) -> Option<()> {
+        self.next()?;
+        Some(())
+    }
+}
+
+impl<'a> Iterator for DerReader<'a> {
+    type Item = &'a [u8];
+
     /// Read and return the next complete TLV (tag byte through content,
     /// inclusive), advancing past it.
-    pub fn next(&mut self) -> Option<&'a [u8]> {
+    fn next(&mut self) -> Option<&'a [u8]> {
         let start = self.pos;
         let _tag = *self.bytes.get(self.pos)?;
         self.pos += 1;
@@ -46,12 +56,6 @@ impl<'a> DerReader<'a> {
         }
         self.pos = end;
         Some(&self.bytes[start..end])
-    }
-
-    /// Read and discard the next TLV.
-    pub fn skip_element(&mut self) -> Option<()> {
-        self.next()?;
-        Some(())
     }
 }
 

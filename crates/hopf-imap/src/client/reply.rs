@@ -2479,7 +2479,7 @@ mod tests {
             ImapEvent::FetchLiteralBegin { seq: 1, section, size: 11 } if section.is_empty()
         )));
         assert!(ev.iter().any(|e| matches!(e, ImapEvent::FetchLiteralData(d) if d == b"hello world")));
-        assert!(ev.iter().any(|e| *e == ImapEvent::FetchLiteralEnd { seq: 1 }));
+        assert!(ev.contains(&ImapEvent::FetchLiteralEnd { seq: 1 }));
         let fetch = ev
             .iter()
             .find_map(|e| match e {
@@ -2547,7 +2547,7 @@ mod tests {
         let mut p2: &[u8] = b"llo)\r\n";
         let e2 = lex.feed(&mut p2).unwrap();
         assert!(e2.iter().any(|e| matches!(e, ImapEvent::FetchLiteralData(d) if d == b"llo")));
-        assert!(e2.iter().any(|e| *e == ImapEvent::FetchLiteralEnd { seq: 1 }));
+        assert!(e2.contains(&ImapEvent::FetchLiteralEnd { seq: 1 }));
         let fetch = e2
             .iter()
             .find_map(|e| match e {
@@ -2567,7 +2567,7 @@ mod tests {
             e,
             ImapEvent::FetchLiteralBegin { seq: 4, section, size: 7 } if section == "HEADER"
         )));
-        assert!(ev.iter().any(|e| *e == ImapEvent::FetchLiteralEnd { seq: 4 }));
+        assert!(ev.contains(&ImapEvent::FetchLiteralEnd { seq: 4 }));
     }
 
     #[test]
@@ -2736,7 +2736,7 @@ mod tests {
         let mut lex = ImapReplyLexer::new();
         let mut data = Vec::new();
         data.extend_from_slice(b"A000 OK ");
-        data.extend(std::iter::repeat(b'x').take(MAX_TOKEN + 1));
+        data.extend(std::iter::repeat_n(b'x', MAX_TOKEN + 1));
         data.extend_from_slice(b"\r\n");
         let mut slice: &[u8] = &data;
         let err = lex.feed(&mut slice).unwrap_err();

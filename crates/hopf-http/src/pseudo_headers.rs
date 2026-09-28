@@ -65,7 +65,7 @@ pub(crate) fn validate_request_pseudo_headers(pairs: &[(String, String)]) -> Res
     // RFC 9114 §4.3.1: pseudo-header values and routing targets must be valid.
     for (name, value) in pairs {
         match name.as_str() {
-            ":path" if !(is_connect && !is_extended_connect) => {
+            ":path" if !is_connect || is_extended_connect => {
                 if !crate::utils::is_valid_request_target(value) {
                     return Err(());
                 }

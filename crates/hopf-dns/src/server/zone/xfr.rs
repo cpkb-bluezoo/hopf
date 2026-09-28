@@ -171,7 +171,7 @@ mod tests {
             r[0] = DnsResourceRecord::soa("example.com", 60, "ns", "h", 50, 2, 3, 4, 5).unwrap();
             r
         }).unwrap(), 3);
-        assert_eq!(msgs[0].answers.len() > 3, true, "AXFR-style: SOA, records, SOA");
+        assert!(msgs[0].answers.len() > 3, "AXFR-style: SOA, records, SOA");
         assert_eq!(msgs[0].answers.first().unwrap().raw_type, 6);
         assert_eq!(msgs[0].answers.last().unwrap().raw_type, 6);
     }

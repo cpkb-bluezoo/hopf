@@ -24,12 +24,10 @@ pub enum TcpTlsVersionPolicy {
 
 impl TcpTlsVersionPolicy {
     pub(crate) fn allows_server_pick(&self, pick: PickedTls) -> bool {
-        match (self, pick) {
-            (Self::Negotiate, _) => true,
-            (Self::Tls13Only, PickedTls::V13) => true,
-            (Self::Tls12Only, PickedTls::V12) => true,
-            _ => false,
-        }
+        matches!(
+            (self, pick),
+            (Self::Negotiate, _) | (Self::Tls13Only, PickedTls::V13) | (Self::Tls12Only, PickedTls::V12)
+        )
     }
 
     pub(crate) fn allows_client_pick(&self, pick: PickedTls) -> bool {

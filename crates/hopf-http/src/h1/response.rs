@@ -320,7 +320,7 @@ impl H1SessionWriter {
 impl ServerWriter for H1SessionWriter {
     fn send_informational(&mut self, code: u16, headers: &Headers) {
         self.with_shared(|s| {
-            if s.response_headers_sent || code < 100 || code > 199 {
+            if s.response_headers_sent || !(100..=199).contains(&code) {
                 return;
             }
             let reason = reason_phrase(code);

@@ -450,7 +450,7 @@ impl Decoder {
     ) -> Result<(), CodingError> {
         match stages.split_first_mut() {
             None => sink(input),
-            Some((first, rest)) if rest.is_empty() => first.push(input, sink),
+            Some((first, [])) => first.push(input, sink),
             Some((first, rest)) => first.push(input, &mut |mid: &[u8]| {
                 Self::run(rest, mid, sink)
             }),

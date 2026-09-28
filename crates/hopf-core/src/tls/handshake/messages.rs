@@ -350,7 +350,7 @@ fn build_client_hello_inner(
         let host = name.as_bytes();
         let mut sni = BytesMut::new();
         // ServerNameList: list_len | NameType(1) | host_len | host (RFC 6066).
-        sni.extend_from_slice(&((host.len() as u16 + 3)).to_be_bytes());
+        sni.extend_from_slice(&(host.len() as u16 + 3).to_be_bytes());
         sni.extend_from_slice(&[0u8]); // host_name
         sni.extend_from_slice(&(host.len() as u16).to_be_bytes());
         sni.extend_from_slice(host);
@@ -781,7 +781,7 @@ mod tests {
             cipher_suites: vec![0x1301],
             key_share: KeyShareEntry {
                 group: NamedGroup::X25519.code(),
-                share: Bytes::copy_from_slice(&kp.public_key()),
+                share: Bytes::copy_from_slice(kp.public_key()),
             },
             supported_groups: vec![NamedGroup::X25519.code()],
             alpn: vec![Bytes::from_static(b"h3")],
@@ -816,7 +816,7 @@ mod tests {
             cipher_suites: vec![0x1301, 0x1303],
             key_share: KeyShareEntry {
                 group: NamedGroup::X25519.code(),
-                share: Bytes::copy_from_slice(&kp.public_key()),
+                share: Bytes::copy_from_slice(kp.public_key()),
             },
             supported_groups: vec![NamedGroup::X25519.code()],
             alpn: vec![],
@@ -849,7 +849,7 @@ mod tests {
         let hello = build_client_hello(&ClientHelloParams {
             random: [6u8; 32],
             cipher_suites: vec![0x1301],
-            key_share: KeyShareEntry { group: NamedGroup::X25519.code(), share: Bytes::copy_from_slice(&kp.public_key()) },
+            key_share: KeyShareEntry { group: NamedGroup::X25519.code(), share: Bytes::copy_from_slice(kp.public_key()) },
             supported_groups: vec![NamedGroup::X25519.code()],
             alpn: vec![],
             server_name: None,
@@ -897,7 +897,7 @@ mod tests {
         let hello = build_client_hello(&ClientHelloParams {
             random: [7u8; 32],
             cipher_suites: vec![0x1301],
-            key_share: KeyShareEntry { group: NamedGroup::X25519.code(), share: Bytes::copy_from_slice(&kp.public_key()) },
+            key_share: KeyShareEntry { group: NamedGroup::X25519.code(), share: Bytes::copy_from_slice(kp.public_key()) },
             supported_groups: vec![NamedGroup::X25519.code()],
             alpn: vec![],
             server_name: None,

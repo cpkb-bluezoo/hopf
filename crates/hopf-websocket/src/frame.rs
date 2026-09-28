@@ -256,12 +256,11 @@ impl WsFrameParser {
             _ => {}
         }
 
-        if self.opcode.is_control() {
-            if !self.fin || len7 > MAX_CONTROL_PAYLOAD as u8 {
+        if self.opcode.is_control()
+            && (!self.fin || len7 > MAX_CONTROL_PAYLOAD as u8) {
                 handler.frame_error(WsFrameError::ControlFrame);
                 return false;
             }
-        }
 
         match len7 {
             126 => {

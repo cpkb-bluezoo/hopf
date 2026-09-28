@@ -250,7 +250,7 @@ mod tests {
                 association_data,
             };
             assert!(
-                verify_dane_chain(&[record], &[cert.clone()], Some("dane.example")),
+                verify_dane_chain(&[record], std::slice::from_ref(&cert), Some("dane.example")),
                 "selector={selector:?} matching_type={matching_type:?}"
             );
         }
@@ -330,7 +330,7 @@ mod tests {
                 association_data: cert.as_ref().to_vec(),
             };
             assert!(
-                !verify_dane_chain(&[record], &[cert.clone()], Some("dane.example")),
+                !verify_dane_chain(&[record], std::slice::from_ref(&cert), Some("dane.example")),
                 "usage {usage:?} must never be matched"
             );
         }

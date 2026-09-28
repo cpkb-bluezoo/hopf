@@ -392,7 +392,7 @@ pub fn encode(plaintext: &[u8]) -> Vec<u8> {
             let space = 8 - bits_in_byte;
             let take = remaining.min(space);
             let shift = remaining - take;
-            let bits = ((code >> shift) & ((1 << take) - 1)) as u32;
+            let bits = (code >> shift) & ((1 << take) - 1);
             current_byte = (current_byte << take) | bits;
             bits_in_byte += take;
             remaining -= take;

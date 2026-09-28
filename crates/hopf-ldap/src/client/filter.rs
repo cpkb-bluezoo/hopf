@@ -11,17 +11,17 @@ pub fn encode_filter(encoder: &mut BerEncoder, filter: &str) {
         filter = &filter[1..filter.len() - 1];
     }
 
-    if filter.starts_with('&') {
+    if let Some(rest) = filter.strip_prefix('&') {
         encoder.begin_context(0, true);
-        encode_filter_list(encoder, &filter[1..]);
+        encode_filter_list(encoder, rest);
         encoder.end_context();
-    } else if filter.starts_with('|') {
+    } else if let Some(rest) = filter.strip_prefix('|') {
         encoder.begin_context(1, true);
-        encode_filter_list(encoder, &filter[1..]);
+        encode_filter_list(encoder, rest);
         encoder.end_context();
-    } else if filter.starts_with('!') {
+    } else if let Some(rest) = filter.strip_prefix('!') {
         encoder.begin_context(2, true);
-        encode_filter(encoder, filter[1..].trim());
+        encode_filter(encoder, rest.trim());
         encoder.end_context();
     } else if filter.contains("=*") && filter.ends_with("=*") && !filter.contains("*=") {
         // Presence: (attr=*)

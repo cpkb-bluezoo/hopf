@@ -102,13 +102,16 @@ pub trait ServerHandler: Send {
     fn request_complete(&mut self, response: &mut dyn ServerWriter);
 }
 
+/// A deferred-write task passed to [`ResponseControl::execute`].
+pub(crate) type WriterTask = Box<dyn FnOnce(&mut dyn ServerWriter) + Send>;
+
 /// Transport-internal control plane for deferred response writes.
 ///
 /// H1/H2/H3 each provide an implementation; application code uses only
 /// [`ServerResponseHandle`].
 pub(crate) trait ResponseControl: Send + Sync {
     fn conn_handle(&self) -> ConnHandle;
-    fn execute(&self, f: Box<dyn FnOnce(&mut dyn ServerWriter) + Send>);
+    fn execute(&self, f: WriterTask);
     fn pause_request_body(&self);
     fn resume_request_body(&self);
 }

@@ -275,7 +275,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> Drop for PooledConn<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handle::ConnHandleBackend;
+    use crate::handle::{ConnHandleBackend, EndpointTask, Task};
     use crate::endpoint::Endpoint;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -307,10 +307,10 @@ mod tests {
         fn pause_read(&mut self) {}
         fn resume_read(&mut self) {}
         fn on_write_ready(&mut self, _callback: Option<crate::endpoint::WriteReadyCallback>) {}
-        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+        fn execute(&self, task: Task) {
             task();
         }
-        fn schedule_timer(&self, _delay: Duration, _callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        fn schedule_timer(&self, _delay: Duration, _callback: Task) -> TimerHandle {
             TimerHandle::new(|| {})
         }
         fn handle(&self) -> ConnHandle {
@@ -327,17 +327,17 @@ mod tests {
     }
 
     impl ConnHandleBackend for FakeBackend {
-        fn with_endpoint(&self, task: Box<dyn FnOnce(&mut dyn Endpoint) + Send>) {
+        fn with_endpoint(&self, task: EndpointTask) {
             let mut ep = FakeEndpoint;
             task(&mut ep);
         }
-        fn execute(&self, task: Box<dyn FnOnce() + Send>) {
+        fn execute(&self, task: Task) {
             task();
         }
         fn is_probably_open(&self) -> bool {
             self.open.load(Ordering::SeqCst)
         }
-        fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle {
+        fn schedule_timer(&self, delay: Duration, callback: Task) -> TimerHandle {
             let cancelled = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&cancelled);
             std::thread::spawn(move || {

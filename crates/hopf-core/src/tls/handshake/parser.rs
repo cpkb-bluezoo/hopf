@@ -1028,7 +1028,7 @@ mod tests {
             cipher_suites: vec![0x1301],
             key_share: KeyShareEntry {
                 group: NamedGroup::X25519.code(),
-                share: Bytes::copy_from_slice(&kp.public_key()),
+                share: Bytes::copy_from_slice(kp.public_key()),
             },
             supported_groups: vec![NamedGroup::X25519.code()],
             alpn: vec![Bytes::from_static(b"h3")],

@@ -277,7 +277,7 @@ struct ClientCtx<'h, 'e> {
 impl MqttClientControl for ClientCtx<'_, '_> {
     fn publish(&mut self, topic: &str, payload: &[u8], qos: QoS, retain: bool, properties: &Properties) -> u16 {
         let packet_id = if qos == QoS::AtMostOnce { 0 } else { self.handler.next_packet_id() };
-        let wire = encode::encode_publish(topic, qos, false, retain, packet_id, payload, properties, self.handler.version);
+        let wire = encode::encode_publish(&encode::PublishFields { topic, qos, dup: false, retain, packet_id, props: properties, version: self.handler.version }, payload);
         self.endpoint.send(&wire);
         packet_id
     }

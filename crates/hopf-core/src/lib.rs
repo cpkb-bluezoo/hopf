@@ -60,7 +60,7 @@ pub use composition::{
 pub use connector::{TcpConnParams, TcpConnectorConfig, UnixConnectorConfig};
 pub use endpoint::{Endpoint, TimerHandle, WriteReadyCallback};
 pub use error::StartTlsError;
-pub use handle::{ConnHandle, ConnHandleBackend};
+pub use handle::{ConnHandle, ConnHandleBackend, EndpointTask, ExecuteFn, Task};
 pub use handler::{NopHandler, ProtocolHandler};
 pub use listener::{
     HandlerFactory, Listener, TcpListenerConfig, UnixListenerConfig, DEFAULT_BUFFER_SIZE,

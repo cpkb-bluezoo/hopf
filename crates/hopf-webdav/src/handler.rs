@@ -89,6 +89,8 @@ pub struct WebDavHandler {
 }
 
 impl WebDavHandler {
+    // WebDAV handler constructor; each parameter is an independently-configurable policy.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: Arc<WebDavConfig>,
         storage: Arc<StorageExecutor>,
@@ -1093,7 +1095,7 @@ impl WebDavHandler {
                                 &acl_ctx,
                             )
                                 .map_err(|c| {
-                                    io::Error::new(io::ErrorKind::Other, format!("propfind {c}"))
+                                    io::Error::other(format!("propfind {c}"))
                                 })
                         })
                     })
@@ -1172,7 +1174,7 @@ enum LockOutcome {
 }
 
 fn io_err(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg))
+    Box::new(std::io::Error::other(msg))
 }
 
 /// Shared, mutex-guarded PUT state (issue #186) — see
@@ -1556,6 +1558,8 @@ fn collect_propfind_children(
     Ok(())
 }
 
+// Each PROPFIND property needs its own independent XML-writer input.
+#[allow(clippy::too_many_arguments)]
 fn append_propfind_props(
     w: &mut PropXmlWriter<Vec<u8>>,
     pf: &crate::parser::PropfindRequest,
@@ -1634,6 +1638,8 @@ fn is_live_prop(name: &str, acl_enabled: bool) -> bool {
     live_prop_names(acl_enabled).contains(&name)
 }
 
+// Each live RFC 4918 property needs its own independent XML-writer input.
+#[allow(clippy::too_many_arguments)]
 fn append_live_props(
     w: &mut PropXmlWriter<Vec<u8>>,
     path: &Path,
@@ -1751,9 +1757,7 @@ fn parse_timeout_header(raw: Option<&str>) -> i64 {
     }
     if let Some(rest) = raw.strip_prefix(constants::TIMEOUT_SECOND_PREFIX) {
         if let Ok(n) = rest.parse::<i64>() {
-            return n
-                .max(0)
-                .min(constants::MAX_LOCK_TIMEOUT_SECONDS);
+            return n.clamp(0, constants::MAX_LOCK_TIMEOUT_SECONDS);
         }
     }
     // Also accept bare "Second-N" case variants and comma-separated first token.
@@ -1763,7 +1767,7 @@ fn parse_timeout_header(raw: Option<&str>) -> i64 {
         .or_else(|| first.strip_prefix("second-"))
     {
         if let Ok(n) = rest.parse::<i64>() {
-            return n.max(0).min(constants::MAX_LOCK_TIMEOUT_SECONDS);
+            return n.clamp(0, constants::MAX_LOCK_TIMEOUT_SECONDS);
         }
     }
     constants::DEFAULT_LOCK_TIMEOUT_SECONDS

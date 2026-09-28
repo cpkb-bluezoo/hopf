@@ -114,6 +114,8 @@ impl LossDetector {
     }
 
     /// Record that a packet was sent (Appendix A.5 `OnPacketSent`).
+    // RFC 9002 loss-detection inputs; each is an independent per-packet fact, not a natural bundle.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_packet_sent(
         &mut self,
         space: SpaceId,
@@ -146,6 +148,8 @@ impl LossDetector {
     }
 
     /// Process a received ACK frame (Appendix A.7 `OnAckReceived`).
+    // RFC 9002 loss-detection inputs; each is an independent per-ACK fact, not a natural bundle.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_ack_received(
         &mut self,
         space: SpaceId,

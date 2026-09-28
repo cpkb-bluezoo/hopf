@@ -1341,8 +1341,8 @@ impl SmtpControlHandler {
             }
             SmtpSessionState::Bdat if self.bdat.is_some() => {
                 self.feed_bdat(endpoint, data);
-                if !self.leftover.is_empty()
-                    && !(self.session == SmtpSessionState::Bdat && self.bdat.is_some())
+                if !(self.leftover.is_empty()
+                    || (self.session == SmtpSessionState::Bdat && self.bdat.is_some()))
                 {
                     self.process_leftover(endpoint);
                 }

@@ -82,6 +82,12 @@ use crate::udp::UdpDatagramHandler;
 use super::engine::{DtlsRecordEngine, DtlsRecordSink};
 
 /// A DTLS engine of either version, driven identically.
+///
+/// The 1.3/1.2 payloads differ substantially in size (record-layer state,
+/// key schedule); boxing the larger one would touch every match site across
+/// the DTLS driver for a one-time-per-connection allocation that already
+/// lives behind the connection map's own indirection, not a hot-loop copy.
+#[allow(clippy::large_enum_variant)]
 pub enum DtlsEngine {
     /// DTLS 1.3 (RFC 9147).
     V13(DtlsRecordEngine),

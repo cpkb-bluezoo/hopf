@@ -383,6 +383,10 @@ fn group_by_domain(
 
 // ── Completion tracking ───────────────────────────────────────────────────────
 
+/// Result of rendering a DSN report: the envelope sender and rendered
+/// message bytes to spool, if there was anything to report.
+type DsnRenderResult = Result<Option<(EmailAddress, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>>;
+
 /// Tracks how many of the destination domains have finished (successfully or
 /// not) and issues the single deferred SMTP reply once every domain has
 /// reported. Shared across all in-flight per-domain deliveries, which may
@@ -453,7 +457,7 @@ impl DeliveryTracker {
 
         self.runtime.storage().submit_on(
             self.control_handle.clone(),
-            move || -> Result<Option<(EmailAddress, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
+            move || -> DsnRenderResult {
                 let rendered = dsn_input.and_then(|(sender, reports)| {
                     let original = spool_path
                         .as_ref()
@@ -844,6 +848,8 @@ fn build_dane_connector(records: Vec<hopf_dns::TlsaRecord>) -> SharedTlsConnecto
 /// per-domain delivery stage (e.g. DELIVERBY deadline already exceeded).
 /// The spool read is offloaded (issue #184) — `handle` bounces the
 /// completion back to the reactor thread that owns it.
+// Each parameter is an independent DSN-rendering input threaded through from the caller.
+#[allow(clippy::too_many_arguments)]
 fn maybe_send_failure_dsn(
     hostname: &str,
     sender: Option<&EmailAddress>,
@@ -917,6 +923,8 @@ fn maybe_send_failure_dsn(
     );
 }
 
+// Each parameter is an independent delivery-context input threaded through from the caller.
+#[allow(clippy::too_many_arguments)]
 fn send_dsn_message(
     message: &[u8],
     reverse_path: &EmailAddress,

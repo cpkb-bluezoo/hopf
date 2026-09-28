@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use hopf_core::{Endpoint, ProtocolHandler, Runtime, RuntimeConfig, TcpListenerConfig};
 
 use crate::client::{
-    connect_auto, connect_http, connect_http2_upgrade, HttpClientTimeouts, HttpFallback,
+    connect_auto, connect_http, connect_http2_upgrade, DialSettings, H3DialSettings, H3Discovery,
+    HttpClientTimeouts, HttpFallback,
 };
 use crate::h2::frame;
 use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
@@ -369,10 +370,8 @@ fn connect_http_literal_ip_roundtrip() {
         &addr.ip().to_string(),
         addr.port(),
         factory,
-        HttpLimits::default(),
         false,
-        HttpClientTimeouts::default(),
-        None,
+        DialSettings { limits: HttpLimits::default(), timeouts: HttpClientTimeouts::default(), resolver: None },
     )
     .unwrap();
 
@@ -399,10 +398,8 @@ fn connect_http_localhost_hostname_roundtrip() {
         "localhost",
         addr.port(),
         factory,
-        HttpLimits::default(),
         false,
-        HttpClientTimeouts::default(),
-        None,
+        DialSettings { limits: HttpLimits::default(), timeouts: HttpClientTimeouts::default(), resolver: None },
     )
     .unwrap();
     // connect_http must return immediately (async DNS), never park the caller.
@@ -493,9 +490,7 @@ fn h2c_upgrade_round_trip_over_real_socket() {
         &addr.ip().to_string(),
         addr.port(),
         factory,
-        HttpLimits::default(),
-        HttpClientTimeouts::default(),
-        None,
+        DialSettings { limits: HttpLimits::default(), timeouts: HttpClientTimeouts::default(), resolver: None },
     )
     .unwrap();
 
@@ -782,8 +777,7 @@ fn connect_h3_by_name_uses_the_injected_dns_resolver_not_the_os_resolver() {
         client_config,
         None,
         factory,
-        HttpLimits::default(),
-        Some(dns),
+        H3DialSettings { limits: HttpLimits::default(), resolver: Some(dns) },
     );
 
     assert!(
@@ -1015,12 +1009,9 @@ fn connect_auto_uses_dns_https_record_to_reach_h3_with_no_tcp_fallback() {
         HOST,
         80, // origin port -- deliberately not the real h3 port; svcb_port must override it
         factory,
-        HttpLimits::default(),
         HttpFallback::PlaintextH1,
-        HttpClientTimeouts::default(),
-        Some(dns),
-        Some(client_cfg),
-        Arc::new(AltSvcCache::new()),
+        DialSettings { limits: HttpLimits::default(), timeouts: HttpClientTimeouts::default(), resolver: Some(dns) },
+        H3Discovery { quic_client_config: Some(client_cfg), alt_svc_cache: Arc::new(AltSvcCache::new()) },
     )
     .unwrap();
 
@@ -1139,12 +1130,16 @@ fn connect_auto_upgrades_to_h3_via_alt_svc_cache_on_the_next_connection() {
         HOST,
         tcp_addr.port(),
         factory1,
-        HttpLimits::default(),
         HttpFallback::PlaintextH1,
-        HttpClientTimeouts::default(),
-        Some(Arc::clone(&dns)),
-        Some(Arc::clone(&client_cfg)),
-        Arc::clone(&alt_svc_cache),
+        DialSettings {
+            limits: HttpLimits::default(),
+            timeouts: HttpClientTimeouts::default(),
+            resolver: Some(Arc::clone(&dns)),
+        },
+        H3Discovery {
+            quic_client_config: Some(Arc::clone(&client_cfg)),
+            alt_svc_cache: Arc::clone(&alt_svc_cache),
+        },
     )
     .unwrap();
     assert!(
@@ -1168,12 +1163,9 @@ fn connect_auto_upgrades_to_h3_via_alt_svc_cache_on_the_next_connection() {
         HOST,
         tcp_addr.port(),
         factory2,
-        HttpLimits::default(),
         HttpFallback::PlaintextH1,
-        HttpClientTimeouts::default(),
-        Some(dns),
-        Some(client_cfg),
-        alt_svc_cache,
+        DialSettings { limits: HttpLimits::default(), timeouts: HttpClientTimeouts::default(), resolver: Some(dns) },
+        H3Discovery { quic_client_config: Some(client_cfg), alt_svc_cache },
     )
     .unwrap();
     assert!(

@@ -61,7 +61,7 @@ impl LdapUrl {
             .unwrap_or("")
             .split(',')
             .filter(|s| !s.is_empty())
-            .map(|s| percent_decode(s))
+            .map(percent_decode)
             .collect::<Vec<_>>();
         let scope = match parts.next().unwrap_or("").to_ascii_lowercase().as_str() {
             "" => None,

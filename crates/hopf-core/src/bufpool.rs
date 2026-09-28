@@ -26,7 +26,7 @@ impl BufferPool {
 
     /// Acquire a cleared buffer with capacity at least `min_capacity` (rounded up).
     pub fn acquire(&self, min_capacity: usize) -> Vec<u8> {
-        let cap = round_up_pow2(min_capacity.max(MIN_BUCKET).min(MAX_BUCKET));
+        let cap = round_up_pow2(min_capacity.clamp(MIN_BUCKET, MAX_BUCKET));
         let idx = bucket_index(cap);
         if let Ok(mut buckets) = self.buckets.lock() {
             if let Some(buf) = buckets.get_mut(idx).and_then(|b| b.pop()) {
@@ -40,7 +40,7 @@ impl BufferPool {
     pub fn release(&self, mut buf: Vec<u8>) {
         buf.clear();
         let cap = buf.capacity();
-        if cap < MIN_BUCKET || cap > MAX_BUCKET || !cap.is_power_of_two() {
+        if !(MIN_BUCKET..=MAX_BUCKET).contains(&cap) || !cap.is_power_of_two() {
             return;
         }
         let idx = bucket_index(cap);

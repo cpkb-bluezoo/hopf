@@ -42,12 +42,36 @@ impl AsRef<[u8]> for SignatureBytes {
 }
 
 /// Key parsing or generation failed.
+///
+/// Carries no further detail deliberately: the underlying AWS-LC operation
+/// (like `ring`'s `Unspecified`) collapses every failure mode — malformed
+/// DER, wrong algorithm, inconsistent key material — into one outcome so
+/// that callers can't build an oracle (e.g. a padding-oracle attack) out of
+/// which check failed first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyError;
 
+impl std::fmt::Display for KeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid or unsupported key material")
+    }
+}
+
+impl std::error::Error for KeyError {}
+
 /// Signing failed.
+///
+/// Same deliberate opacity as [`KeyError`] — see its doc comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignError;
+
+impl std::fmt::Display for SignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("signing operation failed")
+    }
+}
+
+impl std::error::Error for SignError {}
 
 /// RSA PKCS#8 private key for signing.
 pub struct RsaPrivateKey(RsaKeyPair);

@@ -629,10 +629,7 @@ impl FtpControlHandler {
         let bridge2 = Arc::clone(&bridge);
         let expect_tls = self.data_tls().is_some();
         let expected_peer = self.meta.peer.ip();
-        let bind_ip = match self.meta.local.ip() {
-            IpAddr::V4(v) => IpAddr::V4(v),
-            IpAddr::V6(v) => IpAddr::V6(v),
-        };
+        let bind_ip = self.meta.local.ip();
         let port = self.pick_pasv_port();
         let mut cfg = TcpListenerConfig::new(SocketAddr::new(bind_ip, port), move || {
             Box::new(FtpDataHandler::new(Arc::clone(&bridge2), expect_tls, expected_peer))
@@ -1639,8 +1636,8 @@ mod open_offload_tests {
     use crate::server::handler::FilesystemFtpHandler;
     use hopf_auth::PasswordTrustPolicy;
     use hopf_core::{
-        ConnHandle, ConnHandleBackend, RuntimeConfig, SecurityInfo, StartTlsError, TimerHandle,
-        WriteReadyCallback,
+        ConnHandle, ConnHandleBackend, EndpointTask, RuntimeConfig, SecurityInfo, StartTlsError,
+        Task, TimerHandle, WriteReadyCallback,
     };
     use std::collections::VecDeque;
     use std::io;
@@ -1653,8 +1650,8 @@ mod open_offload_tests {
     /// race with `sync_pending_open` at the end of the submitting
     /// `receive`, which flaked the defer/ABOR tests on CI).
     enum MockTask {
-        Execute(Box<dyn FnOnce() + Send>),
-        WithEndpoint(Box<dyn FnOnce(&mut dyn Endpoint) + Send>),
+        Execute(Task),
+        WithEndpoint(EndpointTask),
     }
 
     struct MockBackend {

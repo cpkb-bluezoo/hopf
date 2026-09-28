@@ -75,7 +75,7 @@ fn main() -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(r) = result.lock().unwrap().take() {
-            r.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            r.map_err(|e| io::Error::other(e.to_string()))?;
             break;
         }
         if Instant::now() > deadline {
@@ -104,8 +104,8 @@ fn split_host_port(s: &str, default_port: u16) -> (String, u16) {
         if let Some(bracket) = s.rfind(']') {
             let ip = &s[1..bracket];
             let rest = &s[bracket + 1..];
-            let port = if rest.starts_with(':') {
-                rest[1..].parse().unwrap_or(default_port)
+            let port = if let Some(rest) = rest.strip_prefix(':') {
+                rest.parse().unwrap_or(default_port)
             } else {
                 default_port
             };

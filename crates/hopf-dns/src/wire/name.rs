@@ -227,7 +227,7 @@ mod tests {
         for i in 0..segments {
             outer_offset = buf.len();
             buf.push(label_len);
-            buf.extend(std::iter::repeat(b'a' + (i as u8 % 26)).take(label_len as usize));
+            buf.extend(std::iter::repeat_n(b'a' + (i as u8 % 26), label_len as usize));
             match prev_offset {
                 Some(off) => {
                     buf.push(0xC0 | ((off >> 8) as u8));

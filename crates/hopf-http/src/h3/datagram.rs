@@ -32,6 +32,9 @@ pub fn encode(stream_id: u64, payload: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Decode an HTTP/3 Datagram into `(stream_id, payload)`.
+// Malformed input is the only failure mode; callers treat it as one opaque
+// "drop this datagram" signal, not something to report detail on.
+#[allow(clippy::result_unit_err)]
 pub fn decode(data: &[u8]) -> Result<(u64, &[u8]), ()> {
     let (quarter, n) = varint::decode(data).ok_or(())?;
     if quarter > MAX_QUARTER_STREAM_ID {
@@ -40,6 +43,36 @@ pub fn decode(data: &[u8]) -> Result<(u64, &[u8]), ()> {
     // Client-initiated bidirectional stream IDs are 0 mod 4.
     let stream_id = quarter.checked_mul(4).ok_or(())?;
     Ok((stream_id, &data[n..]))
+}
+
+/// Whether the peer has advertised willingness to receive HTTP/3 Datagrams
+/// (RFC 9297 §2.1.1). Pass the value from [`crate::h3::endpoint::H3PeerState::peer_h3_datagram`].
+pub fn peer_accepts_h3_datagram(peer_h3_datagram: Option<bool>) -> bool {
+    peer_h3_datagram == Some(true)
+}
+
+/// Encode and send an HTTP/3 Datagram on `endpoint` for `stream_id`
+/// (RFC 9297 §2.1). `peer_h3_datagram` must be `Some(true)` — i.e. the
+/// peer's SETTINGS frame included `SETTINGS_H3_DATAGRAM=1`.
+pub fn send(
+    endpoint: &mut dyn hopf_core::Endpoint,
+    peer_h3_datagram: Option<bool>,
+    stream_id: u64,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    if !peer_accepts_h3_datagram(peer_h3_datagram) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "peer has not advertised SETTINGS_H3_DATAGRAM=1",
+        ));
+    }
+    let Some(encoded) = encode(stream_id, payload) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stream_id must be a client-initiated bidirectional QUIC stream id",
+        ));
+    };
+    endpoint.send_datagram(&encoded)
 }
 
 #[cfg(test)]
@@ -159,34 +192,4 @@ mod tests {
         assert_eq!(sid, 8);
         assert_eq!(payload, b"hello");
     }
-}
-
-/// Whether the peer has advertised willingness to receive HTTP/3 Datagrams
-/// (RFC 9297 §2.1.1). Pass the value from [`crate::h3::endpoint::H3PeerState::peer_h3_datagram`].
-pub fn peer_accepts_h3_datagram(peer_h3_datagram: Option<bool>) -> bool {
-    peer_h3_datagram == Some(true)
-}
-
-/// Encode and send an HTTP/3 Datagram on `endpoint` for `stream_id`
-/// (RFC 9297 §2.1). `peer_h3_datagram` must be `Some(true)` — i.e. the
-/// peer's SETTINGS frame included `SETTINGS_H3_DATAGRAM=1`.
-pub fn send(
-    endpoint: &mut dyn hopf_core::Endpoint,
-    peer_h3_datagram: Option<bool>,
-    stream_id: u64,
-    payload: &[u8],
-) -> std::io::Result<()> {
-    if !peer_accepts_h3_datagram(peer_h3_datagram) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "peer has not advertised SETTINGS_H3_DATAGRAM=1",
-        ));
-    }
-    let Some(encoded) = encode(stream_id, payload) else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "stream_id must be a client-initiated bidirectional QUIC stream id",
-        ));
-    };
-    endpoint.send_datagram(&encoded)
 }

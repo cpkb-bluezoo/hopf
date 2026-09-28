@@ -97,6 +97,8 @@ impl WebDavLock {
 
     /// Reconstructs a lock read back from a [`FileLockStore`] record, with
     /// its original token, creation time and expiry preserved verbatim.
+    // Reconstructs a lock record field-for-field from storage; no natural sub-grouping.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_record(
         token: String,
         path: PathBuf,
@@ -428,18 +430,16 @@ impl LockTable {
             if existing.is_expired() {
                 continue;
             }
-            if existing.covers(path) {
-                if existing.scope == LockScope::Exclusive || requested_scope == LockScope::Exclusive
+            if existing.covers(path)
+                && (existing.scope == LockScope::Exclusive || requested_scope == LockScope::Exclusive)
                 {
                     return true;
                 }
-            }
-            if path == existing.path() || existing.path().starts_with(path) {
-                if existing.scope == LockScope::Exclusive || requested_scope == LockScope::Exclusive
+            if (path == existing.path() || existing.path().starts_with(path))
+                && (existing.scope == LockScope::Exclusive || requested_scope == LockScope::Exclusive)
                 {
                     return true;
                 }
-            }
         }
         false
     }

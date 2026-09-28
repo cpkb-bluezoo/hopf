@@ -51,10 +51,10 @@ impl ServerHandlerFactory for HelloFactory {
 }
 
 fn main() -> io::Result<()> {
-    let mut args = env::args().skip(1);
+    let args = env::args().skip(1);
     let mut tls = false;
     let mut addr_s = None;
-    while let Some(a) = args.next() {
+    for a in args {
         if a == "--tls" {
             tls = true;
         } else {
@@ -81,7 +81,7 @@ fn main() -> io::Result<()> {
         let dir = std::env::temp_dir().join("hopf-http-hello");
         std::fs::create_dir_all(&dir)?;
         let cert = generate_simple_self_signed(vec!["localhost".into()])
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
         std::fs::write(&cert_path, cert.cert.pem())?;

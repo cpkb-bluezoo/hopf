@@ -6,7 +6,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::error::StartTlsError;
-use crate::handle::ConnHandle;
+use crate::handle::{ConnHandle, Task};
 use crate::peer_addr::PeerAddr;
 use crate::security::SecurityInfo;
 
@@ -97,10 +97,10 @@ pub trait Endpoint: Send {
     /// Run `task` on this endpoint's reactor thread.
     ///
     /// If already on that thread, runs immediately; otherwise enqueued + wakeup.
-    fn execute(&self, task: Box<dyn FnOnce() + Send>);
+    fn execute(&self, task: Task);
 
     /// Schedule `callback` on the reactor thread after `delay`.
-    fn schedule_timer(&self, delay: Duration, callback: Box<dyn FnOnce() + Send>) -> TimerHandle;
+    fn schedule_timer(&self, delay: Duration, callback: Task) -> TimerHandle;
 
     /// Cloneable handle for hopping work back to this connection from other threads.
     fn handle(&self) -> ConnHandle;

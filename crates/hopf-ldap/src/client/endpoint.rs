@@ -419,8 +419,7 @@ impl LdapEndpoint {
                     cb(Ok(()));
                 }
                 Err(e) => {
-                    cb(Err(LdapError::Io(io::Error::new(
-                        io::ErrorKind::Other,
+                    cb(Err(LdapError::Io(io::Error::other(
                         e.to_string(),
                     ))));
                 }

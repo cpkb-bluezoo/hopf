@@ -23,6 +23,22 @@ pub enum StoreAction {
     Remove,
 }
 
+/// A STORE / UID STORE command's flag-operation arguments (RFC 9051
+/// §6.4.6) — everything about *what* to change, as opposed to *which*
+/// messages (`MessageSet`) or *whether* it's the UID form (kept as its own
+/// trailing `by_uid: bool` alongside this, matching `fetch`/`search`/`sort`).
+#[derive(Clone, Debug)]
+pub struct StoreRequest {
+    /// Replace / add / remove.
+    pub action: StoreAction,
+    /// Flags named in the command.
+    pub flags: BTreeSet<Flag>,
+    /// Keywords (non-system flags) named in the command.
+    pub keywords: BTreeSet<String>,
+    /// `.SILENT` suffix: suppress the untagged FETCH response.
+    pub silent: bool,
+}
+
 /// Operations right after connect.
 pub trait ConnectedState {
     /// Accept with greeting text; transition to not-authenticated.
@@ -180,15 +196,7 @@ pub trait FetchState {
 /// STORE.
 pub trait StoreState {
     /// Protocol performs STORE on the storage pool.
-    fn proceed(
-        &mut self,
-        action: StoreAction,
-        flags: BTreeSet<Flag>,
-        keywords: BTreeSet<String>,
-        silent: bool,
-        by_uid: bool,
-        handler: Box<dyn SelectedHandler>,
-    );
+    fn proceed(&mut self, request: StoreRequest, by_uid: bool, handler: Box<dyn SelectedHandler>);
     /// Failed.
     fn no(&mut self, message: &str, handler: Box<dyn SelectedHandler>);
 }

@@ -28,14 +28,14 @@ use hopf_http::{CleartextHttpEndpoint, HttpLimits, ServerHandlerFactory};
 use hopf_webdav::{DeadPropMode, WebDavConfig, WebDavFactory};
 
 fn main() -> io::Result<()> {
-    let mut args = env::args().skip(1);
+    let args = env::args().skip(1);
     let mut addr: Option<SocketAddr> = None;
     let mut root = env::var("WEBDAV_ROOT")
         .ok()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    while let Some(a) = args.next() {
+    for a in args {
         if let Ok(sa) = a.parse::<SocketAddr>() {
             addr = Some(sa);
         } else {

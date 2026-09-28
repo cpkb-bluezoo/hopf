@@ -26,8 +26,10 @@ use super::state::{
 use super::DotStuffer;
 
 /// Where [`SmtpSend`] reads the message body from.
+#[derive(Default)]
 enum MessageSource {
     /// No content at all (a genuinely empty message).
+    #[default]
     Empty,
     /// Streamed off disk in bounded chunks at DATA/BDAT time — the message is
     /// never held whole in memory by the client (see [`SmtpSend::message_file`]).
@@ -40,11 +42,6 @@ enum MessageSource {
     Chunks(Box<dyn FnMut() -> Option<Vec<u8>> + Send>),
 }
 
-impl Default for MessageSource {
-    fn default() -> Self {
-        MessageSource::Empty
-    }
-}
 
 /// Why an [`SmtpSend`] attempt ended (issue #344) — set via
 /// [`SmtpSend::on_result`] for callers that need to decide whether the
