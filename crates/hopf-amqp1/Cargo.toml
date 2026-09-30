@@ -11,7 +11,7 @@ repository.workspace = true
 authors.workspace = true
 description = "AMQP 1.0 async client for Hopf (RabbitMQ 4 native AMQP 1.0, ActiveMQ Artemis)"
 readme = "README.md"
-keywords = ["amqp", "amqp1.0", "messaging", "networking"]
+keywords = ["amqp", "amqp10", "messaging", "networking"]
 categories = ["network-programming"]
 
 [features]
