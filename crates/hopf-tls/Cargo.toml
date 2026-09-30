@@ -7,10 +7,13 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Real rustls interop test harness for hopf-core::tls (thin re-export shim; not a production dependency of any other crate)"
+description = "DEPRECATED — use hopf-core::tls. Workspace-only rustls interop test harness; do not add as a dependency."
 readme = "README.md"
 keywords = ["tls", "server"]
 categories = ["network-programming", "cryptography"]
+
+[badges]
+maintenance = { status = "deprecated" }
 
 [features]
 default = []

@@ -92,7 +92,7 @@
 <p><code>examples/echo</code> starts a <code>Runtime</code>, binds with <code>Runtime::add_tcp_listener</code>, and echoes bytes in a <code>ProtocolHandler</code>. See <a href="cookbook/echo.html">echo</a>.</p>
 <h3 id="tls-echo">TLS echo</h3>
 <div class="sourceCode" id="cb2"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> tls-echo <span class="at">--</span> 127.0.0.1:8443</span></code></pre></div>
-<p>Uses <code>hopf-tls</code> PEM helpers and <code>TcpListenerConfig::with_tls</code>. See <a href="tls.html">TLS</a> and <a href="cookbook/tls-echo.html">tls-echo</a>.</p>
+<p>TLS-from-accept on a plain <code>ProtocolHandler</code>: <code>acceptor_from_pem</code> → <code>TcpListenerConfig::with_tls</code>; handlers see plaintext after <code>security_established</code>. See <a href="tls.html#architecture">TLS → Architecture</a> and <a href="cookbook/tls-echo.html">tls-echo</a>.</p>
 <h3 id="http-hello">HTTP hello</h3>
 <div class="sourceCode" id="cb3"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="ex">cargo</span> run <span class="at">-p</span> http-hello <span class="at">--</span> 127.0.0.1:8080</span>
 <span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="ex">curl</span> <span class="at">-v</span> http://127.0.0.1:8080/</span></code></pre></div>

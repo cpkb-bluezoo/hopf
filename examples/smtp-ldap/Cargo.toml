@@ -16,4 +16,3 @@ path = "main.rs"
 hopf-core = { workspace = true }
 hopf-smtp = { workspace = true }
 hopf-ldap = { workspace = true }
-hopf-tls = { workspace = true }

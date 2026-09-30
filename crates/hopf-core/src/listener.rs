@@ -37,7 +37,7 @@ pub struct TcpListenerConfig {
     pub idle_timeout: Option<Duration>,
     /// When true, TLS handshake begins from the first byte (TLS-from-accept).
     pub secure: bool,
-    /// TLS acceptor (PEM-backed via `hopf-tls`). Required when [`secure`](Self::secure)
+    /// TLS acceptor (PEM-backed via `hopf_core::tls`). Required when [`secure`](Self::secure)
     /// is true; also enables [`crate::Endpoint::start_tls`] when set.
     pub tls: Option<SharedTlsAcceptor>,
     /// Peer allow/deny CIDR lists.

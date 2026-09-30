@@ -405,7 +405,7 @@ WebDavFactory → WebDavHandler (ServerHandler)
 <span id="cb2-32"><a href="#cb2-32" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;127.0.0.1:8080&quot;</span><span class="op">.</span>parse()<span class="op">?,</span></span>
 <span id="cb2-33"><a href="#cb2-33" aria-hidden="true" tabindex="-1"></a>    endpoint_factory<span class="op">,</span></span>
 <span id="cb2-34"><a href="#cb2-34" aria-hidden="true" tabindex="-1"></a>))<span class="op">?;</span></span></code></pre></div>
-<p>For TLS, wrap with <code>AlpnHttpEndpoint</code> + <a href="tls.html"><code>hopf-tls</code></a> on the listener (<code>with_tls</code>). See <a href="http/server.html">HTTP server</a>.</p>
+<p>For HTTPS, use the same stack as <a href="http/overview.html#tls-alpn-h1-h2">HTTP TLS + ALPN</a>: <code>acceptor_from_pem</code> with <code>&amp;[b"h2", b"http/1.1"]</code>, <code>AlpnHttpEndpoint</code> as the handler factory, <code>TcpListenerConfig::with_tls(acceptor)</code>. See <a href="http/server.html">HTTP server</a> and <a href="tls.html#wiring-listeners-and-connectors">TLS → Wiring</a>.</p>
 <p><code>WebDavFactory::new</code> creates the root directory if needed, builds the Allow header from flags, installs a default MIME map, and shares one lock manager + dead-prop store across handlers from that factory.</p>
 <h2 id="parser-multistatus-apis">Parser / multistatus APIs</h2>
 <p>Useful lower-level types (also for tests / custom handlers):</p>

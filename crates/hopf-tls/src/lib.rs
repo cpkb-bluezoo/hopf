@@ -33,20 +33,36 @@
 //! never had one to match).
 
 #![warn(missing_docs)]
+#![deprecated(
+    since = "0.4.0",
+    note = "hopf-tls is deprecated: use hopf_core::tls (or hopf_core::acceptor_from_pem / connector_from_pem) directly. This crate is kept in the Hopf workspace only as a rustls interop test harness and will not be published after 0.4.0."
+)]
 
 use std::io;
 use std::path::Path;
 
+#[deprecated(
+    since = "0.4.0",
+    note = "use hopf_core::SharedTlsAcceptor instead; do not depend on hopf-tls"
+)]
 pub use hopf_core::{SharedTlsAcceptor, SharedTlsConnector};
 
 /// Build a [`SharedTlsAcceptor`] from a PEM cert-chain and PKCS#8 private key.
 /// `alpn` entries are protocol names such as `b"h2"` and `b"http/1.1"`.
+#[deprecated(
+    since = "0.4.0",
+    note = "use hopf_core::acceptor_from_pem instead; do not depend on hopf-tls"
+)]
 pub fn acceptor_from_pem(cert_path: &Path, key_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTlsAcceptor> {
     hopf_core::acceptor_from_pem(cert_path, key_path, alpn)
 }
 
 /// Build a [`SharedTlsConnector`] that trusts the given PEM CA / leaf cert file.
 /// `alpn` entries are protocol names such as `b"http/1.1"`.
+#[deprecated(
+    since = "0.4.0",
+    note = "use hopf_core::connector_from_pem instead; do not depend on hopf-tls"
+)]
 pub fn connector_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
     hopf_core::connector_from_pem(ca_path, alpn)
 }
@@ -65,6 +81,10 @@ pub fn connector_from_pem(ca_path: &Path, alpn: &[&[u8]]) -> io::Result<SharedTl
 /// (`hopf_dns::dane`, via `hopf_core::connector_with_verify_override`) or
 /// [`connector_from_pem`] is what authenticates the peer when that's
 /// actually possible/required.
+#[deprecated(
+    since = "0.4.0",
+    note = "use hopf_core::insecure_connector instead; do not depend on hopf-tls"
+)]
 pub fn insecure_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
     hopf_core::insecure_connector(alpn)
 }
@@ -72,6 +92,10 @@ pub fn insecure_connector(alpn: &[&[u8]]) -> SharedTlsConnector {
 /// Build a [`SharedTlsConnector`] that trusts the public WebPKI (native OS
 /// roots, falling back to a vendored copy of Mozilla's CA list). See
 /// [`hopf_core::public_trust_connector`].
+#[deprecated(
+    since = "0.4.0",
+    note = "use hopf_core::public_trust_connector instead; do not depend on hopf-tls"
+)]
 pub fn public_trust_connector(alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> {
     Ok(hopf_core::public_trust_connector(alpn))
 }

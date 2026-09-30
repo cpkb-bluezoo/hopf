@@ -343,7 +343,7 @@
 <p>Wire TLS on <code>TcpListenerConfig</code> / <code>TcpConnectorConfig</code> via <code>hopf-core</code>'s in-tree TLS (<code>acceptor_from_pem</code> et al.), and use <code>AlpnHttpEndpoint</code> as the <code>ProtocolHandler</code>. Negotiated ALPN selects H2 or H1. Typical ALPN list: <code>&amp;[b"h2", b"http/1.1"]</code>.</p>
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>ProtocolHandler<span class="op">,</span> TcpListenerConfig<span class="op">};</span></span>
 <span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>AlpnHttpEndpoint<span class="op">,</span> HttpLimits<span class="op">};</span></span>
-<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_tls::</span>acceptor_from_pem<span class="op">;</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span>acceptor_from_pem<span class="op">;</span></span>
 <span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::path::</span><span class="dt">Path</span><span class="op">;</span></span>
 <span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
 <span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a></span>

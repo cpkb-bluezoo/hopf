@@ -382,7 +382,7 @@ response.headers(h);</code></pre>
 <p>Prefer stock factories from <code>hopf-websocket</code> / <code>hopf-grpc</code> rather than hand-rolling handshake headers.</p>
 <h2 id="httpserver-facade">HttpServer facade</h2>
 <p><code>HttpServer</code> is the app-facing bind facade, symmetric to <a href="client.html"><code>HttpClient</code></a> on the dial side: pick cleartext or TLS with one builder call, then <code>bind</code> once per listen address — no manual <code>CleartextHttpEndpoint</code> / <code>AlpnHttpEndpoint</code> selection.</p>
-<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> hopf_core::{Runtime, RuntimeConfig};
+<div class="sourceCode"><pre class="sourceCode rust"><code class="sourceCode rust"><span class="kw">use</span> hopf_core::{acceptor_from_pem, Runtime, RuntimeConfig};
 <span class="kw">use</span> hopf_http::{HttpServer, ServerHandlerFactory};
 
 <span class="kw">let</span> rt = Runtime::start(RuntimeConfig::default())?;
@@ -392,7 +392,7 @@ response.headers(h);</code></pre>
 <span class="kw">let</span> (addr, _binding) = HttpServer::new().bind(&amp;rt, <span class="st">&quot;127.0.0.1:8080&quot;</span>.parse()?, factory.clone())?;
 
 <span class="co">// TLS (ALPN h2 / http/1.1) — acceptor already advertises those protocols:</span>
-<span class="kw">let</span> acceptor = hopf_tls::acceptor_from_pem(&amp;cert_path, &amp;key_path, &amp;[b<span class="st">&quot;h2&quot;</span>, b<span class="st">&quot;http/1.1&quot;</span>])?;
+<span class="kw">let</span> acceptor = acceptor_from_pem(&amp;cert_path, &amp;key_path, &amp;[b<span class="st">&quot;h2&quot;</span>, b<span class="st">&quot;http/1.1&quot;</span>])?;
 <span class="kw">let</span> (addr, _binding) = HttpServer::new().tls(acceptor).bind(&amp;rt, <span class="st">&quot;127.0.0.1:8443&quot;</span>.parse()?, factory)?;</code></pre></div>
 <p>Reach for the manual wiring below when a listener needs an adapter <code>HttpServer</code> doesn't cover yet (H3/QUIC, or a non-TCP transport) — same <code>ServerHandler</code> either way.</p>
 <h2 id="wiring-example">Wiring example</h2>

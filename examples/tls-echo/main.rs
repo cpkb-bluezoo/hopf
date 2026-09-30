@@ -17,9 +17,9 @@ use std::path::PathBuf;
 
 use rcgen::generate_simple_self_signed;
 use hopf_core::{
-    Endpoint, ProtocolHandler, Runtime, RuntimeConfig, SecurityInfo, TcpListenerConfig,
+    acceptor_from_pem, Endpoint, ProtocolHandler, Runtime, RuntimeConfig, SecurityInfo,
+    TcpListenerConfig,
 };
-use hopf_tls::acceptor_from_pem;
 
 struct TlsEcho;
 

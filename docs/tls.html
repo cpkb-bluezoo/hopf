@@ -88,7 +88,7 @@
 <li><a href="#securityinfo">SecurityInfo</a></li>
 <li><a href="#examples">Examples</a></li>
 <li><a href="#limitations">Limitations</a></li>
-<li><a href="#hopf-tls-interop">hopf-tls: interop test harness</a></li>
+<li><a href="#independent-verification">Independent verification</a></li>
 </ul></div>
 <h2 id="standards">Standards</h2>
 <table>
@@ -412,9 +412,8 @@ let cfg = TcpConnectorConfig::new(addr, factory)
 <li>QUIC crypto is configured in <code>hopf-quic</code>, not here (though it shares this module's AWS-LC provider and key-exchange policy).</li>
 <li><strong>No DTLS through this page's types.</strong> DTLS 1.2 and DTLS 1.3 (RFC 6347 / RFC 9147) are implemented — <code>hopf-core::dtls</code> / <code>dtls12</code>, reusing this same handshake engine over a UDP driver with per-peer version negotiation — but as a low-level seam only, not yet exposed through the generic <code>Endpoint</code>/<code>ProtocolHandler</code> contract or through this page's <code>TlsAcceptor</code>/<code>TlsConnector</code>/<code>TlsVariant</code> types. See <a href="conformance.html#tls">Conformance → TLS</a> and <a href="architecture.html#security-substrate">Architecture → Security substrate</a>.</li>
 </ul>
-<h2 id="hopf-tls-interop">hopf-tls: interop test harness</h2>
-<p>The <code>hopf-tls</code> crate is <strong>not</strong> a production TLS implementation and nothing in this workspace depends on it for production code. It exists solely to verify <code>hopf-core::tls</code>'s wire behaviour against a real, independent TLS implementation: its <code>dev-dependencies</code>-only use of <code>rustls</code> (aws-lc-rs provider) drives real handshakes — TLS 1.3 and TLS 1.2, both roles, ALPN, mutual TLS, session resumption, and STARTTLS — against <code>hopf-core::tls</code> over an actual socket. This is the only independent-implementation cross-check TCP TLS gets in this workspace; deleting the crate would silently regress that coverage down to Hopf talking to itself.</p>
-<p>Its runtime-facing API is a thin re-export shim (<code>acceptor_from_pem</code>, <code>connector_from_pem</code>, <code>insecure_connector</code>, <code>public_trust_connector</code>) that forwards straight to the identically-named <code>hopf_core::tls</code> functions, kept only so the crate's own tests didn't need touching when the engine moved in-tree. New code should call <code>hopf_core::tls</code> (or the re-exports at the <code>hopf_core</code> crate root) directly, as shown throughout this page, rather than depending on <code>hopf-tls</code>.</p>
+<h2 id="independent-verification">Independent verification</h2>
+<p>Production TCP TLS is entirely <code>hopf-core::tls</code> as described above. The workspace additionally runs socket-level interop tests that complete real handshakes against <code>rustls</code> (TLS 1.3 and 1.2, both roles, ALPN, mTLS, resumption, STARTTLS) so wire behaviour is checked against a second implementation, not only Hopf-to-Hopf loops. DTLS gets a separate real-peer suite (OpenSSL). Status tables: <a href="conformance.html#tls">Conformance → TLS</a>.</p>
 
       <p class="footer">
         <a href="https://github.com/cpkb-bluezoo/hopf">GitHub</a>

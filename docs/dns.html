@@ -413,13 +413,13 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 </tr>
 <tr>
 <td><code>DohClientTransport</code></td>
-<td><code>doh</code> (+ <code>hopf-http</code>, <code>hopf-tls</code>)</td>
+<td><code>doh</code> (+ <code>hopf-http</code>, <code>hopf-core::tls</code>)</td>
 </tr>
 </tbody>
 </table>
 <p>Traits: <code>DnsClientTransport</code>, <code>DnsClientTransportHandler</code>. Each <code>send_query</code> schedules I/O and returns immediately; responses arrive via the handler callback — there is no blocking query API. These aren't just standalone building blocks: <code>DnsResolver::add_server_doq</code>/<code>add_server_doh</code> construct and drive them directly as part of the resolver's own query pipeline (see <a href="#resolver">Resolver</a>), keeping the transport instance alive for exactly as long as one query is outstanding.</p>
 <p>DoH (<code>DohClientTransport</code>) and DoQ (<code>DoqClientTransport</code>) are <code>DnsClientTransport</code> implementations: DoH dials HTTP/1.1 (POST by default, or GET via <code>with_get(true)</code>) on a shared <code>Arc&lt;Runtime&gt;</code>; DoQ dials via <code>hopf-quic</code>, zeroing the DNS message ID both directions (RFC 9250 §4.2.1). Neither waits on the caller thread.</p>
-<p>DoT client uses <code>hopf-tls</code> when feature <code>dot</code> is enabled. <code>TcpDnsConnectionPool</code> (shared by plain TCP and DoT) reuses a live connection per destination server across queries instead of dialing fresh every time, transparently reconnecting (and, for DoT, re-handshaking) if a reused connection turns out to be stale. Since <code>query_dot</code> is synchronous, <code>DnsResolver::add_server_dot</code> drives each query on a dedicated spawned thread — the same pattern already used for UDP's own truncation → TCP fallback.</p>
+<p>DoT wraps the shared <code>TcpDnsConnectionPool</code> with a <code>SharedTlsConnector</code> from <code>hopf-core::tls</code> (typically <code>connector_from_pem</code> or <code>public_trust_connector</code>) when feature <code>dot</code> is enabled. <code>TcpDnsConnectionPool</code> (shared by plain TCP and DoT) reuses a live connection per destination server across queries instead of dialing fresh every time, transparently reconnecting (and, for DoT, re-handshaking) if a reused connection turns out to be stale. Since <code>query_dot</code> is synchronous, <code>DnsResolver::add_server_dot</code> drives each query on a dedicated spawned thread — the same pattern already used for UDP's own truncation → TCP fallback.</p>
 <p><strong>DoQ limitations:</strong> every query still dials a brand-new QUIC connection — no session-ticket caching, 0-RTT, or cross-query connection reuse (RFC 9250 §4.5/§5.5.1) — and EDNS Padding (<code>encode_edns_padding</code>, RFC 7830/RFC 9250 §5.4) isn't automatically applied to DoQ/DoT queries, though the codec is available for a caller to compose in.</p>
 <h2 id="dnssec">DNSSEC</h2>
 <p>Feature <code>dnssec</code> (+ <code>aws-lc-rs</code> and <code>ed448-goldilocks-plus</code>):</p>
@@ -541,7 +541,7 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 </tr>
 <tr>
 <td><code>dot</code></td>
-<td>DoT (+ <code>hopf-tls</code>)</td>
+<td>DoT (+ <code>hopf-core::tls</code>)</td>
 </tr>
 <tr>
 <td><code>doq</code></td>
@@ -549,7 +549,7 @@ listen_dns_tcp(&amp;rt, addr, handle)?;</code></pre>
 </tr>
 <tr>
 <td><code>doh</code></td>
-<td>DoH (+ <code>hopf-http</code>, <code>hopf-tls</code>)</td>
+<td>DoH (+ <code>hopf-http</code>, <code>hopf-core::tls</code>)</td>
 </tr>
 <tr>
 <td><code>dnssec</code></td>

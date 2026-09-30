@@ -19,9 +19,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rcgen::generate_simple_self_signed;
-use hopf_core::{Runtime, RuntimeConfig};
+use hopf_core::{acceptor_from_pem, Runtime, RuntimeConfig};
 use hopf_http::{Headers, HttpServer, ServerHandler, ServerHandlerFactory, ServerWriter};
-use hopf_tls::acceptor_from_pem;
 
 struct Hello;
 

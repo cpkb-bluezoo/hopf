@@ -13,5 +13,4 @@ path = "main.rs"
 [dependencies]
 hopf-core = { workspace = true }
 hopf-http = { workspace = true }
-hopf-tls = { workspace = true }
 rcgen = { workspace = true }

@@ -140,7 +140,7 @@
 <tr><td>Other transport families</td><td>Separate stacks on same primitives</td><td>SSH/SFTP/SCP (SSH KEX, not TLS), DNSCrypt, CoAP/OSCORE — not DTLS-interoperable</td></tr>
 </tbody>
 </table>
-<p>Details: <a href="architecture.html#security-substrate">Architecture → Security substrate</a>, <a href="tls.html#hopf-tls-interop">hopf-tls interop harness</a>, <a href="quic-h3.html#implementation-status">QUIC implementation status</a>.</p>
+<p>Details: <a href="architecture.html#security-substrate">Architecture → Security substrate</a>, <a href="tls.html#independent-verification">TLS → Independent verification</a>, <a href="quic-h3.html#implementation-status">QUIC implementation status</a>.</p>
 
 <h2 id="tls">TLS — RFC 8446 / RFC 5246 (in-tree, <code>hopf-core::tls</code>)</h2>
 <p>TLS 1.3 and TLS 1.2 are implemented in-tree in <code>hopf-core::tls</code> (<code>HandshakeEngine</code>/<code>TlsRecordEngine</code> for 1.3, <code>tls12::{Tls12Engine, Tls12RecordEngine}</code> for 1.2).</p>

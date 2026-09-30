@@ -106,7 +106,7 @@ ProtocolHandler::connected / receive / …</code></pre>
 <span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>rt<span class="op">.</span>connect(<span class="pp">TcpConnectorConfig::</span>new(addr<span class="op">,</span> <span class="kw">move</span> <span class="op">||</span> <span class="op">{</span></span>
 <span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>    <span class="dt">Box</span><span class="pp">::</span>new(MyClient) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
 <span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>))<span class="op">?;</span></span></code></pre></div>
-<p>Optional TLS: <code>TcpConnectorConfig::with_tls(connector, server_name)</code> from <code>hopf-tls</code>.</p>
+<p>Optional TLS-from-dial uses the same in-tree <code>hopf-core::tls</code> stack as listeners: a <code>SharedTlsConnector</code> from <code>connector_from_pem</code>, <code>public_trust_connector</code>, or another PEM builder, then <code>TcpConnectorConfig::with_tls(connector, server_name)</code>. <code>TcpConnection</code> drives <code>TlsVariant</code> until <code>ProtocolHandler::security_established</code>. Details: <a href="tls.html#wiring-listeners-and-connectors">TLS → Wiring</a>.</p>
 <h2 id="tcpconnectorconfig">TcpConnectorConfig</h2>
 <table>
 <colgroup>

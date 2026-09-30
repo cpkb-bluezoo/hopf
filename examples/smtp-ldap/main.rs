@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hopf_core::{Runtime, RuntimeConfig};
+use hopf_core::{connector_from_pem, Runtime, RuntimeConfig};
 use hopf_ldap::{LdapCredentialStore, LdapStoreConfig, DEFAULT_LDAP_PORT, DEFAULT_LDAPS_PORT};
 use hopf_smtp::{SmtpConfig, SmtpService};
 
@@ -63,7 +63,7 @@ fn main() -> io::Result<()> {
     }
 
     if let Ok(ca) = env::var("LDAP_CA_PEM") {
-        let connector = hopf_tls::connector_from_pem(Path::new(&ca), &[])?;
+        let connector = connector_from_pem(Path::new(&ca), &[])?;
         let port = store_cfg.port;
         if port == DEFAULT_LDAP_PORT {
             store_cfg = store_cfg.with_port(DEFAULT_LDAPS_PORT);

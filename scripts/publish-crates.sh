@@ -18,6 +18,9 @@
 #   --interval-update 90s   (version bumps of existing crates)
 #   --interval DUR    sets both (legacy / blunt override)
 #
+# hopf-tls: publish 0.4.0 once (deprecated final release), then remove it from
+# CRATES below, set `publish = false` in crates/hopf-tls/Cargo.toml, and commit.
+#
 # Usage (from repo root, with CARGO_REGISTRY_TOKEN set or `cargo login` done):
 #   ./scripts/publish-crates.sh
 #   ./scripts/publish-crates.sh --dry-run
@@ -57,6 +60,7 @@ CRATES=(
   hopf-otel
   hopf-ftp
   hopf-amqp
+  hopf-amqp1
   hopf-smtp
   hopf-pop3
   hopf-imap
