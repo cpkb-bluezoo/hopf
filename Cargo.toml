@@ -21,6 +21,7 @@ members = [
     "crates/hopf-mailbox",
     "crates/hopf-pop3",
     "crates/hopf-imap",
+    "crates/hopf-nntp",
     "crates/hopf-mqtt",
     "crates/hopf-amqp",
     "crates/hopf-amqp1",
@@ -72,6 +73,7 @@ default-members = [
     "crates/hopf-mailbox",
     "crates/hopf-pop3",
     "crates/hopf-imap",
+    "crates/hopf-nntp",
     "crates/hopf-mqtt",
     "crates/hopf-amqp",
     "crates/hopf-amqp1",
@@ -98,7 +100,7 @@ aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys",
 tractrix = "0.2"
 self_cell = "1"
 rjsonparser = "0.1"
-rmimeparser = "0.4"
+rmimeparser = "0.5"
 rprotobuf = "0.1"
 # Internal crates: `version` must match [workspace.package] version (required
 # for publishing; cargo cannot inherit it here). Bump together on release.
@@ -120,6 +122,7 @@ hopf-smtp = { version = "0.4.0", path = "crates/hopf-smtp" }
 hopf-mailbox = { version = "0.4.0", path = "crates/hopf-mailbox" }
 hopf-pop3 = { version = "0.4.0", path = "crates/hopf-pop3" }
 hopf-imap = { version = "0.4.0", path = "crates/hopf-imap" }
+hopf-nntp = { version = "0.4.0", path = "crates/hopf-nntp" }
 hopf-mqtt = { version = "0.4.0", path = "crates/hopf-mqtt" }
 hopf-amqp = { version = "0.4.0", path = "crates/hopf-amqp" }
 hopf-amqp1 = { version = "0.4.0", path = "crates/hopf-amqp1" }
