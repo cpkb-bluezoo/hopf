@@ -110,6 +110,8 @@ struct SmtpSendState {
     /// AUTH credentials (username/password, driven via the strongest
     /// mechanism the server advertises — see [`SmtpSendDriver::choose_mechanism`]).
     auth: Option<(String, String)>,
+    /// The `auth` secret is a bearer token (XOAUTH2 / OAUTHBEARER), not a password.
+    auth_bearer: bool,
     /// In-progress SASL exchange, between the `334` challenge and our reply.
     sasl_client: Option<Box<dyn SaslClient>>,
     /// Index of the next recipient to send.
@@ -118,6 +120,9 @@ struct SmtpSendState {
     accepted_rcpts: usize,
     /// PIPELINING group failed (e.g. MAIL rejected); drain replies then quit.
     pipeline_abort: bool,
+    /// The MAIL FROM rejection that set `pipeline_abort`, reported once the
+    /// pipelined replies have drained.
+    pipeline_abort_why: Option<(u16, String)>,
     /// Completion callback.
     on_complete: Option<Box<dyn FnOnce(bool) + Send>>,
     /// Richer completion callback (issue #344) — see [`SmtpSend::on_result`].
@@ -125,6 +130,53 @@ struct SmtpSendState {
     /// Set by an offloaded DATA/BDAT chunk read's storage callback (issue
     /// #184); applied by `SmtpSendDriver::resume_pending_data`.
     pending_data: Option<PendingDataOutcome>,
+}
+
+/// The `EHLO` / `HELO` argument: `hostname` as given, or, when it is empty,
+/// this connection's own address in RFC 5321 §4.1.3 address-literal form
+/// (`[192.0.2.1]`, `[IPv6:2001:db8::1]`) — what a client with no name of
+/// its own (a desktop mail client behind NAT) is supposed to send.
+pub(crate) fn ehlo_argument(hostname: &str, ep: &dyn Endpoint) -> String {
+    let h = hostname.trim();
+    if !h.is_empty() {
+        return h.to_string();
+    }
+    match ep.local_addr() {
+        Ok(hopf_core::PeerAddr::Inet(std::net::SocketAddr::V4(a))) => format!("[{}]", a.ip()),
+        Ok(hopf_core::PeerAddr::Inet(std::net::SocketAddr::V6(a))) => format!("[IPv6:{}]", a.ip()),
+        _ => "[127.0.0.1]".to_string(),
+    }
+}
+
+/// The strongest mechanism an auto-pilot can drive with what it holds —
+/// a bare username/password, or (`bearer`) an OAuth 2.0 token — that the
+/// server actually advertises. Password auth excludes DIGEST-MD5
+/// (deprecated, needs a hostname the pipelines don't track) and EXTERNAL
+/// (needs a client certificate); a custom driver can still use any of
+/// those directly via [`SmtpClientSession::auth`].
+pub(crate) fn choose_sasl_mechanism(auth_methods: &[String], bearer: bool) -> Option<SaslMechanism> {
+    const PASSWORD: &[SaslMechanism] = &[
+        SaslMechanism::ScramSha256,
+        SaslMechanism::CramMd5,
+        SaslMechanism::Plain,
+        SaslMechanism::Login,
+    ];
+    const BEARER: &[SaslMechanism] = &[SaslMechanism::XOauth2, SaslMechanism::OauthBearer];
+    let preference = if bearer { BEARER } else { PASSWORD };
+    preference
+        .iter()
+        .copied()
+        .find(|m| auth_methods.iter().any(|s| s.eq_ignore_ascii_case(m.name())))
+}
+
+/// The failure text when credentials were given but nothing usable was offered.
+pub(crate) fn no_mechanism_message(auth_methods: &[String], bearer: bool) -> String {
+    let wanted = if bearer { "XOAUTH2 or OAUTHBEARER" } else { "SCRAM-SHA-256, CRAM-MD5, PLAIN or LOGIN" };
+    if auth_methods.is_empty() {
+        format!("server advertises no AUTH mechanisms ({wanted} needed)")
+    } else {
+        format!("server advertises no usable AUTH mechanism ({wanted} needed; offered: {})", auth_methods.join(" "))
+    }
 }
 
 // ── SmtpSend ─────────────────────────────────────────────────────────────────
@@ -169,10 +221,12 @@ impl SmtpSend {
             require_starttls: false,
             opportunistic_starttls: false,
             auth: None,
+            auth_bearer: false,
             sasl_client: None,
             rcpt_idx: 0,
             accepted_rcpts: 0,
             pipeline_abort: false,
+            pipeline_abort_why: None,
             on_complete: None,
             on_result: None,
             pending_data: None,
@@ -301,7 +355,23 @@ impl SmtpSend {
 
     /// Set AUTH PLAIN credentials.
     pub fn auth_plain(self, user: impl Into<String>, pass: impl Into<String>) -> Self {
-        self.0.lock().unwrap().auth = Some((user.into(), pass.into()));
+        let mut st = self.0.lock().unwrap();
+        st.auth = Some((user.into(), pass.into()));
+        st.auth_bearer = false;
+        drop(st);
+        self
+    }
+
+    /// Authenticate with an OAuth 2.0 bearer token (Gmail, Microsoft 365):
+    /// `XOAUTH2` when the server advertises it, else `OAUTHBEARER`. When
+    /// credentials are set and the server advertises no mechanism this
+    /// pipeline can drive, the send fails with [`SmtpSendOutcome::Failed`]
+    /// rather than going ahead unauthenticated.
+    pub fn auth_bearer(self, user: impl Into<String>, token: impl Into<String>) -> Self {
+        let mut st = self.0.lock().unwrap();
+        st.auth = Some((user.into(), token.into()));
+        st.auth_bearer = true;
+        drop(st);
         self
     }
 
@@ -329,6 +399,22 @@ impl SmtpClientHandlerFactory for SmtpSend {
             runtime: Arc::clone(runtime),
         })
     }
+
+    /// No connection, no driver: report it the same way a connection-level
+    /// failure is reported (retryable, no reply code) so callers waiting
+    /// on `on_result` / `on_complete` are not left hanging.
+    fn connect_failed(&self, host: &str, error: &std::io::Error) {
+        let (on_result, on_complete) = {
+            let mut st = self.0.lock().unwrap();
+            (st.on_result.take(), st.on_complete.take())
+        };
+        if let Some(cb) = on_result {
+            cb(SmtpSendOutcome::Failed(format!("connect to {host} failed: {error}")));
+        }
+        if let Some(cb) = on_complete {
+            cb(false);
+        }
+    }
 }
 
 // ── SmtpSendDriver ────────────────────────────────────────────────────────────
@@ -351,6 +437,22 @@ impl SmtpSendDriver {
         } else {
             SmtpSendOutcome::Failed(String::new())
         });
+    }
+
+    /// Failure with no reply code to classify, but with a reason the caller
+    /// can show or log.
+    fn fail(&self, reason: impl Into<String>) {
+        self.finish(SmtpSendOutcome::Failed(reason.into()));
+    }
+
+    /// The pipelined MAIL FROM was rejected: report it with its code now
+    /// that the group's replies have drained.
+    fn fail_pipelined_mail(&self) {
+        let why = self.state.lock().unwrap().pipeline_abort_why.take();
+        match why {
+            Some((code, message)) => self.complete_rejected(code, &message),
+            None => self.fail("MAIL FROM rejected"),
+        }
     }
 
     /// Completion with an explicit SMTP reply code — used at the sites
@@ -380,17 +482,8 @@ impl SmtpSendDriver {
     /// track), OAUTHBEARER (needs a bearer token, not a password), and
     /// EXTERNAL (needs a client certificate) — a custom driver can still
     /// use any of those directly via [`SmtpClientSession::auth`].
-    fn choose_mechanism(auth_methods: &[String]) -> Option<SaslMechanism> {
-        const PREFERENCE: &[SaslMechanism] = &[
-            SaslMechanism::ScramSha256,
-            SaslMechanism::CramMd5,
-            SaslMechanism::Plain,
-            SaslMechanism::Login,
-        ];
-        PREFERENCE
-            .iter()
-            .copied()
-            .find(|m| auth_methods.iter().any(|s| s.eq_ignore_ascii_case(m.name())))
+    fn choose_mechanism(auth_methods: &[String], bearer: bool) -> Option<SaslMechanism> {
+        choose_sasl_mechanism(auth_methods, bearer)
     }
 
     /// Pull the next body chunk for BDAT, with one-chunk lookahead so the
@@ -524,9 +617,17 @@ impl SmtpSendDriver {
         let mut st = self.state.lock().unwrap();
         let sender = st.sender.clone();
         let params = st.mail_params.clone();
-        let recipients = st.recipients.clone();
+        let mut recipients = st.recipients.clone();
         let pipelining = session.capabilities().pipelining;
         let chunking = session.capabilities().chunking;
+        if !session.capabilities().dsn {
+            // RFC 3461 §4: NOTIFY / ORCPT may only be sent to a server that
+            // advertised DSN; a caller asking for them on another server
+            // gets plain RCPT TO rather than a 555 (or a 501) in return.
+            for (_, params) in &mut recipients {
+                *params = DsnRecipientParams::default();
+            }
+        }
         if pipelining {
             st.rcpt_idx = recipients.len();
         }
@@ -538,8 +639,8 @@ impl SmtpSendDriver {
 }
 
 impl SmtpClientDriver for SmtpSendDriver {
-    fn on_greeting(&mut self, hello: &mut dyn SmtpClientHello, _ep: &mut dyn Endpoint, esmtp: bool) {
-        let hostname = self.state.lock().unwrap().hostname.clone();
+    fn on_greeting(&mut self, hello: &mut dyn SmtpClientHello, ep: &mut dyn Endpoint, esmtp: bool) {
+        let hostname = ehlo_argument(&self.state.lock().unwrap().hostname, ep);
         if esmtp {
             hello.ehlo(&hostname);
         } else {
@@ -547,8 +648,8 @@ impl SmtpClientDriver for SmtpSendDriver {
         }
     }
 
-    fn on_service_unavailable(&mut self, ep: &mut dyn Endpoint, _message: &str) {
-        self.complete(false);
+    fn on_service_unavailable(&mut self, ep: &mut dyn Endpoint, message: &str) {
+        self.fail(format!("service unavailable: {message}"));
         ep.close();
     }
 
@@ -570,7 +671,7 @@ impl SmtpClientDriver for SmtpSendDriver {
                 } else {
                     drop(st);
                     // STARTTLS required but not advertised.
-                    self.complete(false);
+                    self.fail("STARTTLS required but the server does not offer it");
                     session.quit();
                     return;
                 }
@@ -586,7 +687,8 @@ impl SmtpClientDriver for SmtpSendDriver {
 
         // AUTH path.
         if let Some((user, pass)) = st.auth.clone() {
-            if let Some(mech) = Self::choose_mechanism(&caps.auth_methods) {
+            let bearer = st.auth_bearer;
+            if let Some(mech) = Self::choose_mechanism(&caps.auth_methods, bearer) {
                 let mut client = create_client(mech, &user, &pass, "", "smtp", None);
                 if client.has_initial_response() {
                     if let SaslClientStep::Response(initial) = client.evaluate(None) {
@@ -602,6 +704,13 @@ impl SmtpClientDriver for SmtpSendDriver {
                     return;
                 }
             }
+            // Credentials were given, so the caller expects an authenticated
+            // submission: going ahead without would at best be refused with
+            // a 530 and at worst relay through an open server unnoticed.
+            drop(st);
+            self.finish(SmtpSendOutcome::Failed(no_mechanism_message(&caps.auth_methods, bearer)));
+            session.quit();
+            return;
         }
 
         // Proceed to envelope.
@@ -609,7 +718,7 @@ impl SmtpClientDriver for SmtpSendDriver {
         if params.require_tls && !caps.require_tls {
             drop(st);
             // RFC 8689 §4.2.1: next hop must advertise REQUIRETLS after TLS.
-            self.complete(false);
+            self.fail("REQUIRETLS requested but the server does not advertise it");
             session.quit();
             return;
         }
@@ -618,14 +727,14 @@ impl SmtpClientDriver for SmtpSendDriver {
         {
             drop(st);
             // RFC 3030: BINARYMIME requires CHUNKING.
-            self.complete(false);
+            self.fail("BINARYMIME requested but the server does not support CHUNKING");
             session.quit();
             return;
         }
         if let (Some(size), max) = (params.size, caps.max_size) {
             if max > 0 && size > max {
                 drop(st);
-                self.complete(false);
+                self.fail(format!("message size {size} exceeds the server limit of {max} octets"));
                 session.quit();
                 return;
             }
@@ -643,8 +752,8 @@ impl SmtpClientDriver for SmtpSendDriver {
         session.helo(&hostname);
     }
 
-    fn on_ehlo_error(&mut self, ep: &mut dyn Endpoint, _message: &str) {
-        self.complete(false);
+    fn on_ehlo_error(&mut self, ep: &mut dyn Endpoint, message: &str) {
+        self.fail(format!("EHLO rejected: {message}"));
         ep.close();
     }
 
@@ -652,17 +761,17 @@ impl SmtpClientDriver for SmtpSendDriver {
         self.begin_mail(session);
     }
 
-    fn on_helo_error(&mut self, ep: &mut dyn Endpoint, _message: &str) {
-        self.complete(false);
+    fn on_helo_error(&mut self, ep: &mut dyn Endpoint, message: &str) {
+        self.fail(format!("HELO rejected: {message}"));
         ep.close();
     }
 
     fn on_tls_established(
         &mut self,
         post_tls: &mut dyn SmtpClientPostTls,
-        _ep: &mut dyn Endpoint,
+        ep: &mut dyn Endpoint,
     ) {
-        let hostname = self.state.lock().unwrap().hostname.clone();
+        let hostname = ehlo_argument(&self.state.lock().unwrap().hostname, ep);
         post_tls.ehlo(&hostname);
     }
 
@@ -672,12 +781,12 @@ impl SmtpClientDriver for SmtpSendDriver {
         _ep: &mut dyn Endpoint,
     ) {
         // STARTTLS was required — abort.
-        self.complete(false);
+        self.fail("STARTTLS refused by the server");
         session.quit();
     }
 
-    fn on_tls_error(&mut self, ep: &mut dyn Endpoint, _message: &str) {
-        self.complete(false);
+    fn on_tls_error(&mut self, ep: &mut dyn Endpoint, message: &str) {
+        self.fail(format!("TLS handshake failed: {message}"));
         ep.close();
     }
 
@@ -730,9 +839,9 @@ impl SmtpClientDriver for SmtpSendDriver {
         &mut self,
         session: &mut dyn SmtpClientSession,
         _ep: &mut dyn Endpoint,
-        _code: u16,
+        code: u16,
     ) {
-        self.complete(false);
+        self.complete_rejected(code, "authentication failed");
         session.quit();
     }
 
@@ -740,7 +849,7 @@ impl SmtpClientDriver for SmtpSendDriver {
         // PLAIN never issues its own abort — this only fires if the server
         // sent an unexpected challenge, which `on_auth_challenge` answers
         // with `exchange.abort()`. Treat the same as a failed AUTH.
-        self.complete(false);
+        self.fail("AUTH exchange aborted");
         session.quit();
     }
 
@@ -759,7 +868,7 @@ impl SmtpClientDriver for SmtpSendDriver {
             envelope.rcpt_to(&r, &params);
         } else {
             // No recipients — abort.
-            self.complete(false);
+            self.fail("no recipients");
             envelope.rset();
         }
     }
@@ -768,14 +877,16 @@ impl SmtpClientDriver for SmtpSendDriver {
         &mut self,
         session: &mut dyn SmtpClientSession,
         _ep: &mut dyn Endpoint,
-        _code: u16,
-        _message: &str,
+        code: u16,
+        message: &str,
     ) {
         if session.awaiting_more_replies() {
-            self.state.lock().unwrap().pipeline_abort = true;
+            let mut st = self.state.lock().unwrap();
+            st.pipeline_abort = true;
+            st.pipeline_abort_why = Some((code, message.to_string()));
             return;
         }
-        self.complete(false);
+        self.complete_rejected(code, message);
         session.quit();
     }
 
@@ -790,7 +901,7 @@ impl SmtpClientDriver for SmtpSendDriver {
             return;
         }
         if self.state.lock().unwrap().pipeline_abort {
-            self.complete(false);
+            self.fail_pipelined_mail();
             envelope.quit();
             return;
         }
@@ -820,7 +931,7 @@ impl SmtpClientDriver for SmtpSendDriver {
             return;
         }
         if self.state.lock().unwrap().pipeline_abort {
-            self.complete(false);
+            self.fail_pipelined_mail();
             envelope.quit();
             return;
         }
@@ -837,7 +948,7 @@ impl SmtpClientDriver for SmtpSendDriver {
             envelope.start_data();
         } else {
             // All rejected.
-            self.complete(false);
+            self.fail("every recipient was rejected");
             envelope.rset();
         }
     }
@@ -1014,13 +1125,13 @@ impl SmtpClientDriver for SmtpSendDriver {
     ) {
     }
 
-    fn on_error(&mut self, ep: &mut dyn Endpoint, _err: &io::Error) {
-        self.complete(false);
+    fn on_error(&mut self, ep: &mut dyn Endpoint, err: &io::Error) {
+        self.fail(format!("connection error: {err}"));
         ep.close();
     }
 
     fn on_timeout(&mut self, ep: &mut dyn Endpoint) {
-        self.complete(false);
+        self.fail("timed out waiting for the server");
         ep.close();
     }
 

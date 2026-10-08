@@ -44,6 +44,7 @@
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html" aria-current="page">IMAP</a></li>
+<li><a href="nntp.html">NNTP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
 <li><a href="amqp.html">AMQP 0-9-1</a></li>
 <li><a href="amqp1.html">AMQP 1.0</a></li>
@@ -217,7 +218,22 @@ ImapClient::new(&quot;mail.example.com&quot;, 143)
         ),
     )?;</code></pre>
 <p>For full control implement <code>ImapClientDriver</code>: every server event surfaces as a callback (<code>on_greeting</code>, <code>on_capability</code>, <code>on_authenticated</code>, <code>on_selected</code>, <code>on_fetch_data</code>, <code>on_status_data</code>, <code>on_list_entry</code>, <code>on_idle_started</code>, …), and each callback receives the staged state reference (<code>ImapClientNotAuthenticated</code> → <code>ImapClientAuthenticated</code> → <code>ImapClientSelected</code> / <code>ImapClientIdle</code>) whose methods issue the commands that are legal in that state.</p>
+<p><code>on_fetch_data</code> delivers an <code>ImapFetchData</code> with <code>FLAGS</code>, <code>UID</code>, <code>RFC822.SIZE</code>, <code>MODSEQ</code>, <code>EMAILID</code>/<code>THREADID</code> parsed, and <code>ENVELOPE</code>, <code>BODYSTRUCTURE</code> (or <code>BODY</code>) and <code>INTERNALDATE</code> captured verbatim — any literal the server used inside them (a non-ASCII subject, say) is re-encoded as a quoted string, so each is one line of IMAP syntax. Parse them with <code>ImapEnvelope::parse</code> and <code>ImapBodyStructure::parse</code>; <code>ImapBodyStructure::parts()</code> lists every leaf with the section number <code>BODY[section]</code> would use for it (RFC 3501 §6.4.5, encapsulated <code>message/rfc822</code> parts included), and <code>display_candidates()</code> picks the first non-attachment <code>text/plain</code> and <code>text/html</code> parts, which is what a mail client fetches instead of the whole message. Literal-bearing items (<code>BODY[section]</code>, <code>RFC822*</code>) are streamed through <code>on_fetch_literal*</code> as before.</p>
+<p><code>list_extended(reference, pattern, &amp;ImapListOptions)</code> issues an RFC 5258 <code>LIST</code> with selection options (<code>SUBSCRIBED</code>, <code>REMOTE</code>, <code>RECURSIVEMATCH</code>, <code>SPECIAL-USE</code>) and <code>RETURN</code> items (<code>SUBSCRIBED</code>, <code>CHILDREN</code>, <code>SPECIAL-USE</code>, and <code>STATUS (…)</code> per RFC 5819); the <code>* STATUS</code> replies a <code>RETURN (STATUS …)</code> provokes are routed to <code>on_status_data</code> interleaved with the <code>on_list_entry</code> calls, which is the one round trip a mail client needs for a folder list with unread counts. Extended data items after a LIST name (<code>CHILDINFO</code>, <code>OLDNAME</code>) are accepted and skipped. <code>ImapCapabilities</code> reports <code>list_extended</code>, <code>list_status</code>, <code>special_use</code> and <code>children</code>.</p>
+<p>Commands that do not originate in a reply — a mail client whose user just clicked a folder, say — reach a live session through <code>ImapClientDriver::on_wake</code>. It runs at the start of every <code>receive</code>, so in particular after a <code>hopf_core::ConnHandle::poke()</code> from any thread (which re-enters <code>receive</code> with no data), and it is handed an <code>ImapClientWakeState</code>: the staged state reference for the session's current state (<code>NotAuthenticated</code> / <code>Authenticated</code> / <code>Selected</code> / <code>Idle</code>), or <code>Busy</code> while nothing can be issued (connecting, mid-STARTTLS, IDLE sent but not yet acknowledged). Whatever the driver issues is flushed when it returns. The pattern is: stash the <code>ConnHandle</code> from <code>ep.handle()</code> in an early callback, queue work somewhere the driver can see it, poke, and drain the queue in <code>on_wake</code> — putting back anything the current state does not allow. During IDLE the only legal command is <code>done()</code>; issue the real work from <code>on_idle_complete</code>, which hands over <code>ImapClientSelected</code>.</p>
+<pre class="rust,ignore"><code>fn on_wake(&amp;mut self, state: ImapClientWakeState&lt;'_&gt;, _ep: &amp;mut dyn Endpoint) {
+    let Some(job) = self.queue.lock().unwrap().pop_front() else { return };
+    match (job, state) {
+        (Job::Fetch(set), ImapClientWakeState::Selected(s)) =&gt; s.uid_fetch(&amp;set, "(FLAGS BODY.PEEK[HEADER])"),
+        (Job::Fetch(_), ImapClientWakeState::Idle(i)) =&gt; { i.done(); /* re-queue; see on_idle_complete */ }
+        (job, _) =&gt; self.queue.lock().unwrap().push_front(job), // not now
+    }
+}
+// elsewhere, on the UI thread:
+queue.lock().unwrap().push_back(Job::Fetch("1:*".into()));
+conn_handle.poke();</code></pre>
 <h3 id="client-options">Client options</h3>
+<p>Two things the options table below does not cover. <code>max_net_out(bytes)</code> (and <code>max_net_in</code>) set this connection's buffer limits; hopf-core's 4 MiB outbound default closes the connection on a send that would overflow it, and <code>ImapClientAppend::send_literal</code> writes a whole <code>APPEND</code> literal in one call, so a client that appends messages must raise it above its largest message. And a dial that never produces a connection — DNS failure, no addresses, a connect that cannot start — reaches <code>ImapClientHandlerFactory::connect_failed(host, error)</code>, which prints to stderr unless overridden; <code>ImapFetch</code> and <code>ImapIdle</code> override it to call their <code>on_complete(false)</code>.</p>
 <table>
 <colgroup>
 <col style="width: 33%" />

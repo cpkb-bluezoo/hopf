@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NNTP — Hopf</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Literata:opsz,wght@7..72,400;7..72,600;7..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="assets/site.css">
+</head>
+<body>
+  <div class="layout">
+    <nav class="nav" aria-label="Documentation">
+<a class="logo" href="index.html"><img src="assets/hopf.png" alt="Hopf" width="220" height="206"></a>
+<a class="brand" href="index.html">Hopf</a>
+<p class="tag">Networking framework reference</p>
+<h2>Start</h2><ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="architecture.html">Architecture</a></li>
+</ul>
+<h2>Core</h2><ul>
+<li><a href="services.html">Services</a></li>
+<li><a href="clients.html">Clients</a></li>
+<li><a href="composition.html">Composition</a></li>
+<li><a href="runtime-options.html">Runtime options</a></li>
+</ul>
+<h2>Protocols</h2><ul>
+<li><a href="tls.html">TLS</a></li>
+<li><a href="http/overview.html">HTTP overview</a></li>
+<li><a href="http/server.html">HTTP server</a></li>
+<li><a href="http/client.html">HTTP client</a></li>
+<li><a href="quic-h3.html">QUIC / H3</a></li>
+<li><a href="masque.html">MASQUE</a></li>
+<li><a href="dns.html">DNS</a></li>
+<li><a href="mdns.html">mDNS</a></li>
+<li><a href="ldap.html">LDAP</a></li>
+<li><a href="webdav.html">WebDAV</a></li>
+<li><a href="websocket.html">WebSocket</a></li>
+<li><a href="grpc.html">gRPC</a></li>
+<li><a href="socks.html">SOCKS</a></li>
+<li><a href="ftp.html">FTP</a></li>
+<li><a href="smtp.html">SMTP</a></li>
+<li><a href="pop3.html">POP3</a></li>
+<li><a href="imap.html">IMAP</a></li>
+<li><a href="nntp.html" aria-current="page">NNTP</a></li>
+<li><a href="mqtt.html">MQTT</a></li>
+<li><a href="amqp.html">AMQP 0-9-1</a></li>
+<li><a href="amqp1.html">AMQP 1.0</a></li>
+<li><a href="mailbox.html">Mailbox</a></li>
+</ul>
+<h2>Cross-cutting</h2><ul>
+<li><a href="auth.html">Auth</a></li>
+<li><a href="quota.html">Quota</a></li>
+<li><a href="access-control.html">Access control</a></li>
+<li><a href="telemetry.html">Telemetry</a></li>
+</ul>
+<h2>Architecture audit</h2><ul>
+<li><a href="conformance.html">Conformance</a></li>
+</ul>
+<h2>Cookbook</h2><ul>
+<li><a href="cookbook/echo.html">Echo</a></li>
+<li><a href="cookbook/tls-echo.html">TLS echo</a></li>
+<li><a href="cookbook/http-hello-get.html">HTTP hello / get</a></li>
+<li><a href="cookbook/dns-proxy.html">DNS proxy</a></li>
+<li><a href="cookbook/dns-authoritative.html">DNS authoritative</a></li>
+<li><a href="cookbook/webdav.html">WebDAV</a></li>
+<li><a href="cookbook/websocket.html">WebSocket</a></li>
+<li><a href="cookbook/grpc.html">gRPC</a></li>
+<li><a href="cookbook/ftp.html">FTP</a></li>
+<li><a href="cookbook/smtp.html">SMTP</a></li>
+<li><a href="cookbook/pop3.html">POP3</a></li>
+</ul>
+</nav>
+    <main class="main">
+      <header>
+        <h1>NNTP</h1>
+        <p class="lead"><code>hopf-nntp</code> is an NNTP / NNTPS <strong>async client</strong> (RFC 3977, STARTTLS per RFC 4642, AUTHINFO per RFC 4643). It dials, greets, reads <code>CAPABILITIES</code>, negotiates TLS and authenticates for you, then hands your handler a session that queues commands from any thread and answers through callbacks. There is no server in this crate.</p>
+      </header>
+      <h2 id="features">Features</h2>
+<table>
+<colgroup>
+<col style="width: 40%" />
+<col style="width: 60%" />
+</colgroup>
+<thead>
+<tr>
+<th>Area</th>
+<th>Support</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Handshake</td>
+<td>Greeting (<code>200</code> posting allowed / <code>201</code>), <code>CAPABILITIES</code> (re-read after TLS), <code>STARTTLS</code> required or opportunistic, implicit NNTPS</td>
+</tr>
+<tr>
+<td>Auth</td>
+<td><code>AUTHINFO SASL</code> (SCRAM-SHA-256, CRAM-MD5, PLAIN, LOGIN — chosen from the <code>SASL</code> capability in that order of preference) or <code>AUTHINFO USER</code> / <code>PASS</code>; credentials go out only once TLS is as configured</td>
+</tr>
+<tr>
+<td>Commands</td>
+<td>Typed helpers for <code>LIST ACTIVE [wildmat]</code>, <code>GROUP</code>, <code>OVER</code>, <code>ARTICLE</code>, <code>HEAD</code>, <code>POST</code>, <code>QUIT</code>; <code>NntpSession::command</code> for anything else</td>
+</tr>
+<tr>
+<td>Multi-line replies</td>
+<td>Delivered line by line, dot-unstuffed, as the bytes arrive; <code>POST</code> bodies are dot-stuffed and terminated for you</td>
+</tr>
+<tr>
+<td>Timeouts</td>
+<td>DNS, connect, and a per-command quiet-time budget reset on every reply line</td>
+</tr>
+</tbody>
+</table>
+<h2 id="session-api">Session API</h2>
+<p><code>NntpClientHandler::on_connected(&amp;NntpSession, &amp;NntpGreeting)</code> fires once the session is usable; the greeting carries the capabilities, whether posting is allowed, and whether the connection is secure and authenticated. Clone the <code>NntpSession</code> and keep it: commands may be queued from any thread, go out one at a time in queue order, and each completion callback receives the final <code>NntpStatus</code> (or the transport error that ended the session, which every still-queued command also hears). <code>quit()</code> sends <code>QUIT</code> and closes once it is answered; <code>is_alive()</code> is false after that or once the connection is gone.</p>
+<p>Callbacks run on the connection's reactor thread: hand the data to another thread rather than doing slow work inside them.</p>
+<h2 id="quick-start">Quick start</h2>
+<pre class="rust,ignore"><code>use std::sync::Arc;
+use hopf_core::{public_trust_connector, Runtime, RuntimeConfig};
+use hopf_nntp::{NntpClient, NntpClientHandler, NntpGreeting, NntpSession};
+
+struct Headlines;
+
+impl NntpClientHandler for Headlines {
+    fn on_connected(&amp;mut self, session: &amp;NntpSession, greeting: &amp;NntpGreeting) {
+        println!(&quot;secure={} posting={}&quot;, greeting.secure, greeting.posting_allowed);
+        let s = session.clone();
+        session.group(&quot;comp.lang.rust&quot;, move |g| {
+            let g = g.expect(&quot;GROUP&quot;);
+            s.over(g.last.saturating_sub(20), g.last, |o| println!(&quot;{} {}&quot;, o.article_number, o.subject), |_| {});
+            s.quit();
+        });
+    }
+    fn on_error(&amp;mut self, error: &amp;std::io::Error) {
+        eprintln!(&quot;nntp: {error}&quot;);
+    }
+}
+
+let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
+NntpClient::new(&quot;news.example.com&quot;, 563)
+    .implicit_tls(public_trust_connector(&amp;[]), &quot;news.example.com&quot;)
+    .credentials(&quot;alice&quot;, &quot;secret&quot;)
+    .connect_with(&amp;rt, Box::new(Headlines))?;</code></pre>
+<h2 id="errors">Errors</h2>
+<p><code>NntpClientHandler::on_error</code> reports a refused or timed-out dial, a TLS failure, a required <code>STARTTLS</code> the server did not offer, rejected credentials (<code>PermissionDenied</code>, with the server's <code>481</code>/<code>482</code> text), a command that got no reply within the budget, or the transport going away mid-session. A command the server rejects is not a session error: its own callback gets <code>NntpClientError</code> with the status code and text.</p>
+<h2 id="limitations">Limitations</h2>
+<ul>
+<li>Client only; wildmat matching, overview formats beyond the default eight fields, and <code>LIST OVERVIEW.FMT</code> are left to the application.</li>
+<li>One command in flight at a time (no pipelining).</li>
+<li>Integration tests run against a scripted server inside the crate (<code>--features integration</code>).</li>
+</ul>
+</main>
+  </div>
+</body>
+</html>

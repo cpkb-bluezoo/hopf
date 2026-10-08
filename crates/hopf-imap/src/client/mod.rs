@@ -59,6 +59,7 @@ pub mod pending;
 pub mod pipeline;
 pub mod reply;
 pub mod state;
+pub mod structure;
 pub mod timeout;
 
 pub use endpoint::ImapClientEndpoint;
@@ -72,12 +73,13 @@ pub use pending::{
     DEFAULT_MAX_PIPELINE,
 };
 pub use pipeline::{pipeline_status_and_list, ImapFetch, ImapIdle, MessageReceiveCallback};
-pub use reply::{ImapEvent, ImapReplyLexer, ImapStatus, MAX_TOKEN};
+pub use reply::{ImapEvent, ImapReplyLexer, ImapStatus, MAX_CAPTURED_STRUCTURE, MAX_TOKEN};
+pub use structure::{ImapAddress, ImapBodyPart, ImapBodyStructure, ImapDisposition, ImapEnvelope, ImapMultipart, ImapSectionPart};
 pub use state::{
     parse_thread_response, ImapAppendUid, ImapCapabilities, ImapClientAppend,
     ImapClientAuthExchange, ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated,
-    ImapClientPostStarttls, ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData,
-    ImapListEntry, ImapMailboxInfo, ImapMetadataData, ImapMetadataEntry, ImapNamespace,
+    ImapClientPostStarttls, ImapClientSelected, ImapClientWakeState, ImapCopyUid, ImapEnabledFeatures, ImapFetchData,
+    ImapListEntry, ImapListOptions, ImapMailboxInfo, ImapMetadataData, ImapMetadataEntry, ImapNamespace,
     ImapNamespaceData, ImapQuotaData, ImapQuotaResource, ImapQuotaRootData, ImapStatusData,
     ImapThreadNode,
 };

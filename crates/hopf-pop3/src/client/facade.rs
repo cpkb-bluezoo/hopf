@@ -256,12 +256,15 @@ impl Pop3Client {
                 let addrs = match result {
                     Ok(a) => a,
                     Err(e) => {
-                        eprintln!("hopf-pop3: DNS error for {host_for_err}: {e}");
+                        factory.connect_failed(&host_for_err, &e);
                         return;
                     }
                 };
                 let Some(addr) = addrs.into_iter().next() else {
-                    eprintln!("hopf-pop3: DNS returned no addresses for {host_for_err}");
+                    factory.connect_failed(
+                        &host_for_err,
+                        &io::Error::new(io::ErrorKind::NotFound, "DNS returned no addresses"),
+                    );
                     return;
                 };
                 let tls_for_dial = tls_connector.clone();
@@ -284,7 +287,7 @@ impl Pop3Client {
                     }
                 }
                 if let Err(e) = rt2.connect(cfg) {
-                    eprintln!("hopf-pop3: connect error: {e}");
+                    factory.connect_failed(&host_for_err, &e);
                 }
             }),
         );

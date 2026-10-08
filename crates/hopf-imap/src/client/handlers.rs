@@ -10,7 +10,7 @@ use super::reply::ImapStatus;
 use super::state::{
     ImapAppendUid, ImapCapabilities, ImapClientAppend, ImapClientAuthExchange,
     ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated, ImapClientPostStarttls,
-    ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData, ImapListEntry,
+    ImapClientSelected, ImapClientWakeState, ImapCopyUid, ImapEnabledFeatures, ImapFetchData, ImapListEntry,
     ImapMailboxInfo, ImapMetadataData, ImapNamespaceData, ImapQuotaData, ImapQuotaRootData,
     ImapStatusData,
 };
@@ -19,6 +19,16 @@ use super::state::{
 pub trait ImapClientHandlerFactory: Send + Sync {
     /// Produce a fresh driver for one connection.
     fn create(&self) -> Box<dyn ImapClientDriver>;
+    /// The dial never produced a connection, so there is no driver to tell:
+    /// DNS failed or returned no addresses for `host`, or the connect could
+    /// not be started at all. (A connect that starts and then fails or
+    /// times out reaches the driver's `on_error` / `on_timeout` as usual.)
+    ///
+    /// Default: a line on stderr. Override it to surface the failure the
+    /// way the rest of the session's outcomes are surfaced.
+    fn connect_failed(&self, host: &str, error: &io::Error) {
+        eprintln!("hopf-imap: connect to {host} failed: {error}");
+    }
 }
 
 /// Unsolicited mailbox events (EXISTS / EXPUNGE / FLAGS) when no matching
@@ -482,6 +492,24 @@ pub trait ImapClientDriver: Send {
         message: &str,
     ) {
         let _ = (ep, tag, status, response_code, message);
+    }
+
+    /// A chance to issue commands that did not originate in a reply.
+    ///
+    /// Called at the start of every [`ProtocolHandler::receive`] — so after
+    /// a [`hopf_core::ConnHandle::poke`] from another thread (which
+    /// re-enters `receive` with no data), and also before each batch of
+    /// server replies is dispatched. `state` is the staged state object
+    /// for the session's current state, exactly as the stage callbacks
+    /// hand it over, or [`ImapClientWakeState::Busy`] when nothing can be
+    /// issued yet. Anything issued is flushed when this returns.
+    ///
+    /// Default: no-op. See [`ImapClientWakeState`] for the queue-and-poke
+    /// pattern this exists for.
+    ///
+    /// [`ProtocolHandler::receive`]: hopf_core::ProtocolHandler::receive
+    fn on_wake(&mut self, state: ImapClientWakeState<'_>, ep: &mut dyn Endpoint) {
+        let _ = (state, ep);
     }
 
     /// Unrecoverable I/O or protocol error.

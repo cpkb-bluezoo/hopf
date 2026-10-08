@@ -1882,3 +1882,400 @@ fn fetch_strips_authorization_header_on_a_cross_origin_redirect() {
         "Authorization header must be stripped across a cross-origin redirect:\n{head}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// H2 session: several bodyless requests in flight on one connection
+// ---------------------------------------------------------------------------
+
+/// Sends `n` GETs back to back from `on_connected` without waiting for any
+/// response, recording each one's outcome and any refusal from `send`.
+struct BurstConn {
+    outs: Vec<Arc<Mutex<GumdropOutcome>>>,
+    send_errors: Arc<Mutex<Vec<String>>>,
+}
+
+impl HttpConnectionHandler for BurstConn {
+    fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+        assert!(session.supports_multiplexing(), "expected an H2 session");
+        for (i, out) in self.outs.iter().enumerate() {
+            let r = session
+                .get(&format!("/burst/{i}"))
+                .send(Box::new(RecordingResponseHandler { out: Arc::clone(out) }));
+            if let Err(e) = r {
+                self.send_errors.lock().unwrap().push(e.to_string());
+            }
+        }
+    }
+}
+
+/// On HTTP/2 the Gumdrop session API accepts several bodyless requests
+/// without waiting for the earlier ones to complete, and every one of them
+/// gets its own response — the multiplexing a REST client needs to fetch a
+/// page of resources on one connection.
+#[test]
+fn gumdrop_h2_session_runs_concurrent_bodyless_requests() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let (addr, _captured) = start_capturing_server(&rt, true);
+
+    let outs: Vec<Arc<Mutex<GumdropOutcome>>> =
+        (0..3).map(|_| Arc::new(Mutex::new(GumdropOutcome::default()))).collect();
+    let send_errors = Arc::new(Mutex::new(Vec::new()));
+    HttpClient::new(addr.ip().to_string(), addr.port())
+        .h2_prior_knowledge(true)
+        .connect(
+            &rt,
+            Box::new(BurstConn { outs: outs.clone(), send_errors: Arc::clone(&send_errors) }),
+        )
+        .unwrap();
+
+    for (i, out) in outs.iter().enumerate() {
+        assert!(wait_gumdrop_done(out, Duration::from_secs(5)), "request {i} never completed");
+    }
+    assert!(
+        send_errors.lock().unwrap().is_empty(),
+        "every burst request should have been accepted: {:?}",
+        send_errors.lock().unwrap()
+    );
+    for (i, out) in outs.iter().enumerate() {
+        let g = out.lock().unwrap();
+        assert_eq!(g.failed, None, "request {i} failed");
+        assert_eq!(g.status, 200, "request {i} status");
+        assert_eq!(g.body, b"ok", "request {i} body");
+    }
+}
+
+/// Diagnostic twin of the burst test: the second GET is sent only from
+/// inside the first one's `close()`, so streams never overlap.
+struct ChainedH2Conn {
+    first: Arc<Mutex<GumdropOutcome>>,
+    second: Arc<Mutex<GumdropOutcome>>,
+}
+
+struct ChainThenSend {
+    out: Arc<Mutex<GumdropOutcome>>,
+    next: Option<(HttpClientSessionHandle, Arc<Mutex<GumdropOutcome>>)>,
+}
+
+impl HttpResponseHandler for ChainThenSend {
+    fn ok(&mut self, status: u16) {
+        self.out.lock().unwrap().status = status;
+    }
+    fn error(&mut self, status: u16) {
+        self.out.lock().unwrap().status = status;
+    }
+    fn header(&mut self, _name: &str, _value: &str) {}
+    fn response_body_content(&mut self, data: &[u8]) {
+        self.out.lock().unwrap().body.extend_from_slice(data);
+    }
+    fn close(&mut self) {
+        self.out.lock().unwrap().done = true;
+        if let Some((mut session, out)) = self.next.take() {
+            session
+                .get("/second")
+                .send(Box::new(RecordingResponseHandler { out }))
+                .expect("second GET accepted after the first completed");
+            if let Some(h) = session.conn_handle() {
+                h.poke();
+            }
+        }
+    }
+    fn failed(&mut self, err: io::Error) {
+        let mut g = self.out.lock().unwrap();
+        g.failed = Some(err.kind());
+        g.done = true;
+    }
+}
+
+impl HttpConnectionHandler for ChainedH2Conn {
+    fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+        let next = Some((session.clone(), Arc::clone(&self.second)));
+        session
+            .get("/first")
+            .send(Box::new(ChainThenSend { out: Arc::clone(&self.first), next }))
+            .unwrap();
+    }
+}
+
+#[test]
+fn gumdrop_h2_session_runs_sequential_requests_on_one_connection() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let (addr, _captured) = start_capturing_server(&rt, true);
+    let first = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let second = Arc::new(Mutex::new(GumdropOutcome::default()));
+    HttpClient::new(addr.ip().to_string(), addr.port())
+        .h2_prior_knowledge(true)
+        .connect(&rt, Box::new(ChainedH2Conn { first: Arc::clone(&first), second: Arc::clone(&second) }))
+        .unwrap();
+    assert!(wait_gumdrop_done(&first, Duration::from_secs(5)), "first never completed");
+    assert!(wait_gumdrop_done(&second, Duration::from_secs(5)), "second never completed");
+    assert_eq!(second.lock().unwrap().status, 200);
+    assert_eq!(second.lock().unwrap().body, b"ok");
+}
+
+// ---------------------------------------------------------------------------
+// Session API driven from another thread after `on_connected`
+// ---------------------------------------------------------------------------
+
+/// Hands a clone of the session to the test thread and does nothing else.
+struct HandOff {
+    slot: Arc<Mutex<Option<HttpClientSessionHandle>>>,
+}
+
+impl HttpConnectionHandler for HandOff {
+    fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+        *self.slot.lock().unwrap() = Some(session.clone());
+    }
+}
+
+fn wait_session(slot: &Arc<Mutex<Option<HttpClientSessionHandle>>>) -> HttpClientSessionHandle {
+    assert!(
+        wait_for(|| slot.lock().unwrap().is_some(), Duration::from_secs(5)),
+        "on_connected never handed the session over"
+    );
+    slot.lock().unwrap().clone().unwrap()
+}
+
+/// An HTTP/1.1 GET sent from a thread other than the reactor, after
+/// `on_connected` has returned, goes out on the next poke and completes.
+#[test]
+fn gumdrop_h1_request_sent_off_reactor_after_connect_completes() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let (addr, _captured) = start_capturing_server(&rt, true);
+    let slot = Arc::new(Mutex::new(None));
+    HttpClient::new(addr.ip().to_string(), addr.port())
+        .connect(&rt, Box::new(HandOff { slot: Arc::clone(&slot) }))
+        .unwrap();
+    let mut session = wait_session(&slot);
+    assert!(!session.supports_multiplexing(), "expected HTTP/1.1");
+
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    session
+        .get("/off-reactor")
+        .send(Box::new(RecordingResponseHandler { out: Arc::clone(&out) }))
+        .unwrap();
+    session.conn_handle().unwrap().poke();
+
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(5)), "request never completed");
+    let g = out.lock().unwrap();
+    assert_eq!(g.failed, None);
+    assert_eq!(g.status, 200);
+    assert_eq!(g.body, b"ok");
+}
+
+/// Streams `total` body bytes through `req` from the calling thread the way
+/// an application outside the reactor would: write what is accepted, poke,
+/// and on a short write wait for `on_body_writable` before continuing.
+fn stream_body_off_reactor(session: &HttpClientSessionHandle, req: &mut HttpRequest, total: usize) {
+    let handle = session.conn_handle().unwrap();
+    let body: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    let mut offset = 0;
+    while offset < body.len() {
+        let n = req.request_body_content(&body[offset..]).unwrap();
+        offset += n;
+        handle.poke();
+        if offset < body.len() {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            req.on_body_writable(Box::new(move || {
+                let _ = tx.send(());
+            }))
+            .unwrap();
+            handle.poke();
+            rx.recv_timeout(Duration::from_secs(5)).expect("writable callback never fired");
+        }
+    }
+    req.end_request_body().unwrap();
+    handle.poke();
+}
+
+/// A request body several times larger than the H2 flow-control window and
+/// the session's own buffers, streamed from another thread with the
+/// short-write / writable-callback protocol, reaches the server whole.
+#[test]
+fn gumdrop_h2_streamed_body_off_reactor_reaches_the_server_whole() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let (addr, captured) = start_capturing_server(&rt, true);
+    let slot = Arc::new(Mutex::new(None));
+    HttpClient::new(addr.ip().to_string(), addr.port())
+        .h2_prior_knowledge(true)
+        .connect(&rt, Box::new(HandOff { slot: Arc::clone(&slot) }))
+        .unwrap();
+    let mut session = wait_session(&slot);
+    assert!(session.supports_multiplexing(), "expected HTTP/2");
+
+    const TOTAL: usize = 900 * 1024;
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let mut req = session.put("/big");
+    req.header("content-length", TOTAL.to_string()).unwrap();
+    req.start_request_body(Box::new(RecordingResponseHandler { out: Arc::clone(&out) }))
+        .unwrap();
+    session.conn_handle().unwrap().poke();
+    stream_body_off_reactor(&session, &mut req, TOTAL);
+
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(10)), "request never completed");
+    let g = out.lock().unwrap();
+    assert_eq!(g.failed, None);
+    assert_eq!(g.status, 200);
+    let cap = captured.lock().unwrap();
+    assert!(cap.complete);
+    assert_eq!(cap.chunks.iter().map(|c| c.len()).sum::<usize>(), TOTAL);
+}
+
+/// The HTTP/1.1 counterpart of the streamed-body test.
+#[test]
+fn gumdrop_h1_streamed_body_off_reactor_reaches_the_server_whole() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let (addr, captured) = start_capturing_server(&rt, true);
+    let slot = Arc::new(Mutex::new(None));
+    HttpClient::new(addr.ip().to_string(), addr.port())
+        .connect(&rt, Box::new(HandOff { slot: Arc::clone(&slot) }))
+        .unwrap();
+    let mut session = wait_session(&slot);
+
+    const TOTAL: usize = 600 * 1024;
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let mut req = session.put("/big");
+    req.header("content-length", TOTAL.to_string()).unwrap();
+    req.start_request_body(Box::new(RecordingResponseHandler { out: Arc::clone(&out) }))
+        .unwrap();
+    session.conn_handle().unwrap().poke();
+    stream_body_off_reactor(&session, &mut req, TOTAL);
+
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(10)), "request never completed");
+    let g = out.lock().unwrap();
+    assert_eq!(g.failed, None);
+    assert_eq!(g.status, 200);
+    let cap = captured.lock().unwrap();
+    assert!(cap.complete);
+    assert_eq!(cap.chunks.iter().map(|c| c.len()).sum::<usize>(), TOTAL);
+}
+
+// ---------------------------------------------------------------------------
+// Large echoed response over HTTP/1.1 to the session API
+// ---------------------------------------------------------------------------
+
+/// Echoes the request body back as the response body.
+struct EchoBodyHandler {
+    body: Vec<u8>,
+}
+
+impl ServerHandler for EchoBodyHandler {
+    fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+    fn request_body_content(&mut self, _response: &mut dyn ServerWriter, data: &[u8]) {
+        self.body.extend_from_slice(data);
+    }
+    fn request_complete(&mut self, response: &mut dyn ServerWriter) {
+        let mut h = Headers::new();
+        h.set(":status", "200");
+        response.headers(h);
+        response.response_body_content(&self.body);
+        response.end_response_body();
+        response.complete();
+    }
+}
+
+struct EchoBodyFactory;
+impl ServerHandlerFactory for EchoBodyFactory {
+    fn create_handler(&self) -> Box<dyn ServerHandler> {
+        Box::new(EchoBodyHandler { body: Vec::new() })
+    }
+}
+
+fn start_echo_body_server(rt: &Arc<Runtime>) -> SocketAddr {
+    let factory: Arc<dyn ServerHandlerFactory> = Arc::new(EchoBodyFactory);
+    let (addr, _) = rt
+        .add_tcp_listener(TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), move || {
+            Box::new(CleartextHttpEndpoint::new(Arc::clone(&factory), HttpLimits::default()))
+                as Box<dyn ProtocolHandler>
+        }))
+        .unwrap();
+    addr
+}
+
+/// A response body well past the socket buffers, framed by the server
+/// without a known length up front, is delivered whole to the session
+/// API's response handler on HTTP/1.1.
+#[test]
+fn gumdrop_h1_large_echoed_response_is_delivered_whole() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let addr = start_echo_body_server(&rt);
+    let slot = Arc::new(Mutex::new(None));
+    HttpClient::new(addr.ip().to_string(), addr.port())
+        .connect(&rt, Box::new(HandOff { slot: Arc::clone(&slot) }))
+        .unwrap();
+    let mut session = wait_session(&slot);
+
+    const TOTAL: usize = 600 * 1024;
+    let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let mut req = session.put("/echo");
+    req.header("content-length", TOTAL.to_string()).unwrap();
+    req.start_request_body(Box::new(RecordingResponseHandler { out: Arc::clone(&out) }))
+        .unwrap();
+    session.conn_handle().unwrap().poke();
+    stream_body_off_reactor(&session, &mut req, TOTAL);
+
+    assert!(wait_gumdrop_done(&out, Duration::from_secs(10)), "response never completed");
+    let g = out.lock().unwrap();
+    assert_eq!(g.failed, None);
+    assert_eq!(g.status, 200);
+    assert_eq!(g.body.len(), TOTAL);
+}
+
+/// A bodyless request followed by one with a body on the same HTTP/1.1
+/// session, both from off the reactor: the second response arrives too.
+#[test]
+fn gumdrop_h1_body_request_after_a_completed_request_on_the_same_session() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let addr = start_echo_body_server(&rt);
+    let slot = Arc::new(Mutex::new(None));
+    HttpClient::new(addr.ip().to_string(), addr.port())
+        .connect(&rt, Box::new(HandOff { slot: Arc::clone(&slot) }))
+        .unwrap();
+    let mut session = wait_session(&slot);
+
+    let first = Arc::new(Mutex::new(GumdropOutcome::default()));
+    session
+        .get("/first")
+        .send(Box::new(RecordingResponseHandler { out: Arc::clone(&first) }))
+        .unwrap();
+    session.conn_handle().unwrap().poke();
+    assert!(wait_gumdrop_done(&first, Duration::from_secs(5)), "first never completed");
+    assert_eq!(first.lock().unwrap().status, 200);
+
+    const TOTAL: usize = 100 * 1024;
+    let second = Arc::new(Mutex::new(GumdropOutcome::default()));
+    let mut req = session.put("/second");
+    req.header("content-length", TOTAL.to_string()).unwrap();
+    req.start_request_body(Box::new(RecordingResponseHandler { out: Arc::clone(&second) }))
+        .unwrap();
+    session.conn_handle().unwrap().poke();
+    stream_body_off_reactor(&session, &mut req, TOTAL);
+
+    assert!(wait_gumdrop_done(&second, Duration::from_secs(5)), "second never completed");
+    let g = second.lock().unwrap();
+    assert_eq!(g.failed, None);
+    assert_eq!(g.status, 200);
+    assert_eq!(g.body.len(), TOTAL);
+}
+
+/// Two bodyless requests in turn on one HTTP/1.1 session, both sent from
+/// off the reactor after the previous one completed.
+#[test]
+fn gumdrop_h1_second_bodyless_request_off_reactor_completes() {
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let (addr, _captured) = start_capturing_server(&rt, true);
+    let slot = Arc::new(Mutex::new(None));
+    HttpClient::new(addr.ip().to_string(), addr.port())
+        .connect(&rt, Box::new(HandOff { slot: Arc::clone(&slot) }))
+        .unwrap();
+    let mut session = wait_session(&slot);
+    for i in 0..2 {
+        let out = Arc::new(Mutex::new(GumdropOutcome::default()));
+        session
+            .get(&format!("/turn/{i}"))
+            .send(Box::new(RecordingResponseHandler { out: Arc::clone(&out) }))
+            .unwrap();
+        session.conn_handle().unwrap().poke();
+        assert!(wait_gumdrop_done(&out, Duration::from_secs(5)), "request {i} never completed");
+        assert_eq!(out.lock().unwrap().status, 200);
+    }
+}

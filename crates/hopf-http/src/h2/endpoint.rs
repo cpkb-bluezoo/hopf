@@ -953,6 +953,20 @@ impl H2Endpoint {
         );
     }
 
+    /// Whether [`Self::open_client_stream`] would open a stream right now:
+    /// the connection is past the preface/SETTINGS exchange and the peer's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` has room. Lets a session layer
+    /// keep hold of a request's handler until the stream can really open.
+    pub(crate) fn can_open_client_stream(&self) -> bool {
+        if !self.client_connection_ready() {
+            return false;
+        }
+        match self.peer_max_concurrent_streams {
+            Some(limit) => (self.client_streams.len() as u32) < limit,
+            None => true,
+        }
+    }
+
     /// Open a new client stream and send its HEADERS frame only — no
     /// request body touched.
     ///
@@ -1810,31 +1824,55 @@ impl H2Endpoint {
         // incremental streams concurrent bandwidth while serving
         // non-incremental streams of the same urgency one-by-one in
         // stream-id (request) order.
-        let mut pending: Vec<(u32, PriorityParams)> = self
-            .server_streams
-            .iter()
-            .filter(|(_, s)| stream_needs_flush(s))
-            .map(|(id, s)| (*id, s.priority))
-            .collect();
-        pending.sort_by_key(|(id, p)| crate::priority::schedule_key(*p, u64::from(*id)));
+        //
+        // "One by one" is within this flush, not one per inbound event: a
+        // non-incremental stream that finishes here frees its slot for the
+        // next one of the same urgency straight away. Otherwise a burst of
+        // requests answered at once (the peer then sending nothing more)
+        // would leave every response after the first waiting for an
+        // inbound frame that never comes.
+        loop {
+            let mut pending: Vec<(u32, PriorityParams)> = self
+                .server_streams
+                .iter()
+                .filter(|(_, s)| stream_needs_flush(s))
+                .map(|(id, s)| (*id, s.priority))
+                .collect();
+            if pending.is_empty() {
+                return;
+            }
+            pending.sort_by_key(|(id, p)| crate::priority::schedule_key(*p, u64::from(*id)));
 
-        let mut active_non_inc: [Option<u32>; 8] = [None; 8];
-        for (id, p) in &pending {
-            if !p.incremental {
-                let slot = &mut active_non_inc[p.urgency as usize];
-                if slot.is_none() {
-                    *slot = Some(*id);
+            let mut active_non_inc: [Option<u32>; 8] = [None; 8];
+            for (id, p) in &pending {
+                if !p.incremental {
+                    let slot = &mut active_non_inc[p.urgency as usize];
+                    if slot.is_none() {
+                        *slot = Some(*id);
+                    }
                 }
             }
-        }
 
-        for (id, p) in pending {
-            if !p.incremental && active_non_inc[p.urgency as usize] != Some(id) {
-                continue;
+            // A pass makes progress when some non-incremental stream it
+            // served is finished (gone), so a stream behind it may now go.
+            let mut slot_freed = false;
+            for (id, p) in pending {
+                if !p.incremental && active_non_inc[p.urgency as usize] != Some(id) {
+                    continue;
+                }
+                self.flush_one_server_stream(id);
+                if !p.incremental && !self.server_streams.contains_key(&id) {
+                    slot_freed = true;
+                }
+                // `available_send(0)` would always be 0: stream 0 is never
+                // opened in the per-stream table. The connection window is
+                // its own counter.
+                if self.flow.conn_send_window() <= 0 {
+                    return;
+                }
             }
-            self.flush_one_server_stream(id);
-            if self.flow.available_send(0) == 0 {
-                break;
+            if !slot_freed {
+                return;
             }
         }
     }
@@ -3808,5 +3846,75 @@ mod gumdrop_client_stream_tests {
 
         assert!(result.is_none());
         assert!(ep.client_streams.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod flush_scheduler_tests {
+    use super::*;
+    use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
+
+    fn encode_headers(pairs: &[(&str, &str)]) -> Vec<u8> {
+        super::super::hpack::Encoder::new(4096).encode(pairs.iter().copied())
+    }
+
+    /// Answers every request with `200 ok` as soon as it is complete.
+    struct ImmediateOk;
+    impl ServerHandler for ImmediateOk {
+        fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+        fn request_complete(&mut self, response: &mut dyn ServerWriter) {
+            let mut h = Headers::new();
+            h.set(":status", "200");
+            response.headers(h);
+            response.response_body_content(b"ok");
+            response.end_response_body();
+            response.complete();
+        }
+    }
+    struct ImmediateOkFactory;
+    impl ServerHandlerFactory for ImmediateOkFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            Box::new(ImmediateOk)
+        }
+    }
+
+    /// Stream ids of every HEADERS frame in `out`, in wire order.
+    fn headers_frame_stream_ids(out: &[u8]) -> Vec<u32> {
+        let mut ids = Vec::new();
+        let mut i = 0;
+        while i + 9 <= out.len() {
+            let header = frame::parse_frame_header(&out[i..i + 9]);
+            if header.ty == frame::TYPE_HEADERS {
+                ids.push(header.stream_id);
+            }
+            i += 9 + header.length as usize;
+        }
+        ids
+    }
+
+    /// Two bodyless requests arrive in one read and are both answered at
+    /// once. RFC 9218 serves equal-urgency non-incremental streams one by
+    /// one, but "one by one" must not mean "one per inbound event": with
+    /// nothing more coming from the peer, a single flush has to carry both
+    /// responses, or the second one starves.
+    #[test]
+    fn one_flush_serves_every_ready_non_incremental_stream_in_order() {
+        let mut ep = H2Endpoint::server(Arc::new(ImmediateOkFactory), HttpLimits::default(), false);
+        for stream_id in [1u32, 3, 5] {
+            let block = encode_headers(&[
+                (":method", "GET"),
+                (":scheme", "http"),
+                (":path", "/"),
+                (":authority", "example.test"),
+            ]);
+            ep.process_server_headers_block(stream_id, &block, true);
+        }
+        ep.flush_server_streams();
+        assert_eq!(
+            headers_frame_stream_ids(&ep.out),
+            vec![1, 3, 5],
+            "every ready stream should be answered by one flush, in request order"
+        );
+        assert!(ep.server_streams.is_empty(), "all three streams fully sent and closed");
     }
 }

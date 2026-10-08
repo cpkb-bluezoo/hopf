@@ -136,8 +136,14 @@ const OFFERED_SIGNATURE_ALGORITHMS: &[(u8, u8)] = &[
     (sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519),
 ];
 
-/// `NamedCurve` (RFC 4492 §5.1.1) — only the one curve this engine speaks.
+/// `NamedCurve` (RFC 4492 §5.1.1) — the one curve this engine offers in
+/// its own TLS 1.2 `ClientHello`, and the only one its server side uses.
 pub const NAMED_CURVE_SECP256R1: u16 = 23;
+/// `NamedCurve` for X25519 (RFC 8422 §5.1.1). Accepted in a
+/// `ServerKeyExchange` on the client side only: the TLS 1.3-shaped
+/// `ClientHello` the negotiating connector sends offers X25519 ahead of
+/// `secp256r1`, and a server that prefers it (rustls, OpenSSL) will pick it.
+pub const NAMED_CURVE_X25519: u16 = 29;
 /// `ECCurveType::named_curve` (RFC 4492 §5.4).
 pub const EC_CURVE_TYPE_NAMED_CURVE: u8 = 3;
 /// `ECPointFormat::uncompressed` (RFC 4492 §5.1.2).
@@ -819,7 +825,10 @@ pub fn server_ecdh_params_bytes(ec_point: &[u8]) -> Bytes {
 /// engine speaks; see [`super`]'s module doc for why).
 #[derive(Debug, Clone)]
 pub struct ParsedServerKeyExchange {
-    /// Server's EC point (uncompressed, 65 bytes for P-256).
+    /// The named curve: [`NAMED_CURVE_SECP256R1`] or [`NAMED_CURVE_X25519`].
+    pub curve: u16,
+    /// Server's public share: the uncompressed point (65 bytes) for P-256,
+    /// the raw 32-byte u-coordinate for X25519 (RFC 8422 §5.4.1).
     pub ec_point: Bytes,
     /// Signature hash algorithm byte.
     pub sig_hash: u8,
@@ -831,17 +840,20 @@ pub struct ParsedServerKeyExchange {
     pub signed_params: Bytes,
 }
 
-/// Parse a `ServerKeyExchange` body (named-curve ECDHE only).
+/// Parse a `ServerKeyExchange` body (named-curve ECDHE over `secp256r1` or
+/// X25519 only).
 pub fn parse_server_key_exchange(body: &[u8]) -> Option<ParsedServerKeyExchange> {
     if body.first() != Some(&EC_CURVE_TYPE_NAMED_CURVE) {
         return None; // explicit-prime/explicit-char2 curves not supported
     }
     let curve = u16::from_be_bytes([*body.get(1)?, *body.get(2)?]);
-    if curve != NAMED_CURVE_SECP256R1 {
-        return None;
-    }
     let point_len = *body.get(3)? as usize;
-    if body.len() < 4 + point_len + 2 {
+    let expected_len = match curve {
+        NAMED_CURVE_SECP256R1 => 65,
+        NAMED_CURVE_X25519 => 32,
+        _ => return None,
+    };
+    if point_len != expected_len || body.len() < 4 + point_len + 2 {
         return None;
     }
     let ec_point = Bytes::copy_from_slice(&body[4..4 + point_len]);
@@ -856,7 +868,7 @@ pub fn parse_server_key_exchange(body: &[u8]) -> Option<ParsedServerKeyExchange>
         return None;
     }
     let signature = Bytes::copy_from_slice(&body[i..i + sig_len]);
-    Some(ParsedServerKeyExchange { ec_point, sig_hash, sig_alg, signature, signed_params })
+    Some(ParsedServerKeyExchange { curve, ec_point, sig_hash, sig_alg, signature, signed_params })
 }
 
 /// Build `ServerHelloDone` (empty body).
@@ -1072,11 +1084,48 @@ mod tests {
         let sig = [9u8; 70];
         let wire = build_server_key_exchange(&point, sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA, &sig);
         let parsed = parse_server_key_exchange(&wire[4..]).expect("parse");
+        assert_eq!(parsed.curve, NAMED_CURVE_SECP256R1);
         assert_eq!(parsed.ec_point.as_ref(), &point[..]);
         assert_eq!(parsed.sig_hash, sig_alg::HASH_SHA256);
         assert_eq!(parsed.sig_alg, sig_alg::SIG_ECDSA);
         assert_eq!(parsed.signature.as_ref(), &sig[..]);
         assert_eq!(parsed.signed_params.as_ref(), server_ecdh_params_bytes(&point).as_ref());
+    }
+
+    /// `ServerKeyExchange` body for an arbitrary named curve — what a
+    /// rustls or OpenSSL server sends when it picks X25519 from the
+    /// client's `supported_groups`.
+    fn server_key_exchange_body_on_curve(curve: u16, share: &[u8], sig: &[u8]) -> Vec<u8> {
+        let mut body = vec![EC_CURVE_TYPE_NAMED_CURVE];
+        body.extend_from_slice(&curve.to_be_bytes());
+        body.push(share.len() as u8);
+        body.extend_from_slice(share);
+        body.extend_from_slice(&[sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA]);
+        body.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+        body.extend_from_slice(sig);
+        body
+    }
+
+    #[test]
+    fn server_key_exchange_parses_an_x25519_share() {
+        let share = [7u8; 32];
+        let sig = [9u8; 70];
+        let body = server_key_exchange_body_on_curve(NAMED_CURVE_X25519, &share, &sig);
+        let parsed = parse_server_key_exchange(&body).expect("parse");
+        assert_eq!(parsed.curve, NAMED_CURVE_X25519);
+        assert_eq!(parsed.ec_point.as_ref(), &share[..]);
+        assert_eq!(parsed.signed_params.as_ref(), &body[..4 + 32]);
+        assert_eq!(parsed.signature.as_ref(), &sig[..]);
+    }
+
+    #[test]
+    fn server_key_exchange_rejects_other_curves_and_wrong_share_lengths() {
+        let sig = [9u8; 70];
+        // secp384r1: not implemented on the client side.
+        assert!(parse_server_key_exchange(&server_key_exchange_body_on_curve(24, &[4u8; 97], &sig)).is_none());
+        // Right curves, wrong share sizes.
+        assert!(parse_server_key_exchange(&server_key_exchange_body_on_curve(NAMED_CURVE_X25519, &[7u8; 65], &sig)).is_none());
+        assert!(parse_server_key_exchange(&server_key_exchange_body_on_curve(NAMED_CURVE_SECP256R1, &[4u8; 32], &sig)).is_none());
     }
 
     #[test]

@@ -19,11 +19,16 @@
 //! Key types, on either side of the handshake: RSA, ECDSA P-256 and P-384, and
 //! Ed25519 (RFC 8422 section 5: the `ECDHE_ECDSA` suites with an Edwards-curve
 //! certificate, signed with pure EdDSA over the raw message, which for a
-//! `CertificateVerify` is the raw handshake bytes). One limit remains on the
-//! *client* side: it advertises only `secp256r1` in `supported_groups`, since
-//! P-256 is the only ECDHE curve implemented, and a strict server (OpenSSL)
-//! refuses an ECDSA certificate on a curve the client did not advertise, so a
-//! hopf client cannot connect to such a server with a P-384 certificate.
+//! `CertificateVerify` is the raw handshake bytes). ECDHE runs over
+//! `secp256r1`, which is the only curve this engine's own TLS 1.2
+//! `ClientHello` advertises and the only one its server side ever picks, and
+//! on the client side also over X25519 — the TLS 1.3-shaped `ClientHello`
+//! that the negotiating connector sends (see `super::negotiating`) offers
+//! X25519 ahead of `secp256r1`, and servers that prefer it (rustls, OpenSSL)
+//! answer with an X25519 `ServerKeyExchange`. One limit remains on the
+//! *client* side: a strict server (OpenSSL) refuses an ECDSA certificate on a
+//! curve the client did not advertise, so a hopf client cannot connect to such
+//! a server with a P-384 certificate.
 //!
 //! Reactive/sink-based like every other engine in this crate — see
 //! [`Tls12EventSink`]. Deliberately independent of [`super::engine`] (the
@@ -36,7 +41,7 @@ use bytes::{Bytes, BytesMut};
 
 use crate::crypto::cert::SpkiDer;
 use crate::crypto::digest::{HashAlgorithm, Sha256Context};
-use crate::crypto::kx::EphemeralP256KeyPair;
+use crate::crypto::kx::{EphemeralKeyPair, EphemeralP256KeyPair};
 use crate::crypto::prf::{prf, PrfHash};
 use crate::crypto::signature::{
     ecdsa_p256_sha256_verify_spki, ecdsa_p256_sign, ecdsa_p384_sha384_verify_spki, ecdsa_p384_sign,
@@ -49,7 +54,7 @@ use crate::crypto::trust::TrustStore;
 use crate::crypto::x509::parse_certificate;
 use crate::security::SecurityInfo;
 
-use super::super::engine::{pick_alpn, ClientAuthPolicy, ServerCredentials};
+use super::super::engine::{pick_alpn, ClientAuthPolicy, ServerCredentials, VerifyOverride};
 use super::super::handshake::verify::{ed25519_public_key_from_spki, pkcs8_key_kind, KeyKind};
 use super::super::sink::{AlertDescription, TlsProtocolError, VerifyRequest, VerifyResult};
 use super::super::ticket_keys::TicketKeys;
@@ -190,10 +195,17 @@ pub struct Config {
     /// Ed25519 key needs a client that offers it in `signature_algorithms`
     /// (RFC 8422 section 5.1), and signs with pure EdDSA.
     pub server: Option<ServerCredentials>,
-    /// Trust anchors for server chain verification (client role). `None`
-    /// gates on [`Tls12EventSink::verification_requested`], matching the
-    /// TLS 1.3 engine's `insecure_connector` pattern.
+    /// Trust anchors for server chain verification (client role). Checked
+    /// before [`Self::verify_override`] when both are set. With neither
+    /// set, the engine gates on [`Tls12EventSink::verification_requested`],
+    /// matching the TLS 1.3 engine's `insecure_connector` pattern.
     pub trust_store: Option<TrustStore>,
+    /// Custom server-chain verification (client role) — the TLS 1.2 twin of
+    /// `HandshakeConfig::verify_override`, so a connector built with one
+    /// (DANE, pinning, …) applies it whichever version the server picks.
+    /// Ignored when [`Self::trust_store`] is set. Resolved inline, exactly
+    /// like `trust_store` — not an async gate.
+    pub verify_override: Option<VerifyOverride>,
     /// Server-role only: the RFC 5077 ticket-encryption keyring. `None`
     /// disables both accepting and issuing tickets — every handshake is
     /// full. Construct with [`TicketKeys::single`] for the common
@@ -286,6 +298,7 @@ impl Default for Config {
             server_name: None,
             server: None,
             trust_store: None,
+            verify_override: None,
             ticket_key: None,
             client_ticket_store: None,
             client_auth: ClientAuthPolicy::None,
@@ -453,7 +466,9 @@ pub struct Tls12Engine {
     client_random: [u8; 32],
     server_random: [u8; 32],
     local_ecdhe: Option<EphemeralP256KeyPair>,
-    peer_ec_point: Option<Bytes>,
+    /// Client role: the server's `ServerKeyExchange` share, with the named
+    /// curve it came on, held until `ServerHelloDone` triggers our reply.
+    peer_ecdhe: Option<(u16, Bytes)>,
     master_secret: Option<[u8; 48]>,
     /// Whether Extended Master Secret (RFC 7627 §5.1 / RFC 9846 Appendix D)
     /// was negotiated this handshake. Both roles refuse the handshake
@@ -516,7 +531,7 @@ impl Tls12Engine {
             client_random: [0u8; 32],
             server_random: [0u8; 32],
             local_ecdhe: None,
-            peer_ec_point: None,
+            peer_ecdhe: None,
             master_secret: None,
             use_ems: false,
             peer_certs: Vec::new(),
@@ -753,6 +768,20 @@ impl Tls12Engine {
         if self.config.role != Role::Client || self.state != State::Initial {
             return;
         }
+        // Everything `start` would have recorded about a hello it built
+        // itself has to come out of this one instead: the random is signed
+        // into `ServerKeyExchange` (RFC 5246 §7.4.3) and mixed into the key
+        // block, and the session id decides whether a `ServerHello` echoing
+        // it means resumption. Layout: 4-byte handshake header, 2-byte
+        // legacy_version, 32-byte random, 1-byte session id length.
+        if let Some(random) = wire.get(6..38) {
+            self.client_random.copy_from_slice(random);
+        }
+        self.sent_session_id = wire
+            .get(38)
+            .and_then(|&len| wire.get(39..39 + len as usize))
+            .map(Bytes::copy_from_slice)
+            .unwrap_or_default();
         self.hash_message(wire, true);
         self.state = State::ExpectServerHello;
     }
@@ -892,13 +921,23 @@ impl Tls12Engine {
             self.state = State::ExpectServerKeyExchange;
             return true;
         }
+        if let Some(verify) = &self.config.verify_override {
+            let ok = (verify.0)(&self.peer_certs, self.config.server_name.as_deref());
+            self.verify_pending = false;
+            if !ok {
+                self.fail(sink, AlertDescription::BadCertificate, "certificate verification failed");
+                return false;
+            }
+            self.state = State::ExpectServerKeyExchange;
+            return true;
+        }
         self.state = State::ExpectServerKeyExchange;
         false // gate: wait for feed_verification_result
     }
 
     fn on_server_key_exchange<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
         let Some(ske) = messages::parse_server_key_exchange(body) else {
-            self.fail(sink, AlertDescription::DecodeError, "malformed or unsupported ServerKeyExchange (only named-curve secp256r1 ECDHE is supported)");
+            self.fail(sink, AlertDescription::DecodeError, "malformed or unsupported ServerKeyExchange (only named-curve secp256r1 or X25519 ECDHE is supported)");
             return false;
         };
         let Some(leaf) = self.peer_certs.first() else {
@@ -913,7 +952,7 @@ impl Tls12Engine {
             self.fail(sink, AlertDescription::DecryptError, "ServerKeyExchange signature invalid");
             return false;
         }
-        self.peer_ec_point = Some(ske.ec_point);
+        self.peer_ecdhe = Some((ske.curve, ske.ec_point));
         self.hash_message(&wire, false);
         self.state = State::ExpectServerHelloDoneOrCertRequest;
         true
@@ -932,16 +971,37 @@ impl Tls12Engine {
 
     fn on_server_hello_done<S: Tls12EventSink>(&mut self, wire: Bytes, sink: &mut S) -> bool {
         self.hash_message(&wire, false);
-        let Some(peer_point) = self.peer_ec_point.take() else {
+        let Some((curve, peer_point)) = self.peer_ecdhe.take() else {
             self.fail(sink, AlertDescription::InternalError, "missing server key share");
             return false;
         };
-        let Ok(local) = EphemeralP256KeyPair::generate() else {
-            self.fail(sink, AlertDescription::InternalError, "key generation failed");
-            return false;
+        // RFC 8422 §5.7 / §5.10: our share is the uncompressed point for
+        // P-256 and the raw u-coordinate for X25519; the premaster secret is
+        // the X coordinate (P-256) or the raw 32-byte output (X25519) — both
+        // exactly what the key-pair types' `agree` return.
+        let (client_point, pre_master) = match curve {
+            messages::NAMED_CURVE_SECP256R1 => {
+                let Ok(local) = EphemeralP256KeyPair::generate() else {
+                    self.fail(sink, AlertDescription::InternalError, "key generation failed");
+                    return false;
+                };
+                let point = Bytes::copy_from_slice(local.public_key());
+                (point, local.agree(&peer_point))
+            }
+            messages::NAMED_CURVE_X25519 => {
+                let Ok(local) = EphemeralKeyPair::generate() else {
+                    self.fail(sink, AlertDescription::InternalError, "key generation failed");
+                    return false;
+                };
+                let point = Bytes::copy_from_slice(local.public_key());
+                (point, local.agree(&peer_point))
+            }
+            _ => {
+                self.fail(sink, AlertDescription::InternalError, "unsupported named curve survived ServerKeyExchange parsing");
+                return false;
+            }
         };
-        let client_point = Bytes::copy_from_slice(local.public_key());
-        let Ok(pre_master) = local.agree(&peer_point) else {
+        let Ok(pre_master) = pre_master else {
             self.fail(sink, AlertDescription::IllegalParameter, "key agreement failed");
             return false;
         };
@@ -2630,6 +2690,120 @@ mod tests {
         );
     }
 
+    fn client_config_with_verify_override(verify: VerifyOverride) -> Config {
+        Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            trust_store: None,
+            verify_override: Some(verify),
+            ..Default::default()
+        }
+    }
+
+    /// Same shape as the TLS 1.3 engine's test: with no trust store, the
+    /// override alone decides, inline, so the handshake completes without
+    /// anyone answering a verification gate.
+    #[test]
+    fn verify_override_accepts_when_callback_returns_true() {
+        let creds = test_server_credentials_ecdsa();
+        let expected_chain = creds.cert_chain.clone();
+        let mut client = Tls12Engine::new(client_config_with_verify_override(VerifyOverride(Arc::new(
+            move |chain, name| chain == expected_chain.as_slice() && name == Some("localhost"),
+        ))));
+        let mut server = Tls12Engine::new(Config { role: Role::Server, server: Some(creds), ..Default::default() });
+        let (mut sink_c, mut sink_s) = (RecordingSink::default(), RecordingSink::default());
+        run_full_handshake(&mut client, &mut server, &mut sink_c, &mut sink_s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+    }
+
+    #[test]
+    fn verify_override_rejects_when_callback_returns_false() {
+        let creds = test_server_credentials_ecdsa();
+        let mut client =
+            Tls12Engine::new(client_config_with_verify_override(VerifyOverride(Arc::new(|_chain, _name| false))));
+        let mut server = Tls12Engine::new(Config { role: Role::Server, server: Some(creds), ..Default::default() });
+        let (mut sink_c, mut sink_s) = (RecordingSink::default(), RecordingSink::default());
+        run_full_handshake(&mut client, &mut server, &mut sink_c, &mut sink_s);
+        assert!(!client.is_complete(), "client: {:?}", sink_c.events);
+        let errs = protocol_errors(&sink_c);
+        assert_eq!(errs.len(), 1, "{:?}", sink_c.events);
+        assert!(errs[0].contains("certificate verification failed"), "{errs:?}");
+        // The override's verdict is final: a later "ok" from the connection
+        // layer must not resurrect the handshake.
+        let id = sink_c
+            .events
+            .iter()
+            .find_map(|e| e.strip_prefix("verification_requested id=").map(|s| s.parse::<u64>().unwrap()))
+            .expect("verification_requested fired");
+        client.feed_verification_result(VerifyResult { id, ok: true }, &mut sink_c);
+        assert!(!client.is_complete(), "{:?}", sink_c.events);
+    }
+
+    /// `trust_store` wins over `verify_override` when both are set, as on
+    /// the TLS 1.3 side: a rejecting override is never consulted.
+    #[test]
+    fn trust_store_takes_precedence_over_verify_override() {
+        let creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let mut cfg = client_config_with_verify_override(VerifyOverride(Arc::new(|_chain, _name| {
+            panic!("verify_override consulted despite a trust_store")
+        })));
+        cfg.trust_store = Some(trust);
+        let mut client = Tls12Engine::new(cfg);
+        let mut server = Tls12Engine::new(Config { role: Role::Server, server: Some(creds), ..Default::default() });
+        let (mut sink_c, mut sink_s) = (RecordingSink::default(), RecordingSink::default());
+        run_full_handshake(&mut client, &mut server, &mut sink_c, &mut sink_s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+    }
+
+    /// The negotiating connector hands this engine a ClientHello it did not
+    /// build (`client_note_client_hello_sent`). The engine must recover the
+    /// random from it: the server signs `client_random || server_random ||
+    /// params` into ServerKeyExchange, so a zeroed random fails right there.
+    #[test]
+    fn a_handed_over_client_hello_completes_the_handshake() {
+        let creds = test_server_credentials_ecdsa();
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let mut client = Tls12Engine::new(Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            trust_store: Some(trust),
+            alpn: vec![Bytes::from_static(b"h2")],
+            ..Default::default()
+        });
+        let mut server = Tls12Engine::new(Config {
+            role: Role::Server,
+            server: Some(creds),
+            alpn: vec![Bytes::from_static(b"h2")],
+            ..Default::default()
+        });
+        // A hello built elsewhere, with a random the engine has never seen.
+        let hello = messages::build_client_hello(&messages::ClientHelloParams {
+            random: [0x5a; 32],
+            session_id: &[],
+            cipher_suites: SUPPORTED_CIPHER_SUITES,
+            server_name: Some("localhost"),
+            session_ticket: None,
+            alpn: &[Bytes::from_static(b"h2")],
+            legacy_version: 0x0303,
+            cookie: &[],
+        });
+        client.client_note_client_hello_sent(&hello);
+        assert_eq!(client.client_random, [0x5a; 32]);
+        let (mut sink_c, mut sink_s) = (RecordingSink::default(), RecordingSink::default());
+        let mut input = hello.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink_s);
+        relay(&mut server, &mut client, take_outbound(&mut sink_s), &mut sink_c);
+        relay(&mut client, &mut server, take_outbound(&mut sink_c), &mut sink_s);
+        relay(&mut server, &mut client, take_outbound(&mut sink_s), &mut sink_c);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+        assert_eq!(sink_c.info.as_ref().and_then(|i| i.alpn()), Some(&b"h2"[..]));
+    }
+
     fn message_types(msgs: &[Bytes]) -> Vec<u8> {
         msgs.iter().map(|m| m[0]).collect()
     }
@@ -2908,6 +3082,7 @@ mod tests {
             server_name: None,
             server: Some(server_creds),
             trust_store: None,
+            verify_override: None,
             ticket_key: None,
             client_ticket_store: None,
             client_auth: policy,

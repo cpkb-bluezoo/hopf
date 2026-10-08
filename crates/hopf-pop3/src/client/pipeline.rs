@@ -180,6 +180,15 @@ impl Pop3ClientHandlerFactory for Pop3Fetch {
     fn create(&self) -> Box<dyn Pop3ClientDriver> {
         Box::new(Pop3FetchDriver { state: Arc::clone(&self.0) })
     }
+
+    fn connect_failed(&self, _host: &str, _error: &std::io::Error) {
+        let mut st = self.0.lock().unwrap();
+        st.success = false;
+        if let Some(cb) = st.on_complete.take() {
+            drop(st);
+            cb(false);
+        }
+    }
 }
 
 // ── Pop3FetchDriver ───────────────────────────────────────────────────────────

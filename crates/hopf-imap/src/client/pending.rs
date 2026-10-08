@@ -123,7 +123,9 @@ impl PendingKind {
         match class {
             UntaggedClass::Capability => matches!(self, Self::Capability),
             UntaggedClass::List => matches!(self, Self::List),
-            UntaggedClass::Status => matches!(self, Self::Status),
+            // RFC 5819 (LIST-STATUS): `LIST … RETURN (STATUS …)` provokes
+            // untagged STATUS replies with no STATUS command pending.
+            UntaggedClass::Status => matches!(self, Self::Status | Self::List),
             UntaggedClass::Search => matches!(self, Self::Search),
             UntaggedClass::Sort => matches!(self, Self::Sort),
             UntaggedClass::Thread => matches!(self, Self::Thread),

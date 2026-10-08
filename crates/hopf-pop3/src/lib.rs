@@ -33,6 +33,7 @@ pub use server::{
 pub use client::{
     MessageReceiveCallback, Pop3Capabilities, Pop3Client, Pop3ClientAuthExchange, Pop3ClientAuthorization,
     Pop3ClientDriver, Pop3ClientEndpoint, Pop3ClientHandlerFactory, Pop3ClientPassword,
-    Pop3ClientPostStls, Pop3ClientTimeouts, Pop3ClientTransaction, Pop3DotUnstuffer, Pop3Error,
-    ContentId, Pop3Event, Pop3Fetch, Pop3ReplyLexer, Pop3ReplyShape, Pop3Result, MAX_REPLY_LINE,
+    Pop3ClientPostStls, Pop3ClientTimeouts, Pop3ClientTransaction, Pop3ClientWakeState, Pop3DotUnstuffer, Pop3Error,
+    ContentId, Pop3Event, Pop3Fetch, Pop3Op, Pop3OpResult, Pop3ReplyLexer, Pop3ReplyShape, Pop3Result,
+    Pop3Script, Pop3ScriptOutcome, MAX_REPLY_LINE,
 };

@@ -22,13 +22,13 @@ pub use api::{
 };
 pub use connect::{
     connect_http, connect_http2_upgrade, connect_http2_upgrade_unix, connect_http_unix,
-    DialSettings, HttpClientTimeouts,
+    connect_https, DialSettings, HttpClientTimeouts,
 };
 pub use content_encoding::DecodingResponseHandler;
 pub use redirect::RedirectPolicy;
 #[cfg(feature = "h3")]
 pub use connect::{
-    connect_auto, connect_auto_unix, connect_h3_by_name, connect_https, H3DialSettings,
-    H3Discovery, HttpFallback,
+    connect_auto, connect_auto_unix, connect_h3_by_name, H3DialSettings, H3Discovery,
+    HttpFallback,
 };
 pub use facade::HttpClient;

@@ -44,6 +44,7 @@
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
+<li><a href="nntp.html">NNTP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
 <li><a href="amqp.html">AMQP 0-9-1</a></li>
 <li><a href="amqp1.html">AMQP 1.0</a></li>
@@ -97,6 +98,7 @@
 <li><a href="#ftp-hopf-ftp">FTP</a></li>
 <li><a href="#smtp-hopf-smtp">SMTP</a></li>
 <li><a href="#pop3-hopf-pop3">POP3</a></li>
+<li><a href="#nntp-hopf-nntp">NNTP</a></li>
 <li><a href="#imap-hopf-imap">IMAP</a></li>
 <li><a href="#mqtt-hopf-mqtt">MQTT</a></li>
 <li><a href="#amqp-hopf-amqp">AMQP</a></li>
@@ -270,6 +272,11 @@
 <li>Opens <code>INBOX</code> via <code>MailboxFactory</code>; session DELE until QUIT expunge</li>
 <li>Async client: <code>Pop3Client</code> + <code>Pop3Fetch</code> auto-pilot; USER/PASS, APOP, AUTH PLAIN, STLS/POP3S</li>
 </ul>
+<h3 id="nntp-hopf-nntp">NNTP (<code>hopf-nntp</code>)</h3>
+<ul>
+<li>Async NNTP / NNTPS client (RFC 3977, 4642, 4643): greeting, CAPABILITIES, STARTTLS or implicit TLS, AUTHINFO SASL / USER-PASS</li>
+<li><code>NntpSession</code> command queue usable from any thread; LIST ACTIVE, GROUP, OVER, ARTICLE, HEAD, POST, QUIT helpers; multi-line replies streamed and dot-unstuffed</li>
+</ul>
 <h3 id="imap-hopf-imap">IMAP (<code>hopf-imap</code>)</h3>
 <ul>
 <li>IMAP4rev2 / IMAPS server (RFC 9051) over <code>hopf-mailbox</code>; staged handler SPI</li>
@@ -406,6 +413,13 @@
 <td style="text-align: center;">✓</td>
 <td style="text-align: center;">✓</td>
 <td>callback-driven client (<code>Pop3Fetch</code>)</td>
+</tr>
+<tr>
+<td>NNTP / NNTPS</td>
+<td><code>hopf-nntp</code></td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">✓</td>
+<td>callback-driven client (<code>NntpSession</code>)</td>
 </tr>
 <tr>
 <td>IMAP / IMAPS</td>

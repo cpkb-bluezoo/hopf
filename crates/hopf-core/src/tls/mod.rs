@@ -104,7 +104,7 @@ pub use handshake::transport_params::{
 };
 pub use pem::{
     acceptor_from_pem, acceptor_from_pem_tls12, acceptor_from_pem_tls12_with_client_auth,
-    acceptor_from_pem_with_client_auth, acceptor_from_pem_with_sni, connector_from_pem,
+    acceptor_from_pem_with_client_auth, acceptor_from_credentials, acceptor_from_credentials_with_client_auth, server_credentials_from_pem_bytes, acceptor_from_pem_with_sni, connector_from_pem,
     connector_from_pem_tls12, connector_from_pem_tls12_with_client_cert,
     connector_from_pem_with_client_cert, connector_with_alpn, connector_with_record_size_limit,
     connector_with_verify_override, acceptor_requiring_supported_versions, acceptor_with_alpn, acceptor_with_record_size_limit, acceptor_with_ech, connector_with_ech, insecure_connector,

@@ -19,6 +19,9 @@ pub enum SaslMechanism {
     ScramSha256Plus,
     /// RFC 7628.
     OauthBearer,
+    /// Google's pre-standard bearer mechanism (`XOAUTH2`), still what Gmail
+    /// and Microsoft 365 advertise; see [`crate::xoauth2`].
+    XOauth2,
     /// RFC 4422 Appendix A — TLS client certificate.
     External,
 }
@@ -34,6 +37,7 @@ impl SaslMechanism {
             Self::ScramSha256 => "SCRAM-SHA-256",
             Self::ScramSha256Plus => "SCRAM-SHA-256-PLUS",
             Self::OauthBearer => "OAUTHBEARER",
+            Self::XOauth2 => "XOAUTH2",
             Self::External => "EXTERNAL",
         }
     }
@@ -48,6 +52,7 @@ impl SaslMechanism {
             "SCRAM-SHA-256" => Some(Self::ScramSha256),
             "SCRAM-SHA-256-PLUS" => Some(Self::ScramSha256Plus),
             "OAUTHBEARER" => Some(Self::OauthBearer),
+            "XOAUTH2" => Some(Self::XOauth2),
             "EXTERNAL" => Some(Self::External),
             _ => None,
         }
@@ -65,7 +70,7 @@ impl SaslMechanism {
     pub fn requires_tls(self) -> bool {
         matches!(
             self,
-            Self::Plain | Self::Login | Self::OauthBearer | Self::External
+            Self::Plain | Self::Login | Self::OauthBearer | Self::XOauth2 | Self::External
         )
     }
 
@@ -91,6 +96,7 @@ impl SaslMechanism {
             Self::DigestMd5,
             Self::ScramSha256,
             Self::OauthBearer,
+            Self::XOauth2,
             Self::External,
         ]
     }

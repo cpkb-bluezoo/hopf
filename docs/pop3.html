@@ -44,6 +44,7 @@
 <li><a href="smtp.html">SMTP</a></li>
 <li><a href="pop3.html" aria-current="page">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
+<li><a href="nntp.html">NNTP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
 <li><a href="amqp.html">AMQP 0-9-1</a></li>
 <li><a href="amqp1.html">AMQP 1.0</a></li>
@@ -161,7 +162,9 @@ Pop3Client::new(&quot;mail.example.com&quot;, 110)
                 })),
         ),
     )?;</code></pre>
+<p>For full control implement <code>Pop3ClientDriver</code>: each callback receives the staged state reference (<code>Pop3ClientAuthorization</code> → <code>Pop3ClientPassword</code> / <code>Pop3ClientAuthExchange</code> → <code>Pop3ClientTransaction</code>) whose methods issue the commands that are legal in that state. Commands that do not originate in a reply reach a live session through <code>Pop3ClientDriver::on_wake</code>: it runs at the start of every <code>receive</code>, so in particular after a <code>hopf_core::ConnHandle::poke()</code> from any thread, and is handed a <code>Pop3ClientWakeState</code> — <code>Authorization</code> or <code>Transaction</code> when no command is in flight, <code>Busy</code> otherwise (POP3 is strictly one command at a time). Whatever the driver issues is flushed when it returns. Queue work somewhere the driver can see it, poke the <code>ConnHandle</code> stashed from an earlier callback, and drain the queue in <code>on_wake</code>, putting back anything the current state does not allow.</p>
 <h3 id="client-options">Client options</h3>
+<p>A dial that never produces a connection — DNS failure, no addresses, a connect that cannot start — reaches <code>Pop3ClientHandlerFactory::connect_failed(host, error)</code>, which prints to stderr unless overridden; <code>Pop3Fetch</code> overrides it to call its <code>on_complete(false)</code>.</p>
 <table>
 <thead>
 <tr>

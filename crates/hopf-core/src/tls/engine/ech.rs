@@ -264,8 +264,12 @@ impl HandshakeEngine {
             return true;
         }
 
-        // ClientHelloInner.
-        let inner_msg = build_client_hello_with_ech(&params, &INNER_EXTENSION_BODY);
+        // ClientHelloInner. RFC 9849 §6.1: it MUST NOT offer TLS 1.2 or
+        // below — only the outer hello, which a pre-ECH server answers,
+        // carries the fallback offer and the 1.2 baggage that comes with it.
+        let mut inner = params.clone();
+        inner.offer_tls12_fallback = false;
+        let inner_msg = build_client_hello_with_ech(&inner, &INNER_EXTENSION_BODY);
         let inner_body = inner_msg.body.clone();
         let sni_len = params.server_name.as_ref().map(|n| n.len());
         let pad = wire::padding_len(inner_body.len(), sni_len, real.config.maximum_name_length);

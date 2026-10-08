@@ -22,6 +22,7 @@ pub mod scram;
 pub mod role;
 pub mod session;
 pub mod store;
+pub mod xoauth2;
 
 #[cfg(all(feature = "pam", unix))]
 pub mod pam;
@@ -203,7 +204,7 @@ mod tests {
         };
         let mut server = create_server(mech, Arc::clone(&store), opts);
         let (user, pass) = match mech {
-            SaslMechanism::OauthBearer => ("alice", "tok-alice"),
+            SaslMechanism::OauthBearer | SaslMechanism::XOauth2 => ("alice", "tok-alice"),
             SaslMechanism::External => ("", ""),
             _ => ("alice", "s3cret"),
         };

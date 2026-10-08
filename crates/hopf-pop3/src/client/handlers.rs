@@ -13,7 +13,7 @@ use hopf_core::Endpoint;
 use super::reply::ContentId;
 use super::state::{
     Pop3Capabilities, Pop3ClientAuthExchange, Pop3ClientAuthorization, Pop3ClientPassword,
-    Pop3ClientPostStls, Pop3ClientTransaction,
+    Pop3ClientPostStls, Pop3ClientTransaction, Pop3ClientWakeState,
 };
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -22,6 +22,16 @@ use super::state::{
 pub trait Pop3ClientHandlerFactory: Send + Sync {
     /// Produce a fresh driver for one connection.
     fn create(&self) -> Box<dyn Pop3ClientDriver>;
+    /// The dial never produced a connection, so there is no driver to tell:
+    /// DNS failed or returned no addresses for `host`, or the connect could
+    /// not be started at all. (A connect that starts and then fails or
+    /// times out reaches the driver's `on_error` / `on_timeout` as usual.)
+    ///
+    /// Default: a line on stderr. Override it to surface the failure the
+    /// way the rest of the session's outcomes are surfaced.
+    fn connect_failed(&self, host: &str, error: &io::Error) {
+        eprintln!("hopf-pop3: connect to {host} failed: {error}");
+    }
 }
 
 // ── Driver ────────────────────────────────────────────────────────────────────
@@ -305,6 +315,24 @@ pub trait Pop3ClientDriver: Send {
     );
 
     // ── Lifecycle ─────────────────────────────────────────────────────────
+
+    /// A chance to issue commands that did not originate in a reply.
+    ///
+    /// Called at the start of every [`ProtocolHandler::receive`] — so after
+    /// a [`hopf_core::ConnHandle::poke`] from another thread (which
+    /// re-enters `receive` with no data), and also before each batch of
+    /// server replies is dispatched. `state` is the staged state object
+    /// for the session's current state, exactly as the stage callbacks
+    /// hand it over, or [`Pop3ClientWakeState::Busy`] when a command is in
+    /// flight. Anything issued is flushed when this returns.
+    ///
+    /// Default: no-op. See [`Pop3ClientWakeState`] for the queue-and-poke
+    /// pattern this exists for.
+    ///
+    /// [`ProtocolHandler::receive`]: hopf_core::ProtocolHandler::receive
+    fn on_wake(&mut self, state: Pop3ClientWakeState<'_>, ep: &mut dyn Endpoint) {
+        let _ = (state, ep);
+    }
 
     /// Unrecoverable I/O or protocol error.
     fn on_error(&mut self, ep: &mut dyn Endpoint, err: &io::Error);

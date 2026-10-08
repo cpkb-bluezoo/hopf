@@ -4,6 +4,7 @@
 
 use bytes::{Bytes, BytesMut};
 
+use super::super::tls12::messages as tls12_messages;
 use super::verify::SUPPORTED_SIGNATURE_SCHEMES;
 
 /// Handshake message type (RFC 8446 §B.3).
@@ -181,8 +182,14 @@ pub struct ClientHelloParams {
     /// Offer `compress_certificate` (RFC 8879) with every algorithm in
     /// [`SUPPORTED_ALGORITHMS`](super::cert_compression::SUPPORTED_ALGORITHMS).
     pub compress_certificate: bool,
-    /// When true on TCP TLS, `supported_versions` lists TLS 1.3 then TLS 1.2
-    /// so a single `ClientHello` can be answered by either protocol version.
+    /// When true, `supported_versions` lists TLS 1.3 then TLS 1.2 (or their
+    /// DTLS twins) so a single `ClientHello` can be answered by either
+    /// protocol version — and the hello also carries everything a
+    /// conformant TLS 1.2 server demands before it will answer at all: the
+    /// TLS 1.2 cipher suites after the 1.3 ones, `secp256r1` in
+    /// `supported_groups`, and the `extended_master_secret`,
+    /// `renegotiation_info` and `ec_point_formats` extensions. A TLS 1.3
+    /// server ignores all of those (RFC 8446 §4.1.2, §4.2).
     pub offer_tls12_fallback: bool,
 }
 
@@ -277,8 +284,17 @@ fn build_client_hello_inner(
     if params.legacy_version == 0xfefd {
         body.extend_from_slice(&[0]);
     }
-    body.extend_from_slice(&((params.cipher_suites.len() * 2) as u16).to_be_bytes());
-    for suite in &params.cipher_suites {
+    // With the TLS 1.2 fallback on offer, the 1.2 suites follow the 1.3
+    // ones — a 1.3 server picks from its own list and never sees them as
+    // more than noise, a 1.2 server has nothing else to pick from.
+    let tls12_suites: &[u16] = if params.offer_tls12_fallback {
+        super::super::tls12::engine::SUPPORTED_CIPHER_SUITES
+    } else {
+        &[]
+    };
+    let suite_count = params.cipher_suites.len() + tls12_suites.len();
+    body.extend_from_slice(&((suite_count * 2) as u16).to_be_bytes());
+    for suite in params.cipher_suites.iter().chain(tls12_suites) {
         body.extend_from_slice(&suite.to_be_bytes());
     }
     body.extend_from_slice(&[1, 0]);
@@ -298,11 +314,36 @@ fn build_client_hello_inner(
         &[0x02, real_version[0], real_version[1]]
     };
     push_extension(&mut extensions, ext::SUPPORTED_VERSIONS, supported_versions);
-    push_extension(
-        &mut extensions,
-        ext::SUPPORTED_GROUPS,
-        &encode_group_list(&params.supported_groups),
-    );
+    {
+        // The 1.2 engine's client side does ECDHE over X25519 (already in
+        // every key-exchange policy that allows classical groups) and
+        // secp256r1, which the TLS 1.3 policies never list as a plain
+        // group — so a fallback offer appends it, last, for the 1.2 server
+        // that supports nothing newer. A 1.3 server that picked it would
+        // get no key share for it and fail the handshake, which is the same
+        // outcome as having no group in common at all.
+        let mut groups = params.supported_groups.clone();
+        if params.offer_tls12_fallback && !groups.contains(&tls12_messages::NAMED_CURVE_SECP256R1) {
+            groups.push(tls12_messages::NAMED_CURVE_SECP256R1);
+        }
+        push_extension(&mut extensions, ext::SUPPORTED_GROUPS, &encode_group_list(&groups));
+    }
+    if params.offer_tls12_fallback {
+        // What the TLS 1.2 engine's own ClientHello always carries (see
+        // `tls12::messages::build_client_hello`), and what its server side
+        // insists on: Extended Master Secret (RFC 7627 §5.1, mandatory
+        // there), the RFC 5746 secure-renegotiation signal (empty
+        // `renegotiation_info`), and the point format we accept (RFC 8422
+        // §5.1.2 — uncompressed only). Meaningless to TLS 1.3 and ignored by
+        // it (RFC 8446 §4.1.2).
+        push_extension(&mut extensions, tls12_messages::ext::EXTENDED_MASTER_SECRET, &[]);
+        push_extension(&mut extensions, tls12_messages::ext::RENEGOTIATION_INFO, &[0]);
+        push_extension(
+            &mut extensions,
+            tls12_messages::ext::EC_POINT_FORMATS,
+            &[1, tls12_messages::EC_POINT_FORMAT_UNCOMPRESSED],
+        );
+    }
     push_extension(
         &mut extensions,
         ext::KEY_SHARE,
@@ -798,6 +839,57 @@ mod tests {
         let parsed = parse_client_hello(&hello.body).expect("parse client hello");
         assert!(parsed.peer_key_share.is_some());
         assert_eq!(parsed.key_share_group, Some(NamedGroup::X25519.code()));
+    }
+
+    /// With the TLS 1.2 fallback on offer, the hello must pass every check
+    /// the TLS 1.2 engine's server side applies to a ClientHello before it
+    /// answers — read back through that engine's own parser.
+    #[test]
+    fn fallback_client_hello_satisfies_a_tls12_server() {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        use crate::tls::tls12::engine::SUPPORTED_CIPHER_SUITES as TLS12_SUITES;
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let params = ClientHelloParams {
+            random: [1u8; 32],
+            cipher_suites: vec![0x1301, 0x1303],
+            key_share: KeyShareEntry {
+                group: NamedGroup::X25519MLKEM768.code(),
+                share: Bytes::copy_from_slice(kp.public_key()),
+            },
+            supported_groups: vec![NamedGroup::X25519MLKEM768.code(), NamedGroup::X25519.code()],
+            alpn: vec![Bytes::from_static(b"h2")],
+            server_name: Some("localhost".into()),
+            offer_tls12_fallback: true,
+            ..Default::default()
+        };
+        let hello = build_client_hello(&params);
+        let v12 = tls12_messages::parse_client_hello(&hello.body).expect("a TLS 1.2 server can read it");
+        assert!(v12.extended_master_secret, "EMS is mandatory for the 1.2 engine's server");
+        assert_eq!(v12.renegotiation_info.as_deref(), Some(&[0u8][..]), "RFC 5746 signal");
+        assert_eq!(v12.supported_versions.as_deref(), Some(&[0x0304, 0x0303][..]));
+        for suite in TLS12_SUITES {
+            assert!(v12.cipher_suites.contains(suite), "1.2 suite {suite:#06x} missing");
+        }
+        assert_eq!(&v12.cipher_suites[..2], &[0x1301, 0x1303], "1.3 suites stay first");
+        assert_eq!(v12.alpn, vec![Bytes::from_static(b"h2")]);
+        assert_eq!(v12.server_name.as_deref(), Some("localhost"));
+        // The TLS 1.3 reading of the same bytes is unchanged: key share and
+        // groups as offered, with secp256r1 appended last for the fallback.
+        let v13 = parse_client_hello(&hello.body).expect("parse client hello");
+        assert_eq!(v13.key_share_group, Some(NamedGroup::X25519MLKEM768.code()));
+        assert_eq!(
+            v13.supported_groups,
+            vec![NamedGroup::X25519MLKEM768.code(), NamedGroup::X25519.code(), tls12_messages::NAMED_CURVE_SECP256R1]
+        );
+
+        // Without the fallback, none of that is added.
+        let plain = build_client_hello(&ClientHelloParams { offer_tls12_fallback: false, ..params });
+        let v12 = tls12_messages::parse_client_hello(&plain.body).expect("still well-formed");
+        assert!(!v12.extended_master_secret);
+        assert!(v12.renegotiation_info.is_none());
+        assert_eq!(v12.cipher_suites, vec![0x1301, 0x1303]);
+        let v13 = parse_client_hello(&plain.body).expect("parse client hello");
+        assert_eq!(v13.supported_groups, vec![NamedGroup::X25519MLKEM768.code(), NamedGroup::X25519.code()]);
     }
 
     /// DTLS's ClientHello (`legacy_version = 0xfefd`) carries one extra

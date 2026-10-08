@@ -44,6 +44,7 @@
 <li><a href="smtp.html" aria-current="page">SMTP</a></li>
 <li><a href="pop3.html">POP3</a></li>
 <li><a href="imap.html">IMAP</a></li>
+<li><a href="nntp.html">NNTP</a></li>
 <li><a href="mqtt.html">MQTT</a></li>
 <li><a href="amqp.html">AMQP 0-9-1</a></li>
 <li><a href="amqp1.html">AMQP 1.0</a></li>
@@ -700,6 +701,7 @@ self.auth_results = p.authentication_results(); // stash alongside p.verdict()</
 </tbody>
 </table>
 <p><code>factory</code> is an <code>Arc&lt;dyn SmtpClientHandlerFactory&gt;</code>. <code>SmtpSend</code> implements that trait for one-shot delivery.</p>
+<p>A dial that never produces a connection — DNS failure, no addresses, a connect that cannot start — reaches <code>SmtpClientHandlerFactory::connect_failed(host, error)</code>, which prints to stderr unless overridden; <code>SmtpSend</code> overrides it to report <code>SmtpSendOutcome::Failed</code> (retryable, no reply code) to <code>on_result</code> and <code>false</code> to <code>on_complete</code>.</p>
 <div class="sourceCode" id="cb5"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::sync::</span>Arc<span class="op">;</span></span>
 <span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::time::</span>Duration<span class="op">;</span></span>
 <span id="cb5-3"><a href="#cb5-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_core::</span><span class="op">{</span>Runtime<span class="op">,</span> RuntimeConfig<span class="op">};</span></span>

@@ -21,8 +21,8 @@ pub use auth::{AuthPipeline, AuthPipelineBuilder, AuthResultsHandle, AuthVerdict
 pub use client::{
     dot_stuff, smtp_retry_policy, MailFromParams, RetryingSend, SmtpCapabilities, SmtpClient,
     SmtpClientDriver, SmtpClientEndpoint, SmtpEvent, SmtpClientHandlerFactory, SmtpClientTimeouts,
-    SmtpError, SmtpReplyLexer, SmtpReplyShape, SmtpResult, SmtpSend, SmtpSendOutcome,
-    MAX_REPLY_LINE,
+    SmtpError, SmtpReplyLexer, SmtpReplyShape, SmtpResult, SmtpSend, SmtpSendOutcome, SmtpVerify,
+    SmtpVerifyOutcome, MAX_REPLY_LINE,
 };
 pub use server::{
     parse_mail_from_arg, parse_rcpt_to_arg, reply, reply_ehlo, reply_enhanced, reply_multiline,

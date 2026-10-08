@@ -81,15 +81,16 @@ pub use storage::{StorageConfig, StorageError, StorageExecutor};
 pub use telemetry::{NopTelemetry, TelemetryHook};
 pub use tls::{
     acceptor_from_pem, acceptor_from_pem_tls12, acceptor_from_pem_tls12_with_client_auth,
+    acceptor_from_credentials, acceptor_from_credentials_with_client_auth,
     acceptor_from_pem_with_client_auth, acceptor_from_pem_with_sni,
     acceptor_from_pem_with_tcp_version_policy, acceptor_requiring_supported_versions, acceptor_with_alpn,
     acceptor_with_record_size_limit,
     connector_from_pem, connector_from_pem_tls12, connector_from_pem_tls12_with_client_cert,
     connector_from_pem_with_tcp_version_policy,
     connector_from_pem_with_client_cert, connector_with_alpn, connector_with_record_size_limit, connector_with_verify_override, insecure_connector, insecure_connector_tls12,
-    public_trust_connector, server_credentials_from_pem, ClientAuthPolicy, HandshakeConfig,
+    public_trust_connector, server_credentials_from_pem, server_credentials_from_pem_bytes, ClientAuthPolicy, HandshakeConfig,
     HandshakeEngine, HandshakeMode, HandshakeRole, NopTlsEventSink, QuicSecrets, RecordSizeLimits,
-    ServerCredentialsResolver, SharedTlsAcceptor, SharedTlsConnector, StoredTls12Ticket, TicketKeys,
+    ServerCredentials, ServerCredentialsResolver, SharedTlsAcceptor, SharedTlsConnector, StoredTls12Ticket, TicketKeys,
     Tls12ClientTicketStore, Tls12Config, Tls12Role,
     TlsAcceptor, TlsConnector, TlsEventSink, TcpTlsVersionPolicy, TlsProtocolError, TlsTimerKind, TlsVariant,
     VerifyOverride, VerifyRequest, VerifyResult, TLS12_SUPPORTED_CIPHER_SUITES,
@@ -1207,6 +1208,112 @@ mod tests {
         }
         assert_eq!(echoed.lock().unwrap().as_slice(), b"ping-through-real-tls-socket");
 
+        rt.shutdown();
+    }
+
+    /// A mutual-TLS acceptor built from in-memory credentials: a client
+    /// holding a certificate from the trusted CA completes the handshake,
+    /// one without is refused.
+    #[test]
+    fn tls_acceptor_from_credentials_requires_a_trusted_client_certificate() {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let server = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .signed_by(&server_key, &ca, &ca_key)
+            .unwrap();
+        let client_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let client = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .signed_by(&client_key, &ca, &ca_key)
+            .unwrap();
+
+        let creds = server_credentials_from_pem_bytes(server.pem().as_bytes(), server_key.serialize_pem().as_bytes()).unwrap();
+        let acceptor = acceptor_from_credentials_with_client_auth(
+            creds,
+            &[],
+            ClientAuthPolicy::Require,
+            &[Bytes::from(ca.der().to_vec())],
+        );
+        // The connector side still comes from files; only the server's
+        // material is in memory here.
+        let dir = tempfile::Builder::new().prefix("hopf-core-mtls-").tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        let client_cert_path = dir.path().join("client.pem");
+        let client_key_path = dir.path().join("client-key.pem");
+        std::fs::write(&ca_path, ca.pem()).unwrap();
+        std::fs::write(&client_cert_path, client.pem()).unwrap();
+        std::fs::write(&client_key_path, client_key.serialize_pem()).unwrap();
+        let with_cert = connector_from_pem_with_client_cert(&ca_path, &client_cert_path, &client_key_path, &[]).unwrap();
+        let without_cert = connector_from_pem(&ca_path, &[]).unwrap();
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        let (addr, _) = rt
+            .add_tcp_listener(
+                TcpListenerConfig::new("127.0.0.1:0".parse().unwrap(), || {
+                    Box::new(EchoHandler) as Box<dyn ProtocolHandler>
+                })
+                .with_tls(acceptor),
+            )
+            .unwrap();
+
+        // A TLS 1.3 client sees the handshake as established before the
+        // server has judged its certificate, so admission is observed
+        // through the echo: only an admitted client gets one.
+        #[derive(Default)]
+        struct Outcome {
+            echoed: bool,
+            failed: bool,
+            gone: bool,
+        }
+        struct Probe(Arc<Mutex<Outcome>>);
+        impl ProtocolHandler for Probe {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn security_established(&mut self, endpoint: &mut dyn Endpoint, _info: &SecurityInfo) {
+                endpoint.send(b"ping");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                if !data.is_empty() {
+                    self.0.lock().unwrap().echoed = true;
+                }
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
+                self.0.lock().unwrap().gone = true;
+            }
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {
+                self.0.lock().unwrap().failed = true;
+            }
+        }
+        let dial = |connector: SharedTlsConnector| {
+            let out = Arc::new(Mutex::new(Outcome::default()));
+            let out2 = Arc::clone(&out);
+            rt.connect(
+                TcpConnectorConfig::new(addr, move || Box::new(Probe(Arc::clone(&out2))) as Box<dyn ProtocolHandler>)
+                    .with_tls(connector, "localhost"),
+            )
+            .unwrap();
+            out
+        };
+        let good = dial(with_cert);
+        let bad = dial(without_cert);
+        for _ in 0..150 {
+            let g = good.lock().unwrap().echoed;
+            let b = bad.lock().unwrap();
+            if g && (b.failed || b.gone) {
+                break;
+            }
+            drop(b);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(good.lock().unwrap().echoed, "a client with the CA-issued certificate must be admitted");
+        let b = bad.lock().unwrap();
+        assert!(!b.echoed, "a client without a certificate must not be admitted");
+        assert!(b.failed || b.gone, "the refused handshake must be reported");
+        drop(b);
         rt.shutdown();
     }
     }

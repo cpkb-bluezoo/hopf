@@ -174,7 +174,6 @@ pub fn connect_http2_upgrade_unix(
 /// handshake actually offers — the right fallback once an h3 attempt
 /// (always TLS 1.3 via QUIC) has been ruled out, since a peer reachable
 /// over HTTPS at all has no reason to also expect a cleartext h2c dial.
-#[cfg(feature = "h3")]
 pub fn connect_https(
     rt: &Arc<Runtime>,
     host_or_addr: &str,
@@ -197,7 +196,6 @@ pub fn connect_https(
 /// picks [`H1Endpoint::client`] or [`H2Endpoint::client`] based on the
 /// negotiated ALPN — mirrors `client/connection.rs`'s `HttpClientConnection`
 /// (session API), adapted to the `ClientHandler` layer.
-#[cfg(feature = "h3")]
 struct TlsAlpnClientEndpoint {
     factory: Arc<dyn ClientHandlerFactory>,
     limits: HttpLimits,
@@ -205,7 +203,6 @@ struct TlsAlpnClientEndpoint {
     pending_receive: Vec<u8>,
 }
 
-#[cfg(feature = "h3")]
 impl TlsAlpnClientEndpoint {
     fn new(factory: Arc<dyn ClientHandlerFactory>, limits: HttpLimits) -> Self {
         Self {
@@ -226,7 +223,6 @@ impl TlsAlpnClientEndpoint {
     }
 }
 
-#[cfg(feature = "h3")]
 impl ProtocolHandler for TlsAlpnClientEndpoint {
     fn connected(&mut self, _endpoint: &mut dyn Endpoint) {
         // Nothing to do yet — this dial is always secure, so the request
@@ -325,7 +321,6 @@ pub(crate) fn dial(
 /// [`dial`], additionally configuring the connector for TLS (ALPN offered
 /// via whatever `tls_connector` itself is set up for — `h2`/`http/1.1` for
 /// [`connect_https`]'s use).
-#[cfg(feature = "h3")]
 fn dial_tls(
     rt: &Arc<Runtime>,
     host_or_addr: &str,

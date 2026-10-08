@@ -159,6 +159,15 @@ impl ImapClientHandlerFactory for ImapFetch {
             state: Arc::clone(&self.0),
         })
     }
+
+    fn connect_failed(&self, _host: &str, _error: &std::io::Error) {
+        let mut st = self.0.lock().unwrap();
+        st.success = false;
+        if let Some(cb) = st.on_complete.take() {
+            drop(st);
+            cb(false);
+        }
+    }
 }
 
 struct ImapFetchDriver {
@@ -549,6 +558,15 @@ impl ImapIdleDriver {
 }
 
 impl ImapClientHandlerFactory for ImapIdle {
+    fn connect_failed(&self, _host: &str, _error: &std::io::Error) {
+        let mut st = self.0.lock().unwrap();
+        st.success = false;
+        if let Some(cb) = st.on_complete.take() {
+            drop(st);
+            cb(false);
+        }
+    }
+
     fn create(&self) -> Box<dyn ImapClientDriver> {
         let mut st = self.0.lock().unwrap();
         let events = st.events.take();

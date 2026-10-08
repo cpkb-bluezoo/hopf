@@ -90,28 +90,46 @@ impl H1SessionClientCodec {
     }
 
     pub fn receive(&mut self, data: &mut &[u8]) -> HttpResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(err) = inner.fatal.clone() {
-            *data = &[];
-            return Err(err);
-        }
-        if matches!(inner.state, ParseState::Idle | ParseState::Done) {
-            *data = &[];
-            return Ok(());
-        }
-        let consumed = self.scanner.push(data, &mut *inner);
-        *data = &data[consumed..];
-        if inner.fatal.is_some() || inner.state == ParseState::Done {
-            *data = &[];
-        }
-        inner.take_error()
+        // Completion and failure reach the response handler only after the
+        // lock is released: the handler commonly sends the next request
+        // from there, which takes the lock again.
+        let (result, settled) = {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(err) = inner.fatal.clone() {
+                *data = &[];
+                return Err(err);
+            }
+            if matches!(inner.state, ParseState::Idle | ParseState::Done) {
+                *data = &[];
+                return Ok(());
+            }
+            // The previous response halted the scanner at its end; a new
+            // request has since gone out (state is back at the status line), so
+            // scanning restarts for its response.
+            if self.scanner.is_halted() && inner.state == ParseState::StatusLine {
+                self.scanner.reset();
+            }
+            let consumed = self.scanner.push(data, &mut *inner);
+            *data = &data[consumed..];
+            if inner.fatal.is_some() || inner.state == ParseState::Done {
+                *data = &[];
+            }
+            (inner.take_error(), inner.take_settled())
+        };
+        Settled::deliver(settled);
+        result
     }
 
     /// A transport-level failure (connect refused/reset, TLS handshake
     /// failure, …) reached this connection — see
     /// [`H1SessionInner::fail_transport`].
     pub fn fail_transport(&mut self, err: io::Error) {
-        self.inner.lock().unwrap().fail_transport(err);
+        let settled = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.fail_transport(err);
+            inner.take_settled()
+        };
+        Settled::deliver(settled);
     }
 
     /// (Re)arm the [`crate::HttpClientTimeouts::stage`] timer if a request
@@ -125,8 +143,12 @@ impl H1SessionClientCodec {
     }
 
     pub fn close(&mut self) -> HttpResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.close()
+        let (result, settled) = {
+            let mut inner = self.inner.lock().unwrap();
+            (inner.close(), inner.take_settled())
+        };
+        Settled::deliver(settled);
+        result
     }
 
     pub fn take_outbound(&mut self) -> Vec<u8> {
@@ -150,8 +172,40 @@ impl H1SessionClientCodec {
     }
 }
 
+/// A response handler whose request is over, waiting to be told so once
+/// the session lock is released: `close()` and `failed()` are where a
+/// caller chains the next request from, and that call needs the lock.
+enum Settled {
+    Done {
+        handler: Box<dyn HttpResponseHandler>,
+        body_started: bool,
+    },
+    Failed {
+        handler: Box<dyn HttpResponseHandler>,
+        err: io::Error,
+    },
+}
+
+impl Settled {
+    fn deliver(all: Vec<Settled>) {
+        for s in all {
+            match s {
+                Settled::Done { mut handler, body_started } => {
+                    if body_started {
+                        handler.end_response_body();
+                    }
+                    handler.close();
+                }
+                Settled::Failed { mut handler, err } => handler.failed(err),
+            }
+        }
+    }
+}
+
 struct H1SessionInner {
     config: Arc<H1SessionConfig>,
+    /// Handlers to notify after the lock is dropped — see [`Settled`].
+    settled: Vec<Settled>,
     state: ParseState,
     version: HttpVersion,
     open: bool,
@@ -182,6 +236,7 @@ impl H1SessionInner {
     fn new(config: Arc<H1SessionConfig>) -> Self {
         Self {
             config,
+            settled: Vec::new(),
             state: ParseState::Idle,
             version: HttpVersion::Http11,
             open: false,
@@ -218,6 +273,18 @@ impl H1SessionInner {
         std::mem::take(&mut self.out)
     }
 
+    /// Handlers whose request is over; deliver with [`Settled::deliver`]
+    /// after releasing the lock on this struct.
+    fn take_settled(&mut self) -> Vec<Settled> {
+        std::mem::take(&mut self.settled)
+    }
+
+    fn settle_failed(&mut self, err: io::Error) {
+        if let Some(handler) = self.response_handler.take() {
+            self.settled.push(Settled::Failed { handler, err });
+        }
+    }
+
     /// Take any registered short-write resume callback (see
     /// [`MAX_UNFLUSHED_BODY`]) without invoking it — the caller must run it
     /// only after releasing the lock on this struct, since the callback
@@ -246,9 +313,7 @@ impl H1SessionInner {
             }
             return;
         }
-        if let Some(mut h) = self.response_handler.take() {
-            h.failed(err);
-        }
+        self.settle_failed(err);
     }
 
     fn take_error(&mut self) -> HttpResult<()> {
@@ -265,9 +330,7 @@ impl H1SessionInner {
         self.close_connection = true;
         self.fatal = Some(err);
         self.cancel_stage_timer();
-        if let Some(mut h) = self.response_handler.take() {
-            h.failed(io::Error::other("HTTP protocol error"));
-        }
+        self.settle_failed(io::Error::other("HTTP protocol error"));
     }
 
     fn cancel_stage_timer(&mut self) {
@@ -408,12 +471,10 @@ impl H1SessionInner {
 
     fn finish_response(&mut self) {
         self.cancel_stage_timer();
-        if let Some(mut h) = self.response_handler.take() {
-            if self.body_started {
-                h.end_response_body();
-            }
-            h.close();
-        }
+        let handler = self.response_handler.take();
+        let body_started = self.body_started;
+        // Settle the session before calling out: a request chained from
+        // inside `close()` must find it idle and keep the state it sets.
         self.body_started = false;
         self.in_flight = false;
         self.req_method.clear();
@@ -422,12 +483,14 @@ impl H1SessionInner {
         self.content_length = None;
         self.body_received = 0;
         self.chunked = false;
-
         if self.close_connection {
             self.state = ParseState::Done;
             self.open = false;
         } else {
             self.state = ParseState::Idle;
+        }
+        if let Some(handler) = handler {
+            self.settled.push(Settled::Done { handler, body_started });
         }
     }
 
@@ -515,12 +578,10 @@ impl H1SessionInner {
         if self.state == ParseState::BodyUntilClose {
             self.finish_response();
         } else if !matches!(self.state, ParseState::Idle | ParseState::Done) {
-            if let Some(mut h) = self.response_handler.take() {
-                h.failed(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "incomplete HTTP response",
-                ));
-            }
+            self.settle_failed(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete HTTP response",
+            ));
             self.fail(HttpError::new(0, "incomplete HTTP response"));
         }
         self.open = false;
@@ -583,13 +644,15 @@ impl SessionRequestOps for OpsBridge {
     }
 
     fn cancel_request(&mut self) -> Result<(), HttpClientError> {
-        let mut inner = self.0.lock().unwrap();
-        if let Some(mut h) = inner.response_handler.take() {
-            h.failed(io::Error::new(io::ErrorKind::Interrupted, "request cancelled"));
-        }
-        inner.in_flight = false;
-        inner.body_complete = true;
-        inner.state = ParseState::Idle;
+        let settled = {
+            let mut inner = self.0.lock().unwrap();
+            inner.settle_failed(io::Error::new(io::ErrorKind::Interrupted, "request cancelled"));
+            inner.in_flight = false;
+            inner.body_complete = true;
+            inner.state = ParseState::Idle;
+            inner.take_settled()
+        };
+        Settled::deliver(settled);
         Ok(())
     }
 
@@ -908,5 +971,142 @@ mod tests {
         let remainder = &big[accepted..];
         let accepted2 = req.request_body_content(remainder).unwrap();
         assert_eq!(accepted2, remainder.len());
+    }
+
+    /// Records one response's outcome.
+    #[derive(Default)]
+    struct TurnRec {
+        status: u16,
+        body: Vec<u8>,
+        done: bool,
+        failed: bool,
+    }
+
+    struct TurnHandler(Arc<Mutex<TurnRec>>);
+
+    impl HttpResponseHandler for TurnHandler {
+        fn ok(&mut self, status: u16) {
+            self.0.lock().unwrap().status = status;
+        }
+        fn error(&mut self, status: u16) {
+            self.0.lock().unwrap().status = status;
+        }
+        fn header(&mut self, _name: &str, _value: &str) {}
+        fn response_body_content(&mut self, data: &[u8]) {
+            self.0.lock().unwrap().body.extend_from_slice(data);
+        }
+        fn close(&mut self) {
+            self.0.lock().unwrap().done = true;
+        }
+        fn failed(&mut self, _err: io::Error) {
+            self.0.lock().unwrap().failed = true;
+        }
+    }
+
+    /// Keeps the session for the test to drive from outside any callback.
+    struct KeepSession(Arc<Mutex<Option<HttpClientSessionHandle>>>);
+
+    impl HttpConnectionHandler for KeepSession {
+        fn on_connected(&mut self, session: &mut HttpClientSessionHandle) {
+            *self.0.lock().unwrap() = Some(session.clone());
+        }
+    }
+
+    /// A persistent HTTP/1.1 session serves a second request sent after the
+    /// first response completed: the scanner has to pick up the next status
+    /// line instead of staying halted at the end of the previous message.
+    #[test]
+    fn second_request_after_a_completed_response_gets_its_own_response() {
+        let slot = Arc::new(Mutex::new(None));
+        let config = Arc::new(H1SessionConfig {
+            host: "ex.com".into(),
+            port: 80,
+            limits: HttpLimits::default(),
+            secure: false,
+            handler: Mutex::new(Some(Box::new(KeepSession(Arc::clone(&slot))))),
+            stage: Duration::ZERO,
+        });
+        let mut codec = H1SessionClientCodec::new(config);
+        codec.on_connected(ConnHandle::from_execute(Arc::new(|task| task())));
+        let mut session = slot.lock().unwrap().clone().expect("session handed over");
+
+        let first = Arc::new(Mutex::new(TurnRec::default()));
+        session.get("/one").send(Box::new(TurnHandler(Arc::clone(&first)))).unwrap();
+        assert!(String::from_utf8(codec.take_outbound()).unwrap().starts_with("GET /one HTTP/1.1\r\n"));
+        let mut data: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\none\r\n0\r\n\r\n";
+        codec.receive(&mut data).unwrap();
+        assert!(first.lock().unwrap().done, "first response delivered");
+        assert_eq!(first.lock().unwrap().body, b"one");
+
+        let second = Arc::new(Mutex::new(TurnRec::default()));
+        let mut req = session.put("/two");
+        req.header("content-length", "3").unwrap();
+        req.start_request_body(Box::new(TurnHandler(Arc::clone(&second)))).unwrap();
+        req.request_body_content(b"two").unwrap();
+        req.end_request_body().unwrap();
+        let out = String::from_utf8(codec.take_outbound()).unwrap();
+        assert!(out.starts_with("PUT /two HTTP/1.1\r\n"), "{out}");
+        assert!(out.ends_with("two"));
+        let mut data: &[u8] = b"HTTP/1.1 201 Created\r\nContent-Length: 3\r\n\r\ntwo";
+        codec.receive(&mut data).unwrap();
+        let g = second.lock().unwrap();
+        assert!(!g.failed);
+        assert!(g.done, "second response delivered on the reused session");
+        assert_eq!(g.status, 201);
+        assert_eq!(g.body, b"two");
+    }
+
+    /// The next request is issued from inside `close()` of the previous
+    /// response, as sequential users of a session do. The codec must not
+    /// hold its own lock while delivering `close()`, or the chained
+    /// `send()` deadlocks on it.
+    #[test]
+    fn request_chained_from_close_goes_out_on_the_same_session() {
+        let slot = Arc::new(Mutex::new(None));
+        let config = Arc::new(H1SessionConfig {
+            host: "ex.com".into(),
+            port: 80,
+            limits: HttpLimits::default(),
+            secure: false,
+            handler: Mutex::new(Some(Box::new(KeepSession(Arc::clone(&slot))))),
+            stage: Duration::ZERO,
+        });
+        let mut codec = H1SessionClientCodec::new(config);
+        codec.on_connected(ConnHandle::from_execute(Arc::new(|task| task())));
+        let mut session = slot.lock().unwrap().clone().expect("session handed over");
+
+        struct Chain {
+            session: HttpClientSessionHandle,
+            second: Arc<Mutex<TurnRec>>,
+            closed: Arc<Mutex<bool>>,
+        }
+        impl HttpResponseHandler for Chain {
+            fn ok(&mut self, _status: u16) {}
+            fn error(&mut self, _status: u16) {}
+            fn header(&mut self, _name: &str, _value: &str) {}
+            fn response_body_content(&mut self, _data: &[u8]) {}
+            fn close(&mut self) {
+                *self.closed.lock().unwrap() = true;
+                self.session.get("/two").send(Box::new(TurnHandler(Arc::clone(&self.second)))).unwrap();
+            }
+            fn failed(&mut self, _err: io::Error) {}
+        }
+        let second = Arc::new(Mutex::new(TurnRec::default()));
+        let closed = Arc::new(Mutex::new(false));
+        session
+            .get("/one")
+            .send(Box::new(Chain { session: session.clone(), second: Arc::clone(&second), closed: Arc::clone(&closed) }))
+            .unwrap();
+        assert!(String::from_utf8(codec.take_outbound()).unwrap().starts_with("GET /one HTTP/1.1\r\n"));
+        let mut data: &[u8] = b"HTTP/1.1 204 No Content\r\n\r\n";
+        codec.receive(&mut data).unwrap();
+        assert!(*closed.lock().unwrap(), "first response closed");
+        let out = String::from_utf8(codec.take_outbound()).unwrap();
+        assert!(out.starts_with("GET /two HTTP/1.1\r\n"), "chained request on the wire: {out:?}");
+        let mut data: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\ntwo";
+        codec.receive(&mut data).unwrap();
+        let g = second.lock().unwrap();
+        assert!(g.done && !g.failed, "chained response delivered");
+        assert_eq!(g.body, b"two");
     }
 }

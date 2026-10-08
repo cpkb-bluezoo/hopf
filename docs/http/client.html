@@ -44,6 +44,7 @@
 <li><a href="../smtp.html">SMTP</a></li>
 <li><a href="../pop3.html">POP3</a></li>
 <li><a href="../imap.html">IMAP</a></li>
+<li><a href="../nntp.html">NNTP</a></li>
 <li><a href="../mqtt.html">MQTT</a></li>
 <li><a href="../amqp.html">AMQP 0-9-1</a></li>
 <li><a href="../amqp1.html">AMQP 1.0</a></li>
@@ -225,6 +226,8 @@ let rt = Arc::new(Runtime::start(RuntimeConfig::default())?);
 HttpClient::new("api.example.com", 443)
     .tls(connector, "api.example.com")
     .connect(&amp;rt, Box::new(Conn))?;</code></pre>
+<h3 id="several-requests-at-once">Several requests at once</h3>
+<p>On HTTP/2 the session accepts any number of bodyless requests (<code>send</code>) without waiting for earlier ones to complete: each opens its own stream, in the order accepted, as the peer's <code>SETTINGS_MAX_CONCURRENT_STREAMS</code> allows (the rest queue and open as streams finish). A request <em>body</em> streams for one request at a time, since <code>request_body_content</code> carries no request id — a second <code>start_request_body</code> before the first body's <code>end_request_body</code> is refused with <code>request body already in flight</code>; bodyless requests may still join the queue meanwhile. <code>HttpClientSessionHandle::supports_multiplexing()</code> says which case you are in: on HTTP/1.1 a second request of any kind while one is in flight is refused with <code>request already in flight</code>. <code>HttpClientSessionHandle</code> is <code>Clone</code>, so <code>on_connected</code> can hand the connection to another thread or a later task; requests from any clone share the one connection, and a <code>send</code> made off the reactor thread is followed by <code>conn_handle().poke()</code> to flush it (see below).</p>
 <h3 id="deferred-request-body">Deferred request body</h3>
 <p><code>HttpRequest::start_request_body</code> / <code>request_body_content</code> / <code>end_request_body</code> stream a request body in caller-chosen chunks — on both H1 and H2, bytes reach the wire as each chunk arrives rather than being buffered until the whole body is known:</p>
 <table>
@@ -349,6 +352,7 @@ conn_handle.poke();</code></pre>
 <span id="cb3-8"><a href="#cb3-8" aria-hidden="true" tabindex="-1"></a>    )) <span class="kw">as</span> <span class="dt">Box</span><span class="op">&lt;</span><span class="kw">dyn</span> ProtocolHandler<span class="op">&gt;</span></span>
 <span id="cb3-9"><a href="#cb3-9" aria-hidden="true" tabindex="-1"></a><span class="op">}</span>))<span class="op">?;</span></span></code></pre></div>
 <h3 id="tls-alpn">TLS + ALPN</h3>
+<p><code>connect_https(rt, host, port, factory, tls_connector, server_name, settings)</code> is the TLS counterpart of <code>connect_http</code> for the <code>ClientHandler</code> SPI: it resolves the name, dials with the given connector and installs an H2 or H1 client endpoint according to the ALPN the handshake negotiated (offer <code>http/1.1</code> only, or no ALPN, when the request must be an HTTP/1.1 <code>Upgrade</code>, as a WebSocket client's is). It needs no feature. By hand: </p>
 <p>Build a <code>SharedTlsConnector</code> with <code>hopf_core::connector_from_pem</code> or <code>hopf_core::public_trust_connector</code> (ALPN list must match the server), pass it to <code>TcpConnectorConfig::with_tls(connector, server_name)</code>, and use <code>H2Endpoint::client</code> / <code>H1Endpoint::client</code> or <code>AlpnHttpEndpoint</code> on the dial side so negotiated ALPN selects H2 vs H1. See <a href="../tls.html#wiring-listeners-and-connectors">TLS → Wiring</a>.</p>
 <h3 id="http3">HTTP/3</h3>
 <div class="sourceCode" id="cb4"><pre class="sourceCode rust"><code class="sourceCode rust"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">hopf_http::</span><span class="op">{</span>connect_h3<span class="op">,</span> HttpLimits<span class="op">};</span></span>
@@ -445,6 +449,7 @@ conn_handle.poke();</code></pre>
 <li>Stage-0 <code>TcpConnectorConfig</code> dials expect a pre-resolved <code>SocketAddr</code>; prefer <code>connect_http</code> for hostnames.</li>
 <li>H3 client opens one request Stream after handshake in the stock <code>H3ClientConnection</code> path (suitable for the GET demo; not a pool).</li>
 <li>Response trailers are delivered only on H2/H3.</li>
+<li>One request body streams at a time per session; only bodyless requests overlap, and only on H2.</li>
 </ul>
 <h2 id="see-also">See also</h2>
 <ul>

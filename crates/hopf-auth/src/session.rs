@@ -114,6 +114,7 @@ pub fn create_server(
             Box::new(s)
         }
         SaslMechanism::OauthBearer => Box::new(crate::oauthbearer::OauthBearerServer::new(store)),
+        SaslMechanism::XOauth2 => Box::new(crate::xoauth2::XOauth2Server::new(store)),
         SaslMechanism::External => {
             let mut s = crate::external::ExternalServer::new(store);
             if let Some(k) = opts.peer_certificate {
@@ -157,6 +158,10 @@ pub fn create_client(
         SaslMechanism::OauthBearer => {
             // password slot carries the bearer token
             Box::new(crate::oauthbearer::OauthBearerClient::new(username, password))
+        }
+        SaslMechanism::XOauth2 => {
+            // password slot carries the bearer token
+            Box::new(crate::xoauth2::XOauth2Client::new(username, password))
         }
         SaslMechanism::External => Box::new(crate::external::ExternalClient::new(username)),
     }

@@ -45,6 +45,14 @@ pub struct ImapCapabilities {
     pub compress_deflate: bool,
     /// `UTF8=ACCEPT` (RFC 6855).
     pub utf8_accept: bool,
+    /// `LIST-EXTENDED` (RFC 5258): selection and return options on LIST.
+    pub list_extended: bool,
+    /// `LIST-STATUS` (RFC 5819): `RETURN (STATUS (…))` on LIST.
+    pub list_status: bool,
+    /// `SPECIAL-USE` (RFC 6154): `\\Sent`, `\\Trash`, … attributes.
+    pub special_use: bool,
+    /// `CHILDREN` (RFC 3348): `\\HasChildren` / `\\HasNoChildren`.
+    pub children: bool,
 }
 
 impl ImapCapabilities {
@@ -69,6 +77,10 @@ impl ImapCapabilities {
                 "QUOTA" => caps.quota = true,
                 "COMPRESS=DEFLATE" => caps.compress_deflate = true,
                 "UTF8=ACCEPT" => caps.utf8_accept = true,
+                "LIST-EXTENDED" => caps.list_extended = true,
+                "LIST-STATUS" => caps.list_status = true,
+                "SPECIAL-USE" => caps.special_use = true,
+                "CHILDREN" => caps.children = true,
                 _ => {
                     if let Some(mech) = u.strip_prefix("AUTH=") {
                         if mech == "PLAIN" {
@@ -136,6 +148,85 @@ pub struct ImapFetchData {
     pub thread_id: Option<String>,
     /// Accumulated literal / body octets for simple RFC822 / BODY[] fetches.
     pub body: Vec<u8>,
+    /// `ENVELOPE` as sent, with any literal strings re-encoded as quoted
+    /// strings; parse with [`ImapEnvelope::parse`](super::structure::ImapEnvelope::parse).
+    pub envelope: Option<String>,
+    /// `BODYSTRUCTURE` (or the non-extensible `BODY`) as sent, literals
+    /// re-encoded as quoted strings; parse with
+    /// [`ImapBodyStructure::parse`](super::structure::ImapBodyStructure::parse).
+    pub bodystructure: Option<String>,
+    /// `INTERNALDATE`, without its quotes (e.g. `17-Jul-1996 02:44:25 -0700`).
+    pub internaldate: Option<String>,
+}
+
+/// Options for an extended `LIST` (RFC 5258), with the `RETURN` items
+/// other extensions add: `CHILDREN` (RFC 3348), `SPECIAL-USE` (RFC 6154)
+/// and `STATUS` (RFC 5819, LIST-STATUS).
+///
+/// Check the server's [`ImapCapabilities`] first: `list_extended` for any
+/// selection option or `RETURN`, `list_status` for `return_status`,
+/// `special_use` for `special_use` / `return_special_use`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ImapListOptions {
+    /// Selection option `SUBSCRIBED`: list only subscribed mailboxes (and
+    /// return `\\Subscribed`).
+    pub subscribed: bool,
+    /// Selection option `REMOTE`.
+    pub remote: bool,
+    /// Selection option `RECURSIVEMATCH` (needs another selection option).
+    pub recursive_match: bool,
+    /// Selection option `SPECIAL-USE`: list only mailboxes with a
+    /// special-use attribute.
+    pub special_use: bool,
+    /// `RETURN (SUBSCRIBED)`.
+    pub return_subscribed: bool,
+    /// `RETURN (CHILDREN)`.
+    pub return_children: bool,
+    /// `RETURN (SPECIAL-USE)`.
+    pub return_special_use: bool,
+    /// `RETURN (STATUS (items…))`: the status items wanted for every
+    /// listed mailbox (`MESSAGES`, `UNSEEN`, `UIDNEXT`, `UIDVALIDITY`,
+    /// `RECENT`, `SIZE`, `HIGHESTMODSEQ`, …). Empty: no STATUS.
+    pub return_status: Vec<String>,
+}
+
+impl ImapListOptions {
+    /// The selection-option list, `(SUBSCRIBED …)`, or `None` when empty.
+    pub fn selection(&self) -> Option<String> {
+        let mut out = Vec::new();
+        if self.subscribed {
+            out.push("SUBSCRIBED");
+        }
+        if self.remote {
+            out.push("REMOTE");
+        }
+        if self.recursive_match {
+            out.push("RECURSIVEMATCH");
+        }
+        if self.special_use {
+            out.push("SPECIAL-USE");
+        }
+        (!out.is_empty()).then(|| format!("({})", out.join(" ")))
+    }
+
+    /// The `RETURN (…)` clause, or `None` when nothing is requested.
+    pub fn return_clause(&self) -> Option<String> {
+        let mut out: Vec<String> = Vec::new();
+        if self.return_subscribed {
+            out.push("SUBSCRIBED".into());
+        }
+        if self.return_children {
+            out.push("CHILDREN".into());
+        }
+        if self.return_special_use {
+            out.push("SPECIAL-USE".into());
+        }
+        if !self.return_status.is_empty() {
+            let items: Vec<String> = self.return_status.iter().map(|s| s.trim().to_ascii_uppercase()).collect();
+            out.push(format!("STATUS ({})", items.join(" ")));
+        }
+        (!out.is_empty()).then(|| format!("RETURN ({})", out.join(" ")))
+    }
 }
 
 /// Parsed untagged `STATUS` data.
@@ -565,6 +656,11 @@ pub trait ImapClientAuthenticated {
     fn examine(&mut self, mailbox: &str);
     /// Send `LIST reference pattern`.
     fn list(&mut self, reference: &str, pattern: &str);
+    /// Send an RFC 5258 extended `LIST` with selection and return options
+    /// (see [`ImapListOptions`]). With no options set this is a plain
+    /// `LIST`. `RETURN (STATUS …)` replies arrive as `on_status_data`
+    /// calls interleaved with the `on_list_entry` calls.
+    fn list_extended(&mut self, reference: &str, pattern: &str, options: &ImapListOptions);
     /// Send `LSUB reference pattern`.
     fn lsub(&mut self, reference: &str, pattern: &str);
     /// Send `STATUS mailbox (items…)`.
@@ -685,6 +781,48 @@ pub trait ImapClientSelected: ImapClientAuthenticated {
 pub trait ImapClientIdle {
     /// Send `DONE` to leave IDLE and await the tagged completion.
     fn done(&mut self);
+}
+
+/// What a driver may do when it is woken from outside the reactor — the
+/// staged state object for the session's current state, or [`Busy`] when
+/// no command is legal right now.
+///
+/// Handed to [`ImapClientDriver::on_wake`](super::handlers::ImapClientDriver::on_wake).
+/// This is how an interactive client (one whose commands originate on a UI
+/// or worker thread, not inside a reply callback) drives a live session:
+/// queue the work somewhere the driver can see, call
+/// [`hopf_core::ConnHandle::poke`] on the handle stashed from an earlier
+/// callback, and drain the queue in `on_wake` with the state in hand.
+///
+/// [`Busy`]: ImapClientWakeState::Busy
+pub enum ImapClientWakeState<'a> {
+    /// Greeting seen, not yet authenticated (also after a failed login).
+    NotAuthenticated(&'a mut dyn ImapClientNotAuthenticated),
+    /// Authenticated, no mailbox selected.
+    Authenticated(&'a mut dyn ImapClientAuthenticated),
+    /// A mailbox is selected.
+    Selected(&'a mut dyn ImapClientSelected),
+    /// IDLE is active: the only legal command is
+    /// [`ImapClientIdle::done`]; issue anything else from
+    /// [`on_idle_complete`](super::handlers::ImapClientDriver::on_idle_complete).
+    Idle(&'a mut dyn ImapClientIdle),
+    /// Nothing can be issued yet: connecting, mid-STARTTLS, IDLE sent but
+    /// not yet acknowledged, or logging out. Keep the work queued; the
+    /// next wake or callback will find a usable state.
+    Busy,
+}
+
+impl ImapClientWakeState<'_> {
+    /// Short name of the variant, for logs and tests.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::NotAuthenticated(_) => "not_authenticated",
+            Self::Authenticated(_) => "authenticated",
+            Self::Selected(_) => "selected",
+            Self::Idle(_) => "idle",
+            Self::Busy => "busy",
+        }
+    }
 }
 
 // ── parsing helpers ───────────────────────────────────────────────────────────

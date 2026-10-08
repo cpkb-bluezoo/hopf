@@ -1,7 +1,14 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! HTTP/2 [`HttpRequest`] session adapter (multiplexing-ready; one in-flight for now).
+//! HTTP/2 [`HttpRequest`] session adapter.
+//!
+//! Several bodyless requests may be in flight at once (each on its own
+//! stream, opened in the order they were accepted, as the peer's
+//! `SETTINGS_MAX_CONCURRENT_STREAMS` allows); a request *body* is streamed
+//! for one request at a time, since [`HttpRequest::request_body_content`]
+//! carries no request id.
 
+use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 
@@ -19,23 +26,25 @@ use crate::version::HttpVersion;
 
 use super::session_config::HttpClientSessionConfig;
 
-/// Soft cap on bytes buffered in [`OutboundJob::pending_body`] between
-/// flushes — mirrors `h1::session_client_codec::MAX_UNFLUSHED_BODY`'s
-/// rationale, just split across two smaller caps here (see
-/// [`MAX_STREAM_BACKLOG`] for the other half): `request_body_content`
-/// short-writes once this is reached instead of growing unboundedly while
-/// the producer outruns the reactor's chance to actually drain it (e.g. a
-/// cross-connection producer that never gives this connection an I/O event
-/// of its own — see [`hopf_core::ConnHandle::poke`]).
+/// Soft cap on bytes buffered in a job's `pending_body` between flushes —
+/// mirrors `h1::session_client_codec::MAX_UNFLUSHED_BODY`'s rationale, just
+/// split across two smaller caps here (see [`MAX_STREAM_BACKLOG`] for the
+/// other half): `request_body_content` short-writes once this is reached
+/// instead of growing unboundedly while the producer outruns the reactor's
+/// chance to actually drain it (e.g. a cross-connection producer that never
+/// gives this connection an I/O event of its own — see
+/// [`hopf_core::ConnHandle::poke`]).
 const MAX_PENDING_JOB_BODY: usize = 128 * 1024;
 
 /// Soft cap on bytes queued in the underlying [`H2Endpoint`] client
 /// stream's flow-control backlog (`H2ClientStream::pending_body`) before
 /// [`H2HttpClientSession::flush_session`] stops handing it more bytes from
-/// [`OutboundJob::pending_body`]. Bounds memory when the peer's flow-control
-/// window stays closed for a while, independent of [`MAX_PENDING_JOB_BODY`].
+/// the open body job. Bounds memory when the peer's flow-control window
+/// stays closed for a while, independent of [`MAX_PENDING_JOB_BODY`].
 const MAX_STREAM_BACKLOG: usize = 128 * 1024;
 
+/// A request accepted by `send`/`start_request_body` whose stream has not
+/// opened yet.
 struct OutboundJob {
     method: String,
     path: String,
@@ -44,23 +53,34 @@ struct OutboundJob {
     /// stream opens — ownership then moves to the [`H2StreamHandler`]
     /// stored inside [`H2Endpoint`]'s client-stream table.
     handler: Option<Box<dyn HttpResponseHandler>>,
-    /// Body bytes accepted by `request_body_content` but not yet handed to
-    /// the (possibly not-yet-open) H2 stream.
+    /// `true` for a `start_request_body` request: its bytes arrive through
+    /// `body_content` until `end_body`.
+    has_body: bool,
+    /// Body bytes accepted by `request_body_content` while the stream was
+    /// still unopened.
     pending_body: Vec<u8>,
     body_complete: bool,
-    /// Whether end-of-stream has already been handed to the H2 stream
-    /// (either on the opening HEADERS frame for a bodyless request, or via
-    /// `feed_client_stream_body`) — set at most once per job.
+}
+
+/// The body-streaming request once its stream is open: bytes still arrive
+/// through `body_content` and drain into the stream as flow control allows.
+struct OpenBody {
+    stream_id: u32,
+    pending_body: Vec<u8>,
+    body_complete: bool,
+    /// Whether end-of-stream has already been handed to the H2 stream —
+    /// set at most once.
     end_sent: bool,
 }
 
 struct H2SessionShared {
     config: Arc<HttpClientSessionConfig>,
-    job: Option<OutboundJob>,
-    in_flight: bool,
-    /// `Some` once HEADERS have been sent for `job` (see
-    /// [`H2Endpoint::open_client_stream`]).
-    stream_id: Option<u32>,
+    /// Requests accepted but not yet opened as streams, oldest first.
+    queue: VecDeque<OutboundJob>,
+    /// The body-streaming request whose stream is open (see [`OpenBody`]).
+    open_body: Option<OpenBody>,
+    /// Streams opened and not yet complete (or failed).
+    open_streams: usize,
     /// Set by `enqueue`/`body_content`/`end_body` whenever there's new work
     /// for [`H2HttpClientSession::flush_session`] to do.
     dirty: bool,
@@ -78,9 +98,9 @@ impl H2SessionShared {
     fn new(config: Arc<HttpClientSessionConfig>) -> Self {
         Self {
             config,
-            job: None,
-            in_flight: false,
-            stream_id: None,
+            queue: VecDeque::new(),
+            open_body: None,
+            open_streams: 0,
             dirty: false,
             writable_callback: None,
             generation: 0,
@@ -94,6 +114,23 @@ impl H2SessionShared {
         } else {
             format!("{}:{}", self.config.host, self.config.port)
         }
+    }
+
+    /// Any request accepted and not yet answered.
+    fn in_flight(&self) -> bool {
+        self.open_streams > 0 || !self.queue.is_empty()
+    }
+
+    /// The still-unopened request whose body is being streamed, if any.
+    fn queued_body_job(&mut self) -> Option<&mut OutboundJob> {
+        self.queue.iter_mut().find(|j| j.has_body && !j.body_complete)
+    }
+
+    /// Whether a request body is still being streamed (its `end_body` has
+    /// not been called yet), queued or open.
+    fn body_streaming(&self) -> bool {
+        self.queue.iter().any(|j| j.has_body && !j.body_complete)
+            || self.open_body.as_ref().map(|b| !b.body_complete).unwrap_or(false)
     }
 }
 
@@ -121,6 +158,11 @@ impl H2StreamHandler {
         let r = f(&mut *h);
         self.response = Some(h);
         r
+    }
+
+    fn stream_finished(&self) {
+        let mut g = self.shared.lock().unwrap();
+        g.open_streams = g.open_streams.saturating_sub(1);
     }
 }
 
@@ -172,17 +214,17 @@ impl ClientHandler for H2StreamHandler {
     }
 
     fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
-        // Clear `in_flight` *before* calling out to the app's `close()` --
-        // a caller chaining a follow-up request from inside `close()` (an
-        // ordinary pattern for sequential session use) must see the
-        // session as already idle by then, not still "in flight" against
-        // the very request that just finished.
-        self.shared.lock().unwrap().in_flight = false;
+        // Count the stream as finished *before* calling out to the app's
+        // `close()` -- a caller chaining a follow-up request from inside
+        // `close()` (an ordinary pattern for sequential session use) must
+        // see the session as idle by then, not still busy with the very
+        // request that just finished.
+        self.stream_finished();
         self.with_response(|h| h.close());
     }
 
     fn request_failed(&mut self, _request: &mut dyn ClientWriter, err: &io::Error) {
-        self.shared.lock().unwrap().in_flight = false;
+        self.stream_finished();
         if let Some(mut h) = self.response.take() {
             h.failed(io::Error::new(err.kind(), err.to_string()));
         }
@@ -203,7 +245,7 @@ impl SessionRequestOps for OpsBridge {
         headers: Headers,
         handler: Box<dyn HttpResponseHandler>,
     ) -> Result<(), HttpClientError> {
-        self.enqueue(method, path, headers, handler, true)
+        self.enqueue(method, path, headers, handler, false)
     }
 
     fn start_body(
@@ -213,55 +255,68 @@ impl SessionRequestOps for OpsBridge {
         headers: Headers,
         handler: Box<dyn HttpResponseHandler>,
     ) -> Result<(), HttpClientError> {
-        self.enqueue(method, path, headers, handler, false)
+        self.enqueue(method, path, headers, handler, true)
     }
 
     fn body_content(&mut self, data: &[u8]) -> Result<usize, HttpClientError> {
         let mut g = self.0.lock().unwrap();
-        let Some(job) = g.job.as_mut() else {
-            return Err(HttpClientError::new("must call start_request_body first"));
+        let pending: &mut Vec<u8> = if let Some(job) = g.queued_body_job() {
+            &mut job.pending_body
+        } else {
+            match g.open_body.as_mut() {
+                Some(b) if !b.body_complete => &mut b.pending_body,
+                Some(_) => return Err(HttpClientError::new("request body already ended")),
+                None => return Err(HttpClientError::new("must call start_request_body first")),
+            }
         };
-        if job.body_complete {
-            return Err(HttpClientError::new("request body already ended"));
-        }
-        let available = MAX_PENDING_JOB_BODY.saturating_sub(job.pending_body.len());
+        let available = MAX_PENDING_JOB_BODY.saturating_sub(pending.len());
         let accept = data.len().min(available);
-        job.pending_body.extend_from_slice(&data[..accept]);
+        pending.extend_from_slice(&data[..accept]);
         g.dirty = true;
         Ok(accept)
     }
 
     fn end_body(&mut self) -> Result<(), HttpClientError> {
         let mut g = self.0.lock().unwrap();
-        let Some(job) = g.job.as_mut() else {
-            return Err(HttpClientError::new("must call start_request_body first"));
-        };
-        job.body_complete = true;
+        if let Some(job) = g.queued_body_job() {
+            job.body_complete = true;
+        } else {
+            match g.open_body.as_mut() {
+                Some(b) if !b.body_complete => b.body_complete = true,
+                Some(_) => return Err(HttpClientError::new("request body already ended")),
+                None => return Err(HttpClientError::new("must call start_request_body first")),
+            }
+        }
         g.dirty = true;
         Ok(())
     }
 
     fn cancel_request(&mut self) -> Result<(), HttpClientError> {
         let mut g = self.0.lock().unwrap();
-        if let Some(job) = g.job.take() {
-            // Only reachable before the stream opens (`handler` still
-            // `Some`) — once open, the handler has moved into the
-            // `H2Endpoint`'s client-stream table and this is best-effort
-            // bookkeeping only: it lets a *new* request start, but can't
-            // reach in to abort the peer-visible stream (no RST_STREAM
-            // support here — matches this framework's stated scope).
+        // The most recently accepted request that hasn't opened yet is the
+        // one a caller can still take back. Once open, the handler has
+        // moved into the `H2Endpoint`'s client-stream table and this is
+        // best-effort bookkeeping only: it can't reach in to abort the
+        // peer-visible stream (no RST_STREAM support here — matches this
+        // framework's stated scope).
+        if let Some(job) = g.queue.pop_back() {
             if let Some(mut h) = job.handler {
                 h.failed(io::Error::new(io::ErrorKind::Interrupted, "request cancelled"));
             }
+        } else {
+            g.open_body = None;
         }
-        g.in_flight = false;
-        g.job = None;
-        g.stream_id = None;
         Ok(())
     }
 
     fn on_body_writable(&mut self, cb: Box<dyn FnOnce() + Send>) {
-        self.0.lock().unwrap().writable_callback = Some(cb);
+        let mut g = self.0.lock().unwrap();
+        g.writable_callback = Some(cb);
+        // The queue may already have drained between the short write and
+        // this registration; marking the session dirty makes the next
+        // `receive()`/poke re-check for room instead of waiting for I/O
+        // that an idle connection never gets.
+        g.dirty = true;
     }
 }
 
@@ -272,22 +327,21 @@ impl OpsBridge {
         path: &str,
         headers: Headers,
         handler: Box<dyn HttpResponseHandler>,
-        body_complete: bool,
+        has_body: bool,
     ) -> Result<(), HttpClientError> {
         let mut g = self.0.lock().unwrap();
-        if g.in_flight {
-            return Err(HttpClientError::new("request already in flight"));
+        if has_body && g.body_streaming() {
+            return Err(HttpClientError::new("request body already in flight"));
         }
-        g.in_flight = true;
         g.generation = g.generation.wrapping_add(1);
-        g.job = Some(OutboundJob {
+        g.queue.push_back(OutboundJob {
             method: method.to_string(),
             path: path.to_string(),
             headers,
             handler: Some(handler),
+            has_body,
             pending_body: Vec::new(),
-            body_complete,
-            end_sent: false,
+            body_complete: !has_body,
         });
         g.dirty = true;
         Ok(())
@@ -333,7 +387,7 @@ impl H2HttpClientSession {
         self.cancel_stage_timer();
         let (stage, generation, in_flight) = {
             let g = self.shared.lock().unwrap();
-            (g.config.stage, g.generation, g.in_flight)
+            (g.config.stage, g.generation, g.in_flight())
         };
         if !in_flight || stage.is_zero() {
             return;
@@ -345,7 +399,7 @@ impl H2HttpClientSession {
             Box::new(move || {
                 let still_current = {
                     let g = shared.lock().unwrap();
-                    g.in_flight && g.generation == generation
+                    g.in_flight() && g.generation == generation
                 };
                 if still_current {
                     handle.with_endpoint(|ep2| {
@@ -390,9 +444,10 @@ impl H2HttpClientSession {
         self.arm_stage_timer_if_in_flight(endpoint);
     }
 
-    /// Open the current job's stream if it hasn't been opened yet, then
-    /// hand off whatever body bytes are queued (and end-of-stream, once
-    /// there are none left to send) — the Gumdrop-session counterpart to
+    /// Open a stream for every queued request the connection can take right
+    /// now, oldest first, then hand off whatever body bytes are queued for
+    /// the open body request (and end-of-stream, once there are none left
+    /// to send) — the Gumdrop-session counterpart to
     /// `H2Endpoint::start_client_request`'s one-shot "whole body now" path
     /// used by the lower-level `ClientHandler` SPI.
     ///
@@ -404,22 +459,37 @@ impl H2HttpClientSession {
     fn flush_session(&mut self, endpoint: &mut dyn Endpoint) {
         {
             let mut g = self.shared.lock().unwrap();
-            if !g.dirty || g.job.is_none() {
+            if !g.dirty {
                 return;
             }
             g.dirty = false;
         }
+        if !self.inner.client_connection_ready() {
+            self.shared.lock().unwrap().dirty = true;
+            return;
+        }
 
-        if self.shared.lock().unwrap().stream_id.is_none() {
-            if !self.inner.client_connection_ready() {
-                self.shared.lock().unwrap().dirty = true;
-                return;
-            }
-            let (headers, handler, bodyless) = {
+        // 1. Open queued streams in order.
+        loop {
+            let (headers, handler, bodyless, has_body) = {
                 let mut g = self.shared.lock().unwrap();
+                let Some(job) = g.queue.front() else { break };
+                // A second body request waits until the first body has
+                // been handed over entirely: body bytes target one open
+                // stream at a time.
+                if job.has_body && g.open_body.is_some() {
+                    g.dirty = true;
+                    break;
+                }
+                if !self.inner.can_open_client_stream() {
+                    // Peer's MAX_CONCURRENT_STREAMS exhausted (or not ready
+                    // yet) — retry on a later receive()/poke.
+                    g.dirty = true;
+                    break;
+                }
                 let scheme = if g.config.secure { "https" } else { "http" };
                 let authority = g.authority();
-                let job = g.job.as_mut().unwrap();
+                let job = g.queue.front_mut().expect("checked above");
                 let mut h = Headers::new();
                 h.set(":method", &job.method);
                 h.set(":path", &job.path);
@@ -433,7 +503,7 @@ impl H2HttpClientSession {
                 }
                 let handler = job.handler.take().expect("handler present until stream opens");
                 let bodyless = job.body_complete && job.pending_body.is_empty();
-                (h, handler, bodyless)
+                (h, handler, bodyless, job.has_body)
             };
             let stream_handler: Box<dyn ClientHandler> = Box::new(H2StreamHandler {
                 shared: Arc::clone(&self.shared),
@@ -442,45 +512,60 @@ impl H2HttpClientSession {
             let Some(stream_id) =
                 self.inner.open_client_stream(headers, stream_handler, bodyless, endpoint)
             else {
-                // Not ready yet (e.g. peer's MAX_CONCURRENT_STREAMS
-                // exhausted) — retry on a later receive()/poke.
-                self.shared.lock().unwrap().dirty = true;
-                return;
+                // `can_open_client_stream` said yes a moment ago; nothing
+                // else runs between on this thread, so this is unreachable
+                // in practice — but never lose the request silently.
+                let mut g = self.shared.lock().unwrap();
+                let job = g.queue.pop_front().expect("front job still queued");
+                drop(g);
+                let _ = job;
+                break;
             };
             let mut g = self.shared.lock().unwrap();
-            g.stream_id = Some(stream_id);
-            if bodyless {
-                g.job.as_mut().unwrap().end_sent = true;
+            let job = g.queue.pop_front().expect("front job still queued");
+            g.open_streams += 1;
+            if has_body && !bodyless {
+                g.open_body = Some(OpenBody {
+                    stream_id,
+                    pending_body: job.pending_body,
+                    body_complete: job.body_complete,
+                    end_sent: false,
+                });
             }
         }
 
-        let stream_id = self.shared.lock().unwrap().stream_id.unwrap();
-        if self.inner.client_stream_pending_len(stream_id) >= MAX_STREAM_BACKLOG {
-            // Still catching up on flow control; `receive()` already retries
-            // `flush_client_streams()` on every call (e.g. once a
-            // WINDOW_UPDATE arrives), and this flag brings us back here too
-            // once more of `pending_body` might fit.
-            self.shared.lock().unwrap().dirty = true;
-            return;
-        }
-
-        let (bytes, end_now, fully_done) = {
-            let mut g = self.shared.lock().unwrap();
-            let job = g.job.as_mut().unwrap();
-            let bytes = std::mem::take(&mut job.pending_body);
-            let end_now = job.body_complete && !job.end_sent;
-            if end_now {
-                job.end_sent = true;
+        // 2. Drain the open body request into its stream.
+        let open = self.shared.lock().unwrap().open_body.as_ref().map(|b| b.stream_id);
+        if let Some(stream_id) = open {
+            if self.inner.client_stream_pending_len(stream_id) >= MAX_STREAM_BACKLOG {
+                // Still catching up on flow control; `receive()` already
+                // retries `flush_client_streams()` on every call (e.g. once
+                // a WINDOW_UPDATE arrives), and this flag brings us back
+                // here too once more of `pending_body` might fit.
+                self.shared.lock().unwrap().dirty = true;
+            } else {
+                let (bytes, end_now, fully_done) = {
+                    let mut g = self.shared.lock().unwrap();
+                    let b = g.open_body.as_mut().expect("checked above");
+                    let bytes = std::mem::take(&mut b.pending_body);
+                    let end_now = b.body_complete && !b.end_sent;
+                    if end_now {
+                        b.end_sent = true;
+                    }
+                    (bytes, end_now, b.end_sent)
+                };
+                if !bytes.is_empty() || end_now {
+                    self.inner.feed_client_stream_body(stream_id, &bytes, end_now, endpoint);
+                }
+                if fully_done {
+                    let mut g = self.shared.lock().unwrap();
+                    g.open_body = None;
+                    // A body request queued behind this one may open now.
+                    if g.queue.iter().any(|j| j.has_body) {
+                        g.dirty = true;
+                    }
+                }
             }
-            (bytes, end_now, job.end_sent)
-        };
-        if !bytes.is_empty() || end_now {
-            self.inner.feed_client_stream_body(stream_id, &bytes, end_now, endpoint);
-        }
-        if fully_done {
-            let mut g = self.shared.lock().unwrap();
-            g.job = None;
-            g.stream_id = None;
         }
         self.maybe_fire_writable_callback();
     }
@@ -494,12 +579,15 @@ impl H2HttpClientSession {
             if g.writable_callback.is_none() {
                 return;
             }
-            let job_has_room = g
-                .job
-                .as_ref()
-                .map(|j| j.pending_body.len() < MAX_PENDING_JOB_BODY)
-                .unwrap_or(true);
-            let stream_has_room = match g.stream_id {
+            let job_has_room = match g.queued_body_job() {
+                Some(j) => j.pending_body.len() < MAX_PENDING_JOB_BODY,
+                None => g
+                    .open_body
+                    .as_ref()
+                    .map(|b| b.pending_body.len() < MAX_PENDING_JOB_BODY)
+                    .unwrap_or(true),
+            };
+            let stream_has_room = match g.open_body.as_ref().map(|b| b.stream_id) {
                 Some(id) => self.inner.client_stream_pending_len(id) < MAX_STREAM_BACKLOG,
                 None => true,
             };
@@ -518,10 +606,11 @@ impl H2HttpClientSession {
     /// can still hear about it, mirroring
     /// `h1::session_client_codec::H1SessionInner::fail_transport`: if
     /// `on_connected` hasn't fired yet, the stashed
-    /// [`crate::HttpConnectionHandler`] gets `on_error`; otherwise, a job
-    /// whose stream hasn't opened yet (still holding its response handler
-    /// directly) gets `failed()`. A job whose stream *has* opened is
-    /// handled separately by `H2Endpoint::fail_client_streams`, called from
+    /// [`crate::HttpConnectionHandler`] gets `on_error`; otherwise, every
+    /// queued request whose stream hasn't opened yet (still holding its
+    /// response handler directly) gets `failed()`. Requests whose streams
+    /// *have* opened are handled separately by
+    /// `H2Endpoint::fail_client_streams`, called from
     /// `self.inner.error`/`disconnected` right after this.
     fn fail_transport(&mut self, err: io::Error) {
         if !self.connected_notified {
@@ -531,12 +620,12 @@ impl H2HttpClientSession {
             }
             return;
         }
-        let taken = {
+        let queued: Vec<Box<dyn HttpResponseHandler>> = {
             let mut g = self.shared.lock().unwrap();
-            g.job.as_mut().and_then(|j| j.handler.take())
+            g.queue.drain(..).filter_map(|j| j.handler).collect()
         };
-        if let Some(mut h) = taken {
-            h.failed(err);
+        for mut h in queued {
+            h.failed(io::Error::new(err.kind(), err.to_string()));
         }
     }
 
@@ -573,6 +662,11 @@ impl ProtocolHandler for H2HttpClientSession {
         self.inner.receive(endpoint, data);
         self.maybe_notify_connected(endpoint);
         self.flush_session(endpoint);
+        // Inbound frames (a WINDOW_UPDATE above all) can free room in the
+        // stream backlog without this session having any new work of its
+        // own, so the short-write resume signal is checked on every
+        // receive, not only when `flush_session` had something to do.
+        self.maybe_fire_writable_callback();
         self.arm_stage_timer_if_in_flight(endpoint);
     }
 
@@ -636,7 +730,7 @@ mod tests {
             big.len()
         );
         assert_eq!(
-            session.shared.lock().unwrap().job.as_ref().unwrap().pending_body.len(),
+            session.shared.lock().unwrap().queue.front().unwrap().pending_body.len(),
             accepted
         );
 
@@ -671,14 +765,14 @@ mod tests {
         assert!(!resumed.load(Ordering::SeqCst));
 
         // Simulate `flush_session` having drained the queue into the H2
-        // stream (no real connection needed: `stream_id` stays `None`, so
+        // stream (no real connection needed: no stream is open, so
         // `maybe_fire_writable_callback` only weighs job-queue room).
         session
             .shared
             .lock()
             .unwrap()
-            .job
-            .as_mut()
+            .queue
+            .front_mut()
             .unwrap()
             .pending_body
             .clear();
@@ -688,5 +782,71 @@ mod tests {
             resumed.load(Ordering::SeqCst),
             "writable callback should fire once the pending-job queue has room again"
         );
+    }
+
+    /// On HTTP/2 several bodyless requests may be in flight at once: a
+    /// second `send` while the first is unanswered is queued, not refused.
+    #[test]
+    fn bodyless_requests_queue_while_another_is_in_flight() {
+        let session = session();
+        let ops = session.request_ops();
+        ops.lock()
+            .unwrap()
+            .send_no_body("GET", "/one", Headers::new(), Box::new(NullHandler))
+            .unwrap();
+        ops.lock()
+            .unwrap()
+            .send_no_body("GET", "/two", Headers::new(), Box::new(NullHandler))
+            .expect("a second bodyless request is queued on an H2 session");
+        ops.lock()
+            .unwrap()
+            .send_no_body("GET", "/three", Headers::new(), Box::new(NullHandler))
+            .expect("a third bodyless request is queued on an H2 session");
+        assert_eq!(session.shared.lock().unwrap().queue.len(), 3);
+    }
+
+    /// Only one request body streams at a time: body bytes have no request
+    /// id, so a second body request is refused until the first has ended.
+    #[test]
+    fn a_second_body_request_is_refused_while_one_streams() {
+        let session = session();
+        let ops = session.request_ops();
+        ops.lock()
+            .unwrap()
+            .start_body("PUT", "/upload", Headers::new(), Box::new(NullHandler))
+            .unwrap();
+        let err = ops
+            .lock()
+            .unwrap()
+            .start_body("PUT", "/upload2", Headers::new(), Box::new(NullHandler))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "request body already in flight");
+        // A bodyless request may still join the queue behind it.
+        ops.lock()
+            .unwrap()
+            .send_no_body("GET", "/meanwhile", Headers::new(), Box::new(NullHandler))
+            .unwrap();
+        // Once the body has ended, another body request is accepted.
+        ops.lock().unwrap().end_body().unwrap();
+        ops.lock()
+            .unwrap()
+            .start_body("PUT", "/upload2", Headers::new(), Box::new(NullHandler))
+            .unwrap();
+    }
+
+    /// Registering the writable callback marks the session dirty, so a poke
+    /// after a short write re-checks for room even if the queue drained in
+    /// between — otherwise an idle connection would never fire it.
+    #[test]
+    fn on_body_writable_marks_the_session_dirty() {
+        let session = session();
+        let ops = session.request_ops();
+        ops.lock()
+            .unwrap()
+            .start_body("PUT", "/upload", Headers::new(), Box::new(NullHandler))
+            .unwrap();
+        session.shared.lock().unwrap().dirty = false;
+        ops.lock().unwrap().on_body_writable(Box::new(|| {}));
+        assert!(session.shared.lock().unwrap().dirty);
     }
 }

@@ -23,6 +23,17 @@ pub trait SmtpClientHandlerFactory: Send + Sync {
     /// issue #184) to [`hopf_core::StorageExecutor`] instead of the reactor
     /// thread.
     fn create(&self, runtime: &Arc<Runtime>) -> Box<dyn SmtpClientDriver>;
+
+    /// The dial never produced a connection, so there is no driver to tell:
+    /// DNS failed or returned no addresses for `host`, or the connect could
+    /// not be started at all. (A connect that starts and then fails or
+    /// times out reaches the driver's `on_error` / `on_timeout` as usual.)
+    ///
+    /// Default: a line on stderr. Override it to surface the failure the
+    /// way the rest of the session's outcomes are surfaced.
+    fn connect_failed(&self, host: &str, error: &io::Error) {
+        eprintln!("hopf-smtp: connect to {host} failed: {error}");
+    }
 }
 
 /// Receives all SMTP protocol callbacks for a single client connection.

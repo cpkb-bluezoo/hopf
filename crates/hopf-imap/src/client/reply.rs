@@ -335,6 +335,13 @@ enum State {
     ListNameQuoted { escape: bool },
     /// Reading an unquoted mailbox name atom.
     ListNameAtom,
+    /// Name read: expect CRLF, or SP and an RFC 5258 extended data item.
+    ListAfterName,
+    /// SP seen after the name: expect `(` opening the extended data item.
+    ListExtOpen,
+    /// Inside the extended data item — skip-scanned by depth; its contents
+    /// (`CHILDINFO`, `OLDNAME`, …) are not surfaced.
+    ListExtBody { depth: i32, in_quote: bool, escape: bool },
     /// Deciding quoted-vs-atom for STATUS's mailbox name.
     StatusMailboxStart,
     /// Inside a quoted STATUS mailbox name.
@@ -408,8 +415,20 @@ enum State {
     /// Streaming literal octets (count in `literal_remaining`); handled by
     /// [`ImapReplyLexer::feed`] directly, not `feed_byte`.
     FetchLiteral,
-    /// An unrecognised attribute's value — skip-scanned by depth.
+    /// An unrecognised attribute's value — skip-scanned by depth — or a
+    /// structured one (`ENVELOPE`, `BODYSTRUCTURE`, `INTERNALDATE`) being
+    /// captured verbatim for `super::structure`.
     FetchSkipValue { depth: i32, in_quote: bool, escape: bool },
+    /// `{` seen inside a skipped (captured) value: reading the octet count.
+    FetchSkipLiteralSize { depth: i32 },
+    /// `}` seen: expect CR.
+    FetchSkipLiteralCr { depth: i32 },
+    /// Expect LF, then the literal's octets follow.
+    FetchSkipLiteralLf { depth: i32 },
+    /// Consuming a literal's octets inside a skipped value — handled in
+    /// `feed()` like `FetchLiteral`, but re-encoded into the capture as a
+    /// quoted string instead of being streamed.
+    FetchSkipLiteral { depth: i32 },
     /// Just closed a value: expect SP (next attribute) or `)` (list done).
     FetchAfterValue,
     /// `)` closed the FETCH list: expect CRLF.
@@ -456,7 +475,28 @@ pub struct ImapReplyLexer {
     /// for `RFC822`/`RFC822.TEXT`/`RFC822.HEADER`. Read by
     /// `FetchLiteralBegin` once a literal marker for this value is seen.
     fetch_section: Vec<u8>,
+    /// Which FETCH item the skip scanner is currently capturing verbatim
+    /// (`ENVELOPE`, `BODYSTRUCTURE`/`BODY`, `INTERNALDATE`), if any.
+    fetch_capture_kind: Option<FetchCaptureKind>,
+    /// The captured value's bytes; literals inside it are re-encoded as
+    /// quoted strings so the result is one line the structure parsers
+    /// (`super::structure`) can read.
+    fetch_capture: Vec<u8>,
 }
+
+/// FETCH items whose structured value is captured rather than parsed inline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchCaptureKind {
+    Envelope,
+    BodyStructure,
+    InternalDate,
+}
+
+/// Upper bound on a captured `ENVELOPE` / `BODYSTRUCTURE` value — large
+/// enough for any real message's structure (one line per MIME part, a few
+/// hundred bytes each), small enough that a hostile server cannot make the
+/// client buffer without limit.
+pub const MAX_CAPTURED_STRUCTURE: usize = 1024 * 1024;
 
 impl Default for ImapReplyLexer {
     fn default() -> Self {
@@ -483,6 +523,8 @@ impl ImapReplyLexer {
             list_close_kind: None,
             flags_is_fetch_attr: false,
             fetch_section: Vec::with_capacity(16),
+            fetch_capture_kind: None,
+            fetch_capture: Vec::new(),
         }
     }
 
@@ -517,6 +559,25 @@ impl ImapReplyLexer {
                 if self.literal_remaining == 0 {
                     self.state = State::FetchAfterValue;
                     events.push(ImapEvent::FetchLiteralEnd { seq: self.fetch_data.seq });
+                }
+                continue;
+            }
+            if let State::FetchSkipLiteral { depth } = self.state {
+                // A literal inside a captured structure (an ENVELOPE with a
+                // non-ASCII subject, say): take as much as is available and
+                // re-encode it into the capture as a quoted string.
+                let take = rest.len().min(self.literal_remaining as usize);
+                for &c in &rest[..take] {
+                    if c == b'"' || c == b'\\' {
+                        self.push_capture(b'\\')?;
+                    }
+                    self.push_capture(c)?;
+                }
+                rest = &rest[take..];
+                self.literal_remaining -= take as u64;
+                if self.literal_remaining == 0 {
+                    self.push_capture(b'"')?;
+                    self.state = State::FetchSkipValue { depth, in_quote: false, escape: false };
                 }
                 continue;
             }
@@ -601,6 +662,9 @@ impl ImapReplyLexer {
             State::ListNameStart => self.on_list_name_start(b),
             State::ListNameQuoted { escape } => self.on_list_name_quoted(escape, b),
             State::ListNameAtom => self.on_list_name_atom(b),
+            State::ListAfterName => self.on_list_after_name(b),
+            State::ListExtOpen => self.on_list_ext_open(b),
+            State::ListExtBody { depth, in_quote, escape } => self.on_list_ext_body(depth, in_quote, escape, b),
             State::StatusMailboxStart => self.on_status_mailbox_start(b),
             State::StatusMailboxQuoted { escape } => self.on_status_mailbox_quoted(escape, b),
             State::StatusMailboxAtom => self.on_status_mailbox_atom(b),
@@ -638,6 +702,10 @@ impl ImapReplyLexer {
             State::FetchSkipValue { depth, in_quote, escape } => {
                 self.on_fetch_skip_value(depth, in_quote, escape, b)
             }
+            State::FetchSkipLiteralSize { depth } => self.on_fetch_skip_literal_size(depth, b),
+            State::FetchSkipLiteralCr { depth } => self.on_fetch_skip_literal_cr(depth, b),
+            State::FetchSkipLiteralLf { depth } => self.on_fetch_skip_literal_lf(depth, b),
+            State::FetchSkipLiteral { .. } => unreachable!("handled in feed()"),
             State::FetchAfterValue => self.on_fetch_after_value(b),
             State::FetchListCloseCr => self.on_fetch_list_close_cr(b),
             State::FlagsListCloseCr => self.on_flags_list_close_cr(b),
@@ -1286,8 +1354,7 @@ impl ImapReplyLexer {
             }
             b'"' => {
                 self.list_entry.name = self.take_text();
-                self.state = State::FetchListCloseCr; // reused: "expect CRLF"
-                self.pending_list_entry();
+                self.state = State::ListAfterName;
                 Ok(None)
             }
             _ => {
@@ -1299,13 +1366,73 @@ impl ImapReplyLexer {
     }
 
     fn on_list_name_atom(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b'\r' {
-            self.list_entry.name = self.take_text();
-            self.state = State::AwaitLf(AwaitLfKind::ListEntry);
+        match b {
+            b'\r' => {
+                self.list_entry.name = self.take_text();
+                self.state = State::AwaitLf(AwaitLfKind::ListEntry);
+                Ok(None)
+            }
+            b' ' => {
+                self.list_entry.name = self.take_text();
+                self.state = State::ListExtOpen;
+                Ok(None)
+            }
+            _ => {
+                self.push_text(b)?;
+                self.state = State::ListNameAtom;
+                Ok(None)
+            }
+        }
+    }
+
+    fn on_list_after_name(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        match b {
+            b'\r' => {
+                self.state = State::AwaitLf(AwaitLfKind::ListEntry);
+                Ok(None)
+            }
+            b' ' => {
+                self.state = State::ListExtOpen;
+                Ok(None)
+            }
+            _ => Err(ImapError::Parse("expected CRLF or extended data after LIST name".into())),
+        }
+    }
+
+    fn on_list_ext_open(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        if b != b'(' {
+            return Err(ImapError::Parse("expected '(' opening LIST extended data".into()));
+        }
+        self.state = State::ListExtBody { depth: 1, in_quote: false, escape: false };
+        Ok(None)
+    }
+
+    /// RFC 5258 §3.3 `mbox-list-extended`: `(tagged-ext-label tagged-ext-val …)`
+    /// — nested lists, quoted strings and atoms. Skipped by depth; a `"` inside
+    /// a quoted string is escaped, parentheses inside one do not count.
+    fn on_list_ext_body(&mut self, depth: i32, in_quote: bool, escape: bool, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        if escape {
+            self.state = State::ListExtBody { depth, in_quote, escape: false };
             return Ok(None);
         }
-        self.push_text(b)?;
-        self.state = State::ListNameAtom;
+        if in_quote {
+            self.state = match b {
+                b'\\' => State::ListExtBody { depth, in_quote, escape: true },
+                b'"' => State::ListExtBody { depth, in_quote: false, escape: false },
+                _ => State::ListExtBody { depth, in_quote, escape: false },
+            };
+            return Ok(None);
+        }
+        match b {
+            b'"' => self.state = State::ListExtBody { depth, in_quote: true, escape: false },
+            b'(' => self.state = State::ListExtBody { depth: depth + 1, in_quote: false, escape: false },
+            b')' if depth > 1 => self.state = State::ListExtBody { depth: depth - 1, in_quote: false, escape: false },
+            b')' => {
+                self.state = State::FetchListCloseCr; // reused: "expect CRLF"
+                self.pending_list_entry();
+            }
+            _ => self.state = State::ListExtBody { depth, in_quote: false, escape: false },
+        }
         Ok(None)
     }
 
@@ -1500,9 +1627,18 @@ impl ImapReplyLexer {
                 Ok(None)
             }
             (_, b' ') => {
-                // ENVELOPE / BODYSTRUCTURE / INTERNALDATE / bare BODY /
-                // any unrecognised atom: skip the value (quoted string,
-                // atom, or parenthesized structure).
+                // ENVELOPE / BODYSTRUCTURE / INTERNALDATE / bare BODY are
+                // captured verbatim for the structure parsers; any other
+                // unrecognised atom is skipped. Either way the value may be
+                // a quoted string, an atom, a literal, or a parenthesized
+                // structure with any of those nested inside it.
+                self.fetch_capture_kind = match name {
+                    "ENVELOPE" => Some(FetchCaptureKind::Envelope),
+                    "BODYSTRUCTURE" | "BODY" => Some(FetchCaptureKind::BodyStructure),
+                    "INTERNALDATE" => Some(FetchCaptureKind::InternalDate),
+                    _ => None,
+                };
+                self.fetch_capture.clear();
                 self.state = State::FetchSkipValue { depth: 0, in_quote: false, escape: false };
                 Ok(None)
             }
@@ -1889,6 +2025,36 @@ impl ImapReplyLexer {
         Err(ImapError::Parse("expected LF after literal size marker's CR".into()))
     }
 
+    /// Append one byte to the capture buffer, if a capture is active.
+    fn push_capture(&mut self, b: u8) -> Result<(), ImapError> {
+        if self.fetch_capture_kind.is_none() {
+            return Ok(());
+        }
+        if self.fetch_capture.len() >= MAX_CAPTURED_STRUCTURE {
+            return Err(ImapError::Parse("FETCH structure value too large".into()));
+        }
+        self.fetch_capture.push(b);
+        Ok(())
+    }
+
+    /// The skipped value is complete: file the capture under its item.
+    fn finish_capture(&mut self) {
+        let Some(kind) = self.fetch_capture_kind.take() else {
+            return;
+        };
+        let raw = std::mem::take(&mut self.fetch_capture);
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        match kind {
+            FetchCaptureKind::Envelope => self.fetch_data.envelope = Some(text),
+            FetchCaptureKind::BodyStructure => self.fetch_data.bodystructure = Some(text),
+            FetchCaptureKind::InternalDate => {
+                let t = text.trim();
+                let t = t.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(t);
+                self.fetch_data.internaldate = Some(t.to_string());
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn on_fetch_skip_value(
         &mut self,
@@ -1898,10 +2064,12 @@ impl ImapReplyLexer {
         b: u8,
     ) -> Result<Option<ImapEvent>, ImapError> {
         if escape {
+            self.push_capture(b)?;
             self.state = State::FetchSkipValue { depth, in_quote, escape: false };
             return Ok(None);
         }
         if in_quote {
+            self.push_capture(b)?;
             match b {
                 b'\\' => self.state = State::FetchSkipValue { depth, in_quote, escape: true },
                 b'"' => self.state = State::FetchSkipValue { depth, in_quote: false, escape: false },
@@ -1911,35 +2079,93 @@ impl ImapReplyLexer {
         }
         match b {
             b'"' => {
+                self.push_capture(b)?;
                 self.state = State::FetchSkipValue { depth, in_quote: true, escape: false };
                 Ok(None)
             }
+            b'{' => {
+                // A literal: `{n}` CRLF then n octets. The marker is not
+                // part of the capture; the octets are re-encoded as a
+                // quoted string once they arrive (see `feed()`).
+                self.state = State::FetchSkipLiteralSize { depth };
+                Ok(None)
+            }
             b'(' | b'[' => {
+                self.push_capture(b)?;
                 self.state = State::FetchSkipValue { depth: depth + 1, in_quote: false, escape: false };
                 Ok(None)
             }
             b')' | b']' if depth > 1 => {
+                self.push_capture(b)?;
                 self.state = State::FetchSkipValue { depth: depth - 1, in_quote: false, escape: false };
                 Ok(None)
             }
             b')' | b']' if depth == 1 => {
+                self.push_capture(b)?;
+                self.finish_capture();
                 self.state = State::FetchAfterValue;
                 Ok(None)
             }
             b' ' if depth == 0 => {
+                self.finish_capture();
                 self.state = State::FetchAttrNameStart;
                 Ok(None)
             }
             b')' if depth == 0 => {
+                self.finish_capture();
                 self.state = State::FetchListCloseCr;
                 self.list_close_kind = Some(ListCloseKind::Fetch);
                 Ok(None)
             }
             _ => {
+                self.push_capture(b)?;
                 self.state = State::FetchSkipValue { depth, in_quote: false, escape: false };
                 Ok(None)
             }
         }
+    }
+
+    fn on_fetch_skip_literal_size(&mut self, depth: i32, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        match b {
+            b'+' => Ok(None), // non-synchronizing marker; irrelevant to a reply reader
+            b'}' => {
+                let w = self.take_word();
+                let n: u64 = w
+                    .parse()
+                    .map_err(|_| ImapError::Parse(format!("bad literal size: {w:?}")))?;
+                self.literal_remaining = n;
+                self.state = State::FetchSkipLiteralCr { depth };
+                Ok(None)
+            }
+            _ if b.is_ascii_digit() => {
+                self.push_word(b)?;
+                Ok(None)
+            }
+            _ => Err(ImapError::Parse("bad literal marker inside FETCH value".into())),
+        }
+    }
+
+    fn on_fetch_skip_literal_cr(&mut self, depth: i32, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        if b != b'\r' {
+            return Err(ImapError::Parse("expected CR after literal size".into()));
+        }
+        self.state = State::FetchSkipLiteralLf { depth };
+        Ok(None)
+    }
+
+    fn on_fetch_skip_literal_lf(&mut self, depth: i32, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        if b != b'\n' {
+            return Err(ImapError::Parse("expected LF after literal size".into()));
+        }
+        self.push_capture(b'"')?;
+        if self.literal_remaining == 0 {
+            // `{0}`: an empty string.
+            self.push_capture(b'"')?;
+            self.state = State::FetchSkipValue { depth, in_quote: false, escape: false };
+        } else {
+            self.state = State::FetchSkipLiteral { depth };
+        }
+        Ok(None)
     }
 
     fn on_fetch_after_value(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
@@ -2301,6 +2527,39 @@ mod tests {
         );
     }
 
+    /// RFC 5258 servers append an extended data item after the name —
+    /// `("CHILDINFO" ("SUBSCRIBED"))`, `("OLDNAME" ("x"))` — which must not
+    /// desync the lexer after either a quoted or an atom name.
+    #[test]
+    fn list_entry_with_extended_data_item() {
+        let wire = concat!(
+            "* LIST (\\Subscribed \\HasChildren) \"/\" \"Foo\" (\"CHILDINFO\" (\"SUBSCRIBED\"))\r\n",
+            "* LIST () \"/\" INBOX (\"OLDNAME\" (\"In (box)\" \"q\\\"uote\"))\r\n",
+            "* LIST () \"/\" Plain\r\n",
+        );
+        let ev = assert_split_matches_bulk(wire.as_bytes());
+        assert_eq!(
+            ev,
+            vec![
+                ImapEvent::ListEntry(ImapListEntry {
+                    attributes: vec!["\\Subscribed".into(), "\\HasChildren".into()],
+                    delimiter: Some("/".into()),
+                    name: "Foo".into(),
+                }),
+                ImapEvent::ListEntry(ImapListEntry {
+                    attributes: vec![],
+                    delimiter: Some("/".into()),
+                    name: "INBOX".into(),
+                }),
+                ImapEvent::ListEntry(ImapListEntry {
+                    attributes: vec![],
+                    delimiter: Some("/".into()),
+                    name: "Plain".into(),
+                }),
+            ]
+        );
+    }
+
     #[test]
     fn list_entry_nil_delimiter() {
         let mut lex = ImapReplyLexer::new();
@@ -2606,6 +2865,69 @@ mod tests {
             }
             other => panic!("expected Fetch, got {other:?}"),
         }
+    }
+
+    /// ENVELOPE, BODYSTRUCTURE and INTERNALDATE are captured verbatim so
+    /// the structure parsers can read them; everything around them still
+    /// parses as before.
+    #[test]
+    fn fetch_captures_structured_items() {
+        let mut lex = ImapReplyLexer::new();
+        let ev = feed_all(
+            &mut lex,
+            "* 7 FETCH (UID 42 INTERNALDATE \"17-Jul-1996 02:44:25 -0700\" ENVELOPE (\"date\" \"subj (x)\" NIL NIL) BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 42 3) FLAGS (\\Seen))\r\n",
+        );
+        match &ev[0] {
+            ImapEvent::Fetch(d) => {
+                assert_eq!(d.uid, Some(42));
+                assert_eq!(d.internaldate.as_deref(), Some("17-Jul-1996 02:44:25 -0700"));
+                assert_eq!(d.envelope.as_deref(), Some("(\"date\" \"subj (x)\" NIL NIL)"));
+                assert_eq!(
+                    d.bodystructure.as_deref(),
+                    Some("(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 42 3)")
+                );
+                assert_eq!(d.flags, vec!["\\Seen".to_string()]);
+            }
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
+    /// A literal inside a captured structure — Dovecot sends an ENVELOPE
+    /// subject as `{n}` CRLF octets whenever it has 8-bit or quote
+    /// characters — must neither desync the lexer nor be lost: it is
+    /// re-encoded as a quoted string in the capture.
+    #[test]
+    fn fetch_literal_inside_envelope_is_captured_as_quoted_string() {
+        let wire = b"* 1 FETCH (ENVELOPE (\"date\" {16}\r\nSay \"hi\" \\ caf\xc3\xa9 NIL NIL) FLAGS (\\Seen) UID 9)\r\n";
+        let ev = assert_split_matches_bulk(wire);
+        match &ev[0] {
+            ImapEvent::Fetch(d) => {
+                assert_eq!(
+                    d.envelope.as_deref(),
+                    Some("(\"date\" \"Say \\\"hi\\\" \\\\ caf\u{e9}\" NIL NIL)")
+                );
+                assert_eq!(d.flags, vec!["\\Seen".to_string()]);
+                assert_eq!(d.uid, Some(9));
+            }
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+        // An empty literal is an empty string.
+        let mut lex = ImapReplyLexer::new();
+        let mut data: &[u8] = b"* 2 FETCH (ENVELOPE (\"date\" {0}\r\n NIL) UID 3)\r\n";
+        let ev = lex.feed(&mut data).unwrap();
+        match &ev[0] {
+            ImapEvent::Fetch(d) => assert_eq!(d.envelope.as_deref(), Some("(\"date\" \"\" NIL)")),
+            other => panic!("expected Fetch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_capture_is_bounded() {
+        let mut lex = ImapReplyLexer::new();
+        let huge = "x".repeat(MAX_CAPTURED_STRUCTURE + 1);
+        let line = format!("* 1 FETCH (BODYSTRUCTURE (\"{huge}\" NIL))\r\n");
+        let mut data: &[u8] = line.as_bytes();
+        assert!(lex.feed(&mut data).is_err());
     }
 
     #[test]

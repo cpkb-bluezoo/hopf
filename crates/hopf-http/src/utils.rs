@@ -134,6 +134,7 @@ pub(crate) fn strip_connection_specific_request_headers(headers: &mut Headers) -
     wants_close
 }
 
+#[cfg(feature = "h3")]
 /// RFC 9114 §4.1: trailer field sections MUST NOT contain pseudo-headers.
 pub fn field_section_contains_pseudo_headers(pairs: &[(String, String)]) -> bool {
     pairs.iter().any(|(name, _)| name.starts_with(':'))
@@ -184,6 +185,7 @@ pub fn parse_content_length(value: &str) -> Option<u64> {
     v.parse().ok()
 }
 
+#[cfg(feature = "h3")]
 /// RFC 9110 §6.3: a single consistent `Content-Length` from a field section.
 /// `None` when absent; `Err(())` when invalid or conflicting.
 pub fn parse_content_length_from_pairs(pairs: &[(String, String)]) -> Result<Option<u64>, ()> {
@@ -203,12 +205,14 @@ pub fn parse_content_length_from_pairs(pairs: &[(String, String)]) -> Result<Opt
     Ok(seen)
 }
 
+#[cfg(feature = "h3")]
 /// RFC 9110 §15.2 / §6.4: interim (1xx), 204, and 304 responses MUST NOT
 /// contain content.
 pub fn http_response_status_must_not_have_content(status: u16) -> bool {
     (100..200).contains(&status) || status == 204 || status == 304
 }
 
+#[cfg(feature = "h3")]
 /// RFC 9110 §9.3.2: a HEAD request MUST NOT include a content body.
 pub fn http_request_method_must_not_have_content(method: &str) -> bool {
     method.eq_ignore_ascii_case("HEAD")

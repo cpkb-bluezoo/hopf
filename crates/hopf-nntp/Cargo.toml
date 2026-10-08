@@ -1,0 +1,31 @@
+# Copyright (C) 2026 Chris Burdess <dog@gnu.org>
+
+[package]
+name = "hopf-nntp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "NNTP / NNTPS async client for Hopf (RFC 3977, 4642, 4643)"
+readme = "README.md"
+keywords = ["nntp", "usenet", "news", "networking"]
+categories = ["network-programming"]
+
+[features]
+default = []
+# Opt-in loopback TCP smoke tests against the crate's scripted test server.
+# Run manually with `cargo test -p hopf-nntp --features integration`.
+integration = []
+
+[dependencies]
+hopf-core = { workspace = true }
+hopf-auth = { workspace = true }
+hopf-dns = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = { workspace = true }

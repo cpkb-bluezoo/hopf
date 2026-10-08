@@ -43,6 +43,7 @@ pub mod error;
 pub mod facade;
 pub mod handlers;
 pub mod pipeline;
+mod script;
 pub mod reply;
 pub mod state;
 pub mod timeout;
@@ -53,10 +54,11 @@ pub use error::{Pop3Error, Pop3Result};
 pub use facade::Pop3Client;
 pub use handlers::{Pop3ClientDriver, Pop3ClientHandlerFactory};
 pub use pipeline::{MessageReceiveCallback, Pop3Fetch};
+pub use script::{Pop3Op, Pop3OpResult, Pop3Script, Pop3ScriptOutcome};
 pub use reply::{ContentId, Pop3Event, Pop3ReplyLexer, Pop3ReplyShape, MAX_REPLY_LINE};
 pub use state::{
     Pop3Capabilities, Pop3ClientAuthExchange, Pop3ClientAuthorization, Pop3ClientPassword,
-    Pop3ClientPostStls, Pop3ClientTransaction,
+    Pop3ClientPostStls, Pop3ClientTransaction, Pop3ClientWakeState,
 };
 pub use timeout::Pop3ClientTimeouts;
 pub use unstuff::Pop3DotUnstuffer;

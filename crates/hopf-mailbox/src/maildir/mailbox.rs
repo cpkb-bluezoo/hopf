@@ -1165,10 +1165,18 @@ mod tests {
         let st = mb.status().unwrap();
         assert_eq!(st.messages, 2);
         assert_eq!(st.unseen, 1);
+        assert_eq!(st.first_unseen, 1);
         assert_eq!(st.uid_next, mb.uid_next());
         assert_eq!(st.uid_validity, mb.uid_validity());
         assert_eq!(st.recent, 0);
         assert_eq!(st.highest_modseq, 2);
+
+        // Two unseen: the count grows, the first stays.
+        append_whole(mb.as_mut(), &sample("u3"), &BTreeSet::new(), None).unwrap();
+        let st = mb.status().unwrap();
+        assert_eq!(st.messages, 3);
+        assert_eq!(st.unseen, 2, "a count, not the first unseen sequence number");
+        assert_eq!(st.first_unseen, 1);
         mb.close(false).unwrap();
     }
 

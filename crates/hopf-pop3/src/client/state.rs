@@ -109,3 +109,37 @@ pub trait Pop3ClientTransaction {
     /// Send `QUIT`.
     fn quit(&mut self);
 }
+
+/// What a driver may do when it is woken from outside the reactor — the
+/// staged state object for the session's current state, or [`Busy`] when
+/// a command is already in flight.
+///
+/// Handed to [`Pop3ClientDriver::on_wake`](super::handlers::Pop3ClientDriver::on_wake).
+/// This is how an interactive client (one whose commands originate on a UI
+/// or worker thread, not inside a reply callback) drives a live session:
+/// queue the work somewhere the driver can see, call
+/// [`hopf_core::ConnHandle::poke`] on the handle stashed from an earlier
+/// callback, and drain the queue in `on_wake` with the state in hand.
+///
+/// [`Busy`]: Pop3ClientWakeState::Busy
+pub enum Pop3ClientWakeState<'a> {
+    /// Greeting seen, not yet authenticated (also after a failed login or
+    /// a completed STLS).
+    Authorization(&'a mut dyn Pop3ClientAuthorization),
+    /// Authenticated; no command in flight.
+    Transaction(&'a mut dyn Pop3ClientTransaction),
+    /// A command is in flight (POP3 has no pipelining here), the greeting
+    /// has not arrived, or TLS is being set up. Keep the work queued.
+    Busy,
+}
+
+impl Pop3ClientWakeState<'_> {
+    /// Short name of the variant, for logs and tests.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Authorization(_) => "authorization",
+            Self::Transaction(_) => "transaction",
+            Self::Busy => "busy",
+        }
+    }
+}

@@ -557,3 +557,66 @@ fn server_auth_pipelined_with_stat_waits_for_async_step() {
     );
     drop(rt);
 }
+
+/// `Pop3Script`: one session, several transaction commands, results in
+/// order; a wrong password; a probe with nothing to run.
+#[test]
+fn client_script_runs_ops_in_order() {
+    use crate::client::{Pop3Op, Pop3OpResult, Pop3Script, Pop3ScriptOutcome};
+    let dir = tempfile::tempdir().unwrap();
+    let factory = Arc::new(MaildirFactory::new(dir.path()));
+    {
+        let mut store = factory.create_store();
+        store.open("alice").unwrap();
+        let mut mb = store.open_mailbox("INBOX", false).unwrap();
+        append_whole(mb.as_mut(), b"From: a@b\r\nSubject: one\r\n\r\nfirst body\r\n");
+        append_whole(mb.as_mut(), b"From: c@d\r\nSubject: two\r\n\r\nsecond body\r\n.leading dot\r\n");
+        mb.close(false).unwrap();
+        store.close().unwrap();
+    }
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
+    let config = Pop3Config::new("127.0.0.1:0".parse().unwrap(), "localhost", store, factory);
+    let svc = Pop3Service::new(config, Arc::clone(&rt));
+    let addr = svc.start().unwrap();
+
+    let run = |script: Pop3Script| {
+        let seen: Arc<Mutex<Option<Pop3ScriptOutcome>>> = Arc::new(Mutex::new(None));
+        let s2 = Arc::clone(&seen);
+        let script = script.on_result(Box::new(move |o| *s2.lock().unwrap() = Some(o)));
+        Pop3Client::from_addr(addr)
+            .timeouts(Pop3ClientTimeouts { stage: Duration::from_secs(3), ..Default::default() })
+            .connect(&rt, Arc::new(script))
+            .unwrap();
+        assert!(wait_for(|| seen.lock().unwrap().is_some(), 3000), "script timed out");
+        let out = seen.lock().unwrap().take().unwrap();
+        out
+    };
+
+    let out = run(Pop3Script::new().credentials("alice", "secret").ops(vec![
+        Pop3Op::Stat,
+        Pop3Op::Uidl,
+        Pop3Op::List,
+        Pop3Op::Top { message: 2, lines: 0 },
+        Pop3Op::Retr(2),
+    ]));
+    let Pop3ScriptOutcome::Done(results) = out else { panic!("{out:?}") };
+    assert_eq!(results.len(), 5);
+    assert!(matches!(results[0], Pop3OpResult::Stat { count: 2, .. }), "{:?}", results[0]);
+    let Pop3OpResult::Uidl(uidl) = &results[1] else { panic!("{:?}", results[1]) };
+    assert_eq!(uidl.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![1, 2]);
+    assert!(uidl.iter().all(|(_, u)| !u.is_empty()));
+    let Pop3OpResult::List(list) = &results[2] else { panic!("{:?}", results[2]) };
+    assert_eq!(list.len(), 2);
+    let Pop3OpResult::Message { message: 2, is_top: true, body } = &results[3] else { panic!("{:?}", results[3]) };
+    assert!(body.starts_with(b"From: c@d"), "{:?}", String::from_utf8_lossy(body));
+    assert!(!body.windows(11).any(|w| w == b"second body"), "TOP 0 must stop at the headers");
+    let Pop3OpResult::Message { message: 2, is_top: false, body } = &results[4] else { panic!("{:?}", results[4]) };
+    assert!(body.windows(11).any(|w| w == b"second body"));
+    assert!(body.windows(12).any(|w| w == b".leading dot"), "dot-unstuffed: {:?}", String::from_utf8_lossy(body));
+
+    assert!(matches!(run(Pop3Script::new().credentials("alice", "nope").ops(vec![Pop3Op::Stat])), Pop3ScriptOutcome::AuthFailed(_)));
+    assert_eq!(run(Pop3Script::new()), Pop3ScriptOutcome::Done(Vec::new()), "a bare probe");
+    assert!(matches!(run(Pop3Script::new().ops(vec![Pop3Op::Stat])), Pop3ScriptOutcome::Failed { .. }), "ops need credentials");
+    drop(rt);
+}

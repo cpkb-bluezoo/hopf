@@ -34,6 +34,8 @@ pub struct ImapClient {
     implicit_tls: bool,
     resolver: Option<Arc<DnsResolver>>,
     max_pipeline: usize,
+    max_net_in: Option<usize>,
+    max_net_out: Option<usize>,
 }
 
 impl ImapClient {
@@ -50,6 +52,10 @@ impl ImapClient {
             implicit_tls: false,
             resolver: None,
             max_pipeline: DEFAULT_MAX_PIPELINE,
+
+            max_net_in: None,
+
+            max_net_out: None,
         }
     }
 
@@ -66,6 +72,10 @@ impl ImapClient {
             implicit_tls: false,
             resolver: None,
             max_pipeline: DEFAULT_MAX_PIPELINE,
+
+            max_net_in: None,
+
+            max_net_out: None,
         }
     }
 
@@ -83,6 +93,10 @@ impl ImapClient {
             implicit_tls: false,
             resolver: None,
             max_pipeline: DEFAULT_MAX_PIPELINE,
+
+            max_net_in: None,
+
+            max_net_out: None,
         }
     }
 
@@ -95,6 +109,22 @@ impl ImapClient {
     /// Cap outstanding tagged commands (default [`DEFAULT_MAX_PIPELINE`]).
     pub fn max_pipeline(mut self, n: usize) -> Self {
         self.max_pipeline = n.max(1);
+        self
+    }
+
+    /// Cap the inbound buffer (bytes the server may have in flight before
+    /// the connection is failed). Default: hopf-core's 1 MiB.
+    pub fn max_net_in(mut self, bytes: usize) -> Self {
+        self.max_net_in = Some(bytes);
+        self
+    }
+
+    /// Cap the outbound buffer. hopf-core's default is 4 MiB and a send
+    /// that would overflow it closes the connection — so a client that
+    /// `APPEND`s whole messages (`ImapClientAppend::send_literal` writes
+    /// the literal in one call) must raise this above its largest message.
+    pub fn max_net_out(mut self, bytes: usize) -> Self {
+        self.max_net_out = Some(bytes);
         self
     }
 
@@ -156,6 +186,12 @@ impl ImapClient {
             ))
         })
         .connect_timeout(Some(self.timeouts.connect));
+        if let Some(n) = self.max_net_in {
+            cfg = cfg.max_net_in(n);
+        }
+        if let Some(n) = self.max_net_out {
+            cfg = cfg.max_net_out(n);
+        }
 
         if implicit {
             if let (Some(c), Some(n)) = (tls_for_dial, sn_for_dial) {
@@ -242,6 +278,8 @@ impl ImapClient {
         let max_pipeline = self.max_pipeline;
         let rt2 = Arc::clone(rt);
         let host_for_err = host.to_owned();
+        let max_net_in = self.max_net_in;
+        let max_net_out = self.max_net_out;
 
         resolver.resolve(
             host,
@@ -250,12 +288,15 @@ impl ImapClient {
                 let addrs = match result {
                     Ok(a) => a,
                     Err(e) => {
-                        eprintln!("hopf-imap: DNS error for {host_for_err}: {e}");
+                        factory.connect_failed(&host_for_err, &e);
                         return;
                     }
                 };
                 let Some(addr) = addrs.into_iter().next() else {
-                    eprintln!("hopf-imap: DNS returned no addresses for {host_for_err}");
+                    factory.connect_failed(
+                        &host_for_err,
+                        &io::Error::new(io::ErrorKind::NotFound, "DNS returned no addresses"),
+                    );
                     return;
                 };
                 let tls_for_dial = tls_connector.clone();
@@ -274,13 +315,19 @@ impl ImapClient {
                     ))
                 })
                 .connect_timeout(Some(timeouts.connect));
+                if let Some(n) = max_net_in {
+                    cfg = cfg.max_net_in(n);
+                }
+                if let Some(n) = max_net_out {
+                    cfg = cfg.max_net_out(n);
+                }
                 if implicit_tls {
                     if let (Some(c), Some(n)) = (tls_for_dial, sn_for_dial) {
                         cfg = cfg.with_tls(c, n);
                     }
                 }
                 if let Err(e) = rt2.connect(cfg) {
-                    eprintln!("hopf-imap: connect error: {e}");
+                    factory.connect_failed(&host_for_err, &e);
                 }
             }),
         );

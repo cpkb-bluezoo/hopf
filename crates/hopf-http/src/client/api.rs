@@ -86,6 +86,11 @@ pub trait HttpResponseHandler: Send {
 }
 
 /// Live client connection — request factory (Gumdrop `HTTPClient` methods).
+///
+/// Cloneable: a clone made in [`HttpConnectionHandler::on_connected`] keeps
+/// the connection usable from elsewhere (another thread, a later task).
+/// Requests made from any clone share the one connection.
+#[derive(Clone)]
 pub struct HttpClientSessionHandle {
     pub(crate) ops: Arc<Mutex<dyn SessionRequestOps + Send>>,
     version: HttpVersion,

@@ -1734,3 +1734,84 @@ mod dmarc_pipeline {
         assert!(!ok, "DMARC p=reject should reject unaligned, unsigned mail");
     }
 }
+
+/// `SmtpVerify` with the right password: EHLO → AUTH → QUIT, reporting
+/// the server's capabilities, nothing sent.
+#[test]
+fn client_verify_credentials_against_hopf_server() {
+    use crate::client::{SmtpVerify, SmtpVerifyOutcome};
+    let store = Arc::new(PasswordStore::new().with_user("alice", "secret"));
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let config = SmtpConfig::new(listen, "test.example.com").with_store(store);
+    let handler = AcceptAllSmtpHandler::new("test.example.com").with_capture(Arc::clone(&capture));
+    let factory = Arc::new(AcceptAllSmtpHandlerFactory::new(handler));
+    let service = SmtpService::with_handler_factory(config, factory);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let bound = service.start(Arc::clone(&rt)).unwrap();
+
+    let run = |verify: SmtpVerify| {
+        let seen: Arc<Mutex<Option<SmtpVerifyOutcome>>> = Arc::new(Mutex::new(None));
+        let s2 = Arc::clone(&seen);
+        let verify = verify.on_result(Box::new(move |o| *s2.lock().unwrap() = Some(o)));
+        SmtpClient::from_addr(bound)
+            .timeouts(SmtpClientTimeouts { stage: Duration::from_secs(3), ..Default::default() })
+            .connect(&rt, Arc::new(verify))
+            .unwrap();
+        assert!(wait_for(|| seen.lock().unwrap().is_some(), 3000), "verify timed out");
+        let out = seen.lock().unwrap().take().unwrap();
+        out
+    };
+
+    // Good credentials.
+    match run(SmtpVerify::new("").credentials_password("alice", "secret")) {
+        SmtpVerifyOutcome::Verified(caps) => {
+            assert!(caps.auth_methods.iter().any(|m| m == "SCRAM-SHA-256"), "{:?}", caps.auth_methods);
+        }
+        other => panic!("expected Verified, got {other:?}"),
+    }
+    // Wrong password.
+    assert_eq!(
+        run(SmtpVerify::new("").credentials_password("alice", "wrong")),
+        SmtpVerifyOutcome::AuthFailed { code: 535 }
+    );
+    // No credentials: a capability probe.
+    match run(SmtpVerify::new("probe.example")) {
+        SmtpVerifyOutcome::Verified(caps) => assert!(!caps.auth_methods.is_empty()),
+        other => panic!("expected Verified, got {other:?}"),
+    }
+    // Bearer credentials against a server that offers no bearer mechanism:
+    // an explicit failure, not an unauthenticated session.
+    match run(SmtpVerify::new("").credentials_bearer("alice", "tok")) {
+        SmtpVerifyOutcome::Failed(m) => assert!(m.contains("XOAUTH2"), "{m}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(capture.lock().unwrap().is_empty(), "verify must never send a message");
+}
+
+/// `SmtpSend` given credentials the server cannot take must fail rather
+/// than deliver unauthenticated.
+#[test]
+fn client_send_with_unusable_credentials_fails_instead_of_relaying() {
+    let capture = Arc::new(Mutex::new(Vec::new()));
+    let (rt, addr) = start_accept_all(Arc::clone(&capture)); // no credential store: no AUTH offered
+    let seen: Arc<Mutex<Option<SmtpSendOutcome>>> = Arc::new(Mutex::new(None));
+    let s2 = Arc::clone(&seen);
+    let send = SmtpSend::new("client.example")
+        .mail_from("a@b.com")
+        .rcpt_to("c@d.com")
+        .message_with(once(b"Subject: x\r\n\r\nshould not be sent\r\n".to_vec()))
+        .auth_plain("alice", "secret")
+        .on_result(Box::new(move |o| *s2.lock().unwrap() = Some(o)));
+    SmtpClient::from_addr(addr)
+        .timeouts(SmtpClientTimeouts { stage: Duration::from_secs(3), ..Default::default() })
+        .connect(&rt, Arc::new(send))
+        .unwrap();
+    assert!(wait_for(|| seen.lock().unwrap().is_some(), 3000), "send timed out");
+    match seen.lock().unwrap().take().unwrap() {
+        SmtpSendOutcome::Failed(m) => assert!(m.contains("AUTH"), "{m}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(capture.lock().unwrap().is_empty(), "nothing may have been relayed");
+}

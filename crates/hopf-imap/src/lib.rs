@@ -26,12 +26,13 @@ pub use client::{
     parse_thread_response, pipeline_status_and_list, ImapAppendUid, ImapCapabilities, ImapClient,
     ImapClientAppend, ImapClientAuthExchange, ImapClientAuthenticated, ImapClientDriver,
     ImapClientEndpoint, ImapClientHandlerFactory, ImapClientIdle, ImapClientNotAuthenticated,
-    ImapClientPostStarttls, ImapClientSelected, ImapClientTimeouts, ImapCopyUid,
-    ImapEnabledFeatures, ImapError, ImapEvent, ImapFetch, ImapFetchData, ImapIdle, ImapListEntry,
+    ImapClientPostStarttls, ImapClientSelected, ImapClientTimeouts, ImapClientWakeState, ImapCopyUid,
+    ImapEnabledFeatures, ImapError, ImapEvent, ImapFetch, ImapFetchData, ImapIdle, ImapListEntry, ImapListOptions,
     ImapMailboxInfo, ImapMetadataData, ImapMetadataEntry, ImapNamespace, ImapNamespaceData,
     ImapQuotaData, ImapQuotaResource, ImapQuotaRootData, ImapReplyLexer, ImapResult, ImapStatus,
     ImapStatusData, ImapTagGenerator,
     ImapThreadNode, MailboxEventListener, MessageReceiveCallback, NopMailboxEventListener,
+    ImapAddress, ImapBodyPart, ImapBodyStructure, ImapDisposition, ImapEnvelope, ImapMultipart, ImapSectionPart,
     PendingCommand, PendingKind, PendingMap, Tag, UntaggedClass, DEFAULT_MAX_PIPELINE, MAX_TOKEN,
 };
 pub use enable::{parse_enable_args, EnabledExtensions};

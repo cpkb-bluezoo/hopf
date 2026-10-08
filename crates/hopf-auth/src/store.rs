@@ -295,6 +295,7 @@ impl CredentialStore for PasswordStore {
             SaslMechanism::Login,
             SaslMechanism::ScramSha256,
             SaslMechanism::OauthBearer,
+            SaslMechanism::XOauth2,
             SaslMechanism::External,
         ];
         if !self.digest_realm.is_empty() {

@@ -1990,3 +1990,50 @@ fn server_notify_selected_message_new_raw() {
 
     drop(rt);
 }
+
+/// A dial that never produces a connection (here: a name that cannot
+/// resolve) must reach the factory's `connect_failed`, not just stderr —
+/// otherwise a caller waits for a greeting that never comes.
+#[test]
+fn client_dns_failure_reaches_connect_failed() {
+    struct Reporting(Arc<Mutex<Option<String>>>);
+    impl ImapClientHandlerFactory for Reporting {
+        fn create(&self) -> Box<dyn ImapClientDriver> {
+            unreachable!("no connection should ever be made")
+        }
+        fn connect_failed(&self, host: &str, error: &io::Error) {
+            *self.0.lock().unwrap() = Some(format!("{host}: {error}"));
+        }
+    }
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let seen = Arc::new(Mutex::new(None));
+    crate::client::ImapClient::new("nonexistent.invalid", 143)
+        .timeouts(ImapClientTimeouts { dns: Duration::from_secs(5), ..Default::default() })
+        .connect(&rt, Arc::new(Reporting(Arc::clone(&seen))))
+        .unwrap();
+    assert!(wait_for(|| seen.lock().unwrap().is_some(), 8000), "connect_failed never called");
+    let msg = seen.lock().unwrap().clone().unwrap();
+    assert!(msg.starts_with("nonexistent.invalid: "), "{msg}");
+}
+
+/// RFC 9051 §6.3.11: STATUS `UNSEEN` is the number of messages without
+/// `\Seen` — not the first unseen sequence number, which is SELECT's
+/// `[UNSEEN n]` response code. Three unseen messages must report 3.
+#[test]
+fn server_status_unseen_is_a_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rt, addr) = start_imap_server_with_sort_thread_fixture(&dir);
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = vec![0u8; 8192];
+    read_until(&mut stream, &mut buf, |s| s.contains("* OK"));
+    write_cmd(&mut stream, b"a1 LOGIN alice secret\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("a1 OK"));
+    write_cmd(&mut stream, b"a2 STATUS INBOX (MESSAGES UNSEEN)\r\n");
+    let r = read_until(&mut stream, &mut buf, |s| s.contains("a2 OK"));
+    assert!(r.contains("MESSAGES 3"), "{r}");
+    assert!(r.contains("UNSEEN 3"), "three unseen messages: {r}");
+    write_cmd(&mut stream, b"a3 LOGOUT\r\n");
+    read_until(&mut stream, &mut buf, |s| s.contains("a3 "));
+    drop(rt);
+}

@@ -58,8 +58,13 @@ pub struct MailboxStatus {
     pub messages: u32,
     /// RECENT — count of messages with `\Recent`.
     pub recent: u32,
-    /// UNSEEN — first unseen sequence number, or 0.
+    /// UNSEEN — number of messages without `\Seen` (RFC 9051 §6.3.11's
+    /// STATUS item). Not the first unseen sequence number: that is
+    /// SELECT's `[UNSEEN n]` response code, in [`Self::first_unseen`].
     pub unseen: u32,
+    /// Sequence number of the first message without `\Seen`, or 0 when
+    /// every message is seen — for SELECT's `[UNSEEN n]` response code.
+    pub first_unseen: u32,
     /// UIDNEXT.
     pub uid_next: u64,
     /// UIDVALIDITY.
@@ -273,19 +278,24 @@ pub trait Mailbox: Send {
         let messages = self.message_count()?;
         let mut recent = 0u32;
         let mut unseen = 0u32;
+        let mut first_unseen = 0u32;
         for i in 1..=messages {
             let flags = self.flags(i)?;
             if flags.contains(&Flag::Recent) {
                 recent = recent.saturating_add(1);
             }
-            if unseen == 0 && !flags.contains(&Flag::Seen) {
-                unseen = i;
+            if !flags.contains(&Flag::Seen) {
+                unseen = unseen.saturating_add(1);
+                if first_unseen == 0 {
+                    first_unseen = i;
+                }
             }
         }
         Ok(MailboxStatus {
             messages,
             recent,
             unseen,
+            first_unseen,
             uid_next: self.uid_next(),
             uid_validity: self.uid_validity(),
             highest_modseq: self.highest_modseq(),

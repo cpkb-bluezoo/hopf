@@ -393,6 +393,63 @@ pub fn acceptor_from_pem_with_client_auth(
     }))
 }
 
+/// Parse a PEM certificate chain and PKCS#8 private key already in memory
+/// into [`ServerCredentials`] — for identities generated at run time (an
+/// ephemeral loopback CA, a test fixture) that never touch the file system.
+pub fn server_credentials_from_pem_bytes(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<ServerCredentials> {
+    let certs = parse_certs(cert_pem);
+    if certs.is_empty() {
+        return Err(io::Error::new(ErrorKind::InvalidData, "no certificates in PEM"));
+    }
+    let mut keys = parse_pkcs8_keys(key_pem);
+    let Some(key) = keys.pop() else {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "no PKCS#8 private key found in PEM (only `BEGIN PRIVATE KEY` blocks are supported)",
+        ));
+    };
+    Ok(ServerCredentials {
+        cert_chain: certs.into_iter().map(Bytes::from).collect(),
+        signing_key_pkcs8: Bytes::from(key),
+    })
+}
+
+/// Build a [`SharedTlsAcceptor`] from credentials already in memory — the
+/// counterpart of [`acceptor_from_pem`] for callers holding a
+/// [`ServerCredentials`] (see [`server_credentials_from_pem_bytes`]).
+pub fn acceptor_from_credentials(creds: ServerCredentials, alpn: &[&[u8]]) -> SharedTlsAcceptor {
+    Arc::new(PemAcceptor {
+        creds,
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        client_auth: ClientAuthPolicy::None,
+        client_trust_store: None,
+        version_policy: TcpTlsVersionPolicy::Negotiate,
+    })
+}
+
+/// Mutual-TLS counterpart of [`acceptor_from_credentials`]: requests a
+/// client certificate per `policy` and verifies it against `client_cas`
+/// (DER-encoded CA certificates), as [`acceptor_from_pem_with_client_auth`]
+/// does from files.
+pub fn acceptor_from_credentials_with_client_auth(
+    creds: ServerCredentials,
+    alpn: &[&[u8]],
+    policy: ClientAuthPolicy,
+    client_cas: &[Bytes],
+) -> SharedTlsAcceptor {
+    let mut trust = TrustStore::new();
+    for ca in client_cas {
+        trust.add_anchor(ca.clone());
+    }
+    Arc::new(PemAcceptor {
+        creds,
+        alpn: alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
+        client_auth: policy,
+        client_trust_store: Some(trust),
+        version_policy: TcpTlsVersionPolicy::Negotiate,
+    })
+}
+
 struct TrustedConnector {
     trust_store: Option<TrustStore>,
     verify_override: Option<VerifyOverride>,
@@ -416,6 +473,7 @@ impl TlsConnector for TrustedConnector {
                     role: tls12::engine::Role::Client,
                     server_name: Some(server_name.to_string()),
                     trust_store: self.trust_store.clone(),
+                    verify_override: self.verify_override.clone(),
                     alpn: self.alpn.clone(),
                     client_credentials: self.client_credentials.clone(),
                     ..Default::default()
@@ -433,6 +491,7 @@ impl TlsConnector for TrustedConnector {
                     role: tls12::engine::Role::Client,
                     server_name: Some(server_name.to_string()),
                     trust_store: self.trust_store.clone(),
+                    verify_override: self.verify_override.clone(),
                     alpn: self.alpn.clone(),
                     client_credentials: self.client_credentials.clone(),
                     ..Default::default()
@@ -692,6 +751,8 @@ mod tests {
         received: Vec<u8>,
         errors: Vec<String>,
         alpn: Option<Vec<u8>>,
+        /// Verification gates the engine opened and nobody has answered yet.
+        pending_verify: Vec<u64>,
     }
 
     impl crate::tls::TlsRecordSink for Wire {
@@ -704,7 +765,9 @@ mod tests {
         fn handshake_complete(&mut self, info: crate::security::SecurityInfo) {
             self.alpn = info.alpn().map(<[u8]>::to_vec);
         }
-        fn verification_requested(&mut self, _req: crate::tls::VerifyRequest) {}
+        fn verification_requested(&mut self, req: crate::tls::VerifyRequest) {
+            self.pending_verify.push(req.id);
+        }
         fn protocol_error(&mut self, err: crate::tls::TlsProtocolError) {
             self.errors.push(err.message);
         }
@@ -800,6 +863,33 @@ mod tests {
                 ws.errors
             );
         }
+    }
+
+    /// The default (`Negotiate`) connector must be able to land on TLS 1.2
+    /// when that is all the server speaks. Its ClientHello is the 1.3 probe
+    /// with `supported_versions` widened, so it must also carry everything a
+    /// conformant TLS 1.2 server demands: the 1.2 cipher suites, Extended
+    /// Master Secret, the secure-renegotiation signal and ec_point_formats.
+    #[test]
+    fn negotiate_connector_falls_back_to_a_tls12_only_acceptor() {
+        use crate::tls::connector_from_pem;
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let acceptor = acceptor_with_alpn(acceptor_from_pem_tls12(&cert_path, &key_path).unwrap(), &[b"h2", b"http/1.1"]);
+        let connector = connector_from_pem(&cert_path, &[b"h2", b"http/1.1"]).unwrap();
+        let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
+        let (mut wc, mut ws) = handshake(&mut client, &mut server);
+        assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
+        assert_eq!(wc.alpn.as_deref(), Some(&b"h2"[..]), "ALPN must survive the fallback");
+        assert_eq!(ws.alpn.as_deref(), Some(&b"h2"[..]));
+        // And the data path works under the keys the 1.2 engine derived
+        // from the probe's transcript.
+        client.send_application_data(b"over 1.2", &mut wc);
+        drain(&mut wc, &mut server, &mut ws);
+        assert_eq!(ws.received, b"over 1.2");
+        server.send_application_data(b"and back", &mut ws);
+        drain(&mut ws, &mut client, &mut wc);
+        assert_eq!(wc.received, b"and back");
     }
 
     /// The wrappers give the `*_tls12` builders (which take no protocol list) an
@@ -959,5 +1049,85 @@ mod tests {
         // directly); this just proves the connector wiring compiles and runs.
         let connector = super::connector_with_verify_override(Arc::new(|_chain, _name| true), &[]);
         let _engine = connector.connect("dane.example").unwrap();
+    }
+
+    /// Drive a handshake the way `TcpConnection::process_tls_inbound` does:
+    /// every verification gate the client opens is answered `ok: true`,
+    /// because the connection layer assumes the trust decision was already
+    /// made inline by `trust_store` or `verify_override`. A connector whose
+    /// override is dropped on some code path therefore ends up trusting
+    /// anything on that path — which is exactly what this harness exposes.
+    fn handshake_as_the_connection_layer_would(client: &mut TlsVariant, server: &mut TlsVariant) -> (Wire, Wire) {
+        let (mut wc, mut ws) = (Wire::default(), Wire::default());
+        client.start(&mut wc);
+        server.start(&mut ws);
+        for _ in 0..24 {
+            if client.is_complete() && server.is_complete() {
+                break;
+            }
+            drain(&mut wc, server, &mut ws);
+            drain(&mut ws, client, &mut wc);
+            for id in std::mem::take(&mut wc.pending_verify) {
+                client.feed_verification_result(crate::tls::VerifyResult { id, ok: true }, &mut wc);
+            }
+            for id in std::mem::take(&mut ws.pending_verify) {
+                server.feed_verification_result(crate::tls::VerifyResult { id, ok: true }, &mut ws);
+            }
+        }
+        (wc, ws)
+    }
+
+    /// A connector with only a `verify_override` (no trust store) pinned to
+    /// TLS 1.2 — the same `TrustedConnector` that `connector_with_verify_override`
+    /// builds, minus the Negotiate policy, so the handshake lands on the TLS
+    /// 1.2 engine directly.
+    fn verify_override_connector_tls12(verify: VerifyFn) -> SharedTlsConnector {
+        trusted_connector(None, Some(VerifyOverride(verify)), Vec::new(), None, TcpTlsVersionPolicy::Tls12Only)
+    }
+
+    /// A `verify_override` that says no must be honoured whichever TLS
+    /// version the server picks. `TrustedConnector` used to build its TLS
+    /// 1.2 config without the override (on both the `Negotiate` fallback and
+    /// the `Tls12Only` path), so a server that only spoke 1.2 was trusted
+    /// unconditionally.
+    #[test]
+    fn verify_override_rejection_is_honoured_when_the_server_picks_tls12() {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let acceptor = acceptor_from_pem_tls12(&cert_path, &key_path).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let connector = verify_override_connector_tls12(Arc::new(move |_chain, _name| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        }));
+        let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
+        let (wc, ws) = handshake_as_the_connection_layer_would(&mut client, &mut server);
+        assert!(!client.is_complete(), "client trusted a chain its override rejected: {:?}", wc.errors);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the override must be consulted on TLS 1.2");
+        assert!(!server.is_complete(), "server completed against a client that rejected it: {:?}", ws.errors);
+        assert!(
+            wc.errors.iter().any(|e| e.contains("certificate verification failed")),
+            "the client must report the rejection: {:?}",
+            wc.errors
+        );
+    }
+
+    /// The accept side of the same path: an override that says yes completes
+    /// a TLS 1.2 handshake with no trust store at all, just like it does on 1.3.
+    #[test]
+    fn verify_override_acceptance_completes_a_tls12_handshake() {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (_dir, cert_path, key_path) = write_temp_pem(&key_pair);
+        let acceptor = acceptor_from_pem_tls12(&cert_path, &key_path).unwrap();
+        let expected_chain = load_certs(&cert_path).unwrap();
+        let connector = verify_override_connector_tls12(Arc::new(move |chain, name| {
+            chain == expected_chain.as_slice() && name == Some("localhost")
+        }));
+        let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
+        // `handshake` never answers a verification gate, so completing at
+        // all proves the override was resolved inline.
+        let (wc, ws) = handshake(&mut client, &mut server);
+        assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
     }
 }

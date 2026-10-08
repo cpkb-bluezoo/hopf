@@ -1645,4 +1645,85 @@ mod integration_tests {
         rt.shutdown();
         server_thread.join().unwrap();
     }
+
+    /// The default (`Negotiate`) hopf connector against a real `rustls`
+    /// server forced to TLS 1.2 with its default provider — so the server
+    /// picks X25519 from the client's groups, exercising the 1.2 engine's
+    /// X25519 client path as well as the fallback ClientHello itself.
+    #[test]
+    fn hopf_negotiating_client_falls_back_to_tls12_against_rustls_server() {
+        let (_dir, cert_path, _key_path, certified) = write_temp_pem("negotiate-fallback-server");
+
+        let server_certs = vec![certified.cert.der().clone()];
+        let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let server_cfg = rustls::ServerConfig::builder_with_provider(tls12_provider())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .expect("TLS 1.2 is a valid restricted version list")
+            .with_no_client_auth()
+            .with_single_cert(server_certs, server_key)
+            .unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(server_cfg)).unwrap();
+            let mut tls = StreamOwned::new(conn, sock);
+            let mut buf = [0u8; 64];
+            let n = tls.read(&mut buf).unwrap();
+            tls.write_all(&buf[..n]).unwrap();
+            tls.flush().unwrap();
+            assert_eq!(tls.conn.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_2));
+            tls.conn.negotiated_key_exchange_group().expect("a 1.2 ECDHE group was negotiated")
+        });
+
+        // Default policy: Negotiate (prefers 1.3, falls back to 1.2).
+        let connector = hopf_core::connector_from_pem(&cert_path, &[]).unwrap();
+        let echoed = Arc::new(Mutex::new(Vec::new()));
+        let echoed2 = Arc::clone(&echoed);
+        let protocol = Arc::new(Mutex::new(None));
+        let protocol2 = Arc::clone(&protocol);
+        struct EchoProbe {
+            echoed: Arc<Mutex<Vec<u8>>>,
+            protocol: Arc<Mutex<Option<String>>>,
+        }
+        impl ProtocolHandler for EchoProbe {
+            fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn security_established(&mut self, endpoint: &mut dyn Endpoint, info: &SecurityInfo) {
+                *self.protocol.lock().unwrap() = info.protocol().map(str::to_owned);
+                endpoint.send(b"hopf-negotiate-fallback");
+            }
+            fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+                self.echoed.lock().unwrap().extend_from_slice(data);
+                *data = &[];
+            }
+            fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+            fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &std::io::Error) {}
+        }
+
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).unwrap();
+        rt.connect(
+            TcpConnectorConfig::new(addr, move || {
+                Box::new(EchoProbe { echoed: Arc::clone(&echoed2), protocol: Arc::clone(&protocol2) })
+                    as Box<dyn ProtocolHandler>
+            })
+            .with_tls(connector, "localhost"),
+        )
+        .unwrap();
+
+        for _ in 0..150 {
+            if echoed.lock().unwrap().as_slice() == b"hopf-negotiate-fallback" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(echoed.lock().unwrap().as_slice(), b"hopf-negotiate-fallback");
+        assert_eq!(protocol.lock().unwrap().as_deref(), Some("TLSv1.2"));
+
+        rt.shutdown();
+        let group = server_thread.join().unwrap();
+        assert_eq!(group.name(), rustls::NamedGroup::X25519, "rustls prefers X25519 and the hopf client must follow");
+    }
 }

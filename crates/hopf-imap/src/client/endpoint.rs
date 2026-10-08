@@ -23,7 +23,7 @@ use super::state::{
     parse_thread_response, ImapAppendUid, ImapCapabilities, ImapClientAppend,
     ImapClientAuthExchange, ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated,
     ImapClientPostStarttls, ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData,
-    ImapListEntry, ImapMailboxInfo, ImapMetadataData, ImapNamespaceData, ImapQuotaData,
+    ImapListEntry, ImapListOptions, ImapMailboxInfo, ImapMetadataData, ImapNamespaceData, ImapQuotaData,
     ImapQuotaRootData, ImapStatusData,
 };
 
@@ -164,6 +164,30 @@ impl ImapClientEndpoint {
                 None => ep.send(&out),
             }
         }
+    }
+
+    /// Hand the driver the staged state for the current session state so
+    /// it can issue commands that did not originate in a reply (see
+    /// [`ImapClientDriver::on_wake`]), then flush whatever it issued.
+    fn wake_driver(&mut self, ep: &mut dyn Endpoint) {
+        let Some(mut driver) = self.driver.take() else {
+            return;
+        };
+        let state = match self.session {
+            SessionState::NotAuthenticated => super::state::ImapClientWakeState::NotAuthenticated(self),
+            SessionState::Authenticated => super::state::ImapClientWakeState::Authenticated(self),
+            SessionState::Selected => super::state::ImapClientWakeState::Selected(self),
+            SessionState::IdleActive => super::state::ImapClientWakeState::Idle(self),
+            SessionState::Connecting
+            | SessionState::PendingTls
+            | SessionState::IdleSent
+            | SessionState::Logout
+            | SessionState::Error
+            | SessionState::Closed => super::state::ImapClientWakeState::Busy,
+        };
+        driver.on_wake(state, ep);
+        self.driver = Some(driver);
+        self.flush_outbound(ep);
     }
 
     fn ensure_pending_timers(&mut self, ep: &mut dyn Endpoint) {
@@ -630,9 +654,15 @@ impl ImapClientEndpoint {
 
     fn on_fetch(&mut self, data: ImapFetchData, ep: &mut dyn Endpoint) {
         let streamed_literal = std::mem::take(&mut self.fetch_streamed_literal);
-        let flags_only =
-            data.uid.is_none() && data.size.is_none() && data.modseq.is_none() && data.body.is_empty()
-                && !streamed_literal && !data.flags.is_empty();
+        let flags_only = data.uid.is_none()
+            && data.size.is_none()
+            && data.modseq.is_none()
+            && data.body.is_empty()
+            && data.envelope.is_none()
+            && data.bodystructure.is_none()
+            && data.internaldate.is_none()
+            && !streamed_literal
+            && !data.flags.is_empty();
         if flags_only {
             if self.pending.oldest_of_kind(PendingKind::Store).is_some() {
                 self.deliver_fetch_data(data, ep);
@@ -1222,6 +1252,23 @@ impl ImapClientAuthenticated for ImapClientEndpoint {
         let _ = self.issue_no_ep(PendingKind::List, &cmd);
     }
 
+    fn list_extended(&mut self, reference: &str, pattern: &str, options: &ImapListOptions) {
+        let mut cmd = String::from("LIST");
+        if let Some(sel) = options.selection() {
+            cmd.push(' ');
+            cmd.push_str(&sel);
+        }
+        cmd.push(' ');
+        cmd.push_str(&Self::quote_astring(reference));
+        cmd.push(' ');
+        cmd.push_str(&Self::quote_astring(pattern));
+        if let Some(ret) = options.return_clause() {
+            cmd.push(' ');
+            cmd.push_str(&ret);
+        }
+        let _ = self.issue_no_ep(PendingKind::List, &cmd);
+    }
+
     fn lsub(&mut self, reference: &str, pattern: &str) {
         let cmd = format!(
             "LSUB {} {}",
@@ -1542,6 +1589,13 @@ impl ProtocolHandler for ImapClientEndpoint {
             *data = &[];
             return;
         }
+        // First, before any reply is dispatched: a poke from another
+        // thread arrives here with no data, and this is its whole purpose.
+        self.wake_driver(ep);
+        if matches!(self.session, SessionState::Closed | SessionState::Error) {
+            *data = &[];
+            return;
+        }
         if let Some(layer) = self.compress.as_mut() {
             let plaintext = match layer.inflate(data) {
                 Ok(bytes) => bytes,
@@ -1735,7 +1789,9 @@ mod tests {
     use super::*;
     use crate::client::pending::DEFAULT_MAX_PIPELINE;
     use crate::client::state::ImapClientAuthenticated;
+    use crate::client::state::ImapClientWakeState;
     use hopf_core::ConnHandle;
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     struct FakeEp {
@@ -1818,6 +1874,8 @@ mod tests {
     struct RecordingDriver {
         events: Arc<Mutex<Vec<String>>>,
         listener: RecordingListener,
+        /// Commands queued "from another thread", drained in `on_wake`.
+        wake: Option<Arc<Mutex<VecDeque<String>>>>,
     }
 
     struct RecordingListener {
@@ -2196,6 +2254,19 @@ mod tests {
                 .unwrap()
                 .push(format!("append_done:{status:?}:{au}"));
         }
+        fn on_wake(&mut self, state: ImapClientWakeState<'_>, _e: &mut dyn Endpoint) {
+            self.events.lock().unwrap().push(format!("wake:{}", state.name()));
+            let Some(queue) = &self.wake else { return };
+            let Some(cmd) = queue.lock().unwrap().pop_front() else { return };
+            // Issue the queued command if the state allows it, otherwise
+            // put it back for a later wake — what a real bridge does.
+            match (cmd.as_str(), state) {
+                ("noop", ImapClientWakeState::Authenticated(s)) => s.noop(),
+                ("noop", ImapClientWakeState::Selected(s)) => s.noop(),
+                ("done", ImapClientWakeState::Idle(i)) => i.done(),
+                (_, _) => queue.lock().unwrap().push_front(cmd),
+            }
+        }
         fn on_error(&mut self, _e: &mut dyn Endpoint, err: &io::Error) {
             self.events.lock().unwrap().push(format!("err:{err}"));
         }
@@ -2215,8 +2286,38 @@ mod tests {
             Box::new(RecordingDriver {
                 events: Arc::clone(&events),
                 listener: RecordingListener { events },
+                wake: None,
             })
         }
+    }
+
+    struct WakeFactory(Arc<Mutex<Vec<String>>>, Arc<Mutex<VecDeque<String>>>);
+
+    impl ImapClientHandlerFactory for WakeFactory {
+        fn create(&self) -> Box<dyn ImapClientDriver> {
+            let events = Arc::clone(&self.0);
+            Box::new(RecordingDriver {
+                events: Arc::clone(&events),
+                listener: RecordingListener { events },
+                wake: Some(Arc::clone(&self.1)),
+            })
+        }
+    }
+
+    fn make_ep_with_wake(
+        log: &Arc<Mutex<Vec<String>>>,
+        queue: &Arc<Mutex<VecDeque<String>>>,
+    ) -> ImapClientEndpoint {
+        ImapClientEndpoint::new(
+            &WakeFactory(Arc::clone(log), Arc::clone(queue)),
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+            Duration::from_secs(30),
+            None,
+            None,
+            false,
+            DEFAULT_MAX_PIPELINE,
+        )
     }
 
     fn make_ep(log: &Arc<Mutex<Vec<String>>>) -> ImapClientEndpoint {
@@ -2235,6 +2336,65 @@ mod tests {
     fn feed(ep: &mut ImapClientEndpoint, fake: &mut FakeEp, wire: &[u8]) {
         let mut data = wire;
         ProtocolHandler::receive(ep, fake, &mut data);
+    }
+
+    /// A poke from another thread re-enters `receive` with no data. The
+    /// driver must be handed the staged state for the current session
+    /// state, and whatever it issues must go out without waiting for the
+    /// server to say something first.
+    #[test]
+    fn wake_hands_the_driver_the_staged_state_and_flushes() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut ep = make_ep_with_wake(&log, &queue);
+        ep.session = SessionState::Authenticated;
+        let mut fake = FakeEp::new();
+
+        queue.lock().unwrap().push_back("noop".to_string());
+        feed(&mut ep, &mut fake, b""); // what ConnHandle::poke() delivers
+        assert!(fake.sent_str().contains("NOOP"), "sent: {:?}", fake.sent_str());
+        let events = log.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e == "wake:authenticated"), "{events:?}");
+        assert_eq!(ep.pending_len(), 1, "the NOOP is tracked like any other command");
+
+        // Selected hands over the richer state.
+        feed(&mut ep, &mut fake, b"A000 OK NOOP done\r\n");
+        ep.session = SessionState::Selected;
+        queue.lock().unwrap().push_back("noop".to_string());
+        feed(&mut ep, &mut fake, b"");
+        let events = log.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e == "wake:selected"), "{events:?}");
+        assert_eq!(fake.sent_str().matches("NOOP").count(), 2);
+    }
+
+    /// While IDLE is active the wake state is `Idle`: the driver can only
+    /// end the IDLE, after which `on_idle_complete` hands it `Selected`.
+    #[test]
+    fn wake_during_idle_offers_done() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let mut ep = make_ep_with_wake(&log, &queue);
+        ep.session = SessionState::Selected;
+        let mut fake = FakeEp::new();
+        ImapClientAuthenticated::idle(&mut ep);
+        ep.flush_outbound(&mut fake);
+
+        // IDLE sent, not yet acknowledged: nothing may be issued.
+        queue.lock().unwrap().push_back("done".to_string());
+        feed(&mut ep, &mut fake, b"");
+        let events = log.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e == "wake:busy"), "{events:?}");
+        assert!(!fake.sent_str().contains("DONE"));
+        assert_eq!(queue.lock().unwrap().len(), 1, "kept for later");
+
+        feed(&mut ep, &mut fake, b"+ idling\r\n");
+        assert!(ep.is_idle_active());
+        feed(&mut ep, &mut fake, b"");
+        let events = log.lock().unwrap().clone();
+        assert!(events.iter().any(|e| e == "wake:idle"), "{events:?}");
+        assert!(fake.sent_str().contains("DONE"), "sent: {:?}", fake.sent_str());
+        feed(&mut ep, &mut fake, b"A000 OK IDLE terminated\r\n");
+        assert_eq!(ep.session, SessionState::Selected);
     }
 
     #[test]
@@ -2370,6 +2530,56 @@ mod tests {
             events.iter().any(|e| e.starts_with("idle_done")),
             "{events:?}"
         );
+    }
+
+    /// `LIST … RETURN (STATUS …)`: the command is built per RFC 5258 /
+    /// RFC 5819, and the `* STATUS` replies it provokes reach the driver
+    /// even though no STATUS command is pending.
+    #[test]
+    fn list_extended_builds_the_command_and_routes_status_replies() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut ep = make_ep(&log);
+        ep.session = SessionState::Authenticated;
+        let mut fake = FakeEp::new();
+
+        let opts = ImapListOptions {
+            subscribed: true,
+            recursive_match: true,
+            return_children: true,
+            return_special_use: true,
+            return_status: vec!["messages".into(), "UNSEEN".into()],
+            ..Default::default()
+        };
+        ImapClientAuthenticated::list_extended(&mut ep, "", "*", &opts);
+        ep.flush_outbound(&mut fake);
+        assert_eq!(
+            fake.sent_str(),
+            "A000 LIST (SUBSCRIBED RECURSIVEMATCH) \"\" \"*\" RETURN (CHILDREN SPECIAL-USE STATUS (MESSAGES UNSEEN))\r\n"
+        );
+
+        feed(
+            &mut ep,
+            &mut fake,
+            b"* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent\"\r\n* STATUS \"Sent\" (MESSAGES 12 UNSEEN 0)\r\n* LIST (\\HasChildren) \"/\" INBOX (\"CHILDINFO\" (\"SUBSCRIBED\"))\r\n* STATUS INBOX (MESSAGES 7 UNSEEN 3)\r\nA000 OK List completed\r\n",
+        );
+        let events = log.lock().unwrap().clone();
+        assert_eq!(
+            events.iter().filter(|e| !e.starts_with("wake:")).cloned().collect::<Vec<_>>(),
+            vec![
+                "list_entry:Sent",
+                "status_data:Sent:12",
+                "list_entry:INBOX",
+                "status_data:INBOX:7",
+                "list_done:Ok",
+            ],
+            "entries and their STATUS replies, interleaved, under one pending LIST"
+        );
+        assert_eq!(ep.pending_len(), 0);
+
+        // No options at all: a plain LIST.
+        ImapClientAuthenticated::list_extended(&mut ep, "", "%", &ImapListOptions::default());
+        ep.flush_outbound(&mut fake);
+        assert!(fake.sent_str().ends_with("A001 LIST \"\" \"%\"\r\n"), "{:?}", fake.sent_str());
     }
 
     #[test]
