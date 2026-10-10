@@ -191,6 +191,9 @@ pub struct ClientHelloParams {
     /// `renegotiation_info` and `ec_point_formats` extensions. A TLS 1.3
     /// server ignores all of those (RFC 8446 §4.1.2, §4.2).
     pub offer_tls12_fallback: bool,
+    /// Key shares sent in addition to [`Self::key_share`] (which stays first). Browsers
+    /// offer several; a server may prefer any of them (RFC 8446 §4.2.8).
+    pub extra_key_shares: Vec<KeyShareEntry>,
 }
 
 impl Default for ClientHelloParams {
@@ -210,6 +213,7 @@ impl Default for ClientHelloParams {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            extra_key_shares: Vec::new(),
         }
     }
 }
@@ -347,7 +351,7 @@ fn build_client_hello_inner(
     push_extension(
         &mut extensions,
         ext::KEY_SHARE,
-        &encode_key_share_list(std::slice::from_ref(&params.key_share)),
+        &encode_key_share_list(&std::iter::once(params.key_share.clone()).chain(params.extra_key_shares.iter().cloned()).collect::<Vec<_>>()),
     );
     {
         let mut schemes = BytesMut::with_capacity(2 * SUPPORTED_SIGNATURE_SCHEMES.len());
@@ -831,6 +835,7 @@ mod tests {
             early_data: false,
             psk: None,
             cookie: None,
+            extra_key_shares: Vec::new(),
             record_size_limit: None,
             legacy_version: 0x0303,
             compress_certificate: false,
@@ -856,6 +861,7 @@ mod tests {
                 group: NamedGroup::X25519MLKEM768.code(),
                 share: Bytes::copy_from_slice(kp.public_key()),
             },
+            extra_key_shares: Vec::new(),
             supported_groups: vec![NamedGroup::X25519MLKEM768.code(), NamedGroup::X25519.code()],
             alpn: vec![Bytes::from_static(b"h2")],
             server_name: Some("localhost".into()),
@@ -917,6 +923,7 @@ mod tests {
             early_data: false,
             psk: None,
             cookie: None,
+            extra_key_shares: Vec::new(),
             record_size_limit: None,
             legacy_version: 0xfefd,
             compress_certificate: false,
@@ -949,6 +956,7 @@ mod tests {
             early_data: false,
             psk: None,
             cookie: None,
+            extra_key_shares: Vec::new(),
             record_size_limit: None,
             legacy_version: 0x0303,
             compress_certificate: false,
@@ -997,6 +1005,7 @@ mod tests {
             early_data: false,
             psk: None,
             cookie: None,
+            extra_key_shares: Vec::new(),
             record_size_limit: None,
             legacy_version: 0x0303,
             compress_certificate: false,

@@ -206,6 +206,7 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            extra_key_shares: Vec::new(),
         })
         .encode();
         let inner = body[4..].to_vec();

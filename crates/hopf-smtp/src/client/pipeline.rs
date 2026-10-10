@@ -130,6 +130,9 @@ struct SmtpSendState {
     /// Set by an offloaded DATA/BDAT chunk read's storage callback (issue
     /// #184); applied by `SmtpSendDriver::resume_pending_data`.
     pending_data: Option<PendingDataOutcome>,
+    /// The most recent RCPT TO refusal (recipient, code, text), reported if every
+    /// recipient ends up refused so the caller sees the server's reason.
+    last_rcpt_rejection: Option<(String, u16, String)>,
 }
 
 /// The `EHLO` / `HELO` argument: `hostname` as given, or, when it is empty,
@@ -230,6 +233,7 @@ impl SmtpSend {
             on_complete: None,
             on_result: None,
             pending_data: None,
+            last_rcpt_rejection: None,
         })))
     }
 
@@ -691,7 +695,7 @@ impl SmtpClientDriver for SmtpSendDriver {
             if let Some(mech) = Self::choose_mechanism(&caps.auth_methods, bearer) {
                 let mut client = create_client(mech, &user, &pass, "", "smtp", None);
                 if client.has_initial_response() {
-                    if let SaslClientStep::Response(initial) = client.evaluate(None) {
+                    if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {
                         st.sasl_client = Some(client);
                         drop(st);
                         session.auth(mech.name(), Some(&initial));
@@ -923,10 +927,11 @@ impl SmtpClientDriver for SmtpSendDriver {
         &mut self,
         envelope: &mut dyn SmtpClientEnvelope,
         _ep: &mut dyn Endpoint,
-        _recipient: &str,
-        _code: u16,
-        _message: &str,
+        recipient: &str,
+        code: u16,
+        message: &str,
     ) {
+        self.state.lock().unwrap().last_rcpt_rejection = Some((recipient.to_string(), code, message.to_string()));
         if envelope.awaiting_more_replies() {
             return;
         }
@@ -947,8 +952,12 @@ impl SmtpClientDriver for SmtpSendDriver {
         } else if envelope.has_accepted_recipients() {
             envelope.start_data();
         } else {
-            // All rejected.
-            self.fail("every recipient was rejected");
+            // All rejected: report the server's own refusal.
+            let last = self.state.lock().unwrap().last_rcpt_rejection.take();
+            match last {
+                Some((rcpt, code, message)) => self.complete_rejected(code, &format!("{rcpt}: {message}")),
+                None => self.fail("every recipient was rejected"),
+            }
             envelope.rset();
         }
     }

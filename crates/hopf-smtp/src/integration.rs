@@ -1815,3 +1815,135 @@ fn client_send_with_unusable_credentials_fails_instead_of_relaying() {
     std::thread::sleep(Duration::from_millis(50));
     assert!(capture.lock().unwrap().is_empty(), "nothing may have been relayed");
 }
+
+/// A server that offers only `AUTH PLAIN` (as smtp.mail.com does on 465, and
+/// most providers do over TLS), accepting everything except that every RCPT
+/// gets `rcpt_reply`. Returns its address and the AUTH PLAIN argument it saw.
+fn plain_only_server(rcpt_reply: &'static str) -> (SocketAddr, Arc<Mutex<Option<String>>>) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen_auth: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&seen_auth);
+    std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut out = stream.try_clone().unwrap();
+        let mut input = BufReader::new(stream);
+        out.write_all(b"220 fake ESMTP\r\n").unwrap();
+        let mut in_data = false;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if input.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            let l = line.trim_end().to_string();
+            if in_data {
+                if l == "." {
+                    in_data = false;
+                    out.write_all(b"250 queued\r\n").unwrap();
+                }
+                continue;
+            }
+            let up = l.to_uppercase();
+            if up.starts_with("EHLO") {
+                out.write_all(b"250-fake\r\n250 AUTH PLAIN\r\n").unwrap();
+            } else if up.starts_with("AUTH PLAIN ") {
+                *seen.lock().unwrap() = Some(l["AUTH PLAIN ".len()..].to_string());
+                out.write_all(b"235 ok\r\n").unwrap();
+            } else if up.starts_with("RCPT") && up.contains("NOTIFY=") {
+                // No DSN offered in EHLO, so a parameter here is a syntax error.
+                out.write_all(b"501 Syntax error in parameters or arguments\r\n").unwrap();
+            } else if up.starts_with("RCPT") {
+                out.write_all(rcpt_reply.as_bytes()).unwrap();
+                out.write_all(b"\r\n").unwrap();
+            } else if up.starts_with("MAIL") {
+                out.write_all(b"250 ok\r\n").unwrap();
+            } else if up == "DATA" {
+                in_data = true;
+                out.write_all(b"354 go\r\n").unwrap();
+            } else if up == "QUIT" {
+                out.write_all(b"221 bye\r\n").unwrap();
+                break;
+            } else if up == "RSET" {
+                out.write_all(b"250 reset\r\n").unwrap();
+            } else {
+                out.write_all(b"500 what\r\n").unwrap();
+            }
+        }
+    });
+    (addr, seen_auth)
+}
+
+/// Send one message through [`plain_only_server`] and return how the send ended.
+fn send_to_plain_only_server(rcpt_reply: &'static str) -> (String, Option<String>) {
+    let (addr, seen_auth) = plain_only_server(rcpt_reply);
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let outcome: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let o2 = Arc::clone(&outcome);
+    let send = SmtpSend::new("client.example")
+        .mail_from("a@b.com")
+        .rcpt_to("c@d.com")
+        .message_with(once(b"Subject: plain\r\n\r\nhello\r\n".to_vec()))
+        .auth_plain("alice", "secret")
+        .on_result(Box::new(move |r| *o2.lock().unwrap() = Some(format!("{r:?}"))));
+    SmtpClient::from_addr(addr)
+        .timeouts(SmtpClientTimeouts { stage: Duration::from_secs(3), ..Default::default() })
+        .connect(&rt, Arc::new(send))
+        .unwrap();
+    assert!(wait_for(|| outcome.lock().unwrap().is_some(), 4000), "delivery timed out");
+    let out = outcome.lock().unwrap().clone().unwrap();
+    let auth = seen_auth.lock().unwrap().clone();
+    (out, auth)
+}
+
+/// hopf-auth's PLAIN client answers its first evaluation with `Complete`,
+/// since PLAIN is a single message; the auto-pilot must send that as the
+/// initial response rather than report "no usable AUTH mechanism".
+#[test]
+fn client_auth_plain_only_server() {
+    let (outcome, auth) = send_to_plain_only_server("250 ok");
+    assert_eq!(outcome, "Delivered", "PLAIN-only server");
+    assert_eq!(auth.as_deref(), Some("AGFsaWNlAHNlY3JldA=="));
+}
+
+/// When the server refuses every recipient, the caller needs the server's
+/// own reason (relay denied, no such mailbox, ...), not just "rejected".
+#[test]
+fn rejected_recipients_report_the_servers_reply() {
+    let (outcome, _) = send_to_plain_only_server("550 5.7.1 relay access denied");
+    assert!(
+        outcome.contains("550") && outcome.contains("relay access denied"),
+        "the server's reply must reach the caller: {outcome}"
+    );
+}
+
+/// A server that does not list DSN in EHLO answers `RCPT TO:<..> NOTIFY=..`
+/// with 501. The client must leave DSN parameters off unless the server
+/// advertised them (RFC 3461 §4) - a caller asking for failure notices
+/// should still be able to send mail through such a server.
+#[test]
+fn dsn_parameters_are_left_off_when_the_server_does_not_offer_dsn() {
+    let (addr, _) = plain_only_server("250 ok");
+    let rt = Arc::new(Runtime::start(RuntimeConfig::default()).unwrap());
+    let outcome: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let o2 = Arc::clone(&outcome);
+    let notify = crate::DsnRecipientParams {
+        notify: crate::DsnNotify { failure: true, ..Default::default() },
+        ..Default::default()
+    };
+    let send = SmtpSend::new("client.example")
+        .mail_from("a@b.com")
+        .recipients_with(vec![("c@d.com".to_string(), notify)])
+        .message_with(once(b"Subject: dsn\r\n\r\nhello\r\n".to_vec()))
+        .auth_plain("alice", "secret")
+        .on_result(Box::new(move |r| *o2.lock().unwrap() = Some(format!("{r:?}"))));
+    SmtpClient::from_addr(addr)
+        .timeouts(SmtpClientTimeouts { stage: Duration::from_secs(3), ..Default::default() })
+        .connect(&rt, Arc::new(send))
+        .unwrap();
+    assert!(wait_for(|| outcome.lock().unwrap().is_some(), 4000), "delivery timed out");
+    assert_eq!(outcome.lock().unwrap().as_deref(), Some("Delivered"));
+}

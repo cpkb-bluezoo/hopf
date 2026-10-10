@@ -892,7 +892,11 @@ impl SmtpClientAuthExchange for SmtpClientEndpoint {
 impl SmtpClientEnvelope for SmtpClientEndpoint {
     fn rcpt_to(&mut self, recipient: &str, params: &DsnRecipientParams) {
         let mut arg = format!("RCPT TO:<{recipient}>");
-        arg.push_str(&params.render());
+        // NOTIFY/ORCPT are the DSN extension (RFC 3461): a server that did not
+        // advertise it answers them with 501, so they are sent only to one that did.
+        if self.caps.dsn {
+            arg.push_str(&params.render());
+        }
         self.issue_pending(PendingCmd::RcptTo(recipient.to_string()), &arg);
     }
 

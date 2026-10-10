@@ -218,7 +218,7 @@ impl SmtpClientDriver for SmtpVerifyDriver {
         };
         let mut client = create_client(mech, &user, &secret, "", "smtp", None);
         if client.has_initial_response() {
-            if let SaslClientStep::Response(initial) = client.evaluate(None) {
+            if let SaslClientStep::Response(initial) | SaslClientStep::Complete(initial) = client.evaluate(None) {
                 st.sasl_client = Some(client);
                 drop(st);
                 session.auth(mech.name(), Some(&initial));

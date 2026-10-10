@@ -31,6 +31,10 @@ pub struct ParsedClientHello {
     pub peer_key_share: Option<Bytes>,
     /// Group id for [`Self::peer_key_share`].
     pub key_share_group: Option<u16>,
+    /// Every key share the client sent, in order (the first is [`Self::peer_key_share`]).
+    /// A server that prefers a group other than the first one offered can still use its
+    /// share instead of asking for a `HelloRetryRequest` (RFC 8446 §4.2.8).
+    pub key_shares: Vec<(u16, Bytes)>,
     /// Supported groups extension.
     pub supported_groups: Vec<u16>,
     /// ALPN protocol names offered.
@@ -151,6 +155,7 @@ impl HandshakeEvents for ClientHelloCollector {
     }
 
     fn key_share(&mut self, group: u16, share: &[u8]) {
+        self.out.key_shares.push((group, Bytes::copy_from_slice(share)));
         if !self.first_key_share {
             self.first_key_share = true;
             self.out.key_share_group = Some(group);

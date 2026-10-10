@@ -785,6 +785,7 @@ impl HandshakeEngine {
             legacy_version: self.config.mode.legacy_version(),
             compress_certificate: self.config.certificate_compression,
             offer_tls12_fallback: self.config.offer_tls12_fallback,
+            extra_key_shares: Vec::new(),
         };
 
         if self.ech_client_is_real() {
@@ -1442,14 +1443,20 @@ impl HandshakeEngine {
         // retry anyway, so guessing a group up front buys nothing. Treated
         // identically to "key share for a group we don't want": both need
         // the same `HelloRetryRequest`.
-        if ch.key_share_group != Some(group.code()) {
+        // The share for the chosen group, wherever the client put it among the ones it sent.
+        let peer_share = ch
+            .key_shares
+            .iter()
+            .find(|(g, _)| *g == group.code())
+            .map(|(_, share)| share.clone());
+        if peer_share.is_none() {
             if self.server_retry_requested_group.is_some() {
                 self.fail(sink, AlertDescription::IllegalParameter, "client key share group still mismatched after HelloRetryRequest");
                 return false;
             }
             return self.send_hello_retry_request(group, &ch.legacy_session_id, suite, encoded, sink);
         }
-        let Some(peer_share) = ch.peer_key_share else {
+        let Some(peer_share) = peer_share else {
             self.fail(sink, AlertDescription::InternalError, "key share group matched but bytes missing");
             return false;
         };
@@ -3525,6 +3532,7 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();
         server.feed_handshake_data(&mut wire.as_ref(), &mut sink);
@@ -3652,6 +3660,7 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            extra_key_shares: Vec::new(),
         });
         server.feed_handshake_data(&mut hello.encode().as_ref(), &mut sink);
         assert!(sink.alerts.is_empty(), "even an illegal value is ignored on QUIC: {:?}", sink.events);
@@ -3810,6 +3819,7 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();
         let mut input = wire.as_ref();
@@ -3853,6 +3863,7 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();
         let mut input = wire.as_ref();
@@ -3861,6 +3872,52 @@ mod tests {
         assert!(
             sink.events.iter().any(|e| e.starts_with("protocol_error")),
             "{:?}",
+            sink.events
+        );
+    }
+
+    /// Browsers send several key shares at once (RFC 8446 §4.2.8). When the
+    /// server's preferred group is one the client already sent a share for,
+    /// but not the first, the server must use that share. Asking for a retry
+    /// with a group the client has already offered makes BoringSSL (WebKit,
+    /// Chrome) abort the handshake with `WRONG_CURVE`.
+    #[test]
+    fn server_uses_a_later_key_share_instead_of_retrying_for_a_group_already_offered() {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let creds = test_server_credentials();
+        let server_cfg = server_config_for(creds, KxPolicy::default());
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut sink = RecordingSink::default();
+
+        let classical = EphemeralKeyPair::generate().unwrap();
+        let hybrid = LocalKeyShare::generate(NamedGroup::X25519MLKEM768).unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [4u8; 32],
+            cipher_suites: SUPPORTED_CIPHER_SUITES.to_vec(),
+            key_share: KeyShareEntry {
+                group: NamedGroup::X25519.code(),
+                share: Bytes::copy_from_slice(classical.public_key()),
+            },
+            extra_key_shares: vec![KeyShareEntry {
+                group: NamedGroup::X25519MLKEM768.code(),
+                share: hybrid.client_share_bytes(),
+            }],
+            supported_groups: vec![NamedGroup::X25519MLKEM768.code(), NamedGroup::X25519.code()],
+            ..ClientHelloParams::default()
+        });
+        let wire = hello.encode();
+        let mut input = wire.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink);
+
+        assert!(
+            !sink.events.iter().any(|e| e.starts_with("protocol_error")),
+            "{:?}",
+            sink.events
+        );
+        assert_eq!(
+            sink.negotiated_group,
+            Some(NamedGroup::X25519MLKEM768.code()),
+            "the server must answer with a ServerHello for the group it prefers, not a HelloRetryRequest: {:?}",
             sink.events
         );
     }
