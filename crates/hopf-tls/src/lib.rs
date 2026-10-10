@@ -101,6 +101,8 @@ pub fn public_trust_connector(alpn: &[&[u8]]) -> io::Result<SharedTlsConnector> 
 }
 
 #[cfg(test)]
+// These tests exist to exercise the deprecated hopf-tls wrappers themselves.
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -138,6 +140,8 @@ mod tests {
 }
 
 #[cfg(all(test, feature = "integration"))]
+// As above: these deliberately exercise the deprecated hopf-tls wrappers.
+#[allow(deprecated)]
 mod integration_tests {
     use super::*;
     use std::io::{Read, Write};

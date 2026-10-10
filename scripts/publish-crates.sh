@@ -18,8 +18,8 @@
 #   --interval-update 90s   (version bumps of existing crates)
 #   --interval DUR    sets both (legacy / blunt override)
 #
-# hopf-tls: publish 0.4.0 once (deprecated final release), then remove it from
-# CRATES below, set `publish = false` in crates/hopf-tls/Cargo.toml, and commit.
+# hopf-tls: deprecated; its final release was 0.4.0, so it is no longer in CRATES
+# and is marked `publish = false`. It stays in the workspace as an interop harness.
 #
 # Usage (from repo root, with CARGO_REGISTRY_TOKEN set or `cargo login` done):
 #   ./scripts/publish-crates.sh
@@ -45,7 +45,6 @@ UA='hopf-publish-crates (https://github.com/cpkb-bluezoo/hopf)'
 CRATES=(
   hopf-core
   hopf-auth
-  hopf-tls
   hopf-quic
   hopf-dns
   hopf-mdns
@@ -64,6 +63,7 @@ CRATES=(
   hopf-smtp
   hopf-pop3
   hopf-imap
+  hopf-nntp
   hopf-mqtt
   hopf
 )

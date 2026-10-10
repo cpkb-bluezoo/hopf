@@ -38,10 +38,12 @@
 //! | [`smtp`] | `hopf-smtp` | `smtp` |
 //! | [`pop3`] | `hopf-pop3` | `pop3` |
 //! | [`imap`] | `hopf-imap` | `imap` |
+//! | [`nntp`] | `hopf-nntp` | `nntp` |
 //! | [`mailbox`] | `hopf-mailbox` | `mailbox` |
 //! | [`otel`] | `hopf-otel` | `otel` |
 //! | [`mqtt`] | `hopf-mqtt` | `mqtt` (`mqtt-ws` for MQTT-over-WebSocket) |
 //! | [`amqp`] | `hopf-amqp` | `amqp` |
+//! | [`amqp1`] | `hopf-amqp1` | `amqp1` |
 //!
 //! Documentation: <https://cpkb-bluezoo.github.io/hopf/>
 
@@ -114,6 +116,10 @@ pub use hopf_pop3 as pop3;
 #[cfg(feature = "imap")]
 pub use hopf_imap as imap;
 
+/// NNTP / NNTPS async client.
+#[cfg(feature = "nntp")]
+pub use hopf_nntp as nntp;
+
 /// mbox / Maildir++ mailbox storage SPI.
 #[cfg(feature = "mailbox")]
 pub use hopf_mailbox as mailbox;
@@ -129,3 +135,7 @@ pub use hopf_mqtt as mqtt;
 /// AMQP 0-9-1 async client (RabbitMQ).
 #[cfg(feature = "amqp")]
 pub use hopf_amqp as amqp;
+
+/// AMQP 1.0 async client.
+#[cfg(feature = "amqp1")]
+pub use hopf_amqp1 as amqp1;

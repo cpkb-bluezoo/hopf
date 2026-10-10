@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 description = "DEPRECATED — use hopf-core::tls. Workspace-only rustls interop test harness; do not add as a dependency."
 readme = "README.md"
+publish = false
 keywords = ["tls", "server"]
 categories = ["network-programming", "cryptography"]
 
