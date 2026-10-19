@@ -1710,8 +1710,20 @@ impl H2Endpoint {
             self.send_goaway(ERROR_PROTOCOL_ERROR);
             return;
         }
+        let error_code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
         self.server_streams.remove(&stream_id);
-        self.client_streams.remove(&stream_id);
+        // Client role: the request ended abruptly, which the ClientHandler
+        // contract reports as exactly one `request_failed` (never
+        // `response_complete`), carrying the peer's error code.
+        if let Some(mut stream) = self.client_streams.remove(&stream_id) {
+            stream.handler.request_failed(
+                &mut NullClientWriter,
+                &std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    format!("stream reset by peer: RST_STREAM error code {error_code:#x}"),
+                ),
+            );
+        }
         self.flow.close_stream(stream_id);
     }
 
@@ -3044,6 +3056,80 @@ mod client_goaway_tests {
 
         assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(ep.client_streams.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod client_rst_stream_tests {
+    use super::*;
+    use crate::stream::{ClientHandler, ClientHandlerFactory, ClientWriter};
+
+    struct NoopClientFactory;
+    impl ClientHandlerFactory for NoopClientFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        failed: Vec<String>,
+        completed: usize,
+    }
+
+    struct Recorder(Arc<std::sync::Mutex<Seen>>);
+    impl ClientHandler for Recorder {
+        fn start(&mut self, _request: &mut dyn ClientWriter) {}
+        fn response_headers(&mut self, _request: &mut dyn ClientWriter, _headers: &Headers) {}
+        fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
+            self.0.lock().unwrap().completed += 1;
+        }
+        fn request_failed(&mut self, _request: &mut dyn ClientWriter, err: &std::io::Error) {
+            self.0.lock().unwrap().failed.push(err.to_string());
+        }
+    }
+
+    fn client_with_stream(id: u32) -> (H2Endpoint, Arc<std::sync::Mutex<Seen>>) {
+        let mut ep = H2Endpoint::client(Arc::new(NoopClientFactory), HttpLimits::default(), false);
+        let seen = Arc::new(std::sync::Mutex::new(Seen::default()));
+        ep.client_streams.insert(
+            id,
+            H2ClientStream {
+                id,
+                handler: Box::new(Recorder(Arc::clone(&seen))),
+                response_headers_received: false,
+                response_body_started: false,
+                pending_body: Vec::new(),
+                pending_end_stream: false,
+                is_extended_connect: false,
+                upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
+            },
+        );
+        ep.flow.open_stream(id, crate::h2::flow::INITIAL_WINDOW_SIZE);
+        (ep, seen)
+    }
+
+    /// RFC 9113 section 6.4: a RST_STREAM from the server ends the request
+    /// abruptly, which the ClientHandler contract reports as exactly one
+    /// `request_failed`. Regression: the stream was removed silently, so a
+    /// request the server refused mid-flight hung its caller forever.
+    #[test]
+    fn rst_stream_from_the_server_fails_the_request_once() {
+        let (mut ep, seen) = client_with_stream(1);
+        ep.on_rst_stream(1, &frame::ERROR_CANCEL.to_be_bytes());
+        let s = seen.lock().unwrap();
+        assert_eq!(s.failed.len(), 1, "request_failed must fire exactly once: {:?}", s.failed);
+        assert!(s.failed[0].contains("CANCEL") || s.failed[0].contains("0x8") || s.failed[0].contains('8'), "error code missing: {}", s.failed[0]);
+        assert_eq!(s.completed, 0, "response_complete must not fire");
+        drop(s);
+        assert!(!ep.client_streams.contains_key(&1));
+        assert_ne!(ep.state, ConnState::GoAway, "a stream reset is not a connection error");
+        // A second RST_STREAM for the now-closed stream is tolerated and
+        // reports nothing more.
+        ep.on_rst_stream(1, &frame::ERROR_CANCEL.to_be_bytes());
+        assert_eq!(seen.lock().unwrap().failed.len(), 1);
     }
 }
 
