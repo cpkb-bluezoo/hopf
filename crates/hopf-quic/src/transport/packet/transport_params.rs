@@ -49,6 +49,10 @@ pub struct TransportParameters {
     pub original_dst_cid: Option<ConnectionId>,
     /// retry_source_connection_id (server, after Retry)
     pub retry_src_cid: Option<ConnectionId>,
+    /// preferred_address (server; RFC 9000 section 18.2): an address to
+    /// migrate to after the handshake, with the connection ID (sequence
+    /// number 1) and stateless reset token to use there.
+    pub preferred_address: Option<PreferredAddress>,
     /// max_datagram_frame_size (RFC 9221); `None` = omit (DATAGRAM disabled).
     pub max_datagram_frame_size: Option<u64>,
     /// version_information (RFC 9368); `None` = omitted.
@@ -77,6 +81,7 @@ impl Default for TransportParameters {
             initial_src_cid: None,
             original_dst_cid: None,
             retry_src_cid: None,
+            preferred_address: None,
             max_datagram_frame_size: Some(1452),
             version_information: None,
             version_information_invalid: false,
@@ -96,11 +101,81 @@ const INITIAL_MAX_STREAMS_UNI: u64 = 0x09;
 const ACK_DELAY_EXPONENT: u64 = 0x0a;
 const MAX_ACK_DELAY: u64 = 0x0b;
 const DISABLE_ACTIVE_MIGRATION: u64 = 0x0c;
+const PREFERRED_ADDRESS: u64 = 0x0d;
 const ACTIVE_CONNECTION_ID_LIMIT: u64 = 0x0e;
 const INITIAL_SOURCE_CONNECTION_ID: u64 = 0x0f;
 const RETRY_SOURCE_CONNECTION_ID: u64 = 0x10;
 const VERSION_INFORMATION: u64 = 0x11;
 const MAX_DATAGRAM_FRAME_SIZE: u64 = 0x20;
+
+/// The server's preferred_address transport parameter (RFC 9000 section
+/// 18.2): an IPv4 and/or IPv6 address (an all-zero one means none), the
+/// connection ID with sequence number 1 to use there, and its stateless
+/// reset token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreferredAddress {
+    /// IPv4 address and port, if offered.
+    pub v4: Option<std::net::SocketAddrV4>,
+    /// IPv6 address and port, if offered.
+    pub v6: Option<std::net::SocketAddrV6>,
+    /// Connection ID to use on the preferred address (sequence number 1).
+    pub cid: ConnectionId,
+    /// Stateless reset token for that connection ID.
+    pub reset_token: [u8; 16],
+}
+
+impl PreferredAddress {
+    /// Encode the parameter value.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(41 + self.cid.len());
+        match self.v4 {
+            Some(a) => {
+                out.extend_from_slice(&a.ip().octets());
+                out.extend_from_slice(&a.port().to_be_bytes());
+            }
+            None => out.extend_from_slice(&[0u8; 6]),
+        }
+        match self.v6 {
+            Some(a) => {
+                out.extend_from_slice(&a.ip().octets());
+                out.extend_from_slice(&a.port().to_be_bytes());
+            }
+            None => out.extend_from_slice(&[0u8; 18]),
+        }
+        out.push(self.cid.len() as u8);
+        out.extend_from_slice(self.cid.as_slice());
+        out.extend_from_slice(&self.reset_token);
+        out
+    }
+
+    /// Decode a parameter value; `None` if malformed (section 18.2: the
+    /// connection ID is 1 to 20 bytes).
+    pub fn decode(value: &[u8]) -> Option<Self> {
+        if value.len() < 25 {
+            return None;
+        }
+        let v4 = {
+            let ip = std::net::Ipv4Addr::new(value[0], value[1], value[2], value[3]);
+            let port = u16::from_be_bytes([value[4], value[5]]);
+            (!ip.is_unspecified() || port != 0).then_some(std::net::SocketAddrV4::new(ip, port))
+        };
+        let v6 = {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&value[6..22]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([value[22], value[23]]);
+            (!ip.is_unspecified() || port != 0).then_some(std::net::SocketAddrV6::new(ip, port, 0, 0))
+        };
+        let cid_len = value[24] as usize;
+        if !(1..=20).contains(&cid_len) || value.len() != 25 + cid_len + 16 {
+            return None;
+        }
+        let cid = ConnectionId::from_slice(&value[25..25 + cid_len]);
+        let mut reset_token = [0u8; 16];
+        reset_token.copy_from_slice(&value[25 + cid_len..]);
+        Some(Self { v4, v6, cid, reset_token })
+    }
+}
 
 impl TransportParameters {
     /// Encode to TLS extension payload.
@@ -154,6 +229,9 @@ impl TransportParameters {
         if self.disable_active_migration {
             varint::encode(DISABLE_ACTIVE_MIGRATION, &mut out);
             varint::encode(0, &mut out);
+        }
+        if let Some(pa) = &self.preferred_address {
+            put_bytes(&mut out, PREFERRED_ADDRESS, &pa.encode());
         }
         put_var(
             &mut out,
@@ -231,6 +309,9 @@ impl TransportParameters {
                 }
                 DISABLE_ACTIVE_MIGRATION => {
                     tp.disable_active_migration = true;
+                }
+                PREFERRED_ADDRESS => {
+                    tp.preferred_address = Some(PreferredAddress::decode(value)?);
                 }
                 ACTIVE_CONNECTION_ID_LIMIT => {
                     tp.active_connection_id_limit = varint::decode(&mut value)?;
@@ -334,5 +415,21 @@ mod tests {
             assert!(dec.version_information_invalid, "{bad:?}");
             assert!(dec.version_information.is_none());
         }
+    }
+
+    /// RFC 9000 section 18.2: preferred_address round-trips, with an
+    /// absent family encoded as zeros.
+    #[test]
+    fn preferred_address_round_trips() {
+        let pa = PreferredAddress {
+            v4: Some("192.0.2.1:4433".parse().unwrap()),
+            v6: None,
+            cid: ConnectionId::from_slice(&[7; 8]),
+            reset_token: [0xaa; 16],
+        };
+        let tp = TransportParameters { preferred_address: Some(pa.clone()), ..Default::default() };
+        let dec = TransportParameters::decode(&tp.encode()).unwrap();
+        assert_eq!(dec.preferred_address, Some(pa));
+        assert!(PreferredAddress::decode(&[0u8; 24]).is_none(), "short value");
     }
 }

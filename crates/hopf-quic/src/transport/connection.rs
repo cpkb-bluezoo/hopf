@@ -229,8 +229,15 @@ pub struct Connection {
     peer_cids: Vec<PeerCid>,
     /// RETIRE_CONNECTION_ID frames due (new or lost).
     pending_retire_cids: Vec<u64>,
-    /// PATH_CHALLENGE data to answer with PATH_RESPONSE on the next flush.
-    pending_path_responses: VecDeque<[u8; 8]>,
+    /// PATH_CHALLENGE data to answer with PATH_RESPONSE on the next flush,
+    /// each on the path it arrived from.
+    pending_path_responses: VecDeque<([u8; 8], SocketAddr)>,
+    /// The path being validated, if any.
+    probe: Option<PathProbe>,
+    /// Source address of the datagram being processed.
+    rx_remote: Option<SocketAddr>,
+    /// Where the packet being built goes, when not the current path.
+    tx_destination: Option<SocketAddr>,
     /// Peer-initiated streams ever created, per direction: an index below
     /// this that is no longer in `streams` was released.
     peer_bi_opened: u64,
@@ -341,6 +348,30 @@ struct LocalCid {
     /// The peer retired it.
     retired: bool,
 }
+
+/// A path under validation (RFC 9000 section 8.2): a new client address a
+/// server is probing before migrating to it, or the preferred address a
+/// client has moved to and is confirming.
+#[derive(Debug, Clone)]
+struct PathProbe {
+    remote: SocketAddr,
+    challenge: [u8; 8],
+    /// When the current challenge left; `None` while one is due.
+    sent_at: Option<Instant>,
+    attempts: u32,
+    /// Server: bytes received from and sent to the unvalidated path, which
+    /// bound each other three to one (section 8.1).
+    bytes_received: u64,
+    bytes_sent: u64,
+    /// Client: a non-probing PING goes first, making this a migration.
+    ping_first: bool,
+    /// Client: the path and destination ID to return to if validation
+    /// fails.
+    fallback: Option<(SocketAddr, ConnectionId)>,
+}
+
+/// RFC 9000 section 8.2.4: challenges before a path is given up on.
+const PATH_PROBE_ATTEMPTS: u32 = 3;
 
 /// A STREAM chunk sent in a 0-RTT packet, with the packet that carried it.
 struct Sent0Rtt {
@@ -502,6 +533,9 @@ impl Connection {
             peer_cids: Vec::new(),
             pending_retire_cids: Vec::new(),
             pending_path_responses: VecDeque::new(),
+            probe: None,
+            rx_remote: None,
+            tx_destination: None,
             peer_bi_opened: 0,
             peer_uni_opened: 0,
             retiring: Vec::new(),
@@ -654,6 +688,9 @@ impl Connection {
             peer_cids: Vec::new(),
             pending_retire_cids: Vec::new(),
             pending_path_responses: VecDeque::new(),
+            probe: None,
+            rx_remote: None,
+            tx_destination: None,
             peer_bi_opened: 0,
             peer_uni_opened: 0,
             retiring: Vec::new(),
@@ -752,6 +789,9 @@ impl Connection {
         if let Some(paced) = self.pacer.deadline() {
             next = next.min(paced);
         }
+        if let Some(probe) = self.probe_deadline() {
+            next = next.min(probe);
+        }
         if let Some(interval) = self.keep_alive_interval {
             if self.established && self.spaces[2].secrets.is_some() {
                 next = next.min(self.last_keep_alive + interval);
@@ -775,6 +815,7 @@ impl Connection {
         if self.closed {
             return;
         }
+        self.handle_probe_timeout(now);
 
         if let Some(interval) = self.keep_alive_interval {
             if self.established
@@ -855,7 +896,7 @@ impl Connection {
     /// connection IDs the endpoint issued at this connection's request.
     pub fn handle_event(&mut self, now: Instant, ev: ConnectionEvent) {
         match ev {
-            ConnectionEvent::Datagram { datagram, remote: _ } => self.handle_packet(now, &datagram),
+            ConnectionEvent::Datagram { datagram, remote } => self.handle_datagram_from(now, remote, &datagram),
             ConnectionEvent::LocalConnectionIds(issued) => {
                 self.local_cids_requested = self.local_cids_requested.saturating_sub(issued.len());
                 for (cid, reset_token) in issued {
@@ -888,6 +929,182 @@ impl Connection {
             let need = wanted_spares - have_spares;
             self.local_cids_requested += need;
             self.endpoint_events.push_back(EndpointEvent::NeedConnectionIds(need));
+        }
+    }
+
+    /// Receive a datagram from `remote`, which may be a new path (RFC 9000
+    /// section 9): a server starts validating a new client address it sees
+    /// 1-RTT packets from, and counts its bytes while unvalidated; a client
+    /// takes packets only from the server address it uses.
+    pub fn handle_datagram_from(&mut self, now: Instant, remote: SocketAddr, data: &[u8]) {
+        if remote != self.remote && self.side == Side::Client {
+            return;
+        }
+        self.rx_remote = Some(remote);
+        self.handle_packet(now, data);
+        self.rx_remote = None;
+        if remote != self.remote {
+            if let Some(probe) = self.probe.as_mut().filter(|p| p.remote == remote) {
+                probe.bytes_received += data.len() as u64;
+            }
+        }
+    }
+
+    /// RFC 9000 section 9.6: a client offered a preferred_address moves to
+    /// it once the handshake is done, on the connection ID the server gave
+    /// for it (sequence number 1): a non-probing PING first, then a
+    /// PATH_CHALLENGE to confirm the path, returning to the handshake
+    /// address if that fails.
+    fn start_preferred_address_migration(&mut self) {
+        if self.side != Side::Client || self.probe.is_some() {
+            return;
+        }
+        let Some(pa) = self.peer_tp.as_ref().and_then(|t| t.preferred_address.clone()) else {
+            return;
+        };
+        // The family of the current path if it is offered, else the other.
+        let v4 = pa.v4.map(SocketAddr::V4);
+        let v6 = pa.v6.map(SocketAddr::V6);
+        let target = match self.remote {
+            SocketAddr::V4(_) => v4.or(v6),
+            SocketAddr::V6(_) => v6.or(v4),
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if target == self.remote {
+            return;
+        }
+        if self.peer_cids.is_empty() {
+            self.peer_cids.push(PeerCid { seq: 0, cid: self.rem_cid.clone(), reset_token: None });
+        }
+        if !self.peer_cids.iter().any(|c| c.seq == 1) {
+            self.peer_cids.push(PeerCid { seq: 1, cid: pa.cid.clone(), reset_token: Some(pa.reset_token) });
+        }
+        let fallback = (self.remote, self.rem_cid.clone());
+        self.remote = target;
+        self.rem_cid = pa.cid;
+        self.short_cid_len = self.rem_cid.len();
+        self.probe = Some(PathProbe {
+            remote: target,
+            challenge: fresh_challenge(),
+            sent_at: None,
+            attempts: 0,
+            bytes_received: 0,
+            bytes_sent: 0,
+            ping_first: true,
+            fallback: Some(fallback),
+        });
+    }
+
+    /// Server: a 1-RTT packet from `remote`, not the current path, starts
+    /// validating it (RFC 9000 section 9.3); the path is used only once
+    /// the PATH_RESPONSE arrives.
+    fn note_packet_from_new_address(&mut self, remote: SocketAddr) {
+        if self.side != Side::Server || remote == self.remote {
+            return;
+        }
+        if self.probe.as_ref().is_some_and(|p| p.remote == remote) {
+            return;
+        }
+        self.probe = Some(PathProbe {
+            remote,
+            challenge: fresh_challenge(),
+            sent_at: None,
+            attempts: 0,
+            bytes_received: 0,
+            bytes_sent: 0,
+            ping_first: false,
+            fallback: None,
+        });
+    }
+
+    /// The path under validation answered: move to it (a server), or stay
+    /// on it for good (a client), on a connection ID not used on the old
+    /// path (section 9.5), retiring the old one.
+    fn on_path_validated(&mut self) {
+        let Some(probe) = self.probe.take() else {
+            return;
+        };
+        if self.side == Side::Server {
+            self.remote = probe.remote;
+            // Section 9.4: the new path's congestion state is unknown.
+            self.loss.congestion_mut().reset();
+            self.switch_to_spare_peer_cid();
+        } else if let Some((_, old_cid)) = probe.fallback {
+            if let Some(old) = self.peer_cids.iter().find(|c| c.cid == old_cid).map(|c| c.seq) {
+                self.peer_cids.retain(|c| c.seq != old);
+                self.pending_retire_cids.push(old);
+            }
+        }
+    }
+
+    /// Use a spare connection ID of the peer's, if it gave one, retiring
+    /// the one used so far.
+    fn switch_to_spare_peer_cid(&mut self) {
+        let current = self.peer_cids.iter().find(|c| c.cid == self.rem_cid).map(|c| c.seq);
+        let Some(spare) = self
+            .peer_cids
+            .iter()
+            .filter(|c| c.cid != self.rem_cid)
+            .min_by_key(|c| c.seq)
+            .map(|c| (c.seq, c.cid.clone()))
+        else {
+            return;
+        };
+        self.rem_cid = spare.1;
+        self.short_cid_len = self.rem_cid.len();
+        if let Some(old) = current {
+            self.peer_cids.retain(|c| c.seq != old);
+            self.pending_retire_cids.push(old);
+        }
+    }
+
+    /// RFC 9000 section 8.2.4: a challenge unanswered for a probe timeout
+    /// is sent again, and after enough of them the path is given up: a
+    /// server forgets the candidate, a client returns to its old path.
+    fn probe_timeout(&self) -> Duration {
+        let rtt = self.loss.rtt();
+        rtt.smoothed_rtt() + (4 * rtt.rtt_var()).max(Duration::from_millis(1)) + self.peer_max_ack_delay()
+    }
+
+    fn probe_deadline(&self) -> Option<Instant> {
+        self.probe.as_ref().and_then(|p| p.sent_at).map(|t| t + self.probe_timeout())
+    }
+
+    fn handle_probe_timeout(&mut self, now: Instant) {
+        let Some(deadline) = self.probe_deadline() else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        let Some(probe) = self.probe.as_mut() else {
+            return;
+        };
+        probe.attempts += 1;
+        if probe.attempts < PATH_PROBE_ATTEMPTS {
+            probe.challenge = fresh_challenge();
+            probe.sent_at = None;
+            return;
+        }
+        let abandoned = self.probe.take().unwrap();
+        if let Some((remote, cid)) = abandoned.fallback {
+            self.remote = remote;
+            self.rem_cid = cid;
+            self.short_cid_len = self.rem_cid.len();
+        }
+    }
+
+    /// How large a datagram may be on the path `probe` validates: 1200
+    /// bytes (section 8.2.1), unless a server's amplification limit on the
+    /// unvalidated path allows less.
+    fn probe_pad_to(&self, probe: &PathProbe) -> usize {
+        if self.side == Side::Server {
+            let allowed = (3 * probe.bytes_received).saturating_sub(probe.bytes_sent);
+            usize::try_from(allowed).unwrap_or(usize::MAX).min(MIN_INITIAL_DATAGRAM_SIZE)
+        } else {
+            MIN_INITIAL_DATAGRAM_SIZE
         }
     }
 
@@ -1199,6 +1416,11 @@ impl Connection {
         if ack_eliciting {
             self.space_mut(space).pending_ack.insert(pn);
         }
+        if space == SpaceId::Data {
+            if let Some(remote) = self.rx_remote {
+                self.note_packet_from_new_address(remote);
+            }
+        }
         for frame in frames {
             self.handle_frame(space, frame, now);
         }
@@ -1367,11 +1589,13 @@ impl Connection {
                 self.request_spare_cids();
             }
             Frame::PathChallenge { data } => {
-                self.pending_path_responses.push_back(data);
+                let from = self.rx_remote.unwrap_or(self.remote);
+                self.pending_path_responses.push_back((data, from));
             }
-            Frame::PathResponse { .. } => {
-                // No PATH_CHALLENGE is ever sent yet (no path validation or
-                // migration), so there is nothing a response could match.
+            Frame::PathResponse { data } => {
+                if self.probe.as_ref().is_some_and(|p| p.challenge == data) {
+                    self.on_path_validated();
+                }
             }
             Frame::MaxStreamsBidi { max } => {
                 if max > self.peer_max_streams_bidi {
@@ -1670,6 +1894,7 @@ impl Connection {
             self.established = true;
             self.events.push_back(Event::Connected);
             self.request_spare_cids();
+            self.start_preferred_address_migration();
         }
     }
 
@@ -2143,17 +2368,51 @@ impl Connection {
         if self.spaces[2].secrets.is_none() {
             return;
         }
-        while let Some(data) = self.pending_path_responses.pop_front() {
+        while let Some((data, to)) = self.pending_path_responses.pop_front() {
             let mut payload = Vec::new();
             writer::path_response(&mut payload, &data);
+            // On the path the challenge came from, expanded to 1200 bytes
+            // unless that path's amplification limit allows less.
+            let pad = match self.probe.as_ref().filter(|p| p.remote == to && to != self.remote) {
+                Some(p) => self.probe_pad_to(p),
+                None => MIN_INITIAL_DATAGRAM_SIZE,
+            };
             let previous = self.gso_pad_to;
-            self.gso_pad_to = Some(previous.unwrap_or(0).max(MIN_INITIAL_DATAGRAM_SIZE));
+            self.gso_pad_to = Some(previous.unwrap_or(0).max(pad));
+            self.tx_destination = (to != self.remote).then_some(to);
             // Not recoverable: the peer sends a new challenge if it needs one.
             let queued = self.queue_packet(SpaceId::Data, payload, Vec::new(), true, true, now);
+            self.tx_destination = None;
             self.gso_pad_to = previous;
             if !queued {
-                self.pending_path_responses.push_front(data);
+                self.pending_path_responses.push_front((data, to));
                 break;
+            }
+        }
+        if let Some(probe) = self.probe.clone().filter(|p| p.sent_at.is_none()) {
+            if probe.ping_first {
+                // A non-probing packet: the migration itself (section 9.6).
+                let mut payload = Vec::new();
+                writer::ping(&mut payload);
+                if self.queue_packet(SpaceId::Data, payload, vec![RecoverableFrame::Ping], true, true, now) {
+                    if let Some(p) = self.probe.as_mut() {
+                        p.ping_first = false;
+                    }
+                }
+            }
+            let mut payload = Vec::new();
+            writer::path_challenge(&mut payload, &probe.challenge);
+            let pad = self.probe_pad_to(&probe);
+            let previous = self.gso_pad_to;
+            self.gso_pad_to = Some(previous.unwrap_or(0).max(pad));
+            self.tx_destination = (probe.remote != self.remote).then_some(probe.remote);
+            let queued = self.queue_packet(SpaceId::Data, payload, Vec::new(), true, true, now);
+            self.tx_destination = None;
+            self.gso_pad_to = previous;
+            if queued {
+                if let Some(p) = self.probe.as_mut() {
+                    p.sent_at = Some(now);
+                }
             }
         }
         if !self.pending_retire_cids.is_empty() {
@@ -2471,8 +2730,9 @@ self.version,
             recoverable,
         );
 
+        let destination = self.tx_destination.unwrap_or(self.remote);
         let tx = Transmit {
-            destination: self.remote,
+            destination,
             ecn: None,
             size: packet.len(),
             segment_size: None,
@@ -2480,6 +2740,11 @@ self.version,
         };
         if self.side == Side::Server && !self.client_address_validated {
             self.unvalidated_bytes_sent += tx.size as u64;
+        }
+        if destination != self.remote {
+            if let Some(p) = self.probe.as_mut().filter(|p| p.remote == destination) {
+                p.bytes_sent += tx.size as u64;
+            }
         }
         if self.pacing_charge {
             self.pacer.on_sent(tx.size);
@@ -3282,6 +3547,13 @@ fn idle_timeout_from_ms(ms: u64) -> Duration {
     }
 }
 
+/// Random PATH_CHALLENGE data (RFC 9000 section 8.2.1).
+fn fresh_challenge() -> [u8; 8] {
+    let mut data = [0u8; 8];
+    data.copy_from_slice(ConnectionId::random(8).as_slice());
+    data
+}
+
 /// Negotiate connection idle timeout: min of local and peer, treating 0 as infinite.
 fn negotiate_idle_timeout(local_ms: u64, peer_ms: u64) -> Duration {
     let ms = match (local_ms, peer_ms) {
@@ -3305,6 +3577,7 @@ pub enum WriteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::packet::transport_params::PreferredAddress;
     use hopf_core::crypto::kx_policy::KxPolicy;
     use hopf_core::tls::{HandshakeMode, HandshakeRole};
 
@@ -5420,5 +5693,200 @@ mod tests {
         assert_eq!(closed_with(&mut conn), None);
         conn.handle_frame(SpaceId::Data, Frame::RetireConnectionId { seq: 9 }, now);
         assert_eq!(closed_with(&mut conn), Some(PROTOCOL_VIOLATION));
+    }
+
+    /// A 1-RTT packet (short header) from the peer to `conn`, carrying
+    /// `payload` under the Data keys `conn` holds, padded to `size`.
+    fn peer_1rtt_packet(conn: &Connection, pn: u64, payload: &[u8], size: usize) -> Vec<u8> {
+        let peer = match conn.side {
+            Side::Client => Side::Server,
+            Side::Server => Side::Client,
+        };
+        let keys = conn.space(SpaceId::Data).keys(peer, conn.version).expect("Data keys").local;
+        let pn_len = 2;
+        let header = short_header::build(&conn.local_cid, false, false, pn, pn_len);
+        let mut body = payload.to_vec();
+        writer::pad_to(&mut body, size.saturating_sub(header.len() + keys.tag_len()).max(4));
+        let pn_offset = header.len() - pn_len;
+        keys.encrypt(pn, &header, &mut body);
+        let mut packet = header;
+        packet.append(&mut body);
+        keys.protect_header(pn_offset, &mut packet, true);
+        packet
+    }
+
+    /// Every datagram `conn` sends: destination, size and frames.
+    fn drain_to(conn: &mut Connection, now: Instant) -> Vec<(SocketAddr, usize, Vec<Frame>)> {
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        while let Some(tx) = conn.poll_transmit(now, &mut buf) {
+            let (_, frames) = peer_decrypt(conn, &buf);
+            out.push((tx.destination, tx.size, frames));
+        }
+        out
+    }
+
+    fn challenge_sent_to(out: &[(SocketAddr, usize, Vec<Frame>)], addr: SocketAddr) -> Option<[u8; 8]> {
+        out.iter().filter(|(d, _, _)| *d == addr).flat_map(|(_, _, fr)| fr.iter()).find_map(|f| match f {
+            Frame::PathChallenge { data } => Some(*data),
+            _ => None,
+        })
+    }
+
+    /// An established server with 1-RTT keys, as after the handshake.
+    fn established_server(now: Instant) -> Connection {
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1]);
+        conn.spaces[2].secrets = Some(test_secrets());
+        receive_peer_tp(&mut conn, &client_tp());
+        conn.maybe_establish();
+        assert!(conn.established);
+        conn.loss.set_handshake_confirmed(true);
+        conn.handshake_done = true;
+        drain_to(&mut conn, now);
+        conn
+    }
+
+    /// RFC 9000 section 9.3: a 1-RTT packet from a new address starts path
+    /// validation with a PATH_CHALLENGE to that address, and the peer's
+    /// address changes only once the PATH_RESPONSE arrives. Regression:
+    /// `remote` was set at construction and never changed, so a client
+    /// behind a NAT that rebound lost its connection.
+    #[test]
+    fn server_validates_a_new_client_address_before_migrating_to_it() {
+        let now = Instant::now();
+        let mut conn = established_server(now);
+        let old = conn.remote_address();
+        let new_addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        let packet = peer_1rtt_packet(&conn, 1, &ping, 1200);
+        conn.handle_datagram_from(now, new_addr, &packet);
+        let out = drain_to(&mut conn, now);
+        let challenge = challenge_sent_to(&out, new_addr).expect("PATH_CHALLENGE to the new address");
+        assert_eq!(conn.remote_address(), old, "migrated before the path was validated");
+        let mut response = Vec::new();
+        writer::path_response(&mut response, &challenge);
+        let packet = peer_1rtt_packet(&conn, 2, &response, 1200);
+        conn.handle_datagram_from(now, new_addr, &packet);
+        drain_to(&mut conn, now);
+        assert_eq!(conn.remote_address(), new_addr, "not migrated after the path was validated");
+        // A wrong response does not count.
+        let mut conn = established_server(now);
+        let packet = peer_1rtt_packet(&conn, 1, &ping, 1200);
+        conn.handle_datagram_from(now, new_addr, &packet);
+        drain_to(&mut conn, now);
+        let mut wrong = Vec::new();
+        writer::path_response(&mut wrong, &[0xff; 8]);
+        let packet = peer_1rtt_packet(&conn, 2, &wrong, 1200);
+        conn.handle_datagram_from(now, new_addr, &packet);
+        assert_eq!(conn.remote_address(), old, "migrated on a response to no challenge of ours");
+    }
+
+    /// RFC 9000 section 8.1 on the new path: until it is validated the
+    /// server sends it at most three times what it received there (the
+    /// challenge is padded only as far as that allows).
+    #[test]
+    fn an_unvalidated_new_path_is_amplification_limited() {
+        let now = Instant::now();
+        let mut conn = established_server(now);
+        let new_addr: SocketAddr = "127.0.0.1:50002".parse().unwrap();
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        let small = peer_1rtt_packet(&conn, 1, &ping, 100);
+        conn.handle_datagram_from(now, new_addr, &small);
+        let out = drain_to(&mut conn, now);
+        let to_new: usize = out.iter().filter(|(d, _, _)| *d == new_addr).map(|(_, n, _)| *n).sum();
+        assert!(to_new > 0, "no probe sent to the new address");
+        assert!(to_new <= 3 * small.len(), "{to_new} bytes sent to a path that sent {}", small.len());
+        assert!(challenge_sent_to(&out, new_addr).is_some());
+    }
+
+    /// RFC 9000 section 9.6: a client offered a preferred_address moves to
+    /// it after the handshake, on the connection ID the server gave for it,
+    /// with a non-probing PING and a PATH_CHALLENGE; once validated the old
+    /// path's connection ID is retired.
+    #[test]
+    fn client_migrates_to_the_servers_preferred_address() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let old = conn.remote_address();
+        let preferred: SocketAddr = "127.0.0.1:50009".parse().unwrap();
+        let pa = PreferredAddress {
+            v4: match preferred { SocketAddr::V4(a) => Some(a), _ => None },
+            v6: None,
+            cid: ConnectionId::from_slice(&[0x77; 8]),
+            reset_token: [3; 16],
+        };
+        receive_peer_tp(&mut conn, &TransportParameters { preferred_address: Some(pa.clone()), ..tp_with(V1, &[V1]) });
+        assert_eq!(closed_with(&mut conn), None);
+        conn.loss.set_handshake_confirmed(true);
+        conn.handshake_done = true;
+        conn.start_preferred_address_migration();
+        let out = drain_to(&mut conn, now);
+        let to_preferred: Vec<&(SocketAddr, usize, Vec<Frame>)> = out.iter().filter(|(d, _, _)| *d == preferred).collect();
+        assert!(to_preferred.iter().any(|(_, _, fr)| fr.iter().any(|f| matches!(f, Frame::Ping))), "no PING to the preferred address: {out:?}");
+        let challenge = challenge_sent_to(&out, preferred).expect("PATH_CHALLENGE to the preferred address");
+        assert_eq!(conn.rem_cid, pa.cid, "not using the preferred address's connection ID");
+        let mut response = Vec::new();
+        writer::path_response(&mut response, &challenge);
+        let packet = peer_1rtt_packet(&conn, 5, &response, 1200);
+        conn.handle_datagram_from(now, preferred, &packet);
+        let out = drain_to(&mut conn, now);
+        assert_eq!(conn.remote_address(), preferred);
+        assert_ne!(conn.remote_address(), old);
+        assert!(out.iter().flat_map(|(_, _, fr)| fr.iter()).any(|f| matches!(f, Frame::RetireConnectionId { seq: 0 })), "old connection ID not retired: {out:?}");
+    }
+
+    /// RFC 9000 section 8.2.4: an unanswered challenge is sent again after
+    /// a probe timeout, and after three the path is given up: a server
+    /// keeps its current path, a client returns to the one it left.
+    #[test]
+    fn unanswered_path_probes_are_retried_then_abandoned() {
+        let now = Instant::now();
+        let mut conn = established_server(now);
+        let old = conn.remote_address();
+        let new_addr: SocketAddr = "127.0.0.1:50003".parse().unwrap();
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        conn.handle_datagram_from(now, new_addr, &peer_1rtt_packet(&conn, 1, &ping, 1200));
+        let first = challenge_sent_to(&drain_to(&mut conn, now), new_addr).expect("challenge");
+        let mut t = now;
+        let mut challenges = 1;
+        for _ in 0..3 {
+            t += Duration::from_secs(2);
+            conn.handle_timeout(t);
+            if let Some(c) = challenge_sent_to(&drain_to(&mut conn, t), new_addr) {
+                assert_ne!(c, first, "a retry must carry fresh challenge data");
+                challenges += 1;
+            }
+        }
+        assert_eq!(challenges, 3, "three challenges in all");
+        assert!(conn.probe.is_none(), "probe not abandoned");
+        assert_eq!(conn.remote_address(), old);
+
+        // A client that migrated to a preferred address and got no answer
+        // returns to the handshake address and connection ID.
+        let mut conn = test_client(now);
+        let old = conn.remote_address();
+        let old_cid = conn.rem_cid.clone();
+        let pa = PreferredAddress {
+            v4: Some("127.0.0.1:50010".parse().unwrap()),
+            v6: None,
+            cid: ConnectionId::from_slice(&[0x66; 8]),
+            reset_token: [4; 16],
+        };
+        receive_peer_tp(&mut conn, &TransportParameters { preferred_address: Some(pa), ..tp_with(V1, &[V1]) });
+        conn.start_preferred_address_migration();
+        drain_to(&mut conn, now);
+        assert_ne!(conn.remote_address(), old);
+        let mut t = now;
+        for _ in 0..3 {
+            t += Duration::from_secs(2);
+            conn.handle_timeout(t);
+            drain_to(&mut conn, t);
+        }
+        assert_eq!(conn.remote_address(), old, "client did not return to its old path");
+        assert_eq!(conn.rem_cid, old_cid);
+        assert!(conn.probe.is_none());
     }
 }
