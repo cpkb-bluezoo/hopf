@@ -12,8 +12,7 @@ mod server;
 pub use client::{ClientHandler, ClientHandlerFactory, ClientWriter};
 pub use server::{
     ConnectionInfo, ProtocolUpgradeHandler, ServerHandler, ServerHandlerFactory,
-    ServerResponseHandle, ServerWriter,
-};
+    ServerResponseHandle, ServerWriter, DiscardingWriter};
 pub(crate) use server::ResponseControl;
 
 /// How this peer participates in an HTTP request/response exchange.

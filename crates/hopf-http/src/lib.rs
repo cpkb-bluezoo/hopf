@@ -95,8 +95,8 @@ pub use priority::{
 };
 pub use status::reason_phrase;
 pub use stream::{
-    ClientHandler, ClientHandlerFactory, ClientWriter, ConnectionInfo, HttpRole, HttpStream,
-    ProtocolUpgradeHandler, ServerHandler, ServerHandlerFactory, ServerResponseHandle,
+    ClientHandler, ClientHandlerFactory, ClientWriter, ConnectionInfo, DiscardingWriter, HttpRole,
+    HttpStream, ProtocolUpgradeHandler, ServerHandler, ServerHandlerFactory, ServerResponseHandle,
     ServerWriter,
 };
 pub use utils::{

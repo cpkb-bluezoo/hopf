@@ -224,6 +224,32 @@ impl<H: GrpcEventHandler> GrpcFrameParser<H> {
         self.handler
     }
 
+    /// Parses `data` up to and including the end of the next complete
+    /// frame and returns how many bytes were consumed; what follows belongs
+    /// to the next frame. For callers that handle one message at a time.
+    pub fn receive_until_frame(&mut self, data: &[u8]) -> usize {
+        let total = data.len();
+        let mut rest = data;
+        loop {
+            match self.state {
+                State::Header => {
+                    if !self.process_header(&mut rest) {
+                        return total - rest.len();
+                    }
+                }
+                State::Payload => {
+                    self.process_payload(&mut rest);
+                    if self.state == State::Header {
+                        return total - rest.len();
+                    }
+                }
+            }
+            if rest.is_empty() && !(self.state == State::Payload && self.payload_remaining == 0) {
+                return total;
+            }
+        }
+    }
+
     /// Parses as many complete frames as possible from `data`.
     pub fn receive(&mut self, mut data: &[u8]) {
         // A zero-length frame is complete as soon as its header is: keep

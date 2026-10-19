@@ -70,6 +70,10 @@ impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
         self.handler
     }
 
+    pub fn handler_mut(&mut self) -> &mut H {
+        &mut self.handler
+    }
+
     pub fn start_root_message(&mut self, message_type_name: &str) -> Result<(), ProtoParseError> {
         if self.root_started {
             panic!("Root message already started");
@@ -89,6 +93,9 @@ impl<H: ProtoMessageHandler> JsonModelAdapter<H> {
             self.message_stack.pop_front();
             self.handler.end_message()?;
         }
+        // A further root message (the next one of a stream) may follow.
+        self.root_started = false;
+        self.root_object_open = false;
         Ok(())
     }
 

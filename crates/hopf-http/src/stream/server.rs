@@ -125,6 +125,59 @@ pub(crate) trait ResponseControl: Send + Sync {
     fn resume_request_body(&self);
 }
 
+/// [`ResponseControl`] for a [`ServerResponseHandle::detached`] handle.
+struct DetachedControl {
+    conn: ConnHandle,
+}
+
+impl ResponseControl for DetachedControl {
+    fn conn_handle(&self) -> ConnHandle {
+        self.conn.clone()
+    }
+
+    fn execute(&self, f: WriterTask) {
+        let conn = self.conn.clone();
+        self.conn.execute(Box::new(move || {
+            let mut writer = DiscardingWriter { conn };
+            f(&mut writer);
+        }));
+    }
+
+    fn pause_request_body(&self) {}
+
+    fn resume_request_body(&self) {}
+}
+
+/// A [`ServerWriter`] that accepts and discards everything: what a deferred
+/// task writes into once its stream has gone away, and a stand-in for
+/// tests.
+pub struct DiscardingWriter {
+    conn: ConnHandle,
+}
+
+impl DiscardingWriter {
+    /// A discarding writer whose deferred tasks run on `conn`.
+    pub fn new(conn: ConnHandle) -> Self {
+        Self { conn }
+    }
+}
+
+impl ServerWriter for DiscardingWriter {
+    fn headers(&mut self, _headers: Headers) {}
+    fn start_response_body(&mut self) {}
+    fn response_body_content(&mut self, _data: &[u8]) {}
+    fn end_response_body(&mut self) {}
+    fn complete(&mut self) {}
+    fn conn_handle(&self) -> ConnHandle {
+        self.conn.clone()
+    }
+    fn response_handle(&self) -> ServerResponseHandle {
+        ServerResponseHandle::detached(self.conn.clone())
+    }
+    fn pause_request_body(&mut self) {}
+    fn resume_request_body(&mut self) {}
+}
+
 /// Cloneable handle to finish this Stream's response after offload.
 ///
 /// Obtain via [`ServerWriter::response_handle`]. Framing and flush stay inside
@@ -139,6 +192,13 @@ impl ServerResponseHandle {
     pub(crate) fn new(control: Arc<dyn ResponseControl>) -> Self {
         let conn = control.conn_handle();
         Self { conn, control }
+    }
+
+    /// A handle bound to no transport: deferred tasks run on `conn` against
+    /// a [`DiscardingWriter`], and pausing has no effect. For a stream that
+    /// has gone away, and for tests of code that holds a handle.
+    pub fn detached(conn: ConnHandle) -> Self {
+        Self::new(Arc::new(DetachedControl { conn }))
     }
 
     pub(crate) fn control(&self) -> &Arc<dyn ResponseControl> {

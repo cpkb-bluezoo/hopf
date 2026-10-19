@@ -78,6 +78,8 @@ impl<H: ProtoMessageHandler> ProtoModelAdapter<H> {
             self.message_stack.pop_front();
             self.handler.end_message()?;
         }
+        // A further root message (the next one of a stream) may follow.
+        self.root_started = false;
         Ok(())
     }
 
