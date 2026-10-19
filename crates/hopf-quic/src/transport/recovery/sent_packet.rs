@@ -80,6 +80,13 @@ pub enum RecoverableFrame {
         /// Application error code.
         error_code: u64,
     },
+    /// An ACK frame we sent, noting its Largest Acknowledged: once the peer
+    /// acknowledges this packet, received packets up to there need no
+    /// further acknowledging (RFC 9000 section 13.2.4). Never resent.
+    Ack {
+        /// Largest Acknowledged in the frame.
+        largest: u64,
+    },
 }
 
 /// A tracked outstanding (sent, not yet acknowledged or declared lost) packet.

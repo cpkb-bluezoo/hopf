@@ -29,11 +29,26 @@ pub fn stream(out: &mut Vec<u8>, id: StreamId, offset: u64, data: &[u8], fin: bo
 
 /// Encode a single-range ACK for `pn`.
 pub fn ack_single(out: &mut Vec<u8>, pn: u64) {
+    ack(out, 0, &[(pn, pn)]);
+}
+
+/// Encode an ACK (RFC 9000 section 19.3) over `ranges`, each `(low, high)`
+/// inclusive, in descending order with the largest first, and the given
+/// already-scaled ACK Delay. `ranges` must not be empty.
+pub fn ack(out: &mut Vec<u8>, delay: u64, ranges: &[(u64, u64)]) {
+    let (first_low, largest) = ranges[0];
     varint::encode(ty::ACK, out);
-    varint::encode(pn, out); // largest
-    varint::encode(0, out); // delay
-    varint::encode(0, out); // ACK Range Count
-    varint::encode(0, out); // First ACK Range (just `pn`)
+    varint::encode(largest, out);
+    varint::encode(delay, out);
+    varint::encode(ranges.len() as u64 - 1, out);
+    varint::encode(largest - first_low, out);
+    let mut prev_low = first_low;
+    for &(low, high) in &ranges[1..] {
+        // Gap: packets between this range and the previous one, minus 2.
+        varint::encode(prev_low - high - 2, out);
+        varint::encode(high - low, out);
+        prev_low = low;
+    }
 }
 
 /// Encode HANDSHAKE_DONE.

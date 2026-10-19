@@ -71,7 +71,13 @@ struct Space {
     crypto_pending: VecDeque<Bytes>,
     /// Lost CRYPTO chunks to resend at their original offsets (before new data).
     crypto_retransmit: VecDeque<(u64, Bytes)>,
+    /// Ack-eliciting packets received since the last ACK was sent.
     pending_ack: HashSet<u64>,
+    /// Packet numbers received and still to be reported in ACK frames, as
+    /// `(low, high)` inclusive ranges in ascending order.
+    received: Vec<(u64, u64)>,
+    /// When the largest received packet arrived (for the ACK Delay field).
+    largest_received_at: Option<Instant>,
 }
 
 impl Space {
@@ -87,6 +93,39 @@ impl Space {
             crypto_pending: VecDeque::new(),
             crypto_retransmit: VecDeque::new(),
             pending_ack: HashSet::new(),
+            received: Vec::new(),
+            largest_received_at: None,
+        }
+    }
+
+    /// Record a received packet number in the ACK ranges.
+    fn note_received(&mut self, pn: u64) {
+        let r = &mut self.received;
+        let pos = r.partition_point(|&(_, high)| high < pn);
+        if pos < r.len() && r[pos].0 <= pn {
+            return; // already tracked
+        }
+        let joins_prev = pos > 0 && r[pos - 1].1 + 1 == pn;
+        let joins_next = pos < r.len() && r[pos].0 == pn + 1;
+        match (joins_prev, joins_next) {
+            (true, true) => {
+                r[pos - 1].1 = r[pos].1;
+                r.remove(pos);
+            }
+            (true, false) => r[pos - 1].1 = pn,
+            (false, true) => r[pos].0 = pn,
+            (false, false) => r.insert(pos, (pn, pn)),
+        }
+    }
+
+    /// Stop tracking received packets at or below `largest` (RFC 9000
+    /// section 13.2.4): the peer has acknowledged an ACK that covered them.
+    fn forget_received_up_to(&mut self, largest: u64) {
+        self.received.retain(|&(_, high)| high > largest);
+        if let Some(first) = self.received.first_mut() {
+            if first.0 <= largest {
+                first.0 = largest + 1;
+            }
         }
     }
 
@@ -951,6 +990,7 @@ impl Connection {
             self.rem_cid.as_slice(),
         ));
         self.spaces[0].pending_ack.clear();
+        self.spaces[0].received.clear();
         self.transmits.clear();
 
         // RFC 9000 section 17.2.5.2: the server discarded the 0-RTT packets
@@ -1010,11 +1050,11 @@ impl Connection {
     fn on_decrypted(&mut self, space: SpaceId, pn: u64, payload: &[u8], now: Instant) {
         {
             let sp = self.space_mut(space);
-            sp.largest_received = Some(
-                sp.largest_received
-                    .map(|l| l.max(pn))
-                    .unwrap_or(pn),
-            );
+            if sp.largest_received.is_none_or(|l| pn > l) {
+                sp.largest_received = Some(pn);
+                sp.largest_received_at = Some(now);
+            }
+            sp.note_received(pn);
         }
         // RFC 9000 section 12.4: a malformed frame, or a type this
         // endpoint does not know, is a FRAME_ENCODING_ERROR.
@@ -1051,8 +1091,11 @@ impl Connection {
                     sp.largest_acked =
                         Some(sp.largest_acked.map(|a| a.max(largest)).unwrap_or(largest));
                 }
-                // ACK Delay is in microseconds × 2^ack_delay_exponent (default 3).
-                let ack_delay = Duration::from_micros(delay.saturating_mul(8));
+                // ACK Delay is in microseconds × 2^ack_delay_exponent, the
+                // exponent being the peer's (RFC 9000 section 18.2; 3 if
+                // not yet known).
+                let exponent = self.peer_tp.as_ref().map_or(3, |t| t.ack_delay_exponent.min(20));
+                let ack_delay = Duration::from_micros(delay.saturating_mul(1 << exponent));
                 let peer_validated = self.peer_address_validated();
                 let max_ack_delay = self.peer_max_ack_delay();
                 let result = self.loss.on_ack_received(
@@ -1068,7 +1111,7 @@ impl Connection {
                     self.requeue_lost_packet(space, &lost);
                 }
                 for acked in &result.newly_acked {
-                    self.note_acknowledged_frames(acked);
+                    self.note_acknowledged_frames(space, acked);
                 }
                 self.release_retiring();
             }
@@ -1492,18 +1535,26 @@ impl Connection {
         sp.crypto_pending.push_back(data);
     }
 
+    /// Acknowledge what has arrived in `space` (RFC 9000 section 13.2):
+    /// every received packet still tracked, as ranges, with the delay
+    /// since the largest arrived, scaled by our ack_delay_exponent.
     fn queue_acks(&mut self, space: SpaceId, now: Instant) {
-        let pns: Vec<u64> = self.space(space).pending_ack.iter().copied().collect();
-        if pns.is_empty() {
+        let sp = self.space_mut(space);
+        if sp.pending_ack.is_empty() || sp.received.is_empty() {
             return;
         }
-        self.space_mut(space).pending_ack.clear();
-        // One ACK per largest PN (sufficient for echo).
-        let largest = pns.into_iter().max().unwrap();
+        sp.pending_ack.clear();
+        let ranges: Vec<(u64, u64)> = sp.received.iter().rev().copied().collect();
+        let largest = ranges[0].1;
+        let delay_us = sp
+            .largest_received_at
+            .map_or(0, |t| now.saturating_duration_since(t).as_micros() as u64);
+        let delay = delay_us >> self.local_tp.ack_delay_exponent.min(20);
         let mut payload = Vec::new();
-        writer::ack_single(&mut payload, largest);
-        // ACK-only: not ack-eliciting, not in flight.
-        self.queue_packet(space, payload, Vec::new(), false, false, now);
+        writer::ack(&mut payload, delay, &ranges);
+        // ACK-only: not ack-eliciting, not in flight. The marker lets an
+        // acknowledgement of this packet prune the ranges it reported.
+        self.queue_packet(space, payload, vec![RecoverableFrame::Ack { largest }], false, false, now);
     }
 
     fn flush_pending_packets(&mut self, now: Instant) {
@@ -1956,9 +2007,12 @@ impl Connection {
 
     /// Record what an acknowledged packet settled: a FIN or RESET_STREAM
     /// the peer now has.
-    fn note_acknowledged_frames(&mut self, packet: &crate::transport::recovery::SentPacket) {
+    fn note_acknowledged_frames(&mut self, space: SpaceId, packet: &crate::transport::recovery::SentPacket) {
         for frame in &packet.frames {
             match frame {
+                RecoverableFrame::Ack { largest } => {
+                    self.space_mut(space).forget_received_up_to(*largest);
+                }
                 RecoverableFrame::Stream { id, fin: true, .. } => {
                     if let Some(st) = self.streams.get_mut(id) {
                         st.send.fin_acked = true;
@@ -2309,6 +2363,10 @@ self.version,
                         }
                     }
                 }
+                RecoverableFrame::Ack { .. } => {
+                    // A lost ACK is not resent: the next one reports the
+                    // same ranges.
+                }
             }
         }
     }
@@ -2369,6 +2427,7 @@ self.version,
                         }
                     }
                 }
+                RecoverableFrame::Ack { .. } => {}
             }
         }
         // Ahead of other lost CRYPTO, in their original order.
@@ -4619,5 +4678,110 @@ mod tests {
         conn.handle_frame(SpaceId::Data, Frame::Stream { id: peer, offset: 0, data: Bytes::from_static(b"hi"), fin: true }, now);
         assert!(conn.streams.is_empty(), "a late peer frame recreated the stream");
         assert_eq!(closed_with(&mut conn), None);
+    }
+
+    /// RFC 9000 section 13.2.3: an ACK frame reports every received packet
+    /// still being tracked, as ranges. Regression: every ACK carried only
+    /// the largest packet number, so any reordering on the path made the
+    /// peer treat the lower packets as lost and retransmit them.
+    #[test]
+    fn ack_frames_carry_every_received_range() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        for pn in [1u64, 2, 4, 5, 7] {
+            conn.on_decrypted(SpaceId::Data, pn, &ping, now);
+        }
+        let out = drain_frames(&mut conn, now);
+        let last_ack = out
+            .iter()
+            .flat_map(|(_, frames)| frames.iter())
+            .filter_map(|f| match f {
+                Frame::Ack { largest, ranges, .. } => Some((*largest, ranges.clone())),
+                _ => None,
+            })
+            .last()
+            .expect("an ACK");
+        assert_eq!(last_ack.0, 7);
+        assert_eq!(last_ack.1, vec![(7, 7), (4, 5), (1, 2)], "ranges: {out:?}");
+    }
+
+    /// RFC 9000 section 18.2: the peer's ACK Delay is scaled by its own
+    /// ack_delay_exponent, not a fixed 3. Observed through the RTT
+    /// estimate: the second sample is adjusted by the decoded delay.
+    #[test]
+    fn peer_ack_delay_is_decoded_with_its_ack_delay_exponent() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.peer_tp = Some(TransportParameters { ack_delay_exponent: 5, ..Default::default() });
+        let id = conn.open_bi().expect("stream");
+        conn.write_stream(id, b"one").unwrap();
+        drain_frames(&mut conn, now);
+        conn.handle_frame(SpaceId::Data, Frame::Ack { largest: 0, delay: 0, ranges: vec![(0, 0)] }, now + Duration::from_millis(100));
+        let t1 = now + Duration::from_millis(100);
+        conn.write_stream(id, b"two").unwrap();
+        drain_frames(&mut conn, t1);
+        // A delay field of 1000: 32 ms at exponent 5, 8 ms at exponent 3.
+        conn.handle_frame(SpaceId::Data, Frame::Ack { largest: 1, delay: 1000, ranges: vec![(1, 1)] }, t1 + Duration::from_millis(200));
+        assert_eq!(conn.loss.rtt().smoothed_rtt(), Duration::from_millis(108), "latest 200 ms less a 32 ms ack delay, smoothed from 100 ms");
+    }
+
+    /// RFC 9000 section 13.2.4: once the peer acknowledges a packet that
+    /// carried one of our ACKs, the packets that ACK covered are no longer
+    /// reported; later ones still are.
+    #[test]
+    fn acknowledged_acks_prune_the_reported_ranges() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        for pn in [1u64, 2, 4] {
+            conn.on_decrypted(SpaceId::Data, pn, &ping, now);
+        }
+        drain_frames(&mut conn, now);
+        // The peer acknowledges every packet we sent so far: our ACKs.
+        ack_everything(&mut conn, now);
+        conn.on_decrypted(SpaceId::Data, 7, &ping, now);
+        let out = drain_frames(&mut conn, now);
+        let ranges = out
+            .iter()
+            .flat_map(|(_, frames)| frames.iter())
+            .find_map(|f| match f {
+                Frame::Ack { ranges, .. } => Some(ranges.clone()),
+                _ => None,
+            })
+            .expect("an ACK");
+        assert_eq!(ranges, vec![(7, 7)], "{out:?}");
+    }
+
+    /// RFC 9000 section 19.3: ACK Delay is the time since the largest
+    /// acknowledged packet arrived, scaled by our ack_delay_exponent (3).
+    #[test]
+    fn ack_delay_reports_the_time_since_the_largest_packet_arrived() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        conn.space_mut(SpaceId::Data).pending_ack.clear();
+        conn.on_decrypted(SpaceId::Data, 3, &ping, now);
+        // Already queued at `now` with no delay; a second packet 40 ms on is
+        // acknowledged 8 ms after it arrived.
+        drain_frames(&mut conn, now);
+        let t1 = now + Duration::from_millis(40);
+        conn.on_decrypted(SpaceId::Data, 4, &ping, t1);
+        conn.transmits.clear();
+        conn.space_mut(SpaceId::Data).pending_ack.insert(4);
+        conn.queue_acks(SpaceId::Data, t1 + Duration::from_millis(8));
+        let out = drain_frames(&mut conn, t1);
+        let delay = out
+            .iter()
+            .flat_map(|(_, frames)| frames.iter())
+            .find_map(|f| match f {
+                Frame::Ack { largest: 4, delay, .. } => Some(*delay),
+                _ => None,
+            })
+            .expect("an ACK");
+        assert_eq!(delay, 8000 >> 3, "{out:?}");
     }
 }

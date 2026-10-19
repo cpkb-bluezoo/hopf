@@ -483,6 +483,20 @@ mod tests {
         assert!(parse_all(&buf).is_err(), "zero-length id");
     }
 
+    /// A multi-range ACK encodes gaps and lengths as RFC 9000 section 19.3
+    /// defines them and decodes back to the same ranges.
+    #[test]
+    fn multi_range_ack_round_trips() {
+        let mut buf = Vec::new();
+        writer::ack(&mut buf, 5, &[(7, 7), (4, 5), (1, 2)]);
+        let frames = parse_all(&buf).unwrap();
+        assert!(matches!(&frames[0], Frame::Ack { largest: 7, delay: 5, ranges } if *ranges == vec![(7, 7), (4, 5), (1, 2)]));
+        let mut buf = Vec::new();
+        writer::ack(&mut buf, 0, &[(10, 12)]);
+        let frames = parse_all(&buf).unwrap();
+        assert!(matches!(&frames[0], Frame::Ack { largest: 12, ranges, .. } if *ranges == vec![(10, 12)]));
+    }
+
     #[test]
     fn crypto_round_trip() {
         let mut buf = Vec::new();

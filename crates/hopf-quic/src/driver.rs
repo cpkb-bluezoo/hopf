@@ -873,8 +873,6 @@ impl Driver {
             self.sync_udp_interest(poll)?;
             self.flush_all_transmits()?;
             self.sync_udp_interest(poll)?;
-            self.drain_cmds();
-            self.fire_timers();
 
             if self.shutting_down {
                 break;
@@ -897,6 +895,16 @@ impl Driver {
                     _ => {}
                 }
             }
+
+            // Commands (a datagram delivered through a path, a stream
+            // write or close, a shutdown) are drained here, after the
+            // poll their wake returned from, so that the packets and
+            // stream events they produce are flushed and serviced below
+            // in this same pass. Draining them before the poll left that
+            // work waiting for the next wake or timer, which for a path
+            // transport with nothing else in flight was a probe timeout.
+            self.drain_cmds();
+            self.fire_timers();
 
             self.handle_timeouts(now);
             self.poll_connections(now)?;
@@ -2944,6 +2952,7 @@ mod tests {
         .unwrap();
         *client_handle_cell.lock().unwrap() = Some(client);
 
+        let started = Instant::now();
         for _ in 0..200 {
             if got.lock().unwrap().as_slice() == b"ping" {
                 break;
@@ -2951,6 +2960,13 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(got.lock().unwrap().as_slice(), b"ping");
+        // Regression: datagrams delivered through a path were processed
+        // before the driver polled, but the packets and stream events they
+        // produced were only flushed and serviced after the poll returned,
+        // so every step of the exchange waited for a probe timeout (about
+        // a second each) instead of going out at once.
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(900), "echo over the path took {elapsed:?}: a probe timeout was waited for");
 
         server_handle_cell.lock().unwrap().take().unwrap().shutdown();
     }
