@@ -1,6 +1,6 @@
 # hopf-grpc
 
-Unary gRPC over Hopf HTTP Streams: length-prefixed framing, runtime
+Unary and streaming gRPC over Hopf HTTP Streams: length-prefixed framing, runtime
 `.proto` model (`ProtoFile`), schema-aware push events via `rprotobuf`, and
 `ServerHandler` / client bindings.
 

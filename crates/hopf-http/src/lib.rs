@@ -95,9 +95,9 @@ pub use priority::{
 };
 pub use status::reason_phrase;
 pub use stream::{
-    ClientHandler, ClientHandlerFactory, ClientWriter, ConnectionInfo, DiscardingWriter, HttpRole,
-    HttpStream, ProtocolUpgradeHandler, ServerHandler, ServerHandlerFactory, ServerResponseHandle,
-    ServerWriter,
+    ClientHandler, ClientHandlerFactory, ClientRequestHandle, ClientWriter, ClientWriterTask,
+    ConnectionInfo, DiscardingClientWriter, DiscardingWriter, HttpRole, HttpStream,
+    ProtocolUpgradeHandler, ServerHandler, ServerHandlerFactory, ServerResponseHandle, ServerWriter,
 };
 pub use utils::{
     format_http_date, http_date_now, is_chunked_te, is_default_method, is_invalid_te, is_token,

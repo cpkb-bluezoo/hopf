@@ -76,7 +76,7 @@
     <main class="main">
       <header>
         <h1>gRPC</h1>
-        <p class="lead">Crate <code>hopf-grpc</code>: <strong>unary</strong> gRPC over <a href="http/overview.html"><code>hopf-http</code></a> Streams. Uses a <strong>runtime <code>.proto</code> model</strong> (<code>rprotobuf</code>) — no generated stubs or codegen. Works wherever Hopf Streams run (HTTP/2 preferred; H1/H3 inherit Stream framing, with H1 trailer caveats).</p>
+        <p class="lead">Crate <code>hopf-grpc</code>: <strong>unary and streaming</strong> gRPC over <a href="http/overview.html"><code>hopf-http</code></a> Streams. Uses a <strong>runtime <code>.proto</code> model</strong> (<code>rprotobuf</code>) - no generated stubs or codegen. Works wherever Hopf Streams run (HTTP/2 preferred; H1/H3 inherit Stream framing, with H1 trailer caveats).</p>
       </header>
       <p><code>#![forbid(unsafe_code)]</code>.</p>
 <div class="toc"><h2 id="contents">Contents</h2>
@@ -145,7 +145,7 @@ GrpcHandlerFactory  (ServerHandlerFactory)
 GrpcService::start_unary_call → ProtoMessageHandler
     │
     └── GrpcResponseChannel → framed response + grpc-status trailers</code></pre>
-<p>Client path: <code>GrpcClient::unary_call</code> → <code>GrpcUnaryCall</code> as <code>ClientHandlerFactory</code> for an HTTP client endpoint.</p>
+<p>Client path: <code>GrpcClient::unary_call</code> → <code>GrpcUnaryCall</code> as <code>ClientHandlerFactory</code> for an HTTP client endpoint. For a streaming method, <code>GrpcClient::streaming_call</code> returns the factory and a <code>GrpcClientCall</code> whose <code>send</code> / <code>half_close</code> / <code>cancel</code> drive the request side from any thread; each response message arrives through <code>GrpcResponseHandler::start_message</code>, and <code>on_complete</code> reports the call's final status once.</p>
 <h2 id="framing">Framing</h2>
 <table>
 <thead>
@@ -293,7 +293,11 @@ GrpcService::start_unary_call → ProtoMessageHandler
 </tr>
 <tr>
 <td><code>GrpcUnaryCall</code></td>
-<td><code>ClientHandlerFactory</code> for one call</td>
+<td><code>ClientHandlerFactory</code> for one unary call</td>
+</tr>
+<tr>
+<td><code>GrpcStreamingCall</code> / <code>GrpcClientCall</code></td>
+<td><code>ClientHandlerFactory</code> for one streaming call, and the handle that sends its request messages</td>
 </tr>
 <tr>
 <td><code>GrpcResponseHandler</code></td>
@@ -380,7 +384,6 @@ GrpcService::start_unary_call → ProtoMessageHandler
 <p>No environment variables.</p>
 <h2 id="limitations">Limitations</h2>
 <ul>
-<li><strong>Unary RPC only</strong> — no client / server / bidirectional streaming.</li>
 <li><strong>No message compression</strong> — compressed frames rejected.</li>
 <li><strong>No generated stubs</strong> — runtime <code>.proto</code> model only.</li>
 <li>H1 trailer support is limited (inherited from <code>hopf-http</code>); prefer H2/H3.</li>

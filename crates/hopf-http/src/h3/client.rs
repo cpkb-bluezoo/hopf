@@ -13,7 +13,8 @@ use hopf_quic::{
 };
 
 use crate::{
-    ClientHandler, ClientHandlerFactory, ClientWriter, Headers, HttpLimits, ProtocolUpgradeHandler,
+    ClientHandler, ClientHandlerFactory, ClientRequestHandle, ClientWriter, ClientWriterTask,
+    Headers, HttpLimits, ProtocolUpgradeHandler,
 };
 
 use super::endpoint::{decode_h3_datagram, H3PeerState, H3UniStream};
@@ -218,6 +219,8 @@ struct H3ClientWriter {
     body: Vec<u8>,
     trailers: Option<Headers>,
     done: bool,
+    /// Request side for writes after `start` (see [`ClientRequestHandle`]).
+    control: Arc<H3ClientRequestControl>,
 }
 
 /// Outbound request held while waiting for peer SETTINGS so Extended
@@ -240,13 +243,89 @@ fn is_extended_connect(headers: &Headers) -> bool {
 const EXTENDED_CONNECT_NOT_ENABLED: &str =
     "peer does not support Extended CONNECT (RFC 9220): SETTINGS_ENABLE_CONNECT_PROTOCOL was not advertised";
 
+/// Shared state of one request's side for writes made after
+/// [`ClientHandler::start`] through a [`ClientRequestHandle`], applied by
+/// the stream when the connection is next poked.
+struct H3ClientRequestControl {
+    conn: Mutex<hopf_core::ConnHandle>,
+    shared: Mutex<H3ClientRequestShared>,
+}
+
+#[derive(Default)]
+struct H3ClientRequestShared {
+    body: Vec<u8>,
+    end: bool,
+    cancel: bool,
+}
+
+impl H3ClientRequestControl {
+    fn new(conn: hopf_core::ConnHandle) -> Arc<Self> {
+        Arc::new(Self {
+            conn: Mutex::new(conn),
+            shared: Mutex::new(H3ClientRequestShared::default()),
+        })
+    }
+
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        self.conn.lock().unwrap().clone()
+    }
+
+    fn handle(self: &Arc<Self>) -> ClientRequestHandle {
+        let control = Arc::clone(self);
+        ClientRequestHandle::from_runner(
+            self.conn_handle(),
+            Arc::new(move |task: ClientWriterTask| {
+                let control = Arc::clone(&control);
+                let conn = control.conn_handle();
+                conn.execute(Box::new(move || {
+                    let mut writer = H3ClientSessionWriter { control: Arc::clone(&control) };
+                    task(&mut writer);
+                    control.conn_handle().poke();
+                }));
+            }),
+        )
+    }
+}
+
+/// The writer a deferred request task gets.
+struct H3ClientSessionWriter {
+    control: Arc<H3ClientRequestControl>,
+}
+
+impl ClientWriter for H3ClientSessionWriter {
+    fn headers(&mut self, _: Headers) {}
+    fn start_request_body(&mut self) {}
+    fn request_body_content(&mut self, data: &[u8]) {
+        self.control.shared.lock().unwrap().body.extend_from_slice(data);
+    }
+    fn end_request_body(&mut self) {
+        self.control.shared.lock().unwrap().end = true;
+    }
+    fn complete_request(&mut self) {
+        self.control.shared.lock().unwrap().end = true;
+    }
+    fn cancel(&mut self) {
+        self.control.shared.lock().unwrap().cancel = true;
+    }
+    fn version(&self) -> crate::version::HttpVersion {
+        crate::version::HttpVersion::Http3
+    }
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        self.control.conn_handle()
+    }
+    fn request_handle(&self) -> ClientRequestHandle {
+        self.control.handle()
+    }
+}
+
 impl H3ClientWriter {
-    fn new() -> Self {
+    fn new(control: Arc<H3ClientRequestControl>) -> Self {
         Self {
             request_headers: None,
             body: Vec::new(),
             trailers: None,
             done: false,
+            control,
         }
     }
 }
@@ -294,9 +373,11 @@ impl ClientWriter for H3ClientWriter {
     }
 
     fn conn_handle(&self) -> hopf_core::ConnHandle {
-        // `start()` never needs a working cross-thread handle — see
-        // `ClientWriter::conn_handle`'s own doc comment.
-        hopf_core::ConnHandle::from_execute(Arc::new(|task| task()))
+        self.control.conn_handle()
+    }
+
+    fn request_handle(&self) -> ClientRequestHandle {
+        self.control.handle()
     }
 }
 
@@ -434,6 +515,8 @@ struct H3ClientStream {
     /// See [`ClientWriter::conn_handle`] — a synchronous no-op handle until
     /// [`ProtocolHandler::connected`] binds the real one.
     conn: hopf_core::ConnHandle,
+    /// Request side for writes after `start`, once the request started.
+    request_control: Option<Arc<H3ClientRequestControl>>,
 }
 
 impl H3ClientStream {
@@ -467,7 +550,34 @@ impl H3ClientStream {
             capsule_mode: false,
             capsule_parser: crate::capsule::CapsuleParser::new(),
             conn: hopf_core::ConnHandle::from_execute(Arc::new(|task| task())),
+            request_control: None,
         }
+    }
+
+    /// Apply what a deferred task wrote to the request through its
+    /// [`ClientRequestHandle`]: send the body, end the stream, or reset it.
+    fn flush_deferred_request_writes(&mut self, endpoint: &mut dyn Endpoint) -> bool {
+        let Some(control) = self.request_control.as_ref() else {
+            return false;
+        };
+        let (body, end, cancel) = {
+            let mut shared = control.shared.lock().unwrap();
+            (std::mem::take(&mut shared.body), std::mem::take(&mut shared.end), shared.cancel)
+        };
+        if cancel {
+            self.request_control = None;
+            endpoint.abort(frame::H3_REQUEST_CANCELLED);
+            return true;
+        }
+        if !body.is_empty() {
+            let mut framed = Vec::with_capacity(body.len() + 8);
+            frame::write_data(&mut framed, &body);
+            endpoint.send(&framed);
+        }
+        if end {
+            endpoint.close();
+        }
+        false
     }
 
     fn emit_request(&mut self, endpoint: &mut dyn Endpoint, pending: &PendingOutbound) {
@@ -601,8 +711,10 @@ impl H3ClientStream {
         }
 
         let mut handler = self.factory.create_handler();
-        let mut writer = H3ClientWriter::new();
+        let control = H3ClientRequestControl::new(self.conn.clone());
+        let mut writer = H3ClientWriter::new(Arc::clone(&control));
         handler.start(&mut writer);
+        self.request_control = Some(control);
 
         let pending = PendingOutbound {
             headers: writer.request_headers.take().unwrap_or_default(),
@@ -905,6 +1017,10 @@ impl ProtocolHandler for H3ClientStream {
         if !self.started {
             self.start_request(endpoint);
         }
+        if self.flush_deferred_request_writes(endpoint) {
+            *data = &[];
+            return;
+        }
         let mut parser = std::mem::take(&mut self.parser);
         parser.push(data, self);
         self.parser = parser;
@@ -1168,7 +1284,9 @@ mod status_validation_tests {
     /// it with either.
     #[test]
     fn writer_strips_connection_specific_headers() {
-        let mut writer = H3ClientWriter::new();
+        let mut writer = H3ClientWriter::new(H3ClientRequestControl::new(
+            hopf_core::ConnHandle::from_execute(Arc::new(|task| task())),
+        ));
         let mut h = Headers::new();
         h.set(":method", "GET");
         h.set(":path", "/");
@@ -1650,6 +1768,87 @@ mod status_validation_tests {
         assert!(!ep.sent.is_empty());
         assert_eq!(*failed.lock().unwrap(), 0);
         assert!(stream.started);
+    }
+
+    /// Starts a request whose body stays open and parks the request handle
+    /// for the test to write through after `start` returned.
+    struct ParkingFactory {
+        slot: Arc<Mutex<Option<ClientRequestHandle>>>,
+    }
+    impl ClientHandlerFactory for ParkingFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            Box::new(ParkingHandler { slot: Arc::clone(&self.slot) })
+        }
+    }
+    struct ParkingHandler {
+        slot: Arc<Mutex<Option<ClientRequestHandle>>>,
+    }
+    impl ClientHandler for ParkingHandler {
+        fn start(&mut self, request: &mut dyn ClientWriter) {
+            let mut h = Headers::new();
+            h.set(":method", "POST");
+            h.set(":path", "/");
+            h.set(":scheme", "https");
+            h.set(":authority", "example.test");
+            request.headers(h);
+            request.start_request_body();
+            *self.slot.lock().unwrap() = Some(request.request_handle());
+        }
+        fn response_headers(&mut self, _: &mut dyn ClientWriter, _: &Headers) {}
+        fn response_complete(&mut self, _: &mut dyn ClientWriter) {}
+    }
+
+    fn started_stream() -> (H3ClientStream, RecordingEndpoint, ClientRequestHandle) {
+        let slot = Arc::new(Mutex::new(None));
+        let factory: Arc<dyn ClientHandlerFactory> =
+            Arc::new(ParkingFactory { slot: Arc::clone(&slot) });
+        let mut stream = H3ClientStream::new(
+            factory,
+            HttpLimits::default(),
+            0,
+            Arc::new(qpack::H3Qpack::new()),
+            Arc::new(Mutex::new(H3PeerState::default())),
+        );
+        let mut ep = RecordingEndpoint::default();
+        stream.start_request(&mut ep);
+        let handle = slot.lock().unwrap().take().expect("start parked the request handle");
+        assert!(!ep.closed, "the body is still open");
+        ep.sent.clear();
+        (stream, ep, handle)
+    }
+
+    #[test]
+    fn body_written_through_the_handle_goes_out_when_the_stream_is_poked() {
+        let (mut stream, mut ep, handle) = started_stream();
+
+        handle.execute(|w| {
+            w.request_body_content(b"hello");
+            w.end_request_body();
+            w.complete_request();
+        });
+        assert!(ep.sent.is_empty(), "nothing goes out until the stream runs");
+
+        stream.receive(&mut ep, &mut &[][..]);
+
+        let mut expected = Vec::new();
+        frame::write_data(&mut expected, b"hello");
+        assert_eq!(ep.sent, expected, "one DATA frame");
+        assert!(ep.closed, "the end of the body closes the stream's send side");
+        assert_eq!(ep.abort_code, None);
+    }
+
+    #[test]
+    fn cancel_through_the_handle_aborts_the_stream() {
+        let (mut stream, mut ep, handle) = started_stream();
+
+        handle.execute(|w| {
+            w.request_body_content(b"never sent");
+            w.cancel();
+        });
+        stream.receive(&mut ep, &mut &[][..]);
+
+        assert!(ep.sent.is_empty(), "{:?}", ep.sent);
+        assert_eq!(ep.abort_code, Some(frame::H3_REQUEST_CANCELLED));
     }
 }
 

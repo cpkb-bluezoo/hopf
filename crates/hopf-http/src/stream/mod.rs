@@ -9,7 +9,7 @@
 mod client;
 mod server;
 
-pub use client::{ClientHandler, ClientHandlerFactory, ClientWriter};
+pub use client::{ClientHandler, ClientHandlerFactory, ClientWriter, ClientRequestHandle, ClientWriterTask, DiscardingClientWriter};
 pub use server::{
     ConnectionInfo, ProtocolUpgradeHandler, ServerHandler, ServerHandlerFactory,
     ServerResponseHandle, ServerWriter, DiscardingWriter};

@@ -11,6 +11,7 @@ use rprotobuf::Parser as ProtoParser;
 use crate::codec::{parse_grpc_content_type, GrpcCodec};
 use crate::compression::{
     accept_encoding_header, compress, MessageAccum, MessageCoding, DEFAULT_ENCODINGS,
+    GRPC_STATUS_INTERNAL,
 };
 use crate::framing::{frame, frame_compressed, GrpcFrameParser};
 use crate::proto::{
@@ -25,6 +26,105 @@ pub trait GrpcResponseHandler: Send {
     fn on_error(&mut self, error: &str);
     /// Optional: `grpc-status` from trailers / headers.
     fn on_grpc_status(&mut self, _status: i32, _message: &str) {}
+
+    /// The call has ended, one way or another: the status from the
+    /// trailers (or a trailers-only response), or the status this side
+    /// gave it when the request failed (`UNAVAILABLE`), a message could
+    /// not be decoded (`INTERNAL`) or was too large (`RESOURCE_EXHAUSTED`).
+    /// Fires exactly once per call. Default: ignore.
+    fn on_complete(&mut self, _status: i32, _message: &str) {}
+}
+
+/// Handle to the request side of a streaming call: messages are sent as
+/// they are given, from any thread, before or after the request starts.
+#[derive(Clone)]
+pub struct GrpcClientCall {
+    inner: Arc<Mutex<ClientCallInner>>,
+}
+
+struct ClientCallInner {
+    compression: Option<ContentCoding>,
+    /// Framed messages queued before the request started.
+    queued: Vec<Vec<u8>>,
+    half_closed: bool,
+    cancelled: bool,
+    handle: Option<hopf_http::ClientRequestHandle>,
+}
+
+impl GrpcClientCall {
+    fn new(compression: Option<ContentCoding>) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ClientCallInner {
+                compression,
+                queued: Vec::new(),
+                half_closed: false,
+                cancelled: false,
+                handle: None,
+            })),
+        }
+    }
+
+    /// The request started: what was queued before is written now, and
+    /// writes from now on go through `handle`. Returns whether the call
+    /// was already half-closed.
+    fn started(&self, request: &mut dyn ClientWriter, handle: hopf_http::ClientRequestHandle) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        for framed in g.queued.drain(..) {
+            request.request_body_content(&framed);
+        }
+        g.handle = Some(handle);
+        g.half_closed
+    }
+
+    /// Send one request message (unframed, serialised for the call's
+    /// codec). Ignored after [`half_close`](Self::half_close) or
+    /// [`cancel`](Self::cancel).
+    pub fn send(&self, message: &[u8]) {
+        let mut g = self.inner.lock().unwrap();
+        if g.half_closed || g.cancelled {
+            return;
+        }
+        let framed = frame_request(g.compression, message);
+        match g.handle.clone() {
+            Some(handle) => {
+                drop(g);
+                handle.execute(move |w| w.request_body_content(&framed));
+            }
+            None => g.queued.push(framed),
+        }
+    }
+
+    /// No more request messages: end the request body (the server sees
+    /// the half-close).
+    pub fn half_close(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if g.half_closed || g.cancelled {
+            return;
+        }
+        g.half_closed = true;
+        if let Some(handle) = g.handle.clone() {
+            drop(g);
+            handle.execute(|w| {
+                w.end_request_body();
+                w.complete_request();
+            });
+        }
+    }
+
+    /// Abandon the call: the stream is reset and no further response
+    /// callbacks arrive.
+    pub fn cancel(&self) {
+        let mut g = self.inner.lock().unwrap();
+        if g.cancelled {
+            return;
+        }
+        g.cancelled = true;
+        g.queued.clear();
+        if let Some(handle) = g.handle.clone() {
+            drop(g);
+            handle.execute(|w| w.cancel());
+        }
+    }
 }
 
 /// Builds a [`ClientHandler`] that performs one unary gRPC call.
@@ -108,8 +208,8 @@ fn frame_request(compression: Option<ContentCoding>, message: &[u8]) -> Vec<u8> 
     frame(message)
 }
 
-impl ClientHandlerFactory for GrpcUnaryCall {
-    fn create_handler(&self) -> Box<dyn ClientHandler> {
+impl GrpcUnaryCall {
+    fn handler_for(&self, call: Option<GrpcClientCall>) -> Box<dyn ClientHandler> {
         Box::new(GrpcClientHandler {
             path: self.path.clone(),
             framed: self.framed_request(),
@@ -119,19 +219,26 @@ impl ClientHandlerFactory for GrpcUnaryCall {
             encodings: self.encodings.clone(),
             compression: self.compression,
             handler: Arc::clone(&self.handler),
+            call,
+            request: None,
             frame_parser: None,
-            decoder: None,
-            message_done: false,
+            response_coding: MessageCoding::Identity,
             failed: false,
+            completed: false,
             grpc_status: None,
         })
     }
 }
 
-enum ResponseDecoder {
-    Proto(ProtoModelAdapter<Box<dyn ProtoMessageHandler>>),
-    Json(JsonModelAdapter<Box<dyn ProtoMessageHandler>>),
+impl ClientHandlerFactory for GrpcUnaryCall {
+    fn create_handler(&self) -> Box<dyn ClientHandler> {
+        self.handler_for(None)
+    }
 }
+
+/// gRPC status codes this side assigns.
+const GRPC_STATUS_UNKNOWN: i32 = 2;
+const GRPC_STATUS_UNAVAILABLE: i32 = 14;
 
 struct GrpcClientHandler {
     path: String,
@@ -142,79 +249,110 @@ struct GrpcClientHandler {
     encodings: Vec<ContentCoding>,
     compression: Option<ContentCoding>,
     handler: Arc<Mutex<Box<dyn GrpcResponseHandler>>>,
+    /// The request side of a streaming call; `None` for a unary call,
+    /// whose one message goes out in `start`.
+    call: Option<GrpcClientCall>,
+    /// To cancel the stream from a response callback.
+    request: Option<hopf_http::ClientRequestHandle>,
     frame_parser: Option<GrpcFrameParser<MessageAccum>>,
-    decoder: Option<ResponseDecoder>,
-    message_done: bool,
+    response_coding: MessageCoding,
     failed: bool,
+    completed: bool,
     grpc_status: Option<(i32, String)>,
 }
 
 impl GrpcClientHandler {
-    fn fail(&mut self, msg: &str) {
+    /// The call is over: tell the handler, once.
+    fn complete(&mut self, status: i32, message: &str) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        self.handler.lock().unwrap().on_complete(status, message);
+    }
+
+    /// Fails the call from this side with `status`: `on_error`, then
+    /// `on_complete`, and the stream is cancelled so the server stops
+    /// sending.
+    fn fail_with(&mut self, status: i32, msg: &str) {
         if self.failed {
             return;
         }
         self.failed = true;
         self.handler.lock().unwrap().on_error(msg);
+        self.complete(status, msg);
+        if let Some(request) = &self.request {
+            request.execute(|w| w.cancel());
+        }
+    }
+
+    fn fail(&mut self, msg: &str) {
+        self.fail_with(GRPC_STATUS_INTERNAL, msg);
     }
 
     /// Fails the call with a gRPC status this side determined (a framing or
     /// decompression failure), named in the error text.
     fn fail_status(&mut self, status: i32, msg: &str) {
-        self.fail(&format!("{msg} (grpc-status {status})"));
+        self.fail_with(status, &format!("{msg} (grpc-status {status})"));
     }
 
-    fn decode_frame(&mut self) {
-        let Some(parser) = self.frame_parser.take() else {
-            return;
-        };
-        let accum = parser.into_handler();
+    fn new_frame_parser(&self) -> GrpcFrameParser<MessageAccum> {
+        GrpcFrameParser::new(MessageAccum::new(
+            self.response_coding.clone(),
+            crate::framing::DEFAULT_MAX_MESSAGE_SIZE,
+        ))
+    }
+
+    /// Decodes one complete response frame into a fresh message handler
+    /// from [`GrpcResponseHandler::start_message`].
+    fn decode_frame(&mut self, accum: MessageAccum) {
         if let Some((status, err)) = accum.error {
             self.fail_status(status, &err);
             return;
         }
-        let Some(decoder) = self.decoder.as_mut() else {
-            self.fail("no adapter");
+        let type_name = self.response_type_name.clone();
+        let msg_handler = {
+            let mut h = self.handler.lock().unwrap();
+            h.start_message(type_name.as_deref())
+        };
+        let Some(msg_handler) = msg_handler else {
+            self.fail("no response handler");
             return;
         };
         let mut slice = accum.buf.as_slice();
-        match decoder {
-            ResponseDecoder::Proto(adapter) => {
-                {
-                    let mut pb = ProtoParser::new(adapter);
-                    if let Err(e) = pb.receive(&mut slice) {
-                        self.fail(&e.to_string());
-                        return;
+        let result: Result<(), String> = match self.codec {
+            GrpcCodec::Proto => {
+                let mut adapter = ProtoModelAdapter::new((*self.proto_file).clone(), msg_handler);
+                (|| {
+                    if let Some(ref ty) = type_name {
+                        adapter.start_root_message(ty).map_err(|e| e.to_string())?;
                     }
-                    if let Err(e) = pb.close() {
-                        self.fail(&e.to_string());
-                        return;
+                    {
+                        let mut pb = ProtoParser::new(&mut adapter);
+                        pb.receive(&mut slice).map_err(|e| e.to_string())?;
+                        pb.close().map_err(|e| e.to_string())?;
                     }
-                }
-                if let Err(e) = adapter.end_root_message() {
-                    self.fail(&e.to_string());
-                    return;
-                }
+                    adapter.end_root_message().map_err(|e| e.to_string())
+                })()
             }
-            ResponseDecoder::Json(adapter) => {
-                {
-                    let mut jp = JsonParser::new(adapter);
-                    if let Err(e) = jp.receive(&mut slice) {
-                        self.fail(&e.to_string());
-                        return;
+            GrpcCodec::Json => {
+                let mut adapter = JsonModelAdapter::new((*self.proto_file).clone(), msg_handler);
+                (|| {
+                    if let Some(ref ty) = type_name {
+                        adapter.start_root_message(ty).map_err(|e| e.to_string())?;
                     }
-                    if let Err(e) = jp.close() {
-                        self.fail(&e.to_string());
-                        return;
+                    {
+                        let mut jp = JsonParser::new(&mut adapter);
+                        jp.receive(&mut slice).map_err(|e| e.to_string())?;
+                        jp.close().map_err(|e| e.to_string())?;
                     }
-                }
-                if let Err(e) = adapter.end_root_message() {
-                    self.fail(&e.to_string());
-                    return;
-                }
+                    adapter.end_root_message().map_err(|e| e.to_string())
+                })()
             }
+        };
+        if let Err(e) = result {
+            self.fail(&e);
         }
-        self.message_done = true;
     }
 }
 
@@ -232,83 +370,73 @@ impl ClientHandler for GrpcClientHandler {
         }
         request.headers(h);
         request.start_request_body();
-        request.request_body_content(&self.framed);
-        request.end_request_body();
-        request.complete_request();
+        let handle = request.request_handle();
+        self.request = Some(handle.clone());
+        match &self.call {
+            None => {
+                request.request_body_content(&self.framed);
+                request.end_request_body();
+                request.complete_request();
+            }
+            Some(call) => {
+                // Messages sent before the request started go out now;
+                // later ones reach the stream through the handle.
+                if call.started(request, handle) {
+                    request.end_request_body();
+                    request.complete_request();
+                }
+            }
+        }
     }
 
     fn response_headers(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
         if let Some(status) = headers.get("grpc-status") {
-            let code = status.parse().unwrap_or(2);
+            let code = status.parse().unwrap_or(GRPC_STATUS_UNKNOWN);
             let msg = headers.get("grpc-message").unwrap_or("").to_string();
             self.grpc_status = Some((code, msg.clone()));
             self.handler.lock().unwrap().on_grpc_status(code, &msg);
         }
         // Prefer response Content-Type when present; otherwise use the request codec.
-        let codec = headers
+        self.codec = headers
             .get("content-type")
             .and_then(parse_grpc_content_type)
             .unwrap_or(self.codec);
-        let type_name = self.response_type_name.clone();
-        let msg_handler = {
-            let mut h = self.handler.lock().unwrap();
-            h.start_message(type_name.as_deref())
-        };
-        let Some(msg_handler) = msg_handler else {
-            self.fail("no response handler");
-            return;
-        };
-        let decoder = match codec {
-            GrpcCodec::Proto => {
-                let mut adapter =
-                    ProtoModelAdapter::new((*self.proto_file).clone(), msg_handler);
-                if let Some(ref ty) = type_name {
-                    if let Err(e) = adapter.start_root_message(ty) {
-                        self.fail(&e.to_string());
-                        return;
-                    }
-                }
-                ResponseDecoder::Proto(adapter)
-            }
-            GrpcCodec::Json => {
-                let mut adapter =
-                    JsonModelAdapter::new((*self.proto_file).clone(), msg_handler);
-                if let Some(ref ty) = type_name {
-                    if let Err(e) = adapter.start_root_message(ty) {
-                        self.fail(&e.to_string());
-                        return;
-                    }
-                }
-                ResponseDecoder::Json(adapter)
-            }
-        };
-        self.decoder = Some(decoder);
         // a flagged message is decoded with the response's grpc-encoding,
         // bounded by the message limit so it cannot expand without end
-        let coding = MessageCoding::resolve(headers.get("grpc-encoding"), &self.encodings);
-        self.frame_parser = Some(GrpcFrameParser::new(MessageAccum::new(
-            coding,
-            crate::framing::DEFAULT_MAX_MESSAGE_SIZE,
-        )));
+        self.response_coding =
+            MessageCoding::resolve(headers.get("grpc-encoding"), &self.encodings);
+        self.frame_parser = Some(self.new_frame_parser());
     }
 
-    fn response_body_content(&mut self, _request: &mut dyn ClientWriter, data: &[u8]) {
+    fn response_body_content(&mut self, _request: &mut dyn ClientWriter, mut data: &[u8]) {
         if self.failed || data.is_empty() {
             return;
         }
-        let ended = {
-            let Some(parser) = self.frame_parser.as_mut() else {
-                return;
+        // One frame at a time, each decoded into its own message handler.
+        while !data.is_empty() {
+            let ended = {
+                let Some(parser) = self.frame_parser.as_mut() else {
+                    return;
+                };
+                let consumed = parser.receive_until_frame(data);
+                data = &data[consumed..];
+                if let Some((status, err)) = parser.handler_mut().error.take() {
+                    self.fail_status(status, &err);
+                    return;
+                }
+                parser.handler_mut().ended
             };
-            parser.receive(data);
-            if let Some((status, err)) = parser.handler_mut().error.take() {
-                self.fail_status(status, &err);
+            if !ended {
                 return;
             }
-            parser.handler_mut().ended && !self.message_done
-        };
-        if ended {
-            self.decode_frame();
+            let next = self.new_frame_parser();
+            let Some(parser) = self.frame_parser.replace(next) else {
+                return;
+            };
+            self.decode_frame(parser.into_handler());
+            if self.failed {
+                return;
+            }
         }
     }
 
@@ -320,10 +448,11 @@ impl ClientHandler for GrpcClientHandler {
             return;
         }
         if let Some(status) = headers.get("grpc-status") {
-            let code = status.parse().unwrap_or(2);
+            let code = status.parse().unwrap_or(GRPC_STATUS_UNKNOWN);
             let msg = headers.get("grpc-message").unwrap_or("").to_string();
             self.grpc_status = Some((code, msg.clone()));
             self.handler.lock().unwrap().on_grpc_status(code, &msg);
+            self.complete(code, &msg);
         }
     }
 
@@ -331,21 +460,58 @@ impl ClientHandler for GrpcClientHandler {
         if self.failed {
             return;
         }
-        if !self.message_done {
-            if let Some(parser) = &self.frame_parser {
-                if parser.has_partial_frame() || !parser.is_message_completed() {
-                    self.fail("incomplete gRPC response frame");
-                }
+        if let Some(parser) = &self.frame_parser {
+            if parser.has_partial_frame() {
+                self.fail("incomplete gRPC response frame");
             }
         }
     }
 
     fn response_complete(&mut self, _request: &mut dyn ClientWriter) {
-        let _ = &self.grpc_status;
+        if self.failed || self.completed {
+            return;
+        }
+        // A trailers-only response carried the status in its headers; a
+        // response with neither is not a gRPC outcome at all.
+        match self.grpc_status.clone() {
+            Some((code, msg)) => self.complete(code, &msg),
+            None => self.complete(GRPC_STATUS_UNKNOWN, "missing grpc-status"),
+        }
+    }
+
+    fn request_failed(&mut self, _request: &mut dyn ClientWriter, err: &std::io::Error) {
+        if self.failed {
+            return;
+        }
+        self.failed = true;
+        let msg = err.to_string();
+        self.handler.lock().unwrap().on_error(&msg);
+        self.complete(GRPC_STATUS_UNAVAILABLE, &msg);
     }
 }
 
-/// Thin holder around a [`ProtoFile`] for constructing unary calls.
+/// Builds the [`ClientHandler`] for one streaming call; see
+/// [`GrpcClient::streaming_call`].
+pub struct GrpcStreamingCall {
+    unary: GrpcUnaryCall,
+    call: GrpcClientCall,
+}
+
+impl GrpcStreamingCall {
+    /// Select request/response payload codec (`Proto` default, or `Json`).
+    pub fn with_codec(mut self, codec: GrpcCodec) -> Self {
+        self.unary = self.unary.with_codec(codec);
+        self
+    }
+}
+
+impl ClientHandlerFactory for GrpcStreamingCall {
+    fn create_handler(&self) -> Box<dyn ClientHandler> {
+        self.unary.handler_for(Some(self.call.clone()))
+    }
+}
+
+/// Thin holder around a [`ProtoFile`] for constructing calls.
 pub struct GrpcClient {
     proto_file: Arc<ProtoFile>,
     encodings: Vec<ContentCoding>,
@@ -399,6 +565,24 @@ impl GrpcClient {
         GrpcUnaryCall::new(Arc::clone(&self.proto_file), path, request_message, handler)
             .with_encodings(&self.encodings)
             .with_compression(self.compression)
+    }
+
+    /// Build a [`ClientHandlerFactory`] for a streaming RPC (any
+    /// combination of client and server streaming) and the handle to send
+    /// its request messages with.
+    pub fn streaming_call(
+        &self,
+        path: impl Into<String>,
+        handler: Box<dyn GrpcResponseHandler>,
+    ) -> (GrpcStreamingCall, GrpcClientCall) {
+        let call = GrpcClientCall::new(self.compression);
+        let factory = GrpcStreamingCall {
+            unary: GrpcUnaryCall::new(Arc::clone(&self.proto_file), path, Vec::new(), handler)
+                .with_encodings(&self.encodings)
+                .with_compression(self.compression),
+            call: call.clone(),
+        };
+        (factory, call)
     }
 
     /// Build a unary RPC that sends/accepts `application/grpc+json`.
@@ -472,30 +656,68 @@ mod tests {
         fn on_grpc_status(&mut self, status: i32, message: &str) {
             self.0 .0.lock().unwrap().push(format!("status {status} {message:?}"));
         }
+        fn on_complete(&mut self, status: i32, message: &str) {
+            self.0 .0.lock().unwrap().push(format!("complete {status} {message:?}"));
+        }
+    }
+
+    /// What was written to the request, by the handler in `start` and by
+    /// deferred tasks through the request handle alike.
+    #[derive(Default)]
+    struct Sent {
+        headers: Option<Headers>,
+        body: Vec<u8>,
+        ended: bool,
+        cancelled: bool,
     }
 
     /// Records what the client handler sent.
     #[derive(Default)]
     struct MockRequest {
-        headers: Option<Headers>,
-        body: Vec<u8>,
+        sent: Arc<Mutex<Sent>>,
+    }
+
+    impl MockRequest {
+        fn headers(&self) -> Option<Headers> {
+            self.sent.lock().unwrap().headers.clone()
+        }
+        fn body(&self) -> Vec<u8> {
+            self.sent.lock().unwrap().body.clone()
+        }
     }
 
     impl ClientWriter for MockRequest {
         fn headers(&mut self, headers: Headers) {
-            self.headers = Some(headers);
+            self.sent.lock().unwrap().headers = Some(headers);
         }
         fn start_request_body(&mut self) {}
         fn request_body_content(&mut self, data: &[u8]) {
-            self.body.extend_from_slice(data);
+            self.sent.lock().unwrap().body.extend_from_slice(data);
         }
-        fn end_request_body(&mut self) {}
-        fn complete_request(&mut self) {}
+        fn end_request_body(&mut self) {
+            self.sent.lock().unwrap().ended = true;
+        }
+        fn complete_request(&mut self) {
+            self.sent.lock().unwrap().ended = true;
+        }
+        fn cancel(&mut self) {
+            self.sent.lock().unwrap().cancelled = true;
+        }
         fn version(&self) -> HttpVersion {
             HttpVersion::Http2
         }
         fn conn_handle(&self) -> ConnHandle {
             ConnHandle::from_execute(Arc::new(|task| task()))
+        }
+        fn request_handle(&self) -> hopf_http::ClientRequestHandle {
+            let sent = Arc::clone(&self.sent);
+            hopf_http::ClientRequestHandle::from_runner(
+                self.conn_handle(),
+                Arc::new(move |task: hopf_http::ClientWriterTask| {
+                    let mut w = MockRequest { sent: Arc::clone(&sent) };
+                    task(&mut w);
+                }),
+            )
         }
     }
 
@@ -546,8 +768,9 @@ mod tests {
         // field 1 with wire type 7, which does not exist
         deliver(&mut *handler, &[], &frame(&[0x0F, 0x00]), &[("grpc-status", "0")]);
         let got = events.take();
-        assert_eq!(got.len(), 1, "expected exactly one on_error: {got:?}");
-        assert!(got[0].starts_with("error "), "{got:?}");
+        let errors: Vec<&String> = got.iter().filter(|e| e.starts_with("error ")).collect();
+        assert_eq!(errors.len(), 1, "expected exactly one on_error: {got:?}");
+        assert!(!got.iter().any(|e| e.starts_with("status ")), "no on_grpc_status after the failure: {got:?}");
     }
 
     fn gzip(data: &[u8]) -> Vec<u8> {
@@ -582,18 +805,22 @@ mod tests {
         );
         let mut handler = call.create_handler();
         let req = deliver(&mut *handler, &[], &frame(&msg("ok")), &[("grpc-status", "0")]);
-        let headers = req.headers.unwrap();
+        let headers = req.headers().unwrap();
+        let body = req.body();
         assert_eq!(headers.get("grpc-encoding"), Some("gzip"));
-        assert_eq!(req.body[0], 1, "compressed flag");
-        let len = u32::from_be_bytes(req.body[1..5].try_into().unwrap()) as usize;
-        assert_eq!(len, req.body.len() - 5);
+        assert_eq!(body[0], 1, "compressed flag");
+        let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        assert_eq!(len, body.len() - 5);
         assert!(len < 600, "not smaller: {len}");
         let mut d = hopf_http::Decoder::new(ContentCoding::Gzip, 1 << 20).unwrap();
         let mut out = Vec::new();
-        d.push(&req.body[5..], &mut |o| out.extend_from_slice(o)).unwrap();
+        d.push(&body[5..], &mut |o| out.extend_from_slice(o)).unwrap();
         d.finish().unwrap();
         assert_eq!(out, msg(&text));
-        assert_eq!(events.take(), vec!["field text=String(\"ok\")", "status 0 \"\""]);
+        assert_eq!(
+            events.take(),
+            vec!["field text=String(\"ok\")", "status 0 \"\"", "complete 0 \"\""]
+        );
 
         // a message that would not shrink goes as it is, and by default
         // nothing is compressed at all
@@ -604,7 +831,7 @@ mod tests {
         );
         let mut handler = call.create_handler();
         let req = deliver(&mut *handler, &[], &frame(&msg("ok")), &[("grpc-status", "0")]);
-        assert_eq!(req.body, frame(&msg("x")));
+        assert_eq!(req.body(), frame(&msg("x")));
 
         let call = client().unary_call(
             "/test.TestSvc/Call",
@@ -613,8 +840,8 @@ mod tests {
         );
         let mut handler = call.create_handler();
         let req = deliver(&mut *handler, &[], &frame(&msg("ok")), &[("grpc-status", "0")]);
-        assert_eq!(req.headers.unwrap().get("grpc-encoding"), None);
-        assert_eq!(req.body, frame(&msg(&text)));
+        assert_eq!(req.headers().unwrap().get("grpc-encoding"), None);
+        assert_eq!(req.body(), frame(&msg(&text)));
     }
 
     #[test]
@@ -633,11 +860,14 @@ mod tests {
             &[("grpc-status", "0")],
         );
         assert_eq!(
-            req.headers.as_ref().and_then(|h| h.get("grpc-accept-encoding")),
-            Some("identity,gzip,deflate")
+            req.headers().and_then(|h| h.get("grpc-accept-encoding").map(str::to_string)),
+            Some("identity,gzip,deflate".to_string())
         );
         let got = events.take();
-        assert_eq!(got, vec!["field text=String(\"hello\")", "status 0 \"\""]);
+        assert_eq!(
+            got,
+            vec!["field text=String(\"hello\")", "status 0 \"\"", "complete 0 \"\""]
+        );
     }
 
     /// A compressed response that cannot be decoded fails the call with
@@ -659,8 +889,145 @@ mod tests {
             let mut handler = call.create_handler();
             deliver(&mut *handler, headers, &body, &[("grpc-status", "0")]);
             let got = events.take();
-            assert_eq!(got.len(), 1, "{headers:?}: {got:?}");
+            assert_eq!(got.len(), 2, "{headers:?}: {got:?}");
             assert!(got[0].starts_with("error ") && got[0].contains(&format!("grpc-status {status}")), "{got:?}");
+            assert!(got[1].starts_with(&format!("complete {status} ")), "{got:?}");
         }
+    }
+
+    const STREAM_PROTO: &str = r#"
+        syntax = "proto3";
+        package test;
+        message Msg { string text = 1; }
+        service TestSvc {
+          rpc Call (Msg) returns (Msg);
+          rpc ServerStream (Msg) returns (stream Msg);
+          rpc ClientStream (stream Msg) returns (Msg);
+        }
+    "#;
+
+    fn streaming_client() -> GrpcClient {
+        GrpcClient::new(ProtoFileParser::parse(STREAM_PROTO).unwrap())
+    }
+
+    /// The gRPC frames in a request body.
+    fn frames_in(body: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut rest = body;
+        while rest.len() >= 5 {
+            let len = u32::from_be_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
+            out.push(rest[5..5 + len].to_vec());
+            rest = &rest[5 + len..];
+        }
+        out
+    }
+
+    /// Server streaming: three response messages, each decoded into its
+    /// own message handler, then `on_complete(0)` from the trailers.
+    #[test]
+    fn server_streaming_delivers_each_message_then_completes() {
+        let events = Events::default();
+        let (factory, _call) = streaming_client().streaming_call(
+            "/test.TestSvc/ServerStream",
+            Box::new(RecordingHandler(events.clone())),
+        );
+        let mut handler = factory.create_handler();
+        let mut body = Vec::new();
+        for t in ["a", "b", "c"] {
+            body.extend_from_slice(&frame(&msg(t)));
+        }
+        deliver(&mut *handler, &[], &body, &[("grpc-status", "0")]);
+        let got = events.take();
+        let fields: Vec<&String> = got.iter().filter(|e| e.starts_with("field ")).collect();
+        assert_eq!(fields.len(), 3, "three messages: {got:?}");
+        assert_eq!(got.last().map(String::as_str), Some("complete 0 \"\""), "{got:?}");
+        assert_eq!(got.iter().filter(|e| e.starts_with("complete ")).count(), 1);
+    }
+
+    /// Client streaming: messages sent through the call handle after the
+    /// request started reach the request body as frames, and the half-close
+    /// ends the body.
+    #[test]
+    fn client_streaming_sends_after_start_and_half_closes() {
+        let events = Events::default();
+        let (factory, call) = streaming_client().streaming_call(
+            "/test.TestSvc/ClientStream",
+            Box::new(RecordingHandler(events.clone())),
+        );
+        let mut handler = factory.create_handler();
+        let req = MockRequest::default();
+        let mut start_view = MockRequest { sent: Arc::clone(&req.sent) };
+        handler.start(&mut start_view);
+        assert!(!req.sent.lock().unwrap().ended, "a streaming request is not ended at start");
+        for t in ["a", "b", "c"] {
+            call.send(&msg(t));
+        }
+        call.half_close();
+        let sent = req.sent.lock().unwrap();
+        assert_eq!(frames_in(&sent.body), vec![msg("a"), msg("b"), msg("c")]);
+        assert!(sent.ended, "half-close must end the request body");
+        assert!(!sent.cancelled);
+    }
+
+    /// A response message that cannot be decoded ends the call from this
+    /// side: `on_error`, `on_complete(INTERNAL)`, the stream cancelled, and
+    /// no `on_grpc_status` from the trailers that follow.
+    #[test]
+    fn decode_failure_completes_with_internal_and_cancels() {
+        let events = Events::default();
+        let (factory, _call) = streaming_client().streaming_call(
+            "/test.TestSvc/ServerStream",
+            Box::new(RecordingHandler(events.clone())),
+        );
+        let mut handler = factory.create_handler();
+        let req = MockRequest::default();
+        let mut view = MockRequest { sent: Arc::clone(&req.sent) };
+        handler.start(&mut view);
+        let mut h = Headers::new();
+        h.status(200);
+        h.set("content-type", "application/grpc");
+        handler.response_headers(&mut view, &h);
+        handler.response_body_content(&mut view, &frame(&[0x0F, 0x00]));
+        let mut t = Headers::new();
+        t.set("grpc-status", "0");
+        handler.response_trailers(&mut view, &t);
+        handler.response_complete(&mut view);
+        let got = events.take();
+        assert!(got.iter().any(|e| e.starts_with("error ")), "{got:?}");
+        assert_eq!(got.iter().filter(|e| e.starts_with("complete ")).count(), 1, "{got:?}");
+        assert!(got.iter().any(|e| e.starts_with("complete 13 ")), "INTERNAL: {got:?}");
+        assert!(!got.iter().any(|e| e.starts_with("status ")), "{got:?}");
+        assert!(req.sent.lock().unwrap().cancelled, "the stream must be cancelled");
+    }
+
+    /// A trailers-only response completes the call with its status, and a
+    /// failed request completes it with UNAVAILABLE; either exactly once.
+    #[test]
+    fn trailers_only_and_request_failure_complete_once() {
+        let events = Events::default();
+        let call = client().unary_call("/test.TestSvc/Call", vec![], Box::new(RecordingHandler(events.clone())));
+        let mut handler = call.create_handler();
+        let mut req = MockRequest::default();
+        handler.start(&mut req);
+        let mut h = Headers::new();
+        h.status(200);
+        h.set("content-type", "application/grpc");
+        h.set("grpc-status", "12");
+        h.set("grpc-message", "nope");
+        handler.response_headers(&mut req, &h);
+        handler.response_complete(&mut req);
+        let got = events.take();
+        assert_eq!(got.iter().filter(|e| e.starts_with("complete ")).count(), 1, "{got:?}");
+        assert!(got.iter().any(|e| e == "complete 12 \"nope\""), "{got:?}");
+
+        let events = Events::default();
+        let call = client().unary_call("/test.TestSvc/Call", vec![], Box::new(RecordingHandler(events.clone())));
+        let mut handler = call.create_handler();
+        let mut req = MockRequest::default();
+        handler.start(&mut req);
+        handler.request_failed(&mut req, &std::io::Error::new(std::io::ErrorKind::ConnectionReset, "gone"));
+        let got = events.take();
+        assert!(got.iter().any(|e| e.starts_with("complete 14 ")), "UNAVAILABLE: {got:?}");
+        assert_eq!(got.iter().filter(|e| e.starts_with("complete ")).count(), 1);
     }
 }

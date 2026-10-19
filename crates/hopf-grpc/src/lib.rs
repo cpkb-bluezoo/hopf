@@ -1,6 +1,6 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Unary gRPC over Hopf HTTP Streams (Gumdrop `org.bluezoo.gumdrop.grpc` port).
+//! Unary and streaming gRPC over Hopf HTTP Streams.
 //!
 //! Length-prefixed framing, runtime `.proto` model, schema-aware push events via
 //! [`rprotobuf`], and HTTP Stream server/client bindings. No generated stubs.
@@ -19,7 +19,7 @@ pub mod framing;
 pub mod proto;
 pub mod server;
 
-pub use client::{GrpcClient, GrpcResponseHandler, GrpcUnaryCall};
+pub use client::{GrpcClient, GrpcClientCall, GrpcResponseHandler, GrpcStreamingCall, GrpcUnaryCall};
 pub use codec::{parse_grpc_content_type, GrpcCodec};
 pub use compression::{
     accept_encoding_header, select_encoding, MessageCoding, DEFAULT_COMPRESSION_THRESHOLD,

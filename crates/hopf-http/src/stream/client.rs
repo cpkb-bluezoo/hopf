@@ -4,6 +4,8 @@
 //!
 //! Peer of [`super::server`] — not a delayed add-on.
 
+use std::sync::Arc;
+
 use hopf_core::ConnHandle;
 
 use crate::headers::Headers;
@@ -151,6 +153,90 @@ pub trait ClientWriter {
     /// [`ClientHandler`]'s callbacks already run on the connection's own
     /// thread.
     fn conn_handle(&self) -> ConnHandle;
+
+    /// A handle to write more of this request later, from any thread: the
+    /// client-side counterpart of
+    /// [`ServerWriter::response_handle`](super::ServerWriter::response_handle).
+    /// Call it from [`ClientHandler::start`] and keep the result; a task
+    /// given to [`ClientRequestHandle::execute`] runs on the connection's
+    /// thread with a writer for this request. HTTP/2 and HTTP/3 support
+    /// writing the body in pieces this way (a client-streaming gRPC call,
+    /// say); on HTTP/1.1 the handle discards what is written.
+    fn request_handle(&self) -> ClientRequestHandle {
+        ClientRequestHandle::detached(self.conn_handle(), self.version())
+    }
+
+    /// Abandon the request: on HTTP/2 a `RST_STREAM(CANCEL)`, on HTTP/3 a
+    /// stream reset. No further callbacks reach the [`ClientHandler`].
+    /// Default: no effect.
+    fn cancel(&mut self) {}
+}
+
+/// A deferred write to a request: what [`ClientRequestHandle::execute`]
+/// runs, with a writer for the request.
+pub type ClientWriterTask = Box<dyn FnOnce(&mut dyn ClientWriter) + Send>;
+
+/// Cloneable handle to write more of a request after
+/// [`ClientHandler::start`], from any thread; see
+/// [`ClientWriter::request_handle`].
+#[derive(Clone)]
+pub struct ClientRequestHandle {
+    conn: ConnHandle,
+    run: Arc<dyn Fn(ClientWriterTask) + Send + Sync>,
+}
+
+impl ClientRequestHandle {
+    /// A handle whose tasks `run` carries out; transports build theirs
+    /// this way, and so can a test that wants to see what is written.
+    pub fn from_runner(conn: ConnHandle, run: Arc<dyn Fn(ClientWriterTask) + Send + Sync>) -> Self {
+        Self { conn, run }
+    }
+
+    /// A handle bound to no request: tasks run on `conn` against a writer
+    /// that discards everything.
+    pub fn detached(conn: ConnHandle, version: HttpVersion) -> Self {
+        let runner_conn = conn.clone();
+        Self::from_runner(
+            conn,
+            Arc::new(move |task: ClientWriterTask| {
+                let conn = runner_conn.clone();
+                runner_conn.execute(Box::new(move || {
+                    let mut writer = DiscardingClientWriter { conn, version };
+                    task(&mut writer);
+                }));
+            }),
+        )
+    }
+
+    /// Connection handle for reactor hops.
+    pub fn conn_handle(&self) -> &ConnHandle {
+        &self.conn
+    }
+
+    /// Run `f` on the connection's thread with a writer for the request.
+    pub fn execute(&self, f: impl FnOnce(&mut dyn ClientWriter) + Send + 'static) {
+        (self.run)(Box::new(f));
+    }
+}
+
+/// A [`ClientWriter`] that accepts and discards everything.
+pub struct DiscardingClientWriter {
+    conn: ConnHandle,
+    version: HttpVersion,
+}
+
+impl ClientWriter for DiscardingClientWriter {
+    fn headers(&mut self, _headers: Headers) {}
+    fn start_request_body(&mut self) {}
+    fn request_body_content(&mut self, _data: &[u8]) {}
+    fn end_request_body(&mut self) {}
+    fn complete_request(&mut self) {}
+    fn version(&self) -> HttpVersion {
+        self.version
+    }
+    fn conn_handle(&self) -> ConnHandle {
+        self.conn.clone()
+    }
 }
 
 impl ClientHandler for Box<dyn ClientHandler> {

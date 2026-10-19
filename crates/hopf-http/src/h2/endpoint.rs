@@ -35,6 +35,7 @@ use super::response::{ArcH2ResponseControl, H2ResponseControl, H2SessionWriter};
 use crate::headers::Headers;
 use crate::limits::HttpLimits;
 use crate::version::HttpVersion;
+use crate::stream::{ClientRequestHandle, ClientWriterTask};
 use crate::stream::{
     ClientHandler, ClientHandlerFactory, ClientWriter, ConnectionInfo, ProtocolUpgradeHandler,
     ServerHandler, ServerHandlerFactory, ServerResponseHandle, ServerWriter,
@@ -269,6 +270,8 @@ struct H2ClientStreamWriter {
     /// connection once every client stream has drained instead of
     /// forwarding a header H2 forbids on the wire (RFC 9113 §8.2.2).
     close_after: bool,
+    /// Request side for writes after `start` (see [`ClientRequestHandle`]).
+    control: Arc<H2ClientRequestControl>,
 }
 
 impl H2ClientStreamWriter {
@@ -280,7 +283,90 @@ impl H2ClientStreamWriter {
             done: false,
             scheme,
             close_after: false,
+            control: H2ClientRequestControl::new(),
         }
+    }
+}
+
+/// Shared state of one client stream's request side for writes made after
+/// [`ClientHandler::start`] through a [`ClientRequestHandle`]: body bytes,
+/// the end of the body and a cancellation, applied by the endpoint when it
+/// next drains its deferred flushes.
+struct H2ClientRequestControl {
+    conn: Mutex<hopf_core::ConnHandle>,
+    flush: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    shared: Mutex<H2ClientRequestShared>,
+}
+
+#[derive(Default)]
+struct H2ClientRequestShared {
+    body: Vec<u8>,
+    end: bool,
+    cancel: bool,
+}
+
+impl H2ClientRequestControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            conn: Mutex::new(hopf_core::ConnHandle::from_execute(Arc::new(|task| task()))),
+            flush: Mutex::new(None),
+            shared: Mutex::new(H2ClientRequestShared::default()),
+        })
+    }
+
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        self.conn.lock().unwrap().clone()
+    }
+
+    fn handle(self: &Arc<Self>) -> ClientRequestHandle {
+        let control = Arc::clone(self);
+        ClientRequestHandle::from_runner(
+            self.conn_handle(),
+            Arc::new(move |task: ClientWriterTask| {
+                let control = Arc::clone(&control);
+                let conn = control.conn_handle();
+                conn.execute(Box::new(move || {
+                    let mut writer = H2ClientSessionWriter { control: Arc::clone(&control) };
+                    task(&mut writer);
+                    if let Some(cb) = control.flush.lock().unwrap().clone() {
+                        cb();
+                    }
+                    control.conn_handle().poke();
+                }));
+            }),
+        )
+    }
+}
+
+/// The writer a deferred request task gets: it feeds the stream's shared
+/// state, applied on the connection thread.
+struct H2ClientSessionWriter {
+    control: Arc<H2ClientRequestControl>,
+}
+
+impl ClientWriter for H2ClientSessionWriter {
+    fn headers(&mut self, _headers: Headers) {}
+    fn start_request_body(&mut self) {}
+    fn request_body_content(&mut self, data: &[u8]) {
+        self.control.shared.lock().unwrap().body.extend_from_slice(data);
+    }
+    fn end_request_body(&mut self) {
+        self.control.shared.lock().unwrap().end = true;
+    }
+    fn complete_request(&mut self) {
+        self.control.shared.lock().unwrap().end = true;
+    }
+    fn cancel(&mut self) {
+        self.control.shared.lock().unwrap().cancel = true;
+    }
+    fn version(&self) -> HttpVersion {
+        HttpVersion::Http2
+    }
+    fn conn_handle(&self) -> hopf_core::ConnHandle {
+        self.control.conn_handle()
+    }
+    fn request_handle(&self) -> ClientRequestHandle {
+        self.control.handle()
     }
 }
 
@@ -317,9 +403,11 @@ impl ClientWriter for H2ClientStreamWriter {
     }
 
     fn conn_handle(&self) -> hopf_core::ConnHandle {
-        // `start()` never needs a working cross-thread handle — see
-        // `ClientWriter::conn_handle`'s own doc comment.
-        hopf_core::ConnHandle::from_execute(Arc::new(|task| task()))
+        self.control.conn_handle()
+    }
+
+    fn request_handle(&self) -> ClientRequestHandle {
+        self.control.handle()
     }
 }
 
@@ -383,6 +471,9 @@ struct H2ClientStream {
     #[allow(dead_code)]
     id: u32,
     handler: Box<dyn ClientHandler>,
+    /// Request side for writes after `start`; `None` for streams the unit
+    /// tests insert directly.
+    control: Option<Arc<H2ClientRequestControl>>,
     response_headers_received: bool,
     response_body_started: bool,
     /// Request-body bytes not yet sent because the flow-control window was
@@ -632,6 +723,7 @@ impl H2Endpoint {
             H2ClientStream {
                 id: 1,
                 handler,
+                control: None,
                 response_headers_received: false,
                 response_body_started: false,
                 pending_body: Vec::new(),
@@ -722,9 +814,38 @@ impl H2Endpoint {
             std::mem::take(&mut *g)
         };
         for id in ids {
+            if self.client_streams.contains_key(&id) {
+                self.apply_client_deferred_writes(id);
+                continue;
+            }
             self.deliver_paused_request_body(id);
             self.flush_one_server_stream(id);
         }
+    }
+
+    /// Apply what a deferred task wrote to a client stream's request
+    /// through its [`ClientRequestHandle`]: queue the body for the
+    /// flow-controlled send, note the end of the body, or cancel the
+    /// stream with `RST_STREAM(CANCEL)` and drop it without callbacks.
+    fn apply_client_deferred_writes(&mut self, stream_id: u32) {
+        let Some(stream) = self.client_streams.get_mut(&stream_id) else {
+            return;
+        };
+        let Some(control) = stream.control.as_ref() else {
+            return;
+        };
+        let (body, end, cancel) = {
+            let mut shared = control.shared.lock().unwrap();
+            (std::mem::take(&mut shared.body), std::mem::take(&mut shared.end), shared.cancel)
+        };
+        if cancel {
+            frame::write_rst_stream(&mut self.out, stream_id, frame::ERROR_CANCEL);
+            self.client_streams.remove(&stream_id);
+            self.flow.close_stream(stream_id);
+            return;
+        }
+        stream.pending_body.extend_from_slice(&body);
+        stream.pending_end_stream |= end;
     }
 
     /// Install an upgrade the handler requested from a deferred task
@@ -944,7 +1065,16 @@ impl H2Endpoint {
         };
 
         let mut writer = H2ClientStreamWriter::new(stream_id, scheme);
+        {
+            let control = &writer.control;
+            *control.conn.lock().unwrap() = self.conn.clone();
+            let df = Arc::clone(&self.deferred_flush);
+            *control.flush.lock().unwrap() = Some(Arc::new(move || {
+                df.streams.lock().unwrap().push(stream_id);
+            }));
+        }
         handler.start(&mut writer);
+        let control = Arc::clone(&writer.control);
 
         let headers = writer.request_headers.take().unwrap_or_default();
         let body = std::mem::take(&mut writer.body);
@@ -994,6 +1124,7 @@ impl H2Endpoint {
             H2ClientStream {
                 id: stream_id,
                 handler,
+                control: Some(control),
                 response_headers_received: false,
                 response_body_started: false,
                 pending_body: remaining,
@@ -1072,6 +1203,7 @@ impl H2Endpoint {
             H2ClientStream {
                 id: stream_id,
                 handler,
+                control: None,
                 response_headers_received: false,
                 response_body_started: false,
                 pending_body: Vec::new(),
@@ -3183,6 +3315,7 @@ mod client_goaway_tests {
             id,
             H2ClientStream {
                 id,
+                control: None,
                 handler: Box::new(FailTrackingHandler {
                     failed: Arc::clone(failed),
                 }),
@@ -3360,6 +3493,7 @@ mod client_rst_stream_tests {
             H2ClientStream {
                 id,
                 handler: Box::new(Recorder(Arc::clone(&seen))),
+                control: None,
                 response_headers_received: false,
                 response_body_started: false,
                 pending_body: Vec::new(),
@@ -3455,6 +3589,7 @@ mod client_connection_specific_header_tests {
             H2ClientStream {
                 id,
                 handler: Box::new(NoopHandler),
+                control: None,
                 response_headers_received: false,
                 response_body_started: false,
                 pending_body: Vec::new(),
@@ -3546,6 +3681,7 @@ mod flow_control_error_tests {
             id,
             H2ClientStream {
                 id,
+                control: None,
                 handler: Box::new(FailTrackingHandler {
                     failed: Arc::clone(failed),
                 }),
@@ -3825,6 +3961,7 @@ mod client_informational_response_tests {
             H2ClientStream {
                 id,
                 handler: Box::new(RecordingHandler { rec: Arc::clone(rec) }),
+                control: None,
                 response_headers_received: false,
                 response_body_started: false,
                 pending_body: Vec::new(),
@@ -3982,6 +4119,7 @@ mod client_upgrade_tests {
             id,
             H2ClientStream {
                 id,
+                control: None,
                 handler: Box::new(UpgradingHandler {
                     rec: Arc::clone(rec),
                     upgrade: Arc::clone(upgrade),
@@ -4271,5 +4409,116 @@ mod flush_scheduler_tests {
             "every ready stream should be answered by one flush, in request order"
         );
         assert!(ep.server_streams.is_empty(), "all three streams fully sent and closed");
+    }
+}
+
+#[cfg(test)]
+mod client_request_handle_tests {
+    use super::*;
+    use crate::stream::{ClientHandler, ClientHandlerFactory, ClientWriter};
+
+    /// Starts a request whose body stays open and parks the request handle
+    /// for the test to write through after `start` returned.
+    struct ParkingFactory {
+        slot: Arc<Mutex<Option<ClientRequestHandle>>>,
+    }
+    impl ClientHandlerFactory for ParkingFactory {
+        fn create_handler(&self) -> Box<dyn ClientHandler> {
+            Box::new(ParkingHandler {
+                slot: Arc::clone(&self.slot),
+            })
+        }
+    }
+    struct ParkingHandler {
+        slot: Arc<Mutex<Option<ClientRequestHandle>>>,
+    }
+    impl ClientHandler for ParkingHandler {
+        fn start(&mut self, request: &mut dyn ClientWriter) {
+            let mut h = Headers::new();
+            h.set(":method", "POST");
+            h.set(":path", "/");
+            h.set(":scheme", "https");
+            h.set(":authority", "example.test");
+            request.headers(h);
+            request.start_request_body();
+            *self.slot.lock().unwrap() = Some(request.request_handle());
+        }
+        fn response_headers(&mut self, _: &mut dyn ClientWriter, _: &Headers) {}
+        fn response_complete(&mut self, _: &mut dyn ClientWriter) {}
+    }
+
+    fn started_endpoint() -> (H2Endpoint, ClientRequestHandle) {
+        let slot = Arc::new(Mutex::new(None));
+        let mut ep = H2Endpoint::client(
+            Arc::new(ParkingFactory {
+                slot: Arc::clone(&slot),
+            }),
+            HttpLimits::default(),
+            false,
+        );
+        ep.start_client_request();
+        let handle = slot.lock().unwrap().take().expect("start parked the request handle");
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_HEADERS);
+        assert_eq!(header.flags & FLAG_END_STREAM, 0, "the body is still open");
+        ep.out.clear();
+        (ep, handle)
+    }
+
+    /// `(type, flags, stream id, payload)` of every frame in `out`.
+    fn frames(out: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
+        let mut at = 0;
+        let mut found = Vec::new();
+        while at < out.len() {
+            let h = frame::parse_frame_header(&out[at..at + 9]);
+            let end = at + 9 + h.length as usize;
+            found.push((h.ty, h.flags, h.stream_id, out[at + 9..end].to_vec()));
+            at = end;
+        }
+        found
+    }
+
+    #[test]
+    fn body_written_through_the_handle_goes_out_when_the_endpoint_drains() {
+        let (mut ep, handle) = started_endpoint();
+
+        handle.execute(|w| {
+            w.request_body_content(b"hello");
+            w.end_request_body();
+            w.complete_request();
+        });
+        assert!(ep.out.is_empty(), "nothing goes out until the endpoint drains");
+
+        ep.drain_deferred_flush();
+        ep.flush_client_streams();
+
+        let got = frames(&ep.out);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (ty, flags, id, payload) = &got[0];
+        assert_eq!(*ty, frame::TYPE_DATA);
+        assert_eq!(*id, 1);
+        assert_eq!(payload, b"hello");
+        assert_ne!(flags & FLAG_END_STREAM, 0, "the end of the body ends the stream");
+        assert_eq!(ep.client_streams.len(), 1, "the stream waits for its response");
+    }
+
+    #[test]
+    fn cancel_through_the_handle_resets_the_stream_and_drops_it() {
+        let (mut ep, handle) = started_endpoint();
+
+        handle.execute(|w| {
+            w.request_body_content(b"never sent");
+            w.cancel();
+        });
+        ep.drain_deferred_flush();
+        ep.flush_client_streams();
+
+        let got = frames(&ep.out);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let (ty, _, id, payload) = &got[0];
+        assert_eq!(*ty, frame::TYPE_RST_STREAM);
+        assert_eq!(*id, 1);
+        assert_eq!(payload.as_slice(), &frame::ERROR_CANCEL.to_be_bytes());
+        assert!(ep.client_streams.is_empty(), "a cancelled stream gets no callbacks");
     }
 }
