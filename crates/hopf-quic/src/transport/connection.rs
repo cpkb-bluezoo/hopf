@@ -191,6 +191,12 @@ pub struct Connection {
     pending_retire_cids: Vec<u64>,
     /// PATH_CHALLENGE data to answer with PATH_RESPONSE on the next flush.
     pending_path_responses: VecDeque<[u8; 8]>,
+    /// Peer-initiated streams ever created, per direction: an index below
+    /// this that is no longer in `streams` was released.
+    peer_bi_opened: u64,
+    peer_uni_opened: u64,
+    /// Streams the driver has retired that the wire is not yet done with.
+    retiring: Vec<StreamId>,
     /// Token for Initial (usually empty; set after Retry).
     token: Vec<u8>,
     /// Short-header CID length (peer's CID length we send to).
@@ -275,6 +281,8 @@ struct StreamState {
     opened_event: bool,
     /// Peer bi stream: already raised local MAX_STREAMS for this id.
     bidi_credit_granted: bool,
+    /// The driver is done with the stream: release it once the wire is.
+    retire_requested: bool,
 }
 
 impl Connection {
@@ -398,6 +406,9 @@ impl Connection {
             peer_cids: Vec::new(),
             pending_retire_cids: Vec::new(),
             pending_path_responses: VecDeque::new(),
+            peer_bi_opened: 0,
+            peer_uni_opened: 0,
+            retiring: Vec::new(),
             flow,
             token: Vec::new(),
             short_cid_len: initial_dcid.len(),
@@ -535,6 +546,9 @@ impl Connection {
             peer_cids: Vec::new(),
             pending_retire_cids: Vec::new(),
             pending_path_responses: VecDeque::new(),
+            peer_bi_opened: 0,
+            peer_uni_opened: 0,
+            retiring: Vec::new(),
             flow,
             token: Vec::new(),
             short_cid_len: 0,
@@ -1056,6 +1070,7 @@ impl Connection {
                 for acked in &result.newly_acked {
                     self.note_acknowledged_frames(acked);
                 }
+                self.release_retiring();
             }
             Frame::Crypto { offset, data } => {
                 if self.side == Side::Client && space == SpaceId::Initial && self.peer_initial_scid.is_none() {
@@ -1078,7 +1093,9 @@ impl Connection {
                 data,
                 fin,
             } => {
-                self.ensure_recv_stream(id);
+                if !self.ensure_recv_stream(id) {
+                    return;
+                }
                 // RFC 9000 section 4.1: data past either limit we advertised
                 // is a FLOW_CONTROL_ERROR. The largest offset seen, not the
                 // bytes received, is what the limits bound.
@@ -1226,6 +1243,7 @@ impl Connection {
                         st.recv.readable.clear();
                         st.recv.reset = true;
                     }
+                    self.maybe_grant_bidi_credit(id);
                 }
                 self.events.push_back(Event::Stream(StreamEvent::Stopped {
                     id,
@@ -1687,6 +1705,7 @@ impl Connection {
         }
         self.loss.set_app_limited(!window_limited);
         self.queue_blocked_hints(conn_blocked, now);
+        self.release_retiring();
 
         // DATAGRAM frames on 1-RTT.
         while let Some(data) = self.datagram_tx.pop_front() {
@@ -2383,10 +2402,32 @@ self.version,
         self.remembered_0rtt_stream_max = Some(limits.initial_max_stream_data_bidi_remote);
     }
 
-    fn ensure_recv_stream(&mut self, id: StreamId) {
+    /// Make sure `id` has stream state, creating it for a peer-opened
+    /// stream seen for the first time. `false` for an id that was released
+    /// already (a late frame, ignored) or one of ours the peer must not
+    /// use (RFC 9000 section 19.8: STREAM_STATE_ERROR).
+    fn ensure_recv_stream(&mut self, id: StreamId) -> bool {
         if self.streams.contains_key(&id) {
-            return;
+            return true;
         }
+        if id.initiator() == self.side {
+            let next = match id.dir() {
+                Dir::Bi => self.next_local_bi,
+                Dir::Uni => self.next_local_uni,
+            };
+            if id.index() >= next {
+                self.fail_transport(STREAM_STATE_ERROR, "frame for a local stream not yet opened");
+            }
+            return false;
+        }
+        let opened = match id.dir() {
+            Dir::Bi => &mut self.peer_bi_opened,
+            Dir::Uni => &mut self.peer_uni_opened,
+        };
+        if id.index() < *opened {
+            return false;
+        }
+        *opened = id.index() + 1;
         // A peer-opened stream: our send limit on a bidirectional one is
         // the peer's `initial_max_stream_data_bidi_local` (RFC 9000 section
         // 18.2, the peer being the initiator); on a unidirectional one we
@@ -2412,8 +2453,10 @@ self.version,
                 recv: RecvStream::new(recv_window, now),
                 opened_event: id.initiator() == self.side,
                 bidi_credit_granted: false,
+                retire_requested: false,
             },
         );
+        true
     }
 
     /// After a peer-initiated bi stream finishes (peer FIN), raise the
@@ -2468,6 +2511,7 @@ self.version,
                 recv: RecvStream::new(recv_window, now),
                 opened_event: true,
                 bidi_credit_granted: false,
+                retire_requested: false,
             },
         );
         Some(id)
@@ -2496,6 +2540,7 @@ self.version,
                 recv: RecvStream::new(0, self.last_activity),
                 opened_event: true,
                 bidi_credit_granted: false,
+                retire_requested: false,
             },
         );
         Some(id)
@@ -2575,6 +2620,68 @@ self.version,
         };
         if let Some(released) = st.send.reset(error_code.0) {
             self.send_queued = self.send_queued.saturating_sub(released);
+        }
+    }
+
+    /// The driver is done with a stream: release its transport state once
+    /// the wire is done with it too (queues empty, FIN or RESET_STREAM
+    /// acknowledged, the peer's side finished, and no packet in flight
+    /// carrying a frame for it). A send side the driver abandoned open is
+    /// reset first, so the peer is not left waiting.
+    pub fn retire_stream(&mut self, id: StreamId) {
+        let Some(st) = self.streams.get_mut(&id) else {
+            return;
+        };
+        st.retire_requested = true;
+        let send_side_in_use = id.dir() == Dir::Bi || id.initiator() == self.side;
+        if send_side_in_use && !st.send.fin && st.send.reset.is_none() {
+            if let Some(released) = st.send.reset(0) {
+                self.send_queued = self.send_queued.saturating_sub(released);
+            }
+        }
+        if !self.try_release(id) && !self.retiring.contains(&id) {
+            self.retiring.push(id);
+        }
+    }
+
+    /// Release a retired stream if nothing on the wire still needs it.
+    fn try_release(&mut self, id: StreamId) -> bool {
+        let Some(st) = self.streams.get(&id) else {
+            return true;
+        };
+        if !st.retire_requested {
+            return false;
+        }
+        let we_send = id.dir() == Dir::Bi || id.initiator() == self.side;
+        let peer_sends = id.dir() == Dir::Bi || id.initiator() != self.side;
+        let send_done = !we_send || st.send.fin_acked || st.send.reset_acked;
+        let recv = &st.recv;
+        let recv_done = !peer_sends
+            || recv.reset
+            || (recv.fin && (recv.stop_sending.is_some() || recv.all_data_received()));
+        let nothing_pending = !st.send.pending_reset && !recv.pending_stop && !recv.pending_max;
+        if !(send_done && recv_done && nothing_pending) || self.loss.has_in_flight_stream(id) {
+            return false;
+        }
+        // Whatever the application left unread is consumed as far as the
+        // connection window is concerned, and a peer stream frees its
+        // slot in our stream limit.
+        self.maybe_grant_bidi_credit(id);
+        if let Some(st) = self.streams.remove(&id) {
+            self.conn_consumed += st.recv.highest.saturating_sub(st.recv.consumed);
+        }
+        self.retiring.retain(|r| *r != id);
+        true
+    }
+
+    /// Release every retired stream the wire has finished with.
+    fn release_retiring(&mut self) {
+        if self.retiring.is_empty() {
+            return;
+        }
+        let ids = self.retiring.clone();
+        for id in ids {
+            self.try_release(id);
         }
     }
 
@@ -4412,5 +4519,105 @@ mod tests {
         let id = StreamId::new(Side::Server, Dir::Uni, 0);
         conn.handle_frame(SpaceId::Data, Frame::StopSending { id, error_code: 1 }, now);
         assert_eq!(closed_with(&mut conn), Some(STREAM_STATE_ERROR));
+    }
+
+    /// One request/response exchange on a fresh bidirectional stream, as
+    /// the driver drives it: our data and FIN out, the peer's data and FIN
+    /// in and read, then the driver retires the stream.
+    fn exchange_and_retire(conn: &mut Connection, now: Instant) -> StreamId {
+        let id = conn.open_bi().expect("stream");
+        conn.write_stream(id, b"request").unwrap();
+        conn.finish_stream(id).unwrap();
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Stream { id, offset: 0, data: Bytes::from_static(b"response"), fin: true },
+            now,
+        );
+        assert_eq!(read_all(conn, id), 8);
+        drain_frames(conn, now);
+        conn.retire_stream(id);
+        id
+    }
+
+    /// Stream state must not outlive the stream. Regression: nothing ever
+    /// removed a `StreamState`, so a long-lived connection grew without
+    /// bound and every flush walked every stream ever opened.
+    #[test]
+    fn finished_streams_are_released_once_acknowledged() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.loss.congestion_mut().set_congestion_window_for_tests(u64::MAX / 2);
+        conn.peer_max_streams_bidi = u64::MAX;
+        for _ in 0..1000 {
+            exchange_and_retire(&mut conn, now);
+        }
+        // Retired by the driver, but our FINs are not yet acknowledged.
+        assert_eq!(conn.streams.len(), 1000, "released before the FIN was acknowledged");
+        ack_everything(&mut conn, now);
+        assert_eq!(conn.streams.len(), 0, "stream state leaked");
+    }
+
+    /// A stream whose data is still in flight waits for the acknowledgement
+    /// (a loss would need it to retransmit), then goes.
+    #[test]
+    fn a_stream_with_unacknowledged_data_is_released_only_after_the_ack() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = exchange_and_retire(&mut conn, now);
+        assert!(conn.streams.contains_key(&id));
+        // Acknowledge everything but the packet carrying the stream data.
+        let data_pn = conn.space(SpaceId::Data).next_pn - 1;
+        conn.pto_ping_pending[space_index(SpaceId::Data)] = true;
+        drain_frames(&mut conn, now);
+        let ping_pn = conn.space(SpaceId::Data).next_pn - 1;
+        // (20 ms on: well inside the time threshold, so the unacknowledged
+        // data packet is not declared lost by this acknowledgement.)
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack { largest: ping_pn, delay: 0, ranges: vec![(ping_pn, ping_pn)] },
+            now + Duration::from_millis(20),
+        );
+        assert!(conn.streams.contains_key(&id), "released with data in flight");
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack { largest: ping_pn, delay: 0, ranges: vec![(data_pn, ping_pn)] },
+            now + Duration::from_millis(21),
+        );
+        assert!(!conn.streams.contains_key(&id), "not released after the ack");
+    }
+
+    /// A late frame for a released stream (a retransmission that crossed
+    /// the acknowledgement, or a MAX_STREAM_DATA) is ignored, not turned
+    /// into a new stream.
+    #[test]
+    fn late_frames_for_a_retired_stream_do_not_recreate_it() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = exchange_and_retire(&mut conn, now);
+        ack_everything(&mut conn, now);
+        assert!(conn.streams.is_empty());
+        conn.handle_frame(SpaceId::Data, Frame::MaxStreamData { id, max: 1 << 30 }, now);
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Stream { id, offset: 0, data: Bytes::from_static(b"response"), fin: true },
+            now,
+        );
+        assert!(conn.streams.is_empty(), "a late frame recreated the stream");
+        assert_eq!(closed_with(&mut conn), None);
+        // A peer-opened stream likewise. The driver gives it up without
+        // ever finishing our side, so retiring resets it first and the
+        // release waits for that RESET_STREAM to be acknowledged.
+        let peer = StreamId::new(Side::Server, Dir::Bi, 0);
+        conn.handle_frame(SpaceId::Data, Frame::Stream { id: peer, offset: 0, data: Bytes::from_static(b"hi"), fin: true }, now);
+        assert_eq!(read_all(&mut conn, peer), 2);
+        conn.retire_stream(peer);
+        let out = drain_frames(&mut conn, now);
+        assert!(carries(&out, |f| matches!(f, Frame::ResetStream { id: sid, error_code: 0, final_size: 0 } if *sid == peer)), "{out:?}");
+        assert!(conn.streams.contains_key(&peer), "released before the reset was acknowledged");
+        ack_everything(&mut conn, now);
+        assert!(conn.streams.is_empty(), "not released after the reset was acknowledged");
+        conn.handle_frame(SpaceId::Data, Frame::Stream { id: peer, offset: 0, data: Bytes::from_static(b"hi"), fin: true }, now);
+        assert!(conn.streams.is_empty(), "a late peer frame recreated the stream");
+        assert_eq!(closed_with(&mut conn), None);
     }
 }

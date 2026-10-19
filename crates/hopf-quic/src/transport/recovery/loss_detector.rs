@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::transport::types::SpaceId;
+use crate::transport::types::{SpaceId, StreamId};
 
 use super::congestion::CongestionController;
 use super::rtt::RttEstimator;
@@ -511,6 +511,21 @@ impl LossDetector {
                 && p.frames.iter().any(|f| !matches!(f, RecoverableFrame::Ping))
         })?;
         Some(std::mem::take(&mut packet.frames))
+    }
+
+    /// Whether any 1-RTT packet still in flight carries a frame for stream
+    /// `id` (its data, FIN, RESET_STREAM, STOP_SENDING or a limit).
+    pub fn has_in_flight_stream(&self, id: StreamId) -> bool {
+        self.space(SpaceId::Data).sent.values().any(|p| {
+            p.frames.iter().any(|f| match f {
+                RecoverableFrame::Stream { id: sid, .. }
+                | RecoverableFrame::ResetStream { id: sid, .. }
+                | RecoverableFrame::StopSending { id: sid, .. }
+                | RecoverableFrame::MaxStreamData { id: sid, .. }
+                | RecoverableFrame::StreamDataBlocked { id: sid, .. } => *sid == id,
+                _ => false,
+            })
+        })
     }
 
     /// Forget one sent packet without declaring it lost or acknowledged: it

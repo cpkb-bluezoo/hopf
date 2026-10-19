@@ -1885,7 +1885,9 @@ impl Driver {
             return;
         }
         if let Some(slot) = self.connections.get_mut(&ch) {
-            let _ = slot.streams.remove(&id);
+            if slot.streams.remove(&id).is_some() {
+                slot.conn.retire_stream(id);
+            }
         }
     }
 
@@ -1912,6 +1914,14 @@ impl Driver {
                         let _ = slot.conn.recv_stream(id).stop(vc);
                     }
                 }
+                // Both halves are done from the application's side; the
+                // connection sends the reset and releases the stream once
+                // the peer has acknowledged it.
+                if let Some(st) = self.connections.get_mut(&ch).and_then(|s| s.streams.get_mut(&id)) {
+                    st.send_finished = true;
+                    st.recv_finished = true;
+                }
+                self.maybe_retire_stream(ch, id);
                 continue;
             }
 
@@ -1994,6 +2004,7 @@ impl Driver {
                         None => stream.handler.disconnected(&mut stream.endpoint),
                     }
                 }
+                slot.conn.retire_stream(id);
             }
         }
     }
