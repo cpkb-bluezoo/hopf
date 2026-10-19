@@ -5,6 +5,7 @@
 mod reassembler;
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use bytes::Bytes;
 
@@ -153,19 +154,37 @@ pub struct RecvStream {
     pub fin: bool,
     /// Total stream length, known once a FIN-bearing frame has been seen.
     final_size: Option<u64>,
-    /// Max data we advertise.
+    /// Max data we advertise: the current MAX_STREAM_DATA limit.
     pub max_data: u64,
+    /// Receive window: `max_data` is kept at `consumed + window`.
+    pub window: u64,
+    /// When the current window was advertised (for the growth rule).
+    pub opened_at: Instant,
+    /// Bytes the application has read.
+    pub consumed: u64,
+    /// Largest offset the peer has sent (or declared as final size).
+    pub highest: u64,
+    /// A MAX_STREAM_DATA for the current `max_data` is due (new or lost).
+    pub pending_max: bool,
+    /// Peer sent RESET_STREAM: no more data is delivered or credited.
+    pub reset: bool,
 }
 
 impl RecvStream {
-    /// Create with flow-control max.
-    pub fn new(max_data: u64) -> Self {
+    /// Create with the initial flow-control window.
+    pub fn new(window: u64, now: Instant) -> Self {
         Self {
-            reassembler: StreamReassembler::new(max_data),
+            reassembler: StreamReassembler::new(window),
             readable: VecDeque::new(),
             fin: false,
             final_size: None,
-            max_data,
+            max_data: window,
+            window,
+            opened_at: now,
+            consumed: 0,
+            highest: 0,
+            pending_max: false,
+            reset: false,
         }
     }
 
@@ -202,10 +221,12 @@ impl RecvStream {
         };
         if front.len() <= max {
             let fin = self.readable.is_empty() && self.fully_reassembled();
+            self.consumed += front.len() as u64;
             (front, fin)
         } else {
             let got = front.slice(..max);
             self.readable.push_front(front.slice(max..));
+            self.consumed += got.len() as u64;
             (got, false)
         }
     }
@@ -217,7 +238,7 @@ mod tests {
 
     #[test]
     fn read_does_not_report_fin_while_a_gap_remains() {
-        let mut recv = RecvStream::new(1024);
+        let mut recv = RecvStream::new(1024, Instant::now());
         // Peer's final chunk (offset 4, carrying FIN) arrives before the
         // preceding bytes at offset 0..4, so a gap remains.
         recv.ingest(4, Bytes::from_static(b"ef"), true).unwrap();

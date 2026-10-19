@@ -399,6 +399,55 @@ pub enum TimeoutKind {
     LossDetection,
 }
 
+/// Receive windows (what this endpoint advertises and how far it lets them
+/// grow) and the optional send buffer cap (RFC 9000 section 4).
+#[derive(Debug, Clone)]
+pub struct FlowControlLimits {
+    /// Initial per-stream receive window: `initial_max_stream_data_*`.
+    pub stream_receive_window: u64,
+    /// Largest a stream window grows to on a fast path.
+    pub stream_receive_window_ceiling: u64,
+    /// Initial connection receive window: `initial_max_data`.
+    pub receive_window: u64,
+    /// Largest the connection window grows to on a fast path.
+    pub receive_window_ceiling: u64,
+    /// Cap on stream bytes queued for sending but not yet sent, across all
+    /// streams; a write past it is cut short. `None` is unbounded.
+    pub send_window: Option<u64>,
+}
+
+impl Default for FlowControlLimits {
+    fn default() -> Self {
+        Self {
+            stream_receive_window: 1 << 20,
+            stream_receive_window_ceiling: 16 << 20,
+            receive_window: 10 << 20,
+            receive_window_ceiling: 24 << 20,
+            send_window: None,
+        }
+    }
+}
+
+impl FlowControlLimits {
+    /// Check the limits are usable: non-zero windows, each ceiling at least
+    /// its window.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.stream_receive_window == 0 || self.receive_window == 0 {
+            return Err("receive windows must be non-zero");
+        }
+        if self.stream_receive_window_ceiling < self.stream_receive_window {
+            return Err("stream receive window ceiling is below the initial window");
+        }
+        if self.receive_window_ceiling < self.receive_window {
+            return Err("connection receive window ceiling is below the initial window");
+        }
+        if self.send_window == Some(0) {
+            return Err("send window must be non-zero");
+        }
+        Ok(())
+    }
+}
+
 /// Default idle timeout used when none is configured.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 

@@ -26,8 +26,8 @@ use crate::transport::recovery::{LossDetector, RecoverableFrame};
 use crate::transport::stream::{RecvStream, SendStream, StreamReassembler};
 use crate::transport::tls_bridge::{self, OutboundCrypto, TlsBridge, TlsBridgeEvents};
 use crate::transport::types::{
-    ConnectionError, ConnectionId, Dir, Event, Side, SpaceId, StreamEvent, StreamId, Transmit,
-    VarInt,
+    ConnectionError, ConnectionId, Dir, Event, FlowControlLimits, Side, SpaceId, StreamEvent,
+    StreamId, Transmit, VarInt,
 };
 
 /// Maximum datagram size we send until the path is shown to support more
@@ -39,6 +39,8 @@ const MAX_DATAGRAM_SIZE: usize = 1200;
 const MIN_INITIAL_DATAGRAM_SIZE: usize = 1200;
 /// TRANSPORT_PARAMETER_ERROR (RFC 9000 section 20.1).
 const TRANSPORT_PARAMETER_ERROR: u64 = 0x08;
+/// RFC 9000 section 20.1: the peer sent more data than it was allowed.
+const FLOW_CONTROL_ERROR: u64 = 0x03;
 /// VERSION_NEGOTIATION_ERROR (RFC 9368 section 10.2).
 const VERSION_NEGOTIATION_ERROR: u64 = 0x11;
 
@@ -96,6 +98,7 @@ struct ClientRestart {
     initial_max_streams_bidi: Option<u64>,
     initial_max_streams_uni: Option<u64>,
     keep_alive_interval: Option<Duration>,
+    flow: FlowControlLimits,
 }
 
 /// In-tree QUIC connection.
@@ -154,6 +157,25 @@ pub struct Connection {
     conn_data_sent: u64,
     /// The `conn_max_data` a DATA_BLOCKED was last sent for.
     data_blocked_sent_at: Option<u64>,
+    /// Receive windows and send buffer cap this connection was built with.
+    flow: FlowControlLimits,
+    /// Connection receive limit advertised to the peer: the current
+    /// MAX_DATA value, kept at `conn_consumed + conn_recv_window`.
+    local_max_data: u64,
+    /// Connection receive window; grows up to the configured ceiling.
+    conn_recv_window: u64,
+    /// When the current connection window was advertised.
+    conn_window_opened_at: Instant,
+    /// Stream bytes the application has read, summed over all streams.
+    conn_consumed: u64,
+    /// Sum over all streams of the largest offset the peer has sent (or
+    /// declared as final size), which `local_max_data` bounds.
+    conn_recv_highest: u64,
+    /// A MAX_DATA for `local_max_data` is due (new or lost).
+    pending_max_data: bool,
+    /// Stream bytes queued for sending but not yet sent, which
+    /// `flow.send_window` bounds.
+    send_queued: u64,
     /// Token for Initial (usually empty; set after Retry).
     token: Vec<u8>,
     /// Short-header CID length (peer's CID length we send to).
@@ -257,6 +279,7 @@ impl Connection {
         initial_max_streams_bidi: Option<u64>,
         initial_max_streams_uni: Option<u64>,
         keep_alive_interval: Option<Duration>,
+        flow: FlowControlLimits,
     ) -> Self {
         let restart = ClientRestart {
             server_name: server_name.to_string(),
@@ -266,6 +289,7 @@ impl Connection {
             initial_max_streams_bidi,
             initial_max_streams_uni,
             keep_alive_interval,
+            flow: flow.clone(),
         };
         // RFC 9369 section 4 / RFC 9368: send version_information. Only the
         // chosen version is listed as available, which disables compatible
@@ -286,9 +310,14 @@ impl Connection {
         if let Some(n) = initial_max_streams_uni {
             local_tp.initial_max_streams_uni = n;
         }
+        local_tp.initial_max_data = flow.receive_window;
+        local_tp.initial_max_stream_data_bidi_local = flow.stream_receive_window;
+        local_tp.initial_max_stream_data_bidi_remote = flow.stream_receive_window;
+        local_tp.initial_max_stream_data_uni = flow.stream_receive_window;
         let local_idle_timeout_ms = local_tp.max_idle_timeout;
         let idle_timeout = idle_timeout_from_ms(local_idle_timeout_ms);
         let local_max_streams_bidi = local_tp.initial_max_streams_bidi;
+        let local_max_data = local_tp.initial_max_data;
         let mut hs = handshake;
         // Dial-time SNI always wins over any name baked into the client
         // config (shared configs / PEM helpers must not pin "localhost").
@@ -332,6 +361,14 @@ impl Connection {
             conn_max_data: 10 * 1024 * 1024,
             conn_data_sent: 0,
             data_blocked_sent_at: None,
+            local_max_data,
+            conn_recv_window: flow.receive_window,
+            conn_window_opened_at: now,
+            conn_consumed: 0,
+            conn_recv_highest: 0,
+            pending_max_data: false,
+            send_queued: 0,
+            flow,
             token: Vec::new(),
             short_cid_len: initial_dcid.len(),
             retry_processed: false,
@@ -386,6 +423,7 @@ impl Connection {
         initial_max_streams_bidi: Option<u64>,
         initial_max_streams_uni: Option<u64>,
         keep_alive_interval: Option<Duration>,
+        flow: FlowControlLimits,
     ) -> Self {
         // RFC 9368 section 3: the server's Available Versions are its
         // deployment's versions; the Chosen Version is the one in use.
@@ -409,9 +447,14 @@ impl Connection {
         if let Some(n) = initial_max_streams_uni {
             local_tp.initial_max_streams_uni = n;
         }
+        local_tp.initial_max_data = flow.receive_window;
+        local_tp.initial_max_stream_data_bidi_local = flow.stream_receive_window;
+        local_tp.initial_max_stream_data_bidi_remote = flow.stream_receive_window;
+        local_tp.initial_max_stream_data_uni = flow.stream_receive_window;
         let local_idle_timeout_ms = local_tp.max_idle_timeout;
         let idle_timeout = idle_timeout_from_ms(local_idle_timeout_ms);
         let local_max_streams_bidi = local_tp.initial_max_streams_bidi;
+        let local_max_data = local_tp.initial_max_data;
         // RFC 9369 section 5: only accept tickets this version issued.
         let mut handshake = handshake;
         handshake.ticket_key = handshake.ticket_key.map(|k| version.ticket_keys(k));
@@ -452,6 +495,14 @@ impl Connection {
             conn_max_data: 10 * 1024 * 1024,
             conn_data_sent: 0,
             data_blocked_sent_at: None,
+            local_max_data,
+            conn_recv_window: flow.receive_window,
+            conn_window_opened_at: now,
+            conn_consumed: 0,
+            conn_recv_highest: 0,
+            pending_max_data: false,
+            send_queued: 0,
+            flow,
             token: Vec::new(),
             short_cid_len: 0,
             retry_processed: false,
@@ -814,6 +865,7 @@ impl Connection {
             ctx.initial_max_streams_bidi,
             ctx.initial_max_streams_uni,
             ctx.keep_alive_interval,
+            ctx.flow,
         );
         fresh.reacted_to_version_negotiation = true;
         *self = fresh;
@@ -988,8 +1040,27 @@ impl Connection {
                 fin,
             } => {
                 self.ensure_recv_stream(id);
+                // RFC 9000 section 4.1: data past either limit we advertised
+                // is a FLOW_CONTROL_ERROR. The largest offset seen, not the
+                // bytes received, is what the limits bound.
+                let end = offset.saturating_add(data.len() as u64);
+                let credit_delta = match self.streams.get(&id) {
+                    Some(st) if st.recv.reset => return,
+                    Some(st) if end > st.recv.max_data => {
+                        self.fail_transport(FLOW_CONTROL_ERROR, "stream data past MAX_STREAM_DATA");
+                        return;
+                    }
+                    Some(st) => end.saturating_sub(st.recv.highest),
+                    None => return,
+                };
+                if self.conn_recv_highest.saturating_add(credit_delta) > self.local_max_data {
+                    self.fail_transport(FLOW_CONTROL_ERROR, "stream data past MAX_DATA");
+                    return;
+                }
+                self.conn_recv_highest += credit_delta;
                 let mut grant_credit = false;
                 if let Some(st) = self.streams.get_mut(&id) {
+                    st.recv.highest = st.recv.highest.max(end);
                     if let Ok(readable) = st.recv.ingest(offset, data, fin) {
                         if !st.opened_event && id.initiator() != self.side {
                             st.opened_event = true;
@@ -1057,7 +1128,27 @@ impl Connection {
                 self.events
                     .push_back(Event::ConnectionLost { reason: reason_err });
             }
-            Frame::ResetStream { id, error_code, .. } => {
+            Frame::ResetStream { id, error_code, final_size } => {
+                // RFC 9000 section 4.5: the final size counts against the
+                // connection limit like data would; nothing more will be
+                // read on the stream, so its unread remainder is consumed.
+                let accounted = self.streams.get(&id).map(|st| {
+                    (st.recv.reset, final_size.saturating_sub(st.recv.highest), final_size.saturating_sub(st.recv.consumed))
+                });
+                if let Some((false, delta, unread)) = accounted {
+                    if self.conn_recv_highest.saturating_add(delta) > self.local_max_data {
+                        self.fail_transport(FLOW_CONTROL_ERROR, "final size past MAX_DATA");
+                        return;
+                    }
+                    self.conn_recv_highest += delta;
+                    self.conn_consumed += unread;
+                    if let Some(st) = self.streams.get_mut(&id) {
+                        st.recv.highest = st.recv.highest.max(final_size);
+                        st.recv.consumed = final_size;
+                        st.recv.readable.clear();
+                        st.recv.reset = true;
+                    }
+                }
                 self.events.push_back(Event::Stream(StreamEvent::Stopped {
                     id,
                     error_code: VarInt(error_code),
@@ -1414,6 +1505,8 @@ impl Connection {
             }
         }
 
+        self.queue_flow_control_updates(now);
+
         // STREAM frames on Data. Note whether the congestion window held
         // stream data back, or the loop ended for lack of data (RFC 9002
         // section 7.8: only the former lets acknowledgements grow the window).
@@ -1461,6 +1554,7 @@ impl Connection {
                 };
                 if new_data {
                     self.conn_data_sent += data.len() as u64;
+                    self.send_queued = self.send_queued.saturating_sub(data.len() as u64);
                 }
                 let mut payload = Vec::new();
                 writer::stream(&mut payload, id, offset, &data, fin);
@@ -1527,6 +1621,98 @@ impl Connection {
     /// (RFC 9002 section 7.5).
     fn can_send_data(&self, bytes: usize) -> bool {
         self.probe_bypass || self.loss.congestion().can_send(bytes)
+    }
+
+    /// Raise the receive limits the application has read into (RFC 9000
+    /// section 4.1): MAX_DATA once more than half the connection window
+    /// has been consumed, MAX_STREAM_DATA likewise per stream. A window
+    /// the peer filled within two smoothed round trips is doubled, up to
+    /// the configured ceiling, so a fast path is not held to the initial
+    /// size; one filled slowly keeps its size. Due updates, new or lost,
+    /// go out as recoverable frames (section 13.3).
+    fn queue_flow_control_updates(&mut self, now: Instant) {
+        if self.spaces[2].secrets.is_none() {
+            return;
+        }
+        let two_rtt = self.loss.rtt().smoothed_rtt() * 2;
+        if self.local_max_data.saturating_sub(self.conn_consumed) < self.conn_recv_window / 2 {
+            if now.saturating_duration_since(self.conn_window_opened_at) <= two_rtt {
+                self.conn_recv_window = (self.conn_recv_window * 2)
+                    .min(self.flow.receive_window_ceiling)
+                    .max(self.conn_recv_window);
+            }
+            self.local_max_data = self.conn_consumed + self.conn_recv_window;
+            self.conn_window_opened_at = now;
+            self.pending_max_data = true;
+        }
+        let ceiling = self.flow.stream_receive_window_ceiling;
+        for st in self.streams.values_mut() {
+            let recv = &mut st.recv;
+            if recv.window == 0 || recv.fin || recv.reset {
+                continue;
+            }
+            if recv.max_data.saturating_sub(recv.consumed) < recv.window / 2 {
+                if now.saturating_duration_since(recv.opened_at) <= two_rtt {
+                    recv.window = (recv.window * 2).min(ceiling).max(recv.window);
+                }
+                recv.max_data = recv.consumed + recv.window;
+                recv.reassembler.set_max_buffered(recv.window);
+                recv.opened_at = now;
+                recv.pending_max = true;
+            }
+        }
+
+        let mut due: Vec<(StreamId, u64)> = self
+            .streams
+            .iter()
+            .filter(|(_, st)| st.recv.pending_max)
+            .map(|(id, st)| (*id, st.recv.max_data))
+            .collect();
+        due.sort();
+        let mut payload = Vec::new();
+        let mut frames = Vec::new();
+        if self.pending_max_data {
+            writer::max_data(&mut payload, self.local_max_data);
+            frames.push(RecoverableFrame::MaxData { max: self.local_max_data });
+        }
+        for (id, max) in due {
+            writer::max_stream_data(&mut payload, id, max);
+            frames.push(RecoverableFrame::MaxStreamData { id, max });
+            // Keep each packet comfortably inside the datagram budget.
+            if payload.len() >= 1000 && !self.queue_flow_control_packet(&mut payload, &mut frames, now) {
+                return;
+            }
+        }
+        if !frames.is_empty() {
+            self.queue_flow_control_packet(&mut payload, &mut frames, now);
+        }
+    }
+
+    /// Send one packet of MAX_DATA / MAX_STREAM_DATA frames and clear the
+    /// due flags it covers. On a congestion block the flags stay set for
+    /// the next flush.
+    fn queue_flow_control_packet(
+        &mut self,
+        payload: &mut Vec<u8>,
+        frames: &mut Vec<RecoverableFrame>,
+        now: Instant,
+    ) -> bool {
+        let sent = std::mem::take(frames);
+        if !self.queue_packet(SpaceId::Data, std::mem::take(payload), sent.clone(), true, true, now) {
+            return false;
+        }
+        for frame in sent {
+            match frame {
+                RecoverableFrame::MaxData { .. } => self.pending_max_data = false,
+                RecoverableFrame::MaxStreamData { id, .. } => {
+                    if let Some(st) = self.streams.get_mut(&id) {
+                        st.recv.pending_max = false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     /// Tell the peer which of its limits we are waiting on (RFC 9000
@@ -1834,6 +2020,19 @@ self.version,
                         }
                     }
                 }
+                RecoverableFrame::MaxData { max } => {
+                    // Still the current limit: advertise it again.
+                    if self.local_max_data == *max {
+                        self.pending_max_data = true;
+                    }
+                }
+                RecoverableFrame::MaxStreamData { id, max } => {
+                    if let Some(st) = self.streams.get_mut(id) {
+                        if st.recv.max_data == *max && !st.recv.fin && !st.recv.reset {
+                            st.recv.pending_max = true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1862,6 +2061,18 @@ self.version,
                     if let Some(st) = self.streams.get_mut(&id) {
                         if st.send.blocked_sent_at == Some(max) {
                             st.send.blocked_sent_at = None;
+                        }
+                    }
+                }
+                RecoverableFrame::MaxData { max } => {
+                    if self.local_max_data == max {
+                        self.pending_max_data = true;
+                    }
+                }
+                RecoverableFrame::MaxStreamData { id, max } => {
+                    if let Some(st) = self.streams.get_mut(&id) {
+                        if st.recv.max_data == max && !st.recv.fin && !st.recv.reset {
+                            st.recv.pending_max = true;
                         }
                     }
                 }
@@ -1902,19 +2113,29 @@ self.version,
         if self.streams.contains_key(&id) {
             return;
         }
-        let max = self
-            .peer_tp
-            .as_ref()
-            .map(|t| t.initial_max_stream_data_bidi_remote)
-            .unwrap_or(1 << 20);
+        // A peer-opened stream: our send limit on a bidirectional one is
+        // the peer's `initial_max_stream_data_bidi_local` (RFC 9000 section
+        // 18.2, the peer being the initiator); on a unidirectional one we
+        // never send. Our receive window is what we advertised for
+        // streams the peer opens.
+        let send_max = match (id.dir(), &self.peer_tp) {
+            (Dir::Bi, Some(tp)) => tp.initial_max_stream_data_bidi_local,
+            (Dir::Bi, None) => 1 << 20,
+            (Dir::Uni, _) => 0,
+        };
+        let recv_window = match id.dir() {
+            Dir::Bi => self.local_tp.initial_max_stream_data_bidi_remote,
+            Dir::Uni => self.local_tp.initial_max_stream_data_uni,
+        };
+        let now = self.last_activity;
         self.streams.insert(
             id,
             StreamState {
                 send: SendStream {
-                    max_data: max,
+                    max_data: send_max,
                     ..Default::default()
                 },
-                recv: RecvStream::new(1 << 20),
+                recv: RecvStream::new(recv_window, now),
                 opened_event: id.initiator() == self.side,
                 bidi_credit_granted: false,
             },
@@ -1961,6 +2182,8 @@ self.version,
             .map(|t| t.initial_max_stream_data_bidi_remote)
             .or(self.remembered_0rtt_stream_max)
             .unwrap_or(1 << 20);
+        let recv_window = self.local_tp.initial_max_stream_data_bidi_local;
+        let now = self.last_activity;
         self.streams.insert(
             id,
             StreamState {
@@ -1968,7 +2191,7 @@ self.version,
                     max_data: max,
                     ..Default::default()
                 },
-                recv: RecvStream::new(1 << 20),
+                recv: RecvStream::new(recv_window, now),
                 opened_event: true,
                 bidi_credit_granted: false,
             },
@@ -1996,7 +2219,7 @@ self.version,
                     max_data: max,
                     ..Default::default()
                 },
-                recv: RecvStream::new(0),
+                recv: RecvStream::new(0, self.last_activity),
                 opened_event: true,
                 bidi_credit_granted: false,
             },
@@ -2034,7 +2257,22 @@ self.version,
     /// Write to a send stream.
     pub fn write_stream(&mut self, id: StreamId, data: &[u8]) -> Result<usize, WriteError> {
         let st = self.streams.get_mut(&id).ok_or(WriteError::UnknownStream)?;
-        st.send.write(data).map_err(|_| WriteError::Blocked)
+        // The send window caps what is queued but not yet sent, across
+        // all streams: a write past it is cut short like one at the
+        // peer's stream limit.
+        let data = match self.flow.send_window {
+            Some(window) => {
+                let room = usize::try_from(window.saturating_sub(self.send_queued)).unwrap_or(usize::MAX);
+                if room == 0 && !data.is_empty() {
+                    return Err(WriteError::Blocked);
+                }
+                &data[..data.len().min(room)]
+            }
+            None => data,
+        };
+        let n = st.send.write(data).map_err(|_| WriteError::Blocked)?;
+        self.send_queued += n as u64;
+        Ok(n)
     }
 
     /// Finish a send stream.
@@ -2047,7 +2285,10 @@ self.version,
     /// Read from a recv stream.
     pub fn read_stream(&mut self, id: StreamId, max: usize) -> Result<(Bytes, bool), ()> {
         let st = self.streams.get_mut(&id).ok_or(())?;
-        Ok(st.recv.read(max))
+        let before = st.recv.consumed;
+        let out = st.recv.read(max);
+        self.conn_consumed += st.recv.consumed - before;
+        Ok(out)
     }
 
     /// Reset a send stream.
@@ -2378,6 +2619,7 @@ mod tests {
             None,
             None,
             None,
+            FlowControlLimits::default(),
         );
         // Drop handshake CRYPTO so flush only sees our Data packets.
         for sp in &mut conn.spaces {
@@ -2444,6 +2686,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    FlowControlLimits::default(),
                 );
                 let mut buf = Vec::new();
                 conn.poll_transmit(Instant::now(), &mut buf).expect("a first flight");
@@ -2474,6 +2717,7 @@ mod tests {
             None,
             None,
             None,
+            FlowControlLimits::default(),
         )
     }
 
@@ -2620,6 +2864,7 @@ mod tests {
             None,
             None,
             None,
+            FlowControlLimits::default(),
         );
         assert_eq!(v2_client.local_tp.version_information, Some(VersionInformation { chosen: V2, available: vec![V2] }));
         let _ = &mut v2_client;
@@ -3018,6 +3263,7 @@ mod tests {
             None,
             None,
             None,
+            FlowControlLimits::default(),
         );
         let first = drain_frames(&mut conn, now);
         assert!(carries(&first, |f| matches!(f, Frame::Crypto { .. })), "first flight");
@@ -3381,5 +3627,256 @@ mod tests {
         assert!(largest >= newer + 3);
         let quiet = drain_frames(&mut conn, now);
         assert!(!carries(&quiet, |f| matches!(f, Frame::DataBlocked { .. })), "{quiet:?}");
+    }
+
+    /// Feed `total` bytes of peer STREAM data on `id` in `chunk`-byte
+    /// frames, as the peer's packets would.
+    fn receive_stream_data(conn: &mut Connection, id: StreamId, total: usize, chunk: usize, now: Instant) {
+        receive_stream_data_from(conn, id, 0, total, chunk, now);
+    }
+
+    /// As `receive_stream_data`, starting at stream offset `start`.
+    fn receive_stream_data_from(conn: &mut Connection, id: StreamId, start: usize, len: usize, chunk: usize, now: Instant) {
+        let mut offset = start;
+        let total = start + len;
+        while offset < total {
+            let len = chunk.min(total - offset);
+            conn.handle_frame(
+                SpaceId::Data,
+                Frame::Stream { id, offset: offset as u64, data: Bytes::from(vec![0x5a; len]), fin: false },
+                now,
+            );
+            offset += len;
+        }
+    }
+
+    /// Read everything the application can on `id`; returns the byte count.
+    fn read_all(conn: &mut Connection, id: StreamId) -> usize {
+        let mut total = 0;
+        loop {
+            let (data, _) = conn.read_stream(id, usize::MAX).expect("stream");
+            if data.is_empty() {
+                return total;
+            }
+            total += data.len();
+        }
+    }
+
+    /// RFC 9000 section 4.1: a receiver raises its stream limit with
+    /// MAX_STREAM_DATA as the application consumes data. Regression: the
+    /// limit advertised in the transport parameters was never raised, so
+    /// a peer with more than one window's worth to send on a stream
+    /// blocked on it forever.
+    #[test]
+    fn max_stream_data_is_raised_as_the_application_reads() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = conn.open_bi().expect("stream");
+        let window = 1 << 20;
+        receive_stream_data(&mut conn, id, window, 1024, now);
+        assert_eq!(read_all(&mut conn, id), window);
+        let out = drain_frames(&mut conn, now);
+        let raised: Vec<u64> = out
+            .iter()
+            .flat_map(|(_, frames)| frames.iter())
+            .filter_map(|f| match f {
+                Frame::MaxStreamData { id: sid, max } if *sid == id => Some(*max),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raised.len(), 1, "one MAX_STREAM_DATA after the window was consumed: {out:?}");
+        assert!(raised[0] >= 2 * window as u64, "new limit {} leaves no room past the consumed {window}", raised[0]);
+        // Not repeated while nothing more has been consumed.
+        let again = drain_frames(&mut conn, now);
+        assert!(!carries(&again, |f| matches!(f, Frame::MaxStreamData { .. })), "{again:?}");
+    }
+
+    /// The connection-level counterpart: MAX_DATA once the application has
+    /// consumed half of the connection window across several streams.
+    #[test]
+    fn max_data_is_raised_as_the_application_reads() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let window = 1 << 20;
+        // Six streams of one window each: more than half the 10 MiB
+        // connection limit advertised by default.
+        for _ in 0..6 {
+            let id = conn.open_bi().expect("stream");
+            receive_stream_data(&mut conn, id, window, 4096, now);
+            assert_eq!(read_all(&mut conn, id), window);
+        }
+        let out = drain_frames(&mut conn, now);
+        let raised: Vec<u64> = out
+            .iter()
+            .flat_map(|(_, frames)| frames.iter())
+            .filter_map(|f| match f {
+                Frame::MaxData { max } => Some(*max),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(raised.len(), 1, "one MAX_DATA after half the window was consumed: {out:?}");
+        assert!(raised[0] > 10 * window as u64, "new limit {} is not above the initial 10 MiB", raised[0]);
+    }
+
+    /// The MAX_STREAM_DATA limits `conn` sends for `id` on the next drain.
+    fn stream_limits_sent(conn: &mut Connection, id: StreamId, now: Instant) -> Vec<u64> {
+        drain_frames(conn, now)
+            .iter()
+            .flat_map(|(_, frames)| frames.iter())
+            .filter_map(|f| match f {
+                Frame::MaxStreamData { id: sid, max } if *sid == id => Some(*max),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A client whose stream receive window starts at `window` and may grow
+    /// to `ceiling`.
+    fn test_client_with_stream_window(now: Instant, window: u64, ceiling: u64) -> Connection {
+        let mut conn = test_client(now);
+        conn.local_tp.initial_max_stream_data_bidi_local = window;
+        conn.local_tp.initial_max_stream_data_bidi_remote = window;
+        conn.flow.stream_receive_window = window;
+        conn.flow.stream_receive_window_ceiling = ceiling;
+        conn
+    }
+
+    /// A stream window the peer fills within two smoothed round trips
+    /// (333 ms until the first sample) doubles each time it is raised, and
+    /// stops at the ceiling.
+    #[test]
+    fn a_window_filled_within_two_round_trips_doubles_up_to_the_ceiling() {
+        let now = Instant::now();
+        let mut conn = test_client_with_stream_window(now, 4096, 16384);
+        let id = conn.open_bi().expect("stream");
+        let mut t = now;
+        let mut consumed = 0usize;
+        let mut limit = 4096u64;
+        for expected_window in [8192u64, 16384, 16384, 16384] {
+            receive_stream_data_from(&mut conn, id, consumed, limit as usize - consumed, 1024, t);
+            assert_eq!(read_all(&mut conn, id), limit as usize - consumed);
+            consumed = limit as usize;
+            t += Duration::from_millis(10);
+            let sent = stream_limits_sent(&mut conn, id, t);
+            assert_eq!(sent, vec![consumed as u64 + expected_window], "after consuming {consumed}");
+            limit = sent[0];
+        }
+    }
+
+    /// A window filled slowly keeps its size when raised.
+    #[test]
+    fn a_window_filled_slowly_is_not_doubled() {
+        let now = Instant::now();
+        let mut conn = test_client_with_stream_window(now, 4096, 16384);
+        let id = conn.open_bi().expect("stream");
+        receive_stream_data(&mut conn, id, 4096, 1024, now);
+        assert_eq!(read_all(&mut conn, id), 4096);
+        let later = now + Duration::from_secs(2);
+        assert_eq!(stream_limits_sent(&mut conn, id, later), vec![4096 + 4096]);
+    }
+
+    /// The configured windows are what the transport parameters advertise
+    /// and what a new stream starts with.
+    #[test]
+    fn configured_receive_windows_are_advertised() {
+        let now = Instant::now();
+        let flow = FlowControlLimits {
+            stream_receive_window: 8192,
+            stream_receive_window_ceiling: 8192,
+            receive_window: 65_536,
+            receive_window_ceiling: 65_536,
+            send_window: None,
+        };
+        let mut conn = Connection::new_client(
+            now,
+            "127.0.0.1:4433".parse().unwrap(),
+            "localhost",
+            HandshakeConfig {
+                role: HandshakeRole::Client,
+                mode: HandshakeMode::Quic,
+                alpn: vec![Bytes::from_static(b"hq-interop")],
+                kx_policy: KxPolicy::classical_only(),
+                ..Default::default()
+            },
+            ConnectionId::from_slice(&[1; 8]),
+            ConnectionId::from_slice(&[2; 8]),
+            &[QuicVersion::V1],
+            QuicVersion::V1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            flow,
+        );
+        assert_eq!(conn.local_tp.initial_max_data, 65_536);
+        assert_eq!(conn.local_tp.initial_max_stream_data_bidi_local, 8192);
+        assert_eq!(conn.local_tp.initial_max_stream_data_bidi_remote, 8192);
+        assert_eq!(conn.local_tp.initial_max_stream_data_uni, 8192);
+        assert_eq!(conn.local_max_data, 65_536);
+        let id = conn.open_bi().expect("stream");
+        assert_eq!(conn.streams[&id].recv.max_data, 8192);
+    }
+
+    /// RFC 9000 section 4.1: a peer that sends past the advertised stream
+    /// limit is closed with FLOW_CONTROL_ERROR; likewise past the
+    /// connection limit.
+    #[test]
+    fn data_past_the_advertised_limit_is_a_flow_control_error() {
+        let now = Instant::now();
+        let mut conn = test_client_with_stream_window(now, 4096, 4096);
+        let id = conn.open_bi().expect("stream");
+        receive_stream_data_from(&mut conn, id, 4090, 10, 10, now);
+        assert_eq!(closed_with(&mut conn), Some(FLOW_CONTROL_ERROR), "stream limit");
+
+        let mut conn = test_client_with_stream_window(now, 1 << 20, 1 << 20);
+        conn.local_max_data = 6000;
+        let a = conn.open_bi().expect("stream");
+        let b = conn.open_bi().expect("stream");
+        receive_stream_data(&mut conn, a, 4000, 4000, now);
+        assert_eq!(closed_with(&mut conn), None);
+        receive_stream_data(&mut conn, b, 2001, 2001, now);
+        assert_eq!(closed_with(&mut conn), Some(FLOW_CONTROL_ERROR), "connection limit");
+    }
+
+    /// RFC 9000 section 13.3: a lost MAX_STREAM_DATA is sent again while
+    /// it is still the current limit.
+    #[test]
+    fn lost_max_stream_data_is_sent_again() {
+        let now = Instant::now();
+        let mut conn = test_client_with_stream_window(now, 4096, 4096);
+        let id = conn.open_bi().expect("stream");
+        receive_stream_data(&mut conn, id, 4096, 1024, now);
+        read_all(&mut conn, id);
+        assert_eq!(stream_limits_sent(&mut conn, id, now), vec![8192]);
+        for _ in 0..3 {
+            conn.pto_ping_pending[space_index(SpaceId::Data)] = true;
+            conn.flush_pending_packets(now);
+        }
+        let largest = conn.space(SpaceId::Data).next_pn - 1;
+        drain_frames(&mut conn, now);
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack { largest, delay: 0, ranges: vec![(largest, largest)] },
+            now + Duration::from_millis(20),
+        );
+        assert_eq!(stream_limits_sent(&mut conn, id, now), vec![8192], "sent again after loss");
+        assert_eq!(stream_limits_sent(&mut conn, id, now), Vec::<u64>::new(), "but not twice");
+    }
+
+    /// The send window caps what is queued but unsent across all streams:
+    /// a write past it is cut short and completes as data leaves.
+    #[test]
+    fn send_window_caps_queued_data_across_streams() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.flow.send_window = Some(3000);
+        let a = conn.open_bi().expect("stream");
+        let b = conn.open_bi().expect("stream");
+        assert_eq!(conn.write_stream(a, &[1; 2000]).unwrap(), 2000);
+        assert_eq!(conn.write_stream(b, &[2; 2000]).unwrap(), 1000, "short write at the send window");
+        assert!(matches!(conn.write_stream(b, &[2; 1]), Err(WriteError::Blocked)));
+        assert_eq!(stream_bytes(&drain_frames(&mut conn, now)), 3000);
+        assert_eq!(conn.write_stream(b, &[2; 2000]).unwrap(), 2000, "room again once sent");
     }
 }

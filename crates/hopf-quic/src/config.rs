@@ -721,6 +721,8 @@ pub struct QuicTransportOptions {
     keep_alive_interval: Option<Duration>,
     stream_receive_window: Option<u32>,
     receive_window: Option<u32>,
+    stream_receive_window_ceiling: Option<u32>,
+    receive_window_ceiling: Option<u32>,
     send_window: Option<u64>,
     max_concurrent_bidi_streams: Option<u32>,
     max_concurrent_uni_streams: Option<u32>,
@@ -746,19 +748,40 @@ impl QuicTransportOptions {
         self
     }
 
-    /// Stream receive window.
+    /// Initial per-stream receive window (`initial_max_stream_data_*`,
+    /// default 1 MiB). Raised with MAX_STREAM_DATA as the application
+    /// reads; a stream the peer fills within two round trips has its
+    /// window doubled, up to [`Self::stream_receive_window_ceiling`].
     pub fn stream_receive_window(mut self, value: u32) -> Self {
         self.stream_receive_window = Some(value);
         self
     }
 
-    /// Connection receive window.
+    /// Initial connection receive window (`initial_max_data`, default
+    /// 10 MiB); grows like the stream window up to
+    /// [`Self::receive_window_ceiling`].
     pub fn receive_window(mut self, value: u32) -> Self {
         self.receive_window = Some(value);
         self
     }
 
-    /// Send window.
+    /// Largest a stream receive window grows to (default 16 MiB). Must be
+    /// at least the initial window.
+    pub fn stream_receive_window_ceiling(mut self, value: u32) -> Self {
+        self.stream_receive_window_ceiling = Some(value);
+        self
+    }
+
+    /// Largest the connection receive window grows to (default 24 MiB).
+    /// Must be at least the initial window.
+    pub fn receive_window_ceiling(mut self, value: u32) -> Self {
+        self.receive_window_ceiling = Some(value);
+        self
+    }
+
+    /// Cap on stream bytes queued for sending but not yet sent, across all
+    /// streams (default unbounded). A write past it is cut short and
+    /// retried as data leaves.
     pub fn send_window(mut self, value: u64) -> Self {
         self.send_window = Some(value);
         self
@@ -796,6 +819,30 @@ pub fn apply_server_quic_lb(server: &mut Arc<QuicServerConfig>, config: &QuicLbC
     Arc::make_mut(server).quic_lb(config);
 }
 
+/// Copy the flow-control options into `flow` and check the result.
+fn apply_flow_control_options(
+    flow: &mut crate::transport::types::FlowControlLimits,
+    options: &QuicTransportOptions,
+) -> io::Result<()> {
+    if let Some(n) = options.stream_receive_window {
+        flow.stream_receive_window = u64::from(n);
+    }
+    if let Some(n) = options.receive_window {
+        flow.receive_window = u64::from(n);
+    }
+    if let Some(n) = options.stream_receive_window_ceiling {
+        flow.stream_receive_window_ceiling = u64::from(n);
+    }
+    if let Some(n) = options.receive_window_ceiling {
+        flow.receive_window_ceiling = u64::from(n);
+    }
+    if let Some(n) = options.send_window {
+        flow.send_window = Some(n);
+    }
+    flow.validate()
+        .map_err(|msg| io::Error::new(io::ErrorKind::InvalidInput, msg))
+}
+
 /// Apply transport options to server.
 pub fn apply_server_transport_options(
     server: &mut Arc<QuicServerConfig>,
@@ -817,7 +864,7 @@ pub fn apply_server_transport_options(
     if let Some(d) = options.keep_alive_interval {
         cfg.inner.keep_alive_interval = Some(d);
     }
-    Ok(())
+    apply_flow_control_options(&mut cfg.inner.flow, options)
 }
 
 /// Apply transport options to client.
@@ -841,7 +888,7 @@ pub fn apply_client_transport_options(
     if let Some(d) = options.keep_alive_interval {
         cfg.inner.keep_alive_interval = Some(d);
     }
-    Ok(())
+    apply_flow_control_options(&mut cfg.inner.flow, options)
 }
 
 #[cfg(test)]
@@ -872,6 +919,28 @@ mod tests {
         let _ = server;
         let client = client_config_for_pem_bytes_hopf(&pem, &[ALPN_H3]).unwrap();
         let _ = client;
+    }
+
+    /// The receive-window options reach the limits a connection is built
+    /// with, and a ceiling below its window is rejected.
+    #[test]
+    fn transport_options_set_the_receive_windows() {
+        let (mut server, _) = server_config_self_signed(&["localhost"], &[ALPN_H3]).unwrap();
+        let opts = QuicTransportOptions::new()
+            .stream_receive_window(8192)
+            .stream_receive_window_ceiling(65_536)
+            .receive_window(1 << 20)
+            .receive_window_ceiling(4 << 20)
+            .send_window(1 << 16);
+        apply_server_transport_options(&mut server, &opts).unwrap();
+        assert_eq!(server.inner.flow.stream_receive_window, 8192);
+        assert_eq!(server.inner.flow.stream_receive_window_ceiling, 65_536);
+        assert_eq!(server.inner.flow.receive_window, 1 << 20);
+        assert_eq!(server.inner.flow.receive_window_ceiling, 4 << 20);
+        assert_eq!(server.inner.flow.send_window, Some(1 << 16));
+
+        let bad = QuicTransportOptions::new().receive_window(1 << 20).receive_window_ceiling(1 << 16);
+        assert!(apply_server_transport_options(&mut server, &bad).is_err());
     }
 
     #[test]

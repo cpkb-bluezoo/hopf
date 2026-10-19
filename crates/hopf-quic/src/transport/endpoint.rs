@@ -19,7 +19,7 @@ use crate::transport::version::QuicVersion;
 use crate::transport::quic_lb::{ConnectionIdGenerator, RandomConnectionIdGenerator};
 use crate::transport::types::{
     ConnectionEvent, ConnectionHandle, ConnectionId, DatagramEvent, EndpointConfig, Incoming,
-    Transmit,
+    FlowControlLimits, Transmit,
 };
 
 /// Server crypto + transport settings.
@@ -43,6 +43,8 @@ pub struct ServerConfig {
     pub initial_max_streams_uni: Option<u64>,
     /// Keep-alive PING interval (`None` = disabled).
     pub keep_alive_interval: Option<Duration>,
+    /// Receive windows and send buffer cap.
+    pub flow: FlowControlLimits,
     /// Where server-issued connection IDs come from. `None` = 8 random
     /// octets; set it to issue QUIC-LB IDs (see [`crate::transport::quic_lb`]).
     pub cid_generator: Option<Arc<dyn ConnectionIdGenerator>>,
@@ -64,6 +66,7 @@ impl ServerConfig {
             initial_max_streams_bidi: None,
             initial_max_streams_uni: None,
             keep_alive_interval: None,
+            flow: FlowControlLimits::default(),
             cid_generator: None,
             versions: QuicVersion::ALL.to_vec(),
         }
@@ -91,6 +94,8 @@ pub struct ClientConfig {
     pub initial_max_streams_uni: Option<u64>,
     /// Keep-alive PING interval (`None` = disabled).
     pub keep_alive_interval: Option<Duration>,
+    /// Receive windows and send buffer cap.
+    pub flow: FlowControlLimits,
 }
 
 impl ClientConfig {
@@ -105,6 +110,7 @@ impl ClientConfig {
             initial_max_streams_bidi: None,
             initial_max_streams_uni: None,
             keep_alive_interval: None,
+            flow: FlowControlLimits::default(),
         }
     }
 }
@@ -192,6 +198,7 @@ impl Endpoint {
             config.initial_max_streams_bidi,
             config.initial_max_streams_uni,
             config.keep_alive_interval,
+            config.flow.clone(),
         );
         let handle = self.alloc_handle();
         self.cids.insert(local_cid, handle);
@@ -388,6 +395,7 @@ impl Endpoint {
             server.initial_max_streams_bidi,
             server.initial_max_streams_uni,
             server.keep_alive_interval,
+            server.flow.clone(),
         );
         let handle = self.alloc_handle();
         self.cids.insert(local_cid, handle);

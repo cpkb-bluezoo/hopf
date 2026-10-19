@@ -26,6 +26,11 @@ impl StreamReassembler {
         }
     }
 
+    /// Raise (or lower) the buffer limit, as the flow-control window moves.
+    pub fn set_max_buffered(&mut self, max_buffered: u64) {
+        self.max_buffered = max_buffered;
+    }
+
     /// Next contiguous offset expected.
     pub fn next_offset(&self) -> u64 {
         self.next_offset

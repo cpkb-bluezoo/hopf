@@ -4239,4 +4239,82 @@ mod tests {
         );
         server.shutdown();
     }
+
+    struct CountsBytes {
+        total: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ProtocolHandler for CountsBytes {
+        fn connected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            self.total.fetch_add(data.len(), std::sync::atomic::Ordering::SeqCst);
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    struct SendsBulk {
+        size: usize,
+        sent: bool,
+    }
+
+    impl ProtocolHandler for SendsBulk {
+        fn connected(&mut self, endpoint: &mut dyn Endpoint) {
+            if !self.sent {
+                endpoint.send(&vec![0xab; self.size]);
+                self.sent = true;
+            }
+        }
+        fn receive(&mut self, _endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+            *data = &[];
+        }
+        fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {}
+        fn error(&mut self, _endpoint: &mut dyn Endpoint, _err: &io::Error) {}
+    }
+
+    /// RFC 9000 section 4.1 end to end over UDP loopback: a transfer larger
+    /// than the initial stream window completes because the receiver
+    /// raises MAX_STREAM_DATA as its application reads. Regression: the
+    /// limit advertised in the transport parameters was final, so the
+    /// transfer stalled at the first window.
+    #[test]
+    fn a_transfer_larger_than_the_initial_stream_window_completes() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+        let (server_cfg, pem) =
+            server_config_self_signed_hopf(&["localhost"], &[b"hq-interop"]).unwrap();
+        let client_cfg = client_config_for_pem_bytes_hopf(&pem, &[b"hq-interop"]).unwrap();
+
+        let total = Arc::new(AtomicUsize::new(0));
+        let total2 = Arc::clone(&total);
+        let server = listen_quic(
+            QuicListenConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                server_cfg,
+                Arc::new(move || {
+                    Box::new(CountsBytes { total: Arc::clone(&total2) }) as Box<dyn ProtocolHandler>
+                }),
+            )
+            .with_hardening(crate::QuicListenHardening::permissive()),
+        )
+        .unwrap();
+
+        // Three times the default 1 MiB stream window.
+        const SIZE: usize = 3 * 1024 * 1024;
+        let _client = connect_quic(QuicConnectConfig::new(
+            server.local_addr,
+            client_cfg,
+            "localhost",
+            Arc::new(|| Box::new(SendsBulk { size: SIZE, sent: false }) as Box<dyn ProtocolHandler>),
+        ))
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while total.load(SeqCst) < SIZE && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(total.load(SeqCst), SIZE, "transfer stalled");
+        server.shutdown();
+    }
 }

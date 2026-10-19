@@ -46,6 +46,19 @@ pub enum RecoverableFrame {
         /// The peer's stream limit the sender was blocked at.
         max: u64,
     },
+    /// MAX_DATA advertising the given connection limit (sent again after
+    /// loss while it is still the current limit).
+    MaxData {
+        /// The limit advertised.
+        max: u64,
+    },
+    /// MAX_STREAM_DATA advertising the given stream limit.
+    MaxStreamData {
+        /// Stream identifier.
+        id: StreamId,
+        /// The limit advertised.
+        max: u64,
+    },
 }
 
 /// A tracked outstanding (sent, not yet acknowledged or declared lost) packet.
