@@ -329,6 +329,24 @@ impl Connection {
         &mut self.spaces[space_index(id)]
     }
 
+    /// Discard a packet number space (RFC 9001 section 4.9, RFC 9002
+    /// Appendix A.11): its keys, queued and tracked data, and the loss
+    /// detector's in-flight accounting, without a congestion event.
+    /// Packets for the space are dropped from then on, and none are sent.
+    fn discard_space(&mut self, space: SpaceId) {
+        let sp = self.space_mut(space);
+        if sp.secrets.is_none() {
+            return;
+        }
+        sp.secrets = None;
+        sp.crypto_pending.clear();
+        sp.crypto_retransmit.clear();
+        sp.pending_ack.clear();
+        sp.received.clear();
+        self.pto_ping_pending[space_index(space)] = false;
+        self.loss.discard_packet_number_space(space);
+    }
+
     fn space(&self, id: SpaceId) -> &Space {
         &self.spaces[space_index(id)]
     }
@@ -888,6 +906,11 @@ impl Connection {
             self.server_packet_processed = true;
         }
         self.on_decrypted(space, full_pn, &payload, now);
+        // RFC 9001 section 4.9.1: a server discards Initial keys when it
+        // first successfully processes a Handshake packet.
+        if space == SpaceId::Handshake && self.side == Side::Server {
+            self.discard_space(SpaceId::Initial);
+        }
         packet_len
     }
 
@@ -1242,6 +1265,9 @@ impl Connection {
                 if self.side == Side::Client {
                     self.handshake_done = true;
                     self.loss.set_handshake_confirmed(true);
+                    // RFC 9001 section 4.9.2: the handshake is confirmed.
+                    self.discard_space(SpaceId::Initial);
+                    self.discard_space(SpaceId::Handshake);
                     self.maybe_establish();
                 }
             }
@@ -2013,6 +2039,14 @@ impl Connection {
                 RecoverableFrame::Ack { largest } => {
                     self.space_mut(space).forget_received_up_to(*largest);
                 }
+                RecoverableFrame::HandshakeDone => {
+                    // The client has the handshake confirmed, so it will
+                    // send nothing more in the Handshake space; until now
+                    // a client whose HANDSHAKE_DONE was lost might still be
+                    // retransmitting its Finished and needed an answer.
+                    self.discard_space(SpaceId::Initial);
+                    self.discard_space(SpaceId::Handshake);
+                }
                 RecoverableFrame::Stream { id, fin: true, .. } => {
                     if let Some(st) = self.streams.get_mut(id) {
                         st.send.fin_acked = true;
@@ -2235,6 +2269,11 @@ self.version,
             src_ip: None,
         };
         self.transmits.push_back((tx, packet));
+        // RFC 9001 section 4.9.1: a client discards Initial keys when it
+        // first sends a Handshake packet.
+        if space == SpaceId::Handshake && self.side == Side::Client {
+            self.discard_space(SpaceId::Initial);
+        }
         true
     }
 
@@ -4783,5 +4822,113 @@ mod tests {
             })
             .expect("an ACK");
         assert_eq!(delay, 8000 >> 3, "{out:?}");
+    }
+
+    /// A Handshake packet (RFC 9000 section 17.2.4) from the peer to `conn`,
+    /// carrying `payload` under the Handshake keys `conn` currently holds.
+    fn peer_handshake_packet(conn: &Connection, pn: u64, payload: &[u8]) -> Vec<u8> {
+        let peer = match conn.side {
+            Side::Client => Side::Server,
+            Side::Server => Side::Client,
+        };
+        let keys = conn.space(SpaceId::Handshake).keys(peer, conn.version).expect("Handshake keys").local;
+        let mut body = payload.to_vec();
+        writer::pad_to(&mut body, 16);
+        let pn_len = 1;
+        let header = long_header::build_handshake(
+            conn.version,
+            &conn.local_cid,
+            &conn.rem_cid,
+            pn,
+            pn_len,
+            body.len() + keys.tag_len(),
+        );
+        let pn_offset = header.len() - pn_len;
+        keys.encrypt(pn, &header, &mut body);
+        let mut packet = header;
+        packet.append(&mut body);
+        keys.protect_header(pn_offset, &mut packet, true);
+        packet
+    }
+
+    fn test_secrets() -> ([u8; 32], [u8; 32]) {
+        crate::transport::packet::protection::initial_secrets(QuicVersion::V1, &[5, 6, 7, 8])
+    }
+
+    /// RFC 9001 sections 4.9.1 and 4.9.2: a client discards Initial keys
+    /// when it first sends a Handshake packet and Handshake keys when the
+    /// handshake is confirmed (HANDSHAKE_DONE), and no probe is armed for
+    /// a discarded space. Regression: no keys were ever discarded, so the
+    /// Initial and Handshake probe timers and sent-packet records lived on
+    /// for the whole connection.
+    #[test]
+    fn client_discards_initial_and_handshake_keys() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.spaces[1].secrets = Some(test_secrets());
+        assert!(conn.spaces[0].secrets.is_some());
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        // Acknowledging a Handshake packet is the first Handshake packet sent.
+        conn.on_decrypted(SpaceId::Handshake, 0, &ping, now);
+        drain_frames(&mut conn, now);
+        assert!(conn.spaces[0].secrets.is_none(), "Initial keys kept after the first Handshake packet");
+        conn.handle_frame(SpaceId::Data, Frame::HandshakeDone, now);
+        assert!(conn.spaces[1].secrets.is_none(), "Handshake keys kept after HANDSHAKE_DONE");
+        // No probe for the discarded spaces: well past a probe timeout
+        // nothing leaves in either (the ClientHello was never acknowledged).
+        conn.handle_timeout(now + Duration::from_secs(3));
+        let out = drain_frames(&mut conn, now + Duration::from_secs(3));
+        assert!(
+            out.iter().all(|(ty, _)| *ty != Some(TYPE_INITIAL) && *ty != Some(TYPE_HANDSHAKE)),
+            "a probe went out in a discarded space: {out:?}"
+        );
+    }
+
+    /// A server keeps its Handshake keys until the packet carrying
+    /// HANDSHAKE_DONE is acknowledged, so a client whose HANDSHAKE_DONE was
+    /// lost and is still sending Handshake packets is answered, not met
+    /// with undecryptable silence; after the acknowledgement they go.
+    #[test]
+    fn server_keeps_handshake_keys_until_handshake_done_is_acknowledged() {
+        let now = Instant::now();
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1]);
+        conn.spaces[1].secrets = Some(test_secrets());
+        conn.spaces[2].secrets = Some(test_secrets());
+        conn.handshake_done_pending = true;
+        let sent = drain_frames(&mut conn, now);
+        assert!(carries(&sent, |f| matches!(f, Frame::HandshakeDone)));
+        let done_pn = conn.space(SpaceId::Data).next_pn - 1;
+        assert!(conn.spaces[1].secrets.is_some(), "Handshake keys discarded before HANDSHAKE_DONE was acknowledged");
+
+        // A retransmitted client Handshake packet is still decrypted and
+        // acknowledged in the Handshake space.
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        let packet = peer_handshake_packet(&conn, 7, &ping);
+        conn.handle_packet(now, &packet);
+        let out = drain_frames(&mut conn, now);
+        assert!(out.iter().any(|(ty, fr)| *ty == Some(TYPE_HANDSHAKE) && fr.iter().any(|f| matches!(f, Frame::Ack { largest: 7, .. }))), "{out:?}");
+
+        conn.handle_frame(SpaceId::Data, Frame::Ack { largest: done_pn, delay: 0, ranges: vec![(done_pn, done_pn)] }, now + Duration::from_millis(20));
+        assert!(conn.spaces[1].secrets.is_none(), "Handshake keys kept after HANDSHAKE_DONE was acknowledged");
+        assert!(conn.spaces[0].secrets.is_none(), "Initial keys kept after the handshake");
+    }
+
+    /// RFC 9001 section 4.9: a packet for a discarded space is dropped.
+    #[test]
+    fn packets_for_a_discarded_space_are_dropped() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.spaces[1].secrets = Some(test_secrets());
+        let scid: Vec<u8> = conn.rem_cid.as_slice().to_vec();
+        let initial = server_initial(&conn, &scid, 9, &ack_only());
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        conn.on_decrypted(SpaceId::Handshake, 0, &ping, now);
+        drain_frames(&mut conn, now);
+        assert!(conn.spaces[0].secrets.is_none());
+        conn.handle_packet(now, &initial);
+        assert_ne!(conn.spaces[0].largest_received, Some(9), "an Initial was processed after the keys were discarded");
     }
 }
