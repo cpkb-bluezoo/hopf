@@ -94,6 +94,11 @@ impl H2ResponseControl {
         self.shared.lock().unwrap().upgrade_handler.take()
     }
 
+    /// Whether a response (headers) has started going out.
+    pub(crate) fn headers_sent(&self) -> bool {
+        self.shared.lock().unwrap().headers_sent
+    }
+
     pub(crate) fn writer(self: &Arc<Self>) -> H2SessionWriter {
         H2SessionWriter {
             control: Arc::clone(self),

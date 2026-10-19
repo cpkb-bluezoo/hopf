@@ -422,6 +422,14 @@ struct H3RequestStream {
     /// The stream ended abruptly and the handler has been told: nothing
     /// more is delivered to it.
     aborted: bool,
+    /// Extended CONNECT (`:method: CONNECT` with `:protocol`): DATA before
+    /// an upgrade is installed is tunnel data, held rather than delivered
+    /// as a request body.
+    extended_connect: bool,
+    /// Tunnel bytes received before the upgrade handler was installed.
+    pending_tunnel: Vec<u8>,
+    /// The tunnel ended (FIN) before the upgrade was installed.
+    tunnel_fin: bool,
     /// Set when a HEADERS payload failed to QPACK-decode — checked in
     /// `receive()`'s tail, where an `Endpoint` is available to close the
     /// connection (RFC 9204 §4.5.1: `QPACK_DECOMPRESSION_FAILED`).
@@ -463,6 +471,9 @@ impl H3RequestStream {
             upgraded: None,
             malformed: false,
             aborted: false,
+            extended_connect: false,
+            pending_tunnel: Vec::new(),
+            tunnel_fin: false,
             qpack_error: false,
             excessive_load: false,
             connection_error: None,
@@ -488,7 +499,29 @@ impl H3RequestStream {
         )));
     }
 
+    /// Install an upgrade the handler requested from a deferred task
+    /// (`ServerResponseHandle::execute`), handing it the tunnel bytes held
+    /// in the meantime.
+    fn install_deferred_upgrade(&mut self) {
+        if self.upgraded.is_some() {
+            return;
+        }
+        let Some(mut up) = self.writer.control.take_upgrade() else {
+            return;
+        };
+        let held = std::mem::take(&mut self.pending_tunnel);
+        if !held.is_empty() {
+            up.receive(&held);
+        }
+        if self.tunnel_fin {
+            up.closed();
+        }
+        self.upgraded = Some(up);
+        self.body_tracker.set_skip(true);
+    }
+
     fn maybe_flush_after_deferred(&mut self, endpoint: &mut dyn Endpoint) {
+        self.install_deferred_upgrade();
         self.deliver_paused_body();
         if let Some(up) = self.upgraded.as_mut() {
             let wants_close = up.wants_close();
@@ -506,6 +539,13 @@ impl H3RequestStream {
     }
 
     fn deliver_request_body(&mut self, payload: &[u8]) {
+        self.install_deferred_upgrade();
+        // Extended CONNECT with no response started yet: this is tunnel
+        // data for an upgrade still to come, not a request body.
+        if self.extended_connect && self.upgraded.is_none() && !self.capsule_mode && !self.writer.control.headers_sent() {
+            self.pending_tunnel.extend_from_slice(payload);
+            return;
+        }
         if self.capsule_mode {
             match self.capsule_parser.push(payload) {
                 Ok(capsules) => {
@@ -600,15 +640,16 @@ impl H3RequestStream {
             self.writer.flush(endpoint);
             return;
         }
+        if self.extended_connect && self.upgraded.is_none() {
+            self.tunnel_fin = true;
+        }
         if let Some(handler) = &mut self.handler {
             if self.body_started {
                 handler.end_request_body(&mut self.writer);
             }
             handler.request_complete(&mut self.writer);
-            if let Some(up) = self.writer.control.take_upgrade() {
-                self.upgraded = Some(up);
-            }
         }
+        self.install_deferred_upgrade();
         self.writer.flush(endpoint);
     }
 }
@@ -720,6 +761,10 @@ impl H3FrameHandler for H3RequestStream {
             state.stream_priority.insert(self.stream_id, params);
             self.writer.priority = params;
         }
+        self.extended_connect = headers
+            .method()
+            .is_some_and(|m| m.eq_ignore_ascii_case("CONNECT"))
+            && headers.contains(":protocol");
         let mut handler = self.factory.create_handler();
         handler.headers(&mut self.writer, &headers);
         if let Some(up) = self.writer.control.take_upgrade() {
@@ -2170,8 +2215,23 @@ mod request_validation_tests {
         trailers: Vec<(String, String)>,
         completed: usize,
         aborted: usize,
+        body: Vec<u8>,
         /// Answer the request as soon as the headers arrive.
         answer_at_once: bool,
+    }
+
+    #[derive(Default)]
+    struct Tunnel {
+        received: Vec<u8>,
+    }
+    struct TunnelHandler(Arc<Mutex<Tunnel>>);
+    impl ProtocolUpgradeHandler for TunnelHandler {
+        fn receive(&mut self, data: &[u8]) {
+            self.0.lock().unwrap().received.extend_from_slice(data);
+        }
+        fn take_outbound(&mut self) -> Vec<u8> {
+            Vec::new()
+        }
     }
 
     struct RecordingHandler {
@@ -2193,6 +2253,9 @@ mod request_validation_tests {
         }
         fn aborted(&mut self, _response: &mut dyn ServerWriter, _err: &io::Error) {
             self.rec.lock().unwrap().aborted += 1;
+        }
+        fn request_body_content(&mut self, _response: &mut dyn ServerWriter, data: &[u8]) {
+            self.rec.lock().unwrap().body.extend_from_slice(data);
         }
         fn request_trailers(&mut self, _response: &mut dyn ServerWriter, headers: &Headers) {
             let mut r = self.rec.lock().unwrap();
@@ -2258,6 +2321,38 @@ mod request_validation_tests {
         stream.receive(&mut ep, &mut empty);
         stream.error(&mut ep, &io::Error::new(io::ErrorKind::ConnectionReset, "late reset"));
         assert_eq!(rec.lock().unwrap().aborted, 0);
+    }
+
+    /// An Extended CONNECT whose handler upgrades from a deferred task:
+    /// tunnel DATA that arrives before the task runs reaches the upgrade
+    /// handler once the deferred flush installs it, not the request body.
+    #[test]
+    fn data_before_a_deferred_upgrade_reaches_the_upgrade_handler() {
+        let (mut stream, rec) = stream_with_recorder();
+        stream.headers_frame(&encode(&[
+            (":method", "CONNECT"),
+            (":protocol", "websocket"),
+            (":scheme", "https"),
+            (":path", "/chat"),
+            (":authority", "x"),
+        ]));
+        assert!(!stream.malformed);
+        stream.data_frame(b"hello");
+
+        let tunnel = Arc::new(Mutex::new(Tunnel::default()));
+        let mut h = Headers::new();
+        h.status(200);
+        assert!(stream.writer.upgrade(h, Box::new(TunnelHandler(Arc::clone(&tunnel)))), "late upgrade refused");
+        let mut ep = RecordingEndpoint::default();
+        let mut empty: &[u8] = &[];
+        stream.receive(&mut ep, &mut empty);
+
+        assert_eq!(tunnel.lock().unwrap().received, b"hello", "tunnel bytes did not reach the upgrade handler");
+        assert!(rec.lock().unwrap().body.is_empty(), "tunnel bytes delivered as request body");
+        assert!(stream.upgraded.is_some());
+
+        stream.data_frame(b" world");
+        assert_eq!(tunnel.lock().unwrap().received, b"hello world");
     }
 
     #[test]

@@ -241,6 +241,13 @@ pub trait ServerWriter {
     /// subsequent connection bytes to `handler`. For HTTP/2 and HTTP/3 Extended
     /// CONNECT it sends **200** and routes stream DATA payloads to `handler`.
     ///
+    /// The call may be made later than [`ServerHandler::headers`], from a
+    /// deferred task via [`ServerResponseHandle::execute`] (after an
+    /// offloaded authentication step, say): on HTTP/2 and HTTP/3, tunnel
+    /// DATA that arrives on an Extended CONNECT stream before the upgrade is
+    /// installed is held and handed to `handler` once it is, as long as no
+    /// other response has started.
+    ///
     /// Returns `false` if the transport cannot upgrade (already responded, wrong
     /// version, etc.).
     fn upgrade(&mut self, _headers: Headers, _handler: Box<dyn ProtocolUpgradeHandler>) -> bool {

@@ -228,6 +228,14 @@ struct H2ServerStream {
     capsule_parser: crate::capsule::CapsuleParser,
     /// RFC 9218 priority for scheduling response DATA.
     priority: PriorityParams,
+    /// Extended CONNECT (`:method: CONNECT` with `:protocol`): DATA before
+    /// an upgrade is installed is tunnel data, held rather than delivered
+    /// as a request body.
+    extended_connect: bool,
+    /// Tunnel bytes received before the upgrade handler was installed.
+    pending_tunnel: Vec<u8>,
+    /// The tunnel ended (END_STREAM) before the upgrade was installed.
+    tunnel_fin: bool,
 }
 
 /// A server stream ended by the peer or the connection before its response
@@ -719,11 +727,43 @@ impl H2Endpoint {
         }
     }
 
+    /// Install an upgrade the handler requested from a deferred task
+    /// (`ServerResponseHandle::execute`), handing it the tunnel bytes held
+    /// in the meantime.
+    fn install_deferred_upgrade(stream: &mut H2ServerStream) {
+        if stream.upgraded.is_some() {
+            return;
+        }
+        let Some(mut up) = stream.writer.control.take_upgrade() else {
+            return;
+        };
+        let held = std::mem::take(&mut stream.pending_tunnel);
+        if !held.is_empty() {
+            up.receive(&held);
+        }
+        if stream.tunnel_fin {
+            up.closed();
+        }
+        stream.upgraded = Some(up);
+    }
+
     fn deliver_server_request_body(
         stream: &mut H2ServerStream,
         data: &[u8],
         end_stream: bool,
     ) {
+        // Extended CONNECT with no response started yet: this is tunnel
+        // data for an upgrade still to come, not a request body.
+        if stream.extended_connect && stream.upgraded.is_none() && !stream.writer.control.headers_sent() {
+            if !data.is_empty() {
+                stream.pending_tunnel.extend_from_slice(data);
+            }
+            if end_stream {
+                stream.tunnel_fin = true;
+                stream.half_closed_remote = true;
+            }
+            return;
+        }
         if stream.writer.control.body_paused() {
             if !data.is_empty() {
                 stream.paused_body.extend_from_slice(data);
@@ -1139,6 +1179,9 @@ impl H2Endpoint {
             upgraded: None,
             capsule_mode: false,
             capsule_parser: crate::capsule::CapsuleParser::new(),
+            extended_connect: false,
+            pending_tunnel: Vec::new(),
+            tunnel_fin: false,
             priority: PriorityParams::default(),
         };
         Self::bind_server_stream(&self.conn, &self.connection_info, &self.deferred_flush, &mut stream);
@@ -1379,10 +1422,17 @@ impl H2Endpoint {
             upgraded: None,
             capsule_mode: false,
             capsule_parser: crate::capsule::CapsuleParser::new(),
+            extended_connect: false,
+            pending_tunnel: Vec::new(),
+            tunnel_fin: false,
             priority: PriorityParams::default(),
         };
         Self::bind_server_stream(&self.conn, &self.connection_info, &self.deferred_flush, &mut stream);
 
+        stream.extended_connect = headers
+            .get(":method")
+            .is_some_and(|m| m.eq_ignore_ascii_case("CONNECT"))
+            && headers.contains(":protocol");
         stream.handler.headers(&mut stream.writer, &headers);
         stream.capsule_mode = crate::capsule::capsule_protocol_enabled(&headers);
         stream.priority = self
@@ -1541,6 +1591,7 @@ impl H2Endpoint {
 
         let end_stream = flags & FLAG_END_STREAM != 0;
         if let Some(stream) = self.server_streams.get_mut(&stream_id) {
+            Self::install_deferred_upgrade(stream);
             if stream.upgraded.is_some() {
                 let capsule_mode = stream.capsule_mode;
                 if capsule_mode {
@@ -2029,8 +2080,10 @@ impl H2Endpoint {
     }
 
     fn flush_one_server_stream(&mut self, stream_id: u32) {
-        // Pull upgrade outbound into the body buffer first.
+        // Install an upgrade requested from a deferred task, then pull the
+        // upgrade's outbound into the body buffer.
         if let Some(stream) = self.server_streams.get_mut(&stream_id) {
+            Self::install_deferred_upgrade(stream);
             if let Some(up) = stream.upgraded.as_mut() {
                 let wants_close = up.wants_close();
                 let out = up.take_outbound();
@@ -2636,6 +2689,94 @@ mod settings_tests {
 }
 
 #[cfg(test)]
+mod deferred_upgrade_tests {
+    use super::*;
+    use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
+
+    fn encode_headers(pairs: &[(&str, &str)]) -> Vec<u8> {
+        super::super::hpack::Encoder::new(4096).encode(pairs.iter().copied())
+    }
+
+    #[derive(Default)]
+    struct Tunnel {
+        received: Vec<u8>,
+    }
+    struct TunnelHandler(Arc<std::sync::Mutex<Tunnel>>);
+    impl ProtocolUpgradeHandler for TunnelHandler {
+        fn receive(&mut self, data: &[u8]) {
+            self.0.lock().unwrap().received.extend_from_slice(data);
+        }
+        fn take_outbound(&mut self) -> Vec<u8> {
+            Vec::new()
+        }
+    }
+
+    /// A handler that answers later (as after an offloaded authentication
+    /// step): nothing happens in `headers`.
+    struct Deferring {
+        body: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl ServerHandler for Deferring {
+        fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+        fn request_body_content(&mut self, _response: &mut dyn ServerWriter, data: &[u8]) {
+            self.body.lock().unwrap().extend_from_slice(data);
+        }
+        fn request_complete(&mut self, _response: &mut dyn ServerWriter) {}
+    }
+    struct DeferringFactory {
+        body: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl ServerHandlerFactory for DeferringFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            Box::new(Deferring { body: Arc::clone(&self.body) })
+        }
+    }
+
+    /// An Extended CONNECT whose handler upgrades from a deferred task:
+    /// tunnel DATA that arrives before the task runs reaches the upgrade
+    /// handler once it is installed, not the request body. Regression: the
+    /// deferred flush read the stored upgrade only to suppress END_STREAM
+    /// and never installed it, so the handler was dropped and the tunnel
+    /// bytes were misparsed as a body.
+    #[test]
+    fn data_before_a_deferred_upgrade_reaches_the_upgrade_handler() {
+        let body = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut ep = H2Endpoint::server(Arc::new(DeferringFactory { body: Arc::clone(&body) }), HttpLimits::default(), false);
+        let block = encode_headers(&[
+            (":method", "CONNECT"),
+            (":protocol", "websocket"),
+            (":scheme", "https"),
+            (":path", "/chat"),
+            (":authority", "example.test"),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+        assert!(ep.out.is_empty(), "no error frame expected: {:?}", ep.out);
+
+        ep.data_frame(1, 0, b"hello");
+
+        // The deferred task runs: what `ServerResponseHandle::execute` does.
+        let tunnel = Arc::new(std::sync::Mutex::new(Tunnel::default()));
+        {
+            let stream = ep.server_streams.get_mut(&1).expect("stream");
+            let mut h = Headers::new();
+            h.status(200);
+            assert!(stream.writer.upgrade(h, Box::new(TunnelHandler(Arc::clone(&tunnel)))), "late upgrade refused");
+        }
+        ep.flush_one_server_stream(1);
+
+        assert_eq!(tunnel.lock().unwrap().received, b"hello", "tunnel bytes did not reach the upgrade handler");
+        assert!(body.lock().unwrap().is_empty(), "tunnel bytes delivered as request body");
+        let header = frame::parse_frame_header(&ep.out[..9]);
+        assert_eq!(header.ty, frame::TYPE_HEADERS, "the 200 must go out");
+        assert_eq!(header.flags & FLAG_END_STREAM, 0);
+
+        ep.data_frame(1, 0, b" world");
+        assert_eq!(tunnel.lock().unwrap().received, b"hello world");
+        assert!(body.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
 mod validation_tests {
     use super::*;
     use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
@@ -2970,6 +3111,9 @@ mod graceful_shutdown_tests {
                 upgraded: None,
                 capsule_mode: false,
                 capsule_parser: crate::capsule::CapsuleParser::new(),
+            extended_connect: false,
+            pending_tunnel: Vec::new(),
+            tunnel_fin: false,
             priority: PriorityParams::default(),
             },
         );
@@ -3136,6 +3280,9 @@ mod server_abort_tests {
                 upgraded: None,
                 capsule_mode: false,
                 capsule_parser: crate::capsule::CapsuleParser::new(),
+                extended_connect: false,
+                pending_tunnel: Vec::new(),
+                tunnel_fin: false,
                 priority: PriorityParams::default(),
             },
         );
@@ -3510,6 +3657,9 @@ mod state_machine_tests {
                 upgraded: None,
                 capsule_mode: false,
                 capsule_parser: crate::capsule::CapsuleParser::new(),
+            extended_connect: false,
+            pending_tunnel: Vec::new(),
+            tunnel_fin: false,
             priority: PriorityParams::default(),
             },
         );
@@ -3572,6 +3722,9 @@ mod state_machine_tests {
                 upgraded: None,
                 capsule_mode: false,
                 capsule_parser: crate::capsule::CapsuleParser::new(),
+            extended_connect: false,
+            pending_tunnel: Vec::new(),
+            tunnel_fin: false,
             priority: PriorityParams::default(),
             },
         );
