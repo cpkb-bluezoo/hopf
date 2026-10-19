@@ -144,6 +144,7 @@ impl<H: ServerHandler> H1ServerCodec<H> {
             up.closed();
             return Ok(());
         }
+        self.driver.abort_open_response();
         if self.driver.state == ParseState::BodyUntilClose {
             self.driver.finish_until_close();
         } else if !self.scanner.at_message_start() || self.driver.state != ParseState::RequestLine {
@@ -231,6 +232,9 @@ struct Driver<H: ServerHandler> {
     request_count: u32,
     max_requests: u32,
     response: Arc<H1ResponseControl>,
+    /// A request has been handed to the application whose response it has
+    /// not yet completed.
+    awaiting_response: bool,
     fatal: Option<HttpError>,
     line_too_long_status: u16,
     /// Active protocol upgrade (WebSocket, …).
@@ -260,6 +264,7 @@ impl<H: ServerHandler> Driver<H> {
             request_count: 0,
             max_requests: 0,
             response: H1ResponseControl::new(),
+            awaiting_response: false,
             fatal: None,
             line_too_long_status: 414,
             upgraded: None,
@@ -307,6 +312,7 @@ impl<H: ServerHandler> Driver<H> {
 
     fn finish_request_no_body(&mut self) {
         self.with_app_response(|app, resp| app.request_complete(resp));
+        self.awaiting_response = !self.response.response_ended();
         self.reset_message_fields();
     }
 
@@ -319,7 +325,25 @@ impl<H: ServerHandler> Driver<H> {
         } else {
             self.with_app_response(|app, resp| app.request_complete(resp));
         }
+        self.awaiting_response = !self.response.response_ended();
         self.reset_message_fields();
+    }
+
+    /// The connection is going away with a response still open: tell the
+    /// application once, so a handler answering over time stops.
+    fn abort_open_response(&mut self) {
+        if !self.awaiting_response || self.upgraded.is_some() {
+            return;
+        }
+        self.awaiting_response = false;
+        if self.response.response_ended() {
+            return;
+        }
+        let err = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection closed before the response completed",
+        );
+        self.with_app_response(|app, resp| app.aborted(resp, &err));
     }
 
     fn reset_message_fields(&mut self) {
@@ -993,5 +1017,44 @@ mod tests {
         p.receive(&mut data).unwrap();
         let out = String::from_utf8(p.take_outbound()).unwrap();
         assert!(out.contains("HTTP/1.1 201"), "{out}");
+    }
+
+    /// A handler that leaves its response open (answered later).
+    #[derive(Default)]
+    struct Slow {
+        completed: usize,
+        aborted: usize,
+    }
+    impl ServerHandler for Arc<Mutex<Slow>> {
+        fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+        fn request_complete(&mut self, _response: &mut dyn ServerWriter) {
+            self.lock().unwrap().completed += 1;
+        }
+        fn aborted(&mut self, _response: &mut dyn ServerWriter, _err: &std::io::Error) {
+            self.lock().unwrap().aborted += 1;
+        }
+    }
+
+    /// The connection closing while a response is still open reaches
+    /// `aborted` once; a connection closing after the response completed
+    /// does not.
+    #[test]
+    fn connection_close_with_an_open_response_reaches_aborted() {
+        let slow = Arc::new(Mutex::new(Slow::default()));
+        let mut p = H1ServerCodec::new(Arc::clone(&slow), HttpLimits::default(), false);
+        let mut req: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        p.receive(&mut req).unwrap();
+        assert_eq!(slow.lock().unwrap().completed, 1);
+        let _ = p.close();
+        assert_eq!(slow.lock().unwrap().aborted, 1, "the open response was not told the connection went away");
+
+        let done = Arc::new(Mutex::new(Rec::default()));
+        let mut p = H1ServerCodec::new(Arc::clone(&done), HttpLimits::default(), false);
+        let mut req: &[u8] = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        p.receive(&mut req).unwrap();
+        let _ = p.take_outbound();
+        let _ = p.close();
+        // `Rec` answers in `headers`, so nothing was open: no abort.
+        assert!(!done.lock().unwrap().events.iter().any(|e| e == "aborted"));
     }
 }

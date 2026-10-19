@@ -72,6 +72,11 @@ pub(crate) struct H1ResponseControl {
 }
 
 impl H1ResponseControl {
+    /// Whether the application has completed the current response.
+    pub(crate) fn response_ended(&self) -> bool {
+        self.shared.lock().unwrap().response_ended
+    }
+
     pub(crate) fn new() -> Arc<Self> {
         // Default: run tasks inline (codec unit tests / before TCP bind).
         let conn = ConnHandle::from_execute(Arc::new(|task| task()));

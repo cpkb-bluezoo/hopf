@@ -419,6 +419,9 @@ struct H3RequestStream {
     /// 9114 §4.3.1) — checked in `receive()`'s tail, where an `Endpoint` is
     /// available to abort the stream.
     malformed: bool,
+    /// The stream ended abruptly and the handler has been told: nothing
+    /// more is delivered to it.
+    aborted: bool,
     /// Set when a HEADERS payload failed to QPACK-decode — checked in
     /// `receive()`'s tail, where an `Endpoint` is available to close the
     /// connection (RFC 9204 §4.5.1: `QPACK_DECOMPRESSION_FAILED`).
@@ -459,6 +462,7 @@ impl H3RequestStream {
             needs_protocol_flush: Arc::clone(&needs_protocol_flush),
             upgraded: None,
             malformed: false,
+            aborted: false,
             qpack_error: false,
             excessive_load: false,
             connection_error: None,
@@ -578,6 +582,9 @@ impl H3RequestStream {
     }
 
     fn finish_request(&mut self, endpoint: &mut dyn Endpoint) {
+        if self.aborted {
+            return;
+        }
         if let Some(up) = self.upgraded.as_mut() {
             up.closed();
             let out = up.take_outbound();
@@ -826,16 +833,41 @@ impl ProtocolHandler for H3RequestStream {
         self.finish_request(endpoint);
     }
 
-    fn error(&mut self, endpoint: &mut dyn Endpoint, _: &io::Error) {
-        // Abnormal QUIC teardown (CONNECTION_CLOSE / STOP_SENDING / idle
-        // timeout) replaces disconnected() — still cancel QPACK refs and
-        // finish the request so the application sees completion.
+    fn error(&mut self, _endpoint: &mut dyn Endpoint, err: &io::Error) {
+        // Abnormal teardown (RESET_STREAM / STOP_SENDING / CONNECTION_CLOSE /
+        // idle timeout): cancel QPACK refs, and tell the application the
+        // request was aborted, not completed.
         self.bind_execute_conn();
         // RFC 9204 §4.4.2: this stream won't be acknowledged now — let the
         // peer's encoder release any dynamic-table references it held open
         // for it.
         self.qpack.cancel_stream(self.stream_id);
-        self.finish_request(endpoint);
+        if self.aborted {
+            return;
+        }
+        self.aborted = true;
+        if let Some(up) = self.upgraded.as_mut() {
+            up.closed();
+            return;
+        }
+        // The stream may own the per-urgency non-incremental slot: release
+        // it, or later responses at that urgency would wait forever.
+        let waiters = {
+            let mut state = self.writer.peer_state.lock().unwrap();
+            state.non_inc_waiters.remove(&self.stream_id);
+            state.stream_priority.remove(&self.stream_id);
+            release_non_inc_slot(&mut state, self.stream_id, self.writer.priority)
+        };
+        for waiter in waiters {
+            waiter.poke();
+        }
+        let completed = self.writer.control.shared.lock().unwrap().complete;
+        if completed {
+            return;
+        }
+        if let Some(handler) = &mut self.handler {
+            handler.aborted(&mut self.writer, err);
+        }
     }
 
     fn datagram_received(&mut self, endpoint: &mut dyn Endpoint, data: &[u8]) {
@@ -2137,14 +2169,30 @@ mod request_validation_tests {
         opened: usize,
         trailers: Vec<(String, String)>,
         completed: usize,
+        aborted: usize,
+        /// Answer the request as soon as the headers arrive.
+        answer_at_once: bool,
     }
 
     struct RecordingHandler {
         rec: Arc<Mutex<Recorded>>,
     }
     impl ServerHandler for RecordingHandler {
-        fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {
-            self.rec.lock().unwrap().opened += 1;
+        fn headers(&mut self, response: &mut dyn ServerWriter, _headers: &Headers) {
+            let answer = {
+                let mut r = self.rec.lock().unwrap();
+                r.opened += 1;
+                r.answer_at_once
+            };
+            if answer {
+                let mut h = Headers::new();
+                h.status(204);
+                response.headers(h);
+                response.complete();
+            }
+        }
+        fn aborted(&mut self, _response: &mut dyn ServerWriter, _err: &io::Error) {
+            self.rec.lock().unwrap().aborted += 1;
         }
         fn request_trailers(&mut self, _response: &mut dyn ServerWriter, headers: &Headers) {
             let mut r = self.rec.lock().unwrap();
@@ -2180,6 +2228,36 @@ mod request_validation_tests {
             H3RequestStream::new(factory, HttpLimits::default(), 0, qpack, peer_state),
             rec,
         )
+    }
+
+    /// A reset request stream (RESET_STREAM / STOP_SENDING / abrupt
+    /// teardown reaches `error`) is reported to the handler as `aborted`,
+    /// not as a normal completion. Regression: `error` called
+    /// `finish_request`, so the handler was told the request completed.
+    #[test]
+    fn a_reset_request_stream_reaches_aborted_not_request_complete() {
+        let (mut stream, rec) = stream_with_recorder();
+        let payload = encode(&[(":method", "GET"), (":scheme", "https"), (":path", "/"), (":authority", "x")]);
+        stream.headers_frame(&payload);
+        let mut ep = RecordingEndpoint::default();
+        stream.error(&mut ep, &io::Error::new(io::ErrorKind::ConnectionReset, "stream reset"));
+        let r = rec.lock().unwrap();
+        assert_eq!(r.aborted, 1, "aborted must fire once");
+        assert_eq!(r.completed, 0, "a reset is not a completion");
+    }
+
+    /// A response that already completed receives no `aborted`.
+    #[test]
+    fn a_completed_response_receives_no_aborted() {
+        let (mut stream, rec) = stream_with_recorder();
+        rec.lock().unwrap().answer_at_once = true;
+        let payload = encode(&[(":method", "GET"), (":scheme", "https"), (":path", "/"), (":authority", "x")]);
+        stream.headers_frame(&payload);
+        let mut ep = RecordingEndpoint::default();
+        let mut empty: &[u8] = &[];
+        stream.receive(&mut ep, &mut empty);
+        stream.error(&mut ep, &io::Error::new(io::ErrorKind::ConnectionReset, "late reset"));
+        assert_eq!(rec.lock().unwrap().aborted, 0);
     }
 
     #[test]

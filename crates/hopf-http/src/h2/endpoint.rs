@@ -230,6 +230,19 @@ struct H2ServerStream {
     priority: PriorityParams,
 }
 
+/// A server stream ended by the peer or the connection before its response
+/// finished: an upgraded stream's handler is told it closed, any other's
+/// `ServerHandler` is told it was aborted (once, since the stream has been
+/// removed by the caller; later deferred writes land in its buffer and are
+/// never flushed).
+fn abort_server_stream(stream: &mut H2ServerStream, err: &std::io::Error) {
+    if let Some(up) = stream.upgraded.as_mut() {
+        up.closed();
+    } else {
+        stream.handler.aborted(&mut stream.writer, err);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Client-side per-stream state
 // ---------------------------------------------------------------------------
@@ -1077,6 +1090,14 @@ impl H2Endpoint {
     /// drops the response handler with no callback at all (the client-role
     /// counterpart of `flush_server_streams`-adjacent server bookkeeping;
     /// see issue #88).
+    /// Connection teardown: every server stream still answering is told
+    /// once that its peer is gone.
+    fn abort_server_streams(&mut self, err: &std::io::Error) {
+        for (_, mut stream) in std::mem::take(&mut self.server_streams) {
+            abort_server_stream(&mut stream, err);
+        }
+    }
+
     fn fail_client_streams(&mut self, err: &std::io::Error) {
         for (_, mut stream) in std::mem::take(&mut self.client_streams) {
             if let Some(up) = stream.upgraded.as_mut() {
@@ -1711,7 +1732,15 @@ impl H2Endpoint {
             return;
         }
         let error_code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        self.server_streams.remove(&stream_id);
+        if let Some(mut stream) = self.server_streams.remove(&stream_id) {
+            abort_server_stream(
+                &mut stream,
+                &std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    format!("stream reset by peer: RST_STREAM error code {error_code:#x}"),
+                ),
+            );
+        }
         // Client role: the request ended abruptly, which the ClientHandler
         // contract reports as exactly one `request_failed` (never
         // `response_complete`), carrying the peer's error code.
@@ -1780,7 +1809,9 @@ impl H2Endpoint {
                 return;
             }
             frame::write_rst_stream(&mut self.out, stream_id, ERROR_FLOW_CONTROL_ERROR);
-            self.server_streams.remove(&stream_id);
+            if let Some(mut stream) = self.server_streams.remove(&stream_id) {
+                abort_server_stream(&mut stream, &std::io::Error::other("stream flow-control window overflow"));
+            }
             if let Some(mut stream) = self.client_streams.remove(&stream_id) {
                 stream.handler.request_failed(
                     &mut NullClientWriter,
@@ -2322,15 +2353,15 @@ impl ProtocolHandler for H2Endpoint {
     }
 
     fn disconnected(&mut self, _endpoint: &mut dyn Endpoint) {
-        self.server_streams.clear();
-        self.fail_client_streams(&std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "connection closed",
-        ));
+        let err = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed");
+        self.abort_server_streams(&err);
+        self.fail_client_streams(&err);
     }
 
     fn error(&mut self, endpoint: &mut dyn Endpoint, err: &std::io::Error) {
-        self.fail_client_streams(&std::io::Error::new(err.kind(), err.to_string()));
+        let err = std::io::Error::new(err.kind(), err.to_string());
+        self.abort_server_streams(&err);
+        self.fail_client_streams(&err);
         endpoint.close();
     }
 }
@@ -3056,6 +3087,91 @@ mod client_goaway_tests {
 
         assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert!(ep.client_streams.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod server_abort_tests {
+    use super::*;
+    use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
+
+    struct NoopServerFactory;
+    impl ServerHandlerFactory for NoopServerFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        aborted: Vec<String>,
+        completed: usize,
+    }
+
+    struct Recorder(Arc<std::sync::Mutex<Seen>>);
+    impl ServerHandler for Recorder {
+        fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+        fn request_complete(&mut self, _response: &mut dyn ServerWriter) {
+            self.0.lock().unwrap().completed += 1;
+        }
+        fn aborted(&mut self, _response: &mut dyn ServerWriter, err: &std::io::Error) {
+            self.0.lock().unwrap().aborted.push(err.to_string());
+        }
+    }
+
+    /// A server stream whose request has ended (END_STREAM seen) and whose
+    /// response is still being produced.
+    fn server_with_open_response(id: u32) -> (H2Endpoint, Arc<std::sync::Mutex<Seen>>) {
+        let mut ep = H2Endpoint::server(Arc::new(NoopServerFactory), HttpLimits::default(), false);
+        let seen = Arc::new(std::sync::Mutex::new(Seen::default()));
+        ep.server_streams.insert(
+            id,
+            H2ServerStream {
+                id,
+                handler: Box::new(Recorder(Arc::clone(&seen))),
+                writer: H2StreamWriter::new(id),
+                half_closed_remote: true,
+                paused_body: Vec::new(),
+                paused_end_stream: false,
+                upgraded: None,
+                capsule_mode: false,
+                capsule_parser: crate::capsule::CapsuleParser::new(),
+                priority: PriorityParams::default(),
+            },
+        );
+        ep.flow.open_stream(id, crate::h2::flow::INITIAL_WINDOW_SIZE);
+        (ep, seen)
+    }
+
+    /// A RST_STREAM after the request ended, while the response is still
+    /// being produced, reaches `ServerHandler::aborted` exactly once.
+    /// Regression: the stream was removed silently, so a handler answering
+    /// over time kept writing into a dead stream and never learnt.
+    #[test]
+    fn rst_stream_after_the_request_ended_reaches_aborted_once() {
+        let (mut ep, seen) = server_with_open_response(1);
+        ep.on_rst_stream(1, &frame::ERROR_CANCEL.to_be_bytes());
+        {
+            let s = seen.lock().unwrap();
+            assert_eq!(s.aborted.len(), 1, "aborted must fire exactly once: {:?}", s.aborted);
+            assert!(s.aborted[0].contains("0x8"), "error code missing: {}", s.aborted[0]);
+            assert_eq!(s.completed, 0);
+        }
+        assert!(!ep.server_streams.contains_key(&1));
+        ep.on_rst_stream(1, &frame::ERROR_CANCEL.to_be_bytes());
+        assert_eq!(seen.lock().unwrap().aborted.len(), 1, "a second RST_STREAM reports nothing more");
+    }
+
+    /// Connection teardown (GOAWAY from the peer, or the transport going
+    /// away) aborts every open server stream once.
+    #[test]
+    fn connection_teardown_aborts_open_server_streams() {
+        let (mut ep, seen) = server_with_open_response(3);
+        let mut endpoint = RecordingEndpoint::default();
+        ep.disconnected(&mut endpoint);
+        let aborted = seen.lock().unwrap().aborted.clone();
+        assert_eq!(aborted.len(), 1, "{aborted:?}");
+        assert!(ep.server_streams.is_empty());
     }
 }
 

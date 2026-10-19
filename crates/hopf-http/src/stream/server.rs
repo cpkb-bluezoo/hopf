@@ -100,6 +100,15 @@ pub trait ServerHandler: Send {
 
     /// Request fully received; response may already be in progress.
     fn request_complete(&mut self, response: &mut dyn ServerWriter);
+
+    /// The peer ended the stream abruptly, or the connection went away,
+    /// before the response was finished: a RST_STREAM or GOAWAY on HTTP/2,
+    /// a stream reset or STOP_SENDING on HTTP/3, a connection close on
+    /// HTTP/1.1. Fires at most once, and never after the response has
+    /// completed; further writes through `response` go nowhere. Default:
+    /// ignore. A handler that answers a finished request over time (a
+    /// streaming body, server-sent events) uses this to stop its work.
+    fn aborted(&mut self, _response: &mut dyn ServerWriter, _err: &std::io::Error) {}
 }
 
 /// A deferred-write task passed to [`ResponseControl::execute`].
@@ -291,5 +300,9 @@ impl ServerHandler for Box<dyn ServerHandler> {
 
     fn request_complete(&mut self, response: &mut dyn ServerWriter) {
         (**self).request_complete(response);
+    }
+
+    fn aborted(&mut self, response: &mut dyn ServerWriter, err: &std::io::Error) {
+        (**self).aborted(response, err);
     }
 }
