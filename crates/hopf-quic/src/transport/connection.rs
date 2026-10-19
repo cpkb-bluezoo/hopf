@@ -159,6 +159,14 @@ pub struct Connection {
     server_packet_processed: bool,
     /// Client: Retry SCID that must match peer `retry_source_connection_id`.
     expected_retry_scid: Option<ConnectionId>,
+    /// The Source Connection ID of the peer's Initial packets, which its
+    /// `initial_source_connection_id` must repeat (RFC 9000 section 7.3).
+    /// A server knows it at accept time. A client starts with its own
+    /// random choice as `rem_cid`, moves to a Retry's SCID if one arrives,
+    /// then to that of each server Initial that decrypts, and settles here
+    /// on the first Initial carrying CRYPTO data (section 7.2): a Retry's
+    /// ID and an acknowledgement-only Initial's are provisional.
+    peer_initial_scid: Option<ConnectionId>,
     /// Client: Initial CRYPTO chunks for requeue after Retry.
     initial_crypto_chunks: Vec<Bytes>,
     /// Inbound DATAGRAM payloads.
@@ -171,6 +179,10 @@ pub struct Connection {
     loss: LossDetector,
     /// Spaces that need a PTO probe PING on the next flush.
     pto_ping_pending: [bool; 3],
+    /// A 1-RTT Probe Timeout probe is being built: the next Data packet may
+    /// exceed the congestion window (RFC 9002 section 7.5). Cleared once
+    /// that one packet is queued.
+    probe_bypass: bool,
     /// When set, pad each built packet (PADDING frames before AEAD) so the
     /// final UDP payload length equals this size — required for Linux UDP GSO.
     gso_pad_to: Option<usize>,
@@ -182,14 +194,24 @@ pub struct Connection {
     early_aead: Tls13Aead,
     /// Client: EE early_data acceptance (`None` until EncryptedExtensions).
     early_data_accepted: Option<bool>,
-    /// STREAM chunks sent under 0-RTT keys; requeued on reject for 1-RTT.
-    pending_0rtt_retransmit: Vec<(StreamId, u64, Bytes, bool)>,
+    /// STREAM chunks sent under 0-RTT keys: requeued for 1-RTT if the
+    /// server rejects early data, or as 0-RTT again after a Retry.
+    pending_0rtt_retransmit: Vec<Sent0Rtt>,
     /// Remembered peer stream limit for 0-RTT sends (client bidi remote).
     remembered_0rtt_stream_max: Option<u64>,
     /// Optional keep-alive PING interval.
     keep_alive_interval: Option<Duration>,
     /// Last time a keep-alive PING was sent (or connection start).
     last_keep_alive: Instant,
+}
+
+/// A STREAM chunk sent in a 0-RTT packet, with the packet that carried it.
+struct Sent0Rtt {
+    packet_number: u64,
+    id: StreamId,
+    offset: u64,
+    data: Bytes,
+    fin: bool,
 }
 
 struct StreamState {
@@ -307,12 +329,14 @@ impl Connection {
             retry_processed: false,
             server_packet_processed: false,
             expected_retry_scid: None,
+            peer_initial_scid: None,
             initial_crypto_chunks: Vec::new(),
             datagram_rx: VecDeque::new(),
             datagram_tx: VecDeque::new(),
             peer_max_datagram: 0,
             loss: LossDetector::new(MAX_DATAGRAM_SIZE),
             pto_ping_pending: [false; 3],
+            probe_bypass: false,
             gso_pad_to: None,
             early_secret: None,
             early_aead: Tls13Aead::Aes128GcmSha256,
@@ -392,7 +416,7 @@ impl Connection {
             reacted_to_version_negotiation: false,
             remote,
             local_cid,
-            rem_cid: client_src_cid,
+            rem_cid: client_src_cid.clone(),
             initial_dcid: initial_dcid.clone(),
             spaces: [Space::new(), Space::new(), Space::new()],
             tls,
@@ -423,12 +447,14 @@ impl Connection {
             retry_processed: false,
             server_packet_processed: false,
             expected_retry_scid: None,
+            peer_initial_scid: Some(client_src_cid.clone()),
             initial_crypto_chunks: Vec::new(),
             datagram_rx: VecDeque::new(),
             datagram_tx: VecDeque::new(),
             peer_max_datagram: 0,
             loss: LossDetector::new(MAX_DATAGRAM_SIZE),
             pto_ping_pending: [false; 3],
+            probe_bypass: false,
             gso_pad_to: None,
             early_secret: None,
             early_aead: Tls13Aead::Aes128GcmSha256,
@@ -553,7 +579,20 @@ impl Connection {
                 }
             } else if let Some(probe) = result.probe_space {
                 if self.space(probe).secrets.is_some() {
-                    self.pto_ping_pending[space_index(probe)] = true;
+                    // RFC 9002 section 6.2.4: the probe repeats the oldest
+                    // unacknowledged data in the space, so it repairs a loss
+                    // by itself; a PING only when there is nothing to repeat
+                    // (Appendix A.9). The packet is not declared lost: that
+                    // still waits for the acknowledgement the probe elicits.
+                    match self.loss.oldest_ack_eliciting_frames(probe) {
+                        Some(frames) => self.requeue_probe_frames(probe, frames),
+                        None => self.pto_ping_pending[space_index(probe)] = true,
+                    }
+                    if probe == SpaceId::Data {
+                        // Section 7.5: the one probe packet may exceed the
+                        // congestion window.
+                        self.probe_bypass = true;
+                    }
                 }
             }
             self.flush_pending_packets(now);
@@ -676,10 +715,26 @@ impl Connection {
             return packet_len;
         };
         payload.truncate(plain_len);
-        // Learn peer CID before queuing ACKs so outbound DCID is correct.
-        if self.side == Side::Client && !prefix.src_cid.is_empty() {
-            self.rem_cid = prefix.src_cid;
-            self.short_cid_len = self.rem_cid.len();
+        // RFC 9000 section 7.2: the server's connection ID is the Source
+        // Connection ID of its Initial packets. Until the first one carrying
+        // CRYPTO data settles it (see `peer_initial_scid`), each Initial
+        // that decrypts may move it, before ACKs are queued so the outbound
+        // DCID is right; after that an Initial with another SCID is not
+        // this server's and is discarded.
+        if self.side == Side::Client && space == SpaceId::Initial {
+            match &self.peer_initial_scid {
+                Some(settled) => {
+                    if prefix.src_cid != *settled {
+                        return packet_len;
+                    }
+                }
+                None => {
+                    if prefix.src_cid != self.rem_cid {
+                        self.rem_cid = prefix.src_cid;
+                        self.short_cid_len = self.rem_cid.len();
+                    }
+                }
+            }
         }
         let _ = is_0rtt;
         if self.side == Side::Client {
@@ -789,6 +844,19 @@ impl Connection {
         self.spaces[0].pending_ack.clear();
         self.transmits.clear();
 
+        // RFC 9000 section 17.2.5.2: the server discarded the 0-RTT packets
+        // along with the connection attempt, so send that data again as
+        // 0-RTT to the new connection ID, and stop counting the discarded
+        // packets against the congestion window. Nothing was lost on the
+        // path, so this is not a congestion event.
+        let sent: Vec<Sent0Rtt> = self.pending_0rtt_retransmit.drain(..).collect();
+        for sent in sent {
+            self.loss.discard_packet(SpaceId::Data, sent.packet_number);
+            if let Some(st) = self.streams.get_mut(&sent.id) {
+                st.send.requeue(sent.offset, sent.data, sent.fin);
+            }
+        }
+
         // Requeue Initial CRYPTO (TLS transcript unchanged).
         let chunks = self.initial_crypto_chunks.clone();
         {
@@ -889,6 +957,11 @@ impl Connection {
                 }
             }
             Frame::Crypto { offset, data } => {
+                if self.side == Side::Client && space == SpaceId::Initial && self.peer_initial_scid.is_none() {
+                    // The server's ServerHello: its Initial Source Connection
+                    // ID is now final (RFC 9000 section 7.2).
+                    self.peer_initial_scid = Some(self.rem_cid.clone());
+                }
                 let contiguous = {
                     let sp = self.space_mut(space);
                     sp.crypto_recv.receive(offset, data).unwrap_or_default()
@@ -1021,9 +1094,9 @@ impl Connection {
                 // Server rejected 0-RTT: stop sending under early keys and
                 // retransmit any STREAM data already queued as 0-RTT under 1-RTT.
                 self.early_secret = None;
-                for (id, offset, data, fin) in self.pending_0rtt_retransmit.drain(..) {
-                    if let Some(st) = self.streams.get_mut(&id) {
-                        st.send.requeue(offset, data, fin);
+                for sent in self.pending_0rtt_retransmit.drain(..) {
+                    if let Some(st) = self.streams.get_mut(&sent.id) {
+                        st.send.requeue(sent.offset, sent.data, sent.fin);
                     }
                 }
             } else {
@@ -1037,6 +1110,10 @@ impl Connection {
         if let Some(raw) = events.peer_tp {
             if let Some(tp) = TransportParameters::decode(&raw) {
                 if let Some((code, reason)) = self.check_version_information(&tp) {
+                    self.fail_transport(code, reason);
+                    return;
+                }
+                if let Some((code, reason)) = self.check_connection_id_parameters(&tp) {
                     self.fail_transport(code, reason);
                     return;
                 }
@@ -1137,6 +1214,25 @@ impl Connection {
         }
     }
 
+    /// RFC 9000 section 7.3: the peer's `initial_source_connection_id` must
+    /// repeat the Source Connection ID of its Initial packets (the check
+    /// that catches an on-path attacker rewriting that field), and a
+    /// server's `retry_source_connection_id` is present exactly when it sent
+    /// a Retry, repeating that Retry's SCID. A client that has not yet
+    /// settled the server's ID (no Initial CRYPTO seen) has nothing to
+    /// compare against.
+    fn check_connection_id_parameters(&self, tp: &TransportParameters) -> Option<(u64, &'static str)> {
+        if let Some(expected) = &self.peer_initial_scid {
+            if tp.initial_src_cid.as_ref() != Some(expected) {
+                return Some((TRANSPORT_PARAMETER_ERROR, "initial_source_connection_id mismatch"));
+            }
+        }
+        if self.side == Side::Client && tp.retry_src_cid != self.expected_retry_scid {
+            return Some((TRANSPORT_PARAMETER_ERROR, "retry_source_connection_id mismatch"));
+        }
+        None
+    }
+
     /// Close the connection with a transport error: tell the peer with a
     /// CONNECTION_CLOSE (type 0x1c) in the highest packet space we have keys
     /// for, and report it locally.
@@ -1204,10 +1300,12 @@ impl Connection {
             self.handshake_done_pending = false;
             let mut payload = Vec::new();
             writer::handshake_done(&mut payload);
+            // Recoverable: a lost HANDSHAKE_DONE is sent again (RFC 9000
+            // section 13.3), or the client keeps its Handshake keys forever.
             self.queue_packet(
                 SpaceId::Data,
                 payload,
-                Vec::new(),
+                vec![RecoverableFrame::HandshakeDone],
                 true,
                 true,
                 now,
@@ -1259,7 +1357,7 @@ impl Connection {
                 let Some((offset, chunk)) = retransmit else {
                     break;
                 };
-                if space == SpaceId::Data && !self.loss.congestion().can_send(MAX_DATAGRAM_SIZE) {
+                if space == SpaceId::Data && !self.can_send_data(MAX_DATAGRAM_SIZE) {
                     self.space_mut(space)
                         .crypto_retransmit
                         .push_front((offset, chunk));
@@ -1281,7 +1379,7 @@ impl Connection {
                 let sp = self.space_mut(space);
                 sp.crypto_pending.pop_front()
             } {
-                if space == SpaceId::Data && !self.loss.congestion().can_send(MAX_DATAGRAM_SIZE) {
+                if space == SpaceId::Data && !self.can_send_data(MAX_DATAGRAM_SIZE) {
                     self.space_mut(space).crypto_pending.push_front(chunk);
                     break;
                 }
@@ -1301,11 +1399,15 @@ impl Connection {
             }
         }
 
-        // STREAM frames on Data.
+        // STREAM frames on Data. Note whether the congestion window held
+        // stream data back, or the loop ended for lack of data (RFC 9002
+        // section 7.8: only the former lets acknowledgements grow the window).
+        let mut window_limited = false;
         let ids: Vec<StreamId> = self.streams.keys().copied().collect();
         for id in ids {
             loop {
-                if !self.loss.congestion().can_send(MAX_DATAGRAM_SIZE) {
+                if !self.can_send_data(MAX_DATAGRAM_SIZE) {
+                    window_limited |= self.streams.get(&id).is_some_and(|st| st.send.has_data());
                     break;
                 }
                 let Some(max_chunk) = self.stream_chunk_budget(id) else {
@@ -1331,6 +1433,7 @@ impl Connection {
                     if let Some(st) = self.streams.get_mut(&id) {
                         st.send.requeue(offset, data, fin);
                     }
+                    window_limited = true;
                     break;
                 }
                 // Track STREAM sent under 0-RTT for reject→1-RTT retransmit.
@@ -1339,8 +1442,15 @@ impl Connection {
                     && self.early_secret.is_some()
                     && self.early_data_accepted != Some(true)
                 {
-                    self.pending_0rtt_retransmit
-                        .push((id, offset, data.clone(), fin));
+                    // `queue_packet` has just consumed this packet number.
+                    let packet_number = self.space(SpaceId::Data).next_pn - 1;
+                    self.pending_0rtt_retransmit.push(Sent0Rtt {
+                        packet_number,
+                        id,
+                        offset,
+                        data: data.clone(),
+                        fin,
+                    });
                 }
                 if fin {
                     self.events
@@ -1348,6 +1458,7 @@ impl Connection {
                 }
             }
         }
+        self.loss.set_app_limited(!window_limited);
 
         // DATAGRAM frames on 1-RTT.
         while let Some(data) = self.datagram_tx.pop_front() {
@@ -1355,7 +1466,7 @@ impl Connection {
                 self.datagram_tx.push_front(data);
                 break;
             }
-            if !self.loss.congestion().can_send(MAX_DATAGRAM_SIZE) {
+            if !self.can_send_data(MAX_DATAGRAM_SIZE) {
                 self.datagram_tx.push_front(data);
                 break;
             }
@@ -1364,6 +1475,13 @@ impl Connection {
             // DATAGRAMs are not retransmitted on loss.
             self.queue_packet(SpaceId::Data, payload, Vec::new(), true, true, now);
         }
+    }
+
+    /// Whether `bytes` more of 1-RTT data may be sent: within the congestion
+    /// window, or as the one packet a Probe Timeout may send beyond it
+    /// (RFC 9002 section 7.5).
+    fn can_send_data(&self, bytes: usize) -> bool {
+        self.probe_bypass || self.loss.congestion().can_send(bytes)
     }
 
     /// Largest datagram this endpoint will send: 1200 bytes until path MTU
@@ -1467,8 +1585,12 @@ self.version,
             _ => 50,
         };
         let est_len = header_est + protected_len;
-        if space == SpaceId::Data && in_flight && !self.loss.congestion().can_send(est_len) {
+        if space == SpaceId::Data && in_flight && !self.can_send_data(est_len) {
             return false;
+        }
+        if space == SpaceId::Data && in_flight {
+            // One packet past the window per Probe Timeout.
+            self.probe_bypass = false;
         }
 
         self.space_mut(space).next_pn += 1;
@@ -1608,7 +1730,33 @@ self.version,
                     // PTO PINGs are not retransmitted as such; a later PTO
                     // will send a fresh probe if still needed.
                 }
+                RecoverableFrame::HandshakeDone => {
+                    self.handshake_done_pending = true;
+                }
             }
+        }
+    }
+
+    /// Put the frames of the packet a Probe Timeout probe repeats back on
+    /// the send queues, ahead of other pending data where the queue allows,
+    /// so that the probe flushed next carries them.
+    fn requeue_probe_frames(&mut self, space: SpaceId, frames: Vec<RecoverableFrame>) {
+        let mut crypto = Vec::new();
+        for frame in frames {
+            match frame {
+                RecoverableFrame::Crypto { offset, data } => crypto.push((offset, data)),
+                RecoverableFrame::Stream { id, offset, data, fin } => {
+                    if let Some(st) = self.streams.get_mut(&id) {
+                        st.send.requeue(offset, data, fin);
+                    }
+                }
+                RecoverableFrame::HandshakeDone => self.handshake_done_pending = true,
+                RecoverableFrame::Ping => {}
+            }
+        }
+        // Ahead of other lost CRYPTO, in their original order.
+        for chunk in crypto.into_iter().rev() {
+            self.space_mut(space).crypto_retransmit.push_front(chunk);
         }
     }
 
@@ -2231,6 +2379,19 @@ mod tests {
         }
     }
 
+    /// The SCID of the client `test_server` accepted (RFC 9000 section 7.3:
+    /// its `initial_source_connection_id` must repeat it).
+    const CLIENT_SCID: [u8; 8] = [0xcc; 8];
+
+    /// A client's transport parameters as `test_server` expects them.
+    fn client_tp_with(chosen: u32, available: &[u32]) -> TransportParameters {
+        TransportParameters { initial_src_cid: Some(ConnectionId::from_slice(&CLIENT_SCID)), ..tp_with(chosen, available) }
+    }
+
+    fn client_tp() -> TransportParameters {
+        TransportParameters { initial_src_cid: Some(ConnectionId::from_slice(&CLIENT_SCID)), ..Default::default() }
+    }
+
     /// The `TransportError` code a connection was closed with, if any.
     fn closed_with(conn: &mut Connection) -> Option<u64> {
         match lost_with(conn) {
@@ -2241,6 +2402,89 @@ mod tests {
 
     const V1: u32 = 1;
     const V2: u32 = 0x6b33_43cf;
+
+    /// Decrypt a packet `conn` built, as its peer would: the long-header
+    /// type (`None` for a short header) and the frames it carries.
+    fn peer_decrypt(conn: &Connection, data: &[u8]) -> (Option<u8>, Vec<Frame>) {
+        let peer = match conn.side {
+            Side::Client => Side::Server,
+            Side::Server => Side::Client,
+        };
+        let (ty, keys, pn_offset, len) = if data[0] & 0x80 != 0 {
+            let prefix = long_header::parse_prefix(data).expect("long header");
+            let keys = if prefix.packet_type == TYPE_0RTT {
+                let early = conn.early_secret.as_ref().expect("0-RTT keys");
+                PacketKeys::from_secret(conn.version, conn.early_aead, early)
+            } else {
+                let space = if prefix.packet_type == TYPE_INITIAL {
+                    SpaceId::Initial
+                } else {
+                    SpaceId::Handshake
+                };
+                conn.space(space).keys(peer, conn.version).expect("keys").remote
+            };
+            let len = prefix.pn_offset + prefix.length as usize;
+            (Some(prefix.packet_type), keys, prefix.pn_offset, len)
+        } else {
+            let keys = conn.space(SpaceId::Data).keys(peer, conn.version).expect("1-RTT keys").remote;
+            (None, keys, 1 + conn.rem_cid.len(), data.len())
+        };
+        let mut packet = data[..len].to_vec();
+        keys.protect_header(pn_offset, &mut packet, false);
+        let pn_len = (packet[0] & 0x03) as usize + 1;
+        let truncated = pn::read_truncated(&packet[pn_offset..pn_offset + pn_len]);
+        let full_pn = pn::decode(None, truncated, pn_len);
+        let header_len = pn_offset + pn_len;
+        let mut payload = packet[header_len..].to_vec();
+        let n = keys.decrypt(full_pn, &packet[..header_len], &mut payload).expect("decrypt");
+        payload.truncate(n);
+        (ty, parse_all(&payload).expect("frames"))
+    }
+
+    /// Drain `poll_transmit`, decrypting every packet as the peer would.
+    fn drain_frames(conn: &mut Connection, now: Instant) -> Vec<(Option<u8>, Vec<Frame>)> {
+        let mut out = Vec::new();
+        let mut buf = Vec::new();
+        while conn.poll_transmit(now, &mut buf).is_some() {
+            out.push(peer_decrypt(conn, &buf));
+        }
+        out
+    }
+
+    fn carries(packets: &[(Option<u8>, Vec<Frame>)], pred: impl Fn(&Frame) -> bool) -> bool {
+        packets.iter().any(|(_, frames)| frames.iter().any(&pred))
+    }
+
+    /// RFC 9000 section 13.3: HANDSHAKE_DONE is sent until acknowledged.
+    /// Regression: the frame was queued once with nothing to recover, so a
+    /// lost packet never brought it back and the client kept its Handshake
+    /// keys and retransmitting its Handshake flight.
+    #[test]
+    fn handshake_done_is_sent_again_when_its_packet_is_lost() {
+        let now = Instant::now();
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1]);
+        conn.spaces[2].secrets = Some(crate::transport::packet::protection::initial_secrets(QuicVersion::V1, &[1, 2, 3, 4]));
+        conn.handshake_done_pending = true;
+        let first = drain_frames(&mut conn, now);
+        assert!(carries(&first, |f| matches!(f, Frame::HandshakeDone)), "HANDSHAKE_DONE sent once");
+        // Three more ack-eliciting packets (pn 1..=3), then an ACK of pn 3
+        // alone: pn 0 is K_PACKET_THRESHOLD below it and declared lost.
+        for _ in 0..3 {
+            conn.pto_ping_pending[space_index(SpaceId::Data)] = true;
+            conn.flush_pending_packets(now);
+        }
+        assert_eq!(drain_frames(&mut conn, now).len(), 3);
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack { largest: 3, delay: 0, ranges: vec![(3, 3)] },
+            now + Duration::from_millis(10),
+        );
+        let again = drain_frames(&mut conn, now + Duration::from_millis(10));
+        assert!(
+            carries(&again, |f| matches!(f, Frame::HandshakeDone)),
+            "lost HANDSHAKE_DONE was not sent again: {again:?}"
+        );
+    }
 
     /// RFC 9369 section 4: every v2-capable endpoint sends version_information.
     /// A client lists only its chosen version as available (compatible version
@@ -2334,11 +2578,11 @@ mod tests {
     #[test]
     fn server_accepts_consistent_client_version_information() {
         let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1, QuicVersion::V2]);
-        receive_peer_tp(&mut conn, &tp_with(V1, &[V1]));
+        receive_peer_tp(&mut conn, &client_tp_with(V1, &[V1]));
         assert_eq!(closed_with(&mut conn), None);
         // A missing parameter is tolerated by a server.
         let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1, QuicVersion::V2]);
-        receive_peer_tp(&mut conn, &TransportParameters::default());
+        receive_peer_tp(&mut conn, &client_tp());
         assert_eq!(closed_with(&mut conn), None);
     }
 
@@ -2347,15 +2591,15 @@ mod tests {
     #[test]
     fn server_closes_on_inconsistent_client_version_information() {
         let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1, QuicVersion::V2]);
-        receive_peer_tp(&mut conn, &tp_with(V2, &[V2]));
+        receive_peer_tp(&mut conn, &client_tp_with(V2, &[V2]));
         assert_eq!(closed_with(&mut conn), Some(VERSION_NEGOTIATION_ERROR), "chosen differs from the version in use");
 
         let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1, QuicVersion::V2]);
-        receive_peer_tp(&mut conn, &tp_with(V1, &[V2]));
+        receive_peer_tp(&mut conn, &client_tp_with(V1, &[V2]));
         assert_eq!(closed_with(&mut conn), Some(TRANSPORT_PARAMETER_ERROR), "chosen not among available");
 
         let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1, QuicVersion::V2]);
-        let mut raw = TransportParameters::default().encode();
+        let mut raw = client_tp().encode();
         varint::encode(0x11, &mut raw);
         varint::encode(4, &mut raw);
         raw.extend_from_slice(&[0, 0, 0, 0]);
@@ -2530,8 +2774,13 @@ mod tests {
         let mut conn = test_client(now);
         conn.early_secret = Some([0x42; 32]);
         let id = conn.open_bi().expect("stream");
-        conn.pending_0rtt_retransmit
-            .push((id, 0, Bytes::from_static(b"early-payload"), false));
+        conn.pending_0rtt_retransmit.push(Sent0Rtt {
+            packet_number: 0,
+            id,
+            offset: 0,
+            data: Bytes::from_static(b"early-payload"),
+            fin: false,
+        });
         let events = crate::transport::tls_bridge::TlsBridgeEvents {
             early_data_accepted: Some(false),
             ..Default::default()
@@ -2542,6 +2791,285 @@ mod tests {
         let st = conn.streams.get(&id).unwrap();
         assert_eq!(st.send.retransmit.len(), 1);
         assert_eq!(&st.send.retransmit[0].1[..], b"early-payload");
+    }
+
+    /// RFC 9000 section 17.2.5.2: a client may send 0-RTT again after a
+    /// Retry, to the Retry's connection ID. Regression: data sent as 0-RTT
+    /// before the Retry (which the server discarded along with the
+    /// connection) was only noticed as lost after the handshake and then
+    /// went out at 1-RTT, and its packets kept counting against the window.
+    #[test]
+    fn zero_rtt_data_is_resent_as_zero_rtt_after_a_retry() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.spaces[2].secrets = None;
+        conn.early_secret = Some([0x42; 32]);
+        let id = conn.open_bi().expect("stream");
+        conn.write_stream(id, b"early-payload").unwrap();
+        let is_early_payload = |f: &Frame| {
+            matches!(f, Frame::Stream { id: sid, offset: 0, data, .. } if *sid == id && &data[..] == b"early-payload")
+        };
+        let before = drain_frames(&mut conn, now);
+        assert!(before.iter().any(|(ty, fr)| *ty == Some(TYPE_0RTT) && fr.iter().any(is_early_payload)));
+        assert!(conn.loss.congestion().bytes_in_flight() > 0);
+
+        let retry_scid = ConnectionId::from_slice(&[0x5a; 8]);
+        let retry = retry::build_packet(
+            QuicVersion::V1,
+            &conn.local_cid,
+            &retry_scid,
+            conn.initial_dcid.as_slice(),
+            b"token",
+        );
+        conn.handle_packet(now, &retry);
+        assert!(conn.retry_processed);
+
+        let mut buf = Vec::new();
+        let mut sent_after = 0usize;
+        let mut after = Vec::new();
+        while let Some(tx) = conn.poll_transmit(now, &mut buf) {
+            sent_after += tx.size;
+            after.push(peer_decrypt(&conn, &buf));
+        }
+        assert!(
+            after.iter().any(|(ty, fr)| *ty == Some(TYPE_0RTT) && fr.iter().any(is_early_payload)),
+            "stream data not resent as 0-RTT after the Retry: {after:?}"
+        );
+        // Only the packets sent after the Retry are still in flight.
+        assert_eq!(conn.loss.congestion().bytes_in_flight(), sent_after as u64);
+    }
+
+    /// RFC 9002 section 7.8: an acknowledgement must not grow the window
+    /// while the sender is application-limited. Regression: the flag was
+    /// hard-coded false, so the window grew on every acknowledgement.
+    #[test]
+    fn ack_of_app_limited_data_does_not_grow_the_window() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = conn.open_bi().expect("stream");
+        conn.write_stream(id, b"tiny").unwrap();
+        assert_eq!(drain_lens(&mut conn, now).len(), 1);
+        let before = conn.loss.congestion().congestion_window();
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack { largest: 0, delay: 0, ranges: vec![(0, 0)] },
+            now + Duration::from_millis(20),
+        );
+        let after = conn.loss.congestion().congestion_window();
+        assert_eq!(after, before, "window grew from {before} to {after} while app-limited");
+    }
+
+    /// The other half of section 7.8: when the window itself held stream
+    /// data back, the acknowledgement grows it.
+    #[test]
+    fn ack_of_window_limited_data_grows_the_window() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = conn.open_bi().expect("stream");
+        conn.streams.get_mut(&id).unwrap().send.max_data = u64::MAX;
+        conn.write_stream(id, &vec![0xab; 200_000]).unwrap();
+        assert!(drain_lens(&mut conn, now).len() > 4);
+        let before = conn.loss.congestion().congestion_window();
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack { largest: 0, delay: 0, ranges: vec![(0, 0)] },
+            now + Duration::from_millis(20),
+        );
+        assert!(conn.loss.congestion().congestion_window() > before);
+    }
+
+    /// RFC 9002 section 6.2.4: a Probe Timeout probe carries unacknowledged
+    /// data. Regression: it was a bare PING, so each loss cost an extra
+    /// round trip before the data went out again, and a peer that never
+    /// acknowledged anything never saw the data a second time.
+    #[test]
+    fn pto_probe_repeats_the_unacknowledged_crypto_data() {
+        let now = Instant::now();
+        let mut conn = Connection::new_client(
+            now,
+            "127.0.0.1:4433".parse().unwrap(),
+            "localhost",
+            HandshakeConfig {
+                role: HandshakeRole::Client,
+                mode: HandshakeMode::Quic,
+                alpn: vec![Bytes::from_static(b"hq-interop")],
+                kx_policy: KxPolicy::classical_only(),
+                ..Default::default()
+            },
+            ConnectionId::from_slice(&[1; 8]),
+            ConnectionId::from_slice(&[2; 8]),
+            &[QuicVersion::V1],
+            QuicVersion::V1,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let first = drain_frames(&mut conn, now);
+        assert!(carries(&first, |f| matches!(f, Frame::Crypto { .. })), "first flight");
+        // No reply: past the PTO the probe must carry the ClientHello again.
+        let later = now + Duration::from_secs(2);
+        conn.handle_timeout(later);
+        let probe = drain_frames(&mut conn, later);
+        assert!(!probe.is_empty(), "no probe was sent");
+        assert!(
+            probe.iter().any(|(ty, fr)| *ty == Some(TYPE_INITIAL) && fr.iter().any(|f| matches!(f, Frame::Crypto { offset: 0, .. }))),
+            "probe does not repeat the CRYPTO data: {probe:?}"
+        );
+    }
+
+    /// RFC 9002 section 7.5: the one packet a Probe Timeout sends may exceed
+    /// the congestion window, and it repeats the oldest 1-RTT data.
+    #[test]
+    fn pto_probe_repeats_the_oldest_stream_data_past_a_full_window() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.loss.set_handshake_confirmed(true);
+        conn.handshake_done = true;
+        let id = conn.open_bi().expect("stream");
+        conn.streams.get_mut(&id).unwrap().send.max_data = u64::MAX;
+        conn.write_stream(id, &vec![0xab; 200_000]).unwrap();
+        assert!(drain_lens(&mut conn, now).len() > 4);
+        assert!(!conn.loss.congestion().can_send(MAX_DATAGRAM_SIZE), "window is full");
+        let later = now + Duration::from_secs(2);
+        conn.handle_timeout(later);
+        let probe = drain_frames(&mut conn, later);
+        assert_eq!(probe.len(), 1, "exactly one probe packet: {probe:?}");
+        assert!(
+            probe[0].1.iter().any(|f| matches!(f, Frame::Stream { id: sid, offset: 0, .. } if *sid == id)),
+            "probe does not repeat the oldest stream data: {probe:?}"
+        );
+    }
+
+    /// A server Initial (RFC 9000 section 17.2.2) addressed to `conn` with
+    /// Source Connection ID `scid`, carrying `payload` under the Initial
+    /// keys `conn` currently expects.
+    fn server_initial(conn: &Connection, scid: &[u8], pn: u64, payload: &[u8]) -> Vec<u8> {
+        let keys = conn.space(SpaceId::Initial).keys(Side::Server, conn.version).expect("Initial keys").local;
+        let mut body = payload.to_vec();
+        writer::pad_to(&mut body, 32);
+        let pn_len = 1;
+        let header = long_header::build_initial(
+            conn.version,
+            &conn.local_cid,
+            &ConnectionId::from_slice(scid),
+            &[],
+            pn,
+            pn_len,
+            body.len() + keys.tag_len(),
+        );
+        let pn_offset = header.len() - pn_len;
+        keys.encrypt(pn, &header, &mut body);
+        let mut packet = header;
+        packet.append(&mut body);
+        keys.protect_header(pn_offset, &mut packet, true);
+        packet
+    }
+
+    fn ack_only() -> Vec<u8> {
+        let mut p = Vec::new();
+        writer::ack_single(&mut p, 0);
+        p
+    }
+
+    /// A CRYPTO frame beyond the next expected offset: settles the server's
+    /// connection ID without feeding anything to TLS.
+    fn crypto_ahead() -> Vec<u8> {
+        let mut p = Vec::new();
+        writer::crypto(&mut p, 100, b"later");
+        p
+    }
+
+    /// The DCID of the next packet `conn` sends.
+    fn next_dcid(conn: &mut Connection, now: Instant) -> ConnectionId {
+        let mut buf = Vec::new();
+        conn.poll_transmit(now, &mut buf).expect("a packet");
+        long_header::parse_prefix(&buf).expect("long header").dst_cid
+    }
+
+    /// RFC 9000 section 7.2: the server's connection ID is the Source
+    /// Connection ID of its Initial packets, settled by the first one that
+    /// carries CRYPTO data. An acknowledgement-only Initial that comes first
+    /// (a server holding half a ClientHello has been seen to echo the
+    /// client's own first DCID as its source) is provisional.
+    #[test]
+    fn client_settles_on_the_scid_of_the_servers_first_crypto_initial() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let bogus = [0x9; 8];
+        let real = [0xee; 8];
+        let p0 = server_initial(&conn, &bogus, 0, &ack_only());
+        conn.handle_packet(now, &p0);
+        assert!(conn.peer_initial_scid.is_none(), "an ACK-only Initial does not settle");
+        let p1 = server_initial(&conn, &real, 1, &crypto_ahead());
+        conn.handle_packet(now, &p1);
+        assert_eq!(conn.rem_cid, ConnectionId::from_slice(&real));
+        assert_eq!(conn.peer_initial_scid, Some(ConnectionId::from_slice(&real)));
+        assert_eq!(next_dcid(&mut conn, now), ConnectionId::from_slice(&real));
+    }
+
+    /// Once settled, an Initial with another Source Connection ID is not
+    /// this server's and is discarded. Regression: every decrypted
+    /// long-header packet moved the peer connection ID.
+    #[test]
+    fn client_keeps_the_settled_scid_against_later_initials() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let real = [0xee; 8];
+        let p0 = server_initial(&conn, &real, 0, &crypto_ahead());
+        conn.handle_packet(now, &p0);
+        assert_eq!(next_dcid(&mut conn, now), ConnectionId::from_slice(&real));
+        let p1 = server_initial(&conn, &[0x77; 8], 1, &crypto_ahead());
+        conn.handle_packet(now, &p1);
+        assert_eq!(conn.rem_cid, ConnectionId::from_slice(&real), "a later Initial moved the connection ID");
+        assert_eq!(conn.spaces[0].largest_received, Some(0), "the stray Initial was processed");
+    }
+
+    /// RFC 9000 section 7.3: the server's initial_source_connection_id must
+    /// repeat the settled Source Connection ID, and
+    /// retry_source_connection_id is present exactly when a Retry was.
+    #[test]
+    fn client_closes_on_mismatched_connection_id_transport_parameters() {
+        let now = Instant::now();
+        let real = [0xee; 8];
+        let settled = |now| {
+            let mut conn = test_client(now);
+            let p0 = server_initial(&conn, &real, 0, &crypto_ahead());
+            conn.handle_packet(now, &p0);
+            conn
+        };
+        let mut conn = settled(now);
+        receive_peer_tp(&mut conn, &TransportParameters { initial_src_cid: Some(ConnectionId::from_slice(&real)), ..Default::default() });
+        assert_eq!(closed_with(&mut conn), None, "matching initial_source_connection_id");
+
+        let mut conn = settled(now);
+        receive_peer_tp(&mut conn, &TransportParameters { initial_src_cid: Some(ConnectionId::from_slice(&[0x77; 8])), ..Default::default() });
+        assert_eq!(closed_with(&mut conn), Some(TRANSPORT_PARAMETER_ERROR), "initial_source_connection_id mismatch");
+
+        let mut conn = settled(now);
+        receive_peer_tp(&mut conn, &TransportParameters { initial_src_cid: None, ..Default::default() });
+        assert_eq!(closed_with(&mut conn), Some(TRANSPORT_PARAMETER_ERROR), "initial_source_connection_id missing");
+
+        let mut conn = settled(now);
+        receive_peer_tp(&mut conn, &TransportParameters {
+            initial_src_cid: Some(ConnectionId::from_slice(&real)),
+            retry_src_cid: Some(ConnectionId::from_slice(&[0x5a; 8])),
+            ..Default::default()
+        });
+        assert_eq!(closed_with(&mut conn), Some(TRANSPORT_PARAMETER_ERROR), "retry_source_connection_id without a Retry");
+    }
+
+    /// RFC 9000 section 7.3: the client's initial_source_connection_id must
+    /// repeat the Source Connection ID of its first Initial.
+    #[test]
+    fn server_closes_on_mismatched_initial_source_connection_id() {
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1]);
+        receive_peer_tp(&mut conn, &TransportParameters { initial_src_cid: Some(ConnectionId::from_slice(&[0x77; 8])), ..Default::default() });
+        assert_eq!(closed_with(&mut conn), Some(TRANSPORT_PARAMETER_ERROR), "mismatch");
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1]);
+        receive_peer_tp(&mut conn, &TransportParameters::default());
+        assert_eq!(closed_with(&mut conn), Some(TRANSPORT_PARAMETER_ERROR), "missing");
     }
 
     /// Drain `poll_transmit`, returning every datagram length.

@@ -231,6 +231,15 @@ pub struct HandshakeConfig {
     pub server_resolver: Option<ServerCredentialsResolver>,
     /// Key-exchange group preference (hybrid PQC first by default).
     pub kx_policy: KxPolicy,
+    /// Server: answer with a group the client sent a key share for, in
+    /// [`Self::kx_policy`] order among those, instead of asking for a share
+    /// of a more preferred group with a `HelloRetryRequest`. `false` (the
+    /// default) is the usual TLS 1.3 behaviour: the retry is what a
+    /// preference for a group the client did not offer a share for costs.
+    /// QUIC servers set it, since a retry costs a round trip and raises the
+    /// question of which QUIC version it is sent in (RFC 9368), on which
+    /// peers disagree. Ignored on the client.
+    pub accept_offered_key_share: bool,
     /// Local QUIC transport parameters (RFC 9001 §8.2) sent in ClientHello / EncryptedExtensions.
     pub local_transport_parameters: Option<Bytes>,
     /// Trust anchors for server chain verification (client role). Checked
@@ -243,7 +252,10 @@ pub struct HandshakeConfig {
     pub verify_override: Option<VerifyOverride>,
     /// Offer / accept TLS 1.3 early data (0-RTT).
     pub enable_early_data: bool,
-    /// Server max early data size advertised in NewSessionTicket.
+    /// Server 0-RTT limit sealed into each NewSessionTicket (0 means
+    /// unlimited). Advertised as-is on TCP and DTLS; over QUIC the ticket's
+    /// `early_data` extension always says 0xffffffff (RFC 9001 section
+    /// 4.6.1) and the limit is enforced from the sealed ticket instead.
     pub max_early_data_size: u32,
     /// Max recovered ticket age (ms) for accepting 0-RTT; resume may still succeed.
     pub max_early_data_freshness_ms: u32,
@@ -337,6 +349,7 @@ impl Default for HandshakeConfig {
             server: None,
             server_resolver: None,
             kx_policy: KxPolicy::default(),
+            accept_offered_key_share: false,
             local_transport_parameters: None,
             trust_store: None,
             verify_override: None,
@@ -1433,7 +1446,20 @@ impl HandshakeEngine {
             }
         }
 
-        let Some(group) = self.config.kx_policy.select_mutual(&ch.supported_groups) else {
+        // Our own order of preference among the groups the client sent a
+        // share for, when configured and before any retry: no round trip,
+        // and the client's choice of what to compute up front is respected.
+        let offered = if self.config.accept_offered_key_share && self.server_retry_requested_group.is_none() {
+            self.config
+                .kx_policy
+                .groups()
+                .iter()
+                .copied()
+                .find(|g| ch.supported_groups.contains(&g.code()) && ch.key_shares.iter().any(|(code, _)| *code == g.code()))
+        } else {
+            None
+        };
+        let Some(group) = offered.or_else(|| self.config.kx_policy.select_mutual(&ch.supported_groups)) else {
             self.fail(sink, AlertDescription::HandshakeFailure, "no mutually supported key exchange group");
             return false;
         };
@@ -1837,6 +1863,15 @@ impl HandshakeEngine {
                 } else {
                     0
                 };
+                // RFC 9001 section 4.6.1: over QUIC the extension is always
+                // 0xffffffff (the sealed ticket keeps the real limit), and
+                // strict clients (quic-go, xquic) discard a ticket that
+                // carries anything else.
+                let advertised_early = if max_early != 0 && self.config.mode == HandshakeMode::Quic {
+                    u32::MAX
+                } else {
+                    max_early
+                };
                 let alpn = self
                     .negotiated_alpn
                     .as_deref()
@@ -1852,6 +1887,7 @@ impl HandshakeEngine {
                     key.current(),
                     &rms,
                     max_early,
+                    advertised_early,
                     alpn,
                     remembered,
                     self.config.mode == HandshakeMode::Dtls,
@@ -2727,6 +2763,61 @@ mod tests {
         assert!(client2.is_complete(), "resume client: {:?}", sink2.events);
         assert!(server2.is_complete(), "resume server: {:?}", sink2.events);
         assert_eq!(sink2.early_data_accepted, Some(true));
+    }
+
+    /// Run a 1-RTT handshake against a server in `mode` that issues 0-RTT
+    /// tickets limited to `max_early_data_size`, and return the
+    /// NewSessionTicket it sent as (advertised on the wire, sealed in the
+    /// ticket payload).
+    fn minted_ticket_early_data(mode: HandshakeMode, max_early_data_size: u32) -> (u32, u32) {
+        use super::super::handshake::collect::parse_new_session_ticket;
+        use super::super::handshake::ticket::open_ticket;
+        let creds = test_server_credentials();
+        let mut ticket_key = [0u8; 32];
+        let _ = getrandom(&mut ticket_key);
+        let mut client_cfg = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        client_cfg.mode = mode;
+        let mut server_cfg = server_config_for(creds, KxPolicy::classical_only());
+        server_cfg.mode = mode;
+        server_cfg.enable_early_data = true;
+        server_cfg.max_early_data_size = max_early_data_size;
+        server_cfg.ticket_key = Some(TicketKeys::single(ticket_key));
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        assert!(server.is_complete(), "server: {:?}", sink.events);
+        let nst = take_outbound(&mut sink)
+            .into_iter()
+            .find(|m| m.first() == Some(&(HandshakeType::NewSessionTicket as u8)))
+            .expect("server must send a NewSessionTicket");
+        let parsed = parse_new_session_ticket(&nst[4..]).expect("well-formed NewSessionTicket");
+        let keys = TicketKeys::single(ticket_key);
+        let payload = open_ticket(keys.current(), &parsed.ticket).expect("our own sealed ticket opens");
+        (parsed.max_early_data, payload.max_early_data_size)
+    }
+
+    /// RFC 9001 section 4.6.1: over QUIC the `early_data` extension in a
+    /// NewSessionTicket is always 0xffffffff, whatever 0-RTT limit the
+    /// server applies (that stays in the sealed ticket). Strict clients
+    /// (quic-go, xquic) discard a ticket carrying any other value, so a
+    /// QUIC server configured with a finite limit never got 0-RTT at all.
+    #[test]
+    fn quic_server_advertises_unlimited_early_data_in_new_session_ticket() {
+        let (advertised, sealed) = minted_ticket_early_data(HandshakeMode::Quic, 1000);
+        assert_eq!(advertised, u32::MAX, "the wire value must be 0xffffffff over QUIC");
+        assert_eq!(sealed, 1000, "the real limit stays in the sealed ticket");
+    }
+
+    /// Off QUIC the configured limit is what TLS 1.3 clients read, and a
+    /// server with no 0-RTT keeps omitting the extension.
+    #[test]
+    fn tcp_server_advertises_its_configured_early_data_limit() {
+        assert_eq!(minted_ticket_early_data(HandshakeMode::TcpRecordLayer, 1000), (1000, 1000));
+        assert_eq!(minted_ticket_early_data(HandshakeMode::Quic, 0), (u32::MAX, u32::MAX));
     }
 
     /// A ticket is cached under the client's `ticket_namespace` as well as
@@ -3920,6 +4011,63 @@ mod tests {
             "the server must answer with a ServerHello for the group it prefers, not a HelloRetryRequest: {:?}",
             sink.events
         );
+    }
+
+    /// Feed a QUIC server with the given group policy and
+    /// `accept_offered_key_share` setting a ClientHello that lists the
+    /// hybrid group first in `supported_groups` but only carries an X25519
+    /// key share; returns the server's sink after its first reply.
+    fn server_reply_to_classical_share_only(accept_offered_key_share: bool) -> RecordingSink {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let mut server_cfg = server_config_for(test_server_credentials(), KxPolicy::pqc_first());
+        server_cfg.accept_offered_key_share = accept_offered_key_share;
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut sink = RecordingSink::default();
+        let classical = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [5u8; 32],
+            cipher_suites: SUPPORTED_CIPHER_SUITES.to_vec(),
+            key_share: KeyShareEntry {
+                group: NamedGroup::X25519.code(),
+                share: Bytes::copy_from_slice(classical.public_key()),
+            },
+            supported_groups: vec![NamedGroup::X25519MLKEM768.code(), NamedGroup::X25519.code()],
+            ..ClientHelloParams::default()
+        });
+        let wire = hello.encode();
+        let mut input = wire.as_ref();
+        server.feed_handshake_data(&mut input, &mut sink);
+        assert!(!sink.events.iter().any(|e| e.starts_with("protocol_error")), "{:?}", sink.events);
+        sink
+    }
+
+    /// The first message the server sent is a `HelloRetryRequest`: a
+    /// ServerHello whose random is the RFC 8446 section 4.1.3 constant.
+    fn first_reply_is_hello_retry_request(sink: &RecordingSink) -> bool {
+        let first = sink.outbound.first().expect("server sent nothing");
+        first[0] == HandshakeType::ServerHello as u8 && first[6..38] == HELLO_RETRY_REQUEST_RANDOM
+    }
+
+    /// With `accept_offered_key_share`, a server that would rather have a
+    /// hybrid share uses the X25519 share the client did send instead of a
+    /// `HelloRetryRequest` for the hybrid group: no extra round trip, and
+    /// no question of which QUIC version the retry goes in (picoquic and
+    /// ngtcp2 each offer a different group, so no fixed preference avoided
+    /// the retry for both). Without it the retry is unchanged.
+    #[test]
+    fn server_accepts_an_offered_key_share_instead_of_retrying_when_configured() {
+        use crate::crypto::kx::NamedGroup;
+        let sink = server_reply_to_classical_share_only(true);
+        assert!(
+            !first_reply_is_hello_retry_request(&sink),
+            "the server must answer with a ServerHello for the offered group: {:?}",
+            sink.events
+        );
+        assert_eq!(sink.negotiated_group, Some(NamedGroup::X25519.code()), "{:?}", sink.events);
+
+        let sink = server_reply_to_classical_share_only(false);
+        assert!(first_reply_is_hello_retry_request(&sink), "the default still retries for the preferred group: {:?}", sink.events);
+        assert_eq!(sink.negotiated_group, None, "{:?}", sink.events);
     }
 
     /// Full HelloRetryRequest round trip (RFC 8446 §4.1.4): the client

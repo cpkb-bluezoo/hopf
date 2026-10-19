@@ -73,6 +73,10 @@ pub struct LossDetector {
     pto_count: u32,
     handshake_confirmed: bool,
     first_rtt_sample: Option<Instant>,
+    /// RFC 9002 section 7.8: the last flush ran out of data (or the peer's
+    /// flow control held it back) rather than being limited by the
+    /// congestion window, so acknowledgements must not grow the window.
+    app_limited: bool,
 }
 
 impl LossDetector {
@@ -85,7 +89,15 @@ impl LossDetector {
             pto_count: 0,
             handshake_confirmed: false,
             first_rtt_sample: None,
+            app_limited: false,
         }
+    }
+
+    /// Record whether the sender is application-limited (RFC 9002 section
+    /// 7.8): true when the last flush stopped for lack of data or because of
+    /// the peer's flow control, false when the congestion window stopped it.
+    pub fn set_app_limited(&mut self, app_limited: bool) {
+        self.app_limited = app_limited;
     }
 
     /// RTT estimator.
@@ -194,7 +206,7 @@ impl LossDetector {
         for acked in &newly_acked {
             if acked.in_flight {
                 self.congestion
-                    .on_packet_acked(acked.time_sent, acked.sent_bytes, false);
+                    .on_packet_acked(acked.time_sent, acked.sent_bytes, self.app_limited);
             }
         }
 
@@ -485,6 +497,46 @@ impl LossDetector {
         }
     }
 
+    /// The frames a Probe Timeout probe repeats (RFC 9002 section 6.2.4):
+    /// those of the oldest ack-eliciting packet still in flight in `space`
+    /// that carries any data (a probe PING or an ACK-only packet does not).
+    /// The frames are moved out of the record, so if the packet is later
+    /// declared lost nothing is requeued twice; the packet itself stays in
+    /// flight, and is not declared lost here.
+    pub fn oldest_ack_eliciting_frames(&mut self, space: SpaceId) -> Option<Vec<RecoverableFrame>> {
+        let sp = self.space_mut(space);
+        let packet = sp.sent.values_mut().find(|p| {
+            p.ack_eliciting
+                && p.in_flight
+                && p.frames.iter().any(|f| !matches!(f, RecoverableFrame::Ping))
+        })?;
+        Some(std::mem::take(&mut packet.frames))
+    }
+
+    /// Forget one sent packet without declaring it lost or acknowledged: it
+    /// leaves bytes in flight and the ack-eliciting count, with no
+    /// congestion event. For packets the peer is known to have discarded
+    /// rather than dropped on the path, such as 0-RTT packets sent before a
+    /// Retry (RFC 9000 section 17.2.5.2).
+    pub fn discard_packet(&mut self, space: SpaceId, packet_number: u64) {
+        let sp = self.space_mut(space);
+        let Some(packet) = sp.sent.remove(&packet_number) else {
+            return;
+        };
+        if packet.ack_eliciting && packet.in_flight {
+            sp.ack_eliciting_in_flight = sp.ack_eliciting_in_flight.saturating_sub(1);
+            sp.time_of_last_ack_eliciting = sp
+                .sent
+                .values()
+                .filter(|p| p.ack_eliciting && p.in_flight)
+                .map(|p| p.time_sent)
+                .max();
+        }
+        if packet.in_flight {
+            self.congestion.remove_from_bytes_in_flight(packet.sent_bytes);
+        }
+    }
+
     /// Discard all tracked state for a packet number space (Appendix A.11).
     pub fn discard_packet_number_space(&mut self, space: SpaceId) {
         let sp = self.space_mut(space);
@@ -686,6 +738,49 @@ mod tests {
             &[(0, 0)],
             Duration::from_millis(25),
             at(b, 1100),
+            true,
+        );
+        assert!(result.newly_acked.is_empty());
+    }
+
+    #[test]
+    fn oldest_ack_eliciting_frames_skips_probes_and_takes_the_frames_once() {
+        let mut d = LossDetector::new(1200);
+        let b = base();
+        d.on_packet_sent(SpaceId::Data, 0, at(b, 100), true, true, 50, vec![RecoverableFrame::Ping]);
+        d.on_packet_sent(SpaceId::Data, 1, at(b, 100), false, false, 50, vec![]);
+        d.on_packet_sent(SpaceId::Data, 2, at(b, 200), true, true, 500, vec![RecoverableFrame::HandshakeDone]);
+        d.on_packet_sent(SpaceId::Data, 3, at(b, 300), true, true, 500, vec![RecoverableFrame::HandshakeDone]);
+        let frames = d.oldest_ack_eliciting_frames(SpaceId::Data).expect("pn 2 has data");
+        assert!(matches!(frames[..], [RecoverableFrame::HandshakeDone]));
+        // pn 2 stays in flight but has nothing left to repeat; pn 3 is next.
+        assert_eq!(d.congestion().bytes_in_flight(), 1050);
+        assert!(d.oldest_ack_eliciting_frames(SpaceId::Data).is_some());
+        assert!(d.oldest_ack_eliciting_frames(SpaceId::Data).is_none());
+    }
+
+    #[test]
+    fn discard_packet_forgets_it_without_a_congestion_event() {
+        let mut d = LossDetector::new(1200);
+        let b = base();
+        d.on_packet_sent(SpaceId::Data, 0, at(b, 100), true, true, 500, vec![]);
+        d.on_packet_sent(SpaceId::Data, 1, at(b, 200), true, true, 300, vec![]);
+        d.discard_packet(SpaceId::Data, 0);
+        assert_eq!(d.congestion().bytes_in_flight(), 300);
+        assert_eq!(d.congestion().congestion_window(), 12_000);
+        assert!(d.has_ack_eliciting_in_flight());
+        d.discard_packet(SpaceId::Data, 1);
+        assert_eq!(d.congestion().bytes_in_flight(), 0);
+        assert!(!d.has_ack_eliciting_in_flight());
+        // Unknown packet numbers are ignored.
+        d.discard_packet(SpaceId::Data, 7);
+        let result = d.on_ack_received(
+            SpaceId::Data,
+            0,
+            Duration::ZERO,
+            &[(0, 1)],
+            Duration::from_millis(25),
+            at(b, 300),
             true,
         );
         assert!(result.newly_acked.is_empty());

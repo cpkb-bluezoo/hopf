@@ -11,6 +11,14 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::transport::types::Transmit;
 
+/// Send and receive buffer size requested for every QUIC socket (4 MiB).
+/// The operating system default (under a megabyte on Linux and macOS)
+/// bounds the burst a receiver can absorb between two reads of the socket,
+/// and is the first thing a loopback transfer overruns once the sender's
+/// window is free to grow. The kernel clamps the request to its own limits
+/// (rmem_max / wmem_max on Linux), so this is a request, not a guarantee.
+pub const UDP_SOCKET_BUFFER_SIZE: usize = 4 << 20;
+
 /// Bind a non-blocking UDP socket for QUIC, applying RFC 9000 §14 path-MTU
 /// hardening (Do Not Fragment on IPv4; equivalent on IPv6 where supported).
 pub fn bind_udp(addr: SocketAddr) -> io::Result<(UdpSocket, SocketAddr)> {
@@ -19,6 +27,10 @@ pub fn bind_udp(addr: SocketAddr) -> io::Result<(UdpSocket, SocketAddr)> {
         SocketAddr::V6(_) => Domain::IPV6,
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    // Best effort: the kernel clamps to its limits, and a refusal (or a
+    // smaller grant) leaves a working socket at the default size.
+    let _ = socket.set_recv_buffer_size(UDP_SOCKET_BUFFER_SIZE);
+    let _ = socket.set_send_buffer_size(UDP_SOCKET_BUFFER_SIZE);
     set_dont_fragment(&socket, domain)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
@@ -567,6 +579,29 @@ mod tests {
         let (_sock, local) = bind_udp(addr).unwrap();
         assert!(local.ip().is_ipv4());
         assert_ne!(local.port(), 0);
+    }
+
+    /// The socket asks for larger buffers than the operating system's
+    /// default, so a receiver can absorb a burst between two reads. The
+    /// kernel clamps the request (rmem_max / wmem_max), so the check is
+    /// against what it grants a plain socket for the same request, never
+    /// against the requested size itself.
+    #[test]
+    fn bind_udp_requests_larger_socket_buffers() {
+        let plain = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let _ = plain.set_recv_buffer_size(UDP_SOCKET_BUFFER_SIZE);
+        let _ = plain.set_send_buffer_size(UDP_SOCKET_BUFFER_SIZE);
+        let granted_recv = plain.recv_buffer_size().unwrap();
+        let granted_send = plain.send_buffer_size().unwrap();
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (sock, _) = bind_udp(addr).unwrap();
+        let bound = socket2::SockRef::from(&sock);
+        let recv = bound.recv_buffer_size().unwrap();
+        let send = bound.send_buffer_size().unwrap();
+        assert!(recv > 0 && send > 0);
+        assert!(recv >= granted_recv, "receive buffer {recv} below the {granted_recv} the host grants");
+        assert!(send >= granted_send, "send buffer {send} below the {granted_send} the host grants");
     }
 
     #[test]

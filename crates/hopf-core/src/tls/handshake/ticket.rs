@@ -285,10 +285,16 @@ impl AntiReplay {
 }
 
 /// Mint a NewSessionTicket message and the client-side [`StoredTicket`] material.
+///
+/// `max_early_data_size` is the 0-RTT limit this server applies, sealed
+/// into the ticket; `advertised_max_early_data_size` is what the message's
+/// `early_data` extension carries (0 omits it). They differ over QUIC,
+/// where the extension must be 0xffffffff (RFC 9001 section 4.6.1).
 pub fn mint_new_session_ticket(
     ticket_key: &TicketKey,
     resumption_master: &ResumptionMasterSecret,
     max_early_data_size: u32,
+    advertised_max_early_data_size: u32,
     alpn: &[u8],
     remembered_limits: Option<RememberedTransportLimits>,
     dtls: bool,
@@ -317,7 +323,7 @@ pub fn mint_new_session_ticket(
         ticket_age_add,
         &ticket_nonce,
         identity.as_ref(),
-        max_early_data_size,
+        advertised_max_early_data_size,
     );
     let stored = StoredTicket {
         identity,

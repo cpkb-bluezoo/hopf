@@ -56,6 +56,11 @@ impl SendStream {
         }
     }
 
+    /// Whether `take_chunk` has anything left to return.
+    pub fn has_data(&self) -> bool {
+        !self.pending.is_empty() || !self.retransmit.is_empty() || (self.fin && !self.fin_sent)
+    }
+
     /// Offset of the chunk `take_chunk` would return next.
     pub fn next_offset(&self) -> u64 {
         self.retransmit

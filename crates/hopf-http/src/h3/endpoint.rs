@@ -238,7 +238,7 @@ impl H3Writer {
             let mut shared = self.control.shared.lock().unwrap();
             std::mem::take(&mut shared.body)
         };
-        let trailers = {
+        let mut trailers = {
             let mut shared = self.control.shared.lock().unwrap();
             if shared.complete && !upgraded {
                 shared.trailers.take()
@@ -294,6 +294,7 @@ impl H3Writer {
             return;
         }
 
+        let mut held = false;
         if !body.is_empty() {
             let allowed = {
                 let mut state = self.peer_state.lock().unwrap();
@@ -302,8 +303,14 @@ impl H3Writer {
             if allowed {
                 frame::write_data(&mut out, &body);
             } else {
-                // Hold body until the active non-incremental peer finishes.
-                self.control.shared.lock().unwrap().body = body;
+                // Another stream owns the slot: hold the body, and the
+                // trailers that must follow it, until that stream releases
+                // it and pokes us to flush again. `shared.complete` stays
+                // set, so that flush ends the response once the body is out.
+                let mut shared = self.control.shared.lock().unwrap();
+                shared.body = body;
+                shared.trailers = trailers.take();
+                held = true;
             }
         }
         if let Some(trailers) = trailers {
@@ -315,11 +322,24 @@ impl H3Writer {
         if !out.is_empty() {
             endpoint.send(&out);
         }
+        if held {
+            // Closing now would FIN the stream and drop the held body.
+            self.peer_state
+                .lock()
+                .unwrap()
+                .non_inc_waiters
+                .insert(self.stream_id, endpoint.handle());
+            return;
+        }
         if complete {
-            {
+            let waiters = {
                 let mut state = self.peer_state.lock().unwrap();
-                release_non_inc_slot(&mut state, self.stream_id, self.priority);
+                state.non_inc_waiters.remove(&self.stream_id);
                 state.stream_priority.remove(&self.stream_id);
+                release_non_inc_slot(&mut state, self.stream_id, self.priority)
+            };
+            for waiter in waiters {
+                waiter.poke();
             }
             endpoint.close();
         }
@@ -883,6 +903,11 @@ pub(crate) struct H3PeerState {
     pub(crate) stream_priority: HashMap<u64, PriorityParams>,
     /// Per-urgency active non-incremental stream (RFC 9218 §4.2 / §10).
     pub(crate) non_inc_active: [Option<u64>; 8],
+    /// Request streams whose response body is held back because another
+    /// stream owns the non-incremental slot, by stream id: the handle to
+    /// poke when a slot is released, so the stream's `receive` runs again
+    /// and its flush retries the claim.
+    pub(crate) non_inc_waiters: HashMap<u64, ConnHandle>,
 }
 
 fn claim_non_inc_slot(state: &mut H3PeerState, stream_id: u64, p: PriorityParams) -> bool {
@@ -899,13 +924,20 @@ fn claim_non_inc_slot(state: &mut H3PeerState, stream_id: u64, p: PriorityParams
     }
 }
 
-fn release_non_inc_slot(state: &mut H3PeerState, stream_id: u64, p: PriorityParams) {
-    if p.incremental {
-        return;
+/// Release `stream_id`'s non-incremental slot. Returns the handles of the
+/// streams waiting for a slot, for the caller to poke once the state lock
+/// is dropped; a poked stream that still finds the slot taken simply
+/// registers itself again.
+fn release_non_inc_slot(
+    state: &mut H3PeerState,
+    stream_id: u64,
+    p: PriorityParams,
+) -> Vec<ConnHandle> {
+    if p.incremental || state.non_inc_active[p.urgency as usize] != Some(stream_id) {
+        return Vec::new();
     }
-    if state.non_inc_active[p.urgency as usize] == Some(stream_id) {
-        state.non_inc_active[p.urgency as usize] = None;
-    }
+    state.non_inc_active[p.urgency as usize] = None;
+    state.non_inc_waiters.drain().map(|(_, handle)| handle).collect()
 }
 
 /// What an [`H3UniStream`] does with bytes once its type byte is known.
@@ -2501,6 +2533,190 @@ mod request_validation_tests {
         let mut data: &[u8] = &bytes;
         stream.receive(&mut ep, &mut data);
         assert_eq!(ep.close_connection_code, Some(frame::H3_FRAME_ERROR));
+    }
+}
+
+#[cfg(test)]
+mod non_incremental_slot_tests {
+    use super::*;
+    use std::time::Duration;
+
+    use hopf_core::{ConnHandleBackend, EndpointTask, Task, TimerHandle};
+
+    /// Stands in for the QUIC driver's command channel behind a stream's
+    /// `ConnHandle`: counts the `poke()`s that would re-run the stream's
+    /// `receive` on the driver thread.
+    #[derive(Default)]
+    struct PokeRecorder {
+        pokes: Mutex<usize>,
+    }
+    impl ConnHandleBackend for PokeRecorder {
+        fn with_endpoint(&self, _task: EndpointTask) {
+            *self.pokes.lock().unwrap() += 1;
+        }
+        fn execute(&self, task: Task) {
+            task();
+        }
+        fn is_probably_open(&self) -> bool {
+            true
+        }
+        fn schedule_timer(&self, _delay: Duration, _callback: Task) -> TimerHandle {
+            unimplemented!("not exercised by these unit tests")
+        }
+    }
+
+    /// Records what the stream sends and whether it was closed (FIN).
+    #[derive(Default)]
+    struct RecordingEndpoint {
+        sent: Vec<u8>,
+        closed: bool,
+        pokes: Arc<PokeRecorder>,
+    }
+    impl RecordingEndpoint {
+        fn pokes(&self) -> usize {
+            *self.pokes.pokes.lock().unwrap()
+        }
+    }
+    impl Endpoint for RecordingEndpoint {
+        fn send(&mut self, data: &[u8]) {
+            self.sent.extend_from_slice(data);
+        }
+        fn is_open(&self) -> bool {
+            !self.closed
+        }
+        fn is_closing(&self) -> bool {
+            self.closed
+        }
+        fn close(&mut self) {
+            self.closed = true;
+        }
+        fn close_connection(&mut self, _error_code: u32) {
+            self.closed = true;
+        }
+        fn abort(&mut self, _error_code: u32) {
+            self.closed = true;
+        }
+        fn local_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn remote_addr(&self) -> io::Result<hopf_core::PeerAddr> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn security_info(&self) -> &hopf_core::SecurityInfo {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn start_tls(&mut self) -> Result<(), hopf_core::StartTlsError> {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn pause_read(&mut self) {}
+        fn resume_read(&mut self) {}
+        fn on_write_ready(&mut self, _callback: Option<hopf_core::WriteReadyCallback>) {}
+        fn execute(&self, _task: Box<dyn FnOnce() + Send>) {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn schedule_timer(
+            &self,
+            _delay: Duration,
+            _callback: Box<dyn FnOnce() + Send>,
+        ) -> hopf_core::TimerHandle {
+            unimplemented!("not exercised by these unit tests")
+        }
+        fn handle(&self) -> hopf_core::ConnHandle {
+            let backend = Arc::clone(&self.pokes) as Arc<dyn ConnHandleBackend>;
+            ConnHandle::from_backend(backend)
+        }
+    }
+
+    /// Answers each request with the next scripted `(body, complete)`:
+    /// headers and body straight away, and the end of the response only
+    /// when `complete` is set (the large file keeps streaming).
+    struct ScriptedFactory {
+        responses: Mutex<std::collections::VecDeque<(Vec<u8>, bool)>>,
+    }
+    struct ScriptedHandler {
+        body: Vec<u8>,
+        complete: bool,
+    }
+    impl ServerHandler for ScriptedHandler {
+        fn headers(&mut self, response: &mut dyn ServerWriter, _: &Headers) {
+            let mut h = Headers::new();
+            h.status(200);
+            response.headers(h);
+            response.response_body_content(&self.body);
+            if self.complete {
+                response.complete();
+            }
+        }
+        fn request_complete(&mut self, _: &mut dyn ServerWriter) {}
+    }
+    impl ServerHandlerFactory for ScriptedFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            let (body, complete) = self.responses.lock().unwrap().pop_front().expect("scripted");
+            Box::new(ScriptedHandler { body, complete })
+        }
+    }
+
+    fn request_headers_frame() -> Vec<u8> {
+        let block = qpack::encode(
+            [(":method", "GET"), (":scheme", "https"), (":path", "/"), (":authority", "x")].into_iter(),
+        );
+        let mut out = Vec::new();
+        frame::write_headers(&mut out, &block);
+        out
+    }
+
+    /// Two non-incremental responses at the same urgency: the first owns
+    /// the slot with a body still streaming, so the second's body is held.
+    /// The second stream must not be FINished until the slot is released,
+    /// and once it is, the held body goes out and the stream closes.
+    #[test]
+    fn held_non_incremental_body_is_sent_before_the_stream_closes() {
+        let large = vec![b'a'; 4096];
+        let factory: Arc<dyn ServerHandlerFactory> = Arc::new(ScriptedFactory {
+            responses: Mutex::new([(large.clone(), false), (b"hi".to_vec(), true)].into()),
+        });
+        let qpack = Arc::new(qpack::H3Qpack::new());
+        let peer_state = Arc::new(Mutex::new(H3PeerState::default()));
+        let mut a = H3RequestStream::new(
+            Arc::clone(&factory),
+            HttpLimits::default(),
+            0,
+            Arc::clone(&qpack),
+            Arc::clone(&peer_state),
+        );
+        let mut b = H3RequestStream::new(factory, HttpLimits::default(), 4, qpack, Arc::clone(&peer_state));
+        let mut a_ep = RecordingEndpoint::default();
+        let mut b_ep = RecordingEndpoint::default();
+        let req = request_headers_frame();
+
+        a.receive(&mut a_ep, &mut &req[..]);
+        let mut large_data = Vec::new();
+        frame::write_data(&mut large_data, &large);
+        assert!(a_ep.sent.ends_with(&large_data), "first response body goes straight out");
+        assert!(!a_ep.closed);
+        assert_eq!(peer_state.lock().unwrap().non_inc_active[3], Some(0));
+
+        b.receive(&mut b_ep, &mut &req[..]);
+        let mut small_data = Vec::new();
+        frame::write_data(&mut small_data, b"hi");
+        assert!(!b_ep.sent.is_empty(), "second response headers go out");
+        assert!(!b_ep.sent.ends_with(&small_data), "second body is held while the slot is taken");
+        assert!(!b_ep.closed, "a stream whose body is held must not be FINished");
+        assert_eq!(b_ep.pokes(), 0);
+
+        // The first response ends from a deferred task, as a file streamed
+        // off a worker would, and its stream is re-driven.
+        a.writer.response_handle().execute(|w| w.complete());
+        a.receive(&mut a_ep, &mut &[][..]);
+        assert!(a_ep.closed);
+        assert_eq!(peer_state.lock().unwrap().non_inc_active[3], None);
+        assert_eq!(b_ep.pokes(), 1, "releasing the slot wakes the waiting stream");
+
+        // The poke re-runs the waiting stream's receive on the driver.
+        b.receive(&mut b_ep, &mut &[][..]);
+        assert!(b_ep.sent.ends_with(&small_data), "held body is sent once the slot is free");
+        assert!(b_ep.closed);
+        assert_eq!(peer_state.lock().unwrap().non_inc_active[3], None);
     }
 }
 

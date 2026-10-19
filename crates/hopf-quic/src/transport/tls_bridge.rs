@@ -173,6 +173,10 @@ impl TlsBridge {
         config.role = HandshakeRole::Server;
         config.mode = HandshakeMode::Quic;
         config.local_transport_parameters = Some(Bytes::from(local_tp.encode()));
+        // A retry costs a round trip, and a HelloRetryRequest raises the
+        // question of which QUIC version it is sent in (RFC 9368), on which
+        // peers disagree; use the group the client sent a share for.
+        config.accept_offered_key_share = true;
         Self {
             engine: HandshakeEngine::new(config),
             side: Side::Server,

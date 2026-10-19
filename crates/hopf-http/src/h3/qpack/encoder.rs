@@ -3,10 +3,11 @@
 //! Stateful QPACK field-section encoder (RFC 9204 §4.5), backed by a real
 //! dynamic table. Operates in strictly non-blocking mode: it never
 //! references an entry the peer decoder hasn't yet acknowledged, so it
-//! always emits `Base = Required Insert Count = Known Received Count` and
-//! never uses post-base indexing (§4.5.3/§4.5.5) — a compliant peer never
-//! blocks decoding our field sections, which is why hopf's own decoder can
-//! safely advertise `SETTINGS_QPACK_BLOCKED_STREAMS = 0`.
+//! always emits `Base = Known Received Count`, a Required Insert Count no
+//! larger than that, and never uses post-base indexing (§4.5.3/§4.5.5) - a
+//! compliant peer never blocks decoding our field sections, which is why
+//! hopf's own decoder can safely advertise `SETTINGS_QPACK_BLOCKED_STREAMS
+//! = 0`.
 
 use std::collections::HashMap;
 
@@ -20,7 +21,7 @@ use super::strings;
 pub(crate) struct Encoder {
     table: DynamicTable,
     /// Entries the peer decoder has acknowledged processing through
-    /// (RFC 9204 §2.1.4) — our non-blocking policy's Base/RIC value.
+    /// (RFC 9204 §2.1.4) - our non-blocking policy's Base value.
     known_received_count: u64,
     /// Dynamic-table insertions and duplications sent on the encoder stream
     /// (RFC 9204 §4.4.3 — peer increments must not exceed this).
@@ -70,10 +71,12 @@ impl Encoder {
         stream_id: u64,
         fields: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> (Vec<u8>, Vec<u8>) {
-        let base = self.known_received_count; // non-blocking policy: Base = RIC = KRC
+        let base = self.known_received_count; // non-blocking policy: Base = KRC
         let mut field_lines = Vec::new();
         let mut instructions = Vec::new();
         let mut referenced = Vec::new();
+        // One more than the largest absolute index referenced, 0 if none.
+        let mut required_insert_count = 0;
 
         for (name, value) in fields {
             if let Some(index) = static_table::find(name, value) {
@@ -83,6 +86,7 @@ impl Encoder {
             if let Some((abs, true)) = self.table.find(name, value, base) {
                 self.table.add_ref(abs);
                 referenced.push(abs);
+                required_insert_count = required_insert_count.max(abs + 1);
                 prefix_int::encode(&mut field_lines, base - 1 - abs, 6, 0x80);
                 continue;
             }
@@ -117,6 +121,7 @@ impl Encoder {
                 prefix_int::encode(&mut field_lines, static_index as u64, 4, 0x50);
                 strings::write(&mut field_lines, value.as_bytes(), 7, 0);
             } else if let Some((abs, false)) = self.table.find(name, value, base) {
+                required_insert_count = required_insert_count.max(abs + 1);
                 prefix_int::encode(&mut field_lines, base - 1 - abs, 4, 0x40);
                 strings::write(&mut field_lines, value.as_bytes(), 7, 0);
             } else {
@@ -125,17 +130,24 @@ impl Encoder {
             }
         }
 
+        // RFC 9204 §2.2.1: the Required Insert Count is the lowest value the
+        // section can be decoded with, 0 if it references no dynamic entry;
+        // a strict decoder treats a larger one as a decompression failure.
+        // Base stays the Known Received Count the relative indices were
+        // taken against, so Delta Base (sign 0) is the difference - and 0
+        // when the section has no dynamic references (Base is then 0 too).
         let mut section = Vec::new();
-        let encoded_ric = insert_count::encode(base, self.table.capacity());
+        let encoded_ric = insert_count::encode(required_insert_count, self.table.capacity());
         prefix_int::encode(&mut section, encoded_ric, 8, 0);
-        prefix_int::encode(&mut section, 0, 7, 0); // Base = RIC: sign 0, delta 0
+        let delta_base = if required_insert_count == 0 { 0 } else { base - required_insert_count };
+        prefix_int::encode(&mut section, delta_base, 7, 0);
         section.extend_from_slice(&field_lines);
 
-        if !referenced.is_empty() {
-            self.outstanding.insert(stream_id, (base, referenced));
-        }
-        if base > 0 {
-            self.pending_section_ack.insert(stream_id, base);
+        // The decoder sends a Section Acknowledgment iff the Required
+        // Insert Count is above 0, and Known Received Count then rises to it.
+        if required_insert_count > 0 {
+            self.outstanding.insert(stream_id, (required_insert_count, referenced));
+            self.pending_section_ack.insert(stream_id, required_insert_count);
         }
         (section, instructions)
     }
@@ -252,6 +264,65 @@ mod tests {
             input = &input[used..];
         }
         out
+    }
+
+    /// RFC 9204 section 2.2.1: the Required Insert Count is what the
+    /// section needs, not what the peer has acknowledged. A section that
+    /// uses only static or literal representations needs nothing from the
+    /// dynamic table, so its RIC is 0 even once entries are known-received,
+    /// and the decoder sends no Section Acknowledgment for it.
+    #[test]
+    fn static_only_section_has_zero_required_insert_count_after_dynamic_inserts() {
+        let mut enc = Encoder::new(4096);
+        let (_, instructions) = enc.encode(0, [("x-custom", "widget")]);
+        assert!(!instructions.is_empty(), "expected an insert instruction");
+        enc.on_insert_count_increment(1).unwrap(); // KRC = 1
+
+        let (section, instructions) = enc.encode(4, [(":status", "200")]);
+        assert!(instructions.is_empty());
+        assert_eq!(section, vec![0, 0, 0xc0 | 25], "RIC=0, Base=0, static index 25");
+        assert!(
+            !enc.pending_section_ack.contains_key(&4),
+            "a section with RIC 0 is never acknowledged"
+        );
+        assert!(enc.on_section_acknowledgment(4).is_err());
+    }
+
+    /// A section referencing dynamic absolute index k needs exactly k + 1
+    /// insertions, even when more are already known-received; a strict
+    /// decoder (lsquic) fails decompression when the RIC is larger.
+    #[test]
+    fn required_insert_count_is_one_past_largest_referenced_index_not_krc() {
+        let mut enc = Encoder::new(4096);
+        let mut dec = Decoder::new(4096);
+        let (_, instructions) = enc.encode(0, [("x-a", "1"), ("x-b", "2"), ("x-c", "3")]);
+        for instr in split_instructions(&instructions) {
+            dec.apply_encoder_instruction(instr).unwrap();
+        }
+        enc.on_insert_count_increment(3).unwrap(); // KRC = 3, abs 0..=2 live
+
+        // Full match on abs 0: RIC = 1 (wire 2), Base = KRC = 3 so
+        // Delta Base = 2 with sign 0, relative index = 3 - 1 - 0 = 2.
+        let (section, instructions) = enc.encode(4, [("x-a", "1")]);
+        assert!(instructions.is_empty());
+        assert_eq!(section, vec![2, 2, 0x80 | 2]);
+        assert_eq!(enc.pending_section_ack.get(&4), Some(&1));
+        assert_eq!(enc.outstanding.get(&4).map(|(ric, _)| *ric), Some(1));
+        let (fields, ack) = dec.decode(4, &section).unwrap();
+        assert_eq!(fields, vec![("x-a".into(), "1".into())]);
+        assert!(!ack.is_empty(), "RIC > 0 is acknowledged");
+        enc.on_section_acknowledgment(4).unwrap();
+        assert_eq!(enc.known_received_count, 3, "an ack never lowers KRC");
+
+        // Name-only match on abs 1 (x-b): RIC = 2 (wire 3), Delta Base = 1.
+        let (section, instructions) = enc.encode(8, [("x-b", "9")]);
+        for instr in split_instructions(&instructions) {
+            dec.apply_encoder_instruction(instr).unwrap();
+        }
+        assert_eq!(&section[..3], &[3, 1, 0x40 | 1]);
+        assert_eq!(enc.pending_section_ack.get(&8), Some(&2));
+        let (fields, _) = dec.decode(8, &section).unwrap();
+        assert_eq!(fields, vec![("x-b".into(), "9".into())]);
     }
 
     #[test]

@@ -520,6 +520,16 @@ pub(crate) fn parse_server_hello(body: &[u8]) -> Option<ParsedServerHello> {
     Some(c.out)
 }
 
+/// Parse a `NewSessionTicket` body through the handshake codec.
+#[cfg(test)]
+pub(crate) fn parse_new_session_ticket(body: &[u8]) -> Option<ParsedNewSessionTicket> {
+    let mut c = NewSessionTicketCollector::default();
+    if !decode_one(HandshakeType::NewSessionTicket, body, &mut c) || c.failed || !c.got {
+        return None;
+    }
+    Some(c.out)
+}
+
 /// One fully parsed incoming handshake message (assembled from codec events).
 ///
 /// `ClientHello` carries far more parsed extension data than the other

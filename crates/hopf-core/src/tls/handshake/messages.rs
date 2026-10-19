@@ -165,7 +165,8 @@ pub struct ClientHelloParams {
     pub transport_parameters: Option<Bytes>,
     /// Offer early data (empty early_data extension).
     pub early_data: bool,
-    /// Optional single PSK offer (implies psk_key_exchange_modes).
+    /// Optional single PSK offer. `psk_key_exchange_modes` (psk_dhe_ke) is
+    /// offered either way, so the server knows it may issue a ticket.
     pub psk: Option<OfferedPsk>,
     /// Cookie echoed back verbatim after a `HelloRetryRequest` carried one
     /// (RFC 8446 §4.2.2) — `None` on an initial ClientHello.
@@ -410,9 +411,11 @@ fn build_client_hello_inner(
     if let Some(limit) = params.record_size_limit {
         push_extension(&mut extensions, ext::RECORD_SIZE_LIMIT, &limit.to_be_bytes());
     }
-    if params.psk.is_some() {
-        push_extension(&mut extensions, ext::PSK_KEY_EXCHANGE_MODES, &[1, PSK_DHE_KE]);
-    }
+    // Always offered, not only when resuming (RFC 8446 section 4.2.9): a
+    // server issues a NewSessionTicket only to a client that said it can
+    // use one (picotls, NSS), so a first connection without this extension
+    // never gets a ticket to resume with.
+    push_extension(&mut extensions, ext::PSK_KEY_EXCHANGE_MODES, &[1, PSK_DHE_KE]);
     if let Some(cookie) = &params.cookie {
         push_extension(&mut extensions, ext::COOKIE, cookie);
     }
@@ -936,6 +939,54 @@ mod tests {
         assert!(parsed.peer_key_share.is_some());
         assert_eq!(parsed.key_share_group, Some(NamedGroup::X25519.code()));
         assert_eq!(parsed.cipher_suites, vec![0x1301, 0x1303]);
+    }
+
+    /// The body of extension `et` in a raw (non-DTLS) ClientHello body, or
+    /// `None` when it is absent.
+    fn client_hello_extension(body: &[u8], et: u16) -> Option<Vec<u8>> {
+        let mut i = 2 + 32; // legacy_version, random
+        i += 1 + body[i] as usize; // legacy_session_id
+        i += 2 + u16::from_be_bytes([body[i], body[i + 1]]) as usize; // cipher_suites
+        i += 1 + body[i] as usize; // compression_methods
+        let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        let block = &body[i + 2..i + 2 + ext_len];
+        let mut k = 0;
+        while k + 4 <= block.len() {
+            let t = u16::from_be_bytes([block[k], block[k + 1]]);
+            let l = u16::from_be_bytes([block[k + 2], block[k + 3]]) as usize;
+            k += 4;
+            if t == et {
+                return Some(block[k..k + l].to_vec());
+            }
+            k += l;
+        }
+        None
+    }
+
+    /// `psk_key_exchange_modes` is offered on every ClientHello, not only
+    /// when resuming (RFC 8446 section 4.2.9): servers built on picotls and
+    /// NSS (picoquic, neqo) issue a NewSessionTicket only to a client that
+    /// said it can use one with psk_dhe_ke, so a first connection without
+    /// the extension never received a ticket to resume with.
+    #[test]
+    fn client_hello_always_offers_psk_key_exchange_modes() {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [8u8; 32],
+            cipher_suites: vec![0x1301],
+            key_share: KeyShareEntry { group: NamedGroup::X25519.code(), share: Bytes::copy_from_slice(kp.public_key()) },
+            supported_groups: vec![NamedGroup::X25519.code()],
+            psk: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            client_hello_extension(&hello.body, ext::PSK_KEY_EXCHANGE_MODES),
+            Some(vec![1, PSK_DHE_KE]),
+            "a ClientHello with no PSK must still offer psk_dhe_ke"
+        );
+        // The hello is still well-formed for the server-side parser.
+        assert!(parse_client_hello(&hello.body).is_some());
     }
 
     /// `signature_algorithms_cert` (RFC 9846 §1.4) is advertised; scans the

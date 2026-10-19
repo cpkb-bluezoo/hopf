@@ -24,6 +24,7 @@ pub fn effective_max_message_size(max: u64) -> u64 {
 
 const HEADER_SIZE: usize = 5;
 const UNCOMPRESSED: u8 = 0;
+const COMPRESSED: u8 = 1;
 
 /// Error from gRPC framing helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +61,12 @@ impl GrpcFraming {
         frame(message)
     }
 
+    /// Wraps an already-compressed message with the gRPC 5-byte prefix,
+    /// with the compressed flag set.
+    pub fn frame_compressed(message: &[u8]) -> Vec<u8> {
+        frame_compressed(message)
+    }
+
     /// Returns the total size of a framed message (header + payload).
     pub fn framed_size(payload_length: usize) -> usize {
         framed_size(payload_length)
@@ -85,8 +92,7 @@ impl GrpcFraming {
         if data.len() < HEADER_SIZE {
             return Ok(None);
         }
-        // compressed flag at data[0] — consumed but unused here (parser rejects non-zero)
-        let _flag = data[0];
+        // compressed flag at data[0]: not this helper's concern
         let length = ((data[1] as u64) << 24)
             | ((data[2] as u64) << 16)
             | ((data[3] as u64) << 8)
@@ -115,9 +121,19 @@ impl GrpcFraming {
 
 /// Frame a protobuf message with the gRPC 5-byte prefix (uncompressed).
 pub fn frame(message: &[u8]) -> Vec<u8> {
+    frame_flagged(UNCOMPRESSED, message)
+}
+
+/// Frame a message that has already been compressed with the call's
+/// `grpc-encoding`, with the compressed flag set.
+pub fn frame_compressed(message: &[u8]) -> Vec<u8> {
+    frame_flagged(COMPRESSED, message)
+}
+
+fn frame_flagged(flag: u8, message: &[u8]) -> Vec<u8> {
     let length = message.len();
     let mut out = Vec::with_capacity(HEADER_SIZE + length);
-    out.push(UNCOMPRESSED);
+    out.push(flag);
     out.push((length >> 24) as u8);
     out.push((length >> 16) as u8);
     out.push((length >> 8) as u8);
@@ -210,7 +226,12 @@ impl<H: GrpcEventHandler> GrpcFrameParser<H> {
 
     /// Parses as many complete frames as possible from `data`.
     pub fn receive(&mut self, mut data: &[u8]) {
-        while !data.is_empty() {
+        // A zero-length frame is complete as soon as its header is: keep
+        // going with no input left so that end_message fires for it
+        // without waiting for a byte that may never come.
+        while !data.is_empty()
+            || (self.state == State::Payload && self.payload_remaining == 0)
+        {
             match self.state {
                 State::Header => {
                     if !self.process_header(&mut data) {
@@ -238,10 +259,13 @@ impl<H: GrpcEventHandler> GrpcFrameParser<H> {
         }
 
         let compression_flag = self.header_buf[0];
-        if compression_flag != 0 {
+        // 0 is a message as it is, 1 a message compressed with the call's
+        // grpc-encoding (gRPC HTTP/2 protocol); anything else is not gRPC
+        if compression_flag > COMPRESSED {
             self.reset();
-            self.handler
-                .parse_error("Compressed gRPC frames are not supported");
+            self.handler.parse_error(&format!(
+                "Invalid gRPC compression flag: {compression_flag}"
+            ));
             return false;
         }
 
@@ -343,10 +367,11 @@ mod tests {
         assert!(h.errors.is_empty());
     }
 
+    /// Flag 1 marks a message compressed with the call's grpc-encoding;
+    /// the parser passes it on rather than deciding about it.
     #[test]
-    fn reject_compression() {
-        let mut framed = frame(b"x");
-        framed[0] = 1;
+    fn accepts_compressed_flag() {
+        let framed = frame_compressed(b"xyz");
         let mut p = GrpcFrameParser::new(Collect {
             starts: vec![],
             chunks: vec![],
@@ -354,7 +379,50 @@ mod tests {
             errors: vec![],
         });
         p.receive(&framed);
-        assert!(!p.into_handler().errors.is_empty());
+        let h = p.into_handler();
+        assert!(h.errors.is_empty(), "{:?}", h.errors);
+        assert_eq!(h.starts, vec![(1, 3)]);
+        assert_eq!(h.chunks.concat(), b"xyz");
+        assert_eq!(h.ends, 1);
+    }
+
+    #[test]
+    fn rejects_unknown_compression_flag() {
+        let mut framed = frame(b"x");
+        framed[0] = 2;
+        let mut p = GrpcFrameParser::new(Collect {
+            starts: vec![],
+            chunks: vec![],
+            ends: 0,
+            errors: vec![],
+        });
+        p.receive(&framed);
+        let h = p.into_handler();
+        assert!(h.starts.is_empty());
+        assert!(!h.errors.is_empty());
+    }
+
+    /// A zero-length frame (google.protobuf.Empty, or any message with
+    /// only default fields) must complete as soon as its header does,
+    /// even when the header is the last byte of the chunk.
+    #[test]
+    fn empty_frame_completes_without_further_bytes() {
+        let framed = frame(b"");
+        assert_eq!(framed.len(), HEADER_SIZE);
+        let mut p = GrpcFrameParser::new(Collect {
+            starts: vec![],
+            chunks: vec![],
+            ends: 0,
+            errors: vec![],
+        });
+        p.receive(&framed);
+        assert!(p.is_message_completed(), "empty frame never completed");
+        assert!(!p.has_partial_frame());
+        let h = p.into_handler();
+        assert_eq!(h.starts, vec![(0, 0)]);
+        assert_eq!(h.ends, 1);
+        assert!(h.chunks.concat().is_empty());
+        assert!(h.errors.is_empty());
     }
 
     #[test]

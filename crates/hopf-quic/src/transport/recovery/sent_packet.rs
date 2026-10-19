@@ -31,6 +31,8 @@ pub enum RecoverableFrame {
     },
     /// PING (PTO probe).
     Ping,
+    /// HANDSHAKE_DONE (RFC 9000 section 13.3: sent until acknowledged).
+    HandshakeDone,
 }
 
 /// A tracked outstanding (sent, not yet acknowledged or declared lost) packet.
