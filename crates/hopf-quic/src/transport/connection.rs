@@ -43,6 +43,8 @@ const TRANSPORT_PARAMETER_ERROR: u64 = 0x08;
 const FLOW_CONTROL_ERROR: u64 = 0x03;
 /// RFC 9000 section 20.1: a malformed or unknown frame.
 const FRAME_ENCODING_ERROR: u64 = 0x07;
+/// RFC 9000 section 20.1: a frame for a stream in a state that forbids it.
+const STREAM_STATE_ERROR: u64 = 0x05;
 /// RFC 9000 section 20.1: more active connection IDs than we allow.
 const CONNECTION_ID_LIMIT_ERROR: u64 = 0x09;
 /// RFC 9000 section 20.1: a frame the peer may not send in its role or state.
@@ -1051,6 +1053,9 @@ impl Connection {
                 for lost in result.newly_lost {
                     self.requeue_lost_packet(space, &lost);
                 }
+                for acked in &result.newly_acked {
+                    self.note_acknowledged_frames(acked);
+                }
             }
             Frame::Crypto { offset, data } => {
                 if self.side == Side::Client && space == SpaceId::Initial && self.peer_initial_scid.is_none() {
@@ -1095,7 +1100,14 @@ impl Connection {
                 let mut grant_credit = false;
                 if let Some(st) = self.streams.get_mut(&id) {
                     st.recv.highest = st.recv.highest.max(end);
-                    if let Ok(readable) = st.recv.ingest(offset, data, fin) {
+                    if st.recv.stop_sending.is_some() {
+                        // Stopped: nothing is delivered, but a FIN still
+                        // ends the peer's side for stream credit.
+                        if fin {
+                            st.recv.fin = true;
+                            grant_credit = true;
+                        }
+                    } else if let Ok(readable) = st.recv.ingest(offset, data, fin) {
                         if !st.opened_event && id.initiator() != self.side {
                             st.opened_event = true;
                             self.events
@@ -1221,6 +1233,15 @@ impl Connection {
                 }));
             }
             Frame::StopSending { id, error_code } => {
+                // RFC 9000 section 19.5: not for a stream we only receive on.
+                if id.dir() == Dir::Uni && id.initiator() != self.side {
+                    self.fail_transport(STREAM_STATE_ERROR, "STOP_SENDING for a receive-only stream");
+                    return;
+                }
+                // Section 3.5: answer with RESET_STREAM carrying the peer's
+                // code, unless the send side is already complete and
+                // acknowledged (then there is nothing left to stop).
+                self.reset_stream(id, VarInt(error_code));
                 self.events.push_back(Event::Stream(StreamEvent::Stopped {
                     id,
                     error_code: VarInt(error_code),
@@ -1573,6 +1594,7 @@ impl Connection {
 
         self.queue_flow_control_updates(now);
         self.queue_path_and_cid_frames(now);
+        self.queue_stream_abort_frames(now);
 
         // STREAM frames on Data. Note whether the congestion window held
         // stream data back, or the loop ended for lack of data (RFC 9002
@@ -1869,6 +1891,66 @@ impl Connection {
             }
             if self.queue_packet(SpaceId::Data, payload, frames, true, true, now) {
                 self.pending_retire_cids.clear();
+            }
+        }
+    }
+
+    /// Send due RESET_STREAM and STOP_SENDING frames (new, or lost and
+    /// still wanted), all in one packet.
+    fn queue_stream_abort_frames(&mut self, now: Instant) {
+        if self.spaces[2].secrets.is_none() && self.early_secret.is_none() {
+            return;
+        }
+        let mut ids: Vec<StreamId> = self
+            .streams
+            .iter()
+            .filter(|(_, st)| st.send.pending_reset || st.recv.pending_stop)
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        ids.sort();
+        let mut payload = Vec::new();
+        let mut frames = Vec::new();
+        for id in &ids {
+            let st = &self.streams[id];
+            if let (true, Some((error_code, final_size))) = (st.send.pending_reset, st.send.reset) {
+                writer::reset_stream(&mut payload, *id, error_code, final_size);
+                frames.push(RecoverableFrame::ResetStream { id: *id, error_code, final_size });
+            }
+            if let (true, Some(error_code)) = (st.recv.pending_stop, st.recv.stop_sending) {
+                writer::stop_sending(&mut payload, *id, error_code);
+                frames.push(RecoverableFrame::StopSending { id: *id, error_code });
+            }
+        }
+        if !self.queue_packet(SpaceId::Data, payload, frames, true, true, now) {
+            return;
+        }
+        for id in ids {
+            if let Some(st) = self.streams.get_mut(&id) {
+                st.send.pending_reset = false;
+                st.recv.pending_stop = false;
+            }
+        }
+    }
+
+    /// Record what an acknowledged packet settled: a FIN or RESET_STREAM
+    /// the peer now has.
+    fn note_acknowledged_frames(&mut self, packet: &crate::transport::recovery::SentPacket) {
+        for frame in &packet.frames {
+            match frame {
+                RecoverableFrame::Stream { id, fin: true, .. } => {
+                    if let Some(st) = self.streams.get_mut(id) {
+                        st.send.fin_acked = true;
+                    }
+                }
+                RecoverableFrame::ResetStream { id, .. } => {
+                    if let Some(st) = self.streams.get_mut(id) {
+                        st.send.reset_acked = true;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -2194,6 +2276,20 @@ self.version,
                 RecoverableFrame::RetireConnectionId { seq } => {
                     self.pending_retire_cids.push(*seq);
                 }
+                RecoverableFrame::ResetStream { id, .. } => {
+                    if let Some(st) = self.streams.get_mut(id) {
+                        if st.send.reset.is_some() && !st.send.reset_acked {
+                            st.send.pending_reset = true;
+                        }
+                    }
+                }
+                RecoverableFrame::StopSending { id, .. } => {
+                    if let Some(st) = self.streams.get_mut(id) {
+                        if st.recv.stop_sending.is_some() && !st.recv.reset && !st.recv.all_data_received() {
+                            st.recv.pending_stop = true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2239,6 +2335,20 @@ self.version,
                 }
                 RecoverableFrame::RetireConnectionId { seq } => {
                     self.pending_retire_cids.push(seq);
+                }
+                RecoverableFrame::ResetStream { id, .. } => {
+                    if let Some(st) = self.streams.get_mut(&id) {
+                        if st.send.reset.is_some() && !st.send.reset_acked {
+                            st.send.pending_reset = true;
+                        }
+                    }
+                }
+                RecoverableFrame::StopSending { id, .. } => {
+                    if let Some(st) = self.streams.get_mut(&id) {
+                        if st.recv.stop_sending.is_some() && !st.recv.reset && !st.recv.all_data_received() {
+                            st.recv.pending_stop = true;
+                        }
+                    }
                 }
             }
         }
@@ -2455,11 +2565,35 @@ self.version,
         Ok(out)
     }
 
-    /// Reset a send stream.
-    pub fn reset_stream(&mut self, _id: StreamId, _error_code: VarInt) {}
+    /// Abort the send side of a stream with RESET_STREAM (RFC 9000 section
+    /// 3.1): queued data is dropped and the final size is what was sent.
+    /// Nothing happens for an unknown stream, one already reset, or one
+    /// whose FIN the peer has acknowledged.
+    pub fn reset_stream(&mut self, id: StreamId, error_code: VarInt) {
+        let Some(st) = self.streams.get_mut(&id) else {
+            return;
+        };
+        if let Some(released) = st.send.reset(error_code.0) {
+            self.send_queued = self.send_queued.saturating_sub(released);
+        }
+    }
 
-    /// STOP_SENDING on a recv stream.
-    pub fn stop_stream(&mut self, _id: StreamId, _error_code: VarInt) {}
+    /// Ask the peer to stop sending on a stream with STOP_SENDING (RFC
+    /// 9000 section 3.5); data already received but unread is discarded,
+    /// and later data is counted for flow control but not delivered.
+    /// Nothing happens once all data has arrived or the peer has reset.
+    pub fn stop_stream(&mut self, id: StreamId, error_code: VarInt) {
+        let Some(st) = self.streams.get_mut(&id) else {
+            return;
+        };
+        let recv = &mut st.recv;
+        if recv.reset || recv.stop_sending.is_some() || recv.all_data_received() || recv.window == 0 {
+            return;
+        }
+        recv.stop_sending = Some(error_code.0);
+        recv.pending_stop = true;
+        recv.readable.clear();
+    }
 
     /// Set stream priority (no-op for echo).
     pub fn set_priority(&mut self, _id: StreamId, _priority: i32) {}
@@ -4153,5 +4287,130 @@ mod tests {
         let mut conn = test_client(now);
         conn.handle_frame(SpaceId::Data, Frame::NewToken { token: Bytes::from_static(b"t") }, now);
         assert_eq!(closed_with(&mut conn), None, "a client accepts one");
+    }
+
+    /// Acknowledge every packet `conn` has sent in the Data space so far.
+    fn ack_everything(conn: &mut Connection, now: Instant) {
+        let largest = conn.space(SpaceId::Data).next_pn.saturating_sub(1);
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack { largest, delay: 0, ranges: vec![(0, largest)] },
+            now + Duration::from_millis(20),
+        );
+    }
+
+    /// RFC 9000 section 3.5 and 19.4: resetting a stream sends RESET_STREAM
+    /// with the final size being the bytes actually sent, drops what was
+    /// queued, and sends no further STREAM frames. Regression: the abort
+    /// path was a no-op, so a cancelled request left the peer waiting for
+    /// the rest of the body forever.
+    #[test]
+    fn reset_stream_sends_reset_stream_with_the_real_final_size_and_no_more_data() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.loss.congestion_mut().set_congestion_window_for_tests(u64::MAX / 2);
+        let id = conn.open_bi().expect("stream");
+        conn.write_stream(id, &[1; 5000]).unwrap();
+        assert_eq!(stream_bytes(&drain_frames(&mut conn, now)), 5000);
+        conn.write_stream(id, &[2; 3000]).unwrap();
+        conn.reset_stream(id, VarInt(0x42));
+        let out = drain_frames(&mut conn, now);
+        assert!(
+            carries(&out, |f| matches!(f, Frame::ResetStream { id: sid, error_code: 0x42, final_size: 5000 } if *sid == id)),
+            "RESET_STREAM with final size 5000: {out:?}"
+        );
+        assert_eq!(stream_bytes(&out), 0, "queued data sent after the reset");
+        assert!(matches!(conn.write_stream(id, &[3; 10]), Err(_)), "a reset stream accepts no more data");
+    }
+
+    /// RFC 9000 section 3.5: STOP_SENDING from the peer is answered with
+    /// RESET_STREAM carrying its error code, unless the send side is
+    /// already finished and acknowledged.
+    #[test]
+    fn peer_stop_sending_is_answered_with_reset_stream_unless_fin_is_acknowledged() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = conn.open_bi().expect("stream");
+        conn.write_stream(id, b"partial").unwrap();
+        drain_frames(&mut conn, now);
+        conn.handle_frame(SpaceId::Data, Frame::StopSending { id, error_code: 0x77 }, now);
+        let out = drain_frames(&mut conn, now);
+        assert!(
+            carries(&out, |f| matches!(f, Frame::ResetStream { id: sid, error_code: 0x77, final_size: 7 } if *sid == id)),
+            "RESET_STREAM answering STOP_SENDING: {out:?}"
+        );
+
+        let done = conn.open_bi().expect("stream");
+        conn.write_stream(done, b"all").unwrap();
+        conn.finish_stream(done).unwrap();
+        drain_frames(&mut conn, now);
+        ack_everything(&mut conn, now);
+        conn.handle_frame(SpaceId::Data, Frame::StopSending { id: done, error_code: 0x77 }, now);
+        let out = drain_frames(&mut conn, now);
+        assert!(
+            !carries(&out, |f| matches!(f, Frame::ResetStream { id: sid, .. } if *sid == done)),
+            "no RESET_STREAM once the FIN is acknowledged: {out:?}"
+        );
+    }
+
+    /// RFC 9000 section 3.5: `stop_stream` sends STOP_SENDING, discards
+    /// what was received but unread, and delivers nothing that arrives
+    /// afterwards, while still counting it for flow control.
+    #[test]
+    fn stop_stream_sends_stop_sending_and_discards_later_data() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = conn.open_bi().expect("stream");
+        receive_stream_data(&mut conn, id, 100, 100, now);
+        conn.stop_stream(id, VarInt(0x99));
+        let out = drain_frames(&mut conn, now);
+        assert!(carries(&out, |f| matches!(f, Frame::StopSending { id: sid, error_code: 0x99 } if *sid == id)), "{out:?}");
+        assert_eq!(read_all(&mut conn, id), 0, "unread data was not discarded");
+        receive_stream_data_from(&mut conn, id, 100, 100, 100, now);
+        assert_eq!(read_all(&mut conn, id), 0, "data after STOP_SENDING was delivered");
+        assert_eq!(conn.streams[&id].recv.highest, 200, "still counted for flow control");
+        assert_eq!(closed_with(&mut conn), None);
+    }
+
+    /// RFC 9000 section 13.3: a lost RESET_STREAM is sent again, until
+    /// one is acknowledged.
+    #[test]
+    fn lost_reset_stream_is_sent_again_until_acknowledged() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = conn.open_bi().expect("stream");
+        conn.write_stream(id, b"abc").unwrap();
+        drain_frames(&mut conn, now);
+        conn.reset_stream(id, VarInt(1));
+        let first = drain_frames(&mut conn, now);
+        assert_eq!(count(&first, |f| matches!(f, Frame::ResetStream { .. })), 1);
+        for _ in 0..3 {
+            conn.pto_ping_pending[space_index(SpaceId::Data)] = true;
+            conn.flush_pending_packets(now);
+        }
+        let largest = conn.space(SpaceId::Data).next_pn - 1;
+        drain_frames(&mut conn, now);
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack { largest, delay: 0, ranges: vec![(largest, largest)] },
+            now + Duration::from_millis(20),
+        );
+        let again = drain_frames(&mut conn, now);
+        assert_eq!(count(&again, |f| matches!(f, Frame::ResetStream { id: sid, error_code: 1, final_size: 3 } if *sid == id)), 1, "{again:?}");
+        ack_everything(&mut conn, now);
+        assert!(conn.streams[&id].send.reset_acked);
+        assert!(!carries(&drain_frames(&mut conn, now), |f| matches!(f, Frame::ResetStream { .. })));
+    }
+
+    /// RFC 9000 section 19.5: STOP_SENDING for a stream the peer can only
+    /// receive on is a STREAM_STATE_ERROR.
+    #[test]
+    fn stop_sending_for_a_receive_only_stream_is_a_stream_state_error() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        // A server-initiated unidirectional stream: we only receive on it.
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        conn.handle_frame(SpaceId::Data, Frame::StopSending { id, error_code: 1 }, now);
+        assert_eq!(closed_with(&mut conn), Some(STREAM_STATE_ERROR));
     }
 }

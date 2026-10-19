@@ -64,6 +64,22 @@ pub enum RecoverableFrame {
         /// Sequence number being retired.
         seq: u64,
     },
+    /// RESET_STREAM (sent again after loss while the stream is still reset).
+    ResetStream {
+        /// Stream identifier.
+        id: StreamId,
+        /// Application error code.
+        error_code: u64,
+        /// Final size.
+        final_size: u64,
+    },
+    /// STOP_SENDING (sent again after loss while still wanted).
+    StopSending {
+        /// Stream identifier.
+        id: StreamId,
+        /// Application error code.
+        error_code: u64,
+    },
 }
 
 /// A tracked outstanding (sent, not yet acknowledged or declared lost) packet.

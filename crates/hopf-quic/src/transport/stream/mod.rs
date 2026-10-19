@@ -34,6 +34,15 @@ pub struct SendStream {
     /// The `max_data` a STREAM_DATA_BLOCKED was last sent for, so the
     /// hint goes once per limit (RFC 9000 section 4.1).
     pub blocked_sent_at: Option<u64>,
+    /// Locally reset: the application error code and the final size (the
+    /// bytes sent before the reset). No more STREAM frames are sent.
+    pub reset: Option<(u64, u64)>,
+    /// A RESET_STREAM for `reset` is due (new or lost).
+    pub pending_reset: bool,
+    /// The peer acknowledged the packet carrying our FIN.
+    pub fin_acked: bool,
+    /// The peer acknowledged the packet carrying our RESET_STREAM.
+    pub reset_acked: bool,
 }
 
 impl SendStream {
@@ -41,7 +50,7 @@ impl SendStream {
     /// (a short write when the limit falls inside it), or `Err` when the
     /// stream is finished or nothing fits.
     pub fn write(&mut self, data: &[u8]) -> Result<usize, ()> {
-        if self.fin {
+        if self.fin || self.reset.is_some() {
             return Err(());
         }
         if data.is_empty() {
@@ -69,7 +78,8 @@ impl SendStream {
     /// application wanted to queue more than fits, or queued data cannot
     /// leave because the limit already sits at the offset sent so far.
     pub fn blocked_on_peer(&self) -> bool {
-        (self.wants_more && self.max_data.saturating_sub(self.offset + self.queued) == 0)
+        self.reset.is_none()
+            && (self.wants_more && self.max_data.saturating_sub(self.offset + self.queued) == 0)
             || (!self.pending.is_empty() && self.max_data.saturating_sub(self.offset) == 0)
     }
 
@@ -78,8 +88,30 @@ impl SendStream {
         self.fin = true;
     }
 
-    /// Requeue a lost STREAM chunk for retransmission at `offset`.
+    /// Abort the send side (RFC 9000 section 3.1): queued and lost data is
+    /// dropped and the final size is the bytes sent so far. Returns the
+    /// queued bytes released, or `None` if already reset or complete and
+    /// acknowledged (a reset then would misstate the final size).
+    pub fn reset(&mut self, error_code: u64) -> Option<u64> {
+        if self.reset.is_some() || self.fin_acked {
+            return None;
+        }
+        self.pending.clear();
+        self.retransmit.clear();
+        let released = self.queued;
+        self.queued = 0;
+        self.wants_more = false;
+        self.reset = Some((error_code, self.offset));
+        self.pending_reset = true;
+        Some(released)
+    }
+
+    /// Requeue a lost STREAM chunk for retransmission at `offset`; nothing
+    /// is retransmitted on a reset stream.
     pub fn requeue(&mut self, offset: u64, data: Bytes, fin: bool) {
+        if self.reset.is_some() {
+            return;
+        }
         self.retransmit.push_back((offset, data, fin));
         if fin {
             self.fin_sent = false;
@@ -88,7 +120,8 @@ impl SendStream {
 
     /// Whether `take_chunk` has anything left to return.
     pub fn has_data(&self) -> bool {
-        !self.pending.is_empty() || !self.retransmit.is_empty() || (self.fin && !self.fin_sent)
+        self.reset.is_none()
+            && (!self.pending.is_empty() || !self.retransmit.is_empty() || (self.fin && !self.fin_sent))
     }
 
     /// Offset of the chunk `take_chunk` would return next.
@@ -100,6 +133,9 @@ impl SendStream {
 
     /// Take next chunk up to `max` bytes (retransmits first).
     pub fn take_chunk(&mut self, max: usize) -> Option<(u64, Bytes, bool)> {
+        if self.reset.is_some() {
+            return None;
+        }
         if let Some((offset, chunk, fin)) = self.retransmit.pop_front() {
             let (data, rest) = if chunk.len() > max {
                 (chunk.slice(..max), Some(chunk.slice(max..)))
@@ -168,6 +204,11 @@ pub struct RecvStream {
     pub pending_max: bool,
     /// Peer sent RESET_STREAM: no more data is delivered or credited.
     pub reset: bool,
+    /// We sent STOP_SENDING with this error code: data still arriving is
+    /// counted for flow control but not delivered.
+    pub stop_sending: Option<u64>,
+    /// A STOP_SENDING for `stop_sending` is due (new or lost).
+    pub pending_stop: bool,
 }
 
 impl RecvStream {
@@ -185,7 +226,15 @@ impl RecvStream {
             highest: 0,
             pending_max: false,
             reset: false,
+            stop_sending: None,
+            pending_stop: false,
         }
+    }
+
+    /// Whether every byte up to the final size has arrived (RFC 9000
+    /// "Data Recvd"): nothing is left to stop the peer sending.
+    pub fn all_data_received(&self) -> bool {
+        self.fully_reassembled()
     }
 
     /// Ingest a STREAM frame chunk.
