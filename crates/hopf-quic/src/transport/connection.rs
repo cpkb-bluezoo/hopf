@@ -41,6 +41,12 @@ const MIN_INITIAL_DATAGRAM_SIZE: usize = 1200;
 const TRANSPORT_PARAMETER_ERROR: u64 = 0x08;
 /// RFC 9000 section 20.1: the peer sent more data than it was allowed.
 const FLOW_CONTROL_ERROR: u64 = 0x03;
+/// RFC 9000 section 20.1: a malformed or unknown frame.
+const FRAME_ENCODING_ERROR: u64 = 0x07;
+/// RFC 9000 section 20.1: more active connection IDs than we allow.
+const CONNECTION_ID_LIMIT_ERROR: u64 = 0x09;
+/// RFC 9000 section 20.1: a frame the peer may not send in its role or state.
+const PROTOCOL_VIOLATION: u64 = 0x0a;
 /// VERSION_NEGOTIATION_ERROR (RFC 9368 section 10.2).
 const VERSION_NEGOTIATION_ERROR: u64 = 0x11;
 
@@ -176,6 +182,13 @@ pub struct Connection {
     /// Stream bytes queued for sending but not yet sent, which
     /// `flow.send_window` bounds.
     send_queued: u64,
+    /// The peer's connection IDs we may send to (RFC 9000 section 5.1.1),
+    /// sequence number 0 being the handshake one, filled in lazily.
+    peer_cids: Vec<PeerCid>,
+    /// RETIRE_CONNECTION_ID frames due (new or lost).
+    pending_retire_cids: Vec<u64>,
+    /// PATH_CHALLENGE data to answer with PATH_RESPONSE on the next flush.
+    pending_path_responses: VecDeque<[u8; 8]>,
     /// Token for Initial (usually empty; set after Retry).
     token: Vec<u8>,
     /// Short-header CID length (peer's CID length we send to).
@@ -231,6 +244,18 @@ pub struct Connection {
     keep_alive_interval: Option<Duration>,
     /// Last time a keep-alive PING was sent (or connection start).
     last_keep_alive: Instant,
+}
+
+/// One of the peer's connection IDs (RFC 9000 section 5.1.1), as received
+/// in NEW_CONNECTION_ID or used for the handshake (sequence number 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerCid {
+    /// Sequence number.
+    pub seq: u64,
+    /// The connection ID.
+    pub cid: ConnectionId,
+    /// Stateless reset token, `None` for the handshake ID.
+    pub reset_token: Option<[u8; 16]>,
 }
 
 /// A STREAM chunk sent in a 0-RTT packet, with the packet that carried it.
@@ -368,6 +393,9 @@ impl Connection {
             conn_recv_highest: 0,
             pending_max_data: false,
             send_queued: 0,
+            peer_cids: Vec::new(),
+            pending_retire_cids: Vec::new(),
+            pending_path_responses: VecDeque::new(),
             flow,
             token: Vec::new(),
             short_cid_len: initial_dcid.len(),
@@ -502,6 +530,9 @@ impl Connection {
             conn_recv_highest: 0,
             pending_max_data: false,
             send_queued: 0,
+            peer_cids: Vec::new(),
+            pending_retire_cids: Vec::new(),
+            pending_path_responses: VecDeque::new(),
             flow,
             token: Vec::new(),
             short_cid_len: 0,
@@ -969,7 +1000,10 @@ impl Connection {
                     .unwrap_or(pn),
             );
         }
+        // RFC 9000 section 12.4: a malformed frame, or a type this
+        // endpoint does not know, is a FRAME_ENCODING_ERROR.
         let Ok(frames) = parse_all(payload) else {
+            self.fail_transport(FRAME_ENCODING_ERROR, "malformed or unknown frame");
             return;
         };
         // RFC 9000 §13.2.1: ACK/PADDING-only packets are not ack-eliciting —
@@ -1088,10 +1122,42 @@ impl Connection {
                     st.send.max_data = st.send.max_data.max(max);
                 }
             }
-            Frame::DataBlocked { .. } | Frame::StreamDataBlocked { .. } => {
+            Frame::DataBlocked { .. } | Frame::StreamDataBlocked { .. } | Frame::StreamsBlocked { .. } => {
                 // The peer is waiting on a limit of ours. The receive side
                 // raises its limits as the application reads, so there is
                 // nothing extra to do with the hint.
+            }
+            Frame::MaxStreamsUni { max } => {
+                if max > self.peer_max_streams_uni {
+                    self.peer_max_streams_uni = max;
+                    self.events
+                        .push_back(Event::Stream(StreamEvent::Available { dir: Dir::Uni }));
+                }
+            }
+            Frame::NewToken { .. } => {
+                // RFC 9000 section 19.7: only a server issues tokens. A
+                // client has no use for one yet: address validation on a
+                // later connection is not implemented.
+                if self.side == Side::Server {
+                    self.fail_transport(PROTOCOL_VIOLATION, "NEW_TOKEN from a client");
+                }
+            }
+            Frame::NewConnectionId { seq, retire_prior_to, cid, reset_token } => {
+                self.on_new_connection_id(seq, retire_prior_to, cid, reset_token);
+            }
+            Frame::RetireConnectionId { seq } => {
+                // RFC 9000 section 19.16: we have issued only the handshake
+                // connection ID (sequence 0), which the peer is still using.
+                if seq > 0 {
+                    self.fail_transport(PROTOCOL_VIOLATION, "RETIRE_CONNECTION_ID for an unissued sequence number");
+                }
+            }
+            Frame::PathChallenge { data } => {
+                self.pending_path_responses.push_back(data);
+            }
+            Frame::PathResponse { .. } => {
+                // No PATH_CHALLENGE is ever sent yet (no path validation or
+                // migration), so there is nothing a response could match.
             }
             Frame::MaxStreamsBidi { max } => {
                 if max > self.peer_max_streams_bidi {
@@ -1506,6 +1572,7 @@ impl Connection {
         }
 
         self.queue_flow_control_updates(now);
+        self.queue_path_and_cid_frames(now);
 
         // STREAM frames on Data. Note whether the congestion window held
         // stream data back, or the loop ended for lack of data (RFC 9002
@@ -1713,6 +1780,97 @@ impl Connection {
             }
         }
         true
+    }
+
+    /// Store a connection ID the peer issued (RFC 9000 section 19.15) and
+    /// retire the ones it asked us to, switching the active destination ID
+    /// if that was among them.
+    fn on_new_connection_id(&mut self, seq: u64, retire_prior_to: u64, cid: ConnectionId, reset_token: [u8; 16]) {
+        if self.rem_cid.is_empty() {
+            self.fail_transport(PROTOCOL_VIOLATION, "NEW_CONNECTION_ID with zero-length connection IDs in use");
+            return;
+        }
+        if self.peer_cids.is_empty() {
+            self.peer_cids.push(PeerCid { seq: 0, cid: self.rem_cid.clone(), reset_token: None });
+        }
+        if let Some(known) = self.peer_cids.iter().find(|c| c.seq == seq) {
+            if known.cid != cid {
+                self.fail_transport(PROTOCOL_VIOLATION, "NEW_CONNECTION_ID reuses a sequence number");
+            }
+            // A repeat of a known ID (a retransmission): nothing to do.
+            return;
+        }
+        if self.peer_cids.iter().any(|c| c.cid == cid) {
+            self.fail_transport(PROTOCOL_VIOLATION, "NEW_CONNECTION_ID repeats a connection ID");
+            return;
+        }
+        if seq >= retire_prior_to {
+            self.peer_cids.push(PeerCid { seq, cid, reset_token: Some(reset_token) });
+        } else {
+            // Already retired by the time it arrived: just retire it.
+            self.pending_retire_cids.push(seq);
+        }
+        // Retire what the peer asked for, moving off a retired active ID.
+        let retired: Vec<u64> = self
+            .peer_cids
+            .iter()
+            .filter(|c| c.seq < retire_prior_to)
+            .map(|c| c.seq)
+            .collect();
+        if !retired.is_empty() {
+            self.peer_cids.retain(|c| c.seq >= retire_prior_to);
+            self.pending_retire_cids.extend(retired);
+            let active_retired = !self.peer_cids.iter().any(|c| c.cid == self.rem_cid);
+            if active_retired {
+                if let Some(next) = self.peer_cids.iter().min_by_key(|c| c.seq) {
+                    self.rem_cid = next.cid.clone();
+                    self.short_cid_len = self.rem_cid.len();
+                }
+            }
+        }
+        // RFC 9000 section 5.1.1: never more active IDs than our limit.
+        if self.peer_cids.len() as u64 > self.local_tp.active_connection_id_limit {
+            self.fail_transport(CONNECTION_ID_LIMIT_ERROR, "more connection IDs than active_connection_id_limit");
+        }
+    }
+
+    /// The peer's connection IDs currently held (sequence 0 being the one
+    /// from the handshake), oldest first.
+    pub fn peer_connection_ids(&self) -> &[PeerCid] {
+        &self.peer_cids
+    }
+
+    /// Answer PATH_CHALLENGEs (RFC 9000 section 8.2.2: a PATH_RESPONSE in a
+    /// datagram of at least 1200 bytes, on the path it arrived on, which is
+    /// the only path there is) and send due RETIRE_CONNECTION_ID frames.
+    fn queue_path_and_cid_frames(&mut self, now: Instant) {
+        if self.spaces[2].secrets.is_none() {
+            return;
+        }
+        while let Some(data) = self.pending_path_responses.pop_front() {
+            let mut payload = Vec::new();
+            writer::path_response(&mut payload, &data);
+            let previous = self.gso_pad_to;
+            self.gso_pad_to = Some(previous.unwrap_or(0).max(MIN_INITIAL_DATAGRAM_SIZE));
+            // Not recoverable: the peer sends a new challenge if it needs one.
+            let queued = self.queue_packet(SpaceId::Data, payload, Vec::new(), true, true, now);
+            self.gso_pad_to = previous;
+            if !queued {
+                self.pending_path_responses.push_front(data);
+                break;
+            }
+        }
+        if !self.pending_retire_cids.is_empty() {
+            let mut payload = Vec::new();
+            let mut frames = Vec::new();
+            for seq in &self.pending_retire_cids {
+                writer::retire_connection_id(&mut payload, *seq);
+                frames.push(RecoverableFrame::RetireConnectionId { seq: *seq });
+            }
+            if self.queue_packet(SpaceId::Data, payload, frames, true, true, now) {
+                self.pending_retire_cids.clear();
+            }
+        }
     }
 
     /// Tell the peer which of its limits we are waiting on (RFC 9000
@@ -2033,6 +2191,9 @@ self.version,
                         }
                     }
                 }
+                RecoverableFrame::RetireConnectionId { seq } => {
+                    self.pending_retire_cids.push(*seq);
+                }
             }
         }
     }
@@ -2075,6 +2236,9 @@ self.version,
                             st.recv.pending_max = true;
                         }
                     }
+                }
+                RecoverableFrame::RetireConnectionId { seq } => {
+                    self.pending_retire_cids.push(seq);
                 }
             }
         }
@@ -3878,5 +4042,116 @@ mod tests {
         assert!(matches!(conn.write_stream(b, &[2; 1]), Err(WriteError::Blocked)));
         assert_eq!(stream_bytes(&drain_frames(&mut conn, now)), 3000);
         assert_eq!(conn.write_stream(b, &[2; 2000]).unwrap(), 2000, "room again once sent");
+    }
+
+    /// A raw NEW_CONNECTION_ID frame (RFC 9000 section 19.15) as a peer
+    /// would send it: sequence 1, nothing retired, an 8-byte ID and a
+    /// 16-byte stateless reset token.
+    fn raw_new_connection_id() -> Vec<u8> {
+        let mut f = Vec::new();
+        varint::encode(0x18, &mut f);
+        varint::encode(1, &mut f);
+        varint::encode(0, &mut f);
+        f.push(8);
+        f.extend_from_slice(&[7u8; 8]);
+        f.extend_from_slice(&[9u8; 16]);
+        f
+    }
+
+    /// RFC 9000 section 12.4: a packet is processed frame by frame; one
+    /// the parser does not know must not cost the frames around it.
+    /// Regression: NEW_CONNECTION_ID, which most stacks send right after
+    /// the handshake coalesced with stream data, was unknown, so the whole
+    /// packet was dropped unacknowledged and the peer retransmitted it
+    /// forever.
+    #[test]
+    fn stream_data_coalesced_with_new_connection_id_is_delivered_and_acknowledged() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let id = conn.open_bi().expect("stream");
+        let mut payload = raw_new_connection_id();
+        writer::stream(&mut payload, id, 0, b"hello", false);
+        conn.on_decrypted(SpaceId::Data, 5, &payload, now);
+        let (data, _) = conn.read_stream(id, usize::MAX).unwrap();
+        assert_eq!(data.as_ref(), b"hello", "stream data lost with the packet");
+        let out = drain_frames(&mut conn, now);
+        assert!(carries(&out, |f| matches!(f, Frame::Ack { largest: 5, .. })), "not acknowledged: {out:?}");
+    }
+
+    /// RFC 9000 section 12.4: a frame type the endpoint does not know is a
+    /// connection error of type FRAME_ENCODING_ERROR, not a silent drop.
+    #[test]
+    fn an_unknown_frame_type_is_a_frame_encoding_error() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let mut payload = Vec::new();
+        varint::encode(0x21, &mut payload);
+        conn.on_decrypted(SpaceId::Data, 1, &payload, now);
+        assert_eq!(closed_with(&mut conn), Some(0x07), "FRAME_ENCODING_ERROR");
+    }
+
+    /// RFC 9000 section 8.2.2: a PATH_CHALLENGE is answered with a
+    /// PATH_RESPONSE carrying the same data, in a datagram of at least
+    /// 1200 bytes.
+    #[test]
+    fn path_challenge_is_answered_with_a_padded_path_response() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let data = [1, 2, 3, 4, 5, 6, 7, 8];
+        conn.handle_frame(SpaceId::Data, Frame::PathChallenge { data }, now);
+        let lens = drain_lens(&mut conn, now);
+        assert!(lens.iter().all(|l| *l >= 1200), "PATH_RESPONSE datagram not expanded: {lens:?}");
+        conn.handle_frame(SpaceId::Data, Frame::PathChallenge { data }, now);
+        let out = drain_frames(&mut conn, now);
+        assert!(carries(&out, |f| matches!(f, Frame::PathResponse { data: d } if *d == data)), "{out:?}");
+    }
+
+    /// RFC 9000 section 19.15: NEW_CONNECTION_ID is stored; a raised
+    /// Retire Prior To retires earlier IDs with RETIRE_CONNECTION_ID, and
+    /// a retired active destination ID is replaced.
+    #[test]
+    fn new_connection_ids_are_stored_and_retired_on_request() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        let original = conn.rem_cid.clone();
+        let first = ConnectionId::from_slice(&[0x11; 8]);
+        let second = ConnectionId::from_slice(&[0x22; 8]);
+        conn.handle_frame(SpaceId::Data, Frame::NewConnectionId { seq: 1, retire_prior_to: 0, cid: first.clone(), reset_token: [1; 16] }, now);
+        assert_eq!(conn.peer_connection_ids().len(), 2);
+        assert_eq!(conn.peer_connection_ids()[0].cid, original);
+        assert_eq!(conn.rem_cid, original, "active ID unchanged");
+        assert!(drain_frames(&mut conn, now).iter().all(|(_, fr)| fr.iter().all(|f| !matches!(f, Frame::RetireConnectionId { .. }))));
+
+        conn.handle_frame(SpaceId::Data, Frame::NewConnectionId { seq: 2, retire_prior_to: 2, cid: second.clone(), reset_token: [2; 16] }, now);
+        let out = drain_frames(&mut conn, now);
+        let retired: Vec<u64> = out.iter().flat_map(|(_, fr)| fr.iter()).filter_map(|f| match f { Frame::RetireConnectionId { seq } => Some(*seq), _ => None }).collect();
+        assert_eq!(retired, vec![0, 1], "{out:?}");
+        assert_eq!(conn.peer_connection_ids(), &[PeerCid { seq: 2, cid: second.clone(), reset_token: Some([2; 16]) }]);
+        assert_eq!(conn.rem_cid, second, "moved to the only remaining ID");
+        assert_eq!(closed_with(&mut conn), None);
+    }
+
+    /// RFC 9000 section 5.1.1: the peer must not hold us to more active
+    /// connection IDs than our active_connection_id_limit (2 by default).
+    #[test]
+    fn too_many_active_connection_ids_is_a_connection_id_limit_error() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.handle_frame(SpaceId::Data, Frame::NewConnectionId { seq: 1, retire_prior_to: 0, cid: ConnectionId::from_slice(&[1; 8]), reset_token: [0; 16] }, now);
+        assert_eq!(closed_with(&mut conn), None);
+        conn.handle_frame(SpaceId::Data, Frame::NewConnectionId { seq: 2, retire_prior_to: 0, cid: ConnectionId::from_slice(&[2; 8]), reset_token: [0; 16] }, now);
+        assert_eq!(closed_with(&mut conn), Some(CONNECTION_ID_LIMIT_ERROR));
+    }
+
+    /// RFC 9000 section 19.7: a client must not send NEW_TOKEN.
+    #[test]
+    fn new_token_from_a_client_is_a_protocol_violation() {
+        let now = Instant::now();
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1]);
+        conn.handle_frame(SpaceId::Data, Frame::NewToken { token: Bytes::from_static(b"t") }, now);
+        assert_eq!(closed_with(&mut conn), Some(PROTOCOL_VIOLATION));
+        let mut conn = test_client(now);
+        conn.handle_frame(SpaceId::Data, Frame::NewToken { token: Bytes::from_static(b"t") }, now);
+        assert_eq!(closed_with(&mut conn), None, "a client accepts one");
     }
 }

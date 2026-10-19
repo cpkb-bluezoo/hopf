@@ -1,10 +1,10 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! QUIC frame decode (subset for echo milestone).
+//! QUIC frame decode (every RFC 9000 frame type, plus RFC 9221 DATAGRAM).
 
 use bytes::Bytes;
 
-use crate::transport::types::StreamId;
+use crate::transport::types::{ConnectionId, StreamId};
 use crate::transport::varint;
 
 /// Frame type constants (RFC 9000 §19).
@@ -23,6 +23,8 @@ pub mod ty {
     pub const STOP_SENDING: u64 = 0x05;
     /// CRYPTO
     pub const CRYPTO: u64 = 0x06;
+    /// NEW_TOKEN
+    pub const NEW_TOKEN: u64 = 0x07;
     /// STREAM base (0x08–0x0f)
     pub const STREAM_MIN: u64 = 0x08;
     /// MAX_DATA
@@ -31,10 +33,24 @@ pub mod ty {
     pub const MAX_STREAM_DATA: u64 = 0x11;
     /// MAX_STREAMS_BIDI
     pub const MAX_STREAMS_BIDI: u64 = 0x12;
+    /// MAX_STREAMS (unidirectional)
+    pub const MAX_STREAMS_UNI: u64 = 0x13;
     /// DATA_BLOCKED
     pub const DATA_BLOCKED: u64 = 0x14;
     /// STREAM_DATA_BLOCKED
     pub const STREAM_DATA_BLOCKED: u64 = 0x15;
+    /// STREAMS_BLOCKED (bidirectional)
+    pub const STREAMS_BLOCKED_BIDI: u64 = 0x16;
+    /// STREAMS_BLOCKED (unidirectional)
+    pub const STREAMS_BLOCKED_UNI: u64 = 0x17;
+    /// NEW_CONNECTION_ID
+    pub const NEW_CONNECTION_ID: u64 = 0x18;
+    /// RETIRE_CONNECTION_ID
+    pub const RETIRE_CONNECTION_ID: u64 = 0x19;
+    /// PATH_CHALLENGE
+    pub const PATH_CHALLENGE: u64 = 0x1a;
+    /// PATH_RESPONSE
+    pub const PATH_RESPONSE: u64 = 0x1b;
     /// CONNECTION_CLOSE transport
     pub const CONNECTION_CLOSE: u64 = 0x1c;
     /// CONNECTION_CLOSE application
@@ -114,6 +130,50 @@ pub enum Frame {
         id: StreamId,
         /// The limit the peer is blocked at.
         max: u64,
+    },
+    /// MAX_STREAMS (unidirectional).
+    MaxStreamsUni {
+        /// Maximum streams.
+        max: u64,
+    },
+    /// STREAMS_BLOCKED: the peer wants to open more streams than we allow
+    /// (RFC 9000 section 19.14).
+    StreamsBlocked {
+        /// Bidirectional (0x16) rather than unidirectional (0x17).
+        bidi: bool,
+        /// The stream limit the peer is blocked at.
+        max: u64,
+    },
+    /// NEW_TOKEN (RFC 9000 section 19.7): a token for a later Initial.
+    NewToken {
+        /// Opaque token.
+        token: Bytes,
+    },
+    /// NEW_CONNECTION_ID (RFC 9000 section 19.15).
+    NewConnectionId {
+        /// Sequence number of this connection ID.
+        seq: u64,
+        /// Connection IDs below this sequence number are to be retired.
+        retire_prior_to: u64,
+        /// The connection ID.
+        cid: ConnectionId,
+        /// Stateless reset token for packets with this ID.
+        reset_token: [u8; 16],
+    },
+    /// RETIRE_CONNECTION_ID (RFC 9000 section 19.16).
+    RetireConnectionId {
+        /// Sequence number of the connection ID being retired.
+        seq: u64,
+    },
+    /// PATH_CHALLENGE (RFC 9000 section 19.17).
+    PathChallenge {
+        /// Arbitrary data to echo in a PATH_RESPONSE.
+        data: [u8; 8],
+    },
+    /// PATH_RESPONSE (RFC 9000 section 19.18).
+    PathResponse {
+        /// The PATH_CHALLENGE data echoed.
+        data: [u8; 8],
     },
     /// CONNECTION_CLOSE.
     ConnectionClose {
@@ -254,6 +314,57 @@ pub fn parse_all(mut buf: &[u8]) -> Result<Vec<Frame>, ()> {
                 let max = varint::decode(&mut buf).ok_or(())?;
                 frames.push(Frame::DataBlocked { max });
             }
+            ty::MAX_STREAMS_UNI => {
+                let max = varint::decode(&mut buf).ok_or(())?;
+                frames.push(Frame::MaxStreamsUni { max });
+            }
+            ty::STREAMS_BLOCKED_BIDI | ty::STREAMS_BLOCKED_UNI => {
+                let max = varint::decode(&mut buf).ok_or(())?;
+                frames.push(Frame::StreamsBlocked { bidi: frame_ty == ty::STREAMS_BLOCKED_BIDI, max });
+            }
+            ty::NEW_TOKEN => {
+                let len = varint::decode(&mut buf).ok_or(())? as usize;
+                // Section 19.7: an empty token is a FRAME_ENCODING_ERROR.
+                if len == 0 || buf.len() < len {
+                    return Err(());
+                }
+                let token = Bytes::copy_from_slice(&buf[..len]);
+                buf = &buf[len..];
+                frames.push(Frame::NewToken { token });
+            }
+            ty::NEW_CONNECTION_ID => {
+                let seq = varint::decode(&mut buf).ok_or(())?;
+                let retire_prior_to = varint::decode(&mut buf).ok_or(())?;
+                let len = *buf.first().ok_or(())? as usize;
+                buf = &buf[1..];
+                // Section 19.15: 1 to 20 bytes, and Retire Prior To never
+                // above the sequence number.
+                if !(1..=20).contains(&len) || retire_prior_to > seq || buf.len() < len + 16 {
+                    return Err(());
+                }
+                let cid = ConnectionId::from_slice(&buf[..len]);
+                let mut reset_token = [0u8; 16];
+                reset_token.copy_from_slice(&buf[len..len + 16]);
+                buf = &buf[len + 16..];
+                frames.push(Frame::NewConnectionId { seq, retire_prior_to, cid, reset_token });
+            }
+            ty::RETIRE_CONNECTION_ID => {
+                let seq = varint::decode(&mut buf).ok_or(())?;
+                frames.push(Frame::RetireConnectionId { seq });
+            }
+            ty::PATH_CHALLENGE | ty::PATH_RESPONSE => {
+                if buf.len() < 8 {
+                    return Err(());
+                }
+                let mut data = [0u8; 8];
+                data.copy_from_slice(&buf[..8]);
+                buf = &buf[8..];
+                frames.push(if frame_ty == ty::PATH_CHALLENGE {
+                    Frame::PathChallenge { data }
+                } else {
+                    Frame::PathResponse { data }
+                });
+            }
             ty::STREAM_DATA_BLOCKED => {
                 let id = StreamId::from_wire(varint::decode(&mut buf).ok_or(())?);
                 let max = varint::decode(&mut buf).ok_or(())?;
@@ -320,6 +431,57 @@ pub fn parse_all(mut buf: &[u8]) -> Result<Vec<Frame>, ()> {
 mod tests {
     use super::*;
     use crate::transport::frame::writer;
+
+    /// Every frame the writer can produce decodes back to the same frame.
+    #[test]
+    fn every_frame_type_round_trips() {
+        let id = StreamId::from_wire(4);
+        let cid = ConnectionId::from_slice(&[1, 2, 3, 4, 5]);
+        let mut buf = Vec::new();
+        writer::new_token(&mut buf, b"tok");
+        writer::max_streams_uni(&mut buf, 7);
+        writer::streams_blocked(&mut buf, true, 8);
+        writer::streams_blocked(&mut buf, false, 9);
+        writer::new_connection_id(&mut buf, 3, 1, &cid, &[0xaa; 16]);
+        writer::retire_connection_id(&mut buf, 2);
+        writer::path_challenge(&mut buf, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        writer::path_response(&mut buf, &[8, 7, 6, 5, 4, 3, 2, 1]);
+        writer::reset_stream(&mut buf, id, 0x11, 1234);
+        writer::stop_sending(&mut buf, id, 0x22);
+        writer::data_blocked(&mut buf, 10);
+        writer::stream_data_blocked(&mut buf, id, 11);
+        writer::max_data(&mut buf, 12);
+        writer::max_stream_data(&mut buf, id, 13);
+        let frames = parse_all(&buf).unwrap();
+        assert!(matches!(&frames[0], Frame::NewToken { token } if token.as_ref() == b"tok"));
+        assert!(matches!(frames[1], Frame::MaxStreamsUni { max: 7 }));
+        assert!(matches!(frames[2], Frame::StreamsBlocked { bidi: true, max: 8 }));
+        assert!(matches!(frames[3], Frame::StreamsBlocked { bidi: false, max: 9 }));
+        assert!(matches!(&frames[4], Frame::NewConnectionId { seq: 3, retire_prior_to: 1, cid: c, reset_token } if *c == cid && *reset_token == [0xaa; 16]));
+        assert!(matches!(frames[5], Frame::RetireConnectionId { seq: 2 }));
+        assert!(matches!(frames[6], Frame::PathChallenge { data: [1, 2, 3, 4, 5, 6, 7, 8] }));
+        assert!(matches!(frames[7], Frame::PathResponse { data: [8, 7, 6, 5, 4, 3, 2, 1] }));
+        assert!(matches!(frames[8], Frame::ResetStream { id: i, error_code: 0x11, final_size: 1234 } if i == id));
+        assert!(matches!(frames[9], Frame::StopSending { id: i, error_code: 0x22 } if i == id));
+        assert!(matches!(frames[10], Frame::DataBlocked { max: 10 }));
+        assert!(matches!(frames[11], Frame::StreamDataBlocked { id: i, max: 11 } if i == id));
+        assert!(matches!(frames[12], Frame::MaxData { max: 12 }));
+        assert!(matches!(frames[13], Frame::MaxStreamData { id: i, max: 13 } if i == id));
+        assert_eq!(frames.len(), 14);
+    }
+
+    /// RFC 9000 section 19.15: a zero-length or over-long connection ID,
+    /// or Retire Prior To above the sequence number, is malformed.
+    #[test]
+    fn malformed_new_connection_id_is_rejected() {
+        let cid = ConnectionId::from_slice(&[1; 8]);
+        let mut buf = Vec::new();
+        writer::new_connection_id(&mut buf, 1, 2, &cid, &[0; 16]);
+        assert!(parse_all(&buf).is_err(), "retire_prior_to above seq");
+        let mut buf = Vec::new();
+        writer::new_connection_id(&mut buf, 1, 0, &ConnectionId::from_slice(&[]), &[0; 16]);
+        assert!(parse_all(&buf).is_err(), "zero-length id");
+    }
 
     #[test]
     fn crypto_round_trip() {

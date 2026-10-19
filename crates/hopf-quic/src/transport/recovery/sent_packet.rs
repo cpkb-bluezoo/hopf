@@ -59,6 +59,11 @@ pub enum RecoverableFrame {
         /// The limit advertised.
         max: u64,
     },
+    /// RETIRE_CONNECTION_ID for one of the peer's connection IDs.
+    RetireConnectionId {
+        /// Sequence number being retired.
+        seq: u64,
+    },
 }
 
 /// A tracked outstanding (sent, not yet acknowledged or declared lost) packet.
