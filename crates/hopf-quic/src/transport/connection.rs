@@ -148,6 +148,12 @@ pub struct Connection {
     /// Pending MAX_STREAMS_BIDI to send on next flush.
     pending_max_streams_bidi: Option<u64>,
     conn_max_data: u64,
+    /// Stream bytes sent for the first time on this connection: the sum of
+    /// every stream's send offset, which `conn_max_data` bounds (RFC 9000
+    /// section 4.1). Retransmissions do not count.
+    conn_data_sent: u64,
+    /// The `conn_max_data` a DATA_BLOCKED was last sent for.
+    data_blocked_sent_at: Option<u64>,
     /// Token for Initial (usually empty; set after Retry).
     token: Vec<u8>,
     /// Short-header CID length (peer's CID length we send to).
@@ -324,6 +330,8 @@ impl Connection {
             local_max_streams_bidi,
             pending_max_streams_bidi: None,
             conn_max_data: 10 * 1024 * 1024,
+            conn_data_sent: 0,
+            data_blocked_sent_at: None,
             token: Vec::new(),
             short_cid_len: initial_dcid.len(),
             retry_processed: false,
@@ -442,6 +450,8 @@ impl Connection {
             local_max_streams_bidi,
             pending_max_streams_bidi: None,
             conn_max_data: 10 * 1024 * 1024,
+            conn_data_sent: 0,
+            data_blocked_sent_at: None,
             token: Vec::new(),
             short_cid_len: 0,
             retry_processed: false,
@@ -1007,6 +1017,11 @@ impl Connection {
                     st.send.max_data = st.send.max_data.max(max);
                 }
             }
+            Frame::DataBlocked { .. } | Frame::StreamDataBlocked { .. } => {
+                // The peer is waiting on a limit of ours. The receive side
+                // raises its limits as the application reads, so there is
+                // nothing extra to do with the hint.
+            }
             Frame::MaxStreamsBidi { max } => {
                 if max > self.peer_max_streams_bidi {
                     self.peer_max_streams_bidi = max;
@@ -1403,6 +1418,7 @@ impl Connection {
         // stream data back, or the loop ended for lack of data (RFC 9002
         // section 7.8: only the former lets acknowledgements grow the window).
         let mut window_limited = false;
+        let mut conn_blocked = false;
         let ids: Vec<StreamId> = self.streams.keys().copied().collect();
         for id in ids {
             loop {
@@ -1410,9 +1426,32 @@ impl Connection {
                     window_limited |= self.streams.get(&id).is_some_and(|st| st.send.has_data());
                     break;
                 }
-                let Some(max_chunk) = self.stream_chunk_budget(id) else {
+                let Some(mut max_chunk) = self.stream_chunk_budget(id) else {
                     break;
                 };
+                // New data counts against the peer's limits (RFC 9000
+                // section 4.1); retransmissions and a bare FIN do not.
+                let (new_data, offset_before) = self
+                    .streams
+                    .get(&id)
+                    .map(|st| (st.send.next_chunk_is_new_data(), st.send.offset))
+                    .unwrap_or((false, 0));
+                if new_data {
+                    let conn_credit = self.conn_max_data.saturating_sub(self.conn_data_sent);
+                    if conn_credit == 0 {
+                        conn_blocked = true;
+                        break;
+                    }
+                    let stream_credit = self
+                        .streams
+                        .get(&id)
+                        .map(|st| st.send.max_data.saturating_sub(offset_before))
+                        .unwrap_or(0);
+                    if stream_credit == 0 {
+                        break;
+                    }
+                    max_chunk = max_chunk.min(conn_credit.min(stream_credit) as usize);
+                }
                 let Some((offset, data, fin)) = self
                     .streams
                     .get_mut(&id)
@@ -1420,6 +1459,9 @@ impl Connection {
                 else {
                     break;
                 };
+                if new_data {
+                    self.conn_data_sent += data.len() as u64;
+                }
                 let mut payload = Vec::new();
                 writer::stream(&mut payload, id, offset, &data, fin);
                 let frames = vec![RecoverableFrame::Stream {
@@ -1429,7 +1471,9 @@ impl Connection {
                     fin,
                 }];
                 if !self.queue_packet(SpaceId::Data, payload, frames, true, true, now) {
-                    // Congestion blocked after size estimate — put data back.
+                    // Congestion blocked after size estimate — put data back
+                    // on the retransmit queue: its offsets are allocated,
+                    // so the bytes stay counted in `conn_data_sent`.
                     if let Some(st) = self.streams.get_mut(&id) {
                         st.send.requeue(offset, data, fin);
                     }
@@ -1459,6 +1503,7 @@ impl Connection {
             }
         }
         self.loss.set_app_limited(!window_limited);
+        self.queue_blocked_hints(conn_blocked, now);
 
         // DATAGRAM frames on 1-RTT.
         while let Some(data) = self.datagram_tx.pop_front() {
@@ -1482,6 +1527,49 @@ impl Connection {
     /// (RFC 9002 section 7.5).
     fn can_send_data(&self, bytes: usize) -> bool {
         self.probe_bypass || self.loss.congestion().can_send(bytes)
+    }
+
+    /// Tell the peer which of its limits we are waiting on (RFC 9000
+    /// section 4.1): DATA_BLOCKED when `conn_blocked`, STREAM_DATA_BLOCKED
+    /// for each stream whose application is held at the stream limit. Each
+    /// hint goes once per limit value; a lost one is sent again only while
+    /// still blocked (section 13.3).
+    fn queue_blocked_hints(&mut self, conn_blocked: bool, now: Instant) {
+        if self.spaces[2].secrets.is_none() && self.early_secret.is_none() {
+            return;
+        }
+        let mut payload = Vec::new();
+        let mut frames = Vec::new();
+        if conn_blocked && self.data_blocked_sent_at != Some(self.conn_max_data) {
+            writer::data_blocked(&mut payload, self.conn_max_data);
+            frames.push(RecoverableFrame::DataBlocked { max: self.conn_max_data });
+        }
+        let mut blocked: Vec<(StreamId, u64)> = self
+            .streams
+            .iter()
+            .filter(|(_, st)| st.send.blocked_on_peer() && st.send.blocked_sent_at != Some(st.send.max_data))
+            .map(|(id, st)| (*id, st.send.max_data))
+            .collect();
+        blocked.sort();
+        for (id, max) in &blocked {
+            writer::stream_data_blocked(&mut payload, *id, *max);
+            frames.push(RecoverableFrame::StreamDataBlocked { id: *id, max: *max });
+        }
+        if frames.is_empty() {
+            return;
+        }
+        if !self.queue_packet(SpaceId::Data, payload, frames, true, true, now) {
+            // Congestion-blocked: try again on the next flush.
+            return;
+        }
+        if conn_blocked {
+            self.data_blocked_sent_at = Some(self.conn_max_data);
+        }
+        for (id, max) in blocked {
+            if let Some(st) = self.streams.get_mut(&id) {
+                st.send.blocked_sent_at = Some(max);
+            }
+        }
     }
 
     /// Largest datagram this endpoint will send: 1200 bytes until path MTU
@@ -1733,6 +1821,19 @@ self.version,
                 RecoverableFrame::HandshakeDone => {
                     self.handshake_done_pending = true;
                 }
+                RecoverableFrame::DataBlocked { max } => {
+                    // Sent again by the next flush if still blocked there.
+                    if self.data_blocked_sent_at == Some(*max) {
+                        self.data_blocked_sent_at = None;
+                    }
+                }
+                RecoverableFrame::StreamDataBlocked { id, max } => {
+                    if let Some(st) = self.streams.get_mut(id) {
+                        if st.send.blocked_sent_at == Some(*max) {
+                            st.send.blocked_sent_at = None;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1752,6 +1853,18 @@ self.version,
                 }
                 RecoverableFrame::HandshakeDone => self.handshake_done_pending = true,
                 RecoverableFrame::Ping => {}
+                RecoverableFrame::DataBlocked { max } => {
+                    if self.data_blocked_sent_at == Some(max) {
+                        self.data_blocked_sent_at = None;
+                    }
+                }
+                RecoverableFrame::StreamDataBlocked { id, max } => {
+                    if let Some(st) = self.streams.get_mut(&id) {
+                        if st.send.blocked_sent_at == Some(max) {
+                            st.send.blocked_sent_at = None;
+                        }
+                    }
+                }
             }
         }
         // Ahead of other lost CRYPTO, in their original order.
@@ -3138,5 +3251,135 @@ mod tests {
         let mut buf = Vec::new();
         let tx = conn.poll_transmit_gso(now, 16, &mut buf).expect("gso");
         assert_eq!(tx.segment_size, Some(1200));
+    }
+
+    /// Total STREAM payload bytes across `packets`.
+    fn stream_bytes(packets: &[(Option<u8>, Vec<Frame>)]) -> usize {
+        packets
+            .iter()
+            .flat_map(|(_, frames)| frames.iter())
+            .map(|f| match f {
+                Frame::Stream { data, .. } => data.len(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn count(packets: &[(Option<u8>, Vec<Frame>)], pred: impl Fn(&Frame) -> bool) -> usize {
+        packets.iter().flat_map(|(_, frames)| frames.iter()).filter(|f| pred(f)).count()
+    }
+
+    /// RFC 9000 section 4.1: a sender MUST NOT send stream data beyond the
+    /// peer's connection-level limit. Regression: only the per-stream limit
+    /// was checked, so several streams together overran the peer's
+    /// `initial_max_data` and it closed the connection with
+    /// FLOW_CONTROL_ERROR.
+    #[test]
+    fn connection_level_send_limit_caps_stream_data_until_max_data_arrives() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.loss.congestion_mut().set_congestion_window_for_tests(u64::MAX / 2);
+        conn.conn_max_data = 65_536;
+        let ids: Vec<StreamId> = (0..8).map(|_| conn.open_bi().expect("stream")).collect();
+        for id in &ids {
+            conn.write_stream(*id, &vec![0xab; 32 * 1024]).unwrap();
+        }
+        let first = drain_frames(&mut conn, now);
+        assert_eq!(stream_bytes(&first), 65_536, "stream data sent past the connection limit");
+        assert_eq!(
+            count(&first, |f| matches!(f, Frame::DataBlocked { max: 65_536 })),
+            1,
+            "DATA_BLOCKED once at the limit: {first:?}"
+        );
+        // Nothing more leaves, and the blocked hint is not repeated, until
+        // the peer raises the limit.
+        let idle = drain_frames(&mut conn, now);
+        assert_eq!(stream_bytes(&idle), 0);
+        assert!(!carries(&idle, |f| matches!(f, Frame::DataBlocked { .. })));
+        conn.handle_frame(SpaceId::Data, Frame::MaxData { max: 262_144 }, now);
+        let rest = drain_frames(&mut conn, now);
+        assert_eq!(stream_bytes(&rest), 262_144 - 65_536);
+        assert!(
+            !carries(&rest, |f| matches!(f, Frame::DataBlocked { .. })),
+            "not blocked once everything fitted: {rest:?}"
+        );
+    }
+
+    /// The per-stream limit was checked only when data was queued, and
+    /// against the offset already sent rather than the bytes already
+    /// queued, so two writes could queue more than the peer allowed and the
+    /// flush sent all of it. A write now stops at the limit (a short write,
+    /// then `Blocked`), and STREAM_DATA_BLOCKED tells the peer the stream
+    /// is waiting on it.
+    #[test]
+    fn stream_level_send_limit_is_enforced_on_queued_data() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.loss.congestion_mut().set_congestion_window_for_tests(u64::MAX / 2);
+        let id = conn.open_bi().expect("stream");
+        conn.streams.get_mut(&id).unwrap().send.max_data = 4096;
+        assert_eq!(conn.write_stream(id, &[0xab; 4000]).unwrap(), 4000);
+        assert_eq!(conn.write_stream(id, &[0xcd; 200]).unwrap(), 96, "short write at the limit");
+        assert!(matches!(conn.write_stream(id, &[0xef; 10]), Err(WriteError::Blocked)));
+        let sent = drain_frames(&mut conn, now);
+        assert_eq!(stream_bytes(&sent), 4096);
+        assert_eq!(
+            count(&sent, |f| matches!(f, Frame::StreamDataBlocked { id: sid, max: 4096 } if *sid == id)),
+            1,
+            "STREAM_DATA_BLOCKED once at the limit: {sent:?}"
+        );
+        conn.handle_frame(SpaceId::Data, Frame::MaxStreamData { id, max: 8192 }, now);
+        assert_eq!(conn.write_stream(id, &[0xef; 10]).unwrap(), 10);
+        assert_eq!(stream_bytes(&drain_frames(&mut conn, now)), 10);
+    }
+
+    /// RFC 9000 section 13.3: a lost DATA_BLOCKED is sent again, but only
+    /// while the sender is still blocked at that limit.
+    #[test]
+    fn lost_data_blocked_is_sent_again_only_while_still_blocked() {
+        let now = Instant::now();
+        let mut conn = test_client(now);
+        conn.loss.congestion_mut().set_congestion_window_for_tests(u64::MAX / 2);
+        conn.conn_max_data = 1024;
+        let id = conn.open_bi().expect("stream");
+        conn.write_stream(id, &[0xab; 2048]).unwrap();
+        let first = drain_frames(&mut conn, now);
+        assert_eq!(count(&first, |f| matches!(f, Frame::DataBlocked { max: 1024 })), 1, "{first:?}");
+        let blocked_pn = conn.space(SpaceId::Data).next_pn - 1;
+        // Three more ack-eliciting packets, then an ACK of the last alone:
+        // the DATA_BLOCKED packet is K_PACKET_THRESHOLD below it and lost.
+        for _ in 0..3 {
+            conn.pto_ping_pending[space_index(SpaceId::Data)] = true;
+            conn.flush_pending_packets(now);
+        }
+        let largest = conn.space(SpaceId::Data).next_pn - 1;
+        drain_frames(&mut conn, now);
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack { largest, delay: 0, ranges: vec![(largest, largest)] },
+            now + Duration::from_millis(20),
+        );
+        assert!(largest >= blocked_pn + 3);
+        let again = drain_frames(&mut conn, now);
+        assert_eq!(count(&again, |f| matches!(f, Frame::DataBlocked { max: 1024 })), 1, "resent: {again:?}");
+
+        // Once the limit is raised and everything fits, a lost one is not.
+        conn.handle_frame(SpaceId::Data, Frame::MaxData { max: 4096 }, now);
+        drain_frames(&mut conn, now);
+        let newer = conn.space(SpaceId::Data).next_pn - 1;
+        for _ in 0..3 {
+            conn.pto_ping_pending[space_index(SpaceId::Data)] = true;
+            conn.flush_pending_packets(now);
+        }
+        let largest = conn.space(SpaceId::Data).next_pn - 1;
+        drain_frames(&mut conn, now);
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack { largest, delay: 0, ranges: vec![(largest, largest)] },
+            now + Duration::from_millis(40),
+        );
+        assert!(largest >= newer + 3);
+        let quiet = drain_frames(&mut conn, now);
+        assert!(!carries(&quiet, |f| matches!(f, Frame::DataBlocked { .. })), "{quiet:?}");
     }
 }

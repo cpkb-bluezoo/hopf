@@ -31,6 +31,10 @@ pub mod ty {
     pub const MAX_STREAM_DATA: u64 = 0x11;
     /// MAX_STREAMS_BIDI
     pub const MAX_STREAMS_BIDI: u64 = 0x12;
+    /// DATA_BLOCKED
+    pub const DATA_BLOCKED: u64 = 0x14;
+    /// STREAM_DATA_BLOCKED
+    pub const STREAM_DATA_BLOCKED: u64 = 0x15;
     /// CONNECTION_CLOSE transport
     pub const CONNECTION_CLOSE: u64 = 0x1c;
     /// CONNECTION_CLOSE application
@@ -95,6 +99,20 @@ pub enum Frame {
     /// MAX_STREAMS (bidi).
     MaxStreamsBidi {
         /// Maximum streams.
+        max: u64,
+    },
+    /// DATA_BLOCKED: the peer has data to send but is at our connection
+    /// limit (RFC 9000 section 19.12).
+    DataBlocked {
+        /// The limit the peer is blocked at.
+        max: u64,
+    },
+    /// STREAM_DATA_BLOCKED: the peer is at our limit for one stream
+    /// (RFC 9000 section 19.13).
+    StreamDataBlocked {
+        /// Stream ID.
+        id: StreamId,
+        /// The limit the peer is blocked at.
         max: u64,
     },
     /// CONNECTION_CLOSE.
@@ -231,6 +249,15 @@ pub fn parse_all(mut buf: &[u8]) -> Result<Vec<Frame>, ()> {
             ty::MAX_STREAMS_BIDI => {
                 let max = varint::decode(&mut buf).ok_or(())?;
                 frames.push(Frame::MaxStreamsBidi { max });
+            }
+            ty::DATA_BLOCKED => {
+                let max = varint::decode(&mut buf).ok_or(())?;
+                frames.push(Frame::DataBlocked { max });
+            }
+            ty::STREAM_DATA_BLOCKED => {
+                let id = StreamId::from_wire(varint::decode(&mut buf).ok_or(())?);
+                let max = varint::decode(&mut buf).ok_or(())?;
+                frames.push(Frame::StreamDataBlocked { id, max });
             }
             ty::CONNECTION_CLOSE | ty::CONNECTION_CLOSE_APP => {
                 let application = frame_ty == ty::CONNECTION_CLOSE_APP;

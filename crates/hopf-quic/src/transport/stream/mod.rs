@@ -25,10 +25,20 @@ pub struct SendStream {
     pub fin_sent: bool,
     /// Max data peer allows.
     pub max_data: u64,
+    /// Bytes in `pending` (queued, not yet sent for the first time).
+    pub queued: u64,
+    /// The last write was cut short by `max_data`: the application has
+    /// more to send than the peer currently allows.
+    pub wants_more: bool,
+    /// The `max_data` a STREAM_DATA_BLOCKED was last sent for, so the
+    /// hint goes once per limit (RFC 9000 section 4.1).
+    pub blocked_sent_at: Option<u64>,
 }
 
 impl SendStream {
-    /// Queue data for send.
+    /// Queue data for send: as much of `data` as the peer's limit allows
+    /// (a short write when the limit falls inside it), or `Err` when the
+    /// stream is finished or nothing fits.
     pub fn write(&mut self, data: &[u8]) -> Result<usize, ()> {
         if self.fin {
             return Err(());
@@ -36,11 +46,30 @@ impl SendStream {
         if data.is_empty() {
             return Ok(0);
         }
-        if self.offset + data.len() as u64 > self.max_data {
+        let credit = self.max_data.saturating_sub(self.offset + self.queued);
+        let n = (data.len() as u64).min(credit) as usize;
+        self.wants_more = n < data.len();
+        if n == 0 {
             return Err(());
         }
-        self.pending.push_back(Bytes::copy_from_slice(data));
-        Ok(data.len())
+        self.pending.push_back(Bytes::copy_from_slice(&data[..n]));
+        self.queued += n as u64;
+        Ok(n)
+    }
+
+    /// Whether the next chunk `take_chunk` returns is new data, which
+    /// counts against the peer's limits (retransmissions and a bare FIN do
+    /// not).
+    pub fn next_chunk_is_new_data(&self) -> bool {
+        self.retransmit.is_empty() && !self.pending.is_empty()
+    }
+
+    /// Whether this stream is waiting on the peer to raise `max_data`: the
+    /// application wanted to queue more than fits, or queued data cannot
+    /// leave because the limit already sits at the offset sent so far.
+    pub fn blocked_on_peer(&self) -> bool {
+        (self.wants_more && self.max_data.saturating_sub(self.offset + self.queued) == 0)
+            || (!self.pending.is_empty() && self.max_data.saturating_sub(self.offset) == 0)
     }
 
     /// Mark FIN.
@@ -95,6 +124,7 @@ impl SendStream {
                 self.pending.push_front(r);
             }
             self.offset += data.len() as u64;
+            self.queued -= data.len() as u64;
             let fin = self.fin && self.pending.is_empty() && self.retransmit.is_empty();
             if fin {
                 self.fin_sent = true;

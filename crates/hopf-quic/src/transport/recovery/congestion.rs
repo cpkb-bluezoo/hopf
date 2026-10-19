@@ -39,6 +39,13 @@ impl CongestionController {
         }
     }
 
+    /// Open the window wide so a test can study another limit (flow
+    /// control, pacing) without the congestion window in the way.
+    #[cfg(test)]
+    pub(crate) fn set_congestion_window_for_tests(&mut self, window: u64) {
+        self.congestion_window = window;
+    }
+
     /// Whether `bytes` more may be sent without exceeding the congestion window.
     pub fn can_send(&self, bytes: usize) -> bool {
         self.bytes_in_flight + bytes as u64 <= self.congestion_window

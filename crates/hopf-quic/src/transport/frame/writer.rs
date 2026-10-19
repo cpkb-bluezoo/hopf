@@ -69,6 +69,32 @@ pub fn max_streams_bidi(out: &mut Vec<u8>, max: u64) {
     varint::encode(max, out);
 }
 
+/// Encode MAX_DATA (type 0x10).
+pub fn max_data(out: &mut Vec<u8>, max: u64) {
+    varint::encode(ty::MAX_DATA, out);
+    varint::encode(max, out);
+}
+
+/// Encode MAX_STREAM_DATA (type 0x11).
+pub fn max_stream_data(out: &mut Vec<u8>, id: StreamId, max: u64) {
+    varint::encode(ty::MAX_STREAM_DATA, out);
+    varint::encode(id.as_u64(), out);
+    varint::encode(max, out);
+}
+
+/// Encode DATA_BLOCKED (type 0x14).
+pub fn data_blocked(out: &mut Vec<u8>, max: u64) {
+    varint::encode(ty::DATA_BLOCKED, out);
+    varint::encode(max, out);
+}
+
+/// Encode STREAM_DATA_BLOCKED (type 0x15).
+pub fn stream_data_blocked(out: &mut Vec<u8>, id: StreamId, max: u64) {
+    varint::encode(ty::STREAM_DATA_BLOCKED, out);
+    varint::encode(id.as_u64(), out);
+    varint::encode(max, out);
+}
+
 /// Encode DATAGRAM with length (type 0x31).
 pub fn datagram(out: &mut Vec<u8>, data: &[u8]) {
     varint::encode(ty::DATAGRAM_LEN, out);

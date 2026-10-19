@@ -33,6 +33,19 @@ pub enum RecoverableFrame {
     Ping,
     /// HANDSHAKE_DONE (RFC 9000 section 13.3: sent until acknowledged).
     HandshakeDone,
+    /// DATA_BLOCKED at the given connection limit (RFC 9000 section 13.3:
+    /// sent again only while still blocked at that limit).
+    DataBlocked {
+        /// The peer's connection limit the sender was blocked at.
+        max: u64,
+    },
+    /// STREAM_DATA_BLOCKED at the given stream limit.
+    StreamDataBlocked {
+        /// Stream identifier.
+        id: StreamId,
+        /// The peer's stream limit the sender was blocked at.
+        max: u64,
+    },
 }
 
 /// A tracked outstanding (sent, not yet acknowledged or declared lost) packet.
