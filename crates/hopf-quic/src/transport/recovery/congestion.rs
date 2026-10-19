@@ -23,12 +23,22 @@ pub struct CongestionController {
 }
 
 impl CongestionController {
+    /// The RFC 9002 section 7.2 initial window for a datagram size.
+    pub fn initial_window(max_datagram_size: usize) -> u64 {
+        let max_datagram_size = max_datagram_size.max(1) as u64;
+        (10 * max_datagram_size).min((2 * max_datagram_size).max(INITIAL_WINDOW_FLOOR))
+    }
+
+    /// Whether the controller is in slow start (window below ssthresh).
+    pub fn in_slow_start(&self) -> bool {
+        self.congestion_window < self.ssthresh
+    }
+
     /// Create with the RFC 9002 section 7.2 initial window.
     pub fn new(max_datagram_size: usize) -> Self {
         let max_datagram_size = max_datagram_size.max(1);
         let minimum_window = 2 * max_datagram_size as u64;
-        let congestion_window = (10 * max_datagram_size as u64)
-            .min((2 * max_datagram_size as u64).max(INITIAL_WINDOW_FLOOR));
+        let congestion_window = Self::initial_window(max_datagram_size);
         Self {
             max_datagram_size,
             minimum_window,
@@ -108,8 +118,7 @@ impl CongestionController {
 
     /// Reset path congestion state (RFC 9000 §9.4); leave bytes in flight.
     pub fn reset(&mut self) {
-        self.congestion_window = (10 * self.max_datagram_size as u64)
-            .min((2 * self.max_datagram_size as u64).max(INITIAL_WINDOW_FLOOR));
+        self.congestion_window = Self::initial_window(self.max_datagram_size);
         self.ssthresh = u64::MAX;
         self.congestion_recovery_start = None;
     }

@@ -22,7 +22,7 @@ use crate::transport::packet::version_negotiation;
 use crate::transport::version::{self, QuicVersion};
 use crate::transport::packet::transport_params::VersionInformation;
 use crate::transport::packet::TransportParameters;
-use crate::transport::recovery::{LossDetector, RecoverableFrame};
+use crate::transport::recovery::{CongestionController, LossDetector, Pacer, RecoverableFrame};
 use crate::transport::stream::{RecvStream, SendStream, StreamReassembler};
 use crate::transport::tls_bridge::{self, OutboundCrypto, TlsBridge, TlsBridgeEvents};
 use crate::transport::types::{
@@ -243,6 +243,10 @@ pub struct Connection {
     /// it was unvalidated; sends are capped at three times the receipts.
     unvalidated_bytes_received: u64,
     unvalidated_bytes_sent: u64,
+    /// Spreads stream data over the round trip (RFC 9002 section 7.7).
+    pacer: Pacer,
+    /// The packet being built carries paced stream data: charge the pacer.
+    pacing_charge: bool,
     /// Token for Initial (usually empty; set after Retry).
     token: Vec<u8>,
     /// Short-header CID length (peer's CID length we send to).
@@ -476,6 +480,8 @@ impl Connection {
             client_address_validated: true,
             unvalidated_bytes_received: 0,
             unvalidated_bytes_sent: 0,
+            pacer: Pacer::new(MAX_DATAGRAM_SIZE, CongestionController::initial_window(MAX_DATAGRAM_SIZE)),
+            pacing_charge: false,
             flow,
             token: Vec::new(),
             short_cid_len: initial_dcid.len(),
@@ -619,6 +625,8 @@ impl Connection {
             client_address_validated: true,
             unvalidated_bytes_received: 0,
             unvalidated_bytes_sent: 0,
+            pacer: Pacer::new(MAX_DATAGRAM_SIZE, CongestionController::initial_window(MAX_DATAGRAM_SIZE)),
+            pacing_charge: false,
             flow,
             token: Vec::new(),
             short_cid_len: 0,
@@ -700,6 +708,9 @@ impl Connection {
         }
         let idle = self.last_activity + self.idle_timeout;
         let mut next = idle;
+        if let Some(paced) = self.pacer.deadline() {
+            next = next.min(paced);
+        }
         if let Some(interval) = self.keep_alive_interval {
             if self.established && self.spaces[2].secrets.is_some() {
                 next = next.min(self.last_keep_alive + interval);
@@ -1738,7 +1749,7 @@ impl Connection {
         let mut window_limited = false;
         let mut conn_blocked = false;
         let ids: Vec<StreamId> = self.streams.keys().copied().collect();
-        for id in ids {
+        'streams: for id in ids {
             loop {
                 if !self.amplification_allows(MAX_DATAGRAM_SIZE) {
                     break;
@@ -1746,6 +1757,12 @@ impl Connection {
                 if !self.can_send_data(MAX_DATAGRAM_SIZE) {
                     window_limited |= self.streams.get(&id).is_some_and(|st| st.send.has_data());
                     break;
+                }
+                // Pacing holds bulk data back (a probe goes regardless);
+                // that is the sender's own doing, not being app-limited.
+                if !self.probe_bypass && !self.pacer_allows(now) {
+                    window_limited |= self.streams.get(&id).is_some_and(|st| st.send.has_data());
+                    break 'streams;
                 }
                 let Some(mut max_chunk) = self.stream_chunk_budget(id) else {
                     break;
@@ -1792,7 +1809,10 @@ impl Connection {
                     data: data.clone(),
                     fin,
                 }];
-                if !self.queue_packet(SpaceId::Data, payload, frames, true, true, now) {
+                self.pacing_charge = true;
+                let queued = self.queue_packet(SpaceId::Data, payload, frames, true, true, now);
+                self.pacing_charge = false;
+                if !queued {
                     // Congestion blocked after size estimate — put data back
                     // on the retransmit queue: its offsets are allocated,
                     // so the bytes stay counted in `conn_data_sent`.
@@ -1850,6 +1870,15 @@ impl Connection {
     /// (RFC 9002 section 7.5).
     fn can_send_data(&self, bytes: usize) -> bool {
         self.probe_bypass || self.loss.congestion().can_send(bytes)
+    }
+
+    /// Whether the pacer lets one more datagram of stream data leave now.
+    fn pacer_allows(&mut self, now: Instant) -> bool {
+        let cc = self.loss.congestion();
+        let (cwnd, in_flight, slow_start) = (cc.congestion_window(), cc.bytes_in_flight(), cc.in_slow_start());
+        let rtt = self.loss.rtt();
+        let (srtt, has_sample) = (rtt.smoothed_rtt(), rtt.has_rtt_sample());
+        self.pacer.allow(now, MAX_DATAGRAM_SIZE, cwnd, srtt, slow_start, in_flight, has_sample)
     }
 
     /// RFC 9000 section 8.1: until the client's address is validated a
@@ -2347,6 +2376,9 @@ self.version,
         };
         if self.side == Side::Server && !self.client_address_validated {
             self.unvalidated_bytes_sent += tx.size as u64;
+        }
+        if self.pacing_charge {
+            self.pacer.on_sent(tx.size);
         }
         self.transmits.push_back((tx, packet));
         // RFC 9001 section 4.9.1: a client discards Initial keys when it
@@ -5120,5 +5152,67 @@ mod tests {
         let packet = peer_handshake_packet(&conn, 0, &ping);
         conn.handle_packet(now, &packet);
         assert!(drain_lens(&mut conn, now).iter().sum::<usize>() > 20_000, "a Handshake packet did not validate the address");
+    }
+
+    /// A client with one RTT sample of 100 ms, a wide-open congestion
+    /// window and 200 KB queued on a stream, idle at `t0`.
+    fn paced_sender(now: Instant) -> (Connection, Instant) {
+        let mut conn = test_client(now);
+        conn.loss.set_handshake_confirmed(true);
+        conn.handshake_done = true;
+        let id = conn.open_bi().expect("stream");
+        conn.streams.get_mut(&id).unwrap().send.max_data = u64::MAX;
+        conn.conn_max_data = u64::MAX;
+        conn.write_stream(id, b"x").unwrap();
+        drain_frames(&mut conn, now);
+        let t0 = now + Duration::from_millis(100);
+        ack_everything(&mut conn, t0);
+        assert!(conn.loss.rtt().has_rtt_sample());
+        conn.loss.congestion_mut().set_congestion_window_for_tests(240_000);
+        conn.write_stream(id, &vec![0xab; 200_000]).unwrap();
+        (conn, t0)
+    }
+
+    /// RFC 9002 section 7.7: a sender paces stream data over the round
+    /// trip instead of releasing a whole window at once. Regression: the
+    /// flush emitted packets until the congestion window was full, so a
+    /// bulk sender burst up to a full window into the path.
+    #[test]
+    fn stream_data_is_paced_after_an_initial_burst() {
+        let now = Instant::now();
+        let (mut conn, t0) = paced_sender(now);
+        let burst: usize = drain_lens(&mut conn, t0).iter().sum();
+        assert!(burst > 0 && burst <= 12_000, "first burst from idle was {burst} bytes, not within the initial window");
+        // While data is in flight each wake-up releases at most a datagram
+        // plus one millisecond of credit, never a batch, so the rest is
+        // spread over the round trip: 2 x 240 KB per 100 ms is 4800 bytes
+        // per millisecond.
+        let mut total = burst;
+        for step in 1..=20u64 {
+            let lens = drain_lens(&mut conn, t0 + Duration::from_millis(step));
+            assert!(lens.len() <= 5, "{} datagrams released at once at step {step}", lens.len());
+            total += lens.iter().sum::<usize>();
+        }
+        assert!(total <= 12_000 + 20 * 6000, "{total} bytes within 20 ms of a 100 ms round trip");
+        assert!(conn.poll_timeout().is_some_and(|t| t <= t0 + Duration::from_millis(25)), "no pacing deadline armed");
+    }
+
+    /// Acknowledgements and probe packets are not held by the pacer.
+    #[test]
+    fn acks_and_probes_are_not_paced() {
+        let now = Instant::now();
+        let (mut conn, t0) = paced_sender(now);
+        drain_lens(&mut conn, t0);
+        // Pacing credit is spent; a packet from the peer is still
+        // acknowledged at once.
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        conn.on_decrypted(SpaceId::Data, 50, &ping, t0);
+        let out = drain_frames(&mut conn, t0);
+        assert!(carries(&out, |f| matches!(f, Frame::Ack { largest: 50, .. })), "ACK held back by the pacer: {out:?}");
+        // A probe timeout likewise sends its probe.
+        let later = t0 + Duration::from_secs(3);
+        conn.handle_timeout(later);
+        assert!(!drain_frames(&mut conn, later).is_empty(), "probe held back by the pacer");
     }
 }

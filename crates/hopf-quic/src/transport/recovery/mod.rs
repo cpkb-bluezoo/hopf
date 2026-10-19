@@ -7,5 +7,8 @@ mod loss_detector;
 mod rtt;
 mod sent_packet;
 
+pub use congestion::CongestionController;
 pub use loss_detector::LossDetector;
 pub use sent_packet::{RecoverableFrame, SentPacket};
+pub mod pacer;
+pub use pacer::Pacer;
