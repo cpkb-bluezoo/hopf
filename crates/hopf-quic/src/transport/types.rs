@@ -264,11 +264,30 @@ pub enum DatagramEvent {
     Response(Transmit),
 }
 
-/// Event from endpoint → connection (inbound datagram bytes).
+/// Event from endpoint → connection.
 #[derive(Debug)]
-pub struct ConnectionEvent {
-    /// Raw UDP payload for this connection.
-    pub datagram: Bytes,
+pub enum ConnectionEvent {
+    /// An inbound datagram for this connection, with the address it came
+    /// from.
+    Datagram {
+        /// Raw UDP payload.
+        datagram: Bytes,
+        /// Source address.
+        remote: SocketAddr,
+    },
+    /// Connection IDs the endpoint issued for this connection, each with its
+    /// stateless reset token (RFC 9000 section 5.1.1), answering
+    /// [`EndpointEvent::NeedConnectionIds`].
+    LocalConnectionIds(Vec<(ConnectionId, [u8; 16])>),
+}
+
+/// Event from connection → endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointEvent {
+    /// Issue this many new local connection IDs, registered for routing.
+    NeedConnectionIds(usize),
+    /// The peer retired this local connection ID: stop routing on it.
+    RetireConnectionId(ConnectionId),
 }
 
 /// Pending server connection before accept/retry.

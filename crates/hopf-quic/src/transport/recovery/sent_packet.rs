@@ -64,6 +64,12 @@ pub enum RecoverableFrame {
         /// Sequence number being retired.
         seq: u64,
     },
+    /// NEW_CONNECTION_ID for one of our connection IDs (sent again after
+    /// loss while the ID is still active).
+    NewConnectionId {
+        /// Sequence number of the ID issued.
+        seq: u64,
+    },
     /// RESET_STREAM (sent again after loss while the stream is still reset).
     ResetStream {
         /// Stream identifier.

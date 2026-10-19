@@ -19,8 +19,8 @@ use crate::transport::version::QuicVersion;
 use crate::transport::quic_lb::{ConnectionIdGenerator, RandomConnectionIdGenerator};
 use crate::transport::recovery::CongestionAlgorithm;
 use crate::transport::types::{
-    ConnectionEvent, ConnectionHandle, ConnectionId, DatagramEvent, EndpointConfig, Incoming,
-    FlowControlLimits, Transmit,
+    ConnectionEvent, ConnectionHandle, ConnectionId, DatagramEvent, EndpointConfig, EndpointEvent,
+    FlowControlLimits, Incoming, Transmit,
 };
 
 /// Server crypto + transport settings.
@@ -133,6 +133,10 @@ pub struct Endpoint {
     next_handle: usize,
     /// Client-only: the single outbound connection handle.
     client_handle: Option<ConnectionHandle>,
+    /// Key the stateless reset tokens of issued connection IDs are derived
+    /// from (RFC 9000 section 10.3.2): the Retry token key on a server, a
+    /// random key on a client.
+    reset_token_key: [u8; 32],
 }
 
 impl Endpoint {
@@ -149,6 +153,10 @@ impl Endpoint {
             .as_ref()
             .and_then(|s| s.cid_generator.clone())
             .unwrap_or_else(|| Arc::new(RandomConnectionIdGenerator::new(if config.cid_len == 0 { 8 } else { config.cid_len })));
+        let reset_token_key = server
+            .as_ref()
+            .map(|s| s.retry_token_key)
+            .unwrap_or_else(retry::generate_token_key);
         Self {
             config: EndpointConfig { cid_len: cid_generator.cid_len() },
             cid_generator,
@@ -157,7 +165,20 @@ impl Endpoint {
             connections: HashMap::new(),
             next_handle: 0,
             client_handle: None,
+            reset_token_key,
         }
+    }
+
+    /// The stateless reset token for `cid`: the first 16 bytes of an
+    /// HMAC-SHA256 of the ID under the endpoint's key, so the token can be
+    /// recomputed without per-connection state.
+    fn reset_token(&self, cid: &ConnectionId) -> [u8; 16] {
+        use aws_lc_rs::hmac;
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.reset_token_key);
+        let tag = hmac::sign(&key, cid.as_slice());
+        let mut token = [0u8; 16];
+        token.copy_from_slice(&tag.as_ref()[..16]);
+        token
     }
 
     /// A new local connection ID from the generator that no live connection
@@ -244,14 +265,14 @@ impl Endpoint {
                 let handle = self.cids.get(&parsed.dst_cid)?;
                 return Some(DatagramEvent::ConnectionEvent(
                     handle,
-                    ConnectionEvent { datagram: data },
+                    ConnectionEvent::Datagram { datagram: data, remote },
                 ));
             }
             let prefix = long_header::parse_prefix(&data)?;
             if let Some(handle) = self.cids.get(&prefix.dst_cid) {
                 return Some(DatagramEvent::ConnectionEvent(
                     handle,
-                    ConnectionEvent { datagram: data },
+                    ConnectionEvent::Datagram { datagram: data, remote },
                 ));
             }
             if prefix.packet_type == TYPE_INITIAL {
@@ -277,7 +298,7 @@ impl Endpoint {
             if let Some(handle) = self.cids.get(&cid) {
                 return Some(DatagramEvent::ConnectionEvent(
                     handle,
-                    ConnectionEvent { datagram: data },
+                    ConnectionEvent::Datagram { datagram: data, remote },
                 ));
             }
         }
@@ -303,7 +324,7 @@ impl Endpoint {
             // A Version Negotiation packet: only ever for one of our own
             // outbound connections, demultiplexed on its DCID (our SCID).
             let handle = self.cids.get(&ConnectionId::from_slice(dcid))?;
-            return Some(DatagramEvent::ConnectionEvent(handle, ConnectionEvent { datagram: data.clone() }));
+            return Some(DatagramEvent::ConnectionEvent(handle, ConnectionEvent::Datagram { datagram: data.clone(), remote }));
         }
         let server = self.server.as_ref()?;
         if data.len() < vn::MIN_INITIAL_DATAGRAM_LEN
@@ -451,10 +472,28 @@ impl Endpoint {
     /// Handle endpoint event from a connection (no-op).
     pub fn handle_event(
         &mut self,
-        _ch: ConnectionHandle,
-        _ev: ConnectionEvent,
+        handle: ConnectionHandle,
+        ev: EndpointEvent,
     ) -> Option<ConnectionEvent> {
-        None
+        match ev {
+            EndpointEvent::NeedConnectionIds(n) => {
+                let issued: Vec<(ConnectionId, [u8; 16])> = (0..n)
+                    .map(|_| {
+                        let cid = self.new_local_cid();
+                        self.cids.insert(cid.clone(), handle);
+                        let token = self.reset_token(&cid);
+                        (cid, token)
+                    })
+                    .collect();
+                Some(ConnectionEvent::LocalConnectionIds(issued))
+            }
+            EndpointEvent::RetireConnectionId(cid) => {
+                if self.cids.get(&cid) == Some(handle) {
+                    self.cids.remove(&cid);
+                }
+                None
+            }
+        }
     }
 
     /// Register an additional CID for an existing handle.
@@ -810,5 +849,36 @@ mod tests {
             ep.handle(Instant::now(), remote(), None, None, Bytes::from(d), &mut Vec::new()),
             Some(DatagramEvent::ConnectionEvent(..))
         ));
+    }
+
+    /// Connection IDs issued at a connection's request are registered for
+    /// routing, each with a distinct stateless reset token, and a retired
+    /// one stops routing.
+    #[test]
+    fn issued_connection_ids_route_to_the_connection_until_retired() {
+        let mut ep = endpoint(true);
+        let (ch, _) = accept(&mut ep);
+        let Some(ConnectionEvent::LocalConnectionIds(issued)) = ep.handle_event(ch, EndpointEvent::NeedConnectionIds(2)) else {
+            panic!("no connection IDs issued");
+        };
+        assert_eq!(issued.len(), 2);
+        assert_ne!(issued[0].0, issued[1].0);
+        assert_ne!(issued[0].1, issued[1].1, "reset tokens must differ");
+        for (cid, _) in &issued {
+            let mut datagram = vec![0x40];
+            datagram.extend_from_slice(cid.as_slice());
+            datagram.extend_from_slice(&[0u8; 40]);
+            let mut buf = Vec::new();
+            match ep.handle(Instant::now(), remote(), None, None, Bytes::from(datagram.clone()), &mut buf) {
+                Some(DatagramEvent::ConnectionEvent(h, _)) => assert_eq!(h, ch),
+                other => panic!("spare ID not routed: {other:?}"),
+            }
+        }
+        assert!(ep.handle_event(ch, EndpointEvent::RetireConnectionId(issued[0].0.clone())).is_none());
+        let mut datagram = vec![0x40];
+        datagram.extend_from_slice(issued[0].0.as_slice());
+        datagram.extend_from_slice(&[0u8; 40]);
+        let mut buf = Vec::new();
+        assert!(ep.handle(Instant::now(), remote(), None, None, Bytes::from(datagram), &mut buf).is_none(), "retired ID still routed");
     }
 }

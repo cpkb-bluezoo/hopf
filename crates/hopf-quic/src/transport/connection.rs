@@ -26,8 +26,8 @@ use crate::transport::recovery::{CongestionAlgorithm, CongestionController, Loss
 use crate::transport::stream::{RecvStream, SendStream, StreamReassembler};
 use crate::transport::tls_bridge::{self, OutboundCrypto, TlsBridge, TlsBridgeEvents};
 use crate::transport::types::{
-    ConnectionError, ConnectionId, Dir, Event, FlowControlLimits, Side, SpaceId, StreamEvent,
-    StreamId, Transmit, VarInt,
+    ConnectionError, ConnectionEvent, ConnectionId, Dir, EndpointEvent, Event, FlowControlLimits,
+    Side, SpaceId, StreamEvent, StreamId, Transmit, VarInt,
 };
 
 /// Maximum datagram size we send until the path is shown to support more
@@ -244,6 +244,19 @@ pub struct Connection {
     /// it was unvalidated; sends are capped at three times the receipts.
     unvalidated_bytes_received: u64,
     unvalidated_bytes_sent: u64,
+    /// Our connection IDs, sequence number 0 first.
+    local_cids: Vec<LocalCid>,
+    /// Sequence number the next issued ID gets.
+    next_local_cid_seq: u64,
+    /// IDs asked of the endpoint but not yet delivered.
+    local_cids_requested: usize,
+    /// Sequence numbers whose NEW_CONNECTION_ID is due (new or lost).
+    pending_new_cids: Vec<u64>,
+    /// Events for the endpoint (routing changes).
+    endpoint_events: VecDeque<EndpointEvent>,
+    /// Destination ID of the packet being processed, for the rule that a
+    /// peer may not retire the ID it is using (RFC 9000 section 19.16).
+    rx_dcid: Option<ConnectionId>,
     /// Spreads stream data over the round trip (RFC 9002 section 7.7).
     pacer: Pacer,
     /// The packet being built carries paced stream data: charge the pacer.
@@ -315,6 +328,18 @@ pub struct PeerCid {
     pub cid: ConnectionId,
     /// Stateless reset token, `None` for the handshake ID.
     pub reset_token: Option<[u8; 16]>,
+}
+
+/// One of our connection IDs (RFC 9000 section 5.1.1): sequence number 0
+/// is the handshake ID, later ones were issued by the endpoint on request.
+#[derive(Debug, Clone)]
+struct LocalCid {
+    seq: u64,
+    cid: ConnectionId,
+    /// Stateless reset token sent with the ID (`None` for the handshake ID).
+    reset_token: Option<[u8; 16]>,
+    /// The peer retired it.
+    retired: bool,
 }
 
 /// A STREAM chunk sent in a 0-RTT packet, with the packet that carried it.
@@ -438,7 +463,7 @@ impl Connection {
             client_restart: Some(restart),
             reacted_to_version_negotiation: false,
             remote,
-            local_cid,
+            local_cid: local_cid.clone(),
             rem_cid: initial_dcid.clone(),
             initial_dcid: initial_dcid.clone(),
             spaces: [Space::new(), Space::new(), Space::new()],
@@ -483,6 +508,12 @@ impl Connection {
             client_address_validated: true,
             unvalidated_bytes_received: 0,
             unvalidated_bytes_sent: 0,
+            local_cids: vec![LocalCid { seq: 0, cid: local_cid.clone(), reset_token: None, retired: false }],
+            next_local_cid_seq: 1,
+            local_cids_requested: 0,
+            pending_new_cids: Vec::new(),
+            endpoint_events: VecDeque::new(),
+            rx_dcid: None,
             pacer: Pacer::new(MAX_DATAGRAM_SIZE, CongestionController::initial_window(MAX_DATAGRAM_SIZE)),
             pacing_charge: false,
             flow,
@@ -584,7 +615,7 @@ impl Connection {
             client_restart: None,
             reacted_to_version_negotiation: false,
             remote,
-            local_cid,
+            local_cid: local_cid.clone(),
             rem_cid: client_src_cid.clone(),
             initial_dcid: initial_dcid.clone(),
             spaces: [Space::new(), Space::new(), Space::new()],
@@ -629,6 +660,12 @@ impl Connection {
             client_address_validated: true,
             unvalidated_bytes_received: 0,
             unvalidated_bytes_sent: 0,
+            local_cids: vec![LocalCid { seq: 0, cid: local_cid.clone(), reset_token: None, retired: false }],
+            next_local_cid_seq: 1,
+            local_cids_requested: 0,
+            pending_new_cids: Vec::new(),
+            endpoint_events: VecDeque::new(),
+            rx_dcid: None,
             pacer: Pacer::new(MAX_DATAGRAM_SIZE, CongestionController::initial_window(MAX_DATAGRAM_SIZE)),
             pacing_charge: false,
             flow,
@@ -814,14 +851,44 @@ impl Connection {
         self.flush_pending_packets(now);
     }
 
-    /// Handle endpoint→connection event (inbound datagram).
-    pub fn handle_event(&mut self, now: Instant, ev: crate::transport::types::ConnectionEvent) {
-        self.handle_packet(now, &ev.datagram);
+    /// Handle an endpoint→connection event: an inbound datagram, or the
+    /// connection IDs the endpoint issued at this connection's request.
+    pub fn handle_event(&mut self, now: Instant, ev: ConnectionEvent) {
+        match ev {
+            ConnectionEvent::Datagram { datagram, remote: _ } => self.handle_packet(now, &datagram),
+            ConnectionEvent::LocalConnectionIds(issued) => {
+                self.local_cids_requested = self.local_cids_requested.saturating_sub(issued.len());
+                for (cid, reset_token) in issued {
+                    let seq = self.next_local_cid_seq;
+                    self.next_local_cid_seq += 1;
+                    self.local_cids.push(LocalCid { seq, cid, reset_token: Some(reset_token), retired: false });
+                    self.pending_new_cids.push(seq);
+                }
+            }
+        }
     }
 
-    /// Poll endpoint events (none for echo).
-    pub fn poll_endpoint_events(&mut self) -> Option<crate::transport::types::ConnectionEvent> {
-        None
+    /// Poll connection→endpoint events.
+    pub fn poll_endpoint_events(&mut self) -> Option<EndpointEvent> {
+        self.endpoint_events.pop_front()
+    }
+
+    /// RFC 9000 section 5.1.1: keep the peer supplied with spare connection
+    /// IDs, up to three or its active_connection_id_limit less one, asking
+    /// the endpoint for whatever is missing.
+    fn request_spare_cids(&mut self) {
+        if !self.established {
+            return;
+        }
+        let limit = self.peer_tp.as_ref().map_or(2, |t| t.active_connection_id_limit);
+        let wanted_spares = limit.saturating_sub(1).min(3) as usize;
+        let active = self.local_cids.iter().filter(|c| !c.retired).count();
+        let have_spares = active.saturating_sub(1) + self.local_cids_requested;
+        if wanted_spares > have_spares {
+            let need = wanted_spares - have_spares;
+            self.local_cids_requested += need;
+            self.endpoint_events.push_back(EndpointEvent::NeedConnectionIds(need));
+        }
     }
 
     /// Receive a decrypted-path datagram (may contain coalesced packets).
@@ -877,6 +944,7 @@ impl Connection {
         if prefix.version != self.version {
             return data.len();
         }
+        self.rx_dcid = Some(prefix.dst_cid.clone());
         let space = match prefix.packet_type {
             TYPE_INITIAL => SpaceId::Initial,
             TYPE_HANDSHAKE => SpaceId::Handshake,
@@ -1084,6 +1152,7 @@ impl Connection {
         let Some(prefix) = short_header::parse_prefix(data, cid_len) else {
             return data.len();
         };
+        self.rx_dcid = Some(prefix.dst_cid.clone());
         let keys = match self.space(SpaceId::Data).keys(self.side, self.version) {
             Some(k) => k,
             None => return data.len(),
@@ -1278,11 +1347,24 @@ impl Connection {
                 self.on_new_connection_id(seq, retire_prior_to, cid, reset_token);
             }
             Frame::RetireConnectionId { seq } => {
-                // RFC 9000 section 19.16: we have issued only the handshake
-                // connection ID (sequence 0), which the peer is still using.
-                if seq > 0 {
+                // RFC 9000 section 19.16: only an ID we issued, and not the
+                // one the frame itself arrived on.
+                if seq >= self.next_local_cid_seq {
                     self.fail_transport(PROTOCOL_VIOLATION, "RETIRE_CONNECTION_ID for an unissued sequence number");
+                    return;
                 }
+                let Some(entry) = self.local_cids.iter_mut().find(|c| c.seq == seq && !c.retired) else {
+                    return;
+                };
+                if self.rx_dcid.as_ref() == Some(&entry.cid) {
+                    self.fail_transport(PROTOCOL_VIOLATION, "RETIRE_CONNECTION_ID for the connection ID in use");
+                    return;
+                }
+                entry.retired = true;
+                let cid = entry.cid.clone();
+                self.pending_new_cids.retain(|s| *s != seq);
+                self.endpoint_events.push_back(EndpointEvent::RetireConnectionId(cid));
+                self.request_spare_cids();
             }
             Frame::PathChallenge { data } => {
                 self.pending_path_responses.push_back(data);
@@ -1587,6 +1669,7 @@ impl Connection {
         if ready || (self.side == Side::Server && self.spaces[2].secrets.is_some()) {
             self.established = true;
             self.events.push_back(Event::Connected);
+            self.request_spare_cids();
         }
     }
 
@@ -2084,6 +2167,22 @@ impl Connection {
                 self.pending_retire_cids.clear();
             }
         }
+        if !self.pending_new_cids.is_empty() {
+            let mut payload = Vec::new();
+            let mut frames = Vec::new();
+            self.pending_new_cids.sort_unstable();
+            for seq in &self.pending_new_cids {
+                let Some(entry) = self.local_cids.iter().find(|c| c.seq == *seq && !c.retired) else {
+                    continue;
+                };
+                let token = entry.reset_token.unwrap_or([0; 16]);
+                writer::new_connection_id(&mut payload, *seq, 0, &entry.cid, &token);
+                frames.push(RecoverableFrame::NewConnectionId { seq: *seq });
+            }
+            if frames.is_empty() || self.queue_packet(SpaceId::Data, payload, frames, true, true, now) {
+                self.pending_new_cids.clear();
+            }
+        }
     }
 
     /// Send due RESET_STREAM and STOP_SENDING frames (new, or lost and
@@ -2505,6 +2604,11 @@ self.version,
                 RecoverableFrame::RetireConnectionId { seq } => {
                     self.pending_retire_cids.push(*seq);
                 }
+                RecoverableFrame::NewConnectionId { seq } => {
+                    if self.local_cids.iter().any(|c| c.seq == *seq && !c.retired) {
+                        self.pending_new_cids.push(*seq);
+                    }
+                }
                 RecoverableFrame::ResetStream { id, .. } => {
                     if let Some(st) = self.streams.get_mut(id) {
                         if st.send.reset.is_some() && !st.send.reset_acked {
@@ -2568,6 +2672,11 @@ self.version,
                 }
                 RecoverableFrame::RetireConnectionId { seq } => {
                     self.pending_retire_cids.push(seq);
+                }
+                RecoverableFrame::NewConnectionId { seq } => {
+                    if self.local_cids.iter().any(|c| c.seq == seq && !c.retired) {
+                        self.pending_new_cids.push(seq);
+                    }
                 }
                 RecoverableFrame::ResetStream { id, .. } => {
                     if let Some(st) = self.streams.get_mut(&id) {
@@ -3026,7 +3135,7 @@ self.version,
     }
 
     /// Handle event without explicit now (uses Instant::now).
-    pub fn handle_event_now(&mut self, ev: crate::transport::types::ConnectionEvent) {
+    pub fn handle_event_now(&mut self, ev: ConnectionEvent) {
         self.handle_event(Instant::now(), ev);
     }
 }
@@ -5233,5 +5342,83 @@ mod tests {
     fn connections_run_cubic_by_default() {
         let conn = test_client(Instant::now());
         assert_eq!(conn.loss.congestion().algorithm(), CongestionAlgorithm::Cubic);
+    }
+
+    /// An established server whose client allows four active connection
+    /// IDs, with the endpoint's reply to its request for spare IDs applied.
+    fn server_with_spare_cids(now: Instant) -> (Connection, Vec<(ConnectionId, [u8; 16])>) {
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1]);
+        conn.spaces[1].secrets = Some(test_secrets());
+        conn.spaces[2].secrets = Some(test_secrets());
+        receive_peer_tp(&mut conn, &TransportParameters { active_connection_id_limit: 4, ..client_tp() });
+        conn.maybe_establish();
+        assert!(conn.established);
+        let issued: Vec<(ConnectionId, [u8; 16])> = (1u8..=3)
+            .map(|i| (ConnectionId::from_slice(&[i; 8]), [i; 16]))
+            .collect();
+        assert_eq!(conn.poll_endpoint_events(), Some(EndpointEvent::NeedConnectionIds(3)), "no request for spare IDs");
+        conn.handle_event(now, ConnectionEvent::LocalConnectionIds(issued.clone()));
+        (conn, issued)
+    }
+
+    fn new_cids_sent(packets: &[(Option<u8>, Vec<Frame>)]) -> Vec<(u64, u64, ConnectionId, [u8; 16])> {
+        packets
+            .iter()
+            .flat_map(|(_, fr)| fr.iter())
+            .filter_map(|f| match f {
+                Frame::NewConnectionId { seq, retire_prior_to, cid, reset_token } => Some((*seq, *retire_prior_to, cid.clone(), *reset_token)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// RFC 9000 section 5.1.1: after the handshake an endpoint issues spare
+    /// connection IDs, up to the peer's active_connection_id_limit, each
+    /// with its own sequence number and stateless reset token; a lost
+    /// NEW_CONNECTION_ID is sent again. Regression: nothing was ever
+    /// issued, so a peer could not migrate or rebind without linkability.
+    #[test]
+    fn server_issues_spare_connection_ids_after_the_handshake() {
+        let now = Instant::now();
+        let (mut conn, issued) = server_with_spare_cids(now);
+        let sent = new_cids_sent(&drain_frames(&mut conn, now));
+        let expected: Vec<(u64, u64, ConnectionId, [u8; 16])> = issued
+            .iter()
+            .enumerate()
+            .map(|(i, (cid, tok))| (i as u64 + 1, 0, cid.clone(), *tok))
+            .collect();
+        assert_eq!(sent, expected, "NEW_CONNECTION_ID frames for the three spare IDs");
+        assert_eq!(conn.poll_endpoint_events(), None, "asked again although the peer's limit is met");
+
+        // Lose the packet that carried them: they are sent again.
+        for _ in 0..3 {
+            conn.pto_ping_pending[space_index(SpaceId::Data)] = true;
+            conn.flush_pending_packets(now);
+        }
+        let largest = conn.space(SpaceId::Data).next_pn - 1;
+        drain_frames(&mut conn, now);
+        conn.handle_frame(SpaceId::Data, Frame::Ack { largest, delay: 0, ranges: vec![(largest, largest)] }, now + Duration::from_millis(20));
+        let again = new_cids_sent(&drain_frames(&mut conn, now));
+        assert_eq!(again, expected, "lost NEW_CONNECTION_ID frames not sent again");
+    }
+
+    /// RFC 9000 section 5.1.2: when the peer retires one of our IDs, the
+    /// endpoint stops routing on it and a replacement is issued; retiring
+    /// an ID we never issued is a PROTOCOL_VIOLATION.
+    #[test]
+    fn a_retired_local_connection_id_is_replaced() {
+        let now = Instant::now();
+        let (mut conn, issued) = server_with_spare_cids(now);
+        drain_frames(&mut conn, now);
+        conn.handle_frame(SpaceId::Data, Frame::RetireConnectionId { seq: 1 }, now);
+        assert_eq!(conn.poll_endpoint_events(), Some(EndpointEvent::RetireConnectionId(issued[0].0.clone())));
+        assert_eq!(conn.poll_endpoint_events(), Some(EndpointEvent::NeedConnectionIds(1)));
+        let fresh = (ConnectionId::from_slice(&[9; 8]), [9; 16]);
+        conn.handle_event(now, ConnectionEvent::LocalConnectionIds(vec![fresh.clone()]));
+        let sent = new_cids_sent(&drain_frames(&mut conn, now));
+        assert_eq!(sent, vec![(4, 0, fresh.0, fresh.1)], "replacement with the next sequence number");
+        assert_eq!(closed_with(&mut conn), None);
+        conn.handle_frame(SpaceId::Data, Frame::RetireConnectionId { seq: 9 }, now);
+        assert_eq!(closed_with(&mut conn), Some(PROTOCOL_VIOLATION));
     }
 }
