@@ -236,6 +236,13 @@ pub struct Connection {
     peer_uni_opened: u64,
     /// Streams the driver has retired that the wire is not yet done with.
     retiring: Vec<StreamId>,
+    /// Server: the client's address is validated (RFC 9000 section 8.1),
+    /// by a Retry token or by a packet protected with Handshake keys.
+    client_address_validated: bool,
+    /// Server: bytes received from, and sent to, the client's address while
+    /// it was unvalidated; sends are capped at three times the receipts.
+    unvalidated_bytes_received: u64,
+    unvalidated_bytes_sent: u64,
     /// Token for Initial (usually empty; set after Retry).
     token: Vec<u8>,
     /// Short-header CID length (peer's CID length we send to).
@@ -466,6 +473,9 @@ impl Connection {
             peer_bi_opened: 0,
             peer_uni_opened: 0,
             retiring: Vec::new(),
+            client_address_validated: true,
+            unvalidated_bytes_received: 0,
+            unvalidated_bytes_sent: 0,
             flow,
             token: Vec::new(),
             short_cid_len: initial_dcid.len(),
@@ -606,6 +616,9 @@ impl Connection {
             peer_bi_opened: 0,
             peer_uni_opened: 0,
             retiring: Vec::new(),
+            client_address_validated: true,
+            unvalidated_bytes_received: 0,
+            unvalidated_bytes_sent: 0,
             flow,
             token: Vec::new(),
             short_cid_len: 0,
@@ -630,6 +643,9 @@ impl Connection {
             last_keep_alive: now,
         };
         conn.short_cid_len = conn.rem_cid.len();
+        // RFC 9000 section 8.1: a Retry token validates the address; without
+        // one, sends are limited until a Handshake packet arrives.
+        conn.client_address_validated = conn.local_tp.retry_src_cid.is_some();
         conn.spaces[0].secrets = Some(crate::transport::packet::protection::initial_secrets(
             version,
             initial_dcid.as_slice(),
@@ -690,7 +706,7 @@ impl Connection {
             }
         }
         let loss = self.loss.loss_detection_timeout(
-            false,
+            self.at_amplification_limit(),
             self.peer_address_validated(),
             self.spaces[1].secrets.is_some(),
             self.peer_max_ack_delay(),
@@ -722,7 +738,7 @@ impl Connection {
         let loss_due = self
             .loss
             .loss_detection_timeout(
-                false,
+                self.at_amplification_limit(),
                 self.peer_address_validated(),
                 self.spaces[1].secrets.is_some(),
                 self.peer_max_ack_delay(),
@@ -799,6 +815,9 @@ impl Connection {
             return;
         }
         self.last_activity = now;
+        if self.side == Side::Server && !self.client_address_validated {
+            self.unvalidated_bytes_received += data.len() as u64;
+        }
         let mut rest = data;
         while !rest.is_empty() {
             let consumed = self.handle_one_packet(rest, now);
@@ -907,9 +926,11 @@ impl Connection {
         }
         self.on_decrypted(space, full_pn, &payload, now);
         // RFC 9001 section 4.9.1: a server discards Initial keys when it
-        // first successfully processes a Handshake packet.
+        // first successfully processes a Handshake packet, which also
+        // validates the client's address (RFC 9000 section 8.1).
         if space == SpaceId::Handshake && self.side == Side::Server {
             self.discard_space(SpaceId::Initial);
+            self.client_address_validated = true;
         }
         packet_len
     }
@@ -1569,7 +1590,7 @@ impl Connection {
         if sp.pending_ack.is_empty() || sp.received.is_empty() {
             return;
         }
-        sp.pending_ack.clear();
+        let pending = std::mem::take(&mut sp.pending_ack);
         let ranges: Vec<(u64, u64)> = sp.received.iter().rev().copied().collect();
         let largest = ranges[0].1;
         let delay_us = sp
@@ -1580,35 +1601,40 @@ impl Connection {
         writer::ack(&mut payload, delay, &ranges);
         // ACK-only: not ack-eliciting, not in flight. The marker lets an
         // acknowledgement of this packet prune the ranges it reported.
-        self.queue_packet(space, payload, vec![RecoverableFrame::Ack { largest }], false, false, now);
+        if !self.queue_packet(space, payload, vec![RecoverableFrame::Ack { largest }], false, false, now) {
+            // Withheld (amplification limit): acknowledge on the next flush.
+            self.space_mut(space).pending_ack = pending;
+        }
     }
 
     fn flush_pending_packets(&mut self, now: Instant) {
         if self.handshake_done_pending && self.spaces[2].secrets.is_some() {
-            self.handshake_done_pending = false;
             let mut payload = Vec::new();
             writer::handshake_done(&mut payload);
             // Recoverable: a lost HANDSHAKE_DONE is sent again (RFC 9000
             // section 13.3), or the client keeps its Handshake keys forever.
-            self.queue_packet(
+            // Withheld (amplification limit): still pending for next time.
+            if self.queue_packet(
                 SpaceId::Data,
                 payload,
                 vec![RecoverableFrame::HandshakeDone],
                 true,
                 true,
                 now,
-            );
-            self.handshake_done = true;
-            self.loss.set_handshake_confirmed(true);
-            self.maybe_establish();
+            ) {
+                self.handshake_done_pending = false;
+                self.handshake_done = true;
+                self.loss.set_handshake_confirmed(true);
+                self.maybe_establish();
+            }
         }
 
         if let Some(max) = self.pending_max_streams_bidi.take() {
-            if self.spaces[2].secrets.is_some() {
-                let mut payload = Vec::new();
-                writer::max_streams_bidi(&mut payload, max);
-                self.queue_packet(SpaceId::Data, payload, Vec::new(), true, true, now);
-            } else {
+            let mut payload = Vec::new();
+            writer::max_streams_bidi(&mut payload, max);
+            if self.spaces[2].secrets.is_none()
+                || !self.queue_packet(SpaceId::Data, payload, Vec::new(), true, true, now)
+            {
                 self.pending_max_streams_bidi = Some(max);
             }
         }
@@ -1619,20 +1645,22 @@ impl Connection {
             if !self.pto_ping_pending[idx] {
                 continue;
             }
-            self.pto_ping_pending[idx] = false;
             if self.space(space).secrets.is_none() {
+                self.pto_ping_pending[idx] = false;
                 continue;
             }
             let mut payload = Vec::new();
             writer::ping(&mut payload);
-            self.queue_packet(
+            if self.queue_packet(
                 space,
                 payload,
                 vec![RecoverableFrame::Ping],
                 true,
                 true,
                 now,
-            );
+            ) {
+                self.pto_ping_pending[idx] = false;
+            }
         }
 
         // CRYPTO frames (retransmits first, at stored offsets).
@@ -1657,10 +1685,16 @@ impl Connection {
                     offset,
                     data: chunk.clone(),
                 }];
-                if space == SpaceId::Initial {
-                    self.queue_packet_pad_initial(payload, frames, now);
+                let queued = if space == SpaceId::Initial {
+                    self.queue_packet_pad_initial(payload, frames, now)
                 } else {
-                    self.queue_packet(space, payload, frames, true, true, now);
+                    self.queue_packet(space, payload, frames, true, true, now)
+                };
+                if !queued {
+                    // Withheld (keys gone, or the amplification limit):
+                    // keep it for the next flush.
+                    self.space_mut(space).crypto_retransmit.push_front((offset, chunk));
+                    break;
                 }
             }
             while let Some(chunk) = {
@@ -1674,22 +1708,29 @@ impl Connection {
                 let offset = self.space(space).crypto_send_offset;
                 let mut payload = Vec::new();
                 writer::crypto(&mut payload, offset, &chunk);
-                self.space_mut(space).crypto_send_offset += chunk.len() as u64;
                 let frames = vec![RecoverableFrame::Crypto {
                     offset,
                     data: chunk.clone(),
                 }];
-                if space == SpaceId::Initial {
-                    self.queue_packet_pad_initial(payload, frames, now);
+                let queued = if space == SpaceId::Initial {
+                    self.queue_packet_pad_initial(payload, frames, now)
                 } else {
-                    self.queue_packet(space, payload, frames, true, true, now);
+                    self.queue_packet(space, payload, frames, true, true, now)
+                };
+                if !queued {
+                    self.space_mut(space).crypto_pending.push_front(chunk);
+                    break;
                 }
+                self.space_mut(space).crypto_send_offset += chunk.len() as u64;
             }
         }
 
         self.queue_flow_control_updates(now);
         self.queue_path_and_cid_frames(now);
         self.queue_stream_abort_frames(now);
+        for space in [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data] {
+            self.queue_acks(space, now);
+        }
 
         // STREAM frames on Data. Note whether the congestion window held
         // stream data back, or the loop ended for lack of data (RFC 9002
@@ -1699,6 +1740,9 @@ impl Connection {
         let ids: Vec<StreamId> = self.streams.keys().copied().collect();
         for id in ids {
             loop {
+                if !self.amplification_allows(MAX_DATAGRAM_SIZE) {
+                    break;
+                }
                 if !self.can_send_data(MAX_DATAGRAM_SIZE) {
                     window_limited |= self.streams.get(&id).is_some_and(|st| st.send.has_data());
                     break;
@@ -1806,6 +1850,23 @@ impl Connection {
     /// (RFC 9002 section 7.5).
     fn can_send_data(&self, bytes: usize) -> bool {
         self.probe_bypass || self.loss.congestion().can_send(bytes)
+    }
+
+    /// RFC 9000 section 8.1: until the client's address is validated a
+    /// server sends at most three times the bytes it has received from it.
+    /// Whether `bytes` more fit under that limit (always, once validated or
+    /// as a client).
+    fn amplification_allows(&self, bytes: usize) -> bool {
+        self.side == Side::Client
+            || self.client_address_validated
+            || self.unvalidated_bytes_sent + bytes as u64 <= 3 * self.unvalidated_bytes_received
+    }
+
+    /// Whether the server is held at the anti-amplification limit: nothing
+    /// more can leave until the client sends again, so no probe timer is
+    /// armed (RFC 9002 section 6.2.2.1).
+    fn at_amplification_limit(&self) -> bool {
+        !self.amplification_allows(1)
     }
 
     /// Raise the receive limits the application has read into (RFC 9000
@@ -2155,15 +2216,16 @@ self.version,
         payload: Vec<u8>,
         frames: Vec<RecoverableFrame>,
         now: Instant,
-    ) {
+    ) -> bool {
         // RFC 9000 section 14.1: expand the datagram to at least 1200 octets.
         // `queue_packet` knows the real header length (which varies with the
         // CID lengths, token and packet number), so let it pad exactly.
         let previous = self.gso_pad_to;
         self.gso_pad_to = Some(previous.unwrap_or(0).max(MIN_INITIAL_DATAGRAM_SIZE));
         // Padded Initial is in flight even beyond ack-eliciting frames.
-        self.queue_packet(SpaceId::Initial, payload, frames, true, true, now);
+        let queued = self.queue_packet(SpaceId::Initial, payload, frames, true, true, now);
         self.gso_pad_to = previous;
+        queued
     }
 
     /// Build and enqueue a protected packet. Returns false if congestion-blocked (Data only).
@@ -2207,6 +2269,21 @@ self.version,
         };
         let est_len = header_est + protected_len;
         if space == SpaceId::Data && in_flight && !self.can_send_data(est_len) {
+            return false;
+        }
+        // The anti-amplification limit covers every packet, so it is
+        // checked against the exact size this packet will have.
+        let exact_len = match space {
+            SpaceId::Data if use_0rtt => header_est + protected_len,
+            SpaceId::Data => 1 + self.rem_cid.len() + pn_len + protected_len,
+            SpaceId::Initial => {
+                7 + self.rem_cid.len() + self.local_cid.len()
+                    + varint::encoded_length(self.token.len() as u64) + self.token.len()
+                    + 2 + pn_len + protected_len
+            }
+            SpaceId::Handshake => 7 + self.rem_cid.len() + self.local_cid.len() + 2 + pn_len + protected_len,
+        };
+        if !self.amplification_allows(exact_len) {
             return false;
         }
         if space == SpaceId::Data && in_flight {
@@ -2268,6 +2345,9 @@ self.version,
             segment_size: None,
             src_ip: None,
         };
+        if self.side == Side::Server && !self.client_address_validated {
+            self.unvalidated_bytes_sent += tx.size as u64;
+        }
         self.transmits.push_back((tx, packet));
         // RFC 9001 section 4.9.1: a client discards Initial keys when it
         // first sends a Handshake packet.
@@ -3199,7 +3279,18 @@ mod tests {
         }
     }
 
+    /// A server whose client address counts as validated (as after a
+    /// Retry), so the anti-amplification limit does not get in the way of
+    /// tests about other things.
     fn test_server(version: QuicVersion, server_versions: &[QuicVersion]) -> Connection {
+        let mut conn = test_server_unvalidated(version, server_versions);
+        conn.client_address_validated = true;
+        conn
+    }
+
+    /// A server accepted without a Retry: the client's address is not yet
+    /// validated.
+    fn test_server_unvalidated(version: QuicVersion, server_versions: &[QuicVersion]) -> Connection {
         Connection::new_server(
             Instant::now(),
             "127.0.0.1:50000".parse().unwrap(),
@@ -4930,5 +5021,104 @@ mod tests {
         assert!(conn.spaces[0].secrets.is_none());
         conn.handle_packet(now, &initial);
         assert_ne!(conn.spaces[0].largest_received, Some(9), "an Initial was processed after the keys were discarded");
+    }
+
+    /// A server ready to send 1-RTT stream data, with an open congestion
+    /// window, and a datagram of `len` bytes from the client.
+    fn server_with_data_to_send(validated: bool, now: Instant) -> (Connection, StreamId) {
+        let mut conn = if validated {
+            test_server(QuicVersion::V1, &[QuicVersion::V1])
+        } else {
+            test_server_unvalidated(QuicVersion::V1, &[QuicVersion::V1])
+        };
+        conn.spaces[2].secrets = Some(test_secrets());
+        conn.loss.congestion_mut().set_congestion_window_for_tests(u64::MAX / 2);
+        conn.loss.set_handshake_confirmed(true);
+        conn.handshake_done = true;
+        conn.peer_max_datagram = 0;
+        let id = conn.open_bi().expect("stream");
+        conn.streams.get_mut(&id).unwrap().send.max_data = u64::MAX;
+        conn.conn_max_data = u64::MAX;
+        conn.write_stream(id, &vec![0xab; 20_000]).unwrap();
+        let _ = now;
+        (conn, id)
+    }
+
+    /// RFC 9000 section 8.1: before the client's address is validated a
+    /// server sends at most three times the bytes it has received from it.
+    /// Regression: nothing counted bytes either way, so one spoofed
+    /// 1200-byte Initial could draw an unbounded flight at its victim.
+    #[test]
+    fn an_unvalidated_server_sends_at_most_three_times_what_it_received() {
+        let now = Instant::now();
+        let (mut conn, _) = server_with_data_to_send(false, now);
+        conn.handle_packet(now, &[0u8; 1200]);
+        let first: usize = drain_lens(&mut conn, now).iter().sum();
+        assert!(first <= 3600, "{first} bytes sent after receiving 1200");
+        assert!(first > 2400, "limit not used: only {first} bytes sent");
+        // Nothing more until the client sends again, and then at once:
+        // no probe timeout is waited for.
+        assert_eq!(drain_lens(&mut conn, now).iter().sum::<usize>(), 0);
+        conn.handle_packet(now, &[0u8; 1000]);
+        let second: usize = drain_lens(&mut conn, now).iter().sum();
+        assert!(second > 0 && first + second <= 3 * 2200, "{first} + {second} after receiving 2200");
+    }
+
+    /// While the limit holds, no probe timer is armed (RFC 9002 section
+    /// 6.2.2.1); one is again once more bytes arrive.
+    #[test]
+    fn no_probe_timer_while_at_the_amplification_limit() {
+        let now = Instant::now();
+        let (mut conn, _) = server_with_data_to_send(false, now);
+        conn.handle_packet(now, &[0u8; 1200]);
+        drain_lens(&mut conn, now);
+        let blocked = conn.poll_timeout().expect("idle timeout at least");
+        assert!(blocked > now + Duration::from_secs(10), "a probe is armed while at the limit");
+        // Enough from the client for the rest to leave: no longer at the
+        // limit, data in flight, so a probe is armed again.
+        conn.handle_packet(now, &[0u8; 8000]);
+        assert!(drain_lens(&mut conn, now).iter().sum::<usize>() > 15_000);
+        let armed = conn.poll_timeout().expect("a probe");
+        assert!(armed < now + Duration::from_secs(5), "no probe armed once bytes arrived");
+    }
+
+    /// A Retry token, or a packet protected with Handshake keys, validates
+    /// the address and lifts the limit.
+    #[test]
+    fn a_retry_token_or_a_handshake_packet_lifts_the_limit() {
+        let now = Instant::now();
+        let mut conn = Connection::new_server(
+            now,
+            "127.0.0.1:50000".parse().unwrap(),
+            HandshakeConfig { role: HandshakeRole::Server, mode: HandshakeMode::Quic, ..Default::default() },
+            ConnectionId::from_slice(&[0xaa; 8]),
+            ConnectionId::from_slice(&[0xbb; 8]),
+            QuicVersion::V1,
+            &[QuicVersion::V1],
+            ConnectionId::from_slice(&[0xcc; 8]),
+            ConnectionId::from_slice(&[0xbb; 8]),
+            Some(ConnectionId::from_slice(&[0xdd; 8])),
+            None,
+            None,
+            None,
+            None,
+            None,
+            FlowControlLimits::default(),
+        );
+        conn.spaces[2].secrets = Some(test_secrets());
+        conn.loss.congestion_mut().set_congestion_window_for_tests(u64::MAX / 2);
+        let id = conn.open_bi().expect("stream");
+        conn.streams.get_mut(&id).unwrap().send.max_data = u64::MAX;
+        conn.conn_max_data = u64::MAX;
+        conn.write_stream(id, &vec![0xab; 20_000]).unwrap();
+        assert!(drain_lens(&mut conn, now).iter().sum::<usize>() > 20_000, "a Retry-validated client is limited");
+
+        let (mut conn, _) = server_with_data_to_send(false, now);
+        conn.spaces[1].secrets = Some(test_secrets());
+        let mut ping = Vec::new();
+        writer::ping(&mut ping);
+        let packet = peer_handshake_packet(&conn, 0, &ping);
+        conn.handle_packet(now, &packet);
+        assert!(drain_lens(&mut conn, now).iter().sum::<usize>() > 20_000, "a Handshake packet did not validate the address");
     }
 }
