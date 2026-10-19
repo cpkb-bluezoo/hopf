@@ -125,6 +125,12 @@ pub trait HandshakeEvents {
     /// Client offered / server selected early data (empty payload in CH/EE).
     fn early_data(&mut self) {}
 
+    /// ClientHello: the `psk_key_exchange_modes` extension (RFC 8446
+    /// section 4.2.9), with the modes it lists.
+    fn psk_key_exchange_modes(&mut self, modes: &[u8]) {
+        let _ = modes;
+    }
+
     /// ClientHello: offered PSK identity and binder.
     fn psk_identity(&mut self, identity: &[u8], obfuscated_ticket_age: u32) {
         let _ = (identity, obfuscated_ticket_age);
@@ -690,11 +696,23 @@ fn decode_extension_block(
                     }
                 }
             },
-            ext::PSK_KEY_EXCHANGE_MODES => { /* accepted; no state needed beyond presence via PSK */ }
+            ext::PSK_KEY_EXCHANGE_MODES => decode_psk_key_exchange_modes(edata, handler),
             _ => handler.extension(etype, edata),
         }
         ext_i += elen;
     }
+}
+
+/// `PskKeyExchangeMode ke_modes<1..255>`: a u8 length, then one byte per
+/// mode. The event fires for a malformed list too, with the modes that
+/// could be read, so the extension's presence is never lost.
+fn decode_psk_key_exchange_modes(data: &[u8], handler: &mut dyn HandshakeEvents) {
+    let Some((&len, modes)) = data.split_first() else {
+        handler.psk_key_exchange_modes(&[]);
+        return;
+    };
+    let end = usize::from(len).min(modes.len());
+    handler.psk_key_exchange_modes(&modes[..end]);
 }
 
 fn decode_supported_groups(data: &[u8], handler: &mut dyn HandshakeEvents) {

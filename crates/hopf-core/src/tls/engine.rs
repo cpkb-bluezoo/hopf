@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 mod ech;
 
+use super::handshake::messages::PSK_DHE_KE;
 use super::handshake::verify::{sign_certificate_verify, verify_certificate_verify};
 
 use super::handshake::{
@@ -399,6 +400,10 @@ pub struct HandshakeEngine {
     resumed: bool,
     /// Client offered early data; server may accept.
     early_data_offered: bool,
+    /// Server: the client's `psk_key_exchange_modes` listed `psk_dhe_ke`
+    /// (RFC 8446 section 4.2.9), the one mode this server resumes with. A
+    /// PSK offer is honoured, and a NewSessionTicket issued, only then.
+    peer_offers_psk_dhe_ke: bool,
     /// Server accepted early data (echoed in EE).
     early_data_accepted: bool,
     /// Resumption master secret retained until NST is minted / stored.
@@ -512,6 +517,7 @@ impl HandshakeEngine {
             psk: None,
             resumed: false,
             early_data_offered: false,
+            peer_offers_psk_dhe_ke: false,
             early_data_accepted: false,
             resumption_master: None,
             negotiated_alpn: None,
@@ -1363,9 +1369,25 @@ impl HandshakeEngine {
             Err(()) => return false,
         };
 
+        // RFC 8446 section 4.2.9: a PSK offer must say how the PSK may be
+        // used, and this server only resumes with psk_dhe_ke; an offer
+        // without that mode is ignored and the handshake runs in full.
+        if ch.psk_identity.is_some() && ch.psk_key_exchange_modes.is_none() {
+            self.fail(
+                sink,
+                AlertDescription::MissingExtension,
+                "ClientHello offers pre_shared_key without psk_key_exchange_modes (RFC 8446 section 4.2.9)",
+            );
+            return false;
+        }
+        self.peer_offers_psk_dhe_ke = ch
+            .psk_key_exchange_modes
+            .as_deref()
+            .is_some_and(|modes| modes.contains(&PSK_DHE_KE));
+
         // Try PSK resumption.
         if let (Some(identity), Some(binder), Some(ticket_keys)) = (
-            ch.psk_identity.as_ref(),
+            ch.psk_identity.as_ref().filter(|_| self.peer_offers_psk_dhe_ke),
             ch.psk_binder.as_ref(),
             self.config.ticket_key.as_ref(),
         ) {
@@ -1851,8 +1873,9 @@ impl HandshakeEngine {
         self.state = State::Complete;
         sink.handshake_complete(info, quic);
 
-        // Server: mint NewSessionTicket on 1-RTT CRYPTO after handshake_complete.
-        if self.config.role == HandshakeRole::Server {
+        // Server: mint NewSessionTicket on 1-RTT CRYPTO after handshake_complete,
+        // for a client that said it can use one (RFC 8446 section 4.2.9).
+        if self.config.role == HandshakeRole::Server && self.peer_offers_psk_dhe_ke {
             if let (Some(key), Some(rms)) = (self.config.ticket_key, self.resumption_master) {
                 let max_early = if self.config.enable_early_data {
                     if self.config.max_early_data_size == 0 {
@@ -2104,6 +2127,10 @@ impl<S: TlsEventSink> HandshakeEvents for EngineCodecBridge<'_, S> {
 
     fn early_data(&mut self) {
         self.collector.early_data();
+    }
+
+    fn psk_key_exchange_modes(&mut self, modes: &[u8]) {
+        self.collector.psk_key_exchange_modes(modes);
     }
 
     fn psk_identity(&mut self, identity: &[u8], obfuscated_ticket_age: u32) {
@@ -3585,6 +3612,147 @@ mod tests {
         );
     }
 
+
+    // ---- psk_key_exchange_modes (RFC 8446 section 4.2.9) ----
+
+    /// `hello` with its `psk_key_exchange_modes` extension carrying `modes`
+    /// (`None`: without the extension).
+    fn with_psk_modes(hello: &[u8], modes: Option<&[u8]>) -> Bytes {
+        use super::super::handshake::messages::{ext, rewrite_client_hello_extension};
+        let data = modes.map(|m| {
+            let mut d = vec![m.len() as u8];
+            d.extend_from_slice(m);
+            d
+        });
+        Bytes::from(rewrite_client_hello_extension(hello, ext::PSK_KEY_EXCHANGE_MODES, data.as_deref()))
+    }
+
+    /// RFC 8446 section 4.2.9: a ClientHello that offers `pre_shared_key`
+    /// without `psk_key_exchange_modes` is rejected with
+    /// `missing_extension`, not resumed or silently given a full handshake.
+    #[test]
+    fn server_rejects_pre_shared_key_without_psk_key_exchange_modes() {
+        use super::super::handshake::collect::parse_client_hello;
+        let store = ClientTicketStore::shared();
+        let (client_cfg, server_cfg, _key) = mint_ticket_pair(&store);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut client_sink = RecordingSink::default();
+        client.start(&mut client_sink);
+        let hello = take_outbound(&mut client_sink).remove(0);
+        assert!(
+            parse_client_hello(&hello[4..]).unwrap().psk_identity.is_some(),
+            "control: the client offers its ticket"
+        );
+
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut sink = RecordingSink::default();
+        let hello = with_psk_modes(&hello, None);
+        server.feed_handshake_data(&mut hello.as_ref(), &mut sink);
+
+        assert_eq!(sink.alerts, vec![AlertDescription::MissingExtension], "{:?}", sink.events);
+        assert!(
+            !sink.outbound.iter().any(|m| m.first() == Some(&(HandshakeType::ServerHello as u8))),
+            "no ServerHello after the rejection: {:?}",
+            sink.events
+        );
+    }
+
+    /// Plays a TLS 1.3 client by hand against a ticket-issuing TCP-mode
+    /// server, with `modes` as the ClientHello's `psk_key_exchange_modes`
+    /// (`None`: without the extension), and returns what the server sent
+    /// after the handshake completed.
+    fn post_handshake_messages_with_psk_modes(modes: Option<&[u8]>) -> Vec<Bytes> {
+        use super::super::handshake::collect::parse_server_hello;
+        use super::super::handshake::key_schedule::derive_handshake_traffic_with_psk;
+        use super::super::handshake::Transcript;
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let mut ticket_key = [0u8; 32];
+        let _ = getrandom(&mut ticket_key);
+        let mut server_cfg =
+            tcp_config(server_config_for(test_server_credentials(), KxPolicy::classical_only()), None);
+        server_cfg.ticket_key = Some(TicketKeys::single(ticket_key));
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut sink = RecordingSink::default();
+
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [3u8; 32],
+            cipher_suites: SUPPORTED_CIPHER_SUITES.to_vec(),
+            key_share: KeyShareEntry {
+                group: NamedGroup::X25519.code(),
+                share: Bytes::copy_from_slice(kp.public_key()),
+            },
+            supported_groups: vec![NamedGroup::X25519.code()],
+            alpn: vec![],
+            server_name: None,
+            transport_parameters: None,
+            early_data: false,
+            psk: None,
+            cookie: None,
+            record_size_limit: None,
+            legacy_version: 0x0303,
+            compress_certificate: false,
+            offer_tls12_fallback: false,
+            extra_key_shares: Vec::new(),
+        });
+        let hello = with_psk_modes(&hello.encode(), modes);
+        let mut transcript = Transcript::new();
+        transcript.add_message(&hello);
+        server.feed_handshake_data(&mut hello.as_ref(), &mut sink);
+        assert!(sink.alerts.is_empty(), "{:?}", sink.events);
+
+        // The server's flight: ServerHello, then everything through its
+        // Finished, each a handshake message with its 4-byte header.
+        let flight = take_outbound(&mut sink).concat();
+        let mut messages: Vec<&[u8]> = Vec::new();
+        let mut at = 0;
+        while at + 4 <= flight.len() {
+            let len = u32::from_be_bytes([0, flight[at + 1], flight[at + 2], flight[at + 3]]) as usize;
+            messages.push(&flight[at..at + 4 + len]);
+            at += 4 + len;
+        }
+        let sh = messages[0];
+        assert_eq!(sh[0], HandshakeType::ServerHello as u8, "{:?}", sink.events);
+        let parsed = parse_server_hello(&sh[4..]).expect("well-formed ServerHello");
+        let shared = kp.agree(&parsed.key_share).unwrap();
+        transcript.add_message(sh);
+        let traffic = derive_handshake_traffic_with_psk(None, &shared, &transcript.hash(), false);
+        for m in &messages[1..] {
+            transcript.add_message(m);
+        }
+        assert_eq!(messages.last().unwrap()[0], HandshakeType::Finished as u8, "{:?}", sink.events);
+
+        let verify_data = compute_finished_verify_data(&traffic.client, &transcript.hash(), false);
+        let finished = build_finished(&verify_data).encode();
+        server.feed_handshake_data(&mut finished.as_ref(), &mut sink);
+        assert!(server.is_complete(), "{:?}", sink.events);
+        take_outbound(&mut sink)
+    }
+
+    fn has_new_session_ticket(messages: &[Bytes]) -> bool {
+        messages.iter().any(|m| m.first() == Some(&(HandshakeType::NewSessionTicket as u8)))
+    }
+
+    /// RFC 8446 section 4.2.9: a server issues a NewSessionTicket only to a
+    /// client that said it can use one. This server resumes with
+    /// `psk_dhe_ke` only, so a client that offered no modes at all, or
+    /// `psk_ke` alone, gets no ticket.
+    #[test]
+    fn server_issues_no_ticket_to_a_client_that_did_not_offer_psk_dhe_ke() {
+        use super::super::handshake::messages::PSK_DHE_KE;
+        assert!(
+            has_new_session_ticket(&post_handshake_messages_with_psk_modes(Some(&[PSK_DHE_KE]))),
+            "control: a client offering psk_dhe_ke gets a ticket"
+        );
+        assert!(
+            !has_new_session_ticket(&post_handshake_messages_with_psk_modes(None)),
+            "no psk_key_exchange_modes: no ticket"
+        );
+        assert!(
+            !has_new_session_ticket(&post_handshake_messages_with_psk_modes(Some(&[0]))),
+            "psk_ke only: no ticket"
+        );
+    }
 
     // ---- record_size_limit (RFC 8449) ----
 

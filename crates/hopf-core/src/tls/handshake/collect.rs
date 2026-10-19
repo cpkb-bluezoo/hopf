@@ -45,6 +45,10 @@ pub struct ParsedClientHello {
     pub transport_parameters: Option<Bytes>,
     /// Client offered early data.
     pub early_data: bool,
+    /// Modes from the client's `psk_key_exchange_modes` extension (RFC
+    /// 8446 section 4.2.9). `None` when the extension is absent, which a
+    /// `pre_shared_key` offer must not be.
+    pub psk_key_exchange_modes: Option<Vec<u8>>,
     /// First offered PSK identity (opaque ticket).
     pub psk_identity: Option<Bytes>,
     /// Obfuscated ticket age for the first PSK identity (RFC 8446 §4.2.11).
@@ -203,6 +207,12 @@ impl HandshakeEvents for ClientHelloCollector {
             }
         } else if ext_type == super::messages::ext::ENCRYPTED_CLIENT_HELLO {
             self.out.ech = Some(Bytes::copy_from_slice(data));
+        }
+    }
+
+    fn psk_key_exchange_modes(&mut self, modes: &[u8]) {
+        if self.out.psk_key_exchange_modes.is_none() {
+            self.out.psk_key_exchange_modes = Some(modes.to_vec());
         }
     }
 
@@ -768,6 +778,12 @@ impl HandshakeEvents for MessageCollector {
             Self::ClientHello(c) => c.early_data(),
             Self::EncryptedExtensions(c) => c.early_data(),
             _ => {}
+        }
+    }
+
+    fn psk_key_exchange_modes(&mut self, modes: &[u8]) {
+        if let Self::ClientHello(c) = self {
+            c.psk_key_exchange_modes(modes);
         }
     }
 

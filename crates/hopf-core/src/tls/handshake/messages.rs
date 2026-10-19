@@ -814,6 +814,47 @@ pub(crate) fn rewrite_client_hello_sig_algs_cert(hello: &[u8], schemes: &[u16]) 
     body
 }
 
+/// Test helper: rewrite one extension of a TCP-framed `ClientHello`
+/// handshake message, fixing up the handshake and extensions-block
+/// lengths. `data` of `None` removes the extension; `Some` replaces its
+/// `extension_data` (or appends the extension when it was absent). Lets an
+/// engine test play a client that offers an extension this crate's own
+/// builder always writes one way.
+#[cfg(test)]
+pub(crate) fn rewrite_client_hello_extension(hello: &[u8], ext_type: u16, data: Option<&[u8]>) -> Vec<u8> {
+    let mut i = 4 + 2 + 32; // handshake header, legacy_version, random
+    i += 1 + hello[i] as usize; // session id
+    i += 2 + u16::from_be_bytes([hello[i], hello[i + 1]]) as usize; // cipher suites
+    i += 1 + hello[i] as usize; // compression methods
+    let ext_len_at = i;
+    let ext_end = i + 2 + u16::from_be_bytes([hello[i], hello[i + 1]]) as usize;
+    i += 2;
+    let mut body = hello[..ext_len_at].to_vec();
+    let mut exts = BytesMut::new();
+    let mut found = false;
+    while i < ext_end {
+        let et = u16::from_be_bytes([hello[i], hello[i + 1]]);
+        let el = u16::from_be_bytes([hello[i + 2], hello[i + 3]]) as usize;
+        if et == ext_type {
+            found = true;
+            if let Some(d) = data {
+                push_extension(&mut exts, et, d);
+            }
+        } else {
+            exts.extend_from_slice(&hello[i..i + 4 + el]);
+        }
+        i += 4 + el;
+    }
+    if let (false, Some(d)) = (found, data) {
+        push_extension(&mut exts, ext_type, d);
+    }
+    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts);
+    let len = body.len() - 4;
+    body[1..4].copy_from_slice(&(len as u32).to_be_bytes()[1..]);
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,6 +1002,43 @@ mod tests {
             k += l;
         }
         None
+    }
+
+    /// The server reads the modes a client offers (RFC 8446 section 4.2.9),
+    /// and tells an absent extension from one listing no usable mode.
+    #[test]
+    fn parsed_client_hello_carries_psk_key_exchange_modes() {
+        use crate::crypto::kx::{EphemeralKeyPair, NamedGroup};
+        let kp = EphemeralKeyPair::generate().unwrap();
+        let hello = build_client_hello(&ClientHelloParams {
+            random: [7u8; 32],
+            cipher_suites: vec![0x1301],
+            key_share: KeyShareEntry {
+                group: NamedGroup::X25519.code(),
+                share: Bytes::copy_from_slice(kp.public_key()),
+            },
+            supported_groups: vec![NamedGroup::X25519.code()],
+            alpn: vec![],
+            server_name: None,
+            transport_parameters: None,
+            early_data: false,
+            psk: None,
+            cookie: None,
+            record_size_limit: None,
+            legacy_version: 0x0303,
+            compress_certificate: false,
+            offer_tls12_fallback: false,
+            extra_key_shares: Vec::new(),
+        })
+        .encode();
+        let parsed = parse_client_hello(&hello[4..]).unwrap();
+        assert_eq!(parsed.psk_key_exchange_modes, Some(vec![PSK_DHE_KE]));
+
+        let without = rewrite_client_hello_extension(&hello, ext::PSK_KEY_EXCHANGE_MODES, None);
+        assert_eq!(parse_client_hello(&without[4..]).unwrap().psk_key_exchange_modes, None);
+
+        let psk_ke_only = rewrite_client_hello_extension(&hello, ext::PSK_KEY_EXCHANGE_MODES, Some(&[1, 0]));
+        assert_eq!(parse_client_hello(&psk_ke_only[4..]).unwrap().psk_key_exchange_modes, Some(vec![0]));
     }
 
     /// `psk_key_exchange_modes` is offered on every ClientHello, not only
