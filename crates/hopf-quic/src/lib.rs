@@ -22,6 +22,7 @@ mod udp;
 pub use crypto::{
     hopf_client_config, hopf_server_config, HopfHandshakeData, HopfQuicTlsConfig, HopfTlsBuildParams,
 };
+pub use transport::recovery::CongestionAlgorithm;
 pub use config::{
     apply_client_transport_options, apply_listen_hardening, apply_server_quic_lb,
     apply_server_transport_options,

@@ -22,7 +22,7 @@ use crate::transport::packet::version_negotiation;
 use crate::transport::version::{self, QuicVersion};
 use crate::transport::packet::transport_params::VersionInformation;
 use crate::transport::packet::TransportParameters;
-use crate::transport::recovery::{CongestionController, LossDetector, Pacer, RecoverableFrame};
+use crate::transport::recovery::{CongestionAlgorithm, CongestionController, LossDetector, Pacer, RecoverableFrame};
 use crate::transport::stream::{RecvStream, SendStream, StreamReassembler};
 use crate::transport::tls_bridge::{self, OutboundCrypto, TlsBridge, TlsBridgeEvents};
 use crate::transport::types::{
@@ -146,6 +146,7 @@ struct ClientRestart {
     initial_max_streams_uni: Option<u64>,
     keep_alive_interval: Option<Duration>,
     flow: FlowControlLimits,
+    congestion: CongestionAlgorithm,
 }
 
 /// In-tree QUIC connection.
@@ -383,6 +384,7 @@ impl Connection {
         initial_max_streams_uni: Option<u64>,
         keep_alive_interval: Option<Duration>,
         flow: FlowControlLimits,
+        congestion: CongestionAlgorithm,
     ) -> Self {
         let restart = ClientRestart {
             server_name: server_name.to_string(),
@@ -393,6 +395,7 @@ impl Connection {
             initial_max_streams_uni,
             keep_alive_interval,
             flow: flow.clone(),
+            congestion,
         };
         // RFC 9369 section 4 / RFC 9368: send version_information. Only the
         // chosen version is listed as available, which disables compatible
@@ -493,7 +496,7 @@ impl Connection {
             datagram_rx: VecDeque::new(),
             datagram_tx: VecDeque::new(),
             peer_max_datagram: 0,
-            loss: LossDetector::new(MAX_DATAGRAM_SIZE),
+            loss: LossDetector::with_algorithm(MAX_DATAGRAM_SIZE, congestion),
             pto_ping_pending: [false; 3],
             probe_bypass: false,
             gso_pad_to: None,
@@ -538,6 +541,7 @@ impl Connection {
         initial_max_streams_uni: Option<u64>,
         keep_alive_interval: Option<Duration>,
         flow: FlowControlLimits,
+        congestion: CongestionAlgorithm,
     ) -> Self {
         // RFC 9368 section 3: the server's Available Versions are its
         // deployment's versions; the Chosen Version is the one in use.
@@ -638,7 +642,7 @@ impl Connection {
             datagram_rx: VecDeque::new(),
             datagram_tx: VecDeque::new(),
             peer_max_datagram: 0,
-            loss: LossDetector::new(MAX_DATAGRAM_SIZE),
+            loss: LossDetector::with_algorithm(MAX_DATAGRAM_SIZE, congestion),
             pto_ping_pending: [false; 3],
             probe_bypass: false,
             gso_pad_to: None,
@@ -1007,6 +1011,7 @@ impl Connection {
             ctx.initial_max_streams_uni,
             ctx.keep_alive_interval,
             ctx.flow,
+            ctx.congestion,
         );
         fresh.reacted_to_version_negotiation = true;
         *self = fresh;
@@ -3235,6 +3240,7 @@ mod tests {
             None,
             None,
             FlowControlLimits::default(),
+            CongestionAlgorithm::default(),
         );
         // Drop handshake CRYPTO so flush only sees our Data packets.
         for sp in &mut conn.spaces {
@@ -3302,6 +3308,7 @@ mod tests {
                     None,
                     None,
                     FlowControlLimits::default(),
+                    CongestionAlgorithm::default(),
                 );
                 let mut buf = Vec::new();
                 conn.poll_transmit(Instant::now(), &mut buf).expect("a first flight");
@@ -3344,6 +3351,7 @@ mod tests {
             None,
             None,
             FlowControlLimits::default(),
+            CongestionAlgorithm::default(),
         )
     }
 
@@ -3491,6 +3499,7 @@ mod tests {
             None,
             None,
             FlowControlLimits::default(),
+            CongestionAlgorithm::default(),
         );
         assert_eq!(v2_client.local_tp.version_information, Some(VersionInformation { chosen: V2, available: vec![V2] }));
         let _ = &mut v2_client;
@@ -3890,6 +3899,7 @@ mod tests {
             None,
             None,
             FlowControlLimits::default(),
+            CongestionAlgorithm::default(),
         );
         let first = drain_frames(&mut conn, now);
         assert!(carries(&first, |f| matches!(f, Frame::Crypto { .. })), "first flight");
@@ -4434,6 +4444,7 @@ mod tests {
             None,
             None,
             flow,
+            CongestionAlgorithm::default(),
         );
         assert_eq!(conn.local_tp.initial_max_data, 65_536);
         assert_eq!(conn.local_tp.initial_max_stream_data_bidi_local, 8192);
@@ -5136,6 +5147,7 @@ mod tests {
             None,
             None,
             FlowControlLimits::default(),
+            CongestionAlgorithm::default(),
         );
         conn.spaces[2].secrets = Some(test_secrets());
         conn.loss.congestion_mut().set_congestion_window_for_tests(u64::MAX / 2);
@@ -5214,5 +5226,12 @@ mod tests {
         let later = t0 + Duration::from_secs(3);
         conn.handle_timeout(later);
         assert!(!drain_frames(&mut conn, later).is_empty(), "probe held back by the pacer");
+    }
+
+    /// A connection runs CUBIC unless told otherwise.
+    #[test]
+    fn connections_run_cubic_by_default() {
+        let conn = test_client(Instant::now());
+        assert_eq!(conn.loss.congestion().algorithm(), CongestionAlgorithm::Cubic);
     }
 }

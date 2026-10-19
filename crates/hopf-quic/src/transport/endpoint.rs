@@ -17,6 +17,7 @@ use crate::transport::packet::retry;
 use crate::transport::packet::version_negotiation as vn;
 use crate::transport::version::QuicVersion;
 use crate::transport::quic_lb::{ConnectionIdGenerator, RandomConnectionIdGenerator};
+use crate::transport::recovery::CongestionAlgorithm;
 use crate::transport::types::{
     ConnectionEvent, ConnectionHandle, ConnectionId, DatagramEvent, EndpointConfig, Incoming,
     FlowControlLimits, Transmit,
@@ -45,6 +46,8 @@ pub struct ServerConfig {
     pub keep_alive_interval: Option<Duration>,
     /// Receive windows and send buffer cap.
     pub flow: FlowControlLimits,
+    /// Congestion control algorithm (CUBIC by default).
+    pub congestion: CongestionAlgorithm,
     /// Where server-issued connection IDs come from. `None` = 8 random
     /// octets; set it to issue QUIC-LB IDs (see [`crate::transport::quic_lb`]).
     pub cid_generator: Option<Arc<dyn ConnectionIdGenerator>>,
@@ -67,6 +70,7 @@ impl ServerConfig {
             initial_max_streams_uni: None,
             keep_alive_interval: None,
             flow: FlowControlLimits::default(),
+            congestion: CongestionAlgorithm::default(),
             cid_generator: None,
             versions: QuicVersion::ALL.to_vec(),
         }
@@ -96,6 +100,8 @@ pub struct ClientConfig {
     pub keep_alive_interval: Option<Duration>,
     /// Receive windows and send buffer cap.
     pub flow: FlowControlLimits,
+    /// Congestion control algorithm (CUBIC by default).
+    pub congestion: CongestionAlgorithm,
 }
 
 impl ClientConfig {
@@ -111,6 +117,7 @@ impl ClientConfig {
             initial_max_streams_uni: None,
             keep_alive_interval: None,
             flow: FlowControlLimits::default(),
+            congestion: CongestionAlgorithm::default(),
         }
     }
 }
@@ -199,6 +206,7 @@ impl Endpoint {
             config.initial_max_streams_uni,
             config.keep_alive_interval,
             config.flow.clone(),
+            config.congestion,
         );
         let handle = self.alloc_handle();
         self.cids.insert(local_cid, handle);
@@ -396,6 +404,7 @@ impl Endpoint {
             server.initial_max_streams_uni,
             server.keep_alive_interval,
             server.flow.clone(),
+            server.congestion,
         );
         let handle = self.alloc_handle();
         self.cids.insert(local_cid, handle);

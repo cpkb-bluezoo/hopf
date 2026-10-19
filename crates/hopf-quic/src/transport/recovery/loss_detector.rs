@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::transport::types::{SpaceId, StreamId};
 
-use super::congestion::CongestionController;
+use super::congestion::{CongestionAlgorithm, CongestionController};
 use super::rtt::RttEstimator;
 use super::sent_packet::{RecoverableFrame, SentPacket};
 
@@ -80,12 +80,17 @@ pub struct LossDetector {
 }
 
 impl LossDetector {
-    /// Create a loss detector.
+    /// Create a loss detector running NewReno.
     pub fn new(max_datagram_size: usize) -> Self {
+        Self::with_algorithm(max_datagram_size, CongestionAlgorithm::NewReno)
+    }
+
+    /// Create a loss detector running `algorithm`.
+    pub fn with_algorithm(max_datagram_size: usize, algorithm: CongestionAlgorithm) -> Self {
         Self {
             spaces: [SpaceState::new(), SpaceState::new(), SpaceState::new()],
             rtt: RttEstimator::new(),
-            congestion: CongestionController::new(max_datagram_size),
+            congestion: CongestionController::with_algorithm(max_datagram_size, algorithm),
             pto_count: 0,
             handshake_confirmed: false,
             first_rtt_sample: None,
@@ -195,6 +200,7 @@ impl LossDetector {
             let sample = now.saturating_duration_since(largest_newly_acked.time_sent);
             self.rtt
                 .on_rtt_sample(sample, ack_delay, max_ack_delay, self.handshake_confirmed);
+            self.congestion.on_rtt_sample(self.rtt.latest_rtt());
             if self.first_rtt_sample.is_none() {
                 self.first_rtt_sample = Some(now);
             }
@@ -205,8 +211,13 @@ impl LossDetector {
 
         for acked in &newly_acked {
             if acked.in_flight {
-                self.congestion
-                    .on_packet_acked(acked.time_sent, acked.sent_bytes, self.app_limited);
+                self.congestion.on_packet_acked(
+                    acked.time_sent,
+                    acked.sent_bytes,
+                    self.app_limited,
+                    now,
+                    self.rtt.smoothed_rtt(),
+                );
             }
         }
 

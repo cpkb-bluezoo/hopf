@@ -15,6 +15,7 @@ use hopf_core::pem::{parse_certs, parse_pkcs8_keys};
 use hopf_core::tls::{HandshakeConfig, HandshakeMode, HandshakeRole, ServerCredentials};
 use hopf_core::HandlerFactory;
 
+use crate::transport::recovery::CongestionAlgorithm;
 use crate::crypto::{hopf_client_config, hopf_server_config, HopfTlsBuildParams};
 use crate::hooks::ConnectionFactory;
 use crate::transport::endpoint::{ClientConfig as TransportClientConfig, ServerConfig as TransportServerConfig};
@@ -724,6 +725,7 @@ pub struct QuicTransportOptions {
     stream_receive_window_ceiling: Option<u32>,
     receive_window_ceiling: Option<u32>,
     send_window: Option<u64>,
+    congestion_control: Option<CongestionAlgorithm>,
     max_concurrent_bidi_streams: Option<u32>,
     max_concurrent_uni_streams: Option<u32>,
     datagram_receive_buffer_size: Option<Option<usize>>,
@@ -784,6 +786,13 @@ impl QuicTransportOptions {
     /// retried as data leaves.
     pub fn send_window(mut self, value: u64) -> Self {
         self.send_window = Some(value);
+        self
+    }
+
+    /// Congestion control algorithm: CUBIC (RFC 9438, the default) or
+    /// NewReno (RFC 9002). Both run HyStart++ (RFC 9406) in slow start.
+    pub fn congestion_control(mut self, value: CongestionAlgorithm) -> Self {
+        self.congestion_control = Some(value);
         self
     }
 
@@ -864,6 +873,9 @@ pub fn apply_server_transport_options(
     if let Some(d) = options.keep_alive_interval {
         cfg.inner.keep_alive_interval = Some(d);
     }
+    if let Some(a) = options.congestion_control {
+        cfg.inner.congestion = a;
+    }
     apply_flow_control_options(&mut cfg.inner.flow, options)
 }
 
@@ -887,6 +899,9 @@ pub fn apply_client_transport_options(
     }
     if let Some(d) = options.keep_alive_interval {
         cfg.inner.keep_alive_interval = Some(d);
+    }
+    if let Some(a) = options.congestion_control {
+        cfg.inner.congestion = a;
     }
     apply_flow_control_options(&mut cfg.inner.flow, options)
 }
@@ -941,6 +956,20 @@ mod tests {
 
         let bad = QuicTransportOptions::new().receive_window(1 << 20).receive_window_ceiling(1 << 16);
         assert!(apply_server_transport_options(&mut server, &bad).is_err());
+    }
+
+    /// CUBIC is the default; NewReno is selectable; an unknown name is
+    /// rejected rather than ignored.
+    #[test]
+    fn congestion_control_is_selectable() {
+        let (mut server, _) = server_config_self_signed(&["localhost"], &[ALPN_H3]).unwrap();
+        assert_eq!(server.inner.congestion, CongestionAlgorithm::Cubic);
+        let opts = QuicTransportOptions::new().congestion_control(CongestionAlgorithm::NewReno);
+        apply_server_transport_options(&mut server, &opts).unwrap();
+        assert_eq!(server.inner.congestion, CongestionAlgorithm::NewReno);
+        assert_eq!("cubic".parse::<CongestionAlgorithm>(), Ok(CongestionAlgorithm::Cubic));
+        assert_eq!("NewReno".parse::<CongestionAlgorithm>(), Ok(CongestionAlgorithm::NewReno));
+        assert!("vegas".parse::<CongestionAlgorithm>().is_err());
     }
 
     #[test]
