@@ -142,16 +142,11 @@ pub trait ClientWriter {
     /// thread — the client-side counterpart of
     /// [`ServerWriter::conn_handle`](super::ServerWriter::conn_handle).
     ///
-    /// The one case this actually matters for is a [`ClientWriter::upgrade`]
-    /// handler that needs to wake the connection later from off-thread (e.g.
-    /// an app thread queuing an outbound datagram) so
-    /// [`ProtocolUpgradeHandler::take_outbound`] gets called promptly
-    /// instead of only on the connection's next unrelated event — call this
-    /// from [`ClientHandler::switching_protocols`] and hold onto the result,
-    /// the same place [`Self::upgrade`] itself is called from. Not
-    /// meaningful outside that path: a plain request never needs it, since
-    /// [`ClientHandler`]'s callbacks already run on the connection's own
-    /// thread.
+    /// Wakes the connection from off-thread work: an upgrade handler that
+    /// queues outbound datagrams (call from [`ClientHandler::switching_protocols`]),
+    /// or a layered client such as gRPC that schedules a local call deadline
+    /// when the request starts. Plain requests that finish entirely inside
+    /// [`ClientHandler`] callbacks do not need it.
     fn conn_handle(&self) -> ConnHandle;
 
     /// A handle to write more of this request later, from any thread: the

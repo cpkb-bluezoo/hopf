@@ -2,17 +2,23 @@
 
 //! Unary gRPC client helpers (pre-framed request body + response decode).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use hopf_core::TimerHandle;
 use hopf_http::{ClientHandler, ClientHandlerFactory, ClientWriter, ContentCoding, Headers};
 use rjsonparser::Parser as JsonParser;
 use rprotobuf::Parser as ProtoParser;
 
 use crate::codec::{parse_grpc_content_type, GrpcCodec};
+use crate::call_options::GrpcCallOptions;
 use crate::compression::{
     accept_encoding_header, compress, MessageAccum, MessageCoding, DEFAULT_ENCODINGS,
-    GRPC_STATUS_INTERNAL,
+    GRPC_STATUS_DEADLINE_EXCEEDED, GRPC_STATUS_INTERNAL,
 };
+use crate::metadata::GrpcMetadata;
+use crate::timeout::format as format_grpc_timeout;
 use crate::framing::{frame, frame_compressed, GrpcFrameParser};
 use crate::proto::{
     JsonModelAdapter, ProtoFile, ProtoMessageHandler, ProtoModelAdapter,
@@ -33,6 +39,12 @@ pub trait GrpcResponseHandler: Send {
     /// not be decoded (`INTERNAL`) or was too large (`RESOURCE_EXHAUSTED`).
     /// Fires exactly once per call. Default: ignore.
     fn on_complete(&mut self, _status: i32, _message: &str) {}
+
+    /// Initial response metadata (before the body). Default: ignore.
+    fn on_initial_metadata(&mut self, _metadata: &GrpcMetadata) {}
+
+    /// Trailing metadata (with the final status). Default: ignore.
+    fn on_trailing_metadata(&mut self, _metadata: &GrpcMetadata) {}
 }
 
 /// Handle to the request side of a streaming call: messages are sent as
@@ -137,6 +149,7 @@ pub struct GrpcUnaryCall {
     encodings: Vec<ContentCoding>,
     compression: Option<ContentCoding>,
     handler: Arc<Mutex<Box<dyn GrpcResponseHandler>>>,
+    options: GrpcCallOptions,
 }
 
 impl GrpcUnaryCall {
@@ -163,7 +176,14 @@ impl GrpcUnaryCall {
             encodings: DEFAULT_ENCODINGS.to_vec(),
             compression: None,
             handler: Arc::new(Mutex::new(handler)),
+            options: GrpcCallOptions::new(),
         }
+    }
+
+    /// Per-call metadata and deadline.
+    pub fn with_options(mut self, options: GrpcCallOptions) -> Self {
+        self.options = options;
+        self
     }
 
     /// Compress the request message with this algorithm; see
@@ -226,6 +246,13 @@ impl GrpcUnaryCall {
             failed: false,
             completed: false,
             grpc_status: None,
+            options: self.options.clone(),
+            header_metadata: GrpcMetadata::new(),
+            trailer_metadata: GrpcMetadata::new(),
+            initial_delivered: false,
+            response_body_started: false,
+            deadline_timer: None,
+            finished: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -259,23 +286,71 @@ struct GrpcClientHandler {
     failed: bool,
     completed: bool,
     grpc_status: Option<(i32, String)>,
+    options: GrpcCallOptions,
+    header_metadata: GrpcMetadata,
+    trailer_metadata: GrpcMetadata,
+    initial_delivered: bool,
+    response_body_started: bool,
+    deadline_timer: Option<TimerHandle>,
+    finished: Arc<AtomicBool>,
 }
 
 impl GrpcClientHandler {
     /// The call is over: tell the handler, once.
     fn complete(&mut self, status: i32, message: &str) {
-        if self.completed {
+        if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.stop_deadline();
         self.completed = true;
         self.handler.lock().unwrap().on_complete(status, message);
+    }
+
+    fn stop_deadline(&mut self) {
+        if let Some(timer) = self.deadline_timer.take() {
+            timer.cancel();
+        }
+    }
+
+    fn deliver_initial_metadata(&mut self) {
+        if self.initial_delivered || self.failed {
+            return;
+        }
+        self.initial_delivered = true;
+        let md = self.header_metadata.clone();
+        self.handler.lock().unwrap().on_initial_metadata(&md);
+    }
+
+    fn deliver_trailing_metadata(&mut self) {
+        if self.failed {
+            return;
+        }
+        let md = if self.initial_delivered {
+            self.trailer_metadata.clone()
+        } else {
+            self.header_metadata.clone()
+        };
+        self.handler.lock().unwrap().on_trailing_metadata(&md);
+    }
+
+    fn ingest_response_header(&mut self, name: &str, value: &str, trailers: bool) {
+        let key = name.to_ascii_lowercase();
+        if GrpcMetadata::is_reserved(&key) || key == "grpc-status" || key == "grpc-message" {
+            return;
+        }
+        let target = if trailers || self.response_body_started {
+            &mut self.trailer_metadata
+        } else {
+            &mut self.header_metadata
+        };
+        target.add_received(&key, value);
     }
 
     /// Fails the call from this side with `status`: `on_error`, then
     /// `on_complete`, and the stream is cancelled so the server stops
     /// sending.
     fn fail_with(&mut self, status: i32, msg: &str) {
-        if self.failed {
+        if self.failed || self.finished.load(Ordering::Acquire) {
             return;
         }
         self.failed = true;
@@ -368,10 +443,41 @@ impl ClientHandler for GrpcClientHandler {
         if let Some(coding) = self.compression {
             h.set("grpc-encoding", coding.token());
         }
+        self.options.metadata().apply_to(&mut h);
+        if let Some(nanos) = self.options.remaining_nanos() {
+            h.set("grpc-timeout", format_grpc_timeout(nanos));
+            let mut millis = nanos / 1_000_000;
+            if nanos % 1_000_000 != 0 {
+                millis += 1;
+            }
+            let conn = request.conn_handle();
+            let handle = request.request_handle();
+            self.request = Some(handle.clone());
+            let finished = Arc::clone(&self.finished);
+            self.deadline_timer = Some(conn.schedule_timer(
+                Duration::from_millis(millis),
+                {
+                    let req = handle.clone();
+                    let handler = Arc::clone(&self.handler);
+                    Box::new(move || {
+                        if finished.swap(true, Ordering::AcqRel) {
+                            return;
+                        }
+                        req.execute(|w| w.cancel());
+                        let mut h = handler.lock().unwrap();
+                        h.on_error("Deadline exceeded");
+                        h.on_grpc_status(GRPC_STATUS_DEADLINE_EXCEEDED, "Deadline exceeded");
+                        h.on_complete(GRPC_STATUS_DEADLINE_EXCEEDED, "Deadline exceeded");
+                    })
+                },
+            ));
+        } else {
+            let handle = request.request_handle();
+            self.request = Some(handle.clone());
+        }
         request.headers(h);
         request.start_request_body();
-        let handle = request.request_handle();
-        self.request = Some(handle.clone());
+        let handle = self.request.as_ref().unwrap().clone();
         match &self.call {
             None => {
                 request.request_body_content(&self.framed);
@@ -390,11 +496,16 @@ impl ClientHandler for GrpcClientHandler {
     }
 
     fn response_headers(&mut self, _request: &mut dyn ClientWriter, headers: &Headers) {
+        for field in headers.iter() {
+            self.ingest_response_header(&field.name, &field.value, false);
+        }
         if let Some(status) = headers.get("grpc-status") {
             let code = status.parse().unwrap_or(GRPC_STATUS_UNKNOWN);
             let msg = headers.get("grpc-message").unwrap_or("").to_string();
             self.grpc_status = Some((code, msg.clone()));
             self.handler.lock().unwrap().on_grpc_status(code, &msg);
+        } else {
+            self.deliver_initial_metadata();
         }
         // Prefer response Content-Type when present; otherwise use the request codec.
         self.codec = headers
@@ -411,6 +522,10 @@ impl ClientHandler for GrpcClientHandler {
     fn response_body_content(&mut self, _request: &mut dyn ClientWriter, mut data: &[u8]) {
         if self.failed || data.is_empty() {
             return;
+        }
+        if !self.response_body_started {
+            self.deliver_initial_metadata();
+            self.response_body_started = true;
         }
         // One frame at a time, each decoded into its own message handler.
         while !data.is_empty() {
@@ -447,6 +562,10 @@ impl ClientHandler for GrpcClientHandler {
             // not be reported as its outcome
             return;
         }
+        for field in headers.iter() {
+            self.ingest_response_header(&field.name, &field.value, true);
+        }
+        self.deliver_trailing_metadata();
         if let Some(status) = headers.get("grpc-status") {
             let code = status.parse().unwrap_or(GRPC_STATUS_UNKNOWN);
             let msg = headers.get("grpc-message").unwrap_or("").to_string();
@@ -471,6 +590,7 @@ impl ClientHandler for GrpcClientHandler {
         if self.failed || self.completed {
             return;
         }
+        self.deliver_trailing_metadata();
         // A trailers-only response carried the status in its headers; a
         // response with neither is not a gRPC outcome at all.
         match self.grpc_status.clone() {
@@ -562,9 +682,21 @@ impl GrpcClient {
         request_message: Vec<u8>,
         handler: Box<dyn GrpcResponseHandler>,
     ) -> GrpcUnaryCall {
+        self.unary_call_with_options(path, request_message, handler, GrpcCallOptions::new())
+    }
+
+    /// Like [`Self::unary_call`] with metadata and an optional deadline.
+    pub fn unary_call_with_options(
+        &self,
+        path: impl Into<String>,
+        request_message: Vec<u8>,
+        handler: Box<dyn GrpcResponseHandler>,
+        options: GrpcCallOptions,
+    ) -> GrpcUnaryCall {
         GrpcUnaryCall::new(Arc::clone(&self.proto_file), path, request_message, handler)
             .with_encodings(&self.encodings)
             .with_compression(self.compression)
+            .with_options(options)
     }
 
     /// Build a [`ClientHandlerFactory`] for a streaming RPC (any
@@ -601,8 +733,9 @@ impl GrpcClient {
 mod tests {
     use super::*;
     use crate::proto::{ProtoFileParser, ProtoParseError, ScalarValue};
-    use hopf_core::ConnHandle;
+    use hopf_core::{ConnHandle, ConnHandleBackend, TimerHandle};
     use hopf_http::HttpVersion;
+    use std::time::Duration;
 
     const TEST_PROTO: &str = r#"
         syntax = "proto3";
@@ -671,13 +804,48 @@ mod tests {
         cancelled: bool,
     }
 
+    struct SyncTimerBackend;
+
+    impl ConnHandleBackend for SyncTimerBackend {
+        fn with_endpoint(&self, _task: hopf_core::EndpointTask) {}
+        fn execute(&self, task: hopf_core::Task) {
+            task();
+        }
+        fn is_probably_open(&self) -> bool {
+            true
+        }
+        fn schedule_timer(&self, delay: Duration, callback: hopf_core::Task) -> TimerHandle {
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                callback();
+            });
+            TimerHandle::from_cancel(|| {})
+        }
+    }
+
     /// Records what the client handler sent.
-    #[derive(Default)]
     struct MockRequest {
         sent: Arc<Mutex<Sent>>,
+        conn: ConnHandle,
+    }
+
+    impl Default for MockRequest {
+        fn default() -> Self {
+            Self {
+                sent: Arc::new(Mutex::new(Sent::default())),
+                conn: ConnHandle::from_execute(Arc::new(|task| task())),
+            }
+        }
     }
 
     impl MockRequest {
+        fn with_sent(sent: Arc<Mutex<Sent>>) -> Self {
+            Self {
+                sent,
+                conn: ConnHandle::from_execute(Arc::new(|task| task())),
+            }
+        }
+
         fn headers(&self) -> Option<Headers> {
             self.sent.lock().unwrap().headers.clone()
         }
@@ -707,14 +875,14 @@ mod tests {
             HttpVersion::Http2
         }
         fn conn_handle(&self) -> ConnHandle {
-            ConnHandle::from_execute(Arc::new(|task| task()))
+            self.conn.clone()
         }
         fn request_handle(&self) -> hopf_http::ClientRequestHandle {
             let sent = Arc::clone(&self.sent);
             hopf_http::ClientRequestHandle::from_runner(
                 self.conn_handle(),
                 Arc::new(move |task: hopf_http::ClientWriterTask| {
-                    let mut w = MockRequest { sent: Arc::clone(&sent) };
+                    let mut w = MockRequest::with_sent(Arc::clone(&sent));
                     task(&mut w);
                 }),
             )
@@ -870,6 +1038,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn client_deadline_cancels_when_server_is_silent() {
+        let events = Events::default();
+        let opts = GrpcCallOptions::new().timeout(Duration::from_millis(5));
+        let call = client()
+            .unary_call(
+                "/test.TestSvc/Call",
+                vec![],
+                Box::new(RecordingHandler(events.clone())),
+            )
+            .with_options(opts);
+        let mut handler = call.create_handler();
+        let mut req = MockRequest {
+            sent: Arc::new(Mutex::new(Sent::default())),
+            conn: ConnHandle::from_backend(Arc::new(SyncTimerBackend)),
+        };
+        handler.start(&mut req);
+        assert!(req.headers().unwrap().get("grpc-timeout").is_some());
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(req.sent.lock().unwrap().cancelled);
+        let got = events.take();
+        assert!(
+            got.iter().any(|e| e.starts_with("complete 4 ")),
+            "{got:?}"
+        );
+    }
+
     /// A compressed response that cannot be decoded fails the call with
     /// the gRPC status the failure maps to, and nothing after it.
     #[test]
@@ -956,7 +1151,7 @@ mod tests {
         );
         let mut handler = factory.create_handler();
         let req = MockRequest::default();
-        let mut start_view = MockRequest { sent: Arc::clone(&req.sent) };
+        let mut start_view = MockRequest::with_sent(Arc::clone(&req.sent));
         handler.start(&mut start_view);
         assert!(!req.sent.lock().unwrap().ended, "a streaming request is not ended at start");
         for t in ["a", "b", "c"] {
@@ -981,7 +1176,7 @@ mod tests {
         );
         let mut handler = factory.create_handler();
         let req = MockRequest::default();
-        let mut view = MockRequest { sent: Arc::clone(&req.sent) };
+        let mut view = MockRequest::with_sent(Arc::clone(&req.sent));
         handler.start(&mut view);
         let mut h = Headers::new();
         h.status(200);

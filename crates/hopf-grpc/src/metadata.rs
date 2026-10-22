@@ -2,6 +2,8 @@
 
 //! gRPC call metadata (custom headers and trailers).
 
+use hopf_http::Headers;
+
 use crate::proto::base64;
 
 const BINARY_SUFFIX: &str = "-bin";
@@ -125,6 +127,30 @@ impl GrpcMetadata {
     /// Keys used by the protocol (`grpc-*`, `content-type`, `te`).
     pub fn is_reserved(key: &str) -> bool {
         key.starts_with("grpc-") || key == "content-type" || key == "te"
+    }
+
+    /// Append every entry to `headers` (wire values, including base64 for `-bin`).
+    pub fn apply_to(&self, headers: &mut Headers) {
+        for i in 0..self.len() {
+            headers.add(self.key_at(i), self.wire_value_at(i));
+        }
+    }
+
+    /// Collect custom metadata from HTTP headers (skips pseudo-headers and
+    /// reserved keys). Invalid entries are dropped.
+    pub fn collect_from_headers(headers: &Headers) -> Self {
+        let mut md = Self::new();
+        for h in headers.iter() {
+            if h.name.starts_with(':') {
+                continue;
+            }
+            let key = h.name.to_ascii_lowercase();
+            if Self::is_reserved(&key) {
+                continue;
+            }
+            md.add_received(&key, &h.value);
+        }
+        md
     }
 }
 

@@ -12,6 +12,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod call_options;
 pub mod client;
 pub mod codec;
 pub mod compression;
@@ -21,7 +22,9 @@ pub mod proto;
 pub mod server;
 pub mod timeout;
 
+pub use call_options::GrpcCallOptions;
 pub use client::{GrpcClient, GrpcClientCall, GrpcResponseHandler, GrpcStreamingCall, GrpcUnaryCall};
+pub use server::{GrpcCall, GrpcCallHandler};
 pub use codec::{parse_grpc_content_type, GrpcCodec};
 pub use compression::{
     accept_encoding_header, select_encoding, MessageCoding, DEFAULT_COMPRESSION_THRESHOLD,
