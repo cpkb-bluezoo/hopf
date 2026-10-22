@@ -9,6 +9,7 @@
 pub mod ech;
 mod engine;
 mod handshake;
+mod key_log;
 mod pem;
 mod record;
 mod sink;
@@ -98,6 +99,10 @@ pub use engine::{
 };
 pub use handshake::ticket::{
     AntiReplay, ClientTicketStore, DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS, TICKET_LIFETIME_SECS,
+};
+pub use key_log::{
+    default_key_log, labels as key_log_labels, set_default_key_log, KeyLog, KeyLogFile,
+    SSLKEYLOGFILE_ENV,
 };
 pub use handshake::transport_params::{
     decode_initial_max_data, encode_initial_max_data, RememberedTransportLimits,

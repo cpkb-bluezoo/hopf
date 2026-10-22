@@ -227,6 +227,17 @@ pub fn derive_resumption_master_secret(
     ResumptionMasterSecret::from_bytes(master.derive_secret("res master", transcript_hash.as_bytes()))
 }
 
+/// Exporter master secret (RFC 8446 §7.5) through the given transcript hash.
+pub fn derive_exporter_master_secret(
+    psk: Option<&PskSecret>,
+    shared_secret: &[u8],
+    transcript_hash: &TranscriptHash,
+    dtls: bool,
+) -> [u8; 32] {
+    let master = master_secret(psk, shared_secret, dtls);
+    master.derive_secret("exp master", transcript_hash.as_bytes())
+}
+
 /// Derive a resumption PSK from the resumption master secret and ticket nonce.
 pub fn derive_resumption_psk(resumption_master: &ResumptionMasterSecret, ticket_nonce: &[u8], dtls: bool) -> PskSecret {
     let out = if dtls {

@@ -603,6 +603,9 @@ pub fn client_config_from_pem_with(
         ticket_store: Some(hopf_core::tls::ClientTicketStore::shared()),
         ticket_key: None,
         anti_replay: None,
+        key_log: None,
+        cipher_suites: None,
+        certificate_compression: true,
     };
     Ok(hopf_client_config(params))
 }
@@ -630,6 +633,9 @@ pub fn client_config_public_trust_with(
         ticket_store: Some(hopf_core::tls::ClientTicketStore::shared()),
         ticket_key: None,
         anti_replay: None,
+        key_log: None,
+        cipher_suites: None,
+        certificate_compression: true,
     };
     Ok(hopf_client_config(params))
 }
@@ -739,6 +745,9 @@ pub fn client_config_for_pem_bytes_with_hopf(
         ticket_store: Some(hopf_core::tls::ClientTicketStore::shared()),
         ticket_key: None,
         anti_replay: None,
+        key_log: None,
+        cipher_suites: None,
+        certificate_compression: true,
     };
     Ok(hopf_client_config(params))
 }

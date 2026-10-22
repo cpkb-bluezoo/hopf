@@ -1,0 +1,163 @@
+name: QUIC interop
+
+on:
+  workflow_dispatch:
+    inputs:
+      peers:
+        description: 'Peer implementations (comma-separated from implementations_quic.json, or all)'
+        default: 'quic-go,ngtcp2,quiche,picoquic,msquic,neqo'
+        type: string
+      tests:
+        description: 'Test cases (comma-separated; empty runs the whole suite)'
+        default: ''
+        type: string
+      ref:
+        description: 'hopf commit, branch or tag to build from (empty = this commit)'
+        default: ''
+        type: string
+  schedule:
+    - cron: '0 4 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  DEFAULT_PEERS: quic-go,ngtcp2,quiche,picoquic,msquic,neqo
+
+jobs:
+  image:
+    name: Build endpoint image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      peers: ${{ steps.peers.outputs.peers }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Build image
+        run: docker build -f test/quic-interop-runner/Dockerfile -t hopf-interop:ci .
+
+      - name: Save image
+        run: docker save hopf-interop:ci | zstd -T0 -o hopf-interop.tar.zst
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hopf-interop-image
+          path: hopf-interop.tar.zst
+          retention-days: 1
+
+      - name: Peer list for the matrix
+        id: peers
+        env:
+          PEERS: ${{ inputs.peers }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = schedule ] || [ -z "$PEERS" ]; then
+            PEERS="$DEFAULT_PEERS"
+          fi
+          curl -fsSL https://raw.githubusercontent.com/quic-interop/quic-interop-runner/master/implementations_quic.json > known.json
+          matrix=$(jq -c --arg peers "$(printf '%s' "$PEERS" | tr -d ' ')" '
+            ($peers | ascii_downcase) as $p
+            | to_entries
+            | map(select(.key != "hopf"))
+            | map(select($p == "all" or (.key as $k | ($p | split(",")) | index($k))))
+            | map({peer: .key, role: .value.role})' known.json)
+          echo "peers=$matrix" >> "$GITHUB_OUTPUT"
+
+  interop:
+    name: "vs ${{ matrix.peer }}"
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.image.outputs.peers) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: quic-interop/quic-interop-runner
+          path: runner
+
+      - uses: actions/checkout@v7
+        with:
+          path: hopf-ci
+          sparse-checkout: test/quic-interop-runner
+
+      - uses: docker/setup-docker-action@v5
+        with:
+          version: version=v28.3.0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Enable IPv6 in the simulator
+        run: sudo modprobe ip6table_filter
+
+      - name: Install runner dependencies
+        run: pip install -r runner/requirements.txt
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: hopf-interop-image
+
+      - name: Load endpoint image
+        run: zstd -d -c hopf-interop.tar.zst | docker load
+
+      - name: Register hopf with the runner
+        working-directory: runner
+        run: |
+          jq '. + {"hopf": {"image": "hopf-interop:ci", "url": "https://github.com/cpkb-bluezoo/hopf", "role": "both"}}' \
+            implementations_quic.json > implementations_quic.json.new
+          mv implementations_quic.json.new implementations_quic.json
+          python implementations.py -p quic
+
+      - name: hopf server, ${{ matrix.peer }} client
+        if: matrix.role != 'server'
+        working-directory: runner
+        env:
+          TESTS: ${{ inputs.tests }}
+          PEER: ${{ matrix.peer }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/results"
+          args=(-s hopf -c "$PEER" --markdown
+                --log-dir "$GITHUB_WORKSPACE/logs/hopf-server"
+                --json "$GITHUB_WORKSPACE/results/server-hopf_client-$PEER.json")
+          if [ -n "$TESTS" ]; then args+=(-t "$TESTS"); fi
+          python run.py "${args[@]}" | tee server.txt || true
+
+      - name: ${{ matrix.peer }} server, hopf client
+        if: always() && matrix.role != 'client'
+        working-directory: runner
+        env:
+          TESTS: ${{ inputs.tests }}
+          PEER: ${{ matrix.peer }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/results"
+          args=(-s "$PEER" -c hopf --markdown
+                --log-dir "$GITHUB_WORKSPACE/logs/hopf-client"
+                --json "$GITHUB_WORKSPACE/results/server-${PEER}_client-hopf.json")
+          if [ -n "$TESTS" ]; then args+=(-t "$TESTS"); fi
+          python run.py "${args[@]}" | tee client.txt || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: quic-interop-${{ matrix.peer }}
+          if-no-files-found: warn
+          path: |
+            logs/
+            results/
+
+      - name: Verdict
+        if: always()
+        env:
+          PEER: ${{ matrix.peer }}
+          ROLE: ${{ matrix.role }}
+        run: |
+          files=()
+          if [ "$ROLE" != server ]; then files+=("server-hopf_client-$PEER.json"); fi
+          if [ "$ROLE" != client ]; then files+=("server-${PEER}_client-hopf.json"); fi
+          python3 hopf-ci/test/quic-interop-runner/check_results.py results "${files[@]}"

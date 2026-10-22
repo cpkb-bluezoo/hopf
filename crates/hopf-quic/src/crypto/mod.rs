@@ -9,7 +9,7 @@ use bytes::Bytes;
 use hopf_core::crypto::kx_policy::KxPolicy;
 use hopf_core::crypto::trust::TrustStore;
 use hopf_core::tls::{
-    AntiReplay, ClientTicketStore, HandshakeConfig, HandshakeMode, HandshakeRole,
+    AntiReplay, ClientTicketStore, HandshakeConfig, HandshakeMode, HandshakeRole, KeyLog,
     ServerCredentials, DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
 };
 
@@ -46,6 +46,12 @@ pub struct HopfTlsBuildParams {
     pub ticket_key: Option<[u8; 32]>,
     /// Server early-data anti-replay (shared across accepts).
     pub anti_replay: Option<Arc<AntiReplay>>,
+    /// NSS key log for this connection's TLS handshake.
+    pub key_log: Option<Arc<dyn KeyLog>>,
+    /// Cipher suites to offer (default: hopf's supported set).
+    pub cipher_suites: Option<Vec<u16>>,
+    /// RFC 8879 certificate compression (default `true`).
+    pub certificate_compression: bool,
 }
 
 impl HopfTlsBuildParams {
@@ -68,6 +74,9 @@ impl HopfTlsBuildParams {
             ticket_store: Some(ClientTicketStore::shared()),
             ticket_key: None,
             anti_replay: None,
+            key_log: None,
+            cipher_suites: None,
+            certificate_compression: true,
         }
     }
 
@@ -86,7 +95,28 @@ impl HopfTlsBuildParams {
             ticket_store: None,
             ticket_key: Some(ticket_key),
             anti_replay: None,
+            key_log: None,
+            cipher_suites: None,
+            certificate_compression: true,
         }
+    }
+
+    /// Attach an NSS key log (or clear with `None`).
+    pub fn with_key_log(mut self, key_log: Option<Arc<dyn KeyLog>>) -> Self {
+        self.key_log = key_log;
+        self
+    }
+
+    /// Restrict cipher suites for this handshake.
+    pub fn with_cipher_suites(mut self, suites: Vec<u16>) -> Self {
+        self.cipher_suites = Some(suites);
+        self
+    }
+
+    /// Disable RFC 8879 certificate compression on the wire.
+    pub fn without_certificate_compression(mut self) -> Self {
+        self.certificate_compression = false;
+        self
     }
 
     /// Apply [`QuicTlsOptions`].
@@ -122,6 +152,9 @@ impl HopfTlsBuildParams {
             ticket_key: self.ticket_key.map(hopf_core::TicketKeys::single),
             ticket_store: self.ticket_store,
             anti_replay,
+            key_log: self.key_log,
+            cipher_suites: self.cipher_suites,
+            certificate_compression: self.certificate_compression,
             ..Default::default()
         }
     }

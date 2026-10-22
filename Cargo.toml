@@ -30,6 +30,7 @@ members = [
     "examples/http-hello",
     "examples/http-get",
     "examples/http3-hello",
+    "examples/quic-interop",
     "examples/dns-authoritative",
     "examples/dns-proxy",
     "examples/webdav",
