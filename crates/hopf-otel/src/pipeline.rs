@@ -8,7 +8,10 @@ use std::thread::JoinHandle;
 
 use std::cell::Cell;
 
-use hopf_core::{clear_process_telemetry, set_process_telemetry, LogRecord, PeerAddr, TelemetryHook};
+use hopf_core::{
+    clear_process_telemetry, set_process_telemetry, set_qlog_export_enabled, LogRecord, PeerAddr,
+    TelemetryHook,
+};
 
 use crate::batch::{spawn_worker, ExportHandle};
 use crate::config::{LogSinkConfig, OtelConfig};
@@ -36,7 +39,9 @@ pub struct TelemetryPipeline {
 impl TelemetryPipeline {
     /// Start the export worker. Returns error if no sink is configured.
     pub fn start(config: OtelConfig) -> Result<Self, String> {
-        let config = config.with_default_stderr_if_empty();
+        let config = config
+            .with_qlog_dir_from_env_if_unconfigured()
+            .with_default_stderr_if_empty();
         if !config.has_sink() {
             return Err(
                 "OtelConfig requires at least one OTLP or JSONL sink (logs/traces/metrics)".into(),
@@ -78,6 +83,7 @@ impl TelemetryPipeline {
             join: Some(join),
             running,
         };
+        set_qlog_export_enabled(pipeline.accepts(LogLevel::Qlog));
         set_process_telemetry(pipeline.hook());
         Ok(pipeline)
     }
@@ -153,6 +159,7 @@ impl TelemetryPipeline {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+        set_qlog_export_enabled(false);
         clear_process_telemetry();
     }
 }
@@ -165,6 +172,7 @@ impl Drop for TelemetryPipeline {
                 let _ = j.join();
             }
         }
+        set_qlog_export_enabled(false);
         clear_process_telemetry();
         let _ = self.running;
     }
@@ -400,5 +408,27 @@ mod tests {
 
         let _ = std::fs::remove_file(&info_path);
         let _ = std::fs::remove_file(&access_path);
+    }
+
+    #[test]
+    fn qlog_sink_writes_sqlog_file() {
+        let dir = std::env::temp_dir().join(format!("hopf-qlog-pipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pipeline =
+            TelemetryPipeline::start(OtelConfig::new("qlog-pipe").with_qlog_dir(&dir)).unwrap();
+        assert!(pipeline.accepts(LogLevel::Qlog));
+        assert!(hopf_core::qlog_export_enabled());
+        pipeline.export_handle().try_send_log(crate::qlog::qlog_event(
+            "quic:connection_started",
+            "aa01",
+            "server",
+            hopf_core::QLOG_SCHEMA_QUIC,
+            "{}",
+        ));
+        pipeline.flush().unwrap();
+        pipeline.shutdown();
+        assert!(dir.join("aa01_server.sqlog").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!hopf_core::qlog_export_enabled());
     }
 }

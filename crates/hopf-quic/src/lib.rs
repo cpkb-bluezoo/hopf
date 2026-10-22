@@ -14,6 +14,7 @@ mod driver;
 mod transport;
 mod error;
 mod hooks;
+mod qlog;
 mod path;
 mod runtime_ext;
 mod stream;
@@ -49,6 +50,7 @@ pub use error::{
     QuicDatagramSendError, QuicStreamStoppedError,
 };
 pub use hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection, StreamKey};
+pub use qlog::{NopQlogSink, QlogSink, TelemetryQlogSink};
 pub use path::QuicDatagramPath;
 pub use runtime_ext::RuntimeQuicExt;
 pub use stream::QuicStreamEndpoint;

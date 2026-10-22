@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use hopf_core::LogLevel;
 
+use crate::access_log::{AccessLogFormat, AccessLogUserSelection};
+
 /// Bitset of [`LogLevel`] values a sink accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LevelSet(u8);
@@ -67,6 +69,20 @@ pub enum LogSinkConfig {
         /// Accepted levels.
         levels: LevelSet,
     },
+    /// HTTP access log file (CLF or ELFF).
+    AccessLog {
+        /// Output path.
+        path: PathBuf,
+        /// Line format.
+        format: AccessLogFormat,
+        /// User column policy.
+        user_selection: AccessLogUserSelection,
+    },
+    /// qlog JSON-SEQ directory (one `.sqlog` file per connection).
+    Qlog {
+        /// Output directory.
+        directory: PathBuf,
+    },
 }
 
 impl LogSinkConfig {
@@ -76,6 +92,8 @@ impl LogSinkConfig {
             Self::Jsonl { levels, .. }
             | Self::OtlpHttp { levels, .. }
             | Self::Stderr { levels, .. } => *levels,
+            Self::AccessLog { .. } => LevelSet::ACCESS,
+            Self::Qlog { .. } => LevelSet::QLOG,
         }
     }
 }
@@ -207,6 +225,44 @@ impl OtelConfig {
         self
     }
 
+    /// HTTP access log file (ACCESS level only).
+    pub fn with_access_log(
+        mut self,
+        path: impl Into<PathBuf>,
+        format: AccessLogFormat,
+        user_selection: AccessLogUserSelection,
+    ) -> Self {
+        self.log_sinks.push(LogSinkConfig::AccessLog {
+            path: path.into(),
+            format,
+            user_selection,
+        });
+        self
+    }
+
+    /// qlog directory sink (QLOG level only).
+    pub fn with_qlog_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.log_sinks.push(LogSinkConfig::Qlog {
+            directory: directory.into(),
+        });
+        self
+    }
+
+    /// When `QLOGDIR` is set and no sink accepts qlog, add a directory sink.
+    pub fn with_qlog_dir_from_env_if_unconfigured(mut self) -> Self {
+        if self.accepts(LogLevel::Qlog) {
+            return self;
+        }
+        if let Ok(dir) = std::env::var("QLOGDIR") {
+            if !dir.is_empty() {
+                self.log_sinks.push(LogSinkConfig::Qlog {
+                    directory: PathBuf::from(dir),
+                });
+            }
+        }
+        self
+    }
+
     /// Ensure at least one log sink when none are configured (default stderr).
     pub fn with_default_stderr_if_empty(mut self) -> Self {
         if self.log_sinks.is_empty() {
@@ -264,5 +320,41 @@ impl OtelConfig {
     pub fn with_logs(mut self, enabled: bool) -> Self {
         self.logs_enabled = enabled;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qlogdir_env_adds_sink_when_none_accepts_qlog() {
+        let dir = std::env::temp_dir().join(format!("hopf-qlogdir-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("QLOGDIR", &dir);
+        }
+        let cfg = OtelConfig::new("env-qlog").with_qlog_dir_from_env_if_unconfigured();
+        unsafe {
+            std::env::remove_var("QLOGDIR");
+        }
+        assert!(cfg.accepts(LogLevel::Qlog));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn qlogdir_env_skipped_when_sink_already_accepts_qlog() {
+        let dir = std::env::temp_dir().join(format!("hopf-qlogdir-skip-{}", std::process::id()));
+        unsafe {
+            std::env::set_var("QLOGDIR", &dir);
+        }
+        let cfg = OtelConfig::new("has-qlog")
+            .with_qlog_dir("/tmp/other-qlog")
+            .with_qlog_dir_from_env_if_unconfigured();
+        unsafe {
+            std::env::remove_var("QLOGDIR");
+        }
+        assert_eq!(cfg.log_sinks.len(), 1);
     }
 }

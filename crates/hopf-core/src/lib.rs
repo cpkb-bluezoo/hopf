@@ -79,9 +79,10 @@ pub use security::SecurityInfo;
 pub use service::Service;
 pub use storage::{StorageConfig, StorageError, StorageExecutor};
 pub use telemetry::{
-    clear_process_telemetry, emit_connection_log, emit_log, log_error, log_warn, set_process_telemetry,
-    subsystem_log,
-    AttrValue, LogLevel, LogRecord, NopTelemetry, TelemetryHook,
+    clear_process_telemetry, emit_connection_log, emit_log, log_error, log_warn,
+    qlog_export_enabled, set_qlog_export_enabled, set_process_telemetry, subsystem_log,
+    AttrValue, LogLevel, LogRecord, NopTelemetry, TelemetryHook, QLOG_GROUP_ID, QLOG_SCHEMA,
+    QLOG_SCHEMA_HTTP, QLOG_SCHEMA_HTTP3, QLOG_SCHEMA_QUIC, QLOG_VANTAGE_POINT,
 };
 pub use tls::{
     acceptor_from_pem, acceptor_from_pem_tls12, acceptor_from_pem_tls12_with_client_auth,

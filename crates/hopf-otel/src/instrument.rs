@@ -8,6 +8,7 @@ use hopf_http::{
     Headers, ServerHandler, ServerHandlerFactory, ServerWriter,
 };
 
+use crate::access_log::{build_record, client_host, AccessRecordParams};
 use crate::batch::ExportHandle;
 use crate::metrics::{HttpServerMetrics, RequestTimer};
 use crate::pipeline::TelemetryPipeline;
@@ -22,6 +23,8 @@ pub struct InstrumentedServerFactory {
     export: ExportHandle,
     metrics: Option<Arc<HttpServerMetrics>>,
     traces_enabled: bool,
+    access_enabled: bool,
+    protocol_version: String,
 }
 
 impl InstrumentedServerFactory {
@@ -37,7 +40,15 @@ impl InstrumentedServerFactory {
             export: pipeline.export_handle(),
             metrics,
             traces_enabled: pipeline.config().traces_enabled,
+            access_enabled: pipeline.accepts(hopf_core::LogLevel::Access),
+            protocol_version: "HTTP/1.1".into(),
         }
+    }
+
+    /// Set the `network.protocol.version` attribute on access records (for example `HTTP/2.0`).
+    pub fn with_protocol_version(mut self, version: impl Into<String>) -> Self {
+        self.protocol_version = version.into();
+        self
     }
 
     /// Manual construction (tests / custom wiring).
@@ -46,12 +57,16 @@ impl InstrumentedServerFactory {
         export: ExportHandle,
         metrics: Option<Arc<HttpServerMetrics>>,
         traces_enabled: bool,
+        access_enabled: bool,
+        protocol_version: impl Into<String>,
     ) -> Self {
         Self {
             inner,
             export,
             metrics,
             traces_enabled,
+            access_enabled,
+            protocol_version: protocol_version.into(),
         }
     }
 }
@@ -63,6 +78,8 @@ impl ServerHandlerFactory for InstrumentedServerFactory {
             export: self.export.clone(),
             metrics: self.metrics.clone(),
             traces_enabled: self.traces_enabled,
+            access_enabled: self.access_enabled,
+            protocol_version: self.protocol_version.clone(),
             state: None,
         })
     }
@@ -70,6 +87,8 @@ impl ServerHandlerFactory for InstrumentedServerFactory {
 
 struct RequestState {
     method: String,
+    target: String,
+    client_address: String,
     timer: RequestTimer,
     request_bytes: u64,
     response_bytes: u64,
@@ -84,12 +103,16 @@ struct InstrumentedHandler {
     export: ExportHandle,
     metrics: Option<Arc<HttpServerMetrics>>,
     traces_enabled: bool,
+    access_enabled: bool,
+    protocol_version: String,
     state: Option<RequestState>,
 }
 
 impl InstrumentedHandler {
-    fn begin(&mut self, headers: &Headers) {
+    fn begin(&mut self, headers: &Headers, response: &dyn ServerWriter) {
         let method = headers.method().unwrap_or("UNKNOWN").to_string();
+        let target = headers.path().unwrap_or("-").to_string();
+        let client_address = client_host(response.connection_info().remote_addr());
         let timer = RequestTimer::start();
         if let Some(m) = &self.metrics {
             m.request_started(&method);
@@ -121,6 +144,8 @@ impl InstrumentedHandler {
 
         self.state = Some(RequestState {
             method,
+            target,
+            client_address,
             timer,
             request_bytes: 0,
             response_bytes: 0,
@@ -140,11 +165,28 @@ impl InstrumentedHandler {
         }
         state.finished = true;
 
-        if let Some(trace) = &state.trace {
+        let (trace_id, span_id) = state
+            .trace
+            .as_ref()
+            .map(|trace| {
+                let ctx = trace.root_span().context();
+                (Some(ctx.trace_id), Some(ctx.span_id))
+            })
+            .unwrap_or((None, None));
+
+        let method = state.method.clone();
+        let target = state.target.clone();
+        let client_address = state.client_address.clone();
+        let status = state.status;
+        let response_bytes = state.response_bytes;
+        let request_bytes = state.request_bytes;
+        let elapsed = state.timer.elapsed();
+
+        if let Some(trace) = state.trace.take() {
             let root = trace.root_span();
-            root.set_attribute("http.status_code", state.status.to_string());
-            if state.status >= 500 {
-                root.set_status_error(format!("HTTP {}", state.status));
+            root.set_attribute("http.status_code", status.to_string());
+            if status >= 500 {
+                root.set_status_error(format!("HTTP {status}"));
             } else {
                 root.set_status_ok();
             }
@@ -154,19 +196,35 @@ impl InstrumentedHandler {
 
         if let Some(m) = &self.metrics {
             m.request_completed(
-                &state.method,
-                state.status,
-                state.timer.elapsed(),
-                state.request_bytes,
-                state.response_bytes,
+                &method,
+                status,
+                elapsed,
+                request_bytes,
+                response_bytes,
             );
+        }
+
+        if self.access_enabled {
+            let record = build_record(AccessRecordParams {
+                client_address: &client_address,
+                method: Some(method.as_str()),
+                target: Some(target.as_str()),
+                protocol_version: Some(self.protocol_version.as_str()),
+                protocol_user: None,
+                application_user: None,
+                status_code: status,
+                response_bytes,
+                trace_id,
+                span_id,
+            });
+            self.export.try_send_log(record);
         }
     }
 }
 
 impl ServerHandler for InstrumentedHandler {
     fn headers(&mut self, response: &mut dyn ServerWriter, headers: &Headers) {
-        self.begin(headers);
+        self.begin(headers, response);
         let done = {
             let Self { inner, state, .. } = self;
             let mut wrapped = InstrumentedWriter {
@@ -454,6 +512,56 @@ mod tests {
         assert!(body.contains("resourceSpans"), "{body}");
         let _ = std::fs::remove_file(&traces);
         let _ = std::fs::remove_file(&metrics);
+    }
+
+    #[test]
+    fn access_log_emits_one_clf_line_per_protocol_version() {
+        for (version, path_part) in [
+            ("HTTP/1.1", "v1"),
+            ("HTTP/2.0", "v2"),
+            ("HTTP/3", "v3"),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "hopf-otel-access-{path_part}-{}.log",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            let pipeline = TelemetryPipeline::start(
+                crate::OtelConfig::new("access-test")
+                    .with_access_log(
+                        &path,
+                        crate::AccessLogFormat::Clf,
+                        crate::AccessLogUserSelection::ProtocolFirst,
+                    )
+                    .with_traces(false)
+                    .with_metrics(false),
+            )
+            .unwrap();
+            let factory = InstrumentedServerFactory::new(Arc::new(HelloFactory), &pipeline)
+                .with_protocol_version(version);
+            let mut handler = factory.create_handler();
+            let mut req = Headers::new();
+            req.set(":method", "GET");
+            req.set(":path", "/access");
+            let rec = Arc::new(Mutex::new(Rec {
+                seen_tp: None,
+                status: 0,
+            }));
+            let mut writer = CapturingWriter {
+                headers: None,
+                body: Vec::new(),
+                rec: Arc::clone(&rec),
+            };
+            handler.headers(&mut writer, &req);
+            handler.request_complete(&mut writer);
+            pipeline.flush().unwrap();
+            pipeline.shutdown();
+            let body = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(body.matches("GET /access").count(), 1, "{body}");
+            assert!(body.contains(version), "{body}");
+            assert!(body.contains(" 200 2"), "{body}");
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

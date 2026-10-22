@@ -3,12 +3,17 @@
 //! Telemetry hook seams (OTLP / JSONL exporters live in `hopf-otel`).
 
 mod log_record;
+mod qlog;
 
 use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::peer_addr::PeerAddr;
 
 pub use log_record::{AttrValue, LogLevel, LogRecord};
+pub use qlog::{
+    qlog_export_enabled, set_qlog_export_enabled, QLOG_GROUP_ID, QLOG_SCHEMA, QLOG_SCHEMA_HTTP,
+    QLOG_SCHEMA_HTTP3, QLOG_SCHEMA_QUIC, QLOG_VANTAGE_POINT,
+};
 
 static PROCESS_HOOK: OnceLock<RwLock<Option<Arc<dyn TelemetryHook>>>> = OnceLock::new();
 

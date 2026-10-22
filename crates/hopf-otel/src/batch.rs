@@ -210,6 +210,10 @@ fn export_loop(config: OtelConfig, rx: Receiver<Msg>, running: Arc<AtomicBool>) 
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
+                let now = Instant::now();
+                for sink in &mut log_sinks {
+                    sink.maintain(now);
+                }
                 if last_flush.elapsed() >= config.flush_interval {
                     flush_all(&config, &mut log_sinks, &sinks, &mut logs, &mut spans, &mut metrics);
                     last_flush = Instant::now();

@@ -7,6 +7,8 @@ use crate::jsonl::JsonlAppender;
 use crate::log_record::{LogLevel, LogRecord};
 use crate::otlp_http::{post_protobuf, HttpEndpoint};
 use crate::otlp_proto::encode_logs_request;
+use crate::access_log::AccessLogFileSink;
+use crate::qlog::QlogFileSink;
 use crate::stderr_sink::{write_internal_diagnostic, StderrLogSink};
 
 /// Writes accepted [`LogRecord`] batches on the export worker thread.
@@ -39,6 +41,10 @@ pub enum LogSinkInstance {
     },
     /// Process stderr (console).
     Stderr(StderrLogSink),
+    /// HTTP access log file.
+    AccessLog(AccessLogFileSink),
+    /// qlog JSON-SEQ directory.
+    Qlog(QlogFileSink),
 }
 
 impl LogSinkInstance {
@@ -64,6 +70,25 @@ impl LogSinkInstance {
                 })
             }
             LogSinkConfig::Stderr { levels } => Some(Self::Stderr(StderrLogSink::new(*levels))),
+            LogSinkConfig::AccessLog {
+                path,
+                format,
+                user_selection,
+            } => Some(Self::AccessLog(AccessLogFileSink::new(
+                path.clone(),
+                *format,
+                *user_selection,
+            ))),
+            LogSinkConfig::Qlog { directory } => {
+                Some(Self::Qlog(QlogFileSink::new(directory.clone())))
+            }
+        }
+    }
+
+    /// Periodic maintenance (qlog idle file close).
+    pub fn maintain(&mut self, now: std::time::Instant) {
+        if let Self::Qlog(s) = self {
+            s.close_idle(now);
         }
     }
 
@@ -99,6 +124,8 @@ impl LogSink for LogSinkInstance {
         match self {
             Self::Jsonl { levels, .. } | Self::OtlpHttp { levels, .. } => levels.accepts(level),
             Self::Stderr(s) => s.accepts(level),
+            Self::AccessLog(_) => level == LogLevel::Access,
+            Self::Qlog(_) => level == LogLevel::Qlog,
         }
     }
 
@@ -110,12 +137,15 @@ impl LogSink for LogSinkInstance {
                 post_protobuf(endpoint, &body).map(|_| ())
             }
             Self::Stderr(s) => s.write(config, batch).map_err(|e| e.to_string()),
+            Self::AccessLog(s) => s.write(batch),
+            Self::Qlog(s) => s.write(batch),
         }
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
         match self {
             Self::Stderr(s) => s.shutdown().map_err(|e| e.to_string()),
+            Self::Qlog(s) => s.shutdown(),
             _ => Ok(()),
         }
     }
