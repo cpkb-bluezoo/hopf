@@ -246,9 +246,12 @@ fn amqps_publish_consume_roundtrip_over_implicit_tls() {
     let (host, _plain_port, user, pass) = broker_creds();
     let (tls_port, ca_path) = broker_tls_params();
     if !ca_path.exists() {
-        eprintln!(
-            "skipping amqps_publish_consume_roundtrip_over_implicit_tls: no CA cert at {}",
-            ca_path.display()
+        hopf_core::log_warn(
+            "amqp.test.skip",
+            format!(
+                "skipping amqps_publish_consume_roundtrip_over_implicit_tls: no CA cert at {}",
+                ca_path.display()
+            ),
         );
         return;
     }

@@ -7,7 +7,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use hopf_core::{Runtime, SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig};
+use hopf_core::{
+    subsystem_log, LogLevel, Runtime, SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig,
+};
 use hopf_dns::DnsResolver;
 
 use super::endpoint::{AmqpClientEndpoint, AmqpClientParams};
@@ -288,12 +290,22 @@ impl AmqpClient {
                 let addrs = match result {
                     Ok(a) => a,
                     Err(e) => {
-                        eprintln!("hopf-amqp: DNS error for {host_for_err}: {e}");
+                        subsystem_log(
+                            LogLevel::Warn,
+                            "hopf-amqp",
+                            "amqp.dns.error",
+                            format!("DNS error for {host_for_err}: {e}"),
+                        );
                         return;
                     }
                 };
                 let Some(addr) = addrs.into_iter().next() else {
-                    eprintln!("hopf-amqp: DNS returned no addresses for {host_for_err}");
+                    subsystem_log(
+                        LogLevel::Warn,
+                        "hopf-amqp",
+                        "amqp.dns.empty",
+                        format!("DNS returned no addresses for {host_for_err}"),
+                    );
                     return;
                 };
                 let factory2 = Arc::clone(&factory);
@@ -308,7 +320,12 @@ impl AmqpClient {
                     }
                 }
                 if let Err(e) = rt2.connect(cfg) {
-                    eprintln!("hopf-amqp: connect error: {e}");
+                    subsystem_log(
+                        LogLevel::Warn,
+                        "hopf-amqp",
+                        "amqp.connect.error",
+                        format!("connect error: {e}"),
+                    );
                 }
             }),
         );

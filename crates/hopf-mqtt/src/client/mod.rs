@@ -42,7 +42,7 @@
 //!     fn on_publish_acked(&mut self, _client: &mut dyn MqttClientControl, _packet_id: u16) {}
 //!     fn on_ping_resp(&mut self, _client: &mut dyn MqttClientControl) {}
 //!     fn on_server_disconnect(&mut self, _reason_code: u8, _properties: &Properties) {}
-//!     fn on_error(&mut self, err: &std::io::Error) { eprintln!("mqtt error: {err}"); }
+//!     fn on_error(&mut self, err: &std::io::Error) { hopf_core::log_warn("mqtt.client.error", err.to_string()); }
 //!     fn on_disconnected(&mut self) {}
 //! }
 //! struct Factory;

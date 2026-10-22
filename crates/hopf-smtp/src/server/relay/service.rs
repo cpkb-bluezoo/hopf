@@ -105,8 +105,7 @@ impl SimpleRelayService {
             if let Some(t) = runtime.telemetry() {
                 t.on_warn(msg);
             } else {
-                // No telemetry hook — still surface on stderr so operators notice.
-                eprintln!("hopf-smtp: WARN: {msg}");
+                hopf_core::log_warn("smtp.relay.open_acl", msg);
             }
         }
         self.smtp.start(runtime)

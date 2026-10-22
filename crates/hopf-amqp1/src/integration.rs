@@ -213,7 +213,13 @@ fn amqps_publish_consume_roundtrip_over_implicit_tls() {
         std::path::PathBuf::from(home).join(".hopf-rabbitmq-tls/ca-cert.pem")
     });
     if !ca_path.exists() {
-        eprintln!("skipping amqps_publish_consume_roundtrip_over_implicit_tls: no CA cert at {}", ca_path.display());
+        hopf_core::log_warn(
+            "amqp1.test.skip",
+            format!(
+                "skipping amqps_publish_consume_roundtrip_over_implicit_tls: no CA cert at {}",
+                ca_path.display()
+            ),
+        );
         return;
     }
     let connector = hopf_core::connector_from_pem(&ca_path, &[]).expect("tls connector");

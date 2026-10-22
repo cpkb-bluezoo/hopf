@@ -15,6 +15,7 @@ use crate::metrics::MetricPoint;
 use crate::otlp_http::{post_protobuf, HttpEndpoint};
 use crate::otlp_proto::{encode_metrics_request, encode_traces_request};
 use crate::sink::{LogSink, LogSinkInstance};
+use crate::stderr_sink::write_internal_diagnostic;
 use crate::trace::FinishedSpan;
 
 const LOG_LEVELS: usize = 5;
@@ -251,13 +252,13 @@ fn flush_spans(config: &OtelConfig, sinks: &TraceMetricSinks, batch: &mut Vec<Fi
     }
     if let Some(appender) = &sinks.traces_jsonl {
         if let Err(e) = appender.append_traces(config, batch) {
-            eprintln!("hopf-otel: jsonl traces failed: {e}");
+            write_internal_diagnostic(format!("hopf-otel: jsonl traces failed: {e}"));
         }
     }
     if let Some(ep) = &sinks.traces_http {
         let body = encode_traces_request(config, batch);
         if let Err(e) = post_protobuf(ep, &body) {
-            eprintln!("hopf-otel: otlp traces failed: {e}");
+            write_internal_diagnostic(format!("hopf-otel: otlp traces failed: {e}"));
         }
     }
     batch.clear();
@@ -270,13 +271,13 @@ fn flush_metrics(config: &OtelConfig, sinks: &TraceMetricSinks, batch: &mut Vec<
     }
     if let Some(appender) = &sinks.metrics_jsonl {
         if let Err(e) = appender.append_metrics(config, batch) {
-            eprintln!("hopf-otel: jsonl metrics failed: {e}");
+            write_internal_diagnostic(format!("hopf-otel: jsonl metrics failed: {e}"));
         }
     }
     if let Some(ep) = &sinks.metrics_http {
         let body = encode_metrics_request(config, batch);
         if let Err(e) = post_protobuf(ep, &body) {
-            eprintln!("hopf-otel: otlp metrics failed: {e}");
+            write_internal_diagnostic(format!("hopf-otel: otlp metrics failed: {e}"));
         }
     }
     batch.clear();

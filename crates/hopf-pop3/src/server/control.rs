@@ -1159,7 +1159,12 @@ impl Pop3ControlHandler {
                     // The status line already went out; nothing left to do
                     // but log and let the client observe a truncated
                     // download / closed connection.
-                    eprintln!("hopf-pop3: RETR failed mid-stream: {e}");
+                    hopf_core::subsystem_log(
+                        hopf_core::LogLevel::Error,
+                        "hopf-pop3",
+                        "pop3.retr.failed",
+                        format!("RETR failed mid-stream: {e}"),
+                    );
                 }
                 if let Some(tel) = telemetry {
                     tel.finish(ok);
@@ -1203,7 +1208,12 @@ impl Pop3ControlHandler {
             move |result: Result<(), StorageError>| {
                 let ok = result.is_ok();
                 if let Err(e) = result {
-                    eprintln!("hopf-pop3: TOP failed mid-stream: {e}");
+                    hopf_core::subsystem_log(
+                        hopf_core::LogLevel::Error,
+                        "hopf-pop3",
+                        "pop3.top.failed",
+                        format!("TOP failed mid-stream: {e}"),
+                    );
                 }
                 if let Some(tel) = telemetry {
                     tel.finish(ok);

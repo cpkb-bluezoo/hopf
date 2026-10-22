@@ -14,7 +14,7 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use crate::binding::BindingId;
 use crate::cmd::{ReactorCmd, ReactorHandle};
 use crate::listener::{Listener, TcpListenerConfig, UnixListenerConfig};
-use crate::telemetry::TelemetryHook;
+use crate::telemetry::{emit_connection_log, LogLevel, LogRecord, TelemetryHook};
 
 const WAKER_TOKEN: Token = Token(0);
 const FIRST_LISTENER_TOKEN: usize = 1;
@@ -153,7 +153,12 @@ impl AcceptLoop {
                     backoff_until: None,
                 };
                 if let Err(e) = accept.run() {
-                    eprintln!("hopf: accept loop exited with error: {e}");
+                    crate::telemetry::subsystem_log(
+                        crate::telemetry::LogLevel::Error,
+                        "hopf-core",
+                        "accept.loop_exit",
+                        format!("accept loop exited with error: {e}"),
+                    );
                 }
             })?;
         Ok((handle, thread))
@@ -341,12 +346,15 @@ impl AcceptLoop {
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if is_fd_exhaustion(&e) => {
-                    eprintln!("hopf: accept EMFILE/ENFILE, backing off");
+                    self.log_accept_warn(
+                        "accept.emfile",
+                        "accept EMFILE/ENFILE, backing off".into(),
+                    );
                     self.backoff_until = Some(Instant::now() + ACCEPT_BACKOFF);
                     break;
                 }
                 Err(e) => {
-                    eprintln!("hopf: accept error: {e}");
+                    self.log_accept_warn("accept.error", format!("accept error: {e}"));
                     break;
                 }
             }
@@ -410,17 +418,29 @@ impl AcceptLoop {
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(e) if is_fd_exhaustion(&e) => {
-                    eprintln!("hopf: accept EMFILE/ENFILE, backing off");
+                    self.log_accept_warn(
+                        "accept.emfile",
+                        "accept EMFILE/ENFILE, backing off".into(),
+                    );
                     self.backoff_until = Some(Instant::now() + ACCEPT_BACKOFF);
                     break;
                 }
                 Err(e) => {
-                    eprintln!("hopf: accept error: {e}");
+                    self.log_accept_warn("accept.error", format!("accept error: {e}"));
                     break;
                 }
             }
         }
         Ok(())
+    }
+
+    fn log_accept_warn(&self, name: &str, message: String) {
+        emit_connection_log(
+            self.telemetry.as_ref(),
+            LogRecord::new(LogLevel::Warn, name)
+                .with_scope("hopf-core")
+                .with_body(message),
+        );
     }
 
     fn next_worker(&self) -> &ReactorHandle {

@@ -156,10 +156,12 @@ impl ConnHandle {
                 });
             }
             ConnHandleInner::Tasks { .. } => {
-                eprintln!(
-                    "hopf-core: ConnHandle::with_endpoint (or send/close/poke, which are \
-                     built on it) called on a task-only handle — dropped, no endpoint to \
-                     run it against. Use ConnHandle::execute instead for this handle."
+                crate::telemetry::subsystem_log(
+                    crate::telemetry::LogLevel::Warn,
+                    "hopf-core",
+                    "conn_handle.task_only_with_endpoint",
+                    "ConnHandle::with_endpoint (or send/close/poke) called on a task-only \
+                     handle — dropped. Use ConnHandle::execute instead.",
                 );
                 let _ = task;
             }
@@ -277,7 +279,7 @@ mod tests {
     /// `with_endpoint` (and `send`/`close`/`poke`, built on it) must not
     /// panic for a task-only handle — the task is dropped, not run, but
     /// that drop must stay silent-safe (no crash), just observable (see the
-    /// `eprintln!` in `with_endpoint`, not asserted here since this crate
+    /// telemetry warning in `with_endpoint`, not asserted here since this crate
     /// has no stderr-capturing test infra).
     #[test]
     fn with_endpoint_on_task_only_handle_drops_without_panicking() {

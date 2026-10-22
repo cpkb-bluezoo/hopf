@@ -23,7 +23,7 @@ use crate::listener::DEFAULT_BUFFER_SIZE;
 use crate::peer_addr::PeerAddr;
 use crate::proxy_protocol::{self, ProxyHeaderOutcome};
 use crate::security::SecurityInfo;
-use crate::telemetry::TelemetryHook;
+use crate::telemetry::{emit_connection_log, LogLevel, LogRecord, TelemetryHook};
 use crate::tls::{SharedTlsAcceptor, TlsProtocolError, TlsRecordSink, TlsVariant, VerifyRequest, VerifyResult};
 
 /// Either half of a stream-oriented connection — TCP or UNIX domain socket.
@@ -630,9 +630,12 @@ impl TcpConnection {
         self.app_in = buf;
         self.handler = Some(handler);
         if let Err(payload) = outcome {
-            eprintln!(
-                "hopf: protocol handler panicked in receive on {}: {payload:?}",
-                self.remote
+            self.log_runtime_error(
+                "connection.handler.panic",
+                format!(
+                    "protocol handler panicked in receive on {}: {payload:?}",
+                    self.remote
+                ),
             );
             self.force_close();
         }
@@ -658,9 +661,12 @@ impl TcpConnection {
         self.net_in = buf;
         self.handler = Some(handler);
         if let Err(payload) = outcome {
-            eprintln!(
-                "hopf: protocol handler panicked in receive on {}: {payload:?}",
-                self.remote
+            self.log_runtime_error(
+                "connection.handler.panic",
+                format!(
+                    "protocol handler panicked in receive on {}: {payload:?}",
+                    self.remote
+                ),
             );
             self.force_close();
         }
@@ -695,9 +701,9 @@ impl TcpConnection {
                 cb(self);
             }));
             if let Err(payload) = outcome {
-                eprintln!(
-                    "hopf: on_write_ready panicked on {}: {payload:?}",
-                    self.remote
+                self.log_runtime_error(
+                    "connection.write_ready.panic",
+                    format!("on_write_ready panicked on {}: {payload:?}", self.remote),
                 );
                 self.force_close();
                 return Ok(WriteOutcome::Closed);
@@ -716,9 +722,12 @@ impl TcpConnection {
         }));
         self.handler = Some(handler);
         if let Err(payload) = outcome {
-            eprintln!(
-                "hopf: protocol handler panicked in connected on {}: {payload:?}",
-                self.remote
+            self.log_runtime_error(
+                "connection.handler.panic",
+                format!(
+                    "protocol handler panicked in connected on {}: {payload:?}",
+                    self.remote
+                ),
             );
             self.force_close();
         }
@@ -735,9 +744,12 @@ impl TcpConnection {
         }));
         self.handler = Some(handler);
         if let Err(payload) = outcome {
-            eprintln!(
-                "hopf: protocol handler panicked in security_established on {}: {payload:?}",
-                self.remote
+            self.log_runtime_error(
+                "connection.handler.panic",
+                format!(
+                    "protocol handler panicked in security_established on {}: {payload:?}",
+                    self.remote
+                ),
             );
             self.force_close();
         }
@@ -802,9 +814,12 @@ impl TcpConnection {
         }
         let new_len = self.net_out.len() + data.len();
         if new_len > self.max_net_out {
-            eprintln!(
-                "hopf: outbound buffer overflow on {} ({} > {})",
-                self.remote, new_len, self.max_net_out
+            self.log_runtime_error(
+                "connection.outbound.overflow",
+                format!(
+                    "outbound buffer overflow on {} ({new_len} > {})",
+                    self.remote, self.max_net_out
+                ),
             );
             self.force_close();
             return;
@@ -840,12 +855,24 @@ impl TcpConnection {
                 tls.send_application_data(data, &mut adapter);
             }
             if let Err(e) = self.apply_tls_outcome(outcome) {
-                eprintln!("hopf: TLS send failed on {}: {e}", self.remote);
+                self.log_runtime_error(
+                    "connection.tls.send_failed",
+                    format!("TLS send failed on {}: {e}", self.remote),
+                );
                 self.force_close();
             }
         } else {
             self.append_out(data);
         }
+    }
+
+    fn log_runtime_error(&self, name: &str, message: String) {
+        emit_connection_log(
+            self.telemetry.as_ref(),
+            LogRecord::new(LogLevel::Error, name)
+                .with_scope("hopf-core")
+                .with_body(message),
+        );
     }
 }
 
@@ -994,9 +1021,12 @@ impl Endpoint for TcpConnection {
         }));
         self.handler = Some(handler);
         if let Err(payload) = outcome {
-            eprintln!(
-                "hopf: protocol handler panicked in receive on {}: {payload:?}",
-                self.remote
+            self.log_runtime_error(
+                "connection.handler.panic",
+                format!(
+                    "protocol handler panicked in receive on {}: {payload:?}",
+                    self.remote
+                ),
             );
             self.force_close();
         }

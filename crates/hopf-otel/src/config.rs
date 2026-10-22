@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::log_record::LogLevel;
+use hopf_core::LogLevel;
 
 /// Bitset of [`LogLevel`] values a sink accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,13 +62,20 @@ pub enum LogSinkConfig {
         /// Accepted levels.
         levels: LevelSet,
     },
+    /// Human-readable stderr lines (console).
+    Stderr {
+        /// Accepted levels.
+        levels: LevelSet,
+    },
 }
 
 impl LogSinkConfig {
     /// Level filter for this sink.
     pub fn levels(&self) -> LevelSet {
         match self {
-            Self::Jsonl { levels, .. } | Self::OtlpHttp { levels, .. } => *levels,
+            Self::Jsonl { levels, .. }
+            | Self::OtlpHttp { levels, .. }
+            | Self::Stderr { levels, .. } => *levels,
         }
     }
 }
@@ -183,9 +190,30 @@ impl OtelConfig {
         self
     }
 
+    /// Console stderr sink (operational levels).
+    pub fn with_stderr_logs(self) -> Self {
+        self.with_stderr_log_sink(LevelSet::OPERATIONAL)
+    }
+
+    /// Console stderr sink with an explicit level set.
+    pub fn with_stderr_log_sink(mut self, levels: LevelSet) -> Self {
+        self.log_sinks.push(LogSinkConfig::Stderr { levels });
+        self
+    }
+
     /// Append a pre-built log sink configuration.
     pub fn with_log_sink(mut self, sink: LogSinkConfig) -> Self {
         self.log_sinks.push(sink);
+        self
+    }
+
+    /// Ensure at least one log sink when none are configured (default stderr).
+    pub fn with_default_stderr_if_empty(mut self) -> Self {
+        if self.log_sinks.is_empty() {
+            self.log_sinks.push(LogSinkConfig::Stderr {
+                levels: LevelSet::OPERATIONAL,
+            });
+        }
         self
     }
 

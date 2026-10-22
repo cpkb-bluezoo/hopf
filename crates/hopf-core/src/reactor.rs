@@ -73,7 +73,12 @@ impl Reactor {
                     active,
                 };
                 if let Err(e) = reactor.run() {
-                    eprintln!("hopf: reactor {_id} exited with error: {e}");
+                    crate::telemetry::subsystem_log(
+                        crate::telemetry::LogLevel::Error,
+                        "hopf-core",
+                        "reactor.exit_error",
+                        format!("reactor {_id} exited with error: {e}"),
+                    );
                 }
             })?;
         Ok((handle, thread))

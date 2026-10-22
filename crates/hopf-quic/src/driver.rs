@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
-use hopf_core::{Endpoint, EndpointTask, ExecuteFn, HandlerFactory, ProtocolHandler, SecurityInfo, Task};
+use hopf_core::{
+    subsystem_log, Endpoint, EndpointTask, ExecuteFn, HandlerFactory, LogLevel, ProtocolHandler,
+    SecurityInfo, Task,
+};
 
 use crate::config::{
     apply_listen_hardening, QuicClientConfig, QuicConnectConfig, QuicListenConfig,
@@ -616,7 +619,12 @@ fn spawn_driver(
                 shutting_down: false,
             };
             if let Err(e) = driver.run(&mut poll) {
-                eprintln!("hopf-quic driver error: {e}");
+                subsystem_log(
+                    LogLevel::Error,
+                    "hopf-quic",
+                    "quic.driver.error",
+                    format!("driver error: {e}"),
+                );
             }
         })?;
 
@@ -861,7 +869,12 @@ impl Driver {
                     }
                 }
                 Err(e) => {
-                    eprintln!("hopf-quic connect: {e:?}");
+                    subsystem_log(
+                        LogLevel::Warn,
+                        "hopf-quic",
+                        "quic.connect.error",
+                        format!("connect: {e:?}"),
+                    );
                     return Ok(());
                 }
             }

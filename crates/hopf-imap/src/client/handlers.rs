@@ -4,7 +4,7 @@
 
 use std::io;
 
-use hopf_core::Endpoint;
+use hopf_core::{subsystem_log, Endpoint, LogLevel};
 
 use super::reply::ImapStatus;
 use super::state::{
@@ -24,10 +24,15 @@ pub trait ImapClientHandlerFactory: Send + Sync {
     /// not be started at all. (A connect that starts and then fails or
     /// times out reaches the driver's `on_error` / `on_timeout` as usual.)
     ///
-    /// Default: a line on stderr. Override it to surface the failure the
+    /// Default: process telemetry when configured. Override it to surface the failure the
     /// way the rest of the session's outcomes are surfaced.
     fn connect_failed(&self, host: &str, error: &io::Error) {
-        eprintln!("hopf-imap: connect to {host} failed: {error}");
+        subsystem_log(
+            LogLevel::Warn,
+            "hopf-imap",
+            "imap.connect.failed",
+            format!("connect to {host} failed: {error}"),
+        );
     }
 }
 

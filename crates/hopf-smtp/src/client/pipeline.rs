@@ -203,7 +203,7 @@ pub(crate) fn no_mechanism_message(auth_methods: &[String], bearer: bool) -> Str
 ///     .mail_from("from@example.com")
 ///     .rcpt_to("to@example.com")
 ///     .message_with(move || body.take().map(|b| b.to_vec()))
-///     .on_complete(Box::new(|ok| eprintln!("delivery: {ok}")));
+///     .on_complete(Box::new(|ok| hopf_core::log_warn("smtp.delivery", format!("delivery: {ok}"))));
 /// SmtpClient::new("127.0.0.1", 25)
 ///     .connect(&rt, Arc::new(send))
 ///     .unwrap();

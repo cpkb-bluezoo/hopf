@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hopf_core::{
-    Endpoint, ProtocolHandler, Runtime, SecurityInfo, SharedTlsConnector, TcpConnectorConfig,
-    UnixConnectorConfig,
+    subsystem_log, Endpoint, LogLevel, ProtocolHandler, Runtime, SecurityInfo,
+    SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig,
 };
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
@@ -301,7 +301,7 @@ pub(crate) fn dial(
             let addrs = match result {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!("hopf-http: DNS error: {e}");
+                    subsystem_log(LogLevel::Warn, "hopf-http", "http.dns.error", format!("DNS error: {e}"));
                     return;
                 }
             };
@@ -310,7 +310,7 @@ pub(crate) fn dial(
                 let cfg = TcpConnectorConfig::new(addr, move || mh())
                     .connect_timeout(connect_timeout);
                 if let Err(e) = rt2.connect(cfg) {
-                    eprintln!("hopf-http: connect error: {e}");
+                    subsystem_log(LogLevel::Warn, "hopf-http", "http.connect.error", format!("connect error: {e}"));
                 }
             }
         }),
@@ -353,7 +353,7 @@ fn dial_tls(
             let addrs = match result {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!("hopf-http: DNS error: {e}");
+                    subsystem_log(LogLevel::Warn, "hopf-http", "http.dns.error", format!("DNS error: {e}"));
                     return;
                 }
             };
@@ -363,7 +363,7 @@ fn dial_tls(
                     .connect_timeout(connect_timeout)
                     .with_tls(tls_connector, server_name);
                 if let Err(e) = rt2.connect(cfg) {
-                    eprintln!("hopf-http: connect error: {e}");
+                    subsystem_log(LogLevel::Warn, "hopf-http", "http.connect.error", format!("connect error: {e}"));
                 }
             }
         }),
@@ -496,16 +496,31 @@ pub fn connect_h3_by_name(
             let addrs = match result {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!("hopf-http: DNS error resolving {host_owned} for h3: {e}");
+                    subsystem_log(
+                        LogLevel::Warn,
+                        "hopf-http",
+                        "http.h3.dns.error",
+                        format!("DNS error resolving {host_owned} for h3: {e}"),
+                    );
                     return;
                 }
             };
             let Some(addr) = addrs.into_iter().next() else {
-                eprintln!("hopf-http: no address for {host_owned}");
+                subsystem_log(
+                    LogLevel::Warn,
+                    "hopf-http",
+                    "http.h3.no_address",
+                    format!("no address for {host_owned}"),
+                );
                 return;
             };
             if let Err(e) = connect_h3_with_keepalive(addr, client_config, sni, factory, limits) {
-                eprintln!("hopf-http: h3 connect error: {e}");
+                subsystem_log(
+                    LogLevel::Warn,
+                    "hopf-http",
+                    "http.h3.connect.error",
+                    format!("h3 connect error: {e}"),
+                );
             }
         }),
     );
@@ -695,7 +710,7 @@ pub fn connect_auto(
             if let Err(e) =
                 dial_with_fallback(&rt2, &host_for_tier3, port, observing_factory, fallback, settings.clone())
             {
-                eprintln!("hopf-http: connect error: {e}");
+                subsystem_log(LogLevel::Warn, "hopf-http", "http.connect.error", format!("connect error: {e}"));
             }
         }),
     );

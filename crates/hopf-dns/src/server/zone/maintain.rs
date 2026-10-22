@@ -154,7 +154,12 @@ fn persist(slot: &ZoneSlot) {
     let snapshot = slot.zone.read().unwrap().clone();
     if let Some(zone) = snapshot {
         if let Err(e) = zone.write_zone_file(path) {
-            eprintln!("hopf-dns: cannot write zone {:?}: {e}", slot.origin);
+            hopf_core::subsystem_log(
+                hopf_core::LogLevel::Error,
+                "hopf-dns",
+                "dns.zone.write_failed",
+                format!("cannot write zone {:?}: {e}", slot.origin),
+            );
         }
     }
 }
@@ -240,7 +245,12 @@ fn refresh(st: &mut State, slot: &Arc<ZoneSlot>) -> Instant {
             now + Duration::from_secs(secs)
         }
         Err(e) => {
-            eprintln!("hopf-dns: refresh of zone {:?} from {primary} failed: {e}", slot.origin);
+            hopf_core::subsystem_log(
+                hopf_core::LogLevel::Warn,
+                "hopf-dns",
+                "dns.zone.refresh_failed",
+                format!("refresh of zone {:?} from {primary} failed: {e}", slot.origin),
+            );
             let secs = timers.as_ref().map_or(INITIAL_RETRY.as_secs(), |s| u64::from(s.retry).max(1));
             if let (Some(t), Some(ok)) = (&timers, st.last_ok.get(&slot.origin)) {
                 if now.duration_since(*ok) >= Duration::from_secs(u64::from(t.expire)) {

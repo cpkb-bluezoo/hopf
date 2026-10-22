@@ -7,6 +7,7 @@ use crate::jsonl::JsonlAppender;
 use crate::log_record::{LogLevel, LogRecord};
 use crate::otlp_http::{post_protobuf, HttpEndpoint};
 use crate::otlp_proto::encode_logs_request;
+use crate::stderr_sink::{write_internal_diagnostic, StderrLogSink};
 
 /// Writes accepted [`LogRecord`] batches on the export worker thread.
 pub trait LogSink {
@@ -36,6 +37,8 @@ pub enum LogSinkInstance {
         endpoint: HttpEndpoint,
         levels: LevelSet,
     },
+    /// Process stderr (console).
+    Stderr(StderrLogSink),
 }
 
 impl LogSinkInstance {
@@ -60,6 +63,7 @@ impl LogSinkInstance {
                     levels: *levels,
                 })
             }
+            LogSinkConfig::Stderr { levels } => Some(Self::Stderr(StderrLogSink::new(*levels))),
         }
     }
 
@@ -82,7 +86,7 @@ impl LogSinkInstance {
                 continue;
             }
             if let Err(e) = sink.write(config, &subset) {
-                eprintln!("hopf-otel: log sink write failed: {e}");
+                write_internal_diagnostic(format!("hopf-otel: log sink write failed: {e}"));
             }
         }
         batch.clear();
@@ -94,6 +98,7 @@ impl LogSink for LogSinkInstance {
     fn accepts(&self, level: LogLevel) -> bool {
         match self {
             Self::Jsonl { levels, .. } | Self::OtlpHttp { levels, .. } => levels.accepts(level),
+            Self::Stderr(s) => s.accepts(level),
         }
     }
 
@@ -104,6 +109,14 @@ impl LogSink for LogSinkInstance {
                 let body = encode_logs_request(config, batch);
                 post_protobuf(endpoint, &body).map(|_| ())
             }
+            Self::Stderr(s) => s.write(config, batch).map_err(|e| e.to_string()),
+        }
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        match self {
+            Self::Stderr(s) => s.shutdown().map_err(|e| e.to_string()),
+            _ => Ok(()),
         }
     }
 }

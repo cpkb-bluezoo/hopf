@@ -32,7 +32,7 @@
 //!     fn on_delivery_start(&mut self, _: u16, _: &str, _: u64, _: bool, _: &str, _: &str, _: &BasicProperties, _: u64) {}
 //!     fn on_delivery_data(&mut self, _: u16, _: &[u8]) {}
 //!     fn on_delivery_complete(&mut self, _: &mut dyn AmqpClientControl, _: u16) {}
-//!     fn on_error(&mut self, err: &std::io::Error) { eprintln!("{err}"); }
+//!     fn on_error(&mut self, err: &std::io::Error) { hopf_core::log_warn("amqp.client.error", err.to_string()); }
 //!     fn on_disconnected(&mut self) {}
 //! }
 //! struct Factory;

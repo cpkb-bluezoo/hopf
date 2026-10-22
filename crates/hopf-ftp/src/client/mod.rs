@@ -52,8 +52,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hopf_core::{
-    ConnHandle, ProtocolHandler, Runtime, SharedTlsAcceptor, SharedTlsConnector, TcpConnectorConfig,
-    UnixConnectorConfig,
+    subsystem_log, ConnHandle, LogLevel, ProtocolHandler, Runtime, SharedTlsAcceptor,
+    SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig,
 };
 use hopf_dns::{parse_literal_ip, DnsResolver};
 
@@ -700,13 +700,23 @@ impl FtpClient {
                 let addrs = match result {
                     Ok(a) => a,
                     Err(e) => {
-                        eprintln!("hopf-ftp: DNS error for {host_for_err}: {e}");
+                        subsystem_log(
+                            LogLevel::Warn,
+                            "hopf-ftp",
+                            "ftp.dns.error",
+                            format!("DNS error for {host_for_err}: {e}"),
+                        );
                         return;
                     }
                 };
                 if let Some(addr) = addrs.into_iter().next() {
                     if let Err(e) = dial(addr) {
-                        eprintln!("hopf-ftp: connect error: {e}");
+                        subsystem_log(
+                            LogLevel::Warn,
+                            "hopf-ftp",
+                            "ftp.connect.error",
+                            format!("connect error: {e}"),
+                        );
                     }
                 }
             }),

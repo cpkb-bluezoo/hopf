@@ -6,7 +6,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use hopf_core::{PeerAddr, TelemetryHook};
+use std::cell::Cell;
+
+use hopf_core::{clear_process_telemetry, set_process_telemetry, LogRecord, PeerAddr, TelemetryHook};
 
 use crate::batch::{spawn_worker, ExportHandle};
 use crate::config::{LogSinkConfig, OtelConfig};
@@ -34,6 +36,7 @@ pub struct TelemetryPipeline {
 impl TelemetryPipeline {
     /// Start the export worker. Returns error if no sink is configured.
     pub fn start(config: OtelConfig) -> Result<Self, String> {
+        let config = config.with_default_stderr_if_empty();
         if !config.has_sink() {
             return Err(
                 "OtelConfig requires at least one OTLP or JSONL sink (logs/traces/metrics)".into(),
@@ -63,7 +66,7 @@ impl TelemetryPipeline {
         let pop3_metrics = Pop3ServerMetrics::new(sender.clone());
         let imap_metrics = ImapServerMetrics::new(sender.clone());
         let mqtt_metrics = MqttServerMetrics::new(sender.clone());
-        Ok(Self {
+        let pipeline = Self {
             config,
             sender,
             metrics,
@@ -74,7 +77,9 @@ impl TelemetryPipeline {
             mqtt_metrics,
             join: Some(join),
             running,
-        })
+        };
+        set_process_telemetry(pipeline.hook());
+        Ok(pipeline)
     }
 
     /// Whether any configured log sink accepts `level`.
@@ -148,6 +153,7 @@ impl TelemetryPipeline {
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }
+        clear_process_telemetry();
     }
 }
 
@@ -159,13 +165,27 @@ impl Drop for TelemetryPipeline {
                 let _ = j.join();
             }
         }
+        clear_process_telemetry();
         let _ = self.running;
     }
+}
+
+thread_local! {
+    static HOOK_REENTRANT: Cell<bool> = const { Cell::new(false) };
 }
 
 struct Hook(ExportHandle);
 
 impl TelemetryHook for Hook {
+    fn on_log(&self, record: &LogRecord) {
+        if HOOK_REENTRANT.with(|c| c.get()) {
+            return;
+        }
+        HOOK_REENTRANT.with(|c| c.set(true));
+        self.0.try_send_log(record.clone());
+        HOOK_REENTRANT.with(|c| c.set(false));
+    }
+
     fn on_accept(&self, peer: PeerAddr) {
         self.try_send(log_record_from_event(
             EventKind::Accept,
@@ -216,6 +236,13 @@ mod tests {
     use crate::event::log_record_from_event;
     use crate::log_record::LogRecord;
     use crate::otlp_proto::encode_logs_request;
+
+    #[test]
+    fn default_config_starts_with_stderr_sink() {
+        let pipeline = TelemetryPipeline::start(OtelConfig::default()).unwrap();
+        assert!(pipeline.accepts(LogLevel::Warn));
+        pipeline.shutdown();
+    }
 
     #[test]
     fn jsonl_appends_line() {

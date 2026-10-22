@@ -23,6 +23,7 @@ mod otlp_proto;
 mod pipeline;
 mod propagate;
 mod sink;
+mod stderr_sink;
 mod trace;
 
 pub use batch::ExportHandle;

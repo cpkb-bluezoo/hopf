@@ -78,7 +78,11 @@ pub use runtime::{Runtime, RuntimeConfig};
 pub use security::SecurityInfo;
 pub use service::Service;
 pub use storage::{StorageConfig, StorageError, StorageExecutor};
-pub use telemetry::{NopTelemetry, TelemetryHook};
+pub use telemetry::{
+    clear_process_telemetry, emit_connection_log, emit_log, log_error, log_warn, set_process_telemetry,
+    subsystem_log,
+    AttrValue, LogLevel, LogRecord, NopTelemetry, TelemetryHook,
+};
 pub use tls::{
     acceptor_from_pem, acceptor_from_pem_tls12, acceptor_from_pem_tls12_with_client_auth,
     acceptor_from_credentials, acceptor_from_credentials_with_client_auth,

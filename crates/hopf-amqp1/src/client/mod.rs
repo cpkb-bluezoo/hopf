@@ -28,7 +28,7 @@
 //!         props.content_type = Some("text/plain".into());
 //!         let _ = control.send(handle, b"tag-1", None, Some(&props), &[], b"hello amqp 1.0", true);
 //!     }
-//!     fn on_error(&mut self, err: &std::io::Error) { eprintln!("amqp1 error: {err}"); }
+//!     fn on_error(&mut self, err: &std::io::Error) { hopf_core::log_warn("amqp1.client.error", err.to_string()); }
 //!     fn on_disconnected(&mut self) {}
 //! }
 //! struct Factory;

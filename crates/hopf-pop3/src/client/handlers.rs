@@ -30,7 +30,12 @@ pub trait Pop3ClientHandlerFactory: Send + Sync {
     /// Default: a line on stderr. Override it to surface the failure the
     /// way the rest of the session's outcomes are surfaced.
     fn connect_failed(&self, host: &str, error: &io::Error) {
-        eprintln!("hopf-pop3: connect to {host} failed: {error}");
+        hopf_core::subsystem_log(
+            hopf_core::LogLevel::Warn,
+            "hopf-pop3",
+            "pop3.connect.failed",
+            format!("connect to {host} failed: {error}"),
+        );
     }
 }
 

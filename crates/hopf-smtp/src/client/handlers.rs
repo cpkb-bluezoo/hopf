@@ -32,7 +32,12 @@ pub trait SmtpClientHandlerFactory: Send + Sync {
     /// Default: a line on stderr. Override it to surface the failure the
     /// way the rest of the session's outcomes are surfaced.
     fn connect_failed(&self, host: &str, error: &io::Error) {
-        eprintln!("hopf-smtp: connect to {host} failed: {error}");
+        hopf_core::subsystem_log(
+            hopf_core::LogLevel::Warn,
+            "hopf-smtp",
+            "smtp.connect.failed",
+            format!("connect to {host} failed: {error}"),
+        );
     }
 }
 

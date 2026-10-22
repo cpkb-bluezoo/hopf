@@ -46,7 +46,12 @@ pub trait NntpClientHandlerFactory: Send + Sync {
     /// addresses for `host`, or the connect could not be started at all.
     /// Default: a line on stderr.
     fn connect_failed(&self, host: &str, error: &io::Error) {
-        eprintln!("hopf-nntp: connect to {host} failed: {error}");
+        hopf_core::subsystem_log(
+            hopf_core::LogLevel::Warn,
+            "hopf-nntp",
+            "nntp.connect.failed",
+            format!("connect to {host} failed: {error}"),
+        );
     }
 }
 

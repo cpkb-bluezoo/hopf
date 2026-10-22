@@ -13,7 +13,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hopf_core::{Runtime, SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig};
+use hopf_core::{
+    subsystem_log, LogLevel, Runtime, SharedTlsConnector, TcpConnectorConfig, UnixConnectorConfig,
+};
 use hopf_dns::DnsResolver;
 
 use crate::codec::packet::{ProtocolVersion, Will};
@@ -324,12 +326,22 @@ impl MqttClient {
                 let addrs = match result {
                     Ok(a) => a,
                     Err(e) => {
-                        eprintln!("hopf-mqtt: DNS error for {host_for_err}: {e}");
+                        subsystem_log(
+                            LogLevel::Warn,
+                            "hopf-mqtt",
+                            "mqtt.dns.error",
+                            format!("DNS error for {host_for_err}: {e}"),
+                        );
                         return;
                     }
                 };
                 let Some(addr) = addrs.into_iter().next() else {
-                    eprintln!("hopf-mqtt: DNS returned no addresses for {host_for_err}");
+                    subsystem_log(
+                        LogLevel::Warn,
+                        "hopf-mqtt",
+                        "mqtt.dns.empty",
+                        format!("DNS returned no addresses for {host_for_err}"),
+                    );
                     return;
                 };
                 let factory2 = Arc::clone(&factory);
@@ -344,7 +356,12 @@ impl MqttClient {
                     }
                 }
                 if let Err(e) = rt2.connect(cfg) {
-                    eprintln!("hopf-mqtt: connect error: {e}");
+                    subsystem_log(
+                        LogLevel::Warn,
+                        "hopf-mqtt",
+                        "mqtt.connect.error",
+                        format!("connect error: {e}"),
+                    );
                 }
             }),
         );
