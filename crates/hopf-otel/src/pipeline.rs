@@ -9,8 +9,9 @@ use std::thread::JoinHandle;
 use hopf_core::{PeerAddr, TelemetryHook};
 
 use crate::batch::{spawn_worker, ExportHandle};
-use crate::config::OtelConfig;
-use crate::event::{EventKind, TelemetryEvent};
+use crate::config::{LogSinkConfig, OtelConfig};
+use crate::event::{log_record_from_event, EventKind};
+use crate::log_record::LogLevel;
 use crate::metrics::{
     FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MqttServerMetrics, Pop3ServerMetrics,
     SmtpServerMetrics,
@@ -38,8 +39,14 @@ impl TelemetryPipeline {
                 "OtelConfig requires at least one OTLP or JSONL sink (logs/traces/metrics)".into(),
             );
         }
+        for sink in &config.log_sinks {
+            if let LogSinkConfig::OtlpHttp { endpoint, .. } = sink {
+                if crate::otlp_http::HttpEndpoint::parse(endpoint).is_none() {
+                    return Err(format!("invalid OTLP logs endpoint URL: {endpoint}"));
+                }
+            }
+        }
         for (label, url) in [
-            ("logs", config.otlp_logs_endpoint.as_deref()),
             ("traces", config.otlp_traces_endpoint.as_deref()),
             ("metrics", config.otlp_metrics_endpoint.as_deref()),
         ] {
@@ -68,6 +75,11 @@ impl TelemetryPipeline {
             join: Some(join),
             running,
         })
+    }
+
+    /// Whether any configured log sink accepts `level`.
+    pub fn accepts(&self, level: LogLevel) -> bool {
+        self.config.accepts(level)
     }
 
     /// Shared hook for [`hopf_core::Runtime::start_with_telemetry`].
@@ -125,6 +137,11 @@ impl TelemetryPipeline {
         self.sender.dropped_log_records()
     }
 
+    /// Per-level drop counts (`LogLevel::index` order).
+    pub fn dropped_logs_by_level(&self) -> [u64; 5] {
+        self.sender.dropped_logs_by_level()
+    }
+
     /// Stop the worker and flush.
     pub fn shutdown(mut self) {
         self.sender.shutdown();
@@ -150,7 +167,7 @@ struct Hook(ExportHandle);
 
 impl TelemetryHook for Hook {
     fn on_accept(&self, peer: PeerAddr) {
-        self.0.try_send_log(TelemetryEvent::new(
+        self.try_send(log_record_from_event(
             EventKind::Accept,
             Some(peer.clone()),
             format!("accept {peer}"),
@@ -158,7 +175,7 @@ impl TelemetryHook for Hook {
     }
 
     fn on_dial(&self, peer: PeerAddr) {
-        self.0.try_send_log(TelemetryEvent::new(
+        self.try_send(log_record_from_event(
             EventKind::Dial,
             Some(peer.clone()),
             format!("dial {peer}"),
@@ -166,7 +183,7 @@ impl TelemetryHook for Hook {
     }
 
     fn on_close(&self, peer: PeerAddr) {
-        self.0.try_send_log(TelemetryEvent::new(
+        self.try_send(log_record_from_event(
             EventKind::Close,
             Some(peer.clone()),
             format!("close {peer}"),
@@ -174,7 +191,7 @@ impl TelemetryHook for Hook {
     }
 
     fn on_error(&self, peer: Option<PeerAddr>, msg: &str) {
-        self.0.try_send_log(TelemetryEvent::new(
+        self.try_send(log_record_from_event(
             EventKind::Error,
             peer,
             msg.to_string(),
@@ -182,18 +199,22 @@ impl TelemetryHook for Hook {
     }
 
     fn on_warn(&self, msg: &str) {
-        self.0.try_send_log(TelemetryEvent::new(
-            EventKind::Warn,
-            None,
-            msg.to_string(),
-        ));
+        self.try_send(log_record_from_event(EventKind::Warn, None, msg.to_string()));
+    }
+}
+
+impl Hook {
+    fn try_send(&self, rec: crate::log_record::LogRecord) {
+        self.0.try_send_log(rec);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::EventKind;
+    use crate::config::LevelSet;
+    use crate::event::log_record_from_event;
+    use crate::log_record::LogRecord;
     use crate::otlp_proto::encode_logs_request;
 
     #[test]
@@ -215,6 +236,18 @@ mod tests {
         assert!(body.contains("connection.accept"), "{body}");
         assert!(body.contains("boom"), "{body}");
         let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn accepts_false_when_no_sink_takes_level() {
+        let cfg = OtelConfig::new("no-access").with_jsonl_logs(
+            std::env::temp_dir().join(format!("hopf-otel-no-access-{}.jsonl", std::process::id())),
+        );
+        let pipeline = TelemetryPipeline::start(cfg).unwrap();
+        assert!(pipeline.accepts(LogLevel::Info));
+        assert!(!pipeline.accepts(LogLevel::Access));
+        assert!(!pipeline.accepts(LogLevel::Qlog));
+        pipeline.shutdown();
     }
 
     #[test]
@@ -256,11 +289,10 @@ mod tests {
         let handle = pipeline.export_handle();
         let filler = std::thread::spawn(move || {
             for i in 0..200 {
-                handle.try_send_log(TelemetryEvent::new(
-                    EventKind::Warn,
-                    None,
-                    format!("queued-{i}"),
-                ));
+                handle.try_send_log(
+                    LogRecord::new(LogLevel::Warn, "runtime.warn")
+                        .with_body(format!("queued-{i}")),
+                );
             }
         });
         filler.join().unwrap();
@@ -288,13 +320,13 @@ mod tests {
         let pipeline = TelemetryPipeline::start(cfg).unwrap();
         let handle = pipeline.export_handle();
         for i in 0..500 {
-            handle.try_send_log(TelemetryEvent::new(
-                EventKind::Warn,
-                None,
-                format!("flood-{i}"),
-            ));
+            handle.try_send_log(
+                LogRecord::new(LogLevel::Warn, "runtime.warn").with_body(format!("flood-{i}")),
+            );
         }
         assert!(pipeline.dropped_log_records() > 0);
+        let by_level = pipeline.dropped_logs_by_level();
+        assert!(by_level[LogLevel::Warn.index()] > 0);
         pipeline.flush().unwrap();
         pipeline.shutdown();
         let _ = std::fs::remove_file(&dir);
@@ -303,9 +335,43 @@ mod tests {
     #[test]
     fn encode_protobuf_nonempty() {
         let cfg = OtelConfig::new("pb");
-        let ev = TelemetryEvent::new(EventKind::Dial, None, "dial");
-        let bytes = encode_logs_request(&cfg, &[ev]);
+        let rec = log_record_from_event(EventKind::Dial, None, "dial");
+        let bytes = encode_logs_request(&cfg, &[rec]);
         assert!(!bytes.is_empty());
         assert_eq!(bytes[0] & 0x07, 2);
+    }
+
+    #[test]
+    fn disjoint_sinks_receive_only_matching_levels() {
+        let info_path = std::env::temp_dir().join(format!(
+            "hopf-otel-pipe-info-{}.jsonl",
+            std::process::id()
+        ));
+        let access_path = std::env::temp_dir().join(format!(
+            "hopf-otel-pipe-access-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&info_path);
+        let _ = std::fs::remove_file(&access_path);
+
+        let cfg = OtelConfig::new("levels")
+            .with_jsonl_log_sink(info_path.clone(), LevelSet::INFO)
+            .with_jsonl_log_sink(access_path.clone(), LevelSet::ACCESS);
+        let pipeline = TelemetryPipeline::start(cfg).unwrap();
+        let handle = pipeline.export_handle();
+        handle.try_send_log(LogRecord::new(LogLevel::Info, "i").with_body("info-msg"));
+        handle.try_send_log(LogRecord::new(LogLevel::Access, "a").with_body("access-msg"));
+        pipeline.flush().unwrap();
+        pipeline.shutdown();
+
+        let info_body = std::fs::read_to_string(&info_path).unwrap();
+        assert!(info_body.contains("info-msg"));
+        assert!(!info_body.contains("access-msg"));
+        let access_body = std::fs::read_to_string(&access_path).unwrap();
+        assert!(access_body.contains("access-msg"));
+        assert!(!access_body.contains("info-msg"));
+
+        let _ = std::fs::remove_file(&info_path);
+        let _ = std::fs::remove_file(&access_path);
     }
 }

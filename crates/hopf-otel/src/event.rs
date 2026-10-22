@@ -1,12 +1,12 @@
 // Copyright (C) 2026 Chris Burdess <dog@gnu.org>
 
-//! Telemetry events produced on the hot path (enqueue only).
-
-use std::time::{SystemTime, UNIX_EPOCH};
+//! Runtime event kinds mapped to structured [`LogRecord`]s.
 
 use hopf_core::PeerAddr;
 
-/// Kind of runtime event.
+use crate::log_record::{AttrValue, LogLevel, LogRecord};
+
+/// Kind of runtime event (hook convenience API).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     /// Accepted connection.
@@ -21,52 +21,19 @@ pub enum EventKind {
     Warn,
 }
 
-/// One telemetry event (log-oriented).
-#[derive(Debug, Clone)]
-pub struct TelemetryEvent {
-    /// Event kind.
-    pub kind: EventKind,
-    /// Optional peer address — TCP/IP or UNIX domain socket path.
-    pub peer: Option<PeerAddr>,
-    /// Human-readable body / message.
-    pub message: String,
-    /// Unix nanoseconds.
-    pub time_unix_nano: u64,
-}
-
-impl TelemetryEvent {
-    /// Build with current time.
-    pub fn new(kind: EventKind, peer: Option<PeerAddr>, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            peer,
-            message: message.into(),
-            time_unix_nano: now_unix_nano(),
-        }
-    }
-
-    /// Severity number (OTLP): INFO=9, WARN=13, ERROR=17.
-    pub fn severity_number(&self) -> i32 {
-        match self.kind {
-            EventKind::Error => 17,
-            EventKind::Warn => 13,
-            EventKind::Close => 9,
-            EventKind::Accept | EventKind::Dial => 9,
-        }
-    }
-
-    /// Severity text.
-    pub fn severity_text(&self) -> &'static str {
-        match self.kind {
-            EventKind::Error => "ERROR",
-            EventKind::Warn => "WARN",
-            _ => "INFO",
+impl EventKind {
+    /// Map to [`LogLevel`].
+    pub fn log_level(self) -> LogLevel {
+        match self {
+            EventKind::Error => LogLevel::Error,
+            EventKind::Warn => LogLevel::Warn,
+            _ => LogLevel::Info,
         }
     }
 
     /// Short event name attribute.
-    pub fn event_name(&self) -> &'static str {
-        match self.kind {
+    pub fn event_name(self) -> &'static str {
+        match self {
             EventKind::Accept => "connection.accept",
             EventKind::Dial => "connection.dial",
             EventKind::Close => "connection.close",
@@ -76,9 +43,36 @@ impl TelemetryEvent {
     }
 }
 
-fn now_unix_nano() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+/// Build a [`LogRecord`] from a hook-style runtime event.
+pub fn log_record_from_event(
+    kind: EventKind,
+    peer: Option<PeerAddr>,
+    message: impl Into<String>,
+) -> LogRecord {
+    let message = message.into();
+    let mut record = LogRecord::new(kind.log_level(), kind.event_name()).with_body(message);
+    match peer {
+        Some(PeerAddr::Inet(addr)) => {
+            record
+                .attrs
+                .push(("net.peer.ip".into(), AttrValue::String(addr.ip().to_string())));
+            record.attrs.push((
+                "net.peer.port".into(),
+                AttrValue::String(addr.port().to_string()),
+            ));
+        }
+        Some(PeerAddr::Unix(path)) => {
+            record
+                .attrs
+                .push(("net.sock.family".into(), AttrValue::String("unix".into())));
+            if let Some(path) = path {
+                record.attrs.push((
+                    "net.sock.peer.name".into(),
+                    AttrValue::String(path.display().to_string()),
+                ));
+            }
+        }
+        None => {}
+    }
+    record
 }

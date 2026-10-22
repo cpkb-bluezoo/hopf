@@ -4,10 +4,8 @@
 
 use rprotobuf::Writer;
 
-use hopf_core::PeerAddr;
-
 use crate::config::OtelConfig;
-use crate::event::TelemetryEvent;
+use crate::log_record::{AttrValue, LogRecord};
 use crate::metrics::MetricPoint;
 use crate::trace::FinishedSpan;
 
@@ -25,6 +23,8 @@ const LOG_SEVERITY_NUMBER: u32 = 2;
 const LOG_SEVERITY_TEXT: u32 = 3;
 const LOG_BODY: u32 = 5;
 const LOG_ATTRIBUTES: u32 = 6;
+const LOG_TRACE_ID: u32 = 9;
+const LOG_SPAN_ID: u32 = 10;
 const KV_KEY: u32 = 1;
 const KV_VALUE: u32 = 2;
 const ANY_STRING: u32 = 1;
@@ -71,23 +71,33 @@ const HDP_COUNT: u32 = 4;
 const HDP_SUM: u32 = 5;
 
 /// Encode a batch as `ExportLogsServiceRequest` protobuf bytes.
-pub fn encode_logs_request(config: &OtelConfig, events: &[TelemetryEvent]) -> Vec<u8> {
-    let mut w = Writer::buffer(4096 + events.len() * 256);
+pub fn encode_logs_request(config: &OtelConfig, records: &[LogRecord]) -> Vec<u8> {
+    let mut w = Writer::buffer(4096 + records.len() * 256);
     let _ = w.write_message_field(LOGS_RESOURCE_LOGS, |rl| {
-        rl.write_message_field(RESOURCE_LOGS_RESOURCE, |res| {
-            write_resource(res, config)
-        })?;
-        rl.write_message_field(RESOURCE_LOGS_SCOPE_LOGS, |sl| {
-            sl.write_message_field(SCOPE_LOGS_SCOPE, |scope| {
-                scope.write_string_field(SCOPE_NAME, "hopf")?;
-                scope.write_string_field(SCOPE_VERSION, env!("CARGO_PKG_VERSION"))?;
+        rl.write_message_field(RESOURCE_LOGS_RESOURCE, |res| write_resource(res, config))?;
+        // Group by scope name for ScopeLogs.
+        let mut scopes: Vec<(&str, Vec<&LogRecord>)> = Vec::new();
+        for rec in records {
+            if let Some((_, list)) = scopes.iter_mut().find(|(name, _)| *name == rec.scope.as_str())
+            {
+                list.push(rec);
+            } else {
+                scopes.push((rec.scope.as_str(), vec![rec]));
+            }
+        }
+        for (scope_name, scoped) in scopes {
+            rl.write_message_field(RESOURCE_LOGS_SCOPE_LOGS, |sl| {
+                sl.write_message_field(SCOPE_LOGS_SCOPE, |scope| {
+                    scope.write_string_field(SCOPE_NAME, scope_name)?;
+                    scope.write_string_field(SCOPE_VERSION, env!("CARGO_PKG_VERSION"))?;
+                    Ok(())
+                })?;
+                for rec in scoped {
+                    sl.write_message_field(SCOPE_LOGS_LOG_RECORDS, |lr| write_log_record(lr, rec))?;
+                }
                 Ok(())
             })?;
-            for ev in events {
-                sl.write_message_field(SCOPE_LOGS_LOG_RECORDS, |lr| write_log_record(lr, ev))?;
-            }
-            Ok(())
-        })?;
+        }
         Ok(())
     });
     w.finish()
@@ -106,27 +116,23 @@ fn write_resource(w: &mut Writer<rprotobuf::Buffer>, config: &OtelConfig) -> Res
 
 fn write_log_record(
     w: &mut Writer<rprotobuf::Buffer>,
-    ev: &TelemetryEvent,
+    rec: &LogRecord,
 ) -> Result<(), rprotobuf::WriteError> {
-    w.write_fixed64_field(LOG_TIME, ev.time_unix_nano)?;
-    w.write_varint_field(LOG_SEVERITY_NUMBER, ev.severity_number() as u64)?;
-    w.write_string_field(LOG_SEVERITY_TEXT, ev.severity_text())?;
-    w.write_message_field(LOG_BODY, |any| {
-        any.write_string_field(ANY_STRING, &ev.message)
-    })?;
-    write_kv(w, LOG_ATTRIBUTES, "event.name", ev.event_name())?;
-    match &ev.peer {
-        Some(PeerAddr::Inet(addr)) => {
-            write_kv(w, LOG_ATTRIBUTES, "net.peer.ip", &addr.ip().to_string())?;
-            write_kv(w, LOG_ATTRIBUTES, "net.peer.port", &addr.port().to_string())?;
-        }
-        Some(PeerAddr::Unix(path)) => {
-            write_kv(w, LOG_ATTRIBUTES, "net.sock.family", "unix")?;
-            if let Some(path) = path {
-                write_kv(w, LOG_ATTRIBUTES, "net.sock.peer.name", &path.display().to_string())?;
-            }
-        }
-        None => {}
+    w.write_fixed64_field(LOG_TIME, rec.time_unix_nano)?;
+    w.write_varint_field(LOG_SEVERITY_NUMBER, rec.level.severity_number() as u64)?;
+    w.write_string_field(LOG_SEVERITY_TEXT, rec.level.severity_text())?;
+    if let Some(body) = &rec.body {
+        w.write_message_field(LOG_BODY, |any| any.write_string_field(ANY_STRING, body))?;
+    }
+    write_kv(w, LOG_ATTRIBUTES, "event.name", &rec.name)?;
+    for (key, value) in &rec.attrs {
+        write_attr(w, LOG_ATTRIBUTES, key, value)?;
+    }
+    if let Some(trace_id) = &rec.trace_id {
+        w.write_bytes_field(LOG_TRACE_ID, trace_id)?;
+    }
+    if let Some(span_id) = &rec.span_id {
+        w.write_bytes_field(LOG_SPAN_ID, span_id)?;
     }
     Ok(())
 }
@@ -137,9 +143,23 @@ fn write_kv(
     key: &str,
     value: &str,
 ) -> Result<(), rprotobuf::WriteError> {
+    write_attr(w, field, key, &AttrValue::String(value.to_string()))
+}
+
+fn write_attr(
+    w: &mut Writer<rprotobuf::Buffer>,
+    field: u32,
+    key: &str,
+    value: &AttrValue,
+) -> Result<(), rprotobuf::WriteError> {
     w.write_message_field(field, |kv| {
         kv.write_string_field(KV_KEY, key)?;
-        kv.write_message_field(KV_VALUE, |any| any.write_string_field(ANY_STRING, value))?;
+        kv.write_message_field(KV_VALUE, |any| match value {
+            AttrValue::String(s) => any.write_string_field(ANY_STRING, s),
+            AttrValue::Bool(v) => any.write_bool_field(2, *v),
+            AttrValue::Int(v) => any.write_varint_field(3, *v as u64),
+            AttrValue::Double(v) => any.write_double_field(4, *v),
+        })?;
         Ok(())
     })
 }
@@ -289,7 +309,10 @@ fn write_metric(
 mod tests {
     use super::*;
     use crate::config::OtelConfig;
-    use crate::event::{EventKind, TelemetryEvent};
+    use crate::event::EventKind;
+    use crate::event::log_record_from_event;
+    use crate::log_record::LogLevel;
+    use crate::log_record::LogRecord;
     use crate::metrics::MetricPoint;
     use crate::trace::{FinishedSpan, SpanContext, SpanKind, SpanStatusCode};
 
@@ -298,10 +321,20 @@ mod tests {
         let cfg = OtelConfig::new("cov");
         let logs = encode_logs_request(
             &cfg,
-            &[TelemetryEvent::new(EventKind::Accept, None, "hi")],
+            &[log_record_from_event(EventKind::Accept, None, "hi")],
         );
         assert!(!logs.is_empty());
         assert_eq!(logs[0] & 0x07, 2);
+
+        let trace_id = [0x0a; 16];
+        let span_id = [0x0b; 8];
+        let rich = LogRecord::new(LogLevel::Info, "http.request")
+            .with_body("ok")
+            .attr("http.method", "GET")
+            .with_trace_ids(trace_id, span_id);
+        let rich_bytes = encode_logs_request(&cfg, &[rich]);
+        assert!(rich_bytes.windows(16).any(|w| w == trace_id));
+        assert!(rich_bytes.windows(8).any(|w| w == span_id));
 
         let span = FinishedSpan {
             context: SpanContext::new_sampled(),

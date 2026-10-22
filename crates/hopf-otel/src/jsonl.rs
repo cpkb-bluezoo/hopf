@@ -2,14 +2,14 @@
 
 //! OTLP JSON Lines file appender (export worker only).
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use hopf_core::PeerAddr;
-
 use crate::config::OtelConfig;
-use crate::event::TelemetryEvent;
+use crate::crypto_ids::to_hex;
+use crate::log_record::{AttrValue, LogRecord};
 
 /// Append one JSON object per batch as a JSONL line.
 pub struct JsonlAppender {
@@ -29,8 +29,8 @@ impl JsonlAppender {
     }
 
     /// Encode and append logs JSONL.
-    pub fn append_logs(&self, config: &OtelConfig, events: &[TelemetryEvent]) -> Result<(), String> {
-        self.append_line(&encode_logs_json(config, events))
+    pub fn append_logs(&self, config: &OtelConfig, records: &[LogRecord]) -> Result<(), String> {
+        self.append_line(&encode_logs_json(config, records))
     }
 
     /// Encode and append traces JSONL.
@@ -63,7 +63,8 @@ impl JsonlAppender {
     }
 }
 
-fn escape_json(s: &str) -> String {
+/// Escape a string for JSON string context.
+pub(crate) fn escape_json(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {
@@ -87,8 +88,21 @@ fn kv_string(key: &str, value: &str) -> String {
     )
 }
 
+fn kv_attr(key: &str, value: &AttrValue) -> String {
+    let value_json = match value {
+        AttrValue::String(s) => format!("{{\"stringValue\":\"{}\"}}", escape_json(s)),
+        AttrValue::Int(v) => format!("{{\"intValue\":\"{v}\"}}"),
+        AttrValue::Bool(v) => format!("{{\"boolValue\":{v}}}"),
+        AttrValue::Double(v) => format!("{{\"doubleValue\":{v}}}"),
+    };
+    format!(
+        "{{\"key\":\"{}\",\"value\":{value_json}}}",
+        escape_json(key)
+    )
+}
+
 /// OTLP JSON encoding of ExportLogsServiceRequest (one object).
-pub fn encode_logs_json(config: &OtelConfig, events: &[TelemetryEvent]) -> String {
+pub fn encode_logs_json(config: &OtelConfig, records: &[LogRecord]) -> String {
     let mut resource_attrs = vec![kv_string("service.name", &config.service_name)];
     if let Some(v) = &config.service_version {
         resource_attrs.push(kv_string("service.version", v));
@@ -97,38 +111,59 @@ pub fn encode_logs_json(config: &OtelConfig, events: &[TelemetryEvent]) -> Strin
         resource_attrs.push(kv_string("service.namespace", ns));
     }
 
-    let mut records = String::new();
-    for (i, ev) in events.iter().enumerate() {
-        if i > 0 {
-            records.push(',');
+    let mut by_scope: BTreeMap<&str, Vec<&LogRecord>> = BTreeMap::new();
+    for rec in records {
+        by_scope.entry(rec.scope.as_str()).or_default().push(rec);
+    }
+
+    let mut scope_logs = String::new();
+    for (scope_idx, (scope_name, scoped)) in by_scope.iter().enumerate() {
+        if scope_idx > 0 {
+            scope_logs.push(',');
         }
-        let mut attrs = vec![kv_string("event.name", ev.event_name())];
-        match &ev.peer {
-            Some(PeerAddr::Inet(addr)) => {
-                attrs.push(kv_string("net.peer.ip", &addr.ip().to_string()));
-                attrs.push(kv_string("net.peer.port", &addr.port().to_string()));
+        let mut records_json = String::new();
+        for (i, rec) in scoped.iter().enumerate() {
+            if i > 0 {
+                records_json.push(',');
             }
-            Some(PeerAddr::Unix(path)) => {
-                attrs.push(kv_string("net.sock.family", "unix"));
-                if let Some(path) = path {
-                    attrs.push(kv_string("net.sock.peer.name", &path.display().to_string()));
-                }
+            let mut attrs = vec![kv_string("event.name", &rec.name)];
+            for (k, v) in &rec.attrs {
+                attrs.push(kv_attr(k, v));
             }
-            None => {}
+            let body = rec
+                .body
+                .as_deref()
+                .map(|b| format!("{{\"stringValue\":\"{}\"}}", escape_json(b)))
+                .unwrap_or_else(|| "null".into());
+            let trace = rec
+                .trace_id
+                .map(|t| format!(",\"traceId\":\"{}\"", to_hex(&t)))
+                .unwrap_or_default();
+            let span = rec
+                .span_id
+                .map(|s| format!(",\"spanId\":\"{}\"", to_hex(&s)))
+                .unwrap_or_default();
+            records_json.push_str(&format!(
+                "{{\
+                 \"timeUnixNano\":\"{}\",\
+                 \"severityNumber\":{},\
+                 \"severityText\":\"{}\",\
+                 \"body\":{body},\
+                 \"attributes\":[{attrs}]{trace}{span}\
+                 }}",
+                rec.time_unix_nano,
+                rec.level.severity_number(),
+                escape_json(rec.level.severity_text()),
+                attrs = attrs.join(","),
+            ));
         }
-        records.push_str(&format!(
+        scope_logs.push_str(&format!(
             "{{\
-             \"timeUnixNano\":\"{}\",\
-             \"severityNumber\":{},\
-             \"severityText\":\"{}\",\
-             \"body\":{{\"stringValue\":\"{}\"}},\
-             \"attributes\":[{}]\
+             \"scope\":{{\"name\":\"{}\",\"version\":\"{}\"}},\
+             \"logRecords\":[{records_json}]\
              }}",
-            ev.time_unix_nano,
-            ev.severity_number(),
-            escape_json(ev.severity_text()),
-            escape_json(&ev.message),
-            attrs.join(",")
+            escape_json(scope_name),
+            env!("CARGO_PKG_VERSION"),
         ));
     }
 
@@ -136,14 +171,10 @@ pub fn encode_logs_json(config: &OtelConfig, events: &[TelemetryEvent]) -> Strin
         "{{\
          \"resourceLogs\":[{{\
            \"resource\":{{\"attributes\":[{}]}},\
-           \"scopeLogs\":[{{\
-             \"scope\":{{\"name\":\"hopf\",\"version\":\"{}\"}},\
-             \"logRecords\":[{records}]\
-           }}]\
+           \"scopeLogs\":[{scope_logs}]\
          }}]\
          }}",
         resource_attrs.join(","),
-        env!("CARGO_PKG_VERSION"),
     )
 }
 
@@ -258,19 +289,32 @@ pub fn encode_metrics_json(config: &OtelConfig, points: &[crate::metrics::Metric
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::EventKind;
-
+    use crate::log_record::LogLevel;
     #[test]
     fn json_contains_service_and_event() {
         let cfg = OtelConfig::new("test-svc");
-        let ev = TelemetryEvent::new(
-            EventKind::Accept,
-            Some(PeerAddr::Inet("127.0.0.1:9".parse().unwrap())),
-            "accept",
-        );
-        let s = encode_logs_json(&cfg, &[ev]);
+        let rec = LogRecord::new(LogLevel::Info, "connection.accept")
+            .with_body("accept")
+            .attr("net.peer.ip", "127.0.0.1");
+        let s = encode_logs_json(&cfg, &[rec]);
         assert!(s.contains("test-svc"));
         assert!(s.contains("connection.accept"));
         assert!(s.contains("resourceLogs"));
+    }
+
+    #[test]
+    fn json_roundtrips_trace_and_attrs() {
+        let cfg = OtelConfig::new("trace-svc");
+        let trace_id = [0x01; 16];
+        let span_id = [0x02; 8];
+        let rec = LogRecord::new(LogLevel::Info, "http.request")
+            .with_body("done")
+            .attr("http.method", "GET")
+            .with_trace_ids(trace_id, span_id);
+        let s = encode_logs_json(&cfg, &[rec]);
+        assert!(s.contains("http.method"));
+        assert!(s.contains("GET"));
+        assert!(s.contains("01010101010101010101010101010101"));
+        assert!(s.contains("0202020202020202"));
     }
 }

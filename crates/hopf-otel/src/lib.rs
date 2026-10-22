@@ -16,16 +16,19 @@ mod crypto_ids;
 mod event;
 mod instrument;
 mod jsonl;
+mod log_record;
 mod metrics;
 mod otlp_http;
 mod otlp_proto;
 mod pipeline;
 mod propagate;
+mod sink;
 mod trace;
 
 pub use batch::ExportHandle;
-pub use config::OtelConfig;
-pub use event::{EventKind, TelemetryEvent};
+pub use config::{LevelSet, LogSinkConfig, OtelConfig};
+pub use event::{log_record_from_event, EventKind};
+pub use log_record::{AttrValue, LogLevel, LogRecord};
 pub use instrument::InstrumentedServerFactory;
 pub use metrics::{
     FtpServerMetrics, HttpServerMetrics, ImapServerMetrics, MetricPoint, MqttServerMetrics,
