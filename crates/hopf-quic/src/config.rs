@@ -18,6 +18,7 @@ use hopf_core::HandlerFactory;
 use crate::transport::recovery::CongestionAlgorithm;
 use crate::crypto::{hopf_client_config, hopf_server_config, HopfTlsBuildParams};
 use crate::hooks::ConnectionFactory;
+use crate::qlog::QlogSinkFactory;
 use crate::transport::endpoint::{ClientConfig as TransportClientConfig, ServerConfig as TransportServerConfig};
 use crate::transport::quic_lb::{ConnectionIdGenerator, QuicLbConfig};
 pub use crate::transport::version::QuicVersion;
@@ -184,6 +185,8 @@ pub struct QuicListenConfig {
     pub factory: HandlerFactory,
     /// Address-validation and Incoming DoS hardening.
     pub hardening: QuicListenHardening,
+    /// Optional qlog sink factory (default: telemetry pipeline when enabled).
+    pub qlog_sink_factory: Option<QlogSinkFactory>,
 }
 
 impl QuicListenConfig {
@@ -194,12 +197,19 @@ impl QuicListenConfig {
             server,
             factory,
             hardening: QuicListenHardening::high_security(),
+            qlog_sink_factory: None,
         }
     }
 
     /// Override listen hardening.
     pub fn with_hardening(mut self, hardening: QuicListenHardening) -> Self {
         self.hardening = hardening;
+        self
+    }
+
+    /// Override the per-connection qlog sink factory.
+    pub fn with_qlog_sink_factory(mut self, factory: QlogSinkFactory) -> Self {
+        self.qlog_sink_factory = Some(factory);
         self
     }
 }
@@ -214,6 +224,8 @@ pub struct QuicListenHooksConfig {
     pub connection_factory: ConnectionFactory,
     /// Address-validation and Incoming DoS hardening.
     pub hardening: QuicListenHardening,
+    /// Optional qlog sink factory (default: telemetry pipeline when enabled).
+    pub qlog_sink_factory: Option<QlogSinkFactory>,
 }
 
 impl QuicListenHooksConfig {
@@ -228,12 +240,19 @@ impl QuicListenHooksConfig {
             server,
             connection_factory,
             hardening: QuicListenHardening::high_security(),
+            qlog_sink_factory: None,
         }
     }
 
     /// Override listen hardening.
     pub fn with_hardening(mut self, hardening: QuicListenHardening) -> Self {
         self.hardening = hardening;
+        self
+    }
+
+    /// Override the per-connection qlog sink factory.
+    pub fn with_qlog_sink_factory(mut self, factory: QlogSinkFactory) -> Self {
+        self.qlog_sink_factory = Some(factory);
         self
     }
 }
@@ -376,6 +395,8 @@ pub struct QuicConnectConfig {
     pub server_name: String,
     /// Factory for the first bidirectional stream's handler.
     pub factory: HandlerFactory,
+    /// Optional qlog sink factory (default: telemetry pipeline when enabled).
+    pub qlog_sink_factory: Option<QlogSinkFactory>,
 }
 
 impl QuicConnectConfig {
@@ -391,7 +412,14 @@ impl QuicConnectConfig {
             client,
             server_name: server_name.into(),
             factory,
+            qlog_sink_factory: None,
         }
+    }
+
+    /// Override the per-connection qlog sink factory.
+    pub fn with_qlog_sink_factory(mut self, factory: QlogSinkFactory) -> Self {
+        self.qlog_sink_factory = Some(factory);
+        self
     }
 }
 

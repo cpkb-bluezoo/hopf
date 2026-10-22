@@ -7,12 +7,24 @@ use hopf_core::{
     QLOG_VANTAGE_POINT,
 };
 
+/// Factory for per-connection qlog sinks (`server`, original destination CID bytes).
+pub type QlogSinkFactory =
+    std::sync::Arc<dyn Fn(bool, &[u8]) -> std::sync::Arc<dyn QlogSink + Send + Sync> + Send + Sync>;
+
 /// Where a QUIC connection reports qlog events.
 pub trait QlogSink {
     /// Whether events are exported (`accepts(QLOG)` was true at connection setup).
     fn is_qlog_enabled(&self) -> bool;
     /// Report an event (`data_json` is the event `data` object as JSON text).
     fn emit_qlog(&self, schema: &str, event_name: &str, data_json: &str);
+    /// Alias for [`Self::is_qlog_enabled`].
+    fn is_enabled(&self) -> bool {
+        self.is_qlog_enabled()
+    }
+    /// Alias for [`Self::emit_qlog`].
+    fn emit(&self, schema: &str, event_name: &str, data_json: &str) {
+        self.emit_qlog(schema, event_name, data_json);
+    }
 }
 
 /// Discarding sink when qlog export is disabled.

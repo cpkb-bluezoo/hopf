@@ -25,6 +25,7 @@ use crate::config::{
 };
 use crate::error::{connection_lost_io_error, datagram_send_io_error, stream_stopped_io_error};
 use crate::hooks::{ConnectionFactory, DatagramDecode, QuicConnApi, QuicConnection, StreamKey};
+use crate::qlog::{QlogSink, QlogSinkFactory, TelemetryQlogSink};
 use crate::stream::{QuicStreamEndpoint, StreamQueues};
 use crate::transport::connection::{Connection, WriteError};
 use crate::transport::endpoint::Endpoint as QuicEndpoint;
@@ -303,6 +304,7 @@ pub fn listen_quic(config: QuicListenConfig) -> io::Result<QuicDriverHandle> {
         local_addr,
         None,
         require_address_validation,
+        config.qlog_sink_factory.clone(),
     )
 }
 
@@ -333,6 +335,7 @@ pub fn listen_quic_with_path(
         local_addr,
         None,
         require_address_validation,
+        config.qlog_sink_factory.clone(),
     )
 }
 
@@ -360,6 +363,7 @@ pub fn listen_quic_hooks(config: QuicListenHooksConfig) -> io::Result<QuicDriver
         local_addr,
         None,
         require_address_validation,
+        config.qlog_sink_factory.clone(),
     )
 }
 
@@ -390,6 +394,7 @@ pub fn listen_quic_hooks_with_path(
         local_addr,
         None,
         require_address_validation,
+        config.qlog_sink_factory.clone(),
     )
 }
 
@@ -412,6 +417,7 @@ pub fn connect_quic(config: QuicConnectConfig) -> io::Result<QuicDriverHandle> {
         local_addr,
         Some(config.addr),
         false,
+        config.qlog_sink_factory.clone(),
     )
 }
 
@@ -439,6 +445,7 @@ pub fn connect_quic_with_path(
         local_addr,
         Some(config.addr),
         false,
+        config.qlog_sink_factory.clone(),
     )
 }
 
@@ -466,6 +473,7 @@ pub fn connect_quic_hooks(
         local_addr,
         Some(addr),
         false,
+        None,
     )
 }
 
@@ -497,6 +505,7 @@ pub fn connect_quic_hooks_with_path(
         local_addr,
         Some(addr),
         false,
+        None,
     )
 }
 
@@ -570,6 +579,7 @@ fn spawn_driver(
     local_addr: SocketAddr,
     _peer_hint: Option<SocketAddr>,
     require_address_validation: bool,
+    qlog_sink_factory: Option<QlogSinkFactory>,
 ) -> io::Result<QuicDriverHandle> {
     let mut poll = Poll::new()?;
     let waker = Arc::new(Waker::new(poll.registry(), WAKE_TOKEN)?);
@@ -616,6 +626,7 @@ fn spawn_driver(
                 pending_sends: crate::udp::PendingUdpSends::default(),
                 udp_interest: Interest::READABLE,
                 require_address_validation,
+                qlog_sink_factory,
                 shutting_down: false,
             };
             if let Err(e) = driver.run(&mut poll) {
@@ -808,9 +819,26 @@ struct Driver {
     udp_interest: Interest,
     /// When true, unvalidated Incoming get Retry before handshake (RFC 9000 §8.1.2).
     require_address_validation: bool,
+    /// Per-connection qlog sink factory from listen/connect config.
+    qlog_sink_factory: Option<QlogSinkFactory>,
     /// Set when a `Shutdown` command has been processed.  The run loop
     /// performs a final flush + CONNECTION_CLOSE pass before exiting.
     shutting_down: bool,
+}
+
+fn attach_connection_qlog(
+    conn: &mut Connection,
+    server: bool,
+    factory: &Option<QlogSinkFactory>,
+) {
+    let sink: Arc<dyn QlogSink + Send + Sync> = if let Some(f) = factory {
+        f(server, conn.initial_destination_cid())
+    } else if let Some(s) = TelemetryQlogSink::maybe_new(server, conn.initial_destination_cid()) {
+        Arc::new(s)
+    } else {
+        return;
+    };
+    conn.attach_qlog(sink);
 }
 
 impl Driver {
@@ -840,7 +868,8 @@ impl Driver {
                 peer,
                 &server_name,
             ) {
-                Ok((ch, conn)) => {
+                Ok((ch, mut conn)) => {
+                    attach_connection_qlog(&mut conn, false, &self.qlog_sink_factory);
                     self.endpoint.register_cid(conn.local_cid().clone(), ch);
                     let early = pending_open && conn.has_0rtt();
                     self.connections.insert(
@@ -1230,7 +1259,8 @@ impl Driver {
         }
 
         match self.endpoint.accept(incoming, now, &mut self.send_buf, None) {
-            Ok((ch, conn)) => {
+            Ok((ch, mut conn)) => {
+                attach_connection_qlog(&mut conn, true, &self.qlog_sink_factory);
                 self.endpoint.register_cid(conn.local_cid().clone(), ch);
                 self.connections.insert(
                     ch,

@@ -5,7 +5,17 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::qlog::QlogSink;
+use crate::qlog_events::{OWNER_LOCAL, OWNER_REMOTE};
+use crate::qlog_transport::{
+    self, build_connection_closed, build_connection_started, build_packet_lost,
+    build_packet_received, build_packet_sent, build_parameters_set, build_recovery_metrics,
+    space_packet_type, CONNECTION_CLOSED, CONNECTION_STARTED, PARAMETERS_SET, PACKET_LOST,
+    PACKET_RECEIVED, PACKET_SENT, RECOVERY_METRICS_UPDATED,
+};
 
 use bytes::Bytes;
 use hopf_core::security::SecurityInfo;
@@ -323,6 +333,11 @@ pub struct Connection {
     keep_alive_interval: Option<Duration>,
     /// Last time a keep-alive PING was sent (or connection start).
     last_keep_alive: Instant,
+    /// Per-connection qlog sink (absent when export is off).
+    qlog: Option<Arc<dyn QlogSink + Send + Sync>>,
+    qlog_started: bool,
+    qlog_local_params_logged: bool,
+    qlog_last_metrics: Option<[i64; 4]>,
 }
 
 /// One of the peer's connection IDs (RFC 9000 section 5.1.1), as received
@@ -572,6 +587,10 @@ impl Connection {
             remembered_0rtt_stream_max: None,
             keep_alive_interval,
             last_keep_alive: now,
+            qlog: None,
+            qlog_started: false,
+            qlog_local_params_logged: false,
+            qlog_last_metrics: None,
         };
         conn.spaces[0].secrets = Some(crate::transport::packet::protection::initial_secrets(
             version,
@@ -727,6 +746,10 @@ impl Connection {
             remembered_0rtt_stream_max: None,
             keep_alive_interval,
             last_keep_alive: now,
+            qlog: None,
+            qlog_started: false,
+            qlog_local_params_logged: false,
+            qlog_last_metrics: None,
         };
         conn.short_cid_len = conn.rem_cid.len();
         // RFC 9000 section 8.1: a Retry token validates the address; without
@@ -737,6 +760,97 @@ impl Connection {
             initial_dcid.as_slice(),
         ));
         conn
+    }
+
+    /// Attach a qlog sink for this connection (no-op when disabled).
+    pub fn attach_qlog(&mut self, sink: Arc<dyn QlogSink + Send + Sync>) {
+        if !sink.is_qlog_enabled() {
+            return;
+        }
+        self.qlog = Some(sink);
+        self.qlog_log_local_parameters();
+    }
+
+    /// Original destination connection ID (qlog group id).
+    pub fn initial_destination_cid(&self) -> &[u8] {
+        self.initial_dcid.as_slice()
+    }
+
+    fn qlog_enabled(&self) -> bool {
+        self.qlog.as_ref().is_some_and(|s| s.is_qlog_enabled())
+    }
+
+    fn qlog_emit(&self, name: &str, data: String) {
+        if let Some(s) = &self.qlog {
+            s.emit_qlog(qlog_transport::schema_quic(), name, &data);
+        }
+    }
+
+    fn qlog_log_local_parameters(&mut self) {
+        if !self.qlog_enabled() || self.qlog_local_params_logged {
+            return;
+        }
+        self.qlog_local_params_logged = true;
+        let data = build_parameters_set(OWNER_LOCAL, &self.local_tp);
+        self.qlog_emit(PARAMETERS_SET, data);
+    }
+
+    fn qlog_maybe_connection_started(&mut self) {
+        if !self.qlog_enabled() || self.qlog_started {
+            return;
+        }
+        self.qlog_started = true;
+        let local_addr = SocketAddr::new(self.remote.ip(), 0);
+        let data = build_connection_started(
+            local_addr,
+            self.remote,
+            self.local_cid.as_slice(),
+            self.rem_cid.as_slice(),
+        );
+        self.qlog_emit(CONNECTION_STARTED, data);
+    }
+
+    fn qlog_recovery_metrics(&mut self) {
+        if !self.qlog_enabled() {
+            return;
+        }
+        let rtt = self.loss.rtt();
+        let cc = self.loss.congestion();
+        let min = rtt.min_rtt().as_micros() as i64;
+        let smoothed = rtt.smoothed_rtt().as_micros() as i64;
+        let latest = rtt.latest_rtt().as_micros() as i64;
+        let rttvar = rtt.rtt_var().as_micros() as i64;
+        let cwnd = cc.congestion_window();
+        let bifs = cc.bytes_in_flight();
+        let ssthresh = cc.ssthresh();
+        let sig = [min, smoothed, latest, rttvar];
+        if self.qlog_last_metrics.as_ref() == Some(&sig) {
+            return;
+        }
+        self.qlog_last_metrics = Some(sig);
+        let pacing = rtt.has_rtt_sample().then(|| {
+            let rtt_secs = rtt.smoothed_rtt().max(Duration::from_millis(1)).as_secs_f64();
+            ((cwnd as f64 * 1.25 / rtt_secs) as u64).max(1)
+        });
+        let data = build_recovery_metrics(
+            min,
+            smoothed,
+            latest,
+            rttvar,
+            cwnd,
+            bifs,
+            ssthresh,
+            pacing,
+            rtt.has_rtt_sample(),
+        );
+        self.qlog_emit(RECOVERY_METRICS_UPDATED, data);
+    }
+
+    fn qlog_connection_closed(&mut self, trigger: &str) {
+        if !self.qlog_enabled() {
+            return;
+        }
+        self.qlog_emit(CONNECTION_CLOSED, build_connection_closed(trigger));
     }
 
     /// Peer address.
@@ -885,6 +999,7 @@ impl Connection {
         if self.closed {
             return;
         }
+        self.qlog_connection_closed(crate::qlog_events::TRIGGER_CLEAN);
         self.closed = true;
         let mut payload = Vec::new();
         writer::connection_close_app(&mut payload, error_code.0, reason.as_ref());
@@ -1408,6 +1523,11 @@ impl Connection {
             self.fail_transport(FRAME_ENCODING_ERROR, "malformed or unknown frame");
             return;
         };
+        if self.qlog_enabled() {
+            let pt = space_packet_type(space, false);
+            let data = build_packet_received(pt, pn, payload.len(), &frames);
+            self.qlog_emit(PACKET_RECEIVED, data);
+        }
         // RFC 9000 §13.2.1: ACK/PADDING-only packets are not ack-eliciting —
         // ACKing them creates an infinite ACK loop.
         let ack_eliciting = frames.iter().any(|f| {
@@ -1459,11 +1579,21 @@ impl Connection {
                     peer_validated,
                 );
                 for lost in result.newly_lost {
+                    if self.qlog_enabled() {
+                        let pt = space_packet_type(space, false);
+                        let data = build_packet_lost(
+                            pt,
+                            lost.packet_number,
+                            Some(crate::qlog_events::TRIGGER_TIME_THRESHOLD),
+                        );
+                        self.qlog_emit(PACKET_LOST, data);
+                    }
                     self.requeue_lost_packet(space, &lost);
                 }
                 for acked in &result.newly_acked {
                     self.note_acknowledged_frames(space, acked);
                 }
+                self.qlog_recovery_metrics();
                 self.release_retiring();
             }
             Frame::Crypto { offset, data } => {
@@ -1746,7 +1876,11 @@ impl Connection {
                 self.idle_timeout =
                     negotiate_idle_timeout(self.local_idle_timeout_ms, tp.max_idle_timeout);
                 self.peer_max_datagram = tp.max_datagram_frame_size.unwrap_or(0);
-                self.peer_tp = Some(tp);
+                self.peer_tp = Some(tp.clone());
+                if self.qlog_enabled() {
+                    let data = build_parameters_set(OWNER_REMOTE, &tp);
+                    self.qlog_emit(PARAMETERS_SET, data);
+                }
             }
         }
         // Queue outbound CRYPTO. ServerHello stays on Initial; after handshake
@@ -1863,6 +1997,7 @@ impl Connection {
         if self.closed {
             return;
         }
+        self.qlog_connection_closed(crate::qlog_events::TRIGGER_ERROR);
         self.closed = true;
         let mut payload = Vec::new();
         writer::connection_close(&mut payload, code, reason.as_bytes());
@@ -1892,6 +2027,7 @@ impl Connection {
         }
         if ready || (self.side == Side::Server && self.spaces[2].secrets.is_some()) {
             self.established = true;
+            self.qlog_maybe_connection_started();
             self.events.push_back(Event::Connected);
             self.request_spare_cids();
             self.start_preferred_address_migration();
@@ -2727,8 +2863,24 @@ self.version,
             ack_eliciting,
             in_flight,
             packet.len(),
-            recoverable,
+            recoverable.clone(),
         );
+
+        if self.qlog_enabled() {
+            let long_header = space != SpaceId::Data || use_0rtt;
+            let pt = space_packet_type(space, use_0rtt);
+            let data = build_packet_sent(
+                pt,
+                pn,
+                packet.len(),
+                long_header,
+                self.version,
+                self.local_cid.as_slice(),
+                self.rem_cid.as_slice(),
+                &recoverable,
+            );
+            self.qlog_emit(PACKET_SENT, data);
+        }
 
         let destination = self.tx_destination.unwrap_or(self.remote);
         let tx = Transmit {
@@ -3577,6 +3729,9 @@ pub enum WriteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qlog::QlogSink;
+    use crate::qlog_transport::{PACKET_LOST, PACKET_SENT, RECOVERY_METRICS_UPDATED};
+    use std::sync::{Arc, Mutex};
     use crate::transport::packet::transport_params::PreferredAddress;
     use hopf_core::crypto::kx_policy::KxPolicy;
     use hopf_core::tls::{HandshakeMode, HandshakeRole};
@@ -3826,6 +3981,89 @@ mod tests {
 
     fn carries(packets: &[(Option<u8>, Vec<Frame>)], pred: impl Fn(&Frame) -> bool) -> bool {
         packets.iter().any(|(_, frames)| frames.iter().any(&pred))
+    }
+
+    struct RecordingQlog {
+        names: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl QlogSink for RecordingQlog {
+        fn is_qlog_enabled(&self) -> bool {
+            true
+        }
+
+        fn emit_qlog(&self, _schema: &str, event_name: &str, _data_json: &str) {
+            self.names.lock().unwrap().push(event_name.to_string());
+        }
+    }
+
+    #[test]
+    fn qlog_server_packets_emit_sent_and_received() {
+        let now = Instant::now();
+        let mut server = test_server(QuicVersion::V1, &[QuicVersion::V1]);
+        let names = Arc::new(Mutex::new(Vec::new()));
+        server.attach_qlog(Arc::new(RecordingQlog {
+            names: Arc::clone(&names),
+        }));
+        server.spaces[2].secrets = Some(crate::transport::packet::protection::initial_secrets(
+            QuicVersion::V1,
+            &[1, 2, 3, 4],
+        ));
+        server.handshake_done_pending = true;
+        let _ = drain_frames(&mut server, now);
+        let recorded = names.lock().unwrap();
+        assert!(
+            recorded.iter().any(|n| n == PACKET_SENT),
+            "expected packet_sent, got {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|n| n == "quic:parameters_set"),
+            "expected parameters_set, got {recorded:?}"
+        );
+    }
+
+    #[test]
+    fn qlog_disabled_attaches_nothing() {
+        let mut client = test_client(Instant::now());
+        client.attach_qlog(Arc::new(crate::qlog::NopQlogSink));
+        let _ = drain_frames(&mut client, Instant::now());
+    }
+
+    #[test]
+    fn qlog_loss_and_metrics_events() {
+        let now = Instant::now();
+        let mut conn = test_server(QuicVersion::V1, &[QuicVersion::V1]);
+        let names = Arc::new(Mutex::new(Vec::new()));
+        conn.attach_qlog(Arc::new(RecordingQlog {
+            names: Arc::clone(&names),
+        }));
+        conn.spaces[2].secrets = Some(crate::transport::packet::protection::initial_secrets(
+            QuicVersion::V1,
+            &[1, 2, 3, 4],
+        ));
+        conn.handshake_done_pending = true;
+        let first = drain_frames(&mut conn, now);
+        assert!(carries(&first, |f| matches!(f, Frame::HandshakeDone)));
+        for _ in 0..3 {
+            conn.pto_ping_pending[space_index(SpaceId::Data)] = true;
+            conn.flush_pending_packets(now);
+        }
+        assert_eq!(drain_frames(&mut conn, now).len(), 3);
+        conn.handle_frame(
+            SpaceId::Data,
+            Frame::Ack {
+                largest: 3,
+                delay: 0,
+                ranges: vec![(3, 3)],
+            },
+            now + Duration::from_millis(10),
+        );
+        let recorded = names.lock().unwrap();
+        assert!(recorded.iter().any(|n| n == PACKET_LOST), "{recorded:?}");
+        assert!(
+            recorded.iter().any(|n| n == RECOVERY_METRICS_UPDATED),
+            "{recorded:?}"
+        );
     }
 
     /// RFC 9000 section 13.3: HANDSHAKE_DONE is sent until acknowledged.
