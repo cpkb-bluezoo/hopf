@@ -20,6 +20,8 @@ pub struct OtelConfig {
     pub flush_interval: Duration,
     /// Bounded queue capacity; overflow drops events.
     pub queue_capacity: usize,
+    /// Max wait for [`crate::TelemetryPipeline::flush`] to finish draining the worker.
+    pub flush_timeout: Duration,
     /// Export traces (HTTP request spans).
     pub traces_enabled: bool,
     /// Export metrics.
@@ -49,6 +51,7 @@ impl Default for OtelConfig {
             batch_size: 64,
             flush_interval: Duration::from_secs(5),
             queue_capacity: 4096,
+            flush_timeout: Duration::from_secs(30),
             traces_enabled: true,
             metrics_enabled: true,
             logs_enabled: true,

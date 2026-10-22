@@ -672,7 +672,7 @@ mod tests {
             100,
         );
         metrics.connection_closed();
-        handle.flush();
+        handle.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(80));
         handle.shutdown();
         let _ = join.join();
@@ -703,7 +703,7 @@ mod tests {
             42,
         );
         metrics.connection_closed();
-        handle.flush();
+        handle.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(80));
         handle.shutdown();
         let _ = join.join();
@@ -733,7 +733,7 @@ mod tests {
             100,
         );
         metrics.connection_closed();
-        handle.flush();
+        handle.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(80));
         handle.shutdown();
         let _ = join.join();
@@ -762,7 +762,7 @@ mod tests {
             std::time::Duration::from_millis(9),
         );
         metrics.connection_closed();
-        handle.flush();
+        handle.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(80));
         handle.shutdown();
         let _ = join.join();
@@ -792,7 +792,7 @@ mod tests {
             32,
         );
         metrics.connection_closed();
-        handle.flush();
+        handle.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(80));
         handle.shutdown();
         let _ = join.join();

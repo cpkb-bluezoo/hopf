@@ -115,11 +115,14 @@ impl TelemetryPipeline {
         &self.config
     }
 
-    /// Request an immediate flush of queued events.
-    pub fn flush(&self) {
-        self.sender.flush();
-        // Give the worker a moment to drain.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    /// Block until the export worker drains queued telemetry, or [`OtelConfig::flush_timeout`].
+    pub fn flush(&self) -> Result<(), String> {
+        self.sender.flush()
+    }
+
+    /// Log records dropped because the export queue was full.
+    pub fn dropped_log_records(&self) -> u64 {
+        self.sender.dropped_log_records()
     }
 
     /// Stop the worker and flush.
@@ -205,12 +208,95 @@ mod tests {
         let hook = pipeline.hook();
         TelemetryHook::on_accept(hook.as_ref(), PeerAddr::Inet("127.0.0.1:1".parse().unwrap()));
         TelemetryHook::on_error(hook.as_ref(), None, "boom");
-        pipeline.flush();
+        pipeline.flush().unwrap();
         pipeline.shutdown();
         let body = std::fs::read_to_string(&dir).unwrap();
         assert!(body.contains("jsonl-test"), "{body}");
         assert!(body.contains("connection.accept"), "{body}");
         assert!(body.contains("boom"), "{body}");
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn flush_waits_for_in_memory_log_batch() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-otel-flush-batch-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let mut cfg = OtelConfig::new("flush-batch").with_jsonl_logs(&dir);
+        cfg.batch_size = 10_000;
+        cfg.flush_interval = std::time::Duration::from_secs(3600);
+        let pipeline = TelemetryPipeline::start(cfg).unwrap();
+        let hook = pipeline.hook();
+        for i in 0..100 {
+            TelemetryHook::on_warn(hook.as_ref(), &format!("line-{i}"));
+        }
+        pipeline.flush().unwrap();
+        let body = std::fs::read_to_string(&dir).unwrap();
+        for i in 0..100 {
+            assert!(body.contains(&format!("line-{i}")), "{body}");
+        }
+        pipeline.shutdown();
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn flush_blocks_when_export_queue_is_full() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-otel-flush-full-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let mut cfg = OtelConfig::new("flush-full").with_jsonl_logs(&dir);
+        cfg.batch_size = 10_000;
+        cfg.queue_capacity = 1;
+        cfg.flush_interval = std::time::Duration::from_secs(3600);
+        let pipeline = TelemetryPipeline::start(cfg).unwrap();
+        let handle = pipeline.export_handle();
+        let filler = std::thread::spawn(move || {
+            for i in 0..200 {
+                handle.try_send_log(TelemetryEvent::new(
+                    EventKind::Warn,
+                    None,
+                    format!("queued-{i}"),
+                ));
+            }
+        });
+        filler.join().unwrap();
+        pipeline.flush().unwrap();
+        let body = std::fs::read_to_string(&dir).unwrap();
+        let exported = body.matches("queued-").count();
+        let accepted = 200 - pipeline.dropped_log_records();
+        assert_eq!(exported, accepted as usize, "{body}");
+        assert!(accepted > 0);
+        pipeline.shutdown();
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn dropped_log_records_count_queue_overflow() {
+        let dir = std::env::temp_dir().join(format!(
+            "hopf-otel-drops-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let mut cfg = OtelConfig::new("drops").with_jsonl_logs(&dir);
+        cfg.batch_size = 10_000;
+        cfg.queue_capacity = 2;
+        cfg.flush_interval = std::time::Duration::from_secs(3600);
+        let pipeline = TelemetryPipeline::start(cfg).unwrap();
+        let handle = pipeline.export_handle();
+        for i in 0..500 {
+            handle.try_send_log(TelemetryEvent::new(
+                EventKind::Warn,
+                None,
+                format!("flood-{i}"),
+            ));
+        }
+        assert!(pipeline.dropped_log_records() > 0);
+        pipeline.flush().unwrap();
+        pipeline.shutdown();
         let _ = std::fs::remove_file(&dir);
     }
 

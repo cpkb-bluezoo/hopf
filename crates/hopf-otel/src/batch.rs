@@ -2,7 +2,7 @@
 
 //! Background batching and export (never on accept/reactor threads).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -20,7 +20,7 @@ enum Msg {
     Log(TelemetryEvent),
     Spans(Vec<FinishedSpan>),
     Metric(MetricPoint),
-    Flush,
+    Flush(SyncSender<()>),
     Shutdown,
 }
 
@@ -28,12 +28,24 @@ enum Msg {
 #[derive(Clone)]
 pub struct ExportHandle {
     tx: SyncSender<Msg>,
+    dropped_logs: Arc<AtomicU64>,
+    flush_timeout: Duration,
 }
 
 impl ExportHandle {
     /// Enqueue a log event (non-blocking).
     pub fn try_send_log(&self, event: TelemetryEvent) {
-        let _ = self.tx.try_send(Msg::Log(event));
+        match self.tx.try_send(Msg::Log(event)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.dropped_logs.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Log records dropped because the export queue was full or disconnected.
+    pub fn dropped_log_records(&self) -> u64 {
+        self.dropped_logs.load(Ordering::Relaxed)
     }
 
     /// Enqueue finished spans from one trace.
@@ -52,9 +64,15 @@ impl ExportHandle {
         let _ = self.tx.try_send(Msg::Metric(point));
     }
 
-    /// Request a flush (best-effort).
-    pub fn flush(&self) {
-        let _ = self.tx.try_send(Msg::Flush);
+    /// Block until the worker drains queued logs/spans/metrics, or timeout.
+    pub fn flush(&self) -> Result<(), String> {
+        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+        self.tx
+            .send(Msg::Flush(ack_tx))
+            .map_err(|_| "hopf-otel export worker disconnected".to_string())?;
+        ack_rx
+            .recv_timeout(self.flush_timeout)
+            .map_err(|_| format!("hopf-otel flush timed out after {:?}", self.flush_timeout))
     }
 
     pub(crate) fn shutdown(&self) {
@@ -67,11 +85,22 @@ pub fn spawn_worker(config: OtelConfig) -> (ExportHandle, JoinHandle<()>, Arc<At
     let (tx, rx) = mpsc::sync_channel(config.queue_capacity);
     let running = Arc::new(AtomicBool::new(true));
     let running2 = Arc::clone(&running);
+    let dropped_logs = Arc::new(AtomicU64::new(0));
+    let dropped_logs2 = Arc::clone(&dropped_logs);
+    let flush_timeout = config.flush_timeout;
     let handle = thread::Builder::new()
         .name("hopf-otel-export".into())
         .spawn(move || export_loop(config, rx, running2))
         .expect("spawn otel export worker");
-    (ExportHandle { tx }, handle, running)
+    (
+        ExportHandle {
+            tx,
+            dropped_logs: dropped_logs2,
+            flush_timeout,
+        },
+        handle,
+        running,
+    )
 }
 
 struct Sinks {
@@ -141,9 +170,10 @@ fn export_loop(config: OtelConfig, rx: Receiver<Msg>, running: Arc<AtomicBool>) 
                     last_flush = Instant::now();
                 }
             }
-            Ok(Msg::Flush) => {
+            Ok(Msg::Flush(ack)) => {
                 flush_all(&config, &sinks, &mut logs, &mut spans, &mut metrics);
                 last_flush = Instant::now();
+                let _ = ack.send(());
             }
             Ok(Msg::Shutdown) => {
                 flush_all(&config, &sinks, &mut logs, &mut spans, &mut metrics);

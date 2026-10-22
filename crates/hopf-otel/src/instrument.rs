@@ -446,7 +446,7 @@ mod tests {
         assert_ne!(resp_ctx.span_id, parent_ctx.span_id);
         assert_eq!(writer.body, b"ok");
 
-        pipeline.flush();
+        pipeline.flush().unwrap();
         pipeline.shutdown();
 
         let body = std::fs::read_to_string(&traces).unwrap();
