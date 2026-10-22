@@ -2,7 +2,7 @@
 
 //! ProtoFile IDL model, `.proto` parser, and rprotobuf bridges.
 
-mod base64;
+pub(crate) mod base64;
 mod enum_descriptor;
 mod field_descriptor;
 mod field_type;

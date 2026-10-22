@@ -16,15 +16,19 @@ pub mod client;
 pub mod codec;
 pub mod compression;
 pub mod framing;
+pub mod metadata;
 pub mod proto;
 pub mod server;
+pub mod timeout;
 
 pub use client::{GrpcClient, GrpcClientCall, GrpcResponseHandler, GrpcStreamingCall, GrpcUnaryCall};
 pub use codec::{parse_grpc_content_type, GrpcCodec};
 pub use compression::{
     accept_encoding_header, select_encoding, MessageCoding, DEFAULT_COMPRESSION_THRESHOLD,
-    DEFAULT_ENCODINGS,
+    DEFAULT_ENCODINGS, GRPC_STATUS_DEADLINE_EXCEEDED,
 };
+pub use metadata::{GrpcMetadata, MetadataError};
+pub use timeout::{format as format_grpc_timeout, parse as parse_grpc_timeout};
 pub use hopf_http::ContentCoding;
 pub use framing::{
     effective_max_message_size, frame, frame_compressed, framed_size, GrpcEventHandler,

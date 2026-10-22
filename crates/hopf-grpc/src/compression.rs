@@ -24,6 +24,8 @@ pub const DEFAULT_COMPRESSION_THRESHOLD: usize = 256;
 pub const IDENTITY: &str = "identity";
 
 pub(crate) const GRPC_STATUS_RESOURCE_EXHAUSTED: i32 = 8;
+/// Deadline exceeded (`grpc-timeout` or client deadline).
+pub const GRPC_STATUS_DEADLINE_EXCEEDED: i32 = 4;
 pub(crate) const GRPC_STATUS_UNIMPLEMENTED: i32 = 12;
 pub(crate) const GRPC_STATUS_INTERNAL: i32 = 13;
 
