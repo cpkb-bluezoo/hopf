@@ -155,7 +155,7 @@ pub fn provider_self_check() -> Vec<String> {
 fn aes_gcm_round_trips(key_len: usize) -> bool {
     let mut key = vec![0u8; key_len];
     let mut nonce = [0u8; 12];
-    if aws_lc_rs::rand::fill(&mut key).is_err() || aws_lc_rs::rand::fill(&mut nonce).is_err() {
+    if getrandom::getrandom(&mut key).is_err() || getrandom::getrandom(&mut nonce).is_err() {
         return false;
     }
     let Ok(key) = crate::crypto::aead::AesGcmKey::new(&key) else {
