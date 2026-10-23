@@ -2242,6 +2242,17 @@ impl HandshakeEngine {
         true
     }
 
+    /// Hold this engine to the FIPS profile (see
+    /// [`HandshakeConfig::with_fips_profile`]). Only possible before the
+    /// handshake has started; the config is left untouched on error.
+    pub fn set_fips(&mut self) -> Result<(), super::fips::FipsProfileError> {
+        if self.state != State::Initial {
+            return Err(super::fips::FipsProfileError::too_late());
+        }
+        self.config = self.config.clone().with_fips_profile()?;
+        Ok(())
+    }
+
     /// Set the client's Encrypted Client Hello configuration, as
     /// [`HandshakeConfig::ech_client`] does. Only possible before the
     /// handshake has started; returns whether it took effect.

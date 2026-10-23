@@ -16,7 +16,7 @@ use hopf_core::tls::{HandshakeConfig, HandshakeMode, HandshakeRole, ServerCreden
 use hopf_core::HandlerFactory;
 
 use crate::transport::recovery::CongestionAlgorithm;
-use crate::crypto::{hopf_client_config, hopf_server_config, HopfTlsBuildParams};
+use crate::crypto::{try_hopf_client_config, try_hopf_server_config, HopfTlsBuildParams};
 use crate::hooks::ConnectionFactory;
 use crate::qlog::QlogSinkFactory;
 use crate::transport::endpoint::{ClientConfig as TransportClientConfig, ServerConfig as TransportServerConfig};
@@ -434,6 +434,9 @@ pub struct QuicTlsOptions {
     /// `key_share`). Defaults to [`KxPolicy::classical_only`]; see
     /// [`QuicTlsOptions::with_kx_policy`].
     pub kx_policy: KxPolicy,
+    /// Hold the handshake to the FIPS profile; see
+    /// [`QuicTlsOptions::with_fips`].
+    pub fips: bool,
 }
 
 impl Default for QuicTlsOptions {
@@ -442,6 +445,7 @@ impl Default for QuicTlsOptions {
             enable_early_data: false,
             max_early_data_size: 0,
             kx_policy: KxPolicy::classical_only(),
+            fips: false,
         }
     }
 }
@@ -476,6 +480,19 @@ impl QuicTlsOptions {
         self
     }
 
+    /// Hold every handshake built from these options to the FIPS profile
+    /// (see [`hopf_core::tls::fips`]): AES-GCM suites, secp256r1 / secp384r1
+    /// and ECDSA or RSA signatures only, no key logging. A stock
+    /// [`QuicTlsOptions::kx_policy`] becomes secp256r1 then secp384r1; any
+    /// other must name only those, a cipher-suite list must be within the
+    /// profile, and a key log is refused - otherwise the config builders fail
+    /// with an error listing each offender. Self-signed server configs use an
+    /// ECDSA P-256 key instead of Ed25519.
+    pub fn with_fips(mut self) -> Self {
+        self.fips = true;
+        self
+    }
+
     /// Shorthand for [`QuicTlsOptions::with_kx_policy`] with
     /// [`KxPolicy::pqc_first`].
     pub fn with_pqc(self) -> Self {
@@ -490,8 +507,10 @@ impl QuicTlsOptions {
     }
 }
 
-fn hopf_server_credentials(names: &[&str]) -> io::Result<(ServerCredentials, Vec<u8>)> {
-    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+fn hopf_server_credentials(names: &[&str], fips: bool) -> io::Result<(ServerCredentials, Vec<u8>)> {
+    // The FIPS profile has no Ed25519 signatures.
+    let algorithm = if fips { &rcgen::PKCS_ECDSA_P256_SHA256 } else { &rcgen::PKCS_ED25519 };
+    let key_pair = rcgen::KeyPair::generate_for(algorithm)
         .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
     let params = rcgen::CertificateParams::new(
         names.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
@@ -570,7 +589,7 @@ pub fn server_config_from_pem_with(
         alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
     )
     .with_tls(tls);
-    Ok(hopf_server_config(params))
+    Ok(try_hopf_server_config(params)?)
 }
 
 /// Client config trusting CA PEM.
@@ -607,7 +626,7 @@ pub fn client_config_from_pem_with(
         cipher_suites: None,
         certificate_compression: true,
     };
-    Ok(hopf_client_config(params))
+    Ok(try_hopf_client_config(params)?)
 }
 
 /// Client config trusting the public WebPKI (native OS roots, falling back
@@ -637,7 +656,7 @@ pub fn client_config_public_trust_with(
         cipher_suites: None,
         certificate_compression: true,
     };
-    Ok(hopf_client_config(params))
+    Ok(try_hopf_client_config(params)?)
 }
 
 /// In-memory self-signed server config (Ed25519 via hopf TLS).
@@ -671,13 +690,13 @@ pub fn server_config_self_signed_with_hopf(
     alpn: &[&[u8]],
     tls: QuicTlsOptions,
 ) -> io::Result<(Arc<QuicServerConfig>, Vec<u8>)> {
-    let (creds, pem) = hopf_server_credentials(names)?;
+    let (creds, pem) = hopf_server_credentials(names, tls.fips)?;
     let params = HopfTlsBuildParams::server(
         creds,
         alpn.iter().map(|p| Bytes::copy_from_slice(p)).collect(),
     )
     .with_tls(tls);
-    Ok((hopf_server_config(params), pem))
+    Ok((try_hopf_server_config(params)?, pem))
 }
 
 /// Client config trusting a leaf PEM file.
@@ -749,7 +768,7 @@ pub fn client_config_for_pem_bytes_with_hopf(
         cipher_suites: None,
         certificate_compression: true,
     };
-    Ok(hopf_client_config(params))
+    Ok(try_hopf_client_config(params)?)
 }
 
 /// Transport options (stored but defaults used by in-tree connection for echo).

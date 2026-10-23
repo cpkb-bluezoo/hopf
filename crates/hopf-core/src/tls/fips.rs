@@ -65,6 +65,19 @@ pub struct FipsProfileError {
     pub violations: Vec<String>,
 }
 
+impl FipsProfileError {
+    /// FIPS mode was requested after the handshake had already started.
+    pub(crate) fn too_late() -> Self {
+        Self { violations: vec!["FIPS mode must be set before the handshake starts".into()] }
+    }
+}
+
+impl From<FipsProfileError> for std::io::Error {
+    fn from(err: FipsProfileError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
+    }
+}
+
 impl fmt::Display for FipsProfileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "configuration is outside the FIPS profile: {}", self.violations.join("; "))

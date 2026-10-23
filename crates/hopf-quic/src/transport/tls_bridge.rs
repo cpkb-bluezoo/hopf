@@ -358,6 +358,62 @@ mod tests {
     /// A QUIC-mode handshake restricted to TLS_AES_256_GCM_SHA384 completes
     /// on both sides and reports that suite for packet protection.
     #[test]
+    fn fips_quic_handshake_negotiates_the_profile() {
+        use crate::config::QuicTlsOptions;
+        use hopf_core::crypto::kx::NamedGroup;
+        let tls = QuicTlsOptions::new().with_fips();
+        let (c, s) = handshake_groups(tls.clone(), tls);
+        assert_eq!(c, Some(NamedGroup::SecP256r1.code()));
+        assert_eq!(s, Some(NamedGroup::SecP256r1.code()));
+    }
+
+    /// A key-exchange policy outside the profile is rejected when the config
+    /// is built, and the message names it.
+    #[test]
+    fn fips_quic_configs_reject_a_widened_policy_when_built() {
+        use crate::config::{client_config_for_pem_bytes_with, server_config_self_signed_with, QuicTlsOptions};
+        use hopf_core::crypto::kx::NamedGroup;
+        use hopf_core::crypto::kx_policy::KxPolicy;
+        let alpn: &[&[u8]] = &[b"hq-interop"];
+        // `[X25519]` alone equals the stock classical policy, which the profile replaces.
+        let widened = QuicTlsOptions::new()
+            .with_kx_policy(KxPolicy::new(vec![NamedGroup::SecP256r1, NamedGroup::X25519]))
+            .with_fips();
+        let err = server_config_self_signed_with(&["localhost"], alpn, widened.clone()).err().expect("X25519 is outside the profile");
+        assert!(err.to_string().contains("X25519"), "{err}");
+        let (_, pem) = server_config_self_signed_with(&["localhost"], alpn, QuicTlsOptions::new().with_fips()).unwrap();
+        let err = client_config_for_pem_bytes_with(&pem, alpn, widened).err().expect("X25519 is outside the profile");
+        assert!(err.to_string().contains("X25519"), "{err}");
+    }
+
+    #[test]
+    fn fips_quic_try_builders_reject_suites_and_key_logs_outside_the_profile() {
+        use crate::config::QuicTlsOptions;
+        use crate::crypto::{try_hopf_server_config, HopfTlsBuildParams};
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap().self_signed(&kp).unwrap();
+        let creds = hopf_core::tls::ServerCredentials {
+            cert_chain: vec![bytes::Bytes::copy_from_slice(cert.der())],
+            signing_key_pkcs8: bytes::Bytes::from(kp.serialize_der()),
+        };
+        let params = |suites: Vec<u16>| {
+            HopfTlsBuildParams::server(creds.clone(), vec![bytes::Bytes::from_static(b"h3")])
+                .with_cipher_suites(suites)
+                .with_tls(QuicTlsOptions::new().with_fips())
+        };
+        let err = try_hopf_server_config(params(vec![0x1301, 0x1303])).err().expect("ChaCha20 is outside the profile");
+        assert!(err.to_string().contains("0x1303") && !err.to_string().contains("0x1301"), "{err}");
+        assert!(try_hopf_server_config(params(vec![0x1302])).is_ok(), "narrowing is allowed");
+        let err = try_hopf_server_config(
+            params(vec![0x1301]).with_key_log(Some(hopf_core::tls::KeyLogFile::open("/dev/null").unwrap())),
+        )
+        .err()
+        .expect("a key log is outside the profile");
+        assert!(err.to_string().contains("key_log"), "{err}");
+        assert!(!QuicTlsOptions::new().fips, "FIPS is opt-in");
+    }
+
+    #[test]
     fn quic_handshake_negotiates_aes_256_gcm_sha384() {
         use crate::config::{client_config_for_pem_bytes_with, server_config_self_signed_with, QuicTlsOptions};
         use hopf_core::tls::{Tls13Aead, AES_256_GCM_SHA384};

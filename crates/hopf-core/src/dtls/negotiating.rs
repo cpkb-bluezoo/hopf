@@ -37,26 +37,47 @@ pub struct DtlsServerMaterial {
     pub cookie_secret: [u8; 32],
     /// Require the cookie round trip before the DTLS 1.2 handshake proceeds.
     pub require_cookie: bool,
+    /// Hold every engine built from this material to the FIPS profile; set by
+    /// [`Self::with_fips`].
+    pub fips: bool,
 }
 
 impl DtlsServerMaterial {
+    /// Hold this material's DTLS 1.3 and DTLS 1.2 engines to the FIPS profile
+    /// (see [`crate::tls::fips`]). A stock `kx_policy` (`default` or
+    /// `classical_only`) becomes [`KxPolicy::nist_only`]; any other must name
+    /// only secp256r1 and secp384r1, or this fails listing the offenders.
+    pub fn with_fips(mut self) -> Result<Self, crate::tls::fips::FipsProfileError> {
+        let probe = HandshakeConfig { kx_policy: self.kx_policy.clone(), ..Default::default() }.with_fips_profile()?;
+        self.kx_policy = probe.kx_policy;
+        self.fips = true;
+        Ok(self)
+    }
+
     pub(crate) fn engine_v13(&self) -> DtlsRecordEngine {
-        DtlsRecordEngine::new(HandshakeConfig {
+        let config = HandshakeConfig {
             role: HandshakeRole::Server,
             mode: HandshakeMode::Dtls,
             server: Some(self.creds.clone()),
             kx_policy: self.kx_policy.clone(),
             ..Default::default()
+        };
+        DtlsRecordEngine::new(if self.fips {
+            config.with_fips_profile().expect("checked by `with_fips`")
+        } else {
+            config
         })
     }
 
     pub(crate) fn engine_v12(&self, cookie_binding: Bytes) -> Dtls12RecordEngine {
+        let base = Tls12Config {
+            role: Tls12Role::Server,
+            server: Some(self.creds.clone()),
+            ..Default::default()
+        };
+        let base = if self.fips { base.with_fips_profile().expect("checked by `with_fips`") } else { base };
         Dtls12RecordEngine::new(Dtls12Config {
-            base: Tls12Config {
-                role: Tls12Role::Server,
-                server: Some(self.creds.clone()),
-                ..Default::default()
-            },
+            base,
             require_cookie: self.require_cookie,
             cookie_secret: self.cookie_secret,
             cookie_binding,
@@ -427,11 +448,36 @@ pub fn dtls_client_engine(
     kx_policy: KxPolicy,
     version_policy: DtlsVersionPolicy,
 ) -> super::driver::DtlsEngine {
+    build_client_engine(server_name.into(), trust_store, kx_policy, version_policy, false)
+        .expect("a config that is not held to the FIPS profile cannot fail it")
+}
+
+/// [`dtls_client_engine`] held to the FIPS profile (see [`crate::tls::fips`]):
+/// DTLS 1.3 and DTLS 1.2 are both restricted, whichever the server picks. A
+/// stock `kx_policy` becomes [`KxPolicy::nist_only`]; any other must name only
+/// secp256r1 and secp384r1, or this fails listing the offenders.
+pub fn dtls_client_engine_fips(
+    server_name: impl Into<String>,
+    trust_store: TrustStore,
+    kx_policy: KxPolicy,
+    version_policy: DtlsVersionPolicy,
+) -> Result<super::driver::DtlsEngine, crate::tls::fips::FipsProfileError> {
+    build_client_engine(server_name.into(), trust_store, kx_policy, version_policy, true)
+}
+
+fn build_client_engine(
+    server_name: String,
+    trust_store: TrustStore,
+    kx_policy: KxPolicy,
+    version_policy: DtlsVersionPolicy,
+    fips: bool,
+) -> Result<super::driver::DtlsEngine, crate::tls::fips::FipsProfileError> {
     use super::driver::DtlsEngine;
-    let server_name = server_name.into();
-    match version_policy {
+    let v13 = |config: HandshakeConfig| if fips { config.with_fips_profile() } else { Ok(config) };
+    let v12 = |config: Tls12Config| if fips { config.with_fips_profile() } else { Ok(config) };
+    Ok(match version_policy {
         DtlsVersionPolicy::Negotiate => {
-            let config_v13 = HandshakeConfig {
+            let config_v13 = v13(HandshakeConfig {
                 role: HandshakeRole::Client,
                 mode: HandshakeMode::Dtls,
                 server_name: Some(server_name.clone()),
@@ -439,21 +485,21 @@ pub fn dtls_client_engine(
                 kx_policy: kx_policy.clone(),
                 offer_tls12_fallback: true,
                 ..Default::default()
-            };
+            })?;
             let config_v12 = Dtls12Config {
-                base: Tls12Config {
+                base: v12(Tls12Config {
                     role: Tls12Role::Client,
                     server_name: Some(server_name),
                     trust_store: Some(trust_store),
                     ..Default::default()
-                },
+                })?,
                 require_cookie: false,
                 cookie_secret: [0; 32],
                 cookie_binding: Bytes::new(),
             };
             DtlsEngine::Negotiating(NegotiatingDtls::new(NegotiatingDtlsInner::client(config_v13, config_v12, version_policy)))
         }
-        DtlsVersionPolicy::Tls13Only => DtlsEngine::V13(DtlsRecordEngine::new(HandshakeConfig {
+        DtlsVersionPolicy::Tls13Only => DtlsEngine::V13(DtlsRecordEngine::new(v13(HandshakeConfig {
             role: HandshakeRole::Client,
             mode: HandshakeMode::Dtls,
             server_name: Some(server_name),
@@ -461,17 +507,17 @@ pub fn dtls_client_engine(
             kx_policy,
             offer_tls12_fallback: false,
             ..Default::default()
-        })),
+        })?)),
         DtlsVersionPolicy::Tls12Only => DtlsEngine::V12(Dtls12RecordEngine::new(Dtls12Config {
-            base: Tls12Config {
+            base: v12(Tls12Config {
                 role: Tls12Role::Client,
                 server_name: Some(server_name),
                 trust_store: Some(trust_store),
                 ..Default::default()
-            },
+            })?,
             require_cookie: false,
             cookie_secret: [0; 32],
             cookie_binding: Bytes::new(),
         })),
-    }
+    })
 }

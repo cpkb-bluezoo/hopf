@@ -25,7 +25,8 @@ mod stream;
 mod udp;
 
 pub use crypto::{
-    hopf_client_config, hopf_server_config, HopfHandshakeData, HopfQuicTlsConfig, HopfTlsBuildParams,
+    hopf_client_config, hopf_server_config, try_hopf_client_config, try_hopf_server_config, HopfHandshakeData,
+    HopfQuicTlsConfig, HopfTlsBuildParams,
 };
 pub use transport::recovery::CongestionAlgorithm;
 pub use config::{

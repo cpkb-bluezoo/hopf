@@ -34,6 +34,7 @@ pub(crate) struct ServerEngineExtras {
     pub require_supported_versions: bool,
     pub record_size_limit: Option<u16>,
     pub ech_server: Option<std::sync::Arc<super::ech::EchServerConfig>>,
+    pub fips: bool,
 }
 
 impl ServerTlsMaterial {
@@ -63,6 +64,9 @@ impl ServerTlsMaterial {
                 config.client_trust_store = self.client_trust_store.clone();
                 config.record_size_limit = extras.record_size_limit;
                 config.ech_server = extras.ech_server.clone();
+                if extras.fips {
+                    config = config.with_fips_profile().expect("a freshly built TCP server config is within the profile");
+                }
                 TlsVariant::V13(TlsRecordEngine::new(config))
             }
             PickedTls::V12 => {
@@ -74,6 +78,11 @@ impl ServerTlsMaterial {
                     client_trust_store: self.client_trust_store.clone(),
                     require_supported_versions: extras.require_supported_versions,
                     ..Default::default()
+                };
+                let config = if extras.fips {
+                    config.with_fips_profile().expect("a freshly built TCP server config is within the profile")
+                } else {
+                    config
                 };
                 TlsVariant::V12(Tls12RecordEngine::new(config))
             }
@@ -90,6 +99,7 @@ pub(crate) struct ServerNegotiator {
     require_supported_versions: bool,
     record_size_limit: Option<u16>,
     ech_server: Option<std::sync::Arc<super::ech::EchServerConfig>>,
+    fips: bool,
     version_policy: TcpTlsVersionPolicy,
     active: Option<Box<TlsVariant>>,
 }
@@ -104,6 +114,7 @@ impl ServerNegotiator {
             require_supported_versions: false,
             record_size_limit: None,
             ech_server: None,
+            fips: false,
             version_policy,
             active: None,
         }
@@ -117,6 +128,7 @@ impl ServerNegotiator {
                 require_supported_versions: self.require_supported_versions,
                 record_size_limit: self.record_size_limit,
                 ech_server: self.ech_server.clone(),
+                fips: self.fips,
             },
         )
     }
@@ -333,12 +345,58 @@ impl NegotiatingTls {
         }
     }
 
+    /// See [`TlsVariant::set_fips`]. Before the version is picked this holds
+    /// *both* the TLS 1.3 and the TLS 1.2 config to the profile; either is left
+    /// unchanged if the other is outside it.
+    pub(crate) fn set_fips(&mut self) -> Result<(), super::fips::FipsProfileError> {
+        use super::fips::FipsProfileError;
+        match self {
+            NegotiatingTls::Server(s) => {
+                if let Some(active) = &mut s.active {
+                    return active.set_fips();
+                }
+                if s.ech_server.is_some() {
+                    return Err(FipsProfileError {
+                        violations: vec!["ech_server: Encrypted Client Hello is not permitted".into()],
+                    });
+                }
+                s.fips = true;
+                Ok(())
+            }
+            NegotiatingTls::Client(c) => {
+                if let Some(active) = &mut c.active {
+                    return active.set_fips();
+                }
+                if c.v13_probe.is_some() {
+                    return Err(FipsProfileError::too_late());
+                }
+                let v13 = c.config_v13.clone().with_fips_profile();
+                let v12 = c.config_v12.clone().with_fips_profile();
+                match (v13, v12) {
+                    (Ok(v13), Ok(v12)) => {
+                        c.config_v13 = v13;
+                        c.config_v12 = v12;
+                        Ok(())
+                    }
+                    (v13, v12) => {
+                        let mut violations = v13.err().map(|e| e.violations).unwrap_or_default();
+                        violations.extend(v12.err().map(|e| e.violations).unwrap_or_default());
+                        Err(FipsProfileError { violations })
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn set_ech_client(&mut self, config: super::ech::EchClientConfig) -> bool {
         match self {
             NegotiatingTls::Server(_) => false,
             NegotiatingTls::Client(c) => {
                 if let Some(active) = &mut c.active {
                     return active.set_ech_client(config);
+                }
+                if c.config_v13.fips {
+                    return false;
                 }
                 c.config_v13.ech_client = Some(config);
                 true
@@ -351,6 +409,9 @@ impl NegotiatingTls {
             NegotiatingTls::Server(s) => {
                 if let Some(active) = &mut s.active {
                     return active.set_ech_server(config);
+                }
+                if s.fips {
+                    return false;
                 }
                 s.ech_server = Some(config);
                 true

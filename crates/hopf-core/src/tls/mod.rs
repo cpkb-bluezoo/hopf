@@ -64,6 +64,10 @@ impl NegotiatingTls {
         self.inner_mut().set_record_size_limit(limit)
     }
 
+    pub(crate) fn set_fips(&mut self) -> Result<(), fips::FipsProfileError> {
+        self.inner_mut().set_fips()
+    }
+
     pub(crate) fn set_ech_client(&mut self, config: ech::EchClientConfig) -> bool {
         self.inner_mut().set_ech_client(config)
     }
@@ -114,7 +118,7 @@ pub use pem::{
     acceptor_from_pem_with_client_auth, acceptor_from_credentials, acceptor_from_credentials_with_client_auth, server_credentials_from_pem_bytes, acceptor_from_pem_with_sni, connector_from_pem,
     connector_from_pem_tls12, connector_from_pem_tls12_with_client_cert,
     connector_from_pem_with_client_cert, connector_with_alpn, connector_with_record_size_limit,
-    connector_with_verify_override, acceptor_requiring_supported_versions, acceptor_with_alpn, acceptor_with_record_size_limit, acceptor_with_ech, connector_with_ech, insecure_connector,
+    acceptor_with_fips, connector_with_fips, connector_with_verify_override, acceptor_requiring_supported_versions, acceptor_with_alpn, acceptor_with_record_size_limit, acceptor_with_ech, connector_with_ech, insecure_connector,
     acceptor_from_pem_with_tcp_version_policy, connector_from_pem_with_tcp_version_policy,
     insecure_connector_tls12, public_trust_connector, server_credentials_from_pem, SharedTlsAcceptor,
     SharedTlsConnector, TlsAcceptor, TlsConnector,
@@ -203,6 +207,20 @@ impl TlsVariant {
             TlsVariant::V13(e) => e.set_record_size_limit(limit),
             TlsVariant::V12(_) => false,
             TlsVariant::Negotiating(n) => n.set_record_size_limit(limit),
+        }
+    }
+
+    /// Hold this connection to the FIPS profile (see
+    /// [`fips`](crate::tls::fips)): TLS 1.3 and TLS 1.2 are both restricted,
+    /// so a negotiating engine is on the profile whichever version it lands on.
+    /// Must be called before [`Self::start`]. Fails, leaving the engine
+    /// unchanged, if it is already started or its config names anything
+    /// outside the profile (such as ECH).
+    pub fn set_fips(&mut self) -> Result<(), fips::FipsProfileError> {
+        match self {
+            TlsVariant::V13(e) => e.set_fips(),
+            TlsVariant::V12(e) => e.set_fips(),
+            TlsVariant::Negotiating(n) => n.set_fips(),
         }
     }
 

@@ -759,6 +759,7 @@ mod tests {
             version_policy: crate::dtls::DtlsVersionPolicy::Negotiate,
             cookie_secret: [0; 32],
             require_cookie: false,
+            fips: false,
         };
         let acceptor: Arc<dyn DtlsAcceptor> = Arc::new(move |peer| crate::dtls::dtls_server_engine(material.clone(), peer));
         let (s_obs, s_rx) = observer();
@@ -997,5 +998,73 @@ mod tests {
         assert!(a != b && a != c && b != c);
         assert_eq!(a.len(), 6);
         assert_eq!(peer_cookie_binding("[2001:db8::1]:4433".parse().unwrap()).len(), 18);
+    }
+
+    fn creds_p256() -> (ServerCredentials, TrustStore) {
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap().self_signed(&kp).unwrap();
+        let creds = ServerCredentials {
+            cert_chain: vec![Bytes::copy_from_slice(cert.der())],
+            signing_key_pkcs8: Bytes::from(kp.serialize_der()),
+        };
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        (creds, trust)
+    }
+
+    fn fips_material(creds: &ServerCredentials, policy: crate::dtls::DtlsVersionPolicy) -> crate::dtls::DtlsServerMaterial {
+        crate::dtls::DtlsServerMaterial {
+            creds: creds.clone(),
+            kx_policy: KxPolicy::classical_only(),
+            version_policy: policy,
+            cookie_secret: [0; 32],
+            require_cookie: false,
+            fips: false,
+        }
+        .with_fips()
+        .expect("a stock key-exchange policy is within the profile")
+    }
+
+    /// A FIPS DTLS server and client establish a session (and move data) under
+    /// every version policy: 1.3 only, 1.2 only, and negotiating.
+    #[test]
+    fn fips_dtls_sessions_establish_under_every_version_policy() {
+        use crate::dtls::{dtls_client_engine_fips, dtls_server_engine, DtlsVersionPolicy};
+        let rt = Runtime::start(Default::default()).unwrap();
+        let (creds, trust) = creds_p256();
+        for policy in [DtlsVersionPolicy::Negotiate, DtlsVersionPolicy::Tls13Only, DtlsVersionPolicy::Tls12Only] {
+            let material = fips_material(&creds, policy);
+            let acceptor: Arc<dyn DtlsAcceptor> = Arc::new(move |peer| dtls_server_engine(material.clone(), peer));
+            let (s_obs, s_rx) = observer();
+            let server = listen(rt.pick_worker(), udp(), acceptor, s_obs, DtlsSocketConfig::default()).unwrap();
+            let (c_obs, c_rx) = observer();
+            let engine = dtls_client_engine_fips("localhost", trust.clone(), KxPolicy::classical_only(), policy).unwrap();
+            let client = connect(rt.pick_worker(), udp(), server.local_addr(), engine, c_obs, DtlsSocketConfig::default()).unwrap();
+            expect_established(&s_rx);
+            expect_established(&c_rx);
+            client.send(server.local_addr(), b"fips").unwrap();
+            expect_data(&s_rx, b"fips");
+            client.close();
+            server.close();
+        }
+        rt.shutdown();
+    }
+
+    #[test]
+    fn fips_dtls_entry_points_reject_a_widened_key_exchange_policy() {
+        use crate::crypto::kx::NamedGroup;
+        use crate::dtls::{dtls_client_engine_fips, DtlsVersionPolicy};
+        let (creds, trust) = creds_p256();
+        // A stock policy is replaced by the profile's; one that names X25519 is not stock.
+        let widened = || KxPolicy::new(vec![NamedGroup::SecP256r1, NamedGroup::X25519]);
+        let mut material = fips_material(&creds, DtlsVersionPolicy::Negotiate);
+        material.fips = false;
+        material.kx_policy = widened();
+        let err = material.with_fips().err().expect("X25519 is outside the profile");
+        assert!(err.to_string().contains("X25519"), "{err}");
+        let err = dtls_client_engine_fips("localhost", trust, widened(), DtlsVersionPolicy::Negotiate)
+            .err()
+            .expect("X25519 is outside the profile");
+        assert!(err.to_string().contains("X25519"), "{err}");
     }
 }

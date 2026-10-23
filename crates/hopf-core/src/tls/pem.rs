@@ -229,6 +229,55 @@ pub fn connector_with_ech(
     Arc::new(EchConnector { inner, resolver: Arc::new(resolver) })
 }
 
+struct FipsAcceptor {
+    inner: SharedTlsAcceptor,
+}
+
+impl TlsAcceptor for FipsAcceptor {
+    fn accept(&self) -> TlsVariant {
+        let mut engine = self.inner.accept();
+        // The inner acceptor was probed when this wrapper was built, and
+        // builds the same engine every time.
+        engine.set_fips().expect("the wrapped acceptor was checked against the FIPS profile");
+        engine
+    }
+}
+
+/// Wrap `inner` so every accepted connection is held to the FIPS profile (see
+/// [`fips`](super::fips)): TLS 1.3 and TLS 1.2 are both restricted to the
+/// approved suites, groups and signature algorithms, ECH is refused and key
+/// logging records nothing. Works with any acceptor this module builds.
+///
+/// `inner` is checked once, here: if it already names anything outside the
+/// profile (for example it was wrapped with [`acceptor_with_ech`]) this fails
+/// with the offending items listed. Wrapping with [`acceptor_with_ech`]
+/// *afterwards* is ignored - FIPS mode refuses ECH.
+pub fn acceptor_with_fips(inner: SharedTlsAcceptor) -> io::Result<SharedTlsAcceptor> {
+    inner.accept().set_fips()?;
+    Ok(Arc::new(FipsAcceptor { inner }))
+}
+
+struct FipsConnector {
+    inner: SharedTlsConnector,
+}
+
+impl TlsConnector for FipsConnector {
+    fn connect(&self, server_name: &str) -> io::Result<TlsVariant> {
+        let mut engine = self.inner.connect(server_name)?;
+        engine.set_fips()?;
+        Ok(engine)
+    }
+}
+
+/// Client-side counterpart of [`acceptor_with_fips`]: every connection made
+/// through the wrapped connector offers, and accepts, only the FIPS profile.
+/// A connector that already enables ECH is rejected here; ECH added on top
+/// afterwards is refused at connect time.
+pub fn connector_with_fips(inner: SharedTlsConnector) -> io::Result<SharedTlsConnector> {
+    inner.connect("fips-profile-check.invalid")?.set_fips()?;
+    Ok(Arc::new(FipsConnector { inner }))
+}
+
 fn base_config(role: HandshakeRole, alpn: &[&[u8]]) -> HandshakeConfig {
     handshake_config_tcp_record_layer(role, alpn)
 }
@@ -751,6 +800,9 @@ mod tests {
         received: Vec<u8>,
         errors: Vec<String>,
         alpn: Option<Vec<u8>>,
+        /// Negotiated protocol and cipher suite, as reported on completion.
+        protocol: Option<String>,
+        suite: Option<String>,
         /// Verification gates the engine opened and nobody has answered yet.
         pending_verify: Vec<u64>,
     }
@@ -764,6 +816,8 @@ mod tests {
         }
         fn handshake_complete(&mut self, info: crate::security::SecurityInfo) {
             self.alpn = info.alpn().map(<[u8]>::to_vec);
+            self.protocol = info.protocol().map(str::to_owned);
+            self.suite = info.cipher_suite().map(str::to_owned);
         }
         fn verification_requested(&mut self, req: crate::tls::VerifyRequest) {
             self.pending_verify.push(req.id);
@@ -1129,5 +1183,93 @@ mod tests {
         // all proves the override was resolved inline.
         let (wc, ws) = handshake(&mut client, &mut server);
         assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
+    }
+
+    fn fips_pems() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        write_temp_pem(&key_pair)
+    }
+
+    /// FIPS wrappers over the ordinary builders: TLS 1.3 negotiates the profile
+    /// (secp256r1, AES-128-GCM first), end to end through the negotiating engines.
+    #[test]
+    fn fips_wrappers_negotiate_tls13_on_the_profile() {
+        use crate::tls::connector_from_pem;
+        let (_dir, cert_path, key_path) = fips_pems();
+        let acceptor = acceptor_with_fips(acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()).unwrap();
+        let connector = connector_with_fips(connector_from_pem(&cert_path, &[]).unwrap()).unwrap();
+        let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
+        let (wc, ws) = handshake(&mut client, &mut server);
+        assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
+        assert_eq!(wc.protocol.as_deref(), Some("TLSv1.3"));
+        assert_eq!(wc.suite.as_deref(), Some("TLS_AES_128_GCM_SHA256"));
+    }
+
+    /// A FIPS connector still lands on TLS 1.2 against a TLS 1.2-only server,
+    /// with a profile suite (never ChaCha20-Poly1305).
+    #[test]
+    fn fips_connector_falls_back_to_tls12_on_the_profile() {
+        use crate::tls::connector_from_pem;
+        let (_dir, cert_path, key_path) = fips_pems();
+        let acceptor = acceptor_from_pem_tls12(&cert_path, &key_path).unwrap();
+        let connector = connector_with_fips(connector_from_pem(&cert_path, &[]).unwrap()).unwrap();
+        let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
+        let (wc, ws) = handshake(&mut client, &mut server);
+        assert!(client.is_complete() && server.is_complete(), "{:?} {:?}", wc.errors, ws.errors);
+        assert_eq!(wc.protocol.as_deref(), Some("TLSv1.2"));
+        assert_eq!(wc.suite.as_deref(), Some("TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"));
+    }
+
+    /// A FIPS acceptor refuses a client with no usable group in common: an
+    /// ordinary connector's TLS 1.3 key shares are X25519 and hybrid groups.
+    /// Its TLS 1.2 fallback does list secp256r1, so the server asks for it in
+    /// a HelloRetryRequest, which that client then refuses (its own policy has
+    /// no plain NIST group). Either way no handshake completes.
+    #[test]
+    fn fips_acceptor_refuses_an_ordinary_tls13_client() {
+        use crate::tls::connector_from_pem;
+        let (_dir, cert_path, key_path) = fips_pems();
+        let acceptor = acceptor_with_fips(acceptor_from_pem(&cert_path, &key_path, &[]).unwrap()).unwrap();
+        let connector = connector_from_pem(&cert_path, &[]).unwrap();
+        let (mut client, mut server) = (connector.connect("localhost").unwrap(), acceptor.accept());
+        let (wc, ws) = handshake(&mut client, &mut server);
+        assert!(!server.is_complete() && !client.is_complete());
+        assert!(
+            wc.errors.iter().chain(&ws.errors).any(|e| e.contains("group")),
+            "client {:?} server {:?}",
+            wc.errors,
+            ws.errors
+        );
+    }
+
+    /// A wrapper whose inner connector turns on ECH is rejected when built;
+    /// ECH layered on top of a FIPS connector is refused, not sent.
+    #[test]
+    fn fips_and_ech_do_not_mix() {
+        use crate::tls::connector_from_pem;
+        use crate::tls::ech::EchClientConfig;
+        let (_dir, cert_path, _key_path) = fips_pems();
+        let inner = connector_with_ech(connector_from_pem(&cert_path, &[]).unwrap(), |_| Some(EchClientConfig::grease_only()));
+        let err = connector_with_fips(inner).err().expect("ECH inside FIPS is rejected at build time");
+        assert!(err.to_string().contains("ech_client"), "{err}");
+
+        let fips_first = connector_with_fips(connector_from_pem(&cert_path, &[]).unwrap()).unwrap();
+        let layered = connector_with_ech(fips_first, |_| Some(EchClientConfig::grease_only()));
+        let mut client = layered.connect("localhost").unwrap();
+        let mut wc = Wire::default();
+        client.start(&mut wc);
+        // encrypted_client_hello (0xfe0d) is in no ClientHello this connector sends.
+        assert!(!wc.written.windows(2).any(|w| w == [0xfe, 0x0d]), "ECH must not be offered in FIPS mode");
+    }
+
+    /// FIPS mode has to be set before the handshake starts.
+    #[test]
+    fn fips_cannot_be_set_after_start() {
+        use crate::tls::connector_from_pem;
+        let (_dir, cert_path, _key_path) = fips_pems();
+        let connector = connector_from_pem(&cert_path, &[]).unwrap();
+        let mut client = connector.connect("localhost").unwrap();
+        client.start(&mut Wire::default());
+        assert!(client.set_fips().is_err());
     }
 }

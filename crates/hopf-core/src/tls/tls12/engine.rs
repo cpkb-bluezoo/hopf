@@ -671,6 +671,17 @@ impl Tls12Engine {
         true
     }
 
+    /// Hold this engine to the FIPS profile (see [`Config::with_fips_profile`]).
+    /// Only possible before the handshake has started; the config is left
+    /// untouched on error.
+    pub fn set_fips(&mut self) -> Result<(), crate::tls::fips::FipsProfileError> {
+        if self.state != State::Initial {
+            return Err(crate::tls::fips::FipsProfileError::too_late());
+        }
+        self.config = self.config.clone().with_fips_profile()?;
+        Ok(())
+    }
+
     /// Set the ALPN protocol names (RFC 7301), as [`Config::alpn`] does. Only
     /// possible before the handshake has started; returns whether it took
     /// effect.

@@ -307,6 +307,11 @@ impl Tls12RecordEngine {
         self.engine.set_alpn(protocols)
     }
 
+    /// Hold this engine to the FIPS profile; see [`Tls12Engine::set_fips`].
+    pub fn set_fips(&mut self) -> Result<(), crate::tls::fips::FipsProfileError> {
+        self.engine.set_fips()
+    }
+
     /// Require the `supported_versions` extension of a `ClientHello`; see
     /// [`Config::require_supported_versions`]. Must be called before
     /// [`Self::start`]; returns whether it took effect.

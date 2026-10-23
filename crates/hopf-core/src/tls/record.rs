@@ -429,6 +429,11 @@ impl TlsRecordEngine {
         self.engine.set_alpn(protocols)
     }
 
+    /// Hold this engine to the FIPS profile; see [`HandshakeEngine::set_fips`].
+    pub fn set_fips(&mut self) -> Result<(), super::fips::FipsProfileError> {
+        self.engine.set_fips()
+    }
+
     /// Configure client-side Encrypted Client Hello (RFC 9849); see
     /// [`HandshakeConfig::ech_client`]. Must be called before [`Self::start`];
     /// returns whether it took effect.
