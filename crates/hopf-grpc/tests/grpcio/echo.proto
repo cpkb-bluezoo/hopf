@@ -1,0 +1,53 @@
+// Minimal Echo service for hopf-grpc's interoperability tests against
+// grpcio (Python), which run in both directions: hopf's client against
+// server.py, and the Python client (client.py) against a hopf server
+// implementing the same service. Deliberately simple (scalar fields only)
+// so a failure points at the transport, framing, metadata or compression
+// rather than at an edge case of the schema.
+syntax = "proto3";
+
+package hopftest;
+
+message EchoRequest {
+  string message = 1;
+  int32 repeat_count = 2;
+}
+
+message EchoResponse {
+  string message = 1;
+  int32 length = 2;
+}
+
+message FailRequest {
+  string reason = 1;
+}
+
+service Echo {
+  // The request message repeated repeat_count times (once if it is 0).
+  rpc SayEcho(EchoRequest) returns (EchoResponse);
+  // Always returns a gRPC error (INVALID_ARGUMENT), for exercising the
+  // client's error path against a real peer's actual error framing.
+  rpc AlwaysFail(FailRequest) returns (EchoResponse);
+
+  // Server streaming: repeat_count responses, message followed by 1..n.
+  // A request whose message is "fail" gets one response, "first", and then
+  // the status NOT_FOUND "gone".
+  rpc Watch(EchoRequest) returns (stream EchoResponse);
+  // Client streaming: the concatenation of the request messages.
+  rpc Collect(stream EchoRequest) returns (EchoResponse);
+  // Bidirectional: "re " and each request message, as it arrives.
+  rpc Chat(stream EchoRequest) returns (stream EchoResponse);
+  // Answers with the request metadata x-test, and sends it back as the
+  // initial metadata x-echo (and x-test-bin as x-echo-bin) and the
+  // trailing metadata x-trailer: done.
+  rpc Metadata(EchoRequest) returns (EchoResponse);
+  // Answers with repeat_count letters "a". The server compresses the
+  // response if the client accepts a compression algorithm it offers.
+  rpc Compressed(EchoRequest) returns (EchoResponse);
+  // Takes three seconds to answer, or until the call is cancelled, for
+  // exercising deadlines.
+  rpc Slow(EchoRequest) returns (EchoResponse);
+  // Answers with the milliseconds left to the call's deadline as length
+  // (-1 if the request had none), for checking that grpc-timeout arrived.
+  rpc Deadline(EchoRequest) returns (EchoResponse);
+}

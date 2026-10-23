@@ -14,3 +14,20 @@ accepts (`compress_responses`, `compression_threshold`) and
 `GrpcClient::compression` compresses requests. A message that expands beyond
 the maximum message size is `RESOURCE_EXHAUSTED`, a corrupt one `INTERNAL`,
 and a request in an encoding the server does not offer is `UNIMPLEMENTED`.
+
+A client names the server it calls with `GrpcClient::authority` (sent as
+`:authority`; servers built on gRPC core refuse a call without one).
+
+## Interoperability tests
+
+`tests/grpcio_interop.rs` runs every kind of RPC, metadata (including `-bin`),
+deadlines, gzip and deflate and empty messages in both directions against
+grpcio, Python's gRPC implementation: Hopf's client against a grpcio server,
+and a grpcio client against a Hopf server. The Python side is built from
+`tests/grpcio` and run in a container, so podman or docker is needed at test
+time (set `HOPF_CONTAINER_RUNTIME` to choose one); without either the tests
+say so and pass without running. They are not part of the default CI job:
+
+```bash
+cargo test -p hopf-grpc --features integration --test grpcio_interop
+```
