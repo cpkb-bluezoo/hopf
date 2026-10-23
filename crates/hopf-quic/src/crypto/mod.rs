@@ -8,6 +8,7 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use bytes::Bytes;
 use hopf_core::crypto::kx_policy::KxPolicy;
 use hopf_core::crypto::trust::TrustStore;
+use hopf_core::tls::fips::FipsProfileError;
 use hopf_core::tls::{
     AntiReplay, ClientTicketStore, HandshakeConfig, HandshakeMode, HandshakeRole, KeyLog,
     ServerCredentials, DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS,
@@ -129,14 +130,15 @@ impl HopfTlsBuildParams {
         self
     }
 
-    fn into_handshake(self, role: HandshakeRole) -> HandshakeConfig {
+    fn into_handshake(self, role: HandshakeRole) -> Result<HandshakeConfig, FipsProfileError> {
         let anti_replay = if role == HandshakeRole::Server && self.tls.enable_early_data {
             self.anti_replay
                 .or_else(|| Some(AntiReplay::shared_default()))
         } else {
             self.anti_replay
         };
-        HandshakeConfig {
+        let fips = self.tls.fips;
+        let config = HandshakeConfig {
             role,
             mode: HandshakeMode::Quic,
             alpn: self.alpn,
@@ -156,6 +158,11 @@ impl HopfTlsBuildParams {
             cipher_suites: self.cipher_suites,
             certificate_compression: self.certificate_compression,
             ..Default::default()
+        };
+        if fips {
+            config.with_fips_profile()
+        } else {
+            Ok(config)
         }
     }
 }
@@ -164,13 +171,34 @@ impl HopfTlsBuildParams {
 pub type HopfQuicTlsConfig = HandshakeConfig;
 
 /// Build a QUIC client config using the in-tree handshake engine.
+///
+/// # Panics
+///
+/// If `params` ask for the FIPS profile ([`QuicTlsOptions::with_fips`]) but
+/// name something outside it; use [`try_hopf_client_config`] to get the error.
 pub fn hopf_client_config(params: HopfTlsBuildParams) -> Arc<QuicClientConfig> {
-    let hs = params.into_handshake(HandshakeRole::Client);
-    Arc::new(QuicClientConfig::from_handshake(hs))
+    try_hopf_client_config(params).expect("FIPS profile violated; use try_hopf_client_config to handle it")
+}
+
+/// [`hopf_client_config`], returning the error instead of panicking when the
+/// FIPS profile is requested and `params` are outside it.
+pub fn try_hopf_client_config(params: HopfTlsBuildParams) -> Result<Arc<QuicClientConfig>, FipsProfileError> {
+    let hs = params.into_handshake(HandshakeRole::Client)?;
+    Ok(Arc::new(QuicClientConfig::from_handshake(hs)))
 }
 
 /// Build a QUIC server config using the in-tree handshake engine.
+///
+/// # Panics
+///
+/// As [`hopf_client_config`]; use [`try_hopf_server_config`] to get the error.
 pub fn hopf_server_config(params: HopfTlsBuildParams) -> Arc<QuicServerConfig> {
-    let hs = params.into_handshake(HandshakeRole::Server);
-    Arc::new(QuicServerConfig::from_handshake(hs))
+    try_hopf_server_config(params).expect("FIPS profile violated; use try_hopf_server_config to handle it")
+}
+
+/// [`hopf_server_config`], returning the error instead of panicking when the
+/// FIPS profile is requested and `params` are outside it.
+pub fn try_hopf_server_config(params: HopfTlsBuildParams) -> Result<Arc<QuicServerConfig>, FipsProfileError> {
+    let hs = params.into_handshake(HandshakeRole::Server)?;
+    Ok(Arc::new(QuicServerConfig::from_handshake(hs)))
 }

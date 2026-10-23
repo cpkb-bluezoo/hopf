@@ -23,9 +23,9 @@
 //! which keeps the previous epoch's read keys briefly so reordered datagrams
 //! still decrypt (RFC 9147 §5.8.4).
 
-use aws_lc_rs::aead::quic::{HeaderProtectionKey, AES_128, CHACHA20};
+use aws_lc_rs::aead::quic::{HeaderProtectionKey, AES_128, AES_256, CHACHA20};
 
-use crate::crypto::aead::{AeadError, Aes128GcmKey, ChaCha20Poly1305Key};
+use crate::crypto::aead::{AeadError, Aes128GcmKey, AesGcmKey, ChaCha20Poly1305Key};
 use crate::crypto::hkdf::dtls_expand_label;
 use crate::tls::Tls13Aead;
 
@@ -57,6 +57,7 @@ pub(crate) const AES_GCM_CONFIDENTIALITY_LIMIT: u64 = 23_726_566;
 
 enum AeadKeyKind {
     Aes128Gcm(Aes128GcmKey),
+    Aes256Gcm(AesGcmKey),
     ChaCha20Poly1305(ChaCha20Poly1305Key),
 }
 
@@ -64,6 +65,7 @@ impl AeadKeyKind {
     fn seal_in_place_append_tag(&self, nonce: [u8; 12], aad: &[u8], plaintext: &mut Vec<u8>) -> Result<(), AeadError> {
         match self {
             AeadKeyKind::Aes128Gcm(k) => k.seal_in_place_append_tag(nonce, aad, plaintext),
+            AeadKeyKind::Aes256Gcm(k) => k.seal_in_place_append_tag(nonce, aad, plaintext),
             AeadKeyKind::ChaCha20Poly1305(k) => k.seal_in_place_append_tag(nonce, aad, plaintext),
         }
     }
@@ -71,6 +73,7 @@ impl AeadKeyKind {
     fn open_in_place(&self, nonce: [u8; 12], aad: &[u8], ciphertext: &mut [u8]) -> Result<usize, AeadError> {
         match self {
             AeadKeyKind::Aes128Gcm(k) => k.open_in_place(nonce, aad, ciphertext),
+            AeadKeyKind::Aes256Gcm(k) => k.open_in_place(nonce, aad, ciphertext),
             AeadKeyKind::ChaCha20Poly1305(k) => k.open_in_place(nonce, aad, ciphertext),
         }
     }
@@ -90,16 +93,21 @@ fn nonce_for(iv: &[u8; 12], seq: u64) -> [u8; 12] {
     n
 }
 
-fn keys_for(aead: Tls13Aead, secret: &[u8; 32]) -> (AeadKeyKind, [u8; 12], HeaderProtectionKey) {
+fn keys_for(aead: Tls13Aead, secret: &[u8]) -> (AeadKeyKind, [u8; 12], HeaderProtectionKey) {
     let key_len = aead.key_len();
-    let key_bytes = dtls_expand_label(secret, "key", &[], key_len);
-    let iv_bytes = dtls_expand_label(secret, "iv", &[], 12);
-    let sn_key_bytes = dtls_expand_label(secret, "sn", &[], key_len);
+    let hash = aead.hash();
+    let key_bytes = dtls_expand_label(hash, secret, "key", &[], key_len);
+    let iv_bytes = dtls_expand_label(hash, secret, "iv", &[], 12);
+    let sn_key_bytes = dtls_expand_label(hash, secret, "sn", &[], key_len);
     let iv: [u8; 12] = iv_bytes.as_ref().try_into().expect("12-byte DTLS 1.3 IV");
     let (key, hp_alg): (AeadKeyKind, &'static aws_lc_rs::aead::quic::Algorithm) = match aead {
         Tls13Aead::Aes128GcmSha256 => (
             AeadKeyKind::Aes128Gcm(Aes128GcmKey::new(key_bytes.as_ref()).expect("16-byte AES-128 key")),
             &AES_128,
+        ),
+        Tls13Aead::Aes256GcmSha384 => (
+            AeadKeyKind::Aes256Gcm(AesGcmKey::new(key_bytes.as_ref()).expect("32-byte AES-256 key")),
+            &AES_256,
         ),
         Tls13Aead::ChaCha20Poly1305Sha256 => (
             AeadKeyKind::ChaCha20Poly1305(ChaCha20Poly1305Key::new(key_bytes.as_ref()).expect("32-byte key")),
@@ -122,8 +130,8 @@ pub struct WriteKeys {
 }
 
 impl WriteKeys {
-    /// Derive from a 32-byte traffic secret for `epoch`.
-    pub fn from_secret(aead: Tls13Aead, secret: &[u8; 32], epoch: u64) -> Self {
+    /// Derive from a traffic secret for `epoch`.
+    pub fn from_secret(aead: Tls13Aead, secret: &[u8], epoch: u64) -> Self {
         let (key, iv, sn_hp) = keys_for(aead, secret);
         Self {
             key,
@@ -148,7 +156,8 @@ impl WriteKeys {
     /// Whether this direction has protected enough records under its
     /// current AES-GCM key that it should be rotated (RFC 8446 §5.5).
     pub fn over_confidentiality_limit(&self) -> bool {
-        matches!(self.key, AeadKeyKind::Aes128Gcm(_)) && self.next_seq >= AES_GCM_CONFIDENTIALITY_LIMIT
+        matches!(self.key, AeadKeyKind::Aes128Gcm(_) | AeadKeyKind::Aes256Gcm(_))
+            && self.next_seq >= AES_GCM_CONFIDENTIALITY_LIMIT
     }
 
     /// Fast-forward this direction's counter without actually sending
@@ -171,8 +180,8 @@ pub struct ReadKeys {
 }
 
 impl ReadKeys {
-    /// Derive from a 32-byte traffic secret for `epoch`.
-    pub fn from_secret(aead: Tls13Aead, secret: &[u8; 32], epoch: u64) -> Self {
+    /// Derive from a traffic secret for `epoch`.
+    pub fn from_secret(aead: Tls13Aead, secret: &[u8], epoch: u64) -> Self {
         let (key, iv, sn_hp) = keys_for(aead, secret);
         Self {
             key,
@@ -192,7 +201,7 @@ impl ReadKeys {
     /// side — the anti-replay window's `highest` seen sequence number
     /// doubles as this direction's record count.
     pub fn over_confidentiality_limit(&self) -> bool {
-        matches!(self.key, AeadKeyKind::Aes128Gcm(_))
+        matches!(self.key, AeadKeyKind::Aes128Gcm(_) | AeadKeyKind::Aes256Gcm(_))
             && self.replay.highest().is_some_and(|h| h >= AES_GCM_CONFIDENTIALITY_LIMIT)
     }
 

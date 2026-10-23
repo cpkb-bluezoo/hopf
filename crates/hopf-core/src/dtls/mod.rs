@@ -35,4 +35,4 @@ pub(crate) mod retransmit;
 mod ech_tests;
 
 pub use engine::{DtlsRecordEngine, DtlsRecordSink, NopDtlsRecordSink};
-pub use negotiating::{dtls_client_engine, dtls_server_engine, DtlsServerMaterial, DtlsVersionPolicy};
+pub use negotiating::{dtls_client_engine, dtls_client_engine_fips, dtls_server_engine, DtlsServerMaterial, DtlsVersionPolicy};

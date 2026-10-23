@@ -127,7 +127,7 @@ pub mod sig_alg {
 /// `signature_algorithms` pairs this engine offers/accepts, in preference
 /// order — shared by `build_client_hello` and `build_certificate_request`
 /// (previously duplicated between the two).
-const OFFERED_SIGNATURE_ALGORITHMS: &[(u8, u8)] = &[
+pub(super) const OFFERED_SIGNATURE_ALGORITHMS: &[(u8, u8)] = &[
     (sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA),
     (sig_alg::HASH_SHA256, sig_alg::SIG_RSA),
     (sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA),
@@ -136,9 +136,12 @@ const OFFERED_SIGNATURE_ALGORITHMS: &[(u8, u8)] = &[
     (sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519),
 ];
 
-/// `NamedCurve` (RFC 4492 §5.1.1) — the one curve this engine offers in
-/// its own TLS 1.2 `ClientHello`, and the only one its server side uses.
+/// `NamedCurve` (RFC 4492 §5.1.1) — the curve this engine offers in its own
+/// TLS 1.2 `ClientHello` and its server side uses, unless
+/// [`super::engine::Config::curves`] says otherwise.
 pub const NAMED_CURVE_SECP256R1: u16 = 23;
+/// `NamedCurve` for secp384r1 (RFC 4492 §5.1.1), used when configured.
+pub const NAMED_CURVE_SECP384R1: u16 = 24;
 /// `NamedCurve` for X25519 (RFC 8422 §5.1.1). Accepted in a
 /// `ServerKeyExchange` on the client side only: the TLS 1.3-shaped
 /// `ClientHello` the negotiating connector sends offers X25519 ahead of
@@ -192,6 +195,33 @@ pub struct ClientHelloParams<'a> {
     /// has no such field at all; callers there always pass `&[]`, and
     /// [`Self::legacy_version`] being `0x0303` means it's never written.
     pub cookie: &'a [u8],
+    /// `supported_groups` (named curves) to offer; `None` offers secp256r1 only.
+    pub curves: Option<&'a [u16]>,
+    /// `signature_algorithms` to offer, as `(hash << 8) | signature` codes;
+    /// `None` offers [`OFFERED_SIGNATURE_ALGORITHMS`].
+    pub signature_schemes: Option<&'a [u16]>,
+    /// `signature_algorithms_cert` to offer; `None` offers
+    /// [`crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES`].
+    pub cert_signature_schemes: Option<&'a [u16]>,
+}
+
+/// `supported_signature_algorithms` list data: `schemes` as `(hash, signature)`
+/// pairs, or [`OFFERED_SIGNATURE_ALGORITHMS`] when `None`.
+fn encode_signature_algorithms(schemes: Option<&[u16]>) -> Bytes {
+    let mut bytes = BytesMut::new();
+    match schemes {
+        Some(schemes) => {
+            for scheme in schemes {
+                bytes.extend_from_slice(&scheme.to_be_bytes());
+            }
+        }
+        None => {
+            for (h, s) in OFFERED_SIGNATURE_ALGORITHMS {
+                bytes.extend_from_slice(&[*h, *s]);
+            }
+        }
+    }
+    encode_u16_prefixed(&bytes)
 }
 
 /// Build a TLS 1.2 `ClientHello`.
@@ -229,25 +259,29 @@ pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
     push_extension(
         &mut extensions,
         ext::SUPPORTED_GROUPS,
-        &encode_u16_list(&[NAMED_CURVE_SECP256R1]),
+        &encode_u16_list(params.curves.unwrap_or(&[NAMED_CURVE_SECP256R1])),
     );
     push_extension(
         &mut extensions,
         ext::EC_POINT_FORMATS,
         &[1, EC_POINT_FORMAT_UNCOMPRESSED],
     );
-    let mut sig_alg_bytes = BytesMut::new();
-    for (h, s) in OFFERED_SIGNATURE_ALGORITHMS {
-        sig_alg_bytes.extend_from_slice(&[*h, *s]);
-    }
-    push_extension(&mut extensions, ext::SIGNATURE_ALGORITHMS, &encode_u16_prefixed(&sig_alg_bytes));
+    push_extension(
+        &mut extensions,
+        ext::SIGNATURE_ALGORITHMS,
+        &encode_signature_algorithms(params.signature_schemes),
+    );
     // RFC 9846 §1.4: which certificate-chain signature algorithms this
     // engine can verify — always sent; see crypto::x509's matching
     // constant.
     push_extension(
         &mut extensions,
         ext::SIGNATURE_ALGORITHMS_CERT,
-        &encode_u16_list(crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES),
+        &encode_u16_list(
+            params
+                .cert_signature_schemes
+                .unwrap_or(crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES),
+        ),
     );
     if let Some(name) = params.server_name {
         let host = name.as_bytes();
@@ -330,16 +364,14 @@ pub struct ParsedClientHello {
     pub session_id: Bytes,
     /// Offered cipher suites.
     pub cipher_suites: Vec<u16>,
-    /// `signature_algorithms` pairs, if sent. Parsed but not currently
-    /// consulted by `engine.rs` (`sign_ske` picks its output algorithm
-    /// from this engine's own key type only, unconditionally — a
-    /// deliberate scope decision from the RSASSA-PSS pass: switching our
-    /// own signing output based on the peer's offer would be a real
-    /// behavioral change with no interop benefit today, since PKCS1v1.5
-    /// stays valid). Read in tests; `#[allow(dead_code)]` reflects that
-    /// honestly rather than pretending it's fully wired in.
-    #[allow(dead_code)]
+    /// `signature_algorithms` pairs, if sent (empty when the extension is
+    /// absent). The server consults them only when it has a configured
+    /// [`super::engine::Config::signature_schemes`], so the default output
+    /// stays the key type's own algorithm regardless of the peer's offer.
     pub signature_algorithms: Vec<(u8, u8)>,
+    /// `supported_groups` (named curves) the client offered, empty when the
+    /// extension is absent.
+    pub supported_groups: Vec<u16>,
     /// Schemes from the client's `signature_algorithms_cert` extension
     /// (RFC 8446 §4.2.3, applied to TLS 1.2 by RFC 9846 §1.4): the
     /// certificate-chain signature algorithms it can verify. `None` when
@@ -419,6 +451,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
 
     let mut signature_algorithms = Vec::new();
     let mut signature_algorithms_cert = None;
+    let mut supported_groups = Vec::new();
     let mut server_name = None;
     let mut session_ticket = None;
     let mut extended_master_secret = false;
@@ -447,6 +480,12 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
                                 signature_algorithms.push((data[m], data[m + 1]));
                                 m += 2;
                             }
+                        }
+                    }
+                    ext::SUPPORTED_GROUPS => {
+                        if data.len() >= 2 && usize::from(u16::from_be_bytes([data[0], data[1]])) == data.len() - 2 {
+                            supported_groups =
+                                data[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
                         }
                     }
                     ext::SIGNATURE_ALGORITHMS_CERT => {
@@ -504,6 +543,7 @@ pub fn parse_client_hello(body: &[u8]) -> Option<ParsedClientHello> {
         session_id,
         cipher_suites,
         signature_algorithms,
+        supported_groups,
         signature_algorithms_cert,
         server_name,
         session_ticket,
@@ -733,25 +773,21 @@ pub fn parse_certificate(body: &[u8]) -> Option<Vec<Bytes>> {
 /// `rsa_sign`/`ecdsa_sign` client-certificate types and the same
 /// `SignatureAndHashAlgorithm` pairs [`build_client_hello`] advertises, with
 /// an empty `certificate_authorities` (accept any CA).
-pub fn build_certificate_request() -> Bytes {
+pub fn build_certificate_request(schemes: &[u16]) -> Bytes {
     let mut body = BytesMut::new();
     // ClientCertificateType: rsa_sign(1), ecdsa_sign(64) (RFC 4492 §5.5).
     body.extend_from_slice(&[2u8, 1, 64]);
-    let mut sig_alg_bytes = BytesMut::new();
-    for (h, s) in OFFERED_SIGNATURE_ALGORITHMS {
-        sig_alg_bytes.extend_from_slice(&[*h, *s]);
-    }
-    body.extend_from_slice(&(sig_alg_bytes.len() as u16).to_be_bytes());
-    body.extend_from_slice(&sig_alg_bytes);
+    body.extend_from_slice(&encode_signature_algorithms(Some(schemes)));
     body.extend_from_slice(&0u16.to_be_bytes()); // certificate_authorities: empty
     encode_message(MessageType::CertificateRequest, &body)
 }
 
-/// Validate a `CertificateRequest` body without extracting anything from
-/// it — this engine always offers the caller's single configured client
-/// certificate (or none) regardless of `certificate_authorities` or the
-/// requested types, so only well-formedness matters.
-pub fn parse_certificate_request(body: &[u8]) -> Option<()> {
+/// Validate a `CertificateRequest` body and return its
+/// `supported_signature_algorithms` as `(hash << 8) | signature` codes. This
+/// engine always offers the caller's single configured client certificate (or
+/// none) regardless of `certificate_authorities` or the requested types, so
+/// beyond well-formedness only the signature algorithms matter.
+pub fn parse_certificate_request(body: &[u8]) -> Option<Vec<u16>> {
     let types_len = *body.first()? as usize;
     let mut i = 1;
     if body.len() < i + types_len + 2 {
@@ -763,13 +799,14 @@ pub fn parse_certificate_request(body: &[u8]) -> Option<()> {
     if body.len() < i + sig_algs_len + 2 {
         return None;
     }
+    let schemes = body[i..i + sig_algs_len].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
     i += sig_algs_len;
     let ca_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
     i += 2;
     if body.len() < i + ca_len {
         return None;
     }
-    Some(())
+    Some(schemes)
 }
 
 /// Build a `CertificateVerify` (RFC 5246 §7.4.8) — a client proving
@@ -799,10 +836,10 @@ pub fn parse_certificate_verify(body: &[u8]) -> Option<(u8, u8, Bytes)> {
 /// Build a `ServerKeyExchange` for ECDHE (RFC 4492 §5.4): explicit named
 /// curve, an uncompressed EC point, and a signature over
 /// `client_random || server_random || ServerECDHParams`.
-pub fn build_server_key_exchange(ec_point: &[u8], sig_hash: u8, sig_alg: u8, signature: &[u8]) -> Bytes {
+pub fn build_server_key_exchange(curve: u16, ec_point: &[u8], sig_hash: u8, sig_alg: u8, signature: &[u8]) -> Bytes {
     let mut body = BytesMut::new();
     body.extend_from_slice(&[EC_CURVE_TYPE_NAMED_CURVE]);
-    body.extend_from_slice(&NAMED_CURVE_SECP256R1.to_be_bytes());
+    body.extend_from_slice(&curve.to_be_bytes());
     body.extend_from_slice(&[ec_point.len() as u8]);
     body.extend_from_slice(ec_point);
     body.extend_from_slice(&[sig_hash, sig_alg]);
@@ -812,10 +849,10 @@ pub fn build_server_key_exchange(ec_point: &[u8], sig_hash: u8, sig_alg: u8, sig
 }
 
 /// The part of `ServerKeyExchange` the signature actually covers (RFC 4492 §5.4 `ServerECDHParams`).
-pub fn server_ecdh_params_bytes(ec_point: &[u8]) -> Bytes {
+pub fn server_ecdh_params_bytes(curve: u16, ec_point: &[u8]) -> Bytes {
     let mut out = BytesMut::with_capacity(4 + ec_point.len());
     out.extend_from_slice(&[EC_CURVE_TYPE_NAMED_CURVE]);
-    out.extend_from_slice(&NAMED_CURVE_SECP256R1.to_be_bytes());
+    out.extend_from_slice(&curve.to_be_bytes());
     out.extend_from_slice(&[ec_point.len() as u8]);
     out.extend_from_slice(ec_point);
     out.freeze()
@@ -825,7 +862,8 @@ pub fn server_ecdh_params_bytes(ec_point: &[u8]) -> Bytes {
 /// engine speaks; see [`super`]'s module doc for why).
 #[derive(Debug, Clone)]
 pub struct ParsedServerKeyExchange {
-    /// The named curve: [`NAMED_CURVE_SECP256R1`] or [`NAMED_CURVE_X25519`].
+    /// The named curve: [`NAMED_CURVE_SECP256R1`], [`NAMED_CURVE_SECP384R1`]
+    /// or [`NAMED_CURVE_X25519`].
     pub curve: u16,
     /// Server's public share: the uncompressed point (65 bytes) for P-256,
     /// the raw 32-byte u-coordinate for X25519 (RFC 8422 §5.4.1).
@@ -840,8 +878,8 @@ pub struct ParsedServerKeyExchange {
     pub signed_params: Bytes,
 }
 
-/// Parse a `ServerKeyExchange` body (named-curve ECDHE over `secp256r1` or
-/// X25519 only).
+/// Parse a `ServerKeyExchange` body (named-curve ECDHE over `secp256r1`,
+/// `secp384r1` or X25519 only).
 pub fn parse_server_key_exchange(body: &[u8]) -> Option<ParsedServerKeyExchange> {
     if body.first() != Some(&EC_CURVE_TYPE_NAMED_CURVE) {
         return None; // explicit-prime/explicit-char2 curves not supported
@@ -850,6 +888,7 @@ pub fn parse_server_key_exchange(body: &[u8]) -> Option<ParsedServerKeyExchange>
     let point_len = *body.get(3)? as usize;
     let expected_len = match curve {
         NAMED_CURVE_SECP256R1 => 65,
+        NAMED_CURVE_SECP384R1 => 97,
         NAMED_CURVE_X25519 => 32,
         _ => return None,
     };
@@ -936,6 +975,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         // 1-byte type + 3-byte length header.
@@ -968,6 +1010,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0xfefd,
             cookie: b"a-server-issued-cookie",
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse DTLS-shaped client hello");
@@ -990,6 +1035,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         let schemes = find_extension_u16_list(&wire, ext::SIGNATURE_ALGORITHMS_CERT).expect("extension present");
@@ -1082,14 +1130,14 @@ mod tests {
     fn server_key_exchange_round_trip() {
         let point = [4u8; 65];
         let sig = [9u8; 70];
-        let wire = build_server_key_exchange(&point, sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA, &sig);
+        let wire = build_server_key_exchange(NAMED_CURVE_SECP256R1, &point, sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA, &sig);
         let parsed = parse_server_key_exchange(&wire[4..]).expect("parse");
         assert_eq!(parsed.curve, NAMED_CURVE_SECP256R1);
         assert_eq!(parsed.ec_point.as_ref(), &point[..]);
         assert_eq!(parsed.sig_hash, sig_alg::HASH_SHA256);
         assert_eq!(parsed.sig_alg, sig_alg::SIG_ECDSA);
         assert_eq!(parsed.signature.as_ref(), &sig[..]);
-        assert_eq!(parsed.signed_params.as_ref(), server_ecdh_params_bytes(&point).as_ref());
+        assert_eq!(parsed.signed_params.as_ref(), server_ecdh_params_bytes(NAMED_CURVE_SECP256R1, &point).as_ref());
     }
 
     /// `ServerKeyExchange` body for an arbitrary named curve — what a
@@ -1121,8 +1169,10 @@ mod tests {
     #[test]
     fn server_key_exchange_rejects_other_curves_and_wrong_share_lengths() {
         let sig = [9u8; 70];
-        // secp384r1: not implemented on the client side.
-        assert!(parse_server_key_exchange(&server_key_exchange_body_on_curve(24, &[4u8; 97], &sig)).is_none());
+        // secp521r1: not implemented.
+        assert!(parse_server_key_exchange(&server_key_exchange_body_on_curve(25, &[4u8; 133], &sig)).is_none());
+        // secp384r1 is, but only with a 97-byte point.
+        assert!(parse_server_key_exchange(&server_key_exchange_body_on_curve(NAMED_CURVE_SECP384R1, &[4u8; 65], &sig)).is_none());
         // Right curves, wrong share sizes.
         assert!(parse_server_key_exchange(&server_key_exchange_body_on_curve(NAMED_CURVE_X25519, &[7u8; 65], &sig)).is_none());
         assert!(parse_server_key_exchange(&server_key_exchange_body_on_curve(NAMED_CURVE_SECP256R1, &[4u8; 32], &sig)).is_none());
@@ -1148,6 +1198,9 @@ mod tests {
        
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse");
@@ -1167,6 +1220,9 @@ mod tests {
        
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse");
@@ -1185,6 +1241,9 @@ mod tests {
        
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse");
@@ -1198,5 +1257,26 @@ mod tests {
         let (lifetime, ticket) = parse_new_session_ticket(&wire[4..]).expect("parse");
         assert_eq!(lifetime, 3600);
         assert_eq!(ticket.as_ref(), b"a-sealed-ticket-blob");
+    }
+
+    #[test]
+    fn server_key_exchange_p384_round_trips() {
+        let point = [4u8; 97];
+        let sig = [9u8; 70];
+        let wire = build_server_key_exchange(NAMED_CURVE_SECP384R1, &point, sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA, &sig);
+        let parsed = parse_server_key_exchange(&wire[4..]).expect("parses");
+        assert_eq!(parsed.curve, NAMED_CURVE_SECP384R1);
+        assert_eq!(parsed.ec_point.len(), 97);
+        assert_eq!(parsed.signed_params, server_ecdh_params_bytes(NAMED_CURVE_SECP384R1, &point));
+        // A P-384 curve id with a P-256-sized point is malformed.
+        let bad = build_server_key_exchange(NAMED_CURVE_SECP384R1, &[4u8; 65], sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA, &sig);
+        assert!(parse_server_key_exchange(&bad[4..]).is_none());
+    }
+
+    #[test]
+    fn certificate_request_lists_the_given_signature_algorithms() {
+        let wire = build_certificate_request(&[0x0403, 0x0804]);
+        let listed = parse_certificate_request(&wire[4..]).expect("parses");
+        assert_eq!(listed, vec![0x0403, 0x0804]);
     }
 }

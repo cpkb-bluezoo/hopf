@@ -22,6 +22,7 @@ use crate::tls::{
 };
 
 use super::reassembly::{Reassembler, HANDSHAKE_HEADER_LEN, MAX_FRAGMENT};
+use crate::tls::TrafficSecret;
 use super::record::{self, PlaintextReadOutcome, ReadKeys, ReadOutcome, WriteKeys};
 use super::retransmit::{RetransmitOutcome, RetransmitState};
 
@@ -181,7 +182,7 @@ impl RecordState {
 
     /// The peer's `KeyUpdate` (RFC 9147 §5.8.4): switch to the next epoch's
     /// read key immediately, keeping the old one for reordered records.
-    fn rotate_read_key(&mut self, aead: Tls13Aead, secret: &[u8; 32]) {
+    fn rotate_read_key(&mut self, aead: Tls13Aead, secret: &[u8]) {
         let old = self.read.take().expect("read keys exist once application traffic is established");
         self.read = Some(ReadKeys::from_secret(aead, secret, old.epoch() + 1));
         self.prev_read = Some(old);
@@ -190,7 +191,7 @@ impl RecordState {
 
     /// Our own `KeyUpdate` was just written: derive the next epoch's write
     /// key but hold it until the peer acknowledges that record.
-    fn queue_write_key(&mut self, aead: Tls13Aead, secret: &[u8; 32]) {
+    fn queue_write_key(&mut self, aead: Tls13Aead, secret: &[u8]) {
         let current = self.write.as_ref().expect("write keys exist once application traffic is established");
         let next_epoch = self.pending_writes.back().map_or(current.epoch(), |p| p.keys.epoch()) + 1;
         self.pending_writes.push_back(PendingWrite {
@@ -222,25 +223,25 @@ impl RecordState {
         }
     }
 
-    fn install_handshake_keys(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn install_handshake_keys(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         let (w, r) = match self.role {
             HandshakeRole::Client => (client, server),
             HandshakeRole::Server => (server, client),
         };
         let epoch = Epoch::Handshake.wire_value();
-        self.write = Some(WriteKeys::from_secret(aead, &w, epoch));
-        self.read = Some(ReadKeys::from_secret(aead, &r, epoch));
+        self.write = Some(WriteKeys::from_secret(aead, w.as_bytes(), epoch));
+        self.read = Some(ReadKeys::from_secret(aead, r.as_bytes(), epoch));
         self.epoch = Epoch::Handshake;
     }
 
-    fn stage_application_keys(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn stage_application_keys(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         let (w, r) = match self.role {
             HandshakeRole::Client => (client, server),
             HandshakeRole::Server => (server, client),
         };
         let epoch = Epoch::Application.wire_value();
-        self.next_write = Some(WriteKeys::from_secret(aead, &w, epoch));
-        self.next_read = Some(ReadKeys::from_secret(aead, &r, epoch));
+        self.next_write = Some(WriteKeys::from_secret(aead, w.as_bytes(), epoch));
+        self.next_read = Some(ReadKeys::from_secret(aead, r.as_bytes(), epoch));
     }
 
     fn activate_application_keys(&mut self) {
@@ -349,11 +350,11 @@ impl TlsEventSink for InnerSink<'_> {
         self.events.verify.push(req);
     }
 
-    fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         self.state.install_handshake_keys(aead, client, server);
     }
 
-    fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         self.state.stage_application_keys(aead, client, server);
     }
 
@@ -362,10 +363,10 @@ impl TlsEventSink for InnerSink<'_> {
         self.state.recv_limit = Some(limits.receive as usize);
     }
 
-    fn application_traffic_key_updated(&mut self, aead: Tls13Aead, direction: KeyUpdateDirection, secret: [u8; 32]) {
+    fn application_traffic_key_updated(&mut self, aead: Tls13Aead, direction: KeyUpdateDirection, secret: TrafficSecret) {
         match direction {
-            KeyUpdateDirection::Read => self.state.rotate_read_key(aead, &secret),
-            KeyUpdateDirection::Write => self.state.queue_write_key(aead, &secret),
+            KeyUpdateDirection::Read => self.state.rotate_read_key(aead, secret.as_bytes()),
+            KeyUpdateDirection::Write => self.state.queue_write_key(aead, secret.as_bytes()),
         }
     }
 
@@ -1180,6 +1181,28 @@ mod tests {
         let info = sink_c.info.expect("client security info");
         assert_eq!(info.alpn(), Some(&b"test"[..]));
         assert_eq!(info.protocol(), Some("DTLSv1.3"));
+    }
+
+    /// TLS_AES_256_GCM_SHA384 over DTLS 1.3: AES-256-GCM record protection and
+    /// AES-256 record-number encryption, keyed from a SHA-384 schedule under
+    /// the `dtls13` label prefix.
+    #[test]
+    fn aes_256_gcm_sha384_loopback_handshake_completes() {
+        let (mut client_cfg, mut server_cfg) = configs();
+        client_cfg.cipher_suites = Some(vec![crate::tls::AES_256_GCM_SHA384]);
+        server_cfg.cipher_suites = Some(vec![crate::tls::AES_256_GCM_SHA384]);
+        let mut client = DtlsRecordEngine::new(client_cfg);
+        let mut server = DtlsRecordEngine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+        let info = sink_c.info.expect("client security info");
+        assert_eq!(info.cipher_suite(), Some("TLS_AES_256_GCM_SHA384"));
     }
 
     /// RFC 9147 §7: once we've completed the handshake by processing the

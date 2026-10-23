@@ -206,6 +206,9 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
             extra_key_shares: Vec::new(),
         })
         .encode();
@@ -224,6 +227,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         });
         let body = &wire[4..];
         assert_eq!(u16::from_be_bytes([body[0], body[1]]), TLS12);

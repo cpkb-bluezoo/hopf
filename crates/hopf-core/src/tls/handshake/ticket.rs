@@ -14,6 +14,8 @@ use aws_lc_rs::digest::{digest, SHA256};
 use bytes::{BufMut, Bytes, BytesMut};
 use getrandom::getrandom;
 
+use crate::crypto::Tls13Hash;
+
 use super::key_schedule::{derive_resumption_psk, PskSecret, ResumptionMasterSecret};
 use super::messages::{build_new_session_ticket, HandshakeMessage};
 use super::transport_params::RememberedTransportLimits;
@@ -209,9 +211,7 @@ pub fn open_ticket(ticket_key: &TicketKey, identity: &[u8]) -> Option<TicketPayl
         return None;
     }
     let alpn = Bytes::copy_from_slice(&plain[23..23 + alpn_len]);
-    let mut psk = [0u8; 32];
-    psk.copy_from_slice(&plain[23 + alpn_len..23 + alpn_len + 32]);
-    let psk = PskSecret::from_bytes(psk);
+    let psk = PskSecret::from_bytes(&plain[23 + alpn_len..23 + alpn_len + 32]);
     let remembered_limits = if version == TICKET_PAYLOAD_VERSION {
         let tail = &plain[23 + alpn_len + 32..];
         RememberedTransportLimits::decode_fixed(tail)
@@ -301,7 +301,7 @@ pub fn mint_new_session_ticket(
 ) -> Option<(HandshakeMessage, StoredTicket)> {
     let mut ticket_nonce = [0u8; 8];
     getrandom(&mut ticket_nonce).ok()?;
-    let psk = derive_resumption_psk(resumption_master, &ticket_nonce, dtls);
+    let psk = derive_resumption_psk(Tls13Hash::Sha256, resumption_master, &ticket_nonce, dtls);
     let mut age_add = [0u8; 4];
     getrandom(&mut age_add).ok()?;
     let ticket_age_add = u32::from_be_bytes(age_add);

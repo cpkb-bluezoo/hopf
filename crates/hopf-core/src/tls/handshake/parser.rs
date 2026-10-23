@@ -572,8 +572,11 @@ fn decode_certificate_verify(body: &[u8], handler: &mut dyn HandshakeEvents) -> 
     true
 }
 
+/// `Finished.verify_data` is `Hash.length` octets (RFC 8446 §4.4.4): 32 for
+/// SHA-256 suites, 48 for SHA-384. The parser does not know the suite; the
+/// engine checks the value against the one expected for the negotiated hash.
 fn decode_finished(body: &[u8], handler: &mut dyn HandshakeEvents) -> bool {
-    if body.len() != 32 {
+    if !matches!(body.len(), 32 | 48) {
         handler.parse_error("Finished verify_data length");
         return false;
     }
@@ -1059,6 +1062,9 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
             extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();

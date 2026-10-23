@@ -41,11 +41,12 @@ use bytes::{Bytes, BytesMut};
 
 use crate::crypto::cert::SpkiDer;
 use crate::crypto::digest::{HashAlgorithm, Sha256Context};
-use crate::crypto::kx::{EphemeralKeyPair, EphemeralP256KeyPair};
+use crate::crypto::kx::{EphemeralKeyPair, EphemeralP256KeyPair, EphemeralP384KeyPair};
 use crate::crypto::prf::{prf, PrfHash};
 use crate::crypto::signature::{
     ecdsa_p256_sha256_verify_spki, ecdsa_p256_sign, ecdsa_p384_sha384_verify_spki, ecdsa_p384_sign,
-    ed25519_sign, ed25519_verify, rsa_pss_sha256_verify_spki, rsa_sign_pkcs1_sha256, rsa_verify_pkcs1_sha256,
+    ed25519_sign, ed25519_verify, rsa_pss_sha256_verify_spki, rsa_sign_pkcs1_sha256, rsa_sign_pss_sha256,
+    rsa_verify_pkcs1_sha256,
     EcdsaP256PrivateKey, EcdsaP384PrivateKey, Ed25519PrivateKey, RsaPrivateKey, RsaPublicKeyComponents,
     SignatureBytes,
 };
@@ -289,6 +290,28 @@ pub struct Config {
     /// every client is known to send it. Whatever this is set to, an extension
     /// that *is* present must list this engine's own version.
     pub require_supported_versions: bool,
+    /// Cipher suites offered (client) or considered, in preference order
+    /// (server). `None` uses [`SUPPORTED_CIPHER_SUITES`]. Suites this engine
+    /// does not implement can be listed but are never selected.
+    pub cipher_suites: Option<Vec<u16>>,
+    /// ECDHE named curves, in preference order: offered in `supported_groups`
+    /// (client), the server's choice among those the client offered, and the
+    /// only curves a client accepts in `ServerKeyExchange`. Servers speak
+    /// secp256r1 and secp384r1 only. `None` keeps the unrestricted
+    /// behaviour: offer secp256r1, serve secp256r1, accept secp256r1 or
+    /// X25519.
+    pub curves: Option<Vec<u16>>,
+    /// Signature algorithms as `(hash << 8) | signature` codes (the same
+    /// numbers as TLS 1.3 `SignatureScheme`s): offered in `signature_algorithms`
+    /// and `CertificateRequest`, accepted from the peer, and the only ones this
+    /// side signs with. A server also limits itself to the client's offer
+    /// when this is set. `None` keeps the unrestricted behaviour.
+    pub signature_schemes: Option<Vec<u16>>,
+    /// Certificate-chain signature schemes (`signature_algorithms_cert`,
+    /// RFC 9846 §1.4): advertised in the ClientHello, and a peer chain needing
+    /// any other is rejected. `None`: advertise everything verifiable, check
+    /// nothing, as before.
+    pub cert_signature_schemes: Option<Vec<u16>>,
 }
 
 impl Default for Config {
@@ -310,6 +333,10 @@ impl Default for Config {
             dtls_initial_seq: (0, 0),
             alpn: Vec::new(),
             require_supported_versions: false,
+            cipher_suites: None,
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         }
     }
 }
@@ -454,6 +481,41 @@ impl MessageBuffer {
     }
 }
 
+/// Server-side ephemeral ECDHE key on one of the curves this engine serves.
+enum EcdheKey {
+    P256(EphemeralP256KeyPair),
+    P384(EphemeralP384KeyPair),
+}
+
+impl EcdheKey {
+    fn generate(curve: u16) -> Option<Self> {
+        match curve {
+            messages::NAMED_CURVE_SECP256R1 => EphemeralP256KeyPair::generate().ok().map(EcdheKey::P256),
+            messages::NAMED_CURVE_SECP384R1 => EphemeralP384KeyPair::generate().ok().map(EcdheKey::P384),
+            _ => None,
+        }
+    }
+
+    fn public_key(&self) -> &[u8] {
+        match self {
+            EcdheKey::P256(k) => k.public_key(),
+            EcdheKey::P384(k) => k.public_key(),
+        }
+    }
+
+    fn agree(self, peer: &[u8]) -> Result<Bytes, aws_lc_rs::error::Unspecified> {
+        match self {
+            EcdheKey::P256(k) => k.agree(peer),
+            EcdheKey::P384(k) => k.agree(peer),
+        }
+    }
+}
+
+/// `(hash << 8) | signature` code for a TLS 1.2 `SignatureAndHashAlgorithm`.
+fn scheme_code(hash: u8, alg: u8) -> u16 {
+    (u16::from(hash) << 8) | u16::from(alg)
+}
+
 /// Reactive TLS 1.2 handshake engine — full client/server ECDHE handshake.
 pub struct Tls12Engine {
     config: Config,
@@ -465,7 +527,9 @@ pub struct Tls12Engine {
     prf_hash: Option<PrfHash>,
     client_random: [u8; 32],
     server_random: [u8; 32],
-    local_ecdhe: Option<EphemeralP256KeyPair>,
+    local_ecdhe: Option<EcdheKey>,
+    /// Client role: the signature algorithms of the server's `CertificateRequest`.
+    cert_request_schemes: Option<Vec<u16>>,
     /// Client role: the server's `ServerKeyExchange` share, with the named
     /// curve it came on, held until `ServerHelloDone` triggers our reply.
     peer_ecdhe: Option<(u16, Bytes)>,
@@ -531,6 +595,7 @@ impl Tls12Engine {
             client_random: [0u8; 32],
             server_random: [0u8; 32],
             local_ecdhe: None,
+            cert_request_schemes: None,
             peer_ecdhe: None,
             master_secret: None,
             use_ems: false,
@@ -606,6 +671,17 @@ impl Tls12Engine {
         true
     }
 
+    /// Hold this engine to the FIPS profile (see [`Config::with_fips_profile`]).
+    /// Only possible before the handshake has started; the config is left
+    /// untouched on error.
+    pub fn set_fips(&mut self) -> Result<(), crate::tls::fips::FipsProfileError> {
+        if self.state != State::Initial {
+            return Err(crate::tls::fips::FipsProfileError::too_late());
+        }
+        self.config = self.config.clone().with_fips_profile()?;
+        Ok(())
+    }
+
     /// Set the ALPN protocol names (RFC 7301), as [`Config::alpn`] does. Only
     /// possible before the handshake has started; returns whether it took
     /// effect.
@@ -615,6 +691,36 @@ impl Tls12Engine {
         }
         self.config.alpn = protocols;
         true
+    }
+
+    /// See the TLS 1.3 engine's `peer_chain_schemes_ok`.
+    fn peer_chain_schemes_ok<S: Tls12EventSink>(&mut self, sink: &mut S, whose: &str) -> bool {
+        let Some(allowed) = self.config.cert_signature_schemes.as_deref() else {
+            return true;
+        };
+        match crate::crypto::x509::chain_scheme_not_offered(&self.peer_certs, allowed) {
+            Some(scheme) => {
+                self.fail(
+                    sink,
+                    AlertDescription::BadCertificate,
+                    &format!("{whose} certificate chain is signed with scheme 0x{scheme:04x}, outside signature_algorithms_cert"),
+                );
+                false
+            }
+            None => true,
+        }
+    }
+
+    fn effective_cipher_suites(&self) -> &[u16] {
+        self.config.cipher_suites.as_deref().unwrap_or(SUPPORTED_CIPHER_SUITES)
+    }
+
+    /// Whether this side accepts a peer signing with `(hash, alg)`.
+    fn signature_algorithm_accepted(&self, hash: u8, alg: u8) -> bool {
+        match self.config.signature_schemes.as_deref() {
+            Some(list) => list.contains(&scheme_code(hash, alg)),
+            None => messages::OFFERED_SIGNATURE_ALGORITHMS.contains(&(hash, alg)),
+        }
     }
 
     /// Begin the handshake — client emits `ClientHello`; server waits for input.
@@ -654,12 +760,15 @@ impl Tls12Engine {
         let params = messages::ClientHelloParams {
             random,
             session_id: &session_id,
-            cipher_suites: SUPPORTED_CIPHER_SUITES,
+            cipher_suites: self.effective_cipher_suites(),
             server_name: self.config.server_name.as_deref(),
             session_ticket: ticket_offer.as_deref(),
             alpn: &self.config.alpn,
             legacy_version: if self.config.dtls { 0xfefd } else { 0x0303 },
             cookie: &self.config.cookie,
+            curves: self.config.curves.as_deref(),
+            signature_schemes: self.config.signature_schemes.as_deref(),
+            cert_signature_schemes: self.config.cert_signature_schemes.as_deref(),
         };
         let wire = messages::build_client_hello(&params);
         self.emit(&wire, sink);
@@ -797,6 +906,10 @@ impl Tls12Engine {
             self.fail(sink, AlertDescription::IllegalParameter, "server selected an unsupported cipher suite");
             return false;
         };
+        if !self.effective_cipher_suites().contains(&sh.cipher_suite) {
+            self.fail(sink, AlertDescription::IllegalParameter, "server selected a cipher suite the client did not offer");
+            return false;
+        }
         if !sh.extended_master_secret {
             self.fail(sink, AlertDescription::InsufficientSecurity, "server did not negotiate mandatory Extended Master Secret (RFC 7627)");
             return false;
@@ -904,6 +1017,9 @@ impl Tls12Engine {
         };
         self.hash_message(&wire, false);
         self.peer_certs = certs;
+        if !self.peer_chain_schemes_ok(sink, "server") {
+            return false;
+        }
         self.verify_id += 1;
         self.verify_pending = true;
         sink.verification_requested(VerifyRequest {
@@ -940,6 +1056,22 @@ impl Tls12Engine {
             self.fail(sink, AlertDescription::DecodeError, "malformed or unsupported ServerKeyExchange (only named-curve secp256r1 or X25519 ECDHE is supported)");
             return false;
         };
+        // Unconfigured: the curves this engine has always accepted (the one it
+        // offers, plus X25519 for the negotiating connector's TLS 1.3-shaped
+        // ClientHello); never one it did not offer, such as secp384r1.
+        let acceptable_curves = self
+            .config
+            .curves
+            .as_deref()
+            .unwrap_or(&[messages::NAMED_CURVE_SECP256R1, messages::NAMED_CURVE_X25519]);
+        if !acceptable_curves.contains(&ske.curve) {
+            self.fail(sink, AlertDescription::IllegalParameter, "server selected a curve the client did not offer");
+            return false;
+        }
+        if !self.signature_algorithm_accepted(ske.sig_hash, ske.sig_alg) {
+            self.fail(sink, AlertDescription::IllegalParameter, "ServerKeyExchange signature algorithm was not offered in signature_algorithms");
+            return false;
+        }
         let Some(leaf) = self.peer_certs.first() else {
             self.fail(sink, AlertDescription::UnexpectedMessage, "ServerKeyExchange before Certificate");
             return false;
@@ -959,14 +1091,26 @@ impl Tls12Engine {
     }
 
     fn on_certificate_request<S: Tls12EventSink>(&mut self, body: &[u8], wire: Bytes, sink: &mut S) -> bool {
-        if messages::parse_certificate_request(body).is_none() {
+        let Some(schemes) = messages::parse_certificate_request(body) else {
             self.fail(sink, AlertDescription::DecodeError, "malformed CertificateRequest");
             return false;
-        }
+        };
+        self.cert_request_schemes = Some(schemes);
         self.hash_message(&wire, false);
         self.client_cert_requested = true;
         self.state = State::ExpectServerHelloDone;
         true
+    }
+
+    /// Algorithms a client may sign `CertificateVerify` with: our configured
+    /// list narrowed by the server's `CertificateRequest`. `None`: no
+    /// restriction beyond the key's own algorithm, as before.
+    fn client_signing_allowed(&self) -> Option<Vec<u16>> {
+        let own = self.config.signature_schemes.as_ref()?;
+        Some(match self.cert_request_schemes.as_deref().filter(|l| !l.is_empty()) {
+            Some(theirs) => own.iter().copied().filter(|s| theirs.contains(s)).collect(),
+            None => own.clone(),
+        })
     }
 
     fn on_server_hello_done<S: Tls12EventSink>(&mut self, wire: Bytes, sink: &mut S) -> bool {
@@ -982,6 +1126,14 @@ impl Tls12Engine {
         let (client_point, pre_master) = match curve {
             messages::NAMED_CURVE_SECP256R1 => {
                 let Ok(local) = EphemeralP256KeyPair::generate() else {
+                    self.fail(sink, AlertDescription::InternalError, "key generation failed");
+                    return false;
+                };
+                let point = Bytes::copy_from_slice(local.public_key());
+                (point, local.agree(&peer_point))
+            }
+            messages::NAMED_CURVE_SECP384R1 => {
+                let Ok(local) = EphemeralP384KeyPair::generate() else {
                     self.fail(sink, AlertDescription::InternalError, "key generation failed");
                     return false;
                 };
@@ -1011,7 +1163,14 @@ impl Tls12Engine {
         // presented a non-empty chain) goes right after it, below.
         let sent_client_cert = if self.client_cert_requested {
             self.client_cert_requested = false;
-            let creds = self.config.client_credentials.clone();
+            // RFC 5246 §7.4.6: a client with no certificate that satisfies the
+            // request (its key can only sign with an algorithm outside our
+            // list or the server's) sends an empty Certificate.
+            let allowed = self.client_signing_allowed();
+            let creds = self.config.client_credentials.clone().filter(|c| {
+                pkcs8_key_kind(&c.signing_key_pkcs8)
+                    .is_none_or(|kind| ske_algorithm(kind, allowed.as_deref()).is_some())
+            });
             let cert_refs: Vec<&[u8]> = creds
                 .as_ref()
                 .map(|c| c.cert_chain.iter().map(|c| c.as_ref()).collect())
@@ -1034,7 +1193,9 @@ impl Tls12Engine {
 
         if let Some(creds) = sent_client_cert {
             let message = self.transcript.raw_bytes().to_vec();
-            let Some((sig_hash, sig_alg, signature)) = sign_ske(&creds.signing_key_pkcs8, &message) else {
+            let Some((sig_hash, sig_alg, signature)) =
+                sign_ske(&creds.signing_key_pkcs8, &message, self.client_signing_allowed().as_deref())
+            else {
                 self.fail(sink, AlertDescription::InternalError, "unsupported or invalid client signing key");
                 return false;
             };
@@ -1138,7 +1299,11 @@ impl Tls12Engine {
             // carries no key ID, so there's no cheaper way to tell which
             // one sealed it.
             let payload = keys.decrypt_candidates().find_map(|key| ticket::open_ticket(key, offered))?;
-            if payload.is_expired() || !ch.cipher_suites.contains(&payload.cipher_suite) || cipher_info(payload.cipher_suite).is_none() {
+            if payload.is_expired()
+                || !ch.cipher_suites.contains(&payload.cipher_suite)
+                || !self.config.cipher_suites.as_deref().is_none_or(|own| own.contains(&payload.cipher_suite))
+                || cipher_info(payload.cipher_suite).is_none()
+            {
                 return None;
             }
             Some(payload)
@@ -1213,7 +1378,7 @@ impl Tls12Engine {
             }
         }
 
-        let Some(suite) = SUPPORTED_CIPHER_SUITES.iter().copied().find(|s| {
+        let Some(suite) = self.effective_cipher_suites().iter().copied().find(|s| {
             ch.cipher_suites.contains(s) && cipher_info(*s).is_some_and(|(_, _, k)| suite_accepts_key(k, our_kind))
         }) else {
             self.fail(sink, AlertDescription::HandshakeFailure, "no mutually supported cipher suite for this server's key type");
@@ -1242,26 +1407,63 @@ impl Tls12Engine {
         let cert_msg = messages::build_certificate(&cert_refs);
         self.emit(&cert_msg, sink);
 
-        let Ok(local) = EphemeralP256KeyPair::generate() else {
+        // The curve: with a configured list, our first one the client also
+        // offered (any, when it sent no `supported_groups`); otherwise the
+        // long-standing secp256r1.
+        let curve = match self.config.curves.as_deref() {
+            None => messages::NAMED_CURVE_SECP256R1,
+            Some(own) => {
+                let served = own.iter().copied().filter(|c| {
+                    matches!(*c, messages::NAMED_CURVE_SECP256R1 | messages::NAMED_CURVE_SECP384R1)
+                });
+                let Some(curve) = served
+                    .into_iter()
+                    .find(|c| ch.supported_groups.is_empty() || ch.supported_groups.contains(c))
+                else {
+                    self.fail(sink, AlertDescription::HandshakeFailure, "no mutually supported ECDHE curve");
+                    return false;
+                };
+                curve
+            }
+        };
+        let Some(local) = EcdheKey::generate(curve) else {
             self.fail(sink, AlertDescription::InternalError, "key generation failed");
             return false;
         };
         let server_point = Bytes::copy_from_slice(local.public_key());
-        let signed_params = messages::server_ecdh_params_bytes(&server_point);
+        let signed_params = messages::server_ecdh_params_bytes(curve, &server_point);
         let mut signed = BytesMut::with_capacity(64 + signed_params.len());
         signed.extend_from_slice(&self.client_random);
         signed.extend_from_slice(&self.server_random);
         signed.extend_from_slice(&signed_params);
-        let Some((sig_hash, sig_alg, signature)) = sign_ske(&creds.signing_key_pkcs8, &signed) else {
+        // With a configured list the server signs only with an algorithm both
+        // sides list (an absent client list applies no constraint).
+        let allowed: Option<Vec<u16>> = self.config.signature_schemes.as_ref().map(|own| {
+            let theirs: Vec<u16> = ch.signature_algorithms.iter().map(|(h, a)| scheme_code(*h, *a)).collect();
+            own.iter().copied().filter(|s| theirs.is_empty() || theirs.contains(s)).collect()
+        });
+        if allowed.is_some() && ske_algorithm(our_kind, allowed.as_deref()).is_none() {
+            self.fail(
+                sink,
+                AlertDescription::HandshakeFailure,
+                "server key has no signature algorithm in both sides' signature_algorithms",
+            );
+            return false;
+        }
+        let Some((sig_hash, sig_alg, signature)) = sign_ske(&creds.signing_key_pkcs8, &signed, allowed.as_deref()) else {
             self.fail(sink, AlertDescription::InternalError, "unsupported or invalid server signing key");
             return false;
         };
-        let ske = messages::build_server_key_exchange(&server_point, sig_hash, sig_alg, signature.as_bytes());
+        let ske = messages::build_server_key_exchange(curve, &server_point, sig_hash, sig_alg, signature.as_bytes());
         self.emit(&ske, sink);
         self.local_ecdhe = Some(local);
 
         if self.config.client_auth != ClientAuthPolicy::None {
-            let cr = messages::build_certificate_request();
+            let own_schemes: Vec<u16> = match self.config.signature_schemes.as_deref() {
+                Some(list) => list.to_vec(),
+                None => messages::OFFERED_SIGNATURE_ALGORITHMS.iter().map(|(h, a)| scheme_code(*h, *a)).collect(),
+            };
+            let cr = messages::build_certificate_request(&own_schemes);
             self.emit(&cr, sink);
         }
 
@@ -1291,6 +1493,9 @@ impl Tls12Engine {
             return true;
         }
         self.peer_certs = certs;
+        if !self.peer_chain_schemes_ok(sink, "client") {
+            return false;
+        }
         self.expect_client_certificate_verify = true;
         self.verify_id += 1;
         self.verify_pending = true;
@@ -1352,6 +1557,10 @@ impl Tls12Engine {
         };
         // Signs the transcript through ClientKeyExchange — `wire` (this
         // message) is not yet added to it below.
+        if self.config.signature_schemes.is_some() && !self.signature_algorithm_accepted(sig_hash, sig_alg) {
+            self.fail(sink, AlertDescription::IllegalParameter, "client CertificateVerify algorithm was not offered in CertificateRequest");
+            return false;
+        }
         let message = self.transcript.raw_bytes().to_vec();
         if !verify_ske_signature(leaf, sig_hash, sig_alg, &message, &signature) {
             self.fail(sink, AlertDescription::DecryptError, "client CertificateVerify signature invalid");
@@ -1563,25 +1772,45 @@ fn rsa_n_e_from_spki(spki_der: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((strip_integer_padding(modulus).to_vec(), strip_integer_padding(exponent).to_vec()))
 }
 
-fn sign_ske(signing_key_pkcs8: &[u8], message: &[u8]) -> Option<(u8, u8, SignatureBytes)> {
-    match pkcs8_key_kind(signing_key_pkcs8)? {
-        KeyKind::EcdsaP256 => {
-            let key = EcdsaP256PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
-            Some((sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA, ecdsa_p256_sign(&key, message).ok()?))
+/// The `(hash, signature)` pair a key of `kind` signs a `ServerKeyExchange` or
+/// `CertificateVerify` with, in order of preference, restricted to `allowed`
+/// codes when given. An RSA key prefers PKCS#1 v1.5 (the long-standing output)
+/// and falls back to RSASSA-PSS when only that is allowed.
+fn ske_algorithm(kind: KeyKind, allowed: Option<&[u16]>) -> Option<(u8, u8)> {
+    let candidates: &[(u8, u8)] = match kind {
+        KeyKind::EcdsaP256 => &[(sig_alg::HASH_SHA256, sig_alg::SIG_ECDSA)],
+        KeyKind::EcdsaP384 => &[(sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA)],
+        KeyKind::Rsa => &[
+            (sig_alg::HASH_SHA256, sig_alg::SIG_RSA),
+            (sig_alg::RSA_PSS_SHA256_BYTE0, sig_alg::RSA_PSS_SHA256_BYTE1),
+        ],
+        KeyKind::Ed25519 => &[(sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519)],
+    };
+    candidates
+        .iter()
+        .copied()
+        .find(|(h, a)| allowed.is_none_or(|list| list.contains(&scheme_code(*h, *a))))
+}
+
+fn sign_ske(signing_key_pkcs8: &[u8], message: &[u8], allowed: Option<&[u16]>) -> Option<(u8, u8, SignatureBytes)> {
+    let kind = pkcs8_key_kind(signing_key_pkcs8)?;
+    let (hash, alg) = ske_algorithm(kind, allowed)?;
+    let signature = match (kind, (hash, alg)) {
+        (KeyKind::EcdsaP256, _) => {
+            ecdsa_p256_sign(&EcdsaP256PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?, message).ok()?
         }
-        KeyKind::EcdsaP384 => {
-            let key = EcdsaP384PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
-            Some((sig_alg::HASH_SHA384, sig_alg::SIG_ECDSA, ecdsa_p384_sign(&key, message).ok()?))
+        (KeyKind::EcdsaP384, _) => {
+            ecdsa_p384_sign(&EcdsaP384PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?, message).ok()?
         }
-        KeyKind::Rsa => {
-            let key = RsaPrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
-            Some((sig_alg::HASH_SHA256, sig_alg::SIG_RSA, rsa_sign_pkcs1_sha256(&key, message).ok()?))
+        (KeyKind::Rsa, (sig_alg::RSA_PSS_SHA256_BYTE0, sig_alg::RSA_PSS_SHA256_BYTE1)) => {
+            rsa_sign_pss_sha256(&RsaPrivateKey::from_pkcs8(signing_key_pkcs8).ok()?, message).ok()?
         }
-        KeyKind::Ed25519 => {
-            let key = Ed25519PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
-            Some((sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519, ed25519_sign(&key, message)))
+        (KeyKind::Rsa, _) => {
+            rsa_sign_pkcs1_sha256(&RsaPrivateKey::from_pkcs8(signing_key_pkcs8).ok()?, message).ok()?
         }
-    }
+        (KeyKind::Ed25519, _) => ed25519_sign(&Ed25519PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?, message),
+    };
+    Some((hash, alg, signature))
 }
 
 #[cfg(test)]
@@ -1941,6 +2170,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         let body = &wire[4..];
@@ -2080,6 +2312,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         let tampered = replace_extension(&wire, 43, messages::ext::RENEGOTIATION_INFO, &[1, 2, 3]);
@@ -2119,6 +2354,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         let stripped = strip_extension(&wire, 43, messages::ext::RENEGOTIATION_INFO);
@@ -2158,6 +2396,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         // supported_versions listing only TLS 1.0 (0x0301), not 0x0303.
@@ -2198,6 +2439,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         let stripped = strip_extension(&wire, 43, messages::ext::SUPPORTED_VERSIONS);
@@ -2235,6 +2479,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         let wire = if keep_extension { wire } else { strip_extension(&wire, 43, messages::ext::SUPPORTED_VERSIONS) };
@@ -2298,6 +2545,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         // Same prefix as the other tests plus one extra cipher suite (2 bytes).
@@ -2371,6 +2621,9 @@ mod tests {
             alpn: &[],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         // legacy_version(2) + random(32) + session_id_len(1) + session_id(0)
@@ -2496,7 +2749,7 @@ mod tests {
         let creds = creds_for(&rcgen::PKCS_ED25519);
         let other = creds_for(&rcgen::PKCS_ED25519);
         let message = b"client_random || server_random || params";
-        let (h, a, sig) = sign_ske(&creds.signing_key_pkcs8, message).expect("Ed25519 key signs");
+        let (h, a, sig) = sign_ske(&creds.signing_key_pkcs8, message, None).expect("Ed25519 key signs");
         assert_eq!((h, a), (sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519));
         assert_eq!(sig.as_bytes().len(), 64);
 
@@ -2790,6 +3043,9 @@ mod tests {
             alpn: &[Bytes::from_static(b"h2")],
             legacy_version: 0x0303,
             cookie: &[],
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         });
         client.client_note_client_hello_sent(&hello);
         assert_eq!(client.client_random, [0x5a; 32]);
@@ -3094,6 +3350,10 @@ mod tests {
             dtls_initial_seq: (0, 0),
             alpn: Vec::new(),
             require_supported_versions: false,
+            cipher_suites: None,
+            curves: None,
+            signature_schemes: None,
+            cert_signature_schemes: None,
         }
     }
 
@@ -3261,5 +3521,292 @@ mod tests {
             "{:?}",
             sink_s.events
         );
+    }
+
+    // ---- restricted profiles: suites, curves, signature algorithms ----
+
+    fn ecdsa_p384_credentials() -> ServerCredentials {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        ServerCredentials {
+            cert_chain: vec![Bytes::copy_from_slice(cert.der())],
+            signing_key_pkcs8: Bytes::from(key_pair.serialize_der()),
+        }
+    }
+
+    fn ed25519_credentials() -> ServerCredentials {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        ServerCredentials {
+            cert_chain: vec![Bytes::copy_from_slice(cert.der())],
+            signing_key_pkcs8: Bytes::from(key_pair.serialize_der()),
+        }
+    }
+
+    /// Client and server configs for `creds` with the same restrictions applied to both.
+    fn restricted_pair(
+        creds: &ServerCredentials,
+        suites: Option<&[u16]>,
+        curves: Option<&[u16]>,
+        schemes: Option<&[u16]>,
+    ) -> (Config, Config) {
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[0].clone());
+        let restrict = |mut cfg: Config| {
+            cfg.cipher_suites = suites.map(<[u16]>::to_vec);
+            cfg.curves = curves.map(<[u16]>::to_vec);
+            cfg.signature_schemes = schemes.map(<[u16]>::to_vec);
+            cfg
+        };
+        let client = restrict(Config {
+            role: Role::Client,
+            server_name: Some("localhost".into()),
+            trust_store: Some(trust),
+            ..Default::default()
+        });
+        let server = restrict(Config { role: Role::Server, server: Some(creds.clone()), ..Default::default() });
+        (client, server)
+    }
+
+    /// Run the four flights; returns both engines and sinks (not asserting completion).
+    fn run_flights(client_cfg: Config, server_cfg: Config) -> (Tls12Engine, Tls12Engine, RecordingSink, RecordingSink) {
+        let mut client = Tls12Engine::new(client_cfg);
+        let mut server = Tls12Engine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay(&mut client, &mut server, take_outbound(&mut sink_c), &mut sink_s);
+        relay(&mut server, &mut client, take_outbound(&mut sink_s), &mut sink_c);
+        relay(&mut client, &mut server, take_outbound(&mut sink_c), &mut sink_s);
+        relay(&mut server, &mut client, take_outbound(&mut sink_s), &mut sink_c);
+        (client, server, sink_c, sink_s)
+    }
+
+    /// TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 over secp384r1 with an ECDSA
+    /// P-384 key: the NIST-only combination, end to end.
+    #[test]
+    fn ecdhe_over_secp384r1_with_ecdsa_p384_and_aes_256_gcm() {
+        let creds = ecdsa_p384_credentials();
+        let (c, s) = restricted_pair(
+            &creds,
+            Some(&[ECDHE_ECDSA_AES256_GCM_SHA384]),
+            Some(&[messages::NAMED_CURVE_SECP384R1]),
+            Some(&[0x0503]),
+        );
+        let (client, server, sink_c, sink_s) = run_flights(c, s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+        assert_eq!(sink_c.keys.as_ref().map(|k| k.0), Some(CipherKind::Aes256Gcm));
+    }
+
+    /// P-256 / ECDSA / AES-128-GCM still works when restricted to exactly that.
+    #[test]
+    fn restricted_to_the_p256_profile_completes() {
+        let creds = test_server_credentials_ecdsa();
+        let (c, s) = restricted_pair(
+            &creds,
+            Some(&[ECDHE_ECDSA_AES128_GCM_SHA256]),
+            Some(&[messages::NAMED_CURVE_SECP256R1]),
+            Some(&[0x0403]),
+        );
+        let (client, server, sink_c, sink_s) = run_flights(c, s);
+        assert!(client.is_complete() && server.is_complete(), "{:?} / {:?}", sink_c.events, sink_s.events);
+    }
+
+    /// The ClientHello carries exactly the configured suites, curves and
+    /// signature algorithms.
+    #[test]
+    fn client_hello_carries_the_configured_restrictions() {
+        let creds = test_server_credentials_ecdsa();
+        let (c, _) = restricted_pair(
+            &creds,
+            Some(&[ECDHE_ECDSA_AES128_GCM_SHA256]),
+            Some(&[messages::NAMED_CURVE_SECP384R1, messages::NAMED_CURVE_SECP256R1]),
+            Some(&[0x0503, 0x0403]),
+        );
+        let mut client = Tls12Engine::new(c);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        let wire = take_outbound(&mut sink).concat();
+        let parsed = messages::parse_client_hello(&wire[4..]).expect("ClientHello");
+        assert_eq!(parsed.cipher_suites, vec![ECDHE_ECDSA_AES128_GCM_SHA256]);
+        assert_eq!(parsed.supported_groups, vec![24, 23]);
+        assert_eq!(parsed.signature_algorithms, vec![(5, 3), (4, 3)]);
+    }
+
+    fn server_failure(client_cfg: Config, server_cfg: Config) -> RecordingSink {
+        let (_, server, _, sink_s) = run_flights(client_cfg, server_cfg);
+        assert!(!server.is_complete());
+        sink_s
+    }
+
+    #[test]
+    fn server_with_no_suite_in_common_fails() {
+        let creds = test_server_credentials_ecdsa();
+        let (mut c, mut s) = restricted_pair(&creds, None, None, None);
+        c.cipher_suites = Some(vec![ECDHE_ECDSA_AES256_GCM_SHA384]);
+        s.cipher_suites = Some(vec![ECDHE_ECDSA_AES128_GCM_SHA256]);
+        let sink = server_failure(c, s);
+        assert!(protocol_errors(&sink).iter().any(|e| e.contains("cipher suite")), "{:?}", sink.events);
+    }
+
+    #[test]
+    fn server_with_no_curve_in_common_fails() {
+        let creds = test_server_credentials_ecdsa();
+        let (mut c, mut s) = restricted_pair(&creds, None, None, None);
+        c.curves = Some(vec![messages::NAMED_CURVE_SECP256R1]);
+        s.curves = Some(vec![messages::NAMED_CURVE_SECP384R1]);
+        let sink = server_failure(c, s);
+        assert!(protocol_errors(&sink).iter().any(|e| e.contains("curve")), "{:?}", sink.events);
+    }
+
+    /// A server whose configured signature algorithms exclude its key's
+    /// (Ed25519) refuses to sign the ServerKeyExchange.
+    #[test]
+    fn server_refuses_to_sign_with_an_algorithm_outside_its_list() {
+        let creds = ed25519_credentials();
+        let (c, mut s) = restricted_pair(&creds, None, None, None);
+        s.signature_schemes = Some(vec![0x0403, 0x0503]);
+        let sink = server_failure(c, s);
+        assert!(protocol_errors(&sink).iter().any(|e| e.contains("signature")), "{:?}", sink.events);
+    }
+
+    /// Likewise when the client's own `signature_algorithms` leave the key's out.
+    #[test]
+    fn server_refuses_to_sign_with_an_algorithm_the_client_did_not_offer() {
+        let creds = ed25519_credentials();
+        let (mut c, mut s) = restricted_pair(&creds, None, None, None);
+        c.signature_schemes = Some(vec![0x0403, 0x0503]);
+        s.signature_schemes = Some(vec![0x0403, 0x0503, 0x0807]);
+        let sink = server_failure(c, s);
+        assert!(protocol_errors(&sink).iter().any(|e| e.contains("signature")), "{:?}", sink.events);
+    }
+
+    /// RFC 5246 section 7.4.3: the client rejects a ServerKeyExchange signed
+    /// with an algorithm it never listed. The (unrestricted) server signs
+    /// with ECDSA P-256 / SHA-256 whatever the client offers; the client lists
+    /// only ECDSA P-384 / SHA-384.
+    #[test]
+    fn client_rejects_a_server_key_exchange_signature_outside_its_list() {
+        let creds = test_server_credentials_ecdsa();
+        let (mut c, s) = restricted_pair(&creds, None, None, None);
+        c.signature_schemes = Some(vec![0x0503]);
+        let (client, _server, sink_c, _) = run_flights(c, s);
+        assert!(!client.is_complete());
+        assert!(protocol_errors(&sink_c).iter().any(|e| e.contains("not offered")), "{:?}", sink_c.events);
+    }
+
+    /// RSA keys sign PKCS#1 v1.5 when that is allowed and RSASSA-PSS when only
+    /// that is; neither when the list has no RSA entry.
+    #[test]
+    fn rsa_key_signs_with_whichever_rsa_scheme_is_allowed() {
+        use aws_lc_rs::rsa::{KeyPair as RsaGenKeyPair, KeySize};
+        let key = Bytes::from(pkcs8_der_of(&RsaGenKeyPair::generate(KeySize::Rsa2048).unwrap()));
+        let pair = |allowed: &[u16]| sign_ske(&key, b"message", Some(allowed)).map(|(h, a, _)| (h, a));
+        assert_eq!(pair(&[0x0401, 0x0804]), Some((sig_alg::HASH_SHA256, sig_alg::SIG_RSA)));
+        assert_eq!(pair(&[0x0804]), Some((sig_alg::RSA_PSS_SHA256_BYTE0, sig_alg::RSA_PSS_SHA256_BYTE1)));
+        assert_eq!(pair(&[0x0403, 0x0503]), None);
+        assert!(sign_ske(&key, b"message", None).is_some(), "no restriction: as before");
+    }
+
+    /// Without a configured curve list the client offers secp256r1 only, so it
+    /// rejects a secp384r1 ServerKeyExchange. The server is configured for
+    /// secp384r1 and the ClientHello is rewritten on the way to it, so the
+    /// server believes the client offered it.
+    #[test]
+    fn unconfigured_client_rejects_a_curve_it_did_not_offer() {
+        use crate::tls::handshake::messages::rewrite_client_hello_extension;
+        let creds = ecdsa_p384_credentials();
+        let (c, mut s) = restricted_pair(&creds, None, None, None);
+        s.curves = Some(vec![messages::NAMED_CURVE_SECP384R1]);
+        let mut client = Tls12Engine::new(c);
+        let mut server = Tls12Engine::new(s);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        for chunk in take_outbound(&mut sink_c) {
+            let groups = [0x00, 0x02, 0x00, messages::NAMED_CURVE_SECP384R1 as u8];
+            let chunk = Bytes::from(rewrite_client_hello_extension(&chunk, messages::ext::SUPPORTED_GROUPS, Some(&groups)));
+            let mut input = chunk.as_ref();
+            server.feed_handshake_data(&mut input, &mut sink_s);
+        }
+        relay(&mut server, &mut client, take_outbound(&mut sink_s), &mut sink_c);
+        assert!(!client.is_complete());
+        assert!(protocol_errors(&sink_c).iter().any(|e| e.contains("curve")), "{:?}", sink_c.events);
+    }
+
+    // ---- FIPS profile ----
+
+    fn fips12(cfg: Config) -> Config {
+        cfg.with_fips_profile().expect("test config is within the profile")
+    }
+
+    #[test]
+    fn fips_profile_sets_the_tls12_restrictions() {
+        use crate::tls::fips;
+        let cfg = Config::fips_profile();
+        assert_eq!(cfg.cipher_suites.as_deref(), Some(fips::TLS12_CIPHER_SUITES));
+        assert_eq!(cfg.curves.as_deref(), Some(fips::TLS12_CURVES));
+        assert_eq!(cfg.signature_schemes.as_deref(), Some(fips::TLS12_SIGNATURE_SCHEMES));
+        assert_eq!(cfg.cert_signature_schemes.as_deref(), Some(fips::CERT_SIGNATURE_SCHEMES));
+        let plain = Config::default();
+        assert!(plain.cipher_suites.is_none() && plain.curves.is_none() && plain.cert_signature_schemes.is_none());
+    }
+
+    /// A FIPS TLS 1.2 client offers no ChaCha20-Poly1305, X25519 or Ed25519.
+    #[test]
+    fn fips_tls12_client_hello_offers_nothing_outside_the_profile() {
+        let creds = test_server_credentials_ecdsa();
+        let (c, _) = restricted_pair(&creds, None, None, None);
+        let mut client = Tls12Engine::new(fips12(c));
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        let wire = take_outbound(&mut sink).concat();
+        let ch = messages::parse_client_hello(&wire[4..]).expect("ClientHello");
+        assert_eq!(ch.cipher_suites, crate::tls::fips::TLS12_CIPHER_SUITES.to_vec());
+        assert_eq!(ch.supported_groups, vec![23, 24]);
+        assert!(!ch.signature_algorithms.contains(&(sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519)));
+        assert!(!ch.signature_algorithms_cert.expect("cert schemes").contains(&0x0807));
+    }
+
+    /// Both FIPS ends, each key family: ECDSA P-256 and P-384 certificates.
+    #[test]
+    fn fips_tls12_handshakes_complete_for_the_ecdsa_keys() {
+        for creds in [test_server_credentials_ecdsa(), ecdsa_p384_credentials()] {
+            let (c, s) = restricted_pair(&creds, None, None, None);
+            let (client, server, sink_c, sink_s) = run_flights(fips12(c), fips12(s));
+            assert!(client.is_complete() && server.is_complete(), "{:?} / {:?}", sink_c.events, sink_s.events);
+        }
+    }
+
+    /// A FIPS server rejects a client that offers only ChaCha20-Poly1305.
+    #[test]
+    fn fips_tls12_server_rejects_a_chacha_only_client() {
+        let creds = test_server_credentials_ecdsa();
+        let (mut c, s) = restricted_pair(&creds, None, None, None);
+        c.cipher_suites = Some(vec![ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]);
+        let sink = server_failure(c, fips12(s));
+        assert!(protocol_errors(&sink).iter().any(|e| e.contains("cipher suite")), "{:?}", sink.events);
+    }
+
+    /// Widening is rejected, naming each offender.
+    #[test]
+    fn fips_tls12_rejects_a_widened_config() {
+        let mut cfg = Config::default();
+        cfg.cipher_suites = Some(vec![ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_CHACHA20_POLY1305_SHA256]);
+        cfg.curves = Some(vec![messages::NAMED_CURVE_SECP256R1, messages::NAMED_CURVE_X25519]);
+        cfg.signature_schemes = Some(vec![0x0403, 0x0807]);
+        let err = cfg.with_fips_profile().err().expect("outside the profile");
+        let msg = err.to_string();
+        for needle in ["0xcca8", "29", "0x0807"] {
+            assert!(msg.contains(needle), "{needle} missing from: {msg}");
+        }
+        assert_eq!(err.violations.len(), 3, "{msg}");
+        // Narrowing is fine.
+        let mut cfg = Config::default();
+        cfg.cipher_suites = Some(vec![ECDHE_ECDSA_AES256_GCM_SHA384]);
+        assert!(cfg.with_fips_profile().is_ok());
     }
 }

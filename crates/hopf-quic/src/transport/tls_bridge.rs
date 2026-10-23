@@ -6,7 +6,7 @@ use bytes::Bytes;
 use hopf_core::security::SecurityInfo;
 use hopf_core::tls::{
     HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, QuicSecrets, Tls13Aead, TlsEventSink,
-    TlsProtocolError, TlsTimerKind, VerifyRequest,
+    TlsProtocolError, TlsTimerKind, TrafficSecret, VerifyRequest,
 };
 
 use crate::transport::packet::TransportParameters;
@@ -27,11 +27,11 @@ pub struct TlsBridgeEvents {
     /// CRYPTO bytes to send (may include ServerHello + rest; connection splits).
     pub outbound: Vec<OutboundCrypto>,
     /// Handshake keys ready (client, server secrets).
-    pub handshake_keys: Option<([u8; 32], [u8; 32])>,
+    pub handshake_keys: Option<(TrafficSecret, TrafficSecret)>,
     /// Application keys ready.
-    pub app_keys: Option<([u8; 32], [u8; 32])>,
+    pub app_keys: Option<(TrafficSecret, TrafficSecret)>,
     /// Client early (0-RTT) traffic secret.
-    pub early_keys: Option<[u8; 32]>,
+    pub early_keys: Option<TrafficSecret>,
     /// Negotiated AEAD (RFC 8446 §9.1's MUST `TLS_AES_128_GCM_SHA256` or
     /// SHOULD `TLS_CHACHA20_POLY1305_SHA256`) — set alongside whichever of
     /// `handshake_keys`/`app_keys`/`early_keys` fires first; the same suite
@@ -93,14 +93,14 @@ impl TlsEventSink for Sink<'_> {
         self.events.peer_tp = Some(Bytes::copy_from_slice(params));
     }
 
-    fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         self.events.aead = Some(aead);
         self.events.handshake_keys = Some((client, server));
         // After ServerHello, subsequent CRYPTO is Handshake-protected.
         self.events.write_space = SpaceId::Handshake;
     }
 
-    fn quic_early_keys_ready(&mut self, aead: Tls13Aead, client_early: [u8; 32]) {
+    fn quic_early_keys_ready(&mut self, aead: Tls13Aead, client_early: TrafficSecret) {
         self.events.aead = Some(aead);
         self.events.early_keys = Some(client_early);
     }
@@ -342,5 +342,117 @@ mod tests {
         let (c, s) = handshake_groups(QuicTlsOptions::new(), QuicTlsOptions::new());
         assert_eq!(c, Some(NamedGroup::X25519.code()));
         assert_eq!(s, Some(NamedGroup::X25519.code()));
+    }
+
+    #[test]
+    fn quic_handshake_negotiates_nist_group_when_both_restrict_to_nist() {
+        use crate::config::QuicTlsOptions;
+        use hopf_core::crypto::kx::NamedGroup;
+        use hopf_core::crypto::kx_policy::KxPolicy;
+        let tls = QuicTlsOptions::new().with_kx_policy(KxPolicy::nist_only());
+        let (c, s) = handshake_groups(tls.clone(), tls);
+        assert_eq!(c, Some(NamedGroup::SecP256r1.code()));
+        assert_eq!(s, Some(NamedGroup::SecP256r1.code()));
+    }
+
+    /// A QUIC-mode handshake restricted to TLS_AES_256_GCM_SHA384 completes
+    /// on both sides and reports that suite for packet protection.
+    #[test]
+    fn fips_quic_handshake_negotiates_the_profile() {
+        use crate::config::QuicTlsOptions;
+        use hopf_core::crypto::kx::NamedGroup;
+        let tls = QuicTlsOptions::new().with_fips();
+        let (c, s) = handshake_groups(tls.clone(), tls);
+        assert_eq!(c, Some(NamedGroup::SecP256r1.code()));
+        assert_eq!(s, Some(NamedGroup::SecP256r1.code()));
+    }
+
+    /// A key-exchange policy outside the profile is rejected when the config
+    /// is built, and the message names it.
+    #[test]
+    fn fips_quic_configs_reject_a_widened_policy_when_built() {
+        use crate::config::{client_config_for_pem_bytes_with, server_config_self_signed_with, QuicTlsOptions};
+        use hopf_core::crypto::kx::NamedGroup;
+        use hopf_core::crypto::kx_policy::KxPolicy;
+        let alpn: &[&[u8]] = &[b"hq-interop"];
+        // `[X25519]` alone equals the stock classical policy, which the profile replaces.
+        let widened = QuicTlsOptions::new()
+            .with_kx_policy(KxPolicy::new(vec![NamedGroup::SecP256r1, NamedGroup::X25519]))
+            .with_fips();
+        let err = server_config_self_signed_with(&["localhost"], alpn, widened.clone()).err().expect("X25519 is outside the profile");
+        assert!(err.to_string().contains("X25519"), "{err}");
+        let (_, pem) = server_config_self_signed_with(&["localhost"], alpn, QuicTlsOptions::new().with_fips()).unwrap();
+        let err = client_config_for_pem_bytes_with(&pem, alpn, widened).err().expect("X25519 is outside the profile");
+        assert!(err.to_string().contains("X25519"), "{err}");
+    }
+
+    #[test]
+    fn fips_quic_try_builders_reject_suites_and_key_logs_outside_the_profile() {
+        use crate::config::QuicTlsOptions;
+        use crate::crypto::{try_hopf_server_config, HopfTlsBuildParams};
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap().self_signed(&kp).unwrap();
+        let creds = hopf_core::tls::ServerCredentials {
+            cert_chain: vec![bytes::Bytes::copy_from_slice(cert.der())],
+            signing_key_pkcs8: bytes::Bytes::from(kp.serialize_der()),
+        };
+        let params = |suites: Vec<u16>| {
+            HopfTlsBuildParams::server(creds.clone(), vec![bytes::Bytes::from_static(b"h3")])
+                .with_cipher_suites(suites)
+                .with_tls(QuicTlsOptions::new().with_fips())
+        };
+        let err = try_hopf_server_config(params(vec![0x1301, 0x1303])).err().expect("ChaCha20 is outside the profile");
+        assert!(err.to_string().contains("0x1303") && !err.to_string().contains("0x1301"), "{err}");
+        assert!(try_hopf_server_config(params(vec![0x1302])).is_ok(), "narrowing is allowed");
+        let err = try_hopf_server_config(
+            params(vec![0x1301]).with_key_log(Some(hopf_core::tls::KeyLogFile::open("/dev/null").unwrap())),
+        )
+        .err()
+        .expect("a key log is outside the profile");
+        assert!(err.to_string().contains("key_log"), "{err}");
+        assert!(!QuicTlsOptions::new().fips, "FIPS is opt-in");
+    }
+
+    #[test]
+    fn quic_handshake_negotiates_aes_256_gcm_sha384() {
+        use crate::config::{client_config_for_pem_bytes_with, server_config_self_signed_with, QuicTlsOptions};
+        use hopf_core::tls::{Tls13Aead, AES_256_GCM_SHA384};
+        let alpn: &[&[u8]] = &[b"hq-interop"];
+        let (server_cfg, pem) =
+            server_config_self_signed_with(&["localhost"], alpn, QuicTlsOptions::new()).unwrap();
+        let client_cfg = client_config_for_pem_bytes_with(&pem, alpn, QuicTlsOptions::new()).unwrap();
+        let tp = TransportParameters::default();
+        let mut chs = client_cfg.transport().handshake;
+        chs.server_name = Some("localhost".into());
+        chs.cipher_suites = Some(vec![AES_256_GCM_SHA384]);
+        let mut shs = server_cfg.transport().handshake;
+        shs.cipher_suites = Some(vec![AES_256_GCM_SHA384]);
+        let (mut client, ev) = TlsBridge::start_client(chs, &tp);
+        let mut server = TlsBridge::start_server(shs, &tp);
+
+        let (mut client_aead, mut server_aead) = (ev.aead, None);
+        let mut to_server: Vec<u8> = ev.outbound.iter().flat_map(|o| o.data.to_vec()).collect();
+        for _ in 0..8 {
+            let mut to_client = Vec::new();
+            if !to_server.is_empty() {
+                let ev = server.feed_crypto(SpaceId::Initial, &to_server);
+                assert!(ev.failed.is_none(), "server: {:?}", ev.failed);
+                server_aead = server_aead.or(ev.aead);
+                to_client.extend(ev.outbound.iter().flat_map(|o| o.data.to_vec()));
+            }
+            to_server = Vec::new();
+            if !to_client.is_empty() {
+                let ev = client.feed_crypto(SpaceId::Initial, &to_client);
+                assert!(ev.failed.is_none(), "client: {:?}", ev.failed);
+                client_aead = client_aead.or(ev.aead);
+                to_server.extend(ev.outbound.iter().flat_map(|o| o.data.to_vec()));
+            }
+            if client.is_complete() && server.is_complete() {
+                break;
+            }
+        }
+        assert!(client.is_complete() && server.is_complete(), "handshake incomplete");
+        assert_eq!(client_aead, Some(Tls13Aead::Aes256GcmSha384));
+        assert_eq!(server_aead, Some(Tls13Aead::Aes256GcmSha384));
     }
 }
