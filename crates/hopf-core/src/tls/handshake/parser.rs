@@ -1063,6 +1063,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
             extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();

@@ -198,6 +198,13 @@ pub struct ClientHelloParams {
     /// `signature_algorithms` to advertise (RFC 8446 §4.2.3), in preference
     /// order; `None` offers [`SUPPORTED_SIGNATURE_SCHEMES`].
     pub signature_schemes: Option<Vec<u16>>,
+    /// `signature_algorithms_cert` to advertise (certificate-chain
+    /// signatures, RFC 8446 §4.2.3); `None` offers
+    /// [`crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES`].
+    pub cert_signature_schemes: Option<Vec<u16>>,
+    /// With [`Self::offer_tls12_fallback`], the TLS 1.2 suites to append after
+    /// the TLS 1.3 ones; `None` offers the TLS 1.2 engine's full default list.
+    pub tls12_cipher_suites: Option<Vec<u16>>,
 }
 
 impl Default for ClientHelloParams {
@@ -219,6 +226,8 @@ impl Default for ClientHelloParams {
             offer_tls12_fallback: false,
             extra_key_shares: Vec::new(),
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
         }
     }
 }
@@ -297,7 +306,10 @@ fn build_client_hello_inner(
     // ones — a 1.3 server picks from its own list and never sees them as
     // more than noise, a 1.2 server has nothing else to pick from.
     let tls12_suites: &[u16] = if params.offer_tls12_fallback {
-        super::super::tls12::engine::SUPPORTED_CIPHER_SUITES
+        params
+            .tls12_cipher_suites
+            .as_deref()
+            .unwrap_or(super::super::tls12::engine::SUPPORTED_CIPHER_SUITES)
     } else {
         &[]
     };
@@ -367,7 +379,10 @@ fn build_client_hello_inner(
         // RFC 9846 §1.4: which certificate-chain signature algorithms this
         // engine can verify — always sent; see crypto::x509's matching
         // constant.
-        let schemes = crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES;
+        let schemes = params
+            .cert_signature_schemes
+            .as_deref()
+            .unwrap_or(crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES);
         let mut bytes = BytesMut::with_capacity(2 * schemes.len());
         for scheme in schemes {
             bytes.extend_from_slice(&scheme.to_be_bytes());
@@ -886,6 +901,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
         });
         let parsed = parse_client_hello(&hello.body).expect("parse client hello");
         assert!(parsed.peer_key_share.is_some());
@@ -975,6 +992,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
         });
         // legacy_version(2) + random(32) + session_id_len(1)=0 +
         // legacy_cookie_len(1)=0: byte 35 is the cookie length prefix.
@@ -1032,6 +1051,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
             extra_key_shares: Vec::new(),
         })
         .encode();
@@ -1095,6 +1116,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
         });
         // legacy_version(2) + random(32) + session_id_len(1) + cipher_suites_len(2)
         // + cipher_suites(2) + compression(2).
@@ -1145,6 +1168,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
         });
         let parsed = parse_client_hello(&hello.body).expect("parse");
         assert_eq!(
@@ -1188,5 +1213,29 @@ mod tests {
         // extensions: u16 length, then signature_algorithms (13) holding a u16-prefixed list.
         let expected: &[u8] = &[0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x04, 0x03, 0x08, 0x04];
         assert!(cr.body.windows(expected.len()).any(|w| w == expected), "{:02x?}", cr.body);
+    }
+
+    /// With the TLS 1.2 fallback on offer, the 1.2 suites that follow the 1.3
+    /// ones are the configured list, not the full default.
+    #[test]
+    fn tls12_fallback_offers_the_configured_tls12_suites() {
+        let mut params = hello_params_with_schemes(None);
+        params.offer_tls12_fallback = true;
+        params.tls12_cipher_suites = Some(vec![0xC02B]);
+        let hello = build_client_hello(&params);
+        let parsed = parse_client_hello(&hello.body).expect("parse");
+        assert_eq!(parsed.cipher_suites, vec![0x1301, 0xC02B]);
+        params.tls12_cipher_suites = None;
+        let parsed = parse_client_hello(&build_client_hello(&params).body).expect("parse");
+        assert!(parsed.cipher_suites.contains(&0xCCA9), "default offer is unchanged");
+    }
+
+    /// `signature_algorithms_cert` follows the configured list.
+    #[test]
+    fn client_hello_signature_algorithms_cert_follows_the_configured_schemes() {
+        let mut params = hello_params_with_schemes(None);
+        params.cert_signature_schemes = Some(vec![0x0403, 0x0503]);
+        let parsed = parse_client_hello(&build_client_hello(&params).body).expect("parse");
+        assert_eq!(parsed.signature_algorithms_cert, Some(vec![0x0403, 0x0503]));
     }
 }

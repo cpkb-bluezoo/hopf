@@ -8,6 +8,7 @@
 
 pub mod ech;
 mod engine;
+pub mod fips;
 mod handshake;
 mod key_log;
 mod pem;

@@ -307,6 +307,11 @@ pub struct Config {
     /// side signs with. A server also limits itself to the client's offer
     /// when this is set. `None` keeps the unrestricted behaviour.
     pub signature_schemes: Option<Vec<u16>>,
+    /// Certificate-chain signature schemes (`signature_algorithms_cert`,
+    /// RFC 9846 §1.4): advertised in the ClientHello, and a peer chain needing
+    /// any other is rejected. `None`: advertise everything verifiable, check
+    /// nothing, as before.
+    pub cert_signature_schemes: Option<Vec<u16>>,
 }
 
 impl Default for Config {
@@ -331,6 +336,7 @@ impl Default for Config {
             cipher_suites: None,
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         }
     }
 }
@@ -676,6 +682,24 @@ impl Tls12Engine {
         true
     }
 
+    /// See the TLS 1.3 engine's `peer_chain_schemes_ok`.
+    fn peer_chain_schemes_ok<S: Tls12EventSink>(&mut self, sink: &mut S, whose: &str) -> bool {
+        let Some(allowed) = self.config.cert_signature_schemes.as_deref() else {
+            return true;
+        };
+        match crate::crypto::x509::chain_scheme_not_offered(&self.peer_certs, allowed) {
+            Some(scheme) => {
+                self.fail(
+                    sink,
+                    AlertDescription::BadCertificate,
+                    &format!("{whose} certificate chain is signed with scheme 0x{scheme:04x}, outside signature_algorithms_cert"),
+                );
+                false
+            }
+            None => true,
+        }
+    }
+
     fn effective_cipher_suites(&self) -> &[u16] {
         self.config.cipher_suites.as_deref().unwrap_or(SUPPORTED_CIPHER_SUITES)
     }
@@ -733,6 +757,7 @@ impl Tls12Engine {
             cookie: &self.config.cookie,
             curves: self.config.curves.as_deref(),
             signature_schemes: self.config.signature_schemes.as_deref(),
+            cert_signature_schemes: self.config.cert_signature_schemes.as_deref(),
         };
         let wire = messages::build_client_hello(&params);
         self.emit(&wire, sink);
@@ -981,6 +1006,9 @@ impl Tls12Engine {
         };
         self.hash_message(&wire, false);
         self.peer_certs = certs;
+        if !self.peer_chain_schemes_ok(sink, "server") {
+            return false;
+        }
         self.verify_id += 1;
         self.verify_pending = true;
         sink.verification_requested(VerifyRequest {
@@ -1454,6 +1482,9 @@ impl Tls12Engine {
             return true;
         }
         self.peer_certs = certs;
+        if !self.peer_chain_schemes_ok(sink, "client") {
+            return false;
+        }
         self.expect_client_certificate_verify = true;
         self.verify_id += 1;
         self.verify_pending = true;
@@ -2130,6 +2161,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         let body = &wire[4..];
@@ -2271,6 +2303,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         let tampered = replace_extension(&wire, 43, messages::ext::RENEGOTIATION_INFO, &[1, 2, 3]);
@@ -2312,6 +2345,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         let stripped = strip_extension(&wire, 43, messages::ext::RENEGOTIATION_INFO);
@@ -2353,6 +2387,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         // supported_versions listing only TLS 1.0 (0x0301), not 0x0303.
@@ -2395,6 +2430,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         let stripped = strip_extension(&wire, 43, messages::ext::SUPPORTED_VERSIONS);
@@ -2434,6 +2470,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         let wire = if keep_extension { wire } else { strip_extension(&wire, 43, messages::ext::SUPPORTED_VERSIONS) };
@@ -2499,6 +2536,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         // Same prefix as the other tests plus one extra cipher suite (2 bytes).
@@ -2574,6 +2612,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = messages::build_client_hello(&params);
         // legacy_version(2) + random(32) + session_id_len(1) + session_id(0)
@@ -2995,6 +3034,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         });
         client.client_note_client_hello_sent(&hello);
         assert_eq!(client.client_random, [0x5a; 32]);
@@ -3302,6 +3342,7 @@ mod tests {
             cipher_suites: None,
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         }
     }
 
@@ -3683,5 +3724,78 @@ mod tests {
         relay(&mut server, &mut client, take_outbound(&mut sink_s), &mut sink_c);
         assert!(!client.is_complete());
         assert!(protocol_errors(&sink_c).iter().any(|e| e.contains("curve")), "{:?}", sink_c.events);
+    }
+
+    // ---- FIPS profile ----
+
+    fn fips12(cfg: Config) -> Config {
+        cfg.with_fips_profile().expect("test config is within the profile")
+    }
+
+    #[test]
+    fn fips_profile_sets_the_tls12_restrictions() {
+        use crate::tls::fips;
+        let cfg = Config::fips_profile();
+        assert_eq!(cfg.cipher_suites.as_deref(), Some(fips::TLS12_CIPHER_SUITES));
+        assert_eq!(cfg.curves.as_deref(), Some(fips::TLS12_CURVES));
+        assert_eq!(cfg.signature_schemes.as_deref(), Some(fips::TLS12_SIGNATURE_SCHEMES));
+        assert_eq!(cfg.cert_signature_schemes.as_deref(), Some(fips::CERT_SIGNATURE_SCHEMES));
+        let plain = Config::default();
+        assert!(plain.cipher_suites.is_none() && plain.curves.is_none() && plain.cert_signature_schemes.is_none());
+    }
+
+    /// A FIPS TLS 1.2 client offers no ChaCha20-Poly1305, X25519 or Ed25519.
+    #[test]
+    fn fips_tls12_client_hello_offers_nothing_outside_the_profile() {
+        let creds = test_server_credentials_ecdsa();
+        let (c, _) = restricted_pair(&creds, None, None, None);
+        let mut client = Tls12Engine::new(fips12(c));
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        let wire = take_outbound(&mut sink).concat();
+        let ch = messages::parse_client_hello(&wire[4..]).expect("ClientHello");
+        assert_eq!(ch.cipher_suites, crate::tls::fips::TLS12_CIPHER_SUITES.to_vec());
+        assert_eq!(ch.supported_groups, vec![23, 24]);
+        assert!(!ch.signature_algorithms.contains(&(sig_alg::HASH_INTRINSIC, sig_alg::SIG_ED25519)));
+        assert!(!ch.signature_algorithms_cert.expect("cert schemes").contains(&0x0807));
+    }
+
+    /// Both FIPS ends, each key family: ECDSA P-256 and P-384 certificates.
+    #[test]
+    fn fips_tls12_handshakes_complete_for_the_ecdsa_keys() {
+        for creds in [test_server_credentials_ecdsa(), ecdsa_p384_credentials()] {
+            let (c, s) = restricted_pair(&creds, None, None, None);
+            let (client, server, sink_c, sink_s) = run_flights(fips12(c), fips12(s));
+            assert!(client.is_complete() && server.is_complete(), "{:?} / {:?}", sink_c.events, sink_s.events);
+        }
+    }
+
+    /// A FIPS server rejects a client that offers only ChaCha20-Poly1305.
+    #[test]
+    fn fips_tls12_server_rejects_a_chacha_only_client() {
+        let creds = test_server_credentials_ecdsa();
+        let (mut c, s) = restricted_pair(&creds, None, None, None);
+        c.cipher_suites = Some(vec![ECDHE_ECDSA_CHACHA20_POLY1305_SHA256]);
+        let sink = server_failure(c, fips12(s));
+        assert!(protocol_errors(&sink).iter().any(|e| e.contains("cipher suite")), "{:?}", sink.events);
+    }
+
+    /// Widening is rejected, naming each offender.
+    #[test]
+    fn fips_tls12_rejects_a_widened_config() {
+        let mut cfg = Config::default();
+        cfg.cipher_suites = Some(vec![ECDHE_ECDSA_AES128_GCM_SHA256, ECDHE_RSA_CHACHA20_POLY1305_SHA256]);
+        cfg.curves = Some(vec![messages::NAMED_CURVE_SECP256R1, messages::NAMED_CURVE_X25519]);
+        cfg.signature_schemes = Some(vec![0x0403, 0x0807]);
+        let err = cfg.with_fips_profile().err().expect("outside the profile");
+        let msg = err.to_string();
+        for needle in ["0xcca8", "29", "0x0807"] {
+            assert!(msg.contains(needle), "{needle} missing from: {msg}");
+        }
+        assert_eq!(err.violations.len(), 3, "{msg}");
+        // Narrowing is fine.
+        let mut cfg = Config::default();
+        cfg.cipher_suites = Some(vec![ECDHE_ECDSA_AES256_GCM_SHA384]);
+        assert!(cfg.with_fips_profile().is_ok());
     }
 }

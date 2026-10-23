@@ -352,6 +352,19 @@ pub struct HandshakeConfig {
     /// [`SUPPORTED_SIGNATURE_SCHEMES`]. Entries this crate cannot verify are
     /// advertised but never usable.
     pub signature_schemes: Option<Vec<u16>>,
+    /// Certificate-chain signature schemes (`signature_algorithms_cert`,
+    /// RFC 8446 §4.2.3): advertised in the ClientHello, and a peer chain
+    /// needing any other is rejected. Default: every scheme this crate can
+    /// verify ([`crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES`]), with
+    /// no check on the peer's chain.
+    pub cert_signature_schemes: Option<Vec<u16>>,
+    /// TLS 1.2 suites appended to a [`Self::offer_tls12_fallback`] ClientHello;
+    /// default is the TLS 1.2 engine's full list.
+    pub tls12_cipher_suites: Option<Vec<u16>>,
+    /// FIPS mode: set by [`Self::with_fips_profile`]. Besides the restrictions
+    /// that call applies, no key log (not even the process-wide default) ever
+    /// records a secret and Encrypted Client Hello cannot be enabled.
+    pub fips: bool,
     /// Optional NSS key log for this handshake; falls back to [`super::default_key_log`].
     pub key_log: Option<Arc<dyn super::KeyLog>>,
     /// Certificate compression (RFC 8879, Brotli). Default `true`.
@@ -376,6 +389,9 @@ impl std::fmt::Debug for HandshakeConfig {
             .field("enable_early_data", &self.enable_early_data)
             .field("cipher_suites", &self.cipher_suites)
             .field("signature_schemes", &self.signature_schemes)
+            .field("cert_signature_schemes", &self.cert_signature_schemes)
+            .field("tls12_cipher_suites", &self.tls12_cipher_suites)
+            .field("fips", &self.fips)
             .field("key_log", &self.key_log.as_ref().map(|_| "KeyLog"))
             .field("certificate_compression", &self.certificate_compression)
             .finish_non_exhaustive()
@@ -421,6 +437,9 @@ impl Default for HandshakeConfig {
             ech_server: None,
             cipher_suites: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
+            fips: false,
             key_log: None,
             certificate_compression: true,
             ticket_namespace: 0,
@@ -887,6 +906,8 @@ impl HandshakeEngine {
             offer_tls12_fallback: self.config.offer_tls12_fallback,
             extra_key_shares: Vec::new(),
             signature_schemes: self.config.signature_schemes.clone(),
+            cert_signature_schemes: self.config.cert_signature_schemes.clone(),
+            tls12_cipher_suites: self.config.tls12_cipher_suites.clone(),
         };
 
         if self.ech_client_is_real() {
@@ -1158,6 +1179,9 @@ impl HandshakeEngine {
         }
         self.transcript.add_message(&encoded);
         self.peer_certs = certs;
+        if !self.peer_chain_schemes_ok(sink, "server") {
+            return false;
+        }
         self.verify_id += 1;
         self.verify_pending = true;
         sink.verification_requested(super::sink::VerifyRequest {
@@ -1847,6 +1871,9 @@ impl HandshakeEngine {
             return true;
         }
         self.peer_certs = certs;
+        if !self.peer_chain_schemes_ok(sink, "client") {
+            return false;
+        }
         self.expect_client_certificate_verify = true;
         self.verify_id += 1;
         self.verify_pending = true;
@@ -1994,11 +2021,36 @@ impl HandshakeEngine {
         self.config.cipher_suites.as_deref().unwrap_or(SUPPORTED_CIPHER_SUITES)
     }
 
+    /// With [`HandshakeConfig::cert_signature_schemes`] set, refuse a peer
+    /// chain that needs a signature scheme outside it (RFC 8446 §4.2.3: we
+    /// told the peer what we could accept, so a chain needing anything else
+    /// is not a usable one). No list configured: no check, as before.
+    fn peer_chain_schemes_ok<S: TlsEventSink>(&mut self, sink: &mut S, whose: &str) -> bool {
+        let Some(allowed) = self.config.cert_signature_schemes.as_deref() else {
+            return true;
+        };
+        match crate::crypto::x509::chain_scheme_not_offered(&self.peer_certs, allowed) {
+            Some(scheme) => {
+                self.fail(
+                    sink,
+                    AlertDescription::BadCertificate,
+                    &format!("{whose} certificate chain is signed with scheme 0x{scheme:04x}, outside signature_algorithms_cert"),
+                );
+                false
+            }
+            None => true,
+        }
+    }
+
     fn effective_signature_schemes(&self) -> &[u16] {
         self.config.signature_schemes.as_deref().unwrap_or(SUPPORTED_SIGNATURE_SCHEMES)
     }
 
     fn resolved_key_log(&self) -> Option<Arc<dyn super::KeyLog>> {
+        // FIPS mode: key logging records nothing, whatever is attached.
+        if self.config.fips {
+            return None;
+        }
         self.config.key_log.clone().or_else(super::default_key_log)
     }
 
@@ -2194,7 +2246,7 @@ impl HandshakeEngine {
     /// [`HandshakeConfig::ech_client`] does. Only possible before the
     /// handshake has started; returns whether it took effect.
     pub fn set_ech_client(&mut self, config: Option<super::ech::EchClientConfig>) -> bool {
-        if self.state != State::Initial {
+        if self.state != State::Initial || (self.config.fips && config.is_some()) {
             return false;
         }
         self.config.ech_client = config;
@@ -2205,7 +2257,7 @@ impl HandshakeEngine {
     /// [`HandshakeConfig::ech_server`] does. Only possible before the
     /// handshake has started; returns whether it took effect.
     pub fn set_ech_server(&mut self, config: Option<Arc<super::ech::EchServerConfig>>) -> bool {
-        if self.state != State::Initial {
+        if self.state != State::Initial || (self.config.fips && config.is_some()) {
             return false;
         }
         self.config.ech_server = config;
@@ -3960,6 +4012,231 @@ mod tests {
         assert_eq!(verifications(restricted), 1, "only the server chain: the client sent no certificate");
     }
 
+    // ---- FIPS profile ----
+
+    fn ecdsa_p384_credentials() -> ServerCredentials {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        ServerCredentials {
+            cert_chain: vec![Bytes::copy_from_slice(cert.der())],
+            signing_key_pkcs8: Bytes::from(key_pair.serialize_der()),
+        }
+    }
+
+    fn fips(cfg: HandshakeConfig) -> HandshakeConfig {
+        cfg.with_fips_profile().expect("test config is within the profile")
+    }
+
+    fn client_hello_of(cfg: HandshakeConfig) -> super::super::handshake::collect::ParsedClientHello {
+        let mut sink = RecordingSink::default();
+        let mut client = HandshakeEngine::new(cfg);
+        client.start(&mut sink);
+        let wire = take_outbound(&mut sink).concat();
+        super::super::handshake::collect::parse_client_hello(&wire[4..]).expect("ClientHello")
+    }
+
+    /// The preset applies the whole profile and nothing else changes.
+    #[test]
+    fn fips_profile_sets_the_restrictions() {
+        use crate::tls::fips;
+        let cfg = HandshakeConfig::fips_profile();
+        assert!(cfg.fips);
+        assert_eq!(cfg.cipher_suites.as_deref(), Some(fips::TLS13_CIPHER_SUITES));
+        assert_eq!(cfg.signature_schemes.as_deref(), Some(fips::TLS13_SIGNATURE_SCHEMES));
+        assert_eq!(cfg.cert_signature_schemes.as_deref(), Some(fips::CERT_SIGNATURE_SCHEMES));
+        assert_eq!(cfg.tls12_cipher_suites.as_deref(), Some(fips::TLS12_CIPHER_SUITES));
+        assert_eq!(cfg.kx_policy.groups(), &[NamedGroup::SecP256r1, NamedGroup::SecP384r1]);
+        // And outside FIPS mode nothing is restricted.
+        let plain = HandshakeConfig::default();
+        assert!(!plain.fips);
+        assert!(plain.cipher_suites.is_none() && plain.signature_schemes.is_none());
+        assert!(plain.cert_signature_schemes.is_none() && plain.tls12_cipher_suites.is_none());
+    }
+
+    /// A FIPS-mode client offers no X25519, hybrid group, ChaCha20-Poly1305,
+    /// Ed25519 or ML-DSA anywhere in its ClientHello.
+    #[test]
+    fn fips_client_hello_offers_nothing_outside_the_profile() {
+        let creds = test_server_credentials();
+        let ch = client_hello_of(fips(client_config_with_trust(&creds, KxPolicy::classical_only(), None)));
+        assert_eq!(ch.cipher_suites, vec![AES_128_GCM_SHA256, AES_256_GCM_SHA384]);
+        assert_eq!(ch.supported_groups, vec![0x0017, 0x0018]);
+        assert_eq!(ch.key_shares.iter().map(|(g, _)| *g).collect::<Vec<_>>(), vec![0x0017]);
+        assert_eq!(ch.signature_algorithms, Some(vec![0x0403, 0x0503, 0x0804]));
+        let cert_schemes = ch.signature_algorithms_cert.expect("signature_algorithms_cert");
+        for banned in [0x0807u16, 0x0904, 0x0905, 0x0906] {
+            assert!(!cert_schemes.contains(&banned), "0x{banned:04x} must not be offered");
+        }
+    }
+
+    /// Profile handshakes interoperate with the ordinary engine as the peer
+    /// (here a server that prefers X25519 and also speaks P-256; the default
+    /// policy has no plain NIST group, so a profile client would find no
+    /// group in common with it).
+    #[test]
+    fn fips_client_completes_against_an_unrestricted_server() {
+        let creds = ecdsa_p256_credentials();
+        let server_kx = KxPolicy::new(vec![NamedGroup::X25519, NamedGroup::SecP256r1]);
+        let sink = run_loopback(
+            fips(client_config_with_trust(&creds, KxPolicy::classical_only(), None)),
+            server_config_for(creds, server_kx),
+        );
+        assert_eq!(sink.negotiated_group, Some(NamedGroup::SecP256r1.code()));
+        assert_eq!(sink.negotiated_aead, Some(Tls13Aead::Aes128GcmSha256));
+    }
+
+    /// Both ends in FIPS mode, narrowed to AES-256-GCM-SHA384 over secp384r1
+    /// with an ECDSA P-384 key: the strictest corner of the profile.
+    #[test]
+    fn fips_narrowed_to_aes_256_p384_completes() {
+        let creds = ecdsa_p384_credentials();
+        let narrow = |mut cfg: HandshakeConfig| {
+            cfg.cipher_suites = Some(vec![AES_256_GCM_SHA384]);
+            cfg.kx_policy = KxPolicy::new(vec![NamedGroup::SecP384r1]);
+            cfg.signature_schemes = Some(vec![0x0503]);
+            fips(cfg)
+        };
+        let sink = run_loopback(
+            narrow(client_config_with_trust(&creds, KxPolicy::classical_only(), None)),
+            narrow(server_config_for(creds, KxPolicy::classical_only())),
+        );
+        assert_eq!(sink.negotiated_aead, Some(Tls13Aead::Aes256GcmSha384));
+        assert_eq!(sink.negotiated_group, Some(NamedGroup::SecP384r1.code()));
+    }
+
+    /// RFC 8446 section 4.1.1: with nothing in common the server fails with
+    /// `handshake_failure`. A client offering only X25519 (default suites), or
+    /// only ChaCha20-Poly1305, gets no handshake from a FIPS server.
+    #[test]
+    fn fips_server_rejects_clients_offering_only_non_profile_algorithms() {
+        let creds = ecdsa_p256_credentials();
+        let reject = |client: HandshakeConfig, needle: &str| {
+            let mut sink = RecordingSink::default();
+            let mut c = HandshakeEngine::new(client);
+            c.start(&mut sink);
+            let mut server = HandshakeEngine::new(fips(server_config_for(creds.clone(), KxPolicy::classical_only())));
+            relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+            assert!(!server.is_complete());
+            assert!(sink.alerts.contains(&AlertDescription::HandshakeFailure), "{:?}", sink.events);
+            assert!(sink.events.iter().any(|e| e.contains(needle)), "{needle}: {:?}", sink.events);
+        };
+        let base = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        reject(base.clone(), "key exchange group");
+        reject(with_suites(base.clone(), &[CHACHA20_POLY1305_SHA256]), "cipher suite");
+        // Ed25519 only: the server's key (ECDSA) is not among the offered schemes.
+        let mut ed_only = fips_group_client(&creds);
+        ed_only.signature_schemes = Some(vec![0x0807]);
+        reject(ed_only, "signature_algorithms");
+    }
+
+    /// A client already on the profile's groups, for tests that vary one more thing.
+    fn fips_group_client(creds: &ServerCredentials) -> HandshakeConfig {
+        client_config_with_trust(creds, KxPolicy::nist_only(), None)
+    }
+
+    /// A FIPS client rejects a server whose certificate chain is signed with
+    /// Ed25519 (RFC 8446 section 4.2.3: `signature_algorithms_cert`), and a
+    /// FIPS server rejects such a client chain.
+    #[test]
+    fn fips_client_rejects_a_chain_signed_with_ed25519() {
+        let creds = ca_issued_server_credentials(); // leaf signed by an Ed25519 CA
+        let mut trust = TrustStore::new();
+        trust.add_anchor(creds.cert_chain[1].clone());
+        let mut client_cfg = client_config_with_trust(&creds, KxPolicy::classical_only(), None);
+        client_cfg.trust_store = Some(trust);
+        let mut sink = RecordingSink::default();
+        let mut client = HandshakeEngine::new(fips(client_cfg));
+        // The unrestricted server would happily send it; the FIPS client's
+        // extension keeps it from doing so, so rewrite the extension away.
+        let mut server = HandshakeEngine::new(server_config_for(creds, KxPolicy::nist_only()));
+        client.start(&mut sink);
+        use super::super::handshake::messages::{ext, rewrite_client_hello_extension};
+        for chunk in take_outbound(&mut sink) {
+            let chunk = Bytes::from(rewrite_client_hello_extension(&chunk, ext::SIGNATURE_ALGORITHMS_CERT, None));
+            let mut input = chunk.as_ref();
+            server.feed_handshake_data(&mut input, &mut sink);
+        }
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        assert!(!client.is_complete());
+        let errs = protocol_errors(&sink);
+        assert!(errs.iter().any(|e| e.contains("signature_algorithms_cert")), "{:?}", sink.events);
+        assert!(sink.alerts.contains(&AlertDescription::BadCertificate), "{:?}", sink.alerts);
+    }
+
+    /// Key logging records nothing in FIPS mode, even with a log attached
+    /// directly (bypassing the builder's own refusal).
+    #[test]
+    fn fips_mode_never_writes_the_key_log() {
+        #[derive(Default)]
+        struct Capture(std::sync::Mutex<Vec<String>>);
+        impl super::super::KeyLog for Capture {
+            fn log(&self, label: &str, _client_random: &[u8; 32], _secret: &[u8]) {
+                self.0.lock().unwrap().push(label.to_string());
+            }
+        }
+        let creds = ecdsa_p256_credentials();
+        let logged = |fips_mode: bool| {
+            let log = std::sync::Arc::new(Capture::default());
+            let attach = |mut cfg: HandshakeConfig| {
+                cfg.key_log = Some(log.clone());
+                cfg.fips = fips_mode;
+                cfg
+            };
+            let mut client_cfg = client_config_with_trust(&creds, KxPolicy::nist_only(), None);
+            client_cfg.fips = false; // attach() decides
+            run_loopback(attach(client_cfg), server_config_for(creds.clone(), KxPolicy::nist_only()));
+            let n = log.0.lock().unwrap().len();
+            n
+        };
+        assert!(logged(false) > 0, "control: a normal handshake logs its secrets");
+        assert_eq!(logged(true), 0, "FIPS mode logs nothing");
+    }
+
+    /// Enabling ECH, key logging, or a non-profile algorithm is rejected with a
+    /// message that lists every offending item.
+    #[test]
+    fn widening_the_profile_is_rejected_with_every_offender_listed() {
+        let creds = test_server_credentials();
+        let mut cfg = client_config_with_trust(&creds, KxPolicy::pqc_first(), None);
+        cfg.cipher_suites = Some(vec![AES_128_GCM_SHA256, CHACHA20_POLY1305_SHA256]);
+        cfg.kx_policy = KxPolicy::new(vec![NamedGroup::SecP256r1, NamedGroup::X25519, NamedGroup::X25519MLKEM768]);
+        cfg.signature_schemes = Some(vec![0x0403, 0x0807]);
+        cfg.ech_client = Some(super::super::ech::EchClientConfig::grease_only());
+        let err = cfg.with_fips_profile().expect_err("outside the profile");
+        let msg = err.to_string();
+        for needle in ["0x1303", "X25519", "X25519MLKEM768", "0x0807", "ech_client"] {
+            assert!(msg.contains(needle), "{needle} missing from: {msg}");
+        }
+        assert!(!msg.contains("0x1301"), "in-profile items are not offenders: {msg}");
+        assert_eq!(err.violations.len(), 5, "{msg}");
+
+        let mut cfg = client_config_with_trust(&creds, KxPolicy::nist_only(), None);
+        cfg.key_log = Some(super::super::KeyLogFile::open("/dev/null").unwrap());
+        assert!(cfg.with_fips_profile().unwrap_err().to_string().contains("key_log"));
+    }
+
+    /// Narrowing is allowed; and a tightened config keeps its tightening.
+    #[test]
+    fn narrowing_the_profile_is_allowed_and_preserved() {
+        let creds = test_server_credentials();
+        let mut cfg = client_config_with_trust(&creds, KxPolicy::nist_only(), None);
+        cfg.cipher_suites = Some(vec![AES_256_GCM_SHA384]);
+        cfg.signature_schemes = Some(vec![0x0503]);
+        let cfg = cfg.with_fips_profile().expect("narrower than the profile");
+        assert_eq!(cfg.cipher_suites, Some(vec![AES_256_GCM_SHA384]));
+        assert_eq!(cfg.signature_schemes, Some(vec![0x0503]));
+        assert_eq!(cfg.kx_policy.groups(), &[NamedGroup::SecP256r1, NamedGroup::SecP384r1]);
+    }
+
+    /// Once in FIPS mode ECH cannot be switched on afterwards.
+    #[test]
+    fn fips_engine_refuses_ech_set_later() {
+        let creds = test_server_credentials();
+        let mut client = HandshakeEngine::new(fips(client_config_with_trust(&creds, KxPolicy::classical_only(), None)));
+        assert!(!client.set_ech_client(Some(super::super::ech::EchClientConfig::grease_only())));
+    }
+
     /// SHA-384 is opt-in: a default server does not accept a client that
     /// offers only `TLS_AES_256_GCM_SHA384`.
     #[test]
@@ -4266,6 +4543,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
             extra_key_shares: Vec::new(),
         });
         let hello = with_psk_modes(&hello.encode(), modes);
@@ -4365,6 +4644,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
             extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();
@@ -4494,6 +4775,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
             extra_key_shares: Vec::new(),
         });
         server.feed_handshake_data(&mut hello.encode().as_ref(), &mut sink);
@@ -4654,6 +4937,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
             extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();
@@ -4699,6 +4984,8 @@ mod tests {
             compress_certificate: false,
             offer_tls12_fallback: false,
             signature_schemes: None,
+            cert_signature_schemes: None,
+            tls12_cipher_suites: None,
             extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();

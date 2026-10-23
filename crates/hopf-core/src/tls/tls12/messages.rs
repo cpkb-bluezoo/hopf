@@ -200,6 +200,9 @@ pub struct ClientHelloParams<'a> {
     /// `signature_algorithms` to offer, as `(hash << 8) | signature` codes;
     /// `None` offers [`OFFERED_SIGNATURE_ALGORITHMS`].
     pub signature_schemes: Option<&'a [u16]>,
+    /// `signature_algorithms_cert` to offer; `None` offers
+    /// [`crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES`].
+    pub cert_signature_schemes: Option<&'a [u16]>,
 }
 
 /// `supported_signature_algorithms` list data: `schemes` as `(hash, signature)`
@@ -274,7 +277,11 @@ pub fn build_client_hello(params: &ClientHelloParams<'_>) -> Bytes {
     push_extension(
         &mut extensions,
         ext::SIGNATURE_ALGORITHMS_CERT,
-        &encode_u16_list(crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES),
+        &encode_u16_list(
+            params
+                .cert_signature_schemes
+                .unwrap_or(crate::crypto::x509::ACCEPTED_CERT_SIGNATURE_SCHEMES),
+        ),
     );
     if let Some(name) = params.server_name {
         let host = name.as_bytes();
@@ -970,6 +977,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         // 1-byte type + 3-byte length header.
@@ -1004,6 +1012,7 @@ mod tests {
             cookie: b"a-server-issued-cookie",
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse DTLS-shaped client hello");
@@ -1028,6 +1037,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         let schemes = find_extension_u16_list(&wire, ext::SIGNATURE_ALGORITHMS_CERT).expect("extension present");
@@ -1190,6 +1200,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse");
@@ -1211,6 +1222,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse");
@@ -1231,6 +1243,7 @@ mod tests {
             cookie: &[],
             curves: None,
             signature_schemes: None,
+            cert_signature_schemes: None,
         };
         let wire = build_client_hello(&params);
         let parsed = parse_client_hello(&wire[4..]).expect("parse");
