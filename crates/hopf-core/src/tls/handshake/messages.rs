@@ -1212,7 +1212,10 @@ mod tests {
         let cr = build_certificate_request(&[], &[0x0403, 0x0804]);
         // extensions: u16 length, then signature_algorithms (13) holding a u16-prefixed list.
         let expected: &[u8] = &[0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x04, 0x03, 0x08, 0x04];
-        assert!(cr.body.windows(expected.len()).any(|w| w == expected), "{:02x?}", cr.body);
+        assert!(
+            cr.body.windows(expected.len()).any(|w| w == expected),
+            "CertificateRequest lacks the signature_algorithms extension listing the given schemes"
+        );
     }
 
     /// With the TLS 1.2 fallback on offer, the 1.2 suites that follow the 1.3

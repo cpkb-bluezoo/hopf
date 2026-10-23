@@ -122,8 +122,8 @@ pub fn provider_self_check() -> Vec<String> {
             .is_ok();
         check(name, ok);
     }
-    check("AES-128-GCM", crate::crypto::aead::AesGcmKey::new(&[7u8; 16]).is_ok_and(|k| seals(&k)));
-    check("AES-256-GCM", crate::crypto::aead::AesGcmKey::new(&[7u8; 32]).is_ok_and(|k| seals(&k)));
+    check("AES-128-GCM", aes_gcm_round_trips(16));
+    check("AES-256-GCM", aes_gcm_round_trips(32));
     check("ECDH secp256r1", ecdh_p256_agrees());
     check("ECDH secp384r1", ecdh_p384_agrees());
     for (name, signing, verifying) in [
@@ -151,10 +151,19 @@ pub fn provider_self_check() -> Vec<String> {
     missing
 }
 
-fn seals(key: &crate::crypto::aead::AesGcmKey) -> bool {
+/// Seal and open one message with a fresh random `key_len`-byte key and nonce.
+fn aes_gcm_round_trips(key_len: usize) -> bool {
+    let mut key = vec![0u8; key_len];
+    let mut nonce = [0u8; 12];
+    if aws_lc_rs::rand::fill(&mut key).is_err() || aws_lc_rs::rand::fill(&mut nonce).is_err() {
+        return false;
+    }
+    let Ok(key) = crate::crypto::aead::AesGcmKey::new(&key) else {
+        return false;
+    };
     let mut data = b"plaintext".to_vec();
-    key.seal_in_place_append_tag([0u8; 12], b"aad", &mut data).is_ok()
-        && key.open_in_place([0u8; 12], b"aad", &mut data).is_ok_and(|n| &data[..n] == b"plaintext")
+    key.seal_in_place_append_tag(nonce, b"aad", &mut data).is_ok()
+        && key.open_in_place(nonce, b"aad", &mut data).is_ok_and(|n| &data[..n] == b"plaintext")
 }
 
 fn ecdh_p256_agrees() -> bool {
