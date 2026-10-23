@@ -74,6 +74,8 @@ doq = ["dns", "hopf-dns/doq"]
 doh = ["dns", "hopf-dns/doh"]
 dnssec = ["dns", "hopf-dns/dnssec"]
 webdav-xattr = ["webdav", "hopf-webdav/xattr"]
+# Build AWS-LC's FIPS module instead of the default one (needs cmake and Go).
+fips = ["hopf-core/fips"]
 mqtt-ws = ["mqtt", "hopf-mqtt/websocket"]
 masque-h3 = ["masque", "h3", "hopf-masque/h3"]
 

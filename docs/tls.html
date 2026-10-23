@@ -86,6 +86,7 @@
 <li><a href="#public-api">Public API</a></li>
 <li><a href="#configuration">Configuration</a></li>
 <li><a href="#wiring-listeners-and-connectors">Wiring listeners and connectors</a></li>
+<li><a href="#fips-mode">FIPS mode</a></li>
 <li><a href="#securityinfo">SecurityInfo</a></li>
 <li><a href="#examples">Examples</a></li>
 <li><a href="#limitations">Limitations</a></li>
@@ -360,7 +361,7 @@ let acceptor = acceptor_from_pem_with_sni(
 </tbody>
 </table>
 <h3 id="cargo-features">Cargo features</h3>
-<p>None. <code>hopf-core::tls</code> is always built in — it's not gated behind a feature flag.</p>
+<p><code>hopf-core::tls</code> is always built in. The one feature that affects it is <code>fips</code> (also forwarded by the <code>hopf</code> umbrella crate): it builds AWS-LC's FIPS module in place of the default one; see <a href="#fips-backend">The validated backend</a>.</p>
 <h2 id="wiring-listeners-and-connectors">Wiring listeners and connectors</h2>
 <pre class="rust,ignore"><code>use hopf_core::TcpListenerConfig;
 
@@ -382,6 +383,65 @@ let cfg = TcpConnectorConfig::new(addr, factory)
 <li><a href="smtp.html">SMTP</a> — <code>SmtpConfig::with_tls</code> / <code>implicit_tls</code></li>
 <li><a href="http/overview.html">HTTP</a> — <code>AlpnHttpEndpoint</code> after TLS ALPN</li>
 <li>Cookbook: <a href="cookbook/tls-echo.html">TLS echo</a></li>
+</ul>
+<h2 id="fips-mode">FIPS mode</h2>
+<p>FIPS mode holds a handshake to an approved algorithm profile: one call restricts every cipher suite, key-exchange group and signature algorithm that TLS 1.3, TLS 1.2, DTLS and QUIC will offer, accept or sign with. It is opt-in; without it nothing changes.</p>
+<p><strong>What this claims, precisely.</strong> There are two independent parts. The handshake profile restricts what a handshake <em>negotiates</em>. The <code>fips</code> Cargo feature (below) makes the cryptographic operations run in the FIPS build of AWS-LC (<code>aws-lc-fips-sys</code>, through <code>aws-lc-rs</code>) instead of the default one, and <code>RuntimeConfig { fips: true, .. }</code> refuses to start without it. Together they mean the runtime uses validated cryptography and only the approved profile. They do not mean the product is validated: whether a given build of the module carries a validation depends on its version and platform, and nothing here asserts it.</p>
+<h3 id="fips-backend">The validated backend</h3>
+<pre class="rust,ignore"><code>// Cargo.toml
+hopf-core = { version = "...", features = ["fips"] }   // or hopf = { features = ["fips"] }</code></pre>
+<p>The feature enables <code>aws-lc-rs/fips</code>, which compiles the FIPS module from source: <strong>cmake and Go are needed at build time</strong>. Cargo unifies features, so every crate in the build links the same FIPS-built library, <code>hopf-quic</code> and <code>hopf-tls</code> included.</p>
+<pre class="rust,ignore"><code>use hopf_core::{Runtime, RuntimeConfig};
+
+// Fails with ErrorKind::Unsupported unless the FIPS module is linked and
+// performs every service the profile uses.
+let rt = Runtime::start(RuntimeConfig { fips: true, ..Default::default() })?;</code></pre>
+<p><code>RuntimeConfig::fips</code> checks the backend only; apply the handshake profile per listener and connector as above. The check asks the linked library itself (<code>aws_lc_rs::try_fips_mode</code>) rather than trusting the build flag, then exercises each primitive the profile uses (random, SHA-256/384, HMAC, HKDF, AES-128/256-GCM, ECDH and ECDSA on P-256 and P-384, RSA-2048 PSS and PKCS#1 v1.5) and, if any fails, lists the missing services in the error. <code>hopf_core::tls::fips::require_validated_backend()</code> is the same check for callers that do not use <code>Runtime</code>.</p>
+<h3 id="fips-profile">The profile</h3>
+<table>
+<thead>
+<tr><th>Area</th><th>Permitted</th><th>Excluded</th></tr>
+</thead>
+<tbody>
+<tr><td>TLS 1.3 / DTLS 1.3 / QUIC suites</td><td><code>TLS_AES_128_GCM_SHA256</code>, <code>TLS_AES_256_GCM_SHA384</code></td><td><code>TLS_CHACHA20_POLY1305_SHA256</code></td></tr>
+<tr><td>TLS 1.2 / DTLS 1.2 suites</td><td><code>ECDHE_ECDSA</code> and <code>ECDHE_RSA</code> with AES-128-GCM-SHA256 and AES-256-GCM-SHA384</td><td>ChaCha20-Poly1305</td></tr>
+<tr><td>Key exchange</td><td><code>secp256r1</code>, <code>secp384r1</code> (ECDHE)</td><td>X25519, the hybrid ML-KEM groups</td></tr>
+<tr><td>TLS 1.3 <code>CertificateVerify</code></td><td>ECDSA P-256/SHA-256, ECDSA P-384/SHA-384, RSASSA-PSS (rsae)/SHA-256</td><td>Ed25519, ML-DSA</td></tr>
+<tr><td>TLS 1.2 signatures</td><td>the above plus RSA PKCS#1 v1.5/SHA-256</td><td>Ed25519</td></tr>
+<tr><td>Certificate-chain signatures</td><td>ECDSA P-256/P-384; RSA PKCS#1 v1.5 with SHA-256, SHA-384, SHA-512</td><td>Ed25519, ML-DSA</td></tr>
+<tr><td>Encrypted Client Hello</td><td>-</td><td>Refused</td></tr>
+<tr><td>Key logging</td><td>-</td><td>Records nothing, not even the process-wide default key log</td></tr>
+</tbody>
+</table>
+<p>A profile client offers nothing outside this table in any ClientHello, including the TLS 1.2 suites a negotiating client appends. A profile server answers a client whose offer has nothing in common with it with <code>handshake_failure</code>. The server will not sign with a key whose algorithm is outside the profile or outside the client's own <code>signature_algorithms</code>, and either side rejects a peer certificate chain that needs a signature algorithm outside the profile.</p>
+<h3 id="fips-applying">Applying it</h3>
+<table>
+<thead>
+<tr><th>Transport</th><th>Call</th></tr>
+</thead>
+<tbody>
+<tr><td>TCP TLS</td><td><code>acceptor_with_fips(acceptor)?</code> / <code>connector_with_fips(connector)?</code>; <code>TlsVariant::set_fips()</code> for a single connection</td></tr>
+<tr><td>DTLS</td><td><code>DtlsServerMaterial::with_fips()?</code> / <code>dtls_client_engine_fips(..)?</code></td></tr>
+<tr><td>QUIC</td><td><code>QuicTlsOptions::new().with_fips()</code>; <code>try_hopf_client_config</code> / <code>try_hopf_server_config</code> return the error</td></tr>
+<tr><td>Engines directly</td><td><code>HandshakeConfig::fips_profile()</code> / <code>with_fips_profile()</code> and <code>Tls12Config::fips_profile()</code> / <code>with_fips_profile()</code></td></tr>
+</tbody>
+</table>
+<pre class="rust,ignore"><code>use hopf_core::{acceptor_from_pem, acceptor_with_fips};
+
+// Both TLS 1.3 and the TLS 1.2 fallback are held to the profile.
+let acceptor = acceptor_with_fips(acceptor_from_pem(&amp;cert, &amp;key, &amp;[b"h2"])?)?;</code></pre>
+<p>The wrapped builder is checked once, when the wrapper is built, so a configuration outside the profile fails there rather than on the first connection. The error lists every offending item, for example <code>cipher_suites: 0x1303; kx_policy: X25519; ech_client: Encrypted Client Hello is not permitted</code>.</p>
+<p><strong>Narrowing is allowed, widening is an error.</strong> A restriction left unset becomes the profile. A narrower setting is kept: restricting <code>cipher_suites</code> to <code>TLS_AES_256_GCM_SHA384</code>, or the key-exchange policy to <code>secp384r1</code>, is fine. Naming anything outside the profile, enabling ECH, or attaching a key log is rejected. The two stock key-exchange policies (<code>KxPolicy::default()</code> and <code>classical_only()</code>) count as unconfigured and are replaced by <code>KxPolicy::nist_only()</code> (secp256r1, then secp384r1).</p>
+<p>FIPS mode has to be set before the handshake starts. ECH added <em>after</em> a FIPS wrapper (<code>connector_with_ech(connector_with_fips(..))</code>) is ignored, because those builders cannot return an error: ECH is refused, not offered.</p>
+<h3 id="fips-keys">Keys and certificates</h3>
+<p>The profile has no Ed25519 or ML-DSA signatures, so a FIPS server needs an ECDSA P-256, ECDSA P-384 or RSA key, and a client needs trust anchors whose chain is signed with an approved algorithm. The self-signed QUIC helpers switch to an ECDSA P-256 key when <code>with_fips()</code> is set.</p>
+<h3 id="fips-limitations">Limitations</h3>
+<ul>
+<li>A session that negotiates <code>TLS_AES_256_GCM_SHA384</code> does not resume: it runs a full handshake and the server issues no ticket, because tickets and PSK binders are SHA-256 only. A SHA-384 server also ignores an offered SHA-256 ticket. Sessions on <code>TLS_AES_128_GCM_SHA256</code> resume as usual.</li>
+<li>TLS 1.2 servers speak <code>secp256r1</code> and <code>secp384r1</code> only.</li>
+<li>An ordinary Hopf client cannot complete a handshake with a profile server unless its own key-exchange policy includes a plain NIST group: its TLS 1.3 key shares are X25519 and hybrid groups, and it refuses the HelloRetryRequest that asks for secp256r1.</li>
+<li>The <code>fips</code> feature changes the library that performs the operations; it does not stop other code in the same process from using algorithms outside the profile (X25519, ChaCha20-Poly1305 and so on stay available through the same library). The profile is what keeps the TLS handshakes off them.</li>
+<li>Building the FIPS module needs cmake and Go, and takes noticeably longer than the default build.</li>
 </ul>
 <h2 id="securityinfo">SecurityInfo</h2>
 <p>After handshake, <code>Endpoint::security_info()</code> reports (via core <code>SecurityInfo</code>): secure flag, ALPN protocol, TLS protocol version, cipher suite, the SNI hostname the peer requested (<code>sni()</code>, server side), and — when mTLS presented a client certificate — its SHA-256 fingerprint as lowercase hex (<code>peer_certificate_fingerprint()</code>) and full certificate chain (<code>peer_certificate_chain()</code>), server side. Handlers may gate AUTH or HTTP/2 on this metadata (<code>ProtocolHandler::security_established</code>). The fingerprint is the <code>cert_key</code> expected by <a href="auth.html">SASL EXTERNAL</a>'s <code>CredentialStore::authenticate_certificate</code>.</p>

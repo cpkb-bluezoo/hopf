@@ -27,6 +27,13 @@ pub struct RuntimeConfig {
     pub worker_threads: usize,
     /// Blocking storage / filesystem pool.
     pub storage: StorageConfig,
+    /// FIPS mode: [`Runtime::start`] fails unless the linked cryptographic
+    /// backend is the FIPS build of AWS-LC (`hopf-core`'s `fips` feature) and
+    /// performs every service the FIPS TLS profile uses; see
+    /// [`crate::tls::fips::require_validated_backend`]. This checks the
+    /// backend only: the handshake restrictions are applied separately, per
+    /// listener and connector (`acceptor_with_fips`, `connector_with_fips`).
+    pub fips: bool,
 }
 
 
@@ -65,6 +72,9 @@ impl Runtime {
         config: RuntimeConfig,
         telemetry: Option<Arc<dyn TelemetryHook>>,
     ) -> io::Result<Self> {
+        if config.fips {
+            crate::tls::fips::require_validated_backend()?;
+        }
         let n = config.resolved_workers();
         let active = Arc::new(AtomicBool::new(true));
         let storage = Arc::new(StorageExecutor::new(config.storage));
@@ -230,5 +240,37 @@ impl Runtime {
         if let Ok(storage) = Arc::try_unwrap(self.storage) {
             storage.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod fips_tests {
+    use super::*;
+
+    /// FIPS mode off (the default) never consults the backend.
+    #[test]
+    fn a_runtime_without_fips_mode_starts_whatever_the_backend() {
+        assert!(!RuntimeConfig::default().fips);
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, ..Default::default() }).expect("starts");
+        rt.shutdown();
+    }
+
+    /// Without the validated module a FIPS-mode runtime does not come up, and
+    /// the error says why and how to fix it.
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn a_fips_runtime_refuses_to_start_without_the_validated_backend() {
+        let err = Runtime::start(RuntimeConfig { worker_threads: 1, fips: true, ..Default::default() })
+            .err()
+            .expect("the default build is not the validated module");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("`fips` feature"), "{err}");
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn a_fips_runtime_starts_with_the_validated_backend() {
+        let rt = Runtime::start(RuntimeConfig { worker_threads: 1, fips: true, ..Default::default() }).expect("starts");
+        rt.shutdown();
     }
 }

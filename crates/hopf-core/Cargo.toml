@@ -36,6 +36,11 @@ default = []
 ed448 = ["dep:ed448-goldilocks-plus"]
 # Runtime/TCP smokes; not compiled in CI (`cargo test --lib` without this feature).
 integration = []
+# The validated-cryptography switch: builds AWS-LC's FIPS module
+# (`aws-lc-fips-sys`; needs cmake and Go at build time) instead of the default
+# one. `RuntimeConfig { fips: true, .. }` refuses to start without it. Select
+# the approved handshake profile separately (`tls::fips`).
+fips = ["aws-lc-rs/fips"]
 
 [target.'cfg(unix)'.dependencies]
 # UNIX domain socket peer credentials (SO_PEERCRED / getpeereid).

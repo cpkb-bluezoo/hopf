@@ -58,6 +58,145 @@ pub const TLS12_SIGNATURE_SCHEMES: &[u16] = &[0x0403, 0x0503, 0x0401, 0x0804];
 /// and RSA PKCS#1 v1.5 with SHA-256, SHA-384 and SHA-512.
 pub const CERT_SIGNATURE_SCHEMES: &[u16] = &[0x0403, 0x0503, 0x0401, 0x0501, 0x0601];
 
+/// The linked cryptographic backend is not usable for FIPS mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FipsBackendError {
+    message: String,
+}
+
+impl FipsBackendError {
+    /// Why the backend cannot be used.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for FipsBackendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FipsBackendError {}
+
+impl From<FipsBackendError> for std::io::Error {
+    fn from(err: FipsBackendError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::Unsupported, err)
+    }
+}
+
+/// Whether the linked AWS-LC is its FIPS build, as the library itself reports.
+/// True only when `hopf-core` is built with the `fips` Cargo feature
+/// (`aws-lc-rs/fips`, which compiles the `aws-lc-fips-sys` module; that needs
+/// cmake and Go at build time). Whether a given build of that module is a
+/// *validated* one is a property of the version and platform, not of this check.
+pub fn backend_is_validated() -> bool {
+    aws_lc_rs::try_fips_mode().is_ok()
+}
+
+/// Exercise each primitive the profile relies on and name the ones the linked
+/// provider cannot perform. Empty means the provider has every service.
+pub fn provider_self_check() -> Vec<String> {
+    use aws_lc_rs::{digest, hkdf, hmac, rand, rsa, signature};
+    use signature::KeyPair as _;
+
+    let mut missing = Vec::new();
+    let mut check = |name: &str, ok: bool| {
+        if !ok {
+            missing.push(name.to_string());
+        }
+    };
+    let msg = b"hopf fips provider self-check";
+
+    check("random", rand::fill(&mut [0u8; 32]).is_ok());
+    check("SHA-256", digest::digest(&digest::SHA256, msg).as_ref().len() == 32);
+    check("SHA-384", digest::digest(&digest::SHA384, msg).as_ref().len() == 48);
+    check("HMAC-SHA-256", hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, b"key"), msg).as_ref().len() == 32);
+    check("HMAC-SHA-384", hmac::sign(&hmac::Key::new(hmac::HMAC_SHA384, b"key"), msg).as_ref().len() == 48);
+    for (name, alg) in [("HKDF-SHA-256", hkdf::HKDF_SHA256), ("HKDF-SHA-384", hkdf::HKDF_SHA384)] {
+        let prk = hkdf::Salt::new(alg, b"salt").extract(b"ikm");
+        let mut out = vec![0u8; hkdf::KeyType::len(&alg)];
+        let ok = prk
+            .expand(&[b"info"], alg)
+            .and_then(|okm| okm.fill(&mut out).map_err(|_| aws_lc_rs::error::Unspecified))
+            .is_ok();
+        check(name, ok);
+    }
+    check("AES-128-GCM", crate::crypto::aead::AesGcmKey::new(&[7u8; 16]).is_ok_and(|k| seals(&k)));
+    check("AES-256-GCM", crate::crypto::aead::AesGcmKey::new(&[7u8; 32]).is_ok_and(|k| seals(&k)));
+    check("ECDH secp256r1", ecdh_p256_agrees());
+    check("ECDH secp384r1", ecdh_p384_agrees());
+    for (name, signing, verifying) in [
+        ("ECDSA P-256/SHA-256", &signature::ECDSA_P256_SHA256_ASN1_SIGNING, &signature::ECDSA_P256_SHA256_ASN1),
+        ("ECDSA P-384/SHA-384", &signature::ECDSA_P384_SHA384_ASN1_SIGNING, &signature::ECDSA_P384_SHA384_ASN1),
+    ] {
+        let ok = signature::EcdsaKeyPair::generate(signing).is_ok_and(|kp| {
+            kp.sign(&rand::SystemRandom::new(), msg).is_ok_and(|sig| {
+                signature::UnparsedPublicKey::new(verifying, kp.public_key().as_ref()).verify(msg, sig.as_ref()).is_ok()
+            })
+        });
+        check(name, ok);
+    }
+    let rsa_ok = rsa::KeyPair::generate(rsa::KeySize::Rsa2048).is_ok_and(|kp| {
+        let rng = rand::SystemRandom::new();
+        let sign_verify = |padding: &'static dyn signature::RsaEncoding, verifying: &'static signature::RsaParameters| {
+            let mut sig = vec![0u8; kp.public_modulus_len()];
+            kp.sign(padding, &rng, msg, &mut sig).is_ok()
+                && signature::UnparsedPublicKey::new(verifying, kp.public_key().as_ref()).verify(msg, &sig).is_ok()
+        };
+        sign_verify(&signature::RSA_PSS_SHA256, &signature::RSA_PSS_2048_8192_SHA256)
+            && sign_verify(&signature::RSA_PKCS1_SHA256, &signature::RSA_PKCS1_2048_8192_SHA256)
+    });
+    check("RSA-2048 PSS and PKCS#1 v1.5 (SHA-256)", rsa_ok);
+    missing
+}
+
+fn seals(key: &crate::crypto::aead::AesGcmKey) -> bool {
+    let mut data = b"plaintext".to_vec();
+    key.seal_in_place_append_tag([0u8; 12], b"aad", &mut data).is_ok()
+        && key.open_in_place([0u8; 12], b"aad", &mut data).is_ok_and(|n| &data[..n] == b"plaintext")
+}
+
+fn ecdh_p256_agrees() -> bool {
+    use crate::crypto::kx::EphemeralP256KeyPair;
+    let (Ok(a), Ok(b)) = (EphemeralP256KeyPair::generate(), EphemeralP256KeyPair::generate()) else {
+        return false;
+    };
+    let (pa, pb) = (a.public_key().to_vec(), b.public_key().to_vec());
+    matches!((a.agree(&pb), b.agree(&pa)), (Ok(x), Ok(y)) if x == y)
+}
+
+fn ecdh_p384_agrees() -> bool {
+    use crate::crypto::kx::EphemeralP384KeyPair;
+    let (Ok(a), Ok(b)) = (EphemeralP384KeyPair::generate(), EphemeralP384KeyPair::generate()) else {
+        return false;
+    };
+    let (pa, pb) = (a.public_key().to_vec(), b.public_key().to_vec());
+    matches!((a.agree(&pb), b.agree(&pa)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// Succeeds only when the linked backend is the FIPS build *and* it performs
+/// every service the profile uses. Otherwise the error says what is wrong:
+/// either that the `fips` feature is needed, or which services are missing.
+/// [`Runtime::start`](crate::Runtime::start) calls this for a runtime
+/// configured with `fips: true`.
+pub fn require_validated_backend() -> Result<(), FipsBackendError> {
+    if !backend_is_validated() {
+        return Err(FipsBackendError {
+            message: "FIPS mode needs the FIPS build of the cryptographic module, but the linked AWS-LC is not it: \
+                      build hopf-core with the `fips` feature (aws-lc-rs/fips; needs cmake and Go)"
+                .into(),
+        });
+    }
+    let missing = provider_self_check();
+    if !missing.is_empty() {
+        return Err(FipsBackendError {
+            message: format!("the FIPS provider lacks services the profile uses: {}", missing.join(", ")),
+        });
+    }
+    Ok(())
+}
+
 /// A config outside the FIPS profile: one entry per offending item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FipsProfileError {
@@ -202,5 +341,37 @@ impl Tls12Config {
         self.signature_schemes = Some(narrowed(&self.signature_schemes, TLS12_SIGNATURE_SCHEMES));
         self.cert_signature_schemes = Some(narrowed(&self.cert_signature_schemes, CERT_SIGNATURE_SCHEMES));
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The linked library is the FIPS build exactly when the feature asked for it.
+    #[test]
+    fn backend_is_validated_exactly_when_the_fips_feature_is_on() {
+        assert_eq!(backend_is_validated(), cfg!(feature = "fips"));
+    }
+
+    /// Every primitive the profile relies on works in the linked provider.
+    #[test]
+    fn the_provider_has_every_service_the_profile_uses() {
+        assert_eq!(provider_self_check(), Vec::<String>::new());
+    }
+
+    #[cfg(not(feature = "fips"))]
+    #[test]
+    fn requiring_the_validated_backend_fails_and_says_how_to_get_one() {
+        let err = require_validated_backend().expect_err("the default build is not the validated module");
+        let msg = err.to_string();
+        assert!(msg.contains("`fips` feature"), "{msg}");
+        assert!(msg.contains("aws-lc-rs/fips"), "{msg}");
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn requiring_the_validated_backend_succeeds_with_it() {
+        require_validated_backend().expect("built with the validated module");
     }
 }
