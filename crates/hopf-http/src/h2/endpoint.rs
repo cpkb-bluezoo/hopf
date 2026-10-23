@@ -237,6 +237,9 @@ struct H2ServerStream {
     pending_tunnel: Vec<u8>,
     /// The tunnel ended (END_STREAM) before the upgrade was installed.
     tunnel_fin: bool,
+    /// `start_request_body` has been called: it announces the first body
+    /// byte, once, however many DATA frames the body arrives in.
+    request_body_started: bool,
 }
 
 /// A server stream ended by the peer or the connection before its response
@@ -895,7 +898,10 @@ impl H2Endpoint {
             return;
         }
         if !data.is_empty() {
-            stream.handler.start_request_body(&mut stream.writer);
+            if !stream.request_body_started {
+                stream.request_body_started = true;
+                stream.handler.start_request_body(&mut stream.writer);
+            }
             stream
                 .handler
                 .request_body_content(&mut stream.writer, data);
@@ -1314,6 +1320,7 @@ impl H2Endpoint {
             extended_connect: false,
             pending_tunnel: Vec::new(),
             tunnel_fin: false,
+            request_body_started: false,
             priority: PriorityParams::default(),
         };
         Self::bind_server_stream(&self.conn, &self.connection_info, &self.deferred_flush, &mut stream);
@@ -1557,6 +1564,7 @@ impl H2Endpoint {
             extended_connect: false,
             pending_tunnel: Vec::new(),
             tunnel_fin: false,
+            request_body_started: false,
             priority: PriorityParams::default(),
         };
         Self::bind_server_stream(&self.conn, &self.connection_info, &self.deferred_flush, &mut stream);
@@ -3246,6 +3254,7 @@ mod graceful_shutdown_tests {
             extended_connect: false,
             pending_tunnel: Vec::new(),
             tunnel_fin: false,
+            request_body_started: false,
             priority: PriorityParams::default(),
             },
         );
@@ -3416,6 +3425,7 @@ mod server_abort_tests {
                 extended_connect: false,
                 pending_tunnel: Vec::new(),
                 tunnel_fin: false,
+                request_body_started: false,
                 priority: PriorityParams::default(),
             },
         );
@@ -3796,6 +3806,7 @@ mod state_machine_tests {
             extended_connect: false,
             pending_tunnel: Vec::new(),
             tunnel_fin: false,
+            request_body_started: false,
             priority: PriorityParams::default(),
             },
         );
@@ -3861,6 +3872,7 @@ mod state_machine_tests {
             extended_connect: false,
             pending_tunnel: Vec::new(),
             tunnel_fin: false,
+            request_body_started: false,
             priority: PriorityParams::default(),
             },
         );
@@ -4520,5 +4532,65 @@ mod client_request_handle_tests {
         assert_eq!(*id, 1);
         assert_eq!(payload.as_slice(), &frame::ERROR_CANCEL.to_be_bytes());
         assert!(ep.client_streams.is_empty(), "a cancelled stream gets no callbacks");
+    }
+}
+
+#[cfg(test)]
+mod request_body_events_tests {
+    use super::*;
+    use crate::stream::{ServerHandler, ServerHandlerFactory, ServerWriter};
+    use std::sync::Mutex;
+
+    fn encode_headers(pairs: &[(&str, &str)]) -> Vec<u8> {
+        super::super::hpack::Encoder::new(4096).encode(pairs.iter().copied())
+    }
+
+    /// What a handler was told, in order.
+    struct Events(Arc<Mutex<Vec<String>>>);
+    impl ServerHandler for Events {
+        fn headers(&mut self, _response: &mut dyn ServerWriter, _headers: &Headers) {}
+        fn start_request_body(&mut self, _response: &mut dyn ServerWriter) {
+            self.0.lock().unwrap().push("start".into());
+        }
+        fn request_body_content(&mut self, _response: &mut dyn ServerWriter, data: &[u8]) {
+            self.0.lock().unwrap().push(format!("content {}", String::from_utf8_lossy(data)));
+        }
+        fn end_request_body(&mut self, _response: &mut dyn ServerWriter) {
+            self.0.lock().unwrap().push("end".into());
+        }
+        fn request_complete(&mut self, _response: &mut dyn ServerWriter) {
+            self.0.lock().unwrap().push("complete".into());
+        }
+    }
+    struct EventsFactory(Arc<Mutex<Vec<String>>>);
+    impl ServerHandlerFactory for EventsFactory {
+        fn create_handler(&self) -> Box<dyn ServerHandler> {
+            Box::new(Events(Arc::clone(&self.0)))
+        }
+    }
+
+    /// `start_request_body` announces the first body byte, once: a request
+    /// whose body arrives in several DATA frames (a streaming call's
+    /// messages, say) gets one start, then each chunk.
+    #[test]
+    fn start_request_body_is_called_once_for_a_body_in_several_data_frames() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut ep = H2Endpoint::server(Arc::new(EventsFactory(Arc::clone(&events))), HttpLimits::default(), false);
+        let block = encode_headers(&[
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":path", "/upload"),
+            (":authority", "example.test"),
+        ]);
+        ep.process_server_headers_block(1, &block, false);
+
+        ep.data_frame(1, 0, b"a");
+        ep.data_frame(1, 0, b"b");
+        ep.data_frame(1, FLAG_END_STREAM, b"c");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["start", "content a", "content b", "content c", "end", "complete"]
+        );
     }
 }

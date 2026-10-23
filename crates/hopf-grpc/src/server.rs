@@ -1118,8 +1118,16 @@ impl ServerHandler for GrpcHandler {
         if self.body_rejected {
             return;
         }
+        if !self.body_started && self.client_streaming && self.content_ok && !self.stopped() {
+            // A client-streaming call may send no messages: the body is
+            // empty, so nothing started the call before its end.
+            self.start_request_body(response);
+        }
         if !self.body_started {
             self.reject_grpc(response, GRPC_STATUS_INTERNAL, "Missing request body");
+            return;
+        }
+        if self.body_rejected {
             return;
         }
         let (partial, done) = self
@@ -2008,6 +2016,25 @@ mod tests {
         handler.request_complete(&mut w);
         assert_eq!(texts_in(&w.body), vec!["a,b,c"]);
         assert_eq!(w.grpc_status(), Some(0));
+    }
+
+    /// A client-streaming call may send no messages at all: the request
+    /// body is then empty, and only its end is seen, never its start. The
+    /// call still runs, sees the half-close at once and answers.
+    #[test]
+    fn client_streaming_with_no_messages_gets_its_response() {
+        let (mut handler, _) = streaming_handler();
+        let mut w = MockWriter::default();
+        let mut h = Headers::new();
+        h.set(":method", "POST");
+        h.set(":path", "/test.TestSvc/ClientStream");
+        h.set("content-type", "application/grpc");
+        handler.headers(&mut w, &h);
+        handler.end_request_body(&mut w);
+        handler.request_complete(&mut w);
+        assert_eq!(w.status(), Some(200), "{:?}", w.headers);
+        assert_eq!(w.grpc_status(), Some(0), "{:?}", w.trailers);
+        assert!(!w.body.is_empty(), "the response message is missing");
     }
 
     /// Bidirectional: each request message is echoed as it arrives, and

@@ -148,6 +148,7 @@ pub struct GrpcUnaryCall {
     codec: GrpcCodec,
     encodings: Vec<ContentCoding>,
     compression: Option<ContentCoding>,
+    authority: Option<String>,
     handler: Arc<Mutex<Box<dyn GrpcResponseHandler>>>,
     options: GrpcCallOptions,
 }
@@ -175,9 +176,17 @@ impl GrpcUnaryCall {
             codec: GrpcCodec::Proto,
             encodings: DEFAULT_ENCODINGS.to_vec(),
             compression: None,
+            authority: None,
             handler: Arc::new(Mutex::new(handler)),
             options: GrpcCallOptions::new(),
         }
+    }
+
+    /// The `:authority` of the request, the host (and port) the call is
+    /// for; see [`GrpcClient::authority`].
+    pub fn with_authority(mut self, authority: Option<String>) -> Self {
+        self.authority = authority.filter(|a| !a.is_empty());
+        self
     }
 
     /// Per-call metadata and deadline.
@@ -238,6 +247,7 @@ impl GrpcUnaryCall {
             codec: self.codec,
             encodings: self.encodings.clone(),
             compression: self.compression,
+            authority: self.authority.clone(),
             handler: Arc::clone(&self.handler),
             call,
             request: None,
@@ -275,6 +285,7 @@ struct GrpcClientHandler {
     codec: GrpcCodec,
     encodings: Vec<ContentCoding>,
     compression: Option<ContentCoding>,
+    authority: Option<String>,
     handler: Arc<Mutex<Box<dyn GrpcResponseHandler>>>,
     /// The request side of a streaming call; `None` for a unary call,
     /// whose one message goes out in `start`.
@@ -437,6 +448,9 @@ impl ClientHandler for GrpcClientHandler {
         h.set(":method", "POST");
         h.set(":path", &self.path);
         h.set(":scheme", "https");
+        if let Some(authority) = &self.authority {
+            h.set(":authority", authority);
+        }
         h.set("content-type", self.codec.content_type());
         h.set("te", "trailers");
         h.set("grpc-accept-encoding", accept_encoding_header(&self.encodings));
@@ -636,6 +650,7 @@ pub struct GrpcClient {
     proto_file: Arc<ProtoFile>,
     encodings: Vec<ContentCoding>,
     compression: Option<ContentCoding>,
+    authority: Option<String>,
 }
 
 impl GrpcClient {
@@ -644,7 +659,16 @@ impl GrpcClient {
             proto_file: Arc::new(proto_file),
             encodings: DEFAULT_ENCODINGS.to_vec(),
             compression: None,
+            authority: None,
         }
+    }
+
+    /// The `:authority` to send with every call: the host, and port if it
+    /// is not the default, of the server dialled (`example.com:50051`).
+    /// Servers built on gRPC core refuse a call without one. Default: none.
+    pub fn authority(mut self, authority: impl Into<String>) -> Self {
+        self.authority = Some(authority.into()).filter(|a| !a.is_empty());
+        self
     }
 
     /// The algorithm to compress request messages with, named in
@@ -696,6 +720,7 @@ impl GrpcClient {
         GrpcUnaryCall::new(Arc::clone(&self.proto_file), path, request_message, handler)
             .with_encodings(&self.encodings)
             .with_compression(self.compression)
+            .with_authority(self.authority.clone())
             .with_options(options)
     }
 
@@ -711,7 +736,8 @@ impl GrpcClient {
         let factory = GrpcStreamingCall {
             unary: GrpcUnaryCall::new(Arc::clone(&self.proto_file), path, Vec::new(), handler)
                 .with_encodings(&self.encodings)
-                .with_compression(self.compression),
+                .with_compression(self.compression)
+                .with_authority(self.authority.clone()),
             call: call.clone(),
         };
         (factory, call)
@@ -939,6 +965,33 @@ mod tests {
         let errors: Vec<&String> = got.iter().filter(|e| e.starts_with("error ")).collect();
         assert_eq!(errors.len(), 1, "expected exactly one on_error: {got:?}");
         assert!(!got.iter().any(|e| e.starts_with("status ")), "no on_grpc_status after the failure: {got:?}");
+    }
+
+    /// A call names the server it is for in `:authority` when the client
+    /// was told it, whether unary or streaming, and leaves it out
+    /// otherwise.
+    #[test]
+    fn request_carries_the_configured_authority() {
+        let mut handler = client()
+            .authority("example.test:50051")
+            .unary_call("/test.TestSvc/Call", vec![], Box::new(RecordingHandler(Events::default())))
+            .create_handler();
+        let req = deliver(&mut *handler, &[], &frame(&msg("ok")), &[("grpc-status", "0")]);
+        assert_eq!(req.headers().unwrap().get(":authority"), Some("example.test:50051"));
+
+        let (factory, _call) = streaming_client().authority("example.test:50051").streaming_call(
+            "/test.TestSvc/ServerStream",
+            Box::new(RecordingHandler(Events::default())),
+        );
+        let mut handler = factory.create_handler();
+        let req = deliver(&mut *handler, &[], &[], &[("grpc-status", "0")]);
+        assert_eq!(req.headers().unwrap().get(":authority"), Some("example.test:50051"));
+
+        let mut handler = client()
+            .unary_call("/test.TestSvc/Call", vec![], Box::new(RecordingHandler(Events::default())))
+            .create_handler();
+        let req = deliver(&mut *handler, &[], &frame(&msg("ok")), &[("grpc-status", "0")]);
+        assert_eq!(req.headers().unwrap().get(":authority"), None);
     }
 
     fn gzip(data: &[u8]) -> Vec<u8> {
