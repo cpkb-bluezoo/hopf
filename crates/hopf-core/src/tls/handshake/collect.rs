@@ -66,6 +66,9 @@ pub struct ParsedClientHello {
     /// (RFC 8446 §4.2.3), if it sent one: the certificate-chain signature
     /// algorithms it can verify. `None` when the extension is absent.
     pub signature_algorithms_cert: Option<Vec<u16>>,
+    /// Schemes from the client's `signature_algorithms` extension (RFC 8446
+    /// §4.2.3), `None` when absent or malformed.
+    pub signature_algorithms: Option<Vec<u16>>,
     /// Algorithms from the client's `compress_certificate` extension
     /// (RFC 8879 §3): the certificate compression schemes it can
     /// decompress. Empty when the extension is absent or malformed.
@@ -197,14 +200,10 @@ impl HandshakeEvents for ClientHelloCollector {
                 self.out.compress_certificate =
                     data[1..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
             }
+        } else if ext_type == super::messages::ext::SIGNATURE_ALGORITHMS {
+            self.out.signature_algorithms = parse_scheme_list(data);
         } else if ext_type == super::messages::ext::SIGNATURE_ALGORITHMS_CERT {
-            // `SignatureScheme supported_signature_algorithms<2..2^16-2>`:
-            // a u16 byte length, then u16 schemes. Malformed (odd or
-            // mismatched length) is treated as absent rather than trusted.
-            if data.len() >= 2 && usize::from(u16::from_be_bytes([data[0], data[1]])) == data.len() - 2 && data.len() % 2 == 0 {
-                self.out.signature_algorithms_cert =
-                    Some(data[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect());
-            }
+            self.out.signature_algorithms_cert = parse_scheme_list(data);
         } else if ext_type == super::messages::ext::ENCRYPTED_CLIENT_HELLO {
             self.out.ech = Some(Bytes::copy_from_slice(data));
         }
@@ -396,14 +395,31 @@ impl HandshakeEvents for CertificateCollector {
     }
 }
 
+/// A `u16`-length-prefixed list of `SignatureScheme`s. Malformed (odd or
+/// mismatched length) is treated as absent rather than trusted.
+fn parse_scheme_list(data: &[u8]) -> Option<Vec<u16>> {
+    if data.len() >= 2 && usize::from(u16::from_be_bytes([data[0], data[1]])) == data.len() - 2 && data.len() % 2 == 0 {
+        Some(data[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect())
+    } else {
+        None
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct CertificateRequestCollector {
     context: Bytes,
+    signature_algorithms: Option<Vec<u16>>,
     failed: bool,
 }
 
 impl HandshakeEvents for CertificateRequestCollector {
     fn message_begin(&mut self, _msg_type: HandshakeType) {}
+
+    fn extension(&mut self, ext_type: u16, data: &[u8]) {
+        if ext_type == super::messages::ext::SIGNATURE_ALGORITHMS {
+            self.signature_algorithms = parse_scheme_list(data);
+        }
+    }
 
     fn certificate_request_context(&mut self, ctx: &[u8]) {
         self.context = Bytes::copy_from_slice(ctx);
@@ -553,8 +569,9 @@ pub(crate) enum ParsedIncoming {
     ServerHello(ParsedServerHello),
     /// EncryptedExtensions.
     EncryptedExtensions(ParsedEncryptedExtensions),
-    /// CertificateRequest's `certificate_request_context`.
-    CertificateRequest(Bytes),
+    /// CertificateRequest's `certificate_request_context` and its
+    /// `signature_algorithms` (`None` when absent or malformed).
+    CertificateRequest(Bytes, Option<Vec<u16>>),
     /// Certificate `(certificate_request_context, chain)` — chain is DER,
     /// leaf first, and may legitimately be empty for a client's response to
     /// `CertificateRequest` when it has no certificate to present.
@@ -633,7 +650,7 @@ impl MessageCollector {
                 if c.failed {
                     return None;
                 }
-                Some(ParsedIncoming::CertificateRequest(c.context))
+                Some(ParsedIncoming::CertificateRequest(c.context, c.signature_algorithms))
             }
             (HandshakeType::Certificate, Self::Certificate(c)) => {
                 if c.failed {
@@ -837,6 +854,7 @@ impl HandshakeEvents for MessageCollector {
             Self::ClientHello(c) => c.extension(ext_type, data),
             Self::ServerHello(c) => c.extension(ext_type, data),
             Self::EncryptedExtensions(c) => c.extension(ext_type, data),
+            Self::CertificateRequest(c) => c.extension(ext_type, data),
             _ => {}
         }
     }

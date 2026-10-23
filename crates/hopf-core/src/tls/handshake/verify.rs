@@ -55,39 +55,46 @@ pub fn certificate_verify_message(is_client: bool, transcript_hash: &TranscriptH
     out.freeze()
 }
 
-/// Sign CertificateVerify with whichever [`SUPPORTED_SIGNATURE_SCHEMES`] scheme
-/// matches `signing_key_pkcs8`'s own key type (sniffed from the PKCS#8
-/// `AlgorithmIdentifier` — server credentials carry a bare key, not a declared
-/// scheme). Returns `None` for a key type or curve this crate doesn't sign with.
+/// The [`SUPPORTED_SIGNATURE_SCHEMES`] scheme this crate signs
+/// CertificateVerify with for `signing_key_pkcs8`'s own key type (sniffed
+/// from the PKCS#8 `AlgorithmIdentifier` — server credentials carry a bare
+/// key, not a declared scheme). `None` for a key type or curve it doesn't
+/// sign with.
+pub fn certificate_verify_scheme(signing_key_pkcs8: &[u8]) -> Option<u16> {
+    // ML-DSA keys have no TLS 1.2 form, so they live outside `KeyKind`.
+    if let Some(level) = pkcs8_ml_dsa_level(signing_key_pkcs8) {
+        return Some(level.signature_scheme());
+    }
+    Some(match pkcs8_key_kind(signing_key_pkcs8)? {
+        KeyKind::Ed25519 => SIG_ED25519,
+        KeyKind::EcdsaP256 => SIG_ECDSA_SECP256R1_SHA256,
+        KeyKind::EcdsaP384 => SIG_ECDSA_SECP384R1_SHA384,
+        KeyKind::Rsa => SIG_RSA_PSS_RSAE_SHA256,
+    })
+}
+
+/// Sign CertificateVerify with the scheme [`certificate_verify_scheme`]
+/// picks for `signing_key_pkcs8`. Returns `None` for a key type or curve this
+/// crate doesn't sign with, or when that scheme is not in `allowed`.
 pub fn sign_certificate_verify(
     is_client: bool,
     signing_key_pkcs8: &[u8],
     transcript_hash: &TranscriptHash,
+    allowed: &[u16],
 ) -> Option<(u16, SignatureBytes)> {
+    let scheme = certificate_verify_scheme(signing_key_pkcs8).filter(|s| allowed.contains(s))?;
     let msg = certificate_verify_message(is_client, transcript_hash);
-    // ML-DSA keys have no TLS 1.2 form, so they live outside `KeyKind`.
     if let Some(level) = pkcs8_ml_dsa_level(signing_key_pkcs8) {
         let key = MlDsaPrivateKey::from_pkcs8(level, signing_key_pkcs8).ok()?;
-        return Some((level.signature_scheme(), ml_dsa_sign(&key, &msg).ok()?));
+        return Some((scheme, ml_dsa_sign(&key, &msg).ok()?));
     }
-    match pkcs8_key_kind(signing_key_pkcs8)? {
-        KeyKind::Ed25519 => {
-            let key = Ed25519PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
-            Some((SIG_ED25519, ed25519_sign(&key, &msg)))
-        }
-        KeyKind::EcdsaP256 => {
-            let key = EcdsaP256PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
-            Some((SIG_ECDSA_SECP256R1_SHA256, ecdsa_p256_sign(&key, &msg).ok()?))
-        }
-        KeyKind::EcdsaP384 => {
-            let key = EcdsaP384PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
-            Some((SIG_ECDSA_SECP384R1_SHA384, ecdsa_p384_sign(&key, &msg).ok()?))
-        }
-        KeyKind::Rsa => {
-            let key = RsaPrivateKey::from_pkcs8(signing_key_pkcs8).ok()?;
-            Some((SIG_RSA_PSS_RSAE_SHA256, rsa_sign_pss_sha256(&key, &msg).ok()?))
-        }
-    }
+    let sig = match pkcs8_key_kind(signing_key_pkcs8)? {
+        KeyKind::Ed25519 => ed25519_sign(&Ed25519PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?, &msg),
+        KeyKind::EcdsaP256 => ecdsa_p256_sign(&EcdsaP256PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?, &msg).ok()?,
+        KeyKind::EcdsaP384 => ecdsa_p384_sign(&EcdsaP384PrivateKey::from_pkcs8(signing_key_pkcs8).ok()?, &msg).ok()?,
+        KeyKind::Rsa => rsa_sign_pss_sha256(&RsaPrivateKey::from_pkcs8(signing_key_pkcs8).ok()?, &msg).ok()?,
+    };
+    Some((scheme, sig))
 }
 
 /// Verify a peer CertificateVerify signature against a leaf certificate DER.
@@ -187,7 +194,7 @@ mod tests {
         let doc = Ed25519PrivateKey::generate_pkcs8().unwrap();
         let key = Ed25519PrivateKey::from_pkcs8(&doc).unwrap();
         let th = TranscriptHash::from_bytes([0xabu8; 32]);
-        let (scheme, sig) = sign_certificate_verify(false, &doc, &th).expect("Ed25519 key recognized");
+        let (scheme, sig) = sign_certificate_verify(false, &doc, &th, SUPPORTED_SIGNATURE_SCHEMES).expect("Ed25519 key recognized");
         assert_eq!(scheme, SIG_ED25519);
         let msg = certificate_verify_message(false, &th);
         assert_eq!(msg.len(), 64 + 32 + 1 + "TLS 1.3, server CertificateVerify".len());
@@ -208,7 +215,7 @@ mod tests {
         for level in MlDsaLevel::ALL {
             let id = ml_dsa_identity(level);
             let (scheme, sig) =
-                sign_certificate_verify(false, &id.pkcs8_der, &th).unwrap_or_else(|| panic!("{level:?} key not signable"));
+                sign_certificate_verify(false, &id.pkcs8_der, &th, SUPPORTED_SIGNATURE_SCHEMES).unwrap_or_else(|| panic!("{level:?} key not signable"));
             assert_eq!(scheme, level.signature_scheme());
             assert!(verify_certificate_verify(false, &id.cert_der, scheme, sig.as_bytes(), &th), "{level:?}");
 

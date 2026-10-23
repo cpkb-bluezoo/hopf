@@ -14,7 +14,9 @@ use std::sync::Arc;
 mod ech;
 
 use super::handshake::messages::PSK_DHE_KE;
-use super::handshake::verify::{sign_certificate_verify, verify_certificate_verify};
+use super::handshake::verify::{
+    certificate_verify_scheme, sign_certificate_verify, verify_certificate_verify, SUPPORTED_SIGNATURE_SCHEMES,
+};
 
 use super::handshake::{
     build_certificate, build_certificate_request, build_certificate_verify, build_client_hello,
@@ -344,6 +346,12 @@ pub struct HandshakeConfig {
     pub offer_tls12_fallback: bool,
     /// Cipher suites offered (client) or considered (server). Default: [`SUPPORTED_CIPHER_SUITES`].
     pub cipher_suites: Option<Vec<u16>>,
+    /// `CertificateVerify` signature schemes (RFC 8446 §4.2.3) offered in
+    /// `signature_algorithms` and `CertificateRequest`, accepted from the peer,
+    /// and the only ones this side signs with. Default:
+    /// [`SUPPORTED_SIGNATURE_SCHEMES`]. Entries this crate cannot verify are
+    /// advertised but never usable.
+    pub signature_schemes: Option<Vec<u16>>,
     /// Optional NSS key log for this handshake; falls back to [`super::default_key_log`].
     pub key_log: Option<Arc<dyn super::KeyLog>>,
     /// Certificate compression (RFC 8879, Brotli). Default `true`.
@@ -367,6 +375,7 @@ impl std::fmt::Debug for HandshakeConfig {
             .field("server_name", &self.server_name)
             .field("enable_early_data", &self.enable_early_data)
             .field("cipher_suites", &self.cipher_suites)
+            .field("signature_schemes", &self.signature_schemes)
             .field("key_log", &self.key_log.as_ref().map(|_| "KeyLog"))
             .field("certificate_compression", &self.certificate_compression)
             .finish_non_exhaustive()
@@ -411,6 +420,7 @@ impl Default for HandshakeConfig {
             ech_client: None,
             ech_server: None,
             cipher_suites: None,
+            signature_schemes: None,
             key_log: None,
             certificate_compression: true,
             ticket_namespace: 0,
@@ -477,6 +487,9 @@ pub struct HandshakeEngine {
     /// Client role: the `certificate_request_context` from the server's
     /// `CertificateRequest`, if one was received this handshake — echoed
     /// back verbatim in the client's own `Certificate` response.
+    /// Client role: the `signature_algorithms` of the server's
+    /// `CertificateRequest`, when it sent one.
+    cert_request_schemes: Option<Vec<u16>>,
     client_cert_request_context: Option<Bytes>,
     /// Server role: whether the client's `Certificate` response (already
     /// processed) carried at least one entry — only then is a
@@ -587,6 +600,7 @@ impl HandshakeEngine {
             peer_certs: Vec::new(),
             verify_id: 0,
             verify_pending: false,
+            cert_request_schemes: None,
             client_cert_request_context: None,
             expect_client_certificate_verify: false,
             server_finished_hash: None,
@@ -711,8 +725,8 @@ impl HandshakeEngine {
                 HandshakeRole::Client,
                 HandshakeType::CertificateRequest,
                 State::ReadingServerFlight,
-                ParsedIncoming::CertificateRequest(ctx),
-            ) => self.on_certificate_request(ctx, wire, sink),
+                ParsedIncoming::CertificateRequest(ctx, schemes),
+            ) => self.on_certificate_request(ctx, schemes, wire, sink),
             (
                 HandshakeRole::Client,
                 HandshakeType::CertificateVerify,
@@ -872,6 +886,7 @@ impl HandshakeEngine {
             compress_certificate: self.config.certificate_compression,
             offer_tls12_fallback: self.config.offer_tls12_fallback,
             extra_key_shares: Vec::new(),
+            signature_schemes: self.config.signature_schemes.clone(),
         };
 
         if self.ech_client_is_real() {
@@ -1184,6 +1199,15 @@ impl HandshakeEngine {
             self.fail(sink, AlertDescription::UnexpectedMessage, "certificate verify without certificate");
             return false;
         };
+        // RFC 8446 §4.4.3: the scheme must be one we listed.
+        if !self.effective_signature_schemes().contains(&scheme) {
+            self.fail(
+                sink,
+                AlertDescription::IllegalParameter,
+                &format!("CertificateVerify scheme 0x{scheme:04x} was not offered in signature_algorithms"),
+            );
+            return false;
+        }
         let th = self.transcript.hash(self.hash);
         if !verify_certificate_verify(false, leaf.as_ref(), scheme, &sig, &th) {
             self.fail(sink, AlertDescription::DecryptError, "CertificateVerify signature invalid");
@@ -1196,6 +1220,7 @@ impl HandshakeEngine {
     fn on_certificate_request<S: TlsEventSink>(
         &mut self,
         ctx: Bytes,
+        schemes: Option<Vec<u16>>,
         encoded: Bytes,
         sink: &mut S,
     ) -> bool {
@@ -1205,6 +1230,7 @@ impl HandshakeEngine {
         }
         self.transcript.add_message(&encoded);
         self.client_cert_request_context = Some(ctx);
+        self.cert_request_schemes = schemes;
         true
     }
 
@@ -1284,7 +1310,19 @@ impl HandshakeEngine {
     /// §4.4.2 permits this), and `CertificateVerify` when a non-empty chain
     /// was actually sent.
     fn send_client_certificate_response<S: TlsEventSink>(&mut self, ctx: &Bytes, sink: &mut S) -> bool {
-        let creds = self.config.client_credentials.clone();
+        // RFC 8446 §4.4.2: a client with no certificate that satisfies the
+        // request (here: its key's scheme is not in both our configured list
+        // and the server's `signature_algorithms`) sends an empty Certificate.
+        let creds = self.config.client_credentials.clone().filter(|c| {
+            match certificate_verify_scheme(&c.signing_key_pkcs8) {
+                Some(scheme) => {
+                    self.effective_signature_schemes().contains(&scheme)
+                        && self.cert_request_schemes.as_deref().is_none_or(|offered| offered.contains(&scheme))
+                }
+                // Not a key this crate signs with: let signing report it.
+                None => true,
+            }
+        });
         let cert_refs: Vec<&[u8]> = creds
             .as_ref()
             .map(|c| c.cert_chain.iter().map(|c| c.as_ref()).collect())
@@ -1293,7 +1331,7 @@ impl HandshakeEngine {
         self.emit_outgoing(&cert_msg, sink);
         if let Some(creds) = creds.filter(|c| !c.cert_chain.is_empty()) {
             let cv_th = self.transcript.hash(self.hash);
-            let Some((scheme, sig)) = sign_certificate_verify(true, &creds.signing_key_pkcs8, &cv_th) else {
+            let Some((scheme, sig)) = sign_certificate_verify(true, &creds.signing_key_pkcs8, &cv_th, self.effective_signature_schemes()) else {
                 self.fail(sink, AlertDescription::InternalError, "unsupported or invalid client signing key");
                 return false;
             };
@@ -1726,7 +1764,7 @@ impl HandshakeEngine {
                 }
             }
             if request_client_cert {
-                let cr = build_certificate_request(&[]);
+                let cr = build_certificate_request(&[], self.effective_signature_schemes());
                 self.emit_outgoing(&cr, sink);
             }
             let cert_refs: Vec<&[u8]> = creds.cert_chain.iter().map(|c| c.as_ref()).collect();
@@ -1742,7 +1780,24 @@ impl HandshakeEngine {
             }
 
             let cv_th = self.transcript.hash(self.hash);
-            let Some((scheme, sig)) = sign_certificate_verify(false, &creds.signing_key_pkcs8, &cv_th) else {
+            // RFC 8446 §4.2.3: sign with a scheme both sides list. An absent
+            // client `signature_algorithms` applies no constraint.
+            let key_scheme = certificate_verify_scheme(&creds.signing_key_pkcs8);
+            if let Some(scheme) = key_scheme {
+                let ours = self.effective_signature_schemes().contains(&scheme);
+                let theirs = ch.signature_algorithms.as_deref().is_none_or(|offered| offered.contains(&scheme));
+                if !ours || !theirs {
+                    self.fail(
+                        sink,
+                        AlertDescription::HandshakeFailure,
+                        &format!("server key signs with scheme 0x{scheme:04x}, which is not in both sides' signature_algorithms"),
+                    );
+                    return false;
+                }
+            }
+            let Some((scheme, sig)) =
+                sign_certificate_verify(false, &creds.signing_key_pkcs8, &cv_th, self.effective_signature_schemes())
+            else {
                 self.fail(sink, AlertDescription::InternalError, "unsupported or invalid server signing key");
                 return false;
             };
@@ -1825,6 +1880,14 @@ impl HandshakeEngine {
             self.fail(sink, AlertDescription::UnexpectedMessage, "certificate verify without certificate");
             return false;
         };
+        if !self.effective_signature_schemes().contains(&scheme) {
+            self.fail(
+                sink,
+                AlertDescription::IllegalParameter,
+                &format!("client CertificateVerify scheme 0x{scheme:04x} was not offered in CertificateRequest"),
+            );
+            return false;
+        }
         let th = self.transcript.hash(self.hash);
         if !verify_certificate_verify(true, leaf.as_ref(), scheme, &sig, &th) {
             self.fail(sink, AlertDescription::DecryptError, "client CertificateVerify signature invalid");
@@ -1929,6 +1992,10 @@ impl HandshakeEngine {
 
     fn effective_cipher_suites(&self) -> &[u16] {
         self.config.cipher_suites.as_deref().unwrap_or(SUPPORTED_CIPHER_SUITES)
+    }
+
+    fn effective_signature_schemes(&self) -> &[u16] {
+        self.config.signature_schemes.as_deref().unwrap_or(SUPPORTED_SIGNATURE_SCHEMES)
     }
 
     fn resolved_key_log(&self) -> Option<Arc<dyn super::KeyLog>> {
@@ -3755,6 +3822,144 @@ mod tests {
         );
     }
 
+    fn ecdsa_p256_credentials() -> ServerCredentials {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        ServerCredentials {
+            cert_chain: vec![Bytes::copy_from_slice(cert.der())],
+            signing_key_pkcs8: Bytes::from(key_pair.serialize_der()),
+        }
+    }
+
+    fn with_schemes(mut cfg: HandshakeConfig, schemes: &[u16]) -> HandshakeConfig {
+        cfg.signature_schemes = Some(schemes.to_vec());
+        cfg
+    }
+
+    /// `signature_algorithms` extension data (u16-prefixed list) for `schemes`.
+    fn sig_algs_ext_data(schemes: &[u16]) -> Vec<u8> {
+        let mut data = ((2 * schemes.len()) as u16).to_be_bytes().to_vec();
+        for s in schemes {
+            data.extend_from_slice(&s.to_be_bytes());
+        }
+        data
+    }
+
+    /// Feed a server the client's first flight after rewriting its
+    /// `signature_algorithms` to `offered`; returns the server's sink.
+    fn server_reply_to_client_signature_algorithms(creds: ServerCredentials, offered: &[u16]) -> RecordingSink {
+        use super::super::handshake::messages::{ext, rewrite_client_hello_extension};
+        let mut client_sink = RecordingSink::default();
+        let mut client = HandshakeEngine::new(client_config_with_trust(&creds, KxPolicy::classical_only(), None));
+        client.start(&mut client_sink);
+        let mut server = HandshakeEngine::new(server_config_for(creds, KxPolicy::classical_only()));
+        let mut server_sink = RecordingSink::default();
+        for chunk in take_outbound(&mut client_sink) {
+            let chunk = Bytes::from(rewrite_client_hello_extension(&chunk, ext::SIGNATURE_ALGORITHMS, Some(&sig_algs_ext_data(offered))));
+            let mut input = chunk.as_ref();
+            server.feed_handshake_data(&mut input, &mut server_sink);
+        }
+        server_sink
+    }
+
+    /// RFC 8446 section 4.2.3: the CertificateVerify scheme must come from
+    /// the client's `signature_algorithms`. An Ed25519 server key against a
+    /// client that listed only ECDSA is refused before anything is signed.
+    #[test]
+    fn server_refuses_to_sign_with_a_scheme_the_client_did_not_offer() {
+        let sink = server_reply_to_client_signature_algorithms(test_server_credentials(), &[0x0403, 0x0503]);
+        let errs = protocol_errors(&sink);
+        assert_eq!(errs.len(), 1, "{:?}", sink.events);
+        assert!(errs[0].contains("signature_algorithms"), "{errs:?}");
+        assert!(sink.alerts.contains(&AlertDescription::HandshakeFailure), "{:?}", sink.alerts);
+        let sink = server_reply_to_client_signature_algorithms(test_server_credentials(), &[0x0807]);
+        assert!(protocol_errors(&sink).is_empty(), "control: Ed25519 offered: {:?}", sink.events);
+    }
+
+    /// The ClientHello a restricted client sends carries its list, and a
+    /// server restricted the same way completes with an ECDSA P-256 key.
+    #[test]
+    fn restricted_signature_schemes_complete_with_a_permitted_key() {
+        let creds = ecdsa_p256_credentials();
+        let schemes = [0x0403, 0x0503];
+        let sink = run_loopback(
+            with_schemes(client_config_with_trust(&creds, KxPolicy::classical_only(), None), &schemes),
+            with_schemes(server_config_for(creds, KxPolicy::classical_only()), &schemes),
+        );
+        assert!(sink.events.iter().any(|e| e == "handshake_complete"), "{:?}", sink.events);
+    }
+
+    /// A server whose own list excludes its key's scheme refuses to sign, even
+    /// for a client that would accept anything.
+    #[test]
+    fn server_restricted_away_from_its_key_scheme_fails_the_handshake() {
+        let creds = test_server_credentials(); // Ed25519
+        let mut client_sink = RecordingSink::default();
+        let mut client = HandshakeEngine::new(client_config_with_trust(&creds, KxPolicy::classical_only(), None));
+        client.start(&mut client_sink);
+        let mut server = HandshakeEngine::new(with_schemes(
+            server_config_for(creds, KxPolicy::classical_only()),
+            &[0x0403, 0x0503],
+        ));
+        let mut server_sink = RecordingSink::default();
+        relay_server(&mut server, take_outbound(&mut client_sink), &mut server_sink);
+        assert!(!server.is_complete());
+        assert!(server_sink.alerts.contains(&AlertDescription::HandshakeFailure), "{:?}", server_sink.events);
+    }
+
+    /// RFC 8446 section 4.4.3: a client that never offered the scheme a
+    /// server used in CertificateVerify rejects it. The ClientHello is
+    /// rewritten on the way to the server so the server signs with Ed25519.
+    #[test]
+    fn client_rejects_certificate_verify_scheme_outside_its_list() {
+        use super::super::handshake::messages::{ext, rewrite_client_hello_extension};
+        let creds = test_server_credentials(); // Ed25519
+        let mut sink = RecordingSink::default();
+        let mut client = HandshakeEngine::new(with_schemes(
+            client_config_with_trust(&creds, KxPolicy::classical_only(), None),
+            &[0x0403],
+        ));
+        let mut server = HandshakeEngine::new(server_config_for(creds, KxPolicy::classical_only()));
+        client.start(&mut sink);
+        let defaults = sig_algs_ext_data(super::super::handshake::verify::SUPPORTED_SIGNATURE_SCHEMES);
+        for chunk in take_outbound(&mut sink) {
+            let chunk = Bytes::from(rewrite_client_hello_extension(&chunk, ext::SIGNATURE_ALGORITHMS, Some(&defaults)));
+            let mut input = chunk.as_ref();
+            server.feed_handshake_data(&mut input, &mut sink);
+        }
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        assert!(!client.is_complete());
+        let errs = protocol_errors(&sink);
+        assert_eq!(errs.len(), 1, "{:?}", sink.events);
+        assert!(errs[0].contains("CertificateVerify") && errs[0].contains("not offered"), "{errs:?}");
+        assert!(sink.alerts.contains(&AlertDescription::IllegalParameter), "{:?}", sink.alerts);
+    }
+
+    /// RFC 8446 section 4.4.2: a client whose key's scheme is not in the
+    /// CertificateRequest's list sends an empty Certificate rather than
+    /// signing with an unlisted scheme. With `Request` the handshake still
+    /// completes (no client chain is verified); the control shows the same
+    /// client does present its chain to an unrestricted server.
+    #[test]
+    fn client_omits_its_certificate_when_the_request_excludes_its_key_scheme() {
+        let server_creds = ecdsa_p256_credentials();
+        let client_creds = test_server_credentials(); // Ed25519
+        let verifications = |server_cfg: HandshakeConfig| {
+            let client_cfg = client_config_with_cert(&server_creds, client_creds.clone());
+            let sink = run_loopback(client_cfg, server_cfg);
+            sink.events.iter().filter(|e| e.starts_with("verification_requested")).count()
+        };
+        let unrestricted =
+            server_config_requiring_client_cert(server_creds.clone(), &client_creds, ClientAuthPolicy::Request);
+        let restricted = with_schemes(
+            server_config_requiring_client_cert(server_creds.clone(), &client_creds, ClientAuthPolicy::Request),
+            &[0x0403],
+        );
+        assert_eq!(verifications(unrestricted), 2, "control: client chain and server chain are both verified");
+        assert_eq!(verifications(restricted), 1, "only the server chain: the client sent no certificate");
+    }
+
     /// SHA-384 is opt-in: a default server does not accept a client that
     /// offers only `TLS_AES_256_GCM_SHA384`.
     #[test]
@@ -4060,6 +4265,7 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            signature_schemes: None,
             extra_key_shares: Vec::new(),
         });
         let hello = with_psk_modes(&hello.encode(), modes);
@@ -4158,6 +4364,7 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            signature_schemes: None,
             extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();
@@ -4286,6 +4493,7 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            signature_schemes: None,
             extra_key_shares: Vec::new(),
         });
         server.feed_handshake_data(&mut hello.encode().as_ref(), &mut sink);
@@ -4445,6 +4653,7 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            signature_schemes: None,
             extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();
@@ -4489,6 +4698,7 @@ mod tests {
             legacy_version: 0x0303,
             compress_certificate: false,
             offer_tls12_fallback: false,
+            signature_schemes: None,
             extra_key_shares: Vec::new(),
         });
         let wire = hello.encode();
