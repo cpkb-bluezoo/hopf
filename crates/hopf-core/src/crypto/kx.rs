@@ -29,6 +29,12 @@ pub const P384_PUBLIC_LEN: usize = 97;
 pub enum NamedGroup {
     /// X25519 (RFC 8446 §4.2.7).
     X25519,
+    /// secp256r1 (NIST P-256) ECDHE (RFC 8446 §4.2.7, IANA 0x0017). The key
+    /// share is the bare uncompressed point (`0x04 || X || Y`).
+    SecP256r1,
+    /// secp384r1 (NIST P-384) ECDHE (RFC 8446 §4.2.7, IANA 0x0018). The key
+    /// share is the bare uncompressed point (`0x04 || X || Y`).
+    SecP384r1,
     /// Hybrid X25519 + ML-KEM-768 (RFC 10024, IANA 0x11ec). Concatenation
     /// order is PQ-first (ML-KEM share, then X25519 share) — an explicit,
     /// documented exception to the naming convention the other two hybrid
@@ -48,6 +54,8 @@ impl NamedGroup {
     pub fn code(self) -> u16 {
         match self {
             NamedGroup::X25519 => 0x001d,
+            NamedGroup::SecP256r1 => 0x0017,
+            NamedGroup::SecP384r1 => 0x0018,
             NamedGroup::X25519MLKEM768 => 0x11ec,
             NamedGroup::SecP256r1MLKEM768 => 0x11eb,
             NamedGroup::SecP384r1MLKEM1024 => 0x11ed,
@@ -58,6 +66,8 @@ impl NamedGroup {
     pub fn from_code(code: u16) -> Option<Self> {
         match code {
             0x001d => Some(NamedGroup::X25519),
+            0x0017 => Some(NamedGroup::SecP256r1),
+            0x0018 => Some(NamedGroup::SecP384r1),
             0x11ec => Some(NamedGroup::X25519MLKEM768),
             0x11eb => Some(NamedGroup::SecP256r1MLKEM768),
             0x11ed => Some(NamedGroup::SecP384r1MLKEM1024),
@@ -69,46 +79,57 @@ impl NamedGroup {
     /// combiner both put the ML-KEM component first. Only
     /// `X25519MLKEM768` does (RFC 10024's documented historical
     /// exception) — the other two hybrid groups are classical-first, and
-    /// plain `X25519` doesn't have an ML-KEM component at all (unused
-    /// here, `false` is an arbitrary don't-care).
+    /// the plain classical groups don't have an ML-KEM component at all
+    /// (unused here, `false` is an arbitrary don't-care).
     fn pq_first(self) -> bool {
         matches!(self, NamedGroup::X25519MLKEM768)
     }
 
-    /// Classical (non-PQ) component's public key length for a hybrid
-    /// group. Unused for plain `X25519`.
+    /// Classical (non-PQ) component's public key length: the whole key
+    /// share for a plain classical group, the non-ML-KEM half of a hybrid.
     fn classical_public_len(self) -> usize {
         match self {
             NamedGroup::X25519 | NamedGroup::X25519MLKEM768 => X25519_PUBLIC_LEN,
-            NamedGroup::SecP256r1MLKEM768 => P256_PUBLIC_LEN,
-            NamedGroup::SecP384r1MLKEM1024 => P384_PUBLIC_LEN,
+            NamedGroup::SecP256r1 | NamedGroup::SecP256r1MLKEM768 => P256_PUBLIC_LEN,
+            NamedGroup::SecP384r1 | NamedGroup::SecP384r1MLKEM1024 => P384_PUBLIC_LEN,
         }
     }
 
-    /// ML-KEM algorithm backing this hybrid group. Unused for plain `X25519`.
+    /// ML-KEM algorithm backing this hybrid group. Unused for the plain
+    /// classical groups.
     fn mlkem_algorithm(self) -> &'static kem::Algorithm<kem::AlgorithmId> {
         match self {
-            NamedGroup::X25519 | NamedGroup::X25519MLKEM768 | NamedGroup::SecP256r1MLKEM768 => &ML_KEM_768,
+            NamedGroup::X25519
+            | NamedGroup::SecP256r1
+            | NamedGroup::SecP384r1
+            | NamedGroup::X25519MLKEM768
+            | NamedGroup::SecP256r1MLKEM768 => &ML_KEM_768,
             NamedGroup::SecP384r1MLKEM1024 => &ML_KEM_1024,
         }
     }
 
     /// ML-KEM encapsulation key length for this hybrid group's ML-KEM
-    /// parameter set. Unused for plain `X25519`.
+    /// parameter set. Unused for the plain classical groups.
     fn mlkem_encap_len(self) -> usize {
         match self {
-            NamedGroup::X25519 | NamedGroup::X25519MLKEM768 | NamedGroup::SecP256r1MLKEM768 => MLKEM768_ENCAP_LEN,
+            NamedGroup::X25519
+            | NamedGroup::SecP256r1
+            | NamedGroup::SecP384r1
+            | NamedGroup::X25519MLKEM768
+            | NamedGroup::SecP256r1MLKEM768 => MLKEM768_ENCAP_LEN,
             NamedGroup::SecP384r1MLKEM1024 => MLKEM1024_ENCAP_LEN,
         }
     }
 
     /// ML-KEM ciphertext length for this hybrid group's ML-KEM parameter
-    /// set. Unused for plain `X25519`.
+    /// set. Unused for the plain classical groups.
     fn mlkem_ciphertext_len(self) -> usize {
         match self {
-            NamedGroup::X25519 | NamedGroup::X25519MLKEM768 | NamedGroup::SecP256r1MLKEM768 => {
-                MLKEM768_CIPHERTEXT_LEN
-            }
+            NamedGroup::X25519
+            | NamedGroup::SecP256r1
+            | NamedGroup::SecP384r1
+            | NamedGroup::X25519MLKEM768
+            | NamedGroup::SecP256r1MLKEM768 => MLKEM768_CIPHERTEXT_LEN,
             NamedGroup::SecP384r1MLKEM1024 => MLKEM1024_CIPHERTEXT_LEN,
         }
     }
@@ -116,7 +137,7 @@ impl NamedGroup {
     /// Expected client `KeyShareEntry` length for this group.
     pub fn client_share_len(self) -> usize {
         match self {
-            NamedGroup::X25519 => X25519_PUBLIC_LEN,
+            NamedGroup::X25519 | NamedGroup::SecP256r1 | NamedGroup::SecP384r1 => self.classical_public_len(),
             NamedGroup::X25519MLKEM768 | NamedGroup::SecP256r1MLKEM768 | NamedGroup::SecP384r1MLKEM1024 => {
                 self.classical_public_len() + self.mlkem_encap_len()
             }
@@ -126,7 +147,7 @@ impl NamedGroup {
     /// Expected server `KeyShareEntry` length for this group.
     pub fn server_share_len(self) -> usize {
         match self {
-            NamedGroup::X25519 => X25519_PUBLIC_LEN,
+            NamedGroup::X25519 | NamedGroup::SecP256r1 | NamedGroup::SecP384r1 => self.classical_public_len(),
             NamedGroup::X25519MLKEM768 | NamedGroup::SecP256r1MLKEM768 | NamedGroup::SecP384r1MLKEM1024 => {
                 self.classical_public_len() + self.mlkem_ciphertext_len()
             }
@@ -268,7 +289,9 @@ impl ClassicalKeyPair {
             NamedGroup::X25519MLKEM768 => EphemeralKeyPair::generate().map(ClassicalKeyPair::X25519),
             NamedGroup::SecP256r1MLKEM768 => EphemeralP256KeyPair::generate().map(ClassicalKeyPair::P256),
             NamedGroup::SecP384r1MLKEM1024 => EphemeralP384KeyPair::generate().map(ClassicalKeyPair::P384),
-            NamedGroup::X25519 => unreachable!("classical-only group has no hybrid ClassicalKeyPair"),
+            NamedGroup::X25519 | NamedGroup::SecP256r1 | NamedGroup::SecP384r1 => {
+                unreachable!("plain classical group has no hybrid ClassicalKeyPair")
+            }
         }
     }
 
@@ -395,6 +418,10 @@ pub fn server_agree_hybrid(group: NamedGroup, client_share: &[u8]) -> Result<(By
 pub enum LocalKeyShare {
     /// X25519 only.
     X25519(EphemeralKeyPair),
+    /// Plain secp256r1 ECDHE.
+    P256(EphemeralP256KeyPair),
+    /// Plain secp384r1 ECDHE.
+    P384(EphemeralP384KeyPair),
     /// One of the RFC 10024 hybrid groups.
     Hybrid(HybridKeyPair),
 }
@@ -404,6 +431,8 @@ impl LocalKeyShare {
     pub fn generate(group: NamedGroup) -> Result<Self, Unspecified> {
         match group {
             NamedGroup::X25519 => EphemeralKeyPair::generate().map(LocalKeyShare::X25519),
+            NamedGroup::SecP256r1 => EphemeralP256KeyPair::generate().map(LocalKeyShare::P256),
+            NamedGroup::SecP384r1 => EphemeralP384KeyPair::generate().map(LocalKeyShare::P384),
             NamedGroup::X25519MLKEM768 | NamedGroup::SecP256r1MLKEM768 | NamedGroup::SecP384r1MLKEM1024 => {
                 HybridKeyPair::generate(group).map(LocalKeyShare::Hybrid)
             }
@@ -414,6 +443,8 @@ impl LocalKeyShare {
     pub fn group(&self) -> NamedGroup {
         match self {
             LocalKeyShare::X25519(kp) => kp.group(),
+            LocalKeyShare::P256(_) => NamedGroup::SecP256r1,
+            LocalKeyShare::P384(_) => NamedGroup::SecP384r1,
             LocalKeyShare::Hybrid(h) => h.group,
         }
     }
@@ -422,6 +453,8 @@ impl LocalKeyShare {
     pub fn client_share_bytes(&self) -> Bytes {
         match self {
             LocalKeyShare::X25519(kp) => kp.public.clone(),
+            LocalKeyShare::P256(kp) => kp.public.clone(),
+            LocalKeyShare::P384(kp) => kp.public.clone(),
             LocalKeyShare::Hybrid(h) => h.client_share(),
         }
     }
@@ -430,6 +463,8 @@ impl LocalKeyShare {
     pub fn agree_client(self, group: NamedGroup, peer_share: &[u8]) -> Result<Bytes, Unspecified> {
         match (self, group) {
             (LocalKeyShare::X25519(kp), NamedGroup::X25519) => kp.agree(peer_share),
+            (LocalKeyShare::P256(kp), NamedGroup::SecP256r1) => kp.agree(peer_share),
+            (LocalKeyShare::P384(kp), NamedGroup::SecP384r1) => kp.agree(peer_share),
             (LocalKeyShare::Hybrid(h), _) if h.group == group => h.agree_client(peer_share),
             _ => Err(Unspecified),
         }
@@ -441,6 +476,18 @@ pub fn server_agree(group: NamedGroup, client_share: &[u8]) -> Result<(Bytes, By
     match group {
         NamedGroup::X25519 => {
             let server = EphemeralKeyPair::generate()?;
+            let pub_key = server.public.clone();
+            let shared = server.agree(client_share)?;
+            Ok((pub_key, shared))
+        }
+        NamedGroup::SecP256r1 => {
+            let server = EphemeralP256KeyPair::generate()?;
+            let pub_key = server.public.clone();
+            let shared = server.agree(client_share)?;
+            Ok((pub_key, shared))
+        }
+        NamedGroup::SecP384r1 => {
+            let server = EphemeralP384KeyPair::generate()?;
             let pub_key = server.public.clone();
             let shared = server.agree(client_share)?;
             Ok((pub_key, shared))
@@ -601,6 +648,57 @@ mod tests {
         assert_eq!(s_client, s_server);
         // P-384's 48-byte ECDH secret + ML-KEM-1024's 32-byte secret.
         assert_eq!(s_client.len(), 80);
+    }
+
+    /// Plain (non-hybrid) NIST groups carry the bare uncompressed point as
+    /// the key share, in both directions (RFC 8446 §4.2.8.2).
+    #[test]
+    fn secp256r1_plain_group_agree_roundtrip() {
+        let client = LocalKeyShare::generate(NamedGroup::SecP256r1).unwrap();
+        let share = client.client_share_bytes();
+        assert_eq!(share.len(), NamedGroup::SecP256r1.client_share_len());
+        assert_eq!(share.len(), P256_PUBLIC_LEN);
+        assert_eq!(share[0], 0x04);
+        let (server_share, s_server) = server_agree(NamedGroup::SecP256r1, share.as_ref()).unwrap();
+        assert_eq!(server_share.len(), NamedGroup::SecP256r1.server_share_len());
+        let s_client = client.agree_client(NamedGroup::SecP256r1, server_share.as_ref()).unwrap();
+        assert_eq!(s_client, s_server);
+        assert_eq!(s_client.len(), 32);
+    }
+
+    #[test]
+    fn secp384r1_plain_group_agree_roundtrip() {
+        let client = LocalKeyShare::generate(NamedGroup::SecP384r1).unwrap();
+        let share = client.client_share_bytes();
+        assert_eq!(share.len(), NamedGroup::SecP384r1.client_share_len());
+        assert_eq!(share.len(), P384_PUBLIC_LEN);
+        assert_eq!(share[0], 0x04);
+        let (server_share, s_server) = server_agree(NamedGroup::SecP384r1, share.as_ref()).unwrap();
+        assert_eq!(server_share.len(), NamedGroup::SecP384r1.server_share_len());
+        let s_client = client.agree_client(NamedGroup::SecP384r1, server_share.as_ref()).unwrap();
+        assert_eq!(s_client, s_server);
+        assert_eq!(s_client.len(), 48);
+    }
+
+    #[test]
+    fn nist_group_code_points_round_trip() {
+        assert_eq!(NamedGroup::SecP256r1.code(), 0x0017);
+        assert_eq!(NamedGroup::SecP384r1.code(), 0x0018);
+        assert_eq!(NamedGroup::from_code(0x0017), Some(NamedGroup::SecP256r1));
+        assert_eq!(NamedGroup::from_code(0x0018), Some(NamedGroup::SecP384r1));
+    }
+
+    #[test]
+    fn plain_nist_group_rejects_wrong_length_or_mismatched_share() {
+        // A P-256 point is not a valid P-384 share, and vice versa.
+        let p256 = LocalKeyShare::generate(NamedGroup::SecP256r1).unwrap().client_share_bytes();
+        assert!(server_agree(NamedGroup::SecP384r1, p256.as_ref()).is_err());
+        let p384 = LocalKeyShare::generate(NamedGroup::SecP384r1).unwrap().client_share_bytes();
+        assert!(server_agree(NamedGroup::SecP256r1, p384.as_ref()).is_err());
+        // And a client key share is not accepted for a different group.
+        let client = LocalKeyShare::generate(NamedGroup::SecP256r1).unwrap();
+        let (server_share, _) = server_agree(NamedGroup::SecP256r1, client.client_share_bytes().as_ref()).unwrap();
+        assert!(client.agree_client(NamedGroup::SecP384r1, server_share.as_ref()).is_err());
     }
 
     /// A client offering `X25519MLKEM768` must not be accepted as having

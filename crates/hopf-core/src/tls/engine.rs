@@ -3527,6 +3527,61 @@ mod tests {
         assert!(sink.peer_tp.is_some());
     }
 
+    /// Both ends restricted to the classical NIST groups: the first
+    /// preference, secp256r1, is negotiated with no HelloRetryRequest.
+    #[test]
+    fn nist_only_policy_negotiates_secp256r1() {
+        let creds = test_server_credentials();
+        let sink = run_loopback(
+            client_config_with_trust(&creds, KxPolicy::nist_only(), None),
+            server_config_for(creds, KxPolicy::nist_only()),
+        );
+        assert_eq!(sink.negotiated_group, Some(NamedGroup::SecP256r1.code()));
+    }
+
+    /// A server that only takes secp384r1 forces a HelloRetryRequest round
+    /// trip against a client whose first share is secp256r1.
+    #[test]
+    fn nist_client_retries_onto_secp384r1_server() {
+        let creds = test_server_credentials();
+        let mut client = HandshakeEngine::new(client_config_with_trust(&creds, KxPolicy::nist_only(), None));
+        let mut server = HandshakeEngine::new(server_config_for(creds, KxPolicy::new(vec![NamedGroup::SecP384r1])));
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        // The HelloRetryRequest costs one extra flight over `run_loopback`'s fixed three.
+        for _ in 0..6 {
+            relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+            relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        }
+        assert!(client.is_complete() && server.is_complete(), "{:?}", sink.events);
+        assert_eq!(sink.negotiated_group, Some(NamedGroup::SecP384r1.code()));
+        assert_eq!(
+            sink.events.iter().filter(|e| e.starts_with("negotiated_group=")).count(),
+            2,
+            "one per side, both after the retry: {:?}",
+            sink.events
+        );
+    }
+
+    /// A NIST-only server rejects a client that offers only X25519 and the
+    /// hybrid groups, with no mutual group.
+    #[test]
+    fn nist_only_server_rejects_x25519_only_client() {
+        let creds = test_server_credentials();
+        let mut client_sink = RecordingSink::default();
+        let mut client = HandshakeEngine::new(client_config_with_trust(&creds, KxPolicy::classical_only(), None));
+        client.start(&mut client_sink);
+        let mut server = HandshakeEngine::new(server_config_for(creds, KxPolicy::nist_only()));
+        let mut server_sink = RecordingSink::default();
+        relay_server(&mut server, take_outbound(&mut client_sink), &mut server_sink);
+        assert!(!server.is_complete());
+        assert!(
+            server_sink.events.iter().any(|e| format!("{e:?}").contains("no mutually supported key exchange group")),
+            "{:?}",
+            server_sink.events
+        );
+    }
+
     #[test]
     fn client_event_sequence_bad_server_hello() {
         let mut engine = HandshakeEngine::new(HandshakeConfig {

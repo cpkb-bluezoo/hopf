@@ -343,4 +343,15 @@ mod tests {
         assert_eq!(c, Some(NamedGroup::X25519.code()));
         assert_eq!(s, Some(NamedGroup::X25519.code()));
     }
+
+    #[test]
+    fn quic_handshake_negotiates_nist_group_when_both_restrict_to_nist() {
+        use crate::config::QuicTlsOptions;
+        use hopf_core::crypto::kx::NamedGroup;
+        use hopf_core::crypto::kx_policy::KxPolicy;
+        let tls = QuicTlsOptions::new().with_kx_policy(KxPolicy::nist_only());
+        let (c, s) = handshake_groups(tls.clone(), tls);
+        assert_eq!(c, Some(NamedGroup::SecP256r1.code()));
+        assert_eq!(s, Some(NamedGroup::SecP256r1.code()));
+    }
 }

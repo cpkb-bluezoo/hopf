@@ -34,6 +34,18 @@ impl KxPolicy {
         }
     }
 
+    /// Caller-chosen groups, most preferred first.
+    pub fn new(groups: Vec<NamedGroup>) -> Self {
+        Self { groups }
+    }
+
+    /// The classical NIST groups only: secp256r1, then secp384r1. No
+    /// X25519 and no hybrid groups; the key-exchange half of an approved
+    /// (FIPS) profile.
+    pub fn nist_only() -> Self {
+        Self::new(vec![NamedGroup::SecP256r1, NamedGroup::SecP384r1])
+    }
+
     /// Classical X25519 only (interop / tests).
     pub fn classical_only() -> Self {
         Self {
@@ -99,5 +111,33 @@ mod tests {
         let policy = KxPolicy::default();
         let peer = [NamedGroup::SecP384r1MLKEM1024.code(), NamedGroup::SecP256r1MLKEM768.code()];
         assert_eq!(policy.select_mutual(&peer), Some(NamedGroup::SecP256r1MLKEM768));
+    }
+
+    #[test]
+    fn nist_only_offers_just_the_two_classical_nist_groups() {
+        let policy = KxPolicy::nist_only();
+        assert_eq!(policy.groups(), &[NamedGroup::SecP256r1, NamedGroup::SecP384r1]);
+        assert_eq!(policy.preferred(), NamedGroup::SecP256r1);
+    }
+
+    #[test]
+    fn nist_only_never_selects_x25519_or_hybrids() {
+        let policy = KxPolicy::nist_only();
+        let peer = [
+            NamedGroup::X25519MLKEM768.code(),
+            NamedGroup::SecP256r1MLKEM768.code(),
+            NamedGroup::X25519.code(),
+        ];
+        assert_eq!(policy.select_mutual(&peer), None);
+        let peer = [NamedGroup::X25519.code(), NamedGroup::SecP384r1.code()];
+        assert_eq!(policy.select_mutual(&peer), Some(NamedGroup::SecP384r1));
+    }
+
+    #[test]
+    fn new_keeps_the_given_order_and_defaults_are_unchanged() {
+        let policy = KxPolicy::new(vec![NamedGroup::SecP384r1]);
+        assert_eq!(policy.groups(), &[NamedGroup::SecP384r1]);
+        assert_eq!(KxPolicy::default().groups().len(), 4);
+        assert!(!KxPolicy::default().groups().contains(&NamedGroup::SecP256r1));
     }
 }
