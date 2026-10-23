@@ -9,7 +9,7 @@
 
 use bytes::Bytes;
 
-use crate::crypto::aead::{AeadError, Aes128GcmKey, ChaCha20Poly1305Key};
+use crate::crypto::aead::{AeadError, Aes128GcmKey, AesGcmKey, ChaCha20Poly1305Key};
 use crate::crypto::hkdf::expand_label;
 use crate::security::SecurityInfo;
 
@@ -94,6 +94,7 @@ enum Epoch {
 /// between suites, not the framing.
 enum AeadKeyKind {
     Aes128Gcm(Aes128GcmKey),
+    Aes256Gcm(AesGcmKey),
     ChaCha20Poly1305(ChaCha20Poly1305Key),
 }
 
@@ -113,6 +114,9 @@ impl DirectionalKeys {
         let key = match aead {
             Tls13Aead::Aes128GcmSha256 => {
                 AeadKeyKind::Aes128Gcm(Aes128GcmKey::new(key_bytes.as_ref()).expect("16-byte AES-128 key"))
+            }
+            Tls13Aead::Aes256GcmSha384 => {
+                AeadKeyKind::Aes256Gcm(AesGcmKey::new(key_bytes.as_ref()).expect("32-byte AES-256 key"))
             }
             Tls13Aead::ChaCha20Poly1305Sha256 => AeadKeyKind::ChaCha20Poly1305(
                 ChaCha20Poly1305Key::new(key_bytes.as_ref()).expect("32-byte ChaCha20-Poly1305 key"),
@@ -137,12 +141,14 @@ impl DirectionalKeys {
     /// Whether this direction has protected enough records under its
     /// current AES-GCM key to warrant retiring it (RFC 8446 §5.5).
     fn over_confidentiality_limit(&self) -> bool {
-        matches!(self.key, AeadKeyKind::Aes128Gcm(_)) && self.seq >= AES_GCM_CONFIDENTIALITY_LIMIT
+        matches!(self.key, AeadKeyKind::Aes128Gcm(_) | AeadKeyKind::Aes256Gcm(_))
+            && self.seq >= AES_GCM_CONFIDENTIALITY_LIMIT
     }
 
     fn seal_in_place_append_tag(&self, nonce: [u8; 12], aad: &[u8], plaintext: &mut Vec<u8>) -> Result<(), AeadError> {
         match &self.key {
             AeadKeyKind::Aes128Gcm(k) => k.seal_in_place_append_tag(nonce, aad, plaintext),
+            AeadKeyKind::Aes256Gcm(k) => k.seal_in_place_append_tag(nonce, aad, plaintext),
             AeadKeyKind::ChaCha20Poly1305(k) => k.seal_in_place_append_tag(nonce, aad, plaintext),
         }
     }
@@ -150,6 +156,7 @@ impl DirectionalKeys {
     fn open_in_place(&self, nonce: [u8; 12], aad: &[u8], ciphertext: &mut [u8]) -> Result<usize, AeadError> {
         match &self.key {
             AeadKeyKind::Aes128Gcm(k) => k.open_in_place(nonce, aad, ciphertext),
+            AeadKeyKind::Aes256Gcm(k) => k.open_in_place(nonce, aad, ciphertext),
             AeadKeyKind::ChaCha20Poly1305(k) => k.open_in_place(nonce, aad, ciphertext),
         }
     }
@@ -1049,6 +1056,46 @@ mod tests {
         assert!(sink_s.events.iter().any(|e| e == "handshake_complete"));
         let info = sink_c.info.expect("client security info");
         assert_eq!(info.alpn(), Some(&b"test"[..]));
+    }
+
+    fn aes_256_configs() -> (HandshakeConfig, HandshakeConfig) {
+        let (mut c, mut s) = configs();
+        c.cipher_suites = Some(vec![super::super::engine::AES_256_GCM_SHA384]);
+        s.cipher_suites = Some(vec![super::super::engine::AES_256_GCM_SHA384]);
+        (c, s)
+    }
+
+    /// TLS_AES_256_GCM_SHA384 over the TCP record layer: handshake records
+    /// and application data both ways under 32-byte AES-256-GCM keys.
+    #[test]
+    fn aes_256_gcm_sha384_loopback_carries_application_data_both_ways() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback_with(aes_256_configs());
+        let info = sink_c.info.clone().expect("client security info");
+        assert_eq!(info.cipher_suite(), Some("TLS_AES_256_GCM_SHA384"));
+        client.send_application_data(b"from the client", &mut sink_c);
+        server.send_application_data(b"from the server", &mut sink_s);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        assert_eq!(all_app_data(&sink_s), b"from the client");
+        assert_eq!(all_app_data(&sink_c), b"from the server");
+    }
+
+    /// RFC 8446 section 5.5 limits AES-256-GCM exactly as AES-128-GCM, so an
+    /// AES-256 write key must also rotate itself when it nears the limit.
+    #[test]
+    fn aes_256_gcm_write_key_auto_rotates_at_confidentiality_limit() {
+        let (mut sink_c, mut sink_s, mut client, mut server) = run_loopback_with(aes_256_configs());
+        client.state.write.as_mut().unwrap().seq = AES_GCM_CONFIDENTIALITY_LIMIT - 1;
+        server.state.read.as_mut().unwrap().seq = AES_GCM_CONFIDENTIALITY_LIMIT - 1;
+        client.send_application_data(b"the record that crosses the limit", &mut sink_c);
+        assert_eq!(
+            client.state.write.as_ref().unwrap().seq,
+            0,
+            "an AES-256-GCM write key must rotate at the limit too"
+        );
+        let wire = std::mem::take(&mut sink_c.outbound);
+        server.feed_ciphertext(&mut wire.as_slice(), &mut sink_s);
+        assert_eq!(sink_s.app_data, vec![b"the record that crosses the limit".to_vec()], "{:?}", sink_s.events);
     }
 
     #[test]

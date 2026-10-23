@@ -1183,6 +1183,28 @@ mod tests {
         assert_eq!(info.protocol(), Some("DTLSv1.3"));
     }
 
+    /// TLS_AES_256_GCM_SHA384 over DTLS 1.3: AES-256-GCM record protection and
+    /// AES-256 record-number encryption, keyed from a SHA-384 schedule under
+    /// the `dtls13` label prefix.
+    #[test]
+    fn aes_256_gcm_sha384_loopback_handshake_completes() {
+        let (mut client_cfg, mut server_cfg) = configs();
+        client_cfg.cipher_suites = Some(vec![crate::tls::AES_256_GCM_SHA384]);
+        server_cfg.cipher_suites = Some(vec![crate::tls::AES_256_GCM_SHA384]);
+        let mut client = DtlsRecordEngine::new(client_cfg);
+        let mut server = DtlsRecordEngine::new(server_cfg);
+        let mut sink_c = RecordingSink::default();
+        let mut sink_s = RecordingSink::default();
+        client.start(&mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        relay(&mut sink_s, &mut client, &mut sink_c);
+        relay(&mut sink_c, &mut server, &mut sink_s);
+        assert!(client.is_complete(), "client: {:?}", sink_c.events);
+        assert!(server.is_complete(), "server: {:?}", sink_s.events);
+        let info = sink_c.info.expect("client security info");
+        assert_eq!(info.cipher_suite(), Some("TLS_AES_256_GCM_SHA384"));
+    }
+
     /// RFC 9147 §7: once we've completed the handshake by processing the
     /// peer's Finished, and have nothing else queued to send, we must
     /// send an explicit ACK for it — otherwise a peer still waiting to

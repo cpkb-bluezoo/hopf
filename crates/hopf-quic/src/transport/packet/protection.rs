@@ -5,8 +5,8 @@
 //! §5.3/§5.4.4) for Handshake/1-RTT/0-RTT, following whichever AEAD the TLS
 //! layer negotiated ([`hopf_core::tls::Tls13Aead`]).
 
-use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, CHACHA20_POLY1305};
-use aws_lc_rs::aead::quic::{HeaderProtectionKey, AES_128, CHACHA20};
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, AES_256_GCM, CHACHA20_POLY1305};
+use aws_lc_rs::aead::quic::{HeaderProtectionKey, AES_128, AES_256, CHACHA20};
 use hopf_core::crypto::{extract, quic_expand_label_with_prefix, Tls13Hash};
 use hopf_core::tls::TrafficSecret;
 use hopf_core::tls::Tls13Aead;
@@ -47,6 +47,7 @@ impl PacketKeys {
         let (aead_alg, hp_alg): (&'static aws_lc_rs::aead::Algorithm, &'static aws_lc_rs::aead::quic::Algorithm) =
             match aead {
                 Tls13Aead::Aes128GcmSha256 => (&AES_128_GCM, &AES_128),
+                Tls13Aead::Aes256GcmSha384 => (&AES_256_GCM, &AES_256),
                 Tls13Aead::ChaCha20Poly1305Sha256 => (&CHACHA20_POLY1305, &CHACHA20),
             };
         Self {
@@ -355,5 +356,37 @@ mod tests {
         keys.protect_header(pn_offset, &mut packet, false);
         assert_eq!(packet[0] & 0x03, original[0] & 0x03);
         assert_eq!(&packet[pn_offset..pn_offset + 2], &original[pn_offset..pn_offset + 2]);
+    }
+
+    /// AES-256-GCM packet protection under a SHA-384 traffic secret (RFC 9001
+    /// section 5.1 takes the HKDF hash from the cipher suite). Key and header
+    /// protection key are 32 bytes, the IV 12; encrypt/decrypt and header
+    /// protection round trip, and the same secret under the SHA-256 suites
+    /// derives different keys.
+    #[test]
+    fn aes_256_gcm_sha384_packet_protection_round_trips() {
+        let secret = [0x5au8; 48];
+        let keys = PacketKeys::from_secret(QuicVersion::V1, Tls13Aead::Aes256GcmSha384, &secret);
+        let header = hex("c0000000010001");
+        let mut payload = b"aes-256-gcm payload".to_vec();
+        keys.encrypt(7, &header, &mut payload);
+        assert_eq!(payload.len(), b"aes-256-gcm payload".len() + 16);
+        let mut opened = payload.clone();
+        let plain_len = keys.decrypt(7, &header, &mut opened).expect("decrypts under the same keys");
+        assert_eq!(&opened[..plain_len], b"aes-256-gcm payload");
+        // Header protection with the AES-256 header-protection key round trips.
+        let mut packet = vec![0xc3u8, 0, 0, 0, 1, 0, 0];
+        packet.extend_from_slice(&[0u8; 4]);
+        packet.extend_from_slice(&payload);
+        let original = packet.clone();
+        keys.protect_header(7, &mut packet, true);
+        assert_ne!(packet, original, "header protection changes the first byte and packet number");
+        keys.protect_header(7, &mut packet, false);
+        assert_eq!(packet, original);
+        // Not interchangeable with a SHA-256 / AES-128 derivation of the same secret.
+        let other = PacketKeys::from_secret(QuicVersion::V1, Tls13Aead::Aes128GcmSha256, &secret);
+        assert_ne!(keys.iv, other.iv);
+        let mut wrong = payload.clone();
+        assert!(other.decrypt(7, &header, &mut wrong).is_err());
     }
 }

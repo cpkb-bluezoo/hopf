@@ -354,4 +354,49 @@ mod tests {
         assert_eq!(c, Some(NamedGroup::SecP256r1.code()));
         assert_eq!(s, Some(NamedGroup::SecP256r1.code()));
     }
+
+    /// A QUIC-mode handshake restricted to TLS_AES_256_GCM_SHA384 completes
+    /// on both sides and reports that suite for packet protection.
+    #[test]
+    fn quic_handshake_negotiates_aes_256_gcm_sha384() {
+        use crate::config::{client_config_for_pem_bytes_with, server_config_self_signed_with, QuicTlsOptions};
+        use hopf_core::tls::{Tls13Aead, AES_256_GCM_SHA384};
+        let alpn: &[&[u8]] = &[b"hq-interop"];
+        let (server_cfg, pem) =
+            server_config_self_signed_with(&["localhost"], alpn, QuicTlsOptions::new()).unwrap();
+        let client_cfg = client_config_for_pem_bytes_with(&pem, alpn, QuicTlsOptions::new()).unwrap();
+        let tp = TransportParameters::default();
+        let mut chs = client_cfg.transport().handshake;
+        chs.server_name = Some("localhost".into());
+        chs.cipher_suites = Some(vec![AES_256_GCM_SHA384]);
+        let mut shs = server_cfg.transport().handshake;
+        shs.cipher_suites = Some(vec![AES_256_GCM_SHA384]);
+        let (mut client, ev) = TlsBridge::start_client(chs, &tp);
+        let mut server = TlsBridge::start_server(shs, &tp);
+
+        let (mut client_aead, mut server_aead) = (ev.aead, None);
+        let mut to_server: Vec<u8> = ev.outbound.iter().flat_map(|o| o.data.to_vec()).collect();
+        for _ in 0..8 {
+            let mut to_client = Vec::new();
+            if !to_server.is_empty() {
+                let ev = server.feed_crypto(SpaceId::Initial, &to_server);
+                assert!(ev.failed.is_none(), "server: {:?}", ev.failed);
+                server_aead = server_aead.or(ev.aead);
+                to_client.extend(ev.outbound.iter().flat_map(|o| o.data.to_vec()));
+            }
+            to_server = Vec::new();
+            if !to_client.is_empty() {
+                let ev = client.feed_crypto(SpaceId::Initial, &to_client);
+                assert!(ev.failed.is_none(), "client: {:?}", ev.failed);
+                client_aead = client_aead.or(ev.aead);
+                to_server.extend(ev.outbound.iter().flat_map(|o| o.data.to_vec()));
+            }
+            if client.is_complete() && server.is_complete() {
+                break;
+            }
+        }
+        assert!(client.is_complete() && server.is_complete(), "handshake incomplete");
+        assert_eq!(client_aead, Some(Tls13Aead::Aes256GcmSha384));
+        assert_eq!(server_aead, Some(Tls13Aead::Aes256GcmSha384));
+    }
 }

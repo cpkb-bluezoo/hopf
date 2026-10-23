@@ -648,7 +648,7 @@ impl MessageCollector {
                 Some(ParsedIncoming::CertificateVerify(c.scheme, c.signature))
             }
             (HandshakeType::Finished, Self::Finished(c)) => {
-                if c.failed || c.verify_data.len() != 32 {
+                if c.failed || !matches!(c.verify_data.len(), 32 | 48) {
                     return None;
                 }
                 Some(ParsedIncoming::Finished(c.verify_data))

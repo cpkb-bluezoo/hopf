@@ -89,14 +89,19 @@ impl HandshakeMode {
 
 /// `TLS_AES_128_GCM_SHA256` (RFC 8446 §B.4) — MUST implement per RFC 8446 §9.1.
 pub const AES_128_GCM_SHA256: u16 = 0x1301;
+/// `TLS_AES_256_GCM_SHA384` (RFC 8446 §B.4) — hashed with SHA-384. Opt-in via
+/// [`HandshakeConfig::cipher_suites`]; not in [`SUPPORTED_CIPHER_SUITES`], so
+/// the default offer is unchanged.
+pub const AES_256_GCM_SHA384: u16 = 0x1302;
 /// `TLS_CHACHA20_POLY1305_SHA256` (RFC 8446 §B.4) — SHOULD implement per RFC 8446 §9.1.
 pub const CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
-/// Cipher suites this engine offers/accepts, in preference order. Both use
-/// SHA-256 as the handshake/key-schedule hash (RFC 8446 §B.4), so
+/// Cipher suites this engine offers/accepts by default, in preference order.
+/// Both use SHA-256 as the handshake/key-schedule hash (RFC 8446 §B.4), so
 /// negotiating between them only changes the record/packet-protection AEAD,
-/// never the transcript hash. No CBC (permanently excluded) and no
-/// AES-256-GCM (out of scope for now).
+/// never the transcript hash. No CBC (permanently excluded).
+/// [`AES_256_GCM_SHA384`] is supported but only used when a config lists it
+/// in [`HandshakeConfig::cipher_suites`].
 pub const SUPPORTED_CIPHER_SUITES: &[u16] = &[AES_128_GCM_SHA256, CHACHA20_POLY1305_SHA256];
 
 /// The hash of every resumption PSK, binder and 0-RTT secret. Tickets store
@@ -114,6 +119,8 @@ const PSK_HASH: Tls13Hash = Tls13Hash::Sha256;
 pub enum Tls13Aead {
     /// `TLS_AES_128_GCM_SHA256`.
     Aes128GcmSha256,
+    /// `TLS_AES_256_GCM_SHA384`.
+    Aes256GcmSha384,
     /// `TLS_CHACHA20_POLY1305_SHA256`.
     ChaCha20Poly1305Sha256,
 }
@@ -123,7 +130,7 @@ impl Tls13Aead {
     pub fn key_len(self) -> usize {
         match self {
             Tls13Aead::Aes128GcmSha256 => 16,
-            Tls13Aead::ChaCha20Poly1305Sha256 => 32,
+            Tls13Aead::Aes256GcmSha384 | Tls13Aead::ChaCha20Poly1305Sha256 => 32,
         }
     }
 
@@ -132,6 +139,7 @@ impl Tls13Aead {
     pub fn hash(self) -> Tls13Hash {
         match self {
             Tls13Aead::Aes128GcmSha256 | Tls13Aead::ChaCha20Poly1305Sha256 => Tls13Hash::Sha256,
+            Tls13Aead::Aes256GcmSha384 => Tls13Hash::Sha384,
         }
     }
 
@@ -139,6 +147,7 @@ impl Tls13Aead {
     pub fn from_suite(suite: u16) -> Option<Self> {
         match suite {
             AES_128_GCM_SHA256 => Some(Tls13Aead::Aes128GcmSha256),
+            AES_256_GCM_SHA384 => Some(Tls13Aead::Aes256GcmSha384),
             CHACHA20_POLY1305_SHA256 => Some(Tls13Aead::ChaCha20Poly1305Sha256),
             _ => None,
         }
@@ -148,6 +157,7 @@ impl Tls13Aead {
     pub fn suite(self) -> u16 {
         match self {
             Tls13Aead::Aes128GcmSha256 => AES_128_GCM_SHA256,
+            Tls13Aead::Aes256GcmSha384 => AES_256_GCM_SHA384,
             Tls13Aead::ChaCha20Poly1305Sha256 => CHACHA20_POLY1305_SHA256,
         }
     }
@@ -156,6 +166,7 @@ impl Tls13Aead {
     pub fn name(self) -> &'static str {
         match self {
             Tls13Aead::Aes128GcmSha256 => "TLS_AES_128_GCM_SHA256",
+            Tls13Aead::Aes256GcmSha384 => "TLS_AES_256_GCM_SHA384",
             Tls13Aead::ChaCha20Poly1305Sha256 => "TLS_CHACHA20_POLY1305_SHA256",
         }
     }
@@ -413,9 +424,11 @@ pub struct HandshakeEngine {
     config: HandshakeConfig,
     state: State,
     transcript: Transcript,
-    /// The negotiated suite's hash (SHA-256 until a suite is selected, which
-    /// is also what every suite supported so far uses).
+    /// The negotiated suite's hash (SHA-256 until a suite is selected).
     hash: Tls13Hash,
+    /// Client role: the suite a `HelloRetryRequest` named, which the
+    /// followup `ServerHello` must repeat.
+    retry_cipher_suite: Option<u16>,
     parser: HandshakeParser,
     local_key_share: Option<LocalKeyShare>,
     negotiated_group: Option<NamedGroup>,
@@ -550,6 +563,7 @@ impl HandshakeEngine {
             state: State::Initial,
             transcript: Transcript::new(),
             hash: Tls13Hash::Sha256,
+            retry_cipher_suite: None,
             parser: HandshakeParser::new().with_certificate_compression(accept_compressed_certificate),
             local_key_share: None,
             negotiated_group: None,
@@ -811,7 +825,11 @@ impl HandshakeEngine {
             .collect();
 
         // A real ECH offer does not resume (no GREASE PSK in the outer hello).
-        let ticket = if self.ech_client_is_real() {
+        //
+        // 0-RTT data is protected with the first default suite (the server
+        // cannot have picked a suite before the data is sent), so a client
+        // whose configuration excludes it must not resume at all.
+        let ticket = if self.ech_client_is_real() || !self.effective_cipher_suites().contains(&SUPPORTED_CIPHER_SUITES[0]) {
             None
         } else {
             self.ticket_cache_key()
@@ -919,13 +937,30 @@ impl HandshakeEngine {
         if sh.is_hello_retry_request {
             return self.on_hello_retry_request(sh, encoded, sink);
         }
-        if !self.ech_client_on_server_hello(&encoded, sink) {
-            return false;
-        }
         let Some(aead) = Tls13Aead::from_suite(sh.cipher_suite) else {
             self.fail(sink, AlertDescription::HandshakeFailure, "unsupported cipher suite");
             return false;
         };
+        // RFC 8446 §4.1.3: the server must pick a suite the ClientHello
+        // offered, and (§4.1.4) the same one it named in a HelloRetryRequest.
+        if !self.effective_cipher_suites().contains(&sh.cipher_suite)
+            || self.retry_cipher_suite.is_some_and(|s| s != sh.cipher_suite)
+        {
+            self.fail(sink, AlertDescription::IllegalParameter, "server selected a cipher suite we did not offer");
+            return false;
+        }
+        // The hash is needed by the ECH acceptance check below, before any
+        // key is derived.
+        self.hash = aead.hash();
+        if !self.ech_client_on_server_hello(&encoded, sink) {
+            return false;
+        }
+        // RFC 8446 §4.2.11: a PSK is bound to a hash, and every PSK here is
+        // SHA-256, so a SHA-384 suite cannot have selected one.
+        if sh.psk_selected_identity.is_some() && aead.hash() != PSK_HASH {
+            self.fail(sink, AlertDescription::IllegalParameter, "PSK selected with a cipher suite of a different hash");
+            return false;
+        }
         self.negotiated_aead = Some(aead);
         let Some(group) = NamedGroup::from_code(sh.selected_group) else {
             self.fail(sink, AlertDescription::HandshakeFailure, "unsupported key exchange group");
@@ -987,6 +1022,18 @@ impl HandshakeEngine {
             self.fail(sink, AlertDescription::UnexpectedMessage, "server sent a second HelloRetryRequest");
             return false;
         }
+        let Some(hrr_aead) = Tls13Aead::from_suite(sh.cipher_suite) else {
+            self.fail(sink, AlertDescription::HandshakeFailure, "unsupported cipher suite");
+            return false;
+        };
+        if !self.effective_cipher_suites().contains(&sh.cipher_suite) {
+            self.fail(sink, AlertDescription::IllegalParameter, "HelloRetryRequest selected a cipher suite we did not offer");
+            return false;
+        }
+        // From here the transcript is hashed with the suite's hash (RFC 8446
+        // §4.4.1), including the message_hash stand-in for ClientHello1.
+        self.hash = hrr_aead.hash();
+        self.retry_cipher_suite = Some(sh.cipher_suite);
         if !self.ech_client_on_hello_retry_request(&sh, &encoded, sink) {
             return false;
         }
@@ -1222,7 +1269,12 @@ impl HandshakeEngine {
         self.app_traffic_transcript_hash = Some(th_for_app_traffic);
         self.emit_outgoing(&fin, sink);
         let res_hash = self.transcript.hash(self.hash);
-        self.resumption_master = Some(derive_resumption_master_secret(self.hash, psk.as_ref(), &shared, &res_hash, dtls));
+        // Tickets are SHA-256 only, so other hashes keep no resumption secret
+        // (the server then mints no ticket and a client ignores any it gets).
+        if self.hash == PSK_HASH {
+            self.resumption_master =
+                Some(derive_resumption_master_secret(self.hash, psk.as_ref(), &shared, &res_hash, dtls));
+        }
         self.finish(sink);
         true
     }
@@ -1412,6 +1464,7 @@ impl HandshakeEngine {
         };
         let aead = Tls13Aead::from_suite(suite).expect("suite drawn from effective_cipher_suites");
         self.negotiated_aead = Some(aead);
+        self.hash = aead.hash();
 
         // RFC 8449: validated up front so a bad value is refused before any
         // of our own flight is sent.
@@ -1438,7 +1491,12 @@ impl HandshakeEngine {
 
         // Try PSK resumption.
         if let (Some(identity), Some(binder), Some(ticket_keys)) = (
-            ch.psk_identity.as_ref().filter(|_| self.peer_offers_psk_dhe_ke),
+            // RFC 8446 §4.2.11: the PSK's hash must be the suite's hash. Every
+            // PSK is SHA-256, so a SHA-384 suite ignores an offered PSK and
+            // runs a full handshake.
+            ch.psk_identity
+                .as_ref()
+                .filter(|_| self.peer_offers_psk_dhe_ke && aead.hash() == PSK_HASH),
             ch.psk_binder.as_ref(),
             self.config.ticket_key.as_ref(),
         ) {
@@ -1815,7 +1873,9 @@ impl HandshakeEngine {
         self.app_traffic_transcript_hash = Some(app_th);
         self.transcript.add_message(&encoded);
         let res_hash = self.transcript.hash(self.hash);
-        self.resumption_master = Some(derive_resumption_master_secret(self.hash, psk, shared, &res_hash, dtls));
+        if self.hash == PSK_HASH {
+            self.resumption_master = Some(derive_resumption_master_secret(self.hash, psk, shared, &res_hash, dtls));
+        }
         self.finish(sink);
         true
     }
@@ -3569,6 +3629,150 @@ mod tests {
             server_sink.events.iter().any(|e| format!("{e:?}").contains("no mutually supported key exchange group")),
             "{:?}",
             server_sink.events
+        );
+    }
+
+    fn with_suites(mut cfg: HandshakeConfig, suites: &[u16]) -> HandshakeConfig {
+        cfg.cipher_suites = Some(suites.to_vec());
+        cfg
+    }
+
+    /// TLS_AES_256_GCM_SHA384 end to end: SHA-384 transcript, key schedule
+    /// and Finished on both sides, with the suite reported to the sink.
+    #[test]
+    fn aes_256_gcm_sha384_handshake_completes() {
+        let creds = test_server_credentials();
+        let suites = [AES_256_GCM_SHA384];
+        let sink = run_loopback(
+            with_suites(client_config_with_trust(&creds, KxPolicy::classical_only(), None), &suites),
+            with_suites(server_config_for(creds, KxPolicy::classical_only()), &suites),
+        );
+        assert_eq!(sink.negotiated_aead, Some(Tls13Aead::Aes256GcmSha384));
+        assert_eq!(Tls13Aead::Aes256GcmSha384.suite(), 0x1302);
+        assert_eq!(Tls13Aead::Aes256GcmSha384.key_len(), 32);
+    }
+
+    /// The same suite across a HelloRetryRequest, which re-hashes
+    /// ClientHello1 into the transcript with the suite's own hash.
+    #[test]
+    fn aes_256_gcm_sha384_handshake_completes_across_a_hello_retry_request() {
+        let creds = test_server_credentials();
+        let suites = [AES_256_GCM_SHA384];
+        let mut client = HandshakeEngine::new(with_suites(
+            client_config_with_trust(&creds, KxPolicy::nist_only(), None),
+            &suites,
+        ));
+        let mut server = HandshakeEngine::new(with_suites(
+            server_config_for(creds, KxPolicy::new(vec![NamedGroup::SecP384r1])),
+            &suites,
+        ));
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        for _ in 0..6 {
+            relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+            relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        }
+        assert!(client.is_complete() && server.is_complete(), "{:?}", sink.events);
+        assert_eq!(sink.negotiated_aead, Some(Tls13Aead::Aes256GcmSha384));
+        assert_eq!(sink.negotiated_group, Some(NamedGroup::SecP384r1.code()));
+    }
+
+    /// A server that prefers a SHA-384 suite cannot resume a SHA-256 ticket
+    /// (RFC 8446 section 4.2.11: the PSK's hash must match the suite's), so
+    /// it falls back to a full handshake rather than failing. The control
+    /// shows the same ticket does resume when the server prefers SHA-256.
+    #[test]
+    fn sha384_server_preference_falls_back_to_a_full_handshake_for_a_sha256_ticket() {
+        let store = ClientTicketStore::shared();
+        let (client_cfg, server_cfg, _) = mint_ticket_pair(&store);
+        let both = [AES_128_GCM_SHA256, AES_256_GCM_SHA384];
+        let both_sha384_first = [AES_256_GCM_SHA384, AES_128_GCM_SHA256];
+
+        assert!(
+            resume_once_report_resumed(
+                with_suites(client_cfg.clone(), &both),
+                with_suites(server_cfg.clone(), &both),
+            ),
+            "control: SHA-256 preferred, the ticket resumes"
+        );
+        let (client_sink, server_sink) = resume_once(
+            with_suites(client_cfg.clone(), &both_sha384_first),
+            with_suites(server_cfg.clone(), &both_sha384_first),
+        );
+        assert_eq!(client_sink.negotiated_aead, Some(Tls13Aead::Aes256GcmSha384));
+        assert_eq!(server_sink.negotiated_aead, Some(Tls13Aead::Aes256GcmSha384));
+        assert!(
+            !resume_once_report_resumed(
+                with_suites(client_cfg, &both_sha384_first),
+                with_suites(server_cfg, &both_sha384_first),
+            ),
+            "a SHA-384 suite never accepts a SHA-256 PSK"
+        );
+    }
+
+    /// Tickets and binders are SHA-256 only, so a SHA-384 session mints no
+    /// ticket; the control (a SHA-256 session) does.
+    #[test]
+    fn sha384_session_issues_no_ticket() {
+        let control = ClientTicketStore::shared();
+        let (client_cfg, server_cfg, _) = mint_ticket_pair(&control);
+        assert!(control.get("localhost").is_some(), "control: SHA-256 session mints a ticket");
+
+        let store = ClientTicketStore::shared();
+        let mut client_cfg = with_suites(client_cfg, &[AES_256_GCM_SHA384]);
+        client_cfg.ticket_store = Some(std::sync::Arc::clone(&store));
+        let server_cfg = with_suites(server_cfg, &[AES_256_GCM_SHA384]);
+        let mut server = HandshakeEngine::new(server_cfg);
+        let mut client = HandshakeEngine::new(client_cfg);
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        relay_client(&mut client, take_outbound(&mut sink), &mut sink);
+        assert!(client.is_complete() && server.is_complete(), "{:?}", sink.events);
+        assert_eq!(sink.negotiated_aead, Some(Tls13Aead::Aes256GcmSha384));
+        assert!(store.get("localhost").is_none(), "no ticket for a SHA-384 session");
+    }
+
+    /// 0-RTT data is protected with the first default suite before the server
+    /// has chosen one, so a client whose suite list excludes it must not
+    /// resume: no early keys are derived and no PSK is offered.
+    #[test]
+    fn client_restricted_to_other_suites_does_not_offer_a_ticket_or_early_data() {
+        let store = ClientTicketStore::shared();
+        let (client_cfg, _server_cfg, _) = mint_ticket_pair(&store);
+        let early_keys_after_start = |cfg: HandshakeConfig| {
+            let mut client = HandshakeEngine::new(cfg);
+            let mut sink = RecordingSink::default();
+            client.start(&mut sink);
+            sink.early_keys
+        };
+        assert!(early_keys_after_start(client_cfg.clone()).is_some(), "control: default suites resume with 0-RTT");
+        assert!(
+            early_keys_after_start(with_suites(client_cfg, &[AES_256_GCM_SHA384])).is_none(),
+            "an AES-256-only client must not send 0-RTT under AES-128"
+        );
+    }
+
+    /// SHA-384 is opt-in: a default server does not accept a client that
+    /// offers only `TLS_AES_256_GCM_SHA384`.
+    #[test]
+    fn server_rejects_a_client_that_offers_only_suites_it_does_not_allow() {
+        let creds = test_server_credentials();
+        let mut client = HandshakeEngine::new(with_suites(
+            client_config_with_trust(&creds, KxPolicy::classical_only(), None),
+            &[AES_256_GCM_SHA384],
+        ));
+        let mut server = HandshakeEngine::new(server_config_for(creds, KxPolicy::classical_only()));
+        let mut sink = RecordingSink::default();
+        client.start(&mut sink);
+        relay_server(&mut server, take_outbound(&mut sink), &mut sink);
+        assert!(!server.is_complete());
+        assert!(
+            sink.events.iter().any(|e| e.contains("no mutually supported cipher suite")),
+            "the default server does not enable SHA-384: {:?}",
+            sink.events
         );
     }
 

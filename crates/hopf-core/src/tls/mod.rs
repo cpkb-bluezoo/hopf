@@ -95,7 +95,7 @@ impl NegotiatingTls {
 pub use engine::{
     ClientAuthPolicy, HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole,
     ServerCredentials, ServerCredentialsResolver, Tls13Aead, VerifyOverride, AES_128_GCM_SHA256,
-    CHACHA20_POLY1305_SHA256, SUPPORTED_CIPHER_SUITES,
+    AES_256_GCM_SHA384, CHACHA20_POLY1305_SHA256, SUPPORTED_CIPHER_SUITES,
 };
 pub use handshake::TrafficSecret;
 pub use handshake::ticket::{
