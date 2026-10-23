@@ -4,7 +4,7 @@
 
 use bytes::{Bytes, BytesMut};
 
-use crate::crypto::{hash, HashAlgorithm};
+use crate::crypto::Tls13Hash;
 
 use super::key_schedule::TranscriptHash;
 
@@ -34,9 +34,11 @@ impl Transcript {
         }
     }
 
-    /// Transcript-Hash = Hash(messages).
-    pub fn hash(&self) -> TranscriptHash {
-        TranscriptHash::from_bytes(hash(HashAlgorithm::Sha256, &self.messages).as_bytes().try_into().unwrap())
+    /// Transcript-Hash = Hash(messages), with the negotiated suite's `hash`.
+    /// The messages are kept raw, so the hash can be chosen after the
+    /// ClientHello was added (the suite is only known at ServerHello).
+    pub fn hash(&self, hash: Tls13Hash) -> TranscriptHash {
+        TranscriptHash::from_bytes(hash.hash(&self.messages))
     }
 
     /// RFC 8446 §4.4.1: when a `HelloRetryRequest` happens, the transcript
@@ -49,7 +51,7 @@ impl Transcript {
     /// and the followup `ClientHello2` are appended normally afterwards.
     pub fn retry(&mut self, ch1_hash: TranscriptHash) {
         self.messages.clear();
-        self.messages.extend_from_slice(&[254, 0, 0, 32]);
+        self.messages.extend_from_slice(&[254, 0, 0, ch1_hash.as_bytes().len() as u8]);
         self.messages.extend_from_slice(ch1_hash.as_bytes());
     }
 }

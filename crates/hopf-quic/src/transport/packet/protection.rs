@@ -7,7 +7,8 @@
 
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM, CHACHA20_POLY1305};
 use aws_lc_rs::aead::quic::{HeaderProtectionKey, AES_128, CHACHA20};
-use hopf_core::crypto::{extract, quic_expand_label_with_prefix};
+use hopf_core::crypto::{extract, quic_expand_label_with_prefix, Tls13Hash};
+use hopf_core::tls::TrafficSecret;
 use hopf_core::tls::Tls13Aead;
 
 use crate::transport::types::Side;
@@ -25,20 +26,22 @@ pub struct PacketKeys {
 }
 
 impl PacketKeys {
-    /// Derive from a 32-byte traffic secret. `aead` selects both the packet
+    /// Derive from a traffic secret. `aead` selects the HKDF hash (RFC 9001
+    /// §5.1: the suite's own hash), both the packet
     /// AEAD and its paired header-protection algorithm (RFC 9001 §5.4.3 for
     /// AES, §5.4.4 for ChaCha20) — always [`Tls13Aead::Aes128GcmSha256`] for
     /// Initial/Retry (RFC 9001 §5.2/§5.8 fix the algorithm regardless of
     /// what the handshake negotiates), and whatever the handshake selected
     /// for Handshake/0-RTT/1-RTT.
-    pub fn from_secret(version: QuicVersion, aead: Tls13Aead, secret: &[u8; 32]) -> Self {
+    pub fn from_secret(version: QuicVersion, aead: Tls13Aead, secret: &[u8]) -> Self {
         let key_len = aead.key_len();
+        let hash = aead.hash();
         // "quic key"/"quic iv"/"quic hp" for version 1, "quicv2 ..." for
         // version 2 (RFC 9369 section 3.3.2).
         let prefix = version.label_prefix();
-        let key_bytes = quic_expand_label_with_prefix(prefix, secret, "key", &[], key_len);
-        let iv_bytes = quic_expand_label_with_prefix(prefix, secret, "iv", &[], IV_LEN);
-        let hp_bytes = quic_expand_label_with_prefix(prefix, secret, "hp", &[], key_len);
+        let key_bytes = quic_expand_label_with_prefix(hash, prefix, secret, "key", &[], key_len);
+        let iv_bytes = quic_expand_label_with_prefix(hash, prefix, secret, "iv", &[], IV_LEN);
+        let hp_bytes = quic_expand_label_with_prefix(hash, prefix, secret, "hp", &[], key_len);
         let mut iv = [0u8; IV_LEN];
         iv.copy_from_slice(iv_bytes.as_ref());
         let (aead_alg, hp_alg): (&'static aws_lc_rs::aead::Algorithm, &'static aws_lc_rs::aead::quic::Algorithm) =
@@ -132,26 +135,28 @@ impl KeyPair {
         version: QuicVersion,
         side: Side,
         aead: Tls13Aead,
-        client_secret: [u8; 32],
-        server_secret: [u8; 32],
+        client_secret: TrafficSecret,
+        server_secret: TrafficSecret,
     ) -> Self {
         let (local_secret, remote_secret) = match side {
             Side::Client => (client_secret, server_secret),
             Side::Server => (server_secret, client_secret),
         };
         Self {
-            local: PacketKeys::from_secret(version, aead, &local_secret),
-            remote: PacketKeys::from_secret(version, aead, &remote_secret),
+            local: PacketKeys::from_secret(version, aead, local_secret.as_bytes()),
+            remote: PacketKeys::from_secret(version, aead, remote_secret.as_bytes()),
         }
     }
 }
 
 /// Derive Initial client/server secrets from the client's first DCID (RFC 9001
 /// §5.2; RFC 9369 §3.3.1 changes only the salt for version 2).
-pub fn initial_secrets(version: QuicVersion, dst_cid: &[u8]) -> ([u8; 32], [u8; 32]) {
-    let initial = extract(Some(&version.initial_salt()), dst_cid);
-    let client = initial.derive_secret("client in", &[]);
-    let server = initial.derive_secret("server in", &[]);
+pub fn initial_secrets(version: QuicVersion, dst_cid: &[u8]) -> (TrafficSecret, TrafficSecret) {
+    // Initial secrets always use SHA-256 (RFC 9001 §5.2), whatever suite the
+    // handshake goes on to negotiate.
+    let initial = extract(Tls13Hash::Sha256, Some(&version.initial_salt()), dst_cid);
+    let client = TrafficSecret::from_bytes(initial.derive_secret("client in", &[]));
+    let server = TrafficSecret::from_bytes(initial.derive_secret("server in", &[]));
     (client, server)
 }
 
@@ -179,7 +184,7 @@ mod tests {
             0x23, 0xc4, 0x2d, 0x6b, 0x7d, 0xb6, 0x78, 0x81, 0x28, 0x9a, 0xf4, 0x00, 0x8f, 0x1f,
             0x6c, 0x35, 0x7a, 0xea,
         ];
-        assert_eq!(client, expected);
+        assert_eq!(client.as_bytes(), expected);
     }
 
     fn hex(s: &str) -> Vec<u8> {
@@ -195,7 +200,7 @@ mod tests {
     fn rfc9001_initial_packet_protection_iv() {
         use crate::transport::packet::rfc9001_vectors as v;
         let (client, _) = initial_secrets(QuicVersion::V1, &hex(v::DCID));
-        let keys = PacketKeys::from_secret(QuicVersion::V1, Tls13Aead::Aes128GcmSha256, &client);
+        let keys = PacketKeys::from_secret(QuicVersion::V1, Tls13Aead::Aes128GcmSha256, client.as_bytes());
         assert_eq!(keys.iv.to_vec(), hex("fa044b2f42a3fd3b46fb255c"));
     }
 
@@ -224,9 +229,9 @@ mod tests {
     fn rfc9369_initial_secrets_and_iv() {
         use crate::transport::packet::rfc9369_vectors as v;
         let (client, server) = initial_secrets(QuicVersion::V2, &hex(v::DCID));
-        assert_eq!(client.to_vec(), hex("14ec9d6eb9fd7af83bf5a668bc17a7e283766aade7ecd0891f70f9ff7f4bf47b"));
-        assert_eq!(server.to_vec(), hex("0263db1782731bf4588e7e4d93b7463907cb8cd8200b5da55a8bd488eafc37c1"));
-        let keys = PacketKeys::from_secret(QuicVersion::V2, Tls13Aead::Aes128GcmSha256, &client);
+        assert_eq!(client.as_bytes().to_vec(), hex("14ec9d6eb9fd7af83bf5a668bc17a7e283766aade7ecd0891f70f9ff7f4bf47b"));
+        assert_eq!(server.as_bytes().to_vec(), hex("0263db1782731bf4588e7e4d93b7463907cb8cd8200b5da55a8bd488eafc37c1"));
+        let keys = PacketKeys::from_secret(QuicVersion::V2, Tls13Aead::Aes128GcmSha256, client.as_bytes());
         assert_eq!(keys.iv.to_vec(), hex("91f73e2351d8fa91660e909f"));
         // And v1 stays distinct: same DCID, different salt, different secrets.
         assert_ne!(initial_secrets(QuicVersion::V1, &hex(v::DCID)).0, client);
@@ -284,7 +289,7 @@ mod tests {
     /// header packet.
     #[test]
     fn rfc9369_chacha20_short_header_packet() {
-        let secret: [u8; 32] = hex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b").try_into().unwrap();
+        let secret = hex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b");
         let keys = PacketKeys::from_secret(QuicVersion::V2, Tls13Aead::ChaCha20Poly1305Sha256, &secret);
         assert_eq!(keys.iv.to_vec(), hex("a6b5bc6ab7dafce30ffff5dd"));
         let header = hex("4200bff4");

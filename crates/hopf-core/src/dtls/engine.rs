@@ -22,6 +22,7 @@ use crate::tls::{
 };
 
 use super::reassembly::{Reassembler, HANDSHAKE_HEADER_LEN, MAX_FRAGMENT};
+use crate::tls::TrafficSecret;
 use super::record::{self, PlaintextReadOutcome, ReadKeys, ReadOutcome, WriteKeys};
 use super::retransmit::{RetransmitOutcome, RetransmitState};
 
@@ -181,7 +182,7 @@ impl RecordState {
 
     /// The peer's `KeyUpdate` (RFC 9147 §5.8.4): switch to the next epoch's
     /// read key immediately, keeping the old one for reordered records.
-    fn rotate_read_key(&mut self, aead: Tls13Aead, secret: &[u8; 32]) {
+    fn rotate_read_key(&mut self, aead: Tls13Aead, secret: &[u8]) {
         let old = self.read.take().expect("read keys exist once application traffic is established");
         self.read = Some(ReadKeys::from_secret(aead, secret, old.epoch() + 1));
         self.prev_read = Some(old);
@@ -190,7 +191,7 @@ impl RecordState {
 
     /// Our own `KeyUpdate` was just written: derive the next epoch's write
     /// key but hold it until the peer acknowledges that record.
-    fn queue_write_key(&mut self, aead: Tls13Aead, secret: &[u8; 32]) {
+    fn queue_write_key(&mut self, aead: Tls13Aead, secret: &[u8]) {
         let current = self.write.as_ref().expect("write keys exist once application traffic is established");
         let next_epoch = self.pending_writes.back().map_or(current.epoch(), |p| p.keys.epoch()) + 1;
         self.pending_writes.push_back(PendingWrite {
@@ -222,25 +223,25 @@ impl RecordState {
         }
     }
 
-    fn install_handshake_keys(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn install_handshake_keys(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         let (w, r) = match self.role {
             HandshakeRole::Client => (client, server),
             HandshakeRole::Server => (server, client),
         };
         let epoch = Epoch::Handshake.wire_value();
-        self.write = Some(WriteKeys::from_secret(aead, &w, epoch));
-        self.read = Some(ReadKeys::from_secret(aead, &r, epoch));
+        self.write = Some(WriteKeys::from_secret(aead, w.as_bytes(), epoch));
+        self.read = Some(ReadKeys::from_secret(aead, r.as_bytes(), epoch));
         self.epoch = Epoch::Handshake;
     }
 
-    fn stage_application_keys(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn stage_application_keys(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         let (w, r) = match self.role {
             HandshakeRole::Client => (client, server),
             HandshakeRole::Server => (server, client),
         };
         let epoch = Epoch::Application.wire_value();
-        self.next_write = Some(WriteKeys::from_secret(aead, &w, epoch));
-        self.next_read = Some(ReadKeys::from_secret(aead, &r, epoch));
+        self.next_write = Some(WriteKeys::from_secret(aead, w.as_bytes(), epoch));
+        self.next_read = Some(ReadKeys::from_secret(aead, r.as_bytes(), epoch));
     }
 
     fn activate_application_keys(&mut self) {
@@ -349,11 +350,11 @@ impl TlsEventSink for InnerSink<'_> {
         self.events.verify.push(req);
     }
 
-    fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         self.state.install_handshake_keys(aead, client, server);
     }
 
-    fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         self.state.stage_application_keys(aead, client, server);
     }
 
@@ -362,10 +363,10 @@ impl TlsEventSink for InnerSink<'_> {
         self.state.recv_limit = Some(limits.receive as usize);
     }
 
-    fn application_traffic_key_updated(&mut self, aead: Tls13Aead, direction: KeyUpdateDirection, secret: [u8; 32]) {
+    fn application_traffic_key_updated(&mut self, aead: Tls13Aead, direction: KeyUpdateDirection, secret: TrafficSecret) {
         match direction {
-            KeyUpdateDirection::Read => self.state.rotate_read_key(aead, &secret),
-            KeyUpdateDirection::Write => self.state.queue_write_key(aead, &secret),
+            KeyUpdateDirection::Read => self.state.rotate_read_key(aead, secret.as_bytes()),
+            KeyUpdateDirection::Write => self.state.queue_write_key(aead, secret.as_bytes()),
         }
     }
 

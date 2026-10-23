@@ -19,7 +19,7 @@ use crate::qlog_transport::{
 
 use bytes::Bytes;
 use hopf_core::security::SecurityInfo;
-use hopf_core::tls::{HandshakeConfig, Tls13Aead};
+use hopf_core::tls::{HandshakeConfig, Tls13Aead, TrafficSecret};
 
 use crate::transport::varint;
 use crate::transport::frame::{parse_all, writer, Frame};
@@ -65,7 +65,7 @@ const VERSION_NEGOTIATION_ERROR: u64 = 0x11;
 /// Per-PN-space state.
 struct Space {
     /// Client and server traffic secrets (when installed).
-    secrets: Option<([u8; 32], [u8; 32])>,
+    secrets: Option<(TrafficSecret, TrafficSecret)>,
     /// AEAD paired with `secrets` — always AES-128-GCM for Initial (RFC 9001
     /// §5.2 fixes it regardless of the handshake's own negotiated suite);
     /// for Handshake/1-RTT this is set alongside `secrets` from the
@@ -317,7 +317,7 @@ pub struct Connection {
     /// final UDP payload length equals this size — required for Linux UDP GSO.
     gso_pad_to: Option<usize>,
     /// Client early traffic secret for 0-RTT (client write / server read).
-    early_secret: Option<[u8; 32]>,
+    early_secret: Option<TrafficSecret>,
     /// AEAD paired with `early_secret` — see `Space::aead`'s doc comment;
     /// same default-matches-fixed-Initial reasoning (0-RTT never installs
     /// before `early_secret` is `Some`, so the default is never actually used).
@@ -1293,7 +1293,7 @@ impl Connection {
             let Some(early) = self.early_secret else {
                 return packet_len;
             };
-            (PacketKeys::from_secret(self.version, self.early_aead, &early), true)
+            (PacketKeys::from_secret(self.version, self.early_aead, early.as_bytes()), true)
         } else {
             match self.space(space).keys(self.side, self.version) {
                 Some(k) => (k.remote, false),
@@ -2771,7 +2771,7 @@ self.version,
             && self.early_secret.is_some()
             && self.side == Side::Client;
         let local_keys = if use_0rtt {
-            PacketKeys::from_secret(self.version, self.early_aead, self.early_secret.as_ref().unwrap())
+            PacketKeys::from_secret(self.version, self.early_aead, self.early_secret.as_ref().unwrap().as_bytes())
         } else {
             match self.space(space).keys(self.side, self.version) {
                 Some(k) => k.local,
@@ -3942,7 +3942,7 @@ mod tests {
             let prefix = long_header::parse_prefix(data).expect("long header");
             let keys = if prefix.packet_type == TYPE_0RTT {
                 let early = conn.early_secret.as_ref().expect("0-RTT keys");
-                PacketKeys::from_secret(conn.version, conn.early_aead, early)
+                PacketKeys::from_secret(conn.version, conn.early_aead, early.as_bytes())
             } else {
                 let space = if prefix.packet_type == TYPE_INITIAL {
                     SpaceId::Initial
@@ -4385,7 +4385,7 @@ mod tests {
     fn reject_requeues_0rtt_stream_for_1rtt_retransmit() {
         let now = Instant::now();
         let mut conn = test_client(now);
-        conn.early_secret = Some([0x42; 32]);
+        conn.early_secret = Some(TrafficSecret::from_bytes([0x42; 32]));
         let id = conn.open_bi().expect("stream");
         conn.pending_0rtt_retransmit.push(Sent0Rtt {
             packet_number: 0,
@@ -4416,7 +4416,7 @@ mod tests {
         let now = Instant::now();
         let mut conn = test_client(now);
         conn.spaces[2].secrets = None;
-        conn.early_secret = Some([0x42; 32]);
+        conn.early_secret = Some(TrafficSecret::from_bytes([0x42; 32]));
         let id = conn.open_bi().expect("stream");
         conn.write_stream(id, b"early-payload").unwrap();
         let is_early_payload = |f: &Frame| {
@@ -5605,7 +5605,7 @@ mod tests {
         packet
     }
 
-    fn test_secrets() -> ([u8; 32], [u8; 32]) {
+    fn test_secrets() -> (TrafficSecret, TrafficSecret) {
         crate::transport::packet::protection::initial_secrets(QuicVersion::V1, &[5, 6, 7, 8])
     }
 

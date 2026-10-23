@@ -90,11 +90,12 @@ fn nonce_for(iv: &[u8; 12], seq: u64) -> [u8; 12] {
     n
 }
 
-fn keys_for(aead: Tls13Aead, secret: &[u8; 32]) -> (AeadKeyKind, [u8; 12], HeaderProtectionKey) {
+fn keys_for(aead: Tls13Aead, secret: &[u8]) -> (AeadKeyKind, [u8; 12], HeaderProtectionKey) {
     let key_len = aead.key_len();
-    let key_bytes = dtls_expand_label(secret, "key", &[], key_len);
-    let iv_bytes = dtls_expand_label(secret, "iv", &[], 12);
-    let sn_key_bytes = dtls_expand_label(secret, "sn", &[], key_len);
+    let hash = aead.hash();
+    let key_bytes = dtls_expand_label(hash, secret, "key", &[], key_len);
+    let iv_bytes = dtls_expand_label(hash, secret, "iv", &[], 12);
+    let sn_key_bytes = dtls_expand_label(hash, secret, "sn", &[], key_len);
     let iv: [u8; 12] = iv_bytes.as_ref().try_into().expect("12-byte DTLS 1.3 IV");
     let (key, hp_alg): (AeadKeyKind, &'static aws_lc_rs::aead::quic::Algorithm) = match aead {
         Tls13Aead::Aes128GcmSha256 => (
@@ -122,8 +123,8 @@ pub struct WriteKeys {
 }
 
 impl WriteKeys {
-    /// Derive from a 32-byte traffic secret for `epoch`.
-    pub fn from_secret(aead: Tls13Aead, secret: &[u8; 32], epoch: u64) -> Self {
+    /// Derive from a traffic secret for `epoch`.
+    pub fn from_secret(aead: Tls13Aead, secret: &[u8], epoch: u64) -> Self {
         let (key, iv, sn_hp) = keys_for(aead, secret);
         Self {
             key,
@@ -171,8 +172,8 @@ pub struct ReadKeys {
 }
 
 impl ReadKeys {
-    /// Derive from a 32-byte traffic secret for `epoch`.
-    pub fn from_secret(aead: Tls13Aead, secret: &[u8; 32], epoch: u64) -> Self {
+    /// Derive from a traffic secret for `epoch`.
+    pub fn from_secret(aead: Tls13Aead, secret: &[u8], epoch: u64) -> Self {
         let (key, iv, sn_hp) = keys_for(aead, secret);
         Self {
             key,

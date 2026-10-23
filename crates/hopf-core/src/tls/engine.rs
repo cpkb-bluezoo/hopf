@@ -40,7 +40,7 @@ use super::sink::{
     VerifyResult,
 };
 use super::ticket_keys::TicketKeys;
-use crate::crypto::hkdf::{dtls_expand_label, expand_label};
+use crate::crypto::hkdf::{dtls_expand_label, expand_label, Tls13Hash};
 
 /// Client or server role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +99,11 @@ pub const CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 /// AES-256-GCM (out of scope for now).
 pub const SUPPORTED_CIPHER_SUITES: &[u16] = &[AES_128_GCM_SHA256, CHACHA20_POLY1305_SHA256];
 
+/// The hash of every resumption PSK, binder and 0-RTT secret. Tickets store
+/// a 32-byte PSK and binders are 32 bytes on the wire, so only sessions whose
+/// suite hashes with SHA-256 resume; a SHA-384 session does a full handshake.
+const PSK_HASH: Tls13Hash = Tls13Hash::Sha256;
+
 /// Negotiated TLS 1.3 AEAD — one of [`SUPPORTED_CIPHER_SUITES`]. Threaded
 /// through [`super::sink::TlsEventSink`]'s key-ready callbacks so both this
 /// crate's own TCP record layer ([`super::record`]) and `hopf-quic`'s packet
@@ -119,6 +124,14 @@ impl Tls13Aead {
         match self {
             Tls13Aead::Aes128GcmSha256 => 16,
             Tls13Aead::ChaCha20Poly1305Sha256 => 32,
+        }
+    }
+
+    /// The hash this suite's key schedule, transcript and `Finished` use
+    /// (RFC 8446 §B.4).
+    pub fn hash(self) -> Tls13Hash {
+        match self {
+            Tls13Aead::Aes128GcmSha256 | Tls13Aead::ChaCha20Poly1305Sha256 => Tls13Hash::Sha256,
         }
     }
 
@@ -400,6 +413,9 @@ pub struct HandshakeEngine {
     config: HandshakeConfig,
     state: State,
     transcript: Transcript,
+    /// The negotiated suite's hash (SHA-256 until a suite is selected, which
+    /// is also what every suite supported so far uses).
+    hash: Tls13Hash,
     parser: HandshakeParser,
     local_key_share: Option<LocalKeyShare>,
     negotiated_group: Option<NamedGroup>,
@@ -516,15 +532,13 @@ enum State {
 /// RFC 8446 §7.2: `application_traffic_secret_N+1 = HKDF-Expand-Label(
 /// application_traffic_secret_N, "traffic upd", "", Hash.length)`. DTLS 1.3
 /// uses the same derivation under RFC 9147 §5.9's `dtls13` label prefix.
-fn ratchet_application_secret(secret: &TrafficSecret, dtls: bool) -> TrafficSecret {
+fn ratchet_application_secret(hash: Tls13Hash, secret: &TrafficSecret, dtls: bool) -> TrafficSecret {
     let out = if dtls {
-        dtls_expand_label(secret.as_bytes(), "traffic upd", &[], 32)
+        dtls_expand_label(hash, secret.as_bytes(), "traffic upd", &[], hash.len())
     } else {
-        expand_label(secret.as_bytes(), "traffic upd", &[], 32)
+        expand_label(hash, secret.as_bytes(), "traffic upd", &[], hash.len())
     };
-    let mut buf = [0u8; 32];
-    buf.copy_from_slice(out.as_ref());
-    TrafficSecret::from_bytes(buf)
+    TrafficSecret::from_bytes(out)
 }
 
 impl HandshakeEngine {
@@ -535,6 +549,7 @@ impl HandshakeEngine {
             config,
             state: State::Initial,
             transcript: Transcript::new(),
+            hash: Tls13Hash::Sha256,
             parser: HandshakeParser::new().with_certificate_compression(accept_compressed_certificate),
             local_key_share: None,
             negotiated_group: None,
@@ -852,7 +867,8 @@ impl HandshakeEngine {
         let grease = self.ech_grease_extension(&params, is_retry);
         let hello = if let Some(psk) = self.psk {
             build_client_hello_with_binder(params, grease.as_deref(), |hash| {
-                compute_psk_binder(&psk, &TranscriptHash::from_bytes(*hash), dtls)
+                let binder = compute_psk_binder(PSK_HASH, &psk, &TranscriptHash::from_bytes(hash), dtls);
+                binder.as_bytes().try_into().expect("PSK_HASH binder is 32 bytes")
             })
         } else if let Some(ext) = grease.as_deref() {
             build_client_hello_with_ech(&params, ext)
@@ -863,14 +879,8 @@ impl HandshakeEngine {
         if want_early {
             if let Some(psk) = self.psk {
                 let wire = hello.encode();
-                let ch_hash = {
-                    use aws_lc_rs::digest::{digest, SHA256};
-                    let d = digest(&SHA256, &wire);
-                    let mut out = [0u8; 32];
-                    out.copy_from_slice(d.as_ref());
-                    TranscriptHash::from_bytes(out)
-                };
-                let early = derive_early_traffic(&psk, &ch_hash, dtls);
+                let ch_hash = TranscriptHash::from_bytes(PSK_HASH.hash(&wire));
+                let early = derive_early_traffic(PSK_HASH, &psk, &ch_hash, dtls);
                 self.early_client_secret = Some(early.client);
                 self.early_data_offered = true;
                 // The server's actual suite selection hasn't happened yet
@@ -884,7 +894,7 @@ impl HandshakeEngine {
                 // this crate's own top preference.
                 let early_aead = Tls13Aead::from_suite(SUPPORTED_CIPHER_SUITES[0])
                     .expect("SUPPORTED_CIPHER_SUITES[0] is always a supported suite");
-                sink.quic_early_keys_ready(early_aead, *early.client.as_bytes());
+                sink.quic_early_keys_ready(early_aead, early.client);
                 self.log_traffic_secret(super::key_log::labels::CLIENT_EARLY_TRAFFIC_SECRET, early.client.as_bytes());
                 if let Some(limits) = ticket
                     .as_ref()
@@ -941,14 +951,13 @@ impl HandshakeEngine {
         // (correctly deriving with `psk: None`) can never match, breaking
         // every full-handshake fallback after an offered PSK is rejected.
         let psk = if self.resumed { self.psk.as_ref() } else { None };
-        self.handshake_traffic = Some(derive_handshake_traffic_with_psk(
-            psk,
+        self.handshake_traffic = Some(derive_handshake_traffic_with_psk(self.hash, psk,
             self.shared_secret.as_ref().unwrap(),
-            &self.transcript.hash(),
+            &self.transcript.hash(self.hash),
             self.config.mode == HandshakeMode::Dtls,
         ));
         if let Some(traffic) = self.handshake_traffic.as_ref() {
-            sink.quic_handshake_keys_ready(aead, *traffic.client.as_bytes(), *traffic.server.as_bytes());
+            sink.quic_handshake_keys_ready(aead, traffic.client, traffic.server);
             self.log_traffic_secret(
                 super::key_log::labels::CLIENT_HANDSHAKE_TRAFFIC_SECRET,
                 traffic.client.as_bytes(),
@@ -1007,7 +1016,7 @@ impl HandshakeEngine {
         // (this is the first message the client processes after sending
         // it), so its current hash is exactly Hash(ClientHello1) — RFC 8446
         // §4.4.1's required input for the message_hash substitution.
-        let ch1_hash = self.transcript.hash();
+        let ch1_hash = self.transcript.hash(self.hash);
         self.transcript.retry(ch1_hash);
         self.transcript.add_message(&encoded);
         self.client_retried = true;
@@ -1128,7 +1137,7 @@ impl HandshakeEngine {
             self.fail(sink, AlertDescription::UnexpectedMessage, "certificate verify without certificate");
             return false;
         };
-        let th = self.transcript.hash();
+        let th = self.transcript.hash(self.hash);
         if !verify_certificate_verify(false, leaf.as_ref(), scheme, &sig, &th) {
             self.fail(sink, AlertDescription::DecryptError, "CertificateVerify signature invalid");
             return false;
@@ -1162,10 +1171,10 @@ impl HandshakeEngine {
             self.fail(sink, AlertDescription::InternalError, "missing handshake traffic");
             return false;
         };
-        let th = self.transcript.hash();
+        let th = self.transcript.hash(self.hash);
         let dtls = self.config.mode == HandshakeMode::Dtls;
-        let expected = compute_finished_verify_data(&traffic.server, &th, dtls);
-        if vd.as_ref() != expected {
+        let expected = compute_finished_verify_data(self.hash, &traffic.server, &th, dtls);
+        if vd.as_ref() != expected.as_bytes() {
             self.fail(sink, AlertDescription::DecryptError, "server Finished verify failed");
             return false;
         }
@@ -1186,7 +1195,7 @@ impl HandshakeEngine {
         // client Certificate/CertificateVerify response joins the
         // transcript below (client Finished's own verify_data, in
         // contrast, must cover those too — it uses a separate, later hash).
-        let th_for_app_traffic = self.transcript.hash();
+        let th_for_app_traffic = self.transcript.hash(self.hash);
         if let Some(ctx) = self.client_cert_request_context.take() {
             if !self.send_client_certificate_response(&ctx, sink) {
                 return false;
@@ -1196,9 +1205,9 @@ impl HandshakeEngine {
             self.fail(sink, AlertDescription::InternalError, "missing handshake traffic");
             return false;
         };
-        let th = self.transcript.hash();
-        let vd = compute_finished_verify_data(&traffic.client, &th, dtls);
-        let fin = build_finished(&vd);
+        let th = self.transcript.hash(self.hash);
+        let vd = compute_finished_verify_data(self.hash, &traffic.client, &th, dtls);
+        let fin = build_finished(vd.as_bytes());
         let Some(shared) = self.shared_secret.clone() else {
             self.fail(sink, AlertDescription::InternalError, "missing shared secret");
             return false;
@@ -1209,11 +1218,11 @@ impl HandshakeEngine {
         // See on_client_finished's comment: application_traffic_secret_0 uses
         // `th_for_app_traffic` (through server Finished only); resumption_master_secret
         // uses the transcript after this client Finished is added, below.
-        self.application_traffic = Some(derive_application_traffic_with_psk(psk.as_ref(), &shared, &th_for_app_traffic, dtls));
+        self.application_traffic = Some(derive_application_traffic_with_psk(self.hash, psk.as_ref(), &shared, &th_for_app_traffic, dtls));
         self.app_traffic_transcript_hash = Some(th_for_app_traffic);
         self.emit_outgoing(&fin, sink);
-        let res_hash = self.transcript.hash();
-        self.resumption_master = Some(derive_resumption_master_secret(psk.as_ref(), &shared, &res_hash, dtls));
+        let res_hash = self.transcript.hash(self.hash);
+        self.resumption_master = Some(derive_resumption_master_secret(self.hash, psk.as_ref(), &shared, &res_hash, dtls));
         self.finish(sink);
         true
     }
@@ -1231,7 +1240,7 @@ impl HandshakeEngine {
         let cert_msg = build_certificate(ctx, &cert_refs);
         self.emit_outgoing(&cert_msg, sink);
         if let Some(creds) = creds.filter(|c| !c.cert_chain.is_empty()) {
-            let cv_th = self.transcript.hash();
+            let cv_th = self.transcript.hash(self.hash);
             let Some((scheme, sig)) = sign_certificate_verify(true, &creds.signing_key_pkcs8, &cv_th) else {
                 self.fail(sink, AlertDescription::InternalError, "unsupported or invalid client signing key");
                 return false;
@@ -1256,7 +1265,7 @@ impl HandshakeEngine {
         let Some(store) = self.config.ticket_store.as_ref() else {
             return;
         };
-        let psk = derive_resumption_psk(&rms, &nst.nonce, self.config.mode == HandshakeMode::Dtls);
+        let psk = derive_resumption_psk(PSK_HASH, &rms, &nst.nonce, self.config.mode == HandshakeMode::Dtls);
         let alpn = self
             .negotiated_alpn
             .clone()
@@ -1303,9 +1312,9 @@ impl HandshakeEngine {
             return false;
         };
         let aead = self.negotiated_aead.expect("cipher suite negotiated before Complete");
-        let new_secret = ratchet_application_secret(&secret, self.config.mode == HandshakeMode::Dtls);
+        let new_secret = ratchet_application_secret(self.hash, &secret, self.config.mode == HandshakeMode::Dtls);
         self.peer_app_secret = Some(new_secret);
-        sink.application_traffic_key_updated(aead, KeyUpdateDirection::Read, *new_secret.as_bytes());
+        sink.application_traffic_key_updated(aead, KeyUpdateDirection::Read, new_secret);
         self.log_application_traffic_update(KeyUpdateDirection::Read, new_secret.as_bytes());
         // RFC 8446 §4.6.3: a reciprocal update MUST go out before any
         // further application data — this engine controls all outbound
@@ -1328,9 +1337,9 @@ impl HandshakeEngine {
         sink.handshake_data_ready(&wire);
         let secret = self.own_app_secret.expect("application traffic established before Complete");
         let aead = self.negotiated_aead.expect("cipher suite negotiated before Complete");
-        let new_secret = ratchet_application_secret(&secret, self.config.mode == HandshakeMode::Dtls);
+        let new_secret = ratchet_application_secret(self.hash, &secret, self.config.mode == HandshakeMode::Dtls);
         self.own_app_secret = Some(new_secret);
-        sink.application_traffic_key_updated(aead, KeyUpdateDirection::Write, *new_secret.as_bytes());
+        sink.application_traffic_key_updated(aead, KeyUpdateDirection::Write, new_secret);
         self.log_application_traffic_update(KeyUpdateDirection::Write, new_secret.as_bytes());
     }
 
@@ -1363,13 +1372,7 @@ impl HandshakeEngine {
         ch1_encoded: Bytes,
         sink: &mut S,
     ) -> bool {
-        let ch1_hash = {
-            use aws_lc_rs::digest::{digest, SHA256};
-            let d = digest(&SHA256, &ch1_encoded);
-            let mut out = [0u8; 32];
-            out.copy_from_slice(d.as_ref());
-            TranscriptHash::from_bytes(out)
-        };
+        let ch1_hash = TranscriptHash::from_bytes(self.hash.hash(&ch1_encoded));
         self.transcript.retry(ch1_hash);
         let legacy_version = self.config.mode.legacy_version();
         let hrr = self.ech_server_confirm_hello_retry_request(|confirmation| {
@@ -1447,15 +1450,9 @@ impl HandshakeEngine {
                 // Verify binder over truncated ClientHello (drop last binder entry = 33 bytes).
                 if encoded.len() > 33 && binder.len() == 32 {
                     let truncated = &encoded[..encoded.len() - 33];
-                    let trunc_hash = {
-                        use aws_lc_rs::digest::{digest, SHA256};
-                        let d = digest(&SHA256, truncated);
-                        let mut out = [0u8; 32];
-                        out.copy_from_slice(d.as_ref());
-                        TranscriptHash::from_bytes(out)
-                    };
-                    let expected = compute_psk_binder(&payload.psk, &trunc_hash, dtls);
-                    if binder.as_ref() == expected {
+                    let trunc_hash = TranscriptHash::from_bytes(PSK_HASH.hash(truncated));
+                    let expected = compute_psk_binder(PSK_HASH, &payload.psk, &trunc_hash, dtls);
+                    if binder.as_ref() == expected.as_bytes() {
                         let obfuscated = ch.obfuscated_ticket_age.unwrap_or(0);
                         let age_ms = recover_ticket_age(obfuscated, payload.ticket_age_add);
                         let lifetime_ms = u64::from(payload.lifetime_secs).saturating_mul(1000);
@@ -1497,17 +1494,11 @@ impl HandshakeEngine {
                                     .map(|ar| ar.check_and_record(identity.as_ref()))
                                     .unwrap_or(true);
                                 if anti_ok {
-                                    let ch_hash = {
-                                        use aws_lc_rs::digest::{digest, SHA256};
-                                        let d = digest(&SHA256, &encoded);
-                                        let mut out = [0u8; 32];
-                                        out.copy_from_slice(d.as_ref());
-                                        TranscriptHash::from_bytes(out)
-                                    };
-                                    let early = derive_early_traffic(&payload.psk, &ch_hash, dtls);
+                                    let ch_hash = TranscriptHash::from_bytes(PSK_HASH.hash(&encoded));
+                                    let early = derive_early_traffic(PSK_HASH, &payload.psk, &ch_hash, dtls);
                                     self.early_client_secret = Some(early.client);
                                     self.early_data_accepted = true;
-                                    sink.quic_early_keys_ready(aead, *early.client.as_bytes());
+                                    sink.quic_early_keys_ready(aead, early.client);
                                     self.log_traffic_secret(
                                         super::key_log::labels::CLIENT_EARLY_TRAFFIC_SECRET,
                                         early.client.as_bytes(),
@@ -1593,14 +1584,13 @@ impl HandshakeEngine {
         sink.key_exchange_group_negotiated(group.code());
         self.shared_secret = Some(shared);
         let psk = self.psk.as_ref();
-        self.handshake_traffic = Some(derive_handshake_traffic_with_psk(
-            psk,
+        self.handshake_traffic = Some(derive_handshake_traffic_with_psk(self.hash, psk,
             self.shared_secret.as_ref().unwrap(),
-            &self.transcript.hash(),
+            &self.transcript.hash(self.hash),
             dtls,
         ));
         if let Some(traffic) = self.handshake_traffic.as_ref() {
-            sink.quic_handshake_keys_ready(aead, *traffic.client.as_bytes(), *traffic.server.as_bytes());
+            sink.quic_handshake_keys_ready(aead, traffic.client, traffic.server);
             self.log_traffic_secret(
                 super::key_log::labels::CLIENT_HANDSHAKE_TRAFFIC_SECRET,
                 traffic.client.as_bytes(),
@@ -1693,7 +1683,7 @@ impl HandshakeEngine {
                 None => self.emit_outgoing(&cert_msg, sink),
             }
 
-            let cv_th = self.transcript.hash();
+            let cv_th = self.transcript.hash(self.hash);
             let Some((scheme, sig)) = sign_certificate_verify(false, &creds.signing_key_pkcs8, &cv_th) else {
                 self.fail(sink, AlertDescription::InternalError, "unsupported or invalid server signing key");
                 return false;
@@ -1702,10 +1692,10 @@ impl HandshakeEngine {
             self.emit_outgoing(&cv, sink);
         }
 
-        let fin_th = self.transcript.hash();
+        let fin_th = self.transcript.hash(self.hash);
         let traffic = self.handshake_traffic.as_ref().expect("hs traffic");
-        let vd = compute_finished_verify_data(&traffic.server, &fin_th, dtls);
-        let fin = build_finished(&vd);
+        let vd = compute_finished_verify_data(self.hash, &traffic.server, &fin_th, dtls);
+        let fin = build_finished(vd.as_bytes());
         self.emit_outgoing(&fin, sink);
         // RFC 8446 §7.1: application_traffic_secret_0 covers the transcript
         // through the server's own Finished (just added above) — captured
@@ -1713,7 +1703,7 @@ impl HandshakeEngine {
         // whatever the transcript grows to include by then (the client's
         // optional Certificate/CertificateVerify response, which must NOT
         // factor into this derivation).
-        self.server_finished_hash = Some(self.transcript.hash());
+        self.server_finished_hash = Some(self.transcript.hash(self.hash));
 
         self.state = if request_client_cert {
             State::AwaitingClientCertificate
@@ -1777,7 +1767,7 @@ impl HandshakeEngine {
             self.fail(sink, AlertDescription::UnexpectedMessage, "certificate verify without certificate");
             return false;
         };
-        let th = self.transcript.hash();
+        let th = self.transcript.hash(self.hash);
         if !verify_certificate_verify(true, leaf.as_ref(), scheme, &sig, &th) {
             self.fail(sink, AlertDescription::DecryptError, "client CertificateVerify signature invalid");
             return false;
@@ -1798,9 +1788,9 @@ impl HandshakeEngine {
             self.fail(sink, AlertDescription::InternalError, "missing handshake traffic");
             return false;
         };
-        let th = self.transcript.hash();
-        let expected = compute_finished_verify_data(&traffic.client, &th, dtls);
-        if vd.as_ref() != expected {
+        let th = self.transcript.hash(self.hash);
+        let expected = compute_finished_verify_data(self.hash, &traffic.client, &th, dtls);
+        if vd.as_ref() != expected.as_bytes() {
             self.fail(sink, AlertDescription::DecryptError, "client Finished verify failed");
             return false;
         }
@@ -1821,11 +1811,11 @@ impl HandshakeEngine {
             .server_finished_hash
             .take()
             .expect("server Finished sent before client Finished");
-        self.application_traffic = Some(derive_application_traffic_with_psk(psk, shared, &app_th, dtls));
+        self.application_traffic = Some(derive_application_traffic_with_psk(self.hash, psk, shared, &app_th, dtls));
         self.app_traffic_transcript_hash = Some(app_th);
         self.transcript.add_message(&encoded);
-        let res_hash = self.transcript.hash();
-        self.resumption_master = Some(derive_resumption_master_secret(psk, shared, &res_hash, dtls));
+        let res_hash = self.transcript.hash(self.hash);
+        self.resumption_master = Some(derive_resumption_master_secret(self.hash, psk, shared, &res_hash, dtls));
         self.finish(sink);
         true
     }
@@ -1892,7 +1882,7 @@ impl HandshakeEngine {
         }
     }
 
-    fn log_traffic_secret(&self, label: &str, secret: &[u8; 32]) {
+    fn log_traffic_secret(&self, label: &str, secret: &[u8]) {
         if let Some(log) = self.resolved_key_log() {
             if let Some(random) = self.key_log_client_random() {
                 log.log(label, &random, secret);
@@ -1900,7 +1890,7 @@ impl HandshakeEngine {
         }
     }
 
-    fn log_application_traffic_update(&mut self, direction: super::sink::KeyUpdateDirection, secret: &[u8; 32]) {
+    fn log_application_traffic_update(&mut self, direction: super::sink::KeyUpdateDirection, secret: &[u8]) {
         let label = match (self.config.role, direction) {
             (HandshakeRole::Client, super::sink::KeyUpdateDirection::Write)
             | (HandshakeRole::Server, super::sink::KeyUpdateDirection::Read) => {
@@ -1952,7 +1942,7 @@ impl HandshakeEngine {
             }
         }
         if let Some(a) = app.as_ref() {
-            sink.application_traffic_keys_ready(aead, *a.client.as_bytes(), *a.server.as_bytes());
+            sink.application_traffic_keys_ready(aead, a.client, a.server);
             self.log_traffic_secret(
                 &super::key_log::labels::client_traffic_secret(0),
                 a.client.as_bytes(),
@@ -1966,8 +1956,8 @@ impl HandshakeEngine {
             if let (Some(th), Some(shared)) = (self.app_traffic_transcript_hash, self.shared_secret.as_ref()) {
                 let psk = if self.resumed { self.psk.as_ref() } else { None };
                 let dtls = self.config.mode == HandshakeMode::Dtls;
-                let exporter = derive_exporter_master_secret(psk, shared, &th, dtls);
-                self.log_traffic_secret(super::key_log::labels::EXPORTER_SECRET, &exporter);
+                let exporter = derive_exporter_master_secret(self.hash, psk, shared, &th, dtls);
+                self.log_traffic_secret(super::key_log::labels::EXPORTER_SECRET, exporter.as_bytes());
             }
             let (own, peer) = match self.config.role {
                 HandshakeRole::Client => (a.client, a.server),
@@ -1980,11 +1970,11 @@ impl HandshakeEngine {
         let quic = match self.config.mode {
             HandshakeMode::Quic => Some(QuicSecrets {
                 aead,
-                client_handshake_traffic_secret: *client_hs.as_bytes(),
-                server_handshake_traffic_secret: *server_hs.as_bytes(),
-                client_application_traffic_secret: app.as_ref().map(|a| *a.client.as_bytes()),
-                server_application_traffic_secret: app.as_ref().map(|a| *a.server.as_bytes()),
-                client_early_traffic_secret: early.map(|e| *e.as_bytes()),
+                client_handshake_traffic_secret: client_hs,
+                server_handshake_traffic_secret: server_hs,
+                client_application_traffic_secret: app.as_ref().map(|a| a.client),
+                server_application_traffic_secret: app.as_ref().map(|a| a.server),
+                client_early_traffic_secret: early,
             }),
             HandshakeMode::TcpRecordLayer | HandshakeMode::Dtls => None,
         };
@@ -2376,7 +2366,7 @@ mod tests {
         quic: Option<QuicSecrets>,
         peer_tp: Option<Bytes>,
         negotiated_group: Option<u16>,
-        early_keys: Option<[u8; 32]>,
+        early_keys: Option<TrafficSecret>,
         early_data_accepted: Option<bool>,
         info: Option<SecurityInfo>,
         negotiated_aead: Option<Tls13Aead>,
@@ -2402,16 +2392,16 @@ mod tests {
             self.peer_tp = Some(Bytes::copy_from_slice(params));
             self.events.push(format!("peer_tp {} bytes", params.len()));
         }
-        fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {
+        fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, _client: TrafficSecret, _server: TrafficSecret) {
             self.negotiated_aead = Some(aead);
             self.events.push("handshake_keys".into());
         }
-        fn quic_early_keys_ready(&mut self, aead: Tls13Aead, client_early: [u8; 32]) {
+        fn quic_early_keys_ready(&mut self, aead: Tls13Aead, client_early: TrafficSecret) {
             self.negotiated_aead = Some(aead);
             self.early_keys = Some(client_early);
             self.events.push("early_keys".into());
         }
-        fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {
+        fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, _client: TrafficSecret, _server: TrafficSecret) {
             self.negotiated_aead = Some(aead);
         }
         fn early_data_accepted(&mut self, accepted: bool) {
@@ -3889,14 +3879,14 @@ mod tests {
         let parsed = parse_server_hello(&sh[4..]).expect("well-formed ServerHello");
         let shared = kp.agree(&parsed.key_share).unwrap();
         transcript.add_message(sh);
-        let traffic = derive_handshake_traffic_with_psk(None, &shared, &transcript.hash(), false);
+        let traffic = derive_handshake_traffic_with_psk(Tls13Hash::Sha256, None, &shared, &transcript.hash(Tls13Hash::Sha256), false);
         for m in &messages[1..] {
             transcript.add_message(m);
         }
         assert_eq!(messages.last().unwrap()[0], HandshakeType::Finished as u8, "{:?}", sink.events);
 
-        let verify_data = compute_finished_verify_data(&traffic.client, &transcript.hash(), false);
-        let finished = build_finished(&verify_data).encode();
+        let verify_data = compute_finished_verify_data(Tls13Hash::Sha256, &traffic.client, &transcript.hash(Tls13Hash::Sha256), false);
+        let finished = build_finished(verify_data.as_bytes()).encode();
         server.feed_handshake_data(&mut finished.as_ref(), &mut sink);
         assert!(server.is_complete(), "{:?}", sink.events);
         take_outbound(&mut sink)

@@ -14,6 +14,7 @@ use crate::crypto::hkdf::expand_label;
 use crate::security::SecurityInfo;
 
 use super::engine::{HandshakeConfig, HandshakeEngine, HandshakeMode, HandshakeRole, Tls13Aead};
+use super::handshake::TrafficSecret;
 use super::sink::{
     AlertDescription, KeyUpdateDirection, QuicSecrets, RecordSizeLimits, TlsEventSink, TlsProtocolError,
     TlsTimerKind, VerifyRequest,
@@ -104,9 +105,10 @@ struct DirectionalKeys {
 }
 
 impl DirectionalKeys {
-    fn from_secret(aead: Tls13Aead, secret: &[u8; 32]) -> Self {
-        let key_bytes = expand_label(secret, "key", &[], aead.key_len());
-        let iv_bytes = expand_label(secret, "iv", &[], 12);
+    fn from_secret(aead: Tls13Aead, secret: &[u8]) -> Self {
+        let hash = aead.hash();
+        let key_bytes = expand_label(hash, secret, "key", &[], aead.key_len());
+        let iv_bytes = expand_label(hash, secret, "iv", &[], 12);
         let iv: [u8; 12] = iv_bytes.as_ref().try_into().expect("12-byte TLS 1.3 IV");
         let key = match aead {
             Tls13Aead::Aes128GcmSha256 => {
@@ -200,23 +202,23 @@ impl RecordState {
         }
     }
 
-    fn install_handshake_keys(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn install_handshake_keys(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         let (w, r) = match self.role {
             HandshakeRole::Client => (client, server),
             HandshakeRole::Server => (server, client),
         };
-        self.write = Some(DirectionalKeys::from_secret(aead, &w));
-        self.read = Some(DirectionalKeys::from_secret(aead, &r));
+        self.write = Some(DirectionalKeys::from_secret(aead, w.as_bytes()));
+        self.read = Some(DirectionalKeys::from_secret(aead, r.as_bytes()));
         self.epoch = Epoch::Handshake;
     }
 
-    fn stage_application_keys(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn stage_application_keys(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         let (w, r) = match self.role {
             HandshakeRole::Client => (client, server),
             HandshakeRole::Server => (server, client),
         };
-        self.next_write = Some(DirectionalKeys::from_secret(aead, &w));
-        self.next_read = Some(DirectionalKeys::from_secret(aead, &r));
+        self.next_write = Some(DirectionalKeys::from_secret(aead, w.as_bytes()));
+        self.next_read = Some(DirectionalKeys::from_secret(aead, r.as_bytes()));
     }
 
     fn activate_application_keys(&mut self) {
@@ -231,13 +233,13 @@ impl RecordState {
     /// swap in immediately (unlike the handshake→application transition,
     /// no staging is needed: by the time this is called, anything needing
     /// the old key has already been encrypted and handed off).
-    fn update_write_key(&mut self, aead: Tls13Aead, secret: &[u8; 32]) {
+    fn update_write_key(&mut self, aead: Tls13Aead, secret: &[u8]) {
         self.write = Some(DirectionalKeys::from_secret(aead, secret));
     }
 
     /// The peer's `KeyUpdate` ratcheted their write secret — swap our
     /// matching read key in immediately.
-    fn update_read_key(&mut self, aead: Tls13Aead, secret: &[u8; 32]) {
+    fn update_read_key(&mut self, aead: Tls13Aead, secret: &[u8]) {
         self.read = Some(DirectionalKeys::from_secret(aead, secret));
         self.read_update_requested = false;
     }
@@ -342,11 +344,11 @@ impl<S: TlsRecordSink + ?Sized> TlsEventSink for InnerSink<'_, S> {
         self.outer.verification_requested(req);
     }
 
-    fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn quic_handshake_keys_ready(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         self.state.install_handshake_keys(aead, client, server);
     }
 
-    fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, client: [u8; 32], server: [u8; 32]) {
+    fn application_traffic_keys_ready(&mut self, aead: Tls13Aead, client: TrafficSecret, server: TrafficSecret) {
         self.state.stage_application_keys(aead, client, server);
     }
 
@@ -354,10 +356,10 @@ impl<S: TlsRecordSink + ?Sized> TlsEventSink for InnerSink<'_, S> {
         self.state.apply_record_size_limits(limits);
     }
 
-    fn application_traffic_key_updated(&mut self, aead: Tls13Aead, direction: KeyUpdateDirection, secret: [u8; 32]) {
+    fn application_traffic_key_updated(&mut self, aead: Tls13Aead, direction: KeyUpdateDirection, secret: TrafficSecret) {
         match direction {
-            KeyUpdateDirection::Write => self.state.update_write_key(aead, &secret),
-            KeyUpdateDirection::Read => self.state.update_read_key(aead, &secret),
+            KeyUpdateDirection::Write => self.state.update_write_key(aead, secret.as_bytes()),
+            KeyUpdateDirection::Read => self.state.update_read_key(aead, secret.as_bytes()),
         }
     }
 

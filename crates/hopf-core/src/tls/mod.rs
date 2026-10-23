@@ -97,6 +97,7 @@ pub use engine::{
     ServerCredentials, ServerCredentialsResolver, Tls13Aead, VerifyOverride, AES_128_GCM_SHA256,
     CHACHA20_POLY1305_SHA256, SUPPORTED_CIPHER_SUITES,
 };
+pub use handshake::TrafficSecret;
 pub use handshake::ticket::{
     AntiReplay, ClientTicketStore, DEFAULT_MAX_EARLY_DATA_FRESHNESS_MS, TICKET_LIFETIME_SECS,
 };

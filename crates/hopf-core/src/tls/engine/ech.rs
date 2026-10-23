@@ -347,13 +347,14 @@ impl HandshakeEngine {
         let accepted = match (sh.ech.as_ref(), hello_retry_request_with_zeroed_confirmation(wire_msg)) {
             (Some(theirs), Some(zeroed)) => {
                 let mut t = self.transcript.clone();
-                let ch1 = t.hash();
+                let ch1 = t.hash(self.hash);
                 t.retry(ch1);
                 t.add_message(&zeroed);
                 let expected = ech_accept_confirmation(
+                    self.hash,
                     &self.client_hello_random.unwrap_or([0; 32]),
                     "hrr ech accept confirmation",
-                    t.hash().as_bytes(),
+                    t.hash(self.hash).as_bytes(),
                     dtls,
                 );
                 let mut got = [0u8; 8];
@@ -384,9 +385,10 @@ impl HandshakeEngine {
                 let mut t = self.transcript.clone();
                 t.add_message(&zeroed);
                 let expected = ech_accept_confirmation(
+                    self.hash,
                     &self.client_hello_random.unwrap_or([0; 32]),
                     "ech accept confirmation",
-                    t.hash().as_bytes(),
+                    t.hash(self.hash).as_bytes(),
                     dtls,
                 );
                 confirmation_eq(&expected, &theirs)
@@ -671,9 +673,10 @@ impl HandshakeEngine {
         let mut t = self.transcript.clone();
         t.add_message(&zeroed.encode());
         let conf = ech_accept_confirmation(
+            self.hash,
             &acc.inner_random,
             "hrr ech accept confirmation",
-            t.hash().as_bytes(),
+            t.hash(self.hash).as_bytes(),
             dtls,
         );
         build(Some(&conf))
@@ -694,7 +697,7 @@ impl HandshakeEngine {
         zeroed_random[24..].fill(0);
         let mut t = self.transcript.clone();
         t.add_message(&build(&zeroed_random).encode());
-        let conf = ech_accept_confirmation(&acc.inner_random, "ech accept confirmation", t.hash().as_bytes(), dtls);
+        let conf = ech_accept_confirmation(self.hash, &acc.inner_random, "ech accept confirmation", t.hash(self.hash).as_bytes(), dtls);
         let mut final_random = random;
         final_random[24..].copy_from_slice(&conf);
         build(&final_random)

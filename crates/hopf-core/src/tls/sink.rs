@@ -7,6 +7,7 @@ use bytes::Bytes;
 use crate::security::SecurityInfo;
 
 use super::engine::Tls13Aead;
+use super::handshake::TrafficSecret;
 
 /// TLS protocol error surfaced to the connection pump — not a `Result` from `feed_*`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,16 +243,16 @@ pub struct VerifyResult {
 pub struct QuicSecrets {
     /// Negotiated AEAD — see [`TlsEventSink::quic_handshake_keys_ready`].
     pub aead: Tls13Aead,
-    /// Client handshake traffic secret (32 bytes).
-    pub client_handshake_traffic_secret: [u8; 32],
-    /// Server handshake traffic secret (32 bytes).
-    pub server_handshake_traffic_secret: [u8; 32],
+    /// Client handshake traffic secret (`Hash.length` bytes of the negotiated suite's hash).
+    pub client_handshake_traffic_secret: TrafficSecret,
+    /// Server handshake traffic secret (`Hash.length` bytes of the negotiated suite's hash).
+    pub server_handshake_traffic_secret: TrafficSecret,
     /// Client application traffic secret — present once the full 1-RTT handshake finishes.
-    pub client_application_traffic_secret: Option<[u8; 32]>,
+    pub client_application_traffic_secret: Option<TrafficSecret>,
     /// Server application traffic secret.
-    pub server_application_traffic_secret: Option<[u8; 32]>,
+    pub server_application_traffic_secret: Option<TrafficSecret>,
     /// Client early (0-RTT) traffic secret, when early data was negotiated.
-    pub client_early_traffic_secret: Option<[u8; 32]>,
+    pub client_early_traffic_secret: Option<TrafficSecret>,
 }
 
 /// The record size limits in force once `record_size_limit` (RFC 8449) has
@@ -286,18 +287,18 @@ pub trait TlsEventSink {
     /// `aead` is the negotiated cipher suite's AEAD (RFC 8446 §9.1's MUST
     /// `TLS_AES_128_GCM_SHA256` or SHOULD `TLS_CHACHA20_POLY1305_SHA256`) — the
     /// only thing that differs between them is AEAD key length.
-    fn quic_handshake_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
+    fn quic_handshake_keys_ready(&mut self, _aead: Tls13Aead, _client: TrafficSecret, _server: TrafficSecret) {}
 
     /// Client early traffic secret available (0-RTT keys) — before or with ClientHello send /
     /// after accepting a PSK on the server. See [`Self::quic_handshake_keys_ready`] for `aead`.
-    fn quic_early_keys_ready(&mut self, _aead: Tls13Aead, _client_early: [u8; 32]) {}
+    fn quic_early_keys_ready(&mut self, _aead: Tls13Aead, _client_early: TrafficSecret) {}
 
     /// Application traffic secrets — fired alongside `handshake_complete` in both
     /// [`super::HandshakeMode::Quic`] and [`super::HandshakeMode::TcpRecordLayer`] (the QUIC
     /// path also gets these via `handshake_complete`'s `QuicSecrets`; the TCP record layer has
     /// no other way to learn them, since `QuicSecrets` is QUIC-only). See
     /// [`Self::quic_handshake_keys_ready`] for `aead`.
-    fn application_traffic_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
+    fn application_traffic_keys_ready(&mut self, _aead: Tls13Aead, _client: TrafficSecret, _server: TrafficSecret) {}
 
     /// One direction's application traffic secret ratcheted forward by a
     /// `KeyUpdate` (RFC 8446 §4.6.3/§7.2), TCP-TLS-1.3 only — never fired
@@ -305,7 +306,7 @@ pub trait TlsEventSink {
     /// Carries the raw new secret, same shape as
     /// [`Self::application_traffic_keys_ready`] — the record layer
     /// re-derives key+iv itself.
-    fn application_traffic_key_updated(&mut self, _aead: Tls13Aead, _direction: KeyUpdateDirection, _secret: [u8; 32]) {}
+    fn application_traffic_key_updated(&mut self, _aead: Tls13Aead, _direction: KeyUpdateDirection, _secret: TrafficSecret) {}
 
     /// Negotiated TLS key-exchange group (IANA code, e.g. 0x11ec for X25519MLKEM768).
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
@@ -342,10 +343,10 @@ impl TlsEventSink for NopTlsEventSink {
     fn handshake_complete(&mut self, _info: SecurityInfo, _quic_secrets: Option<QuicSecrets>) {}
     fn verification_requested(&mut self, _req: VerifyRequest) {}
     fn peer_transport_parameters(&mut self, _params: &[u8]) {}
-    fn quic_handshake_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
-    fn quic_early_keys_ready(&mut self, _aead: Tls13Aead, _client_early: [u8; 32]) {}
-    fn application_traffic_keys_ready(&mut self, _aead: Tls13Aead, _client: [u8; 32], _server: [u8; 32]) {}
-    fn application_traffic_key_updated(&mut self, _aead: Tls13Aead, _direction: KeyUpdateDirection, _secret: [u8; 32]) {}
+    fn quic_handshake_keys_ready(&mut self, _aead: Tls13Aead, _client: TrafficSecret, _server: TrafficSecret) {}
+    fn quic_early_keys_ready(&mut self, _aead: Tls13Aead, _client_early: TrafficSecret) {}
+    fn application_traffic_keys_ready(&mut self, _aead: Tls13Aead, _client: TrafficSecret, _server: TrafficSecret) {}
+    fn application_traffic_key_updated(&mut self, _aead: Tls13Aead, _direction: KeyUpdateDirection, _secret: TrafficSecret) {}
     fn key_exchange_group_negotiated(&mut self, _group: u16) {}
     fn early_data_accepted(&mut self, _accepted: bool) {}
     fn record_size_limit_negotiated(&mut self, _limits: RecordSizeLimits) {}
