@@ -45,8 +45,8 @@ pub use auth::{
 pub use client::{
     connect_http, connect_http2_upgrade, connect_http2_upgrade_unix, connect_http_unix,
     connect_https, parse_alt_svc_h3, AltSvcCache, AltSvcEntry, AltSvcH3Entry, DialSettings, HttpClient,
-    HttpClientError, HttpClientSessionHandle, HttpClientTimeouts, HttpConnectionHandler,
-    HttpRequest, HttpResponseHandler, RedirectPolicy,
+    HttpClientConnection, HttpClientError, HttpClientSessionConfig, HttpClientSessionHandle,
+    HttpClientTimeouts, HttpConnectionHandler, HttpRequest, HttpResponseHandler, RedirectPolicy,
 };
 #[cfg(feature = "h3")]
 pub use client::{

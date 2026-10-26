@@ -24,6 +24,8 @@ pub use connect::{
     connect_http, connect_http2_upgrade, connect_http2_upgrade_unix, connect_http_unix,
     connect_https, DialSettings, HttpClientTimeouts,
 };
+pub use connection::HttpClientConnection;
+pub use session_config::HttpClientSessionConfig;
 pub use content_encoding::DecodingResponseHandler;
 pub use redirect::RedirectPolicy;
 #[cfg(feature = "h3")]

@@ -34,7 +34,25 @@ fn h2_session_handler(
 }
 
 /// Negotiates HTTP version on the wire, then runs the Gumdrop session API.
-pub(crate) struct HttpClientConnection {
+///
+/// Public so callers that need to dial through their own lower transport
+/// layer first (a SOCKS5 proxy, an HTTP CONNECT tunnel, …) instead of this
+/// crate's own DNS-resolve-then-dial (`connect_http`/`connect_https`) can
+/// still get the Gumdrop-shaped session API
+/// ([`HttpConnectionHandler`](super::api::HttpConnectionHandler),
+/// [`HttpRequest`](super::api::HttpRequest)) on top of it: wrap the
+/// already-established transport's innermost [`ProtocolHandler`] with one of
+/// these instead of reimplementing H1/H2 version negotiation.
+///
+/// For a `secure` connection, the caller is responsible for actually
+/// arranging the TLS handshake (e.g. [`Endpoint::start_client_tls`] once its
+/// own lower layer reports `connected`) — this only reacts to the resulting
+/// [`ProtocolHandler::security_established`] callback to pick H1 vs H2 by
+/// ALPN, exactly like [`connect_https`](super::connect_https)'s own
+/// `TlsAlpnClientEndpoint` does; it does not configure TLS on any dial
+/// itself. For a cleartext connection, `connected` dispatches immediately
+/// using `h2_prior_knowledge`, matching [`connect_http`](super::connect_http).
+pub struct HttpClientConnection {
     config: Arc<HttpClientSessionConfig>,
     limits: HttpLimits,
     secure: bool,
@@ -44,6 +62,10 @@ pub(crate) struct HttpClientConnection {
 }
 
 impl HttpClientConnection {
+    /// `config.secure` and `secure` must agree (the config decides what
+    /// [`HttpConnectionHandler::on_security_established`] expects); `secure`
+    /// is accepted separately only because the surrounding dial helpers in
+    /// this module already had it to hand.
     pub fn new(
         config: Arc<HttpClientSessionConfig>,
         limits: HttpLimits,

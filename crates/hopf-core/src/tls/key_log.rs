@@ -57,6 +57,9 @@ pub fn default_key_log() -> Option<Arc<dyn KeyLog>> {
 /// Append NSS key log lines to a file, flushed after each line.
 #[derive(Debug)]
 pub struct KeyLogFile {
+    // Never read programmatically -- kept only so `#[derive(Debug)]` shows
+    // which file a `KeyLogFile` points at.
+    #[allow(dead_code)]
     path: PathBuf,
     writer: Mutex<File>,
 }
