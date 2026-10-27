@@ -2,8 +2,7 @@
 
 //! quic-interop-runner environment contract.
 
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct InteropEnv {
@@ -44,27 +43,6 @@ impl InteropEnv {
 
     pub fn ca_file(&self) -> PathBuf {
         self.certs.join("ca.pem")
-    }
-
-    pub fn preferred_address(ipv6: bool) -> Option<SocketAddr> {
-        let host = std::env::var(if ipv6 {
-            "INTEROP_PREFERRED_IPV6"
-        } else {
-            "INTEROP_PREFERRED_IPV4"
-        })
-        .ok()
-        .filter(|s| !s.is_empty())?;
-        let port: u16 = env_or("INTEROP_PREFERRED_PORT", "4434").parse().ok()?;
-        if ipv6 {
-            host.parse::<SocketAddrV6>()
-                .ok()
-                .map(SocketAddr::V6)
-        } else {
-            host.parse::<SocketAddrV4>()
-                .ok()
-                .map(SocketAddr::V4)
-        }
-        .filter(|a| a.port() == port || port != 0)
     }
 }
 

@@ -4,16 +4,11 @@
 
 pub const CONNECTION_STARTED: &str = "quic:connection_started";
 pub const CONNECTION_CLOSED: &str = "quic:connection_closed";
-pub const VERSION_INFORMATION: &str = "quic:version_information";
 pub const PARAMETERS_SET: &str = "quic:parameters_set";
-pub const KEY_DISCARDED: &str = "quic:key_discarded";
 pub const RECOVERY_METRICS_UPDATED: &str = "quic:recovery_metrics_updated";
 pub const PACKET_LOST: &str = "quic:packet_lost";
 pub const PACKET_SENT: &str = "quic:packet_sent";
 pub const PACKET_RECEIVED: &str = "quic:packet_received";
-pub const PACKET_DROPPED: &str = "quic:packet_dropped";
-pub const ALPN_INFORMATION: &str = "quic:alpn_information";
-pub const KEY_UPDATED: &str = "quic:key_updated";
 
 pub const IP_VERSION: &str = "ip_version";
 pub const SRC_IP: &str = "src_ip";
