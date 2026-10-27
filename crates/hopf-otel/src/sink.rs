@@ -17,10 +17,6 @@ pub trait LogSink {
     fn accepts(&self, level: LogLevel) -> bool;
     /// Encode and export one batch (already filtered to accepted levels).
     fn write(&mut self, config: &OtelConfig, batch: &[LogRecord]) -> Result<(), String>;
-    /// Optional fsync / socket flush.
-    fn flush(&mut self) -> Result<(), String> {
-        Ok(())
-    }
     /// Close resources.
     fn shutdown(&mut self) -> Result<(), String> {
         Ok(())
