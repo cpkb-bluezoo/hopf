@@ -2,7 +2,7 @@
 
 //! Extension command handlers (IDLE, ENABLE, NAMESPACE, STATUS, QUOTA, MOVE, …).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -11,14 +11,12 @@ use hopf_mailbox::{MailboxAttribute, MessageSet};
 
 use super::ImapControlHandler;
 use crate::compress::ImapCompressLayer;
-use crate::server::codec::{parse_astring, ImapCommand};
 use crate::server::idle::{
     idle_diff_lines, IdleMailboxSnapshot, IdleMsgSnap, IDLE_POLL_INTERVAL,
 };
 use crate::server::list_ext::ListCommand;
-use crate::server::metadata::{parse_getmetadata, parse_setmetadata};
-use crate::server::notify::{filter_notify_lines, parse_notify, NotifyState};
-use crate::server::quota::parse_quota_resource_list;
+use crate::server::metadata::{GetMetadataCommand, SetMetadataCommand};
+use crate::server::notify::{filter_notify_lines, NotifyState};
 use crate::server::reply::{
     continuation, format_list_attrs, quote_astring, tagged_bad, tagged_no, tagged_ok, untagged,
 };
@@ -73,8 +71,7 @@ impl ImapControlHandler {
         self.send(endpoint, tagged_ok(tag, "NOOP completed"));
     }
 
-    pub(super) fn cmd_id(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        let _ = cmd.args;
+    pub(super) fn cmd_id(&mut self, endpoint: &mut dyn Endpoint, tag: String, _client: Vec<(String, Option<String>)>) {
         let mut fields = self.config.server_id.clone();
         if fields.is_empty() {
             fields.insert("name".into(), "hopf-imap".into());
@@ -85,7 +82,7 @@ impl ImapControlHandler {
             parts.push(format!("\"{k}\" \"{v}\""));
         }
         self.send(endpoint, untagged(&format!("ID ({})", parts.join(" "))));
-        self.send(endpoint, tagged_ok(&cmd.tag, "ID completed"));
+        self.send(endpoint, tagged_ok(&tag, "ID completed"));
     }
 
     pub(super) fn cmd_enable(&mut self, endpoint: &mut dyn Endpoint, tag: String, tokens: Vec<String>) {
@@ -288,28 +285,27 @@ impl ImapControlHandler {
         schedule(endpoint, handle, bundle, shared, runtime, max_idle);
     }
 
-    pub(super) fn cmd_notify(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    pub(super) fn cmd_notify(&mut self, endpoint: &mut dyn Endpoint, tag: String, state: NotifyState) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
         if !self.config.enable_notify {
-            self.send(endpoint, tagged_bad(&cmd.tag, "NOTIFY not available"));
+            self.send(endpoint, tagged_bad(&tag, "NOTIFY not available"));
             return;
         }
-        match parse_notify(&cmd.args) {
-            Ok(NotifyState::None) => {
+        match state {
+            NotifyState::None => {
                 self.notify.set(None);
-                self.send(endpoint, tagged_ok(&cmd.tag, "NOTIFY completed"));
+                self.send(endpoint, tagged_ok(&tag, "NOTIFY completed"));
             }
-            Ok(NotifyState::Selected(events)) => {
+            NotifyState::Selected(events) => {
                 self.notify.set(Some(events));
                 if !self.notify.is_armed() {
                     self.notify.set_armed(true);
                     self.arm_notify_timer(endpoint);
                 }
-                self.send(endpoint, tagged_ok(&cmd.tag, "NOTIFY completed"));
+                self.send(endpoint, tagged_ok(&tag, "NOTIFY completed"));
             }
-            Err(e) => self.send(endpoint, tagged_bad(&cmd.tag, &e)),
         }
     }
 
@@ -464,25 +460,18 @@ impl ImapControlHandler {
         }
     }
 
-    pub(super) fn cmd_getmetadata(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    pub(super) fn cmd_getmetadata(&mut self, endpoint: &mut dyn Endpoint, tag: String, parsed: GetMetadataCommand) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
         if !self.config.enable_metadata {
-            self.send(endpoint, tagged_bad(&cmd.tag, "METADATA not available"));
+            self.send(endpoint, tagged_bad(&tag, "METADATA not available"));
             return;
         }
-        let parsed = match parse_getmetadata(&cmd.args) {
-            Ok(v) => v,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e));
-                return;
-            }
-        };
         if let Some(mut h) = self.selected.take() {
             let mut view = GetMetadataView {
                 endpoint,
-                tag: &cmd.tag,
+                tag: &tag,
                 mailbox: parsed.mailbox.clone(),
                 entries: parsed.entries.clone(),
                 options: parsed.options.clone(),
@@ -510,7 +499,7 @@ impl ImapControlHandler {
         if let Some(mut h) = self.authenticated.take() {
             let mut view = GetMetadataView {
                 endpoint,
-                tag: &cmd.tag,
+                tag: &tag,
                 mailbox: parsed.mailbox.clone(),
                 entries: parsed.entries.clone(),
                 options: parsed.options.clone(),
@@ -538,25 +527,18 @@ impl ImapControlHandler {
         }
     }
 
-    pub(super) fn cmd_setmetadata(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    pub(super) fn cmd_setmetadata(&mut self, endpoint: &mut dyn Endpoint, tag: String, parsed: SetMetadataCommand) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
         if !self.config.enable_metadata {
-            self.send(endpoint, tagged_bad(&cmd.tag, "METADATA not available"));
+            self.send(endpoint, tagged_bad(&tag, "METADATA not available"));
             return;
         }
-        let parsed = match parse_setmetadata(&cmd.args) {
-            Ok(v) => v,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e));
-                return;
-            }
-        };
         if let Some(mut h) = self.selected.take() {
             let mut view = SetMetadataView {
                 endpoint,
-                tag: &cmd.tag,
+                tag: &tag,
                 mailbox: parsed.mailbox.clone(),
                 entries: parsed.entries.clone(),
                 authenticated: &mut self.authenticated,
@@ -577,7 +559,7 @@ impl ImapControlHandler {
         if let Some(mut h) = self.authenticated.take() {
             let mut view = SetMetadataView {
                 endpoint,
-                tag: &cmd.tag,
+                tag: &tag,
                 mailbox: parsed.mailbox.clone(),
                 entries: parsed.entries.clone(),
                 authenticated: &mut self.authenticated,
@@ -732,32 +714,21 @@ impl ImapControlHandler {
         self.send(endpoint, tagged_ok(&tag, "GETQUOTAROOT completed"));
     }
 
-    pub(super) fn cmd_setquota(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    pub(super) fn cmd_setquota(&mut self, endpoint: &mut dyn Endpoint, tag: String, root: String, resources: BTreeMap<String, i64>) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
         if !self.config.enable_quota {
-            self.send(endpoint, tagged_bad(&cmd.tag, "QUOTA not available"));
+            self.send(endpoint, tagged_bad(&tag, "QUOTA not available"));
             return;
         }
-        let Ok((root, rest)) = parse_astring(cmd.args.trim()) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid quota root"));
-            return;
-        };
-        let resources = match parse_quota_resource_list(rest) {
-            Ok(r) => r,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e));
-                return;
-            }
-        };
         let username = self.username.clone().unwrap_or_default();
         match self.config.quota_manager.set_quota(&username, resources) {
             Ok(q) => {
                 self.send(endpoint, untagged(&q.format_response(&root)));
-                self.send(endpoint, tagged_ok(&cmd.tag, "SETQUOTA completed"));
+                self.send(endpoint, tagged_ok(&tag, "SETQUOTA completed"));
             }
-            Err(e) => self.send(endpoint, tagged_no(&cmd.tag, &e)),
+            Err(e) => self.send(endpoint, tagged_no(&tag, &e)),
         }
     }
 

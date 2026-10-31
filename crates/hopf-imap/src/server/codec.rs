@@ -1540,11 +1540,11 @@ mod tests {
     fn a_literal_is_one_token_whatever_it_contains() {
         let wire = b"a1 XSEARCH TEXT {7}\r\nal ice\" secret\r\n\
                      a2 METADATA {4}\r\n(x)\" \r\n\
-                     a3 SETQUOTA {3+}\r\na b {2+}\r\ncd\r\n";
+                     a3 XSETQUOTA {3+}\r\na b {2+}\r\ncd\r\n";
         let want = vec![
             cmd("a1", "XSEARCH", vec![a("TEXT"), lit(b"al ice\""), a("secret")]),
             cmd("a2", "METADATA", vec![lit(b"(x)\"")]),
-            cmd("a3", "SETQUOTA", vec![lit(b"a b"), lit(b"cd")]),
+            cmd("a3", "XSETQUOTA", vec![lit(b"a b"), lit(b"cd")]),
         ];
         for chunk in [1, 2, 3, 7, 1000] {
             let events = lex(wire, chunk);
@@ -1649,8 +1649,8 @@ mod tests {
 
     #[test]
     fn a_zero_length_literal_is_an_empty_token() {
-        let events = lex(b"a1 SETQUOTA {0+}\r\n\r\n", 3);
-        assert_eq!(commands(events), vec![cmd("a1", "SETQUOTA", vec![lit(b"")])]);
+        let events = lex(b"a1 XSETQUOTA {0+}\r\n\r\n", 3);
+        assert_eq!(commands(events), vec![cmd("a1", "XSETQUOTA", vec![lit(b"")])]);
     }
 
     #[test]

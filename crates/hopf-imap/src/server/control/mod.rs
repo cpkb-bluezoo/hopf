@@ -28,7 +28,7 @@ use crate::server::handler::StoreAction;
 use hopf_mailbox::{MessageSet, SearchCriteria};
 use crate::server::sort::SortCriterion;
 use crate::server::codec::{
-    parse_sequence_set, BTreeSetFlags, ImapCommand,
+    BTreeSetFlags, ImapCommand,
     ImapServerLexer, LexEvent, MAX_COMMAND_LINE,
 };
 use crate::server::fetch_format::{FetchItem, FetchModifiers};
@@ -812,16 +812,10 @@ impl ImapControlHandler {
                 endpoint.close();
             }
             "STARTTLS" => self.cmd_starttls(endpoint, &cmd.tag),
-            "ID" => self.cmd_id(endpoint, cmd),
             "CLOSE" => self.cmd_close(endpoint, &cmd.tag, true),
             "UNSELECT" => self.cmd_close(endpoint, &cmd.tag, false),
             "NAMESPACE" => self.cmd_namespace(endpoint, &cmd.tag),
             "IDLE" => self.cmd_idle(endpoint, &cmd.tag),
-            "SETQUOTA" => self.cmd_setquota(endpoint, cmd),
-            "GETMETADATA" => self.cmd_getmetadata(endpoint, cmd),
-            "SETMETADATA" => self.cmd_setmetadata(endpoint, cmd),
-            "NOTIFY" => self.cmd_notify(endpoint, cmd),
-            "EXPUNGE" => self.cmd_expunge(endpoint, &cmd.tag, None),
             "UID" => self.cmd_uid(endpoint, cmd),
             "DONE" => self.send(endpoint, tagged_bad(&cmd.tag, "Not IDLEing")),
             _ => self.send(
@@ -866,6 +860,12 @@ impl ImapControlHandler {
             Request::Search { criteria, by_uid } => self.cmd_search(endpoint, tag, criteria, by_uid),
             Request::Sort { keys, criteria, by_uid } => self.cmd_sort(endpoint, tag, keys, criteria, by_uid),
             Request::Thread { algorithm, criteria, by_uid } => self.cmd_thread(endpoint, tag, algorithm, criteria, by_uid),
+            Request::GetMetadata { command } => self.cmd_getmetadata(endpoint, tag, command),
+            Request::SetMetadata { command } => self.cmd_setmetadata(endpoint, tag, command),
+            Request::Notify { state } => self.cmd_notify(endpoint, tag, state),
+            Request::SetQuota { root, resources } => self.cmd_setquota(endpoint, tag, root, resources),
+            Request::Id { fields } => self.cmd_id(endpoint, tag, fields),
+            Request::Expunge { uids } => self.cmd_expunge(endpoint, &tag, uids),
             Request::List { command, lsub } => self.cmd_list(endpoint, tag, command, lsub),
             Request::Fetch { set, items, modifiers, by_uid } => {
                 self.cmd_fetch(endpoint, tag, set, items, modifiers, by_uid)
@@ -1804,13 +1804,6 @@ impl ImapControlHandler {
             return;
         };
         match sub_cmd.verb.as_str() {
-            "EXPUNGE" => {
-                let Ok((set, _)) = parse_sequence_set(&sub_cmd.args) else {
-                    self.send(endpoint, tagged_bad(&sub_cmd.tag, "Invalid UID set"));
-                    return;
-                };
-                self.cmd_expunge(endpoint, &sub_cmd.tag, Some(set));
-            }
             _ => self.send(endpoint, tagged_bad(&cmd.tag, "Unsupported UID command")),
         }
     }

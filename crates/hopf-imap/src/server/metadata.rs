@@ -2,6 +2,7 @@
 
 //! IMAP GETMETADATA / SETMETADATA argument parsing (RFC 5464).
 
+#[cfg(test)]
 use crate::server::codec::parse_astring;
 
 /// GETMETADATA options (RFC 5464 §4.2.2).
@@ -53,6 +54,7 @@ pub struct SetMetadataCommand {
 
 /// Parse `GETMETADATA` args, i.e. everything after the command verb:
 /// `[(options)] mailbox (entry ...)` or `[(options)] mailbox entry`.
+#[cfg(test)]
 pub fn parse_getmetadata(args: &str) -> Result<GetMetadataCommand, String> {
     let mut rest = args.trim_start();
     let mut options = GetMetadataOptions::default();
@@ -75,6 +77,7 @@ pub fn parse_getmetadata(args: &str) -> Result<GetMetadataCommand, String> {
 }
 
 /// Parse `SETMETADATA` args: `mailbox (entry value entry value ...)`.
+#[cfg(test)]
 pub fn parse_setmetadata(args: &str) -> Result<SetMetadataCommand, String> {
     let rest = args.trim_start();
     let (mailbox, rest) = parse_astring(rest)?;
@@ -105,6 +108,7 @@ pub fn parse_setmetadata(args: &str) -> Result<SetMetadataCommand, String> {
     Ok(SetMetadataCommand { mailbox, entries })
 }
 
+#[cfg(test)]
 fn parse_getmetadata_options(s: &str) -> Result<GetMetadataOptions, String> {
     let mut opts = GetMetadataOptions::default();
     let mut cursor = s.trim();
@@ -138,6 +142,7 @@ fn parse_getmetadata_options(s: &str) -> Result<GetMetadataOptions, String> {
     Ok(opts)
 }
 
+#[cfg(test)]
 fn parse_entry_list(s: &str) -> Result<Vec<String>, String> {
     let s = s.trim();
     if s.starts_with('(') {
@@ -170,6 +175,7 @@ fn parse_entry_list(s: &str) -> Result<Vec<String>, String> {
 }
 
 /// One `SETMETADATA` value: `NIL` (deletion) or an astring/literal.
+#[cfg(test)]
 fn parse_metadata_value(s: &str) -> Result<(Option<String>, &str), String> {
     if let Some(after) = s.strip_prefix("NIL") {
         let boundary = after
@@ -187,6 +193,7 @@ fn parse_metadata_value(s: &str) -> Result<(Option<String>, &str), String> {
 
 /// Consume a balanced `(...)` group starting at `s`, returning its interior
 /// (without the parens) and whatever trails it.
+#[cfg(test)]
 fn take_parenthesized(s: &str) -> Result<(&str, &str), String> {
     if !s.starts_with('(') {
         return Err("expected '('".into());
@@ -207,6 +214,7 @@ fn take_parenthesized(s: &str) -> Result<(&str, &str), String> {
     Err("unclosed parenthesized list".into())
 }
 
+#[cfg(test)]
 fn take_atom(s: &str) -> Result<(String, &str), String> {
     let s = s.trim_start();
     let end = s

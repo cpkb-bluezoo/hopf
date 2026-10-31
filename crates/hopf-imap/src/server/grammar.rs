@@ -18,13 +18,16 @@
 //! byte at a time by a builder, not split out of the text afterwards.
 
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hopf_mailbox::{MessageRange, MessageSet, SearchCriteria, WILDCARD};
 
 use super::codec::{ArgToken, BTreeSetFlags};
 use super::fetch_format::{BodySection, FetchItem, FetchModifiers};
 use super::handler::StoreAction;
+use super::grammar_ext::{GetMetadata, Id, Notify, SetMetadata, SetQuota};
+use super::metadata::{GetMetadataCommand, SetMetadataCommand};
+use super::notify::NotifyState;
 use super::grammar_search::{Search, Sort, Thread};
 use super::sort::SortCriterion;
 use super::thread::ThreadAlgorithm;
@@ -121,6 +124,18 @@ pub enum Request {
     Sort { keys: Vec<SortCriterion>, criteria: SearchCriteria, by_uid: bool },
     /// `[UID] THREAD algorithm charset criteria`
     Thread { algorithm: ThreadAlgorithm, criteria: SearchCriteria, by_uid: bool },
+    /// `GETMETADATA [(options)] mailbox entries`
+    GetMetadata { command: GetMetadataCommand },
+    /// `SETMETADATA mailbox (entry value ...)`
+    SetMetadata { command: SetMetadataCommand },
+    /// `NOTIFY NONE` / `NOTIFY SET ...`
+    Notify { state: NotifyState },
+    /// `SETQUOTA root (resource limit ...)`
+    SetQuota { root: String, resources: BTreeMap<String, i64> },
+    /// `ID NIL` / `ID (field value ...)`: what the client says of itself.
+    Id { fields: Vec<(String, Option<String>)> },
+    /// `EXPUNGE`, or `UID EXPUNGE set`.
+    Expunge { uids: Option<MessageSet> },
 }
 
 /// The machine for one command's arguments.
@@ -156,6 +171,7 @@ pub fn grammar_for(verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
             "COPY" => pattern(COPY, "Invalid destination", build_copy),
             "MOVE" => pattern(COPY, "Invalid destination", build_move),
             "FETCH" => Some(Box::new(Fetch::new(true))),
+            "EXPUNGE" => pattern(UID_EXPUNGE, "Invalid UID set", build_expunge),
             "SEARCH" => Some(Box::new(Search::new(true))),
             "SORT" => Some(Box::new(Sort::new(true))),
             "THREAD" => Some(Box::new(Thread::new(true))),
@@ -184,6 +200,12 @@ pub fn grammar_for(verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
         "LIST" => Some(Box::new(List::new(false))),
         "LSUB" => Some(Box::new(List::new(true))),
         "APPEND" => Some(Box::new(Append::default())),
+        "EXPUNGE" => pattern(&[], "Invalid EXPUNGE arguments", build_expunge),
+        "GETMETADATA" => Some(Box::new(GetMetadata::new())),
+        "SETMETADATA" => Some(Box::new(SetMetadata::new())),
+        "NOTIFY" => Some(Box::new(Notify::new())),
+        "SETQUOTA" => Some(Box::new(SetQuota::new())),
+        "ID" => Some(Box::new(Id::new())),
         "SEARCH" => Some(Box::new(Search::new(false))),
         "SORT" => Some(Box::new(Sort::new(false))),
         "THREAD" => Some(Box::new(Thread::new(false))),
@@ -506,6 +528,7 @@ const ENABLE: &[(Slot, &str)] = &[(Slot::Keywords, "Invalid ENABLE arguments")];
 const COMPRESS: &[(Slot, &str)] = &[(Slot::Keyword, "Unsupported compression mechanism")];
 const ONE_ROOT: &[(Slot, &str)] = &[(Slot::Astring, "Invalid quota root")];
 const ONE_MAILBOX: &[(Slot, &str)] = &[(Slot::Astring, "Invalid mailbox")];
+const UID_EXPUNGE: &[(Slot, &str)] = &[(Slot::SeqSet, "Invalid UID set")];
 const STORE: &[(Slot, &str)] = &[
     (Slot::SeqSet, "Invalid sequence set"),
     (Slot::Keyword, "Missing STORE item"),
@@ -554,6 +577,10 @@ fn take_set(v: &mut Vec<Value>) -> MessageSet {
         Value::Set(s) => s,
         _ => MessageSet::empty(),
     }
+}
+
+fn build_expunge(mut v: Vec<Value>, by_uid: bool) -> Result<Request, Reject> {
+    Ok(Request::Expunge { uids: by_uid.then(|| take_set(&mut v)) })
 }
 
 fn build_copy(mut v: Vec<Value>, by_uid: bool) -> Result<Request, Reject> {

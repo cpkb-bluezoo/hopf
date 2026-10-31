@@ -54,6 +54,7 @@ pub enum NotifyState {
 }
 
 /// Parse `NOTIFY` command args (everything after the verb).
+#[cfg(test)]
 pub fn parse_notify(args: &str) -> Result<NotifyState, String> {
     let args = args.trim();
     if args.eq_ignore_ascii_case("NONE") {
@@ -110,6 +111,7 @@ pub fn parse_notify(args: &str) -> Result<NotifyState, String> {
     Ok(NotifyState::Selected(events))
 }
 
+#[cfg(test)]
 fn split_first_word(s: &str) -> Option<(&str, &str)> {
     let s = s.trim_start();
     let end = s.find(char::is_whitespace).unwrap_or(s.len());
