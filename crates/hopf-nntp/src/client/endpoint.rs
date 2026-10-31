@@ -10,13 +10,13 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use hopf_auth::{create_client, SaslClient, SaslClientStep, SaslMechanism};
-use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
+use hopf_core::{take_crlf_line, Endpoint, LoopBuf, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
 
 use super::error::NntpClientError;
 use super::handlers::{NntpClientHandler, NntpGreeting};
 use super::reply::{
     has_capability, is_multiline_code, normalize_capabilities, parse_status, sasl_mechanisms,
-    unstuff_line, LineBuffer, NntpStatus,
+    unstuff_line, NntpStatus,
 };
 use super::session::{Command, NntpSession, Queue};
 
@@ -73,7 +73,6 @@ enum InFlight {
 pub(crate) struct NntpClientEndpoint {
     handler: Option<Box<dyn NntpClientHandler>>,
     phase: Phase,
-    lines: LineBuffer,
     credentials: Option<(String, String)>,
     tls: Option<(SharedTlsConnector, String)>,
     tls_mode: TlsMode,
@@ -102,7 +101,6 @@ impl NntpClientEndpoint {
         Self {
             handler: Some(handler),
             phase: Phase::Greeting,
-            lines: LineBuffer::default(),
             credentials,
             tls,
             tls_mode,
@@ -471,17 +469,13 @@ impl ProtocolHandler for NntpClientEndpoint {
         }
     }
 
-    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-        if !data.is_empty() {
-            self.lines.push(data);
-            *data = &[];
-        }
+    fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut LoopBuf) {
         loop {
             if self.phase == Phase::Closed {
                 return;
             }
-            let Some(line) = self.lines.next_line() else {
-                if self.lines.len() > MAX_LINE {
+            let Some(line) = take_crlf_line(buf) else {
+                if buf.len() > MAX_LINE {
                     self.fail(ep, io::Error::new(io::ErrorKind::InvalidData, "reply line too long"));
                 }
                 break;

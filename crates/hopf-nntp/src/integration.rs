@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use hopf_core::{
-    acceptor_from_pem, connector_from_pem, Endpoint, ProtocolHandler, Runtime, RuntimeConfig,
+    acceptor_from_pem, connector_from_pem, take_crlf_line, Endpoint, LoopBuf, ProtocolHandler, Runtime,
+    RuntimeConfig,
     SecurityInfo, SharedTlsAcceptor, SharedTlsConnector, TcpListenerConfig,
 };
 
-use crate::client::reply::LineBuffer;
 use crate::{
     NntpClient, NntpClientHandler, NntpClientTimeouts, NntpGreeting, NntpSession, OverviewEntry,
 };
@@ -43,7 +43,6 @@ struct Recorded {
 struct Server {
     config: ServerConfig,
     recorded: Arc<Mutex<Recorded>>,
-    lines: LineBuffer,
     authed: bool,
     pending_user: Option<String>,
     group: Option<String>,
@@ -216,10 +215,8 @@ impl ProtocolHandler for Server {
         }
     }
 
-    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
-        self.lines.push(data);
-        *data = &[];
-        while let Some(line) = self.lines.next_line() {
+    fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut LoopBuf) {
+        while let Some(line) = take_crlf_line(buf) {
             if let Some(body) = self.posting.as_mut() {
                 if line == b"." {
                     let article = self.posting.take().unwrap();
@@ -256,7 +253,6 @@ fn start_server(rt: &Runtime, mut config: ServerConfig, tls: Option<(SharedTlsAc
         Box::new(Server {
             config: config.clone(),
             recorded: Arc::clone(&rec),
-            lines: LineBuffer::default(),
             authed: false,
             pending_user: None,
             group: None,

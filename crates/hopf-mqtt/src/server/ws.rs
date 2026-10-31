@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_core::{ConnHandle, Runtime, TimerHandle};
+use hopf_core::{ConnHandle, LoopBuf, Runtime, TimerHandle};
 use hopf_http::Headers;
 use hopf_websocket::{framed_ws_conn_handle, WsEventHandler, WsEventHandlerFactory, WsFrameError, WsRole, WsSession};
 
@@ -140,6 +140,7 @@ impl WsEventHandlerFactory for MqttWsFactory {
         Box::new(MqttWsHandler {
             config: Arc::clone(&self.config),
             parser,
+            ring: None,
             session: SessionState::AwaitingConnect,
             connect_handler: Some(self.handler_factory.create()),
             publish_handler: self.handler_factory.create_publish(),
@@ -174,6 +175,9 @@ impl WsEventHandlerFactory for MqttWsFactory {
 pub struct MqttWsHandler {
     config: Arc<MqttConfig>,
     parser: MqttFrameParser,
+    /// The ring a WebSocket message is fed to the parser through, made when
+    /// the first message arrives. A packet other than PUBLISH must fit it.
+    ring: Option<LoopBuf>,
     session: SessionState,
     /// `None` only while offloaded to the storage pool for an in-flight
     /// `authorize()` call (issue #232), or after one has run — `authorize`
@@ -406,6 +410,10 @@ fn schedule_qos_retry(
     )
 }
 
+/// What the ring an MQTT-over-WebSocket connection feeds its parser through
+/// holds.
+const WS_RING_BYTES: usize = 128 * 1024;
+
 impl WsEventHandler for MqttWsHandler {
     fn opened(&mut self, _session: &mut WsSession<'_>, _conn: &ConnHandle) {
         self.ensure_connection_telemetry();
@@ -418,8 +426,25 @@ impl WsEventHandler for MqttWsHandler {
 
     fn binary_message(&mut self, session: &mut WsSession<'_>, data: &[u8]) {
         let mut parser = mem::replace(&mut self.parser, MqttFrameParser::new(ProtocolVersion::V311));
+        let mut ring = self
+            .ring
+            .take()
+            .unwrap_or_else(|| LoopBuf::with_capacity(WS_RING_BYTES));
         let mut ctx = WsCtx { handler: self, session };
-        parser.push(data, &mut ctx);
+        // A message may be larger than the ring: it goes in as the parser
+        // makes room, and what the parser leaves (a packet split across
+        // messages) waits in the ring for the next.
+        let mut rest = data;
+        while !rest.is_empty() {
+            let taken = ring.extend_from_slice(rest);
+            rest = &rest[taken..];
+            let before = ring.len();
+            parser.receive(&mut ring, &mut ctx);
+            if taken == 0 && ring.len() == before {
+                break; // full of something the parser cannot use
+            }
+        }
+        self.ring = Some(ring);
         self.parser = parser;
         self.rearm_keepalive();
     }

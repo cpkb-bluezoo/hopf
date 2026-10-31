@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hopf_auth::{SaslServer, SaslServerStep};
-use hopf_core::{ConnHandle, Endpoint, ProtocolHandler, Runtime, TimerHandle};
+use hopf_core::{ConnHandle, Endpoint, LoopBuf, ProtocolHandler, Runtime, TimerHandle};
 use hopf_otel::{
     ExportHandle, RequestTimer, Span, SpanKind, Trace, MqttServerMetrics as OtelMqttMetrics,
 };
@@ -406,7 +406,7 @@ impl ProtocolHandler for MqttControlHandler {
         ));
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
         crate::server::auth::sync_pending_auth_check(self, endpoint);
         sync_pending_authorize(self, endpoint);
         sync_pending_connack(self, endpoint);
@@ -420,12 +420,11 @@ impl ProtocolHandler for MqttControlHandler {
             endpoint: &mut *endpoint,
             pending_version: None,
         };
-        parser.push(data, &mut ctx);
+        parser.receive(buf, &mut ctx);
         if let Some(version) = ctx.pending_version {
             parser.set_version(version);
         }
         self.parser = parser;
-        *data = &[];
         rearm_keepalive(self, endpoint);
     }
 

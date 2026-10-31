@@ -9,7 +9,7 @@
 use std::io;
 use std::time::Duration;
 
-use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
+use hopf_core::{Endpoint, LoopBuf, ProtocolHandler, SecurityInfo, SharedTlsConnector, TimerHandle};
 
 use crate::codec::packet::{reason, ConnectPacket, PublishHeader, QoS, SubscribeFilter, Will};
 use crate::codec::parser::{MqttFrameHandler, MqttFrameParser};
@@ -216,15 +216,14 @@ impl ProtocolHandler for MqttClientEndpoint {
         self.send_connect(ep);
     }
 
-    fn receive_slice(&mut self, ep: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, ep: &mut dyn Endpoint, buf: &mut LoopBuf) {
         // `parser.push` calls back into `self` (it implements
         // `MqttFrameHandler` directly below) — take it out of `self` first
         // so that isn't a simultaneous double borrow of the same field.
         let mut parser = std::mem::replace(&mut self.parser, MqttFrameParser::new(self.version));
         let mut ctx = ClientCtx { handler: self, endpoint: ep };
-        parser.push(data, &mut ctx);
+        parser.receive(buf, &mut ctx);
         self.parser = parser;
-        *data = &[];
     }
 
     fn security_established(&mut self, ep: &mut dyn Endpoint, _info: &SecurityInfo) {

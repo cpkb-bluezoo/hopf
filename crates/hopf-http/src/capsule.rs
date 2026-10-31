@@ -4,6 +4,11 @@
 
 use crate::varint;
 
+/// The longest capsule value the parser will wait for (1 MiB). A capsule is
+/// held whole until it is complete, so the peer's declared length must be
+/// bounded.
+pub const MAX_CAPSULE_VALUE: usize = 1024 * 1024;
+
 /// `DATAGRAM` capsule type (RFC 9297 §3.5).
 pub const CAPSULE_DATAGRAM: u64 = 0x00;
 
@@ -99,6 +104,9 @@ fn try_parse_one(buf: &[u8]) -> Result<Option<(Capsule, usize)>, ()> {
     };
     let header = n_ty + n_len;
     let len = usize::try_from(len).map_err(|_| ())?;
+    if len > MAX_CAPSULE_VALUE {
+        return Err(());
+    }
     if buf.len() < header + len {
         return Ok(None);
     }
@@ -176,5 +184,22 @@ mod tests {
         let mut h2 = Headers::new();
         h2.set("capsule-protocol", "?0");
         assert!(!capsule_protocol_enabled(&h2));
+    }
+
+    /// A capsule's declared length is checked as soon as its header is in:
+    /// a peer cannot make the parser wait on, and so buffer, an enormous one.
+    #[test]
+    fn a_capsule_longer_than_the_cap_is_rejected_from_its_header_alone() {
+        let mut header = Vec::new();
+        varint::encode(&mut header, CAPSULE_DATAGRAM);
+        varint::encode(&mut header, (MAX_CAPSULE_VALUE as u64) + 1);
+        let mut p = CapsuleParser::new();
+        assert!(p.push(&header).is_err());
+
+        let mut ok = Vec::new();
+        varint::encode(&mut ok, CAPSULE_DATAGRAM);
+        varint::encode(&mut ok, MAX_CAPSULE_VALUE as u64);
+        let mut p = CapsuleParser::new();
+        assert!(p.push(&ok).unwrap().is_empty(), "a capsule at the cap is waited for");
     }
 }

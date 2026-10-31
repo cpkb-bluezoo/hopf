@@ -31,36 +31,6 @@ pub(crate) fn is_multiline_code(code: u16) -> bool {
     matches!(code, 100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231)
 }
 
-/// Splits inbound bytes into CRLF-terminated lines. Bytes after the last
-/// CRLF wait for more input.
-#[derive(Debug, Default)]
-pub(crate) struct LineBuffer {
-    buf: Vec<u8>,
-}
-
-impl LineBuffer {
-    pub fn push(&mut self, data: &[u8]) {
-        self.buf.extend_from_slice(data);
-    }
-
-    /// The next complete line without its CRLF, if there is one.
-    pub fn next_line(&mut self) -> Option<Vec<u8>> {
-        let end = self.buf.windows(2).position(|w| w == b"\r\n")?;
-        let line = self.buf[..end].to_vec();
-        self.buf.drain(..end + 2);
-        Some(line)
-    }
-
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.buf.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.buf.len()
-    }
-}
-
 /// One line of a multi-line block: `None` at the terminating `.`, else
 /// the line with a stuffed leading dot removed.
 pub(crate) fn unstuff_line(line: &[u8]) -> Option<&[u8]> {
@@ -201,18 +171,6 @@ mod tests {
         assert_eq!(parse_status("381"), Some(NntpStatus { code: 381, text: String::new() }));
         assert_eq!(parse_status("hello"), None);
         assert_eq!(parse_status("20"), None);
-    }
-
-    #[test]
-    fn line_buffer_splits_on_crlf_and_keeps_the_rest() {
-        let mut b = LineBuffer::default();
-        b.push(b"200 hi\r\n101 caps\r\nVERS");
-        assert_eq!(b.next_line().as_deref(), Some(&b"200 hi"[..]));
-        assert_eq!(b.next_line().as_deref(), Some(&b"101 caps"[..]));
-        assert_eq!(b.next_line(), None);
-        b.push(b"ION 2\r\n");
-        assert_eq!(b.next_line().as_deref(), Some(&b"VERSION 2"[..]));
-        assert!(b.is_empty());
     }
 
     #[test]

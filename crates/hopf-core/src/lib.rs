@@ -18,6 +18,7 @@ pub mod acl;
 pub mod asn1;
 pub mod binding;
 pub mod bufpool;
+pub mod lines;
 pub mod composition;
 pub mod connector;
 pub mod crypto;
@@ -61,6 +62,7 @@ pub use connector::{TcpConnParams, TcpConnectorConfig, UnixConnectorConfig};
 pub use endpoint::{Endpoint, TimerHandle, WriteReadyCallback};
 pub use error::StartTlsError;
 pub use handle::{ConnHandle, ConnHandleBackend, EndpointTask, ExecuteFn, Task};
+pub use lines::take_crlf_line;
 pub use loopbuf::LoopBuf;
 pub use handler::{forward_slice, with_slice, NopHandler, ProtocolHandler};
 pub use listener::{
