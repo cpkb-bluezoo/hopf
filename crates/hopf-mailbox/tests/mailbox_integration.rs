@@ -412,3 +412,39 @@ fn copy_to_a_mailbox_that_does_not_exist_is_not_found_and_creates_nothing() {
     inbox.close(false).unwrap();
     assert_eq!(store.list("", "*").unwrap().len(), 1, "no mailbox was made on the way");
 }
+
+#[test]
+fn address_searches_match_the_display_names_as_well_as_the_addresses() {
+    for maildir in [true, false] {
+        let dir = tempdir().unwrap();
+        let mut mb: Box<dyn Mailbox> = if maildir {
+            let mut store = MaildirFactory::new(dir.path()).create_store();
+            store.open("u").unwrap();
+            store.open_mailbox("INBOX", false).unwrap()
+        } else {
+            let mut store = MboxFactory::new(dir.path()).create_store();
+            store.open("u").unwrap();
+            store.open_mailbox("INBOX", false).unwrap()
+        };
+        let raw = |from: &str, to: &str, cc: &str| {
+            format!("From: {from}\r\nTo: {to}\r\nCc: {cc}\r\nSubject: s\r\nMessage-ID: <m@x.org>\r\n\r\nbody\r\n").into_bytes()
+        };
+        let none = BTreeSet::new();
+        append_whole(mb.as_mut(), &raw("\"Bob Jones\" <bob@x.org>", "Carol <c@x.org>, dave@x.org", "Eve Adams <eve@x.org>"), &none, None).unwrap();
+        append_whole(mb.as_mut(), &raw("zed@x.org", "\"Frank, Jr.\" <frank@x.org>", "g@x.org"), &none, None).unwrap();
+        let found = |mb: &dyn Mailbox, c: SearchCriteria| mb.search(&c).unwrap();
+        let header = |name: &str, pattern: &str| SearchCriteria::Header { name: name.into(), pattern: pattern.into() };
+        let why = if maildir { "maildir" } else { "mbox" };
+        assert_eq!(found(mb.as_ref(), SearchCriteria::from("jones")), vec![1], "{why}: a surname");
+        assert_eq!(found(mb.as_ref(), SearchCriteria::from("BOB")), vec![1], "{why}: either case");
+        assert_eq!(found(mb.as_ref(), SearchCriteria::from("bob@x.org")), vec![1], "{why}: the address still matches");
+        assert_eq!(found(mb.as_ref(), SearchCriteria::from("zed")), vec![2], "{why}");
+        assert_eq!(found(mb.as_ref(), header("To", "carol")), vec![1], "{why}: second kind of header");
+        assert_eq!(found(mb.as_ref(), header("To", "dave")), vec![1], "{why}");
+        assert_eq!(found(mb.as_ref(), header("To", "frank")), vec![2], "{why}: a quoted name with a comma");
+        assert_eq!(found(mb.as_ref(), header("Cc", "adams")), vec![1], "{why}");
+        assert_eq!(found(mb.as_ref(), SearchCriteria::text("jones")), vec![1], "{why}: TEXT covers the names");
+        assert_eq!(found(mb.as_ref(), SearchCriteria::from("nobody")), Vec::<u32>::new(), "{why}");
+        mb.close(false).unwrap();
+    }
+}

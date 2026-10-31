@@ -268,10 +268,11 @@ pub fn fetch_needs_bytes(items: &[FetchItem]) -> bool {
     })
 }
 
-/// Whether FETCH should set `\Seen` (non-peek body / RFC822).
+/// Whether FETCH should set `\Seen` (non-peek body, `RFC822`, `RFC822.TEXT`).
 pub fn fetch_sets_seen(items: &[FetchItem]) -> bool {
     items.iter().any(|i| match i {
-        FetchItem::Rfc822 | FetchItem::Rfc822Header | FetchItem::Rfc822Text => true,
+        // (RFC822.HEADER is BODY.PEEK[HEADER]: it does not.)
+        FetchItem::Rfc822 | FetchItem::Rfc822Text => true,
         FetchItem::Body { peek, .. } => !peek,
         _ => false,
     })

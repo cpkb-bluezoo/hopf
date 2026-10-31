@@ -812,8 +812,10 @@ fn append_variants() {
     assert!(status(&out, "d").starts_with("d OK "), "{out}");
     s.run("sel SELECT INBOX\r\n");
     let out = s.run("e FETCH 2 FLAGS\r\n");
-    assert!(out.contains("\\Seen") && out.contains("\\Flagged"), "{out}");
+    assert!(out.contains("\\Seen") && out.contains("\\Flagged") && out.contains("$k"), "keywords are kept: {out}");
     assert!(s.run("e2 FETCH 3 FLAGS\r\n").contains("FLAGS ()"));
+    assert!(s.run("e3 SEARCH KEYWORD $k\r\n").contains("* SEARCH 2\r\n"));
+    assert!(s.run("e4 SEARCH UNKEYWORD $k\r\n").contains("* SEARCH 1 3\r\n"));
     // A bad flag list is refused before the continuation, and the line is skipped.
     let out = s.run("f APPEND INBOX (\\Seen {1+}\r\nx\r\ng NOOP\r\n");
     assert!(status(&out, "f").starts_with("f BAD "), "{out}");
@@ -962,4 +964,64 @@ fn a_select_that_fails_leaves_the_session_working() {
     let out = s.run("m SELECT INBOX\r\n");
     assert!(out.contains("* 3 EXISTS") && status(&out, "m").starts_with("m OK [READ-WRITE]"), "{out}");
     assert!(s.run("n FETCH 1 FLAGS\r\n").contains("* 1 FETCH"));
+}
+
+#[test]
+fn from_to_and_cc_searches_find_display_names_and_sort_still_goes_by_address() {
+    // Alphabetical by name is the reverse of alphabetical by address.
+    let zed = message("one", "Zed Zimmer <a@x.org>", "Pat <p@x.org>", ALICE, "x\r\n");
+    let abe = message("two", "Abe Adams <b@x.org>", "Quinn Q <q@x.org>", BOB, "y\r\n");
+    let mut s = Session::with_inbox(&[("", &zed), ("", &abe)]);
+    let found = |s: &mut Session, keys: &str| -> String {
+        let out = s.run(&format!("s SEARCH {keys}\r\n"));
+        lines(&out, "* SEARCH").first().map(|l| l.trim_start_matches("* SEARCH").trim().to_string()).unwrap_or_default()
+    };
+    assert_eq!(found(&mut s, "FROM zimmer"), "1");
+    assert_eq!(found(&mut s, "FROM \"abe adams\""), "2");
+    assert_eq!(found(&mut s, "FROM b@x.org"), "2");
+    assert_eq!(found(&mut s, "TO quinn"), "2");
+    assert_eq!(found(&mut s, "HEADER From abe"), "2");
+    assert_eq!(found(&mut s, "TEXT zimmer"), "1");
+    assert_eq!(found(&mut s, "FROM nobody"), "");
+    // SORT by sender goes by the address, as RFC 5256 says (the addr-mailbox).
+    let out = s.run("t SORT (FROM) UTF-8 ALL\r\n");
+    assert!(out.contains("* SORT 1 2\r\n"), "{out}");
+    let out = s.run("u SORT (REVERSE TO) UTF-8 ALL\r\n");
+    assert!(out.contains("* SORT 2 1\r\n"), "{out}");
+}
+
+/// RFC 9051 §6.4.5: fetching a body without PEEK sets \Seen, and the new
+/// flags are reported in the FETCH response that did it.
+#[test]
+fn a_fetch_that_sets_seen_says_so() {
+    let mut s = three();
+    // Message 2 is unseen: asked for without FLAGS, they are sent anyway.
+    let out = s.run("a FETCH 2 BODY[TEXT]\r\n");
+    assert!(out.contains("jumps over") && out.contains("FLAGS (\\Seen)"), "{out}");
+    // Asked for with FLAGS, the flags are the ones after the change, wherever they were asked for.
+    let out = s.run("b FETCH 3 (FLAGS BODY[HEADER])\r\n");
+    assert!(out.contains("FLAGS (\\Seen \\Flagged)") || out.contains("FLAGS (\\Flagged \\Seen)"), "{out}");
+    assert_eq!(out.matches("FLAGS").count(), 1, "once: {out}");
+    // Already seen: nothing is added.
+    let out = s.run("c FETCH 1 BODY[TEXT]\r\n");
+    assert!(!out.contains("FLAGS"), "{out}");
+    // PEEK does not set it, and says nothing.
+    s.run("d STORE 2 -FLAGS.SILENT (\\Seen)\r\n");
+    let out = s.run("e FETCH 2 BODY.PEEK[TEXT]\r\n");
+    assert!(!out.contains("FLAGS"), "{out}");
+    assert!(s.run("f FETCH 2 FLAGS\r\n").contains("FLAGS ()"));
+    // RFC822 and RFC822.TEXT set it too; RFC822.HEADER does not.
+    let out = s.run("g FETCH 2 RFC822.HEADER\r\n");
+    assert!(!out.contains("FLAGS"), "{out}");
+    let out = s.run("h FETCH 2 RFC822.TEXT\r\n");
+    assert!(out.contains("FLAGS (\\Seen)"), "{out}");
+    s.run("i STORE 2 -FLAGS.SILENT (\\Seen)\r\n");
+    let out = s.run("j UID FETCH 2 RFC822\r\n");
+    assert!(out.contains("FLAGS (\\Seen)") && out.contains("UID 2"), "{out}");
+    // A read-only session changes nothing.
+    s.run("k STORE 2 -FLAGS.SILENT (\\Seen)\r\n");
+    s.run("l CLOSE\r\nm EXAMINE INBOX\r\n");
+    let out = s.run("n FETCH 2 BODY[TEXT]\r\n");
+    assert!(!out.contains("FLAGS"), "{out}");
+    assert!(s.run("o FETCH 2 FLAGS\r\n").contains("FLAGS ()"));
 }

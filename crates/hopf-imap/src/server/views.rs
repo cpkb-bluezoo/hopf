@@ -677,6 +677,9 @@ pub(crate) struct AppendView<'a> {
     pub body_path: Option<std::path::PathBuf>,
     #[allow(dead_code)]
     pub flags: BTreeSet<Flag>,
+    /// The keywords (`$Forwarded`, ...) the client gave: the handler's
+    /// `proceed` carries the system flags only.
+    pub keywords: BTreeSet<String>,
     #[allow(dead_code)]
     pub internal_date: Option<SystemTime>,
     pub authenticated: &'a mut Option<Box<dyn AuthenticatedHandler>>,
@@ -700,6 +703,7 @@ impl AppendState for AppendView<'_> {
         };
         let bundle = Arc::clone(self.bundle);
         let mailbox = self.mailbox.clone();
+        let keywords = self.keywords.clone();
         let body_path = self.body_path.take();
         let tag = self.tag.to_string();
         let busy = Arc::clone(self.busy);
@@ -725,6 +729,7 @@ impl AppendState for AppendView<'_> {
                         let uid = append_streaming(
                             mb.as_mut(),
                             &flags,
+                            &keywords,
                             internal_date,
                             body_path.as_deref(),
                         )
@@ -740,6 +745,7 @@ impl AppendState for AppendView<'_> {
                         let uid = append_streaming(
                             mb.as_mut(),
                             &flags,
+                            &keywords,
                             internal_date,
                             body_path.as_deref(),
                         )
@@ -793,6 +799,7 @@ impl AppendState for AppendView<'_> {
 fn append_streaming(
     mb: &mut dyn Mailbox,
     flags: &BTreeSet<Flag>,
+    keywords: &BTreeSet<String>,
     internal_date: Option<SystemTime>,
     body_path: Option<&std::path::Path>,
 ) -> hopf_mailbox::MailboxResult<u64> {
@@ -809,7 +816,15 @@ fn append_streaming(
             guard.append_content(&buf[..n])?;
         }
     }
-    guard.commit()
+    let uid = guard.commit()?;
+    // The new message is the last one. A store that keeps no keywords of its
+    // own leaves them out, as a refusal of them would be to refuse the message.
+    if !keywords.is_empty() {
+        if let Ok(count) = mb.message_count() {
+            let _ = mb.set_keywords(count, keywords, true);
+        }
+    }
+    Ok(uid)
 }
 
 pub(crate) struct FetchView<'a> {
@@ -876,7 +891,7 @@ impl FetchState for FetchView<'_> {
                     if !matched {
                         continue;
                     }
-                    let modseq = mb.modseq(seq).unwrap_or(0);
+                    let mut modseq = mb.modseq(seq).unwrap_or(0);
                     if let Some(since) = changed_since {
                         // Only include messages the backend reports as changed.
                         // If modseq is unsupported (0), skip rather than lie.
@@ -884,7 +899,7 @@ impl FetchState for FetchView<'_> {
                             continue;
                         }
                     }
-                    let flags = mb.flags(seq).map_err(|e| e.to_string())?;
+                    let mut flags = mb.flags(seq).map_err(|e| e.to_string())?;
                     let keywords = mb.keywords(seq).unwrap_or_default();
                     let size = mb
                         .messages()
@@ -895,11 +910,26 @@ impl FetchState for FetchView<'_> {
                                 .map(|d| d.size)
                         })
                         .unwrap_or(0);
-                    if set_seen && !read_only {
+                    // Fetching a body without PEEK marks the message seen, and
+                    // the client is told (RFC 9051 §6.4.5): the reply carries the
+                    // flags and modification sequence as they are after the change.
+                    let mut seen_just_now = false;
+                    if set_seen && !read_only && !flags.contains(&Flag::Seen) {
                         let mut seen = BTreeSet::new();
                         seen.insert(Flag::Seen);
-                        let _ = mb.set_flags(seq, &seen, true);
+                        if mb.set_flags(seq, &seen, true).is_ok() {
+                            seen_just_now = true;
+                            flags = mb.flags(seq).unwrap_or(flags);
+                            modseq = mb.modseq(seq).unwrap_or(modseq);
+                        }
                     }
+                    let announce_flags: Vec<FetchItem>;
+                    let wanted: &[FetchItem] = if seen_just_now && !items.iter().any(|i| matches!(i, FetchItem::Flags)) {
+                        announce_flags = items.iter().cloned().chain(std::iter::once(FetchItem::Flags)).collect();
+                        &announce_flags
+                    } else {
+                        &items
+                    };
                     let modseq_opt = if modseq > 0 { Some(modseq) } else { None };
                     let email_id = mb.email_id(seq).ok().flatten();
 
@@ -907,7 +937,7 @@ impl FetchState for FetchView<'_> {
                     buf.extend_from_slice(format!("* {seq} FETCH ").as_bytes());
                     let push_result = push_fetch_attrs(
                         mb.as_mut(),
-                        &items,
+                        wanted,
                         seq,
                         uid,
                         size,

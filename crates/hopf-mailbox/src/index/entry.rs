@@ -47,7 +47,9 @@ pub struct IndexEntry {
     /// Sent date (Unix millis); 0 = unknown.
     pub sent_date: i64,
     flags_byte: u8,
-    /// Parallel to descriptors: location, from, to, cc, bcc, subject, message-id, keywords [, body]
+    /// Parallel to descriptors: location, from, to, cc, bcc, subject, message-id, keywords [, body].
+    /// `from`, `to`, `cc` and `bcc` hold the addresses, lowercased and space-joined in
+    /// header order, then the lowercased display names, each after a tab.
     props: Vec<String>,
 }
 

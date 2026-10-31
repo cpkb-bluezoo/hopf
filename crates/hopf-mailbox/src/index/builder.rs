@@ -26,6 +26,13 @@ struct CollectHandler {
     to: String,
     cc: String,
     bcc: String,
+    /// The display names of the same headers, lowercased, each after a tab:
+    /// appended to the addresses when the entry is made, so that a search
+    /// finds `Bob Jones <bob@x.org>` by either.
+    from_names: String,
+    to_names: String,
+    cc_names: String,
+    bcc_names: String,
     subject: String,
     message_id: String,
     /// `References` header's message-IDs, space-joined in header order
@@ -78,6 +85,19 @@ impl CollectHandler {
         push_lowercase(field, local);
         field.push('@');
         push_lowercase(field, domain);
+    }
+
+    /// Notes `name`, the display name of the address just added.
+    fn add_display_name(&mut self, name: &str) {
+        let field = match self.target {
+            Target::From => &mut self.from_names,
+            Target::To => &mut self.to_names,
+            Target::Cc => &mut self.cc_names,
+            Target::Bcc => &mut self.bcc_names,
+            _ => return,
+        };
+        field.push('\t');
+        push_lowercase(field, name);
     }
 }
 
@@ -148,11 +168,14 @@ impl MessageHandler for CollectHandler {
 
     fn mailbox(
         &mut self,
-        _display_name: Option<&str>,
+        display_name: Option<&str>,
         local_part: &str,
         domain: &str,
     ) -> rmimeparser::ParseResult<()> {
         self.add_address(local_part, domain);
+        if let Some(name) = display_name.map(str::trim).filter(|n| !n.is_empty()) {
+            self.add_display_name(name);
+        }
         Ok(())
     }
 
@@ -314,10 +337,10 @@ impl IndexBuilder {
         };
         let mut props = vec![String::new(); n];
         props[DESC_LOCATION] = location.to_ascii_lowercase();
-        props[DESC_FROM] = handler.from;
-        props[DESC_TO] = handler.to;
-        props[DESC_CC] = handler.cc;
-        props[DESC_BCC] = handler.bcc;
+        props[DESC_FROM] = handler.from + &handler.from_names;
+        props[DESC_TO] = handler.to + &handler.to_names;
+        props[DESC_CC] = handler.cc + &handler.cc_names;
+        props[DESC_BCC] = handler.bcc + &handler.bcc_names;
         props[DESC_SUBJECT] = handler.subject;
         props[DESC_MESSAGE_ID] = handler.message_id;
         props[DESC_KEYWORDS] = kw;
@@ -412,6 +435,17 @@ This is the body.\r\nSecond line of the body.\r\n";
             self.data = &self.data[n..];
             Ok(n)
         }
+    }
+
+    #[test]
+    fn address_fields_start_with_the_addresses_and_carry_the_display_names_after_them() {
+        let raw = b"From: \"Bob Jones\" <Bob@X.org>, carol@x.org\r\nTo: Dave <d@x.org>\r\nSubject: s\r\n\r\nb\r\n";
+        let entry = IndexBuilder::new(IndexConfig::default()).build(1, 1, 10, "m", &BTreeSet::new(), &BTreeSet::new(), 0, raw);
+        // The first token is still the first address: SORT reads it.
+        let from = entry.prop(DESC_FROM);
+        assert_eq!(from.split_whitespace().next(), Some("bob@x.org"), "{from:?}");
+        assert!(from.contains("carol@x.org") && from.contains("bob jones"), "{from:?}");
+        assert!(entry.prop(DESC_TO).starts_with("d@x.org") && entry.prop(DESC_TO).contains("dave"));
     }
 
     #[test]

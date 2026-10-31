@@ -1553,6 +1553,7 @@ impl ImapControlHandler {
             self.send(endpoint, tagged_bad(&tag, "APPEND requires a message literal"));
             return;
         };
+        let keywords = flags.keywords;
         let flags = flags.flags;
         let internal_date: Option<SystemTime> = None;
         if let Some(mut h) = self.selected.take() {
@@ -1562,6 +1563,7 @@ impl ImapControlHandler {
                 mailbox: name.clone(),
                 body_path: Some(body_path),
                 flags: flags.clone(),
+                keywords: keywords.clone(),
                 internal_date,
                 authenticated: &mut self.authenticated,
                 bundle: &self.bundle,
@@ -1587,6 +1589,7 @@ impl ImapControlHandler {
                 mailbox: name.clone(),
                 body_path: Some(body_path),
                 flags: flags.clone(),
+                keywords: keywords.clone(),
                 internal_date,
                 authenticated: &mut self.authenticated,
                 bundle: &self.bundle,
