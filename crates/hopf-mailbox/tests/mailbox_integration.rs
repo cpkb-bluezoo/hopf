@@ -448,3 +448,62 @@ fn address_searches_match_the_display_names_as_well_as_the_addresses() {
         mb.close(false).unwrap();
     }
 }
+
+/// HIGHESTMODSEQ must never be behind a message's own modification sequence,
+/// and what was reached must survive closing and opening the mailbox again.
+#[test]
+fn highest_modseq_follows_the_changes_and_survives_a_reopen() {
+    let dir = tempdir().unwrap();
+    let mut store = MaildirFactory::new(dir.path()).create_store();
+    store.open("u").unwrap();
+    let mut mb = store.open_mailbox("INBOX", false).unwrap();
+    for subject in ["a", "b", "c"] {
+        append_whole(mb.as_mut(), &sample_msg(subject, "x"), &BTreeSet::new(), None).unwrap();
+    }
+    let before = mb.status().unwrap().highest_modseq;
+    let flags = BTreeSet::from([Flag::Flagged]);
+    mb.set_flags(2, &flags, true).unwrap();
+    mb.set_flags(2, &BTreeSet::from([Flag::Seen]), true).unwrap();
+    let own = mb.modseq(2).unwrap();
+    let highest = mb.status().unwrap().highest_modseq;
+    assert!(own > before, "a change moves the message's own sequence on: {own} after {before}");
+    assert!(highest >= own, "highest {highest} is behind the message's own {own}");
+    mb.close(false).unwrap();
+    drop(mb);
+
+    let mb = store.open_mailbox("INBOX", true).unwrap();
+    let reopened = mb.status().unwrap().highest_modseq;
+    assert_eq!(mb.modseq(2).unwrap(), own, "the message's sequence was kept");
+    assert!(reopened >= own, "after reopening, highest {reopened} is behind the message's own {own}");
+    for seq in 1..=3 {
+        assert!(mb.modseq(seq).unwrap() <= reopened, "message {seq} is ahead of the highest");
+    }
+}
+
+/// A refresh picks up what other writers did; it must not lose what this
+/// session did and has not yet been written out.
+#[test]
+fn a_refresh_keeps_the_modification_sequences_this_session_has_made() {
+    let dir = tempdir().unwrap();
+    let mut store = MaildirFactory::new(dir.path()).create_store();
+    store.open("u").unwrap();
+    let mut mb = store.open_mailbox("INBOX", false).unwrap();
+    for subject in ["a", "b"] {
+        append_whole(mb.as_mut(), &sample_msg(subject, "x"), &BTreeSet::new(), None).unwrap();
+    }
+    mb.set_flags(1, &BTreeSet::from([Flag::Flagged]), true).unwrap();
+    mb.set_keywords(1, &BTreeSet::from(["$k".to_string()]), true).unwrap();
+    let own = mb.modseq(1).unwrap();
+    let highest = mb.status().unwrap().highest_modseq;
+    assert!(highest >= own);
+
+    mb.refresh().unwrap();
+    assert_eq!(mb.modseq(1).unwrap(), own, "the message's own sequence went back");
+    assert_eq!(mb.status().unwrap().highest_modseq, highest, "highest went back");
+    assert!(mb.flags(1).unwrap().contains(&Flag::Flagged));
+    assert!(mb.keywords(1).unwrap().contains("$k"), "the keyword was lost");
+    // And the next change goes on from where it was, not from an older number.
+    mb.set_flags(2, &BTreeSet::from([Flag::Seen]), true).unwrap();
+    assert!(mb.modseq(2).unwrap() > highest, "sequences must not be reused");
+    mb.close(false).unwrap();
+}

@@ -1025,3 +1025,71 @@ fn a_fetch_that_sets_seen_says_so() {
     assert!(!out.contains("FLAGS"), "{out}");
     assert!(s.run("o FETCH 2 FLAGS\r\n").contains("FLAGS ()"));
 }
+
+/// A NOOP re-reads the mailbox; the modification sequences the session had
+/// made must not go back with it, nor HIGHESTMODSEQ on the next SELECT.
+#[test]
+fn a_noop_does_not_take_modification_sequences_back() {
+    let number = |out: &str, after: &str| -> u64 {
+        out.split(after).nth(1).and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).and_then(|n| n.parse().ok()).unwrap_or_else(|| panic!("{after} in {out}"))
+    };
+    for pipelined in [false, true] {
+        let mut s = three();
+        s.run("a ENABLE CONDSTORE\r\n");
+        let stored = s.run("b STORE 1 +FLAGS (\\Flagged)\r\n");
+        let changed = number(&stored, "MODSEQ (");
+        assert!(changed > 3, "{stored}");
+        let out = if pipelined {
+            s.run("c NOOP\r\nd FETCH 1 MODSEQ\r\ne SELECT INBOX (CONDSTORE)\r\n")
+        } else {
+            let a = s.run("c NOOP\r\n");
+            let b = s.run("d FETCH 1 MODSEQ\r\n");
+            let c = s.run("e SELECT INBOX (CONDSTORE)\r\n");
+            format!("{a}{b}{c}")
+        };
+        assert_eq!(number(&out, "FETCH (MODSEQ ("), changed, "pipelined={pipelined}: {out}");
+        assert!(number(&out, "[HIGHESTMODSEQ ") >= changed, "pipelined={pipelined}: {out}");
+        assert!(s.run("f STATUS INBOX (HIGHESTMODSEQ)\r\n").contains(&format!("HIGHESTMODSEQ {}", number(&out, "[HIGHESTMODSEQ "))));
+    }
+}
+
+/// RFC 7162 §3.1: until the client has enabled CONDSTORE - by ENABLE, by
+/// SELECT (CONDSTORE), or by using something only CONDSTORE has - the server
+/// sends no modification sequences.
+#[test]
+fn modseq_is_only_sent_once_condstore_is_enabled() {
+    let mut s = three();
+    let out = s.run("a FETCH 1:3 (FLAGS UID)\r\n");
+    assert!(!out.contains("MODSEQ"), "plain fetch: {out}");
+    let out = s.run("b STORE 2 +FLAGS (\\Answered)\r\n");
+    assert!(out.contains("FLAGS (") && !out.contains("MODSEQ"), "store reply: {out}");
+    let out = s.run("c FETCH 3 BODY[TEXT]\r\n");
+    assert!(out.contains("FLAGS (\\Seen \\Flagged)") && !out.contains("MODSEQ"), "implicit seen: {out}");
+    let out = s.run("d UID STORE 1 +FLAGS (\\Flagged)\r\n");
+    assert!(!out.contains("MODSEQ"), "{out}");
+    assert!(!s.run("e SELECT INBOX\r\n").contains("HIGHESTMODSEQ"));
+
+    // Asking for MODSEQ is using CONDSTORE: it is given, and stays on.
+    let mut s = three();
+    let out = s.run("a FETCH 1 (UID MODSEQ)\r\n");
+    assert!(out.contains("* 1 FETCH (UID 1 MODSEQ ("), "{out}");
+    let out = s.run("b STORE 2 +FLAGS (\\Answered)\r\n");
+    assert!(out.contains("MODSEQ ("), "enabled by the fetch: {out}");
+    assert!(s.run("c FETCH 1 FLAGS\r\n").contains("MODSEQ ("));
+
+    // So is searching on it.
+    let mut s = three();
+    assert!(s.run("a SEARCH MODSEQ 1\r\n").contains("* SEARCH "));
+    assert!(s.run("b FETCH 1 FLAGS\r\n").contains("MODSEQ ("));
+
+    // And CHANGEDSINCE, ENABLE and SELECT (CONDSTORE).
+    let mut s = three();
+    assert!(s.run("a FETCH 1:* FLAGS (CHANGEDSINCE 1)\r\n").contains("MODSEQ ("));
+    assert!(s.run("b STORE 1 +FLAGS.SILENT (\\Answered)\r\nc STORE 1 +FLAGS (\\Seen)\r\n").contains("MODSEQ ("));
+    let mut s = three();
+    s.run("a ENABLE CONDSTORE\r\n");
+    assert!(s.run("b FETCH 1 FLAGS\r\n").contains("MODSEQ ("));
+    let mut s = three();
+    s.run("a SELECT INBOX (CONDSTORE)\r\n");
+    assert!(s.run("b STORE 1 +FLAGS (\\Answered)\r\n").contains("MODSEQ ("));
+}

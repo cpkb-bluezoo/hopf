@@ -497,7 +497,6 @@ pub fn format_fetch_attrs(
     let mut out = Vec::from(b"(".as_slice());
     let mut first = true;
     let mut wrote_uid = false;
-    let mut wrote_modseq = false;
 
     let emit = |name: &str, value: &[u8], buf: &mut Vec<u8>, first: &mut bool| {
         if !*first {
@@ -524,7 +523,6 @@ pub fn format_fetch_attrs(
                     // RFC 7162: MODSEQ value is parenthesized.
                     let v = format!("({m})");
                     emit("MODSEQ", v.as_bytes(), &mut out, &mut first);
-                    wrote_modseq = true;
                 }
             }
             FetchItem::Rfc822Size => {
@@ -597,12 +595,7 @@ pub fn format_fetch_attrs(
     if by_uid && !wrote_uid {
         emit("UID", uid.to_string().as_bytes(), &mut out, &mut first);
     }
-    if let Some(m) = modseq {
-        if !wrote_modseq {
-            let v = format!("({m})");
-            emit("MODSEQ", v.as_bytes(), &mut out, &mut first);
-        }
-    }
+    // (MODSEQ is only ever given where it is asked for: as an item.)
     out.push(b')');
     out
 }
@@ -789,7 +782,6 @@ pub fn push_fetch_attrs(
     push(b"(");
     let mut first = true;
     let mut wrote_uid = false;
-    let mut wrote_modseq = false;
 
     for item in items {
         if !first {
@@ -810,7 +802,6 @@ pub fn push_fetch_attrs(
                 if let Some(m) = modseq {
                     push(b"MODSEQ ");
                     push(format!("({m})").as_bytes());
-                    wrote_modseq = true;
                 } else {
                     // Nothing written for this item — undo the separator
                     // we just pushed so we don't leave a dangling space.
@@ -914,18 +905,8 @@ pub fn push_fetch_attrs(
         if !first {
             push(b" ");
         }
-        first = false;
         push(b"UID ");
         push(uid.to_string().as_bytes());
-    }
-    if let Some(m) = modseq {
-        if !wrote_modseq {
-            if !first {
-                push(b" ");
-            }
-            push(b"MODSEQ ");
-            push(format!("({m})").as_bytes());
-        }
     }
     push(b")");
     Ok(())

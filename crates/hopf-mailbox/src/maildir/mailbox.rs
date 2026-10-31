@@ -225,6 +225,11 @@ impl Mailbox for MaildirMailbox {
             .collect();
 
         move_new_to_cur(&self.dir)?;
+        // What this session has changed is written out first: the reload below
+        // would otherwise replace it with what is on disk, and the modification
+        // sequences (and keywords) it has made would go back.
+        self.uidlist.save()?;
+        self.keywords.save()?;
         // Pick up flag/keyword changes and UIDASSIGN updates from other writers.
         let default_uv = self.uidlist.uid_validity;
         self.uidlist = UidList::load_or_new(&self.dir, default_uv)?;

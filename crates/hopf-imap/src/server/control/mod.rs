@@ -1403,6 +1403,10 @@ impl ImapControlHandler {
         if !self.require_selected(endpoint, &tag) {
             return;
         }
+        if items.iter().any(|i| matches!(i, FetchItem::ModSeq)) && self.config.enable_condstore {
+            // Asking for MODSEQ is using CONDSTORE (RFC 7162 §3.1).
+            self.enabled.condstore = true;
+        }
         if modifiers.changed_since.is_some() && !self.enabled.condstore {
             // Implicitly enable CONDSTORE when CHANGEDSINCE is used (RFC 7162).
             if self.config.enable_condstore {
@@ -1626,6 +1630,7 @@ impl ImapControlHandler {
             return;
         };
         let mut view = StoreView {
+            condstore: self.enabled.condstore,
             endpoint,
             tag: &tag,
             set: set.clone(),
@@ -1656,6 +1661,10 @@ impl ImapControlHandler {
     fn cmd_search(&mut self, endpoint: &mut dyn Endpoint, tag: String, criteria: SearchCriteria, by_uid: bool) {
         if !self.require_selected(endpoint, &tag) {
             return;
+        }
+        if uses_modseq(&criteria) && self.config.enable_condstore {
+            // Searching on MODSEQ is using CONDSTORE (RFC 7162 §3.1).
+            self.enabled.condstore = true;
         }
         let Some(mut h) = self.selected.take() else {
             return;
@@ -2029,6 +2038,17 @@ impl ImapControlHandler {
         self.sync_pending(endpoint);
         self.sync_pending_auth_check(endpoint);
         self.drain_queue(endpoint);
+    }
+}
+
+/// Does a search key anywhere in `criteria` ask about modification sequences?
+fn uses_modseq(criteria: &SearchCriteria) -> bool {
+    match criteria {
+        SearchCriteria::ModSeq(_) => true,
+        SearchCriteria::And(keys) => keys.iter().any(uses_modseq),
+        SearchCriteria::Or(a, b) => uses_modseq(a) || uses_modseq(b),
+        SearchCriteria::Not(key) => uses_modseq(key),
+        _ => false,
     }
 }
 

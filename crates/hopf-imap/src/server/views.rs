@@ -982,6 +982,8 @@ pub(crate) struct StoreView<'a> {
     pub set: MessageSet,
     #[allow(dead_code)]
     pub by_uid: bool,
+    /// The client has enabled CONDSTORE: replies carry modification sequences.
+    pub condstore: bool,
     pub selected: &'a mut Option<Box<dyn SelectedHandler>>,
     pub bundle: &'a Arc<Mutex<MailboxBundle>>,
     pub runtime: &'a Arc<Runtime>,
@@ -1001,6 +1003,7 @@ impl StoreState for StoreView<'_> {
         let set = self.set.clone();
         let tag = self.tag.to_string();
         let busy = Arc::clone(self.busy);
+        let condstore = self.condstore;
         let pending = Arc::clone(self.pending_open);
         *pending.lock().unwrap() = Some(PendingOpen {
             auth_handler: None,
@@ -1052,8 +1055,9 @@ impl StoreState for StoreView<'_> {
                         let f = mb.flags(seq).map_err(|e| e.to_string())?;
                         let k = mb.keywords(seq).unwrap_or_default();
                         let modseq = mb.modseq(seq).ok().filter(|&m| m > 0);
+                        let items: &[FetchItem] = if condstore { &[FetchItem::Flags, FetchItem::ModSeq] } else { &[FetchItem::Flags] };
                         let attrs = format_fetch_attrs(
-                            &[FetchItem::Flags],
+                            items,
                             seq,
                             uid,
                             0,
