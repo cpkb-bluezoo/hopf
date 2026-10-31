@@ -348,10 +348,9 @@ pub struct ImapMetadataEntry {
 
 /// Parsed untagged `METADATA` response.
 ///
-/// Values sent as a wire literal (`{n}\r\n…`) rather than a quoted string
-/// or bare atom aren't supported — the same limitation `ImapNamespaceData`
-/// / `ImapQuotaData` already have, inherited from the lexer's single-line
-/// bounded-capture for these responses (see [`super::reply::ImapEvent::Metadata`]).
+/// The reply lexer builds this directly as the response arrives (see
+/// [`super::reply::ImapEvent::Metadata`]), values sent as literals included;
+/// [`ImapMetadataData::parse`] reads the same shape from text.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ImapMetadataData {
     /// Mailbox the entries apply to (`""` = server annotations).
@@ -361,8 +360,9 @@ pub struct ImapMetadataData {
 }
 
 impl ImapMetadataData {
-    /// Parse `mailbox (entry value entry value …)` — the `METADATA`
-    /// keyword itself is already consumed by the lexer's bounded capture.
+    /// Parse `mailbox (entry value entry value …)` from text, without the
+    /// `METADATA` keyword. (The reply lexer does not use this: it builds the
+    /// value token by token.)
     pub fn parse(raw: &str) -> Option<Self> {
         let rest = raw.trim_start();
         let (mailbox, items) = split_mailbox_and_list(rest)?;
@@ -411,8 +411,9 @@ pub struct ImapNamespaceData {
 }
 
 impl ImapNamespaceData {
-    /// Parse `personal other shared` — the `NAMESPACE` keyword itself is
-    /// already consumed by the lexer's bounded capture ([`ImapEvent::Namespace`](super::reply::ImapEvent::Namespace)).
+    /// Parse `personal other shared` from text, without the `NAMESPACE`
+    /// keyword. (The reply lexer builds [`ImapEvent::Namespace`](super::reply::ImapEvent::Namespace)
+    /// token by token and does not use this.)
     pub fn parse(raw: &str) -> Option<Self> {
         let rest = raw.trim_start();
         let mut data = Self::default();
@@ -445,8 +446,9 @@ pub struct ImapQuotaData {
 }
 
 impl ImapQuotaData {
-    /// Parse `root (name usage limit …)` — the `QUOTA` keyword itself is
-    /// already consumed by the lexer's bounded capture ([`ImapEvent::Quota`](super::reply::ImapEvent::Quota)).
+    /// Parse `root (name usage limit …)` from text, without the `QUOTA`
+    /// keyword. (The reply lexer builds [`ImapEvent::Quota`](super::reply::ImapEvent::Quota)
+    /// token by token and does not use this.)
     pub fn parse(raw: &str) -> Option<Self> {
         let rest = raw.trim_start();
         let (root, items) = split_mailbox_and_list(rest)?;
@@ -475,8 +477,9 @@ pub struct ImapQuotaRootData {
 }
 
 impl ImapQuotaRootData {
-    /// Parse `mailbox root…` — the `QUOTAROOT` keyword itself is already
-    /// consumed by the lexer's bounded capture ([`ImapEvent::QuotaRoot`](super::reply::ImapEvent::QuotaRoot)).
+    /// Parse `mailbox root…` from text, without the `QUOTAROOT` keyword.
+    /// (The reply lexer builds [`ImapEvent::QuotaRoot`](super::reply::ImapEvent::QuotaRoot)
+    /// token by token and does not use this.)
     pub fn parse(raw: &str) -> Option<Self> {
         let rest = raw.trim_start();
         let mut parts = rest.split_whitespace();
@@ -497,9 +500,10 @@ pub struct ImapThreadNode {
     pub children: Vec<ImapThreadNode>,
 }
 
-/// Parse a `THREAD` response body into its forest of threads — the
-/// `THREAD` keyword itself is already consumed by the lexer's bounded
-/// capture ([`ImapEvent::ThreadData`](super::reply::ImapEvent::ThreadData)).
+/// Parse a `THREAD` response body from text into its forest of threads,
+/// without the `THREAD` keyword. (The reply lexer builds
+/// [`ImapEvent::ThreadData`](super::reply::ImapEvent::ThreadData) token by
+/// token and does not use this.)
 /// An empty (all-whitespace) body parses as no threads, matching RFC 5256
 /// §2's "no untagged THREAD at all when there's nothing to thread" — a
 /// caller that never sees the event should treat that the same way.

@@ -20,7 +20,7 @@ use super::handlers::{ImapClientDriver, ImapClientHandlerFactory};
 use super::pending::{ImapTagGenerator, PendingCommand, PendingKind, PendingMap, UntaggedClass};
 use super::reply::{ImapEvent, ImapReplyLexer, ImapStatus};
 use super::state::{
-    parse_thread_response, ImapAppendUid, ImapCapabilities, ImapClientAppend,
+    ImapThreadNode, ImapAppendUid, ImapCapabilities, ImapClientAppend,
     ImapClientAuthExchange, ImapClientAuthenticated, ImapClientIdle, ImapClientNotAuthenticated,
     ImapClientPostStarttls, ImapClientSelected, ImapCopyUid, ImapEnabledFeatures, ImapFetchData,
     ImapListEntry, ImapListOptions, ImapMailboxInfo, ImapMetadataData, ImapNamespaceData, ImapQuotaData,
@@ -550,16 +550,13 @@ impl ImapClientEndpoint {
         let _ = ep;
     }
 
-    fn on_thread_data(&mut self, payload: &str, ep: &mut dyn Endpoint) {
+    fn on_thread_data(&mut self, threads: &[ImapThreadNode], ep: &mut dyn Endpoint) {
         let _ = ep;
         if self.pending.oldest_of_kind(PendingKind::Thread).is_none() {
             return;
         }
-        let Some(threads) = parse_thread_response(payload) else {
-            return;
-        };
         if let Some(mut driver) = self.driver.take() {
-            driver.on_thread_data(&threads);
+            driver.on_thread_data(threads);
             self.driver = Some(driver);
         }
     }
@@ -736,67 +733,58 @@ impl ImapClientEndpoint {
         }
     }
 
-    fn on_namespace(&mut self, payload: &str, ep: &mut dyn Endpoint) {
+    fn on_namespace(&mut self, data: &ImapNamespaceData, ep: &mut dyn Endpoint) {
         let _ = ep;
         if self.pending.oldest_of_kind(PendingKind::Namespace).is_none() {
             return;
         }
-        if let Some(data) = ImapNamespaceData::parse(payload) {
-            if let Some(mut driver) = self.driver.take() {
-                driver.on_namespace(&data);
-                self.driver = Some(driver);
-            }
-        }
-    }
-
-    fn on_quota(&mut self, payload: &str, ep: &mut dyn Endpoint) {
-        let _ = ep;
-        if self.pending.oldest_of_kind(PendingKind::Quota).is_none() {
-            return;
-        }
-        if let Some(data) = ImapQuotaData::parse(payload) {
-            if let Some(mut driver) = self.driver.take() {
-                driver.on_quota(&data);
-                self.driver = Some(driver);
-            }
-        }
-    }
-
-    fn on_quota_root(&mut self, payload: &str, ep: &mut dyn Endpoint) {
-        let _ = ep;
-        if self.pending.oldest_of_kind(PendingKind::Quota).is_none() {
-            return;
-        }
-        if let Some(data) = ImapQuotaRootData::parse(payload) {
-            if let Some(mut driver) = self.driver.take() {
-                driver.on_quota_root(&data);
-                self.driver = Some(driver);
-            }
-        }
-    }
-
-    fn on_id_params(&mut self, payload: &str, ep: &mut dyn Endpoint) {
-        let _ = ep;
-        if self.pending.oldest_of_kind(PendingKind::Id).is_none() {
-            return;
-        }
-        let params = parse_id_params(payload);
         if let Some(mut driver) = self.driver.take() {
-            driver.on_id_params(&params);
+            driver.on_namespace(data);
             self.driver = Some(driver);
         }
     }
 
-    fn on_metadata(&mut self, payload: &str, ep: &mut dyn Endpoint) {
+    fn on_quota(&mut self, data: &ImapQuotaData, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if self.pending.oldest_of_kind(PendingKind::Quota).is_none() {
+            return;
+        }
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_quota(data);
+            self.driver = Some(driver);
+        }
+    }
+
+    fn on_quota_root(&mut self, data: &ImapQuotaRootData, ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if self.pending.oldest_of_kind(PendingKind::Quota).is_none() {
+            return;
+        }
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_quota_root(data);
+            self.driver = Some(driver);
+        }
+    }
+
+    fn on_id_params(&mut self, params: &[(String, String)], ep: &mut dyn Endpoint) {
+        let _ = ep;
+        if self.pending.oldest_of_kind(PendingKind::Id).is_none() {
+            return;
+        }
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_id_params(params);
+            self.driver = Some(driver);
+        }
+    }
+
+    fn on_metadata(&mut self, data: &ImapMetadataData, ep: &mut dyn Endpoint) {
         let _ = ep;
         if self.pending.oldest_of_kind(PendingKind::Metadata).is_none() {
             return;
         }
-        if let Some(data) = ImapMetadataData::parse(payload) {
-            if let Some(mut driver) = self.driver.take() {
-                driver.on_metadata(&data);
-                self.driver = Some(driver);
-            }
+        if let Some(mut driver) = self.driver.take() {
+            driver.on_metadata(data);
+            self.driver = Some(driver);
         }
     }
 
@@ -1704,7 +1692,8 @@ fn parse_flag_list(s: &str) -> Vec<String> {
 
 /// Parse the bounded-captured `ID` payload (already stripped of the `ID `
 /// keyword by the lexer): `(key value key value …)` or `NIL`.
-fn parse_id_params(raw: &str) -> Vec<(String, String)> {
+#[cfg(test)]
+pub(super) fn parse_id_params(raw: &str) -> Vec<(String, String)> {
     let rest = raw.trim();
     if rest.eq_ignore_ascii_case("NIL") {
         return Vec::new();
@@ -1723,6 +1712,7 @@ fn parse_id_params(raw: &str) -> Vec<(String, String)> {
     out
 }
 
+#[cfg(test)]
 fn tokenize_astring_list(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = s.trim();
@@ -1747,6 +1737,7 @@ fn tokenize_astring_list(s: &str) -> Vec<String> {
     out
 }
 
+#[cfg(test)]
 fn find_closing_quote(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     if bytes.first() != Some(&b'"') {
@@ -1766,6 +1757,7 @@ fn find_closing_quote(s: &str) -> Option<usize> {
     None
 }
 
+#[cfg(test)]
 fn unquote_simple(s: &str) -> String {
     let s = s.trim();
     if let Some(inner) = s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {

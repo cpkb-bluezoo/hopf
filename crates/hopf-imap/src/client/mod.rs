@@ -58,9 +58,11 @@ pub mod handlers;
 pub mod pending;
 pub mod pipeline;
 pub mod reply;
+mod sinks;
 pub mod state;
 pub mod structure;
 pub mod timeout;
+mod tokens;
 
 pub use endpoint::ImapClientEndpoint;
 pub use error::{ImapError, ImapResult};

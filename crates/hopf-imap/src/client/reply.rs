@@ -41,7 +41,12 @@
 //! already correct before this rewrite and is unchanged in spirit.
 
 use super::error::ImapError;
-use super::state::{ImapCapabilities, ImapFetchData, ImapListEntry, ImapStatusData};
+use super::sinks::{IdSink, MetadataSink, NamespaceSink, QuotaRootSink, QuotaSink, ThreadSink};
+use super::state::{
+    ImapCapabilities, ImapFetchData, ImapListEntry, ImapMetadataData, ImapNamespaceData, ImapQuotaData,
+    ImapQuotaRootData, ImapStatusData, ImapThreadNode,
+};
+use super::tokens::{Out, Output, Sink, Tokenizer};
 
 /// Cap on one bounded scratch field (an atom, tag, quoted string, message
 /// text, or response-code/NAMESPACE/QUOTA/ID payload) — large enough for
@@ -128,9 +133,8 @@ pub enum ImapEvent {
     SearchNumbers(Vec<u32>),
     /// `* SORT n1 n2 …`.
     SortNumbers(Vec<u32>),
-    /// `* THREAD …` (bounded-captured; caller parses with
-    /// [`super::state::parse_thread_response`]).
-    ThreadData(String),
+    /// `* THREAD …`, as the forest of threads it describes.
+    ThreadData(Vec<ImapThreadNode>),
     /// `* n EXISTS`.
     Exists(u32),
     /// `* n RECENT`.
@@ -168,21 +172,16 @@ pub enum ImapEvent {
     },
     /// `* ENABLED …`.
     Enabled(Vec<String>),
-    /// `* NAMESPACE …` (bounded-captured; caller parses with
-    /// [`super::state::ImapNamespaceData::parse`]).
-    Namespace(String),
-    /// `* QUOTA …` (bounded-captured; caller parses with
-    /// [`super::state::ImapQuotaData::parse`]).
-    Quota(String),
-    /// `* QUOTAROOT …` (bounded-captured; caller parses with
-    /// [`super::state::ImapQuotaRootData::parse`]).
-    QuotaRoot(String),
-    /// `* ID …` (bounded-captured; caller parses with the `ID` params
-    /// helper).
-    IdParams(String),
-    /// `* METADATA mailbox (…)` (bounded-captured; caller parses with
-    /// [`super::state::ImapMetadataData::parse`]).
-    Metadata(String),
+    /// `* NAMESPACE …`, fully parsed.
+    Namespace(ImapNamespaceData),
+    /// `* QUOTA …`, fully parsed.
+    Quota(ImapQuotaData),
+    /// `* QUOTAROOT …`, fully parsed.
+    QuotaRoot(ImapQuotaRootData),
+    /// `* ID …`: the server's `(field, value)` pairs (empty for `NIL`).
+    IdParams(Vec<(String, String)>),
+    /// `* METADATA mailbox (…)`, fully parsed.
+    Metadata(ImapMetadataData),
     /// Unrecognised untagged response — a server extension hopf doesn't
     /// know about. The line has already been consumed.
     Other,
@@ -280,7 +279,6 @@ enum AwaitLfKind {
     ListEntry,
     Fetch,
     StatusData,
-    Bounded(BoundedKind),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,8 +433,9 @@ enum State {
     FetchListCloseCr,
     /// `)` closed the top-level `* FLAGS (…)` list: expect CRLF.
     FlagsListCloseCr,
-    /// Bounded whole-payload capture (`NAMESPACE`/`QUOTA`/`QUOTAROOT`/`ID`).
-    BoundedPayload { kind: BoundedKind },
+    /// A structured payload read to the end of the line by its machine
+    /// (`NAMESPACE`/`QUOTA`/`QUOTAROOT`/`ID`/`THREAD`/`METADATA`).
+    Payload,
     /// Saw CR; waiting for the completing LF, then emit `kind`'s event.
     AwaitLf(AwaitLfKind),
 }
@@ -482,6 +481,14 @@ pub struct ImapReplyLexer {
     /// quoted strings so the result is one line the structure parsers
     /// (`super::structure`) can read.
     fetch_capture: Vec<u8>,
+    /// The payload being read by `State::Payload`.
+    payload: Option<Payload>,
+}
+
+/// A structured payload being read: the tokenizer and the machine it feeds.
+struct Payload {
+    tokens: Tokenizer,
+    sink: Box<dyn Sink>,
 }
 
 /// FETCH items whose structured value is captured rather than parsed inline.
@@ -525,12 +532,18 @@ impl ImapReplyLexer {
             fetch_section: Vec::with_capacity(16),
             fetch_capture_kind: None,
             fetch_capture: Vec::new(),
+            payload: None,
         }
     }
 
     /// Whether the lexer is currently streaming a FETCH literal's octets.
     pub fn in_literal(&self) -> bool {
         matches!(self.state, State::FetchLiteral)
+    }
+
+    /// Is the payload in `State::Payload` in the middle of a literal's octets?
+    fn payload_in_literal(&self) -> bool {
+        self.state == State::Payload && self.payload.as_ref().is_some_and(|p| p.tokens.in_literal())
     }
 
     /// Feed inbound bytes, returning every event completed so far.
@@ -559,6 +572,15 @@ impl ImapReplyLexer {
                 if self.literal_remaining == 0 {
                     self.state = State::FetchAfterValue;
                     events.push(ImapEvent::FetchLiteralEnd { seq: self.fetch_data.seq });
+                }
+                continue;
+            }
+            if self.payload_in_literal() {
+                let payload = self.payload.as_mut().expect("checked above");
+                let (take, out) = payload.tokens.literal_octets(rest, &mut *payload.sink);
+                rest = &rest[take..];
+                if out == Out::Eol {
+                    events.push(self.finish_payload());
                 }
                 continue;
             }
@@ -709,7 +731,7 @@ impl ImapReplyLexer {
             State::FetchAfterValue => self.on_fetch_after_value(b),
             State::FetchListCloseCr => self.on_fetch_list_close_cr(b),
             State::FlagsListCloseCr => self.on_flags_list_close_cr(b),
-            State::BoundedPayload { kind } => self.on_bounded_payload(kind, b),
+            State::Payload => self.on_payload(b),
             State::AwaitLf(kind) => self.on_await_lf(kind, b),
         }
     }
@@ -2205,37 +2227,47 @@ impl ImapReplyLexer {
         Ok(None)
     }
 
-    // ── bounded-capture payloads (NAMESPACE / QUOTA / QUOTAROOT / ID) ────
+    // ── structured payloads (NAMESPACE / QUOTA / QUOTAROOT / ID / THREAD / METADATA) ──
 
     fn begin_bounded(&mut self, kind: BoundedKind, by_cr: bool) -> Result<Option<ImapEvent>, ImapError> {
-        self.text.clear();
+        let sink: Box<dyn Sink> = match kind {
+            BoundedKind::Namespace => Box::<NamespaceSink>::default(),
+            BoundedKind::Quota => Box::<QuotaSink>::default(),
+            BoundedKind::QuotaRoot => Box::<QuotaRootSink>::default(),
+            BoundedKind::Id => Box::<IdSink>::default(),
+            BoundedKind::Thread => Box::<ThreadSink>::default(),
+            BoundedKind::Metadata => Box::<MetadataSink>::default(),
+        };
+        self.payload = Some(Payload { tokens: Tokenizer::line(), sink });
+        self.state = State::Payload;
         if by_cr {
-            self.state = State::AwaitLf(AwaitLfKind::Bounded(kind));
-            return Ok(None);
+            // The line ended at the keyword: the CR has been seen.
+            return self.on_payload(b'\r');
         }
-        self.state = State::BoundedPayload { kind };
         Ok(None)
     }
 
-    fn on_bounded_payload(&mut self, kind: BoundedKind, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b'\r' {
-            self.state = State::AwaitLf(AwaitLfKind::Bounded(kind));
-            return Ok(None);
+    fn on_payload(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
+        let payload = self.payload.as_mut().ok_or_else(|| ImapError::Parse("internal: no payload".into()))?;
+        match payload.tokens.byte(b, &mut *payload.sink)? {
+            Out::Eol => Ok(Some(self.finish_payload())),
+            _ => Ok(None),
         }
-        self.push_text(b)?;
-        self.state = State::BoundedPayload { kind };
-        Ok(None)
     }
 
-    fn finish_bounded(&mut self, kind: BoundedKind) -> ImapEvent {
-        let payload = self.take_text();
-        match kind {
-            BoundedKind::Namespace => ImapEvent::Namespace(payload),
-            BoundedKind::Quota => ImapEvent::Quota(payload),
-            BoundedKind::QuotaRoot => ImapEvent::QuotaRoot(payload),
-            BoundedKind::Id => ImapEvent::IdParams(payload),
-            BoundedKind::Thread => ImapEvent::ThreadData(payload),
-            BoundedKind::Metadata => ImapEvent::Metadata(payload),
+    /// The payload's line has ended: its event, or `Other` if it was not
+    /// what it should have been.
+    fn finish_payload(&mut self) -> ImapEvent {
+        self.state = State::Word1;
+        let Some(Payload { tokens, sink }) = self.payload.take() else {
+            return ImapEvent::Other;
+        };
+        if tokens.is_bad() {
+            return ImapEvent::Other;
+        }
+        match sink.finish() {
+            Ok(Output::Event(event)) => event,
+            Err(_) => ImapEvent::Other,
         }
     }
 
@@ -2281,7 +2313,6 @@ impl ImapReplyLexer {
             AwaitLfKind::ListEntry => ImapEvent::ListEntry(std::mem::take(&mut self.list_entry)),
             AwaitLfKind::Fetch => ImapEvent::Fetch(std::mem::take(&mut self.fetch_data)),
             AwaitLfKind::StatusData => ImapEvent::StatusData(std::mem::take(&mut self.status_data)),
-            AwaitLfKind::Bounded(k) => self.finish_bounded(k),
         };
         Ok(Some(event))
     }
@@ -2359,6 +2390,7 @@ fn apply_status_item(data: &mut ImapStatusData, item: StatusItem, val: Option<i6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::state::{ImapNamespace, ImapQuotaResource};
 
     fn feed_all(lex: &mut ImapReplyLexer, s: &str) -> Vec<ImapEvent> {
         let mut data: &[u8] = s.as_bytes();
@@ -2645,11 +2677,12 @@ mod tests {
     }
 
     #[test]
-    fn thread_data_bounded_capture() {
+    fn thread_data_is_built_as_it_arrives() {
+        let node = |n: u32, children: Vec<ImapThreadNode>| ImapThreadNode { result_number: n, children };
         let mut lex = ImapReplyLexer::new();
         assert_eq!(
             feed_all(&mut lex, "* THREAD (3)(1 2)\r\n"),
-            vec![ImapEvent::ThreadData("(3)(1 2)".into())]
+            vec![ImapEvent::ThreadData(vec![node(3, vec![]), node(1, vec![node(2, vec![])])])]
         );
 
         // RFC 5256 §2: nothing to thread emits no untagged THREAD line at
@@ -2658,7 +2691,7 @@ mod tests {
         let mut lex2 = ImapReplyLexer::new();
         assert_eq!(
             feed_all(&mut lex2, "* THREAD\r\n"),
-            vec![ImapEvent::ThreadData(String::new())]
+            vec![ImapEvent::ThreadData(vec![])]
         );
     }
 
@@ -2955,31 +2988,40 @@ mod tests {
     }
 
     #[test]
-    fn namespace_bounded_capture() {
+    fn namespace_is_built_as_it_arrives() {
         let mut lex = ImapReplyLexer::new();
         let ev = feed_all(&mut lex, "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
-        assert_eq!(ev, vec![ImapEvent::Namespace("((\"\" \"/\")) NIL NIL".into())]);
+        let want = ImapNamespaceData {
+            personal: vec![ImapNamespace { prefix: String::new(), delimiter: Some("/".into()) }],
+            other: vec![],
+            shared: vec![],
+        };
+        assert_eq!(ev, vec![ImapEvent::Namespace(want)]);
     }
 
     #[test]
-    fn quota_bounded_capture() {
+    fn quota_is_built_as_it_arrives() {
         let mut lex = ImapReplyLexer::new();
         let ev = feed_all(&mut lex, "* QUOTA \"\" (STORAGE 10 512)\r\n");
-        assert_eq!(ev, vec![ImapEvent::Quota("\"\" (STORAGE 10 512)".into())]);
+        let want = ImapQuotaData {
+            root: String::new(),
+            resources: vec![ImapQuotaResource { name: "STORAGE".into(), usage: 10, limit: 512 }],
+        };
+        assert_eq!(ev, vec![ImapEvent::Quota(want)]);
     }
 
     #[test]
-    fn quotaroot_and_id_bounded_capture() {
+    fn quotaroot_and_id_are_built_as_they_arrive() {
         let mut lex = ImapReplyLexer::new();
         assert_eq!(
             feed_all(&mut lex, "* QUOTAROOT INBOX \"\"\r\n"),
-            vec![ImapEvent::QuotaRoot("INBOX \"\"".into())]
+            vec![ImapEvent::QuotaRoot(ImapQuotaRootData { mailbox: "INBOX".into(), roots: vec![String::new()] })]
         );
 
         let mut lex2 = ImapReplyLexer::new();
         assert_eq!(
             feed_all(&mut lex2, "* ID (\"name\" \"hopf\")\r\n"),
-            vec![ImapEvent::IdParams("(\"name\" \"hopf\")".into())]
+            vec![ImapEvent::IdParams(vec![("name".into(), "hopf".into())])]
         );
     }
 
