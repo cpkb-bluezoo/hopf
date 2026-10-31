@@ -1904,18 +1904,9 @@ impl ImapControlHandler {
         if !self.require_selected(endpoint, &cmd.tag) {
             return;
         }
-        let args = cmd.args.trim();
-        let mut parts = args.splitn(2, char::is_whitespace);
-        let Some(sub) = parts.next() else {
+        let Some(sub_cmd) = cmd.sub_command() else {
             self.send(endpoint, tagged_bad(&cmd.tag, "Missing UID command"));
             return;
-        };
-        let rest = parts.next().unwrap_or("").trim_start();
-        let sub_cmd = ImapCommand {
-            tag: cmd.tag.clone(),
-            verb: sub.to_ascii_uppercase(),
-            args: rest.to_string(),
-            arg_bytes: rest.as_bytes().to_vec(),
         };
         match sub_cmd.verb.as_str() {
             "FETCH" => self.cmd_fetch(endpoint, sub_cmd, true),
@@ -2441,12 +2432,11 @@ mod append_offload_tests {
         let mut ep = NoopEndpoint;
 
         h.handle_append_chunk(b"hello world");
-        let append_cmd = ImapCommand {
-            tag: "a1".into(),
-            verb: "APPEND".into(),
-            args: "INBOX".into(),
-            arg_bytes: b"INBOX".to_vec(),
-        };
+        let append_cmd = ImapCommand::new(
+            "a1",
+            "APPEND",
+            vec![crate::server::codec::ArgToken::Atom("INBOX".into())],
+        );
         // Mirrors `receive()`'s `LexEvent::Command` arm.
         if h.finalize_pending_append() {
             h.enqueue_or_dispatch(&mut ep, append_cmd);
@@ -2456,12 +2446,7 @@ mod append_offload_tests {
 
         // A further pipelined command must queue behind the still-
         // finalizing APPEND, not run ahead of it.
-        let noop_cmd = ImapCommand {
-            tag: "a2".into(),
-            verb: "NOOP".into(),
-            args: String::new(),
-            arg_bytes: Vec::new(),
-        };
+        let noop_cmd = ImapCommand::new("a2", "NOOP", Vec::new());
         h.enqueue_or_dispatch(&mut ep, noop_cmd);
         if h.pending_append_cmd.is_some() {
             assert_eq!(

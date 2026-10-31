@@ -85,6 +85,11 @@ mod tests {
     use hopf_core::{set_qlog_export_enabled, TelemetryHook};
     use std::sync::{Arc, Mutex};
 
+    /// The qlog export flag and the process telemetry hook are process-wide,
+    /// and tests run on several threads: a test that sets either holds this
+    /// for as long as it needs them to stay as it set them.
+    static GLOBAL_STATE: Mutex<()> = Mutex::new(());
+
     struct Capture(Arc<Mutex<Vec<LogRecord>>>);
 
     impl TelemetryHook for Capture {
@@ -102,6 +107,7 @@ mod tests {
 
     #[test]
     fn telemetry_sink_forwards_when_enabled() {
+        let _global = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
         set_qlog_export_enabled(true);
         let buf = Arc::new(Mutex::new(Vec::new()));
         hopf_core::set_process_telemetry(Arc::new(Capture(Arc::clone(&buf))));
@@ -117,6 +123,7 @@ mod tests {
 
     #[test]
     fn maybe_new_none_when_disabled() {
+        let _global = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
         set_qlog_export_enabled(false);
         assert!(TelemetryQlogSink::maybe_new(true, &[1]).is_none());
     }
