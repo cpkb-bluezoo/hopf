@@ -9,6 +9,7 @@
 mod config;
 mod error;
 mod flag;
+mod list;
 mod message_set;
 mod name_codec;
 mod search;

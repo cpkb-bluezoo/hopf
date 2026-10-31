@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use hopf_core::{ConnHandle, Endpoint, Runtime, StorageError};
 use hopf_mailbox::{
-    Flag, Mailbox, MailboxFactory, MailboxInfo, MailboxStore, MessageSet, SearchCriteria,
+    Flag, Mailbox, MailboxError, MailboxFactory, MailboxInfo, MailboxStore, MessageSet, SearchCriteria,
 };
 
 use crate::server::control::{MailboxBundle, PendingOpen};
@@ -30,6 +30,19 @@ use crate::server::sort::{sort_messages, SortCriterion, SortableMessage};
 use crate::server::status_items::StatusItem;
 use crate::server::thread::{format_thread_response, ThreadAlgorithm, ThreadInput};
 use crate::server::uidplus::{format_appenduid, format_copyuid};
+
+/// The text of the `NO` for a mailbox that is to receive messages but does not
+/// exist: the client may create it and try again (RFC 9051 §6.4.7, §6.3.12).
+const TRY_CREATE: &str = "[TRYCREATE] Mailbox does not exist";
+
+/// A destination mailbox must exist; COPY, MOVE and APPEND do not make it.
+fn check_destination(store: &mut dyn MailboxStore, name: &str) -> Result<(), String> {
+    match store.open_mailbox(name, true) {
+        Ok(_) => Ok(()),
+        Err(MailboxError::NotFound(_)) => Err(TRY_CREATE.to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
 
 /// Shared offload helpers.
 pub(crate) fn begin_busy(endpoint: &mut dyn Endpoint, busy: &Arc<AtomicBool>) {
@@ -720,9 +733,10 @@ impl AppendState for AppendView<'_> {
                         Ok((uv, uid))
                     } else {
                         let store = g.store.as_mut().ok_or_else(|| "no store".to_string())?;
-                        let mut mb = store
-                            .open_mailbox(&mailbox, false)
-                            .map_err(|e| e.to_string())?;
+                        let mut mb = store.open_mailbox(&mailbox, false).map_err(|e| match e {
+                            MailboxError::NotFound(_) => TRY_CREATE.to_string(),
+                            e => e.to_string(),
+                        })?;
                         let uid = append_streaming(
                             mb.as_mut(),
                             &flags,
@@ -1322,6 +1336,10 @@ impl CopyState for CopyView<'_> {
             handle.clone(),
             move || {
                 let mut g = bundle.lock().unwrap();
+                {
+                    let store = g.store.as_mut().ok_or_else(|| "no store".to_string())?;
+                    check_destination(store.as_mut(), &dest)?;
+                }
                 let (src_uids, dest_uids) = {
                     let mb = g.mailbox.as_mut().ok_or_else(|| "no mailbox".to_string())?;
                     let count = mb.message_count().map_err(|e| e.to_string())?;
@@ -1743,6 +1761,10 @@ impl MoveState for MoveView<'_> {
                 let mut g = bundle.lock().unwrap();
                 if g.read_only {
                     return Err("mailbox is read-only".into());
+                }
+                {
+                    let store = g.store.as_mut().ok_or_else(|| "no store".to_string())?;
+                    check_destination(store.as_mut(), &dest)?;
                 }
                 let map = {
                     if g.read_only {

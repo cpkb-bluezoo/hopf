@@ -83,19 +83,10 @@ impl MailboxStore for MboxStore {
         '/'
     }
 
-    fn list(&self, _reference: &str, pattern: &str) -> MailboxResult<Vec<MailboxInfo>> {
+    fn list(&self, reference: &str, pattern: &str) -> MailboxResult<Vec<MailboxInfo>> {
         let _ = self.inbox_path()?;
-        if pattern_matches(pattern, "INBOX") {
-            let mut attrs = BTreeSet::new();
-            attrs.insert(MailboxAttribute::NoInferiors);
-            attrs.insert(MailboxAttribute::HasNoChildren);
-            Ok(vec![MailboxInfo {
-                name: "INBOX".into(),
-                attributes: attrs,
-            }])
-        } else {
-            Ok(vec![])
-        }
+        let inbox = MailboxInfo { name: "INBOX".into(), attributes: BTreeSet::from([MailboxAttribute::NoInferiors]) };
+        Ok(crate::list::rows(vec![inbox], reference, pattern, self.hierarchy_delimiter()))
     }
 
     fn create_mailbox(&mut self, _name: &str) -> MailboxResult<()> {
@@ -130,11 +121,4 @@ impl MailboxStore for MboxStore {
             self.index_config.clone(),
         )?))
     }
-}
-
-fn pattern_matches(pattern: &str, name: &str) -> bool {
-    if pattern == "*" || pattern == "%" || pattern.eq_ignore_ascii_case("INBOX") {
-        return name.eq_ignore_ascii_case("INBOX");
-    }
-    pattern.eq_ignore_ascii_case(name)
 }

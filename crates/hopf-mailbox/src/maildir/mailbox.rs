@@ -639,7 +639,11 @@ impl Mailbox for MaildirMailbox {
             return Err(MailboxError::Invalid("COPY to same mailbox".into()));
         }
         let dest_dir = self.paths.mailbox_dir(destination_mailbox)?;
-        ensure_maildir_layout(&dest_dir)?;
+        // COPY does not make the mailbox it copies to: the client is told to
+        // create it (RFC 9051 §6.4.7, `[TRYCREATE]`).
+        if !dest_dir.join("cur").is_dir() {
+            return Err(MailboxError::NotFound(destination_mailbox.to_string()));
+        }
         let mut dest = MaildirMailbox::open(
             dest_dir,
             destination_mailbox.to_string(),

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use crate::config::IndexConfig;
 use crate::error::{MailboxError, MailboxResult};
 use crate::name_codec::MailboxNameCodec;
-use crate::traits::{Mailbox, MailboxAttribute, MailboxFactory, MailboxInfo, MailboxStore};
+use crate::traits::{Mailbox, MailboxFactory, MailboxInfo, MailboxStore};
 
 use super::mailbox::{ensure_maildir_layout, resolve_mailbox_dir, MaildirMailbox, MaildirPaths};
 
@@ -182,45 +182,13 @@ impl MailboxStore for MaildirStore {
         '/'
     }
 
-    fn list(&self, _reference: &str, pattern: &str) -> MailboxResult<Vec<MailboxInfo>> {
+    fn list(&self, reference: &str, pattern: &str) -> MailboxResult<Vec<MailboxInfo>> {
         let root = self.user_root()?;
-        let mut out = Vec::new();
-        // INBOX
-        if glob_match(pattern, "INBOX") {
-            let mut attrs = BTreeSet::new();
-            attrs.insert(MailboxAttribute::HasNoChildren);
-            out.push(MailboxInfo {
-                name: "INBOX".into(),
-                attributes: attrs,
-            });
+        let mut real = vec![MailboxInfo { name: "INBOX".into(), attributes: BTreeSet::new() }];
+        for name in mailbox_dirs(root)? {
+            real.push(MailboxInfo { name: name.1, attributes: BTreeSet::new() });
         }
-        for ent in fs::read_dir(root)? {
-            let ent = ent?;
-            let name = ent.file_name().to_string_lossy().into_owned();
-            if !name.starts_with('.')
-                || name == ".subscriptions"
-                || name == ".uidlist"
-                || name == ".keywords"
-                || name == ".gidx"
-                || name == ".metadata"
-                || name == ".server-metadata"
-            {
-                continue;
-            }
-            if !ent.path().join("cur").is_dir() {
-                continue;
-            }
-            let imap = maildir_dir_to_imap(&name);
-            if glob_match(pattern, &imap) {
-                let mut attrs = BTreeSet::new();
-                attrs.insert(MailboxAttribute::HasNoChildren);
-                out.push(MailboxInfo {
-                    name: imap,
-                    attributes: attrs,
-                });
-            }
-        }
-        Ok(out)
+        Ok(crate::list::rows(real, reference, pattern, self.hierarchy_delimiter()))
     }
 
     fn list_subscribed(&self, reference: &str, pattern: &str) -> MailboxResult<Vec<MailboxInfo>> {
@@ -266,18 +234,40 @@ impl MailboxStore for MaildirStore {
         if old.eq_ignore_ascii_case("INBOX") || new.eq_ignore_ascii_case("INBOX") {
             return Err(MailboxError::Invalid("cannot rename INBOX".into()));
         }
-        let src = resolve_mailbox_dir(root, old)?;
-        let dst = resolve_mailbox_dir(root, new)?;
-        if !src.exists() {
+        // The mailbox and every name beneath it move (RFC 9051 §6.3.6): "Work"
+        // is "Work", "Work/Reports", "Work/Reports/Q1" ...
+        let below = format!("{old}/");
+        let moves: Vec<(PathBuf, String)> = mailbox_dirs(root)?
+            .into_iter()
+            .filter(|(_, name)| name == old || name.starts_with(&below))
+            .map(|(path, name)| (path, format!("{new}{}", &name[old.len()..])))
+            .collect();
+        if moves.is_empty() {
             return Err(MailboxError::NotFound(old.into()));
         }
-        if dst.exists() {
-            return Err(MailboxError::Invalid("destination exists".into()));
+        // Nothing is moved unless everything can be.
+        let mut targets = Vec::with_capacity(moves.len());
+        for (_, name) in &moves {
+            let target = resolve_mailbox_dir(root, name)?;
+            if target.exists() {
+                return Err(MailboxError::Invalid("destination exists".into()));
+            }
+            targets.push(target);
         }
-        fs::rename(src, dst)?;
+        for ((src, _), dst) in moves.iter().zip(targets) {
+            fs::rename(src, dst)?;
+        }
         let mut subs = self.load_subscriptions()?;
-        if subs.remove(old) {
-            subs.insert(new.to_string());
+        let renamed: Vec<(String, String)> = subs
+            .iter()
+            .filter(|s| s.as_str() == old || s.starts_with(&below))
+            .map(|s| (s.clone(), format!("{new}{}", &s[old.len()..])))
+            .collect();
+        if !renamed.is_empty() {
+            for (from, to) in renamed {
+                subs.remove(&from);
+                subs.insert(to);
+            }
             self.save_subscriptions(&subs)?;
         }
         Ok(())
@@ -406,18 +396,29 @@ fn maildir_dir_to_imap(dot_name: &str) -> String {
         .join("/")
 }
 
-fn glob_match(pattern: &str, name: &str) -> bool {
-    if pattern == "*" || pattern == "%" {
-        return true;
+/// Every mailbox in `root` other than the INBOX, with the path of its
+/// directory and its name as a client sees it.
+fn mailbox_dirs(root: &Path) -> MailboxResult<Vec<(PathBuf, String)>> {
+    let mut out = Vec::new();
+    for ent in fs::read_dir(root)? {
+        let ent = ent?;
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if !name.starts_with('.')
+            || name == ".subscriptions"
+            || name == ".uidlist"
+            || name == ".keywords"
+            || name == ".gidx"
+            || name == ".metadata"
+            || name == ".server-metadata"
+        {
+            continue;
+        }
+        if !ent.path().join("cur").is_dir() {
+            continue;
+        }
+        out.push((ent.path(), maildir_dir_to_imap(&name)));
     }
-    if pattern.eq_ignore_ascii_case(name) {
-        return true;
-    }
-    // simple * suffix
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        return name.starts_with(prefix);
-    }
-    false
+    Ok(out)
 }
 
 #[cfg(test)]

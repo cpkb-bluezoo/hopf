@@ -472,6 +472,8 @@ impl ImapControlHandler {
         let Some(outcome) = outcome else {
             return;
         };
+        // The reply is for the client: not the storage pool's own prefix.
+        let outcome = outcome.map_err(|e| e.strip_prefix("storage task failed: ").map(str::to_string).unwrap_or(e));
         let cmd_ok = outcome.is_ok();
 
         match kind {
@@ -595,6 +597,15 @@ impl ImapControlHandler {
                     if let Some(h) = auth_handler {
                         self.authenticated = Some(h);
                     }
+                    // The attempt deselected whatever was selected (RFC 9051
+                    // §6.3.2), so the connection is authenticated again. The
+                    // handler that would have taken over on success is kept:
+                    // it serves the authenticated commands as well as the
+                    // one it replaced, and dropping it would leave none.
+                    if let Some(h) = selected_handler {
+                        self.selected = Some(h);
+                    }
+                    self.session = ImapSessionState::Authenticated;
                 }
             },
             PendingKind::Close { tag, ok } => match outcome {

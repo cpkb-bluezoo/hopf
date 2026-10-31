@@ -7,8 +7,8 @@ use std::time::SystemTime;
 
 use tempfile::tempdir;
 use hopf_mailbox::{
-    AppendGuard, Flag, IndexConfig, Mailbox, MailboxFactory, MailboxResult, MaildirFactory,
-    MboxFactory, SearchCriteria,
+    AppendGuard, Flag, IndexConfig, Mailbox, MailboxAttribute, MailboxError, MailboxFactory, MailboxInfo,
+    MailboxResult, MailboxStore, MaildirFactory, MboxFactory, SearchCriteria,
 };
 
 fn sample_msg(subject: &str, body: &str) -> Vec<u8> {
@@ -268,4 +268,147 @@ fn mbox_modseq_search_criterion_matches_real_tracked_values() {
     assert_eq!(all, vec![1, 2]);
 
     mb.close(false).unwrap();
+}
+
+// ── LIST, RENAME and COPY on the Maildir store ──────────────────────────────
+
+/// A store for one user with `mailboxes` created.
+fn store_with(dir: &std::path::Path, mailboxes: &[&str]) -> Box<dyn MailboxStore> {
+    let factory = MaildirFactory::new(dir);
+    let mut store = factory.create_store();
+    store.open("u").unwrap();
+    for name in mailboxes {
+        store.create_mailbox(name).unwrap();
+    }
+    store
+}
+
+fn names(rows: &[MailboxInfo]) -> Vec<&str> {
+    rows.iter().map(|r| r.name.as_str()).collect()
+}
+
+fn attrs<'a>(rows: &'a [MailboxInfo], name: &str) -> &'a std::collections::BTreeSet<MailboxAttribute> {
+    &rows.iter().find(|r| r.name == name).unwrap_or_else(|| panic!("no {name} in {:?}", names(rows))).attributes
+}
+
+#[test]
+fn list_matches_the_wildcards_and_honours_the_reference() {
+    let dir = tempdir().unwrap();
+    let store = store_with(dir.path(), &["Work", "Work/Reports", "Work/Reports/Q1", "Other"]);
+    let list = |reference: &str, pattern: &str| {
+        let mut n: Vec<String> = store.list(reference, pattern).unwrap().into_iter().map(|r| r.name).collect();
+        n.sort();
+        n
+    };
+    // `*` matches across the hierarchy, `%` stops at a delimiter.
+    assert_eq!(list("", "*"), ["INBOX", "Other", "Work", "Work/Reports", "Work/Reports/Q1"]);
+    assert_eq!(list("", "%"), ["INBOX", "Other", "Work"]);
+    assert_eq!(list("", "Work/%"), ["Work/Reports"]);
+    assert_eq!(list("", "Work/*"), ["Work/Reports", "Work/Reports/Q1"]);
+    assert_eq!(list("", "Wo%"), ["Work"]);
+    assert_eq!(list("", "W*"), ["Work", "Work/Reports", "Work/Reports/Q1"]);
+    assert_eq!(list("", "%/Reports"), ["Work/Reports"]);
+    assert_eq!(list("", "Work"), ["Work"]);
+    assert_eq!(list("", "Nope"), Vec::<String>::new());
+    // The reference is the context the pattern is read in.
+    assert_eq!(list("Work/", "%"), ["Work/Reports"]);
+    assert_eq!(list("Work/", "*"), ["Work/Reports", "Work/Reports/Q1"]);
+    assert_eq!(list("Work/Reports/", "%"), ["Work/Reports/Q1"]);
+    // INBOX is the one name that is not case-sensitive.
+    assert_eq!(list("", "inbox"), ["INBOX"]);
+    assert_eq!(list("", "work"), Vec::<String>::new());
+}
+
+#[test]
+fn list_says_which_mailboxes_have_children_and_names_the_parents_that_are_implied() {
+    let dir = tempdir().unwrap();
+    // "Deep" and "Deep/Down" are not mailboxes of their own: only "Deep/Down/Here" is.
+    let store = store_with(dir.path(), &["Work", "Work/Reports", "Other", "Deep/Down/Here"]);
+    let rows = store.list("", "*").unwrap();
+    assert!(attrs(&rows, "Work").contains(&MailboxAttribute::HasChildren), "{rows:?}");
+    assert!(!attrs(&rows, "Work").contains(&MailboxAttribute::HasNoChildren));
+    assert!(attrs(&rows, "Work/Reports").contains(&MailboxAttribute::HasNoChildren));
+    assert!(attrs(&rows, "Other").contains(&MailboxAttribute::HasNoChildren));
+    assert!(attrs(&rows, "INBOX").contains(&MailboxAttribute::HasNoChildren));
+    // The names above a mailbox that exist only as the way to it are real as far as a client
+    // walking the tree is concerned, but cannot be selected.
+    for implied in ["Deep", "Deep/Down"] {
+        let a = attrs(&rows, implied);
+        assert!(a.contains(&MailboxAttribute::NoSelect) && a.contains(&MailboxAttribute::HasChildren), "{implied}: {a:?}");
+    }
+    assert!(!attrs(&rows, "Deep/Down/Here").contains(&MailboxAttribute::NoSelect));
+    // So a client that lists one level at a time finds its way down.
+    let top: Vec<_> = store.list("", "%").unwrap();
+    assert!(names(&top).contains(&"Deep"), "{top:?}");
+    let next = store.list("Deep/", "%").unwrap();
+    assert_eq!(names(&next), ["Deep/Down"]);
+}
+
+#[test]
+fn an_empty_pattern_asks_for_the_hierarchy_delimiter_and_root() {
+    let dir = tempdir().unwrap();
+    let store = store_with(dir.path(), &["Work"]);
+    let rows = store.list("", "").unwrap();
+    assert_eq!(names(&rows), [""]);
+    assert!(rows[0].attributes.contains(&MailboxAttribute::NoSelect));
+    assert_eq!(store.hierarchy_delimiter(), '/');
+}
+
+#[test]
+fn rename_moves_the_inferior_names_with_it() {
+    let dir = tempdir().unwrap();
+    let mut store = store_with(dir.path(), &["Work", "Work/Reports", "Work/Reports/Q1", "Other"]);
+    store.subscribe("Work/Reports").unwrap();
+    store.rename_mailbox("Work", "Play").unwrap();
+    let mut n: Vec<String> = store.list("", "*").unwrap().into_iter().map(|r| r.name).collect();
+    n.sort();
+    assert_eq!(n, ["INBOX", "Other", "Play", "Play/Reports", "Play/Reports/Q1"]);
+    // Subscriptions follow the names.
+    let subscribed: Vec<String> = store.list_subscribed("", "*").unwrap().into_iter().map(|r| r.name).collect();
+    assert!(subscribed.contains(&"Play/Reports".to_string()), "{subscribed:?}");
+    assert!(!subscribed.contains(&"Work/Reports".to_string()), "{subscribed:?}");
+    // The renamed mailboxes open, and the old names are gone.
+    assert!(store.open_mailbox("Play/Reports", true).is_ok());
+    assert!(matches!(store.open_mailbox("Work/Reports", true), Err(MailboxError::NotFound(_))));
+    assert!(matches!(store.rename_mailbox("Work", "Else"), Err(MailboxError::NotFound(_))));
+}
+
+#[test]
+fn rename_can_move_a_mailbox_beneath_itself_and_a_parent_that_exists_only_by_implication() {
+    let dir = tempdir().unwrap();
+    let mut store = store_with(dir.path(), &["Work", "Work/Reports", "Implied/Child"]);
+    store.rename_mailbox("Work", "Work/Old").unwrap();
+    let mut n: Vec<String> = store.list("", "Work/*").unwrap().into_iter().map(|r| r.name).collect();
+    n.sort();
+    assert_eq!(n, ["Work/Old", "Work/Old/Reports"]);
+    // "Implied" is only the way to "Implied/Child"; renaming it moves what is beneath.
+    store.rename_mailbox("Implied", "Moved").unwrap();
+    let n: Vec<String> = store.list("", "Moved/*").unwrap().into_iter().map(|r| r.name).collect();
+    assert_eq!(n, ["Moved/Child"]);
+}
+
+#[test]
+fn rename_refuses_to_land_on_a_name_that_is_taken_and_changes_nothing() {
+    let dir = tempdir().unwrap();
+    let mut store = store_with(dir.path(), &["Work", "Work/Reports", "Play/Reports"]);
+    // "Play" itself is free, but "Play/Reports" is not.
+    assert!(matches!(store.rename_mailbox("Work", "Play"), Err(MailboxError::Invalid(_))));
+    let mut n: Vec<String> = store.list("", "*").unwrap().into_iter().map(|r| r.name).collect();
+    n.sort();
+    assert_eq!(n, ["INBOX", "Play", "Play/Reports", "Work", "Work/Reports"]);
+    assert!(matches!(store.rename_mailbox("Work", "inbox"), Err(MailboxError::Invalid(_))));
+}
+
+#[test]
+fn copy_to_a_mailbox_that_does_not_exist_is_not_found_and_creates_nothing() {
+    let dir = tempdir().unwrap();
+    let mut store = store_with(dir.path(), &[]);
+    let mut inbox = store.open_mailbox("INBOX", false).unwrap();
+    append_whole(inbox.as_mut(), &sample_msg("one", "body"), &BTreeSet::new(), None).unwrap();
+    let err = inbox.copy_messages(&[1], "Nowhere").unwrap_err();
+    assert!(matches!(err, MailboxError::NotFound(ref n) if n == "Nowhere"), "{err:?}");
+    let err = inbox.move_messages(&[1], "Nowhere").unwrap_err();
+    assert!(matches!(err, MailboxError::NotFound(_)), "{err:?}");
+    inbox.close(false).unwrap();
+    assert_eq!(store.list("", "*").unwrap().len(), 1, "no mailbox was made on the way");
 }

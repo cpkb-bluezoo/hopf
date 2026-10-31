@@ -302,7 +302,7 @@ fn mailbox_management() {
     assert!(listed.iter().any(|l| l.ends_with(" Work/Reports")), "{out}");
     assert!(status(&out, "d").starts_with("d OK "));
 
-    let out = s.run("e LIST \"\" \"Work/*\"\r\n");
+    let out = s.run("e LIST \"\" \"Work/%\"\r\n");
     assert_eq!(lines(&out, "* LIST").len(), 1, "{out}");
     let out = s.run("e2 LIST \"\" Work\r\n");
     assert_eq!(lines(&out, "* LIST").len(), 1, "an exact name matches itself only: {out}");
@@ -319,9 +319,11 @@ fn mailbox_management() {
     assert!(status(&s.run("j RENAME Work Play\r\n"), "j").starts_with("j OK "));
     let out = s.run("k LIST \"\" *\r\n");
     assert!(lines(&out, "* LIST").iter().any(|l| l.ends_with(" Play")), "{out}");
-    assert!(!lines(&out, "* LIST").iter().any(|l| l.ends_with(" Work")), "{out}");
+    assert!(!lines(&out, "* LIST").iter().any(|l| l.contains(" Work")), "{out}");
 
-    assert!(status(&s.run("l DELETE Work/Reports\r\n"), "l").starts_with("l OK "));
+    // RENAME took the mailbox beneath it along.
+    assert!(lines(&out, "* LIST").iter().any(|l| l.ends_with(" Play/Reports")), "{out}");
+    assert!(status(&s.run("l DELETE Play/Reports\r\n"), "l").starts_with("l OK "));
     assert!(status(&s.run("m DELETE Play\r\n"), "m").starts_with("m OK "));
     assert!(status(&s.run("n DELETE Play\r\n"), "n").starts_with("n NO "), "gone");
     assert!(status(&s.run("o RENAME Nope Else\r\n"), "o").starts_with("o NO "));
@@ -863,4 +865,101 @@ fn an_append_pipelined_with_other_commands_is_answered_in_order() {
     assert!(out.contains("* 1 FETCH (FLAGS (\\Seen)") && out.contains("Subject: hi"), "{out}");
     assert!(out.contains("* 2 FETCH (FLAGS ()") && out.contains("Subject: yo"), "{out}");
     assert!(out.contains("* SEARCH 2"), "{out}");
+}
+
+#[test]
+fn list_follows_the_rfc_on_wildcards_references_and_children() {
+    let mut s = Session::new();
+    s.login();
+    s.run("a CREATE Work\r\nb CREATE Work/Reports\r\nc CREATE Work/Reports/Q1\r\nd CREATE Other\r\ne CREATE Deep/Down/Here\r\n");
+    let names = |out: &str| -> Vec<String> {
+        let mut n: Vec<String> = lines(out, "* LIST").iter().map(|l| l.rsplit(' ').next().unwrap().to_string()).collect();
+        n.sort();
+        n
+    };
+    assert_eq!(names(&s.run("p LIST \"\" %\r\n")), ["Deep", "INBOX", "Other", "Work"]);
+    assert_eq!(names(&s.run("p LIST \"\" Work/%\r\n")), ["Work/Reports"]);
+    assert_eq!(names(&s.run("p LIST \"\" Wo%\r\n")), ["Work"]);
+    assert_eq!(names(&s.run("p LIST Work/ %\r\n")), ["Work/Reports"]);
+    assert_eq!(names(&s.run("p LIST Work/ *\r\n")), ["Work/Reports", "Work/Reports/Q1"]);
+    assert_eq!(names(&s.run("p LIST \"\" inbox\r\n")), ["INBOX"]);
+
+    // What has children, and the names that are only the way to one.
+    let out = s.run("q LIST \"\" *\r\n");
+    let row = |name: &str| lines(&out, "* LIST").into_iter().find(|l| l.ends_with(&format!(" {name}"))).unwrap_or_else(|| panic!("{name} in {out}")).to_string();
+    assert!(row("Work").contains("\\HasChildren"), "{out}");
+    assert!(row("Work/Reports/Q1").contains("\\HasNoChildren"), "{out}");
+    assert!(row("Other").contains("\\HasNoChildren") && row("INBOX").contains("\\HasNoChildren"), "{out}");
+    assert!(row("Deep").contains("\\Noselect") && row("Deep").contains("\\HasChildren"), "{out}");
+    assert!(row("Deep/Down").contains("\\Noselect"), "{out}");
+    assert!(!row("Deep/Down/Here").contains("\\Noselect"), "{out}");
+    assert!(status(&s.run("r SELECT Deep\r\n"), "r").starts_with("r NO "), "an implied name cannot be selected");
+
+    // An empty pattern asks for the delimiter and the root.
+    assert_eq!(s.run("t LIST \"\" \"\"\r\n"), "* LIST (\\Noselect) \"/\" \"\"\r\nt OK LIST completed\r\n");
+}
+
+#[test]
+fn rename_carries_what_is_beneath_a_mailbox_and_its_subscriptions() {
+    let mut s = Session::new();
+    s.login();
+    s.run("a CREATE Work\r\nb CREATE Work/Reports\r\nc SUBSCRIBE Work/Reports\r\n");
+    assert!(status(&s.run("d RENAME Work Play\r\n"), "d").starts_with("d OK "));
+    let out = s.run("e LIST \"\" *\r\n");
+    assert!(out.contains(" Play\r\n") && out.contains(" Play/Reports\r\n") && !out.contains(" Work"), "{out}");
+    let out = s.run("f LSUB \"\" *\r\n");
+    assert!(out.contains(" Play/Reports\r\n") && !out.contains("Work"), "{out}");
+    // A name that is taken (even beneath the new one) stops the whole rename.
+    s.run("g CREATE Taken/Child\r\nh CREATE Src\r\ni CREATE Src/Child\r\n");
+    assert!(status(&s.run("j RENAME Src Taken\r\n"), "j").starts_with("j NO "));
+    assert!(s.run("k LIST \"\" Src*\r\n").contains(" Src/Child\r\n"), "nothing was moved");
+}
+
+#[test]
+fn a_destination_that_does_not_exist_is_try_create_and_is_not_made() {
+    let mut s = three();
+    for (tag, command) in [("a", "COPY 1 Nowhere"), ("b", "UID COPY 1 Nowhere"), ("c", "MOVE 1 Nowhere"), ("d", "UID MOVE 1 Nowhere")] {
+        let out = s.run(&format!("{tag} {command}\r\n"));
+        assert_eq!(status(&out, tag), format!("{tag} NO [TRYCREATE] Mailbox does not exist"), "{command}: {out}");
+        assert!(!out.contains("EXPUNGE"), "{command}: nothing was moved: {out}");
+    }
+    let m = message("x", "a@x.org", "u@x.org", ALICE, "b");
+    let out = s.run(&format!("e APPEND Nowhere {{{}}}\r\n{m}\r\n", m.len()));
+    assert_eq!(status(&out, "e"), "e NO [TRYCREATE] Mailbox does not exist", "{out}");
+    assert!(!s.run("f LIST \"\" *\r\n").contains("Nowhere"), "none of them made it");
+    assert!(s.run("g STATUS INBOX (MESSAGES)\r\n").contains("(MESSAGES 3)"), "the messages are where they were");
+    // Created, the same commands work.
+    s.run("h CREATE Nowhere\r\n");
+    assert!(status(&s.run("i COPY 1 Nowhere\r\n"), "i").starts_with("i OK [COPYUID "));
+    // A refusal for any other reason does not carry the storage pool's prefix.
+    let out = s.run("j COPY 1 INBOX\r\n");
+    assert!(status(&out, "j").starts_with("j NO ") && !out.contains("storage task failed"), "{out}");
+}
+
+/// A SELECT that fails (the mailbox does not exist, or exists only as the way
+/// to others) must leave the connection usable: the handler that would have
+/// run it is not thrown away with the attempt.
+#[test]
+fn a_select_that_fails_leaves_the_session_working() {
+    let mut s = three();
+    s.run("a CLOSE\r\nb CREATE Deep/Down\r\n");
+    // From the authenticated state.
+    for name in ["Nope", "Deep"] {
+        assert!(status(&s.run(&format!("c SELECT {name}\r\n")), "c").starts_with("c NO "), "{name}");
+        let out = s.run("d LIST \"\" INBOX\r\n");
+        assert!(out.contains("* LIST") && status(&out, "d").starts_with("d OK "), "after SELECT {name}: {out:?}");
+        assert!(status(&s.run("e CREATE Made\r\n"), "e").starts_with("e OK "), "after SELECT {name}");
+        assert!(status(&s.run("f DELETE Made\r\n"), "f").starts_with("f OK "));
+        assert!(s.run("g STATUS INBOX (MESSAGES)\r\n").contains("(MESSAGES 3)"));
+    }
+    // From the selected state: the failed attempt deselects, as RFC 9051 §6.3.2 says.
+    assert!(status(&s.run("h SELECT INBOX\r\n"), "h").starts_with("h OK "));
+    assert!(status(&s.run("i SELECT Nope\r\n"), "i").starts_with("i NO "));
+    assert!(status(&s.run("j FETCH 1 FLAGS\r\n"), "j").starts_with("j NO "), "no mailbox is selected any more");
+    assert!(status(&s.run("k LIST \"\" INBOX\r\n"), "k").starts_with("k OK "));
+    assert!(status(&s.run("l CREATE Again\r\n"), "l").starts_with("l OK "));
+    // And the connection can select again.
+    let out = s.run("m SELECT INBOX\r\n");
+    assert!(out.contains("* 3 EXISTS") && status(&out, "m").starts_with("m OK [READ-WRITE]"), "{out}");
+    assert!(s.run("n FETCH 1 FLAGS\r\n").contains("* 1 FETCH"));
 }
