@@ -29,7 +29,7 @@ use crate::server::codec::{
     parse_astring, parse_flag_list, parse_sequence_set, BTreeSetFlags, ImapCommand,
     ImapServerLexer, LexEvent, MAX_COMMAND_LINE,
 };
-use crate::server::fetch_format::parse_fetch_args;
+use crate::server::fetch_format::{FetchItem, FetchModifiers};
 use crate::server::handler::{
     AuthenticatedHandler, ClientConnected, ImapConnectionMetadata, NotAuthenticatedHandler,
     SelectedHandler, StoreRequest,
@@ -823,7 +823,6 @@ impl ImapControlHandler {
             "SETMETADATA" => self.cmd_setmetadata(endpoint, cmd),
             "NOTIFY" => self.cmd_notify(endpoint, cmd),
             "APPEND" => self.cmd_append(endpoint, cmd),
-            "FETCH" => self.cmd_fetch(endpoint, cmd, false),
             "SEARCH" => self.cmd_search(endpoint, cmd, false),
             "SORT" => self.cmd_sort(endpoint, cmd, false),
             "THREAD" => self.cmd_thread(endpoint, cmd, false),
@@ -868,6 +867,9 @@ impl ImapControlHandler {
                 self.cmd_store(endpoint, tag, set, action, silent, flags, by_uid)
             }
             Request::Status { mailbox, items } => self.cmd_status(endpoint, tag, mailbox, items),
+            Request::Fetch { set, items, modifiers, by_uid } => {
+                self.cmd_fetch(endpoint, tag, set, items, modifiers, by_uid)
+            }
         }
     }
 
@@ -1412,21 +1414,18 @@ impl ImapControlHandler {
         self.run_list_ext(endpoint, &cmd.tag, parsed, subscribed);
     }
 
-    fn cmd_fetch(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, by_uid: bool) {
-        if !self.require_selected(endpoint, &cmd.tag) {
+    fn cmd_fetch(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        tag: String,
+        set: MessageSet,
+        mut items: Vec<FetchItem>,
+        modifiers: FetchModifiers,
+        by_uid: bool,
+    ) {
+        if !self.require_selected(endpoint, &tag) {
             return;
         }
-        let Ok((set, rest)) = parse_sequence_set(&cmd.args) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid sequence set"));
-            return;
-        };
-        let (mut items, modifiers) = match parse_fetch_args(rest) {
-            Ok(v) => v,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e));
-                return;
-            }
-        };
         if modifiers.changed_since.is_some() && !self.enabled.condstore {
             // Implicitly enable CONDSTORE when CHANGEDSINCE is used (RFC 7162).
             if self.config.enable_condstore {
@@ -1436,16 +1435,16 @@ impl ImapControlHandler {
         if self.enabled.condstore
             && !items
                 .iter()
-                .any(|i| matches!(i, crate::server::fetch_format::FetchItem::ModSeq))
+                .any(|i| matches!(i, FetchItem::ModSeq))
         {
-            items.push(crate::server::fetch_format::FetchItem::ModSeq);
+            items.push(FetchItem::ModSeq);
         }
         let Some(mut h) = self.selected.take() else {
             return;
         };
         let mut view = FetchView {
             endpoint,
-            tag: &cmd.tag,
+            tag: &tag,
             set: set.clone(),
             by_uid,
             changed_since: modifiers.changed_since,
@@ -1879,7 +1878,6 @@ impl ImapControlHandler {
             return;
         };
         match sub_cmd.verb.as_str() {
-            "FETCH" => self.cmd_fetch(endpoint, sub_cmd, true),
             "SEARCH" => self.cmd_search(endpoint, sub_cmd, true),
             "SORT" => self.cmd_sort(endpoint, sub_cmd, true),
             "THREAD" => self.cmd_thread(endpoint, sub_cmd, true),

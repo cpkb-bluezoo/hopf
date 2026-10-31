@@ -1453,14 +1453,14 @@ mod tests {
 
     #[test]
     fn arguments_are_typed_tokens() {
-        let wire = b"t1 FETCH 1:* (FLAGS BODY.PEEK[HEADER.FIELDS (From \"To\")]<0.100>)\r\n\
+        let wire = b"t1 XFETCH 1:* (FLAGS BODY.PEEK[HEADER.FIELDS (From \"To\")]<0.100>)\r\n\
                      t2 LIST \"\" \"INBOX/%\"\r\n\
                      t3 SEARCH 1,3:5 KEYWORD (\\Seen \\Deleted)\r\n\
                      t4 METADATA \"My \\\"box\\\" \\\\ x\"\r\n";
         let want = vec![
             cmd(
                 "t1",
-                "FETCH",
+                "XFETCH",
                 vec![
                     a("1:*"),
                     ArgToken::Open,

@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 use hopf_mailbox::{MessageRange, MessageSet, WILDCARD};
 
 use super::codec::{ArgToken, BTreeSetFlags};
+use super::fetch_format::{BodySection, FetchItem, FetchModifiers};
 use super::handler::StoreAction;
 use super::status_items::StatusItem;
 
@@ -103,6 +104,8 @@ pub enum Request {
     Store { set: MessageSet, action: StoreAction, silent: bool, flags: BTreeSetFlags, by_uid: bool },
     /// `STATUS mailbox (items)`
     Status { mailbox: String, items: BTreeSet<StatusItem> },
+    /// `[UID] FETCH set items [(modifiers)]`
+    Fetch { set: MessageSet, items: Vec<FetchItem>, modifiers: FetchModifiers, by_uid: bool },
 }
 
 /// The machine for one command's arguments.
@@ -130,6 +133,7 @@ pub fn grammar_for(verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
             "STORE" => pattern(STORE, "Invalid flag list", build_store),
             "COPY" => pattern(COPY, "Invalid destination", build_copy),
             "MOVE" => pattern(COPY, "Invalid destination", build_move),
+            "FETCH" => Some(Box::new(Fetch::new(true))),
             _ => None,
         };
     }
@@ -151,6 +155,7 @@ pub fn grammar_for(verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
         "GETQUOTAROOT" => pattern(ONE_MAILBOX, "Invalid mailbox", build_getquotaroot),
         "STORE" => pattern(STORE, "Invalid flag list", build_store),
         "STATUS" => pattern(STATUS, "Invalid STATUS arguments", build_status),
+        "FETCH" => Some(Box::new(Fetch::new(false))),
         _ => None,
     }
 }
@@ -708,6 +713,314 @@ impl Grammar for Select {
     }
 }
 
+// ── FETCH ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchAt {
+    /// The sequence set.
+    Set,
+    /// A single item, or `(`.
+    Items,
+    /// An item of the list, or its `)`.
+    List,
+    /// After the items: the end, or `(` of the modifiers.
+    AfterItems,
+    /// A modifier's name, or the `)` that closes the list.
+    ModName,
+    /// The `CHANGEDSINCE` value.
+    ModValue,
+    /// A modifier not known: its arguments, skipped to the matching `)`.
+    ModSkip,
+    /// After the modifiers' `)`: nothing more.
+    Done,
+}
+
+/// `[UID] FETCH set (item ...) | item [(CHANGEDSINCE n [VANISHED])]`
+struct Fetch {
+    by_uid: bool,
+    at: FetchAt,
+    set: SeqSetBuilder,
+    set_done: Option<MessageSet>,
+    items: Vec<FetchItem>,
+    changed_since: Option<u64>,
+    /// Depth inside a modifier's arguments being skipped.
+    depth: usize,
+}
+
+impl Fetch {
+    fn new(by_uid: bool) -> Self {
+        Self {
+            by_uid,
+            at: FetchAt::Set,
+            set: SeqSetBuilder::default(),
+            set_done: None,
+            items: Vec::new(),
+            changed_since: None,
+            depth: 0,
+        }
+    }
+}
+
+/// The items written as one bare word each.
+const FETCH_KEYWORDS: &[(&str, fn() -> FetchItem)] = &[
+    ("FLAGS", || FetchItem::Flags),
+    ("UID", || FetchItem::Uid),
+    ("RFC822.SIZE", || FetchItem::Rfc822Size),
+    ("RFC822", || FetchItem::Rfc822),
+    ("RFC822.HEADER", || FetchItem::Rfc822Header),
+    ("RFC822.TEXT", || FetchItem::Rfc822Text),
+    ("MODSEQ", || FetchItem::ModSeq),
+    ("ENVELOPE", || FetchItem::Envelope),
+    ("BODYSTRUCTURE", || FetchItem::BodyStructure),
+    ("EMAILID", || FetchItem::EmailId),
+    ("THREADID", || FetchItem::ThreadId),
+];
+
+fn starts_with_ignore_case(bytes: &[u8], prefix: &[u8]) -> bool {
+    bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// One FETCH item, read a byte at a time.
+fn fetch_item(atom: &str) -> Result<FetchItem, Reject> {
+    let bytes = atom.as_bytes();
+    let (peek, from) = if starts_with_ignore_case(bytes, b"BODY.PEEK[") {
+        (true, b"BODY.PEEK[".len())
+    } else if starts_with_ignore_case(bytes, b"BODY[") {
+        (false, b"BODY[".len())
+    } else {
+        for (name, make) in FETCH_KEYWORDS {
+            if atom.eq_ignore_ascii_case(name) {
+                return Ok(make());
+            }
+        }
+        return Ok(FetchItem::Other(atom.to_string()));
+    };
+    body_item(peek, &bytes[from..])
+}
+
+/// What the bytes of a `BODY[` ... `]` section have said so far.
+#[derive(Default)]
+struct SectionReader {
+    /// The section's name: `HEADER`, `TEXT`, `HEADER.FIELDS`, `1.2.MIME`.
+    name: String,
+    /// The name has ended (at a space or `(`).
+    named: bool,
+    /// More was written after the name than a field list.
+    stray: bool,
+    /// Inside the `(` ... `)` of a field list.
+    in_list: bool,
+    /// The field list was closed.
+    listed: bool,
+    word: String,
+    fields: Vec<String>,
+}
+
+impl SectionReader {
+    fn byte(&mut self, b: u8) {
+        if self.in_list {
+            match b {
+                b')' => {
+                    self.end_word();
+                    self.in_list = false;
+                    self.listed = true;
+                }
+                b'"' => {}
+                b if b.is_ascii_whitespace() => self.end_word(),
+                b => self.word.push(b as char),
+            }
+            return;
+        }
+        match b {
+            b'(' if !self.listed => {
+                self.named = true;
+                self.in_list = true;
+            }
+            b if b.is_ascii_whitespace() => self.named = self.named || !self.name.is_empty(),
+            b => {
+                if self.named || self.listed {
+                    self.stray = true;
+                } else {
+                    self.name.push(b as char);
+                }
+            }
+        }
+    }
+
+    fn end_word(&mut self) {
+        if !self.word.is_empty() {
+            self.fields.push(std::mem::take(&mut self.word));
+        }
+    }
+
+    /// The section and, for `HEADER.FIELDS`, the names wanted. Sections not
+    /// known (part numbers, `MIME`) stand for the whole message, as they
+    /// always have.
+    fn finish(self) -> (BodySection, Option<Vec<String>>) {
+        let plain = !self.stray && !self.listed && !self.in_list;
+        let is = |n: &str| self.name.eq_ignore_ascii_case(n);
+        if self.name.is_empty() {
+            (BodySection::Full, None)
+        } else if is("HEADER") && plain {
+            (BodySection::Header, None)
+        } else if is("TEXT") && plain {
+            (BodySection::Text, None)
+        } else if starts_with_ignore_case(self.name.as_bytes(), b"HEADER.FIELDS") {
+            (BodySection::HeaderFields, Some(self.fields))
+        } else {
+            (BodySection::Full, None)
+        }
+    }
+}
+
+/// The rest of a `BODY[` item: the section, `]`, and an optional `<start.count>`.
+fn body_item(peek: bool, rest: &[u8]) -> Result<FetchItem, Reject> {
+    let bad = || Reject::new("bad BODY item");
+    let mut section = SectionReader::default();
+    let mut depth = 1usize;
+    let mut i = 0;
+    loop {
+        let b = *rest.get(i).ok_or_else(bad)?;
+        i += 1;
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        section.byte(b);
+    }
+    let partial = body_partial(&rest[i..])?;
+    let (section, header_fields) = section.finish();
+    Ok(FetchItem::Body { peek, header_fields, section, partial })
+}
+
+/// An optional `<start.count>` after the section's `]`.
+fn body_partial(rest: &[u8]) -> Result<Option<(u64, u64)>, Reject> {
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let range = || Reject::new("bad partial fetch range");
+    let mut it = rest.iter().copied();
+    if it.next() != Some(b'<') {
+        return Err(range());
+    }
+    let mut start: Option<u64> = None;
+    let mut count: Option<u64> = None;
+    let mut closed = false;
+    let mut in_count = false;
+    for b in it {
+        if closed {
+            return Err(range());
+        }
+        match b {
+            b'0'..=b'9' => {
+                let slot = if in_count { &mut count } else { &mut start };
+                let v = slot.unwrap_or(0);
+                let err = || Reject::new(if in_count { "bad partial fetch count" } else { "bad partial fetch start" });
+                *slot = Some(v.checked_mul(10).and_then(|v| v.checked_add(u64::from(b - b'0'))).ok_or_else(err)?);
+            }
+            b'.' if !in_count => {
+                if start.is_none() {
+                    return Err(Reject::new("bad partial fetch start"));
+                }
+                in_count = true;
+            }
+            b'>' if in_count => closed = true,
+            _ => return Err(range()),
+        }
+    }
+    if !closed {
+        return Err(range());
+    }
+    match (start, count) {
+        (Some(_), Some(0)) => Err(Reject::new("partial fetch count must be nonzero")),
+        (Some(s), Some(c)) => Ok(Some((s, c))),
+        _ => Err(Reject::new("bad partial fetch count")),
+    }
+}
+
+impl Grammar for Fetch {
+    fn token(&mut self, tok: Tok<'_>) -> Result<(), Reject> {
+        match (self.at, tok) {
+            (FetchAt::Set, Tok::Atom(a)) => {
+                for b in a.bytes() {
+                    self.set.feed(b);
+                }
+                let set = std::mem::take(&mut self.set).finish();
+                self.set_done = Some(set.ok_or_else(|| Reject::new("Invalid sequence set"))?);
+                self.at = FetchAt::Items;
+            }
+            (FetchAt::Set, _) => return Err(Reject::new("Invalid sequence set")),
+            (FetchAt::Items, Tok::Atom(a)) => {
+                self.items.push(fetch_item(a)?);
+                self.at = FetchAt::AfterItems;
+            }
+            (FetchAt::Items, Tok::Open) => self.at = FetchAt::List,
+            (FetchAt::List, Tok::Atom(a)) => self.items.push(fetch_item(a)?),
+            (FetchAt::List, Tok::Close) => {
+                if self.items.is_empty() {
+                    return Err(Reject::new("empty FETCH items"));
+                }
+                self.at = FetchAt::AfterItems;
+            }
+            (FetchAt::AfterItems, Tok::Open) => self.at = FetchAt::ModName,
+            (FetchAt::AfterItems, _) => return Err(Reject::new("FETCH modifiers must be parenthesized")),
+            (FetchAt::ModName, Tok::Atom(a)) if a.eq_ignore_ascii_case("CHANGEDSINCE") => self.at = FetchAt::ModValue,
+            // VANISHED (RFC 7162) has no effect on a message-number FETCH, and
+            // modifiers not known have always been let through.
+            (FetchAt::ModName, Tok::Atom(_) | Tok::Quoted(_)) => {}
+            (FetchAt::ModName, Tok::Open) => {
+                self.depth = 1;
+                self.at = FetchAt::ModSkip;
+            }
+            (FetchAt::ModName, Tok::Close) => self.at = FetchAt::Done,
+            (FetchAt::ModValue, Tok::Atom(a)) => {
+                self.changed_since = Some(number(a).ok_or_else(|| Reject::new("bad CHANGEDSINCE value"))?);
+                self.at = FetchAt::ModName;
+            }
+            (FetchAt::ModValue, _) => return Err(Reject::new("bad CHANGEDSINCE value")),
+            (FetchAt::ModSkip, Tok::Open) => self.depth += 1,
+            (FetchAt::ModSkip, Tok::Close) => {
+                self.depth -= 1;
+                if self.depth == 0 {
+                    self.at = FetchAt::ModName;
+                }
+            }
+            (FetchAt::ModSkip, _) => {}
+            (FetchAt::Items | FetchAt::List, _) => return Err(Reject::new("Invalid FETCH items")),
+            _ => return Err(Reject::new("Invalid FETCH arguments")),
+        }
+        Ok(())
+    }
+
+    fn literal(&mut self, _size: u64) -> Result<(), Reject> {
+        match self.at {
+            FetchAt::ModSkip => Ok(()),
+            _ => Err(Reject::new("Literal not allowed here")),
+        }
+    }
+
+    fn finish(self: Box<Self>) -> Result<Request, Reject> {
+        match self.at {
+            FetchAt::Set => Err(Reject::new("Invalid sequence set")),
+            FetchAt::Items => Err(Reject::new("empty FETCH items")),
+            FetchAt::List => Err(Reject::new("unclosed FETCH list")),
+            FetchAt::ModValue => Err(Reject::new("bad CHANGEDSINCE value")),
+            FetchAt::ModName | FetchAt::ModSkip => Err(Reject::new("Invalid FETCH arguments")),
+            FetchAt::AfterItems | FetchAt::Done => Ok(Request::Fetch {
+                set: self.set_done.unwrap_or_default(),
+                items: self.items,
+                modifiers: FetchModifiers { changed_since: self.changed_since },
+                by_uid: self.by_uid,
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,5 +1237,117 @@ mod tests {
             }
             assert_eq!(builder.finish(), MessageSet::parse(text).ok(), "{text:?}");
         }
+    }
+
+    fn fetch(wire: &str) -> Result<(Vec<FetchItem>, FetchModifiers, bool), String> {
+        match one(wire)? {
+            Request::Fetch { items, modifiers, by_uid, .. } => Ok((items, modifiers, by_uid)),
+            other => panic!("not a FETCH: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_agrees_with_the_text_parser() {
+        use crate::server::fetch_format::parse_fetch_args;
+        let corpus = [
+            "FLAGS",
+            "(FLAGS)",
+            "(FLAGS UID RFC822.SIZE)",
+            "(flags uid)",
+            "RFC822",
+            "(RFC822.HEADER RFC822.TEXT)",
+            "ENVELOPE",
+            "BODYSTRUCTURE",
+            "BODY",
+            "(MODSEQ EMAILID THREADID)",
+            "(INTERNALDATE)",
+            "FAST",
+            "BODY[]",
+            "BODY.PEEK[]",
+            "BODY[HEADER]",
+            "BODY.PEEK[TEXT]",
+            "body.peek[header]",
+            "BODY[HEADER.FIELDS (From To)]",
+            "BODY.PEEK[HEADER.FIELDS (From \"Subject\" X-Spam)]",
+            "BODY[HEADER.FIELDS ()]",
+            "BODY[HEADER.FIELDS.NOT (Received)]",
+            "BODY[1]",
+            "BODY[1.2.MIME]",
+            "BODY[1.HEADER]",
+            "BODY[]<0.100>",
+            "BODY.PEEK[TEXT]<10.20>",
+            "BODY[]<0.0>",
+            "BODY[]<5>",
+            "BODY[]<.5>",
+            "BODY[]<5.>",
+            "BODY[]<a.5>",
+            "BODY[]<18446744073709551616.1>",
+            "BODY[HEADER",
+            "(BODY[HEADER.FIELDS (From To)]<0.100> FLAGS UID)",
+            "(FLAGS BODY.PEEK[HEADER.FIELDS (Message-ID)])",
+            "(FLAGS) (CHANGEDSINCE 12345)",
+            "(FLAGS UID) (changedsince 7)",
+            "(FLAGS) ()",
+            "(FLAGS) (CHANGEDSINCE)",
+            "(FLAGS) (CHANGEDSINCE x)",
+            "(FLAGS) (SOMETHING 1)",
+            "()",
+            "(",
+            "(FLAGS",
+            "",
+        ];
+        for items in corpus {
+            let text = format!("1:* {items}");
+            let mine = fetch(&format!("a FETCH {text}\r\n"));
+            let old = parse_fetch_args(items);
+            match (&mine, &old) {
+                (Ok((i, m, false)), Ok((oi, om))) => assert_eq!((i, m), (oi, om), "{items:?}"),
+                (Err(_), Err(_)) => {}
+                _ => panic!("{items:?}: new {mine:?}, old {old:?}"),
+            }
+            let uid = fetch(&format!("a UID FETCH {text}\r\n"));
+            assert_eq!(uid.map(|(i, m, u)| (i, m, u)), mine.map(|(i, m, _)| (i, m, true)), "{items:?}");
+        }
+    }
+
+    #[test]
+    fn fetch_refuses_what_the_text_parser_let_through() {
+        use crate::server::fetch_format::parse_fetch_args;
+        // The text parser read the debris after a malformed partial or a bare
+        // modifier as further items, or ignored it.
+        for items in ["BODY[]<1.2", "BODY[]x", "(FLAGS) CHANGEDSINCE 5", "(FLAGS) CHANGEDSINCE", "FLAGS UID"] {
+            assert!(fetch(&format!("a FETCH 1 {items}\r\n")).is_err(), "{items:?}");
+            let _ = parse_fetch_args(items);
+        }
+    }
+
+    #[test]
+    fn fetch_reads_sections_and_partials_whole() {
+        let (items, _, _) = fetch("a FETCH 1 (BODY.PEEK[HEADER.FIELDS (From \"To\")]<2.30> UID)\r\n").unwrap();
+        assert_eq!(
+            items,
+            vec![
+                FetchItem::Body {
+                    peek: true,
+                    header_fields: Some(vec!["From".into(), "To".into()]),
+                    section: BodySection::HeaderFields,
+                    partial: Some((2, 30)),
+                },
+                FetchItem::Uid
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_modifiers_and_early_refusals() {
+        let (_, m, _) = fetch("a UID FETCH 1:* (FLAGS) (CHANGEDSINCE 9 VANISHED)\r\n").unwrap();
+        assert_eq!(m.changed_since, Some(9));
+        // Refused at the offending token, not at the end of the line.
+        let got = outcomes("a FETCH x FLAGS\r\nb FETCH 1 UID\r\n", 1);
+        assert_eq!(got[0], Err("Invalid sequence set".to_string()));
+        assert!(matches!(got[1], Ok(_)), "{got:?}");
+        assert_eq!(fetch("a FETCH 1 FLAGS extra\r\n"), Err("FETCH modifiers must be parenthesized".to_string()));
+        let got = outcomes("a FETCH 1 {5}\r\n", 1000);
+        assert!(matches!(&got[..], [Err(_)]), "{got:?}");
     }
 }
