@@ -10,9 +10,11 @@
 //!
 //! This goes a step further than Gumdrop's own IMAP client (which tokenises
 //! only down to whole-line granularity and hands each line to a
-//! string-based `IMAPResponse.parse`): here, `CAPABILITY`/`ENABLED`/`SEARCH`
-//! token-and-number lists, `LIST`/`LSUB` entries, and `STATUS` item lists
-//! are built token-by-token with no intermediate raw-line buffer, and
+//! string-based `IMAPResponse.parse`): here, `CAPABILITY`/`ENABLED` token
+//! lists are built token-by-token with no intermediate raw-line buffer,
+//! `SEARCH`/`SORT` number lists, `LIST`/`LSUB` entries and `STATUS` item
+//! lists are read by the tokenizer described below (mailbox names may be
+//! literals, extended data is read and dropped), and
 //! `FETCH` responses are walked attribute-by-attribute — recognised
 //! attributes (`FLAGS`, `UID`, `RFC822.SIZE`, `MODSEQ`, literal-bearing
 //! `BODY[...]`/`RFC822`/`RFC822.TEXT`/`RFC822.HEADER`) are parsed directly
@@ -39,7 +41,9 @@
 
 use super::error::ImapError;
 use super::code::{CodeSink, ImapResponseCode};
-use super::sinks::{Discard, IdSink, MetadataSink, NamespaceSink, QuotaRootSink, QuotaSink, ThreadSink};
+use super::sinks::{
+    Discard, IdSink, ListSink, MetadataSink, NamespaceSink, NumbersSink, QuotaRootSink, QuotaSink, StatusSink, ThreadSink,
+};
 use super::structure_sink::{DateSink, StructureSink};
 use super::state::{
     ImapCapabilities, ImapFetchData, ImapListEntry, ImapMetadataData, ImapNamespaceData, ImapQuotaData,
@@ -208,39 +212,6 @@ enum TokenListUse {
     Enabled,
 }
 
-/// Which bounded-capture payload we're accumulating.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BoundedKind {
-    Namespace,
-    Quota,
-    QuotaRoot,
-    Id,
-    Thread,
-    Metadata,
-}
-
-/// Which space-separated *number* list we're reading (`SEARCH`/`SORT`
-/// share an identical wire grammar, just a different result kind).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NumListKind {
-    Search,
-    Sort,
-}
-
-/// A recognised STATUS item name, or `Other` for one we skip the value of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StatusItem {
-    Messages,
-    Recent,
-    UidNext,
-    UidValidity,
-    Unseen,
-    Deleted,
-    Size,
-    HighestModseq,
-    Other,
-}
-
 /// A recognised numeric FETCH attribute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FetchNumField {
@@ -253,8 +224,6 @@ enum FetchNumField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListCloseKind {
     Fetch,
-    StatusData,
-    ListEntry,
 }
 
 /// What to emit once the LF completing a CRLF just seen arrives.
@@ -269,14 +238,11 @@ enum AwaitLfKind {
     Preauth { code: Option<ImapResponseCode> },
     Capability,
     Enabled,
-    NumList(NumListKind),
     Exists(u32),
     Recent(u32),
     Expunge(u32),
     Flags,
-    ListEntry,
     Fetch,
-    StatusData,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,54 +268,6 @@ enum State {
     RespMessage { ctx: RespCtx },
     /// Space-separated atom list to CRLF (`CAPABILITY` / `ENABLED`).
     TokenList { use_: TokenListUse },
-    /// Space-separated numbers to CRLF (`SEARCH`/`SORT`).
-    NumList { kind: NumListKind },
-    /// Optional `(MODSEQ n)`-style trailer after SEARCH/SORT numbers, or
-    /// the remainder of an unrecognised line — quote/depth aware skip.
-    NumListTrailerSkip { kind: NumListKind, depth: i32, in_quote: bool, escape: bool },
-    /// `(` expected (`LIST`/`LSUB` attribute list).
-    ListAttrsOpen,
-    /// Inside the attribute list, quote/depth aware.
-    ListAttrsBody { depth: i32, in_quote: bool, escape: bool },
-    /// Expect SP after the attribute list.
-    ListPostAttrs,
-    /// Reading the delimiter: quoted char, or `NIL`.
-    ListDelimStart,
-    /// Reading the one delimiter char inside quotes (escape pending).
-    ListDelimQuotedChar { escape: bool },
-    /// Expect the closing `"` after the delimiter char.
-    ListDelimQuotedClose,
-    /// Matching literal `NIL` for the delimiter (chars matched so far).
-    ListDelimNil { matched: u8 },
-    /// Expect SP between delimiter and mailbox name.
-    ListPreName,
-    /// Deciding quoted-vs-atom for the mailbox name.
-    ListNameStart,
-    /// Inside a quoted mailbox name.
-    ListNameQuoted { escape: bool },
-    /// Reading an unquoted mailbox name atom.
-    ListNameAtom,
-    /// Name read: expect CRLF, or SP and an RFC 5258 extended data item.
-    ListAfterName,
-    /// SP seen after the name: expect `(` opening the extended data item.
-    ListExtOpen,
-    /// Inside the extended data item — skip-scanned by depth; its contents
-    /// (`CHILDINFO`, `OLDNAME`, …) are not surfaced.
-    ListExtBody { depth: i32, in_quote: bool, escape: bool },
-    /// Deciding quoted-vs-atom for STATUS's mailbox name.
-    StatusMailboxStart,
-    /// Inside a quoted STATUS mailbox name.
-    StatusMailboxQuoted { escape: bool },
-    /// Reading an unquoted STATUS mailbox name atom.
-    StatusMailboxAtom,
-    /// After a quoted STATUS mailbox name: expect SP.
-    StatusPostMailbox,
-    /// `(` expected (STATUS item list).
-    StatusItemsOpen,
-    /// Reading a STATUS item name.
-    StatusItemName,
-    /// Reading a STATUS item's numeric value.
-    StatusItemValue { item: StatusItem },
     /// `(` expected after `n FETCH`.
     FetchOpenParen,
     /// At the top of the attribute list: expect `)` (done) or an attribute
@@ -440,10 +358,7 @@ pub struct ImapReplyLexer {
     code: Option<ImapResponseCode>,
     literal_remaining: u64,
     caps: ImapCapabilities,
-    list_entry: ImapListEntry,
-    status_data: ImapStatusData,
     fetch_data: ImapFetchData,
-    search_nums: Vec<u32>,
     tokens: Vec<String>,
     /// Which event `FetchListCloseCr` should emit once CRLF completes.
     list_close_kind: Option<ListCloseKind>,
@@ -492,10 +407,7 @@ impl ImapReplyLexer {
             code: None,
             literal_remaining: 0,
             caps: ImapCapabilities::default(),
-            list_entry: ImapListEntry::default(),
-            status_data: ImapStatusData::default(),
             fetch_data: ImapFetchData::default(),
-            search_nums: Vec::new(),
             tokens: Vec::new(),
             list_close_kind: None,
             flags_is_fetch_attr: false,
@@ -619,33 +531,6 @@ impl ImapReplyLexer {
             State::RespCodeGap { ctx } => self.on_resp_code_gap(ctx, b),
             State::RespMessage { ctx } => self.on_resp_message(ctx, b),
             State::TokenList { use_ } => self.on_token_list(use_, b),
-            State::NumList { kind } => self.on_num_list(kind, b),
-            State::NumListTrailerSkip { kind, depth, in_quote, escape } => {
-                self.on_num_list_trailer_skip(kind, depth, in_quote, escape, b)
-            }
-            State::ListAttrsOpen => self.on_list_attrs_open(b),
-            State::ListAttrsBody { depth, in_quote, escape } => {
-                self.on_list_attrs_body(depth, in_quote, escape, b)
-            }
-            State::ListPostAttrs => self.on_list_post_attrs(b),
-            State::ListDelimStart => self.on_list_delim_start(b),
-            State::ListDelimQuotedChar { escape } => self.on_list_delim_quoted_char(escape, b),
-            State::ListDelimQuotedClose => self.on_list_delim_quoted_close(b),
-            State::ListDelimNil { matched } => self.on_list_delim_nil(matched, b),
-            State::ListPreName => self.on_list_pre_name(b),
-            State::ListNameStart => self.on_list_name_start(b),
-            State::ListNameQuoted { escape } => self.on_list_name_quoted(escape, b),
-            State::ListNameAtom => self.on_list_name_atom(b),
-            State::ListAfterName => self.on_list_after_name(b),
-            State::ListExtOpen => self.on_list_ext_open(b),
-            State::ListExtBody { depth, in_quote, escape } => self.on_list_ext_body(depth, in_quote, escape, b),
-            State::StatusMailboxStart => self.on_status_mailbox_start(b),
-            State::StatusMailboxQuoted { escape } => self.on_status_mailbox_quoted(escape, b),
-            State::StatusMailboxAtom => self.on_status_mailbox_atom(b),
-            State::StatusPostMailbox => self.on_status_post_mailbox(b),
-            State::StatusItemsOpen => self.on_status_items_open(b),
-            State::StatusItemName => self.on_status_item_name(b),
-            State::StatusItemValue { item } => self.on_status_item_value(item, b),
             State::FetchOpenParen => self.on_fetch_open_paren(b),
             State::FetchAttrNameStart => self.on_fetch_attr_name_start(b),
             State::FetchAttrName => self.on_fetch_attr_name(b),
@@ -755,41 +640,11 @@ impl ImapReplyLexer {
                         self.state = State::TokenList { use_: TokenListUse::Enabled };
                         Ok(None)
                     }
-                    "SEARCH" | "ESEARCH" => {
-                        self.search_nums.clear();
-                        if by_cr {
-                            self.state = State::AwaitLf(AwaitLfKind::NumList(NumListKind::Search));
-                            return Ok(None);
-                        }
-                        self.state = State::NumList { kind: NumListKind::Search };
-                        Ok(None)
-                    }
-                    "SORT" => {
-                        self.search_nums.clear();
-                        if by_cr {
-                            self.state = State::AwaitLf(AwaitLfKind::NumList(NumListKind::Sort));
-                            return Ok(None);
-                        }
-                        self.state = State::NumList { kind: NumListKind::Sort };
-                        Ok(None)
-                    }
-                    "THREAD" => self.begin_bounded(BoundedKind::Thread, by_cr),
-                    "LIST" | "LSUB" => {
-                        if by_cr {
-                            return Err(ImapError::Parse("truncated LIST response".into()));
-                        }
-                        self.list_entry = ImapListEntry::default();
-                        self.state = State::ListAttrsOpen;
-                        Ok(None)
-                    }
-                    "STATUS" => {
-                        if by_cr {
-                            return Err(ImapError::Parse("truncated STATUS response".into()));
-                        }
-                        self.status_data = ImapStatusData::default();
-                        self.state = State::StatusMailboxStart;
-                        Ok(None)
-                    }
+                    "SEARCH" => self.begin_payload(Box::new(NumbersSink::search()), by_cr),
+                    "SORT" => self.begin_payload(Box::new(NumbersSink::sort()), by_cr),
+                    "THREAD" => self.begin_payload(Box::<ThreadSink>::default(), by_cr),
+                    "LIST" | "LSUB" => self.begin_payload(Box::<ListSink>::default(), by_cr),
+                    "STATUS" => self.begin_payload(Box::<StatusSink>::default(), by_cr),
                     "FLAGS" => {
                         if by_cr {
                             return Err(ImapError::Parse("truncated FLAGS response".into()));
@@ -797,11 +652,11 @@ impl ImapReplyLexer {
                         self.state = State::FetchFlagsOpen;
                         Ok(None)
                     }
-                    "NAMESPACE" => self.begin_bounded(BoundedKind::Namespace, by_cr),
-                    "QUOTA" => self.begin_bounded(BoundedKind::Quota, by_cr),
-                    "QUOTAROOT" => self.begin_bounded(BoundedKind::QuotaRoot, by_cr),
-                    "ID" => self.begin_bounded(BoundedKind::Id, by_cr),
-                    "METADATA" => self.begin_bounded(BoundedKind::Metadata, by_cr),
+                    "NAMESPACE" => self.begin_payload(Box::<NamespaceSink>::default(), by_cr),
+                    "QUOTA" => self.begin_payload(Box::<QuotaSink>::default(), by_cr),
+                    "QUOTAROOT" => self.begin_payload(Box::<QuotaRootSink>::default(), by_cr),
+                    "ID" => self.begin_payload(Box::<IdSink>::default(), by_cr),
+                    "METADATA" => self.begin_payload(Box::<MetadataSink>::default(), by_cr),
                     _ => {
                         // A response hopf does not know: read through its
                         // tokens (a literal in it may hold anything) and drop it.
@@ -1005,479 +860,6 @@ impl ImapReplyLexer {
         match use_ {
             TokenListUse::Capability => apply_capability_token(&mut self.caps, &upper),
             TokenListUse::Enabled => self.tokens.push(upper),
-        }
-    }
-
-    // ── SEARCH numbers ───────────────────────────────────────────────────
-
-    fn on_num_list(&mut self, kind: NumListKind, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        match b {
-            b' ' => {
-                let w = self.take_word();
-                if w.is_empty() {
-                    self.state = State::NumList { kind };
-                    return Ok(None);
-                }
-                if let Ok(n) = w.parse::<u32>() {
-                    self.search_nums.push(n);
-                    self.state = State::NumList { kind };
-                    Ok(None)
-                } else if w.starts_with('(') {
-                    self.state = State::NumListTrailerSkip {
-                        kind,
-                        depth: 1,
-                        in_quote: false,
-                        escape: false,
-                    };
-                    Ok(None)
-                } else {
-                    Err(ImapError::Parse(format!("unexpected SEARCH/SORT token: {w:?}")))
-                }
-            }
-            b'\r' => {
-                let w = self.take_word();
-                if !w.is_empty() {
-                    let n: u32 = w.parse().map_err(|_| {
-                        ImapError::Parse(format!("unexpected SEARCH/SORT token: {w:?}"))
-                    })?;
-                    self.search_nums.push(n);
-                }
-                self.state = State::AwaitLf(AwaitLfKind::NumList(kind));
-                Ok(None)
-            }
-            b'(' if self.word.is_empty() => {
-                self.state = State::NumListTrailerSkip {
-                    kind,
-                    depth: 1,
-                    in_quote: false,
-                    escape: false,
-                };
-                Ok(None)
-            }
-            _ => {
-                self.push_word(b)?;
-                self.state = State::NumList { kind };
-                Ok(None)
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn on_num_list_trailer_skip(
-        &mut self,
-        kind: NumListKind,
-        depth: i32,
-        in_quote: bool,
-        escape: bool,
-        b: u8,
-    ) -> Result<Option<ImapEvent>, ImapError> {
-        if escape {
-            self.state = State::NumListTrailerSkip { kind, depth, in_quote, escape: false };
-            return Ok(None);
-        }
-        if in_quote {
-            match b {
-                b'\\' => {
-                    self.state = State::NumListTrailerSkip { kind, depth, in_quote, escape: true }
-                }
-                b'"' => {
-                    self.state =
-                        State::NumListTrailerSkip { kind, depth, in_quote: false, escape: false }
-                }
-                _ => {
-                    self.state = State::NumListTrailerSkip { kind, depth, in_quote, escape: false }
-                }
-            }
-            return Ok(None);
-        }
-        match b {
-            b'"' => {
-                self.state =
-                    State::NumListTrailerSkip { kind, depth, in_quote: true, escape: false };
-                Ok(None)
-            }
-            b'(' => {
-                self.state = State::NumListTrailerSkip {
-                    kind,
-                    depth: depth + 1,
-                    in_quote: false,
-                    escape: false,
-                };
-                Ok(None)
-            }
-            b')' if depth > 1 => {
-                self.state = State::NumListTrailerSkip {
-                    kind,
-                    depth: depth - 1,
-                    in_quote: false,
-                    escape: false,
-                };
-                Ok(None)
-            }
-            b')' => {
-                self.state =
-                    State::NumListTrailerSkip { kind, depth: 0, in_quote: false, escape: false };
-                Ok(None)
-            }
-            b'\r' if depth <= 0 => {
-                self.state = State::AwaitLf(AwaitLfKind::NumList(kind));
-                Ok(None)
-            }
-            _ => {
-                self.state =
-                    State::NumListTrailerSkip { kind, depth, in_quote: false, escape: false };
-                Ok(None)
-            }
-        }
-    }
-
-    // ── LIST / LSUB ───────────────────────────────────────────────────────
-
-    fn on_list_attrs_open(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b'(' {
-            self.state = State::ListAttrsBody { depth: 1, in_quote: false, escape: false };
-            self.word.clear();
-            return Ok(None);
-        }
-        Err(ImapError::Parse("expected '(' opening LIST attribute list".into()))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn on_list_attrs_body(
-        &mut self,
-        depth: i32,
-        in_quote: bool,
-        escape: bool,
-        b: u8,
-    ) -> Result<Option<ImapEvent>, ImapError> {
-        if escape {
-            self.state = State::ListAttrsBody { depth, in_quote, escape: false };
-            return Ok(None);
-        }
-        if in_quote {
-            match b {
-                b'\\' => self.state = State::ListAttrsBody { depth, in_quote, escape: true },
-                b'"' => self.state = State::ListAttrsBody { depth, in_quote: false, escape: false },
-                _ => self.state = State::ListAttrsBody { depth, in_quote, escape: false },
-            }
-            return Ok(None);
-        }
-        match b {
-            b'"' => {
-                self.state = State::ListAttrsBody { depth, in_quote: true, escape: false };
-                Ok(None)
-            }
-            b'(' => {
-                self.state = State::ListAttrsBody { depth: depth + 1, in_quote: false, escape: false };
-                Ok(None)
-            }
-            b')' if depth > 1 => {
-                self.state = State::ListAttrsBody { depth: depth - 1, in_quote: false, escape: false };
-                Ok(None)
-            }
-            b')' => {
-                let w = self.take_word();
-                if !w.is_empty() {
-                    self.list_entry.attributes.push(w);
-                }
-                self.state = State::ListPostAttrs;
-                Ok(None)
-            }
-            b' ' => {
-                let w = self.take_word();
-                if !w.is_empty() {
-                    self.list_entry.attributes.push(w);
-                }
-                self.state = State::ListAttrsBody { depth, in_quote: false, escape: false };
-                Ok(None)
-            }
-            _ => {
-                self.push_word(b)?;
-                self.state = State::ListAttrsBody { depth, in_quote: false, escape: false };
-                Ok(None)
-            }
-        }
-    }
-
-    fn on_list_post_attrs(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b' ' {
-            self.state = State::ListDelimStart;
-            return Ok(None);
-        }
-        Err(ImapError::Parse("expected SP after LIST attribute list".into()))
-    }
-
-    fn on_list_delim_start(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        match b {
-            b'"' => {
-                self.state = State::ListDelimQuotedChar { escape: false };
-                Ok(None)
-            }
-            b'N' | b'n' => {
-                self.state = State::ListDelimNil { matched: 1 };
-                Ok(None)
-            }
-            _ => Err(ImapError::Parse("expected quoted delimiter or NIL in LIST".into())),
-        }
-    }
-
-    fn on_list_delim_quoted_char(&mut self, escape: bool, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if !escape && b == b'\\' {
-            self.state = State::ListDelimQuotedChar { escape: true };
-            return Ok(None);
-        }
-        self.list_entry.delimiter = Some((b as char).to_string());
-        self.state = State::ListDelimQuotedClose;
-        Ok(None)
-    }
-
-    fn on_list_delim_quoted_close(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b'"' {
-            self.state = State::ListPreName;
-            return Ok(None);
-        }
-        Err(ImapError::Parse("expected closing '\"' after LIST delimiter".into()))
-    }
-
-    fn on_list_delim_nil(&mut self, matched: u8, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        const NIL: &[u8] = b"NIL";
-        if b.to_ascii_uppercase() != NIL[matched as usize] {
-            return Err(ImapError::Parse("expected NIL delimiter in LIST".into()));
-        }
-        let matched = matched + 1;
-        if matched as usize == NIL.len() {
-            self.list_entry.delimiter = None;
-            self.state = State::ListPreName;
-        } else {
-            self.state = State::ListDelimNil { matched };
-        }
-        Ok(None)
-    }
-
-    fn on_list_pre_name(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b' ' {
-            self.state = State::ListNameStart;
-            return Ok(None);
-        }
-        Err(ImapError::Parse("expected SP before LIST mailbox name".into()))
-    }
-
-    fn on_list_name_start(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b'"' {
-            self.state = State::ListNameQuoted { escape: false };
-            return Ok(None);
-        }
-        self.state = State::ListNameAtom;
-        self.push_text(b)?;
-        Ok(None)
-    }
-
-    fn on_list_name_quoted(&mut self, escape: bool, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if escape {
-            self.push_text(b)?;
-            self.state = State::ListNameQuoted { escape: false };
-            return Ok(None);
-        }
-        match b {
-            b'\\' => {
-                self.state = State::ListNameQuoted { escape: true };
-                Ok(None)
-            }
-            b'"' => {
-                self.list_entry.name = self.take_text();
-                self.state = State::ListAfterName;
-                Ok(None)
-            }
-            _ => {
-                self.push_text(b)?;
-                self.state = State::ListNameQuoted { escape: false };
-                Ok(None)
-            }
-        }
-    }
-
-    fn on_list_name_atom(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        match b {
-            b'\r' => {
-                self.list_entry.name = self.take_text();
-                self.state = State::AwaitLf(AwaitLfKind::ListEntry);
-                Ok(None)
-            }
-            b' ' => {
-                self.list_entry.name = self.take_text();
-                self.state = State::ListExtOpen;
-                Ok(None)
-            }
-            _ => {
-                self.push_text(b)?;
-                self.state = State::ListNameAtom;
-                Ok(None)
-            }
-        }
-    }
-
-    fn on_list_after_name(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        match b {
-            b'\r' => {
-                self.state = State::AwaitLf(AwaitLfKind::ListEntry);
-                Ok(None)
-            }
-            b' ' => {
-                self.state = State::ListExtOpen;
-                Ok(None)
-            }
-            _ => Err(ImapError::Parse("expected CRLF or extended data after LIST name".into())),
-        }
-    }
-
-    fn on_list_ext_open(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b != b'(' {
-            return Err(ImapError::Parse("expected '(' opening LIST extended data".into()));
-        }
-        self.state = State::ListExtBody { depth: 1, in_quote: false, escape: false };
-        Ok(None)
-    }
-
-    /// RFC 5258 §3.3 `mbox-list-extended`: `(tagged-ext-label tagged-ext-val …)`
-    /// — nested lists, quoted strings and atoms. Skipped by depth; a `"` inside
-    /// a quoted string is escaped, parentheses inside one do not count.
-    fn on_list_ext_body(&mut self, depth: i32, in_quote: bool, escape: bool, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if escape {
-            self.state = State::ListExtBody { depth, in_quote, escape: false };
-            return Ok(None);
-        }
-        if in_quote {
-            self.state = match b {
-                b'\\' => State::ListExtBody { depth, in_quote, escape: true },
-                b'"' => State::ListExtBody { depth, in_quote: false, escape: false },
-                _ => State::ListExtBody { depth, in_quote, escape: false },
-            };
-            return Ok(None);
-        }
-        match b {
-            b'"' => self.state = State::ListExtBody { depth, in_quote: true, escape: false },
-            b'(' => self.state = State::ListExtBody { depth: depth + 1, in_quote: false, escape: false },
-            b')' if depth > 1 => self.state = State::ListExtBody { depth: depth - 1, in_quote: false, escape: false },
-            b')' => {
-                self.state = State::FetchListCloseCr; // reused: "expect CRLF"
-                self.pending_list_entry();
-            }
-            _ => self.state = State::ListExtBody { depth, in_quote: false, escape: false },
-        }
-        Ok(None)
-    }
-
-    fn pending_list_entry(&mut self) {
-        // FetchListCloseCr is a generic "expect CRLF" state shared with
-        // FETCH/STATUS; on_fetch_list_close_cr checks which of these
-        // flags produced the wait and emits the right event.
-        self.list_close_kind = Some(ListCloseKind::ListEntry);
-    }
-
-    // ── STATUS ────────────────────────────────────────────────────────────
-
-    fn on_status_mailbox_start(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b'"' {
-            self.state = State::StatusMailboxQuoted { escape: false };
-            return Ok(None);
-        }
-        self.state = State::StatusMailboxAtom;
-        self.push_text(b)?;
-        Ok(None)
-    }
-
-    fn on_status_mailbox_quoted(&mut self, escape: bool, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if escape {
-            self.push_text(b)?;
-            self.state = State::StatusMailboxQuoted { escape: false };
-            return Ok(None);
-        }
-        match b {
-            b'\\' => {
-                self.state = State::StatusMailboxQuoted { escape: true };
-                Ok(None)
-            }
-            b'"' => {
-                self.status_data.mailbox = self.take_text();
-                self.state = State::StatusPostMailbox;
-                Ok(None)
-            }
-            _ => {
-                self.push_text(b)?;
-                self.state = State::StatusMailboxQuoted { escape: false };
-                Ok(None)
-            }
-        }
-    }
-
-    fn on_status_mailbox_atom(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b' ' {
-            self.status_data.mailbox = self.take_text();
-            self.state = State::StatusItemsOpen;
-            return Ok(None);
-        }
-        self.push_text(b)?;
-        self.state = State::StatusMailboxAtom;
-        Ok(None)
-    }
-
-    fn on_status_post_mailbox(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b' ' {
-            self.state = State::StatusItemsOpen;
-            return Ok(None);
-        }
-        Err(ImapError::Parse("expected SP after STATUS mailbox".into()))
-    }
-
-    fn on_status_items_open(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        if b == b'(' {
-            self.state = State::StatusItemName;
-            self.word.clear();
-            return Ok(None);
-        }
-        Err(ImapError::Parse("expected '(' opening STATUS item list".into()))
-    }
-
-    fn on_status_item_name(&mut self, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        match b {
-            b' ' => {
-                let w = self.take_word().to_ascii_uppercase();
-                let item = status_item_from_name(&w);
-                self.state = State::StatusItemValue { item };
-                Ok(None)
-            }
-            b')' if self.word.is_empty() => {
-                self.state = State::FetchListCloseCr;
-                self.list_close_kind = Some(ListCloseKind::StatusData);
-                Ok(None)
-            }
-            _ => {
-                self.push_word(b)?;
-                self.state = State::StatusItemName;
-                Ok(None)
-            }
-        }
-    }
-
-    fn on_status_item_value(&mut self, item: StatusItem, b: u8) -> Result<Option<ImapEvent>, ImapError> {
-        match b {
-            b' ' | b')' => {
-                let w = self.take_word();
-                let val = w.parse::<i64>().ok();
-                apply_status_item(&mut self.status_data, item, val);
-                if b == b')' {
-                    self.state = State::FetchListCloseCr;
-                    self.list_close_kind = Some(ListCloseKind::StatusData);
-                    return Ok(None);
-                }
-                self.state = State::StatusItemName;
-                Ok(None)
-            }
-            _ => {
-                self.push_word(b)?;
-                self.state = State::StatusItemValue { item };
-                Ok(None)
-            }
         }
     }
 
@@ -2011,8 +1393,6 @@ impl ImapReplyLexer {
         let kind = self.list_close_kind.take();
         self.state = State::AwaitLf(match kind {
             Some(ListCloseKind::Fetch) => AwaitLfKind::Fetch,
-            Some(ListCloseKind::StatusData) => AwaitLfKind::StatusData,
-            Some(ListCloseKind::ListEntry) => AwaitLfKind::ListEntry,
             None => return Err(ImapError::Parse("internal: missing list-close kind".into())),
         });
         Ok(None)
@@ -2026,17 +1406,9 @@ impl ImapReplyLexer {
         Ok(None)
     }
 
-    // ── structured payloads (NAMESPACE / QUOTA / QUOTAROOT / ID / THREAD / METADATA) ──
+    // ── structured payloads (read to the end of the line by their machines) ──
 
-    fn begin_bounded(&mut self, kind: BoundedKind, by_cr: bool) -> Result<Option<ImapEvent>, ImapError> {
-        let sink: Box<dyn Sink> = match kind {
-            BoundedKind::Namespace => Box::<NamespaceSink>::default(),
-            BoundedKind::Quota => Box::<QuotaSink>::default(),
-            BoundedKind::QuotaRoot => Box::<QuotaRootSink>::default(),
-            BoundedKind::Id => Box::<IdSink>::default(),
-            BoundedKind::Thread => Box::<ThreadSink>::default(),
-            BoundedKind::Metadata => Box::<MetadataSink>::default(),
-        };
+    fn begin_payload(&mut self, sink: Box<dyn Sink>, by_cr: bool) -> Result<Option<ImapEvent>, ImapError> {
         self.payload = Some(Payload { tokens: Tokenizer::line(), sink });
         self.state = State::Payload;
         if by_cr {
@@ -2098,19 +1470,11 @@ impl ImapReplyLexer {
             AwaitLfKind::Preauth { code } => ImapEvent::Preauth { code, text: self.take_text() },
             AwaitLfKind::Capability => ImapEvent::Capability(std::mem::take(&mut self.caps)),
             AwaitLfKind::Enabled => ImapEvent::Enabled(std::mem::take(&mut self.tokens)),
-            AwaitLfKind::NumList(NumListKind::Search) => {
-                ImapEvent::SearchNumbers(std::mem::take(&mut self.search_nums))
-            }
-            AwaitLfKind::NumList(NumListKind::Sort) => {
-                ImapEvent::SortNumbers(std::mem::take(&mut self.search_nums))
-            }
             AwaitLfKind::Exists(n) => ImapEvent::Exists(n),
             AwaitLfKind::Recent(n) => ImapEvent::Recent(n),
             AwaitLfKind::Expunge(n) => ImapEvent::Expunge(n),
             AwaitLfKind::Flags => ImapEvent::FlagsList(std::mem::take(&mut self.tokens)),
-            AwaitLfKind::ListEntry => ImapEvent::ListEntry(std::mem::take(&mut self.list_entry)),
             AwaitLfKind::Fetch => ImapEvent::Fetch(std::mem::take(&mut self.fetch_data)),
-            AwaitLfKind::StatusData => ImapEvent::StatusData(std::mem::take(&mut self.status_data)),
         };
         Ok(Some(event))
     }
@@ -2153,36 +1517,6 @@ pub(super) fn apply_capability_token(caps: &mut ImapCapabilities, upper: &str) {
         }
     }
     caps.tokens.push(upper.to_string());
-}
-
-fn status_item_from_name(name: &str) -> StatusItem {
-    match name {
-        "MESSAGES" => StatusItem::Messages,
-        "RECENT" => StatusItem::Recent,
-        "UIDNEXT" => StatusItem::UidNext,
-        "UIDVALIDITY" => StatusItem::UidValidity,
-        "UNSEEN" => StatusItem::Unseen,
-        "DELETED" => StatusItem::Deleted,
-        "SIZE" => StatusItem::Size,
-        "HIGHESTMODSEQ" => StatusItem::HighestModseq,
-        _ => StatusItem::Other,
-    }
-}
-
-fn apply_status_item(data: &mut ImapStatusData, item: StatusItem, val: Option<i64>) {
-    let u32v = val.and_then(|v| u32::try_from(v).ok());
-    let u64v = val.and_then(|v| u64::try_from(v).ok());
-    match item {
-        StatusItem::Messages => data.messages = u32v,
-        StatusItem::Recent => data.recent = u32v,
-        StatusItem::UidNext => data.uid_next = u32v,
-        StatusItem::UidValidity => data.uid_validity = u32v,
-        StatusItem::Unseen => data.unseen = u32v,
-        StatusItem::Deleted => data.deleted = u32v,
-        StatusItem::Size => data.size = u64v,
-        StatusItem::HighestModseq => data.highest_modseq = u64v,
-        StatusItem::Other => {}
-    }
 }
 
 #[cfg(test)]

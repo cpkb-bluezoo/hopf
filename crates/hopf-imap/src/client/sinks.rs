@@ -6,8 +6,8 @@
 
 use super::reply::ImapEvent;
 use super::state::{
-    ImapMetadataData, ImapMetadataEntry, ImapNamespace, ImapNamespaceData, ImapQuotaData, ImapQuotaResource,
-    ImapQuotaRootData, ImapThreadNode,
+    ImapListEntry, ImapMetadataData, ImapMetadataEntry, ImapNamespace, ImapNamespaceData, ImapQuotaData,
+    ImapQuotaResource, ImapQuotaRootData, ImapStatusData, ImapThreadNode,
 };
 use super::tokens::{Bad, Output, Sink, Tok};
 
@@ -44,6 +44,190 @@ impl Sink for Discard {
 
     fn finish(self: Box<Self>) -> Result<Output, Bad> {
         Ok(Output::Event(ImapEvent::Other))
+    }
+}
+
+// ── SEARCH / SORT ──────────────────────────────────────────────────────────
+
+/// `n n n ...`, with an optional `(MODSEQ n)` after them that is read and dropped.
+pub(crate) struct NumbersSink {
+    sort: bool,
+    depth: usize,
+    numbers: Vec<u32>,
+}
+
+impl NumbersSink {
+    pub(crate) fn search() -> Self {
+        Self { sort: false, depth: 0, numbers: Vec::new() }
+    }
+
+    pub(crate) fn sort() -> Self {
+        Self { sort: true, depth: 0, numbers: Vec::new() }
+    }
+}
+
+impl Sink for NumbersSink {
+    fn token(&mut self, tok: Tok<'_>) -> Result<(), Bad> {
+        match tok {
+            Tok::Open => self.depth += 1,
+            Tok::Close => self.depth = self.depth.checked_sub(1).ok_or(Bad)?,
+            _ if self.depth > 0 => {}
+            tok => self.numbers.push(number(tok).ok_or(Bad)?),
+        }
+        Ok(())
+    }
+
+    fn keeps_literals(&self) -> bool {
+        false
+    }
+
+    fn finish(self: Box<Self>) -> Result<Output, Bad> {
+        if self.depth != 0 {
+            return Err(Bad);
+        }
+        Ok(Output::Event(if self.sort { ImapEvent::SortNumbers(self.numbers) } else { ImapEvent::SearchNumbers(self.numbers) }))
+    }
+}
+
+// ── LIST / LSUB ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ListAt {
+    #[default]
+    Open,
+    Attributes,
+    Delimiter,
+    Name,
+    /// The name is read: whatever follows (RFC 5258 extended data such as
+    /// `("CHILDINFO" ("SUBSCRIBED"))`) is read and not kept.
+    Done,
+}
+
+/// `(attribute ...) delimiter name [extended data]`
+#[derive(Default)]
+pub(crate) struct ListSink {
+    at: ListAt,
+    entry: ImapListEntry,
+}
+
+impl Sink for ListSink {
+    fn token(&mut self, tok: Tok<'_>) -> Result<(), Bad> {
+        match (self.at, tok) {
+            (ListAt::Open, Tok::Open) => self.at = ListAt::Attributes,
+            (ListAt::Attributes, Tok::Close) => self.at = ListAt::Delimiter,
+            (ListAt::Attributes, Tok::Atom(a)) => self.entry.attributes.push(String::from_utf8_lossy(a).into_owned()),
+            (ListAt::Delimiter, tok) => {
+                self.entry.delimiter = if is_nil(tok) { None } else { Some(text(tok).ok_or(Bad)?) };
+                self.at = ListAt::Name;
+            }
+            (ListAt::Name, tok) => {
+                self.entry.name = text(tok).ok_or(Bad)?;
+                self.at = ListAt::Done;
+            }
+            (ListAt::Done, _) => {}
+            _ => return Err(Bad),
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<Output, Bad> {
+        match self.at {
+            ListAt::Done => Ok(Output::Event(ImapEvent::ListEntry(self.entry))),
+            _ => Err(Bad),
+        }
+    }
+}
+
+// ── STATUS ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum StatusAt {
+    #[default]
+    Mailbox,
+    Open,
+    /// An item name, or the `)`.
+    Item,
+    /// The item's value: a number, or a list (`MAILBOXID (id)`).
+    Value,
+    /// Inside an item's list value.
+    List,
+    Done,
+}
+
+/// `mailbox (item value ...)`
+#[derive(Default)]
+pub(crate) struct StatusSink {
+    at: StatusAt,
+    data: ImapStatusData,
+    item: String,
+    /// The words of a list value.
+    list: Vec<String>,
+}
+
+impl StatusSink {
+    fn apply(&mut self, value: Option<i64>) {
+        let u32v = value.and_then(|v| u32::try_from(v).ok());
+        let u64v = value.and_then(|v| u64::try_from(v).ok());
+        let data = &mut self.data;
+        match self.item.as_str() {
+            "MESSAGES" => data.messages = u32v,
+            "RECENT" => data.recent = u32v,
+            "UIDNEXT" => data.uid_next = u32v,
+            "UIDVALIDITY" => data.uid_validity = u32v,
+            "UNSEEN" => data.unseen = u32v,
+            "DELETED" => data.deleted = u32v,
+            "SIZE" => data.size = u64v,
+            "HIGHESTMODSEQ" => data.highest_modseq = u64v,
+            _ => {}
+        }
+    }
+}
+
+impl Sink for StatusSink {
+    fn token(&mut self, tok: Tok<'_>) -> Result<(), Bad> {
+        match (self.at, tok) {
+            (StatusAt::Mailbox, tok) => {
+                self.data.mailbox = text(tok).ok_or(Bad)?;
+                self.at = StatusAt::Open;
+            }
+            (StatusAt::Open, Tok::Open) => self.at = StatusAt::Item,
+            (StatusAt::Item, Tok::Close) => self.at = StatusAt::Done,
+            (StatusAt::Item, Tok::Atom(a)) => {
+                self.item = String::from_utf8_lossy(a).to_ascii_uppercase();
+                self.at = StatusAt::Value;
+            }
+            (StatusAt::Value, Tok::Open) => {
+                self.list.clear();
+                self.at = StatusAt::List;
+            }
+            (StatusAt::Value, tok) => {
+                // (A value that is not a number leaves the item unset.)
+                self.apply(match tok {
+                    Tok::Atom(a) => std::str::from_utf8(a).ok().and_then(|s| s.parse().ok()),
+                    _ => None,
+                });
+                self.at = StatusAt::Item;
+            }
+            (StatusAt::List, Tok::Close) => {
+                if self.item == "MAILBOXID" {
+                    if let [id] = self.list.as_slice() {
+                        self.data.mailbox_id = Some(id.clone());
+                    }
+                }
+                self.at = StatusAt::Item;
+            }
+            (StatusAt::List, tok) => self.list.push(text(tok).ok_or(Bad)?),
+            (StatusAt::Done, _) => {}
+            _ => return Err(Bad),
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Result<Output, Bad> {
+        match self.at {
+            StatusAt::Done => Ok(Output::Event(ImapEvent::StatusData(self.data))),
+            _ => Err(Bad),
+        }
     }
 }
 
@@ -541,6 +725,87 @@ mod tests {
         }
         assert_eq!(event("* METADATA INBOX\r\n"), E::Other);
         assert_eq!(event("* METADATA INBOX (/a\r\n"), E::Other);
+    }
+
+    #[test]
+    fn list_agrees_with_the_text_parser() {
+        for (keyword, payload) in [
+            ("LIST", "(\\HasNoChildren) \"/\" INBOX"),
+            ("LIST", "(\\Noselect \\HasChildren) \"/\" \"Sent Items\""),
+            ("LSUB", "() \".\" Drafts"),
+            ("LIST", "() NIL \"\""),
+            ("LIST", "(\\Marked) \"/\" \"a \\\"b\\\" c\""),
+            ("list", "(\\Sent) \"\\\\\" Sent"),
+        ] {
+            let want = ImapListEntry::parse(&format!("{keyword} {payload}")).expect("the oracle reads it");
+            assert_eq!(event(&format!("* {keyword} {payload}\r\n")), E::ListEntry(want), "{payload:?}");
+        }
+        for payload in ["(\\A) \"/\"", "(\\A \"/\" x", "\"/\" x", "(\\A) 12", ""] {
+            assert_eq!(event(&format!("* LIST {payload}\r\n")), E::Other, "{payload:?}");
+        }
+    }
+
+    #[test]
+    fn list_names_may_be_literals_and_extended_data_is_read_through() {
+        let want = ImapListEntry { attributes: vec!["\\HasChildren".into()], delimiter: Some("/".into()), name: "Entw\u{fc}rfe".into() };
+        assert_eq!(event("* LIST (\\HasChildren) \"/\" {9}\r\nEntw\u{fc}rfe\r\n"), E::ListEntry(want.clone()));
+        // RFC 5258 extended data - including a literal holding a line break - is not kept.
+        assert_eq!(
+            event("* LIST (\\HasChildren) \"/\" {9}\r\nEntw\u{fc}rfe (\"CHILDINFO\" (\"SUBSCRIBED\") \"OLDNAME\" ({4}\r\na\r\nb))\r\n"),
+            E::ListEntry(want)
+        );
+    }
+
+    #[test]
+    fn status_agrees_with_the_text_parser() {
+        for payload in [
+            "INBOX (MESSAGES 17 UIDNEXT 18)",
+            "\"Sent Items\" (MESSAGES 1 RECENT 0 UIDNEXT 2 UIDVALIDITY 3 UNSEEN 4 DELETED 5 SIZE 6 HIGHESTMODSEQ 7)",
+            "INBOX ()",
+            "INBOX (MESSAGES 1 X-UNKNOWN 5 UNSEEN 2)",
+            "INBOX (MESSAGES x)",
+            "INBOX (MESSAGES -1)",
+        ] {
+            let mut want = ImapStatusData::parse(&format!("STATUS {payload}")).expect("the oracle reads it");
+            // (The text parser does not know the items the lexer does not keep.)
+            want.mailbox_id = None;
+            assert_eq!(event(&format!("* STATUS {payload}\r\n")), E::StatusData(want), "{payload:?}");
+        }
+        for payload in ["INBOX", "INBOX (MESSAGES 1", "(MESSAGES 1)", "INBOX MESSAGES"] {
+            assert_eq!(event(&format!("* STATUS {payload}\r\n")), E::Other, "{payload:?}");
+        }
+    }
+
+    #[test]
+    fn status_reads_mailboxid_and_literal_names() {
+        let got = event("* STATUS {6}\r\nSent 1 (MESSAGES 3 MAILBOXID (F2212ea87-6097) UIDNEXT 9)\r\n");
+        assert_eq!(
+            got,
+            E::StatusData(ImapStatusData {
+                mailbox: "Sent 1".into(),
+                messages: Some(3),
+                uid_next: Some(9),
+                mailbox_id: Some("F2212ea87-6097".into()),
+                ..ImapStatusData::default()
+            })
+        );
+    }
+
+    #[test]
+    fn search_and_sort_numbers() {
+        assert_eq!(event("* SEARCH 2 84 882\r\n"), E::SearchNumbers(vec![2, 84, 882]));
+        assert_eq!(event("* SEARCH\r\n"), E::SearchNumbers(vec![]));
+        assert_eq!(event("* SORT 5 3 4\r\n"), E::SortNumbers(vec![5, 3, 4]));
+        assert_eq!(event("* SORT\r\n"), E::SortNumbers(vec![]));
+        // The CONDSTORE trailer is read and not kept.
+        assert_eq!(event("* SEARCH 2 84 (MODSEQ 917162500)\r\n"), E::SearchNumbers(vec![2, 84]));
+        assert_eq!(event("* SEARCH (MODSEQ 917162500)\r\n"), E::SearchNumbers(vec![]));
+        assert_eq!(event("* SORT 1 (MODSEQ \"x (y\" ({1}\r\n)))\r\n"), E::SortNumbers(vec![1]));
+        // Not numbers: refused, not fatal. (ESEARCH, RFC 4731, is another response.)
+        assert_eq!(event("* SEARCH 1 x\r\n"), E::Other);
+        assert_eq!(event("* SEARCH 1 \"2\"\r\n"), E::Other);
+        assert_eq!(event("* SEARCH 1 (MODSEQ 5\r\n"), E::Other);
+        assert_eq!(event("* ESEARCH (TAG \"A1\") UID ALL 1:5\r\n"), E::Other);
     }
 
     #[test]
