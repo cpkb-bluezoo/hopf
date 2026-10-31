@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hopf_core::{Endpoint, ProtocolHandler, SecurityInfo, TimerHandle};
+use hopf_core::{Endpoint, LoopBuf, ProtocolHandler, SecurityInfo, TimerHandle};
 
 use super::hpack::{Decoder, Encoder};
 use super::response::{ArcH2ResponseControl, H2ResponseControl, H2SessionWriter};
@@ -514,8 +514,11 @@ pub struct H2Endpoint {
     limits: HttpLimits,
 
     state: ConnState,
-    /// Push frame parser (owns the inbound byte buffer).
+    /// Push frame parser (reads the connection's inbound ring).
     parser: H2Parser,
+    /// The DATA frame being received was answered with a stream error
+    /// already, so its remaining pieces are not answered again.
+    data_rejected: bool,
     out: Vec<u8>,
 
     decoder: Decoder,
@@ -746,6 +749,7 @@ impl H2Endpoint {
             limits,
             state: ConnState::ExpectPreface,
             parser: H2Parser::with_max_frame_size(DEFAULT_MAX_FRAME_SIZE),
+            data_rejected: false,
             out: Vec::new(),
             decoder: Decoder::new(4096),
             encoder: Encoder::new(4096),
@@ -1725,7 +1729,10 @@ impl H2Endpoint {
         if self.stream_state(stream_id) == StreamState::Closed {
             // RFC 9113 §6.1: DATA on a stream that isn't open or
             // half-closed(local) gets a stream error, not silence.
-            frame::write_rst_stream(&mut self.out, stream_id, ERROR_STREAM_CLOSED);
+            if !self.data_rejected {
+                self.data_rejected = true;
+                frame::write_rst_stream(&mut self.out, stream_id, ERROR_STREAM_CLOSED);
+            }
             return;
         }
 
@@ -1812,7 +1819,10 @@ impl H2Endpoint {
         if self.stream_state(stream_id) == StreamState::Closed {
             // RFC 9113 §6.1: DATA on a stream that isn't open or
             // half-closed(local) gets a stream error, not silence.
-            frame::write_rst_stream(&mut self.out, stream_id, ERROR_STREAM_CLOSED);
+            if !self.data_rejected {
+                self.data_rejected = true;
+                frame::write_rst_stream(&mut self.out, stream_id, ERROR_STREAM_CLOSED);
+            }
             return;
         }
 
@@ -2389,6 +2399,10 @@ fn stream_needs_flush(stream: &H2ServerStream) -> bool {
 // ---------------------------------------------------------------------------
 
 impl H2FrameHandler for H2Endpoint {
+    fn data_start(&mut self, _stream_id: u32, _flags: u8, _length: u32) {
+        self.data_rejected = false;
+    }
+
     fn data_frame(&mut self, stream_id: u32, flags: u8, payload: &[u8]) {
         self.on_data(stream_id, flags, payload);
     }
@@ -2494,36 +2508,34 @@ impl ProtocolHandler for H2Endpoint {
         }
     }
 
-    fn receive_slice(&mut self, endpoint: &mut dyn Endpoint, data: &mut &[u8]) {
+    fn receive(&mut self, endpoint: &mut dyn Endpoint, buf: &mut LoopBuf) {
         self.bind_server_stream_controls(endpoint);
-        // Take the parser so frame callbacks can borrow `self` without overlapping
-        // the parser buffer.
-        let mut parser = std::mem::take(&mut self.parser);
-        let mut buf = parser.take_buf();
-        buf.extend_from_slice(data);
-        *data = &[];
 
         if self.state == ConnState::ExpectPreface {
             if buf.len() < CLIENT_PREFACE.len() {
-                parser.set_buf(buf);
-                self.parser = parser;
                 return;
             }
-            if &buf[..CLIENT_PREFACE.len()] != CLIENT_PREFACE {
+            let mut preface = [0u8; CLIENT_PREFACE.len()];
+            super::parser::copy_front(buf, &mut preface);
+            if &preface[..] != CLIENT_PREFACE {
                 frame::write_goaway(&mut self.out, 0, ERROR_PROTOCOL_ERROR);
                 endpoint.send(&self.out);
                 self.out.clear();
                 endpoint.close();
-                self.parser = parser;
+                buf.advance(buf.len());
                 return;
             }
-            buf.drain(..CLIENT_PREFACE.len());
+            buf.advance(CLIENT_PREFACE.len());
             self.state = ConnState::ExpectSettings;
         }
 
-        parser.set_buf(buf);
+        // Take the parser so frame callbacks can borrow `self` without
+        // overlapping it.
+        let mut parser = std::mem::take(&mut self.parser);
         if self.state != ConnState::GoAway {
-            parser.drain(self);
+            parser.receive(buf, self);
+        } else {
+            buf.advance(buf.len());
         }
         self.parser = parser;
 
