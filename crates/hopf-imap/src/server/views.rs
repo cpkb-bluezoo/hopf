@@ -456,7 +456,7 @@ pub(crate) struct MgmtView<'a> {
     pub pending_open: &'a Arc<Mutex<Option<PendingOpen>>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MgmtOp {
     Create,
     Delete,

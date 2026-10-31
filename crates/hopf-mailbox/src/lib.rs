@@ -24,7 +24,7 @@ pub use error::{MailboxError, MailboxResult};
 pub use flag::Flag;
 pub use maildir::{MaildirFactory, MaildirMailbox, MaildirStore};
 pub use mbox::{MboxFactory, MboxFlagsFile, MboxMailbox, MboxStore};
-pub use message_set::{MessageRange, MessageSet};
+pub use message_set::{MessageRange, MessageSet, WILDCARD};
 pub use name_codec::MailboxNameCodec;
 pub use search::{
     body_contains_streaming, MessageContext, SearchCriteria, StreamingSubstringMatcher,

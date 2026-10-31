@@ -119,6 +119,12 @@ impl MessageSet {
         Ok(Self { ranges })
     }
 
+    /// A set of these ranges, in the order given. `None` if there are none:
+    /// a set is never empty when it comes from the wire.
+    pub fn from_ranges(ranges: Vec<MessageRange>) -> Option<Self> {
+        (!ranges.is_empty()).then_some(Self { ranges })
+    }
+
     /// Ranges in this set.
     pub fn ranges(&self) -> &[MessageRange] {
         &self.ranges

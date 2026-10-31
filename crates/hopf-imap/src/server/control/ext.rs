@@ -2,6 +2,7 @@
 
 //! Extension command handlers (IDLE, ENABLE, NAMESPACE, STATUS, QUOTA, MOVE, …).
 
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -10,8 +11,7 @@ use hopf_mailbox::{MailboxAttribute, MessageSet};
 
 use super::ImapControlHandler;
 use crate::compress::ImapCompressLayer;
-use crate::enable::parse_enable_args;
-use crate::server::codec::{parse_astring, parse_sequence_set, ImapCommand};
+use crate::server::codec::{parse_astring, ImapCommand};
 use crate::server::idle::{
     idle_diff_lines, IdleMailboxSnapshot, IdleMsgSnap, IDLE_POLL_INTERVAL,
 };
@@ -23,7 +23,7 @@ use crate::server::reply::{
     continuation, format_list_attrs, quote_astring, tagged_bad, tagged_no, tagged_ok, untagged,
 };
 use crate::server::session::ImapSessionState;
-use crate::server::status_items::parse_status_command;
+use crate::server::status_items::StatusItem;
 use crate::server::views::{
     begin_busy, end_busy, format_status_line, ExpungeView, GetMetadataView, MoveView,
     SetMetadataView, StatusView,
@@ -88,15 +88,14 @@ impl ImapControlHandler {
         self.send(endpoint, tagged_ok(&cmd.tag, "ID completed"));
     }
 
-    pub(super) fn cmd_enable(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    pub(super) fn cmd_enable(&mut self, endpoint: &mut dyn Endpoint, tag: String, tokens: Vec<String>) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
         if !self.config.enable_enable {
-            self.send(endpoint, tagged_bad(&cmd.tag, "ENABLE not available"));
+            self.send(endpoint, tagged_bad(&tag, "ENABLE not available"));
             return;
         }
-        let tokens = parse_enable_args(&cmd.args);
         let refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
         let newly = self.enabled.enable(
             &refs,
@@ -107,36 +106,36 @@ impl ImapControlHandler {
         if !newly.is_empty() {
             self.send(endpoint, untagged(&format!("ENABLED {}", newly.join(" "))));
         }
-        self.send(endpoint, tagged_ok(&cmd.tag, "ENABLE completed"));
+        self.send(endpoint, tagged_ok(&tag, "ENABLE completed"));
     }
 
     /// RFC 4978 COMPRESS DEFLATE. The `OK` response is sent uncompressed —
     /// the layer only activates for bytes exchanged after it, matching "the
     /// client MUST NOT send further data until it sees the result" (and
     /// mirroring the same fresh-frame boundary at the far end).
-    pub(super) fn cmd_compress(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    pub(super) fn cmd_compress(&mut self, endpoint: &mut dyn Endpoint, tag: String, mechanism: String) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
         if !self.config.enable_compress {
-            self.send(endpoint, tagged_bad(&cmd.tag, "COMPRESS not available"));
+            self.send(endpoint, tagged_bad(&tag, "COMPRESS not available"));
             return;
         }
         if self.compress_active {
             self.send(
                 endpoint,
-                tagged_no(&cmd.tag, "COMPRESS DEFLATE already active"),
+                tagged_no(&tag, "COMPRESS DEFLATE already active"),
             );
             return;
         }
-        if !cmd.args.trim().eq_ignore_ascii_case("DEFLATE") {
+        if !mechanism.eq_ignore_ascii_case("DEFLATE") {
             self.send(
                 endpoint,
-                tagged_bad(&cmd.tag, "Unsupported compression mechanism"),
+                tagged_bad(&tag, "Unsupported compression mechanism"),
             );
             return;
         }
-        self.send(endpoint, tagged_ok(&cmd.tag, "DEFLATE active"));
+        self.send(endpoint, tagged_ok(&tag, "DEFLATE active"));
         self.record_compress();
         self.compress = Some(ImapCompressLayer::new());
         self.compress_active = true;
@@ -416,21 +415,14 @@ impl ImapControlHandler {
         schedule(endpoint, handle, bundle, runtime, notify, idle_shared);
     }
 
-    pub(super) fn cmd_status(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    pub(super) fn cmd_status(&mut self, endpoint: &mut dyn Endpoint, tag: String, name: String, items: BTreeSet<StatusItem>) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
-        let (name, items) = match parse_status_command(&cmd.args) {
-            Ok(v) => v,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e));
-                return;
-            }
-        };
         if let Some(mut h) = self.selected.take() {
             let mut view = StatusView {
                 endpoint,
-                tag: &cmd.tag,
+                tag: &tag,
                 name: name.clone(),
                 items: items.clone(),
                 authenticated: &mut self.authenticated,
@@ -451,7 +443,7 @@ impl ImapControlHandler {
         if let Some(mut h) = self.authenticated.take() {
             let mut view = StatusView {
                 endpoint,
-                tag: &cmd.tag,
+                tag: &tag,
                 name: name.clone(),
                 items: items.clone(),
                 authenticated: &mut self.authenticated,
@@ -703,33 +695,28 @@ impl ImapControlHandler {
         );
     }
 
-    pub(super) fn cmd_getquota(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    pub(super) fn cmd_getquota(&mut self, endpoint: &mut dyn Endpoint, tag: String, root: String) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
         if !self.config.enable_quota {
-            self.send(endpoint, tagged_bad(&cmd.tag, "QUOTA not available"));
+            self.send(endpoint, tagged_bad(&tag, "QUOTA not available"));
             return;
         }
-        let root = cmd.args.trim().trim_matches('"').to_string();
         let username = self.username.clone().unwrap_or_default();
         let q = self.config.quota_manager.get_quota(&username);
         self.send(endpoint, untagged(&q.format_response(&root)));
-        self.send(endpoint, tagged_ok(&cmd.tag, "GETQUOTA completed"));
+        self.send(endpoint, tagged_ok(&tag, "GETQUOTA completed"));
     }
 
-    pub(super) fn cmd_getquotaroot(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    pub(super) fn cmd_getquotaroot(&mut self, endpoint: &mut dyn Endpoint, tag: String, mailbox: String) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
         if !self.config.enable_quota {
-            self.send(endpoint, tagged_bad(&cmd.tag, "QUOTA not available"));
+            self.send(endpoint, tagged_bad(&tag, "QUOTA not available"));
             return;
         }
-        let Ok((mailbox, _)) = parse_astring(cmd.args.trim()) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid mailbox"));
-            return;
-        };
         let username = self.username.clone().unwrap_or_default();
         let root = "";
         self.send(
@@ -742,7 +729,7 @@ impl ImapControlHandler {
         );
         let q = self.config.quota_manager.get_quota(&username);
         self.send(endpoint, untagged(&q.format_response(root)));
-        self.send(endpoint, tagged_ok(&cmd.tag, "GETQUOTAROOT completed"));
+        self.send(endpoint, tagged_ok(&tag, "GETQUOTAROOT completed"));
     }
 
     pub(super) fn cmd_setquota(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
@@ -774,28 +761,20 @@ impl ImapControlHandler {
         }
     }
 
-    pub(super) fn cmd_move(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, by_uid: bool) {
-        if !self.require_selected(endpoint, &cmd.tag) {
+    pub(super) fn cmd_move(&mut self, endpoint: &mut dyn Endpoint, tag: String, set: MessageSet, dest: String, by_uid: bool) {
+        if !self.require_selected(endpoint, &tag) {
             return;
         }
         if !self.config.enable_move {
-            self.send(endpoint, tagged_bad(&cmd.tag, "MOVE not available"));
+            self.send(endpoint, tagged_bad(&tag, "MOVE not available"));
             return;
         }
-        let Ok((set, rest)) = parse_sequence_set(&cmd.args) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid sequence set"));
-            return;
-        };
-        let Ok((dest, _)) = parse_astring(rest) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid destination"));
-            return;
-        };
         let Some(mut h) = self.selected.take() else {
             return;
         };
         let mut view = MoveView {
             endpoint,
-            tag: &cmd.tag,
+            tag: &tag,
             set: set.clone(),
             dest: dest.clone(),
             by_uid,

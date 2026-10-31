@@ -23,6 +23,7 @@
 
 use hopf_mailbox::{Flag, MessageSet};
 
+use crate::server::grammar::{grammar_for, Grammar, Reject, Request};
 use crate::server::handler::StoreAction;
 
 /// Default max command-line length (octets), matching common IMAP practice.
@@ -61,13 +62,22 @@ pub struct ImapCommand {
     pub tokens: Vec<ArgToken>,
     /// The same arguments rendered as text: see [`render_args`].
     pub args: String,
+    /// The command with its arguments read, for a verb whose grammar the
+    /// lexer already runs (see `server::grammar`); then `tokens` and `args`
+    /// are empty.
+    pub request: Option<Request>,
 }
 
 impl ImapCommand {
     /// A command from its tokens.
     pub fn new(tag: impl Into<String>, verb: impl Into<String>, tokens: Vec<ArgToken>) -> Self {
         let args = render_args(&tokens);
-        Self { tag: tag.into(), verb: verb.into(), tokens, args }
+        Self { tag: tag.into(), verb: verb.into(), tokens, args, request: None }
+    }
+
+    /// A command whose arguments the lexer has read.
+    pub fn typed(tag: impl Into<String>, verb: impl Into<String>, request: Request) -> Self {
+        Self { tag: tag.into(), verb: verb.into(), tokens: Vec::new(), args: String::new(), request: Some(request) }
     }
 
     /// The command that the first argument of this one names, with the rest
@@ -167,6 +177,11 @@ enum LiteralPhase {
     Append {
         remaining: u64,
     },
+    /// A literal the grammar refused, which the client sends anyway (a
+    /// non-synchronizing one): its octets are skipped.
+    Skip {
+        remaining: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,8 +230,14 @@ pub struct ImapServerLexer {
     tag: Vec<u8>,
     /// The verb, once read.
     verb: Option<String>,
-    /// The arguments so far.
+    /// The arguments so far, for a verb with no grammar yet.
     tokens: Vec<ArgToken>,
+    /// The machine reading the arguments of this verb, if it has one.
+    grammar: Option<Box<dyn Grammar>>,
+    /// The verb is `UID`: the next token names the command it is for.
+    uid_pending: bool,
+    /// The line's CRLF has been read, so a refusal has nothing left to skip.
+    line_ended: bool,
     /// The atom or quoted string being read.
     word: Vec<u8>,
     /// Unclosed `[` in the atom being read: inside brackets, white space and
@@ -248,6 +269,9 @@ impl ImapServerLexer {
             tag: Vec::new(),
             verb: None,
             tokens: Vec::new(),
+            grammar: None,
+            uid_pending: false,
+            line_ended: false,
             word: Vec::new(),
             brackets: 0,
             literal_size: 0,
@@ -299,6 +323,7 @@ impl ImapServerLexer {
         let remaining = match self.literal {
             LiteralPhase::General { remaining } => remaining,
             LiteralPhase::Append { remaining } => remaining,
+            LiteralPhase::Skip { remaining } => remaining,
             LiteralPhase::None => unreachable!("feed_literal only called in State::Literal"),
         };
         let take = (remaining as usize).min(data.len());
@@ -310,9 +335,17 @@ impl ImapServerLexer {
                 *remaining -= take as u64;
                 if *remaining == 0 {
                     let octets = std::mem::take(&mut self.literal_buf);
-                    self.tokens.push(ArgToken::Literal(octets));
                     self.literal = LiteralPhase::None;
+                    // (The line goes on after a literal.)
                     self.state = State::Between;
+                    self.push_token(ArgToken::Literal(octets));
+                }
+            }
+            LiteralPhase::Skip { remaining } => {
+                *remaining -= take as u64;
+                if *remaining == 0 {
+                    self.literal = LiteralPhase::None;
+                    self.state = State::Tag;
                 }
             }
             LiteralPhase::Append { remaining } => {
@@ -439,16 +472,19 @@ impl ImapServerLexer {
                     }
                     match b {
                         b' ' => {
-                            self.end_atom();
                             self.state = State::Between;
+                            self.end_atom();
                         }
                         b'\r' => {
                             self.cr_from = State::Atom;
                             self.state = State::Cr;
                         }
                         b'(' | b')' | b'"' => {
-                            self.end_atom();
                             self.state = State::Between;
+                            self.end_atom();
+                            if self.state != State::Between {
+                                return; // refused: the rest of the line is skipped
+                            }
                             continue;
                         }
                         _ => self.atom_byte(b),
@@ -460,8 +496,8 @@ impl ImapServerLexer {
                         b'"' => {
                             let text = String::from_utf8_lossy(&self.word).into_owned();
                             self.word.clear();
-                            self.push_token(ArgToken::Quoted(text));
                             self.state = State::Between;
+                            self.push_token(ArgToken::Quoted(text));
                         }
                         b'\\' => self.state = State::QuotedEscape,
                         b'\r' => self.state = State::QuotedCr,
@@ -568,16 +604,48 @@ impl ImapServerLexer {
         self.push_token(ArgToken::Atom(text));
     }
 
-    /// The next token of the command: the first, if it is a word, is the verb.
+    /// The next token of the command: the first, if it is a word, is the
+    /// verb; after that each goes to the verb's grammar, which may refuse it.
     fn push_token(&mut self, token: ArgToken) {
         if self.verb.is_none() {
             match token {
-                ArgToken::Atom(word) => self.verb = Some(word.to_ascii_uppercase()),
+                ArgToken::Atom(word) => {
+                    let verb = word.to_ascii_uppercase();
+                    self.grammar = grammar_for(&verb, false);
+                    self.uid_pending = verb == "UID";
+                    self.verb = Some(verb);
+                }
                 _ => self.fail("Missing command"),
             }
             return;
         }
+        if self.uid_pending {
+            // `UID` names the command that follows it.
+            self.uid_pending = false;
+            if let ArgToken::Atom(sub) = &token {
+                if let Some(grammar) = grammar_for(&sub.to_ascii_uppercase(), true) {
+                    self.grammar = Some(grammar);
+                    return;
+                }
+            }
+            self.tokens.push(token);
+            return;
+        }
+        if let Some(grammar) = self.grammar.as_mut() {
+            if let Err(reject) = grammar.token(token.as_tok()) {
+                self.refuse(reject);
+            }
+            return;
+        }
         self.tokens.push(token);
+    }
+
+    /// A grammar refused the command: reply, and skip what is left of the
+    /// line (nothing, if it has been read).
+    fn refuse(&mut self, reject: Reject) {
+        self.emit_error(&reject.0);
+        self.reset_command();
+        self.state = if self.line_ended { State::Tag } else { State::Resync };
     }
 
     /// `{n}` and the line it ends have been read: take the octets.
@@ -586,6 +654,22 @@ impl ImapServerLexer {
         let non_sync = self.literal_plus;
         if self.verb.is_none() {
             return self.fail("Missing command");
+        }
+        // May a literal stand here, and of this size? Asked before the client
+        // is told to send it.
+        if let Some(grammar) = self.grammar.as_mut() {
+            if let Err(reject) = grammar.literal(n) {
+                self.emit_error(&reject.0);
+                self.reset_command();
+                if non_sync && n > 0 {
+                    // It will be sent anyway: its octets are skipped.
+                    self.literal = LiteralPhase::Skip { remaining: n };
+                    self.state = State::Literal;
+                } else {
+                    self.state = State::Tag;
+                }
+                return;
+            }
         }
         // The body of an APPEND is its message: an argument after the mailbox.
         let append_body = self.verb.as_deref() == Some("APPEND") && !self.tokens.is_empty();
@@ -655,6 +739,8 @@ impl ImapServerLexer {
         self.tag.clear();
         self.verb = None;
         self.tokens.clear();
+        self.grammar = None;
+        self.uid_pending = false;
         self.word.clear();
         self.brackets = 0;
         self.typed_bytes = 0;
@@ -665,6 +751,12 @@ impl ImapServerLexer {
 
     /// CRLF confirmed: the line ends here.
     fn on_crlf(&mut self) {
+        self.line_ended = true;
+        self.on_crlf_inner();
+        self.line_ended = false;
+    }
+
+    fn on_crlf_inner(&mut self) {
         match self.cr_from {
             // A line that is only a tag: IDLE's "DONE", sent without a tag.
             State::Tag => {
@@ -692,9 +784,21 @@ impl ImapServerLexer {
         let tag = std::mem::take(&mut self.tag);
         let verb = self.verb.take();
         let tokens = std::mem::take(&mut self.tokens);
+        let grammar = self.grammar.take();
+        self.uid_pending = false;
         self.typed_bytes = 0;
         self.literal_total = 0;
         if tag.is_empty() {
+            return;
+        }
+        if let Some(grammar) = grammar {
+            let tag = String::from_utf8_lossy(&tag).into_owned();
+            match grammar.finish() {
+                Ok(request) => {
+                    self.ready.push(LexEvent::Command(ImapCommand::typed(tag, verb.unwrap_or_default(), request)));
+                }
+                Err(reject) => self.ready.push(LexEvent::Error { tag, message: reject.0.into_owned() }),
+            }
             return;
         }
         self.ready.push(LexEvent::Command(ImapCommand::new(
@@ -783,12 +887,26 @@ pub fn parse_flag_list(s: &str) -> Result<(BTreeSetFlags, &str), String> {
 }
 
 /// Parsed system flags + keywords.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BTreeSetFlags {
     /// System flags.
     pub flags: std::collections::BTreeSet<Flag>,
     /// User keywords.
     pub keywords: std::collections::BTreeSet<String>,
+}
+
+impl BTreeSetFlags {
+    /// Adds a flag or keyword by name (`\Seen`, `$label`); `\Recent` is the
+    /// server's to set, and is ignored.
+    pub fn add(&mut self, name: &str) {
+        if let Some(f) = Flag::parse(name) {
+            if f != Flag::Recent {
+                self.flags.insert(f);
+            }
+        } else {
+            self.keywords.insert(name.trim_start_matches('\\').to_string());
+        }
+    }
 }
 
 /// Parse STORE data item name into action + silent.
@@ -852,7 +970,7 @@ mod tests {
         match &ev[0] {
             LexEvent::Command(c) => {
                 assert_eq!(c.verb, "LOGIN");
-                assert_eq!(c.args, "alice secret");
+                assert_eq!(c.request, Some(login("alice", "secret")));
             }
             _ => panic!(),
         }
@@ -873,7 +991,7 @@ mod tests {
             .collect();
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].verb, "LOGIN");
-        assert_eq!(cmds[0].args, "alice secret");
+        assert_eq!(cmds[0].request, Some(login("alice", "secret")));
         let mut data2: &[u8] = b"a2 CAPABILITY\r\n";
         let ev2 = lex.feed(&mut data2);
         assert!(matches!(ev2[0], LexEvent::Command(_)));
@@ -899,7 +1017,7 @@ mod tests {
             .collect();
         assert!(!cmds.is_empty());
         assert_eq!(cmds[0].verb, "LOGIN");
-        assert_eq!(cmds[0].args, "alice secret");
+        assert_eq!(cmds[0].request, Some(login("alice", "secret")));
     }
 
     #[test]
@@ -924,7 +1042,7 @@ mod tests {
             .collect();
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].verb, "LOGIN");
-        assert_eq!(cmds[0].args, "alice secret");
+        assert_eq!(cmds[0].request, Some(login("alice", "secret")));
     }
 
     #[test]
@@ -1172,11 +1290,11 @@ mod tests {
     #[test]
     fn literal_cr_not_followed_by_lf_is_content() {
         let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
-        let mut data: &[u8] = b"a1 LOGIN a\rb\r\n";
+        let mut data: &[u8] = b"a1 SEARCH a\rb\r\n";
         let ev = lex.feed(&mut data);
         match &ev[0] {
             LexEvent::Command(c) => {
-                assert_eq!(c.verb, "LOGIN");
+                assert_eq!(c.verb, "SEARCH");
                 assert_eq!(c.args, "a\rb");
             }
             _ => panic!(),
@@ -1291,6 +1409,10 @@ mod tests {
 
     // ── tokens ──────────────────────────────────────────────────────────
 
+    fn login(user: &str, pass: &str) -> Request {
+        Request::Login { user: user.into(), pass: pass.into() }
+    }
+
     fn a(text: &str) -> ArgToken {
         ArgToken::Atom(text.into())
     }
@@ -1333,8 +1455,8 @@ mod tests {
     fn arguments_are_typed_tokens() {
         let wire = b"t1 FETCH 1:* (FLAGS BODY.PEEK[HEADER.FIELDS (From \"To\")]<0.100>)\r\n\
                      t2 LIST \"\" \"INBOX/%\"\r\n\
-                     t3 STORE 1,3:5 +FLAGS.SILENT (\\Seen \\Deleted)\r\n\
-                     t4 SELECT \"My \\\"box\\\" \\\\ x\"\r\n";
+                     t3 SEARCH 1,3:5 KEYWORD (\\Seen \\Deleted)\r\n\
+                     t4 METADATA \"My \\\"box\\\" \\\\ x\"\r\n";
         let want = vec![
             cmd(
                 "t1",
@@ -1350,10 +1472,10 @@ mod tests {
             cmd("t2", "LIST", vec![q(""), q("INBOX/%")]),
             cmd(
                 "t3",
-                "STORE",
-                vec![a("1,3:5"), a("+FLAGS.SILENT"), ArgToken::Open, a("\\Seen"), a("\\Deleted"), ArgToken::Close],
+                "SEARCH",
+                vec![a("1,3:5"), a("KEYWORD"), ArgToken::Open, a("\\Seen"), a("\\Deleted"), ArgToken::Close],
             ),
-            cmd("t4", "SELECT", vec![q("My \"box\" \\ x")]),
+            cmd("t4", "METADATA", vec![q("My \"box\" \\ x")]),
         ];
         for chunk in [1, 2, 3, 5, 13, 1000] {
             assert_eq!(commands(lex(wire, chunk)), want, "chunk={chunk}");
@@ -1365,13 +1487,13 @@ mod tests {
     /// first of these would have been a user, a password and a stray word.)
     #[test]
     fn a_literal_is_one_token_whatever_it_contains() {
-        let wire = b"a1 LOGIN {7}\r\nal ice\" secret\r\n\
-                     a2 SELECT {4}\r\n(x)\" \r\n\
-                     a3 RENAME {3+}\r\na b {2+}\r\ncd\r\n";
+        let wire = b"a1 SEARCH TEXT {7}\r\nal ice\" secret\r\n\
+                     a2 METADATA {4}\r\n(x)\" \r\n\
+                     a3 SETQUOTA {3+}\r\na b {2+}\r\ncd\r\n";
         let want = vec![
-            cmd("a1", "LOGIN", vec![lit(b"al ice\""), a("secret")]),
-            cmd("a2", "SELECT", vec![lit(b"(x)\"")]),
-            cmd("a3", "RENAME", vec![lit(b"a b"), lit(b"cd")]),
+            cmd("a1", "SEARCH", vec![a("TEXT"), lit(b"al ice\""), a("secret")]),
+            cmd("a2", "METADATA", vec![lit(b"(x)\"")]),
+            cmd("a3", "SETQUOTA", vec![lit(b"a b"), lit(b"cd")]),
         ];
         for chunk in [1, 2, 3, 7, 1000] {
             let events = lex(wire, chunk);
@@ -1471,8 +1593,8 @@ mod tests {
 
     #[test]
     fn a_zero_length_literal_is_an_empty_token() {
-        let events = lex(b"a1 CREATE {0+}\r\n\r\n", 3);
-        assert_eq!(commands(events), vec![cmd("a1", "CREATE", vec![lit(b"")])]);
+        let events = lex(b"a1 SETQUOTA {0+}\r\n\r\n", 3);
+        assert_eq!(commands(events), vec![cmd("a1", "SETQUOTA", vec![lit(b"")])]);
     }
 
     #[test]

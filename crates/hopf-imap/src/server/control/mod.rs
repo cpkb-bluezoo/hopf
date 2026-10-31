@@ -22,8 +22,11 @@ use rmimeparser::charset::base64;
 use crate::compress::{CompressingEndpoint, ImapCompressLayer};
 use crate::enable::EnabledExtensions;
 use crate::server::capability::build_capabilities;
+use crate::server::grammar::Request;
+use crate::server::handler::StoreAction;
+use hopf_mailbox::MessageSet;
 use crate::server::codec::{
-    parse_astring, parse_flag_list, parse_sequence_set, parse_store_item, ImapCommand,
+    parse_astring, parse_flag_list, parse_sequence_set, BTreeSetFlags, ImapCommand,
     ImapServerLexer, LexEvent, MAX_COMMAND_LINE,
 };
 use crate::server::fetch_format::parse_fetch_args;
@@ -787,6 +790,12 @@ impl ImapControlHandler {
         let tel = self.begin_command_telemetry(&verb);
         let verb = verb.as_str();
         match verb {
+            // The lexer has read this command's arguments.
+            _ if cmd.request.is_some() => {
+                if let Some(request) = cmd.request {
+                    self.dispatch_request(endpoint, cmd.tag, request);
+                }
+            }
             "CAPABILITY" => {
                 let caps = self.capabilities();
                 self.send(endpoint, untagged(&format!("CAPABILITY {caps}")));
@@ -802,39 +811,22 @@ impl ImapControlHandler {
                 endpoint.close();
             }
             "STARTTLS" => self.cmd_starttls(endpoint, &cmd.tag),
-            "LOGIN" => self.cmd_login(endpoint, cmd),
-            "AUTHENTICATE" => self.cmd_authenticate(endpoint, cmd),
             "ID" => self.cmd_id(endpoint, cmd),
-            "ENABLE" => self.cmd_enable(endpoint, cmd),
-            "COMPRESS" => self.cmd_compress(endpoint, cmd),
-            "SELECT" => self.cmd_select(endpoint, cmd, false),
-            "EXAMINE" => self.cmd_select(endpoint, cmd, true),
             "CLOSE" => self.cmd_close(endpoint, &cmd.tag, true),
             "UNSELECT" => self.cmd_close(endpoint, &cmd.tag, false),
-            "CREATE" => self.cmd_mgmt_name(endpoint, cmd, MgmtOp::Create),
-            "DELETE" => self.cmd_mgmt_name(endpoint, cmd, MgmtOp::Delete),
-            "RENAME" => self.cmd_rename(endpoint, cmd),
-            "SUBSCRIBE" => self.cmd_mgmt_name(endpoint, cmd, MgmtOp::Subscribe),
-            "UNSUBSCRIBE" => self.cmd_mgmt_name(endpoint, cmd, MgmtOp::Unsubscribe),
             "LIST" => self.cmd_list(endpoint, cmd, false),
             "LSUB" => self.cmd_list(endpoint, cmd, true),
-            "STATUS" => self.cmd_status(endpoint, cmd),
             "NAMESPACE" => self.cmd_namespace(endpoint, &cmd.tag),
             "IDLE" => self.cmd_idle(endpoint, &cmd.tag),
-            "GETQUOTA" => self.cmd_getquota(endpoint, cmd),
-            "GETQUOTAROOT" => self.cmd_getquotaroot(endpoint, cmd),
             "SETQUOTA" => self.cmd_setquota(endpoint, cmd),
             "GETMETADATA" => self.cmd_getmetadata(endpoint, cmd),
             "SETMETADATA" => self.cmd_setmetadata(endpoint, cmd),
             "NOTIFY" => self.cmd_notify(endpoint, cmd),
             "APPEND" => self.cmd_append(endpoint, cmd),
             "FETCH" => self.cmd_fetch(endpoint, cmd, false),
-            "STORE" => self.cmd_store(endpoint, cmd, false),
             "SEARCH" => self.cmd_search(endpoint, cmd, false),
             "SORT" => self.cmd_sort(endpoint, cmd, false),
             "THREAD" => self.cmd_thread(endpoint, cmd, false),
-            "COPY" => self.cmd_copy(endpoint, cmd, false),
-            "MOVE" => self.cmd_move(endpoint, cmd, false),
             "EXPUNGE" => self.cmd_expunge(endpoint, &cmd.tag, None),
             "UID" => self.cmd_uid(endpoint, cmd),
             "DONE" => self.send(endpoint, tagged_bad(&cmd.tag, "Not IDLEing")),
@@ -848,6 +840,34 @@ impl ImapControlHandler {
             self.pending_cmd_tel = tel;
         } else if let Some(tel) = tel {
             self.finish_command_telemetry(tel, "ok");
+        }
+    }
+
+    /// Runs a command whose arguments the lexer has read.
+    fn dispatch_request(&mut self, endpoint: &mut dyn Endpoint, tag: String, request: Request) {
+        match request {
+            Request::Login { user, pass } => self.cmd_login(endpoint, tag, user, pass),
+            Request::Authenticate { mechanism, initial_response } => {
+                self.cmd_authenticate(endpoint, tag, mechanism, initial_response)
+            }
+            Request::Select { mailbox, examine, condstore, qresync } => {
+                self.cmd_select(endpoint, tag, mailbox, examine, condstore, qresync)
+            }
+            Request::Create { mailbox } => self.cmd_mgmt_name(endpoint, tag, mailbox, MgmtOp::Create),
+            Request::Delete { mailbox } => self.cmd_mgmt_name(endpoint, tag, mailbox, MgmtOp::Delete),
+            Request::Subscribe { mailbox } => self.cmd_mgmt_name(endpoint, tag, mailbox, MgmtOp::Subscribe),
+            Request::Unsubscribe { mailbox } => self.cmd_mgmt_name(endpoint, tag, mailbox, MgmtOp::Unsubscribe),
+            Request::Rename { from, to } => self.cmd_rename(endpoint, tag, from, to),
+            Request::Copy { set, mailbox, by_uid } => self.cmd_copy(endpoint, tag, set, mailbox, by_uid),
+            Request::Move { set, mailbox, by_uid } => self.cmd_move(endpoint, tag, set, mailbox, by_uid),
+            Request::Enable { capabilities } => self.cmd_enable(endpoint, tag, capabilities),
+            Request::Compress { mechanism } => self.cmd_compress(endpoint, tag, mechanism),
+            Request::GetQuota { root } => self.cmd_getquota(endpoint, tag, root),
+            Request::GetQuotaRoot { mailbox } => self.cmd_getquotaroot(endpoint, tag, mailbox),
+            Request::Store { set, action, silent, flags, by_uid } => {
+                self.cmd_store(endpoint, tag, set, action, silent, flags, by_uid)
+            }
+            Request::Status { mailbox, items } => self.cmd_status(endpoint, tag, mailbox, items),
         }
     }
 
@@ -922,32 +942,24 @@ impl ImapControlHandler {
         }
     }
 
-    fn cmd_login(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
+    fn cmd_login(&mut self, endpoint: &mut dyn Endpoint, tag: String, user: String, pass: String) {
         if self.session != ImapSessionState::NotAuthenticated {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Already authenticated"));
+            self.send(endpoint, tagged_bad(&tag, "Already authenticated"));
             return;
         }
         if !self.tls && self.config.tls_acceptor.is_some() && !self.config.implicit_tls {
             self.send(
                 endpoint,
-                tagged_no(&cmd.tag, "[PRIVACYREQUIRED] LOGIN disabled on plaintext"),
+                tagged_no(&tag, "[PRIVACYREQUIRED] LOGIN disabled on plaintext"),
             );
             return;
         }
-        let Ok((user, rest)) = parse_astring(cmd.args.trim()) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid LOGIN arguments"));
-            return;
-        };
-        let Ok((pass, _)) = parse_astring(rest) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid LOGIN arguments"));
-            return;
-        };
         let Some(handle) = self.control_handle.clone() else {
-            self.send(endpoint, tagged_no(&cmd.tag, "Internal error: no handle"));
+            self.send(endpoint, tagged_no(&tag, "Internal error: no handle"));
             return;
         };
         let store = Arc::clone(&self.config.store);
-        let tag = cmd.tag.clone();
+        let tag = tag.clone();
         let user_for_check = user.clone();
         let pending = Arc::clone(&self.pending_auth_check);
         let busy = Arc::clone(&self.busy);
@@ -963,25 +975,26 @@ impl ImapControlHandler {
         );
     }
 
-    fn cmd_authenticate(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
+    fn cmd_authenticate(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        tag: String,
+        mech_name: String,
+        initial_response: Option<String>,
+    ) {
         if self.session != ImapSessionState::NotAuthenticated {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Already authenticated"));
+            self.send(endpoint, tagged_bad(&tag, "Already authenticated"));
             return;
         }
-        let mut parts = cmd.args.split_whitespace();
-        let Some(mech_name) = parts.next() else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Missing mechanism"));
-            return;
-        };
-        let Some(mech) = SaslMechanism::from_name(mech_name) else {
-            self.send(endpoint, tagged_no(&cmd.tag, "Unsupported mechanism"));
+        let Some(mech) = SaslMechanism::from_name(&mech_name) else {
+            self.send(endpoint, tagged_no(&tag, "Unsupported mechanism"));
             return;
         };
         if mech.requires_tls() && !self.tls {
             self.send(
                 endpoint,
                 tagged_no(
-                    &cmd.tag,
+                    &tag,
                     "[PRIVACYREQUIRED] Encryption required for requested authentication mechanism",
                 ),
             );
@@ -995,7 +1008,7 @@ impl ImapControlHandler {
         };
         let server = create_server(mech, Arc::clone(&self.config.store), opts);
 
-        let initial_response = match parts.next() {
+        let initial_response = match initial_response.as_deref() {
             // RFC 4959 SASL-IR: a bare "=" is an explicit *empty* initial
             // response, fed straight to the mechanism — not "no response
             // yet" (the `None` arm below, which prompts for one).
@@ -1003,7 +1016,7 @@ impl ImapControlHandler {
             Some(ir) => match base64::decode(ir) {
                 Ok(raw) => Some(raw),
                 Err(_) => {
-                    self.send(endpoint, tagged_no(&cmd.tag, "Invalid base64"));
+                    self.send(endpoint, tagged_no(&tag, "Invalid base64"));
                     return;
                 }
             },
@@ -1016,10 +1029,10 @@ impl ImapControlHandler {
             // "complete" on this very first step would mean the mechanism
             // authenticated nobody, so treat it as failure, not success
             // (see `AuthCheckOutcome::Step::first_step`).
-            self.sasl_step(endpoint, cmd.tag, server, None, true);
+            self.sasl_step(endpoint, tag, server, None, true);
             return;
         }
-        self.sasl_step(endpoint, cmd.tag, server, initial_response.as_deref(), false);
+        self.sasl_step(endpoint, tag, server, initial_response.as_deref(), false);
     }
 
     /// Run one SASL step off the reactor thread (issue #181 —
@@ -1179,55 +1192,41 @@ impl ImapControlHandler {
         }
     }
 
-    fn cmd_select(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, examine: bool) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    fn cmd_select(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        tag: String,
+        name: String,
+        examine: bool,
+        condstore_option: bool,
+        qresync_option: Option<(u64, u64)>,
+    ) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
-        let Ok((name, rest)) = parse_astring(&cmd.args) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid mailbox name"));
-            return;
-        };
-        // Optional (CONDSTORE) / (QRESYNC (...))
+        // Optional (CONDSTORE) / (QRESYNC (...)), already read by the lexer.
         self.pending_qresync = None;
         let mut select_condstore = self.enabled.condstore;
-        let rest = rest.trim_start();
-        if rest.starts_with('(') {
-            let upper = rest.to_ascii_uppercase();
-            if upper.starts_with("(CONDSTORE") {
-                if self.config.enable_condstore {
-                    select_condstore = true;
-                    self.enabled.condstore = true;
-                }
-            } else if upper.starts_with("(QRESYNC") {
-                if !self.enabled.qresync {
-                    self.send(
-                        endpoint,
-                        tagged_bad(&cmd.tag, "QRESYNC not enabled (use ENABLE)"),
-                    );
-                    return;
-                }
-                select_condstore = true;
-                // Parse (QRESYNC (uidvalidity modseq ...))
-                if let Some(inner_start) = rest
-                    .find('(')
-                    .and_then(|i| rest[i + 1..].find('(').map(|j| i + 1 + j))
-                {
-                    let inner = &rest[inner_start + 1..];
-                    let end = inner.find(')').unwrap_or(inner.len());
-                    let mut parts = inner[..end].split_whitespace();
-                    if let (Some(uv), Some(ms)) = (parts.next(), parts.next()) {
-                        if let (Ok(uv), Ok(ms)) = (uv.parse::<u64>(), ms.parse::<u64>()) {
-                            self.pending_qresync = Some((uv, ms));
-                        }
-                    }
-                }
+        if condstore_option && self.config.enable_condstore {
+            select_condstore = true;
+            self.enabled.condstore = true;
+        }
+        if let Some(resync) = qresync_option {
+            if !self.enabled.qresync {
+                self.send(
+                    endpoint,
+                    tagged_bad(&tag, "QRESYNC not enabled (use ENABLE)"),
+                );
+                return;
             }
+            select_condstore = true;
+            self.pending_qresync = Some(resync);
         }
         let qresync = self.pending_qresync;
         if let Some(mut h) = self.selected.take() {
             let mut view = SelectView {
                 endpoint,
-                tag: &cmd.tag,
+                tag: &tag,
                 name: name.clone(),
                 examine,
                 condstore: select_condstore,
@@ -1261,7 +1260,7 @@ impl ImapControlHandler {
         if let Some(mut h) = self.authenticated.take() {
             let mut view = SelectView {
                 endpoint,
-                tag: &cmd.tag,
+                tag: &tag,
                 name: name.clone(),
                 examine,
                 condstore: select_condstore,
@@ -1325,17 +1324,13 @@ impl ImapControlHandler {
         }
     }
 
-    fn cmd_mgmt_name(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, op: MgmtOp) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    fn cmd_mgmt_name(&mut self, endpoint: &mut dyn Endpoint, tag: String, name: String, op: MgmtOp) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
-        let Ok((name, _)) = parse_astring(&cmd.args) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid mailbox name"));
-            return;
-        };
         self.run_mgmt(
             endpoint,
-            &cmd.tag,
+            &tag,
             name,
             None,
             String::new(),
@@ -1344,21 +1339,13 @@ impl ImapControlHandler {
         );
     }
 
-    fn cmd_rename(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand) {
-        if !self.require_auth(endpoint, &cmd.tag) {
+    fn cmd_rename(&mut self, endpoint: &mut dyn Endpoint, tag: String, old: String, new: String) {
+        if !self.require_auth(endpoint, &tag) {
             return;
         }
-        let Ok((old, rest)) = parse_astring(&cmd.args) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid RENAME"));
-            return;
-        };
-        let Ok((new, _)) = parse_astring(rest) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid RENAME"));
-            return;
-        };
         self.run_mgmt(
             endpoint,
-            &cmd.tag,
+            &tag,
             old,
             Some(new),
             String::new(),
@@ -1666,34 +1653,25 @@ impl ImapControlHandler {
         }
     }
 
-    fn cmd_store(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, by_uid: bool) {
-        if !self.require_selected(endpoint, &cmd.tag) {
+    fn cmd_store(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        tag: String,
+        set: MessageSet,
+        action: StoreAction,
+        silent: bool,
+        flist: BTreeSetFlags,
+        by_uid: bool,
+    ) {
+        if !self.require_selected(endpoint, &tag) {
             return;
         }
-        let Ok((set, rest)) = parse_sequence_set(&cmd.args) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid sequence set"));
-            return;
-        };
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let Some(item) = parts.next() else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Missing STORE item"));
-            return;
-        };
-        let flag_part = parts.next().unwrap_or("").trim_start();
-        let Ok((action, silent)) = parse_store_item(item) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid STORE item"));
-            return;
-        };
-        let Ok((flist, _)) = parse_flag_list(flag_part) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid flag list"));
-            return;
-        };
         let Some(mut h) = self.selected.take() else {
             return;
         };
         let mut view = StoreView {
             endpoint,
-            tag: &cmd.tag,
+            tag: &tag,
             set: set.clone(),
             by_uid,
             selected: &mut self.selected,
@@ -1862,24 +1840,16 @@ impl ImapControlHandler {
         }
     }
 
-    fn cmd_copy(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, by_uid: bool) {
-        if !self.require_selected(endpoint, &cmd.tag) {
+    fn cmd_copy(&mut self, endpoint: &mut dyn Endpoint, tag: String, set: MessageSet, dest: String, by_uid: bool) {
+        if !self.require_selected(endpoint, &tag) {
             return;
         }
-        let Ok((set, rest)) = parse_sequence_set(&cmd.args) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid sequence set"));
-            return;
-        };
-        let Ok((dest, _)) = parse_astring(rest) else {
-            self.send(endpoint, tagged_bad(&cmd.tag, "Invalid destination"));
-            return;
-        };
         let Some(mut h) = self.selected.take() else {
             return;
         };
         let mut view = CopyView {
             endpoint,
-            tag: &cmd.tag,
+            tag: &tag,
             set: set.clone(),
             dest: dest.clone(),
             by_uid,
@@ -1910,12 +1880,9 @@ impl ImapControlHandler {
         };
         match sub_cmd.verb.as_str() {
             "FETCH" => self.cmd_fetch(endpoint, sub_cmd, true),
-            "STORE" => self.cmd_store(endpoint, sub_cmd, true),
             "SEARCH" => self.cmd_search(endpoint, sub_cmd, true),
             "SORT" => self.cmd_sort(endpoint, sub_cmd, true),
             "THREAD" => self.cmd_thread(endpoint, sub_cmd, true),
-            "COPY" => self.cmd_copy(endpoint, sub_cmd, true),
-            "MOVE" => self.cmd_move(endpoint, sub_cmd, true),
             "EXPUNGE" => {
                 let Ok((set, _)) = parse_sequence_set(&sub_cmd.args) else {
                     self.send(endpoint, tagged_bad(&sub_cmd.tag, "Invalid UID set"));
