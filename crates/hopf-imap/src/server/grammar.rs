@@ -20,11 +20,14 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
-use hopf_mailbox::{MessageRange, MessageSet, WILDCARD};
+use hopf_mailbox::{MessageRange, MessageSet, SearchCriteria, WILDCARD};
 
 use super::codec::{ArgToken, BTreeSetFlags};
 use super::fetch_format::{BodySection, FetchItem, FetchModifiers};
 use super::handler::StoreAction;
+use super::grammar_search::{Search, Sort, Thread};
+use super::sort::SortCriterion;
+use super::thread::ThreadAlgorithm;
 use super::list_ext::{ListCommand, ListReturnOptions, ListSelectOption};
 use super::status_items::StatusItem;
 
@@ -37,7 +40,7 @@ pub const MAX_NAME_LITERAL: u64 = 64 * 1024;
 pub struct Reject(pub Cow<'static, str>);
 
 impl Reject {
-    fn new(message: &'static str) -> Self {
+    pub(super) fn new(message: &'static str) -> Self {
         Self(Cow::Borrowed(message))
     }
 }
@@ -112,6 +115,12 @@ pub enum Request {
     /// `APPEND mailbox [(flags)] [date-time] {size}` - the message itself is
     /// not part of the request: it is streamed as its octets arrive.
     Append { mailbox: String, flags: BTreeSetFlags },
+    /// `[UID] SEARCH criteria`
+    Search { criteria: SearchCriteria, by_uid: bool },
+    /// `[UID] SORT (keys) charset criteria`
+    Sort { keys: Vec<SortCriterion>, criteria: SearchCriteria, by_uid: bool },
+    /// `[UID] THREAD algorithm charset criteria`
+    Thread { algorithm: ThreadAlgorithm, criteria: SearchCriteria, by_uid: bool },
 }
 
 /// The machine for one command's arguments.
@@ -147,6 +156,9 @@ pub fn grammar_for(verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
             "COPY" => pattern(COPY, "Invalid destination", build_copy),
             "MOVE" => pattern(COPY, "Invalid destination", build_move),
             "FETCH" => Some(Box::new(Fetch::new(true))),
+            "SEARCH" => Some(Box::new(Search::new(true))),
+            "SORT" => Some(Box::new(Sort::new(true))),
+            "THREAD" => Some(Box::new(Thread::new(true))),
             _ => None,
         };
     }
@@ -172,6 +184,9 @@ pub fn grammar_for(verb: &str, by_uid: bool) -> Option<Box<dyn Grammar>> {
         "LIST" => Some(Box::new(List::new(false))),
         "LSUB" => Some(Box::new(List::new(true))),
         "APPEND" => Some(Box::new(Append::default())),
+        "SEARCH" => Some(Box::new(Search::new(false))),
+        "SORT" => Some(Box::new(Sort::new(false))),
+        "THREAD" => Some(Box::new(Thread::new(false))),
         _ => None,
     }
 }
@@ -339,7 +354,7 @@ impl Pattern {
 
 /// A character an atom that is to be an astring may be made of
 /// (RFC 3501 §9: ATOM-CHAR and `]`; 8-bit characters are UTF8=ACCEPT's).
-fn is_astring_char(b: u8) -> bool {
+pub(super) fn is_astring_char(b: u8) -> bool {
     b >= 0x80 || (b.is_ascii_graphic() && !b"(){\"\\%*".contains(&b))
 }
 

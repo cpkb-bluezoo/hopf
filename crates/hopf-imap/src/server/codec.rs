@@ -1341,11 +1341,11 @@ mod tests {
     #[test]
     fn literal_cr_not_followed_by_lf_is_content() {
         let mut lex = ImapServerLexer::new(MAX_COMMAND_LINE);
-        let mut data: &[u8] = b"a1 SEARCH a\rb\r\n";
+        let mut data: &[u8] = b"a1 XSEARCH a\rb\r\n";
         let ev = lex.feed(&mut data);
         match &ev[0] {
             LexEvent::Command(c) => {
-                assert_eq!(c.verb, "SEARCH");
+                assert_eq!(c.verb, "XSEARCH");
                 assert_eq!(c.args, "a\rb");
             }
             _ => panic!(),
@@ -1506,7 +1506,7 @@ mod tests {
     fn arguments_are_typed_tokens() {
         let wire = b"t1 XFETCH 1:* (FLAGS BODY.PEEK[HEADER.FIELDS (From \"To\")]<0.100>)\r\n\
                      t2 XLIST \"\" \"INBOX/%\"\r\n\
-                     t3 SEARCH 1,3:5 KEYWORD (\\Seen \\Deleted)\r\n\
+                     t3 XSEARCH 1,3:5 KEYWORD (\\Seen \\Deleted)\r\n\
                      t4 METADATA \"My \\\"box\\\" \\\\ x\"\r\n";
         let want = vec![
             cmd(
@@ -1523,7 +1523,7 @@ mod tests {
             cmd("t2", "XLIST", vec![q(""), q("INBOX/%")]),
             cmd(
                 "t3",
-                "SEARCH",
+                "XSEARCH",
                 vec![a("1,3:5"), a("KEYWORD"), ArgToken::Open, a("\\Seen"), a("\\Deleted"), ArgToken::Close],
             ),
             cmd("t4", "METADATA", vec![q("My \"box\" \\ x")]),
@@ -1538,11 +1538,11 @@ mod tests {
     /// first of these would have been a user, a password and a stray word.)
     #[test]
     fn a_literal_is_one_token_whatever_it_contains() {
-        let wire = b"a1 SEARCH TEXT {7}\r\nal ice\" secret\r\n\
+        let wire = b"a1 XSEARCH TEXT {7}\r\nal ice\" secret\r\n\
                      a2 METADATA {4}\r\n(x)\" \r\n\
                      a3 SETQUOTA {3+}\r\na b {2+}\r\ncd\r\n";
         let want = vec![
-            cmd("a1", "SEARCH", vec![a("TEXT"), lit(b"al ice\""), a("secret")]),
+            cmd("a1", "XSEARCH", vec![a("TEXT"), lit(b"al ice\""), a("secret")]),
             cmd("a2", "METADATA", vec![lit(b"(x)\"")]),
             cmd("a3", "SETQUOTA", vec![lit(b"a b"), lit(b"cd")]),
         ];
@@ -1615,7 +1615,7 @@ mod tests {
         let mut lexer = ImapServerLexer::new(MAX_COMMAND_LINE);
         let one = MAX_LITERAL_SIZE / 2 + 1;
         // Each is under the cap; both together are not.
-        let mut first: &[u8] = format!("a1 SEARCH TEXT {{{one}}}\r\n").as_bytes().to_vec().leak();
+        let mut first: &[u8] = format!("a1 XSEARCH TEXT {{{one}}}\r\n").as_bytes().to_vec().leak();
         let events = lexer.feed(&mut first);
         assert!(matches!(events[0], LexEvent::NeedContinuation));
         let octets = vec![b'x'; one as usize];

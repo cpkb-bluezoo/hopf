@@ -9,6 +9,7 @@ mod control;
 mod envelope;
 mod fetch_format;
 mod grammar;
+mod grammar_search;
 pub mod handler;
 pub mod idle;
 pub mod list_ext;

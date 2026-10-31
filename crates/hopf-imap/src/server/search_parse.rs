@@ -349,7 +349,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn parse_imap_date(s: &str) -> Option<(i32, u32, u32)> {
+pub(super) fn parse_imap_date(s: &str) -> Option<(i32, u32, u32)> {
     // d-MMM-yyyy or dd-MMM-yyyy
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 3 {

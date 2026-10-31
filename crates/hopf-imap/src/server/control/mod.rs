@@ -25,7 +25,8 @@ use crate::server::capability::build_capabilities;
 use crate::server::grammar::Request;
 use crate::server::list_ext::ListCommand;
 use crate::server::handler::StoreAction;
-use hopf_mailbox::MessageSet;
+use hopf_mailbox::{MessageSet, SearchCriteria};
+use crate::server::sort::SortCriterion;
 use crate::server::codec::{
     parse_sequence_set, BTreeSetFlags, ImapCommand,
     ImapServerLexer, LexEvent, MAX_COMMAND_LINE,
@@ -38,7 +39,6 @@ use crate::server::handler::{
 use crate::server::idle::{is_idle_done, IdleState};
 use crate::server::metrics::ImapServerMetrics;
 use crate::server::reply::{continuation, tagged_bad, tagged_no, tagged_ok, untagged};
-use crate::server::search_parse::parse_search;
 use crate::server::service::ImapConfig;
 use crate::server::session::ImapSessionState;
 use crate::server::thread::ThreadAlgorithm;
@@ -821,9 +821,6 @@ impl ImapControlHandler {
             "GETMETADATA" => self.cmd_getmetadata(endpoint, cmd),
             "SETMETADATA" => self.cmd_setmetadata(endpoint, cmd),
             "NOTIFY" => self.cmd_notify(endpoint, cmd),
-            "SEARCH" => self.cmd_search(endpoint, cmd, false),
-            "SORT" => self.cmd_sort(endpoint, cmd, false),
-            "THREAD" => self.cmd_thread(endpoint, cmd, false),
             "EXPUNGE" => self.cmd_expunge(endpoint, &cmd.tag, None),
             "UID" => self.cmd_uid(endpoint, cmd),
             "DONE" => self.send(endpoint, tagged_bad(&cmd.tag, "Not IDLEing")),
@@ -866,6 +863,9 @@ impl ImapControlHandler {
             }
             Request::Status { mailbox, items } => self.cmd_status(endpoint, tag, mailbox, items),
             Request::Append { mailbox, flags } => self.cmd_append(endpoint, tag, mailbox, flags),
+            Request::Search { criteria, by_uid } => self.cmd_search(endpoint, tag, criteria, by_uid),
+            Request::Sort { keys, criteria, by_uid } => self.cmd_sort(endpoint, tag, keys, criteria, by_uid),
+            Request::Thread { algorithm, criteria, by_uid } => self.cmd_thread(endpoint, tag, algorithm, criteria, by_uid),
             Request::List { command, lsub } => self.cmd_list(endpoint, tag, command, lsub),
             Request::Fetch { set, items, modifiers, by_uid } => {
                 self.cmd_fetch(endpoint, tag, set, items, modifiers, by_uid)
@@ -1645,23 +1645,16 @@ impl ImapControlHandler {
         }
     }
 
-    fn cmd_search(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, by_uid: bool) {
-        if !self.require_selected(endpoint, &cmd.tag) {
+    fn cmd_search(&mut self, endpoint: &mut dyn Endpoint, tag: String, criteria: SearchCriteria, by_uid: bool) {
+        if !self.require_selected(endpoint, &tag) {
             return;
         }
-        let criteria = match parse_search(&cmd.args) {
-            Ok(c) => c,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e.to_string()));
-                return;
-            }
-        };
         let Some(mut h) = self.selected.take() else {
             return;
         };
         let mut view = SearchView {
             endpoint,
-            tag: &cmd.tag,
+            tag: &tag,
             criteria: criteria.clone(),
             by_uid,
             selected: &mut self.selected,
@@ -1681,35 +1674,27 @@ impl ImapControlHandler {
         }
     }
 
-    fn cmd_sort(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, by_uid: bool) {
-        if !self.require_selected(endpoint, &cmd.tag) {
+    fn cmd_sort(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        tag: String,
+        sort_criteria: Vec<SortCriterion>,
+        search_criteria: SearchCriteria,
+        by_uid: bool,
+    ) {
+        if !self.require_selected(endpoint, &tag) {
             return;
         }
         if !self.config.enable_sort {
-            self.send(endpoint, tagged_bad(&cmd.tag, "SORT not available"));
+            self.send(endpoint, tagged_bad(&tag, "SORT not available"));
             return;
         }
-        let (sort_criteria, search_args) = match crate::server::sort::parse_sort_command(&cmd.args)
-        {
-            Ok(v) => v,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e));
-                return;
-            }
-        };
-        let search_criteria = match parse_search(&search_args) {
-            Ok(c) => c,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e.to_string()));
-                return;
-            }
-        };
         let Some(mut h) = self.selected.take() else {
             return;
         };
         let mut view = SortView {
             endpoint,
-            tag: &cmd.tag,
+            tag: &tag,
             sort_criteria: sort_criteria.clone(),
             search_criteria: search_criteria.clone(),
             by_uid,
@@ -1732,18 +1717,17 @@ impl ImapControlHandler {
         }
     }
 
-    fn cmd_thread(&mut self, endpoint: &mut dyn Endpoint, cmd: ImapCommand, by_uid: bool) {
-        if !self.require_selected(endpoint, &cmd.tag) {
+    fn cmd_thread(
+        &mut self,
+        endpoint: &mut dyn Endpoint,
+        tag: String,
+        algorithm: ThreadAlgorithm,
+        search_criteria: SearchCriteria,
+        by_uid: bool,
+    ) {
+        if !self.require_selected(endpoint, &tag) {
             return;
         }
-        let (algorithm, search_args) = match crate::server::thread::parse_thread_command(&cmd.args)
-        {
-            Ok(v) => v,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e));
-                return;
-            }
-        };
         let enabled = match algorithm {
             ThreadAlgorithm::OrderedSubject => self.config.enable_thread_ordered_subject,
             ThreadAlgorithm::References => self.config.enable_thread_references,
@@ -1751,23 +1735,16 @@ impl ImapControlHandler {
         if !enabled {
             self.send(
                 endpoint,
-                tagged_bad(&cmd.tag, "THREAD algorithm not available"),
+                tagged_bad(&tag, "THREAD algorithm not available"),
             );
             return;
         }
-        let search_criteria = match parse_search(&search_args) {
-            Ok(c) => c,
-            Err(e) => {
-                self.send(endpoint, tagged_bad(&cmd.tag, &e.to_string()));
-                return;
-            }
-        };
         let Some(mut h) = self.selected.take() else {
             return;
         };
         let mut view = ThreadView {
             endpoint,
-            tag: &cmd.tag,
+            tag: &tag,
             algorithm,
             search_criteria: search_criteria.clone(),
             by_uid,
@@ -1827,9 +1804,6 @@ impl ImapControlHandler {
             return;
         };
         match sub_cmd.verb.as_str() {
-            "SEARCH" => self.cmd_search(endpoint, sub_cmd, true),
-            "SORT" => self.cmd_sort(endpoint, sub_cmd, true),
-            "THREAD" => self.cmd_thread(endpoint, sub_cmd, true),
             "EXPUNGE" => {
                 let Ok((set, _)) = parse_sequence_set(&sub_cmd.args) else {
                     self.send(endpoint, tagged_bad(&sub_cmd.tag, "Invalid UID set"));

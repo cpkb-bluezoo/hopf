@@ -44,7 +44,7 @@ pub trait MessageContext {
 }
 
 /// IMAP SEARCH predicate tree (RFC 9051 §6.4.4).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchCriteria {
     /// ALL
     All,
