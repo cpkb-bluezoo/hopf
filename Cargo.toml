@@ -98,11 +98,17 @@ rustls-native-certs = "0.8"
 webpki-roots = "1"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
-tractrix = "0.2"
+# Each of the crates developed alongside hopf is a `path` dependency with the
+# `version` of its next, unreleased release, so that hopf builds against the
+# local sources and can only be published once those releases exist. A bare
+# registry version could be satisfied by an older release without the
+# changes hopf now depends on.
+tractrix = { version = "0.3", path = "../tractrix" }
 self_cell = "1"
-rjsonparser = "0.1"
-rmimeparser = "0.5"
-rprotobuf = "0.1"
+rjsonparser = { version = "0.3", path = "../rjsonparser" }
+loopbuf = { version = "0.2", path = "../loopbuf" }
+rmimeparser = { version = "0.6", path = "../rmimeparser" }
+rprotobuf = { version = "0.2", path = "../rprotobuf" }
 # Internal crates: `version` must match [workspace.package] version (required
 # for publishing; cargo cannot inherit it here). Bump together on release.
 hopf-core = { version = "0.6.0", path = "crates/hopf-core" }
